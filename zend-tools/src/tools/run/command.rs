@@ -169,14 +169,13 @@ const CARGO_READS: [&str; 5] = ["test", "check", "clippy", "build", "doc"];
 /// Whether `program` with `args` changes none of the conversation's files:
 /// cargo's checks, tests and builds, and `cargo fmt` when it only checks.
 fn reads_only(program: &str, args: &[String]) -> bool {
-    let (program, args) = match take_apart(program.to_string(), args.to_vec()) {
-        Ok(taken) => taken,
-        Err(_) => return false,
-    };
-    if program != "cargo" {
+    if program.trim() != "cargo" {
         return false;
     }
-    let mut words = args.iter().map(String::as_str).skip_while(|a| a.starts_with('+'));
+    let mut words = args
+        .iter()
+        .map(String::as_str)
+        .skip_while(|a| a.starts_with('+'));
     match words.next() {
         Some(sub) if CARGO_READS.contains(&sub) => true,
         Some("fmt") => args.iter().any(|a| a == "--check"),
@@ -401,10 +400,16 @@ mod tests {
         let safe = |program: &str, args: &[&str]| reads_only(program, &strings(args));
         assert!(safe("cargo", &["test", "-p", "zend", "--lib"]));
         assert!(safe("cargo", &["+nightly", "check"]));
-        assert!(safe("cargo", &["clippy", "--tests", "--", "-D", "warnings"]));
+        assert!(safe(
+            "cargo",
+            &["clippy", "--tests", "--", "-D", "warnings"]
+        ));
         assert!(safe("cargo", &["build", "--release"]));
         assert!(safe("cargo", &["fmt", "--all", "--", "--check"]));
-        assert!(safe("cargo test", &["-p", "web"]), "a command line taken apart");
+        assert!(
+            !safe("cargo test", &["-p", "web"]),
+            "a command line in `program` is refused when it runs"
+        );
         assert!(!safe("cargo", &["fmt", "--all"]));
         assert!(!safe("cargo", &["add", "serde"]));
         assert!(!safe("cargo", &["fix"]));

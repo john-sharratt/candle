@@ -61,6 +61,7 @@ pub mod repo_scan;
 pub mod resident;
 pub mod response_section;
 pub mod resume;
+pub mod round_timing;
 pub mod retrieval_scope;
 pub mod schema_layers;
 pub mod secrets;

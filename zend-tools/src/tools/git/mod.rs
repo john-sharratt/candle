@@ -434,9 +434,9 @@ fn on_record(repo: &ConvRepo, branch: &BranchName) -> Result<Rev, GitToolError> 
         true => format!(" and {} more", held.len() - 20),
         false => String::new(),
     };
-    Err(GitError::invalid(format!(
-        "there is no branch {branch} on the record; it holds {shown}{more}"
-    ))
+    Err(GitError::UnknownRevision {
+        rev: format!("{branch} — no such branch on the record; it holds {shown}{more}"),
+    }
     .into())
 }
 

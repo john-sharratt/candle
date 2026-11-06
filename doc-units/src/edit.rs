@@ -697,7 +697,9 @@ mod tests {
         );
         assert_eq!(
             delete(3, 2),
-            EditError::Invalid("+3 comes after +2: a range runs from `from` forward to `to`".into())
+            EditError::Invalid(
+                "+3 comes after +2: a range runs from `from` forward to `to`".into()
+            )
         );
     }
 

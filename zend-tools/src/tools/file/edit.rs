@@ -286,6 +286,12 @@ fn edit_of(req: &EditRequest) -> Result<Edit, FileError> {
         )));
     }
     let lines = line_range(req)?;
+    if lines.is_some() && req.action == "move" {
+        return Err(invalid(
+            "`move` moves whole parts; it takes no `from` — to move lines, delete them and \
+             insert them where they go",
+        ));
+    }
     if lines.is_some() && (req.old.is_some() || req.through.is_some()) {
         return Err(invalid(
             "`from` names lines of one part: it takes no `old`, which changes words of the \
@@ -340,13 +346,7 @@ fn edit_of(req: &EditRequest) -> Result<Edit, FileError> {
         ("delete", None) => Op::Delete {
             to: req.through.clone(),
         },
-        ("move", Some(_)) => {
-            return Err(invalid(
-                "`move` moves whole parts; it takes no `from` — to move lines, delete them and \
-                 insert them where they go",
-            ))
-        }
-        ("move", None) => Op::Move {
+        ("move", _) => Op::Move {
             to: req.through.clone(),
             dest: req
                 .dest

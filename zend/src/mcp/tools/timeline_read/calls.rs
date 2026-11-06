@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use host::substrate_views::TimelineDetail;
 
 use super::head;
+use crate::round_timing::{rounds, total};
 use crate::tools::extract_tool_calls;
 
 /// How much of a call's arguments a line shows.
@@ -36,8 +37,12 @@ pub fn render(t: &TimelineDetail, offset: usize, limit: usize) -> String {
     let (mut calls, mut repeats) = (0, 0);
     let mut cut = false;
     let mut lines = Vec::new();
+    let timed = rounds(&t.custom);
     for (at, turn) in t.turns.iter().enumerate() {
         let shown = (offset..offset + limit).contains(&at);
+        if let (true, Some(timing)) = (shown, timed.get(&turn.index)) {
+            lines.push(format!("#{} round: {timing}", turn.index));
+        }
         let made = extract_tool_calls(&turn.assistant);
         if shown && made.is_empty() {
             lines.push(format!("#{} no calls", turn.index));
@@ -65,6 +70,10 @@ pub fn render(t: &TimelineDetail, offset: usize, limit: usize) -> String {
         }
     }
     let mut out = head(t);
+    let (n, sum) = total(timed.values());
+    if n > 0 {
+        out.push_str(&format!("\ntime over {n} timed rounds: {sum}"));
+    }
     out.push_str(&format!(
         "\ncalls of turns {}–{}: {calls}, of which {repeats} repeat a call already made",
         offset.min(t.turns.len()),
@@ -149,6 +158,33 @@ mod tests {
         let short = "<tool_call>\n{\"name\": \"datetime\", \"arguments\": {}}\n</tool_call>";
         t.turns = vec![turn_view(0, "a", short)];
         assert!(!render(&t, 0, 1).contains(WHOLE));
+    }
+
+    /// **A timed round shows where its time went**, before its calls, and the
+    /// conversation's rounds are totalled under the header.
+    #[test]
+    fn a_rounds_time_shows_beside_its_calls() {
+        use crate::round_timing::{key, RoundTiming};
+        let call = "<tool_call>\n{\"name\": \"datetime\", \"arguments\": {}}\n</tool_call>";
+        let mut t = timeline();
+        t.turns = vec![turn_view(0, "a", call), turn_view(1, "b", "Done.")];
+        let timing = RoundTiming::of(10_000, 512, 1_400, 210, 6_100);
+        t.custom.insert(key(0), timing.value());
+        let text = render(&t, 0, 2);
+        assert!(
+            text.contains(
+                "\ntime over 1 timed rounds: queued 2.5 s, prefill 512 tok in 1.4 s, decode 210 \
+                 tok in 6.1 s\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n#0 round: queued 2.5 s, prefill 512 tok in 1.4 s, decode 210 tok in 6.1 s\n#0 \
+                 datetime {}"
+            ),
+            "{text}"
+        );
     }
 
     /// **A repeat of a call made before the page is still a repeat.**

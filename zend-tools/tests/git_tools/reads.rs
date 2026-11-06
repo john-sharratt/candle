@@ -403,6 +403,14 @@ fn an_unknown_revision_says_so() {
         json!({"repo": "app", "rev": branch_rev("nope"), "page": 1}),
     );
     assert_eq!(out["error"], "unknown_revision", "{out}");
+    // It names the branches the record does hold.
+    assert!(
+        out["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no such branch on the record; it holds main"),
+        "{out}"
+    );
 }
 
 /// A field the schema does not define is refused rather than ignored.
@@ -574,17 +582,19 @@ fn an_upstream_revision_resolves_what_the_branch_tracks() {
     ws.git(&["config", "branch.main.remote", "origin"]);
     ws.git(&["config", "branch.main.merge", "refs/heads/main"]);
 
+    // The local branch's own commit, one past what it tracks — `branch` would
+    // read origin's copy, the record, which is the upstream itself.
+    let tip = json!({"kind": "commit", "name": ws.oid("HEAD")});
     let out = ws.read(
         "git_log",
-        json!({"repo": "app", "rev": branch_rev("main"), "since": {"kind": "upstream"},
-               "page": 1}),
+        json!({"repo": "app", "rev": tip.clone(), "since": {"kind": "upstream"}, "page": 1}),
     );
     assert_eq!(out["count"], 1, "{out}");
 
     // Naming the branch explicitly is equivalent.
     let named = ws.read(
         "git_log",
-        json!({"repo": "app", "rev": branch_rev("main"),
+        json!({"repo": "app", "rev": tip,
                "since": {"kind": "upstream", "name": "main"}, "page": 1}),
     );
     assert_eq!(named["count"], 1, "{named}");
@@ -1233,10 +1243,11 @@ fn branches_list_with_the_current_one_marked_and_a_count() {
     );
 }
 
-/// Ahead and behind are the question this answers; live, the model invented
-/// the number instead.
+/// **With an origin, the branches are origin's**: the record, at the commit
+/// origin holds, not a local copy one commit ahead of it — how far a
+/// conversation is ahead is `git_status`'s to say.
 #[test]
-fn a_tracking_branch_reports_how_far_ahead_and_behind() {
+fn with_an_origin_the_branches_are_the_records() {
     let ws = GitWorkspace::new();
     ws.git(&[
         "remote",
@@ -1251,15 +1262,11 @@ fn a_tracking_branch_reports_how_far_ahead_and_behind() {
         "git_refs",
         json!({"repo": "app", "kind": "branches", "page": 1}),
     );
-    let up = &out["branches"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|b| b["name"] == "main")
-        .unwrap()["upstream"];
-    assert_eq!(up["remote"], "origin", "{out}");
-    assert_eq!(up["ahead"], 1);
-    assert_eq!(up["behind"], 0);
+    assert_eq!(out["count"], 1, "{out}");
+    let main = &out["branches"][0];
+    assert_eq!(main["name"], "main", "{out}");
+    assert_eq!(main["id"], ws.oid("HEAD~1"), "origin's copy: {out}");
+    assert!(main.get("upstream").is_none(), "{out}");
 }
 
 #[test]

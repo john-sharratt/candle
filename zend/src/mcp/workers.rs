@@ -51,6 +51,7 @@ use super::ops::NODE_HEADER;
 use super::records::Records;
 use super::resuming;
 use super::roles::{WorkerKind, ROLE_SELECTOR};
+use super::steps;
 use super::stops;
 use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
@@ -1293,7 +1294,7 @@ async fn run(
                 break settled;
             };
             let round = keep_first_answer(&mut worker, answer, &audit);
-            break (label, format!("{outcome}; its citation check {round}"));
+            break (label, format!("{outcome}; its answer's check {round}"));
         }
         let audit = match audit_of(&session, &worker).await {
             Ok(audit) => audit,
@@ -1306,28 +1307,45 @@ async fn run(
                 break settled;
             }
         };
-        // A task's first answer citing what it never opened goes back once
-        // to open it; the second answer is kept with its audit, whatever it
+        // A task's first answer citing what it never opened, or saying nothing
+        // of steps its brief gave it (`super::steps`), goes back once to put
+        // that right; the second answer is kept with its audit, whatever it
         // says. A continuation is Claude's to direct, with the audit in hand,
         // so it is not sent back.
-        if audit.unopened() && first.is_none() && !worker.checked {
-            let to_correct = audit.miscopied.len() + audit.seen.len() + audit.never_seen.len();
-            let line = format!(
-                "{to_correct} of its answer's citations are not by an address it opened; it is \
-                 checking them"
-            );
+        let given = steps::of(&worker.prompt);
+        let unsaid = steps::unaccounted(&given, &worker.final_text);
+        if (audit.unopened() || !unsaid.is_empty()) && first.is_none() && !worker.checked {
+            let mut told = Vec::new();
+            let mut why = Vec::new();
+            if audit.unopened() {
+                let to_correct =
+                    audit.miscopied.len() + audit.seen.len() + audit.never_seen.len();
+                told.push(audit.correction());
+                why.push(format!(
+                    "{to_correct} of its answer's citations are not by an address it opened"
+                ));
+            }
+            if !unsaid.is_empty() {
+                told.push(steps::correction(&given, &unsaid));
+                why.push(format!(
+                    "its answer says nothing of {} of the {} steps it was given",
+                    unsaid.len(),
+                    given.len()
+                ));
+            }
+            let why = why.join(", and ");
+            let line = format!("{why}; it is putting that right");
             if let Err(e) = note(&records, &owner, &worker, "Task sent back:", line) {
                 tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be entered: {e}");
             }
-            next = First::Message(format!("{}{ASKING}", audit.correction()));
+            next = First::Message(format!("{}{ASKING}", told.join("\n\n")));
             first = Some((worker.final_text.clone(), audit, settled));
             worker.state = State::Running;
             worker.checked = true;
             // Said on its record while the check runs, so a wait shows why a
             // worker that answered is running again. Only these fields: the
             // beat owns the rest of the record while the turn runs.
-            let checking =
-                format!("Checking its citations: sent back to correct {to_correct} of them.");
+            let checking = format!("Checking its answer: sent back because {why}.");
             if let Some(mut stored) =
                 threads::worker(&records, &owner, &worker.thread, &worker.name)
             {

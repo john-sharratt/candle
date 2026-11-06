@@ -52,6 +52,7 @@ pub mod resuming;
 pub mod roles;
 pub mod server;
 pub mod state;
+pub mod steps;
 pub mod stops;
 pub mod tending;
 pub mod threads;
