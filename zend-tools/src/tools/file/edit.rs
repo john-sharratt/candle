@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::FileError;
+use super::{edit_changes, FileError};
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// Schema-only mirror of the operations `do` accepts, so the generated schema
@@ -85,7 +85,9 @@ impl Tool for FileEdit {
          body, adding a method after another, fixing a value in a config, removing dead code, \
          reordering items. An anchor that no longer names a part — the file changed since it was \
          read — is refused; read it again. Returns what was done and the parts it wrote under \
-         their new anchors, between their neighbours, so the next edit needs no read. Triggered \
+         their new anchors, between their neighbours, so the next edit needs no read. It also \
+         lists the lines that changed, `-` for what was removed and `+` for what was written: a \
+         line listed there you did not mean to change is a slip to fix with the next edit. Triggered \
          by \"change X to Y in the file\", \"update this function\", \"add this after\", \"remove \
          that\". For a new file, or rewriting most of one, use write.";
 
@@ -123,6 +125,17 @@ impl Tool for FileEdit {
                 return Err(FileError::InvalidArguments(why));
             }
         }
+        // The lines that changed, in file order. A whole-part replace is
+        // retyped by the caller and can drop a character from a line nobody
+        // meant to touch, and the parts around it read the same either way —
+        // so the lines themselves are named here. A move carries no line's
+        // text into new text, so it has nothing to report. Taken before the
+        // store moves `text` out of reach.
+        let changes = if req.action == "move" {
+            String::new()
+        } else {
+            edit_changes::changed(&content, &text)
+        };
         // Recorded as an edit — the changed lines only, not the file they
         // landed in.
         store.edit(&req.path, text)?;
@@ -131,6 +144,9 @@ impl Tool for FileEdit {
             done.summary,
             around(&done.doc, &done.touched, done.at_line)
         );
+        if !changes.is_empty() {
+            result.push_str(&format!("Changed lines:\n{changes}"));
+        }
         if done.broke {
             result.push_str(&format!(
                 "{} no longer parses as {} — mend it with the next edit.\n",
