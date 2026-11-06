@@ -54,7 +54,7 @@ by rule — before it goes live.
 | No approvals while iterating | Nothing in editing, publishing or a Zen task on the yenbot repository waits on an approval (§17.7). |
 | Data stays sound as apps change | Collections declare their fields; writes are validated; an app's version can carry a migration (§7.5). |
 | Real apps' queries | Counts, sums and groups, full-text search, batches, pages (§7.6). |
-| English, Vietnamese-safe | English interfaces; type, input, search and sorting that handle Vietnamese correctly (§8.7). |
+| English | English interfaces; accented text stored, searched and sorted correctly (§8.7). |
 | Families share | Groups, and roles per collection and per record; children with their own Google accounts (§12.5). |
 | Safe by default | A strict content policy, request forgery refused, uploads checked, markup escaped, hashed API tokens; loopback identity is a known hole, noted (§12.6). |
 | Google services through the gateway | The gateway's Google client, already used for sign-in, gains a "connect Google" flow; yenbot asks the gateway for a person's access token (§19.3). |
@@ -117,7 +117,7 @@ yenbot/
     index.html  _admin/       the landing page and the admin page
     _/yen.js  _/framework/    the framework: one import, one module per concern (§8)
     _/yen.css  _/ui/          design system: the page's look; tokens.css, fonts.css, components/
-    _design/                  the catalogue and the Vietnamese test page (§8.5, §8.7)
+    _design/                  the design system's catalogue (§8.5)
     _/vendor/                 pinned third-party modules (Lit, signals)
     _/icons/  _/fonts/        the vector UI icon set and the typefaces
     sw.js                     the service worker: push and offline (§11)
@@ -617,10 +617,9 @@ browser loads it, the catalogue reads it to draw its dark frame beside its
 light one, and the platform reads it to check a theme's contrast.
 
 The site puts `/_/yen.css` and the app's theme at the head of every app page,
-so an app's `index.html` names neither. A line of text is never set tighter
-than 1.4 and is only ever cut short sideways — Be Vietnam Pro sets a
-Vietnamese capital's stacked marks above the line box, and a vertical clip
-cuts them off (found on the Vietnamese test page).
+so an app's `index.html` names neither. A line of text is only ever cut short
+sideways: an accent on a capital stands above the line box, and a vertical
+clip cuts it off.
 
 **An app may override a few named tokens for itself**, in its manifest:
 
@@ -667,14 +666,13 @@ mistake — is the page's to show beside the field; one that comes after the
 page moved on is held in the shell, to keep ("Keep mine", sent again over the
 newer version) or drop.
 
-### 8.7 Language and type
+### 8.7 Language and text
 
-Interfaces are in English, and everything handles Vietnamese: the text and
-display faces cover the full Vietnamese set, stacked diacritics included
-(chosen and checked against a test page of Vietnamese text); text is
-normalised to NFC on every write so the same word is always the same bytes;
-search folds diacritics (§7.6); sorting is by `Intl.Collator`; dates, times
-and numbers are formatted for `en-AU` in Yen's time zone.
+Interfaces are in English; there is no other language to support. The faces
+carry the Latin and Latin-extended ranges. Text is normalised to NFC on every
+write so the same accented word is always the same bytes; search folds
+accents (§7.6); sorting is by `Intl.Collator("en-AU")`; dates, times and
+numbers are formatted for `en-AU` in Yen's time zone.
 
 ## 9. Scheduled jobs
 
@@ -1475,7 +1473,7 @@ Taken 2026-11-06:
 - **Undo is failing forward**; there are no history tools.
 - **Children sign in with their own Google accounts**, approved and grouped
   like anyone else.
-- **English interfaces, Vietnamese-safe** throughout.
+- **English interfaces** throughout; no Vietnamese support.
 - **No vision** in the first version.
 - **Claude sees the site's logs through general connector tools**
   (`log_list`, `log_read`, `log_grep`), **and everything else through the
@@ -1511,7 +1509,7 @@ Taken 2026-11-06:
    test that keeps them equal — with tests against a real SQLite file.
 4. The frontend framework: `yen.js`, the vendored modules, routing, stores,
    forms, offline writes, error reporting.
-5. The design system, its type and its Vietnamese test page, its catalogue
+5. The design system, its type, its catalogue
    page and the components.
 6. The gate: the platform's check answering candidates on the bus.
 7. The art library: the house style, sizing on load, the first library.
@@ -1571,5 +1569,5 @@ or the docs are fixed until it passes as written.
 | 20 | "Make the date picker nicer everywhere" | The platform component under `web/_/ui/components/`, an edit and a release (the binary embeds `web/`) | §5.2, §5.5 | Every app's date picker changes with the release; `/_design` shows it in every state. |
 | 21 | "Can the platform make QR codes?" | A task on the Rust, then `service_deploy` for yenbot, watched with `job_status` | §5.5, §17.7 | The feature is live; Claude told Yen how long it would take and confirmed on the site that it landed. |
 | 22 | "Put my apps in this order" | Yen's admin page, or a task: `PUT /admin/apps/order` | §6.2 | The landing page shows the order she gave. |
-| 23 | "Put the recipes in a spreadsheet" | `/export/<app>` as CSV | §20.1 | The CSV opens in a spreadsheet with every recipe and Vietnamese text intact. |
+| 23 | "Put the recipes in a spreadsheet" | `/export/<app>` as CSV | §20.1 | The CSV opens in a spreadsheet with every recipe and its accented text intact. |
 | 24 | "Put it on my phone's home screen" | The install prompt every app gets | §11 | The app opens from the home screen, full-screen, and its pushes still arrive. |
