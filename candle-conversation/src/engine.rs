@@ -17,6 +17,7 @@ use crate::persistence::record::DistillMode;
 use crate::persistence::thread::{BacklogWaker, PersistenceThread};
 use crate::persistence::triggers::FIRST_ATTACHMENT;
 use crate::persistence::vfs::{VfsEventId, VfsEventPayload, VfsWrite};
+use crate::persistence::warm_ledger::WarmLedger;
 use crate::persistence::BoundSubstrate;
 use crate::projection::CorruptTurnPolicy;
 use crate::projection::{
@@ -324,10 +325,12 @@ struct EngineCore {
     kv_layers: usize,
 
     /// What [`ConversationEngine::attach`] hands a new persistence thread
-    /// beside the backings ([`Attachments::persist_with`]): the device and the
-    /// compression policy.
+    /// beside the backings ([`Attachments::persist_with`]): the device, the
+    /// compression policy, and a share of the one warm budget every attached
+    /// substrate's purge divides.
     device: Device,
     compression_policy: Option<CompressionPolicy>,
+    warm_ledger: Arc<WarmLedger>,
 
     /// Every attached substrate, and the backings while the core runs.
     attachments: Mutex<Attachments>,
@@ -484,11 +487,13 @@ impl ConversationEngine {
         let backings: Arc<Vec<ChunkedKvBacking>> = Arc::new(session.backings().to_vec());
         let device = session.device().clone();
         let compression_policy = config.batched_config.compression_policy();
+        let warm_ledger = WarmLedger::new();
         let persist_thread = PersistenceThread::spawn(
             conversation.clone(),
             Arc::clone(&backings),
             device.clone(),
             compression_policy,
+            warm_ledger.join(),
         );
         let persist_trigger = persist_thread.trigger_handle();
         persist_trigger.on_backlog_fall(scheduler_waker(&tx));
@@ -606,6 +611,7 @@ impl ConversationEngine {
             kv_layers,
             device,
             compression_policy,
+            warm_ledger,
             attachments: Mutex::new(Attachments::first(
                 FIRST_ATTACHMENT,
                 conversation.clone(),
@@ -786,6 +792,7 @@ impl EngineAttacher {
             backings,
             self.core.device.clone(),
             self.core.compression_policy,
+            self.core.warm_ledger.join(),
         );
         let id = self.core.next_attachment.fetch_add(1, Ordering::Relaxed);
         let status = Arc::new(SubstrateReloadStatus::default());

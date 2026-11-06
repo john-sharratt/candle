@@ -141,6 +141,11 @@ zend's `tool_def::DEFS`, `SCAN_*`, `ingest_backlog`, `ingest_report`; npcd's
    the shared `EngineCore` (scheduler, model, tokenizer, device, guests) plus one
    substrate with its own persistence thread, writer, reload and cancel. Tenant code
    that calls `engine.new_conversation_with_projection(…)` keeps doing so unchanged.
+   The warm KV tier's host-RAM budget is the machine's and stays one budget: the
+   core holds a `WarmLedger`, every attachment's persistence thread a share of it,
+   and each purges its own substrate to its share in proportion to the warm bytes
+   it holds (`persistence/warm_ledger.rs`) — never each to the whole budget, which
+   let the tier grow to the budget times the number of tenants.
 5. **Scheduler keys stay unique across substrates.** Every substrate mints its
    timelines from one process-wide allocator, and attaching a substrate whose stored
    timeline ids overlap an attached one's is refused — so a bare `TimelineId`,

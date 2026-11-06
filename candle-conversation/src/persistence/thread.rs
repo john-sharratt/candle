@@ -55,6 +55,7 @@ use super::held_groups::{drain_in_held_groups, HeldDrain};
 use super::resume::TurnChunkGrid;
 use super::streams::StreamId;
 use super::transfer::seal_to_chunk_images;
+use super::warm_ledger::WarmShare;
 use crate::projection::{Conversation, MaintenanceOp};
 use crate::scheduler::phase_ring::{
     migrate_sample, mix_due, push_idle_migrate, push_migrate, push_mix,
@@ -291,11 +292,15 @@ impl PersistenceThread {
     /// run on the copy stream so they overlap with main-stream
     /// compute, and the DtoH target is write-combined pinned memory
     /// (no driver-side pageable bounce).
+    ///
+    /// `warm` is this substrate's share of the engine's one warm budget: the
+    /// warm purge keeps this substrate to its share of it ([`WarmShare`]).
     pub fn spawn(
         conversation: Conversation,
         backings: Arc<Vec<ChunkedKvBacking>>,
         device: Device,
         compression_policy: Option<CompressionPolicy>,
+        warm: WarmShare,
     ) -> Self {
         let (trigger_tx, trigger_rx) = channel::bounded::<()>(1);
         let (flush_tx, flush_rx) = channel::bounded::<FlushRequest>(1);
@@ -328,6 +333,7 @@ impl PersistenceThread {
                     flush_rx,
                     shutdown_rx,
                     loop_backlog,
+                    warm,
                 );
             })
             .expect("failed to spawn substrate-persistence thread");
@@ -386,6 +392,7 @@ fn run_loop(
     flush_rx: Receiver<FlushRequest>,
     shutdown_rx: Receiver<()>,
     backlog: BacklogGauge,
+    warm: WarmShare,
 ) {
     // Bind this thread to the device's CUDA context BEFORE any pinned
     // alloc — the CUDA context is per-thread on Windows and the
@@ -472,6 +479,7 @@ fn run_loop(
                 may_start: run_maintenance,
             },
             &backlog,
+            &warm,
             &mut flush,
         );
         carried = flush.carried();
@@ -577,6 +585,7 @@ fn run_loop(
                     // backlog, and leaving the gauge holding its pre-shutdown
                     // reading would publish a deficit that never clears.
                     &backlog,
+                    &warm,
                     // Nothing waits on the shutdown drain's passes.
                     &mut PassFlush::new(None, None),
                 );
@@ -986,6 +995,7 @@ fn run_pass(
     pinned_scratch: &mut Option<PinnedBuf>,
     maintenance: PassMaintenance<'_>,
     backlog: &BacklogGauge,
+    warm: &WarmShare,
     flush: &mut PassFlush<'_>,
 ) {
     let t_pass = std::time::Instant::now();
@@ -1589,18 +1599,20 @@ fn run_pass(
         )
     };
     backlog.stamp_residents(warm_resident as u64, warm_bytes, held);
+    warm.hold(warm_bytes);
     if warm_resident > 0 {
         let mut sys = System::new();
         sys.refresh_memory();
         // Budget-based purge: warm may hold up to what RAM affords after the OS
         // buffer, pinned pools, and fully-reserved weights. A zero budget means
         // this machine cannot afford a standing warm tier — everything
-        // cold-backed drains straight out. `purge_warm_to_budget` logs its own
-        // batch summary (see substrate.rs).
+        // cold-backed drains straight out. The budget is the machine's, shared
+        // by every substrate the engine holds, so this one purges to its share
+        // of it (`warm_ledger`). `purge_warm_to_budget` logs its own batch
+        // summary (see substrate.rs).
         let budget = candle::vram::host_ram_budget(sys.total_memory());
-        let _ = conversation
-            .read()
-            .purge_warm_to_budget(budget.kv_warm_budget_bytes, 0);
+        let target = warm.target(budget.kv_warm_budget_bytes);
+        let _ = conversation.read().purge_warm_to_budget(target, 0);
     }
 
     // ── Phase 2.7: the memory census's gauge ──────────────────────────────

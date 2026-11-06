@@ -517,8 +517,7 @@ impl BackingInner {
     #[cfg(feature = "cuda")]
     fn claim_slab(&self, key: ArenaKey, index: usize, arena_bytes: usize) -> Result<Arena> {
         if key.location == ArenaLocation::Cpu {
-            let data = Tensor::zeros(arena_bytes, DType::U8, &Device::Cpu)?;
-            return Ok(Arena::new(data, key, index));
+            return Ok(Arena::new(cpu_slab(arena_bytes)?, key, index));
         }
         let Device::Cuda(cuda) = &self.device else {
             candle::bail!("a GPU arena needs a CUDA device, not {:?}", self.device)
@@ -611,13 +610,27 @@ impl BackingInner {
 
     #[cfg(not(feature = "cuda"))]
     fn claim_slab(&self, key: ArenaKey, index: usize, arena_bytes: usize) -> Result<Arena> {
-        let device = match key.location {
-            ArenaLocation::Gpu => &self.device,
-            ArenaLocation::Cpu => &Device::Cpu,
+        let data = match key.location {
+            ArenaLocation::Gpu => Tensor::zeros(arena_bytes, DType::U8, &self.device)?,
+            ArenaLocation::Cpu => cpu_slab(arena_bytes)?,
         };
-        let data = Tensor::zeros(arena_bytes, DType::U8, device)?;
         Ok(Arena::new(data, key, index))
     }
+}
+
+/// A warm-tier (host RAM) arena's storage, **uninitialised**.
+///
+/// Every byte of it that is ever read was written first: a slot is filled by
+/// the hot→warm migration over exactly its band's payload, and read back —
+/// by an elevate to hot or the warm→cold gather — over that same payload
+/// length, taken from the chunk's own band tag. The tail of a
+/// slot past its payload is never read. Nor does the slab change hands: it is a
+/// fresh heap block freed when the arena is released, never another tenant's
+/// ground the way a device region is (`region_pool::claim_region` zeroes those).
+/// Zeroing it was a full-width write of up to an arena per migration, over
+/// bytes the migration then overwrote.
+fn cpu_slab(arena_bytes: usize) -> Result<Tensor> {
+    Tensor::empty(arena_bytes, DType::U8, &Device::Cpu)
 }
 
 impl ChunkedKvBacking {
