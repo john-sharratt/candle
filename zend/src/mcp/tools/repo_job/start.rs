@@ -13,10 +13,10 @@
 
 use std::sync::Arc;
 
+use agent::overlay::Overlay;
 use agent::wire::RunJob;
 use serde_json::{json, Value};
 use tokio::task::spawn_blocking;
-use zend_vfs::Snapshot;
 
 use super::{host_in, phase, pinned, Handle, NO_AGENTS};
 use crate::mcp::ops;
@@ -118,7 +118,7 @@ pub fn job_of(args: &Value) -> Result<RunJob, String> {
     Ok(RunJob {
         repo: string(args, "repo")?.to_string(),
         branch: string(args, "branch")?.to_string(),
-        overlay: Snapshot::default(),
+        overlay: Overlay::default(),
         program,
         args: list,
         timeout_secs: args
@@ -147,15 +147,16 @@ pub fn next_steps(job: &JobHandle) -> String {
 /// The calling task's uncommitted changes to `repo`, as its last tool round
 /// saved them: what its job lays onto the branch, as `run_command` lays them
 /// onto its sandbox. A job from outside a task carries none, and runs the
-/// branch as origin holds it.
+/// branch as origin holds it. The agent is sent each file's chain by name,
+/// and the chains themselves only when it lacks them.
 ///
 /// **A job a task starts runs the task's work, not origin's alone.** A worker
 /// started tests on a branch before committing to it, read "1399 passed" off
 /// a run of origin's tree without its edits, and recorded a pass of a change
 /// the run never held (`docs/zen_coding_challenge_fixes.md` Cause 5).
-async fn overlay_of(call: &OpsCall, repo: &str) -> Snapshot {
+async fn overlay_of(call: &OpsCall, repo: &str) -> Overlay {
     if !call.worker {
-        return Snapshot::default();
+        return Overlay::default();
     }
     let (session, conv, repo) = (
         Arc::clone(&call.session),
@@ -166,15 +167,15 @@ async fn overlay_of(call: &OpsCall, repo: &str) -> Snapshot {
         session
             .saved_files(&conv)
             .and_then(|files| files.repo(&repo).ok().map(|store| store.snapshot()))
-            .unwrap_or_default()
+            .map_or_else(Overlay::default, |snapshot| Overlay::of(&snapshot))
     })
     .await
     .unwrap_or_default()
 }
 
 /// What a job's answer says of the work it carries.
-fn carried(worker: bool, overlay: &Snapshot) -> String {
-    match (worker, overlay.chains().len()) {
+fn carried(worker: bool, overlay: &Overlay) -> String {
+    match (worker, overlay.files()) {
         (false, _) => " as origin holds it".to_string(),
         (true, 0) => " as origin holds it — you have no uncommitted changes in it".to_string(),
         (true, n) => format!(" with your {n} uncommitted file(s) laid onto it"),
@@ -235,6 +236,8 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
 
 #[cfg(test)]
 mod tests {
+    use zend_vfs::VfsStore;
+
     use super::*;
 
     #[test]
@@ -287,10 +290,16 @@ mod tests {
     /// a task, and from a task its uncommitted files, or that it has none.
     #[test]
     fn the_answer_says_what_work_the_job_carries() {
-        assert_eq!(carried(false, &Snapshot::default()), " as origin holds it");
+        assert_eq!(carried(false, &Overlay::default()), " as origin holds it");
         assert_eq!(
-            carried(true, &Snapshot::default()),
+            carried(true, &Overlay::default()),
             " as origin holds it — you have no uncommitted changes in it"
+        );
+        let store = VfsStore::new();
+        store.write("a.txt", "one\n".into()).unwrap();
+        assert_eq!(
+            carried(true, &Overlay::of(&store.snapshot())),
+            " with your 1 uncommitted file(s) laid onto it"
         );
     }
 

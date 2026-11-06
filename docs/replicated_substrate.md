@@ -4007,6 +4007,15 @@ its base included, which the 10 MiB store cap keeps small. That answers the open
 of sync granularity (`docs/zend_workspace_execution.md` §9.4) with a per-job overlay over a
 fetched base.
 
+The overlay goes by name (`agent/src/overlay.rs`): `{ base, chains: { path: digest } }`,
+each changed path's chain named by the SHA-256 of its JSON. The agent keeps the chains it
+has been sent in memory, least recently used out first, up to 256 MiB
+(`agent/src/chains.rs`). A run naming a chain it holds neither in memory nor in the
+request is answered `409 { "error": "missing", "missing": [digest, …] }` and kept as no
+job; the member sends it again to that agent with `carried: { digest: chain }` holding
+those chains alone (`Agents::submit`). A long session's unchanged files cross once, not on
+every run. An agent in the member's own process is sent every chain.
+
 **A run** goes through the existing sandbox cycle against the agent's own checkout:
 fetch the base, then preserve → materialize → run → capture → restore
 (`zend-vfs/src/sandbox/mod.rs:1-45`). It returns the exit code, the log, and the captured

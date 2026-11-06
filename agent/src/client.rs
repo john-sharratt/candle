@@ -40,6 +40,7 @@ use zend_vfs::{FetchBundle, JobStatus, PushResult, RemoteRefs, RunOutcome};
 
 use crate::jobs::{JobError, Jobs, MAX_WAIT};
 use crate::member::{capacity, node_in, APP};
+use crate::overlay::{Missing, MISSING};
 use crate::wire::{
     AgentJobs, BridgeCall, Bridged, FetchJob, JobView, ListJob, LogChunk, PushJob, RunJob, Submit,
     Switching,
@@ -127,6 +128,16 @@ impl Agents {
     }
 
     async fn call(&self, call: Call<'_>) -> Result<(Option<u64>, Bytes), AgentError> {
+        let (status, agent, body) = self.send(call).await?;
+        if status.is_success() {
+            return Ok((agent, body));
+        }
+        Err(refusal(status, &body))
+    }
+
+    /// Send `call` and answer the status, the agent that answered and the
+    /// body, whatever the status.
+    async fn send(&self, call: Call<'_>) -> Result<(StatusCode, Option<u64>, Bytes), AgentError> {
         let Some(conn) = self.member.as_ref().and_then(|m| m.open_group(APP)) else {
             return Err(AgentError::NoAgent(
                 "cut off from every cluster, and no agent runs in this process".into(),
@@ -175,24 +186,28 @@ impl Agents {
             .await
             .map_err(|e| AgentError::Transport(e.to_string()))?
             .to_bytes();
-        if status.is_success() {
-            return Ok((agent, body));
-        }
-        let why = serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| {
-                let error = v.get("error")?.as_str()?.to_string();
-                let message = v.get("message").and_then(|m| m.as_str());
-                Some(message.map_or(error.clone(), |m| format!("{error}: {m}")))
-            })
-            .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
-        if status == StatusCode::SERVICE_UNAVAILABLE && why.starts_with("no_agent") {
-            return Err(AgentError::NoAgent(why));
-        }
-        Err(AgentError::Refused {
-            status: status.as_u16(),
-            why,
+        Ok((status, agent, body))
+    }
+
+    /// Post run `job` for `lineage`, to agent `to` or where it is placed.
+    async fn send_run(
+        &self,
+        lineage: &str,
+        job: &RunJob,
+        to: Option<u64>,
+    ) -> Result<(StatusCode, Option<u64>, Bytes), AgentError> {
+        let body = serde_json::to_vec(&Submit::Run(job.clone())).expect("a job serialises");
+        self.send(Call {
+            method: Method::POST,
+            path: "/v1/jobs".into(),
+            body,
+            to,
+            lineage: Some(lineage),
+            repo: Some(&job.repo),
+            toolchain: Some(&job.program),
+            push: false,
         })
+        .await
     }
 
     fn view_of(body: &Bytes) -> Result<JobView, AgentError> {
@@ -207,6 +222,11 @@ impl Agents {
     /// Start `job` for `lineage` — on agent `to`, or on the one the gateway
     /// chooses — and answer where it runs and how it stands, without waiting
     /// for it to end.
+    ///
+    /// Its overlay goes by name first. An agent lacking chains it names
+    /// answers `409` with their digests, and the job goes again to that agent
+    /// carrying those chains alone — or, when the answer names no agent,
+    /// carrying every chain, wherever it is placed.
     pub async fn submit(
         &self,
         lineage: &str,
@@ -225,20 +245,28 @@ impl Agents {
             let view = jobs.submit(Submit::Run(job)).await.map_err(refused)?;
             return Ok((At::InProcess, view));
         }
-        let body = serde_json::to_vec(&Submit::Run(job.clone())).expect("a job serialises");
-        let (agent, started) = self
-            .call(Call {
-                method: Method::POST,
-                path: "/v1/jobs".into(),
-                body,
-                to,
-                lineage: Some(lineage),
-                repo: Some(&job.repo),
-                toolchain: Some(&job.program),
-                push: false,
-            })
-            .await?;
-        let view = Self::view_of(&started)?;
+        let named = RunJob {
+            overlay: job.overlay.named(),
+            ..job.clone()
+        };
+        let (status, agent, body) = self.send_run(lineage, &named, to).await?;
+        let (status, agent, body) = match missing_of(status, &body) {
+            Some(missing) => {
+                let again = RunJob {
+                    overlay: match agent {
+                        Some(_) => job.overlay.carrying(&missing),
+                        None => job.overlay.clone(),
+                    },
+                    ..job.clone()
+                };
+                self.send_run(lineage, &again, agent.or(to)).await?
+            }
+            None => (status, agent, body),
+        };
+        if !status.is_success() {
+            return Err(refusal(status, &body));
+        }
+        let view = Self::view_of(&body)?;
         let agent = agent.ok_or_else(|| {
             AgentError::Transport("the gateway named no agent for the job".into())
         })?;
@@ -695,6 +723,36 @@ impl Agents {
             .refs()
             .map_err(|e| AgentError::Transport(e.0))
     }
+}
+
+/// What an agent's answer of `status` with `body` refuses.
+fn refusal(status: StatusCode, body: &[u8]) -> AgentError {
+    let why = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            let error = v.get("error")?.as_str()?.to_string();
+            let message = v.get("message").and_then(|m| m.as_str());
+            Some(message.map_or(error.clone(), |m| format!("{error}: {m}")))
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    if status == StatusCode::SERVICE_UNAVAILABLE && why.starts_with("no_agent") {
+        return AgentError::NoAgent(why);
+    }
+    AgentError::Refused {
+        status: status.as_u16(),
+        why,
+    }
+}
+
+/// The digests an agent's `409` says it lacks; `None` for any other answer.
+fn missing_of(status: StatusCode, body: &[u8]) -> Option<Vec<String>> {
+    if status != StatusCode::CONFLICT {
+        return None;
+    }
+    serde_json::from_slice::<Missing>(body)
+        .ok()
+        .filter(|m| m.error == MISSING)
+        .map(|m| m.missing)
 }
 
 fn refused(e: JobError) -> AgentError {

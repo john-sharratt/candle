@@ -5,7 +5,10 @@
 //! - **`run`** — `{ repo, branch, overlay, program, args, timeout_secs }`: run
 //!   `program` on the checkout, on `branch` at the base the overlay names,
 //!   with the overlay's changes laid down. `overlay` is the conversation's or
-//!   operation's store [`Snapshot`], its base included.
+//!   operation's store [`Snapshot`](zend_vfs::Snapshot), its base included, each changed path's
+//!   chain named by its digest ([`Overlay`]); an agent that lacks a chain
+//!   answers `409` with the digests it lacks, and the job is sent again
+//!   carrying them.
 //! - **`push`** — `{ repo, bundle, specs }`: take the bundle's objects — what
 //!   the member built that origin lacks — and push `specs` to origin in one
 //!   atomic push, each under its lease. The member builds commits and merges
@@ -30,8 +33,10 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use zend_vfs::{
     BranchName, FetchBundle, JobStatus, Lease, Oid, PushAction, PushOutcome, PushResult, PushSpec,
-    PushTarget, RefName, RemoteRefs, RunOutcome, Snapshot,
+    PushTarget, RefName, RemoteRefs, RunOutcome,
 };
+
+use crate::overlay::Overlay;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "job", rename_all = "snake_case", deny_unknown_fields)]
@@ -183,7 +188,7 @@ impl Fetched {
 pub struct RunJob {
     pub repo: String,
     pub branch: String,
-    pub overlay: Snapshot,
+    pub overlay: Overlay,
     pub program: String,
     pub args: Vec<String>,
     pub timeout_secs: u64,
@@ -511,7 +516,7 @@ mod tests {
         let run = Submit::Run(RunJob {
             repo: "candle".into(),
             branch: "zen/x".into(),
-            overlay: Snapshot::new(None, BTreeMap::new()),
+            overlay: Overlay::default(),
             program: "cargo".into(),
             args: vec!["test".into()],
             timeout_secs: 600,
@@ -528,7 +533,7 @@ mod tests {
         let staging = Submit::Run(RunJob {
             repo: "candle".into(),
             branch: "main".into(),
-            overlay: Snapshot::new(None, BTreeMap::new()),
+            overlay: Overlay::default(),
             program: "cargo".into(),
             args: vec!["build".into()],
             timeout_secs: 600,

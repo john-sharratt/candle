@@ -16,7 +16,9 @@
 //! A job carrying [`LINEAGE_HEADER`] claims that lineage for this agent, so
 //! the next job of the conversation comes back here while the claim lasts
 //! (§11.3). A job sent to an agent switched off is answered `503` `no_agent`,
-//! as the gateway answers a job no agent can take.
+//! as the gateway answers a job no agent can take. A run whose overlay names
+//! chains the agent does not hold is answered `409` with their digests
+//! ([`Missing`]).
 //!
 //! [`AgentJobs`]: crate::wire::AgentJobs
 //! [`LogChunk`]: crate::wire::LogChunk
@@ -46,6 +48,7 @@ use tokio::sync::Mutex;
 use cluster::log_read::LogAsk;
 
 use crate::jobs::{JobError, Jobs};
+use crate::overlay::Missing;
 use crate::wire::{BridgeCall, Bridged, Submit, Switching};
 
 /// Set on every request that arrived over the agent's socket.
@@ -130,6 +133,9 @@ fn failed(e: JobError) -> Response {
                 Json(json!({ "error": "no_agent", "message": e.to_string() })),
             )
                 .into_response()
+        }
+        JobError::Missing(missing) => {
+            return (StatusCode::CONFLICT, Json(Missing::of(missing.clone()))).into_response()
         }
         JobError::Bad(_) => StatusCode::BAD_REQUEST,
     };

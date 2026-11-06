@@ -31,12 +31,13 @@ use tokio::task::{spawn_blocking, AbortHandle};
 use tokio::time::timeout;
 use zend_vfs::{
     BranchName, DiskWriteGrant, FetchBundle, FetchSpec, JobId, JobRequest, JobStatus, Oid,
-    Priority, RemoteName, Rev, RunOutcome, SandboxCommand, StartedJob, VfsStore, ORIGIN,
+    Priority, RemoteName, Rev, RunOutcome, SandboxCommand, Snapshot, StartedJob, VfsStore, ORIGIN,
 };
 
 use cluster::disk::volume_of;
 use cluster::log_read::{self, LogAsk, LogRead};
 
+use crate::chains::{Chains, Unresolved};
 use crate::checkouts::{Checkout, Checkouts};
 use crate::sweep::{sweep, Bars, Target};
 use crate::switch::Switch;
@@ -67,6 +68,10 @@ pub enum JobError {
     Disabled,
     #[error("this agent is offline: origin is not reached until the host is `online` again")]
     Offline,
+    /// The chains a run's overlay names that this agent does not hold, by
+    /// digest: send the run again carrying them.
+    #[error("this agent lacks {} of the overlay's chains", .0.len())]
+    Missing(Vec<String>),
     #[error("{0}")]
     Bad(String),
 }
@@ -136,6 +141,9 @@ pub struct Jobs {
     table: Mutex<Table>,
     /// When each repository's origin was last fetched into its checkout.
     fetched: Mutex<HashMap<String, Instant>>,
+    /// The chains runs' overlays have carried, which a later run names
+    /// instead of carrying.
+    chains: Mutex<Chains>,
 }
 
 /// How recent a fetch of origin a slice past a run's first answers from: a
@@ -238,6 +246,7 @@ impl Jobs {
             running: AtomicU32::new(0),
             table: Mutex::new((HashMap::new(), VecDeque::new())),
             fetched: Mutex::new(HashMap::new()),
+            chains: Mutex::new(Chains::default()),
         })
     }
 
@@ -467,7 +476,9 @@ impl Jobs {
     /// Accept `run` and answer at once, in [`Phase::Fetching`]: everything
     /// that can take time — fetching origin, building its store, waiting for
     /// the checkout — happens in the job's own task, so a caller has the id
-    /// in the time it takes to check the request.
+    /// in the time it takes to check the request. A run whose overlay names a
+    /// chain this agent neither holds nor was sent is refused
+    /// [`JobError::Missing`], before anything is kept.
     async fn run(self: &Arc<Self>, run: RunJob) -> Result<JobView, JobError> {
         self.checkout(&run.repo)?;
         let branch = BranchName::parse(&run.branch).map_err(|e| JobError::Bad(e.to_string()))?;
@@ -475,6 +486,17 @@ impl Jobs {
             Some(rel) => Some(stage_path(rel, self.checkouts.stage_dir())?),
             None => None,
         };
+        let overlay = self
+            .chains
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve(&run.overlay)
+            .map_err(|u| match u {
+                Unresolved::Missing(m) => JobError::Missing(m),
+                Unresolved::Misnamed(d) => {
+                    JobError::Bad(format!("the overlay's chain {d} is not the chain it names"))
+                }
+            })?;
         let line = Line {
             branch: Some(run.branch.clone()),
             command: [run.program.clone()]
@@ -494,7 +516,7 @@ impl Jobs {
             // Held while the job is kept: its task records how far it got
             // only once it is in the table.
             let mut t = self.table();
-            let task = tokio::spawn(async move { jobs.carry(&job, run, branch).await });
+            let task = tokio::spawn(async move { jobs.carry(&job, run, overlay, branch).await });
             keep_in(
                 &mut t,
                 id.clone(),
@@ -517,8 +539,8 @@ impl Jobs {
 
     /// Run job `id` from its fetch to its end: fetch origin, start its
     /// sandbox job, wait for it, and stage what it built.
-    async fn carry(self: Arc<Self>, id: &str, run: RunJob, branch: BranchName) {
-        let handle = match self.start(run, branch).await {
+    async fn carry(self: Arc<Self>, id: &str, run: RunJob, overlay: Snapshot, branch: BranchName) {
+        let handle = match self.start(run, overlay, branch).await {
             Ok(started) => {
                 self.set_prep(id, Prep::Started(started.id));
                 started.handle
@@ -537,10 +559,12 @@ impl Jobs {
         self.finished(id, outcome, staged);
     }
 
-    /// Fetch origin for `run` and start it in its checkout's sandbox.
+    /// Fetch origin for `run` and start it in its checkout's sandbox, with
+    /// `overlay` laid down.
     async fn start(
         self: &Arc<Self>,
         run: RunJob,
+        overlay: Snapshot,
         branch: BranchName,
     ) -> Result<StartedJob, JobError> {
         self.fetch(&run.repo).await?;
@@ -548,7 +572,7 @@ impl Jobs {
         let c = self.checkout(&run.repo)?;
         let store = VfsStore::on_branch(Arc::clone(&c.source), Rev::Branch(branch.clone()));
         store
-            .restore(run.overlay)
+            .restore(overlay)
             .map_err(|e| JobError::Bad(format!("the overlay: {e}")))?;
         let command = SandboxCommand::new(run.program)
             .args(run.args)

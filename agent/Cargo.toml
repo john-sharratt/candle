@@ -33,6 +33,8 @@ rand         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 serde_yaml   = "0.9"
+# A run's overlay names each changed path's chain by its digest (`src/overlay.rs`).
+sha2         = "0.10"
 # The disk sweep's prune (`src/sweep`): the generations `cargo prune` removes.
 target-prune = { path = "../target-prune" }
 thiserror    = { workspace = true }

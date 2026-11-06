@@ -1028,9 +1028,12 @@ each motherd at low priority (`motherd/motherd.yaml`, `motherd/agent.yaml`).
 
 - **A run job** is `{repo, branch, overlay, program, args, timeout_secs,
   stage}`: a program with arguments, not a shell line, limited by the sandbox
-  allow-list (`agent/src/wire.rs`). `repo_job_start` sends an empty overlay, so the
-  job runs on the branch as the agent fetches it from origin, and refuses a
-  shell word (`&&`, `|`, `;`, a redirect) before anything is sent.
+  allow-list (`agent/src/wire.rs`). From Claude, `repo_job_start` sends an
+  empty overlay, so the job runs on the branch as the agent fetches it from
+  origin; from a task, the task's uncommitted changes, each file's chain by
+  name and sent only when the agent lacks it (`docs/replicated_substrate.md`
+  §11.4). It refuses a shell word (`&&`, `|`, `;`, a redirect) before
+  anything is sent.
 - **Started over the member's own agent stream**, in process: the tool calls
   `Agents::submit` (`agent/src/client.rs`). The agent registers the job and
   answers before it fetches origin; the fetch, the wait for the checkout and

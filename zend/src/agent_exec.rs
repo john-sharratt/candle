@@ -2,7 +2,8 @@
 //! §11.5): the [`Executor`] of a daemon given `--cluster`.
 //!
 //! A command goes to an agent with the conversation's store as its overlay —
-//! its branch, the base it pinned, its uncommitted changes. What the command
+//! its branch, the base it pinned, its uncommitted changes, each file's chain
+//! named by its digest and sent only when the agent lacks it. What the command
 //! changed comes back as deltas, and this daemon records them in the
 //! conversation's store exactly as its own sandbox would: those the store
 //! takes are the conversation's changes, the rest are reported not kept. The
@@ -19,6 +20,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use agent::client::{AgentError, Agents, JobWatch, Ran as AgentRan};
+use agent::overlay::Overlay;
 use agent::pusher::AgentPush;
 use agent::wire::RunJob;
 use tokio::runtime::Handle;
@@ -119,7 +121,7 @@ impl Executor for AgentExecutor {
         let job = RunJob {
             repo: repo.to_string(),
             branch: request.branch.to_string(),
-            overlay: request.files.snapshot(),
+            overlay: Overlay::of(&request.files.snapshot()),
             program: request.command.program.clone(),
             args: request.command.args.clone(),
             timeout_secs: request.command.timeout.as_secs(),
