@@ -1734,6 +1734,29 @@ impl Scheduler {
                         }
                     }
                     None => {
+                        // An end token with a tail bound does not end the turn:
+                        // it is dropped, and the tail writes in its place and
+                        // ends the turn itself — once. A replayed turn plays
+                        // what its recording holds, the tail's text included.
+                        let tail = match self.eos_tokens.contains(&token)
+                            && state.recorded_reply.is_none()
+                        {
+                            true => state.triggers.tail_driver(),
+                            false => None,
+                        };
+                        if let Some(driver) = tail {
+                            state.triggers = Arc::new(state.triggers.without_tail());
+                            tracing::debug!(
+                                target: "candle_conversation::stencil",
+                                seq_id = seq_id.0,
+                                tree = driver.tree().label(),
+                                "the answer's end handed over to its tail",
+                            );
+                            dropped[i] = true;
+                            state.pending_mask = None;
+                            state.stencil = Some(driver);
+                            continue;
+                        }
                         // Held as a turn that has reasoned for as long as this
                         // one's block ran: what the first `</think>` closed.
                         let reasoned = state.think_close_at.unwrap_or(0);

@@ -19,12 +19,16 @@
 //! **In prose, an edit writes the part it names and nothing already there**
 //! ([`copies_a_part`]). A Maker replaced one paragraph of a story with the whole
 //! story, heading and all, again and again: each edit pasted every other
-//! paragraph back in, until each sentence stood eight times.
+//! paragraph back in, until each sentence stood eight times. **With `old`, the
+//! new words do not retype what stands around them** ([`retyped`]).
+
+mod retyped;
 
 use std::collections::HashSet;
 use std::fmt;
 
 use crate::Doc;
+use retyped::retyped;
 
 /// Where an insert or a move puts its text, beside the unit it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,6 +547,9 @@ fn replace_within(
                 "`old` occurs {n} times in {at}; give more of the words around the one to change"
             )))
         }
+    }
+    if let Some(why) = retyped(&unit, &old, &new) {
+        return Err(EditError::Invalid(why));
     }
     let changed = unit.replacen(old.as_str(), new.as_str(), 1);
     let u = &doc.units()[i];

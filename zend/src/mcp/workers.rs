@@ -256,6 +256,13 @@ pub fn start(
             "the task could not be given its starter's work: {e}"
         ));
     }
+    // Its answer ends in a `Steps:` section of them, written by the grammar.
+    let given = steps::of(prompt);
+    if given.len() >= 2 {
+        if let Some(Err(e)) = session.answer_steps(&worker.conv_id, &given) {
+            return Err(format!("the task's steps could not be recorded: {e}"));
+        }
+    }
     let started = if by_task {
         "A task started:"
     } else {

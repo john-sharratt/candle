@@ -99,6 +99,7 @@ use crate::code_read::{FILE_READ_TOOL, PATH_KEY};
 use crate::coding_sampling;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
+use crate::answer_steps;
 use crate::conv_inherit;
 use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
@@ -4588,13 +4589,17 @@ fn run_inference_stream(
                 round_selection.note_summary(SectionId::reserved(summary), withheld.lines.clone());
             }
             // The round's calls to the files it has read or edited are held to
-            // what those files hold now (`docs/stencil_tree.md` §9.2). Reading
-            // them and building the rules is blocking work.
+            // what those files hold now (`docs/stencil_tree.md` §9.2), and a
+            // task's answer ends in the `Steps:` section of the steps it was
+            // given (`answer_steps`). Reading the files and building the
+            // grammar is blocking work.
             let base = round_triggers(&state, think_mode, tools_mode, &withheld);
             let (hold_state, seen, held_files) =
                 (Arc::clone(&state), cs.seen.clone(), Arc::clone(&cs.files));
             let triggers = match tokio::task::spawn_blocking(move || {
-                seen.triggers(&hold_state.engine, &base, &held_files)
+                let engine = &hold_state.engine;
+                let held = seen.triggers(engine, &base, &held_files);
+                engine.ending_with_steps(&held, &answer_steps::of(engine, timeline))
             })
             .await
             {
@@ -6862,6 +6867,17 @@ impl ZendSession {
             &state.engine,
             conversation_timeline(conv_id),
             starter,
+        ))
+    }
+
+    /// Record `steps` as what the conversation `conv_id`'s answers account
+    /// for ([`answer_steps`]). `None` while the model is not loaded.
+    pub fn answer_steps(&self, conv_id: &str, steps: &[String]) -> Option<EngineResult<()>> {
+        let state = self.loaded()?;
+        Some(answer_steps::mark(
+            &state.engine,
+            conversation_timeline(conv_id),
+            steps,
         ))
     }
 

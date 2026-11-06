@@ -779,6 +779,21 @@ was carved from, and a value set's rule is taken from the last round's
 current round used, so neither grows past one round's files. A file the store
 cannot read is held to nothing, and logged.
 
+### 9.3 A tail: what an answer's end hands over to
+
+A trigger starts a walk on a token the model writes. A **tail** starts one on
+the token that would end the turn (`TriggerRegistry::with_tail`). An end token
+sampled in free decode, with a tail bound, is dropped, not committed, and the
+tail's walk writes in its place. The tail's own last static is the turn's
+close, so the turn ends inside the stencil. A tail fires once, and never on a
+replayed turn, whose recording already holds what it wrote.
+
+A task's `Steps:` section is the tail (`stencil/answer_steps.rs`). It writes
+the heading and, for each step, `N. <its words> — `. Each line is held to
+`done`, `not done` or `could not`, then `: ` and the model's own line, which
+ends at its newline. A section the model was only asked to write was left out
+of 3 answers in 8 (`docs/zen_coding_challenge_fixes.md` Cause 3).
+
 ---
 
 ## 10. Scheduler integration

@@ -29,6 +29,7 @@
 //! [`next_action`]: StencilSession::next_action
 //! [`observe`]: StencilSession::observe
 
+mod answer_steps;
 mod builder;
 mod call_so_far;
 mod compile;
@@ -73,6 +74,7 @@ mod sub_stencil_tests;
 #[cfg(test)]
 mod tests;
 
+pub use answer_steps::{compile_steps_tail, OUTCOMES, STEPS_TREE_LABEL};
 pub use builder::StencilTreeBuilder;
 pub use compile::compile;
 pub use driver::{Healed, PathStats, StencilDriver, StepMask};

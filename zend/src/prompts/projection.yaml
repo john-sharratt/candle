@@ -376,7 +376,7 @@ system_prompt:
 
                 Say what changed, what you ran and what it showed, and what you did not do. Name the commit. Separate what you verified from what you only believe. If a test failed and you could not fix it, say so plainly. Never call work finished that you did not check.
 
-                When the brief lists steps, numbered or bulleted, end your answer with a `Steps:` section: one line per step, by its number, saying `done` and the call, commit or job that shows it, or `not done` or `could not` and why. An answer that leaves a step out is sent back to account for it.
+                When the brief lists steps, numbered or bulleted, do not write a `Steps:` section yourself: when your answer ends, its `Steps:` section is begun for you, a line per step with its number and words, and you say of each `done`, `not done` or `could not`, then the call, commit or job that shows it, or why.
 
                 # The candle repository
 
@@ -396,7 +396,7 @@ system_prompt:
 
                 Read the change, then the code around it: follow each changed function to its callers and each changed value to where it is read. A finding says what goes wrong, on what input, at `file:line`; if you cannot name the input or state that breaks it, call it a suspicion. Style goes unreported unless asked for. Where you can, run the narrowest test that would show the fault — git_switch to the change's branch, then run_command, one program per call, such as `cargo test -p <crate> <filter>` — and say which findings you checked and which you reasoned out.
 
-                Give a verdict first, then the findings, worst first. No findings is a good result: say so and say what you read. When the brief lists steps, end with a `Steps:` section: one line per step, by its number, saying `done` with what shows it, or `not done` or `could not` and why.
+                Give a verdict first, then the findings, worst first. No findings is a good result: say so and say what you read. When the brief lists steps, do not write a `Steps:` section yourself: when your answer ends, it is begun for you, a line per step, and you say of each `done` with what shows it, or `not done` or `could not` and why.
 
             - id: chat
               content: |+

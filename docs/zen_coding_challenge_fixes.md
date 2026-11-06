@@ -15,10 +15,18 @@ departure is recorded here:
   are recorded together, as the engine counts them.
 - **Cause 3** is held on the answer, not on a journal field. A brief's
   numbered or bulleted lines are its steps (`zend/src/mcp/steps.rs`). An
-  answer to two or more steps ends with a `Steps:` section, and one that
-  leaves a step out is sent back once, in the citation check's send-back. The
-  coder and reviewer role documents ask for the section. That a `done` step
-  cites a call is asked, not verified.
+  answer to two or more steps ends with a `Steps:` section **written by the
+  grammar** (`candle-conversation/src/stencil/answer_steps.rs`). The task
+  records its steps on its conversation as it starts (metadata
+  `answer_steps`, `zend/src/answer_steps.rs`), and each round binds them as
+  the turn's *tail* (`TriggerRegistry::with_tail`). When the answer's end
+  token is sampled in free decode, it is dropped and the tail writes
+  `Steps:`, then each step's number and words. It holds each line to `done`,
+  `not done` or `could not` before the model's own line, and ends the turn.
+  Asked for the section in the role documents alone, a coder left it out of
+  3 answers in 8, each sent back for a whole extra round. The send-back of
+  an answer that leaves a step out stays, as the check of what the answer
+  says. That a `done` step cites a call is asked, not verified.
 - **Cause 4**'s line ranges are zend's `file_edit` (`part`, `from`, `to`,
   `through`). npcd's bench act keeps the whole-unit form under its turn
   grammar's path budget (`docs/npcd_anchored_edits.md` §6).

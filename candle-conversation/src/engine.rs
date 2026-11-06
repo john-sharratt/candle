@@ -28,7 +28,8 @@ use crate::projection::{
 use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
-    compile, compile_think_tree, compile_tool_call_loop, held_branches, held_branches_first,
+    compile, compile_steps_tail, compile_think_tree, compile_tool_call_loop, held_branches,
+    held_branches_first,
     HeldRules, HeldValues, HfVocab, StencilTree, ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId,
     ToolCallEnvelope, ToolSpec, TriggerRegistry, ValueHolds, MAX_TOOL_CALLS_PER_TURN,
 };
@@ -2221,6 +2222,29 @@ impl ConversationEngine {
             return Arc::clone(triggers);
         }
         Arc::new(triggers.holding_values(trigger, Arc::new(held)))
+    }
+
+    /// `triggers` with an answer that ends written on into its `Steps:`
+    /// section ([`compile_steps_tail`]): one line per step of `steps`, each
+    /// held to an outcome, and the turn closed by the grammar. Fewer than two
+    /// steps ask for no section, and `triggers` come back as they are, as
+    /// they do when the tree cannot be built (logged).
+    pub fn ending_with_steps(
+        &self,
+        triggers: &Arc<TriggerRegistry>,
+        steps: &[String],
+    ) -> Arc<TriggerRegistry> {
+        if steps.len() < 2 {
+            return Arc::clone(triggers);
+        }
+        let close_turn = ToolCallEnvelope::turn_close(&self.core.dialect);
+        match compile(&compile_steps_tail(steps, &close_turn), &self.vocab()) {
+            Ok(tree) => Arc::new(triggers.with_tail(Arc::new(tree))),
+            Err(e) => {
+                tracing::warn!("an answer's steps could not be built into its grammar: {e}");
+                Arc::clone(triggers)
+            }
+        }
     }
 
     /// Compile the thinking-block steering trees (one per effort dial, `Off`

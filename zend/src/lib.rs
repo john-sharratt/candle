@@ -15,6 +15,7 @@
 //! and shared wire types (`types`, `response_section`, `repo_ads`).
 pub mod access;
 pub mod agent_exec;
+pub mod answer_steps;
 pub mod api;
 pub mod branch_ingest;
 pub mod calibrate;
