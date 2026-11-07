@@ -9,7 +9,9 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use tokio::time::timeout;
 
 use cluster::consensus::rendezvous::Weighted;
 use cluster::frame::MemberState;
@@ -21,6 +23,11 @@ use crate::engine::event::{EventKind, Salience};
 use crate::engine::runtime::Runtime;
 use crate::engine::tick::Pace;
 use crate::world_state::place_of;
+
+/// How long a hand-back waits for the world's authority to answer before it is
+/// sent again. A request to a gateway carries no deadline of its own, and one
+/// whose answer never comes would otherwise hold its character for good.
+const HAND_BACK_DEADLINE: Duration = Duration::from_secs(30);
 
 impl Runtime {
     /// The npcd members ready now, weighted as rendezvous weighs them, and
@@ -125,9 +132,11 @@ impl Runtime {
                         self.put_down(npc);
                     }
                     let next = lease.is_some_and(|l| l.next.is_some());
-                    if mine && next && !handing && self.standing.begin_handing(npc) {
-                        self.hand_back(&world, npc);
-                    } else if !mine && handing {
+                    if mine && next {
+                        if self.standing.hand_back_due(npc) {
+                            self.hand_back(&world, npc);
+                        }
+                    } else if handing {
                         self.standing.end_handing(npc);
                     }
                     continue;
@@ -140,8 +149,8 @@ impl Runtime {
                     // woken, it was never handed back, and ran nowhere. The
                     // hand-back keeps every wait the lease names, so the next
                     // holder still waits for what this one never took in.
-                    (true, false) if moving && !handing => {
-                        if self.standing.begin_handing(npc) {
+                    (true, false) if moving => {
+                        if self.standing.hand_back_due(npc) {
                             self.hand_back(&world, npc);
                         }
                     }
@@ -171,9 +180,16 @@ impl Runtime {
                             self.hand_back(&world, npc);
                         }
                     }
-                    (true, true) if handing => self.standing.end_handing(npc),
-                    (false, true) if !handing => self.put_down(npc),
-                    (false, _) if handing => self.standing.end_handing(npc),
+                    (true, _) if handing => self.standing.end_handing(npc),
+                    // Lent elsewhere: put down before any hold on it is let
+                    // go, so it takes no turn here in between.
+                    (false, true) => {
+                        self.put_down(npc);
+                        if handing {
+                            self.standing.end_handing(npc);
+                        }
+                    }
+                    (false, false) if handing => self.standing.end_handing(npc),
                     _ => {}
                 }
             }
@@ -241,18 +257,28 @@ impl Runtime {
         let rt = Arc::clone(self);
         let world = world.to_string();
         handle.spawn(async move {
-            match rt
-                .world_write(&world, WorldOp::HandBack { npc, through })
-                .await
-            {
-                Ok(OpReply::Done { ok: true }) => rt.put_down(npc),
-                Ok(other) => {
+            let sent = timeout(
+                HAND_BACK_DEADLINE,
+                rt.world_write(&world, WorldOp::HandBack { npc, through }),
+            )
+            .await;
+            // Anything but a hand-back taken leaves the character held and
+            // sends it again on the next beat: the hold itself ends only when
+            // the lease moves it or stops asking it to — see
+            // `Standing::retry_hand_back`.
+            match sent {
+                Ok(Ok(OpReply::Done { ok: true })) => rt.put_down(npc),
+                Ok(Ok(other)) => {
                     tracing::warn!(npc, "a hand-back was not taken: {other:?}");
-                    rt.standing.end_handing(npc);
+                    rt.standing.retry_hand_back(npc);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!(npc, "a hand-back did not reach the world: {e:#}");
-                    rt.standing.end_handing(npc);
+                    rt.standing.retry_hand_back(npc);
+                }
+                Err(_) => {
+                    tracing::warn!(npc, "a hand-back was not answered in time");
+                    rt.standing.retry_hand_back(npc);
                 }
             }
         });

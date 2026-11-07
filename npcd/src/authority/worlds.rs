@@ -300,11 +300,6 @@ impl Standing {
         self.held.lock().unwrap().clone()
     }
 
-    /// Mark `npc` as being handed back; `false` if it already is.
-    pub fn begin_handing(&self, npc: u64) -> bool {
-        self.turns.lock().unwrap().handing.insert(npc)
-    }
-
     pub fn end_handing(&self, npc: u64) {
         let mut turns = self.turns.lock().unwrap();
         turns.handing.remove(&npc);
@@ -322,6 +317,16 @@ impl Standing {
         let mut turns = self.turns.lock().unwrap();
         turns.handing.insert(npc);
         !turns.turning.contains(&npc) && turns.returning.insert(npc)
+    }
+
+    /// A hand-back of `npc` that was not taken, or not answered in time: it
+    /// stays held, and the next beat sends it again. The hold ends when the
+    /// lease moves it ([`Self::end_handing`] once it is put down) or stops
+    /// asking it to move — never here, because the authority may have taken a
+    /// hand-back whose answer was lost, and a turn begun now would run a
+    /// character another member already runs.
+    pub fn retry_hand_back(&self, npc: u64) {
+        self.turns.lock().unwrap().returning.remove(&npc);
     }
 
     pub fn handing(&self, npc: u64) -> bool {
@@ -508,16 +513,17 @@ mod tests {
         assert!(w.begin_turn(1));
         assert!(w.turning(1));
         w.end_turn(1);
-        assert!(w.begin_handing(1));
-        assert!(!w.begin_handing(1), "once");
+        assert!(w.hand_back_due(1));
+        assert!(w.handing(1));
         assert!(!w.begin_turn(1));
         w.end_handing(1);
         assert!(w.begin_turn(1));
     }
 
     /// **A character asked to move mid-turn is held, and handed back when the
-    /// turn ends, once.** Held at once, it begins no further turn; a failed
-    /// hand-back lets it go on and try again.
+    /// turn ends, once.** Held at once, it begins no further turn. A hand-back
+    /// not taken, or not answered, keeps it held and is sent again; only the
+    /// hold's end lets it take a turn.
     #[test]
     fn a_character_asked_to_move_mid_turn_is_held_then_handed_back_once() {
         let w = Standing::new(true);
@@ -527,9 +533,10 @@ mod tests {
         assert!(!w.begin_turn(1), "held: it begins no further turn");
         assert!(w.hand_back_due(1), "its turn over, it is handed back");
         assert!(!w.hand_back_due(1), "once");
+        w.retry_hand_back(1);
+        assert!(!w.begin_turn(1), "still held while the move is unsettled");
+        assert!(w.hand_back_due(1), "and it is sent again");
         w.end_handing(1);
-        assert!(w.begin_turn(1), "a hand-back not taken lets it go on");
-        w.end_turn(1);
-        assert!(w.hand_back_due(1), "and it is tried again");
+        assert!(w.begin_turn(1), "the hold ended, it goes on");
     }
 }
