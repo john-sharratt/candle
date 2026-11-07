@@ -132,7 +132,10 @@ mod tests {
             anchor(Reading::File, "candle/zend/src/held_values.rs"),
             "file=candle/zend/src/held_values.rs"
         );
-        assert_eq!(anchor(Reading::Folder, "candle/zend/src"), "folder=candle/zend/src");
+        assert_eq!(
+            anchor(Reading::Folder, "candle/zend/src"),
+            "folder=candle/zend/src"
+        );
         assert_eq!(anchor(Reading::Folder, "candle"), "folder=candle");
     }
 }

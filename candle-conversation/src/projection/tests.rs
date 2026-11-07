@@ -192,7 +192,9 @@ impl ContentResolver for MockResolver {
     }
 
     fn face_of(&self, turn: TurnKey) -> Option<TurnKey> {
-        self.faces.get(&(Self::group_of(turn), turn.index.0)).copied()
+        self.faces
+            .get(&(Self::group_of(turn), turn.index.0))
+            .copied()
     }
 
     fn compounds_on(&self, group: GroupId) -> bool {
@@ -1095,8 +1097,14 @@ fn a_dialogue_holds_a_units_opening_by_its_face() {
     let proj = b.project(target, &resolver);
     let placed: Vec<Option<TurnKey>> = proj.sealed_turns().map(|t| t.key()).collect();
     assert!(placed.contains(&Some(face)), "{placed:?}");
-    assert!(!placed.contains(&Some(TurnKey::new(facts, TurnIndex(0)))), "{placed:?}");
-    assert!(placed.contains(&Some(TurnKey::new(facts, TurnIndex(1)))), "{placed:?}");
+    assert!(
+        !placed.contains(&Some(TurnKey::new(facts, TurnIndex(0)))),
+        "{placed:?}"
+    );
+    assert!(
+        placed.contains(&Some(TurnKey::new(facts, TurnIndex(1)))),
+        "{placed:?}"
+    );
 }
 
 /// **A unit being read projects its own opening** — the request it is
@@ -1108,7 +1116,10 @@ fn an_ingest_projection_holds_its_own_opening() {
     let proj = b.project(target, &resolver);
     let placed: Vec<Option<TurnKey>> = proj.sealed_turns().map(|t| t.key()).collect();
     assert!(!placed.contains(&Some(face)), "{placed:?}");
-    assert!(placed.contains(&Some(TurnKey::new(facts, TurnIndex(0)))), "{placed:?}");
+    assert!(
+        placed.contains(&Some(TurnKey::new(facts, TurnIndex(0)))),
+        "{placed:?}"
+    );
 }
 
 // —— Score threshold ———————————————————————————————————————————————————————————

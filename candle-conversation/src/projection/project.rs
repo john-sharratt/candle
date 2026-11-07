@@ -2247,9 +2247,7 @@ pub fn run_with_sink<R: ContentResolver>(
             // record; fall back to projector context if the
             // resolver doesn't track origins (e.g. test mocks). A face
             // reports the layer of the unit it stands for.
-            let origin_layer = resolver
-                .turn_origin(selected)
-                .unwrap_or(layer_id_for_walk);
+            let origin_layer = resolver.turn_origin(selected).unwrap_or(layer_id_for_walk);
             turns.push(ResolvedTurn {
                 id: TurnId {
                     layer_id: origin_layer,
