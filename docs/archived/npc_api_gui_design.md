@@ -569,8 +569,8 @@ defend against anyone with server access. The UI therefore says "hidden" and nev
   /v1/npc/{id}                                get, patch, delete
   /v1/npc/{id}/tags                           set tags
   /v1/npc/{id}/hidden                         toggle hidden
-  /v1/npc/{id}/freeze                         freeze / unfreeze one: no turn of any kind
-  /v1/npcs/freeze                             freeze / unfreeze every one the caller manages
+  /v1/npc/{id}/suspend                        suspend / resume one: no turn of any kind
+  /v1/npcs/suspend                            suspend / resume every one the caller manages
   /v1/npc/{id}/perceive                       batched perception ingest
   /v1/npc/{id}/relationships[/{entity}]       authoring plane
   /v1/npc/{id}/beliefs[/{belief}]             authoring plane
@@ -825,26 +825,41 @@ would have to send a whole character to add one tag. A route that wrote its own 
 a second answer to "what may a tag be".
 
 ```
-POST   /v1/npc/{id}/freeze   { "frozen": true }   → 200 { Npc }   (its "frozen" field set)
-POST   /v1/npcs/freeze       { "frozen": true }   → 200 { "frozen": true, "changed": 3 }
+POST   /v1/npc/{id}/suspend   { "suspended": true }   → 200 { Npc }   (its "state" now "suspended")
+POST   /v1/npcs/suspend       { "suspended": true }   → 200 { "suspended": true, "changed": 3 }
 ```
 
-**A frozen character takes no turn of any kind** until it is unfrozen: the scheduler never makes
-it due, the guardian does not scan it, and nothing it would think, reflect, dream or draft is
-decoded — which is how an operator takes the whole cast's load off the card for other work.
-Everything that reaches it meanwhile (a message, a thought, an interaction line, what its world
-does around it) waits in its inbox and is read on the first turn after the thaw. The routes that
-decode for a character directly — `ask`, `reflect`, `dream`, `journal/draft` — refuse a frozen
-one with `409 npc_frozen`.
+**`state: "suspended"` is the one state that changes how a character runs**: a suspended
+character takes no turn of any kind until it is resumed. The scheduler never makes it due, the
+guardian does not scan it, and nothing it would think, reflect, dream or draft is decoded — which
+is how an operator takes the whole cast's load off the card for other work. The routes that decode
+for a character directly — `ask`, `reflect`, `dream`, `journal/draft` — refuse a suspended one with
+`409 npc_suspended`. Every other state (`active`, `idle`, `asleep`) is its owner's word for it and
+changes nothing. A turn already decoding when it is suspended finishes.
 
-The state is a field on the character's record (`frozen`, written only while true), so it
-survives a restart and replicates to every member like any other edit; the member that writes it
-holds its own scheduler at once, and every other member as the record arrives. It is operational,
-not authored: no `revision` bump and no `updated_ms`, so freezing the cast does not reorder a
-roster sorted by recent edits. `/v1/npc/{id}/freeze` is its owner's or any admin's (a stranger's
-character is a `404`, as on every write); `/v1/npcs/freeze` reaches the caller's own cast, or the
-whole cast for an admin, and `changed` counts only the characters that were not already so.
-`{ Npc }` and every listing row carry `"frozen": bool`.
+Everything that reaches it meanwhile (a message, a thought, an interaction line, what its world
+does around it) waits in its inbox, and nothing is dropped. The first turn after the resume reads
+the newest 20 of each source — one thread, one speaker, one thing watched, the world around it —
+and one counted line where the rest stood: "While you were suspended, 214 more messages on
+#general." An arrival that only restates a standing fact (a situation, an unread count) keeps its
+newest alone. Its round mission's hour stands still while it is suspended and picks up where it
+stood on the resume, so a character held past the hour is not called off for it. A lease may still
+move it: a hand-back takes no turn, and the member it lands on holds it suspended from its first
+moment, so a member's drain never waits on a character doing nothing.
+
+The state is the character's record, so it survives a restart and replicates to every member like
+any other edit; the member that writes it holds its own scheduler at once, and every other member
+as the record arrives. The two routes differ in who owns the answer:
+
+- **One character** (`/v1/npc/{id}/suspend`) is its owner's, or any admin's, Suspend / Resume — an
+  edit with its `revision`. Resuming puts back the state a suspension of the whole cast found it in,
+  or `idle`. A stranger's character is a `404`, as on every write. A `PATCH` of `state` is the same
+  act and clears what the cast's suspension kept.
+- **The whole cast** (`/v1/npcs/suspend`) reaches the caller's own characters, or every one for an
+  admin. Suspending keeps each one's state as `suspended_from` on its record; resuming puts back
+  exactly those and leaves a character suspended any other way suspended. It is operational, not
+  authored: no `revision` bump and no `updated_ms`, so suspending the cast does not reorder a roster
+  sorted by recent edits. `changed` counts only the characters it moved.
 
 **Every write appends.** One record keyed by `npc_id`, newest wins on replay — an implicit
 tombstone, with no delete record to write and none to replay. So an edit does not mutate a
@@ -2784,9 +2799,11 @@ characters have faces and the collection grows past a screenful.
 
 Live-updated over `/ws/events`; no polling.
 
-Each row carries a **Freeze / Unfreeze** button and, while frozen, a `frozen` chip beside its
-name; the header carries **Freeze all** and **Unfreeze all** beside `[+ New NPC]`, which call
-`/v1/npcs/freeze` — the caller's own cast, or the whole cast for an admin — and re-list (§11).
+Each row carries a **Suspend / Resume** button and, while suspended, a `suspended` chip beside its
+name, both swapped in place as its state changes on any member; the header carries **Suspend all**
+and **Resume all** beside `[+ New NPC]`, which call `/v1/npcs/suspend` — the caller's own cast, or
+the whole cast for an admin — and re-list (§11). The character page's Danger zone carries the same
+Suspend / Resume for the one character.
 
 ## 28. Tag filtering, and how hidden characters surface
 

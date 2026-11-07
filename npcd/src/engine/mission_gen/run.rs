@@ -792,12 +792,16 @@ pub fn spawn(rt: Arc<Runtime>) {
                     Ok(items) => {
                         told_round.remove(&id);
                         let settles = rt.standing.role(&id).is_authority();
+                        // A suspended character's round mission is held, so
+                        // the hour it is given runs only while it can work.
+                        let suspended = rt.suspended_bodies(&id);
                         let closed = hosted.with_sim(|s| {
                             s.missions.set_round(items);
                             if !settles {
                                 return Vec::new();
                             }
                             let now = now_ms();
+                            s.missions.hold_round(&suspended, now);
                             let closed = s.missions.settle_agendas(now);
                             s.missions.stamp_round(now);
                             closed

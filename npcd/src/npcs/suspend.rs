@@ -1,18 +1,18 @@
-//! Freezing characters: setting and clearing [`SUSPENDED`], the one state that
-//! stops a character taking turns of any kind.
+//! Suspending characters: setting and clearing [`SUSPENDED`], the one state
+//! that stops a character taking turns of any kind.
 //!
 //! Two ways in, with different owners of the answer:
 //!
-//! - **One character** ([`Npcs::freeze`]) is its owner's Suspend / Resume:
-//!   suspended, or put back to the state a freeze of the whole cast found it in
-//!   — `idle` when none did. An edit like any other, with its revision.
-//! - **The whole cast** ([`Npcs::freeze_all`]) suspends every character the
+//! - **One character** ([`Npcs::suspend`]) is its owner's Suspend / Resume:
+//!   suspended, or put back to the state a suspension of the whole cast found
+//!   it in — `idle` when none did. An edit like any other, with its revision.
+//! - **The whole cast** ([`Npcs::suspend_all`]) suspends every character the
 //!   manager may manage, keeping the state each was in as
-//!   [`NpcPayload::suspended_from`], and its thaw puts back exactly those it
-//!   suspended. A character suspended any other way has no `suspended_from`, so
-//!   the thaw leaves it suspended. Operational rather than authored, for the
-//!   reason a mood is: no revision and no `updated_ms`, so a roster sorted by
-//!   "recently edited" does not jump every time somebody frees the card.
+//!   [`NpcPayload::suspended_from`], and resuming it puts back exactly those it
+//!   suspended. A character suspended any other way has no `suspended_from`,
+//!   so it stays suspended. Operational rather than authored, for the reason a
+//!   mood is: no revision and no `updated_ms`, so a roster sorted by "recently
+//!   edited" does not jump every time somebody frees the card.
 //!
 //! Every write is a superseding record, so it is durable before it is
 //! published, survives a restart, and replicates to every member.
@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use super::{bumped, one, wire, NpcError, Npcs, INITIAL_STATE, SUSPENDED};
 
-/// Who is freezing, and so which characters they may freeze.
+/// Who is suspending, and so which characters they may suspend.
 #[derive(Clone, Copy, Debug)]
 pub enum Manager<'a> {
     /// An account, which manages the characters it owns. Holds its public id.
@@ -42,8 +42,8 @@ impl Manager<'_> {
         }
     }
 
-    /// Whether this manager may freeze `npc`. A tombstoned character is
-    /// nobody's to freeze.
+    /// Whether this manager may suspend `npc`. A tombstoned character is
+    /// nobody's to suspend.
     fn manages(&self, npc: &NpcPayload) -> bool {
         if npc.is_tombstoned() {
             return false;
@@ -59,14 +59,15 @@ impl Npcs {
     /// Suspend one character, or resume it, and answer with it as it now
     /// stands.
     ///
-    /// Resuming puts it back to the state a freeze of the whole cast found it
-    /// in, or `idle`. A character the manager may not manage reads as absent,
-    /// as every other write's does; setting what is already set writes nothing.
-    pub fn freeze(
+    /// Resuming puts it back to the state a suspension of the whole cast found
+    /// it in, or `idle`. A character the manager may not manage reads as
+    /// absent, as every other write's does; setting what is already set writes
+    /// nothing.
+    pub fn suspend(
         &self,
         npc_id: u64,
         by: Manager<'_>,
-        frozen: bool,
+        suspended: bool,
         now_ms: u64,
     ) -> Result<Value, NpcError> {
         self.write(|cast| {
@@ -75,11 +76,11 @@ impl Npcs {
                 .get(&npc_id)
                 .filter(|n| by.manages(n))
                 .ok_or(NpcError::NotFound)?;
-            if (npc.state == SUSPENDED) == frozen {
+            if (npc.state == SUSPENDED) == suspended {
                 return Ok((Vec::new(), wire(npc, by.caller())));
             }
             let mut npc = npc.clone();
-            npc.state = match frozen {
+            npc.state = match suspended {
                 true => SUSPENDED.to_string(),
                 false => npc
                     .suspended_from
@@ -92,13 +93,13 @@ impl Npcs {
     }
 
     /// Suspend every character the manager may manage, or resume every one a
-    /// freeze of the whole cast suspended, in one write behind one fsync.
+    /// suspension of the whole cast suspended, in one write behind one fsync.
     /// Returns how many changed.
     ///
-    /// Freezing keeps each character's state as `suspended_from` and passes
-    /// over one already suspended, which keeps none; thawing restores the state
-    /// kept and passes over a suspended character with none kept.
-    pub fn freeze_all(&self, by: Manager<'_>, frozen: bool) -> Result<usize, NpcError> {
+    /// Suspending keeps each character's state as `suspended_from` and passes
+    /// over one already suspended, which keeps none; resuming restores the
+    /// state kept and passes over a suspended character with none kept.
+    pub fn suspend_all(&self, by: Manager<'_>, suspended: bool) -> Result<usize, NpcError> {
         self.write(|cast| {
             let changed: Vec<NpcPayload> = cast
                 .by_id
@@ -106,7 +107,7 @@ impl Npcs {
                 .filter(|n| by.manages(n))
                 .filter_map(|n| {
                     let mut n = n.clone();
-                    match (frozen, n.state == SUSPENDED) {
+                    match (suspended, n.state == SUSPENDED) {
                         (true, false) => {
                             n.suspended_from =
                                 Some(mem::replace(&mut n.state, SUSPENDED.to_string()));
@@ -142,7 +143,7 @@ mod tests {
     fn tmp() -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "npcd-freeze-{}-{}",
+            "npcd-suspend-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
@@ -180,78 +181,76 @@ mod tests {
         (state.to_string(), from.map(str::to_string))
     }
 
-    /// **One character's freeze is its owner's Suspend / Resume**: suspended
-    /// with nothing kept, resumed to `idle`, each an edit with its revision,
-    /// and both survive a restart.
+    /// **One character's suspension is its owner's Suspend / Resume**:
+    /// suspended with nothing kept, resumed to `idle`, each an edit with its
+    /// revision, and both survive a restart.
     #[test]
-    fn one_characters_freeze_is_suspend_and_resume() {
+    fn one_characters_suspension_is_suspend_and_resume() {
         let dir = tmp();
         let varek = {
             let n = Npcs::load(&dir).unwrap();
             let varek = create(&n, ME, "Varek", 1_000);
             n.patch(varek, ME, &json!({ "state": "active" }), 1_500)
                 .unwrap();
-            let v = n.freeze(varek, Manager::Owner(ME), true, 2_000).unwrap();
+            let v = n.suspend(varek, Manager::Owner(ME), true, 2_000).unwrap();
             assert_eq!(v["state"], "suspended");
-            assert_eq!(v["frozen"], true);
             assert_eq!(v["revision"], 3);
             assert_eq!(v["updated_ms"], 2_000);
             assert_eq!(standing(&n, varek), st("suspended", None));
-            assert_eq!(n.view().frozen(), HashSet::from([varek]));
+            assert_eq!(n.view().suspended(), HashSet::from([varek]));
             varek
         };
 
         let n = Npcs::load(&dir).unwrap();
         assert_eq!(standing(&n, varek), st("suspended", None));
-        let v = n.freeze(varek, Manager::Owner(ME), false, 3_000).unwrap();
+        let v = n.suspend(varek, Manager::Owner(ME), false, 3_000).unwrap();
         assert_eq!(v["state"], "idle");
-        assert_eq!(v["frozen"], false);
         drop(n);
         let n = Npcs::load(&dir).unwrap();
         assert_eq!(standing(&n, varek), st("idle", None));
-        assert!(n.view().frozen().is_empty());
+        assert!(n.view().suspended().is_empty());
     }
 
     /// Setting what is already set writes no record at all.
     #[test]
-    fn freezing_a_frozen_character_writes_nothing() {
+    fn suspending_a_suspended_character_writes_nothing() {
         let n = Npcs::load(&tmp()).unwrap();
         let id = create(&n, ME, "Varek", 1_000);
-        n.freeze(id, Manager::Owner(ME), true, 2_000).unwrap();
+        n.suspend(id, Manager::Owner(ME), true, 2_000).unwrap();
         let identity = n.view().read_as.get(&id).copied();
-        let v = n.freeze(id, Manager::Owner(ME), true, 3_000).unwrap();
+        let v = n.suspend(id, Manager::Owner(ME), true, 3_000).unwrap();
         assert_eq!(v["updated_ms"], 2_000);
         assert_eq!(n.view().read_as.get(&id).copied(), identity);
     }
 
-    /// **An owner freezes their own, and an admin freezes anybody's.** A
-    /// stranger's character reads as absent to an owner, as every write's does.
+    /// **An owner suspends their own, and an admin anybody's.** A stranger's
+    /// character reads as absent to an owner, as every write's does.
     #[test]
-    fn an_owner_freezes_their_own_and_an_admin_anybodys() {
+    fn an_owner_suspends_their_own_and_an_admin_anybodys() {
         let n = Npcs::load(&tmp()).unwrap();
         let mine = create(&n, ME, "Varek", 1_000);
         let theirs = create(&n, OTHER, "Ilse", 1_001);
 
         assert!(matches!(
-            n.freeze(theirs, Manager::Owner(ME), true, 2_000),
+            n.suspend(theirs, Manager::Owner(ME), true, 2_000),
             Err(NpcError::NotFound)
         ));
-        assert!(n.view().frozen().is_empty());
+        assert!(n.view().suspended().is_empty());
 
         let v = n
-            .freeze(theirs, Manager::Admin(ADMIN), true, 2_000)
+            .suspend(theirs, Manager::Admin(ADMIN), true, 2_000)
             .unwrap();
         assert_eq!(v["state"], "suspended");
         assert_eq!(v["access"], "viewer");
-        n.freeze(mine, Manager::Owner(ME), true, 2_000).unwrap();
-        assert_eq!(n.view().frozen(), HashSet::from([mine, theirs]));
+        n.suspend(mine, Manager::Owner(ME), true, 2_000).unwrap();
+        assert_eq!(n.view().suspended(), HashSet::from([mine, theirs]));
     }
 
-    /// **A freeze of the whole cast and its thaw put each character back in
+    /// **Suspending the whole cast and resuming it put each character back in
     /// the state it was in**: an active one active, an idle one idle — neither
     /// an edit — across a restart between the two.
     #[test]
-    fn a_cast_freeze_and_thaw_return_each_character_to_its_state() {
+    fn a_cast_suspension_returns_each_character_to_its_state() {
         let dir = tmp();
         let (varek, ilse) = {
             let n = Npcs::load(&dir).unwrap();
@@ -260,30 +259,30 @@ mod tests {
             n.patch(varek, ME, &json!({ "state": "active" }), 1_500)
                 .unwrap();
 
-            assert_eq!(n.freeze_all(Manager::Owner(ME), true).unwrap(), 2);
+            assert_eq!(n.suspend_all(Manager::Owner(ME), true).unwrap(), 2);
             assert_eq!(standing(&n, varek), st("suspended", Some("active")));
             assert_eq!(standing(&n, ilse), st("suspended", Some("idle")));
             let view = n.view();
             let p = view.by_id.get(&varek).unwrap();
             assert_eq!((p.revision, p.updated_ms), (2, 1_500), "not an edit");
-            assert_eq!(n.freeze_all(Manager::Owner(ME), true).unwrap(), 0);
+            assert_eq!(n.suspend_all(Manager::Owner(ME), true).unwrap(), 0);
             (varek, ilse)
         };
 
         let n = Npcs::load(&dir).unwrap();
-        assert_eq!(n.view().frozen(), HashSet::from([varek, ilse]));
-        assert_eq!(n.freeze_all(Manager::Owner(ME), false).unwrap(), 2);
+        assert_eq!(n.view().suspended(), HashSet::from([varek, ilse]));
+        assert_eq!(n.suspend_all(Manager::Owner(ME), false).unwrap(), 2);
         assert_eq!(standing(&n, varek), st("active", None));
         assert_eq!(standing(&n, ilse), st("idle", None));
-        assert!(n.view().frozen().is_empty());
-        assert_eq!(n.freeze_all(Manager::Owner(ME), false).unwrap(), 0);
+        assert!(n.view().suspended().is_empty());
+        assert_eq!(n.suspend_all(Manager::Owner(ME), false).unwrap(), 0);
     }
 
-    /// **A character its owner suspended stays suspended through a thaw of the
-    /// whole cast**, whether it was suspended before the freeze or during it —
-    /// the owner's word on its state clears what the freeze kept.
+    /// **A character its owner suspended stays suspended when the whole cast
+    /// is resumed**, whether it was suspended before the cast was or during
+    /// it — the owner's word on its state clears what the cast's kept.
     #[test]
-    fn an_owner_suspended_character_stays_suspended_through_a_cast_thaw() {
+    fn an_owner_suspended_character_stays_suspended_when_the_cast_resumes() {
         let n = Npcs::load(&tmp()).unwrap();
         let before = create(&n, ME, "Varek", 1_000);
         let during = create(&n, ME, "Ilse", 1_001);
@@ -291,40 +290,40 @@ mod tests {
         n.patch(before, ME, &json!({ "state": "suspended" }), 1_500)
             .unwrap();
 
-        assert_eq!(n.freeze_all(Manager::Owner(ME), true).unwrap(), 2);
+        assert_eq!(n.suspend_all(Manager::Owner(ME), true).unwrap(), 2);
         assert_eq!(standing(&n, before), st("suspended", None));
         assert_eq!(standing(&n, during), st("suspended", Some("idle")));
         n.patch(during, ME, &json!({ "state": "suspended" }), 2_000)
             .unwrap();
         assert_eq!(standing(&n, during), st("suspended", None));
 
-        assert_eq!(n.freeze_all(Manager::Owner(ME), false).unwrap(), 1);
+        assert_eq!(n.suspend_all(Manager::Owner(ME), false).unwrap(), 1);
         assert_eq!(standing(&n, before), st("suspended", None));
         assert_eq!(standing(&n, during), st("suspended", None));
         assert_eq!(standing(&n, free), st("idle", None));
-        assert_eq!(n.view().frozen(), HashSet::from([before, during]));
+        assert_eq!(n.view().suspended(), HashSet::from([before, during]));
     }
 
-    /// **A freeze of the whole cast reaches exactly the manager's**: an
-    /// owner's leaves a stranger's characters running, an admin's reaches
-    /// everybody's, and a deleted character is nobody's.
+    /// **Suspending the whole cast reaches exactly the manager's**: an owner's
+    /// leaves a stranger's characters running, an admin's reaches everybody's,
+    /// and a deleted character is nobody's.
     #[test]
-    fn a_cast_freeze_reaches_the_managers_cast() {
+    fn a_cast_suspension_reaches_the_managers_cast() {
         let n = Npcs::load(&tmp()).unwrap();
         let a = create(&n, ME, "Varek", 1_000);
         let b = create(&n, OTHER, "Wren", 1_001);
         let gone = create(&n, OTHER, "Pax", 1_002);
         n.delete(gone, OTHER, 1_003).unwrap();
 
-        assert_eq!(n.freeze_all(Manager::Owner(ME), true).unwrap(), 1);
-        assert_eq!(n.view().frozen(), HashSet::from([a]));
-        assert_eq!(n.freeze_all(Manager::Admin(ADMIN), true).unwrap(), 1);
-        assert_eq!(n.view().frozen(), HashSet::from([a, b]));
+        assert_eq!(n.suspend_all(Manager::Owner(ME), true).unwrap(), 1);
+        assert_eq!(n.view().suspended(), HashSet::from([a]));
+        assert_eq!(n.suspend_all(Manager::Admin(ADMIN), true).unwrap(), 1);
+        assert_eq!(n.view().suspended(), HashSet::from([a, b]));
         assert_eq!(standing(&n, gone), st("tombstoned", None));
 
-        assert_eq!(n.freeze_all(Manager::Owner(OTHER), false).unwrap(), 1);
-        assert_eq!(n.view().frozen(), HashSet::from([a]));
-        assert_eq!(n.freeze_all(Manager::Admin(ADMIN), false).unwrap(), 1);
-        assert!(n.view().frozen().is_empty());
+        assert_eq!(n.suspend_all(Manager::Owner(OTHER), false).unwrap(), 1);
+        assert_eq!(n.view().suspended(), HashSet::from([a]));
+        assert_eq!(n.suspend_all(Manager::Admin(ADMIN), false).unwrap(), 1);
+        assert!(n.view().suspended().is_empty());
     }
 }

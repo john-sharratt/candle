@@ -7,7 +7,7 @@
 //! next beat, the way standing missions are (`Missions::stamp_standing`): the
 //! close happens inside an act, which has no clock of its own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,10 @@ pub struct RoundState {
     /// When each body's round mission was set, while it carries one.
     #[serde(default)]
     set_at: BTreeMap<String, u64>,
+    /// Since when each body's character has been found suspended, while it is
+    /// ([`Self::hold`]): its round mission's clock stands still meanwhile.
+    #[serde(default)]
+    held: BTreeMap<String, u64>,
 }
 
 impl RoundState {
@@ -86,6 +90,39 @@ impl RoundState {
             at.get_or_insert(now_ms);
         }
     }
+
+    /// Hold exactly the bodies in `suspended` — those whose characters are
+    /// suspended at `now_ms` — and let the rest go.
+    ///
+    /// A suspended character takes no turn, so the hour its round mission is
+    /// given must not run while it cannot work: a body held stays held from
+    /// the moment it was first found so, and a body let go has its mission's
+    /// `set_at` moved on by the time it was held since the mission was set.
+    /// Read against the live suspended set each time, so a body resumed while
+    /// nothing was looking is let go on the next look all the same.
+    pub fn hold(&mut self, suspended: &BTreeSet<String>, now_ms: u64) {
+        let released: Vec<String> = self
+            .held
+            .keys()
+            .filter(|body| !suspended.contains(*body))
+            .cloned()
+            .collect();
+        for body in released {
+            let since = self.held.remove(&body).unwrap_or(now_ms);
+            if let Some(at) = self.set_at.get_mut(&body) {
+                let from = since.max(*at);
+                *at = at.saturating_add(now_ms.saturating_sub(from));
+            }
+        }
+        for body in suspended {
+            self.held.entry(body.clone()).or_insert(now_ms);
+        }
+    }
+
+    /// Whether `body`'s character is held suspended ([`Self::hold`]).
+    pub fn is_held(&self, body: &str) -> bool {
+        self.held.contains_key(body)
+    }
 }
 
 #[cfg(test)]
@@ -119,5 +156,34 @@ mod tests {
         r.dropped("zen");
         assert_eq!(r.set_at("zen"), None);
         assert_eq!(r.done_at("read-the-reports"), None);
+    }
+
+    /// **A held body's mission clock stands still**: held from the first look
+    /// that finds it suspended, its mission's `set_at` moves on by exactly the
+    /// time it was held once it is let go — and only by the part after the
+    /// mission was set.
+    #[test]
+    fn a_held_bodys_mission_clock_stands_still() {
+        let held = BTreeSet::from(["zen".to_string()]);
+        let none = BTreeSet::new();
+
+        let mut r = RoundState::default();
+        r.set("zen", "watch-earth", 100);
+        r.set("yen", "read-the-reports", 100);
+        r.hold(&held, 1_000);
+        r.hold(&held, 5_000);
+        assert!(r.is_held("zen") && !r.is_held("yen"));
+        assert_eq!(r.set_at("zen"), Some(100), "not moved while held");
+        r.hold(&none, 9_000);
+        assert!(!r.is_held("zen"));
+        assert_eq!(r.set_at("zen"), Some(8_100), "moved by the 8,000 held");
+        assert_eq!(r.set_at("yen"), Some(100), "a body never held is untouched");
+
+        // Held before its mission was set: only the time since it was set.
+        let mut r = RoundState::default();
+        r.hold(&held, 1_000);
+        r.set("zen", "watch-earth", 4_000);
+        r.hold(&none, 10_000);
+        assert_eq!(r.set_at("zen"), Some(10_000));
     }
 }

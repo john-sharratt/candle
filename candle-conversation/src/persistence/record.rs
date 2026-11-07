@@ -1341,18 +1341,18 @@ pub struct NpcPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mood: Option<String>,
 
-    /// The state a freeze of the whole cast found this character in, while that
-    /// freeze holds it `suspended`.
+    /// The state a suspension of the whole cast found this character in, while
+    /// that suspension holds it `suspended`.
     ///
-    /// `suspended` is what stops a character's turns, and a freeze of the whole
+    /// `suspended` is what stops a character's turns, and suspending the whole
     /// cast sets it on every character it reaches — over whatever state each
-    /// one's owner had set. This is that state, so the thaw of the whole cast
-    /// puts each one back where it was. Written only by that freeze; any other
-    /// change of state, an owner's own suspend among them, clears it, so a
-    /// character its owner suspended stays suspended through the thaw.
+    /// one's owner had set. This is that state, so resuming the whole cast
+    /// puts each one back where it was. Written only by that suspension; any
+    /// other change of state, an owner's own suspend among them, clears it, so
+    /// a character its owner suspended stays suspended when the cast resumes.
     ///
-    /// Absent on every other record, so a record nobody froze carries the same
-    /// bytes it always did.
+    /// Absent on every other record, so a record no such suspension holds
+    /// carries the same bytes it always did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspended_from: Option<String>,
 
@@ -2674,20 +2674,18 @@ mod tests {
         assert_eq!(older.at, None);
     }
 
-    /// **A character a freeze of the whole cast holds carries the state it
+    /// **A character a suspension of the whole cast holds carries the state it
     /// found in one key, and any other carries none.** The key sits between
     /// `portrait_origin` and the authoring plane, where the struct declares it;
-    /// a record without it decodes as one no such freeze holds.
+    /// a record without it decodes as one no such suspension holds.
     #[test]
-    fn the_state_a_cast_freeze_found_is_one_key_and_absent_otherwise() {
+    fn the_state_a_cast_suspension_found_is_one_key_and_absent_otherwise() {
         let mut held = npc_fixture();
         held.state = "suspended".to_string();
         held.suspended_from = Some("active".to_string());
         let text = String::from_utf8(held.encode()).unwrap();
         assert!(
-            text.contains(
-                r#""portrait_origin":"uploaded","suspended_from":"active","beliefs":["#
-            ),
+            text.contains(r#""portrait_origin":"uploaded","suspended_from":"active","beliefs":["#),
             "{text}"
         );
         assert!(text.contains(r#""state":"suspended","#), "{text}");

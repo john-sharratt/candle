@@ -21,7 +21,7 @@ use crate::api::{err, Authored};
 use crate::engine::check;
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::{no_engine, owned};
-use crate::freeze;
+use crate::suspend;
 
 /// The body of an `ask`: a standing question by name, or the caller's own.
 #[derive(Debug, Deserialize)]
@@ -68,7 +68,7 @@ fn resolve(body: AskBody) -> Result<(String, Vec<String>), String> {
 ///
 /// Ownership is checked: this reads a mind somebody owns. It waits for the
 /// character's own turn to finish, so on a busy character it takes as long as
-/// that turn does. A frozen character is not asked: 409 `npc_frozen`.
+/// that turn does. A suspended character is not asked: 409 `npc_suspended`.
 pub async fn ask(
     State(s): State<Arc<Authored>>,
     Path(nid): Path<String>,
@@ -79,7 +79,7 @@ pub async fn ask(
         Ok(id) => id,
         Err(r) => return *r,
     };
-    if let Some(r) = freeze::frozen(&s, npc_id) {
+    if let Some(r) = suspend::refused(&s, npc_id) {
         return r;
     }
     let Some(rt) = s.runtime.as_ref() else {

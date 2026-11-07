@@ -173,8 +173,8 @@ impl Cast {
     }
 
     /// Every living character that is suspended, whoever owns it — what the
-    /// scheduler holds still (`Scheduler::follow_frozen`).
-    pub fn frozen(&self) -> HashSet<u64> {
+    /// scheduler holds still (`Scheduler::follow_suspended`).
+    pub fn suspended(&self) -> HashSet<u64> {
         self.by_id
             .values()
             .filter(|n| n.state == SUSPENDED)

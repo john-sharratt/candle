@@ -703,7 +703,7 @@ fn read_again_on_arrival(
                 }
                 state.npcs.refresh();
                 if let Some(rt) = &state.runtime {
-                    rt.follow_frozen();
+                    rt.follow_suspended();
                 }
                 let cast = state.npcs.view().cast();
                 let characters: Vec<String> = state

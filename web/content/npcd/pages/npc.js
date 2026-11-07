@@ -1644,12 +1644,24 @@ export async function render(params) {
         h('div', { class: 'row wrap', style: 'gap:8px' },
           h('button', { class: 'btn sm', onClick: duplicate }, 'Duplicate'),
           h('button', { class: 'btn sm', onClick: exportJson }, 'Export JSON'),
+          /* Suspend stops every turn this character takes — no decode at all —
+           * until Resume, which puts back the state it was in before the
+           * whole cast was suspended, or idle. */
           h('button', {
             class: 'btn sm',
-            onClick: () => patch(
-              { state: npc.state === 'suspended' ? 'idle' : 'suspended' },
-              npc.state === 'suspended' ? 'resumed' : 'suspended',
-            ).then((ok) => { if (ok) go('/npc/' + id + '/manage'); }),
+            title: npc.state === 'suspended'
+              ? 'Let this character think again'
+              : 'Stop this character taking turns — no decode at all until it is resumed',
+            onClick: async () => {
+              const suspending = npc.state !== 'suspended';
+              try {
+                npc = await API.setSuspended(id, suspending);
+                toast(suspending ? 'suspended' : 'resumed', 'ok');
+                go('/npc/' + id + '/manage');
+              } catch (e) {
+                toast(e.detail || e.message || 'could not save', 'err');
+              }
+            },
           }, npc.state === 'suspended' ? 'Resume' : 'Suspend'),
           h('button', {
             class: 'btn sm danger',
