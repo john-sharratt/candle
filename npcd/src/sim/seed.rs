@@ -460,7 +460,10 @@ mod tests {
         let s = for_world("an-undescribed-world", Some(&maps()));
         assert!(s.part_offers("vault-command/command-room", "collect_mission"));
         assert!(s.part_offers("vault-command/command-room", "order_post"));
-        assert!(!s.has_home(), "a world with no area of its name has no home");
+        assert!(
+            !s.has_home(),
+            "a world with no area of its name has no home"
+        );
         assert!(s.tower.is_none());
     }
 
