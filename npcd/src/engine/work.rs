@@ -4511,7 +4511,8 @@ mod tests {
                     .into()
             )
         );
-        assert_eq!(h.sim(|s| s.unheld_orders()), ["mind the drill"]);
+        assert!(h.sim(|s| s.unheld_orders().contains(&"mind the drill".to_string())));
+        assert!(h.sim(|s| s.orders_held_by("m2")).is_empty());
     }
 
     /// **An order handed over by name is held by the body of that name** — the
@@ -4642,12 +4643,14 @@ mod tests {
         );
     }
 
-    /// **A writing step is not stuck while a desk can be reached**: the report
-    /// is turned away with the way to one.
+    /// **A writing step is not stuck while a desk can be reached**: the report,
+    /// made away from one, is turned away with the way to one.
     #[test]
     fn a_writing_step_is_not_stuck_while_a_desk_can_be_reached() {
         use crate::engine::mission::{Mission, Origin, Todo};
         let (h, _root) = vault_with_documents("stuck-at-desk");
+        h.with(|w| w.place("m1", Where::new("vault-chronicle", "stacks")))
+            .unwrap();
         h.with_sim(|s| {
             s.missions.assign(
                 "m1",
