@@ -214,18 +214,10 @@ struct WorldConfig {
 }
 
 /// Whether an argument's value is a stand-in for one — empty, or a word that
-/// says the value is not known.
+/// says the value is not known. "none" is not among them: for a filter or a
+/// list it is a value.
 fn is_no_value(value: &str) -> bool {
-    const NONE: [&str; 8] = [
-        "",
-        "unknown",
-        "?",
-        "n/a",
-        "na",
-        "none",
-        "tbd",
-        "unspecified",
-    ];
+    const NONE: [&str; 6] = ["", "unknown", "?", "n/a", "tbd", "unspecified"];
     let v = value
         .trim()
         .trim_matches(|c| c == '"' || c == '\'')
@@ -691,6 +683,10 @@ routines:
         assert_eq!(
             r.fill(&args(&[("title", "Dune")])).unwrap().brief,
             "Put Dune on it."
+        );
+        assert!(
+            r.fill(&args(&[("title", "none")])).is_ok(),
+            "none is a value"
         );
         for none in ["unknown", " Unknown ", "", "\"?\"", "TBD"] {
             assert_eq!(
