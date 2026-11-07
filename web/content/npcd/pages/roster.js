@@ -7,12 +7,18 @@
  * The page never polls. `/ws/events` pushes what changed and only the affected
  * row's mutable nodes are swapped — a re-list per event would rebuild every row
  * on the page to move one badge, and it would do it under the reader's cursor
- * while they are trying to click something. */
+ * while they are trying to click something.
+ *
+ * Freezing: a frozen character takes no turn of any kind — no decode at all —
+ * until it is unfrozen, which is how the cast's load comes off the card. Each
+ * row freezes or unfreezes its own character in place; "Freeze all" and
+ * "Unfreeze all" reach every character the caller may manage (the whole cast,
+ * for an admin) and re-list. */
 
 import { API } from '../lib/api.js';
 import { h, mount, ago } from '/common/lib/dom.js';
 import { go, link } from '/common/lib/router.js';
-import { avatar, stateDot, bandChip, pending, empty, STATE_LABEL, MODE_LABEL, MODE_ICON } from '../lib/ui.js';
+import { avatar, stateDot, bandChip, pending, empty, toast, STATE_LABEL, MODE_LABEL, MODE_ICON } from '../lib/ui.js';
 import * as sessions from '../lib/sessions.js';
 
 const VIEW_KEY = 'npcd.roster.view';
@@ -44,10 +50,37 @@ export async function render() {
     onClick: () => { view = mode; try { localStorage.setItem(VIEW_KEY, mode); } catch (_) {} refresh(); },
   }, glyph);
 
+  /* The whole cast at once. One request either way, and a re-list after it:
+   * every row on the page may have changed, and some the filter hides. */
+  let freezingAll = false;
+  async function freezeAll(frozen) {
+    if (freezingAll) return;
+    freezingAll = true;
+    try {
+      const r = await API.setAllFrozen(frozen);
+      const n = r.changed;
+      toast(`${n} character${n === 1 ? '' : 's'} ${frozen ? 'frozen' : 'unfrozen'}`, 'ok');
+      await refresh();
+    } catch (e) {
+      toast(e.detail || e.message || String(e), 'err');
+    }
+    freezingAll = false;
+  }
+
   el.appendChild(h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, 'My NPCs'),
       h('div', { class: 'sub' }, 'Characters you own or have been given access to.')),
-    h('div', { class: 'row' },
+    h('div', { class: 'row', style: 'gap:6px' },
+      h('button', {
+        class: 'btn sm',
+        title: 'Stop every character you manage taking turns — no decode at all until unfrozen',
+        onClick: () => freezeAll(true),
+      }, 'Freeze all'),
+      h('button', {
+        class: 'btn sm',
+        title: 'Let every character you manage think again',
+        onClick: () => freezeAll(false),
+      }, 'Unfreeze all'),
       link('/npc/new', { class: 'btn primary' }, '+ New NPC'))));
 
   /* ── the conversations you are in ──────────────────────────────────────────
@@ -131,6 +164,41 @@ export async function render() {
     nodes[key] = next;
   }
 
+  /* The frozen badge, or an empty placeholder where it would go, so the row
+   * has a node to swap either way. */
+  const frozenChip = (n) => n.frozen
+    ? h('span', { class: 'chip accent', title: 'Frozen — takes no turn until it is unfrozen' }, 'frozen')
+    : h('span', {});
+
+  /* A row's own Freeze / Unfreeze. It answers with the character as it now
+   * stands, so the badge and the button are swapped in place. */
+  function freezeBtn(n, nodes) {
+    return h('button', {
+      class: 'btn sm ghost',
+      title: n.frozen
+        ? 'Let this character think again'
+        : 'Stop this character taking turns — no decode at all until it is unfrozen',
+      onClick: async (e) => {
+        e.stopPropagation();
+        try {
+          const v = await API.setFrozen(n.npc_id, !n.frozen);
+          n.frozen = !!v.frozen;
+          swap(nodes, 'frozen', frozenChip(n));
+          swap(nodes, 'freeze', freezeBtn(n, nodes));
+        } catch (err) {
+          toast(err.detail || err.message || String(err), 'err');
+        }
+      },
+    }, n.frozen ? 'Unfreeze' : 'Freeze');
+  }
+
+  /* The badge and the button, added to a row's tracked nodes. */
+  function withFreeze(n, nodes) {
+    nodes.frozen = frozenChip(n);
+    nodes.freeze = freezeBtn(n, nodes);
+    return nodes;
+  }
+
   const metaLine = (n) => [
     `tick ${Math.round((n.tick?.heartbeat_ms || 0) / 1000)}s`,
     `last ${ago(n.tick?.last_tick_ms)}`,
@@ -154,7 +222,7 @@ export async function render() {
   function rows(items) {
     // One surface with hairline dividers — not a stack of bordered boxes.
     return h('div', { class: 'list' }, items.map((n) => {
-      const p = track(n, {
+      const p = withFreeze(n, track(n, {
         dot: stateDot(n.state),
         // No `|| 0` / `|| 'healthy'`: both are engine measurements, and a
         // character the engine has never run has neither. The helpers render
@@ -162,7 +230,7 @@ export async function render() {
         pend: pending(n.tick?.pending_events ?? null),
         band: bandChip(n.monitor?.band ?? null),
         meta: h('div', { class: 'npc-meta' }, metaLine(n)),
-      });
+      }));
       return h('div', { class: 'npc-row', onClick: () => go('/npc/' + n.npc_id) },
         avatar(n),
         h('div', { style: 'min-width:0' },
@@ -170,28 +238,29 @@ export async function render() {
             p.dot,
             h('span', { class: 'npc-name' }, n.name),
             h('span', { class: 'chip' }, n.personality_name || n.personality_id),
-            n.access && n.access !== 'owner' ? h('span', { class: 'chip' }, n.access) : null),
+            n.access && n.access !== 'owner' ? h('span', { class: 'chip' }, n.access) : null,
+            p.frozen),
           p.meta),
-        h('div', { class: 'row', style: 'gap:10px' }, p.pend, p.band));
+        h('div', { class: 'row', style: 'gap:10px' }, p.pend, p.band, p.freeze));
     }));
   }
 
   function cards(items) {
     return h('div', { class: 'cards' }, items.map((n) => {
-      const p = track(n, {
+      const p = withFreeze(n, track(n, {
         dot: stateDot(n.state),
         // No `|| 0` / `|| 'healthy'`: both are engine measurements, and a
         // character the engine has never run has neither. The helpers render
         // absence as absence.
         pend: pending(n.tick?.pending_events ?? null),
         band: bandChip(n.monitor?.band ?? null),
-      });
+      }));
       return h('div', { class: 'npc-card', onClick: () => go('/npc/' + n.npc_id) },
         h('div', { class: 'art' }, (n.name || '?')[0]),
         h('div', { class: 'meta' },
-          h('div', { class: 'row', style: 'gap:6px' }, p.dot, h('span', { class: 'npc-name' }, n.name)),
+          h('div', { class: 'row', style: 'gap:6px' }, p.dot, h('span', { class: 'npc-name' }, n.name), p.frozen),
           h('div', { class: 'npc-meta' }, n.personality_name || ''),
-          h('div', { class: 'row', style: 'gap:8px;margin-top:8px' }, p.pend, p.band)));
+          h('div', { class: 'row', style: 'gap:8px;margin-top:8px' }, p.pend, p.band, p.freeze)));
     }));
   }
 

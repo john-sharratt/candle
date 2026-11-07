@@ -37,7 +37,7 @@
 //! apiece and a delivery wakes exactly the character it names, at the moment it
 //! lands rather than at the next poll.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -589,6 +589,14 @@ pub struct Scheduler {
     /// browser whose clock is not this machine's — an age computed here is
     /// right whatever the reader's clock says, where a timestamp is not.
     born: Instant,
+    /// The characters that are frozen: never due, whatever their inbox holds,
+    /// until they are unfrozen. See [`Self::follow_frozen`].
+    ///
+    /// Kept beside the inboxes rather than in them, because whether a character
+    /// is frozen is a fact about its record, not about this member's running of
+    /// it: it holds for a character this member is not lent, and it has to be
+    /// standing already on the moment a lease brings one here and wakes it.
+    frozen: Mutex<HashSet<u64>>,
 }
 
 impl Default for Scheduler {
@@ -606,6 +614,76 @@ impl Scheduler {
             recent: Mutex::new(VecDeque::new()),
             recent_cap: recent_cap.max(1),
             born: Instant::now(),
+            frozen: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Freeze or unfreeze one character. Returns whether that changed anything.
+    ///
+    /// A frozen character is never due: [`Self::wait_due`] parks its task on
+    /// its waker, [`Self::due_now`] leaves it out, and [`Self::begin_tick`]
+    /// refuses it a turn. Everything delivered meanwhile stays in its inbox, and
+    /// unfreezing rings its waker so a character with something waiting thinks
+    /// about it at once.
+    pub fn freeze(&self, npc_id: u64, frozen: bool) -> bool {
+        let changed = {
+            let mut set = self.frozen.lock().unwrap();
+            if frozen {
+                set.insert(npc_id)
+            } else {
+                set.remove(&npc_id)
+            }
+        };
+        if changed && !frozen {
+            self.ring(npc_id);
+        }
+        changed
+    }
+
+    /// Hold exactly `frozen` frozen — the cast's frozen characters, as its
+    /// records say — and return each character whose standing changed, with
+    /// whether it is frozen now.
+    ///
+    /// What follows the records: a character frozen or unfrozen on another
+    /// member arrives here as its record, and this is how the scheduler comes
+    /// to agree with it. Each character unfrozen has its waker rung, as
+    /// [`Self::freeze`] rings it.
+    pub fn follow_frozen(&self, frozen: HashSet<u64>) -> Vec<(u64, bool)> {
+        let changed: Vec<(u64, bool)> = {
+            let mut set = self.frozen.lock().unwrap();
+            let mut changed: Vec<(u64, bool)> = frozen
+                .difference(&set)
+                .map(|id| (*id, true))
+                .chain(set.difference(&frozen).map(|id| (*id, false)))
+                .collect();
+            changed.sort_unstable();
+            *set = frozen;
+            changed
+        };
+        for (id, now_frozen) in &changed {
+            if !now_frozen {
+                self.ring(*id);
+            }
+        }
+        changed
+    }
+
+    /// Whether this character is frozen.
+    pub fn is_frozen(&self, npc_id: u64) -> bool {
+        self.frozen.lock().unwrap().contains(&npc_id)
+    }
+
+    /// Wake a character's task so it reads its standing again. Nothing for a
+    /// character with no inbox here.
+    fn ring(&self, npc_id: u64) {
+        let waker = self
+            .inboxes
+            .lock()
+            .unwrap()
+            .get(&npc_id)
+            .map(|i| Arc::clone(&i.waker));
+        if let Some(waker) = waker {
+            waker.notify_one();
         }
     }
 
@@ -897,23 +975,34 @@ impl Scheduler {
     ///
     /// Returns `false` when the character has been retired: there is no inbox
     /// left to be due, and the task exits.
+    ///
+    /// A frozen character waits on its waker alone, whatever its deadline: it is
+    /// not due until it is unfrozen, and unfreezing rings it.
     pub async fn wait_due(&self, npc_id: u64) -> bool {
         loop {
-            let (due_at, waker) = {
+            let (due_at, waker, frozen) = {
                 let inboxes = self.inboxes.lock().unwrap();
                 let Some(inbox) = inboxes.get(&npc_id) else {
                     return false;
                 };
-                (inbox.due_at, Arc::clone(&inbox.waker))
+                (
+                    inbox.due_at,
+                    Arc::clone(&inbox.waker),
+                    self.is_frozen(npc_id),
+                )
             };
-            let now = self.now_ms();
-            if due_at <= now {
-                return true;
-            }
             // Registered before the deadline check could race a notify: a
             // permit stored between the read above and this await completes
             // the wait immediately.
             let woken = waker.notified();
+            if frozen {
+                woken.await;
+                continue;
+            }
+            let now = self.now_ms();
+            if due_at <= now {
+                return true;
+            }
             if due_at == NEVER {
                 woken.await;
             } else {
@@ -928,12 +1017,14 @@ impl Scheduler {
 
     /// Every character due at `now_ms`, soonest deadline first — the
     /// synchronous read of the state each [`Self::wait_due`] sleeps on, for
-    /// tests that drive the scheduler without standing the tasks up.
+    /// tests that drive the scheduler without standing the tasks up. A frozen
+    /// character is never among them.
     pub fn due_now(&self, now_ms: u64) -> Vec<u64> {
         let inboxes = self.inboxes.lock().unwrap();
+        let frozen = self.frozen.lock().unwrap();
         let mut due: Vec<(u64, u64)> = inboxes
             .values()
-            .filter(|i| i.due_at <= now_ms)
+            .filter(|i| i.due_at <= now_ms && !frozen.contains(&i.npc_id))
             .map(|i| (i.due_at, i.npc_id))
             .collect();
         due.sort_unstable();
@@ -944,11 +1035,11 @@ impl Scheduler {
     /// narrowed to the inbox a test is watching.
     #[cfg(test)]
     fn is_due(&self, npc_id: u64, now_ms: u64) -> bool {
-        self.inboxes
-            .lock()
-            .unwrap()
+        let inboxes = self.inboxes.lock().unwrap();
+        let frozen = self.frozen.lock().unwrap();
+        inboxes
             .get(&npc_id)
-            .is_some_and(|i| i.due_at <= now_ms)
+            .is_some_and(|i| i.due_at <= now_ms && !frozen.contains(&npc_id))
     }
 
     /// Run one character's tick.
@@ -979,7 +1070,14 @@ impl Scheduler {
     /// The decode between this and [`Self::end_tick`] runs under no lock here:
     /// it can take seconds, and holding the inbox map across it would block
     /// every other character's `deliver` for that whole time.
+    ///
+    /// `None`, with nothing drained, for a frozen character: one frozen after
+    /// its task left [`Self::wait_due`] takes no turn, and its inbox stays
+    /// whole for the turn it takes once unfrozen.
     pub fn begin_tick(&self, npc_id: u64) -> Option<TickStart> {
+        if self.is_frozen(npc_id) {
+            return None;
+        }
         // The drain takes the lock and gives it straight back.
         let (events, cause, owed, replayed) = {
             let mut inboxes = self.inboxes.lock().unwrap();
@@ -1463,6 +1561,88 @@ mod tests {
         );
         let rec = s.tick(1, 3_000, 0, |_, _| vec![]).expect("ticked");
         assert_eq!(rec.perceived.len(), 1);
+    }
+
+    /// **A frozen character is never due, and comes back once unfrozen with
+    /// everything that reached it meanwhile.** It is left out of `due_now`
+    /// however urgent its inbox, refused a turn, and nothing it was told is
+    /// lost: the one turn after the thaw reads all of it.
+    #[test]
+    fn a_frozen_character_is_never_due_and_returns_once_unfrozen() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.wake(2, 0, 0);
+        assert!(s.freeze(1, true));
+        assert!(!s.freeze(1, true), "freezing it twice changes nothing");
+        assert!(s.is_frozen(1));
+        assert!(!s.is_frozen(2));
+
+        s.deliver(1, 0, Salience::URGENT, say("an alarm"));
+        s.deliver(1, 0, Salience::NORMAL, say("somebody comes in"));
+        s.deliver(2, 0, Salience::NORMAL, say("somebody comes in"));
+        assert_eq!(s.due_now(1_000), vec![2]);
+        assert!(!s.is_due(1, u64::MAX - 1));
+        assert!(s.begin_tick(1).is_none(), "a frozen character took a turn");
+        assert_eq!(s.inbox_depth(1), Some(2), "the refused turn drained it");
+
+        assert!(s.freeze(1, false));
+        assert!(!s.is_frozen(1));
+        assert_eq!(s.due_now(1_000), vec![1, 2]);
+        let rec = s.tick(1, 1_000, 0, |_, _| vec![]).expect("ticked");
+        assert_eq!(
+            rec.perceived,
+            vec!["an alarm".to_string(), "somebody comes in".to_string()]
+        );
+    }
+
+    /// **The scheduler holds the cast's frozen set as it is handed, and says
+    /// what moved.** A character the set no longer names is unfrozen, one it
+    /// names newly is frozen, and one in neither is untouched — including one
+    /// with no inbox here, which is frozen already on the day it is woken.
+    #[test]
+    fn following_the_frozen_set_reports_each_change_once() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.wake(2, 0, 0);
+        s.freeze(1, true);
+
+        let moved = s.follow_frozen(HashSet::from([2, 9]));
+        assert_eq!(moved, vec![(1, false), (2, true), (9, true)]);
+        assert!(s.follow_frozen(HashSet::from([2, 9])).is_empty());
+
+        s.wake(9, 0, 0);
+        s.deliver(9, 0, Salience::URGENT, say("an alarm"));
+        s.deliver(1, 0, Salience::URGENT, say("an alarm"));
+        assert_eq!(s.due_now(1_000), vec![1], "a woken frozen character is due");
+    }
+
+    /// **A frozen task parks, and the thaw is what moves it.** An arrival rings
+    /// the waker and the task goes straight back to waiting; unfreezing rings it
+    /// and the task finds itself due.
+    #[tokio::test]
+    async fn a_frozen_task_waits_until_it_is_unfrozen() {
+        let s = Arc::new(sched());
+        s.wake(1, 0, 0);
+        s.freeze(1, true);
+        s.deliver(1, 0, Salience::URGENT, say("an alarm"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), s.wait_due(1))
+                .await
+                .is_err(),
+            "a frozen character's task came due"
+        );
+
+        let waiting = tokio::spawn({
+            let s = Arc::clone(&s);
+            async move { s.wait_due(1).await }
+        });
+        tokio::task::yield_now().await;
+        s.freeze(1, false);
+        let due = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the thaw did not wake the task")
+            .unwrap();
+        assert!(due);
     }
 
     /// **A character thinking somewhere else loses nothing that arrives

@@ -3723,11 +3723,36 @@ impl Runtime {
     ///
     /// Once: a second cast would be the second writable handle this exists to
     /// rule out, so installing one over another panics.
+    ///
+    /// The scheduler takes the cast's frozen characters from it here, before any
+    /// character is woken, so one frozen before a restart is frozen on its first
+    /// moment after it.
     pub fn set_npcs(&self, npcs: Arc<Npcs>) {
         assert!(
             self.npcs.set(npcs).is_ok(),
             "the cast is installed once, at startup"
         );
+        self.follow_frozen();
+    }
+
+    /// Bring the scheduler's frozen characters to what the cast's records say
+    /// — after this member writes a freeze, and after the cast takes in records
+    /// written on other members, so every member holds the same characters
+    /// still.
+    pub fn follow_frozen(&self) {
+        let Some(npcs) = self.npcs() else {
+            return;
+        };
+        for (npc, frozen) in self.scheduler.follow_frozen(npcs.view().frozen()) {
+            if frozen {
+                tracing::info!(
+                    npc,
+                    "character frozen: it takes no turn until it is unfrozen"
+                );
+            } else {
+                tracing::info!(npc, "character unfrozen: it thinks again");
+            }
+        }
     }
 
     /// The shared cast, for the effector bridge. `None` on a test path that
@@ -3810,6 +3835,9 @@ impl Runtime {
         sampled_axes: &[String],
         on_reflection: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> anyhow::Result<reflect::Reflection> {
+        if self.scheduler.is_frozen(npc_id) {
+            anyhow::bail!("npc {npc_id} is frozen, and reflects on nothing until it is unfrozen");
+        }
         let who = self
             .persona_of_async(npc_id)
             .await
@@ -3866,6 +3894,10 @@ impl Runtime {
     /// Dream a brief and keep the dream. Logged, never returned: nobody is
     /// waiting on it, and a dream that did not land costs a dream.
     async fn dream_now(&self, npc_id: u64, brief: &str, assumption: &str) {
+        if self.scheduler.is_frozen(npc_id) {
+            tracing::info!("npc {npc_id}: frozen, so this brief is not dreamt");
+            return;
+        }
         let started = Instant::now();
         tracing::info!("npc {npc_id}: dream begun");
         let Some(minds) = self.minds.read().unwrap().clone() else {
@@ -3900,6 +3932,9 @@ impl Runtime {
         brief: &str,
         assumption: &str,
     ) -> anyhow::Result<crate::engine::dreams::Kept> {
+        if self.scheduler.is_frozen(npc_id) {
+            anyhow::bail!("npc {npc_id} is frozen, and dreams nothing until it is unfrozen");
+        }
         let minds = self
             .minds
             .read()
@@ -3927,8 +3962,12 @@ impl Runtime {
 
     /// Start a draft of the stretch waiting in `npc_id`'s journal, as a task of
     /// its own. `false` when there is no stretch to draft: another draft is
-    /// running, or the stretch was taken since the guardian looked.
+    /// running, the stretch was taken since the guardian looked, or the
+    /// character is frozen.
     pub fn draft_journal(self: &Arc<Self>, npc_id: u64) -> bool {
+        if self.scheduler.is_frozen(npc_id) {
+            return false;
+        }
         let Some(due) = self.scheduler.journal_begin(npc_id) else {
             return false;
         };
@@ -4273,6 +4312,9 @@ impl Runtime {
         question: &str,
         choices: &[String],
     ) -> anyhow::Result<Answer> {
+        if self.scheduler.is_frozen(npc_id) {
+            anyhow::bail!("npc {npc_id} is frozen, and answers nothing until it is unfrozen");
+        }
         let minds = self
             .minds
             .read()

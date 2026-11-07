@@ -204,6 +204,7 @@ mod tests {
             portrait_origin: None,
             at: None,
             mood: None,
+            frozen: false,
             beliefs,
             relationships: Vec::new(),
             agency,

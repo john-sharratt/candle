@@ -172,6 +172,16 @@ impl Cast {
             .and_then(|n| n.mood.as_deref())
     }
 
+    /// Every living character that is frozen, whoever owns it — what the
+    /// scheduler holds still (`Scheduler::follow_frozen`).
+    pub fn frozen(&self) -> HashSet<u64> {
+        self.by_id
+            .values()
+            .filter(|n| n.frozen && !n.is_tombstoned())
+            .map(|n| n.npc_id)
+            .collect()
+    }
+
     /// The image every character's portrait names — what a drawn picture's
     /// retirement leaves alone.
     pub fn portrait_ids(&self) -> HashSet<String> {

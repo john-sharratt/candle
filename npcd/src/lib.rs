@@ -38,6 +38,7 @@ pub mod discord;
 pub mod drafts;
 pub mod effector;
 pub mod engine;
+pub mod freeze;
 pub mod guest_routes;
 pub mod guests;
 pub mod identity;
