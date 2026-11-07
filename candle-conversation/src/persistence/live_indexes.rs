@@ -31,6 +31,7 @@ use super::rebase::RebaseMap;
 use super::replica::ReplicaPayload;
 use super::segment::SegmentId;
 use super::stamped_locs::StampedLocs;
+use super::stranded::Stranded;
 use super::vfs::VfsIndex;
 use super::{MetadataKey, Result, SubstratePersistence};
 
@@ -51,6 +52,9 @@ pub struct LiveIndexes {
     /// The `Replica` record an op re-emits, as it would be written now.
     pub(super) replica: ReplicaPayload,
     pub(super) rebases: RebaseMap,
+    /// Segments an earlier op kept for a record the index named there; an op
+    /// is chosen around the ones whose record the index still names.
+    pub(super) stranded: Stranded,
 }
 
 /// One sealed segment's size and age, as choosing an op weighs it.
@@ -118,6 +122,7 @@ impl SubstratePersistence {
             marker_ids: self.marker_ids.clone(),
             replica: self.replica_record(),
             rebases: self.rebases.clone(),
+            stranded: self.stranded.clone(),
         }
     }
 

@@ -157,6 +157,7 @@ use sealed_reader::SealedReader;
 use segment::SegmentId;
 use segmented_log::{store_mib, SegmentedLog};
 use stamped_locs::StampedLocs;
+use stranded::Stranded;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use survival::RecordCensus;
 use tombstone_expiry::{TombstoneExpiry, DEFAULT_TOMBSTONE_RETENTION};
@@ -633,6 +634,11 @@ pub struct SubstratePersistence {
     /// plan until the op's sources are unlinked (or the op fails), so it also
     /// marks an op in flight: a handle runs one at a time.
     relocation_watch: Option<RelocationWatch>,
+    /// Records the substrate index named inside a segment an op was about to
+    /// drop, which kept that segment linked ([`stranded`]). Choosing an op
+    /// leaves such a segment alone while the index still names the record
+    /// there. In-memory; a restart rebuilds the index from the log.
+    stranded: Stranded,
     /// On-disk location of each stream's CURRENT per-stream metadata record —
     /// `StreamDecl` / `ProjectionEvents` / `WideQSig` / `Commit` — keyed by
     /// [`MetadataKey`], the greatest stamp. The substrate index caches
@@ -1455,6 +1461,7 @@ impl SubstratePersistence {
             recovered_records,
             last_maintenance: None,
             relocation_watch: None,
+            stranded: Stranded::default(),
             metadata_locs,
             resident_locs,
             snapshot_locs,

@@ -553,56 +553,58 @@ impl MaintenancePlan {
     /// names there — read after the apply, so a record the apply repointed, or
     /// one rewritten since the plan, is not among them.
     fn stranded_in(&self, substrate: &Substrate) -> Stranded {
-        let mut out = Stranded::default();
-        let mut note = |kind, stream_id: StreamId, segment, offset| {
-            out.push(StrandedRecord {
+        let record =
+            |kind, stream_id: StreamId, writer, chunk_index, segment, offset| StrandedRecord {
                 kind,
                 stream_id: stream_id.0,
+                writer,
+                chunk_index,
                 segment,
                 offset,
-            })
-        };
-        for (key, idx, old) in &self.chunk_relocs {
-            if substrate
-                .stream_at(*key)
-                .and_then(|s| s.chunks.get(idx).copied())
-                == Some(*old)
-            {
-                note(StrandedKind::Chunk, key.stream_id, old.segment, old.offset);
-            }
-        }
-        for (key, old) in &self.token_relocs {
-            if substrate.stream_at(*key).and_then(|s| s.tokens) == Some(*old) {
-                note(StrandedKind::Tokens, key.stream_id, old.segment, old.offset);
-            }
-        }
-        for (key, old) in &self.index_page_relocs {
-            let held = substrate
-                .stream_at(*key)
-                .and_then(|s| s.index_page.as_ref().and_then(IndexPage::stored));
-            if held == Some(*old) {
-                note(
-                    StrandedKind::IndexPage,
-                    key.stream_id,
-                    old.segment,
-                    old.offset,
-                );
-            }
-        }
-        for (sid, old) in &self.snapshot_relocs {
-            if substrate.recurrent_snapshot_loc(*sid) == Some(*old) {
-                note(StrandedKind::Snapshot, *sid, old.segment, old.offset);
-            }
-        }
-        for (sid, old) in &self.branch_checkpoint_relocs {
-            if substrate.branch_checkpoint_loc(*sid) == Some(*old) {
-                note(
-                    StrandedKind::BranchCheckpoint,
-                    *sid,
-                    old.segment,
-                    old.offset,
-                );
-            }
+            };
+        let chunks = self.chunk_relocs.iter().map(|(key, idx, old)| {
+            let (seg, off) = (old.segment, old.offset);
+            record(
+                StrandedKind::Chunk,
+                key.stream_id,
+                key.writer,
+                *idx,
+                seg,
+                off,
+            )
+        });
+        let tokens = self.token_relocs.iter().map(|(key, old)| {
+            let (seg, off) = (old.segment, old.offset);
+            record(StrandedKind::Tokens, key.stream_id, key.writer, 0, seg, off)
+        });
+        let pages = self.index_page_relocs.iter().map(|(key, old)| {
+            let (seg, off) = (old.segment, old.offset);
+            record(
+                StrandedKind::IndexPage,
+                key.stream_id,
+                key.writer,
+                0,
+                seg,
+                off,
+            )
+        });
+        let snapshots = self
+            .snapshot_relocs
+            .iter()
+            .map(|(sid, old)| record(StrandedKind::Snapshot, *sid, 0, 0, old.segment, old.offset));
+        let branches = self.branch_checkpoint_relocs.iter().map(|(sid, old)| {
+            let (seg, off) = (old.segment, old.offset);
+            record(StrandedKind::BranchCheckpoint, *sid, 0, 0, seg, off)
+        });
+        let mut out = Stranded::default();
+        for r in chunks
+            .chain(tokens)
+            .chain(pages)
+            .chain(snapshots)
+            .chain(branches)
+            .filter(|r| r.named_in(substrate))
+        {
+            out.push(r);
         }
         out
     }
@@ -1054,9 +1056,13 @@ impl LiveIndexes {
         let liveness = self.segment_liveness(substrate);
         let liveness_ms = t_liveness.elapsed().as_millis() as u64;
         self.note_dead_ratio(sizes.total_record_bytes, liveness.values().sum());
+        // A segment kept for a record the index still names there would be
+        // picked, kept and picked again, and no other segment compacted.
+        let held = self.stranded.held_in(substrate);
         let stats: Vec<SegmentStat> = sizes
             .sealed
             .iter()
+            .filter(|s| !held.contains(&s.id))
             .map(|s| SegmentStat {
                 id: s.id,
                 total_bytes: s.total_bytes,
@@ -1248,6 +1254,82 @@ impl SubstratePersistence {
     /// Stop watching — the op finished or was abandoned.
     pub fn end_relocation_watch(&mut self) {
         self.relocation_watch = None;
+    }
+
+    /// Put back what an op that ends **without its apply** moved on the
+    /// persistence side: an op that failed part-way, or was abandoned. Returns
+    /// how many entries were restored.
+    ///
+    /// A relocated copy keeps its record's identity, so its append moves the
+    /// live-tail maps onto it at once (`track_snapshot_loc`,
+    /// `track_metadata_loc`), while the substrate index moves only at
+    /// [`MaintenanceResult::apply_to_substrate`]. An op that never applies left
+    /// the maps on the copy and the index on the source. The next op over the
+    /// source's segment then planned the source from the index, filtered it
+    /// out against the maps, and unlinked it under the index: a snapshot that
+    /// stayed indexed but unreadable until a restart re-walked the log — 15
+    /// minutes of retries for one of BlackWorld's characters (2026-11-07).
+    /// Restored, the maps name the source the index names, under the same
+    /// identity; the copies are dead weight a later op reclaims.
+    ///
+    /// **Only where `substrate`'s index still names the source.** An entry the
+    /// index has moved onto the copy — an apply that ran — keeps the copy:
+    /// put back, the maps would name the source while the index named the
+    /// copy, the same divergence the other way. `why` is what ended the op,
+    /// logged beside the repair.
+    ///
+    /// The byte accounting needs nothing: the relocation counted the source's
+    /// bytes dead and the copy took its record's live entry at the same size,
+    /// and once the maps name the source again, the copy is the record nothing
+    /// indexes — the same bytes, dead.
+    pub fn unwind_relocation(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &MaintenanceRun,
+        substrate: &Substrate,
+        why: &str,
+    ) -> usize {
+        let mut restored = 0;
+        for (sid, old, new) in &run.snapshot_updates {
+            if self.snapshot_locs.get(&sid.0) == Some(new)
+                && substrate.recurrent_snapshot_loc(*sid) == Some(*old)
+            {
+                if let Some(id) = self.snapshot_locs.identity(&sid.0) {
+                    restored += usize::from(self.snapshot_locs.offer(sid.0, Some(*old), id));
+                }
+            }
+        }
+        for (sid, old, new) in &run.branch_checkpoint_updates {
+            if self.snapshot_locs.get(&sid.0) == Some(new)
+                && substrate.branch_checkpoint_loc(*sid) == Some(*old)
+            {
+                if let Some(id) = self.snapshot_locs.identity(&sid.0) {
+                    restored += usize::from(self.snapshot_locs.offer(sid.0, Some(*old), id));
+                }
+            }
+        }
+        for (key, old, new) in &run.index_page_updates {
+            let page = metadata_key_parts(RecordType::TurnIndexPage, key.stream_id.0, key.writer);
+            let indexed = substrate
+                .stream_at(*key)
+                .and_then(|s| s.index_page.as_ref().and_then(IndexPage::stored));
+            if self.metadata_locs.get(&page) == Some(new) && indexed == Some(*old) {
+                if let Some(id) = self.metadata_locs.identity(&page) {
+                    restored += usize::from(self.metadata_locs.offer(page, Some(*old), id));
+                }
+            }
+        }
+        if restored > 0 {
+            tracing::warn!(
+                target: "candle_conversation::persistence::maintenance",
+                op = plan.op.label(),
+                restored,
+                ended_by = why,
+                "segment-maintenance: an op ended before its apply; the live-tail maps \
+                 name its sources again",
+            );
+        }
+        restored
     }
 
     /// The first step of [`Self::execute_maintenance`]: start the run the
@@ -1882,17 +1964,28 @@ impl SubstratePersistence {
         // runs on the owner after this call.
         self.end_relocation_watch();
         for record in stranded.records() {
+            // The persistence side's map is the one the relocation filtered
+            // by, so its entry beside the index's is the divergence.
             let persisted = match record.kind {
                 StrandedKind::Snapshot | StrandedKind::BranchCheckpoint => self
                     .snapshot_locs
                     .get(&record.stream_id)
                     .map(|loc| (loc.segment.0, loc.offset)),
-                _ => None,
+                StrandedKind::IndexPage => self
+                    .metadata_locs
+                    .get(&metadata_key_parts(
+                        RecordType::TurnIndexPage,
+                        record.stream_id,
+                        record.writer,
+                    ))
+                    .map(|loc| (loc.segment.0, loc.offset)),
+                StrandedKind::Chunk | StrandedKind::Tokens => None,
             };
             tracing::warn!(
                 target: "candle_conversation::persistence::maintenance",
                 kind = ?record.kind,
                 stream_id = record.stream_id,
+                writer = record.writer,
                 substrate_segment = record.segment.0,
                 substrate_offset = record.offset,
                 persisted = ?persisted,
@@ -1927,6 +2020,11 @@ impl SubstratePersistence {
         // dropped segment was not carried forward, so this member no longer
         // holds it.
         self.locations.forget_segments(&targets);
+        // Keep what this op stranded for the next choice to step around, and
+        // let go of the records of segments no longer in the log.
+        self.stranded.extend(stranded);
+        let sealed: HashSet<SegmentId> = self.segments.sealed_ids().iter().copied().collect();
+        self.stranded.retain_segments(|s| sealed.contains(&s));
         let unix = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3107,6 +3205,8 @@ mod tests {
             vec![StrandedRecord {
                 kind: StrandedKind::Snapshot,
                 stream_id: sid.0,
+                writer: 0,
+                chunk_index: 0,
                 segment: SegmentId(1),
                 offset: loc_b.offset,
             }]
@@ -3117,6 +3217,150 @@ mod tests {
         assert!(sealed_log(&dir, 1).exists(), "seg 1 stays linked");
         let decoded = SnapshotPayload::decode(&sp.read_record_payload(&loc_b).unwrap()).unwrap();
         assert_eq!(decoded.turn_index, 2, "the indexed tail still reads");
+
+        // While the index names the tail there, no op takes seg 1 again.
+        let again = sp.plan_maintenance(&substrate, true).unwrap();
+        assert!(
+            again.is_none_or(|p| !p.op().targets().contains(&SegmentId(1))),
+            "a stranded segment is left alone"
+        );
+
+        // A newer seal moves the index off it, and seg 1 is chosen again.
+        let Stamped { value: loc_c, id } = sp
+            .write_snapshot(sid, &[&snapshot_payload(timeline, 3, 0x33)])
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_c, id);
+        sp.commit().unwrap();
+        let plan = sp
+            .plan_maintenance(&substrate, true)
+            .unwrap()
+            .expect("seg 1 is all dead weight now");
+        assert!(
+            plan.op().targets().contains(&SegmentId(1)),
+            "{:?}",
+            plan.op()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **An op that ends before its apply puts the live-tail map back.** Its
+    /// relocation moved `snapshot_locs` onto the copy while the index stayed
+    /// on the source; left so, the next op over the source's segment filtered
+    /// the source out and unlinked it under the index. Unwound, the map names
+    /// the source again, and the next op carries it and repoints the index.
+    #[test]
+    fn an_op_ended_before_its_apply_puts_the_tail_map_back() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::SnapshotPayload;
+
+        let dir = tmp_dir("snap_reloc_unwind");
+        let timeline: u64 = 95;
+        let sid = snapshot_stream_id(timeline);
+
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let Stamped { value: loc_a, id } = sp
+            .write_snapshot(sid, &[&snapshot_payload(timeline, 1, 0x11)])
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_a, id);
+        let Stamped { value: loc_b, id } = sp
+            .write_snapshot(sid, &[&snapshot_payload(timeline, 2, 0x22)])
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_b, id);
+        sp.commit().unwrap();
+        sp.seal_active().unwrap();
+
+        let plan = sp
+            .plan_maintenance(&substrate, true)
+            .unwrap()
+            .expect("compact planned");
+        let live_before = sp.segment_liveness(&substrate)[&SegmentId(1)];
+        let dead_before = sp.accounting.dead_bytes();
+        sp.watch_relocation();
+        let mut run = sp.begin_maintenance(&plan).unwrap();
+        while sp.relocate_batch(&plan, &mut run, u64::MAX).unwrap() {}
+        while sp.relocate_tail_batch(&plan, &mut run, u64::MAX).unwrap() {}
+        let copy = *sp.snapshot_locs.get(&sid.0).unwrap();
+        assert_ne!(copy, loc_b, "the relocation moved the map onto its copy");
+        assert_eq!(substrate.recurrent_snapshot_loc(sid), Some(loc_b));
+
+        // The op ends here, never applied.
+        assert_eq!(sp.unwind_relocation(&plan, &run, &substrate, "test"), 1);
+        sp.end_relocation_watch();
+        assert_eq!(sp.snapshot_locs.get(&sid.0), Some(&loc_b));
+        assert_eq!(
+            sp.unwind_relocation(&plan, &run, &substrate, "test"),
+            0,
+            "unwinding twice moves nothing"
+        );
+        // The source reads as live as it did, and the copy's bytes are the
+        // dead ones: one record's worth more than before the relocation.
+        assert_eq!(sp.segment_liveness(&substrate)[&SegmentId(1)], live_before);
+        assert_eq!(sp.accounting.dead_bytes(), dead_before + copy.record_size);
+        assert_eq!(copy.record_size, loc_b.record_size, "a verbatim copy");
+
+        // The next op carries the tail it names and repoints the index.
+        let plan = sp
+            .plan_maintenance(&substrate, true)
+            .unwrap()
+            .expect("seg 1 still carries dead weight");
+        let result = sp.execute_maintenance(&plan).unwrap();
+        let stranded = result.apply_to_substrate(&plan, &mut substrate);
+        assert!(stranded.is_empty(), "the tail was carried, not stranded");
+        sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
+        let tail = substrate.recurrent_snapshot_loc(sid).unwrap();
+        assert_ne!(tail.segment, SegmentId(1));
+        let decoded = SnapshotPayload::decode(&sp.read_record_payload(&tail).unwrap()).unwrap();
+        assert_eq!(decoded.turn_index, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **An op whose apply ran keeps its copies on unwind.** The index already
+    /// names the copy, so putting the map back on the source would split them
+    /// the other way.
+    #[test]
+    fn an_applied_op_keeps_its_copies_on_unwind() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::SnapshotPayload;
+
+        let dir = tmp_dir("snap_reloc_unwind_applied");
+        let timeline: u64 = 96;
+        let sid = snapshot_stream_id(timeline);
+
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let Stamped { value: loc_a, id } = sp
+            .write_snapshot(sid, &[&snapshot_payload(timeline, 1, 0x11)])
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_a, id);
+        let Stamped { value: loc_b, id } = sp
+            .write_snapshot(sid, &[&snapshot_payload(timeline, 2, 0x22)])
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_b, id);
+        sp.commit().unwrap();
+        sp.seal_active().unwrap();
+
+        let plan = sp
+            .plan_maintenance(&substrate, true)
+            .unwrap()
+            .expect("compact planned");
+        sp.watch_relocation();
+        let mut run = sp.begin_maintenance(&plan).unwrap();
+        while sp.relocate_batch(&plan, &mut run, u64::MAX).unwrap() {}
+        while sp.relocate_tail_batch(&plan, &mut run, u64::MAX).unwrap() {}
+        let copy = *sp.snapshot_locs.get(&sid.0).unwrap();
+        // The apply's edit, made by hand so the run keeps its updates: the
+        // index moves onto the copy under the record's own identity.
+        let id = substrate.snapshot_id(sid);
+        substrate.apply_snapshot_loc(sid, copy, id);
+        assert_eq!(substrate.recurrent_snapshot_loc(sid), Some(copy));
+
+        // Something after the apply ends the op: the unwind leaves it be.
+        assert_eq!(sp.unwind_relocation(&plan, &run, &substrate, "test"), 0);
+        sp.end_relocation_watch();
+        assert_eq!(sp.snapshot_locs.get(&sid.0), Some(&copy));
+        let decoded = SnapshotPayload::decode(&sp.read_record_payload(&copy).unwrap()).unwrap();
+        assert_eq!(decoded.turn_index, 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -184,6 +184,13 @@ impl Conversation {
                 finished.map(|()| true)
             }
             Err(e) => {
+                // It never applies: the maps go back to the sources the index
+                // still names (`SubstratePersistence::unwind_relocation`).
+                let substrate = self.read();
+                let why = e.to_string();
+                self.persistence
+                    .call(|p| p.unwind_relocation(&op.plan, &op.run, &substrate, &why));
+                drop(substrate);
                 self.refresh_maintenance_status();
                 Err(e)
             }
@@ -192,11 +199,17 @@ impl Conversation {
 
     /// Let `op` go without finishing it: the relocation watch ends and the
     /// status clears. What it relocated stays, as copies a later op reclaims;
-    /// its sources were never unlinked, so nothing it planned is lost. For a
-    /// thread shutting down, whose drain must not queue behind the op.
+    /// its sources were never unlinked, so nothing it planned is lost, and the
+    /// live-tail maps go back to naming them, as the index does
+    /// (`SubstratePersistence::unwind_relocation`). For a thread shutting
+    /// down, whose drain must not queue behind the op.
     pub fn abandon_maintenance(&self, op: MaintenanceOp) {
-        drop(op);
-        self.persistence.call(|p| p.end_relocation_watch());
+        let substrate = self.read();
+        self.persistence.call(|p| {
+            p.unwind_relocation(&op.plan, &op.run, &substrate, "abandoned at shutdown");
+            p.end_relocation_watch();
+        });
+        drop((substrate, op));
         self.refresh_maintenance_status();
     }
 
