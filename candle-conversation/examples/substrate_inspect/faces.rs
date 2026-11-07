@@ -28,8 +28,9 @@ const REASON: &str = "a face that kept a recurrent snapshot";
 /// holding `substrate/`), then run maintenance until it has nothing to do.
 pub fn retire_faces(workspace: &Path) -> Result<()> {
     let mut substrate = Substrate::new();
-    let mut persistence = SubstratePersistence::open_in_with_substrate(workspace, &mut substrate)
-        .with_context(|| format!("opening the substrate under {}", workspace.display()))?;
+    let mut persistence =
+        SubstratePersistence::open_in_with_substrate(workspace, &mut substrate)
+            .with_context(|| format!("opening the substrate under {}", workspace.display()))?;
     let faces: Vec<TimelineId> = substrate
         .timelines_with_metadata_key(Substrate::FACE_OF_KEY)
         .into_iter()

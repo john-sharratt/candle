@@ -137,7 +137,9 @@ mod tests {
             next_syncing_line(0, Some(&view("calibrating_sections", 3_355)), &mut last),
             None
         );
-        assert!(next_syncing_line(0, Some(&view("calibrating_sections", 3_356)), &mut last).is_some());
+        assert!(
+            next_syncing_line(0, Some(&view("calibrating_sections", 3_356)), &mut last).is_some()
+        );
     }
 
     /// A count that falls — a catch-up round that started over — is the new
