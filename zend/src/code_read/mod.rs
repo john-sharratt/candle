@@ -31,7 +31,7 @@ mod link;
 pub(crate) use link::ingest_link;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_conversation::chain_health::{chain_break, ChainBreak};
@@ -604,7 +604,15 @@ pub fn ingest_jobs(
     crate::ingest_backlog::add_pending(backlog_pending);
     let backlog_done = AtomicUsize::new(0);
 
-    let cursor = AtomicUsize::new(0);
+    // **Each member walks the queue in an order of its own**, so two members
+    // planning the same unread tree meet on few files: walked in the same
+    // order, both pools reached the same files at the same moment, and every
+    // file one of them held the other passed over.
+    let order = ingest_lease::order(&keys);
+    // What the first round left to another member's lease, read in the
+    // second once the rest is done: a holder that died or restarted has let
+    // its lease lapse by then, and one that read it has committed it.
+    let left_over: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     let done = AtomicUsize::new(0);
     // Per-file failures are RECORDED, never propagated: the file keeps its prior
     // generation live and the pass carries on, so a bad file (or a systemic VRAM
@@ -614,60 +622,84 @@ pub fn ingest_jobs(
     let failures = Failures::new();
     progress.set_step_progress(0, total as u64);
 
-    std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(n_workers);
-        for _ in 0..n_workers.max(1) {
-            handles.push(s.spawn(|| loop {
-                // Stop pulling new files on first-error abort OR a shutdown cancel.
-                // The current file finishes (the scheduler is still live), so no
-                // half-ingested file; the loader thread then drains the engine.
-                if failures.aborted() || crate::ingest_cancel::cancelled() {
-                    return;
-                }
-                let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                if idx >= jobs.len() {
-                    return;
-                }
-                let (file, key) = (&jobs[idx], &keys[idx]);
-                let job = Job {
-                    file,
-                    key,
-                    live,
-                    binary,
-                };
-                if let Err(e) =
-                    process_one_file(ctx, base, &job, &present_keys, &failures, calibrate)
-                {
-                    // An error escaping `process_one_file` is an unexpected one
-                    // (its own failure mode records and returns Ok). Record it
-                    // so it reaches the report instead of vanishing, and let the
-                    // cap decide whether to stop the pass.
-                    let n = failures.record(&file.path, format!("{e:#}"));
-                    tracing::warn!(
-                        target: "zend::code_read::ingest",
-                        file = %file.path,
-                        "file ingest failed (will retry next run): {e:#}",
-                    );
-                    if n > MAX_DECODE_FAILURES {
-                        failures.set_abort();
+    let round = |indices: &[usize], last: bool| {
+        let cursor = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(n_workers);
+            for _ in 0..n_workers.max(1) {
+                handles.push(s.spawn(|| loop {
+                    // Stop pulling new files on first-error abort OR a shutdown
+                    // cancel. The current file finishes (the scheduler is still
+                    // live), so no half-ingested file; the loader thread then
+                    // drains the engine.
+                    if failures.aborted() || crate::ingest_cancel::cancelled() {
+                        return;
                     }
-                }
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                progress.set_step_progress(d as u64, total as u64);
-                // A registered file is "done" on every exit from
-                // `process_one_file` above — success, tolerated failure, or a
-                // mid-file shutdown cancel — so the backlog can never wedge
-                // non-empty on a file that will just be retried next pass.
-                if !present_keys.contains(key) {
-                    backlog_done.fetch_add(1, Ordering::Relaxed);
-                    crate::ingest_backlog::item_done(&file.path);
-                }
-            }));
-        }
-        for h in handles {
-            h.join().expect("code_read worker panicked");
-        }
-    });
+                    let at = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(&idx) = indices.get(at) else {
+                        return;
+                    };
+                    let (file, key) = (&jobs[idx], &keys[idx]);
+                    let left = AtomicBool::new(false);
+                    let job = Job {
+                        file,
+                        key,
+                        live,
+                        binary,
+                        left: &left,
+                    };
+                    if let Err(e) =
+                        process_one_file(ctx, base, &job, &present_keys, &failures, calibrate)
+                    {
+                        // An error escaping `process_one_file` is an unexpected
+                        // one (its own failure mode records and returns Ok).
+                        // Record it so it reaches the report instead of
+                        // vanishing, and let the cap decide whether to stop the
+                        // pass.
+                        let n = failures.record(&file.path, format!("{e:#}"));
+                        tracing::warn!(
+                            target: "zend::code_read::ingest",
+                            file = %file.path,
+                            "file ingest failed (will retry next run): {e:#}",
+                        );
+                        if n > MAX_DECODE_FAILURES {
+                            failures.set_abort();
+                        }
+                    }
+                    // Left to its holder in the first round, the file is come
+                    // back to, and is not done yet.
+                    if !last && left.load(Ordering::Relaxed) {
+                        left_over.lock().unwrap().push(idx);
+                        continue;
+                    }
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    progress.set_step_progress(d as u64, total as u64);
+                    // A registered file is "done" on every exit from
+                    // `process_one_file` above — success, tolerated failure, or
+                    // a mid-file shutdown cancel — so the backlog can never
+                    // wedge non-empty on a file that will just be retried next
+                    // pass.
+                    if !present_keys.contains(key) {
+                        backlog_done.fetch_add(1, Ordering::Relaxed);
+                        crate::ingest_backlog::item_done(&file.path);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("code_read worker panicked");
+            }
+        });
+    };
+    round(&order, false);
+    let again = std::mem::take(&mut *left_over.lock().unwrap());
+    if !again.is_empty() {
+        tracing::info!(
+            target: "zend::code_read::ingest",
+            files = again.len(),
+            "coming back to the files left to another member's lease",
+        );
+    }
+    round(&again, true);
 
     // An abort or a shutdown cancel can leave files claimed but never run —
     // hand them back, or the GUI's backlog bar never reaches zero.
@@ -712,6 +744,9 @@ struct Job<'a> {
     live: &'a HashSet<String>,
     /// Keys found to be binary, kept for the life of the process.
     binary: &'a Mutex<HashSet<String>>,
+    /// Set when the file is left to the member holding its lease, so the pass
+    /// comes back to it once the rest is read.
+    left: &'a AtomicBool,
 }
 
 /// The tools a file's conversation runs against: file stores reading the
@@ -763,6 +798,7 @@ fn process_one_file(
                 file = %file.path,
                 "left to the member holding its ingest lease",
             );
+            job.left.store(true, Ordering::Relaxed);
             return Ok(());
         }
         Share::Mine(hold) => hold,

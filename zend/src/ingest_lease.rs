@@ -182,6 +182,42 @@ pub fn install(replicator: Arc<Replicator>) {
     }
 }
 
+/// This member's id in the cluster, or `0` when it has not joined one — what a
+/// pass orders its queue by, so members order the same queue differently.
+pub fn member() -> u64 {
+    SEAT.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |seat| seat.member())
+}
+
+/// The order this member walks a pass's queue of `keys` in — see
+/// [`order_for`].
+pub fn order(keys: &[String]) -> Vec<usize> {
+    order_for(keys, member())
+}
+
+/// Each index of `keys`, by a hash of `member` and the key: two members order
+/// the same queue differently, so their pools meet on few units — walked in
+/// one order, both reached the same units at the same moment, and every unit
+/// one held the other passed over — and a member orders it the same way every
+/// pass.
+fn order_for(keys: &[String], member: u64) -> Vec<usize> {
+    let rank = |key: &str| {
+        // FNV-1a over the member's bytes and the key's: stable across runs and
+        // builds, which a std hasher does not promise.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in member.to_le_bytes().iter().chain(key.as_bytes()) {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    };
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by_key(|&i| (rank(&keys[i]), i));
+    order
+}
+
 /// Lease `content_key`. [`Share::Mine`] when this member should read the unit.
 pub fn share(content_key: &str) -> Share {
     share_key(lease_key(content_key))
@@ -360,6 +396,7 @@ trait LeaseSeat: Send + Sync {
     fn release(&self, key: &[u8]);
     fn subscribe(&self) -> Receiver<LeaseEvent>;
     fn applied(&self, origin: u64) -> u64;
+    fn member(&self) -> u64;
 }
 
 struct ClusterSeat(Arc<Replicator>);
@@ -383,6 +420,10 @@ impl LeaseSeat for ClusterSeat {
 
     fn applied(&self, origin: u64) -> u64 {
         self.0.applied_through(origin)
+    }
+
+    fn member(&self) -> u64 {
+        self.0.node()
     }
 }
 
@@ -458,6 +499,25 @@ mod tests {
         fn applied(&self, _origin: u64) -> u64 {
             *self.applied.lock().unwrap()
         }
+
+        fn member(&self) -> u64 {
+            self.id
+        }
+    }
+
+    /// **Each member walks the queue in an order of its own**: every unit
+    /// once, the same order on every pass, and another member's differs.
+    #[test]
+    fn each_member_orders_the_queue_its_own_way() {
+        let keys: Vec<String> = (0..64).map(|i| format!("v4:candle/f{i}.rs@{i}")).collect();
+        let a = order_for(&keys, 0x8939_59be_acad_c372);
+        let mut sorted = a.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..64).collect::<Vec<_>>(), "every unit once");
+        assert_eq!(a, order_for(&keys, 0x8939_59be_acad_c372), "stable");
+        let b = order_for(&keys, 0xa0ac_8817_8cb2_b57d);
+        assert_ne!(a, b, "another member walks it otherwise");
+        assert_ne!(a[..8], b[..8], "and starts on other units");
     }
 
     #[test]
@@ -625,5 +685,6 @@ mod tests {
             panic!("without a seat every unit is read here");
         };
         assert!(!guard.recheck());
+        assert_eq!(member(), 0, "a member of no cluster orders by 0");
     }
 }
