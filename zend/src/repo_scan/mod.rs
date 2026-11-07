@@ -807,11 +807,13 @@ fn run_dir_pool(
     crate::ingest_backlog::add_pending(backlog_pending);
     let backlog_done = AtomicUsize::new(0);
 
-    // Each member walks the queue in its own order, and comes back once the
-    // rest is done to what it left to another member's lease
-    // (`ingest_lease::order`).
+    // Each member walks the queue in its own order, the folders a drawing
+    // group draws first, and comes back once the rest is done to what it left
+    // to another member's lease (`ingest_lease::order`); one a live holder
+    // still keeps is left again and counted done, its holder's commit landing
+    // it.
     let keys: Vec<String> = jobs.iter().map(|j| j.unit.key.clone()).collect();
-    let order = ingest_lease::order(&keys);
+    let order = ingest_lease::order(&keys, |i| ctx.retrieval.draws(&jobs[i].unit.dir));
     let left_over: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     let done = AtomicUsize::new(0);
     // Conversations this pool currently holds open — the quantity that actually

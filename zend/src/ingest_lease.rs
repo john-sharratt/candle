@@ -191,18 +191,20 @@ pub fn member() -> u64 {
         .map_or(0, |seat| seat.member())
 }
 
-/// The order this member walks a pass's queue of `keys` in — see
-/// [`order_for`].
-pub fn order(keys: &[String]) -> Vec<usize> {
-    order_for(keys, member())
+/// The order this member walks a pass's queue of `keys` in, the units `first`
+/// names ahead of the rest — see [`order_for`].
+pub fn order(keys: &[String], first: impl Fn(usize) -> bool) -> Vec<usize> {
+    order_for(keys, member(), first)
 }
 
-/// Each index of `keys`, by a hash of `member` and the key: two members order
-/// the same queue differently, so their pools meet on few units — walked in
-/// one order, both reached the same units at the same moment, and every unit
-/// one held the other passed over — and a member orders it the same way every
-/// pass.
-fn order_for(keys: &[String], member: u64) -> Vec<usize> {
+/// Each index of `keys`: those `first` names before all others, and within
+/// each, by a hash of `member` and the key. Two members order the same queue
+/// differently, so their pools meet on few units — walked in one order, both
+/// reached the same units at the same moment, and every unit one held the
+/// other passed over — and a member orders it the same way every pass.
+/// `first` is what a pass wants read before anything else: the units a
+/// drawing group draws, which place nothing until they are read.
+fn order_for(keys: &[String], member: u64, first: impl Fn(usize) -> bool) -> Vec<usize> {
     let rank = |key: &str| {
         // FNV-1a over the member's bytes and the key's: stable across runs and
         // builds, which a std hasher does not promise.
@@ -214,7 +216,7 @@ fn order_for(keys: &[String], member: u64) -> Vec<usize> {
         h
     };
     let mut order: Vec<usize> = (0..keys.len()).collect();
-    order.sort_by_key(|&i| (rank(&keys[i]), i));
+    order.sort_by_key(|&i| (!first(i), rank(&keys[i]), i));
     order
 }
 
@@ -510,14 +512,30 @@ mod tests {
     #[test]
     fn each_member_orders_the_queue_its_own_way() {
         let keys: Vec<String> = (0..64).map(|i| format!("v4:candle/f{i}.rs@{i}")).collect();
-        let a = order_for(&keys, 0x8939_59be_acad_c372);
+        let none = |_| false;
+        let a = order_for(&keys, 0x8939_59be_acad_c372, none);
         let mut sorted = a.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..64).collect::<Vec<_>>(), "every unit once");
-        assert_eq!(a, order_for(&keys, 0x8939_59be_acad_c372), "stable");
-        let b = order_for(&keys, 0xa0ac_8817_8cb2_b57d);
+        assert_eq!(a, order_for(&keys, 0x8939_59be_acad_c372, none), "stable");
+        let b = order_for(&keys, 0xa0ac_8817_8cb2_b57d, none);
         assert_ne!(a, b, "another member walks it otherwise");
         assert_ne!(a[..8], b[..8], "and starts on other units");
+    }
+
+    /// **What a pass wants first is walked first by every member**, and in an
+    /// order of each member's own among itself.
+    #[test]
+    fn the_units_wanted_first_lead_for_every_member() {
+        let keys: Vec<String> = (0..64).map(|i| format!("v4:candle/f{i}.rs@{i}")).collect();
+        let first = |i: usize| i % 8 == 0;
+        let a = order_for(&keys, 0x8939_59be_acad_c372, first);
+        let b = order_for(&keys, 0xa0ac_8817_8cb2_b57d, first);
+        for o in [&a, &b] {
+            assert!(o[..8].iter().all(|&i| first(i)), "{o:?}");
+            assert!(o[8..].iter().all(|&i| !first(i)), "{o:?}");
+        }
+        assert_ne!(a[..8], b[..8], "the first ones in each member's own order");
     }
 
     #[test]

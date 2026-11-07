@@ -608,10 +608,14 @@ pub fn ingest_jobs(
     // planning the same unread tree meet on few files: walked in the same
     // order, both pools reached the same files at the same moment, and every
     // file one of them held the other passed over.
-    let order = ingest_lease::order(&keys);
+    // The files a drawing group draws — the guides and journals — lead: they
+    // place nothing until they are read.
+    let order = ingest_lease::order(&keys, |i| ctx.retrieval.draws(&jobs[i].path));
     // What the first round left to another member's lease, read in the
     // second once the rest is done: a holder that died or restarted has let
-    // its lease lapse by then, and one that read it has committed it.
+    // its lease lapse by then, and one that read it has committed it. One a
+    // live holder still keeps is left again and counted done here, as every
+    // file left to a holder was before: the holder's commit lands it.
     let left_over: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     let done = AtomicUsize::new(0);
     // Per-file failures are RECORDED, never propagated: the file keeps its prior
