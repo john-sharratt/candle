@@ -170,6 +170,20 @@ mod tests {
         );
     }
 
+    /// A value missing any one of its three fields parses to `None`.
+    #[test]
+    fn a_value_missing_any_field_parses_to_none() {
+        // Missing queued: starts with prefill instead.
+        assert_eq!(
+            RoundTiming::parse("prefill=512/1400ms decode=210/6100ms"),
+            None,
+        );
+        // Missing prefill: only queued and decode.
+        assert_eq!(RoundTiming::parse("queued=2500 decode=210/6100ms"), None,);
+        // Missing decode: only queued and prefill.
+        assert_eq!(RoundTiming::parse("queued=2500 prefill=512/1400ms"), None,);
+    }
+
     #[test]
     fn the_rounds_of_a_conversation_are_read_by_turn_and_totalled() {
         let a = RoundTiming::of(10_000, 512, 1_400, 210, 6_100);
