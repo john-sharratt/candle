@@ -480,6 +480,12 @@ export const MockAPI = {
   async deleteNpc(id) { const i = NPCS.findIndex((x) => x.npc_id === id); if (i >= 0) NPCS.splice(i, 1); return null; },
   async setTags(id, tags) { (await this.getNpc(id)).tags = tags; return { ok: true }; },
   async setHidden(id, hidden) { (await this.getNpc(id)).hidden = hidden; return { ok: true }; },
+  async setFrozen(id, frozen) { const n = await this.getNpc(id); n.frozen = frozen; return n; },
+  async setAllFrozen(frozen) {
+    const moved = NPCS.filter((n) => !!n.frozen !== frozen);
+    moved.forEach((n) => { n.frozen = frozen; });
+    return { frozen, changed: moved.length };
+  },
   async getOwners() {
     await sleep(40);
     return {

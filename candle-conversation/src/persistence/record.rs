@@ -1341,7 +1341,22 @@ pub struct NpcPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mood: Option<String>,
 
-    /* ── the authoring plane (§16) ──────────────────────────────────────────
+    /// Whether this character is frozen: it takes no turn of any kind — no
+    /// decode, no reflection, no dream, no journal draft, no question put to it
+    /// — until it is unfrozen. What reaches it meanwhile waits in its inbox.
+    ///
+    /// Operational state, set by its owner or an admin to take the cast's load
+    /// off the card, and carried here because it must hold across a restart
+    /// and be the same on every member: this record is what replicates. Not an
+    /// authoring act, for the reason a mood is not one.
+    ///
+    /// Absent means not frozen, which is what every character is until somebody
+    /// freezes it; the key is written only while it is `true`, so a record of an
+    /// unfrozen character carries the same bytes it always did.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub frozen: bool,
+
+    /* ── the authoring plane (§16)──────────────────────────────────────────
      *
      * What an operator says a character believes, who they know, what they are
      * trying to do, and the dials their affect starts at. Every write here is
@@ -2571,6 +2586,7 @@ mod tests {
             // covers the field being present.
             at: None,
             mood: None,
+            frozen: false,
             beliefs: vec![AuthoredBelief {
                 belief_id: "hess_word".to_string(),
                 statement: "Hess keeps his word.".to_string(),
@@ -2656,6 +2672,30 @@ mod tests {
         );
         let older: NpcPayload = serde_json::from_value(v).unwrap();
         assert_eq!(older.at, None);
+    }
+
+    /// **A frozen character's record says so in one key, and an unfrozen one's
+    /// does not carry it at all.** The key sits between `portrait_origin` and the
+    /// authoring plane, where the struct declares it; a record without it — every
+    /// record written before anybody froze anything — decodes as not frozen.
+    #[test]
+    fn a_frozen_character_writes_one_key_and_an_unfrozen_one_none() {
+        let mut frozen = npc_fixture();
+        frozen.frozen = true;
+        let text = String::from_utf8(frozen.encode()).unwrap();
+        assert!(
+            text.contains(r#""portrait_origin":"uploaded","frozen":true,"beliefs":["#),
+            "{text}"
+        );
+        assert_eq!(
+            NpcPayload::decode(frozen.encode().as_slice()).unwrap(),
+            frozen
+        );
+
+        let thawed = String::from_utf8(npc_fixture().encode()).unwrap();
+        assert!(!thawed.contains("frozen"), "{thawed}");
+        let older = NpcPayload::decode(thawed.as_bytes()).unwrap();
+        assert!(!older.frozen);
     }
 
     #[test]

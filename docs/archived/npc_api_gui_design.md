@@ -569,6 +569,8 @@ defend against anyone with server access. The UI therefore says "hidden" and nev
   /v1/npc/{id}                                get, patch, delete
   /v1/npc/{id}/tags                           set tags
   /v1/npc/{id}/hidden                         toggle hidden
+  /v1/npc/{id}/freeze                         freeze / unfreeze one: no turn of any kind
+  /v1/npcs/freeze                             freeze / unfreeze every one the caller manages
   /v1/npc/{id}/perceive                       batched perception ingest
   /v1/npc/{id}/relationships[/{entity}]       authoring plane
   /v1/npc/{id}/beliefs[/{belief}]             authoring plane
@@ -821,6 +823,28 @@ supersession. They exist because the console edits those fields from controls no
 rest of the form, a tag chip and a checkbox, each saving on the spot; without them the console
 would have to send a whole character to add one tag. A route that wrote its own record would be
 a second answer to "what may a tag be".
+
+```
+POST   /v1/npc/{id}/freeze   { "frozen": true }   → 200 { Npc }   (its "frozen" field set)
+POST   /v1/npcs/freeze       { "frozen": true }   → 200 { "frozen": true, "changed": 3 }
+```
+
+**A frozen character takes no turn of any kind** until it is unfrozen: the scheduler never makes
+it due, the guardian does not scan it, and nothing it would think, reflect, dream or draft is
+decoded — which is how an operator takes the whole cast's load off the card for other work.
+Everything that reaches it meanwhile (a message, a thought, an interaction line, what its world
+does around it) waits in its inbox and is read on the first turn after the thaw. The routes that
+decode for a character directly — `ask`, `reflect`, `dream`, `journal/draft` — refuse a frozen
+one with `409 npc_frozen`.
+
+The state is a field on the character's record (`frozen`, written only while true), so it
+survives a restart and replicates to every member like any other edit; the member that writes it
+holds its own scheduler at once, and every other member as the record arrives. It is operational,
+not authored: no `revision` bump and no `updated_ms`, so freezing the cast does not reorder a
+roster sorted by recent edits. `/v1/npc/{id}/freeze` is its owner's or any admin's (a stranger's
+character is a `404`, as on every write); `/v1/npcs/freeze` reaches the caller's own cast, or the
+whole cast for an admin, and `changed` counts only the characters that were not already so.
+`{ Npc }` and every listing row carry `"frozen": bool`.
 
 **Every write appends.** One record keyed by `npc_id`, newest wins on replay — an implicit
 tombstone, with no delete record to write and none to replay. So an edit does not mutate a
@@ -2759,6 +2783,10 @@ A grid/list toggle (`⊞ ≣`) switches to a portrait-first card grid, which is 
 characters have faces and the collection grows past a screenful.
 
 Live-updated over `/ws/events`; no polling.
+
+Each row carries a **Freeze / Unfreeze** button and, while frozen, a `frozen` chip beside its
+name; the header carries **Freeze all** and **Unfreeze all** beside `[+ New NPC]`, which call
+`/v1/npcs/freeze` — the caller's own cast, or the whole cast for an admin — and re-list (§11).
 
 ## 28. Tag filtering, and how hidden characters surface
 

@@ -143,6 +143,11 @@ export const LiveAPI = {
   deleteNpc: (id) => j(`/v1/npc/${id}`, { method: 'DELETE' }),
   setTags:   (id, tags) => j(`/v1/npc/${id}/tags`, { method: 'PUT', body: { tags } }),
   setHidden: (id, hidden) => j(`/v1/npc/${id}/hidden`, { method: 'PUT', body: { hidden } }),
+  /* A frozen character takes no turn of any kind until unfrozen. One answers
+   * with the character as it now stands; all of them — every character the
+   * caller may manage, the whole cast for an admin — with `{frozen, changed}`. */
+  setFrozen:    (id, frozen) => j(`/v1/npc/${id}/freeze`, { method: 'POST', body: { frozen } }),
+  setAllFrozen: (frozen) => j('/v1/npcs/freeze', { method: 'POST', body: { frozen } }),
   /* Admin: every living character with its owner, the accounts one can be
    * handed to, and the caller's own id — `{me, accounts, npcs}`. */
   getOwners: () => j('/v1/npcs/owners'),

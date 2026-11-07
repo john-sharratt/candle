@@ -39,6 +39,7 @@ use crate::engine::runtime::Runtime;
 use crate::engine::slash;
 use crate::engine::survey::Survey;
 use crate::engine::{owned, owned_by};
+use crate::freeze;
 use crate::npcs;
 
 /// How many ticks a feed request may ask for. The scheduler's own ring is the
@@ -617,8 +618,8 @@ pub async fn journal(
 /// journal holds an entry.
 ///
 /// Answers 202 with the turns the draft covers; how it ends shows in the
-/// journal's `drafts`. 409 while a draft is already running or when nothing has
-/// happened since the last entry.
+/// journal's `drafts`. 409 while a draft is already running, when nothing has
+/// happened since the last entry, or while the character is frozen.
 pub async fn journal_draft(
     State(s): State<Arc<Authored>>,
     Path(nid): Path<String>,
@@ -628,6 +629,9 @@ pub async fn journal_draft(
         Ok(id) => id,
         Err(r) => return *r,
     };
+    if let Some(r) = freeze::frozen(&s, nid) {
+        return r;
+    }
     let Some(rt) = s.runtime.as_ref() else {
         return no_scheduler();
     };

@@ -330,6 +330,7 @@ mod tests {
             portrait_origin: None,
             at: None,
             mood: None,
+            frozen: false,
             beliefs: Vec::new(),
             relationships: Vec::new(),
             agency: Vec::new(),

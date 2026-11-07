@@ -19,7 +19,9 @@ use crate::engine::runtime::Runtime;
 const RECENT_TICKS: usize = 512;
 
 pub trait Probe: Send + Sync {
-    /// Every character in the cast.
+    /// Every character in the cast that is not frozen. A frozen one is not
+    /// scanned at all: asking it anything, drafting its journal or nudging it
+    /// would each be a turn it is not to take.
     fn npcs(&self) -> Vec<u64>;
 
     /// Whether the engine is loaded and the cast is thinking.
@@ -83,11 +85,12 @@ fn view_of(mission: &Mission) -> MissionView {
 
 impl Probe for RuntimeProbe {
     fn npcs(&self) -> Vec<u64> {
-        self.0
-            .scheduler
+        let scheduler = &self.0.scheduler;
+        scheduler
             .census()
             .into_iter()
             .map(|c| c.npc_id)
+            .filter(|id| !scheduler.is_frozen(*id))
             .collect()
     }
 
