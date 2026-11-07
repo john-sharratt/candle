@@ -172,6 +172,20 @@ mod tests {
         assert_eq!(literal_pattern(&["KehT".into()]), "(?:KehT)");
     }
 
+    /// Every operator the escape function knows about is escaped, and plain
+    /// letters and digits are left alone.
+    #[test]
+    fn every_operator_in_a_value_is_escaped() {
+        // One value holding every character the escape function targets.
+        let all_ops = r"\ . + * ? ( ) | [ ] { } ^ $ # & - ~";
+        assert_eq!(
+            literal_pattern(&[all_ops.into()]),
+            r"(?:\\ \. \+ \* \? \( \) \| \[ \] \{ \} \^ \$ \# \& \- \~)"
+        );
+        // Plain letters and digits pass through untouched.
+        assert_eq!(literal_pattern(&["hello42".into()]), "(?:hello42)");
+    }
+
     fn parts(table: &[(&str, &[&str])]) -> ValueHolds {
         ValueHolds {
             fields: vec![FieldHold {
