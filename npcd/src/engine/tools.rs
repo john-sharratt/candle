@@ -47,7 +47,7 @@
 use candle_conversation::projection::{
     Builder, SelectionRule, SelectionState, FORCE_TOOL_SELECTOR, FORCE_TOOL_SEPARATOR,
 };
-use candle_conversation::stencil::{Param as StencilParam, ParamType, ToolSpec};
+use candle_conversation::stencil::{Param as StencilParam, ParamType, Pick, ToolSpec};
 use serde::Serialize;
 
 use crate::bridge::BRIDGE_ACTS;
@@ -2401,8 +2401,30 @@ fn stencil_param(t: &Tool, p: &Param, within: &Within) -> StencilParam {
             Some(Choices::InvokeUrl) => invoke_body::shapes(within),
             _ => value_shapes(t, p.name, within),
         },
-        pick: Default::default(),
+        pick: pick_of(t.name, p.name),
         pattern: None,
+    }
+}
+
+/// The acts whose optional fields make a choice the call must make — at least
+/// one of these written — so that an empty call does not parse. `(tool, the
+/// members)`.
+///
+/// **A call of all-optional fields closes at `{}` unless it must choose.**
+/// `order_post` takes a standing `job`, or a `brief` and its `steps`: each is
+/// optional because the other may stand in its place, and with nothing
+/// requiring either, the empty post would be the cheapest path through the
+/// grammar.
+const PICKS: &[(&str, &[&str])] = &[("order_post", &["job", "brief"])];
+
+/// What `param` of `tool` owes a choice among the act's fields.
+fn pick_of(tool: &str, param: &str) -> Pick {
+    match PICKS
+        .iter()
+        .any(|(t, members)| *t == tool && members.contains(&param))
+    {
+        true => Pick::AtLeastOne,
+        false => Pick::None,
     }
 }
 
