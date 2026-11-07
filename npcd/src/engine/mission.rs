@@ -1007,19 +1007,19 @@ pub fn post_work_line(routines: &[Routine], at: Option<&str>) -> String {
         Some(url) => format!("`invoke` `{url}`"),
         None => "`order_post` at the order table".to_string(),
     };
-    let jobs = match routines.is_empty() {
-        true => String::new(),
+    let what = match routines.is_empty() {
+        true => ", with a `brief` and its `steps`".to_string(),
         false => {
             let ids: Vec<String> = routines.iter().map(|r| format!("`{}`", r.id)).collect();
             format!(
-                " — a standing `job` by name when one fits what the families need: {}; or",
+                " — a standing `job` by name when one fits what the families need: {}; or a \
+                 `brief` and its `steps` for what none of them covers",
                 ids.join(", ")
             )
         }
     };
     format!(
-        "Work is posted with {act}{jobs} a `brief` and its `steps` for what none of them covers. \
-         A notice on a board is not work: nobody takes it up."
+        "Work is posted with {act}{what}. A notice on a board is not work: nobody takes it up."
     )
 }
 
@@ -1933,6 +1933,49 @@ mod tests {
             "scan the coolant valve and read what state it is in"
         ));
         assert!(!super::engine_sees("form your own view of it"));
+    }
+
+    /// **Work is posted with the act at its address**, a standing job by name
+    /// when there are any, and a notice is said not to be work — in every case.
+    #[test]
+    fn the_line_for_posting_work_names_the_act_and_the_jobs() {
+        use super::post_work_line;
+        use crate::engine::mission_gen::world::Routine;
+        let jobs = [
+            Routine {
+                id: "ward-patrol".into(),
+                ..Default::default()
+            },
+            Routine {
+                id: "morning-briefing".into(),
+                ..Default::default()
+            },
+        ];
+        let at = "http://local/command/order-table~0/order_post";
+        assert_eq!(
+            post_work_line(&jobs, Some(at)),
+            "Work is posted with `invoke` `http://local/command/order-table~0/order_post` — a \
+             standing `job` by name when one fits what the families need: `ward-patrol`, \
+             `morning-briefing`; or a `brief` and its `steps` for what none of them covers. A \
+             notice on a board is not work: nobody takes it up."
+        );
+        assert_eq!(
+            post_work_line(&jobs, None),
+            "Work is posted with `order_post` at the order table — a standing `job` by name when \
+             one fits what the families need: `ward-patrol`, `morning-briefing`; or a `brief` and \
+             its `steps` for what none of them covers. A notice on a board is not work: nobody \
+             takes it up."
+        );
+        assert_eq!(
+            post_work_line(&[], Some(at)),
+            "Work is posted with `invoke` `http://local/command/order-table~0/order_post`, with a \
+             `brief` and its `steps`. A notice on a board is not work: nobody takes it up."
+        );
+        assert_eq!(
+            post_work_line(&[], None),
+            "Work is posted with `order_post` at the order table, with a `brief` and its `steps`. \
+             A notice on a board is not work: nobody takes it up."
+        );
     }
 
     /// **The compass for the year says the act at the machine, or the way to it.**
