@@ -84,6 +84,12 @@ fn fingerprint(yaml: &str) -> u64 {
     h.finish()
 }
 
+/// Whether a param's name says there is no param at all.
+fn is_no_name(param: &str) -> bool {
+    let p = param.trim().to_lowercase();
+    ["", "none", "n/a", "-"].contains(&p.as_str())
+}
+
 /// `mission_write`: author a new mission template the world can hand out
 /// (`docs/mission_templates.md` §6). Zen gives the template's `id`, its `group`
 /// (the folder), its `brief`, its `steps` and any `params`; this renders them
@@ -158,6 +164,14 @@ pub fn write(hosted: &Hosted, _body: &str, args: &Map<String, Value>) -> Outcome
                 .collect()
         })
         .unwrap_or_default();
+    // **"None" is not a param's name.** A template written with `params: [none]`
+    // asks for an argument called `none` whenever it is posted, and no value
+    // given for it is one, so it can never be posted.
+    if params.iter().any(|p| is_no_name(p)) {
+        return Outcome::Refused(
+            "A param needs a name; leave `params` out when the mission takes none.".into(),
+        );
+    }
     let routine = Routine {
         id: id.clone(),
         brief,
@@ -298,6 +312,60 @@ mod tests {
             &args(json!({"id": "Bad Id", "group": "devices", "brief": "b", "steps": "go"})),
         );
         assert!(!bad.happened(), "{bad:?}");
+    }
+
+    /// **"None" is not a param's name**: a template whose params say there are
+    /// none is refused, and nothing is opened for it.
+    #[test]
+    fn a_param_named_none_is_refused() {
+        let h = world_with_write_template();
+        for params in ["none", " None ", "n/a", "-", "title, none"] {
+            assert_eq!(
+                write(
+                    &h,
+                    "zen",
+                    &args(json!({
+                        "id": "trace-family-movement",
+                        "group": "family",
+                        "brief": "Trace where the family went.",
+                        "steps": "go to the front room",
+                        "params": params,
+                    })),
+                ),
+                Outcome::Refused(
+                    "A param needs a name; leave `params` out when the mission takes none.".into()
+                ),
+                "{params:?}"
+            );
+        }
+        assert!(h.sim(|s| s.missions.operations().all().next().is_none()));
+    }
+
+    /// **Left out, `params` renders a template that takes none.**
+    #[test]
+    fn a_template_without_params_takes_none() {
+        let h = world_with_write_template();
+        assert!(write(
+            &h,
+            "zen",
+            &args(json!({
+                "id": "trace-family-movement",
+                "group": "family",
+                "brief": "Trace where the family went.",
+                "steps": "go to the front room",
+            })),
+        )
+        .happened());
+        let yaml = h
+            .sim(|s| {
+                s.missions
+                    .operations()
+                    .all()
+                    .find_map(|o| o.fields.get("yaml").cloned())
+            })
+            .expect("an operation holding the template");
+        let routine = Routine::parse("t.yaml", &yaml).unwrap();
+        assert!(routine.params.is_empty(), "{yaml}");
     }
 
     /// **A template is written once.** While a write of it is open, writing it
