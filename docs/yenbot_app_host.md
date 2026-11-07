@@ -1075,9 +1075,12 @@ A kept picture is committed once, as it was drawn, as
 tags, prompt and seed, so any picture can be drawn again in kind. Pictures
 are binary, so a Zen task commits them (§17.7) — the worker takes the link
 `image_generate` answered with. The platform does the rest on load: it cuts
-each picture to its kind's shape and sizes it to its kind's sizes as lossless
-WebP — flat art compresses well without loss, and WebP keeps a sticker's
-transparency, so one format serves every kind — reads its dominant colour
+each picture to its kind's shape and sizes it to its kind's sizes as lossy
+WebP (libwebp, quality 82) — the model's flat art carries a fine grain that
+lossless coding keeps at nearly a PNG's size (measured: a 512 tile 155 KB
+lossless, 2.8 KB lossy; a 1024 header 344 KB and 9.5 KB, alike to the eye), and
+WebP keeps a sticker's transparency exactly, so one format serves every
+kind — reads its dominant colour
 (the most common among its saturated pixels, so the subject rather than its
 cream ground) and the palette colour nearest it, and caches the results by
 the picture's content. On a change to `library/`, the gate refuses a
