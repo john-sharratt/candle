@@ -101,9 +101,9 @@ use crate::engine::loopguard::{salient, Took, NUDGE};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mind_record;
 use crate::engine::mission::{
-    compass_line, compass_report_line, doc_compass, given_compass, post_work_line, progress_line,
-    publish_compass, refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission,
-    MissionPrompt, Outcome as Verdict,
+    compass_line, compass_report_line, doc_compass, given_compass, is_judgement, post_work_line,
+    progress_line, publish_compass, refused_compass, time_compass, time_step, Aim, DeskVerbs,
+    DocStep, Mission, MissionPrompt, Outcome as Verdict, JUDGEMENT_LINE,
 };
 use crate::engine::mission_acts::{self, COMMAND_DESK};
 use crate::engine::mission_gen;
@@ -1814,6 +1814,10 @@ impl Runtime {
                 .collect();
             let way = way.map(|w| format!("It is in {w}."));
             let mut line = compass_line(&next, &people, way.as_deref());
+            if is_judgement(&next.text) {
+                line.push(' ');
+                line.push_str(JUDGEMENT_LINE);
+            }
             // **Work is posted from the world's catalogue.** Told only "post work
             // on the order table", Zen never saw the jobs it could post by name
             // and wrote its own instead — a crisis a turn, each one a template

@@ -1495,6 +1495,32 @@ const READING_RESULTS: &str = "read what came back";
 const READING_MESSAGES: &str = "read your messages";
 
 /// How a step that is about saying something to somebody begins.
+/// How a step the body settles in its own mind begins — nothing in the world
+/// signs it off, and it is carried to the table in the report.
+const JUDGING: &[&str] = &[
+    "settle ",
+    "decide ",
+    "note ",
+    "judge ",
+    "work out ",
+    "think ",
+    "conclude ",
+];
+
+/// Whether a step is one the body settles in its own mind ([`JUDGING`]).
+pub fn is_judgement(step: &str) -> bool {
+    let lower = step.trim().to_lowercase();
+    JUDGING.iter().any(|v| lower.starts_with(v))
+}
+
+/// What the compass adds to a step the body settles in its own mind.
+///
+/// **Nothing in the world signs it off.** Sent to "settle how the Sharratt
+/// family is today", a Drone walked between their room and the lift looking
+/// for the act that would, and said so to itself.
+pub const JUDGEMENT_LINE: &str = "Nothing in the world marks that done: settle it from what you \
+     have seen, and say it in your report — `report_done` at the table carries it.";
+
 const SPEAKING: &[&str] = &[
     "ask ",
     "tell ",
@@ -2029,6 +2055,29 @@ mod tests {
             "Work is posted with `order_post` at the order table, with a `brief` and its `steps`. \
              A notice on a board is not work: nobody takes it up."
         );
+    }
+
+    /// **A step settled in the body's own mind is told so**; a journey, a
+    /// reading or a word to somebody is not one.
+    #[test]
+    fn a_judgement_step_is_known_by_its_verb() {
+        use super::is_judgement;
+        for step in [
+            "settle how the Sharratt family is today",
+            "Decide what they might need before they ask for it",
+            "note whether the wifi is up, how fast it is, and what is using most of it",
+            "work out where the two meet",
+        ] {
+            assert!(is_judgement(step), "{step}");
+        }
+        for step in [
+            "go to the Sharratt room",
+            "scan the sensor panel and read what state it is in",
+            "ask Wick what they found",
+            "notes from the ward",
+        ] {
+            assert!(!is_judgement(step), "{step}");
+        }
     }
 
     /// **A document whose text the brief gives is written as given**: at a desk
