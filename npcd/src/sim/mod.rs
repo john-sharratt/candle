@@ -868,8 +868,21 @@ mod tests {
             "moon-command/watch-room",
             &["quiet", "watching"],
         ));
+        let light = || {
+            device::Device::new(
+                "moon-command/watch-room/light-ring~0",
+                "the light ring",
+                device::Kind::Panel,
+                "moon-command/watch-room",
+                &["steady", "failing"],
+            )
+        };
+        s.devices.install(light());
         let mut written = Sim::new();
         written.table_open = false;
+        let mut failing = light();
+        assert!(failing.set("failing"));
+        written.devices.install(failing);
         written.postings.post(
             "moon-ward/ward-room",
             "the status board",
@@ -891,6 +904,13 @@ mod tests {
                 .get("moon-command/watch-room/sensor-panel~0")
                 .is_some(),
             "a machine the map stands that the record lacks is installed"
+        );
+        assert_eq!(
+            s.devices
+                .get("moon-command/watch-room/light-ring~0")
+                .map(|d| d.mode.as_str()),
+            Some("failing"),
+            "a machine the record has keeps the record's state, not the seed's"
         );
     }
 

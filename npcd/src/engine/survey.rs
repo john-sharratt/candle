@@ -249,10 +249,7 @@ impl Entry {
                     .filter(|n| n.required)
                     .map(|n| n.name)
                     .collect();
-                // **An act whose every field is optional still takes them.**
-                // Listed as needing nothing, `order_post` — a brief and steps,
-                // or a standing job — read as an act with no fields, and was
-                // invoked with an empty body.
+                // An act whose every field is optional still takes them.
                 let takes: Vec<&str> = v.needs.iter().map(|n| n.name).collect();
                 match (needs.is_empty(), takes.is_empty()) {
                     (true, true) => format!("`{}`", v.address),

@@ -144,6 +144,22 @@ fn an_item_of_the_round_is_not_closed_by_saying_so() {
         )
     );
     assert!(h.sim(|s| s.missions.is_on_mission("zen")), "still carried");
+
+    // Its steps all seen done, it closes itself on the engine's next pass.
+    h.with_sim(|s| s.missions.posted_work("zen"));
+    assert_eq!(
+        act(
+            &h,
+            "zen",
+            "mission_done",
+            json!({"mission": "set the work", "found": "the work is posted"})
+        ),
+        Outcome::Refused(
+            "\"set the work\" is an item of your round: it is done when its steps are seen done, \
+             not when you say so. Its steps are all seen done, and it closes itself."
+                .into()
+        )
+    );
 }
 
 /// **Editing keeps what was done**: steps it keeps stay signed off, and a
