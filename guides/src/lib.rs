@@ -68,6 +68,7 @@ mod tests {
             "bots",
             "guide-change",
             "journal-restructure",
+            "yen-apps",
         ] {
             assert!(library.get(name).is_some(), "{name}");
         }

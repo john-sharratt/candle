@@ -339,6 +339,7 @@ Everything the admin page shows and does, under `/api/v1/admin`:
 | `GET /admin/usage?app=…&since=…&by=day\|account` | Opens, active accounts and AI calls, summed (§20.3). |
 | `GET /admin/errors?app=…`, `GET /admin/feedback?app=…` | Browser errors and feedback notes. |
 | `PUT/DELETE /admin/secrets/<app>/<name>`, `GET /admin/secrets/<app>` | An app's integration keys: set, remove, list names (§19.1). |
+| `GET /admin/hooks/<app>`, `POST/DELETE /admin/hooks/<app>/<name>` | An app's inbound hooks: list them, make a hook's token (shown once), revoke it (§19.2). |
 | `POST /admin/apps/<id>/archive\|restore`, `GET /admin/archive` | Deleted apps' data, kept thirty days (§20.1). |
 | `GET /admin/backups`, `POST /admin/backups/<date>/restore` | The nightly backups; restore one app's data, or the whole store (§7.4). |
 | `GET/POST/DELETE /admin/tokens` | API tokens (§6.3). |
@@ -1054,16 +1055,22 @@ with Google". Pending: a page saying the account is waiting for Yen.
 
 - **Accounts**: pending ones first with approve and refuse; then everyone,
   with when they joined and were last seen, their groups, and block.
-- **Groups**: create, rename, add and remove accounts (§12.5).
+- **Groups**: create, delete, add and remove accounts (§12.5). A group's
+  name is written into apps' `roles:` and shares, so a group is never
+  renamed: a new one is made and its people moved.
 - **Apps**: each with its tile, status, public or private, who it is shared
-  with, the order on the landing page, its last publish, its check result
-  (§17.4), its storage, and export, import and delete
-  (§20.1).
-- **Jobs**: what runs next, what failed and why.
-- **Secrets**: each app's integration keys, set and replaced, never shown
-  again once saved (§19.1).
+  with, the order on the landing page, its check result and the commit it
+  passed at (§17.4), its storage, export, import, and archive (§20.1).
+  Deleting an app is removing its folder, which is a commit, not a button.
+- **Usage**: each app's opens, the people who opened it, the days it was
+  used, and its AI calls over the last four weeks (§20.3).
+- **Jobs**: what runs next, what failed and why; run now, hold, release.
+- **Keys and hooks**: each app's integration keys, set and replaced, never
+  shown again once saved (§19.1); its hooks, each with its token made and
+  shown once (§19.2).
 - **Errors and feedback**: what browsers reported, and notes from the apps'
   feedback items.
+- **Archive**: the apps archived, with restore (§20.1).
 - **Registration**: approve or open.
 
 ## 14. AI and pictures through Zen
@@ -1523,9 +1530,12 @@ are its listed test users, which is the family. John adds them.
 
 ### 20.1 Apps and accounts over time
 
-- **Deleting an app** is removing its folder. Its data, files and jobs are
-  moved to an archive and kept thirty days, shown on the admin page with
-  restore; then a platform job purges them.
+- **Deleting an app** is removing its folder. It is archived: served to no
+  one, its waiting jobs held, its data, files and jobs kept thirty days and
+  shown on the admin page; then the nightly `purge` job removes them. Its
+  folder coming back restores it. An admin may archive an app whose folder
+  stays (`POST /admin/apps/<id>/archive`): it is hidden until restored, and
+  kept as long as its folder is there.
 - **Renaming an app** is moving its folder to the new id and adding
   `renamed_from: <old>` to its manifest, in one commit (a Zen task, for an app
   of any size). On load the platform moves the app's data, files, jobs and
@@ -1535,8 +1545,8 @@ are its listed test users, which is the family. John adds them.
   validated against the fields like any write.
 - **An account deleted** by an admin loses its private records and files;
   records it shared stay, shown as by a former member.
-- **Storage**: the admin page shows each app's records and files; a platform
-  job removes files no record names.
+- **Storage**: the admin page shows each app's records and files; the
+  nightly `purge` removes a file no record names a week after it was kept.
 
 ### 20.2 Health
 
@@ -1669,6 +1679,21 @@ Taken 2026-11-07:
   and inbound hooks are built; the gateway's connect flow waits.
 - **A picture is changed through the draw route, with a reference**, and an
   answer of a shape is held to its schema by yenbot (§14).
+- **Integrations as built** (§19.1–19.2): `ctx.fetch` calls only an
+  `https://` host the manifest lists exactly, follows no redirect, and reads
+  at most 5 MB of an answer; a hook is signed with the HMAC-SHA256 of its
+  body keyed by the app secret `hook-<name>`, in `X-Yen-Signature: sha256=…`
+  (GitHub's `X-Hub-Signature-256` read too), or carries its one token.
+- **An app an admin archives keeps its folder and is hidden until
+  restored**, and is purged only thirty days after its folder is removed;
+  an app whose folder is removed is archived, and restored when its folder
+  comes back (§20.1).
+- **Yen is told of a newcomer as the first admin `yenbot.yaml` lists**
+  (§12.2).
+- **An admin's export holds every account's records**; anyone else's, the
+  records they may read (§20.1).
+- **The templates are drafts** (`status: draft`) and are held by a test to
+  pass the check as new apps built to the guide's current edition (§16).
 
 ## 24. Order of work
 
