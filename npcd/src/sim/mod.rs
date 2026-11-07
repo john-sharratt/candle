@@ -811,8 +811,10 @@ impl Sim {
         other.built.carry_laid(&self.built);
         other.part_tools = std::mem::take(&mut self.part_tools);
         other.home = self.home.take();
-        // A board's lines are the world's; that the board stands is the map's.
+        // A board's lines and a machine's state are the world's; that the board
+        // or the machine stands there is the map's.
         other.postings.stand_up_from(&self.postings);
+        other.devices.install_missing(&self.devices);
         *self = other;
     }
 
@@ -859,6 +861,13 @@ mod tests {
         s.postings.stand_up("moon-command/watch-room", "the table");
         s.postings
             .stand_up("moon-ward/ward-room", "the status board");
+        s.devices.install(device::Device::new(
+            "moon-command/watch-room/sensor-panel~0",
+            "the sensor panel",
+            device::Kind::Panel,
+            "moon-command/watch-room",
+            &["quiet", "watching"],
+        ));
         let mut written = Sim::new();
         written.table_open = false;
         written.postings.post(
@@ -876,6 +885,12 @@ mod tests {
             s.postings.unread_names_at("moon-ward/ward-room", "Wick"),
             ["the status board"],
             "what was written on a board the record has is kept"
+        );
+        assert!(
+            s.devices
+                .get("moon-command/watch-room/sensor-panel~0")
+                .is_some(),
+            "a machine the map stands that the record lacks is installed"
         );
     }
 

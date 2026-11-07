@@ -249,9 +249,15 @@ impl Entry {
                     .filter(|n| n.required)
                     .map(|n| n.name)
                     .collect();
-                match needs.is_empty() {
-                    true => format!("`{}`", v.address),
-                    false => format!("`{}` (needs {})", v.address, needs.join(", ")),
+                // **An act whose every field is optional still takes them.**
+                // Listed as needing nothing, `order_post` — a brief and steps,
+                // or a standing job — read as an act with no fields, and was
+                // invoked with an empty body.
+                let takes: Vec<&str> = v.needs.iter().map(|n| n.name).collect();
+                match (needs.is_empty(), takes.is_empty()) {
+                    (true, true) => format!("`{}`", v.address),
+                    (true, false) => format!("`{}` (takes any of {})", v.address, takes.join(", ")),
+                    (false, _) => format!("`{}` (needs {})", v.address, needs.join(", ")),
                 }
             })
             .collect::<Vec<_>>()
@@ -401,6 +407,26 @@ mod tests {
             "Bridge console: besieging the eastern ledger, shields down, 1 open \
              decision. You can `invoke` `http://local/tower/bridge-console~0/command_tower` \
              (needs action) — the tower can relocate, lift siege, raise shields."
+        );
+    }
+
+    /// **An act whose every field is optional is shown taking them**, not as an
+    /// act that takes nothing.
+    #[test]
+    fn an_act_of_optional_fields_reads_as_taking_them() {
+        let said = Entry::new(
+            "the table",
+            "http://local/command/order-table~0",
+            &verbs("order-table"),
+            &Map::new(),
+        )
+        .prose();
+        assert!(
+            said.contains(
+                "`http://local/command/order-table~0/order_post` (takes any of job, brief, steps, \
+                 for, args)"
+            ),
+            "{said}"
         );
     }
 
