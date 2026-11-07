@@ -813,7 +813,12 @@ fn run_dir_pool(
     // still keeps is left again and counted done, its holder's commit landing
     // it.
     let keys: Vec<String> = jobs.iter().map(|j| j.unit.key.clone()).collect();
-    let order = ingest_lease::order(&keys, |i| ctx.retrieval.draws(&jobs[i].unit.dir));
+    // A folder is drawn when its path as a folder — one closing `/` — is,
+    // since what a group draws is named by such prefixes.
+    let order = ingest_lease::order(&keys, |i| {
+        let dir = jobs[i].unit.dir.trim_end_matches('/');
+        ctx.retrieval.draws(&format!("{dir}/"))
+    });
     let left_over: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     let done = AtomicUsize::new(0);
     // Conversations this pool currently holds open — the quantity that actually
