@@ -172,6 +172,58 @@ mod tests {
         assert_eq!(literal_pattern(&["KehT".into()]), "(?:KehT)");
     }
 
+    /// **Every operator the pattern reads is escaped**, not only the two the
+    /// test above happens to use — and a value of plain letters and digits is
+    /// left exactly as it stands.
+    ///
+    /// The escape list is `"\\.+*?()|[]{}^$#&-~"`; a value holding one of them
+    /// unescaped would let that character act on the whole alternation, so a
+    /// held value like `a(b` would match `ab` and hold the model to a shape it
+    /// never agreed to.
+    #[test]
+    fn every_operator_in_a_value_is_escaped() {
+        // Each operator alone, and the exact bytes it must come out as.
+        for (op, expected) in [
+            ("\\", r"(?:\\)"),
+            (".", r"(?:\.)"),
+            ("+", r"(?:\+)"),
+            ("*", r"(?:\*)"),
+            ("?", r"(?:\?)"),
+            ("(", r"(?:\()"),
+            (")", r"(?:\))"),
+            ("|", r"(?:\|)"),
+            ("[", r"(?:\[)"),
+            ("]", r"(?:\])"),
+            ("{", r"(?:\{)"),
+            ("}", r"(?:\})"),
+            ("^", r"(?:\^)"),
+            ("$", r"(?:\$)"),
+            ("#", r"(?:\#)"),
+            ("&", r"(?:\&)"),
+            ("-", r"(?:\-)"),
+            ("~", r"(?:\~)"),
+        ] {
+            assert_eq!(
+                literal_pattern(&[op.to_string()]),
+                expected,
+                "operator {op:?}"
+            );
+        }
+        // All of them at once, in one value, in the order the escape list
+        // holds: the leading backslash escapes to two, and every operator
+        // after it to itself with one backslash before it.
+        assert_eq!(
+            literal_pattern(&[r"\.+*?()|[]{}^$#&-~".to_string()]),
+            r"(?:\\\.\+\*\?\(\)\|\[\]\{\}\^\$\#\&\-\~)"
+        );
+        // A value of plain letters and digits is left as it is, and the two
+        // arms are joined with a bare `|`.
+        assert_eq!(
+            literal_pattern(&["main2".to_string(), "Zen42".to_string()]),
+            "(?:main2|Zen42)"
+        );
+    }
+
     fn parts(table: &[(&str, &[&str])]) -> ValueHolds {
         ValueHolds {
             fields: vec![FieldHold {
