@@ -25,6 +25,7 @@ filter over the units it draws:
   draws:
     from: scopes
     paths: [candle/mcp/src/guides/, journals/]
+    except: [README.md, group.yaml, journal.yaml, person.yaml]
   selection: { kind: working_set, share: guidance }
 ```
 
@@ -36,7 +37,10 @@ filter over the units it draws:
   retrieval scope names them.
 - **One group or the other.** `zend::retrieval_scope` splits each target's
   files. A file under one of the `paths` goes into the drawing group's scope and
-  out of the files' scope. The scan, selection, the working-set share
+  out of the files' scope, unless its file name is one of `except`. Those are a
+  folder's hub files (a journal group's README, `group.yaml`), which match every
+  question and answer none. Drawn, with no use-exemplars yet, they took every
+  placement and were never read, so they stay with `scopes`. The scan, selection, the working-set share
   (`Substrate::placing_group`) and the members a group emits
   (`working_set_members`) all follow that split, so a unit is placed through one
   group, never both.

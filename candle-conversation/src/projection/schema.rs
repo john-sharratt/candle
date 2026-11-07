@@ -1123,14 +1123,20 @@ pub struct Draws {
     /// Workspace-relative path prefixes — `candle/mcp/src/guides/`,
     /// `journals/` — a unit's file must lie under one of.
     pub paths: Vec<String>,
+    /// File names never drawn wherever they lie under `paths` — the hub
+    /// files (`README.md`, `group.yaml`) a folder carries beside its entries,
+    /// which match every question and answer none. They stay with the owner.
+    pub except: Vec<String>,
 }
 
 impl Draws {
     /// Whether the file at workspace-relative `path` is one this group draws.
     pub fn takes(&self, path: &str) -> bool {
+        let name = path.rsplit('/').next().unwrap_or(path);
         self.paths
             .iter()
             .any(|prefix| path.starts_with(prefix.as_str()))
+            && !self.except.iter().any(|hub| hub == name)
     }
 }
 
@@ -1527,6 +1533,28 @@ impl Schema {
             ids.extend(layer.all_section_ids());
         }
         ids
+    }
+}
+
+#[cfg(test)]
+mod draws_tests {
+    use super::Draws;
+    use crate::projection::ids::GroupId;
+
+    /// **A hub file under a drawn path is not drawn**; an entry beside it is,
+    /// and a file of the same name outside the paths was never drawn.
+    #[test]
+    fn a_hub_file_under_a_drawn_path_is_not_drawn() {
+        let d = Draws {
+            from: GroupId::new(1),
+            paths: vec!["journals/".into()],
+            except: vec!["README.md".into(), "group.yaml".into()],
+        };
+        assert!(d.takes("journals/groups/zen/2026-11-01-0900-a1b2.yaml"));
+        assert!(!d.takes("journals/groups/zen/README.md"));
+        assert!(!d.takes("journals/groups/guest/group.yaml"));
+        assert!(!d.takes("candle/README.md"));
+        assert!(d.takes("journals/groups/zen/README.md.yaml"));
     }
 }
 

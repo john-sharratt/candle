@@ -555,6 +555,7 @@ mod tests {
         let draws = Draws {
             from: GroupId::from_raw(2).unwrap(),
             paths: vec!["r/src/".into()],
+            except: Vec::new(),
         };
         let rs = scoped(root.path()).with_drawn(vec![(guides, draws)]);
         let files = RepoFiles::overlay(ws).unwrap();

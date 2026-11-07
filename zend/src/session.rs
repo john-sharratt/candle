@@ -5531,6 +5531,11 @@ fn calibrate_guidance_reads(
         };
         for read in reads {
             let Some((unit, key)) = guidance::unit_of(&state.engine, &files, &read) else {
+                tracing::debug!(
+                    target: "zend::guidance",
+                    subject = %read.path(),
+                    "no finished unit for a drawn read at this base: it seals no exemplar",
+                );
                 continue;
             };
             let subject = read.path();
