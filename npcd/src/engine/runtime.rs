@@ -101,9 +101,9 @@ use crate::engine::loopguard::{salient, Took, NUDGE};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mind_record;
 use crate::engine::mission::{
-    compass_line, compass_report_line, doc_compass, post_work_line, progress_line, publish_compass,
-    refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission, MissionPrompt,
-    Outcome as Verdict,
+    compass_line, compass_report_line, doc_compass, given_compass, post_work_line, progress_line,
+    publish_compass, refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission,
+    MissionPrompt, Outcome as Verdict,
 };
 use crate::engine::mission_acts::{self, COMMAND_DESK};
 use crate::engine::mission_gen;
@@ -1732,8 +1732,13 @@ impl Runtime {
                 // terminal that only reads, a Maker was told "at a desk, `scan`
                 // shows its address", scanned the terminal it stood at, and
                 // never found the desk it needed.
+                // A document whose text the brief gives is written as given,
+                // with `file_write`, not composed.
+                let given = mission.writes_given();
+                let write = url_of("file_write");
                 let (act, here_does) = match &doc {
                     DocStep::Read(_) => ("file_read", desk.read.is_some()),
+                    DocStep::Write(_) if given => ("file_write", write.is_some()),
                     DocStep::Write(_) => ("compose", desk.compose.is_some()),
                 };
                 let way = (!here_does)
@@ -1744,6 +1749,15 @@ impl Runtime {
                             .and_then(&way_to)
                     })
                     .flatten();
+                if let (DocStep::Write(p), true) = (&doc, given) {
+                    return Some(given_compass(
+                        p,
+                        write.as_deref(),
+                        desk.commit.as_deref(),
+                        way.as_deref(),
+                        mission.gate_refusal.as_deref(),
+                    ));
+                }
                 if let (DocStep::Write(p), Some(refusal)) = (&doc, &mission.gate_refusal) {
                     return Some(refused_compass(p, refusal, &desk, way.as_deref()));
                 }

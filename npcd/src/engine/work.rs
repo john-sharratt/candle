@@ -950,6 +950,17 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
                 .find(|at| at.area == here.area)
                 .or_else(|| desks.first())?;
             let room = room_of(desk)?;
+            // At the desk already, the way is the act, not a walk to where it
+            // stands.
+            if **desk == here {
+                let write = match s.missions.active(body).is_some_and(|m| m.writes_given()) {
+                    true => "`file_write` it exactly as your brief gives it",
+                    false => "write it with `compose`",
+                };
+                return Some(format!(
+                    "You are at a desk, in {room}: {write}, then `bench_commit` it."
+                ));
+            }
             return Some(match desk.area == here.area {
                 true => format!("A desk is within reach in {room}: `move_to` it, and work there."),
                 false => format!(
@@ -4383,6 +4394,83 @@ mod tests {
                 .iter()
                 .any(|o| o.ends_with(&format!(", {device}: {mode}"))),
             "{observed:?}"
+        );
+    }
+
+    /// **At a desk already, a stuck report is told the act there, not a walk to
+    /// it.**
+    #[test]
+    fn a_stuck_report_at_the_desk_is_told_the_act_there() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let h = vault();
+        h.with_sim(|s| {
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Write the story.",
+                    vec![Todo::new("write layers/stories/y.md")],
+                    Origin::Lodged { by: "op".into() },
+                ),
+            )
+        });
+        assert_eq!(
+            perform(
+                &h,
+                "m1",
+                &act(
+                    "report_stuck",
+                    json!({"why": "there is no desk to write it at"})
+                )
+            ),
+            Outcome::Refused(
+                "It is not stuck yet — You are at a desk, in the early range: write it with \
+                 `compose`, then `bench_commit` it. Do that, then come back to the table and \
+                 `invoke` its `report_done` with what you found."
+                    .into()
+            )
+        );
+    }
+
+    /// **A mission whose text its brief gives is told `file_write` at the desk,
+    /// not `compose`.**
+    #[test]
+    fn a_stuck_report_at_the_desk_with_given_text_is_told_file_write() {
+        use crate::engine::mission::{Mission, Origin, Todo, Work};
+        let h = vault();
+        h.with_sim(|s| {
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Write the template.",
+                    vec![Todo::new("write layers/stories/y.md")],
+                    Origin::Lodged { by: "op".into() },
+                )
+                .with_work(Work {
+                    writes: "layers/stories/y.md".into(),
+                    reads: vec![],
+                    min_words: 0,
+                    edit_optional: false,
+                    anew: false,
+                    checks: Vec::new(),
+                    tools: vec!["file_write".into()],
+                }),
+            )
+        });
+        assert_eq!(
+            perform(
+                &h,
+                "m1",
+                &act(
+                    "report_stuck",
+                    json!({"why": "there is no desk to write it at"})
+                )
+            ),
+            Outcome::Refused(
+                "It is not stuck yet — You are at a desk, in the early range: `file_write` it \
+                 exactly as your brief gives it, then `bench_commit` it. Do that, then come back \
+                 to the table and `invoke` its `report_done` with what you found."
+                    .into()
+            )
         );
     }
 
