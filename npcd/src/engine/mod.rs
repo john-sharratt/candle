@@ -72,6 +72,7 @@ pub mod environment;
 pub mod event;
 pub mod guardian;
 pub mod guardian_api;
+pub mod held;
 pub mod identity;
 pub mod ingest;
 pub mod interaction;

@@ -1062,7 +1062,13 @@ async fn import_npcs(State(s): State<Arc<Authored>>, Json(body): Json<Value>) ->
             }
         };
     match s.npcs.import(payloads) {
-        Ok(n) => Json(json!({ "imported": n })).into_response(),
+        Ok(n) => {
+            // A restored record may be suspended (`crate::freeze`).
+            if let Some(rt) = s.runtime.as_ref() {
+                rt.follow_frozen();
+            }
+            Json(json!({ "imported": n })).into_response()
+        }
         Err(e) => {
             tracing::error!(error = ?e, "npc import failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "import failed").into_response()
@@ -1595,6 +1601,10 @@ async fn patch_npc(
     };
     match s.npcs.patch(npc_id, &owner, &body, now_ms()) {
         Ok(mut v) => {
+            // A state edit may suspend or resume it (`crate::freeze`).
+            if let Some(rt) = s.runtime.as_ref() {
+                rt.follow_frozen();
+            }
             name_personality(&mut v, &*s.personalities.read().await);
             Json(v).into_response()
         }
@@ -4651,11 +4661,12 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 
-    /// **Freezing, through the routes.** An owner freezes their own character
+    /// **Freezing, through the routes.** An owner suspends their own character
     /// and a stranger cannot; the listing says which are frozen; a frozen
     /// character's model is not run by the routes that decode for it; the
     /// whole-cast route counts what it changed and reaches everybody's for an
-    /// admin; and the state comes back off the log after a restart.
+    /// admin; the state comes back off the log after a restart; and the thaw
+    /// of the whole cast resumes only what that freeze suspended.
     #[tokio::test]
     async fn characters_are_frozen_and_unfrozen_through_the_routes() {
         let dir = tmp("freeze");
@@ -4717,6 +4728,7 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{npc}");
+        assert_eq!(npc["state"], "suspended");
         assert_eq!(npc["frozen"], true);
         assert_eq!(npc["npc_id"], json!(varek));
 
@@ -4808,13 +4820,23 @@ mod tests {
             assert_eq!(s, StatusCode::OK, "{npc}");
             assert_eq!(npc["frozen"], want, "{}", npc["name"]);
         }
+        // The thaw of the whole cast puts back what that freeze suspended, and
+        // leaves the one its owner suspended on its own as it is.
         let (s, v) = call(
-            router(again),
+            router(again.clone()),
             send("/v1/npcs/freeze", "POST", ADMIN, json!({ "frozen": false })),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
-        assert_eq!(v, json!({ "frozen": false, "changed": 2 }));
+        assert_eq!(v, json!({ "frozen": false, "changed": 1 }));
+        for (id, who, want) in [(varek, a, "suspended"), (wren, b, "idle")] {
+            let (_, npc) = call(
+                router(again.clone()),
+                get(&format!("/v1/npc/{id}"), Some(who)),
+            )
+            .await;
+            assert_eq!(npc["state"], want, "{}", npc["name"]);
+        }
     }
 
     /// **Hidden worlds, and the whole word that reveals them.**

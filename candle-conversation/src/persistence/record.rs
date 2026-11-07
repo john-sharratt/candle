@@ -1341,20 +1341,20 @@ pub struct NpcPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mood: Option<String>,
 
-    /// Whether this character is frozen: it takes no turn of any kind — no
-    /// decode, no reflection, no dream, no journal draft, no question put to it
-    /// — until it is unfrozen. What reaches it meanwhile waits in its inbox.
+    /// The state a freeze of the whole cast found this character in, while that
+    /// freeze holds it `suspended`.
     ///
-    /// Operational state, set by its owner or an admin to take the cast's load
-    /// off the card, and carried here because it must hold across a restart
-    /// and be the same on every member: this record is what replicates. Not an
-    /// authoring act, for the reason a mood is not one.
+    /// `suspended` is what stops a character's turns, and a freeze of the whole
+    /// cast sets it on every character it reaches — over whatever state each
+    /// one's owner had set. This is that state, so the thaw of the whole cast
+    /// puts each one back where it was. Written only by that freeze; any other
+    /// change of state, an owner's own suspend among them, clears it, so a
+    /// character its owner suspended stays suspended through the thaw.
     ///
-    /// Absent means not frozen, which is what every character is until somebody
-    /// freezes it; the key is written only while it is `true`, so a record of an
-    /// unfrozen character carries the same bytes it always did.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub frozen: bool,
+    /// Absent on every other record, so a record nobody froze carries the same
+    /// bytes it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_from: Option<String>,
 
     /* ── the authoring plane (§16)──────────────────────────────────────────
      *
@@ -2586,7 +2586,7 @@ mod tests {
             // covers the field being present.
             at: None,
             mood: None,
-            frozen: false,
+            suspended_from: None,
             beliefs: vec![AuthoredBelief {
                 belief_id: "hess_word".to_string(),
                 statement: "Hess keeps his word.".to_string(),
@@ -2674,28 +2674,29 @@ mod tests {
         assert_eq!(older.at, None);
     }
 
-    /// **A frozen character's record says so in one key, and an unfrozen one's
-    /// does not carry it at all.** The key sits between `portrait_origin` and the
-    /// authoring plane, where the struct declares it; a record without it — every
-    /// record written before anybody froze anything — decodes as not frozen.
+    /// **A character a freeze of the whole cast holds carries the state it
+    /// found in one key, and any other carries none.** The key sits between
+    /// `portrait_origin` and the authoring plane, where the struct declares it;
+    /// a record without it decodes as one no such freeze holds.
     #[test]
-    fn a_frozen_character_writes_one_key_and_an_unfrozen_one_none() {
-        let mut frozen = npc_fixture();
-        frozen.frozen = true;
-        let text = String::from_utf8(frozen.encode()).unwrap();
+    fn the_state_a_cast_freeze_found_is_one_key_and_absent_otherwise() {
+        let mut held = npc_fixture();
+        held.state = "suspended".to_string();
+        held.suspended_from = Some("active".to_string());
+        let text = String::from_utf8(held.encode()).unwrap();
         assert!(
-            text.contains(r#""portrait_origin":"uploaded","frozen":true,"beliefs":["#),
+            text.contains(
+                r#""portrait_origin":"uploaded","suspended_from":"active","beliefs":["#
+            ),
             "{text}"
         );
-        assert_eq!(
-            NpcPayload::decode(frozen.encode().as_slice()).unwrap(),
-            frozen
-        );
+        assert!(text.contains(r#""state":"suspended","#), "{text}");
+        assert_eq!(NpcPayload::decode(held.encode().as_slice()).unwrap(), held);
 
-        let thawed = String::from_utf8(npc_fixture().encode()).unwrap();
-        assert!(!thawed.contains("frozen"), "{thawed}");
-        let older = NpcPayload::decode(thawed.as_bytes()).unwrap();
-        assert!(!older.frozen);
+        let free = String::from_utf8(npc_fixture().encode()).unwrap();
+        assert!(!free.contains("suspended_from"), "{free}");
+        let older = NpcPayload::decode(free.as_bytes()).unwrap();
+        assert_eq!(older.suspended_from, None);
     }
 
     #[test]

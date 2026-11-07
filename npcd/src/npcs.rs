@@ -71,7 +71,13 @@ pub use freeze::Manager;
 /// States a character may be in, mirroring §10 of the design doc. A state off
 /// this list is a typo or a version skew, and either way not something to write
 /// into a durable record.
-pub const STATES: [&str; 5] = ["active", "idle", "asleep", "suspended", "tombstoned"];
+pub const STATES: [&str; 5] = ["active", "idle", "asleep", SUSPENDED, "tombstoned"];
+
+/// The state that stops a character's turns: a suspended character takes no
+/// turn of any kind until its state is changed again (`crate::freeze`). Every
+/// other state is its owner's word for it and changes nothing about how it
+/// runs.
+pub const SUSPENDED: &str = "suspended";
 
 /// The state a new character starts in. Idle, not active: a character that has
 /// never been ticked is not doing anything, and saying `active` would put it in
@@ -519,8 +525,8 @@ impl Npcs {
             // Nobody has asked it how it feels yet, which is a different fact
             // from it being calm.
             mood: None,
-            // Running: a character is frozen only by somebody freezing it.
-            frozen: false,
+            // No freeze of the whole cast holds it.
+            suspended_from: None,
             // The authoring plane starts empty. A character nobody has written
             // beliefs for holds none — which is different from one whose
             // beliefs could not be read, and is what the console shows.
@@ -577,6 +583,9 @@ impl Npcs {
                 return Err(NpcError::Invalid("state"));
             }
             npc.state = s.to_string();
+            // The owner has said where it stands, which a thaw of the whole
+            // cast must not then overrule.
+            npc.suspended_from = None;
         }
         if let Some(v) = body.get("heartbeat_ms") {
             let ms = v.as_u64().ok_or(NpcError::Invalid("heartbeat_ms"))?;
@@ -1054,8 +1063,9 @@ fn wire(n: &NpcPayload, caller: &str) -> Value {
         "owner_id": n.owner_id,
         "access": if n.owner_id == caller { "owner" } else { "viewer" },
         "hidden": n.hidden,
-        // Takes no turn of any kind until unfrozen — see `NpcPayload::frozen`.
-        "frozen": n.frozen,
+        // Whether it is suspended, and so takes no turn of any kind — `state`
+        // read for the one value that stops it (`crate::freeze`).
+        "frozen": n.state == SUSPENDED,
         "tags": n.tags,
         "portrait": n.portrait_image_id.as_ref().map(|id| json!({
             "image_id": id,

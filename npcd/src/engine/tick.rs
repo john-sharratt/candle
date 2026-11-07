@@ -49,6 +49,7 @@ use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::engine::event::{Event, EventKind, Salience};
+use crate::engine::held;
 use crate::engine::journal::closing;
 use crate::engine::journal::state::{JournalState, Waiting};
 use crate::engine::mission::Mission;
@@ -622,9 +623,10 @@ impl Scheduler {
     ///
     /// A frozen character is never due: [`Self::wait_due`] parks its task on
     /// its waker, [`Self::due_now`] leaves it out, and [`Self::begin_tick`]
-    /// refuses it a turn. Everything delivered meanwhile stays in its inbox, and
-    /// unfreezing rings its waker so a character with something waiting thinks
-    /// about it at once.
+    /// refuses it a turn. Everything delivered meanwhile stays in its inbox.
+    /// Unfreezing bounds that backlog per source ([`held::bound`]) and rings
+    /// the waker, so a character with something waiting thinks about it at
+    /// once, on the newest of each source and a count of the rest.
     pub fn freeze(&self, npc_id: u64, frozen: bool) -> bool {
         let changed = {
             let mut set = self.frozen.lock().unwrap();
@@ -635,7 +637,7 @@ impl Scheduler {
             }
         };
         if changed && !frozen {
-            self.ring(npc_id);
+            self.thaw(npc_id);
         }
         changed
     }
@@ -646,8 +648,8 @@ impl Scheduler {
     ///
     /// What follows the records: a character frozen or unfrozen on another
     /// member arrives here as its record, and this is how the scheduler comes
-    /// to agree with it. Each character unfrozen has its waker rung, as
-    /// [`Self::freeze`] rings it.
+    /// to agree with it. Each character unfrozen is thawed as [`Self::freeze`]
+    /// thaws it.
     pub fn follow_frozen(&self, frozen: HashSet<u64>) -> Vec<(u64, bool)> {
         let changed: Vec<(u64, bool)> = {
             let mut set = self.frozen.lock().unwrap();
@@ -662,7 +664,7 @@ impl Scheduler {
         };
         for (id, now_frozen) in &changed {
             if !now_frozen {
-                self.ring(*id);
+                self.thaw(*id);
             }
         }
         changed
@@ -673,18 +675,25 @@ impl Scheduler {
         self.frozen.lock().unwrap().contains(&npc_id)
     }
 
-    /// Wake a character's task so it reads its standing again. Nothing for a
-    /// character with no inbox here.
-    fn ring(&self, npc_id: u64) {
-        let waker = self
-            .inboxes
-            .lock()
-            .unwrap()
-            .get(&npc_id)
-            .map(|i| Arc::clone(&i.waker));
-        if let Some(waker) = waker {
-            waker.notify_one();
-        }
+    /// Let a character go: bound what queued while it was held, then wake its
+    /// task. Nothing for a character with no inbox here.
+    ///
+    /// The head of the queue a failed turn handed back is already in the
+    /// window ([`Self::retry`]) and is left whole; what follows it is bounded
+    /// to [`held::PER_SOURCE`] per source.
+    fn thaw(&self, npc_id: u64) {
+        let waker = {
+            let mut inboxes = self.inboxes.lock().unwrap();
+            let Some(inbox) = inboxes.get_mut(&npc_id) else {
+                return;
+            };
+            let waiting: Vec<Event> = inbox.queue.drain(..).collect();
+            let (replayed, held) = waiting.split_at(inbox.replayed.min(waiting.len()));
+            let bounded = held::bound(held.to_vec(), held::PER_SOURCE, || self.next_seq());
+            inbox.queue = replayed.iter().cloned().chain(bounded).collect();
+            Arc::clone(&inbox.waker)
+        };
+        waker.notify_one();
     }
 
     /// Bring a character into the scheduler. Idempotent — a character already

@@ -2,12 +2,15 @@
 //! may manage, and the refusal every route that would run a frozen character's
 //! model answers with.
 //!
-//! A frozen character takes no turn of any kind — its scheduler never makes it
-//! due, the guardian does not scan it, and the routes that decode for it
-//! directly (`ask`, `reflect`, `dream`, `journal/draft`) refuse it with
-//! [`frozen`]. Everything delivered to it meanwhile — a message, a thought, a
-//! line in an interaction, what its world does around it — waits in its inbox
-//! and is read on the turn it takes once unfrozen.
+//! Frozen is `state: suspended` ([`SUSPENDED`]), whoever set it — these routes,
+//! or an owner's Suspend on the character's own page. A suspended character
+//! takes no turn of any kind: its scheduler never makes it due, the guardian
+//! does not scan it, the round does not judge its mission stale, its lease
+//! does not move it, and the routes that decode for it directly (`ask`,
+//! `reflect`, `dream`, `journal/draft`) refuse it with [`frozen`]. Everything
+//! delivered to it meanwhile — a message, a thought, a line in an interaction,
+//! what its world does around it — waits in its inbox, and the turn after the
+//! thaw reads it bounded per source (`Scheduler::freeze`).
 //!
 //! The state is the character's record ([`crate::npcs::Npcs::freeze`]), so it
 //! survives a restart and replicates; the member that writes it brings its own
@@ -23,13 +26,17 @@ use axum::Json;
 use serde_json::{json, Value};
 use web::auth::Role;
 
-use crate::api::{err, name_personality, npc_err, owner_of, Authored};
-use crate::npcs::{npc_id_of_wire, Manager};
+use crate::api::{err, name_personality, now_ms, npc_err, owner_of, Authored};
+use crate::npcs::{npc_id_of_wire, Manager, SUSPENDED};
 
 /// The `409` a route that would decode for a frozen character answers with,
 /// or `None` for a character that is not frozen.
 pub fn frozen(s: &Authored, npc_id: u64) -> Option<Response> {
-    let held = s.npcs.view().payload(npc_id).is_some_and(|n| n.frozen);
+    let held = s
+        .npcs
+        .view()
+        .payload(npc_id)
+        .is_some_and(|n| n.state == SUSPENDED);
     held.then(|| {
         err(
             StatusCode::CONFLICT,
@@ -75,10 +82,12 @@ fn follow(s: &Authored) {
     }
 }
 
-/// `POST /v1/npc/:nid/freeze` — freeze or unfreeze one character.
+/// `POST /v1/npc/:nid/freeze` — suspend one character, or resume it.
 ///
-/// Body `{"frozen": true|false}`. Its owner's, or any admin's. Answers with
-/// the character as it now stands, `frozen` among its fields.
+/// Body `{"frozen": true|false}`. Its owner's, or any admin's — the same act as
+/// the owner's Suspend / Resume: resuming puts back the state a freeze of the
+/// whole cast found it in, or `idle`. Answers with the character as it now
+/// stands, its `state` and the `frozen` derived from it among its fields.
 pub async fn post_freeze(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
@@ -96,7 +105,7 @@ pub async fn post_freeze(
     let Some(npc_id) = npc_id_of_wire(&nid) else {
         return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
     };
-    match s.npcs.freeze(npc_id, manager(&me, admin), frozen) {
+    match s.npcs.freeze(npc_id, manager(&me, admin), frozen, now_ms()) {
         Ok(mut v) => {
             follow(&s);
             tracing::info!(npc = %nid, frozen, "character freeze set");
@@ -107,11 +116,13 @@ pub async fn post_freeze(
     }
 }
 
-/// `POST /v1/npcs/freeze` — freeze or unfreeze every character the caller may
-/// manage: their own, or for an admin the whole cast.
+/// `POST /v1/npcs/freeze` — suspend every character the caller may manage
+/// (their own, or for an admin the whole cast), or resume every one such a
+/// freeze suspended.
 ///
-/// Body `{"frozen": true|false}`. Answers `{"frozen": bool, "changed": n}`,
-/// `n` counting only the characters that were not already so.
+/// Body `{"frozen": true|false}`. Freezing keeps each character's state to put
+/// back; thawing puts back only what a freeze kept, so a character suspended
+/// any other way stays suspended. Answers `{"frozen": bool, "changed": n}`.
 pub async fn post_freeze_all(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
