@@ -16,13 +16,13 @@
 use std::time::Instant;
 
 use anyhow::Context;
-use candle_conversation::projection::{DecodePriority, Reserved, TurnIndex, TurnKey};
+use candle_conversation::projection::{Reserved, TurnIndex, TurnKey};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::{ConversationEngine, Sequence};
 
 use crate::branch_ingest::plan::Committed;
 use crate::ingest_lease::{self, Share};
-use crate::refresh_ctx::RefreshContext;
+use crate::refresh_ctx::{RefreshContext, PRIMING_BAND};
 
 /// What kind of reading a unit is, which says how its anchor names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,12 +146,20 @@ pub fn fill(ctx: &RefreshContext<'_>, units: &[(Reading, Committed)]) -> usize {
 
 /// The conversation every face of one [`fill`] forks: the `Face` layer, framed
 /// by the prelude every dialogue primes on, holding no turn.
+///
+/// At [`PRIMING_BAND`], as the priming chain's links are, and for the same
+/// reason: until a unit has a face a dialogue holds its request, so a face is
+/// not background work. At `Low` a face yields 64:1 to any `High` decode, and
+/// beside npcd's constant decodes on WhiteWorld the backfill sealed its first
+/// hundred while npcd loaded and then none for half an hour (2026-11-07). A
+/// face is a prefill of a few dozen tokens, so the band costs a dialogue next
+/// to nothing.
 fn opened_base(ctx: &RefreshContext<'_>) -> anyhow::Result<Sequence> {
     ctx.engine
         .new_reserved_conversation(
             ctx.formatted_prompt,
             Reserved::Face,
-            DecodePriority::Low,
+            PRIMING_BAND,
             ctx.config.clone(),
         )
         .context("faces' base conversation")
