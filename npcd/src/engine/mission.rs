@@ -24,6 +24,7 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::mission_gen::world::Routine;
 use crate::sim::agenda::Agendum;
 
 /// One step of a mission. `done` flips when the character ticks it off.
@@ -994,6 +995,22 @@ pub fn compass_line(next: &Todo, people: &[(String, Option<String>)], way: Optio
         }
     }
     line
+}
+
+/// The standing jobs an order-giver may post by name, for the compass of a step
+/// that posts work: every job's id, in the catalogue's order. `None` with no
+/// catalogue.
+pub fn job_catalogue(routines: &[Routine]) -> Option<String> {
+    if routines.is_empty() {
+        return None;
+    }
+    let ids: Vec<String> = routines.iter().map(|r| format!("`{}`", r.id)).collect();
+    Some(format!(
+        "Post one of the standing jobs by name — `order_post` with `job` — when one fits what \
+         the families need: {}. Write a brief and steps of your own only for what none of them \
+         covers.",
+        ids.join(", ")
+    ))
 }
 
 /// The addresses a document step is done through, at the desk the body stands

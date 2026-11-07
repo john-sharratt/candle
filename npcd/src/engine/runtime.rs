@@ -101,9 +101,9 @@ use crate::engine::loopguard::{salient, Took, NUDGE};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mind_record;
 use crate::engine::mission::{
-    compass_line, compass_report_line, doc_compass, progress_line, publish_compass,
-    refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission, MissionPrompt,
-    Outcome as Verdict,
+    compass_line, compass_report_line, doc_compass, job_catalogue, progress_line,
+    publish_compass, refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission,
+    MissionPrompt, Outcome as Verdict,
 };
 use crate::engine::mission_acts::{self, COMMAND_DESK};
 use crate::engine::mission_gen;
@@ -1766,7 +1766,19 @@ impl Runtime {
                 })
                 .collect();
             let way = way.map(|w| format!("It is in {w}."));
-            Some(compass_line(&next, &people, way.as_deref()))
+            let mut line = compass_line(&next, &people, way.as_deref());
+            // **Work is posted from the world's catalogue.** Told only "post work
+            // on the order table", Zen never saw the jobs it could post by name
+            // and wrote its own instead — a crisis a turn, each one a template
+            // the Drones were set to write.
+            let posts = next.text.to_lowercase().starts_with("post work");
+            if posts && s.missions.is_unordered(&body) {
+                if let Some(jobs) = job_catalogue(s.missions.routines()) {
+                    line.push(' ');
+                    line.push_str(&jobs);
+                }
+            }
+            Some(line)
         })
     }
 
@@ -8207,6 +8219,50 @@ mod tests {
         assert_eq!(
             attends,
             "Your mission, next: go to the command room. It is in the command room: `focus` on it."
+        );
+    }
+
+    /// **A step that posts work names the jobs it may post.** Told only "post
+    /// work on the order table", Zen never saw the catalogue and invented a
+    /// crisis a turn instead.
+    #[tokio::test]
+    async fn the_compass_to_post_work_names_the_standing_jobs() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        use crate::engine::mission_gen::world::{Draw, Routine};
+        use npc_map::world::Where;
+        let rt = vaulted();
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let table = Where::new("vault-command", "command-room");
+        hosted.with(|w| w.enter("m1", "Zen".to_string(), table).unwrap());
+        rt.scheduler.wake(1, 0, 0);
+        rt.embody(1, WORLD, "m1", 0).expect("bound");
+        let job = |id: &str| Routine {
+            id: id.into(),
+            brief: "b".into(),
+            steps: vec!["go to the ward room".into()],
+            ..Default::default()
+        };
+        hosted.with_sim(|s| {
+            s.missions.set_unordered("m1", true);
+            s.missions
+                .set_routines(vec![job("ward-patrol"), job("morning-briefing")], Draw::None);
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Set the work.",
+                    vec![Todo::new("post work on the order table")],
+                    Origin::Lodged {
+                        by: "u_op".to_string(),
+                    },
+                ),
+            );
+        });
+        assert_eq!(
+            rt.mission_compass(1).expect("a compass"),
+            "Your mission, next: post work on the order table. Post one of the standing jobs by \
+             name — `order_post` with `job` — when one fits what the families need: \
+             `ward-patrol`, `morning-briefing`. Write a brief and steps of your own only for what \
+             none of them covers."
         );
     }
 
