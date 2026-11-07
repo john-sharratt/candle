@@ -1078,11 +1078,11 @@ are binary, so a Zen task commits them (§17.7) — the worker takes the link
 each picture to its kind's shape and sizes it to its kind's sizes as lossy
 WebP (libwebp, quality 82) — the model's flat art carries a fine grain that
 lossless coding keeps at nearly a PNG's size (measured: a 512 tile 155 KB
-lossless, 2.8 KB lossy; a 1024 header 344 KB and 9.5 KB, alike to the eye), and
-WebP keeps a sticker's transparency exactly, so one format serves every
-kind — reads its dominant colour
-(the most common among its saturated pixels, so the subject rather than its
-cream ground) and the palette colour nearest it, and caches the results by
+lossless, 2.8 KB lossy; a 1024 header 344 KB and 9.5 KB, alike to the
+eye), and WebP keeps a sticker's transparency exactly, so one format serves
+every kind — reads its dominant colour (the most common among its vivid
+pixels — saturated and not pale — so the subject rather than its cream or
+beige ground) and the palette colour nearest it, and caches the results by
 the picture's content. On a change to `library/`, the gate refuses a
 catalogue that does not parse, a line naming a picture that is not there, a
 picture with no line, and anything else in the folder; and it checks every
