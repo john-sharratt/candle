@@ -622,7 +622,10 @@ dozen of them framed exactly like the user's own.
 
 **Each unit has a face.** A face is a one-turn conversation on the reserved
 `Face` layer (`Reserved::Face`). It is framed by the prelude every dialogue
-primes on. Its user half is only the reading's anchor, `file=<repo>/<path>` or
+primes on. Every face of one fill forks a single base conversation, so the
+prelude is sealed once and shared. Measured 2026-11-07: opening each face as a
+conversation of its own wrote roughly 4 GB of redo log a minute while a
+corpus-wide backfill ran, and filled WhiteWorld's substrate drive. Its user half is only the reading's anchor, `file=<repo>/<path>` or
 `folder=<repo>/<dir>` (`zend::faces::anchor`). Its assistant half is the unit's
 own opening, the calls it made, prefilled. The unit names its face under
 `face`, and the face names its unit under `face_of`. Both are plain `custom`

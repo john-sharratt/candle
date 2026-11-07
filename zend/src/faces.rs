@@ -18,7 +18,7 @@ use std::time::Instant;
 use anyhow::Context;
 use candle_conversation::projection::{DecodePriority, Reserved, TurnIndex, TurnKey};
 use candle_conversation::substrate::Substrate;
-use candle_conversation::ConversationEngine;
+use candle_conversation::{ConversationEngine, Sequence};
 
 use crate::branch_ingest::plan::Committed;
 use crate::ingest_lease::{self, Share};
@@ -79,6 +79,19 @@ pub fn fill(ctx: &RefreshContext<'_>, units: &[(Reading, Committed)]) -> usize {
         units = units.len(),
         "sealing faces for the units that lack one",
     );
+    // Every face forks this one conversation, so the prelude framing them is
+    // sealed once and shared — never once per face, which over a corpus of
+    // thousands of units wrote the prelude's K/V that many times.
+    let base = match opened_base(ctx) {
+        Ok(base) => base,
+        Err(e) => {
+            tracing::warn!(
+                target: "zend::faces",
+                "opening the faces' base conversation failed; no face is sealed: {e:#}",
+            );
+            return 0;
+        }
+    };
     let mut tally = Tally::default();
     for (done, (reading, unit)) in faceless.into_iter().enumerate() {
         if crate::ingest_cancel::cancelled() {
@@ -90,7 +103,7 @@ pub fn fill(ctx: &RefreshContext<'_>, units: &[(Reading, Committed)]) -> usize {
             Share::Mine(guard) if guard.recheck() && has_face(ctx.engine, unit) => {
                 tally.arrived += 1
             }
-            Share::Mine(_guard) => match seal(ctx, *reading, unit) {
+            Share::Mine(_guard) => match seal(ctx, &base, *reading, unit) {
                 Ok(()) => tally.sealed += 1,
                 Err(e) => {
                     tally.failed += 1;
@@ -125,7 +138,24 @@ pub fn fill(ctx: &RefreshContext<'_>, units: &[(Reading, Committed)]) -> usize {
         elapsed_s = started.elapsed().as_secs(),
         "sealed ingest units' faces",
     );
+    // The base holds no turn of its own; only its forks are faces.
+    if let Err(e) = ctx.engine.tombstone_timeline(base.timeline_id()) {
+        tracing::warn!(target: "zend::faces", "retiring the faces' base failed: {e:#}");
+    }
     tally.sealed
+}
+
+/// The conversation every face of one [`fill`] forks: the `Face` layer, framed
+/// by the prelude every dialogue primes on, holding no turn.
+fn opened_base(ctx: &RefreshContext<'_>) -> anyhow::Result<Sequence> {
+    ctx.engine
+        .new_reserved_conversation(
+            ctx.formatted_prompt,
+            Reserved::Face,
+            DecodePriority::Low,
+            ctx.config.clone(),
+        )
+        .context("faces' base conversation")
 }
 
 /// Whether `unit` has a live face.
@@ -140,21 +170,19 @@ fn has_face(engine: &ConversationEngine, unit: &Committed) -> bool {
 /// Seal `unit`'s face: the face names its unit before its turn is prefilled,
 /// and the unit names the face only once the turn holds, so a face that
 /// failed part-way is never one a dialogue is pointed at.
-fn seal(ctx: &RefreshContext<'_>, reading: Reading, unit: &Committed) -> anyhow::Result<()> {
+fn seal(
+    ctx: &RefreshContext<'_>,
+    base: &Sequence,
+    reading: Reading,
+    unit: &Committed,
+) -> anyhow::Result<()> {
     let e = ctx.engine;
     let (_, opening) = e
         .turn_texts(unit.timeline)
         .into_iter()
         .next()
         .context("the unit holds no turn")?;
-    let mut face = e
-        .new_reserved_conversation(
-            ctx.formatted_prompt,
-            Reserved::Face,
-            DecodePriority::Low,
-            ctx.config.clone(),
-        )
-        .context("face conversation")?;
+    let mut face = base.fork().context("face conversation")?;
     let timeline = face.timeline_id();
     e.set_conversation_metadata(
         timeline,
