@@ -195,4 +195,38 @@ mod tests {
             }
         );
     }
+    /// A value missing any one of its fields is not one this wrote: each case
+    /// is well-formed except for the one field absent.
+    #[test]
+    fn a_value_missing_any_field_is_refused() {
+        // missing the queued= word entirely
+        assert_eq!(
+            RoundTiming::parse("prefill=512/1400ms decode=210/6100ms"),
+            None
+        );
+        // missing the prefill= word entirely
+        assert_eq!(RoundTiming::parse("queued=2500 decode=210/6100ms"), None);
+        // missing the decode= word entirely
+        assert_eq!(RoundTiming::parse("queued=2500 prefill=512/1400ms"), None);
+        // prefill present but its token count is empty
+        assert_eq!(
+            RoundTiming::parse("queued=2500 prefill=/1400ms decode=210/6100ms"),
+            None
+        );
+        // prefill present but its ms is empty
+        assert_eq!(
+            RoundTiming::parse("queued=2500 prefill=512/ms decode=210/6100ms"),
+            None
+        );
+        // decode present but its token count is empty
+        assert_eq!(
+            RoundTiming::parse("queued=2500 prefill=512/1400ms decode=/6100ms"),
+            None
+        );
+        // decode present but its ms is empty
+        assert_eq!(
+            RoundTiming::parse("queued=2500 prefill=512/1400ms decode=210/ms"),
+            None
+        );
+    }
 }
