@@ -95,6 +95,7 @@ use crate::api::substrate::{
 use crate::branch_ingest::filter::IngestScope;
 use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY};
 use crate::branch_ingest::{moves_branches, BranchIngest, LayerPass};
+use crate::calibrate::thinking::thinking_of;
 use crate::calibrate::{calibrate_layer, Frame as CalibrateFrame, Layer as CalibrateLayer};
 use crate::code_read::{FILE_READ_TOOL, PATH_KEY};
 use crate::coding_sampling;
@@ -106,6 +107,7 @@ use crate::conv_overlay::{self, Mirror};
 use crate::conv_sweep::{CONV_IDLE_TTL, CONV_SWEEP_EVERY};
 use crate::deletions::Deletions;
 use crate::engine_asks;
+use crate::guidance;
 use crate::hand_records::{self, Carrying};
 use crate::held_values::FilesSeen;
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
@@ -5260,6 +5262,13 @@ fn run_inference_stream(
                 }
             }
             withhold_read_files(&state, timeline, &cs.files, &results).await;
+            calibrate_guidance_reads(
+                &state,
+                &cs.files,
+                &results,
+                &original_user_message,
+                &resp.answer,
+            );
             cs.seen.note(&results);
             let now_out = unavailable(&state.tool_host.availability_facts(), &offered);
             announce_returned(&mut results, &withheld, &now_out);
@@ -5427,6 +5436,64 @@ async fn withhold_read_files(
             "withholding the round's read files panicked: {e}"
         );
     }
+}
+
+/// Seal every read of a drawn unit `results` made — a guide, a journal — as a
+/// use-exemplar of that unit (`crate::guidance`): the reasoning the turn wrote
+/// before the calls, under the request `asked`, is the state the unit was
+/// wanted in. On a thread of its own: finding the unit is git work and the
+/// seal is a prefill, and the turn waits for neither. A read that failed, and
+/// a round with no reasoning ahead of its calls, teach nothing.
+fn calibrate_guidance_reads(
+    state: &Arc<InferenceState>,
+    files: &Arc<RepoFiles>,
+    results: &[ToolResult],
+    asked: &str,
+    answer: &TurnText,
+) {
+    let Some(thought) = thinking_of(answer) else {
+        return;
+    };
+    let Some(case) = guidance::use_case(asked, &thought) else {
+        return;
+    };
+    let reads: Vec<guidance::Read> = results
+        .iter()
+        .filter(|r| r.response.get("error").is_none())
+        .filter_map(|r| guidance::read_path(&r.call, &state.workspace))
+        .filter(|read| state.retrieval_scope.draws(&read.path()))
+        .collect();
+    if reads.is_empty() {
+        return;
+    }
+    let state = Arc::clone(state);
+    let files = Arc::clone(files);
+    std::thread::spawn(move || {
+        let frame = CalibrateFrame {
+            system_prompt: &state.formatted_prompt,
+            config: &state.refresh_config,
+            thinking: turn_triggers(&state, ThinkMode::Balanced, ToolMode::None),
+        };
+        for read in reads {
+            let Some((unit, key)) = guidance::unit_of(&state.engine, &files, &read) else {
+                continue;
+            };
+            let subject = read.path();
+            match guidance::record_use(&state.engine, &frame, unit, &key, &subject, case.clone()) {
+                Ok(retired) => tracing::info!(
+                    target: "zend::guidance",
+                    subject = %subject,
+                    retired,
+                    "a read sealed as its unit's use-exemplar",
+                ),
+                Err(e) => tracing::warn!(
+                    target: "zend::guidance",
+                    subject = %subject,
+                    "sealing a read's use-exemplar failed: {e:#}",
+                ),
+            }
+        }
+    });
 }
 
 /// The journal `timeline`'s metadata records, if it records one.

@@ -46,7 +46,7 @@ pub fn normalise(path: &str, repo_dir: &Path) -> String {
 /// The repository and normalised path a `file_read` names. `None` for any
 /// other call, a read without both, or a repository the workspace does not
 /// list.
-fn read_target(call: &ToolCall, workspace: &Workspace) -> Option<(String, String)> {
+pub(crate) fn read_target(call: &ToolCall, workspace: &Workspace) -> Option<(String, String)> {
     if call.name != FILE_READ {
         return None;
     }

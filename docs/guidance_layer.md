@@ -59,20 +59,44 @@ need it on BlackWorld"), and that rarely reads as a question about the guide.
 
 So a guidance unit is calibrated **from use**:
 
-1. **Every read is a labelled exemplar.** When a worker's turn calls `guide_read
-   {name}` or `journal_read {path}`, the reasoning it wrote before the call is the
-   state in which that unit was wanted. After the round, zend prefills that
-   reasoning, up to the layer's `think` budget, as one more exemplar in the unit's
-   **use calibration**: a conversation of the hidden calibration layer carrying
-   `Substrate::CALIBRATES_KEY` for the unit, marked unresumed, so it keeps no
-   recurrent snapshot. Its questions vote for the unit wherever the unit is
-   scored, exactly as drafted calibrations do.
-2. **The cue seeds a unit no one has read yet.** The layer's `calibrate:` block
-   drafts worker-voice thoughts from the unit's first lines (a guide opens on its
-   cue), not user questions. Mined exemplars join them as reads happen.
-3. **Bounded.** A unit keeps at most `max_exemplars` mined exemplars, the newest
-   kept, so a guide read a thousand times does not dominate the gallery, and a
-   cue that has drifted ages out.
+1. **Every read is a labelled exemplar.** A tool round's read of a unit a
+   drawing group draws counts: a `guide_read {name}` (the guide at
+   `candle/mcp/src/guides/<name>.md`), or a `file_read` of a file under the
+   group's `paths`, such as a journal. The reasoning the turn wrote before the
+   call is the state in which that unit was wanted. After the round, on a thread
+   of its own (`calibrate_guidance_reads`), zend seals one **use-exemplar** of
+   the unit at the version the conversation's base holds (`zend::guidance`).
+   - The case's user half is the start of the turn's request (600 characters).
+   - Its answer is the end of the reasoning (1024 characters, about a live
+     probe's 256-token window), as a closed `<think>` block.
+   - It is sealed exactly as a drafted calibration is (`calibrate::seal`): a
+     conversation of the hidden calibration layer carrying
+     `Substrate::CALIBRATES_KEY` for the unit, archived and distilled
+     provenance-only.
+   - It is named by `guidance_use` (the unit's content key) rather than the
+     drafted calibrations' marker, so a layer's calibration pass neither counts
+     it nor retires it.
+   - Its signature votes for the unit wherever the unit is scored, exactly as a
+     drafted calibration's does.
+   - A round that wrote no reasoning ahead of its calls teaches nothing, and
+     neither does a read that failed.
+2. **The draft seeds a unit no one has read yet.** The layer's `calibrate:`
+   block declares a `guidance_prompt`. A unit under any drawing group's `paths`
+   is drafted with it instead of the layer's `prompt` (`CalibrateSpec::
+   template_for`). It asks for the questions a worker asks itself mid-task at
+   the moment it needs the unit, in its own words, never naming the file.
+   - The parser keeps questions only, so the draft writes questions.
+   - Each question is asked again with thinking on, as every drafted question
+     is, so the seed is a worker's reasoning too.
+   - The marker digests the template the unit is asked under. A changed
+     guidance prompt calibrates the drawn units again, and no code file.
+   Use-exemplars join the drafted ones as reads happen.
+3. **Bounded.** A unit keeps at most `guidance::record::MAX_EXEMPLARS` (16)
+   use-exemplars, the newest by `guidance_used_at`, so a guide read a thousand
+   times does not dominate the gallery, and reasoning that has drifted ages out.
+   Each seal retires the unit's oldest past that bound, and every use-exemplar
+   whose unit is gone. A new version of a file is a new unit, and its use
+   calibration starts empty.
 
 Nothing about this is offline. A read in a worker's turn is calibration for the
 next turn of every conversation.
@@ -108,8 +132,9 @@ Journals reach the same group by the same filter, with two differences:
    its source, the drawn units leaving the owning group's candidates; the
    `guidance` share and `guidance_tokens`. Tests against the substrate, the
    retrieval scope and the working set.
-2. Use calibration: a read in a tool round becomes an exemplar of its unit, kept
-   per unit up to `max_exemplars`. Tests for the exemplar text and its labelling.
-3. Cue seeding for units no one has read.
+2. **Built.** Use calibration: a read in a tool round becomes an exemplar of its
+   unit, kept per unit up to `MAX_EXEMPLARS`. Tests for the read's file, the
+   exemplar text and which exemplars are retired.
+3. **Built.** Seeding for units no one has read: the `guidance_prompt`.
 4. The hit / missed / idle counts.
 5. Journals' recency term.

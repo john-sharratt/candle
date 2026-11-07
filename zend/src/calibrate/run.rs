@@ -33,7 +33,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle_conversation::chain_health::chain_break;
-use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::projection::{
     DecodePriority, GroupId, OptionalState, Reserved, SelectionState, TimelineId,
     NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
@@ -46,6 +45,7 @@ use super::permits::Permits;
 use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
 use super::retire_replies::retire_reply_records;
+use super::seal::seal_calibration;
 use super::spec::CalibrateSpec;
 use super::thinking::{exemplar, thinking_of};
 use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
@@ -318,7 +318,7 @@ fn units_of(substrate: &Substrate, group: GroupId, spec: &CalibrateSpec) -> Vec<
             // A file's reading is keyed by its own content key; a unit built
             // on one records the reading's under `FILE_KEY`.
             let reading = meta.get(FILE_KEY).unwrap_or(key);
-            let marker = spec.marker(key);
+            let marker = spec.marker(key, subject);
             let prior_failures = meta.get(FAILED_KEY).cloned();
             Some(Unit {
                 timeline: tl,
@@ -337,15 +337,17 @@ fn units_of(substrate: &Substrate, group: GroupId, spec: &CalibrateSpec) -> Vec<
     units
 }
 
-/// The config a calibration is prefilled under: the frame's, lossless until
-/// the seal, as the tools' calibrations are — the signature is captured from
-/// every token's Q at the seal, and a quantized K/V would capture it from a
-/// degraded one.
-fn calibration_config(frame: &SequenceConfig) -> SequenceConfig {
-    SequenceConfig {
-        kv_lossless: true,
-        ..frame.clone()
-    }
+/// What names every calibration of `unit`: its kind, the unit it calibrates
+/// ([`Substrate::CALIBRATES_KEY`]), and the unit's subject.
+pub(crate) fn calibration_meta(unit: TimelineId, subject: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("kind".to_string(), TAG.to_string()),
+        (
+            Substrate::CALIBRATES_KEY.to_string(),
+            unit.raw().to_string(),
+        ),
+        (SUBJECT_KEY.to_string(), subject.to_string()),
+    ])
 }
 
 /// The selection a draft is asked under: no reasoning, and no tool block.
@@ -379,7 +381,7 @@ pub fn calibrate_committed(
         timeline,
         subject: subject.to_string(),
         key: key.to_string(),
-        marker: spec.marker(key),
+        marker: spec.marker(key, subject),
         ready: true,
         prior_failures: None,
     };
@@ -418,56 +420,14 @@ fn calibrate_one(
     let think_ms = t_think.elapsed().as_millis() as u64;
     // The exemplars' prefill and seal, the calibration's archive and distill.
     let t_exemplars = Instant::now();
-    let mut conv = engine
-        .new_reserved_conversation(
-            frame.system_prompt,
-            Reserved::Calibration,
-            DecodePriority::Normal,
-            calibration_config(frame.config),
-        )
-        .map_err(|e| anyhow::anyhow!("calibration conversation: {e}"))?;
-    let timeline = conv.timeline_id();
-    // Its K/V is dropped at the distill; written cold, it would be bytes
-    // the next compaction deletes.
-    engine.conversation().mark_timeline_transient(timeline);
-    let mut meta = BTreeMap::new();
-    meta.insert("kind".to_string(), TAG.to_string());
+    let mut meta = calibration_meta(unit.timeline, &unit.subject);
     meta.insert(MARKER_KEY.to_string(), unit.marker.clone());
-    meta.insert(
-        Substrate::CALIBRATES_KEY.to_string(),
-        unit.timeline.raw().to_string(),
-    );
-    meta.insert(SUBJECT_KEY.to_string(), unit.subject.clone());
-    let sealed = conv
-        .set_metadata_many(&meta)
-        .map_err(|e| anyhow::anyhow!("naming the calibration: {e}"))
-        .and_then(|()| {
-            let cases: Vec<(String, String, Vec<String>)> = found
-                .iter()
-                .zip(&thought)
-                .map(|(q, t)| (q.clone(), exemplar(t), vec![TAG.to_string()]))
-                .collect();
-            let (handle, _) = conv
-                .submit_prefilled_turn_group(&cases, SelectionState::new())
-                .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
-            let resp = handle
-                .wait_cancellable(crate::ingest_cancel::token())
-                .map_err(|e| anyhow::anyhow!("prefill: {e}"))?;
-            conv.finish_turn(handle, &resp)
-                .map_err(|e| anyhow::anyhow!("seal: {e}"))?;
-            Ok(())
-        });
-    let e = engine;
-    if let Err(err) = sealed {
-        let _ = e.tombstone_timeline(timeline);
-        return Err(err);
-    }
-    e.set_conversation_archived(timeline, true)
-        .map_err(|err| anyhow::anyhow!("archiving the calibration: {err}"))?;
-    if e.timeline_has_kv(timeline) && !e.is_timeline_distilled(timeline) {
-        e.distill_timeline(timeline, DistillMode::ProvenanceOnly)
-            .map_err(|err| anyhow::anyhow!("distilling the calibration: {err}"))?;
-    }
+    let cases: Vec<(String, String)> = found
+        .iter()
+        .zip(&thought)
+        .map(|(q, t)| (q.clone(), exemplar(t)))
+        .collect();
+    seal_calibration(engine, frame, &meta, &cases)?;
     tracing::debug!(
         target: "zend::calibrate",
         layer = %spec.layer,
@@ -697,6 +657,7 @@ mod tests {
             questions: 4,
             think: 64,
             prompt: "ask".into(),
+            guidance: None,
         };
         let said = |tl: TimelineId, text: &str| {
             conv.record_turn(
@@ -754,7 +715,7 @@ mod tests {
         let unit = |timeline: TimelineId, subject: &str, key: String, ready: bool| Unit {
             timeline,
             subject: subject.into(),
-            marker: spec.marker(&key),
+            marker: spec.marker(&key, subject),
             key,
             ready,
             prior_failures: None,

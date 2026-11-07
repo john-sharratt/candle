@@ -34,6 +34,7 @@ pub mod deletions;
 mod engine_asks;
 pub mod faces;
 pub mod file_commit;
+pub mod guidance;
 pub mod hand_records;
 pub mod handover;
 pub mod held_values;

@@ -138,6 +138,11 @@ impl RetrievalScope {
         self
     }
 
+    /// Whether a drawing group draws the file at workspace-relative `path`.
+    pub fn draws(&self, path: &str) -> bool {
+        self.drawn.iter().any(|(_, draws)| draws.takes(path))
+    }
+
     /// A unit committed: the next turn rebuilds the index.
     pub fn mark_stale(&self) {
         self.stale.store(true, Ordering::SeqCst);
@@ -551,6 +556,7 @@ mod tests {
         let scope = scope_of(&rs, &files);
         assert_eq!(*scope.files, set(&[1, 30]));
         assert_eq!(*scope.drawn[&guides], set(&[2]));
+        assert!(rs.draws("r/src/b.rs") && !rs.draws("r/a.rs"));
 
         let files = files.fresh();
         files

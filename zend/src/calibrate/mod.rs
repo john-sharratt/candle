@@ -27,8 +27,11 @@ pub mod plan;
 pub mod questions;
 pub mod retire_replies;
 pub mod run;
+pub mod seal;
 pub mod spec;
 pub mod thinking;
 
+pub(crate) use run::calibration_meta;
 pub use run::{calibrate_committed, calibrate_layer, Frame, Layer, Report};
+pub(crate) use seal::seal_calibration;
 pub use spec::CalibrateSpec;

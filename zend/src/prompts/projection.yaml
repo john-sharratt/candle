@@ -921,6 +921,12 @@ layers:
       think: 64
       prompt: |
         Write <<n>> different questions someone working in this workspace might ask whose answer needs what you just read in `<<path>>`. Vary what they ask: what it is for, how it works, where something is done, why it is built the way it is, how to change or extend it, what it relates to. Ask them as a person would, not as a summary. At most half may name the file. Write one question per line and nothing else.
+      # The guides and journals the `guidance` group draws are wanted at a
+      # point in a worker's own reasoning, mid-task, so their seed questions
+      # are the ones a worker asks itself there (docs/guidance_layer.md §2.2).
+      # Reads then add the worker's real reasoning as use-exemplars.
+      guidance_prompt: |
+        Write <<n>> different questions a worker in the middle of a task might ask itself at the moment it needs what you just read in `<<path>>`. Each is the next step the worker is stuck on, in its own words, as it reasons: "the fix is on main, how do I get it onto BlackWorld?", "the test passes here, what do I check before I deploy?". Vary the task each comes from and the point it is at. Never name the file or call it a guide or a journal. Write one question per line and nothing else.
     # In tool rounds, like repo_map: a dialogue sees this layer as its working
     # set's files — whole, pinned or by momentum — and the rounds that lean on
     # them must still have them.
