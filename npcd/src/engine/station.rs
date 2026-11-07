@@ -914,7 +914,9 @@ pub const ORDERS_REPORT_DONE: Tool = on!(
     ORDERS,
     "Command",
     Plane::World,
-    "Report an order you were holding as finished, to whoever set it.",
+    "Report a standing order from the orders board you were holding as finished, to whoever \
+     set it. Not a mission: a mission from the table is reported with `report_done`, and one of \
+     your own closes when its steps are seen done.",
     "what",
     "The order you have finished.",
     "You have done the thing and nobody knows yet.",

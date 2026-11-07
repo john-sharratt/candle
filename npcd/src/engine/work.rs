@@ -1422,7 +1422,17 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         }
         "orders_report_done" => hosted.with_sim(|s| match s.ledger.finish(body, &what) {
             true => Outcome::Did(format!("Reported done: {what}")),
-            false => Outcome::Refused(format!("You are not holding an order to {what}.")),
+            false => {
+                let held = s.orders_held_by(body);
+                let holds = match held.is_empty() {
+                    true => "You hold no order from the orders board.".to_string(),
+                    false => format!("The orders you hold: {}.", held.join("; ")),
+                };
+                Outcome::Refused(format!(
+                    "You are not holding an order to {what}. {holds} A mission is not an order: \
+                     one from the table is reported with `report_done`."
+                ))
+            }
         }),
         "dispatch_post_wake" => with_second(hosted, a, "breaks", &what, |s, w, breaks| {
             s.ledger.set_order(breaks, "the wake", Some(w));

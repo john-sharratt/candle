@@ -657,10 +657,12 @@ fn only_the_template_library_is_worked_in_missions() {
         &s,
     )
     .unwrap();
-    let refused = b
-        .write("m1", "missions", "missions/moon.yaml", "draw: none\n", &s)
-        .unwrap_err();
-    assert!(refused.contains("is not somewhere anybody works"), "{refused}");
+    for not_a_template in ["missions/moon.yaml", "missions/moon/loose.yaml"] {
+        let refused = b
+            .write("m1", "missions", not_a_template, "draw: none\n", &s)
+            .unwrap_err();
+        assert!(refused.contains("is not somewhere anybody works"), "{refused}");
+    }
     assert_eq!(
         b.list("m1", "missions/moon/ops", &s).unwrap(),
         vec!["check-the-wifi.yaml"]

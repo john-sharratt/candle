@@ -79,9 +79,23 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         }
         None => {
             let Some(brief) = text(args, "brief") else {
-                return Outcome::Refused(
-                    "You meant to post a mission, but did not say what is to be done.".into(),
-                );
+                // What to give, said where it is read: in the refusal, with
+                // the standing jobs by name.
+                let jobs: Vec<String> = hosted.sim(|s| {
+                    s.missions
+                        .routines()
+                        .iter()
+                        .map(|r| format!("`{}`", r.id))
+                        .collect()
+                });
+                let or_job = match jobs.is_empty() {
+                    true => String::new(),
+                    false => format!(", or a standing `job` by name: {}", jobs.join(", ")),
+                };
+                return Outcome::Refused(format!(
+                    "You meant to post a mission, but did not say what is to be done. Give a \
+                     `brief` and its `steps`{or_job}."
+                ));
             };
             let steps: Vec<String> = text(args, "steps")
                 .map(|s| {
@@ -463,6 +477,14 @@ mod tests {
     fn a_standing_job_is_posted_whole() {
         let h = vault();
         h.with_sim(|s| s.missions.set_routines(vec![ward_shift()], Draw::None));
+        assert_eq!(
+            post(&h, "zen", &args(json!({}))),
+            Outcome::Refused(
+                "You meant to post a mission, but did not say what is to be done. Give a \
+                 `brief` and its `steps`, or a standing `job` by name: `ward-shift`."
+                    .into()
+            )
+        );
         assert!(post(&h, "zen", &args(json!({"job": "ward-shift"}))).happened());
         let m = h
             .with_sim(|s| s.missions.collect("wick", &Facts::default()).cloned())
