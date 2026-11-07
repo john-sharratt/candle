@@ -1107,13 +1107,28 @@ pub fn doc_compass(
 /// The compass for a document whose text the brief gives whole — a mission
 /// template: written as given with `file_write`, then committed. `write` and
 /// `commit` are the desk's addresses when the body stands at one, `way` the
-/// way to one when it does not.
+/// way to one when it does not, and `refused` what the table said when it last
+/// would not take the document — led with, so the next write puts that right.
 pub fn given_compass(
     p: &str,
     write: Option<&str>,
     commit: Option<&str>,
     way: Option<&str>,
+    refused: Option<&str>,
 ) -> String {
+    let write_it = given_write(p, write, commit, way);
+    match refused {
+        None => write_it,
+        Some(refusal) => format!(
+            "When you last reported {p}, the table would not take it: {}\nPut that right in \
+             the text and write it again. {write_it}",
+            bounded_refusal(refusal)
+        ),
+    }
+}
+
+/// [`given_compass`]'s own line: the acts that write and commit it.
+fn given_write(p: &str, write: Option<&str>, commit: Option<&str>, way: Option<&str>) -> String {
     match (write, commit) {
         (Some(write), Some(commit)) => format!(
             "Your mission, next: write {p} exactly as your brief gives it, whole: `invoke` \
@@ -1146,18 +1161,23 @@ pub fn given_compass(
 /// refusal of 412,000 characters, carried so, grew a turn to ~190k tokens.
 pub fn refused_compass(p: &str, refusal: &str, at: &DeskVerbs, way: Option<&str>) -> String {
     let desk = doc_compass_unwritten(&DocStep::Write(p.to_string()), at, way);
-    let refusal = match refusal.char_indices().nth(COMPASS_REFUSAL_CHARS) {
+    format!(
+        "When you last reported {p}, the table would not take it: {}\nIf you have put that \
+         right since, commit it and report again. If not, mend those passages with \
+         `file_edit` — or write it whole again: {desk}",
+        bounded_refusal(refusal)
+    )
+}
+
+/// A refusal cut to [`COMPASS_REFUSAL_CHARS`], saying so when it is cut.
+fn bounded_refusal(refusal: &str) -> String {
+    match refusal.char_indices().nth(COMPASS_REFUSAL_CHARS) {
         None => refusal.to_string(),
         Some((cut, _)) => format!(
             "{} … (the table said more; report it again to hear all of it)",
             &refusal[..cut]
         ),
-    };
-    format!(
-        "When you last reported {p}, the table would not take it: {refusal}\nIf you have put \
-         that right since, commit it and report again. If not, mend those passages with \
-         `file_edit` — or write it whole again: {desk}"
-    )
+    }
 }
 
 /// The most of a refusal the compass carries, in characters: a gate's refusal
@@ -2023,6 +2043,7 @@ mod tests {
                 p,
                 Some("http://local/archive/map-table~0/file_write"),
                 Some("http://local/archive/map-table~0/bench_commit"),
+                None,
                 None
             ),
             "Your mission, next: write missions/moon/ops/check-the-wifi.yaml exactly as your \
@@ -2032,10 +2053,25 @@ mod tests {
              is."
         );
         assert_eq!(
-            given_compass(p, None, None, Some("the watch room: `move_to` it")),
+            given_compass(p, None, None, Some("the watch room: `move_to` it"), None),
             "Your mission, next: write missions/moon/ops/check-the-wifi.yaml exactly as your \
              brief gives it, whole, with `file_write` at a desk, then commit it with \
              `bench_commit`. The nearest desk is in the watch room: `move_to` it."
+        );
+        // Refused at its last report, it is told why first.
+        assert_eq!(
+            given_compass(
+                p,
+                None,
+                None,
+                None,
+                Some("It is not a mission template: `steps` is missing.")
+            ),
+            "When you last reported missions/moon/ops/check-the-wifi.yaml, the table would not \
+             take it: It is not a mission template: `steps` is missing.\nPut that right in the \
+             text and write it again. Your mission, next: write \
+             missions/moon/ops/check-the-wifi.yaml exactly as your brief gives it, whole, with \
+             `file_write` at a desk, then commit it with `bench_commit`."
         );
     }
 

@@ -101,9 +101,9 @@ use crate::engine::loopguard::{salient, Took, NUDGE};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mind_record;
 use crate::engine::mission::{
-    compass_line, compass_report_line, doc_compass, given_compass, post_work_line, progress_line, publish_compass,
-    refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission, MissionPrompt,
-    Outcome as Verdict,
+    compass_line, compass_report_line, doc_compass, given_compass, post_work_line,
+    progress_line, publish_compass, refused_compass, time_compass, time_step, Aim, DeskVerbs,
+    DocStep, Mission, MissionPrompt, Outcome as Verdict,
 };
 use crate::engine::mission_acts::{self, COMMAND_DESK};
 use crate::engine::mission_gen;
@@ -1755,6 +1755,7 @@ impl Runtime {
                         write.as_deref(),
                         desk.commit.as_deref(),
                         way.as_deref(),
+                        mission.gate_refusal.as_deref(),
                     ));
                 }
                 if let (DocStep::Write(p), Some(refusal)) = (&doc, &mission.gate_refusal) {

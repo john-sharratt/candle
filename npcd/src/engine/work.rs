@@ -4428,6 +4428,46 @@ mod tests {
         );
     }
 
+    /// **A mission whose text its brief gives is told `file_write` at the desk,
+    /// not `compose`.**
+    #[test]
+    fn a_stuck_report_at_the_desk_with_given_text_is_told_file_write() {
+        use crate::engine::mission::{Mission, Origin, Todo, Work};
+        let h = vault();
+        h.with_sim(|s| {
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Write the template.",
+                    vec![Todo::new("write layers/stories/y.md")],
+                    Origin::Lodged { by: "op".into() },
+                )
+                .with_work(Work {
+                    writes: "layers/stories/y.md".into(),
+                    reads: vec![],
+                    min_words: 0,
+                    edit_optional: false,
+                    anew: false,
+                    checks: Vec::new(),
+                    tools: vec!["file_write".into()],
+                }),
+            )
+        });
+        assert_eq!(
+            perform(
+                &h,
+                "m1",
+                &act("report_stuck", json!({"why": "there is no desk to write it at"}))
+            ),
+            Outcome::Refused(
+                "It is not stuck yet — You are at a desk, in the early range: `file_write` it \
+                 exactly as your brief gives it, then `bench_commit` it. Do that, then come back \
+                 to the table and `invoke` its `report_done` with what you found."
+                    .into()
+            )
+        );
+    }
+
     /// A mission taken up at the desk, worked with its progress recorded, and
     /// reported — the whole loop through `perform`. `perform` does not gate on
     /// availability (the grammar does), so this drives the acts directly.
