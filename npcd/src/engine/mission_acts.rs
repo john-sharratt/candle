@@ -464,7 +464,10 @@ mod tests {
             ..writing
         };
         assert!(offered("file_write", given));
-        assert!(!offered("compose", given), "not composed: its text is given");
+        assert!(
+            !offered("compose", given),
+            "not composed: its text is given"
+        );
         // An unordered character is handed nothing at the table, and the table
         // is otherwise the same to it.
         let unordered = Carrying {

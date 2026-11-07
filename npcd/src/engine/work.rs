@@ -4417,7 +4417,10 @@ mod tests {
             perform(
                 &h,
                 "m1",
-                &act("report_stuck", json!({"why": "there is no desk to write it at"}))
+                &act(
+                    "report_stuck",
+                    json!({"why": "there is no desk to write it at"})
+                )
             ),
             Outcome::Refused(
                 "It is not stuck yet — You are at a desk, in the early range: write it with \
@@ -4457,7 +4460,10 @@ mod tests {
             perform(
                 &h,
                 "m1",
-                &act("report_stuck", json!({"why": "there is no desk to write it at"}))
+                &act(
+                    "report_stuck",
+                    json!({"why": "there is no desk to write it at"})
+                )
             ),
             Outcome::Refused(
                 "It is not stuck yet — You are at a desk, in the early range: `file_write` it \

@@ -226,7 +226,11 @@ mod tests {
         assert_eq!(write.by, By::Maker);
         assert_eq!(write.desk.as_deref(), Some("map-table"));
         assert_eq!(write.checks, ["committed", "routine-parses"]);
-        assert_eq!(write.tools, ["file_write"], "its text is given, and written as given");
+        assert_eq!(
+            write.tools,
+            ["file_write"],
+            "its text is given, and written as given"
+        );
         assert!(!write.publishes());
 
         let publish = &wf.steps[1];
