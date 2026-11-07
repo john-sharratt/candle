@@ -623,6 +623,8 @@ struct CharacterTask {
 struct TableWay {
     /// The room the table stands in.
     room: String,
+    /// The level that room is on.
+    level: String,
     /// Whether that room is on the character's own level, so a walk is all it
     /// takes. When it is not, the lift is the way.
     on_foot: bool,
@@ -772,13 +774,16 @@ fn written_up_to_floor(s: &Sim, body: &str, mission: &Mission, doc: &DocStep) ->
 /// records — it is only the *surface* that moved. The loud call that reaches a
 /// character mid-conversation is the tannoy the table's opening sends; this is
 /// what keeps drawing one that has drifted, and what a character reads on its way.
+///
+/// `{room}` and `{level}` are where the table stands. Fixed as "the command room,
+/// on the command level", the moon's Drones were sent to a room their world does
+/// not have — its table is in the watch room — and never found the work.
 pub const TO_THE_TABLE: &str =
     "The command table is open and there is work waiting for you. Leave off \
-     whatever you are doing or saying and go to it now. The table is in the \
-     command room, on the command level: if you are on another floor, go to the \
-     lift, ride it to the command level with `lift_use` — it calls the car and \
-     waits for it — and then `move_to` the command room; you cannot walk between \
-     floors. This comes before talk — do not answer the room, go. Once you are \
+     whatever you are doing or saying and go to it now. The table is in {room}, \
+     on {level}: if you are on another floor, go to the lift, ride it to {level} \
+     with `lift_use` — it calls the car and waits for it — and then `move_to` \
+     {room}; you cannot walk between floors. This comes before talk — do not answer the room, go. Once you are \
      there, the table is on your effector device: `scan` to see what it offers, \
      then take up a mission by `invoke` on its `collect_mission`. Carry it out, \
      and when it is done come back and report it at the table the same way, then \
@@ -1984,6 +1989,7 @@ impl Runtime {
                 .or_else(|| offering.first())?;
             Some(TableWay {
                 room: w.node(table).map(|n| n.name.clone())?,
+                level: w.map().get(&table.area).map(|a| a.name.clone())?,
                 on_foot: table.area == here.area,
             })
         })
@@ -1995,7 +2001,9 @@ impl Runtime {
     fn to_the_table(way: &TableWay) -> String {
         match way.on_foot {
             true => TO_THE_TABLE_ON_FOOT.replace("{room}", &way.room),
-            false => TO_THE_TABLE.to_string(),
+            false => TO_THE_TABLE
+                .replace("{room}", &way.room)
+                .replace("{level}", &way.level),
         }
     }
 
@@ -7071,6 +7079,14 @@ mod tests {
         npc_map::world::Where::new("vault-casting", node)
     }
 
+    /// [`TO_THE_TABLE`] as the vault words it: its table is in the command
+    /// room, on the command level.
+    fn vault_table_call() -> String {
+        TO_THE_TABLE
+            .replace("{room}", "the command room")
+            .replace("{level}", "the command level")
+    }
+
     /// **Composing is refused honestly, never faked.** With no piece of work to
     /// write there is nothing to sit down to; nothing is written into the working
     /// set, and the refusal says why.
@@ -8054,7 +8070,10 @@ mod tests {
         embody(&rt, 1, "m1", "green-room");
         // Nobody has touched the table; its default is open, so a free character
         // out in the wing is called to make its way to it.
-        assert_eq!(rt.nudge_for(1).as_deref(), Some(TO_THE_TABLE));
+        assert_eq!(
+            rt.nudge_for(1).as_deref(),
+            Some(vault_table_call().as_str())
+        );
     }
 
     /// **Company changes the standing task.** Told to go somewhere new every
@@ -8560,7 +8579,10 @@ mod tests {
 
         // Opened: now it is called to the command room.
         rt.set_table_open(true);
-        assert_eq!(rt.table_summons(1).as_deref(), Some(TO_THE_TABLE));
+        assert_eq!(
+            rt.table_summons(1).as_deref(),
+            Some(vault_table_call().as_str())
+        );
 
         // Once it is carrying a mission, the call stops — the mission's own text
         // is the standing task now.
@@ -8613,7 +8635,10 @@ mod tests {
             None,
             "a character not at the table is not told it is standing there"
         );
-        assert_eq!(rt.table_summons(2).as_deref(), Some(TO_THE_TABLE));
+        assert_eq!(
+            rt.table_summons(2).as_deref(),
+            Some(vault_table_call().as_str())
+        );
 
         // Shut the table and both go quiet.
         rt.set_table_open(false);
@@ -8659,7 +8684,10 @@ mod tests {
         );
 
         embody(&rt, 2, "m2", "green-room");
-        assert_eq!(rt.table_summons(2).as_deref(), Some(TO_THE_TABLE));
+        assert_eq!(
+            rt.table_summons(2).as_deref(),
+            Some(vault_table_call().as_str())
+        );
         assert!(rt.takes_orders(2));
 
         hosted.with_sim(|s| {
@@ -8720,7 +8748,10 @@ mod tests {
                 Some(&body),
             )
         });
-        assert_eq!(rt.table_summons(2).as_deref(), Some(TO_THE_TABLE));
+        assert_eq!(
+            rt.table_summons(2).as_deref(),
+            Some(vault_table_call().as_str())
+        );
     }
 
     /// **The table's notices reach whom they are for**: a post for whoever
@@ -9158,7 +9189,7 @@ mod tests {
         embody(&rt, 2, "m2", "green-room");
         assert_eq!(
             rt.nudge_for(2).as_deref(),
-            Some(TO_THE_TABLE),
+            Some(vault_table_call().as_str()),
             "a character on its way is told to make its way to the table"
         );
     }
@@ -9196,8 +9227,14 @@ mod tests {
 
         // A character in the vault, however far from the table, can ride to it.
         embody(&rt, 2, "m2", "green-room");
-        assert_eq!(rt.table_summons(2).as_deref(), Some(TO_THE_TABLE));
-        assert_eq!(rt.nudge_for(2).as_deref(), Some(TO_THE_TABLE));
+        assert_eq!(
+            rt.table_summons(2).as_deref(),
+            Some(vault_table_call().as_str())
+        );
+        assert_eq!(
+            rt.nudge_for(2).as_deref(),
+            Some(vault_table_call().as_str())
+        );
     }
 
     /// **The Redoubt has a command table of its own, in the muster hall where
