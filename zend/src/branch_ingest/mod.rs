@@ -69,9 +69,11 @@ pub struct LayerPass<'a> {
     pub base: &'a Sequence,
     /// How a [`IngestMode::Derived`] layer's units are read.
     pub spec: Option<&'a LayerSpec>,
-    /// How the layer's units are calibrated as they commit
-    /// (`crate::calibrate::calibrate_committed`), for a layer that declares a
-    /// `calibrate:` block.
+    /// How a [`IngestMode::Derived`] layer's units are calibrated as they
+    /// commit (`crate::calibrate::calibrate_committed`), for a layer that
+    /// declares a `calibrate:` block. A file layer's units are not: the branch
+    /// pass reads them all first, and `Session::calibrate_layers` calibrates
+    /// them after it.
     pub calibrate: Option<&'a CalibrateSpec>,
     /// The scoped groups of the layers of units below a derived layer, by
     /// layer name — what its units may retrieve, on their branches.

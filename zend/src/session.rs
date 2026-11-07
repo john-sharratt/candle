@@ -3325,9 +3325,10 @@ impl InferenceState {
 
     /// Calibrate every branch layer that declares a `calibrate:` block
     /// (`crate::calibrate`): each ready unit without a calibration of its
-    /// current version — one its ingest did not calibrate as it committed it —
-    /// writes its questions, and they are prefilled as its exemplars. Run ahead
-    /// of each pass.
+    /// current version writes its questions, and they are prefilled as its
+    /// exemplars. Run ahead of each pass, for what an earlier one left, and
+    /// right after the branch pass, which reads a file layer's units without
+    /// calibrating them: that is where they are calibrated.
     fn calibrate_layers(&self) {
         for (il, _) in &self.branch_layers {
             if crate::ingest_cancel::cancelled() {
