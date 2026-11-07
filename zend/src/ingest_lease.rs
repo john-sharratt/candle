@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn the_units_wanted_first_lead_for_every_member() {
         let keys: Vec<String> = (0..64).map(|i| format!("v4:candle/f{i}.rs@{i}")).collect();
-        let first = |i: usize| i % 8 == 0;
+        let first = |i: usize| i.is_multiple_of(8);
         let a = order_for(&keys, 0x8939_59be_acad_c372, first);
         let b = order_for(&keys, 0xa0ac_8817_8cb2_b57d, first);
         for o in [&a, &b] {
