@@ -168,4 +168,11 @@ mod tests {
         assert_eq!(retyped(PART, "mod tests {", "mod checks {"), None);
         assert_eq!(retyped("f(a)\n", "a", "g(\n    1)"), None);
     }
+    /// **A blank line alone is not retyped**: `same` counts a match only when
+    /// one of the lines it compares holds something, so a `text` that opens on a
+    /// blank line where the line above `old` is blank too is taken, not refused.
+    #[test]
+    fn a_blank_line_alone_is_not_retyped() {
+        assert_eq!(retyped("a();\n\nb();\n", "b();", "\nb();\nc();"), None);
+    }
 }
