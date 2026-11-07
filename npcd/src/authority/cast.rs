@@ -133,7 +133,7 @@ impl Runtime {
                     }
                     let next = lease.is_some_and(|l| l.next.is_some());
                     if mine && next {
-                        if self.standing.hand_back_due(npc) {
+                        if self.standing.hand_back_due(npc, Instant::now()) {
                             self.hand_back(&world, npc);
                         }
                     } else if handing {
@@ -150,7 +150,7 @@ impl Runtime {
                     // hand-back keeps every wait the lease names, so the next
                     // holder still waits for what this one never took in.
                     (true, false) if moving => {
-                        if self.standing.hand_back_due(npc) {
+                        if self.standing.hand_back_due(npc, Instant::now()) {
                             self.hand_back(&world, npc);
                         }
                     }
@@ -176,7 +176,7 @@ impl Runtime {
                     // `Standing::hand_back_due`. No longer asked, it is let go
                     // on.
                     (true, true) if moving => {
-                        if self.standing.hand_back_due(npc) {
+                        if self.standing.hand_back_due(npc, Instant::now()) {
                             self.hand_back(&world, npc);
                         }
                     }
@@ -263,22 +263,22 @@ impl Runtime {
             )
             .await;
             // Anything but a hand-back taken leaves the character held and
-            // sends it again on the next beat: the hold itself ends only when
+            // sends it again once its retry is due: the hold itself ends only when
             // the lease moves it or stops asking it to — see
             // `Standing::retry_hand_back`.
             match sent {
                 Ok(Ok(OpReply::Done { ok: true })) => rt.put_down(npc),
                 Ok(Ok(other)) => {
                     tracing::warn!(npc, "a hand-back was not taken: {other:?}");
-                    rt.standing.retry_hand_back(npc);
+                    rt.standing.retry_hand_back(npc, Instant::now());
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(npc, "a hand-back did not reach the world: {e:#}");
-                    rt.standing.retry_hand_back(npc);
+                    rt.standing.retry_hand_back(npc, Instant::now());
                 }
                 Err(_) => {
                     tracing::warn!(npc, "a hand-back was not answered in time");
-                    rt.standing.retry_hand_back(npc);
+                    rt.standing.retry_hand_back(npc, Instant::now());
                 }
             }
         });

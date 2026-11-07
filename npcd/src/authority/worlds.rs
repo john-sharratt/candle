@@ -33,9 +33,25 @@ struct Turns {
     handing: HashSet<u64>,
     /// Characters part-way through a turn: a hand-back waits for its end.
     turning: HashSet<u64>,
-    /// Held characters whose hand-back has been sent, so it is sent once.
-    returning: HashSet<u64>,
+    /// Held characters whose hand-back has been sent: in flight, or to be sent
+    /// again once an instant has passed.
+    returning: HashMap<u64, Sending>,
 }
+
+/// Where a held character's hand-back stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sending {
+    /// Sent, and not yet answered.
+    InFlight,
+    /// Not taken, or not answered in time: sent again from this instant on.
+    RetryAt(Instant),
+}
+
+/// How long a hand-back not taken waits before it is sent again. A refusal
+/// comes back at once, and a resend every beat would send one request and log
+/// one warning per character twice a second for as long as the authority kept
+/// refusing.
+pub const HAND_BACK_RETRY: Duration = Duration::from_secs(5);
 
 pub struct Standing {
     clustered: AtomicBool,
@@ -312,21 +328,37 @@ impl Standing {
     /// Held at once, so it begins no further turn, and handed back once the
     /// turn in progress is over — once. Holding it first is what lets a
     /// character whose inbox never empties be found between turns at all: it
-    /// would otherwise begin its next turn the moment one ended.
-    pub fn hand_back_due(&self, npc: u64) -> bool {
+    /// would otherwise begin its next turn the moment one ended. One sent and
+    /// not taken is sent again only once its retry is due at `now`.
+    pub fn hand_back_due(&self, npc: u64, now: Instant) -> bool {
         let mut turns = self.turns.lock().unwrap();
         turns.handing.insert(npc);
-        !turns.turning.contains(&npc) && turns.returning.insert(npc)
+        if turns.turning.contains(&npc) {
+            return false;
+        }
+        let due = match turns.returning.get(&npc) {
+            None => true,
+            Some(Sending::InFlight) => false,
+            Some(Sending::RetryAt(at)) => now >= *at,
+        };
+        if due {
+            turns.returning.insert(npc, Sending::InFlight);
+        }
+        due
     }
 
-    /// A hand-back of `npc` that was not taken, or not answered in time: it
-    /// stays held, and the next beat sends it again. The hold ends when the
-    /// lease moves it ([`Self::end_handing`] once it is put down) or stops
-    /// asking it to move — never here, because the authority may have taken a
-    /// hand-back whose answer was lost, and a turn begun now would run a
-    /// character another member already runs.
-    pub fn retry_hand_back(&self, npc: u64) {
-        self.turns.lock().unwrap().returning.remove(&npc);
+    /// A hand-back of `npc` that was not taken, or not answered in time, at
+    /// `now`: it stays held, and is sent again [`HAND_BACK_RETRY`] later. The
+    /// hold ends when the lease moves it ([`Self::end_handing`] once it is put
+    /// down) or stops asking it to move — never here, because the authority may
+    /// have taken a hand-back whose answer was lost, and a turn begun now would
+    /// run a character another member already runs.
+    pub fn retry_hand_back(&self, npc: u64, now: Instant) {
+        self.turns
+            .lock()
+            .unwrap()
+            .returning
+            .insert(npc, Sending::RetryAt(now + HAND_BACK_RETRY));
     }
 
     pub fn handing(&self, npc: u64) -> bool {
@@ -513,7 +545,7 @@ mod tests {
         assert!(w.begin_turn(1));
         assert!(w.turning(1));
         w.end_turn(1);
-        assert!(w.hand_back_due(1));
+        assert!(w.hand_back_due(1, Instant::now()));
         assert!(w.handing(1));
         assert!(!w.begin_turn(1));
         w.end_handing(1);
@@ -527,15 +559,19 @@ mod tests {
     #[test]
     fn a_character_asked_to_move_mid_turn_is_held_then_handed_back_once() {
         let w = Standing::new(true);
+        let t0 = Instant::now();
         assert!(w.begin_turn(1));
-        assert!(!w.hand_back_due(1), "not while its turn is in progress");
+        assert!(!w.hand_back_due(1, t0), "not while its turn is in progress");
         w.end_turn(1);
         assert!(!w.begin_turn(1), "held: it begins no further turn");
-        assert!(w.hand_back_due(1), "its turn over, it is handed back");
-        assert!(!w.hand_back_due(1), "once");
-        w.retry_hand_back(1);
+        assert!(w.hand_back_due(1, t0), "its turn over, it is handed back");
+        assert!(!w.hand_back_due(1, t0), "once, while it is in flight");
+        w.retry_hand_back(1, t0);
         assert!(!w.begin_turn(1), "still held while the move is unsettled");
-        assert!(w.hand_back_due(1), "and it is sent again");
+        let soon = t0 + HAND_BACK_RETRY - Duration::from_millis(1);
+        assert!(!w.hand_back_due(1, soon), "not sent again before its retry");
+        assert!(w.hand_back_due(1, t0 + HAND_BACK_RETRY), "and sent again then");
+        assert!(!w.hand_back_due(1, t0 + HAND_BACK_RETRY), "once more");
         w.end_handing(1);
         assert!(w.begin_turn(1), "the hold ended, it goes on");
     }
