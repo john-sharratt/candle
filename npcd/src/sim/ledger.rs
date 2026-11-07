@@ -79,6 +79,15 @@ pub struct Order {
     pub done: bool,
 }
 
+/// Why an order could not be taken on or handed over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OrderRefused {
+    /// No open order reads so.
+    NoSuch,
+    /// Somebody else holds it — their body id, for the act to name them by.
+    HeldBy(String),
+}
+
 /// Somebody's judgement of a made thing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdict {
@@ -327,18 +336,18 @@ impl Ledger {
     }
 
     /// Hand an order to somebody, whether or not it was on the board.
-    pub fn hand_to(&mut self, what: &str, who: &str) -> Result<(), String> {
+    pub fn hand_to(&mut self, what: &str, who: &str) -> Result<(), OrderRefused> {
         let want = what.trim().to_lowercase();
         let Some(o) = self
             .orders
             .iter_mut()
             .find(|o| !o.done && o.what.to_lowercase() == want)
         else {
-            return Err(format!("There is no standing order to {what}."));
+            return Err(OrderRefused::NoSuch);
         };
         if let Some(holder) = &o.held_by {
             if holder != who {
-                return Err(format!("{holder} is holding that one."));
+                return Err(OrderRefused::HeldBy(holder.clone()));
             }
         }
         o.held_by = Some(who.to_string());
@@ -347,17 +356,17 @@ impl Ledger {
 
     /// Take an unheld order. `Err` when somebody already has it — the same
     /// refusal shape `World::take` gives for a claimed character.
-    pub fn take_order(&mut self, what: &str, who: &str) -> Result<(), String> {
+    pub fn take_order(&mut self, what: &str, who: &str) -> Result<(), OrderRefused> {
         let want = what.trim().to_lowercase();
         let Some(o) = self
             .orders
             .iter_mut()
             .find(|o| !o.done && o.what.to_lowercase() == want)
         else {
-            return Err(format!("There is no standing order to {what}."));
+            return Err(OrderRefused::NoSuch);
         };
         match &o.held_by {
-            Some(holder) if holder != who => Err(format!("{holder} is holding that one.")),
+            Some(holder) if holder != who => Err(OrderRefused::HeldBy(holder.clone())),
             _ => {
                 o.held_by = Some(who.to_string());
                 Ok(())
@@ -709,8 +718,14 @@ mod tests {
         let mut l = Ledger::new();
         l.set_order("mind the drill", "keeper", None);
         l.take_order("mind the drill", "c1").unwrap();
-        let err = l.take_order("mind the drill", "c2").unwrap_err();
-        assert!(err.contains("c1"), "the holder was not named: {err}");
+        assert_eq!(
+            l.take_order("mind the drill", "c2"),
+            Err(OrderRefused::HeldBy("c1".into()))
+        );
+        assert_eq!(
+            l.hand_to("mind the drill", "c2"),
+            Err(OrderRefused::HeldBy("c1".into()))
+        );
     }
 
     #[test]

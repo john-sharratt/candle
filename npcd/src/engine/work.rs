@@ -36,6 +36,7 @@ use crate::engine::act::Act;
 use crate::engine::archive;
 use crate::engine::body::Outcome;
 use crate::engine::chronology;
+use crate::engine::enact::order_refusal;
 use crate::engine::mission::{progress_line, time_step, Aim, DocStep, Mission, Outcome as Verdict};
 use crate::engine::mission_gen::config::{
     CHANGED, MERGE_PUBLISH, MERGE_STATUS, MERGE_SYNC, ROUTINE_PARSES,
@@ -1439,10 +1440,10 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "{to} takes no orders: work for {to} is not handed over, it is asked for."
                 ));
             }
-            hosted.with_sim(|s| match s.ledger.hand_to(&what, &id) {
+            match hosted.with_sim(|s| s.ledger.hand_to(&what, &id)) {
                 Ok(()) => Outcome::Did(format!("{to} has it: {what}")),
-                Err(why) => Outcome::Refused(why),
-            })
+                Err(why) => Outcome::Refused(order_refusal(hosted, &what, why)),
+            }
         }
         "orders_report_done" => hosted.with_sim(|s| match s.ledger.finish(body, &what) {
             true => Outcome::Did(format!("Reported done: {what}")),
@@ -4541,6 +4542,11 @@ mod tests {
             Outcome::Did("Orion Vance has it: mind the drill".into())
         );
         assert_eq!(h.sim(|s| s.orders_held_by("m2")), ["mind the drill"]);
+        // Held, it is refused to anybody else, and the holder is named.
+        assert_eq!(
+            hand("Perrin Vastwood"),
+            Outcome::Refused("Orion Vance is holding that one.".into())
+        );
     }
 
     /// A mission taken up at the desk, worked with its progress recorded, and
