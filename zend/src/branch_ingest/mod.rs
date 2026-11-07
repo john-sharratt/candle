@@ -5,8 +5,8 @@
 //! by what it shows ([`keys`]), plan each layer against what it already holds
 //! ([`plan`]), tombstone what no branch holds at any depth, and ingest what
 //! nothing holds yet within the depth bound — each unit read at the commit it
-//! was found on. The pass ends by sealing a face for every file and folder unit
-//! that has none ([`crate::faces`]).
+//! was found on. The pass begins and ends by sealing a face for every file and
+//! folder unit that has none ([`crate::faces`]).
 
 pub mod filter;
 pub mod keys;
@@ -107,6 +107,10 @@ impl BranchIngest {
         layers: &[LayerPass<'_>],
         progress: &Arc<LoadProgress>,
     ) -> anyhow::Result<bool> {
+        // Faces first for what is already read: a pass can queue thousands of
+        // readings, and a unit that waited for the pass's end to get its face
+        // would be placed with its request for as long as the pass runs.
+        faces::fill(ctx, &readings(ctx, layers));
         let (repos, unreadable) = record_branches(workspace);
         let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
         let mut corpora: HashMap<IngestScope, (Corpus, Vec<String>)> = HashMap::new();

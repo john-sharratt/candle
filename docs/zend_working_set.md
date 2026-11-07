@@ -657,8 +657,10 @@ offers it as content of its own.
   ingest's rate. Until that finished, the old units would carry their requests,
   giving two paths or an outage.
 
-**Lifecycle.** `zend::faces::fill` runs at the end of every branch-ingest pass.
-It seals a face for every committed file and folder unit without a live one,
+**Lifecycle.** `zend::faces::fill` runs at the start and at the end of every
+branch-ingest pass. A pass can queue thousands of readings, and a unit already
+read must not wait out the whole pass for its face. It seals a face for every
+committed file and folder unit without a live one,
 each under a `face/<content key>` lease so two members do not both seal it. A
 unit read this pass and one read before faces existed meet the same rule, and
 filling is one short prefill per unit, never a re-read. A face names its unit

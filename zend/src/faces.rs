@@ -8,9 +8,9 @@
 //! dialogue primes on, whose user half is the reading's anchor alone and whose
 //! assistant half is the unit's own opening — the calls it made — prefilled.
 //!
-//! [`fill`] gives every committed unit without a live face one, at the end of
-//! each branch-ingest pass, so a unit read this pass and one read before faces
-//! existed meet the same rule. A face is one short prefill; nothing is read
+//! [`fill`] gives every committed unit without a live face one, at the start and
+//! the end of each branch-ingest pass, so a unit read this pass and one read
+//! before faces existed meet the same rule. A face is one short prefill; nothing is read
 //! again.
 
 use anyhow::Context;
