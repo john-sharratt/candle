@@ -643,6 +643,30 @@ fn a_diff_names_what_kind_of_change_each_one_is() {
     );
 }
 
+/// **In `missions/`, only the template library is worked**: a template in a
+/// world's folder is written, the world's missions file beside it is refused,
+/// and the folders are listed.
+#[test]
+fn only_the_template_library_is_worked_in_missions() {
+    let (mut b, _, s) = rooted("missions");
+    b.write(
+        "m1",
+        "missions/moon/ops",
+        "missions/moon/ops/check-the-wifi.yaml",
+        "id: check-the-wifi\n",
+        &s,
+    )
+    .unwrap();
+    let refused = b
+        .write("m1", "missions", "missions/moon.yaml", "draw: none\n", &s)
+        .unwrap_err();
+    assert!(refused.contains("is not somewhere anybody works"), "{refused}");
+    assert_eq!(
+        b.list("m1", "missions/moon/ops", &s).unwrap(),
+        vec!["check-the-wifi.yaml"]
+    );
+}
+
 // ── listing ─────────────────────────────────────────────────────────────
 
 #[test]

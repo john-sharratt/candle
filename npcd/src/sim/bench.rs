@@ -757,6 +757,7 @@ fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
 pub const EDITABLE_AREAS: &[&str] = &[
     "layers",
     "map",
+    "missions",
     "moods",
     "personalities",
     "responses",
@@ -764,10 +765,17 @@ pub const EDITABLE_AREAS: &[&str] = &[
 ];
 
 /// Whether an area may be edited at all.
+///
+/// **In `missions/`, only the template library.** A world's template is
+/// `missions/<world>/<group>/<id>.yaml`, written at a bench by the
+/// `write-template` workflow; `missions/<world>.yaml` beside it is the world's
+/// missions file, which the loader reads as configuration, and stays out of
+/// reach like the rest of the daemon's own. Its folders can still be listed.
 fn editable_area(p: &MindPath) -> bool {
     match p.area() {
         // The root itself, which is a listing rather than a document.
         None => true,
+        Some("missions") => p.ext().is_none() || p.segments().len() >= 3,
         Some(a) => EDITABLE_AREAS.contains(&a),
     }
 }
