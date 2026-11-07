@@ -89,6 +89,7 @@ pub mod segment;
 pub mod segmented_log;
 pub mod space;
 pub mod stamped_locs;
+pub mod stranded;
 pub mod streams;
 mod stripes;
 pub mod survival;
