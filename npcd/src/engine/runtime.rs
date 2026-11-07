@@ -1809,9 +1809,13 @@ impl Runtime {
                 })
             };
             let way = way_of(&next.text);
+            // **A judgement about somebody is not a walk to them.** Told where
+            // Jitter was while noting what Jitter needed, a Drone that already
+            // had the answer followed Jitter between the lift and the room.
+            let judging = is_judgement(&next.text);
             let people: Vec<(String, Option<String>)> = w
                 .actors()
-                .filter(|a| a.id != body)
+                .filter(|a| a.id != body && !judging)
                 .map(|a| {
                     let room = (a.at != here).then(|| way_to(&a.at)).flatten();
                     (a.name.clone(), room)
@@ -1819,7 +1823,7 @@ impl Runtime {
                 .collect();
             let way = way.map(|w| format!("It is in {w}."));
             let mut line = compass_line(&next, &people, way.as_deref());
-            if is_judgement(&next.text) {
+            if judging {
                 line.push(' ');
                 match mission.step_to_do() {
                     None => line.push_str(JUDGEMENT_LINE),
@@ -8296,6 +8300,40 @@ mod tests {
             attends,
             "Your mission, next: go to the command room. It is in the command room: `focus` on it."
         );
+    }
+
+    /// **A judgement about somebody is not a walk to them.** A step that only
+    /// names a person to judge them is told it is settled in the mind, and not
+    /// where they are; a step that goes to them still is.
+    #[tokio::test]
+    async fn a_judgement_about_somebody_does_not_send_the_body_after_them() {
+        use crate::engine::mission::{Mission, Origin, Todo, JUDGEMENT_LINE};
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "band-one");
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let assign = |step: &str| {
+            let m = Mission::new(
+                "Look in on Maker-02.",
+                vec![
+                    Todo::new(step),
+                    Todo::report("go back to the table and report it"),
+                ],
+                Origin::Lodged {
+                    by: "u_op".to_string(),
+                },
+            );
+            hosted.with_sim(|s| s.missions.assign("m1", m));
+        };
+        assign("note what Maker-02 needs");
+        assert_eq!(
+            rt.mission_compass(1).expect("a compass"),
+            format!("Your mission, next: note what Maker-02 needs. {JUDGEMENT_LINE}")
+        );
+        hosted.with_sim(|s| s.missions.cancel("m1"));
+        assign("ask Maker-02 what they need");
+        let asks = rt.mission_compass(1).expect("a compass");
+        assert!(asks.contains("Maker-02 is in"), "{asks}");
     }
 
     /// **A step that posts work names the jobs it may post.** Told only "post
