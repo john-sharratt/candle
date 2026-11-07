@@ -236,6 +236,12 @@ pub async fn census(
                 "phase".into(),
                 json!(crate::engine::sleep::phase_of(world_ms)),
             );
+            // **What its standing task would say now**, and whether this member
+            // is the one that tells it: a summons that never arrives is one of
+            // these being empty or false, and nothing else shows which.
+            o.insert("runs_here".into(), json!(rt.standing.runs(c.npc_id)));
+            o.insert("summons".into(), json!(rt.table_summons(c.npc_id)));
+            o.insert("nudge".into(), json!(rt.nudge_for(c.npc_id)));
         }
         characters.push(v);
     }

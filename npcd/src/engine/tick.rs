@@ -1317,6 +1317,8 @@ impl Scheduler {
                         // above and this line would otherwise be an age in the
                         // future, which renders as a very large number.
                         .map(|at| now.saturating_sub(at).as_millis() as u64),
+                    last_news_ms: i.last_news_ms,
+                    last_nudge_ms: i.last_nudge_ms,
                 }
             })
             .collect();
@@ -1361,6 +1363,13 @@ pub struct Census {
     /// `None` for a character that has not acted yet, which reads as *never*
     /// rather than as a very large number.
     pub acted_ms_ago: Option<u64>,
+    /// The world-clock instant of the last news it was given — what the quiet
+    /// gate on its standing task measures from.
+    pub last_news_ms: u64,
+    /// The world-clock instant its standing task was last restated — what the
+    /// summons gate measures from. One ahead of the world's clock shuts both
+    /// gates until the clock reaches it.
+    pub last_nudge_ms: u64,
 }
 
 /// Shared handle.
