@@ -1033,10 +1033,12 @@ layers:
         # `scopes` by path, so a unit is placed through one group or the other.
         # They compete among themselves for the working set's
         # `guidance_tokens`: a guide never dislodges a file, and no burst of
-        # files crowds out a guide.
+        # files crowds out a guide. A folder's hub files are not drawn: they
+        # match every question and answer none, so they stay with `scopes`.
         draws:
           from: scopes
           paths: [candle/mcp/src/guides/, journals/]
+          except: [README.md, group.yaml, journal.yaml, person.yaml]
         selection: { kind: working_set, share: guidance }
         # Scanned as `scopes` is, each guide one case; its own competition is
         # what keeps a guide from being ranked against every `.rs` file.

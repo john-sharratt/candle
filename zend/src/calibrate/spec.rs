@@ -16,7 +16,7 @@
 //! file's reading, an analysis of it, a day — may declare one, and each of its
 //! units is calibrated the same way ([`super::run`]).
 
-use candle_conversation::projection::LayerSchema;
+use candle_conversation::projection::{Draws, LayerSchema};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -62,8 +62,8 @@ pub struct CalibrateSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuidancePrompt {
     pub prompt: String,
-    /// Workspace-relative prefixes, every drawing group's together.
-    pub paths: Vec<String>,
+    /// What every drawing group of the layer draws.
+    pub draws: Vec<Draws>,
 }
 
 impl CalibrateSpec {
@@ -91,11 +91,10 @@ impl CalibrateSpec {
         if raw.prompt.trim().is_empty() {
             anyhow::bail!("layer '{}': `calibrate.prompt` is empty", layer.name);
         }
-        let paths: Vec<String> = layer
+        let draws: Vec<Draws> = layer
             .groups
             .iter()
-            .filter_map(|g| g.draws.as_ref())
-            .flat_map(|d| d.paths.iter().cloned())
+            .filter_map(|g| g.draws.clone())
             .collect();
         let guidance = match raw.guidance_prompt {
             None => None,
@@ -105,12 +104,12 @@ impl CalibrateSpec {
                     layer.name
                 )
             }
-            Some(_) if paths.is_empty() => anyhow::bail!(
+            Some(_) if draws.is_empty() => anyhow::bail!(
                 "layer '{}': `calibrate.guidance_prompt` is declared but no group of the layer \
                  draws anything",
                 layer.name
             ),
-            Some(prompt) => Some(GuidancePrompt { prompt, paths }),
+            Some(prompt) => Some(GuidancePrompt { prompt, draws }),
         };
         Ok(Some(Self {
             layer: layer.name.clone(),
@@ -125,7 +124,7 @@ impl CalibrateSpec {
     /// a drawing group draws, the layer's prompt for every other.
     fn template_for(&self, subject: &str) -> &str {
         match &self.guidance {
-            Some(g) if g.paths.iter().any(|p| subject.starts_with(p.as_str())) => &g.prompt,
+            Some(g) if g.draws.iter().any(|d| d.takes(subject)) => &g.prompt,
             _ => &self.prompt,
         }
     }
@@ -182,7 +181,7 @@ fn fill(template: &str, questions: usize, subject: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_conversation::projection::Builder;
+    use candle_conversation::projection::{Builder, GroupId};
 
     fn spec() -> CalibrateSpec {
         CalibrateSpec {
@@ -198,20 +197,29 @@ mod tests {
         CalibrateSpec {
             guidance: Some(GuidancePrompt {
                 prompt: "<<n>> a worker asks itself before `<<path>>`".into(),
-                paths: vec!["candle/mcp/src/guides/".into(), "journals/".into()],
+                draws: vec![Draws {
+                    from: GroupId::from_raw(1).unwrap(),
+                    paths: vec!["candle/mcp/src/guides/".into(), "journals/".into()],
+                    except: vec!["README.md".into()],
+                }],
             }),
             ..spec()
         }
     }
 
     /// **A drawn unit is asked the guidance prompt**; every other unit the
-    /// layer's.
+    /// layer's, a hub file under a drawn path among them.
     #[test]
     fn a_drawn_unit_is_asked_the_guidance_prompt() {
         let s = with_guidance();
         assert_eq!(
             s.prompt_for("candle/mcp/src/guides/deploy.md"),
             "3 a worker asks itself before `mcp/src/guides/deploy.md`"
+        );
+        assert_eq!(
+            s.prompt_for("journals/groups/zen/README.md"),
+            "3 about `groups/zen/README.md` in journals \
+             (journals/groups/zen/README.md, journals/groups/zen/README.md)"
         );
         assert_eq!(
             s.prompt_for("candle/docs/paper.md"),
@@ -370,17 +378,15 @@ layers:
       - id: scopes
         selection: { kind: working_set, share: remainder }
       - id: guidance
-        draws: { from: scopes, paths: [candle/mcp/src/guides/, journals/] }
+        draws: { from: scopes, paths: [candle/mcp/src/guides/, journals/], except: [README.md] }
         selection: { kind: working_set, share: guidance }
 "#;
         let layer = Builder::from_yaml(yaml).unwrap().schema().layers[0].clone();
         let s = CalibrateSpec::of(&layer).unwrap().expect("declared");
-        assert_eq!(
-            s.guidance,
-            Some(GuidancePrompt {
-                prompt: "y".into(),
-                paths: vec!["candle/mcp/src/guides/".into(), "journals/".into()],
-            })
-        );
+        let g = s.guidance.expect("a guidance prompt");
+        assert_eq!(g.prompt, "y");
+        assert_eq!(g.draws.len(), 1);
+        assert_eq!(g.draws[0].paths, ["candle/mcp/src/guides/", "journals/"]);
+        assert_eq!(g.draws[0].except, ["README.md"]);
     }
 }

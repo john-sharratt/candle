@@ -746,12 +746,14 @@ struct YamlGroup {
     draws: Option<YamlDraws>,
 }
 
-/// YAML shadow of [`Draws`] — `draws: { from: scopes, paths: [...] }`.
+/// YAML shadow of [`Draws`] — `draws: { from: scopes, paths: [...], except: [...] }`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct YamlDraws {
     from: String,
     paths: Vec<String>,
+    #[serde(default)]
+    except: Vec<String>,
 }
 
 /// YAML shadow of [`SelectionDefault`] — `default: { tag: "…" }`.
@@ -892,9 +894,19 @@ fn parse_draws(
             "paths must name at least one non-empty prefix".into(),
         ));
     }
+    if yd
+        .except
+        .iter()
+        .any(|name| name.is_empty() || name.contains('/'))
+    {
+        return Err(invalid(
+            "except must name files, not paths: no empty name and no '/'".into(),
+        ));
+    }
     Ok(Some(Draws {
         from: from.id,
         paths: yd.paths.clone(),
+        except: yd.except.clone(),
     }))
 }
 
