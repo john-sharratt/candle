@@ -41,7 +41,9 @@ filter over the units it draws:
   (`working_set_members`) all follow that split, so a unit is placed through one
   group, never both.
 - **Its own pool.** `WorkingSetShare::Guidance` is bounded by the working set's
-  `guidance_tokens`, a pool beside `budget_tokens` rather than inside it.
+  `guidance_tokens` (40K, eight to ten guides and journal notes at a time), a
+  pool beside `budget_tokens` (122K) rather than inside it; the two were sized
+  together, so the dialogue's total stays where it was.
   Guidance dislodges only guidance, and nothing else dislodges it: a guide never
   dislodges a code file, and no burst of code crowds out the guide the worker
   needs. Without `guidance_tokens` no guide enters.
@@ -104,19 +106,35 @@ next turn of every conversation.
 ## 3. Measuring it
 
 A turn keeps a `guidance::Tally`. For every round it notes the drawn units the
-working set placed (members whose `placing_group` is a drawing group) and the
+working set placed (members whose `placing_group` is a drawing group), each
+with the fresh score the round's scan gave it (`WorkingSet::fresh_of`), and the
 drawn units the round read. At the turn's end it logs, per unit:
 
-- **hit**: placed, and read in the same turn;
-- **missed**: read by the turn while not placed;
-- **idle**: placed, and the turn never read it.
+- **missed**: read by the turn while not placed — placement failed to offer it;
+- **read anyway**: placed, and read in the same turn — placement offered it and
+  did not spare the read;
+- **relevant**: placed, never read, and the turn's own scans kept matching it —
+  its peak fresh score reached the working set's `min_momentum`. This is the
+  case placement exists for: the worker's reasoning was on what the unit says,
+  and the unit was already in front of it;
+- **idle**: placed, never read, and no scan matched it — it took room it did not
+  use.
 
 The log line is `zend::guidance` "guidance this turn", with each count and its
-paths, and only for a turn that placed or read guidance. A read is the measure;
-a citation in the reply is not counted. The self-improvement mission reads
-these lines to retune `guidance_tokens` and the group's band, and to judge
-whether the mined calibration is working: the missed count should fall as
-exemplars accumulate.
+paths, and only for a turn that placed or read guidance.
+
+**Why "read anyway" is not a hit.** A placed unit is attended and recalled, yet
+the model's own sense of what it has read comes from what its recurrence ran
+over (`docs/inline_read_injection.md`): it can judge a placed page unread and
+fetch it again. So a read of a placed unit is evidence the placement did not
+count as reading, and a high "read anyway" count says placement is spending
+room on units the worker will read regardless. "Relevant" is the signal of
+placement working. It is a proxy: a matching scan says the reasoning was on the
+unit's subject while it was placed, not that the reply used it.
+
+The self-improvement mission reads these lines to retune `guidance_tokens` and
+the group's band, and to judge the mined calibration: "missed" should fall as
+exemplars accumulate, and "relevant" should rise against "read anyway".
 
 ## 4. Journals
 
@@ -126,9 +144,27 @@ Journals reach the same group by the same filter, with two differences:
   `code_reading` unit, read when the branch ingest sees it, and its use
   calibration starts empty. The unit's cue seeding (§2.2) covers it until it is
   read.
-- **The newest note wins.** Journal entries are append-only, so an older entry
-  and the one that superseded it can both match. That needs a recency term in the
-  group's selection, and is not part of this first cut.
+- **The newest note wins.** A journal is a folder of entries, one file each,
+  named `YYYY-MM-DD-HHMM-xxxx.yaml` by the minute it was written (UTC, the
+  entry's own `at`). Entries are append-only and name nothing they replace, so
+  an older entry and the one that superseded it can both match. The group's
+  selection therefore carries a recency term:
+
+  ```yaml
+  selection:
+    kind: working_set
+    share: guidance
+    recency: { half_life_days: 30, dated_by: path }
+  ```
+
+  `dated_by` names the unit metadata that holds its path (zend's `code_reading`
+  units carry it as `path`), so the engine reads a stamp without knowing whose
+  units these are. A drawn unit whose path's file name opens with that date stamp has its fresh
+  score scaled by `0.5^(age_days / half_life_days)` before it feeds momentum
+  (`working_set_fresh`), age measured from the stamp to the scan. A unit whose
+  name carries no stamp — every guide — is not scaled: a guide is as current as
+  its version. The stamp is read from that metadata, so no unit is re-read and
+  the 3,800 journal units already ingested are dated as they stand.
 
 ## 5. Build order
 
@@ -140,6 +176,9 @@ Journals reach the same group by the same filter, with two differences:
    unit, kept per unit up to `MAX_EXEMPLARS`. Tests for the read's file, the
    exemplar text and which exemplars are retired.
 3. **Built.** Seeding for units no one has read: the `guidance_prompt`.
-4. **Built.** The hit / missed / idle counts, logged per turn.
-5. Journals' recency term (§4), once the counts show whether superseded
-   entries are actually placed.
+4. **Built.** The per-turn counts, logged per turn.
+5. The counts split as §3 now gives them — "read anyway" and "relevant" in
+   place of hit and idle — from each placed unit's peak fresh score
+   (`WorkingSet::fresh_of`).
+6. Journals' recency term (§4), and the pool at 40K beside a 122K files budget
+   (§1).

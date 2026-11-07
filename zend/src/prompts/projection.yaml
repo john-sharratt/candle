@@ -1097,17 +1097,17 @@ layers:
     working_set:
       # What the set holds voluntarily — seeds and provenance. The model's own
       # reads sit on top under `lock_tokens`.
-      budget_tokens: 150000
+      budget_tokens: 122000
       # The locks sit on top: a read the model makes adds to what it carries
       # and never displaces the provenance around it, up to this ceiling.
-      # 150K + 150K + the 12K `guidance_tokens` + this layer's 116K window
+      # 122K + 150K + the 40K `guidance_tokens` + this layer's 116K window
       # stays clear of the ×2 rung's
       # ceiling of 524,288 (`rope: min_yarn_factor: 2`, §5).
       lock_tokens: 150000
       folder_tokens: 10000       # repo_map's share: pinned + provenance folders
-      # The guidance group's pool, beside `budget_tokens`: two or three guides
-      # or journal notes at a time (docs/guidance_layer.md §1).
-      guidance_tokens: 12000
+      # The guidance group's pool, beside `budget_tokens`: eight to ten guides
+      # and journal notes at a time (docs/guidance_layer.md §1).
+      guidance_tokens: 40000
       beta: 0.2                  # per-file momentum leak: m ← (1 − β)·m + fresh
       min_momentum: 100          # below this a file is no provenance candidate
       max_file_tokens: 100000    # one file above this is never seeded or locked
