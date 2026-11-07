@@ -15,7 +15,9 @@
 pub mod exemplar;
 pub mod reads;
 pub mod record;
+pub mod tally;
 
 pub use exemplar::use_case;
 pub use reads::{read_path, unit_of, Read};
 pub use record::{record_use, USE_KEY};
+pub use tally::{Counts, Tally};

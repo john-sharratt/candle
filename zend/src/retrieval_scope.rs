@@ -143,6 +143,11 @@ impl RetrievalScope {
         self.drawn.iter().any(|(_, draws)| draws.takes(path))
     }
 
+    /// Whether `group` is a drawing group.
+    pub fn is_drawing(&self, group: GroupId) -> bool {
+        self.drawn.iter().any(|(g, _)| *g == group)
+    }
+
     /// A unit committed: the next turn rebuilds the index.
     pub fn mark_stale(&self) {
         self.stale.store(true, Ordering::SeqCst);
@@ -557,6 +562,7 @@ mod tests {
         assert_eq!(*scope.files, set(&[1, 30]));
         assert_eq!(*scope.drawn[&guides], set(&[2]));
         assert!(rs.draws("r/src/b.rs") && !rs.draws("r/a.rs"));
+        assert!(rs.is_drawing(guides) && !rs.is_drawing(GroupId::from_raw(2).unwrap()));
 
         let files = files.fresh();
         files

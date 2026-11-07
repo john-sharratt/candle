@@ -103,16 +103,20 @@ next turn of every conversation.
 
 ## 3. Measuring it
 
-Each placement and each read is already recorded (the working set's marks, the
-tool round). Per unit, three counts:
+A turn keeps a `guidance::Tally`. For every round it notes the drawn units the
+working set placed (members whose `placing_group` is a drawing group) and the
+drawn units the round read. At the turn's end it logs, per unit:
 
-- **hit**: placed, then read or cited in the same turn;
-- **missed**: read by the worker while not placed;
-- **idle**: placed, and the turn neither read nor cited it.
+- **hit**: placed, and read in the same turn;
+- **missed**: read by the turn while not placed;
+- **idle**: placed, and the turn never read it.
 
-These are what the self-improvement mission reads to retune `guidance_tokens` and
-the group's band, and what decides whether the mined calibration is working: the
-missed count should fall as exemplars accumulate.
+The log line is `zend::guidance` "guidance this turn", with each count and its
+paths, and only for a turn that placed or read guidance. A read is the measure;
+a citation in the reply is not counted. The self-improvement mission reads
+these lines to retune `guidance_tokens` and the group's band, and to judge
+whether the mined calibration is working: the missed count should fall as
+exemplars accumulate.
 
 ## 4. Journals
 
@@ -136,5 +140,6 @@ Journals reach the same group by the same filter, with two differences:
    unit, kept per unit up to `MAX_EXEMPLARS`. Tests for the read's file, the
    exemplar text and which exemplars are retired.
 3. **Built.** Seeding for units no one has read: the `guidance_prompt`.
-4. The hit / missed / idle counts.
-5. Journals' recency term.
+4. **Built.** The hit / missed / idle counts, logged per turn.
+5. Journals' recency term (§4), once the counts show whether superseded
+   entries are actually placed.

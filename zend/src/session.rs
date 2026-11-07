@@ -4537,6 +4537,8 @@ fn run_inference_stream(
         // (`docs/zen_tool_reach.md` §6.3): a nested task's rounds' grammar and
         // prompt hold out the task tools.
         let level = level_of(&state.engine.conversation().shared(), &conv_id);
+        // The guidance this turn placed and read, logged once it ends.
+        let mut guidance_tally = guidance::Tally::default();
         // A new question starts a new loop: the files the last one read may
         // be placed again, since its reads may be summarised away by now. A
         // resumed round goes on with the loop it belongs to.
@@ -5262,10 +5264,15 @@ fn run_inference_stream(
                 }
             }
             withhold_read_files(&state, timeline, &cs.files, &results).await;
+            let guidance_reads = drawn_reads(&state, &results);
+            guidance_tally.place(placed_guidance(&state, timeline));
+            for read in &guidance_reads {
+                guidance_tally.read(read.path());
+            }
             calibrate_guidance_reads(
                 &state,
                 &cs.files,
-                &results,
+                guidance_reads,
                 &original_user_message,
                 &resp.answer,
             );
@@ -5388,6 +5395,11 @@ fn run_inference_stream(
             resume::clear_call_turn(&state.engine, timeline);
         }
 
+        // The answering round's placements count too: what was placed as the
+        // turn answered without reading it is idle.
+        guidance_tally.place(placed_guidance(&state, timeline));
+        log_guidance_tally(&conv_id, &guidance_tally);
+
         // Title generation has already been fired in parallel from
         // `submit_with_sampling` — it doesn't depend on the main
         // convo's state, so we don't repeat it here.
@@ -5438,34 +5450,77 @@ async fn withhold_read_files(
     }
 }
 
-/// Seal every read of a drawn unit `results` made — a guide, a journal — as a
-/// use-exemplar of that unit (`crate::guidance`): the reasoning the turn wrote
-/// before the calls, under the request `asked`, is the state the unit was
-/// wanted in. On a thread of its own: finding the unit is git work and the
-/// seal is a prefill, and the turn waits for neither. A read that failed, and
-/// a round with no reasoning ahead of its calls, teach nothing.
+/// The reads of drawn units — a guide, a journal — among `results`; a read
+/// that failed read nothing.
+fn drawn_reads(state: &InferenceState, results: &[ToolResult]) -> Vec<guidance::Read> {
+    results
+        .iter()
+        .filter(|r| r.response.get("error").is_none())
+        .filter_map(|r| guidance::read_path(&r.call, &state.workspace))
+        .filter(|read| state.retrieval_scope.draws(&read.path()))
+        .collect()
+}
+
+/// The drawn units `timeline`'s working set places now, by path.
+fn placed_guidance(state: &InferenceState, timeline: TimelineId) -> Vec<String> {
+    let conversation = state.engine.conversation();
+    let substrate = conversation.read();
+    let Some(ws) = substrate.working_set(timeline) else {
+        return Vec::new();
+    };
+    ws.members()
+        .into_iter()
+        .filter(|(member, _)| {
+            substrate
+                .placing_group(timeline, *member)
+                .is_some_and(|g| state.retrieval_scope.is_drawing(g))
+        })
+        .filter_map(|(member, _)| substrate.custom_of(member)?.get(PATH_KEY).cloned())
+        .collect()
+}
+
+/// Log what the turn's guidance came to (`guidance::tally`), when it placed or
+/// read any.
+fn log_guidance_tally(conv_id: &str, tally: &guidance::Tally) {
+    if tally.is_empty() {
+        return;
+    }
+    let counts = tally.counts();
+    tracing::info!(
+        target: "zend::guidance",
+        conv_id = %conv_id,
+        hit = counts.hit.len(),
+        missed = counts.missed.len(),
+        idle = counts.idle.len(),
+        hits = %counts.hit.join(","),
+        misses = %counts.missed.join(","),
+        idles = %counts.idle.join(","),
+        "guidance this turn",
+    );
+}
+
+/// Seal each of `reads` — a round's reads of drawn units — as a use-exemplar
+/// of its unit (`crate::guidance`): the reasoning the turn wrote before the
+/// calls, under the request `asked`, is the state the unit was wanted in. On a
+/// thread of its own: finding the unit is git work and the seal is a prefill,
+/// and the turn waits for neither. A round with no reasoning ahead of its calls
+/// teaches nothing.
 fn calibrate_guidance_reads(
     state: &Arc<InferenceState>,
     files: &Arc<RepoFiles>,
-    results: &[ToolResult],
+    reads: Vec<guidance::Read>,
     asked: &str,
     answer: &TurnText,
 ) {
+    if reads.is_empty() {
+        return;
+    }
     let Some(thought) = thinking_of(answer) else {
         return;
     };
     let Some(case) = guidance::use_case(asked, &thought) else {
         return;
     };
-    let reads: Vec<guidance::Read> = results
-        .iter()
-        .filter(|r| r.response.get("error").is_none())
-        .filter_map(|r| guidance::read_path(&r.call, &state.workspace))
-        .filter(|read| state.retrieval_scope.draws(&read.path()))
-        .collect();
-    if reads.is_empty() {
-        return;
-    }
     let state = Arc::clone(state);
     let files = Arc::clone(files);
     std::thread::spawn(move || {
