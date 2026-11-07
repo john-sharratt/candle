@@ -168,6 +168,7 @@ schedules:                     # jobs (§9)
     at: due_ms                 #   at that field's time,
     before: 10m                #   less this,
     run: remind                #   running this workflow with the record
+deadline: 5m                   # how long each workflow run may take; 1 min when absent, 10 min at most (§10.3)
 ```
 
 Whether the app is public or private is not in the manifest: it is Yen's
@@ -428,14 +429,14 @@ was asked or drawn, by which app and account, how long, how many tokens) and
 
 ### 7.4 Backups
 
-Once a day — when the site starts, and at its first look after the UTC day
-turns (every fifteen minutes) — it writes `VACUUM INTO
-data\backups\yenbot-YYYY-MM-DD.db`, through a part file renamed into place so
-a backup cut short is written again; fourteen are kept, on BlackWorld
-(`yenbot/src/store/backups.rs`). Once the scheduler runs platform jobs (§9)
-the backup is one, at 03:00 in Yen's time zone, and once apps keep files
-(§7.2) it copies the files directory beside the store. Restoring is an API call, like everything
-else (§6.2):
+Once a day it writes `VACUUM INTO data\backups\yenbot-YYYY-MM-DD.db`, through
+a part file renamed into place so a backup cut short is written again;
+fourteen are kept, on BlackWorld (`yenbot/src/store/backups.rs`). The backup
+is one of the platform's own jobs (§9.3), `backup`, at 03:00 in Yen's time
+zone and caught up on start when the site was down then; a file is named for
+Yen's day, not Greenwich's. Once apps keep files (§7.2) it copies the files
+directory beside the store. Restoring is an API call, like everything else
+(§6.2):
 
 - **One app**, the usual case — "I deleted the wrong recipes" —
   `POST /api/v1/admin/backups/<date>/restore {app, collections?}` replaces that
@@ -489,6 +490,17 @@ old shape and returns it at the new. On load the platform runs it over every
 record, in batches, in the background, recording progress; until it finishes
 the app is served its last good version. A raised version without its
 migration is refused at load.
+
+Each record keeps the shape it was written at (`docs.shape`), so a migration
+cut short carries on where it stopped, a record written by the version still
+being served is taken up too, and a restored record at an older shape is
+taken up by the app's migrations (`yenbot/src/reshape/`). A batch is one
+engine run and one transaction; a record taken to the declared version is
+held to the collection's fields as any write is, and one refused stops the
+migration — the app keeps its last good version, and the app's check on the
+admin page names the record and why, until a new commit fixes it. An app
+seen for the first time since the site started, with records behind, opens
+once its migration finishes.
 
 ### 7.6 Queries, sums, search and batches
 
@@ -687,34 +699,50 @@ when it next runs, and what happened when it last did.
 
 ```sql
 CREATE TABLE jobs (
-  id          TEXT PRIMARY KEY,      -- ULID
+  id          TEXT PRIMARY KEY,      -- time-ordered, as a record's
   app         TEXT NOT NULL,         -- '_platform' for the platform's own
   workflow    TEXT NOT NULL,
   args        TEXT NOT NULL,         -- JSON
-  source      TEXT NOT NULL,         -- 'schedule:<n>' | 'record:<coll>/<id>' | 'write:<coll>/<id>' | 'workflow'
+  source      TEXT NOT NULL,         -- 'schedule:<n>' | 'record:<n>:<coll>/<id>' | 'write:<coll>/<id>' | 'workflow'
   rule        TEXT,                  -- a repeat rule, for a repeating job
+  catch_up    INTEGER NOT NULL DEFAULT 0,
   next_ms     INTEGER,               -- NULL: not due again
   attempts    INTEGER NOT NULL DEFAULT 0,
   state       TEXT NOT NULL,         -- 'waiting' | 'running' | 'held' | 'done' | 'failed'
-  run_as      TEXT,                  -- the account it acts for, if any
+  run_as      TEXT,                  -- the account it acts for; the app itself when NULL
   updated_ms  INTEGER NOT NULL
 );
 CREATE INDEX jobs_due ON jobs (next_ms) WHERE state = 'waiting';
-CREATE TABLE job_runs (job TEXT, started_ms INTEGER, ended_ms INTEGER,
-                       outcome TEXT, error TEXT, log TEXT);
+CREATE TABLE job_runs (id INTEGER PRIMARY KEY, job TEXT, app TEXT, workflow TEXT,
+                       started_ms INTEGER, ended_ms INTEGER, outcome TEXT,
+                       error TEXT, log TEXT);  -- job NULL: a run asked for at once
 ```
+
+A record's job is `record:<n>:<coll>/<id>`, `n` the schedule's place in the
+manifest, so two schedules on one collection — a reminder ten minutes before
+and one at the time — each keep their own. A job's `id` and `due` time are
+what `ctx.job` shows a run. The newest twenty runs of each job are kept, and
+the platform's `tidy` job drops a one-off job a week after it is done.
 
 ### 9.2 Four ways jobs are made
 
 - **Repeat rules** in the manifest's `schedules:` — `every: "daily 07:30"`,
-  `"weekly mon 09:00"`, `"monthly 1st 08:00"`, `"hourly"`, or a cron line for
-  anything else — in Yen's time zone (`yenbot.yaml`). One job per rule, its
-  `next_ms` advanced after each run.
+  `"weekly mon 09:00"` (or `mon,thu`), `"monthly 1st 08:00"` (a month too
+  short for the day runs on its last), `"hourly"`, or a five-field cron line
+  for anything else — in Yen's time zone (`yenbot.yaml`'s `time_zone`,
+  `Australia/Sydney`; the zone database is compiled in). A time the clocks
+  skip runs just after the change; one they pass twice runs once. One job per
+  rule, its `next_ms` advanced after each run; a rule unchanged across a
+  reload keeps its job and its time. A rule that never comes is refused with
+  the manifest.
 - **From records** — `from: <collection>, at: <field>[, before: <offset>]`:
   one job per record whose field holds a time, kept in step with the record.
   Creating, moving or deleting the record creates, moves or deletes its job,
   in the same transaction as the write; a record whose time has passed gets
-  none. A reminder is a record with a `due_ms`; its ping is its job.
+  none. A reminder is a record with a `due_ms`; its ping is its job. The
+  field is a `time` field, and the job acts for the record's owner; the
+  workflow is handed the record as it is when the job runs. A record's job an
+  admin runs early waits for the record's time again afterwards.
 - **From workflows** — `ctx.schedule(at, workflow, args)` (§10.2): a
   workflow that has to come back later — tomorrow's follow-up, a retry in an
   hour — leaves a job for itself.
@@ -723,24 +751,37 @@ CREATE TABLE job_runs (job TEXT, started_ms INTEGER, ended_ms INTEGER,
   filter, makes a job for the workflow with the record before and after, in
   the same transaction as the write. "Tell me when the kids finish a chore" is
   this and a notification; the workflow runs moments later, off the request,
-  so a write never waits on it.
+  so a write never waits on it. `where` is fields and the values they hold;
+  on `update` the job is made when the record *comes* to match — it did not
+  before the write and does after — so a chore marked done runs it once and
+  an edit to a chore already done does not. On `create` it is the new record
+  that matches, on `delete` the record as it was.
 
 ### 9.3 Running
 
-One scheduler loop wakes at the earliest `next_ms` (and on any change to
-`jobs`), claims due jobs in a transaction (`state = 'running'`), and runs each
-as a workflow (§10) on a bounded pool, a few at a time. A run that finishes
-marks its job `done`, or advances a repeating job to its next time. A run that
-fails is retried with backoff (1 min, 5 min, 30 min, then `failed`) and its
-error kept in `job_runs`; a failed job shows on the admin page and in
-`GET /jobs/<app>`.
+One scheduler loop wakes at the earliest `next_ms` (and on any committed
+write, any job made, any reload), claims due jobs in a transaction
+(`state = 'running'`), and runs each as a workflow (§10) on a bounded pool,
+four at a time. Only the jobs of apps being served are claimed, and the
+platform's own. A run that finishes marks its job `done`, or advances a
+repeating job to its next time. A run that fails is retried with backoff
+(1 min, 5 min, 30 min, then `failed`) and its error kept in `job_runs`; a
+failed job shows on the admin page and in `GET /jobs/<app>`. A repeating job
+whose tries are spent is not failed for good: that occurrence's runs say it
+failed, and it waits for its next time. Every run is written to its app's
+log, `yenbot/<app>` target `workflow`, with what it logged.
+
+The platform's own jobs, app `_platform`, run in Rust on the same scheduler:
+`backup` at 03:00 (§7.4) and `tidy` at 04:00.
 
 ### 9.4 When the machine was down
 
 On start the scheduler finds jobs due while it was not running. A job due
 within the last hour runs once; an older one runs once only if its schedule
 says `catch_up: true`, and a repeating job then moves to its next time rather
-than running every missed one. Delivery is at least once: a workflow that
+than running every missed one. A job passed over keeps a failed run saying it
+was missed, and when; one left `running` by a site that stopped is due again.
+Delivery is at least once: a workflow that
 sends something keys it on the job and its time (`ctx.once(key, fn)`), so a
 run repeated after a crash does not send twice.
 
@@ -782,21 +823,40 @@ in the engine:
 | `once(key, fn)` | Run `fn` only once for this key, across retries. |
 | `fetch(url, {method, headers, body})` | An HTTP call to a host the manifest's `fetch:` lists — a weather service, a calendar (§19.1). |
 | `secret(name)` | One of the app's integration keys (§19.1). |
-| `time(ms)`, `now()`, `log(…)` | Time in Yen's zone; a line in the run's log. |
+| `time(ms)`, `now()`, `log(…)` | Time in Yen's zone ("Sunday 8 November, 7:30 pm"); the time now; a line in the run's log. |
+| `app`, `account`, `job` | The app's id; the account the run acts for, or `null` as the app; the job, `{id, due_ms}`, or `null` for a run asked for at once. |
+
+Every call goes to the platform through one host function, answered
+`{ok}` or `{error, detail}` and thrown as an `Error` with its `code`; the
+engine takes the host function off the global object before the workflow
+loads, so `ctx` is the only way out. Records are read and written through
+the same code the API's routes use — access judged for the run's caller,
+each write's jobs kept in its transaction (§9.2), each write told to the
+open pages — and a record reads as a page reads it, its fields beside `id`,
+`owner`, `version`, `created_ms` and `updated_ms`. A run acting as the app
+reaches every record of the app's own collections, and a record it makes is
+owned by `app:<id>`. The check and the engine share one loader
+(`yenbot/src/workflows/loader.rs`): a workflow imports the app's other
+workflow files by a relative path, and nothing else.
 
 ### 10.3 Limits
 
-Each run has a deadline (60 s; the manifest may ask for up to 10 min, which a
-workflow drawing pictures needs), a memory ceiling (64 MiB) and an
-instruction-count interrupt, so a loop that never ends is stopped and recorded
-rather than holding a worker. Runs are isolated: one engine context per run,
-nothing kept between them except what a workflow writes to the store.
+Each run has a deadline (60 s; the manifest's `deadline:` may ask for up to
+10 min, which a workflow drawing pictures needs), a memory ceiling (64 MiB)
+and an interrupt handler that stops it at its deadline, so a loop that never
+ends is stopped and recorded rather than holding a worker. Runs are
+isolated: one engine runtime per run, nothing kept between them except what
+a workflow writes to the store.
 
 ### 10.4 Run now
 
 `POST /api/v1/workflows/<app>/<name>` and `app.workflows.run(name, args)` run
 one at once, as the account — a "send me today's summary now" button, or a
-heavy job (forty pictures for a storybook) kept off the phone.
+heavy job (forty pictures for a storybook) kept off the phone. The body is
+the workflow's arguments; the answer, when the run ends, is what it returned
+and what it logged, or 422 `workflow_failed` with the error's file and line.
+`POST /api/v1/admin/workflows/<app>/<name>` runs one as the app. Either run is
+kept in `job_runs` and the app's log, as a job's is.
 
 ## 11. Notifications
 
@@ -1557,6 +1617,19 @@ Taken 2026-11-07:
   side — and nothing is scaled up (§15.1).
 - **The first library is small** — eleven pictures — and grows one picture
   at a time as apps need more (§15.4).
+- **Yen's time zone is `Australia/Sydney`** (`yenbot.yaml`); repeat rules,
+  `ctx.time` and the backups' names read it (§9.2, §7.4).
+- **The nightly backup is a platform job** at 03:00, caught up on start
+  (§7.4, §9.3).
+- **A `when:` on `update` runs when a record comes to match**, not on every
+  write to a matching record (§9.2).
+- **A repeating job whose tries are spent waits for its next time**; only a
+  one-off job is `failed` for good (§9.3).
+- **Each record keeps its shape**, so a migration resumes, catches records
+  written meanwhile, and takes up restored ones (§7.5).
+- **A workflow's `ctx` reaches the records, `schedule`, `run`, `once`, the
+  time and the log**; `notify`, `ai`, `fetch` and `secret` join it with
+  notifications, AI and integrations (§24, steps 9–11).
 
 ## 24. Order of work
 
