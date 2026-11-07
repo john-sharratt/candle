@@ -1649,15 +1649,27 @@ impl Runtime {
                 if attends {
                     return Some(format!("{room}: `focus` on it"));
                 }
-                let (level, first) = match way::way(w, &here, to)? {
-                    Way::Walk => return Some(format!("{room}: `move_to` it")),
-                    Way::Ride { level, first } => (level, first),
+                // The last leg: into the room, through the door's room when it
+                // lies beyond one.
+                let arrive = |through: Option<String>| match through {
+                    None => format!("`move_to` {room}"),
+                    Some(door) => format!("`move_to` {door}, then `move_to` {room}"),
+                };
+                let (level, first, through) = match way::way(w, &here, to)? {
+                    Way::Walk { through: None } => return Some(format!("{room}: `move_to` it")),
+                    Way::Walk { through } => return Some(format!("{room}: {}", arrive(through))),
+                    Way::Ride {
+                        level,
+                        first,
+                        through,
+                    } => (level, first, through),
                 };
                 let on = w.map().get(&to.area)?.name.clone();
+                let then = arrive(through);
                 if let Some(door) = first {
                     return Some(format!(
                         "{room}, on {on}: `move_to` {door}, then `move_to` the lift, `lift_use` \
-                         naming {level}, then `move_to` {room}"
+                         naming {level}, then {then}"
                     ));
                 }
                 // At the lift already, the way is the ride itself — said from
@@ -1668,11 +1680,11 @@ impl Runtime {
                 Some(match at_lift {
                     true => format!(
                         "{room}, on {on}. You are at the lift: `lift_use` naming {level} — it \
-                         calls the car and waits for it if it is not here — then `move_to` {room}"
+                         calls the car and waits for it if it is not here — then {then}"
                     ),
                     false => format!(
                         "{room}, on {on}: `move_to` the lift, `lift_use` naming {level}, then \
-                         `move_to` {room}"
+                         {then}"
                     ),
                 })
             };

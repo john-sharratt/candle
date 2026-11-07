@@ -937,18 +937,28 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
         let room_of = |at: &Where| w.node(at).map(|n| n.name.clone());
         let level_of = |at: &Where| w.map().get(&at.area).map(|a| a.name.clone());
         let place = |at: &Where| format!("{}/{}", at.area, at.node);
-        // The lift ride to a room on another level, from the level it is
-        // ridden to by ([`way::way`]) — through a door first when the body
-        // stands off the shaft.
-        let ride = |level: &str, first: Option<&str>| match first {
-            None => format!(
-                "`move_to` the lift, `lift_use` naming {level} — it calls the car and waits for \
-                 it —"
-            ),
-            Some(door) => format!(
-                "`move_to` {door}, then `move_to` the lift, `lift_use` naming {level} — it calls \
-                 the car and waits for it —"
-            ),
+        // The way to a room as `move_to` and the lift take it ([`way::way`]):
+        // the ride first when it is on another level, out through a door before
+        // that when the body stands off the shaft, and through the door's room
+        // when the room lies beyond one.
+        let legs = |way: Way, room: &str| -> String {
+            let arrive = |through: Option<String>| match through {
+                None => format!("`move_to` {room}"),
+                Some(door) => format!("`move_to` {door}, then `move_to` {room}"),
+            };
+            match way {
+                Way::Walk { through } => arrive(through),
+                Way::Ride {
+                    level,
+                    first,
+                    through,
+                } => format!(
+                    "{}`move_to` the lift, `lift_use` naming {level} — it calls the car and \
+                     waits for it — then {}",
+                    first.map_or_else(String::new, |d| format!("`move_to` {d}, then ")),
+                    arrive(through)
+                ),
+            }
         };
         // **A document is read and written at a desk, and the desks can be
         // reached.** Makers gave drafts up as stuck "between the lift and the
@@ -977,12 +987,16 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
                 ));
             }
             return Some(match way::way(w, &here, desk)? {
-                Way::Walk => {
+                Way::Walk { through: None } => {
                     format!("A desk is within reach in {room}: `move_to` it, and work there.")
                 }
-                Way::Ride { level, first } => format!(
-                    "The desks are on {on}, and the lift goes there: {} then `move_to` {room}.",
-                    ride(&level, first.as_deref()),
+                walk @ Way::Walk { .. } => format!(
+                    "A desk is within reach in {room}: {}, and work there.",
+                    legs(walk, &room)
+                ),
+                ride => format!(
+                    "The desks are on {on}, and the lift goes there: {}.",
+                    legs(ride, &room),
                     on = level_of(desk)?
                 ),
             });
@@ -999,12 +1013,11 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
                 return Some(format!("{room} is within reach: `focus` on it."));
             }
             return Some(match way::way(w, &here, at)? {
-                Way::Walk => format!("{room} is within reach: `move_to` it."),
-                Way::Ride { level, first } => format!(
-                    "{room} is on {}: {} then `move_to` {room}.",
-                    level_of(at)?,
-                    ride(&level, first.as_deref())
-                ),
+                Way::Walk { through: None } => format!("{room} is within reach: `move_to` it."),
+                walk @ Way::Walk { .. } => {
+                    format!("{room} is within reach: {}.", legs(walk, &room))
+                }
+                ride => format!("{room} is on {}: {}.", level_of(at)?, legs(ride, &room)),
             });
         }
         for d in s.devices.iter().filter(|d| aim.is_machine(&d.name)) {
