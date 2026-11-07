@@ -873,17 +873,34 @@ browsers, and iPhone and iPad once the site is added to the home screen (iOS
 A tap opens the URL the notification names. A subscription the push service
 reports gone is dropped. There is no email.
 
+The push contact the services are given (VAPID's `sub`) is the site's own
+address, `https://yenbot.com.au`, so no person's email leaves the site. Each
+message is encrypted to its device (RFC 8291, `aes128gcm`, implemented in
+`yenbot/src/notify/` and tested against the RFC's own example bytes) and
+posted by one sender thread, so what asked for it never waits on the network;
+a push service keeps one for a device that is off for a day. The site's icon
+is a library tile, `tiles/heart-coral`, served as PNG for the iPhone's home
+screen. The bell is where a device is turned on: on Android and desktop a
+"Turn on notifications" button, and the browser's own install offer when it
+makes one; on an iPhone or iPad not yet opened from its home screen, the
+steps to put it there — shown once on the landing page as well.
+
 ### 11.2 The inbox
 
 Every notification is also written to the account's `inbox`, so nothing is
 lost on a device that was off or never subscribed: a bell on the landing page
-and in every app's shell shows what is unread.
+and in every app's shell shows what is unread. The newest five hundred of an
+account's are kept; a tap on a push marks it read.
 
 ### 11.3 Who can be notified
 
 A workflow may notify an account that has access to its app. Each account can
 mute an app's notifications from the shell; a muted app still writes to the
-inbox.
+inbox. `ctx.notify(to, {title, body, open})` names an account's id, a group
+(`group:<name>`) or `admins` — "tell me when the kids finish a chore" is
+`admins` — and only those of them who may open the app are told; an app
+sends notifications only when its manifest says `notify: true`. A feedback
+note (`POST /feedback/<app>`) is a notification to the admins from that app.
 
 ## 12. Accounts and access
 
@@ -1627,9 +1644,15 @@ Taken 2026-11-07:
   one-off job is `failed` for good (§9.3).
 - **Each record keeps its shape**, so a migration resumes, catches records
   written meanwhile, and takes up restored ones (§7.5).
-- **A workflow's `ctx` reaches the records, `schedule`, `run`, `once`, the
-  time and the log**; `notify`, `ai`, `fetch` and `secret` join it with
-  notifications, AI and integrations (§24, steps 9–11).
+- **A workflow's `ctx` reaches the records, `schedule`, `run`, `once`,
+  `notify`, the time and the log**; `ai`, `fetch` and `secret` join it with
+  AI and integrations (§24, steps 10–11).
+- **The family's phones are a mix of iPhone and Android**: both paths are
+  built, the iPhone's home-screen walk-through in the bell and once on the
+  landing page (§11.1).
+- **The push contact is the site's address**, not a person's email (§11.1).
+- **No phone test at first**: notifications are verified up to the push
+  service accepting them (§11.1).
 
 ## 24. Order of work
 
