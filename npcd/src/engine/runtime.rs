@@ -101,9 +101,9 @@ use crate::engine::loopguard::{salient, Took, NUDGE};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mind_record;
 use crate::engine::mission::{
-    compass_line, compass_report_line, doc_compass, job_catalogue, progress_line,
-    publish_compass, refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission,
-    MissionPrompt, Outcome as Verdict,
+    compass_line, compass_report_line, doc_compass, job_catalogue, progress_line, publish_compass,
+    refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission, MissionPrompt,
+    Outcome as Verdict,
 };
 use crate::engine::mission_acts::{self, COMMAND_DESK};
 use crate::engine::mission_gen;
@@ -8244,8 +8244,10 @@ mod tests {
         };
         hosted.with_sim(|s| {
             s.missions.set_unordered("m1", true);
-            s.missions
-                .set_routines(vec![job("ward-patrol"), job("morning-briefing")], Draw::None);
+            s.missions.set_routines(
+                vec![job("ward-patrol"), job("morning-briefing")],
+                Draw::None,
+            );
             s.missions.assign(
                 "m1",
                 Mission::new(
