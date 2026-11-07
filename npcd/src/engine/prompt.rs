@@ -536,9 +536,9 @@ fn frame_acting(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
          to do about something that is not yours to settle alone — a question obliges an \
          answer, and the answer usually names a room you can walk to. Saying that you are \
          ready, or where you are, or that you are standing by, obliges nobody and moves \
-         nothing; a channel of those is people talking past each other. Then `move_to` \
-         wherever the answer sent you. A message is how you find each other; it is not a \
-         substitute for being in the same room, and two people in one room texting is \
+         nothing; a channel of those is people talking past each other. Then go wherever \
+         the answer sent you — `move_to` it, or `focus` on it if you move by attention. A \
+         message is how you find each other; it is not a substitute for being in the same room, and two people in one room texting is \
          worse than either of them saying nothing.\n\n",
     );
 

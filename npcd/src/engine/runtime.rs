@@ -1622,10 +1622,19 @@ impl Runtime {
             let mission = s.missions.active(&body)?;
             let next = mission.next_step()?.clone();
             let here = w.actor(&body)?.at.clone();
+            // **A body that moves by attention is told to `focus`.** It has no
+            // `move_to` and no lift, so a way given in those verbs was a way it
+            // could not take: Zen, told to ride the lift to the dispatch room,
+            // decided the lift was locked and spent a night asking the Drones
+            // to override it.
+            let attends = s.attends(&body);
             // The way to a place, in the grammar's verbs: a walk on this level,
             // the lift to any other — `move_to` does not cross floors.
             let way_to = |to: &Where| -> Option<String> {
                 let room = w.node(to)?.name.clone();
+                if attends {
+                    return Some(format!("{room}: `focus` on it"));
+                }
                 if to.area == here.area {
                     return Some(format!("{room}: `move_to` it"));
                 }
@@ -8169,6 +8178,35 @@ mod tests {
         assert!(
             told.contains("`time_travel` naming the year 2837"),
             "{told}"
+        );
+    }
+
+    /// **A body that moves by attention is pointed at `focus`, never the lift.**
+    /// Zen has no `move_to` and no lift; told to ride the lift to the room its
+    /// mission named, it decided the lift was locked and asked the Drones all
+    /// night to override it.
+    #[tokio::test]
+    async fn the_compass_points_a_body_that_attends_at_focus() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let mission = Mission::new(
+            "Read the board.",
+            vec![Todo::new("go to the command room")],
+            Origin::Lodged {
+                by: "u_op".to_string(),
+            },
+        );
+        hosted.with_sim(|s| s.missions.assign("m1", mission));
+        let walks = rt.mission_compass(1).expect("a compass");
+        assert!(walks.contains("`lift_use`"), "{walks}");
+
+        hosted.with_sim(|s| s.set_attends("m1", true));
+        let attends = rt.mission_compass(1).expect("a compass");
+        assert_eq!(
+            attends,
+            "Your mission, next: go to the command room. It is in the command room: `focus` on it."
         );
     }
 

@@ -961,10 +961,16 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
             });
         }
         let aim = Aim::of(&step)?;
+        // A body that moves by attention has no `move_to` and no lift: the way
+        // to anywhere is `focus` on it.
+        let attends = s.attends(body);
         if let Some(at) = reach.iter().find(|at| {
             room_of(at).is_some_and(|name| aim.is_room(&name, &level_of(at).unwrap_or_default()))
         }) {
             let room = room_of(at)?;
+            if attends {
+                return Some(format!("{room} is within reach: `focus` on it."));
+            }
             return Some(match at.area == here.area {
                 true => format!("{room} is within reach: `move_to` it."),
                 false => format!(
@@ -978,9 +984,13 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
         for d in s.devices.iter().filter(|d| aim.is_machine(&d.name)) {
             if let Some(at) = reach.iter().find(|at| place(at) == d.at) {
                 let room = room_of(at)?;
+                let go = match attends {
+                    true => "`focus` on",
+                    false => "`move_to`",
+                };
                 return Some(format!(
-                    "{} stands in {room}, within reach: `move_to` {room}, and you read its \
-                     state as you arrive.",
+                    "{} stands in {room}, within reach: {go} {room}, and you read its state as \
+                     you arrive.",
                     d.name
                 ));
             }
@@ -991,11 +1001,15 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
         {
             if reach.contains(&a.at) {
                 let room = room_of(&a.at)?;
+                let go = match attends {
+                    true => "`focus` on",
+                    false => "`move_to`",
+                };
                 return Some(match a.at == here {
                     true => format!("{} is here with you: `ask` or `tell` them.", a.name),
                     false => format!(
-                        "{} is in {room}, within reach: `move_to` {room} and `ask` or `tell` \
-                         them — or `message` them, which reaches them wherever they are.",
+                        "{} is in {room}, within reach: {go} {room} and `ask` or `tell` them — \
+                         or `message` them, which reaches them wherever they are.",
                         a.name
                     ),
                 });

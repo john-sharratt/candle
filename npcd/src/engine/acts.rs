@@ -115,9 +115,9 @@ pub const ACT: Tool = Tool {
                   promise or order somebody, use `tell`, `ask`, `whisper` or `shout`; to signal \
                   without touching, `gesture`; to stop and take stock, `reflect`; **to set off \
                   somewhere — a room, another level, back the way you came — use `move_to`, \
-                  never this.** This is only ever the act of a body on a body. You give what \
-                  you MEAN by the contact, not the choreography; the narrator renders the \
-                  movement. They feel it, they may refuse it, and what they do next is theirs. \
+                  or `focus` if you move by attention, never this.** This is only ever the act \
+                  of a body on a body. You give what you MEAN by the contact, not the \
+                  choreography; the narrator renders the movement. They feel it, they may refuse it, and what they do next is theirs. \
                   On `yourself` it is still physical — binding a wound, getting your own weapon \
                   clear, dragging yourself up — never a feeling, a thought, or a plan to be \
                   elsewhere. Acting on your own body never changes where you are or what anyone \
