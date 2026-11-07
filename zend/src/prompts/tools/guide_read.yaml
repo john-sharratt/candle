@@ -79,6 +79,7 @@ parameters:
       - verify
       - wait
       - watch
+      - yen-apps
       - zen-chat
       type: string
   required:
