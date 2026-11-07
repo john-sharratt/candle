@@ -759,23 +759,9 @@ impl Mission {
         ticked
     }
 
-    /// The step to do next: the first not yet signed off — passing over one
-    /// the body settles in its own mind ([`is_judgement`]) while a step the
-    /// world can see is still open before the report.
-    ///
-    /// **Nothing signs a judgement off,** so put first it would stand in front
-    /// of everything after it: the compass would never show the journey behind
-    /// it, and `report_done`, checked against the next step alone, would take
-    /// a mission with that journey never made. It is settled whenever the body
-    /// likes and carried in the report, so it is offered once nothing else is
-    /// left to do.
+    /// The first step not yet signed off, if any.
     pub fn next_step(&self) -> Option<&Todo> {
-        let open = || self.todo.iter().filter(|t| !t.done);
-        open()
-            .find(|t| t.reports || !is_judgement(&t.text))
-            .filter(|t| !t.reports)
-            .or_else(|| open().find(|t| is_judgement(&t.text)))
-            .or_else(|| open().next())
+        self.todo.iter().find(|t| !t.done)
     }
 
     /// The first open step that is a reading of one of `machines` the body has
@@ -2092,34 +2078,6 @@ mod tests {
         ] {
             assert!(!is_judgement(step), "{step}");
         }
-    }
-
-    /// **A judgement does not stand in front of a step the world can see**: the
-    /// journey behind it is next, and the judgement once only the report is
-    /// left.
-    #[test]
-    fn a_judgement_step_waits_behind_what_the_world_can_see() {
-        use super::{Mission, Origin, Todo};
-        let mut m = Mission::new(
-            "Look in on them.",
-            vec![
-                Todo::new("go to the Sharratt room"),
-                Todo::new("decide what they might need"),
-                Todo::new("go to the store room"),
-                Todo::report("go back to the table and report it"),
-            ],
-            Origin::Random {
-                routine: "x".into(),
-            },
-        );
-        let next = |m: &Mission| m.next_step().map(|t| t.text.clone()).unwrap();
-        assert_eq!(next(&m), "go to the Sharratt room");
-        m.todo[0].done = true;
-        assert_eq!(next(&m), "go to the store room");
-        m.todo[2].done = true;
-        assert_eq!(next(&m), "decide what they might need");
-        m.todo[1].done = true;
-        assert_eq!(next(&m), "go back to the table and report it");
     }
 
     /// **A document whose text the brief gives is written as given**: at a desk
