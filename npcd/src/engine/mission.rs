@@ -997,20 +997,30 @@ pub fn compass_line(next: &Todo, people: &[(String, Option<String>)], way: Optio
     line
 }
 
-/// The standing jobs an order-giver may post by name, for the compass of a step
-/// that posts work: every job's id, in the catalogue's order. `None` with no
-/// catalogue.
-pub fn job_catalogue(routines: &[Routine]) -> Option<String> {
-    if routines.is_empty() {
-        return None;
-    }
-    let ids: Vec<String> = routines.iter().map(|r| format!("`{}`", r.id)).collect();
-    Some(format!(
-        "Post one of the standing jobs by name — `order_post` with `job` — when one fits what \
-         the families need: {}. Write a brief and steps of your own only for what none of them \
-         covers.",
-        ids.join(", ")
-    ))
+/// How an order-giver posts work, for the compass of a step that posts it: the
+/// act at its address (`order_post`, `invoke`d at `at` when the table's address
+/// is known), the standing jobs it may post by name in the catalogue's order,
+/// and that a notice on a board is not work — the step's own word, "post",
+/// otherwise reads as `post_notice`.
+pub fn post_work_line(routines: &[Routine], at: Option<&str>) -> String {
+    let act = match at {
+        Some(url) => format!("`invoke` `{url}`"),
+        None => "`order_post` at the order table".to_string(),
+    };
+    let jobs = match routines.is_empty() {
+        true => String::new(),
+        false => {
+            let ids: Vec<String> = routines.iter().map(|r| format!("`{}`", r.id)).collect();
+            format!(
+                " — a standing `job` by name when one fits what the families need: {}; or",
+                ids.join(", ")
+            )
+        }
+    };
+    format!(
+        "Work is posted with {act}{jobs} a `brief` and its `steps` for what none of them covers. \
+         A notice on a board is not work: nobody takes it up."
+    )
 }
 
 /// The addresses a document step is done through, at the desk the body stands

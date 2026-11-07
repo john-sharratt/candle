@@ -101,9 +101,9 @@ use crate::engine::loopguard::{salient, Took, NUDGE};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mind_record;
 use crate::engine::mission::{
-    compass_line, compass_report_line, doc_compass, job_catalogue, progress_line, publish_compass,
-    refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission, MissionPrompt,
-    Outcome as Verdict,
+    compass_line, compass_report_line, doc_compass, post_work_line, progress_line,
+    publish_compass, refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission,
+    MissionPrompt, Outcome as Verdict,
 };
 use crate::engine::mission_acts::{self, COMMAND_DESK};
 use crate::engine::mission_gen;
@@ -1785,10 +1785,11 @@ impl Runtime {
             // the Drones were set to write.
             let posts = next.text.to_lowercase().starts_with("post work");
             if posts && s.missions.is_unordered(&body) {
-                if let Some(jobs) = job_catalogue(s.missions.routines()) {
-                    line.push(' ');
-                    line.push_str(&jobs);
-                }
+                line.push(' ');
+                line.push_str(&post_work_line(
+                    s.missions.routines(),
+                    url_of("order_post").as_deref(),
+                ));
             }
             Some(line)
         })
@@ -8285,12 +8286,21 @@ mod tests {
                 ),
             );
         });
-        assert_eq!(
-            rt.mission_compass(1).expect("a compass"),
-            "Your mission, next: post work on the order table. Post one of the standing jobs by \
-             name — `order_post` with `job` — when one fits what the families need: \
-             `ward-patrol`, `morning-briefing`. Write a brief and steps of your own only for what \
-             none of them covers."
+        let told = rt.mission_compass(1).expect("a compass");
+        assert!(
+            told.starts_with(
+                "Your mission, next: post work on the order table. Work is posted with `invoke` \
+                 `http://local/"
+            ),
+            "{told}"
+        );
+        assert!(
+            told.ends_with(
+                "/order_post` — a standing `job` by name when one fits what the families need: \
+                 `ward-patrol`, `morning-briefing`; or a `brief` and its `steps` for what none of \
+                 them covers. A notice on a board is not work: nobody takes it up."
+            ),
+            "{told}"
         );
     }
 
