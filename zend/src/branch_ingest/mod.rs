@@ -277,15 +277,14 @@ impl BranchIngest {
         }
         if !jobs.is_empty() {
             let keys: HashSet<String> = retain.iter().map(|k| k.to_string()).collect();
-            code_read::ingest_jobs(
-                ctx,
-                &jobs,
-                &keys,
-                progress,
-                layer.base,
-                &self.binary,
-                layer.calibrate,
-            )?;
+            // **Every file is read before any is calibrated.** A unit's 24
+            // calibration questions cost many times its reading, and calibrated
+            // inline each worker held its next file back for them: a whole
+            // tree re-read under a new key took a day to place its first
+            // current reading of most files. The layer's calibration pass
+            // (`Session::calibrate_layers`) takes the committed units up after
+            // this pass, and at the start of every one.
+            code_read::ingest_jobs(ctx, &jobs, &keys, progress, layer.base, &self.binary, None)?;
         }
         ground_files(
             ctx, layer.name, &files, &retained, held_back, corpus, ground,

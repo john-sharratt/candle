@@ -174,7 +174,9 @@ A new step of the `code_reading` layer's calibration, run where calibration
 already runs:
 
 - **At commit** (`calibrate_committed`), after the questions, while the reading
-  is still resident — one record per page of the unit just read.
+  is still resident — one record per page of the unit just read — for a file
+  read on its own (an upload). The branch pass reads every file before it
+  calibrates any, and the calibration pass below runs right after it.
 - **In the calibration pass** (`calibrate_layer`), as a sweep: every unit of the
   layer that is ready by the questions' rules (`units_of`: current `KEY_VERSION`,
   chain whole, every turn held) and has a page whose slot is missing or whose

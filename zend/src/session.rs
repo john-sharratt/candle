@@ -3512,6 +3512,9 @@ impl InferenceState {
             any |= self
                 .branch_ingest
                 .pass(&ctx, &self.workspace, &passes, &progress)?;
+            // The branch pass reads files without calibrating them; what it
+            // committed is calibrated now, not at the next pass.
+            self.calibrate_layers();
         }
         for il in &self.ingest_layers {
             // Cooperative shutdown: stop the background reconcile between layers so
