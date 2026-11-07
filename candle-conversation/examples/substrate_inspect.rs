@@ -1,4 +1,6 @@
-//! `substrate_inspect` — a read-only inspector for a substrate redo log.
+//! `substrate_inspect` — an inspector for a substrate redo log, read-only but
+//! for its maintenance jobs (`retire-faces`), which write and need the daemon
+//! stopped.
 //!
 //! The substrate persistence layer (`docs/archived/kv_tier_migration.md`) stores a
 //! conversation workspace as an append-only log of content-addressed
@@ -27,6 +29,8 @@
 //!   completeness --kv-layers N
 //!                         turns holding every record they declare, by writer
 //!                         (directory target)
+//!   retire-faces          WRITES: tombstone every face and run maintenance to
+//!                         reclaim them (directory target, daemon stopped)
 //! ```
 //!
 //! `<stream-id>` accepts decimal or `0x`-prefixed hex (as printed by
@@ -45,6 +49,8 @@
 
 #[path = "substrate_inspect/completeness.rs"]
 mod completeness;
+#[path = "substrate_inspect/faces.rs"]
+mod faces;
 #[path = "substrate_inspect/liveness.rs"]
 mod liveness;
 
@@ -671,6 +677,11 @@ enum Cmd {
         #[arg(long)]
         kv_layers: usize,
     },
+    /// **Writes.** Tombstone every ingest unit's face, then run maintenance
+    /// until it has nothing to do: undoes the face backfill that kept a
+    /// recurrent snapshot per face. The daemon must be stopped. Directory
+    /// target only.
+    RetireFaces,
     /// Export a conversation's projection points + candidate/target galleries
     /// as an offline selection-replay fixture
     /// (`docs/provenance_adaptive_projection.md` §11): per dialogue turn the raw
@@ -1215,6 +1226,12 @@ fn main() -> Result<()> {
         if let Cmd::Completeness { kv_layers } = &cli.cmd {
             return completeness::completeness(&target, *kv_layers);
         }
+        if matches!(cli.cmd, Cmd::RetireFaces) {
+            let workspace = target
+                .parent()
+                .context("the substrate directory has no parent workspace")?;
+            return faces::retire_faces(workspace);
+        }
         if let Cmd::Conversations { filter, limit } = &cli.cmd {
             return segment_conversations(&segs, filter, *limit);
         }
@@ -1294,6 +1311,9 @@ fn main() -> Result<()> {
         }
         Cmd::Completeness { .. } => {
             anyhow::bail!("completeness requires the segmented `substrate` DIRECTORY target")
+        }
+        Cmd::RetireFaces => {
+            anyhow::bail!("retire-faces requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Couplings { .. } => {
             anyhow::bail!("couplings requires the segmented `substrate` DIRECTORY target")
