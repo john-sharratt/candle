@@ -80,7 +80,7 @@ use super::persisted_ids;
 use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
-    Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
+    Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, Draws, GatherScope,
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema,
     SectionTree, SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema,
     TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
@@ -741,6 +741,17 @@ struct YamlGroup {
     /// when absent.
     #[serde(default)]
     max_swaps: Option<usize>,
+    /// The units of an earlier group of this layer this group places instead.
+    #[serde(default)]
+    draws: Option<YamlDraws>,
+}
+
+/// YAML shadow of [`Draws`] — `draws: { from: scopes, paths: [...] }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlDraws {
+    from: String,
+    paths: Vec<String>,
 }
 
 /// YAML shadow of [`SelectionDefault`] — `default: { tag: "…" }`.
@@ -827,6 +838,9 @@ struct YamlWorkingSet {
     beta: f32,
     min_momentum: f32,
     max_file_tokens: usize,
+    /// The guidance groups' pool; none when the schema declares no such group.
+    #[serde(default)]
+    guidance_tokens: usize,
     #[serde(default)]
     seeds: Vec<String>,
     #[serde(default)]
@@ -838,6 +852,51 @@ struct YamlWorkingSet {
 }
 
 // ── Conversion ────────────────────────────────────────────────────────────────
+
+/// Resolve a group's `draws:` block against the groups of its layer declared
+/// before it. A drawing group and the group it draws from are both working-set
+/// groups — the units move between their shares, not into a belief selection —
+/// and it names at least one path.
+fn parse_draws(
+    group: &str,
+    yd: Option<&YamlDraws>,
+    selection: &SelectionRule,
+    earlier: &[GroupSchema],
+) -> Result<Option<Draws>, ConstructionError> {
+    let Some(yd) = yd else {
+        return Ok(None);
+    };
+    let invalid = |reason: String| ConstructionError::InvalidPolicy {
+        name: group.to_string(),
+        reason: format!("draws.{reason}"),
+    };
+    if !matches!(selection, SelectionRule::WorkingSet { .. }) {
+        return Err(invalid(
+            "a drawing group needs a working_set selection".into(),
+        ));
+    }
+    let from = earlier.iter().find(|g| g.name == yd.from).ok_or_else(|| {
+        invalid(format!(
+            "from: {:?} is no earlier group of this layer",
+            yd.from
+        ))
+    })?;
+    if !from.is_working_set() || from.draws.is_some() {
+        return Err(invalid(format!(
+            "from: {:?} must be a working_set group that draws nothing itself",
+            yd.from
+        )));
+    }
+    if yd.paths.is_empty() || yd.paths.iter().any(String::is_empty) {
+        return Err(invalid(
+            "paths must name at least one non-empty prefix".into(),
+        ));
+    }
+    Ok(Some(Draws {
+        from: from.id,
+        paths: yd.paths.clone(),
+    }))
+}
 
 /// Resolve a layer's `working_set:` block, refusing values the arithmetic
 /// cannot use: a leak outside `(0, 1]`, a folder share larger than the whole,
@@ -874,6 +933,7 @@ fn parse_working_set(
     Ok(Some(WorkingSetConfig {
         budget_tokens: yw.budget_tokens,
         folder_tokens: yw.folder_tokens,
+        guidance_tokens: yw.guidance_tokens,
         lock_tokens: yw.lock_tokens,
         beta: yw.beta,
         min_momentum: yw.min_momentum,
@@ -1235,6 +1295,7 @@ fn build(
             let group_policy = parse_policy(&yg.id, yg.policy.as_ref(), &layer_policy)?;
             let policy_band_declared =
                 layer_band_declared || yg.policy.as_ref().and_then(|p| p.min_score).is_some();
+            let draws = parse_draws(&yg.id, yg.draws.as_ref(), &selection, &groups)?;
 
             groups.push(GroupSchema {
                 id: gid,
@@ -1258,6 +1319,7 @@ fn build(
                         })?
                     }
                 },
+                draws,
             });
         }
 
@@ -2584,9 +2646,11 @@ fn parse_selection(name: &str, ys: &YamlSelection) -> Result<SelectionRule, Cons
             let share = match ys.share.as_deref() {
                 Some("folders") => WorkingSetShare::Folders,
                 Some("remainder") => WorkingSetShare::Remainder,
+                Some("guidance") => WorkingSetShare::Guidance,
                 other => {
                     let reason = format!(
-                        "a working_set selection needs share: folders | remainder, got {other:?}"
+                        "a working_set selection needs share: folders | remainder | guidance, \
+                         got {other:?}"
                     );
                     return Err(ConstructionError::InvalidPolicy {
                         name: name.to_string(),

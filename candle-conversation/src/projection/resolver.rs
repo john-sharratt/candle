@@ -5669,11 +5669,7 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         let members = ws
             .members()
             .into_iter()
-            .filter(|(tl, _)| {
-                self.read
-                    .timeline_target(*tl)
-                    .is_some_and(|(_, g)| g == group)
-            })
+            .filter(|(tl, _)| self.read.placing_group(target, *tl) == Some(group))
             .filter(|(tl, locked)| *locked || self.read.scope_offers(group, target, *tl))
             .map(|(tl, locked)| {
                 let standing = if locked {

@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use candle_conversation::projection::{GroupId, TimelineId};
+use candle_conversation::projection::{Draws, GroupId, TimelineId};
 use candle_conversation::ConversationEngine;
 use zend_vfs::{Base, Oid, RepoFiles, VfsStore};
 
@@ -68,6 +68,8 @@ struct Scope {
     folders: Arc<HashSet<TimelineId>>,
     /// Each layer of files' units, by its group.
     derived: Arc<HashMap<GroupId, Arc<HashSet<TimelineId>>>>,
+    /// The files each drawing group takes, by the group — out of `files`.
+    drawn: Arc<HashMap<GroupId, Arc<HashSet<TimelineId>>>>,
 }
 
 /// One repository a conversation reads at a base.
@@ -89,6 +91,9 @@ pub struct RetrievalScope {
     /// The groups of the layers of units built on each file's reading
     /// (`crate::layers`): a unit is in scope when its file version is.
     derived: Vec<GroupId>,
+    /// The groups that draw files out of `files_group` by path
+    /// (`docs/guidance_layer.md` §1), each with what it draws.
+    drawn: Vec<(GroupId, Draws)>,
     index: RwLock<Arc<IngestIndex>>,
     /// Set when a unit commits: the index no longer holds all that is
     /// committed.
@@ -109,6 +114,7 @@ impl RetrievalScope {
             files_group,
             folders,
             derived: Vec::new(),
+            drawn: Vec::new(),
             index: RwLock::new(Arc::default()),
             stale: AtomicBool::new(false),
             rebuilt: Mutex::new(None),
@@ -122,6 +128,13 @@ impl RetrievalScope {
     /// too.
     pub fn with_derived(mut self, groups: Vec<GroupId>) -> Self {
         self.derived = groups;
+        self
+    }
+
+    /// Scope the groups that draw files out of the `code_reading` group too:
+    /// a file one of them draws is in its scope instead of the files'.
+    pub fn with_drawn(mut self, drawn: Vec<(GroupId, Draws)>) -> Self {
+        self.drawn = drawn;
         self
     }
 
@@ -154,6 +167,10 @@ impl RetrievalScope {
         }
         for group in &self.derived {
             let allowed = scope.derived.get(group).cloned().unwrap_or_default();
+            e.set_retrieval_scope(target, *group, allowed);
+        }
+        for (group, _) in &self.drawn {
+            let allowed = scope.drawn.get(group).cloned().unwrap_or_default();
             e.set_retrieval_scope(target, *group, allowed);
         }
     }
@@ -261,6 +278,7 @@ impl RetrievalScope {
         let mut in_files: HashSet<TimelineId> = index.uploads().iter().copied().collect();
         let mut in_folders = HashSet::new();
         let mut in_derived: HashMap<GroupId, HashSet<TimelineId>> = HashMap::new();
+        let mut in_drawn: HashMap<GroupId, HashSet<TimelineId>> = HashMap::new();
         for repo in &repos {
             let Some(of_tree) = self.tree_scope(index, repo) else {
                 continue;
@@ -271,13 +289,20 @@ impl RetrievalScope {
                 .iter()
                 .map(|path| dir_of(&format!("{}/{path}", repo.name)))
                 .collect();
-            in_files.extend(
-                of_tree
-                    .files
-                    .iter()
-                    .filter(|(path, _)| !changed.contains(path.as_str()))
-                    .map(|(_, tl)| *tl),
-            );
+            for (path, tl) in &of_tree.files {
+                if changed.contains(path.as_str()) {
+                    continue;
+                }
+                let at = format!("{}/{path}", repo.name);
+                match self.drawn.iter().find(|(_, draws)| draws.takes(&at)) {
+                    Some((group, _)) => {
+                        in_drawn.entry(*group).or_default().insert(*tl);
+                    }
+                    None => {
+                        in_files.insert(*tl);
+                    }
+                }
+            }
             in_folders.extend(
                 of_tree
                     .folders
@@ -305,6 +330,12 @@ impl RetrievalScope {
             folders: Arc::new(in_folders),
             derived: Arc::new(
                 in_derived
+                    .into_iter()
+                    .map(|(g, tls)| (g, Arc::new(tls)))
+                    .collect(),
+            ),
+            drawn: Arc::new(
+                in_drawn
                     .into_iter()
                     .map(|(g, tls)| (g, Arc::new(tls)))
                     .collect(),
@@ -503,6 +534,33 @@ mod tests {
         let scope = scope_of(&rs, &RepoFiles::overlay(ws).unwrap());
         assert_eq!(*scope.files, set(&[1, 2, 30]));
         assert_eq!(*scope.folders, set(&[10, 11]));
+    }
+
+    /// **A file a drawing group draws is in its scope instead of the files'**;
+    /// a changed one is in neither.
+    #[test]
+    fn a_drawn_file_is_scoped_to_the_drawing_group_alone() {
+        let (root, ws) = workspace();
+        let guides = GroupId::from_raw(3).unwrap();
+        let draws = Draws {
+            from: GroupId::from_raw(2).unwrap(),
+            paths: vec!["r/src/".into()],
+        };
+        let rs = scoped(root.path()).with_drawn(vec![(guides, draws)]);
+        let files = RepoFiles::overlay(ws).unwrap();
+        let scope = scope_of(&rs, &files);
+        assert_eq!(*scope.files, set(&[1, 30]));
+        assert_eq!(*scope.drawn[&guides], set(&[2]));
+
+        let files = files.fresh();
+        files
+            .repo("r")
+            .unwrap()
+            .write("src/b.rs", "fn mine() {}\n".into())
+            .unwrap();
+        let scope = scope_of(&rs, &files);
+        assert_eq!(*scope.files, set(&[1, 30]));
+        assert!(!scope.drawn.contains_key(&guides));
     }
 
     /// **A path the conversation changed leaves the scope**, and so does the

@@ -286,7 +286,7 @@ pub use resolver::{
     TargetedRead, WarmProbe,
 };
 pub use schema::{
-    Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
+    Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, Draws, GatherScope,
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection,
     SectionSchema, SectionTree, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeDim,
     TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,

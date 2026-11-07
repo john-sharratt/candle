@@ -21,21 +21,34 @@ filter over the units it draws:
 
 ```yaml
 - id: guidance
-  persisted_id: 3
-  draws: [{ repo: candle, path: mcp/src/guides/ }, { repo: journals, path: "" }]
+  persisted_id: 13
+  draws:
+    from: scopes
+    paths: [candle/mcp/src/guides/, journals/]
   selection: { kind: working_set, share: guidance }
 ```
 
-- **It draws, it does not own.** A unit belongs to `scopes` as it always has. A
-  drawing group's candidates are the units of its layer whose path matches one of
-  its `draws`; those units are then no longer `scopes`' candidates. A unit is
-  placed through one group or the other, never both.
-- **Its own share.** The working set's `guidance_tokens` is the most the guidance
-  members may hold between them. They compete among themselves, as folders do
-  under `folder_tokens`: a guide never dislodges a code file, and a burst of code
-  never crowds out the guide the worker needs.
+- **It draws, it does not own.** A unit belongs to `scopes` as it always has.
+  `paths` are workspace-relative prefixes, and `from` names an earlier
+  working-set group of the same layer. The substrate records the pair
+  (`Substrate::set_group_draws`). A drawing group holds no conversation of its
+  own: its candidates are its source's (`active_timelines_for_group`), as its own
+  retrieval scope names them.
+- **One group or the other.** `zend::retrieval_scope` splits each target's
+  files. A file under one of the `paths` goes into the drawing group's scope and
+  out of the files' scope. The scan, selection, the working-set share
+  (`Substrate::placing_group`) and the members a group emits
+  (`working_set_members`) all follow that split, so a unit is placed through one
+  group, never both.
+- **Its own pool.** `WorkingSetShare::Guidance` is bounded by the working set's
+  `guidance_tokens`, a pool beside `budget_tokens` rather than inside it.
+  Guidance dislodges only guidance, and nothing else dislodges it: a guide never
+  dislodges a code file, and no burst of code crowds out the guide the worker
+  needs. Without `guidance_tokens` no guide enters.
 - **The same scope.** A unit is offered only when the conversation's base holds
-  its version (`retrieval_scope`), as for every `code_reading` unit.
+  its version (`retrieval_scope`), as for every `code_reading` unit. Its own
+  scan competition (`cases: file`, per group) keeps a guide from being ranked
+  against every `.rs` file.
 
 ## 2. Calibration as it runs
 
@@ -91,9 +104,10 @@ Journals reach the same group by the same filter, with two differences:
 
 ## 5. Build order
 
-1. The drawing group: `draws:` on a group, its candidates filtered from its
-   layer, the drawn units leaving the owning group's candidates; the `guidance`
-   share and `guidance_tokens`. Tests against the resolver and the working set.
+1. **Built.** The drawing group: `draws:` on a group, its candidates taken from
+   its source, the drawn units leaving the owning group's candidates; the
+   `guidance` share and `guidance_tokens`. Tests against the substrate, the
+   retrieval scope and the working set.
 2. Use calibration: a read in a tool round becomes an exemplar of its unit, kept
    per unit up to `max_exemplars`. Tests for the exemplar text and its labelling.
 3. Cue seeding for units no one has read.

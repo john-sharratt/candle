@@ -20,6 +20,9 @@ pub struct Limits {
     /// Tokens the voluntary folder members may hold between them; the files
     /// take what is left of `budget_tokens`.
     pub folder_tokens: usize,
+    /// Tokens the voluntary guidance members may hold between them — a pool
+    /// of their own, outside `budget_tokens`.
+    pub guidance_tokens: usize,
     /// Tokens the locks may hold together, on top of `budget_tokens`.
     pub lock_tokens: usize,
     /// Tokens one member may hold.
@@ -367,6 +370,9 @@ impl WorkingSet {
         if let Some(over) = self.room_for(0, WorkingSetShare::Folders, limits, &|_| true) {
             self.evict(&over);
         }
+        if let Some(over) = self.room_for(0, WorkingSetShare::Guidance, limits, &|_| true) {
+            self.evict(&over);
+        }
 
         let mut newcomers: Vec<(TimelineId, f32)> = self
             .momentum
@@ -429,7 +435,9 @@ impl WorkingSet {
     /// allows (judged on their momentum) — or `None` when no such set makes it
     /// fit. On a momentum tie the one nearest the insertion point goes first:
     /// it moves the fewest members on its left. Locks count against nothing
-    /// here; they sit on top.
+    /// here; they sit on top. Guidance is a pool apart: it is bounded by
+    /// `guidance_tokens` alone and dislodges only guidance, and nothing else
+    /// dislodges it.
     fn room_for(
         &self,
         tokens: usize,
@@ -437,7 +445,18 @@ impl WorkingSet {
         limits: Limits,
         may_dislodge: &dyn Fn(f32) -> bool,
     ) -> Option<Vec<usize>> {
-        let mut total = self.tokens_where(false);
+        let guidance = share == WorkingSetShare::Guidance;
+        let in_pool = |m: &Member| !m.locked && (m.share == WorkingSetShare::Guidance) == guidance;
+        let mut total: usize = self
+            .members
+            .iter()
+            .filter(|m| in_pool(m))
+            .map(|m| m.tokens)
+            .sum();
+        let ceiling = match guidance {
+            true => limits.guidance_tokens,
+            false => limits.budget_tokens,
+        };
         let mut folders: usize = self
             .members
             .iter()
@@ -451,14 +470,14 @@ impl WorkingSet {
             .members
             .iter()
             .enumerate()
-            .filter(|(_, m)| !m.locked)
+            .filter(|(_, m)| in_pool(m))
             .map(|(i, m)| (i, self.momentum_of(m.timeline).unwrap_or(0.0)))
             .filter(|&(_, m)| may_dislodge(m))
             .collect();
         pool.sort_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)));
         let mut victims = Vec::new();
         loop {
-            let over_total = total + tokens > limits.budget_tokens;
+            let over_total = total + tokens > ceiling;
             let over_folders = folder_bound(folders);
             if !over_total && !over_folders {
                 return Some(victims);
@@ -496,6 +515,7 @@ mod tests {
 
     const FILES: WorkingSetShare = WorkingSetShare::Remainder;
     const FOLDERS: WorkingSetShare = WorkingSetShare::Folders;
+    const GUIDES: WorkingSetShare = WorkingSetShare::Guidance;
 
     fn tl(raw: u64) -> TimelineId {
         TimelineId::from_raw(raw).unwrap()
@@ -505,13 +525,14 @@ mod tests {
         Limits {
             budget_tokens,
             folder_tokens: budget_tokens,
+            guidance_tokens: budget_tokens,
             lock_tokens: budget_tokens,
             max_file_tokens: 1_000,
         }
     }
 
     /// A 100-token file, except 9 (no total) and 8 (2,000 tokens); 50–59 are
-    /// 100-token folders.
+    /// 100-token folders, 60–69 100-token guides.
     fn info(timeline: TimelineId) -> Option<Candidate> {
         let raw = timeline.raw();
         Some(Candidate {
@@ -520,10 +541,10 @@ mod tests {
                 8 => Some(2_000),
                 _ => Some(100),
             },
-            share: Some(if (50..60).contains(&raw) {
-                FOLDERS
-            } else {
-                FILES
+            share: Some(match raw {
+                50..60 => FOLDERS,
+                60..70 => GUIDES,
+                _ => FILES,
             }),
         })
     }
@@ -768,6 +789,7 @@ mod tests {
         let lim = Limits {
             budget_tokens: 300,
             folder_tokens: 100,
+            guidance_tokens: 0,
             lock_tokens: 300,
             max_file_tokens: 1_000,
         };
@@ -782,6 +804,67 @@ mod tests {
             vec![1, 51],
             "50 left for 51; the weaker file 1 stayed"
         );
+    }
+
+    /// Room for one 100-token guide beside two 100-token files.
+    fn guide_limits() -> Limits {
+        Limits {
+            budget_tokens: 200,
+            folder_tokens: 0,
+            guidance_tokens: 100,
+            lock_tokens: 300,
+            max_file_tokens: 1_000,
+        }
+    }
+
+    /// **Guidance is a pool of its own**: a guide enters beside a full budget
+    /// of files without dislodging one, and a stronger guide dislodges the
+    /// guide, never the weaker file.
+    #[test]
+    fn a_guide_makes_room_among_the_guides_alone() {
+        let mut ws = WorkingSet::default();
+        let lim = guide_limits();
+        let fresh = HashMap::from([(tl(1), 200.0), (tl(2), 200.0), (tl(60), 900.0)]);
+        ws.observe(&fresh, 0.2, 100.0, lim, NonZeroUsize::MAX, &info);
+        assert_eq!(
+            order(&ws),
+            vec![60, 1, 2],
+            "the files' budget is full and the guide still entered"
+        );
+        // 60 decays to 720, and 720 × 1.5 < 5,000; the files sit at 160.
+        let fresh = HashMap::from([(tl(61), 5_000.0)]);
+        ws.observe(&fresh, 0.2, 100.0, lim, NonZeroUsize::MAX, &info);
+        assert_eq!(order(&ws), vec![1, 2, 61], "60 left for 61; no file moved");
+    }
+
+    /// **No burst of files crowds out a guide**: a file far stronger than the
+    /// guide dislodges a file, never the guide.
+    #[test]
+    fn a_file_never_dislodges_a_guide() {
+        let mut ws = WorkingSet::default();
+        let lim = guide_limits();
+        let fresh = HashMap::from([(tl(1), 900.0), (tl(2), 900.0), (tl(60), 200.0)]);
+        ws.observe(&fresh, 0.2, 100.0, lim, NonZeroUsize::MAX, &info);
+        assert_eq!(order(&ws), vec![1, 2, 60]);
+        let fresh = HashMap::from([(tl(3), 50_000.0)]);
+        ws.observe(&fresh, 0.2, 100.0, lim, NonZeroUsize::MAX, &info);
+        let members = order(&ws);
+        assert!(members.contains(&60), "the guide stayed: {members:?}");
+        assert!(members.contains(&3), "the file entered: {members:?}");
+        assert_eq!(members.len(), 3, "one file left for it: {members:?}");
+    }
+
+    /// With no guidance pool declared, a guide never enters.
+    #[test]
+    fn with_no_guidance_pool_no_guide_enters() {
+        let mut ws = WorkingSet::default();
+        let lim = Limits {
+            guidance_tokens: 0,
+            ..guide_limits()
+        };
+        let fresh = HashMap::from([(tl(60), 5_000.0), (tl(1), 100.0)]);
+        ws.observe(&fresh, 0.2, 100.0, lim, NonZeroUsize::MAX, &info);
+        assert_eq!(order(&ws), vec![1]);
     }
 
     /// **An unlocked member the scope no longer offers leaves**; a lock stays —

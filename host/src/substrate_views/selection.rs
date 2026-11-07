@@ -17,6 +17,7 @@ pub fn fmt_selection(rule: &SelectionRule) -> String {
         SelectionRule::WorkingSet { share } => match share {
             WorkingSetShare::Folders => "working set (folders)".to_string(),
             WorkingSetShare::Remainder => "working set (files)".to_string(),
+            WorkingSetShare::Guidance => "working set (guidance)".to_string(),
         },
     }
 }

@@ -1485,6 +1485,7 @@ impl Builder {
                     locality: None,
                     anchor: None,
                     max_swaps: DEFAULT_MAX_SWAPS,
+                    draws: None,
                 }],
                 policy: SelectionPolicy::default_policy(),
                 gather_scope: GatherScope::default(),

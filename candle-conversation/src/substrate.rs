@@ -267,6 +267,14 @@ pub struct Substrate {
     /// member. In-memory only, set once at engine setup.
     working_set_shares: PMap<GroupId, WorkingSetShare>,
 
+    /// Each drawing group and the group whose conversations it draws from —
+    /// the schema's `draws: { from }` (`docs/guidance_layer.md` §1). A drawing
+    /// group holds no conversation of its own: its candidates are its source's,
+    /// as its retrieval scope names them, and a unit its scope names is placed
+    /// through it rather than through the source. In-memory only, set once at
+    /// engine setup.
+    drawing_groups: PMap<GroupId, GroupId>,
+
     /// Per target, per scoped group, the conversations that group may offer
     /// it ([`Self::scoped_timelines_for_group`]). In-memory only and derived:
     /// the embedder sets it before each turn from the target's own files.
@@ -3303,6 +3311,9 @@ impl Substrate {
         arc_mut(&mut self.timelines, &timeline).and_then(|t| ord_arc_mut(&mut t.turns, &index))
     }
 
+    /// Every conversation registered in `group` — none for a drawing group,
+    /// which holds none of its own ([`Self::active_timelines_for_group`] is
+    /// what it selects from).
     pub fn timelines_for_group(&self, group: GroupId) -> impl Iterator<Item = TimelineId> + '_ {
         self.timelines_by_group
             .get(&group)
@@ -3342,15 +3353,13 @@ impl Substrate {
     /// flagged `archived` or tombstoned.  Projection retrieval
     /// ([`ContentResolver`]) uses this so retired and user-archived
     /// conversations drop out of selection without their turns
-    /// being physically deleted from the substrate.
+    /// being physically deleted from the substrate. A drawing group's are
+    /// those of the group it draws from ([`Self::set_group_draws`]).
     pub fn active_timelines_for_group(
         &self,
         group: GroupId,
     ) -> impl Iterator<Item = TimelineId> + '_ {
-        self.timelines_by_group
-            .get(&group)
-            .into_iter()
-            .flat_map(|v| v.iter().copied())
+        self.timelines_for_group(self.holding_group(group))
             .filter(move |tl| {
                 if self.tombstoned_timelines.contains(tl) {
                     return false;
@@ -3472,6 +3481,34 @@ impl Substrate {
         self.working_set_shares.insert(group, share);
     }
 
+    /// Record that `drawing` places units of `from`'s conversations: its
+    /// candidates are `from`'s, as `drawing`'s own retrieval scope names them.
+    /// Both are scoped, and the embedder gives each target scopes that do not
+    /// overlap, so a unit is placed through one group or the other. Idempotent.
+    pub fn set_group_draws(&mut self, drawing: GroupId, from: GroupId) {
+        self.drawing_groups.insert(drawing, from);
+    }
+
+    /// The group whose registered conversations `group`'s candidates are: its
+    /// source for a drawing group, itself otherwise.
+    fn holding_group(&self, group: GroupId) -> GroupId {
+        self.drawing_groups.get(&group).copied().unwrap_or(group)
+    }
+
+    /// The group `timeline` is placed through in `target`'s projection: a
+    /// drawing group of its own group whose scope offers it to `target`, or
+    /// else the group it is registered in. `None` for an unknown timeline.
+    pub fn placing_group(&self, target: TimelineId, timeline: TimelineId) -> Option<GroupId> {
+        let (_, owner) = self.timeline_target(timeline)?;
+        let drawn = self
+            .drawing_groups
+            .iter()
+            .filter(|(_, from)| **from == owner)
+            .map(|(drawing, _)| *drawing)
+            .find(|drawing| self.scope_offers(*drawing, target, timeline));
+        Some(drawn.unwrap_or(owner))
+    }
+
     /// What admitting `timeline` into `target`'s working set needs: its
     /// recorded size and its share — or `None` when it cannot be a member at
     /// all: it cannot deliver ([`Self::deliverable`]), it is a link of
@@ -3486,7 +3523,7 @@ impl Substrate {
         if self.inherited_chain(target).contains(&timeline) {
             return None;
         }
-        let group = self.timeline_target(timeline).map(|(_, g)| g);
+        let group = self.placing_group(target, timeline);
         if group.is_some_and(|g| !self.scope_offers(g, target, timeline)) {
             return None;
         }
@@ -8335,6 +8372,55 @@ mod tests {
         assert!(sub.retrieval_scopes.is_empty());
     }
 
+    /// **A drawing group's candidates are its source's, as its own scope names
+    /// them**, and a unit it draws is placed through it — while the source,
+    /// scoped without it, no longer offers it.
+    #[test]
+    fn a_drawing_group_places_what_its_scope_draws_from_its_source() {
+        let (mut sub, files, [a, b], ingested) = scope_fixture();
+        let guides = GroupId::for_test(3);
+        sub.set_group_draws(guides, files);
+        sub.mark_group_scoped(files);
+        sub.mark_group_scoped(guides);
+        assert_eq!(
+            sub.timelines_for_group(guides).count(),
+            0,
+            "it holds none of its own"
+        );
+        assert_eq!(
+            sub.active_timelines_for_group(guides).collect::<Vec<_>>(),
+            ingested.to_vec(),
+            "it selects from its source's"
+        );
+        sub.set_retrieval_scope(a, files, Arc::new(HashSet::from([ingested[0]])));
+        sub.set_retrieval_scope(a, guides, Arc::new(HashSet::from([ingested[1]])));
+        assert_eq!(scoped(&sub, files, a), vec![ingested[0]]);
+        assert_eq!(scoped(&sub, guides, a), vec![ingested[1]]);
+        assert_eq!(sub.placing_group(a, ingested[0]), Some(files));
+        assert_eq!(sub.placing_group(a, ingested[1]), Some(guides));
+        assert_eq!(
+            sub.placing_group(b, ingested[1]),
+            Some(files),
+            "a target whose scope draws nothing places through the owner"
+        );
+        assert!(scoped(&sub, guides, b).is_empty());
+    }
+
+    /// **A drawn unit draws on the drawing group's share** of the working set.
+    #[test]
+    fn a_drawn_unit_draws_on_the_drawing_groups_share() {
+        let (mut sub, target, reads) = working_set_fixture(2, 100);
+        let files = GroupId::for_test(1);
+        let guides = GroupId::for_test(3);
+        sub.set_working_set_share(guides, WorkingSetShare::Guidance);
+        sub.set_group_draws(guides, files);
+        sub.mark_group_scoped(guides);
+        sub.set_retrieval_scope(target, guides, Arc::new(HashSet::from([reads[1]])));
+        let share = |tl| sub.working_set_candidate(target, tl).and_then(|c| c.share);
+        assert_eq!(share(reads[0]), Some(WorkingSetShare::Remainder));
+        assert_eq!(share(reads[1]), Some(WorkingSetShare::Guidance));
+    }
+
     // ── working sets ────────────────────────────────────────────────────────
 
     /// A dialogue plus `n` ingest conversations of `tokens_each`, none of them
@@ -8365,6 +8451,7 @@ mod tests {
         Limits {
             budget_tokens,
             folder_tokens: budget_tokens,
+            guidance_tokens: budget_tokens,
             lock_tokens: budget_tokens,
             max_file_tokens: 100_000,
         }

@@ -1020,6 +1020,28 @@ layers:
           layer_weights: [0.0, 1.0, 1.0]
           calibration_layer_weights: [0.0, 0.0, 1.0]
           calibration_weight: 0.25
+      - id: guidance
+        persisted_id: 13
+        # The workers' guides and the journals, placed apart from the code
+        # (docs/guidance_layer.md): the same `code_reading` units, drawn out of
+        # `scopes` by path, so a unit is placed through one group or the other.
+        # They compete among themselves for the working set's
+        # `guidance_tokens`: a guide never dislodges a file, and no burst of
+        # files crowds out a guide.
+        draws:
+          from: scopes
+          paths: [candle/mcp/src/guides/, journals/]
+        selection: { kind: working_set, share: guidance }
+        # Scanned as `scopes` is, each guide one case; its own competition is
+        # what keeps a guide from being ranked against every `.rs` file.
+        policy:
+          fusion: { mode: additive }
+          question_pin: true
+          level_prior: { floor_base: 2.0, floor_cap: 16.0 }
+          cases: file
+          layer_weights: [0.0, 1.0, 1.0]
+          calibration_layer_weights: [0.0, 0.0, 1.0]
+          calibration_weight: 0.25
 
   # ── Dialogue ───────────────────────────────────────────────────────────────
   # The live developer ↔ assistant conversation.  Highest layer — sees
@@ -1072,10 +1094,14 @@ layers:
       budget_tokens: 150000
       # The locks sit on top: a read the model makes adds to what it carries
       # and never displaces the provenance around it, up to this ceiling.
-      # 150K + 150K + this layer's 116K window stays clear of the ×2 rung's
+      # 150K + 150K + the 12K `guidance_tokens` + this layer's 116K window
+      # stays clear of the ×2 rung's
       # ceiling of 524,288 (`rope: min_yarn_factor: 2`, §5).
       lock_tokens: 150000
       folder_tokens: 10000       # repo_map's share: pinned + provenance folders
+      # The guidance group's pool, beside `budget_tokens`: two or three guides
+      # or journal notes at a time (docs/guidance_layer.md §1).
+      guidance_tokens: 12000
       beta: 0.2                  # per-file momentum leak: m ← (1 − β)·m + fresh
       min_momentum: 100          # below this a file is no provenance candidate
       max_file_tokens: 100000    # one file above this is never seeded or locked

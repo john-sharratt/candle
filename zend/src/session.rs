@@ -2979,6 +2979,22 @@ impl InferenceState {
                 engine.set_working_set_share(group.id, share);
             }
         }
+        // Each group that draws files out of another's conversations by path
+        // (`docs/guidance_layer.md` §1): scoped like the group it draws from,
+        // with the files it draws in its scope rather than that group's.
+        let mut drawn_groups = Vec::new();
+        for group in proj_builder_refresh
+            .schema()
+            .layers
+            .iter()
+            .flat_map(|l| l.groups.iter())
+        {
+            if let Some(draws) = &group.draws {
+                engine.set_group_draws(group.id, draws.from);
+                engine.mark_group_scoped(group.id);
+                drawn_groups.push((group.id, draws.clone()));
+            }
+        }
 
         let mut branch_layers: Vec<(IngestLayer, IngestScope)> = Vec::new();
         let mut files_group = None;
@@ -3015,8 +3031,12 @@ impl InferenceState {
             }
             branch_layers.push((il.clone(), scope));
         }
-        let retrieval_scope =
-            RetrievalScope::new(files_group, folders_group).with_derived(derived_groups);
+        // Files are what a drawing group draws by path; one drawing from any
+        // other group is scoped and given nothing.
+        drawn_groups.retain(|(_, draws)| Some(draws.from) == files_group);
+        let retrieval_scope = RetrievalScope::new(files_group, folders_group)
+            .with_derived(derived_groups)
+            .with_drawn(drawn_groups);
         // Each layer of units compounds on the layers of units below it: their
         // groups are what its units retrieve across conversations
         // (`Substrate::set_ingest_sees`), the scoped ones on the unit's own

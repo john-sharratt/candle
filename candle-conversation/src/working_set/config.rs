@@ -22,6 +22,9 @@ pub struct WorkingSetConfig {
     /// The most of `budget_tokens` the folder members may hold between them.
     /// The files take what the folders leave.
     pub folder_tokens: usize,
+    /// The most the guidance members may hold between them, beside
+    /// `budget_tokens` rather than inside it (`docs/guidance_layer.md` §1).
+    pub guidance_tokens: usize,
     /// Tokens the locks may hold together, on top of `budget_tokens` — what the
     /// model's own reads may add before one runs for real.
     pub lock_tokens: usize,
@@ -65,6 +68,7 @@ impl WorkingSetConfig {
         Limits {
             budget_tokens: self.budget_tokens,
             folder_tokens: self.folder_tokens,
+            guidance_tokens: self.guidance_tokens,
             lock_tokens: self.lock_tokens,
             max_file_tokens: self.max_file_tokens,
         }
@@ -84,6 +88,7 @@ mod tests {
         WorkingSetConfig {
             budget_tokens: 350_000,
             folder_tokens: 30_000,
+            guidance_tokens: 8_000,
             lock_tokens: 200_000,
             beta: 0.2,
             min_momentum: 100.0,
@@ -119,10 +124,11 @@ mod tests {
             (
                 l.budget_tokens,
                 l.folder_tokens,
+                l.guidance_tokens,
                 l.lock_tokens,
                 l.max_file_tokens
             ),
-            (350_000, 30_000, 200_000, 100_000)
+            (350_000, 30_000, 8_000, 200_000, 100_000)
         );
     }
 }

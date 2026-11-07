@@ -1433,6 +1433,14 @@ impl ConversationEngine {
             .update(|s| s.set_working_set_share(group, share));
     }
 
+    /// Record that `drawing` places units of `from`'s conversations — what a
+    /// group's `draws:` declares (`docs/guidance_layer.md` §1). Idempotent;
+    /// in-memory, so it is set at every setup.
+    pub fn set_group_draws(&self, drawing: GroupId, from: GroupId) {
+        self.conversation
+            .update(|s| s.set_group_draws(drawing, from));
+    }
+
     /// Name the conversations the scoped `group` may offer `target`, replacing
     /// what it named before. Both the belief scan and selection honour it.
     pub fn set_retrieval_scope(

@@ -1106,6 +1106,32 @@ pub struct GroupSchema {
     /// momentum, and section collections (the tool catalog) are not capped.
     /// Never zero: the smallest cap still admits one whole conversation.
     pub max_swaps: NonZeroUsize,
+    /// The units of another group of this layer that this group places
+    /// instead (`docs/guidance_layer.md` §1). `None` for a group that places
+    /// only its own.
+    pub draws: Option<Draws>,
+}
+
+/// What a drawing group takes from the group that owns the units: the ones
+/// under its paths. A unit is placed through one group or the other, never
+/// both. The owner holds every unit as it always has; which of them the
+/// drawing group takes is decided per target by its retrieval scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draws {
+    /// The group whose conversations hold the units.
+    pub from: GroupId,
+    /// Workspace-relative path prefixes — `candle/mcp/src/guides/`,
+    /// `journals/` — a unit's file must lie under one of.
+    pub paths: Vec<String>,
+}
+
+impl Draws {
+    /// Whether the file at workspace-relative `path` is one this group draws.
+    pub fn takes(&self, path: &str) -> bool {
+        self.paths
+            .iter()
+            .any(|prefix| path.starts_with(prefix.as_str()))
+    }
 }
 
 impl GroupSchema {
@@ -1344,6 +1370,10 @@ pub enum WorkingSetShare {
     Folders,
     /// What `budget_tokens` leaves once the folder groups have selected.
     Remainder,
+    /// Up to the working set's `guidance_tokens`, a pool of its own beside
+    /// `budget_tokens`: a guide never dislodges a file, and no burst of files
+    /// crowds out a guide (`docs/guidance_layer.md` §1).
+    Guidance,
 }
 
 /// A fallback section injected when a **collection's** normal selection
@@ -1539,6 +1569,7 @@ mod belief_config_tests {
             locality: None,
             anchor: None,
             max_swaps: DEFAULT_MAX_SWAPS,
+            draws: None,
         }
     }
 
