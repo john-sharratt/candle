@@ -405,7 +405,42 @@ impl Missions {
 
     /// Close the mission on `body`'s agenda called `title` as done, on
     /// `found` — the agenda's own close, for a mission no step shows done.
+    ///
+    /// **An item of the round is not closed by saying so.** Its steps are
+    /// ones the engine sees done (`docs/zen_moon_mind.md` §17.5), and it closes
+    /// itself when they are; `mission_done` is for the agenda's own missions,
+    /// whose steps may be Zen's to judge. The refusal names the next step and,
+    /// for posting work, the act that does it.
     pub fn agenda_done(&mut self, body: &str, title: &str, found: &str) -> Result<Mission, String> {
+        let round_step = self
+            .agenda(body)
+            .into_iter()
+            .find(|m| {
+                m.agendum
+                    .as_ref()
+                    .is_some_and(|a| a.title.eq_ignore_ascii_case(title))
+            })
+            .filter(|m| matches!(m.origin, Origin::Round { .. }))
+            .map(|m| m.next_step().map(|t| t.text.clone()));
+        if let Some(step) = round_step {
+            let next = match step {
+                Some(step) => {
+                    let how = match step.to_lowercase().starts_with("post work") {
+                        true => {
+                            " — `order_post` at the order table, which answers you from \
+                             wherever your attention is"
+                        }
+                        false => "",
+                    };
+                    format!("Its next step is to {step}{how}.")
+                }
+                None => "Its steps are all seen done, and it closes itself.".to_string(),
+            };
+            return Err(format!(
+                "\"{title}\" is an item of your round: it is done when its steps are seen done, \
+                 not when you say so. {next}"
+            ));
+        }
         self.agenda_work(body, title)?;
         self.report(body, Outcome::Pass, found, None)
             .ok_or_else(|| format!("You have no mission called \"{title}\"."))

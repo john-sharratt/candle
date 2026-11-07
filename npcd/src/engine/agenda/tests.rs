@@ -112,6 +112,56 @@ fn a_mission_at_now_goes_first_and_the_one_it_displaces_keeps_its_place() {
     assert_eq!(h.sim(|s| s.missions.chapter("zen")), 0, "no chapter turned");
 }
 
+/// **An item of the round is not closed by saying so**: `mission_done` is
+/// refused for it, naming its next step and the act that does it, and it is
+/// still carried.
+#[test]
+fn an_item_of_the_round_is_not_closed_by_saying_so() {
+    use crate::engine::mission_gen::round;
+    let h = vault();
+    let items = round::parse(
+        "rounds/creators-vault.yaml",
+        "round:\n  - id: set-the-work\n    brief: Set the work.\n    steps:\n      - post work on \
+         the order table\n",
+    )
+    .unwrap();
+    h.with_sim(|s| {
+        s.missions.set_round(items);
+        round::collect(s, "zen", 0).expect("the round's item is collected");
+    });
+    assert_eq!(
+        act(
+            &h,
+            "zen",
+            "mission_done",
+            json!({"mission": "set the work", "found": "posted it on the sensor panel"})
+        ),
+        Outcome::Refused(
+            "\"set the work\" is an item of your round: it is done when its steps are seen done, \
+             not when you say so. Its next step is to post work on the order table — \
+             `order_post` at the order table, which answers you from wherever your attention is."
+                .into()
+        )
+    );
+    assert!(h.sim(|s| s.missions.is_on_mission("zen")), "still carried");
+
+    // Its steps all seen done, it closes itself on the engine's next pass.
+    h.with_sim(|s| s.missions.posted_work("zen"));
+    assert_eq!(
+        act(
+            &h,
+            "zen",
+            "mission_done",
+            json!({"mission": "set the work", "found": "the work is posted"})
+        ),
+        Outcome::Refused(
+            "\"set the work\" is an item of your round: it is done when its steps are seen done, \
+             not when you say so. Its steps are all seen done, and it closes itself."
+                .into()
+        )
+    );
+}
+
 /// **Editing keeps what was done**: steps it keeps stay signed off, and a
 /// raised priority puts it first.
 #[test]

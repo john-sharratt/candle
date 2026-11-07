@@ -134,6 +134,17 @@ impl Devices {
         self.devices.insert(device.id.clone(), device);
     }
 
+    /// Install every device `seeded` has that this lacks, keeping the state of
+    /// each it has — a world taken in from a record written before its map
+    /// stood a machine somewhere still has the machine.
+    pub fn install_missing(&mut self, seeded: &Devices) {
+        for d in seeded.iter() {
+            self.devices
+                .entry(d.id.clone())
+                .or_insert_with(|| d.clone());
+        }
+    }
+
     pub fn get(&self, id: &str) -> Option<&Device> {
         self.devices.get(id)
     }
