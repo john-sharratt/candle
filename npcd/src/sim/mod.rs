@@ -381,9 +381,7 @@ impl Sim {
     /// distinguish them — both are *taking something on* — and splitting them
     /// would be two tools for one act.
     ///
-    /// **A body the world gives no orders takes none off the board.** Zen,
-    /// offered every crisis line a Drone or a panel put up, claimed eighty of
-    /// them, and then read them back as the work it was holding.
+    /// **A body the world gives no orders takes none off the board.**
     pub fn claimable_at(&self, place: &str, body: &str) -> Vec<String> {
         let mut out: Vec<String> = self
             .devices

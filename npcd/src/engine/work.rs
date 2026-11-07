@@ -1426,19 +1426,20 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "You meant to hand an order to somebody, but not who.".into(),
                 );
             };
-            let unordered = hosted
-                .read(|w| {
-                    w.actors()
-                        .find(|a| a.name.eq_ignore_ascii_case(&to))
-                        .map(|a| a.id.clone())
-                })
-                .is_some_and(|id| hosted.sim(|s| s.missions.is_unordered(&id)));
-            if unordered {
+            // Held by body id, as every reader of the board matches it.
+            let Some((id, to)) = hosted.read(|w| {
+                w.actors()
+                    .find(|a| a.name.eq_ignore_ascii_case(&to))
+                    .map(|a| (a.id.clone(), a.name.clone()))
+            }) else {
+                return Outcome::Refused(format!("There is nobody here called {to}."));
+            };
+            if hosted.sim(|s| s.missions.is_unordered(&id)) {
                 return Outcome::Refused(format!(
                     "{to} takes no orders: work for {to} is not handed over, it is asked for."
                 ));
             }
-            hosted.with_sim(|s| match s.ledger.hand_to(&what, &to) {
+            hosted.with_sim(|s| match s.ledger.hand_to(&what, &id) {
                 Ok(()) => Outcome::Did(format!("{to} has it: {what}")),
                 Err(why) => Outcome::Refused(why),
             })
@@ -4510,6 +4511,36 @@ mod tests {
             )
         );
         assert_eq!(h.sim(|s| s.unheld_orders()), ["mind the drill"]);
+    }
+
+    /// **An order handed over by name is held by the body of that name** — the
+    /// id every reader of the board matches — and refused for a name nobody
+    /// answers to.
+    #[test]
+    fn an_order_handed_by_name_is_held_by_that_body() {
+        let h = vault();
+        h.with_sim(|s| {
+            s.ledger.set_order("mind the drill", "m1", None);
+        });
+        let hand = |to: &str| {
+            perform(
+                &h,
+                "m1",
+                &act(
+                    "orders_hand_to",
+                    json!({"what": "mind the drill", "to": to}),
+                ),
+            )
+        };
+        assert_eq!(
+            hand("Nobody Atall"),
+            Outcome::Refused("There is nobody here called Nobody Atall.".into())
+        );
+        assert_eq!(
+            hand("orion vance"),
+            Outcome::Did("Orion Vance has it: mind the drill".into())
+        );
+        assert_eq!(h.sim(|s| s.orders_held_by("m2")), ["mind the drill"]);
     }
 
     /// A mission taken up at the desk, worked with its progress recorded, and
