@@ -50,9 +50,9 @@ const IDLE: &[&str] = &[
     "A cabinet fan somewhere under the bench changes speed and settles.",
     "A terminal on the side bench scrolls two lines of log and stops.",
     "The screen on the wall panel wakes for its scheduled check and dims itself again.",
-    "A hard drive in the rack chatters briefly and goes quiet.",
+    "A hard drive in the rack chatters through its nightly index and goes quiet.",
     "An indicator on a junction box blinks twice, amber, and returns to green.",
-    "A power brick under the desk gives off a faint whine that comes and goes.",
+    "A power brick under the desk whines faintly while the handset on it charges.",
     "The keyboard on the bench terminal still has the caps-lock key lit from whoever used it last.",
     "A cable reel on the wall unwinds a quarter turn under its own weight.",
     "The printer in the corner draws in a sheet, thinks about it, and gives it back.",
@@ -67,16 +67,16 @@ const IDLE: &[&str] = &[
     "A tape drive in the corner spools, stops, and spools the other way.",
     // Doors, hatches, floors, walls.
     "A door two rooms away opens and closes as somebody goes through it.",
-    "The floor plate by the doorway rocks a fraction when weight comes off it.",
+    "The floor plate by the doorway gives a fraction as somebody steps off it, as it always has.",
     "A hatch cover settles against its frame with a soft metallic knock.",
     "A door somewhere down the corridor sighs as the pressure on the two sides of it evens out.",
-    "A wall panel that was never fastened properly taps once against its stud.",
-    "The threshold strip at the door has worked loose at one end.",
+    "A wall panel taps once against its stud as a door down the corridor shuts.",
+    "The threshold strip at the door is scuffed bright where everybody steps.",
     "A handrail somewhere takes a knock and rings for a moment.",
     "The floor grating gives its usual note under a shift of weight.",
-    "A door catch that never quite seats lets the door rest an inch open.",
-    "Dust comes off the top of the door frame in a thin line.",
-    "The rubber on the doorway seal has taken a set and no longer sits flat.",
+    "The last one through left the door off its catch, and it rests an inch open.",
+    "Dust comes off the top of the door frame in a thin line as the door swings.",
+    "The rubber on the doorway seal is worn smooth where the door closes on it.",
     "The lift shaft ticks somewhere behind the wall as the car settles.",
     // Pipes, ducts, and the fabric.
     "A pipe behind the wall carries a knock along its length and away.",
@@ -86,9 +86,9 @@ const IDLE: &[&str] = &[
     "Water moves in a pipe overhead, briefly, going somewhere else.",
     "A duct joint ticks twice as the air behind it changes pressure.",
     "The extract grille above the door draws a scrap of dust up against itself.",
-    "A run of conduit along the wall gives a single hollow note.",
-    "Somewhere above the ceiling a valve closes and the flow stops.",
-    "The trunking along the skirting has come away from the wall at one clip.",
+    "A run of conduit along the wall gives a hollow note as a bag knocks it in passing.",
+    "Somewhere above the ceiling the heating valve closes on its timer and the flow stops.",
+    "The trunking along the skirting carries a label somebody wrote on it in marker.",
     // Objects, furniture, paper.
     "A stack of printed pages, set down crooked, slides an inch across the bench and stops.",
     "Somebody's mug on the far bench has gone cold and left a ring.",
@@ -98,7 +98,7 @@ const IDLE: &[&str] = &[
     "A clipboard slips off its hook and swings on the lanyard.",
     "The corner of a wall notice has come unstuck and curls forward.",
     "A tool left on the bench edge shifts and settles into the groove.",
-    "A cardboard box on the floor gives up a fold and sags.",
+    "A cardboard box on the floor, emptied this morning, gives up a fold and sags.",
     "Loose change or washers rattle in a tray as something passes.",
     "A folded chart on the side table relaxes open along one crease.",
     "The label on a bin has faded to the point of saying nothing.",
@@ -111,12 +111,12 @@ const IDLE: &[&str] = &[
     "A conversation goes past in the corridor outside and does not stop.",
     "Footsteps cross the ceiling overhead, unhurried, from one side to the other.",
     "A trolley goes along a corridor somewhere with one bad wheel.",
-    "Something heavy is set down on the level above and the floor registers it.",
+    "A crate of parts is set down on the level above and the floor registers it.",
     "A door shuts two levels down and the sound comes up the shaft.",
     "The lift moves in its shaft without stopping at this level.",
     "Somebody whistles four notes in the corridor and stops.",
     "A voice on another level calls a name, and somebody calls back.",
-    "Machinery starts up somewhere far off and settles into a steady note.",
+    "The air handling starts on its schedule somewhere far off and settles into a steady note.",
     "The lift shaft carries a scrape of the car's cable somewhere overhead.",
     "Two sets of footsteps go past the door in step and then out of it.",
     "A tool is dropped on a hard floor somewhere below and bounces twice.",
@@ -131,13 +131,13 @@ const IDLE: &[&str] = &[
     "A magnetic strip on the wall gives up one of its tools.",
     "A hinge somewhere in the room complains and then does not.",
     "The waste chute flap opens a crack and falls shut.",
-    "A screw that has been backing out for weeks finally clears its thread.",
+    "A screw knocked off the bench rolls until the skirting stops it.",
     // Air, smell, temperature.
-    "The air in the room carries a faint smell of hot dust from somewhere.",
-    "A draught crosses the floor at ankle height and is gone.",
-    "The air tastes faintly of solder for a few seconds and then does not.",
-    "Something in the room smells briefly of machine oil.",
-    "The temperature in the room has gone up a degree without any announcement.",
+    "The air carries a faint smell of hot dust off the heater as it comes on.",
+    "A draught crosses the floor at ankle height as a door opens somewhere and shuts.",
+    "The air tastes faintly of solder from the bench for a few seconds and then does not.",
+    "The bench smells briefly of machine oil from a tool somebody has just wiped down.",
+    "The room has warmed a degree as the heating follows the hour.",
     "A warm current comes off the back of the rack and rises past the light.",
     "The air near the door is noticeably fresher than the air by the wall.",
     "A charger on the bench gives off the faint warm smell chargers do.",
@@ -181,7 +181,7 @@ const DAMP: &[&str] = &[
     "The air has the flat, mineral smell of standing water in it.",
     "Paper left on the bench has gone soft at the corners.",
     "A film of moisture has come up on the cold surfaces in the room.",
-    "The floor by the wall is tacky underfoot in a way it should not be.",
+    "The floor by the wall is tacky underfoot with the damp.",
     "Everything metal in the room has taken on a dull, beaded look.",
     "The smell in this corner is the smell of a cellar.",
 ];
@@ -317,5 +317,33 @@ impl Fixture for Ambient {
         // of this, and that is deliberate — it is the floor everything else is
         // heard against.
         Some(Stirring::new("ambient", line, Salience::IDLE))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COLD, DAMP, DARK, IDLE, QUIET, WORKING};
+
+    /// **No line is a fault, or a thing without its cause.** The moon's cast,
+    /// told a threshold strip had worked loose, the trunking had come away and
+    /// the room had warmed "without any announcement", spent a night sending
+    /// one another to find what was wrong with the building.
+    #[test]
+    fn no_line_reads_as_a_fault_or_a_mystery() {
+        const TELLS: [&str; 7] = [
+            "worked loose",
+            "come away",
+            "never fastened",
+            "backing out",
+            "without any",
+            "from somewhere",
+            "should not be",
+        ];
+        let pools = [IDLE, COLD, DARK, DAMP, WORKING, QUIET];
+        for line in pools.iter().flat_map(|p| p.iter()) {
+            for tell in TELLS {
+                assert!(!line.contains(tell), "{line:?} reads as {tell:?}");
+            }
+        }
     }
 }
