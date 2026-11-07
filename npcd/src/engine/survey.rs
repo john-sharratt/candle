@@ -13,6 +13,7 @@ use npc_map::text;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::bridge;
 use crate::effector::router::address_of;
 use crate::effector::station;
 use crate::engine::body::Outcome;
@@ -115,6 +116,8 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Survey {
     pub stations: Vec<Entry>,
+    /// The house's bridges here, a line each with the act that works it.
+    pub house: Vec<String>,
     pub threads: Vec<String>,
     pub lately: Option<String>,
 }
@@ -174,8 +177,22 @@ impl Survey {
                 .collect::<Vec<_>>();
             (stations, threads, lately)
         });
+        // **The house link is listed, with what works it.** A fixture with no
+        // controls and no state, it is passed over by the stations above, and
+        // a Drone sent to survey the network from it scanned the front room,
+        // did not see it, and was sent off to look for it on another level.
+        let house = bridge::links_of(&bridge::parts_here(hosted, body))
+            .into_iter()
+            .map(|name| {
+                format!(
+                    "{}. Survey the house network from it with `survey_network`, naming it.",
+                    capital(&name)
+                )
+            })
+            .collect();
         Survey {
             stations,
+            house,
             threads,
             lately,
         }
@@ -183,7 +200,12 @@ impl Survey {
 
     /// The whole survey as the character reads it.
     pub fn prose(&self) -> String {
-        let lines: Vec<String> = self.stations.iter().map(Entry::prose).collect();
+        let lines: Vec<String> = self
+            .stations
+            .iter()
+            .map(Entry::prose)
+            .chain(self.house.iter().cloned())
+            .collect();
         let mut said = say(&lines);
         if let Some(mine) = on_you::say(&self.threads, self.lately.as_deref()) {
             said.push('\n');
@@ -511,6 +533,27 @@ mod tests {
         assert_eq!(
             say(&[]),
             "Nothing in this room answers to you. To see somewhere else, name a place."
+        );
+    }
+
+    /// **A house link is in the survey, with the act that works it**, though it
+    /// is no station.
+    #[test]
+    fn the_survey_lists_the_house_link_with_its_act() {
+        let survey = Survey {
+            stations: Vec::new(),
+            house: vec![
+                "The house link. Survey the house network from it with `survey_network`, \
+                 naming it."
+                    .into(),
+            ],
+            threads: Vec::new(),
+            lately: None,
+        };
+        assert_eq!(
+            survey.prose(),
+            "Here you can work:\n- The house link. Survey the house network from it with \
+             `survey_network`, naming it.\nTo act on one, `invoke` its address."
         );
     }
 
