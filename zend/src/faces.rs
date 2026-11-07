@@ -13,6 +13,8 @@
 //! before faces existed meet the same rule. A face is one short prefill; nothing is read
 //! again.
 
+use std::time::Instant;
+
 use anyhow::Context;
 use candle_conversation::projection::{DecodePriority, Reserved, TurnIndex, TurnKey};
 use candle_conversation::substrate::Substrate;
@@ -41,38 +43,89 @@ pub fn anchor(reading: Reading, subject: &str) -> String {
     }
 }
 
+/// How many faceless units [`fill`] works through between progress lines.
+const PROGRESS_EVERY: usize = 100;
+
+/// What [`fill`] has done so far with the units that lacked a face.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Tally {
+    sealed: usize,
+    failed: usize,
+    /// Leased to another member, which seals it.
+    theirs: usize,
+    /// Given a face while this member waited for the lease.
+    arrived: usize,
+}
+
 /// Seal a face for every unit of `units` that has no live one, each under its
 /// lease so two members do not both seal it. Returns how many were sealed.
+///
+/// A backfill over a whole corpus is thousands of prefills at background
+/// priority, so it says how many units it found faceless, how far it has got
+/// every [`PROGRESS_EVERY`] of them, and how it ended.
 pub fn fill(ctx: &RefreshContext<'_>, units: &[(Reading, Committed)]) -> usize {
-    let mut sealed = 0;
-    for (reading, unit) in units {
+    let faceless: Vec<&(Reading, Committed)> = units
+        .iter()
+        .filter(|(_, unit)| !has_face(ctx.engine, unit))
+        .collect();
+    if faceless.is_empty() {
+        return 0;
+    }
+    let started = Instant::now();
+    let of = faceless.len();
+    tracing::info!(
+        target: "zend::faces",
+        faceless = of,
+        units = units.len(),
+        "sealing faces for the units that lack one",
+    );
+    let mut tally = Tally::default();
+    for (done, (reading, unit)) in faceless.into_iter().enumerate() {
         if crate::ingest_cancel::cancelled() {
             break;
         }
-        if has_face(ctx.engine, unit) {
-            continue;
+        match ingest_lease::share_face(&unit.key) {
+            Share::Theirs => tally.theirs += 1,
+            // A previous holder's face may have arrived while the lease was asked.
+            Share::Mine(guard) if guard.recheck() && has_face(ctx.engine, unit) => {
+                tally.arrived += 1
+            }
+            Share::Mine(_guard) => match seal(ctx, *reading, unit) {
+                Ok(()) => tally.sealed += 1,
+                Err(e) => {
+                    tally.failed += 1;
+                    tracing::warn!(
+                        target: "zend::faces",
+                        subject = %unit.subject,
+                        "sealing the unit's face failed; its own opening stands: {e:#}",
+                    );
+                }
+            },
         }
-        let guard = match ingest_lease::share_face(&unit.key) {
-            Share::Mine(guard) => guard,
-            Share::Theirs => continue,
-        };
-        // A previous holder's face may have arrived while the lease was asked.
-        if guard.recheck() && has_face(ctx.engine, unit) {
-            continue;
-        }
-        match seal(ctx, *reading, unit) {
-            Ok(()) => sealed += 1,
-            Err(e) => tracing::warn!(
+        if (done + 1) % PROGRESS_EVERY == 0 {
+            tracing::info!(
                 target: "zend::faces",
-                subject = %unit.subject,
-                "sealing the unit's face failed; its own opening stands: {e:#}",
-            ),
+                done = done + 1,
+                of,
+                sealed = tally.sealed,
+                failed = tally.failed,
+                theirs = tally.theirs,
+                elapsed_s = started.elapsed().as_secs(),
+                "faces: progress",
+            );
         }
     }
-    if sealed > 0 {
-        tracing::info!(target: "zend::faces", sealed, "sealed ingest units' faces");
-    }
-    sealed
+    tracing::info!(
+        target: "zend::faces",
+        of,
+        sealed = tally.sealed,
+        failed = tally.failed,
+        theirs = tally.theirs,
+        arrived = tally.arrived,
+        elapsed_s = started.elapsed().as_secs(),
+        "sealed ingest units' faces",
+    );
+    tally.sealed
 }
 
 /// Whether `unit` has a live face.
