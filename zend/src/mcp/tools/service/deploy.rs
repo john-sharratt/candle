@@ -14,7 +14,9 @@ use axum::http::Method;
 use serde_json::{json, Value};
 use zend_vfs::JobStatus;
 
-use super::{guard, keep, repo_of, service_of, trial_body, KEEP_TRIAL, SERVICES};
+use super::{
+    guard, keep, keep_build, repo_of, service_of, trial_body, KEEP_STATE, KEEP_TRIAL, SERVICES,
+};
 use crate::mcp::ops;
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::tools::job::JobHandle;
@@ -187,6 +189,16 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
         .iter()
         .find(|a| u64::from_str_radix(&a.node, 16) == Ok(node))
         .map_or(host, |a| a.host.clone());
+    // The trial is keep's, found again by the deploy it records: a keep that
+    // cannot record it is updated before anything is built for it.
+    match keep(call, Method::GET, KEEP_STATE, &host, None).await {
+        Ok(state) => {
+            if let Err(why) = keep_build(&host, &state) {
+                return Answer::error(why);
+            }
+        }
+        Err(e) => return Answer::error(format!("{e}: nothing is built for a keep not reached")),
+    }
     if service == DAEMON {
         if let Err(e) = agents
             .submit(&call.lineage, connector_job(), Some(node))

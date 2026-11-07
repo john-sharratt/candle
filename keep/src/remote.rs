@@ -29,6 +29,7 @@ use cluster::log_read::{self, LogAsk, LogRead};
 use cluster::member::FROM_MEMBER;
 use cluster::session::VirtualConn;
 use cluster::upgrade::artifacts::{Probe, RunProbe};
+use cluster::version::this_build;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
@@ -170,7 +171,15 @@ pub fn state(slots: &[Slot], probe: &dyn Probe) -> Value {
             })
         })
         .collect();
-    json!({"services": services})
+    json!({"keep": keep_build(), "services": services})
+}
+
+/// This keep's own build. A member reads it before a deploy: a keep that names
+/// no build of its own records no deploy on its trials, so the deploy could not
+/// find the trial it asked for.
+fn keep_build() -> Value {
+    let b = this_build();
+    json!({"count": b.count, "hash": b.hash, "local": b.local})
 }
 
 #[derive(Deserialize)]
@@ -379,6 +388,20 @@ mod tests {
         assert!(mainline(a, &Says(None))
             .unwrap_err()
             .contains("--build-info"));
+    }
+
+    /// **keep's state names keep's own build** beside its services, so a
+    /// deploy can tell it records the deploy on each trial.
+    #[test]
+    fn the_state_names_keeps_own_build() {
+        let b = this_build();
+        assert_eq!(
+            state(&[], &Says(None)),
+            json!({
+                "keep": {"count": b.count, "hash": b.hash, "local": b.local},
+                "services": []
+            })
+        );
     }
 
     #[test]

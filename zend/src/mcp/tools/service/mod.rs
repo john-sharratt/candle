@@ -105,6 +105,34 @@ pub async fn keep(
     json_of(&reply).map_err(|e| format!("keep on {host}: {e}"))
 }
 
+/// What a keep too old to record deploys is told to do.
+pub const REBUILD_KEEP: &str = "rename the running `target\\release\\keep.exe`, `cargo build \
+     --release -p keep`, then `curl -X POST http://127.0.0.1:8092/exit` on that machine — its \
+     services keep running and the new keep adopts them";
+
+/// keep `host`'s own build, from its `state`: `count-hash`. A keep that names
+/// none predates recording each trial's deploy, so a deploy there could not find
+/// the trial it asked for — it is refused, with what to do.
+pub fn keep_build(host: &str, state: &Value) -> Result<String, String> {
+    let Some(b) = state.get("keep").filter(|b| !b.is_null()) else {
+        return Err(format!(
+            "keep on {host} is too old to record which deploy a trial belongs to, so a deploy \
+             there would build and try but never see its trial; update keep first: {REBUILD_KEEP}"
+        ));
+    };
+    let local = b.get("local").and_then(Value::as_str).unwrap_or("");
+    Ok(format!(
+        "{}-{}{}",
+        b.get("count").map_or_else(|| "?".into(), Value::to_string),
+        b.get("hash").and_then(Value::as_str).unwrap_or("?"),
+        if local.is_empty() {
+            String::new()
+        } else {
+            format!(" (local {local})")
+        }
+    ))
+}
+
 /// The trials of `service` in keep's `state`.
 pub fn trials_of<'a>(state: &'a Value, service: &str) -> Option<&'a Value> {
     state
@@ -253,6 +281,29 @@ mod tests {
             started_ms: 0,
             ended_ms,
         }
+    }
+
+    /// **A keep names its own build, or is too old to deploy through**: one
+    /// with no `keep` in its state records no deploy on its trials.
+    #[test]
+    fn a_keep_that_names_no_build_of_its_own_is_refused() {
+        let new =
+            json!({"keep": {"count": 4543, "hash": "1a2b3c4d5", "local": ""}, "services": []});
+        assert_eq!(keep_build("BlackWorld", &new), Ok("4543-1a2b3c4d5".into()));
+        let dirty = json!({"keep": {"count": 7, "hash": "ab", "local": "ffee"}});
+        assert_eq!(
+            keep_build("BlackWorld", &dirty),
+            Ok("7-ab (local ffee)".into())
+        );
+        let old = json!({"services": []});
+        assert_eq!(
+            keep_build("WhiteWorld", &old),
+            Err(format!(
+                "keep on WhiteWorld is too old to record which deploy a trial belongs to, so a \
+                 deploy there would build and try but never see its trial; update keep first: \
+                 {REBUILD_KEEP}"
+            ))
+        );
     }
 
     #[test]

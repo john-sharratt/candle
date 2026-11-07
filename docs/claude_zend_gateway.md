@@ -1093,8 +1093,8 @@ are Admin-only at the endpoint:
 
 | Tool | keep route | Class |
 |---|---|---|
-| `service_deploy {host, service}` | the build on that machine's agent, then `POST /v1/keep/trial {service, artifact, deploy}` — the trial, run as a job and tagged with the deploy's handle, `deploy:<node>:<id>`, which it answers. `service` is `motherd`, `web` or `mcp`; each answers `--build-info`, which keep checks the artifact by | Care |
-| `service_status {host?}` | `GET /v1/keep/state` — each service: its stable file's build and whether it runs | Look |
+| `service_deploy {host, service}` | `GET /v1/keep/state` first: a keep whose state names no build of its own (`keep`) records no deploy on its trials, so the deploy is refused with how to update keep. Then the build on that machine's agent, then `POST /v1/keep/trial {service, artifact, deploy}` — the trial, run as a job and tagged with the deploy's handle, `deploy:<node>:<id>`, which it answers. `service` is `motherd`, `web`, `mcp` or `yenbot`; each answers `--build-info`, which keep checks the artifact by | Care |
+| `service_status {host?}` | `GET /v1/keep/state` — keep's own build, and each service: its stable file's build and whether it runs | Look |
 | `job_read` / `job_grep` on a deploy | the build's log, a marker line, then `POST /v1/keep/trial/log` — the trial log, read on keep's machine | Look |
 | `job_status` / `job_cancel` on a deploy | the deploy's stage, waited on; or the build cancelled, or `POST /v1/keep/trial/cancel` — the trial rolled back and recorded cancelled | Look / Care |
 | `service_control {host, service, action}` | `POST /v1/keep/service/:name/:action` — `restart`, `stop`, `start` | `restart`, `start`: Care; `stop`: Decide |

@@ -7,7 +7,7 @@ use agent::client::Agents;
 use axum::http::Method;
 use serde_json::{json, Value};
 
-use super::{built_service, keep, KEEP_STATE, PROOF_WINDOW_MS};
+use super::{built_service, keep, keep_build, KEEP_STATE, PROOF_WINDOW_MS};
 use crate::mcp::ops;
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::tools::cluster_status::ago;
@@ -78,7 +78,10 @@ pub fn trying(trial: &Value, now: u64) -> String {
 
 /// A keep's services, one block each, naming the deploy each trial belongs to.
 pub fn render_keep(host: &str, state: &Value, now: u64) -> String {
-    let mut out = format!("keep on {host}:");
+    let mut out = match keep_build(host, state) {
+        Ok(build) => format!("keep on {host} (keep {build}):"),
+        Err(why) => format!("keep on {host}: {why}"),
+    };
     for s in state
         .get("services")
         .and_then(Value::as_array)
@@ -203,6 +206,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::REBUILD_KEEP;
     use super::*;
 
     const NOW: u64 = 1_800_000_000_000;
@@ -211,7 +215,7 @@ mod tests {
     /// job handle, and a cancelled one says so.
     #[test]
     fn a_keep_names_the_deploy_of_each_trial() {
-        let state = json!({"services": [
+        let state = json!({"keep": {"count": 4543, "hash": "1a2b3c4d5", "local": ""}, "services": [
             {"name": "motherd", "running": 4242,
              "build": {"count": 5739, "hash": "c544", "local": ""},
              "trials": {"running": null,
@@ -223,7 +227,22 @@ mod tests {
                         "last": null}}
         ]});
         let text = render_keep("BlackWorld", &state, NOW);
-        assert!(text.starts_with("keep on BlackWorld:\n- motherd: build 5739-c544, running as pid 4242\n  last trial, of deploy:00000000000000ab:Xe (stage/motherd.exe): cancelled and rolled back 2 min ago"), "{text}");
+        assert!(text.starts_with("keep on BlackWorld (keep 4543-1a2b3c4d5):\n- motherd: build 5739-c544, running as pid 4242\n  last trial, of deploy:00000000000000ab:Xe (stage/motherd.exe): cancelled and rolled back 2 min ago"), "{text}");
         assert!(text.contains("\n- web: build unreadable, not running\n  trial of stage/web.exe — keep is trying it: 30 s in"), "{text}");
+    }
+
+    /// **A keep too old to record deploys says so at the top**, with how to
+    /// update it.
+    #[test]
+    fn an_old_keep_is_named_with_its_fix() {
+        let text = render_keep("WhiteWorld", &json!({"services": []}), NOW);
+        assert_eq!(
+            text,
+            format!(
+                "keep on WhiteWorld: keep on WhiteWorld is too old to record which deploy a trial \
+                 belongs to, so a deploy there would build and try but never see its trial; update \
+                 keep first: {REBUILD_KEEP}"
+            )
+        );
     }
 }
