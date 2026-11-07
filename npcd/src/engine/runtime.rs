@@ -8305,13 +8305,21 @@ mod tests {
         let rt = vaulted();
         let hosted = rt.hosted.get(WORLD).unwrap();
         hosted.with(|w| {
-            w.enter("m1", "Zen".to_string(), Where::new("vault-casting", "green-room"))
-                .unwrap()
+            w.enter(
+                "m1",
+                "Zen".to_string(),
+                Where::new("vault-casting", "green-room"),
+            )
+            .unwrap()
         });
         rt.scheduler.wake(1, 0, 0);
         rt.embody(1, WORLD, "m1", 0).expect("bound");
         hosted.with_sim(|s| s.missions.set_unordered("m1", true));
-        assert_eq!(rt.table_summons(1), None, "a world with no round calls nobody");
+        assert_eq!(
+            rt.table_summons(1),
+            None,
+            "a world with no round calls nobody"
+        );
 
         let items = round::parse(
             "rounds/creators-vault.yaml",
@@ -8332,7 +8340,11 @@ mod tests {
                 ),
             )
         });
-        assert_eq!(rt.table_summons(1), None, "an agenda in hand is worked first");
+        assert_eq!(
+            rt.table_summons(1),
+            None,
+            "an agenda in hand is worked first"
+        );
     }
 
     /// **A piece is written at a desk that composes.** At a chronicle terminal,
