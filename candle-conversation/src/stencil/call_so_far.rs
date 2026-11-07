@@ -128,4 +128,16 @@ mod tests {
         assert_eq!(value_of(br#" "a\"b""#), "a\"b");
         assert_eq!(value_of(b"+3"), "+3");
     }
+    /// **An escaped backslash does not hide the close**: `"a\\"` is `a\` and
+    /// the closing quote ends the value; `"a\\b"` is `a\b`.
+    #[test]
+    fn an_escaped_backslash_does_not_hide_the_close() {
+        // "a\\" — the two characters a\ and then the close.
+        let bytes = &[b'"', b'a', b'\\', b'\\', b'"'];
+        assert_eq!(value_of(bytes), "a\\");
+
+        // "a\\b" — escaped backslash in the middle, then b, then close.
+        let bytes = &[b'"', b'a', b'\\', b'\\', b'b', b'"'];
+        assert_eq!(value_of(bytes), "a\\b");
+    }
 }
