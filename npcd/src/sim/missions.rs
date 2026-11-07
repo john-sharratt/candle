@@ -1347,10 +1347,20 @@ impl Missions {
         before - self.targets.len()
     }
 
-    /// Throw away every generated mission still waiting, releasing its target
-    /// to be found again. Returns how many there were.
+    /// Throw away every mission still waiting on the table — the pool, and what
+    /// a character posted for another by name — releasing each target to be
+    /// found again. Returns how many there were. A mission an operator lodged
+    /// for a character is the operator's, and stays.
     pub fn discard_pool(&mut self) -> usize {
-        let gone = std::mem::take(&mut self.pool);
+        let mut gone = std::mem::take(&mut self.pool);
+        for queue in self.lodged.values_mut() {
+            let (posted, kept): (Vec<Mission>, Vec<Mission>) = std::mem::take(queue)
+                .into_iter()
+                .partition(|m| matches!(m.origin, Origin::Ordered { .. }));
+            *queue = kept;
+            gone.extend(posted);
+        }
+        self.lodged.retain(|_, queue| !queue.is_empty());
         for m in &gone {
             if let Some(k) = target_of(m) {
                 self.targets.remove(k);
@@ -1897,6 +1907,32 @@ mod tests {
         assert_eq!(m.take_lodged("bram").unwrap().prompt, "second");
         assert!(m.take_lodged("bram").is_none(), "queue empties");
         assert!(!m.has_lodged("bram"));
+    }
+
+    /// **Clearing the table clears what was posted by name too**, and leaves
+    /// what an operator lodged.
+    #[test]
+    fn discarding_the_table_takes_posts_set_by_name_and_keeps_the_operators() {
+        let mut m = Missions::default();
+        let posted = |brief: &str| {
+            Mission::new(
+                brief,
+                vec![Todo::new("go to the ward room")],
+                Origin::Ordered {
+                    by: "Zen".into(),
+                    poster: "zen".into(),
+                    job: None,
+                },
+            )
+        };
+        m.lodge("jitter", posted("Watch the ward."));
+        m.lodge("jitter", posted("Check the heat."));
+        m.lodge("jitter", a_mission("the operator's"));
+        m.lodge("wick", posted("Read the board."));
+        assert_eq!(m.discard_pool(), 3);
+        assert!(!m.has_lodged("wick"), "an emptied queue goes");
+        assert_eq!(m.take_lodged("jitter").unwrap().prompt, "the operator's");
+        assert!(m.take_lodged("jitter").is_none());
     }
 
     #[test]

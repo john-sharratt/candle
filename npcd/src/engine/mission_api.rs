@@ -620,9 +620,10 @@ pub struct DiscardQuery {
     ledger: bool,
 }
 
-/// `DELETE /v1/pulse/missions/pool` — throw away every generated mission still
-/// waiting, so the next are written from the corpus as it now stands; with
-/// `?ledger=true`, forget every settled target as well.
+/// `DELETE /v1/pulse/missions/pool` — throw away every mission still waiting
+/// on the table, generated or posted by a character, so the next are written
+/// from the corpus as it now stands; with `?ledger=true`, forget every settled
+/// target as well.
 pub async fn discard_pool(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
