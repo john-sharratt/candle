@@ -114,6 +114,9 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         }
     };
     let brief = filled.brief.clone();
+    if let Some(refusal) = table_full(hosted, body, &brief) {
+        return Outcome::Refused(refusal);
+    }
     // Reported at the table's own room, not the poster's: a poster that takes no
     // orders posts from wherever its attention is (`docs/zen_moon_mind.md`
     // §8.1).
@@ -173,10 +176,43 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     ))
 }
 
-/// The characters who take orders here, named for a refusal that has to say
-/// whom a mission could be for.
-fn who_takes_orders(hosted: &Hosted) -> String {
-    let names: Vec<String> = hosted
+/// Why `body` may not post `brief` now, or `None` when it may.
+///
+/// **The table is not a queue to fill.** A mission already out is not posted
+/// again, and while there is as much work waiting as there are hands to take
+/// it, more waits for a report. With neither, Zen posted 170 missions for three
+/// Drones in a night: each took the next before the last was done, and none
+/// was carried to the end.
+fn table_full(hosted: &Hosted, body: &str, brief: &str) -> Option<String> {
+    let out = hosted.sim(|s| s.missions.out_for(body));
+    if out.iter().any(|(b, _)| b.eq_ignore_ascii_case(brief)) {
+        return Some(format!(
+            "\"{brief}\" is already on the table and not yet reported: you will be told when it \
+             is."
+        ));
+    }
+    // Taken is being carried: work set for a Drone by name waits while that
+    // Drone carries something else.
+    let waiting = out
+        .iter()
+        .filter(|(b, with)| {
+            with.as_deref().is_none_or(|carrier| {
+                hosted.sim(|s| s.missions.active(carrier).is_none_or(|m| m.prompt != *b))
+            })
+        })
+        .count();
+    let hands = order_takers(hosted).len();
+    (waiting >= hands.max(1)).then(|| {
+        format!(
+            "The table already holds {waiting} missions nobody has taken, and there are {hands} \
+             to take them: wait for a report before you set more."
+        )
+    })
+}
+
+/// The names of the characters who take orders here.
+fn order_takers(hosted: &Hosted) -> Vec<String> {
+    hosted
         .read(|w| {
             w.actors()
                 .map(|a| (a.id.clone(), a.name.clone()))
@@ -185,7 +221,13 @@ fn who_takes_orders(hosted: &Hosted) -> String {
         .into_iter()
         .filter(|(id, _)| takes_orders(hosted, id))
         .map(|(_, name)| name)
-        .collect();
+        .collect()
+}
+
+/// The characters who take orders here, named for a refusal that has to say
+/// whom a mission could be for.
+fn who_takes_orders(hosted: &Hosted) -> String {
+    let names = order_takers(hosted);
     match names.is_empty() {
         true => "Nobody here takes orders.".to_string(),
         false => format!("Those who take your orders: {}.", names.join(", ")),
@@ -368,6 +410,42 @@ mod tests {
         assert!(!post(&h, "zen", &args(json!({"steps": "go"}))).happened());
         assert!(!post(&h, "zen", &args(json!({"brief": "Watch Earth."}))).happened());
         assert!(!post(&h, "zen", &args(json!({"brief": "x", "steps": "\n - \n"}))).happened());
+    }
+
+    /// **The table is not a queue to fill.** A mission still out is not posted
+    /// again, and nothing more is posted while every hand that could take it
+    /// already has work waiting: Zen posted 170 missions for three Drones in a
+    /// night, and they carried none of them to the end.
+    #[test]
+    fn the_table_takes_no_more_than_the_hands_to_carry_it() {
+        let h = vault();
+        let board =
+            || args(json!({"brief": "Read the board.", "steps": "go to the dispatch room"}));
+        assert!(post(&h, "zen", &board()).happened());
+        assert_eq!(
+            post(&h, "zen", &board()),
+            Outcome::Refused(
+                "\"Read the board.\" is already on the table and not yet reported: you will be \
+                 told when it is."
+                    .into()
+            )
+        );
+        let earth = args(json!({"brief": "Watch Earth.", "steps": "go to the observatory"}));
+        assert!(post(&h, "zen", &earth).happened());
+        let ward = args(json!({"brief": "Walk the ward.", "steps": "go to the ward room"}));
+        assert_eq!(
+            post(&h, "zen", &ward),
+            Outcome::Refused(
+                "The table already holds 2 missions nobody has taken, and there are 2 to take \
+                 them: wait for a report before you set more."
+                    .into()
+            )
+        );
+        // Taken up, a mission no longer waits, and there is room for one more.
+        h.with_sim(|s| {
+            s.missions.collect("wick", &Facts::default()).unwrap();
+        });
+        assert!(post(&h, "zen", &ward).happened());
     }
 
     fn ward_shift() -> Routine {

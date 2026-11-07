@@ -107,6 +107,32 @@ pub fn write(hosted: &Hosted, _body: &str, args: &Map<String, Value>) -> Outcome
             "The group `{group}` must be kebab-case: it is the folder the template goes in."
         ));
     }
+    // **A template is written once.** Each write is an operation, and each
+    // operation two missions for the Drones: written again while the first was
+    // open, or after it had landed, the same template was 146 operations in a
+    // night and the Drones' table held two thousand missions.
+    let path = format!("{}/{group}/{id}.yaml", dir(hosted.id()));
+    let target = format!("template:{path}");
+    let (writing, landed) = hosted.sim(|s| {
+        (
+            s.missions
+                .operations()
+                .all()
+                .any(|o| o.target == target && !o.settled()),
+            s.missions.routine(&id).is_some(),
+        )
+    });
+    if landed {
+        return Outcome::Refused(format!(
+            "There is already a standing job called `{id}`: `order_post` it by name."
+        ));
+    }
+    if writing {
+        return Outcome::Refused(format!(
+            "The template `{id}` is already being written: you will be able to `order_post` it \
+             by name once it has landed."
+        ));
+    }
     let steps: Vec<Step> = text(args, "steps")
         .map(|s| {
             s.lines()
@@ -143,7 +169,6 @@ pub fn write(hosted: &Hosted, _body: &str, args: &Map<String, Value>) -> Outcome
         Ok(y) => y,
         Err(e) => return Outcome::Refused(format!("The template could not be written out: {e}")),
     };
-    let path = format!("{}/{group}/{id}.yaml", dir(hosted.id()));
     // Caught here as well as by the write step's `routine-parses` check, so Zen
     // hears a malformed template at once rather than the Drone's publish holding.
     if let Err(why) = Routine::parse(&path, &yaml) {
@@ -159,7 +184,7 @@ pub fn write(hosted: &Hosted, _body: &str, args: &Map<String, Value>) -> Outcome
         s.missions.launch(
             "write-template",
             "mission_write",
-            &format!("template:{path}"),
+            &target,
             fingerprint(&yaml),
             &objective,
             &path,
@@ -180,6 +205,7 @@ pub fn write(hosted: &Hosted, _body: &str, args: &Map<String, Value>) -> Outcome
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::mission_gen::world::Draw;
     use crate::engine::workflow::By;
     use crate::world::Hosted;
     use npc_map::world::Where;
@@ -266,5 +292,62 @@ mod tests {
             &args(json!({"id": "Bad Id", "group": "devices", "brief": "b", "steps": "go"})),
         );
         assert!(!bad.happened(), "{bad:?}");
+    }
+
+    /// **A template is written once.** While a write of it is open, writing it
+    /// again opens nothing, and one that has landed is posted by name instead:
+    /// Zen wrote `read-dispatch-board` 146 times in a night, and every write was
+    /// another two missions for the Drones.
+    #[test]
+    fn a_template_is_written_once() {
+        let h = world_with_write_template();
+        let film = || {
+            args(json!({
+                "id": "play-a-film",
+                "group": "devices",
+                "brief": "Put a film on.",
+                "steps": "go to the front room",
+            }))
+        };
+        assert!(write(&h, "zen", &film()).happened());
+        assert_eq!(
+            write(&h, "zen", &film()),
+            Outcome::Refused(
+                "The template `play-a-film` is already being written: you will be able to \
+                 `order_post` it by name once it has landed."
+                    .into()
+            )
+        );
+        let open = h.sim(|s| {
+            s.missions
+                .operations()
+                .all()
+                .filter(|o| o.run.workflow == "write-template" && !o.settled())
+                .count()
+        });
+        assert_eq!(open, 1, "the second write opened nothing");
+
+        h.with_sim(|s| {
+            s.missions.set_routines(
+                vec![Routine {
+                    id: "ward-shift".into(),
+                    brief: "Take a shift on the ward.".into(),
+                    steps: vec!["go to the ward room".into()],
+                    ..Default::default()
+                }],
+                Draw::None,
+            )
+        });
+        assert_eq!(
+            write(
+                &h,
+                "zen",
+                &args(json!({"id": "ward-shift", "group": "ops", "brief": "b", "steps": "go"})),
+            ),
+            Outcome::Refused(
+                "There is already a standing job called `ward-shift`: `order_post` it by name."
+                    .into()
+            )
+        );
     }
 }
