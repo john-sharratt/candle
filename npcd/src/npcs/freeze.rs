@@ -27,7 +27,7 @@ impl Manager<'_> {
     /// The account the answer is written for.
     fn caller(&self) -> &str {
         match self {
-            Manager::Owner(id) | Manager::Admin(id) => *id,
+            Manager::Owner(id) | Manager::Admin(id) => id,
         }
     }
 
