@@ -185,4 +185,49 @@ mod tests {
         assert!(!chains.holds(&a), "the older chain went");
         assert!(chains.holds(&b));
     }
+    /// **A chain named again outlives one held later and not named**: resolving
+    /// touches every chain the overlay names, so the least recently used is the
+    /// last named rather than the last held, and that is the one a third chain
+    /// takes the place of.
+    #[test]
+    fn a_chain_named_again_outlives_one_not_named() {
+        let store = VfsStore::new();
+        store.write("a.txt", "one\n".into()).unwrap();
+        store.write("b.txt", "two\n".into()).unwrap();
+        store.write("c.txt", "six\n".into()).unwrap();
+        let full = Overlay::of(&store.snapshot());
+        let (a, b, c) = (
+            full.chains["a.txt"].clone(),
+            full.chains["b.txt"].clone(),
+            full.chains["c.txt"].clone(),
+        );
+        // Every file is four bytes, so the three chains cost the same and the
+        // cap holds exactly two of them.
+        let one = serde_json::to_vec(&full.carried[&a]).unwrap().len();
+        assert_eq!(
+            (
+                serde_json::to_vec(&full.carried[&b]).unwrap().len(),
+                serde_json::to_vec(&full.carried[&c]).unwrap().len()
+            ),
+            (one, one),
+            "the fixture's three chains are the same size"
+        );
+        let mut chains = Chains::new(one + one);
+        let only = |name: &str| Overlay {
+            chains: BTreeMap::from([("x".to_string(), name.to_string())]),
+            ..full.carrying(&[name.to_string()])
+        };
+        chains.resolve(&only(&a)).unwrap();
+        chains.resolve(&only(&b)).unwrap();
+        // A named again by name alone, nothing carried: it is held already, and
+        // the touch is all the run asks of it.
+        chains.resolve(&only(&a).named()).unwrap();
+        chains.resolve(&only(&c)).unwrap();
+        assert!(chains.holds(&a), "the chain named again stayed");
+        assert!(chains.holds(&c), "the chain just held is held");
+        assert!(
+            !chains.holds(&b),
+            "the chain held after A but never named is the one that went"
+        );
+    }
 }
