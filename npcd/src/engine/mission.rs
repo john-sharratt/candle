@@ -997,20 +997,30 @@ pub fn compass_line(next: &Todo, people: &[(String, Option<String>)], way: Optio
     line
 }
 
-/// The standing jobs an order-giver may post by name, for the compass of a step
-/// that posts work: every job's id, in the catalogue's order. `None` with no
-/// catalogue.
-pub fn job_catalogue(routines: &[Routine]) -> Option<String> {
-    if routines.is_empty() {
-        return None;
-    }
-    let ids: Vec<String> = routines.iter().map(|r| format!("`{}`", r.id)).collect();
-    Some(format!(
-        "Post one of the standing jobs by name — `order_post` with `job` — when one fits what \
-         the families need: {}. Write a brief and steps of your own only for what none of them \
-         covers.",
-        ids.join(", ")
-    ))
+/// How an order-giver posts work, for the compass of a step that posts it: the
+/// act at its address (`order_post`, `invoke`d at `at` when the table's address
+/// is known), the standing jobs it may post by name in the catalogue's order,
+/// and that a notice on a board is not work — the step's own word, "post",
+/// otherwise reads as `post_notice`.
+pub fn post_work_line(routines: &[Routine], at: Option<&str>) -> String {
+    let act = match at {
+        Some(url) => format!("`invoke` `{url}`"),
+        None => "`order_post` at the order table".to_string(),
+    };
+    let what = match routines.is_empty() {
+        true => ", with a `brief` and its `steps`".to_string(),
+        false => {
+            let ids: Vec<String> = routines.iter().map(|r| format!("`{}`", r.id)).collect();
+            format!(
+                " — a standing `job` by name when one fits what the families need: {}; or a \
+                 `brief` and its `steps` for what none of them covers",
+                ids.join(", ")
+            )
+        }
+    };
+    format!(
+        "Work is posted with {act}{what}. A notice on a board is not work: nobody takes it up."
+    )
 }
 
 /// The addresses a document step is done through, at the desk the body stands
@@ -1923,6 +1933,49 @@ mod tests {
             "scan the coolant valve and read what state it is in"
         ));
         assert!(!super::engine_sees("form your own view of it"));
+    }
+
+    /// **Work is posted with the act at its address**, a standing job by name
+    /// when there are any, and a notice is said not to be work — in every case.
+    #[test]
+    fn the_line_for_posting_work_names_the_act_and_the_jobs() {
+        use super::post_work_line;
+        use crate::engine::mission_gen::world::Routine;
+        let jobs = [
+            Routine {
+                id: "ward-patrol".into(),
+                ..Default::default()
+            },
+            Routine {
+                id: "morning-briefing".into(),
+                ..Default::default()
+            },
+        ];
+        let at = "http://local/command/order-table~0/order_post";
+        assert_eq!(
+            post_work_line(&jobs, Some(at)),
+            "Work is posted with `invoke` `http://local/command/order-table~0/order_post` — a \
+             standing `job` by name when one fits what the families need: `ward-patrol`, \
+             `morning-briefing`; or a `brief` and its `steps` for what none of them covers. A \
+             notice on a board is not work: nobody takes it up."
+        );
+        assert_eq!(
+            post_work_line(&jobs, None),
+            "Work is posted with `order_post` at the order table — a standing `job` by name when \
+             one fits what the families need: `ward-patrol`, `morning-briefing`; or a `brief` and \
+             its `steps` for what none of them covers. A notice on a board is not work: nobody \
+             takes it up."
+        );
+        assert_eq!(
+            post_work_line(&[], Some(at)),
+            "Work is posted with `invoke` `http://local/command/order-table~0/order_post`, with a \
+             `brief` and its `steps`. A notice on a board is not work: nobody takes it up."
+        );
+        assert_eq!(
+            post_work_line(&[], None),
+            "Work is posted with `order_post` at the order table, with a `brief` and its `steps`. \
+             A notice on a board is not work: nobody takes it up."
+        );
     }
 
     /// **The compass for the year says the act at the machine, or the way to it.**
