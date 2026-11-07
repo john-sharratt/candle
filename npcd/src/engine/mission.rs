@@ -764,6 +764,24 @@ impl Mission {
         self.todo.iter().find(|t| !t.done)
     }
 
+    /// The step the world can see still to do: [`Self::next_step`], or — when
+    /// that is one the body settles in its own mind ([`is_judgement`]), which
+    /// nothing signs off — the first open step after it that is not, short of
+    /// the report.
+    ///
+    /// **A judgement does not hide what follows it.** Checked against the next
+    /// step alone, `report_done` took a mission whose "decide what they need"
+    /// stood in front of a journey never made.
+    pub fn step_to_do(&self) -> Option<&Todo> {
+        match self.next_step() {
+            Some(t) if is_judgement(&t.text) => self
+                .todo
+                .iter()
+                .find(|t| !t.done && !t.reports && !is_judgement(&t.text)),
+            next => next,
+        }
+    }
+
     /// The first open step that is a reading of one of `machines` the body has
     /// not made, if any.
     ///
@@ -1521,6 +1539,17 @@ pub fn is_judgement(step: &str) -> bool {
 pub const JUDGEMENT_LINE: &str = "Nothing in the world marks that done: settle it from what you \
      have seen, and say it in your report — `report_done` at the table carries it.";
 
+/// [`JUDGEMENT_LINE`] for a judgement with a step the world can see still
+/// after it ([`Mission::step_to_do`]): settled, the body goes on to that one.
+pub fn judgement_then(later: &str, way: Option<&str>) -> String {
+    let later = later.trim().trim_end_matches('.');
+    let at = way.map_or_else(String::new, |w| format!(" It is in {w}."));
+    format!(
+        "Nothing in the world marks that done: settle it from what you have seen, and say it in \
+         your report. Then go on to what is still to do: {later}.{at}"
+    )
+}
+
 const SPEAKING: &[&str] = &[
     "ask ",
     "tell ",
@@ -2059,6 +2088,42 @@ mod tests {
 
     /// **A step settled in the body's own mind is told so**; a journey, a
     /// reading or a word to somebody is not one.
+    /// **A judgement keeps its place, and does not hide what follows it**: the
+    /// next step is still the authored one, and the step to do is the journey
+    /// after it — until only the report is left.
+    #[test]
+    fn a_judgement_step_does_not_hide_the_journey_after_it() {
+        use super::{judgement_then, Mission, Origin, Todo};
+        let mut m = Mission::new(
+            "Look in on them.",
+            vec![
+                Todo::new("decide what they might need"),
+                Todo::new("go to the store room"),
+                Todo::report("go back to the table and report it"),
+            ],
+            Origin::Random {
+                routine: "x".into(),
+            },
+        );
+        let text = |t: Option<&Todo>| t.map(|t| t.text.clone());
+        assert_eq!(
+            text(m.next_step()).as_deref(),
+            Some("decide what they might need")
+        );
+        assert_eq!(
+            text(m.step_to_do()).as_deref(),
+            Some("go to the store room")
+        );
+        m.todo[1].done = true;
+        assert!(m.step_to_do().is_none(), "only the report is left");
+        assert_eq!(
+            judgement_then("go to the store room", Some("the store room: `move_to` it")),
+            "Nothing in the world marks that done: settle it from what you have seen, and say it \
+             in your report. Then go on to what is still to do: go to the store room. It is in \
+             the store room: `move_to` it."
+        );
+    }
+
     #[test]
     fn a_judgement_step_is_known_by_its_verb() {
         use super::is_judgement;

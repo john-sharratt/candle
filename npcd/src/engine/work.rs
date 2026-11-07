@@ -232,7 +232,12 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             // never made. The way to the step is the refusal.
             if let Some(way) = still_doable(hosted, body) {
                 let step = hosted
-                    .sim(|s| s.missions.active(body)?.next_step().map(|t| t.text.clone()))
+                    .sim(|s| {
+                        s.missions
+                            .active(body)?
+                            .step_to_do()
+                            .map(|t| t.text.clone())
+                    })
                     .unwrap_or_default();
                 return Outcome::Refused(format!(
                     "You have not done this yet: {step}. {way} Then come back and report it. If \
@@ -389,7 +394,12 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             // A review must have read what it rejects.
             if let Some(way) = still_doable(hosted, body) {
                 let step = hosted
-                    .sim(|s| s.missions.active(body)?.next_step().map(|t| t.text.clone()))
+                    .sim(|s| {
+                        s.missions
+                            .active(body)?
+                            .step_to_do()
+                            .map(|t| t.text.clone())
+                    })
                     .unwrap_or_default();
                 return Outcome::Refused(format!(
                     "You have not done this yet: {step}. {way} Read it, and mend what the table \
@@ -911,7 +921,7 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
         let step = s
             .missions
             .active(body)?
-            .next_step()
+            .step_to_do()
             .filter(|t| !t.reports)?
             .text
             .clone();
@@ -4513,6 +4523,46 @@ mod tests {
                     .into()
             )
         );
+    }
+
+    /// **A judgement does not let a report past the journey after it.**
+    #[test]
+    fn a_report_is_held_by_a_journey_behind_a_judgement() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let h = vault();
+        h.with_sim(|s| {
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Look in on the stacks.",
+                    vec![
+                        Todo::new("decide what the stacks might need"),
+                        Todo::new("go to the stacks"),
+                        Todo::report("go back to the table and report it"),
+                    ],
+                    Origin::Random {
+                        routine: "x".into(),
+                    },
+                ),
+            )
+        });
+        match perform(
+            &h,
+            "m1",
+            &act(
+                "report_done",
+                json!({"found": "the stacks need nothing at all today"}),
+            ),
+        ) {
+            Outcome::Refused(why) => {
+                assert!(
+                    why.starts_with("You have not done this yet: go to the stacks."),
+                    "{why}"
+                );
+                assert!(why.contains("`move_to`"), "{why}");
+            }
+            other => panic!("a report past an unmade journey was taken: {other:?}"),
+        }
     }
 
     /// **An order is not handed to a body the world gives no orders.**

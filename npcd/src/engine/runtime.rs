@@ -101,9 +101,9 @@ use crate::engine::loopguard::{salient, Took, NUDGE};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mind_record;
 use crate::engine::mission::{
-    compass_line, compass_report_line, doc_compass, given_compass, is_judgement, post_work_line,
-    progress_line, publish_compass, refused_compass, time_compass, time_step, Aim, DeskVerbs,
-    DocStep, Mission, MissionPrompt, Outcome as Verdict, JUDGEMENT_LINE,
+    compass_line, compass_report_line, doc_compass, given_compass, is_judgement, judgement_then,
+    post_work_line, progress_line, publish_compass, refused_compass, time_compass, time_step, Aim,
+    DeskVerbs, DocStep, Mission, MissionPrompt, Outcome as Verdict, JUDGEMENT_LINE,
 };
 use crate::engine::mission_acts::{self, COMMAND_DESK};
 use crate::engine::mission_gen;
@@ -1790,20 +1790,25 @@ impl Runtime {
             if next.critical {
                 return Some(critical_compass(&next.text, s.missions.authorizers()));
             }
-            let way = Aim::of(&next.text).and_then(|aim| {
-                let target = reach
-                    .iter()
-                    .find(|at| {
-                        let level = w.map().get(&at.area).map(|a| a.name.as_str());
-                        w.node(at)
-                            .is_some_and(|n| aim.is_room(&n.name, level.unwrap_or_default()))
-                    })
-                    .or_else(|| {
-                        let d = s.devices.iter().find(|d| aim.is_machine(&d.name))?;
-                        reach.iter().find(|at| place(at) == d.at)
-                    })?;
-                (target != &here).then(|| way_to(target)).flatten()
-            });
+            // The way to the room or machine a step names, when it names one
+            // somewhere other than here.
+            let way_of = |step: &str| {
+                Aim::of(step).and_then(|aim| {
+                    let target = reach
+                        .iter()
+                        .find(|at| {
+                            let level = w.map().get(&at.area).map(|a| a.name.as_str());
+                            w.node(at)
+                                .is_some_and(|n| aim.is_room(&n.name, level.unwrap_or_default()))
+                        })
+                        .or_else(|| {
+                            let d = s.devices.iter().find(|d| aim.is_machine(&d.name))?;
+                            reach.iter().find(|at| place(at) == d.at)
+                        })?;
+                    (target != &here).then(|| way_to(target)).flatten()
+                })
+            };
+            let way = way_of(&next.text);
             let people: Vec<(String, Option<String>)> = w
                 .actors()
                 .filter(|a| a.id != body)
@@ -1816,7 +1821,12 @@ impl Runtime {
             let mut line = compass_line(&next, &people, way.as_deref());
             if is_judgement(&next.text) {
                 line.push(' ');
-                line.push_str(JUDGEMENT_LINE);
+                match mission.step_to_do() {
+                    None => line.push_str(JUDGEMENT_LINE),
+                    Some(later) => {
+                        line.push_str(&judgement_then(&later.text, way_of(&later.text).as_deref()))
+                    }
+                }
             }
             // **Work is posted from the world's catalogue.** Told only "post work
             // on the order table", Zen never saw the jobs it could post by name
