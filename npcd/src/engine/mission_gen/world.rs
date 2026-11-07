@@ -213,6 +213,26 @@ struct WorldConfig {
     authorizers: Vec<String>,
 }
 
+/// Whether an argument's value is a stand-in for one — empty, or a word that
+/// says the value is not known.
+fn is_no_value(value: &str) -> bool {
+    const NONE: [&str; 8] = [
+        "",
+        "unknown",
+        "?",
+        "n/a",
+        "na",
+        "none",
+        "tbd",
+        "unspecified",
+    ];
+    let v = value
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_lowercase();
+    NONE.contains(&v.as_str())
+}
+
 /// Where world `world`'s combined missions file stands in the mind.
 pub fn path(world: &str) -> String {
     format!("{FOLDER}/{world}.yaml")
@@ -234,12 +254,24 @@ impl Routine {
     /// This routine filled with `args`: its brief, steps and work with every
     /// `{name}` replaced. Every parameter the routine declares must be in
     /// `args`, and no placeholder may name anything else.
+    ///
+    /// **A value that stands for no value is none.** Zen, with no build to
+    /// name, posted the build check with `build: unknown`, and a Drone was
+    /// sent to check that "build unknown" had reached every member.
     pub fn fill(&self, args: &BTreeMap<String, String>) -> Result<Filled, String> {
         for p in &self.params {
-            if !args.contains_key(p) {
+            let Some(value) = args.get(p) else {
                 return Err(format!(
                     "the mission `{}` needs an argument for `{p}`",
                     self.id
+                ));
+            };
+            if is_no_value(value) {
+                return Err(format!(
+                    "the mission `{}` needs a value for `{p}`, and \"{}\" is not one: name it, \
+                     or post something else",
+                    self.id,
+                    value.trim()
                 ));
             }
         }
@@ -660,6 +692,17 @@ routines:
             r.fill(&args(&[("title", "Dune")])).unwrap().brief,
             "Put Dune on it."
         );
+        for none in ["unknown", " Unknown ", "", "\"?\"", "TBD"] {
+            assert_eq!(
+                r.fill(&args(&[("title", none)])).unwrap_err(),
+                format!(
+                    "the mission `f` needs a value for `title`, and \"{}\" is not one: name it, \
+                     or post something else",
+                    none.trim()
+                ),
+                "{none:?}"
+            );
+        }
     }
 
     /// **Work is filled too**, each path substituted, into a `Work` the mission
