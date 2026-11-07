@@ -1103,14 +1103,12 @@ so the next app has it too.
 
 ### 15.4 The first library
 
-Drawn before the first app: sixteen tiles, two in each of the palette's
-eight colours, for the apps a family makes first (recipes, shopping, lists,
-a planner, reminders, a journal, photos, money, a garden, health, school,
-travel, a tracker, an assistant, a picture maker, a daily digest); ten
-illustrations across the subjects above; eight empty states; four
-backgrounds; and twelve stickers — fifty pictures, enough that the templates
-(§16) and a first app need nothing drawn. The library grows from there one
-picture at a time, as apps need them.
+A small start, drawn before the first app: ten tiles — a bell, a heart, a
+notebook, a camera, a piggy bank, a sun, a pot, a plant, a shopping basket
+and a checklist — and one illustration, a kitchen. Everything else (more
+tiles, illustrations, empty states, backgrounds, stickers) is drawn when an
+app first needs it, to the house style, and added to the library for the
+next app.
 
 ## 16. Templates
 
@@ -1556,8 +1554,8 @@ Taken 2026-11-07:
 - **The house style is soft flat vector** (§15.2).
 - **The library's sizes are what the image model draws** — 1024 at most a
   side — and nothing is scaled up (§15.1).
-- **The first library is fifty pictures**, grown one picture at a time as
-  apps need more (§15.4).
+- **The first library is small** — eleven pictures — and grows one picture
+  at a time as apps need more (§15.4).
 
 ## 24. Order of work
 
