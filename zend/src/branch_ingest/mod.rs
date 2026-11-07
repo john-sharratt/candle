@@ -31,7 +31,7 @@ use self::tie::{backfill_commits, retie};
 use self::walk::{walk, Corpus, FileItem, RepoBranches, TreeCache};
 use crate::calibrate::CalibrateSpec;
 use crate::code_read::{self, is_upload_path, FileJob};
-use crate::faces::{self, Reading};
+use crate::faces;
 use crate::ingest::IngestMode;
 use crate::layers::plan::Below;
 use crate::layers::{Ground, LayerRun, LayerSpec, Reach};
@@ -358,21 +358,24 @@ fn ground_files(
 
 /// Every committed unit of the file and folder layers among `layers` — what a
 /// dialogue can place, and so what has a face.
-fn readings(ctx: &RefreshContext<'_>, layers: &[LayerPass<'_>]) -> Vec<(Reading, Committed)> {
+fn readings(
+    ctx: &RefreshContext<'_>,
+    layers: &[LayerPass<'_>],
+) -> Vec<(faces::Reading, Committed)> {
     let has = |mode: IngestMode| layers.iter().any(|l| l.mode == mode);
     let mut out = Vec::new();
     if has(IngestMode::Files) {
         out.extend(
             code_read::committed(ctx.engine)
                 .into_iter()
-                .map(|c| (Reading::File, c)),
+                .map(|c| (faces::Reading::File, c)),
         );
     }
     if has(IngestMode::Folders) {
         out.extend(
             repo_scan::committed(ctx.engine)
                 .into_iter()
-                .map(|c| (Reading::Folder, c)),
+                .map(|c| (faces::Reading::Folder, c)),
         );
     }
     out
