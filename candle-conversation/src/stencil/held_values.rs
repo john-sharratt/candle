@@ -172,6 +172,30 @@ mod tests {
         assert_eq!(literal_pattern(&["KehT".into()]), "(?:KehT)");
     }
 
+    /// **Every operator a pattern reads is escaped, and nothing else is.**
+    /// One value per operator, then all of them in one value, then a plain
+    /// word: a held value that slipped through would write the pattern rather
+    /// than be matched by it.
+    #[test]
+    fn every_operator_in_a_value_is_escaped() {
+        let operators = [
+            "\\", ".", "+", "*", "?", "(", ")", "|", "[", "]", "{", "}", "^", "$", "#", "&", "-",
+            "~",
+        ];
+        for operator in operators {
+            assert_eq!(
+                literal_pattern(&[operator.to_string()]),
+                format!("(?:\\{operator})"),
+                "`{operator}` was not escaped"
+            );
+        }
+        assert_eq!(
+            literal_pattern(&[operators.join("")]),
+            r#"(?:\\\.\+\*\?\(\)\|\[\]\{\}\^\$\#\&\-\~)"#
+        );
+        assert_eq!(literal_pattern(&["main2".into()]), "(?:main2)");
+    }
+
     fn parts(table: &[(&str, &[&str])]) -> ValueHolds {
         ValueHolds {
             fields: vec![FieldHold {
