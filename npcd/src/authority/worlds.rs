@@ -19,6 +19,24 @@ use super::role::{Role, Roles};
 use super::told::Told;
 use crate::world_state::Records;
 
+/// Which characters are part-way through a turn, and which are held for a
+/// hand-back.
+///
+/// **One lock, because a turn and a hand-back each read what the other
+/// writes.** A turn begins only if its character is not held, and a hand-back
+/// is sent only if no turn is in progress; with the sets under separate locks
+/// a turn could pass its check, a hand-back pass its own, and the character
+/// run here after it was handed to another member.
+#[derive(Default)]
+struct Turns {
+    /// Characters held for a hand-back, which take no turn meanwhile.
+    handing: HashSet<u64>,
+    /// Characters part-way through a turn: a hand-back waits for its end.
+    turning: HashSet<u64>,
+    /// Held characters whose hand-back has been sent, so it is sent once.
+    returning: HashSet<u64>,
+}
+
 pub struct Standing {
     clustered: AtomicBool,
     /// Whether this member runs characters (`characters:` in its config). One
@@ -47,13 +65,9 @@ pub struct Standing {
     told: Mutex<BTreeMap<String, Vec<Told>>>,
     /// The characters this member runs.
     held: Mutex<BTreeSet<u64>>,
-    /// Characters being handed back, which take no turn meanwhile.
-    handing: Mutex<HashSet<u64>>,
-    /// Characters part-way through a turn: a hand-back waits for its end.
-    turning: Mutex<HashSet<u64>>,
-    /// Characters held for a hand-back whose hand-back has been sent, so it is
-    /// sent once.
-    returning: Mutex<HashSet<u64>>,
+    /// Which characters are mid-turn and which are held for a hand-back, under
+    /// one lock — see [`Turns`].
+    turns: Mutex<Turns>,
     /// Characters lent here that wait for their last holder's writes before
     /// they wake, since when (`docs/cooperative_admission.md` §4.6).
     arriving: Mutex<HashMap<u64, Instant>>,
@@ -90,9 +104,7 @@ impl Standing {
             handed: Mutex::new(BTreeMap::new()),
             told: Mutex::new(BTreeMap::new()),
             held: Mutex::new(BTreeSet::new()),
-            handing: Mutex::new(HashSet::new()),
-            turning: Mutex::new(HashSet::new()),
-            returning: Mutex::new(HashSet::new()),
+            turns: Mutex::new(Turns::default()),
             arriving: Mutex::new(HashMap::new()),
             sending: Mutex::new(HashSet::new()),
             legacy: Mutex::new((BTreeSet::new(), BTreeSet::new())),
@@ -290,12 +302,13 @@ impl Standing {
 
     /// Mark `npc` as being handed back; `false` if it already is.
     pub fn begin_handing(&self, npc: u64) -> bool {
-        self.handing.lock().unwrap().insert(npc)
+        self.turns.lock().unwrap().handing.insert(npc)
     }
 
     pub fn end_handing(&self, npc: u64) {
-        self.handing.lock().unwrap().remove(&npc);
-        self.returning.lock().unwrap().remove(&npc);
+        let mut turns = self.turns.lock().unwrap();
+        turns.handing.remove(&npc);
+        turns.returning.remove(&npc);
     }
 
     /// Hold `npc`, running here and asked to move, for its hand-back; `true`
@@ -306,12 +319,13 @@ impl Standing {
     /// character whose inbox never empties be found between turns at all: it
     /// would otherwise begin its next turn the moment one ended.
     pub fn hand_back_due(&self, npc: u64) -> bool {
-        self.handing.lock().unwrap().insert(npc);
-        !self.turning(npc) && self.returning.lock().unwrap().insert(npc)
+        let mut turns = self.turns.lock().unwrap();
+        turns.handing.insert(npc);
+        !turns.turning.contains(&npc) && turns.returning.insert(npc)
     }
 
     pub fn handing(&self, npc: u64) -> bool {
-        self.handing.lock().unwrap().contains(&npc)
+        self.turns.lock().unwrap().handing.contains(&npc)
     }
 
     /// `npc`, lent here, waits at `now` for its last holder's writes; the
@@ -333,19 +347,20 @@ impl Standing {
     /// `npc`'s turn began; `false` if it is being handed back and must take
     /// none.
     pub fn begin_turn(&self, npc: u64) -> bool {
-        if self.handing(npc) {
+        let mut turns = self.turns.lock().unwrap();
+        if turns.handing.contains(&npc) {
             return false;
         }
-        self.turning.lock().unwrap().insert(npc);
+        turns.turning.insert(npc);
         true
     }
 
     pub fn end_turn(&self, npc: u64) {
-        self.turning.lock().unwrap().remove(&npc);
+        self.turns.lock().unwrap().turning.remove(&npc);
     }
 
     pub fn turning(&self, npc: u64) -> bool {
-        self.turning.lock().unwrap().contains(&npc)
+        self.turns.lock().unwrap().turning.contains(&npc)
     }
 
     /// Mark the write `key` as on its way; `false` if it already is.
