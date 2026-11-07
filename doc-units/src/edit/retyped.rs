@@ -168,4 +168,16 @@ mod tests {
         assert_eq!(retyped(PART, "mod tests {", "mod checks {"), None);
         assert_eq!(retyped("f(a)\n", "a", "g(\n    1)"), None);
     }
+    /// **A blank line alone is not retyped**: the `same` closure requires at
+    /// least one non-blank line among those compared, so a new text that opens
+    /// with a blank line matching the blank line above `old` is not a repeat.
+    #[test]
+    fn a_blank_line_alone_is_not_retyped() {
+        let unit = "a();\n\nb();\n";
+        assert_eq!(
+            retyped(unit, "b();", "\nb();\nc();"),
+            None,
+            "a blank line above `old` must not count as a retyped line"
+        );
+    }
 }
