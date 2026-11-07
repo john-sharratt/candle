@@ -128,4 +128,13 @@ mod tests {
         assert_eq!(value_of(br#" "a\"b""#), "a\"b");
         assert_eq!(value_of(b"+3"), "+3");
     }
+    /// **An escaped backslash does not hide the close**: the pair stands for
+    /// one backslash, and the quote after it still ends the value — whether it
+    /// comes there or the backslash sits in the middle of the text.
+    #[test]
+    fn an_escaped_backslash_does_not_hide_the_close() {
+        // ` "a\\"` is the two characters `a\` and then the close.
+        assert_eq!(value_of(br#" "a\\""#), "a\\");
+        assert_eq!(value_of(br#" "a\\b""#), "a\\b");
+    }
 }
