@@ -64,20 +64,14 @@ fn kind_of(part: &Part) -> DeviceKind {
     }
 }
 
-/// Every machine in a loaded map, derived from the parts standing in its rooms.
+/// Every machine in a map, and what every room's parts let a body do there.
 ///
 /// **The map is the only place a device is written down.** A part that declares
 /// modes is a thing a body works, so it becomes a device wherever it stands and
 /// as many times as it stands there — six terminals in a room are six things to
-/// claim, which is what makes a level able to hold a crew.
-///
-/// The alternative was a second list in this file, free to disagree with the
-/// map about what a room contains. It would have disagreed within the week.
-pub fn devices_from_map(map: &MapSet) -> Devices {
-    devices_and_tools(map).0
-}
-
-/// Every machine in a map, and what every room's parts let a body do there.
+/// claim, which is what makes a level able to hold a crew. The alternative was a
+/// second list in this file, free to disagree with the map about what a room
+/// contains.
 ///
 /// Two answers from one walk, because they come from the same parts and a
 /// second walk could disagree. A part becomes a *device* only if it declares
@@ -411,12 +405,18 @@ pub fn for_world(id: &str, map: Option<&MapSet>) -> Sim {
         "creators-vault" => vault(map),
         "battle-cities" => battle_cities(map),
         _ => {
-            // Even an undescribed world gets its machines, because those come
-            // from its own map rather than from this file. What it does not get
-            // is a tower, a stockpile, or anything to shoot.
+            // Even an undescribed world gets everything its map stands up —
+            // its machines, its boards, and the acts its parts offer — because
+            // those come from its own map rather than from this file. What it
+            // does not get is a tower, a stockpile, or anything to shoot.
+            //
+            // **The acts too.** Given only its machines, the moon offered no
+            // part's act in any room: no `collect_mission` at its order table,
+            // so its Drones were never called to the table and could not have
+            // taken work standing at it.
             let mut sim = Sim::new();
             if let Some(map) = map {
-                sim.devices = devices_from_map(map);
+                from_map(&mut sim, map, id);
             }
             sim
         }
@@ -455,6 +455,18 @@ mod tests {
         // in. A muster point and a tower are different things, and conflating
         // them is what made `recall` look like a battlefield act.
         assert!(s.has_home(), "the vault lost its own teleport point");
+    }
+
+    /// **A world this file does not describe still offers what its parts do.**
+    /// Seeded with its machines alone, the moon offered no `collect_mission` at
+    /// its order table, and its Drones were never called to take work.
+    #[test]
+    fn an_undescribed_world_offers_the_acts_of_its_parts() {
+        let s = for_world("an-undescribed-world", Some(&maps()));
+        assert!(s.part_offers("vault-command/command-room", "collect_mission"));
+        assert!(s.part_offers("vault-command/command-room", "order_post"));
+        assert!(!s.has_home(), "a world with no area of its name has no home");
+        assert!(s.tower.is_none());
     }
 
     #[test]
