@@ -140,6 +140,70 @@ fn the_published_mind_takes_no_commit() {
     );
 }
 
+/// **A mission's commit carries its own document and nothing else**: the
+/// rest of the working set stays open, uncommitted, and still the body's.
+#[test]
+fn a_commit_of_one_document_leaves_the_rest_open() {
+    let (mut b, root, s) = rooted("commit-only");
+    b.write("m1", "x", "layers/eras/fifth.md", "the fifth era\n", &s)
+        .unwrap();
+    b.write("m1", "x", "layers/eras/third.md", "rewritten\n", &s)
+        .unwrap();
+    assert_eq!(
+        b.commit_only("m1", "layers/eras/fifth.md", &s).unwrap(),
+        ["layers/eras/fifth.md"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("layers/eras/fifth.md")).unwrap(),
+        "the fifth era\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("layers/eras/third.md")).unwrap(),
+        "the third era\nburned in the spring\n",
+        "the other change was not committed"
+    );
+    assert_eq!(b.diff("m1"), ["layers/eras/third.md (changed)"]);
+    // Committing the last of it closes the bench, as a whole commit does.
+    b.commit_only("m1", "layers/eras/third.md", &s).unwrap();
+    assert!(b.opened("m1").is_none());
+}
+
+/// **A change no bench may reach any longer is dropped, and named**, so it
+/// cannot hold every commit after it up; the rest of the set is untouched.
+#[test]
+fn a_change_out_of_reach_is_dropped_and_named() {
+    let (mut b, _, s) = rooted("unreachable");
+    b.write("m1", "x", "layers/eras/fifth.md", "the fifth era\n", &s)
+        .unwrap();
+    // Written when worlds/ was still in reach.
+    b.open.get_mut("m1").unwrap().files.insert(
+        "worlds/moon.yaml".into(),
+        Change {
+            base: None,
+            now: Some("journals: {}\n".into()),
+        },
+    );
+    assert_eq!(b.drop_unreachable("m1"), ["worlds/moon.yaml"]);
+    assert_eq!(b.diff("m1"), ["layers/eras/fifth.md (new)"]);
+    assert!(b.drop_unreachable("m1").is_empty());
+    assert_eq!(b.commit("m1", &s).unwrap(), ["layers/eras/fifth.md"]);
+}
+
+/// **A world's own file is not worked at a bench**: it is configuration the
+/// loader reads, as the world's missions file is.
+#[test]
+fn a_world_file_is_not_editable() {
+    let (mut b, _, s) = rooted("worlds");
+    assert_eq!(
+        b.write("m1", "x", "worlds/moon.yaml", "journals: {}\n", &s),
+        Err(
+            "worlds/moon.yaml is not somewhere anybody works. What can be changed is layers, \
+             map, missions, moods, personalities, responses."
+                .to_string()
+        )
+    );
+}
+
 /// **Nobody collides with themselves, nor with the engine's tidying.** A
 /// body's own earlier commit, or a rebased clerical rewrite, is not a
 /// change made under it; somebody else's commit still is.

@@ -2100,8 +2100,11 @@ taken on) and a `Benches` working set (documents it has changed, uncommitted). `
   (`bench.rs:559`). This is what "manufactures the Settling trigger" (C.25) — for real.
 - commit writes every changed doc atomically (`bench.rs:748` `put`) and records
   `last[path]=body` for `bench_blame`.
-- allow-list of editable areas (`bench.rs:666`): `layers`, `map`, `moods`, `personalities`,
-  `responses`, `worlds` — deliberately not `projection.yaml`/`mind.yaml`/`schema/`.
+- allow-list of editable areas (`bench.rs` `EDITABLE_AREAS`): `layers`, `map`, `missions`
+  (its template library only), `moods`, `personalities`, `responses` — deliberately not
+  `projection.yaml`/`mind.yaml`/`schema/`, nor `worlds/`, a world's own configuration.
+- a mission whose step writes one document commits that document alone (`commit_only`);
+  anything else in the working set stays open.
 
 **The write path.** For the prose verbs (`chronicle_add_entry`/`rewrite_page`, `story_draft`,
 `character_write_*`, `place_write_*`) dispatch funnels into `write_into` (`work.rs:700`):

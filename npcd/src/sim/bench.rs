@@ -629,20 +629,71 @@ impl Benches {
     /// person to talk to about it. A shelf that takes no commit — the
     /// published mind — refuses the lot, and the working set stays.
     pub fn commit(&mut self, body: &str, shelf: &dyn Shelf) -> Result<Vec<String>, String> {
+        self.commit_where(body, shelf, |_| true)
+    }
+
+    /// Take out of this body's working set every change to a path no bench may
+    /// reach any longer, and say which — they could never be committed, and
+    /// kept, every commit after would be refused over them.
+    pub fn drop_unreachable(&mut self, body: &str) -> Vec<String> {
+        // With no mind to judge reach against, nothing is out of reach.
+        if self.root().is_err() {
+            return Vec::new();
+        }
+        let gone: Vec<String> = match self.open.get(body) {
+            Some(w) => w
+                .changed()
+                .into_iter()
+                .filter(|p| self.doc(p).is_err())
+                .cloned()
+                .collect(),
+            None => return Vec::new(),
+        };
+        if let Some(w) = self.open.get_mut(body) {
+            w.files.retain(|p, _| !gone.contains(p));
+        }
+        gone
+    }
+
+    /// Record only `raw` of what this body has changed, and leave the rest of
+    /// its working set open — for a mission whose step writes one document,
+    /// whose commit carries that document and nothing else.
+    pub fn commit_only(
+        &mut self,
+        body: &str,
+        raw: &str,
+        shelf: &dyn Shelf,
+    ) -> Result<Vec<String>, String> {
+        let want = self.doc(raw)?;
+        self.commit_where(body, shelf, |key| key == want)
+    }
+
+    /// Record the changes whose path `take` accepts, checked all at once as
+    /// [`Self::commit`] says, and close the working set once nothing changed is
+    /// left in it.
+    fn commit_where(
+        &mut self,
+        body: &str,
+        shelf: &dyn Shelf,
+        take: impl Fn(&str) -> bool,
+    ) -> Result<Vec<String>, String> {
         let Some(w) = self.open.get(body) else {
             return Err("You have nothing open.".into());
         };
         let changed: Vec<(String, Change)> = w
             .files
             .iter()
-            .filter(|(_, c)| c.changed())
+            .filter(|(p, c)| c.changed() && take(p))
             .map(|(p, c)| (p.clone(), c.clone()))
             .collect();
-        if changed.is_empty() {
+        if changed.is_empty() && w.is_empty() {
             // Committing nothing still closes the bench. A body that opened
             // work, changed no document and committed is finished with it, and
             // leaving the set open would refuse its next `bench_branch`.
             self.open.remove(body);
+            return Ok(Vec::new());
+        }
+        if changed.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -673,7 +724,13 @@ impl Benches {
         for key in &written {
             self.last.insert(key.clone(), body.to_string());
         }
-        self.open.remove(body);
+        let rest = self.open.get_mut(body).map(|w| {
+            w.files.retain(|p, _| !written.contains(p));
+            w.is_empty()
+        });
+        if rest != Some(false) {
+            self.open.remove(body);
+        }
         Ok(written)
     }
 
@@ -751,9 +808,11 @@ fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
 /// the world that broke it.
 ///
 /// Everything named here is content: the canon, the cast, the craft libraries,
-/// and the buildings. Adding an area is one line; the guard is
-/// [`MindPath::area`], which is the first path segment and cannot be spoofed
-/// because the path is parsed into segments before anything sees it.
+/// and the buildings. `worlds/` is not: a world's file is its configuration,
+/// read by the loader as a world's missions file is. Adding an area is one
+/// line; the guard is [`MindPath::area`], which is the first path segment and
+/// cannot be spoofed because the path is parsed into segments before anything
+/// sees it.
 pub const EDITABLE_AREAS: &[&str] = &[
     "layers",
     "map",
@@ -761,7 +820,6 @@ pub const EDITABLE_AREAS: &[&str] = &[
     "moods",
     "personalities",
     "responses",
-    "worlds",
 ];
 
 /// Whether an area may be edited at all.
