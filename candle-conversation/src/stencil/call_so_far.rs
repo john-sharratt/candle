@@ -128,4 +128,13 @@ mod tests {
         assert_eq!(value_of(br#" "a\"b""#), "a\"b");
         assert_eq!(value_of(b"+3"), "+3");
     }
+    /// **An escaped backslash does not hide the close**: the backslash escapes
+    /// itself, so the quote after it still closes the value, and a backslash
+    /// escaped in the middle keeps its literal backslash without swallowing
+    /// what follows.
+    #[test]
+    fn an_escaped_backslash_does_not_hide_the_close() {
+        assert_eq!(value_of(b"\"a\\\\\""), "a\\");
+        assert_eq!(value_of(b" \"a\\\\b\" tail"), "a\\b");
+    }
 }
