@@ -86,11 +86,20 @@ impl Tool for HttpSessionOpen {
 
         let mut credential_name = None;
         if let Some(cred_name) = &req.credential_name {
-            let cred = ctx
-                .credentials()?
-                .get_by_name(cred_name)
-                .ok_or_else(|| HttpSessionError::CredentialNotFound(cred_name.clone()))?;
-            credential_name = Some(cred.name.clone());
+            let saved = ctx.credentials()?.get_by_name(cred_name);
+            credential_name = Some(cred_name.clone());
+            // A conversation's own credential first; then a bearer token the
+            // daemon's secrets name for every conversation.
+            let Some(cred) = saved else {
+                let token = ctx
+                    .secrets
+                    .http_bearer(cred_name)
+                    .ok_or_else(|| HttpSessionError::CredentialNotFound(cred_name.clone()))?;
+                let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| HttpSessionError::InvalidCredentialType("http_bearer".into()))?;
+                default_headers.insert(reqwest::header::AUTHORIZATION, value);
+                return open(ctx, builder, default_headers, req.base_url, credential_name);
+            };
             match cred.cred_type.as_str() {
                 "http_basic" => {
                     let username = cred.username.as_deref().unwrap_or("");
@@ -124,31 +133,40 @@ impl Tool for HttpSessionOpen {
             }
         }
 
-        builder = builder.default_headers(default_headers);
-        let client = builder
-            .build()
-            .map_err(|e| HttpSessionError::ConnectionFailed(e.to_string()))?;
-
-        let session_id = format!("sess_{}", Uuid::new_v4());
-        let entry = HttpEntry {
-            meta: SessionMeta {
-                session_id: session_id.clone(),
-                conversation: ctx.lineage().to_string(),
-                opened_at: Utc::now().to_rfc3339(),
-                last_activity: Utc::now().to_rfc3339(),
-                alive: true,
-            },
-            base_url: req.base_url.clone(),
-            credential_name,
-            client,
-        };
-        ctx.sessions.insert_http(entry);
-
-        Ok(OpenResponse {
-            session_id,
-            base_url: req.base_url,
-        })
+        open(ctx, builder, default_headers, req.base_url, credential_name)
     }
+}
+
+/// Build the session's client with `headers` and register it.
+fn open(
+    ctx: &ToolContext,
+    builder: reqwest::blocking::ClientBuilder,
+    headers: reqwest::header::HeaderMap,
+    base_url: Option<String>,
+    credential_name: Option<String>,
+) -> Result<OpenResponse, HttpSessionError> {
+    let client = builder
+        .default_headers(headers)
+        .build()
+        .map_err(|e| HttpSessionError::ConnectionFailed(e.to_string()))?;
+    let session_id = format!("sess_{}", Uuid::new_v4());
+    let entry = HttpEntry {
+        meta: SessionMeta {
+            session_id: session_id.clone(),
+            conversation: ctx.lineage().to_string(),
+            opened_at: Utc::now().to_rfc3339(),
+            last_activity: Utc::now().to_rfc3339(),
+            alive: true,
+        },
+        base_url: base_url.clone(),
+        credential_name,
+        client,
+    };
+    ctx.sessions.insert_http(entry);
+    Ok(OpenResponse {
+        session_id,
+        base_url,
+    })
 }
 
 pub const HTTP_SESSION_OPEN: RegisteredTool = RegisteredTool::new::<HttpSessionOpen>();

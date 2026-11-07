@@ -357,8 +357,11 @@ its own (the gateway believes a bearer token only on `/mcp`,
 - **An API token** is made on the admin page (`/api/v1/admin/tokens`) for an
   admin's account, named, with an expiry, and shown once. yenbot keeps only
   its hash.
-- **It is held as a Zen credential**, `yenbot`, saved once with
-  `credential_save`, so a task names it rather than ever seeing it: 
+- **It is held as a Zen credential**, `yenbot`: a named bearer token in each
+  member's daemon secrets (`~/.zend/secrets.yaml`, `http_bearer: {yenbot:
+  …}`), which `http_session_open` reads when the conversation has saved no
+  credential of that name — a `credential_save` lasts only its own
+  conversation. A task names it rather than ever seeing it: 
   `http_session_open {base_url: "https://yenbot.com.au", credential_name:
   "yenbot"}`, then `http_request {path: "/api/v1/admin/jobs", …}`. The
   gateway passes the `Authorization` header to yenbot unread; yenbot matches
@@ -1594,7 +1597,7 @@ with its tile under `web/content/common/brand/`, and in the footer.
 | `web/src/`, `web.yaml`, zend | Service keys, the gateway's bus, `repo/<name>` on every push, and the connector's file tools — `docs/mcp_file_tools.md`. |
 | `host/roles.yaml` | `service:yenbot` as a user. |
 | Google Cloud console | `https://yenbot.com.au/auth/callback` as a redirect URI on the existing client; the scopes apps may ask for on the consent screen, and the family as test users (§19.3). John does this. |
-| Zen credentials | `yenbot`, an API token for Yen's account, saved with `credential_save` (§6.3). |
+| Zen credentials | `yenbot`, an API token for an admin's account, under `http_bearer` in each member's `~/.zend/secrets.yaml`, which `http_session_open` falls back to (§6.3). |
 | `keep/keep.yaml` | The `yenbot` service: `stable: keep/stable/yenbot.exe`, `args: [--config, D:/yenbot/yenbot.yaml]`. |
 | `motherd/agent.yaml`, `D:\prog\workspace.yaml` | The `yenbot` repository, for Zen and the agent, with `author: {name: Yen, email: <Yen's address>}`. |
 | `service_deploy`, `service_control`, `service_status` | Learn `yenbot`: its repository and its package (§5.5). |

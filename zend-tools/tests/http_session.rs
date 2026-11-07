@@ -1,6 +1,9 @@
 mod harness;
 
+use std::sync::Arc;
+
 use serde_json::json;
+use zend_tools::state::secrets::Secrets;
 
 #[test]
 fn http_session_list_empty() {
@@ -77,6 +80,32 @@ fn http_session_open_credential_not_found() {
         json!({"credential_name": "no_such_cred"}),
     );
     harness::expect_error(&resp, "credential_not_found");
+}
+
+/// **A credential the daemon's secrets name opens a session in any
+/// conversation**, with no `credential_save` first.
+#[test]
+fn http_session_open_with_a_daemon_bearer_token() {
+    let secrets = Secrets::from_yaml("http_bearer:\n  yenbot: tok-123\n", "t.yaml").unwrap();
+    let ctx = harness::granted().with_secrets(Arc::new(secrets));
+    let open = harness::expect_success(harness::invoke_with_ctx(
+        "http_session_open",
+        json!({"base_url": "https://yenbot.com.au", "credential_name": "yenbot"}),
+        &ctx,
+    ));
+    assert!(open["session_id"].as_str().unwrap().starts_with("sess_"));
+    let list = harness::expect_success(harness::invoke_with_ctx(
+        "http_session_list",
+        json!({}),
+        &ctx,
+    ));
+    assert_eq!(list["sessions"][0]["credential_name"], "yenbot");
+    let missing = harness::invoke_with_ctx(
+        "http_session_open",
+        json!({"credential_name": "other"}),
+        &ctx,
+    );
+    harness::expect_error(&missing, "credential_not_found");
 }
 
 #[test]

@@ -41,6 +41,7 @@
 //! reported as such — including an unknown field, so that `tavily_key:` fails
 //! loudly at load instead of silently leaving search unconfigured.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
@@ -83,6 +84,13 @@ pub struct Secrets {
     /// Tavily API key for `web_search`. Obtained from tavily.com.
     #[serde(default)]
     tavily_api_key: Option<String>,
+    /// Bearer tokens by name, for `http_session_open {credential_name}`: a
+    /// service every conversation calls — `yenbot`, Yen Bots' API token for an
+    /// admin's account (`docs/yenbot_app_host.md` §6.3) — is named here once
+    /// rather than saved again in each chat. A conversation's own credential
+    /// of the same name comes first.
+    #[serde(default)]
+    http_bearer: BTreeMap<String, String>,
     /// The file this document was read from, or would have been had it
     /// existed — the file an operator edits to set a missing secret. Not part
     /// of the document itself.
@@ -98,6 +106,7 @@ impl fmt::Debug for Secrets {
         f.debug_struct("Secrets")
             .field("github_token", &redacted(&self.github_token))
             .field("tavily_api_key", &redacted(&self.tavily_api_key))
+            .field("http_bearer", &self.http_bearer.keys().collect::<Vec<_>>())
             .field("source", &self.source)
             .finish()
     }
@@ -133,6 +142,15 @@ impl Secrets {
     /// The Tavily key, or `None` when the document does not usefully set one.
     pub fn tavily_api_key(&self) -> Option<&str> {
         set(&self.tavily_api_key)
+    }
+
+    /// The bearer token named `name`, or `None` when the document does not
+    /// usefully set one.
+    pub fn http_bearer(&self, name: &str) -> Option<&str> {
+        self.http_bearer
+            .get(name)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
     }
 
     /// The file this document came from, or `None` for one the daemon did not
@@ -295,6 +313,25 @@ mod tests {
         assert!(
             msg.contains("tavily_key"),
             "the error should name the unknown field: {msg}"
+        );
+    }
+
+    /// **A named bearer token is read by its name**, trimmed; a blank one or
+    /// an unnamed one is unset, and `Debug` names it without its value.
+    #[test]
+    fn a_named_bearer_token_is_read_by_name() {
+        let s = Secrets::from_yaml(
+            "http_bearer:\n  yenbot: \" 0f3a9c \"\n  blank: \"\"\n",
+            "t.yaml",
+        )
+        .unwrap();
+        assert_eq!(s.http_bearer("yenbot"), Some("0f3a9c"));
+        assert_eq!(s.http_bearer("blank"), None);
+        assert_eq!(s.http_bearer("other"), None);
+        let debug = format!("{s:?}");
+        assert!(
+            debug.contains("yenbot") && !debug.contains("0f3a9c"),
+            "{debug}"
         );
     }
 
