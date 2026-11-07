@@ -1349,6 +1349,7 @@ pub(crate) fn shared_prompt_body(builder: &projection::Builder) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::faces::{anchor, Reading};
 
     /// **The concession is measured against the ZONE, never base + zone.**
     ///
@@ -1563,20 +1564,16 @@ mod tests {
         );
     }
 
-    /// The working set places both ingest layers' units ahead of the dialogue as
-    /// whole exchanges, request turn included, so `history_stance` must disown
-    /// both request forms — and it must disown them **in the words they really
-    /// open with**.
+    /// A dialogue holds each placed reading by its face, whose opening turn is
+    /// only the reading's anchor (`crate::faces::anchor`), so `history_stance`
+    /// names a reading by that label — **in the form the faces really render**.
     ///
-    /// This asserts against the renderers, not against a copy of their output:
-    /// every opener below is read off a freshly rendered request, so rewording
-    /// either ingest's prompt fails this test instead of silently leaving the
-    /// section disowning a form that no longer occurs. Two earlier revisions of
-    /// the section quoted forms written from memory — one of them naming a
-    /// "folder" that a repository-root unit never says — and a chat asked for its
-    /// own first question quoted exactly the unit the carve-out had missed.
+    /// This asserts against the renderer, not against a copy of its output: each
+    /// label below is read off a freshly rendered anchor, so changing the face's
+    /// form fails this test instead of silently leaving the section describing a
+    /// label that no longer occurs.
     #[test]
-    fn history_stance_disowns_the_real_placed_request_openers() {
+    fn history_stance_names_a_reading_by_its_faces_label() {
         let builder = bundled_builder();
         let stance = builder
             .schema()
@@ -1596,36 +1593,27 @@ mod tests {
         // wording, not the wrapping.
         let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        // One real request per placed unit kind: a file, a folder, and a
-        // repository root — the root being the one whose request says no "folder".
-        let file = crate::code_read::opening_prompt("candle/src/lib.rs", 120, &[(1, 120)]);
-        let folder = render::render_request(&unit("candle/zend/src/"));
-        let root = render::render_request(&unit("candle/"));
-
-        for (what, request, opener) in [
-            ("a file", &file, "Read the entire contents of"),
-            ("a folder", &folder, "Summarize"),
-            ("a repository root", &root, "Summarize"),
+        // One real face per placed unit kind: a file, and a folder.
+        for (what, label, reading) in [
+            ("a file", "file=", Reading::File),
+            ("a folder", "folder=", Reading::Folder),
         ] {
+            let rendered = anchor(reading, "candle/zend/src");
             assert!(
-                request.starts_with(opener),
-                "{what}'s request no longer opens {opener:?}, so history_stance \
-                 disowns a form that does not occur: {request:?}",
+                rendered.starts_with(label),
+                "{what}'s face no longer opens {label:?}, so history_stance names a \
+                 label that does not occur: {rendered:?}",
             );
             assert!(
-                stance.contains(opener),
-                "history_stance must disown {what}'s request by its real opener \
-                 {opener:?}: {stance:?}",
+                stance.contains(&format!("`{label}`")),
+                "history_stance must name {what}'s face by its real label {label:?}: \
+                 {stance:?}",
             );
         }
 
         assert!(
-            stance.contains("never read one as the turn you are continuing"),
-            "a tool round's look-back is the failure this section prevents: {stance:?}",
-        );
-        assert!(
-            stance.contains("never count one as something you were asked"),
-            "a reading request must not answer \"what was I asked\": {stance:?}",
+            stance.contains("nothing in it was asked of you"),
+            "a reading's label must not answer \"what was I asked\": {stance:?}",
         );
         // The priming chain's links are inherited INTO `primary_conversation` and
         // sit as the conversation's earliest turns, so a section that spoke only of

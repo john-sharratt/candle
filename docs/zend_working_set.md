@@ -607,6 +607,66 @@ re-decided it.
 The same tags give the GUI a served-call marker for free, and give any later
 audit of "what did the fast path promise this conversation" a direct answer.
 
+### 4.9 Faces — a reading reaches a dialogue without its request
+
+An ingest unit opens on the request that commissioned its reading: a file's on
+"Read the entire contents of `X` … The file is N lines long … summarize …", a
+folder's on "Summarize the `X/` folder …". The reader has to be asked. A
+dialogue that places the reading must not hold that request, because a user turn
+reads as the user's. Measured 2026-11-07: with the working set present, 6 of 12
+workers answered a placed request in place of their own task, describing a
+file nobody had asked about in the layout the request asks for, and quoting
+the request's line count as the size of the file they were given. A section of
+the system prompt saying "those requests are not yours" did not hold against a
+dozen of them framed exactly like the user's own.
+
+**Each unit has a face.** A face is a one-turn conversation on the reserved
+`Face` layer (`Reserved::Face`). It is framed by the prelude every dialogue
+primes on. Its user half is only the reading's anchor, `file=<repo>/<path>` or
+`folder=<repo>/<dir>` (`zend::faces::anchor`). Its assistant half is the unit's
+own opening, the calls it made, prefilled. The unit names its face under
+`face`, and the face names its unit under `face_of`. Both are plain `custom`
+entries, like `forked_from`.
+
+**A dialogue holds the opening by the face.** Every selected turn becomes a
+`ResolvedTurn` at one place (`projection/project.rs`). There, a projection
+whose target is not an append-only ingest layer emits `Substrate::face_of(turn)`
+in place of a unit's opening turn, when the unit has a live, sealed face. The
+face is a turn like any other, with its own K/V, layout and index pages, so
+nothing is windowed and nothing goes in unindexed. A unit being read projects
+its own opening, which is the request it is answering.
+
+**What was selected is still the unit's opening.** Selection, belief, coupling
+and the window all run on the unit's turns. The projection event records the
+opening (`Substrate::unit_of`) with its score, origin and belief carry, and only
+its token count is the face's. A face's own layer is reserved, so no retrieval
+offers it as content of its own.
+
+**Rejected alternatives, recorded because each was proposed.**
+
+- **Cutting the request out of the sealed turn at projection.** K/V can be
+  windowed only where a turn's index pages break (`kept_outside`). Pages break
+  where a unit begins, at the first decoded token and after `</think>`, never at
+  the question's edges. So a file's question shares its first page with its
+  role markers, and a folder's whole request turn (question and prefilled call)
+  is one page. The stored rows cannot be kept for cut K/V either. A row is the
+  indexer's `k_proj` of hidden states, pooled over `ratio` tokens and placed by
+  position, so rows for a missing span point QSA at whatever now sits there.
+- **Rewording the ingest request and moving the instruction into the layer's
+  system prompt.** Every file would have to be read again, which is hours at
+  ingest's rate. Until that finished, the old units would carry their requests,
+  giving two paths or an outage.
+
+**Lifecycle.** `zend::faces::fill` runs at the end of every branch-ingest pass.
+It seals a face for every committed file and folder unit without a live one,
+each under a `face/<content key>` lease so two members do not both seal it. A
+unit read this pass and one read before faces existed meet the same rule, and
+filling is one short prefill per unit, never a re-read. A face names its unit
+before its turn is prefilled, and the unit names the face only once that turn
+holds, so a face that failed part-way is never pointed at. Tombstoning a unit
+tombstones its face (`Conversation::tombstone_timeline`). A face that is gone
+or not yet sealed reads as absent, and the unit's own opening stands.
+
 ## 5. Constraints and cost
 
 - **Context length.** Flash-Next is trained to 262,144 positions; progressive
@@ -659,6 +719,10 @@ these numbers.
 | Seed resolution | `zend/src/working_set/seeds.rs` |
 | Open, the read files withheld after each round, cleared at a new question | `zend/src/session.rs` (`run_inference_stream`, `withhold_read_files`) |
 | Layer config | `zend/src/prompts/projection.yaml` |
+| Faces: `face_of` / `unit_of`, the `face` / `face_of` keys | `candle-conversation/src/substrate/faces.rs` |
+| A dialogue holds an opening by its face; the event records the unit | `projection/project.rs`, `projection/event.rs` (`build_selection`) |
+| A unit's tombstone takes its face | `projection/resolver.rs` (`Conversation::tombstone_timeline`) |
+| Sealing faces after each pass, the `face/` lease | `zend/src/faces.rs`, `zend/src/branch_ingest/mod.rs` (`readings`), `zend/src/ingest_lease.rs` |
 
 ## 7. Tests (CPU unless marked)
 

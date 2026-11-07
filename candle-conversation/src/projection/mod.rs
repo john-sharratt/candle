@@ -231,6 +231,8 @@ mod working_set_pick;
 mod yaml;
 
 #[cfg(test)]
+mod face_tests;
+#[cfg(test)]
 mod operation_tests;
 #[cfg(test)]
 mod remote_turn_tests;

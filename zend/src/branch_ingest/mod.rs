@@ -5,7 +5,8 @@
 //! by what it shows ([`keys`]), plan each layer against what it already holds
 //! ([`plan`]), tombstone what no branch holds at any depth, and ingest what
 //! nothing holds yet within the depth bound — each unit read at the commit it
-//! was found on.
+//! was found on. The pass ends by sealing a face for every file and folder unit
+//! that has none ([`crate::faces`]).
 
 pub mod filter;
 pub mod keys;
@@ -30,6 +31,7 @@ use self::tie::{backfill_commits, retie};
 use self::walk::{walk, Corpus, FileItem, RepoBranches, TreeCache};
 use crate::calibrate::CalibrateSpec;
 use crate::code_read::{self, is_upload_path, FileJob};
+use crate::faces::{self, Reading};
 use crate::ingest::IngestMode;
 use crate::layers::plan::Below;
 use crate::layers::{Ground, LayerRun, LayerSpec, Reach};
@@ -183,6 +185,7 @@ impl BranchIngest {
             }
         }
         trees.retain_tips(&repos);
+        faces::fill(ctx, &readings(ctx, layers));
         Ok(changed)
     }
 
@@ -351,6 +354,28 @@ fn ground_files(
         })
         .collect();
     ground.standing.insert(layer.to_string(), standing);
+}
+
+/// Every committed unit of the file and folder layers among `layers` — what a
+/// dialogue can place, and so what has a face.
+fn readings(ctx: &RefreshContext<'_>, layers: &[LayerPass<'_>]) -> Vec<(Reading, Committed)> {
+    let has = |mode: IngestMode| layers.iter().any(|l| l.mode == mode);
+    let mut out = Vec::new();
+    if has(IngestMode::Files) {
+        out.extend(
+            code_read::committed(ctx.engine)
+                .into_iter()
+                .map(|c| (Reading::File, c)),
+        );
+    }
+    if has(IngestMode::Folders) {
+        out.extend(
+            repo_scan::committed(ctx.engine)
+                .into_iter()
+                .map(|c| (Reading::Folder, c)),
+        );
+    }
+    out
 }
 
 /// `items` less the files found to be binary.

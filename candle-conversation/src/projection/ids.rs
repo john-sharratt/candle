@@ -91,13 +91,17 @@ pub enum Reserved {
     /// rules. Sealed at startup beside the tool summary and projected after it
     /// on a round where the rule holds ([`super::SelectionState::note_summary`]).
     ToolUnavailable(u8),
+    /// Ingest units' faces — each a one-turn conversation a dialogue holds a
+    /// unit's opening by (`Substrate::face_of`). On their own layer and group
+    /// so no retrieval ever offers a face as content of its own.
+    Face,
 }
 
 impl Reserved {
     /// Number of reserved kinds — the width of the band at the very top of the
     /// u32 space that is disjoint from the `1..n` ids YAML allocates. Bump this
     /// when adding a `Reserved` variant.
-    pub const COUNT: u32 = 6 + Self::TOOL_UNAVAILABLE_SLOTS;
+    pub const COUNT: u32 = 7 + Self::TOOL_UNAVAILABLE_SLOTS;
 
     /// Slots held for [`Reserved::ToolUnavailable`].
     pub const TOOL_UNAVAILABLE_SLOTS: u32 = 32;
@@ -113,6 +117,8 @@ impl Reserved {
             Reserved::Prose => 4,
             Reserved::Passthrough => 5,
             Reserved::ToolUnavailable(rule) => 6 + rule as u32,
+            // Past the tool-rule band, so no id already persisted moves.
+            Reserved::Face => 6 + Self::TOOL_UNAVAILABLE_SLOTS,
         }
     }
 

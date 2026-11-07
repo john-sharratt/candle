@@ -640,6 +640,12 @@ fn build_selection(
                 selected.insert(s.id);
             }
             ProjectionSegment::Sealed(SealedKind::Turn(t, role)) => {
+                // A face placed for a unit's opening records the opening: that
+                // is what was selected, scored and given a reason, and what the
+                // next reprojection's belief is seeded from. Its tokens are the
+                // face's, which is what the slot holds.
+                let placed = t.key();
+                let selected = placed.map(|k| resolver.unit_of(k).unwrap_or(k));
                 turns.push(SelectedTurn {
                     layer: layer_name_of_group(schema, t.group())
                         .unwrap_or("")
@@ -647,17 +653,17 @@ fn build_selection(
                     group: group_name_of(schema, t.group())
                         .unwrap_or("conversation")
                         .to_string(),
-                    index: t.index().0,
+                    index: selected.map_or(t.index().0, |k| k.index.0),
                     role: role_str(*role).to_string(),
-                    tokens: t.key().map_or(0, |k| resolver.turn_token_count(k)) as u32,
-                    kind: t.key().map_or(TurnKind::Normal, |k| resolver.turn_kind(k)),
-                    reason: t.key().and_then(|k| origins.get(&k)).copied(),
-                    timeline: t.timeline.map(|tl| tl.raw()),
+                    tokens: placed.map_or(0, |k| resolver.turn_token_count(k)) as u32,
+                    kind: selected.map_or(TurnKind::Normal, |k| resolver.turn_kind(k)),
+                    reason: selected.and_then(|k| origins.get(&k)).copied(),
+                    timeline: selected.map(|k| k.timeline.raw()),
                     // A turn in the segments was selected; stamp its belief score
                     // so the next reprojection can seed its turn-group carry.
                     selected: true,
-                    score: t.key().map_or(0.0, |k| scores.turn(k)),
-                    qualified: t.key().is_some_and(|k| scores.turn_qualified(k)),
+                    score: selected.map_or(0.0, |k| scores.turn(k)),
+                    qualified: selected.is_some_and(|k| scores.turn_qualified(k)),
                 });
             }
             ProjectionSegment::NewUserMessage { tokens } => {

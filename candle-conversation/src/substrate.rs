@@ -47,6 +47,7 @@ mod custom_object_tests;
 mod deleted_set;
 mod dominance;
 mod ended_sections;
+mod faces;
 pub mod gauge;
 mod label_records;
 mod lock;
@@ -1160,6 +1161,19 @@ pub trait ContentResolver {
     /// Default `false` — an ordinary projection retrieves.
     fn target_is_ingest_self(&self) -> bool {
         false
+    }
+
+    /// The turn a dialogue holds in place of `turn` — its unit's face
+    /// ([`Substrate::face_of`]) — or `None` when `turn` is held as it is.
+    /// Default `None`: a resolver with no units has no faces.
+    fn face_of(&self, _turn: TurnKey) -> Option<TurnKey> {
+        None
+    }
+
+    /// The unit opening a face's `turn` stands for ([`Substrate::unit_of`]) —
+    /// what a projection's record names in its place. Default `None`.
+    fn unit_of(&self, _turn: TurnKey) -> Option<TurnKey> {
+        None
     }
 
     /// Whether an ingest target draws on `group` across conversations — a
@@ -7805,6 +7819,14 @@ impl ContentResolver for Substrate {
         Some(layer)
     }
 
+    fn face_of(&self, turn: TurnKey) -> Option<TurnKey> {
+        Substrate::face_of(self, turn)
+    }
+
+    fn unit_of(&self, turn: TurnKey) -> Option<TurnKey> {
+        Substrate::unit_of(self, turn)
+    }
+
     fn section_token_count(&self, section: SectionId) -> usize {
         self.sections.get(&section).map_or(0, |e| e.token_count)
     }
@@ -7951,6 +7973,14 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         Some(layer)
     }
 
+    fn face_of(&self, turn: TurnKey) -> Option<TurnKey> {
+        self.substrate.face_of(turn)
+    }
+
+    fn unit_of(&self, turn: TurnKey) -> Option<TurnKey> {
+        self.substrate.unit_of(turn)
+    }
+
     fn section_token_count(&self, section: SectionId) -> usize {
         self.substrate
             .sections
@@ -8078,6 +8108,14 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
     fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
         let (layer, _) = self.guard.timeline_target(turn.timeline)?;
         Some(layer)
+    }
+
+    fn face_of(&self, turn: TurnKey) -> Option<TurnKey> {
+        self.guard.face_of(turn)
+    }
+
+    fn unit_of(&self, turn: TurnKey) -> Option<TurnKey> {
+        self.guard.unit_of(turn)
     }
 
     fn section_token_count(&self, section: SectionId) -> usize {

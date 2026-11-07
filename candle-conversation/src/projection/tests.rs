@@ -63,6 +63,8 @@ struct MockResolver {
     /// (group_raw, turn_raw) → the gather-scope tags the turn was written with,
     /// backing `turn_carries`. A turn absent here carries none.
     turn_tags: HashMap<(u32, u32), Vec<String>>,
+    /// (group_raw, turn_raw) → the face a dialogue holds that turn by.
+    faces: HashMap<(u32, u32), TurnKey>,
 }
 
 impl MockResolver {
@@ -131,6 +133,12 @@ impl MockResolver {
         self
     }
 
+    /// Give `idx` in `group` a face: the turn a dialogue holds it by.
+    fn with_face(mut self, group: GroupId, idx: TurnIndex, face: TurnKey) -> Self {
+        self.faces.insert((group.raw(), idx.0), face);
+        self
+    }
+
     fn with_section_score(mut self, section: SectionId, score: f32) -> Self {
         self.section_scores.insert(section.raw(), score);
         self
@@ -181,6 +189,10 @@ impl MockResolver {
 impl ContentResolver for MockResolver {
     fn target_is_ingest_self(&self) -> bool {
         self.ingest_self
+    }
+
+    fn face_of(&self, turn: TurnKey) -> Option<TurnKey> {
+        self.faces.get(&(Self::group_of(turn), turn.index.0)).copied()
     }
 
     fn compounds_on(&self, group: GroupId) -> bool {
@@ -1046,6 +1058,57 @@ layers:
         !groups.contains(&g2),
         "sibling group_a2 must not be visible"
     );
+}
+
+// —— Faces ————————————————————————————————————————————————————————————————————
+
+/// A dialogue over a ground layer whose `facts` turn 0 has a face, and the
+/// face's key.
+fn faced_facts(ingest_self: bool) -> (Builder, ProjectionTarget, MockResolver, TurnKey) {
+    let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let facts = b.id_for_group("facts").unwrap();
+    let target = ProjectionTarget {
+        layer: b.id_for_layer("dialogue").unwrap(),
+        group: b.id_for_group("conversation").unwrap(),
+        timeline: TimelineId::for_test(1),
+    };
+    let face = TurnKey::new(TimelineId::for_test(99), TurnIndex(0));
+    let mut resolver = MockResolver::new();
+    let opening = resolver.append(facts);
+    resolver.append(facts);
+    let resolver = resolver.with_face(facts, opening, face);
+    // An ingest target reads a layer below it only when it compounds on it.
+    let resolver = match ingest_self {
+        true => resolver.as_ingest_self().compounding_on(facts),
+        false => resolver,
+    };
+    (b, target, resolver, face)
+}
+
+/// **A dialogue holds a unit's opening by its face**: the face's turn is
+/// emitted where the opening was selected, and the unit's other turns as they
+/// are.
+#[test]
+fn a_dialogue_holds_a_units_opening_by_its_face() {
+    let (b, target, resolver, face) = faced_facts(false);
+    let facts = MockResolver::timeline_of(b.id_for_group("facts").unwrap());
+    let proj = b.project(target, &resolver);
+    let placed: Vec<Option<TurnKey>> = proj.sealed_turns().map(|t| t.key()).collect();
+    assert!(placed.contains(&Some(face)), "{placed:?}");
+    assert!(!placed.contains(&Some(TurnKey::new(facts, TurnIndex(0)))), "{placed:?}");
+    assert!(placed.contains(&Some(TurnKey::new(facts, TurnIndex(1)))), "{placed:?}");
+}
+
+/// **A unit being read projects its own opening** — the request it is
+/// answering — never its face.
+#[test]
+fn an_ingest_projection_holds_its_own_opening() {
+    let (b, target, resolver, face) = faced_facts(true);
+    let facts = MockResolver::timeline_of(b.id_for_group("facts").unwrap());
+    let proj = b.project(target, &resolver);
+    let placed: Vec<Option<TurnKey>> = proj.sealed_turns().map(|t| t.key()).collect();
+    assert!(!placed.contains(&Some(face)), "{placed:?}");
+    assert!(placed.contains(&Some(TurnKey::new(facts, TurnIndex(0)))), "{placed:?}");
 }
 
 // —— Score threshold ———————————————————————————————————————————————————————————

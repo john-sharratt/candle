@@ -2219,9 +2219,18 @@ pub fn run_with_sink<R: ContentResolver>(
         blocks = rest;
     }
 
+    // A dialogue holds an ingest unit's opening by its face — the unit's opening
+    // calls under a user turn naming only the reading — never by the request
+    // that commissioned it, which reads as the user's own
+    // (`Substrate::face_of`). A unit being read projects its own opening.
+    let faces = !resolver.target_is_ingest_self();
     let mut turns: Vec<ResolvedTurn> = vec![];
     for (gs, layer_id_for_walk, group_turns) in blocks {
-        for key in group_turns {
+        for selected in group_turns {
+            let key = match faces {
+                true => resolver.face_of(selected).unwrap_or(selected),
+                false => selected,
+            };
             // Ghost summary turns (`record_summary_turn` →
             // `append_with_blocks(0..0)`) are zero-token tree-meta anchors
             // with no K/V in any tier. They must never become a
@@ -2236,8 +2245,11 @@ pub fn run_with_sink<R: ContentResolver>(
             }
             // Prefer the producer's `layer_id` from the resolver
             // record; fall back to projector context if the
-            // resolver doesn't track origins (e.g. test mocks).
-            let origin_layer = resolver.turn_origin(key).unwrap_or(layer_id_for_walk);
+            // resolver doesn't track origins (e.g. test mocks). A face
+            // reports the layer of the unit it stands for.
+            let origin_layer = resolver
+                .turn_origin(selected)
+                .unwrap_or(layer_id_for_walk);
             turns.push(ResolvedTurn {
                 id: TurnId {
                     layer_id: origin_layer,

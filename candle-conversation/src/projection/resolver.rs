@@ -3990,17 +3990,24 @@ impl Conversation {
     ///
     /// Sections the timeline owns ([`Self::release_owned_sections`]) go with it.
     pub fn tombstone_timeline(&self, timeline: TimelineId) -> candle::Result<()> {
+        // A unit's face stands only for it, so it goes with it.
+        let face = self
+            .read()
+            .face_timeline(timeline)
+            .filter(|&face| face != timeline);
         self.release_owned_sections(timeline)?;
         self.update(|s| s.tombstone_timeline(timeline));
-        if self.read_only {
-            return Ok(());
+        if !self.read_only {
+            // The append runs on the log's owner; this returns without waiting.
+            self.persistence.enqueue(WriteJob::TimelineTombstone {
+                timeline_id: timeline.raw(),
+                reason: None,
+            });
         }
-        // The append runs on the log's owner; this returns without waiting.
-        self.persistence.enqueue(WriteJob::TimelineTombstone {
-            timeline_id: timeline.raw(),
-            reason: None,
-        });
-        Ok(())
+        match face {
+            Some(face) if !self.read().is_tombstoned(face) => self.tombstone_timeline(face),
+            _ => Ok(()),
+        }
     }
 
     /// Tombstone a section stream — the section counterpart of
@@ -5584,6 +5591,14 @@ impl<'a> ContentResolver for TargetedRead<'a> {
     fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
         let (layer, _) = self.read.timeline_target(turn.timeline)?;
         Some(layer)
+    }
+
+    fn face_of(&self, turn: TurnKey) -> Option<TurnKey> {
+        self.read.face_of(turn)
+    }
+
+    fn unit_of(&self, turn: TurnKey) -> Option<TurnKey> {
+        self.read.unit_of(turn)
     }
 
     fn target_is_ingest_self(&self) -> bool {

@@ -66,6 +66,8 @@ const CALIBRATE_PREFIX: &[u8] = b"calibrate/";
 
 const WORKER_PREFIX: &[u8] = b"worker/";
 
+const FACE_PREFIX: &[u8] = b"face/";
+
 /// The lease key for a content key.
 pub fn lease_key(content_key: &str) -> Vec<u8> {
     prefixed(PREFIX, content_key)
@@ -81,6 +83,11 @@ pub fn worker_key(conv_id: &str) -> Vec<u8> {
     prefixed(WORKER_PREFIX, conv_id)
 }
 
+/// The lease key for a unit's face, by the unit's content key.
+pub fn face_key(content_key: &str) -> Vec<u8> {
+    prefixed(FACE_PREFIX, content_key)
+}
+
 fn prefixed(prefix: &[u8], name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(prefix.len() + name.len());
     key.extend_from_slice(prefix);
@@ -88,10 +95,10 @@ fn prefixed(prefix: &[u8], name: &str) -> Vec<u8> {
     key
 }
 
-/// Whether `key` is one of this module's: a reading's, a calibration's or a
-/// worker's.
+/// Whether `key` is one of this module's: a reading's, a calibration's, a
+/// worker's or a face's.
 fn is_unit_lease(key: &[u8]) -> bool {
-    [PREFIX, CALIBRATE_PREFIX, WORKER_PREFIX]
+    [PREFIX, CALIBRATE_PREFIX, WORKER_PREFIX, FACE_PREFIX]
         .iter()
         .any(|prefix| key.starts_with(prefix))
 }
@@ -185,6 +192,14 @@ pub fn share(content_key: &str) -> Share {
 /// for a calibration carrying the marker before it asks for one.
 pub fn share_calibration(marker: &str) -> Share {
     share_key(calibration_key(marker))
+}
+
+/// Lease the face of the unit `content_key` names. [`Share::Mine`] when this
+/// member should seal it; on a [`Guard::recheck`] the caller looks again for a
+/// face before it seals one. Every member's pass finds the same faceless units
+/// from the same replicated substrate, as with calibration.
+pub fn share_face(content_key: &str) -> Share {
+    share_key(face_key(content_key))
 }
 
 /// Lease the turns of the worker conversation `conv_id`. [`Share::Mine`] when
