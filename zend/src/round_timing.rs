@@ -195,4 +195,51 @@ mod tests {
             }
         );
     }
+    /// **A value missing any one of its three words — or any sub-field within
+    /// a word — parses to `None`.**
+    #[test]
+    fn a_value_missing_any_field_is_none() {
+        let r = RoundTiming::of(10_000, 512, 1_400, 210, 6_100);
+        let full = r.value();
+        assert_eq!(RoundTiming::parse(&full), Some(r));
+
+        // Missing one whole word.
+        assert_eq!(
+            RoundTiming::parse("prefill=512/1400ms decode=210/6100ms"),
+            None,
+        );
+        assert_eq!(RoundTiming::parse("queued=2500 decode=210/6100ms"), None,);
+        assert_eq!(RoundTiming::parse("queued=2500 prefill=512/1400ms"), None,);
+
+        // Missing a sub-field inside a word: empty value, missing '/',
+        // missing 'ms' suffix.
+        assert_eq!(
+            RoundTiming::parse("queued= prefill=512/1400ms decode=210/6100ms"),
+            None,
+        );
+        assert_eq!(
+            RoundTiming::parse("queued=2500 prefill=/1400ms decode=210/6100ms"),
+            None,
+        );
+        assert_eq!(
+            RoundTiming::parse("queued=2500 prefill=512ms decode=210/6100ms"),
+            None,
+        );
+        assert_eq!(
+            RoundTiming::parse("queued=2500 prefill=512/ decode=210/6100ms"),
+            None,
+        );
+        assert_eq!(
+            RoundTiming::parse("queued=2500 prefill=512/1400ms decode=/6100ms"),
+            None,
+        );
+        assert_eq!(
+            RoundTiming::parse("queued=2500 prefill=512/1400ms decode=210ms"),
+            None,
+        );
+        assert_eq!(
+            RoundTiming::parse("queued=2500 prefill=512/1400ms decode=210/"),
+            None,
+        );
+    }
 }
