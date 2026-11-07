@@ -5299,11 +5299,15 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     // largest index; sizing off it keeps the array in step as record types are
     // added without re-counting by hand.
     let mut counts = [0usize; RecordType::Unknown as usize];
+    // Each type's bytes beside its count: a segment's size is a few large
+    // types (Chunk, Snapshot), and a count alone cannot say which.
+    let mut type_bytes = [0u64; RecordType::Unknown as usize];
     let mut payload_bytes = 0u64;
     let mut record_bytes = 0u64;
     let mut acc = RecordAccounting::new();
     for e in &entries {
         counts[type_index(e.record.header.record_type)] += 1;
+        type_bytes[type_index(e.record.header.record_type)] += e.size;
         payload_bytes += e.record.header.payload_len;
         record_bytes += e.size;
         acc.record(&e.record.header, &e.record.payload, e.size);
@@ -5337,7 +5341,11 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     for rt in ALL_TYPES {
         let n = counts[type_index(rt)];
         if n > 0 {
-            println!("  {:<12} {n}", format!("{rt:?}"));
+            println!(
+                "  {:<16} {n:>8}  {:>10.1} MiB",
+                format!("{rt:?}"),
+                type_bytes[type_index(rt)] as f64 / 1_048_576.0
+            );
         }
     }
     println!();
@@ -6139,7 +6147,9 @@ fn recover_view(log: &mut LogFile) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const ALL_TYPES: [RecordType; 19] = [
+/// Every record type, in discriminant order. A type missing here is counted but
+/// never printed, so a segment's histogram then sums to less than the segment.
+const ALL_TYPES: [RecordType; 30] = [
     RecordType::ModelKey,
     RecordType::Template,
     RecordType::StreamDecl,
@@ -6158,6 +6168,17 @@ const ALL_TYPES: [RecordType; 19] = [
     RecordType::HeaderIndex,
     RecordType::TurnCoupling,
     RecordType::Snapshot,
+    RecordType::BranchCheckpoint,
+    RecordType::Npc,
+    RecordType::TurnIndexPage,
+    RecordType::SectionTombstone,
+    RecordType::VfsEvent,
+    RecordType::VfsTombstone,
+    RecordType::CustomObject,
+    RecordType::Replica,
+    RecordType::Blob,
+    RecordType::Rebase,
+    RecordType::Deleted,
     RecordType::Unknown,
 ];
 
