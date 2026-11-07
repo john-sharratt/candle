@@ -65,4 +65,14 @@ mod tests {
         );
         assert!(steps_in("").is_empty());
     }
+
+    /// **A blank line is no step** — `steps_in` skips empty lines, so a value
+    /// with a blank line between two steps reads back as two steps, not three.
+    #[test]
+    fn a_blank_line_is_no_step() {
+        assert_eq!(
+            steps_in("Build it.\n\nTest it.\n"),
+            ["Build it.", "Test it."]
+        );
+    }
 }
