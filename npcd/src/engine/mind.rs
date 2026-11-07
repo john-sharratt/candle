@@ -2048,6 +2048,23 @@ impl Minds {
         }
     }
 
+    /// Let a character's conversation go without retiring it, because the
+    /// character now thinks on another member.
+    ///
+    /// Its slot and resident K/V are freed here; the conversation stays live in
+    /// the log, and whichever member runs the character next rejoins it from
+    /// there. Kept instead, the conversation stood on this member's slot as it
+    /// was when the character left, while the member it went to wrote its next
+    /// turns — and when the character came back, its first turn continued that
+    /// stale slot against a record turns ahead of it, and failed every turn
+    /// after (`slot 1 parked at turn 1025 but its record holds turn 1038`).
+    ///
+    /// A turn in flight keeps its own handle and finishes; only the next turn
+    /// is affected, and it is the next holder's.
+    pub fn let_go(&self, npc_id: u64) -> bool {
+        self.release(npc_id).is_some()
+    }
+
     /// Retire a character's conversation, because the character is gone.
     ///
     /// **On delete only, and deliberately not on shutdown.** A tombstone is the
