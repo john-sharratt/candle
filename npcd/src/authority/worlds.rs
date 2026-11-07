@@ -570,7 +570,10 @@ mod tests {
         assert!(!w.begin_turn(1), "still held while the move is unsettled");
         let soon = t0 + HAND_BACK_RETRY - Duration::from_millis(1);
         assert!(!w.hand_back_due(1, soon), "not sent again before its retry");
-        assert!(w.hand_back_due(1, t0 + HAND_BACK_RETRY), "and sent again then");
+        assert!(
+            w.hand_back_due(1, t0 + HAND_BACK_RETRY),
+            "and sent again then"
+        );
         assert!(!w.hand_back_due(1, t0 + HAND_BACK_RETRY), "once more");
         w.end_handing(1);
         assert!(w.begin_turn(1), "the hold ended, it goes on");
