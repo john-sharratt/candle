@@ -117,6 +117,7 @@ pub mod tick;
 pub mod tools;
 pub mod watch;
 pub mod watcher;
+pub mod way;
 pub mod whereabouts;
 pub mod window;
 pub mod witnessed;

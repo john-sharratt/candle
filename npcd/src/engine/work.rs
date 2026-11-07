@@ -46,6 +46,7 @@ use crate::engine::mission_gen::world::Routine;
 use crate::engine::mission_gen::{gates, leakage, rejection, round, write_template};
 use crate::engine::order_table;
 use crate::engine::passage;
+use crate::engine::way::{self, Way};
 use crate::engine::workflow::OnFailed;
 use crate::engine::workflow::PUBLISHED;
 use crate::opstore::owner::Owner;
@@ -936,6 +937,19 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
         let room_of = |at: &Where| w.node(at).map(|n| n.name.clone());
         let level_of = |at: &Where| w.map().get(&at.area).map(|a| a.name.clone());
         let place = |at: &Where| format!("{}/{}", at.area, at.node);
+        // The lift ride to a room on another level, from the level it is
+        // ridden to by ([`way::way`]) — through a door first when the body
+        // stands off the shaft.
+        let ride = |level: &str, first: Option<&str>| match first {
+            None => format!(
+                "`move_to` the lift, `lift_use` naming {level} — it calls the car and waits for \
+                 it —"
+            ),
+            Some(door) => format!(
+                "`move_to` {door}, then `move_to` the lift, `lift_use` naming {level} — it calls \
+                 the car and waits for it —"
+            ),
+        };
         // **A document is read and written at a desk, and the desks can be
         // reached.** Makers gave drafts up as stuck "between the lift and the
         // command room", the chronicle level "not accessible" — one from the
@@ -962,13 +976,14 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
                     "You are at a desk, in {room}: {write}, then `bench_commit` it."
                 ));
             }
-            return Some(match desk.area == here.area {
-                true => format!("A desk is within reach in {room}: `move_to` it, and work there."),
-                false => format!(
-                    "The desks are on {level}, and the lift goes there: `move_to` the lift, \
-                     `lift_use` naming {level} — it calls the car and waits for it — then \
-                     `move_to` {room}.",
-                    level = level_of(desk)?
+            return Some(match way::way(w, &here, desk)? {
+                Way::Walk => {
+                    format!("A desk is within reach in {room}: `move_to` it, and work there.")
+                }
+                Way::Ride { level, first } => format!(
+                    "The desks are on {on}, and the lift goes there: {} then `move_to` {room}.",
+                    ride(&level, first.as_deref()),
+                    on = level_of(desk)?
                 ),
             });
         }
@@ -983,13 +998,12 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
             if attends {
                 return Some(format!("{room} is within reach: `focus` on it."));
             }
-            return Some(match at.area == here.area {
-                true => format!("{room} is within reach: `move_to` it."),
-                false => format!(
-                    "{room} is on {}: `move_to` the lift, `lift_use` naming {}, then `move_to` \
-                     {room}.",
+            return Some(match way::way(w, &here, at)? {
+                Way::Walk => format!("{room} is within reach: `move_to` it."),
+                Way::Ride { level, first } => format!(
+                    "{room} is on {}: {} then `move_to` {room}.",
                     level_of(at)?,
-                    level_of(at)?
+                    ride(&level, first.as_deref())
                 ),
             });
         }

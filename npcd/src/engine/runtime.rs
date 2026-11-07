@@ -119,6 +119,7 @@ use crate::engine::schema;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
 use crate::engine::watcher::{is_ingestible, Ledger, Reconcile};
+use crate::engine::way::{self, Way};
 use crate::engine::witnessed;
 use crate::engine::work;
 use crate::mind::files::MindFiles;
@@ -1640,17 +1641,25 @@ impl Runtime {
             // decided the lift was locked and spent a night asking the Drones
             // to override it.
             let attends = s.attends(&body);
-            // The way to a place, in the grammar's verbs: a walk on this level,
-            // the lift to any other — `move_to` does not cross floors.
+            // The way to a place, in the grammar's verbs: a walk on this level
+            // or through a door from it, the lift to any other — `move_to` does
+            // not cross floors ([`way::way`]).
             let way_to = |to: &Where| -> Option<String> {
                 let room = w.node(to)?.name.clone();
                 if attends {
                     return Some(format!("{room}: `focus` on it"));
                 }
-                if to.area == here.area {
-                    return Some(format!("{room}: `move_to` it"));
+                let (level, first) = match way::way(w, &here, to)? {
+                    Way::Walk => return Some(format!("{room}: `move_to` it")),
+                    Way::Ride { level, first } => (level, first),
+                };
+                let on = w.map().get(&to.area)?.name.clone();
+                if let Some(door) = first {
+                    return Some(format!(
+                        "{room}, on {on}: `move_to` {door}, then `move_to` the lift, `lift_use` \
+                         naming {level}, then `move_to` {room}"
+                    ));
                 }
-                let level = w.map().get(&to.area)?.name.clone();
                 // At the lift already, the way is the ride itself — said from
                 // where the body stands, so it is news there and is told again.
                 // Told only "go to the lift" back in the room, a character reached
@@ -1658,11 +1667,11 @@ impl Runtime {
                 let at_lift = w.node(&here).is_some_and(|n| n.kind == NodeKind::Core);
                 Some(match at_lift {
                     true => format!(
-                        "{room}, on {level}. You are at the lift: `lift_use` naming {level} — it \
+                        "{room}, on {on}. You are at the lift: `lift_use` naming {level} — it \
                          calls the car and waits for it if it is not here — then `move_to` {room}"
                     ),
                     false => format!(
-                        "{room}, on {level}: `move_to` the lift, `lift_use` naming {level}, then \
+                        "{room}, on {on}: `move_to` the lift, `lift_use` naming {level}, then \
                          `move_to` {room}"
                     ),
                 })
