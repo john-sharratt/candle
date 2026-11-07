@@ -4,6 +4,7 @@
 //! before the next link's reading starts.
 
 use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use candle_conversation::projection::TimelineId;
@@ -48,11 +49,15 @@ pub(crate) fn ingest_link(
         band: Some(PRIMING_BAND),
         ..ctx.clone()
     };
+    // A link left to the member holding its lease has no holder here yet, so
+    // the chain continues from the link before it, as for a failed read.
+    let left = AtomicBool::new(false);
     let job = Job {
         file,
         key: &key,
         live,
         binary,
+        left: &left,
     };
     let failures = Failures::new();
     priming_watch::stage("reading the file");
