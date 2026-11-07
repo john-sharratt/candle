@@ -185,4 +185,41 @@ mod tests {
         assert!(!chains.holds(&a), "the older chain went");
         assert!(chains.holds(&b));
     }
+    /// **A chain named again outlives one not named**: touching a chain on
+    /// resolve makes it the most recently used, so the next eviction takes the
+    /// one that was never named again.
+    #[test]
+    fn a_chain_named_again_outlives_one_not_named() {
+        let store = VfsStore::new();
+        store.write("a.txt", "one\n".into()).unwrap();
+        store.write("b.txt", "two\n".into()).unwrap();
+        store.write("c.txt", "x\n".into()).unwrap();
+        let snapshot = store.snapshot();
+        let full = Overlay::of(&snapshot);
+        let (a, b, c) = (
+            full.chains["a.txt"].clone(),
+            full.chains["b.txt"].clone(),
+            full.chains["c.txt"].clone(),
+        );
+        let size_a = serde_json::to_vec(&full.carried[&a]).unwrap().len();
+        let size_b = serde_json::to_vec(&full.carried[&b]).unwrap().len();
+        let mut chains = Chains::new(size_a + size_b);
+        let only = |name: &str| Overlay {
+            chains: BTreeMap::from([("x".to_string(), name.to_string())]),
+            ..full.carrying(&[name.to_string()])
+        };
+        chains.resolve(&only(&a)).unwrap();
+        chains.resolve(&only(&b)).unwrap();
+        // Name A alone — no carried — so A is touched but not re-held.
+        let named_a = Overlay {
+            chains: BTreeMap::from([("x".to_string(), a.clone())]),
+            ..Default::default()
+        };
+        chains.resolve(&named_a).unwrap();
+        // Hold C; the cap fits two chains, so B (the LRU) goes.
+        chains.resolve(&only(&c)).unwrap();
+        assert!(chains.holds(&a), "A was named again and should stay");
+        assert!(!chains.holds(&b), "B was never named again and should go");
+        assert!(chains.holds(&c), "C was just held");
+    }
 }
