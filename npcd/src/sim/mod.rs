@@ -794,9 +794,12 @@ impl Sim {
     }
 
     /// Take `other` in as this world's state, keeping what is this machine's
-    /// own rather than the world's: where its benches' documents live, and the
-    /// workflows the mind's operations run on. What a world's authority writes
-    /// is the world; those two are read here, from this machine's mind.
+    /// own rather than the world's: where its benches' documents live, the
+    /// workflows the mind's operations run on, and what its seed read from the
+    /// map — the acts each room's parts offer, and where a recall lands. What a
+    /// world's authority writes is the world; those are read here, from this
+    /// machine's mind and map, and a record written before the map changed
+    /// would otherwise carry its old reading to every member for good.
     ///
     /// The record is taken as `other` holds it, not re-indexed from this
     /// machine's documents: what the world has been told is what it knows.
@@ -806,6 +809,8 @@ impl Sim {
         }
         other.missions.adopt_workflows(&mut self.missions);
         other.built.carry_laid(&self.built);
+        other.part_tools = std::mem::take(&mut self.part_tools);
+        other.home = self.home.take();
         *self = other;
     }
 
@@ -836,6 +841,22 @@ mod tests {
         s.pack_mut("c2")
             .add(Item::new("bolt", "bolt rounds", Kind::Ammunition, 30));
         s
+    }
+
+    /// **A world taken in from its records keeps what this machine's seed read
+    /// from the map.** A record written before the map offered an act there
+    /// would otherwise take the act away on every member that follows it.
+    #[test]
+    fn taking_a_world_in_keeps_what_the_map_offers_here() {
+        let mut s = Sim::new();
+        s.set_part_tools("moon-command/watch-room", vec!["collect_mission".to_string()]);
+        s.set_home("moon-command/watch-room".to_string());
+        let mut written = Sim::new();
+        written.table_open = false;
+        s.take_in(written);
+        assert!(s.part_offers("moon-command/watch-room", "collect_mission"));
+        assert_eq!(s.homes(), ["moon-command/watch-room"]);
+        assert!(!s.table_open, "the world's own state is the record's");
     }
 
     /// **What a Maker may present is its own filed work, by name** — not
