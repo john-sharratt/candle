@@ -2118,6 +2118,9 @@ fn bench(
                     .active(body)
                     .and_then(|m| m.work.as_ref())
                     .map(|w| w.writes.clone());
+                // Changes to where no bench may reach can never land; they
+                // are dropped, and said, rather than refusing every commit.
+                let dropped = s.bench.drop_unreachable(body);
                 let written = match s.bench.opened(body).is_some() {
                     true => {
                         let committed = match &only {
@@ -2153,6 +2156,13 @@ fn bench(
                             left.join(", ")
                         ),
                     };
+                    let line = match dropped.is_empty() {
+                        true => line,
+                        false => format!(
+                            "{line} Left out and thrown away, because no bench works there: {}.",
+                            dropped.join(", ")
+                        ),
+                    };
                     match &progress {
                         Some(p) => format!("{line}\n{p}"),
                         None => line,
@@ -2161,6 +2171,10 @@ fn bench(
                 let held = s.record.held_by(body);
                 let Some(target) = held.first().cloned() else {
                     return match written.is_empty() {
+                        true if !dropped.is_empty() => Outcome::Did(format!(
+                            "Nothing was committed. Thrown away, because no bench works there: {}.",
+                            dropped.join(", ")
+                        )),
                         true => Outcome::Refused("You have nothing open to merge.".into()),
                         false => Outcome::Did(with_progress(format!(
                             "{} is part of what stands: {why_line}",

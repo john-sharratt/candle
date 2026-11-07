@@ -168,6 +168,27 @@ fn a_commit_of_one_document_leaves_the_rest_open() {
     assert!(b.opened("m1").is_none());
 }
 
+/// **A change no bench may reach any longer is dropped, and named**, so it
+/// cannot hold every commit after it up; the rest of the set is untouched.
+#[test]
+fn a_change_out_of_reach_is_dropped_and_named() {
+    let (mut b, _, s) = rooted("unreachable");
+    b.write("m1", "x", "layers/eras/fifth.md", "the fifth era\n", &s)
+        .unwrap();
+    // Written when worlds/ was still in reach.
+    b.open.get_mut("m1").unwrap().files.insert(
+        "worlds/moon.yaml".into(),
+        Change {
+            base: None,
+            now: Some("journals: {}\n".into()),
+        },
+    );
+    assert_eq!(b.drop_unreachable("m1"), ["worlds/moon.yaml"]);
+    assert_eq!(b.diff("m1"), ["layers/eras/fifth.md (new)"]);
+    assert!(b.drop_unreachable("m1").is_empty());
+    assert_eq!(b.commit("m1", &s).unwrap(), ["layers/eras/fifth.md"]);
+}
+
 /// **A world's own file is not worked at a bench**: it is configuration the
 /// loader reads, as the world's missions file is.
 #[test]

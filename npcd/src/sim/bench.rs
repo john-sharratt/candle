@@ -632,6 +632,29 @@ impl Benches {
         self.commit_where(body, shelf, |_| true)
     }
 
+    /// Take out of this body's working set every change to a path no bench may
+    /// reach any longer, and say which — they could never be committed, and
+    /// kept, every commit after would be refused over them.
+    pub fn drop_unreachable(&mut self, body: &str) -> Vec<String> {
+        // With no mind to judge reach against, nothing is out of reach.
+        if self.root().is_err() {
+            return Vec::new();
+        }
+        let gone: Vec<String> = match self.open.get(body) {
+            Some(w) => w
+                .changed()
+                .into_iter()
+                .filter(|p| self.doc(p).is_err())
+                .cloned()
+                .collect(),
+            None => return Vec::new(),
+        };
+        if let Some(w) = self.open.get_mut(body) {
+            w.files.retain(|p, _| !gone.contains(p));
+        }
+        gone
+    }
+
     /// Record only `raw` of what this body has changed, and leave the rest of
     /// its working set open — for a mission whose step writes one document,
     /// whose commit carries that document and nothing else.
