@@ -210,10 +210,15 @@ impl Runtime {
         });
     }
 
-    /// Stop running a character here: its lease names another member.
+    /// Stop running a character here: its lease names another member. Its
+    /// conversation is let go with it, so the turns the next holder writes are
+    /// what this member rejoins if the character comes back — see `Minds::let_go`.
     pub(crate) fn put_down(&self, npc: u64) {
         self.scheduler.retire(npc);
         self.stop_character(npc);
+        if let Some(minds) = self.minds.read().unwrap().clone() {
+            minds.let_go(npc);
+        }
         tracing::info!(npc, "character lent elsewhere: no longer running it here");
     }
 
