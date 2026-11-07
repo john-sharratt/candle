@@ -851,15 +851,22 @@ mod tests {
     #[test]
     fn taking_a_world_in_keeps_what_the_map_offers_here() {
         let mut s = Sim::new();
-        s.set_part_tools("moon-command/watch-room", vec!["collect_mission".to_string()]);
+        s.set_part_tools(
+            "moon-command/watch-room",
+            vec!["collect_mission".to_string()],
+        );
         s.set_home("moon-command/watch-room".to_string());
         s.postings.stand_up("moon-command/watch-room", "the table");
-        s.postings.stand_up("moon-ward/ward-room", "the status board");
+        s.postings
+            .stand_up("moon-ward/ward-room", "the status board");
         let mut written = Sim::new();
         written.table_open = false;
-        written
-            .postings
-            .post("moon-ward/ward-room", "the status board", "Zen", "all clear");
+        written.postings.post(
+            "moon-ward/ward-room",
+            "the status board",
+            "Zen",
+            "all clear",
+        );
         s.take_in(written);
         assert!(s.part_offers("moon-command/watch-room", "collect_mission"));
         assert_eq!(s.homes(), ["moon-command/watch-room"]);
