@@ -162,12 +162,16 @@ impl Runtime {
                             self.standing.arriving(npc, now);
                         }
                     }
-                    (true, true) => {
-                        if moving && !self.standing.turning(npc) && self.standing.begin_handing(npc)
-                        {
+                    // Asked to move: held from its next turn and handed back
+                    // once the turn in progress is over — see
+                    // `Standing::hand_back_due`. No longer asked, it is let go
+                    // on.
+                    (true, true) if moving => {
+                        if self.standing.hand_back_due(npc) {
                             self.hand_back(&world, npc);
                         }
                     }
+                    (true, true) if handing => self.standing.end_handing(npc),
                     (false, true) if !handing => self.put_down(npc),
                     (false, _) if handing => self.standing.end_handing(npc),
                     _ => {}

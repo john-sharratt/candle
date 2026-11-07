@@ -51,6 +51,9 @@ pub struct Standing {
     handing: Mutex<HashSet<u64>>,
     /// Characters part-way through a turn: a hand-back waits for its end.
     turning: Mutex<HashSet<u64>>,
+    /// Characters held for a hand-back whose hand-back has been sent, so it is
+    /// sent once.
+    returning: Mutex<HashSet<u64>>,
     /// Characters lent here that wait for their last holder's writes before
     /// they wake, since when (`docs/cooperative_admission.md` §4.6).
     arriving: Mutex<HashMap<u64, Instant>>,
@@ -89,6 +92,7 @@ impl Standing {
             held: Mutex::new(BTreeSet::new()),
             handing: Mutex::new(HashSet::new()),
             turning: Mutex::new(HashSet::new()),
+            returning: Mutex::new(HashSet::new()),
             arriving: Mutex::new(HashMap::new()),
             sending: Mutex::new(HashSet::new()),
             legacy: Mutex::new((BTreeSet::new(), BTreeSet::new())),
@@ -291,6 +295,19 @@ impl Standing {
 
     pub fn end_handing(&self, npc: u64) {
         self.handing.lock().unwrap().remove(&npc);
+        self.returning.lock().unwrap().remove(&npc);
+    }
+
+    /// Hold `npc`, running here and asked to move, for its hand-back; `true`
+    /// when it is to be handed back now.
+    ///
+    /// Held at once, so it begins no further turn, and handed back once the
+    /// turn in progress is over — once. Holding it first is what lets a
+    /// character whose inbox never empties be found between turns at all: it
+    /// would otherwise begin its next turn the moment one ended.
+    pub fn hand_back_due(&self, npc: u64) -> bool {
+        self.handing.lock().unwrap().insert(npc);
+        !self.turning(npc) && self.returning.lock().unwrap().insert(npc)
     }
 
     pub fn handing(&self, npc: u64) -> bool {
@@ -481,5 +498,23 @@ mod tests {
         assert!(!w.begin_turn(1));
         w.end_handing(1);
         assert!(w.begin_turn(1));
+    }
+
+    /// **A character asked to move mid-turn is held, and handed back when the
+    /// turn ends, once.** Held at once, it begins no further turn; a failed
+    /// hand-back lets it go on and try again.
+    #[test]
+    fn a_character_asked_to_move_mid_turn_is_held_then_handed_back_once() {
+        let w = Standing::new(true);
+        assert!(w.begin_turn(1));
+        assert!(!w.hand_back_due(1), "not while its turn is in progress");
+        w.end_turn(1);
+        assert!(!w.begin_turn(1), "held: it begins no further turn");
+        assert!(w.hand_back_due(1), "its turn over, it is handed back");
+        assert!(!w.hand_back_due(1), "once");
+        w.end_handing(1);
+        assert!(w.begin_turn(1), "a hand-back not taken lets it go on");
+        w.end_turn(1);
+        assert!(w.hand_back_due(1), "and it is tried again");
     }
 }
