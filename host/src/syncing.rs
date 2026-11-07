@@ -13,14 +13,26 @@
 //! member with a new substrate takes every pack of a large repository before
 //! it serves, and on 2026-10-25 a fresh `.5` was rolled back ten minutes into
 //! pulling candle's history, answer by answer, with nothing wrong but its size.
+//!
+//! So is calibration's backlog. Every exemplar the store lacks is prefilled
+//! before the member serves, and that runs as long as the exemplars are new,
+//! not as the build: while an ingest backlog commits units faster than boots
+//! calibrate them, a boot found 1,011 to run at ~0.7 a second, and keep rolled
+//! back a sound build for it (BlackWorld, 2026-11-07). A calibration that keeps
+//! sealing exemplars is waited out like a catch-up that keeps receiving.
 
 use cluster::upgrade::switch::SYNCING;
 
 use crate::loading::LoadingView;
 
-/// The step ids whose progress is data received: the catch-up both tenants
-/// give, and a repository pull's packs.
-const SYNC_STEPS: [&str; 3] = ["catchup", "pulling_repositories", "repositories"];
+/// The step ids whose progress is a backlog worked through: the catch-up both
+/// tenants give, a repository pull's packs, and calibration's exemplars.
+const SYNC_STEPS: [&str; 4] = [
+    "catchup",
+    "pulling_repositories",
+    "repositories",
+    "calibrating_sections",
+];
 
 /// The syncing line to print for one tenant's newest load, or `None`.
 ///
@@ -111,6 +123,21 @@ mod tests {
             next_syncing_line(0, Some(&view("repositories", 4)), &mut last),
             None
         );
+    }
+
+    /// **Calibration that seals more exemplars prints a line**, and one that
+    /// stands still prints none, so a stalled calibration still times out.
+    #[test]
+    fn a_calibration_that_seals_more_exemplars_prints_a_line() {
+        let mut last = 0;
+        let line =
+            next_syncing_line(0, Some(&view("calibrating_sections", 3_355)), &mut last).unwrap();
+        assert_eq!(line, "INFO syncing tenant 0 3355/5000 records");
+        assert_eq!(
+            next_syncing_line(0, Some(&view("calibrating_sections", 3_355)), &mut last),
+            None
+        );
+        assert!(next_syncing_line(0, Some(&view("calibrating_sections", 3_356)), &mut last).is_some());
     }
 
     /// A count that falls — a catch-up round that started over — is the new

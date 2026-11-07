@@ -238,8 +238,9 @@ is running from, so the trial runs from `keep/stable/web.exe` or
 stays free for the next deploy. Its stderr goes to `keep/state/<name>.trial.log`,
 read until the line `INFO serving` or the 10 minute limit; those lines are logged. The
 limit restarts at every `INFO syncing …` line, which `motherd` prints each time a
-tenant's cluster catch-up receives more: a member that is behind is waited out while
-its sync keeps arriving, and rolled back 10 minutes after the sync stalls. A
+tenant's cluster catch-up receives more, a repository pull takes another pack, or
+calibration seals another exemplar: a member working through a backlog is waited out
+while it keeps progressing, and rolled back 10 minutes after it stalls. A
 file, not a pipe, so the process can go on writing to it after the proof, and after
 `keep` itself restarts, with nothing draining it. `web` prints the line once it is
 serving; `motherd` once every tenant has *proven* the build (`TenantStatus::proven`):

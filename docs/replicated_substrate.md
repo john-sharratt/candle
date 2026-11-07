@@ -839,7 +839,9 @@ build is certified (§3.8):
      (§7.6) prints `INFO syncing …` each time its catch-up count rises, and every
      such line restarts the 10 minutes. A catch-up is as long as the backlog, not
      the build, so one that keeps receiving is waited out; one that stalls prints
-     nothing and is rolled back 10 minutes after its last line.
+     nothing and is rolled back 10 minutes after its last line. Calibration's
+     exemplars are a backlog of the same kind and print the same line as each
+     one seals (`host/src/syncing.rs`).
    - **No line in that time, or the process dying,** kills the trial, puts the
      set-aside file back and starts it.
    - **The line** makes the trial the service: the set-aside file is deleted and
