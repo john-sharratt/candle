@@ -392,6 +392,16 @@ impl Ledger {
         }
     }
 
+    /// Take every open order off the board, held or not, and free its holder:
+    /// an operator's clear, for a board a cast has filled with work nobody
+    /// should do. Returns how many came down.
+    pub fn clear_open(&mut self) -> usize {
+        let open = self.orders.iter().filter(|o| !o.done).count();
+        self.orders.retain(|o| o.done);
+        self.orders_read.clear();
+        open
+    }
+
     /// The orders `setter` has put up that are still open, held or not.
     pub fn open_set_by(&self, setter: &str) -> Vec<&Order> {
         self.orders
@@ -711,6 +721,24 @@ mod tests {
         assert_eq!(l.give_back("c1").as_deref(), Some("mind the drill"));
         assert_eq!(l.unheld().len(), 1);
         assert!(l.give_back("c1").is_none(), "gave back what was not held");
+    }
+
+    /// **An operator's clear takes down every open order and frees its
+    /// holder**, and leaves finished ones as the record of what was done.
+    #[test]
+    fn clearing_the_board_takes_down_every_open_order() {
+        let mut l = Ledger::new();
+        l.set_order("mind the drill", "keeper", None);
+        l.set_order("hold the gate", "keeper", None);
+        l.set_order("sweep the hall", "keeper", None);
+        l.take_order("mind the drill", "c1").unwrap();
+        l.take_order("sweep the hall", "c2").unwrap();
+        assert!(l.finish("c2", "sweep the hall"));
+        assert_eq!(l.clear_open(), 2);
+        assert!(l.unheld().is_empty());
+        assert!(l.held_by("c1").is_empty());
+        assert_eq!(l.orders().len(), 1);
+        assert!(l.orders()[0].done);
     }
 
     #[test]

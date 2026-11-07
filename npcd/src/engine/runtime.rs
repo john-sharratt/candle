@@ -1247,7 +1247,7 @@ impl Runtime {
         // in with the rest of its state.
         if self.standing.writes(world_id) {
             hosted.with_sim(|s| {
-                s.missions.set_unordered(&body, unordered);
+                s.set_unordered(&body, unordered);
                 s.set_attends(&body, attends);
             });
         }
@@ -1944,7 +1944,7 @@ impl Runtime {
             if stands != (p.unordered, p.attends) {
                 hosted.with_sim(|s| {
                     if s.missions.is_unordered(&body) != p.unordered {
-                        s.missions.set_unordered(&body, p.unordered);
+                        s.set_unordered(&body, p.unordered);
                     }
                     s.set_attends(&body, p.attends);
                 });

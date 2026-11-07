@@ -618,12 +618,16 @@ pub struct DiscardQuery {
     /// Forget the settled targets too, so all of the corpus can be found again.
     #[serde(default)]
     ledger: bool,
+    /// Take every open order off the orders board as well, freeing whoever
+    /// held it.
+    #[serde(default)]
+    orders: bool,
 }
 
 /// `DELETE /v1/pulse/missions/pool` — throw away every mission still waiting
 /// on the table, generated or posted by a character, so the next are written
 /// from the corpus as it now stands; with `?ledger=true`, forget every settled
-/// target as well.
+/// target as well, and with `?orders=true`, clear the orders board.
 pub async fn discard_pool(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
@@ -635,7 +639,7 @@ pub async fn discard_pool(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("clearing the pool");
     };
-    let (mut discarded, mut forgotten) = (0, 0);
+    let (mut discarded, mut forgotten, mut cleared) = (0, 0, 0);
     let run_here = rt
         .hosted
         .ids()
@@ -647,9 +651,13 @@ pub async fn discard_pool(
             if q.ledger {
                 forgotten += sim.missions.forget_settled();
             }
+            if q.orders {
+                cleared += sim.ledger.clear_open();
+            }
         });
     }
-    Json(json!({ "discarded": discarded, "forgotten": forgotten })).into_response()
+    Json(json!({ "discarded": discarded, "forgotten": forgotten, "orders": cleared }))
+        .into_response()
 }
 
 /// What a name in a brief is.

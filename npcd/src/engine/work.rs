@@ -1426,6 +1426,18 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "You meant to hand an order to somebody, but not who.".into(),
                 );
             };
+            let unordered = hosted
+                .read(|w| {
+                    w.actors()
+                        .find(|a| a.name.eq_ignore_ascii_case(&to))
+                        .map(|a| a.id.clone())
+                })
+                .is_some_and(|id| hosted.sim(|s| s.missions.is_unordered(&id)));
+            if unordered {
+                return Outcome::Refused(format!(
+                    "{to} takes no orders: work for {to} is not handed over, it is asked for."
+                ));
+            }
             hosted.with_sim(|s| match s.ledger.hand_to(&what, &to) {
                 Ok(()) => Outcome::Did(format!("{to} has it: {what}")),
                 Err(why) => Outcome::Refused(why),
@@ -4472,6 +4484,32 @@ mod tests {
                     .into()
             )
         );
+    }
+
+    /// **An order is not handed to a body the world gives no orders.**
+    #[test]
+    fn an_order_is_not_handed_to_an_unordered_body() {
+        let h = vault();
+        h.with_sim(|s| {
+            s.ledger.set_order("mind the drill", "m1", None);
+            s.set_unordered("m2", true);
+        });
+        assert_eq!(
+            perform(
+                &h,
+                "m1",
+                &act(
+                    "orders_hand_to",
+                    json!({"what": "mind the drill", "to": "Orion Vance"})
+                )
+            ),
+            Outcome::Refused(
+                "Orion Vance takes no orders: work for Orion Vance is not handed over, it is \
+                 asked for."
+                    .into()
+            )
+        );
+        assert_eq!(h.sim(|s| s.unheld_orders()), ["mind the drill"]);
     }
 
     /// A mission taken up at the desk, worked with its progress recorded, and
