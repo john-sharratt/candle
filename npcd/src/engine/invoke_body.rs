@@ -238,8 +238,11 @@ mod tests {
     #[test]
     fn a_post_must_name_a_job_or_a_brief() {
         const POST: &str = "http://local/command/order-table~0/order_post";
+        // A world with a standing job: in one with none, `job` is taken out
+        // and `brief` alone makes the choice.
         let within = Within {
             invokable: vec![Invokable::new(POST, "order_post")],
+            jobs: vec!["ward-shift".into()],
             ..Within::among(&[])
         };
         let body = body_of_url(&within, POST);

@@ -62,9 +62,27 @@ fn tree(v: &TestVocab) -> Arc<StencilTree> {
     Arc::new(compile(&spec, v).unwrap())
 }
 
+/// Where a target stopped being writable.
+#[derive(Debug, PartialEq)]
+enum Refused {
+    /// The grammar masked out the byte at `at`.
+    Masked { at: usize },
+    /// The grammar wrote `wrote`, which leaves the target at `at`: the first
+    /// byte it wrote differently.
+    Prefilled { at: usize, wrote: String },
+}
+
+impl Refused {
+    fn at(&self) -> usize {
+        match self {
+            Refused::Masked { at } | Refused::Prefilled { at, .. } => *at,
+        }
+    }
+}
+
 /// Write `target` through the grammar: `Ok` when every byte of it is allowed,
-/// `Err` with the offset of the first byte that is not.
-fn write(target: &str) -> Result<(), usize> {
+/// or where and how it was refused.
+fn write(target: &str) -> Result<(), Refused> {
     let v = TestVocab::new();
     let mut session = StencilSession::new(tree(&v));
     let bytes = target.as_bytes();
@@ -74,14 +92,22 @@ fn write(target: &str) -> Result<(), usize> {
             StencilAction::Prefill(toks) => {
                 let wrote = v.decode(&toks);
                 if !bytes[at..].starts_with(&wrote) {
-                    return Err(at);
+                    let same = bytes[at..]
+                        .iter()
+                        .zip(&wrote)
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    return Err(Refused::Prefilled {
+                        at: at + same,
+                        wrote: String::from_utf8_lossy(&wrote).into_owned(),
+                    });
                 }
                 at += wrote.len();
             }
             StencilAction::MaskedDecode(set) => {
                 let b = *bytes.get(at).expect("the target ended inside the call");
                 if !set.contains(b as TokenId) {
-                    return Err(at);
+                    return Err(Refused::Masked { at });
                 }
                 session.observe(b as TokenId, &[b]).unwrap();
                 at += 1;
@@ -97,20 +123,29 @@ fn write(target: &str) -> Result<(), usize> {
 }
 
 fn call(body: &str) -> String {
-    format!("<tool_call>\n{{\"name\": \"post\", \"arguments\": {{\"body\": {body}}}}}\n</tool_call>")
+    format!(
+        "<tool_call>\n{{\"name\": \"post\", \"arguments\": {{\"body\": {body}}}}}\n</tool_call>"
+    )
 }
 
 #[test]
 fn a_nested_choice_holds_its_object_open_until_a_member_is_written() {
     let empty = call("{}");
-    let at = write(&empty).expect_err("an empty body is no post");
-    assert_eq!(&empty[at..at + 2], "}}", "refused at the body's close");
+    let refused = write(&empty).expect_err("an empty body is no post");
+    let at = refused.at();
+    assert_eq!(
+        &empty[at..at + 2],
+        "}}",
+        "refused at the body's close: {refused:?}"
+    );
 
     assert_eq!(write(&call("{\"job\": \"ward-shift\"}")), Ok(()));
     assert_eq!(
-        write(&call("{\"brief\": \"Walk the ward.\", \"steps\": \"go to the ward room\"}")),
+        write(&call(
+            "{\"brief\": \"Walk the ward.\", \"steps\": \"go to the ward room\"}"
+        )),
         Ok(())
     );
-    let at = write(&call("{\"steps\": \"go\"}")).expect_err("steps alone make no choice");
-    assert!(at > 0);
+    let refused = write(&call("{\"steps\": \"go\"}")).expect_err("steps alone make no choice");
+    assert!(refused.at() > 0, "{refused:?}");
 }
