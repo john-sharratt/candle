@@ -32,6 +32,7 @@ use crate::engine::tools::{CHANNEL_WAY, PRIVATE, SELF};
 use crate::engine::whereabouts;
 use crate::sim::field::{Resource, Stance};
 use crate::sim::item::{Item, Kind as ItemKind};
+use crate::sim::ledger::OrderRefused;
 use crate::sim::phone::{Kind as ThreadKind, Threads, ALL_MESSAGES};
 use crate::sim::tower::{on_map, Coord, Posture, DRILL_COST_PER_METRE, EDGE, SIEGE_COST};
 use crate::sim::Sim;
@@ -434,7 +435,21 @@ fn claim(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     }
     match hosted.with_sim(|s| s.ledger.take_order(&what, body)) {
         Ok(()) => Outcome::Did(format!("You take it on: {what}. Nobody else can now.")),
-        Err(why) => Outcome::Refused(why),
+        Err(why) => Outcome::Refused(order_refusal(hosted, &what, why)),
+    }
+}
+
+/// What a character is told when an order will not be taken on or handed
+/// over: its holder by the name the world knows them by, never a body id.
+pub(crate) fn order_refusal(hosted: &Hosted, what: &str, why: OrderRefused) -> String {
+    match why {
+        OrderRefused::NoSuch => format!("There is no standing order to {what}."),
+        OrderRefused::HeldBy(holder) => {
+            let name = hosted
+                .read(|w| w.actors().find(|a| a.id == holder).map(|a| a.name.clone()))
+                .unwrap_or_else(|| "somebody".to_string());
+            format!("{name} is holding that one.")
+        }
     }
 }
 

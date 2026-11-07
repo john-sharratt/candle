@@ -380,7 +380,9 @@ impl Sim {
     /// exclusively, and the orders lying unheld on a board. A character does not
     /// distinguish them — both are *taking something on* — and splitting them
     /// would be two tools for one act.
-    pub fn claimable_at(&self, place: &str) -> Vec<String> {
+    ///
+    /// **A body the world gives no orders takes none off the board.**
+    pub fn claimable_at(&self, place: &str, body: &str) -> Vec<String> {
         let mut out: Vec<String> = self
             .devices
             .at(place)
@@ -388,8 +390,19 @@ impl Sim {
             .filter(|d| d.claimable && d.working)
             .map(|d| d.name.clone())
             .collect();
-        out.extend(self.ledger.unheld());
+        if !self.missions.is_unordered(body) {
+            out.extend(self.ledger.unheld());
+        }
         out
+    }
+
+    /// Stand a body ordered or unordered ([`Missions::set_unordered`]); an
+    /// unordered one puts back on the board every order it was holding.
+    pub fn set_unordered(&mut self, body: &str, unordered: bool) {
+        self.missions.set_unordered(body, unordered);
+        if unordered {
+            while self.ledger.give_back(body).is_some() {}
+        }
     }
 
     /// `gather.what`.

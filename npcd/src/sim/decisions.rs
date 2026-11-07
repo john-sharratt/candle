@@ -192,9 +192,24 @@ mod tests {
             "the klaxon did not say how to take the decision on: {told:?}"
         );
         assert!(
-            s.claimable_at("tower-redoubt/bridge").contains(&what),
+            s.claimable_at("tower-redoubt/bridge", "c1").contains(&what),
             "what the klaxon names is not something `claim` offers"
         );
+    }
+
+    /// **A body the world gives no orders is offered none to claim, and stood
+    /// unordered puts back what it held.**
+    #[test]
+    fn an_unordered_body_claims_no_orders_and_puts_back_what_it_held() {
+        let mut s = with_contact();
+        s.watch_tower();
+        let what = whats(&s)[0].clone();
+        s.ledger.take_order(&what, "c1").unwrap();
+        s.set_unordered("c1", true);
+        assert!(s.orders_held_by("c1").is_empty());
+        assert_eq!(s.unheld_orders(), [what.clone()]);
+        assert!(!s.claimable_at("tower-redoubt/bridge", "c1").contains(&what));
+        assert!(s.claimable_at("tower-redoubt/bridge", "c2").contains(&what));
     }
 
     /// A tower with nothing pressing, and a world with no tower, put up nothing.

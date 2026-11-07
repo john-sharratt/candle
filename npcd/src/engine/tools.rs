@@ -2167,8 +2167,7 @@ impl Within {
             .iter()
             .flat_map(|who| sim.owed_to(&me, who))
             .collect();
-        let _ = body;
-        self.claimable = sim.claimable_at(place);
+        self.claimable = sim.claimable_at(place, body);
         // The orders only: a claimed station lives in the world, not the sim, so
         // the caller that has the world adds it ahead of this call.
         self.held.extend(sim.orders_held_by(body));

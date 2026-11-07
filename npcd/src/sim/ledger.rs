@@ -79,6 +79,15 @@ pub struct Order {
     pub done: bool,
 }
 
+/// Why an order could not be taken on or handed over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OrderRefused {
+    /// No open order reads so.
+    NoSuch,
+    /// Somebody else holds it — their body id, for the act to name them by.
+    HeldBy(String),
+}
+
 /// Somebody's judgement of a made thing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdict {
@@ -327,18 +336,18 @@ impl Ledger {
     }
 
     /// Hand an order to somebody, whether or not it was on the board.
-    pub fn hand_to(&mut self, what: &str, who: &str) -> Result<(), String> {
+    pub fn hand_to(&mut self, what: &str, who: &str) -> Result<(), OrderRefused> {
         let want = what.trim().to_lowercase();
         let Some(o) = self
             .orders
             .iter_mut()
             .find(|o| !o.done && o.what.to_lowercase() == want)
         else {
-            return Err(format!("There is no standing order to {what}."));
+            return Err(OrderRefused::NoSuch);
         };
         if let Some(holder) = &o.held_by {
             if holder != who {
-                return Err(format!("{holder} is holding that one."));
+                return Err(OrderRefused::HeldBy(holder.clone()));
             }
         }
         o.held_by = Some(who.to_string());
@@ -347,17 +356,17 @@ impl Ledger {
 
     /// Take an unheld order. `Err` when somebody already has it — the same
     /// refusal shape `World::take` gives for a claimed character.
-    pub fn take_order(&mut self, what: &str, who: &str) -> Result<(), String> {
+    pub fn take_order(&mut self, what: &str, who: &str) -> Result<(), OrderRefused> {
         let want = what.trim().to_lowercase();
         let Some(o) = self
             .orders
             .iter_mut()
             .find(|o| !o.done && o.what.to_lowercase() == want)
         else {
-            return Err(format!("There is no standing order to {what}."));
+            return Err(OrderRefused::NoSuch);
         };
         match &o.held_by {
-            Some(holder) if holder != who => Err(format!("{holder} is holding that one.")),
+            Some(holder) if holder != who => Err(OrderRefused::HeldBy(holder.clone())),
             _ => {
                 o.held_by = Some(who.to_string());
                 Ok(())
@@ -390,6 +399,16 @@ impl Ledger {
             }
             None => false,
         }
+    }
+
+    /// Take every open order off the board, held or not, and free its holder:
+    /// an operator's clear, for a board a cast has filled with work nobody
+    /// should do. Returns how many came down.
+    pub fn clear_open(&mut self) -> usize {
+        let open = self.orders.iter().filter(|o| !o.done).count();
+        self.orders.retain(|o| o.done);
+        self.orders_read.clear();
+        open
     }
 
     /// The orders `setter` has put up that are still open, held or not.
@@ -699,8 +718,14 @@ mod tests {
         let mut l = Ledger::new();
         l.set_order("mind the drill", "keeper", None);
         l.take_order("mind the drill", "c1").unwrap();
-        let err = l.take_order("mind the drill", "c2").unwrap_err();
-        assert!(err.contains("c1"), "the holder was not named: {err}");
+        assert_eq!(
+            l.take_order("mind the drill", "c2"),
+            Err(OrderRefused::HeldBy("c1".into()))
+        );
+        assert_eq!(
+            l.hand_to("mind the drill", "c2"),
+            Err(OrderRefused::HeldBy("c1".into()))
+        );
     }
 
     #[test]
@@ -711,6 +736,24 @@ mod tests {
         assert_eq!(l.give_back("c1").as_deref(), Some("mind the drill"));
         assert_eq!(l.unheld().len(), 1);
         assert!(l.give_back("c1").is_none(), "gave back what was not held");
+    }
+
+    /// **An operator's clear takes down every open order and frees its
+    /// holder**, and leaves finished ones as the record of what was done.
+    #[test]
+    fn clearing_the_board_takes_down_every_open_order() {
+        let mut l = Ledger::new();
+        l.set_order("mind the drill", "keeper", None);
+        l.set_order("hold the gate", "keeper", None);
+        l.set_order("sweep the hall", "keeper", None);
+        l.take_order("mind the drill", "c1").unwrap();
+        l.take_order("sweep the hall", "c2").unwrap();
+        assert!(l.finish("c2", "sweep the hall"));
+        assert_eq!(l.clear_open(), 2);
+        assert!(l.unheld().is_empty());
+        assert!(l.held_by("c1").is_empty());
+        assert_eq!(l.orders().len(), 1);
+        assert!(l.orders()[0].done);
     }
 
     #[test]
