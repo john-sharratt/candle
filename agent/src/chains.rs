@@ -185,4 +185,55 @@ mod tests {
         assert!(!chains.holds(&a), "the older chain went");
         assert!(chains.holds(&b));
     }
+    /// **A chain named again outlives one not named**: `resolve` touches every
+    /// chain an overlay names, so the one named again is the most recently
+    /// used of the held set, and the one held earlier and not named since is
+    /// what the next chain displaces.
+    #[test]
+    fn a_chain_named_again_outlives_one_not_named() {
+        // Three chains of one size, so a cap of two holds exactly two.
+        let store = VfsStore::new();
+        store.write("a.txt", "one\n".into()).unwrap();
+        store.write("b.txt", "two\n".into()).unwrap();
+        store.write("c.txt", "six\n".into()).unwrap();
+        let full = Overlay::of(&store.snapshot());
+        let (a, b, c) = (
+            full.chains["a.txt"].clone(),
+            full.chains["b.txt"].clone(),
+            full.chains["c.txt"].clone(),
+        );
+        let one = serde_json::to_vec(&full.carried[&a]).unwrap().len();
+        for name in [b.as_str(), c.as_str()] {
+            assert_eq!(
+                serde_json::to_vec(&full.carried[name]).unwrap().len(),
+                one,
+                "every chain is the same size, so the cap fits two of them"
+            );
+        }
+        let mut chains = Chains::new(one * 2);
+        let carrying = |name: &str| Overlay {
+            chains: BTreeMap::from([("x".to_string(), name.to_string())]),
+            ..full.carrying(&[name.to_string()])
+        };
+        let named = |name: &str| Overlay {
+            chains: BTreeMap::from([("x".to_string(), name.to_string())]),
+            ..full.named()
+        };
+
+        let snap_a = chains.resolve(&carrying(&a)).unwrap();
+        chains.resolve(&carrying(&b)).unwrap();
+        assert_eq!(chains.bytes(), one * 2, "both fit under the cap");
+
+        // A by name alone, nothing carried: it resolves from what is held,
+        // and the touch is all this run does.
+        assert_eq!(chains.resolve(&named(&a)).unwrap(), snap_a);
+
+        chains.resolve(&carrying(&c)).unwrap();
+        assert!(chains.holds(&a), "A was named again and should stay");
+        assert!(chains.holds(&c), "C is the newest");
+        assert!(
+            !chains.holds(&b),
+            "B was held earlier and named no more: it should be the one gone"
+        );
+    }
 }
