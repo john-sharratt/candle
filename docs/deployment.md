@@ -100,6 +100,7 @@ as its working directory. cf-ddns is the exception — see below.
 | web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:9443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml` — `rdp-tunnel-server` holds 443 and 8443) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
 | motherd | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the zend route's upstream in dumb mode; outbound to the gateway's cluster on `:9443` | `cargo build --release -p motherd` | yes |
 | keep | .5 | — (watches web on `:80` and motherd on `:8081`) | `cargo build --release -p keep` | **never** |
+| yenbot | .5 | `127.0.0.1:8096` (from `D:\yenbot\live\yenbot.yaml`) — loopback only; the gateway's `yenbot` site forwards yenbot.com.au to it | `cargo build --release` in `D:\prog\yenbot` (its own repository, `docs/yenbot_app_host.md` §5.5); released with `service_deploy {host: BlackWorld, service: yenbot}` | yes |
 | npcd | .6 | `0.0.0.0:8081` (`--host 0.0.0.0 --port 8081`) | `cargo build --release -p npcd` | yes |
 | cf-ddns | .5 | — (outbound only) | scheduled task, see below | **never** |
 
@@ -113,6 +114,7 @@ Paths are relative to the repo root.
 |---|---|---|---|
 | .5 | web | `keep\stable\web.exe --config web/web.yaml` | 2026-10-14, keep restarts a proven trial from this path |
 | .5 | motherd | `keep\stable\motherd.exe --config motherd\motherd.yaml` | 2026-10-14, keep restarts a proven trial from this path — every setting is in `motherd/motherd.yaml` |
+| .5 | yenbot | `keep\stable\yenbot.exe --config D:/yenbot/live/yenbot.yaml`, working directory `D:\yenbot` | 2026-11-07, keep restarts a proven trial from this path. Its store, files, backups and library cache are under `D:\yenbot\data\`, its bus key at `D:\yenbot\secrets\gateway.key`, and the live checkout it serves at `D:\yenbot\live` (yenbot's `docs/running.md`) |
 | .5 | keep | `target\release\keep.exe keep/keep.yaml` | 2026-10-14. Supervisor `C:\Users\johna\AppData\Local\keep\supervise.ps1` (restart 10 s after exit), run by the scheduled task `\keep` at boot since 2026-10-15. keep is not swapped by a rollout |
 | .6 | npcd | `target\release\npcd.exe --host 0.0.0.0 --port 8081 --gateway 192.168.0.5 --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`). Rewritten 2026-10-10 for the host's flags (not yet run): `--bind` became `--host`/`--port`, `--content` is gone, and `--gateway 192.168.0.5` is new — without it every signed-in visitor is anonymous. Its store was written by the AntiLoop + StyleTune fine-tune; since 2026-10-11 the host prescribes Flash-Next, so that store is refused at open, before anything in it is rewritten, and npcd's first run on this build needs a new `--data` |
 
@@ -356,6 +358,7 @@ Expected results, as measured 2026-09-13:
 |---|---|---|
 | motherd on the LAN | `curl http://192.168.0.5:8081/v1/status` | `"tenants":{"zend":{"state":"ready",…},"npcd":{"state":"ready",…}}` and `"cluster":{…"apps":{"zend":{"link":"joined",…},"npcd":{"link":"joined",…}}}` — it answers `200` with `"loading"` throughout startup, and npcd's first start on a fresh substrate ingests its mind for a while after zend is ready |
 | npcd on the LAN | `curl http://192.168.0.6:8081/v1/status` | `200`; a host-built npcd answers with `"tenants":{"npcd":…}` |
+| yenbot on loopback | `curl http://127.0.0.1:8096/v1/status` | `{"state":"ready","build":"<count>-<hash>","store":{"schema":…}}` |
 | gateway config | `target\release\web.exe --config web/web.yaml --check` | exit 0 |
 | gateway routing | `curl -H "Host: <name>" http://127.0.0.1/` for `tokera.com`, `code.tokera.com`, `bot.tokera.com` | `200` / `30x` / `401`; `503` = that upstream is down |
 | from the internet | `curl https://<name>/` for `tokera.com`, `www.tokera.com`, `battlecities.net`, `code.tokera.com`, `bot.tokera.com` | not `5xx`, not `000` |

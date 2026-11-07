@@ -41,6 +41,7 @@ export const SITES = [
   { id: 'zend',         name: 'Zen',           url: 'https://code.tokera.com/',  icon: '/brand/zen.png' },
   { id: 'npcd',         name: 'NPCs',          url: 'https://bot.tokera.com/',   icon: '/brand/npcd.svg' },
   { id: 'battlecities', name: 'Battle Cities', url: 'https://battlecities.net/', icon: '/brand/battlecities.png' },
+  { id: 'yenbot',       name: 'Yen Bots',      url: 'https://yenbot.com.au/',    icon: '/brand/yenbot.svg' },
 ];
 
 /** The site this page belongs to, or `null` if it is not one of them. */

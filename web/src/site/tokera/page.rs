@@ -170,7 +170,7 @@ pub const LINKS: [(&str, &str, Nav); 3] = [
 /// one list is exactly the thing that drifts, so
 /// [`tests::the_estate_list_matches_the_shared_module`] compares this against
 /// the JavaScript rather than trusting them to stay level.
-pub const ESTATE: [(&str, &str, &str, &str); 4] = [
+pub const ESTATE: [(&str, &str, &str, &str); 5] = [
     (
         "tokera",
         "Tokera",
@@ -184,6 +184,12 @@ pub const ESTATE: [(&str, &str, &str, &str); 4] = [
         "Battle Cities",
         "https://battlecities.net/",
         "/brand/battlecities.png",
+    ),
+    (
+        "yenbot",
+        "Yen Bots",
+        "https://yenbot.com.au/",
+        "/brand/yenbot.svg",
     ),
 ];
 
