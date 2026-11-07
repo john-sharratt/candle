@@ -20,7 +20,7 @@ use crate::engine::body::Outcome;
 use crate::engine::mission::{progress_line, Mission};
 use crate::engine::mission_acts;
 use crate::engine::on_you;
-use crate::engine::tools::Tool;
+use crate::engine::tools::{self, Choices, Tool};
 use crate::world::Hosted;
 
 /// Survey the room the body stands in and what it carries, as the character reads it.
@@ -177,19 +177,10 @@ impl Survey {
                 .collect::<Vec<_>>();
             (stations, threads, lately)
         });
-        // **The house link is listed, with what works it.** A fixture with no
-        // controls and no state, it is passed over by the stations above, and
-        // a Drone sent to survey the network from it scanned the front room,
-        // did not see it, and was sent off to look for it on another level.
-        let house = bridge::links_of(&bridge::parts_here(hosted, body))
-            .into_iter()
-            .map(|name| {
-                format!(
-                    "{}. Survey the house network from it with `survey_network`, naming it.",
-                    capital(&name)
-                )
-            })
-            .collect();
+        // **A part a bridge works is listed with the acts that work it** — it
+        // has no address and may have no state, so the stations above pass it
+        // over.
+        let house = house_lines(&bridge::parts_here(hosted, body));
         Survey {
             stations,
             house,
@@ -200,13 +191,8 @@ impl Survey {
 
     /// The whole survey as the character reads it.
     pub fn prose(&self) -> String {
-        let lines: Vec<String> = self
-            .stations
-            .iter()
-            .map(Entry::prose)
-            .chain(self.house.iter().cloned())
-            .collect();
-        let mut said = say(&lines);
+        let lines: Vec<String> = self.stations.iter().map(Entry::prose).collect();
+        let mut said = listed(&lines, &self.house);
         if let Some(mine) = on_you::say(&self.threads, self.lately.as_deref()) {
             said.push('\n');
             said.push_str(&mine);
@@ -320,17 +306,56 @@ impl Entry {
 
 /// The station lines as the character reads them.
 pub fn say(lines: &[String]) -> String {
-    if lines.is_empty() {
+    listed(lines, &[])
+}
+
+/// The station lines and the house's, as the character reads them. The way to
+/// `invoke` is said of the stations alone: a part a bridge works has no
+/// address, and its line names its own acts.
+fn listed(stations: &[String], house: &[String]) -> String {
+    if stations.is_empty() && house.is_empty() {
         return "Nothing in this room answers to you. To see somewhere else, name a place.".into();
     }
-    format!(
-        "Here you can work:\n{}\nTo act on one, `invoke` its address.",
-        lines
-            .iter()
-            .map(|l| format!("- {l}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    )
+    let lines = stations
+        .iter()
+        .chain(house)
+        .map(|l| format!("- {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let footer = match (stations.is_empty(), house.is_empty()) {
+        (true, _) => "",
+        (false, true) => "\nTo act on one, `invoke` its address.",
+        (false, false) => "\nTo act on a station, `invoke` its address.",
+    };
+    format!("Here you can work:\n{lines}{footer}")
+}
+
+/// A line for each part here a bridge works — a house link, a Sonos player,
+/// a receiver, a Cast device, a TV to pair — naming the acts the grammar binds
+/// to it ([`tools::bound_to`]) and the argument that names it.
+fn house_lines(parts: &[bridge::Here]) -> Vec<String> {
+    [
+        (bridge::links_of(parts), Choices::Links),
+        (bridge::sonos_of(parts), Choices::Sonos),
+        (bridge::receiver_of(parts), Choices::Receiver),
+        (bridge::cast_of(parts), Choices::Cast),
+        (bridge::pairable_of(parts), Choices::Pairable),
+        (bridge::pairing_of(parts), Choices::Pairing),
+    ]
+    .into_iter()
+    .flat_map(|(names, choices)| {
+        let bound: Vec<(&str, &str)> = tools::bound_to(choices).collect();
+        let acts: Vec<String> = bound.iter().map(|(act, _)| format!("`{act}`")).collect();
+        let param = bound.first().map_or("", |(_, p)| *p);
+        names.into_iter().map(move |name| {
+            format!(
+                "{}. Work it with {}, giving `{param}` as \"{name}\".",
+                capital(&name),
+                text::list_or(&acts)
+            )
+        })
+    })
+    .collect()
 }
 
 /// A station's reading in a few words.
@@ -536,25 +561,77 @@ mod tests {
         );
     }
 
-    /// **A house link is in the survey, with the act that works it**, though it
-    /// is no station.
+    /// **The way to `invoke` is said of the stations alone**: a house line has
+    /// no address, and names its own acts.
     #[test]
-    fn the_survey_lists_the_house_link_with_its_act() {
-        let survey = Survey {
-            stations: Vec::new(),
-            house: vec![
-                "The house link. Survey the house network from it with `survey_network`, \
-                 naming it."
-                    .into(),
-            ],
-            threads: Vec::new(),
-            lately: None,
-        };
+    fn the_invoke_footer_is_said_of_stations_only() {
+        let house = ["The house link. Work it with `survey_network`.".to_string()];
         assert_eq!(
-            survey.prose(),
-            "Here you can work:\n- The house link. Survey the house network from it with \
-             `survey_network`, naming it.\nTo act on one, `invoke` its address."
+            listed(&[], &house),
+            "Here you can work:\n- The house link. Work it with `survey_network`."
         );
+        assert_eq!(
+            listed(&["One.".into()], &house),
+            "Here you can work:\n- One.\n- The house link. Work it with `survey_network`.\nTo \
+             act on a station, `invoke` its address."
+        );
+    }
+
+    /// The vault with a house link in its green room, the room a mirror of a
+    /// real place or not, and a body standing in it.
+    fn linked_vault(mirrored: bool) -> Hosted {
+        use npc_map::part::{Part, PartKind, Placement};
+        use npc_map::schema::Where;
+        use npc_map::world::World;
+        use npc_map::MapSet;
+
+        use crate::engine::mission_gen::standing::HOUSE_LINK;
+
+        let map =
+            MapSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps")).unwrap();
+        let (mut areas, mut parts) = map.authored();
+        parts.push(Part {
+            id: HOUSE_LINK.into(),
+            kind: PartKind::Fixture,
+            name: "house link".into(),
+            plural: None,
+            binds: None,
+            short: None,
+            long: "x".into(),
+            modes: vec![],
+            link: None,
+        });
+        let casting = areas.iter_mut().find(|a| a.id == "vault-casting").unwrap();
+        casting.mirrored = mirrored;
+        casting
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == "green-room")
+            .unwrap()
+            .parts
+            .push(Placement::Bare(HOUSE_LINK.into()));
+        let h = Hosted::of(
+            "creators-vault",
+            World::new(MapSet::assemble(areas, parts).unwrap()),
+        );
+        h.with(|w| {
+            w.enter("drone", "Wick", Where::new("vault-casting", "green-room"))
+                .unwrap();
+        });
+        h
+    }
+
+    /// **A house link is in the survey, with the act that works it**, in a
+    /// room that mirrors a real place — and nowhere else, where no bridge
+    /// reaches.
+    #[test]
+    fn the_survey_lists_the_house_link_in_a_mirrored_room() {
+        let line = "House link. Work it with `survey_network`, giving `at` as \"house link\".";
+        let mirrored = Survey::of(&linked_vault(true), "drone");
+        assert_eq!(mirrored.house, [line]);
+        assert!(mirrored.prose().contains(&format!("- {line}")));
+        let plain = Survey::of(&linked_vault(false), "drone");
+        assert!(plain.house.is_empty(), "{:?}", plain.house);
     }
 
     #[test]

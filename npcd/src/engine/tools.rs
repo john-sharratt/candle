@@ -1796,6 +1796,14 @@ fn value_requirements(tool: &str, param: &str) -> Vec<(String, Vec<String>)> {
 /// matter would be lost among them. The cost is that a typo here names no real
 /// parameter and would quietly do nothing —
 /// [`tests::every_live_parameter_names_a_real_one`] closes that.
+/// The acts whose argument [`LIVE`] binds to `choices`, each with that
+/// argument's name, in the table's order.
+pub fn bound_to(choices: Choices) -> impl Iterator<Item = (&'static str, &'static str)> {
+    LIVE.iter()
+        .filter(move |(_, _, c)| *c == choices)
+        .map(|(act, param, _)| (*act, *param))
+}
+
 const LIVE: &[(&str, &str, Choices)] = &[
     ("tell", "to", Choices::Company),
     ("whisper", "to", Choices::Company),
