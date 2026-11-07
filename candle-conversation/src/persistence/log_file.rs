@@ -360,7 +360,19 @@ impl LogFile {
     /// Fill `dest` from `offset`, through the whole sectors around it, a
     /// [`PARTS_WINDOW`] at a time — so the scratch stays one window, however
     /// large a cold load's stripe is.
+    ///
+    /// **A read of a staged record flushes it first.** [`Self::stage`] hands
+    /// out a record's offset before its bytes reach the file, and the index
+    /// takes that offset at once: a turn's index page is settled at its
+    /// location the moment it is appended. The file past `write_offset` is
+    /// pre-grown zeros, so read before the flush, the record was indexed but
+    /// unreadable — "expected JSON header starting with '{', found 0x00" —
+    /// until the next commit. The flush writes without syncing, and only when
+    /// the read reaches into what is staged.
     fn read_into(&mut self, offset: u64, dest: &mut [u8]) -> Result<()> {
+        if offset + dest.len() as u64 > self.write_offset {
+            self.flush()?;
+        }
         let need = dest.len();
         for (i, piece) in dest.chunks_mut(PARTS_WINDOW).enumerate() {
             let at = offset + (i * PARTS_WINDOW) as u64;
@@ -847,6 +859,31 @@ mod tests {
                 .unwrap(),
             joined
         );
+        drop(log);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **A staged record reads back before any flush.** Its offset is handed
+    /// out at `stage`, and the index takes it at once; read from the file
+    /// alone, the pre-grown bytes there were zeros.
+    #[test]
+    fn a_staged_record_reads_back_before_any_flush() {
+        let path = tmp_path("stage_read");
+        let r0 = rec(1, 0, b"flushed");
+        let r1 = rec(1, 1, b"staged-only");
+        let mut log = LogFile::create(&path).unwrap();
+        let off0 = log.stage(&r0);
+        log.flush().unwrap();
+        let off1 = log.stage(&r1);
+        assert_eq!(log.pending_len(), r1.len(), "r1 is staged, not written");
+        assert_eq!(log.read_at(off1, r1.len()).unwrap(), r1);
+        assert_eq!(log.pending_len(), 0, "the read flushed what it reached");
+        assert_eq!(log.read_at(off0, r0.len()).unwrap(), r0);
+        // A read that stops short of the staged bytes leaves them staged.
+        let off2 = log.stage(&rec(1, 2, b"later"));
+        assert_eq!(log.read_at(off0, r0.len()).unwrap(), r0);
+        assert!(log.pending_len() > 0);
+        assert!(off2 > off1);
         drop(log);
         std::fs::remove_file(&path).ok();
     }

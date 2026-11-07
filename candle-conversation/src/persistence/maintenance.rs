@@ -1263,14 +1263,13 @@ impl SubstratePersistence {
     /// A relocated copy keeps its record's identity, so its append moves the
     /// live-tail maps onto it at once (`track_snapshot_loc`,
     /// `track_metadata_loc`), while the substrate index moves only at
-    /// [`MaintenanceResult::apply_to_substrate`]. An op that never applies left
-    /// the maps on the copy and the index on the source. The next op over the
-    /// source's segment then planned the source from the index, filtered it
-    /// out against the maps, and unlinked it under the index: a snapshot that
-    /// stayed indexed but unreadable until a restart re-walked the log — 15
-    /// minutes of retries for one of BlackWorld's characters (2026-11-07).
-    /// Restored, the maps name the source the index names, under the same
-    /// identity; the copies are dead weight a later op reclaims.
+    /// [`MaintenanceResult::apply_to_substrate`]. An op that never applies
+    /// would leave the maps on the copy and the index on the source, and the
+    /// next op over the source's segment would plan the source from the index,
+    /// filter it out against the maps, and unlink it under the index: a record
+    /// indexed but unreadable until a restart re-walks the log. Restored, the
+    /// maps name the source the index names, under the same identity; the
+    /// copies are dead weight a later op reclaims.
     ///
     /// **Only where `substrate`'s index still names the source.** An entry the
     /// index has moved onto the copy — an apply that ran — keeps the copy:
@@ -3160,9 +3159,8 @@ mod tests {
     /// keeps its segment.** The persistence-side live-tail map moved off the
     /// planned tail while the substrate index kept naming it: the relocation
     /// filters the tail out, the apply has nothing to repoint, and dropping
-    /// the segment left the tail indexed but unreadable — the fault on
-    /// BlackWorld's npcd segment 16628 (2026-11-07). The segment stays linked,
-    /// and the tail still reads.
+    /// the segment would leave the tail indexed but unreadable. The segment
+    /// stays linked, and the tail still reads.
     #[test]
     fn a_tail_the_index_still_names_keeps_its_segment() {
         use crate::persistence::content_hash::snapshot_stream_id;
