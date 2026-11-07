@@ -409,11 +409,6 @@ pub fn for_world(id: &str, map: Option<&MapSet>) -> Sim {
             // its machines, its boards, and the acts its parts offer — because
             // those come from its own map rather than from this file. What it
             // does not get is a tower, a stockpile, or anything to shoot.
-            //
-            // **The acts too.** Given only its machines, the moon offered no
-            // part's act in any room: no `collect_mission` at its order table,
-            // so its Drones were never called to the table and could not have
-            // taken work standing at it.
             let mut sim = Sim::new();
             if let Some(map) = map {
                 from_map(&mut sim, map, id);
