@@ -838,7 +838,9 @@ for a character directly — `ask`, `reflect`, `dream`, `journal/draft` — refu
 changes nothing. A turn already decoding when it is suspended finishes.
 
 Everything that reaches it meanwhile (a message, a thought, an interaction line, what its world
-does around it) waits in its inbox, and nothing is dropped. The first turn after the resume reads
+does around it) waits in its inbox, and nothing is dropped while the member holding it runs; the
+inbox is that member's memory, so a restart starts it empty, as it does every character's. The
+first turn after the resume reads
 the newest 20 of each source — one thread, one speaker, one thing watched, the world around it —
 and one counted line where the rest stood: "While you were suspended, 214 more messages on
 #general." An arrival that only restates a standing fact (a situation, an unread count) keeps its
