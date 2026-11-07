@@ -80,8 +80,7 @@ pub fn fill(ctx: &RefreshContext<'_>, units: &[(Reading, Committed)]) -> usize {
         "sealing faces for the units that lack one",
     );
     // Every face forks this one conversation, so the prelude framing them is
-    // sealed once and shared — never once per face, which over a corpus of
-    // thousands of units wrote the prelude's K/V that many times.
+    // resolved and primed once per fill rather than once per face.
     let base = match opened_base(ctx) {
         Ok(base) => base,
         Err(e) => {
@@ -184,6 +183,10 @@ fn seal(
         .context("the unit holds no turn")?;
     let mut face = base.fork().context("face conversation")?;
     let timeline = face.timeline_id();
+    // A face is placed, never continued, so its seal writes no recurrent
+    // snapshot — a whole recurrent state, 65–112 MB, for a turn of a few dozen
+    // tokens. Noted before the turn seals, so there is no tail to retire.
+    e.note_timeline_unresumed(timeline);
     e.set_conversation_metadata(
         timeline,
         Substrate::FACE_OF_KEY,

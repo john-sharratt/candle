@@ -623,9 +623,15 @@ dozen of them framed exactly like the user's own.
 **Each unit has a face.** A face is a one-turn conversation on the reserved
 `Face` layer (`Reserved::Face`). It is framed by the prelude every dialogue
 primes on. Every face of one fill forks a single base conversation, so the
-prelude is sealed once and shared. Measured 2026-11-07: opening each face as a
-conversation of its own wrote roughly 4 GB of redo log a minute while a
-corpus-wide backfill ran, and filled WhiteWorld's substrate drive. Its user half is only the reading's anchor, `file=<repo>/<path>` or
+prelude is primed once per fill.
+
+**A face keeps no recurrent snapshot**, like every ingest unit
+(`zend::ingest_snapshots`). It is noted unresumed before its turn seals. A
+snapshot is the whole recurrent state, 65–112 MB on Flash-Next whatever the
+turn's length. The first backfill sealed faces without the mark: about 4 GB of
+redo log a minute across a corpus of ~3,400 units, which filled WhiteWorld's
+substrate drive (2026-11-07). The load-time sweep `retire_finished` retires any
+snapshot a face kept. Its user half is only the reading's anchor, `file=<repo>/<path>` or
 `folder=<repo>/<dir>` (`zend::faces::anchor`). Its assistant half is the unit's
 own opening, the calls it made, prefilled. The unit names its face under
 `face`, and the face names its unit under `face_of`. Both are plain `custom`

@@ -17,6 +17,7 @@
 //! file, and is re-pointed as a link on a later boot.
 
 use candle_conversation::projection::TimelineId;
+use candle_conversation::substrate::Substrate;
 use candle_conversation::ConversationEngine;
 
 use crate::branch_ingest::prime::{is_link_dir, is_link_file};
@@ -38,6 +39,12 @@ pub enum Unit<'a> {
     /// A unit of a layer built on another, by its subject — read once, never
     /// continued, and never a chain link.
     Layer(&'a str),
+    /// A unit's face (`crate::faces`): one prefilled turn a dialogue places,
+    /// never continued and never a chain link. A face kept its snapshot before
+    /// it was marked, 65–112 MB for a turn of a few dozen tokens, and a
+    /// corpus-wide backfill of them filled WhiteWorld's substrate drive
+    /// (2026-11-07).
+    Face,
 }
 
 impl Unit<'_> {
@@ -45,7 +52,7 @@ impl Unit<'_> {
         match self {
             Unit::File(path) => is_link_file(path),
             Unit::Folder(dir) => is_link_dir(dir),
-            Unit::Layer(_) => false,
+            Unit::Layer(_) | Unit::Face => false,
         }
     }
 }
@@ -88,6 +95,7 @@ pub fn retire_finished(engine: &ConversationEngine) -> usize {
     let mut retired = 0;
     let files = engine.conversations_with_metadata_key(PATH_KEY);
     let folders = engine.conversations_with_metadata_key(DIR_KEY);
+    let faces = engine.conversations_with_metadata_key(Substrate::FACE_OF_KEY);
     let units = files
         .iter()
         .filter(|(tl, _)| kind_is(engine, *tl, "code_read"))
@@ -97,7 +105,8 @@ pub fn retire_finished(engine: &ConversationEngine) -> usize {
                 .iter()
                 .filter(|(tl, _)| kind_is(engine, *tl, "repo_map"))
                 .map(|(tl, d)| (*tl, Unit::Folder(d))),
-        );
+        )
+        .chain(faces.iter().map(|(tl, _)| (*tl, Unit::Face)));
     for (timeline, unit) in units {
         match verdict(unit, engine.recurrent_snapshot_bytes(timeline)) {
             Verdict::Keep => {}
@@ -131,6 +140,14 @@ mod tests {
         assert_eq!(verdict(file, None), Verdict::Note);
         let folder = Unit::Folder("candle/candle-nn/src/");
         assert_eq!(verdict(folder, Some(KEPT_SNAPSHOT_BYTES)), Verdict::Retire);
+    }
+
+    /// **A face keeps no snapshot**: one it kept is retired, one it never kept
+    /// only noted.
+    #[test]
+    fn a_face_keeps_no_snapshot() {
+        assert_eq!(verdict(Unit::Face, Some(113_246_208)), Verdict::Retire);
+        assert_eq!(verdict(Unit::Face, None), Verdict::Note);
     }
 
     /// The chain's links keep theirs: what is forked from them seeds from it.
