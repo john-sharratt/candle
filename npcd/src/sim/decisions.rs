@@ -207,7 +207,7 @@ mod tests {
         s.ledger.take_order(&what, "c1").unwrap();
         s.set_unordered("c1", true);
         assert!(s.orders_held_by("c1").is_empty());
-        assert_eq!(s.unheld_orders(), [what.clone()]);
+        assert_eq!(s.unheld_orders(), [what.as_str()]);
         assert!(!s.claimable_at("tower-redoubt/bridge", "c1").contains(&what));
         assert!(s.claimable_at("tower-redoubt/bridge", "c2").contains(&what));
     }
