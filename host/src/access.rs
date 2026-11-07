@@ -136,6 +136,16 @@ mod tests {
         assert_eq!(role(&h, &roles()), Role::Creator);
     }
 
+    /// **Yen Bots' service key is a user of the estate**: it calls the model
+    /// and the image engine for its apps, and nothing an admin may.
+    #[test]
+    fn the_yenbot_service_is_a_user() {
+        let mut h = HeaderMap::new();
+        h.insert(USER, "service:yenbot".parse().unwrap());
+        h.insert(PROVIDER, "service-key".parse().unwrap());
+        assert_eq!(role(&h, &roles()), Role::User);
+    }
+
     /// The role comes from the gateway's headers; a request without them is
     /// anonymous.
     #[test]

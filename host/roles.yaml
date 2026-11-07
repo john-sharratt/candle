@@ -32,3 +32,8 @@ people:
     role: creator
   - email_sha256: 583eaf0ef44aa1ad59a8db43e029df5cfc6b9b77bb473d51ea0beed2b86f7225
     role: user
+  # Yen Bots' site, calling the model and the image engine with its service
+  # key (`web.yaml` `cluster.service_keys`, `docs/yenbot_app_host.md` §14).
+  # A service's subject names no person, so it is written as it is.
+  - sub: "service:yenbot"
+    role: user
