@@ -125,6 +125,34 @@ impl Parts {
             _ => Ok(()),
         }
     }
+
+    /// Remove the downloads of every build but those `keep` names by hash —
+    /// the ones still being fetched — once a build is installed. The files
+    /// beside them (`ok`, `refused.json`, the plan) are not downloads and stay.
+    /// Answers the builds removed.
+    ///
+    /// An installed build's downloads were never removed, so every build a
+    /// member had installed stayed here: ~150 on WhiteWorld, 60.7 GB, on the
+    /// drive its substrate shares, which then filled (2026-11-07).
+    pub fn keep_only(&self, keep: &[&str]) -> io::Result<Vec<String>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut removed = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type()?.is_dir() || keep.contains(&name.as_str()) {
+                continue;
+            }
+            fs::remove_dir_all(entry.path())?;
+            removed.push(name);
+        }
+        removed.sort();
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -216,5 +244,31 @@ mod tests {
         parts.remove(&build()).unwrap();
         assert!(!t.path().join("abc1234").exists());
         parts.remove(&build()).unwrap();
+    }
+
+    /// **Once a build is installed, only the downloads still being fetched
+    /// stay**: every other build's folder goes, and the files beside them —
+    /// the watchdog's `ok`, `refused.json` — are left.
+    #[test]
+    fn an_install_keeps_only_the_downloads_still_fetching() {
+        let t = TempDir::new().unwrap();
+        let parts = Parts::new(t.path());
+        for hash in ["old1", "old2", "newer"] {
+            fs::create_dir_all(t.path().join(hash)).unwrap();
+            fs::write(t.path().join(hash).join("x.part"), b"x").unwrap();
+        }
+        fs::write(t.path().join("ok"), b"").unwrap();
+        fs::write(t.path().join("refused.json"), b"[]").unwrap();
+        assert_eq!(parts.keep_only(&["newer"]).unwrap(), ["old1", "old2"]);
+        let mut left: Vec<String> = fs::read_dir(t.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["newer", "ok", "refused.json"]);
+        assert!(Parts::new(t.path().join("absent"))
+            .keep_only(&[])
+            .unwrap()
+            .is_empty());
     }
 }

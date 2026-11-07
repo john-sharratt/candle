@@ -771,6 +771,13 @@ There is no UI artifact. Each binary carries its tenants' UI compiled in
   `<data>/upgrade/<hash>/<sha256>` (with the platform's executable suffix for a
   binary). A binary is then asked for its `--build-info`, which must name the build
   offered. On a mismatch the part file is discarded and fetched again from the start.
+- **Removing.** A rejected build's downloads are removed when it is rejected. Once a
+  new build is ready and writes `ok`, it removes the downloads of every build but those
+  newer than itself, which may still be fetching (`Parts::keep_only`). Its own
+  downloads and those of every build installed before it go, because the kept copy
+  under `builds/` (§3.9) is what a rollback installs. Before this, an installed
+  build's downloads stayed for good. WhiteWorld held ~150, 60.7 GB, on the drive its
+  substrate shares, and that drive filled (2026-11-07).
 - **Peers become sources.** Every member announces with `BUILD_HAVE`, every 30 s and on
   admission, the build it runs, each one it keeps (§3.9) and each it verified. A member
   fetches with `from_node` 0, and the gateway sends each request to the next member

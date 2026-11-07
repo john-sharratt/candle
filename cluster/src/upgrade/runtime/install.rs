@@ -151,6 +151,7 @@ impl Upgrader {
                             tracing::warn!("the kept builds were not pruned: {e}");
                         }
                     }
+                    self.remove_installed_downloads();
                     let mut s = self.state();
                     s.handback.ok_written = true;
                     s.failure = None;
@@ -199,6 +200,30 @@ impl Upgrader {
         };
         if all {
             let _ = fs::remove_file(dir.join(PLAN));
+        }
+    }
+
+    /// Remove the downloads of every build but the ones newer than this, which
+    /// may still be fetching: this build's own, and those of every build
+    /// installed before it, which the drive they share with the substrate
+    /// would otherwise keep for good.
+    fn remove_installed_downloads(&self) {
+        let own = self.setup.info.build().count;
+        let fetching: Vec<String> = self
+            .state()
+            .known
+            .keys()
+            .filter(|(count, _)| *count > own)
+            .map(|(_, hash)| hash.clone())
+            .collect();
+        let keep: Vec<&str> = fetching.iter().map(String::as_str).collect();
+        match self.parts.keep_only(&keep) {
+            Ok(removed) if !removed.is_empty() => tracing::info!(
+                removed = removed.len(),
+                "removed the downloads of builds already installed"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("the installed builds' downloads were not removed: {e}"),
         }
     }
 
