@@ -1385,16 +1385,23 @@ impl Runtime {
         // the slow one that must not repeat over a long journey, and a character
         // that has arrived is out of its scope.
         let (hosted, body) = self.body_of(npc_id)?;
-        // Nor for an unordered character, which the table never calls.
-        let (on_mission, table_open, unordered, waits) = hosted.sim(|s| {
+        let (on_mission, table_open, unordered, waits, round_due) = hosted.sim(|s| {
             (
                 s.missions.is_on_mission(&body),
                 s.table_open,
                 s.missions.is_unordered(&body),
                 !s.missions.draws() && !s.missions.has_work_for(&body),
+                s.missions.has_round() && round::due_for(s, &body, crate::api::now_ms()),
             )
         });
-        if on_mission || unordered || !table_open || self.at_command_table(npc_id) {
+        // **The table calls an unordered character only to its round**, with
+        // an empty agenda and an item due (`docs/zen_moon_mind.md` §17.3), on
+        // the same clock that reaches a character deep in conversation — one
+        // talking on its channels never falls quiet enough for the idle wake.
+        if unordered {
+            return (!on_mission && round_due).then(|| ROUND_DUE.to_string());
+        }
+        if on_mission || !table_open || self.at_command_table(npc_id) {
             return None;
         }
         // With nothing posted in a world that draws nothing, it is called to
@@ -8285,6 +8292,47 @@ mod tests {
              `ward-patrol`, `morning-briefing`. Write a brief and steps of your own only for what \
              none of them covers."
         );
+    }
+
+    /// **The table calls an unordered character to its round, and only then.**
+    /// With an empty agenda and an item due, the call rides the summons clock
+    /// that reaches a character mid-conversation; with something on its agenda,
+    /// or nothing due, it is not called.
+    #[tokio::test]
+    async fn the_table_calls_an_unordered_character_to_its_round() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        use npc_map::world::Where;
+        let rt = vaulted();
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with(|w| {
+            w.enter("m1", "Zen".to_string(), Where::new("vault-casting", "green-room"))
+                .unwrap()
+        });
+        rt.scheduler.wake(1, 0, 0);
+        rt.embody(1, WORLD, "m1", 0).expect("bound");
+        hosted.with_sim(|s| s.missions.set_unordered("m1", true));
+        assert_eq!(rt.table_summons(1), None, "a world with no round calls nobody");
+
+        let items = round::parse(
+            "rounds/creators-vault.yaml",
+            "round:\n  - id: set-the-work\n    brief: Set the work.\n    steps:\n      - post \
+             work on the order table\n",
+        )
+        .unwrap();
+        hosted.with_sim(|s| s.missions.set_round(items));
+        assert_eq!(rt.table_summons(1).as_deref(), Some(ROUND_DUE));
+
+        hosted.with_sim(|s| {
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Its own.",
+                    vec![Todo::new("go to the command room")],
+                    Origin::Own,
+                ),
+            )
+        });
+        assert_eq!(rt.table_summons(1), None, "an agenda in hand is worked first");
     }
 
     /// **A piece is written at a desk that composes.** At a chronicle terminal,
