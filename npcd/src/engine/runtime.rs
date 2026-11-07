@@ -8070,7 +8070,10 @@ mod tests {
         embody(&rt, 1, "m1", "green-room");
         // Nobody has touched the table; its default is open, so a free character
         // out in the wing is called to make its way to it.
-        assert_eq!(rt.nudge_for(1).as_deref(), Some(vault_table_call().as_str()));
+        assert_eq!(
+            rt.nudge_for(1).as_deref(),
+            Some(vault_table_call().as_str())
+        );
     }
 
     /// **Company changes the standing task.** Told to go somewhere new every
@@ -8576,7 +8579,10 @@ mod tests {
 
         // Opened: now it is called to the command room.
         rt.set_table_open(true);
-        assert_eq!(rt.table_summons(1).as_deref(), Some(vault_table_call().as_str()));
+        assert_eq!(
+            rt.table_summons(1).as_deref(),
+            Some(vault_table_call().as_str())
+        );
 
         // Once it is carrying a mission, the call stops — the mission's own text
         // is the standing task now.
@@ -8629,7 +8635,10 @@ mod tests {
             None,
             "a character not at the table is not told it is standing there"
         );
-        assert_eq!(rt.table_summons(2).as_deref(), Some(vault_table_call().as_str()));
+        assert_eq!(
+            rt.table_summons(2).as_deref(),
+            Some(vault_table_call().as_str())
+        );
 
         // Shut the table and both go quiet.
         rt.set_table_open(false);
@@ -8675,7 +8684,10 @@ mod tests {
         );
 
         embody(&rt, 2, "m2", "green-room");
-        assert_eq!(rt.table_summons(2).as_deref(), Some(vault_table_call().as_str()));
+        assert_eq!(
+            rt.table_summons(2).as_deref(),
+            Some(vault_table_call().as_str())
+        );
         assert!(rt.takes_orders(2));
 
         hosted.with_sim(|s| {
@@ -8736,7 +8748,10 @@ mod tests {
                 Some(&body),
             )
         });
-        assert_eq!(rt.table_summons(2).as_deref(), Some(vault_table_call().as_str()));
+        assert_eq!(
+            rt.table_summons(2).as_deref(),
+            Some(vault_table_call().as_str())
+        );
     }
 
     /// **The table's notices reach whom they are for**: a post for whoever
@@ -9212,8 +9227,14 @@ mod tests {
 
         // A character in the vault, however far from the table, can ride to it.
         embody(&rt, 2, "m2", "green-room");
-        assert_eq!(rt.table_summons(2).as_deref(), Some(vault_table_call().as_str()));
-        assert_eq!(rt.nudge_for(2).as_deref(), Some(vault_table_call().as_str()));
+        assert_eq!(
+            rt.table_summons(2).as_deref(),
+            Some(vault_table_call().as_str())
+        );
+        assert_eq!(
+            rt.nudge_for(2).as_deref(),
+            Some(vault_table_call().as_str())
+        );
     }
 
     /// **The Redoubt has a command table of its own, in the muster hall where
