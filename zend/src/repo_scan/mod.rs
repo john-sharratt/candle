@@ -813,11 +813,8 @@ fn run_dir_pool(
     // still keeps is left again and counted done, its holder's commit landing
     // it.
     let keys: Vec<String> = jobs.iter().map(|j| j.unit.key.clone()).collect();
-    // A folder is drawn when its path as a folder — one closing `/` — is,
-    // since what a group draws is named by such prefixes.
     let order = ingest_lease::order(&keys, |i| {
-        let dir = jobs[i].unit.dir.trim_end_matches('/');
-        ctx.retrieval.draws(&format!("{dir}/"))
+        ctx.retrieval.draws(&as_folder(&jobs[i].unit.dir))
     });
     let left_over: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     let done = AtomicUsize::new(0);
@@ -1016,6 +1013,13 @@ fn run_dir_pool(
 /// unit was found on, so the listing and the manifest hint its turns show are the
 /// ones its key names. `None` when the unit's repository is not read through
 /// git.
+/// A folder's path as a folder — closed by one `/` — which is how what a
+/// drawing group draws is named. The workspace root, `""`, becomes `/`, which
+/// nothing draws.
+fn as_folder(dir: &str) -> String {
+    format!("{}/", dir.trim_end_matches('/'))
+}
+
 fn unit_tools(tools: &ToolContext, job: &UnitJob) -> Option<ToolContext> {
     let files = tools.files.fresh_at(&job.unit.repo, &job.at)?;
     Some(tools.with_files(Arc::new(files), ""))
@@ -1388,6 +1392,18 @@ pub(crate) fn shared_prompt_body(builder: &projection::Builder) -> String {
 mod tests {
     use super::*;
     use crate::faces::{anchor, Reading};
+
+    /// **A folder is asked after as a folder**, one closing `/`, however its
+    /// unit spells it.
+    #[test]
+    fn a_folder_is_named_with_one_closing_slash() {
+        assert_eq!(as_folder("candle/mcp/src/guides"), "candle/mcp/src/guides/");
+        assert_eq!(
+            as_folder("candle/mcp/src/guides/"),
+            "candle/mcp/src/guides/"
+        );
+        assert_eq!(as_folder(""), "/");
+    }
 
     /// **The concession is measured against the ZONE, never base + zone.**
     ///
