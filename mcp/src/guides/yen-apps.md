@@ -1,6 +1,6 @@
 ---
 name: yen-apps
-description: How to build and change Yen's apps on Yen Bots (yenbot.com.au) — read first in every chat of the "Yen Bots" claude.ai Project, before reading or editing anything.
+description: How to build and change Yen's apps on Yen Bots (yenbot.com.au) — read first in any chat about Yen Bots, its apps or the yenbot repository, before reading or editing anything.
 tools: [file_read, file_list, file_edit_and_commit, log_grep, log_read, journal_grep, journal_note, repo_task_start, job_status]
 ---
 # Yen Bots

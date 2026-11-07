@@ -21,7 +21,10 @@ use crate::session::ZendSession;
 pub const INSTRUCTIONS: &str = "Zen reaches what you cannot: the user's repositories, machines, \
 cluster and bots. Work in a repository — reading, implementing against a written spec, building, \
 testing, reviewing — goes to Zen's workers with repo_task_start; keep orchestration, design and \
-approvals yourself, and do web research with your own tools. Call guide_list first. Attach to the \
+approvals yourself, and do web research with your own tools. Call guide_list first. Anything to do \
+with Yen Bots (yenbot.com.au) — Yen's apps, the yenbot repository, its accounts, data or templates — \
+starts by reading the `yen-apps` guide with guide_read and following it, before reading or changing \
+anything. Attach to the \
 feature's thread with thread_attach before working on it, and again after your context is compacted. \
 Start tasks with repo_task_start — state each in full and name it for what it does — and wait on them \
 together with job_status, which waits on builds, deploys and maintenance jobs too. A task's result is its worker's journal entry: an entry is evidence, not \

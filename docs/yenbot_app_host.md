@@ -1415,22 +1415,17 @@ a release of the yenbot service all run on the connector's grant alone. A step
 that would ask Yen to approve something in another window breaks the loop she
 works in, so none does.
 
-### 17.8 Yen's claude.ai Project
+### 17.8 How Claude finds the guide
 
 The docs above are what Claude reads once it is in the repository; this is
-how it gets there. Yen works in one claude.ai Project, "Yen Bots", set up once
-by John, with the Zen connector enabled and these instructions:
-
-```text
-You build and change apps on Yen Bots (yenbot.com.au) for Yen, through the Zen
-connector. Before anything else in a chat, read the Zen guide `yen-apps` with
-guide_read, then follow it: it tells you what to read in the yenbot repository
-and in what order. Yen is not a coder: speak plainly, show her the result,
-and ask before anything she would not expect.
-```
-
-The text lives in `docs/claude-ai-project.md`, so a change to it is
-reviewed like any other; John copies it into the Project when it changes.
+how it gets there. Yen chats in claude.ai with the Zen connector enabled, and
+nothing else is set up. The connector's own instructions — which claude.ai
+reads when a chat starts (`mcp/served.yaml`, and zend's `INSTRUCTIONS` for
+Claude Code) — say that anything to do with Yen Bots starts with the
+`yen-apps` guide. That guide says who Yen is and how to speak to her, and
+names what to read in the repository and in what order. A change to how
+Claude approaches the site is a change to the guide, reviewed and released
+with the connector; there is no per-chat or per-Project text to copy.
 
 ## 18. Seeing what happened
 
@@ -1725,18 +1720,19 @@ Taken 2026-11-07:
 12. The admin page, usage, export, import, deleting and archiving.
 13. Templates, the repository's `docs/` derived from this design (with
     `docs/calling-the-api.md`), `CLAUDE.md`, the connector's `yen-apps` guide,
-    the `yenbot` journal, the `yenbot` Zen credential, the claude.ai Project.
+    the `yenbot` journal, the `yenbot` Zen credential, and the connector's
+    instructions naming the guide.
 14. `service_deploy`, `service_control` and `service_status` for yenbot, no
     approvals on the iteration, the estate entry, `deployment.md`.
-15. The test cases (§25), run in claude.ai through the "Yen Bots" Project,
-    every one passing.
+15. The test cases (§25), run in claude.ai with the Zen connector, every one
+    passing.
 16. Yen's first app, built by her in claude.ai from the docs alone — the test
     of everything above.
 
 ## 25. Test cases
 
 The platform is done when every case below passes, run as Yen would run it: a
-fresh chat in the "Yen Bots" claude.ai Project (§17.8), the request typed in
+fresh claude.ai chat with the Zen connector (§17.8), the request typed in
 her words, nothing else said. Claude has only the connector, the guides and
 the repository's docs. A case passes when the outcome holds on the live site
 and Claude got there by the path named, reading the guide named. A case that
