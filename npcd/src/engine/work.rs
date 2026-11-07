@@ -2111,27 +2111,52 @@ fn bench(
                 // The documents go first: it is the half somebody else's work
                 // can refuse, and a refusal has to leave everything — the
                 // working set and the record item — exactly as it was.
+                // A mission that writes a document commits that document alone
+                // (the bench's `commit_only`); anything else open stays open.
+                let only = s
+                    .missions
+                    .active(body)
+                    .and_then(|m| m.work.as_ref())
+                    .map(|w| w.writes.clone());
                 let written = match s.bench.opened(body).is_some() {
-                    true => match s.bench.commit(body, &*shelf) {
-                        Ok(w) => w,
-                        Err(collision) => {
-                            return Outcome::Refused(format!(
-                                "{collision} That is somebody to talk to, not something to try \
-                                 again."
-                            ))
+                    true => {
+                        let committed = match &only {
+                            Some(doc) => s.bench.commit_only(body, doc, &*shelf),
+                            None => s.bench.commit(body, &*shelf),
+                        };
+                        match committed {
+                            Ok(w) => w,
+                            Err(collision) => {
+                                return Outcome::Refused(format!(
+                                    "{collision} That is somebody to talk to, not something to \
+                                     try again."
+                                ))
+                            }
                         }
-                    },
+                    }
                     false => Vec::new(),
                 };
+                // What stays open after a mission's commit, said with it, so
+                // nothing left behind is mistaken for committed.
+                let left = s.bench.diff(body);
                 // Committing a document a mission writes is that step done, and
                 // what comes next is said with the commit.
                 let progress = s.missions.committed(body, &written).then(|| {
                     let next = s.missions.active(body).and_then(|m| m.next_step());
                     progress_line("It is committed", next, &[])
                 });
-                let with_progress = |line: String| match &progress {
-                    Some(p) => format!("{line}\n{p}"),
-                    None => line,
+                let with_progress = |line: String| {
+                    let line = match left.is_empty() {
+                        true => line,
+                        false => format!(
+                            "{line} Still open, and not part of this commit: {}.",
+                            left.join(", ")
+                        ),
+                    };
+                    match &progress {
+                        Some(p) => format!("{line}\n{p}"),
+                        None => line,
+                    }
                 };
                 let held = s.record.held_by(body);
                 let Some(target) = held.first().cloned() else {
@@ -2470,6 +2495,83 @@ mod tests {
     /// What `key` holds in operation [`OP`]'s store.
     fn stored(h: &Hosted, key: &str) -> Option<String> {
         h.op_shelf(OP)?.read(key)
+    }
+
+    /// **A mission's commit carries its own document and nothing else**: an
+    /// edit left in the working set from before stays open, uncommitted, and
+    /// the commit says so.
+    #[test]
+    fn a_missions_commit_carries_only_its_document() {
+        use crate::engine::mission::{Mission, Origin, Todo, Work};
+        let (h, _root) = vault_with_documents("commit-only");
+        let path = "layers/stories/the-water-schedule.md";
+        h.with_sim(|s| {
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Tell the story of the water schedule.",
+                    vec![
+                        Todo::new(format!("write {path} and commit it")),
+                        Todo::report("go back to the table and report it"),
+                    ],
+                    Origin::Generated {
+                        generator: "untold".into(),
+                        target: "era:layers/eras/third.md".into(),
+                        operation: OP,
+                        step: "write".into(),
+                    },
+                )
+                .with_work(Work {
+                    writes: path.into(),
+                    reads: vec![],
+                    min_words: 0,
+                    edit_optional: false,
+                    anew: false,
+                    checks: Vec::new(),
+                    tools: Vec::new(),
+                }),
+            )
+        });
+        // Left in the working set from earlier work.
+        let shelf = h.shelf_of("m1");
+        h.with_sim(|s| {
+            s.bench
+                .write("m1", "x", "layers/eras/third.md", "stray\n", &*shelf)
+                .unwrap()
+        });
+        assert!(perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path": path, "content": "# The Water Schedule\n\nThe clerks finished it.\n"})
+            ),
+        )
+        .happened());
+        let committed = perform(
+            &h,
+            "m1",
+            &act(
+                "bench_commit",
+                json!({"why": "the story of the water schedule"}),
+            ),
+        );
+        let line = committed.line().unwrap().to_string();
+        assert!(
+            line.contains(
+                "Still open, and not part of this commit: layers/eras/third.md (changed)."
+            ),
+            "{line}"
+        );
+        assert!(stored(&h, path).is_some());
+        assert_ne!(
+            stored(&h, "layers/eras/third.md").as_deref(),
+            Some("stray\n")
+        );
+        assert_eq!(
+            h.sim(|s| s.bench.diff("m1")),
+            ["layers/eras/third.md (changed)"]
+        );
     }
 
     /// **A mission that writes the record is reported done only once its
