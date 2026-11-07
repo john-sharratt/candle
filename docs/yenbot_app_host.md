@@ -1078,11 +1078,20 @@ Zen.
   "passthrough"` (`zend/src/api/chat.rs`, `passthrough.rs`): the app's
   messages as given, its own system prompt, streaming, a JSON schema when
   asked — none of Zen's coding projection.
-- **Pictures** go to Zen's image engine — npcd's `POST /v1/image/generate`
-  and `/v1/image/edit`, the engine behind the MCP's `image_generate` and
-  `image_edit` (`npcd/src/mcp/image.rs`). The route streams progress and then
-  the picture; yenbot relays the progress to the app and stores the picture as
-  a file of the app, so it has URLs, a thumbnail and a place in the app's data.
+- **Pictures** go to Zen's image engine — npcd's `POST /v1/image/generate`,
+  the engine behind the MCP's `image_generate` and `image_edit`
+  (`npcd/src/mcp/image.rs`). The route streams its progress a JSON line at a
+  time and ends with the picture, a PNG in base64; yenbot relays the progress
+  to the app and stores the picture as a file of the app, so it has URLs, a
+  thumbnail and a place in the app's data. A change to a picture is the same
+  route with the app's picture as its `reference` and a `reference_hold`
+  (0.5 when the app does not say), as the MCP's `image_edit` does: there is no
+  separate edit route. Sides are 64 to 1024, multiples of 16.
+- **An answer of a shape**: zend's chat takes no JSON schema, so yenbot asks
+  for JSON alone in the system prompt, reads the answer whole and holds it to
+  the schema's `type`, `properties`, `required`, `items` and `enum`
+  (`yenbot/src/ai/schema.rs`), asking once more, told why, when it does not
+  fit.
 
 **Both are reached through the gateway** on loopback — `Host:
 code.tokera.com` for text, `Host: bot.tokera.com` for pictures — so the
@@ -1091,10 +1100,12 @@ cluster routes each to a ready member, not only BlackWorld's.
 **The credential is a service key**, which is new
 (`docs/mcp_file_tools.md` §4): yenbot's key names the identity
 `service:yenbot`, the routes it may call (`/v1/chat/completions`,
-`/v1/models`, `/v1/image/generate`, `/v1/image/edit`) and the bus topics it
-may use; `host/roles.yaml` grants `service:yenbot` the user role. The key
-lives in yenbot's secrets (`D:\yenbot\secrets\zen.key`), is read at start and
-never logged, and the gateway accepts it only from its trusted backends.
+`/v1/models`, `/v1/image/generate`) and the bus topics it may use;
+`host/roles.yaml` grants `service:yenbot` the user role. It is the one key
+yenbot holds for the gateway, for the bus and for Zen alike
+(`D:\yenbot\secrets\gateway.key`), is read at start and never logged, and the
+gateway accepts it only from its trusted backends; yenbot calls the gateway
+on this machine's loopback (`gateway:` in `yenbot.yaml`, `http://127.0.0.1`).
 
 **No budget.** An app chooses its prompt, its length, its dials and its
 picture sizes, and nothing caps how much it asks for. Every call is recorded
@@ -1653,6 +1664,11 @@ Taken 2026-11-07:
 - **The push contact is the site's address**, not a person's email (§11.1).
 - **No phone test at first**: notifications are verified up to the push
   service accepting them (§11.1).
+- **All eleven templates** are built (§16).
+- **Google services are left out for now** (§19.3): secrets, outbound calls
+  and inbound hooks are built; the gateway's connect flow waits.
+- **A picture is changed through the draw route, with a reference**, and an
+  answer of a shape is held to its schema by yenbot (§14).
 
 ## 24. Order of work
 
