@@ -135,7 +135,7 @@ mod tests {
     use std::time::Instant;
 
     use candle_conversation::stencil::{
-        compile, compile_action_loop, TestVocab, ToolCallEnvelope, ToolSpec,
+        compile, compile_action_loop, Pick, TestVocab, ToolCallEnvelope, ToolSpec,
     };
 
     use super::*;
@@ -231,6 +231,22 @@ mod tests {
         assert_eq!(body.name, "body");
         assert_eq!(body.ty, ParamType::Object);
         assert!(body.required);
+    }
+
+    /// **A post must name a standing job or a brief**: the two make the choice
+    /// the body cannot close without, so `{}` is no post.
+    #[test]
+    fn a_post_must_name_a_job_or_a_brief() {
+        const POST: &str = "http://local/command/order-table~0/order_post";
+        let within = Within {
+            invokable: vec![Invokable::new(POST, "order_post")],
+            ..Within::among(&[])
+        };
+        let body = body_of_url(&within, POST);
+        for member in ["job", "brief"] {
+            assert_eq!(field(&body, member).pick, Pick::AtLeastOne, "{member}");
+        }
+        assert_eq!(field(&body, "steps").pick, Pick::None);
     }
 
     #[test]
