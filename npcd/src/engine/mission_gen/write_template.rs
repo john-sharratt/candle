@@ -37,6 +37,7 @@ workflows:
         edits: new
         desk: map-table
         checks: [committed, routine-parses]
+        tools: [file_write]
         next: publish
         prompt: |
           Write the mission template `{id}` into {document}. Write it exactly as
@@ -225,6 +226,7 @@ mod tests {
         assert_eq!(write.by, By::Maker);
         assert_eq!(write.desk.as_deref(), Some("map-table"));
         assert_eq!(write.checks, ["committed", "routine-parses"]);
+        assert_eq!(write.tools, ["file_write"], "its text is given, and written as given");
         assert!(!write.publishes());
 
         let publish = &wf.steps[1];

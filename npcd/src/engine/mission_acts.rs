@@ -303,6 +303,9 @@ pub struct Carrying {
     /// made for its agenda — which the engine closes when its steps are seen
     /// done, or its carrier with `mission_done`, never with a report.
     pub own: bool,
+    /// That mission's document is given whole in its brief, to be written as
+    /// given with `file_write` — see [`crate::engine::mission::Mission::writes_given`].
+    pub given: bool,
 }
 
 /// What `body` is carrying in `s`.
@@ -320,6 +323,7 @@ pub fn carrying(s: &Sim, body: &str) -> Carrying {
         unread: s.missions.unread_for(body),
         round_due: s.missions.is_unordered(body) && round::due_for(s, body, now_ms()),
         own: mission.is_some_and(|m| matches!(m.origin, Origin::Round { .. } | Origin::Own)),
+        given: mission.is_some_and(|m| m.writes_given()),
     }
 }
 
@@ -379,9 +383,11 @@ pub fn offered(tool: &str, c: Carrying) -> bool {
         // was written in; and a composed draft rewritten by hand afterwards
         // lost what the composing gave it — "I am writing this from the
         // chronicle level, where the light ring hums". Its Maker writes it with
-        // `compose` and puts single passages right with `file_edit`.
-        "compose" => c.drafts,
-        "file_write" => !c.drafts,
+        // `compose` and puts single passages right with `file_edit`. A document
+        // whose text the brief gives whole — a mission template — is not
+        // composed but written as given, with `file_write`.
+        "compose" => c.drafts && !c.given,
+        "file_write" => !c.drafts || c.given,
         t if NOT_FOR_OPERATIONS.contains(&t) => !c.operation,
         _ => true,
     }
@@ -407,6 +413,7 @@ mod tests {
             unread: false,
             round_due: false,
             own: false,
+            given: false,
         }
     }
 
@@ -451,6 +458,13 @@ mod tests {
         assert!(offered("compose", writing));
         assert!(!offered("file_write", writing), "written sitting down");
         assert!(offered("file_edit", writing), "a passage is still mended");
+        // A document whose text the brief gives whole is written as given.
+        let given = Carrying {
+            given: true,
+            ..writing
+        };
+        assert!(offered("file_write", given));
+        assert!(!offered("compose", given), "not composed: its text is given");
         // An unordered character is handed nothing at the table, and the table
         // is otherwise the same to it.
         let unordered = Carrying {
