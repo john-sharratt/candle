@@ -1018,9 +1018,7 @@ pub fn post_work_line(routines: &[Routine], at: Option<&str>) -> String {
             )
         }
     };
-    format!(
-        "Work is posted with {act}{what}. A notice on a board is not work: nobody takes it up."
-    )
+    format!("Work is posted with {act}{what}. A notice on a board is not work: nobody takes it up.")
 }
 
 /// The addresses a document step is done through, at the desk the body stands
