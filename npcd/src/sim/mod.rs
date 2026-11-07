@@ -811,6 +811,8 @@ impl Sim {
         other.built.carry_laid(&self.built);
         other.part_tools = std::mem::take(&mut self.part_tools);
         other.home = self.home.take();
+        // A board's lines are the world's; that the board stands is the map's.
+        other.postings.stand_up_from(&self.postings);
         *self = other;
     }
 
@@ -851,12 +853,23 @@ mod tests {
         let mut s = Sim::new();
         s.set_part_tools("moon-command/watch-room", vec!["collect_mission".to_string()]);
         s.set_home("moon-command/watch-room".to_string());
+        s.postings.stand_up("moon-command/watch-room", "the table");
+        s.postings.stand_up("moon-ward/ward-room", "the status board");
         let mut written = Sim::new();
         written.table_open = false;
+        written
+            .postings
+            .post("moon-ward/ward-room", "the status board", "Zen", "all clear");
         s.take_in(written);
         assert!(s.part_offers("moon-command/watch-room", "collect_mission"));
         assert_eq!(s.homes(), ["moon-command/watch-room"]);
         assert!(!s.table_open, "the world's own state is the record's");
+        assert_eq!(s.postable_at("moon-command/watch-room"), ["the table"]);
+        assert_eq!(
+            s.postings.unread_names_at("moon-ward/ward-room", "Wick"),
+            ["the status board"],
+            "what was written on a board the record has is kept"
+        );
     }
 
     /// **What a Maker may present is its own filed work, by name** — not

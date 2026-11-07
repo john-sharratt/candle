@@ -176,6 +176,15 @@ impl Postings {
             });
     }
 
+    /// Stand up every surface `seeded` has that this lacks, keeping whatever
+    /// is on those this already has — a world's postings taken in from a record
+    /// written before its map had a board there still have the board.
+    pub fn stand_up_from(&mut self, seeded: &Postings) {
+        for p in seeded.postings.values() {
+            self.stand_up(&p.at, &p.name);
+        }
+    }
+
     /// Everything here that can be written on, whether or not anything is on it
     /// yet — what `post_notice.on` binds to.
     ///
