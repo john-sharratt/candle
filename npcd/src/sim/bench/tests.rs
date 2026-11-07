@@ -661,7 +661,10 @@ fn only_the_template_library_is_worked_in_missions() {
         let refused = b
             .write("m1", "missions", not_a_template, "draw: none\n", &s)
             .unwrap_err();
-        assert!(refused.contains("is not somewhere anybody works"), "{refused}");
+        assert!(
+            refused.contains("is not somewhere anybody works"),
+            "{refused}"
+        );
     }
     assert_eq!(
         b.list("m1", "missions/moon/ops", &s).unwrap(),

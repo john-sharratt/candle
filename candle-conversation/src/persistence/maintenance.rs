@@ -4404,9 +4404,25 @@ mod tests {
                 let more = sp.relocate_batch(&plan, &mut run, 1).unwrap();
                 batches += 1;
                 if batches == 1 {
-                    sp.write_chunk(sid, 2, 32, 4, None, &chunk_payload(99))
+                    let rewritten = sp
+                        .write_chunk(sid, 2, 32, 4, None, &chunk_payload(99))
                         .unwrap();
                     sp.commit().unwrap();
+                    // The writer registers the rewrite in the index, as the
+                    // cold write does; a payload of the same shape has the
+                    // same length.
+                    let key = StreamKey::of(sid, &rewritten.identity);
+                    let held = substrate
+                        .stream_at(key)
+                        .and_then(|s| s.chunks.get(&2).copied())
+                        .unwrap();
+                    let at = ChunkLoc {
+                        segment: rewritten.segment,
+                        offset: rewritten.offset,
+                        record_size: rewritten.size,
+                        ..held
+                    };
+                    substrate.apply_chunk_loc(sid, 2, at, rewritten.identity);
                 }
                 if !more {
                     break;
