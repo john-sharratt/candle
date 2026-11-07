@@ -21,6 +21,7 @@
 
 use super::tools::{Availability, Example, Param, Plane, Tool};
 use crate::api::now_ms;
+use crate::engine::mission::Origin;
 use crate::engine::mission_gen::round;
 use crate::sim::Sim;
 
@@ -298,6 +299,10 @@ pub struct Carrying {
     /// what the table gives it when its agenda is empty
     /// (`docs/zen_moon_mind.md` §17.3).
     pub round_due: bool,
+    /// That mission is its carrier's own — an item of its round, or one it
+    /// made for its agenda — which the engine closes when its steps are seen
+    /// done, or its carrier with `mission_done`, never with a report.
+    pub own: bool,
 }
 
 /// What `body` is carrying in `s`.
@@ -314,6 +319,7 @@ pub fn carrying(s: &Sim, body: &str) -> Carrying {
         unordered: s.missions.is_unordered(body),
         unread: s.missions.unread_for(body),
         round_due: s.missions.is_unordered(body) && round::due_for(s, body, now_ms()),
+        own: mission.is_some_and(|m| matches!(m.origin, Origin::Round { .. } | Origin::Own)),
     }
 }
 
@@ -361,7 +367,11 @@ pub fn offered(tool: &str, c: Carrying) -> bool {
         t if t == ORDER_RESULTS.name => c.unordered && c.unread,
         // Authoring a template is the order-giver's, like posting work.
         t if t == MISSION_WRITE.name => c.unordered,
-        t if t == REPORT_DONE.name || t == REPORT_STUCK.name => c.mission,
+        // **A mission of one's own is not reported.** Offered the report, Zen
+        // filed its round's `watch-earth` done with "post work on the order
+        // table" never done — the step that is the Drones' work — and the
+        // round moved on with nothing set.
+        t if t == REPORT_DONE.name || t == REPORT_STUCK.name => c.mission && !c.own,
         t if t == REPORT_REJECTED.name => c.mission && c.review,
         "orders_report_done" => c.order,
         // **A mission's piece is written sitting down.** Written whole as one
@@ -396,6 +406,7 @@ mod tests {
             unordered: false,
             unread: false,
             round_due: false,
+            own: false,
         }
     }
 
@@ -475,5 +486,15 @@ mod tests {
         ));
         assert!(!offered("order_post", idle));
         assert!(!offered("order_results", busy));
+        // A mission of its own — a round item, or one of its agenda — is closed
+        // by its steps or by `mission_done`, never reported at the table.
+        let own = Carrying {
+            mission: true,
+            own: true,
+            ..unordered
+        };
+        assert!(!offered("report_done", own));
+        assert!(!offered("report_stuck", own));
+        assert!(offered("order_post", own));
     }
 }
