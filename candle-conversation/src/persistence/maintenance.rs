@@ -83,6 +83,7 @@ use super::record::{
 use super::relocation_watch::{Reemit, RelocationWatch};
 use super::retired::RetiredSegments;
 use super::segment::SegmentId;
+use super::stranded::{Stranded, StrandedKind, StrandedRecord};
 use super::streams::{StreamDecl, StreamId};
 use super::stripes::{stripes, MAX_STRIPE_BYTES};
 use super::survival::RecordCensus;
@@ -479,7 +480,17 @@ impl MaintenanceResult {
     /// kept. Held under a brief substrate write lock only: the cold references
     /// refreshed are those of the streams whose chunks moved, not every
     /// residence's.
-    pub fn apply_to_substrate(&self, substrate: &mut Substrate) {
+    ///
+    /// Answers every record of `plan` the index still names where the plan
+    /// found it, inside a target ([`Stranded`]): one the relocation filtered
+    /// out and the index was never moved off. Unlinking its segment would
+    /// leave it indexed but unreadable, so
+    /// [`SubstratePersistence::finish_maintenance`] keeps that segment.
+    pub fn apply_to_substrate(
+        &self,
+        plan: &MaintenancePlan,
+        substrate: &mut Substrate,
+    ) -> Stranded {
         let mut moved: HashSet<StreamId> = HashSet::new();
         for (key, idx, old, new) in &self.chunk_updates {
             let held = substrate.stream_at(*key).and_then(|s| {
@@ -533,6 +544,67 @@ impl MaintenanceResult {
             }
         }
         substrate.refresh_cold_refs_of(&moved);
+        plan.stranded_in(substrate)
+    }
+}
+
+impl MaintenancePlan {
+    /// Every record this plan found in a target that `substrate`'s index still
+    /// names there — read after the apply, so a record the apply repointed, or
+    /// one rewritten since the plan, is not among them.
+    fn stranded_in(&self, substrate: &Substrate) -> Stranded {
+        let mut out = Stranded::default();
+        let mut note = |kind, stream_id: StreamId, segment, offset| {
+            out.push(StrandedRecord {
+                kind,
+                stream_id: stream_id.0,
+                segment,
+                offset,
+            })
+        };
+        for (key, idx, old) in &self.chunk_relocs {
+            if substrate
+                .stream_at(*key)
+                .and_then(|s| s.chunks.get(idx).copied())
+                == Some(*old)
+            {
+                note(StrandedKind::Chunk, key.stream_id, old.segment, old.offset);
+            }
+        }
+        for (key, old) in &self.token_relocs {
+            if substrate.stream_at(*key).and_then(|s| s.tokens) == Some(*old) {
+                note(StrandedKind::Tokens, key.stream_id, old.segment, old.offset);
+            }
+        }
+        for (key, old) in &self.index_page_relocs {
+            let held = substrate
+                .stream_at(*key)
+                .and_then(|s| s.index_page.as_ref().and_then(IndexPage::stored));
+            if held == Some(*old) {
+                note(
+                    StrandedKind::IndexPage,
+                    key.stream_id,
+                    old.segment,
+                    old.offset,
+                );
+            }
+        }
+        for (sid, old) in &self.snapshot_relocs {
+            if substrate.recurrent_snapshot_loc(*sid) == Some(*old) {
+                note(StrandedKind::Snapshot, *sid, old.segment, old.offset);
+            }
+        }
+        for (sid, old) in &self.branch_checkpoint_relocs {
+            if substrate.branch_checkpoint_loc(*sid) == Some(*old) {
+                note(
+                    StrandedKind::BranchCheckpoint,
+                    *sid,
+                    old.segment,
+                    old.offset,
+                );
+            }
+        }
+        out
     }
 }
 
@@ -902,8 +974,8 @@ impl SubstratePersistence {
         };
         let op = plan.op;
         let result = self.execute_maintenance(&plan)?;
-        result.apply_to_substrate(substrate);
-        unlink_now(self.finish_maintenance(&plan)?)?;
+        let stranded = result.apply_to_substrate(&plan, substrate);
+        unlink_now(self.finish_maintenance(&plan, &stranded)?)?;
         Ok(Some(op))
     }
 
@@ -1791,14 +1863,49 @@ impl SubstratePersistence {
     /// the rest were dead). The sources' files come back as
     /// [`RetiredSegments`], for the caller to unlink off the owner. A
     /// read-only handle refuses with [`PersistenceError::ReadOnly`].
-    pub fn finish_maintenance(&mut self, plan: &MaintenancePlan) -> Result<RetiredSegments> {
+    ///
+    /// **A target holding a `stranded` record stays.** The index still names a
+    /// record in it that the relocation never carried
+    /// ([`MaintenanceResult::apply_to_substrate`]); dropped, the record would
+    /// be indexed but unreadable. Each such record is logged with where the
+    /// substrate and the persistence side each place it, and its segment is
+    /// left linked, its relocated copies standing beside it, for a later pass.
+    pub fn finish_maintenance(
+        &mut self,
+        plan: &MaintenancePlan,
+        stranded: &Stranded,
+    ) -> Result<RetiredSegments> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
         // The op ends here whether or not the unlink succeeds: nothing of it
         // runs on the owner after this call.
         self.end_relocation_watch();
-        let targets = plan.op.targets();
+        for record in stranded.records() {
+            let persisted = match record.kind {
+                StrandedKind::Snapshot | StrandedKind::BranchCheckpoint => self
+                    .snapshot_locs
+                    .get(&record.stream_id)
+                    .map(|loc| (loc.segment.0, loc.offset)),
+                _ => None,
+            };
+            tracing::warn!(
+                target: "candle_conversation::persistence::maintenance",
+                kind = ?record.kind,
+                stream_id = record.stream_id,
+                substrate_segment = record.segment.0,
+                substrate_offset = record.offset,
+                persisted = ?persisted,
+                "segment-maintenance: the index still names a record the relocation did not \
+                 carry; its segment stays linked",
+            );
+        }
+        let targets: Vec<SegmentId> = plan
+            .op
+            .targets()
+            .into_iter()
+            .filter(|t| !stranded.holds(*t))
+            .collect();
         let mut retired = RetiredSegments::default();
         for &t in &targets {
             self.segments.retire_sealed(t, &mut retired)?;
@@ -1895,8 +2002,8 @@ impl SubstratePersistence {
             blob_relocs: ix.blob_relocations(&op.targets()),
         };
         let result = self.execute_maintenance(&plan)?;
-        result.apply_to_substrate(substrate);
-        unlink_now(self.finish_maintenance(&plan)?)
+        let stranded = result.apply_to_substrate(&plan, substrate);
+        unlink_now(self.finish_maintenance(&plan, &stranded)?)
     }
 }
 
@@ -2597,9 +2704,9 @@ mod tests {
             "relocation credits exactly the OLD live copy's bytes as dead"
         );
 
-        result.apply_to_substrate(&mut substrate);
+        let stranded = result.apply_to_substrate(&plan, &mut substrate);
         assert_eq!(substrate.recurrent_snapshot_loc(sid), Some(new));
-        sp.finish_maintenance(&plan).unwrap().unlink();
+        sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
         assert!(!sealed_log(&dir, 1).exists(), "seg 1 compacted away");
         let decoded = SnapshotPayload::decode(&sp.read_record_payload(&new).unwrap()).unwrap();
         assert_eq!(decoded.turn_index, 2);
@@ -2648,11 +2755,12 @@ mod tests {
         let before = sp.segment_count();
         let plan = sp.plan_maintenance(&substrate, true).unwrap().unwrap();
         assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
-        sp.execute_maintenance(&plan)
+        let stranded = sp
+            .execute_maintenance(&plan)
             .unwrap()
-            .apply_to_substrate(&mut substrate);
+            .apply_to_substrate(&plan, &mut substrate);
 
-        let retired = sp.finish_maintenance(&plan).unwrap();
+        let retired = sp.finish_maintenance(&plan, &stranded).unwrap();
         assert_eq!(retired.paths(), [sealed_log(&dir, 1)]);
         assert!(sealed_log(&dir, 1).exists(), "the owner unlinked the file");
         assert_eq!(sp.segment_count(), before - 1, "the log still names seg 1");
@@ -2749,8 +2857,8 @@ mod tests {
             SegmentId(1),
             "relocated off the compacted segment"
         );
-        result.apply_to_substrate(&mut substrate);
-        sp.finish_maintenance(&plan).unwrap().unlink();
+        let stranded = result.apply_to_substrate(&plan, &mut substrate);
+        sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
         assert!(!sealed_log(&dir, 1).exists(), "seg 1 compacted away");
 
         let moved = substrate
@@ -2850,9 +2958,9 @@ mod tests {
 
         // Phase 3 + 4: the index keeps the newer tail; seg 1 still drops
         // (the stale copy is dead there).
-        result.apply_to_substrate(&mut substrate);
+        let stranded = result.apply_to_substrate(&plan, &mut substrate);
         assert_eq!(substrate.recurrent_snapshot_loc(sid), Some(loc_c));
-        sp.finish_maintenance(&plan).unwrap().unlink();
+        sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
         assert!(
             !sealed_log(&dir, 1).exists(),
             "seg 1 dropped; the stale copy died with it"
@@ -2933,8 +3041,8 @@ mod tests {
         );
         assert_eq!(sp.write_offset(), offset_before);
         assert_eq!(sp.accounting.dead_bytes(), dead_before);
-        result.apply_to_substrate(&mut substrate);
-        sp.finish_maintenance(&plan).unwrap().unlink();
+        let stranded = result.apply_to_substrate(&plan, &mut substrate);
+        sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
         assert!(!sealed_log(&dir, 1).exists());
         drop(sp);
 
@@ -2947,6 +3055,68 @@ mod tests {
             "no tail resurrected after the tombstone"
         );
         assert!(!sp.snapshot_locs.contains_key(&sid.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A tail the index still names, which the relocation did not carry,
+    /// keeps its segment.** The persistence-side live-tail map moved off the
+    /// planned tail while the substrate index kept naming it: the relocation
+    /// filters the tail out, the apply has nothing to repoint, and dropping
+    /// the segment left the tail indexed but unreadable — the fault on
+    /// BlackWorld's npcd segment 16628 (2026-11-07). The segment stays linked,
+    /// and the tail still reads.
+    #[test]
+    fn a_tail_the_index_still_names_keeps_its_segment() {
+        use crate::persistence::content_hash::snapshot_stream_id;
+        use crate::persistence::record::SnapshotPayload;
+        use crate::persistence::stranded::{StrandedKind, StrandedRecord};
+
+        let dir = tmp_dir("snap_reloc_stranded");
+        let timeline: u64 = 94;
+        let sid = snapshot_stream_id(timeline);
+
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let Stamped { value: loc_a, id } = sp
+            .write_snapshot(sid, &[&snapshot_payload(timeline, 1, 0x11)])
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_a, id);
+        let Stamped { value: loc_b, id } = sp
+            .write_snapshot(sid, &[&snapshot_payload(timeline, 2, 0x22)])
+            .unwrap();
+        substrate.apply_snapshot_loc(sid, loc_b, id);
+        sp.commit().unwrap();
+        sp.seal_active().unwrap();
+
+        let plan = sp
+            .plan_maintenance(&substrate, true)
+            .unwrap()
+            .expect("compact planned");
+        assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
+
+        // The two maps diverge: the persistence side no longer holds the
+        // tail the substrate index names.
+        sp.snapshot_locs.remove(&sid.0);
+        let result = sp.execute_maintenance(&plan).unwrap();
+        assert!(result.snapshot_updates.is_empty(), "the filter skipped it");
+
+        let stranded = result.apply_to_substrate(&plan, &mut substrate);
+        assert_eq!(substrate.recurrent_snapshot_loc(sid), Some(loc_b));
+        assert_eq!(
+            stranded.records().copied().collect::<Vec<_>>(),
+            vec![StrandedRecord {
+                kind: StrandedKind::Snapshot,
+                stream_id: sid.0,
+                segment: SegmentId(1),
+                offset: loc_b.offset,
+            }]
+        );
+        let retired = sp.finish_maintenance(&plan, &stranded).unwrap();
+        assert!(retired.paths().is_empty(), "nothing is retired");
+        retired.unlink();
+        assert!(sealed_log(&dir, 1).exists(), "seg 1 stays linked");
+        let decoded = SnapshotPayload::decode(&sp.read_record_payload(&loc_b).unwrap()).unwrap();
+        assert_eq!(decoded.turn_index, 2, "the indexed tail still reads");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3162,8 +3332,8 @@ mod tests {
                 .expect("seg 1 carries dead weight, so a pass runs");
             let op = plan.op();
             let result = sp.execute_maintenance(&plan).unwrap();
-            result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap().unlink();
+            let stranded = result.apply_to_substrate(&plan, &mut substrate);
+            sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
             assert!(
                 op.targets().contains(&SegmentId(1)),
                 "the pass targets the segment holding the character, got {op:?}"
@@ -3259,8 +3429,8 @@ mod tests {
                 .expect("seg 1 carries dead weight, so a pass runs");
             let op = plan.op();
             let result = sp.execute_maintenance(&plan).unwrap();
-            result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap().unlink();
+            let stranded = result.apply_to_substrate(&plan, &mut substrate);
+            sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
             assert!(
                 op.targets().contains(&SegmentId(1)),
                 "the pass targets the segment holding the object, got {op:?}"
@@ -4010,8 +4180,8 @@ mod tests {
                 vec![0, 1, 3],
                 "chunk 2's planned copy was superseded"
             );
-            result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap().unlink();
+            let stranded = result.apply_to_substrate(&plan, &mut substrate);
+            sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
             assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
         }
         {
@@ -4105,8 +4275,8 @@ mod tests {
                 "neither the retired section's tokens nor the turn's superseded ones"
             );
             assert!(sp.relocation_in_flight(), "in flight until the unlink");
-            result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap().unlink();
+            let stranded = result.apply_to_substrate(&plan, &mut substrate);
+            sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
             assert!(!sp.relocation_in_flight());
         }
         {
@@ -4203,8 +4373,8 @@ mod tests {
             );
             while sp.relocate_batch(&plan, &mut run, 1).unwrap() {}
             let result = sp.complete_maintenance(&plan, run).unwrap();
-            result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap().unlink();
+            let stranded = result.apply_to_substrate(&plan, &mut substrate);
+            sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
             assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
         }
         {
@@ -4310,8 +4480,8 @@ mod tests {
             sp.commit().unwrap();
             while sp.relocate_batch(&plan, &mut run, 1).unwrap() {}
             let result = sp.complete_maintenance(&plan, run).unwrap();
-            result.apply_to_substrate(&mut substrate);
-            sp.finish_maintenance(&plan).unwrap().unlink();
+            let stranded = result.apply_to_substrate(&plan, &mut substrate);
+            sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
             assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
             assert_eq!(
                 sp.origination().next_oseq(),

@@ -241,12 +241,14 @@ impl Conversation {
         let t_apply = Instant::now();
         // Guarded per record (`MaintenanceResult::apply_to_substrate`), so the
         // edit is right on whatever version it lands on.
-        self.update(|s| result.apply_to_substrate(s));
+        // What the edit left in a target keeps that target linked
+        // (`SubstratePersistence::finish_maintenance`).
+        let stranded = self.update(|s| result.apply_to_substrate(&op.plan, s));
         let apply_ms = t_apply.elapsed().as_millis() as u64;
         let t_finish = Instant::now();
         let retired = self
             .persistence
-            .call_behind(|p| p.finish_maintenance(&op.plan))
+            .call_behind(|p| p.finish_maintenance(&op.plan, &stranded))
             .map_err(|e| candle::Error::Msg(format!("substrate maintenance drop: {e}")))?;
         let finish_ms = t_finish.elapsed().as_millis() as u64;
         unlink_apart(retired, op.dir.clone());
