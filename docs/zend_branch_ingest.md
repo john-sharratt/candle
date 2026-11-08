@@ -9,11 +9,11 @@ It replaces the folder walk of `docs/zend_workspace_execution.md` §5.1 and refi
 
 ## 1. Summary
 
-Every repository in the workspace whose record is on `origin` (`docs/zend_git.md` §7.8) is ingested **from its branches as origin holds them**: every `refs/remotes/origin/*` ref, read in place, with no local branch made for any of them and nothing written to the checkout. A watcher asks origin every couple of seconds whether any branch moved — one small authenticated request per repository, on git's own wire protocol, which no API quota counts — and fetches only when something did. The fetch wakes the ingest worker.
+Every repository in the workspace whose record is on `origin` (`docs/zend_git.md` §7.8) is ingested **from its branches as origin holds them**: each `refs/remotes/origin/*` ref the ingest's whitelist names (§3.1), read in place, with no local branch made for any of them and nothing written to the checkout. A watcher asks origin every couple of seconds whether any branch moved — one small authenticated request per repository, on git's own wire protocol, which no API quota counts — and fetches only when something did. The fetch wakes the ingest worker.
 
 The ingest lists each branch tip's tree (one `ls-tree` per distinct tree, no file contents read), filters it by the same rules the folder walk used, and derives the units the two layers ingest. **A unit is keyed by what it shows, never by the commit it was found on.** A file's key is its repository, its path and its **blob id** — git's own hash of exactly the bytes `file_read` returns. A folder's key is a hash of its listing — the entries on its first page and how many it holds — and the blob ids of the files whose content its turns show. A commit only says where to read a unit's bytes from. So a branch moving forward re-ingests only the paths whose blob changed there; a file untouched since an older commit is never read again; and the same file on twenty branches is one conversation.
 
-Whatever is ingested but no longer found on any branch is tombstoned. A conversation retrieves only the ingested units whose keys its own base holds, so it never reads another branch's version of a file, and a conversation pins **origin's copy** of its branch — the same copy the ingest covers.
+Whatever is ingested but no longer found on any whitelisted branch is tombstoned. A conversation retrieves only the ingested units whose keys its own base holds, so it never reads another branch's version of a file, and a conversation pins **origin's copy** of its branch — the same copy the ingest covers.
 
 ---
 
@@ -21,7 +21,7 @@ Whatever is ingested but no longer found on any branch is tombstoned. A conversa
 
 ### Goals
 
-- Every branch on origin ingested, within `--max-depth` and the `--ingest-dir` scope, whatever is checked out.
+- Every whitelisted branch on origin ingested (§3.1), within `--max-depth` and the `--ingest-dir` scope, whatever is checked out.
 - A change on origin noticed within seconds, on GitHub, GitLab, Gitea or any smart-HTTP host, without spending REST or GraphQL quota.
 - One ingest per distinct unit of content, however many branches or commits carry it.
 - A conversation's retrieval and fast path agree with the files it actually reads.
@@ -40,6 +40,8 @@ Whatever is ingested but no longer found on any branch is tombstoned. A conversa
 ### 3.1 The record
 
 A repository's branches are its **record branches**: with an `origin` remote, every `refs/remotes/origin/<b>` except the symbolic `HEAD`; with none, every local branch. `Repo::record_branches()` returns them as `(BranchName, Oid)`, in name order. They are read locally and never touch the network — the watcher (§4) is what keeps them current.
+
+**The ingest reads only the record branches its whitelist names.** `zend/src/prompts/ingest_branches.yaml` lists branch names, matched whole and applied to every repository; `branch_ingest::record_branches` drops every other branch before a tree is walked (`branch_ingest/monitored.rs`). A branch off the list contributes no unit, so every reading only such a branch held is planned as gone and tombstoned on the next pass (§1), and maintenance reclaims its bytes; a version a listed branch shares keeps its reading. The list ships as `main` and `master`. Reading every branch cost a reading per distinct file version on each of them: on BlackWorld (2026-11-09) ~127 branches of `candle` held 3,562 `code_reading` conversations for the ~1,177 files of `main`, and the substrate reached 694 GB.
 
 No local branch is created for any of them. The ingest reads trees and blobs by id, which needs no branch at all, and a conversation that switches to one gets a local branch the ordinary way (`git_switch` pulls it, `docs/zend_git.md` §7.8).
 

@@ -1,7 +1,8 @@
 //! Ingesting the repositories' branches — `docs/zend_branch_ingest.md`.
 //!
 //! One pass, run by the ingest worker at startup and after every fetch that
-//! moved a branch: list every record branch's tree ([`walk`]), key every unit
+//! moved a branch: list the tree of every record branch the whitelist names
+//! ([`monitored`], [`walk`]), key every unit
 //! by what it shows ([`keys`]), plan each layer against what it already holds
 //! ([`plan`]), tombstone what no branch holds at any depth, and ingest what
 //! nothing holds yet within the depth bound — each unit read at the commit it
@@ -11,6 +12,7 @@
 pub mod filter;
 pub mod keys;
 pub mod manifest;
+pub mod monitored;
 pub mod order;
 pub mod plan;
 pub mod prime;
@@ -26,6 +28,7 @@ use candle_conversation::{ConversationEngine, Sequence};
 use zend_vfs::Workspace;
 
 use self::filter::IngestScope;
+use self::monitored::{keep_monitored, monitored};
 use self::plan::{plan, Committed, Live};
 use self::tie::{backfill_commits, retie};
 use self::walk::{walk, Corpus, FileItem, RepoBranches, TreeCache};
@@ -459,9 +462,15 @@ fn units(
     Ok(!jobs.is_empty() || !p.tombstone.is_empty())
 }
 
-/// Every git repository of the workspace with its record branches, and the
-/// names of those whose branches could not be read. The uploads folder and
-/// any other folder not under git have no branches and are not among either.
+/// Every git repository of the workspace with the record branches the ingest
+/// reads — those the whitelist names ([`monitored`]) — and the names of those
+/// whose branches could not be read. The uploads folder and any other folder
+/// not under git have no branches and are not among either.
+///
+/// A branch off the whitelist is dropped here, before any tree is walked, so
+/// no unit is found on it: a reading only such a branch held is planned as
+/// gone and tombstoned, and the layers above are built on the listed
+/// branches alone.
 ///
 /// Whether a folder is under git is read from the folder — a `.git` in it —
 /// never from a failure to open it: a git that cannot be spawned, a lock held
@@ -479,7 +488,10 @@ pub(crate) fn record_branches(workspace: &Workspace) -> (Vec<RepoBranches>, Vec<
             .open()
             .and_then(|repo| RepoBranches::read(&spec.name, repo));
         match read {
-            Ok(branches) => repos.push(branches),
+            Ok(mut branches) => {
+                keep_monitored(&mut branches.tips, monitored());
+                repos.push(branches);
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "zend::branch_ingest",
@@ -527,6 +539,8 @@ fn tombstone(engine: &ConversationEngine, layer: &str, timelines: &[TimelineId])
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use zend_vfs::RepoSpec;
 
     use super::*;
@@ -579,6 +593,41 @@ mod tests {
         let (repos, unreadable) = record_branches(&workspace);
         assert!(repos.is_empty());
         assert_eq!(unreadable, ["broken"]);
+    }
+
+    /// **Only the whitelisted branches are walked**: a repository on `main`
+    /// with a `topic` branch is read on `main` alone, so what only `topic`
+    /// holds is no unit and its readings plan as gone.
+    #[test]
+    fn a_branch_off_the_whitelist_is_not_walked() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "core.hooksPath=", "-c", "user.name=T"])
+                .args(["-c", "user.email=t@x"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "main"]);
+        git(&["checkout", "-q", "-b", "topic"]);
+        std::fs::write(dir.join("b.rs"), "fn b() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "topic"]);
+        let workspace = Workspace::new(root.path(), vec![RepoSpec::named("r")]).unwrap();
+        let (repos, unreadable) = record_branches(&workspace);
+        assert!(unreadable.is_empty());
+        let tips: Vec<&str> = repos[0].tips.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tips, ["main"]);
     }
 
     #[test]

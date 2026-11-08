@@ -1,0 +1,19 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# zend — The branches the ingest reads
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A whitelist, by exact name, applied to every git repository of the workspace
+# (docs/zend_branch_ingest.md §3.1). Only these branches are walked: their files
+# are read into `code_reading`, their folders into `repo_map`, and the layers
+# above are built on them.
+#
+# A branch not named here is not read. Every reading that only such a branch
+# held — a file version, a folder listing — is tombstoned on the next pass, and
+# the substrate's maintenance reclaims its bytes. A version a listed branch
+# shares keeps its reading.
+#
+# Add a name to have a branch read; remove one to drop its readings. A
+# repository with none of these branches has nothing read and nothing kept.
+branches:
+  - main
+  - master
