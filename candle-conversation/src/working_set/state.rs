@@ -108,6 +108,10 @@ pub struct WorkingSet {
     /// keeps its place — evicting it would rebuild the slot past it for one
     /// file's tokens.
     withheld: HashSet<TimelineId>,
+    /// Each conversation's fresh score in the last scan folded in
+    /// ([`Self::observe`]) — whether the reasoning was on it then, apart from
+    /// the momentum it has carried since.
+    fresh: HashMap<TimelineId, f32>,
 }
 
 impl WorkingSet {
@@ -162,6 +166,12 @@ impl WorkingSet {
     /// `timeline`'s momentum, when it has any.
     pub fn momentum_of(&self, timeline: TimelineId) -> Option<f32> {
         self.momentum.get(&timeline).copied()
+    }
+
+    /// `timeline`'s fresh score in the last scan folded in: `0` for one that
+    /// scan did not score.
+    pub fn fresh_of(&self, timeline: TimelineId) -> f32 {
+        self.fresh.get(&timeline).copied().unwrap_or(0.0)
     }
 
     /// Tokens every member together holds.
@@ -350,6 +360,7 @@ impl WorkingSet {
                 *self.momentum.entry(timeline).or_insert(0.0) += score;
             }
         }
+        self.fresh.clone_from(fresh);
         self.momentum
             .retain(|timeline, m| *m >= min_momentum || locked.contains(timeline));
 
@@ -560,6 +571,20 @@ mod tests {
     fn observe(ws: &mut WorkingSet, fresh: &[(u64, f32)], budget: usize) {
         let fresh: HashMap<TimelineId, f32> = fresh.iter().map(|&(r, s)| (tl(r), s)).collect();
         ws.observe(&fresh, 0.2, 100.0, limits(budget), NonZeroUsize::MAX, &info);
+    }
+
+    /// **A fresh score is the last scan's alone**, apart from momentum: a
+    /// member the next scan does not score reads `0` though its momentum
+    /// keeps it placed.
+    #[test]
+    fn a_fresh_score_is_the_last_scans_alone() {
+        let mut ws = WorkingSet::default();
+        observe(&mut ws, &[(1, 900.0), (2, 300.0)], 1_000);
+        assert_eq!((ws.fresh_of(tl(1)), ws.fresh_of(tl(2))), (900.0, 300.0));
+        observe(&mut ws, &[(2, 150.0)], 1_000);
+        assert_eq!((ws.fresh_of(tl(1)), ws.fresh_of(tl(2))), (0.0, 150.0));
+        assert_eq!(ws.momentum_of(tl(1)), Some(720.0));
+        assert!(ws.is_member(tl(1)));
     }
 
     /// **A withheld conversation does not enter, and a withheld member stays**:
