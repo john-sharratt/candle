@@ -7,9 +7,12 @@ const URL = '/index.html?mock=1';
 
 // Boot the app. By design the home page no longer auto-selects a conversation;
 // pass `{ conv: id }` to open one via the URL hash (the same path a reload uses to
-// restore the chat the user had open).
+// restore the chat the user had open). Each boot is a fresh load: a second
+// `goto` that changes only the hash is a same-document navigation, and the page
+// reads the hash only as it loads.
 async function boot(page, opts) {
   const conv = opts && opts.conv;
+  await page.goto('about:blank');
   await page.goto(conv ? (URL + '#conv=' + encodeURIComponent(conv)) : URL);
   await page.waitForFunction(() => window.__ZEND_READY__ === true);
 }
@@ -72,18 +75,18 @@ test.describe('1.0b home page on load', () => {
 });
 
 test.describe('1.1 sidebar', () => {
-  test('collapsed rail by default; expands and collapses', async ({ page }) => {
+  test('open sidebar by default on a desktop; collapses to the rail and expands', async ({ page }) => {
     await boot(page);
-    expect(await page.locator('.z-rail').count()).toBe(1);
-    await page.getByTitle('Expand sidebar').click();
     await expect(page.locator('.z-sb')).toBeVisible();
+    await expect(page.locator('.z-rail')).toHaveCount(0);
     await page.getByTitle('Collapse sidebar').click();
     await expect(page.locator('.z-rail')).toBeVisible();
+    await page.getByTitle('Expand sidebar').click();
+    await expect(page.locator('.z-sb')).toBeVisible();
   });
 
   test('show-archived reveals archived rows; archiving asks first', async ({ page }) => {
     await boot(page);
-    await page.getByTitle('Expand sidebar').click();
     // archived conv (#5) hidden by default
     await expect(page.getByText('Scratch notes on WS reconnect backoff')).toHaveCount(0);
     await page.getByText('Show archived').click();
@@ -95,7 +98,6 @@ test.describe('1.1 sidebar', () => {
 
   test('selecting a conversation hydrates it', async ({ page }) => {
     await boot(page);
-    await page.getByTitle('Expand sidebar').click();
     await page.getByText('Explain the tokenizer ChatML decoder').click();
     // lazy hydrate fills an assistant bubble
     await expect(page.locator('.zmd').first()).toBeVisible();
@@ -147,13 +149,14 @@ test.describe('1.2 chat rendering', () => {
     await expect(page.locator('.copy-btn').first()).toHaveText(/Copied/);
   });
   test('per-turn copy button copies the whole turn', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     const btn = page.locator('.z-turn-copy').first();
     await btn.click();
     await expect(btn.locator('span')).toHaveText('Copied');
   });
   test('chat turns are text-selectable (not preventDefault-blocked)', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
+    await expect(page.locator('.z-turn.z-selectable').first()).toBeVisible();
     // The global mousedown handler must not cancel selection inside a turn.
     const blocked = await page.evaluate(() => {
       const turn = document.querySelector('.z-turn.z-selectable');
@@ -169,8 +172,8 @@ test.describe('1.2 chat rendering', () => {
 test.describe('1.3 streaming', () => {
   test('sending streams tokens into a new assistant bubble', async ({ page }) => {
     await boot(page);
-    await page.getByTitle('Expand sidebar').click();
     await page.getByText('Why is decode latency spiking under load?').click();
+    await expect(page.locator('.zmd').first()).toBeVisible();
     const ta = page.locator('#zend-prompt');
     await ta.fill('Give me the short version');
     await ta.press('Enter');
@@ -182,8 +185,8 @@ test.describe('1.3 streaming', () => {
 test.describe('1.3a a long write shows as it is written', () => {
   test('the writing box shows the file and its text mid-call, then gives way to the card', async ({ page }) => {
     await boot(page);
-    await page.getByTitle('Expand sidebar').click();
     await page.getByText('Why is decode latency spiking under load?').click();
+    await expect(page.locator('.zmd').first()).toBeVisible();
     const ta = page.locator('#zend-prompt');
     await ta.fill('write up the redo log as a doc');
     await ta.press('Enter');
@@ -202,8 +205,9 @@ test.describe('1.3a a long write shows as it is written', () => {
 test.describe('1.3b a failed send', () => {
   async function sendFailing(page, failure) {
     await boot(page);
-    await page.getByTitle('Expand sidebar').click();
     await page.getByText('Why is decode latency spiking under load?').click();
+    // A conversation still loading takes no send.
+    await expect(page.locator('.zmd').first()).toBeVisible();
     await page.evaluate((f) => { window.__ZEND_MOCK_SEND_FAILURE__ = f; }, failure);
     const ta = page.locator('#zend-prompt');
     await ta.fill('Give me the short version');
@@ -283,8 +287,7 @@ test.describe('1.3c a reply runs on while another conversation answers', () => {
     await ta.press('Enter');
     await expect(page.locator('.zcursor')).toBeVisible({ timeout: 5000 });
 
-    await page.getByTitle('Expand sidebar').click();
-    await page.getByText('How does a request flow?').click();
+    await page.locator('.z-sb').getByText('How does a request flow?').click();
     await expect(reply).toContainText(END, { timeout: 15000 });
     await expect(page.locator('.zcursor')).toHaveCount(0, { timeout: 5000 });
     await expect(page.locator('.zerr')).toHaveCount(0);
@@ -311,7 +314,6 @@ test.describe('1.5b dials follow the conversation', () => {
 
   test('opening a conversation adopts the dials it last ran at', async ({ page }) => {
     await boot(page);
-    await page.getByTitle('Expand sidebar').click();
     await page.getByText('Why is decode latency spiking under load?').click();
     await expect(page.locator('.zmd').first()).toBeVisible();
     // The mock reports effort 3 / verbosity 1 / tools 1 for every conversation.
@@ -320,7 +322,6 @@ test.describe('1.5b dials follow the conversation', () => {
 
   test('a new conversation returns to the composer defaults', async ({ page }) => {
     await boot(page);
-    await page.getByTitle('Expand sidebar').click();
     await page.getByText('Why is decode latency spiking under load?').click();
     await expect.poll(() => dialNames(page)).toEqual(['Deep', 'Concise', 'Restricted']);
     await page.getByTitle('New conversation').first().click();
@@ -364,7 +365,6 @@ test.describe('1.5 composer dials', () => {
     await page.getByTitle('Thinking effort').click();
     await page.getByRole('button', { name: /Off/ }).click();
     // new conversation, send
-    await page.getByTitle('Expand sidebar').click();
     await page.getByTitle('New conversation').first().click();
     const ta = page.locator('#zend-prompt');
     await ta.fill('walk me through the request lifecycle');
@@ -378,7 +378,9 @@ test.describe('1.5 composer dials', () => {
     const ask = async (verb) => {
       await page.getByTitle('New conversation').first().click().catch(() => {});
       await page.getByTitle('Response length').click();
-      await page.getByRole('button', { name: new RegExp(verb) }).click();
+      // The level's button names it and what it means ("Terse a line or
+      // two"); the tools dial's "Comprehensive" names only itself.
+      await page.getByRole('button', { name: new RegExp('^' + verb + ' ') }).click();
       const ta = page.locator('#zend-prompt');
       await ta.fill('give me the lifecycle overview');
       await ta.press('Enter');
@@ -392,24 +394,31 @@ test.describe('1.5 composer dials', () => {
 });
 
 test.describe('1.6 projection timeline', () => {
-  test('active conversation seeds dots; hover shows popover; click opens substrate', async ({ page }) => {
+  test('a turn draws its projection bars; hover shows the popover; click opens the selection', async ({ page }) => {
     await boot(page, { conv: '1' });
-    await expect(page.locator('.z-dot')).toHaveCount(7);
-    await page.locator('.z-dot').first().hover();
-    await expect(page.getByText('unbounded context')).toBeVisible();
-    await page.locator('.z-dot').first().click();
-    await expect(page.getByText('Windowed substrate')).toBeVisible();
+    const bars = page.locator('.z-projbar');
+    await expect(bars.first()).toBeVisible();
+    await bars.first().hover();
+    await expect(page.getByText('materialized context')).toBeVisible();
+    await bars.first().click();
+    await expect(page.getByText('Projection selection')).toBeVisible();
   });
 });
 
-test.describe('1.7 windowed substrate', () => {
-  test('opens with sections; assistant section expanded by default; copy all', async ({ page }) => {
+// The panel is kept in the page across renders while what it shows is
+// unchanged, so the status and job polls that re-render the page leave it —
+// and its scroll — alone.
+test.describe('1.7 projection selection', () => {
+  test('opens onto its selection, survives re-renders, and copies all', async ({ page }) => {
     await boot(page, { conv: '1' });
-    await page.locator('.z-dot').last().click();
-    await expect(page.getByText('Windowed substrate')).toBeVisible();
-    await expect(page.getByText('kv-inject').first()).toBeVisible();
-    await page.getByText('Copy all').click();
-    await expect(page.getByText('Copied')).toBeVisible();
+    await page.locator('.z-projbar').last().click();
+    const panel = page.locator('.z-modal', { hasText: 'Projection selection' });
+    await expect(panel.getByRole('button', { name: 'Copy all' })).toBeVisible();
+    const kept = await panel.elementHandle();
+    await page.waitForTimeout(2500); // past a status poll's re-render
+    expect(await kept.evaluate((el) => el.isConnected)).toBe(true);
+    await panel.getByRole('button', { name: 'Copy all' }).click();
+    await expect(panel.getByRole('button', { name: 'Copied' })).toBeVisible();
   });
 });
 
@@ -423,7 +432,7 @@ test.describe('1.8 files + upload', () => {
   });
 
   test('markdown file renders as markdown; csv as a table', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     await page.getByTitle('Conversation files').click();
     await page.getByText('substrate-schema.md').click();
     // The .md body renders through the markdown pipeline (heading element),
@@ -462,7 +471,7 @@ test.describe('1.8 files + upload', () => {
     // closed); the viewer places the measured upload time in its header.
     await tile.click();
     await expect(page.getByText('Download')).toBeVisible();
-    await expect(page.getByText(/Uploaded in/)).toBeVisible();
+    await expect(page.locator('.z-modal').getByText(/^Uploaded [\d.]+ MB/)).toBeVisible();
   });
 
   test('drag-drop runs the three stages (upload, read, summarize), then completes', async ({ page }) => {
@@ -545,7 +554,6 @@ test.describe('1.11 opening a conversation', () => {
 
   test('the pane shows the conversation loading, under its title, until the history lands', async ({ page }) => {
     await boot(page);
-    await page.getByTitle('Expand sidebar').click();
     await page.getByText('Explain the tokenizer ChatML decoder').click();
     // Never the home page: the conversation's own pane, loading.
     await expect(page.locator('.z-convload')).toBeVisible();
@@ -791,16 +799,19 @@ test.describe('1.10 cross-cutting', () => {
 
   test('Escape closes overlays in priority order', async ({ page }) => {
     await boot(page, { conv: '1' });
-    await page.locator('.z-dot').first().click();
-    await expect(page.getByText('Windowed substrate')).toBeVisible();
+    await page.locator('.z-projbar').first().click();
+    await expect(page.getByText('Projection selection')).toBeVisible();
     await page.keyboard.press('Escape');
-    await expect(page.getByText('Windowed substrate')).toHaveCount(0);
+    await expect(page.getByText('Projection selection')).toHaveCount(0);
   });
 
   test('composer keeps focus when clicking a non-input element', async ({ page }) => {
     await boot(page, { conv: '1' });
+    await expect(page.locator('.zmd').first()).toBeVisible();
     await page.locator('#zend-prompt').click();
-    await page.locator('.z-chatscroll').click({ position: { x: 200, y: 50 } }).catch(() => {});
+    // The scroller's own padding: inert chrome. A turn's text is selectable,
+    // so a press on it is the reader's, and is let through.
+    await page.locator('.z-chatscroll').click({ position: { x: 6, y: 6 } });
     expect(await page.evaluate(() => document.activeElement && document.activeElement.id)).toBe('zend-prompt');
   });
 });

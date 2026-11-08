@@ -2852,6 +2852,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       return out.length > 1 ? out : null;
     };
     const barFor = (sp, idx) => h('div', {
+      class: 'z-projbar',
       onMouseEnter: (e) => { e.currentTarget.style.filter = 'brightness(1.4)'; showProjPopover(sp, e.currentTarget); },
       onMouseLeave: (e) => { e.currentTarget.style.filter = 'none'; hideProjPopover(); },
       onClick: () => { hideProjPopover(); openSubstrate(sp, m); },
