@@ -12,6 +12,10 @@
 //! what its world does around it — waits in its inbox, and the turn after it
 //! resumes reads it bounded per source (`Scheduler::suspend`).
 //!
+//! Its conversation is let go as it is suspended (`Runtime::follow_suspended`):
+//! its engine slot and resident K/V are freed for other work, and the turn it
+//! takes once resumed rejoins the conversation from the log.
+//!
 //! A lease may still move it, as it moves any character: a hand-back takes no
 //! turn, and the member it lands on holds it suspended from its first moment,
 //! since every member follows the record. Pinning it instead would stall a

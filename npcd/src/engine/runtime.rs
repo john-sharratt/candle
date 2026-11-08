@@ -3739,14 +3739,23 @@ impl Runtime {
     /// say — after this member writes a suspension or a state edit, and after
     /// the cast takes in records written on other members, so every member
     /// holds the same characters still.
+    ///
+    /// A character suspended here also lets its conversation go
+    /// ([`Minds::let_go`]): its engine slot and resident K/V are freed for
+    /// other work, and the turn it takes once resumed rejoins the conversation
+    /// from the log. Kept open, a suspended cast would take no turns and still
+    /// hold the card.
     pub fn follow_suspended(&self) {
         let Some(npcs) = self.npcs() else {
             return;
         };
+        let minds = self.minds.read().unwrap().clone();
         for (npc, suspended) in self.scheduler.follow_suspended(npcs.view().suspended()) {
             if suspended {
+                let freed = minds.as_ref().is_some_and(|m| m.let_go(npc));
                 tracing::info!(
                     npc,
+                    freed,
                     "character suspended: it takes no turn until it is resumed"
                 );
             } else {

@@ -835,7 +835,9 @@ guardian does not scan it, and nothing it would think, reflect, dream or draft i
 is how an operator takes the whole cast's load off the card for other work. The routes that decode
 for a character directly — `ask`, `reflect`, `dream`, `journal/draft` — refuse a suspended one with
 `409 npc_suspended`. Every other state (`active`, `idle`, `asleep`) is its owner's word for it and
-changes nothing. A turn already decoding when it is suspended finishes.
+changes nothing. A turn already decoding when it is suspended finishes. Its conversation is let go
+as it is suspended: its engine slot and resident K/V are freed, so a suspended cast holds none of
+the card, and the first turn after the resume rejoins the conversation from the log.
 
 Everything that reaches it meanwhile (a message, a thought, an interaction line, what its world
 does around it) waits in its inbox, and nothing is dropped while the member holding it runs; the
