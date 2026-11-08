@@ -415,14 +415,27 @@ is `npcd/src/engine/zen_task/` (acts, zend calls, the task step) and
 
 ### Phase 7 — Maintenance templates and the cleanup pass
 
-- **The library:** `battle-mind:missions/<world>/maintenance/` (`world.rs:22-25,
-  229-236`), `<world>` the world Zen lives in.
-- **`journal-maintenance`** and **`guide-maintenance`.** Steps, maker never the
-  checker:
+- **Where they live:** `journal-maintenance` and `guide-maintenance` are
+  standing missions of the world Zen lives in, `battle-mind:standing/moon/`
+  (`npcd/src/engine/mission_gen/standing.rs`), put up by the table once a day
+  (`every: 1d`) in the watch room. A standing mission grants the task acts
+  (`task_start`, `task_reply`, `task_nudge`) beside the building acts, and its
+  steps may be flagged `critical` as a template's are. The gated landing is a
+  template, `battle-mind:missions/moon/maintenance/land-journal-maintenance.yaml`
+  (`branch`, `why`), whose first step — landing the branch — is critical; Zen
+  issues it when a night's report names a held branch.
+- **One task per mission.** The engine signs off every "see the task through"
+  step at once when the task reports done, so each mission drives one task, and
+  the task keeps the maker apart from the checker itself: it surveys, starts a
+  `reviewer` task that verifies its proposals, and applies only what that task
+  confirms. Steps, maker never the checker:
   1. **Survey**, read only: candidates with evidence — a line whose `source`
      changed on main, a line past `expires`, a line off its journal's cue, a
      duplicate, a cut summary; for guides, a tool not served, a guide not
-     present, a template without `role`.
+     present, a template without `role`. Every rule but the cue is mechanical:
+     `journals::tree::survey`, run by `journal_check {survey: true, code}` and
+     `journals survey <dir> [--code <checkout>]`; the cue is the task's
+     judgement.
   2. **Operations**, not prose: move, supersede-with-source, expire, merge,
      forget.
   3. **Verify** by a second task against the source on main.
@@ -430,20 +443,24 @@ is `npcd/src/engine/zen_task/` (acts, zend calls, the task step) and
      for guides), runs `journal_check --against <base> --budget` (or the guide
      tests), and pushes `journals` to `main` (its standing rule) or `candle`'s
      guides to a `zen/` branch for the user.
-  5. **Gate:** within budget it lands; a split, merge, rename or a change past
-     the budget is a `critical` step for the authorizers, failing safe; a
-     correction about a person is a proposal for that person.
+  5. **Gate:** within budget (`lines_moved: 20`, `summaries_rewritten: 10`,
+     nothing created or removed) it lands; a split, merge, rename or a change
+     past the budget goes to `maintenance/<date>` and lands only through
+     `land-journal-maintenance`, whose critical step waits on the authorizers,
+     failing safe; a correction about a person is a proposal for that person.
+     Guide changes never land themselves: they go to a `zen/` branch for John.
   6. **Report:** the mission's report, through npcd's reports to the
-     authorizers.
-- **Trigger:** nightly.
+     authorizers, naming any branch that waits.
+- **Trigger:** nightly — the standing missions' `every: 1d`.
 - **The cleanup pass** is the first run of `journal-maintenance`, issued by hand
   once the release is live: re-file `people/john`; supersede the stale
   `workers-threads` and `ingest` lines; expire the reminders; forget the stored
   instruction; move every existing episode line into its conversation's activity
   record (ids kept) and remove its entry file; rebuild the cut summaries.
-- **Tests:** each template loads (`routine-parses`); the survey's candidate rules
-  on a fixture tree with raw expected candidates; a budget breach raising the
-  critical step.
+- **Tests:** a maintenance standing mission parses with the task grants and a
+  critical step (`standing.rs`); the survey's candidate rules on a fixture tree
+  with raw expected candidates (`survey.rs`); a budget breach is
+  `compare::Budget::over`'s (Phase 2).
 
 ### Phase 8 — Review, measure, merge, release
 

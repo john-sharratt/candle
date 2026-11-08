@@ -243,11 +243,16 @@ steps:
   is the table's, not Zen's; its report is filed for every body there that gives orders all the
   same, and each is told, so Zen knows what the world did (`Origin::Standing { id, room }`).
 - **Its grants.** The world-building acts (§14) a carrier may use while it carries it, and only
-  in its room.
+  in its room; and the task acts (`task_start`, `task_reply`, `task_nudge`,
+  `docs/mission_templates.md` §7), offered wherever it is carried — the nightly
+  `journal-maintenance` and `guide-maintenance` drive a task of Zen's
+  (`docs/zen_memory_and_guides.md` Phase 7).
 - **Steps the engine signs off.** A `go to …` step is signed off by the journey; a step that
   begins `survey` by `survey_network` landing; a step that begins `put each device found` once
-  the room has been surveyed and no device the survey found is without a part. Any other step is
-  the carrier's to report.
+  the room has been surveyed and no device the survey found is without a part; `see the task
+  through` once its task reports done. A step may be flagged `{text, critical: true}`, as a
+  template's may, and then waits on an authorizer's go-ahead. Any other step is the carrier's
+  to report.
 
 The routines of `missions/life.yaml` are standing missions in all but name; they become
 `standing/life/*.yaml` with an `every`, and the maintenance catalogue (§8.3) is the standing

@@ -14,6 +14,8 @@ use npc_map::MapSet;
 
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::mission::{Mission, Origin, Todo};
+use crate::engine::mission_gen::world::Step;
+use crate::engine::zen_task::TASK_ACTS;
 use crate::mind::files::MindFiles;
 use crate::sim::missions::Missions;
 
@@ -51,7 +53,9 @@ pub struct Standing {
     pub rooms: Rooms,
     pub every: Every,
     pub grants: Vec<String>,
-    pub steps: Vec<String>,
+    /// Its steps, each plain or flagged `critical` — a step that waits on an
+    /// authorizer (`docs/mission_templates.md` §6), as a template's does.
+    pub steps: Vec<Step>,
 }
 
 #[derive(Deserialize)]
@@ -64,7 +68,14 @@ struct File {
     every: String,
     #[serde(default)]
     grants: Vec<String>,
-    steps: Vec<String>,
+    steps: Vec<Step>,
+}
+
+/// Whether `act` is one a standing mission may grant: a building act, or a
+/// task act — a maintenance mission's carrier drives a task of Zen's
+/// (`crate::engine::zen_task`).
+fn grantable(act: &str) -> bool {
+    BUILD_ACTS.iter().chain(TASK_ACTS).any(|t| t.name == act)
 }
 
 /// A period as written — `30m`, `6h`, `2d` — in milliseconds.
@@ -93,7 +104,7 @@ impl Standing {
             return Err(format!("{file}: the id `{}` is not kebab-case", f.id));
         }
         if f.brief.trim().is_empty()
-            || f.steps.iter().any(|s| s.trim().is_empty())
+            || f.steps.iter().any(|s| s.text().trim().is_empty())
             || f.steps.is_empty()
         {
             return Err(format!(
@@ -120,11 +131,7 @@ impl Standing {
                 "{file}: `every` is `never` or a period — `30m`, `6h`, `2d`"
             ))?),
         };
-        if let Some(g) = f
-            .grants
-            .iter()
-            .find(|g| !BUILD_ACTS.iter().any(|t| t.name == g.as_str()))
-        {
+        if let Some(g) = f.grants.iter().find(|g| !grantable(g)) {
             return Err(format!("{file}: `{g}` is no act a mission can grant"));
         }
         Ok(Standing {
@@ -164,7 +171,14 @@ impl Standing {
     /// `table`.
     pub fn mission(&self, room: &Where, room_name: &str, table: Option<&str>) -> Mission {
         let fill = |s: &str| s.replace("{room}", room_name);
-        let mut todo: Vec<Todo> = self.steps.iter().map(|s| Todo::new(fill(s))).collect();
+        let mut todo: Vec<Todo> = self
+            .steps
+            .iter()
+            .map(|s| match s.is_critical() {
+                true => Todo::critical(fill(s.text())),
+                false => Todo::new(fill(s.text())),
+            })
+            .collect();
         todo.push(Todo::report(match table {
             Some(t) => format!("go back to the table in {t} and report it"),
             None => "go back to the table and report it".to_string(),
@@ -356,6 +370,42 @@ mod tests {
             let e = Standing::parse("f", &bad).unwrap_err();
             assert!(e.contains(why), "{e}");
         }
+    }
+
+    /// **A maintenance mission grants the task acts and may flag a step
+    /// critical**: its mission carries the grants and a critical todo, and an
+    /// act no mission can grant is still refused.
+    #[test]
+    fn a_standing_mission_drives_a_task_and_flags_a_critical_step() {
+        let yaml = "id: journal-maintenance\nbrief: Keep the journals true.\n\
+                    where: [vault-casting/green-room]\nevery: 1d\n\
+                    grants: [task_start, task_reply, task_nudge]\nsteps:\n\
+                    \x20 - start the journal maintenance task\n  - see the task through\n\
+                    \x20 - text: land the held branch\n    critical: true\n";
+        let s = Standing::parse("standing/moon/journal-maintenance.yaml", yaml).unwrap();
+        assert_eq!(s.every, Every::Period(86_400_000));
+        let m = s.mission(
+            &Where::new("vault-casting", "green-room"),
+            "the green room",
+            Some("the command room"),
+        );
+        assert_eq!(m.grants, ["task_start", "task_reply", "task_nudge"]);
+        let steps: Vec<(&str, bool)> = m
+            .todo
+            .iter()
+            .map(|t| (t.text.as_str(), t.critical))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("start the journal maintenance task", false),
+                ("see the task through", false),
+                ("land the held branch", true),
+                ("go back to the table in the command room and report it", false),
+            ]
+        );
+        let e = Standing::parse("f", &yaml.replace("task_nudge", "task_delete")).unwrap_err();
+        assert!(e.contains("`task_delete` is no act"), "{e}");
     }
 
     /// **One per room, never two at once, and with `every: never` once ever**:
