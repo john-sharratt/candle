@@ -134,21 +134,34 @@ by a factor that depends on the class:
 So the live native slots are the demand's measure, and the factor per class is
 learned from what migrates actually allocate rather than assumed.
 
-**Target per class** (Band and Record kinds alike):
+**Target per class, read from what VRAM holds now.** The quant slots live on
+the card are mostly what migrates produced, so their mix is the factor. Band
+and Record kinds are kept apart:
 
 ```
-pending      = live native (R16 + F16) slots             (per backing)
-factor(c)    = EWMA of (slots allocated in c) / (native slots migrated),
-               over each migrate install
-target(c)    = clamp( ceil(pending × factor(c)),
-                      floor = one arena of c,
-                      cap   = RESERVE_CAP × KV regions, split by factor )
+pending     = live native (R16 + F16) slots                     (per backing)
+band(c)     = live slots of quant band class c
+record(c)   = live slots of record class c
+factor(c)   = band(c)   / Σ band               for a quant band class
+            = record(c) / Σ band               for a record class
+target(c)   = clamp( ceil(pending × factor(c)),
+                     floor = one arena of c,
+                     cap   = RESERVE_CAP × KV regions, split by factor )
 ```
 
-- **`factor`** is measured at each install (the group's per-class destination
-  allocations over its native source slots) and smoothed with α = 0.2. Until
-  a class has a measurement it is held at its floor, one arena, which is
-  today's reserve.
+- **Why that is the factor.** A native slot becomes one band slot, in the
+  class its block was chosen for. So each band class's share of the live quant
+  band slots is its per-native-slot factor, and those shares sum to 1. Records
+  ride in proportion to bands, so a record class's live slots over all quant
+  band slots is its factor.
+- **Every term is a counter the pools keep** (`kv_gpu_class_stats`). No scan
+  and no learning state.
+- **Where it errs.** Quant KV that stays hot is weighted toward active
+  conversations and galleries, so when chat rather than ingest dominates, the
+  split can differ from a burst of file readings. The total is unaffected,
+  and the one-arena floor per class absorbs a small split error.
+- **Cold start.** With no quant slots live, every class sits at its floor,
+  which is today's reserve.
 - **`pending`** is the native classes' live slot counts, which the pools
   already hold. One counter read, no scan. A hot copy kept beside its warm
   copy (a conversation still active) counts too, so `pending` can overstate
