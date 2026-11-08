@@ -18,7 +18,7 @@ These were settled in conversation on 2026-11-08 and are not reopened here.
 
 | Decision | Choice | Why |
 |---|---|---|
-| Playback engine | **rekordbox 7.2.19**, with the DDJ-FLX4 attached natively | It already plays streaming audio, analyses tracks, beat-syncs, and runs the FLX4 with its full feature set. Writing our own audio engine buys nothing for this event. |
+| Playback engine | **rekordbox 7** (7.2.19 installed 2026-11-08), with the DDJ-FLX4 attached natively | It already plays streaming audio, analyses tracks, beat-syncs, and runs the FLX4 with its full feature set. Writing our own audio engine buys nothing for this event. |
 | Audio source | **TIDAL** (Individual + DJ Extension), logged in inside rekordbox | Spotify inside rekordbox was tried and is not good enough. TIDAL tracks can be analysed and stored offline. |
 | Taste and requests | **Spotify** — both accounts' history and likes, plus a shared request playlist | That is where John's and Yen's music lives and where requests are made from a phone. |
 | Where the party is | **John's home, where BlackWorld is** | The FLX4, the monitors and the TV are cabled straight to BlackWorld; nothing of the set crosses the network but Zen's choices. |
@@ -52,7 +52,7 @@ Automix stays, as the safety net below ZenJ (§7.4), not as ZenJ.
  │                         the conductor (§6) — beat-accurate, no model           │
  │                                   │ virtual MIDI          ▲ deck state        │
  │  visuals (§8) ◄── beat + audio     ▼                       │ (memory reader)   │
- └────────────────────────────── rekordbox 7.2.19 ────────────┘────────────────┘
+ └────────────────────────────── rekordbox 7 ─────────────────┘────────────────┘
                                    │ ▲
                          DDJ-FLX4  │ │  John's / Yen's hands
                      (sound card)  ▼ │
@@ -197,9 +197,11 @@ extrapolated. Upstream issue #63 reports wrong phrase data for local files on 7.
 own reader, starting from those offsets and the fork's offset-finding method, and reads the track
 id rather than the title (the title then comes from the library, §4.1).
 
-**rekordbox is pinned to 7.2.19 until after New Year's Eve**: automatic updates off. An update moves
-the memory layout, and the reader would read nothing — or worse, the wrong thing. The reader
-therefore validates what it reads every sample (a track id that exists in the library, a BPM in
+**rekordbox takes its updates until the freeze, and is held from then.** An update moves the memory
+layout, so after each one the reader's offsets are found again with the offset-finding method above,
+about an hour a release. From 2026-12-20 the version that was rehearsed on is held, with rekordbox's
+update check off, so nothing moves under the reader before the night. The reader validates what it
+reads every sample (a track id that exists in the library, a BPM in
 range, a beat position that advances with time) and reports itself `blind` rather than guess. A
 blind reader drops ZenJ to Automix (§7.4).
 
@@ -302,7 +304,7 @@ functions it drives. The full list of learnable functions — in particular brow
 sync, tempo, channel fader, trim, EQ high/mid/low, filter, beat FX on/off and level, loop in/out,
 hot cues 1–8; and globally: crossfader, browser up/down, the sampler pads, Automix on/off.
 
-The map lives in `zenj/maps/rekordbox-7.2.19.yaml` and is loaded with the round's rule: a control
+The map lives in `zenj/maps/rekordbox-7.yaml` and is loaded with the round's rule: a control
 named twice, or a message used twice, is refused at load, naming the file and the fault.
 
 What the earlier design learned about MIDI still applies: running status, SysEx termination,
@@ -411,7 +413,8 @@ runs during the set.
 
 - **Event mode on BlackWorld**, 2026-12-31 18:00 to 2027-01-01 06:00: no deploys of anything (keep
   refuses trials), ingest and calibration paused, the GPU's share for inference reduced.
-- **Freeze**: rekordbox 7.2.19 pinned; `zenj` frozen on 2026-12-20; the map file frozen with it.
+- **Freeze, 2026-12-20**: the rekordbox version rehearsed on is held with its update check off; `zenj`
+  and the map file are frozen with it.
 - **Offline store** refreshed after 2026-12-10, with a TIDAL login in rekordbox on 2026-12-30.
 - **Two full rehearsals**, each at least four hours with a midnight run-in, before 2026-12-20.
 
@@ -419,7 +422,7 @@ runs during the set.
 
 Each is a day or less and decides something.
 
-0. **The machine.** rekordbox 7.2.19 installed, the FLX4 on USB, the monitors and TV cabled, John
+0. **The machine.** rekordbox installed (7.2.19, done 2026-11-08), the FLX4 on USB, the monitors and TV cabled, John
    signed in at the console with automatic sign-in, and a test program started "at log on" playing
    through the FLX4 with no RDP connection.
 1. **TIDAL playlist → rekordbox.** Add a track to a TIDAL playlist through the API; time how long
@@ -430,7 +433,7 @@ Each is a day or less and decides something.
    rekordbox's audio driver modes.
 3. **Virtual controller.** A virtual port learned in rekordbox alongside the FLX4: does each learned
    control act, and does a physical touch after a software move behave as §6.3 assumes?
-4. **Deck reader.** Locate deck state in rekordbox 7.2.19's memory; validate across load, play,
+4. **Deck reader.** Locate deck state in the installed rekordbox's memory; validate across load, play,
    sync, and both decks.
 5. **Closed-loop load.** Browser to *NYE Next*, load, confirm through the reader.
 
