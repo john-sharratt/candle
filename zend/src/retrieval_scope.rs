@@ -652,9 +652,10 @@ mod tests {
     }
 
     /// **A person's conversation retrieves their groups' journals and their
-    /// own file**, the repository's README and the listings above the groups —
-    /// never another group's journal or another person's file, as a file or
-    /// as a folder.
+    /// own file**, the repository's README and its root listing — never
+    /// another group's journal or another person's file, as a file or as a
+    /// folder. (The folder layer makes no unit of a folder that only leads to
+    /// the next one.)
     #[test]
     fn a_person_retrieves_only_their_groups_and_their_own_file() {
         let (root, ws) = memory_workspace();
@@ -666,12 +667,8 @@ mod tests {
             [
                 "journals/",
                 "journals/README.md",
-                "journals/groups/",
-                "journals/groups/zen/",
-                "journals/groups/zen/topics/",
                 "journals/groups/zen/topics/candle/",
                 "journals/groups/zen/topics/candle/2026-10-31-0034-7c25.yaml",
-                "journals/persons/",
                 "journals/persons/john/",
                 "journals/persons/john/person.yaml",
             ]
@@ -679,7 +676,7 @@ mod tests {
     }
 
     /// **A conversation nobody signed in to retrieves no journal**: only the
-    /// repository's own files and the listings above the groups.
+    /// repository's own files and its root listing.
     #[test]
     fn a_conversation_nobody_signed_in_to_retrieves_no_journal() {
         let (root, ws) = memory_workspace();
@@ -687,12 +684,7 @@ mod tests {
         let files = RepoFiles::overlay(ws).unwrap();
         assert_eq!(
             held(&rs, &files, &scope_as(&rs, &files, &Reader::nobody())),
-            [
-                "journals/",
-                "journals/README.md",
-                "journals/groups/",
-                "journals/persons/",
-            ]
+            ["journals/", "journals/README.md"]
         );
     }
 
