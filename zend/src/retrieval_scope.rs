@@ -296,7 +296,7 @@ impl RetrievalScope {
         self.shared
             .lock()
             .unwrap()
-            .retain(|(g, _)| *g == generation);
+            .retain(|(g, _, _)| *g == generation);
     }
 
     /// What `files` may retrieve under `index`, read as `reader`.
