@@ -21,6 +21,7 @@ These were settled in conversation on 2026-11-08 and are not reopened here.
 | Playback engine | **rekordbox 7.2.19**, with the DDJ-FLX4 attached natively | It already plays streaming audio, analyses tracks, beat-syncs, and runs the FLX4 with its full feature set. Writing our own audio engine buys nothing for this event. |
 | Audio source | **TIDAL** (Individual + DJ Extension), logged in inside rekordbox | Spotify inside rekordbox was tried and is not good enough. TIDAL tracks can be analysed and stored offline. |
 | Taste and requests | **Spotify** — both accounts' history and likes, plus a shared request playlist | That is where John's and Yen's music lives and where requests are made from a phone. |
+| Where the party is | **John's home, where BlackWorld is** | The FLX4, the monitors and the TV are cabled straight to BlackWorld; nothing of the set crosses the network but Zen's choices. |
 | Where ZenJ runs | **Its own process, `zenj`, on BlackWorld**, joining the cluster as its own app | Not inside the agent: the agent restarts with every motherd deploy, and the music must not. |
 | Licences | Not a constraint: a private party | Only technical risk is weighed below. |
 
@@ -74,19 +75,59 @@ reflexes, unhurried taste.
 
 ### 3.1 A cluster member of its own
 
-`zenj` is a new crate and binary. It joins the cluster exactly as the agent does
-(`agent/src/member.rs`: same handshake and group key, no model, no substrate, its node id kept in a
-`NODE` file beside its logs) but as **its own app, `zenj`**, not as `agent` — so the gateway never
-routes it a build job. That needs one change in `web`: accept `/v1/cluster/zenj`. Requests reach it
-only on routes it declares (MCP invariant 5, `CLAUDE.md`).
+`zenj` is a new crate and binary. It joins the cluster with the generic member machinery in the
+`cluster` and `cluster-dial` crates (`AppMember`, `Identity`, `Capacity`, `kept_node`, `Dial`,
+`RouteTable`) — no model, no substrate, its node id kept in a `NODE` file beside its logs. The
+template is the `mcp` service's presence (`mcp/src/presence.rs`, about 60 lines), not the agent:
+one route table, a capacity, `INFO serving` printed once admitted.
 
-It is supervised by keep as its own service. A motherd deploy never touches it. keep refuses a trial
-of `zenj` while a set is live (`zenj` reports `live` in its `CAPACITY`).
+It joins as **its own app, `zenj`**, never as `agent`, so the gateway never routes it a build job.
+Apps are a fixed list in the `cluster` crate, and that is where the change is:
 
-rekordbox is a desktop application and needs a logged-in Windows session with the display attached,
-so `zenj` runs in John's session on BlackWorld, started by keep there.
+- `zenj` is added to `APPS` (`cluster/src/gateway/hub.rs:109`); `web` takes the list from there
+  (`web/src/cluster/endpoint.rs:60-66`) and needs no change of its own for the socket.
+- `zenj` is added to `SERVICES` (`hub.rs:122`). An app outside `SERVICES` and not `agent` is
+  *locked* and must name a model, so a `zenj` with `model: None` would be closed at the handshake
+  (`cluster/src/gateway/admission.rs:26-28`, `:148-152`). As a service it has no floor, no model
+  lock and no rollout: each machine's is released on its own — which is exactly right for a process
+  motherd deploys must never touch.
 
-### 3.2 Threads
+Requests reach it only on routes it declares (`Registry::declaring`,
+`cluster/src/gateway/registry/pick.rs:205-217`; MCP invariant 5, `CLAUDE.md`).
+
+**Live.** `MemberState` has no "live" and `Capacity` no field to carry one
+(`cluster/src/frame/types.rs:77-91`, `cluster/src/frame/membership.rs:30-100`). `zenj` reports
+`live` in its `/v1/status` instead, and keep's guard gains a generic refusal: a service whose status
+says `refuse: "<why>"` is not switched, restarted or stopped. Today the guard covers only the
+last-member case (`keep/src/guard.rs:27-40`), applies to local switch/accept/restart/stop, and is
+**not** consulted by the cluster's own trial (`keep/src/remote.rs:303-353`), so the refusal is
+added there too.
+
+### 3.2 The machine and the session
+
+rekordbox, its audio through the FLX4, and full-screen output on local monitors all need **a local,
+logged-in Windows desktop — the console session**. BlackWorld today is run as a server
+(2026-11-08, read on the machine):
+
+- keep, motherd and web run in **session 0**, from a boot task as an S4U logon with no desktop
+  (`keep/src/owner_access.rs:3-5`, `docs/deployment.md:264-278`). keep starts children with
+  `CREATE_NO_WINDOW | DETACHED_PROCESS` (`keep/src/trial.rs:87-104`), and nothing in the repository
+  launches into a user's session (no `WTSQueryUserToken` / `CreateProcessAsUser`).
+- John reaches it over **Remote Desktop** (session 1). An RDP session plays audio either at the
+  client or at the remote machine, not both, and its redirection hides the host's own audio
+  devices; its display is virtual, not the monitors on the card.
+- rekordbox is **not installed**, the DDJ-FLX4 is **not connected**, and the card drives **one**
+  physical monitor (a Lenovo on DisplayPort).
+
+So for the party BlackWorld runs a console session: John's account signed in at the machine, with
+automatic sign-in at boot, and no RDP connection during the set (an RDP connection would take the
+session from the console). `zenj` is started at that logon — a scheduled task "at log on",
+interactive — and restarts itself through a small watchdog launched the same way. keep keeps
+supervising motherd and web in session 0 as today. Teaching keep to launch a service into the
+console session (`WTSQueryUserToken` + `CreateProcessAsUser`) is the cleaner end state and is not
+needed for New Year's Eve.
+
+### 3.3 Threads
 
 Each thread does one thing; they talk through lock-free single-producer queues (`rtrb`), so nothing
 waits on anything else.
@@ -123,16 +164,38 @@ waits on anything else.
    analysis from rekordbox's library, read-only, through the `rbox` crate (`master.db` and the ANLZ
    files: `PQTZ` beat grid, `PCOB` cues, phrase tags).
 
-TIDAL is driven through its official API v2 (`openapi.tidal.com/v2`, OAuth with PKCE, scopes
-`playlists.read`, `playlists.write`, `search.read`, `collection.read`). There is no maintained Rust
-client, so `zenj` has its own small one, written against TIDAL's published OpenAPI description.
+TIDAL is driven through its official API v2 (`openapi.tidal.com/v2`, JSON:API, user login with
+OAuth; scopes `playlists.read`, `playlists.write`, `search.read`, `collection.read`). There is no
+maintained Rust client, so `zenj` has its own small one, written against TIDAL's published OpenAPI
+description. **What is verified and what is not** (2026-11-08): reading user playlists has been
+public since August 2024; adding items is reported working by users since 2025
+(`POST /playlists/{id}/relationships/items`); removing and reordering items, the ISRC filter's exact
+form, the login flows offered (authorization code with PKCE; device code is unconfirmed) and the
+rate limits could not be read from TIDAL's reference, which renders only in a browser. Spike 1
+settles them against the live API. Responses page at 20 items (`links.next`).
+
+Spotify is read in **development mode** (rules of 2026-02-11/03-09): the app owner needs Premium,
+at most five users (two are needed), and playlist contents come from `GET /playlists/{id}/items`
+— the old `/tracks` paths are gone — and only for playlists the user owns or collaborates on, which
+*ZenJ Requests* is. `external_ids` (the ISRC) stays on track objects. Polling compares each
+playlist's `snapshot_id` and fetches items only when it changed. The privacy export is one JSON
+record per play (`ts`, `spotify_track_uri`, `ms_played`, `skipped`, …); `spotify_track_uri` can be
+null and such records are skipped.
+
+The OAuth client in the repository is the gateway's Google sign-in (`web/src/auth/oidc.rs`: PKCE,
+no refresh, no device flow). `zenj` has its own small client for both services: authorization code
+with PKCE through a loopback redirect on BlackWorld, refresh tokens kept in its data folder.
 
 ### 4.2 Live deck state
 
 rekordbox publishes no deck state; its Ableton Link only receives. ZenJ reads it from rekordbox's
 memory, as `rkbx_link` does: for each deck the loaded track, BPM, play state, beat and bar position,
-phrase, and which deck is on air. `rkbx_link` itself targets rekordbox 6.7.3 and is not maintained,
-so `zenj` has its own reader for 7.2.19.
+phrase, and which deck is on air. Upstream `rkbx_link` ships offsets for 7.2.2 and sells updates;
+an unofficial fork (`BA-24/rkbx_link`, 2026-11-02) publishes Windows offsets for **7.2.19**, checked
+on decks 1–2 for beat, BPM and master across restarts, with track titles still empty and decks 3–4
+extrapolated. Upstream issue #63 reports wrong phrase data for local files on 7.2.19. `zenj` has its
+own reader, starting from those offsets and the fork's offset-finding method, and reads the track
+id rather than the title (the title then comes from the library, §4.1).
 
 **rekordbox is pinned to 7.2.19 until after New Year's Eve**: automatic updates off. An update moves
 the memory layout, and the reader would read nothing — or worse, the wrong thing. The reader
@@ -154,9 +217,11 @@ Computed ahead of time, never live, for every track in the crates:
 ### 4.4 The room
 
 The FLX4's output is captured from the system (WASAPI loopback of the FLX4 render device), giving
-loudness and spectral energy over the last minutes. If rekordbox takes the device exclusively and
-loopback captures nothing, the fallback is physical: the FLX4's master out into a USB audio input.
-This is the first thing tested (§11).
+loudness and spectral energy over the last minutes. The FLX4 has no ASIO driver on Windows: it is
+class compliant and rekordbox drives it through WASAPI (`DDJ-FLX4 WASAPI: MASTER` and `PHONES`),
+which is also how Pioneer's own streaming guide captures it in OBS — so loopback has a device to
+capture. If it captures nothing in practice, the fallback is physical: the FLX4's master out into a
+USB audio input (spike 2).
 
 Requests are a signal too: their rate, and who is making them. A "more energy" / "chill" pair of
 pads (on the FLX4 in a spare pad mode, or on the phones through the Zen chat) gives the room a
@@ -226,9 +291,14 @@ logged, overridden, and replayed in tests with no party and no rekordbox.
 
 ### 6.1 The virtual controller
 
-`zenj` opens a virtual MIDI output port — a Windows MIDI Services loopback endpoint if BlackWorld's
-build has them, otherwise loopMIDI (spike 3) — that rekordbox maps with MIDI LEARN as a second
-controller. The map covers, per deck: load selected, play, cue,
+`zenj` opens a virtual MIDI output port that rekordbox maps with MIDI LEARN as a second
+controller. BlackWorld runs Windows 11 25H2 (build 26200) with the Windows MIDI Services service
+installed (`MidiSrv`, manual start); its built-in Basic Loopback endpoints reach most machines
+between November 2026 and January 2027, so the port is a Windows MIDI Services loopback if present
+and loopMIDI otherwise (spike 3). MIDI LEARN needs a paid rekordbox plan **or** a connected
+hardware-unlock device, which the FLX4 is; the 7.2.18 manual lists the Automix window among the
+functions it drives. The full list of learnable functions — in particular browser movement and
+"load to deck" — is read from the MIDI LEARN screen on BlackWorld in spike 3. The map covers, per deck: load selected, play, cue,
 sync, tempo, channel fader, trim, EQ high/mid/low, filter, beat FX on/off and level, loop in/out,
 hot cues 1–8; and globally: crossfader, browser up/down, the sampler pads, Automix on/off.
 
@@ -349,6 +419,9 @@ runs during the set.
 
 Each is a day or less and decides something.
 
+0. **The machine.** rekordbox 7.2.19 installed, the FLX4 on USB, the monitors and TV cabled, John
+   signed in at the console with automatic sign-in, and a test program started "at log on" playing
+   through the FLX4 with no RDP connection.
 1. **TIDAL playlist → rekordbox.** Add a track to a TIDAL playlist through the API; time how long
    rekordbox takes to show it, during Automix. Then removal and reordering through the API. Confirm
    that rekordbox analyses TIDAL tracks (§4.1) and that Automix plays them, online and from the
@@ -380,7 +453,13 @@ rekordbox at all.
 
 ## 13. Zen's surface
 
-Tools on the `/mcp` surface, routed to `zenj`, each answering from memory within the 30 ms rule:
+Tools on the `/mcp` surface, served by `zenj` itself, each answering from memory within the 30 ms
+rule. Tools do not have to live in zend: npcd already serves its own through the `mcp-server` crate
+(`mcp-server/src/lib.rs`). So `zenj` mounts `mcp_server` at `/v1/zenj/mcp` and declares it in its
+route table; `web/web.yaml` gains a site route `cluster: zenj` for that prefix (longest prefix
+wins, `web/src/config.rs:589`; a fallback upstream is required, `config.rs:872-889`); and
+`mcp/served.yaml` gains a `zenj` backend, so the aggregator lists and routes its tools
+(`mcp/src/app.rs:62-79`). No change to zend.
 
 | Tool | Does |
 |---|---|
@@ -396,7 +475,15 @@ Tools on the `/mcp` surface, routed to `zenj`, each answering from memory within
 
 Every pick and its reason, every transition and its plan, every request and where it went, every
 mode change and fault: written to the `@zen` journal as the set runs, `by` the writer that made the
-decision (`zenj` for the conductor, Zen for its choices). The next morning Zen writes the set up from
+decision (`zenj` for the conductor, Zen for its choices).
+
+There is no such writer today. A line's `by` is a `Writer` — a channel, `server`, `zend`, `npcd` or
+`worker` (`journals/src/line.rs:107-118`) — set from an `Actor`, never from what a caller says of
+itself (`journals/src/actor.rs`); and the one HTTP write path, `POST /v1/journals` on zend, takes a
+signed-in person only (`zend/src/api/journals/mod.rs:101-114`). So the journal needs a `zenj`
+`Writer` and `Actor`, and a member-authenticated write route on the members that hold the memory
+(declared like `MEMORY_ROUTES`, `zend/src/api/mod.rs:60-85`) that `zenj` reaches up its own cluster
+socket. The next morning Zen writes the set up from
 that record: what the night was, what landed, what to do differently. That record is also how the
 next party's ZenJ starts out knowing what worked.
 
