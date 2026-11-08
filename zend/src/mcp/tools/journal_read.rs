@@ -11,6 +11,7 @@ use journals::path::JournalPath;
 use journals::time::Stamp;
 use journals::tree::WINDOW;
 use journals::view::open::open;
+use journals::view::page::before;
 use journals::view::who::render_line;
 use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
@@ -53,7 +54,8 @@ pub fn definition() -> Value {
                 "journal": {"type": "string", "description": "`@<group>`, a memory path such as `topics/candle` or `here`, or `<path>#<line id>`; or `\"self\"`, `T:<thread>`, `T:<thread>/<name>`, `P:<repository>`, or an entry's address, `T:<thread>/<name>#12`."},
                 "entry": {"type": "integer", "minimum": 0, "description": "An entry's number: a worker's, to page the turns behind it; a thread's or project's, to read that note."},
                 "offset": {"type": "integer", "minimum": 1, "description": "With `entry`, the first line of a worker entry's page; without it, the first entry of a thread's, project's or worker's journal (1 by default)."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LINES, "description": "Lines in a worker entry's page (200 by default)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LINES, "description": "Lines in a worker entry's page (200 by default), or in a memory journal's page with `after` (50 by default)."},
+                "after": {"type": "string", "description": "Memory only: read the lines before this one, `<path>#<line id>` — the oldest line the read before showed, as its answer names it — going on into the journal's archives."},
                 "answer_from": {"type": "integer", "minimum": 0, "description": "For a worker's path: read its final answer instead, a page of characters from this one (0 to start)."}
             },
             "required": ["journal"],
@@ -79,7 +81,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Err(e) => return Answer::error(e),
     };
     if is_memory_path(journal) {
-        return read_memory(ctx, journal);
+        return read_memory(ctx, journal, args);
     }
     // An address names its entry: `T:<thread>/<name>#12`, or `#12.3` for one
     // of its claims.
@@ -176,8 +178,9 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     }
 }
 
-/// One of the memory's journals, opened; or one line of it, by its address.
-fn read_memory(ctx: &Ctx, journal: &str) -> Answer {
+/// One of the memory's journals, opened; one line of it, by its address; or,
+/// with `after`, a page of the lines before that one.
+fn read_memory(ctx: &Ctx, journal: &str, args: &Value) -> Answer {
     let m = match mem::read(ctx) {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
@@ -208,9 +211,34 @@ fn read_memory(ctx: &Ctx, journal: &str) -> Answer {
         Ok(p) => p,
         Err(e) => return Answer::error(e),
     };
-    match Memory::readable(&m.tree, &actor, &path) {
-        Ok(j) => Answer::ok(open(&m.tree, &path, j, WINDOW, Stamp::now())),
-        Err(e) => Answer::error(e),
+    let j = match Memory::readable(&m.tree, &actor, &path) {
+        Ok(j) => j,
+        Err(e) => return Answer::error(e),
+    };
+    // A page of what came before a line: `after` is the line the page before
+    // began with, as its answer names it.
+    match args.get("after").and_then(Value::as_str) {
+        None => Answer::ok(open(&m.tree, &path, j, WINDOW, Stamp::now())),
+        Some(after) => {
+            let address = match m.find_address(after) {
+                Ok(a) if a.path == path => a,
+                Ok(a) => {
+                    return Answer::error(format!(
+                        "`after` names a line of {}, not of {path}",
+                        a.path
+                    ))
+                }
+                Err(e) => return Answer::error(String::from(e)),
+            };
+            let lines = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(WINDOW, |n| n as usize);
+            match before(&m.tree, &path, j, &address.id, lines, Stamp::now()) {
+                Some(page) => Answer::ok(page),
+                None => Answer::error(format!("{address} is no line")),
+            }
+        }
     }
 }
 

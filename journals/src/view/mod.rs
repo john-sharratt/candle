@@ -7,6 +7,7 @@ pub mod frame;
 pub mod grep;
 pub mod index;
 pub mod open;
+pub mod page;
 pub mod who;
 
 /// What heads everything recalled (§7.2).

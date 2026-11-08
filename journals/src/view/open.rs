@@ -78,11 +78,14 @@ pub fn open(tree: &Tree, path: &JournalPath, j: &Journal, lines: usize, now: Sta
             format!("Lines (the newest {count} of {}):", window.len())
         };
         out.push(head);
-        out.extend(
-            window[window.len() - count..]
-                .iter()
-                .map(|l| format!("  {}", render_line(tree, l))),
-        );
+        let page = &window[window.len() - count..];
+        out.extend(page.iter().map(|l| format!("  {}", render_line(tree, l))));
+        if count < window.len() || !j.archives.is_empty() {
+            out.push(format!(
+                "Older lines: page on with `after: {path}#{}`.",
+                page[0].id
+            ));
+        }
     }
     if archived > 0 {
         let periods: Vec<String> = j.archives.keys().rev().map(ToString::to_string).collect();
@@ -167,8 +170,14 @@ mod tests {
             lines[8]
         );
         assert!(lines[9].ends_with("Note 2."));
-        assert_eq!(lines[10], "1 older line folded into 2026-09-01 — grep finds them, and each fold line above says what they held.");
-        assert_eq!(lines.len(), 11);
+        assert!(
+            lines[10].starts_with("Older lines: page on with `after: @zen/")
+                && lines[10].ends_with("`."),
+            "{}",
+            lines[10]
+        );
+        assert_eq!(lines[11], "1 older line folded into 2026-09-01 — grep finds them, and each fold line above says what they held.");
+        assert_eq!(lines.len(), 12);
     }
 
     #[test]
