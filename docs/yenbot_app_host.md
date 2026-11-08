@@ -240,6 +240,11 @@ all or nothing:
    the commit. On refused, the candidate is deleted, `main` never moved, and
    the call answers the reason.
 
+A change too large to type as edits, a new page or a picture is made in a
+**preview** on claude.ai instead (`docs/yenbot_preview.md`): the app as
+`main` holds it with Claude's changes over it, seen before it lands and
+published from the page with the same tools, so no file is typed out again.
+
 The whole loop is about two seconds. A larger change made by a Zen task lands
 the same way, each of its commits through the same gate. yenbot also fetches
 on every (re)connection to the bus and every 60 s, for a push made outside
@@ -1224,6 +1229,10 @@ its new id, with the template's id replaced and `guide:` set to the building
 guide's current edition — made by Claude with the file tools for a small
 template, by a Zen task for a large one.
 
+`templates/preview/` is not an app: it is the preview kit — the loader, the
+toolbar and the SDK's preview backend every preview on claude.ai is published
+with (`docs/yenbot_preview.md` §6). It passes the same checks.
+
 ## 17. Docs, CLAUDE.md, the checks and the connector's guide
 
 ### 17.1 The manual
@@ -1378,7 +1387,8 @@ short, because it is read at the start of every chat and her context is not
 spent on it. It says what Yen Bots is, the tools the work uses
 (`file_read`, `file_edit_and_commit`, the log tools, the journal tools,
 `repo_task_start` and its watching — which is also how the API is called), the
-order of work, and that
+order of work, when a change is made in a preview and published from it
+(`docs/yenbot_preview.md`), and that
 everything else is in the yenbot repository: `CLAUDE.md` first, then
 `docs/index.md`, reading only the docs the task needs. Every Claude session
 Yen opens, on any device, reads it first, as `guide_list` already asks.

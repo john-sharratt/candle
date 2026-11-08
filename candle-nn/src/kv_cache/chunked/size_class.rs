@@ -71,7 +71,7 @@ use super::types::{CHUNK_SIZE, TARGET_ARENA_BYTES};
 ///
 /// `head_dim 512` is DeepSeek's latent width. The single-latent backing runs
 /// its 16×32-dim bands (1024-elem slots) in steady state, but it is
-/// *constructed* at the GQA width — `warm_protected_arenas` mints the writer
+/// *constructed* at the GQA width — `keep_reserves` mints the writer
 /// arenas at `512 / N_PALETTE = 128` dims before `set_single_latent` drops
 /// them and re-mints at band width — so the construction-time R16 payload
 /// (16384 B) must have a rung to pass through.

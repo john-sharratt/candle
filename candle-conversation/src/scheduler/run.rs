@@ -1367,19 +1367,15 @@ impl Scheduler {
             // cheap counter read and a minimum interval, so being considered here
             // costs the loop nothing on the iterations it declines.
             //
-            // Legal here for the same reason `create_deferred_arenas` below is: the
-            // quanta are done, every forward's guards are dropped, and no wave
-            // generation is live — which is the condition `set_weight_floor` itself
-            // checks. `compact_kv` refuses rather than corrupts if that ever stops
-            // being true.
-            {
-                // The whole pass, including the gate that usually declines it — so the
-                // table shows what being *considered* every wave costs, not only what a
-                // pass costs when it runs. The phase breakdown is filed inside.
-                let _g = super::profile::span("loop:compact_kv");
-                self.compact_kv_if_fragmented();
-            }
-
+            // Legal here for the same reason `create_deferred_arenas` is: the quanta
+            // are done, every forward's guards are dropped, and no wave generation is
+            // live — which is the condition `set_weight_floor` itself checks.
+            // `compact_kv` refuses rather than corrupts if that ever stops being true.
+            //
+            // **Arenas first, then compaction.** The arenas a refused pass is owed and
+            // the reserves are made protected; compaction's empty sweep, run after,
+            // cannot take back what was just made for a demand that has not filled it
+            // (`docs/kv_drain_under_pressure.md` §2).
             match self.session.create_deferred_arenas() {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(
@@ -1388,6 +1384,13 @@ impl Scheduler {
                     "created arenas a refused pass asked for"
                 ),
                 Err(e) => tracing::warn!("deferred arena creation failed: {e}"),
+            }
+            {
+                // The whole pass, including the gate that usually declines it — so the
+                // table shows what being *considered* every wave costs, not only what a
+                // pass costs when it runs. The phase breakdown is filed inside.
+                let _g = super::profile::span("loop:compact_kv");
+                self.compact_kv_if_fragmented();
             }
 
             // Flush the wave summary + phase breakdown if its 2 s window

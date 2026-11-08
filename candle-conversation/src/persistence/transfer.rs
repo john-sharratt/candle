@@ -720,10 +720,10 @@ mod cuda_impl {
             // C1 — production recall level: K→Q8_KS, V→Q4_0/Q8_0.
             let policy = CompressionPolicy::new(1);
 
-            // `new_with_format_adaptive(..., Some(policy))` warms the shared
-            // adaptive candidate arenas at construction — the public path the
-            // substrate engine uses (the internal `warm_protected_arenas` is
-            // `pub(super)` to candle-nn).
+            // `new_with_format_adaptive(..., Some(policy))` keeps a reserve
+            // for each shared adaptive candidate class at construction — the
+            // public path the substrate engine uses (the internal
+            // `keep_reserves` is `pub(super)` to candle-nn).
             let backing = ChunkedKvBacking::new_with_format_adaptive(
                 4,
                 n_kv_head,
