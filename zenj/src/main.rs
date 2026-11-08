@@ -8,6 +8,7 @@
 //! | `zenj login <account>` | sign in once: `spotify-john`, `spotify-yen`, `tidal` |
 //! | `zenj library sync` | taste → TIDAL → crates, ahead of the night |
 //! | `zenj library analyse` | rekordbox's analysis into the library, once it has analysed the crates |
+//! | `zenj library tag` | what Zen knows of each track: singalong, classic, its year |
 //! | `zenj midi monitor` | each FLX4 message as the map names it, to check the map on the wire |
 //! | `zenj learn` | send each virtual control on Enter, for rekordbox's MIDI LEARN |
 
@@ -47,9 +48,10 @@ use zenj::deck::Snapshot;
 use zenj::events::{Events, Kind};
 use zenj::hands::Hands;
 use zenj::http::router;
-use zenj::library::crates::{BUILD, LIVE, NEXT, PEAK};
+use zenj::library::crates::{crates_of, BUILD, LIVE, NEXT, PEAK};
 use zenj::library::sync::{analyse, build, file_crates, Person};
-use zenj::library::Library;
+use zenj::library::{tags, Library};
+use zenj::music::{Profile, TrackId};
 use zenj::live::Live;
 use zenj::midi::{ports, Map, Out, Reading};
 use zenj::oauth::{login, Account};
@@ -96,6 +98,8 @@ enum Cmd {
 enum LibraryCmd {
     Sync,
     Analyse,
+    /// Ask Zen what it knows of each track not yet tagged.
+    Tag,
 }
 
 #[derive(Subcommand)]
@@ -132,6 +136,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Login { account }) => runtime()?.block_on(sign_in(&config, &account)),
         Some(Cmd::Library(LibraryCmd::Sync)) => runtime()?.block_on(sync(&config)),
         Some(Cmd::Library(LibraryCmd::Analyse)) => analyse_library(&config),
+        Some(Cmd::Library(LibraryCmd::Tag)) => runtime()?.block_on(tag(&config)),
         Some(Cmd::Midi(MidiCmd::Monitor)) => monitor(&config),
         Some(Cmd::Learn) => learn(&config),
     }
@@ -241,6 +246,28 @@ fn analyse_library(config: &Config) -> anyhow::Result<()> {
     }
     for f in &r.failed {
         println!("  failed: {f}");
+    }
+    Ok(())
+}
+
+async fn tag(config: &Config) -> anyhow::Result<()> {
+    let mut lib = Library::load(&config.library_path()).map_err(|e| anyhow!(e))?;
+    let zen = Zen::new(config.zen.clone(), Path::new(".")).map_err(|e| anyhow!(e))?;
+    let untagged: Vec<TrackId> = lib.tracks.iter().filter(|t| t.tags.is_empty()).map(|t| t.id.clone()).collect();
+    let names = config.names();
+    for batch in untagged.chunks(tags::BATCH) {
+        let tracks: Vec<&Profile> = batch.iter().filter_map(|id| lib.get(id)).collect();
+        let answer = zen.ask(tags::SYSTEM, &tags::prompt(&tracks)).await.map_err(|e| anyhow!(e))?;
+        let known = tags::read(&answer, batch.len());
+        for (i, (found, year)) in known {
+            if let Some(t) = lib.get_mut(&batch[i]) {
+                t.tags = found;
+                t.year = t.year.or(year);
+                t.crate_name = crates_of(t, &names).first().map(|c| c.to_string());
+            }
+        }
+        lib.save(&config.library_path()).map_err(|e| anyhow!(e))?;
+        println!("tagged {} of {}", batch.len(), untagged.len());
     }
     Ok(())
 }
