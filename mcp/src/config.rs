@@ -129,6 +129,9 @@ impl Config {
             instructions: self.server.instructions.clone(),
             icon: self.server.icon.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
+            // The aggregator is what a client lists; the backends' listings
+            // change under it with every release, and it tells its client.
+            list_changed: true,
         }
     }
 }

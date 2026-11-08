@@ -49,6 +49,7 @@ mod last_listed;
 mod presence;
 mod reading;
 mod routes;
+mod served;
 mod sse;
 
 use app::App;
@@ -58,6 +59,7 @@ use context::Conversations;
 use last_listed::LastListed;
 use reading::Readings;
 use routes::Routes;
+use served::Served;
 
 #[derive(Parser)]
 struct Args {
@@ -115,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
             config.backends.iter().map(|b| b.name.clone()).collect(),
         ),
         last_listed: LastListed::default(),
+        served: Served::default(),
         library: guides::embedded()?,
         read_only: RwLock::new(BTreeSet::new()),
         conversations: Conversations::default(),

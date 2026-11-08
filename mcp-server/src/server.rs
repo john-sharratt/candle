@@ -26,6 +26,10 @@ pub struct Identity {
     /// Where its icon is served, under the origin a request reached it at.
     pub icon: Option<String>,
     pub version: String,
+    /// Whether it tells a client its tool list changed
+    /// (`notifications/tools/list_changed`): the server a client lists, in
+    /// front of the servers whose listings change under it.
+    pub list_changed: bool,
 }
 
 /// Why a request names no caller, which decides how it is refused.
@@ -108,6 +112,16 @@ pub trait Server: Send + Sync + 'static {
         name: &str,
         args: &Value,
     ) -> impl Future<Output = Self::Answer> + Send;
+
+    /// The version of the listing `tools/list` would answer now
+    /// ([`crate::listing::version`]), named on every answer; `None` for a
+    /// server whose listing is the sum of others'.
+    fn tools_version(&self) -> Option<&str>;
+
+    /// Whether `call`'s client is owed `notifications/tools/list_changed`,
+    /// sent on its stream before the call's result. Asked once per call, as
+    /// the result is sent: a server that answers yes has noted the debt paid.
+    fn list_changed(&self, call: &Call<Self>) -> bool;
 
     /// The `tools/call` result an answer is sent as.
     fn result(&self, answer: &Self::Answer) -> Value;

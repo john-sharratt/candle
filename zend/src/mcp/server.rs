@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 
 use axum::http::HeaderMap;
-use mcp_server::{Call, Identity, NoCaller, Server, Store};
+use mcp_server::{listing, Call, Identity, NoCaller, Server, Store};
 use serde_json::Value;
 use web::auth::Role;
 
@@ -54,7 +54,12 @@ static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     instructions: INSTRUCTIONS.into(),
     icon: Some(ICON_PATH.into()),
     version: env!("CARGO_PKG_VERSION").into(),
+    list_changed: false,
 });
+
+/// The version of what `tools/list` answers: every caller is listed the same
+/// tools, so one version, once.
+static TOOLS_VERSION: LazyLock<String> = LazyLock::new(|| listing::version(&tools::definitions()));
 
 impl Server for ZendSession {
     type Caller = Caller;
@@ -102,6 +107,15 @@ impl Server for ZendSession {
             progress: call.progress.clone(),
         };
         tools::fit(tools::call(&ctx, name, args).await)
+    }
+
+    fn tools_version(&self) -> Option<&str> {
+        Some(&TOOLS_VERSION)
+    }
+
+    /// zend's client is the aggregator, which tells its own clients.
+    fn list_changed(&self, _call: &Call<Self>) -> bool {
+        false
     }
 
     fn result(&self, answer: &Answer) -> Value {

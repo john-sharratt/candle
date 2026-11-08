@@ -12,6 +12,7 @@
 //! | [`http`] | The routes, the challenge, the event stream a call answers on |
 //! | [`protocol`] | The MCP methods in the 2025-11-25 and 2026-07-28 eras |
 //! | [`jsonrpc`] | One JSON-RPC message per POST |
+//! | [`listing`] | A listing's version on every answer, and the notification that it changed |
 //! | [`server`] | What an app supplies: [`Server`], [`Identity`], [`Call`] |
 //! | [`session`] | Sessions and the [`Store`] they are kept in |
 //! | [`local_store`] | Sessions kept by one process, in memory or in a file |
@@ -22,6 +23,7 @@
 pub mod client;
 pub mod http;
 pub mod jsonrpc;
+pub mod listing;
 pub mod local_store;
 pub mod origin;
 pub mod protocol;
