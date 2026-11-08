@@ -123,6 +123,7 @@ Workstation build specs and standalone quality/throughput measurements.
 | [`hardware_machine_consumer.md`](hardware_machine_consumer.md) | Parts list and cost for the AM5 + single RTX PRO 5000 Blackwell (72 GB) Battle Cities workstation build. |
 | [`hardware_machine_enterprise.md`](hardware_machine_enterprise.md) | Parts list and cost for the 4× RTX PRO 4500 Blackwell Threadripper PRO production workstation build, sized to saturate aggregate GPU ingress via a 16-way PCIe 5.0 NVMe array. |
 | [`perplexity_results.md`](perplexity_results.md) | WikiText-2 perplexity measurements across model/quant combinations (Qwen3-30B-A3B, Qwen2/3, Llama-3.2-3B), methodology and per-context-size result tables. |
+| [`midi_dj_set.md`](midi_dj_set.md) | **Design, not built.** Hooking a physical MIDI controller on BlackWorld into Zen: the controller as a source the model never drives, the port-ownership test that replaces the house's `in_house` address test for a device with no address, how a knob turn becomes a coalesced gesture the model can read, and what happens when the cable comes out. |
 
 ## Other files in this directory
 
