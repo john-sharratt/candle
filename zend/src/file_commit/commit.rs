@@ -170,6 +170,7 @@ fn changed(
                     )])
                 }
             }
+            Change::Bytes { path: p, bytes } => Ok(vec![(p.clone(), Some((bytes.clone(), None)))]),
             Change::Delete { path: p } => match files.read(p) {
                 Ok(Some(_)) => Ok(vec![(p.clone(), None)]),
                 Ok(None) => Err(format!("{p} does not exist, so there is nothing to delete")),
@@ -453,6 +454,32 @@ mod tests {
                 .next(),
             Some("100755")
         );
+    }
+
+    /// **Bytes land exactly**, a picture's NUL and high bytes included.
+    #[test]
+    fn bytes_land_exactly() {
+        let (origin, work) = repo(&[("a.txt", "one\n")]);
+        let r = Repo::open(work.path()).unwrap();
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+        let outcome = commit(
+            &r,
+            &main_branch(),
+            &[Change::Bytes {
+                path: "library/moon.png".into(),
+                bytes: png.clone(),
+            }],
+            "library: the moon",
+            &yen(),
+        )
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Live { .. }), "{outcome:?}");
+        let out = Command::new("git")
+            .args(["show", "main:library/moon.png"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.stdout, png);
     }
 
     #[test]

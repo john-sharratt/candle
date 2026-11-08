@@ -21,6 +21,16 @@ pub fn read_within(response: Response, cap: usize) -> Result<Vec<u8>, FetchError
     Ok(bytes)
 }
 
+/// The first `n` bytes of `response`'s body, as text, and whether there was
+/// more: what an upload's answer shows of what the server said back.
+pub fn read_head(response: Response, n: usize) -> (String, bool) {
+    let mut bytes = Vec::new();
+    let _ = response.take(n as u64 + 1).read_to_end(&mut bytes);
+    let more = bytes.len() > n;
+    bytes.truncate(n);
+    (String::from_utf8_lossy(&bytes).into_owned(), more)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -74,5 +84,17 @@ mod tests {
             read_within(get(&url), png.len() - 1),
             Err(FetchError::TooLarge { cap: 15 })
         ));
+    }
+
+    /// **The head of an answer is its first bytes**, and says whether more
+    /// followed.
+    #[test]
+    fn the_head_of_an_answer_is_its_first_bytes() {
+        let url = serving(b"created: library/moon.png", 2);
+        assert_eq!(read_head(get(&url), 7), ("created".to_string(), true));
+        assert_eq!(
+            read_head(get(&url), 64),
+            ("created: library/moon.png".to_string(), false)
+        );
     }
 }

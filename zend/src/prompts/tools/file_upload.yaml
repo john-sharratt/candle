@@ -1,0 +1,44 @@
+name: file_upload
+questions:
+- upload the built file to the release host
+- send that picture to the service's upload URL
+- PUT this artefact to the storage bucket link
+- post the report file to their endpoint
+- push the generated archive to that URL
+- send the file in the repo to this address without reading it out
+- upload the exported CSV to the form's endpoint
+- put the binary at the presigned link they gave us
+category: Files
+high_risk: true
+description: 'Send a file of the repository to a public URL by PUT (the default) or POST, without reading it into the conversation — a built artefact to a release host, a picture to a service that takes uploads. Answers the server''s status and the first 4 KiB of its answer. Private and local addresses are refused; 60 seconds at most. For calls that need a sign-in or cookies use http_session_*.'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    content_type:
+      description: The `Content-Type` to send; none when left out.
+      type:
+      - string
+      - 'null'
+    method:
+      description: '`PUT` (the default) or `POST`.'
+      type:
+      - string
+      - 'null'
+    path:
+      description: The file to send, relative to the repository, as this session holds it. Required.
+      minLength: 1
+      type: string
+    repo:
+      description: The repository the file is in. Required.
+      minLength: 1
+      type: string
+    url:
+      description: 'Where to send it: an `http://` or `https://` URL on the public internet. Private and local addresses are refused. Required.'
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - path
+  - url
+  title: UploadRequest
+  type: object

@@ -25,15 +25,22 @@ pub enum Change {
     Delete { path: String },
     /// Move the file, unchanged, to a path that does not exist yet.
     Move { from: String, to: String },
+    /// The file's whole new bytes, any bytes; created when it does not exist.
+    /// The transfers' alone (`file_download_and_commit`,
+    /// `file_upload_and_commit`, `docs/mcp_file_tools.md` §3.8): no call of
+    /// `file_edit_and_commit` can name it, which stays text-only.
+    #[serde(skip_deserializing)]
+    Bytes { path: String, bytes: Vec<u8> },
 }
 
 impl Change {
     /// Every path the change touches.
     pub fn paths(&self) -> Vec<&str> {
         match self {
-            Change::Edit { path, .. } | Change::Write { path, .. } | Change::Delete { path } => {
-                vec![path]
-            }
+            Change::Edit { path, .. }
+            | Change::Write { path, .. }
+            | Change::Delete { path }
+            | Change::Bytes { path, .. } => vec![path],
             Change::Move { from, to } => vec![from, to],
         }
     }
@@ -88,6 +95,11 @@ mod tests {
         );
         assert_eq!(changes[3].paths(), vec!["d.js", "e.js"]);
         assert!(serde_json::from_value::<Change>(json!({"op": "chmod", "path": "a"})).is_err());
+        assert!(
+            serde_json::from_value::<Change>(json!({"op": "bytes", "path": "a", "bytes": [0]}))
+                .is_err(),
+            "no call names bytes"
+        );
         assert!(
             serde_json::from_value::<Change>(json!({"op": "delete", "path": "a", "x": 1})).is_err()
         );

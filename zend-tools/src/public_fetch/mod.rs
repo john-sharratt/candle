@@ -23,6 +23,6 @@ mod client;
 mod error;
 
 pub use address::{is_private_ip, is_private_url};
-pub use body::read_within;
+pub use body::{read_head, read_within};
 pub use client::{public_client, Pinned};
 pub use error::FetchError;

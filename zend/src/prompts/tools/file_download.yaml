@@ -1,0 +1,35 @@
+name: file_download
+questions:
+- download that picture into the art library
+- save the image at this link into the repo
+- put the font from this URL in the app's assets
+- vendor this library file from the CDN into the repository
+- grab the raw file from that GitHub link and add it here
+- the drawing is at this link, store it with the app
+- fetch this PNG and keep it in library/
+- copy the file at that address into the repository
+- I need that dataset file in the repo, not summarised
+- add the logo from this URL to the site
+category: Files
+description: 'Download what a public URL serves into a file of the repository — a picture, a font, a library, a raw file from another repository — without reading it into the conversation. Use it instead of web_fetch or http_request plus write whenever the file itself is wanted, binary or text. Answers the file''s size, SHA-256 and type, never its bytes; the file is committed with the rest of your changes. At most 8 MiB, 30 seconds, five redirects; private and local addresses are refused. Triggered by "download this into", "save the picture at", "put that file in the repo", "vendor this library".'
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    path:
+      description: The file to write, relative to the repository (e.g. `library/art/moon.png`); created or replaced in this session. Required.
+      minLength: 1
+      type: string
+    repo:
+      description: The repository the file goes in. Required.
+      minLength: 1
+      type: string
+    url:
+      description: 'What to fetch: an `http://` or `https://` URL on the public internet. Private and local addresses are refused, and so is every redirect to one. Required.'
+      minLength: 1
+      type: string
+  required:
+  - repo
+  - path
+  - url
+  title: DownloadRequest
+  type: object

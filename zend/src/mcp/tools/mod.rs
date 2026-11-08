@@ -44,7 +44,9 @@ pub mod cluster_audit;
 pub mod cluster_command;
 pub mod cluster_logs;
 pub mod cluster_status;
+mod file_download_and_commit;
 mod file_edit_and_commit;
+mod file_upload_and_commit;
 mod files;
 mod fit;
 pub mod gateway_command;
@@ -63,6 +65,7 @@ mod journal_grep;
 pub mod journal_link;
 pub mod journal_note;
 mod journal_read;
+mod landing;
 pub mod layer_read;
 pub mod layer_toggle;
 pub mod logs;
@@ -169,6 +172,8 @@ pub fn definitions() -> Value {
         files::definition("file_list"),
         files::definition("file_search"),
         file_edit_and_commit::definition(),
+        file_download_and_commit::definition(),
+        file_upload_and_commit::definition(),
         journal_read::definition(),
         journal_grep::definition(),
         journal_note::definition(),
@@ -243,6 +248,8 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
             blocking(ctx, args, move |ctx, args| files::call(ctx, &name, args)).await
         }
         file_edit_and_commit::NAME => blocking(ctx, args, file_edit_and_commit::call).await,
+        file_download_and_commit::NAME => blocking(ctx, args, file_download_and_commit::call).await,
+        file_upload_and_commit::NAME => blocking(ctx, args, file_upload_and_commit::call).await,
         journal_read::NAME => blocking(ctx, args, journal_read::call).await,
         journal_note::NAME => blocking(ctx, args, journal_note::call).await,
         journal_grep::NAME => blocking(ctx, args, journal_grep::call).await,
@@ -365,6 +372,8 @@ mod tests {
                 "file_list",
                 "file_search",
                 "file_edit_and_commit",
+                "file_download_and_commit",
+                "file_upload_and_commit",
                 "journal_read",
                 "journal_grep",
                 "journal_note",
