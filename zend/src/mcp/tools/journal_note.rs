@@ -14,6 +14,7 @@ use super::note_terms::terms_of;
 use super::{mem, string, Answer, Ctx};
 use crate::mcp::memory::is_memory_path;
 use crate::mcp::names::Path;
+use crate::mcp::thread_export;
 use crate::mcp::threads::{self, project_journal, Note};
 use crate::mcp::workers::now_ms;
 
@@ -134,6 +135,17 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     let key = target.key();
     match threads::add_note(&records, &owner, &key, &note) {
         Ok(()) => {
+            // A thread bound to the memory keeps its notes there too.
+            if let Target::Thread(thread) = &target {
+                thread_export::spawn_export(
+                    &records,
+                    ctx.session.mcp().memory(),
+                    &owner,
+                    thread,
+                    &note.label,
+                    &note.text,
+                );
+            }
             let n = threads::note_count(&records, &owner, &key);
             Answer::ok(format!("Noted as {}#{n}.", target.path()))
         }

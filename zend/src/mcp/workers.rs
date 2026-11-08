@@ -50,6 +50,7 @@ use super::names;
 use super::nudges::{self, Sender};
 use super::ops::NODE_HEADER;
 use super::outcomes::{self, Outcome};
+use super::thread_export;
 use super::records::Records;
 use super::resuming;
 use super::roles::{WorkerKind, ROLE_SELECTOR};
@@ -1443,6 +1444,14 @@ async fn run(
             tracing::warn!(conv_id = %worker.conv_id, "mcp: an alone task's outcome could not be kept for its owner: {e}");
         }
     }
+    thread_export::spawn_export(
+        &records,
+        session.mcp().memory(),
+        &owner,
+        &worker.thread,
+        &format!("{} {label}", worker.path()),
+        &outcome,
+    );
     if let Err(e) = note(&records, &owner, &worker, label, outcome) {
         tracing::warn!(conv_id = %worker.conv_id, "mcp: the outcome could not be entered on the thread: {e}");
     }

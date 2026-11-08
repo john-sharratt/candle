@@ -1,15 +1,26 @@
-//! `thread_attach {thread}`: bind the MCP session to a thread, creating it on
-//! first use (`docs/claude_zend_gateway.md` §4).
+//! `thread_attach {thread, about?}`: bind the MCP session to a thread,
+//! creating it on first use (`docs/claude_zend_gateway.md` §4), and — with
+//! `about` — the thread to the memory topics its work is about
+//! (`docs/zen_memory_and_guides.md` D9).
 
+use std::sync::Arc;
+use std::thread;
+
+use journals::scope::Section;
 use serde_json::{json, Value};
 
-use super::{string, Answer, Ctx};
+use super::{mem, string, Answer, Ctx};
 use crate::mcp::names;
+use crate::mcp::records::Records;
 use crate::mcp::state::ATTACHED;
+use crate::mcp::thread_export;
 use crate::mcp::threads;
 use crate::mcp::workers::{self, now_ms};
 
 pub const NAME: &str = "thread_attach";
+
+/// The most topics a thread is about.
+const MAX_ABOUT: usize = 3;
 
 pub fn definition() -> Value {
     json!({
@@ -25,7 +36,8 @@ pub fn definition() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "thread": {"type": "string", "description": "The thread's name: a kebab-case slug of at most 40 characters."}
+                "thread": {"type": "string", "description": "The thread's name: a kebab-case slug of at most 40 characters."},
+                "about": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_ABOUT, "description": "The memory topics the work is about, at most three (`topics/candle/zen`): its notes and its tasks' ends are kept on the memory's `threads/<thread>`, which each topic references, so every conversation reading the topic sees the work."}
             },
             "required": ["thread"],
             "additionalProperties": false
@@ -59,12 +71,61 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     {
         return Answer::error(e.to_string());
     }
+    if let Some(about) = args.get("about") {
+        if let Err(e) = bind_about(ctx, &records, &owner, thread, about) {
+            return Answer::error(e);
+        }
+    }
     let notes = threads::notes(&records, &owner, thread);
     Answer::ok(answer(
         thread,
         created,
         &threads::render_journal(&format!("T:{thread}"), &notes),
     ))
+}
+
+/// Bind the thread to the caller's group and the topics `about` names
+/// (`crate::mcp::thread_export`), then open its memory journal and reference
+/// it from each topic — off the request path, as the caller.
+fn bind_about(
+    ctx: &Ctx,
+    records: &dyn Records,
+    owner: &str,
+    thread: &str,
+    about: &Value,
+) -> Result<(), String> {
+    let topics: Vec<&str> = about
+        .as_array()
+        .ok_or("`about` is a list of memory topics")?
+        .iter()
+        .map(|v| v.as_str().ok_or("`about` lists topics by their paths"))
+        .collect::<Result<_, _>>()?;
+    if topics.len() > MAX_ABOUT {
+        return Err(format!("`about` names at most {MAX_ABOUT} topics"));
+    }
+    let m = mem::read(ctx)?;
+    let group = m
+        .group
+        .clone()
+        .ok_or_else(|| format!("no memory to keep the work in: {}", m.why_no_here()))?;
+    let paths = topics
+        .iter()
+        .map(|t| m.path(t))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(p) = paths.iter().find(|p| p.section() != Some(Section::Topics)) {
+        return Err(format!("`about` names topics; {p} is none"));
+    }
+    thread_export::bind(records, owner, thread, &group, &paths).map_err(|e| e.to_string())?;
+    let Some(bound) = thread_export::bound(records, owner, thread) else {
+        return Ok(());
+    };
+    let (memory, actor, thread) = (Arc::clone(&m.memory), m.actor(), thread.to_string());
+    thread::spawn(move || {
+        if let Err(e) = thread_export::attach(&memory, &actor, &bound, &thread) {
+            tracing::warn!(%thread, "mcp: the thread's memory journal could not be opened: {e}");
+        }
+    });
+    Ok(())
 }
 
 /// What an attach says: whether the thread was just created — so a mistyped
