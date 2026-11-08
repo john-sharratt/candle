@@ -163,9 +163,11 @@ pub fn drafting(view: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
-/// The reply of a final response, whole: what follows its last `</think>`.
+/// The reply of a final round, whole: what follows the `</think>` that closes
+/// its reasoning — the first. A reply may quote `</think>` itself, as a review
+/// of the code that closes a turn does, and the reply runs on past the quote.
 pub fn final_reply(text: &str) -> String {
-    text.rsplit_once("</think>")
+    text.split_once("</think>")
         .map_or(text, |(_, after)| after)
         .trim()
         .to_string()
@@ -1671,7 +1673,10 @@ async fn turn(
             may_hand,
         )
         .await;
+    // The round being streamed, and the last one that ended: a turn runs a
+    // round per tool call, and its reply is the last round's alone.
     let mut text = String::new();
+    let mut ended = String::new();
     let mut failed: Option<String> = None;
     let mut closed: Option<&'static str> = None;
     let mut handed: Option<(u64, u32, usize)> = None;
@@ -1681,6 +1686,7 @@ async fn turn(
         }
         match item {
             Ok(StreamItem::Token(t)) => text.push_str(&t),
+            Ok(StreamItem::TurnEnd { .. }) => ended = std::mem::take(&mut text),
             Ok(StreamItem::Error(e)) => {
                 failed.get_or_insert(e);
             }
@@ -1696,7 +1702,8 @@ async fn turn(
             }
         }
     }
-    turned(text, failed, closed, handed)
+    let last = if text.is_empty() { ended } else { text };
+    turned(last, failed, closed, handed)
 }
 
 /// What a turn that streamed `text` came to: a failure first, since nothing
@@ -2086,6 +2093,15 @@ mod tests {
         assert_eq!(final_reply("plain"), "plain");
         let long = "x".repeat(5_000);
         assert_eq!(final_reply(&long), long);
+        // A reply that quotes the close of a thought keeps everything after
+        // its own thinking, the quote and what follows it included.
+        assert_eq!(
+            final_reply(
+                "<think>check the close</think>\nThe turn ends at `</think>` or `<|im_end|>`; \
+                 both are fine."
+            ),
+            "The turn ends at `</think>` or `<|im_end|>`; both are fine."
+        );
     }
 
     /// **A turn with no entry says why**, from its last draft's record.
