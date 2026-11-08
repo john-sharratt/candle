@@ -10,8 +10,9 @@ redesign.
 item touches shared state it uses an immutable snapshot published through
 `arc_swap` (already a dependency of zend, npcd and the workspace), an atomic,
 an `Arc` in place of a deep copy, or work moved onto owned data outside the
-lock. Each item says which locks it touches and for how long. The patch adds
-two locks, neither on a request's or a beat's path: the static-file cache's
+lock. Each item says which locks it touches and for how long. Besides
+atomics and `arc_swap` snapshots, the patch adds two locks, neither on a
+request's or a beat's path: the static-file cache's
 (W8), read for a lookup and written on a miss; and the MCP aggregator's
 listing generation (W5), held only by background tasks.
 
@@ -20,9 +21,8 @@ Each item: **what costs** (with the code it is in), **the change**,
 repository requires. File references are as the code stood when this was
 written; the validation pass (§6) re-checks each against the code.
 
-Order of landing: the npcd beat items (N1–N3, N12), then the gateway lock
-items (W1–W3), then the GUI caches (G1–G3), then the rest. §5 lists what was
-considered and held back.
+§5 lists what was considered and held back; §6 the validation, and §7 the
+decisions taken on the open questions and how the patch lands.
 
 ---
 
@@ -778,6 +778,109 @@ panicking.
 
 **Risk.** Low.
 
+### N13. The tower's clock is its own record (promoted, with a lease floor)
+
+**Costs.** Every beat with anyone in the world, `tower.advance` (`engine/watch.rs:78`,
+`sim/upkeep.rs:181-218`) rewrites the clock's `carry`, `tap_carry` and
+`quiet_ms`. The tower is not in `SIM_MAPS` (`snapshot.rs:36-57`), so it lives
+in `sim/meta` — beside `built` (the map-edit history, which only grows),
+findings, the roster and `part_tools` — and the whole meta record is diffed,
+committed and replicated to every member twice a second. Each commit also
+bumps the substrate-wide version every replica watches (N14).
+
+**Change.**
+- `SIM_FACETS = ["tower/clock", "tower/contact", "tower"]` in `snapshot.rs`.
+  `split(value, maps, facets)` takes the facets out whole, children first,
+  **only when the tower is present** (a `None` tower emits no tower records);
+  `join(records, maps, facets)` puts `tower` back first, then each child
+  whose record is present, and none when `tower` is absent or null — so a
+  null tower never becomes `{clock: …}`. Meta then never changes for tower
+  reasons; `sim/tower` changes only when stock or posture does.
+- **Lease floor.** An old-build member reading the new layout sees no tower,
+  and one that took a world's lease would diff against that and tombstone
+  `sim/tower*` for everyone — permanent loss. So the lease driver grants a
+  world lease only to a member whose build is at or above `TOWER_SPLIT_BUILD`,
+  the build that introduces this layout, once any member at or above it is
+  in the group: from then on no older member can write a world. A member
+  below the floor keeps running as a replica until it is upgraded.
+- Before landing, check which other meta fields change every beat (so the
+  tower is not assumed to be the only churn).
+
+**Locks.** None new; the same commit carries fewer bytes. The floor is read
+where the lease driver already decides.
+
+**Tests.** `split` of a world with a tower gives exactly the four records
+`sim/meta`, `sim/tower`, `sim/tower/clock`, `sim/tower/contact` with their
+literal values, and `join` of them gives back the input; a world with no
+tower round-trips with no tower records; contact `None` and `Some` each
+round-trip. On the shipped seed with a body in the foundry, the diff across
+one `watch_at(+500 ms)` puts exactly `sim/tower/clock`. The lease driver
+grants no world lease to a member below the floor once one at or above it is
+present, and grants as today when none is.
+
+**Risk.** Low with the floor; without it, a rolling upgrade could lose the
+tower.
+
+### N14. A replica skips re-applying an unchanged world (promoted, with a dirty flag)
+
+**Costs.** `beat.rs:212-219`: a replica re-reads and re-applies its whole
+world whenever the substrate-wide `custom_objects_version` moves — which any
+custom-object write anywhere does: every world's beat, accounts, bot state.
+`apply` (`apply.rs:144-158`) decodes the Sim and replays it, under the world
+lock — about one full decode per world per beat on every replica.
+
+**Change.** After `store::read`, skip `apply` and `recompute_held` when the
+records equal `standing.written(world).records` (N1's `Arc`, compared
+without a clone) **and the world is clean**. A per-world `dirty: AtomicBool`
+on `Standing` is set by anything that changes a replica's world locally —
+an embody on a world this member does not write (embody restores only the
+place, so the body's hold, walk and lift wait for the next apply), and every
+move to Replica (a lost or cut lease; Discord tasks that land after a
+demotion) — and cleared by an apply. Equal records and a clean world give the
+same result as applying: every input to apply is in the records.
+
+**Locks.** The world lock is no longer taken on most follow beats; the
+`written` mutex is held for one comparison; the flag is an atomic.
+
+**Tests.** A replica follows a world once; locally teleport a body; an
+unrelated custom-object write and a follow beat leave the body where it was
+teleported (proving apply was skipped) with `followed` at the new version;
+a changed `body/` record then places the body by the record. Embodying a
+body locally marks the world dirty, and the next follow beat applies it
+whole. A demotion marks it dirty.
+
+**Risk.** Low with the flag.
+
+### N15. Percepts are composed only for bodies perceived here (promoted)
+
+**Costs.** `Attention::sweep` (`npc-map/src/delta.rs:142-181`) composes a
+full percept, and walks `since`, for every actor every beat under the world
+lock; `push` (`environment.rs:287-292`) then discards the deltas of bodies
+with no mind here or whose character runs on another member — about half the
+cast on a two-member cluster.
+
+**Change.** `Attention::sweep_for(world, keep)`: a kept body goes through
+`take` as today; a body not kept gets `shown.remove(id)` and
+`world.mark_seen(id)` — its cursor still advances, as `environment.rs:269-273`
+requires, so a character lent here later gets no backlog — and nothing is
+composed. The keep set is computed before the world lock, from N11's body →
+mind map and `runs()`. `wake_character` now calls `Hosted::forget` for the
+body it wakes, which nothing in production called: a character lent back
+here could otherwise have its first percept suppressed by a stale
+fingerprint. The first delta after a body starts being perceived here
+re-grounds it with a full percept.
+
+**Locks.** The world lock is held for less time on the beat; nothing new is
+taken inside it.
+
+**Tests.** Bodies m1 and m2, only m1 kept: after a third body speaks,
+`sweep_for` returns only m1's delta and m2's `since` is empty afterwards; with
+both kept, m2's next delta carries a percept. A character lent back here
+(`wake_character`) receives its percept on its first delta. Checked against
+the cooperative-admission tests before landing.
+
+**Risk.** Low–medium; it lands in its own commit.
+
 ---
 
 ## 4. Gateway, cluster, MCP aggregator, tokera.com
@@ -1043,8 +1146,9 @@ gate on `document.hidden` and are left.
 `zend/web/favicon.ico` (itself a PNG), byte-identical at 109,363 bytes,
 replaced together by a lossless 256×256 recompress — the size the MCP
 `serverInfo` icon declares (`mcp-server/src/protocol.rs:186-190`). The site's
-JSON-LD logo is `tokera/favicon.png`, a different file, untouched. A manual
-image step, done outside the session.
+JSON-LD logo is `tokera/favicon.png`, a different file, untouched. The
+re-encode is done through Zen's `image_edit`; the file tools cannot write a
+binary.
 
 **Tests.** `the_switcher_icons_are_the_marks_their_sites_serve`
 (`page.rs:781`) also pins `zend/web/favicon.ico` to `brand/zen.png`; a new
@@ -1057,12 +1161,6 @@ test reads `brand/zen.png`'s IHDR and asserts width and height are exactly
 
 ## 5. Considered and held back
 
-- **The tower's clock in its own record** (npcd): a rolling upgrade's old
-  member taking the lease would tombstone it — permanent loss.
-- **A replica skipping re-apply when nothing changed** (npcd): removes a
-  re-sync that today hides local drift on replicas.
-- **Skipping percepts for bodies this member does not run** (npcd): medium
-  risk.
 - **Cloning the Sim to serialise it outside the lock** (npcd): `Sim::clone`
   copies fields serde skips; needs measuring first.
 - **gzip on zlib-rs**: features unify into zend-vfs's git pack code.
@@ -1102,12 +1200,46 @@ What the passes changed most:
 - **G7** was found here: live history drops its parts, which left a
   sub-agent's tool results drawn as text.
 
-**Landing order.** Z9 before Z4; W1 before W2; W9 before W11; N12 before N9;
-W12's helper before N9. Then the batches: the npcd beat items (N1–N3, N12),
-the gateway lock items (W1–W3), the GUI caches (G1–G3, G7), the rest.
-
 **Test harness additions.** zend's dev-dependency `tokio` gains `test-util`;
 the Playwright suite starts using `page.clock` (1.45+, installed before
 `goto`) and a frozen mock job; pure GUI modules (`job-poll.js`,
 `tool-responses.js`, the list merge) follow `partial-call.js` with
 `node --test`; `mcp` gains an in-module fake-gateway fixture.
+
+## 7. Decisions and landing
+
+**Decided (2026-11-09):**
+- **Z1 is in**, in a commit of its own, landed last, so any regression in the
+  streamed text points at one change.
+- **W9's pages use the gateway's short cache age** (60 s today), with an
+  ETag and 304.
+- **N10's one-pass delay and Z10's briefly stale index are accepted.**
+- **N8's completion-order news is accepted.**
+- **N13, N14 and N15 are promoted** from §5: the tower split behind a lease
+  floor, the replica skip behind a dirty flag, and percepts only for bodies
+  perceived here.
+- **W13's favicon** is re-encoded through Zen's `image_edit` (a lossless
+  256×256 resize of the current mark), and the result committed in all three
+  places.
+- **No before-and-after measurement**: the tests and the trial carry it.
+
+**Who and how.** BlackWorld implements and tests the patch in batches, each
+its own commit, in this order:
+
+1. npcd beat: N1, N2, N3, N12, N4, N11, N7, N10, then N9 (after N12) and
+   N5, N6, N8.
+2. npcd promoted: N14, then N13 with its lease floor, then N15 (its own
+   commit).
+3. Gateway and aggregator: W1, W2 (after W1), W3, W4, W6, W7, W5.
+4. Static and site: W8, W10, W9, W11 (after W9), W12 (before N9's use of
+   it — so W12's helper lands with batch 1), W13.
+5. GUI: G1, G3, G2, G4, G5, G6, G7.
+6. zend server: Z9 (before Z4), Z2, Z3, Z4, Z5, Z6, Z7, Z8, Z10, Z11.
+7. Z1, alone.
+
+Dependencies within: Z9 before Z4; W1 before W2; W9 before W11; N12 before
+N9; W12's helper before N9.
+
+**Release.** The batches land on one branch and go out together as a single
+trial and release once every batch is done and green. Merging to main, the
+trial and the rollout to WhiteWorld are John's calls.
