@@ -17,6 +17,8 @@
 //! | [`spotify`] | Taste and requests |
 //! | [`tidal`] | The audio's catalogue and ZenJ's playlists |
 //! | [`library`] | The tracks ZenJ plays from, built ahead of the night |
+//! | [`live`] | What the night looks like now, for the tools and screens |
+//! | [`zen`] | Asking Zen, through the gateway, as the service `zenj` |
 
 pub mod brain;
 pub mod conductor;
@@ -25,6 +27,7 @@ pub mod deck;
 pub mod events;
 pub mod hands;
 pub mod library;
+pub mod live;
 pub mod midi;
 pub mod music;
 pub mod oauth;
@@ -33,3 +36,4 @@ pub mod rekordbox;
 pub mod room;
 pub mod spotify;
 pub mod tidal;
+pub mod zen;

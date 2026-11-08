@@ -70,11 +70,12 @@ impl Snapshot {
 }
 
 /// An analysis file's path as rekordbox's library and its memory both name
-/// it: from `PIONEER/`, forward slashes, lower case — so one file has one
-/// name whichever wrote it.
+/// it: from `PIONEER/USBANLZ/`, forward slashes, lower case — so one file
+/// has one name whichever wrote it. (The share folder itself sits under
+/// another `Pioneer`, in AppData, which is why the anchor is the pair.)
 pub fn anlz_key(path: &str) -> Option<String> {
     let p = path.replace('\\', "/").to_ascii_lowercase();
-    let at = p.find("pioneer/")?;
+    let at = p.find("pioneer/usbanlz/")?;
     Some(p[at..].to_string())
 }
 
