@@ -43,8 +43,9 @@ mod suspend;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
+use std::mem;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use candle_conversation::models::identity::LegacySpec;
@@ -216,6 +217,41 @@ pub struct Npcs {
     /// **The daemon's only handle to the substrate**, shared with the engine
     /// rather than opened twice. See [`Npcs::substrate`].
     shared: SharedSubstrate,
+    /// Characters a write took in from records replicated since the last
+    /// refresh, for the next [`Npcs::refresh`] to report as changed: the write
+    /// published them, so the refresh no longer finds them moved.
+    taken_in: Mutex<Vec<u64>>,
+}
+
+/// `cast` caught up with the records `p` holds that it was not read from —
+/// written on another member and replicated here — and the ids whose record
+/// changed; `None` when nothing moved.
+fn caught_up(p: &mut SubstratePersistence, cast: &Cast) -> Option<(Cast, Vec<u64>)> {
+    let moved: Vec<(u64, RecordIdentity)> = p
+        .npc_locs()
+        .iter()
+        .filter_map(|(id, _)| Some((*id, p.npc_locs().identity(id)?)))
+        .filter(|(id, identity)| cast.read_as.get(id) != Some(identity))
+        .collect();
+    if moved.is_empty() {
+        return None;
+    }
+    let mut next = Cast::clone(cast);
+    let mut changed = Vec::new();
+    for (id, identity) in moved {
+        match p.read_npc(id) {
+            Ok(Some(npc)) => {
+                if next.by_id.get(&id) != Some(&npc) {
+                    next.by_id.insert(id, npc);
+                    changed.push(id);
+                }
+                next.read_as.insert(id, identity);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("character {id}'s record would not read: {e}"),
+        }
+    }
+    Some((next, changed))
 }
 
 /// A record the log would not take, as the error every write returns.
@@ -315,6 +351,7 @@ impl Npcs {
         Ok(Self {
             current: ArcSwap::from_pointee(cast),
             shared: SharedSubstrate::new(substrate, persistence),
+            taken_in: Mutex::new(Vec::new()),
         })
     }
 
@@ -328,6 +365,13 @@ impl Npcs {
     /// then publish the cast with them in — one step on the persistence owner's
     /// thread, so every write is ordered after the one before it and computed
     /// from what that one published (`docs/npcd_cast_lock_free.md` §2).
+    ///
+    /// **Computed from every record the log holds**, those replicated since
+    /// the last refresh included: the cast is caught up first, in the same
+    /// step. An edit clones the whole record it changes, so one computed from
+    /// a cast behind the log would write the older record back over the newer
+    /// — a mood named from the copy before another member's suspension lands
+    /// as the character's record, unsuspended, on every member.
     ///
     /// Nothing is published unless it is durable, and everything durable is
     /// published: a refused edit leaves the cast exactly as it was, and when an
@@ -344,7 +388,13 @@ impl Npcs {
         let current = &self.current;
         off_the_runtime(|| {
             self.shared.persistence.call(|p| {
-                let cast = current.load_full();
+                let mut cast = current.load_full();
+                if let Some((next, changed)) = caught_up(p, &cast) {
+                    let next = Arc::new(next);
+                    current.store(Arc::clone(&next));
+                    cast = next;
+                    self.taken_in.lock().unwrap().extend(changed);
+                }
                 let (records, out) = edit(&cast)?;
                 if records.is_empty() {
                     return Ok(out);
@@ -399,32 +449,13 @@ impl Npcs {
     /// [`Self::refresh`]'s one step on the owner's thread.
     fn refresh_on(&self, current: &ArcSwap<Cast>) -> Vec<u64> {
         self.shared.persistence.call(|p| {
-            let cast = current.load_full();
-            let moved: Vec<(u64, RecordIdentity)> = p
-                .npc_locs()
-                .iter()
-                .filter_map(|(id, _)| Some((*id, p.npc_locs().identity(id)?)))
-                .filter(|(id, identity)| cast.read_as.get(id) != Some(identity))
-                .collect();
-            if moved.is_empty() {
-                return Vec::new();
+            let mut changed = mem::take(&mut *self.taken_in.lock().unwrap());
+            if let Some((next, more)) = caught_up(p, &current.load_full()) {
+                current.store(Arc::new(next));
+                changed.extend(more);
             }
-            let mut next = Cast::clone(&cast);
-            let mut changed = Vec::new();
-            for (id, identity) in moved {
-                match p.read_npc(id) {
-                    Ok(Some(npc)) => {
-                        if next.by_id.get(&id) != Some(&npc) {
-                            next.by_id.insert(id, npc);
-                            changed.push(id);
-                        }
-                        next.read_as.insert(id, identity);
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("character {id}'s record would not read: {e}"),
-                }
-            }
-            current.store(Arc::new(next));
+            changed.sort_unstable();
+            changed.dedup();
             changed
         })
     }
@@ -1534,6 +1565,45 @@ mod tests {
         // put the character back into it.
         let casting = back.cast().into_iter().find(|c| c.npc_id == id).unwrap();
         assert_eq!(casting.mood.as_deref(), Some("cornered"));
+    }
+
+    /// **A write does not put an older record back over a newer one.** A
+    /// record replicated into the log after the cast was last refreshed is
+    /// what the next write is computed from: a mood named from the stale copy
+    /// would otherwise land as the character's whole record, its suspension
+    /// gone, on every member.
+    #[test]
+    fn a_write_does_not_put_an_older_record_back_over_a_newer_one() {
+        let n = Npcs::load(&tmp()).unwrap();
+        let id = nid(&n.create(&ident("u1"), ME, &body("Umbra"), 1_000).unwrap());
+
+        // Another member's suspension reaches this member's log, and the cast
+        // has not been refreshed since.
+        let mut theirs = n.view().payload(id).unwrap().clone();
+        theirs.state = SUSPENDED.to_string();
+        n.shared.persistence.call(|p| {
+            p.write_npc(&theirs).unwrap();
+            p.commit().unwrap();
+        });
+        assert_eq!(n.view().payload(id).unwrap().state, "idle", "not refreshed");
+
+        // The character names a mood from here: the write is computed from the
+        // log, so the suspension stands under the mood.
+        assert!(n.remember_mood(id, "wary"));
+        let view = n.view();
+        let now = view.payload(id).unwrap();
+        assert_eq!(now.state, SUSPENDED);
+        assert_eq!(now.mood.as_deref(), Some("wary"));
+        drop(view);
+        let logged = n
+            .shared
+            .persistence
+            .call(|p| p.read_npc(id).unwrap().unwrap().state);
+        assert_eq!(logged, SUSPENDED, "the log holds the suspension too");
+
+        // The record it took in is reported to the next refresh, once.
+        assert_eq!(n.refresh(), vec![id]);
+        assert!(n.refresh().is_empty());
     }
 
     /// Feeling something is not an authoring act: a revision bump and an
