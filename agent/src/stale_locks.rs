@@ -72,7 +72,12 @@ fn git_starts() -> Vec<SystemTime> {
     sys.refresh_processes_specifics(ProcessesToUpdate::All, ProcessRefreshKind::new());
     sys.processes()
         .values()
-        .filter(|p| p.name().to_ascii_lowercase().starts_with("git"))
+        .filter(|p| {
+            p.name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("git")
+        })
         .map(|p| UNIX_EPOCH + Duration::from_secs(p.start_time()))
         .collect()
 }
