@@ -489,11 +489,15 @@ fn thoughts(
     let mut timelines: Vec<TimelineId> = Vec::with_capacity(questions.len());
     let opened: anyhow::Result<()> = questions.iter().try_for_each(|_| {
         let e = engine;
+        // **Background, as the ingest is.** A sweep thinks dozens of
+        // questions at once; at `Normal` they rode every forward beside a live
+        // turn, where `Low` rows step aside for an `Urgent` decode
+        // (`scheduler::band`, `urgent_hold`).
         let conv = e
             .new_reserved_conversation(
                 frame.system_prompt,
                 Reserved::Calibration,
-                DecodePriority::Normal,
+                DecodePriority::Low,
                 frame.config.clone(),
             )
             .map_err(|err| anyhow::anyhow!("thinking conversation: {err}"))?;
