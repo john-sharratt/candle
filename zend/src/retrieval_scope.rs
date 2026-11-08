@@ -572,8 +572,14 @@ mod tests {
         let dir = root.path().join("journals");
         for (path, body) in [
             ("README.md", "# The memory\n"),
-            ("groups/zen/topics/candle/2026-10-31-0034-7c25.yaml", "text: a\n"),
-            ("groups/guest/topics/visit/2026-11-01-0900-aaaa.yaml", "text: b\n"),
+            (
+                "groups/zen/topics/candle/2026-10-31-0034-7c25.yaml",
+                "text: a\n",
+            ),
+            (
+                "groups/guest/topics/visit/2026-11-01-0900-aaaa.yaml",
+                "text: b\n",
+            ),
             ("persons/john/person.yaml", "person: john\n"),
             ("persons/yen/person.yaml", "person: yen\n"),
         ] {

@@ -160,7 +160,8 @@ mod tests {
     #[test]
     fn a_conversations_journal_in_the_memory_is_not_read() {
         let s = IngestScope::new("", None);
-        let episode = "groups/zen/conversations/2026-11-08-0308-claude-code/2026-11-08-0315-1989.yaml";
+        let episode =
+            "groups/zen/conversations/2026-11-08-0308-claude-code/2026-11-08-0315-1989.yaml";
         assert_eq!(s.admits("journals", episode, 10), None);
         assert_eq!(
             s.admits("journals", "groups/zen/conversations/journal.yaml", 10),
