@@ -8,6 +8,8 @@
 //! at most [`RING`] small records, never a thread's history, and reading marks
 //! nothing.
 
+use std::cmp::Reverse;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -55,7 +57,7 @@ pub fn newest(records: &dyn Records, owner: &str, n: usize) -> Vec<Outcome> {
         .into_iter()
         .filter_map(|(_, v)| serde_json::from_value(v).ok())
         .collect();
-    all.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+    all.sort_by_key(|o| Reverse(o.at_ms));
     all.truncate(n);
     all
 }
