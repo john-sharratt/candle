@@ -41,7 +41,9 @@ use candle_conversation::projection::{
     TOOLS_ENABLED_SELECTOR,
 };
 use candle_conversation::stencil::{TriggerRegistry, MAX_TOOL_CALLS_PER_TURN};
-use candle_conversation::{ConversationEngine, Sequence, TurnOptions, TurnText};
+use candle_conversation::{
+    is_ground_refusal_message, ConversationEngine, Sequence, TurnOptions, TurnText,
+};
 use zend_tools::tools::file::render::{range_value, windows, PAGE_LINES};
 use zend_tools::ToolContext;
 use zend_vfs::{ObjectFormat, Oid};
@@ -209,6 +211,13 @@ pub(crate) fn chain_finished(engine: &ConversationEngine, timeline: TimelineId) 
 /// transient resource pressure); a cascade signals something
 /// systemic.
 pub const MAX_DECODE_FAILURES: usize = 16;
+
+/// Rounds a pass gives the files whose attempt found no ground — a refused tier,
+/// a full span, the KV budget — after the round that refused them. Each such
+/// attempt is dropped whole (its partial tombstoned, its slot freed) and the file
+/// goes back through admission once the rest of the round has finished and given
+/// its ground back. Only in the last of them does a refusal count as a failure.
+const GROUND_RESUBMITS: usize = 2;
 
 /// Key this pass reports completeness under (see [`crate::ingest_report`]).
 pub const PASS_NAME: &str = "code_read";
@@ -618,6 +627,9 @@ pub fn ingest_jobs(
     // live holder still keeps is left again and counted done here, as every
     // file left to a holder was before: the holder's commit lands it.
     let left_over: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    // The files whose attempt found no ground, resubmitted once the round that
+    // refused them is done ([`GROUND_RESUBMITS`]).
+    let resubmitted: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     let done = AtomicUsize::new(0);
     // Per-file failures are RECORDED, never propagated: the file keeps its prior
     // generation live and the pass carries on, so a bad file (or a systemic VRAM
@@ -627,7 +639,7 @@ pub fn ingest_jobs(
     let failures = Failures::new();
     progress.set_step_progress(0, total as u64);
 
-    let round = |indices: &[usize], last: bool| {
+    let round = |indices: &[usize], last: bool, may_resubmit: bool| {
         let cursor = AtomicUsize::new(0);
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(n_workers);
@@ -646,12 +658,14 @@ pub fn ingest_jobs(
                     };
                     let (file, key) = (&jobs[idx], &keys[idx]);
                     let left = AtomicBool::new(false);
+                    let resubmit = AtomicBool::new(false);
                     let job = Job {
                         file,
                         key,
                         live,
                         binary,
                         left: &left,
+                        resubmit: may_resubmit.then_some(&resubmit),
                     };
                     if let Err(e) =
                         process_one_file(ctx, base, &job, &present_keys, &failures, calibrate)
@@ -677,6 +691,12 @@ pub fn ingest_jobs(
                         left_over.lock().unwrap().push(idx);
                         continue;
                     }
+                    // Refused for want of ground, it goes back through admission
+                    // after this round, and is not done yet either.
+                    if resubmit.load(Ordering::Relaxed) {
+                        resubmitted.lock().unwrap().push(idx);
+                        continue;
+                    }
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     progress.set_step_progress(d as u64, total as u64);
                     // A registered file is "done" on every exit from
@@ -695,7 +715,7 @@ pub fn ingest_jobs(
             }
         });
     };
-    round(&order, false);
+    round(&order, false, true);
     let again = std::mem::take(&mut *left_over.lock().unwrap());
     if !again.is_empty() {
         tracing::info!(
@@ -704,7 +724,21 @@ pub fn ingest_jobs(
             "coming back to the files left to another member's lease",
         );
     }
-    round(&again, true);
+    round(&again, true, true);
+    for remaining in (0..GROUND_RESUBMITS).rev() {
+        let again = std::mem::take(&mut *resubmitted.lock().unwrap());
+        if again.is_empty() {
+            break;
+        }
+        tracing::info!(
+            target: "zend::code_read::ingest",
+            files = again.len(),
+            rounds_left = remaining,
+            "resubmitting the files whose attempt found no ground, now the round that \
+             refused them has given its ground back",
+        );
+        round(&again, true, remaining > 0);
+    }
 
     // An abort or a shutdown cancel can leave files claimed but never run —
     // hand them back, or the GUI's backlog bar never reaches zero.
@@ -752,6 +786,10 @@ struct Job<'a> {
     /// Set when the file is left to the member holding its lease, so the pass
     /// comes back to it once the rest is read.
     left: &'a AtomicBool,
+    /// Set when the file's attempt found no ground and was dropped, so the pass
+    /// resubmits it after this round; `None` in the last round that may, where
+    /// such an attempt is a failure like any other.
+    resubmit: Option<&'a AtomicBool>,
 }
 
 /// The tools a file's conversation runs against: file stores reading the
@@ -997,6 +1035,27 @@ fn process_one_file(
                     "shutdown cancelled decode mid-file — dropped partial; will re-ingest next run",
                 );
                 return Ok(());
+            }
+            // **No ground is not a bad file.** The device refused the file's wave
+            // for want of room the rest of the round is holding — and gives back as
+            // it finishes. The attempt is dropped whole (its partial is tombstoned
+            // above, its slot freed when `conv` drops) and the file goes back
+            // through admission after the round, rather than being counted against
+            // the cap and left for a pass that only a branch move or a layer clock
+            // starts. On WhiteWorld (2026-11-08) every such failure was one region
+            // short, and a pass gave up at its cap with 30 files refused this way.
+            if let Some(resubmit) = job.resubmit {
+                let msg = format!("{e:#}");
+                if is_ground_refusal_message(&msg) {
+                    tracing::info!(
+                        target: "zend::code_read::ingest",
+                        file = %file.path,
+                        "file ingest found no ground; its attempt is dropped and the file \
+                         is resubmitted after this round: {msg}",
+                    );
+                    resubmit.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
             }
             let n = failures.record(&file.path, format!("{e:#}"));
             tracing::warn!(

@@ -860,6 +860,9 @@ impl BackingInner {
                 LeaseOrigin::Foreign,
             )?
         };
+        // The arena's place in every allocation and release choice is where its
+        // region sits, known only now.
+        self.pool.set_arena_rank(key, index, region.index());
         Ok(Arena::new(data, key, index).in_region(region))
     }
 

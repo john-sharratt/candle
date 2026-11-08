@@ -58,6 +58,9 @@ pub(crate) fn ingest_link(
         live,
         binary,
         left: &left,
+        // Read ahead of the pass, outside its rounds: a link that found no ground
+        // fails here, and the chain continues from the link before it.
+        resubmit: None,
     };
     let failures = Failures::new();
     priming_watch::stage("reading the file");

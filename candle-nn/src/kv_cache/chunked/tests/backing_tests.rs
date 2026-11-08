@@ -3,7 +3,35 @@
 use candle::{DType, Device};
 
 use crate::kv_cache::chunked::ChunkedKvBacking;
-use crate::kv_cache::{tier_refusal_shortfall, KvFormat, TIER_REFUSED_MARKER, TIER_SHORT_BY};
+use crate::kv_cache::{
+    is_ground_refusal_message, tier_refusal_shortfall, KvFormat, KV_DEVICE_OOM_MARKER,
+    SPAN_FULL_MARKER, TIER_REFUSED_MARKER, TIER_SHORT_BY,
+};
+
+/// **No ground reads as no ground however a caller wrapped it** — the refusal a
+/// file ingest met on WhiteWorld (2026-11-08), wrapped twice on its way up, and
+/// the span and budget refusals beside it — and a fault in the work does not.
+#[test]
+fn a_ground_refusal_reads_through_its_wrapping() {
+    let met = format!(
+        "decode: wave group forward failed mid-sweep: {TIER_REFUSED_MARKER}: \
+         {TIER_SHORT_BY}16777216 B — its transient tier needs 50331648 B below the weight \
+         floor and is 1 regions into ground live KV arenas hold, which cannot move."
+    );
+    assert!(is_ground_refusal_message(&met));
+    assert!(is_ground_refusal_message(&format!(
+        "prefill: {SPAN_FULL_MARKER}"
+    )));
+    assert!(is_ground_refusal_message(&format!(
+        "{KV_DEVICE_OOM_MARKER}: no region is claimable"
+    )));
+    assert!(!is_ground_refusal_message(
+        "decode: the draft wrote no question"
+    ));
+    assert!(!is_ground_refusal_message(
+        "QSA index page of stream 17774215047922622983 is indexed but unreadable"
+    ));
+}
 
 /// A refusal's shortfall reads back as the bytes the placement wrote, from the
 /// message shaped as `place_transient` shapes it; anything else reads `None`.

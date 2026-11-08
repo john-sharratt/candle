@@ -24,9 +24,21 @@
 //! At 10M-token arena scale, this replaces 10M `Arc<GidInner>` heap
 //! allocations with one ~600 KB contiguous `Vec<AtomicU16>` per arena.
 //!
+//! ### Placement order
+//!
+//! Every choice of arena — which takes the next slot, which empty one is
+//! released — goes by the arena's **place**: its region's position in the
+//! device reservation, lowest address first ([`ArenaPool::set_rank`]). An
+//! `arena_idx` is only the gid namespace slot, recycled whenever an arena is
+//! tombstoned, so it says nothing about where the arena sits; ordering by it
+//! put new chunks and the kept reserve wherever recycling had left the index,
+//! including the region at the top of the span. An arena with no region (a
+//! warm-tier slab, or one whose region is not yet claimed) sorts after every
+//! placed arena, by index.
+//!
 //! ### Allocation path
 //!
-//! `ArenaPool::allocate_n` iterates arenas in `arena_idx` order (skipping full
+//! `ArenaPool::allocate_n` iterates arenas in place order (skipping full
 //! ones via the pool capacity bitmap). For each arena it claims slots in O(1):
 //! pop the `recycle_head` stack if non-empty, else bump `hwm`. No per-slot
 //! scan, so allocation cost is independent of how fragmented the arena is.
@@ -139,6 +151,10 @@ pub struct ArenaRefcounts {
     /// full → non-full transition so the pool's `allocate_any` can find it via
     /// find-first-set instead of scanning every arena.
     capacity: Arc<CapacityBitmap>,
+    /// This arena's place in its pool's placement order — its region rank once
+    /// [`ArenaPool::set_rank`] records it, [`unranked_place`] until then — and
+    /// so the bit it owns in `capacity`.
+    place: AtomicUsize,
     /// Creation window guard: `true` from registration until the arena hands out
     /// its FIRST gid, or until its creator closes it explicitly with
     /// `ChunkGidPool::finish_creation` — which every creator that may not claim does
@@ -189,8 +205,15 @@ impl ArenaRefcounts {
             arena_idx,
             key,
             capacity,
+            place: AtomicUsize::new(unranked_place(arena_idx)),
             creation_pending: AtomicBool::new(true),
         }
+    }
+
+    /// This arena's place in its pool's placement order.
+    #[inline]
+    fn place(&self) -> usize {
+        self.place.load(Ordering::Acquire)
     }
 
     /// Whether this arena is still inside its creation window (registered but
@@ -431,7 +454,7 @@ impl ArenaRefcounts {
             // can only *hide* capacity, which `allocate_any`'s fallback resync
             // recovers — it can never leak a slot permanently.
             if prev_live == self.arena_chunks {
-                self.capacity.set(self.arena_idx);
+                self.capacity.set(self.place());
             }
         } else if prev == 0 {
             // Underflow: someone over-decremented. Panic loudly — this
@@ -622,17 +645,36 @@ impl Eq for ChunkGid {}
 ///
 /// Each arena owns a lock-free [`ArenaRefcounts`] table behind an `Arc`.
 /// The pool only takes its `RwLock` on `register_arena` / `release_arena`
-/// Per-format bitmap: bit `i` set ⇒ arena `i` of this format has ≥1 free slot.
+/// Places a ranked arena can take — one per region of the largest span the pool
+/// is sized for: a 512 GiB VRAM ceiling over the arena size, far past any single
+/// card. Region ranks and `arena_idx` (VRAM-bounded, recycled on tombstone) both
+/// stay below it.
+const RANKED_PLACES: usize = {
+    let regions = (512usize << 30) / TARGET_ARENA_BYTES;
+    if regions > 4096 {
+        regions
+    } else {
+        4096
+    }
+};
+
+/// The place of an arena with no region rank: after every ranked place, in
+/// index order.
+#[inline]
+const fn unranked_place(arena_idx: usize) -> usize {
+    RANKED_PLACES + arena_idx
+}
+
+/// Per-format bitmap: bit `p` set ⇒ the arena at place `p` has ≥1 free slot.
 /// The pool's O(1) "which arena has capacity" index — it replaces the per-alloc
 /// walk over every arena that was the pressure-regime `alloc` bottleneck
 /// (`allocate_any` used to iterate the whole `tables` map, O(num_arenas), for
 /// every one of the ~1M allocations a drain pass issues). Fully lock-free: `dec`
 /// sets a bit on a full→non-full transition, alloc clears it on non-full→full
-/// and reads it via find-first-set. Fixed-size so `dec` never contends a resize;
-/// sized from a 512 GiB VRAM ceiling / arena size, far past any single card, so
-/// `arena_idx` (VRAM-bounded — indices are recycled on tombstone) never exceeds
-/// it. `find-first-set` returns the lowest such arena, preserving the lowest-
-/// first packing compaction relies on.
+/// and reads it via find-first-set. Fixed-size so `dec` never contends a resize:
+/// [`RANKED_PLACES`] ranked places, then as many unranked ones. `find-first-set`
+/// returns the lowest place — the arena lowest in the span — which is the
+/// lowest-first packing compaction relies on.
 #[derive(Debug)]
 struct CapacityBitmap {
     words: Box<[AtomicU64]>,
@@ -640,28 +682,27 @@ struct CapacityBitmap {
 
 impl CapacityBitmap {
     fn new() -> Self {
-        let max_arenas = ((512usize << 30) / TARGET_ARENA_BYTES).max(4096);
-        let words = (0..max_arenas.div_ceil(64))
+        let words = (0..(2 * RANKED_PLACES).div_ceil(64))
             .map(|_| AtomicU64::new(0))
             .collect();
         Self { words }
     }
 
     #[inline]
-    fn set(&self, arena_idx: usize) {
-        if let Some(w) = self.words.get(arena_idx >> 6) {
-            w.fetch_or(1u64 << (arena_idx & 63), Ordering::Release);
+    fn set(&self, place: usize) {
+        if let Some(w) = self.words.get(place >> 6) {
+            w.fetch_or(1u64 << (place & 63), Ordering::Release);
         }
     }
 
     #[inline]
-    fn clear(&self, arena_idx: usize) {
-        if let Some(w) = self.words.get(arena_idx >> 6) {
-            w.fetch_and(!(1u64 << (arena_idx & 63)), Ordering::Release);
+    fn clear(&self, place: usize) {
+        if let Some(w) = self.words.get(place >> 6) {
+            w.fetch_and(!(1u64 << (place & 63)), Ordering::Release);
         }
     }
 
-    /// Lowest arena index whose has-capacity bit is set, or `None` if all clear.
+    /// Lowest place whose has-capacity bit is set, or `None` if all clear.
     #[inline]
     fn first_set(&self) -> Option<usize> {
         for (wi, w) in self.words.iter().enumerate() {
@@ -680,11 +721,12 @@ impl CapacityBitmap {
 struct ArenaPool {
     /// `arena_idx → refcount table`. `RwLock`'d for register/release;
     /// reads are uncontended in steady state.
-    /// Keyed by `arena_idx`. A `BTreeMap` (not a hash map) so iteration is
-    /// already in ascending `arena_idx` order: the allocators walk it
-    /// lowest-first for compaction-friendly packing without rebuilding and
-    /// sorting an index `Vec` on every allocation.
     tables: RwLock<BTreeMap<usize, Arc<ArenaRefcounts>>>,
+    /// `place → arena_idx` for every arena in `tables`: the placement order the
+    /// allocators walk and the empty sweep chooses by, lowest in the span
+    /// first, kept so neither rebuilds and sorts it per claim. Taken after
+    /// `tables`, never before.
+    order: RwLock<BTreeMap<usize, usize>>,
     /// Number of currently-registered arenas for this key. Lock-free
     /// counter for fast diagnostics.
     total_arenas: AtomicUsize,
@@ -704,10 +746,11 @@ struct ArenaPool {
     /// lock-free on arbitrary threads; the gate only removes claimer↔claimer
     /// contention. Held for bookkeeping only, never across GPU work.
     alloc_gate: Mutex<()>,
-    /// Bit `i` set ⇒ arena `i` has ≥1 free slot. `allocate_any` finds the
-    /// lowest such arena via find-first-set instead of walking every arena.
+    /// Bit `p` set ⇒ the arena at place `p` has ≥1 free slot. `allocate_any`
+    /// finds the lowest such arena via find-first-set instead of walking every
+    /// arena.
     capacity: Arc<CapacityBitmap>,
-    /// `run_floors[l]`: every arena below this index has a never-used tail
+    /// `run_floors[l]`: every arena placed below this place has a never-used tail
     /// shorter than `l` slots, so it can host no run of `l` or more — its
     /// high-water mark never retreats. A run claim of length `l` starts at
     /// `run_floors[min(l, RUN_FLOOR_LENS − 1)]` instead of at the lowest arena,
@@ -718,9 +761,9 @@ struct ArenaPool {
     /// because an arena whose tail is a few slots short of a run — left behind
     /// when single-slot claims have moved its high-water mark off the run grid —
     /// stops a floor kept for "no tail at all" dead, and every run claim then
-    /// walked every arena past it. Lowered when an arena registers below them (a
-    /// recycled index is a fresh arena with a whole tail); only moved under the
-    /// `tables` lock.
+    /// walked every arena past it. Lowered when an arena takes a place below them
+    /// (registered, or ranked into a lower place, with a whole tail); only moved
+    /// under the `tables` lock.
     run_floors: [AtomicUsize; RUN_FLOOR_LENS],
 }
 
@@ -741,6 +784,7 @@ impl ArenaPool {
     fn with_chunks(arena_chunks: usize) -> Self {
         Self {
             tables: RwLock::new(BTreeMap::new()),
+            order: RwLock::new(BTreeMap::new()),
             total_arenas: AtomicUsize::new(0),
             total_live: Arc::new(AtomicUsize::new(0)),
             arena_chunks,
@@ -764,25 +808,79 @@ impl ArenaPool {
             Arc::clone(&self.total_live),
             Arc::clone(&self.capacity),
         ));
+        let place = table.place();
         {
             let mut tables = self.tables.write().unwrap();
             tables.insert(arena_idx, Arc::clone(&table));
+            self.order.write().unwrap().insert(place, arena_idx);
             // A fresh arena has its whole tail: runs of every length may land
             // at or above it.
             for floor in &self.run_floors {
-                floor.fetch_min(arena_idx, Ordering::Relaxed);
+                floor.fetch_min(place, Ordering::Relaxed);
             }
         }
         self.total_arenas.fetch_add(1, Ordering::Relaxed);
         // A fresh arena is all free — mark it available. Ordered after the
         // `tables` insert so a claimer that sees the bit also finds the table.
-        self.capacity.set(arena_idx);
+        self.capacity.set(place);
         table
     }
 
-    /// Allocate a single gid from any arena. Iterates arenas in
-    /// `arena_idx` order (lowest first) so live data clusters in low
-    /// indices, keeping compaction effective.
+    /// Record that `arena_idx`'s slab is carved from region `rank`, moving it to
+    /// that place in the placement order.
+    ///
+    /// **After the region is claimed, never at registration**: the index is handed
+    /// out before its storage exists, and recycled onto a different region once the
+    /// arena is tombstoned. The rank goes with the refcount table, which the
+    /// tombstone drops, so a recycled index starts unranked again.
+    ///
+    /// Under the claim gate, so no claimer reads the arena's capacity bit while it
+    /// moves; a drop racing the move can leave a stale bit at the old place, which
+    /// [`Self::allocate_any`] clears on sight.
+    fn set_rank(&self, arena_idx: usize, rank: usize) {
+        if rank >= RANKED_PLACES {
+            return;
+        }
+        let _gate = self.alloc_gate.lock().unwrap();
+        let tables = self.tables.read().unwrap();
+        let Some(table) = tables.get(&arena_idx) else {
+            return;
+        };
+        let old = table.place.swap(rank, Ordering::AcqRel);
+        if old == rank {
+            return;
+        }
+        {
+            let mut order = self.order.write().unwrap();
+            order.remove(&old);
+            order.insert(rank, arena_idx);
+        }
+        self.capacity.clear(old);
+        if !table.is_full() {
+            self.capacity.set(rank);
+        }
+        for floor in &self.run_floors {
+            floor.fetch_min(rank, Ordering::Relaxed);
+        }
+    }
+
+    /// Drop `arena_idx`'s table and its place, and clear its capacity bit;
+    /// `true` when there was one. The caller holds the `tables` write lock.
+    fn remove_table(
+        &self,
+        tables: &mut BTreeMap<usize, Arc<ArenaRefcounts>>,
+        arena_idx: usize,
+    ) -> bool {
+        let Some(table) = tables.remove(&arena_idx) else {
+            return false;
+        };
+        let place = table.place();
+        self.order.write().unwrap().remove(&place);
+        self.total_arenas.fetch_sub(1, Ordering::Relaxed);
+        self.capacity.clear(place);
+        true
+    }
+
     /// Claim `len` CONSECUTIVE slots in one arena of this pool, returning the
     /// first raw gid and the arena's refcount table. Only the never-used
     /// high-water tail of an arena can host a run (see
@@ -792,6 +890,7 @@ impl ArenaPool {
         let _gate = self.alloc_gate.lock().unwrap();
         let stride = GID_STRIDE;
         let tables = self.tables.read().unwrap();
+        let order = self.order.read().unwrap();
         let floor_len = len.min(RUN_FLOOR_LENS - 1);
         let floor = self.run_floor(len).load(Ordering::Relaxed);
         // The prefix that cannot serve this length grows as the walk passes
@@ -801,18 +900,21 @@ impl ArenaPool {
         // past the last floor says nothing about that floor's length.
         let mut next_floor = floor;
         let mut prefix_exhausted = true;
-        for (&arena_idx, table) in tables.range(floor..) {
+        for (&place, arena_idx) in order.range(floor..) {
+            let Some(table) = tables.get(arena_idx) else {
+                continue;
+            };
             if table.run_fits(len) {
                 if let Some(first) = table.try_claim_run(len) {
                     if table.is_full() {
-                        self.capacity.clear(arena_idx);
+                        self.capacity.clear(place);
                     }
                     self.run_floors[floor_len].store(next_floor, Ordering::Relaxed);
                     return Some(((arena_idx * stride + first) as i64, Arc::clone(table)));
                 }
             }
             if prefix_exhausted && !table.run_fits(floor_len) {
-                next_floor = arena_idx + 1;
+                next_floor = place + 1;
             } else {
                 prefix_exhausted = false;
             }
@@ -839,9 +941,22 @@ impl ArenaPool {
         let table = tables.get(&arena_idx)?;
         let first = table.try_claim_run(len)?;
         if table.is_full() {
-            self.capacity.clear(arena_idx);
+            self.capacity.clear(table.place());
         }
         Some(((arena_idx * stride + first) as i64, Arc::clone(table)))
+    }
+
+    /// The arena at `place`, if one stands there: its index and table.
+    fn at_place<'t>(
+        tables: &'t BTreeMap<usize, Arc<ArenaRefcounts>>,
+        order: &BTreeMap<usize, usize>,
+        place: usize,
+    ) -> Option<(usize, &'t Arc<ArenaRefcounts>)> {
+        let arena_idx = *order.get(&place)?;
+        tables
+            .get(&arena_idx)
+            .filter(|t| t.place() == place)
+            .map(|t| (arena_idx, t))
     }
 
     fn allocate_any(&self) -> Option<(i64, Arc<ArenaRefcounts>)> {
@@ -852,25 +967,27 @@ impl ArenaPool {
         let _gate = self.alloc_gate.lock().unwrap();
         let stride = GID_STRIDE;
         let tables = self.tables.read().unwrap();
-        // Fast path: the capacity bitmap points at the lowest arena with a free
-        // slot (find-first-set = lowest-first packing), skipping the full-arena
-        // prefix that made this an O(num_arenas) walk per alloc at pressure. A
-        // set bit can be stale (the arena filled since it was set) → the claim
-        // fails → clear it and try the next set bit.
-        while let Some(arena_idx) = self.capacity.first_set() {
-            match tables.get(&arena_idx) {
-                Some(table) => {
+        let order = self.order.read().unwrap();
+        // Fast path: the capacity bitmap points at the lowest-placed arena with a
+        // free slot (find-first-set = lowest-first packing), skipping the
+        // full-arena prefix that made this an O(num_arenas) walk per alloc at
+        // pressure. A set bit can be stale (the arena filled since it was set) →
+        // the claim fails → clear it and try the next set bit.
+        while let Some(place) = self.capacity.first_set() {
+            match Self::at_place(&tables, &order, place) {
+                Some((arena_idx, table)) => {
                     if let Some(chunk_idx) = table.try_claim_one() {
                         if table.is_full() {
-                            self.capacity.clear(arena_idx);
+                            self.capacity.clear(place);
                         }
                         return Some(((arena_idx * stride + chunk_idx) as i64, Arc::clone(table)));
                     }
                     // Stale set bit — arena is full. Clear and try the next.
-                    self.capacity.clear(arena_idx);
+                    self.capacity.clear(place);
                 }
-                // Bit set for a tombstoned arena (register/release race) — clear.
-                None => self.capacity.clear(arena_idx),
+                // Bit set for a tombstoned arena (register/release race), or left at
+                // the place an arena moved from when it was ranked — clear.
+                None => self.capacity.clear(place),
             }
         }
         // Fallback: the bitmap says every arena is full. That's authoritative
@@ -881,18 +998,18 @@ impl ArenaPool {
         // hold `alloc_gate`, so no concurrent claim can consume the recovered
         // capacity before we do; concurrent drops only add more.
         let mut recovered = false;
-        for (&arena_idx, table) in tables.iter() {
+        for table in tables.values() {
             if table.free_count() > 0 {
-                self.capacity.set(arena_idx);
+                self.capacity.set(table.place());
                 recovered = true;
             }
         }
         if recovered {
-            if let Some(arena_idx) = self.capacity.first_set() {
-                if let Some(table) = tables.get(&arena_idx) {
+            if let Some(place) = self.capacity.first_set() {
+                if let Some((arena_idx, table)) = Self::at_place(&tables, &order, place) {
                     if let Some(chunk_idx) = table.try_claim_one() {
                         if table.is_full() {
-                            self.capacity.clear(arena_idx);
+                            self.capacity.clear(place);
                         }
                         return Some(((arena_idx * stride + chunk_idx) as i64, Arc::clone(table)));
                     }
@@ -914,15 +1031,19 @@ impl ArenaPool {
 
         // One gate acquisition for the whole bulk claim (see `allocate_any`).
         let _gate = self.alloc_gate.lock().unwrap();
-        // Same lowest-first BTreeMap walk as `allocate_any`, draining each
+        // The same lowest-placed-first order as `allocate_any`, draining each
         // arena before moving up — one read lock, no index collect + sort.
         let stride = GID_STRIDE;
         let tables = self.tables.read().unwrap();
-        for (&arena_idx, table) in tables.iter() {
+        let order = self.order.read().unwrap();
+        for arena_idx in order.values() {
             if out.len() == n {
                 break;
             }
-            let base = (arena_idx * stride) as i64;
+            let Some(table) = tables.get(arena_idx) else {
+                continue;
+            };
+            let base = (*arena_idx * stride) as i64;
             // Drain as many as we can from this arena.
             while out.len() < n {
                 match table.try_claim_one() {
@@ -972,8 +1093,15 @@ impl ArenaPool {
     /// least one arena): an empty arena is released only while the class would
     /// still hold its target free without it — and, above the one-arena floor,
     /// one arena more, a hysteresis band so a target moving by a few slots
-    /// neither creates nor releases. The highest-index empty goes first, so the
-    /// reserve that stays is the lowest — left in the span.
+    /// neither creates nor releases.
+    ///
+    /// **The highest-placed empty goes first** — the one at the greatest offset
+    /// into the reservation, never the greatest `arena_idx` — for every class: the
+    /// arenas that stay are the lowest in the span, and the frontier comes down to
+    /// them. Chosen by index, the kept reserve was wherever recycling had left the
+    /// index: on BlackWorld (2026-11-08) an empty 2048 B reserve arena stood on
+    /// region 3127, the top of the span, for hours, with 20 GB of holes below it
+    /// that no pass could hand the expert zone.
     fn try_tombstone(
         &self,
         protected_arenas: &AHashSet<usize>,
@@ -995,37 +1123,35 @@ impl ArenaPool {
         let _gate = self.alloc_gate.lock().unwrap();
 
         let tables = self.tables.read().unwrap();
-        // Lowest-index fully-free, non-protected arena. `creation_pending` is
+        // Highest-placed fully-free, non-protected arena. `creation_pending` is
         // checked FIRST: its Acquire load pairs with `occupy`'s Release clear,
         // so an arena observed past its creation window is guaranteed to show
         // its first allocation in `live_count` — a freshly-registered arena
         // whose creator hasn't allocated yet can never be tombstoned (freeing
         // it would unmap memory an in-flight kernel writes, and recycle its
         // index to a second owner: cross-context KV contamination).
-        let empties = tables.iter().filter(|(idx, t)| {
-            !t.creation_pending() && t.live_count() == 0 && !protected_arenas.contains(idx)
-        });
-        let candidate = match reserve {
-            Some(target) => {
-                let free: usize = tables
-                    .values()
-                    .map(|t| self.arena_chunks.saturating_sub(t.live_count()))
-                    .sum();
-                if free.saturating_sub(self.arena_chunks) < keep_free(target, self.arena_chunks) {
-                    return None;
-                }
-                empties.map(|(&idx, _)| idx).max()?
+        let highest_empty = tables
+            .iter()
+            .filter(|(idx, t)| {
+                !t.creation_pending() && t.live_count() == 0 && !protected_arenas.contains(idx)
+            })
+            .map(|(&idx, t)| (t.place(), idx))
+            .max();
+        if let Some(target) = reserve {
+            let free: usize = tables
+                .values()
+                .map(|t| self.arena_chunks.saturating_sub(t.live_count()))
+                .sum();
+            if free.saturating_sub(self.arena_chunks) < keep_free(target, self.arena_chunks) {
+                return None;
             }
-            None => empties.map(|(&idx, _)| idx).min()?,
-        };
+        }
+        let (_, candidate) = highest_empty?;
         drop(tables);
 
-        let mut tables = self.tables.write().unwrap();
-        tables.remove(&candidate);
-        self.total_arenas.fetch_sub(1, Ordering::Relaxed);
-        // Arena gone — clear its capacity bit so `allocate_any` doesn't chase a
-        // dangling index (it self-heals via the `tables.get` miss anyway).
-        self.capacity.clear(candidate);
+        // Arena gone — its capacity bit goes with it, so `allocate_any` doesn't
+        // chase a dangling place (it self-heals via the lookup miss anyway).
+        self.remove_table(&mut self.tables.write().unwrap(), candidate);
         Some(candidate)
     }
 
@@ -1046,21 +1172,13 @@ impl ArenaPool {
         if !empty {
             return false;
         }
-        let mut tables = self.tables.write().unwrap();
-        tables.remove(&arena_idx);
-        self.total_arenas.fetch_sub(1, Ordering::Relaxed);
-        self.capacity.clear(arena_idx);
-        true
+        self.remove_table(&mut self.tables.write().unwrap(), arena_idx)
     }
 
     /// Force-remove an arena's table regardless of whether it's empty.
     /// Used by the legacy `release_arena` path after a manual gid drain.
     fn force_release(&self, arena_idx: usize) {
-        let mut tables = self.tables.write().unwrap();
-        if tables.remove(&arena_idx).is_some() {
-            self.total_arenas.fetch_sub(1, Ordering::Relaxed);
-            self.capacity.clear(arena_idx);
-        }
+        self.remove_table(&mut self.tables.write().unwrap(), arena_idx);
     }
 
     fn has_reclaimable(&self) -> bool {
@@ -1439,9 +1557,18 @@ impl ChunkGidPool {
             .store(true, Ordering::Release);
     }
 
+    /// Record that `key`'s arena `arena_idx` is carved from region `rank` — its
+    /// place in the reservation, which every allocation and every release of the
+    /// arena is ordered by. Called once the region is claimed.
+    pub fn set_arena_rank(&self, key: ArenaKey, arena_idx: usize, rank: usize) {
+        if let Some(pool) = self.inner.pools.get(&key) {
+            pool.set_rank(arena_idx, rank);
+        }
+    }
+
     /// Allocate a gid for the given format.
     ///
-    /// Iterates arenas in `arena_idx` order (lowest first). Returns
+    /// Takes the lowest-placed arena with a free slot. Returns
     /// `None` if no arena of this format has free capacity — caller
     /// should `register_arena` and retry.
     pub fn allocate_for(&self, key: ArenaKey) -> Option<ChunkGid> {
@@ -1491,8 +1618,11 @@ impl ChunkGidPool {
             return false;
         };
         let tables = pool.tables.read().unwrap();
+        let order = pool.order.read().unwrap();
         let floor = pool.run_floor(len).load(Ordering::Relaxed);
-        tables.range(floor..).any(|(_, t)| t.run_fits(len))
+        order
+            .range(floor..)
+            .any(|(_, idx)| tables.get(idx).is_some_and(|t| t.run_fits(len)))
     }
 
     /// [`Self::allocate_run_for`] against one specific arena index — see
@@ -1947,11 +2077,117 @@ mod tests {
 
         let a = standing_arena(&pool, other);
         let b = standing_arena(&pool, other);
-        assert_eq!(pool.next_tombstone(other), Some(a.min(b)));
+        assert_eq!(pool.next_tombstone(other), Some(a.max(b)));
         assert_eq!(
             pool.next_tombstone(other),
-            Some(a.max(b)),
+            Some(a.min(b)),
             "no reserve, swept bare"
+        );
+    }
+
+    /// Two standing arenas of `key` whose indices run **opposite** to their
+    /// places in the span: `(high, low)`, `high` registered first (the lower
+    /// index) and carved from region 9, `low` second and from region 2.
+    fn reversed_pair(pool: &ChunkGidPool, key: ArenaKey) -> (usize, usize) {
+        let high = standing_arena(pool, key);
+        let low = standing_arena(pool, key);
+        assert!(high < low, "the lower index is the higher place");
+        pool.set_arena_rank(key, high, 9);
+        pool.set_arena_rank(key, low, 2);
+        (high, low)
+    }
+
+    /// **The reserve that stays is the lowest in the span, whatever the
+    /// indices say**: of two empty arenas the sweep releases the one at the
+    /// greater offset into the reservation. Chosen by index, it released the
+    /// lower arena and kept the higher one standing on the frontier — region
+    /// 3127 on BlackWorld (2026-11-08), for hours.
+    #[test]
+    fn the_reserve_keeps_the_lowest_placed_arena_whatever_its_index() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        pool.keep_reserve(key);
+        let (high, low) = reversed_pair(&pool, key);
+        assert_eq!(
+            pool.next_tombstone(key),
+            Some(high),
+            "the arena higher in the span goes"
+        );
+        pool.recycle_arena_index(high);
+        assert_eq!(pool.next_tombstone(key), None, "the lower one stays");
+        assert_eq!(pool.pool_arena_load(key)[0].0, low);
+    }
+
+    /// **A class with no reserve is swept from the top of the span down.**
+    #[test]
+    fn an_unreserved_class_is_swept_from_the_highest_place() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let (high, low) = reversed_pair(&pool, key);
+        assert_eq!(pool.next_tombstone(key), Some(high));
+        assert_eq!(pool.next_tombstone(key), Some(low));
+    }
+
+    /// **A slot goes to the arena lowest in the span, whatever its index** —
+    /// a single claim, a bulk claim and a run alike. Filling by index put new
+    /// chunks in the high arenas compaction had just emptied, and the two moved
+    /// the same chunks back and forth every few seconds.
+    #[test]
+    fn a_claim_takes_the_lowest_placed_arena_whatever_its_index() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let (high, low) = reversed_pair(&pool, key);
+
+        let one = pool.allocate_for(key).expect("a slot");
+        assert_eq!(one.arena_idx(), low, "single claim");
+        let bulk = pool.allocate_n_for(key, 3);
+        assert!(bulk.iter().all(|g| g.arena_idx() == low), "bulk claim");
+        let run = pool.allocate_run_for(key, 2).expect("a run");
+        assert!(run.iter().all(|g| g.arena_idx() == low), "run claim");
+        assert!(pool.run_would_fit(key, 2));
+
+        // Fill the low arena: only then does the high one serve.
+        let cap = test_arena_chunks();
+        let rest = pool.allocate_n_for(key, cap - 6);
+        assert!(rest.iter().all(|g| g.arena_idx() == low));
+        assert_eq!(pool.allocate_for(key).unwrap().arena_idx(), high);
+    }
+
+    /// **A freed slot in a full low arena brings it back first**: the drop sets
+    /// the arena's capacity at its place, not at its index.
+    #[test]
+    fn a_drop_in_the_low_arena_serves_the_next_claim() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let (high, low) = reversed_pair(&pool, key);
+        let cap = test_arena_chunks();
+        let mut filled = pool.allocate_n_for(key, cap);
+        assert!(filled.iter().all(|g| g.arena_idx() == low));
+        let in_high = pool.allocate_for(key).unwrap();
+        assert_eq!(in_high.arena_idx(), high);
+        filled.pop();
+        assert_eq!(pool.allocate_for(key).unwrap().arena_idx(), low);
+    }
+
+    /// **A placed arena comes before every unplaced one**, and a recycled index
+    /// starts unplaced: the rank went with the table its tombstone dropped, so
+    /// the index does not carry its old region's place onto a new one.
+    #[test]
+    fn a_recycled_index_does_not_keep_its_old_place() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let first = standing_arena(&pool, key);
+        pool.set_arena_rank(key, first, 0);
+        assert_eq!(pool.next_tombstone(key), Some(first));
+        pool.recycle_arena_index(first);
+        let reused = standing_arena(&pool, key);
+        assert_eq!(reused, first, "the index is recycled");
+        let placed = standing_arena(&pool, key);
+        pool.set_arena_rank(key, placed, 7);
+        assert_eq!(
+            pool.allocate_for(key).unwrap().arena_idx(),
+            placed,
+            "the placed arena serves before the unplaced recycled one"
         );
     }
 

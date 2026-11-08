@@ -126,6 +126,17 @@ pub fn is_span_full(err: &candle::Error) -> bool {
     err.to_string().contains(SPAN_FULL_MARKER)
 }
 
+/// Whether `msg` — an error as text, however many layers wrapped it on its way
+/// up — is the device having no ground for the work right now: a refused tier
+/// ([`TIER_REFUSED_MARKER`]), a full span ([`SPAN_FULL_MARKER`]) or the KV budget
+/// ([`KV_DEVICE_OOM_MARKER`]). Ground that comes back as other work finishes,
+/// not a fault in the work that met it.
+pub fn is_ground_refusal_message(msg: &str) -> bool {
+    [SPAN_FULL_MARKER, TIER_REFUSED_MARKER, KV_DEVICE_OOM_MARKER]
+        .iter()
+        .any(|m| msg.contains(m))
+}
+
 /// Follows [`TIER_REFUSED_MARKER`] in a refusal: the bytes the tier was short
 /// of the ground it could be placed in, as `short by {bytes} B`.
 pub const TIER_SHORT_BY: &str = "short by ";

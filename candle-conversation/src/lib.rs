@@ -184,7 +184,7 @@ pub use tree::{
 pub use batched_sampler::{BatchedSampler, SequenceSamplingState};
 
 // Re-export types callers need from our dependencies.
-pub use candle_nn::kv_cache::{KvFormat, QuantFormat};
+pub use candle_nn::kv_cache::{is_ground_refusal_message, KvFormat, QuantFormat};
 pub use candle_transformers::generation::Sampling;
 pub use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,

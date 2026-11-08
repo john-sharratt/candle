@@ -11,7 +11,9 @@ use super::*;
 use crate::batched_sampler::DEGENERATE_TOKEN_RUN;
 use crate::recorded_reply::{departure, replayed_step};
 use crate::stats::streams_committed;
-use candle_nn::kv_cache::{is_arena_exhausted, is_span_full, is_tier_refusal};
+use candle_nn::kv_cache::{
+    is_arena_exhausted, is_ground_refusal_message, is_span_full, is_tier_refusal,
+};
 use candle_transformers::models::expert_lre::{is_expert_stall, PipelineStats, ProfileSnapshot};
 use candle_transformers::models::held_tensor::hold_rows;
 use candle_transformers::models::speculative_choice::AcceptWalk;
@@ -2651,11 +2653,7 @@ fn is_step_refusal(e: &candle::Error) -> bool {
 /// tier, a full span, the KV budget — rather than a fault: ground that comes
 /// back as turns finish and the KV side relieves.
 fn is_ground_refusal(e: &ConversationError) -> bool {
-    use candle_nn::kv_cache::{KV_DEVICE_OOM_MARKER, SPAN_FULL_MARKER, TIER_REFUSED_MARKER};
-    let s = e.to_string();
-    [SPAN_FULL_MARKER, TIER_REFUSED_MARKER, KV_DEVICE_OOM_MARKER]
-        .iter()
-        .any(|m| s.contains(m))
+    is_ground_refusal_message(&e.to_string())
 }
 
 /// Split a speculative step's rows for the rollback: the positions (into
