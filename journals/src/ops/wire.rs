@@ -18,6 +18,8 @@ use crate::path::{Address, Below, JournalPath};
 use crate::period::Period;
 use crate::scope::Channel;
 use crate::slug::Slug;
+use crate::terms::Terms;
+use crate::time::Stamp;
 
 pub fn path_to_wire(p: &JournalPath) -> String {
     p.folder()
@@ -161,6 +163,43 @@ pub fn actor_from_wire(v: &Value) -> Result<Actor> {
     })
 }
 
+/// A note's terms beside its op's fields — each only when it states one, so a
+/// note with none is written as it always was.
+fn terms_to_wire(terms: &Terms, v: &mut Value) {
+    let Some(o) = v.as_object_mut() else { return };
+    if terms.concluded {
+        o.insert("concluded".into(), Value::Bool(true));
+    }
+    if let Some(s) = &terms.source {
+        o.insert("source".into(), Value::String(s.clone()));
+    }
+    if let Some(e) = terms.expires {
+        o.insert("expires".into(), Value::String(e.to_string()));
+    }
+    if let Some(r) = &terms.replaces {
+        o.insert("replaces".into(), Value::String(r.as_str().to_string()));
+    }
+}
+
+/// A note's terms, read back from its op's fields.
+fn terms_from_wire(o: &Obj<'_>) -> Result<Terms> {
+    Ok(Terms {
+        concluded: match o.0.get("concluded") {
+            None | Some(Value::Null) => false,
+            Some(_) => o.bool("concluded")?,
+        },
+        source: o.opt_str("source")?.map(str::to_string),
+        expires: o
+            .opt_str("expires")?
+            .map(|s| Stamp::parse(s).map_err(Error::Invalid))
+            .transpose()?,
+        replaces: o
+            .opt_str("replaces")?
+            .map(|s| LineId::parse(s).map_err(Error::Invalid))
+            .transpose()?,
+    })
+}
+
 pub fn op_to_wire(op: &Op) -> Value {
     let p = path_to_wire;
     let slug = |s: &Option<Slug>| s.as_ref().map(Slug::as_str).map(str::to_string);
@@ -169,7 +208,13 @@ pub fn op_to_wire(op: &Op) -> Value {
             path,
             text,
             speaker,
-        } => json!({"op": "note", "path": p(path), "text": text, "speaker": slug(speaker)}),
+            terms,
+        } => {
+            let mut v =
+                json!({"op": "note", "path": p(path), "text": text, "speaker": slug(speaker)});
+            terms_to_wire(terms, &mut v);
+            v
+        }
         Op::Episode {
             path,
             text,
@@ -292,6 +337,7 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
             path: o.path("path")?,
             text: text()?,
             speaker: o.opt_slug("speaker")?,
+            terms: terms_from_wire(&o)?,
         },
         "episode" => Op::Episode {
             path: o.path("path")?,
@@ -451,11 +497,18 @@ mod tests {
                 path: p("people/yen"),
                 text: "a \"quoted\"\nline".into(),
                 speaker: Some(slug("yen")),
+                terms: Terms::default(),
             },
             Op::Note {
                 path: p("@zen"),
                 text: "x".into(),
                 speaker: None,
+                terms: Terms {
+                    concluded: true,
+                    source: Some("docs/a.md §2".into()),
+                    expires: Some(Stamp::parse("2026-12-01T00:00:00Z").unwrap()),
+                    replaces: Some(id.clone()),
+                },
             },
             Op::Episode {
                 path: p("conversations/2026-10-31-0712-grok"),

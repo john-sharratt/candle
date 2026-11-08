@@ -12,6 +12,7 @@ use crate::line::{Folds, Kind, Line, Writer, MAX_TEXT};
 use crate::ops::mint;
 use crate::path::JournalPath;
 use crate::slug::Slug;
+use crate::terms::Terms;
 use crate::time::Stamp;
 use crate::tree::Journal;
 
@@ -55,6 +56,7 @@ pub(crate) fn fold_child(
         channel: None,
         folds: Some(Folds::Journal(name.clone())),
         proposed: false,
+        terms: Terms::default(),
         text,
     };
     parent.window.push(line);

@@ -96,6 +96,7 @@ mod tests {
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
     use crate::path::Address;
+    use crate::terms::Terms;
     use crate::testing::at;
     use crate::tree::window::next_fold;
     use crate::tree::WINDOW;
@@ -112,6 +113,7 @@ mod tests {
                 path: p(path),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             at,
         )

@@ -15,6 +15,7 @@ use journals::ops::Op;
 use journals::path::JournalPath;
 use journals::scope::Channel;
 use journals::slug::Slug;
+use journals::terms::Terms;
 use journals::time::Stamp;
 
 use super::{held, Memory};
@@ -50,6 +51,7 @@ pub fn move_of(path: JournalPath, person: &Slug, note: &Note) -> (Actor, Op, Sta
                 path,
                 text: note.text.clone(),
                 speaker: Some(person.clone()),
+                terms: Terms::default(),
             },
             at,
         )

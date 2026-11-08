@@ -9,6 +9,7 @@ use crate::ops::{mint_keeping, Applied};
 use crate::path::JournalPath;
 use crate::scope::Section;
 use crate::slug::Slug;
+use crate::terms::Terms;
 use crate::time::Stamp;
 use crate::tree::Tree;
 
@@ -19,21 +20,41 @@ struct Said<'a> {
     speaker: Option<&'a Slug>,
     /// A worker's note outside its thread: kept once a member accepts it.
     proposed: bool,
+    terms: Terms,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn note(
     tree: &mut Tree,
     actor: &Actor,
     path: &JournalPath,
     speaker: Option<&Slug>,
+    terms: &Terms,
     text: &str,
     now: Stamp,
     keep: Option<&LineId>,
 ) -> Result<Applied> {
+    // A conclusion about a subject is checked against where it came from:
+    // without a source nobody can tell when it stopped being true.
+    if terms.concluded && terms.source.is_none() && path.section() == Some(Section::Topics) {
+        return Err(Error::invalid(
+            "a note you concluded rather than heard needs its `source` on a topic: the \
+             document, file:line, commit or URL it rests on",
+        ));
+    }
+    if let Some(old) = &terms.replaces {
+        let replaced = tree.need(path)?.window.iter().any(|l| &l.id == old);
+        if !replaced {
+            return Err(Error::not_found(format!(
+                "{path} has no line #{old} in its window to replace"
+            )));
+        }
+    }
     let said = Said {
         kind: Kind::Note,
         speaker,
         proposed: matches!(actor, Actor::Worker { .. }) && path.section() != Some(Section::Threads),
+        terms: terms.clone(),
     };
     append(tree, actor, path, said, text, now, keep)
 }
@@ -117,6 +138,7 @@ fn append(
         },
         folds: None,
         proposed: said.proposed,
+        terms: said.terms,
         text,
     };
     line.check().map_err(Error::Invalid)?;
@@ -152,6 +174,7 @@ pub fn episode(
         kind: Kind::Episode,
         speaker,
         proposed: false,
+        terms: Terms::default(),
     };
     append(tree, actor, path, said, text, now, keep)
 }
@@ -171,6 +194,7 @@ mod tests {
             path: p(path),
             text: text.into(),
             speaker: None,
+            terms: Terms::default(),
         }
     }
 
@@ -202,6 +226,7 @@ mod tests {
                 path: path.clone(),
                 text: "  The builder starts Monday. ".into(),
                 speaker: Some(slug("john")),
+                terms: Terms::default(),
             },
             now(),
         )
@@ -229,6 +254,7 @@ mod tests {
                     path,
                     text: "x".into(),
                     speaker: Some(slug("nobody")),
+                    terms: Terms::default(),
                 },
                 now(),
             )
@@ -347,6 +373,68 @@ mod tests {
             .map(|l| l.text.as_str())
             .collect();
         assert_eq!(texts, ["first", "second", "third", "fourth"]);
+    }
+
+    /// **A conclusion on a topic needs its source; a replacement names a line
+    /// its journal holds**, and a note with both is kept with its terms.
+    #[test]
+    fn a_conclusion_needs_its_source_and_a_replacement_its_line() {
+        let mut t = zen();
+        let concluded = |source: Option<&str>, replaces: Option<LineId>| Op::Note {
+            path: p("topics"),
+            text: "The ingest key version is 4.".into(),
+            speaker: None,
+            terms: Terms {
+                concluded: true,
+                source: source.map(str::to_string),
+                expires: None,
+                replaces,
+            },
+        };
+        assert!(apply(&mut t, &john(), &concluded(None, None), now())
+            .unwrap_err()
+            .to_string()
+            .contains("needs its `source`"));
+        let missing = LineId::parse("2026-10-31-0034-7c25").unwrap();
+        assert_eq!(
+            apply(
+                &mut t,
+                &john(),
+                &concluded(Some("keys.rs:12"), Some(missing)),
+                now()
+            )
+            .unwrap_err()
+            .to_string(),
+            "@zen/topics has no line #2026-10-31-0034-7c25 in its window to replace"
+        );
+        let old = apply(
+            &mut t,
+            &john(),
+            &note_op("topics", "The key version is 2."),
+            now(),
+        )
+        .unwrap()
+        .line
+        .unwrap();
+        apply(
+            &mut t,
+            &john(),
+            &concluded(Some("keys.rs:12"), Some(old.clone())),
+            now().plus(60),
+        )
+        .unwrap();
+        let kept = &t.get(&p("topics")).unwrap().window[1];
+        assert_eq!(kept.terms.replaces, Some(old));
+        assert_eq!(kept.terms.source.as_deref(), Some("keys.rs:12"));
+        assert!(kept.terms.concluded);
+        // Heard rather than concluded, a note needs no source anywhere.
+        apply(
+            &mut t,
+            &john(),
+            &note_op("topics", "John prefers tea."),
+            now(),
+        )
+        .unwrap();
     }
 
     #[test]

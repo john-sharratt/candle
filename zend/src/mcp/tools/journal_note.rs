@@ -10,6 +10,7 @@ use journals::ops::Op;
 use serde_json::{json, Value};
 
 use super::mem::{Mem, APPEND_ONLY, PATHS};
+use super::note_terms::terms_of;
 use super::{mem, string, Answer, Ctx};
 use crate::mcp::memory::is_memory_path;
 use crate::mcp::names::Path;
@@ -38,7 +39,11 @@ pub fn definition() -> Value {
             "type": "object",
             "properties": {
                 "journal": {"type": "string", "description": "A memory path: `people/<person>`, `topics/<topic>`, `here`, `@<group>`; or `\"self\"`, `T:<thread>`, `P:<repository>`."},
-                "text": {"type": "string", "description": "The note, at most 2000 characters."}
+                "text": {"type": "string", "description": "The note, at most 2000 characters."},
+                "by": {"type": "string", "enum": ["speaker", "assistant"], "description": "Memory only. `speaker` (the default): the person speaking said it. `assistant`: you concluded it — from code, a document, your own reasoning; a conclusion on a topic needs its `source`."},
+                "source": {"type": "string", "description": "Memory only. What it rests on: a document's section, file:line, a commit or a URL."},
+                "expires": {"type": "string", "description": "Memory only. When it stops being true — a date (`2026-11-30`, to that day's end) or a moment; from then it is hidden."},
+                "replaces": {"type": "string", "description": "Memory only. The line of this journal it supersedes, `#<line id>`; that line is hidden from then on."}
             },
             "required": ["journal", "text"],
             "additionalProperties": false
@@ -79,7 +84,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         ));
     }
     if is_memory_path(journal) {
-        return note_memory(ctx, journal, text);
+        return note_memory(ctx, journal, text, args);
     }
     let target = if journal == "self" {
         match ctx.attached() {
@@ -137,16 +142,18 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
 }
 
 /// Keep `text` on the memory's journal `journal`, as the caller's AI wrote
-/// it through this session's client, from whoever the focus says is speaking.
-fn note_memory(ctx: &Ctx, journal: &str, text: &str) -> Answer {
+/// it through this session's client, from whoever the focus says is speaking,
+/// with the terms `args` state.
+fn note_memory(ctx: &Ctx, journal: &str, text: &str, args: &Value) -> Answer {
     match mem::open(ctx) {
-        Ok(m) => note_in(&m, journal, text),
+        Ok(m) => note_in(&m, journal, text, args),
         Err(e) => Answer::error(e),
     }
 }
 
-/// Keep `text` on the memory's journal `journal`, as `m`'s caller writes.
-pub fn note_in(m: &Mem, journal: &str, text: &str) -> Answer {
+/// Keep `text` on the memory's journal `journal`, as `m`'s caller writes,
+/// with the terms `args` state ([`terms_of`]).
+pub fn note_in(m: &Mem, journal: &str, text: &str, args: &Value) -> Answer {
     if text.chars().count() > MAX_NOTE {
         return Answer::error(format!(
             "the note is longer than {MAX_NOTE} characters: one note per decision, in a sentence or two"
@@ -159,10 +166,15 @@ pub fn note_in(m: &Mem, journal: &str, text: &str) -> Answer {
         Ok(p) => p,
         Err(e) => return Answer::error(e),
     };
+    let terms = match terms_of(args) {
+        Ok(t) => t,
+        Err(e) => return Answer::error(e),
+    };
     let op = Op::Note {
         path: path.clone(),
         text: text.to_string(),
         speaker: m.speaker(),
+        terms,
     };
     match m.memory.write(&m.actor(), &op) {
         Ok(applied) => Answer::ok(format!(

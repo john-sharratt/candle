@@ -90,6 +90,7 @@ mod tests {
     use crate::path::Address;
     use crate::period::Period;
     use crate::scope::Channel;
+    use crate::terms::Terms;
     use crate::testing::{note, slug};
     use crate::tree::load::load;
     use crate::tree::render::render_all;
@@ -113,6 +114,7 @@ mod tests {
             path: p(path),
             text: text.into(),
             speaker: None,
+            terms: Terms::default(),
         }
     }
 

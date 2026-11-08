@@ -23,14 +23,21 @@
 //! once every [`REBUILD_EVERY`], since units commit continuously through an
 //! ingest pass. An upload rebuilds it at once ([`RetrievalScope::refresh`]):
 //! the very next turn may ask about the file.
+//!
+//! A scope is worked out for its conversation's [`Reader`] too: of the
+//! memory's files it holds only those of the groups its person reads, on every
+//! route (`docs/zen_memory_and_guides.md` D2). Until the session names how a
+//! conversation's reader is found ([`RetrievalScope::set_readers`]), every
+//! conversation is read as nobody.
 
 mod index;
 mod kept;
+mod reader;
 mod tree_scope;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use candle_conversation::projection::{Draws, GroupId, TimelineId};
@@ -39,6 +46,7 @@ use zend_vfs::{Base, Oid, RepoFiles, VfsStore};
 
 use self::index::IngestIndex;
 use self::kept::Kept;
+pub use self::reader::{Reader, Readers};
 use self::tree_scope::TreeScope;
 use crate::branch_ingest::filter::IngestScope;
 use crate::branch_ingest::manifest::Hints;
@@ -56,9 +64,9 @@ const KEPT_TREES: usize = 16;
 /// conversations that changed nothing are on.
 const KEPT_SCOPES: usize = 16;
 
-/// What a whole scope is kept under: the index generation, and each
-/// repository's base tree.
-type ScopeKey = (u64, Vec<(String, Oid)>);
+/// What a whole scope is kept under: the index generation, each repository's
+/// base tree, and whom it was worked out for.
+type ScopeKey = (u64, Vec<(String, Oid)>, Reader);
 
 /// A conversation's scope, per scoped group — shared by every conversation
 /// on the same bases that has changed nothing.
@@ -106,6 +114,8 @@ pub struct RetrievalScope {
     shared: Mutex<Kept<ScopeKey, Scope>>,
     /// Each manifest version's hint — part of a folder's key, as in the walk.
     hints: Mutex<Hints>,
+    /// How a conversation's reader is found, once the session names it.
+    readers: OnceLock<Arc<dyn Readers>>,
 }
 
 impl RetrievalScope {
@@ -121,7 +131,21 @@ impl RetrievalScope {
             trees: Mutex::new(Kept::new(KEPT_TREES)),
             shared: Mutex::new(Kept::new(KEPT_SCOPES)),
             hints: Mutex::new(Hints::default()),
+            readers: OnceLock::new(),
         }
+    }
+
+    /// Name how each conversation's reader is found. Set once, as the session
+    /// starts serving; a second call changes nothing.
+    pub fn set_readers(&self, readers: Arc<dyn Readers>) {
+        let _ = self.readers.set(readers);
+    }
+
+    /// `conv_id`'s reader: nobody, until the session names the readers.
+    fn reader_of(&self, conv_id: &str) -> Reader {
+        self.readers
+            .get()
+            .map_or_else(Reader::nobody, |r| r.of(conv_id))
     }
 
     /// Scope the groups of the layers of units built on each file's reading
@@ -161,13 +185,19 @@ impl RetrievalScope {
         });
     }
 
-    /// `target`'s scope from its files, set on the engine for each scoped
-    /// group.
-    pub fn apply(&self, engine: &ConversationEngine, target: TimelineId, files: &RepoFiles) {
+    /// `target`'s scope from its files and the reader of `conv_id`, set on the
+    /// engine for each scoped group.
+    pub fn apply(
+        &self,
+        engine: &ConversationEngine,
+        target: TimelineId,
+        conv_id: &str,
+        files: &RepoFiles,
+    ) {
         let index = self.current(Instant::now(), |generation| {
             IngestIndex::read(engine, generation)
         });
-        let scope = self.scope_of(&index, files);
+        let scope = self.scope_of(&index, files, &self.reader_of(conv_id));
         let e = engine;
         if let Some(group) = self.files_group {
             e.set_retrieval_scope(target, group, scope.files);
@@ -266,11 +296,11 @@ impl RetrievalScope {
         self.shared
             .lock()
             .unwrap()
-            .retain(|(g, _)| *g == generation);
+            .retain(|(g, _, _)| *g == generation);
     }
 
-    /// What `files` may retrieve under `index`.
-    fn scope_of(&self, index: &IngestIndex, files: &RepoFiles) -> Scope {
+    /// What `files` may retrieve under `index`, read as `reader`.
+    fn scope_of(&self, index: &IngestIndex, files: &RepoFiles, reader: &Reader) -> Scope {
         let repos = at_bases(files);
         let unchanged = repos.iter().all(|r| r.changed.is_empty());
         let key: ScopeKey = (
@@ -279,6 +309,7 @@ impl RetrievalScope {
                 .iter()
                 .map(|r| (r.name.clone(), r.tree.clone()))
                 .collect(),
+            reader.clone(),
         );
         if unchanged {
             if let Some(kept) = self.shared.lock().unwrap().get(&key) {
@@ -300,10 +331,10 @@ impl RetrievalScope {
                 .map(|path| dir_of(&format!("{}/{path}", repo.name)))
                 .collect();
             for (path, tl) in &of_tree.files {
-                if changed.contains(path.as_str()) {
+                let at = format!("{}/{path}", repo.name);
+                if changed.contains(path.as_str()) || !reader.reads(&at) {
                     continue;
                 }
-                let at = format!("{}/{path}", repo.name);
                 match self.drawn.iter().find(|(_, draws)| draws.takes(&at)) {
                     Some((group, _)) => {
                         in_drawn.entry(*group).or_default().insert(*tl);
@@ -317,7 +348,7 @@ impl RetrievalScope {
                 of_tree
                     .folders
                     .iter()
-                    .filter(|(dir, _)| !changed_dirs.contains(*dir))
+                    .filter(|(dir, _)| !changed_dirs.contains(*dir) && reader.reads(dir))
                     .map(|(_, tl)| *tl),
             );
             // A unit of a layer of files is in scope when its file version is,
@@ -327,7 +358,7 @@ impl RetrievalScope {
                 let touched = std::iter::once(&unit.path)
                     .chain(&unit.deps)
                     .any(|p| changed.contains(p.as_str()));
-                if !touched {
+                if !touched && reader.reads(&format!("{}/{}", repo.name, unit.path)) {
                     in_derived
                         .entry(unit.group)
                         .or_default()
@@ -526,8 +557,184 @@ mod tests {
     }
 
     fn scope_of(rs: &RetrievalScope, files: &RepoFiles) -> Scope {
+        scope_as(rs, files, &Reader::nobody())
+    }
+
+    fn scope_as(rs: &RetrievalScope, files: &RepoFiles, reader: &Reader) -> Scope {
         let index = Arc::clone(&rs.index.read().unwrap());
-        rs.scope_of(&index, files)
+        rs.scope_of(&index, files, reader)
+    }
+
+    /// A workspace with the memory, `journals`, on `main`: a journal of `zen`,
+    /// one of `guest`, John's and Yen's person files, and the README.
+    fn memory_workspace() -> (tempfile::TempDir, Workspace) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("journals");
+        for (path, body) in [
+            ("README.md", "# The memory\n"),
+            (
+                "groups/zen/topics/candle/2026-10-31-0034-7c25.yaml",
+                "text: a\n",
+            ),
+            (
+                "groups/guest/topics/visit/2026-11-01-0900-aaaa.yaml",
+                "text: b\n",
+            ),
+            ("persons/john/person.yaml", "person: john\n"),
+            ("persons/yen/person.yaml", "person: yen\n"),
+        ] {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "first"]);
+        let ws = Workspace::new(root.path(), vec![RepoSpec::named("journals")]).unwrap();
+        (root, ws)
+    }
+
+    /// The memory's files numbered from 1 in path order, and its folder units
+    /// from 10, each committed.
+    fn memory_scoped(root: &Path) -> RetrievalScope {
+        let folder_scope = IngestScope::new("", None);
+        let dir = root.join("journals");
+        let repo = Repo::open(&dir).unwrap();
+        let tree_oid = Oid::parse(git(&dir, &["rev-parse", "main^{tree}"]).trim()).unwrap();
+        let tree = Tree::read(&repo, &tree_oid).unwrap();
+        let read: Vec<TreeFile> = tree
+            .files()
+            .map(|(path, blob, size)| TreeFile {
+                path: format!("journals/{path}"),
+                blob: blob.clone(),
+                size,
+                language: folder_scope.admits("journals", path, size).unwrap(),
+            })
+            .collect();
+        let mut by_key: HashMap<String, TimelineId> = read
+            .iter()
+            .enumerate()
+            .map(|(n, f)| (file_key(&f.path, &f.blob), tl(1 + n as u64)))
+            .collect();
+        for (n, unit) in folder_units("journals", &tree, &read, &mut |_: &TreeFile| None)
+            .into_iter()
+            .enumerate()
+        {
+            by_key.insert(unit.key, tl(100 + n as u64));
+        }
+        let rs = RetrievalScope::new(
+            Some(GroupId::from_raw(2).unwrap()),
+            Some((GroupId::from_raw(1).unwrap(), folder_scope)),
+        );
+        *rs.index.write().unwrap() = Arc::new(IngestIndex::of(by_key, Vec::new(), 1));
+        rs
+    }
+
+    /// The workspace-relative paths of the memory's units in `units`: a file's
+    /// path, a folder's folder.
+    fn paths_of<'a>(
+        rs: &RetrievalScope,
+        files: &RepoFiles,
+        units: impl Iterator<Item = &'a TimelineId>,
+    ) -> Vec<String> {
+        let index = Arc::clone(&rs.index.read().unwrap());
+        let at = at_bases(files).into_iter().next().unwrap();
+        let tree = rs.tree_scope(&index, &at).unwrap();
+        let by_unit: HashMap<TimelineId, String> = tree
+            .files
+            .iter()
+            .map(|(path, t)| (*t, format!("journals/{path}")))
+            .chain(tree.folders.iter().map(|(dir, t)| (*t, dir.clone())))
+            .collect();
+        let mut paths: Vec<String> = units.filter_map(|t| by_unit.get(t).cloned()).collect();
+        paths.sort();
+        paths
+    }
+
+    /// The memory's files and folders `scope` holds, outside any drawing group.
+    fn held(rs: &RetrievalScope, files: &RepoFiles, scope: &Scope) -> Vec<String> {
+        paths_of(rs, files, scope.files.iter().chain(scope.folders.iter()))
+    }
+
+    /// **A person's conversation retrieves their groups' journals and their
+    /// own file**, the repository's README and its root listing — never
+    /// another group's journal or another person's file, as a file or as a
+    /// folder. (The folder layer makes no unit of a folder that only leads to
+    /// the next one.)
+    #[test]
+    fn a_person_retrieves_only_their_groups_and_their_own_file() {
+        let (root, ws) = memory_workspace();
+        let rs = memory_scoped(root.path());
+        let files = RepoFiles::overlay(ws).unwrap();
+        let john = Reader::person("john", ["zen".to_string()]);
+        assert_eq!(
+            held(&rs, &files, &scope_as(&rs, &files, &john)),
+            [
+                "journals/",
+                "journals/README.md",
+                "journals/groups/zen/topics/candle/",
+                "journals/groups/zen/topics/candle/2026-10-31-0034-7c25.yaml",
+                "journals/persons/john/",
+                "journals/persons/john/person.yaml",
+            ]
+        );
+    }
+
+    /// **A conversation nobody signed in to retrieves no journal**: only the
+    /// repository's own files and its root listing.
+    #[test]
+    fn a_conversation_nobody_signed_in_to_retrieves_no_journal() {
+        let (root, ws) = memory_workspace();
+        let rs = memory_scoped(root.path());
+        let files = RepoFiles::overlay(ws).unwrap();
+        assert_eq!(
+            held(&rs, &files, &scope_as(&rs, &files, &Reader::nobody())),
+            ["journals/", "journals/README.md"]
+        );
+    }
+
+    /// **Two readers on one base never share a scope**, and one reader's scope
+    /// is kept for the next turn on that base.
+    #[test]
+    fn two_readers_never_share_a_scope() {
+        let (root, ws) = memory_workspace();
+        let rs = memory_scoped(root.path());
+        let files = RepoFiles::overlay(ws).unwrap();
+        let john = Reader::person("john", ["zen".to_string()]);
+        let yen = Reader::person("yen", ["guest".to_string()]);
+        let (a, b) = (scope_as(&rs, &files, &john), scope_as(&rs, &files, &yen));
+        assert_ne!(a.files, b.files);
+        assert!(Arc::ptr_eq(&a.files, &scope_as(&rs, &files, &john).files));
+    }
+
+    /// **A drawn journal obeys the boundary too**: the drawing group holds a
+    /// journal of the reader's group and none of another's, beside a drawn
+    /// guide every reader holds.
+    #[test]
+    fn a_drawn_journal_obeys_the_boundary() {
+        let (root, ws) = memory_workspace();
+        let guidance = GroupId::from_raw(3).unwrap();
+        let draws = Draws {
+            from: GroupId::from_raw(2).unwrap(),
+            paths: vec!["journals/".into()],
+            except: vec!["README.md".into()],
+        };
+        let rs = memory_scoped(root.path()).with_drawn(vec![(guidance, draws)]);
+        let files = RepoFiles::overlay(ws).unwrap();
+        let john = scope_as(&rs, &files, &Reader::person("john", ["zen".to_string()]));
+        assert_eq!(
+            paths_of(&rs, &files, john.drawn[&guidance].iter()),
+            [
+                "journals/groups/zen/topics/candle/2026-10-31-0034-7c25.yaml",
+                "journals/persons/john/person.yaml",
+            ]
+        );
+        assert_eq!(
+            paths_of(&rs, &files, john.files.iter()),
+            ["journals/README.md"],
+            "the README is excepted from the draw, and stays with the files"
+        );
     }
 
     fn set(timelines: &[u64]) -> HashSet<TimelineId> {
@@ -753,7 +960,7 @@ mod tests {
         let rs = scoped(root.path());
         scope_of(&rs, &RepoFiles::overlay(ws).unwrap());
         let tree = oid(root.path(), "main^{tree}");
-        let shared_key = (1, vec![("r".to_string(), tree.clone())]);
+        let shared_key = (1, vec![("r".to_string(), tree.clone())], Reader::nobody());
         let tree_key = ("r".to_string(), tree, 1);
         assert!(rs.shared.lock().unwrap().get(&shared_key).is_some());
         assert!(rs.trees.lock().unwrap().get(&tree_key).is_some());

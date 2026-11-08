@@ -3,6 +3,7 @@
 use crate::line::{Kind, Line, LineId, Writer};
 use crate::scope::Channel;
 use crate::slug::Slug;
+use crate::terms::Terms;
 use crate::time::Stamp;
 
 pub(crate) fn at(s: &str) -> Stamp {
@@ -27,6 +28,7 @@ pub(crate) fn note(when: &str, text: &str) -> Line {
         channel: None,
         folds: None,
         proposed: false,
+        terms: Terms::default(),
         text: text.into(),
     }
 }

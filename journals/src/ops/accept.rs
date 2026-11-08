@@ -27,6 +27,7 @@ mod tests {
     use crate::actor::Actor;
     use crate::ops::fixture::{john, now, p, thanhlong, zen};
     use crate::ops::{apply, Op};
+    use crate::terms::Terms;
     use crate::testing::slug;
 
     #[test]
@@ -43,6 +44,7 @@ mod tests {
                 path: path.clone(),
                 text: "Trials run on BlackWorld.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )

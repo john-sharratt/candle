@@ -253,6 +253,7 @@ mod tests {
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, OnTaken, Which};
     use crate::scope::Channel;
+    use crate::terms::Terms;
     use crate::testing::slug;
 
     #[test]
@@ -277,6 +278,7 @@ mod tests {
             &john(),
             &Op::Note {
                 speaker: None,
+                terms: Terms::default(),
                 path: trip.clone(),
                 text: "Flights to Da Nang.".into(),
             },
@@ -347,6 +349,7 @@ mod tests {
             &john(),
             &Op::Note {
                 speaker: None,
+                terms: Terms::default(),
                 path: p("@zen"),
                 text: "Prefers tea.".into(),
             },
@@ -363,6 +366,7 @@ mod tests {
             &john(),
             &Op::Note {
                 speaker: None,
+                terms: Terms::default(),
                 path: p("topics"),
                 text: "x".into(),
             },
@@ -393,6 +397,7 @@ mod tests {
             &john(),
             &Op::Note {
                 speaker: None,
+                terms: Terms::default(),
                 path: p("@zen"),
                 text: "Prefers tea.".into(),
             },
@@ -428,6 +433,7 @@ mod tests {
             &john(),
             &Op::Note {
                 speaker: None,
+                terms: Terms::default(),
                 path: p("@zen"),
                 text: "Prefers tea.".into(),
             },
@@ -481,6 +487,7 @@ mod tests {
             &john(),
             &Op::Note {
                 speaker: None,
+                terms: Terms::default(),
                 path: p("@zen"),
                 text: "Takes it black.".into(),
             },
@@ -501,6 +508,7 @@ mod tests {
             &john(),
             &Op::Note {
                 speaker: None,
+                terms: Terms::default(),
                 path: p("@zen"),
                 text: "Prefers tea.".into(),
             },
@@ -526,6 +534,7 @@ mod tests {
             &john(),
             &Op::Note {
                 speaker: None,
+                terms: Terms::default(),
                 path: p("@zen"),
                 text: "Takes it black.".into(),
             },
@@ -551,6 +560,7 @@ mod tests {
                 &john(),
                 &Op::Note {
                     speaker: None,
+                    terms: Terms::default(),
                     path: p("@zen"),
                     text: format!("Line {n}."),
                 },
@@ -608,6 +618,7 @@ mod tests {
             &john(),
             &Op::Note {
                 speaker: None,
+                terms: Terms::default(),
                 path: p("@zen"),
                 text: "A line.".into(),
             },

@@ -55,6 +55,12 @@ filter over the units it draws:
   its version (`retrieval_scope`), as for every `code_reading` unit. Its own
   scan competition (`cases: file`, per group) keeps a guide from being ranked
   against every `.rs` file.
+- **The group boundary.** A journal is offered only to a conversation whose
+  person reads its group, and a person's own file only to that person
+  (`retrieval_scope::Reader`, `docs/memory_backbone.md` §7.2) — in this group
+  and in every other route a unit of the memory reaches a prompt by. A
+  conversation's journal in the memory is never ingested at all
+  (`branch_ingest::filter`), so none is drawn.
 
 ## 2. Calibration as it runs
 

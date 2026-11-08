@@ -516,6 +516,7 @@ mod tests {
     use journals::scope::Channel;
     use journals::slug::Slug;
     use journals::store::StoreError;
+    use journals::terms::Terms;
     use journals::tree::load::load;
 
     use super::*;
@@ -549,6 +550,7 @@ mod tests {
                 path: root.clone(),
                 text: "Everyone drinks tea.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             Stamp::now(),
         )
