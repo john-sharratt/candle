@@ -25,7 +25,7 @@ pub struct ClusterJoin {
 }
 
 /// One person the night is for.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PersonCfg {
     /// The name ZenJ knows them by: `john`, `yen`.
     pub name: String,
