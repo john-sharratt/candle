@@ -1039,7 +1039,13 @@ layers:
           from: scopes
           paths: [candle/mcp/src/guides/, journals/]
           except: [README.md, group.yaml, journal.yaml, person.yaml]
-        selection: { kind: working_set, share: guidance }
+        # A journal entry fades with its age, so the note that superseded an
+        # older one outranks it (docs/guidance_layer.md §4); a guide carries
+        # no date stamp and does not fade.
+        selection:
+          kind: working_set
+          share: guidance
+          recency: { half_life_days: 30, dated_by: path }
         # Scanned as `scopes` is, each guide one case; its own competition is
         # what keeps a guide from being ranked against every `.rs` file.
         policy:

@@ -181,8 +181,8 @@ Journals reach the same group by the same filter, with two differences:
    exemplar text and which exemplars are retired.
 3. **Built.** Seeding for units no one has read: the `guidance_prompt`.
 4. **Built.** The per-turn counts, logged per turn.
-5. The counts split as §3 now gives them — "read anyway" and "relevant" in
-   place of hit and idle — from each placed unit's peak fresh score
+5. **Built.** The counts split as §3 gives them — missed, read anyway,
+   relevant, idle — from each placed unit's peak fresh score
    (`WorkingSet::fresh_of`).
-6. Journals' recency term (§4), and the pool at 40K beside a 122K files budget
-   (§1).
+6. **Built.** Journals' recency term (§4: `Recency`, applied in
+   `working_set_fresh`), and the pool at 40K beside a 122K files budget (§1).

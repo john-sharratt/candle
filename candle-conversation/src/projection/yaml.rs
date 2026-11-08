@@ -81,9 +81,10 @@ use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, Draws, GatherScope,
-    GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema,
-    SectionTree, SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema,
-    TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
+    GroupSchema, LayerDials, LayerSchema, LayerSummary, Recency, Schema, SectionCollection,
+    SectionSchema, SectionTree, SelectionDefault, SelectionRule, SystemPromptItem,
+    SystemPromptSchema, TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary,
+    WorkingSetShare,
 };
 use super::swap_cap::DEFAULT_MAX_SWAPS;
 use crate::summary_tree::scope::Scope;
@@ -828,6 +829,48 @@ struct YamlSelection {
     /// `kind: working_set` only — `folders` or `remainder`.
     #[serde(default)]
     share: Option<String>,
+    /// `kind: working_set` only — how its units fade with age.
+    #[serde(default)]
+    recency: Option<YamlRecency>,
+}
+
+/// YAML shadow of [`Recency`] — `recency: { half_life_days, dated_by }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlRecency {
+    half_life_days: f32,
+    dated_by: String,
+}
+
+/// A group's `selection.recency`, for a working-set group with a positive
+/// half-life and a metadata key to date it by.
+fn parse_recency(
+    group: &str,
+    ys: &YamlSelection,
+    selection: &SelectionRule,
+) -> Result<Option<Recency>, ConstructionError> {
+    let Some(yr) = &ys.recency else {
+        return Ok(None);
+    };
+    let invalid = |reason: &str| ConstructionError::InvalidPolicy {
+        name: group.to_string(),
+        reason: format!("selection.recency: {reason}"),
+    };
+    if !matches!(selection, SelectionRule::WorkingSet { .. }) {
+        return Err(invalid("only a working_set selection ages its units"));
+    }
+    if !(yr.half_life_days.is_finite() && yr.half_life_days > 0.0) {
+        return Err(invalid("half_life_days must be a positive number of days"));
+    }
+    if yr.dated_by.trim().is_empty() {
+        return Err(invalid(
+            "dated_by must name the metadata that holds a unit's path",
+        ));
+    }
+    Ok(Some(Recency {
+        half_life_days: yr.half_life_days,
+        dated_by: yr.dated_by.clone(),
+    }))
 }
 
 /// A dialogue layer's `working_set:` block — see [`WorkingSetConfig`].
@@ -1308,6 +1351,7 @@ fn build(
             let policy_band_declared =
                 layer_band_declared || yg.policy.as_ref().and_then(|p| p.min_score).is_some();
             let draws = parse_draws(&yg.id, yg.draws.as_ref(), &selection, &groups)?;
+            let recency = parse_recency(&yg.id, &yg.selection, &selection)?;
 
             groups.push(GroupSchema {
                 id: gid,
@@ -1332,6 +1376,7 @@ fn build(
                     }
                 },
                 draws,
+                recency,
             });
         }
 

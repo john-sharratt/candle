@@ -55,6 +55,7 @@
 //! `LayerSchema.window` has no default — it must be declared.
 
 use std::num::NonZeroUsize;
+use std::ops::Range;
 
 use super::adaptive::{AnchorConfig, BudgetAdaptive, LocalityConfig, MemberBudgetAdaptive};
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
@@ -1110,6 +1111,9 @@ pub struct GroupSchema {
     /// instead (`docs/guidance_layer.md` §1). `None` for a group that places
     /// only its own.
     pub draws: Option<Draws>,
+    /// How a working-set group's units fade with age (`docs/guidance_layer.md`
+    /// §4). `None` for a group whose units do not age.
+    pub recency: Option<Recency>,
 }
 
 /// What a drawing group takes from the group that owns the units: the ones
@@ -1127,6 +1131,67 @@ pub struct Draws {
     /// files (`README.md`, `group.yaml`) a folder carries beside its entries,
     /// which match every question and answer none. They stay with the owner.
     pub except: Vec<String>,
+}
+
+/// How a working-set group's units fade as they age (`docs/guidance_layer.md`
+/// §4): a unit whose file name opens with a `YYYY-MM-DD-HHMM` UTC stamp has
+/// its fresh score scaled by `0.5^(age_days / half_life_days)` before it feeds
+/// momentum. A unit whose name carries no stamp is not scaled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recency {
+    pub half_life_days: f32,
+    /// The unit metadata that holds its path.
+    pub dated_by: String,
+}
+
+const DAY_MS: f64 = 86_400_000.0;
+
+impl Recency {
+    /// The factor a unit at `path` is scaled by at `now_ms`: `1` for a name
+    /// with no stamp, and for one stamped after `now_ms`.
+    pub fn factor(&self, path: &str, now_ms: u64) -> f32 {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let Some(stamped) = stamp_ms(name) else {
+            return 1.0;
+        };
+        let age_days = now_ms.saturating_sub(stamped) as f64 / DAY_MS;
+        0.5f64.powf(age_days / f64::from(self.half_life_days)) as f32
+    }
+}
+
+/// The UTC instant a `YYYY-MM-DD-HHMM` stamp opening `name` names, in Unix
+/// milliseconds; `None` for a name that does not open with one.
+fn stamp_ms(name: &str) -> Option<u64> {
+    let s = name.get(..15)?;
+    let b = s.as_bytes();
+    if [4, 7, 10].iter().any(|&i| b[i] != b'-') {
+        return None;
+    }
+    let num = |r: Range<usize>| -> Option<i64> {
+        let t = &s[r];
+        t.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| t.parse().ok())?
+    };
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm) = (num(11..13)?, num(13..15)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 {
+        return None;
+    }
+    let days = days_from_civil(y, m, d);
+    let ms = ((days * 24 + hh) * 60 + mm) * 60_000;
+    u64::try_from(ms).ok()
+}
+
+/// Days from 1970-01-01 to the proleptic Gregorian date `y-m-d`.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 impl Draws {
@@ -1537,6 +1602,49 @@ impl Schema {
 }
 
 #[cfg(test)]
+mod recency_tests {
+    use super::{days_from_civil, stamp_ms, Recency};
+
+    /// **A stamp is read to the minute it names**, and a name that does not
+    /// open with one has none — exact instants, not tolerances.
+    #[test]
+    fn a_stamp_names_its_minute() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        assert_eq!(days_from_civil(2026, 11, 8), 20_765);
+        assert_eq!(stamp_ms("1970-01-01-0001-ab12.yaml"), Some(60_000));
+        assert_eq!(
+            stamp_ms("2026-11-08-0130-7c1e.yaml"),
+            Some(20_765 * 86_400_000 + 90 * 60_000)
+        );
+        assert_eq!(stamp_ms("README.md"), None);
+        assert_eq!(stamp_ms("2026-13-08-0130-x.yaml"), None);
+        assert_eq!(stamp_ms("2026-11-08T0130.yaml"), None);
+    }
+
+    /// **An entry's score halves each half-life**; a guide, whose name has no
+    /// stamp, is not scaled, and neither is an entry dated after now.
+    #[test]
+    fn an_entry_fades_by_its_half_life() {
+        let r = Recency {
+            half_life_days: 30.0,
+            dated_by: "path".into(),
+        };
+        let at = stamp_ms("2026-10-09-0000-a.yaml").unwrap();
+        let day = 86_400_000;
+        let path = "journals/groups/zen/2026-10-09-0000-a.yaml";
+        assert_eq!(r.factor(path, at), 1.0);
+        assert_eq!(r.factor(path, at + 30 * day), 0.5);
+        assert_eq!(r.factor(path, at + 60 * day), 0.25);
+        assert_eq!(
+            r.factor("candle/mcp/src/guides/deploy.md", at + 60 * day),
+            1.0
+        );
+        assert_eq!(r.factor(path, at - day), 1.0);
+    }
+}
+
+#[cfg(test)]
 mod draws_tests {
     use super::Draws;
     use crate::projection::ids::GroupId;
@@ -1598,6 +1706,7 @@ mod belief_config_tests {
             anchor: None,
             max_swaps: DEFAULT_MAX_SWAPS,
             draws: None,
+            recency: None,
         }
     }
 

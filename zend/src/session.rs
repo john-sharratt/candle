@@ -5400,9 +5400,11 @@ fn run_inference_stream(
         }
 
         // The answering round's placements count too: what was placed as the
-        // turn answered without reading it is idle.
+        // turn answered without reading it is relevant or idle.
         guidance_tally.place(placed_guidance(&state, timeline));
-        log_guidance_tally(&conv_id, &guidance_tally);
+        if let Some(ws) = &state.working_set {
+            log_guidance_tally(&conv_id, &guidance_tally, ws.min_momentum);
+        }
 
         // Title generation has already been fired in parallel from
         // `submit_with_sampling` — it doesn't depend on the main
@@ -5465,8 +5467,9 @@ fn drawn_reads(state: &InferenceState, results: &[ToolResult]) -> Vec<guidance::
         .collect()
 }
 
-/// The drawn units `timeline`'s working set places now, by path.
-fn placed_guidance(state: &InferenceState, timeline: TimelineId) -> Vec<String> {
+/// The drawn units `timeline`'s working set places now, by path, each with
+/// the fresh score the last scan gave it (`WorkingSet::fresh_of`).
+fn placed_guidance(state: &InferenceState, timeline: TimelineId) -> Vec<(String, f32)> {
     let conversation = state.engine.conversation();
     let substrate = conversation.read();
     let Some(ws) = substrate.working_set(timeline) else {
@@ -5479,25 +5482,31 @@ fn placed_guidance(state: &InferenceState, timeline: TimelineId) -> Vec<String> 
                 .placing_group(timeline, *member)
                 .is_some_and(|g| state.retrieval_scope.is_drawing(g))
         })
-        .filter_map(|(member, _)| substrate.custom_of(member)?.get(PATH_KEY).cloned())
+        .filter_map(|(member, _)| {
+            let path = substrate.custom_of(member)?.get(PATH_KEY).cloned()?;
+            Some((path, ws.fresh_of(member)))
+        })
         .collect()
 }
 
 /// Log what the turn's guidance came to (`guidance::tally`), when it placed or
-/// read any.
-fn log_guidance_tally(conv_id: &str, tally: &guidance::Tally) {
+/// read any; a placed unit unread is relevant once a scan matched it to the
+/// working set's `min_momentum`.
+fn log_guidance_tally(conv_id: &str, tally: &guidance::Tally, min_momentum: f32) {
     if tally.is_empty() {
         return;
     }
-    let counts = tally.counts();
+    let counts = tally.counts(min_momentum);
     tracing::info!(
         target: "zend::guidance",
         conv_id = %conv_id,
-        hit = counts.hit.len(),
         missed = counts.missed.len(),
+        read_anyway = counts.read_anyway.len(),
+        relevant = counts.relevant.len(),
         idle = counts.idle.len(),
-        hits = %counts.hit.join(","),
         misses = %counts.missed.join(","),
+        read_anyways = %counts.read_anyway.join(","),
+        relevants = %counts.relevant.join(","),
         idles = %counts.idle.join(","),
         "guidance this turn",
     );
@@ -9451,6 +9460,24 @@ mod projection_schema_tests {
             assert!(g.budget_adaptive.is_none(), "{name}");
             assert!(l.budget.adaptive.is_none(), "{name}");
         }
+
+        // The guides and journals are drawn out of the files with their hub
+        // files left behind, and a journal entry fades over a 30-day half-life.
+        let guidance = layer("code_reading")
+            .groups
+            .iter()
+            .find(|g| g.name == "guidance")
+            .expect("code_reading declares the guidance group");
+        let draws = guidance.draws.as_ref().expect("guidance draws");
+        assert_eq!(
+            draws.except,
+            ["README.md", "group.yaml", "journal.yaml", "person.yaml"]
+        );
+        let recency = guidance.recency.as_ref().expect("journals age");
+        assert_eq!(
+            (recency.half_life_days, recency.dated_by.as_str()),
+            (30.0, "path")
+        );
 
         // A whole file is one case of one competition, content weighed on fold
         // groups 1-2 and the calibration competition on the top group alone,

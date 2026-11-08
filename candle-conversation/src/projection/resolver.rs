@@ -8,7 +8,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 
@@ -28,7 +28,7 @@ use super::owned_sections::OwnedSection;
 use super::project::ProjectionTarget;
 use super::scan_stats::{scan_stats, GroupScan};
 use super::schema::{
-    CorruptTurnPolicy, GatherScope, GroupSchema, LayerSchema, Schema, SectionCollection,
+    CorruptTurnPolicy, GatherScope, GroupSchema, LayerSchema, Recency, Schema, SectionCollection,
     SystemPromptItem, SystemPromptSchema,
 };
 use super::warm_pool;
@@ -1476,7 +1476,20 @@ impl Conversation {
         let Some(cfg) = working_set_config(schema, target) else {
             return;
         };
-        let fresh = working_set_fresh(schema, candidates);
+        // A unit an aging group holds is dated by its metadata, against the
+        // moment of this scan.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let fresh = {
+            let read = self.read();
+            let aged = |r: &Recency, timeline: TimelineId| {
+                read.custom_of(timeline)
+                    .and_then(|m| m.get(&r.dated_by))
+                    .map_or(1.0, |path| r.factor(path, now_ms))
+            };
+            working_set_fresh(schema, candidates, &aged)
+        };
         self.update(|s| {
             s.working_set_observe(
                 target.timeline,

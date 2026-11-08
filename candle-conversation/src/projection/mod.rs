@@ -287,9 +287,9 @@ pub use resolver::{
 };
 pub use schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, Draws, GatherScope,
-    GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection,
-    SectionSchema, SectionTree, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeDim,
-    TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
+    GroupSchema, LayerDials, LayerSchema, LayerSummary, Recency, Schema, ScoreFormula,
+    SectionCollection, SectionSchema, SectionTree, SelectionRule, SystemPromptItem,
+    SystemPromptSchema, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
 };
 pub use script::{recorded_dials, ProjectionScript};
 pub use working_set_pick::{Standing, WorkingSetMembers};

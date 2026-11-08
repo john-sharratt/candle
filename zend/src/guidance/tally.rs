@@ -1,36 +1,46 @@
-//! Whether placing guidance helps: per turn, which drawn units were placed and
-//! which were read (`docs/guidance_layer.md` §3).
+//! Whether placing guidance helps: per turn, which drawn units were placed,
+//! how strongly the turn's scans matched each while it was, and which were
+//! read (`docs/guidance_layer.md` §3).
 //!
-//! - **hit**: placed, and read in the same turn;
 //! - **missed**: read by the turn while not placed;
-//! - **idle**: placed, and the turn never read it.
+//! - **read anyway**: placed, and read in the same turn — placement offered
+//!   it and did not spare the read;
+//! - **relevant**: placed, never read, and the turn's scans kept matching it —
+//!   its peak fresh score reached the working set's `min_momentum`;
+//! - **idle**: placed, never read, and no scan matched it.
 //!
 //! The counts are logged once per turn (`zend::guidance`, "guidance this
-//! turn"), where the self-improvement mission reads them: the missed count
-//! should fall as use-exemplars accumulate, and a unit idle turn after turn is
-//! placed on a calibration that no longer fits.
+//! turn"), where the self-improvement mission reads them: "missed" should fall
+//! as use-exemplars accumulate, and "relevant" should rise against "read
+//! anyway".
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One turn's placements and reads of drawn units, by workspace-relative path.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Tally {
-    placed: BTreeSet<String>,
+    /// Each unit placed, with the best fresh score a scan gave it while it was.
+    placed: BTreeMap<String, f32>,
     read: BTreeSet<String>,
 }
 
 /// What a turn's [`Tally`] comes to, each list in path order.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Counts {
-    pub hit: Vec<String>,
     pub missed: Vec<String>,
+    pub read_anyway: Vec<String>,
+    pub relevant: Vec<String>,
     pub idle: Vec<String>,
 }
 
 impl Tally {
-    /// Note the drawn units placed for one of the turn's rounds.
-    pub fn place(&mut self, paths: impl IntoIterator<Item = String>) {
-        self.placed.extend(paths);
+    /// Note the drawn units placed for one of the turn's rounds, each with the
+    /// fresh score that round's scan gave it.
+    pub fn place(&mut self, placed: impl IntoIterator<Item = (String, f32)>) {
+        for (path, fresh) in placed {
+            let peak = self.placed.entry(path).or_insert(fresh);
+            *peak = peak.max(fresh);
+        }
     }
 
     /// Note a drawn unit one of the turn's rounds read.
@@ -43,13 +53,29 @@ impl Tally {
         self.placed.is_empty() && self.read.is_empty()
     }
 
-    /// The turn's counts.
-    pub fn counts(&self) -> Counts {
-        Counts {
-            hit: self.placed.intersection(&self.read).cloned().collect(),
-            missed: self.read.difference(&self.placed).cloned().collect(),
-            idle: self.placed.difference(&self.read).cloned().collect(),
+    /// The turn's counts, a placed unit unread counting as relevant once its
+    /// peak fresh score reached `min_momentum`.
+    pub fn counts(&self, min_momentum: f32) -> Counts {
+        let mut counts = Counts {
+            missed: self
+                .read
+                .iter()
+                .filter(|p| !self.placed.contains_key(*p))
+                .cloned()
+                .collect(),
+            ..Counts::default()
+        };
+        for (path, peak) in &self.placed {
+            let list = if self.read.contains(path) {
+                &mut counts.read_anyway
+            } else if *peak >= min_momentum {
+                &mut counts.relevant
+            } else {
+                &mut counts.idle
+            };
+            list.push(path.clone());
         }
+        counts
     }
 }
 
@@ -61,21 +87,31 @@ mod tests {
         p.iter().map(|s| s.to_string()).collect()
     }
 
-    /// **A placed unit the turn read is a hit, one it did not is idle, and one
-    /// it read unplaced is missed**, over every round of the turn.
+    fn at(p: &[(&str, f32)]) -> Vec<(String, f32)> {
+        p.iter().map(|(s, f)| (s.to_string(), *f)).collect()
+    }
+
+    /// **A placed unit the turn read is read anyway; one it did not read is
+    /// relevant once a scan matched it to `min_momentum`, idle otherwise; one
+    /// read unplaced is missed** — over every round, on each unit's peak.
     #[test]
-    fn placed_and_read_make_hit_missed_and_idle() {
+    fn placed_read_and_matched_make_the_four_counts() {
         let mut t = Tally::default();
-        t.place(paths(&["g/deploy.md", "g/test.md"]));
+        t.place(at(&[("g/deploy.md", 400.0), ("g/test.md", 20.0)]));
         t.read("g/deploy.md".into());
-        t.place(paths(&["g/deploy.md", "j/notes.md"]));
+        t.place(at(&[
+            ("g/test.md", 150.0),
+            ("j/notes.yaml", 30.0),
+            ("g/deploy.md", 0.0),
+        ]));
         t.read("g/release.md".into());
         assert_eq!(
-            t.counts(),
+            t.counts(100.0),
             Counts {
-                hit: paths(&["g/deploy.md"]),
                 missed: paths(&["g/release.md"]),
-                idle: paths(&["g/test.md", "j/notes.md"]),
+                read_anyway: paths(&["g/deploy.md"]),
+                relevant: paths(&["g/test.md"]),
+                idle: paths(&["j/notes.yaml"]),
             }
         );
     }
