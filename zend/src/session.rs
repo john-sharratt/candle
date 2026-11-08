@@ -75,6 +75,9 @@ use journal_core::record::view as journal_view;
 use journal_core::section::{JournalPrompt, Kept, JOURNAL};
 use journal_core::span::Span;
 use journal_core::transcript::{Filed, Hits, Miss, Page};
+use journals::ops::wire::path_from_wire;
+use journals::path::JournalPath;
+use journals::time::Stamp;
 use serde_json::{json, Value};
 use web::auth::Roles;
 use zend_tools::run_watch::{self, RunWatch};
@@ -127,11 +130,15 @@ use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::mcp::chats::sweep as chat_sweep;
 use crate::mcp::memory::readers::MemoryReaders;
+use crate::mcp::memory::Memory;
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
 use crate::mcp::zen_tasks::{level_of, withhold_by_level};
-use crate::mcp::{archiving, lineage, nudges, resuming, stops, tending, threads, workers};
+use crate::mcp::{
+    archiving, lineage, memory_sections, nudges, resuming, stops, tending, thread_export, threads,
+    workers,
+};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -851,6 +858,9 @@ struct InferenceState {
     /// Which ingested units each conversation may retrieve
     /// (`crate::retrieval_scope`), set on the engine before every turn.
     retrieval_scope: RetrievalScope,
+    /// The memory a worker's sections read its thread's topics from
+    /// (`mcp::memory_sections`).
+    memory: Arc<Memory>,
     /// The ingest worker's wake, once it is running: a `git_*` tool round
     /// that can move a branch wakes it, since a push moves the tracking refs
     /// itself and no origin probe will see a difference afterwards.
@@ -1370,6 +1380,7 @@ impl InferenceState {
         progress: Arc<LoadProgress>,
         loading_substrate: Arc<OnceLock<Conversation>>,
         ops: Arc<dyn OpsRunner>,
+        memory: Arc<Memory>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         // The workspace folder: where the substrate, the schema override and a
         // mind's section folders live. Repositories are reached through
@@ -3163,6 +3174,7 @@ impl InferenceState {
             deletions: Deletions::default(),
             journaling,
             journals: Journals::default(),
+            memory,
         });
         // A conversation is this member's for one turn at a time, and what it
         // keeps of one goes when the conversation does.
@@ -5618,22 +5630,19 @@ async fn carry_journal(
         Some((reader, before)) => (before, Some(reader)),
         None => (&inherited[..], None),
     };
-    let mut wants: Vec<Want<'_>> = before
-        .iter()
-        .map(|i| Want {
-            name: &i.name,
-            text: &i.text,
-        })
-        .collect();
+    // Then the memory its thread is about, before its own journal
+    // (`mcp::memory_sections`).
+    let memory = carried_memory(state, conv_id);
+    let mut wants: Vec<Want<'_>> = before.iter().map(inherited_want).collect();
+    wants.extend(memory.iter().map(inherited_want));
     wants.extend(carry::wants(&prompt));
-    wants.extend(reader.map(|i| Want {
-        name: &i.name,
-        text: &i.text,
-    }));
+    wants.extend(reader.map(inherited_want));
     let lineage_sweep = lineage::sweep_names();
+    let memory_sweep = memory_sections::sweep_names();
     let mut sweep = prompt.sweep();
     if owner_of(conv_id).is_some() {
         sweep.extend(lineage_sweep.iter().map(String::as_str));
+        sweep.extend(memory_sweep.iter().map(String::as_str));
     }
     let ConvState {
         conv,
@@ -5669,12 +5678,42 @@ fn inherited_journals(state: &InferenceState, conv_id: &str) -> Vec<lineage::Inh
     lineage::sections(&format!("T:{thread}/{name}"), &nearest_first)
 }
 
+/// An inherited section as the reconcile wants it.
+fn inherited_want(i: &lineage::Inherited) -> Want<'_> {
+    Want {
+        name: &i.name,
+        text: &i.text,
+    }
+}
+
+/// The memory sections `conv_id` carries: the topics its thread is about, read
+/// from the memory's tree as last published — none for a conversation not
+/// owned through `/mcp`, a thread about nothing, or a memory not open.
+fn carried_memory(state: &InferenceState, conv_id: &str) -> Vec<lineage::Inherited> {
+    let Some((owner, thread, _)) = conv_names(conv_id) else {
+        return Vec::new();
+    };
+    let records = state.engine.conversation().shared();
+    let Some(bound) = thread_export::bound(&records, owner, thread) else {
+        return Vec::new();
+    };
+    let Ok(tree) = state.memory.tree() else {
+        return Vec::new();
+    };
+    let about: Vec<JournalPath> = bound
+        .about
+        .iter()
+        .filter_map(|p| path_from_wire(p).ok())
+        .collect();
+    memory_sections::sections(&memory_sections::topics(&tree, &about, Stamp::now()))
+}
+
 /// One journal above a conversation: the ancestor it is and the bare name it
 /// answers to.
 struct JournalAbove {
     ancestor: lineage::Ancestor,
     name: String,
-    /// The entries a citation may name: its notes, numbered from 1.
+    /// The entries a citation may name: its notes' numbers.
     entries: Vec<u64>,
 }
 
@@ -5687,11 +5726,16 @@ fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
     };
     let records = state.engine.conversation().shared();
     let mut nearest_first = Vec::new();
-    let notes = |journal: &str| threads::note_lines(&threads::notes(&records, owner, journal));
-    let numbered = |lines: &[String]| (1..=lines.len() as u64).collect();
-    let lines = notes(thread);
+    let notes = |journal: &str| -> (Vec<String>, Vec<u64>) {
+        let entries = threads::notes(&records, owner, journal);
+        (
+            threads::note_lines(&entries),
+            entries.iter().map(|e| e.number).collect(),
+        )
+    };
+    let (lines, entries) = notes(thread);
     nearest_first.push(JournalAbove {
-        entries: numbered(&lines),
+        entries,
         ancestor: lineage::Ancestor {
             path: format!("T:{thread}"),
             whose: lineage::Whose::Thread,
@@ -5706,9 +5750,9 @@ fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
         .filter(|r| r.name != UPLOADS_REPO)
     {
         let project = project_journal(&repo.name);
-        let lines = notes(&project);
+        let (lines, entries) = notes(&project);
         nearest_first.push(JournalAbove {
-            entries: numbered(&lines),
+            entries,
             ancestor: lineage::Ancestor {
                 lines,
                 path: project,
@@ -8430,6 +8474,7 @@ impl ZendSession {
                     load_progress_for_blocking,
                     loading_substrate,
                     ops,
+                    Arc::clone(&memory),
                 ) {
                     Ok(Some(state)) => {
                         // Before the state is published: no turn is scoped

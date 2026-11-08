@@ -43,6 +43,7 @@ pub mod chats;
 pub mod driven;
 pub mod lineage;
 pub mod memory;
+pub mod memory_sections;
 pub mod names;
 pub mod npcd_tools;
 pub mod nudges;

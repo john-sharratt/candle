@@ -497,13 +497,16 @@ journal, outermost first, then its own, then the reader's line:
 … shared prompt …
 P:candle                                  ← the project's standing rules (lineage/0)
 T:review-layers                           ← Claude's thread: decisions, what the user said, outcomes
+@zen/topics/candle                        ← the memory the thread is about (memory/0 …)
 … this conversation's own journal …       ← journal/<id>, journal/open
 This conversation is T:review-layers/verify-expiry.   ← the reader's line (lineage/reader)
 system_close
 ```
 
 A task a worker started is a worker on the same thread, so it carries the
-same two; what it needs of its starter's findings is in its prompt.
+same two; what it needs of its starter's findings is in its prompt. A thread
+attached with `about` adds the memory topics it names, `memory/<n>`, between
+the lineage and the worker's own journal (`docs/memory_backbone.md` §7.3).
 
 - **The reader's own sections.** The thread's and the project's journals are
   records (§3.2) — no conversation of their own holds them — so each

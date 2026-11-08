@@ -1259,10 +1259,25 @@ read every folder, and each person added is told so.
 ### 7.3 Zen workers
 
 A worker drafts its own journal every 16 turns with `journal-core`, tied to
-its conversation in zend's substrate, and keeps doing so. Each draft and
-fold, and the task's end, is exported to `threads/<thread>/<worker>/` as
-lines. The tree therefore holds every worker's account, and lineage reads it
-from the tree.
+its conversation in zend's substrate; that journal stays the work record, read
+with `T:<thread>/<worker>`.
+
+A thread is tied to the memory by `thread_attach`'s `about`: at most three
+topics, kept in the record `mcp/thread-memory/<owner>/<thread>` with the
+owner's group (`zend/src/mcp/thread_export.rs`). Once bound:
+
+- **Out.** Every note on the thread and every task's end is written, as zend
+  and off the request path, as a line of `threads/<thread>` in that group —
+  created on first write — and each topic references that journal. Every
+  conversation reading a topic sees the work.
+- **In.** Each worker on the thread carries the topics as sections of its
+  journal collection, `memory/<n>` by the topic's place, after its lineage and
+  before its own journal, under `MEMORY_MAX_CHARS` (16,000 characters), the
+  first topic served first (`zend/src/mcp/memory_sections.rs`). They are read
+  from the tree as last published at each round head, so a topic's new line
+  joins the prompt the round after its section seals and reseals from that
+  section on. A line past its `expires`, or replaced, is not carried; the
+  activity record is no line and is never carried.
 
 ## 8. Keeping forever
 

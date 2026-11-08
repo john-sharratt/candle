@@ -175,7 +175,7 @@ pub(crate) fn repo() -> (TempDir, PathBuf) {
     (root, agent)
 }
 
-fn opened(dir: PathBuf) -> Arc<Memory> {
+pub(crate) fn opened(dir: PathBuf) -> Arc<Memory> {
     let m = Arc::new(Memory::default());
     m.start(dir);
     let until = Instant::now() + Duration::from_secs(30);

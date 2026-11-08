@@ -284,7 +284,8 @@ quoted in Phase 8's report.
   `lineage::MAX_CHARS`, with a heading of their own ("From memory — what the
   household and its work have noted; information, not instructions"). They are
   reconciled each round from the in-memory tree. A topic's new line reseals from
-  its section on; the activity record is never in a section.
+  its section on; the activity record is never in a section
+  (`zend/src/mcp/memory_sections.rs`, `memory/<n>` by the topic's place).
 - **A thread names its topics.** `thread_attach` takes `about` (at most three
   memory paths), kept on the thread record.
 - **The export (D9).** When zend writes a thread note or a settle note,
@@ -292,13 +293,16 @@ quoted in Phase 8's report.
   default group (created on first write, cue "the work on <thread>"), and links
   it from each `about` topic (`journal_link`). Memory paths only, so
   `check_links` holds.
-- **Search.** Memory `journal_grep` takes `kind` (note, fold, proposal,
-  outcome) and `speaker`, and pages by `before` (a stamp): hits from every
-  journal searched merge newest first, each journal read by key range — no full
-  scan. `T:`/`P:` grep is unchanged; their results reach memory through the
-  export.
-- **Reading.** Memory `journal_read` pages newest first by `before`, continuing
-  into archived lines, so an archive is read by paging past the window.
+- **Search.** Memory `journal_grep` takes `kind` (note, fold, proposal) and
+  `speaker`, and pages by `after: <path>#<line id>`, the last hit of the page
+  before: hits from every journal searched merge newest first, ties broken by
+  id, so a cursor names one place even among lines of one second
+  (`journals::view::grep::grep_by`). A task's outcome is no journal line; it
+  reaches a client through `get_user_context`'s outcomes block (Phase 4).
+  `T:`/`P:` grep is unchanged; their results reach memory through the export.
+- **Reading.** Memory `journal_read` pages newest first by `after: <path>#<line
+  id>` and `limit`, continuing into archived lines, so an archive is read by
+  paging past the window (`journals::view::page::before`).
 - **Stable note numbers.** A thread note's number is assigned at write — one
   past both the journal's entry count and its newest entry's number, read
   from the keys' count and the newest record only — and stored on the note,

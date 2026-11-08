@@ -10,6 +10,7 @@ use journals::scope::Section;
 use serde_json::{json, Value};
 
 use super::{mem, string, Answer, Ctx};
+use crate::mcp::memory_sections::MAX_TOPICS;
 use crate::mcp::names;
 use crate::mcp::records::Records;
 use crate::mcp::state::ATTACHED;
@@ -19,8 +20,8 @@ use crate::mcp::workers::{self, now_ms};
 
 pub const NAME: &str = "thread_attach";
 
-/// The most topics a thread is about.
-const MAX_ABOUT: usize = 3;
+/// The most topics a thread is about: as many as its workers carry.
+const MAX_ABOUT: usize = MAX_TOPICS;
 
 pub fn definition() -> Value {
     json!({
@@ -37,7 +38,7 @@ pub fn definition() -> Value {
             "type": "object",
             "properties": {
                 "thread": {"type": "string", "description": "The thread's name: a kebab-case slug of at most 40 characters."},
-                "about": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_ABOUT, "description": "The memory topics the work is about, at most three (`topics/candle/zen`): its notes and its tasks' ends are kept on the memory's `threads/<thread>`, which each topic references, so every conversation reading the topic sees the work."}
+                "about": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_ABOUT, "description": "The memory topics the work is about, at most three (`topics/candle/zen`): its notes and its tasks' ends are kept on the memory's `threads/<thread>`, which each topic references, so every conversation reading the topic sees the work, and each task on the thread opens carrying the topics' newest lines."}
             },
             "required": ["thread"],
             "additionalProperties": false
