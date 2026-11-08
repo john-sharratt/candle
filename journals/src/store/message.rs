@@ -66,6 +66,7 @@ pub fn read(message: &str) -> Result<Recorded> {
 mod tests {
     use super::*;
     use crate::ops::fixture::{now, p, yen};
+    use crate::terms::Terms;
     use crate::testing::slug;
 
     #[test]
@@ -74,6 +75,7 @@ mod tests {
             path: p("topics"),
             text: "Builder starts Monday.\nBring keys.".into(),
             speaker: Some(slug("john")),
+            terms: Terms::default(),
         };
         let id = LineId::parse("2026-10-30-1200-7e3a").unwrap();
         let m = message("Note on @zen/topics", &yen(), &op, now(), Some(&id));

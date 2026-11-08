@@ -25,6 +25,7 @@ use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::mission_gen::world::Routine;
+use crate::engine::zen_task::{is_task_step, Task};
 use crate::sim::agenda::Agendum;
 
 /// One step of a mission. `done` flips when the character ticks it off.
@@ -281,6 +282,10 @@ pub struct Mission {
     /// carried alone.
     #[serde(default)]
     pub agendum: Option<Agendum>,
+    /// The task of Zen's this mission drives, once its carrier started one
+    /// (`docs/mission_templates.md` §7).
+    #[serde(default)]
+    pub task: Option<Task>,
 }
 
 impl Mission {
@@ -301,7 +306,26 @@ impl Mission {
             year: None,
             grants: Vec::new(),
             agendum: None,
+            task: None,
         }
+    }
+
+    /// Sign off every open step that sees the mission's task through, because
+    /// the task reported done. Returns whether anything was signed off.
+    pub fn task_done(&mut self) -> bool {
+        let mut ticked = false;
+        for step in self
+            .todo
+            .iter_mut()
+            .filter(|t| !t.done && !t.reports && !t.critical)
+        {
+            if is_task_step(&step.text) {
+                step.done = true;
+                step.outcome = Some(StepOutcome::Achieved);
+                ticked = true;
+            }
+        }
+        ticked
     }
 
     /// The same mission, on an agenda as `agendum`.
@@ -1374,6 +1398,7 @@ pub fn engine_sees(step: &str) -> bool {
         || reading_doc(step).is_some()
         || writing_doc(step).is_some()
         || time_step(step).is_some()
+        || is_task_step(step)
 }
 
 /// The step that sends a carrier to a time machine to work in `year`.

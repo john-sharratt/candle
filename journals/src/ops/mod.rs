@@ -12,6 +12,7 @@
 //! and the service folds only what its upkeep folds (§2.3, §4).
 
 pub mod accept;
+pub mod activity;
 pub mod append;
 pub mod close;
 pub mod create;
@@ -35,6 +36,7 @@ use crate::line::{LineId, Writer};
 use crate::path::{Address, Below, JournalPath};
 use crate::period::Period;
 use crate::slug::Slug;
+use crate::terms::Terms;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 
@@ -57,16 +59,25 @@ pub enum OnTaken {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    /// `speaker` is who the conversation's focus says is talking (§2.4).
+    /// `speaker` is who the conversation's focus says is talking (§2.4);
+    /// `terms` what the note says about itself ([`Terms`]).
     Note {
         path: JournalPath,
         text: String,
         speaker: Option<Slug>,
+        terms: Terms,
     },
     Episode {
         path: JournalPath,
         text: String,
         speaker: Option<Slug>,
+    },
+    /// A call that changed something, kept on a conversation's
+    /// `journal.yaml` rather than as a line of its own (D3).
+    Activity {
+        path: JournalPath,
+        tool: String,
+        subject: String,
     },
     Edit {
         address: Address,
@@ -246,12 +257,18 @@ fn run(
             path,
             text,
             speaker,
-        } => append::note(tree, actor, path, speaker.as_ref(), text, now, keep),
+            terms,
+        } => append::note(tree, actor, path, speaker.as_ref(), terms, text, now, keep),
         Op::Episode {
             path,
             text,
             speaker,
         } => append::episode(tree, actor, path, speaker.as_ref(), text, now, keep),
+        Op::Activity {
+            path,
+            tool,
+            subject,
+        } => activity::record(tree, path, tool, subject, now),
         Op::Edit { address, text } => edit::edit(tree, address, text),
         Op::Forget { path, which } => forget::forget(tree, path, which),
         Op::Accept { address } => accept::accept(tree, address),

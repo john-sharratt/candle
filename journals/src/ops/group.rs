@@ -47,7 +47,7 @@ fn free_email(tree: &Tree, person: &Slug, email: &Email) -> Result<()> {
         }
         if p.file
             .as_ref()
-            .is_ok_and(|f| f.accounts.iter().any(|a| &a.email == email))
+            .is_ok_and(|f| f.accounts.iter().any(|a| a.email.as_ref() == Some(email)))
         {
             return Err(Error::refused(format!(
                 "{email} is {slug}'s: an account is one person's"
@@ -244,9 +244,9 @@ pub fn add_member(
                 .ok_or_else(|| Error::invalid(format!("{person} is new: give their name")))?;
             let mut accounts: Vec<Account> = Vec::new();
             for e in emails {
-                if !accounts.iter().any(|a| &a.email == e) {
+                if !accounts.iter().any(|a| a.email.as_ref() == Some(e)) {
                     accounts.push(Account {
-                        email: e.clone(),
+                        email: Some(e.clone()),
                         key: None,
                     });
                 }
@@ -283,9 +283,9 @@ pub fn add_member(
                 changed = true;
             }
             for e in emails {
-                if !file.accounts.iter().any(|a| &a.email == e) {
+                if !file.accounts.iter().any(|a| a.email.as_ref() == Some(e)) {
                     file.accounts.push(Account {
-                        email: e.clone(),
+                        email: Some(e.clone()),
                         key: None,
                     });
                     changed = true;
@@ -474,7 +474,7 @@ pub fn bind(tree: &mut Tree, person: &Slug, email: &Email, key: &AccountKey) -> 
     let account = file
         .accounts
         .iter_mut()
-        .find(|a| &a.email == email)
+        .find(|a| a.email.as_ref() == Some(email))
         .ok_or_else(|| Error::not_found(format!("{person} lists no {email}")))?;
     if account.key.is_some() {
         return Err(Error::conflict(format!("{email} is bound already")));
@@ -619,7 +619,10 @@ mod tests {
         let pf = t.person_file(&slug("yen-nhi")).unwrap();
         assert_eq!(pf.groups, vec![slug("zen")]);
         assert_eq!(pf.default_group, Some(slug("zen")));
-        assert_eq!(pf.accounts[0].email.as_str(), "yen.nhi@example.com");
+        assert_eq!(
+            pf.accounts[0].email.as_ref().map(Email::as_str),
+            Some("yen.nhi@example.com")
+        );
         assert_eq!(
             t.group_file(&slug("zen"))
                 .unwrap()

@@ -162,6 +162,36 @@ client on keep-alives of its own.
 `tools/list` keeps them, as above. A call to a tool whose backend is known goes straight there,
 and a relisting keeps the routes of any backend that did not answer.
 
+### 3.1 A changed list is told
+
+A client keeps the tools it was given, across chats and across our releases.
+On 2026-11-08 a claude.ai session still held `cluster_logs` and none of the
+`file_*` or `log_*` tools two days after a release replaced the one with the
+others: calling `cluster_logs` reached a backend that no longer had it, and
+the new tools were never offered. Nothing between zend and claude.ai dropped
+them; the client was never told.
+
+So the aggregator declares `tools: {listChanged: true}` and tells:
+
+- **Every answer names its listing.** Each backend stamps
+  `x-mcp-tools-version` on every answer: a 16-hex-digit FNV-1a of the
+  listing it would give (`mcp_server::listing::version`), computed once, as
+  zend and npcd list every caller the same tools.
+- **The aggregator remembers what it served** each session, one version per
+  backend, when it answers that session's `tools/list` (`mcp/src/served.rs`),
+  in memory, bounded at 4,096 sessions with the idlest let go.
+- **A call answered on another listing owes the notice.** So does a call of a
+  session this process never served: one opened before a restart, or served
+  by the other aggregator, whose list is unknown here.
+- **It is told on the call's stream**: `notifications/tools/list_changed`
+  after the call's progress and before its result, once. The client lists
+  again, and that listing is what the session is owed against from then on.
+  A call answered in its response, not on a stream, carries no notification,
+  and the debt waits for the session's next streamed call.
+
+The backends declare `listChanged: false` and never notify: their client is
+the aggregator, which lists them whenever its own client does.
+
 ## 4. The backends
 
 ### zend (`/v1/mcp` on code.tokera.com)

@@ -31,6 +31,8 @@
 //! | [`state`] | Sessions as records, the attached thread, the change signal |
 //! | [`tending`] | The sessions' noted use written in, and the stale swept, off the request path |
 //! | [`chats`] | Zen chat: a private conversation named by its id, disposed of when closed or idle (`docs/zen_chat.md`) |
+//! | [`driven`] | Whether anyone drives a task: `attended`, or `alone` and told so |
+//! | [`thread_export`] | A thread's notes and tasks' ends kept in the memory's `threads/`, referenced from its topics |
 
 pub mod activity;
 pub mod approvals;
@@ -38,13 +40,16 @@ pub mod archiving;
 pub mod audit;
 pub mod caller;
 pub mod chats;
+pub mod driven;
 pub mod lineage;
 pub mod memory;
+pub mod memory_sections;
 pub mod names;
 pub mod npcd_tools;
 pub mod nudges;
 pub mod ops;
 pub mod ops_tools;
+pub mod outcomes;
 pub mod ownership;
 pub mod records;
 pub mod reported;
@@ -55,6 +60,7 @@ pub mod state;
 pub mod steps;
 pub mod stops;
 pub mod tending;
+pub mod thread_export;
 pub mod threads;
 
 #[cfg(test)]

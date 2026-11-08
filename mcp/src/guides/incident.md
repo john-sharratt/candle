@@ -1,15 +1,16 @@
 ---
 name: incident
 description: How to handle something broken now — contain, establish what changed, diagnose from evidence, act only with approval, then write it up.
-tools: [cluster_status, log_grep, cluster_audit, service_status, service_control, cluster_command, job_status, journal_note]
+tools: [cluster_status, member_status, log_grep, cluster_audit, service_status, service_control, cluster_command, job_status, journal_note]
 ---
 # Incidents
 
 ## 1. Scope it — what is affected, since when
 
 `cluster_status` (every member, every app's floor), `service_status` for the
-machines involved. Tell the user what is down and what is not, before
-anything else.
+machines involved, and `member_status {node}` for a member whose replication
+or upgrade the summary does not explain. Tell the user what is down and what
+is not, before anything else.
 
 ## 2. What changed
 

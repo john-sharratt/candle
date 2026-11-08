@@ -23,6 +23,7 @@ use super::Ctx;
 use crate::mcp::caller::Caller;
 use crate::mcp::memory::who::{self, Who};
 use crate::mcp::memory::{conversations, moved, Memory};
+use crate::mcp::records::Records;
 use crate::session::ZendSession;
 
 /// How every memory tool's paths are read, as its description says it
@@ -97,7 +98,11 @@ pub fn read(ctx: &Ctx) -> Result<Mem, String> {
     if let (Who::Person(person), Some(group)) = (&m.who, &m.group) {
         if writes_in(&m.tree, person, group) {
             let followed = conversations::followed_by(m.channel, person, group, &ctx.mcp_id);
-            m.here = Some(conversations::here(&m.memory, group, m.channel, &followed)?);
+            let records = ctx.session.shared_substrate();
+            let records = records.as_ref().map(|r| r as &dyn Records);
+            m.here = Some(conversations::here(
+                &m.memory, records, group, m.channel, &followed,
+            )?);
         }
     }
     Ok(m)
@@ -113,7 +118,9 @@ pub fn open(ctx: &Ctx) -> Result<Mem, String> {
     if let (Who::Person(person), Some(group)) = (&m.who, &m.group) {
         if writes_in(&m.tree, person, group) {
             let followed = conversations::followed_by(m.channel, person, group, &ctx.mcp_id);
-            match conversations::open(&m.memory, person, group, m.channel, &followed) {
+            let records = ctx.session.shared_substrate();
+            let records = records.as_ref().map(|r| r as &dyn Records);
+            match conversations::open(&m.memory, records, person, group, m.channel, &followed) {
                 Ok(here) => {
                     m.tree = m.memory.tree()?;
                     m.here = Some(here);

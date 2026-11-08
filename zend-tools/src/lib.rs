@@ -82,6 +82,7 @@ pub mod executor;
 pub mod grants;
 pub mod net;
 mod numfmt;
+pub mod public_fetch;
 pub mod registry;
 pub mod run_watch;
 pub mod runner;

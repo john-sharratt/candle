@@ -89,6 +89,7 @@ mod tests {
     use crate::brief::call_of;
     use crate::ops::apply;
     use crate::ops::fixture::{john, p, zen};
+    use crate::terms::Terms;
     use crate::testing::at;
     use crate::tree::window::next_fold;
     use crate::tree::WINDOW;
@@ -105,6 +106,7 @@ mod tests {
                     path: p("people"),
                     text: format!("n{i}"),
                     speaker: None,
+                    terms: Terms::default(),
                 },
                 t0.plus(3600 * i as i64),
             )

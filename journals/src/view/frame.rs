@@ -11,6 +11,7 @@ use crate::files::Focus;
 use crate::path::{JournalPath, Place};
 use crate::scope::{conversation_channel, Channel, Section};
 use crate::slug::Slug;
+use crate::terms::shown;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 use crate::view::index::{index, refs_lines, written};
@@ -195,8 +196,12 @@ fn people_lines(tree: &Tree, group: &Slug) -> Vec<String> {
     lines.into_iter().map(|(_, l)| l).collect()
 }
 
-/// The conversation before `here` on the same channel that has a summary:
-/// where a conversation on that client picks up.
+/// The newest calls a conversation's activity names before its summary is
+/// built.
+const LEFT_OFF_CALLS: usize = 3;
+
+/// The conversation before `here` on the same channel that says where it left
+/// off: where a conversation on that client picks up.
 fn last_time(tree: &Tree, here: &JournalPath) -> Option<(JournalPath, String)> {
     let channel = here.last().and_then(|n| conversation_channel(n.as_str()))?;
     let conversations = JournalPath::of_section(here.group(), Section::Conversations);
@@ -205,9 +210,27 @@ fn last_time(tree: &Tree, here: &JournalPath) -> Option<(JournalPath, String)> {
         .iter()
         .filter(|(n, _)| Some(*n) != here.last())
         .filter(|(n, _)| conversation_channel(n.as_str()) == Some(channel))
-        .filter_map(|(n, c)| summary_of(c).map(|s| (n, c, s)))
+        .filter_map(|(n, c)| left_off(c).map(|s| (n, c, s)))
         .max_by_key(|(_, c, _)| c.meta.as_ref().map(|m| m.created))
         .and_then(|(n, _, s)| Some((conversations.child(n.clone()).ok()?, s)))
+}
+
+/// Where conversation `c` left off: its summary, or — before one is built —
+/// its newest calls.
+fn left_off(c: &Journal) -> Option<String> {
+    summary_of(c).or_else(|| {
+        let calls: Vec<String> = c
+            .meta
+            .as_ref()?
+            .activity
+            .newest(LEFT_OFF_CALLS)
+            .map(|d| match d.subject.as_str() {
+                "" => d.tool.clone(),
+                s => format!("{} — {s}", d.tool),
+            })
+            .collect();
+        (!calls.is_empty()).then(|| format!("it last called {}.", calls.join("; ")))
+    })
 }
 
 fn focus_of<'a>(tree: &'a Tree, at: Option<&JournalPath>) -> Option<&'a Focus> {
@@ -228,9 +251,10 @@ fn focused_block(tree: &Tree, path: &JournalPath, j: &Journal, label: &str, now:
     }];
     block.extend(index(path, j, now).into_iter().map(|l| format!("  - {l}")));
     block.extend(refs_lines(j).into_iter().map(|l| format!("  - {l}")));
-    let from = j.window.len().saturating_sub(FOCUSED_LINES);
+    let window = shown(&j.window, now);
+    let from = window.len().saturating_sub(FOCUSED_LINES);
     block.extend(
-        j.window[from..]
+        window[from..]
             .iter()
             .map(|l| format!("  {}", render_line(tree, l))),
     );
@@ -290,7 +314,7 @@ pub fn frame(
             // The newest lines that fit in half of what is left.
             let mut lines: Vec<String> = Vec::new();
             let mut room = f.left / 2;
-            for l in j.window.iter().rev() {
+            for l in shown(&j.window, now).into_iter().rev() {
                 let r = format!("  {}", render_line(tree, l));
                 let n = r.chars().count() + 1;
                 if n > room {
@@ -476,6 +500,7 @@ mod tests {
     use crate::files::summary::{Cite, Sentence};
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, OnTaken, Op};
+    use crate::terms::Terms;
     use crate::testing::slug;
     use crate::tree::fingerprint::fingerprint;
 
@@ -513,6 +538,7 @@ mod tests {
                 path: p(path),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )
@@ -621,6 +647,60 @@ mod tests {
             "open for a drive",
         );
         (t, today)
+    }
+
+    /// **Before a conversation's summary is built, where it left off is its
+    /// newest calls.**
+    #[test]
+    fn without_a_summary_a_conversation_left_off_at_its_newest_calls() {
+        let mut t = zen();
+        let server = Actor::Server {
+            person: slug("john"),
+            channel: Channel::Grok,
+        };
+        let yesterday = made(
+            &mut t,
+            &server,
+            "conversations",
+            "2026-10-29-0800-grok",
+            "open for a drive",
+        );
+        for (i, (tool, subject)) in [
+            ("image_generate", "a cat"),
+            ("repo_task_start", "dj-set"),
+            ("journal_note", ""),
+            ("bot_mission_give", "patrol"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            apply(
+                &mut t,
+                &server,
+                &Op::Activity {
+                    path: yesterday.clone(),
+                    tool: tool.into(),
+                    subject: subject.into(),
+                },
+                now().plus(i as i64),
+            )
+            .unwrap();
+        }
+        let today = made(
+            &mut t,
+            &server,
+            "conversations",
+            "2026-10-30-0800-grok",
+            "open for a drive",
+        );
+        assert_eq!(
+            last_time(&t, &today),
+            Some((
+                yesterday,
+                "it last called bot_mission_give — patrol; journal_note; repo_task_start — dj-set."
+                    .to_string()
+            ))
+        );
     }
 
     /// **A conversation nothing has written to reads as a just-opened one**:
@@ -947,6 +1027,7 @@ mod tests {
                 path: path.clone(),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )

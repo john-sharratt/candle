@@ -460,6 +460,24 @@ the same fields: `{at: …, kind: note, text: "…"}` on one line reads as well.
   every version, and `git log -L` / `git blame` answer when and by whom.
 - **A line stays in the journal it was written to.** Moving one is a
   restructuring (§2.6): `git mv` of its file, which keeps its id.
+- **A note states its terms** (`journals::terms`), each a field before its
+  text and absent when not stated: `concluded: true` — the assistant writing it
+  concluded it rather than heard it, which on a topic needs a `source`;
+  `source` — the document section, file:line, commit or URL it rests on;
+  `expires` — when it stops being true; `replaces` — the line of the same
+  journal it supersedes. A line past its `expires`, and a line another
+  replaces, is hidden from every read, search and frame, and kept in its file
+  and in history.
+- **A conversation's calls are not lines.** Each call that changed something
+  is kept on the conversation's `journal.yaml` as `activity` — one
+  `{at, tool, subject}` to a line, the newest 200, older ones counted per tool
+  in `activity_before` (`journals::files::activity`). Nothing reads it but the
+  frame's "where it left off" and the conversation's own view.
+- **A change is held to the tree it changed** (`journals check <dir> --against
+  <old dir> [--forgets <file>] [--budget <file>]`, and the worker tool's
+  `against_base`): every line of the old tree is somewhere in the new one
+  unless `--forgets` names it, and the shape — journals created and removed,
+  lines moved, summaries rewritten — moves no further than the budget.
 
 ### 3.3 Errors
 
@@ -511,6 +529,10 @@ default_group: zen
   lists that email with no key, and reads the account as that person. At its
   first call that writes, it writes the key in (a commit), and from then on
   knows the account by its key alone. An unverified email binds nothing.
+- **A service's account is its key alone**, `- {key: <hex>}`: a service
+  identity (`service:<name>`, provider `service-key`) has no email and never
+  signs in, so it is listed with its key from the start and nothing binds it.
+  An account with neither email nor key is refused.
 - **An account no person lists is a guest.** It reads `@guest`, and nothing
   else, until an admin lists it (§3.6).
 - **An account says which group, not who is speaking.** A conversation opens
@@ -522,8 +544,11 @@ A member's journal about themselves lives in their group, at
 group's own.
 
 **Zen is a member too**, an identity like the people in the group (the
-user's decision, 2026-10-31). `persons/zen/person.yaml` names it and lists
-no accounts, since nobody signs in as Zen. `@zen` lists it as a member, and
+user's decision, 2026-10-31). `persons/zen/person.yaml` names it, and lists
+one account: its service identity, `service:zen`, by key alone
+(`- {key: cbee5f243460cbae}`), which is what npcd's drones call zend as when a
+mission drives a task (`docs/zen_memory_and_guides.md` D8). Nobody signs in
+as Zen. `@zen` lists it as a member, and
 its `people/zen` journal holds what Zen is and what it keeps about itself:
 - its models and the machines it runs on;
 - what it does well and what it has learned about how this group wants
@@ -1107,8 +1132,13 @@ connector's listing, says what this document says about that tool:
 - that the structure is never changed by a tool;
 - how paths and references resolve.
 
-Each client's guide (`mcp/src/guides/`) is written from §2.4, §2.5 and
-§2.6, and says the same thing to every client, in that client's voice:
+Each client's guide (`mcp/src/guides/` — `claude` for every Claude client,
+`grok` for Grok) is short, since it rides the first call of every
+conversation: the frame and the rules below in brief, and a pointer to the
+full `memory` guide, read on demand, which carries all of them, the note
+terms, proposals, reading and search, threads and projects, and the two
+skills. Between them they are written from §2.4, §2.5 and §2.6, and say the
+same thing to every client, in that client's voice:
 
 1. **This is Zen's memory.** The master, `@zen`, is Zen itself: what it
    is, who is in it, the few things that last.
@@ -1206,6 +1236,20 @@ A note that tells an AI what to do is refused, and each channel's writes are
 rate-limited. Memory is where a prompt injection persists, and git history
 is what makes one found and reverted.
 
+**The boundary in retrieval.** zend ingests the repository like code, so its
+journals reach model prompts by provenance as well as by these tools. That
+route holds the same line (`zend::retrieval_scope::Reader`): a conversation's
+scope holds a journal only of a group its person reads, and a person's own
+file only for that person, on every route — files, folders, the layers built
+on files, and the groups that draw them. A task's or a chat's person is its
+owner, named in its conversation id; a dialogue's, whoever's signed-in message
+began its turn. An account no person lists reads `@guest`, and a conversation
+nobody signed in to reads no journal. The ingest readers and calibration
+conversations work no scope out, so they read every group's units; their
+output is a reading or an exemplar, never placed as another group's text. A
+conversation's own journal — what a session's calls wrote — is not ingested
+at all.
+
 **What the boundary protects.** It keeps each group's journals from every
 other group's members and from bots outside what they are granted. It does
 not keep them from whoever runs an agent holding the repository, or holds
@@ -1215,10 +1259,25 @@ read every folder, and each person added is told so.
 ### 7.3 Zen workers
 
 A worker drafts its own journal every 16 turns with `journal-core`, tied to
-its conversation in zend's substrate, and keeps doing so. Each draft and
-fold, and the task's end, is exported to `threads/<thread>/<worker>/` as
-lines. The tree therefore holds every worker's account, and lineage reads it
-from the tree.
+its conversation in zend's substrate; that journal stays the work record, read
+with `T:<thread>/<worker>`.
+
+A thread is tied to the memory by `thread_attach`'s `about`: at most three
+topics, kept in the record `mcp/thread-memory/<owner>/<thread>` with the
+owner's group (`zend/src/mcp/thread_export.rs`). Once bound:
+
+- **Out.** Every note on the thread and every task's end is written, as zend
+  and off the request path, as a line of `threads/<thread>` in that group —
+  created on first write — and each topic references that journal. Every
+  conversation reading a topic sees the work.
+- **In.** Each worker on the thread carries the topics as sections of its
+  journal collection, `memory/<n>` by the topic's place, after its lineage and
+  before its own journal, under `MEMORY_MAX_CHARS` (16,000 characters), the
+  first topic served first (`zend/src/mcp/memory_sections.rs`). They are read
+  from the tree as last published at each round head, so a topic's new line
+  joins the prompt the round after its section seals and reseals from that
+  section on. A line past its `expires`, or replaced, is not carried; the
+  activity record is no line and is never carried.
 
 ## 8. Keeping forever
 

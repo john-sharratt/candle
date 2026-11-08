@@ -9,7 +9,7 @@ tools: [repo_task_start, repo_job_start, job_status, job_read]
 
 ## Prompt
 
-`repo_task_start {thread, name: "tests-<what>", effort: "deep", prompt}`:
+`repo_task_start {thread, name: "tests-<what>", role: "coder", effort: "deep", prompt}`:
 
 ```
 GOAL: write tests for <module | behaviour> in <repository>, on branch

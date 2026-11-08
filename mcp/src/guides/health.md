@@ -1,7 +1,7 @@
 ---
 name: health
 description: How to read how the cluster stands — every member's build and state, each app's floor, upgrades in progress, anything in fault — and summarise it with problems first.
-tools: [cluster_status, service_status, log_grep, cluster_audit]
+tools: [cluster_status, member_status, service_status, log_grep, cluster_audit]
 ---
 # Cluster health
 
@@ -19,7 +19,10 @@ oldest build it still routes to.
 2. For a machine's services and its last trial: `service_status {host}`,
    with the host as `cluster_status`'s keep rows name it — those are the
    machines.
-3. Summarise, in this order:
+3. For a member the summary leaves unclear — cut off, rejoining, unsent
+   events, a catch-up that does not end, the leases it holds —
+   `member_status {node}` with its node id: the member's own report, whole.
+4. Summarise, in this order:
    - **Anything wrong first**: a member not ready, a tenant loading or in
      fault, a member that gave no answer, a local build serving cluster
      traffic.

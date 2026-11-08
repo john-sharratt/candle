@@ -15,11 +15,12 @@ use journals::ops::Op;
 use journals::path::JournalPath;
 use journals::scope::Channel;
 use journals::slug::Slug;
+use journals::terms::Terms;
 use journals::time::Stamp;
 
 use super::{held, Memory};
 use crate::mcp::records::Records;
-use crate::mcp::threads::{self, Note};
+use crate::mcp::threads::{self, Note, Numbered};
 
 /// The key the substrate kept a person's old notes under.
 const OLD_JOURNAL: &str = "U:";
@@ -50,6 +51,7 @@ pub fn move_of(path: JournalPath, person: &Slug, note: &Note) -> (Actor, Op, Sta
                 path,
                 text: note.text.clone(),
                 speaker: Some(person.clone()),
+                terms: Terms::default(),
             },
             at,
         )
@@ -116,7 +118,7 @@ pub fn move_all(memory: &Memory, records: &dyn Records, owner: &str, group: &Slu
         }
     };
     let mut moved = 0usize;
-    for (key, note) in &old {
+    for (key, Numbered { note, .. }) in &old {
         let (actor, op, at) = move_of(path.clone(), person, note);
         match memory.write_at(&actor, &op, at) {
             Ok(_) => match records.cease(key) {

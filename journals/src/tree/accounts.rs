@@ -28,8 +28,10 @@ pub fn resolve(tree: &Tree, key: &AccountKey, verified: Option<&Email>) -> Resul
         for a in &file.accounts {
             if a.key.as_ref() == Some(key) {
                 by_key.push(slug.clone());
-            } else if a.key.is_none() && Some(&a.email) == verified {
-                by_email.push((slug.clone(), a.email.clone()));
+            } else if let (None, Some(e)) = (&a.key, &a.email) {
+                if Some(e) == verified {
+                    by_email.push((slug.clone(), e.clone()));
+                }
             }
         }
     }
@@ -135,6 +137,25 @@ mod tests {
                 &t,
                 &key("4444444444444444"),
                 Some(&email("yen@example.com"))
+            ),
+            Ok(Known::Stranger)
+        );
+    }
+
+    /// **A service is known by its key alone**: no email binds it, and its
+    /// key is its person from the first call.
+    #[test]
+    fn a_service_account_is_known_by_its_key() {
+        let t = tree(&[("zen", "  - {key: 0f1e2d3c4b5a6978}\n")]);
+        assert_eq!(
+            resolve(&t, &key("0f1e2d3c4b5a6978"), None),
+            Ok(Known::Person(slug("zen")))
+        );
+        assert_eq!(
+            resolve(
+                &t,
+                &key("7777777777777777"),
+                Some(&email("zen@example.com"))
             ),
             Ok(Known::Stranger)
         );

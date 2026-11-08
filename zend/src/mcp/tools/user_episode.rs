@@ -1,9 +1,10 @@
 //! `user_episode_note {tool, summary?}`: record on this conversation's
-//! journal that a tool did something for the user, through this session's
-//! channel (`docs/mcp_user_context.md` §2.3, `docs/memory_backbone.md` §2). The
-//! aggregator calls it by name after each call that changed something; it is
-//! in no listing, so no model is offered it — what was done is kept whether or
-//! not the model thought to note it.
+//! `journal.yaml` that a tool did something for the user, through this
+//! session's channel (`docs/mcp_user_context.md` §2.3,
+//! `docs/zen_memory_and_guides.md` D3) — its activity, never a line of its
+//! own. The aggregator calls it by name after each call that changed
+//! something; it is in no listing, so no model is offered it — what was done
+//! is kept whether or not the model thought to note it.
 
 use journals::actor::Actor;
 use journals::ops::guard::refuse_instructions;
@@ -42,12 +43,9 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     // What a call was asked is the model's own words: when they read as an
     // instruction, that the tool ran is kept and they are not.
-    let text = match refuse_instructions(summary) {
-        Ok(()) => episode_text(tool, summary),
-        Err(_) => episode_text(
-            tool,
-            "(what it was asked reads as an instruction, and is not kept)",
-        ),
+    let subject = match refuse_instructions(summary) {
+        Ok(()) => summary.trim(),
+        Err(_) => "(what it was asked reads as an instruction, and is not kept)",
     };
     let server = Actor::Server {
         person: person.clone(),
@@ -55,13 +53,16 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     match m.memory.write(
         &server,
-        &Op::Episode {
+        &Op::Activity {
             path: path.clone(),
-            text: text.clone(),
-            speaker: m.speaker(),
+            tool: tool.to_string(),
+            subject: subject.to_string(),
         },
     ) {
-        Ok(_) => Answer::ok(format!("Recorded on {path}: {text}.")),
+        Ok(_) => Answer::ok(format!(
+            "Recorded on {path}: {}.",
+            episode_text(tool, subject)
+        )),
         Err(e) => Answer::error(e),
     }
 }

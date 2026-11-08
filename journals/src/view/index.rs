@@ -126,6 +126,7 @@ mod tests {
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::fold::fold_child;
     use crate::ops::{apply, OnTaken, Op};
+    use crate::terms::Terms;
     use crate::testing::slug;
     use crate::tree::fingerprint::fingerprint;
 
@@ -208,6 +209,7 @@ mod tests {
                 path: trip.clone(),
                 text: "Flights booked.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )
@@ -243,6 +245,7 @@ mod tests {
                 path: trip.clone(),
                 text: "Hotel too.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now().plus(7_200),
         )

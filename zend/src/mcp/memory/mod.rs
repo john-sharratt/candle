@@ -9,6 +9,7 @@
 //! | [`conversations`] | each conversation's own journal, opened at its first call |
 //! | [`moved`] | a person's old `U:` notes, moved onto their own journal once |
 //! | [`context`] | `get_user_context`: the frame, within the client's budget |
+//! | [`readers`] | whom each conversation reads the memory as, for its retrieval scope |
 //!
 //! Reads answer from a published snapshot of the tree and never take the
 //! store. Writes take the store, commit at once, and publish the new
@@ -19,6 +20,7 @@
 pub mod context;
 pub mod conversations;
 pub mod moved;
+pub mod readers;
 pub mod who;
 
 use std::collections::BTreeSet;

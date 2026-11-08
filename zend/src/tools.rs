@@ -194,12 +194,14 @@ pub fn build_calibration_projection(
          <tools>\n",
         sys_start = dialect.system_start,
     );
-    // Background to any dialogue that is up while it runs.
+    // Background to any dialogue that is up while it runs: `Low`, the band
+    // that steps aside for a live turn (`scheduler::band`), as the ingest and
+    // the units' calibration are.
     let mut builder = ProjectionBuilder::for_reserved_corpus(
         &frame,
         Reserved::Calibration,
         CALIB_SECTION_BASE,
-        DecodePriority::Normal,
+        DecodePriority::Low,
     );
 
     let collection = builder

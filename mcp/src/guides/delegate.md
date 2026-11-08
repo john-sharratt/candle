@@ -77,6 +77,21 @@ For work on the web:
   evidence it does not exist — the page may have shown it as an image (the
   fetch reports `images`). Say what could not be read.
 
+## Role, and who drives it
+
+- `role` puts that kind's working rules in the worker's system prompt. **Work
+  that must land is `coder`** — a change, a document, a guide, anything that
+  ends in a commit — since only a coder commits and pushes. `researcher`
+  answers a question from evidence and changes nothing; `reviewer` reads a
+  change and reports what is wrong with it. Every guide's template names its
+  role; a task asked to write something under `researcher` stops at "shall I
+  commit it?".
+- `driven: attended` (the default, except from Grok) means you stay: you
+  answer its questions, check its result and carry approvals to the user.
+  `driven: alone` means no one will — it decides within its brief and the
+  repository's rules, lands its own result and states what waits on an
+  approval. Read `drive` before starting one alone.
+
 ## Effort and priority
 
 - `effort: exhaustive` — work that weighs many results against each other:

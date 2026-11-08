@@ -1023,8 +1023,8 @@ use crate::tools::{
     },
     datetime::REGISTRATION as DATETIME,
     file::{
-        FILE_DELETE, FILE_EDIT, FILE_GREP, FILE_IMAGE, FILE_LIST, FILE_MOVE, FILE_PRESENT,
-        FILE_READ, FILE_SEARCH, FILE_WRITE,
+        FILE_DELETE, FILE_DOWNLOAD, FILE_EDIT, FILE_GREP, FILE_IMAGE, FILE_LIST, FILE_MOVE,
+        FILE_PRESENT, FILE_READ, FILE_SEARCH, FILE_UPLOAD, FILE_WRITE,
     },
     git::{
         GIT_COMMIT, GIT_FETCH, GIT_GREP, GIT_LOG, GIT_MERGE, GIT_PUSH, GIT_REF, GIT_REFS,
@@ -1132,6 +1132,10 @@ fn register_all() -> &'static [RegisteredTool] {
         FILE_MOVE,
         FILE_IMAGE,
         FILE_PRESENT,
+        // The transfers fetch or send over the network; what they write stays
+        // in the overlay like every file tool's.
+        FILE_DOWNLOAD.requires(NET),
+        FILE_UPLOAD.requires(NET),
         // Git tools (9) — the split that decides the whole family.
         //
         // The readers declare nothing and are not high-risk, so every mode

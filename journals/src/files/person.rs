@@ -90,10 +90,15 @@ impl fmt::Display for Email {
     }
 }
 
+/// One account of a person's: a sign-in, known by its email until it first
+/// signs in and then by its key; or a service's, which has no email and no
+/// sign-in, and is listed with its key from the start (§3.4) — Zen's own,
+/// `service:zen`, which npcd's drones call zend as.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
-    pub email: Email,
-    /// Its key, once it has signed in with that verified email.
+    pub email: Option<Email>,
+    /// Its key: a sign-in's once it has signed in with that verified email,
+    /// a service's always.
     pub key: Option<AccountKey>,
 }
 
@@ -116,8 +121,18 @@ impl PersonFile {
         let mut emails = BTreeSet::new();
         let mut keys = BTreeSet::new();
         for a in &self.accounts {
-            if !emails.insert(&a.email) {
-                return Err(format!("{} is listed twice", a.email));
+            match (&a.email, &a.key) {
+                (Some(e), _) if !emails.insert(e) => {
+                    return Err(format!("{e} is listed twice"));
+                }
+                (None, None) => {
+                    return Err(
+                        "an account with no email is a service's, known by its key alone: \
+                         give it its `key`"
+                            .into(),
+                    );
+                }
+                _ => {}
             }
             if let Some(k) = &a.key {
                 if !keys.insert(k) {
@@ -156,9 +171,13 @@ impl PersonFile {
         } else {
             out.push_str("accounts:\n");
             for a in &self.accounts {
-                out.push_str(&format!("  - email: {}\n", scalar(a.email.as_str())));
+                let mut lead = "  - ";
+                if let Some(e) = &a.email {
+                    out.push_str(&format!("{lead}email: {}\n", scalar(e.as_str())));
+                    lead = "    ";
+                }
                 if let Some(k) = &a.key {
-                    out.push_str(&format!("    key: {}\n", scalar(k.as_str())));
+                    out.push_str(&format!("{lead}key: {}\n", scalar(k.as_str())));
                 }
             }
         }
@@ -178,7 +197,7 @@ impl PersonFile {
         let mut accounts = Vec::new();
         for (i, a) in f.opt_seq("accounts")?.into_iter().flatten().enumerate() {
             let mut af = Fields::of(a, file, item_line(text, "accounts", i), None)?;
-            let email = af.parsed("email", Email::parse)?;
+            let email = af.opt_parsed("email", Email::parse)?;
             let key = af.opt_parsed("key", AccountKey::parse)?;
             af.done()?;
             accounts.push(Account { email, key });
@@ -217,11 +236,11 @@ mod tests {
             name: "Yen".into(),
             accounts: vec![
                 Account {
-                    email: Email::parse("yen@example.com").unwrap(),
+                    email: Some(Email::parse("yen@example.com").unwrap()),
                     key: Some(AccountKey::parse("3b1f09c2d47e8a60").unwrap()),
                 },
                 Account {
-                    email: Email::parse("yen.other@example.net").unwrap(),
+                    email: Some(Email::parse("yen.other@example.net").unwrap()),
                     key: None,
                 },
             ],
@@ -262,6 +281,32 @@ mod tests {
             "person: zen\nname: Zen\naccounts: []\ngroups: [zen]\ndefault_group: zen\n"
         );
         assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
+    }
+
+    /// **A service's account is its key alone**, written and read back
+    /// exactly; an account with neither email nor key is refused.
+    #[test]
+    fn a_service_account_is_its_key_alone() {
+        let p = PersonFile {
+            person: slug("zen"),
+            name: "Zen".into(),
+            accounts: vec![Account {
+                email: None,
+                key: Some(AccountKey::parse("0f1e2d3c4b5a6978").unwrap()),
+            }],
+            groups: vec![slug("zen")],
+            default_group: Some(slug("zen")),
+        };
+        assert_eq!(
+            p.render(),
+            "person: zen\nname: Zen\naccounts:\n\
+             \x20 - key: 0f1e2d3c4b5a6978\n\
+             groups: [zen]\ndefault_group: zen\n"
+        );
+        assert_eq!(PersonFile::read("f", &p.render()).unwrap(), p);
+        let none = "person: zen\nname: Zen\naccounts:\n  - {}\ngroups: [zen]\n";
+        let err = PersonFile::read("f", none).unwrap_err();
+        assert!(err.what.contains("known by its key alone"), "{err}");
     }
 
     /// **Groups without a default are theirs to choose from**: an owner

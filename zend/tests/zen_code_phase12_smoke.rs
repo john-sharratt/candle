@@ -321,9 +321,11 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
             "every unit already committed"
         },
     );
+    // A dialogue nobody signed in to: it reads the code, and no journal.
     retrieval.apply(
         &engine,
         dialogue.timeline_id(),
+        "phase12-smoke",
         &tool_host.conversation_files(),
     );
 

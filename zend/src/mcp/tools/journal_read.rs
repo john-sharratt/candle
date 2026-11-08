@@ -11,6 +11,7 @@ use journals::path::JournalPath;
 use journals::time::Stamp;
 use journals::tree::WINDOW;
 use journals::view::open::open;
+use journals::view::page::before;
 use journals::view::who::render_line;
 use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
@@ -21,7 +22,7 @@ use super::mem::PATHS;
 use super::{mem, string, Answer, Ctx, LOADING};
 use crate::mcp::memory::{is_memory_path, Memory};
 use crate::mcp::names::Path;
-use crate::mcp::threads::{self, project_journal, Note};
+use crate::mcp::threads::{self, project_journal, Numbered};
 
 pub const NAME: &str = "journal_read";
 
@@ -53,7 +54,8 @@ pub fn definition() -> Value {
                 "journal": {"type": "string", "description": "`@<group>`, a memory path such as `topics/candle` or `here`, or `<path>#<line id>`; or `\"self\"`, `T:<thread>`, `T:<thread>/<name>`, `P:<repository>`, or an entry's address, `T:<thread>/<name>#12`."},
                 "entry": {"type": "integer", "minimum": 0, "description": "An entry's number: a worker's, to page the turns behind it; a thread's or project's, to read that note."},
                 "offset": {"type": "integer", "minimum": 1, "description": "With `entry`, the first line of a worker entry's page; without it, the first entry of a thread's, project's or worker's journal (1 by default)."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LINES, "description": "Lines in a worker entry's page (200 by default)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LINES, "description": "Lines in a worker entry's page (200 by default), or in a memory journal's page with `after` (50 by default)."},
+                "after": {"type": "string", "description": "Memory only: read the lines before this one, `<path>#<line id>` — the oldest line the read before showed, as its answer names it — going on into the journal's archives."},
                 "answer_from": {"type": "integer", "minimum": 0, "description": "For a worker's path: read its final answer instead, a page of characters from this one (0 to start)."}
             },
             "required": ["journal"],
@@ -79,7 +81,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Err(e) => return Answer::error(e),
     };
     if is_memory_path(journal) {
-        return read_memory(ctx, journal);
+        return read_memory(ctx, journal, args);
     }
     // An address names its entry: `T:<thread>/<name>#12`, or `#12.3` for one
     // of its claims.
@@ -176,8 +178,9 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     }
 }
 
-/// One of the memory's journals, opened; or one line of it, by its address.
-fn read_memory(ctx: &Ctx, journal: &str) -> Answer {
+/// One of the memory's journals, opened; one line of it, by its address; or,
+/// with `after`, a page of the lines before that one.
+fn read_memory(ctx: &Ctx, journal: &str, args: &Value) -> Answer {
     let m = match mem::read(ctx) {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
@@ -208,9 +211,34 @@ fn read_memory(ctx: &Ctx, journal: &str) -> Answer {
         Ok(p) => p,
         Err(e) => return Answer::error(e),
     };
-    match Memory::readable(&m.tree, &actor, &path) {
-        Ok(j) => Answer::ok(open(&m.tree, &path, j, WINDOW, Stamp::now())),
-        Err(e) => Answer::error(e),
+    let j = match Memory::readable(&m.tree, &actor, &path) {
+        Ok(j) => j,
+        Err(e) => return Answer::error(e),
+    };
+    // A page of what came before a line: `after` is the line the page before
+    // began with, as its answer names it.
+    match args.get("after").and_then(Value::as_str) {
+        None => Answer::ok(open(&m.tree, &path, j, WINDOW, Stamp::now())),
+        Some(after) => {
+            let address = match m.find_address(after) {
+                Ok(a) if a.path == path => a,
+                Ok(a) => {
+                    return Answer::error(format!(
+                        "`after` names a line of {}, not of {path}",
+                        a.path
+                    ))
+                }
+                Err(e) => return Answer::error(String::from(e)),
+            };
+            let lines = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(WINDOW, |n| n as usize);
+            match before(&m.tree, &path, j, &address.id, lines, Stamp::now()) {
+                Some(page) => Answer::ok(page),
+                None => Answer::error(format!("{address} is no line")),
+            }
+        }
     }
 }
 
@@ -264,25 +292,23 @@ fn answer_page(path: &str, text: &str, from: usize) -> String {
 /// A thread's or project's journal at `path`: its entries from `first` on, or
 /// with `entry` that one note — its entries are its record, with no turns
 /// behind them.
-fn notes_answer(path: &str, notes: &[Note], entry: Option<u64>, first: usize) -> Answer {
+fn notes_answer(path: &str, notes: &[Numbered], entry: Option<u64>, first: usize) -> Answer {
     let Some(n) = entry else {
-        let all = threads::render_journal(path, notes);
         if first <= 1 {
-            return Answer::ok(all);
+            return Answer::ok(threads::render_journal(path, notes));
         }
-        let mut lines = all.lines();
-        let head = lines.next().unwrap_or_default().to_string();
-        let shown: Vec<&str> = lines.skip(first - 1).collect();
+        let shown: Vec<&Numbered> = notes.iter().filter(|e| e.number >= first as u64).collect();
+        let last = shown.iter().map(|e| e.number).max().unwrap_or(first as u64);
+        let lines: Vec<String> = shown.into_iter().map(threads::note_line).collect();
         return Answer::ok(format!(
-            "{head}, entries {first}–{} of {}\n{}",
-            first + shown.len().saturating_sub(1),
+            "{}, entries {first}–{last} of {}\n{}",
+            threads::journal_head(path),
             notes.len(),
-            shown.join("\n")
+            lines.join("\n")
         ));
     };
-    let lines = threads::note_lines(notes);
-    match n.checked_sub(1).and_then(|i| lines.get(i as usize)) {
-        Some(line) => Answer::ok(format!("{path}{line}")),
+    match notes.iter().find(|e| e.number == n) {
+        Some(e) => Answer::ok(format!("{path}{}", threads::note_line(e))),
         None => Answer::error(format!(
             "{path} has no entry {n}: it holds {} entries",
             notes.len()
@@ -327,26 +353,25 @@ pub fn render_worker(path: &str, view: Option<&Value>, first: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::threads::Note;
 
     /// **A thread's entry address reads that note**; one past its end says
     /// how many there are.
     #[test]
     fn a_notes_address_reads_that_note() {
+        let entry = |number, label: &str, text: &str| Numbered {
+            number,
+            note: Note {
+                label: label.into(),
+                text: text.into(),
+                at_ms: number,
+                worker: None,
+                client: None,
+            },
+        };
         let notes = vec![
-            Note {
-                label: "Claude started:".into(),
-                text: "verify the expiry".into(),
-                at_ms: 0,
-                worker: None,
-                client: None,
-            },
-            Note {
-                label: "Decided:".into(),
-                text: "parts cite their files".into(),
-                at_ms: 1,
-                worker: None,
-                client: None,
-            },
+            entry(1, "Claude started:", "verify the expiry"),
+            entry(2, "Decided:", "parts cite their files"),
         ];
         assert_eq!(
             notes_answer("T:review", &notes, Some(2), 1).text,

@@ -5,8 +5,10 @@ tools: [thread_attach, journal_note, repo_task_start, job_status, repo_task_repl
 ---
 # A feature, end to end
 
-One thread for the whole feature (`thread`); note each decision as it is
-made.
+One thread for the whole feature (`thread`), attached `about` the feature's
+topic; note each decision as it is made. Each task is attended while you are
+here to answer it, and alone (`drive`) for any stage left to run while you
+are away.
 
 1. **Understand** — `ask` tasks for how the code works today; `research` for
    anything outside it.

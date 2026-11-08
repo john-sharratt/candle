@@ -2303,7 +2303,10 @@ impl Runtime {
         }
         // What the house's bridges can work here, and what the carried mission
         // lets this body build (`docs/zen_moon_mind.md` §13–§15).
-        .in_the_house(&hosted, &body);
+        .in_the_house(&hosted, &body)
+        // And the acts that drive the mission's task, wherever it stands
+        // (`docs/mission_templates.md` §7).
+        .with_task_grants(&hosted, &body);
         // What the world's own state adds: what this body carries, what stands
         // in the room with it, what is outside. An empty answer to any of them
         // takes the acts that need it out of the grammar, which is how a world

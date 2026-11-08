@@ -7,13 +7,15 @@
 //! - The **thread's journal is written, not drafted**: each task Claude starts
 //!   and each one that ends is one entry, kept as its own record under
 //!   `mcp/note/<owner>/<thread>/` so two tasks ending at once never race to
-//!   rewrite one record. An entry's number is its place in key order.
+//!   rewrite one record. An entry's number is assigned when it is written,
+//!   one past the newest, and stored on it.
 //!
 //! Every key starts with the owner's key, so one person's records are never
 //! another's, whatever the names.
 
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use candle_conversation::projection::DecodePriority;
 use serde::{Deserialize, Serialize};
@@ -22,12 +24,16 @@ use web::auth::Role;
 
 use super::activity::Activity;
 use super::caller::Person;
+use super::driven::Driven;
 use super::names::Path;
 use super::records::Records;
 use super::roles::WorkerKind;
 
 /// Orders the notes one process writes within one millisecond.
 static NOTE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Held while a note is numbered and written.
+static NOTE_NUMBERING: Mutex<()> = Mutex::new(());
 
 /// How a worker stands (`docs/claude_zend_gateway.md` §3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +169,9 @@ pub struct Worker {
     /// The kind of work it does, which picks the document it carries.
     #[serde(default)]
     pub kind: WorkerKind,
+    /// Whether anyone drives it: an `alone` task is told nobody will answer.
+    #[serde(default)]
+    pub driven: Driven,
     pub started_ms: u64,
     /// When its current turn began.
     pub turn_ms: u64,
@@ -427,25 +436,62 @@ pub fn put_worker(records: &dyn Records, owner: &str, w: &Worker) -> anyhow::Res
     )
 }
 
-/// Add `note` to the thread's journal.
+/// One entry of a thread's journal with its number, `#N`: assigned when it
+/// is written and stored on it, so a note replicated in with an earlier
+/// stamp takes its own number and moves no other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Numbered {
+    pub number: u64,
+    pub note: Note,
+}
+
+/// The field of a stored note that holds its number.
+const NUMBER: &str = "number";
+
+/// The number a stored note holds, or — for one stored without — its place
+/// in key order, counted from one.
+fn number_of(value: &Value, place: usize) -> u64 {
+    value
+        .get(NUMBER)
+        .and_then(Value::as_u64)
+        .unwrap_or(place as u64)
+}
+
+/// Add `note` to the thread's journal, numbered one past both the entries it
+/// holds and its newest entry's number — the count takes in a note another
+/// member wrote that replicated in behind the newest; answers that number.
 pub fn add_note(
     records: &dyn Records,
     owner: &str,
     thread: &str,
     note: &Note,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
+    let prefix = note_prefix(owner, thread);
+    // Reading the journal's numbers and writing past them is one step for
+    // this process, so two of its notes never take one number.
+    let _numbering = NOTE_NUMBERING.lock().unwrap_or_else(|e| e.into_inner());
+    let held = records.count_under(&prefix);
+    let newest = records
+        .last_under(&prefix)
+        .map_or(0, |(_, last)| number_of(&last, held));
+    let number = held.max(newest as usize) as u64 + 1;
+    let mut value = serde_json::to_value(note)?;
+    if let Value::Object(fields) = &mut value {
+        fields.insert(NUMBER.into(), number.into());
+    }
     // Time first, zero-padded, so key order is the order they were written;
     // the sequence after it keeps two notes of one millisecond in order.
     let seq = NOTE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let key = format!("{}{:016}-{seq:010}", note_prefix(owner, thread), note.at_ms);
-    records.put(&key, serde_json::to_value(note)?)
+    let key = format!("{prefix}{:016}-{seq:010}", note.at_ms);
+    records.put(&key, value)?;
+    Ok(number)
 }
 
 /// The thread's journal, oldest first.
-pub fn notes(records: &dyn Records, owner: &str, thread: &str) -> Vec<Note> {
+pub fn notes(records: &dyn Records, owner: &str, thread: &str) -> Vec<Numbered> {
     notes_keyed(records, owner, thread)
         .into_iter()
-        .map(|(_, n)| n)
+        .map(|(_, e)| e)
         .collect()
 }
 
@@ -463,27 +509,43 @@ pub fn last_note(records: &dyn Records, owner: &str, thread: &str) -> Option<Not
 
 /// The thread's journal, oldest first, each entry with the record key it is
 /// kept under — what ending one names.
-pub fn notes_keyed(records: &dyn Records, owner: &str, thread: &str) -> Vec<(String, Note)> {
+pub fn notes_keyed(records: &dyn Records, owner: &str, thread: &str) -> Vec<(String, Numbered)> {
     records
         .under(&note_prefix(owner, thread))
         .into_iter()
-        .filter_map(|(k, v)| Some((k, decode(v)?)))
+        .enumerate()
+        .filter_map(|(i, (k, v))| {
+            let number = number_of(&v, i + 1);
+            Some((
+                k,
+                Numbered {
+                    number,
+                    note: decode(v)?,
+                },
+            ))
+        })
         .collect()
 }
 
 /// A thread's or project's journal, one numbered line per entry, oldest first.
-pub fn note_lines(notes: &[Note]) -> Vec<String> {
-    notes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| format!("#{} {} {}", i + 1, n.label, n.text))
-        .collect()
+pub fn note_lines(notes: &[Numbered]) -> Vec<String> {
+    notes.iter().map(note_line).collect()
+}
+
+/// One entry as a journal prints it, `#N <label> <text>`.
+pub fn note_line(e: &Numbered) -> String {
+    format!("#{} {} {}", e.number, e.note.label, e.note.text)
+}
+
+/// The line a thread's or project's journal opens with.
+pub fn journal_head(path: &str) -> String {
+    format!("Journal of {path}, written by Claude")
 }
 
 /// A thread's or project's journal as `journal_read` prints it: one numbered
 /// line per entry, under its path.
-pub fn render_journal(path: &str, notes: &[Note]) -> String {
-    let mut out = format!("Journal of {path}, written by Claude");
+pub fn render_journal(path: &str, notes: &[Numbered]) -> String {
+    let mut out = journal_head(path);
     if notes.is_empty() {
         out.push_str(" — no entries yet.");
         return out;
@@ -497,6 +559,8 @@ pub fn render_journal(path: &str, notes: &[Note]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::mcp::records::MemRecords;
 
@@ -570,6 +634,43 @@ mod tests {
         );
     }
 
+    /// **A note keeps the number it was written with**: one replicated in
+    /// with an earlier stamp sits in time order and moves no later number,
+    /// and one stored without a number reads as its place.
+    #[test]
+    fn a_note_keeps_its_number_when_an_earlier_one_lands() {
+        let r = MemRecords::default();
+        let note = |at_ms, text: &str| Note {
+            at_ms,
+            label: "Claude said:".into(),
+            text: text.into(),
+            worker: None,
+            client: None,
+        };
+        r.put(
+            "mcp/note/o/review/0000000000000001-0000000000",
+            serde_json::to_value(note(1, "unnumbered")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(add_note(&r, "o", "review", &note(20, "second")).unwrap(), 2);
+        assert_eq!(add_note(&r, "o", "review", &note(30, "third")).unwrap(), 3);
+        r.put(
+            "mcp/note/o/review/0000000000000010-0000000000",
+            json!({"at_ms": 10, "label": "Claude said:", "text": "late", "number": 4}),
+        )
+        .unwrap();
+        assert_eq!(
+            note_lines(&notes(&r, "o", "review")),
+            [
+                "#1 Claude said: unnumbered",
+                "#4 Claude said: late",
+                "#2 Claude said: second",
+                "#3 Claude said: third",
+            ]
+        );
+        assert_eq!(add_note(&r, "o", "review", &note(40, "fifth")).unwrap(), 5);
+    }
+
     #[test]
     fn a_running_task_whose_beat_stopped_reads_as_cut_off() {
         let w = Worker {
@@ -583,6 +684,7 @@ mod tests {
             priority: Priority::Normal,
             effort: Effort::Deep,
             kind: WorkerKind::Coder,
+            driven: Driven::Attended,
             started_ms: 0,
             turn_ms: 0,
             beat_ms: 1_000,

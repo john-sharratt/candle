@@ -124,6 +124,7 @@ pub mod window;
 pub mod witnessed;
 pub mod work;
 pub mod workflow;
+pub mod zen_task;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

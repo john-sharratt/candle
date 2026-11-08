@@ -1,6 +1,7 @@
 //! Which of a tree's files an ingest layer reads — decided from the listing
 //! alone, before any file is opened (`docs/zend_branch_ingest.md` §5).
 
+use crate::memory_paths::{self, is_conversation};
 use crate::repo_scan::types::Language;
 
 /// The largest file an ingest layer reads.
@@ -55,9 +56,15 @@ impl IngestScope {
     /// The language `repo`'s file at `path` (repository-relative), of `size`
     /// bytes, is read as — `None` when the layer does not read it: outside
     /// the scope or past the depth bound, hidden (any component starting
-    /// with `.`), off the extension allowlist, or over [`MAX_FILE_BYTES`].
+    /// with `.`), off the extension allowlist, over [`MAX_FILE_BYTES`], or a
+    /// conversation's journal in the memory — what a session's calls wrote,
+    /// which no other conversation retrieves
+    /// (`docs/zen_memory_and_guides.md` D3).
     pub fn admits(&self, repo: &str, path: &str, size: u64) -> Option<Language> {
         if size > MAX_FILE_BYTES || path.split('/').any(|c| c.starts_with('.')) {
+            return None;
+        }
+        if repo == memory_paths::REPO && is_conversation(path) {
             return None;
         }
         let key = format!("{repo}/{path}");
@@ -145,6 +152,32 @@ mod tests {
         assert_eq!(
             s.admits("battle-cities", "crates/lore/src/lore.json", 12_961_528),
             None
+        );
+    }
+
+    /// **A conversation's journal in the memory is not read**; the memory's
+    /// other journals are, and a `conversations` folder elsewhere is a folder.
+    #[test]
+    fn a_conversations_journal_in_the_memory_is_not_read() {
+        let s = IngestScope::new("", None);
+        let episode =
+            "groups/zen/conversations/2026-11-08-0308-claude-code/2026-11-08-0315-1989.yaml";
+        assert_eq!(s.admits("journals", episode, 10), None);
+        assert_eq!(
+            s.admits("journals", "groups/zen/conversations/journal.yaml", 10),
+            None
+        );
+        assert_eq!(
+            s.admits(
+                "journals",
+                "groups/zen/topics/candle/2026-10-31-0034-7c25.yaml",
+                10
+            ),
+            Some(Language::Yaml)
+        );
+        assert_eq!(
+            s.admits("candle", "groups/zen/conversations/notes.md", 10),
+            Some(Language::Markdown)
         );
     }
 

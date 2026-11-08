@@ -3,6 +3,7 @@
 //! front names, a call answered on an event stream with its progress, and the
 //! refusals.
 
+use std::mem;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +29,8 @@ struct Stand {
     delivered: Mutex<Vec<String>>,
     /// Set by `linger` once its client has gone.
     left: Notify,
+    /// Whether the next streamed call's client is told its list changed.
+    owed: Mutex<bool>,
 }
 
 impl Server for Stand {
@@ -88,6 +91,14 @@ impl Server for Stand {
         }
     }
 
+    fn tools_version(&self) -> Option<&str> {
+        Some("0123456789abcdef")
+    }
+
+    fn list_changed(&self, _call: &Call<Self>) -> bool {
+        mem::take(&mut *self.owed.lock().unwrap())
+    }
+
     fn result(&self, answer: &String) -> Value {
         text_result(answer, false)
     }
@@ -106,10 +117,12 @@ fn stand() -> (Router, Arc<Stand>) {
             instructions: "Use it.".into(),
             icon: None,
             version: "0".into(),
+            list_changed: true,
         },
         store: Arc::new(LocalStore::in_memory()),
         delivered: Mutex::new(Vec::new()),
         left: Notify::new(),
+        owed: Mutex::new(false),
     });
     let router = Router::new()
         .route(
@@ -165,6 +178,10 @@ async fn a_handshake_opens_a_session_its_owner_alone_calls_on() {
     let sid = init.headers()[SESSION_HEADER].to_str().unwrap().to_string();
     let answered: Value = serde_json::from_str(&body(init).await).unwrap();
     assert_eq!(answered["result"]["serverInfo"]["name"], "stand");
+    assert_eq!(
+        answered["result"]["capabilities"],
+        json!({"tools": {"listChanged": true}})
+    );
     assert_eq!(answered["result"]["instructions"], "Use it.");
 
     let first = send(
@@ -284,6 +301,58 @@ async fn a_call_on_an_event_stream_says_each_step_then_answers() {
     assert_eq!(data[1]["params"]["progress"], 2);
     assert_eq!(data[2]["id"], 9);
     assert_eq!(data[2]["result"]["content"][0]["text"], "done");
+}
+
+/// **A changed list is told on the stream, after the steps and before the
+/// answer, once**; every answer names the listing's version, a refusal's and a
+/// listing's alike.
+#[tokio::test]
+async fn a_changed_list_is_told_before_the_answer_and_every_answer_names_the_listing() {
+    let (router, s) = stand();
+    let streamed = |id: u64| {
+        rpc(
+            Some("ann"),
+            &[
+                (VERSION_HEADER, MODERN),
+                (
+                    header::ACCEPT.as_str(),
+                    "application/json, text/event-stream",
+                ),
+            ],
+            call(id, "slow", json!({}), json!({"progressToken": "p"})),
+        )
+    };
+    *s.owed.lock().unwrap() = true;
+    let res = send(&router, streamed(1)).await;
+    assert_eq!(res.headers()["x-mcp-tools-version"], "0123456789abcdef");
+    let text = body(res).await;
+    let data: Vec<Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect();
+    assert_eq!(data.len(), 4, "{text}");
+    assert_eq!(data[1]["params"]["message"], "second");
+    assert_eq!(
+        data[2],
+        json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+    );
+    assert_eq!(data[3]["id"], 1);
+
+    let again = body(send(&router, streamed(2)).await).await;
+    assert!(!again.contains("list_changed"), "told once: {again}");
+
+    let refused = send(
+        &router,
+        rpc(
+            None,
+            &[],
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(refused.headers()["x-mcp-tools-version"], "0123456789abcdef");
 }
 
 /// **A client gone from its stream is noticed, and nothing is delivered**:

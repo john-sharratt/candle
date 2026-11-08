@@ -54,6 +54,7 @@ use crate::bridge::BRIDGE_ACTS;
 use crate::engine::agenda::AGENDA_ACTS;
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::invoke_body::{self, Invokable};
+use crate::engine::zen_task::TASK_ACTS;
 use crate::engine::{acts, bench, mission, mission_acts, station};
 use crate::sim::agenda::Priority;
 use crate::sim::phone::Kind as ThreadKind;
@@ -973,6 +974,7 @@ pub static CATALOG: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(||
         .chain(AGENDA_ACTS)
         .chain(BRIDGE_ACTS)
         .chain(BUILD_ACTS)
+        .chain(TASK_ACTS)
         .copied()
         .collect()
 });
@@ -4207,6 +4209,7 @@ mod tests {
             .chain(AGENDA_ACTS)
             .chain(BRIDGE_ACTS)
             .chain(BUILD_ACTS)
+            .chain(TASK_ACTS)
             .map(|t| t.name)
             .collect();
         let n = declared.len();

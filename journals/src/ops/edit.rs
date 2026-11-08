@@ -39,6 +39,7 @@ mod tests {
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
     use crate::period::Period;
+    use crate::terms::Terms;
     use crate::testing::note;
 
     #[test]
@@ -52,6 +53,7 @@ mod tests {
                 path: path.clone(),
                 text: "Prefers tea.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )

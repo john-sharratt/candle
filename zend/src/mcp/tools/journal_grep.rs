@@ -5,12 +5,14 @@
 //! line, archive and summary the user reads, or one subtree of them
 //! (`docs/memory_backbone.md` §6.5).
 
-use journals::view::grep::{grep, render};
+use journals::slug::Slug;
+use journals::time::Stamp;
+use journals::view::grep::{grep_by, render, Filter, Only};
 use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
 
 use super::fit::around;
-use super::mem::PATHS;
+use super::mem::{Mem, PATHS};
 use super::{mem, string, Answer, Ctx, LOADING};
 use crate::mcp::memory::is_memory_path;
 use crate::mcp::names::Path;
@@ -42,7 +44,10 @@ pub fn definition() -> Value {
                 "journal": {"type": "string", "description": "`*`, `@<group>` or a memory path such as `topics`; or `T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>`, `P:<repository>` or `\"self\"`."},
                 "pattern": {"type": "string", "description": "The text to find, ignoring case."},
                 "entry": {"type": "integer", "minimum": 0, "description": "One of a worker's entries, to search it alone."},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_HITS, "description": "Hits to answer (20 by default)."}
+                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_HITS, "description": "Hits to answer (20 by default)."},
+                "kind": {"type": "string", "enum": ["note", "fold", "proposal"], "description": "Memory only: lines of this kind alone."},
+                "speaker": {"type": "string", "description": "Memory only: lines this person spoke or wrote, `yen`."},
+                "after": {"type": "string", "description": "Memory only: the page after this line, `<path>#<line id>` — the last hit of the page before, as its answer names it."}
             },
             "required": ["journal", "pattern"],
             "additionalProperties": false
@@ -138,7 +143,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         .unwrap_or(DEFAULT_HITS)
         .clamp(1, MAX_HITS) as usize;
     if journal == "*" || is_memory_path(journal) {
-        return grep_memory(ctx, journal, pattern, max);
+        return grep_memory(ctx, journal, pattern, max, args);
     }
     let scope = match scope(ctx, journal) {
         Ok(s) => s,
@@ -157,13 +162,12 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
             let needle = pattern.to_lowercase();
             let lines: Vec<String> = threads::notes(&records, &owner, &key)
                 .iter()
-                .enumerate()
-                .filter(|(_, n)| {
-                    format!("{} {}", n.label, n.text)
+                .filter(|e| {
+                    format!("{} {}", e.note.label, e.note.text)
                         .to_lowercase()
                         .contains(&needle)
                 })
-                .map(|(i, n)| format!("{path}#{} {} {}", i + 1, n.label, n.text))
+                .map(|e| format!("{path}{}", threads::note_line(e)))
                 .collect();
             let total = lines.len();
             answer(lines.into_iter().take(max).collect(), total, pattern)
@@ -201,11 +205,32 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     }
 }
 
+/// The filter `args` state for a memory search: `kind`, `speaker`, and
+/// `after`, the line the page before ended on.
+fn filter_of(m: &Mem, args: &Value) -> Result<Filter, String> {
+    let text = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim);
+    Ok(Filter {
+        only: text("kind").map(Only::parse).transpose()?,
+        speaker: text("speaker").map(Slug::parse).transpose()?,
+        after: match text("after") {
+            Some(a) => {
+                let address = m.find_address(a).map_err(String::from)?;
+                Some((address.path, address.id))
+            }
+            None => None,
+        },
+    })
+}
+
 /// The memory's lines, archives and summaries that hold `pattern`: under
-/// `journal`, or everything the caller reads for `*`.
-fn grep_memory(ctx: &Ctx, journal: &str, pattern: &str, max: usize) -> Answer {
+/// `journal`, or everything the caller reads for `*`, as `args` filter them.
+fn grep_memory(ctx: &Ctx, journal: &str, pattern: &str, max: usize, args: &Value) -> Answer {
     let m = match mem::read(ctx) {
         Ok(m) => m,
+        Err(e) => return Answer::error(e),
+    };
+    let filter = match filter_of(&m, args) {
+        Ok(f) => f,
         Err(e) => return Answer::error(e),
     };
     // This conversation's journal holds nothing before its first write.
@@ -219,7 +244,15 @@ fn grep_memory(ctx: &Ctx, journal: &str, pattern: &str, max: usize) -> Answer {
             Err(e) => return Answer::error(e),
         },
     };
-    let (hits, total) = grep(&m.tree, &m.actor(), pattern, under.as_ref(), max);
+    let (hits, total) = grep_by(
+        Stamp::now(),
+        &m.tree,
+        &m.actor(),
+        pattern,
+        under.as_ref(),
+        &filter,
+        max,
+    );
     if hits.is_empty() {
         return Answer::ok(render(&hits, total));
     }

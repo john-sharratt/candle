@@ -19,7 +19,7 @@ Two cautions:
 ## Delegate
 
 On a thread `watch-<what>`, `repo_task_start {thread, name: "watch-<what>",
-effort: "balanced", prompt}`:
+role: "researcher", effort: "balanced", prompt}`:
 
 ```
 GOAL: watch <what> until <the end condition>, or for at most <duration>.

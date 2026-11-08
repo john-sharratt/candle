@@ -59,8 +59,8 @@ pub fn server_info(identity: &Identity, origin: &str) -> Value {
     info
 }
 
-fn capabilities() -> Value {
-    json!({"tools": {"listChanged": false}})
+fn capabilities(identity: &Identity) -> Value {
+    json!({"tools": {"listChanged": identity.list_changed}})
 }
 
 /// The `initialize` result in `version`, for a request that reached the server
@@ -68,7 +68,7 @@ fn capabilities() -> Value {
 pub fn initialize_result(identity: &Identity, version: &str, origin: &str) -> Value {
     json!({
         "protocolVersion": version,
-        "capabilities": capabilities(),
+        "capabilities": capabilities(identity),
         "serverInfo": server_info(identity, origin),
         "instructions": identity.instructions,
     })
@@ -80,7 +80,7 @@ pub fn discover_result(identity: &Identity, origin: &str) -> Value {
     json!({
         "resultType": "complete",
         "supportedVersions": supported(),
-        "capabilities": capabilities(),
+        "capabilities": capabilities(identity),
         "_meta": {"io.modelcontextprotocol/serverInfo": server_info(identity, origin)},
         "instructions": identity.instructions,
     })
@@ -156,6 +156,7 @@ mod tests {
             instructions: "Attach first.".into(),
             icon: Some("/brand/zen.png".into()),
             version: "1.0.0".into(),
+            list_changed: false,
         }
     }
 
@@ -199,6 +200,26 @@ mod tests {
             "zen"
         );
         assert!(d.get("protocolVersion").is_none());
+    }
+
+    /// **A server in front of others says it tells of a changed list**, in
+    /// both eras; one that does not, says so.
+    #[test]
+    fn the_capability_says_whether_a_changed_list_is_told() {
+        let mut front = zen();
+        front.list_changed = true;
+        let init = initialize_result(&front, "2025-11-25", "https://x");
+        assert_eq!(
+            init["capabilities"],
+            json!({"tools": {"listChanged": true}})
+        );
+        let d = discover_result(&front, "https://x");
+        assert_eq!(d["capabilities"], json!({"tools": {"listChanged": true}}));
+        let behind = initialize_result(&zen(), "2025-11-25", "https://x");
+        assert_eq!(
+            behind["capabilities"],
+            json!({"tools": {"listChanged": false}})
+        );
     }
 
     #[test]

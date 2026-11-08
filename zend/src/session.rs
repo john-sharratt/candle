@@ -75,6 +75,9 @@ use journal_core::record::view as journal_view;
 use journal_core::section::{JournalPrompt, Kept, JOURNAL};
 use journal_core::span::Span;
 use journal_core::transcript::{Filed, Hits, Miss, Page};
+use journals::ops::wire::path_from_wire;
+use journals::path::JournalPath;
+use journals::time::Stamp;
 use serde_json::{json, Value};
 use web::auth::Roles;
 use zend_tools::run_watch::{self, RunWatch};
@@ -126,11 +129,16 @@ use crate::layers::keys::SUBJECT_KEY;
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::mcp::chats::sweep as chat_sweep;
+use crate::mcp::memory::readers::MemoryReaders;
+use crate::mcp::memory::Memory;
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
 use crate::mcp::zen_tasks::{level_of, withhold_by_level};
-use crate::mcp::{archiving, lineage, nudges, resuming, stops, tending, threads, workers};
+use crate::mcp::{
+    archiving, lineage, memory_sections, nudges, resuming, stops, tending, thread_export, threads,
+    workers,
+};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -140,7 +148,7 @@ use crate::repo_path::shown as shown_unit;
 use crate::repo_scan::{utility_config, DIR_KEY};
 use crate::resident::Resident;
 use crate::resume;
-use crate::retrieval_scope::RetrievalScope;
+use crate::retrieval_scope::{Readers, RetrievalScope};
 use crate::round_timing::{self, RoundTiming};
 use crate::self_check::{self, Report as SelfCheckReport};
 use crate::substrate_git::{self, Repositories};
@@ -850,6 +858,9 @@ struct InferenceState {
     /// Which ingested units each conversation may retrieve
     /// (`crate::retrieval_scope`), set on the engine before every turn.
     retrieval_scope: RetrievalScope,
+    /// The memory a worker's sections read its thread's topics from
+    /// (`mcp::memory_sections`).
+    memory: Arc<Memory>,
     /// The ingest worker's wake, once it is running: a `git_*` tool round
     /// that can move a branch wakes it, since a push moves the tracking refs
     /// itself and no origin probe will see a difference afterwards.
@@ -1369,6 +1380,7 @@ impl InferenceState {
         progress: Arc<LoadProgress>,
         loading_substrate: Arc<OnceLock<Conversation>>,
         ops: Arc<dyn OpsRunner>,
+        memory: Arc<Memory>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         // The workspace folder: where the substrate, the schema override and a
         // mind's section folders live. Repositories are reached through
@@ -3162,6 +3174,7 @@ impl InferenceState {
             deletions: Deletions::default(),
             journaling,
             journals: Journals::default(),
+            memory,
         });
         // A conversation is this member's for one turn at a time, and what it
         // keeps of one goes when the conversation does.
@@ -3326,9 +3339,10 @@ impl InferenceState {
     /// Calibrate every branch layer that declares a `calibrate:` block
     /// (`crate::calibrate`): each ready unit without a calibration of its
     /// current version writes its questions, and they are prefilled as its
-    /// exemplars. Run ahead of each pass, for what an earlier one left, and
-    /// right after the branch pass, which reads a file layer's units without
-    /// calibrating them: that is where they are calibrated.
+    /// exemplars. Run right after the branch pass, which reads a file layer's
+    /// units without calibrating them, and never ahead of it: this sweep is
+    /// where they are calibrated, together with whatever an earlier pass or a
+    /// restart left.
     fn calibrate_layers(&self) {
         for (il, _) in &self.branch_layers {
             if crate::ingest_cancel::cancelled() {
@@ -3506,15 +3520,20 @@ impl InferenceState {
         // silent so a pass doesn't log "load step started Loading model".
         let progress = Arc::new(LoadProgress::silent());
         let mut any = false;
-        self.calibrate_layers();
         if !self.branch_layers.is_empty() {
             let passes = self.layer_passes()?;
             let ctx = self.refresh_ctx();
             any |= self
                 .branch_ingest
                 .pass(&ctx, &self.workspace, &passes, &progress)?;
-            // The branch pass reads files without calibrating them; what it
-            // committed is calibrated now, not at the next pass.
+            // **Read first, calibrate after — and only after.** The branch
+            // pass reads files without calibrating them; the sweep that
+            // follows calibrates what it committed and whatever an earlier
+            // pass or a restart left uncalibrated. A sweep ahead of the pass
+            // as well held every file back for its whole length: after the
+            // 2026-11-08 restarts, each boot spent 15–30 minutes calibrating
+            // the same 160 units, and with a deploy every ~20 minutes no file
+            // was read again at all.
             self.calibrate_layers();
         }
         for il in &self.ingest_layers {
@@ -4274,6 +4293,7 @@ fn run_inference_stream(
             // the scan.
             if let Some(config) = state.working_set.clone() {
                 let open_state = Arc::clone(&state);
+                let open_conv = conv_id.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     let t_open = Instant::now();
                     open_state.engine.working_set_clear(timeline);
@@ -4284,12 +4304,16 @@ fn run_inference_stream(
                     // otherwise first set right before its first submit — after
                     // this — so every seed was refused: measured 2026-10-24, no
                     // dialogue had carried a seed since scoping landed.
-                    open_state
-                        .retrieval_scope
-                        .apply(&open_state.engine, timeline, &files);
+                    open_state.retrieval_scope.apply(
+                        &open_state.engine,
+                        timeline,
+                        &open_conv,
+                        &files,
+                    );
                     let scope_ms = t_scope.elapsed().as_millis() as u64;
                     let t_seed = Instant::now();
-                    let seeded = seed_working_set(&open_state, timeline, &files, &config);
+                    let seeded =
+                        seed_working_set(&open_state, timeline, &open_conv, &files, &config);
                     let seed_ms = t_seed.elapsed().as_millis() as u64;
                     tracing::info!(
                         target: "zend::working_set",
@@ -4658,10 +4682,14 @@ fn run_inference_stream(
             // on a base not yet listed, so on the blocking pool.
             let scope_state = Arc::clone(&state);
             let scope_files = Arc::clone(&cs.files);
+            let scope_conv = conv_id.clone();
             if let Err(e) = tokio::task::spawn_blocking(move || {
-                scope_state
-                    .retrieval_scope
-                    .apply(&scope_state.engine, timeline, &scope_files)
+                scope_state.retrieval_scope.apply(
+                    &scope_state.engine,
+                    timeline,
+                    &scope_conv,
+                    &scope_files,
+                )
             })
             .await
             {
@@ -5603,22 +5631,19 @@ async fn carry_journal(
         Some((reader, before)) => (before, Some(reader)),
         None => (&inherited[..], None),
     };
-    let mut wants: Vec<Want<'_>> = before
-        .iter()
-        .map(|i| Want {
-            name: &i.name,
-            text: &i.text,
-        })
-        .collect();
+    // Then the memory its thread is about, before its own journal
+    // (`mcp::memory_sections`).
+    let memory = carried_memory(state, conv_id);
+    let mut wants: Vec<Want<'_>> = before.iter().map(inherited_want).collect();
+    wants.extend(memory.iter().map(inherited_want));
     wants.extend(carry::wants(&prompt));
-    wants.extend(reader.map(|i| Want {
-        name: &i.name,
-        text: &i.text,
-    }));
+    wants.extend(reader.map(inherited_want));
     let lineage_sweep = lineage::sweep_names();
+    let memory_sweep = memory_sections::sweep_names();
     let mut sweep = prompt.sweep();
     if owner_of(conv_id).is_some() {
         sweep.extend(lineage_sweep.iter().map(String::as_str));
+        sweep.extend(memory_sweep.iter().map(String::as_str));
     }
     let ConvState {
         conv,
@@ -5654,12 +5679,42 @@ fn inherited_journals(state: &InferenceState, conv_id: &str) -> Vec<lineage::Inh
     lineage::sections(&format!("T:{thread}/{name}"), &nearest_first)
 }
 
+/// An inherited section as the reconcile wants it.
+fn inherited_want(i: &lineage::Inherited) -> Want<'_> {
+    Want {
+        name: &i.name,
+        text: &i.text,
+    }
+}
+
+/// The memory sections `conv_id` carries: the topics its thread is about, read
+/// from the memory's tree as last published — none for a conversation not
+/// owned through `/mcp`, a thread about nothing, or a memory not open.
+fn carried_memory(state: &InferenceState, conv_id: &str) -> Vec<lineage::Inherited> {
+    let Some((owner, thread, _)) = conv_names(conv_id) else {
+        return Vec::new();
+    };
+    let records = state.engine.conversation().shared();
+    let Some(bound) = thread_export::bound(&records, owner, thread) else {
+        return Vec::new();
+    };
+    let Ok(tree) = state.memory.tree() else {
+        return Vec::new();
+    };
+    let about: Vec<JournalPath> = bound
+        .about
+        .iter()
+        .filter_map(|p| path_from_wire(p).ok())
+        .collect();
+    memory_sections::sections(&memory_sections::topics(&tree, &about, Stamp::now()))
+}
+
 /// One journal above a conversation: the ancestor it is and the bare name it
 /// answers to.
 struct JournalAbove {
     ancestor: lineage::Ancestor,
     name: String,
-    /// The entries a citation may name: its notes, numbered from 1.
+    /// The entries a citation may name: its notes' numbers.
     entries: Vec<u64>,
 }
 
@@ -5672,11 +5727,16 @@ fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
     };
     let records = state.engine.conversation().shared();
     let mut nearest_first = Vec::new();
-    let notes = |journal: &str| threads::note_lines(&threads::notes(&records, owner, journal));
-    let numbered = |lines: &[String]| (1..=lines.len() as u64).collect();
-    let lines = notes(thread);
+    let notes = |journal: &str| -> (Vec<String>, Vec<u64>) {
+        let entries = threads::notes(&records, owner, journal);
+        (
+            threads::note_lines(&entries),
+            entries.iter().map(|e| e.number).collect(),
+        )
+    };
+    let (lines, entries) = notes(thread);
     nearest_first.push(JournalAbove {
-        entries: numbered(&lines),
+        entries,
         ancestor: lineage::Ancestor {
             path: format!("T:{thread}"),
             whose: lineage::Whose::Thread,
@@ -5691,9 +5751,9 @@ fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
         .filter(|r| r.name != UPLOADS_REPO)
     {
         let project = project_journal(&repo.name);
-        let lines = notes(&project);
+        let (lines, entries) = notes(&project);
         nearest_first.push(JournalAbove {
-            entries: numbered(&lines),
+            entries,
             ancestor: lineage::Ancestor {
                 lines,
                 path: project,
@@ -6083,13 +6143,14 @@ fn spawn_journal_folds(
 fn seed_working_set(
     state: &InferenceState,
     timeline: TimelineId,
+    conv_id: &str,
     files: &RepoFiles,
     config: &WorkingSetConfig,
 ) -> usize {
     let folder_of = |repo: &str, inner: &str| {
         state
             .retrieval_scope
-            .folder_unit(&state.engine, files, repo, inner)
+            .folder_unit(&state.engine, files, conv_id, repo, inner)
     };
     Seeding {
         engine: &state.engine,
@@ -8282,6 +8343,11 @@ impl ZendSession {
         let ops: Arc<dyn OpsRunner> = Arc::clone(self.mcp.ops()) as _;
         // The memory its writer keeps current once the engine is up.
         let memory = Arc::clone(self.mcp.memory());
+        // Whom each conversation's retrieval reads the memory as.
+        let readers: Arc<dyn Readers> = Arc::new(MemoryReaders::new(
+            Arc::clone(&memory),
+            Arc::clone(self.mcp.ops()),
+        ));
         // Handed to both the downloader and the engine builder, so the artifact
         // fetched and the model built are the same one.
         let model = self.config.model.clone();
@@ -8410,8 +8476,12 @@ impl ZendSession {
                     load_progress_for_blocking,
                     loading_substrate,
                     ops,
+                    Arc::clone(&memory),
                 ) {
                     Ok(Some(state)) => {
+                        // Before the state is published: no turn is scoped
+                        // without its reader.
+                        state.retrieval_scope.set_readers(readers);
                         slot.store(Some(Arc::clone(&state)));
                         tracing::info!("inference engine ready");
                         // A stop asked since the load's last boundary: the engine

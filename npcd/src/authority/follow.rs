@@ -13,6 +13,7 @@ use super::pulse::{self, EVENTS};
 use super::report;
 use super::role::Role;
 use super::told::{self, TOLD};
+use super::zen_task;
 use crate::engine::runtime::Runtime;
 
 impl Runtime {
@@ -49,6 +50,7 @@ impl Runtime {
                 }
             }
         });
+        handle.spawn(zen_task::run(Arc::clone(self), Arc::clone(&member)));
         handle.spawn(driver::run(Arc::clone(self), member));
     }
 

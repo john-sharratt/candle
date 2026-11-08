@@ -130,6 +130,7 @@ mod tests {
     use crate::ops::fixture::{john, p, zen};
     use crate::ops::{apply, OnTaken, Op};
     use crate::scope::Channel;
+    use crate::terms::Terms;
     use crate::testing::{at, slug};
     use crate::tree::WINDOW;
 
@@ -141,6 +142,7 @@ mod tests {
                 path: p(path),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             at,
         )

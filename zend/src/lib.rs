@@ -52,6 +52,7 @@ pub mod lenient_json;
 pub mod live_turn;
 pub mod loading;
 pub mod mcp;
+pub mod memory_paths;
 pub mod openai_tools;
 pub mod parts;
 pub mod passthrough;

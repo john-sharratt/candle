@@ -33,6 +33,7 @@ line for each still running. Handle the one that settled, then call
 |---|---|
 | done | Read the final response; verify what you will rely on |
 | asking | Reply with the decision itself (`repo_task_reply`) |
+| needs approval — its question names `needs_approval <id>` | Ask the user; on their yes `approval_grant {id, confirm}`, then reply with its answer (`approvals`) |
 | stuck | Its loop closed: reply with what to do next (`repo_task_reply`) |
 | stopped | You stopped it: redirect it (`repo_task_reply`) or archive the thread |
 | failed | Read why; fix the cause or start the task again |

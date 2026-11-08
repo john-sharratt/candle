@@ -21,6 +21,7 @@ use journals::path::JournalPath;
 use journals::scope::{Channel, Section};
 use journals::slug::Slug;
 use journals::store::Store as JournalStore;
+use journals::terms::Terms;
 use journals::time::Stamp;
 use mcp_server::protocol::MODERN;
 use mcp_server::{Client, Session, Store};
@@ -86,6 +87,7 @@ fn grow(dir: &Path) {
                     path: topic.clone(),
                     text: format!("Area {a} topic {t} holds line {n}."),
                     speaker: None,
+                    terms: Terms::default(),
                 };
                 written += 1;
                 store.write(&john, &note, at.plus(written)).unwrap();

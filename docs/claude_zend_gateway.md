@@ -283,6 +283,20 @@ it sits 24 hours untouched (`docs/mcp_guides.md` §3).
   with under 3K tokens of thinking extracted the facts and missed that two of
   its own findings contradicted each other. Effort is how hard a turn thinks;
   priority, below, is only how soon it decodes.
+- **`driven` `attended` or `alone`** (`mcp::driven`,
+  `docs/zen_memory_and_guides.md` D5). A task is `attended` when its
+  coordinator waits on it, answers its questions and checks its result;
+  `alone` when nobody will — Grok's, whose drive ends seconds after it is
+  spoken. Left out, it is `alone` for the Grok client and `attended` for every
+  other; a task Zen starts is attended by its starter. It is kept on the
+  worker's record and selects an option of the `driven` selector in
+  `projection.yaml`: `attended` emits nothing, `alone` seals one section
+  telling the worker nobody will answer — to decide within its brief, land its
+  own result, check it, and leave what only the user may approve pending. When
+  an alone task settles, its end is kept for its owner in a ring of ten
+  (`mcp::outcomes`, `mcp/outcome/<owner>/<slot>`), and `get_user_context` raises
+  the newest — one aloud, three written — in their next conversation from any
+  client, marking nothing read.
 - **Decode priority `normal` by default.** Priority is a layer's, and a worker
   is a dialogue-layer conversation, so it would decode at the dialogue's `high`
   (`zend/src/prompts/projection.yaml`), level with a live user. A conversation
@@ -483,13 +497,16 @@ journal, outermost first, then its own, then the reader's line:
 … shared prompt …
 P:candle                                  ← the project's standing rules (lineage/0)
 T:review-layers                           ← Claude's thread: decisions, what the user said, outcomes
+@zen/topics/candle                        ← the memory the thread is about (memory/0 …)
 … this conversation's own journal …       ← journal/<id>, journal/open
 This conversation is T:review-layers/verify-expiry.   ← the reader's line (lineage/reader)
 system_close
 ```
 
 A task a worker started is a worker on the same thread, so it carries the
-same two; what it needs of its starter's findings is in its prompt.
+same two; what it needs of its starter's findings is in its prompt. A thread
+attached with `about` adds the memory topics it names, `memory/<n>`, between
+the lineage and the worker's own journal (`docs/memory_backbone.md` §7.3).
 
 - **The reader's own sections.** The thread's and the project's journals are
   records (§3.2) — no conversation of their own holds them — so each

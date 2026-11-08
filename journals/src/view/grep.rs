@@ -6,9 +6,11 @@
 //! each line is found once, at its real path.
 
 use crate::actor::{need_read, Actor};
-use crate::line::{Line, LineId};
+use crate::line::{Kind, Line, LineId};
 use crate::path::JournalPath;
 use crate::period::Period;
+use crate::slug::Slug;
+use crate::terms::shown as current_lines;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 use crate::view::who::render_line;
@@ -114,20 +116,90 @@ fn excerpt(text: &str, phrase: &str) -> String {
     out
 }
 
+/// Which lines a search keeps: of one kind, from one speaker, and those after
+/// a line — the last hit of the page before, so a long answer is read page by
+/// page, newest first, no hit on two pages. A filter on lines finds no
+/// journal by its name, and no summary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filter {
+    pub only: Option<Only>,
+    pub speaker: Option<Slug>,
+    /// The line, by its journal and id, the page before ended on.
+    pub after: Option<(JournalPath, LineId)>,
+}
+
+/// The kind of line a search keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Only {
+    Notes,
+    Folds,
+    /// Notes a worker proposed, not yet accepted.
+    Proposals,
+}
+
+impl Only {
+    pub fn parse(s: &str) -> Result<Only, String> {
+        match s {
+            "note" => Ok(Only::Notes),
+            "fold" => Ok(Only::Folds),
+            "proposal" => Ok(Only::Proposals),
+            _ => Err(format!("`kind` is `note`, `fold` or `proposal`, not `{s}`")),
+        }
+    }
+
+    fn keeps(self, l: &Line) -> bool {
+        match self {
+            Only::Notes => l.kind == Kind::Note && !l.proposed,
+            Only::Folds => l.kind == Kind::Fold,
+            Only::Proposals => l.proposed,
+        }
+    }
+}
+
+impl Filter {
+    /// Whether it narrows to lines alone.
+    fn lines_only(&self) -> bool {
+        self.only.is_some() || self.speaker.is_some() || self.after.is_some()
+    }
+
+    fn keeps(&self, l: &Line) -> bool {
+        self.only.is_none_or(|o| o.keeps(l))
+            && self
+                .speaker
+                .as_ref()
+                .is_none_or(|s| l.speaker.as_ref() == Some(s) || l.account.as_ref() == Some(s))
+    }
+}
+
 /// Every hit for `phrase` that `actor` may read, under `under` when given —
 /// the journals it names first, then lines and summaries newest first — and
 /// the count before `limit` cut it.
 pub fn grep(
+    now: Stamp,
     tree: &Tree,
     actor: &Actor,
     phrase: &str,
     under: Option<&JournalPath>,
     limit: usize,
 ) -> (Vec<Hit>, usize) {
+    grep_by(now, tree, actor, phrase, under, &Filter::default(), limit)
+}
+
+/// [`grep`], keeping only the lines `filter` keeps.
+pub fn grep_by(
+    now: Stamp,
+    tree: &Tree,
+    actor: &Actor,
+    phrase: &str,
+    under: Option<&JournalPath>,
+    filter: &Filter,
+    limit: usize,
+) -> (Vec<Hit>, usize) {
     let want = wanted(phrase);
     if want.is_empty() {
         return (Vec::new(), 0);
     }
+    let lines_only = filter.lines_only();
     let mut hits = Vec::new();
     for (path, j) in tree.journals() {
         if need_read(tree, actor, &path).is_err() || under.is_some_and(|u| !u.holds(&path)) {
@@ -136,7 +208,7 @@ pub fn grep(
         if !j.problems.is_empty() {
             continue;
         }
-        if names(&path, j, &want) {
+        if !lines_only && names(&path, j, &want) {
             hits.push(Hit {
                 path: path.clone(),
                 found: Found::Journal,
@@ -150,8 +222,8 @@ pub fn grep(
             cut.text = excerpt(&l.text, phrase);
             render_line(tree, &cut)
         };
-        for l in &j.window {
-            if holds(&l.text, &want) {
+        for l in current_lines(&j.window, now) {
+            if filter.keeps(l) && holds(&l.text, &want) {
                 hits.push(Hit {
                     path: path.clone(),
                     found: Found::Window,
@@ -163,7 +235,7 @@ pub fn grep(
         }
         for (period, lines) in &j.archives {
             for l in lines.iter() {
-                if holds(&l.text, &want) {
+                if filter.keeps(l) && holds(&l.text, &want) {
                     hits.push(Hit {
                         path: path.clone(),
                         found: Found::Archive(*period),
@@ -174,7 +246,7 @@ pub fn grep(
                 }
             }
         }
-        if let Some(s) = j.summary() {
+        if let Some(s) = j.summary().filter(|_| !lines_only) {
             let text = s.text();
             if holds(&text, &want) || s.digest.as_deref().is_some_and(|d| holds(d, &want)) {
                 hits.push(Hit {
@@ -195,7 +267,17 @@ pub fn grep(
             .cmp(&line(b))
             .then_with(|| b.at.cmp(&a.at))
             .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.id.cmp(&b.id))
     });
+    // The page after the line the last one ended on.
+    if let Some((path, id)) = &filter.after {
+        if let Some(i) = hits
+            .iter()
+            .position(|h| &h.path == path && h.id.as_ref() == Some(id))
+        {
+            hits.drain(..=i);
+        }
+    }
     let total = hits.len();
     hits.truncate(limit);
     (hits, total)
@@ -216,8 +298,15 @@ pub fn render(hits: &[Hit], total: usize) -> String {
         })
         .collect();
     if total > hits.len() {
+        let next = hits
+            .last()
+            .and_then(|h| {
+                let id = h.id.as_ref()?;
+                Some(format!(", or page on with `after: {}#{id}`", h.path))
+            })
+            .unwrap_or_default();
         out.push(format!(
-            "… and {} more; narrow the phrase or search under one journal",
+            "… and {} more; narrow the phrase or search under one journal{next}",
             total - hits.len()
         ));
     }
@@ -233,6 +322,7 @@ mod tests {
     use crate::ops::fold::fold_child;
     use crate::ops::{apply, OnTaken, Op};
     use crate::scope::Section;
+    use crate::terms::Terms;
     use crate::testing::{note, slug};
 
     fn noted(t: &mut Tree, actor: &Actor, path: &str, text: &str, at: Stamp) {
@@ -243,6 +333,7 @@ mod tests {
                 path: p(path),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             at,
         )
@@ -340,7 +431,7 @@ mod tests {
             "b".repeat(800)
         );
         noted(&mut t, &john(), "topics", &long, now());
-        let (hits, _) = grep(&t, &john(), "builder", None, 10);
+        let (hits, _) = grep(now(), &t, &john(), "builder", None, 10);
         assert_eq!(hits.len(), 1);
         let cut = excerpt(&long, "builder");
         assert_eq!(cut.chars().count(), EXCERPT + 2, "both ends marked");
@@ -372,7 +463,7 @@ mod tests {
             "The cpu experts pool is on by default.",
             now().plus(120),
         );
-        let (hits, total) = grep(&t, &john(), "CPU experts", None, 10);
+        let (hits, total) = grep(now(), &t, &john(), "CPU experts", None, 10);
         assert_eq!(total, 2);
         assert_eq!(
             render(&hits, total),
@@ -380,12 +471,12 @@ mod tests {
              @zen/topics #2026-10-30-1202-b082 2026-10-30 12:02 note, john via Claude Code: \
              The cpu experts pool is on by default."
         );
-        let (by_cue, _) = grep(&t, &john(), "host pool", None, 10);
+        let (by_cue, _) = grep(now(), &t, &john(), "host pool", None, 10);
         assert_eq!(by_cue[0].found, Found::Journal);
         // A word naming its group, its section or a fixed journal's cue
         // finds no journal: only a named journal's own name and cue count.
         let journals = |phrase| {
-            grep(&t, &john(), phrase, None, 50)
+            grep(now(), &t, &john(), phrase, None, 50)
                 .0
                 .into_iter()
                 .filter(|h| h.found == Found::Journal)
@@ -428,7 +519,7 @@ mod tests {
         )
         .unwrap();
         noted(&mut t, &john(), "topics/wasmer", "WASIX came first.", now());
-        let (hits, total) = grep(&t, &john(), "wasix", None, 10);
+        let (hits, total) = grep(now(), &t, &john(), "wasix", None, 10);
         assert_eq!(total, 1);
         assert_eq!(hits[0].path, p("topics/wasmer"));
     }
@@ -449,11 +540,14 @@ mod tests {
             "ENVIRONMENT-VARIABLE",
             "feature-flags",
         ] {
-            assert_eq!(grep(&t, &john(), phrase, None, 10).1, 1, "{phrase}");
+            assert_eq!(grep(now(), &t, &john(), phrase, None, 10).1, 1, "{phrase}");
         }
-        assert_eq!(grep(&t, &john(), "environmentvariable", None, 10).1, 0);
+        assert_eq!(
+            grep(now(), &t, &john(), "environmentvariable", None, 10).1,
+            0
+        );
         for empty in ["-", " - ", "--"] {
-            assert_eq!(grep(&t, &john(), empty, None, 10).1, 0, "{empty:?}");
+            assert_eq!(grep(now(), &t, &john(), empty, None, 10).1, 0, "{empty:?}");
         }
         assert_eq!(
             excerpt(
@@ -475,7 +569,7 @@ mod tests {
     fn grep_finds_what_the_caller_reads_and_nothing_else() {
         let t = seeded();
         let shown = |actor: &Actor| -> Vec<String> {
-            grep(&t, actor, "permit", None, 50)
+            grep(now(), &t, actor, "permit", None, 50)
                 .0
                 .iter()
                 .map(|h| format!("{} {:?}", h.path, h.found))
@@ -503,14 +597,67 @@ mod tests {
     #[test]
     fn grep_narrows_to_a_subtree_and_cuts_at_its_limit() {
         let t = seeded();
-        let (hits, total) = grep(&t, &john(), "permit", Some(&p("topics")), 1);
+        let (hits, total) = grep(now(), &t, &john(), "permit", Some(&p("topics")), 1);
         assert_eq!((hits.len(), total), (1, 2));
         let text = render(&hits, total);
         assert!(
-            text.ends_with("… and 1 more; narrow the phrase or search under one journal"),
+            text.contains("… and 1 more; narrow the phrase or search under one journal"),
             "{text}"
         );
         assert_eq!(render(&[], 0), "Nothing found.");
-        assert_eq!(grep(&t, &john(), "  ", None, 5).1, 0);
+        assert_eq!(grep(now(), &t, &john(), "  ", None, 5).1, 0);
+    }
+
+    /// **A filter keeps lines alone — of a kind, from a speaker, before a
+    /// moment — and pages newest first**: each page's last hit is where the
+    /// next page begins, and no hit is on two pages.
+    #[test]
+    fn a_filter_keeps_lines_and_pages_newest_first() {
+        let t = seeded();
+        let lines =
+            |filter: &Filter, limit| grep_by(now(), &t, &john(), "permit", None, filter, limit);
+        let all = lines(&Filter::default(), 50).0;
+        let notes = Filter {
+            only: Some(Only::Notes),
+            ..Filter::default()
+        };
+        let (every, total) = lines(&notes, 50);
+        assert!(!every.is_empty());
+        assert!(every
+            .iter()
+            .all(|h| h.found != Found::Journal && h.found != Found::Summary));
+        assert!(every.len() <= all.len());
+        let first = lines(&notes, 1).0;
+        let after = (first[0].path.clone(), first[0].id.clone().unwrap());
+        let rest = lines(
+            &Filter {
+                after: Some(after),
+                ..notes.clone()
+            },
+            50,
+        );
+        assert_eq!(
+            first.len() + rest.1,
+            total,
+            "the pages hold every line once"
+        );
+        assert!(!rest.0.contains(&first[0]));
+        assert_eq!(
+            &every[1..],
+            rest.0.as_slice(),
+            "the next page goes on in order"
+        );
+        let yen = Filter {
+            speaker: Some(slug("yen")),
+            ..notes
+        };
+        assert!(lines(&yen, 50)
+            .0
+            .iter()
+            .all(|h| h.shown.contains("yen") || h.shown.contains("Yen")));
+        assert_eq!(
+            Only::parse("episode").unwrap_err(),
+            "`kind` is `note`, `fold` or `proposal`, not `episode`"
+        );
     }
 }

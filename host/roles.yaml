@@ -41,3 +41,8 @@ people:
   # `docs/zenj.md` §5.2).
   - sub: "service:zenj"
     role: user
+  # Zen, as npcd's drones call zend for it over their member's socket
+  # (`docs/zen_memory_and_guides.md` D8): it starts and steers tasks as the
+  # person `zen`, and grants nothing — `approval_grant` is an admin's.
+  - sub: "service:zen"
+    role: user

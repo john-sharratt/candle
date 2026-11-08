@@ -11,15 +11,19 @@
 //! | [`fingerprint`] | what a summary is built over, and so what is dirty |
 //! | [`window`] | which closed period of a window folds next |
 //! | [`accounts`] | which person an account is |
+//! | [`compare`] | a change from an older tree, held to its rules |
+//! | [`survey`] | the candidates a maintenance mission starts from |
 
 pub mod accounts;
 pub mod check;
 pub mod children;
+pub mod compare;
 pub mod fingerprint;
 pub mod journal;
 pub mod load;
 mod problems;
 pub mod render;
+pub mod survey;
 pub mod window;
 
 use std::collections::BTreeMap;

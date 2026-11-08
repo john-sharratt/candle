@@ -76,7 +76,9 @@ site. A preview shows how an app looks and behaves to the person using it.
 
 The toolbar's **Publish** lands the overlay:
 
-1. **Pictures and photos first**, the binary files of the overlay, with
+1. **New library art first**, the overlay's pictures under `library/` (the
+   only place the gate takes a binary; a photo a person adds in the preview is
+   the app's data, kept by `app.files`, never committed), with
    `file_upload_and_commit` (`docs/mcp_file_tools.md` §3.6). A picture an
    image tool drew is landed by its link with `file_download_and_commit`
    instead, so its bytes never reach the page.
@@ -159,19 +161,18 @@ Each decides part of the design, and is answered by trying it:
    `file_read`'s answer. If the page's policy refuses that, the framework is
    copied into the kit artifact and each preview carries it, and only the
    app's own files are loaded.
-3. **The file tools reach claude.ai.** zend lists `file_read`, `file_list`,
-   `file_search`, `file_edit_and_commit` and the log tools
-   (`zend/src/mcp/tools/mod.rs`), yet a claude.ai session's Zen connector on
-   2026-11-08 offered none of them, and no longer `cluster_logs`. Find where
-   the listing is cut (the aggregator, `mcp/served.yaml`, the connector's cached
-   listing) and fix it there.
+3. **The file tools reach claude.ai.** Answered: they do. A claude.ai
+   session on 2026-11-08 had none of them only because its list predated the
+   release that added them, and nothing told it the list had changed; a
+   reconnect brought them in. The aggregator now tells a client when its list
+   changes (`docs/mcp_app.md` §3.1).
 
 A custom artifact type would have carried the kit and its instructions on its
 own; claude.ai offers only its five built-in types, so the kit is a template.
 
 ## 9. Order of work
 
-1. **The connector's tools reach claude.ai** (§8.3).
+1. **A client is told when its tools change** (§8.3, `docs/mcp_app.md` §3.1).
 2. **The address guard and the transfers** (`docs/mcp_file_tools.md` §3.6–§3.8,
    §9 step 7): the guard first, then `file_download` and `file_upload` for
    workers, then the two `_and_commit` tools and yenbot's gate rules for binary

@@ -24,16 +24,68 @@ questions:
 - check the yaml in the journals
 - is the new journal.yaml right
 - validate before the commit
+- survey the journals for what needs maintenance
 category: Journals
-description: 'Check the memory''s journal repository as this session holds it, uncommitted changes included, reading it as the memory service would. Use before committing a change to the journals: moved lines, edited entries, a new journal. Triggered by "check the journals", "validate the memory", "is the journal tree valid". Returns how many journals and lines it holds and every problem found; none means it is safe to commit.'
+description: 'Check the memory''s journal repository as this session holds it, uncommitted changes included, reading it as the memory service would. Use before committing a change to the journals: moved lines, edited entries, a new journal. With `against_base` it also holds the change to the rules of a change against the tree the session began on: no line id may be lost unless `forgets` names it, and the shape may move no further than `budget` allows (journals created or removed, lines moved, summaries rewritten; a part left out may not move at all). With `survey` it also lists the maintenance candidates with their evidence: lines past their expiry, lines said twice, cut summaries, and, with `code`, lines whose source file changed there since they were written. Triggered by "check the journals", "validate the memory", "is the journal tree valid", "survey the journals". Returns how many journals and lines it holds, how far the change `moved` the tree, every problem found (none means it is safe to commit) and the `candidates`.'
 high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
+  definitions:
+    BudgetRequest:
+      description: The most a change may move each part of the tree's shape; a part left out may not move at all.
+      properties:
+        created:
+          default: 0
+          format: uint
+          minimum: 0.0
+          type: integer
+        lines_moved:
+          default: 0
+          format: uint
+          minimum: 0.0
+          type: integer
+        removed:
+          default: 0
+          format: uint
+          minimum: 0.0
+          type: integer
+        summaries_rewritten:
+          default: 0
+          format: uint
+          minimum: 0.0
+          type: integer
+      type: object
   properties:
+    against_base:
+      default: false
+      description: Hold this session's changes to the rules of a change, against the tree the session began on.
+      type: boolean
+    budget:
+      anyOf:
+      - $ref: '#/definitions/BudgetRequest'
+      - type: 'null'
+      default: null
+      description: How far the change may move the tree's shape.
+    code:
+      default: null
+      description: The repository a line's `source` names files in, for the survey's source rule; left out, no source is looked up.
+      type:
+      - string
+      - 'null'
+    forgets:
+      default: []
+      description: Line ids the change forgets on purpose (`#2026-10-30-0912-7e3a`).
+      items:
+        type: string
+      type: array
     repo:
       description: The repository holding the journals. Required.
       minLength: 1
       type: string
+    survey:
+      default: false
+      description: 'Also list the maintenance candidates (`journals::tree::survey`): lines past their expiry, lines said twice, cut summaries, and lines whose source file changed since they were written.'
+      type: boolean
   required:
   - repo
   title: CheckRequest

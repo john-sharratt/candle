@@ -17,6 +17,11 @@ starting `HANDOFF:`, with:
 - **What is not done**, and why.
 - **What to do next**, and what needs the user's approval first.
 
+A task still running when you go is one nobody will steer: if it may ask
+something before you or the next session are back, it should have been
+started alone (`drive`); say in the note which tasks are attended and so wait
+on an answer.
+
 Workers keep running without you: the note is how the next session knows
 which to wait on.
 

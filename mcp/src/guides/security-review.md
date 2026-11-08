@@ -11,7 +11,7 @@ sandboxing or anything that runs commands.
 
 ## Prompt
 
-`repo_task_start {thread, name: "security-<area>", effort: "exhaustive", prompt}`:
+`repo_task_start {thread, name: "security-<area>", role: "reviewer", effort: "exhaustive", prompt}`:
 
 ```
 GOAL: review <the change: branch or commits — or the area: the feature and
