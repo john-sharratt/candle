@@ -171,7 +171,7 @@ mod tests {
         );
         assert!(lines[9].ends_with("Note 2."));
         assert!(
-            lines[10].starts_with("Older lines: page on with `after: @zen/")
+            lines[10].starts_with("Older lines: page on with `after: @zen#")
                 && lines[10].ends_with("`."),
             "{}",
             lines[10]
