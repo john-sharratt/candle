@@ -37,3 +37,7 @@ people:
   # A service's subject names no person, so it is written as it is.
   - sub: "service:yenbot"
     role: user
+  # ZenJ, asking Zen for its choices with its service key (`web.yaml`,
+  # `docs/zenj.md` §5.2).
+  - sub: "service:zenj"
+    role: user

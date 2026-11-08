@@ -1,8 +1,14 @@
 //! What happened, in order (§13 `zenj_events`): a track changed, a request
 //! arrived, the mode changed, a fault. Each event has a number; a reader asks
-//! for those after the last it saw. The newest few thousand are kept.
+//! for those after the last it saw. The newest few thousand are kept in
+//! memory, and every one is appended to the night's record (§14), one JSON
+//! line each, which outlives the process and is what the morning's write-up
+//! is written from.
 
 use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Local};
@@ -35,11 +41,29 @@ pub struct Event {
 #[derive(Debug, Default)]
 pub struct Events {
     inner: Mutex<(u64, VecDeque<Event>)>,
+    record: Option<Mutex<File>>,
 }
 
 impl Events {
     pub fn new() -> Events {
         Events::default()
+    }
+
+    /// Events also appended to the record at `path`, which is created or
+    /// added to.
+    pub fn recorded_at(path: &Path) -> Result<Events, String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Events {
+            record: Some(Mutex::new(f)),
+            ..Events::default()
+        })
     }
 
     /// Record one, at `at`; its number.
@@ -49,7 +73,15 @@ impl Events {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.0 += 1;
         let id = g.0;
-        g.1.push_back(Event { id, at, kind, text });
+        let e = Event { id, at, kind, text };
+        if let Some(f) = &self.record {
+            let line = serde_json::to_string(&e).expect("an event serializes");
+            let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(err) = writeln!(f, "{line}") {
+                tracing::warn!("the night's record: {err}");
+            }
+        }
+        g.1.push_back(e);
         while g.1.len() > KEPT {
             g.1.pop_front();
         }
@@ -87,6 +119,24 @@ mod tests {
         assert_eq!(e.since(1, 1).len(), 1);
         assert!(e.since(3, 10).is_empty());
         assert_eq!(e.last(), 3);
+    }
+
+    #[test]
+    fn every_event_is_appended_to_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nights").join("2026-12-31.jsonl");
+        let e = Events::recorded_at(&path).unwrap();
+        e.push(Kind::Track, "a");
+        e.push(Kind::Fault, "b");
+        drop(e);
+        let again = Events::recorded_at(&path).unwrap();
+        again.push(Kind::Said, "c");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let kinds: Vec<String> = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, ["track", "fault", "said"], "added to, not replaced");
     }
 
     #[test]

@@ -236,6 +236,17 @@ cluster:
       topics:
         subscribe: ["repo/yenbot", "gate/yenbot"]
         publish: ["gate/yenbot/result/*", "service/yenbot/*"]
+    # ZenJ (docs/zenj.md §5.2): asking Zen for each choice, as itself, on the
+    # night's own conversation. Made once on this machine, before this
+    # gateway next starts, with
+    #
+    #   target\release\web.exe --new-ops-key web/secrets/zenj.key
+    - name: zenj
+      key_file: "secrets/zenj.key"
+      routes: [/v1/chat/completions]
+      topics:
+        subscribe: []
+        publish: []
 
 sites:
   # ── tokera.com ──────────────────────────────────────────────────────────

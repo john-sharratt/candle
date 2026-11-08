@@ -22,7 +22,7 @@ pub fn outputs() -> Result<Vec<String>, String> {
 }
 
 /// Every frame of `data`, `channels` wide, mixed to mono.
-pub fn mono(data: &[f32], channels: usize) -> impl Iterator<Item = f32> + '_ {
+pub fn mono(data: &[f32], channels: usize) -> impl Iterator<Item = f32> + Clone + '_ {
     data.chunks_exact(channels.max(1))
         .map(move |f| f.iter().sum::<f32>() / channels.max(1) as f32)
 }
@@ -85,14 +85,16 @@ pub fn open(part: &str, mut sinks: Vec<Producer<f32>>) -> Result<Capture, String
 
 #[cfg(test)]
 mod tests {
+    use rtrb::RingBuffer;
+
     use super::*;
 
     #[test]
     fn frames_mix_to_mono_and_reach_every_reader() {
         let m: Vec<f32> = mono(&[1.0, 0.0, 0.5, 0.5, -1.0, 1.0], 2).collect();
         assert_eq!(m, vec![0.5, 0.5, 0.0]);
-        let (p1, mut c1) = rtrb::RingBuffer::new(2);
-        let (p2, mut c2) = rtrb::RingBuffer::new(8);
+        let (p1, mut c1) = RingBuffer::new(2);
+        let (p2, c2) = RingBuffer::new(8);
         let mut sinks = vec![p1, p2];
         hand_on(&mut sinks, m.iter().copied());
         assert_eq!((c1.pop(), c1.pop(), c1.pop().is_err()), (Ok(0.5), Ok(0.5), true), "full: the rest dropped");
