@@ -4,16 +4,19 @@
 //! whole history is read without a search. A page names where the next one
 //! begins.
 
+use std::collections::HashSet;
+
 use crate::line::{Line, LineId};
 use crate::path::JournalPath;
-use crate::terms::shown;
+use crate::terms::is_current;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 use crate::view::who::render_line;
 use crate::view::NOT_INSTRUCTIONS;
 
 /// Every line of `j` a reader is shown at `now`, oldest first: its archives,
-/// period by period, then its window.
+/// period by period, then its window — an archived line as hidden as a
+/// window line by its own `expires`, or by a `replaces` anywhere in either.
 fn history(j: &Journal, now: Stamp) -> Vec<&Line> {
     let mut lines: Vec<&Line> = j
         .archives
@@ -21,8 +24,15 @@ fn history(j: &Journal, now: Stamp) -> Vec<&Line> {
         .flat_map(|period| period.iter())
         .collect();
     lines.sort_by(|a, b| (a.at, &a.id).cmp(&(b.at, &b.id)));
-    lines.extend(shown(&j.window, now));
+    lines.extend(j.window.iter());
+    let replaced: HashSet<&LineId> = lines
+        .iter()
+        .filter_map(|l| l.terms.replaces.as_ref())
+        .collect();
     lines
+        .into_iter()
+        .filter(|l| !replaced.contains(&l.id) && is_current(l, now))
+        .collect()
 }
 
 /// The `n` lines of `j` before `after`, newest last, and where the page
@@ -61,10 +71,14 @@ pub fn before(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
+    use crate::period::Period;
     use crate::terms::Terms;
+    use crate::testing::{at, note};
 
     /// `topics` holding notes `n0`…`n{count-1}`, a minute apart.
     fn noted(count: usize) -> (Tree, Vec<LineId>) {
@@ -117,5 +131,29 @@ mod tests {
         assert!(none.ends_with(&format!("holds nothing older than #{}.", ids[0])));
         let missing = LineId::parse("2026-01-01-0000-0000").unwrap();
         assert_eq!(before(&t, &path, j, &missing, 2, now()), None);
+    }
+
+    /// **An archived line is hidden as a window line is**: one past its
+    /// expiry, and one a window line replaces, are not on any page.
+    #[test]
+    fn a_hidden_archived_line_is_on_no_page() {
+        let (mut t, ids) = noted(1);
+        let path = p("topics");
+        let mut expired = note("2026-09-01T10:00:00Z", "the old reminder");
+        expired.terms.expires = Some(at("2026-09-02T00:00:00Z"));
+        let superseded = note("2026-09-01T11:00:00Z", "the key version is 2");
+        let kept = note("2026-09-01T12:00:00Z", "the archived fact");
+        let j = t.get_mut(&path).unwrap();
+        j.archives.insert(
+            Period::parse("2026-09-01").unwrap(),
+            Arc::new(vec![expired.clone(), superseded.clone(), kept.clone()]),
+        );
+        j.window[0].terms.replaces = Some(superseded.id.clone());
+        let j = t.get(&path).unwrap();
+        let page = before(&t, &path, j, &ids[0], 10, now()).unwrap();
+        assert!(page.ends_with("the archived fact"), "{page}");
+        assert!(!page.contains("the old reminder"), "{page}");
+        assert!(!page.contains("the key version is 2"), "{page}");
+        assert!(page.contains("the 1 line before"), "{page}");
     }
 }
