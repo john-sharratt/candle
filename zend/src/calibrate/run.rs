@@ -108,6 +108,10 @@ pub struct Report {
     pub sealed: usize,
     /// Units that failed, calibrated again by a later pass.
     pub failed: usize,
+    /// Units whose draft a shutdown or an ingest cancel stopped — no failure
+    /// of theirs, and calibrated again by a later pass. Counted apart, or every
+    /// restart reads as one in-flight unit per worker failing.
+    pub cancelled: usize,
     /// Units another member was calibrating, or had calibrated by the time
     /// this one held its lease ([`ingest_lease::share_calibration`]). Their
     /// calibrations arrive with replication.
@@ -194,6 +198,7 @@ pub fn calibrate_layer(
     let cursor = AtomicUsize::new(0);
     let sealed = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
+    let cancelled = AtomicUsize::new(0);
     let elsewhere = AtomicUsize::new(0);
     let drafts = Permits::new(LAYER_PARALLELISM);
     std::thread::scope(|s| {
@@ -227,35 +232,36 @@ pub fn calibrate_layer(
                     Ok(()) => {
                         sealed.fetch_add(1, Ordering::Relaxed);
                     }
+                    // A draft a shutdown stopped is no failure of the unit's.
+                    Err(_) if crate::ingest_cancel::cancelled() => {
+                        cancelled.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => {
                         failed.fetch_add(1, Ordering::Relaxed);
-                        if !crate::ingest_cancel::cancelled() {
-                            // Only the unit's own failure counts against it: a
-                            // decode lost to a restart or a full card says
-                            // nothing about the unit, and is simply tried again.
-                            if format!("{e:#}").starts_with(NO_QUESTION) {
-                                let tries =
-                                    failures_of(unit.prior_failures.as_deref(), &unit.marker)
-                                        .saturating_add(1);
-                                if let Err(err) = engine.set_conversation_metadata(
-                                    unit.timeline,
-                                    FAILED_KEY,
-                                    &format!("{} {tries}", unit.marker),
-                                ) {
-                                    tracing::warn!(
-                                        target: "zend::calibrate",
-                                        subject = %unit.subject,
-                                        "a failed calibration could not be counted: {err}",
-                                    );
-                                }
+                        // Only the unit's own failure counts against it: a
+                        // decode lost to a full card says nothing about the
+                        // unit, and is simply tried again.
+                        if format!("{e:#}").starts_with(NO_QUESTION) {
+                            let tries = failures_of(unit.prior_failures.as_deref(), &unit.marker)
+                                .saturating_add(1);
+                            if let Err(err) = engine.set_conversation_metadata(
+                                unit.timeline,
+                                FAILED_KEY,
+                                &format!("{} {tries}", unit.marker),
+                            ) {
+                                tracing::warn!(
+                                    target: "zend::calibrate",
+                                    subject = %unit.subject,
+                                    "a failed calibration could not be counted: {err}",
+                                );
                             }
-                            tracing::warn!(
-                                target: "zend::calibrate",
-                                layer = %spec.layer,
-                                subject = %unit.subject,
-                                "calibration failed: {e:#}",
-                            );
                         }
+                        tracing::warn!(
+                            target: "zend::calibrate",
+                            layer = %spec.layer,
+                            subject = %unit.subject,
+                            "calibration failed: {e:#}",
+                        );
                     }
                 }
             });
@@ -263,6 +269,7 @@ pub fn calibrate_layer(
     });
     report.sealed = sealed.into_inner();
     report.failed = failed.into_inner();
+    report.cancelled = cancelled.into_inner();
     report.elsewhere = elsewhere.into_inner();
     report.replies = retire_reply_records(engine);
     tracing::info!(
@@ -271,6 +278,7 @@ pub fn calibrate_layer(
         calibrated = report.done,
         sealed = report.sealed,
         failed = report.failed,
+        cancelled = report.cancelled,
         elsewhere = report.elsewhere,
         waiting = report.waiting,
         retired = report.retired,
