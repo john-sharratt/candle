@@ -1,0 +1,93 @@
+# ZenJ on BlackWorld (docs/zenj.md): the machine the FLX4, the monitors and
+# the TV are cabled to. Started from the repository's root at John's logon,
+# in the console session:
+#
+#   target\release\zenj.exe --config zenj/zenj.yaml
+
+# Where it listens: the gateway's `/v1/zenj` route names it as its upstream,
+# and keep's guard reads its status here.
+bind: "127.0.0.1:8097"
+trusted_gateways: ["127.0.0.1"]
+cluster:
+  urls: "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
+  name: tokera.com
+  group_key: web/secrets/group.key
+  host: blackworld
+# The library, the sign-ins' tokens, each night's record, its node.
+state: D:/zenj
+
+# Whose night it is, and each one's share of the music.
+people:
+  - name: john
+    email: johnathan.sharratt@gmail.com
+    export: D:/zenj/exports/john
+    share: 0.4
+  - name: yen
+    export: D:/zenj/exports/yen
+    share: 0.4
+request_share: 0.2
+
+night: 2026-12-31
+midnight: 2027-01-01T00:00:00
+# The energy curve (§5.1): warm-up, build, peak, the midnight moment,
+# wind-down. Times run on through midnight.
+curve:
+  - {at: "19:00", energy: 0.35}
+  - {at: "21:00", energy: 0.5}
+  - {at: "22:30", energy: 0.7}
+  - {at: "23:30", energy: 0.85}
+  - {at: "00:00", energy: 1.0}
+  - {at: "00:30", energy: 0.9}
+  - {at: "02:00", energy: 0.6}
+  - {at: "04:00", energy: 0.4}
+
+# The apps ZenJ signs in as (§4.1): each one's Client ID from its developer
+# dashboard, registered with this redirect. No secret: the sign-in is PKCE.
+spotify:
+  authorize: https://accounts.spotify.com/authorize
+  token: https://accounts.spotify.com/api/token
+  client_id: ""
+  scopes: [playlist-read-private, playlist-read-collaborative, user-library-read]
+  redirect: "http://127.0.0.1:43821/callback"
+  # The shared *ZenJ Requests* playlist's id, from its share link.
+  requests_playlist: ""
+tidal:
+  authorize: https://login.tidal.com/authorize
+  token: https://auth.tidal.com/v1/oauth2/token
+  client_id: ""
+  scopes: [playlists.read, playlists.write, search.read, collection.read]
+  redirect: "http://127.0.0.1:43821/callback"
+  country: AU
+
+rekordbox:
+  version: "7.2.19"
+  decks: 2
+  dir: C:/Users/johna/AppData/Roaming/Pioneer/rekordbox
+
+midi:
+  flx4: zenj/maps/ddj-flx4.yaml
+  hands: zenj/maps/rekordbox-7.yaml
+  lead_ms: 8
+  # More ZenJ is asked for on the pads (§6.3): the last two hot-cue pads of
+  # a deck held together.
+  combos:
+    assist: [deck1.hotcue7, deck1.hotcue8]
+    zenj: [deck2.hotcue7, deck2.hotcue8]
+
+audio_device: DDJ-FLX4
+
+zen:
+  gateway: "http://127.0.0.1"
+  host: code.tokera.com
+  key_file: web/secrets/zenj.key
+  conversation: zenj-2026-12-31
+  deadline_s: 20
+
+screens:
+  presets: D:/zenj/presets
+  outputs:
+    - {monitor: 0}
+    - {monitor: 1}
+    - {monitor: 2}
+    # The TV, on its own wired output: its scenes lead by its lag.
+    - {monitor: 3, latency_ms: 80}

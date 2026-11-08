@@ -31,6 +31,13 @@ pub struct Provider {
 
 /// The address a person opens to sign in.
 pub fn authorize_url(p: &Provider, challenge: &str, state: &str) -> Result<Url, String> {
+    if p.client_id.trim().is_empty() {
+        return Err(format!(
+            "no app to sign in as at {}: register one in the service's developer dashboard, \
+             with the redirect {}, and put its Client ID in zenj.yaml",
+            p.authorize, p.redirect
+        ));
+    }
     let mut u = Url::parse(&p.authorize).map_err(|e| format!("{}: {e}", p.authorize))?;
     u.query_pairs_mut()
         .append_pair("response_type", "code")
@@ -195,6 +202,15 @@ mod tests {
             scopes: vec!["playlist-read-private".into(), "user-library-read".into()],
             redirect: "http://127.0.0.1:43821/callback".into(),
         }
+    }
+
+    #[test]
+    fn no_app_is_no_sign_in() {
+        let p = Provider {
+            client_id: " ".into(),
+            ..spotify()
+        };
+        assert!(authorize_url(&p, "C", "S").unwrap_err().starts_with("no app to sign in as"));
     }
 
     #[test]

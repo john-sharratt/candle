@@ -18,22 +18,32 @@
 //! | [`tidal`] | The audio's catalogue and ZenJ's playlists |
 //! | [`library`] | The tracks ZenJ plays from, built ahead of the night |
 //! | [`live`] | What the night looks like now, for the tools and screens |
+//! | [`tools`] | The tools on the `/mcp` surface |
+//! | [`http`] | The routes: tools, status, events, keep's guard |
+//! | [`presence`] | The cluster socket, as the app `zenj` |
+//! | [`screens`] | The scenes and ZenJ's layer on every output |
+//! | [`config`] | The machine's file |
 //! | [`zen`] | Asking Zen, through the gateway, as the service `zenj` |
 
 pub mod brain;
 pub mod conductor;
+pub mod config;
 pub mod control;
 pub mod deck;
 pub mod events;
 pub mod hands;
+pub mod http;
 pub mod library;
 pub mod live;
 pub mod midi;
 pub mod music;
 pub mod oauth;
 pub mod plan;
+pub mod presence;
 pub mod rekordbox;
 pub mod room;
+pub mod screens;
 pub mod spotify;
 pub mod tidal;
+pub mod tools;
 pub mod zen;

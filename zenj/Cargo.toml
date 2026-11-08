@@ -10,6 +10,10 @@ description = "ZenJ, Zen as DJ (docs/zenj.md): the brain and hands above rekordb
 # settings. Build and test with `--manifest-path zenj/Cargo.toml`.
 [workspace]
 
+[[bin]]
+name = "zenj"
+path = "src/main.rs"
+
 [lib]
 path = "src/lib.rs"
 
@@ -49,7 +53,7 @@ serde_json   = { version = "1.0.99", features = ["preserve_order"] }
 serde_yaml   = "0.9"
 sha2         = "0.10"
 tokio        = { version = "1", features = ["full"] }
-tower        = { version = "0.5" }
+tower        = { version = "0.5", features = ["util"] }
 tracing      = "0.1.37"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url          = "2"
