@@ -62,6 +62,29 @@ impl House {
             _ => Vec::new(),
         }
     }
+
+    /// The house's line in the reading of `place`, for the body that sets its
+    /// mode: what it is in, and how to change it. `None` outside its room.
+    pub fn line(&self, place: &str) -> Option<String> {
+        let room = &self.table.as_ref()?.room;
+        if room != place {
+            return None;
+        }
+        let modes = Mode::ALL.map(Mode::name).join(", ");
+        Some(match &self.now {
+            Some(s) => format!(
+                "The house, in {}: {}, set by {}. Change it with `house_mode`, giving `mode` as \
+                 one of {modes}.",
+                s.mode.name(),
+                s.mode.what(),
+                s.by
+            ),
+            None => format!(
+                "The house, its mode not yet set. Set it with `house_mode`, giving `mode` as one \
+                 of {modes}."
+            ),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -84,6 +107,31 @@ mod tests {
         h.set_table(Some(table()));
         assert_eq!(h.modes_at("home/front-room").len(), Mode::ALL.len());
         assert!(h.modes_at("home/back-hall").is_empty());
+    }
+
+    /// **The room's reading says what the house is in**, and only in its room.
+    #[test]
+    fn the_reading_says_what_the_house_is_in() {
+        let mut h = House::default();
+        assert_eq!(h.line("home/front-room"), None, "no table");
+        h.set_table(Some(table()));
+        assert_eq!(
+            h.line("home/front-room").as_deref(),
+            Some(
+                "The house, its mode not yet set. Set it with `house_mode`, giving `mode` as one \
+                 of away, asleep, home, listening, watching, party."
+            )
+        );
+        h.set(Mode::Watching, "Zen", 1);
+        assert_eq!(
+            h.line("home/front-room").as_deref(),
+            Some(
+                "The house, in watching: the television is on, set by Zen. Change it with \
+                 `house_mode`, giving `mode` as one of away, asleep, home, listening, watching, \
+                 party."
+            )
+        );
+        assert_eq!(h.line("home/back-hall"), None);
     }
 
     /// **A mode set is kept with who set it; the table is not saved**, being

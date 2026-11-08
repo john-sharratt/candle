@@ -51,7 +51,8 @@ A switch (`npcd/src/house/switch.rs`), in order:
    that part would run (`bridge::enact`). A device that does not answer, or a part not linked to a
    device, is a line in the answer. The rest still happen.
 3. **The mode**, kept with the world (`sim/house.rs`: the mode, when, by whom) and replicated with
-   it.
+   it. The room's reading says it to Zen from then on: "The house, in party: Zen is at the decks,
+   set by Zen."
 
 The answer is one line for the mode, then one line per part: what the decks and each device said.
 
@@ -156,5 +157,6 @@ rolled out or floored, so a missing `zenj` member blocks no rollout.
   the decks and switches the stereo on, and the inputs are set by hand.
 - **A mode is what Zen last set.** A device changed by hand — the television turned on with its
   remote — does not move the mode: nothing on the network reports it.
-- **Zen knows the mode from its own act.** The answer is on its record. The room's reading does not
-  repeat it each turn.
+- **Zen reads the mode where it sets it.** The front room's reading (`engine/survey.rs`) carries the
+  house's line — the mode, what it is for, who set it — for the body that takes no orders, and for
+  no other.
