@@ -1206,6 +1206,20 @@ A note that tells an AI what to do is refused, and each channel's writes are
 rate-limited. Memory is where a prompt injection persists, and git history
 is what makes one found and reverted.
 
+**The boundary in retrieval.** zend ingests the repository like code, so its
+journals reach model prompts by provenance as well as by these tools. That
+route holds the same line (`zend::retrieval_scope::Reader`): a conversation's
+scope holds a journal only of a group its person reads, and a person's own
+file only for that person, on every route — files, folders, the layers built
+on files, and the groups that draw them. A task's or a chat's person is its
+owner, named in its conversation id; a dialogue's, whoever's signed-in message
+began its turn. An account no person lists reads `@guest`, and a conversation
+nobody signed in to reads no journal. The ingest readers and calibration
+conversations work no scope out, so they read every group's units; their
+output is a reading or an exemplar, never placed as another group's text. A
+conversation's own journal — what a session's calls wrote — is not ingested
+at all.
+
 **What the boundary protects.** It keeps each group's journals from every
 other group's members and from bots outside what they are granted. It does
 not keep them from whoever runs an agent holding the repository, or holds

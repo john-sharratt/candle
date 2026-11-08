@@ -140,7 +140,8 @@ use crate::repo_path::shown as shown_unit;
 use crate::repo_scan::{utility_config, DIR_KEY};
 use crate::resident::Resident;
 use crate::resume;
-use crate::retrieval_scope::RetrievalScope;
+use crate::mcp::memory::readers::MemoryReaders;
+use crate::retrieval_scope::{Readers, RetrievalScope};
 use crate::round_timing::{self, RoundTiming};
 use crate::self_check::{self, Report as SelfCheckReport};
 use crate::substrate_git::{self, Repositories};
@@ -4274,6 +4275,7 @@ fn run_inference_stream(
             // the scan.
             if let Some(config) = state.working_set.clone() {
                 let open_state = Arc::clone(&state);
+                let open_conv = conv_id.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     let t_open = Instant::now();
                     open_state.engine.working_set_clear(timeline);
@@ -4284,9 +4286,12 @@ fn run_inference_stream(
                     // otherwise first set right before its first submit — after
                     // this — so every seed was refused: measured 2026-10-24, no
                     // dialogue had carried a seed since scoping landed.
-                    open_state
-                        .retrieval_scope
-                        .apply(&open_state.engine, timeline, &files);
+                    open_state.retrieval_scope.apply(
+                        &open_state.engine,
+                        timeline,
+                        &open_conv,
+                        &files,
+                    );
                     let scope_ms = t_scope.elapsed().as_millis() as u64;
                     let t_seed = Instant::now();
                     let seeded = seed_working_set(&open_state, timeline, &files, &config);
@@ -4658,10 +4663,14 @@ fn run_inference_stream(
             // on a base not yet listed, so on the blocking pool.
             let scope_state = Arc::clone(&state);
             let scope_files = Arc::clone(&cs.files);
+            let scope_conv = conv_id.clone();
             if let Err(e) = tokio::task::spawn_blocking(move || {
-                scope_state
-                    .retrieval_scope
-                    .apply(&scope_state.engine, timeline, &scope_files)
+                scope_state.retrieval_scope.apply(
+                    &scope_state.engine,
+                    timeline,
+                    &scope_conv,
+                    &scope_files,
+                )
             })
             .await
             {
@@ -8282,6 +8291,11 @@ impl ZendSession {
         let ops: Arc<dyn OpsRunner> = Arc::clone(self.mcp.ops()) as _;
         // The memory its writer keeps current once the engine is up.
         let memory = Arc::clone(self.mcp.memory());
+        // Whom each conversation's retrieval reads the memory as.
+        let readers: Arc<dyn Readers> = Arc::new(MemoryReaders::new(
+            Arc::clone(&memory),
+            Arc::clone(self.mcp.ops()),
+        ));
         // Handed to both the downloader and the engine builder, so the artifact
         // fetched and the model built are the same one.
         let model = self.config.model.clone();
@@ -8412,6 +8426,9 @@ impl ZendSession {
                     ops,
                 ) {
                     Ok(Some(state)) => {
+                        // Before the state is published: no turn is scoped
+                        // without its reader.
+                        state.retrieval_scope.set_readers(readers);
                         slot.store(Some(Arc::clone(&state)));
                         tracing::info!("inference engine ready");
                         // A stop asked since the load's last boundary: the engine

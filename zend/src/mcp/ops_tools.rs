@@ -486,6 +486,12 @@ impl OpsTools {
             .contains(conv_id)
     }
 
+    /// The account key of whoever's message started dialogue `conv_id`'s
+    /// turn: whom its retrieval reads the memory as.
+    pub fn dialogue_key(&self, conv_id: &str) -> Option<String> {
+        self.dialogue_person(conv_id).map(|p| p.key())
+    }
+
     /// Whose message started dialogue `conv_id`'s turn.
     fn dialogue_person(&self, conv_id: &str) -> Option<Person> {
         self.people
