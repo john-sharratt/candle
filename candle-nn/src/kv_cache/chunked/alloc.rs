@@ -558,30 +558,44 @@ impl BackingInner {
             for _ in 0..more {
                 owed_list.push(key);
             }
+            // INFO only when the class is owed arenas — the reserve actually
+            // growing. A target crossing an arena boundary moves with every
+            // seal and drain, many times a second, so it is DEBUG; the pass
+            // line carries every target.
             let per = key.chunks().max(1);
             let (was, now) = (before.div_ceil(per), target.div_ceil(per));
-            if more > 0 || was != now {
-                let reason = if capped {
-                    "capped"
-                } else if now < was {
-                    "drained"
-                } else {
-                    "backlog"
-                };
+            let reason = if capped {
+                "capped"
+            } else if now < was {
+                "drained"
+            } else {
+                "backlog"
+            };
+            if more > 0 {
                 tracing::info!(
                     target: "candle_conversation::kv_reserve",
                     class = %key.label(),
                     arenas_owed = more,
+                    target_arenas = now,
+                    target_slots = target,
+                    free_slots = free,
+                    factor,
+                    reason,
+                    "kv_reserve: grow {} by {more} arena(s)",
+                    key.label(),
+                );
+            } else if was != now {
+                tracing::debug!(
+                    target: "candle_conversation::kv_reserve",
+                    class = %key.label(),
                     target_arenas_before = was,
                     target_arenas = now,
                     target_slots = target,
                     free_slots = free,
                     factor,
                     reason,
-                    "kv_reserve: {} ({} -> {} arenas)",
-                    if now < was { "shrink" } else { "grow" },
-                    was,
-                    now,
+                    "kv_reserve: target {} ({was} -> {now} arenas)",
+                    key.label(),
                 );
             }
             report.classes.push(ReserveClass {

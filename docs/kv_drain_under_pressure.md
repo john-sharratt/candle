@@ -212,10 +212,14 @@ WARN on the event marked:
 
    With that line the factor is a number in the log, not an assumption, and
    the design can be checked against it.
-2. **Grow and shrink events** (`kv_reserve: grow` / `shrink`, from
-   `owe_reserves`). They fire when a class's target crosses a whole arena or
-   it is owed arenas. Each names the class, the arenas owed, the target in
-   arenas before and after, and the reason: `backlog`, `drained` or `capped`.
+2. **Grow events** (`kv_reserve: grow <class> by N arena(s)`, from
+   `owe_reserves`) fire at INFO when a class is owed arenas. Each names the
+   class, the arenas owed, the target, the free slots, the factor, and the
+   reason: `backlog` or `capped`. A target crossing an arena boundary with no
+   arena owed (`kv_reserve: target`, reason `drained` on the way down) is
+   DEBUG. It moves with every seal and drain, many times a second (measured
+   on BW on 4662: 15 lines in 3 s at INFO), and the pass line carries every
+   target.
 3. **The quantize deferral** (`kv_reserve: quantize deferred short of …`, from
    `owe_capacity`). It names the class, the slots the layer needed, the slots
    free, the class's target and the arenas owed. It is a WARN when the need
