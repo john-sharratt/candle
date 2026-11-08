@@ -15,6 +15,7 @@ use tempfile::TempDir;
 
 use super::who::Who;
 use super::*;
+use crate::mcp::records::{MemRecords, Records};
 
 #[test]
 fn memory_paths_are_told_from_thread_paths() {
@@ -204,12 +205,19 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
         "the account is bound now"
     );
     let before = m.tree().unwrap();
-    let named = conversations::here(&m, &zen(), Channel::Grok, "session-1").unwrap();
+    let records = MemRecords::default();
+    let rec = Some(&records as &dyn Records);
+    let named = conversations::here(&m, rec, &zen(), Channel::Grok, "session-1").unwrap();
     assert!(
         Arc::ptr_eq(&before, &m.tree().unwrap()) && before.get(&named).is_none(),
         "a read names the conversation and writes nothing"
     );
-    let conv = conversations::open(&m, &john(), &zen(), Channel::Grok, "session-1").unwrap();
+    let conv = conversations::open(&m, rec, &john(), &zen(), Channel::Grok, "session-1").unwrap();
+    assert_eq!(
+        records.count_under("mcp/conversation/zen/"),
+        1,
+        "the journal is recorded for the other members"
+    );
     assert_eq!(
         conv, named,
         "the first write opens the journal its reads named"
@@ -218,12 +226,12 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
     assert!(conv.show().ends_with("-grok"), "{conv}");
     assert!(m.tree().unwrap().get(&conv).is_some());
     assert_eq!(
-        conversations::open(&m, &john(), &zen(), Channel::Grok, "session-1").unwrap(),
+        conversations::open(&m, rec, &john(), &zen(), Channel::Grok, "session-1").unwrap(),
         conv,
         "one journal a session"
     );
     assert_eq!(
-        conversations::here(&m, &zen(), Channel::Grok, "session-1").unwrap(),
+        conversations::here(&m, rec, &zen(), Channel::Grok, "session-1").unwrap(),
         conv
     );
     let own = johns_journal();
