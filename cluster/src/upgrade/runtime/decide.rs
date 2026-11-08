@@ -96,17 +96,25 @@ pub fn target(f: &Facts) -> Option<Target> {
     let own = f.own.as_ref()?;
     let running = own.build();
     if let Some(floor) = &f.upgrading {
+        // The floor as it was at admission. It may have risen since — the
+        // members above it gone on to a newer build, and the old one no longer
+        // served — so a newer certified build is taken over it: a member that
+        // asked only for the floor it was admitted under asked for it for as
+        // long as the process ran (WhiteWorld on 4754, 2026-11-09).
+        let newer = f
+            .known
+            .iter()
+            .filter(|b| !b.is_local() && b.count >= floor.count && **b != running && *b != floor)
+            .filter(|b| f.certified(b) && !f.refused.contains(&build_name(b)))
+            .max_by_key(|b| b.count);
+        if let Some(b) = newer {
+            return Some(Target {
+                build: b.clone(),
+                lease: Lease::None,
+            });
+        }
         if f.refused.contains(&build_name(floor)) {
-            return f
-                .known
-                .iter()
-                .filter(|b| !b.is_local() && b.count >= floor.count && **b != running)
-                .filter(|b| f.certified(b) && !f.refused.contains(&build_name(b)))
-                .max_by_key(|b| b.count)
-                .map(|b| Target {
-                    build: b.clone(),
-                    lease: Lease::None,
-                });
+            return None;
         }
         if *floor != running {
             return Some(Target {
@@ -309,6 +317,31 @@ mod tests {
         assert_eq!(target(&f).map(|t| t.build), Some(b(13)));
         f.refused.insert("13-h13".into());
         assert_eq!(target(&f), None, "nothing above the floor is left to take");
+    }
+
+    /// **A floor that rose after admission gives way to the newer certified
+    /// build**: the members above it went on, and the floor it was admitted
+    /// under is no longer served. One not yet certified does not.
+    #[test]
+    fn a_risen_floor_gives_way_to_the_newer_certified_build() {
+        let mut f = facts(10, "");
+        f.upgrading = Some(b(12));
+        f.known = vec![b(12), b(13)];
+        assert_eq!(
+            target(&f).map(|t| t.build),
+            Some(b(12)),
+            "13 has not certified"
+        );
+        f.verdicts
+            .insert(("zend".into(), "13-h13".into()), Settled::Pass);
+        assert_eq!(
+            target(&f),
+            Some(Target {
+                build: b(13),
+                lease: Lease::None
+            })
+        );
+        assert_eq!(prefetch(&f), Some(b(13)), "and fetched, not the floor");
     }
 
     /// A certified build is installed under `upgrade/<app>`; one not
