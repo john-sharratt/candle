@@ -75,6 +75,7 @@ fn texts(op: &Op) -> Vec<&str> {
         Op::Episode { text, .. } | Op::Edit { text, .. } | Op::FoldPeriod { text, .. } => {
             vec![text]
         }
+        Op::Activity { subject, .. } => vec![subject],
         Op::Create { cue, .. } | Op::Link { cue, .. } => vec![cue],
         Op::Summarize {
             sentences,
@@ -167,6 +168,14 @@ pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
             Ok(())
         }
         (_, Op::Episode { .. }) => Err(no(actor, "record episodes there")),
+
+        // What a conversation's calls did: the server's record alone.
+        (Actor::Server { .. }, Op::Activity { path, .. })
+            if in_sections(path, &[Section::Conversations]) =>
+        {
+            Ok(())
+        }
+        (_, Op::Activity { .. }) => Err(no(actor, "record a conversation's calls there")),
 
         // Changing a line.
         (Actor::Person { .. }, Op::Edit { address, .. } | Op::Accept { address }) => {
@@ -361,6 +370,7 @@ fn paths(op: &Op) -> Vec<&JournalPath> {
     match op {
         Op::Note { path, .. }
         | Op::Episode { path, .. }
+        | Op::Activity { path, .. }
         | Op::Forget { path, .. }
         | Op::Close { path }
         | Op::Summarize { path, .. }

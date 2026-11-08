@@ -220,6 +220,11 @@ pub fn op_to_wire(op: &Op) -> Value {
             text,
             speaker,
         } => json!({"op": "episode", "path": p(path), "text": text, "speaker": slug(speaker)}),
+        Op::Activity {
+            path,
+            tool,
+            subject,
+        } => json!({"op": "activity", "path": p(path), "tool": tool, "subject": subject}),
         Op::Edit { address, text } => {
             json!({"op": "edit", "path": p(&address.path), "id": address.id.as_str(), "text": text})
         }
@@ -343,6 +348,11 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
             path: o.path("path")?,
             text: text()?,
             speaker: o.opt_slug("speaker")?,
+        },
+        "activity" => Op::Activity {
+            path: o.path("path")?,
+            tool: o.str("tool")?.to_string(),
+            subject: o.str("subject")?.to_string(),
         },
         "edit" => Op::Edit {
             address: address()?,
@@ -514,6 +524,11 @@ mod tests {
                 path: p("conversations/2026-10-31-0712-grok"),
                 text: "x".into(),
                 speaker: None,
+            },
+            Op::Activity {
+                path: p("conversations/2026-10-31-0712-grok"),
+                tool: "log_grep".into(),
+                subject: "wave \"too\" wide".into(),
             },
             Op::Edit {
                 address: Address {

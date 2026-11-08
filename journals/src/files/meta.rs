@@ -3,6 +3,7 @@
 //! rebuilds of one summary conflict.
 
 use crate::error::Problem;
+use crate::files::activity::Activity;
 use crate::files::focus::{Focus, MAX_ABOUT};
 use crate::files::reference::{Ref, MAX_REFS};
 use crate::files::summary::Summary;
@@ -29,6 +30,8 @@ pub struct Meta {
     pub refs: Vec<Ref>,
     /// A conversation's focus: who is speaking, and what it is about (§2.4).
     pub focus: Option<Focus>,
+    /// What a conversation's calls did ([`Activity`]).
+    pub activity: Activity,
     pub summary: Option<Summary>,
 }
 
@@ -43,6 +46,7 @@ impl Meta {
             repo: None,
             refs: Vec::new(),
             focus: None,
+            activity: Activity::default(),
             summary: None,
         }
     }
@@ -78,6 +82,7 @@ impl Meta {
                 out.push_str(&format!("  about: {}\n", scalar_list(&about)));
             }
         }
+        self.activity.render(&mut out);
         if let Some(s) = &self.summary {
             s.render(&mut out);
         }
@@ -144,6 +149,7 @@ impl Meta {
                 Some(Focus { speaker, about })
             }
         };
+        let activity = Activity::read(&mut f, file, text)?;
         let summary = match f.opt_map("summary")? {
             None => None,
             Some(sv) => {
@@ -163,6 +169,7 @@ impl Meta {
             repo,
             refs,
             focus,
+            activity,
             summary,
         })
     }
@@ -203,6 +210,12 @@ mod tests {
                 speaker: Some(slug("yen")),
                 about: vec![Below::parse("topics/house-extension/permits").unwrap()],
             }),
+            activity: {
+                let mut a = Activity::default();
+                a.push(at("2026-10-30T10:00:00Z"), "repo_task_start", "permits: tidy");
+                a.before.insert("log_grep".into(), 2);
+                a
+            },
             summary: Some(Summary {
                 over: Fingerprint::of_bytes(b"inputs"),
                 built: at("2026-10-30T11:02:40Z"),
@@ -247,6 +260,10 @@ mod tests {
                  focus:\n\
                  \x20 speaker: yen\n\
                  \x20 about: [topics/house-extension/permits]\n\
+                 activity:\n\
+                 \x20 - {{at: 2026-10-30T10:00:00Z, tool: repo_task_start, subject: \"permits: tidy\"}}\n\
+                 activity_before:\n\
+                 \x20 log_grep: 2\n\
                  summary:\n  over: {}\n  built: 2026-10-30T11:02:40Z\n  lines: 12\n  children: 2\n  stale: true\n\
                  \x20 digest: \"Candle: releases go through keep.\"\n  sentences:\n\
                  \x20   - text: Releases go through keep trials on BlackWorld, then roll out.\n\
