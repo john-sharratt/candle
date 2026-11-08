@@ -68,6 +68,7 @@ pub mod layer_toggle;
 pub mod logs;
 pub mod mem;
 pub mod member_status;
+pub mod note_terms;
 mod nudge;
 mod reply;
 pub mod repo_job;

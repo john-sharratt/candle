@@ -120,6 +120,7 @@ pub fn index(path: &JournalPath, j: &Journal, now: Stamp) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::error::Problem;
     use crate::files::summary::{Cite, Sentence};
@@ -208,6 +209,7 @@ mod tests {
                 path: trip.clone(),
                 text: "Flights booked.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )
@@ -243,6 +245,7 @@ mod tests {
                 path: trip.clone(),
                 text: "Hotel too.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now().plus(7_200),
         )

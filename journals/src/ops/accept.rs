@@ -24,6 +24,7 @@ pub fn accept(tree: &mut Tree, address: &Address) -> Result<Applied> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::ops::fixture::{john, now, p, thanhlong, zen};
     use crate::ops::{apply, Op};
@@ -43,6 +44,7 @@ mod tests {
                 path: path.clone(),
                 text: "Trials run on BlackWorld.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )

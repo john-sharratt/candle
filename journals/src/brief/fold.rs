@@ -85,6 +85,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::brief::call_of;
     use crate::ops::apply;
@@ -105,6 +106,7 @@ mod tests {
                     path: p("people"),
                     text: format!("n{i}"),
                     speaker: None,
+                    terms: Terms::default(),
                 },
                 t0.plus(3600 * i as i64),
             )

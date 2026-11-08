@@ -35,6 +35,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::terms::Terms;
     use crate::line::{Folds, LineId};
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
@@ -52,6 +53,7 @@ mod tests {
                 path: path.clone(),
                 text: "Prefers tea.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )

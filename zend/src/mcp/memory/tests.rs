@@ -9,6 +9,7 @@ use journals::error::Problem;
 use journals::files::{Cite, Sentence};
 use journals::scope::Channel;
 use journals::slug::Slug;
+use journals::terms::Terms;
 use journals::tree::fingerprint::fingerprint;
 use tempfile::TempDir;
 
@@ -86,6 +87,7 @@ fn a_write_error_is_told_by_its_kind() {
         path: own.clone(),
         text: text.into(),
         speaker: None,
+        terms: Terms::default(),
     };
     let id = m
         .write(&actor, &note("Prefers tea."))
@@ -236,6 +238,7 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
             path: own.clone(),
             text: "Prefers short answers.".into(),
             speaker: Some(john()),
+            terms: Terms::default(),
         },
     )
     .unwrap();

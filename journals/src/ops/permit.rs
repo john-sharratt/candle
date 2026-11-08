@@ -69,10 +69,12 @@ fn read_only<'a>(tree: &Tree, actor: &Actor, path: &'a JournalPath) -> Option<&'
 /// cue, a summary, a fold, a name.
 fn texts(op: &Op) -> Vec<&str> {
     match op {
-        Op::Note { text, .. }
-        | Op::Episode { text, .. }
-        | Op::Edit { text, .. }
-        | Op::FoldPeriod { text, .. } => vec![text],
+        Op::Note { text, terms, .. } => once(text.as_str())
+            .chain(terms.source.as_deref())
+            .collect(),
+        Op::Episode { text, .. } | Op::Edit { text, .. } | Op::FoldPeriod { text, .. } => {
+            vec![text]
+        }
         Op::Create { cue, .. } | Op::Link { cue, .. } => vec![cue],
         Op::Summarize {
             sentences,
@@ -388,6 +390,7 @@ mod tests {
     use crate::path::Address;
     use crate::period::Period;
     use crate::scope::Channel;
+    use crate::terms::Terms;
     use crate::testing::slug;
 
     fn note(path: JournalPath) -> Op {
@@ -395,6 +398,7 @@ mod tests {
             path,
             text: "x".into(),
             speaker: None,
+            terms: Terms::default(),
         }
     }
 
@@ -439,6 +443,7 @@ mod tests {
                     path: p("people"),
                     text: bad.into(),
                     speaker: None,
+                    terms: Terms::default(),
                 },
             ),
             (
@@ -447,6 +452,7 @@ mod tests {
                     path: p("topics"),
                     text: bad.into(),
                     speaker: None,
+                    terms: Terms::default(),
                 },
             ),
             (
@@ -627,6 +633,7 @@ mod tests {
                 path: topics.clone(),
                 text: "Thanh Long's".into(),
                 speaker: Some(slug("yen")),
+                terms: Terms::default(),
             },
             now(),
         )
@@ -657,6 +664,7 @@ mod tests {
                 path: topics.clone(),
                 text: "Yen's".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )

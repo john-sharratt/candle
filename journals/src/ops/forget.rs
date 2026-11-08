@@ -70,6 +70,7 @@ pub fn forget(tree: &mut Tree, path: &JournalPath, which: &Which) -> Result<Appl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::Terms;
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
     use crate::period::Period;
@@ -90,6 +91,7 @@ mod tests {
                     path: path.clone(),
                     text: text.into(),
                     speaker: None,
+                    terms: Terms::default(),
                 },
                 now(),
             )

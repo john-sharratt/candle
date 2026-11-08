@@ -29,6 +29,7 @@ pub mod period;
 pub mod scope;
 pub mod slug;
 pub mod store;
+pub mod terms;
 pub mod time;
 pub mod tree;
 pub mod view;

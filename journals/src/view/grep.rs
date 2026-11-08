@@ -9,6 +9,7 @@ use crate::actor::{need_read, Actor};
 use crate::line::{Line, LineId};
 use crate::path::JournalPath;
 use crate::period::Period;
+use crate::terms::shown;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 use crate::view::who::render_line;
@@ -118,6 +119,7 @@ fn excerpt(text: &str, phrase: &str) -> String {
 /// the journals it names first, then lines and summaries newest first — and
 /// the count before `limit` cut it.
 pub fn grep(
+    now: Stamp,
     tree: &Tree,
     actor: &Actor,
     phrase: &str,
@@ -150,7 +152,7 @@ pub fn grep(
             cut.text = excerpt(&l.text, phrase);
             render_line(tree, &cut)
         };
-        for l in &j.window {
+        for l in shown(&j.window, now) {
             if holds(&l.text, &want) {
                 hits.push(Hit {
                     path: path.clone(),
@@ -229,6 +231,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::terms::Terms;
     use crate::ops::fixture::{bot, guest, john, now, p, stranger, yen, zen};
     use crate::ops::fold::fold_child;
     use crate::ops::{apply, OnTaken, Op};
@@ -243,6 +246,7 @@ mod tests {
                 path: p(path),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             at,
         )
@@ -340,7 +344,7 @@ mod tests {
             "b".repeat(800)
         );
         noted(&mut t, &john(), "topics", &long, now());
-        let (hits, _) = grep(&t, &john(), "builder", None, 10);
+        let (hits, _) = grep(now(), &t,&john(), "builder", None, 10);
         assert_eq!(hits.len(), 1);
         let cut = excerpt(&long, "builder");
         assert_eq!(cut.chars().count(), EXCERPT + 2, "both ends marked");
@@ -372,7 +376,7 @@ mod tests {
             "The cpu experts pool is on by default.",
             now().plus(120),
         );
-        let (hits, total) = grep(&t, &john(), "CPU experts", None, 10);
+        let (hits, total) = grep(now(), &t, &john(), "CPU experts", None, 10);
         assert_eq!(total, 2);
         assert_eq!(
             render(&hits, total),
@@ -380,12 +384,12 @@ mod tests {
              @zen/topics #2026-10-30-1202-b082 2026-10-30 12:02 note, john via Claude Code: \
              The cpu experts pool is on by default."
         );
-        let (by_cue, _) = grep(&t, &john(), "host pool", None, 10);
+        let (by_cue, _) = grep(now(), &t,&john(), "host pool", None, 10);
         assert_eq!(by_cue[0].found, Found::Journal);
         // A word naming its group, its section or a fixed journal's cue
         // finds no journal: only a named journal's own name and cue count.
         let journals = |phrase| {
-            grep(&t, &john(), phrase, None, 50)
+            grep(now(), &t, &john(), phrase, None, 50)
                 .0
                 .into_iter()
                 .filter(|h| h.found == Found::Journal)
@@ -428,7 +432,7 @@ mod tests {
         )
         .unwrap();
         noted(&mut t, &john(), "topics/wasmer", "WASIX came first.", now());
-        let (hits, total) = grep(&t, &john(), "wasix", None, 10);
+        let (hits, total) = grep(now(), &t, &john(), "wasix", None, 10);
         assert_eq!(total, 1);
         assert_eq!(hits[0].path, p("topics/wasmer"));
     }
@@ -449,11 +453,11 @@ mod tests {
             "ENVIRONMENT-VARIABLE",
             "feature-flags",
         ] {
-            assert_eq!(grep(&t, &john(), phrase, None, 10).1, 1, "{phrase}");
+            assert_eq!(grep(now(), &t, &john(), phrase, None, 10).1, 1, "{phrase}");
         }
-        assert_eq!(grep(&t, &john(), "environmentvariable", None, 10).1, 0);
+        assert_eq!(grep(now(), &t, &john(), "environmentvariable", None, 10).1, 0);
         for empty in ["-", " - ", "--"] {
-            assert_eq!(grep(&t, &john(), empty, None, 10).1, 0, "{empty:?}");
+            assert_eq!(grep(now(), &t, &john(), empty, None, 10).1, 0, "{empty:?}");
         }
         assert_eq!(
             excerpt(
@@ -475,7 +479,7 @@ mod tests {
     fn grep_finds_what_the_caller_reads_and_nothing_else() {
         let t = seeded();
         let shown = |actor: &Actor| -> Vec<String> {
-            grep(&t, actor, "permit", None, 50)
+            grep(now(), &t, actor, "permit", None, 50)
                 .0
                 .iter()
                 .map(|h| format!("{} {:?}", h.path, h.found))
@@ -503,7 +507,7 @@ mod tests {
     #[test]
     fn grep_narrows_to_a_subtree_and_cuts_at_its_limit() {
         let t = seeded();
-        let (hits, total) = grep(&t, &john(), "permit", Some(&p("topics")), 1);
+        let (hits, total) = grep(now(), &t, &john(), "permit", Some(&p("topics")), 1);
         assert_eq!((hits.len(), total), (1, 2));
         let text = render(&hits, total);
         assert!(
@@ -511,6 +515,6 @@ mod tests {
             "{text}"
         );
         assert_eq!(render(&[], 0), "Nothing found.");
-        assert_eq!(grep(&t, &john(), "  ", None, 5).1, 0);
+        assert_eq!(grep(now(), &t, &john(), "  ", None, 5).1, 0);
     }
 }

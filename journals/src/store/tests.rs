@@ -17,6 +17,7 @@ use crate::ops::{OnTaken, Which};
 use crate::path::Address;
 use crate::path::Below;
 use crate::scope::Channel;
+use crate::terms::Terms;
 use crate::testing::{note as testing_note, slug};
 use crate::tree::render::render_all;
 
@@ -111,6 +112,7 @@ fn note_on(path: &str, text: &str) -> Op {
         path: p(path),
         text: text.into(),
         speaker: None,
+        terms: Terms::default(),
     }
 }
 

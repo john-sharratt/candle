@@ -40,6 +40,7 @@ use serde_json::{Map, Value};
 
 use crate::mcp::tools::group_add::{self, group_of};
 use crate::mcp::tools::mem::{Mem, Miss};
+use crate::mcp::tools::note_terms::terms_of;
 use crate::mcp::tools::string;
 use crate::mcp::tools::{group_create, group_default, group_describe};
 
@@ -93,7 +94,9 @@ impl Kind {
     /// The fields it takes beside `op`.
     fn fields(self) -> &'static [&'static str] {
         match self {
-            Kind::Note => &["journal", "text", "at", "speaker"],
+            Kind::Note => &[
+                "journal", "text", "at", "speaker", "by", "source", "expires", "replaces",
+            ],
             Kind::Edit => &["line", "text"],
             Kind::Forget => &["line", "journal", "says"],
             Kind::Create => &["under", "name", "cue", "at"],
@@ -149,6 +152,7 @@ pub fn plan(m: &Mem, v: &Value, now: Stamp, speaker: Option<&Slug>) -> Result<Pl
                 Some(s) => Some(speaker_of(s)?),
                 None => speaker.cloned().or_else(|| m.speaker()),
             },
+            terms: terms_of(v)?,
         },
         Kind::Edit => Op::Edit {
             address: address()?,
@@ -234,6 +238,7 @@ mod tests {
     use journals::files::Who;
     use journals::line::LineId;
     use journals::path::{Address, Below, JournalPath};
+    use journals::terms::Terms;
     use serde_json::json;
 
     use super::*;
@@ -276,6 +281,7 @@ mod tests {
                     path: path("@zen/topics"),
                     text: "Keep trials.".into(),
                     speaker: None,
+                    terms: Terms::default(),
                 },
                 at: now()
             }

@@ -11,6 +11,7 @@ use crate::files::Focus;
 use crate::path::{JournalPath, Place};
 use crate::scope::{conversation_channel, Channel, Section};
 use crate::slug::Slug;
+use crate::terms::shown;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 use crate::view::index::{index, refs_lines, written};
@@ -228,9 +229,10 @@ fn focused_block(tree: &Tree, path: &JournalPath, j: &Journal, label: &str, now:
     }];
     block.extend(index(path, j, now).into_iter().map(|l| format!("  - {l}")));
     block.extend(refs_lines(j).into_iter().map(|l| format!("  - {l}")));
-    let from = j.window.len().saturating_sub(FOCUSED_LINES);
+    let window = shown(&j.window, now);
+    let from = window.len().saturating_sub(FOCUSED_LINES);
     block.extend(
-        j.window[from..]
+        window[from..]
             .iter()
             .map(|l| format!("  {}", render_line(tree, l))),
     );
@@ -290,7 +292,7 @@ pub fn frame(
             // The newest lines that fit in half of what is left.
             let mut lines: Vec<String> = Vec::new();
             let mut room = f.left / 2;
-            for l in j.window.iter().rev() {
+            for l in shown(&j.window, now).into_iter().rev() {
                 let r = format!("  {}", render_line(tree, l));
                 let n = r.chars().count() + 1;
                 if n > room {
@@ -472,6 +474,7 @@ fn deeper(root: &JournalPath, j: &Journal) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::files::summary::{Cite, Sentence};
     use crate::ops::fixture::{john, now, p, zen};
@@ -513,6 +516,7 @@ mod tests {
                 path: p(path),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )
@@ -947,6 +951,7 @@ mod tests {
                 path: path.clone(),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )

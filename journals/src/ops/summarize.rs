@@ -242,6 +242,7 @@ pub fn mark_stale(tree: &mut Tree, path: &JournalPath, why: &str) -> Result<Appl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::line::LineId;
     use crate::ops::fixture::{john, now, p, zen};
@@ -266,6 +267,7 @@ mod tests {
                 path: path.clone(),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )
@@ -583,6 +585,7 @@ mod tests {
                 path: path.clone(),
                 text: "Flights to Da Nang.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )

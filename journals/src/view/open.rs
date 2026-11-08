@@ -4,6 +4,7 @@
 
 use crate::files::Focus;
 use crate::path::{Below, JournalPath};
+use crate::terms::shown;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 use crate::view::index::{index, index_line, refs_lines};
@@ -66,18 +67,19 @@ pub fn open(tree: &Tree, path: &JournalPath, j: &Journal, lines: usize, now: Sta
         out.extend(refs.into_iter().map(|l| format!("  - {l}")));
     }
     let archived: usize = j.archives.values().map(|lines| lines.len()).sum();
-    if j.window.is_empty() {
+    let window = shown(&j.window, now);
+    if window.is_empty() {
         out.push("No lines.".into());
     } else {
-        let shown = j.window.len().min(lines);
-        let head = if shown == j.window.len() {
-            format!("Lines ({shown}):")
+        let count = window.len().min(lines);
+        let head = if count == window.len() {
+            format!("Lines ({count}):")
         } else {
-            format!("Lines (the newest {shown} of {}):", j.window.len())
+            format!("Lines (the newest {count} of {}):", window.len())
         };
         out.push(head);
         out.extend(
-            j.window[j.window.len() - shown..]
+            window[window.len() - count..]
                 .iter()
                 .map(|l| format!("  {}", render_line(tree, l))),
         );
@@ -98,6 +100,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::error::Problem;
     use crate::ops::fixture::{john, now, p, zen};
@@ -118,6 +121,7 @@ mod tests {
                     path: path.clone(),
                     text: format!("Note {i}."),
                     speaker: None,
+                    terms: Terms::default(),
                 },
                 now().plus(i * 60),
             )

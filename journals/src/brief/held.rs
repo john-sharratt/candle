@@ -93,6 +93,7 @@ impl Held {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::Terms;
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
     use crate::path::Address;
@@ -112,6 +113,7 @@ mod tests {
                 path: p(path),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             at,
         )

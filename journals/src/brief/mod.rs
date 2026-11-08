@@ -126,6 +126,7 @@ pub fn due(tree: &Tree, now: Stamp) -> Vec<Job> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::ops::fixture::{john, p, zen};
     use crate::ops::{apply, OnTaken, Op};
@@ -141,6 +142,7 @@ mod tests {
                 path: p(path),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             at,
         )

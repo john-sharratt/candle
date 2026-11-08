@@ -83,6 +83,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::files::Role;
     use crate::ops::fixture::{john, now, p, zen};
@@ -113,6 +114,7 @@ mod tests {
             path: p(path),
             text: text.into(),
             speaker: None,
+            terms: Terms::default(),
         }
     }
 
