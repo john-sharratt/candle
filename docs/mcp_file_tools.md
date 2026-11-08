@@ -239,6 +239,15 @@ sign-in can produce — and `host/roles.yaml` grants it a role by that subject
 forwarded without its `Authorization` header, like the ops key's. It is a file
 only the service and the gateway read, never logged, never on a command line.
 
+**A service on a member, not the gateway's machine,** states the same
+identity without a key. npcd's drones call zend as Zen
+(`docs/zen_memory_and_guides.md` D8) over their member's cluster socket,
+where a member is trusted to name its caller as zend names one when it calls
+npcd: `x-tokera-user: service:zen`, `x-tokera-provider: service-key`, no
+email (`service_key::subject`). `host/roles.yaml` gives `service:zen` the
+role `user`, and the memory binds it to the person `zen` by its key alone
+(`docs/memory_backbone.md` §3.4).
+
 ### 4.1 A known hole: identity from loopback
 
 The daemons behind the gateway — yenbot among them, and keep's HTTP API on

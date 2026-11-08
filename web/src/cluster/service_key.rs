@@ -19,6 +19,14 @@ use crate::config::ServiceKeyConfig;
 /// The provider a service key's identity names.
 pub const SERVICE_PROVIDER: &str = "service-key";
 
+/// The subject of service `name`'s identity: `service:<name>`. A service
+/// calling from its own member over the cluster socket — npcd's drones, as
+/// `service:zen` — states the same identity in the forwarded headers, with no
+/// key, since a member is trusted on its socket.
+pub fn subject(name: &str) -> String {
+    format!("service:{name}")
+}
+
 /// One loaded service key.
 pub struct ServiceKey {
     key: BearerKey,
@@ -50,7 +58,7 @@ impl ServiceKey {
             key,
             identity: Identity {
                 provider: SERVICE_PROVIDER.into(),
-                sub: format!("service:{}", cfg.name),
+                sub: subject(&cfg.name),
                 email: String::new(),
                 name: cfg.name.clone(),
                 picture: String::new(),

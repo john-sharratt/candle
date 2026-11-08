@@ -294,7 +294,7 @@ pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
             let file = tree.person_file(person);
             let new_email = emails
                 .iter()
-                .any(|e| file.is_none_or(|f| f.accounts.iter().all(|a| &a.email != e)));
+                .any(|e| file.is_none_or(|f| f.accounts.iter().all(|a| a.email.as_ref() != Some(e))));
             let renames = name
                 .as_deref()
                 .map(str::trim)

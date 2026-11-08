@@ -430,7 +430,10 @@ fn an_admins_write_replays_as_an_admins() {
     b.sync().unwrap();
     let mut s = Store::open(&dir).unwrap();
     let p = s.tree().person_file(&slug("yen-nhi")).unwrap();
-    assert_eq!(p.accounts[0].email.as_str(), "yen.nhi@example.com");
+    assert_eq!(
+        p.accounts[0].email.as_ref().map(|e| e.as_str()),
+        Some("yen.nhi@example.com")
+    );
     let synced = s.sync().unwrap();
     assert_eq!(synced.dropped, vec![]);
     assert!(r
