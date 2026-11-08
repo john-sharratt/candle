@@ -126,7 +126,7 @@ use crate::mind::files::MindFiles;
 use crate::mind::{Mind, MindRepo};
 use crate::mind_store::{self, MindSource};
 use crate::model;
-use crate::npcs::{Casting, Npcs};
+use crate::npcs::{Casting, Npcs, SUSPENDED};
 use crate::opstore::MindStores;
 use crate::projection;
 use crate::sim::orders::{Notice, EVERY_POSTER};
@@ -3764,6 +3764,27 @@ impl Runtime {
         }
     }
 
+    /// Whether `npc`'s own record says it is suspended — asked as each turn
+    /// is about to begin, so no turn begins on the scheduler's copy of the
+    /// cast's suspensions alone. A character the record suspends that the copy
+    /// had missed is suspended there now, and its conversation let go, as
+    /// [`Self::follow_suspended`] would have done.
+    pub fn held_by_record(&self, npc: u64) -> bool {
+        let held = self
+            .npcs()
+            .is_some_and(|n| n.view().payload(npc).is_some_and(|p| p.state == SUSPENDED));
+        if held && self.scheduler.suspend(npc, true) {
+            let minds = self.minds.read().unwrap().clone();
+            let freed = minds.as_ref().is_some_and(|m| m.let_go(npc));
+            tracing::warn!(
+                npc,
+                freed,
+                "character suspended in its record but not held: held at its turn"
+            );
+        }
+        held
+    }
+
     /// The bodies in world `world` whose characters are suspended — the ones
     /// whose round missions' clocks stand still (`RoundState::hold`).
     pub fn suspended_bodies(&self, world: &str) -> BTreeSet<String> {
@@ -6474,6 +6495,13 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // world takes none**: the member it moves to runs its next one
             // (§9.3). Marked only from here, so a character waiting for an
             // engine is between turns and can be handed back meanwhile.
+            // **A suspended character takes no turn**, by its own record: the
+            // scheduler's copy of the cast's suspensions parks it between
+            // turns, and this is what holds it when that copy has not caught
+            // up. Held, it parks in `wait_due` until it is resumed.
+            if rt.held_by_record(id) {
+                continue;
+            }
             if !rt.standing.begin_turn(id) {
                 tokio::time::sleep(UNREADY_RETRY).await;
                 continue;
@@ -6833,12 +6861,71 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
 mod tests {
     use super::*;
     use crate::sim::shelf::Published;
+    use candle_conversation::persistence::record::{Modulation, NpcPayload};
     use serde_json::json;
 
     fn rt() -> Arc<Runtime> {
         // A temp path: the tests exercise scheduling, not persistence, and an
         // in-repo one would leave a ledger file behind.
         Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap()
+    }
+
+    /// One character's record in `state`, for a cast a test installs.
+    fn character(npc_id: u64, state: &str) -> NpcPayload {
+        NpcPayload {
+            npc_id,
+            owner_id: "u_1a2b3c4d".into(),
+            revision: 1,
+            created_ms: 0,
+            updated_ms: 0,
+            state: state.into(),
+            name: format!("npc {npc_id}"),
+            world_id: "battle-cities".into(),
+            personality_id: "commander".into(),
+            hidden: false,
+            heartbeat_ms: 120_000,
+            salience_gate: 0.5,
+            tags: Vec::new(),
+            persona_description: "A quartermaster.".into(),
+            persona_origin: "authored".into(),
+            portrait_image_id: None,
+            portrait_origin: None,
+            at: None,
+            mood: None,
+            suspended_from: None,
+            beliefs: Vec::new(),
+            relationships: Vec::new(),
+            agency: Vec::new(),
+            modulation: Modulation::default(),
+        }
+    }
+
+    /// **A character suspended in its record takes no turn, whatever the
+    /// scheduler's copy says.** The copy is brought to the records at install;
+    /// left behind them — as a member that missed a sync leaves it — the turn's
+    /// own look at the record holds the character, and the copy is put right.
+    /// A running character is not held.
+    #[test]
+    fn a_character_suspended_in_its_record_is_held_at_its_turn() {
+        let dir = std::env::temp_dir().join(format!("npcd-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let npcs = Npcs::load(&dir).unwrap();
+        npcs.import(vec![character(1, "suspended"), character(2, "idle")])
+            .unwrap();
+        let rt = rt();
+        rt.set_npcs(Arc::new(npcs));
+        rt.scheduler.wake(1, 0, 0);
+        rt.scheduler.wake(2, 0, 0);
+        assert!(rt.scheduler.is_suspended(1), "installed with the cast");
+
+        rt.scheduler.follow_suspended(HashSet::new());
+        assert!(!rt.scheduler.is_suspended(1), "the copy left behind");
+        assert!(rt.held_by_record(1));
+        assert!(rt.scheduler.is_suspended(1), "the copy put right");
+        assert!(!rt.held_by_record(2));
+        assert!(!rt.scheduler.is_suspended(2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── the effector device, enacted ────────────────────────────────────────

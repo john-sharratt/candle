@@ -68,9 +68,10 @@ impl Runtime {
             return;
         };
         let changed = npcs.refresh();
-        if !changed.is_empty() {
-            self.follow_suspended();
-        }
+        // Every pass, not only one that took records in: the scheduler's copy
+        // of the cast's suspensions is brought to the records whatever left it
+        // behind, and a pass in agreement changes nothing.
+        self.follow_suspended();
         let cast = npcs.view();
         for npc in changed {
             let living = cast.is_living(npc);
