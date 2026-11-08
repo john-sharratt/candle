@@ -249,6 +249,15 @@ impl ArenaKey {
             ArenaKind::Record { chunks, .. } => chunks as usize,
         }
     }
+
+    /// `class<bytes>` for a band key, `record<stride>` for a record key — the
+    /// names the occupancy dumps use.
+    pub fn label(&self) -> String {
+        match self.kind {
+            ArenaKind::Band => format!("class{}", self.class.bytes()),
+            ArenaKind::Record { stride, .. } => format!("record{stride}"),
+        }
+    }
 }
 
 // ==================== Storage Policy ====================
@@ -804,10 +813,7 @@ impl Arena {
         // A record arena labels itself as one. Reporting `class0` for it made it
         // indistinguishable from the smallest band class in every occupancy and region
         // dump — in a change whose point is making the span's ground accountable.
-        let what = match self.kind {
-            ArenaKind::Band => format!("class{}", self.class.bytes()),
-            ArenaKind::Record { stride, .. } => format!("record{stride}"),
-        };
+        let what = self.arena_key().label();
         #[cfg(feature = "cuda")]
         if let Some(region) = self.region.as_ref().map(RegionHandle::index) {
             return format!("{what} r{region}");

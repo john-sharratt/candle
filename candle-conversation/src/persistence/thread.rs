@@ -52,6 +52,7 @@ use heap_census::{enter, set_thread, Scope};
 use super::cold_load::preallocate_pinned_scratch;
 use super::flush::{FlushRequest, PassFlush};
 use super::held_groups::{drain_in_held_groups, HeldDrain};
+use super::reserve_log::log_reserve;
 use super::resume::TurnChunkGrid;
 use super::streams::StreamId;
 use super::transfer::seal_to_chunk_images;
@@ -1360,6 +1361,17 @@ fn run_pass(
             total_ms,
             "hot→warm pass timing"
         );
+    }
+    // The reserve this pass leaves standing, against the backlog it is sized
+    // from (`docs/kv_drain_under_pressure.md` §2b). Pools are shared across
+    // the model's layers, so the first backing's report is the whole model's.
+    // Written when the pass moved something or a class is still owed arenas,
+    // so an idle drain stays quiet.
+    if let Some(first) = backings.first() {
+        let report = first.owe_reserves();
+        if hot_to_warm_count > 0 || report.classes.iter().any(|c| c.owed_arenas > 0) {
+            log_reserve(&report, hot_to_warm_count, hot_to_warm_bytes, total_ms);
+        }
     }
     if hot_to_warm_count > 0 {
         relief_trace::note(

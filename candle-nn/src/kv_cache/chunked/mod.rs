@@ -99,6 +99,11 @@ pub mod region_runs;
 mod release_watch;
 #[cfg(feature = "cuda")]
 pub(crate) mod reservation;
+/// The free slots each reserve class holds, sized from the native backlog.
+/// Pure arithmetic, outside the `cuda` gate so it is tested anywhere; only the
+/// CUDA allocator sizes a reserve with it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+mod reserve_target;
 pub mod sampled_selection;
 pub mod seal_gather;
 mod selection_batches;
@@ -203,6 +208,8 @@ pub(crate) use types::{BlockTableState, ChunkWindow, SequenceState};
 pub use super::arena_table::ArenaLocation;
 
 pub use alloc::class_promotion_count;
+#[cfg(feature = "cuda")]
+pub use alloc::{ReserveClass, ReserveReport};
 #[cfg(feature = "cuda")]
 pub use bump_arena::{
     begin_forward, begin_guest, begin_wave, close_guest_arena, cover_wave_transient,

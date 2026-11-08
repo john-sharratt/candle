@@ -968,14 +968,16 @@ impl ArenaPool {
     /// its region is immediately available to *any* class — §3.8's first
     /// pressure response, with nothing to decide.
     ///
-    /// **A reserve class keeps one arena's worth free** (`keep_reserve`): an
-    /// empty arena is released only while the slots free across the class
-    /// would still fill a whole arena without it, and the highest-index empty
-    /// goes first, so the reserve that stays is the lowest — left in the span.
+    /// **A reserve class keeps its target free** (`reserve`, in slots, at
+    /// least one arena): an empty arena is released only while the class would
+    /// still hold its target free without it — and, above the one-arena floor,
+    /// one arena more, a hysteresis band so a target moving by a few slots
+    /// neither creates nor releases. The highest-index empty goes first, so the
+    /// reserve that stays is the lowest — left in the span.
     fn try_tombstone(
         &self,
         protected_arenas: &AHashSet<usize>,
-        keep_reserve: bool,
+        reserve: Option<usize>,
     ) -> Option<usize> {
         // Held across BOTH the emptiness test and the removal. Claims are gated
         // (`allocate_any` and friends take this before `tables.read()`), so with
@@ -1003,17 +1005,18 @@ impl ArenaPool {
         let empties = tables.iter().filter(|(idx, t)| {
             !t.creation_pending() && t.live_count() == 0 && !protected_arenas.contains(idx)
         });
-        let candidate = if keep_reserve {
-            let free: usize = tables
-                .values()
-                .map(|t| self.arena_chunks.saturating_sub(t.live_count()))
-                .sum();
-            if free.saturating_sub(self.arena_chunks) < self.arena_chunks {
-                return None;
+        let candidate = match reserve {
+            Some(target) => {
+                let free: usize = tables
+                    .values()
+                    .map(|t| self.arena_chunks.saturating_sub(t.live_count()))
+                    .sum();
+                if free.saturating_sub(self.arena_chunks) < keep_free(target, self.arena_chunks) {
+                    return None;
+                }
+                empties.map(|(&idx, _)| idx).max()?
             }
-            empties.map(|(&idx, _)| idx).max()?
-        } else {
-            empties.map(|(&idx, _)| idx).min()?
+            None => empties.map(|(&idx, _)| idx).min()?,
         };
         drop(tables);
 
@@ -1162,6 +1165,17 @@ pub struct EmptyCensus {
     pub protected: usize,
 }
 
+/// The free slots a reserve class keeps beyond the arena a sweep would
+/// release: its target, never below one arena (`arena`), with one arena more
+/// of hysteresis once the target is above that floor.
+fn keep_free(target: usize, arena: usize) -> usize {
+    if target > arena {
+        target + arena
+    } else {
+        arena
+    }
+}
+
 /// Internal state of the GID pool, partitioned by ArenaKey.
 struct GidPoolState {
     /// arena_idx → ArenaKey registry for routing/compaction bookkeeping.
@@ -1175,11 +1189,13 @@ struct GidPoolState {
     /// a demand that has not filled them yet (`docs/kv_drain_under_pressure.md`
     /// §2). Lifted once the demand arrives or is abandoned.
     protected_arenas: AHashSet<usize>,
-    /// The classes that keep a **reserve**: at least one arena's worth of
-    /// free slots, which the empty sweep never releases. A hot→warm migrate
-    /// into one of them always finds a destination without creating an arena,
-    /// which it cannot do while a wave is open.
-    reserve_keys: AHashSet<ArenaKey>,
+    /// The classes that keep a **reserve**, each with its target in free
+    /// slots (`docs/kv_drain_under_pressure.md` §2a): never less than one
+    /// arena's worth, grown with the native backlog the migrate has yet to
+    /// quantize. The empty sweep never takes a class below its target. A
+    /// hot→warm migrate into one of them finds its destination without
+    /// creating an arena, which it cannot do while a wave is open.
+    reserve_keys: AHashMap<ArenaKey, usize>,
 }
 
 /// Inner pool state.
@@ -1289,7 +1305,7 @@ impl ChunkGidPool {
                     next_arena_idx: 0,
                     free_arenas: VecDeque::with_capacity(16),
                     protected_arenas: AHashSet::with_capacity(32),
-                    reserve_keys: AHashSet::with_capacity(16),
+                    reserve_keys: AHashMap::with_capacity(16),
                 }),
                 may_have_reclaimable: AtomicBool::new(false),
             }),
@@ -1302,11 +1318,18 @@ impl ChunkGidPool {
         state.protected_arenas.insert(arena_idx);
     }
 
-    /// Keep a reserve for `key`: one arena's worth of free slots the empty
-    /// sweep never releases ([`ArenaPool::try_tombstone`]).
+    /// Keep a reserve for `key`, at its floor of one arena's worth of free
+    /// slots until a target is set ([`Self::set_reserve_target`]).
     pub fn keep_reserve(&self, key: ArenaKey) {
         let mut state = self.inner.metadata.lock().unwrap();
-        state.reserve_keys.insert(key);
+        state.reserve_keys.entry(key).or_insert(0);
+    }
+
+    /// Set `key`'s reserve target in free slots; below one arena it is held
+    /// at that floor. Keeps a reserve for `key` if it kept none.
+    pub fn set_reserve_target(&self, key: ArenaKey, slots: usize) {
+        let mut state = self.inner.metadata.lock().unwrap();
+        state.reserve_keys.insert(key, slots);
     }
 
     /// Keep no reserve for any class — for a backing whose classes were named
@@ -1319,7 +1342,23 @@ impl ChunkGidPool {
     /// The classes that keep a reserve.
     pub fn reserve_keys(&self) -> Vec<ArenaKey> {
         let state = self.inner.metadata.lock().unwrap();
-        state.reserve_keys.iter().copied().collect()
+        state.reserve_keys.keys().copied().collect()
+    }
+
+    /// The free slots `key`'s reserve holds: its target, never below one
+    /// arena's worth; `None` for a class that keeps no reserve.
+    pub fn reserve_target(&self, key: ArenaKey) -> Option<usize> {
+        let state = self.inner.metadata.lock().unwrap();
+        let arena = key.chunks();
+        state.reserve_keys.get(&key).map(|&t| t.max(arena))
+    }
+
+    /// Slots live across `key`'s arenas — one atomic read.
+    pub fn live_slots(&self, key: ArenaKey) -> usize {
+        self.inner
+            .pools
+            .get(&key)
+            .map_or(0, |pool| pool.total_live())
     }
 
     /// Slots free across `key`'s arenas.
@@ -1594,8 +1633,8 @@ impl ChunkGidPool {
     pub fn next_tombstone(&self, key: ArenaKey) -> Option<usize> {
         let mut state = self.inner.metadata.lock().unwrap();
         let pool = self.inner.pools.get(&key)?;
-        let keep_reserve = state.reserve_keys.contains(&key);
-        let arena_idx = pool.try_tombstone(&state.protected_arenas, keep_reserve)?;
+        let reserve = state.reserve_keys.get(&key).copied();
+        let arena_idx = pool.try_tombstone(&state.protected_arenas, reserve)?;
         state.arena_registry[arena_idx] = None;
         Some(arena_idx)
     }
@@ -1936,6 +1975,35 @@ mod tests {
         drop(held);
         assert!(pool.next_tombstone(key).is_some(), "both empty: one may go");
         assert_eq!(pool.next_tombstone(key), None, "and one stays");
+    }
+
+    /// **A target above the floor holds that many slots free, with one arena
+    /// of hysteresis**: at a three-arena target, five empty arenas sweep down
+    /// to four — the target plus the band — and no lower; at the floor the
+    /// band is gone and the class sweeps to one.
+    #[test]
+    fn a_reserve_target_holds_its_slots_free_with_one_arena_of_hysteresis() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let arena = test_arena_chunks();
+        pool.set_reserve_target(key, 3 * arena);
+        assert_eq!(pool.reserve_target(key), Some(3 * arena));
+        for _ in 0..5 {
+            standing_arena(&pool, key);
+        }
+        let first = pool.next_tombstone(key).expect("five over a band of four");
+        pool.recycle_arena_index(first);
+        assert_eq!(pool.next_tombstone(key), None, "target plus the band stays");
+        assert_eq!(pool.free_slots(key), 4 * arena);
+
+        pool.set_reserve_target(key, 0);
+        assert_eq!(pool.reserve_target(key), Some(arena), "held at the floor");
+        for _ in 0..3 {
+            let idx = pool.next_tombstone(key).expect("above the floor");
+            pool.recycle_arena_index(idx);
+        }
+        assert_eq!(pool.next_tombstone(key), None, "one arena stays");
+        assert_eq!(pool.free_slots(key), arena);
     }
 
     /// **No reserve is kept once cleared**, for a backing that no longer

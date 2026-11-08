@@ -81,6 +81,7 @@ pub mod replica;
 #[cfg(test)]
 mod replica_tests;
 pub mod replication_load;
+mod reserve_log;
 pub mod resume;
 pub mod retired;
 pub mod rewritten;

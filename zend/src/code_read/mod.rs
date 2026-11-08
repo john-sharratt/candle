@@ -25,6 +25,7 @@
 //! engine wave-batches together.
 
 pub mod binary_mark;
+mod ingest_rate;
 mod lines;
 mod link;
 
@@ -1070,6 +1071,7 @@ fn process_one_file(
         return Ok(());
     }
     ctx.retrieval.mark_stale();
+    ingest_rate::note_committed();
 
     // Deferred tombstone ACTIVATES, now that the new generation is committed.
     if !superseded.is_empty() {

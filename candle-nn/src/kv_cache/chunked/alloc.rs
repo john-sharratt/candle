@@ -28,6 +28,8 @@ use super::gid_pool::ChunkGid;
 use super::head_gids::HeadGids;
 #[cfg(feature = "cuda")]
 use super::region_pool;
+#[cfg(feature = "cuda")]
+use super::reserve_target::{reserve_targets, RESERVE_CAP_PERCENT};
 use super::size_class::{elems_per_chunk, SizeClass};
 use super::types::{ChunkWindow, DecodeLayout, CHUNK_SIZE};
 use super::write_placement::appended_tokens;
@@ -189,6 +191,12 @@ impl ChunkedKvBacking {
             }
         }
 
+        // Every quantized chunk the migrate makes takes a record slot too, and
+        // records are device-only.
+        if location == ArenaLocation::Gpu {
+            push_unique_key(&mut keys, self.record_layout()?.key);
+        }
+
         for key in keys {
             self.inner.pool.keep_reserve(key);
             let arena_idx = self.inner.pool.register_arena(key);
@@ -227,6 +235,54 @@ impl ChunkedKvBacking {
 
     pub(super) fn create_arena(&self, key: ArenaKey, index: usize) -> Result<Arena> {
         self.inner.create_arena(key, index)
+    }
+}
+
+/// One reserve class as [`BackingInner::owe_reserves`] last set it.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReserveClass {
+    pub key: ArenaKey,
+    /// Free slots the class holds.
+    pub target_slots: usize,
+    /// Free slots it held when the target was set.
+    pub free_slots: usize,
+    /// Arenas owed to it, for the gap to create.
+    pub owed_arenas: usize,
+    /// Its live slots over all live quant band slots.
+    pub factor: f64,
+    /// The backlog asked for more than its share of the cap.
+    pub capped: bool,
+}
+
+/// What [`BackingInner::owe_reserves`] set: the native backlog it sized from,
+/// the cap, and every reserve class (`docs/kv_drain_under_pressure.md` §2b).
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReserveReport {
+    /// Live native (R16/F16) slots, the migrate's backlog.
+    pub pending_slots: usize,
+    pub pending_bytes: usize,
+    /// Free bytes the reserve may hold across every class.
+    pub cap_bytes: usize,
+    /// The KV ground the cap is a share of.
+    pub kv_bytes: usize,
+    pub classes: Vec<ReserveClass>,
+}
+
+#[cfg(feature = "cuda")]
+impl ReserveReport {
+    /// Free bytes the reserve classes hold now.
+    pub fn free_bytes(&self) -> usize {
+        self.classes
+            .iter()
+            .map(|c| c.free_slots * c.key.slot_stride())
+            .sum()
+    }
+
+    /// Whether `key`'s reserve was at its cap.
+    pub fn capped(&self, key: ArenaKey) -> bool {
+        self.classes.iter().any(|c| c.key == key && c.capped)
     }
 }
 
@@ -400,32 +456,152 @@ impl BackingInner {
             return;
         };
         for &(key, slots) in demand {
-            let free: usize = self
-                .pool
-                .pool_arena_load(key)
-                .iter()
-                .map(|&(_, capacity, live)| capacity.saturating_sub(live))
-                .sum();
+            let free = self.pool.free_slots(key);
             let owed = pending.iter().filter(|k| **k == key).count();
-            for _ in 0..more_arenas_owed(slots, free, key.chunks(), owed) {
+            let more = more_arenas_owed(slots, free, key.chunks(), owed);
+            for _ in 0..more {
                 pending.push(key);
+            }
+            if slots <= free {
+                continue;
+            }
+            // A shortfall the reserve was sized to cover is a sizing or
+            // replenishing bug; one past its target is demand beyond the cap.
+            let target = self.pool.reserve_target(key);
+            let covered = target.is_some_and(|t| slots <= t);
+            macro_rules! short {
+                ($level:ident) => {
+                    tracing::$level!(
+                        target: "candle_conversation::kv_reserve",
+                        class = %key.label(),
+                        needed_slots = slots,
+                        free_slots = free,
+                        target_slots = target.unwrap_or(0),
+                        arenas_owed = more,
+                        "kv_reserve: quantize deferred short of {} slots of {}{}",
+                        slots - free,
+                        key.label(),
+                        if covered { " — inside its reserve target" } else { "" },
+                    )
+                };
+            }
+            if covered {
+                short!(warn);
+            } else {
+                short!(info);
             }
         }
     }
 
-    /// Owe an arena to every reserve class whose free slots have fallen below
-    /// one arena's worth — a migrate's destination taken mid-wave, to be
-    /// replaced in the gap (`docs/kv_drain_under_pressure.md` §2).
+    /// **Size every reserve to the native backlog and owe what each falls
+    /// short** (`docs/kv_drain_under_pressure.md` §2a). The live native
+    /// (R16/F16) slots are the hot→warm migrate's backlog; each quant class's
+    /// target is its share of it by the quant mix VRAM holds now
+    /// ([`reserve_targets`]), never below one arena and held to
+    /// [`RESERVE_CAP_PERCENT`] of the KV ground. A class whose free slots fall
+    /// below its target is owed the shortfall in whole arenas, which the gap
+    /// creates; a target that falls lets the empty sweep release down to it
+    /// (`ChunkGidPool::set_reserve_target`). The native classes keep their
+    /// one-arena floor — the migrate never writes them.
+    ///
+    /// Answers what it set, for the persistence pass's `kv_reserve` line.
     #[cfg(feature = "cuda")]
-    pub(super) fn owe_reserves(&self) {
-        for key in self.pool.reserve_keys() {
-            if key.location != self.hot_location() {
-                continue;
+    pub(super) fn owe_reserves(&self) -> ReserveReport {
+        let hot = self.hot_location();
+        let natives: Vec<ArenaKey> = [
+            KvFormat::Float(DType::F16),
+            KvFormat::Quantized(QuantFormat::R16),
+        ]
+        .into_iter()
+        .filter_map(|fmt| self.arena_key_for(fmt, hot).ok())
+        .fold(Vec::new(), |mut keys, key| {
+            push_unique_key(&mut keys, key);
+            keys
+        });
+        let pending_slots: usize = natives.iter().map(|&k| self.pool.live_slots(k)).sum();
+        let pending_bytes: usize = natives
+            .iter()
+            .map(|&k| self.pool.live_slots(k) * k.slot_stride())
+            .sum();
+        let classes: Vec<(ArenaKey, usize)> = self
+            .pool
+            .reserve_keys()
+            .into_iter()
+            .filter(|k| k.location == hot && !natives.contains(k))
+            .map(|k| (k, self.pool.live_slots(k)))
+            .collect();
+        let kv_bytes = match self.device.location() {
+            candle::DeviceLocation::Cuda { gpu_id } => {
+                region_pool::region_stats(gpu_id).map_or(0, |s| s.total * region_pool::REGION_BYTES)
             }
-            if self.pool.free_slots(key) < key.chunks() {
-                self.note_deferred_arena(key);
+            _ => 0,
+        };
+        let cap_bytes = kv_bytes / 100 * RESERVE_CAP_PERCENT;
+        let targets = reserve_targets(pending_slots, &classes, cap_bytes);
+
+        let Ok(mut owed_list) = self.deferred_arenas.lock() else {
+            return ReserveReport::default();
+        };
+        let mut report = ReserveReport {
+            pending_slots,
+            pending_bytes,
+            cap_bytes,
+            kv_bytes,
+            classes: Vec::with_capacity(targets.len() + natives.len()),
+        };
+        let mut owe = |key: ArenaKey, target: usize, factor: f64, capped: bool| {
+            let before = self.pool.reserve_target(key).unwrap_or(0);
+            self.pool.set_reserve_target(key, target);
+            let free = self.pool.free_slots(key);
+            let owed = owed_list.iter().filter(|k| **k == key).count();
+            let more = more_arenas_owed(target, free, key.chunks(), owed);
+            for _ in 0..more {
+                owed_list.push(key);
+            }
+            let per = key.chunks().max(1);
+            let (was, now) = (before.div_ceil(per), target.div_ceil(per));
+            if more > 0 || was != now {
+                let reason = if capped {
+                    "capped"
+                } else if now < was {
+                    "drained"
+                } else {
+                    "backlog"
+                };
+                tracing::info!(
+                    target: "candle_conversation::kv_reserve",
+                    class = %key.label(),
+                    arenas_owed = more,
+                    target_arenas_before = was,
+                    target_arenas = now,
+                    target_slots = target,
+                    free_slots = free,
+                    factor,
+                    reason,
+                    "kv_reserve: {} ({} -> {} arenas)",
+                    if now < was { "shrink" } else { "grow" },
+                    was,
+                    now,
+                );
+            }
+            report.classes.push(ReserveClass {
+                key,
+                target_slots: target,
+                free_slots: free,
+                owed_arenas: owed + more,
+                factor,
+                capped,
+            });
+        };
+        for t in targets {
+            owe(t.key, t.slots, t.factor, t.capped);
+        }
+        for key in natives {
+            if self.pool.reserve_target(key).is_some() {
+                owe(key, key.chunks(), 0.0, false);
             }
         }
+        report
     }
 
     /// Lift the protection of each arena made ahead of demand that the
@@ -996,6 +1172,15 @@ impl ChunkedKvBacking {
     #[cfg(feature = "cuda")]
     pub fn create_deferred_arenas(&self) -> Result<usize> {
         self.inner.create_deferred_arenas()
+    }
+
+    /// Size every reserve to the native backlog, owe what each falls short,
+    /// and answer what was set — see [`BackingInner::owe_reserves`]. The gap's
+    /// [`Self::create_deferred_arenas`] does the same first; the persistence
+    /// pass calls this for its `kv_reserve` line.
+    #[cfg(feature = "cuda")]
+    pub fn owe_reserves(&self) -> ReserveReport {
+        self.inner.owe_reserves()
     }
 
     /// Whether a refused pass is still owed an arena here — `false` once the

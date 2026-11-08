@@ -166,8 +166,24 @@ target(c)   = clamp( ceil(pending × factor(c)),
   already hold. One counter read, no scan. A hot copy kept beside its warm
   copy (a conversation still active) counts too, so `pending` can overstate
   the backlog. `RESERVE_CAP` bounds what that costs.
-- **`RESERVE_CAP`** = 25% of the KV reservation, so a burst never hands the
-  whole card to free slots.
+- **`RESERVE_CAP_PERCENT`** = 25% of the KV regions (`region_stats().total`,
+  the ground below `weight_floor`), so a burst never hands the whole card to
+  free slots.
+- **The record class** is the backing's one record key
+  (`record_layout().key`). Every quantized chunk takes one record, so the
+  records' share is their live slots over the live band slots, as above.
+- **The destinations are transient.** The migrate quantizes into GPU Q arenas,
+  copies them to warm, and the install drops the hot copy. So one pass needs
+  about one group's worth of destination slots, while `pending × factor`
+  sizes for the whole backlog. The cap bounds the difference, and what is
+  over-reserved is returned by the sweep as the backlog drains.
+
+**Where it lives.** The arithmetic is `chunked/reserve_target.rs`
+(`reserve_targets`), and it is pure and tested on its own. The pool holds each
+class's target (`ChunkGidPool::set_reserve_target`), and
+`BackingInner::owe_reserves` sets the targets and owes the shortfall at the
+top of every `create_deferred_arenas`. The native classes keep their one-arena
+floor because the migrate never writes them.
 
 **Grows at the gap, shrinks under the sweep, never thrashes.**
 - **Grow.** `owe_reserves` owes class c an arena whenever
@@ -185,25 +201,36 @@ target's floor. It is one rule, not two.
 
 ## 2b. Logging for the next attempt
 
-Everything below goes to `candle_conversation::kv_reserve` at INFO, once per
-persistence pass, and at WARN on the events marked:
+Everything below goes to `candle_conversation::kv_reserve` at INFO, and at
+WARN on the event marked:
 
-1. **Reserve line, per backing:** `pending` native slots and MiB, and per class
-   `target`, `free`, `owed` and the measured `factor`. With that line the
-   factor is a number in the log, not an assumption, and the design can be
-   checked against it.
-2. **Grow and shrink events:** the class, how many arenas, the target before
-   and after, and the reason (`backlog`, `drained`, `capped`).
-3. **The quantize deferral** (`quantize deferred`), now with the class, the
-   slots the group needed, the slots free, and whether the reserve was at its
-   cap. WARN if the reserve was not at its cap: the reserve should have
-   covered it, so that is a sizing bug.
-4. **Migrate progress:** slots moved hot→warm this pass, per class, plus pass
-   time, so the drain rate is a number rather than an inference.
-5. **Region accounting:** reserve arenas and slots against the KV reservation,
-   with the cap, so a reserve crowding the card is visible.
-6. **Ingest rate:** `code_read` logs files completed per 5-minute window,
-   once per window. A rate then needs no grep over per-file DEBUG lines.
+1. **`kv_reserve: pass`**, once per persistence pass that moved something or
+   left a class owed (`persistence/reserve_log.rs`). It carries:
+   - `pending_slots` and `pending_mib`;
+   - `classes`, one field per class: `label:target/free+owed@factor`, with a
+     `!` when the class is held at its cap.
+
+   With that line the factor is a number in the log, not an assumption, and
+   the design can be checked against it.
+2. **Grow and shrink events** (`kv_reserve: grow` / `shrink`, from
+   `owe_reserves`). They fire when a class's target crosses a whole arena or
+   it is owed arenas. Each names the class, the arenas owed, the target in
+   arenas before and after, and the reason: `backlog`, `drained` or `capped`.
+3. **The quantize deferral** (`kv_reserve: quantize deferred short of …`, from
+   `owe_capacity`). It names the class, the slots the layer needed, the slots
+   free, the class's target and the arenas owed. It is a WARN when the need
+   was inside the class's reserve target: the reserve was sized to cover it
+   and did not, so that is a sizing or replenishing bug. A need past the target
+   is demand beyond the cap, and is logged at INFO.
+4. **Migrate progress**, on the pass line: `moved_residences`, `moved_mib` and
+   `pass_ms`. The drain per class is the change in `free` between two pass
+   lines.
+5. **Region accounting**, on the pass line: `reserve_free_mib` against
+   `cap_mib` and `kv_mib`, so a reserve crowding the card is visible.
+6. **Ingest rate:** `code_read: N file(s) read in S s`
+   (`zend::code_read::ingest`, `code_read/ingest_rate.rs`). It is written once
+   per 5-minute window and carries `files_per_min`. A window closes at the
+   first commit past its length, so a quiet spell is one long window.
 
 ## 3. Compaction and migration: pool-grained, and neither waits
 
