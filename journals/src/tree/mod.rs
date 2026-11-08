@@ -15,6 +15,7 @@
 pub mod accounts;
 pub mod check;
 pub mod children;
+pub mod compare;
 pub mod fingerprint;
 pub mod journal;
 pub mod load;

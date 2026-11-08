@@ -30,11 +30,11 @@ the context over on whatever tool the model calls first.
 
 | Piece | Where | What |
 |---|---|---|
-| The user's memory, `~` and `@group` | zend | The memory backbone's tree (`docs/memory_backbone.md`): the person's own journals and their groups', beside every thread's and project's. Needs no attach. |
-| `journal_note` / `journal_read` / `journal_grep` on a memory path | zend | The journal tools take `~/…` and `@group/…` beside `T:` and `P:`. |
+| The user's memory, `@group` | zend | The memory backbone's tree (`docs/memory_backbone.md`): each group's master, its people, topics and conversations, and `here`, beside every thread's and project's journal. Needs no attach. |
+| `journal_note` / `journal_read` / `journal_grep` on a memory path | zend | The journal tools take `@group/…`, a bare path in the conversation's group, and `here`, beside `T:` and `P:`. A memory note takes its terms: `by`, `source`, `expires`, `replaces` (`docs/zen_memory_and_guides.md` Phase 2). |
 | `journal_forget {journal, says}` | zend | Removes the one line of a memory journal that says `says`. Thread and project journals stay append-only. |
 | `get_user_context` | zend, decorated by the aggregator | The conversation's frame: its own journal, each above it, the person, each group they frame — within the client's budget. The aggregator puts the client's guide in front of it. |
-| `user_episode_note` | zend, called by the aggregator only | Records one episode on the conversation's journal: a tool call that did something. In no listing; the aggregator refuses it from a client. |
+| `user_episode_note` | zend, called by the aggregator only | Records a tool call that did something on the conversation's `journal.yaml`, its `activity` — never a line of its own. In no listing; the aggregator refuses it from a client. |
 | `readOnlyHint` | zend, npcd | The MCP annotation on every tool that only reads: what the aggregator tells an episode by. |
 | The client's guide | aggregator (`clients:` in a guide's frontmatter) | The client's "system prompt addition": how to work with the user there — in the car, spoken answers. |
 | Context on the first call | aggregator | The first call of a conversation, whatever tool it is, carries the user context after its own answer. |
@@ -42,18 +42,19 @@ the context over on whatever tool the model calls first.
 
 ### 2.1 The user's memory
 
-The memory is the backbone's tree (`docs/memory_backbone.md` §2): the person's
-own journals under `~` — their profile, a journal per client and per
-conversation, the people in their life — and each group's under `@<group>`.
-Its lines are of two kinds, set by who writes:
+The memory is the backbone's tree (`docs/memory_backbone.md` §2): each group
+under `@<group>` — its master, its people, its topics, a journal per
+conversation, and `here`, this conversation's. What it holds:
 
 - **notes** — a fact the model was asked to keep, or judged worth keeping:
   "the cat's name is Miso", "prefers watercolour". Written with
-  `journal_note {journal: "~", text}` from any client, or onto a group's journal
-  every member reads. Removed only by `journal_forget`, which names a line by
-  what it says or by its address.
-- **episodes** — one tool call that changed something, recorded by the server
-  (§2.3) on the conversation's own journal.
+  `journal_note {journal, text}` from any client onto the journal it belongs to,
+  with its terms — whether the model concluded it rather than heard it, its
+  source, when it expires, the line it replaces. Removed only by
+  `journal_forget`, which names a line by what it says or by its address.
+- **activity** — each tool call that changed something, recorded by the
+  server (§2.3) on the conversation's `journal.yaml`: kept for where the
+  conversation left off, never a line, never ingested.
 
 Each line records who wrote it, for whom and through which client, which is
 what lets the context put this client's history first.
@@ -72,7 +73,7 @@ the client's guide (§2.4) in front of it. The tool's description says to call
 it before answering anything from the user, especially anything that assumes
 shared history ("again", "last time", "my").
 
-### 2.3 Episodes
+### 2.3 Activity
 
 After a backend call answers without error, the aggregator records it with
 `user_episode_note {tool, summary}` on the backend that answers
@@ -82,6 +83,14 @@ name), cut at 160 characters. The client is the one the call came from. A
 record refused — zend restarting, its model still loading — is tried again
 every 30 seconds, twelve times, which outlasts a model reload: a picture
 drawn while zend is down is still remembered once it is back.
+
+zend keeps it on the conversation's `journal.yaml` as `activity` — the tool,
+the time, the subject cut at 120 characters — the newest 200, older ones
+counted per tool in `activity_before`. It is not a line, so a conversation's
+window holds only what was said and decided, and nothing of it is ingested:
+the branch walk reads no conversation's journal (`docs/zen_memory_and_guides.md`
+D3). Before a conversation's summary is built, the next conversation's
+"last time" is its newest three calls.
 
 Not recorded: a tool its listing marks `annotations.readOnlyHint` — the MCP
 annotation every tool that only reads carries, in zend and npcd alike; an

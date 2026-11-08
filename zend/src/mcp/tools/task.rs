@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use super::wait::answer_for;
 use super::{string, wait_secs, Answer, Ctx};
+use crate::mcp::driven::Driven;
 use crate::mcp::roles::WorkerKind;
 use crate::mcp::threads::{Effort, Priority};
 use crate::mcp::workers;
@@ -40,6 +41,7 @@ pub fn definition() -> Value {
                 "role": {"type": "string", "enum": ["coder", "researcher", "reviewer"], "description": "The kind of work it does, which puts that kind's working rules in its system prompt: `coder` by default, for changing code; `researcher` to answer a question from evidence; `reviewer` to read a change and report what is wrong with it."},
                 "priority": {"type": "string", "enum": ["normal", "high"], "description": "How soon its turns decode — scheduling only, not how hard it thinks: today both decode at the top band beside a live dialogue, since someone is waiting on the task; `normal` is the default."},
                 "effort": {"type": "string", "enum": ["balanced", "deep", "exhaustive"], "description": "How hard it thinks (`deep` by default). `exhaustive` for work that must weigh many sources or results against each other — research that reconciles what it fetched, a review that cross-checks findings — where catching a contradiction takes thought; `balanced` for routine, mechanical tasks."},
+                "driven": {"type": "string", "enum": ["attended", "alone"], "description": "Whether you stay with it: `attended` — you wait on it, answer its questions and check its result; `alone` — nobody will, so it decides within its brief, lands its own result and leaves what needs the user's approval pending. Grok's tasks are `alone` unless it says otherwise; every other client's `attended`."},
                 "wait_s": {"type": "integer", "minimum": 0, "maximum": 3600, "description": "Seconds to wait for it to settle before answering that it runs; 45 by default."}
             },
             "required": ["thread", "name", "prompt"],
@@ -69,13 +71,17 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(k) => k,
         Err(e) => return Answer::error(e),
     };
+    let driven = match Driven::of(args.get("driven").and_then(Value::as_str), ctx.mcp.client) {
+        Ok(d) => d,
+        Err(e) => return Answer::error(e),
+    };
     let worker = match workers::start(
         &ctx.session,
         &ctx.caller,
         thread,
         name,
         prompt,
-        (priority, effort, kind),
+        (priority, effort, kind, driven),
         false,
         None,
     ) {

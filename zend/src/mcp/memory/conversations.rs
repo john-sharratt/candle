@@ -7,10 +7,12 @@
 //!
 //! A conversation is a session's calls, for as long as the session lasts —
 //! the aggregator's own boundary (`docs/mcp_user_context.md` §2.5). Every
-//! memory call of a session moves its clock on. A session this process has
-//! not seen — a new conversation, or one carried here by a restart or from
-//! another member — begins a conversation of its own: two conversations are
-//! never written onto one.
+//! memory call of a session moves its clock on. The journal a session opened
+//! is kept in a replicated record, `mcp/conversation/<group>/<session digest>`
+//! (`docs/zen_memory_and_guides.md` Phase 2), so a call carried to another
+//! member, or here after a restart, goes on writing it; a session no record
+//! names begins a conversation of its own. This process keeps what it has
+//! seen in memory too, so a call it has seen reads no record.
 //!
 //! Grok opens a session for every call it makes, so its calls are followed
 //! by the person and group instead ([`followed_by`]): a drive is one
@@ -20,13 +22,34 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use journals::actor::Actor;
+use journals::ops::wire::path_from_wire;
 use journals::ops::{OnTaken, Op};
 use journals::path::JournalPath;
 use journals::scope::{conversation_name, Channel, Section};
 use journals::slug::Slug;
 use journals::time::Stamp;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::{held, Memory};
+use crate::mcp::records::Records;
+
+/// What every session's record of its journal is kept under.
+const RECORD_PREFIX: &str = "mcp/conversation/";
+
+/// The record naming the journal `session` opened in `group`: the session
+/// kept by a digest, so no session id is written into a key.
+fn record_key(group: &Slug, session: &str) -> String {
+    let digest = Sha256::digest(session.as_bytes());
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{RECORD_PREFIX}{group}/{hex}")
+}
+
+/// The journal `records` say `session` opened in `group`, when they say one.
+fn recorded(records: &dyn Records, group: &Slug, session: &str) -> Option<JournalPath> {
+    let folder = records.get(&record_key(group, session))?;
+    path_from_wire(folder.as_str()?).ok()
+}
 
 /// The sessions remembered; past this, the idlest are let go.
 const KEPT: usize = 4_096;
@@ -115,12 +138,13 @@ pub fn reserve(at: Stamp, channel: Channel, taken: &BTreeSet<Slug>) -> Slug {
     name_at(at, channel).numbered(taken)
 }
 
-/// Where `session`'s conversation in `group` stands: its journal, or — when
-/// nothing has written to it — the moment it began and the name it reserved,
-/// begun now when this is its first call. Writes nothing; the session's
-/// clock moves on.
+/// Where `session`'s conversation in `group` stands: its journal — as this
+/// process kept it, or as `records` name it — or, when nothing has written to
+/// it, the moment it began and the name it reserved, begun now when this is
+/// its first call. Writes nothing; the session's clock moves on.
 fn kept(
     memory: &Memory,
+    records: Option<&dyn Records>,
     group: &Slug,
     channel: Channel,
     session: &str,
@@ -128,17 +152,24 @@ fn kept(
 ) -> Result<Kept, String> {
     let tree = memory.tree()?;
     let mut sessions = held(&memory.conversations.sessions);
+    let found = |p: &JournalPath| p.group() == group && tree.get(p).is_some();
     let kept = match sessions.get(session) {
-        Some(Kept::Open(p)) if p.group() == group && tree.get(p).is_some() => Kept::Open(p.clone()),
+        Some(Kept::Open(p)) if found(p) => Kept::Open(p.clone()),
         Some(Kept::Begun(at, name)) => Kept::Begun(*at, name.clone()),
-        _ => {
-            let mut taken: BTreeSet<Slug> = tree
-                .get(&section(group))
-                .map(|j| j.children.keys().cloned().collect())
-                .unwrap_or_default();
-            taken.extend(sessions.reserved().cloned());
-            Kept::Begun(now, reserve(now, channel, &taken))
-        }
+        _ => match records
+            .and_then(|r| recorded(r, group, session))
+            .filter(found)
+        {
+            Some(p) => Kept::Open(p),
+            None => {
+                let mut taken: BTreeSet<Slug> = tree
+                    .get(&section(group))
+                    .map(|j| j.children.keys().cloned().collect())
+                    .unwrap_or_default();
+                taken.extend(sessions.reserved().cloned());
+                Kept::Begun(now, reserve(now, channel, &taken))
+            }
+        },
     };
     sessions.keep(session, kept.clone(), now);
     Ok(kept)
@@ -148,20 +179,23 @@ fn kept(
 /// sees it: opened, or the one its first write opens. Writes nothing.
 pub fn here(
     memory: &Memory,
+    records: Option<&dyn Records>,
     group: &Slug,
     channel: Channel,
     session: &str,
 ) -> Result<JournalPath, String> {
-    match kept(memory, group, channel, session, Stamp::now())? {
+    match kept(memory, records, group, channel, session, Stamp::now())? {
         Kept::Open(p) => Ok(p),
         Kept::Begun(_, name) => section(group).child(name).map_err(|e| e.to_string()),
     }
 }
 
 /// The journal of `session`'s conversation in `group`, opened now when this
-/// is the conversation's first write, under the name its reads were given.
+/// is the conversation's first write, under the name its reads were given,
+/// and named in `records` for every member.
 pub fn open(
     memory: &Memory,
+    records: Option<&dyn Records>,
     person: &Slug,
     group: &Slug,
     channel: Channel,
@@ -169,7 +203,7 @@ pub fn open(
 ) -> Result<JournalPath, String> {
     let _opening = held(&memory.conversations.opening);
     let now = Stamp::now();
-    let (began, name) = match kept(memory, group, channel, session, now)? {
+    let (began, name) = match kept(memory, records, group, channel, session, now)? {
         Kept::Open(p) => return Ok(p),
         Kept::Begun(at, name) => (at, name),
     };
@@ -193,12 +227,18 @@ pub fn open(
         .created
         .expect("create makes a journal");
     held(&memory.conversations.sessions).keep(session, Kept::Open(path.clone()), now);
+    if let Some(r) = records {
+        if let Err(e) = r.put(&record_key(group, session), Value::String(path.folder())) {
+            tracing::warn!(%path, "journals: this conversation's journal was not recorded for the other members: {e}");
+        }
+    }
     Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::records::MemRecords;
 
     fn zen() -> Slug {
         Slug::parse("zen").unwrap()
@@ -272,6 +312,29 @@ mod tests {
         s.keep("b", Kept::Open(section(&zen())), began);
         let reserved: Vec<&str> = s.reserved().map(Slug::as_str).collect();
         assert_eq!(reserved, ["2026-10-31-0712-grok"]);
+    }
+
+    /// **A session's journal is found by its record where this process never
+    /// saw it**, keyed by a digest that writes no session id; a record naming
+    /// another group's journal, or none, is no find.
+    #[test]
+    fn a_sessions_journal_is_found_by_its_record() {
+        let records = MemRecords::default();
+        let key = record_key(&zen(), "session-1");
+        assert!(key.starts_with("mcp/conversation/zen/") && key.len() == 21 + 16);
+        assert!(!key.contains("session-1"));
+        assert_eq!(recorded(&records, &zen(), "session-1"), None);
+        records
+            .put(
+                &key,
+                Value::String("groups/zen/conversations/2026-11-08-0308-claude-code".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded(&records, &zen(), "session-1").map(|p| p.show()),
+            Some("@zen/conversations/2026-11-08-0308-claude-code".to_string())
+        );
+        assert_eq!(recorded(&records, &zen(), "session-2"), None);
     }
 
     #[test]

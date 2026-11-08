@@ -2,6 +2,7 @@
 //! its references, focus and summary, each entry's own file, `person.yaml`,
 //! `group.yaml`, and the README each group's folder opens with.
 
+pub mod activity;
 pub mod entry;
 pub mod focus;
 pub mod group;

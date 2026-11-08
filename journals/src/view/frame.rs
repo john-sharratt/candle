@@ -196,8 +196,12 @@ fn people_lines(tree: &Tree, group: &Slug) -> Vec<String> {
     lines.into_iter().map(|(_, l)| l).collect()
 }
 
-/// The conversation before `here` on the same channel that has a summary:
-/// where a conversation on that client picks up.
+/// The newest calls a conversation's activity names before its summary is
+/// built.
+const LEFT_OFF_CALLS: usize = 3;
+
+/// The conversation before `here` on the same channel that says where it left
+/// off: where a conversation on that client picks up.
 fn last_time(tree: &Tree, here: &JournalPath) -> Option<(JournalPath, String)> {
     let channel = here.last().and_then(|n| conversation_channel(n.as_str()))?;
     let conversations = JournalPath::of_section(here.group(), Section::Conversations);
@@ -206,9 +210,27 @@ fn last_time(tree: &Tree, here: &JournalPath) -> Option<(JournalPath, String)> {
         .iter()
         .filter(|(n, _)| Some(*n) != here.last())
         .filter(|(n, _)| conversation_channel(n.as_str()) == Some(channel))
-        .filter_map(|(n, c)| summary_of(c).map(|s| (n, c, s)))
+        .filter_map(|(n, c)| left_off(c).map(|s| (n, c, s)))
         .max_by_key(|(_, c, _)| c.meta.as_ref().map(|m| m.created))
         .and_then(|(n, _, s)| Some((conversations.child(n.clone()).ok()?, s)))
+}
+
+/// Where conversation `c` left off: its summary, or — before one is built —
+/// its newest calls.
+fn left_off(c: &Journal) -> Option<String> {
+    summary_of(c).or_else(|| {
+        let calls: Vec<String> = c
+            .meta
+            .as_ref()?
+            .activity
+            .newest(LEFT_OFF_CALLS)
+            .map(|d| match d.subject.as_str() {
+                "" => d.tool.clone(),
+                s => format!("{} — {s}", d.tool),
+            })
+            .collect();
+        (!calls.is_empty()).then(|| format!("it last called {}.", calls.join("; ")))
+    })
 }
 
 fn focus_of<'a>(tree: &'a Tree, at: Option<&JournalPath>) -> Option<&'a Focus> {
@@ -625,6 +647,60 @@ mod tests {
             "open for a drive",
         );
         (t, today)
+    }
+
+    /// **Before a conversation's summary is built, where it left off is its
+    /// newest calls.**
+    #[test]
+    fn without_a_summary_a_conversation_left_off_at_its_newest_calls() {
+        let mut t = zen();
+        let server = Actor::Server {
+            person: slug("john"),
+            channel: Channel::Grok,
+        };
+        let yesterday = made(
+            &mut t,
+            &server,
+            "conversations",
+            "2026-10-29-0800-grok",
+            "open for a drive",
+        );
+        for (i, (tool, subject)) in [
+            ("image_generate", "a cat"),
+            ("repo_task_start", "dj-set"),
+            ("journal_note", ""),
+            ("bot_mission_give", "patrol"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            apply(
+                &mut t,
+                &server,
+                &Op::Activity {
+                    path: yesterday.clone(),
+                    tool: tool.into(),
+                    subject: subject.into(),
+                },
+                now().plus(i as i64),
+            )
+            .unwrap();
+        }
+        let today = made(
+            &mut t,
+            &server,
+            "conversations",
+            "2026-10-30-0800-grok",
+            "open for a drive",
+        );
+        assert_eq!(
+            last_time(&t, &today),
+            Some((
+                yesterday,
+                "it last called bot_mission_give — patrol; journal_note; repo_task_start — dj-set."
+                    .to_string()
+            ))
+        );
     }
 
     /// **A conversation nothing has written to reads as a just-opened one**:

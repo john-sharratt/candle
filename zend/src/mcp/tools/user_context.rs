@@ -9,13 +9,16 @@
 //! (`docs/mcp_user_context.md` §2.5).
 
 use journals::actor::GUEST;
+use journals::scope::Channel;
 use journals::slug::Slug;
 use journals::time::Stamp;
+use journals::view::frame::Budget;
 use serde_json::{json, Value};
 
 use super::{mem, Answer, Ctx};
 use crate::mcp::memory::context;
 use crate::mcp::memory::who::Who;
+use crate::mcp::outcomes;
 
 pub const NAME: &str = "get_user_context";
 
@@ -54,14 +57,35 @@ pub fn call(ctx: &Ctx, _args: &Value) -> Answer {
     if guest && m.tree.root(&guests).is_none() {
         return Answer::ok(nothing_kept("this account is mapped to no one"));
     }
-    Answer::ok(context::render(
+    let mut text = context::render(
         &m.tree,
         group,
         m.here.as_ref(),
         m.channel,
         guest,
         Stamp::now(),
-    ))
+    );
+    // What ended while nobody waited on it (`crate::mcp::outcomes`): read from
+    // a bounded ring, marking nothing.
+    if !guest {
+        if let Some(records) = ctx.session.shared_substrate() {
+            let shown = outcomes_shown(m.channel);
+            let ended = outcomes::newest(&records, &ctx.caller.key(), shown);
+            if let Some(block) = outcomes::block(&ended) {
+                text.push('\n');
+                text.push_str(&block);
+            }
+        }
+    }
+    Answer::ok(text)
+}
+
+/// How many outcomes a frame carries: one, aloud; three, written.
+fn outcomes_shown(channel: Channel) -> usize {
+    match context::budget(channel) {
+        Budget::Voice => 1,
+        Budget::Chat | Budget::Worker => 3,
+    }
 }
 
 #[cfg(test)]
