@@ -283,6 +283,20 @@ it sits 24 hours untouched (`docs/mcp_guides.md` §3).
   with under 3K tokens of thinking extracted the facts and missed that two of
   its own findings contradicted each other. Effort is how hard a turn thinks;
   priority, below, is only how soon it decodes.
+- **`driven` `attended` or `alone`** (`mcp::driven`,
+  `docs/zen_memory_and_guides.md` D5). A task is `attended` when its
+  coordinator waits on it, answers its questions and checks its result;
+  `alone` when nobody will — Grok's, whose drive ends seconds after it is
+  spoken. Left out, it is `alone` for the Grok client and `attended` for every
+  other; a task Zen starts is attended by its starter. It is kept on the
+  worker's record and selects an option of the `driven` selector in
+  `projection.yaml`: `attended` emits nothing, `alone` seals one section
+  telling the worker nobody will answer — to decide within its brief, land its
+  own result, check it, and leave what only the user may approve pending. When
+  an alone task settles, its end is kept for its owner in a ring of ten
+  (`mcp::outcomes`, `mcp/outcome/<owner>/<slot>`), and `get_user_context` raises
+  the newest — one aloud, three written — in their next conversation from any
+  client, marking nothing read.
 - **Decode priority `normal` by default.** Priority is a layer's, and a worker
   is a dialogue-layer conversation, so it would decode at the dialogue's `high`
   (`zend/src/prompts/projection.yaml`), level with a live user. A conversation
