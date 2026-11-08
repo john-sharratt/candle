@@ -302,6 +302,16 @@ impl App {
         }))
     }
 
+    /// Whether this process has listed any backend, so its read-only set says
+    /// something.
+    fn has_listed(&self) -> bool {
+        !self
+            .read_only
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
     /// Whether the last listing marked `name` as only reading.
     fn reads_only(&self, name: &str) -> bool {
         self.read_only
@@ -472,6 +482,14 @@ impl Server for App {
                 client,
                 "mcp: a conversation's first call carries its context"
             );
+        }
+        // **Which tools only read is a listing's to say**, and this process
+        // may never have listed: a client keeps the list it was given across
+        // our restarts, so its calls arrive at a process whose read-only set
+        // is empty, and every read was recorded as an episode. Listed once
+        // here, before the first record is decided.
+        if !this.has_listed() {
+            this.list(call).await;
         }
         let after = context::after(
             name,

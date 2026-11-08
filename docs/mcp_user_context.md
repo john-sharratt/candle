@@ -84,7 +84,10 @@ every 30 seconds, twelve times, which outlasts a model reload: a picture
 drawn while zend is down is still remembered once it is back.
 
 Not recorded: a tool its listing marks `annotations.readOnlyHint` — the MCP
-annotation every tool that only reads carries, in zend and npcd alike — the
+annotation every tool that only reads carries, in zend and npcd alike; an
+aggregator that has not listed since it started lists once before it decides
+its first record, since a client keeps its list across restarts and would
+otherwise have every read recorded — the
 memory's own tools (`get_user_context`, `user_episode_note`, and every
 `journal_*` and `group_*` tool that writes the memory), and the guide tools. `user_episode_note` is in no listing,
 and the aggregator refuses it from a client, so no model is offered it.

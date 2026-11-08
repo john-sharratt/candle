@@ -29,6 +29,23 @@ pub struct NoteRequest {
     #[schemars(with = "String")]
     #[validate(length(min = 1, max = 200))]
     pub journal: Option<String>,
+    /// Memory only: `speaker` (the default) when the person speaking said it, `assistant` when you concluded it — from code, a document, your own reasoning. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub by: Option<String>,
+    /// Memory only: what it rests on — a document's section, file:line, a commit or a URL. A conclusion of yours on a topic needs one. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    #[validate(length(min = 1, max = 400))]
+    pub source: Option<String>,
+    /// Memory only: when it stops being true — a date (`2026-11-30`, to that day's end) or a moment; from then it is hidden. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub expires: Option<String>,
+    /// Memory only: the line of the same journal it supersedes, `#<line id>`; that line is hidden from then on. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub replaces: Option<String>,
 }
 
 /// What a note on the conversation's own journal answers.
@@ -41,7 +58,9 @@ impl Tool for JournalNote {
     const DESCRIPTION: &'static str =
         "Note a short conclusion from your thinking — what you found, decided or mean to do — so \
          it is kept in your journal's current entry when the thinking itself is gone; or, naming \
-         a memory journal, keep a line there.";
+         a memory journal, keep a line there, with `by`, `source`, `expires` and `replaces` \
+         saying whose it is, what it rests on, when it stops being true and which line it \
+         supersedes.";
 
     type Request = NoteRequest;
     type Response = Value;
@@ -71,26 +90,43 @@ mod tests {
     #[test]
     fn a_note_answers_noted_and_a_memory_note_goes_to_the_runner() {
         let ctx = ToolContext::new();
-        let own = NoteRequest {
-            text: "scan.rs holds its lock across the await".into(),
-            journal: None,
+        let note = |text: &str, journal: Option<&str>| NoteRequest {
+            text: text.into(),
+            journal: journal.map(Into::into),
+            by: None,
+            source: None,
+            expires: None,
+            replaces: None,
         };
+        let own = note("scan.rs holds its lock across the await", None);
         assert_eq!(
             serde_json::to_string(&JournalNote::run(&ctx, own).unwrap()).unwrap(),
             "\"noted\""
         );
-        let named_self = NoteRequest {
-            text: "the same".into(),
-            journal: Some(SELF.into()),
-        };
+        let named_self = note("the same", Some(SELF));
         assert_eq!(JournalNote::run(&ctx, named_self).unwrap(), json!(NOTED));
-        let memory = NoteRequest {
-            text: "Yen prefers the morning flight".into(),
-            journal: Some("people/yen".into()),
-        };
+        let memory = note("Yen prefers the morning flight", Some("people/yen"));
         assert!(matches!(
             JournalNote::run(&ctx, memory),
             Err(OpsError::NotConfigured)
         ));
+    }
+
+    /// **The terms go to the runner as the call gave them**, and a note
+    /// without them carries none.
+    #[test]
+    fn the_terms_are_sent_as_given() {
+        let req = NoteRequest {
+            text: "the pool caps at 16".into(),
+            journal: Some("topics/candle/zen/ingest".into()),
+            by: Some("assistant".into()),
+            source: Some("zend/src/calibrate/run.rs:100".into()),
+            expires: None,
+            replaces: Some("#k3f9".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r##"{"text":"the pool caps at 16","journal":"topics/candle/zen/ingest","by":"assistant","source":"zend/src/calibrate/run.rs:100","replaces":"#k3f9"}"##
+        );
     }
 }
