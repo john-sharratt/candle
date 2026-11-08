@@ -1,5 +1,5 @@
 //! `file_upload_and_commit {repo, message, files: [{path, base64}], branch?}`:
-//! bytes the caller holds — a photo dropped on an app preview, a page a
+//! bytes the caller holds — a picture for the art library, a page a
 //! preview built — landed as one commit (`docs/mcp_file_tools.md` §3.6),
 //! through the path every committing tool shares ([`super::landing`]). Any
 //! bytes: the repository's gate decides which paths may hold them (§3.8).

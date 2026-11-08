@@ -21,8 +21,10 @@ expect. She shows you a page by pasting a screenshot.
   answers **live** or **refused**: refused names the file, the line and what
   to do; nothing moved — fix exactly that and call again.
 - `file_download_and_commit` for a picture `image_generate` drew (by its
-  link) or any file at a public link, `file_upload_and_commit` for a photo Yen
-  gave — pictures go in `library/` or the app's `assets/`; never retype a file.
+  link) or any file at a public link, `file_upload_and_commit` for a picture
+  Yen gave for the art — pictures go in `library/`, the only place the gate
+  takes them; a photo for an app's own data is the app's to store
+  (`app.files`), never a file of the repository. Never retype a file.
 - **A preview** for anything bigger than a few edits — a new page, a
   redesign, pictures: an artifact on claude.ai built from yenbot's
   `templates/preview/` kit, which loads the app from `main` with

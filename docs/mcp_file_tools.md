@@ -165,7 +165,7 @@ without passing through a model:
   claude.ai, which sits behind its sign-in: such a page sends its own bytes
   with `file_upload_and_commit` (`docs/yenbot_preview.md` §4).
 - **Upload** on the connector is for bytes the caller holds and Zen cannot
-  fetch: a photo dropped on an app preview, a page a preview built. At most
+  fetch: a picture for the art library, a page a preview built. At most
   8 MiB a file and 16 MiB a call, as base64.
 - **The worker pair** keeps a file out of a worker's context. A worker that
   fetched a file with `http_request` read the whole body into its context and
@@ -205,9 +205,11 @@ test services; the guard is its own module and does not loosen for them.
 
 `file_edit_and_commit` stays text-only. The transfers commit any bytes, and
 the repository decides what may hold them: a gated repository's gate sees every
-path and its size (§5.4), and yenbot's refuses binary outside the paths its
-rules name for it (`library/`, an app's `assets/`), a file past its size, and a
-file whose content does not match its extension.
+path and its size (§5.4). yenbot's already allows binary in `library/` alone:
+an app's files must be its fixed shape and UTF-8 text (`src/check/rules/layout.rs`),
+and the library's own check rules on every picture in it
+(`src/library/check.rs`). A picture an app shows is library art, and a photo a
+person adds is the app's data (`app.files`), never a file of the repository.
 
 ## 4. Service keys
 
