@@ -2451,9 +2451,11 @@ mod tests {
         let fill_b = pool.allocate_run_for(key, cap - 1).unwrap();
         assert!(fill_b.iter().all(|g| g.arena_idx() == b));
 
+        // A floor is a place: these arenas carry no region, so theirs follow
+        // their indices after every ranked place.
         let pair = pool.allocate_run_for(key, 2).unwrap();
         assert!(pair.iter().all(|g| g.arena_idx() == c));
-        assert_eq!(pool.run_floor_for(key, 2), c);
+        assert_eq!(pool.run_floor_for(key, 2), unranked_place(c));
         assert_eq!(pool.run_floor_for(key, 3), 0, "no length-3 walk ran");
         assert_eq!(pool.run_floor_for(key, 1), 0);
 
@@ -2461,7 +2463,7 @@ mod tests {
         assert_eq!(single[0].arena_idx(), a);
         let single = pool.allocate_run_for(key, 1).unwrap();
         assert_eq!(single[0].arena_idx(), b);
-        assert_eq!(pool.run_floor_for(key, 1), b);
+        assert_eq!(pool.run_floor_for(key, 1), unranked_place(b));
     }
 
     /// An arena that registers below the point the walk has passed is a fresh
