@@ -22,7 +22,7 @@ use super::mem::PATHS;
 use super::{mem, string, Answer, Ctx, LOADING};
 use crate::mcp::memory::{is_memory_path, Memory};
 use crate::mcp::names::Path;
-use crate::mcp::threads::{self, project_journal, Note};
+use crate::mcp::threads::{self, project_journal, Entry};
 
 pub const NAME: &str = "journal_read";
 
@@ -292,25 +292,23 @@ fn answer_page(path: &str, text: &str, from: usize) -> String {
 /// A thread's or project's journal at `path`: its entries from `first` on, or
 /// with `entry` that one note — its entries are its record, with no turns
 /// behind them.
-fn notes_answer(path: &str, notes: &[Note], entry: Option<u64>, first: usize) -> Answer {
+fn notes_answer(path: &str, notes: &[Entry], entry: Option<u64>, first: usize) -> Answer {
     let Some(n) = entry else {
-        let all = threads::render_journal(path, notes);
         if first <= 1 {
-            return Answer::ok(all);
+            return Answer::ok(threads::render_journal(path, notes));
         }
-        let mut lines = all.lines();
-        let head = lines.next().unwrap_or_default().to_string();
-        let shown: Vec<&str> = lines.skip(first - 1).collect();
+        let shown: Vec<&Entry> = notes.iter().filter(|e| e.number >= first as u64).collect();
+        let last = shown.iter().map(|e| e.number).max().unwrap_or(first as u64);
+        let lines: Vec<String> = shown.into_iter().map(threads::note_line).collect();
         return Answer::ok(format!(
-            "{head}, entries {first}–{} of {}\n{}",
-            first + shown.len().saturating_sub(1),
+            "{}, entries {first}–{last} of {}\n{}",
+            threads::journal_head(path),
             notes.len(),
-            shown.join("\n")
+            lines.join("\n")
         ));
     };
-    let lines = threads::note_lines(notes);
-    match n.checked_sub(1).and_then(|i| lines.get(i as usize)) {
-        Some(line) => Answer::ok(format!("{path}{line}")),
+    match notes.iter().find(|e| e.number == n) {
+        Some(e) => Answer::ok(format!("{path}{}", threads::note_line(e))),
         None => Answer::error(format!(
             "{path} has no entry {n}: it holds {} entries",
             notes.len()
@@ -355,26 +353,25 @@ pub fn render_worker(path: &str, view: Option<&Value>, first: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::threads::Note;
 
     /// **A thread's entry address reads that note**; one past its end says
     /// how many there are.
     #[test]
     fn a_notes_address_reads_that_note() {
+        let entry = |number, label: &str, text: &str| Entry {
+            number,
+            note: Note {
+                label: label.into(),
+                text: text.into(),
+                at_ms: number,
+                worker: None,
+                client: None,
+            },
+        };
         let notes = vec![
-            Note {
-                label: "Claude started:".into(),
-                text: "verify the expiry".into(),
-                at_ms: 0,
-                worker: None,
-                client: None,
-            },
-            Note {
-                label: "Decided:".into(),
-                text: "parts cite their files".into(),
-                at_ms: 1,
-                worker: None,
-                client: None,
-            },
+            entry(1, "Claude started:", "verify the expiry"),
+            entry(2, "Decided:", "parts cite their files"),
         ];
         assert_eq!(
             notes_answer("T:review", &notes, Some(2), 1).text,

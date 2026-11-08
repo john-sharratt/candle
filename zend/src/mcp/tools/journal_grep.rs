@@ -162,13 +162,12 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
             let needle = pattern.to_lowercase();
             let lines: Vec<String> = threads::notes(&records, &owner, &key)
                 .iter()
-                .enumerate()
-                .filter(|(_, n)| {
-                    format!("{} {}", n.label, n.text)
+                .filter(|e| {
+                    format!("{} {}", e.note.label, e.note.text)
                         .to_lowercase()
                         .contains(&needle)
                 })
-                .map(|(i, n)| format!("{path}#{} {} {}", i + 1, n.label, n.text))
+                .map(|e| format!("{path}{}", threads::note_line(e)))
                 .collect();
             let total = lines.len();
             answer(lines.into_iter().take(max).collect(), total, pattern)

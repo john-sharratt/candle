@@ -731,6 +731,7 @@ fn note(
             client: None,
         },
     )
+    .map(|_| ())
     .map_err(|e| e.to_string())
 }
 

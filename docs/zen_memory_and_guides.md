@@ -299,8 +299,11 @@ quoted in Phase 8's report.
   export.
 - **Reading.** Memory `journal_read` pages newest first by `before`, continuing
   into archived lines, so an archive is read by paging past the window.
-- **Stable note numbers.** A thread note's number is assigned at write from the
-  thread record's counter and stored on the note, replicated with it.
+- **Stable note numbers.** A thread note's number is assigned at write — one
+  past both the journal's entry count and its newest entry's number, read
+  from the keys' count and the newest record only — and stored on the note,
+  replicated with it. A note stored without one reads as its place in key
+  order (`threads::add_note`, `number_of`).
 - **Tests:** raw expected sections for a worker on a thread with two topics; the
   cap; reseal from the changed section; `about` on attach; an exported note and
   its link; each filter; `before` paging across journals in time order and into

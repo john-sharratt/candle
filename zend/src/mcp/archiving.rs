@@ -278,7 +278,7 @@ pub fn archive_thread(
                 client: None,
             };
             let kept = threads::put_thread(records, owner, &archived)
-                .and_then(|()| threads::add_note(records, owner, name, &note));
+                .and_then(|()| threads::add_note(records, owner, name, &note).map(|_| ()));
             if let Err(e) = kept {
                 let mut held = archiving();
                 for w in &claimed {
@@ -538,7 +538,7 @@ mod tests {
         );
         assert!(threads::thread(&records, "o", "review").unwrap().archived);
         let notes = threads::notes(&records, "o", "review");
-        assert_eq!(notes.last().unwrap().text, "a day idle");
+        assert_eq!(notes.last().unwrap().note.text, "a day idle");
         assert_eq!(
             sweep(&records, &distil, 2 * DAY),
             (0, 0),
@@ -657,7 +657,7 @@ mod tests {
         );
         let notes = threads::notes(&records, "o", "review");
         assert_eq!(
-            notes.last().unwrap().text,
+            notes.last().unwrap().note.text,
             "T:review/gone — lost: the member running it restarted, and its turn with it"
         );
         assert_eq!(sweep(&records, &distil, now + 1), (0, 0), "once only");
