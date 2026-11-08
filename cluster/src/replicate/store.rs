@@ -84,12 +84,16 @@ pub trait Store: Send + Sync + 'static {
     /// Apply records other members wrote, as `(origin, oseq, bytes)`.
     fn apply(&self, records: &[(u64, u64, Vec<u8>)]) -> Applied;
 
-    /// Whether the record `bytes`, applied, only lets this store free space —
-    /// a tombstone, which makes the records it names dead for maintenance to
-    /// reclaim. The one kind a member in fault mode still applies (§7.7):
-    /// with its disk full, the space the group has deleted is the only way
-    /// back out.
-    fn frees(&self, bytes: &[u8]) -> bool;
+    /// Whether a member in fault mode still applies the record `bytes`
+    /// (§7.7): a tombstone, which makes the records it names dead for
+    /// maintenance to reclaim — with its disk full, the space the group has
+    /// deleted is a way back out — or an upgrade decision
+    /// ([`is_upgrade_decision`]), by which it installs a certified build, the
+    /// other way back. Both are small; neither grows the substrate by more
+    /// than its own bytes.
+    ///
+    /// [`is_upgrade_decision`]: crate::upgrade::decisions::is_upgrade_decision
+    fn applies_in_fault(&self, bytes: &[u8]) -> bool;
 
     /// The records held in `origin`'s `from..=to`, a range the store covers
     /// completely, and the `oseq`s in it that are gone.

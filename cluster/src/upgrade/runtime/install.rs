@@ -6,7 +6,8 @@
 //! app it serves, or one of a forced rollout's `upgrade/<app>/<i>` — and hands
 //! the install to its [`Installer`]: the process drains, flushes, releases its
 //! substrate, closes its sockets, stages the new executable and asks `keep`
-//! to start it, then exits. An upgrading member takes no lease. A build that
+//! to start it, then exits. An upgrading member takes no lease, and an app in
+//! fault mode takes none for itself ([`leases_to_take`]). A build that
 //! cannot open the substrate strands the member, and its install is never
 //! attempted.
 //!
@@ -84,6 +85,16 @@ pub struct Handback {
 /// The app an upgrade lease belongs to: `upgrade/<app>[/<i>]`.
 fn app_of(key: &str) -> Option<&str> {
     key.strip_prefix("upgrade/")?.split('/').next()
+}
+
+/// The leases an install takes of `leases`: none of an app whose member is in
+/// fault mode. A lease keeps two members of an app from being down at once,
+/// and a member in fault mode is already out of service — it serves nothing
+/// and proposes nothing, so it could never hold one (§7.7). Its install costs
+/// the app no capacity, and is how a fault a new build clears is cleared.
+fn leases_to_take(mut leases: Vec<String>, in_fault: impl Fn(&str) -> bool) -> Vec<String> {
+    leases.retain(|key| !app_of(key).is_some_and(&in_fault));
+    leases
 }
 
 /// The step while an install waits for leases: `waiting: <keys> not held`.
@@ -345,6 +356,11 @@ impl Upgrader {
                 keys
             }
         };
+        let leases = leases_to_take(leases, |app| {
+            self.member(app)
+                .and_then(|m| m.replicator().cloned())
+                .is_some_and(|r| r.faulted())
+        });
         let mut missing: Vec<&str> = Vec::new();
         for key in &leases {
             let Some(r) = app_of(key)
@@ -412,6 +428,19 @@ mod tests {
         assert_eq!(app_of("upgrade/zend"), Some("zend"));
         assert_eq!(app_of("upgrade/npcd/1"), Some("npcd"));
         assert_eq!(app_of("world/w1"), None);
+    }
+
+    /// **An app in fault mode takes no lease to install**: it is out of
+    /// service already, and could not hold one. An app still serving does.
+    #[test]
+    fn an_app_in_fault_takes_no_lease() {
+        let leases = || vec!["upgrade/zend".to_string(), "upgrade/npcd/1".to_string()];
+        assert_eq!(leases_to_take(leases(), |_| false), leases());
+        assert_eq!(
+            leases_to_take(leases(), |app| app == "zend"),
+            vec!["upgrade/npcd/1".to_string()]
+        );
+        assert!(leases_to_take(leases(), |_| true).is_empty());
     }
 
     /// **A lease wait names the leases it waits for.** It said only

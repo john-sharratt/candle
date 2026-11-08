@@ -159,6 +159,40 @@ async fn substrates_replicate_live_and_by_catch_up() {
     .await;
 }
 
+/// **A member in fault mode applies the upgrade's decisions** (§7.7): a
+/// verdict, a rollout and a pause, by which it installs a certified build, as
+/// written to a real substrate. A generation, `max_members` or any other keyed
+/// object waits for its catch-up on leaving.
+#[test]
+fn a_faulted_member_applies_the_upgrades_decisions_and_nothing_else_keyed() {
+    let dir = TempDir::new().unwrap();
+    let mut substrate = Substrate::new();
+    let sp = SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+    let conv = Conversation::from_parts(substrate, sp);
+    let store = ConversationStore::new(conv.clone(), 0, || {});
+    let node = store.node();
+    let last = |store: &ConversationStore| store.read(node, store.own_through()).unwrap();
+
+    for key in [
+        "certify/zend/4753-130547d5/0",
+        "rollout/npcd/3",
+        "pause/zend/1",
+    ] {
+        store.record_decision(key.as_bytes(), b"[]");
+        assert!(store.applies_in_fault(&last(&store)), "{key}");
+    }
+    store.record_decision(b"gen/7", b"[]");
+    assert!(!store.applies_in_fault(&last(&store)), "a generation");
+    store.set_max_members(3);
+    assert!(!store.applies_in_fault(&last(&store)), "max_members");
+    conv.put_cluster_object("cluster/certified-notes", json!(1))
+        .unwrap();
+    assert!(
+        !store.applies_in_fault(&last(&store)),
+        "a key that only looks like one"
+    );
+}
+
 /// What operating a member reads of a real substrate (§7.7, §12.1): its
 /// volume measured with no write failed, a test write that succeeds, nothing
 /// deferred and no tombstones on a fresh store — and the member reports it in

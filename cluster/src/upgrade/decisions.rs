@@ -45,6 +45,17 @@ pub fn pause_prefix(app: &str) -> String {
     format!("pause/{app}/")
 }
 
+/// The roots every upgrade decision is keyed under.
+const UPGRADE_ROOTS: [&str; 3] = ["certify/", "rollout/", "pause/"];
+
+/// Whether the decision `key` is one of the upgrade's — a verdict, a forced
+/// rollout or a pause. A member in fault mode still applies these (§7.7): they
+/// are what it installs a certified build by, which is its way back when the
+/// build is what clears the fault.
+pub fn is_upgrade_decision(key: &str) -> bool {
+    UPGRADE_ROOTS.iter().any(|root| key.starts_with(root))
+}
+
 /// How a verdict settled a build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +169,18 @@ mod tests {
         assert_eq!(parse_build("4815"), None);
         assert_eq!(parse_build("x-9f8e7d6"), None);
         assert_eq!(parse_build("4815-"), None);
+    }
+
+    /// **Verdicts, rollouts and pauses are the upgrade's decisions**; a
+    /// generation or `max_members` is not.
+    #[test]
+    fn the_upgrades_decisions_are_its_verdicts_rollouts_and_pauses() {
+        assert!(is_upgrade_decision(&certify_key("zend", &build(), 0)));
+        assert!(is_upgrade_decision(&format!("{}3", rollout_prefix("npcd"))));
+        assert!(is_upgrade_decision(&format!("{}1", pause_prefix("zend"))));
+        for other in ["gen/7", "max_members/set", "max_members/raise/5", "certify"] {
+            assert!(!is_upgrade_decision(other), "{other}");
+        }
     }
 
     /// A verdict is exact JSON, and the latest number holds.

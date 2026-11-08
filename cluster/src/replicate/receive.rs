@@ -78,21 +78,21 @@ impl Replicator {
             *at = (*at).max(upto);
             advanced
         };
-        // In fault mode only what frees space is applied — the tombstones,
-        // whose dead records maintenance reclaims, which is the only way a
-        // full disk gets back out (§7.7). The rest is fetched again by the
-        // catch-up that leaving starts; it counts as handled, so a request
-        // waiting on it is not held for it.
+        // In fault mode only the tombstones, whose dead records maintenance
+        // reclaims, and the upgrade's decisions, by which a certified build is
+        // installed, are applied: the two ways back out (§7.7). The rest is
+        // fetched again by the catch-up that leaving starts; it counts as
+        // handled, so a request waiting on it is not held for it.
         let records = if self.faulted() {
-            let freeing: Vec<_> = records
+            let kept: Vec<_> = records
                 .into_iter()
-                .filter(|(_, w, _)| self.store.frees(&w.bytes))
+                .filter(|(_, w, _)| self.store.applies_in_fault(&w.bytes))
                 .collect();
-            if freeing.is_empty() {
+            if kept.is_empty() {
                 self.applied_upto.send_if_modified(advance);
                 return;
             }
-            freeing
+            kept
         } else {
             records
         };
@@ -175,15 +175,15 @@ impl Replicator {
     /// any socket's stream — what a member handing work on carries of its own
     /// records the member taking it lacks — counted as arrivals are, and
     /// reloaded when the store asks. How many the store took; in fault mode
-    /// only what frees space is taken (§7.7). Each one that also arrives by
-    /// the stream is a duplicate there.
+    /// only what the store's `applies_in_fault` keeps is taken (§7.7). Each one
+    /// that also arrives by the stream is a duplicate there.
     pub async fn apply_carried(
         self: &Arc<Self>,
         origin: u64,
         mut records: Vec<(u64, Vec<u8>)>,
     ) -> usize {
         if self.faulted() {
-            records.retain(|(_, bytes)| self.store.frees(bytes));
+            records.retain(|(_, bytes)| self.store.applies_in_fault(bytes));
         }
         if records.is_empty() {
             return 0;

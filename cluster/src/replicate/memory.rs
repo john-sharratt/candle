@@ -10,6 +10,7 @@
 //! in any arrival order.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::from_utf8;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -18,6 +19,7 @@ use applied_set::AppliedSet;
 use super::store::{Applied, Disk, Listing, Store, Tap, Tombstones, GEN_DETACHED};
 use crate::consensus::{Change, MaxMembers};
 use crate::frame::RecordHeader;
+use crate::upgrade::decisions::is_upgrade_decision;
 
 const MAX_MEMBERS_SET: &[u8] = b"cluster/max_members/set";
 const MAX_MEMBERS_RAISE: &[u8] = b"cluster/max_members/raise/";
@@ -26,8 +28,8 @@ const GENERATION: &[u8] = b"cluster/gen/";
 /// Keys a timeline's turns are written under: `turn/<timeline>/…`. A turn
 /// ranked below one held asks for a reload (§6.6).
 const TURN: &[u8] = b"turn/";
-/// Keys a tombstone is written under: `tombstone/<what it ends>`. The one kind
-/// of record a member in fault mode still applies (§7.7).
+/// Keys a tombstone is written under: `tombstone/<what it ends>`. A member in
+/// fault mode still applies one (§7.7), as it does an upgrade decision.
 pub const TOMBSTONE: &[u8] = b"tombstone/";
 
 /// A record's version stamp: `(gen, epoch, hlc, origin)`.
@@ -457,8 +459,13 @@ impl Store for MemoryStore {
         out
     }
 
-    fn frees(&self, bytes: &[u8]) -> bool {
-        MemoryRecord::decode(bytes).is_some_and(|r| r.key.starts_with(TOMBSTONE))
+    fn applies_in_fault(&self, bytes: &[u8]) -> bool {
+        MemoryRecord::decode(bytes).is_some_and(|r| {
+            r.key.starts_with(TOMBSTONE)
+                || r.key
+                    .strip_prefix(DECISION)
+                    .is_some_and(|k| from_utf8(k).is_ok_and(is_upgrade_decision))
+        })
     }
 
     fn list(&self, origin: u64, from: u64, to: u64) -> Listing {
@@ -790,6 +797,30 @@ mod tests {
             ]
         );
         assert!(s.decisions("rollout/").is_empty());
+    }
+
+    /// **In fault mode a member applies tombstones and the upgrade's
+    /// decisions**, and nothing else (§7.7).
+    #[test]
+    fn a_faulted_member_applies_tombstones_and_upgrade_decisions() {
+        let s = MemoryStore::new(1);
+        let last = |s: &MemoryStore| s.read(1, s.own_through()).unwrap();
+        s.write(b"tombstone/t/1", b"");
+        assert!(s.applies_in_fault(&last(&s)), "a tombstone");
+        for key in [
+            &b"certify/zend/7-abc/1"[..],
+            b"rollout/npcd/2",
+            b"pause/zend/1",
+        ] {
+            s.record_decision(key, b"v");
+            assert!(s.applies_in_fault(&last(&s)), "{key:?}");
+        }
+        s.record_decision(b"gen/3", &1u64.to_le_bytes());
+        assert!(!s.applies_in_fault(&last(&s)), "a generation");
+        s.write(b"turn/t/1", b"text");
+        assert!(!s.applies_in_fault(&last(&s)), "a turn");
+        s.write(b"certify/zend/7-abc/1", b"not a decision");
+        assert!(!s.applies_in_fault(&last(&s)), "outside cluster/");
     }
 
     /// A turn ranked below a turn held asks for a reload; one above does not.

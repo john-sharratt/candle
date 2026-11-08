@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 
 use applied_set::AppliedSet;
 use candle_conversation::persistence::identity::VersionStamp;
-use candle_conversation::persistence::record::{decode_header, RecordType};
+use candle_conversation::persistence::record::{decode_header, CustomObjectPayload, RecordType};
 use candle_conversation::persistence::remote::RemoteOutcome;
 use candle_conversation::projection::replication::CLUSTER_PREFIX;
 use candle_conversation::projection::Conversation;
@@ -20,6 +20,7 @@ use cluster::consensus::votes::{FileJournal, VoteStore, DEFAULT_SIZE};
 use cluster::consensus::{Change, MaxMembers};
 use cluster::frame::RecordHeader;
 use cluster::replicate::{Applied, Disk, Listing, Replication, Store, Tap, Tombstones};
+use cluster::upgrade::decisions::is_upgrade_decision;
 use serde_json::{json, Value};
 
 use ::cluster::disk::volume_of;
@@ -206,8 +207,23 @@ impl Store for ConversationStore {
         Applied { taken, reload }
     }
 
-    fn frees(&self, bytes: &[u8]) -> bool {
-        decode_header(bytes).is_ok_and(|(h, _)| h.record_type.frees_space())
+    fn applies_in_fault(&self, bytes: &[u8]) -> bool {
+        // A record travels as its header line and payload, unpadded.
+        let Ok((header, head)) = decode_header(bytes) else {
+            return false;
+        };
+        let Some(payload) = bytes.get(head..head + header.payload_len as usize) else {
+            return false;
+        };
+        match header.record_type {
+            t if t.frees_space() => true,
+            RecordType::CustomObject => CustomObjectPayload::decode(payload).is_ok_and(|o| {
+                o.key
+                    .strip_prefix(CLUSTER_PREFIX)
+                    .is_some_and(is_upgrade_decision)
+            }),
+            _ => false,
+        }
     }
 
     fn list(&self, origin: u64, from: u64, to: u64) -> Listing {

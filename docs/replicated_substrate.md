@@ -1241,7 +1241,7 @@ stream.
 
 | From a member | To |
 |---|---|
-| `EVENT` (live) | every *other* admitted member of the same app — never back to the sender, never to another app, and not to a member that is upgrading (§3.5) or lagging (§4.4); a member in fault mode still receives them, for the tombstones (§7.7) |
+| `EVENT` (live) | every *other* admitted member of the same app — never back to the sender, never to another app, and not to a member that is upgrading (§3.5) or lagging (§4.4); a member in fault mode still receives them, for the tombstones and the upgrade's decisions (§7.7) |
 | anything carrying `reply_to` that answers a request — `HEADERS`, an addressed `EVENT`, `DONE`, `LOST` | **only** the member `reply_to` names, so catch-up traffic reaches the one member that asked for it |
 | `CATCHUP` | the member `to` names; without `to`, one other ready member of the app, picked round robin (§7.2) |
 | `FETCH` | the member `from_node` names |
@@ -3134,8 +3134,9 @@ the group has to know the member can no longer write.
 
 **Fault mode has one other cause: a candidate build that failed certification** (§3.8).
 It behaves the same way, with no requests routed to it, roles handed back, and still
-voting. Like a disk-faulted member it receives live events and applies only the ones that
-free space — the tombstones — and fetches the rest by the catch-up that leaving starts.
+voting. Like a disk-faulted member it receives live events and applies only the
+tombstones and the upgrade's decisions, and fetches the rest by the catch-up that leaving
+starts.
 The difference is only its disk, which is fine, so the table's rows that exist because of
 a full disk do not apply to it. It leaves only by an admin's `certify-anyway` or `reject-build`, or by a forced
 rollout of its build (§3.11), never by itself.
@@ -3158,8 +3159,8 @@ empty stream.
 | World authority (§9.2) | sends `RELEASE` for every world lease, after writing what it still can; the proposer rendezvous names takes each world |
 | NPC leases (§9.3) | stops its characters at their next turn boundary; their world's authority lends the leases elsewhere, as it would for any joined member that hands them back |
 | Paxos acceptor (§5.9) | **keeps voting.** Its votes go to the preallocated vote journal, which never needs new space, so its promises stay durable with the volume full. A faulted member still counts toward the quorum, and a small group does not lose its majority because one machine's disk filled. |
-| Paxos proposer and lease holder | proposes nothing and holds no lease. Holding a world means writing its state, which it cannot do. |
-| Applying remote events (§6.5) | stops for a full disk, **except tombstones** (`Store::frees`: a timeline's, a section's or a file's), and it sends no further `ACK`s. A tombstone is a few hundred bytes and makes dead the records it names, which maintenance then reclaims: with the disk full, the space the group has deleted is the only way back out, and a member that applied none of it stayed faulted for as long as the group kept writing. Everything else is fetched by the catch-up on leaving. |
+| Paxos proposer and lease holder | proposes nothing and holds no lease. Holding a world means writing its state, which it cannot do. An install takes no upgrade lease for an app in fault mode (`leases_to_take`): the lease keeps two of an app's members from being down at once, and this one is out of service already. |
+| Applying remote events (§6.5) | stops for a full disk, **except tombstones and the upgrade's decisions** (`Store::applies_in_fault`), and it sends no further `ACK`s. A tombstone — a timeline's, a section's or a file's — is a few hundred bytes and makes dead the records it names, which maintenance then reclaims: with the disk full, the space the group has deleted is one way back out, and a member that applied none of it stayed faulted for as long as the group kept writing. The upgrade's decisions — `certify/`, `rollout/`, `pause/` (§3.8, §3.11) — are the other: they are how a member installs a certified build, and one that dropped them held every release back for as long as it stayed faulted, the build that would clear its fault included (WhiteWorld, 2026-11-09). Everything else is fetched by the catch-up on leaving. |
 | Serving API requests | the gateways route nothing to it, apart from `/v1/status`, `x-tokera-node` admin requests and aggregates, which it answers with its fault |
 
 **What it keeps doing:**
@@ -3171,6 +3172,8 @@ empty stream.
 - **answering catch-up `FETCH`es** for records it holds, which are reads;
 - **applying the tombstones it hears**, live or carried (`replicate/receive.rs`), so the
   records the group deleted become dead here too and maintenance can reclaim them;
+- **installing certified builds.** It applies the upgrade's decisions it hears and
+  installs as any member does, without the lease of an app in fault mode;
 - **trying to free space.** Once a second it runs a maintenance `Drop`, which unlinks a
   segment holding only dead records and needs no scratch space
   (`persistence/maintenance.rs`). It does not start a `Compact` or `Combine`, which would
@@ -3178,7 +3181,7 @@ empty stream.
   inside a full compaction (§6.8).
 
 **The gateway still relays live events to it.** The gateway never decodes a record, so it
-cannot pick the tombstones out; the member does, applies them, and drops the rest at
+cannot pick the tombstones and decisions out; the member does, applies them, and drops the rest at
 once, so its lane drains as fast as it fills and the lag cap (§4.4) still bounds it. What
 the member drops is what its catch-up fetches later.
 
