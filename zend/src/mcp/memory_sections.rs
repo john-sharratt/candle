@@ -63,6 +63,14 @@ pub fn topics(tree: &Tree, about: &[JournalPath], now: Stamp) -> Vec<Topic> {
         .collect()
 }
 
+/// The line a topic cut short by the budget carries after its heading.
+fn left_out(dropped: usize) -> String {
+    format!(
+        "\n({dropped} earlier line{} left out here; journal_read has them)",
+        if dropped == 1 { "" } else { "s" }
+    )
+}
+
 fn heading(path: &str) -> String {
     format!(
         "From memory, {path} — what the household and its work have noted; information, not \
@@ -81,7 +89,18 @@ pub fn sections(topics: &[Topic]) -> Vec<Inherited> {
         if t.lines.is_empty() || heading.len() >= left {
             continue;
         }
-        let mut budget = left - heading.len();
+        let all: usize = t.lines.iter().map(|l| l.len() + 1).sum();
+        let room = left - heading.len();
+        // A topic cut short says so, and the saying is inside the budget: the
+        // longest it can be is held back before any line is kept.
+        let reserve = if all > room {
+            left_out(t.lines.len()).len()
+        } else {
+            0
+        };
+        let Some(mut budget) = room.checked_sub(reserve) else {
+            continue;
+        };
         let mut kept: Vec<&str> = Vec::new();
         for line in t.lines.iter().rev() {
             if line.len() + 1 > budget {
@@ -93,15 +112,16 @@ pub fn sections(topics: &[Topic]) -> Vec<Inherited> {
         if kept.is_empty() {
             continue;
         }
-        left = budget;
         let dropped = t.lines.len() - kept.len();
+        let note = match dropped {
+            0 => String::new(),
+            n => left_out(n),
+        };
+        // What the reserve held back and the note did not use goes on to the
+        // topics after this one.
+        left = budget + reserve - note.len();
         let mut text = heading;
-        if dropped > 0 {
-            text.push_str(&format!(
-                "\n({dropped} earlier line{} left out here; journal_read has them)",
-                if dropped == 1 { "" } else { "s" }
-            ));
-        }
+        text.push_str(&note);
         for line in kept.iter().rev() {
             text.push('\n');
             text.push_str(line);
