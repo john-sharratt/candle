@@ -717,23 +717,35 @@ impl Join {
         };
         loop {
             progress(&r.catchups());
-            let ready = r.caught_up() && r.phase() == Phase::Joined;
-            if ready || cancelled() {
+            if cancelled() {
                 return;
             }
-            // Cut off before catching up: the load goes on detached, and the
-            // catch-up resumes once a gateway admits it again. Said, because
-            // the step reads done either way.
-            if self.link.state() == Link::CutOff {
-                let catchups = r.catchups();
-                tracing::warn!(
-                    behind = %view::catchup_detail(&catchups),
-                    "cut off before catching up — loading on detached; the catch-up resumes \
-                     once rejoined"
-                );
-                return;
+            let ends = catch_up_ends(
+                r.caught_up() && r.phase() == Phase::Joined,
+                self.link.state() == Link::CutOff,
+                r.faulted(),
+            );
+            // The step reads done either way, so a load that goes on without
+            // its catch-up says why.
+            match ends {
+                None => sleep(CONNECTING_POLL),
+                Some(CatchUpEnd::CaughtUp) => return,
+                Some(CatchUpEnd::CutOff) => {
+                    tracing::warn!(
+                        behind = %view::catchup_detail(&r.catchups()),
+                        "cut off before catching up — loading on detached; the catch-up resumes \
+                         once rejoined"
+                    );
+                    return;
+                }
+                Some(CatchUpEnd::Fault) => {
+                    tracing::warn!(
+                        "in fault mode before catching up — loading on what this member holds; \
+                         the catch-up starts once it leaves (§7.7)"
+                    );
+                    return;
+                }
             }
-            sleep(CONNECTING_POLL);
         }
     }
 
@@ -744,5 +756,58 @@ impl Join {
             progress(&self.link.clusters());
             sleep(CONNECTING_POLL);
         }
+    }
+}
+
+/// Why the `catchup` loading step ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatchUpEnd {
+    /// An admission catch-up finished, and any rejoin is done.
+    CaughtUp,
+    /// Cut off: the load goes on detached, and the catch-up resumes once a
+    /// gateway admits it again.
+    CutOff,
+    /// In fault mode, which asks for nothing (§7.7): the load goes on with
+    /// what the member holds — it is routed nothing — and leaving fault starts
+    /// the catch-up. Waiting would hold the load until the fault cleared, so a
+    /// faulted member could never show a build works, and the build that
+    /// clears the fault could never be installed.
+    Fault,
+}
+
+/// Whether the `catchup` step ends, and why; `None` while it still waits.
+fn catch_up_ends(caught_up: bool, cut_off: bool, faulted: bool) -> Option<CatchUpEnd> {
+    if caught_up {
+        Some(CatchUpEnd::CaughtUp)
+    } else if cut_off {
+        Some(CatchUpEnd::CutOff)
+    } else if faulted {
+        Some(CatchUpEnd::Fault)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod catch_up_tests {
+    use super::*;
+
+    /// **A member in fault mode loads on without its catch-up**, as a member
+    /// cut off does: a fault asks for nothing, so waiting would hold the load
+    /// — and the proof line, and the install — until the fault cleared.
+    #[test]
+    fn the_catchup_step_ends_caught_up_cut_off_or_in_fault() {
+        assert_eq!(catch_up_ends(false, false, false), None);
+        assert_eq!(
+            catch_up_ends(true, false, false),
+            Some(CatchUpEnd::CaughtUp)
+        );
+        assert_eq!(
+            catch_up_ends(true, true, true),
+            Some(CatchUpEnd::CaughtUp),
+            "caught up is caught up"
+        );
+        assert_eq!(catch_up_ends(false, true, true), Some(CatchUpEnd::CutOff));
+        assert_eq!(catch_up_ends(false, false, true), Some(CatchUpEnd::Fault));
     }
 }

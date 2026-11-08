@@ -3174,6 +3174,13 @@ empty stream.
   records the group deleted become dead here too and maintenance can reclaim them;
 - **installing certified builds.** It applies the upgrade's decisions it hears and
   installs as any member does, without the lease of an app in fault mode;
+- **loading.** A member that starts in fault mode, or enters it while it loads, ends the
+  `catchup` step without catching up, as a member cut off does, and loads on what it
+  holds (`host/src/cluster/mod.rs`, `catch_up_ends`). It asks for nothing in fault mode,
+  so a load that waited for its catch-up never reached the steps that show a build
+  works, never printed its proof line, and every trial of it was rolled back — the
+  build that would clear the fault included (WhiteWorld, 2026-11-09). Leaving starts the
+  catch-up, and it is routed nothing until it has;
 - **trying to free space.** Once a second it runs a maintenance `Drop`, which unlinks a
   segment holding only dead records and needs no scratch space
   (`persistence/maintenance.rs`). It does not start a `Compact` or `Combine`, which would
