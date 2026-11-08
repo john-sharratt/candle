@@ -9,7 +9,7 @@ use crate::actor::{need_read, Actor};
 use crate::line::{Line, LineId};
 use crate::path::JournalPath;
 use crate::period::Period;
-use crate::terms::shown;
+use crate::terms::shown as current_lines;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 use crate::view::who::render_line;
@@ -152,7 +152,7 @@ pub fn grep(
             cut.text = excerpt(&l.text, phrase);
             render_line(tree, &cut)
         };
-        for l in shown(&j.window, now) {
+        for l in current_lines(&j.window, now) {
             if holds(&l.text, &want) {
                 hits.push(Hit {
                     path: path.clone(),
