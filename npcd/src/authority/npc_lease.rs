@@ -15,7 +15,7 @@
 //!   naming what the old holder wrote — its turns, its journal — for the new
 //!   one to have applied before the character wakes there.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use cluster::consensus::rendezvous::{owner, Weighted};
 use cluster::frame::Plan;
@@ -240,6 +240,19 @@ pub fn lend(
     out
 }
 
+/// Keep each character in `suspended` where it is: its lease's move, if one
+/// is asked, is withdrawn, and it is renewed where it runs as `lend` renews
+/// it. A suspended character takes no turn, so it holds the member nothing to
+/// move it for — and every move is a hand-back and a wake on the next member,
+/// which must hold it as still as this one does.
+pub fn hold_still(leases: &mut BTreeMap<u64, NpcLease>, suspended: &HashSet<u64>) {
+    for (nid, lease) in leases.iter_mut() {
+        if suspended.contains(nid) {
+            lease.next = None;
+        }
+    }
+}
+
 /// Whether `node` is among `members` with a weight: one the plan lends to.
 fn hosts(members: &[Weighted], node: u64) -> bool {
     members.iter().any(|m| m.node == node && m.weight > 0.0)
@@ -434,6 +447,25 @@ mod tests {
             back_to_a.waits,
             vec![w(a, 900), w(b, 80), w(c, 70), w(d, 10)]
         );
+    }
+
+    /// **A suspended character is not moved**: the move rendezvous asks for it
+    /// is withdrawn, its holder kept, and a character not suspended moves as
+    /// asked.
+    #[test]
+    fn a_suspended_character_is_held_where_it_is() {
+        let before = members(&[1]);
+        let after = members(&[1, 2]);
+        let moving: Vec<u64> = (1..)
+            .filter(|n| lent_to(*n, &after) == Some(2))
+            .take(2)
+            .collect();
+        let held = lend(&moving, &BTreeMap::new(), &before, &joined(&[1]), NOW);
+        let mut lent = lend(&moving, &held, &after, &joined(&[1, 2]), NOW + 1_000);
+        hold_still(&mut lent, &HashSet::from([moving[0]]));
+        assert_eq!(lent[&moving[0]].holder, hex(1));
+        assert_eq!(lent[&moving[0]].next, None, "suspended: kept where it is");
+        assert_eq!(lent[&moving[1]].next.as_deref(), Some(hex(2).as_str()));
     }
 
     /// **A move, once asked, completes** (`docs/static_placement.md` §5.5):

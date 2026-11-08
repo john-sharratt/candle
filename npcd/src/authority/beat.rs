@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use cluster::frame::Pulse;
 
-use super::npc_lease::{leases_of, lend, moves, with_leases, LEASES};
+use super::npc_lease::{hold_still, leases_of, lend, moves, with_leases, LEASES};
 use super::pulse::{self, EVENTS};
 use super::role::Role;
 use super::told::{self, TOLD};
@@ -107,7 +107,11 @@ impl Runtime {
                 .map(|(npc, _)| npc)
                 .collect();
             let (members, joined) = self.lending_members();
-            let lent = lend(&cast, &current, &members, &joined, now_ms());
+            let mut lent = lend(&cast, &current, &members, &joined, now_ms());
+            // A suspended character stays where it is, by its record.
+            if let Some(npcs) = self.npcs() {
+                hold_still(&mut lent, &npcs.view().suspended());
+            }
             let moved = moves(&current, &lent);
             if !moved.is_empty() {
                 let weights: Vec<String> = members

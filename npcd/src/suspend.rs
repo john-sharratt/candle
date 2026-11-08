@@ -16,11 +16,11 @@
 //! its engine slot and resident K/V are freed for other work, and the turn it
 //! takes once resumed rejoins the conversation from the log.
 //!
-//! A lease may still move it, as it moves any character: a hand-back takes no
-//! turn, and the member it lands on holds it suspended from its first moment,
-//! since every member follows the record. Pinning it instead would stall a
-//! member's drain — a deploy's restart among them — on a character that is
-//! doing nothing.
+//! Its lease is not moved while it is suspended (`npc_lease::hold_still`): a
+//! move is a hand-back and a wake on the next member, and a character woken by
+//! a move once took turns there while suspended in every record. It stays
+//! where it runs, which a member's drain does not wait on — a suspended
+//! character takes no turn to finish.
 //!
 //! The state is the character's record ([`crate::npcs::Npcs::suspend`]), so it
 //! survives a restart and replicates; the member that writes it brings its own

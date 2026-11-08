@@ -847,9 +847,9 @@ the newest 20 of each source — one thread, one speaker, one thing watched, the
 and one counted line where the rest stood: "While you were suspended, 214 more messages on
 #general." An arrival that only restates a standing fact (a situation, an unread count) keeps its
 newest alone. Its round mission's hour stands still while it is suspended and picks up where it
-stood on the resume, so a character held past the hour is not called off for it. A lease may still
-move it: a hand-back takes no turn, and the member it lands on holds it suspended from its first
-moment, so a member's drain never waits on a character doing nothing.
+stood on the resume, so a character held past the hour is not called off for it. Its lease is not
+moved while it is suspended: it stays on the member that runs it, since a character woken on a new
+member by a move once took turns there while every record suspended it.
 
 The state is the character's record, so it survives a restart and replicates to every member like
 any other edit; the member that writes it holds its own scheduler at once, and every other member
