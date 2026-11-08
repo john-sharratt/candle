@@ -209,11 +209,17 @@ mod tests {
         let mut front = zen();
         front.list_changed = true;
         let init = initialize_result(&front, "2025-11-25", "https://x");
-        assert_eq!(init["capabilities"], json!({"tools": {"listChanged": true}}));
+        assert_eq!(
+            init["capabilities"],
+            json!({"tools": {"listChanged": true}})
+        );
         let d = discover_result(&front, "https://x");
         assert_eq!(d["capabilities"], json!({"tools": {"listChanged": true}}));
         let behind = initialize_result(&zen(), "2025-11-25", "https://x");
-        assert_eq!(behind["capabilities"], json!({"tools": {"listChanged": false}}));
+        assert_eq!(
+            behind["capabilities"],
+            json!({"tools": {"listChanged": false}})
+        );
     }
 
     #[test]

@@ -152,7 +152,11 @@ mod tests {
             Ok(Known::Person(slug("zen")))
         );
         assert_eq!(
-            resolve(&t, &key("7777777777777777"), Some(&email("zen@example.com"))),
+            resolve(
+                &t,
+                &key("7777777777777777"),
+                Some(&email("zen@example.com"))
+            ),
             Ok(Known::Stranger)
         );
     }

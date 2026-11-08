@@ -103,7 +103,10 @@ mod tests {
         assert!(s.take_owed("a"));
         assert!(!s.take_owed("a"), "paid");
         s.answered("a", 0, "z2", 4);
-        assert!(!s.take_owed("a"), "the new listing is now the one it is owed against");
+        assert!(
+            !s.take_owed("a"),
+            "the new listing is now the one it is owed against"
+        );
     }
 
     /// **A session this process never served is owed the notice**, and
