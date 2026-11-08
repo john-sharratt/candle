@@ -78,7 +78,7 @@ pub fn candidates(
     limit: usize,
 ) -> BTreeMap<String, Vec<(String, f32)>> {
     let mut out: BTreeMap<String, Vec<(String, f32)>> = BTreeMap::new();
-    for (person, taste) in tastes {
+    for (_, taste) in tastes {
         let mut w: Vec<(&String, f32)> = taste
             .iter()
             .map(|(id, h)| (id, weight(h)))

@@ -6,6 +6,9 @@
 //! | [`control`] | Every control a mixer has, by one name |
 //! | [`plan`] | A transition plan: moves at beats |
 //! | [`brain`] | The set plan, the shortlist, Zen's choice, transition plans |
+//! | [`conductor`] | The per-beat loop: plans run, loads confirmed, the watchdog |
+//! | [`hands`] | A person and ZenJ on one mixer: modes, taking back, the walk back |
+//! | [`events`] | What happened, in order |
 //! | [`midi`] | The wire, controller maps, the ports |
 //! | [`deck`] | rekordbox's live deck state, read from its memory |
 //! | [`rekordbox`] | rekordbox's library and analysis files |
@@ -15,8 +18,11 @@
 //! | [`library`] | The tracks ZenJ plays from, built ahead of the night |
 
 pub mod brain;
+pub mod conductor;
 pub mod control;
 pub mod deck;
+pub mod events;
+pub mod hands;
 pub mod library;
 pub mod midi;
 pub mod music;

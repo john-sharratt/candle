@@ -135,7 +135,7 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Offsets>, String> {
 mod tests {
     use super::*;
 
-    const SHIPPED: &str = include_str!("../../data/offsets");
+    const SHIPPED: &str = include_str!("../../offsets/rekordbox.txt");
 
     /// **The shipped offsets read**: 7.2.19's master chain and its decks
     /// exactly, each with its uuid; 7.2.2's with none; the last block read
