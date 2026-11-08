@@ -44,7 +44,7 @@ pub fn zend_call(
             }
             let mut call = json!({
                 "thread": thread,
-                "name": text("name")?,
+                "name": text("title")?,
                 "prompt": text("prompt")?,
                 "driven": "attended",
                 "wait_s": 0,
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(
             zend_call(
                 "task_start",
-                &args(json!({"name": "fix-door", "prompt": "Fix the door.", "role": "coder"})),
+                &args(json!({"title": "fix-door", "prompt": "Fix the door.", "role": "coder"})),
                 &t,
                 None
             )
@@ -247,14 +247,14 @@ mod tests {
         );
         assert!(zend_call(
             "task_start",
-            &args(json!({"name": "a", "prompt": "b"})),
+            &args(json!({"title": "a", "prompt": "b"})),
             &t,
             h
         )
         .unwrap_err()
         .contains("started already"));
         assert_eq!(
-            zend_call("task_start", &args(json!({"name": "a"})), &t, None).unwrap_err(),
+            zend_call("task_start", &args(json!({"title": "a"})), &t, None).unwrap_err(),
             "Say the `prompt`."
         );
     }
