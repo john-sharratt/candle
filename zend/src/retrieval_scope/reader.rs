@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::memory_paths::{self, Owner};
+use crate::memory_paths::{self, is_memory_repo, Owner};
 
 /// The person a conversation reads the memory as, and the groups they read.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -52,7 +52,7 @@ impl Reader {
     /// Anything outside the memory is everyone's.
     pub fn reads(&self, at: &str) -> bool {
         match at.split_once('/') {
-            Some((repo, path)) if repo == memory_paths::REPO => self.reads_memory(path),
+            Some((repo, path)) if is_memory_repo(repo) => self.reads_memory(path),
             _ => true,
         }
     }

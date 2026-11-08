@@ -499,7 +499,7 @@ mod tests {
     use crate::actor::Actor;
     use crate::files::summary::{Cite, Sentence};
     use crate::ops::fixture::{john, now, p, zen};
-    use crate::ops::{apply, OnTaken, Op};
+    use crate::ops::{apply, Call, OnTaken, Op};
     use crate::terms::Terms;
     use crate::testing::slug;
     use crate::tree::fingerprint::fingerprint;
@@ -679,8 +679,11 @@ mod tests {
                 &server,
                 &Op::Activity {
                     path: yesterday.clone(),
-                    tool: tool.into(),
-                    subject: subject.into(),
+                    calls: vec![Call {
+                        at: now().plus(i as i64),
+                        tool: tool.into(),
+                        subject: subject.into(),
+                    }],
                 },
                 now().plus(i as i64),
             )

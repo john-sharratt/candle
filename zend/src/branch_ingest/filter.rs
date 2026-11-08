@@ -1,7 +1,7 @@
 //! Which of a tree's files an ingest layer reads — decided from the listing
 //! alone, before any file is opened (`docs/zend_branch_ingest.md` §5).
 
-use crate::memory_paths::{self, is_conversation};
+use crate::memory_paths::{is_conversation, is_memory_repo};
 use crate::repo_scan::types::Language;
 
 /// The largest file an ingest layer reads.
@@ -64,7 +64,7 @@ impl IngestScope {
         if size > MAX_FILE_BYTES || path.split('/').any(|c| c.starts_with('.')) {
             return None;
         }
-        if repo == memory_paths::REPO && is_conversation(path) {
+        if is_memory_repo(repo) && is_conversation(path) {
             return None;
         }
         let key = format!("{repo}/{path}");

@@ -139,6 +139,7 @@ use crate::mcp::{
     archiving, lineage, memory_sections, nudges, resuming, stops, tending, thread_export, threads,
     workers,
 };
+use crate::memory_paths;
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -5687,9 +5688,10 @@ fn inherited_want(i: &lineage::Inherited) -> Want<'_> {
     }
 }
 
-/// The memory sections `conv_id` carries: the topics its thread is about, read
-/// from the memory's tree as last published — none for a conversation not
-/// owned through `/mcp`, a thread about nothing, or a memory not open.
+/// The memory sections `conv_id` carries: the topics its thread is about that
+/// its reader still reads, from the memory's tree as last published — none
+/// for a conversation not owned through `/mcp`, a thread about nothing, or a
+/// memory not open.
 fn carried_memory(state: &InferenceState, conv_id: &str) -> Vec<lineage::Inherited> {
     let Some((owner, thread, _)) = conv_names(conv_id) else {
         return Vec::new();
@@ -5706,7 +5708,13 @@ fn carried_memory(state: &InferenceState, conv_id: &str) -> Vec<lineage::Inherit
         .iter()
         .filter_map(|p| path_from_wire(p).ok())
         .collect();
-    memory_sections::sections(&memory_sections::topics(&tree, &about, Stamp::now()))
+    let reader = state.retrieval_scope.reader_of(conv_id);
+    memory_sections::sections(&memory_sections::topics(
+        &tree,
+        &about,
+        &reader,
+        Stamp::now(),
+    ))
 }
 
 /// One journal above a conversation: the ancestor it is and the bare name it
@@ -6972,13 +6980,26 @@ impl ZendSession {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let mcp = Arc::new(McpState::default());
-        // The memory backbone, when the agent holds the journal repository.
+        // The memory backbone, when the agent holds the journal repository —
+        // and the workspace repository that is it, by its folder, so retrieval
+        // and ingest keep the memory's boundary whatever it is called.
         if let Some(journal) = config
             .agent
             .as_ref()
             .and_then(|jobs| jobs.checkouts().journal())
         {
             mcp.memory().start(journal.dir.clone());
+            let same = |dir: &Path| match (dir.canonicalize(), journal.dir.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => dir == journal.dir,
+            };
+            let named = config
+                .workspace
+                .repos()
+                .iter()
+                .find(|r| r.folder().is_some_and(same))
+                .map_or(journal.name.as_str(), |r| r.name.as_str());
+            memory_paths::name_repo(named);
         }
         Self {
             inference: Arc::new(ArcSwapOption::empty()),

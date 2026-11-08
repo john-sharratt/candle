@@ -26,6 +26,7 @@ use crate::ops::{OnTaken, Op};
 use crate::path::{JournalPath, Place};
 use crate::scope::Section;
 use crate::slug::Slug;
+use crate::terms::Terms;
 use crate::tree::Tree;
 
 /// Sections a member's AI organises: creates and links in.
@@ -75,7 +76,7 @@ fn texts(op: &Op) -> Vec<&str> {
         Op::Episode { text, .. } | Op::Edit { text, .. } | Op::FoldPeriod { text, .. } => {
             vec![text]
         }
-        Op::Activity { subject, .. } => vec![subject],
+        Op::Activity { calls, .. } => calls.iter().map(|c| c.subject.as_str()).collect(),
         Op::Create { cue, .. } | Op::Link { cue, .. } => vec![cue],
         Op::Summarize {
             sentences,
@@ -126,6 +127,26 @@ pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
     // readers is never an instruction to them.
     for text in texts(op) {
         refuse_instructions(text)?;
+    }
+    // A note that replaces a line hides it, which is changing it: the same
+    // right as an edit, whoever writes the note.
+    if let Op::Note {
+        path,
+        terms: Terms {
+            replaces: Some(old),
+            ..
+        },
+        ..
+    } = op
+    {
+        if let Some(line) = tree.need(path)?.line(old) {
+            if !may_change_line(tree, actor, path, line.account.as_ref()) {
+                return Err(no(
+                    actor,
+                    "replace another member's line: propose the change, or ask an owner",
+                ));
+            }
+        }
     }
     match (actor, op) {
         (Actor::System, Op::Bind { .. }) => Ok(()),

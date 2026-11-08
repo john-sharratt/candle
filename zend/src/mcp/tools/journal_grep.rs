@@ -7,11 +7,11 @@
 
 use journals::slug::Slug;
 use journals::time::Stamp;
-use journals::view::grep::{grep_by, render, Filter, Only};
+use journals::view::grep::{grep_by, render, After, Filter, Only, SUMMARY};
 use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
 
-use super::fit::around;
+use super::fit::{around, MAX_ANSWER};
 use super::mem::{Mem, PATHS};
 use super::{mem, string, Answer, Ctx, LOADING};
 use crate::mcp::memory::is_memory_path;
@@ -47,7 +47,7 @@ pub fn definition() -> Value {
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_HITS, "description": "Hits to answer (20 by default)."},
                 "kind": {"type": "string", "enum": ["note", "fold", "proposal"], "description": "Memory only: lines of this kind alone."},
                 "speaker": {"type": "string", "description": "Memory only: lines this person spoke or wrote, `yen`."},
-                "after": {"type": "string", "description": "Memory only: the page after this line, `<path>#<line id>` — the last hit of the page before, as its answer names it."}
+                "after": {"type": "string", "description": "Memory only: the page after this hit — the last of the page before, as its answer names it (`<path>#<line id>`, `<path>#summary` or a journal's `<path>`)."}
             },
             "required": ["journal", "pattern"],
             "additionalProperties": false
@@ -206,20 +206,27 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
 }
 
 /// The filter `args` state for a memory search: `kind`, `speaker`, and
-/// `after`, the line the page before ended on.
+/// `after`, the hit the page before ended on.
 fn filter_of(m: &Mem, args: &Value) -> Result<Filter, String> {
     let text = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim);
     Ok(Filter {
         only: text("kind").map(Only::parse).transpose()?,
         speaker: text("speaker").map(Slug::parse).transpose()?,
-        after: match text("after") {
-            Some(a) => {
-                let address = m.find_address(a).map_err(String::from)?;
-                Some((address.path, address.id))
-            }
-            None => None,
-        },
+        after: text("after").map(|a| cursor(m, a)).transpose()?,
     })
+}
+
+/// The hit `after` names, as a page's answer names it: `<path>#<line id>`,
+/// `<path>#summary`, or a journal's `<path>`.
+fn cursor(m: &Mem, after: &str) -> Result<After, String> {
+    match after.rsplit_once('#') {
+        Some((path, SUMMARY)) => Ok(After::Summary(m.path(path)?)),
+        Some(_) => {
+            let address = m.find_address(after).map_err(String::from)?;
+            Ok(After::Line(address.path, address.id))
+        }
+        None => Ok(After::Journal(m.path(after)?)),
+    }
 }
 
 /// The memory's lines, archives and summaries that hold `pattern`: under
@@ -235,7 +242,7 @@ fn grep_memory(ctx: &Ctx, journal: &str, pattern: &str, max: usize, args: &Value
     };
     // This conversation's journal holds nothing before its first write.
     if m.here_unopened(journal).is_some() {
-        return Answer::ok(render(&[], 0));
+        return Answer::ok(render(&[], 0, MAX_ANSWER));
     }
     let under = match journal {
         "*" => None,
@@ -244,7 +251,7 @@ fn grep_memory(ctx: &Ctx, journal: &str, pattern: &str, max: usize, args: &Value
             Err(e) => return Answer::error(e),
         },
     };
-    let (hits, total) = grep_by(
+    let (hits, total) = match grep_by(
         Stamp::now(),
         &m.tree,
         &m.actor(),
@@ -252,11 +259,19 @@ fn grep_memory(ctx: &Ctx, journal: &str, pattern: &str, max: usize, args: &Value
         under.as_ref(),
         &filter,
         max,
-    );
+    ) {
+        Ok(found) => found,
+        Err(e) => return Answer::error(e),
+    };
     if hits.is_empty() {
-        return Answer::ok(render(&hits, total));
+        return Answer::ok(render(&hits, total, MAX_ANSWER));
     }
-    Answer::ok(format!("{NOT_INSTRUCTIONS}\n{}", render(&hits, total)))
+    // The hits fit in what the framing leaves, so the cursor is never cut.
+    let fit = MAX_ANSWER - NOT_INSTRUCTIONS.chars().count() - 1;
+    Answer::ok(format!(
+        "{NOT_INSTRUCTIONS}\n{}",
+        render(&hits, total, fit)
+    ))
 }
 
 #[cfg(test)]

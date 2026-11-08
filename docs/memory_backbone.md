@@ -469,10 +469,13 @@ the same fields: `{at: …, kind: note, text: "…"}` on one line reads as well.
   replaces, is hidden from every read, search and frame, and kept in its file
   and in history.
 - **A conversation's calls are not lines.** Each call that changed something
-  is kept on the conversation's `journal.yaml` as `activity` — one
-  `{at, tool, subject}` to a line, the newest 200, older ones counted per tool
-  in `activity_before` (`journals::files::activity`). Nothing reads it but the
-  frame's "where it left off" and the conversation's own view.
+  is kept on the conversation's `journal.yaml` as `activity` — each call's
+  `at`, `tool` and `subject`, with the `id` of the episode line it was once
+  kept as when one was moved in; the newest 200, older ones counted per tool
+  in `activity_folded` (`journals::files::activity`). A call is noted in
+  memory and a conversation's calls are written together, at most once a
+  minute, off the request path (`zend::mcp::noted_calls`). Nothing reads it
+  but the frame's "where it left off" and the conversation's own view.
 - **A change is held to the tree it changed** (`journals check <dir> --against
   <old dir> [--forgets <file>] [--budget <file>]`, and the worker tool's
   `against_base`): every line of the old tree is somewhere in the new one

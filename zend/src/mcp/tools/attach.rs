@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::thread;
 
+use journals::path::JournalPath;
 use journals::scope::Section;
 use serde_json::{json, Value};
 
@@ -113,9 +114,7 @@ fn bind_about(
         .iter()
         .map(|t| m.path(t))
         .collect::<Result<Vec<_>, _>>()?;
-    if let Some(p) = paths.iter().find(|p| p.section() != Some(Section::Topics)) {
-        return Err(format!("`about` names topics; {p} is none"));
-    }
+    check_topics(&paths)?;
     thread_export::bind(records, owner, thread, &group, &paths).map_err(|e| e.to_string())?;
     let Some(bound) = thread_export::bound(records, owner, thread) else {
         return Ok(());
@@ -126,6 +125,26 @@ fn bind_about(
             tracing::warn!(%thread, "mcp: the thread's memory journal could not be opened: {e}");
         }
     });
+    Ok(())
+}
+
+/// `about`'s journals, as resolved: each a topic, and each named once — a
+/// topic twice would carry its lines twice in the space three share. Two
+/// paths that reach one journal through a reference are one topic.
+fn check_topics(paths: &[JournalPath]) -> Result<(), String> {
+    if let Some(p) = paths.iter().find(|p| p.section() != Some(Section::Topics)) {
+        return Err(format!("`about` names topics; {p} is none"));
+    }
+    if let Some((i, p)) = paths
+        .iter()
+        .enumerate()
+        .find(|(i, p)| paths[..*i].contains(p))
+    {
+        return Err(format!(
+            "`about` names {p} twice (topic {}): name each topic once",
+            i + 1
+        ));
+    }
     Ok(())
 }
 
@@ -162,5 +181,22 @@ mod tests {
              them.\n\nJournal of T:review, written by Claude — no entries yet."
         );
         assert_eq!(answer("review", false, "J"), "Attached to T:review.\n\nJ");
+    }
+
+    /// **Each topic is named once, and each is a topic.**
+    #[test]
+    fn about_names_each_topic_once() {
+        let m = mem::tests::mem("john");
+        let topics = m.path("topics").unwrap();
+        let people = m.path("people").unwrap();
+        assert!(check_topics(&[topics.clone()]).is_ok());
+        assert_eq!(
+            check_topics(&[topics.clone(), topics.clone()]).unwrap_err(),
+            "`about` names @zen/topics twice (topic 2): name each topic once"
+        );
+        assert_eq!(
+            check_topics(&[topics, people]).unwrap_err(),
+            "`about` names topics; @zen/people is none"
+        );
     }
 }

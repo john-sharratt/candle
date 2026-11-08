@@ -26,6 +26,7 @@ use tokio::sync::watch;
 use web::auth::oidc::random_token;
 
 use super::memory::Memory;
+use super::noted_calls::NotedCalls;
 use super::ops_tools::OpsTools;
 use super::records::Records;
 
@@ -182,12 +183,14 @@ impl<R: Records> Store for RecordStore<R> {
 }
 
 /// What `/v1/mcp` holds in memory: the change signal, the runner of the ops
-/// tools, the memory backbone, and the sessions' noted use.
+/// tools, the memory backbone, the sessions' noted use, and the calls noted
+/// for their conversations' activity.
 pub struct McpState {
     changed: watch::Sender<u64>,
     ops: Arc<OpsTools>,
     memory: Arc<Memory>,
     used: Arc<Used>,
+    noted: NotedCalls,
 }
 
 impl Default for McpState {
@@ -197,11 +200,18 @@ impl Default for McpState {
             ops: Arc::default(),
             memory: Arc::default(),
             used: Arc::default(),
+            noted: NotedCalls::default(),
         }
     }
 }
 
 impl McpState {
+    /// The calls that changed something, waiting to be written into their
+    /// conversations' activity.
+    pub fn noted(&self) -> &NotedCalls {
+        &self.noted
+    }
+
     /// The sessions' use as noted in memory, for each [`RecordStore`].
     pub fn used(&self) -> &Arc<Used> {
         &self.used

@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use axum::http::{HeaderName, HeaderValue, Method};
+use candle_conversation::persistence::SharedSubstrate;
 use host::cluster::up::Reply;
 use host::commands::class::Class;
 use journals::scope::Channel;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use web::auth::Role;
 use zend_tools::{run_watch, OpsRunner};
@@ -22,6 +24,7 @@ use super::approvals::{self, Approval};
 use super::caller::{Caller, Person};
 use super::npcd_tools;
 use super::ops;
+use super::records::Records;
 use super::roles::WorkerKind;
 use super::threads;
 use super::tools::mem::Mem;
@@ -38,6 +41,15 @@ use crate::session::ZendSession;
 /// The longest a worker's call waits: it has no client to cut it off, and a
 /// round that waited longer would hold the conversation for nothing.
 const WORKER_WAIT_S: u64 = 300;
+
+/// Where a dialogue's person is kept, under its conversation id's digest.
+const DIALOGUE_PERSON: &str = "mcp/dialogue-person/";
+
+fn dialogue_person_key(conv_id: &str) -> String {
+    let digest = Sha256::digest(conv_id.as_bytes());
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{DIALOGUE_PERSON}{hex}")
+}
 
 /// Who an operations tool runs for, and how it may wait.
 #[derive(Clone)]
@@ -440,8 +452,10 @@ pub struct OpsTools {
     /// arrives on a tool round's own thread.
     bound: OnceLock<(Weak<ZendSession>, Handle)>,
     /// Each dialogue's person: whose signed-in message started its latest
-    /// turn, by conversation id. A dialogue's tools read the cluster as them.
-    /// Held in memory, as the turn and its tool rounds run in this process.
+    /// turn, by conversation id. A dialogue's tools read the cluster as them,
+    /// and its retrieval reads the memory as them. Each is also kept as a
+    /// record ([`DIALOGUE_PERSON`]), so a turn resumed after a restart is
+    /// still theirs; this holds what this process has read or written.
     people: Mutex<HashMap<String, Person>>,
     /// The conversations whose current turn has read content from outside
     /// (`tool_round::READS_UNTRUSTED`): what they write to memory waits for a
@@ -455,17 +469,48 @@ impl OpsTools {
         let _ = self.bound.set((session, runtime));
     }
 
+    /// The substrate's records, once the session is bound and loaded.
+    fn records(&self) -> Option<SharedSubstrate> {
+        self.bound.get()?.0.upgrade()?.shared_substrate()
+    }
+
     /// Note who started dialogue `conv_id`'s turn: `None` for a message no
-    /// signed-in person sent, which reads nothing as anyone.
+    /// signed-in person sent, which reads nothing as anyone. A change is kept
+    /// on the dialogue's record too.
     pub fn note_dialogue_person(&self, conv_id: &str, person: Option<Person>) {
-        let mut people = self.people.lock().unwrap_or_else(|e| e.into_inner());
-        match person {
-            Some(p) => {
-                people.insert(conv_id.to_string(), p);
+        let was = {
+            let mut people = self.people.lock().unwrap_or_else(|e| e.into_inner());
+            match &person {
+                Some(p) => people.insert(conv_id.to_string(), p.clone()),
+                None => people.remove(conv_id),
             }
-            None => {
-                people.remove(conv_id);
+        };
+        let Some(records) = self.records() else {
+            return;
+        };
+        let key = dialogue_person_key(conv_id);
+        let kept = match &person {
+            Some(p) if was.as_ref() == Some(p) => return,
+            Some(p) => serde_json::to_value(p)
+                .map_err(Into::into)
+                .and_then(|v| records.put(&key, v)),
+            // A record another process wrote is ended as well.
+            None if was.is_none() && records.get(&key).is_none() => return,
+            None => records.cease(&key),
+        };
+        if let Err(e) = kept {
+            tracing::warn!(conv_id, "mcp: the dialogue's person could not be kept: {e}");
+        }
+    }
+
+    /// Whom conversation `conv_id` works for: a task's or a chat's person, as
+    /// its worker's record names them, or a dialogue's.
+    pub fn reader_person(&self, conv_id: &str) -> Option<Person> {
+        match threads::conv_names(conv_id) {
+            Some((owner, thread, name)) => {
+                threads::worker(&self.records()?, owner, thread, name)?.person
             }
+            None => self.dialogue_person(conv_id),
         }
     }
 
@@ -486,19 +531,24 @@ impl OpsTools {
             .contains(conv_id)
     }
 
-    /// The account key of whoever's message started dialogue `conv_id`'s
-    /// turn: whom its retrieval reads the memory as.
-    pub fn dialogue_key(&self, conv_id: &str) -> Option<String> {
-        self.dialogue_person(conv_id).map(|p| p.key())
-    }
-
-    /// Whose message started dialogue `conv_id`'s turn.
+    /// Whose message started dialogue `conv_id`'s turn: as this process
+    /// noted it, else as its record keeps it.
     fn dialogue_person(&self, conv_id: &str) -> Option<Person> {
-        self.people
+        if let Some(p) = self
+            .people
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(conv_id)
-            .cloned()
+        {
+            return Some(p.clone());
+        }
+        let person: Person =
+            serde_json::from_value(self.records()?.get(&dialogue_person_key(conv_id))?).ok()?;
+        self.people
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(conv_id.to_string(), person.clone());
+        Some(person)
     }
 }
 

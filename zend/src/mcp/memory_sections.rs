@@ -18,6 +18,7 @@ use journals::tree::Tree;
 use journals::view::who::render_line;
 
 use super::lineage::Inherited;
+use crate::retrieval_scope::Reader;
 
 /// The most memory text a worker carries, in characters: about 4K tokens,
 /// beside the lineage's [`super::lineage::MAX_CHARS`].
@@ -45,20 +46,26 @@ pub struct Topic {
     pub lines: Vec<String>,
 }
 
-/// The topics `about` names, read from `tree` as of `now`: a path the tree
-/// does not hold is carried as no lines, keeping the others' places.
-pub fn topics(tree: &Tree, about: &[JournalPath], now: Stamp) -> Vec<Topic> {
+/// The topics `about` names, read from `tree` as of `now` for `reader`: a
+/// path the tree does not hold, or one in a group the reader no longer reads,
+/// is carried as no lines, keeping the others' places. A thread's `about` is
+/// checked when it is bound; this keeps a person who has since left a group
+/// from being carried its lines (`docs/zen_memory_and_guides.md` D2).
+pub fn topics(tree: &Tree, about: &[JournalPath], reader: &Reader, now: Stamp) -> Vec<Topic> {
     about
         .iter()
         .take(MAX_TOPICS)
         .map(|path| Topic {
             path: path.show(),
-            lines: tree.get(path).map_or_else(Vec::new, |j| {
-                shown(&j.window, now)
-                    .into_iter()
-                    .map(|l| render_line(tree, l))
-                    .collect()
-            }),
+            lines: tree
+                .get(path)
+                .filter(|_| reader.reads_memory(&format!("{}/", path.folder())))
+                .map_or_else(Vec::new, |j| {
+                    shown(&j.window, now)
+                        .into_iter()
+                        .map(|l| render_line(tree, l))
+                        .collect()
+                }),
         })
         .collect()
 }
@@ -261,7 +268,8 @@ mod tests {
             .child(Slug::parse("none").unwrap())
             .unwrap();
         let tree = m.tree().unwrap();
-        let got = topics(&tree, &[own, missing], Stamp::now());
+        let john = Reader::person("john", ["zen".to_string()]);
+        let got = topics(&tree, &[own.clone(), missing], &john, Stamp::now());
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].path, "@zen/people/john");
         assert_eq!(got[0].lines.len(), 1, "{:?}", got[0].lines);
@@ -272,6 +280,11 @@ mod tests {
         );
         assert_eq!(got[1].path, "@zen/topics/none");
         assert!(got[1].lines.is_empty());
+        // Out of the group, the same thread carries none of its lines.
+        let left = Reader::person("john", []);
+        let got = topics(&tree, &[own], &left, Stamp::now());
+        assert_eq!(got[0].path, "@zen/people/john");
+        assert!(got[0].lines.is_empty(), "{:?}", got[0].lines);
     }
 
     #[test]

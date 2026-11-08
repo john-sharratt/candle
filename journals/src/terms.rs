@@ -79,13 +79,20 @@ impl Terms {
 /// The lines of `window` shown at `now`: those not past their `expires` and
 /// not superseded by another line's `replaces`, in their order.
 pub fn shown(window: &[Line], now: Stamp) -> Vec<&Line> {
-    let replaced: HashSet<&LineId> = window
-        .iter()
-        .filter_map(|l| l.terms.replaces.as_ref())
-        .collect();
+    let replaced = replaced(window);
     window
         .iter()
         .filter(|l| !replaced.contains(&l.id) && is_current(l, now))
+        .collect()
+}
+
+/// Every line one of `lines` replaces. A proposal replaces nothing until a
+/// member accepts it.
+pub fn replaced<'a>(lines: impl IntoIterator<Item = &'a Line>) -> HashSet<&'a LineId> {
+    lines
+        .into_iter()
+        .filter(|l| !l.proposed)
+        .filter_map(|l| l.terms.replaces.as_ref())
         .collect()
 }
 
@@ -158,6 +165,29 @@ mod tests {
             ],
             "before its expiry a reminder is shown"
         );
+    }
+
+    /// **A proposal replaces nothing until it is accepted**: the line it
+    /// names stays shown beside it.
+    #[test]
+    fn a_proposal_hides_nothing_until_accepted() {
+        let old = note("2026-10-31T00:34:00Z", "The key version is 2.");
+        let mut proposal = note("2026-11-08T05:00:00Z", "The key version is 4.");
+        proposal.terms.replaces = Some(old.id.clone());
+        proposal.proposed = true;
+        let mut window = vec![old, proposal];
+        let texts = |w: &[Line]| -> Vec<String> {
+            shown(w, at("2026-11-08T06:00:00Z"))
+                .into_iter()
+                .map(|l| l.text.clone())
+                .collect()
+        };
+        assert_eq!(
+            texts(&window),
+            ["The key version is 2.", "The key version is 4."]
+        );
+        window[1].proposed = false;
+        assert_eq!(texts(&window), ["The key version is 4."]);
     }
 
     #[test]

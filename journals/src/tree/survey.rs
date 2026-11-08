@@ -9,12 +9,12 @@
 //! it. Each is a proposal the maintenance task verifies before it becomes an
 //! operation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
-use crate::line::{Line, LineId};
+use crate::line::{Kind, Line, LineId};
 use crate::path::JournalPath;
-use crate::terms::is_current;
+use crate::terms::{is_current, replaced};
 use crate::time::Stamp;
 use crate::tree::Tree;
 
@@ -104,11 +104,7 @@ pub fn survey(
                 });
             }
         }
-        let replaced: HashSet<&LineId> = j
-            .window
-            .iter()
-            .filter_map(|l| l.terms.replaces.as_ref())
-            .collect();
+        let replaced = replaced(&j.window);
         let mut first_said: HashMap<String, &LineId> = HashMap::new();
         for line in j.window.iter().filter(|l| !replaced.contains(&l.id)) {
             if let Some(finding) = finding(line, now, &mut first_said, changed_since) {
@@ -134,10 +130,13 @@ fn finding<'a>(
     if !is_current(line, now) {
         return line.terms.expires.map(|at| Finding::Expired { at });
     }
-    if let Some(of) = first_said.get(&said(&line.text)) {
-        return Some(Finding::Duplicate { of: (*of).clone() });
+    // Only a note says a fact: the same episode twice is two things done.
+    if line.kind == Kind::Note {
+        if let Some(of) = first_said.get(&said(&line.text)) {
+            return Some(Finding::Duplicate { of: (*of).clone() });
+        }
+        first_said.insert(said(&line.text), &line.id);
     }
-    first_said.insert(said(&line.text), &line.id);
     let file = line.terms.source.as_deref().and_then(source_file)?;
     changed_since(file, line.at).then(|| Finding::SourceChanged {
         file: file.to_string(),

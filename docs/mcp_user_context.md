@@ -84,9 +84,11 @@ record refused — zend restarting, its model still loading — is tried again
 every 30 seconds, twelve times, which outlasts a model reload: a picture
 drawn while zend is down is still remembered once it is back.
 
-zend keeps it on the conversation's `journal.yaml` as `activity` — the tool,
-the time, the subject cut at 120 characters — the newest 200, older ones
-counted per tool in `activity_before`. It is not a line, so a conversation's
+zend notes it in memory and writes each conversation's notes into its
+`journal.yaml` together, at most once a minute and off the request path, as
+`activity` — the tool, the time it was called, the subject cut at 120
+characters — the newest 200, older ones counted per tool in
+`activity_folded`. It is not a line, so a conversation's
 window holds only what was said and decided, and nothing of it is ingested:
 the branch walk reads no conversation's journal (`docs/zen_memory_and_guides.md`
 D3). Before a conversation's summary is built, the next conversation's

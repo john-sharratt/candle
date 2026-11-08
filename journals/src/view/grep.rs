@@ -5,14 +5,18 @@
 //! shown by default, never what is found. References are not followed, so
 //! each line is found once, at its real path.
 
+use std::cmp::Reverse;
+use std::fmt;
+
 use crate::actor::{need_read, Actor};
 use crate::line::{Kind, Line, LineId};
 use crate::path::JournalPath;
 use crate::period::Period;
 use crate::slug::Slug;
-use crate::terms::shown as current_lines;
+use crate::terms::{is_current, replaced};
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
+use crate::view::room::{fitting, CURSOR_ROOM};
 use crate::view::who::render_line;
 
 /// Where a hit is.
@@ -116,16 +120,76 @@ fn excerpt(text: &str, phrase: &str) -> String {
     out
 }
 
-/// Which lines a search keeps: of one kind, from one speaker, and those after
-/// a line — the last hit of the page before, so a long answer is read page by
-/// page, newest first, no hit on two pages. A filter on lines finds no
+/// Which hits a search keeps: lines of one kind, lines from one speaker, and
+/// whatever comes after the last hit of the page before, so a long answer
+/// is read page by page, no hit on two pages. A filter on lines finds no
 /// journal by its name, and no summary.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filter {
     pub only: Option<Only>,
     pub speaker: Option<Slug>,
-    /// The line, by its journal and id, the page before ended on.
-    pub after: Option<(JournalPath, LineId)>,
+    /// The hit the page before ended on.
+    pub after: Option<After>,
+}
+
+/// A hit a page ended on, as its answer names it: `<path>` for a journal
+/// found by its name or cue, `<path>#<line id>` for a line, `<path>#summary`
+/// for a summary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum After {
+    Journal(JournalPath),
+    Line(JournalPath, LineId),
+    Summary(JournalPath),
+}
+
+/// What a cursor names a summary by, after its journal's `#`.
+pub const SUMMARY: &str = "summary";
+
+impl fmt::Display for After {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            After::Journal(p) => write!(f, "{p}"),
+            After::Line(p, id) => write!(f, "{p}#{id}"),
+            After::Summary(p) => write!(f, "{p}#{SUMMARY}"),
+        }
+    }
+}
+
+impl Hit {
+    /// The cursor that pages on from this hit.
+    pub fn after(&self) -> After {
+        match (&self.found, &self.id) {
+            (Found::Journal, _) => After::Journal(self.path.clone()),
+            (Found::Summary, _) | (_, None) => After::Summary(self.path.clone()),
+            (Found::Window | Found::Archive(_), Some(id)) => {
+                After::Line(self.path.clone(), id.clone())
+            }
+        }
+    }
+}
+
+/// Where a hit sorts: journals the phrase names first, by path, then what
+/// was written, newest first.
+type Place<'a> = (bool, Reverse<Stamp>, &'a JournalPath, Option<&'a LineId>);
+
+fn place(h: &Hit) -> Place<'_> {
+    (
+        h.found != Found::Journal,
+        Reverse(h.at),
+        &h.path,
+        h.id.as_ref(),
+    )
+}
+
+/// Where `after` sorts, read from the tree: a line or a summary sorts by
+/// when it was written, so the page goes on from its place even when it no
+/// longer matches, is hidden, or was filtered out. `None` when it is gone.
+fn place_of<'a>(tree: &Tree, after: &'a After) -> Option<Place<'a>> {
+    Some(match after {
+        After::Journal(p) => (false, Reverse(Stamp::MIN), p, None),
+        After::Line(p, id) => (true, Reverse(tree.get(p)?.line(id)?.at), p, Some(id)),
+        After::Summary(p) => (true, Reverse(tree.get(p)?.summary()?.built), p, None),
+    })
 }
 
 /// The kind of line a search keeps.
@@ -159,7 +223,7 @@ impl Only {
 impl Filter {
     /// Whether it narrows to lines alone.
     fn lines_only(&self) -> bool {
-        self.only.is_some() || self.speaker.is_some() || self.after.is_some()
+        self.only.is_some() || self.speaker.is_some()
     }
 
     fn keeps(&self, l: &Line) -> bool {
@@ -182,10 +246,14 @@ pub fn grep(
     under: Option<&JournalPath>,
     limit: usize,
 ) -> (Vec<Hit>, usize) {
-    grep_by(now, tree, actor, phrase, under, &Filter::default(), limit)
+    let mut hits = found(now, tree, actor, phrase, under, &Filter::default());
+    let total = hits.len();
+    hits.truncate(limit);
+    (hits, total)
 }
 
-/// [`grep`], keeping only the lines `filter` keeps.
+/// [`grep`], keeping only the hits `filter` keeps; or, when the hit its
+/// `after` names is gone from the tree, why the page cannot go on.
 pub fn grep_by(
     now: Stamp,
     tree: &Tree,
@@ -194,10 +262,35 @@ pub fn grep_by(
     under: Option<&JournalPath>,
     filter: &Filter,
     limit: usize,
-) -> (Vec<Hit>, usize) {
+) -> Result<(Vec<Hit>, usize), String> {
+    let mut hits = found(now, tree, actor, phrase, under, filter);
+    // The page after the hit the last one ended on, from that hit's place.
+    if let Some(after) = &filter.after {
+        let Some(from) = place_of(tree, after) else {
+            return Err(format!(
+                "{after} is gone from the memory, so the search cannot go on after it: \
+                 search again without `after`"
+            ));
+        };
+        hits.retain(|h| place(h) > from);
+    }
+    let total = hits.len();
+    hits.truncate(limit);
+    Ok((hits, total))
+}
+
+/// Every hit `filter` keeps, sorted by [`place`].
+fn found(
+    now: Stamp,
+    tree: &Tree,
+    actor: &Actor,
+    phrase: &str,
+    under: Option<&JournalPath>,
+    filter: &Filter,
+) -> Vec<Hit> {
     let want = wanted(phrase);
     if want.is_empty() {
-        return (Vec::new(), 0);
+        return Vec::new();
     }
     let lines_only = filter.lines_only();
     let mut hits = Vec::new();
@@ -222,7 +315,12 @@ pub fn grep_by(
             cut.text = excerpt(&l.text, phrase);
             render_line(tree, &cut)
         };
-        for l in current_lines(&j.window, now) {
+        // A line is hidden wherever it is kept: an archived one past its
+        // expiry, or replaced by a line still in the window, is found by no
+        // search.
+        let replaced = replaced(j.all_lines());
+        let visible = |l: &Line| !replaced.contains(&l.id) && is_current(l, now);
+        for l in j.window.iter().filter(|l| visible(l)) {
             if filter.keeps(l) && holds(&l.text, &want) {
                 hits.push(Hit {
                     path: path.clone(),
@@ -234,7 +332,7 @@ pub fn grep_by(
             }
         }
         for (period, lines) in &j.archives {
-            for l in lines.iter() {
+            for l in lines.iter().filter(|l| visible(l)) {
                 if filter.keeps(l) && holds(&l.text, &want) {
                     hits.push(Hit {
                         path: path.clone(),
@@ -259,36 +357,18 @@ pub fn grep_by(
             }
         }
     }
-    // Journals the phrase names come first, by path, then what was written,
-    // newest first.
-    let line = |h: &Hit| h.found != Found::Journal;
-    hits.sort_by(|a, b| {
-        line(a)
-            .cmp(&line(b))
-            .then_with(|| b.at.cmp(&a.at))
-            .then_with(|| a.path.cmp(&b.path))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    // The page after the line the last one ended on.
-    if let Some((path, id)) = &filter.after {
-        if let Some(i) = hits
-            .iter()
-            .position(|h| &h.path == path && h.id.as_ref() == Some(id))
-        {
-            hits.drain(..=i);
-        }
-    }
-    let total = hits.len();
-    hits.truncate(limit);
-    (hits, total)
+    hits.sort_by(|a, b| place(a).cmp(&place(b)));
+    hits
 }
 
-/// Hits as a reader sees them.
-pub fn render(hits: &[Hit], total: usize) -> String {
+/// Hits as a reader sees them, in an answer of at most `fit` characters: the
+/// first of them that fit, then how many more there are and the cursor that
+/// pages on from the last one shown.
+pub fn render(hits: &[Hit], total: usize, fit: usize) -> String {
     if hits.is_empty() {
         return "Nothing found.".into();
     }
-    let mut out: Vec<String> = hits
+    let lines: Vec<String> = hits
         .iter()
         .map(|h| match &h.found {
             Found::Journal => format!("{} (journal) {}", h.path, h.shown),
@@ -297,17 +377,14 @@ pub fn render(hits: &[Hit], total: usize) -> String {
             Found::Summary => format!("{} (summary) {}", h.path, h.shown),
         })
         .collect();
-    if total > hits.len() {
-        let next = hits
-            .last()
-            .and_then(|h| {
-                let id = h.id.as_ref()?;
-                Some(format!(", or page on with `after: {}#{id}`", h.path))
-            })
-            .unwrap_or_default();
+    let shown = fitting(&lines, fit.saturating_sub(CURSOR_ROOM));
+    let mut out = lines[..shown].to_vec();
+    if total > shown {
         out.push(format!(
-            "… and {} more; narrow the phrase or search under one journal{next}",
-            total - hits.len()
+            "… and {} more; narrow the phrase, search under one journal, or page on with \
+             `after: {}`",
+            total - shown,
+            hits[shown - 1].after()
         ));
     }
     out.join("\n")
@@ -466,7 +543,7 @@ mod tests {
         let (hits, total) = grep(now(), &t, &john(), "CPU experts", None, 10);
         assert_eq!(total, 2);
         assert_eq!(
-            render(&hits, total),
+            render(&hits, total, usize::MAX),
             "@zen/topics/cpu-experts (journal) experts computed by the host pool\n\
              @zen/topics #2026-10-30-1202-b082 2026-10-30 12:02 note, john via Claude Code: \
              The cpu experts pool is on by default."
@@ -599,12 +676,16 @@ mod tests {
         let t = seeded();
         let (hits, total) = grep(now(), &t, &john(), "permit", Some(&p("topics")), 1);
         assert_eq!((hits.len(), total), (1, 2));
-        let text = render(&hits, total);
+        let text = render(&hits, total, usize::MAX);
         assert!(
-            text.contains("… and 1 more; narrow the phrase or search under one journal"),
+            text.ends_with(&format!(
+                "… and 1 more; narrow the phrase, search under one journal, or page on with \
+                 `after: @zen/topics#{}`",
+                hits[0].id.as_ref().unwrap()
+            )),
             "{text}"
         );
-        assert_eq!(render(&[], 0), "Nothing found.");
+        assert_eq!(render(&[], 0, usize::MAX), "Nothing found.");
         assert_eq!(grep(now(), &t, &john(), "  ", None, 5).1, 0);
     }
 
@@ -614,8 +695,9 @@ mod tests {
     #[test]
     fn a_filter_keeps_lines_and_pages_newest_first() {
         let t = seeded();
-        let lines =
-            |filter: &Filter, limit| grep_by(now(), &t, &john(), "permit", None, filter, limit);
+        let lines = |filter: &Filter, limit| {
+            grep_by(now(), &t, &john(), "permit", None, filter, limit).unwrap()
+        };
         let all = lines(&Filter::default(), 50).0;
         let notes = Filter {
             only: Some(Only::Notes),
@@ -628,7 +710,7 @@ mod tests {
             .all(|h| h.found != Found::Journal && h.found != Found::Summary));
         assert!(every.len() <= all.len());
         let first = lines(&notes, 1).0;
-        let after = (first[0].path.clone(), first[0].id.clone().unwrap());
+        let after = first[0].after();
         let rest = lines(
             &Filter {
                 after: Some(after),
@@ -659,5 +741,126 @@ mod tests {
             Only::parse("episode").unwrap_err(),
             "`kind` is `note`, `fold` or `proposal`, not `episode`"
         );
+    }
+
+    /// **A page goes on from its cursor's place even when the cursor's line
+    /// no longer matches**: the next page is what came after it, never the
+    /// first page again. A cursor whose line is gone says so.
+    #[test]
+    fn a_cursor_that_no_longer_matches_still_pages_on() {
+        let mut t = seeded();
+        let (all, total) = grep(now(), &t, &john(), "permit", None, 50);
+        let after = all[1].after();
+        let After::Line(path, id) = &after else {
+            panic!("{after:?}")
+        };
+        t.get_mut(path).unwrap().line_mut(id).unwrap().text = "Edited away.".into();
+        let filter = Filter {
+            after: Some(after.clone()),
+            ..Filter::default()
+        };
+        let (rest, left) = grep_by(now(), &t, &john(), "permit", None, &filter, 50).unwrap();
+        assert_eq!(rest.as_slice(), &all[2..]);
+        assert_eq!(left, total - 2);
+        let gone = Filter {
+            after: Some(After::Line(
+                path.clone(),
+                LineId::parse("2026-01-01-0000-0000").unwrap(),
+            )),
+            ..Filter::default()
+        };
+        assert!(grep_by(now(), &t, &john(), "permit", None, &gone, 50)
+            .unwrap_err()
+            .contains("search again without `after`"));
+    }
+
+    /// **A page that ends on a journal or a summary names a cursor too**, and
+    /// the next page goes on after it.
+    #[test]
+    fn a_page_ending_on_a_journal_pages_on() {
+        let mut t = seeded();
+        apply(
+            &mut t,
+            &john(),
+            &Op::Create {
+                under: p("topics"),
+                name: slug("permits"),
+                cue: "open for council permits".into(),
+                on_taken: OnTaken::Refuse,
+            },
+            now(),
+        )
+        .unwrap();
+        let (first, total) = grep(now(), &t, &john(), "permit", None, 1);
+        assert_eq!(first[0].found, Found::Journal);
+        let text = render(&first, total, usize::MAX);
+        assert!(
+            text.ends_with("page on with `after: @zen/topics/permits`"),
+            "{text}"
+        );
+        let filter = Filter {
+            after: Some(first[0].after()),
+            ..Filter::default()
+        };
+        let (rest, left) = grep_by(now(), &t, &john(), "permit", None, &filter, 50).unwrap();
+        assert_eq!(left, total - 1);
+        assert!(rest.iter().all(|h| h.found != Found::Journal));
+        assert_eq!(
+            After::Summary(p("topics")).to_string(),
+            "@zen/topics#summary"
+        );
+    }
+
+    /// **An archived line is hidden as a window line is**: past its expiry,
+    /// or replaced, no search finds it.
+    #[test]
+    fn a_hidden_archived_line_is_found_by_no_search() {
+        let mut t = zen();
+        let mut expired = note("2026-09-01T10:00:00Z", "the old permit reminder");
+        expired.terms.expires = Some(Stamp::parse("2026-09-02T00:00:00Z").unwrap());
+        let superseded = note("2026-09-01T11:00:00Z", "the permit is version 2");
+        let kept = note("2026-09-01T12:00:00Z", "the archived permit fact");
+        let mut replacing = note("2026-10-01T12:00:00Z", "the permit is version 3");
+        replacing.terms.replaces = Some(superseded.id.clone());
+        let j = t.get_mut(&p("topics")).unwrap();
+        j.archives.insert(
+            Period::parse("2026-09-01").unwrap(),
+            Arc::new(vec![expired, superseded, kept]),
+        );
+        j.window.push(replacing);
+        let texts: Vec<String> = grep(now(), &t, &john(), "permit", None, 50)
+            .0
+            .into_iter()
+            .map(|h| h.shown)
+            .collect();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts[0].ends_with("the permit is version 3"));
+        assert!(texts[1].ends_with("the archived permit fact"));
+    }
+
+    /// **A page that would not fit its answer shows the hits that do**, and
+    /// the cursor pages on from the last one shown.
+    #[test]
+    fn a_page_is_cut_to_its_answer_and_keeps_its_cursor() {
+        let mut t = zen();
+        for i in 0..10 {
+            noted(
+                &mut t,
+                &john(),
+                "topics",
+                &format!("permit {i} {}", "x".repeat(900)),
+                now().plus(60 * i),
+            );
+        }
+        let (hits, total) = grep(now(), &t, &john(), "permit", None, 10);
+        let text = render(&hits, total, 4_000);
+        assert!(text.chars().count() <= 4_000, "{}", text.chars().count());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(lines[3].ends_with(&format!(
+            "… and 7 more; narrow the phrase, search under one journal, or page on with \
+             `after: @zen/topics#{}`",
+            hits[2].id.as_ref().unwrap()
+        )));
     }
 }

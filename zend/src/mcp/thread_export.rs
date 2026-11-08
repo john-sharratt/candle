@@ -11,7 +11,9 @@
 
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
+use candle_conversation::persistence::SharedSubstrate;
 use journals::actor::Actor;
 use journals::error::Error;
 use journals::ops::wire::{path_from_wire, path_to_wire};
@@ -25,6 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use super::memory::{Memory, WriteError};
 use super::records::Records;
+use super::threads::{add_note, Note};
+use super::workers::now_ms;
 
 /// What a thread is bound to in the memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,10 +120,21 @@ pub fn attach(memory: &Memory, person: &Actor, b: &Bound, thread: &str) -> Resul
     Ok(())
 }
 
+/// How many times an export is tried before the thread is told it failed.
+const EXPORT_TRIES: u32 = 3;
+
+/// How long an export waits before it is tried again: what a memory still
+/// being read, or a write that met another, takes to pass.
+const EXPORT_AGAIN: Duration = Duration::from_secs(10);
+
+/// What a thread's own journal says of a note its memory journal lacks.
+pub const NOT_KEPT: &str = "Not kept in memory:";
+
 /// When `owner`'s thread is bound, write `label text` on its memory journal
-/// off the request path.
+/// off the request path. A write that keeps failing is said on the thread's
+/// own journal, so the thread and its memory never disagree unrecorded.
 pub fn spawn_export(
-    records: &dyn Records,
+    records: &SharedSubstrate,
     memory: &Arc<Memory>,
     owner: &str,
     thread: &str,
@@ -129,11 +144,29 @@ pub fn spawn_export(
     let Some(b) = bound(records, owner, thread) else {
         return;
     };
-    let memory = Arc::clone(memory);
-    let (thread, line) = (thread.to_string(), (label.to_string(), text.to_string()));
+    let (records, memory) = (records.clone(), Arc::clone(memory));
+    let (owner, thread) = (owner.to_string(), thread.to_string());
+    let (label, text) = (label.to_string(), text.to_string());
     thread::spawn(move || {
-        if let Err(e) = export(&memory, &b, &thread, &line.0, &line.1) {
-            tracing::warn!(%thread, "mcp: a thread's note could not be kept in the memory: {e}");
+        let mut tries = 0;
+        let why = loop {
+            tries += 1;
+            match export(&memory, &b, &thread, &label, &text) {
+                Ok(()) => return,
+                Err(e) if tries >= EXPORT_TRIES => break e,
+                Err(_) => thread::sleep(EXPORT_AGAIN),
+            }
+        };
+        tracing::warn!(%thread, "mcp: a thread's note could not be kept in the memory: {why}");
+        let missed = Note {
+            label: NOT_KEPT.into(),
+            text: format!("{label} {text} — {why}"),
+            at_ms: now_ms(),
+            worker: None,
+            client: None,
+        };
+        if let Err(e) = add_note(&records, &owner, &thread, &missed) {
+            tracing::warn!(%thread, "mcp: the thread could not be told its note is not in memory: {e}");
         }
     });
 }

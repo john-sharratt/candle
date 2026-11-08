@@ -5,10 +5,30 @@
 //! `conversations` section.
 //!
 //! Paths here are repository-relative: what a branch walk lists for the
-//! `journals` repository.
+//! memory's repository.
+//!
+//! Which workspace repository is the memory is the session's to say
+//! ([`name_repo`]): the one whose folder is the agent's `journal: true`
+//! checkout, whatever the workspace calls it. A tree of the same shape under
+//! any other name is no one's memory, and nothing here treats it as one.
 
-/// The memory's repository, as the workspace names it.
+use std::sync::OnceLock;
+
+/// What the memory's repository is called when the session names none.
 pub const REPO: &str = "journals";
+
+static NAMED: OnceLock<String> = OnceLock::new();
+
+/// Name the workspace repository that is the memory. Set once, as the
+/// session starts; a second call changes nothing.
+pub fn name_repo(name: &str) {
+    let _ = NAMED.set(name.to_string());
+}
+
+/// Whether the workspace repository `repo` is the memory.
+pub fn is_memory_repo(repo: &str) -> bool {
+    repo == NAMED.get().map_or(REPO, String::as_str)
+}
 
 /// The section every conversation's journal sits under.
 const CONVERSATIONS: &str = "conversations";
@@ -64,6 +84,15 @@ mod tests {
             Owner::Repository,
             "a bare folder name holds nothing"
         );
+    }
+
+    /// **The memory is one repository**: until the session names it, the one
+    /// called `journals`; a tree of the same shape under another name is not.
+    #[test]
+    fn the_memory_is_the_repository_named() {
+        assert!(is_memory_repo(REPO));
+        assert!(!is_memory_repo("memory"));
+        assert!(!is_memory_repo("candle"));
     }
 
     /// **Only a file below a group's `conversations` is a conversation's.**

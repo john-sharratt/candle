@@ -21,28 +21,53 @@ pub struct Shape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget(pub Shape);
 
-/// Where each line of `tree` is, by id: its journal's address.
-fn line_homes(tree: &Tree) -> BTreeMap<LineId, String> {
-    tree.journals()
-        .into_iter()
-        .flat_map(|(path, j)| {
-            let at = path.show();
-            j.all_lines()
-                .map(move |l| (l.id.clone(), at.clone()))
-                .collect::<Vec<_>>()
-        })
-        .collect()
+/// Where each line of `tree` is, by id: every journal holding a line of that
+/// id — two journals can hold the same id, minted alike in each — and every
+/// conversation whose activity keeps an episode moved in under it.
+fn line_homes(tree: &Tree) -> BTreeMap<LineId, Vec<String>> {
+    let mut homes: BTreeMap<LineId, Vec<String>> = BTreeMap::new();
+    for (path, j) in tree.journals() {
+        let at = path.show();
+        for l in j.all_lines() {
+            homes.entry(l.id.clone()).or_default().push(at.clone());
+        }
+        let activity = j.meta.iter().flat_map(|m| &m.activity.done);
+        for id in activity.filter_map(|d| d.id.as_ref()) {
+            homes
+                .entry(id.clone())
+                .or_default()
+                .push(format!("{at} (activity)"));
+        }
+    }
+    homes
 }
 
-/// Every line of `old` that `new` holds nowhere, unless `forgets` names it:
-/// each as a problem naming the line and where it was.
+/// The homes of `was` not in `is`, and how many of them are kept elsewhere:
+/// a home is lost when `is` holds the id fewer times than `was` did.
+fn gone<'a>(was: &'a [String], is: &[String]) -> (Vec<&'a String>, usize) {
+    let left: Vec<&String> = was.iter().filter(|h| !is.contains(h)).collect();
+    let lost = was.len().saturating_sub(is.len()).min(left.len());
+    (left, lost)
+}
+
+/// Every line of `old` that `new` holds fewer times, unless `forgets` names
+/// it: each as a problem naming the line and where it was.
 pub fn lost(old: &Tree, new: &Tree, forgets: &BTreeSet<LineId>) -> Vec<String> {
     let kept = line_homes(new);
+    let none = Vec::new();
     line_homes(old)
         .into_iter()
-        .filter(|(id, _)| !kept.contains_key(id) && !forgets.contains(id))
-        .map(|(id, at)| {
-            format!("{at}#{id} is gone: a change keeps every line it does not forget by name")
+        .filter(|(id, _)| !forgets.contains(id))
+        .flat_map(|(id, was)| {
+            let (left, lost) = gone(&was, kept.get(&id).unwrap_or(&none));
+            left.into_iter()
+                .take(lost)
+                .map(|at| {
+                    format!(
+                        "{at}#{id} is gone: a change keeps every line it does not forget by name"
+                    )
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -62,8 +87,9 @@ pub fn shape(old: &Tree, new: &Tree) -> Shape {
         removed: before.keys().filter(|p| !after.contains_key(*p)).count(),
         lines_moved: was
             .iter()
-            .filter(|(id, at)| is.get(*id).is_some_and(|now| now != *at))
-            .count(),
+            .filter_map(|(id, at)| Some(gone(at, is.get(id)?)))
+            .map(|(left, lost)| left.len() - lost)
+            .sum(),
         summaries_rewritten: before
             .iter()
             .filter(|(p, s)| after.get(*p).is_some_and(|now| now != *s))
@@ -137,6 +163,11 @@ mod tests {
 
     /// A tree holding the journals `at`, each `name:` folder with its lines.
     fn tree(at: &[(&str, &[&str])]) -> Tree {
+        load(&files(at))
+    }
+
+    /// The files of [`tree`].
+    fn files(at: &[(&str, &[&str])]) -> BTreeMap<String, Vec<u8>> {
         let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::from([
             ("groups/zen/group.yaml".to_string(), ZEN.as_bytes().to_vec()),
             (
@@ -160,7 +191,34 @@ mod tests {
                 );
             }
         }
-        load(&files)
+        files
+    }
+
+    /// **An id two journals hold is lost when either copy goes**, and an
+    /// episode moved into a conversation's activity keeps its id.
+    #[test]
+    fn each_copy_of_an_id_is_counted_and_activity_keeps_one() {
+        let old = tree(&[("topics/a", &[A]), ("topics/b", &[A])]);
+        let one = tree(&[("topics/a", &[A]), ("topics/b", &[])]);
+        assert_eq!(
+            lost(&old, &one, &BTreeSet::new()),
+            [format!(
+                "@zen/topics/b#{A} is gone: a change keeps every line it does not forget by name"
+            )]
+        );
+        let mut moved = files(&[("topics/a", &[A]), ("topics/b", &[])]);
+        moved.insert(
+            "groups/zen/topics/b/journal.yaml".into(),
+            format!(
+                "name: b\ncue: open for it\ncreated: 2026-10-30T00:00:00Z\nfolded: false\n\
+                 activity:\n  - at: 2026-10-30T09:12:40Z\n    tool: image_generate\n    \
+                 subject: a cat\n    id: {A}\n"
+            )
+            .into_bytes(),
+        );
+        let moved = load(&moved);
+        assert!(lost(&old, &moved, &BTreeSet::new()).is_empty());
+        assert_eq!(shape(&old, &moved).lines_moved, 1);
     }
 
     const A: &str = "2026-10-30-0912-7e3a";
