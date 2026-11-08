@@ -62,13 +62,13 @@ is true, `journal_accept {journal: "<path>#<line id>"}`; when they don't,
 ## Reading and searching
 
 - `journal_read {journal}` opens a journal: its summary, references,
-  sub-journals by cue and newest lines. Read on into older lines by paging
-  `before` the oldest stamp you have; an archive is just further back. One
-  line is `<path>#<line id>`.
+  sub-journals by cue and newest lines. Read on into older lines with
+  `after: <path>#<line id>`, the last line you were shown; an archive is
+  just further back. One line is `<path>#<line id>`.
 - `journal_grep {journal, pattern}` searches one journal, a subtree, or `*`
   for everything the person reads, newest first; narrow it with `kind`
-  (`note`, `fold`, `proposal`, `outcome`) and `speaker`, and page with
-  `before`.
+  (`note`, `fold`, `proposal`) and `speaker` (a person's slug). When more
+  hits remain the answer says so: page on with the `after` it names.
 
 ## Zen's own work: threads and projects
 
