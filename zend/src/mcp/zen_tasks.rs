@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use super::caller::Caller;
 use super::chats::naming::id_of;
+use super::driven::Driven;
 use super::ops_tools::OpsCall;
 use super::records::Records;
 use super::roles::WorkerKind;
@@ -162,7 +163,8 @@ pub fn start(call: &OpsCall, args: &Value) -> Answer {
         &thread,
         name,
         prompt,
-        (Priority::Normal, effort, kind),
+        // Its starter — a task, a chat, a dialogue — waits on it.
+        (Priority::Normal, effort, kind, Driven::Attended),
         by_task,
         Some(&call.lineage),
     ) {

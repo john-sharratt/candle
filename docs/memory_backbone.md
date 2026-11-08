@@ -460,6 +460,24 @@ the same fields: `{at: …, kind: note, text: "…"}` on one line reads as well.
   every version, and `git log -L` / `git blame` answer when and by whom.
 - **A line stays in the journal it was written to.** Moving one is a
   restructuring (§2.6): `git mv` of its file, which keeps its id.
+- **A note states its terms** (`journals::terms`), each a field before its
+  text and absent when not stated: `concluded: true` — the assistant writing it
+  concluded it rather than heard it, which on a topic needs a `source`;
+  `source` — the document section, file:line, commit or URL it rests on;
+  `expires` — when it stops being true; `replaces` — the line of the same
+  journal it supersedes. A line past its `expires`, and a line another
+  replaces, is hidden from every read, search and frame, and kept in its file
+  and in history.
+- **A conversation's calls are not lines.** Each call that changed something
+  is kept on the conversation's `journal.yaml` as `activity` — one
+  `{at, tool, subject}` to a line, the newest 200, older ones counted per tool
+  in `activity_before` (`journals::files::activity`). Nothing reads it but the
+  frame's "where it left off" and the conversation's own view.
+- **A change is held to the tree it changed** (`journals check <dir> --against
+  <old dir> [--forgets <file>] [--budget <file>]`, and the worker tool's
+  `against_base`): every line of the old tree is somewhere in the new one
+  unless `--forgets` names it, and the shape — journals created and removed,
+  lines moved, summaries rewritten — moves no further than the budget.
 
 ### 3.3 Errors
 

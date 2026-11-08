@@ -22,6 +22,7 @@ use web::auth::Role;
 
 use super::activity::Activity;
 use super::caller::Person;
+use super::driven::Driven;
 use super::names::Path;
 use super::records::Records;
 use super::roles::WorkerKind;
@@ -163,6 +164,9 @@ pub struct Worker {
     /// The kind of work it does, which picks the document it carries.
     #[serde(default)]
     pub kind: WorkerKind,
+    /// Whether anyone drives it: an `alone` task is told nobody will answer.
+    #[serde(default)]
+    pub driven: Driven,
     pub started_ms: u64,
     /// When its current turn began.
     pub turn_ms: u64,
@@ -583,6 +587,7 @@ mod tests {
             priority: Priority::Normal,
             effort: Effort::Deep,
             kind: WorkerKind::Coder,
+            driven: Driven::Attended,
             started_ms: 0,
             turn_ms: 0,
             beat_ms: 1_000,

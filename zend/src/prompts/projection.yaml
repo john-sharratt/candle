@@ -406,6 +406,23 @@ system_prompt:
 
                 The chat is deleted, with everything said on it, when Claude closes it or after twelve hours with nothing said. Anything that must outlast it belongs in a journal or a repository, written there only when Claude asks.
 
+    # Whether anyone drives the task (`mcp::driven`,
+    # `docs/zen_memory_and_guides.md` D5). `attended` — a coordinator waits on
+    # it, answers it and checks it — emits nothing; `alone`, a task whose
+    # coordinator has gone (Grok's, whose drive ends seconds after it is
+    # spoken), seals one section of its own. Its own tree, so it multiplies no
+    # dial and no role.
+    - kind: section_tree
+      nodes:
+        - kind: selector
+          id: driven
+          default: attended
+          options:
+            - id: attended
+            - id: alone
+              content: |+
+                Nobody will answer you on this task. Whoever started it has gone — often a person in a car, whose conversation ended seconds after they asked — and nothing you ask reaches them before your work is judged. So never end on a question. Where a decision is needed, make the one the brief, the design documents and the repository's rules point to, and say in your answer what you decided and why. Land your own result: commit and push it to your branch without asking. Check your work as the brief says before you answer. What only the user may approve — a merge, a deploy, anything that cannot be undone — you do not do: say in your answer that it waits on the user's approval, and stop there.
+
     # A reading reaches a dialogue by its FACE (`Substrate::face_of`,
     # `docs/zend_working_set.md` §4.9): its opening turn's user half is only the
     # reading's anchor — `file=<repo>/<path>`, `folder=<repo>/<dir>` — never the

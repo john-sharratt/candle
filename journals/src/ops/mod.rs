@@ -12,6 +12,7 @@
 //! and the service folds only what its upkeep folds (§2.3, §4).
 
 pub mod accept;
+pub mod activity;
 pub mod append;
 pub mod close;
 pub mod create;
@@ -70,6 +71,13 @@ pub enum Op {
         path: JournalPath,
         text: String,
         speaker: Option<Slug>,
+    },
+    /// A call that changed something, kept on a conversation's
+    /// `journal.yaml` rather than as a line of its own (D3).
+    Activity {
+        path: JournalPath,
+        tool: String,
+        subject: String,
     },
     Edit {
         address: Address,
@@ -256,6 +264,11 @@ fn run(
             text,
             speaker,
         } => append::episode(tree, actor, path, speaker.as_ref(), text, now, keep),
+        Op::Activity {
+            path,
+            tool,
+            subject,
+        } => activity::record(tree, path, tool, subject, now),
         Op::Edit { address, text } => edit::edit(tree, address, text),
         Op::Forget { path, which } => forget::forget(tree, path, which),
         Op::Accept { address } => accept::accept(tree, address),
