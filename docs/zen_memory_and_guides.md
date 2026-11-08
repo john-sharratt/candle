@@ -122,6 +122,8 @@ Settled before the build; a phase that meets one of these does not reopen it.
 | D6 | **No backward compatibility.** Existing episode entry files, stale lines and the old guide text are replaced, not kept beside the new. |
 | D7 | **Simplicity cuts** (from the review of the first draft): no verify task chained by zend after an alone task — the templates carry one; no automatic restart of a lost alone task — it is reported; the live path reuses lineage sections; maintenance checks live in `journals check`. |
 | D8 | **A drone's zend task runs as Zen's own person**, a service person added for Zen: its tasks, threads and outcomes are its own, it grants nothing, and its held calls go to the authorizers (the Creator, Yen). |
+| D10 | **The memory guide splits in two.** A short client guide rides the first call of every Claude conversation (`mcp_user_context.md` §2.4–2.5's budget): the frame, the write rules in brief, pointers, the `yen-apps` line. A full `memory` guide, absorbing `journal` and `knowledge`, is read on demand. `grok.md` stays the Grok client guide. |
+| D11 | **One sitting, AlienWorld and BlackWorld together, on the user's command.** BlackWorld's overlapping pieces join this build rather than landing ahead of it: dropping `conversations/` from the `guidance` draw (the first step of Phase 2), and the transfer and preview sections of the `files` guide and the `yen-apps` text (`mcp_file_tools.md`, `yenbot_preview.md`) in Phase 5. Nothing starts before the command. |
 | D9 | **Thread results are exported into the memory tree** (`memory_backbone.md` §7.3): a thread's notes and its tasks' outcomes are written to memory journals under `threads/` and referenced from the topics they are about. `T:`/`P:` stay the work records; there is no resolver over them. |
 
 ---
@@ -435,3 +437,31 @@ when a second review finds none of it open.
   (`world.rs:22-25, 229-236`); how the carrier's task edits the journals
   checkout is stated; `check --against` allows the episode moves the cleanup
   pass makes; the report is a drone-task outcome, not an alone one.
+
+BlackWorld's review of the overlap (2026-11-08) adds:
+
+- **§1.2** — the `guidance` draw already excludes the hub files
+  (`except: [README.md, group.yaml, journal.yaml, person.yaml]`, 37f13b0ca) and
+  the recency term is built; item 3 is corrected to say so.
+- **Phase 1 and §5** — use-exemplars (a conversation's request and reasoning
+  sealed as calibration of a guide or journal unit, `zend/src/guidance/`) are
+  provenance only, never placed, yet one person's reasoning shapes scoring in
+  another's conversation; the risk is named and Phase 1 asserts no exemplar is
+  placed as text. The scope work keeps the draw's `except` and its share pool,
+  and its tests include a drawn guide and a drawn journal under one owner.
+- **Phase 2** — opens with `conversations/` added to the `guidance` draw's
+  `except`, with its test (D11).
+- **Phase 5** — the served-set test reads the aggregator's served list: the live
+  connector serves none of `file_*`, `log_*` or `cluster_logs` although zend
+  defines them (`zend/src/mcp/tools/mod.rs`), so where they are dropped —
+  aggregator, `mcp/served.yaml` or the connector's cached listing — is found and
+  fixed first (`yenbot_preview.md` §8.3). The `memory` split per D10.
+- **Phase 6** — Zen's person is `service:zen` on the service-key path
+  (`mcp_file_tools.md` §4, `web/src/cluster/service_key.rs`). A suspended
+  carrier holds the bridge too: its task acts are refused and the bridge's
+  polling and posting never wake it, with a test.
+- **Phase 0.4** — the count comes from `ingest_backlog` (`item_done` by path)
+  and the branch pass's plan line; episodes are the entries under
+  `conversations/`.
+- **Phase 8** — placement is measured with the guidance tally (missed, read
+  anyway, relevant, idle) beside the reseal cost.
