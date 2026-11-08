@@ -126,7 +126,15 @@ fn shared_table(roles: Roles) -> Api<Arc<Shared>> {
             get(telemetry::telemetry),
         )
         .mirror(Mirror::Shape)
-        .route("/v1/memory", Role::User, each(), get(telemetry::memory))
+        // Open, like `/v1/me`: where the machine's and the engine's memory
+        // went — KV classes, arenas, weights — read from a shell or a tool
+        // without a session. Counts and sizes only; it names nobody's data.
+        .route(
+            "/v1/memory",
+            Role::Unauthenticated,
+            each(),
+            get(telemetry::memory),
+        )
         .route("/v1/phases", Role::User, each(), get(waves::phases))
         .route(
             "/v1/projections",
@@ -423,7 +431,7 @@ mod tests {
                 ("/v1/status", "unauthenticated"),
                 ("/v1/me", "unauthenticated"),
                 ("/v1/telemetry", "user"),
-                ("/v1/memory", "user"),
+                ("/v1/memory", "unauthenticated"),
                 ("/v1/phases", "user"),
                 ("/v1/projections", "user"),
                 ("/v1/layers", "user"),

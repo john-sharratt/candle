@@ -67,6 +67,7 @@ pub mod layer_read;
 pub mod layer_toggle;
 pub mod logs;
 pub mod mem;
+pub mod member_memory;
 pub mod member_status;
 mod nudge;
 mod reply;
@@ -198,6 +199,7 @@ pub fn definitions() -> Value {
         logs::grep::definition(),
         cluster_audit::definition(),
         member_status::definition(),
+        member_memory::definition(),
         cluster_command::definition(),
         gateway_command::definition(),
         approval_grant::definition(),
@@ -271,6 +273,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         logs::grep::NAME => logs::grep::call(ctx, args).await,
         cluster_audit::NAME => cluster_audit::call(ctx, args).await,
         member_status::NAME => member_status::call(ctx, args).await,
+        member_memory::NAME => member_memory::call(ctx, args).await,
         cluster_command::NAME => cluster_command::call(ctx, args).await,
         gateway_command::NAME => gateway_command::call(ctx, args).await,
         approval_grant::NAME => approval_grant::call(ctx, args).await,
@@ -394,6 +397,7 @@ mod tests {
                 "log_grep",
                 "cluster_audit",
                 "member_status",
+                "member_memory",
                 "cluster_command",
                 "gateway_command",
                 "approval_grant",
@@ -443,6 +447,7 @@ mod tests {
                 "log_grep",
                 "cluster_audit",
                 "member_status",
+                "member_memory",
                 "service_status",
                 "layer_read",
                 "timeline_read"
