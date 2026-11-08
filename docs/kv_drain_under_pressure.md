@@ -118,6 +118,72 @@ Replenishing one reserve costs one region claim per class consumed.
 **Arenas made ahead of demand** are protected until the demand fills them or
 [`FRESH_GAPS`] gaps pass (`BackingInner::fresh_arenas`, `settle_fresh`).
 
+## 2a. The reserve grows with the R16 backlog
+
+A fixed reserve of one arena per class can be smaller than one migrate group
+needs: a group is up to `MAX_GROUP_RESIDENCES` finished readings across every
+layer. So the reserve is sized from the backlog it serves.
+
+**R16 is the backlog, counted in slots.** Hot KV is written native (R16/F16),
+and the hot→warm migrate turns each native chunk slot into **exactly one** slot
+of the quant class the policy chose for it. The live native slots that have no
+warm copy are therefore the migrate's destination demand, slot for slot. Only
+the split across classes is unknown in advance.
+
+**Target per class.**
+
+```
+pending      = live native (R16 + F16) slots             (per backing)
+share(c)     = EWMA of the fraction of migrated slots landing in class c
+target(c)    = clamp( ceil(pending × share(c)),
+                      floor = one arena of c,
+                      cap   = RESERVE_CAP × KV regions, split by share )
+```
+
+- **`share`** is learned from what migrates actually produced: each install
+  adds its per-class slot counts, smoothed with α = 0.2. It starts at uniform
+  over the policy's reachable candidates.
+- **`pending`** is the native classes' live slot counts, which the pools
+  already hold. One counter read, no scan. A hot copy kept beside its warm
+  copy (a conversation still active) counts too, so `pending` can overstate
+  the backlog. `RESERVE_CAP` bounds what that costs.
+- **`RESERVE_CAP`** = 25% of the KV reservation, so a burst never hands the
+  whole card to free slots.
+
+**Grows at the gap, shrinks under the sweep, never thrashes.**
+- **Grow.** `owe_reserves` owes class c an arena whenever
+  `free(c) < target(c)`, up to the shortfall in whole arenas (as
+  `owe_capacity` does), and the gap creates them. Every arena still starts
+  lowest-free.
+- **Shrink.** The empty sweep releases an arena of class c only while
+  `free(c) − arena(c) ≥ target(c) + arena(c)`. That is a one-arena hysteresis
+  band, so a target oscillating by a few slots neither creates nor releases.
+- **Knocked off by persistence.** As the migrate drains, `pending` falls, then
+  each `target` falls, and the sweep then releases what the band allows.
+
+**What it replaces.** The fixed one-arena-per-class headroom of §2 becomes this
+target's floor. It is one rule, not two.
+
+## 2b. Logging for the next attempt
+
+Everything below goes to `candle_conversation::kv_reserve` at INFO, once per
+persistence pass, and at WARN on the events marked:
+
+1. **Reserve line, per backing:** `pending` native slots and MiB, and per class
+   `target`, `free`, `owed`, `share` (%).
+2. **Grow and shrink events:** the class, how many arenas, the target before
+   and after, and the reason (`backlog`, `drained`, `capped`).
+3. **The quantize deferral** (`quantize deferred`), now with the class, the
+   slots the group needed, the slots free, and whether the reserve was at its
+   cap. WARN if the reserve was not at its cap: the reserve should have
+   covered it, so that is a sizing bug.
+4. **Migrate progress:** slots moved hot→warm this pass, per class, plus pass
+   time, so the drain rate is a number rather than an inference.
+5. **Region accounting:** reserve arenas and slots against the KV reservation,
+   with the cap, so a reserve crowding the card is visible.
+6. **Ingest rate:** `code_read` logs files completed per 5-minute window,
+   once per window. A rate then needs no grep over per-file DEBUG lines.
+
 ## 3. Compaction and migration: pool-grained, and neither waits
 
 > **Revised on reading the code: per-pool holds do not reach the contention.**
