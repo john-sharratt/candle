@@ -69,9 +69,11 @@ pub struct LayerPass<'a> {
     pub base: &'a Sequence,
     /// How a [`IngestMode::Derived`] layer's units are read.
     pub spec: Option<&'a LayerSpec>,
-    /// How the layer's units are calibrated as they commit
-    /// (`crate::calibrate::calibrate_committed`), for a layer that declares a
-    /// `calibrate:` block.
+    /// How a [`IngestMode::Derived`] layer's units are calibrated as they
+    /// commit (`crate::calibrate::calibrate_committed`), for a layer that
+    /// declares a `calibrate:` block. A file layer's units are not: the branch
+    /// pass reads them all first, and `Session::calibrate_layers` calibrates
+    /// them after it.
     pub calibrate: Option<&'a CalibrateSpec>,
     /// The scoped groups of the layers of units below a derived layer, by
     /// layer name — what its units may retrieve, on their branches.
@@ -277,15 +279,14 @@ impl BranchIngest {
         }
         if !jobs.is_empty() {
             let keys: HashSet<String> = retain.iter().map(|k| k.to_string()).collect();
-            code_read::ingest_jobs(
-                ctx,
-                &jobs,
-                &keys,
-                progress,
-                layer.base,
-                &self.binary,
-                layer.calibrate,
-            )?;
+            // **Every file is read before any is calibrated.** A unit's 24
+            // calibration questions cost many times its reading, and calibrated
+            // inline each worker held its next file back for them: a whole
+            // tree re-read under a new key took a day to place its first
+            // current reading of most files. The layer's calibration pass
+            // (`Session::calibrate_layers`) takes the committed units up after
+            // this pass, and at the start of every one.
+            code_read::ingest_jobs(ctx, &jobs, &keys, progress, layer.base, &self.binary, None)?;
         }
         ground_files(
             ctx, layer.name, &files, &retained, held_back, corpus, ground,
