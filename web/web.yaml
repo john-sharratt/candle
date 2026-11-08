@@ -350,6 +350,12 @@ sites:
         exact: true
         upstream: "http://127.0.0.1:8095"
         cluster: mcp
+      # The DJ (docs/zenj.md §13): its tools, status and events, served by the
+      # zenj member on the machine the decks are cabled to — this one, whose
+      # listener answers while it is between sockets.
+      - prefix: /v1/zenj
+        upstream: "http://127.0.0.1:8097"
+        cluster: zenj
 
   # ── yenbot.com.au — Yen Bots ────────────────────────────────────────────
   # Yen's app-hosting site (docs/yenbot_app_host.md): one binary on this

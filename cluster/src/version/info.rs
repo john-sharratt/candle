@@ -25,11 +25,13 @@ pub const AGENT: &str = "tokera-agent";
 /// substrate and run no model.
 pub const WEB: &str = "web";
 pub const MCP: &str = "mcp";
+/// The DJ (`docs/zenj.md`): a service on the machine the decks are cabled to.
+pub const ZENJ: &str = "zenj";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildInfo {
-    /// Which binary: [`ZEND`], [`NPCD`], [`MOTHERD`], [`AGENT`], [`WEB`] or
-    /// [`MCP`].
+    /// Which binary: [`ZEND`], [`NPCD`], [`MOTHERD`], [`AGENT`], [`WEB`],
+    /// [`MCP`] or [`ZENJ`].
     pub kind: String,
     pub count: u32,
     pub hash: String,
