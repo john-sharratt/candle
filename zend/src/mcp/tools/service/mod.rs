@@ -209,6 +209,10 @@ pub fn stage_of(handle: &Handle, view: &JobView, trials: Option<&Value>, now: u6
         (JobStatus::Exited { code: Some(0) }, Some(Staged::Not(why))) => {
             Stage::BuildFailed(format!("it built, but nothing was staged: {why}"))
         }
+        // Built, and its binary still being staged: the agent records where it
+        // put it only once the copy is done, after the build has exited. Not
+        // over, or a wait on it ends there and calls a good build failed.
+        (JobStatus::Exited { code: Some(0) }, None) => Stage::Building,
         (status, _) => Stage::BuildFailed(state(status)),
     }
 }
@@ -343,6 +347,11 @@ mod tests {
             stage_of(&h, &failed, None, 9),
             Stage::BuildFailed("exited 101".into())
         );
+        // Exited 0 with its binary not yet staged: still under way, not failed.
+        let staging = build(ok.clone(), None, Some(5));
+        let stage = stage_of(&h, &staging, None, 9);
+        assert_eq!(stage, Stage::Building);
+        assert!(!stage.is_over());
         let built = build(ok.clone(), staged.clone(), Some(1_000));
         let other =
             json!({"running": {"artifact": "x", "deploy": "00000000000000ab:Other"}, "last": null});
