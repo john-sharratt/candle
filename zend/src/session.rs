@@ -4312,7 +4312,8 @@ fn run_inference_stream(
                     );
                     let scope_ms = t_scope.elapsed().as_millis() as u64;
                     let t_seed = Instant::now();
-                    let seeded = seed_working_set(&open_state, timeline, &files, &config);
+                    let seeded =
+                        seed_working_set(&open_state, timeline, &open_conv, &files, &config);
                     let seed_ms = t_seed.elapsed().as_millis() as u64;
                     tracing::info!(
                         target: "zend::working_set",
@@ -6142,13 +6143,14 @@ fn spawn_journal_folds(
 fn seed_working_set(
     state: &InferenceState,
     timeline: TimelineId,
+    conv_id: &str,
     files: &RepoFiles,
     config: &WorkingSetConfig,
 ) -> usize {
     let folder_of = |repo: &str, inner: &str| {
         state
             .retrieval_scope
-            .folder_unit(&state.engine, files, repo, inner)
+            .folder_unit(&state.engine, files, conv_id, repo, inner)
     };
     Seeding {
         engine: &state.engine,

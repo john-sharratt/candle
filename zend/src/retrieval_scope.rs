@@ -217,18 +217,19 @@ impl RetrievalScope {
 
     /// The committed `repo_map` unit for the folder `inner` of `repo` (`""`
     /// for its root), as `files` lists it — what the fast path carries in
-    /// place of a `file_list`.
+    /// place of a `file_list` — when `conv_id`'s reader reads that folder.
     pub fn folder_unit(
         &self,
         engine: &ConversationEngine,
         files: &RepoFiles,
+        conv_id: &str,
         repo: &str,
         inner: &str,
     ) -> Option<TimelineId> {
         let index = self.current(Instant::now(), |generation| {
             IngestIndex::read(engine, generation)
         });
-        self.folder_in(&index, files, repo, inner)
+        self.folder_in(&index, files, &self.reader_of(conv_id), repo, inner)
     }
 
     /// [`Self::folder_unit`] under `index`. `None` when the folder layer is not
@@ -237,11 +238,14 @@ impl RetrievalScope {
     /// the folder. That is stricter than the scope, which drops only a changed
     /// file's own folder: a scope that keeps a stale folder offers a summary,
     /// while this tells the model the listing is in context, and a new file in
-    /// a new subfolder changes the listing above it too.
+    /// a new subfolder changes the listing above it too. A folder `reader`
+    /// does not read — a journals folder of a group they are not in — has
+    /// none.
     fn folder_in(
         &self,
         index: &IngestIndex,
         files: &RepoFiles,
+        reader: &Reader,
         repo: &str,
         inner: &str,
     ) -> Option<TimelineId> {
@@ -256,6 +260,9 @@ impl RetrievalScope {
             return None;
         }
         let dir = format!("{repo}/{under}");
+        if !reader.reads(&dir) {
+            return None;
+        }
         self.tree_scope(index, &at)?.folders.get(&dir).copied()
     }
 
@@ -822,7 +829,7 @@ mod tests {
 
     fn folder_in(rs: &RetrievalScope, files: &RepoFiles, repo: &str, inner: &str) -> Option<u64> {
         let index = Arc::clone(&rs.index.read().unwrap());
-        rs.folder_in(&index, files, repo, inner)
+        rs.folder_in(&index, files, &Reader::nobody(), repo, inner)
             .map(TimelineId::raw)
     }
 
