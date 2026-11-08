@@ -96,14 +96,15 @@ Apps are a fixed list in the `cluster` crate, and that is where the change is:
 Requests reach it only on routes it declares (`Registry::declaring`,
 `cluster/src/gateway/registry/pick.rs:205-217`; MCP invariant 5, `CLAUDE.md`).
 
-**Live.** `MemberState` has no "live" and `Capacity` no field to carry one
-(`cluster/src/frame/types.rs:77-91`, `cluster/src/frame/membership.rs:30-100`). `zenj` reports
-`live` on its listener's `/v1/status` instead, with `refuse: "<why>"` while music plays
-(`zenj/src/http.rs`). keep's guard reads that refusal (`keep::guard::declined`) both from a
-service's own status and from the machine's **guards** — `keep.yaml`'s `guards:`, the statuses of
-processes keep does not run, which on BlackWorld is `zenj`'s. While one refuses, no switch,
-accept, restart, stop or cluster trial of any service on the machine goes ahead, unless forced with
-`X-Keep-Force`. So nothing is deployed under a party, by hand or by the cluster.
+**The reservation.** `MemberState` has no "live" and `Capacity` no field to carry one
+(`cluster/src/frame/types.rs:77-91`, `cluster/src/frame/membership.rs:30-100`). `zenj` says so on
+its listener's `/v1/status` instead, with `refuse: "<why>"` **while rekordbox is open** — playing
+or between tracks, since a build begun in a pause is still running when the music starts again
+(`zenj/src/http.rs`). keep reads it as one of the machine's **guards** (`keep.yaml`'s `guards:`)
+and reserves BlackWorld: no switch, accept, restart, stop or cluster trial goes ahead unless forced,
+and motherd — its model's memory, its agent's builds, its share of the card — is held down. The
+reservation ends ten minutes after the guard last refused (`keep/src/reserve.rs`). The whole of it
+is `docs/house_modes.md` §4.
 
 ### 3.2 The machine and the session
 
@@ -345,9 +346,10 @@ of applications open the same port — and never sits between the hands and reko
 show rekordbox a virtual port instead of the FLX4, losing its native support, and a crash of `zenj`
 would kill the controller mid-set.
 
-Modes, each visible on the screens:
+Who has the decks — the **hands** (`zenj/src/hands.rs`, `Holder`), named apart from the house's
+mode (`docs/house_modes.md`), of which the decks are one part — each visible on the screens:
 
-| Mode | Entered | ZenJ does |
+| Hands | Entered | ZenJ does |
 |---|---|---|
 | **Human** | any touch on the FLX4 | keeps *NYE Next* stocked and the next track profiled; never touches a deck that is on air |
 | **Assist** | explicitly: a pad combination or "help me" to Zen | also loads the next track on the idle deck and cues its in point |
@@ -379,7 +381,7 @@ music.
 | A load cannot be confirmed (§6.2) | Automix takes that transition |
 | Zen does not answer in time | The shortlist's top entry is taken (§5.2) |
 | `zenj` crashes | `zenj watch` starts it again; rekordbox keeps playing the loaded track and Automix continues |
-| rekordbox crashes | Restarted by hand; the crates live in TIDAL and the offline store, so nothing is lost |
+| rekordbox crashes | Opened again by Zen (`zenj_rekordbox`) or by hand; the crates live in TIDAL and the offline store, so nothing is lost. The reservation outlasts it by ten minutes, so motherd is not started under the gap |
 | motherd is busy or restarting | No effect: `zenj` needs Zen only for choices, and falls back to the shortlist |
 
 ### 7.3 Watchdog
@@ -401,13 +403,14 @@ if the card's outputs are DisplayPort) — not cast, which adds seconds of delay
   (§4.4), so a scene change lands on a phrase. `lactea` runs the MilkDrop preset library in Rust, so
   there are thousands of scenes from the first day.
 - **The layer we own**: now playing and next, a request arriving ("Yen's request is up next"), Zen's
-  one-line reasons, the mode (§6.3), and the midnight countdown, which takes over every screen from
-  23:59:00.
+  one-line reasons, who has the decks (§6.3), and the midnight countdown, which takes over every
+  screen from 23:59:00.
 - The visuals are driven from the predicted beat grid, so they can lead the sound by the TV's
   measured latency, and land on the beat on every screen.
 
-The visuals share BlackWorld's GPU with motherd. For the night, BlackWorld runs in **event mode**
-(§10), so motherd's inference yields to the render threads.
+While rekordbox is open BlackWorld is reserved and its motherd is held down (§3.1), so the card,
+the cores and the memory are the decks' and the screens'. Zen's choices are served by the other
+members.
 
 ## 9. Models
 
@@ -425,8 +428,9 @@ runs during the set.
 
 ## 10. The night
 
-- **Event mode on BlackWorld**, 2026-12-31 18:00 to 2027-01-01 06:00: no deploys of anything (keep
-  refuses trials), ingest and calibration paused, the GPU's share for inference reduced.
+- **The house in Party** (`docs/house_modes.md`): rekordbox open, so BlackWorld is reserved for
+  as long as it is — nothing deployed there, its motherd held down, and with it its builds, its
+  inference, its ingest and its calibration. Zen runs on the other members for the night.
 - **Freeze, 2026-12-20**: the rekordbox version rehearsed on is held with its update check off; `zenj`
   and the map file are frozen with it.
 - **Offline store** refreshed after 2026-12-10, with a TIDAL login in rekordbox on 2026-12-30.
@@ -479,13 +483,14 @@ night's people may call them (`zenj.yaml` `people[].email`). No change to zend.
 
 | Tool | Does |
 |---|---|
-| `zenj_now` | what is playing on each deck, where in it, the mode, and the next track with its reason |
+| `zenj_now` | what is playing on each deck, where in it, who has the decks, and the next track with its reason |
 | `zenj_queue` | *NYE Next* and the set plan; reorder or pin |
 | `zenj_request` | add a request, with an optional note and urgency |
-| `zenj_mode` | Human / Assist / ZenJ (moving toward ZenJ needs a person's confirmation in the chat) |
+| `zenj_hands` | Human / Assist / ZenJ (moving toward ZenJ needs a person's confirmation in the chat) |
+| `zenj_rekordbox` | open or close rekordbox; closing with a deck playing needs `force` (`docs/house_modes.md` §3) |
 | `zenj_moment` | schedule a moment: a track at a time, a dedication, an effect |
 | `zenj_sfx` | fire a sampler slot now or on the next beat or bar |
-| `zenj_events` | the event stream since a cursor: track changed, request arrived, mode changed, fault |
+| `zenj_events` | the event stream since a cursor: track changed, request arrived, the decks changed hands, rekordbox opened or closed, fault |
 | `zenj_said` | a line the room said, which Zen hears at the next choice |
 | `zenj_midnight` | the midnight track, whose drop lands on 00:00:00 |
 | `zenj_energy` | more or less energy for a while: the curve's target moved from now |
@@ -493,7 +498,7 @@ night's people may call them (`zenj.yaml` `people[].email`). No change to zend.
 ## 14. The journal
 
 Every pick and its reason, every transition and its plan, every request and where it went, every
-mode change and fault is an event (`zenj/src/events.rs`), and every event is appended, one JSON line
+change of hands, every open and close of rekordbox, and every fault is an event (`zenj/src/events.rs`), and every event is appended, one JSON line
 each, to the night's record in ZenJ's data folder (`D:/zenj/nights/2026-12-31.jsonl`). The record
 outlives the process, and `zenj_events` reads it back from any cursor. Zen's own choices are also in
 its conversation for the night (§5.2).

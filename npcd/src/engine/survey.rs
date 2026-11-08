@@ -180,7 +180,15 @@ impl Survey {
         // **A part a bridge works is listed with the acts that work it** — it
         // has no address and may have no state, so the stations above pass it
         // over.
-        let house = house_lines(&bridge::parts_here(hosted, body));
+        let mut house = house_lines(&bridge::parts_here(hosted, body));
+        // **The house's mode, for the body that sets it** (`docs/house_modes.md`).
+        let place = hosted.standpoint_of(body);
+        if let Some(line) = hosted.sim(|s| match s.missions.is_unordered(body) {
+            true => s.house.line(&place),
+            false => None,
+        }) {
+            house.push(line);
+        }
         Survey {
             stations,
             house,

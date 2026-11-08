@@ -357,6 +357,9 @@ device's world part (`keep_earned`), so every later command carries it and the s
 never holds a secret. Once begun, a Google TV is offered only `pair_code` until it finishes —
 re-beginning would orphan the open session and show a fresh code.
 
+The house as a whole — every device of the room at once, and the decks — is set by Zen's
+`house_mode` act, from the house's table in the mind (`docs/house_modes.md`).
+
 A profile is code in candle, written against the device's own documented or openly offered
 interface. Building one for a kind of device the house has and the world cannot yet reach is
 work like any other — a profile at a time.

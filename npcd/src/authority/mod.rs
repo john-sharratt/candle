@@ -19,6 +19,7 @@
 //! | [`cast`] | the characters run here kept to their leases |
 //! | [`ops`] | a write to a world, as it travels |
 //! | [`perform`] | a write made where the world runs |
+//! | [`house`] | the house's mode, set where the world runs |
 //! | [`forward`] | an act as the call line it travels as |
 //! | [`pulse`] | what the world is doing, as pulses |
 //! | [`told`] | what the world tells characters that run elsewhere |
@@ -33,6 +34,7 @@ pub mod cast;
 pub mod driver;
 pub mod follow;
 pub mod forward;
+pub mod house;
 pub mod npc_lease;
 pub mod ops;
 pub mod perform;

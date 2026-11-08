@@ -5,10 +5,11 @@
 //!
 //! | Module | Tool |
 //! |---|---|
-//! | [`now`] | `zenj_now` — the decks, the mode, the next track and why |
+//! | [`now`] | `zenj_now` — the decks, who has them, the next track and why |
 //! | [`queue`] | `zenj_queue` — the next and the requests waiting; pin one next |
 //! | [`request`] | `zenj_request` — ask for a track |
-//! | [`mode`] | `zenj_mode` — Human, Assist or ZenJ |
+//! | [`hands`] | `zenj_hands` — Human, Assist or ZenJ |
+//! | [`rekordbox`] | `zenj_rekordbox` — open or close rekordbox |
 //! | [`moment`] | `zenj_moment` — book a track, a dedication or a sample for a time |
 //! | [`sfx`] | `zenj_sfx` — fire a sample now or on the next beat or bar |
 //! | [`events`] | `zenj_events` — what happened since a cursor |
@@ -18,11 +19,12 @@
 
 pub mod energy;
 pub mod events;
+pub mod hands;
 pub mod midnight;
-pub mod mode;
 pub mod moment;
 pub mod now;
 pub mod queue;
+pub mod rekordbox;
 pub mod request;
 pub mod said;
 pub mod sfx;
@@ -43,14 +45,16 @@ use web::auth::session::Identity as Person;
 use crate::brain::run::Ask;
 use crate::events::Events;
 use crate::live::Live;
+use crate::rekordbox::control::Rekordbox;
 
 const DESCRIPTION: &str = "ZenJ: Zen as DJ for the party at John's — what is playing and next, \
-requests, the mode of the decks, moments and samples, and what the room says.";
+requests, who has the decks, moments and samples, rekordbox itself, and what the room says.";
 
-const INSTRUCTIONS: &str = "zenj_now says what is playing, the mode and the next track with its \
-reason. Requests go to zenj_request; a line someone in the room said to you goes to zenj_said, so \
-the next choice hears it. zenj_mode hands the decks between a person and ZenJ: moving toward ZenJ \
-needs a person's yes in this chat first. zenj_events follows what happens.";
+const INSTRUCTIONS: &str = "zenj_now says what is playing, who has the decks and the next track \
+with its reason. Requests go to zenj_request; a line someone in the room said to you goes to \
+zenj_said, so the next choice hears it. zenj_hands hands the decks between a person and ZenJ: \
+moving toward ZenJ needs a person's yes in this chat first. zenj_rekordbox opens or closes \
+rekordbox. zenj_events follows what happens.";
 
 static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     name: "zenj".into(),
@@ -92,6 +96,7 @@ pub struct Dj {
     pub live: Arc<ArcSwap<Live>>,
     pub events: Arc<Events>,
     pub asks: mpsc::Sender<Ask>,
+    pub rekordbox: Arc<Rekordbox>,
     /// Who may call, by email, and the name each is known by.
     pub people: Vec<(String, String)>,
     pub store: Arc<SealedStore>,
@@ -132,7 +137,8 @@ pub fn definitions() -> Value {
         now::Now::definition(),
         queue::Queue::definition(),
         request::RequestTool::definition(),
-        mode::ModeTool::definition(),
+        hands::HandsTool::definition(),
+        rekordbox::RekordboxTool::definition(),
         moment::MomentTool::definition(),
         sfx::Sfx::definition(),
         events::EventsTool::definition(),
@@ -148,7 +154,8 @@ pub async fn call(dj: &Dj, who: &Person, name: &str, args: &Value) -> Answer {
         now::Now::NAME => now::call(dj),
         queue::Queue::NAME => queue::call(dj, args).await,
         request::RequestTool::NAME => request::call(dj, &by, args).await,
-        mode::ModeTool::NAME => mode::call(dj, args).await,
+        hands::HandsTool::NAME => hands::call(dj, args).await,
+        rekordbox::RekordboxTool::NAME => rekordbox::call(dj, args).await,
         moment::MomentTool::NAME => moment::call(dj, args).await,
         sfx::Sfx::NAME => sfx::call(dj, args).await,
         events::EventsTool::NAME => events::call(dj, args),
@@ -220,10 +227,18 @@ pub mod fixture {
     /// its asks.
     pub fn dj() -> (Dj, mpsc::Receiver<Ask>) {
         let (tx, rx) = mpsc::channel(8);
+        let live = Arc::new(ArcSwap::from_pointee(Live::default()));
+        let events = Arc::new(Events::new());
         (
             Dj {
-                live: Arc::new(ArcSwap::from_pointee(Live::default())),
-                events: Arc::new(Events::new()),
+                rekordbox: Arc::new(Rekordbox::new(
+                    "Z:/no/such/rekordbox.exe".into(),
+                    "zenj-no-such-process.exe",
+                    live.clone(),
+                    events.clone(),
+                )),
+                live,
+                events,
                 asks: tx,
                 people: vec![("john@example.com".into(), "john".into())],
                 store: Arc::new(SealedStore),
@@ -267,7 +282,8 @@ mod tests {
                 "zenj_now",
                 "zenj_queue",
                 "zenj_request",
-                "zenj_mode",
+                "zenj_hands",
+                "zenj_rekordbox",
                 "zenj_moment",
                 "zenj_sfx",
                 "zenj_events",

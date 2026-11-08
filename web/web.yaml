@@ -237,16 +237,18 @@ cluster:
         subscribe: ["repo/yenbot", "gate/yenbot"]
         publish: ["gate/yenbot/result/*", "service/yenbot/*"]
     # ZenJ (docs/zenj.md §5.2): asking Zen for each choice, as itself, on the
-    # night's own conversation. Made once on this machine, before this
-    # gateway next starts, with
+    # night's own conversation; and answering the house's asks to open or
+    # close rekordbox (docs/house_modes.md §3). Made once on BlackWorld with
     #
     #   target\release\web.exe --new-ops-key web/secrets/zenj.key
+    #
+    # A gateway whose machine has no such file admits no zenj, and starts.
     - name: zenj
       key_file: "secrets/zenj.key"
       routes: [/v1/chat/completions]
       topics:
-        subscribe: []
-        publish: []
+        subscribe: ["dj/rekordbox"]
+        publish: ["dj/rekordbox/result/*"]
 
 sites:
   # ── tokera.com ──────────────────────────────────────────────────────────

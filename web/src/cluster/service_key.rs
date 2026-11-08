@@ -9,6 +9,7 @@
 //! no sign-in issues one, so it collides with no person, and the role table
 //! grants it a role by that subject (`host/roles.yaml`).
 
+use anyhow::Context;
 use axum::http::HeaderMap;
 
 use super::bearer_key::BearerKey;
@@ -104,6 +105,29 @@ pub fn presented<'a>(keys: &'a [ServiceKey], headers: &HeaderMap) -> Option<&'a 
     keys.iter().find(|k| k.presented(headers))
 }
 
+/// The keys `cfgs` name whose files are on this machine. A service's key is
+/// made on the machine the service runs on, and every gateway reads the one
+/// configuration: a key whose file is absent here is a service this gateway
+/// does not admit, and nothing else. A file that is present and does not
+/// hold a key is a fault, and refuses the start.
+pub fn load_present(cfgs: &[ServiceKeyConfig]) -> anyhow::Result<Vec<ServiceKey>> {
+    let mut keys = Vec::new();
+    for cfg in cfgs {
+        if !cfg.key_file.exists() {
+            tracing::warn!(
+                service = cfg.name,
+                file = %cfg.key_file.display(),
+                "gateway: no key file for this service here, so it is not admitted"
+            );
+            continue;
+        }
+        keys.push(
+            ServiceKey::load(cfg).with_context(|| format!("the service key of `{}`", cfg.name))?,
+        );
+    }
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::{header, HeaderValue};
@@ -181,5 +205,32 @@ mod tests {
         assert!(key.may_publish("gate/yenbot/result/01JD"));
         assert!(!key.may_publish("gate/yenbot"));
         assert!(!key.may_publish("repo/yenbot"));
+    }
+
+    /// **A key whose file is not on this machine is a service this gateway
+    /// does not admit**; one whose file holds no key refuses the start.
+    #[test]
+    fn a_missing_key_file_is_skipped_and_a_bad_one_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = |name: &str| ServiceKeyConfig {
+            name: name.into(),
+            key_file: dir.path().join(format!("{name}.key")),
+            routes: vec!["/v1/models".into()],
+            topics: ServiceTopics::default(),
+        };
+        BearerKey::create(&dir.path().join("here.key")).unwrap();
+        let keys = load_present(&[cfg("here"), cfg("elsewhere")]).unwrap();
+        assert_eq!(
+            keys.iter()
+                .map(|k| k.identity().sub.as_str())
+                .collect::<Vec<_>>(),
+            ["service:here"]
+        );
+        std::fs::write(dir.path().join("bad.key"), "not a key\n").unwrap();
+        let bad = load_present(&[cfg("here"), cfg("bad")]).err().unwrap();
+        assert!(
+            format!("{bad:#}").contains("the service key of `bad`"),
+            "{bad:#}"
+        );
     }
 }

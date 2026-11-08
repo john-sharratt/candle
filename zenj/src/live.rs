@@ -3,7 +3,7 @@
 
 use serde::Serialize;
 
-use crate::hands::Mode;
+use crate::hands::Holder;
 
 /// One deck as shown.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -31,7 +31,7 @@ pub struct NextView {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Live {
-    pub mode: Mode,
+    pub holder: Holder,
     pub decks: Vec<DeckView>,
     pub next: Option<NextView>,
     /// The requests waiting: `who: artist — title`.
@@ -47,6 +47,9 @@ pub struct Live {
     pub to_midnight_s: i64,
     /// The line for the screens, newest: a choice's reason, a dedication.
     pub banner: Option<String>,
-    /// Whether music is playing: what keep's guard reads.
+    /// Whether music is playing.
     pub live: bool,
+    /// Whether rekordbox is running: while it is, this machine is reserved
+    /// for the decks, and keep's guard reads so (`http::keep_status`).
+    pub rekordbox: bool,
 }

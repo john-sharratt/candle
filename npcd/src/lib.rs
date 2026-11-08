@@ -40,6 +40,7 @@ pub mod effector;
 pub mod engine;
 pub mod guest_routes;
 pub mod guests;
+pub mod house;
 pub mod identity;
 pub mod image_links;
 pub mod image_ops;

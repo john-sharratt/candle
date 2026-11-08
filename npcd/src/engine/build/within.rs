@@ -1,6 +1,7 @@
 //! What the house adds to a body's situation (`docs/zen_moon_mind.md`
-//! §13–§15): the bridges it can work where it stands, and what its carried
-//! mission lets it build there. One computation, so the runtime's grammar and
+//! §13–§15, `docs/house_modes.md`): the bridges it can work where it stands,
+//! the house's modes where it may set them, and what its carried mission lets
+//! it build there. One computation, so the runtime's grammar and
 //! anything checking it read the same sets.
 
 use npc_map::schema::Where;
@@ -40,6 +41,11 @@ impl Within {
                 .collect();
             (unlinked, doors)
         });
+        // The house's mode is Zen's to set, from the room its devices are in.
+        let house_modes = hosted.sim(|s| match s.missions.is_unordered(body) {
+            true => s.house.modes_at(&place),
+            false => Vec::new(),
+        });
         Within {
             links: bridge::links_of(&parts),
             sonos: bridge::sonos_of(&parts),
@@ -47,6 +53,7 @@ impl Within {
             cast: bridge::cast_of(&parts),
             pairable: bridge::pairable_of(&parts),
             pairing: bridge::pairing_of(&parts),
+            house_modes,
             grants: grants_here(hosted, body),
             findings: open_findings(hosted, &place)
                 .iter()

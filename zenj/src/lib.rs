@@ -7,11 +7,12 @@
 //! | [`plan`] | A transition plan: moves at beats |
 //! | [`brain`] | The set plan, the shortlist, Zen's choice, transition plans |
 //! | [`conductor`] | The per-beat loop: plans run, loads confirmed, the watchdog |
-//! | [`hands`] | A person and ZenJ on one mixer: modes, taking back, the walk back |
+//! | [`hands`] | A person and ZenJ on one mixer: who holds it, taking back, the walk back |
 //! | [`events`] | What happened, in order |
 //! | [`midi`] | The wire, controller maps, the ports |
 //! | [`deck`] | rekordbox's live deck state, read from its memory |
-//! | [`rekordbox`] | rekordbox's library and analysis files |
+//! | [`rekordbox`] | rekordbox's library and analysis files; opening and closing it |
+//! | [`bus`] | The house's asks of rekordbox, over the gateway's bus |
 //! | [`room`] | The FLX4's output captured, its levels, how it is landing |
 //! | [`oauth`] | Signing in to Spotify and TIDAL |
 //! | [`spotify`] | Taste and requests |
@@ -26,6 +27,7 @@
 //! | [`zen`] | Asking Zen, through the gateway, as the service `zenj` |
 
 pub mod brain;
+pub mod bus;
 pub mod conductor;
 pub mod config;
 pub mod control;

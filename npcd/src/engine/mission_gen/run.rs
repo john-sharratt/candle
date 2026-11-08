@@ -36,6 +36,7 @@ use crate::engine::prose::{self, decode_call, CallAsk, Frame, WORK_BAND};
 use crate::engine::runtime::Runtime;
 use crate::engine::work::what_happens;
 use crate::engine::workflow::{OnFailed, Where};
+use crate::house::table as house_table;
 use crate::mind::files::MindFiles;
 use crate::opstore::owner::Owner;
 use crate::prose::Request;
@@ -727,6 +728,7 @@ pub fn spawn(rt: Arc<Runtime>) {
         let mut told_world: BTreeMap<String, String> = BTreeMap::new();
         let mut told_standing: BTreeMap<String, String> = BTreeMap::new();
         let mut told_round: BTreeMap<String, String> = BTreeMap::new();
+        let mut told_house: BTreeMap<String, String> = BTreeMap::new();
         loop {
             tokio::time::sleep(TICK).await;
             if rt.stopping() {
@@ -814,6 +816,20 @@ pub fn spawn(rt: Arc<Runtime>) {
                         if told_round.get(&id) != Some(&e) {
                             tracing::warn!(world = %id, "a world's round: {e}");
                             told_round.insert(id.clone(), e);
+                        }
+                    }
+                }
+                // **The house's table** (`docs/house_modes.md` §3): read on
+                // every member, since whichever runs Zen offers its modes.
+                match house_table::load(&mind, &id) {
+                    Ok(table) => {
+                        told_house.remove(&id);
+                        hosted.with_sim(|s| s.house.set_table(table));
+                    }
+                    Err(e) => {
+                        if told_house.get(&id) != Some(&e) {
+                            tracing::warn!(world = %id, "a world's house: {e}");
+                            told_house.insert(id.clone(), e);
                         }
                     }
                 }

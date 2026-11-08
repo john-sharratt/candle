@@ -18,20 +18,24 @@ cluster:
   name: tokera.com
   group_key: web/secrets/group.key
   host: blackworld
-# Processes keep does not run whose refusal holds for every service here:
-# zenj, started at John's logon in the console session (docs/zenj.md §3.2),
-# says `refuse` on its status while music is playing, so no switch, restart or
-# trial lands under a party.
+# Processes keep does not run that reserve this machine while they refuse
+# (docs/house_modes.md §4): zenj, started at John's logon in the console
+# session (docs/zenj.md §3.2), says `refuse` on its status while rekordbox is
+# open. While it does, and for ten minutes after, nothing here is switched,
+# restarted, stopped or tried, and motherd is held down.
 guards: ["127.0.0.1:8097"]
 services:
   - name: web
     stable: keep/stable/web.exe
     args: ["--config", "web/web.yaml"]
     cwd: D:/prog/candle
+  # Yields to the reservation: its model's memory, its agent's builds and its
+  # share of the card are the decks' while the house is in Party.
   - name: motherd
     stable: keep/stable/motherd.exe
     args: ["--config", "motherd/motherd.yaml"]
     cwd: D:/prog/candle
+    yields: true
   - name: mcp
     stable: keep/stable/mcp.exe
     args: ["--config", "mcp/mcp.yaml"]

@@ -1,5 +1,5 @@
-//! `zenj_now`: what is playing on each deck and where in it, the mode, the
-//! next track and why, and anything wrong.
+//! `zenj_now`: what is playing on each deck and where in it, who has the
+//! decks, the next track and why, and anything wrong.
 
 use std::fmt::Write;
 
@@ -28,8 +28,8 @@ pub fn say(l: &Live) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "Mode: {}{}",
-        l.mode.name(),
+        "Hands: {}{}",
+        l.holder.name(),
         if l.automix { " (Automix on)" } else { "" }
     );
     for d in &l.decks {
@@ -101,13 +101,13 @@ pub fn call(dj: &Dj) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hands::Mode;
+    use crate::hands::Holder;
     use crate::live::{DeckView, NextView};
 
     #[test]
     fn the_view_is_said_plainly() {
         let l = Live {
-            mode: Mode::Zenj,
+            holder: Holder::Zenj,
             decks: vec![
                 DeckView {
                     number: 1,
@@ -138,7 +138,7 @@ mod tests {
         };
         assert_eq!(
             say(&l),
-            "Mode: zenj\n\
+            "Hands: zenj\n\
              Deck 1: ON AIR Daft Punk — One More Time (122.0 BPM, 40 bars left)\n\
              Deck 2: empty\n\
              Next: ABBA — Dancing Queen — yen's request. Why: Yen's mum is here\n\

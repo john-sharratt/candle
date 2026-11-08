@@ -16,6 +16,7 @@
 //! | [`disk`] | the volume a substrate is on, for fault mode (§7.7) |
 //! | [`leave`] | draining and sending before the process stops (§12.4) |
 //! | [`up`] | requests between members, and the stamp naming the sender (§9.3) |
+//! | [`bus`] | a member's asks on the gateways' bus |
 //! | [`upgrade`] | what the upgrades start from, and installing a build (§3.9) |
 //! | [`view`] | the `cluster` block of `/v1/status`, and the `connecting` and `catchup` steps |
 //!
@@ -32,6 +33,7 @@
 //! keep the socket admitted; they are read here, off that runtime. A request
 //! the gateway opens is handed back to the HTTP runtime to be served.
 
+pub mod bus;
 pub mod capacity;
 pub mod flush;
 pub mod held_body;

@@ -82,47 +82,19 @@ mod windows {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
-        MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
-        TH32CS_SNAPPROCESS,
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+        TH32CS_SNAPMODULE32,
     };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
 
     use super::{MemError, Memory};
+    use crate::rekordbox::process::id_of;
 
     fn wide_name(raw: &[u16]) -> String {
         let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
         String::from_utf16_lossy(&raw[..end])
-    }
-
-    /// The id of the first process whose executable is `exe`.
-    fn process_id(exe: &str) -> Option<u32> {
-        // SAFETY: a snapshot handle is checked before use and closed after;
-        // the entry is sized as the API requires.
-        unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap == INVALID_HANDLE_VALUE {
-                return None;
-            }
-            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-            entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-            let mut found = None;
-            if Process32FirstW(snap, &mut entry) != 0 {
-                loop {
-                    if wide_name(&entry.szExeFile).eq_ignore_ascii_case(exe) {
-                        found = Some(entry.th32ProcessID);
-                        break;
-                    }
-                    if Process32NextW(snap, &mut entry) == 0 {
-                        break;
-                    }
-                }
-            }
-            CloseHandle(snap);
-            found
-        }
     }
 
     /// The base address of module `exe` in process `pid`.
@@ -164,7 +136,7 @@ mod windows {
     impl Process {
         /// The running process whose executable is `exe`.
         pub fn open(exe: &str) -> Result<Process, MemError> {
-            let pid = process_id(exe).ok_or(MemError::NotRunning)?;
+            let pid = id_of(exe).ok_or(MemError::NotRunning)?;
             let base = module_base(pid, exe)
                 .ok_or_else(|| MemError::Open(format!("no module {exe} in process {pid}")))?;
             // SAFETY: the returned handle is checked and closed on drop.

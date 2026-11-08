@@ -63,6 +63,8 @@ rekordbox:
   version: "7.2.19"
   decks: 2
   dir: C:/Users/johna/AppData/Roaming/Pioneer/rekordbox
+  # Where its installer puts the release: what the house's Party mode starts.
+  program: "C:/Program Files/rekordbox/rekordbox 7.2.19/rekordbox.exe"
 
 midi:
   flx4: zenj/maps/ddj-flx4.yaml

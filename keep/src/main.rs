@@ -24,6 +24,10 @@
 //! take down the only member serving an app (`guard`), for a service whose
 //! config names its `status` address.
 //!
+//! While a guard reserves the machine (`reserve`), every switch, accept,
+//! restart, stop and trial is refused unless forced, and a service marked
+//! `yields` is held down — started again once the reservation is released.
+//!
 //! `POST /restart/<service>` stops that service and starts its stable file
 //! again — no trial, since the binary is the one already kept. `POST
 //! /stop/<service>` stops it and holds it down until `POST /start/<service>`
@@ -47,11 +51,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use board::BOARD;
 use cluster::upgrade::switch::SWITCH_ADDR;
 use place::{accept, previous_of, restore, same_file};
+use reserve::Reservation;
 use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use trial::{spawn_detached, switch_to, Ended, Running};
@@ -63,6 +68,7 @@ mod owner_access;
 mod place;
 mod presence;
 mod remote;
+mod reserve;
 mod trial;
 
 /// How long a trial may run before it is stopped and the stable file is
@@ -80,6 +86,10 @@ struct ServiceCfg {
     /// guard (`guard`). Absent for a service with no quorum.
     #[serde(default)]
     status: Option<String>,
+    /// Held down while the machine is reserved (`reserve`), and started again
+    /// once the reservation is released.
+    #[serde(default)]
+    yields: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,10 +98,9 @@ struct Config {
     services: Vec<ServiceCfg>,
     #[serde(default)]
     cluster: Option<presence::ClusterJoin>,
-    /// The `host:port` statuses of processes keep does not run whose own
-    /// refusal holds for every service here (`guard::declined`): `zenj`, which
-    /// refuses while music is playing, so nothing on the machine is switched
-    /// under a party.
+    /// The `host:port` statuses of processes keep does not run that reserve
+    /// the machine while they refuse (`reserve`): `zenj`, while rekordbox is
+    /// open.
     #[serde(default)]
     guards: Vec<String>,
 }
@@ -114,21 +123,23 @@ struct Slot {
     tx: Sender<Req>,
     /// See [`ServiceCfg::status`].
     status: Option<String>,
-    /// See [`Config::guards`].
-    guards: Arc<[String]>,
+    /// See [`ServiceCfg::yields`].
+    yields: bool,
+    /// The machine's, shared by every slot.
+    reservation: Arc<Reservation>,
     /// See [`Service::trial_log`]: read back for the cluster.
     trial_log: PathBuf,
 }
 
 impl Slot {
     /// Why switching, restarting or stopping this service is refused by a
-    /// process that says so itself — the service, or one of the machine's
-    /// guards — if one does.
+    /// process that says so itself — the service, or a guard reserving the
+    /// machine — if one does.
     fn declined(&self) -> Option<String> {
         self.status
-            .iter()
-            .chain(self.guards.iter())
-            .find_map(|addr| guard::own_refusal(addr))
+            .as_deref()
+            .and_then(guard::own_refusal)
+            .or_else(|| self.reservation.refusal(Instant::now()))
     }
 }
 
@@ -180,9 +191,15 @@ fn main() -> anyhow::Result<()> {
     owner_access::grant_owner()
         .map_err(|e| anyhow::anyhow!("granting the owner its children: {e}"))?;
     let mut slots = Vec::new();
-    let guards: Arc<[String]> = cfg.guards.clone().into();
+    let reservation = Arc::new(Reservation::new());
+    // Read before any service starts, so one that yields is not started
+    // under a reservation already standing.
+    if let Some(why) = cfg.guards.iter().find_map(|addr| guard::own_reason(addr)) {
+        reservation.observe(Some(why), Instant::now());
+    }
+    reserve::watch(cfg.guards.clone(), reservation.clone());
     for svc in cfg.services {
-        let status = svc.status.clone();
+        let (status, yields) = (svc.status.clone(), svc.yields);
         let svc = prepare(&cfg.state, svc)?;
         let (tx, rx) = mpsc::channel();
         slots.push(Slot {
@@ -191,13 +208,15 @@ fn main() -> anyhow::Result<()> {
             stable: svc.stable.clone(),
             tx,
             status,
-            guards: guards.clone(),
+            yields,
+            reservation: reservation.clone(),
             trial_log: svc.trial_log.clone(),
         });
         let name = svc.name.clone();
+        let yielding = yields.then(|| reservation.clone());
         thread::Builder::new()
             .name(format!("keep-{name}"))
-            .spawn(move || supervise(svc, rx))
+            .spawn(move || supervise(svc, rx, yielding))
             .map_err(|e| anyhow::anyhow!("starting {name}: {e}"))?;
     }
     if let Some(cluster) = cfg.cluster.clone() {
@@ -222,7 +241,8 @@ impl Clone for Slot {
             stable: self.stable.clone(),
             tx: self.tx.clone(),
             status: self.status.clone(),
-            guards: self.guards.clone(),
+            yields: self.yields,
+            reservation: self.reservation.clone(),
             trial_log: self.trial_log.clone(),
         }
     }
@@ -268,40 +288,84 @@ fn bind_switch() -> io::Result<TcpListener> {
     TcpListener::bind(addr)
 }
 
-fn supervise(svc: Service, rx: Receiver<Req>) {
+/// Run `svc`, answering what `rx` asks of it. A service that yields to the
+/// machine's reservation (`yields_to`) is held down while it stands, and
+/// started again once it is released.
+fn supervise(svc: Service, rx: Receiver<Req>, yields_to: Option<Arc<Reservation>>) {
     roll_back_interrupted_trial(&svc);
-    let mut live = ensure(&svc);
+    let reserved = || yields_to.as_ref().is_some_and(|r| r.holds());
+    let mut live = if reserved() { None } else { ensure(&svc) };
     // Held down by a stop: the watchdog leaves the service stopped.
     let mut held = false;
+    // Taken down for the reservation standing now.
+    let mut yielded = false;
+    // Asked for while the reservation stood, which only a forced request gets
+    // past: left running until the reservation is released.
+    let mut overridden = false;
     loop {
-        match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(Req::Switch { path, reply }) => {
+        let asked = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(req) => req,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                match (reserved() && !overridden, held) {
+                    (true, _) if !yielded => {
+                        live = take_down(&svc, live);
+                        yielded = true;
+                    }
+                    (true, _) | (false, true) => {}
+                    (false, false) => {
+                        if !reserved() {
+                            overridden = false;
+                        }
+                        yielded = false;
+                        live = restart_if_gone(&svc, live);
+                    }
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        if !matches!(asked, Req::Stop { .. }) && reserved() {
+            overridden = true;
+        }
+        match asked {
+            Req::Switch { path, reply } => {
                 held = false;
                 live = apply(&svc, live, &path, reply);
             }
-            Ok(Req::Accept { path, reply }) => {
+            Req::Accept { path, reply } => {
                 held = false;
                 live = accept_build(&svc, live, &path, reply);
             }
-            Ok(Req::Restart { reply }) => {
+            Req::Restart { reply } => {
                 held = false;
                 live = restart(&svc, live, reply);
             }
-            Ok(Req::Stop { reply }) => {
+            Req::Stop { reply } => {
                 held = true;
                 live = hold(&svc, live, reply);
             }
-            Ok(Req::Start { reply }) => {
+            Req::Start { reply } => {
                 held = false;
                 live = start(&svc, live, reply);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) if held => {}
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                live = restart_if_gone(&svc, live);
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// Stop the service for the machine's reservation: the one keep runs, and one
+/// found by name, whoever started it.
+fn take_down(svc: &Service, live: Option<Live>) -> Option<Live> {
+    if let Some(mut live) = live {
+        stop(&mut live);
+    }
+    if let Some(found) = find(&svc.file) {
+        stop(&mut Live::Adopted(found.pid));
+    }
+    eprintln!(
+        "keep: {} held down while this machine is reserved",
+        svc.name
+    );
+    None
 }
 
 /// Stop the service and leave it stopped.
@@ -698,10 +762,19 @@ fn service_request(action: Action, name: &str, slots: &[Slot], forced: bool) -> 
             body: "no such service\n".into(),
         };
     };
-    if action != Action::Start {
-        if let Some(refused) = guarded(slot, forced) {
-            return refused;
-        }
+    // A start takes nothing down, so only the reservation refuses one, of a
+    // service it holds down.
+    let refused = match action {
+        Action::Start if !slot.yields || forced => None,
+        Action::Start => slot.reservation.refusal(Instant::now()).map(|why| Answer {
+            status: 409,
+            reason: "Conflict",
+            body: why,
+        }),
+        _ => guarded(slot, forced),
+    };
+    if let Some(refused) = refused {
+        return refused;
     }
     let (tx, rx) = mpsc::channel();
     let req = match action {
@@ -958,6 +1031,12 @@ mod tests {
         assert_eq!(
             cfg.services[2].stable,
             PathBuf::from(STABLE_DIR).join("mcp.exe")
+        );
+        assert_eq!(cfg.guards, ["127.0.0.1:8097"]);
+        assert_eq!(
+            cfg.services.iter().map(|s| s.yields).collect::<Vec<_>>(),
+            [false, true, false],
+            "only motherd yields to the reservation"
         );
         assert_eq!(cfg.services[0].args, ["--config", "web/web.yaml"]);
         assert_eq!(cfg.services[1].args, ["--config", "motherd/motherd.yaml"]);

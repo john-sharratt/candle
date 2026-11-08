@@ -1,11 +1,11 @@
 //! The layer ZenJ owns on every screen (§8): now playing and next, a
-//! request coming up, Zen's one-line reason, the mode — and the midnight
+//! request coming up, Zen's one-line reason, who mixes — and the midnight
 //! countdown, which takes the whole screen from 23:59:00 and says the new
 //! year for a minute after.
 
 use chrono::{DateTime, Local};
 
-use crate::hands::Mode;
+use crate::hands::Holder;
 use crate::live::Live;
 
 /// When the countdown takes over, in seconds before midnight.
@@ -47,12 +47,12 @@ pub fn overlay(l: &Live, now: DateTime<Local>, midnight: DateTime<Local>) -> Ove
     if let Some(b) = l.banner.as_ref().filter(|b| !b.is_empty()) {
         lines.push(format!("Zen: {b}"));
     }
-    let mode = match l.mode {
-        Mode::Human => None,
-        Mode::Assist => Some("ZenJ is assisting"),
-        Mode::Zenj => Some("ZenJ is mixing"),
+    let mixing = match l.holder {
+        Holder::Human => None,
+        Holder::Assist => Some("ZenJ is assisting"),
+        Holder::Zenj => Some("ZenJ is mixing"),
     };
-    if let Some(m) = mode {
+    if let Some(m) = mixing {
         lines.push(m.to_string());
     }
     Overlay::Corner(lines)
@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn the_corner_says_now_next_why_and_who_mixes() {
         let l = Live {
-            mode: Mode::Zenj,
+            holder: Holder::Zenj,
             decks: vec![DeckView {
                 number: 1,
                 title: "Waterloo".into(),

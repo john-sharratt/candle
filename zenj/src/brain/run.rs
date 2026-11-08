@@ -5,7 +5,7 @@
 //! arms the transition. It never touches MIDI: everything it does to the
 //! decks is a command to the conductor.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +20,7 @@ use super::shortlist::Scored;
 use crate::conductor::{Command, Quant, State as ConductorState};
 use crate::deck::Snapshot;
 use crate::events::{Events, Kind};
-use crate::hands::Mode;
+use crate::hands::Holder;
 use crate::library::crates::NEXT;
 use crate::live::{DeckView, Live, NextView};
 use crate::music::{Grid, Profile, TrackId};
@@ -41,8 +41,9 @@ pub enum Ask {
         now: bool,
         reply: oneshot::Sender<String>,
     },
-    Mode {
-        mode: Mode,
+    /// Give the decks to `holder`.
+    Hands {
+        holder: Holder,
         reply: oneshot::Sender<String>,
     },
     /// Make a track the next, past the shortlist.
@@ -93,6 +94,8 @@ pub struct Brain {
     pub tidal: Option<Arc<Tidal>>,
     /// The room's landing, `0..=1`, as `f32` bits (`room::Room::landing`).
     pub landing: Arc<AtomicU32>,
+    /// Whether rekordbox runs, as the deck reader last found it.
+    pub rekordbox: Arc<AtomicBool>,
 }
 
 /// A choice in flight, and what it was asked from.
@@ -184,11 +187,14 @@ impl Brain {
                 };
                 let _ = reply.send(said);
             }
-            Ask::Mode { mode, reply } => {
-                let _ = self.commands.send(Command::Mode(mode));
-                self.events
-                    .push_at(now, Kind::Mode, format!("mode {} asked for", mode.name()));
-                let _ = reply.send(format!("the decks are now in {} mode", mode.name()));
+            Ask::Hands { holder, reply } => {
+                let _ = self.commands.send(Command::Hand(holder));
+                self.events.push_at(
+                    now,
+                    Kind::Hands,
+                    format!("the decks to {} asked for", holder.name()),
+                );
+                let _ = reply.send(format!("the decks are now {}'s", holder.name()));
             }
             Ask::Pin { query, reply } => {
                 let said = match self.find(&query) {
@@ -378,7 +384,7 @@ impl Brain {
             .map(|r| format!("{}: {}", r.by, self.title(&r.track)))
             .collect();
         self.live.store(Arc::new(Live {
-            mode: c.mode,
+            holder: c.holder,
             decks,
             next,
             requests,
@@ -390,6 +396,7 @@ impl Brain {
             to_midnight_s: (self.night.midnight - now).num_seconds(),
             banner: banner.clone(),
             live: s.decks.iter().any(|d| d.playing),
+            rekordbox: self.rekordbox.load(Ordering::Relaxed),
         }));
     }
 
@@ -500,7 +507,7 @@ impl Brain {
                     .loaded
                     .iter()
                     .any(|(d, t)| *d == idle && *t == next.track);
-                if matches!(cond.mode, Mode::Assist | Mode::Zenj)
+                if matches!(cond.holder, Holder::Assist | Holder::Zenj)
                     && !loaded
                     && cond.loading.is_none()
                 {
@@ -509,7 +516,7 @@ impl Brain {
                         track: next.track.clone(),
                     });
                 }
-                if cond.mode == Mode::Zenj
+                if cond.holder == Holder::Zenj
                     && loaded
                     && cond.armed.is_none()
                     && armed_for.as_ref() != Some(&next.track)

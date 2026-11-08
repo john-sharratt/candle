@@ -56,6 +56,7 @@ use crate::engine::build::BUILD_ACTS;
 use crate::engine::invoke_body::{self, Invokable};
 use crate::engine::zen_task::TASK_ACTS;
 use crate::engine::{acts, bench, mission, mission_acts, station};
+use crate::house::HOUSE_ACTS;
 use crate::sim::agenda::Priority;
 use crate::sim::phone::Kind as ThreadKind;
 
@@ -973,6 +974,7 @@ pub static CATALOG: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(||
         .chain(mission_acts::MISSION_ACTS)
         .chain(AGENDA_ACTS)
         .chain(BRIDGE_ACTS)
+        .chain(HOUSE_ACTS)
         .chain(BUILD_ACTS)
         .chain(TASK_ACTS)
         .copied()
@@ -1464,6 +1466,11 @@ pub enum Choices {
     /// A Google TV here not yet paired — what `pair_code` finishes. A webOS TV
     /// is absent, since it earns its key in one call and takes no code.
     Pairing,
+    /// The house's modes (`docs/house_modes.md`) — what `house_mode` sets.
+    /// Offered only to a character that takes no orders, standing in the room
+    /// the house's devices stand in; empty anywhere else, which takes the act
+    /// away.
+    HouseModes,
     /// A device the last survey here found that no part stands for yet — what
     /// `onboard_part` and `link_part` are grounded in.
     Findings,
@@ -1886,6 +1893,7 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("cast_launch", "device", Choices::Cast),
     ("pair_device", "device", Choices::Pairable),
     ("pair_code", "device", Choices::Pairing),
+    ("house_mode", "mode", Choices::HouseModes),
     ("wake_device", "device", Choices::Onboarded),
     ("onboard_part", "from", Choices::Findings),
     ("link_part", "part", Choices::Unlinked),
@@ -1966,6 +1974,9 @@ pub struct Within {
     /// The Google TVs here not yet paired, by name — [`Choices::Pairing`]. What
     /// `pair_code` finishes; a webOS TV never appears, since it takes no code.
     pub pairing: Vec<String>,
+    /// The house's modes, where this character may set them —
+    /// [`Choices::HouseModes`].
+    pub house_modes: Vec<String>,
     /// The acts the carried mission grants here (`docs/zen_moon_mind.md` §14):
     /// what [`Availability::Granted`] reads. Empty unless the body carries a
     /// mission granting them, stands in its room, and the room is a mirror.
@@ -2594,6 +2605,7 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Cast => within.cast.clone(),
         Choices::Pairable => within.pairable.clone(),
         Choices::Pairing => within.pairing.clone(),
+        Choices::HouseModes => within.house_modes.clone(),
         Choices::Findings => within.findings.clone(),
         Choices::Unlinked => within.unlinked.clone(),
         Choices::Onboarded => within.onboarded.clone(),
@@ -4208,6 +4220,7 @@ mod tests {
             .chain(mission_acts::MISSION_ACTS)
             .chain(AGENDA_ACTS)
             .chain(BRIDGE_ACTS)
+            .chain(HOUSE_ACTS)
             .chain(BUILD_ACTS)
             .chain(TASK_ACTS)
             .map(|t| t.name)
