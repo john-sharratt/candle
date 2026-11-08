@@ -46,7 +46,21 @@ cycle in the engine, and every throttle goes (§1).
 - **The back-pressure design (`docs/kv_back_pressure.md`) is withdrawn.** Its
   producer "room" is a throttle under another name, so the file is deleted.
 
-## 2. The quant reserve: one empty arena per reachable class, always there
+## 2. The quant reserve: one arena's worth free per reachable class, always there
+
+**Built** as a headroom rule, not a marked arena:
+- Each reserve class (`GidPool::keep_reserve`, registered by
+  `ChunkedKvBacking::keep_reserves` in place of `warm_protected_arenas`) keeps
+  at least one arena's worth of **free slots**.
+- The empty sweep (`ArenaPool::try_tombstone`) releases an empty arena of a
+  reserve class only while the class keeps a whole arena free without it, and
+  takes the highest-index empty first, so the lowest stands.
+
+Because the reserve is free capacity rather than a particular arena,
+allocation and compaction need no special case. Allocation's lock-free path
+is unchanged. Compaction packs within a class without changing its free total,
+so it cannot consume a reserve. The detail below is the original design; where
+it names a marked arena, the headroom rule is what was built.
 
 **What it holds.** For every size class the active `CompressionPolicy` can
 quantize into, the KV side keeps exactly **one empty reserve arena**. It also
@@ -72,13 +86,13 @@ then **owed a new reserve**. A migrate mid-wave therefore always has a
 destination. It never needs a new arena inside a wave, so "deferred: needs a
 new arena" cannot recur while the reserve stands.
 
-**When it is replenished**, at the moments arena creation is legal:
-- the wave-loop gap (`run.rs:1383`, `create_deferred_arenas`), moved **ahead
-  of** compaction so a sweep cannot see the new reserve before it is
-  protected;
-- admission relief (`promote_new_prefills` → `relieve_vram_pressure`, after
-  `end_wave_transient`);
-- the persistence pass top (`thread.rs:1100`).
+**When it is replenished** (`BackingInner::owe_reserves`, at the top of every
+`create_deferred_arenas`), at the moments arena creation is legal:
+- the wave-loop gap, which now creates arenas **ahead of** compaction, so a
+  sweep cannot see the new reserve before it is protected;
+- the persistence pass top.
+
+The gap runs on every loop iteration, so admission needs no third site.
 
 Replenishing one reserve costs one region claim per class consumed.
 
@@ -96,13 +110,37 @@ Replenishing one reserve costs one region claim per class consumed.
 4. Hysteresis: a class that is no longer reachable (the policy changed) gives
    its reserve back only after one full persistence pass with no demand for it.
 
-**Accounting.** Reserve regions are KV ground.
-- They count against the KV side of `weight_floor`, which grows by the reserve
-  set (one region per reachable class) at most.
-- `region_stats` reports them separately (`reserve`), so a check that reads
-  free regions does not count a reserve as headroom (invariant 7).
+**Accounting.** Reserve arenas are KV ground and are never free regions:
+- the weight side buys only free regions, so it cannot take one;
+- they count against the KV side of `weight_floor`, adding at most one region
+  per reachable class.
+
+**Arenas made ahead of demand** are protected until the demand fills them or
+[`FRESH_GAPS`] gaps pass (`BackingInner::fresh_arenas`, `settle_fresh`).
 
 ## 3. Compaction and migration: pool-grained, and neither waits
+
+> **Revised on reading the code: per-pool holds do not reach the contention.**
+>
+> - A migrate learns its destination classes only inside the quantize, block
+>   by block, so it would have to hold every reachable quant pool shared.
+> - It reads native hot pools, which are exactly where finished readings
+>   fragment and compaction is most needed.
+>
+> Per-pool holds would starve compaction on the pools that matter, as the
+> global word does now.
+>
+> The design that reaches it is per **chunk**: compaction never relocates a
+> slot that a holder it cannot sweep has a reference to. A migrate's snapshot
+> holds one, so its refcount says so. The planner skips such slots instead of
+> refusing the whole pass. That is a change to compaction's planner (census and
+> sweep), and is proposed for a decision before it is built.
+>
+> The "skip a whole class" refusal in `run_pass` is not a defect. It is taken
+> before the group is snapshotted, when every group of that class would be
+> refused at the same instant.
+>
+> The text below is the original per-pool design, kept for the record.
 
 **Replacing the global word.** `CHUNK_LOCATIONS` / `COMPACTION_WAITING` give
 way to a **per-pool gate**, one atomic word per `ArenaKey`

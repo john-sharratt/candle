@@ -144,9 +144,15 @@ fn push_unique_key(keys: &mut Vec<super::arena::ArenaKey>, key: super::arena::Ar
 }
 
 impl ChunkedKvBacking {
-    /// Pre-create one arena for baseline formats and quant candidates, then
-    /// mark those arena indices as protected so compaction never tombstones them.
-    pub(super) fn warm_protected_arenas(
+    /// Keep a **reserve** for the baseline formats and every quant candidate
+    /// the policy can produce (`docs/kv_drain_under_pressure.md` §2): one
+    /// arena's worth of free slots per class, which the empty sweep never
+    /// releases, created here and replenished between forwards
+    /// ([`BackingInner::owe_reserves`]). A hot→warm migrate then always finds
+    /// its quantize destination without creating an arena — which it cannot
+    /// do while a wave is open, and which a full reservation gives it no
+    /// region for between waves.
+    pub(super) fn keep_reserves(
         &self,
         compression: Option<&super::CompressionPolicy>,
     ) -> Result<()> {
@@ -184,9 +190,10 @@ impl ChunkedKvBacking {
         }
 
         for key in keys {
+            self.inner.pool.keep_reserve(key);
             let arena_idx = self.inner.pool.register_arena(key);
-            self.inner.pool.protect_arena(arena_idx);
             self.ensure_arena_exists(arena_idx, key)?;
+            self.inner.pool.finish_creation(key, arena_idx);
         }
         Ok(())
     }
@@ -222,6 +229,12 @@ impl ChunkedKvBacking {
         self.inner.create_arena(key, index)
     }
 }
+
+/// Gaps an arena made ahead of its demand stays protected while the demand
+/// has not come: long enough for the refused pass to return, short enough
+/// that a demand abandoned does not hold a region for good.
+#[cfg(feature = "cuda")]
+const FRESH_GAPS: u32 = 64;
 
 /// Most arenas one refused pass may owe a class: a mis-sized demand cannot
 /// owe the whole span.
@@ -400,6 +413,44 @@ impl BackingInner {
         }
     }
 
+    /// Owe an arena to every reserve class whose free slots have fallen below
+    /// one arena's worth — a migrate's destination taken mid-wave, to be
+    /// replaced in the gap (`docs/kv_drain_under_pressure.md` §2).
+    #[cfg(feature = "cuda")]
+    pub(super) fn owe_reserves(&self) {
+        for key in self.pool.reserve_keys() {
+            if key.location != self.hot_location() {
+                continue;
+            }
+            if self.pool.free_slots(key) < key.chunks() {
+                self.note_deferred_arena(key);
+            }
+        }
+    }
+
+    /// Lift the protection of each arena made ahead of demand that the
+    /// demand has since filled, that is gone, or that has waited
+    /// [`FRESH_GAPS`] gaps for a demand that never came.
+    #[cfg(feature = "cuda")]
+    fn settle_fresh(&self) {
+        let Ok(mut fresh) = self.fresh_arenas.lock() else {
+            return;
+        };
+        fresh.retain_mut(|(key, idx, gaps)| {
+            *gaps += 1;
+            let load = self.pool.pool_arena_load(*key);
+            let standing = load.iter().find(|&&(i, _, _)| i == *idx);
+            let settled = match standing {
+                None => true,
+                Some(&(_, _, live)) => live > 0 || *gaps > FRESH_GAPS,
+            };
+            if settled {
+                self.pool.unprotect_arena(*idx);
+            }
+            !settled
+        });
+    }
+
     /// Create the arenas that mid-wave refusals asked for, and answer with how
     /// many were made.
     ///
@@ -414,8 +465,15 @@ impl BackingInner {
     /// Refusals here are ordinary and silent: if a forward has started, the
     /// demand stays recorded and the next gap gets it. Only a genuine allocation
     /// failure — the reservation truly full — propagates.
+    ///
+    /// It first owes every reserve that has fallen short ([`Self::owe_reserves`])
+    /// and lifts the protection of the arenas it made earlier whose demand has
+    /// arrived ([`Self::settle_fresh`]), so one call keeps the reserve standing.
+    /// Each arena it makes is protected until its demand fills it.
     #[cfg(feature = "cuda")]
     pub(super) fn create_deferred_arenas(&self) -> Result<usize> {
+        self.settle_fresh();
+        self.owe_reserves();
         let pending: Vec<ArenaKey> = match self.deferred_arenas.lock() {
             Ok(mut p) => std::mem::take(&mut *p),
             Err(_) => return Ok(0),
@@ -471,6 +529,13 @@ impl BackingInner {
                     // arena whose window never closes is counted as reclaimable
                     // and then refused by the sweep for the life of the process.
                     self.pool.finish_creation(key, idx);
+                    // Made for a demand that has not filled it yet: protected
+                    // until it does, or the sweep this same gap runs reclaims
+                    // it first and the pass that wanted it is refused again.
+                    self.pool.protect_arena(idx);
+                    if let Ok(mut fresh) = self.fresh_arenas.lock() {
+                        fresh.push((key, idx, 0));
+                    }
                     made += 1;
                 }
                 Err(e) => {
