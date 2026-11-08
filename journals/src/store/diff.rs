@@ -83,7 +83,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::files::Role;
     use crate::ops::fixture::{john, now, p, zen};
@@ -91,6 +90,7 @@ mod tests {
     use crate::path::Address;
     use crate::period::Period;
     use crate::scope::Channel;
+    use crate::terms::Terms;
     use crate::testing::{note, slug};
     use crate::tree::load::load;
     use crate::tree::render::render_all;

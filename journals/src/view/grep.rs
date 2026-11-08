@@ -231,11 +231,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::terms::Terms;
     use crate::ops::fixture::{bot, guest, john, now, p, stranger, yen, zen};
     use crate::ops::fold::fold_child;
     use crate::ops::{apply, OnTaken, Op};
     use crate::scope::Section;
+    use crate::terms::Terms;
     use crate::testing::{note, slug};
 
     fn noted(t: &mut Tree, actor: &Actor, path: &str, text: &str, at: Stamp) {
@@ -344,7 +344,7 @@ mod tests {
             "b".repeat(800)
         );
         noted(&mut t, &john(), "topics", &long, now());
-        let (hits, _) = grep(now(), &t,&john(), "builder", None, 10);
+        let (hits, _) = grep(now(), &t, &john(), "builder", None, 10);
         assert_eq!(hits.len(), 1);
         let cut = excerpt(&long, "builder");
         assert_eq!(cut.chars().count(), EXCERPT + 2, "both ends marked");
@@ -384,7 +384,7 @@ mod tests {
              @zen/topics #2026-10-30-1202-b082 2026-10-30 12:02 note, john via Claude Code: \
              The cpu experts pool is on by default."
         );
-        let (by_cue, _) = grep(now(), &t,&john(), "host pool", None, 10);
+        let (by_cue, _) = grep(now(), &t, &john(), "host pool", None, 10);
         assert_eq!(by_cue[0].found, Found::Journal);
         // A word naming its group, its section or a fixed journal's cue
         // finds no journal: only a named journal's own name and cue count.
@@ -455,7 +455,10 @@ mod tests {
         ] {
             assert_eq!(grep(now(), &t, &john(), phrase, None, 10).1, 1, "{phrase}");
         }
-        assert_eq!(grep(now(), &t, &john(), "environmentvariable", None, 10).1, 0);
+        assert_eq!(
+            grep(now(), &t, &john(), "environmentvariable", None, 10).1,
+            0
+        );
         for empty in ["-", " - ", "--"] {
             assert_eq!(grep(now(), &t, &john(), empty, None, 10).1, 0, "{empty:?}");
         }

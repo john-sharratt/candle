@@ -242,12 +242,12 @@ pub fn mark_stale(tree: &mut Tree, path: &JournalPath, why: &str) -> Result<Appl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::line::LineId;
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, OnTaken, Op, Which};
     use crate::scope::Channel;
+    use crate::terms::Terms;
     use crate::testing::slug;
     use crate::tree::fingerprint::is_dirty;
 

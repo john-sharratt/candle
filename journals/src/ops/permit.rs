@@ -69,9 +69,9 @@ fn read_only<'a>(tree: &Tree, actor: &Actor, path: &'a JournalPath) -> Option<&'
 /// cue, a summary, a fold, a name.
 fn texts(op: &Op) -> Vec<&str> {
     match op {
-        Op::Note { text, terms, .. } => once(text.as_str())
-            .chain(terms.source.as_deref())
-            .collect(),
+        Op::Note { text, terms, .. } => {
+            once(text.as_str()).chain(terms.source.as_deref()).collect()
+        }
         Op::Episode { text, .. } | Op::Edit { text, .. } | Op::FoldPeriod { text, .. } => {
             vec![text]
         }

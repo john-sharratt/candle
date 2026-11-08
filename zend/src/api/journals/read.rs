@@ -114,7 +114,14 @@ pub fn searched(m: &Mem, pattern: &str, under: Option<&str>, max: Option<usize>)
         },
     };
     let max = max.unwrap_or(DEFAULT_HITS).clamp(1, MAX_HITS);
-    let (hits, total) = search(Stamp::now(), &m.tree, &m.actor(), pattern, under.as_ref(), max);
+    let (hits, total) = search(
+        Stamp::now(),
+        &m.tree,
+        &m.actor(),
+        pattern,
+        under.as_ref(),
+        max,
+    );
     (StatusCode::OK, view::hits(&hits, total))
 }
 

@@ -397,15 +397,25 @@ mod tests {
             .contains("needs its `source`"));
         let missing = LineId::parse("2026-10-31-0034-7c25").unwrap();
         assert_eq!(
-            apply(&mut t, &john(), &concluded(Some("keys.rs:12"), Some(missing)), now())
-                .unwrap_err()
-                .to_string(),
+            apply(
+                &mut t,
+                &john(),
+                &concluded(Some("keys.rs:12"), Some(missing)),
+                now()
+            )
+            .unwrap_err()
+            .to_string(),
             "@zen/topics has no line #2026-10-31-0034-7c25 in its window to replace"
         );
-        let old = apply(&mut t, &john(), &note_op("topics", "The key version is 2."), now())
-            .unwrap()
-            .line
-            .unwrap();
+        let old = apply(
+            &mut t,
+            &john(),
+            &note_op("topics", "The key version is 2."),
+            now(),
+        )
+        .unwrap()
+        .line
+        .unwrap();
         apply(
             &mut t,
             &john(),
@@ -418,7 +428,13 @@ mod tests {
         assert_eq!(kept.terms.source.as_deref(), Some("keys.rs:12"));
         assert!(kept.terms.concluded);
         // Heard rather than concluded, a note needs no source anywhere.
-        apply(&mut t, &john(), &note_op("topics", "John prefers tea."), now()).unwrap();
+        apply(
+            &mut t,
+            &john(),
+            &note_op("topics", "John prefers tea."),
+            now(),
+        )
+        .unwrap();
     }
 
     #[test]

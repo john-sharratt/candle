@@ -126,11 +126,11 @@ pub fn due(tree: &Tree, now: Stamp) -> Vec<Job> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::ops::fixture::{john, p, zen};
     use crate::ops::{apply, OnTaken, Op};
     use crate::scope::Channel;
+    use crate::terms::Terms;
     use crate::testing::{at, slug};
     use crate::tree::WINDOW;
 

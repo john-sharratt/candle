@@ -35,11 +35,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::terms::Terms;
     use crate::line::{Folds, LineId};
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Op};
     use crate::period::Period;
+    use crate::terms::Terms;
     use crate::testing::note;
 
     #[test]

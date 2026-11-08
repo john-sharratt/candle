@@ -249,11 +249,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, OnTaken, Which};
     use crate::scope::Channel;
+    use crate::terms::Terms;
     use crate::testing::slug;
 
     #[test]

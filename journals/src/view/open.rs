@@ -100,13 +100,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::error::Problem;
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, OnTaken, Op};
     use crate::period::Period;
     use crate::scope::Channel;
+    use crate::terms::Terms;
     use crate::testing::{note, slug};
 
     #[test]

@@ -120,13 +120,13 @@ pub fn index(path: &JournalPath, j: &Journal, now: Stamp) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::error::Problem;
     use crate::files::summary::{Cite, Sentence};
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::fold::fold_child;
     use crate::ops::{apply, OnTaken, Op};
+    use crate::terms::Terms;
     use crate::testing::slug;
     use crate::tree::fingerprint::fingerprint;
 

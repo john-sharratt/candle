@@ -65,8 +65,8 @@ pub fn read(message: &str) -> Result<Recorded> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terms::Terms;
     use crate::ops::fixture::{now, p, yen};
+    use crate::terms::Terms;
     use crate::testing::slug;
 
     #[test]

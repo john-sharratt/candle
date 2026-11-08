@@ -62,7 +62,10 @@ mod tests {
     /// states none.
     #[test]
     fn each_term_is_read_as_stated() {
-        assert_eq!(terms_of(&json!({"journal": "here", "text": "x"})).unwrap(), Terms::default());
+        assert_eq!(
+            terms_of(&json!({"journal": "here", "text": "x"})).unwrap(),
+            Terms::default()
+        );
         let t = terms_of(&json!({
             "by": "assistant",
             "source": " zend/src/branch_ingest/keys.rs:12 ",
@@ -90,9 +93,18 @@ mod tests {
     /// **A term stated wrongly is refused, saying what it takes.**
     #[test]
     fn a_wrong_term_is_refused_saying_what_it_takes() {
-        assert!(terms_of(&json!({"by": "claude"})).unwrap_err().contains("`speaker`"));
-        assert!(terms_of(&json!({"expires": "soon"})).unwrap_err().contains("a date"));
-        assert!(terms_of(&json!({"replaces": "7e3a"})).unwrap_err().contains("not a line id"));
-        assert_eq!(terms_of(&json!({"source": 3})).unwrap_err(), "`source` is text");
+        assert!(terms_of(&json!({"by": "claude"}))
+            .unwrap_err()
+            .contains("`speaker`"));
+        assert!(terms_of(&json!({"expires": "soon"}))
+            .unwrap_err()
+            .contains("a date"));
+        assert!(terms_of(&json!({"replaces": "7e3a"}))
+            .unwrap_err()
+            .contains("not a line id"));
+        assert_eq!(
+            terms_of(&json!({"source": 3})).unwrap_err(),
+            "`source` is text"
+        );
     }
 }

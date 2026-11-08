@@ -85,11 +85,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::terms::Terms;
     use crate::actor::Actor;
     use crate::brief::call_of;
     use crate::ops::apply;
     use crate::ops::fixture::{john, p, zen};
+    use crate::terms::Terms;
     use crate::testing::at;
     use crate::tree::window::next_fold;
     use crate::tree::WINDOW;
