@@ -345,7 +345,10 @@ pub fn wait_secs(ctx: &Ctx, args: &Value) -> Wait {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use crate::mcp::npcd_tools;
 
     #[test]
     fn every_tool_has_a_name_a_description_and_an_object_schema() {
@@ -416,6 +419,31 @@ mod tests {
                 "timeline_read",
                 "timeline_delete"
             ]
+        );
+    }
+
+    /// **Every tool a guide names is one the connector serves**: zend's, npcd's
+    /// — its bot reads and acts, which zend lists for its own workers, and
+    /// `image_upload`, its one tool no worker calls — or the aggregator's own
+    /// guide tools. The runtime half is the aggregator's `Library::unserved`
+    /// warning; this fails the build instead.
+    #[test]
+    fn every_tool_a_guide_names_is_served() {
+        let library = guides::embedded().unwrap();
+        let defs = definitions();
+        let mut served: BTreeSet<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["name"].as_str())
+            .collect();
+        served.extend(npcd_tools::READS);
+        served.extend(npcd_tools::ACTS);
+        served.extend(["image_upload", "guide_list", "guide_read"]);
+        let unserved = library.unserved(&served);
+        assert!(
+            unserved.is_empty(),
+            "guides name tools nothing serves: {unserved:?}"
         );
     }
 

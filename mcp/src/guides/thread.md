@@ -18,9 +18,13 @@ answer it and stop.
 
 1. `guide_list` once per conversation, to see what methods exist.
 2. `thread_list` if the work may already have a thread.
-3. `thread_attach {thread}` — a kebab-case slug for what the work is about
-   (`review-layers`, `model-releases-research`). Two unrelated pieces of work
-   never share a thread; one piece of work never spans two.
+3. `thread_attach {thread, about}` — a kebab-case slug for what the work is
+   about (`review-layers`, `model-releases-research`), and `about`, up to three
+   memory topics it concerns (`topics/candle/zen`): every worker on the thread
+   then carries those topics' newest lines, and the thread's notes and its
+   tasks' outcomes are kept under `threads/<thread>` and linked from them. Two
+   unrelated pieces of work never share a thread; one piece of work never
+   spans two.
 4. Read what it answers: the journal so far. If it holds earlier tasks, start
    from what they found, not from scratch. An answer that begins "Created" is
    a new thread — when you meant an existing one, the name was mistyped:

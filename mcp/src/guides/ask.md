@@ -11,7 +11,7 @@ safe. Split a broad question into independent ones and start them together.
 
 ## Prompt
 
-`repo_task_start {thread, name: "ask-<topic>", effort: "deep", prompt}`:
+`repo_task_start {thread, name: "ask-<topic>", role: "researcher", effort: "deep", prompt}`:
 
 ```
 GOAL: <the question, in full, and what the answer is for>

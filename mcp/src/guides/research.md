@@ -20,7 +20,7 @@ answers each of those.
 ## Delegate
 
 Split a broad question into independent ones and start them together, each
-with `effort: "exhaustive"`:
+with `role: "researcher"` and `effort: "exhaustive"`:
 
 ```
 GOAL: <the question, in full, and what the answer is for>

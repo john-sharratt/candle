@@ -17,7 +17,7 @@ An `ask` task: every use in the repository of what changed, with file:line.
 
 ## 3. Upgrade
 
-`repo_task_start {thread, name: "upgrade-<dep>", effort: "deep", prompt}`:
+`repo_task_start {thread, name: "upgrade-<dep>", role: "coder", effort: "deep", prompt}`:
 
 ```
 GOAL: upgrade <dependency> from <old> to <new> in <repository>, on branch

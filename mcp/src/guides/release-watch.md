@@ -18,7 +18,7 @@ that starts from the notes.
 
 ## Delegate
 
-`effort: "exhaustive"`:
+`role: "researcher"`, `effort: "exhaustive"`:
 
 ```
 GOAL: survey <subject> released between <from> and <to>.

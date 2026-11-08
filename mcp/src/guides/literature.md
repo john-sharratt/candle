@@ -15,7 +15,7 @@ image.
 
 ## Delegate
 
-`effort: "exhaustive"`:
+`role: "researcher"`, `effort: "exhaustive"`:
 
 ```
 GOAL: survey the work on <technique> for <purpose>.

@@ -1,7 +1,7 @@
 ---
 name: steer
-description: How to redirect a running worker — a nudge for a course correction, a stop when it is looping, a reply that gives it the decision.
-tools: [repo_task_nudge, job_cancel, repo_task_reply, job_status]
+description: How to redirect a running worker — a nudge for a course correction, a stop when it is looping, a reply that gives it the decision, a held call granted, and a result landed.
+tools: [repo_task_nudge, job_cancel, repo_task_reply, job_status, approval_grant]
 ---
 # Steering a worker
 
@@ -38,4 +38,17 @@ next message:
   what to do instead. "It depends" sends it round again.
 - Check its pointers first when the question rests on them.
 - A reply grants nothing: it cannot approve a merge, a deploy, or anything the
-  user must approve. Ask the user, then reply with what they decided.
+  user must approve. Ask the user, then reply with what they decided. A call
+  the worker could not make alone came back to it as `needs_approval <id>`:
+  with the user's yes, `approval_grant` runs it and you reply with its answer
+  (the `approvals` guide).
+
+## Land it — when it wrote the result but did not commit
+
+A worker that finished its work and asks "shall I commit it?" or answers with
+a document and no commit has not landed anything. If its brief said where the
+result goes, reply "land it": commit and push it as its brief says, and
+answer the commit. A worker started as `researcher` cannot commit at all:
+start the landing as its own task with `role: "coder"`, pointing at the
+worker's answer, and next time give the work its `coder` role from the start
+(`delegate`).

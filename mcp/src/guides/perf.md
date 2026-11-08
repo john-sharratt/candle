@@ -7,7 +7,7 @@ tools: [repo_task_start, repo_job_start, job_status, job_read, cluster_status]
 
 ## Prompt
 
-`repo_task_start {thread, name: "perf-<what>", effort: "exhaustive", prompt}`:
+`repo_task_start {thread, name: "perf-<what>", role: "coder", effort: "exhaustive", prompt}`:
 
 ```
 GOAL: find why <operation> is slower than <expected>, and make it faster, in

@@ -106,6 +106,11 @@ the first-call context, and is readable like any guide with `guide_read`. It is
 written on a budget — it rides the first call of every conversation — and
 leans on the other guides and the tools' descriptions for detail.
 
+`claude` is the guide for every Claude client (`claude-code`, `claude-ai`) and
+any other: the frame, the write rules in brief, and which guide to read for
+the work, the full `memory` guide among them, which is read on demand and
+rides no first call.
+
 `grok` is the guide for Grok: answers are spoken and short; URLs, ids and
 code are never read out; memory is kept with `journal_note ~`; and the basics
 of changing the connector itself — a guide edit through a worker, merged with

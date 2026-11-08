@@ -12,7 +12,7 @@ user asks — otherwise check them yourself, by the same method.
 
 ## Delegate
 
-`effort: "exhaustive"`:
+`role: "researcher"`, `effort: "exhaustive"`:
 
 ```
 GOAL: check each claim below.

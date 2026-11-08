@@ -12,7 +12,7 @@ Split a large change by area; one task each, started together.
 
 ## Prompt
 
-`repo_task_start {thread, name: "review-<area>", effort: "exhaustive", prompt}`:
+`repo_task_start {thread, name: "review-<area>", role: "reviewer", effort: "exhaustive", prompt}`:
 
 ```
 GOAL: review <branch | these files | this diff> of <repository>.

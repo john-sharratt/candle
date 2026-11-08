@@ -14,7 +14,8 @@ Note the spec's decisions on the thread first: every worker starts with them.
 
 ## Prompt
 
-`repo_task_start {thread, name: "implement-<what>", effort: "deep", prompt}`:
+`repo_task_start {thread, name: "implement-<what>", role: "coder", effort: "deep", prompt}`
+— `driven: "alone"` when no one will answer its questions (read `drive`):
 
 ```
 GOAL: implement the specification below in <repository>, on the branch
