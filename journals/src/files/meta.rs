@@ -212,7 +212,11 @@ mod tests {
             }),
             activity: {
                 let mut a = Activity::default();
-                a.push(at("2026-10-30T10:00:00Z"), "repo_task_start", "permits: tidy");
+                a.push(
+                    at("2026-10-30T10:00:00Z"),
+                    "repo_task_start",
+                    "permits: tidy",
+                );
                 a.before.insert("log_grep".into(), 2);
                 a
             },

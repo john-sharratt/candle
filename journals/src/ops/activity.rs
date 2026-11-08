@@ -83,7 +83,10 @@ mod tests {
         let j = t.get(&conv).unwrap();
         assert!(j.window.is_empty(), "no line was written");
         let done = &j.meta.as_ref().unwrap().activity.done;
-        assert_eq!((done[0].tool.as_str(), done[0].subject.as_str()), ("log_grep", "wave too wide"));
+        assert_eq!(
+            (done[0].tool.as_str(), done[0].subject.as_str()),
+            ("log_grep", "wave too wide")
+        );
         assert!(apply(&mut t, &server(), &op(&p("topics")), now())
             .unwrap_err()
             .to_string()

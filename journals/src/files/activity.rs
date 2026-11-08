@@ -149,7 +149,11 @@ mod tests {
         Activity::default().render(&mut out);
         assert_eq!(out, "");
         let mut a = Activity::default();
-        a.push(at("2026-11-08T03:27:00Z"), "log_grep", "^2026-11-08T0: wave");
+        a.push(
+            at("2026-11-08T03:27:00Z"),
+            "log_grep",
+            "^2026-11-08T0: wave",
+        );
         a.before.insert("service_status".into(), 3);
         a.render(&mut out);
         assert_eq!(

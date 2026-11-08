@@ -67,7 +67,8 @@ pub fn block(outcomes: &[Outcome]) -> Option<String> {
     if outcomes.is_empty() {
         return None;
     }
-    let mut out = "Finished while nobody waited on it — read and verify before relying on it:".to_string();
+    let mut out =
+        "Finished while nobody waited on it — read and verify before relying on it:".to_string();
     for o in outcomes {
         out.push_str(&format!(
             "\n  - T:{}/{} — {} {}",
@@ -88,7 +89,8 @@ mod tests {
             thread: "dj-set".into(),
             name: format!("doc-{at_ms}"),
             label: "Task ended:".into(),
-            text: "Wrote docs/midi_dj_set.md; pushed zen/docs-midi-dj-set; the merge waits on you.".into(),
+            text: "Wrote docs/midi_dj_set.md; pushed zen/docs-midi-dj-set; the merge waits on you."
+                .into(),
         }
     }
 

@@ -54,7 +54,10 @@ mod tests {
     #[test]
     fn a_call_names_its_mode_or_its_client_decides() {
         assert_eq!(Driven::of(None, Client::Grok).unwrap(), Driven::Alone);
-        assert_eq!(Driven::of(None, Client::ClaudeCode).unwrap(), Driven::Attended);
+        assert_eq!(
+            Driven::of(None, Client::ClaudeCode).unwrap(),
+            Driven::Attended
+        );
         assert_eq!(
             Driven::of(Some("attended"), Client::Grok).unwrap(),
             Driven::Attended

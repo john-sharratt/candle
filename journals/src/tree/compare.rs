@@ -41,7 +41,9 @@ pub fn lost(old: &Tree, new: &Tree, forgets: &BTreeSet<LineId>) -> Vec<String> {
     line_homes(old)
         .into_iter()
         .filter(|(id, _)| !kept.contains_key(id) && !forgets.contains(id))
-        .map(|(id, at)| format!("{at}#{id} is gone: a change keeps every line it does not forget by name"))
+        .map(|(id, at)| {
+            format!("{at}#{id} is gone: a change keeps every line it does not forget by name")
+        })
         .collect()
 }
 
@@ -130,7 +132,8 @@ mod tests {
     use crate::tree::load::load;
 
     const ZEN: &str = "group: zen\nname: \"Zen\"\nmembers:\n  - {person: john, role: owner, joined: 2026-10-30T00:00:00Z}\n";
-    const LINE: &str = "at: 2026-10-30T09:12:40Z\nkind: note\nby: claude-code\naccount: john\ntext: a\n";
+    const LINE: &str =
+        "at: 2026-10-30T09:12:40Z\nkind: note\nby: claude-code\naccount: john\ntext: a\n";
 
     /// A tree holding the journals `at`, each `name:` folder with its lines.
     fn tree(at: &[(&str, &[&str])]) -> Tree {
@@ -151,7 +154,10 @@ mod tests {
                 .into_bytes(),
             );
             for id in *lines {
-                files.insert(format!("groups/zen/{folder}/{id}.yaml"), LINE.as_bytes().to_vec());
+                files.insert(
+                    format!("groups/zen/{folder}/{id}.yaml"),
+                    LINE.as_bytes().to_vec(),
+                );
             }
         }
         load(&files)
@@ -204,7 +210,11 @@ mod tests {
                 "1 journals removed, over the budget of 0"
             ]
         );
-        assert!(Budget::parse("moved: 3").unwrap_err().contains("no part of a shape"));
-        assert!(Budget::parse("created: many").unwrap_err().contains("not a count"));
+        assert!(Budget::parse("moved: 3")
+            .unwrap_err()
+            .contains("no part of a shape"));
+        assert!(Budget::parse("created: many")
+            .unwrap_err()
+            .contains("not a count"));
     }
 }
