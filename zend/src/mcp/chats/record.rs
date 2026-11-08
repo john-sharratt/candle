@@ -41,10 +41,7 @@ pub struct Chat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Speaker {
-    /// The MCP client that sent it, whichever that was. A message kept as
-    /// `claude` reads as one of these: chats an earlier build wrote keep the
-    /// caller's side under that name, and a chat lives twelve hours.
-    #[serde(alias = "claude")]
+    /// The MCP client that sent it, whichever that was.
     Caller,
     Zen,
 }
@@ -236,15 +233,6 @@ mod tests {
         );
         let kept: Said = serde_json::from_str(r#"{"at_ms":7,"by":"caller","text":"hi"}"#).unwrap();
         assert_eq!(kept, said_at(7, Speaker::Caller, "hi"));
-    }
-
-    /// **A message kept as `claude` reads as the caller's**, so a chat open
-    /// across a deploy keeps its messages.
-    #[test]
-    fn a_message_kept_as_claude_reads_as_the_callers() {
-        let kept: Said = serde_json::from_str(r#"{"at_ms":7,"by":"claude","text":"hi"}"#).unwrap();
-        assert_eq!(kept, said_at(7, Speaker::Caller, "hi"));
-        assert_eq!(kept.speaker(), "Caller");
     }
 
     /// **The caller is named by the app it came through**, and "Caller" when
