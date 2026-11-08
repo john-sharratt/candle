@@ -12,6 +12,7 @@
 //! | [`midi`] | The wire, controller maps, the ports |
 //! | [`deck`] | rekordbox's live deck state, read from its memory |
 //! | [`rekordbox`] | rekordbox's library and analysis files |
+//! | [`room`] | The FLX4's output captured, its levels, how it is landing |
 //! | [`oauth`] | Signing in to Spotify and TIDAL |
 //! | [`spotify`] | Taste and requests |
 //! | [`tidal`] | The audio's catalogue and ZenJ's playlists |
@@ -29,5 +30,6 @@ pub mod music;
 pub mod oauth;
 pub mod plan;
 pub mod rekordbox;
+pub mod room;
 pub mod spotify;
 pub mod tidal;

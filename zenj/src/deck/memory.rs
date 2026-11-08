@@ -252,6 +252,14 @@ pub mod fake {
     }
 
     impl Image {
+        /// An empty image whose module is at `base`.
+        pub fn at(base: usize) -> Image {
+            Image {
+                base,
+                regions: BTreeMap::new(),
+            }
+        }
+
         pub fn write(&mut self, at: usize, bytes: &[u8]) {
             self.regions.insert(at, bytes.to_vec());
         }
@@ -291,10 +299,7 @@ mod tests {
     /// dereferenced, the last only added — and reads the value there.
     #[test]
     fn a_chain_resolves_through_its_hops() {
-        let mut m = Image {
-            base: 0x1000,
-            ..Image::default()
-        };
+        let mut m = Image::at(0x1000);
         m.pointer(0x1000 + 0x40, 0x9000);
         m.pointer(0x9000 + 0x8, 0x5000);
         m.write(0x5000 + 0x1A0, &128.5f32.to_le_bytes());
