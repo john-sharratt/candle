@@ -99,8 +99,8 @@ mod tests {
             keep(&r, "o", &outcome(at)).unwrap();
         }
         assert_eq!(r.count_under("mcp/outcome/o/"), RING as usize);
-        let newest: Vec<u64> = newest(&r, "o", 3).iter().map(|o| o.at_ms).collect();
-        assert_eq!(newest, [RING + 3, RING + 2, RING + 1]);
+        let kept: Vec<u64> = newest(&r, "o", 3).iter().map(|o| o.at_ms).collect();
+        assert_eq!(kept, [RING + 3, RING + 2, RING + 1]);
         assert!(newest(&r, "other", 3).is_empty());
     }
 
