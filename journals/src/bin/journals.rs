@@ -11,18 +11,26 @@
 //! `journals fmt <dir>`: the same read, then every file the tree is made of
 //! rewritten as the service writes it — for a tree written by hand, or in an
 //! older form of the files. Writes nothing when anything is wrong.
+//!
+//! `journals survey <dir> [--code <checkout>]`: the candidates a maintenance
+//! mission starts from (`journals::tree::survey`), one per line; with
+//! `--code`, a line's `source` file is looked up in that git checkout's
+//! history since the line was written. Reads only; exits 0 with or without
+//! candidates.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use journals::line::LineId;
+use journals::time::Stamp;
 use journals::tree::compare::{lost, shape, Budget, Shape};
 use journals::tree::load::load;
 use journals::tree::render::render_all;
+use journals::tree::survey::survey;
 use journals::tree::Tree;
 
 fn read_dir(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> io::Result<()> {
@@ -122,13 +130,54 @@ fn against_of(flags: &[String]) -> Result<Option<Against>, String> {
     }
 }
 
+/// Whether `file` has a commit in the checkout `code` since `at`.
+fn changed_in(code: &Path, file: &str, at: Stamp) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(code)
+        .args(["log", "-1", "--format=%H"])
+        .arg(format!("--since={at}"))
+        .args(["--", file])
+        .output()
+        .is_ok_and(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
+}
+
+/// `journals survey <dir> [--code <checkout>]`.
+fn run_survey(dir: &str, flags: &[String]) -> ExitCode {
+    let code = match flags {
+        [] => None,
+        [flag, checkout] if flag == "--code" => Some(Path::new(checkout)),
+        _ => {
+            eprintln!("usage: journals survey <dir> [--code <checkout>]");
+            return ExitCode::from(2);
+        }
+    };
+    let (tree, _) = match read_tree(dir) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let changed = |file: &str, at: Stamp| code.is_some_and(|c| changed_in(c, file, at));
+    let found = survey(&tree, Stamp::now(), &changed);
+    for c in &found {
+        println!("{c}");
+    }
+    println!("{} candidates", found.len());
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
-    let usage = "usage: journals check <dir> [--against <old dir> [--forgets <file>] [--budget <file>]] | journals fmt <dir>";
+    let usage = "usage: journals check <dir> [--against <old dir> [--forgets <file>] [--budget <file>]] | journals fmt <dir> | journals survey <dir> [--code <checkout>]";
     let args: Vec<String> = env::args().collect();
     let [_, cmd, dir, flags @ ..] = args.as_slice() else {
         eprintln!("{usage}");
         return ExitCode::from(2);
     };
+    if cmd == "survey" {
+        return run_survey(dir, flags);
+    }
     if (cmd != "check" && cmd != "fmt") || (cmd == "fmt" && !flags.is_empty()) {
         eprintln!("{usage}");
         return ExitCode::from(2);

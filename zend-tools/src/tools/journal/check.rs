@@ -7,13 +7,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use journals::line::LineId;
+use journals::time::Stamp;
 use journals::tree::compare::{lost, shape, Budget, Shape};
 use journals::tree::load::load;
+use journals::tree::survey::survey;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
+use zend_vfs::LogRange;
 
 use crate::tools::file::FileError;
+use crate::tools::git::{open, path_arg, rev_or_head, ConvRepo};
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// The most a change may move each part of the tree's shape; a part left
@@ -45,6 +49,15 @@ pub struct CheckRequest {
     /// How far the change may move the tree's shape.
     #[serde(default)]
     pub budget: Option<BudgetRequest>,
+    /// Also list the maintenance candidates (`journals::tree::survey`): lines
+    /// past their expiry, lines said twice, cut summaries, and lines whose
+    /// source file changed since they were written.
+    #[serde(default)]
+    pub survey: bool,
+    /// The repository a line's `source` names files in, for the survey's
+    /// source rule; left out, no source is looked up.
+    #[serde(default)]
+    pub code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -66,6 +79,26 @@ pub struct CheckResponse {
     /// Everything wrong with the tree as this session holds it, and with the
     /// change; empty when nothing is.
     pub problems: Vec<String>,
+    /// With `survey`, each candidate with its evidence — none is a problem.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
+}
+
+/// Whether `file` of `repo` has a commit at its head newer than `at`; a
+/// source naming no file of it has none.
+fn changed_since(repo: &ConvRepo, file: &str, at: Stamp) -> bool {
+    let (Ok(to), Ok(path)) = (rev_or_head(&None, repo), path_arg(file)) else {
+        return false;
+    };
+    let range = LogRange {
+        to,
+        exclude: Vec::new(),
+        paths: vec![path],
+    };
+    repo.log(&range, 1)
+        .ok()
+        .and_then(|c| c.into_iter().next())
+        .is_some_and(|c| c.committer.when.seconds > at.secs())
 }
 
 pub struct JournalCheck;
@@ -79,9 +112,12 @@ impl Tool for JournalCheck {
          the change to its rules: every line the session began with is still somewhere unless \
          `forgets` names it, and the tree's shape moved no further than `budget` (journals \
          created and removed, lines moved, summaries rewritten; a part left out may not move). \
-         Triggered by \"check the journals\", \"validate the memory\", \"is the journal tree \
-         valid\". Returns how many journals and lines it holds, how far it moved, and every \
-         problem found; none means it is safe to commit.";
+         With `survey`, also list the maintenance candidates with their evidence — lines past \
+         their expiry, lines said twice, cut summaries, and, with `code`, lines whose source file \
+         changed there since they were written. Triggered by \"check the journals\", \"validate \
+         the memory\", \"is the journal tree valid\", \"survey the journals\". Returns how many \
+         journals and lines it holds, how far it moved, every problem found — none means it is \
+         safe to commit — and the candidates.";
 
     type Request = CheckRequest;
     type Response = CheckResponse;
@@ -142,12 +178,29 @@ impl Tool for JournalCheck {
                 summaries_rewritten: s.summaries_rewritten,
             });
         }
+        let mut candidates = Vec::new();
+        if req.survey {
+            let code = match req.code.as_deref().map(|c| open(ctx, c)).transpose() {
+                Ok(code) => code,
+                Err(e) => {
+                    problems.push(format!("code: {e}"));
+                    None
+                }
+            };
+            let changed =
+                |file: &str, at: Stamp| code.as_ref().is_some_and(|r| changed_since(r, file, at));
+            candidates = survey(&tree, Stamp::now(), &changed)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+        }
         Ok(CheckResponse {
             repo: req.repo,
             journals: journals.len(),
             lines,
             moved,
             problems,
+            candidates,
         })
     }
 }
