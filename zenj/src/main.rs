@@ -656,13 +656,15 @@ async fn serve(
             let bus = Bus::at(&config.zen.gateway, &config.zen.host, key.trim());
             tokio::spawn(bus.serve(rekordbox.clone()));
         }
-        Err(e) => events.push(
-            Kind::Fault,
-            format!(
-                "the house's asks of rekordbox are not answered: {}: {e}",
-                config.zen.key_file.display()
-            ),
-        ),
+        Err(e) => {
+            events.push(
+                Kind::Fault,
+                format!(
+                    "the house's asks of rekordbox are not answered: {}: {e}",
+                    config.zen.key_file.display()
+                ),
+            );
+        }
     }
 
     // Requests from the phones.
