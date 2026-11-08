@@ -1226,13 +1226,13 @@ the Playwright suite starts using `page.clock` (1.45+, installed before
 **Who and how.** BlackWorld implements and tests the patch in batches, each
 its own commit, in this order:
 
-1. npcd beat: N1, N2, N3, N12, N4, N11, N7, N10, then N9 (after N12) and
-   N5, N6, N8.
+1. npcd beat: N1, N2, N3, N12, N4, N11, N7, N10, then W12's helper and N9
+   (after N12), then N5, N6, N8.
 2. npcd promoted: N14, then N13 with its lease floor, then N15 (its own
    commit).
 3. Gateway and aggregator: W1, W2 (after W1), W3, W4, W6, W7, W5.
-4. Static and site: W8, W10, W9, W11 (after W9), W12 (before N9's use of
-   it — so W12's helper lands with batch 1), W13.
+4. Static and site: W8, W10, W9, W11 (after W9), W12's remaining sites
+   (the consoles' polls), W13.
 5. GUI: G1, G3, G2, G4, G5, G6, G7.
 6. zend server: Z9 (before Z4), Z2, Z3, Z4, Z5, Z6, Z7, Z8, Z10, Z11.
 7. Z1, alone.
