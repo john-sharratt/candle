@@ -124,25 +124,31 @@ A fixed reserve of one arena per class can be smaller than one migrate group
 needs: a group is up to `MAX_GROUP_RESIDENCES` finished readings across every
 layer. So the reserve is sized from the backlog it serves.
 
-**R16 is the backlog, counted in slots.** Hot KV is written native (R16/F16),
-and the hot→warm migrate turns each native chunk slot into **exactly one** slot
-of the quant class the policy chose for it. The live native slots that have no
-warm copy are therefore the migrate's destination demand, slot for slot. Only
-the split across classes is unknown in advance.
+**R16 is the backlog.** Hot KV is written native (R16/F16), and the hot→warm
+migrate turns each native chunk slot into **at least one** destination slot,
+by a factor that depends on the class:
+- a mixed-format chunk takes a slot **per band**, in its band's class;
+- every quantized chunk adds metadata **record** slots, in the record arenas
+  (`kind = Record`).
 
-**Target per class.**
+So the live native slots are the demand's measure, and the factor per class is
+learned from what migrates actually allocate rather than assumed.
+
+**Target per class** (Band and Record kinds alike):
 
 ```
 pending      = live native (R16 + F16) slots             (per backing)
-share(c)     = EWMA of the fraction of migrated slots landing in class c
-target(c)    = clamp( ceil(pending × share(c)),
+factor(c)    = EWMA of (slots allocated in c) / (native slots migrated),
+               over each migrate install
+target(c)    = clamp( ceil(pending × factor(c)),
                       floor = one arena of c,
-                      cap   = RESERVE_CAP × KV regions, split by share )
+                      cap   = RESERVE_CAP × KV regions, split by factor )
 ```
 
-- **`share`** is learned from what migrates actually produced: each install
-  adds its per-class slot counts, smoothed with α = 0.2. It starts at uniform
-  over the policy's reachable candidates.
+- **`factor`** is measured at each install (the group's per-class destination
+  allocations over its native source slots) and smoothed with α = 0.2. Until
+  a class has a measurement it is held at its floor, one arena, which is
+  today's reserve.
 - **`pending`** is the native classes' live slot counts, which the pools
   already hold. One counter read, no scan. A hot copy kept beside its warm
   copy (a conversation still active) counts too, so `pending` can overstate
@@ -170,7 +176,9 @@ Everything below goes to `candle_conversation::kv_reserve` at INFO, once per
 persistence pass, and at WARN on the events marked:
 
 1. **Reserve line, per backing:** `pending` native slots and MiB, and per class
-   `target`, `free`, `owed`, `share` (%).
+   `target`, `free`, `owed` and the measured `factor`. With that line the
+   factor is a number in the log, not an assumption, and the design can be
+   checked against it.
 2. **Grow and shrink events:** the class, how many arenas, the target before
    and after, and the reason (`backlog`, `drained`, `capped`).
 3. **The quantize deferral** (`quantize deferred`), now with the class, the
