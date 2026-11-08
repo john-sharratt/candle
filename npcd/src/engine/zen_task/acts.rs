@@ -24,7 +24,7 @@ pub const TASK_START: Tool = Tool {
                   repositories, which runs on its own and answers on your handset.",
     params: &[
         param(
-            "name",
+            "title",
             true,
             "What the task does, in a few words joined by dashes: \"fix-door-sensor\".",
         ),
@@ -43,7 +43,7 @@ pub const TASK_START: Tool = Tool {
     ],
     examples: &[Example {
         situation: "Your mission is to fix the door sensor's firmware build.",
-        call: r#"{"name":"fix-door-sensor-build","prompt":"The door sensor's firmware no longer builds on main. Find why, fix it on a branch, run its tests, and say what changed.","role":"coder"}"#,
+        call: r#"{"title":"fix-door-sensor-build","prompt":"The door sensor's firmware no longer builds on main. Find why, fix it on a branch, run its tests, and say what changed.","role":"coder"}"#,
         because: "The work is code, and a worker of Zen's does code; you see it through.",
     }],
 };

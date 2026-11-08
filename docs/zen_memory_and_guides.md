@@ -392,7 +392,7 @@ is `npcd/src/engine/zen_task/` (acts, zend calls, the task step) and
   (`people/zen`). zend's `/mcp` accepts it as that person (`zen_tasks.rs:114-118`
   then has a person). `high_risk` holds apply to Zen's tasks as to anyone's, and
   Zen grants nothing.
-- **Acts (BlackWorld).** A routine's `grants` lend `task_start {name, prompt,
+- **Acts (BlackWorld).** A routine's `grants` lend `task_start {title, prompt,
   role}`, `task_reply {answer}` and `task_nudge {message}` wherever its mission
   is carried; npcd maps them onto `repo_task_start`, `repo_task_reply` and
   `repo_task_nudge` on the thread named for the mission

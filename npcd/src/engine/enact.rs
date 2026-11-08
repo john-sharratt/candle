@@ -1185,6 +1185,7 @@ fn reach_out(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome 
 mod tests {
     use super::*;
     use crate::engine::act::Act;
+    use crate::engine::zen_task;
     use crate::sim::upkeep::{CONTACT_EVERY, RESERVE};
     use npc_map::world::Where;
     use serde_json::json;
@@ -1356,6 +1357,11 @@ mod tests {
             // The house's acts likewise run on the async path
             // (`Runtime::bridge_act`, `Runtime::build_act`).
             if crate::engine::body::is_of_the_house(name) {
+                continue;
+            }
+            // A mission's task acts call zend, also on the async path
+            // (`Runtime::zen_task_act`).
+            if zen_task::is_mine(name) {
                 continue;
             }
             assert!(

@@ -211,7 +211,8 @@ The mission's terminal step is gated on that — the engine signs it off when th
 task completes, not on the drone's word, the same shape as the doc-commit and
 publish gates in `mission.rs`.
 
-**The acts.** A template grants any of `task_start { name, prompt, role? }`,
+**The acts.** A template grants any of `task_start { title, prompt, role? }` (the task's name; `name` is the act
+line's own field),
 `task_reply { answer }` and `task_nudge { message }`
 (`npcd/src/engine/zen_task/acts.rs`). Unlike the building acts, which are lent
 in the mission's room, these are granted **wherever the mission is carried**: a
