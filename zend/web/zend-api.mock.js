@@ -33,7 +33,8 @@
     if (ev.op === 'open') { parts.push({ kind: ev.kind, id: ev.id, tool: ev.tool || null, text: '', args: [], ok: false }); return; }
     const p = parts.find((x) => x.id === ev.id);
     if (!p) return;
-    if (ev.op === 'arg') {
+    if (ev.op === 'tool') p.tool = ev.tool;
+    else if (ev.op === 'arg') {
       const last = p.args[p.args.length - 1];
       if (last && last[0] === ev.name) last[1] += ev.text; else p.args.push([ev.name, ev.text]);
     } else if (ev.op === 'text') p.text += ev.text || '';
@@ -814,7 +815,9 @@
       // A call, its arguments written as they decode, then run and answered.
       const streamCall = (tool, args, result, tokens, then) => {
         const id = partId();
-        part({ op: 'open', id, kind: 'call', tool });
+        // A call opens at its `<tool_call>` and names its tool once written.
+        part({ op: 'open', id, kind: 'call' });
+        part({ op: 'tool', id, tool });
         const chunks = [];
         Object.keys(args).forEach((name) => words(args[name]).forEach((w) => chunks.push([name, w])));
         drip(chunks, ([name, w]) => part({ op: 'arg', id, name, text: w }), () => {

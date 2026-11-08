@@ -26,8 +26,8 @@ use candle_conversation::stencil::ToolSpec;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::json_call_stream::{JsonCallStream, JsonOut};
 use crate::reasoning_split::marker_start_len;
-use crate::tool_call_split::object_end;
 
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
@@ -48,13 +48,16 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PartEvent {
-    /// A part starts; a call names its tool.
+    /// A part starts. A call opens at its `<tool_call>`, before its tool is
+    /// written, so the GUI draws it from its first token.
     Open {
         id: String,
         kind: Kind,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool: Option<String>,
     },
+    /// The tool a call names, once it is written.
+    Tool { id: String, tool: String },
     /// The next chunk of a call's argument `name`, as decoded.
     Arg {
         id: String,
@@ -105,8 +108,9 @@ enum Call {
     Value { name: String, started: bool },
     /// A function block whose `</function>` was written.
     Done,
-    /// A JSON call, held whole until its object ends.
-    Json,
+    /// A JSON call, its name and arguments released as they decode; once its
+    /// object ends, the `</tool_call>` after it.
+    Json(JsonCallStream),
     /// Text that is no call, held to the close.
     Junk,
 }
@@ -180,11 +184,6 @@ impl PartSplit {
                 out.push(close(id, None));
             }
             State::Call(id, call) => {
-                // A call cut short before its tool was named opens here.
-                let id = match id.is_empty() {
-                    true => self.open(&mut out, Kind::Call, None),
-                    false => id,
-                };
                 if let Call::Value { name, started } = call {
                     let text = if started {
                         rest
@@ -286,7 +285,10 @@ impl PartSplit {
                 self.think = Some(id.clone());
                 State::Think(id)
             }
-            _ => State::Call(String::new(), Call::Head),
+            _ => {
+                self.block = (String::new(), Vec::new());
+                State::Call(self.open(out, Kind::Call, None), Call::Head)
+            }
         };
         true
     }
@@ -328,11 +330,15 @@ impl PartSplit {
                     let name = rest[FN_OPEN.len()..name_end].trim().to_string();
                     self.pending.drain(..lead + name_end + 1);
                     self.block = (name.clone(), Vec::new());
-                    let id = self.open(out, Kind::Call, Some(name));
+                    out.push(Out::Part(PartEvent::Tool {
+                        id: id.clone(),
+                        tool: name,
+                    }));
                     self.state = State::Call(id, Call::Between);
                     true
                 } else if rest.starts_with('{') {
-                    self.state = State::Call(id, Call::Json);
+                    self.pending.drain(..lead);
+                    self.state = State::Call(id, Call::Json(JsonCallStream::default()));
                     true
                 } else if rest.is_empty() || FN_OPEN.starts_with(rest) {
                     false
@@ -374,28 +380,70 @@ impl PartSplit {
                 }
             }
             Call::Value { name, started } => self.value_step(out, id, name, started),
-            Call::Done | Call::Junk | Call::Json => {
-                let close_at = match call {
-                    Call::Json => json_close(&self.pending),
-                    _ => self.pending.find(CALL_CLOSE),
-                };
-                let Some(at) = close_at else {
+            Call::Json(stream) => self.json_step(out, id, stream),
+            Call::Done | Call::Junk => {
+                let Some(at) = self.pending.find(CALL_CLOSE) else {
                     return false;
                 };
-                let body: String = self.pending.drain(..at).collect();
-                self.pending.drain(..CALL_CLOSE.len());
+                self.pending.drain(..at + CALL_CLOSE.len());
                 match call {
                     Call::Done => self.closed_call(out, id, None),
-                    Call::Json => self.json_call(out, &body),
-                    _ => {
-                        let id = self.open(out, Kind::Call, None);
-                        self.closed_call(out, id, Some("the call could not be read"));
-                    }
+                    _ => self.closed_call(out, id, Some("the call could not be read")),
                 }
                 self.state = State::Prose;
                 true
             }
         }
+    }
+
+    /// A JSON call: its name and arguments as they decode, then — once its
+    /// object ends — its `</tool_call>`. Text that is no JSON call is held to
+    /// the close as junk.
+    fn json_step(&mut self, out: &mut Vec<Out>, id: String, mut stream: JsonCallStream) -> bool {
+        if !stream.is_done() {
+            let (read, released) = stream.push(&self.pending);
+            self.pending.drain(..read);
+            for r in released {
+                out.push(Out::Part(match r {
+                    JsonOut::Name(tool) => {
+                        self.block = (tool.clone(), Vec::new());
+                        PartEvent::Tool {
+                            id: id.clone(),
+                            tool,
+                        }
+                    }
+                    JsonOut::Arg { name, text } => PartEvent::Arg {
+                        id: id.clone(),
+                        name,
+                        text,
+                    },
+                }));
+            }
+            if stream.is_bad() {
+                self.state = State::Call(id, Call::Junk);
+                return true;
+            }
+            if !stream.is_done() {
+                self.state = State::Call(id, Call::Json(stream));
+                return false;
+            }
+        }
+        let lead = self.pending.len() - self.pending.trim_start().len();
+        let rest = &self.pending[lead..];
+        if rest.starts_with(CALL_CLOSE) {
+            self.pending.drain(..lead + CALL_CLOSE.len());
+            // A call that never named its tool is no call the round can run.
+            let error = self.block.0.is_empty().then_some("the call names no tool");
+            self.closed_call(out, id, error);
+            self.state = State::Prose;
+            return true;
+        }
+        if rest.is_empty() || CALL_CLOSE.starts_with(rest) {
+            self.state = State::Call(id, Call::Json(stream));
+            return false;
+        }
+        self.state = State::Call(id, Call::Junk);
+        true
     }
 
     /// A function block's value: everything up to the `</parameter>` a tag the
@@ -449,39 +497,6 @@ impl PartSplit {
         out.push(close(id, error));
     }
 
-    /// A JSON call, whole: its tool, its arguments, its close.
-    fn json_call(&mut self, out: &mut Vec<Out>, body: &str) {
-        let parsed: Option<(String, serde_json::Map<String, Value>)> =
-            serde_json::from_str::<Value>(body.trim())
-                .ok()
-                .and_then(|v| {
-                    let name = v.get("name")?.as_str()?.to_string();
-                    let args = v
-                        .get("arguments")
-                        .and_then(Value::as_object)
-                        .cloned()
-                        .unwrap_or_default();
-                    Some((name, args))
-                });
-        let Some((name, args)) = parsed else {
-            let id = self.open(out, Kind::Call, None);
-            self.closed_call(out, id, Some("the call could not be read"));
-            return;
-        };
-        let id = self.open(out, Kind::Call, Some(name));
-        for (key, value) in args {
-            let text = match value {
-                Value::String(s) => s,
-                other => other.to_string(),
-            };
-            out.push(Out::Part(PartEvent::Arg {
-                id: id.clone(),
-                name: key,
-                text,
-            }));
-        }
-        self.closed_call(out, id, None);
-    }
 }
 
 /// Where the undecided tail of a value starts: at a `</parameter>` whose
@@ -499,14 +514,6 @@ fn undecided_from(text: &str, follows: Follows) -> usize {
         at = close + PARAM_CLOSE.len();
     }
     text.len() - marker_start_len(text, PARAM_CLOSE)
-}
-
-/// Where a JSON call's `</tool_call>` is: after its object, read
-/// string-aware, so a value holding the tag stays inside.
-fn json_close(text: &str) -> Option<usize> {
-    let lead = text.len() - text.trim_start().len();
-    let end = lead + object_end(&text[lead..])?;
-    text[end..].find(CALL_CLOSE).map(|c| end + c)
 }
 
 fn strip_lead(text: &str) -> &str {
@@ -599,6 +606,12 @@ pub fn parts_of(
                 result: None,
                 tokens: None,
             }),
+            Out::Part(PartEvent::Tool { id, tool: named }) => {
+                if let Some(Part::Call { tool, .. }) = find(&mut parts, &id).map(|i| &mut parts[i])
+                {
+                    *tool = Some(named);
+                }
+            }
             Out::Part(PartEvent::Text { id, text, .. }) => {
                 if let Some(Part::Think { text: body, .. }) =
                     find(&mut parts, &id).map(|i| &mut parts[i])
@@ -697,6 +710,17 @@ mod tests {
         })
     }
 
+    /// A call opening at its `<tool_call>`, then naming its tool.
+    fn call(id: &str, tool: &str) -> [Out; 2] {
+        [
+            open(id, Kind::Call, None),
+            Out::Part(PartEvent::Tool {
+                id: id.into(),
+                tool: tool.into(),
+            }),
+        ]
+    }
+
     fn arg(id: &str, name: &str, text: &str) -> Out {
         Out::Part(PartEvent::Arg {
             id: id.into(),
@@ -718,7 +742,7 @@ mod tests {
     #[test]
     fn a_reply_comes_apart_into_its_parts() {
         let reply = "<think>plan it</think>\nReading.\n<tool_call>\n<function=file_read>\n<parameter=path>\na.rs</parameter>\n</function>\n</tool_call>";
-        let expected = vec![
+        let mut expected = vec![
             open("p0", Kind::Think, None),
             Out::Part(PartEvent::Text {
                 id: "p0".into(),
@@ -727,10 +751,9 @@ mod tests {
             }),
             closed("p0"),
             Out::Prose("\nReading.\n".into()),
-            open("p1", Kind::Call, Some("file_read")),
-            arg("p1", "path", "a.rs"),
-            closed("p1"),
         ];
+        expected.extend(call("p1", "file_read"));
+        expected.extend([arg("p1", "path", "a.rs"), closed("p1")]);
         assert_eq!(run(&[reply]), expected);
         let bytes: Vec<String> = reply.chars().map(|c| c.to_string()).collect();
         let pieces: Vec<&str> = bytes.iter().map(String::as_str).collect();
@@ -745,15 +768,13 @@ mod tests {
         let reply = format!(
             "<tool_call>\n<function=write>\n<parameter=content>\n{content}</parameter>\n</function>\n</tool_call>after"
         );
-        assert_eq!(
-            run(&[&reply]),
-            vec![
-                open("p0", Kind::Call, Some("write")),
-                arg("p0", "content", content),
-                closed("p0"),
-                Out::Prose("after".into()),
-            ]
-        );
+        let mut expected = call("p0", "write").to_vec();
+        expected.extend([
+            arg("p0", "content", content),
+            closed("p0"),
+            Out::Prose("after".into()),
+        ]);
+        assert_eq!(run(&[&reply]), expected);
     }
 
     /// **A note's text arrives as it decodes**, so the bubble fills while the
@@ -775,14 +796,71 @@ mod tests {
         );
         let bytes: Vec<String> = reply.chars().map(|c| c.to_string()).collect();
         let pieces: Vec<&str> = bytes.iter().map(String::as_str).collect();
+        let mut expected = call("p0", "file_write").to_vec();
+        expected.extend([
+            arg("p0", "path", "a.md"),
+            arg("p0", "content", content),
+            closed("p0"),
+        ]);
+        assert_eq!(run_with(tools, &pieces), expected);
+    }
+
+    /// **A call opens at its `<tool_call>`**, before a token of its tool is
+    /// written, so the GUI draws it at once.
+    #[test]
+    fn a_call_opens_at_its_tag() {
+        let mut split = PartSplit::new(&[]);
         assert_eq!(
-            run_with(tools, &pieces),
-            vec![
-                open("p0", Kind::Call, Some("file_write")),
-                arg("p0", "path", "a.md"),
-                arg("p0", "content", content),
-                closed("p0"),
-            ]
+            split.push("Next.<tool_call>"),
+            vec![Out::Prose("Next.".into()), open("p0", Kind::Call, None)]
+        );
+    }
+
+    /// **A JSON call streams as a function block does**: its tool once it is
+    /// written, each string argument as it decodes — a document's text
+    /// arrives while it is being written — and its close after its object.
+    #[test]
+    fn a_json_call_streams_its_arguments() {
+        let reply = "<tool_call>\n{\"name\": \"file_write\", \"arguments\": {\"path\": \"a.md\", \"content\": \"# Title\\nbody </tool_call> \\\"q\\\"\", \"n\": 3}}\n</tool_call>after";
+        let mut expected = call("p0", "file_write").to_vec();
+        expected.extend([
+            arg("p0", "path", "a.md"),
+            arg("p0", "content", "# Title\nbody </tool_call> \"q\""),
+            arg("p0", "n", "3"),
+            closed("p0"),
+            Out::Prose("after".into()),
+        ]);
+        assert_eq!(run(&[reply]), expected);
+        let bytes: Vec<String> = reply.chars().map(|c| c.to_string()).collect();
+        let pieces: Vec<&str> = bytes.iter().map(String::as_str).collect();
+        assert_eq!(run(&pieces), expected, "byte at a time");
+        let mut split = PartSplit::new(&[]);
+        split.push("<tool_call>{\"name\": \"file_write\", \"arguments\": {\"content\": \"");
+        assert_eq!(
+            split.push("half a doc"),
+            vec![arg("p0", "content", "half a doc")],
+            "a value streams before it ends"
+        );
+    }
+
+    /// **A JSON call that is not one, or names no tool, closes failed.**
+    #[test]
+    fn a_json_call_that_cannot_run_closes_failed() {
+        let failed = |reply: &str| -> Option<String> {
+            run(&[reply]).into_iter().find_map(|o| match o {
+                Out::Part(PartEvent::Close {
+                    ok: false, error, ..
+                }) => error,
+                _ => None,
+            })
+        };
+        assert_eq!(
+            failed("<tool_call>{\"arguments\": {}}</tool_call>").as_deref(),
+            Some("the call names no tool")
+        );
+        assert_eq!(
+            failed("<tool_call>{\"name\": \"a\"} junk</tool_call>").as_deref(),
+            Some("the call could not be read")
         );
     }
 
@@ -798,9 +876,9 @@ mod tests {
     #[test]
     fn a_call_cut_short_closes_failed() {
         let got = run(&["<tool_call>\n<function=write>\n<parameter=content>\nhalf"]);
-        assert_eq!(got[1], arg("p0", "content", "half"));
+        assert_eq!(got[2], arg("p0", "content", "half"));
         assert!(matches!(
-            &got[2],
+            &got[3],
             Out::Part(PartEvent::Close {
                 ok: false,
                 error: Some(_),

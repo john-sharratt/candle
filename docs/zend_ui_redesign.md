@@ -205,8 +205,9 @@ conversation in `x-tokera-conversation`) carries its reasoning and calls:
 
 | `op` | Fields | Meaning |
 | --- | --- | --- |
-| `open` | `id`, `kind` (`think` or `call`), `tool` | A part starts |
-| `arg` | `id`, `name`, `text` | The next chunk of a call's argument, as decoded |
+| `open` | `id`, `kind` (`think` or `call`) | A part starts — a call at its `<tool_call>`, before its tool is written, so its card is drawn from the first token |
+| `tool` | `id`, `tool` | The tool a call names, once it is written |
+| `arg` | `id`, `name`, `text` | The next chunk of a call's argument, as decoded — in either call syntax: a function block's value, or a JSON call's argument (a string's text as it arrives, unescaped; any other value whole, as its JSON) |
 | `text` | `id`, `text`, `tokens` | The next chunk of reasoning, and its running length |
 | `close` | `id`, `ok`, `error` | The part ended; a call that could not be read says why |
 | `run` | `ids` | These calls have started running |
@@ -340,22 +341,34 @@ Empty-state greeting + prompt cards. Auto-scroll.
 ### 1.4 Thinking block + tool-call cards
 `<think>…</think>` → `<details>` with brain icon, live word count, **collapsed
 by default even while streaming**, chevron rotates on open, per-message open
-state persists across re-renders. `<tool_call>{json}</tool_call>` → card with
-tool name + arg rows; pending (incomplete) card pulses.
+state persists across re-renders. While it streams it opens like a finished
+block, onto the reasoning so far, and stays open as more arrives.
+`<tool_call>{json}</tool_call>` → card with tool name + arg rows; pending
+(incomplete) card pulses, drawn from the call's `<tool_call>` on, and a value
+being written other than its target (a file's content) shows live in the
+writing box.
 
-A `journal_note` call (`docs/zend_journal.md` §5.2; designed, not built) is not
+**Reading while it streams.** Any block can be opened and shut while the
+reply decodes: what is open in a bubble is read from the page before each
+streaming patch rewrites it, and a press held in the chat holds the patch until
+it is released. The view follows the bottom only while the reader is at it —
+each update asks where the view is before it changes the page — so opening a
+block higher up never pulls the reader back down.
+
+A `journal_note` call (`docs/zend_journal.md` §5.2) is not
 drawn as a tool card. It renders as a **note bubble**, placed after the call
 that wrote it and before the response turn, in the order the turn decoded:
 - **always open**: no `<details>`, no chevron, no toggle. A note is short, and
   it is what the reader wants to see;
 - **indented** a step in from the message column, so it reads as an aside to
   the work rather than part of the answer;
-- **like a thought bubble**: rounded corners, a soft tint of the theme's
-  accent as its background with a hairline border one shade deeper, a small
-  thought-bubble tail at its top left toward the call above it, and the note's
-  text in the body font, slightly smaller and in a muted tone. It sits beside
-  the thinking block's style as its quieter cousin: the thinking is the
-  working, collapsed; the note is the conclusion, open;
+- **like a speech bubble the turn says to itself**: a vivid pink-to-violet
+  tint with a bright border, rounded on three corners and pointed at the
+  fourth, a tail at its top left toward the reasoning above it, and the note's
+  text in a hand-written face (the platform's own — Segoe Print, Bradley Hand —
+  so nothing is fetched), so it reads as a thought rather than as output. The
+  thinking is the working, collapsed; the note is the conclusion, open and
+  easy to spot;
 - **both themes**: drawn in the page's own palette, as the thinking block is,
   so the light theme's filter over the page turns it with everything else, and
   its text keeps body contrast;
@@ -404,8 +417,14 @@ that started it, never off anything else the person owns.
      bar becomes a settled mark, a tick or a cross.
    - **Expanded:** a log job's lines in a monospace view. A task's
      conversation, indented one step and drawn with a thin bar down its left,
-     its replies through the conversation's own renderer, so their notes and
-     tool cards draw as they do in the main conversation.
+     its replies through the conversation's own renderer from their parts, so
+     their notes, thinking and tool cards draw as they do in the main
+     conversation, and a `working` mark below them while the task runs.
+   - **A task is a sub-agent, and looks it:** its block carries a
+     `sub-agent` label and a violet rail and tint in place of the job's amber,
+     and a chevron that turns as it opens and shuts. What is open inside it is
+     kept under the task's handle, apart from the parent's own blocks, so the
+     two-second poll that redraws it shuts nothing.
    - **Rehydrated:** a block rebuilds from its handle when the conversation is
      opened again, an ended job in its end state.
 

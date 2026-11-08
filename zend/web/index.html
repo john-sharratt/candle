@@ -161,6 +161,16 @@
   .zmd .job-end.bad { color: #e08a7a; }
   .zmd .job-log { margin: 0; max-height: 22rem; overflow: auto; padding: .5rem .75rem; background: #1a1816; border-top: 1px solid #2e2b27; font-size: .74rem; line-height: 1.5; color: #b9ab98; white-space: pre-wrap; word-break: break-word; }
   .zmd .job-conv { margin: 0 .5rem .5rem 1rem; padding-left: .8rem; border-left: 2px solid #8c5f28; }
+  .zmd .job-chevron { width: 9px; height: 9px; flex-shrink: 0; color: #7c736a; transition: transform .18s; }
+  .zmd .job-block.open .job-chevron { transform: rotate(90deg); }
+  /* A sub-agent: a task the turn started, drawn as a nested conversation
+     under a violet rail so it reads as another agent's work, not this one's. */
+  .zmd .job-block.agent { border-color: rgba(160,132,232,0.38); border-left: 3px solid #9b80e6; background: #211e26; }
+  .zmd .job-block.agent .job-name { color: #c4b2f2; }
+  .zmd .job-agent { flex-shrink: 0; font-size: .64rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #d8ccff; background: rgba(155,128,230,0.24); border-radius: 4px; padding: .05rem .38rem; }
+  .zmd .job-block.agent .job-conv { border-left-color: rgba(155,128,230,0.45); font-size: .94em; }
+  .zmd .job-block.agent .job-msg.assistant { margin: .45rem 0; }
+  .zmd .job-working { display: flex; align-items: center; gap: .5rem; color: #8f86a6; font-size: .85em; padding: .3rem 0 .1rem; }
   .zmd .job-msg.user { margin: .5rem 0; color: #a99a88; font-size: .9em; white-space: pre-wrap; max-height: 8rem; overflow: hidden; }
   .zmd .job-empty { color: #7c736a; padding: .4rem 0; }
   .zmd .job-waits { margin: -.2rem 0 .7rem 1.5rem; max-width: 46rem; display: flex; flex-direction: column; gap: .35rem; }
@@ -179,11 +189,14 @@
   .zmd .approval-state { margin-top: .5rem; color: #e6c08a; font-weight: 600; }
   .zmd .approval-state.err { color: #e08a7a; }
   .zmd .approval-answer { margin: .35rem 0 0; white-space: pre-wrap; font-size: .76rem; color: #b9ab98; }
-  .zmd .note-bubble { position: relative; margin: .75rem 0 .7rem 1.5rem; padding: .5rem .85rem; max-width: 46rem; background: rgba(224,138,166,0.07); border: 1px solid rgba(224,138,166,0.2); border-radius: 14px; color: #bfb3a8; font-size: .86em; line-height: 1.55; }
-  .zmd .note-bubble::before, .zmd .note-bubble::after { content: ''; position: absolute; border-radius: 50%; background: rgba(224,138,166,0.07); border: 1px solid rgba(224,138,166,0.2); }
-  .zmd .note-bubble::before { left: -.55rem; top: -.5rem; width: .55rem; height: .55rem; }
-  .zmd .note-bubble::after { left: -1rem; top: -.95rem; width: .32rem; height: .32rem; }
-  .zmd .note-bubble.writing { color: #9a8f86; }
+  /* A journal note: a speech bubble the turn says to itself, its tail
+     pointing back up-left at the reasoning it concludes, in a hand-written
+     face so it reads as a thought rather than as output. The face is the
+     platform's own (Segoe Print, Bradley Hand), so nothing is fetched. */
+  .zmd .note-bubble { position: relative; margin: 1rem 0 .8rem 1.4rem; padding: .6rem 1rem .65rem; max-width: 46rem; width: fit-content; background: linear-gradient(135deg, rgba(240,128,170,0.22), rgba(176,124,236,0.18)); border: 1.5px solid rgba(240,140,184,0.55); border-radius: 18px 18px 18px 6px; color: #f6e4ee; font-family: "Segoe Print", "Bradley Hand", "Comic Neue", "Patrick Hand", "Chalkboard SE", cursive; font-size: .9em; line-height: 1.6; letter-spacing: .01em; box-shadow: 0 2px 14px rgba(232,120,176,0.16), inset 0 1px 0 rgba(255,255,255,0.06); white-space: pre-wrap; }
+  .zmd .note-bubble::before { content: ''; position: absolute; left: 14px; top: -10px; width: 16px; height: 10px; background: rgba(240,140,184,0.55); clip-path: polygon(0 0, 100% 100%, 0 100%); }
+  .zmd .note-bubble.writing { color: #d9c4cf; border-style: dashed; }
+  .zmd .note-bubble.writing::selection { background: rgba(240,128,170,0.3); }
   .zmd .think-block { margin: .1rem 0 .9rem; }
   .zmd .think-summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: .45rem; font-size: .8rem; color: #7c736a; user-select: none; padding: .2rem 0; transition: color .13s; }
   .zmd .think-summary:hover { color: #9a9490; }
@@ -199,7 +212,9 @@
      only offered once the block is complete) plus a word ticker that rolls the
      most recent thoughts through a bright centre band, showing progress + speed. */
   .zmd .think-streaming { margin: .1rem 0 .9rem; }
-  .zmd .think-head { display: inline-flex; align-items: center; gap: .45rem; max-width: 100%; }
+  .zmd .think-head { display: inline-flex; align-items: center; gap: .45rem; max-width: 100%; list-style: none; cursor: pointer; user-select: none; }
+  .zmd .think-head::-webkit-details-marker { display: none; }
+  .zmd .think-live { white-space: pre-wrap; }
   /* The token count leads, in a chip on its own ground; the ticker runs faded
      beside it. */
   .zmd .think-track { position: relative; width: 20rem; max-width: 55vw; display: flex; align-items: center; gap: .55rem; }
@@ -601,14 +616,20 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // full re-render as the chat's scroll is. The list opens at its newest entry.
   let journalListEl = null, journalEntryEl = null;
   let journalListAtEnd = true, savedJournalListScroll = 0, savedJournalEntryScroll = null;
-  // Follow the bottom while streaming, but the instant the user scrolls UP they
-  // take over and we leave the scroll alone until they return to the bottom.
-  // `stick` is driven solely by the scroller's own scroll events (buildChat);
-  // every programmatic scroll keeps `lastScrollTop` in sync right after, so it
-  // can never be mistaken for a user scroll-up. (Safe now that streaming patches
-  // in place and no longer resets scrollTop with a full rebuild.)
-  let stick = true, lastScrollTop = 0, logStick = true;
+  // Follow the bottom only while the reader is AT the bottom: every update asks
+  // where the view is just before it changes the page, and pins to the new
+  // bottom only if it was at the old one. A flag set by scroll events could
+  // not do this — opening a block above the bottom grows the page without a
+  // scroll event, so the flag still said "following" and the next token
+  // yanked the reader away from what they had just opened.
+  // `chatConvShown` is the conversation the chat last drew: a different one
+  // opens at its bottom.
+  let chatConvShown = null, logStick = true;
   const nearBottom = (el) => !el || (el.scrollHeight - el.scrollTop - el.clientHeight) < 24;
+  // A press inside the chat holds the streaming patch until it is released:
+  // the patch rewrites the streaming bubble, and a click whose press and
+  // release land on two different copies of a block's header opens nothing.
+  let chatPointerDown = false;
 
   // ── navigation tag ───────────────────────────────────────────────────────
   // The active conversation lives in the URL hash, so a forced reload (after a
@@ -661,6 +682,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const seln = window.getSelection && window.getSelection();
     if (seln && !seln.isCollapsed && seln.rangeCount && chatEl &&
         chatEl.contains(seln.getRangeAt(0).commonAncestorContainer)) return;
+    // The same while a press is held in the chat; its release re-fires this.
+    if (chatPointerDown) return;
     const conv = activeConv();
     if (!conv || !chatEl) { render(); return; }
     let idx = -1, m = null;
@@ -670,7 +693,13 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const row = idx >= 0 && chatEl.querySelector('[data-msg="' + idx + '"]');
     const zmd = row && row.querySelector('.zmd');
     if (!zmd) { render(); return; }   // not laid out yet — fall back to full render
+    // What the reader has open in the bubble now is what it keeps: read from
+    // the page itself, so a block opened a moment ago — its `toggle` event
+    // still queued — is not shut by this rewrite.
+    harvestOpen(zmd, conv.id, idx);
     const open = !!S.thinkOpen[conv.id + ':' + idx];
+    // Whether the reader is at the bottom, asked before the page changes.
+    const follow = nearBottom(chatEl);
     // The hover popover is parented to `<body>` and hidden by the bar's own
     // `mouseleave`. The write below destroys the hovered bar outright, so that
     // event never fires and the popover is left floating at fixed coordinates —
@@ -690,9 +719,20 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // Keep any live thinking ticker scrolled to its tail so the newest words sit at
     // the right and roll leftward through the fade as more stream in.
     zmd.querySelectorAll('.think-ticker').forEach((t) => { t.scrollLeft = t.scrollWidth; });
-    // Follow the bottom only while the user hasn't scrolled away; keep
-    // lastScrollTop in sync so this programmatic move isn't read as a scroll-up.
-    if (stick) { chatEl.scrollTop = chatEl.scrollHeight; lastScrollTop = chatEl.scrollTop; }
+    if (follow) chatEl.scrollTop = chatEl.scrollHeight;
+  }
+  // Note in state which of a bubble's blocks are open on the page.
+  function harvestOpen(zmd, convId, idx) {
+    const cards = zmd.querySelectorAll('details.tool-call-card');
+    for (let i = 0; i < cards.length; i++) S.toolOpen[blockKey(cards[i], convId, idx)] = cards[i].open;
+    // A message's thinking blocks share one flag: any one open holds it open.
+    const thinks = zmd.querySelectorAll('details.think-block');
+    const open = {};
+    for (let i = 0; i < thinks.length; i++) {
+      const key = blockKey(thinks[i], convId, idx);
+      open[key] = open[key] || thinks[i].open;
+    }
+    Object.assign(S.thinkOpen, open);
   }
   // **A streaming reply never shrinks.** Its phases swap blocks of different
   // heights — a file being written is drawn in a box up to 18rem tall that
@@ -1030,22 +1070,29 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const j = S.jobs[h];
     const mark = !j.ended ? '<span class="job-bar"></span>'
       : /fail|error|rolled back|lost|cancel/i.test(j.line) ? '<span class="job-end bad">✕</span>' : '<span class="job-end ok">✓</span>';
-    const head = '<div class="job-head" data-job-toggle="' + esc(h) + '">' +
+    // A task is a sub-agent: its block says so, and opens onto its own
+    // conversation drawn as the parent's bubbles are.
+    const agent = j.kind === 'task';
+    const chevron = '<svg class="job-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    const head = '<div class="job-head" data-job-toggle="' + esc(h) + '">' + chevron +
       '<span class="job-icon">' + (JOB_ICON[j.kind] || '⚙') + '</span>' +
+      (agent ? '<span class="job-agent">sub-agent</span>' : '') +
       '<span class="job-name">' + esc(h) + '</span>' +
       '<span class="job-line">' + esc(j.line || 'starting…') + '</span>' +
       (j.ended ? '' : '<span class="job-time">' + elapsed(_now() - j.began) + '</span>') + mark + '</div>';
-    if (!j.open) return '<div class="job-block" data-job="' + esc(h) + '">' + head + '</div>';
+    const cls = 'job-block' + (agent ? ' agent' : '');
+    if (!j.open) return '<div class="' + cls + '" data-job="' + esc(h) + '">' + head + '</div>';
     let body;
-    if (j.kind === 'task') {
+    if (agent) {
       const msgs = (j.messages || []).filter((m) => m.role === 'assistant' || m.role === 'user');
-      body = '<div class="job-conv">' + (msgs.length ? msgs.map((m) =>
-        '<div class="job-msg ' + m.role + '">' + (m.role === 'assistant' ? renderContent(m.content || '', false, false, null, null, null, null) : esc(m.content || '')) + '</div>').join('')
+      body = '<div class="job-conv">' + (msgs.length ? msgs.map((m, i) =>
+        '<div class="job-msg ' + m.role + '" data-jmsg="' + i + '">' + (m.role === 'assistant' ? '<div class="zmd">' + nodeHtml(m, !!S.thinkOpen[jobMsgKey(h, i)]) + '</div>' : esc(m.content || '')) + '</div>').join('') +
+        (j.ended ? '' : '<div class="job-working"><span class="zdots"><i></i><i></i><i></i></span>working</div>')
         : '<div class="job-empty">Its conversation is loading…</div>') + '</div>';
     } else {
       body = '<pre class="job-log">' + esc(j.lines.map((l) => l.text).join('\n')) + '</pre>';
     }
-    return '<div class="job-block open" data-job="' + esc(h) + '">' + head + body + '</div>';
+    return '<div class="' + cls + ' open" data-job="' + esc(h) + '">' + head + body + '</div>';
   }
   // A waited job's newest lines, in a fixed-height window: at most three
   // windows, the rest named in one line.
@@ -1163,20 +1210,23 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // "1,234 tokens" — the reasoning's length as the thinking block shows it.
   function fmtTokens(n) { return Number(n).toLocaleString() + (n === 1 ? ' token' : ' tokens'); }
   function renderThink(seg, open) {
-    // Still thinking: a NON-collapsible header (no chevron, no click toggle — the
-    // expand affordance is withheld until the block finishes, since it can't expand
-    // mid-stream anyway) plus a ticker of the most recent words, right-pinned so
-    // new words roll leftward — faded under the running token count once the
-    // daemon reports one.
+    // Still thinking: a header with a ticker of the most recent words, right-
+    // pinned so new words roll leftward — faded under the running token count
+    // once the daemon reports one. It opens like a finished block does, onto
+    // the reasoning so far, kept open as more arrives.
     if (!seg.complete) {
-      const w = (seg.body || '').trim().split(/\s+/).filter(Boolean);
+      const text = (seg.body || '').trim();
+      const w = text.split(/\s+/).filter(Boolean);
       const tick = esc(w.slice(-24).join(' '));
       const count = seg.tokens != null ? '<span class="think-count" aria-live="off">' + fmtTokens(seg.tokens) + '</span>' : '';
-      return '<div class="think-block think-streaming"><div class="think-head">' +
+      // Escaped, not parsed: the text so far is redrawn on every patch.
+      const body = open ? '<div class="think-body think-live">' + esc(text) + '</div>' : '';
+      return '<details class="think-block think-streaming"' + (open ? ' open' : '') + '><summary class="think-head">' +
         THINK_BRAIN +
         '<span class="think-label think-pulse">Thinking…</span>' +
         '<div class="think-track' + (count ? ' counted' : '') + '">' + count + '<div class="think-ticker">' + tick + '</div></div>' +
-        '</div></div>';
+        '<svg class="think-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+        '</summary>' + body + '</details>';
     }
     // Finished: the collapsible block, labelled with the reasoning's length in
     // tokens (≈ when the turn's reasoning K/V was dropped and the count is an
@@ -1308,6 +1358,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     if (ev.op === 'run') { for (const id of ev.ids || []) { const p = partById(m, id); if (p) p.running = true; } return; }
     const p = partById(m, ev.id);
     if (!p) return;
+    // A call opens at its `<tool_call>` and names its tool once it is written.
+    if (ev.op === 'tool') { p.tool = ev.tool; return; }
     if (ev.op === 'arg') {
       const last = p.args[p.args.length - 1];
       if (last && last[0] === ev.name) last[1] += ev.text; else p.args.push([ev.name, ev.text]);
@@ -1374,6 +1426,22 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   function toolOpenKey(convId, msgIdx, toolIdx) {
     return convId + ':' + msgIdx + ':' + toolIdx;
   }
+  // A sub-agent's message, drawn inside the job block of the task `handle`:
+  // its blocks keep their open state under the task, apart from the parent's.
+  function jobMsgKey(handle, i) {
+    return 'job:' + handle + ':' + i;
+  }
+  // The open-state key of a tool card or thinking block, wherever it sits: a
+  // parent message's own, or a sub-agent message's inside a job block.
+  function blockKey(det, convId, msgIdx) {
+    const sub = det.closest('[data-jmsg]');
+    const tool = det.classList.contains('tool-call-card') ? ':' + (det.getAttribute('data-tool') || '0') : '';
+    if (sub) {
+      const job = sub.closest('[data-job]');
+      return jobMsgKey(job ? job.getAttribute('data-job') : '', sub.getAttribute('data-jmsg')) + tool;
+    }
+    return tool ? toolOpenKey(convId, msgIdx, det.getAttribute('data-tool') || '0') : convId + ':' + msgIdx;
+  }
   // Put back what the reader had opened, after any rebuild of a bubble.
   //
   // Called wherever `.zmd` innerHTML is written — the full render, and the
@@ -1387,8 +1455,13 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   function restoreToolOpen(zmd, convId, msgIdx) {
     const cards = zmd.querySelectorAll('details.tool-call-card');
     for (let i = 0; i < cards.length; i++) {
-      const key = toolOpenKey(convId, msgIdx, cards[i].getAttribute('data-tool') || '0');
-      if (S.toolOpen[key]) { cards[i].open = true; fillLazy(cards[i]); }
+      if (S.toolOpen[blockKey(cards[i], convId, msgIdx)]) { cards[i].open = true; fillLazy(cards[i]); }
+    }
+    // A sub-agent's thinking is drawn inside its parent's memoised bubble,
+    // which does not change when the sub-agent's block is opened: put it back.
+    const thinks = zmd.querySelectorAll('[data-jmsg] details.think-block');
+    for (let i = 0; i < thinks.length; i++) {
+      if (S.thinkOpen[blockKey(thinks[i], convId, msgIdx)]) { thinks[i].open = true; fillLazy(thinks[i]); }
     }
   }
   // Memoized `nodeHtml` for FINISHED messages: a full render re-parses the whole
@@ -2160,7 +2233,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
 
   // ── helpers ────────────────────────────────────────────────────────────
   function focusPrompt() { requestAnimationFrame(() => { if (promptEl) promptEl.focus(); }); }
-  function scrollChat() { stick = true; requestAnimationFrame(() => { if (chatEl) { chatEl.scrollTop = chatEl.scrollHeight; lastScrollTop = chatEl.scrollTop; } }); }
+  function scrollChat() { requestAnimationFrame(() => { if (chatEl) chatEl.scrollTop = chatEl.scrollHeight; }); }
   function scrollLog() { requestAnimationFrame(() => { if (logEl) logEl.scrollTop = logEl.scrollHeight; }); }
   function visibleConvs() {
     return S.conversations
@@ -2235,8 +2308,10 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     }
     const hadFocus = promptEl && document.activeElement === promptEl;
     const caret = hadFocus ? promptEl.selectionStart : null;
-    // Capture the exact pre-rebuild scroll so we can put the user back precisely
-    // (or pin to the bottom if `stick` says they were following).
+    // Capture the exact pre-rebuild scroll so we can put the user back
+    // precisely — or pin to the bottom if they were at it, or this is the
+    // chat's first drawing of this conversation.
+    const chatFollow = !chatEl || chatConvShown !== S.activeId || nearBottom(chatEl);
     if (chatEl) savedChatScroll = chatEl.scrollTop;
     // Same for the substrate modal's scroll body, so expanding a section in place
     // doesn't jump the panel back to the top.
@@ -2276,22 +2351,25 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     }
     if (S.fileView) overlays.push(buildFileViewer());
     if (S.journalEntry && S.journalEntry.convId === S.activeId) overlays.push(buildJournalModal());
-    if (S.substrateOpen) overlays.push(buildSubstrate());
+    const kept = S.substrateOpen ? substrateOverlay() : null;
+    if (kept) overlays.push(kept);
     if (S.upload) overlays.push(buildUploadModal());
     if (S.confirm) overlays.push(buildConfirmModal());
 
-    root.innerHTML = '';
-    root.appendChild(layout);
-    overlays.forEach((o) => root.appendChild(o));
+    // Everything is replaced but a kept substrate panel, which stays where it
+    // is; the overlays stack by their z-index, not their order.
+    Array.from(root.childNodes).forEach((n) => { if (n !== kept) root.removeChild(n); });
+    root.insertBefore(layout, root.firstChild);
+    overlays.forEach((o) => { if (o.parentNode !== root) root.appendChild(o); });
 
-    if (substrateEl && savedSubstrateScroll != null) substrateEl.scrollTop = savedSubstrateScroll;
+    if (substrateEl && savedSubstrateScroll != null && substrateEl.scrollTop !== savedSubstrateScroll) substrateEl.scrollTop = savedSubstrateScroll;
     if (journalListEl) journalListEl.scrollTop = journalListAtEnd ? journalListEl.scrollHeight : savedJournalListScroll;
     if (journalEntryEl && savedJournalEntryScroll != null) journalEntryEl.scrollTop = savedJournalEntryScroll;
 
     if (chatEl) {
-      if (stick) chatEl.scrollTop = chatEl.scrollHeight;
+      if (chatFollow) chatEl.scrollTop = chatEl.scrollHeight;
       else if (savedChatScroll != null) chatEl.scrollTop = savedChatScroll;
-      lastScrollTop = chatEl.scrollTop;   // resync so the async scroll event isn't read as user input
+      chatConvShown = S.activeId;
     }
     // After a forced reload, restore the saved scroll once the active
     // conversation's content has hydrated (tall enough to scroll).
@@ -2531,7 +2609,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const leftPad = S.narrow ? '2rem' : '1.5rem';
     // When wide, keep content left of the top-right Logs/Files pills (~112px).
     const rightPad = S.wide ? '8rem' : '2rem';
-    const scroller = h('div', { class: 'zscroll zscroll-wide z-chatscroll', ref: (el) => { chatEl = el; }, onScroll: (e) => { const st = e.currentTarget.scrollTop; if (st < lastScrollTop - 1) stick = false; else if (nearBottom(e.currentTarget)) stick = true; lastScrollTop = st; }, style: 'display:flex; flex-direction:column; flex:1; min-height:0; overflow-y:auto; padding:2rem ' + rightPad + ' 0.5rem ' + leftPad + '; position:relative;' });
+    const scroller = h('div', { class: 'zscroll zscroll-wide z-chatscroll', ref: (el) => { chatEl = el; }, style: 'display:flex; flex-direction:column; flex:1; min-height:0; overflow-y:auto; padding:2rem ' + rightPad + ' 0.5rem ' + leftPad + '; position:relative;' });
     // Pair each tool result with the call it answers: a user turn that is a bare
     // <tool_response> is the OUTPUT of the most recent assistant turn's tool
     // call, not a chat bubble of its own — fold it into that call's card (in
@@ -4123,6 +4201,25 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       content);
     return h('div', { class: 'z-modal-ov', onClick: () => setState({ substrateOpen: false }), style: modalOvStyle(400) }, modal);
   }
+  // The substrate panel as last built, and what it was built from. The page
+  // re-renders on every status poll, job poll and stream update, and an
+  // expanded turn is thousands of lines: rebuilt — and laid out again — each
+  // time, it kept the main thread busy enough that scrolling it stalled. It is
+  // rebuilt only when what it shows changes, and `render` leaves it in the
+  // page, so its layout and its scroll are kept.
+  let _substrate = { inputs: null, el: null, body: null };
+  function substrateOverlay() {
+    const inputs = [S.substrateNode, S.substrateExpanded, S.substrateGroupOpen, S.substrateContent,
+      S.substrateTurnContent, S.substrateLoading, S.substrateError, S.substrateMsg, S.substrateUserMsg,
+      S.substrateGlue, S.substrateTargetLayer, S.effortLevel];
+    const same = _substrate.inputs && inputs.every((v, i) => v === _substrate.inputs[i]);
+    if (!same) {
+      const el = buildSubstrate();
+      _substrate = { inputs, el, body: substrateEl };
+    }
+    substrateEl = _substrate.body;
+    return _substrate.el;
+  }
 
   // ── logs pane ────────────────────────────────────────────────────────────
   // One log row — extracted so `addLog` can append a single row incrementally.
@@ -4165,7 +4262,10 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     return h('button', { title, onClick, style: 'width:' + s + 'px; height:' + s + 'px; border-radius:' + (s > 30 ? 8 : 6) + 'px; border:1px solid #334455; background:transparent; color:' + (s > 30 ? '#8ba0b6' : '#6a8098') + '; cursor:pointer; display:flex; align-items:center; justify-content:center; flex-shrink:0;', html: '<svg viewBox="0 0 14 14" fill="none" style="width:' + Math.round(s * 0.45) + 'px;height:' + Math.round(s * 0.45) + 'px;"><path d="' + path + '" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>' });
   }
   function closeBtnStyle() { return 'flex-shrink:0; width:28px; height:28px; display:flex; align-items:center; justify-content:center; font-size:15px; color:#7c736a; background:none; border:1px solid #38342f; border-radius:7px; cursor:pointer; padding:0;'; }
-  function modalOvStyle(z) { return 'position:fixed; inset:0; z-index:' + z + '; background:rgba(0,0,0,0.62); backdrop-filter:blur(2px); display:flex; align-items:center; justify-content:center; padding:40px;'; }
+  // No backdrop blur: the chat behind a modal keeps streaming, and a blurred
+  // backdrop is recomposited on every frame it changes, which made a long
+  // modal's scroll stutter.
+  function modalOvStyle(z) { return 'position:fixed; inset:0; z-index:' + z + '; background:rgba(0,0,0,0.7); display:flex; align-items:center; justify-content:center; padding:40px;'; }
   // Zen's mark: the same image the page's icon is.
   function zenLogo(sz) {
     return '<img src="/favicon.png" alt="Zen" width="' + sz + '" height="' + sz + '" style="flex-shrink:0;display:block;">';
@@ -4360,19 +4460,32 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const cb = btn.closest('.code-block'); const code = cb && cb.querySelector('code');
     if (code) { try { navigator.clipboard.writeText(code.innerText); } catch (_) {} btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = 'Copy'; }, 1600); }
   });
+  // A press in the chat holds the streaming patch (`liveUpdateStreaming`);
+  // its release lets the patch catch up at once.
+  document.addEventListener('pointerdown', (e) => {
+    if (chatEl && chatEl.contains(e.target)) chatPointerDown = true;
+  }, true);
+  const chatPointerUp = () => {
+    if (!chatPointerDown) return;
+    chatPointerDown = false;
+    const c = activeConv();
+    if (c && c.history.some((m) => m.streaming)) scheduleLiveUpdate(S.activeId);
+  };
+  document.addEventListener('pointerup', chatPointerUp, true);
+  document.addEventListener('pointercancel', chatPointerUp, true);
   document.addEventListener('toggle', (e) => {
     const det = e.target;
     if (det && det.classList && det.classList.contains('think-block')) {
       const turn = det.closest('[data-msg]');
-      if (turn) { const key = S.activeId + ':' + turn.getAttribute('data-msg'); S.thinkOpen = Object.assign({}, S.thinkOpen, { [key]: det.open }); }
+      if (turn) { const key = blockKey(det, S.activeId, turn.getAttribute('data-msg')); S.thinkOpen = Object.assign({}, S.thinkOpen, { [key]: det.open }); }
     }
     // The same for a tool card, which had no such record and so lost its open
     // state to every rebuild — including the streaming patch that runs while
-    // the reader is looking at it.
+    // the reader is looking at it. A sub-agent's card is keyed under its task.
     if (det && det.classList && det.classList.contains('tool-call-card')) {
       const turn = det.closest('[data-msg]');
       if (turn) {
-        const key = toolOpenKey(S.activeId, turn.getAttribute('data-msg'), det.getAttribute('data-tool') || '0');
+        const key = blockKey(det, S.activeId, turn.getAttribute('data-msg'));
         S.toolOpen = Object.assign({}, S.toolOpen, { [key]: det.open });
       }
     }

@@ -46,6 +46,7 @@ pub mod ingest_report;
 pub mod ingest_snapshots;
 pub mod ingest_worker;
 pub mod journal;
+pub mod json_call_stream;
 pub mod layers;
 pub mod legacy_uploads;
 pub mod lenient_json;
