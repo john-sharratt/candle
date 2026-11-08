@@ -2,7 +2,7 @@
 //! `thread_archive`, and by the sweep once they have sat idle a day.
 //!
 //! A worker that finished its task is kept whole — its conversation and its
-//! KV — so Claude can continue it with `repo_task_reply`, as it can a worker that
+//! KV — so its caller can continue it with `repo_task_reply`, as it can a worker that
 //! asked or is stuck. Archiving distils the conversation to text
 //! (`ZendSession::archive_worker`), which is one way: an archived worker's
 //! evidence stays readable, and the worker is never continued.
@@ -57,7 +57,7 @@ pub fn lost(w: &Worker) -> bool {
     w.state == State::Error && w.ended_ms.is_none()
 }
 
-/// Whether `w` still holds its whole conversation: waiting on Claude,
+/// Whether `w` still holds its whole conversation: waiting on its caller,
 /// finished and kept to be continued, or lost with nothing to end it.
 pub fn unarchived(w: &Worker) -> bool {
     (w.state.live() && !w.state.working()) || w.resumable || lost(w)
@@ -85,7 +85,7 @@ fn newest(records: &dyn Records, owner: &str, t: &Thread, workers: &[Worker]) ->
 }
 
 /// The record of the worker `w`, which is not working, once archived `why`:
-/// a worker waiting on Claude ends as an error saying so, its question kept,
+/// a worker waiting on its caller ends as an error saying so, its question kept,
 /// ended when it last did anything — archiving is not activity; a finished
 /// one keeps its answer, and can no longer be continued.
 fn archived(mut w: Worker, why: &str) -> Worker {
@@ -320,8 +320,8 @@ pub fn sweep(records: &dyn Records, distil: Distil, now: u64) -> (usize, usize) 
         let mut stuck = false;
         for w in workers.iter().filter(|w| due(w)) {
             // Read again and claimed under the lock a reply takes, so a
-            // worker Claude continued a moment ago is never archived under
-            // its turn, and one Claude tries to continue now is refused.
+            // worker its caller continued a moment ago is never archived under
+            // its turn, and one a caller tries to continue now is refused.
             let claimed = {
                 let _held = workers::holding();
                 let Some(w) = threads::worker(records, &owner, &t.name, &w.name)
@@ -497,7 +497,7 @@ mod tests {
 
     /// **A day idle archives the worker, and a day quiet the thread**: a
     /// finished worker kept to be continued is distilled and no longer
-    /// resumable; one waiting on Claude ends as an error saying why; the
+    /// resumable; one waiting on its caller ends as an error saying why; the
     /// thread is archived once nothing on it has moved for a day.
     #[test]
     fn a_day_idle_archives_the_workers_and_then_the_thread() {
@@ -563,7 +563,7 @@ mod tests {
         assert!(!threads::thread(&records, "o", "review").unwrap().archived);
     }
 
-    /// **Attaching again is activity**: a swept thread Claude reopens is not
+    /// **Attaching again is activity**: a swept thread a caller reopens is not
     /// swept again while the attach is within the day.
     #[test]
     fn a_reopened_thread_is_not_swept_again() {
@@ -697,7 +697,7 @@ mod tests {
     }
 
     /// `thread_archive` is refused while a worker runs, and otherwise archives
-    /// every worker still whole, naming the ones that waited on Claude.
+    /// every worker still whole, naming the ones that waited on their caller.
     #[test]
     fn archiving_a_thread_names_the_unanswered_and_refuses_while_running() {
         let records = MemRecords::default();

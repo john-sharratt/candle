@@ -2,7 +2,7 @@
 //! the turns behind one of them (`docs/claude_zend_gateway.md` §5.3).
 //!
 //! `journal` is `"self"` — the attached thread — or a path: a thread's journal
-//! is the entries the server wrote as Claude delegated (§4); a worker's is the
+//! is the entries the server wrote as the caller delegated (§4); a worker's is the
 //! journal its own conversation kept. A memory path — `@group/…`, a section,
 //! `here` — opens one of the memory's journals (`docs/memory_backbone.md`
 //! §6.5), or with `#<line id>` reads one line of it.
@@ -334,7 +334,7 @@ mod tests {
     fn a_notes_address_reads_that_note() {
         let notes = vec![
             Note {
-                label: "Claude started:".into(),
+                label: "Zen started:".into(),
                 text: "verify the expiry".into(),
                 at_ms: 0,
                 worker: None,
@@ -357,10 +357,10 @@ mod tests {
         assert_eq!(past.text, "T:review has no entry 3: it holds 2 entries");
         assert!(notes_answer("T:review", &notes, None, 1)
             .text
-            .starts_with("Journal of T:review, written by Claude"));
+            .starts_with("Journal of T:review, written by Zen"));
         assert_eq!(
             notes_answer("T:review", &notes, None, 2).text,
-            "Journal of T:review, written by Claude, entries 2–2 of 2\n\
+            "Journal of T:review, written by Zen, entries 2–2 of 2\n\
              #2 Decided: parts cite their files"
         );
     }

@@ -11,12 +11,12 @@
 //!
 //! A tool's name says what it acts on and what it does to it —
 //! `repo_task_start`, `service_status` — never the process that serves it.
-//! What it acts on is named so Claude can route by the name alone, before it
+//! What it acts on is named so a client can route by the name alone, before it
 //! has read a description: `repo_` is work in the user's repositories, which
-//! Claude has no other way to reach.
+//! the client has no other way to reach.
 //!
 //! **The descriptions carry the rules.** claude.ai discards a server's
-//! `instructions` (§13.3), so what Claude must do to keep its thread — attach
+//! `instructions` (§13.3), so what a client must do to keep its thread — attach
 //! first, name each task for what it is for, read the journal after its
 //! context is compacted — is said in the descriptions, the one channel every
 //! client delivers. **And they define their terms**: a model meets these tools

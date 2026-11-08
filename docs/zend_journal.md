@@ -100,7 +100,7 @@ fork already holds every turn in full. A reply's reasoning block is left out.
 | Kind | Cited part | Rendered under |
 |---|---|---|
 | `Observed` | a user side carrying `<tool_response>` blocks: a file read, a grep, a command's output | `Saw:` |
-| `Heard` | a user side carrying a person's message | `User said:` — `Claude said:` in a task delegated through `/mcp` (`style::style_for`) |
+| `Heard` | a user side carrying a person's message | `User said:` — `Asked:` in a task delegated through `/mcp` (`style::style_for`) |
 | `Did` | a reply: the call it made, or what it told the user | `Did:` |
 | `Inferred` | nothing the session saw supports it | `Concluded, not seen:` |
 

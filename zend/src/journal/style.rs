@@ -188,10 +188,12 @@ from its turns or from what was retrieved for it, not from your journal.",
 };
 
 /// The wording of a task's journal — a conversation owned through `/mcp`
-/// (`docs/claude_zend_gateway.md` §5): every user turn there is Claude's — the
-/// task, an answer, a nudge — so what it heard is what Claude said.
+/// (`docs/claude_zend_gateway.md` §5): every user turn there is the caller's —
+/// the task, an answer, a nudge — so what it heard is what it was asked. The
+/// caller is whichever MCP client delegated, and the worker reading the line is
+/// Zen, so the line names neither.
 pub const DELEGATED: Style = Style {
-    heard: "Claude said:",
+    heard: "Asked:",
     ..CODING
 };
 
@@ -301,18 +303,18 @@ mod tests {
         );
     }
 
-    /// **In a task's journal, what was heard is what Claude said**: every
-    /// user turn of a conversation owned through `/mcp` is Claude's. Every
-    /// other conversation keeps the user's words.
+    /// **In a task's journal, what was heard is what it was asked**: every
+    /// user turn of a conversation owned through `/mcp` is the caller's.
+    /// Every other conversation keeps the user's words.
     #[test]
-    fn a_tasks_journal_hears_claude() {
+    fn a_tasks_journal_hears_what_it_was_asked() {
         let mut e = entry();
         e.claims = vec![claim("Asked for the expiry check.", Kind::Heard, false)];
         assert_eq!(
             e.detail(style_for("mcp:abc:review/verify")),
             "Entry 1 [2026-10-23 14:20–14:41 UTC]\n\
              Fixed the scan's race.\n\
-             - Claude said: Asked for the expiry check."
+             - Asked: Asked for the expiry check."
         );
         assert_eq!(style_for("c-123").heard, "User said:");
     }

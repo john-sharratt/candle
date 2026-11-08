@@ -23,7 +23,7 @@ pub enum WorkerKind {
     Coder,
     Researcher,
     Reviewer,
-    /// Zen answering Claude on a session's chat: its message is the text as
+    /// Zen answering an MCP client on a session's chat: its message is the text as
     /// sent, its answer is ready when its turn ends, and nothing of it is kept
     /// on a thread.
     Chat,

@@ -1,7 +1,7 @@
 //! The bots' and the pictures' tools for a conversation of Zen's
 //! (`docs/zen_tool_reach.md` §4.3, §6.4): npcd's own MCP tools, called
 //! through the gateway as the conversation's person, exactly as the
-//! aggregator calls them for Claude (`docs/mcp_app.md` §3). npcd is their only
+//! aggregator calls them for an MCP client (`docs/mcp_app.md` §3). npcd is their only
 //! implementation, and its own role checks stand: a bot the person does not
 //! own is one npcd does not show them.
 //!

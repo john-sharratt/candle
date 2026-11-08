@@ -6,7 +6,7 @@
 //!
 //! A drafted journal — a conversation's own — lists its entries and reads the
 //! turns behind them. A thread's or project's
-//! journal is Claude's notes, records with no turns behind them, so an entry
+//! journal is Zen's notes, records with no turns behind them, so an entry
 //! of it reads as the note itself.
 
 use std::sync::{Arc, OnceLock};
@@ -46,7 +46,7 @@ impl JournalBook for Drafted {
     }
 }
 
-/// A thread's or project's journal: Claude's notes, one numbered line each.
+/// A thread's or project's journal: Zen's notes, one numbered line each.
 pub struct Notes {
     lines: Vec<String>,
 }
@@ -204,7 +204,7 @@ mod tests {
             notes(&["#1 own"]),
             vec![
                 above("T:t/w", "w", notes(&["#1 worker"])),
-                above("T:t", "t", notes(&["#1 Claude said: keep it small"])),
+                above("T:t", "t", notes(&["#1 Asked: keep it small"])),
                 above("P:candle", "candle", notes(&["#1 never push main"])),
             ],
         )
@@ -220,10 +220,7 @@ mod tests {
             shelf()
         });
         assert_eq!(builds.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            lazy.open("t").unwrap().entries(),
-            "#1 Claude said: keep it small"
-        );
+        assert_eq!(lazy.open("t").unwrap().entries(), "#1 Asked: keep it small");
         assert_eq!(lazy.open("self").unwrap().entries(), "#1 own");
         assert_eq!(builds.load(Ordering::Relaxed), 1);
     }
@@ -239,10 +236,7 @@ mod tests {
         let s = shelf();
         assert_eq!(s.open("T:t/w").unwrap().entries(), "#1 worker");
         assert_eq!(s.open("w").unwrap().entries(), "#1 worker");
-        assert_eq!(
-            s.open("t").unwrap().entries(),
-            "#1 Claude said: keep it small"
-        );
+        assert_eq!(s.open("t").unwrap().entries(), "#1 Asked: keep it small");
         assert_eq!(s.open("candle").unwrap().entries(), "#1 never push main");
     }
 
@@ -279,7 +273,7 @@ mod tests {
     #[test]
     fn notes_read_and_search_note_by_note() {
         let n = Notes::new(vec![
-            "#1 Claude said: verify the expiry".into(),
+            "#1 Asked: verify the expiry".into(),
             "#2 Decided: parts cite their files".into(),
         ]);
         assert_eq!(
@@ -305,11 +299,11 @@ mod tests {
                 text: "#2 Decided: parts cite their files".into(),
             }
         );
-        assert_eq!(n.grep("claude", Some(2), 20).unwrap().total, 0);
+        assert_eq!(n.grep("asked", Some(2), 20).unwrap().total, 0);
         assert_eq!(n.grep("#", None, 1).unwrap().hits.len(), 1);
         assert_eq!(
             n.entries(),
-            "#1 Claude said: verify the expiry\n#2 Decided: parts cite their files"
+            "#1 Asked: verify the expiry\n#2 Decided: parts cite their files"
         );
         assert_eq!(Notes::new(Vec::new()).entries(), "No entries yet.");
     }

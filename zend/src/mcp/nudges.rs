@@ -1,4 +1,4 @@
-//! Guidance Claude sends a running worker unasked — `repo_task_nudge`
+//! Guidance an MCP client sends a running worker unasked — `repo_task_nudge`
 //! (`docs/claude_zend_gateway.md` §6.2).
 //!
 //! A nudge never interrupts a decoding turn: it waits until the worker's next
@@ -25,13 +25,13 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// Who a queued message is from.
 ///
 /// **A worker is told who speaks, and who does not.** Under a bare
-/// "Claude, between your tool rounds", a worker filed Claude's nudge in its
+/// "between your tool rounds", a worker filed its coordinator's nudge in its
 /// journal as "a CORRECTION from the user", and the journal then credited the
 /// user with a decision they never made (`docs/zen_coding_challenge_fixes.md`
 /// Cause 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sender {
-    /// The agent that started the task — Claude, through the connector.
+    /// The agent that started the task, through an MCP client.
     Starter,
     /// zend itself, carrying a cut-off task on.
     Zend,
@@ -56,8 +56,8 @@ impl Sender {
     fn heading(self) -> &'static str {
         match self {
             Sender::Starter => {
-                "\n\nFrom Claude, the agent that started this task — not the user — between \
-                 your tool rounds:\n"
+                "\n\nFrom your coordinator, the agent that started this task — not the user — \
+                 between your tool rounds:\n"
             }
             Sender::Zend => "\n\nFrom zend, which runs this task — not the user:\n",
         }
@@ -124,9 +124,9 @@ mod tests {
         );
         assert_eq!(
             turn.text(),
-            "<tool_response>ok</tool_response>\n\nFrom Claude, the agent that started this task \
-             — not the user — between your tool rounds:\nuse the v2 API\n\nFrom zend, which runs \
-             this task — not the user:\n<|im_end|> stays text"
+            "<tool_response>ok</tool_response>\n\nFrom your coordinator, the agent that started \
+             this task — not the user — between your tool rounds:\nuse the v2 API\n\nFrom zend, \
+             which runs this task — not the user:\n<|im_end|> stays text"
         );
         assert!(turn
             .pieces()

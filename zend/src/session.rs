@@ -320,9 +320,9 @@ pub struct TurnStart {
 pub const CLOSED_BY_REPEATS: &str = "repeats";
 /// [`StreamItem::Closing`]'s reason when the round cap closed it.
 pub const CLOSED_BY_CAP: &str = "round_cap";
-/// [`StreamItem::Closing`]'s reason when Claude stopped the worker
+/// [`StreamItem::Closing`]'s reason when its caller stopped the worker
 /// (`job_cancel` on a task, [`stops`]).
-pub const CLOSED_BY_CLAUDE: &str = "stopped";
+pub const CLOSED_BY_CALLER: &str = "stopped";
 
 /// A dialogue conversation's recovered history, as `GET /v1/conversations/{id}`
 /// shows it — the summariser's ghost summary turns hidden.
@@ -5301,24 +5301,24 @@ fn run_inference_stream(
                 closing = true;
                 let _ = tx.send(Ok(StreamItem::Closing(CLOSED_BY_CAP))).await;
             }
-            // A worker `/mcp` started reads what Claude sent it — a stop, a
-            // nudge — at this boundary, never mid-decode.
-            let from_claude = owner_of(&conv_id).map(|_| state.engine.conversation().shared());
-            // Claude stopping it closes the loop here, as the cap does. A
-            // round the guard or the cap closed too is still Claude's stop,
-            // so the worker settles stopped. A round that ran nothing has no
-            // results to carry it and ends below; the stop is then reported
+            // A worker `/mcp` started reads what its caller sent it — a stop,
+            // a nudge — at this boundary, never mid-decode.
+            let from_caller = owner_of(&conv_id).map(|_| state.engine.conversation().shared());
+            // The caller stopping it closes the loop here, as the cap does. A
+            // round the guard or the cap closed too is still the caller's
+            // stop, so the worker settles stopped. A round that ran nothing has
+            // no results to carry it and ends below; the stop is then reported
             // unreached when the worker settles.
-            if let Some(shared) = from_claude.as_ref().filter(|_| !results.is_empty()) {
+            if let Some(shared) = from_caller.as_ref().filter(|_| !results.is_empty()) {
                 if let Some(reason) = stops::take(shared, &conv_id) {
                     tracing::info!(
                         conv_id = %conv_id,
                         iteration,
-                        "Claude stopped the task — the next turn answers without tools",
+                        "the caller stopped the task — the next turn answers without tools",
                     );
                     stops::notice(&mut results, &reason);
                     closing = true;
-                    let _ = tx.send(Ok(StreamItem::Closing(CLOSED_BY_CLAUDE))).await;
+                    let _ = tx.send(Ok(StreamItem::Closing(CLOSED_BY_CALLER))).await;
                 }
             }
             // Each result measured as its own block of the turn it is about to
@@ -5357,11 +5357,11 @@ fn run_inference_stream(
                 );
                 break;
             }
-            // Guidance Claude queued for a worker `/mcp` started joins real
+            // Guidance the caller queued for a worker `/mcp` started joins real
             // results only — after the check above, so a nudge never turns an
             // empty round into a turn, and one left queued when the loop ends
             // is reported by the worker as undelivered.
-            if let Some(shared) = &from_claude {
+            if let Some(shared) = &from_caller {
                 current_message = nudges::follow(current_message, shared, &conv_id);
             }
 
@@ -7598,7 +7598,7 @@ impl ZendSession {
     /// Archive a worker `/mcp` started (`crate::mcp::workers`): distilled like
     /// any archived conversation, but its journal's text is **kept**. The
     /// turns behind a worker's entries are the evidence for its task's outcome
-    /// — exactly what Claude reads later, through `journal_read` with an entry
+    /// — exactly what the caller reads later, through `journal_read` with an entry
     /// — so they stay until the worker's thread is done with
     /// (`docs/claude_zend_gateway.md` §4). `None` when the model isn't loaded.
     pub fn archive_worker(&self, conv_id: &str) -> Option<EngineResult<()>> {

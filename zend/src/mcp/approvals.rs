@@ -4,7 +4,7 @@
 //! A Decide command, a stop, a delete — and a step the deploy guard refuses —
 //! is not run when Zen asks for it. It is recorded here, exactly as asked, and
 //! the call answers `needs_approval` with the record's id. The grant comes from
-//! outside the conversation: Claude's `approval_grant`, with the user's
+//! outside the conversation: the caller's `approval_grant`, with the user's
 //! `confirm`, for a task or chat it started; or the person's own signed-in
 //! browser, for a dialogue. Nothing a turn writes grants anything.
 //!

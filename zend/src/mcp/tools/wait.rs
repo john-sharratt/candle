@@ -50,7 +50,7 @@ pub fn result_of(w: &Worker, seen: Option<u64>) -> String {
             )
         }
         State::Question => format!(
-            "{} — asks Claude (reply with `repo_task_reply`; it waits until then):\n{}{entries}",
+            "{} — asks you (reply with `repo_task_reply`; it waits until then):\n{}{entries}",
             handle(w),
             w.question.as_deref().unwrap_or("")
         ),
@@ -241,7 +241,7 @@ mod tests {
         asks.question = Some("QUESTION: Inclusive?".into());
         assert_eq!(
             result_of(&asks, None),
-            "task:review/v — asks Claude (reply with `repo_task_reply`; it waits until then):\n\
+            "task:review/v — asks you (reply with `repo_task_reply`; it waits until then):\n\
              QUESTION: Inclusive?"
         );
         let stuck = worker("v", State::Stuck);

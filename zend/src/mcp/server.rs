@@ -1,6 +1,6 @@
 //! zend's MCP server, at `/v1/mcp` (`docs/mcp_app.md` §3): who it is, who is
 //! calling, where its sessions are kept, and its tools — the protocol around
-//! them is `mcp_server`'s. Claude reaches it through the aggregator at
+//! them is `mcp_server`'s. An MCP client reaches it through the aggregator at
 //! `code.tokera.com/mcp`, which serves these tools beside npcd's.
 
 use std::net::IpAddr;

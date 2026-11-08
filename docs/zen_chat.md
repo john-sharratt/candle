@@ -57,9 +57,12 @@ question it has not read.
   one person's id never reaches another's chat.
 - **Its messages** are records under `mcp/chat-said/<owner>/<id>/`, one per
   message, keyed by time and a sequence like a thread's notes, so key order is
-  the order they were said. A message is who said it — `claude` or `zen` — its
-  text, and whether it is a failure Zen's turn ended in. A message's number is
-  its place in that order, from 1.
+  the order they were said. A message is who said it — `caller` or `zen` — its
+  text, whether it is a failure Zen's turn ended in, and on the caller's side the
+  client it came through (`mcp_server::Client::name`). A read names the caller
+  by that client — Claude Code, claude.ai, Grok — and as `Caller` when the
+  client is none Zen knows; a message kept as `claude` reads as the caller's. A
+  message's number is its place in that order, from 1.
 - **Zen's side** is a worker (`docs/claude_zend_gateway.md` §4) of kind `chat`
   under the thread `~<id>`, named `zen`. A thread name starting `~` is no name a
   person can give (`names::check` refuses it), so no `T:` path addresses a
@@ -84,8 +87,8 @@ four differences, all keyed on its kind (`WorkerKind::Chat`):
    ended, so a reader woken by the record finds the message there.
 
 The `chat` option of the `role` selector (`zend/src/prompts/projection.yaml`)
-tells Zen what the conversation is: Claude writing to it from a session of its
-own, answered plainly, the chat deleted afterwards. A chat worker runs with the
+tells Zen what the conversation is: another AI writing to it from a session of
+its own, answered plainly, the chat deleted afterwards. A chat worker runs with the
 tools of the caller's role, like a task, and acts as a coder does: it deploys,
 restarts and runs Care commands, and it starts and steers tasks of its own,
 which a task never does (`docs/zen_tool_reach.md` §6.1, §6.3).

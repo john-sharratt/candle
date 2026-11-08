@@ -163,7 +163,7 @@ mod tests {
     fn a_journal_is_kept_in_its_conversations_wording() {
         let journals = Journals::default();
         let task = journals.of("mcp:abc:review/verify", || None);
-        assert_eq!(task.lock().unwrap().style().heard, "Claude said:");
+        assert_eq!(task.lock().unwrap().style().heard, "Asked:");
         let dialogue = journals.of("c-1", || Some(kept()));
         assert_eq!(dialogue.lock().unwrap().style().heard, "User said:");
     }

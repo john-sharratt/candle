@@ -30,7 +30,7 @@ use super::ops_tools::OpsTools;
 use super::records::Records;
 
 /// The longest any call waits when it names no `wait_s`: short enough that a
-/// running worker reports what it has done every 45 seconds, and Claude can
+/// running worker reports what it has done every 45 seconds, and the caller can
 /// stop waiting on what it reads.
 pub const DEFAULT_WAIT_S: u64 = 45;
 

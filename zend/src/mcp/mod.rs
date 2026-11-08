@@ -1,8 +1,8 @@
 //! zend's MCP server, `/v1/mcp` (`docs/claude_zend_gateway.md`,
 //! `docs/mcp_app.md` §3).
 //!
-//! Claude — in Claude Code or an ordinary claude.ai conversation — reaches zend
-//! through it, by way of the aggregator at `code.tokera.com/mcp`: Claude
+//! An MCP client — Claude Code, a claude.ai conversation, Grok — reaches zend
+//! through it, by way of the aggregator at `code.tokera.com/mcp`: the caller
 //! orchestrates and reviews, zend does the volume. Each task runs on a native
 //! zend conversation (a worker) under a thread, the feature's place, and its
 //! result is the worker's journal entry. Signing the caller in is the
@@ -17,11 +17,11 @@
 //! | [`audit`] | A finished task's citation audit: each cited URL opened, seen, or never seen |
 //! | [`archiving`] | Archiving threads and workers: by `thread_archive`, and after a day idle |
 //! | [`activity`] | What a running worker is doing, counted from its stream and said in one sentence |
-//! | [`reported`] | The journal entries already handed to Claude, so a later result gives only new ones |
+//! | [`reported`] | The journal entries already handed to the caller, so a later result gives only new ones |
 //! | [`lineage`] | The journals a worker inherits from above it |
 //! | [`ops`] | What the operations tools share: Admins only, the decision gate, the way up |
 //! | [`nudges`] | Guidance for a running worker, taken at its next tool round |
-//! | [`stops`] | Claude stopping a running worker, at its next tool round |
+//! | [`stops`] | The caller stopping a running worker, at its next tool round |
 //! | [`threads`] | Threads, workers and the thread's journal, as records |
 //! | [`memory`] | The memory backbone: the user's and their groups' journals, and the context made of them |
 //! | [`names`] | Names and paths |

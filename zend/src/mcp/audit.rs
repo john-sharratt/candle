@@ -9,7 +9,7 @@
 //! | never seen | cited, but no tool result held it |
 //!
 //! Only what tools returned counts: the `<tool_response>` blocks of each
-//! turn's user half. A URL named in a prompt — Claude's, or the correction
+//! turn's user half. A URL named in a prompt — the caller's, or the correction
 //! that sends a worker back — is not evidence of anything, and a fetch that
 //! failed returned no page. Deterministic and cheap. A task whose answer cites
 //! anything not opened is sent back once to open it ([`Audit::correction`]).

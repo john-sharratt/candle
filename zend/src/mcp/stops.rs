@@ -1,4 +1,4 @@
-//! Claude stopping a running worker — `job_cancel` on a task
+//! An MCP client stopping a running worker — `job_cancel` on a task
 //! (`docs/claude_zend_gateway.md` §6.2, `docs/jobs.md`).
 //!
 //! Like a nudge, a stop never interrupts a decoding turn: it is read where the
@@ -39,7 +39,7 @@ pub fn take(records: &dyn Records, conv_id: &str) -> Option<String> {
 }
 
 /// Mark the round a stop closes, on its last result: the worker reads that
-/// Claude stopped it, why, and that it now answers with what it has.
+/// its coordinator stopped it, why, and that it now answers with what it has.
 pub fn notice(results: &mut [ToolResult], reason: &str) {
     let Some(last) = results.last_mut() else {
         return;
@@ -47,11 +47,12 @@ pub fn notice(results: &mut [ToolResult], reason: &str) {
     let why = if reason.trim().is_empty() {
         String::new()
     } else {
-        format!(" Claude's reason: {}.", reason.trim().trim_end_matches('.'))
+        format!(" Its reason: {}.", reason.trim().trim_end_matches('.'))
     };
     let notice = Value::String(format!(
-        "Claude stopped this task: no further tool call will run.{why} Answer now with what you \
-         have — what you found, and what remains undone — so Claude can redirect you."
+        "Your coordinator stopped this task: no further tool call will run.{why} Answer now with \
+         what you have — what you found, and what remains undone — so your coordinator can \
+         redirect you."
     ));
     match &mut last.response {
         Value::Object(map) => {
@@ -81,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn the_closing_round_says_claude_stopped_it_and_why() {
+    fn the_closing_round_says_its_coordinator_stopped_it_and_why() {
         let result = |response: Value| ToolResult {
             call: ToolCall {
                 name: "web_fetch".into(),
@@ -95,17 +96,16 @@ mod tests {
             results[0].response,
             json!({
                 "status": 404,
-                "notice": "Claude stopped this task: no further tool call will run. Claude's \
-                           reason: use v2 only. Answer now with what you have — what you found, \
-                           and what remains undone — so Claude can redirect you."
+                "notice": "Your coordinator stopped this task: no further tool call will run. \
+                           Its reason: use v2 only. Answer now with what you have — what you \
+                           found, and what remains undone — so your coordinator can redirect you."
             })
         );
         let mut bare = vec![result(json!("text"))];
         notice(&mut bare, "");
         assert_eq!(bare[0].response["result"], "text");
-        assert!(bare[0].response["notice"]
-            .as_str()
-            .unwrap()
-            .starts_with("Claude stopped this task: no further tool call will run. Answer now"));
+        assert!(bare[0].response["notice"].as_str().unwrap().starts_with(
+            "Your coordinator stopped this task: no further tool call will run. Answer now"
+        ));
     }
 }

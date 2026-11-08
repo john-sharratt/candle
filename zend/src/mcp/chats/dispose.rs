@@ -195,18 +195,19 @@ mod tests {
         threads::put_worker(r, OWNER, &worker("zen.2", "done", 1_000)).unwrap();
         let note = Note {
             at_ms: 1,
-            label: "Claude started:".into(),
+            label: "Zen started:".into(),
             text: "t".into(),
             worker: None,
             client: None,
         };
         threads::add_note(r, OWNER, &thread, &note).unwrap();
-        for (by, text) in [(Speaker::Claude, "hello"), (Speaker::Zen, "hi")] {
+        for (by, text) in [(Speaker::Caller, "hello"), (Speaker::Zen, "hi")] {
             let s = Said {
                 at_ms: 2,
                 by,
                 text: text.into(),
                 failed: false,
+                client: None,
             };
             record::say(r, OWNER, ID, &s).unwrap();
         }

@@ -1,6 +1,6 @@
 //! `journal_grep {journal, pattern, entry?, max_results?}`: the lines of a
 //! journal's turns that hold `pattern` — one worker's, or a whole thread's
-//! when Claude does not yet know which worker learned something
+//! when the caller does not yet know which worker learned something
 //! (`docs/claude_zend_gateway.md` §5, §5.3) — or across the memory: every
 //! line, archive and summary the user reads, or one subtree of them
 //! (`docs/memory_backbone.md` §6.5).

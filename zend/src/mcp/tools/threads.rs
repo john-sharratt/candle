@@ -30,7 +30,7 @@ pub fn definition() -> Value {
 }
 
 /// One thread's line, then a line for each worker running — what its turn
-/// has done, at `now` — and each waiting on Claude.
+/// has done, at `now` — and each waiting on its caller.
 pub fn render_thread(t: &Thread, workers: &[Worker], last: Option<&str>, now: u64) -> String {
     let running = workers.iter().filter(|w| w.state.working()).count();
     let mut out = format!(
@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_names_what_runs_and_what_waits_on_claude() {
+    fn a_thread_names_what_runs_and_what_waits_on_its_caller() {
         let t = Thread {
             name: "review".into(),
             created_ms: 0,

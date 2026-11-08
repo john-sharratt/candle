@@ -1,5 +1,5 @@
 //! The tasks a conversation of Zen's starts and steers
-//! (`docs/zen_tool_reach.md` §6.3): a person's dialogue, a chat Claude holds
+//! (`docs/zen_tool_reach.md` §6.3): a person's dialogue, a chat an MCP client holds
 //! with Zen, or a task one of those started. Tasks nest one level: a task a
 //! task started holds none of these tools, so it does its work itself.
 //!
@@ -42,7 +42,7 @@ pub const BEGINS_ON: &str = " It begins on your branches with your uncommitted c
 pub enum Level {
     /// A person's dialogue, or a chat: it starts tasks.
     Conversation,
-    /// A task a conversation, Claude or a person started: it starts tasks,
+    /// A task a conversation, an MCP client or a person started: it starts tasks,
     /// each a level down.
     Task,
     /// A task a task started: it starts none.

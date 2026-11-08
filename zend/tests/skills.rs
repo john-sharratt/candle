@@ -1,4 +1,4 @@
-//! The skills Claude follows to use zend (`skills/`,
+//! The skills a client follows to use zend (`skills/`,
 //! `docs/claude_zend_gateway.md` §9, §13.4) meet the rules an upload to
 //! claude.ai enforces: each folder holds a `SKILL.md` whose frontmatter is
 //! `name` and `description` alone, `name` matches the folder — lowercase

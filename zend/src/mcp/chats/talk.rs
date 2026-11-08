@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use journals::scope::Channel;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::mcp::archiving;
@@ -138,11 +139,11 @@ pub fn recap(earlier: &[Said], text: &str) -> String {
         out.push_str(&format!(
             "\n#{} {}: {}",
             i + 1,
-            s.by.name(),
+            s.speaker(),
             quote(&s.text, RECAP_QUOTE)
         ));
     }
-    out.push_str("\n\nClaude's new message:\n");
+    out.push_str("\n\nThe new message:\n");
     out.push_str(text);
     out
 }
@@ -168,11 +169,12 @@ fn continued(
 }
 
 /// Send `text` to Zen on `caller`'s chat `on`, or on a new chat when `on` is
-/// `None`; Zen's answer runs at `effort`. A chat that is closing or no longer
-/// kept takes no message: [`not_open`].
+/// `None`, through the client app `channel`; Zen's answer runs at `effort`. A
+/// chat that is closing or no longer kept takes no message: [`not_open`].
 pub fn send(
     session: &Arc<ZendSession>,
     caller: &Caller,
+    channel: Channel,
     on: Option<&str>,
     text: &str,
     effort: Effort,
@@ -235,9 +237,10 @@ pub fn send(
     };
     let said = Said {
         at_ms: now,
-        by: Speaker::Claude,
+        by: Speaker::Caller,
         text: text.to_string(),
         failed: false,
+        client: Some(channel.name().to_string()),
     };
     record::say(&records, &owner, &chat.id, &said).map_err(|e| e.to_string())?;
     let worker = workers::begin(session, &records, &owner, worker, message)?;
@@ -271,12 +274,13 @@ pub fn view(records: &dyn Records, owner: &str, id: &str, now: u64) -> View {
     }
 }
 
-/// The message a read starts after: `after`, or else Claude's last message,
-/// so a read with none gives what Zen said since Claude last spoke.
+/// The message a read starts after: `after`, or else the caller's last
+/// message, so a read with none gives what Zen said since the caller last
+/// spoke.
 pub fn start_after(said: &[Said], after: Option<usize>) -> usize {
     after.unwrap_or_else(|| {
         said.iter()
-            .rposition(|s| s.by == Speaker::Claude)
+            .rposition(|s| s.by == Speaker::Caller)
             .map_or(0, |i| i + 1)
     })
 }
@@ -343,7 +347,7 @@ pub fn render(v: &View, id: &str, from: usize, now: u64) -> String {
         } else {
             ""
         };
-        out.push_str(&format!("\n\n#{n} {}{failed}:\n{}", s.by.name(), s.text));
+        out.push_str(&format!("\n\n#{n} {}{failed}:\n{}", s.speaker(), s.text));
     }
     if let Some(w) = &v.answering {
         out.push_str(&format!(
@@ -379,12 +383,14 @@ pub fn answered(records: &dyn Records, owner: &str, worker: &Worker) {
                 .clone()
                 .unwrap_or_else(|| "the answer failed".into()),
             failed: true,
+            client: None,
         },
         _ => Said {
             at_ms: now,
             by: Speaker::Zen,
             text: worker.final_text.clone(),
             failed: false,
+            client: None,
         },
     };
     if let Err(e) = record::say(records, owner, id, &said) {
@@ -456,6 +462,7 @@ mod tests {
             by,
             text: text.into(),
             failed: false,
+            client: None,
         }
     }
 
@@ -519,7 +526,7 @@ mod tests {
             };
             record::put_chat(&r, "o", &c).unwrap();
         }
-        record::say(&r, "o", "0000000000000000", &said(Speaker::Claude, "q")).unwrap();
+        record::say(&r, "o", "0000000000000000", &said(Speaker::Caller, "q")).unwrap();
         record::put_chat(
             &r,
             "p",
@@ -547,7 +554,7 @@ mod tests {
         let earlier: Vec<Said> = (1..=10)
             .map(|i| {
                 let by = if i % 2 == 1 {
-                    Speaker::Claude
+                    Speaker::Caller
                 } else {
                     Speaker::Zen
                 };
@@ -558,21 +565,22 @@ mod tests {
             recap(&earlier, "and now?"),
             "This chat began before this conversation did: an earlier answer of yours failed, so \
              you are taking the chat up afresh. Its last messages:\n\
-             #3 Claude: m3\n#4 Zen: m4\n#5 Claude: m5\n#6 Zen: m6\n\
-             #7 Claude: m7\n#8 Zen: m8\n#9 Claude: m9\n#10 Zen: m10\n\n\
-             Claude's new message:\nand now?"
+             #3 Caller: m3\n#4 Zen: m4\n#5 Caller: m5\n#6 Zen: m6\n\
+             #7 Caller: m7\n#8 Zen: m8\n#9 Caller: m9\n#10 Zen: m10\n\n\
+             The new message:\nand now?"
         );
         assert_eq!(quote("abcdef", 3), "abc…");
         assert_eq!(quote(" abc ", 3), "abc");
     }
 
-    /// **A read with no `after` gives what Zen said since Claude last spoke.**
+    /// **A read with no `after` gives what Zen said since the caller last
+    /// spoke.**
     #[test]
-    fn a_read_starts_after_claudes_last_message() {
+    fn a_read_starts_after_the_callers_last_message() {
         let s = [
-            said(Speaker::Claude, "q1"),
+            said(Speaker::Caller, "q1"),
             said(Speaker::Zen, "a1"),
-            said(Speaker::Claude, "q2"),
+            said(Speaker::Caller, "q2"),
             said(Speaker::Zen, "a2"),
             said(Speaker::Zen, "a2, more"),
         ];
@@ -589,7 +597,7 @@ mod tests {
         let v = View {
             chat: None,
             said: vec![
-                said(Speaker::Claude, "q1"),
+                said(Speaker::Caller, "q1"),
                 failed,
                 said(Speaker::Zen, "a1"),
             ],
@@ -606,7 +614,7 @@ mod tests {
             "Chat `0123456789abcdef` with Zen: 3 messages. Nothing after #3."
         );
         let one = View {
-            said: vec![said(Speaker::Claude, "q1")],
+            said: vec![said(Speaker::Caller, "q1")],
             ..v
         };
         assert_eq!(
@@ -619,7 +627,7 @@ mod tests {
     #[test]
     fn a_view_writes_no_record() {
         let r = MemRecords::default();
-        record::say(&r, "o", "0123456789abcdef", &said(Speaker::Claude, "q")).unwrap();
+        record::say(&r, "o", "0123456789abcdef", &said(Speaker::Caller, "q")).unwrap();
         threads::put_worker(&r, "o", &worker("zen", "done", 1, true)).unwrap();
         let before = r.under("mcp/");
         let v = view(&r, "o", "0123456789abcdef", 10);
@@ -698,6 +706,7 @@ mod tests {
         let first = send(
             &session,
             &caller,
+            Channel::Grok,
             None,
             "how big is the arena?",
             Effort::Balanced,
@@ -726,11 +735,16 @@ mod tests {
         .await
         .unwrap();
         assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
-        assert_eq!(from, 1, "a read starts after Claude's last message");
+        assert_eq!(from, 1, "a read starts after the caller's last message");
         assert_eq!(v.said.len(), 1);
         assert_eq!(
             (v.said[0].by, v.said[0].text.as_str()),
-            (Speaker::Claude, "how big is the arena?")
+            (Speaker::Caller, "how big is the arena?")
+        );
+        assert_eq!(
+            v.said[0].speaker(),
+            "Grok",
+            "the caller is named by its client"
         );
         let answering = v.answering.as_ref().expect("Zen is answering");
         assert_eq!(answering.name, ZEN);
@@ -745,6 +759,7 @@ mod tests {
             send(
                 &session,
                 &caller,
+                Channel::Grok,
                 Some(&first.chat.id),
                 "still there?",
                 Effort::Balanced
@@ -754,7 +769,15 @@ mod tests {
         );
         assert_eq!(record::said(&records, &owner, &first.chat.id).len(), 1);
 
-        let other = send(&session, &caller, None, "a second chat", Effort::Balanced).unwrap();
+        let other = send(
+            &session,
+            &caller,
+            Channel::Grok,
+            None,
+            "a second chat",
+            Effort::Balanced,
+        )
+        .unwrap();
         assert_ne!(
             other.chat.id, first.chat.id,
             "each send naming no chat opens its own"
@@ -772,6 +795,7 @@ mod tests {
                     },
                     role: caller.role,
                 },
+                Channel::Grok,
                 Some(&first.chat.id),
                 "may I read it?",
                 Effort::Balanced
@@ -812,6 +836,7 @@ mod tests {
             send(
                 &session,
                 &caller,
+                Channel::Grok,
                 Some(&first.chat.id),
                 "and now?",
                 Effort::Deep
@@ -825,6 +850,7 @@ mod tests {
             send(
                 &session,
                 &caller,
+                Channel::Grok,
                 None,
                 &format!("chat {i}"),
                 Effort::Balanced,
@@ -833,7 +859,15 @@ mod tests {
         }
         assert_eq!(record::kept_count(&records, &owner), MAX_CHATS);
         assert_eq!(
-            send(&session, &caller, None, "one too many", Effort::Balanced).unwrap_err(),
+            send(
+                &session,
+                &caller,
+                Channel::Grok,
+                None,
+                "one too many",
+                Effort::Balanced
+            )
+            .unwrap_err(),
             too_many()
         );
     }

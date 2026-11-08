@@ -1,6 +1,6 @@
 //! The operations tools — the jobs, building, deploying, and reading the
-//! cluster — as one implementation two surfaces call (`docs/jobs.md` §8): Claude
-//! through the MCP connector, and a worker of Zen's through its own tool round
+//! cluster — as one implementation two surfaces call (`docs/jobs.md` §8): an MCP
+//! client through the connector, and a worker of Zen's through its own tool round
 //! ([`OpsTools`], the daemon's [`OpsRunner`]). Each tool runs against an
 //! [`OpsCall`] — whom it is for and how it may wait — so neither surface has a
 //! copy of its own to drift.
@@ -134,7 +134,7 @@ impl OpsCall {
     }
 }
 
-/// Which conversation is calling: a task or chat Claude delegated through
+/// Which conversation is calling: a task or chat a caller delegated through
 /// `/mcp`, by its kind, or a person's dialogue with Zen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Acting {
@@ -144,7 +144,7 @@ enum Acting {
 
 impl Acting {
     /// Whether it may change what runs (`docs/zen_tool_reach.md` §6.1): a
-    /// coder, a chat — which acts for Claude, with Claude's role — and a
+    /// coder, a chat — which acts for its caller, with the caller's role — and a
     /// person's dialogue. A researcher and a reviewer read untrusted content
     /// and change nothing.
     fn may_change(self) -> bool {
@@ -359,7 +359,7 @@ fn unfit(tool: &str, role: Role, acting: Acting, person: bool) -> Option<String>
             ),
             Acting::Worker(_) => format!(
                 "`{tool}` reads the cluster as the person this task works for, and its record \
-                 names none: it was started before tasks carried one. Ask Claude to start it again"
+                 names none: it was started before tasks carried one. Ask your coordinator to start it again"
             ),
         }),
         _ => None,

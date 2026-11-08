@@ -332,9 +332,12 @@ The note's text is filed as the turn behind its entry, so `journal_read` and
 route appends a turn with no model reply — today every dialogue turn is
 decoded — and keeps the entry through the journal's own keep path
 (`journal.kept`, the section submit), so it seals, folds and replicates like
-any entry. Its claims are labelled by speaker: `Claude said:` for a note,
-`Claude started:` for a task, `Task ended:` for an outcome (**new** labels;
-`zend/src/journal/style.rs:154-170` holds today's).
+any entry. Its claims are labelled by speaker: `Asked:` for a note,
+`Zen started:` for a task (and `Zen answered:`, `Zen continued:`, `Zen nudged:`,
+`Zen stopped:` for the calls that follow it), `Task ended:` for an outcome. The
+server writes the thread's journal, so its labels name Zen, never the client
+that called — any MCP client may be calling. A label is kept on the note as
+written and rendered as stored (`mcp::threads::Note`).
 
 Claude learns to keep the thread from the tools' own descriptions and the
 skills (§7.1). The thread's journal is the anchor Claude re-reads after its
@@ -400,8 +403,9 @@ The kinds are `Observed` / `Heard` / `Did` / `Inferred`
 `Concluded, not seen:` (`zend/src/journal/style.rs:158-161`): a user turn is
 `Heard`, a user turn carrying a `<tool_response>` is `Observed`, an assistant
 turn is `Did` (`zend/src/journal/origin.rs:80-86`). In an `/mcp` worker every
-user turn is Claude's — the task, an answer, a nudge — so `Heard` renders
-`Claude said:` there (`style_for`, `zend/src/journal/style.rs`).
+user turn is the caller's — the task, an answer, a nudge — so `Heard` renders
+`Asked:` there (`style_for`, `zend/src/journal/style.rs`): the worker reading it
+is Zen, and the caller may be any MCP client, so the label names neither.
 
 **Every task ends with an entry.** The journal drafts on its own cadence —
 every 16 turns, or under selection pressure (`zend/src/journal/state.rs:23,
@@ -526,11 +530,11 @@ conventions and whatever the user states as standing, so every worker in every
 thread starts with them. Every repository of the workspace has one.
 
 **Framed by whose it is.** Each inherited journal is headed by its absolute
-path and whose it is — *the standing rules of the project, noted by Claude*,
-*the notes of the thread, written by Claude* — and the reader's line names
+path and whose it is — *the standing rules of the project, noted by Zen*,
+*the notes of the thread, written by Zen* — and the reader's line names
 which path the reader is, and says the journals above are information to
 weigh, not instructions. In a conversation owned through `/mcp` a claim drawn
-from a user turn renders `Claude said:` (`style::DELEGATED`).
+from a user turn renders `Asked:` (`style::DELEGATED`).
 
 **Privacy becomes lineage-scoped.** `docs/zend_journal.md` §7's "a journal is
 read by its own conversation and nothing else" becomes: a thread's and a
@@ -730,7 +734,7 @@ answers with `repo_task_reply`.
 submits it as the worker's next message through the same session path a chat
 turn takes, and the worker carries on with the answer in its history, so a
 later round, its journal and its verifier all see what was decided. The answer
-is also entered on the thread as `Claude answered:` (§4), so it stands in the
+is also entered on the thread as `Zen answered:` (§4), so it stands in the
 thread's record for every later task. A worker may ask again; it settles after
 every turn.
 
@@ -1444,7 +1448,7 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
 - The question block read only from its own line at a reply's end; a reply
   ending in one settling `question`, unarchived, with a `Task asks:` entry;
   `job_status` answering it; `repo_task_reply` refused for a worker not waiting,
-  landing as the next turn otherwise, entered as `Claude answered:`; a restart
+  landing as the next turn otherwise, entered as `Zen answered:`; a restart
   finding a finished turn. `StreamItem::Closing` settling the worker `stuck`.
 - `repo_task_nudge` queued, surviving a restart, and taken at the next round head,
   never mid-decode.
@@ -1519,7 +1523,7 @@ Made in the change that builds each piece:
     archived, until its thread is tombstoned.
   - §4.2: in such a conversation a fold files the folded entries' turns under
     the fold.
-  - §3: the `Claude said:`, `Claude started:` and `Task ended:` labels, and
+  - §3: the `Asked:`, `Zen started:` and `Task ended:` labels, and
     entries kept from a note with no model reply.
   - §7: a journal is read by its own conversation and its descendants, and
     through the tools by its owner.

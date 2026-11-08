@@ -4,7 +4,7 @@
 //! - A **thread** is one feature's place: `mcp/thread/<owner>/<name>`.
 //! - A **worker** is one task on it: `mcp/worker/<owner>/<thread>/<name>`,
 //!   naming the zend conversation the task runs in and how it stands.
-//! - The **thread's journal is written, not drafted**: each task Claude starts
+//! - The **thread's journal is written, not drafted**: each task a caller starts
 //!   and each one that ends is one entry, kept as its own record under
 //!   `mcp/note/<owner>/<thread>/` so two tasks ending at once never race to
 //!   rewrite one record. An entry's number is its place in key order.
@@ -34,7 +34,7 @@ static NOTE_SEQ: AtomicU64 = AtomicU64::new(0);
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Running,
-    /// Its turn ended asking Claude a question; it waits, live, for
+    /// Its turn ended asking its caller a question; it waits, live, for
     /// `repo_task_reply`.
     Question,
     /// The repeat guard or the round cap closed its tools; it waits, live, for
@@ -46,7 +46,7 @@ pub enum State {
 
 impl State {
     /// Whether the worker is still live: its name is taken and it is not
-    /// archived — working, or waiting on Claude.
+    /// archived — working, or waiting on its caller.
     pub fn live(self) -> bool {
         matches!(self, Self::Running | Self::Question | Self::Stuck)
     }
@@ -133,7 +133,7 @@ pub struct Entry {
     pub text: String,
 }
 
-/// A worker's record: a task Claude, a person, a conversation or another task
+/// A worker's record: a task an MCP client, a person, a conversation or another task
 /// started, or Zen's side of a chat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worker {
@@ -195,7 +195,7 @@ pub struct Worker {
     /// Why its turn ended with no journal entry, as the draft recorded it;
     /// none when it kept one.
     pub no_entry: Option<String>,
-    /// Whether Claude stopped its last turn (`job_cancel`): it is stuck, live,
+    /// Whether its caller stopped its last turn (`job_cancel`): it is stuck, live,
     /// for `repo_task_reply` to redirect.
     #[serde(default)]
     pub stopped: bool,
@@ -223,7 +223,7 @@ pub struct Worker {
     #[serde(default)]
     pub runner: Option<u64>,
     /// Whether another task started it with `repo_task_start`. Tasks nest one
-    /// level: a task Claude or a person started may start tasks, and a task a
+    /// level: a task an MCP client or a person started may start tasks, and a task a
     /// task started may not (`docs/zen_tool_reach.md` §6.3).
     #[serde(default)]
     pub by_task: bool,
@@ -279,7 +279,7 @@ pub struct Thread {
     /// The feature is done (`thread_archive`); attaching to it again reopens it.
     #[serde(default)]
     pub archived: bool,
-    /// When Claude last attached to it, to the nearest [`ATTACH_MARK_MS`]:
+    /// When a caller last attached to it, to the nearest [`ATTACH_MARK_MS`]:
     /// activity, to the sweep that archives a thread left a day idle.
     #[serde(default)]
     pub attached_ms: u64,
@@ -293,8 +293,9 @@ pub const ATTACH_MARK_MS: u64 = 60 * 60 * 1000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Note {
     pub at_ms: u64,
-    /// `Claude started:` or `Task ended:` — who the line is from, said in the
-    /// line, since the thread holds no model turns to cite.
+    /// `Zen started:` or `Task ended:` — who the line is from, said in the
+    /// line, since the thread holds no model turns to cite. Rendered as
+    /// stored, so an entry keeps the label it was written with.
     pub label: String,
     pub text: String,
     /// The worker the entry is about, as a path.
@@ -483,7 +484,7 @@ pub fn note_lines(notes: &[Note]) -> Vec<String> {
 /// A thread's or project's journal as `journal_read` prints it: one numbered
 /// line per entry, under its path.
 pub fn render_journal(path: &str, notes: &[Note]) -> String {
-    let mut out = format!("Journal of {path}, written by Claude");
+    let mut out = format!("Journal of {path}, written by Zen");
     if notes.is_empty() {
         out.push_str(" — no entries yet.");
         return out;
@@ -520,7 +521,7 @@ mod tests {
     }
 
     /// **An attach is activity**: marked when the mark is an hour stale, so
-    /// a thread Claude came back to is not swept as idle under it.
+    /// a thread a caller came back to is not swept as idle under it.
     #[test]
     fn an_attach_marks_the_thread_at_most_hourly() {
         let r = MemRecords::default();
@@ -554,19 +555,19 @@ mod tests {
             worker: Some("T:review/verify".into()),
             client: None,
         };
-        add_note(&r, "o", "review", &note(5, "Claude started:", "verify")).unwrap();
+        add_note(&r, "o", "review", &note(5, "Zen started:", "verify")).unwrap();
         add_note(&r, "o", "review", &note(5, "Task ended:", "verify — ok")).unwrap();
-        add_note(&r, "o", "review", &note(9, "Claude started:", "check")).unwrap();
+        add_note(&r, "o", "review", &note(9, "Zen started:", "check")).unwrap();
         let got = notes(&r, "o", "review");
         assert_eq!(got.len(), 3);
         assert_eq!(
             render_journal("T:review", &got),
-            "Journal of T:review, written by Claude\n\
-             #1 Claude started: verify\n#2 Task ended: verify — ok\n#3 Claude started: check"
+            "Journal of T:review, written by Zen\n\
+             #1 Zen started: verify\n#2 Task ended: verify — ok\n#3 Zen started: check"
         );
         assert_eq!(
             render_journal("P:candle", &[]),
-            "Journal of P:candle, written by Claude — no entries yet."
+            "Journal of P:candle, written by Zen — no entries yet."
         );
     }
 

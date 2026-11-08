@@ -1,6 +1,6 @@
-//! The journal entries of each worker already handed to Claude in a tool
+//! The journal entries of each worker already handed to its caller in a tool
 //! result, so a later result — the next wait's, or the one that finds the
-//! worker done — gives only the entries Claude has not read
+//! worker done — gives only the entries the caller has not read
 //! (`docs/claude_zend_gateway.md` §3.3).
 //!
 //! Kept as a record of its own rather than on the worker's, which its beat

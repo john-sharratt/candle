@@ -1,6 +1,6 @@
 //! `journal_note {journal, text}`: record a note on a thread's or a project's
 //! journal — a decision and its reason, what the user said, a standing rule —
-//! as one entry, written by the server in Claude's words
+//! as one entry, written by the server in the caller's words
 //! (`docs/claude_zend_gateway.md` §4, §5.1, §5.3); or on one of the memory's
 //! journals, stamped with the speaker the conversation's focus names — a line
 //! every later conversation in the group reads (`docs/memory_backbone.md`
@@ -121,7 +121,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     }
     let note = Note {
         at_ms: now_ms(),
-        label: "Claude said:".into(),
+        label: "Asked:".into(),
         text: text.to_string(),
         worker: None,
         client: None,

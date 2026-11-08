@@ -94,10 +94,10 @@ mod tests {
             answer(
                 "review",
                 true,
-                "Journal of T:review, written by Claude — no entries yet."
+                "Journal of T:review, written by Zen — no entries yet."
             ),
             "Created T:review, a new thread. If you meant one that exists, `thread_list` names \
-             them.\n\nJournal of T:review, written by Claude — no entries yet."
+             them.\n\nJournal of T:review, written by Zen — no entries yet."
         );
         assert_eq!(answer("review", false, "J"), "Attached to T:review.\n\nJ");
     }

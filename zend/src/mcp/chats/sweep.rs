@@ -27,7 +27,7 @@ pub const SWEEP_EVERY: Duration = Duration::from_secs(10 * 60);
 /// Why a chat is disposed of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Due {
-    /// Claude closed it while Zen was answering, or an earlier sweep found it
+    /// Its caller closed it while Zen was answering, or an earlier sweep found it
     /// due then.
     Closing,
     /// Nothing has been said on it for [`CHAT_IDLE_MS`].

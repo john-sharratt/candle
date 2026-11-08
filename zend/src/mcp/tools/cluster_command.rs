@@ -7,7 +7,7 @@
 //!
 //! - **Classed before anything is sent** ([`class_of`]): a Look runs, a Care
 //!   runs, a Decide is refused without the endpoint's `confirm` — the user's
-//!   approval, which only Claude can pass on — and `offline`/`online` are done
+//!   approval, which only the caller can pass on — and `offline`/`online` are done
 //!   on the member's own machine, never through here.
 //! - **The members' own checks stand behind it.** A destructive command's
 //!   machine name, or a rollout's `count-hash`, goes in `args.confirm`, as the

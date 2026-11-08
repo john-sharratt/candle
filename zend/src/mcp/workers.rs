@@ -58,7 +58,7 @@ use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
 use crate::hand_records::{self, Carrying};
 use crate::ingest_lease::{self, Guard, Share};
-use crate::session::{NoDraft, Resume, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
+use crate::session::{NoDraft, Resume, StreamItem, ZendSession, CLOSED_BY_CALLER};
 use crate::tools::Dispatch;
 use crate::worker_hop;
 
@@ -80,7 +80,7 @@ const PROMPT_QUOTE: usize = 160;
 pub const QUESTION_MARK: &str = "QUESTION:";
 
 /// Held while a worker's state is checked and its turn begun — naming a new
-/// worker, answering one — so two calls at once (Claude issuing them in
+/// worker, answering one — so two calls at once (a caller issuing them in
 /// parallel) cannot both take one name, or both answer one question, and run
 /// two turns on one conversation.
 static BEGIN: Mutex<()> = Mutex::new(());
@@ -101,7 +101,7 @@ pub fn holding() -> MutexGuard<'static, ()> {
 /// (`docs/zen_coding_challenge_fixes.md` Cause 7).
 pub const SENT_BACK: &str = "From zend, which checked your answer — not the user:\n\n";
 
-/// What every task's prompt ends with: how to ask Claude instead of guessing.
+/// What every task's prompt ends with: how to ask its caller instead of guessing.
 /// Asking ends the turn — the worker's last words are the question — so
 /// nothing waits mid-turn, a restart finds a finished turn, and the answer is
 /// simply the worker's next turn.
@@ -266,7 +266,7 @@ pub fn start(
     let started = if by_task {
         "A task started:"
     } else {
-        "Claude started:"
+        "Zen started:"
     };
     note(
         &records,
@@ -384,8 +384,8 @@ pub fn answer(
         ));
     }
     let label = match worker.state {
-        State::Question | State::Stuck => "Claude answered:",
-        State::Done if worker.resumable => "Claude continued:",
+        State::Question | State::Stuck => "Zen answered:",
+        State::Done if worker.resumable => "Zen continued:",
         State::Running => {
             return Err(format!(
                 "`{}` is still working: nudge it with `repo_task_nudge`, or wait",
@@ -454,8 +454,8 @@ const RESUMED: &str = "Your work was cut off, so your last turn may not have fin
 const CHAT_RESUMED: &str = "Your answer was cut off by a restart, so it may not have finished. \
     Answer the message below again, whole, as your next message in the chat.";
 
-/// What a turn's message ends with: for a task, how to ask Claude; for a chat,
-/// nothing — Zen answers Claude in the chat itself.
+/// What a turn's message ends with: for a task, how to ask its caller; for a
+/// chat, nothing — Zen answers its caller in the chat itself.
 fn closing_of(kind: WorkerKind) -> &'static str {
     if kind.is_chat() {
         ""
@@ -651,7 +651,7 @@ pub fn nudge(
         &records,
         &owner,
         &worker,
-        "Claude nudged:",
+        "Zen nudged:",
         first_line(text, PROMPT_QUOTE),
     )?;
     Ok(worker)
@@ -695,7 +695,7 @@ pub fn stop(
             first_line(reason, PROMPT_QUOTE)
         )
     };
-    note(&records, &owner, &worker, "Claude stopped:", line)?;
+    note(&records, &owner, &worker, "Zen stopped:", line)?;
     Ok(worker)
 }
 
@@ -1126,8 +1126,8 @@ pub fn continue_handed(
 enum Ended {
     /// It ended on its own: its whole text.
     Replied(String),
-    /// Its tools were closed — by the repeat guard, the round cap, or Claude
-    /// stopping it (`by`, a [`StreamItem::Closing`] reason): its whole text.
+    /// Its tools were closed — by the repeat guard, the round cap, or its
+    /// caller stopping it (`by`, a [`StreamItem::Closing`] reason): its whole text.
     Closed {
         text: String,
         by: &'static str,
@@ -1148,9 +1148,9 @@ enum Turned {
 }
 
 impl Ended {
-    /// Whether Claude stopped the turn (`job_cancel`).
+    /// Whether its caller stopped the turn (`job_cancel`).
     fn stopped(&self) -> bool {
-        matches!(self, Ended::Closed { by, .. } if *by == CLOSED_BY_CLAUDE)
+        matches!(self, Ended::Closed { by, .. } if *by == CLOSED_BY_CALLER)
     }
 }
 
@@ -1242,7 +1242,7 @@ async fn run(
                     }
                 };
                 // The member it moved to beats, settles and answers for it
-                // now; what Claude sent it, a nudge or a stop, is read there.
+                // now; what its caller sent it, a nudge or a stop, is read there.
                 if moved {
                     session.forget(&worker.conv_id);
                     tracing::info!(
@@ -1285,7 +1285,7 @@ async fn run(
         }
         worker.no_entry = None;
         // A chat's answer is ready when its turn ends: no draft stands between
-        // Claude and the reply (`docs/zen_chat.md` §2).
+        // the caller and the reply (`docs/zen_chat.md` §2).
         let drafted = match ended {
             Ended::Failed(_) => None,
             _ if worker.kind.is_chat() => None,
@@ -1332,7 +1332,7 @@ async fn run(
         // A task's first answer citing what it never opened, or saying nothing
         // of steps its brief gave it (`super::steps`), goes back once to put
         // that right; the second answer is kept with its audit, whatever it
-        // says. A continuation is Claude's to direct, with the audit in hand,
+        // says. A continuation is the caller's to direct, with the audit in hand,
         // so it is not sent back.
         let given = steps::of(&worker.prompt);
         let unsaid = steps::unaccounted(&given, &worker.final_text);
@@ -1550,7 +1550,7 @@ fn keep_first_answer(worker: &mut Worker, answer: String, audit: &Audit) -> Stri
             "ended asking: {}",
             first_line(worker.question.as_deref().unwrap_or(""), 200)
         ),
-        _ if worker.stopped => "was stopped by Claude".to_string(),
+        _ if worker.stopped => "was stopped by Zen".to_string(),
         _ => "had its tools closed before it finished".to_string(),
     };
     worker.audit = Some(format!(
@@ -1585,7 +1585,7 @@ fn settle(worker: &mut Worker, ended: Ended) -> (&'static str, String) {
             worker.final_text = final_reply(&text);
             worker.state = State::Stuck;
             let line = format!(
-                "stopped by Claude; it ended: {}{}",
+                "stopped by Zen; it ended: {}{}",
                 first_line(&worker.final_text, 200),
                 cite(worker)
             );
@@ -1628,7 +1628,7 @@ fn settle(worker: &mut Worker, ended: Ended) -> (&'static str, String) {
 
 /// Settle Zen's side of a chat on how its turn `ended`: `done` with its reply —
 /// a closed loop's text still its reply, and a question block no question,
-/// since Zen asks Claude in the chat itself — or `error`. The line is for no
+/// since Zen asks its caller in the chat itself — or `error`. The line is for no
 /// journal: a chat's thread keeps none ([`note`]).
 fn settle_chat(worker: &mut Worker, ended: Ended) -> (&'static str, String) {
     worker.stopped = ended.stopped();
@@ -2211,21 +2211,21 @@ mod tests {
         assert_eq!((w.state, label), (State::Stuck, "Task stuck:"));
         assert!(!w.stopped);
 
-        // **A stopped worker is live, and says Claude stopped it**: stuck,
+        // **A stopped worker is live, and says Zen stopped it**: stuck,
         // so `repo_task_reply` redirects it.
         let mut w = worker();
         let (label, line) = settle(
             &mut w,
             Ended::Closed {
                 text: "Found v2 only.".into(),
-                by: CLOSED_BY_CLAUDE,
+                by: CLOSED_BY_CALLER,
             },
         );
         assert_eq!((w.state, label), (State::Stuck, "Task stopped:"));
         assert!(w.stopped && w.state.live());
         assert_eq!(
             line,
-            "stopped by Claude; it ended: Found v2 only. (T:review/verify#2)"
+            "stopped by Zen; it ended: Found v2 only. (T:review/verify#2)"
         );
 
         let mut w = worker();
@@ -2271,7 +2271,7 @@ mod tests {
     }
 
     /// **Zen's side of a chat settles done with its reply, never as a
-    /// question** — Zen asks Claude in the chat itself — and its message ends
+    /// question** — Zen asks its caller in the chat itself — and its message ends
     /// with no question block; resumed, it is told the message it was
     /// answering, not a task.
     #[test]
@@ -2297,7 +2297,7 @@ mod tests {
             &mut w,
             Ended::Closed {
                 text: "About 30 GiB.".into(),
-                by: CLOSED_BY_CLAUDE,
+                by: CLOSED_BY_CALLER,
             },
         );
         assert_eq!((w.state, w.stopped), (State::Done, true));
@@ -2325,10 +2325,10 @@ mod tests {
             kind: WorkerKind::Chat,
             ..worker()
         };
-        note(&r, "o", &chat, "Claude started:", "hello".into()).unwrap();
+        note(&r, "o", &chat, "Zen started:", "hello".into()).unwrap();
         assert_eq!(threads::note_count(&r, "o", "~0123456789abcdef"), 0);
         let task = worker();
-        note(&r, "o", &task, "Claude started:", "verify".into()).unwrap();
+        note(&r, "o", &task, "Zen started:", "verify".into()).unwrap();
         assert_eq!(threads::note_count(&r, "o", &task.thread), 1);
     }
 

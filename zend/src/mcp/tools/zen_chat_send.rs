@@ -4,6 +4,7 @@
 
 use serde_json::{json, Value};
 
+use super::mem::channel_of;
 use super::{string, wait_secs, Answer, Ctx};
 use crate::mcp::chats::naming::checked_id;
 use crate::mcp::chats::talk::{self, render};
@@ -67,7 +68,8 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         (Ok(e), Ok(on)) => (e, on),
         (Err(e), _) | (_, Err(e)) => return Answer::error(e),
     };
-    let sent = match talk::send(&ctx.session, &ctx.caller, on, text, effort) {
+    let channel = channel_of(ctx.mcp.client);
+    let sent = match talk::send(&ctx.session, &ctx.caller, channel, on, text, effort) {
         Ok(s) => s,
         Err(e) => return Answer::error(e),
     };
