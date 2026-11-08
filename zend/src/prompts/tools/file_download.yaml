@@ -10,6 +10,14 @@ questions:
 - copy the file at that address into the repository
 - I need that dataset file in the repo, not summarised
 - add the logo from this URL to the site
+- download the release asset into vendor/
+- pull the PDF at that address into docs/
+- store the generated image under the library folder
+- save the icon pack from the CDN alongside the others
+- the sample file is at this link, put it in the test fixtures
+- bring the upstream licence file into the repo as it is
+- download the font files into the app
+- keep a copy of that JSON schema in the repository
 category: Files
 description: 'Download what a public URL serves into a file of the repository — a picture, a font, a library, a raw file from another repository — without reading it into the conversation. Use it instead of web_fetch or http_request plus write whenever the file itself is wanted, binary or text. Answers the file''s size, SHA-256 and type, never its bytes; the file is committed with the rest of your changes. At most 8 MiB, 30 seconds, five redirects; private and local addresses are refused. Triggered by "download this into", "save the picture at", "put that file in the repo", "vendor this library".'
 parameters:

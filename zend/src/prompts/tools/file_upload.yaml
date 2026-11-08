@@ -8,6 +8,14 @@ questions:
 - send the file in the repo to this address without reading it out
 - upload the exported CSV to the form's endpoint
 - put the binary at the presigned link they gave us
+- send the built wasm bundle to the CDN's upload endpoint
+- upload the log archive to the support ticket's link
+- push the rendered image to the host that serves it
+- send the release zip to the distribution server
+- PUT the config file to that service's settings URL
+- upload the dataset file from the repo to their importer
+- send the screenshot in the repo to the upload link
+- post the PDF in docs to the review service
 category: Files
 high_risk: true
 description: 'Send a file of the repository to a public URL by PUT (the default) or POST, without reading it into the conversation — a built artefact to a release host, a picture to a service that takes uploads. Answers the server''s status and the first 4 KiB of its answer. Private and local addresses are refused; 60 seconds at most. For calls that need a sign-in or cookies use http_session_*.'
