@@ -21,7 +21,7 @@
 //! console shows an engine that is present and broken rather than absent. The
 //! loader logs what failed and exits the process.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -3724,35 +3724,47 @@ impl Runtime {
     /// Once: a second cast would be the second writable handle this exists to
     /// rule out, so installing one over another panics.
     ///
-    /// The scheduler takes the cast's frozen characters from it here, before any
-    /// character is woken, so one frozen before a restart is frozen on its first
-    /// moment after it.
+    /// The scheduler takes the cast's suspended characters from it here,
+    /// before any character is woken, so one suspended before a restart is
+    /// suspended on its first moment after it.
     pub fn set_npcs(&self, npcs: Arc<Npcs>) {
         assert!(
             self.npcs.set(npcs).is_ok(),
             "the cast is installed once, at startup"
         );
-        self.follow_frozen();
+        self.follow_suspended();
     }
 
-    /// Bring the scheduler's frozen characters to what the cast's records say
-    /// — after this member writes a freeze, and after the cast takes in records
-    /// written on other members, so every member holds the same characters
-    /// still.
-    pub fn follow_frozen(&self) {
+    /// Bring the scheduler's suspended characters to what the cast's records
+    /// say — after this member writes a suspension or a state edit, and after
+    /// the cast takes in records written on other members, so every member
+    /// holds the same characters still.
+    pub fn follow_suspended(&self) {
         let Some(npcs) = self.npcs() else {
             return;
         };
-        for (npc, frozen) in self.scheduler.follow_frozen(npcs.view().frozen()) {
-            if frozen {
+        for (npc, suspended) in self.scheduler.follow_suspended(npcs.view().suspended()) {
+            if suspended {
                 tracing::info!(
                     npc,
-                    "character frozen: it takes no turn until it is unfrozen"
+                    "character suspended: it takes no turn until it is resumed"
                 );
             } else {
-                tracing::info!(npc, "character unfrozen: it thinks again");
+                tracing::info!(npc, "character resumed: it thinks again");
             }
         }
+    }
+
+    /// The bodies in world `world` whose characters are suspended — the ones
+    /// whose round missions' clocks stand still (`RoundState::hold`).
+    pub fn suspended_bodies(&self, world: &str) -> BTreeSet<String> {
+        self.scheduler
+            .suspended()
+            .into_iter()
+            .filter_map(|npc| self.bodies.bound(npc))
+            .filter(|at| at.world == world)
+            .map(|at| at.body)
+            .collect()
     }
 
     /// The shared cast, for the effector bridge. `None` on a test path that
@@ -3835,8 +3847,8 @@ impl Runtime {
         sampled_axes: &[String],
         on_reflection: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> anyhow::Result<reflect::Reflection> {
-        if self.scheduler.is_frozen(npc_id) {
-            anyhow::bail!("npc {npc_id} is frozen, and reflects on nothing until it is unfrozen");
+        if self.scheduler.is_suspended(npc_id) {
+            anyhow::bail!("npc {npc_id} is suspended, and reflects on nothing until it is resumed");
         }
         let who = self
             .persona_of_async(npc_id)
@@ -3894,8 +3906,8 @@ impl Runtime {
     /// Dream a brief and keep the dream. Logged, never returned: nobody is
     /// waiting on it, and a dream that did not land costs a dream.
     async fn dream_now(&self, npc_id: u64, brief: &str, assumption: &str) {
-        if self.scheduler.is_frozen(npc_id) {
-            tracing::info!("npc {npc_id}: frozen, so this brief is not dreamt");
+        if self.scheduler.is_suspended(npc_id) {
+            tracing::info!("npc {npc_id}: suspended, so this brief is not dreamt");
             return;
         }
         let started = Instant::now();
@@ -3932,8 +3944,8 @@ impl Runtime {
         brief: &str,
         assumption: &str,
     ) -> anyhow::Result<crate::engine::dreams::Kept> {
-        if self.scheduler.is_frozen(npc_id) {
-            anyhow::bail!("npc {npc_id} is frozen, and dreams nothing until it is unfrozen");
+        if self.scheduler.is_suspended(npc_id) {
+            anyhow::bail!("npc {npc_id} is suspended, and dreams nothing until it is resumed");
         }
         let minds = self
             .minds
@@ -3963,9 +3975,9 @@ impl Runtime {
     /// Start a draft of the stretch waiting in `npc_id`'s journal, as a task of
     /// its own. `false` when there is no stretch to draft: another draft is
     /// running, the stretch was taken since the guardian looked, or the
-    /// character is frozen.
+    /// character is suspended.
     pub fn draft_journal(self: &Arc<Self>, npc_id: u64) -> bool {
-        if self.scheduler.is_frozen(npc_id) {
+        if self.scheduler.is_suspended(npc_id) {
             return false;
         }
         let Some(due) = self.scheduler.journal_begin(npc_id) else {
@@ -4312,8 +4324,8 @@ impl Runtime {
         question: &str,
         choices: &[String],
     ) -> anyhow::Result<Answer> {
-        if self.scheduler.is_frozen(npc_id) {
-            anyhow::bail!("npc {npc_id} is frozen, and answers nothing until it is unfrozen");
+        if self.scheduler.is_suspended(npc_id) {
+            anyhow::bail!("npc {npc_id} is suspended, and answers nothing until it is resumed");
         }
         let minds = self
             .minds

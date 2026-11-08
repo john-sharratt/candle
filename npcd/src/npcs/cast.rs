@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use web::auth::session::Identity;
 
-use super::{npc_id_wire, wire, Casting, Filter, NpcError};
+use super::{npc_id_wire, wire, Casting, Filter, NpcError, SUSPENDED};
 
 /// The whole cast, including tombstoned characters.
 ///
@@ -172,12 +172,12 @@ impl Cast {
             .and_then(|n| n.mood.as_deref())
     }
 
-    /// Every living character that is frozen, whoever owns it — what the
-    /// scheduler holds still (`Scheduler::follow_frozen`).
-    pub fn frozen(&self) -> HashSet<u64> {
+    /// Every living character that is suspended, whoever owns it — what the
+    /// scheduler holds still (`Scheduler::follow_suspended`).
+    pub fn suspended(&self) -> HashSet<u64> {
         self.by_id
             .values()
-            .filter(|n| n.frozen && !n.is_tombstoned())
+            .filter(|n| n.state == SUSPENDED)
             .map(|n| n.npc_id)
             .collect()
     }

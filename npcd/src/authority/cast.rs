@@ -61,15 +61,15 @@ impl Runtime {
     /// Take in characters created, changed or deleted on other members. The
     /// cast replicates as records; every member embodies every character of
     /// the worlds it hosts, in its own copy of the world, so each world's
-    /// authority can lend it and each member can see it. A character frozen or
-    /// unfrozen elsewhere is held or let go here as its record arrives.
+    /// authority can lend it and each member can see it. A character suspended
+    /// or resumed elsewhere is held or let go here as its record arrives.
     pub(crate) async fn follow_cast(self: &Arc<Self>) {
         let Some(npcs) = self.npcs() else {
             return;
         };
         let changed = npcs.refresh();
         if !changed.is_empty() {
-            self.follow_frozen();
+            self.follow_suspended();
         }
         let cast = npcs.view();
         for npc in changed {

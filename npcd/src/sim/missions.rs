@@ -551,11 +551,18 @@ impl Missions {
         self.round.stamp(now_ms);
     }
 
+    /// Hold the round missions of the bodies in `suspended` — those whose
+    /// characters are suspended — and let the rest go (`RoundState::hold`).
+    pub fn hold_round(&mut self, suspended: &BTreeSet<String>, now_ms: u64) {
+        self.round.hold(suspended, now_ms);
+    }
+
     /// Close every mission worked on an agenda whose steps are all signed off,
     /// as done, and call off as failed every round mission carried
     /// [`STALE_MS`] without — an agenda is closed by what the engine saw, with
-    /// no report (`docs/zen_moon_mind.md` §17.5). Returns each body closed, the
-    /// mission's title, and how.
+    /// no report (`docs/zen_moon_mind.md` §17.5). A body held suspended
+    /// ([`Self::hold_round`]) is not called off: its clock stands still.
+    /// Returns each body closed, the mission's title, and how.
     pub fn settle_agendas(&mut self, now_ms: u64) -> Vec<(String, String, Outcome)> {
         let closing: Vec<(String, String, Outcome)> = self
             .active
@@ -563,6 +570,7 @@ impl Missions {
             .filter_map(|(body, m)| {
                 let title = m.agendum.as_ref()?.title.clone();
                 let stale = matches!(m.origin, Origin::Round { .. })
+                    && !self.round.is_held(body)
                     && self
                         .round
                         .set_at(body)

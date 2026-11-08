@@ -143,11 +143,13 @@ export const LiveAPI = {
   deleteNpc: (id) => j(`/v1/npc/${id}`, { method: 'DELETE' }),
   setTags:   (id, tags) => j(`/v1/npc/${id}/tags`, { method: 'PUT', body: { tags } }),
   setHidden: (id, hidden) => j(`/v1/npc/${id}/hidden`, { method: 'PUT', body: { hidden } }),
-  /* A frozen character takes no turn of any kind until unfrozen. One answers
-   * with the character as it now stands; all of them — every character the
-   * caller may manage, the whole cast for an admin — with `{frozen, changed}`. */
-  setFrozen:    (id, frozen) => j(`/v1/npc/${id}/freeze`, { method: 'POST', body: { frozen } }),
-  setAllFrozen: (frozen) => j('/v1/npcs/freeze', { method: 'POST', body: { frozen } }),
+  /* A suspended character takes no turn of any kind until it is resumed. One
+   * answers with the character as it now stands; all of them — every
+   * character the caller may manage, the whole cast for an admin — with
+   * `{suspended, changed}`. Resuming all of them resumes only those that
+   * suspending all of them suspended. */
+  setSuspended:    (id, suspended) => j(`/v1/npc/${id}/suspend`, { method: 'POST', body: { suspended } }),
+  setAllSuspended: (suspended) => j('/v1/npcs/suspend', { method: 'POST', body: { suspended } }),
   /* Admin: every living character with its owner, the accounts one can be
    * handed to, and the caller's own id — `{me, accounts, npcs}`. */
   getOwners: () => j('/v1/npcs/owners'),

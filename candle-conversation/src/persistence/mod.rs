@@ -255,7 +255,7 @@ pub(crate) fn test_npc(id: u64, name: &str) -> NpcPayload {
         portrait_origin: None,
         at: None,
         mood: None,
-        frozen: false,
+        suspended_from: None,
         beliefs: Vec::new(),
         relationships: Vec::new(),
         agency: Vec::new(),

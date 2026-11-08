@@ -57,7 +57,6 @@ use crate::discord::trace::route as discord_trace;
 use crate::drafts::routes as drafts;
 use crate::drafts::{caller, records, Author};
 use crate::engine::runtime::{OwnedPersona, Runtime};
-use crate::freeze;
 use crate::guest_routes;
 use crate::identity::require;
 use crate::image_links::{ImageLinks, Refused};
@@ -81,6 +80,7 @@ use crate::refimage;
 use crate::registry::authored::{PERSONALITIES, WORLDS};
 use crate::registry::{self, PutError, Record, Registry};
 use crate::sim::shelf::{Published, Shelf};
+use crate::suspend;
 use crate::visibility;
 use crate::world_state::renamed;
 use host::guard::Api;
@@ -738,22 +738,23 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             character(),
             put(put_npc_hidden),
         )
-        // Freezing: a frozen character takes no turn of any kind until it is
-        // unfrozen (`crate::freeze`). One character goes to the member running
-        // it, so its own scheduler holds it at once; the whole cast goes to
-        // any member, and the others follow the records it writes. `User`
-        // plus the ownership check inside, which an admin passes for any.
+        // Suspending: a suspended character takes no turn of any kind until it
+        // is resumed (`crate::suspend`). One character goes to the member
+        // running it, so its own scheduler holds it at once; the whole cast
+        // goes to any member, and the others follow the records it writes.
+        // `User` plus the ownership check inside, which an admin passes for
+        // any.
         .route(
-            "/v1/npc/:nid/freeze",
+            "/v1/npc/:nid/suspend",
             Role::User,
             character(),
-            post(freeze::post_freeze),
+            post(suspend::post_suspend),
         )
         .route(
-            "/v1/npcs/freeze",
+            "/v1/npcs/suspend",
             Role::User,
             Dispatch::Best,
-            post(freeze::post_freeze_all),
+            post(suspend::post_suspend_all),
         )
         // The authoring plane (§16). `User` is the bar; ownership is the rest
         // of the answer and is checked per record.
@@ -1062,7 +1063,11 @@ async fn import_npcs(State(s): State<Arc<Authored>>, Json(body): Json<Value>) ->
             }
         };
     match s.npcs.import(payloads) {
-        Ok(n) => Json(json!({ "imported": n })).into_response(),
+        Ok(n) => {
+            // A restored record may be suspended.
+            suspend::follow(&s);
+            Json(json!({ "imported": n })).into_response()
+        }
         Err(e) => {
             tracing::error!(error = ?e, "npc import failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "import failed").into_response()
@@ -1240,7 +1245,7 @@ async fn post_reflect(
     if let Err(e) = s.npcs.view().get(npc_id, &owner) {
         return npc_err(e);
     }
-    if let Some(r) = freeze::frozen(&s, npc_id) {
+    if let Some(r) = suspend::refused(&s, npc_id) {
         return r;
     }
 
@@ -1357,7 +1362,7 @@ async fn post_dream(
             return npc_err(e);
         }
     }
-    if let Some(r) = freeze::frozen(&s, npc_id) {
+    if let Some(r) = suspend::refused(&s, npc_id) {
         return r;
     }
 
@@ -1595,6 +1600,8 @@ async fn patch_npc(
     };
     match s.npcs.patch(npc_id, &owner, &body, now_ms()) {
         Ok(mut v) => {
+            // A state edit may suspend or resume it.
+            suspend::follow(&s);
             name_personality(&mut v, &*s.personalities.read().await);
             Json(v).into_response()
         }
@@ -4219,11 +4226,11 @@ mod tests {
                 ("/v1/npc/:nid", "user"),
                 ("/v1/npc/:nid/tags", "user"),
                 ("/v1/npc/:nid/hidden", "user"),
-                // Freezing one character, and every character the caller may
-                // manage: `user` plus the ownership check inside, which an
+                // Suspending one character, and every character the caller
+                // may manage: `user` plus the ownership check inside, which an
                 // admin passes for any character.
-                ("/v1/npc/:nid/freeze", "user"),
-                ("/v1/npcs/freeze", "user"),
+                ("/v1/npc/:nid/suspend", "user"),
+                ("/v1/npcs/suspend", "user"),
                 // The authoring plane. Every one of these is a write to the
                 // caller's own character, so `user` plus the ownership check
                 // inside — never `admin`, which would mean an operator could
@@ -4651,14 +4658,15 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 
-    /// **Freezing, through the routes.** An owner freezes their own character
-    /// and a stranger cannot; the listing says which are frozen; a frozen
-    /// character's model is not run by the routes that decode for it; the
-    /// whole-cast route counts what it changed and reaches everybody's for an
-    /// admin; and the state comes back off the log after a restart.
+    /// **Suspending, through the routes.** An owner suspends their own
+    /// character and a stranger cannot; the listing says which are suspended;
+    /// a suspended character's model is not run by the routes that decode for
+    /// it; the whole-cast route counts what it changed and reaches everybody's
+    /// for an admin; the state comes back off the log after a restart; and
+    /// resuming the whole cast resumes only what suspending it suspended.
     #[tokio::test]
-    async fn characters_are_frozen_and_unfrozen_through_the_routes() {
-        let dir = tmp("freeze");
+    async fn characters_are_suspended_and_resumed_through_the_routes() {
+        let dir = tmp("suspend");
         let st = state(dir.clone());
         let (a, b) = ("google-1", "google-2");
         sign_in(&st, a).await;
@@ -4679,7 +4687,7 @@ mod tests {
             )
             .await;
             assert_eq!(s, StatusCode::CREATED, "{npc}");
-            assert_eq!(npc["frozen"], false, "a new character runs");
+            assert_eq!(npc["state"], "idle", "a new character runs");
             ids.push(npc["npc_id"].as_str().unwrap().to_string());
         }
         let (varek, ilse, wren) = (&ids[0], &ids[1], &ids[2]);
@@ -4687,20 +4695,20 @@ mod tests {
         // A body without the flag says what it wants.
         let (s, e) = call(
             router(st.clone()),
-            send(&format!("/v1/npc/{varek}/freeze"), "POST", a, json!({})),
+            send(&format!("/v1/npc/{varek}/suspend"), "POST", a, json!({})),
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
-        assert_eq!(e["error"], "frozen_missing");
+        assert_eq!(e["error"], "suspended_missing");
 
         // A stranger's character is absent, never forbidden.
         let (s, _) = call(
             router(st.clone()),
             send(
-                &format!("/v1/npc/{wren}/freeze"),
+                &format!("/v1/npc/{wren}/suspend"),
                 "POST",
                 a,
-                json!({ "frozen": true }),
+                json!({ "suspended": true }),
             ),
         )
         .await;
@@ -4709,36 +4717,39 @@ mod tests {
         let (s, npc) = call(
             router(st.clone()),
             send(
-                &format!("/v1/npc/{varek}/freeze"),
+                &format!("/v1/npc/{varek}/suspend"),
                 "POST",
                 a,
-                json!({ "frozen": true }),
+                json!({ "suspended": true }),
             ),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{npc}");
-        assert_eq!(npc["frozen"], true);
+        assert_eq!(npc["state"], "suspended");
         assert_eq!(npc["npc_id"], json!(varek));
 
         let (_, list) = call(router(st.clone()), get("/v1/npc", Some(a))).await;
-        let mut frozen: Vec<(String, bool)> = list["items"]
+        let mut states: Vec<(String, String)> = list["items"]
             .as_array()
             .unwrap()
             .iter()
             .map(|n| {
                 (
                     n["name"].as_str().unwrap().to_string(),
-                    n["frozen"].as_bool().unwrap(),
+                    n["state"].as_str().unwrap().to_string(),
                 )
             })
             .collect();
-        frozen.sort();
+        states.sort();
         assert_eq!(
-            frozen,
-            vec![("Ilse".to_string(), false), ("Varek".to_string(), true)]
+            states,
+            vec![
+                ("Ilse".to_string(), "idle".to_string()),
+                ("Varek".to_string(), "suspended".to_string())
+            ]
         );
 
-        // The routes that run the model refuse a frozen character outright.
+        // The routes that run the model refuse a suspended character outright.
         let (s, e) = call(
             router(st.clone()),
             send(
@@ -4750,7 +4761,7 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::CONFLICT, "{e}");
-        assert_eq!(e["error"], "npc_frozen");
+        assert_eq!(e["error"], "npc_suspended");
         let (s, e) = call(
             router(st.clone()),
             send(
@@ -4762,59 +4773,83 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::CONFLICT, "{e}");
-        assert_eq!(e["error"], "npc_frozen");
+        assert_eq!(e["error"], "npc_suspended");
 
         // The caller's whole cast: one more changed, and the stranger's runs on.
         let (s, v) = call(
             router(st.clone()),
-            send("/v1/npcs/freeze", "POST", a, json!({ "frozen": true })),
+            send("/v1/npcs/suspend", "POST", a, json!({ "suspended": true })),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
-        assert_eq!(v, json!({ "frozen": true, "changed": 1 }));
+        assert_eq!(v, json!({ "suspended": true, "changed": 1 }));
         let (_, w) = call(router(st.clone()), get(&format!("/v1/npc/{wren}"), Some(b))).await;
-        assert_eq!(w["frozen"], false);
+        assert_eq!(w["state"], "idle");
 
         // An admin's reaches everybody's.
         let (s, v) = call(
             router(st.clone()),
-            send("/v1/npcs/freeze", "POST", ADMIN, json!({ "frozen": true })),
+            send(
+                "/v1/npcs/suspend",
+                "POST",
+                ADMIN,
+                json!({ "suspended": true }),
+            ),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
-        assert_eq!(v, json!({ "frozen": true, "changed": 1 }));
+        assert_eq!(v, json!({ "suspended": true, "changed": 1 }));
         let (s, npc) = call(
             router(st.clone()),
             send(
-                &format!("/v1/npc/{ilse}/freeze"),
+                &format!("/v1/npc/{ilse}/suspend"),
                 "POST",
                 ADMIN,
-                json!({ "frozen": false }),
+                json!({ "suspended": false }),
             ),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{npc}");
-        assert_eq!(npc["frozen"], false);
+        assert_eq!(npc["state"], "idle");
 
         // A restart keeps every one of them as it was left.
         drop(st);
         let again = state(dir);
-        for (id, who, want) in [(varek, a, true), (ilse, a, false), (wren, b, true)] {
+        for (id, who, want) in [
+            (varek, a, "suspended"),
+            (ilse, a, "idle"),
+            (wren, b, "suspended"),
+        ] {
             let (s, npc) = call(
                 router(again.clone()),
                 get(&format!("/v1/npc/{id}"), Some(who)),
             )
             .await;
             assert_eq!(s, StatusCode::OK, "{npc}");
-            assert_eq!(npc["frozen"], want, "{}", npc["name"]);
+            assert_eq!(npc["state"], want, "{}", npc["name"]);
         }
+        // Resuming the whole cast puts back what suspending it suspended, and
+        // leaves the one its owner suspended on its own as it is.
         let (s, v) = call(
-            router(again),
-            send("/v1/npcs/freeze", "POST", ADMIN, json!({ "frozen": false })),
+            router(again.clone()),
+            send(
+                "/v1/npcs/suspend",
+                "POST",
+                ADMIN,
+                json!({ "suspended": false }),
+            ),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
-        assert_eq!(v, json!({ "frozen": false, "changed": 2 }));
+        assert_eq!(v, json!({ "suspended": false, "changed": 1 }));
+        for (id, who, want) in [(varek, a, "suspended"), (wren, b, "idle")] {
+            let (_, npc) = call(
+                router(again.clone()),
+                get(&format!("/v1/npc/{id}"), Some(who)),
+            )
+            .await;
+            assert_eq!(npc["state"], want, "{}", npc["name"]);
+        }
     }
 
     /// **Hidden worlds, and the whole word that reveals them.**

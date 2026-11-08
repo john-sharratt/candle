@@ -9,11 +9,12 @@
  * on the page to move one badge, and it would do it under the reader's cursor
  * while they are trying to click something.
  *
- * Freezing: a frozen character takes no turn of any kind — no decode at all —
- * until it is unfrozen, which is how the cast's load comes off the card. Each
- * row freezes or unfreezes its own character in place; "Freeze all" and
- * "Unfreeze all" reach every character the caller may manage (the whole cast,
- * for an admin) and re-list. */
+ * Suspending: a suspended character takes no turn of any kind — no decode at
+ * all — until it is resumed, which is how the cast's load comes off the card.
+ * Each row suspends or resumes its own character in place; "Suspend all" and
+ * "Resume all" reach every character the caller may manage (the whole cast,
+ * for an admin) and re-list. Resume all puts each character back in the state
+ * Suspend all found it in, and leaves one suspended on its own suspended. */
 
 import { API } from '../lib/api.js';
 import { h, mount, ago } from '/common/lib/dom.js';
@@ -52,19 +53,19 @@ export async function render() {
 
   /* The whole cast at once. One request either way, and a re-list after it:
    * every row on the page may have changed, and some the filter hides. */
-  let freezingAll = false;
-  async function freezeAll(frozen) {
-    if (freezingAll) return;
-    freezingAll = true;
+  let suspendingAll = false;
+  async function suspendAll(suspended) {
+    if (suspendingAll) return;
+    suspendingAll = true;
     try {
-      const r = await API.setAllFrozen(frozen);
+      const r = await API.setAllSuspended(suspended);
       const n = r.changed;
-      toast(`${n} character${n === 1 ? '' : 's'} ${frozen ? 'frozen' : 'unfrozen'}`, 'ok');
+      toast(`${n} character${n === 1 ? '' : 's'} ${suspended ? 'suspended' : 'resumed'}`, 'ok');
       await refresh();
     } catch (e) {
       toast(e.detail || e.message || String(e), 'err');
     }
-    freezingAll = false;
+    suspendingAll = false;
   }
 
   el.appendChild(h('div', { class: 'hd' },
@@ -73,14 +74,14 @@ export async function render() {
     h('div', { class: 'row', style: 'gap:6px' },
       h('button', {
         class: 'btn sm',
-        title: 'Stop every character you manage taking turns — no decode at all until unfrozen',
-        onClick: () => freezeAll(true),
-      }, 'Freeze all'),
+        title: 'Stop every character you manage taking turns — no decode at all until resumed',
+        onClick: () => suspendAll(true),
+      }, 'Suspend all'),
       h('button', {
         class: 'btn sm',
-        title: 'Let every character you manage think again',
-        onClick: () => freezeAll(false),
-      }, 'Unfreeze all'),
+        title: 'Let every character Suspend all stopped think again, in the state it was in',
+        onClick: () => suspendAll(false),
+      }, 'Resume all'),
       link('/npc/new', { class: 'btn primary' }, '+ New NPC'))));
 
   /* ── the conversations you are in ──────────────────────────────────────────
@@ -149,6 +150,8 @@ export async function render() {
           n.monitor = { overlap: ev.overlap ?? n.monitor?.overlap, band: ev.band || n.monitor?.band };
         }
         swap(nodes, 'dot', stateDot(n.state));
+        if (nodes.suspended) swap(nodes, 'suspended', suspendedChip(n));
+        if (nodes.suspend) swap(nodes, 'suspend', suspendBtn(n, nodes));
         swap(nodes, 'pend', pending(n.tick?.pending_events ?? null));
         swap(nodes, 'band', bandChip(n.monitor?.band ?? null));
         if (nodes.meta) nodes.meta.textContent = metaLine(n);
@@ -164,38 +167,42 @@ export async function render() {
     nodes[key] = next;
   }
 
-  /* The frozen badge, or an empty placeholder where it would go, so the row
-   * has a node to swap either way. */
-  const frozenChip = (n) => n.frozen
-    ? h('span', { class: 'chip accent', title: 'Frozen — takes no turn until it is unfrozen' }, 'frozen')
+  const isSuspended = (n) => n.state === 'suspended';
+
+  /* The suspended badge, or an empty placeholder where it would go, so the
+   * row has a node to swap either way. */
+  const suspendedChip = (n) => isSuspended(n)
+    ? h('span', { class: 'chip accent', title: 'Suspended — takes no turn until it is resumed' }, 'suspended')
     : h('span', {});
 
-  /* A row's own Freeze / Unfreeze. It answers with the character as it now
-   * stands, so the badge and the button are swapped in place. */
-  function freezeBtn(n, nodes) {
+  /* A row's own Suspend / Resume. It answers with the character as it now
+   * stands, so the dot, the badge and the button are swapped in place. */
+  function suspendBtn(n, nodes) {
     return h('button', {
       class: 'btn sm ghost',
-      title: n.frozen
+      title: isSuspended(n)
         ? 'Let this character think again'
-        : 'Stop this character taking turns — no decode at all until it is unfrozen',
+        : 'Stop this character taking turns — no decode at all until it is resumed',
       onClick: async (e) => {
         e.stopPropagation();
         try {
-          const v = await API.setFrozen(n.npc_id, !n.frozen);
-          n.frozen = !!v.frozen;
-          swap(nodes, 'frozen', frozenChip(n));
-          swap(nodes, 'freeze', freezeBtn(n, nodes));
+          const v = await API.setSuspended(n.npc_id, !isSuspended(n));
+          n.state = v.state;
+          swap(nodes, 'dot', stateDot(n.state));
+          swap(nodes, 'suspended', suspendedChip(n));
+          swap(nodes, 'suspend', suspendBtn(n, nodes));
+          if (nodes.meta) nodes.meta.textContent = metaLine(n);
         } catch (err) {
           toast(err.detail || err.message || String(err), 'err');
         }
       },
-    }, n.frozen ? 'Unfreeze' : 'Freeze');
+    }, isSuspended(n) ? 'Resume' : 'Suspend');
   }
 
   /* The badge and the button, added to a row's tracked nodes. */
-  function withFreeze(n, nodes) {
-    nodes.frozen = frozenChip(n);
-    nodes.freeze = freezeBtn(n, nodes);
+  function withSuspend(n, nodes) {
+    nodes.suspended = suspendedChip(n);
+    nodes.suspend = suspendBtn(n, nodes);
     return nodes;
   }
 
@@ -222,7 +229,7 @@ export async function render() {
   function rows(items) {
     // One surface with hairline dividers — not a stack of bordered boxes.
     return h('div', { class: 'list' }, items.map((n) => {
-      const p = withFreeze(n, track(n, {
+      const p = withSuspend(n, track(n, {
         dot: stateDot(n.state),
         // No `|| 0` / `|| 'healthy'`: both are engine measurements, and a
         // character the engine has never run has neither. The helpers render
@@ -239,15 +246,15 @@ export async function render() {
             h('span', { class: 'npc-name' }, n.name),
             h('span', { class: 'chip' }, n.personality_name || n.personality_id),
             n.access && n.access !== 'owner' ? h('span', { class: 'chip' }, n.access) : null,
-            p.frozen),
+            p.suspended),
           p.meta),
-        h('div', { class: 'row', style: 'gap:10px' }, p.pend, p.band, p.freeze));
+        h('div', { class: 'row', style: 'gap:10px' }, p.pend, p.band, p.suspend));
     }));
   }
 
   function cards(items) {
     return h('div', { class: 'cards' }, items.map((n) => {
-      const p = withFreeze(n, track(n, {
+      const p = withSuspend(n, track(n, {
         dot: stateDot(n.state),
         // No `|| 0` / `|| 'healthy'`: both are engine measurements, and a
         // character the engine has never run has neither. The helpers render
@@ -258,9 +265,9 @@ export async function render() {
       return h('div', { class: 'npc-card', onClick: () => go('/npc/' + n.npc_id) },
         h('div', { class: 'art' }, (n.name || '?')[0]),
         h('div', { class: 'meta' },
-          h('div', { class: 'row', style: 'gap:6px' }, p.dot, h('span', { class: 'npc-name' }, n.name), p.frozen),
+          h('div', { class: 'row', style: 'gap:6px' }, p.dot, h('span', { class: 'npc-name' }, n.name), p.suspended),
           h('div', { class: 'npc-meta' }, n.personality_name || ''),
-          h('div', { class: 'row', style: 'gap:8px;margin-top:8px' }, p.pend, p.band, p.freeze)));
+          h('div', { class: 'row', style: 'gap:8px;margin-top:8px' }, p.pend, p.band, p.suspend)));
     }));
   }
 

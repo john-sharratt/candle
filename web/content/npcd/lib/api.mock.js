@@ -480,11 +480,26 @@ export const MockAPI = {
   async deleteNpc(id) { const i = NPCS.findIndex((x) => x.npc_id === id); if (i >= 0) NPCS.splice(i, 1); return null; },
   async setTags(id, tags) { (await this.getNpc(id)).tags = tags; return { ok: true }; },
   async setHidden(id, hidden) { (await this.getNpc(id)).hidden = hidden; return { ok: true }; },
-  async setFrozen(id, frozen) { const n = await this.getNpc(id); n.frozen = frozen; return n; },
-  async setAllFrozen(frozen) {
-    const moved = NPCS.filter((n) => !!n.frozen !== frozen);
-    moved.forEach((n) => { n.frozen = frozen; });
-    return { frozen, changed: moved.length };
+  /* As the daemon does it: one character's Resume puts back what suspending
+   * the whole cast found it in, or `idle`; resuming the whole cast resumes
+   * only those that suspending it suspended. */
+  async setSuspended(id, suspended) {
+    const n = await this.getNpc(id);
+    if ((n.state === 'suspended') !== suspended) {
+      n.state = suspended ? 'suspended' : (n.suspended_from || 'idle');
+      delete n.suspended_from;
+    }
+    return n;
+  },
+  async setAllSuspended(suspended) {
+    const moved = NPCS.filter((n) => (suspended
+      ? n.state !== 'suspended' && n.state !== 'tombstoned'
+      : n.state === 'suspended' && n.suspended_from));
+    moved.forEach((n) => {
+      if (suspended) { n.suspended_from = n.state; n.state = 'suspended'; }
+      else { n.state = n.suspended_from; delete n.suspended_from; }
+    });
+    return { suspended, changed: moved.length };
   },
   async getOwners() {
     await sleep(40);

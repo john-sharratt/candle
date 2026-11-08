@@ -475,4 +475,35 @@ mod tests {
         assert_eq!(closed[0].2, Outcome::Fail);
         assert_eq!(m.round().failed_at("watch-earth"), Some(None));
     }
+
+    /// **A round mission whose character was suspended longer than the hour
+    /// is not called off for it**: not while it is held, and on its resume the
+    /// hour picks up where it stood, so only time it could work counts.
+    #[test]
+    fn a_suspension_longer_than_the_hour_does_not_call_a_mission_off() {
+        use std::collections::BTreeSet;
+
+        use crate::sim::missions::Missions;
+
+        let held = BTreeSet::from(["zen".to_string()]);
+        let mut m = Missions::default();
+        m.set_unordered("zen", true);
+        m.set_round(round());
+        m.take_round("zen", round()[2].mission(), "watch earth", 0);
+        m.hold_round(&held, 1_000);
+        assert!(
+            m.settle_agendas(3 * STALE_MS).is_empty(),
+            "called off while it was suspended"
+        );
+        m.hold_round(&BTreeSet::new(), 3 * STALE_MS);
+        assert!(
+            m.settle_agendas(3 * STALE_MS).is_empty(),
+            "the suspension counted against it"
+        );
+        // 1,000 ms of its hour ran before it was held; the rest runs now.
+        assert!(m.settle_agendas(4 * STALE_MS - 1_001).is_empty());
+        let closed = m.settle_agendas(4 * STALE_MS - 1_000);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].2, Outcome::Fail);
+    }
 }

@@ -49,6 +49,7 @@ use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::engine::event::{Event, EventKind, Salience};
+use crate::engine::held;
 use crate::engine::journal::closing;
 use crate::engine::journal::state::{JournalState, Waiting};
 use crate::engine::mission::Mission;
@@ -589,14 +590,14 @@ pub struct Scheduler {
     /// browser whose clock is not this machine's — an age computed here is
     /// right whatever the reader's clock says, where a timestamp is not.
     born: Instant,
-    /// The characters that are frozen: never due, whatever their inbox holds,
-    /// until they are unfrozen. See [`Self::follow_frozen`].
+    /// The characters that are suspended: never due, whatever their inbox
+    /// holds, until they are resumed. See [`Self::follow_suspended`].
     ///
     /// Kept beside the inboxes rather than in them, because whether a character
-    /// is frozen is a fact about its record, not about this member's running of
-    /// it: it holds for a character this member is not lent, and it has to be
+    /// is suspended is a fact about its record, not about this member's running
+    /// of it: it holds for a character this member is not lent, and it has to be
     /// standing already on the moment a lease brings one here and wakes it.
-    frozen: Mutex<HashSet<u64>>,
+    suspended: Mutex<HashSet<u64>>,
 }
 
 impl Default for Scheduler {
@@ -614,77 +615,90 @@ impl Scheduler {
             recent: Mutex::new(VecDeque::new()),
             recent_cap: recent_cap.max(1),
             born: Instant::now(),
-            frozen: Mutex::new(HashSet::new()),
+            suspended: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Freeze or unfreeze one character. Returns whether that changed anything.
+    /// Suspend or resume one character. Returns whether that changed anything.
     ///
-    /// A frozen character is never due: [`Self::wait_due`] parks its task on
-    /// its waker, [`Self::due_now`] leaves it out, and [`Self::begin_tick`]
-    /// refuses it a turn. Everything delivered meanwhile stays in its inbox, and
-    /// unfreezing rings its waker so a character with something waiting thinks
-    /// about it at once.
-    pub fn freeze(&self, npc_id: u64, frozen: bool) -> bool {
+    /// A suspended character is never due: [`Self::wait_due`] parks its task
+    /// on its waker, [`Self::due_now`] leaves it out, and [`Self::begin_tick`]
+    /// refuses it a turn. Everything delivered meanwhile stays in its inbox.
+    /// Resuming bounds that backlog per source ([`held::bound`]) and rings the
+    /// waker, so a character with something waiting thinks about it at once,
+    /// on the newest of each source and a count of the rest.
+    pub fn suspend(&self, npc_id: u64, suspended: bool) -> bool {
         let changed = {
-            let mut set = self.frozen.lock().unwrap();
-            if frozen {
+            let mut set = self.suspended.lock().unwrap();
+            if suspended {
                 set.insert(npc_id)
             } else {
                 set.remove(&npc_id)
             }
         };
-        if changed && !frozen {
-            self.ring(npc_id);
+        if changed && !suspended {
+            self.resume(npc_id);
         }
         changed
     }
 
-    /// Hold exactly `frozen` frozen — the cast's frozen characters, as its
-    /// records say — and return each character whose standing changed, with
-    /// whether it is frozen now.
+    /// Hold exactly `suspended` suspended — the cast's suspended characters,
+    /// as its records say — and return each character whose standing changed,
+    /// with whether it is suspended now.
     ///
-    /// What follows the records: a character frozen or unfrozen on another
+    /// What follows the records: a character suspended or resumed on another
     /// member arrives here as its record, and this is how the scheduler comes
-    /// to agree with it. Each character unfrozen has its waker rung, as
-    /// [`Self::freeze`] rings it.
-    pub fn follow_frozen(&self, frozen: HashSet<u64>) -> Vec<(u64, bool)> {
+    /// to agree with it. Each character resumed is let go as
+    /// [`Self::suspend`] lets it go.
+    pub fn follow_suspended(&self, suspended: HashSet<u64>) -> Vec<(u64, bool)> {
         let changed: Vec<(u64, bool)> = {
-            let mut set = self.frozen.lock().unwrap();
-            let mut changed: Vec<(u64, bool)> = frozen
+            let mut set = self.suspended.lock().unwrap();
+            let mut changed: Vec<(u64, bool)> = suspended
                 .difference(&set)
                 .map(|id| (*id, true))
-                .chain(set.difference(&frozen).map(|id| (*id, false)))
+                .chain(set.difference(&suspended).map(|id| (*id, false)))
                 .collect();
             changed.sort_unstable();
-            *set = frozen;
+            *set = suspended;
             changed
         };
-        for (id, now_frozen) in &changed {
-            if !now_frozen {
-                self.ring(*id);
+        for (id, now_suspended) in &changed {
+            if !now_suspended {
+                self.resume(*id);
             }
         }
         changed
     }
 
-    /// Whether this character is frozen.
-    pub fn is_frozen(&self, npc_id: u64) -> bool {
-        self.frozen.lock().unwrap().contains(&npc_id)
+    /// Whether this character is suspended.
+    pub fn is_suspended(&self, npc_id: u64) -> bool {
+        self.suspended.lock().unwrap().contains(&npc_id)
     }
 
-    /// Wake a character's task so it reads its standing again. Nothing for a
-    /// character with no inbox here.
-    fn ring(&self, npc_id: u64) {
-        let waker = self
-            .inboxes
-            .lock()
-            .unwrap()
-            .get(&npc_id)
-            .map(|i| Arc::clone(&i.waker));
-        if let Some(waker) = waker {
-            waker.notify_one();
-        }
+    /// Every character suspended now.
+    pub fn suspended(&self) -> HashSet<u64> {
+        self.suspended.lock().unwrap().clone()
+    }
+
+    /// Let a character go: bound what queued while it was held, then wake its
+    /// task. Nothing for a character with no inbox here.
+    ///
+    /// The head of the queue a failed turn handed back is already in the
+    /// window ([`Self::retry`]) and is left whole; what follows it is bounded
+    /// to [`held::PER_SOURCE`] per source.
+    fn resume(&self, npc_id: u64) {
+        let waker = {
+            let mut inboxes = self.inboxes.lock().unwrap();
+            let Some(inbox) = inboxes.get_mut(&npc_id) else {
+                return;
+            };
+            let waiting: Vec<Event> = inbox.queue.drain(..).collect();
+            let (replayed, held) = waiting.split_at(inbox.replayed.min(waiting.len()));
+            let bounded = held::bound(held.to_vec(), held::PER_SOURCE, || self.next_seq());
+            inbox.queue = replayed.iter().cloned().chain(bounded).collect();
+            Arc::clone(&inbox.waker)
+        };
+        waker.notify_one();
     }
 
     /// Bring a character into the scheduler. Idempotent — a character already
@@ -976,11 +990,11 @@ impl Scheduler {
     /// Returns `false` when the character has been retired: there is no inbox
     /// left to be due, and the task exits.
     ///
-    /// A frozen character waits on its waker alone, whatever its deadline: it is
-    /// not due until it is unfrozen, and unfreezing rings it.
+    /// A suspended character waits on its waker alone, whatever its deadline:
+    /// it is not due until it is resumed, and resuming rings it.
     pub async fn wait_due(&self, npc_id: u64) -> bool {
         loop {
-            let (due_at, waker, frozen) = {
+            let (due_at, waker, suspended) = {
                 let inboxes = self.inboxes.lock().unwrap();
                 let Some(inbox) = inboxes.get(&npc_id) else {
                     return false;
@@ -988,14 +1002,14 @@ impl Scheduler {
                 (
                     inbox.due_at,
                     Arc::clone(&inbox.waker),
-                    self.is_frozen(npc_id),
+                    self.is_suspended(npc_id),
                 )
             };
             // Registered before the deadline check could race a notify: a
             // permit stored between the read above and this await completes
             // the wait immediately.
             let woken = waker.notified();
-            if frozen {
+            if suspended {
                 woken.await;
                 continue;
             }
@@ -1017,14 +1031,14 @@ impl Scheduler {
 
     /// Every character due at `now_ms`, soonest deadline first — the
     /// synchronous read of the state each [`Self::wait_due`] sleeps on, for
-    /// tests that drive the scheduler without standing the tasks up. A frozen
-    /// character is never among them.
+    /// tests that drive the scheduler without standing the tasks up. A
+    /// suspended character is never among them.
     pub fn due_now(&self, now_ms: u64) -> Vec<u64> {
         let inboxes = self.inboxes.lock().unwrap();
-        let frozen = self.frozen.lock().unwrap();
+        let suspended = self.suspended.lock().unwrap();
         let mut due: Vec<(u64, u64)> = inboxes
             .values()
-            .filter(|i| i.due_at <= now_ms && !frozen.contains(&i.npc_id))
+            .filter(|i| i.due_at <= now_ms && !suspended.contains(&i.npc_id))
             .map(|i| (i.due_at, i.npc_id))
             .collect();
         due.sort_unstable();
@@ -1036,10 +1050,10 @@ impl Scheduler {
     #[cfg(test)]
     fn is_due(&self, npc_id: u64, now_ms: u64) -> bool {
         let inboxes = self.inboxes.lock().unwrap();
-        let frozen = self.frozen.lock().unwrap();
+        let suspended = self.suspended.lock().unwrap();
         inboxes
             .get(&npc_id)
-            .is_some_and(|i| i.due_at <= now_ms && !frozen.contains(&npc_id))
+            .is_some_and(|i| i.due_at <= now_ms && !suspended.contains(&npc_id))
     }
 
     /// Run one character's tick.
@@ -1071,11 +1085,11 @@ impl Scheduler {
     /// it can take seconds, and holding the inbox map across it would block
     /// every other character's `deliver` for that whole time.
     ///
-    /// `None`, with nothing drained, for a frozen character: one frozen after
-    /// its task left [`Self::wait_due`] takes no turn, and its inbox stays
-    /// whole for the turn it takes once unfrozen.
+    /// `None`, with nothing drained, for a suspended character: one suspended
+    /// after its task left [`Self::wait_due`] takes no turn, and its inbox
+    /// stays whole for the turn it takes once resumed.
     pub fn begin_tick(&self, npc_id: u64) -> Option<TickStart> {
-        if self.is_frozen(npc_id) {
+        if self.is_suspended(npc_id) {
             return None;
         }
         // The drain takes the lock and gives it straight back.
@@ -1563,30 +1577,33 @@ mod tests {
         assert_eq!(rec.perceived.len(), 1);
     }
 
-    /// **A frozen character is never due, and comes back once unfrozen with
+    /// **A suspended character is never due, and comes back once resumed with
     /// everything that reached it meanwhile.** It is left out of `due_now`
     /// however urgent its inbox, refused a turn, and nothing it was told is
-    /// lost: the one turn after the thaw reads all of it.
+    /// lost: the one turn after the resume reads all of it.
     #[test]
-    fn a_frozen_character_is_never_due_and_returns_once_unfrozen() {
+    fn a_suspended_character_is_never_due_and_returns_once_resumed() {
         let s = sched();
         s.wake(1, 0, 0);
         s.wake(2, 0, 0);
-        assert!(s.freeze(1, true));
-        assert!(!s.freeze(1, true), "freezing it twice changes nothing");
-        assert!(s.is_frozen(1));
-        assert!(!s.is_frozen(2));
+        assert!(s.suspend(1, true));
+        assert!(!s.suspend(1, true), "suspending it twice changes nothing");
+        assert!(s.is_suspended(1));
+        assert!(!s.is_suspended(2));
 
         s.deliver(1, 0, Salience::URGENT, say("an alarm"));
         s.deliver(1, 0, Salience::NORMAL, say("somebody comes in"));
         s.deliver(2, 0, Salience::NORMAL, say("somebody comes in"));
         assert_eq!(s.due_now(1_000), vec![2]);
         assert!(!s.is_due(1, u64::MAX - 1));
-        assert!(s.begin_tick(1).is_none(), "a frozen character took a turn");
+        assert!(
+            s.begin_tick(1).is_none(),
+            "a suspended character took a turn"
+        );
         assert_eq!(s.inbox_depth(1), Some(2), "the refused turn drained it");
 
-        assert!(s.freeze(1, false));
-        assert!(!s.is_frozen(1));
+        assert!(s.suspend(1, false));
+        assert!(!s.is_suspended(1));
         assert_eq!(s.due_now(1_000), vec![1, 2]);
         let rec = s.tick(1, 1_000, 0, |_, _| vec![]).expect("ticked");
         assert_eq!(
@@ -1595,41 +1612,69 @@ mod tests {
         );
     }
 
-    /// **The scheduler holds the cast's frozen set as it is handed, and says
-    /// what moved.** A character the set no longer names is unfrozen, one it
-    /// names newly is frozen, and one in neither is untouched — including one
-    /// with no inbox here, which is frozen already on the day it is woken.
+    /// **The turn after a long suspension reads the newest of each source and
+    /// a count of the rest**, never the whole backlog: 25 things happen around
+    /// a suspended character, and it resumes to the newest 20, behind one line
+    /// standing for the 5 before them.
     #[test]
-    fn following_the_frozen_set_reports_each_change_once() {
+    fn a_resumed_turn_reads_its_backlog_bounded_per_source() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.suspend(1, true);
+        for i in 0..25 {
+            s.deliver(1, 0, Salience::NORMAL, say(&format!("line {i}")));
+        }
+        assert_eq!(s.inbox_depth(1), Some(25), "nothing is dropped while held");
+
+        s.suspend(1, false);
+        let rec = s.tick(1, 1_000, 0, |_, _| vec![]).expect("ticked");
+        let mut want =
+            vec!["While you were suspended, 5 more things that happened around you.".to_string()];
+        want.extend((5..25).map(|i| format!("line {i}")));
+        assert_eq!(rec.perceived, want);
+    }
+
+    /// **The scheduler holds the cast's suspended set as it is handed, and
+    /// says what moved.** A character the set no longer names is resumed, one
+    /// it names newly is suspended, and one in neither is untouched — including
+    /// one with no inbox here, which is suspended already on the day it is
+    /// woken.
+    #[test]
+    fn following_the_suspended_set_reports_each_change_once() {
         let s = sched();
         s.wake(1, 0, 0);
         s.wake(2, 0, 0);
-        s.freeze(1, true);
+        s.suspend(1, true);
 
-        let moved = s.follow_frozen(HashSet::from([2, 9]));
+        let moved = s.follow_suspended(HashSet::from([2, 9]));
         assert_eq!(moved, vec![(1, false), (2, true), (9, true)]);
-        assert!(s.follow_frozen(HashSet::from([2, 9])).is_empty());
+        assert!(s.follow_suspended(HashSet::from([2, 9])).is_empty());
+        assert_eq!(s.suspended(), HashSet::from([2, 9]));
 
         s.wake(9, 0, 0);
         s.deliver(9, 0, Salience::URGENT, say("an alarm"));
         s.deliver(1, 0, Salience::URGENT, say("an alarm"));
-        assert_eq!(s.due_now(1_000), vec![1], "a woken frozen character is due");
+        assert_eq!(
+            s.due_now(1_000),
+            vec![1],
+            "a woken suspended character is due"
+        );
     }
 
-    /// **A frozen task parks, and the thaw is what moves it.** An arrival rings
-    /// the waker and the task goes straight back to waiting; unfreezing rings it
-    /// and the task finds itself due.
+    /// **A suspended task parks, and the resume is what moves it.** An arrival
+    /// rings the waker and the task goes straight back to waiting; resuming
+    /// rings it and the task finds itself due.
     #[tokio::test]
-    async fn a_frozen_task_waits_until_it_is_unfrozen() {
+    async fn a_suspended_task_waits_until_it_is_resumed() {
         let s = Arc::new(sched());
         s.wake(1, 0, 0);
-        s.freeze(1, true);
+        s.suspend(1, true);
         s.deliver(1, 0, Salience::URGENT, say("an alarm"));
         assert!(
             tokio::time::timeout(Duration::from_millis(200), s.wait_due(1))
                 .await
                 .is_err(),
-            "a frozen character's task came due"
+            "a suspended character's task came due"
         );
 
         let waiting = tokio::spawn({
@@ -1637,10 +1682,10 @@ mod tests {
             async move { s.wait_due(1).await }
         });
         tokio::task::yield_now().await;
-        s.freeze(1, false);
+        s.suspend(1, false);
         let due = tokio::time::timeout(Duration::from_secs(1), waiting)
             .await
-            .expect("the thaw did not wake the task")
+            .expect("the resume did not wake the task")
             .unwrap();
         assert!(due);
     }
