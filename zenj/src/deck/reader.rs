@@ -89,10 +89,7 @@ mod tests {
     use crate::deck::offsets::{parse, Chain, DeckChains, Offsets};
 
     fn chain(last: usize) -> Chain {
-        Chain {
-            hops: vec![],
-            last,
-        }
+        Chain { hops: vec![], last }
     }
 
     /// **One reading takes every deck's chains in order**, through the same

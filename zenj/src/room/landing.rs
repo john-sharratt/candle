@@ -60,9 +60,10 @@ impl Room {
 
     /// How well it is landing, `0..=1`; 0.5 with too little heard to say.
     pub fn landing(&self, now: Instant) -> f32 {
-        let (Some((rdb, rlow)), Some((bdb, blow))) =
-            (mean(self.recent(now)), mean(self.seen.iter().map(|(_, l)| l)))
-        else {
+        let (Some((rdb, rlow)), Some((bdb, blow))) = (
+            mean(self.recent(now)),
+            mean(self.seen.iter().map(|(_, l)| l)),
+        ) else {
             return 0.5;
         };
         let lift = (rdb - bdb) / SWING_DB + (rlow - blow) * 2.0;
@@ -90,7 +91,11 @@ mod tests {
             r.push(t0 + Duration::from_secs(s), at(-20.0, 0.3));
         }
         let now = t0 + Duration::from_secs(240);
-        assert!((r.landing(now) - 0.5).abs() < 1e-5, "steady: {}", r.landing(now));
+        assert!(
+            (r.landing(now) - 0.5).abs() < 1e-5,
+            "steady: {}",
+            r.landing(now)
+        );
         for s in 241..=270 {
             r.push(t0 + Duration::from_secs(s), at(-14.0, 0.4));
         }

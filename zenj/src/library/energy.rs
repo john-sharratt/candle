@@ -41,7 +41,8 @@ mod tests {
         assert!(high > low);
         assert!(estimate(140.0, Some(2), &club) > estimate(100.0, Some(2), &club));
         // The club shape: (0.4·32 + 0.7·32 + 1·64 + 0.35·32 + 1·64 + 0.4·32) / 256.
-        let shape = (0.4 * 32.0 + 0.7 * 32.0 + 64.0 + 0.35 * 32.0 + 64.0 + 0.4 * 32.0) / 256.0 - 0.6;
+        let shape =
+            (0.4 * 32.0 + 0.7 * 32.0 + 64.0 + 0.35 * 32.0 + 64.0 + 0.4 * 32.0) / 256.0 - 0.6;
         assert!((estimate(120.0, Some(2), &club) - (0.55 + 0.4 * shape)).abs() < 1e-6);
         assert_eq!(estimate(120.0, None, &[]), 0.5);
     }

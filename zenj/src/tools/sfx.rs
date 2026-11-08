@@ -25,7 +25,11 @@ impl Tool for Sfx {
 }
 
 pub async fn call(dj: &Dj, args: &Value) -> Answer {
-    let Some(slot) = args.get("slot").and_then(Value::as_u64).filter(|s| (1..=16).contains(s)) else {
+    let Some(slot) = args
+        .get("slot")
+        .and_then(Value::as_u64)
+        .filter(|s| (1..=16).contains(s))
+    else {
         return Answer::error("`slot` is 1 to 16");
     };
     let when = match args.get("when").and_then(Value::as_str).unwrap_or("bar") {
@@ -38,9 +42,12 @@ pub async fn call(dj: &Dj, args: &Value) -> Answer {
     if dj.asks.send(Ask::Sample { slot, when }).await.is_err() {
         return Answer::error("ZenJ's brain is not running");
     }
-    Answer::ok(format!("sample {slot} fires {}", match when {
-        Quant::Now => "now",
-        Quant::Beat => "on the next beat",
-        Quant::Bar => "on the next bar",
-    }))
+    Answer::ok(format!(
+        "sample {slot} fires {}",
+        match when {
+            Quant::Now => "now",
+            Quant::Beat => "on the next beat",
+            Quant::Bar => "on the next bar",
+        }
+    ))
 }

@@ -139,7 +139,8 @@ pub struct Config {
 impl Config {
     pub fn load(path: &Path) -> Result<Config, String> {
         let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let c: Config = serde_yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let c: Config =
+            serde_yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         let total: f32 = c.people.iter().map(|p| p.share).sum::<f32>() + c.request_share;
         if (total - 1.0).abs() > 0.01 {
             return Err(format!(
@@ -190,7 +191,9 @@ impl Config {
     }
 
     pub fn record_path(&self) -> PathBuf {
-        self.state.join("nights").join(format!("{}.jsonl", self.night))
+        self.state
+            .join("nights")
+            .join(format!("{}.jsonl", self.night))
     }
 }
 
@@ -208,10 +211,19 @@ mod tests {
         assert_eq!(c.cluster.host, "blackworld");
         assert_eq!(c.names(), ["john", "yen"]);
         assert_eq!(c.emails(), ["johnathan.sharratt@gmail.com"]);
-        assert_eq!(c.midnight().unwrap().format("%Y-%m-%d %H:%M").to_string(), "2027-01-01 00:00");
+        assert_eq!(
+            c.midnight().unwrap().format("%Y-%m-%d %H:%M").to_string(),
+            "2027-01-01 00:00"
+        );
         assert_eq!(c.rekordbox.version, "7.2.19");
-        assert_eq!(c.spotify.provider.redirect, "http://127.0.0.1:43821/callback");
-        assert_eq!(c.record_path(), c.state.join("nights").join("2026-12-31.jsonl"));
+        assert_eq!(
+            c.spotify.provider.redirect,
+            "http://127.0.0.1:43821/callback"
+        );
+        assert_eq!(
+            c.record_path(),
+            c.state.join("nights").join("2026-12-31.jsonl")
+        );
         assert!(!c.midi.combos.zenj.is_empty() && !c.midi.combos.assist.is_empty());
     }
 
@@ -223,6 +235,8 @@ mod tests {
             .replace("request_share: 0.2", "request_share: 0.5");
         let path = dir.path().join("z.yaml");
         fs::write(&path, text).unwrap();
-        assert!(Config::load(&path).unwrap_err().ends_with("add to 1.30, not 1"));
+        assert!(Config::load(&path)
+            .unwrap_err()
+            .ends_with("add to 1.30, not 1"));
     }
 }

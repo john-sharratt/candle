@@ -89,7 +89,8 @@ pub type Taste = BTreeMap<String, Heard>;
 
 /// The track id of a `spotify:track:<id>` URI.
 pub fn track_id(uri: &str) -> Option<&str> {
-    uri.strip_prefix("spotify:track:").filter(|id| !id.is_empty())
+    uri.strip_prefix("spotify:track:")
+        .filter(|id| !id.is_empty())
 }
 
 fn entry<'a>(taste: &'a mut Taste, uri: &str, title: &str, artist: &str) -> Option<&'a mut Heard> {

@@ -17,10 +17,11 @@ use glyphon::{
 use lactea::{Engine, EngineConfig, FrameClock, Transition};
 use rtrb::Consumer;
 use wgpu::{
-    Adapter, Color as Fill, CommandEncoderDescriptor, CompositeAlphaMode, CurrentSurfaceTexture, Device, DeviceDescriptor,
-    Instance, InstanceDescriptor, LoadOp, MultisampleState, Operations, PresentMode, Queue,
-    RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions, StoreOp, Surface,
-    SurfaceColorSpace, SurfaceConfiguration, TextureFormat, TextureUsages, TextureViewDescriptor,
+    Adapter, Color as Fill, CommandEncoderDescriptor, CompositeAlphaMode, CurrentSurfaceTexture,
+    Device, DeviceDescriptor, Instance, InstanceDescriptor, LoadOp, MultisampleState, Operations,
+    PresentMode, Queue, RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions,
+    StoreOp, Surface, SurfaceColorSpace, SurfaceConfiguration, TextureFormat, TextureUsages,
+    TextureViewDescriptor,
 };
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -70,10 +71,18 @@ fn load(library: &[PathBuf], engine: &mut Engine, scenes: &mut Scenes, transitio
     for _ in 0..library.len().min(8) {
         let Some(i) = scenes.current() else { return };
         let path = &library[i];
-        let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = path
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let loaded = std::fs::read(path)
             .map_err(|e| e.to_string())
-            .and_then(|b| engine.load_preset(&b, &name, transition).map(|_| ()).map_err(|e| e.to_string()));
+            .and_then(|b| {
+                engine
+                    .load_preset(&b, &name, transition)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            });
         match loaded {
             Ok(()) => return,
             Err(e) => {
@@ -119,7 +128,11 @@ impl Screens {
         let total = self.cfg.outputs.len();
         for (n, out) in self.cfg.outputs.clone().into_iter().enumerate() {
             let Some(monitor) = monitors.get(out.monitor).cloned() else {
-                tracing::warn!(monitor = out.monitor, found = monitors.len(), "screens: no such monitor");
+                tracing::warn!(
+                    monitor = out.monitor,
+                    found = monitors.len(),
+                    "screens: no such monitor"
+                );
                 continue;
             };
             let attrs = Window::default_attributes()
@@ -133,24 +146,33 @@ impl Screens {
                 }
             };
             if self.gpu.is_none() {
-                let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(
-                    el.owned_display_handle(),
-                )));
-                let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions::default())) {
+                let instance = Instance::new(InstanceDescriptor::new_with_display_handle(
+                    Box::new(el.owned_display_handle()),
+                ));
+                let adapter = match pollster::block_on(
+                    instance.request_adapter(&RequestAdapterOptions::default()),
+                ) {
                     Ok(a) => a,
                     Err(e) => {
                         tracing::warn!("screens: no GPU adapter: {e}");
                         return;
                     }
                 };
-                let (device, queue) = match pollster::block_on(adapter.request_device(&DeviceDescriptor::default())) {
+                let (device, queue) = match pollster::block_on(
+                    adapter.request_device(&DeviceDescriptor::default()),
+                ) {
                     Ok(dq) => dq,
                     Err(e) => {
                         tracing::warn!("screens: no GPU device: {e}");
                         return;
                     }
                 };
-                self.gpu = Some(Gpu { instance, device, queue, adapter });
+                self.gpu = Some(Gpu {
+                    instance,
+                    device,
+                    queue,
+                    adapter,
+                });
             }
             let gpu = self.gpu.as_ref().expect("made above");
             let surface = match gpu.instance.create_surface(window.clone()) {
@@ -202,7 +224,8 @@ impl Screens {
             let cache = Cache::new(&gpu.device);
             let viewport = Viewport::new(&gpu.device, &cache);
             let mut atlas = TextAtlas::new(&gpu.device, &gpu.queue, &cache, format);
-            let text = TextRenderer::new(&mut atlas, &gpu.device, MultisampleState::default(), None);
+            let text =
+                TextRenderer::new(&mut atlas, &gpu.device, MultisampleState::default(), None);
             let mut corner = Buffer::new(&mut self.fonts, Metrics::new(34.0, 44.0));
             corner.set_size(Some(config.width as f32 - 80.0), Some(config.height as f32));
             let mut big = Buffer::new(&mut self.fonts, Metrics::new(320.0, 340.0));
@@ -237,7 +260,9 @@ impl Screens {
 
     fn draw(&mut self, id: WindowId) {
         let Some(gpu) = self.gpu.as_ref() else { return };
-        let Some(i) = self.screens.iter().position(|(w, _)| *w == id) else { return };
+        let Some(i) = self.screens.iter().position(|(w, _)| *w == id) else {
+            return;
+        };
         let live = self.shared.live.load_full();
         let now = Local::now();
         let ov = overlay(&live, now, self.shared.midnight);
@@ -270,18 +295,26 @@ impl Screens {
         let attrs = Attrs::new().family(Family::SansSerif);
         let area = match &ov {
             Overlay::Corner(lines) => {
-                s.corner.set_text(&lines.join("\n"), &attrs, Shaping::Advanced, None);
+                s.corner
+                    .set_text(&lines.join("\n"), &attrs, Shaping::Advanced, None);
                 s.corner.shape_until_scroll(&mut self.fonts, false);
                 let top = h - 44.0 * lines.len() as f32 - 48.0;
                 (true, 40.0, top)
             }
             Overlay::Big(text) => {
-                s.big.set_text(text, &attrs, Shaping::Advanced, Some(Align::Center));
+                s.big
+                    .set_text(text, &attrs, Shaping::Advanced, Some(Align::Center));
                 s.big.shape_until_scroll(&mut self.fonts, false);
                 (false, 0.0, h / 2.0 - 170.0)
             }
         };
-        s.viewport.update(&gpu.queue, Resolution { width: s.config.width, height: s.config.height });
+        s.viewport.update(
+            &gpu.queue,
+            Resolution {
+                width: s.config.width,
+                height: s.config.height,
+            },
+        );
         let buffer = if area.0 { &s.corner } else { &s.big };
         if let Err(e) = s.text.prepare(
             &gpu.device,
@@ -294,7 +327,12 @@ impl Screens {
                 left: area.1,
                 top: area.2,
                 scale: 1.0,
-                bounds: TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 },
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: w as i32,
+                    bottom: h as i32,
+                },
                 default_color: Color::rgb(255, 255, 255),
                 custom_glyphs: &[],
             }],
@@ -319,10 +357,21 @@ impl Screens {
             _ => return,
         };
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
-        let mut enc = gpu.device.create_command_encoder(&CommandEncoderDescriptor { label: Some("zenj-screen") });
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("zenj-screen"),
+            });
         let scene_drawn = match s.engine.as_mut() {
             Some(e) => {
-                e.render(&mut enc, &view, FrameClock { time, frame: s.frame });
+                e.render(
+                    &mut enc,
+                    &view,
+                    FrameClock {
+                        time,
+                        frame: s.frame,
+                    },
+                );
                 true
             }
             None => false,
@@ -336,7 +385,11 @@ impl Screens {
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
-                        load: if scene_drawn { LoadOp::Load } else { LoadOp::Clear(Fill::BLACK) },
+                        load: if scene_drawn {
+                            LoadOp::Load
+                        } else {
+                            LoadOp::Clear(Fill::BLACK)
+                        },
                         store: StoreOp::Store,
                     },
                 })],
@@ -375,8 +428,12 @@ impl ApplicationHandler for Screens {
                     if let Some(e) = s.engine.as_mut() {
                         let _ = e.resize(s.config.width, s.config.height);
                     }
-                    s.corner.set_size(Some(s.config.width as f32 - 80.0), Some(s.config.height as f32));
-                    s.big.set_size(Some(s.config.width as f32), Some(s.config.height as f32));
+                    s.corner.set_size(
+                        Some(s.config.width as f32 - 80.0),
+                        Some(s.config.height as f32),
+                    );
+                    s.big
+                        .set_size(Some(s.config.width as f32), Some(s.config.height as f32));
                 }
             }
             // The screens close only with the process: a stray close on the

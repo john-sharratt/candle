@@ -15,10 +15,9 @@ pub fn weight(h: &Heard) -> f32 {
     } else {
         h.skips as f32 / plays as f32
     };
-    let w = 0.55 * listens
-        + 0.3 * h.liked as u8 as f32
-        + 0.15 * (!h.playlists.is_empty()) as u8 as f32
-        - 0.25 * skips;
+    let w =
+        0.55 * listens + 0.3 * h.liked as u8 as f32 + 0.15 * (!h.playlists.is_empty()) as u8 as f32
+            - 0.25 * skips;
     w.clamp(0.0, 1.0)
 }
 

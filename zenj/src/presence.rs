@@ -107,7 +107,9 @@ pub fn join(config: &Config, router: Router) -> anyhow::Result<()> {
     tracing::info!(node = %format!("{node:016x}"), urls = %target.url, "joining the cluster as zenj");
     tokio::spawn(async move {
         let stopped = member
-            .run(0, Dial::new(Arc::new(target), ZENJ, tls), move |conn| serve(router.clone(), conn))
+            .run(0, Dial::new(Arc::new(target), ZENJ, tls), move |conn| {
+                serve(router.clone(), conn)
+            })
             .await;
         tracing::warn!("zenj: left the cluster: {stopped:?}");
     });
@@ -126,7 +128,10 @@ mod tests {
         }
         assert!(t.lookup("GET", STATUS_PATH).is_some());
         assert!(t.lookup("POST", STATUS_PATH).is_none());
-        assert!(t.lookup("GET", "/v1/status").is_none(), "keep's is the listener's alone");
+        assert!(
+            t.lookup("GET", "/v1/status").is_none(),
+            "keep's is the listener's alone"
+        );
         assert!(t.lookup("POST", "/v1/mcp").is_none());
     }
 }

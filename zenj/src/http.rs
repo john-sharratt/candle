@@ -56,7 +56,8 @@ async fn keep(State(dj): State<Arc<Dj>>) -> Json<Value> {
 async fn events(State(dj): State<Arc<Dj>>, Query(q): Query<HashMap<String, String>>) -> Response {
     let since = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
     let got = dj.events.since(since, 500);
-    Json(json!({"events": got, "cursor": got.last().map_or(dj.events.last().max(since), |e| e.id)})).into_response()
+    Json(json!({"events": got, "cursor": got.last().map_or(dj.events.last().max(since), |e| e.id)}))
+        .into_response()
 }
 
 /// Whether a request's identity is believed.
@@ -80,7 +81,12 @@ async fn believe(State(gateways): State<Arc<[IpAddr]>>, mut req: Request, next: 
 
 pub fn router(dj: Arc<Dj>, gateways: Arc<[IpAddr]>) -> Router {
     Router::new()
-        .route(MCP_PATH, post(http::post::<Dj>).get(http::get).delete(http::delete::<Dj>))
+        .route(
+            MCP_PATH,
+            post(http::post::<Dj>)
+                .get(http::get)
+                .delete(http::delete::<Dj>),
+        )
         .route(STATUS_PATH, get(status))
         .route(EVENTS_PATH, get(events))
         .route(KEEP_STATUS_PATH, get(keep))
@@ -102,9 +108,18 @@ mod tests {
     #[test]
     fn keep_is_refused_while_music_plays() {
         let quiet = keep_status(&Live::default());
-        assert_eq!(quiet, json!({"app": "zenj", "live": false, "mode": "human"}));
-        let live = keep_status(&Live { live: true, ..Live::default() });
-        assert_eq!(live["refuse"], "music is playing at the party (zenj is live)");
+        assert_eq!(
+            quiet,
+            json!({"app": "zenj", "live": false, "mode": "human"})
+        );
+        let live = keep_status(&Live {
+            live: true,
+            ..Live::default()
+        });
+        assert_eq!(
+            live["refuse"],
+            "music is playing at the party (zenj is live)"
+        );
     }
 
     #[test]
@@ -121,13 +136,21 @@ mod tests {
     #[tokio::test]
     async fn the_status_keep_reads_is_served() {
         let (dj, _rx) = dj();
-        dj.live.store(Arc::new(Live { live: true, ..Live::default() }));
+        dj.live.store(Arc::new(Live {
+            live: true,
+            ..Live::default()
+        }));
         let r = router(Arc::new(dj), Arc::from(vec![]));
         let res = r
-            .oneshot(HttpRequest::get(KEEP_STATUS_PATH).body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::get(KEEP_STATUS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let body: Value = serde_json::from_slice(&to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
         assert_eq!(body["live"], true);
         assert!(body["refuse"].is_string());
     }

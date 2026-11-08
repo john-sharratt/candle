@@ -86,7 +86,10 @@ mod tests {
     fn the_prompt_numbers_each_track() {
         let a = club("a", 128.0, "8A", 0.5);
         let b = club("b", 128.0, "8A", 0.5);
-        assert_eq!(prompt(&[&a, &b]), "1. a artist — a title\n2. b artist — b title\n");
+        assert_eq!(
+            prompt(&[&a, &b]),
+            "1. a artist — a title\n2. b artist — b title\n"
+        );
     }
 
     /// **Only the vocabulary and a plausible year are kept**, for tracks
@@ -98,7 +101,13 @@ mod tests {
                       "2": {"tags": [], "year": 3000}, "9": {"tags": ["classic"]}, "x": {}}"#,
             2,
         );
-        assert_eq!(got[&0], (vec!["singalong".to_string(), "anthem".to_string()], Some(1976)));
+        assert_eq!(
+            got[&0],
+            (
+                vec!["singalong".to_string(), "anthem".to_string()],
+                Some(1976)
+            )
+        );
         assert_eq!(got[&1], (vec![], None));
         assert_eq!(got.len(), 2);
         assert!(read("no idea", 2).is_empty());

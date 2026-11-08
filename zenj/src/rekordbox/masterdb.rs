@@ -59,7 +59,8 @@ pub fn decrypt_to(master: &Path, copy: &Path) -> Result<(), String> {
     fs::rename(&tmp, copy).map_err(|e| format!("{}: {e}", copy.display()))
 }
 
-const QUERY: &str = "SELECT c.ID, COALESCE(c.Title, ''), COALESCE(a.Name, ''), COALESCE(c.BPM, 0), \
+const QUERY: &str =
+    "SELECT c.ID, COALESCE(c.Title, ''), COALESCE(a.Name, ''), COALESCE(c.BPM, 0), \
     k.ScaleName, COALESCE(c.Length, 0), c.ISRC, COALESCE(c.FolderPath, ''), c.AnalysisDataPath, \
     c.ReleaseYear \
     FROM djmdContent c \
@@ -94,7 +95,8 @@ pub fn contents(db: &Path) -> Result<Vec<Content>, String> {
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -106,10 +108,7 @@ pub mod fixture {
     /// A plain library with rekordbox's tables, and the rows given as
     /// `(id, title, artist, bpm×100, key, length, isrc, path, anlz)`.
     #[allow(clippy::type_complexity)]
-    pub fn library(
-        at: &Path,
-        rows: &[(&str, &str, &str, i64, &str, i64, &str, &str, &str)],
-    ) {
+    pub fn library(at: &Path, rows: &[(&str, &str, &str, i64, &str, i64, &str, &str, &str)]) {
         let c = Connection::open(at).unwrap();
         c.execute_batch(
             "CREATE TABLE djmdArtist (ID VARCHAR(255) PRIMARY KEY, Name VARCHAR(255));
@@ -163,13 +162,26 @@ mod tests {
                     "tidal:tracks:1234567",
                     "/PIONEER/USBANLZ/a1b/2c3d/ANLZ0000.DAT",
                 ),
-                ("102", "Local", "Someone", 12800, "8A", 200, " ", "C:/Music/x.mp3", ""),
+                (
+                    "102",
+                    "Local",
+                    "Someone",
+                    12800,
+                    "8A",
+                    200,
+                    " ",
+                    "C:/Music/x.mp3",
+                    "",
+                ),
                 ("103", "Gone", "Nobody", 12000, "Am", 100, "", "", ""),
             ],
         );
         Connection::open(&db)
             .unwrap()
-            .execute("UPDATE djmdContent SET rb_local_deleted = 1 WHERE ID = '103'", [])
+            .execute(
+                "UPDATE djmdContent SET rb_local_deleted = 1 WHERE ID = '103'",
+                [],
+            )
             .unwrap();
         let c = contents(&db).unwrap();
         assert_eq!(c.len(), 2);

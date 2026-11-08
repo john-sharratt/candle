@@ -174,16 +174,30 @@ mod tests {
         let now = club("now", 128.0, "8A", 0.6);
         let mut a = club("a", 127.0, "9A", 0.7);
         a.liked = vec![
-            Liked { person: "john".into(), weight: 1.0 },
-            Liked { person: "yen".into(), weight: 0.3 },
+            Liked {
+                person: "john".into(),
+                weight: 1.0,
+            },
+            Liked {
+                person: "yen".into(),
+                weight: 0.3,
+            },
         ];
         a.year = Some(1999);
         a.tags = vec!["singalong".into()];
         let b = club("b", 128.0, "8B", 0.65);
         let (sa, sb) = (scored("a", 0.91), scored("b", 0.8));
         let offers = [
-            Offer { track: &a, scored: &sa, request: None },
-            Offer { track: &b, scored: &sb, request: Some(("yen", "for mum")) },
+            Offer {
+                track: &a,
+                scored: &sa,
+                request: None,
+            },
+            Offer {
+                track: &b,
+                scored: &sb,
+                request: Some(("yen", "for mum")),
+            },
         ];
         let said = ["yen: more energy please".to_string()];
         let owed = [("yen".to_string(), 0.25)];
@@ -216,18 +230,41 @@ mod tests {
         let b = club("b", 128.0, "8B", 0.65);
         let (sa, sb) = (scored("a", 0.9), scored("b", 0.8));
         let offers = [
-            Offer { track: &a, scored: &sa, request: None },
-            Offer { track: &b, scored: &sb, request: None },
+            Offer {
+                track: &a,
+                scored: &sa,
+                request: None,
+            },
+            Offer {
+                track: &b,
+                scored: &sb,
+                request: None,
+            },
         ];
         assert_eq!(
             read(r#"{"pick": 2, "why": " Yen's mum is here "}"#, &offers),
-            Some(Choice::Pick { id: TrackId("b".into()), why: "Yen's mum is here".into() })
+            Some(Choice::Pick {
+                id: TrackId("b".into()),
+                why: "Yen's mum is here".into()
+            })
         );
         assert_eq!(
-            read("Sure! {\"search\": \"ABBA - Dancing Queen\", \"why\": \"asked\"} hope that helps", &offers),
-            Some(Choice::Search { query: "ABBA - Dancing Queen".into(), why: "asked".into() })
+            read(
+                "Sure! {\"search\": \"ABBA - Dancing Queen\", \"why\": \"asked\"} hope that helps",
+                &offers
+            ),
+            Some(Choice::Search {
+                query: "ABBA - Dancing Queen".into(),
+                why: "asked".into()
+            })
         );
-        for nothing in [r#"{"pick": 3}"#, r#"{"pick": 0}"#, "no json", r#"{"search": " "}"#, "{bad"] {
+        for nothing in [
+            r#"{"pick": 3}"#,
+            r#"{"pick": 0}"#,
+            "no json",
+            r#"{"search": " "}"#,
+            "{bad",
+        ] {
             assert_eq!(read(nothing, &offers), None, "{nothing}");
         }
     }

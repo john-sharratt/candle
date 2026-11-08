@@ -56,13 +56,19 @@ pub enum Command {
     /// Run `plan` from the playing deck's next steps.
     Arm(Plan),
     /// Load `track` to `deck` and confirm it.
-    Load { deck: u8, track: TrackId },
+    Load {
+        deck: u8,
+        track: TrackId,
+    },
     /// The grid and length of the track on each deck, for the beat and the
     /// watchdog.
     Tracks(Vec<(u8, Grid, u64)>),
     Mode(Mode),
     /// Fire sampler slot `slot`.
-    Sample { slot: u8, when: Quant },
+    Sample {
+        slot: u8,
+        when: Quant,
+    },
     /// Automix on or off.
     Automix(bool),
 }
@@ -109,7 +115,9 @@ impl Conductor {
         for s in sends {
             match *s {
                 Send::Set(k, v) => msgs.extend(self.map.set(k, v).unwrap_or_default()),
-                Send::Press(b) => msgs.extend(self.map.press(Control::Button(b)).unwrap_or_default()),
+                Send::Press(b) => {
+                    msgs.extend(self.map.press(Control::Button(b)).unwrap_or_default())
+                }
             }
         }
         if msgs.is_empty() {
@@ -117,7 +125,8 @@ impl Conductor {
         }
         if let Some(out) = &mut self.out {
             if let Err(e) = out.send(&msgs) {
-                self.events.push(Kind::Fault, format!("the virtual controller: {e}"));
+                self.events
+                    .push(Kind::Fault, format!("the virtual controller: {e}"));
                 self.out = None;
             }
         }
@@ -152,12 +161,16 @@ impl Conductor {
             while let Ok(t) = self.touches.pop() {
                 match self.hands.touch(&t) {
                     Some(Change::TookBack(k)) => {
-                        self.events.push(Kind::Mode, format!("{} taken back by hand", Control::Knob(k)));
+                        self.events.push(
+                            Kind::Mode,
+                            format!("{} taken back by hand", Control::Knob(k)),
+                        );
                     }
                     Some(Change::HandedBack) => {
                         runner = None;
                         walk = self.walk_back(beat);
-                        self.events.push(Kind::Mode, "the decks are a person's again");
+                        self.events
+                            .push(Kind::Mode, "the decks are a person's again");
                         self.publish(|s| {
                             s.mode = Mode::Human;
                             s.armed = None;
@@ -165,7 +178,8 @@ impl Conductor {
                     }
                     Some(Change::Asked(m)) => {
                         self.hands.set_mode(m);
-                        self.events.push(Kind::Mode, format!("{} asked for on the pads", m.name()));
+                        self.events
+                            .push(Kind::Mode, format!("{} asked for on the pads", m.name()));
                         self.publish(|s| s.mode = m);
                     }
                     None => {}
@@ -247,7 +261,8 @@ impl Conductor {
                     Step::Waiting => {}
                     Step::Loaded => {
                         let (deck, track) = (l.deck, l.track.clone());
-                        self.events.push(Kind::Next, format!("{track} loaded on deck {deck}"));
+                        self.events
+                            .push(Kind::Next, format!("{track} loaded on deck {deck}"));
                         self.publish(|s| {
                             s.loading = None;
                             s.loaded.retain(|(d, _)| *d != deck);
@@ -256,7 +271,8 @@ impl Conductor {
                         load = None;
                     }
                     Step::Failed(why) => {
-                        self.events.push(Kind::Fault, format!("a load failed: {why}"));
+                        self.events
+                            .push(Kind::Fault, format!("a load failed: {why}"));
                         self.publish(|s| {
                             s.loading = None;
                             s.fault = Some(why);
@@ -289,7 +305,12 @@ impl Conductor {
             } else if !pending.is_empty() && self.hands.mode() != Mode::Human {
                 for p in pending.drain(..) {
                     if let Some(o) = self.out.as_mut() {
-                        let _ = o.send(&self.map.press(Control::Button(Button::Sampler(p.slot))).unwrap_or_default());
+                        let _ = o.send(
+                            &self
+                                .map
+                                .press(Control::Button(Button::Sampler(p.slot)))
+                                .unwrap_or_default(),
+                        );
                     }
                 }
             }
@@ -324,12 +345,16 @@ impl Conductor {
             return;
         }
         let state = self.state.load_full();
-        let on_air = snap.on_air().and_then(|d| tracks.iter().find(|t| t.0 == d.number));
-        let next_loaded = snap
-            .decks
-            .iter()
-            .filter(|d| !d.playing)
-            .any(|d| d.track.is_some() && state.loaded.iter().any(|(n, t)| *n == d.number && d.track.as_ref() == Some(t)));
+        let on_air = snap
+            .on_air()
+            .and_then(|d| tracks.iter().find(|t| t.0 == d.number));
+        let next_loaded = snap.decks.iter().filter(|d| !d.playing).any(|d| {
+            d.track.is_some()
+                && state
+                    .loaded
+                    .iter()
+                    .any(|(n, t)| *n == d.number && d.track.as_ref() == Some(t))
+        });
         let why = fault(&Watched {
             snapshot: snap,
             on_air: on_air.map(|t| (t.1, t.2)),

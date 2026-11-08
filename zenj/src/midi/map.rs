@@ -114,8 +114,9 @@ impl Map {
                 .as_str()
                 .ok_or_else(|| format!("a control's name is text: {key:?}"))?;
             let control: Control = name.parse()?;
-            let binding: Binding = serde_yaml::from_value(value)
-                .map_err(|e| format!("{name}: a note {{channel, note}} or a CC {{channel, cc, lsb?}}: {e}"))?;
+            let binding: Binding = serde_yaml::from_value(value).map_err(|e| {
+                format!("{name}: a note {{channel, note}} or a CC {{channel, cc, lsb?}}: {e}")
+            })?;
             if !binding.valid() {
                 return Err(format!("{name}: a channel is 0–15 and a note or CC 0–127"));
             }
@@ -133,7 +134,9 @@ impl Map {
             }
             for (i, slot) in binding.slots().into_iter().enumerate() {
                 if let Some((other, _)) = by_slot.insert(slot, (control, i == 1)) {
-                    return Err(format!("{name} and {other} use the same message ({slot:?})"));
+                    return Err(format!(
+                        "{name} and {other} use the same message ({slot:?})"
+                    ));
                 }
             }
         }
@@ -348,7 +351,12 @@ mod tests {
                 assert!(virt.press(b.into()).is_some(), "{b:?}");
             }
         }
-        for b in [Button::BrowseUp, Button::BrowseDown, Button::Automix, Button::Sampler(16)] {
+        for b in [
+            Button::BrowseUp,
+            Button::BrowseDown,
+            Button::Automix,
+            Button::Sampler(16),
+        ] {
             assert!(virt.press(b.into()).is_some(), "{b:?}");
         }
         assert!(virt.set(Knob::Crossfader, 0.5).is_some());
@@ -358,7 +366,11 @@ mod tests {
     fn a_load_names_its_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.yaml");
-        fs::write(&path, "port: x\ncontrols:\n  deck1.volume: {channel: 0, cc: 1}\n").unwrap();
+        fs::write(
+            &path,
+            "port: x\ncontrols:\n  deck1.volume: {channel: 0, cc: 1}\n",
+        )
+        .unwrap();
         assert_eq!(
             Map::load(&path).unwrap_err(),
             format!("{}: `deck1.volume` names no control", path.display())

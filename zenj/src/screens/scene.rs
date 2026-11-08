@@ -15,12 +15,17 @@ pub fn presets(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&d) else { continue };
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
-            } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("milk")) {
+            } else if p
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("milk"))
+            {
                 out.push(p);
             }
         }
@@ -43,7 +48,11 @@ impl Scenes {
     pub fn new(count: usize, screen: usize, screens: usize) -> Scenes {
         Scenes {
             count,
-            at: if screens == 0 { 0 } else { count * screen / screens.max(1) },
+            at: if screens == 0 {
+                0
+            } else {
+                count * screen / screens.max(1)
+            },
             phrase: None,
         }
     }
@@ -94,7 +103,11 @@ mod tests {
         assert_eq!(Scenes::new(100, 3, 4).current(), Some(75));
         assert_eq!(Scenes::new(0, 1, 4).current(), None);
         let mut s = Scenes::new(10, 0, 1);
-        assert_eq!(s.at_beat(5.0, 120.0, 0.0), None, "the first look only learns the phrase");
+        assert_eq!(
+            s.at_beat(5.0, 120.0, 0.0),
+            None,
+            "the first look only learns the phrase"
+        );
         assert_eq!(s.at_beat(31.0, 120.0, 0.0), None);
         assert_eq!(s.at_beat(32.0, 120.0, 0.0), Some(1));
         assert_eq!(s.at_beat(40.0, 120.0, 0.0), None);
@@ -114,6 +127,10 @@ mod tests {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, ["b.milk", "a.MILK"], "sorted by path: b.milk sorts before pack/");
+        assert_eq!(
+            names,
+            ["b.milk", "a.MILK"],
+            "sorted by path: b.milk sorts before pack/"
+        );
     }
 }

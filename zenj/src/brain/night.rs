@@ -264,7 +264,11 @@ impl Night {
 
     /// The forced next, ahead of any choice: the midnight track when its
     /// run-in is due, a track booked for now, or a "now" request.
-    pub fn forced(&self, now: DateTime<Local>, ends: Option<DateTime<Local>>) -> Option<(TrackId, String)> {
+    pub fn forced(
+        &self,
+        now: DateTime<Local>,
+        ends: Option<DateTime<Local>>,
+    ) -> Option<(TrackId, String)> {
         if let (Some(m), Some(ends)) = (&self.midnight_track, ends) {
             if !self.played_set.contains(m) {
                 if let Some(t) = self.library.get(m) {
@@ -289,7 +293,13 @@ impl Night {
     /// The plan from the playing track to the next, on `next_deck`, at the
     /// playing deck's `beat` now. For the midnight track, the start is moved
     /// so its drop lands on midnight.
-    pub fn plan_next(&self, next_deck: u8, beat: f64, bpm: f32, now: DateTime<Local>) -> Option<Plan> {
+    pub fn plan_next(
+        &self,
+        next_deck: u8,
+        beat: f64,
+        bpm: f32,
+        now: DateTime<Local>,
+    ) -> Option<Plan> {
         let (deck, _) = self.on_air.as_ref()?;
         let from = self.playing()?;
         let next = self.next.as_ref()?;
@@ -351,7 +361,10 @@ mod tests {
         } else {
             NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()
         };
-        Local.from_local_datetime(&d.and_hms_opt(h, m, 0).unwrap()).earliest().unwrap()
+        Local
+            .from_local_datetime(&d.and_hms_opt(h, m, 0).unwrap())
+            .earliest()
+            .unwrap()
     }
 
     fn analysed(id: &str, bpm: f32, key: &str, energy: f32) -> Profile {
@@ -364,7 +377,16 @@ mod tests {
     fn night() -> Night {
         let curve = Curve::of(
             NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
-            &[PointCfg { at: "20:00".into(), energy: 0.5 }, PointCfg { at: "00:00".into(), energy: 0.9 }],
+            &[
+                PointCfg {
+                    at: "20:00".into(),
+                    energy: 0.5,
+                },
+                PointCfg {
+                    at: "00:00".into(),
+                    energy: 0.9,
+                },
+            ],
         )
         .unwrap();
         let lib = Library::new(vec![
@@ -376,7 +398,10 @@ mod tests {
         Night::new(
             lib,
             curve,
-            Budget::new([("john".to_string(), 0.5), ("yen".to_string(), 0.5)].into(), 0.2),
+            Budget::new(
+                [("john".to_string(), 0.5), ("yen".to_string(), 0.5)].into(),
+                0.2,
+            ),
             at(0, 0),
         )
     }
@@ -404,13 +429,20 @@ mod tests {
         n.choose(TrackId("a".into()), "x".into());
         assert_eq!(
             n.see(&on("a", 0.0), at(22, 0)),
-            Some(Seen::OnAir { deck: 1, track: TrackId("a".into()) })
+            Some(Seen::OnAir {
+                deck: 1,
+                track: TrackId("a".into())
+            })
         );
         assert_eq!(n.next, None);
         assert_eq!(n.see(&on("a", 5000.0), at(22, 1)), None);
         assert_eq!(n.played.len(), 1);
         let ends = n.ends_at(&on("a", 60_000.0), at(22, 1)).unwrap();
-        assert_eq!((ends - at(22, 1)).num_milliseconds(), 60_000, "120 s long, 60 s in");
+        assert_eq!(
+            (ends - at(22, 1)).num_milliseconds(),
+            60_000,
+            "120 s long, 60 s in"
+        );
     }
 
     /// **The shortlist leaves out what has played; a request leads it, and
@@ -422,14 +454,29 @@ mod tests {
         let ids = |l: Vec<Scored>| l.into_iter().map(|s| s.id.0).collect::<Vec<_>>();
         let l = ids(n.shortlist(at(22, 2), 0.5));
         assert!(!l.contains(&"a".to_string()));
-        n.request(Request { track: TrackId("c".into()), by: "yen".into(), note: "for mum".into(), urgency: 1.0, now: false });
+        n.request(Request {
+            track: TrackId("c".into()),
+            by: "yen".into(),
+            note: "for mum".into(),
+            urgency: 1.0,
+            now: false,
+        });
         assert_eq!(ids(n.shortlist(at(22, 2), 0.5))[0], "c");
         let list = n.shortlist(at(22, 2), 0.5);
         let offers = n.offers(&list);
         assert_eq!(offers[0].request, Some(("yen", "for mum")));
-        n.request(Request { track: TrackId("b".into()), by: "john".into(), note: String::new(), urgency: 1.0, now: true });
+        n.request(Request {
+            track: TrackId("b".into()),
+            by: "john".into(),
+            note: String::new(),
+            urgency: 1.0,
+            now: true,
+        });
         assert_eq!(n.next.as_ref().unwrap().track, TrackId("b".into()));
-        assert_eq!(n.next.as_ref().unwrap().requested_by.as_deref(), Some("john"));
+        assert_eq!(
+            n.next.as_ref().unwrap().requested_by.as_deref(),
+            Some("john")
+        );
     }
 
     /// **The midnight track is forced when the playing one would run past
@@ -441,10 +488,15 @@ mod tests {
         n.see(&on("a", 0.0), at(23, 50));
         // m's drop is beat 64 at 128 BPM: it starts 30 s before midnight.
         let early = at(23, 50);
-        assert_eq!(n.forced(early, Some(early + Duration::minutes(2))), None, "ten minutes out");
+        assert_eq!(
+            n.forced(early, Some(early + Duration::minutes(2))),
+            None,
+            "ten minutes out"
+        );
         let near = at(23, 58);
         assert_eq!(
-            n.forced(near, Some(near + Duration::seconds(90))).map(|f| f.0),
+            n.forced(near, Some(near + Duration::seconds(90)))
+                .map(|f| f.0),
             Some(TrackId("m".into()))
         );
         n.choose(TrackId("m".into()), "the midnight track".into());
@@ -457,10 +509,21 @@ mod tests {
     #[test]
     fn bookings_fire_once_when_due() {
         let mut n = night();
-        n.bookings.push(Booking { at: at(22, 30), what: Booked::Sample(3), done: false });
-        n.bookings.push(Booking { at: at(22, 30), what: Booked::Track(TrackId("c".into())), done: false });
+        n.bookings.push(Booking {
+            at: at(22, 30),
+            what: Booked::Sample(3),
+            done: false,
+        });
+        n.bookings.push(Booking {
+            at: at(22, 30),
+            what: Booked::Track(TrackId("c".into())),
+            done: false,
+        });
         assert!(n.due(at(22, 29)).is_empty());
-        assert_eq!(n.forced(at(22, 31), None).map(|f| f.0), Some(TrackId("c".into())));
+        assert_eq!(
+            n.forced(at(22, 31), None).map(|f| f.0),
+            Some(TrackId("c".into()))
+        );
         assert_eq!(n.due(at(22, 31)), vec![Booked::Sample(3)]);
         assert!(n.due(at(22, 32)).is_empty());
         for i in 0..10 {

@@ -202,7 +202,10 @@ mod tests {
         assert_eq!(t.external_ids.isrc.as_deref(), Some("SEAYD7601020"));
         assert_eq!(t.year(), Some(1976));
         assert_eq!(page.items[0].added_by.as_ref().unwrap().id, "yen");
-        assert_eq!(page.items[1].track.as_ref().unwrap().id.as_deref(), Some("T2"));
+        assert_eq!(
+            page.items[1].track.as_ref().unwrap().id.as_deref(),
+            Some("T2")
+        );
         assert_eq!(page.items[2].track, None);
         assert_eq!(page.next, None);
     }

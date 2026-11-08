@@ -9,15 +9,40 @@
 /// One message. Channels are 0–15.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    NoteOff { channel: u8, note: u8, velocity: u8 },
+    NoteOff {
+        channel: u8,
+        note: u8,
+        velocity: u8,
+    },
     /// A note-on with velocity 0 is decoded as the note-off it means.
-    NoteOn { channel: u8, note: u8, velocity: u8 },
-    PolyPressure { channel: u8, note: u8, pressure: u8 },
-    Control { channel: u8, control: u8, value: u8 },
-    Program { channel: u8, program: u8 },
-    ChannelPressure { channel: u8, pressure: u8 },
+    NoteOn {
+        channel: u8,
+        note: u8,
+        velocity: u8,
+    },
+    PolyPressure {
+        channel: u8,
+        note: u8,
+        pressure: u8,
+    },
+    Control {
+        channel: u8,
+        control: u8,
+        value: u8,
+    },
+    Program {
+        channel: u8,
+        program: u8,
+    },
+    ChannelPressure {
+        channel: u8,
+        pressure: u8,
+    },
     /// 14 bits, centre 8192.
-    PitchBend { channel: u8, value: u16 },
+    PitchBend {
+        channel: u8,
+        value: u16,
+    },
     /// The bytes between `F0` and `F7`, neither included.
     SysEx(Vec<u8>),
     /// A system common message (`F1`–`F6`), with its data.

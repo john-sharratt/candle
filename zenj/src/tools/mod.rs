@@ -73,11 +73,17 @@ pub struct Answer {
 
 impl Answer {
     pub fn ok(text: impl Into<String>) -> Answer {
-        Answer { text: text.into(), is_error: false }
+        Answer {
+            text: text.into(),
+            is_error: false,
+        }
     }
 
     pub fn error(text: impl Into<String>) -> Answer {
-        Answer { text: text.into(), is_error: true }
+        Answer {
+            text: text.into(),
+            is_error: true,
+        }
     }
 }
 

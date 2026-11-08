@@ -43,7 +43,9 @@ mod tests {
     fn a_verifier_is_43_url_safe_characters_and_fresh() {
         let v = verifier();
         assert_eq!(v.len(), 43);
-        assert!(v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        assert!(v
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
         assert_ne!(v, verifier());
     }
 }

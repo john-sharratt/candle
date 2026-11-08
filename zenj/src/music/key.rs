@@ -124,7 +124,9 @@ impl Camelot {
             _ => return None,
         };
         let number: u8 = digits.parse().ok()?;
-        (1..=12).contains(&number).then_some(Camelot { number, minor })
+        (1..=12)
+            .contains(&number)
+            .then_some(Camelot { number, minor })
     }
 
     /// Steps round the wheel from `self` to `other`, ignoring mode: 0 to 6.

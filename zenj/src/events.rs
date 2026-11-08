@@ -95,7 +95,11 @@ impl Events {
     /// Up to `limit` events after `cursor`, oldest first.
     pub fn since(&self, cursor: u64, limit: usize) -> Vec<Event> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.1.iter().filter(|e| e.id > cursor).take(limit).cloned().collect()
+        g.1.iter()
+            .filter(|e| e.id > cursor)
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// The newest event's number.
@@ -134,7 +138,12 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let kinds: Vec<String> = text
             .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["kind"].as_str().unwrap().to_string())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
         assert_eq!(kinds, ["track", "fault", "said"], "added to, not replaced");
     }

@@ -128,7 +128,12 @@ mod tests {
     fn the_curve_runs_through_midnight_in_straight_lines() {
         let c = Curve::of(
             night(),
-            &cfg(&[("20:00", 0.4), ("23:00", 0.7), ("00:00", 1.0), ("02:00", 0.5)]),
+            &cfg(&[
+                ("20:00", 0.4),
+                ("23:00", 0.7),
+                ("00:00", 1.0),
+                ("02:00", 0.5),
+            ]),
         )
         .unwrap();
         assert_eq!(c.points()[2].0, at(1, 0, 0));
@@ -144,7 +149,10 @@ mod tests {
         let c = Curve::of(night(), &cfg(&[("20:00", 0.4), ("00:00", 0.9)])).unwrap();
         let n = c.nudged(at(31, 22, 0), Duration::minutes(30), 0.2);
         assert!((n.target(at(31, 22, 15)) - (0.65 + 0.03125 + 0.2)).abs() < 1e-4);
-        assert!((n.target(at(31, 21, 0)) - 0.525).abs() < 1e-4, "before the window");
+        assert!(
+            (n.target(at(31, 21, 0)) - 0.525).abs() < 1e-4,
+            "before the window"
+        );
         let max = c.nudged(at(31, 23, 50), Duration::minutes(30), 0.5);
         assert_eq!(max.target(at(31, 23, 55)), 1.0);
     }

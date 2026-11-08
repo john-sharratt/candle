@@ -76,12 +76,13 @@ pub fn out(c: &Profile, m: &Moment<'_>) -> Option<Out> {
         return Some(Out::Played);
     }
     let recent = &m.recent_artists[..m.recent_artists.len().min(ARTIST_GAP)];
-    if c.artists.iter().any(|a| recent.iter().any(|r| r.eq_ignore_ascii_case(a))) {
+    if c.artists
+        .iter()
+        .any(|a| recent.iter().any(|r| r.eq_ignore_ascii_case(a)))
+    {
         return Some(Out::Artist);
     }
-    let Some(after) = m.after else {
-        return None;
-    };
+    let after = m.after?;
     if tempo_gap(after.grid.bpm, c.grid.bpm) > TEMPO_MAX {
         return Some(Out::Tempo);
     }
@@ -277,11 +278,17 @@ mod tests {
         let twin = club("q", 128.0, "8A", 0.6);
         let mut w = World::new();
         for i in 0..3 {
-            w.budget.count(&by(club(&format!("h{i}"), 128.0, "8A", 0.6), &[("john", 1.0)]), false);
+            w.budget.count(
+                &by(club(&format!("h{i}"), 128.0, "8A", 0.6), &[("john", 1.0)]),
+                false,
+            );
         }
         let all = [johns.clone(), yens.clone(), plain.clone(), twin.clone()];
         let ids = |l: Vec<Scored>| l.into_iter().map(|s| s.id.0).collect::<Vec<_>>();
-        assert_eq!(ids(shortlist(&all, &w.moment(&now, 0.6), 8)), ["y", "j", "p", "q"]);
+        assert_eq!(
+            ids(shortlist(&all, &w.moment(&now, 0.6), 8)),
+            ["y", "j", "p", "q"]
+        );
         w.requests.insert(plain.id.clone(), 0.5);
         assert_eq!(ids(shortlist(&all, &w.moment(&now, 0.6), 2)), ["p", "y"]);
     }

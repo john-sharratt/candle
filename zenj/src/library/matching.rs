@@ -44,7 +44,10 @@ pub fn agrees(w: &Wanted, t: &Track) -> bool {
     let (a, b) = (normal(&w.title), normal(&t.title));
     let titles = !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a));
     let artists = w.artists.iter().map(|x| normal(x)).any(|x| {
-        t.artists.iter().map(|y| normal(y)).any(|y| !x.is_empty() && (x == y || x.contains(&y) || y.contains(&x)))
+        t.artists
+            .iter()
+            .map(|y| normal(y))
+            .any(|y| !x.is_empty() && (x == y || x.contains(&y) || y.contains(&x)))
     });
     let lengths = w.duration_ms == 0
         || t.duration_ms == 0
@@ -88,9 +91,13 @@ pub fn by_search(w: &Wanted, results: &[Track]) -> Result<Track, String> {
 
 /// The search ZenJ runs for `w`.
 pub fn query(w: &Wanted) -> String {
-    format!("{} {}", w.artists.first().map(String::as_str).unwrap_or(""), normal(&w.title))
-        .trim()
-        .to_string()
+    format!(
+        "{} {}",
+        w.artists.first().map(String::as_str).unwrap_or(""),
+        normal(&w.title)
+    )
+    .trim()
+    .to_string()
 }
 
 #[cfg(test)]
@@ -120,7 +127,10 @@ mod tests {
 
     #[test]
     fn titles_and_names_reduce_to_what_catalogues_agree_on() {
-        assert_eq!(normal("Don't Stop Me Now - Remastered 2011"), "don t stop me now");
+        assert_eq!(
+            normal("Don't Stop Me Now - Remastered 2011"),
+            "don t stop me now"
+        );
         assert_eq!(normal("Titanium (feat. Sia)"), "titanium");
         assert_eq!(normal("One More Time [Radio Edit]"), "one more time");
         assert_eq!(normal("Simon & Garfunkel"), "simon and garfunkel");
@@ -141,7 +151,10 @@ mod tests {
             ],
         );
         assert_eq!(found.map(|t| t.id), Some("2".into()));
-        assert_eq!(by_isrc(&w, &[tidal("9", "Titanium", "David Guetta", 400_000)]), None);
+        assert_eq!(
+            by_isrc(&w, &[tidal("9", "Titanium", "David Guetta", 400_000)]),
+            None
+        );
     }
 
     /// **A search is accepted only when exactly one result agrees.**
@@ -149,9 +162,15 @@ mod tests {
     fn a_search_is_accepted_only_when_one_agrees() {
         let w = wanted("Dancing Queen", "ABBA", 231_000);
         assert_eq!(
-            by_search(&w, &[tidal("1", "Dancing Queen", "ABBA", 230_000), tidal("2", "Dancing Queen", "Cover Band", 231_000)])
-                .unwrap()
-                .id,
+            by_search(
+                &w,
+                &[
+                    tidal("1", "Dancing Queen", "ABBA", 230_000),
+                    tidal("2", "Dancing Queen", "Cover Band", 231_000)
+                ]
+            )
+            .unwrap()
+            .id,
             "1"
         );
         assert_eq!(
@@ -159,8 +178,14 @@ mod tests {
             "no TIDAL track agrees with ABBA — Dancing Queen"
         );
         assert_eq!(
-            by_search(&w, &[tidal("1", "Dancing Queen", "ABBA", 230_000), tidal("2", "Dancing Queen - Live", "ABBA", 232_000)])
-                .unwrap_err(),
+            by_search(
+                &w,
+                &[
+                    tidal("1", "Dancing Queen", "ABBA", 230_000),
+                    tidal("2", "Dancing Queen - Live", "ABBA", 232_000)
+                ]
+            )
+            .unwrap_err(),
             "2 TIDAL tracks agree with ABBA — Dancing Queen: not guessed"
         );
         assert_eq!(query(&w), "ABBA dancing queen");

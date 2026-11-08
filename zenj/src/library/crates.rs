@@ -58,8 +58,14 @@ mod tests {
         t.year = Some(1994);
         t.tags = vec!["anthem".into()];
         t.liked = vec![
-            Liked { person: "john".into(), weight: 0.9 },
-            Liked { person: "yen".into(), weight: 0.4 },
+            Liked {
+                person: "john".into(),
+                weight: 0.9,
+            },
+            Liked {
+                person: "yen".into(),
+                weight: 0.4,
+            },
         ];
         assert_eq!(crates_of(&t, &people), [PEAK, CLASSICS, MIDNIGHT, BOTH]);
         t.liked.pop();

@@ -164,56 +164,190 @@ pub fn plan(pair: &Pair<'_>) -> Plan {
     // Before any style: the next deck silent and its bass out, synced.
     let mut steps = vec![
         at(s - 16.0, Move::Match { deck: b }),
-        at(s - 16.0, Move::Set { knob: Knob::Fader(b), to: 0.0 }),
-        at(s - 16.0, Move::Set { knob: Knob::Filter(b), to: 0.5 }),
+        at(
+            s - 16.0,
+            Move::Set {
+                knob: Knob::Fader(b),
+                to: 0.0,
+            },
+        ),
+        at(
+            s - 16.0,
+            Move::Set {
+                knob: Knob::Filter(b),
+                to: 0.5,
+            },
+        ),
     ];
     let end = match style {
         Style::Blend => {
             let len = blend_len(pair.from, start, pair.to) as f64;
             let half = (len / 8.0).floor() * 4.0;
             steps.extend([
-                at(s - 16.0, Move::Set { knob: low(b), to: 0.0 }),
+                at(
+                    s - 16.0,
+                    Move::Set {
+                        knob: low(b),
+                        to: 0.0,
+                    },
+                ),
                 at(s, Move::Start { deck: b }),
-                at(s, Move::Ramp { knob: Knob::Fader(b), to: 1.0, beats: half }),
-                at(s + half, Move::Set { knob: low(a), to: 0.0 }),
-                at(s + half, Move::Set { knob: low(b), to: 0.5 }),
-                at(s + half, Move::Ramp { knob: Knob::Fader(a), to: 0.0, beats: len - half }),
+                at(
+                    s,
+                    Move::Ramp {
+                        knob: Knob::Fader(b),
+                        to: 1.0,
+                        beats: half,
+                    },
+                ),
+                at(
+                    s + half,
+                    Move::Set {
+                        knob: low(a),
+                        to: 0.0,
+                    },
+                ),
+                at(
+                    s + half,
+                    Move::Set {
+                        knob: low(b),
+                        to: 0.5,
+                    },
+                ),
+                at(
+                    s + half,
+                    Move::Ramp {
+                        knob: Knob::Fader(a),
+                        to: 0.0,
+                        beats: len - half,
+                    },
+                ),
                 at(s + len, Move::Stop { deck: a }),
-                at(s + len, Move::Set { knob: low(a), to: 0.5 }),
+                at(
+                    s + len,
+                    Move::Set {
+                        knob: low(a),
+                        to: 0.5,
+                    },
+                ),
             ]);
             s + len
         }
         Style::Cut => {
             steps.extend([
-                at(s - 16.0, Move::Set { knob: low(b), to: 0.5 }),
+                at(
+                    s - 16.0,
+                    Move::Set {
+                        knob: low(b),
+                        to: 0.5,
+                    },
+                ),
                 at(s, Move::Start { deck: b }),
-                at(s, Move::Set { knob: Knob::Fader(b), to: 1.0 }),
-                at(s, Move::Set { knob: Knob::Fader(a), to: 0.0 }),
+                at(
+                    s,
+                    Move::Set {
+                        knob: Knob::Fader(b),
+                        to: 1.0,
+                    },
+                ),
+                at(
+                    s,
+                    Move::Set {
+                        knob: Knob::Fader(a),
+                        to: 0.0,
+                    },
+                ),
                 at(s + 4.0, Move::Stop { deck: a }),
             ]);
             s + 4.0
         }
         Style::EchoOut => {
             steps.extend([
-                at(s - 16.0, Move::Set { knob: low(b), to: 0.5 }),
-                at(s - 4.0, Move::Set { knob: Knob::FxLevel, to: 0.7 }),
-                at(s - 4.0, Move::Press { button: Button::Fx(a) }),
-                at(s, Move::Set { knob: Knob::Fader(a), to: 0.0 }),
+                at(
+                    s - 16.0,
+                    Move::Set {
+                        knob: low(b),
+                        to: 0.5,
+                    },
+                ),
+                at(
+                    s - 4.0,
+                    Move::Set {
+                        knob: Knob::FxLevel,
+                        to: 0.7,
+                    },
+                ),
+                at(
+                    s - 4.0,
+                    Move::Press {
+                        button: Button::Fx(a),
+                    },
+                ),
+                at(
+                    s,
+                    Move::Set {
+                        knob: Knob::Fader(a),
+                        to: 0.0,
+                    },
+                ),
                 at(s, Move::Start { deck: b }),
-                at(s, Move::Ramp { knob: Knob::Fader(b), to: 1.0, beats: 4.0 }),
-                at(s + 8.0, Move::Press { button: Button::Fx(a) }),
+                at(
+                    s,
+                    Move::Ramp {
+                        knob: Knob::Fader(b),
+                        to: 1.0,
+                        beats: 4.0,
+                    },
+                ),
+                at(
+                    s + 8.0,
+                    Move::Press {
+                        button: Button::Fx(a),
+                    },
+                ),
                 at(s + 8.0, Move::Stop { deck: a }),
             ]);
             s + 8.0
         }
         Style::FilterSweep => {
             steps.extend([
-                at(s - 16.0, Move::Set { knob: low(b), to: 0.5 }),
-                at(s - 16.0, Move::Ramp { knob: Knob::Filter(a), to: 0.1, beats: 16.0 }),
-                at(s, Move::Set { knob: Knob::Fader(a), to: 0.0 }),
+                at(
+                    s - 16.0,
+                    Move::Set {
+                        knob: low(b),
+                        to: 0.5,
+                    },
+                ),
+                at(
+                    s - 16.0,
+                    Move::Ramp {
+                        knob: Knob::Filter(a),
+                        to: 0.1,
+                        beats: 16.0,
+                    },
+                ),
+                at(
+                    s,
+                    Move::Set {
+                        knob: Knob::Fader(a),
+                        to: 0.0,
+                    },
+                ),
                 at(s, Move::Start { deck: b }),
-                at(s, Move::Set { knob: Knob::Fader(b), to: 1.0 }),
-                at(s + 4.0, Move::Set { knob: Knob::Filter(a), to: 0.5 }),
+                at(
+                    s,
+                    Move::Set {
+                        knob: Knob::Fader(b),
+                        to: 1.0,
+                    },
+                ),
+                at(
+                    s + 4.0,
+                    Move::Set {
+                        knob: Knob::Filter(a),
+                        to: 0.5,
+                    },
+                ),
                 at(s + 4.0, Move::Stop { deck: a }),
             ]);
             s + 4.0
@@ -275,19 +409,72 @@ mod tests {
             moves(&p),
             vec![
                 (208.0, Move::Match { deck: 2 }),
-                (208.0, Move::Set { knob: Knob::Fader(2), to: 0.0 }),
-                (208.0, Move::Set { knob: Knob::Filter(2), to: 0.5 }),
-                (208.0, Move::Set { knob: low(2), to: 0.0 }),
+                (
+                    208.0,
+                    Move::Set {
+                        knob: Knob::Fader(2),
+                        to: 0.0
+                    }
+                ),
+                (
+                    208.0,
+                    Move::Set {
+                        knob: Knob::Filter(2),
+                        to: 0.5
+                    }
+                ),
+                (
+                    208.0,
+                    Move::Set {
+                        knob: low(2),
+                        to: 0.0
+                    }
+                ),
                 (224.0, Move::Start { deck: 2 }),
-                (224.0, Move::Ramp { knob: Knob::Fader(2), to: 1.0, beats: 16.0 }),
-                (240.0, Move::Set { knob: low(1), to: 0.0 }),
-                (240.0, Move::Set { knob: low(2), to: 0.5 }),
-                (240.0, Move::Ramp { knob: Knob::Fader(1), to: 0.0, beats: 16.0 }),
+                (
+                    224.0,
+                    Move::Ramp {
+                        knob: Knob::Fader(2),
+                        to: 1.0,
+                        beats: 16.0
+                    }
+                ),
+                (
+                    240.0,
+                    Move::Set {
+                        knob: low(1),
+                        to: 0.0
+                    }
+                ),
+                (
+                    240.0,
+                    Move::Set {
+                        knob: low(2),
+                        to: 0.5
+                    }
+                ),
+                (
+                    240.0,
+                    Move::Ramp {
+                        knob: Knob::Fader(1),
+                        to: 0.0,
+                        beats: 16.0
+                    }
+                ),
                 (256.0, Move::Stop { deck: 1 }),
-                (256.0, Move::Set { knob: low(1), to: 0.5 }),
+                (
+                    256.0,
+                    Move::Set {
+                        knob: low(1),
+                        to: 0.5
+                    }
+                ),
             ]
         );
-        assert!(p.steps.iter().all(|s| s.at % 4.0 == 0.0), "every move on a bar");
+        assert!(
+            p.steps.iter().all(|s| s.at % 4.0 == 0.0),
+            "every move on a bar"
+        );
     }
 
     /// **The start leaves time to arm**: with the outro too close, the last
@@ -309,23 +496,44 @@ mod tests {
         let clash = club("c", 128.0, "3B", 0.5);
         let p = plan(&pair(&a, &clash, 0.0));
         assert_eq!(p.style, Style::EchoOut);
-        assert_eq!(p.why, "8A → 3B clash: echo out rather than lay them together");
-        assert!(moves(&p).contains(&(220.0, Move::Press { button: Button::Fx(1) })));
+        assert_eq!(
+            p.why,
+            "8A → 3B clash: echo out rather than lay them together"
+        );
+        assert!(moves(&p).contains(&(
+            220.0,
+            Move::Press {
+                button: Button::Fx(1)
+            }
+        )));
         assert_eq!(p.end, 232.0);
 
         let lift = club("l", 128.0, "8A", 0.8);
         let p = plan(&pair(&a, &lift, 0.0));
         assert_eq!(p.style, Style::Cut);
         assert_eq!(p.why, "a lift of 0.30: cut in on the phrase");
-        assert!(moves(&p).contains(&(224.0, Move::Set { knob: Knob::Fader(1), to: 0.0 })));
+        assert!(moves(&p).contains(&(
+            224.0,
+            Move::Set {
+                knob: Knob::Fader(1),
+                to: 0.0
+            }
+        )));
 
         let slow = club("s", 100.0, "8A", 0.5);
         let p = plan(&pair(&a, &slow, 0.0));
         assert_eq!(p.style, Style::FilterSweep);
-        assert_eq!(p.why, "128 → 100 BPM is too far to blend: filter out, then in");
+        assert_eq!(
+            p.why,
+            "128 → 100 BPM is too far to blend: filter out, then in"
+        );
         assert!(moves(&p).contains(&(
             208.0,
-            Move::Ramp { knob: Knob::Filter(1), to: 0.1, beats: 16.0 }
+            Move::Ramp {
+                knob: Knob::Filter(1),
+                to: 0.1,
+                beats: 16.0
+            }
         )));
     }
 

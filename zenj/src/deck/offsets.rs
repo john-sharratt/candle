@@ -30,7 +30,9 @@ impl Chain {
     pub fn parse(line: &str) -> Result<Chain, String> {
         let values = line
             .split_whitespace()
-            .map(|v| usize::from_str_radix(v, 16).map_err(|_| format!("`{v}` is not hex in `{line}`")))
+            .map(|v| {
+                usize::from_str_radix(v, 16).map_err(|_| format!("`{v}` is not hex in `{line}`"))
+            })
             .collect::<Result<Vec<usize>, String>>()?;
         let (last, hops) = values
             .split_last()
@@ -63,7 +65,10 @@ pub struct Offsets {
 fn block(lines: &[String]) -> Result<Offsets, String> {
     let mut rows = lines.iter().peekable();
     let version = rows.next().ok_or("an empty block")?.clone();
-    let master = Chain::parse(rows.next().ok_or_else(|| format!("{version}: no master chain"))?)?;
+    let master = Chain::parse(
+        rows.next()
+            .ok_or_else(|| format!("{version}: no master chain"))?,
+    )?;
     let mut decks = Vec::new();
     while rows.peek().is_some() {
         let mut next = |what: &str| {

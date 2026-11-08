@@ -138,9 +138,14 @@ impl Hands {
                 if b.is_transport() && self.mode() != Mode::Human {
                     return Some(Change::HandedBack);
                 }
-                for (mode, combo) in [(Mode::Zenj, &self.combos.zenj), (Mode::Assist, &self.combos.assist)] {
+                for (mode, combo) in [
+                    (Mode::Zenj, &self.combos.zenj),
+                    (Mode::Assist, &self.combos.assist),
+                ] {
                     let held = !combo.is_empty()
-                        && combo.iter().all(|c| matches!(c, Control::Button(x) if self.down.contains(x)));
+                        && combo
+                            .iter()
+                            .all(|c| matches!(c, Control::Button(x) if self.down.contains(x)));
                     if held && self.mode() != mode {
                         return Some(Change::Asked(mode));
                     }
@@ -186,7 +191,11 @@ mod tests {
     fn press(b: Button, down: bool) -> Touch {
         Touch {
             control: b.into(),
-            reading: if down { Reading::Pressed } else { Reading::Released },
+            reading: if down {
+                Reading::Pressed
+            } else {
+                Reading::Released
+            },
             at: Instant::now(),
         }
     }
@@ -206,11 +215,21 @@ mod tests {
         h.set_mode(Mode::Zenj);
         h.moved(Knob::Fader(2), 1.0);
         assert!(h.may_move(Knob::Fader(2)));
-        assert_eq!(h.touch(&knob(Knob::Fader(1), 0.8)), None, "not held: just noted");
-        assert_eq!(h.touch(&knob(Knob::Fader(2), 0.6)), Some(Change::TookBack(Knob::Fader(2))));
+        assert_eq!(
+            h.touch(&knob(Knob::Fader(1), 0.8)),
+            None,
+            "not held: just noted"
+        );
+        assert_eq!(
+            h.touch(&knob(Knob::Fader(2), 0.6)),
+            Some(Change::TookBack(Knob::Fader(2)))
+        );
         assert!(!h.may_move(Knob::Fader(2)));
         assert!(h.may_move(Knob::Fader(1)));
-        assert_eq!(h.touch(&press(Button::Jog(1), true)), Some(Change::HandedBack));
+        assert_eq!(
+            h.touch(&press(Button::Jog(1), true)),
+            Some(Change::HandedBack)
+        );
         h.set_mode(Mode::Human);
         assert!(!h.may_move(Knob::Fader(1)));
     }
@@ -222,11 +241,21 @@ mod tests {
         let mut h = Hands::new(combos());
         assert_eq!(h.touch(&press(Button::HotCue(2, 7), true)), None);
         assert_eq!(h.touch(&press(Button::HotCue(2, 7), false)), None);
-        assert_eq!(h.touch(&press(Button::HotCue(2, 8), true)), None, "the first was let go");
-        assert_eq!(h.touch(&press(Button::HotCue(2, 7), true)), Some(Change::Asked(Mode::Zenj)));
+        assert_eq!(
+            h.touch(&press(Button::HotCue(2, 8), true)),
+            None,
+            "the first was let go"
+        );
+        assert_eq!(
+            h.touch(&press(Button::HotCue(2, 7), true)),
+            Some(Change::Asked(Mode::Zenj))
+        );
         h.set_mode(Mode::Zenj);
         assert_eq!(h.touch(&press(Button::HotCue(1, 7), true)), None);
-        assert_eq!(h.touch(&press(Button::HotCue(1, 8), true)), Some(Change::Asked(Mode::Assist)));
+        assert_eq!(
+            h.touch(&press(Button::HotCue(1, 8), true)),
+            Some(Change::Asked(Mode::Assist))
+        );
     }
 
     /// **The walk back takes each held knob to the hardware**, over the
@@ -245,8 +274,22 @@ mod tests {
         assert_eq!(
             walk,
             vec![
-                (64.0, Move::Ramp { knob: Knob::Fader(1), to: 0.2, beats: 4.0 }),
-                (64.0, Move::Ramp { knob: Knob::Filter(2), to: 0.5, beats: 4.0 }),
+                (
+                    64.0,
+                    Move::Ramp {
+                        knob: Knob::Fader(1),
+                        to: 0.2,
+                        beats: 4.0
+                    }
+                ),
+                (
+                    64.0,
+                    Move::Ramp {
+                        knob: Knob::Filter(2),
+                        to: 0.5,
+                        beats: 4.0
+                    }
+                ),
             ]
         );
         assert!(h.walk_back(68.0, 4.0).is_empty(), "released");

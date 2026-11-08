@@ -26,14 +26,22 @@ impl Tool for Now {
 /// The view, said.
 pub fn say(l: &Live) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "Mode: {}{}", l.mode.name(), if l.automix { " (Automix on)" } else { "" });
+    let _ = writeln!(
+        s,
+        "Mode: {}{}",
+        l.mode.name(),
+        if l.automix { " (Automix on)" } else { "" }
+    );
     for d in &l.decks {
         if d.title.is_empty() {
             let _ = writeln!(s, "Deck {}: empty", d.number);
             continue;
         }
         let air = if d.on_air { "ON AIR " } else { "" };
-        let left = d.bars_left.map(|b| format!(", {b:.0} bars left")).unwrap_or_default();
+        let left = d
+            .bars_left
+            .map(|b| format!(", {b:.0} bars left"))
+            .unwrap_or_default();
         let _ = writeln!(
             s,
             "Deck {}: {air}{} — {} ({:.1} BPM{}{left})",
@@ -46,7 +54,11 @@ pub fn say(l: &Live) -> String {
     }
     match &l.next {
         Some(n) => {
-            let by = n.requested_by.as_deref().map(|b| format!(" — {b}'s request")).unwrap_or_default();
+            let by = n
+                .requested_by
+                .as_deref()
+                .map(|b| format!(" — {b}'s request"))
+                .unwrap_or_default();
             let _ = writeln!(s, "Next: {} — {}{by}. Why: {}", n.artist, n.title, n.why);
             if let Some(style) = &n.style {
                 let _ = writeln!(s, "Armed: {style}");
@@ -107,7 +119,10 @@ mod tests {
                     playing: true,
                     on_air: true,
                 },
-                DeckView { number: 2, ..DeckView::default() },
+                DeckView {
+                    number: 2,
+                    ..DeckView::default()
+                },
             ],
             next: Some(NextView {
                 title: "Dancing Queen".into(),

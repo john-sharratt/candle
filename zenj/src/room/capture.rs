@@ -47,8 +47,16 @@ pub fn open(part: &str, mut sinks: Vec<Producer<f32>>) -> Result<Capture, String
     let device = host
         .output_devices()
         .map_err(|e| e.to_string())?
-        .find(|d| d.name().is_ok_and(|n| n.to_ascii_lowercase().contains(&want)))
-        .ok_or_else(|| format!("no output device named like `{part}` among {:?}", outputs().unwrap_or_default()))?;
+        .find(|d| {
+            d.name()
+                .is_ok_and(|n| n.to_ascii_lowercase().contains(&want))
+        })
+        .ok_or_else(|| {
+            format!(
+                "no output device named like `{part}` among {:?}",
+                outputs().unwrap_or_default()
+            )
+        })?;
     let name = device.name().unwrap_or_default();
     let config = device.default_output_config().map_err(|e| e.to_string())?;
     let channels = config.channels() as usize;
@@ -97,7 +105,11 @@ mod tests {
         let (p2, c2) = RingBuffer::new(8);
         let mut sinks = vec![p1, p2];
         hand_on(&mut sinks, m.iter().copied());
-        assert_eq!((c1.pop(), c1.pop(), c1.pop().is_err()), (Ok(0.5), Ok(0.5), true), "full: the rest dropped");
+        assert_eq!(
+            (c1.pop(), c1.pop(), c1.pop().is_err()),
+            (Ok(0.5), Ok(0.5), true),
+            "full: the rest dropped"
+        );
         assert_eq!(c2.slots(), 3, "all three for the roomier reader");
     }
 }

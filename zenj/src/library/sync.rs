@@ -189,7 +189,11 @@ pub async fn build(people: &[Person], tidal: &Tidal, limit: usize) -> Result<Lib
 
 /// Each crate's playlist on TIDAL made if it is missing, and every track
 /// that belongs in it added.
-pub async fn file_crates(lib: &mut Library, tidal: &Tidal, people: &[String]) -> Result<(), String> {
+pub async fn file_crates(
+    lib: &mut Library,
+    tidal: &Tidal,
+    people: &[String],
+) -> Result<(), String> {
     for name in ALL {
         let id = match lib.playlists.get(name) {
             Some(id) => id.clone(),
@@ -201,7 +205,12 @@ pub async fn file_crates(lib: &mut Library, tidal: &Tidal, people: &[String]) ->
                 id
             }
         };
-        let have: Vec<String> = tidal.items(&id).await?.into_iter().map(|i| i.track).collect();
+        let have: Vec<String> = tidal
+            .items(&id)
+            .await?
+            .into_iter()
+            .map(|i| i.track)
+            .collect();
         let missing: Vec<String> = lib
             .tracks
             .iter()
@@ -210,7 +219,11 @@ pub async fn file_crates(lib: &mut Library, tidal: &Tidal, people: &[String]) ->
             .filter(|t| !have.contains(t))
             .collect();
         tidal.add(&id, &missing, None).await?;
-        tracing::info!(crate_name = name, added = missing.len(), "library: crate filed");
+        tracing::info!(
+            crate_name = name,
+            added = missing.len(),
+            "library: crate filed"
+        );
     }
     Ok(())
 }
@@ -226,7 +239,12 @@ pub struct Analysed {
 
 /// Each library track's analysis from rekordbox's `contents` and the
 /// analysis files under `share`, matched by ISRC, then by TIDAL id.
-pub fn analyse(lib: &mut Library, contents: &[Content], share: &Path, people: &[String]) -> Analysed {
+pub fn analyse(
+    lib: &mut Library,
+    contents: &[Content],
+    share: &Path,
+    people: &[String],
+) -> Analysed {
     let by_isrc: HashMap<&str, &Content> = contents
         .iter()
         .filter_map(|c| Some((c.isrc.as_deref()?, c)))
@@ -238,18 +256,22 @@ pub fn analyse(lib: &mut Library, contents: &[Content], share: &Path, people: &[
     let mut out = Analysed::default();
     let ids: Vec<TrackId> = lib.tracks.iter().map(|t| t.id.clone()).collect();
     for id in ids {
-        let Some(t) = lib.get(&id).cloned() else { continue };
+        let Some(t) = lib.get(&id).cloned() else {
+            continue;
+        };
         let content = t
             .isrc
             .as_deref()
             .and_then(|i| by_isrc.get(i))
             .or_else(|| t.tidal_id.as_ref().and_then(|i| by_tidal.get(i)));
         let Some(c) = content else {
-            out.waiting.push(format!("{} — {}", t.artist_line(), t.title));
+            out.waiting
+                .push(format!("{} — {}", t.artist_line(), t.title));
             continue;
         };
         let Some(anlz) = &c.anlz else {
-            out.waiting.push(format!("{} — {}", t.artist_line(), t.title));
+            out.waiting
+                .push(format!("{} — {}", t.artist_line(), t.title));
             continue;
         };
         match read_analysis(&file(share, anlz)) {
@@ -312,7 +334,10 @@ mod tests {
             ],
             5,
         );
-        assert_eq!(c["B"].iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), ["john", "yen"]);
+        assert_eq!(
+            c["B"].iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            ["john", "yen"]
+        );
     }
 
     /// **rekordbox's analysis lands on the track it is of**, by ISRC: its
@@ -325,10 +350,19 @@ mod tests {
         let rel = "/PIONEER/USBANLZ/a1b/2c3d/ANLZ0000.DAT";
         let dat = file(share, rel);
         fs::create_dir_all(dat.parent().unwrap()).unwrap();
-        fs::write(&dat, anlz_build::file(&[anlz_build::grid(&[(1, 12400, 40), (2, 12400, 524)])])).unwrap();
+        fs::write(
+            &dat,
+            anlz_build::file(&[anlz_build::grid(&[(1, 12400, 40), (2, 12400, 524)])]),
+        )
+        .unwrap();
         fs::write(
             dat.with_extension("EXT"),
-            anlz_build::file(&[anlz_build::phrases(1, 129, &[(1, 1), (33, 5), (97, 6)], true)]),
+            anlz_build::file(&[anlz_build::phrases(
+                1,
+                129,
+                &[(1, 1), (33, 5), (97, 6)],
+                true,
+            )]),
         )
         .unwrap();
         let mut t = club("ISRC1", 120.0, "8A", 0.5);
@@ -353,12 +387,20 @@ mod tests {
         assert_eq!(r.analysed, 1);
         assert_eq!(r.waiting, vec!["ISRC2 artist — ISRC2 title".to_string()]);
         let p = lib.get(&TrackId("ISRC1".into())).unwrap();
-        assert_eq!(p.grid, Grid { bpm: 124.0, first_beat_ms: 40.0 });
+        assert_eq!(
+            p.grid,
+            Grid {
+                bpm: 124.0,
+                first_beat_ms: 40.0
+            }
+        );
         assert_eq!(p.key, Camelot::parse("7A"));
         assert_eq!(p.phrases.len(), 3);
         assert_eq!(p.anlz.as_deref(), Some(rel));
         assert_eq!(p.year, Some(2010));
         assert!(p.energy > 0.5, "a high mood: {}", p.energy);
-        assert!(lib.by_anlz("pioneer/usbanlz/a1b/2c3d/anlz0000.dat").is_some());
+        assert!(lib
+            .by_anlz("pioneer/usbanlz/a1b/2c3d/anlz0000.dat")
+            .is_some());
     }
 }

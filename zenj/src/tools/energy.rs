@@ -24,10 +24,18 @@ impl Tool for Energy {
 }
 
 pub async fn call(dj: &Dj, args: &Value) -> Answer {
-    let Some(by) = args.get("by").and_then(Value::as_f64).filter(|b| (-0.5..=0.5).contains(b)) else {
+    let Some(by) = args
+        .get("by")
+        .and_then(Value::as_f64)
+        .filter(|b| (-0.5..=0.5).contains(b))
+    else {
         return Answer::error("`by` is between -0.5 and 0.5");
     };
-    let minutes = args.get("minutes").and_then(Value::as_i64).unwrap_or(30).clamp(5, 120);
+    let minutes = args
+        .get("minutes")
+        .and_then(Value::as_i64)
+        .unwrap_or(30)
+        .clamp(5, 120);
     let by = by as f32;
     dj.ask(|reply| Ask::Energy { by, minutes, reply }).await
 }

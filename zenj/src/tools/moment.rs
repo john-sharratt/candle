@@ -28,10 +28,18 @@ impl Tool for MomentTool {
 
 /// The next `hh:mm` at or after `now`.
 pub fn next_at(hh_mm: &str, now: DateTime<Local>) -> Result<DateTime<Local>, String> {
-    let t = NaiveTime::parse_from_str(hh_mm, "%H:%M").map_err(|_| format!("`{hh_mm}` is not HH:MM"))?;
+    let t =
+        NaiveTime::parse_from_str(hh_mm, "%H:%M").map_err(|_| format!("`{hh_mm}` is not HH:MM"))?;
     let today = now.date_naive().and_time(t);
-    let at = Local.from_local_datetime(&today).earliest().ok_or("no such time today")?;
-    Ok(if at < now { at + TimeDelta::days(1) } else { at })
+    let at = Local
+        .from_local_datetime(&today)
+        .earliest()
+        .ok_or("no such time today")?;
+    Ok(if at < now {
+        at + TimeDelta::days(1)
+    } else {
+        at
+    })
 }
 
 pub async fn call(dj: &Dj, args: &Value) -> Answer {
@@ -40,8 +48,17 @@ pub async fn call(dj: &Dj, args: &Value) -> Answer {
         Ok(Err(e)) => return Answer::error(e),
         Err(a) => return a,
     };
-    let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty());
-    let what = match (s("track"), s("dedication"), args.get("sample").and_then(Value::as_u64)) {
+    let s = |k: &str| {
+        args.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+    };
+    let what = match (
+        s("track"),
+        s("dedication"),
+        args.get("sample").and_then(Value::as_u64),
+    ) {
         (Some(t), None, None) => BookWhat::Track(t.to_string()),
         (None, Some(d), None) => BookWhat::Dedication(d.to_string()),
         (None, None, Some(n)) if (1..=16).contains(&n) => BookWhat::Sample(n as u8),
@@ -57,8 +74,14 @@ mod tests {
     #[test]
     fn a_time_is_the_next_to_come() {
         let now = Local.with_ymd_and_hms(2026, 12, 31, 22, 0, 0).unwrap();
-        assert_eq!(next_at("22:30", now).unwrap(), Local.with_ymd_and_hms(2026, 12, 31, 22, 30, 0).unwrap());
-        assert_eq!(next_at("00:15", now).unwrap(), Local.with_ymd_and_hms(2027, 1, 1, 0, 15, 0).unwrap());
+        assert_eq!(
+            next_at("22:30", now).unwrap(),
+            Local.with_ymd_and_hms(2026, 12, 31, 22, 30, 0).unwrap()
+        );
+        assert_eq!(
+            next_at("00:15", now).unwrap(),
+            Local.with_ymd_and_hms(2027, 1, 1, 0, 15, 0).unwrap()
+        );
         assert_eq!(next_at("25:00", now).unwrap_err(), "`25:00` is not HH:MM");
     }
 }

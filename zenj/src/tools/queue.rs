@@ -23,7 +23,12 @@ impl Tool for Queue {
 }
 
 pub async fn call(dj: &Dj, args: &Value) -> Answer {
-    match args.get("pin").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+    match args
+        .get("pin")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(q) => {
             let query = q.to_string();
             dj.ask(|reply| Ask::Pin { query, reply }).await

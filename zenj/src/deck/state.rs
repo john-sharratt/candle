@@ -151,7 +151,10 @@ impl Judge {
                 seen.moved = Some(now);
             }
             seen.samples = Some(raw.samples);
-            let playing = loaded && seen.moved.is_some_and(|m| now.duration_since(m) < PLAYING_HOLD);
+            let playing = loaded
+                && seen
+                    .moved
+                    .is_some_and(|m| now.duration_since(m) < PLAYING_HOLD);
             let position_ms = raw.samples as f64 / SAMPLE_RATE * 1000.0;
             decks.push(Deck {
                 number,
@@ -244,9 +247,19 @@ mod tests {
         let s = j.judge(&[raw(120.0, 44_320, PATH), raw(0.0, 0, "")], 0, t1, &lib);
         assert!(s.deck(1).unwrap().playing);
         assert_eq!(s.on_air().map(|d| d.number), Some(1));
-        let held = j.judge(&[raw(120.0, 44_320, PATH), raw(0.0, 0, "")], 0, t1 + Duration::from_millis(200), &lib);
+        let held = j.judge(
+            &[raw(120.0, 44_320, PATH), raw(0.0, 0, "")],
+            0,
+            t1 + Duration::from_millis(200),
+            &lib,
+        );
         assert!(held.deck(1).unwrap().playing, "inside the hold");
-        let stopped = j.judge(&[raw(120.0, 44_320, PATH), raw(0.0, 0, "")], 0, t1 + Duration::from_millis(400), &lib);
+        let stopped = j.judge(
+            &[raw(120.0, 44_320, PATH), raw(0.0, 0, "")],
+            0,
+            t1 + Duration::from_millis(400),
+            &lib,
+        );
         assert!(!stopped.deck(1).unwrap().playing);
         assert_eq!(stopped.on_air(), None);
     }
@@ -261,19 +274,27 @@ mod tests {
         let now = Instant::now();
         let other = "/PIONEER/USBANLZ/fff/0000/ANLZ0000.DAT";
         assert_eq!(
-            j.judge(&[raw(120.0, 0, other)], 0, now, &lib).blind.as_deref(),
+            j.judge(&[raw(120.0, 0, other)], 0, now, &lib)
+                .blind
+                .as_deref(),
             Some("deck 1: pioneer/usbanlz/fff/0000/anlz0000.dat is in no library track")
         );
         assert_eq!(
-            j.judge(&[raw(900.0, 0, PATH)], 0, now, &lib).blind.as_deref(),
+            j.judge(&[raw(900.0, 0, PATH)], 0, now, &lib)
+                .blind
+                .as_deref(),
             Some("deck 1: a tempo of 900")
         );
         assert_eq!(
-            j.judge(&[raw(120.0, -44_100 * 61, PATH)], 0, now, &lib).blind.as_deref(),
+            j.judge(&[raw(120.0, -44_100 * 61, PATH)], 0, now, &lib)
+                .blind
+                .as_deref(),
             Some("deck 1: a position of -2690100")
         );
         assert_eq!(
-            j.judge(&[raw(0.0, 0, "garbage")], 0, now, &lib).blind.as_deref(),
+            j.judge(&[raw(0.0, 0, "garbage")], 0, now, &lib)
+                .blind
+                .as_deref(),
             Some("deck 1: `garbage` is no analysis file")
         );
         assert_eq!(

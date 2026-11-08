@@ -87,7 +87,10 @@ impl Zen {
 
     /// Zen's answer to `user` under `system`, or why there is none in time.
     pub async fn ask(&self, system: &str, user: &str) -> Result<String, String> {
-        let url = format!("{}/v1/chat/completions", self.cfg.gateway.trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.cfg.gateway.trim_end_matches('/')
+        );
         let send = self
             .http
             .post(&url)
@@ -124,6 +127,8 @@ mod tests {
     fn the_answer_is_the_first_choice_without_its_thinking() {
         let a = r#"{"choices": [{"message": {"role": "assistant", "content": "<think>hm</think>\n {\"pick\": 2} "}}]}"#;
         assert_eq!(answer(a).unwrap(), r#"{"pick": 2}"#);
-        assert!(answer(r#"{"error": "x"}"#).unwrap_err().starts_with("no answer"));
+        assert!(answer(r#"{"error": "x"}"#)
+            .unwrap_err()
+            .starts_with("no answer"));
     }
 }

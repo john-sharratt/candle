@@ -51,9 +51,9 @@ use zenj::http::router;
 use zenj::library::crates::{crates_of, BUILD, LIVE, NEXT, PEAK};
 use zenj::library::sync::{analyse, build, file_crates, Person};
 use zenj::library::{tags, Library};
-use zenj::music::{Profile, TrackId};
 use zenj::live::Live;
 use zenj::midi::{ports, Map, Out, Reading};
+use zenj::music::{Profile, TrackId};
 use zenj::oauth::{login, Account};
 use zenj::presence;
 use zenj::rekordbox::masterdb::{contents, decrypt_to};
@@ -116,7 +116,11 @@ fn logging(state: &Path) {
             .with_filter(filter())
     });
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(io::stderr).with_filter(filter()))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stderr)
+                .with_filter(filter()),
+        )
         .with(to_file)
         .init();
 }
@@ -143,7 +147,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
-    Ok(tokio::runtime::Builder::new_multi_thread().enable_all().build()?)
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?)
 }
 
 /// Start `zenj` again whenever it stops, a few seconds after.
@@ -152,9 +158,16 @@ fn watch(config: &Path) -> anyhow::Result<()> {
     loop {
         let started = Instant::now();
         let status = Process::new(&exe).arg("--config").arg(config).status();
-        eprintln!("zenj watch: zenj stopped ({status:?}) after {:?}", started.elapsed());
+        eprintln!(
+            "zenj watch: zenj stopped ({status:?}) after {:?}",
+            started.elapsed()
+        );
         // A crash at start is not retried in a tight loop.
-        let wait = if started.elapsed() < Duration::from_secs(30) { 10 } else { 2 };
+        let wait = if started.elapsed() < Duration::from_secs(30) {
+            10
+        } else {
+            2
+        };
         thread::sleep(Duration::from_secs(wait));
     }
 }
@@ -171,31 +184,49 @@ fn account(config: &Config, name: &str) -> anyhow::Result<Account> {
 async fn sign_in(config: &Config, name: &str) -> anyhow::Result<()> {
     let provider = if name == Config::TIDAL_ACCOUNT {
         config.tidal.provider.clone()
-    } else if config.names().iter().any(|p| Config::spotify_account(p) == name) {
+    } else if config
+        .names()
+        .iter()
+        .any(|p| Config::spotify_account(p) == name)
+    {
         config.spotify.provider.clone()
     } else {
         return Err(anyhow!(
             "`{name}` is no account: tidal, or one of {}",
-            config.names().iter().map(|p| Config::spotify_account(p)).collect::<Vec<_>>().join(", ")
+            config
+                .names()
+                .iter()
+                .map(|p| Config::spotify_account(p))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     };
-    login(&provider, &config.state, name).await.map_err(|e| anyhow!(e))?;
+    login(&provider, &config.state, name)
+        .await
+        .map_err(|e| anyhow!(e))?;
     println!("Signed in as {name}.");
     Ok(())
 }
 
 async fn sync(config: &Config) -> anyhow::Result<()> {
-    let tidal = Tidal::new(account(config, Config::TIDAL_ACCOUNT)?, &config.tidal.country);
+    let tidal = Tidal::new(
+        account(config, Config::TIDAL_ACCOUNT)?,
+        &config.tidal.country,
+    );
     let people: Vec<Person> = config
         .people
         .iter()
         .map(|p| Person {
             name: p.name.clone(),
             export: p.export.clone().filter(|d| d.is_dir()),
-            spotify: account(config, &Config::spotify_account(&p.name)).ok().map(Spotify::new),
+            spotify: account(config, &Config::spotify_account(&p.name))
+                .ok()
+                .map(Spotify::new),
         })
         .collect();
-    let mut lib = build(&people, &tidal, PER_PERSON).await.map_err(|e| anyhow!(e))?;
+    let mut lib = build(&people, &tidal, PER_PERSON)
+        .await
+        .map_err(|e| anyhow!(e))?;
     // What was analysed before is kept: a sync does not undo an analysis.
     if let Ok(old) = Library::load(&config.library_path()) {
         lib.playlists = old.playlists.clone();
@@ -207,16 +238,27 @@ async fn sync(config: &Config) -> anyhow::Result<()> {
             }
         }
     }
-    file_crates(&mut lib, &tidal, &config.names()).await.map_err(|e| anyhow!(e))?;
+    file_crates(&mut lib, &tidal, &config.names())
+        .await
+        .map_err(|e| anyhow!(e))?;
     for name in [NEXT, LIVE] {
         if !lib.playlists.contains_key(name) {
-            let id = tidal.create_playlist(name, "Kept by ZenJ for New Year's Eve").await.map_err(|e| anyhow!(e))?;
+            let id = tidal
+                .create_playlist(name, "Kept by ZenJ for New Year's Eve")
+                .await
+                .map_err(|e| anyhow!(e))?;
             lib.playlists.insert(name.to_string(), id);
         }
     }
     // Automix's playlist, should ZenJ step down: the build and peak crates.
     let live = lib.playlists[LIVE].clone();
-    let have: Vec<String> = tidal.items(&live).await.map_err(|e| anyhow!(e))?.into_iter().map(|i| i.track).collect();
+    let have: Vec<String> = tidal
+        .items(&live)
+        .await
+        .map_err(|e| anyhow!(e))?
+        .into_iter()
+        .map(|i| i.track)
+        .collect();
     let want: Vec<String> = lib
         .tracks
         .iter()
@@ -224,9 +266,16 @@ async fn sync(config: &Config) -> anyhow::Result<()> {
         .filter_map(|t| t.tidal_id.clone())
         .filter(|t| !have.contains(t))
         .collect();
-    tidal.add(&live, &want, None).await.map_err(|e| anyhow!(e))?;
+    tidal
+        .add(&live, &want, None)
+        .await
+        .map_err(|e| anyhow!(e))?;
     lib.save(&config.library_path()).map_err(|e| anyhow!(e))?;
-    println!("{} tracks, {} unmatched:", lib.tracks.len(), lib.unmatched.len());
+    println!(
+        "{} tracks, {} unmatched:",
+        lib.tracks.len(),
+        lib.unmatched.len()
+    );
     for u in &lib.unmatched {
         println!("  {} — {}: {}", u.artist, u.title, u.why);
     }
@@ -238,9 +287,19 @@ fn analyse_library(config: &Config) -> anyhow::Result<()> {
     let plain = config.state.join("master.plain.db");
     decrypt_to(&config.rekordbox.dir.join("master.db"), &plain).map_err(|e| anyhow!(e))?;
     let c = contents(&plain).map_err(|e| anyhow!(e))?;
-    let r = analyse(&mut lib, &c, &config.rekordbox.dir.join("share"), &config.names());
+    let r = analyse(
+        &mut lib,
+        &c,
+        &config.rekordbox.dir.join("share"),
+        &config.names(),
+    );
     lib.save(&config.library_path()).map_err(|e| anyhow!(e))?;
-    println!("{} analysed; {} waiting for rekordbox; {} failed", r.analysed, r.waiting.len(), r.failed.len());
+    println!(
+        "{} analysed; {} waiting for rekordbox; {} failed",
+        r.analysed,
+        r.waiting.len(),
+        r.failed.len()
+    );
     for w in r.waiting.iter().take(50) {
         println!("  waiting: {w}");
     }
@@ -253,11 +312,19 @@ fn analyse_library(config: &Config) -> anyhow::Result<()> {
 async fn tag(config: &Config) -> anyhow::Result<()> {
     let mut lib = Library::load(&config.library_path()).map_err(|e| anyhow!(e))?;
     let zen = Zen::new(config.zen.clone(), Path::new(".")).map_err(|e| anyhow!(e))?;
-    let untagged: Vec<TrackId> = lib.tracks.iter().filter(|t| t.tags.is_empty()).map(|t| t.id.clone()).collect();
+    let untagged: Vec<TrackId> = lib
+        .tracks
+        .iter()
+        .filter(|t| t.tags.is_empty())
+        .map(|t| t.id.clone())
+        .collect();
     let names = config.names();
     for batch in untagged.chunks(tags::BATCH) {
         let tracks: Vec<&Profile> = batch.iter().filter_map(|id| lib.get(id)).collect();
-        let answer = zen.ask(tags::SYSTEM, &tags::prompt(&tracks)).await.map_err(|e| anyhow!(e))?;
+        let answer = zen
+            .ask(tags::SYSTEM, &tags::prompt(&tracks))
+            .await
+            .map_err(|e| anyhow!(e))?;
         let known = tags::read(&answer, batch.len());
         for (i, (found, year)) in known {
             if let Some(t) = lib.get_mut(&batch[i]) {
@@ -274,10 +341,16 @@ async fn tag(config: &Config) -> anyhow::Result<()> {
 
 fn monitor(config: &Config) -> anyhow::Result<()> {
     let map = Map::load(&config.midi.flx4).map_err(|e| anyhow!(e))?;
-    println!("MIDI inputs: {:?}", ports::input_names().map_err(|e| anyhow!(e))?);
+    println!(
+        "MIDI inputs: {:?}",
+        ports::input_names().map_err(|e| anyhow!(e))?
+    );
     let (tx, mut rx) = RingBuffer::new(1024);
     let _conn = ports::observe(map, tx).map_err(|e| anyhow!(e))?;
-    println!("Listening to {}; Ctrl+C to stop.", config.midi.flx4.display());
+    println!(
+        "Listening to {}; Ctrl+C to stop.",
+        config.midi.flx4.display()
+    );
     loop {
         while let Ok(t) = rx.pop() {
             let reading = match t.reading {
@@ -293,7 +366,10 @@ fn monitor(config: &Config) -> anyhow::Result<()> {
 
 fn learn(config: &Config) -> anyhow::Result<()> {
     let map = Map::load(&config.midi.hands).map_err(|e| anyhow!(e))?;
-    println!("MIDI outputs: {:?}", ports::output_names().map_err(|e| anyhow!(e))?);
+    println!(
+        "MIDI outputs: {:?}",
+        ports::output_names().map_err(|e| anyhow!(e))?
+    );
     let mut out = Out::open(&map.port).map_err(|e| anyhow!(e))?;
     println!(
         "In rekordbox: MIDI → the {} port → LEARN. For each control, choose its function, \
@@ -325,21 +401,35 @@ fn night(config: Config) -> anyhow::Result<()> {
     let config = Arc::new(config);
     let stop = Arc::new(AtomicBool::new(false));
     let library = Library::load(&config.library_path()).unwrap_or_else(|e| {
-        tracing::warn!("no library yet ({e}): run `zenj library sync`, then `zenj library analyse`");
+        tracing::warn!(
+            "no library yet ({e}): run `zenj library sync`, then `zenj library analyse`"
+        );
         Library::default()
     });
-    tracing::info!(tracks = library.tracks.len(), playable = library.playable().len(), "library read");
+    tracing::info!(
+        tracks = library.tracks.len(),
+        playable = library.playable().len(),
+        "library read"
+    );
     let events = Arc::new(Events::recorded_at(&config.record_path()).map_err(|e| anyhow!(e))?);
 
     // The deck reader.
     let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot::blind("not read yet")));
     let all = offsets::parse(OFFSETS).map_err(|e| anyhow!(e))?;
-    let off = all
-        .get(&config.rekordbox.version)
-        .cloned()
-        .ok_or_else(|| anyhow!("no offsets for rekordbox {} among {:?}", config.rekordbox.version, all.keys()))?;
+    let off = all.get(&config.rekordbox.version).cloned().ok_or_else(|| {
+        anyhow!(
+            "no offsets for rekordbox {} among {:?}",
+            config.rekordbox.version,
+            all.keys()
+        )
+    })?;
     {
-        let (snap, stop, tracks, decks) = (snapshot.clone(), stop.clone(), Arc::new(library.clone()), config.rekordbox.decks);
+        let (snap, stop, tracks, decks) = (
+            snapshot.clone(),
+            stop.clone(),
+            Arc::new(library.clone()),
+            config.rekordbox.decks,
+        );
         thread::Builder::new()
             .name("zenj-deck-reader".into())
             .spawn(move || reader::run(off, decks, tracks, snap, stop))?;
@@ -359,7 +449,10 @@ fn night(config: Config) -> anyhow::Result<()> {
     let out = match Out::open(&hands_map.port) {
         Ok(o) => Some(o),
         Err(e) => {
-            events.push(Kind::Fault, format!("the virtual controller is not open: {e}"));
+            events.push(
+                Kind::Fault,
+                format!("the virtual controller is not open: {e}"),
+            );
             None
         }
     };
@@ -382,7 +475,9 @@ fn night(config: Config) -> anyhow::Result<()> {
             lead_beats: config.midi.lead_ms / 480.0,
         };
         let stop = stop.clone();
-        thread::Builder::new().name("zenj-conductor".into()).spawn(move || c.run(stop))?;
+        thread::Builder::new()
+            .name("zenj-conductor".into())
+            .spawn(move || c.run(stop))?;
     }
 
     // The room: the FLX4's output for the room's levels and every screen.
@@ -408,42 +503,60 @@ fn night(config: Config) -> anyhow::Result<()> {
     };
     {
         let (landing, stop) = (landing.clone(), stop.clone());
-        thread::Builder::new().name("zenj-room".into()).spawn(move || {
-            let mut a = Analyser::new(rate);
-            let mut room = Room::new();
-            let mut block = Vec::with_capacity(BLOCK);
-            while !stop.load(Ordering::Relaxed) {
-                while let Ok(x) = room_rx.pop() {
-                    block.push(x);
-                    if block.len() == BLOCK {
-                        let now = Instant::now();
-                        room.push(now, a.levels(&block));
-                        landing.store(room.landing(now).to_bits(), Ordering::Relaxed);
-                        block.clear();
+        thread::Builder::new()
+            .name("zenj-room".into())
+            .spawn(move || {
+                let mut a = Analyser::new(rate);
+                let mut room = Room::new();
+                let mut block = Vec::with_capacity(BLOCK);
+                while !stop.load(Ordering::Relaxed) {
+                    while let Ok(x) = room_rx.pop() {
+                        block.push(x);
+                        if block.len() == BLOCK {
+                            let now = Instant::now();
+                            room.push(now, a.levels(&block));
+                            landing.store(room.landing(now).to_bits(), Ordering::Relaxed);
+                            block.clear();
+                        }
                     }
+                    thread::sleep(Duration::from_millis(10));
                 }
-                thread::sleep(Duration::from_millis(10));
-            }
-        })?;
+            })?;
     }
 
     // The brain, the tools and the cluster, on their runtime.
     let live = Arc::new(ArcSwap::from_pointee(Live::default()));
     let midnight = config.midnight().map_err(|e| anyhow!(e))?;
     {
-        let (config, live, events, snapshot) = (config.clone(), live.clone(), events.clone(), snapshot.clone());
-        thread::Builder::new().name("zenj-runtime".into()).spawn(move || {
-            let rt = match runtime() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("zenj: no runtime: {e}");
-                    return;
+        let (config, live, events, snapshot) = (
+            config.clone(),
+            live.clone(),
+            events.clone(),
+            snapshot.clone(),
+        );
+        thread::Builder::new()
+            .name("zenj-runtime".into())
+            .spawn(move || {
+                let rt = match runtime() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("zenj: no runtime: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = rt.block_on(serve(
+                    config,
+                    library,
+                    live,
+                    events,
+                    snapshot,
+                    conductor_state,
+                    cmd_tx,
+                    landing,
+                )) {
+                    tracing::error!("zenj: {e:#}");
                 }
-            };
-            if let Err(e) = rt.block_on(serve(config, library, live, events, snapshot, conductor_state, cmd_tx, landing)) {
-                tracing::error!("zenj: {e:#}");
-            }
-        })?;
+            })?;
     }
 
     // The screens own the main thread, as windows on Windows want.
@@ -481,14 +594,26 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let curve = Curve::of(config.night, &config.curve).map_err(|e| anyhow!(e))?;
     let budget = Budget::new(
-        config.people.iter().map(|p| (p.name.clone(), p.share)).collect(),
+        config
+            .people
+            .iter()
+            .map(|p| (p.name.clone(), p.share))
+            .collect(),
         config.request_share,
     );
-    let night = Night::new(library, curve, budget, config.midnight().map_err(|e| anyhow!(e))?);
+    let night = Night::new(
+        library,
+        curve,
+        budget,
+        config.midnight().map_err(|e| anyhow!(e))?,
+    );
     let zen = match Zen::new(config.zen.clone(), Path::new(".")) {
         Ok(z) => Some(Arc::new(z)),
         Err(e) => {
-            events.push(Kind::Fault, format!("Zen is not reachable, the shortlist chooses: {e}"));
+            events.push(
+                Kind::Fault,
+                format!("Zen is not reachable, the shortlist chooses: {e}"),
+            );
             None
         }
     };
@@ -511,7 +636,10 @@ async fn serve(
     tokio::spawn(brain.run(ask_rx));
 
     // Requests from the phones.
-    let requests_owner = config.people.first().map(|p| Config::spotify_account(&p.name));
+    let requests_owner = config
+        .people
+        .first()
+        .map(|p| Config::spotify_account(&p.name));
     match requests_owner.and_then(|n| account(&config, &n).ok()) {
         Some(a) if !config.spotify.requests_playlist.is_empty() => {
             let spotify = Spotify::new(a);
@@ -539,9 +667,19 @@ async fn serve(
                         Ok(asked) => {
                             for a in asked {
                                 let (reply, _) = tokio::sync::oneshot::channel();
-                                let query = a.isrc.clone().unwrap_or_else(|| format!("{} {}", a.artist, a.title));
+                                let query = a
+                                    .isrc
+                                    .clone()
+                                    .unwrap_or_else(|| format!("{} {}", a.artist, a.title));
                                 let _ = asks
-                                    .send(Ask::Request { query, by: a.by, note: String::new(), urgency: 0.5, now: false, reply })
+                                    .send(Ask::Request {
+                                        query,
+                                        by: a.by,
+                                        note: String::new(),
+                                        urgency: 0.5,
+                                        now: false,
+                                        reply,
+                                    })
                                     .await;
                             }
                         }
@@ -553,7 +691,10 @@ async fn serve(
             });
         }
         _ => {
-            events.push(Kind::Fault, "requests from the phones are not read: no Spotify sign-in or no requests playlist");
+            events.push(
+                Kind::Fault,
+                "requests from the phones are not read: no Spotify sign-in or no requests playlist",
+            );
         }
     }
 
@@ -569,10 +710,16 @@ async fn serve(
         store: Arc::new(SealedStore),
     });
     let app = router(dj, config.trusted_gateways.clone().into());
-    let listener = TcpListener::bind(&config.bind).await.with_context(|| config.bind.clone())?;
+    let listener = TcpListener::bind(&config.bind)
+        .await
+        .with_context(|| config.bind.clone())?;
     presence::join(&config, app.clone())?;
     tracing::info!(bind = %config.bind, "serving");
     eprintln!("{PROOF}");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

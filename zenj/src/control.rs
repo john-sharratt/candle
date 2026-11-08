@@ -328,8 +328,14 @@ mod tests {
         for c in &all {
             assert_eq!(c.to_string().parse::<Control>().as_ref(), Ok(c), "{c}");
         }
-        assert_eq!(Control::Knob(Knob::Eq(2, Band::Low)).to_string(), "deck2.eq_low");
-        assert_eq!(Control::Button(Button::Load(1)).to_string(), "browser.load1");
+        assert_eq!(
+            Control::Knob(Knob::Eq(2, Band::Low)).to_string(),
+            "deck2.eq_low"
+        );
+        assert_eq!(
+            Control::Button(Button::Load(1)).to_string(),
+            "browser.load1"
+        );
     }
 
     #[test]

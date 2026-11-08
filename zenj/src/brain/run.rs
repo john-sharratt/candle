@@ -126,12 +126,22 @@ impl Brain {
     }
 
     fn title(&self, id: &TrackId) -> String {
-        self.night.track(id).map(line).unwrap_or_else(|| id.to_string())
+        self.night
+            .track(id)
+            .map(line)
+            .unwrap_or_else(|| id.to_string())
     }
 
     fn handle(&mut self, ask: Ask, now: DateTime<Local>) {
         match ask {
-            Ask::Request { query, by, note, urgency, now: right_now, reply } => {
+            Ask::Request {
+                query,
+                by,
+                note,
+                urgency,
+                now: right_now,
+                reply,
+            } => {
                 let said = match self.find(&query) {
                     Some(track) => {
                         let title = self.title(&track);
@@ -142,18 +152,31 @@ impl Brain {
                             urgency: urgency.clamp(0.0, 1.0),
                             now: right_now,
                         });
-                        let place = if right_now { "next, at the coming phrase" } else { "placed where it fits, usually within two tracks" };
+                        let place = if right_now {
+                            "next, at the coming phrase"
+                        } else {
+                            "placed where it fits, usually within two tracks"
+                        };
                         let text = format!("{by}'s request: {title} — {place}");
                         self.events.push_at(now, Kind::Request, text.clone());
                         text
                     }
                     None => {
-                        let closest: Vec<String> =
-                            self.night.library.search(&query).iter().take(3).map(|t| line(t)).collect();
+                        let closest: Vec<String> = self
+                            .night
+                            .library
+                            .search(&query)
+                            .iter()
+                            .take(3)
+                            .map(|t| line(t))
+                            .collect();
                         let text = if closest.is_empty() {
                             format!("{by} asked for `{query}`: not in tonight's library")
                         } else {
-                            format!("{by} asked for `{query}`: not in tonight's library — closest: {}", closest.join("; "))
+                            format!(
+                                "{by} asked for `{query}`: not in tonight's library — closest: {}",
+                                closest.join("; ")
+                            )
                         };
                         self.events.push_at(now, Kind::Request, text.clone());
                         text
@@ -163,7 +186,8 @@ impl Brain {
             }
             Ask::Mode { mode, reply } => {
                 let _ = self.commands.send(Command::Mode(mode));
-                self.events.push_at(now, Kind::Mode, format!("mode {} asked for", mode.name()));
+                self.events
+                    .push_at(now, Kind::Mode, format!("mode {} asked for", mode.name()));
                 let _ = reply.send(format!("the decks are now in {} mode", mode.name()));
             }
             Ask::Pin { query, reply } => {
@@ -171,7 +195,8 @@ impl Brain {
                     Some(t) => {
                         let title = self.title(&t);
                         self.night.choose(t, "asked for next".into());
-                        self.events.push_at(now, Kind::Next, format!("next: {title} (pinned)"));
+                        self.events
+                            .push_at(now, Kind::Next, format!("next: {title} (pinned)"));
                         format!("next: {title}")
                     }
                     None => format!("`{query}` is not in tonight's library"),
@@ -186,7 +211,11 @@ impl Brain {
                 };
                 let said = match booked {
                     Ok(what) => {
-                        self.night.bookings.push(Booking { at, what, done: false });
+                        self.night.bookings.push(Booking {
+                            at,
+                            what,
+                            done: false,
+                        });
                         format!("booked for {}", at.format("%H:%M"))
                     }
                     Err(q) => format!("`{q}` is not in tonight's library"),
@@ -198,7 +227,8 @@ impl Brain {
             }
             Ask::Said { who, text } => {
                 self.night.heard(&who, &text);
-                self.events.push_at(now, Kind::Said, format!("{who}: {text}"));
+                self.events
+                    .push_at(now, Kind::Said, format!("{who}: {text}"));
             }
             Ask::Midnight { query, reply } => {
                 let said = match self.find(&query) {
@@ -212,7 +242,10 @@ impl Brain {
                 let _ = reply.send(said);
             }
             Ask::Energy { by, minutes, reply } => {
-                self.night.curve = self.night.curve.nudged(now, TimeDelta::minutes(minutes), by);
+                self.night.curve = self
+                    .night
+                    .curve
+                    .nudged(now, TimeDelta::minutes(minutes), by);
                 let _ = reply.send(format!(
                     "energy {} by {:.2} for {minutes} minutes: target now {:.2}",
                     if by >= 0.0 { "up" } else { "down" },
@@ -231,7 +264,10 @@ impl Brain {
         let clock = now.format("%H:%M").to_string();
         let target = self.night.curve.target(now);
         let offers = self.night.offers(&list);
-        let p = prompt(&self.night.scene(&clock, now, target, &said, &owed), &offers);
+        let p = prompt(
+            &self.night.scene(&clock, now, target, &said, &owed),
+            &offers,
+        );
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             let _ = tx.send(zen.ask(SYSTEM, &p).await);
@@ -253,7 +289,10 @@ impl Brain {
             Some(Choice::Pick { id, why }) => (id, why),
             Some(Choice::Search { query, why }) => match self.find(&query) {
                 Some(id) => (id, why),
-                None => (top.id.clone(), format!("{query} is not in tonight's library; the best fit instead")),
+                None => (
+                    top.id.clone(),
+                    format!("{query} is not in tonight's library; the best fit instead"),
+                ),
             },
             None => {
                 let why = match answer {
@@ -264,16 +303,22 @@ impl Brain {
             }
         };
         let title = self.title(&track);
-        self.events.push_at(now, Kind::Next, format!("next: {title} — {why}"));
+        self.events
+            .push_at(now, Kind::Next, format!("next: {title} — {why}"));
         self.night.choose(track, why);
     }
 
     /// Put `track` alone on *NYE Next*, for the loader to find at its top.
     fn stock(&self, track: &TrackId) {
-        let (Some(tidal), Some(list)) = (self.tidal.clone(), self.night.library.playlists.get(NEXT).cloned()) else {
+        let (Some(tidal), Some(list)) = (
+            self.tidal.clone(),
+            self.night.library.playlists.get(NEXT).cloned(),
+        ) else {
             return;
         };
-        let Some(id) = self.night.track(track).and_then(|t| t.tidal_id.clone()) else { return };
+        let Some(id) = self.night.track(track).and_then(|t| t.tidal_id.clone()) else {
+            return;
+        };
         let events = self.events.clone();
         tokio::spawn(async move {
             let result = async {
@@ -290,7 +335,13 @@ impl Brain {
         });
     }
 
-    fn publish(&self, s: &Snapshot, c: &ConductorState, now: DateTime<Local>, banner: &Option<String>) {
+    fn publish(
+        &self,
+        s: &Snapshot,
+        c: &ConductorState,
+        now: DateTime<Local>,
+        banner: &Option<String>,
+    ) {
         let decks = s
             .decks
             .iter()
@@ -302,7 +353,9 @@ impl Brain {
                     artist: t.map(|t| t.artist_line()).unwrap_or_default(),
                     bpm: d.bpm,
                     beat: d.beat,
-                    bars_left: t.zip(d.beat).map(|(t, b)| (t.beats() as f64 - b).max(0.0) / 4.0),
+                    bars_left: t
+                        .zip(d.beat)
+                        .map(|(t, b)| (t.beats() as f64 - b).max(0.0) / 4.0),
                     playing: d.playing,
                     on_air: s.on_air().is_some_and(|o| o.number == d.number),
                 }
@@ -360,7 +413,11 @@ impl Brain {
             let cond = self.conductor.load_full();
 
             if let Some(Seen::OnAir { deck, track }) = self.night.see(&snap, now) {
-                self.events.push_at(now, Kind::Track, format!("on air, deck {deck}: {}", self.title(&track)));
+                self.events.push_at(
+                    now,
+                    Kind::Track,
+                    format!("on air, deck {deck}: {}", self.title(&track)),
+                );
                 let tracks: Vec<(u8, Grid, u64)> = snap
                     .decks
                     .iter()
@@ -377,7 +434,11 @@ impl Brain {
             let ends = self.night.ends_at(&snap, now);
             if let Some((track, why)) = self.night.forced(now, ends) {
                 if self.night.next.as_ref().map(|n| &n.track) != Some(&track) {
-                    self.events.push_at(now, Kind::Next, format!("next: {} — {why}", self.title(&track)));
+                    self.events.push_at(
+                        now,
+                        Kind::Next,
+                        format!("next: {} — {why}", self.title(&track)),
+                    );
                     self.night.choose(track, why);
                     asking = None;
                 }
@@ -385,7 +446,10 @@ impl Brain {
             for b in self.night.due(now) {
                 match b {
                     Booked::Sample(slot) => {
-                        let _ = self.commands.send(Command::Sample { slot, when: Quant::Bar });
+                        let _ = self.commands.send(Command::Sample {
+                            slot,
+                            when: Quant::Bar,
+                        });
                     }
                     Booked::Dedication(text) => {
                         self.events.push_at(now, Kind::Moment, text.clone());
@@ -416,7 +480,9 @@ impl Brain {
                 }
             }
             if let Some(n) = &self.night.next {
-                banner = Some(n.why.clone()).filter(|w| !w.is_empty()).or(banner.take());
+                banner = Some(n.why.clone())
+                    .filter(|w| !w.is_empty())
+                    .or(banner.take());
             }
 
             // Stocked, loaded, armed.
@@ -430,11 +496,24 @@ impl Brain {
                     Some(1) => 2,
                     _ => 1,
                 };
-                let loaded = cond.loaded.iter().any(|(d, t)| *d == idle && *t == next.track);
-                if matches!(cond.mode, Mode::Assist | Mode::Zenj) && !loaded && cond.loading.is_none() {
-                    let _ = self.commands.send(Command::Load { deck: idle, track: next.track.clone() });
+                let loaded = cond
+                    .loaded
+                    .iter()
+                    .any(|(d, t)| *d == idle && *t == next.track);
+                if matches!(cond.mode, Mode::Assist | Mode::Zenj)
+                    && !loaded
+                    && cond.loading.is_none()
+                {
+                    let _ = self.commands.send(Command::Load {
+                        deck: idle,
+                        track: next.track.clone(),
+                    });
                 }
-                if cond.mode == Mode::Zenj && loaded && cond.armed.is_none() && armed_for.as_ref() != Some(&next.track) {
+                if cond.mode == Mode::Zenj
+                    && loaded
+                    && cond.armed.is_none()
+                    && armed_for.as_ref() != Some(&next.track)
+                {
                     let air = on_air.and_then(|d| snap.deck(d));
                     if let Some((beat, bpm)) = air.and_then(|d| d.beat.map(|b| (b, d.bpm))) {
                         if let Some(p) = self.night.plan_next(idle, beat, bpm, now) {

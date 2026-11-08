@@ -33,8 +33,17 @@ impl Tool for EventsTool {
 pub fn say(events: &[Event], last: u64) -> String {
     let mut s = String::new();
     for e in events {
-        let kind = serde_json::to_value(e.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
-        let _ = writeln!(s, "#{} {} {kind}: {}", e.id, e.at.format("%H:%M:%S"), e.text);
+        let kind = serde_json::to_value(e.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let _ = writeln!(
+            s,
+            "#{} {} {kind}: {}",
+            e.id,
+            e.at.format("%H:%M:%S"),
+            e.text
+        );
     }
     let cursor = events.last().map_or(last, |e| e.id);
     let _ = write!(s, "cursor: {cursor}");
@@ -43,10 +52,16 @@ pub fn say(events: &[Event], last: u64) -> String {
 
 pub fn call(dj: &Dj, args: &Value) -> Answer {
     let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
-    let limit = args.get("limit").and_then(Value::as_u64).map_or(LIMIT, |l| (l as usize).min(LIMIT));
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(LIMIT, |l| (l as usize).min(LIMIT));
     let got = dj.events.since(since, limit);
     if got.is_empty() {
-        return Answer::ok(format!("nothing since {since}; cursor: {}", dj.events.last().max(since)));
+        return Answer::ok(format!(
+            "nothing since {since}; cursor: {}",
+            dj.events.last().max(since)
+        ));
     }
     Answer::ok(say(&got, dj.events.last()))
 }
@@ -63,13 +78,24 @@ mod tests {
     fn events_are_said_with_the_cursor_to_ask_from() {
         let (dj, _) = dj();
         let at = Local.with_ymd_and_hms(2026, 12, 31, 22, 41, 5).unwrap();
-        dj.events.push_at(at, Kind::Track, "on air, deck 1: ABBA — Waterloo");
-        dj.events.push_at(at, Kind::Request, "yen's request: placed");
+        dj.events
+            .push_at(at, Kind::Track, "on air, deck 1: ABBA — Waterloo");
+        dj.events
+            .push_at(at, Kind::Request, "yen's request: placed");
         assert_eq!(
             call(&dj, &json!({"since": 0})).text,
             "#1 22:41:05 track: on air, deck 1: ABBA — Waterloo\n#2 22:41:05 request: yen's request: placed\ncursor: 2"
         );
-        assert_eq!(call(&dj, &json!({"since": 2})).text, "nothing since 2; cursor: 2");
-        assert_eq!(call(&dj, &json!({"since": 0, "limit": 1})).text.lines().last(), Some("cursor: 1"));
+        assert_eq!(
+            call(&dj, &json!({"since": 2})).text,
+            "nothing since 2; cursor: 2"
+        );
+        assert_eq!(
+            call(&dj, &json!({"since": 0, "limit": 1}))
+                .text
+                .lines()
+                .last(),
+            Some("cursor: 1")
+        );
     }
 }

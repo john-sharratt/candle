@@ -115,12 +115,20 @@ mod tests {
         let t0 = Instant::now();
         let mut l = Load::new(2, TrackId("want".into()));
         let s = holding(Some("other"));
-        let Step::Press(p) = l.step(t0, &s) else { panic!() };
+        let Step::Press(p) = l.step(t0, &s) else {
+            panic!()
+        };
         assert_eq!(p.len(), TO_TOP + 1);
         assert_eq!(p.last(), Some(&Button::Load(2)));
         assert_eq!(l.step(t0 + Duration::from_secs(1), &s), Step::Waiting);
         for i in 1..=RETRIES as u64 {
-            assert!(matches!(l.step(t0 + SHOWS_WITHIN * (i as u32) + Duration::from_millis(1), &s), Step::Press(_)));
+            assert!(matches!(
+                l.step(
+                    t0 + SHOWS_WITHIN * (i as u32) + Duration::from_millis(1),
+                    &s
+                ),
+                Step::Press(_)
+            ));
         }
         assert_eq!(
             l.step(t0 + SHOWS_WITHIN * 4, &s),

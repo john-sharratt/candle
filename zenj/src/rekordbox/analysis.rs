@@ -75,7 +75,13 @@ mod tests {
         )
         .unwrap();
         let only_dat = analyse(&dat).unwrap();
-        assert_eq!(only_dat.grid, Grid { bpm: 120.0, first_beat_ms: 500.0 });
+        assert_eq!(
+            only_dat.grid,
+            Grid {
+                bpm: 120.0,
+                first_beat_ms: 500.0
+            }
+        );
         assert_eq!(only_dat.cues, vec![HotCue { pad: 2, beat: 8.0 }]);
         assert!(only_dat.phrases.is_empty() && only_dat.mood.is_none());
 

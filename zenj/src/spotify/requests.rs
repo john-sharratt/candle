@@ -58,12 +58,22 @@ impl Watch {
             let by = item
                 .added_by
                 .as_ref()
-                .map(|u| self.people.get(&u.id).cloned().unwrap_or_else(|| u.id.clone()))
+                .map(|u| {
+                    self.people
+                        .get(&u.id)
+                        .cloned()
+                        .unwrap_or_else(|| u.id.clone())
+                })
                 .unwrap_or_else(|| "someone".into());
             out.push(Asked {
                 spotify_id: id.clone(),
                 title: t.name.clone(),
-                artist: t.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "),
+                artist: t
+                    .artists
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 isrc: t.external_ids.isrc.clone(),
                 duration_ms: t.duration_ms,
                 by,
@@ -110,7 +120,11 @@ mod tests {
         assert!(!w.moved("s1"));
         let asked = w.read(
             "s2",
-            &[item("old", "t0", "spot_yen"), item("new", "t1", "spot_yen"), item("x", "t2", "stranger")],
+            &[
+                item("old", "t0", "spot_yen"),
+                item("new", "t1", "spot_yen"),
+                item("x", "t2", "stranger"),
+            ],
         );
         assert_eq!(asked.len(), 2);
         assert_eq!(

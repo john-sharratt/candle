@@ -149,10 +149,7 @@ pub struct Profile {
 impl Profile {
     /// The track's length in beats.
     pub fn beats(&self) -> u32 {
-        self.grid
-            .beat_at(self.duration_ms as f64)
-            .max(0.0)
-            .floor() as u32
+        self.grid.beat_at(self.duration_ms as f64).max(0.0).floor() as u32
     }
 
     /// How much `person` likes it, 0 when they never played or liked it.

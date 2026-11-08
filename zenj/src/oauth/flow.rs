@@ -210,7 +210,9 @@ mod tests {
             client_id: " ".into(),
             ..spotify()
         };
-        assert!(authorize_url(&p, "C", "S").unwrap_err().starts_with("no app to sign in as"));
+        assert!(authorize_url(&p, "C", "S")
+            .unwrap_err()
+            .starts_with("no app to sign in as"));
     }
 
     #[test]

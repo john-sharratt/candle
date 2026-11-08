@@ -32,7 +32,12 @@ pub async fn call(dj: &Dj, caller: &str, args: &Value) -> Answer {
         Ok(t) => t.to_string(),
         Err(a) => return a,
     };
-    let note = args.get("note").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let note = args
+        .get("note")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let urgency = args.get("urgency").and_then(Value::as_f64).unwrap_or(0.5) as f32;
     let now = args.get("now").and_then(Value::as_bool).unwrap_or(false);
     let by = args
@@ -42,7 +47,15 @@ pub async fn call(dj: &Dj, caller: &str, args: &Value) -> Answer {
         .filter(|s| !s.is_empty())
         .unwrap_or(caller)
         .to_string();
-    dj.ask(|reply| Ask::Request { query, by, note, urgency, now, reply }).await
+    dj.ask(|reply| Ask::Request {
+        query,
+        by,
+        note,
+        urgency,
+        now,
+        reply,
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -57,8 +70,18 @@ mod tests {
         let (dj, mut rx) = dj();
         let brain = tokio::spawn(async move {
             match rx.recv().await.unwrap() {
-                Ask::Request { query, by, note, urgency, now, reply } => {
-                    assert_eq!((query.as_str(), by.as_str(), note.as_str(), urgency, now), ("ABBA dancing queen", "yen", "for mum", 1.0, false));
+                Ask::Request {
+                    query,
+                    by,
+                    note,
+                    urgency,
+                    now,
+                    reply,
+                } => {
+                    assert_eq!(
+                        (query.as_str(), by.as_str(), note.as_str(), urgency, now),
+                        ("ABBA dancing queen", "yen", "for mum", 1.0, false)
+                    );
                     reply.send("placed".into()).unwrap();
                 }
                 _ => panic!("not a request"),
@@ -67,6 +90,9 @@ mod tests {
         let a = call(&dj, "john", &json!({"track": " ABBA dancing queen ", "note": "for mum", "urgency": 1.0, "by": "yen"})).await;
         assert_eq!(a, Answer::ok("placed"));
         brain.await.unwrap();
-        assert_eq!(call(&dj, "john", &json!({})).await, Answer::error("`track` is required"));
+        assert_eq!(
+            call(&dj, "john", &json!({})).await,
+            Answer::error("`track` is required")
+        );
     }
 }

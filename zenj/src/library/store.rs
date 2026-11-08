@@ -95,7 +95,11 @@ impl Library {
     /// The tracks whose artist and title hold every word of `query`, best
     /// first: those whose title is the query's rest.
     pub fn search(&self, query: &str) -> Vec<&Profile> {
-        let words: Vec<String> = normal(query).split(' ').filter(|w| !w.is_empty()).map(String::from).collect();
+        let words: Vec<String> = normal(query)
+            .split(' ')
+            .filter(|w| !w.is_empty())
+            .map(String::from)
+            .collect();
         if words.is_empty() {
             return Vec::new();
         }
@@ -118,7 +122,11 @@ impl Library {
     /// The tracks ready to mix: analysed, so their grid and phrases are
     /// rekordbox's.
     pub fn playable(&self) -> Vec<Profile> {
-        self.tracks.iter().filter(|t| t.anlz.is_some()).cloned().collect()
+        self.tracks
+            .iter()
+            .filter(|t| t.anlz.is_some())
+            .cloned()
+            .collect()
     }
 }
 
@@ -152,7 +160,11 @@ mod tests {
     fn a_library_finds_tracks_by_id_words_and_analysis() {
         let l = lib();
         assert_eq!(l.get(&TrackId("c".into())).unwrap().title, "Waterloo");
-        let hits: Vec<&str> = l.search("abba dancing queen").iter().map(|t| t.id.as_str()).collect();
+        let hits: Vec<&str> = l
+            .search("abba dancing queen")
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
         assert_eq!(hits, ["a", "b"]);
         assert!(l.search("queen waterloo").is_empty());
         let (id, grid) = l.by_anlz("pioneer/usbanlz/x/anlz0000.dat").unwrap();

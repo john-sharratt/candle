@@ -58,13 +58,16 @@ fn body_range(index: usize) -> std::ops::Range<usize> {
 
 /// `file`, a SQLCipher 4 database under `pass`, as a plain SQLite file.
 pub fn decrypt(file: &[u8], pass: &[u8], rounds: u32) -> Result<Vec<u8>, String> {
-    if file.len() < PAGE || file.len() % PAGE != 0 {
-        return Err(format!("{} bytes is not a whole number of pages", file.len()));
+    if file.len() < PAGE || !file.len().is_multiple_of(PAGE) {
+        return Err(format!(
+            "{} bytes is not a whole number of pages",
+            file.len()
+        ));
     }
     let (key, mac_key) = keys(pass, &file[..SALT], rounds);
     let cipher = Aes256::new(GenericArray::from_slice(&key));
     let mut out = Vec::with_capacity(file.len());
-    for (i, page) in file.chunks_exact(PAGE).enumerate() {
+    for (i, page) in file.as_chunks::<PAGE>().0.iter().enumerate() {
         let body = &page[body_range(i)];
         let reserve = &page[PAGE - RESERVE..];
         let (iv, mac) = (&reserve[..IV], &reserve[IV..IV + MAC]);
@@ -78,14 +81,14 @@ pub fn decrypt(file: &[u8], pass: &[u8], rounds: u32) -> Result<Vec<u8>, String>
             out.extend_from_slice(HEADER);
         }
         let mut prev: [u8; 16] = iv.try_into().expect("an IV is a block");
-        for block in body.chunks_exact(16) {
+        for block in body.as_chunks::<16>().0 {
             let mut b = GenericArray::clone_from_slice(block);
             cipher.decrypt_block(&mut b);
             for (x, p) in b.iter_mut().zip(prev) {
                 *x ^= p;
             }
             out.extend_from_slice(&b);
-            prev = block.try_into().expect("a block");
+            prev = *block;
         }
         out.extend_from_slice(reserve);
     }
@@ -104,14 +107,14 @@ pub fn encrypt(
     let (key, mac_key) = keys(pass, salt, rounds);
     let cipher = Aes256::new(GenericArray::from_slice(&key));
     let mut out = Vec::with_capacity(plain.len());
-    for (i, page) in plain.chunks_exact(PAGE).enumerate() {
+    for (i, page) in plain.as_chunks::<PAGE>().0.iter().enumerate() {
         if i == 0 {
             out.extend_from_slice(salt);
         }
         let iv = iv_of(i);
         let mut prev = iv;
         let mut body = Vec::with_capacity(PAGE);
-        for block in page[body_range(i)].chunks_exact(16) {
+        for block in page[body_range(i)].as_chunks::<16>().0 {
             let mut b = GenericArray::clone_from_slice(block);
             for (x, p) in b.iter_mut().zip(prev) {
                 *x ^= p;
@@ -139,7 +142,7 @@ mod tests {
     fn plain() -> Vec<u8> {
         let mut p: Vec<u8> = (0..2 * PAGE).map(|i| (i * 7 % 251) as u8).collect();
         p[..16].copy_from_slice(HEADER);
-        for page in p.chunks_exact_mut(PAGE) {
+        for page in p.as_chunks_mut::<PAGE>().0 {
             page[PAGE - RESERVE..].fill(0);
         }
         p
@@ -160,7 +163,7 @@ mod tests {
         let dec = decrypt(&enc, b"secret", TEST_ROUNDS).unwrap();
         let mut want = plain();
         // The reserve comes back as it was stored: the IV and the HMAC.
-        for (i, page) in want.chunks_exact_mut(PAGE).enumerate() {
+        for (i, page) in want.as_chunks_mut::<PAGE>().0.iter_mut().enumerate() {
             page[PAGE - RESERVE..].copy_from_slice(&enc[(i + 1) * PAGE - RESERVE..(i + 1) * PAGE]);
         }
         assert_eq!(dec, want);
@@ -178,7 +181,9 @@ mod tests {
             "page 1 fails its HMAC: the wrong key, or a file changed while it was read"
         );
         enc[PAGE + 100] ^= 1;
-        assert!(decrypt(&enc, b"secret", TEST_ROUNDS).unwrap_err().starts_with("page 2 "));
+        assert!(decrypt(&enc, b"secret", TEST_ROUNDS)
+            .unwrap_err()
+            .starts_with("page 2 "));
         assert!(decrypt(&enc[..100], b"secret", TEST_ROUNDS).is_err());
     }
 
@@ -188,9 +193,6 @@ mod tests {
     fn the_key_derivation_is_pbkdf2_sha512() {
         let mut k = [0u8; 32];
         pbkdf2_hmac::<Sha512>(b"password", b"salt", 1, &mut k);
-        assert_eq!(
-            k[..8],
-            [0x86, 0x7f, 0x70, 0xcf, 0x1a, 0xde, 0x02, 0xcf]
-        );
+        assert_eq!(k[..8], [0x86, 0x7f, 0x70, 0xcf, 0x1a, 0xde, 0x02, 0xcf]);
     }
 }

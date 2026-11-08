@@ -100,7 +100,11 @@ impl Runner {
         for (at, act) in due {
             match act {
                 Move::Set { knob, to } => self.set(knob, to, hands, &mut out),
-                Move::Ramp { knob, to: target, beats } => {
+                Move::Ramp {
+                    knob,
+                    to: target,
+                    beats,
+                } => {
                     let from = self.value_of(knob, hands);
                     self.ramps.retain(|r| r.knob != knob);
                     self.ramps.push(Ramp {
@@ -191,11 +195,20 @@ mod tests {
     fn a_blend_replays_beat_by_beat() {
         let a = club("a", 128.0, "8A", 0.6);
         let b = club("b", 126.0, "9A", 0.65);
-        let p = plan(&Pair { from: &a, from_deck: 1, to: &b, to_deck: 2, now: 100.0 });
+        let p = plan(&Pair {
+            from: &a,
+            from_deck: 1,
+            to: &b,
+            to_deck: 2,
+            now: 100.0,
+        });
         let mut r = Runner::new(p, 100.0);
         let mut h = mixing();
         let s = snapshot(true, false, 126.0);
-        assert!(r.tick(200.0, 0.0, &s, &mut h).is_empty(), "before the first step");
+        assert!(
+            r.tick(200.0, 0.0, &s, &mut h).is_empty(),
+            "before the first step"
+        );
         let prep = r.tick(208.0, 0.0, &s, &mut h);
         assert_eq!(
             prep,
@@ -207,17 +220,27 @@ mod tests {
             ]
         );
         let start = r.tick(224.0, 0.0, &s, &mut h);
-        assert_eq!(start, vec![Send::Press(Button::Play(2))], "the ramp starts where it is");
+        assert_eq!(
+            start,
+            vec![Send::Press(Button::Play(2))],
+            "the ramp starts where it is"
+        );
         let s = snapshot(true, true, 128.0);
         let mid = r.tick(232.0, 0.0, &s, &mut h);
         assert_eq!(mid, vec![Send::Set(Knob::Fader(2), 0.5)]);
         let swap = r.tick(240.0, 0.0, &s, &mut h);
         assert!(swap.contains(&Send::Set(Knob::Fader(2), 1.0)));
         assert!(swap.contains(&Send::Set(Knob::Eq(1, Band::Low), 0.0)));
-        assert!(swap.contains(&Send::Set(Knob::Fader(1), 1.0)), "the heard deck's fader is up");
+        assert!(
+            swap.contains(&Send::Set(Knob::Fader(1), 1.0)),
+            "the heard deck's fader is up"
+        );
         let end = r.tick(256.0, 0.0, &s, &mut h);
         assert!(end.contains(&Send::Set(Knob::Fader(1), 0.0)));
-        assert!(end.contains(&Send::Press(Button::Play(1))), "stopped: it was playing");
+        assert!(
+            end.contains(&Send::Press(Button::Play(1))),
+            "stopped: it was playing"
+        );
         assert!(r.done());
     }
 
@@ -227,7 +250,13 @@ mod tests {
     fn a_taken_control_is_left_alone() {
         let a = club("a", 128.0, "8A", 0.6);
         let b = club("b", 128.0, "8A", 0.6);
-        let p = plan(&Pair { from: &a, from_deck: 1, to: &b, to_deck: 2, now: 100.0 });
+        let p = plan(&Pair {
+            from: &a,
+            from_deck: 1,
+            to: &b,
+            to_deck: 2,
+            now: 100.0,
+        });
         let mut r = Runner::new(p, 100.0);
         let mut h = mixing();
         let s = snapshot(true, false, 128.0);
@@ -238,7 +267,9 @@ mod tests {
             at: Instant::now(),
         });
         let after = r.tick(232.0, 0.0, &s, &mut h);
-        assert!(!after.iter().any(|x| matches!(x, Send::Set(Knob::Fader(2), _))));
+        assert!(!after
+            .iter()
+            .any(|x| matches!(x, Send::Set(Knob::Fader(2), _))));
         h.set_mode(Mode::Human);
         assert!(r.tick(256.0, 0.0, &s, &mut h).is_empty());
     }

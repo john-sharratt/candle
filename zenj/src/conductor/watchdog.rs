@@ -34,7 +34,11 @@ pub fn fault(w: &Watched<'_>) -> Option<String> {
         "deck {} has {:.0} bars left and the next is {}",
         deck.number,
         bars_left.max(0.0),
-        if w.next_loaded { "loaded but not armed" } else { "not loaded" }
+        if w.next_loaded {
+            "loaded but not armed"
+        } else {
+            "not loaded"
+        }
     ))
 }
 
@@ -68,7 +72,12 @@ mod tests {
     #[test]
     fn inside_32_bars_the_next_must_be_ready() {
         let far = playing(100_000.0);
-        let w = |s, loaded, armed| Watched { snapshot: s, on_air: Some((GRID, 200_000)), next_loaded: loaded, armed };
+        let w = |s, loaded, armed| Watched {
+            snapshot: s,
+            on_air: Some((GRID, 200_000)),
+            next_loaded: loaded,
+            armed,
+        };
         assert_eq!(fault(&w(&far, false, false)), None, "50 bars left");
         let near = playing(150_000.0);
         assert_eq!(

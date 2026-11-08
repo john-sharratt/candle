@@ -100,9 +100,21 @@ mod tests {
         let slots = schedule(
             midnight(),
             &[
-                Leg { track: &a, enter: 0.0, leave: 224.0 },
-                Leg { track: &b, enter: 0.0, leave: 224.0 },
-                Leg { track: &m, enter: 0.0, leave: 64.0 },
+                Leg {
+                    track: &a,
+                    enter: 0.0,
+                    leave: 224.0,
+                },
+                Leg {
+                    track: &b,
+                    enter: 0.0,
+                    leave: 224.0,
+                },
+                Leg {
+                    track: &m,
+                    enter: 0.0,
+                    leave: 64.0,
+                },
             ],
         );
         let t = |s: &Slot| (midnight() - s.starts).num_milliseconds();

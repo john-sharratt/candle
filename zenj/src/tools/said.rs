@@ -28,8 +28,22 @@ pub async fn call(dj: &Dj, caller: &str, args: &Value) -> Answer {
         Ok(t) => t.to_string(),
         Err(a) => return a,
     };
-    let who = args.get("who").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or(caller).to_string();
-    if dj.asks.send(Ask::Said { who: who.clone(), text: line }).await.is_err() {
+    let who = args
+        .get("who")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(caller)
+        .to_string();
+    if dj
+        .asks
+        .send(Ask::Said {
+            who: who.clone(),
+            text: line,
+        })
+        .await
+        .is_err()
+    {
         return Answer::error("ZenJ's brain is not running");
     }
     Answer::ok(format!("heard; the next choice hears {who} too"))

@@ -124,7 +124,9 @@ pub fn read_tracks(text: &str) -> Result<(Vec<Track>, Option<String>), String> {
     let doc: Document = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let data: Vec<Resource> = match &doc.data {
         Value::Array(_) => serde_json::from_value(doc.data.clone()).map_err(|e| e.to_string())?,
-        Value::Object(_) => vec![serde_json::from_value(doc.data.clone()).map_err(|e| e.to_string())?],
+        Value::Object(_) => {
+            vec![serde_json::from_value(doc.data.clone()).map_err(|e| e.to_string())?]
+        }
         _ => Vec::new(),
     };
     let mut tracks: Vec<Track> = data
@@ -133,8 +135,15 @@ pub fn read_tracks(text: &str) -> Result<(Vec<Track>, Option<String>), String> {
         .map(|r| track_of(r, &doc.included))
         .collect();
     // A relationship document names its tracks and includes them whole.
-    for r in data.iter().filter(|r| r.kind == "tracks" && r.attributes.is_null()) {
-        if let Some(full) = doc.included.iter().find(|i| i.kind == "tracks" && i.id == r.id) {
+    for r in data
+        .iter()
+        .filter(|r| r.kind == "tracks" && r.attributes.is_null())
+    {
+        if let Some(full) = doc
+            .included
+            .iter()
+            .find(|i| i.kind == "tracks" && i.id == r.id)
+        {
             tracks.push(track_of(full, &doc.included));
         }
     }
@@ -175,7 +184,10 @@ pub fn new_playlist(name: &str, description: &str) -> Value {
 /// The body adding `tracks`, before item `before` when given (else at the
 /// end).
 pub fn add_items(tracks: &[String], before: Option<&str>) -> Value {
-    let data: Vec<Value> = tracks.iter().map(|t| json!({"id": t, "type": "tracks"})).collect();
+    let data: Vec<Value> = tracks
+        .iter()
+        .map(|t| json!({"id": t, "type": "tracks"}))
+        .collect();
     match before {
         Some(b) => json!({"data": data, "meta": {"positionBefore": b}}),
         None => json!({"data": data}),
@@ -236,7 +248,10 @@ impl Tidal {
         if let Some(b) = body {
             req = req.header("content-type", JSON_API).body(b.to_string());
         }
-        let res = req.send().await.map_err(|e| format!("{method} {url}: {e}"))?;
+        let res = req
+            .send()
+            .await
+            .map_err(|e| format!("{method} {url}: {e}"))?;
         let status = res.status();
         let text = res.text().await.map_err(|e| e.to_string())?;
         if !status.is_success() {
@@ -271,7 +286,12 @@ impl Tidal {
         // A search names tracks without their artists: fill them by ISRC.
         for t in found.iter_mut().filter(|t| t.artists.is_empty()) {
             if let Some(isrc) = t.isrc.clone() {
-                if let Some(full) = self.by_isrc(&isrc).await?.into_iter().find(|f| f.id == t.id) {
+                if let Some(full) = self
+                    .by_isrc(&isrc)
+                    .await?
+                    .into_iter()
+                    .find(|f| f.id == t.id)
+                {
                     *t = full;
                 }
             }
@@ -309,7 +329,12 @@ impl Tidal {
         Ok(out)
     }
 
-    pub async fn add(&self, playlist: &str, tracks: &[String], before: Option<&str>) -> Result<(), String> {
+    pub async fn add(
+        &self,
+        playlist: &str,
+        tracks: &[String],
+        before: Option<&str>,
+    ) -> Result<(), String> {
         for chunk in tracks.chunks(20) {
             self.send(
                 Method::POST,
@@ -333,7 +358,12 @@ impl Tidal {
         Ok(())
     }
 
-    pub async fn move_before(&self, playlist: &str, items: &[Item], before: &str) -> Result<(), String> {
+    pub async fn move_before(
+        &self,
+        playlist: &str,
+        items: &[Item],
+        before: &str,
+    ) -> Result<(), String> {
         self.send(
             Method::PATCH,
             &format!("/playlists/{playlist}/relationships/items"),
@@ -393,7 +423,10 @@ mod tests {
                "included": [{"id": "5", "type": "tracks", "attributes": {"title": "S", "duration": "PT1M"}}]}"#,
         )
         .unwrap();
-        assert_eq!((t[0].id.as_str(), t[0].title.as_str(), t[0].duration_ms), ("5", "S", 60_000));
+        assert_eq!(
+            (t[0].id.as_str(), t[0].title.as_str(), t[0].duration_ms),
+            ("5", "S", 60_000)
+        );
         assert_eq!(t[0].bpm, None);
     }
 
@@ -408,8 +441,14 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                Item { track: "11".into(), item: "a-1".into() },
-                Item { track: "12".into(), item: "a-2".into() }
+                Item {
+                    track: "11".into(),
+                    item: "a-1".into()
+                },
+                Item {
+                    track: "12".into(),
+                    item: "a-2".into()
+                }
             ]
         );
         assert_eq!(next, None);
@@ -427,9 +466,19 @@ mod tests {
             r#"{"data":[{"id":"11","type":"tracks"},{"id":"12","type":"tracks"}],"meta":{"positionBefore":"a-1"}}"#
         );
         assert_eq!(
-            name_items(&[Item { track: "11".into(), item: "a-1".into() }], None).to_string(),
+            name_items(
+                &[Item {
+                    track: "11".into(),
+                    item: "a-1".into()
+                }],
+                None
+            )
+            .to_string(),
             r#"{"data":[{"id":"11","type":"tracks","meta":{"itemId":"a-1"}}]}"#
         );
-        assert_eq!(read_id(r#"{"data": {"id": "pl-9", "type": "playlists"}}"#).unwrap(), "pl-9");
+        assert_eq!(
+            read_id(r#"{"data": {"id": "pl-9", "type": "playlists"}}"#).unwrap(),
+            "pl-9"
+        );
     }
 }

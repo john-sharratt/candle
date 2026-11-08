@@ -98,11 +98,14 @@ fn phrases_in(tag: &[u8]) -> Option<Phrases> {
             kind: u16_at(tag, at + 4)?,
         });
     }
-    entries.windows(2).all(|w| w[0].beat < w[1].beat).then_some(Phrases {
-        mood,
-        end_beat,
-        entries,
-    })
+    entries
+        .windows(2)
+        .all(|w| w[0].beat < w[1].beat)
+        .then_some(Phrases {
+            mood,
+            end_beat,
+            entries,
+        })
 }
 
 /// The phrases of a `PSSI` tag, masked or not: whichever reading has a mood
@@ -130,8 +133,10 @@ fn path(tag: &[u8]) -> Option<String> {
     let len = u32_at(tag, 12)? as usize;
     let raw = tag.get(16..16 + len)?;
     let units: Vec<u16> = raw
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_be_bytes(*c))
         .take_while(|&u| u != 0)
         .collect();
     Some(String::from_utf16_lossy(&units))
@@ -207,14 +212,14 @@ impl Phrases {
     pub fn folded(&self) -> Vec<Phrase> {
         let mut out = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
-            let end = self
-                .entries
-                .get(i + 1)
-                .map_or(self.end_beat, |n| n.beat);
+            let end = self.entries.get(i + 1).map_or(self.end_beat, |n| n.beat);
             let Some(kind) = kind(self.mood, e.kind) else {
                 continue;
             };
-            let (start, end) = (e.beat.saturating_sub(1) as u32, end.saturating_sub(1) as u32);
+            let (start, end) = (
+                e.beat.saturating_sub(1) as u32,
+                end.saturating_sub(1) as u32,
+            );
             if end > start {
                 out.push(Phrase { kind, start, end });
             }
@@ -362,18 +367,34 @@ mod tests {
     fn a_dat_file_reads_its_path_grid_and_cues() {
         let f = build::file(&[
             build::path("/Music/TIDAL/123.flac"),
-            build::grid(&[(1, 12800, 120), (2, 12800, 589), (3, 12800, 1058), (4, 12850, 1527)]),
+            build::grid(&[
+                (1, 12800, 120),
+                (2, 12800, 589),
+                (3, 12800, 1058),
+                (4, 12850, 1527),
+            ]),
             build::cues(&[(1, 120), (0, 600), (3, 15120)]),
             build::tag(b"PWAV", &[0, 0, 0, 0], &[9, 9]),
         ]);
         let a = parse(&f).unwrap();
         assert_eq!(a.path.as_deref(), Some("/Music/TIDAL/123.flac"));
         assert_eq!(a.beats.len(), 4);
-        assert_eq!(a.beats[3], Beat { number: 4, bpm: 128.5, ms: 1527 });
+        assert_eq!(
+            a.beats[3],
+            Beat {
+                number: 4,
+                bpm: 128.5,
+                ms: 1527
+            }
+        );
         assert_eq!(a.grid(), Some((120.0, 128.0)));
         assert_eq!(
             a.cues,
-            vec![Cue { hot: 1, ms: 120 }, Cue { hot: 0, ms: 600 }, Cue { hot: 3, ms: 15120 }]
+            vec![
+                Cue { hot: 1, ms: 120 },
+                Cue { hot: 0, ms: 600 },
+                Cue { hot: 3, ms: 15120 }
+            ]
         );
         let hot = a.hot_cues(120.0, 468.75);
         assert_eq!(hot.len(), 2, "memory cues are not pads");
@@ -388,7 +409,11 @@ mod tests {
         for masked in [false, true] {
             let f = build::file(&[build::phrases(3, 257, &entries, masked)]);
             let p = parse(&f).unwrap().phrases.unwrap();
-            assert_eq!((p.mood, p.end_beat, p.entries.len()), (3, 257, 6), "masked {masked}");
+            assert_eq!(
+                (p.mood, p.end_beat, p.entries.len()),
+                (3, 257, 6),
+                "masked {masked}"
+            );
             use PhraseKind::*;
             assert_eq!(
                 p.folded()
@@ -406,13 +431,20 @@ mod tests {
             );
         }
         let masked = build::phrases(1, 100, &[(1, 1)], true);
-        assert_ne!(masked, build::phrases(1, 100, &[(1, 1)], false), "the mask changes bytes");
+        assert_ne!(
+            masked,
+            build::phrases(1, 100, &[(1, 1)], false),
+            "the mask changes bytes"
+        );
         assert_eq!(kind(1, 4), None, "high mood has no kind 4");
     }
 
     #[test]
     fn a_file_that_is_not_analysis_is_refused() {
-        assert_eq!(parse(b"RIFF....").unwrap_err(), "not an analysis file: no PMAI header");
+        assert_eq!(
+            parse(b"RIFF....").unwrap_err(),
+            "not an analysis file: no PMAI header"
+        );
         let mut f = build::file(&[build::path("x")]);
         let at = 28 + 8;
         f[at..at + 4].copy_from_slice(&9999u32.to_be_bytes());

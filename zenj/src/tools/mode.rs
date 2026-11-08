@@ -31,7 +31,10 @@ pub async fn call(dj: &Dj, args: &Value) -> Answer {
         Ok(None) => return Answer::error("`mode` is human, assist or zenj"),
         Err(a) => return a,
     };
-    let confirmed = args.get("confirmed").and_then(Value::as_bool).unwrap_or(false);
+    let confirmed = args
+        .get("confirmed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if mode != Mode::Human && !confirmed {
         return Answer::error(format!(
             "moving to {} needs a person at the party to say yes first: ask them, then call again with confirmed",
@@ -63,8 +66,14 @@ mod tests {
                 }
             }
         });
-        assert_eq!(call(&dj, &json!({"mode": "human"})).await, Answer::ok("human"));
-        assert_eq!(call(&dj, &json!({"mode": "zenj", "confirmed": true})).await, Answer::ok("zenj"));
+        assert_eq!(
+            call(&dj, &json!({"mode": "human"})).await,
+            Answer::ok("human")
+        );
+        assert_eq!(
+            call(&dj, &json!({"mode": "zenj", "confirmed": true})).await,
+            Answer::ok("zenj")
+        );
         brain.await.unwrap();
     }
 }

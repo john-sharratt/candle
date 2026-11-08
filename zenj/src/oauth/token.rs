@@ -34,7 +34,11 @@ pub const MARGIN_S: u64 = 120;
 impl Token {
     /// The kept token `answer` makes at `now`, keeping `previous`'s refresh
     /// token when the answer carries none (a refresh need not rotate it).
-    pub fn from_answer(answer: Answer, now: u64, previous: Option<&Token>) -> Result<Token, String> {
+    pub fn from_answer(
+        answer: Answer,
+        now: u64,
+        previous: Option<&Token>,
+    ) -> Result<Token, String> {
         let refresh = answer
             .refresh_token
             .or_else(|| previous.map(|p| p.refresh.clone()))
