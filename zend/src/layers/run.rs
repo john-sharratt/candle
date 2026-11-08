@@ -29,6 +29,7 @@ use super::plan::{dep_version, Done, LiveFiles};
 use super::spec::LayerSpec;
 use crate::branch_ingest::keys::branches_value;
 use crate::calibrate::{calibrate_committed, CalibrateSpec};
+use crate::ingest_backlog::{self, Work};
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::{Failures, IngestReport};
 use crate::ingest_snapshots::{finished, Unit};
@@ -189,7 +190,7 @@ pub fn ingest_units(
         thinking = %spec.effort,
         "reading the layer's units",
     );
-    crate::ingest_backlog::add_pending(total as u64);
+    ingest_backlog::add_pending(Work::Reading, total as u64);
     let backlog_done = AtomicUsize::new(0);
     let cursor = AtomicUsize::new(0);
     let failures = Failures::new();
@@ -221,11 +222,12 @@ pub fn ingest_units(
                     }
                 }
                 backlog_done.fetch_add(1, Ordering::Relaxed);
-                crate::ingest_backlog::item_done(&job.subject);
+                ingest_backlog::item_done(Work::Reading, &job.subject);
             });
         }
     });
-    crate::ingest_backlog::drop_pending(
+    ingest_backlog::drop_pending(
+        Work::Reading,
         (total as u64).saturating_sub(backlog_done.load(Ordering::Relaxed) as u64),
     );
     let report = failures.into_report(total);

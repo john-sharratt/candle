@@ -1474,6 +1474,16 @@ impl Missions {
         }
     }
 
+    /// Whether what `digest` names is news from the body's mission's task:
+    /// `false` when the news last passed on said it too, or there is no task.
+    /// Nothing is noted — [`Self::heard`] notes it once it is passed on.
+    pub fn is_news(&self, body: &str, digest: u64) -> bool {
+        self.active
+            .get(body)
+            .and_then(|m| m.task.as_ref())
+            .is_some_and(|t| t.heard != digest)
+    }
+
     /// Note that the body's mission's task said what `digest` names, and say
     /// whether that is news: `false` when it said it last time too, or there
     /// is no task.

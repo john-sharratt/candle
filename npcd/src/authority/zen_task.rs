@@ -28,8 +28,8 @@ use web::cluster::service_key::{subject, SERVICE_PROVIDER};
 use crate::engine::act::Act;
 use crate::engine::runtime::{Recorded, Runtime, LANDED, REFUSED};
 use crate::engine::zen_task::request::{
-    answer_of, digest, handle_in, news, rpc, standing_of, status_call, thread_for, zend_call,
-    Standing, ZEND_MCP,
+    answer_of, digest, handle_in, news, news_of, rpc, standing_of, status_call, thread_for,
+    zend_call, Standing, ZEND_MCP,
 };
 use crate::engine::zen_task::{task_grants, Task};
 
@@ -199,23 +199,40 @@ impl Runtime {
                     }
                 };
                 let standing = standing_of(&text, &handle);
+                // The state and what the task said, never the counters of its
+                // running turn: those change on every look.
+                let said = news_of(&text, &handle);
+                let said_digest = digest(&said);
                 hosted.with_sim(|s| {
-                    if s.missions.heard(&body, digest(&text)) {
-                        let id = s.threads.reach(&body, FROM);
-                        if let Err(why) = s.threads.send_on(&id, FROM, &news(&text), None) {
-                            tracing::warn!(npc, "a task's news could not be posted: {why}");
-                        }
+                    if standing == Standing::Done && s.missions.task_done(&body) {
+                        s.missions.observe(&body, format!("{handle} reported done"));
                     }
+                    if !s.missions.is_news(&body, said_digest) {
+                        return;
+                    }
+                    let id = s.threads.reach(&body, FROM);
+                    // Noted as heard only once it is posted: a post that fails
+                    // is tried again on the next look.
+                    if let Err(why) = s.threads.send_on(&id, FROM, &news(&said), None) {
+                        tracing::warn!(npc, "a task's news could not be posted: {why}");
+                        return;
+                    }
+                    s.missions.heard(&body, said_digest);
                     match standing {
-                        Standing::Done => {
-                            if s.missions.task_done(&body) {
-                                s.missions.observe(&body, format!("{handle} reported done"));
-                            }
-                        }
                         Standing::Failed => {
                             s.missions.observe(&body, format!("{handle} failed"));
                         }
-                        Standing::Running | Standing::Asking | Standing::Stuck => {}
+                        Standing::Stuck => s.missions.observe(
+                            &body,
+                            format!(
+                                "{handle} is stuck: it waits for `task_reply` to say how to go on"
+                            ),
+                        ),
+                        Standing::Asking => s.missions.observe(
+                            &body,
+                            format!("{handle} asks a question: answer it with `task_reply`"),
+                        ),
+                        Standing::Running | Standing::Done => {}
                     }
                 });
             }

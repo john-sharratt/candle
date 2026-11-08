@@ -168,14 +168,14 @@ fn the_ingest_backlog_is_every_members() {
     };
     let envelope = json!({ "members": [
         member("ww", ".6", line(Value::Null)),
-        member("bw", ".5", line(json!({ "processed": 5, "total": 233, "last_item": "candle/a.rs" }))),
+        member("bw", ".5", line(json!({ "processed": 5, "total": 233, "last_item": "candle/a.rs", "calibrating": 200 }))),
         member("xx", ".7", line(json!({ "processed": 10, "total": 12, "last_item": "candle/b.rs" }))),
     ]});
     let got = call("memberStatus", &[envelope, json!("zend")]);
     assert_eq!(got["build"], "b");
     assert_eq!(
         got["tenants"]["zend"]["ingest_backlog"],
-        json!({ "processed": 15, "total": 245, "last_item": "candle/a.rs" })
+        json!({ "processed": 15, "total": 245, "last_item": "candle/a.rs", "calibrating": 200 })
     );
     let idle = json!({ "members": [member("ww", ".6", line(Value::Null)), member("bw", ".5", line(Value::Null))] });
     assert_eq!(

@@ -181,7 +181,7 @@ getProjectionContext(convId, turns) -> Promise<{glue, sectionContent, turnConten
 getStatus() -> Promise<{state, started_at_ms, build, tenants:{zend:{state:"loading"|"ready", loading?, maintenance?, ingest_backlog?}}}>
                                                     // GET /v1/status; zend's line gates the startup overlay; `build` (a hash of the UI
                                                     // files on disk and the binary's version) drives the hot-reload check;
-                                                    // `ingest_backlog: {processed,total,last_item}|null` drives the under-chat background-ingest bar
+                                                    // `ingest_backlog: {processed,total,last_item,calibrating}|null` drives the under-chat background-ingest bar; `calibrating` is the calibration sweep's units still to go, named "Calibrating" when they are all that is left
 getToolSchemas() -> Promise<{[tool]: JSONSchema|null}>  // GET /v1/tools (zend's entries); tool-call cards list every parameter from it, defaults included
 archiveConversation(id) / unarchiveConversation(id) -> Promise<void>
 streamChatCompletion(conv, text, opts, handlers) -> { cancel() }

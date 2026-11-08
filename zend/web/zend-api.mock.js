@@ -244,7 +244,12 @@
         const files = ['src/main.rs', 'src/session.rs', 'src/api/status.rs', 'src/ingest_backlog.rs'];
         const total = n < 3 ? 5 : 7; // bumps from 5 to 7 on the 3rd poll
         if (n < total) {
-          ingest_backlog = { processed: n, total, last_item: files[(n - 1) % files.length] };
+          // The last two units are a calibration sweep's, as the daemon's
+          // `calibrating` counts them.
+          ingest_backlog = {
+            processed: n, total, last_item: files[(n - 1) % files.length],
+            calibrating: Math.min(2, total - n),
+          };
         }
       }
       // The host's shape: the process's status, with zend's own line under

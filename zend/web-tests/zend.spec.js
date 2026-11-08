@@ -921,6 +921,21 @@ test.describe('1.14 background ingest bar', () => {
     expect(firstPct).toBeGreaterThanOrEqual(0); // sanity: the first read wasn't NaN
   });
 
+  // The mock's last two units are a calibration sweep's (`calibrating`):
+  // while reading remains beside them the count names them, and once they
+  // are all that is left the strip says it is calibrating.
+  test('names a calibration sweep beside the reading, then on its own', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_INGEST_BACKLOG__ = true; });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await boot(page, { conv: '1' });
+    const bar = page.locator('#zend-ingest');
+    await expect(bar).toBeVisible();
+    await expect(bar.locator('.z-ingest-count')).toContainText('· 2 calibrating');
+    await expect(bar.locator('.z-ingest-label')).toHaveText('Indexing');
+    await expect(bar.locator('.z-ingest-label')).toHaveText('Calibrating', { timeout: 10000 });
+    await expect(bar.locator('.z-ingest-count')).toHaveText('2 left');
+  });
+
   test('mobile shows the count without the last-file label; desktop shows both', async ({ page }) => {
     await page.addInitScript(() => { window.__ZEND_MOCK_INGEST_BACKLOG__ = true; });
     await page.setViewportSize({ width: 390, height: 844 });

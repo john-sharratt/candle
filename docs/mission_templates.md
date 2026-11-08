@@ -212,7 +212,8 @@ task completes, not on the drone's word, the same shape as the doc-commit and
 publish gates in `mission.rs`.
 
 **The acts.** A template grants any of `task_start { title, prompt, role? }` (the task's name; `name` is the act
-line's own field),
+line's own field — made the kebab-case slug of at most 40 characters zend names a task with, cut on a word,
+`request::slug`),
 `task_reply { answer }` and `task_nudge { message }`
 (`npcd/src/engine/zen_task/acts.rs`). Unlike the building acts, which are lent
 in the mission's room, these are granted **wherever the mission is carried**: a
@@ -227,13 +228,19 @@ with is kept on the mission (`Mission::task`); a reply or nudge before it is
 refused.
 
 **The tending.** Every 15 s, off the decode path, the world's authority asks
-each carried mission's task how it stands (`job_status`, `wait_s: 0`). When its
-answer changed, the news is posted on the carrier's handset from **"Zen Code"** —
+each carried mission's task how it stands (`job_status`, `wait_s: 0`), read from
+the `{job}: {state}` line its block opens with — `running`, `question`, `stuck`,
+`done` or `error`, and `there is no task` for one zend no longer holds
+(`request::standing_of`). When its news changed — the state and what follows it,
+never the elapsed time and tokens of a running turn, which change on every look
+(`request::news_of`) — it is posted on the carrier's handset from **"Zen Code"**,
 kept apart from the moon's character Zen, whose thread with the carrier is its
-own — once per change (a digest of the last answer posted is kept). A task that
-reports done signs off the mission's step `see the task through`
-(`zen_task::TASK_STEP`, which only the engine closes); one that fails is noted
-on the mission for its carrier to act on.
+own, once per change: a digest of the news last posted is kept, and noted only
+once the post succeeds, so a post that fails is tried again on the next look. A
+task that reports done signs off the mission's step `see the task through`
+(`zen_task::TASK_STEP`, which only the engine closes); one that fails, is stuck
+or asks a question is noted on the mission, with the news, for its carrier to
+act on.
 
 **A suspended carrier is held still here too**: its task acts are refused, and
 its task is neither asked after nor posted to until it is let go.

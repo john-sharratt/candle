@@ -62,10 +62,10 @@ is true, `journal_accept {journal: "<path>#<line id>"}`; when they don't,
 ## Reading and searching
 
 - `journal_read {journal}` opens a journal: its summary, references,
-  sub-journals by cue and newest lines. When older lines remain, its answer
-  ends with the `after: <path>#<line id>` to page on with (`limit` lines a
-  page, 50 by default); an archive is just further back. One line is
-  `<path>#<line id>`.
+  sub-journals by cue and its newest 50 lines. When older lines remain, its
+  answer ends with the `after: <path>#<line id>` to page on with; a read with
+  `after` takes `limit` lines a page (50 by default), while an opening read is
+  always 50. An archive is just further back. One line is `<path>#<line id>`.
 - `journal_grep {journal, pattern}` searches one journal, a subtree, or `*`
   for everything the person reads, newest first; narrow it with `kind`
   (`note`, `fold`, `proposal`) and `speaker` (a person's slug). When more

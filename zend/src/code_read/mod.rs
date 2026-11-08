@@ -56,6 +56,7 @@ use crate::branch_ingest::keys::{
 };
 use crate::branch_ingest::plan::Committed;
 use crate::calibrate::{calibrate_committed, CalibrateSpec};
+use crate::ingest_backlog::{self, Work};
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::Failures;
 use crate::ingest_snapshots::{finished, Unit};
@@ -611,7 +612,7 @@ pub fn ingest_jobs(
     // REALLY run. Same snapshot every worker probes below, so registration
     // and completion can't disagree.
     let backlog_pending = keys.iter().filter(|k| !present_keys.contains(*k)).count() as u64;
-    crate::ingest_backlog::add_pending(backlog_pending);
+    ingest_backlog::add_pending(Work::Reading, backlog_pending);
     let backlog_done = AtomicUsize::new(0);
 
     // **Each member walks the queue in an order of its own**, so two members
@@ -706,7 +707,7 @@ pub fn ingest_jobs(
                     // pass.
                     if !present_keys.contains(key) {
                         backlog_done.fetch_add(1, Ordering::Relaxed);
-                        crate::ingest_backlog::item_done(&file.path);
+                        ingest_backlog::item_done(Work::Reading, &file.path);
                     }
                 }));
             }
@@ -742,7 +743,8 @@ pub fn ingest_jobs(
 
     // An abort or a shutdown cancel can leave files claimed but never run —
     // hand them back, or the GUI's backlog bar never reaches zero.
-    crate::ingest_backlog::drop_pending(
+    ingest_backlog::drop_pending(
+        Work::Reading,
         backlog_pending.saturating_sub(backlog_done.load(Ordering::Relaxed) as u64),
     );
 

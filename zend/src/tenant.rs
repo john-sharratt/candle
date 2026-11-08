@@ -301,6 +301,7 @@ fn backlog_view(b: BacklogSnapshot) -> Value {
         "processed": b.processed,
         "total": b.total,
         "last_item": b.last_item,
+        "calibrating": b.calibrating,
     })
 }
 
@@ -342,17 +343,24 @@ mod tests {
         assert_eq!(v.waiting_for, ["npcd"]);
     }
 
-    /// The backlog keeps its wire shape; maintenance's is the host's
-    /// (`host::Maintenance`).
+    /// The backlog's wire shape: every kind of work in `processed` / `total`,
+    /// and the calibration units still to go in `calibrating`; maintenance's
+    /// is the host's (`host::Maintenance`).
     #[test]
     fn the_backlog_keeps_its_wire_shape() {
         assert_eq!(
             backlog_view(BacklogSnapshot {
                 processed: 3,
                 total: 9,
-                last_item: Some("src/lib.rs".into()),
+                last_item: Some("src/lib.rs (calibrated)".into()),
+                calibrating: 4,
             }),
-            json!({"processed": 3, "total": 9, "last_item": "src/lib.rs"})
+            json!({
+                "processed": 3,
+                "total": 9,
+                "last_item": "src/lib.rs (calibrated)",
+                "calibrating": 4,
+            })
         );
     }
 

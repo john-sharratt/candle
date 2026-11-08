@@ -2948,17 +2948,27 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // work, not a miscount — so the fill can slip backwards. That is the truth
   // of the queue and is left visible; the readout on the right is what
   // REMAINS, which is the number that only ever means one thing.
+  //
+  // The calibration sweep shares the bar (`calibrating`: its units still to
+  // go). It follows every reading pass and costs many times the reading — 24
+  // questions decoded per file — so the strip names it: `Calibrating` when it
+  // is all that is left, and its own count beside the rest while both run.
   const INGEST_ITEM_MAX = 56;
   function ingestView(b) {
     const total = b.total || 0;
     // `processed` is clamped so a poll that catches a grown total late can
     // never render a fill past 100% or a negative remainder.
     const processed = Math.min(b.processed || 0, total);
+    const remaining = Math.max(0, total - processed);
+    const calibrating = Math.min(b.calibrating || 0, remaining);
+    const onlyCalibrating = calibrating > 0 && calibrating === remaining;
     const item = b.last_item || '';
     return {
       total, processed,
       pct: total > 0 ? Math.round((processed / total) * 100) : 0,
-      left: Math.max(0, total - processed).toLocaleString() + ' left',
+      label: onlyCalibrating ? 'Calibrating' : 'Indexing',
+      left: remaining.toLocaleString() + ' left'
+        + (calibrating > 0 && !onlyCalibrating ? ' · ' + calibrating.toLocaleString() + ' calibrating' : ''),
       item,
       // A path's tail (the file) identifies it; its head is repeated
       // boilerplate — clamp from the left. The CSS ellipsis then handles
@@ -2973,8 +2983,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // Narrow: the count alone, against the fill. There is no room for a path
     // on a phone, and the eyebrow would cost more width than it explains.
     return h('div', { id: 'zend-ingest', class: 'z-ingest', style: 'padding:0.3rem ' + (S.narrow ? '0.85rem' : '2rem') + ' 0.35rem;' },
-      S.narrow ? null : h('span', { class: 'z-ingest-label' }, 'Indexing'),
-      h('div', { class: 'z-ingest-track', role: 'progressbar', 'aria-label': 'Workspace indexing backlog', 'aria-valuemin': '0', 'aria-valuemax': String(v.total), 'aria-valuenow': String(v.processed) },
+      S.narrow ? null : h('span', { class: 'z-ingest-label' }, v.label),
+      h('div', { class: 'z-ingest-track', role: 'progressbar', 'aria-label': 'Workspace ' + v.label.toLowerCase() + ' backlog', 'aria-valuemin': '0', 'aria-valuemax': String(v.total), 'aria-valuenow': String(v.processed) },
         h('div', { class: 'z-ingest-fill', style: 'width:' + v.pct + '%;' })),
       S.narrow ? null : h('span', { class: 'z-ingest-item', title: v.item || null }, v.itemTxt),
       h('span', { class: 'z-ingest-count' }, v.left));
@@ -2994,8 +3004,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const track = bar.querySelector('.z-ingest-track');
     track.setAttribute('aria-valuemax', String(v.total));
     track.setAttribute('aria-valuenow', String(v.processed));
+    track.setAttribute('aria-label', 'Workspace ' + v.label.toLowerCase() + ' backlog');
     bar.querySelector('.z-ingest-fill').style.width = v.pct + '%';
     bar.querySelector('.z-ingest-count').textContent = v.left;
+    const label = bar.querySelector('.z-ingest-label');
+    if (label) label.textContent = v.label;
     const item = bar.querySelector('.z-ingest-item');
     if (item) { item.textContent = v.itemTxt; item.setAttribute('title', v.item); }
   }

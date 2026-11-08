@@ -33,10 +33,11 @@ Correcting one line is not a restructure: use `journal_edit` on it, or
 
 ## Briefing the worker
 
-Start `repo_task_start` on `repo: "journals"` with `role: "coder"` (it
-pushes the change) — `driven: "alone"` when no one will answer it (the `drive`
-guide). The worker shares the thread's journal, not this conversation, so
-state in full:
+Start `repo_task_start` with `role: "coder"` (it pushes the change) —
+`driven: "alone"` when no one will answer it (the `drive` guide). The tool
+takes no repository: name it in the prompt, which opens with `GOAL: in the
+journals repository, …`, the way the `guide-change` guide names `candle`. The
+worker shares the thread's journal, not this conversation, so state in full:
 
 1. **What moves where, and why.** Name the lines by id and the journals by
    path.

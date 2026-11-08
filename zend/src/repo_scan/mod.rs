@@ -35,6 +35,7 @@ use zend_vfs::Oid;
 use crate::branch_ingest::keys::{branches_value, BRANCHES_KEY, CONTENT_KEY};
 use crate::branch_ingest::plan::Committed;
 use crate::branch_ingest::units::FolderUnit;
+use crate::ingest_backlog::{self, Work};
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::{Failures, IngestReport};
 use crate::ingest_snapshots::{finished, Unit};
@@ -804,7 +805,7 @@ fn run_dir_pool(
         .iter()
         .filter(|j| !present_keys.contains(&j.unit.key))
         .count() as u64;
-    crate::ingest_backlog::add_pending(backlog_pending);
+    ingest_backlog::add_pending(Work::Reading, backlog_pending);
     let backlog_done = AtomicUsize::new(0);
 
     // Each member walks the queue in its own order, the folders a drawing
@@ -940,7 +941,7 @@ fn run_dir_pool(
                         // retried next pass.
                         if tracked {
                             backlog_done.fetch_add(1, Ordering::Relaxed);
-                            crate::ingest_backlog::item_done(&job.unit.dir);
+                            ingest_backlog::item_done(Work::Reading, &job.unit.dir);
                         }
                         // An error escaping `process_one_dir` is an unexpected
                         // one (its own two failure modes record and return Ok).
@@ -979,7 +980,8 @@ fn run_dir_pool(
 
     // An abort or a shutdown cancel can leave units claimed but never run —
     // hand them back, or the GUI's backlog bar never reaches zero.
-    crate::ingest_backlog::drop_pending(
+    ingest_backlog::drop_pending(
+        Work::Reading,
         backlog_pending.saturating_sub(backlog_done.load(Ordering::Relaxed) as u64),
     );
 

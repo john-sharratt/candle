@@ -31,9 +31,9 @@ const lineOf = (body, tenant) => (body.tenants || {})[tenant] || null;
 
 /* Every member's ingest backlog for `tenant` as one — the work is the
  * cluster's, split by lease, so the member that speaks for the app may have
- * none of its own while another reads on. Processed and total summed; the item
- * named is the one being read by the member with the most still to go. `null`
- * when no member has a backlog. */
+ * none of its own while another reads on. Processed, total and the calibration
+ * units still to go summed; the item named is the one being read by the member
+ * with the most still to go. `null` when no member has a backlog. */
 function clusterBacklog(members, tenant) {
   const backlogs = members
     .map((m) => (lineOf(m.body, tenant) || {}).ingest_backlog)
@@ -45,6 +45,7 @@ function clusterBacklog(members, tenant) {
     processed: backlogs.reduce((n, b) => n + (b.processed || 0), 0),
     total: backlogs.reduce((n, b) => n + (b.total || 0), 0),
     last_item: busiest.last_item ?? null,
+    calibrating: backlogs.reduce((n, b) => n + (b.calibrating || 0), 0),
   };
 }
 

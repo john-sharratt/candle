@@ -44,7 +44,7 @@ pub fn zend_call(
             }
             let mut call = json!({
                 "thread": thread,
-                "name": text("title")?,
+                "name": slug(&text("title")?).ok_or("Say the `title` in words.")?,
                 "prompt": text("prompt")?,
                 "driven": "attended",
                 "wait_s": 0,
@@ -64,6 +64,33 @@ pub fn zend_call(
         )),
         other => Err(format!("`{other}` is no act that drives a task.")),
     }
+}
+
+/// The longest task name zend takes (`zend::mcp::names::MAX_NAME`).
+pub const MAX_TITLE: usize = 40;
+
+/// `title` as the name zend takes: a kebab-case slug of at most
+/// [`MAX_TITLE`] characters — lowercase letters and digits, every other run
+/// of characters one hyphen, cut on a word. `None` when it holds no letter or
+/// digit.
+pub fn slug(title: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    if out.len() > MAX_TITLE {
+        let cut = &out[..=MAX_TITLE];
+        out = match cut.rfind('-') {
+            Some(at) if at > 0 => cut[..at].to_string(),
+            _ => out[..MAX_TITLE].to_string(),
+        };
+    }
+    let out = out.trim_end_matches('-').to_string();
+    (!out.is_empty()).then_some(out)
 }
 
 /// How a task stands, as `job_status` says it.
@@ -147,24 +174,58 @@ pub enum Standing {
 }
 
 /// Where the task `handle` stands, as `job_status`'s answer `text` words it.
+///
+/// zend opens each job's block with `{job}: {state}`
+/// (`zend::mcp::tools::job::source::task::standing`): `running — …` while it
+/// works, then `question`, `stuck`, `done` or `error`. A task zend no longer
+/// holds is `{job}: there is no task …`.
 pub fn standing_of(text: &str, handle: &str) -> Standing {
-    let Some(rest) = text
-        .find(handle)
-        .map(|at| text[at + handle.len()..].trim_start_matches([' ', '—', '-']))
-    else {
+    let Some(state) = state_of(text, handle) else {
         return Standing::Running;
     };
-    if rest.starts_with("done") {
+    if state.starts_with("done") {
         Standing::Done
-    } else if rest.starts_with("asks") {
+    } else if state.starts_with("question") {
         Standing::Asking
-    } else if rest.starts_with("stuck") || rest.starts_with("stopped") {
+    } else if state.starts_with("stuck") {
         Standing::Stuck
-    } else if rest.starts_with("error") || rest.starts_with("no such worker") {
+    } else if state.starts_with("error") || state.starts_with("there is no task") {
         Standing::Failed
     } else {
         Standing::Running
     }
+}
+
+/// What follows `{handle}: ` on the line that opens `handle`'s block.
+fn state_of<'t>(text: &'t str, handle: &str) -> Option<&'t str> {
+    let opener = format!("{handle}: ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(opener.as_str()))
+        .map(str::trim)
+}
+
+/// What `job_status` said of `handle` that is news to its carrier: the state
+/// its block opens with and what follows it — the question, the answer, the
+/// journal entries — without what a running task's lines say of its turn: what
+/// it is doing, for how long and with how many tokens changes on every look,
+/// and is not news. The block's closing `pages:` line is not news either.
+pub fn news_of(text: &str, handle: &str) -> String {
+    let opener = format!("{handle}: ");
+    let mut lines = text.lines().skip_while(|l| !l.starts_with(opener.as_str()));
+    let Some(first) = lines.next() else {
+        return text.trim().to_string();
+    };
+    let state = first[opener.len()..].trim();
+    let running = state.starts_with("running");
+    let head = if running { "running" } else { state };
+    let turn = format!("{handle} — ");
+    let body: Vec<&str> = lines
+        .take_while(|l| !l.starts_with("pages: "))
+        .filter(|l| !(running && l.starts_with(turn.as_str())))
+        .collect();
+    format!("{handle}: {head}\n{}", body.join("\n"))
+        .trim()
+        .to_string()
 }
 
 /// A digest of what the task said, so the same news is posted once.
@@ -300,32 +361,118 @@ mod tests {
         assert_eq!(handle_in("nothing started", "mission-7-3"), None);
     }
 
-    /// **Where a task stands is read from its line**, each settled state by
-    /// its word.
+    const H: &str = "task:mission-7-3/fix-door";
+
+    /// One job's block as zend's `job_status` renders it
+    /// (`zend::mcp::tools::job::status::render` over `source::task::standing`
+    /// and `tools::wait::result_of`): `{job}: {state}`, the result under it
+    /// opening `{job} — …`, and the pages line.
+    fn block(state: &str, result: &str) -> String {
+        format!(
+            "{H}: {state}\n{H} — {result}\npages: 2 — `job_read {{job: \"{H}\", page: P}}` reads page P"
+        )
+    }
+
+    fn running(secs: u32, tokens: &str) -> String {
+        let doing = format!(
+            "running {secs}s, 3 rounds: {tokens} thinking tokens, 4 tool calls (file_read 4); now thinking"
+        );
+        block(&format!("running — {doing}"), &doing)
+    }
+
+    /// **Where a task stands is read from the line its block opens with**,
+    /// each state by zend's word for it; a task zend no longer holds failed.
     #[test]
     fn a_tasks_standing_is_read_from_its_line() {
-        let h = "task:mission-7-3/fix-door";
-        let line = |rest: &str| format!("{h} — {rest}");
         assert_eq!(
-            standing_of(&line("done. Its answer:\nfixed"), h),
+            standing_of(&block("done", "done. Its answer:\nfixed"), H),
             Standing::Done
         );
         assert_eq!(
-            standing_of(&line("asks Claude (reply with …):\nWhich?"), h),
+            standing_of(
+                &block(
+                    "question",
+                    "asks Claude (reply with `repo_task_reply`; it waits until then):\nWhich?"
+                ),
+                H
+            ),
             Standing::Asking
         );
         assert_eq!(
-            standing_of(&line("stuck: the repeat guard…"), h),
+            standing_of(
+                &block(
+                    "stuck",
+                    "stuck: the repeat guard or the round cap closed its tools."
+                ),
+                H
+            ),
             Standing::Stuck
         );
         assert_eq!(
-            standing_of(&line("stopped, as you asked"), h),
-            Standing::Stuck
+            standing_of(&block("error", "error: the worker was lost"), H),
+            Standing::Failed
         );
-        assert_eq!(standing_of(&line("error: lost"), h), Standing::Failed);
+        assert_eq!(standing_of(&running(30, "1,234"), H), Standing::Running);
         assert_eq!(
-            standing_of(&line("round 3, reading files"), h),
-            Standing::Running
+            standing_of(&format!("{H}: there is no task `{H}`"), H),
+            Standing::Failed
+        );
+        assert_eq!(
+            standing_of("task:mission-7-3/other: done", H),
+            Standing::Running,
+            "another task's line is not this one's"
+        );
+    }
+
+    /// **A running task's news does not change as it runs**: its elapsed time
+    /// and tokens are left out, so the same news is posted once, and what it
+    /// says once it settles is news.
+    #[test]
+    fn a_running_tasks_news_holds_still_between_looks() {
+        let first = news_of(&running(30, "1,234"), H);
+        assert_eq!(first, format!("{H}: running"));
+        assert_eq!(news_of(&running(45, "2,001"), H), first);
+        let done = news_of(&block("done", "done. Its answer:\nfixed"), H);
+        assert_eq!(done, format!("{H}: done\n{H} — done. Its answer:\nfixed"));
+        assert_ne!(digest(&done), digest(&first));
+    }
+
+    /// **A title becomes the name zend takes**: a kebab-case slug of at most
+    /// 40 characters, cut on a word; one with no letter or digit is none.
+    #[test]
+    fn a_title_becomes_a_kebab_slug() {
+        assert_eq!(
+            slug("Fix the door sensor build!").as_deref(),
+            Some("fix-the-door-sensor-build")
+        );
+        assert_eq!(slug("fix-door").as_deref(), Some("fix-door"));
+        assert_eq!(slug("  --Door__Sensor--  ").as_deref(), Some("door-sensor"));
+        assert_eq!(
+            slug("Replace the broken east door sensor and rebuild the firmware").as_deref(),
+            Some("replace-the-broken-east-door-sensor-and")
+        );
+        assert_eq!(slug("x".repeat(50).as_str()).map(|s| s.len()), Some(40));
+        assert_eq!(slug("!!!"), None);
+        assert_eq!(
+            zend_call(
+                "task_start",
+                &args(json!({"title": "Fix the Door", "prompt": "p"})),
+                "t",
+                None
+            )
+            .unwrap()
+            .1["name"],
+            "fix-the-door"
+        );
+        assert_eq!(
+            zend_call(
+                "task_start",
+                &args(json!({"title": "…", "prompt": "p"})),
+                "t",
+                None
+            )
+            .unwrap_err(),
+            "Say the `title` in words."
         );
     }
 
