@@ -310,7 +310,7 @@ impl Npcs {
         // store that model would refuse is refused here before anything in it
         // is rewritten.
         let model = LegacySpec::of(&MODEL.spec());
-        let persistence = SubstratePersistence::open_in_with_substrate_and_sink(
+        let mut persistence = SubstratePersistence::open_in_with_substrate_and_sink(
             dir,
             &mut substrate,
             Admit::Spec(&model),
@@ -340,14 +340,16 @@ impl Npcs {
             dir.join(SUBSTRATE_DIR).display()
         );
 
-        let read_as = by_id
-            .keys()
-            .filter_map(|id| Some((*id, persistence.npc_locs().identity(id)?)))
-            .collect();
-        let cast = Cast {
+        // Each character is read from the record its index names, the one a
+        // refresh compares against — not the last one replay passed. A record
+        // replicated in carries its writer's stamp, so a log can hold an older
+        // one after a newer: taking replay's last kept the older content under
+        // the newer one's identity, and no refresh ever read it again.
+        let replayed = Cast {
             by_id: by_id.into_iter().collect(),
-            read_as,
+            read_as: Default::default(),
         };
+        let cast = caught_up(&mut persistence, &replayed).map_or(replayed, |(cast, _)| cast);
         Ok(Self {
             current: ArcSwap::from_pointee(cast),
             shared: SharedSubstrate::new(substrate, persistence),
@@ -1565,6 +1567,50 @@ mod tests {
         // put the character back into it.
         let casting = back.cast().into_iter().find(|c| c.npc_id == id).unwrap();
         assert_eq!(casting.mood.as_deref(), Some("cornered"));
+    }
+
+    /// **The cast loads each character's newest record, not replay's last.**
+    /// Another member's older record replicated in after this member's newer
+    /// one: the log holds them in that order, and a reload must hold the
+    /// newer — the one a refresh compares against, so nothing would ever read
+    /// it again.
+    #[test]
+    fn a_reload_holds_the_newest_record_whatever_order_the_log_holds() {
+        let (dir_a, dir_b) = (tmp(), tmp());
+        let id = {
+            let a = Npcs::load(&dir_a).unwrap();
+            let b = Npcs::load(&dir_b).unwrap();
+            let id = nid(&a.create(&ident("u1"), ME, &body("Umbra"), 1_000).unwrap());
+            let older = a.view().payload(id).unwrap().clone();
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut newer = older.clone();
+            newer.state = SUSPENDED.to_string();
+            b.shared.persistence.call(|p| {
+                p.write_npc(&newer).unwrap();
+                p.commit().unwrap();
+            });
+
+            // A's records reach B after B wrote its own.
+            let bytes: Vec<Vec<u8>> = a.shared.persistence.call(|p| {
+                let node = p.node();
+                (1..)
+                    .map_while(|q| p.read_event(node, q).unwrap())
+                    .collect()
+            });
+            let refs: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+            let checks = SubstratePersistence::check_remote(&refs);
+            let lock = Arc::clone(&b.shared.substrate);
+            b.shared.persistence.call(|p| {
+                p.apply_remote_shared(&lock, &refs, &checks, 0).unwrap();
+                p.commit().unwrap();
+            });
+            id
+        };
+
+        let b = Npcs::load(&dir_b).unwrap();
+        assert_eq!(b.view().payload(id).unwrap().state, SUSPENDED);
+        assert!(b.refresh().is_empty(), "the cast agrees with the log");
     }
 
     /// **A write does not put an older record back over a newer one.** A
