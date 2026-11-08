@@ -79,7 +79,7 @@ use journals::ops::wire::path_from_wire;
 use journals::path::JournalPath;
 use journals::time::Stamp;
 use serde_json::{json, Value};
-use web::auth::Roles;
+use web::auth::{Role as AccessRole, Roles};
 use zend_tools::run_watch::{self, RunWatch};
 use zend_tools::state::Secrets;
 use zend_tools::tools::journal::{JournalBook, JournalShelf};
@@ -158,8 +158,8 @@ use crate::think_progress::{ThinkProgress, ThinkUpdate};
 use crate::tool_availability::{announce_returned, unavailable, Unavailable};
 use crate::tool_round;
 use crate::tools::{
-    extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, Dispatch,
-    ToolCall, ToolHost, ToolResult, CALIB_TOOL_SELECTOR,
+    extract_tool_calls, format_tool_responses, install_tool_catalog, memory_hidden, run_tool_calls,
+    Dispatch, ToolCall, ToolHost, ToolResult, CALIB_TOOL_SELECTOR,
 };
 use crate::turn_claims;
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
@@ -7766,10 +7766,16 @@ impl ZendSession {
     /// committed — no conversation's changes — whose pushes are made, gated
     /// and announced as every push of Zen's is, and each repository's base
     /// branch. It belongs to no conversation, so it pushes to any branch.
+    /// For a caller below an admin the memory's repository is not among them
+    /// ([`memory_hidden`]): an admin's alone to read or commit file by file.
     /// `None` while the model is not loaded.
-    pub fn repository_tools(&self) -> Option<(Arc<ToolContext>, BaseBranches)> {
+    pub fn repository_tools(&self, role: AccessRole) -> Option<(Arc<ToolContext>, BaseBranches)> {
         let state = self.loaded()?;
         let files = state.tool_host.conversation_files();
+        let files = match role.at_least(AccessRole::Admin) {
+            true => files,
+            false => Arc::new(memory_hidden(&files)),
+        };
         let ctx = state
             .tool_host
             .context_for(ToolMode::Comprehensive, &files, "");

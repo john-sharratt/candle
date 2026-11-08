@@ -147,6 +147,27 @@ impl RepoFiles {
         Some(fresh)
     }
 
+    /// The same stores without the repository `name`: a view for a caller who
+    /// may not see it. The stores it keeps are these very ones, so a write
+    /// through the view is a write here; `name` reads as no repository, and
+    /// `*` covers every repository but it.
+    pub fn without(&self, name: &str) -> Self {
+        let stores = self
+            .stores
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n != name)
+            .cloned()
+            .collect();
+        let workspace = self.workspace.as_ref().map(|w| w.without(name));
+        Self {
+            workspace,
+            sources: Arc::clone(&self.sources),
+            stores: RwLock::new(stores),
+        }
+    }
+
     /// Read each named repository through the branch `branches` gives it —
     /// the conversation's own. A repository the set does not have, one not
     /// under git, and a name that is not a branch are named in the result
@@ -340,6 +361,31 @@ mod tests {
             err.to_string(),
             "no repository named \"c\" — repo must be one of: a, b"
         );
+    }
+
+    /// **A view without a repository does not have it**: by name it is no
+    /// repository, `*` and the workspace leave it out, and a write through the
+    /// view to another repository lands in the store it shares.
+    #[test]
+    fn a_view_without_a_repository_hides_it_and_shares_the_rest() {
+        let (_dir, ws) = two_repos();
+        let files = RepoFiles::overlay(ws).unwrap();
+        let view = files.without("b");
+        assert_eq!(
+            view.repo("b").err().unwrap(),
+            UnknownRepo {
+                name: "b".to_string(),
+                known: vec!["a".to_string()],
+            }
+        );
+        assert_eq!(view.names(), vec!["a"]);
+        assert_eq!(view.all().len(), 1);
+        assert!(view.workspace().unwrap().repo("b").is_none());
+        assert!(Arc::ptr_eq(
+            &view.repo("a").unwrap(),
+            &files.repo("a").unwrap()
+        ));
+        assert!(files.repo("b").is_ok(), "the set itself still has it");
     }
 
     #[test]

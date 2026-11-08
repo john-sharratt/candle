@@ -27,7 +27,13 @@ pub fn name_repo(name: &str) {
 
 /// Whether the workspace repository `repo` is the memory.
 pub fn is_memory_repo(repo: &str) -> bool {
-    repo == NAMED.get().map_or(REPO, String::as_str)
+    repo == memory_repo()
+}
+
+/// The workspace repository that is the memory: the one the session named,
+/// else [`REPO`].
+pub fn memory_repo() -> &'static str {
+    NAMED.get().map_or(REPO, String::as_str)
 }
 
 /// The section every conversation's journal sits under.

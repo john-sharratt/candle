@@ -369,6 +369,20 @@ impl Workspace {
         self.repos.iter().find(|r| r.name == name)
     }
 
+    /// The same workspace without the repository `name`: what a caller who
+    /// may not see that repository is shown.
+    pub fn without(&self, name: &str) -> Self {
+        Self {
+            root: self.root.clone(),
+            repos: self
+                .repos
+                .iter()
+                .filter(|r| r.name != name)
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// Every repository's name, in manifest order.
     pub fn names(&self) -> Vec<String> {
         self.repos.iter().map(|r| r.name.clone()).collect()

@@ -58,7 +58,7 @@ pub fn land(ctx: &Ctx, args: &Value, changes: &[Change]) -> Answer {
         Err(a) => return a,
     };
     let repo_name = repo_name.as_str();
-    let Some((tools, bases)) = ctx.session.repository_tools() else {
+    let Some((tools, bases)) = ctx.session.repository_tools(ctx.caller.role) else {
         return Answer::error(LOADING);
     };
     let Some(workspace) = tools.files.workspace() else {

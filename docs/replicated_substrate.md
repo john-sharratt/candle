@@ -3134,9 +3134,10 @@ the group has to know the member can no longer write.
 
 **Fault mode has one other cause: a candidate build that failed certification** (§3.8).
 It behaves the same way, with no requests routed to it, roles handed back, and still
-voting, with one difference: its disk is fine, so it **keeps applying remote events**
-and receiving live ones. The table's rows that exist because of a full disk do not apply
-to it. It leaves only by an admin's `certify-anyway` or `reject-build`, or by a forced
+voting. Like a disk-faulted member it receives live events and applies only the ones that
+free space — the tombstones — and fetches the rest by the catch-up that leaving starts.
+The difference is only its disk, which is fine, so the table's rows that exist because of
+a full disk do not apply to it. It leaves only by an admin's `certify-anyway` or `reject-build`, or by a forced
 rollout of its build (§3.11), never by itself.
 
 **A device that cannot take a turn reports `fault` too.** While the GPU context is

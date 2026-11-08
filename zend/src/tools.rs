@@ -55,6 +55,7 @@ use zend_vfs::{GitError, RepoFiles, Workspace, JOBS_DIR};
 use crate::access;
 use crate::agent_exec::AgentExecutor;
 use crate::mcp::ownership::owner_of;
+use crate::memory_paths;
 use crate::substrate_git::agents as agents_for;
 use crate::tool_availability::Facts;
 use crate::tool_constraints::grammar_schema;
@@ -598,6 +599,12 @@ impl RawCall {
 
 // ── Tool dispatch ────────────────────────────────────────────────────────────
 
+/// `files` without the memory's repository (`crate::memory_paths`): what a
+/// caller who is not an admin reads the workspace through.
+pub fn memory_hidden(files: &RepoFiles) -> RepoFiles {
+    files.without(memory_paths::memory_repo())
+}
+
 /// Run one parsed tool call against the registry.  Always returns a
 /// JSON value the model can consume — successful tools return their
 /// typed response; a refused call carries what the model needs to correct
@@ -947,8 +954,8 @@ impl ToolHost {
 
     /// The context of `mode` for the conversation `lineage`, with its file
     /// stores `files`: branches-only when an `/mcp` caller owns it.
-    fn bound(&self, mode: ToolMode, files: &Arc<RepoFiles>, lineage: &str) -> ToolContext {
-        let ctx = self.contexts[mode.level() as usize].with_files(Arc::clone(files), lineage);
+    fn bound(&self, mode: ToolMode, files: Arc<RepoFiles>, lineage: &str) -> ToolContext {
+        let ctx = self.contexts[mode.level() as usize].with_files(files, lineage);
         if owner_of(lineage).is_some() {
             ctx.branches_only(Arc::clone(&self.default_branches))
         } else {
@@ -974,11 +981,20 @@ impl ToolHost {
         files: &Arc<RepoFiles>,
         lineage: &str,
     ) -> Arc<ToolContext> {
-        Arc::new(self.bound(mode, files, lineage))
+        Arc::new(self.bound(mode, Arc::clone(files), lineage))
     }
 
     /// [`Self::context_for`] a dialogue's round, whose journal tools read
     /// `journals`.
+    ///
+    /// **The memory's repository is an admin's to read file by file.** Below
+    /// [`ToolMode::Comprehensive`] — the mode only an admin holds — a
+    /// dialogue's stores are a view without it ([`memory_hidden`]), so a
+    /// person's conversation, and every task it starts, reads the memory
+    /// through the memory's tools and its retrieval scope alone, never
+    /// another group's journal by path or by `*`. The ingest's own contexts
+    /// ([`Self::context_for`]) read the memory whole: reading it is how it
+    /// enters the substrate.
     pub fn dialogue_context(
         &self,
         mode: ToolMode,
@@ -986,6 +1002,10 @@ impl ToolHost {
         lineage: &str,
         journals: Arc<dyn JournalShelf>,
     ) -> Arc<ToolContext> {
+        let files = match mode {
+            ToolMode::Comprehensive => Arc::clone(files),
+            _ => Arc::new(memory_hidden(files)),
+        };
         Arc::new(self.bound(mode, files, lineage).with_journals(journals))
     }
 
@@ -1009,6 +1029,8 @@ mod tests {
 
     use zend_tools::state::sessions::{CodeEntry, SessionMeta};
     use zend_vfs::RepoSpec;
+
+    use crate::journal::shelf::{Lazy, Shelf};
 
     /// A code session opened by the round `ctx` runs.
     fn open_code_session(ctx: &ToolContext, id: &str) {
@@ -1185,6 +1207,45 @@ mod tests {
                     .tavily_api_key(),
                 Some("tvly-wired-through"),
                 "{} lost the daemon's secrets",
+                mode.id()
+            );
+        }
+    }
+
+    /// **Only an admin's dialogue reads the memory's repository file by
+    /// file**: below Comprehensive a dialogue's stores have every other
+    /// repository and not the memory, while the ingest's context reads it
+    /// whole.
+    #[test]
+    fn only_a_comprehensive_dialogue_reads_the_memory_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["r", memory_paths::REPO] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
+        let workspace = Workspace::new(
+            dir.path(),
+            vec![RepoSpec::named("r"), RepoSpec::named(memory_paths::REPO)],
+        )
+        .unwrap();
+        let host = ToolHost::new(&workspace, no_secrets()).unwrap();
+        let files = host.conversation_files();
+        let shelf = || -> Arc<dyn JournalShelf> {
+            Arc::new(Lazy::new(|| -> Shelf {
+                unreachable!("no journal tool runs")
+            }))
+        };
+        for mode in ToolMode::ALL {
+            let dialogue = host.dialogue_context(mode, &files, "c1", shelf());
+            let want: Vec<&str> = match mode {
+                ToolMode::Comprehensive => vec!["r", memory_paths::REPO],
+                _ => vec!["r"],
+            };
+            assert_eq!(dialogue.files.names(), want, "{}", mode.id());
+            let ingest = host.context_for(mode, &files, "");
+            assert_eq!(
+                ingest.files.names(),
+                vec!["r", memory_paths::REPO],
+                "{}",
                 mode.id()
             );
         }

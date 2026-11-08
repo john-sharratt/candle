@@ -107,7 +107,7 @@ pub fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
     if !ctx.caller.role.at_least(Role::User) {
         return Answer::error("reading the repositories is a user's; you are a guest");
     }
-    let Some((tools, _)) = ctx.session.repository_tools() else {
+    let Some((tools, _)) = ctx.session.repository_tools(ctx.caller.role) else {
         return Answer::error(LOADING);
     };
     if let (true, Some(paths)) = (name == "file_read", args.get("paths")) {
