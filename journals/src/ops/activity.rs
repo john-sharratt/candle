@@ -87,6 +87,11 @@ mod tests {
         assert!(apply(&mut t, &server(), &op(&p("topics")), now())
             .unwrap_err()
             .to_string()
+            .contains("record a conversation's calls there"));
+        // Past the permit, the op itself holds the same line.
+        assert!(record(&mut t, &p("topics"), "log_grep", "x", now())
+            .unwrap_err()
+            .to_string()
             .contains("no conversation"));
     }
 }
