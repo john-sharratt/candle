@@ -104,6 +104,12 @@ web UI.
 | [`reflection_and_dreams.md`](reflection_and_dreams.md) | The second and third conversations a character runs: `reflect` as a one-shot transient conversation over a deep dream gather, and a private per-NPC dream corpus maintained as a quality-diversity search — anti-correlated generation, relevance selection, recency reaping. Implements the reflection half of `theory_of_the_mind.md`'s layers 14/16/17/19. |
 | [`narrative_engine.md`](narrative_engine.md) | Roleplay Engine (RPE) design: translates structured player `Input` events into narrated prose via a conversation-as-KV-cache narrator, with `parse_turn`/`text_to_inputs` as the crate's entry points. |
 
+## ZenJ: Zen as DJ
+
+| Doc | Covers |
+|---|---|
+| [`zenj.md`](zenj.md) | **Design, not built; first use New Year's Eve 2026.** Zen running the music on BlackWorld: rekordbox 7.2.19 as the engine with the DDJ-FLX4 attached, TIDAL for audio, Spotify for taste and phone requests; the `zenj` cluster member; the brain (set plan, next-track shortlist with Zen choosing, transition plans), the beat-accurate conductor over a virtual MIDI controller, human/assist/ZenJ hand-off, the four-screen visuals, failure ladder, spikes and build order. |
+
 ## Web tier & deployment
 
 | Doc | Covers |
