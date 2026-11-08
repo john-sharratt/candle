@@ -11,6 +11,7 @@ use crate::error::Problem;
 use crate::period::{Level, Period};
 use crate::scope::Channel;
 use crate::slug::Slug;
+use crate::terms::Terms;
 use crate::time::Stamp;
 use crate::yaml::{quote, scalar, text_field, Fields};
 
@@ -170,6 +171,9 @@ pub struct Line {
     pub folds: Option<Folds>,
     /// A worker's note the person has not yet accepted.
     pub proposed: bool,
+    /// What a note says about itself: concluded, its source, its expiry, the
+    /// line it replaces.
+    pub terms: Terms,
     pub text: String,
 }
 
@@ -199,6 +203,10 @@ impl Line {
         }
         if n > MAX_TEXT {
             return Err(format!("its text is {n} characters, over {MAX_TEXT}"));
+        }
+        self.terms.check()?;
+        if self.kind != Kind::Note && self.terms != Terms::default() {
+            return Err("only a note states its terms".into());
         }
         match (self.kind, &self.folds) {
             (Kind::Fold, None) => Err("a fold names its `period` or `journal`".into()),
@@ -240,6 +248,7 @@ impl Line {
         if self.proposed {
             out.push_str("proposed: true\n");
         }
+        out.push_str(&self.terms.render());
         out.push_str(&text_field("", "text", &self.text));
         out
     }
@@ -273,6 +282,7 @@ impl Line {
             (None, None) => None,
         };
         let proposed = f.opt_bool("proposed")?.unwrap_or(false);
+        let terms = Terms::read(f)?;
         let text = f.str("text")?;
         let line = Line {
             id,
@@ -284,6 +294,7 @@ impl Line {
             channel,
             folds,
             proposed,
+            terms,
             text,
         };
         line.check()
@@ -374,6 +385,16 @@ mod tests {
                 channel: Some(Channel::Grok),
                 folds,
                 proposed: kind == Kind::Note,
+                terms: if kind == Kind::Note {
+                    Terms {
+                        concluded: true,
+                        source: Some("docs/a.md §2: b".into()),
+                        expires: Some(at),
+                        replaces: Some(LineId::mint(at, Writer::Zend, "y", 0)),
+                    }
+                } else {
+                    Terms::default()
+                },
                 text: "a: b, {c} #d \"e\"\nf".into(),
             };
             assert_eq!(read_as(&line.id, &line.render()).unwrap(), line);
@@ -441,6 +462,21 @@ mod tests {
                 "only a note can be proposed",
             ),
             (
+                "kind: episode\nby: server\nsource: a.md\ntext: x\n",
+                Some(5),
+                "only a note states its terms",
+            ),
+            (
+                "kind: note\nby: grok\nexpires: soon\ntext: x\n",
+                Some(4),
+                "expires",
+            ),
+            (
+                "kind: note\nby: grok\nreplaces: 7e3a\ntext: x\n",
+                Some(4),
+                "not a line id",
+            ),
+            (
                 "kind: fold\nby: zend\nperiod: \"2026\"\njournal: a\ntext: x\n",
                 Some(5),
                 "not both",
@@ -503,6 +539,7 @@ mod tests {
             channel: None,
             folds: Some(Folds::Period(Period::parse("2026").unwrap())),
             proposed: false,
+            terms: Terms::default(),
             text: "The year.".into(),
         };
         assert!(line.render().contains("period: \"2026\""));

@@ -34,6 +34,7 @@ use crate::guides::Library;
 use crate::last_listed::LastListed;
 use crate::reading::{Read, Readings};
 use crate::routes::Routes;
+use crate::served::Served;
 
 /// What every request is served with.
 pub struct App {
@@ -48,6 +49,9 @@ pub struct App {
     /// Each backend's last listing for each caller, listed in its place while
     /// it cannot be.
     pub last_listed: LastListed,
+    /// Which listing each session was served, so a call answered on another
+    /// tells its client the list changed.
+    pub served: Served,
     /// The guides served beside the backends' tools (`docs/mcp_guides.md`).
     pub library: Library,
     /// The backend tools the last listing marked as only reading.
@@ -99,11 +103,12 @@ enum Ran {
     Left,
 }
 
-/// What listing every backend found: the tools of those that answered, and
-/// why each of the others did not.
+/// What listing every backend found: the tools of those that answered, why
+/// each of the others did not, and the listing version each answered on.
 struct Listed {
     tools: Vec<Value>,
     failed: Vec<String>,
+    versions: Vec<Option<String>>,
 }
 
 impl App {
@@ -123,10 +128,12 @@ impl App {
         let who = call.caller.key();
         let mut lists = Vec::new();
         let mut why_failed = Vec::new();
+        let mut versions = vec![None; self.backends.len()];
         for (i, (got, took)) in listed.into_iter().enumerate() {
             let backend = &self.backends[i].name;
             match got {
-                Ok(tools) => {
+                Ok((tools, version)) => {
+                    versions[i] = version;
                     tracing::info!(
                         backend,
                         tools = tools.len(),
@@ -160,12 +167,14 @@ impl App {
         Listed {
             tools,
             failed: why_failed,
+            versions,
         }
     }
 
     /// `name` called on `backend` for `caller`: a memory call at the path only
     /// the members serving the memory declare, so the gateway sends it to one
-    /// of them ([`Backend::path_for`]).
+    /// of them ([`Backend::path_for`]). The listing the backend answered on is
+    /// noted against what the session was served.
     async fn call_served(
         &self,
         backend: usize,
@@ -175,9 +184,14 @@ impl App {
         args: &Value,
         step: &(dyn Fn(String) + Sync),
     ) -> Value {
-        self.link
+        let (answer, version) = self
+            .link
             .call(&self.backends[backend], caller, on, name, args, step)
-            .await
+            .await;
+        if let Some(version) = version {
+            self.served.answered(on.id, backend, &version, now_ms());
+        }
+        answer
     }
 
     fn route(&self, name: &str) -> Option<usize> {
@@ -392,6 +406,8 @@ impl Server for App {
         this.library.decorate(&mut listed.tools);
         let mut tools = guide_tools::definitions(&this.library);
         tools.append(&mut listed.tools);
+        this.served
+            .listed(&call.session_id, listed.versions, now_ms());
         Ok(Value::Array(tools))
     }
 
@@ -474,6 +490,22 @@ impl Server for App {
             record_episode(this, call, name, args);
         }
         answer
+    }
+
+    /// The aggregator's listing is the sum of the backends'; each names its own.
+    fn tools_version(&self) -> Option<&str> {
+        None
+    }
+
+    fn list_changed(&self, call: &Call<Self>) -> bool {
+        let owed = self.served.take_owed(&call.session_id);
+        if owed {
+            tracing::info!(
+                client = call.session.client.name(),
+                "mcp: told a client its tool list changed"
+            );
+        }
+        owed
     }
 
     fn result(&self, answer: &Value) -> Value {

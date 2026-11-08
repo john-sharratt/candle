@@ -284,6 +284,13 @@ pub(crate) struct BackingInner {
     // are device arenas to create.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) deferred_arenas: Mutex<Vec<super::arena::ArenaKey>>,
+    /// Arenas `create_deferred_arenas` made ahead of a demand, with the gaps
+    /// each has waited: protected from the empty sweep until the demand fills
+    /// them or is abandoned (`BackingInner::settle_fresh`). Unprotected, the
+    /// sweep that runs in the same gap took them back before the pass they
+    /// were made for could fill them.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fresh_arenas: Mutex<Vec<(super::arena::ArenaKey, usize, u32)>>,
 }
 
 impl BackingInner {
@@ -622,17 +629,18 @@ impl ChunkedKvBacking {
         // `build_meta_records` now derives the record size from the live `n_palette()` on
         // every call and picks the arena key from that, so flipping the flag above is by
         // itself enough and there is no second copy to keep in step.
-        // The constructor's `warm_protected_arenas` ran while single_latent was
-        // still false, so it minted the writer/candidate arenas at the GQA band
-        // width (`head_dim / N_PALETTE` = 128). The single latent needs them at
-        // its own width (`head_dim / 16` = 32) — the width `resolve_arena_info`
-        // and the band writes both assume. Nothing has allocated a chunk yet
-        // (this runs immediately after construction, before any write), so drop
-        // the mis-sized warm arenas; the pool keeps their registrations and the
-        // next allocation recreates each at the single-latent width. GQA never
-        // calls this, so its warm set is untouched.
+        // The constructor's `keep_reserves` ran while single_latent was still
+        // false, so it minted the writer/candidate arenas at the GQA band width
+        // (`head_dim / N_PALETTE` = 128). The single latent needs them at its
+        // own width (`head_dim / 16` = 32) — the width `resolve_arena_info` and
+        // the band writes both assume. Nothing has allocated a chunk yet (this
+        // runs immediately after construction, before any write), so drop the
+        // mis-sized arenas and the reserves named at that width; the pool keeps
+        // their registrations and the next allocation recreates each at the
+        // single-latent width. GQA never calls this, so its reserves stand.
         if on {
             let _ = self.inner.storage.truncate_arenas(0);
+            self.inner.pool.clear_reserves();
         }
     }
 
@@ -782,6 +790,7 @@ impl ChunkedKvBacking {
             single_latent: std::sync::atomic::AtomicBool::new(false),
             mapped_sealed: std::sync::atomic::AtomicBool::new(false),
             deferred_arenas: Mutex::new(Vec::new()),
+            fresh_arenas: Mutex::new(Vec::new()),
         });
 
         // Register for cooperative compaction
@@ -800,7 +809,7 @@ impl ChunkedKvBacking {
             state,
         };
         if !device.is_cpu() {
-            backing.warm_protected_arenas(compression.as_ref())?;
+            backing.keep_reserves(compression.as_ref())?;
         }
         Ok(backing)
     }

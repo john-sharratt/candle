@@ -114,7 +114,14 @@ pub fn searched(m: &Mem, pattern: &str, under: Option<&str>, max: Option<usize>)
         },
     };
     let max = max.unwrap_or(DEFAULT_HITS).clamp(1, MAX_HITS);
-    let (hits, total) = search(&m.tree, &m.actor(), pattern, under.as_ref(), max);
+    let (hits, total) = search(
+        Stamp::now(),
+        &m.tree,
+        &m.actor(),
+        pattern,
+        under.as_ref(),
+        max,
+    );
     (StatusCode::OK, view::hits(&hits, total))
 }
 
@@ -188,6 +195,7 @@ pub async fn grep(
 mod tests {
     use journals::ops::{apply, OnTaken, Op};
     use journals::slug::Slug;
+    use journals::terms::Terms;
 
     use super::*;
     use crate::mcp::tools::mem::tests::mem;
@@ -222,6 +230,7 @@ mod tests {
                 path: master.clone(),
                 text: "Everyone drinks tea.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             at("2026-10-29T10:01:00Z"),
         )

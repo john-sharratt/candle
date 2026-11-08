@@ -146,6 +146,16 @@ mod tests {
         assert_eq!(role(&h, &roles()), Role::User);
     }
 
+    /// **Zen, as npcd's drones call zend, is a user**: it starts tasks and
+    /// grants nothing.
+    #[test]
+    fn zens_service_identity_is_a_user() {
+        let mut h = HeaderMap::new();
+        h.insert(USER, "service:zen".parse().unwrap());
+        h.insert(PROVIDER, "service-key".parse().unwrap());
+        assert_eq!(role(&h, &roles()), Role::User);
+    }
+
     /// The role comes from the gateway's headers; a request without them is
     /// anonymous.
     #[test]

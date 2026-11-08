@@ -150,15 +150,14 @@ fn check_accounts(tree: &mut Tree) {
     for (slug, person) in &tree.persons {
         let Ok(file) = &person.file else { continue };
         for a in &file.accounts {
-            if let Some(other) = emails.insert(&a.email, slug) {
-                found.push(Problem::new(
-                    format!("persons/{slug}/person.yaml"),
-                    None,
-                    format!(
-                        "{} is listed by {other} too: an account is one person's",
-                        a.email
-                    ),
-                ));
+            if let Some(e) = &a.email {
+                if let Some(other) = emails.insert(e, slug) {
+                    found.push(Problem::new(
+                        format!("persons/{slug}/person.yaml"),
+                        None,
+                        format!("{e} is listed by {other} too: an account is one person's"),
+                    ));
+                }
             }
             if let Some(k) = &a.key {
                 if let Some(other) = keys.insert(k, slug) {

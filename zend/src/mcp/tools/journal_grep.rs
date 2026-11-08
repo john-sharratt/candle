@@ -5,6 +5,7 @@
 //! line, archive and summary the user reads, or one subtree of them
 //! (`docs/memory_backbone.md` §6.5).
 
+use journals::time::Stamp;
 use journals::view::grep::{grep, render};
 use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
@@ -219,7 +220,14 @@ fn grep_memory(ctx: &Ctx, journal: &str, pattern: &str, max: usize) -> Answer {
             Err(e) => return Answer::error(e),
         },
     };
-    let (hits, total) = grep(&m.tree, &m.actor(), pattern, under.as_ref(), max);
+    let (hits, total) = grep(
+        Stamp::now(),
+        &m.tree,
+        &m.actor(),
+        pattern,
+        under.as_ref(),
+        max,
+    );
     if hits.is_empty() {
         return Answer::ok(render(&hits, total));
     }

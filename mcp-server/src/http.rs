@@ -9,8 +9,10 @@
 //! A `tools/call` from a client that accepts an event stream is answered on
 //! one: a progress notification for each step the tool says of the work it
 //! waits on, and at least every [`PROGRESS_EVERY`], which keeps Claude Code's
-//! idle timer from firing; then the result. Notifications are shown, not read
-//! into Claude's context.
+//! idle timer from firing; then, when the server says the client's tool list
+//! changed, `notifications/tools/list_changed`; then the result. Notifications
+//! are shown, not read into Claude's context. A call answered in its response
+//! carries no notification, and is told on its next streamed call.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -29,6 +31,7 @@ use web::auth::mcp::metadata::RESOURCE_DOC_PATH;
 
 use crate::client::Client;
 use crate::jsonrpc::{self, Message};
+use crate::listing::{self, TOOLS_VERSION_HEADER};
 use crate::origin;
 use crate::protocol::{self, MODERN, UNSUPPORTED_VERSION};
 use crate::server::{Call, NoCaller, Server};
@@ -118,9 +121,27 @@ fn wants_stream(headers: &HeaderMap) -> bool {
     read_header(headers, header::ACCEPT.as_str()).is_some_and(|a| a.contains("text/event-stream"))
 }
 
-/// `POST`: one JSON-RPC message.
+/// `POST`: one JSON-RPC message. Every answer names the server's current
+/// listing ([`TOOLS_VERSION_HEADER`]), so a server in front learns that it
+/// changed from any answer, not only from listing again.
 pub async fn post<S: Server>(
     State(server): State<Arc<S>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let mut res = answer_post(Arc::clone(&server), peer, headers, body).await;
+    if let Some(v) = server
+        .tools_version()
+        .and_then(|v| HeaderValue::from_str(v).ok())
+    {
+        res.headers_mut().insert(TOOLS_VERSION_HEADER, v);
+    }
+    res
+}
+
+async fn answer_post<S: Server>(
+    server: Arc<S>,
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
@@ -410,6 +431,12 @@ fn stream_call<S: Server>(
         while let Ok(step) = steps.try_recv() {
             sent += 1;
             let _ = tx.send(Ok(event(sent, &step))).await;
+        }
+        // A changed list is told before the answer, so the client lists again
+        // before its next call.
+        if server.list_changed(&call) {
+            let notice = Event::default().data(listing::list_changed().to_string());
+            let _ = tx.send(Ok(notice)).await;
         }
         let done = jsonrpc::result(id, protocol::call_result(server.result(&answer), modern));
         if tx

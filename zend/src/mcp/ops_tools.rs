@@ -421,7 +421,7 @@ async fn memory(name: &str, call: &OpsCall, args: &Value) -> Answer {
                     args.get("journal").and_then(Value::as_str).unwrap_or(""),
                     args.get("text").and_then(Value::as_str).unwrap_or(""),
                 );
-                journal_note::note_in(&m, journal, text)
+                journal_note::note_in(&m, journal, text, &args)
             }
             journal_create::NAME => journal_create::create_in(&m, &args),
             _ => journal_link::link_in(&m, &args),

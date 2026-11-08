@@ -69,8 +69,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use journals::tree::load::load;
+    use web::cluster::service_key::{subject, SERVICE_PROVIDER};
 
     use super::*;
+    use crate::mcp::caller::Person;
 
     fn tree() -> Tree {
         let files: BTreeMap<String, Vec<u8>> = BTreeMap::from([(
@@ -95,5 +97,29 @@ mod tests {
             (Who::Guest, None)
         );
         assert!(known(&t, "not-a-key", "").is_err());
+    }
+
+    /// **Zen's service identity is the person `zen`** (D8): `service:zen`,
+    /// stated by npcd on its member's socket with no email, is the account
+    /// `zen`'s person file lists by key alone, and nothing is bound.
+    #[test]
+    fn zens_service_identity_is_the_person_zen() {
+        let caller = Person {
+            provider: SERVICE_PROVIDER.into(),
+            sub: subject("zen"),
+            email: String::new(),
+            name: String::new(),
+        };
+        // sha256("service-key\0service:zen"), its first eight bytes.
+        assert_eq!(caller.key(), "cbee5f243460cbae");
+        let files: BTreeMap<String, Vec<u8>> = BTreeMap::from([(
+            "persons/zen/person.yaml".to_string(),
+            b"person: zen\nname: Zen\naccounts:\n  - key: cbee5f243460cbae\ngroups: []\n".to_vec(),
+        )]);
+        let t = load(&files);
+        assert_eq!(
+            known(&t, &caller.key(), &caller.email).unwrap(),
+            (Who::Person(Slug::parse("zen").unwrap()), None)
+        );
     }
 }

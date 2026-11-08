@@ -35,6 +35,7 @@ use crate::line::{LineId, Writer};
 use crate::path::{Address, Below, JournalPath};
 use crate::period::Period;
 use crate::slug::Slug;
+use crate::terms::Terms;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 
@@ -57,11 +58,13 @@ pub enum OnTaken {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    /// `speaker` is who the conversation's focus says is talking (§2.4).
+    /// `speaker` is who the conversation's focus says is talking (§2.4);
+    /// `terms` what the note says about itself ([`Terms`]).
     Note {
         path: JournalPath,
         text: String,
         speaker: Option<Slug>,
+        terms: Terms,
     },
     Episode {
         path: JournalPath,
@@ -246,7 +249,8 @@ fn run(
             path,
             text,
             speaker,
-        } => append::note(tree, actor, path, speaker.as_ref(), text, now, keep),
+            terms,
+        } => append::note(tree, actor, path, speaker.as_ref(), terms, text, now, keep),
         Op::Episode {
             path,
             text,

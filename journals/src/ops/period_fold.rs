@@ -12,6 +12,7 @@ use crate::ops::append::clean;
 use crate::ops::{mint_keeping, Applied};
 use crate::path::JournalPath;
 use crate::period::Period;
+use crate::terms::Terms;
 use crate::time::Stamp;
 use crate::tree::window::inside;
 use crate::tree::{Journal, Tree};
@@ -102,6 +103,7 @@ pub fn fold_period(
         channel: None,
         folds: Some(Folds::Period(period)),
         proposed: false,
+        terms: Terms::default(),
         text,
     };
     let id = fold.id.clone();
@@ -136,6 +138,7 @@ mod tests {
                     path: path.clone(),
                     text: format!("n{i}"),
                     speaker: None,
+                    terms: Terms::default(),
                 },
                 t0.plus(3600 * i as i64),
             )

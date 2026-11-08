@@ -511,6 +511,10 @@ default_group: zen
   lists that email with no key, and reads the account as that person. At its
   first call that writes, it writes the key in (a commit), and from then on
   knows the account by its key alone. An unverified email binds nothing.
+- **A service's account is its key alone**, `- {key: <hex>}`: a service
+  identity (`service:<name>`, provider `service-key`) has no email and never
+  signs in, so it is listed with its key from the start and nothing binds it.
+  An account with neither email nor key is refused.
 - **An account no person lists is a guest.** It reads `@guest`, and nothing
   else, until an admin lists it (§3.6).
 - **An account says which group, not who is speaking.** A conversation opens
@@ -522,8 +526,11 @@ A member's journal about themselves lives in their group, at
 group's own.
 
 **Zen is a member too**, an identity like the people in the group (the
-user's decision, 2026-10-31). `persons/zen/person.yaml` names it and lists
-no accounts, since nobody signs in as Zen. `@zen` lists it as a member, and
+user's decision, 2026-10-31). `persons/zen/person.yaml` names it, and lists
+one account: its service identity, `service:zen`, by key alone
+(`- {key: cbee5f243460cbae}`), which is what npcd's drones call zend as when a
+mission drives a task (`docs/zen_memory_and_guides.md` D8). Nobody signs in
+as Zen. `@zen` lists it as a member, and
 its `people/zen` journal holds what Zen is and what it keeps about itself:
 - its models and the machines it runs on;
 - what it does well and what it has learned about how this group wants

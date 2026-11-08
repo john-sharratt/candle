@@ -247,6 +247,7 @@ mod tests {
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, OnTaken, Op, Which};
     use crate::scope::Channel;
+    use crate::terms::Terms;
     use crate::testing::slug;
     use crate::tree::fingerprint::is_dirty;
 
@@ -266,6 +267,7 @@ mod tests {
                 path: path.clone(),
                 text: text.into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )
@@ -583,6 +585,7 @@ mod tests {
                 path: path.clone(),
                 text: "Flights to Da Nang.".into(),
                 speaker: None,
+                terms: Terms::default(),
             },
             now(),
         )

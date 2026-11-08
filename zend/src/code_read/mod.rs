@@ -33,7 +33,6 @@ pub(crate) use link::ingest_link;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use candle_conversation::chain_health::{chain_break, ChainBreak};
 use candle_conversation::projection::{
@@ -1127,44 +1126,9 @@ fn process_one_file(
         "flagged completed file conversation for full KV eviction to cold",
     );
 
-    // FreeSequence releases the GPU slot; the sealed turns and metadata remain
-    // in the substrate.
-    let timeline = conv.timeline_id();
-    drop(conv);
-    wait_evicted(ctx.engine, timeline, &file.path);
+    // `conv` drops here → FreeSequence releases the GPU slot; the sealed
+    // turns and metadata remain in the substrate.
     Ok(())
-}
-
-/// How long a worker waits for its file's reading to leave the device before
-/// it takes the next file regardless.
-const EVICT_WAIT: Duration = Duration::from_secs(120);
-
-/// Wait until `timeline`'s turns hold no device copy, up to [`EVICT_WAIT`].
-///
-/// **The pool reads no faster than the readings leave the card.** Eviction is
-/// the persistence thread's, on its own schedule; a pool reading each file
-/// straight after the last outran it and filled every KV region until no wave
-/// could be placed ("wave too wide for the partition", the pass stopped at its
-/// failure cap). Calibrating inline had paced the pool; reading first, this
-/// does.
-fn wait_evicted(engine: &ConversationEngine, timeline: TimelineId, path: &str) {
-    let conversation = engine.conversation();
-    let deadline = Instant::now() + EVICT_WAIT;
-    while conversation.timeline_hot_residences(timeline) > 0 {
-        if crate::ingest_cancel::cancelled() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            tracing::warn!(
-                target: "zend::code_read::ingest",
-                file = %path,
-                "the reading is still on the device {EVICT_WAIT:?} after its eviction; \
-                 taking the next file",
-            );
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 /// The projection selection every turn of a file's conversation runs under:

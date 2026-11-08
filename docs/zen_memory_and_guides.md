@@ -40,9 +40,12 @@ gates, the ownership and the decisions in §2.
   drifted. `journal` and `knowledge` cover the same ground as `memory`.
 - **`docs-write` covers documents from code only**; no guide lands a design
   proposal, the document the DJ task wrote.
-- **The live connector serves none of `file_*`, `log_*` or `cluster_logs`**
-  although zend defines them (`zend/src/mcp/tools/mod.rs`): something between
-  zend and claude.ai drops them (`yenbot_preview.md` §8.3).
+- **A client never learns that the tools changed.** Two days after a release
+  replaced `cluster_logs` with the `file_*` and `log_*` tools, claude.ai
+  sessions still held `cluster_logs` and none of the new ones. Nothing
+  between zend and claude.ai dropped them: every server declared
+  `listChanged: false` (`mcp-server/src/protocol.rs`), and claude.ai keeps a
+  list across chats. A reconnect of the connector brought them in at once.
 
 ### 1.2 Journals
 
@@ -132,7 +135,7 @@ Settled; a phase that meets one does not reopen it.
 | D5 | **A task is driven `attended` or `alone`**, defaulting from the client: `alone` for Grok, `attended` otherwise. A drone driving a task is an attended coordinator. |
 | D6 | **No backward compatibility.** Existing episode entry files, stale lines and old guide text are replaced, not kept beside the new. |
 | D7 | **Simplicity cuts:** no verify task chained by zend after an alone task (the templates carry one); no automatic restart of a lost alone task (it is reported); no resolver over `T:`/`P:` (D9); the live path reuses lineage sections; maintenance checks live in `journals check`; outcomes extend the settle notes zend already writes. |
-| D8 | **A drone's zend task runs as Zen's own person** (`people/zen`), authenticated as `service:zen` on the service-key path (`mcp_file_tools.md` §4, `web/src/cluster/service_key.rs`): its tasks, threads and outcomes are its own, it grants nothing, and its held calls go to the authorizers (the Creator, Yen). |
+| D8 | **A drone's zend task runs as Zen's own person** (`people/zen`), calling as a service-key identity, subject `service:zen` (`mcp_file_tools.md` §4, `web/src/cluster/service_key.rs`), from its own member over the cluster socket: its tasks, threads and outcomes are its own, it grants nothing, and its held calls go to the authorizers (the Creator, Yen). |
 | D9 | **Thread results are exported into the memory tree** (`memory_backbone.md` §7.3): a thread's notes and its tasks' outcomes are written to `threads/<thread>` in its owner's group and referenced from the topics it is about. `T:`/`P:` stay the work records. |
 | D10 | **The memory guide splits in two.** A short client guide rides the first call of every Claude conversation (`mcp_user_context.md` §2.4–2.5's budget): the frame, the write rules in brief, pointers, the `yen-apps` line. A full `memory` guide, absorbing `journal` and `knowledge`, is read on demand. `grok.md` stays the Grok client guide. |
 | D11 | **BlackWorld's overlapping pieces join this build**: dropping `conversations/` from provenance (Phase 2), the transfer and preview sections of the `files` guide and the `yen-apps` text (Phase 5). |
@@ -146,7 +149,7 @@ Settled; a phase that meets one does not reopen it.
 | Owner | Phases |
 |---|---|
 | **AlienWorld** (coordinator) | 0, 1, 2, 3, 4, the npcd half of 6, 7, 8's review and merge request |
-| **BlackWorld** | 5 (the guides, D10, D11's files and yen-apps text, and first finding where the connector drops `file_*`/`log_*`); the `service:zen` identity and the npcd → zend route of 6; 8's trial and joint release |
+| **BlackWorld** | 5 (the guides, D10, D11's files and yen-apps text, and first the changed-list notice); the `service:zen` identity and the npcd → zend route of 6; 8's trial and joint release |
 
 Each session writes its own phases' specs, delegates the implementation to Zen
 workers (`repo_task_start`, `role: coder`, `effort: deep`; reviews
@@ -328,9 +331,15 @@ quoted in Phase 8's report.
 
 ### Phase 5 — Guides and the served list (BlackWorld)
 
-1. **Find and fix where the connector drops `file_*`, `log_*` and
-   `cluster_logs`** (the aggregator, `mcp/served.yaml` or the connector's cached
-   listing), so the served list is the one the guides are tested against.
+1. **A changed list is told** (`mcp_app.md` §3.1). The aggregator declares
+   `listChanged: true`; every backend names its listing's version on every
+   answer (`x-mcp-tools-version`); the aggregator remembers the versions it
+   served each session and, when a call is answered on another, sends
+   `notifications/tools/list_changed` on that call's stream before its result.
+   Tests: the notice's place on the stream, once; the header on every answer;
+   the per-session record (owed, paid, a session never served here, a backend
+   not listed, the bound). Phase 8's trial checks that claude.ai and Claude
+   Code list again on it.
 2. **Tool descriptions**, each changed in both places it lives — the `/mcp`
    definition and its calibrated YAML in `zend/src/prompts/tools/`
    (`repo_task_start`, `journal_note`, `journal_read`, `journal_grep`,
@@ -364,12 +373,16 @@ quoted in Phase 8's report.
 Templates, parameters, `work.checks` and the `critical` gate are built
 (`npcd/src/engine/mission_gen/world.rs`, `authorize.rs`); the bridge is not.
 
-- **Identity and route (BlackWorld).** `service:zen` is issued on the
-  service-key path with Zen's person, `zen`, as its subject's person, and zend's
-  `/mcp` accepts it as that person (`zen_tasks.rs:114-118` then has a person).
-  npcd reaches its own member's zend over the member's cluster socket, as zend
-  reaches npcd (`npcd_tools.rs:8`), with the service key as its bearer.
-  `high_risk` holds apply to Zen's tasks as to anyone's, and Zen grants nothing.
+- **Identity and route (BlackWorld).** npcd reaches its own member's zend over
+  the member's cluster socket, as zend reaches npcd (`npcd_tools.rs:8`): the
+  member states the caller in identity headers, and no key is presented, since
+  a service key's bearer is checked only on gateway HTTP from a trusted backend.
+  The caller is a service-key identity — provider `service-key`, subject
+  `service:zen`, which no sign-in produces — given a role by `sub` in
+  `host/roles.yaml` and bound by the memory's accounts to the person `zen`
+  (`people/zen`). zend's `/mcp` accepts it as that person (`zen_tasks.rs:114-118`
+  then has a person). `high_risk` holds apply to Zen's tasks as to anyone's, and
+  Zen grants nothing.
 - **Acts (AlienWorld).** A routine's `grants` lend `task_start {name, prompt,
   role}`, `task_reply {answer}` and `task_nudge {message}` while its mission is
   carried; npcd maps them onto `repo_task_start`, `repo_task_reply` and
@@ -475,6 +488,8 @@ Templates, parameters, `work.checks` and the `critical` gate are built
   D8, D9 settled its design questions; §4 was rewritten against `origin/main`
   with every finding applied.
 - **2026-11-08, BlackWorld's overlap review.** Ownership settled (§3.1, D11);
-  the memory guide split (D10); `service:zen` on the service-key path; suspended
-  carriers hold the bridge; exemplars named; the served-list drop found first;
-  the guidance tally in Phase 8.
+  the memory guide split (D10); `service:zen` as a service-key identity;
+  suspended carriers hold the bridge; exemplars named; the guidance tally in
+  Phase 8. Its claim that the connector dropped the `file_*` and `log_*` tools
+  was wrong: the client was never told the list changed, which Phase 5 step 1
+  now fixes.

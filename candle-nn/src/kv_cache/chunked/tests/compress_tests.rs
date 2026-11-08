@@ -71,8 +71,8 @@ fn cuda_backing_with_policy(device: &Device, policy: &CompressionPolicy) -> Chun
     )
     .expect("create chunked backing");
     backing
-        .warm_protected_arenas(Some(policy))
-        .expect("pre-allocate compression candidate arenas");
+        .keep_reserves(Some(policy))
+        .expect("keep a reserve for each compression candidate class");
     backing
 }
 

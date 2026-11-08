@@ -215,6 +215,7 @@ mod tests {
     use journals::ops::{apply, OnTaken, Op};
     use journals::period::Period;
     use journals::slug::Slug;
+    use journals::terms::Terms;
 
     use super::*;
     use crate::mcp::tools::mem::tests::mem;
@@ -266,6 +267,7 @@ mod tests {
                     path: trip.clone(),
                     text: text.into(),
                     speaker: Some(Slug::parse("yen").unwrap()),
+                    terms: Terms::default(),
                 },
                 at(t),
             )

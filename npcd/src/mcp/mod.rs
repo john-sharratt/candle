@@ -49,7 +49,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 
 use axum::http::HeaderMap;
-use mcp_server::{protocol, Call, Identity, NoCaller, Server, Store};
+use mcp_server::{listing, protocol, Call, Identity, NoCaller, Server, Store};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use web::auth::session::Identity as Person;
@@ -107,7 +107,12 @@ static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     instructions: INSTRUCTIONS.into(),
     icon: None,
     version: env!("CARGO_PKG_VERSION").into(),
+    list_changed: false,
 });
+
+/// The version of what `tools/list` answers: every caller is listed the same
+/// tools, so one version, once.
+static TOOLS_VERSION: LazyLock<String> = LazyLock::new(|| listing::version(&definitions()));
 
 /// A tool's answer: its text, whether it is an error the model reads as one,
 /// and a picture when the tool drew one.
@@ -269,6 +274,15 @@ impl Server for Authored {
 
     async fn call(this: &Arc<Self>, call: &Call<Self>, name: &str, args: &Value) -> Answer {
         self::call(this, &call.headers, name, args).await
+    }
+
+    fn tools_version(&self) -> Option<&str> {
+        Some(&TOOLS_VERSION)
+    }
+
+    /// npcd's client is the aggregator, which tells its own clients.
+    fn list_changed(&self, _call: &Call<Self>) -> bool {
+        false
     }
 
     fn result(&self, answer: &Answer) -> Value {

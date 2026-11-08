@@ -15,6 +15,7 @@ use std::time::Duration;
 use axum::http::header;
 use futures::StreamExt;
 use mcp_server::http::{PROGRESS_EVERY, VERSION_HEADER};
+use mcp_server::listing::TOOLS_VERSION_HEADER;
 use mcp_server::protocol::{text_result, CLIENT_META, MODERN, SESSION_META};
 use mcp_server::Session;
 use reqwest::StatusCode;
@@ -165,13 +166,14 @@ impl Link {
         }
     }
 
-    /// `backend`'s tools, as `caller` may call them.
+    /// `backend`'s tools, as `caller` may call them, and the version of the
+    /// listing they are.
     pub async fn tools(
         &self,
         backend: &Backend,
         caller: &Caller,
         on: &OnBehalf<'_>,
-    ) -> Result<Vec<Value>, String> {
+    ) -> Result<(Vec<Value>, Option<String>), String> {
         let req = self
             .request(
                 backend,
@@ -183,16 +185,19 @@ impl Link {
                 false,
             )
             .timeout(LIST_TIMEOUT);
-        let result = answer(backend, req, &|_| {}).await?;
-        result
+        let answered = answer(backend, req, &|_| {}).await?;
+        let tools = answered
+            .result
             .get("tools")
             .and_then(Value::as_array)
             .cloned()
-            .ok_or_else(|| format!("{} listed no tools", backend.name))
+            .ok_or_else(|| format!("{} listed no tools", backend.name))?;
+        Ok((tools, answered.tools_version))
     }
 
     /// Run tool `name` on `backend` as `caller`, telling each step of its work
-    /// to `step`; its `tools/call` result. A failure is an error result.
+    /// to `step`; its `tools/call` result, and the version of the listing the
+    /// backend answered on. A failure is an error result.
     pub async fn call(
         &self,
         backend: &Backend,
@@ -201,15 +206,21 @@ impl Link {
         name: &str,
         args: &Value,
         step: &(dyn Fn(String) + Sync),
-    ) -> Value {
+    ) -> (Value, Option<String>) {
         let params = json!({"name": name, "arguments": args});
         let path = backend.path_for(name, args);
         let req = self.request(backend, path, caller, on, "tools/call", params, true);
         match answer(backend, req, step).await {
-            Ok(result) => result,
-            Err(why) => text_result(&why, true),
+            Ok(answered) => (answered.result, answered.tools_version),
+            Err(why) => (text_result(&why, true), None),
         }
     }
+}
+
+/// A backend's answer: its result, and the listing it named.
+struct Answered {
+    result: Value,
+    tools_version: Option<String>,
 }
 
 /// What a backend answering a server error says: it is down or restarting —
@@ -263,7 +274,7 @@ async fn answer(
     backend: &Backend,
     req: reqwest::RequestBuilder,
     step: &(dyn Fn(String) + Sync),
-) -> Result<Value, String> {
+) -> Result<Answered, String> {
     let name = &backend.name;
     let silent = || format!("{name} went silent for {}s", IDLE.as_secs());
     let res = timeout(IDLE, req.send())
@@ -271,6 +282,15 @@ async fn answer(
         .map_err(|_| silent())?
         .map_err(|e| format!("{name} could not be reached: {e}"))?;
     let status = res.status();
+    let tools_version = res
+        .headers()
+        .get(TOOLS_VERSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let answered = |result: Value| Answered {
+        result,
+        tools_version: tools_version.clone(),
+    };
     let streamed = res
         .headers()
         .get(header::CONTENT_TYPE)
@@ -282,7 +302,7 @@ async fn answer(
             .map_err(|_| silent())?
             .map_err(|e| format!("{name}'s answer was cut off: {e}"))?;
         return match serde_json::from_slice::<Value>(&bytes).map(|m| read(&m)) {
-            Ok(Read::Result(r)) => Ok(r),
+            Ok(Read::Result(r)) => Ok(answered(r)),
             Ok(Read::Error(e)) if status.is_success() => Err(format!("{name}: {e}")),
             Ok(Read::Error(e)) => Err(refusal(name, status, &e)),
             _ => {
@@ -305,7 +325,7 @@ async fn answer(
             };
             match read(&message) {
                 Read::Progress(line) => step(line),
-                Read::Result(r) => return Ok(r),
+                Read::Result(r) => return Ok(answered(r)),
                 Read::Error(e) => return Err(format!("{name}: {e}")),
                 Read::Other => {}
             }

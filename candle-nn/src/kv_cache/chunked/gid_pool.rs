@@ -967,7 +967,16 @@ impl ArenaPool {
     /// neither touching the driver. So an empty arena is always released, and
     /// its region is immediately available to *any* class — §3.8's first
     /// pressure response, with nothing to decide.
-    fn try_tombstone(&self, protected_arenas: &AHashSet<usize>) -> Option<usize> {
+    ///
+    /// **A reserve class keeps one arena's worth free** (`keep_reserve`): an
+    /// empty arena is released only while the slots free across the class
+    /// would still fill a whole arena without it, and the highest-index empty
+    /// goes first, so the reserve that stays is the lowest — left in the span.
+    fn try_tombstone(
+        &self,
+        protected_arenas: &AHashSet<usize>,
+        keep_reserve: bool,
+    ) -> Option<usize> {
         // Held across BOTH the emptiness test and the removal. Claims are gated
         // (`allocate_any` and friends take this before `tables.read()`), so with
         // it held no slot in the candidate can be occupied between observing
@@ -991,13 +1000,21 @@ impl ArenaPool {
         // whose creator hasn't allocated yet can never be tombstoned (freeing
         // it would unmap memory an in-flight kernel writes, and recycle its
         // index to a second owner: cross-context KV contamination).
-        let candidate = tables
-            .iter()
-            .filter(|(idx, t)| {
-                !t.creation_pending() && t.live_count() == 0 && !protected_arenas.contains(idx)
-            })
-            .map(|(&idx, _)| idx)
-            .min()?;
+        let empties = tables.iter().filter(|(idx, t)| {
+            !t.creation_pending() && t.live_count() == 0 && !protected_arenas.contains(idx)
+        });
+        let candidate = if keep_reserve {
+            let free: usize = tables
+                .values()
+                .map(|t| self.arena_chunks.saturating_sub(t.live_count()))
+                .sum();
+            if free.saturating_sub(self.arena_chunks) < self.arena_chunks {
+                return None;
+            }
+            empties.map(|(&idx, _)| idx).max()?
+        } else {
+            empties.map(|(&idx, _)| idx).min()?
+        };
         drop(tables);
 
         let mut tables = self.tables.write().unwrap();
@@ -1154,9 +1171,15 @@ struct GidPoolState {
     next_arena_idx: usize,
     /// FIFO queue of recycled arena indices from tombstoned arenas.
     free_arenas: VecDeque<usize>,
-    /// Arena indices pinned for the lifetime of this backing.
-    /// Protected arenas are never tombstoned by compaction.
+    /// Arena indices protected from the empty sweep: arenas created ahead of
+    /// a demand that has not filled them yet (`docs/kv_drain_under_pressure.md`
+    /// §2). Lifted once the demand arrives or is abandoned.
     protected_arenas: AHashSet<usize>,
+    /// The classes that keep a **reserve**: at least one arena's worth of
+    /// free slots, which the empty sweep never releases. A hot→warm migrate
+    /// into one of them always finds a destination without creating an arena,
+    /// which it cannot do while a wave is open.
+    reserve_keys: AHashSet<ArenaKey>,
 }
 
 /// Inner pool state.
@@ -1266,6 +1289,7 @@ impl ChunkGidPool {
                     next_arena_idx: 0,
                     free_arenas: VecDeque::with_capacity(16),
                     protected_arenas: AHashSet::with_capacity(32),
+                    reserve_keys: AHashSet::with_capacity(16),
                 }),
                 may_have_reclaimable: AtomicBool::new(false),
             }),
@@ -1276,6 +1300,34 @@ impl ChunkGidPool {
     pub fn protect_arena(&self, arena_idx: usize) {
         let mut state = self.inner.metadata.lock().unwrap();
         state.protected_arenas.insert(arena_idx);
+    }
+
+    /// Keep a reserve for `key`: one arena's worth of free slots the empty
+    /// sweep never releases ([`ArenaPool::try_tombstone`]).
+    pub fn keep_reserve(&self, key: ArenaKey) {
+        let mut state = self.inner.metadata.lock().unwrap();
+        state.reserve_keys.insert(key);
+    }
+
+    /// Keep no reserve for any class — for a backing whose classes were named
+    /// at a width it no longer writes.
+    pub fn clear_reserves(&self) {
+        let mut state = self.inner.metadata.lock().unwrap();
+        state.reserve_keys.clear();
+    }
+
+    /// The classes that keep a reserve.
+    pub fn reserve_keys(&self) -> Vec<ArenaKey> {
+        let state = self.inner.metadata.lock().unwrap();
+        state.reserve_keys.iter().copied().collect()
+    }
+
+    /// Slots free across `key`'s arenas.
+    pub fn free_slots(&self, key: ArenaKey) -> usize {
+        self.pool_arena_load(key)
+            .iter()
+            .map(|&(_, capacity, live)| capacity.saturating_sub(live))
+            .sum()
     }
 
     /// Lift [`Self::protect_arena`], so the empty sweep may reclaim the arena again.
@@ -1542,7 +1594,8 @@ impl ChunkGidPool {
     pub fn next_tombstone(&self, key: ArenaKey) -> Option<usize> {
         let mut state = self.inner.metadata.lock().unwrap();
         let pool = self.inner.pools.get(&key)?;
-        let arena_idx = pool.try_tombstone(&state.protected_arenas)?;
+        let keep_reserve = state.reserve_keys.contains(&key);
+        let arena_idx = pool.try_tombstone(&state.protected_arenas, keep_reserve)?;
         state.arena_registry[arena_idx] = None;
         Some(arena_idx)
     }
@@ -1822,6 +1875,81 @@ mod tests {
 
     fn test_arena_chunks() -> usize {
         TEST_CLASS.chunks_per_region()
+    }
+
+    /// An arena of `key` registered and past its creation window, empty.
+    fn standing_arena(pool: &ChunkGidPool, key: ArenaKey) -> usize {
+        let idx = pool.register_arena(key);
+        pool.finish_creation(key, idx);
+        idx
+    }
+
+    /// **A reserve class keeps one arena's worth free, the lowest standing**
+    /// (`docs/kv_drain_under_pressure.md` §2): of two empty arenas the sweep
+    /// takes the higher and keeps the lower, then takes nothing more; a class
+    /// with no reserve is swept bare.
+    #[test]
+    fn a_reserve_class_keeps_one_arenas_worth_free_at_its_lowest() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let other = ArenaKey::new(SizeClass::at(1), ArenaLocation::Gpu);
+        pool.keep_reserve(key);
+        let low = standing_arena(&pool, key);
+        let high = standing_arena(&pool, key);
+        assert!(low < high);
+        assert_eq!(
+            pool.next_tombstone(key),
+            Some(high),
+            "the higher goes first"
+        );
+        pool.recycle_arena_index(high);
+        assert_eq!(pool.next_tombstone(key), None, "the reserve stays");
+        assert_eq!(pool.free_slots(key), test_arena_chunks());
+
+        let a = standing_arena(&pool, other);
+        let b = standing_arena(&pool, other);
+        assert_eq!(pool.next_tombstone(other), Some(a.min(b)));
+        assert_eq!(
+            pool.next_tombstone(other),
+            Some(a.max(b)),
+            "no reserve, swept bare"
+        );
+    }
+
+    /// **An empty arena of a reserve class goes only while the class keeps a
+    /// whole arena free without it**: one slot live in the other arena leaves
+    /// one slot short, so the empty arena is the reserve and stays.
+    #[test]
+    fn an_empty_arena_stays_while_the_class_would_fall_short_without_it() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        pool.keep_reserve(key);
+        let _first = standing_arena(&pool, key);
+        let held = pool.allocate_for(key).expect("a slot in the first arena");
+        let _second = standing_arena(&pool, key);
+        assert_eq!(pool.free_slots(key), 2 * test_arena_chunks() - 1);
+        assert_eq!(
+            pool.next_tombstone(key),
+            None,
+            "one slot short of a reserve without it"
+        );
+        drop(held);
+        assert!(pool.next_tombstone(key).is_some(), "both empty: one may go");
+        assert_eq!(pool.next_tombstone(key), None, "and one stays");
+    }
+
+    /// **No reserve is kept once cleared**, for a backing that no longer
+    /// writes the classes its reserves were named at.
+    #[test]
+    fn a_cleared_reserve_is_swept_like_any_class() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        pool.keep_reserve(key);
+        let only = standing_arena(&pool, key);
+        assert_eq!(pool.next_tombstone(key), None);
+        pool.clear_reserves();
+        assert!(pool.reserve_keys().is_empty());
+        assert_eq!(pool.next_tombstone(key), Some(only));
     }
 
     /// **An arena created ahead of demand is reclaimable once its creator is
