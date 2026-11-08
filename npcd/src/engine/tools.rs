@@ -52,10 +52,10 @@ use serde::Serialize;
 
 use crate::bridge::BRIDGE_ACTS;
 use crate::engine::agenda::AGENDA_ACTS;
-use crate::house::HOUSE_ACTS;
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::invoke_body::{self, Invokable};
 use crate::engine::{acts, bench, mission, mission_acts, station};
+use crate::house::HOUSE_ACTS;
 use crate::sim::agenda::Priority;
 use crate::sim::phone::Kind as ThreadKind;
 

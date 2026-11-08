@@ -213,11 +213,16 @@ mod tests {
         BearerKey::create(&dir.path().join("here.key")).unwrap();
         let keys = load_present(&[cfg("here"), cfg("elsewhere")]).unwrap();
         assert_eq!(
-            keys.iter().map(|k| k.identity().sub.as_str()).collect::<Vec<_>>(),
+            keys.iter()
+                .map(|k| k.identity().sub.as_str())
+                .collect::<Vec<_>>(),
             ["service:here"]
         );
         std::fs::write(dir.path().join("bad.key"), "not a key\n").unwrap();
         let bad = load_present(&[cfg("here"), cfg("bad")]).err().unwrap();
-        assert!(format!("{bad:#}").contains("the service key of `bad`"), "{bad:#}");
+        assert!(
+            format!("{bad:#}").contains("the service key of `bad`"),
+            "{bad:#}"
+        );
     }
 }

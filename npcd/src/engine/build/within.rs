@@ -42,11 +42,9 @@ impl Within {
             (unlinked, doors)
         });
         // The house's mode is Zen's to set, from the room its devices are in.
-        let house_modes = hosted.sim(|s| {
-            match s.missions.is_unordered(body) {
-                true => s.house.modes_at(&place),
-                false => Vec::new(),
-            }
+        let house_modes = hosted.sim(|s| match s.missions.is_unordered(body) {
+            true => s.house.modes_at(&place),
+            false => Vec::new(),
         });
         Within {
             links: bridge::links_of(&parts),

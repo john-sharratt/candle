@@ -20,7 +20,9 @@ use crate::live::Live;
 pub enum Act {
     Open,
     /// Close it; `force` closes it with a deck playing.
-    Close { force: bool },
+    Close {
+        force: bool,
+    },
 }
 
 impl Act {

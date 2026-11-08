@@ -40,11 +40,11 @@ use npc_map::world::{Refused, Voice, Where};
 use npc_map::NodeKind;
 
 use crate::bridge;
-use crate::house;
 use crate::engine::act::Act;
 use crate::engine::agenda;
 use crate::engine::build;
 use crate::engine::tools::CATALOG;
+use crate::house;
 use crate::world::Hosted;
 
 /// What came of an act.

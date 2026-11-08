@@ -148,7 +148,12 @@ pub async fn switch(
         lines.push(work(hosted, body, step, agents.clone()).await);
     }
     hosted.with_sim(|s| s.house.set(mode, body, now_ms()));
-    tracing::info!(world = hosted.id(), mode = mode.name(), by = body, "house: mode set");
+    tracing::info!(
+        world = hosted.id(),
+        mode = mode.name(),
+        by = body,
+        "house: mode set"
+    );
     let mut answer = format!("The house is in {}: {}.", mode.name(), mode.what());
     for l in lines {
         answer.push_str("\n- ");
@@ -184,7 +189,9 @@ mod tests {
         );
         assert_eq!(
             decks_heard(Err(Unasked::NoSubscriber)),
-            Decks::Unreached("zenj is not running on BlackWorld, so rekordbox was not asked".into())
+            Decks::Unreached(
+                "zenj is not running on BlackWorld, so rekordbox was not asked".into()
+            )
         );
         assert_eq!(
             decks_heard(Err(Unasked::Timeout)),

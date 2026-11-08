@@ -20,7 +20,6 @@ use super::npc_lease::{hand_back, leases_of, released};
 use super::ops::{Decided, OpReply, WorldOp};
 use crate::api::now_ms;
 use crate::bridge;
-use crate::house;
 use crate::discord::server::apply::channel_message;
 use crate::discord::world::apply::mirrored_message;
 use crate::engine::act::Act;
@@ -28,6 +27,7 @@ use crate::engine::event::{EventKind, Salience};
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::{Recorded, Runtime, REFUSED};
 use crate::engine::{body, build, tools};
+use crate::house;
 
 /// An act made, for the feed and the character, and whether it moved the
 /// character's mission.

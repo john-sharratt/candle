@@ -173,9 +173,16 @@ mod tests {
         );
         assert_eq!(
             asked(&frame(json!({"id": "03L", "act": "dance"}))),
-            Some(("03L".into(), Err("`\"dance\"` is neither open nor close".into())))
+            Some((
+                "03L".into(),
+                Err("`\"dance\"` is neither open nor close".into())
+            ))
         );
-        assert_eq!(asked(&frame(json!({"act": "open"}))), None, "no id to answer");
+        assert_eq!(
+            asked(&frame(json!({"act": "open"}))),
+            None,
+            "no id to answer"
+        );
         assert_eq!(
             asked(&json!({"op": "message", "topic": "repo/x", "payload": {}}).to_string()),
             None

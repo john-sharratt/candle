@@ -56,20 +56,14 @@ pub enum Command {
     /// Run `plan` from the playing deck's next steps.
     Arm(Plan),
     /// Load `track` to `deck` and confirm it.
-    Load {
-        deck: u8,
-        track: TrackId,
-    },
+    Load { deck: u8, track: TrackId },
     /// The grid and length of the track on each deck, for the beat and the
     /// watchdog.
     Tracks(Vec<(u8, Grid, u64)>),
     /// Give the decks to a person, to ZenJ beside them, or to ZenJ.
     Hand(Holder),
     /// Fire sampler slot `slot`.
-    Sample {
-        slot: u8,
-        when: Quant,
-    },
+    Sample { slot: u8, when: Quant },
     /// Automix on or off.
     Automix(bool),
 }

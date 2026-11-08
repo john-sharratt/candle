@@ -47,8 +47,12 @@ pub fn open(program: &Path, exe: &str) -> Result<String, String> {
     if let Some(dir) = program.parent() {
         cmd.current_dir(dir);
     }
-    cmd.spawn()
-        .map_err(|e| format!("rekordbox could not be started from {}: {e}", program.display()))?;
+    cmd.spawn().map_err(|e| {
+        format!(
+            "rekordbox could not be started from {}: {e}",
+            program.display()
+        )
+    })?;
     match until(|| running(exe), OPEN_WITHIN) {
         true => Ok("rekordbox is open".into()),
         false => Err(format!(
@@ -101,8 +105,8 @@ mod windows {
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
-        GW_OWNER, WM_CLOSE,
+        EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, GW_OWNER,
+        WM_CLOSE,
     };
 
     fn wide_name(raw: &[u16]) -> String {
@@ -177,9 +181,9 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use windows::id_of;
-#[cfg(windows)]
 use windows::ask_to_close;
+#[cfg(windows)]
+pub use windows::id_of;
 
 /// rekordbox runs on Windows here: elsewhere there is no process to find.
 #[cfg(not(windows))]

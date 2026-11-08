@@ -71,10 +71,7 @@ struct StepFile {
 pub fn parse(file: &str, yaml: &str) -> Result<Table, String> {
     let f: File = serde_yaml::from_str(yaml).map_err(|e| format!("{file}: {e}"))?;
     if Where::parse(f.room.trim()).is_none() {
-        return Err(format!(
-            "{file}: the room `{}` is not `area/node`",
-            f.room
-        ));
+        return Err(format!("{file}: the room `{}` is not `area/node`", f.room));
     }
     let mut modes = BTreeMap::new();
     for (name, steps) in f.modes {
@@ -88,7 +85,9 @@ pub fn parse(file: &str, yaml: &str) -> Result<Table, String> {
         for s in steps {
             let (device, act) = (s.device.trim(), s.act.trim());
             if device.is_empty() || act.is_empty() {
-                return Err(format!("{file}: a step of `{name}` names no device or no act"));
+                return Err(format!(
+                    "{file}: a step of `{name}` names no device or no act"
+                ));
             }
             out.push(Step {
                 device: device.to_string(),
@@ -159,7 +158,10 @@ modes:
             (watching[1].device.as_str(), watching[1].act.as_str()),
             ("stereo", "input")
         );
-        assert_eq!(Value::Object(watching[1].args.clone()), json!({"source": "tv"}));
+        assert_eq!(
+            Value::Object(watching[1].args.clone()),
+            json!({"source": "tv"})
+        );
         assert!(watching[0].args.is_empty());
         assert!(t.steps(Mode::Party).is_empty());
         assert_eq!(
@@ -180,9 +182,16 @@ modes:
             "f: `dinner` is no mode: one of away, asleep, home, listening, watching, party"
         );
         assert_eq!(
-            parse("f", "room: a/b\nmodes:\n  home:\n    - {device: '', act: on}\n").unwrap_err(),
+            parse(
+                "f",
+                "room: a/b\nmodes:\n  home:\n    - {device: '', act: on}\n"
+            )
+            .unwrap_err(),
             "f: a step of `home` names no device or no act"
         );
-        assert!(parse("f", "room: a/b\nrooms: []\n").is_err(), "unknown field");
+        assert!(
+            parse("f", "room: a/b\nrooms: []\n").is_err(),
+            "unknown field"
+        );
     }
 }
