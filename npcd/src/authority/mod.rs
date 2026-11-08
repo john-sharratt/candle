@@ -25,6 +25,7 @@
 //! | [`follow`] | joining, and the pulses taken in |
 //! | [`report`] | the worlds in `COORD` |
 //! | [`routes`] | the authority's routes |
+//! | [`zen_task`] | a mission's task of Zen's, driven and tended |
 
 pub mod beat;
 pub mod building;
@@ -42,6 +43,7 @@ pub mod routes;
 pub mod told;
 pub mod world_lease;
 pub mod worlds;
+pub mod zen_task;
 
 pub use role::{Role, Roles};
 pub use worlds::Standing;

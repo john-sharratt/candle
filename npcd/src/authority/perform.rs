@@ -26,7 +26,7 @@ use crate::engine::act::Act;
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::{Recorded, Runtime, REFUSED};
-use crate::engine::{body, build, tools};
+use crate::engine::{body, build, tools, zen_task};
 
 /// An act made, for the feed and the character, and whether it moved the
 /// character's mission.
@@ -350,6 +350,8 @@ impl Runtime {
             self.bridge_act(npc, act).await
         } else if build::is_mine(act.tool) {
             self.build_act(npc, act).await
+        } else if zen_task::is_mine(act.tool) {
+            self.zen_task_act(npc, act).await
         } else {
             self.record_act(npc, act)
         };
