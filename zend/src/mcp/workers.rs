@@ -48,6 +48,7 @@ use super::chats::talk;
 use super::names;
 use super::nudges::{self, Sender};
 use super::ops::NODE_HEADER;
+use super::driven::{Driven, DRIVEN_SELECTOR};
 use super::records::Records;
 use super::resuming;
 use super::roles::{WorkerKind, ROLE_SELECTOR};
@@ -209,10 +210,10 @@ pub fn summary_line(entry: &str, max: usize) -> String {
 }
 
 /// Start `prompt` on a new worker named after `wanted` under `thread`,
-/// decoding at `priority`, thinking at `effort` and doing `kind`'s work; the
-/// worker's record, `running`. A worker a conversation of Zen's starts —
-/// `from` names it — begins on that conversation's branches and uncommitted
-/// changes (`conv_inherit`).
+/// decoding at `priority`, thinking at `effort`, doing `kind`'s work and
+/// driven as `driven` says; the worker's record, `running`. A worker a
+/// conversation of Zen's starts — `from` names it — begins on that
+/// conversation's branches and uncommitted changes (`conv_inherit`).
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     session: &Arc<ZendSession>,
@@ -220,7 +221,7 @@ pub fn start(
     thread: &str,
     wanted: &str,
     prompt: &str,
-    (priority, effort, kind): (Priority, Effort, WorkerKind),
+    (priority, effort, kind, driven): (Priority, Effort, WorkerKind, Driven),
     by_task: bool,
     from: Option<&str>,
 ) -> Result<Worker, String> {
@@ -253,6 +254,7 @@ pub fn start(
         now,
     );
     worker.by_task = by_task;
+    worker.driven = driven;
     if let Some(Err(e)) = from.and_then(|starter| session.begin_on(&worker.conv_id, starter)) {
         return Err(format!(
             "the task could not be given its starter's work: {e}"
@@ -337,6 +339,7 @@ pub(super) fn fresh(
         priority,
         effort,
         kind,
+        driven: Driven::default(),
         started_ms: now,
         turn_ms: now,
         beat_ms: now,
@@ -1661,6 +1664,7 @@ async fn turn(
     let mode = access::effective_mode(worker.role, None);
     let mut selection = dial_selection(Some(worker.effort.level()), None, Some(true));
     selection.select(ROLE_SELECTOR, worker.kind.option());
+    selection.select(DRIVEN_SELECTOR, worker.driven.option());
     apply_tools_dial(&mut selection, mode);
     let (message, round) = first.into_start();
     let mut stream = session
@@ -1935,6 +1939,7 @@ mod tests {
             priority: Priority::Normal,
             effort: Effort::Deep,
             kind: WorkerKind::Coder,
+            driven: Driven::Attended,
             started_ms: 0,
             turn_ms: 0,
             beat_ms: 0,

@@ -461,6 +461,7 @@ mod tests {
             priority: Default::default(),
             effort: Default::default(),
             kind: Default::default(),
+            driven: Default::default(),
             started_ms: at,
             turn_ms: at,
             beat_ms: at,
