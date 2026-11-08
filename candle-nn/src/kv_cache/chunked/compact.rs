@@ -816,8 +816,7 @@ impl super::backing::ChunkedKvBacking {
         // A pool cut short has work left, which the next pass resumes — reported apart
         // from the budget's clip; see `CompactionReport::plan_capped`.
         report.plan_capped = plans.iter().any(|p| p.clipped);
-        let mut ranked: Vec<(ChunkMove, ArenaKey)> =
-            by_source_rank(&plans, |idx| rank_of.get(&idx).copied().unwrap_or(0)).collect();
+        let mut ranked = by_source_rank(&plans, |idx| rank_of.get(&idx).copied().unwrap_or(0));
         if ranked.is_empty() {
             return Err(CompactionRefused::AlreadyPacked);
         }
