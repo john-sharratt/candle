@@ -22,7 +22,7 @@ use super::mem::PATHS;
 use super::{mem, string, Answer, Ctx, LOADING};
 use crate::mcp::memory::{is_memory_path, Memory};
 use crate::mcp::names::Path;
-use crate::mcp::threads::{self, project_journal, Entry};
+use crate::mcp::threads::{self, project_journal, Numbered};
 
 pub const NAME: &str = "journal_read";
 
@@ -292,12 +292,12 @@ fn answer_page(path: &str, text: &str, from: usize) -> String {
 /// A thread's or project's journal at `path`: its entries from `first` on, or
 /// with `entry` that one note — its entries are its record, with no turns
 /// behind them.
-fn notes_answer(path: &str, notes: &[Entry], entry: Option<u64>, first: usize) -> Answer {
+fn notes_answer(path: &str, notes: &[Numbered], entry: Option<u64>, first: usize) -> Answer {
     let Some(n) = entry else {
         if first <= 1 {
             return Answer::ok(threads::render_journal(path, notes));
         }
-        let shown: Vec<&Entry> = notes.iter().filter(|e| e.number >= first as u64).collect();
+        let shown: Vec<&Numbered> = notes.iter().filter(|e| e.number >= first as u64).collect();
         let last = shown.iter().map(|e| e.number).max().unwrap_or(first as u64);
         let lines: Vec<String> = shown.into_iter().map(threads::note_line).collect();
         return Answer::ok(format!(
@@ -359,7 +359,7 @@ mod tests {
     /// how many there are.
     #[test]
     fn a_notes_address_reads_that_note() {
-        let entry = |number, label: &str, text: &str| Entry {
+        let entry = |number, label: &str, text: &str| Numbered {
             number,
             note: Note {
                 label: label.into(),

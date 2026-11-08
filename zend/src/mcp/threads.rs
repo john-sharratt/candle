@@ -440,7 +440,7 @@ pub fn put_worker(records: &dyn Records, owner: &str, w: &Worker) -> anyhow::Res
 /// is written and stored on it, so a note replicated in with an earlier
 /// stamp takes its own number and moves no other.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
+pub struct Numbered {
     pub number: u64,
     pub note: Note,
 }
@@ -488,7 +488,7 @@ pub fn add_note(
 }
 
 /// The thread's journal, oldest first.
-pub fn notes(records: &dyn Records, owner: &str, thread: &str) -> Vec<Entry> {
+pub fn notes(records: &dyn Records, owner: &str, thread: &str) -> Vec<Numbered> {
     notes_keyed(records, owner, thread)
         .into_iter()
         .map(|(_, e)| e)
@@ -509,7 +509,7 @@ pub fn last_note(records: &dyn Records, owner: &str, thread: &str) -> Option<Not
 
 /// The thread's journal, oldest first, each entry with the record key it is
 /// kept under — what ending one names.
-pub fn notes_keyed(records: &dyn Records, owner: &str, thread: &str) -> Vec<(String, Entry)> {
+pub fn notes_keyed(records: &dyn Records, owner: &str, thread: &str) -> Vec<(String, Numbered)> {
     records
         .under(&note_prefix(owner, thread))
         .into_iter()
@@ -518,7 +518,7 @@ pub fn notes_keyed(records: &dyn Records, owner: &str, thread: &str) -> Vec<(Str
             let number = number_of(&v, i + 1);
             Some((
                 k,
-                Entry {
+                Numbered {
                     number,
                     note: decode(v)?,
                 },
@@ -528,12 +528,12 @@ pub fn notes_keyed(records: &dyn Records, owner: &str, thread: &str) -> Vec<(Str
 }
 
 /// A thread's or project's journal, one numbered line per entry, oldest first.
-pub fn note_lines(notes: &[Entry]) -> Vec<String> {
+pub fn note_lines(notes: &[Numbered]) -> Vec<String> {
     notes.iter().map(note_line).collect()
 }
 
 /// One entry as a journal prints it, `#N <label> <text>`.
-pub fn note_line(e: &Entry) -> String {
+pub fn note_line(e: &Numbered) -> String {
     format!("#{} {} {}", e.number, e.note.label, e.note.text)
 }
 
@@ -544,7 +544,7 @@ pub fn journal_head(path: &str) -> String {
 
 /// A thread's or project's journal as `journal_read` prints it: one numbered
 /// line per entry, under its path.
-pub fn render_journal(path: &str, notes: &[Entry]) -> String {
+pub fn render_journal(path: &str, notes: &[Numbered]) -> String {
     let mut out = journal_head(path);
     if notes.is_empty() {
         out.push_str(" — no entries yet.");

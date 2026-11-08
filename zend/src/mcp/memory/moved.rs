@@ -20,7 +20,7 @@ use journals::time::Stamp;
 
 use super::{held, Memory};
 use crate::mcp::records::Records;
-use crate::mcp::threads::{self, Entry, Note};
+use crate::mcp::threads::{self, Note, Numbered};
 
 /// The key the substrate kept a person's old notes under.
 const OLD_JOURNAL: &str = "U:";
@@ -118,7 +118,7 @@ pub fn move_all(memory: &Memory, records: &dyn Records, owner: &str, group: &Slu
         }
     };
     let mut moved = 0usize;
-    for (key, Entry { note, .. }) in &old {
+    for (key, Numbered { note, .. }) in &old {
         let (actor, op, at) = move_of(path.clone(), person, note);
         match memory.write_at(&actor, &op, at) {
             Ok(_) => match records.cease(key) {
