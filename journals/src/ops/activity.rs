@@ -62,7 +62,7 @@ mod tests {
         let mut t = zen();
         apply(
             &mut t,
-            &Actor::System,
+            &server(),
             &Op::Create {
                 under: p("conversations"),
                 name: slug("2026-11-08-0308-claude-code"),
