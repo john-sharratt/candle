@@ -47,6 +47,7 @@ pub mod npcd_tools;
 pub mod nudges;
 pub mod ops;
 pub mod ops_tools;
+pub mod outcomes;
 pub mod ownership;
 pub mod records;
 pub mod reported;

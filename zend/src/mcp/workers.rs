@@ -49,6 +49,7 @@ use super::names;
 use super::nudges::{self, Sender};
 use super::ops::NODE_HEADER;
 use super::driven::{Driven, DRIVEN_SELECTOR};
+use super::outcomes::{self, Outcome};
 use super::records::Records;
 use super::resuming;
 use super::roles::{WorkerKind, ROLE_SELECTOR};
@@ -1427,6 +1428,20 @@ async fn run(
     }
     if let Err(e) = threads::put_worker(&records, &owner, &worker) {
         tracing::warn!(conv_id = %worker.conv_id, "mcp: the worker's outcome could not be kept: {e}");
+    }
+    // Nobody waited on an alone task: its end is kept for its owner's next
+    // conversation (`super::outcomes`).
+    if worker.driven == Driven::Alone {
+        let kept = Outcome {
+            at_ms: now_ms(),
+            thread: worker.thread.clone(),
+            name: worker.name.clone(),
+            label: label.to_string(),
+            text: outcome.clone(),
+        };
+        if let Err(e) = outcomes::keep(&records, &owner, &kept) {
+            tracing::warn!(conv_id = %worker.conv_id, "mcp: an alone task's outcome could not be kept for its owner: {e}");
+        }
     }
     if let Err(e) = note(&records, &owner, &worker, label, outcome) {
         tracing::warn!(conv_id = %worker.conv_id, "mcp: the outcome could not be entered on the thread: {e}");
