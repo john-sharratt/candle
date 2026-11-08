@@ -41,6 +41,7 @@ use crate::engine::mission::{Mission, MissionPrompt, Origin, Outcome, StepOutcom
 use crate::engine::mission_gen::round::{Item as RoundItem, STALE_MS};
 use crate::engine::mission_gen::world::{self, Draw, Routine};
 use crate::engine::workflow::{Next, Taker, Where, Workflow, STUCK};
+use crate::engine::zen_task::Task;
 
 /// The outcome a Maker's `report_done` reports on a step that offers a choice.
 pub const PASS: &str = "pass";
@@ -1459,6 +1460,37 @@ impl Missions {
         self.active
             .get_mut(body)
             .is_some_and(|m| m.committed(paths))
+    }
+
+    /// Keep `task` as the one the body's open mission drives. `false` when it
+    /// has no open mission.
+    pub fn set_task(&mut self, body: &str, task: Task) -> bool {
+        match self.active.get_mut(body) {
+            Some(m) => {
+                m.task = Some(task);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Note that the body's mission's task said what `digest` names, and say
+    /// whether that is news: `false` when it said it last time too, or there
+    /// is no task.
+    pub fn heard(&mut self, body: &str, digest: u64) -> bool {
+        match self.active.get_mut(body).and_then(|m| m.task.as_mut()) {
+            Some(t) if t.heard != digest => {
+                t.heard = digest;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Sign off the steps that see the body's mission's task through — see
+    /// [`Mission::task_done`].
+    pub fn task_done(&mut self, body: &str) -> bool {
+        self.active.get_mut(body).is_some_and(Mission::task_done)
     }
 
     /// Put the writing of the body's mission document back in front of it —

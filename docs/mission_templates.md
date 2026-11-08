@@ -204,21 +204,38 @@ of the cluster's "Decide commands need approval" split. A deploy is reversible
 ## 7. Coding and deploy — driving zend over a thread
 
 A coding or deploy mission does not build anything itself. The drone **drives a
-zend task as a correspondent**, over the Discord messaging it already uses: it
-opens a thread to zend and posts the task (the feature, the fix, the release), the
-task's turns arrive as messages, and the drone nudges it and answers its questions
-across as many ticks as it takes, until it reports done. The mission's terminal
-step is gated on that — the engine signs it off when the task completes, not on the
-drone's word, the same shape as the doc-commit and publish gates in `mission.rs`.
+zend task as a correspondent**: it starts the task (the feature, the fix, the
+release), the task's news arrives on its handset, and the drone answers its
+questions and nudges it across as many ticks as it takes, until it reports done.
+The mission's terminal step is gated on that — the engine signs it off when the
+task completes, not on the drone's word, the same shape as the doc-commit and
+publish gates in `mission.rs`.
 
-**This is the one part with real new plumbing, and it does not exist yet.** npcd
-has no in-process path to zend's repo-task machinery (`repo_task` lives in
-`zend/src/mcp/`); the drones' threads today are handset/Discord threads between
-world characters. Bridging a world thread to a zend repo task — posting the task,
-piping its turns back onto the thread as messages, learning when it is done — is a
-self-contained integration, and it is scheduled **last** (§8) so every other kind
-of template ships without it. Until it lands, coding/deploy templates can still be
-authored and issued; they simply wait on this bridge to actually run.
+**The acts.** A template grants any of `task_start { name, prompt, role? }`,
+`task_reply { answer }` and `task_nudge { message }`
+(`npcd/src/engine/zen_task/acts.rs`). Unlike the building acts, which are lent
+in the mission's room, these are granted **wherever the mission is carried**: a
+task is work in the house's repositories, not in a room
+(`Within::with_task_grants`). Each act becomes `repo_task_start`,
+`repo_task_reply` or `repo_task_nudge` on zend's `/v1/mcp`, sent up the member's
+cluster socket as Zen — `x-tokera-user: service:zen` from the service-key
+provider, no email (`docs/zen_memory_and_guides.md` D8) — on the thread
+`mission-<npc>-<chapter>`, so one mission's task never shares a thread with
+another's (`npcd/src/authority/zen_task.rs`). The handle `task_start` answers
+with is kept on the mission (`Mission::task`); a reply or nudge before it is
+refused.
+
+**The tending.** Every 15 s, off the decode path, the world's authority asks
+each carried mission's task how it stands (`job_status`, `wait_s: 0`). When its
+answer changed, the news is posted on the carrier's handset from **"Zen Code"** —
+kept apart from the moon's character Zen, whose thread with the carrier is its
+own — once per change (a digest of the last answer posted is kept). A task that
+reports done signs off the mission's step `see the task through`
+(`zen_task::TASK_STEP`, which only the engine closes); one that fails is noted
+on the mission for its carrier to act on.
+
+**A suspended carrier is held still here too**: its task acts are refused, and
+its task is neither asked after nor posted to until it is let go.
 
 ---
 
@@ -238,8 +255,8 @@ with no GPU and no live devices, fully unit-testable.
    operation on it (a world's own-missions path runs this one workflow).
 4. **The `critical` gate.** Step flag, the authorizer list, the Discord reach-out,
    the fail-safe hold.
-5. **Coding/deploy (separate phase).** The world-thread ↔ zend-repo-task bridge
-   (§7), then the completion gate on top.
+5. **Coding/deploy — built.** The task acts, their zend calls as Zen, the
+   tending and the completion gate (§7).
 6. One template of each group proven end to end; then fill the library toward a
    hundred.
 

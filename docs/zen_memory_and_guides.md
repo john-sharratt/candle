@@ -378,7 +378,9 @@ quoted in Phase 8's report.
 ### Phase 6 — Drone ↔ zend task bridge (`mission_templates.md` §7, D4, D8)
 
 Templates, parameters, `work.checks` and the `critical` gate are built
-(`npcd/src/engine/mission_gen/world.rs`, `authorize.rs`); the bridge is not.
+(`npcd/src/engine/mission_gen/world.rs`, `authorize.rs`). **Built:** the bridge
+is `npcd/src/engine/zen_task/` (acts, zend calls, the task step) and
+`npcd/src/authority/zen_task.rs` (the calls as Zen, the tending).
 
 - **Identity and route (BlackWorld).** npcd reaches its own member's zend over
   the member's cluster socket, as zend reaches npcd (`npcd_tools.rs:8`): the
@@ -390,15 +392,16 @@ Templates, parameters, `work.checks` and the `critical` gate are built
   (`people/zen`). zend's `/mcp` accepts it as that person (`zen_tasks.rs:114-118`
   then has a person). `high_risk` holds apply to Zen's tasks as to anyone's, and
   Zen grants nothing.
-- **Acts (AlienWorld).** A routine's `grants` lend `task_start {name, prompt,
-  role}`, `task_reply {answer}` and `task_nudge {message}` while its mission is
-  carried; npcd maps them onto `repo_task_start`, `repo_task_reply` and
+- **Acts (BlackWorld).** A routine's `grants` lend `task_start {name, prompt,
+  role}`, `task_reply {answer}` and `task_nudge {message}` wherever its mission
+  is carried; npcd maps them onto `repo_task_start`, `repo_task_reply` and
   `repo_task_nudge` on the thread named for the mission
-  (`mission-<mission id>`).
-- **The task as a correspondent.** npcd's tending thread (off the decode path)
-  calls `job_status` with `wait_s: 0` for each carried mission's task, and posts
-  what changed — progress, a question, the final answer — to the carrier's
-  thread as a message from Zen.
+  (`mission-<npc>-<chapter>`).
+- **The task as a correspondent.** npcd's tending loop (every 15 s, off the
+  decode path) calls `job_status` with `wait_s: 0` for each carried mission's
+  task, and posts what changed — progress, a question, the final answer — once
+  per change to the carrier's handset, from "Zen Code" (apart from the moon's
+  character Zen).
 - **Suspended carriers.** A suspended carrier's task acts are refused, and the
   bridge neither polls for it nor posts to it until it is unfrozen.
 - **The completion gate.** The mission's terminal step is signed off by the
