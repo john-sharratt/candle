@@ -1614,10 +1614,10 @@ impl Scheduler {
         // refused.** `MIN_INTERVAL` exists to bound the census, and a contended pass
         // pays no census — it refuses on a `try_` acquisition and returns. Stamping
         // ahead of the call made every refusal cost a quarter second of not trying
-        // again, and against a persistence thread that holds its migrate for the
+        // again, and against a persistence thread that held its migrate for the
         // length of a hot→warm batch that meant 15 passes out of 52 attempts and the
         // pools left at 69%. Now the next wave picks up the gap the moment the
-        // migrate lets go.
+        // migrate's writes have landed.
         if !matches!(
             outcome,
             Err(candle_nn::kv_cache::CompactionRefused::WaveInFlight)
@@ -1727,6 +1727,9 @@ impl Scheduler {
                     provision_us = report.timings.provision.as_micros(),
                     walk_us = report.timings.walk.as_micros(),
                     planned_moves = report.planned_moves,
+                    // Moves stepped around because a migrate group holds the chunk;
+                    // they pack once the group has installed.
+                    held = report.held,
                     pools_censused = report.pools_censused,
                     pools_ranked = report.pools_ranked,
                     first_source_rank = ?report.first_source_rank,

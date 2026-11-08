@@ -1932,9 +1932,14 @@ impl Substrate {
     /// residence leaves the working set.
     ///
     /// **Only over the copy it was made from.** `migrated` is the hot copy the
-    /// migrate read; when the residence no longer holds it — killed, or taken
-    /// since — nothing is installed, and `false` says so: the copies were made
-    /// from state that has moved on.
+    /// migrate read; when the residence no longer holds its content — killed, or
+    /// taken or replaced since — nothing is installed, and `false` says so: the
+    /// copies were made from state that has moved on. A KV compaction that
+    /// relocated the copy while the migrate read it has not moved the content on
+    /// ([`HotKv::lineage`]), so the install lands over the relocation.
+    ///
+    /// A refused `hot` goes back through a [`HotKv`], so its device chunks are
+    /// freed on the device's own thread like any other hot payload.
     pub fn install_migrated(
         &self,
         residence: ResidenceIndex,
@@ -1943,10 +1948,14 @@ impl Substrate {
         warm: Vec<SealedSequence>,
     ) -> bool {
         let r = self.residences.get(residence);
-        if r.hot().is_none_or(|now| !Arc::ptr_eq(&now, migrated)) {
+        if r.hot()
+            .is_none_or(|now| now.lineage() != migrated.lineage())
+        {
+            drop(HotKv::new(hot));
             return false;
         }
         if r.has_flag(EVICT_WHEN_COLD) && !r.is_pinned() {
+            drop(HotKv::new(hot));
             self.install_warm_and_evict_hot(residence, warm);
             return true;
         }
@@ -2172,7 +2181,7 @@ impl Substrate {
                 let Some(next) = rewrite_sealed(&hot, sweep)? else {
                     break;
                 };
-                if self.residences.replace_hot(idx, &hot, next) || r.is_dead() {
+                if self.residences.relocate_hot(idx, &hot, next) || r.is_dead() {
                     any = true;
                     break;
                 }

@@ -197,15 +197,41 @@ pub fn reclaim_pending() -> usize {
     RECLAIM.len()
 }
 
+/// Lineages handed out so far — see [`HotKv::lineage`].
+static LINEAGES: AtomicU64 = AtomicU64::new(0);
+
 /// A residence's VRAM-resident sealed chunks. Dropped off the device's own
 /// thread, the chunks are handed to the reclaim queue instead of freed there.
 pub struct HotKv {
     seqs: Vec<SealedSequence>,
+    lineage: u64,
 }
 
 impl HotKv {
+    /// New content: a lineage of its own.
     pub fn new(seqs: Vec<SealedSequence>) -> Self {
-        Self { seqs }
+        Self {
+            seqs,
+            lineage: LINEAGES.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// `from`'s content at new addresses — a KV compaction's rewrite — so it
+    /// keeps `from`'s lineage.
+    pub fn relocated(seqs: Vec<SealedSequence>, from: &HotKv) -> Self {
+        Self {
+            seqs,
+            lineage: from.lineage,
+        }
+    }
+
+    /// **Which content this is, wherever it sits.** Two copies of one lineage
+    /// hold the same bytes: a compaction relocates chunks and keeps the
+    /// lineage, while every copy made from different bytes — a quantize, a
+    /// lift, a fresh seal — starts one. So a migrate or a quantize that read one
+    /// copy may install over another of the same lineage, and over nothing else.
+    pub fn lineage(&self) -> u64 {
+        self.lineage
     }
 
     /// The sequences, cloned — chunk handles, not bytes.
@@ -570,28 +596,66 @@ impl ResidenceSlab {
         true
     }
 
-    /// Replace `idx`'s hot copy only if it is still `expected` — a quantize or
-    /// a migrate installing the copy it produced from that one. Returns whether
-    /// it was replaced; a residence whose hot copy changed or went keeps what it
-    /// has, and `seqs` is dropped.
+    /// Replace `idx`'s hot copy only if it still holds `expected`'s content — a
+    /// quantize or a migrate installing the copy it produced from that one.
+    /// Returns whether it was replaced; a residence whose hot copy changed or
+    /// went keeps what it has, and `seqs` is dropped.
+    ///
+    /// **Compared by lineage, not by pointer** ([`HotKv::lineage`]): a KV
+    /// compaction that relocated the copy while the migrate was reading it
+    /// leaves the same bytes at other addresses, and the migrate's result is as
+    /// good over those as over the original.
     pub fn replace_hot(
         &self,
         idx: ResidenceIndex,
         expected: &Arc<HotKv>,
         seqs: Vec<SealedSequence>,
     ) -> bool {
+        self.swap_hot_if_lineage(idx, expected, Arc::new(HotKv::new(seqs)))
+    }
+
+    /// Replace `idx`'s hot copy with `seqs`, `expected`'s content relocated by a
+    /// KV compaction — only while it still holds that content. Keeps the
+    /// lineage, so a migrate reading `expected` installs over the result.
+    pub fn relocate_hot(
+        &self,
+        idx: ResidenceIndex,
+        expected: &Arc<HotKv>,
+        seqs: Vec<SealedSequence>,
+    ) -> bool {
+        self.swap_hot_if_lineage(idx, expected, Arc::new(HotKv::relocated(seqs, expected)))
+    }
+
+    /// Swap `fresh` into `idx`'s hot cell while the cell holds `expected`'s
+    /// lineage. Retried against the copy the cell holds now when a relocation of
+    /// the same lineage lands between the read and the swap.
+    fn swap_hot_if_lineage(
+        &self,
+        idx: ResidenceIndex,
+        expected: &Arc<HotKv>,
+        fresh: Arc<HotKv>,
+    ) -> bool {
         let r = self.get(idx);
         if r.is_dead() {
             return false;
         }
-        let fresh = Some(Arc::new(HotKv::new(seqs)));
-        let prev = r.hot.compare_and_swap(expected, fresh);
-        let replaced = prev.as_ref().is_some_and(|p| Arc::ptr_eq(p, expected));
-        if replaced && r.is_dead() {
+        loop {
+            let Some(now) = r.hot() else {
+                return false;
+            };
+            if now.lineage() != expected.lineage() {
+                return false;
+            }
+            let prev = r.hot.compare_and_swap(&now, Some(fresh.clone()));
+            if prev.as_ref().is_some_and(|p| Arc::ptr_eq(p, &now)) {
+                break;
+            }
+        }
+        if r.is_dead() {
             self.take_hot(idx);
             return false;
         }
-        replaced
+        true
     }
 
     /// Take `idx`'s hot copy, leaving none. The returned `Arc` frees its chunks
@@ -927,6 +991,39 @@ mod tests {
         assert!(!slab.replace_hot(idx[0], &seen, vec![seq()]));
         let now = slab.get(idx[0]).hot().unwrap();
         assert!(slab.replace_hot(idx[0], &now, vec![seq()]));
+    }
+
+    /// **A copy a compaction relocated is still the copy a migrate read**: the
+    /// migrate's install lands over the relocation, and over nothing made from
+    /// other bytes since.
+    #[test]
+    fn a_replace_lands_over_a_relocation_of_the_copy_it_read() {
+        let (slab, idx) = slab_with(1);
+        slab.install_hot(idx[0], vec![seq()]);
+        let read = slab.get(idx[0]).hot().unwrap();
+        assert!(slab.relocate_hot(idx[0], &read, vec![seq()]));
+        let relocated = slab.get(idx[0]).hot().unwrap();
+        assert!(!Arc::ptr_eq(&relocated, &read));
+        assert_eq!(relocated.lineage(), read.lineage());
+        assert!(
+            slab.replace_hot(idx[0], &read, vec![seq()]),
+            "the migrate's result lands over the relocated copy"
+        );
+
+        let installed = slab.get(idx[0]).hot().unwrap();
+        assert_ne!(
+            installed.lineage(),
+            read.lineage(),
+            "an install is new content"
+        );
+        assert!(
+            !slab.relocate_hot(idx[0], &read, vec![seq()]),
+            "a relocation of superseded content does not land"
+        );
+        assert!(
+            !slab.replace_hot(idx[0], &read, vec![seq()]),
+            "nor does a second install made from it"
+        );
     }
 
     /// Membership follows the cell through take and re-install.

@@ -84,7 +84,11 @@ use super::backing::ChunkedKvBacking;
 use super::compact_map::{CompactionMap, Sweep};
 use super::compact_plan::{by_source_rank, plan_pool, ArenaSlots, ChunkMove, CompactPlan};
 use super::fresh_arenas::FreshArenas;
+#[cfg(feature = "cuda")]
+use super::migrate_flight::retain_unheld;
 use super::size_class::SizeClass;
+#[cfg(feature = "cuda")]
+use super::size_class::GID_STRIDE;
 use super::types::StrandedRecords;
 use crate::kv_cache::ArenaLocation;
 
@@ -95,6 +99,9 @@ pub struct CompactionReport {
     pub moves: usize,
     /// Moves the plan produced, of which the budget let `moves` through.
     pub planned_moves: usize,
+    /// Moves dropped from the plan because a migrate group holds their chunk
+    /// (`HeldChunks`) — not counted in `planned_moves`.
+    pub held: usize,
     /// Pools the census reached before the planning deadline.
     pub pools_censused: usize,
     /// Pools with an arena to rank — what the census set out to reach.
@@ -359,9 +366,10 @@ pub enum CompactionRefused {
     /// A forward owns the partition. Ordinary between-forwards contention; the
     /// caller notes it and comes back.
     WaveInFlight,
-    /// The persistence thread is acting on chunk addresses it has already captured.
-    /// Ordinary contention like [`Self::WaveInFlight`], and the reverse direction
-    /// defers too — see `migrate_flight`.
+    /// The persistence thread is writing device slots a pass could copy, or every
+    /// move the plan proposed was a chunk a migrate group holds. Ordinary contention
+    /// like [`Self::WaveInFlight`], and the reverse direction defers too — see
+    /// `migrate_flight`.
     MigrateInFlight,
     /// Not a CUDA device, or no reservation yet.
     NoDevice,
@@ -652,14 +660,14 @@ impl super::backing::ChunkedKvBacking {
             return Err(CompactionRefused::NoDevice);
         };
 
-        // **Nothing off-thread may be holding a chunk address.** The arena window
-        // below excludes forwards, which run on this thread; it says nothing about the
-        // persistence thread, whose hot→warm migrate captures a device address per
-        // band from gids it has pinned. A pin keeps the arena alive and says nothing
-        // about which slot of it the chunk occupies, so relocating one under a migrate
-        // makes it copy whatever now sits in the vacated slot into the warm tier —
-        // which surfaces, much later, as a sequence answering from another sequence's
-        // KV. See `migrate_flight` for the measurement that found it.
+        // **Nothing off-thread may be writing a slot this pass could copy.** The arena
+        // window below excludes forwards, which run on this thread; it says nothing
+        // about the persistence thread, whose hot→warm migrate claims quantize
+        // destinations and writes them. Copied before the convert lands, a slot hands
+        // its holders a copy of nothing — which surfaces, much later, as a sequence
+        // answering from another sequence's KV. The migrate holds locations only while
+        // it writes; the rest of its group the pass steps around (`retain_unheld`
+        // below). See `migrate_flight`.
         let _locations = super::migrate_flight::try_freeze_chunk_locations()
             .ok_or(CompactionRefused::MigrateInFlight)?;
 
@@ -808,12 +816,24 @@ impl super::backing::ChunkedKvBacking {
         // A pool cut short has work left, which the next pass resumes — reported apart
         // from the budget's clip; see `CompactionReport::plan_capped`.
         report.plan_capped = plans.iter().any(|p| p.clipped);
-        for (m, key) in by_source_rank(&plans, |idx| rank_of.get(&idx).copied().unwrap_or(0)) {
+        let mut ranked: Vec<(ChunkMove, ArenaKey)> =
+            by_source_rank(&plans, |idx| rank_of.get(&idx).copied().unwrap_or(0)).collect();
+        if ranked.is_empty() {
+            return Err(CompactionRefused::AlreadyPacked);
+        }
+        // **Step around what a migrate group holds** — see `HeldChunks`. Its handles
+        // keep each source alive whatever this pass does, so a move of one claims a
+        // destination nothing this pass reaches would take up. The group packs once
+        // it has installed and let go.
+        report.held = retain_unheld(&mut ranked, |(m, _)| {
+            (m.from.0 * GID_STRIDE + m.from.1 as usize) as i64
+        });
+        if ranked.is_empty() {
+            return Err(CompactionRefused::MigrateInFlight);
+        }
+        for (m, key) in ranked {
             pending.push(m);
             pool_of.push(key);
-        }
-        if pending.is_empty() {
-            return Err(CompactionRefused::AlreadyPacked);
         }
         report.planned_moves = pending.len();
         report.pools_censused = census_by_pool.len();

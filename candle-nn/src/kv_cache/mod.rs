@@ -145,7 +145,8 @@ pub use chunked::{
 };
 pub use chunked::{
     clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations,
-    try_hold_chunk_locations, try_migrate_flight, LocationFreeze, LocationHold, MigrateFlight,
+    try_hold_chunk_locations, try_migrate_flight, HeldChunks, LocationFreeze, LocationHold,
+    MigrateFlight,
 };
 /// Arena sparsity — the arenas a perfect KV pack would empty, per pool. The
 /// figure compaction is judged by; see `chunked::compact_plan`. `compaction_tally`

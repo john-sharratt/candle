@@ -42,8 +42,8 @@ use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::Device;
 use candle_nn::kv_cache::{
-    is_tier_standing_over_free, try_hold_chunk_locations, ChunkedKvBacking, CompressionPolicy,
-    SealedSequence,
+    is_tier_standing_over_free, try_hold_chunk_locations, try_migrate_flight, ChunkedKvBacking,
+    CompressionPolicy, HeldChunks, MigrateFlight, SealedSequence,
 };
 use crossbeam::channel::{self, Receiver, Sender};
 #[cfg(feature = "memory-census")]
@@ -756,6 +756,16 @@ fn install_hot_to_warm(
 /// Returns whether a forward turned the group away — an arena it needed could
 /// not be created mid-wave — rather than anything failing. The group is intact
 /// and hot; the caller runs it again once the next gap has made those arenas.
+///
+/// **A compaction is held off only while the group writes** (`flight`, see
+/// `candle_nn::kv_cache::migrate_flight`): the quantize claims its destinations
+/// and fills their records, the convert writes their bytes, and once those are
+/// fenced the quantized copies join `held` and the flight settles. The DtoH —
+/// most of the group's time — then runs beside any pass, which steps around
+/// every chunk `held` names.
+///
+/// Every device sequence it does not hand to `installs` goes back through a
+/// [`HotKv`], so it is freed on the device's own thread.
 #[allow(clippy::too_many_arguments)]
 fn migrate_group_hot_to_warm(
     backings: &[ChunkedKvBacking],
@@ -763,6 +773,8 @@ fn migrate_group_hot_to_warm(
     copy_stream: &Arc<CudaStream>,
     policy: Option<&CompressionPolicy>,
     group: &[(ResidenceIndex, Vec<SealedSequence>)],
+    flight: &mut MigrateFlight,
+    held: &mut HeldChunks,
     pinned_scratch: &mut Option<PinnedBuf>,
     n_layers: usize,
     installs: &mut Vec<(ResidenceIndex, Vec<SealedSequence>, Vec<SealedSequence>)>,
@@ -897,6 +909,29 @@ fn migrate_group_hot_to_warm(
             }
         }
 
+        // ── The writes are done: fence them, then let a compaction in ────────
+        // The quantize's claims, its records and the convert's bytes are the only
+        // device writes the group makes, all on `copy_stream`. Once they have
+        // landed, the quantized copies are registered beside the native ones the
+        // caller registered, and only then does the flight settle — so a pass that
+        // starts the moment it does already steps around every chunk this group
+        // holds.
+        if policy.is_some() {
+            let t_fence = std::time::Instant::now();
+            let fenced = copy_stream.synchronize();
+            *quantize_ms += t_fence.elapsed().as_millis() as u64;
+            if let Err(e) = fenced {
+                tracing::warn!(
+                    "cache: hot→warm fence after the convert failed: {e:?} (last CUDA kernel \
+                     on this thread: {})",
+                    candle::last_cuda_kernel_launch()
+                );
+                break 'work false;
+            }
+        }
+        held.hold(gpu_hot_per_layer.iter().flatten());
+        flight.settle();
+
         // ── Phase 3: ONE batched hot → warm DtoH across every layer ─────────
         // A single gather + DtoH + sync for all layers (vs 48 per-layer gathers +
         // syncs), which was the dominant `copy_ms` term. Bit-identical to the
@@ -959,7 +994,7 @@ fn migrate_group_hot_to_warm(
         }
 
         // Distribute the per-layer hot sequences into per-residence order.
-        for layer_hot in gpu_hot_per_layer.into_iter() {
+        for layer_hot in gpu_hot_per_layer.drain(..) {
             for (i, h) in layer_hot.into_iter().enumerate() {
                 hot_per[i].push(h);
             }
@@ -978,6 +1013,15 @@ fn migrate_group_hot_to_warm(
             installs.push((*idx, hot, warm));
         }
     }
+    // What no install took — a failed group's quantized copies — may be the last
+    // handle on its slots, and a pass may be running.
+    drop(HotKv::new(
+        gpu_hot_per_layer
+            .into_iter()
+            .flatten()
+            .chain(hot_per.into_iter().flatten())
+            .collect(),
+    ));
     wave_deferred
 }
 
@@ -1205,7 +1249,7 @@ fn run_pass(
     let mut install_ms = 0u64;
     'policies: for cc in policies {
         loop {
-            let Some(group_guard) = candle_nn::kv_cache::try_migrate_flight() else {
+            let Some(mut group_guard) = try_migrate_flight() else {
                 deferred_groups += 1;
                 continue 'policies;
             };
@@ -1230,6 +1274,12 @@ fn run_pass(
             // The hot copies the migrate reads, which its installs replace only
             // while the residences still hold them.
             let migrated: HashMap<ResidenceIndex, Arc<HotKv>> = read.into_iter().collect();
+            // Registered while the flight still holds chunk locations, so no
+            // compaction can start between the snapshot and the registration and
+            // spend claims on chunks this group keeps alive. Dropped last, once
+            // every handle the group took is gone.
+            let mut held = HeldChunks::new();
+            held.hold(group.iter().flat_map(|(_, hot)| hot.iter()));
             let effective = if single_latent {
                 None
             } else {
@@ -1249,6 +1299,8 @@ fn run_pass(
                 &copy_stream,
                 effective.as_ref(),
                 &group,
+                &mut group_guard,
+                &mut held,
                 pinned_scratch,
                 n_layers,
                 &mut installs,
@@ -1275,20 +1327,30 @@ fn run_pass(
                     candle::last_cuda_kernel_launch()
                 );
                 // This group's GPU work is suspect — install none of it, and queue
-                // nothing more behind a device that is not answering.
-                drop(installs);
+                // nothing more behind a device that is not answering. Its quantized
+                // copies go back through a `HotKv`, freed on the device's thread.
+                drop(HotKv::new(
+                    installs.into_iter().flat_map(|(_, hot, _)| hot).collect(),
+                ));
                 drop(group);
                 drop(migrated);
+                drop(held);
                 drop(group_guard);
                 break 'policies;
             }
             let t_install = std::time::Instant::now();
             let (bytes, count) = install_hot_to_warm(conversation, &migrated, installs);
-            drop(migrated);
             install_ms += t_install.elapsed().as_millis() as u64;
             hot_to_warm_bytes = hot_to_warm_bytes.saturating_add(bytes);
             hot_to_warm_count += count;
+            // **The group's clones before the hot copies they share chunks with.**
+            // A `HotKv` hands its chunks to the reclaim queue when it drops off the
+            // device's thread; a bare clone frees them where it drops. Dropped
+            // first, the clones are never the last handle, so the native chunks a
+            // pass may be stepping around are freed on the thread that compacts.
             drop(group);
+            drop(migrated);
+            drop(held);
             drop(group_guard);
             // A sized flush is answered the moment enough is warm — including
             // one sent while this pass was already running — and the rest of the

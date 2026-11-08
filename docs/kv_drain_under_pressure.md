@@ -236,59 +236,57 @@ WARN on the event marked:
    per 5-minute window and carries `files_per_min`. A window closes at the
    first commit past its length, so a quiet spell is one long window.
 
-## 3. Compaction and migration: pool-grained, and neither waits
+## 3. Compaction and migration: held off only while the migrate writes
 
-> **Revised on reading the code: per-pool holds do not reach the contention.**
->
-> - A migrate learns its destination classes only inside the quantize, block
->   by block, so it would have to hold every reachable quant pool shared.
-> - It reads native hot pools, which are exactly where finished readings
->   fragment and compaction is most needed.
->
-> Per-pool holds would starve compaction on the pools that matter, as the
-> global word does now.
->
-> The design that reaches it is per **chunk**: compaction never relocates a
-> slot that a holder it cannot sweep has a reference to. A migrate's snapshot
-> holds one, so its refcount says so. The planner skips such slots instead of
-> refusing the whole pass. That is a change to compaction's planner (census and
-> sweep), and is proposed for a decision before it is built.
->
-> The "skip a whole class" refusal in `run_pass` is not a defect. It is taken
-> before the group is snapshotted, when every group of that class would be
-> refused at the same instant.
->
-> The text below is the original per-pool design, kept for the record.
+**The contention.** A migrate group took `CHUNK_LOCATIONS` shared for its whole
+length, and a compaction pass needs it exclusive. On BW (2026-11-08, 02:11–02:16)
+that refused 586 passes. The group's time is almost all DtoH: the quantize and
+convert were 0–42 ms of groups lasting 20–922 ms.
 
-**Replacing the global word.** `CHUNK_LOCATIONS` / `COMPACTION_WAITING` give
-way to a **per-pool gate**, one atomic word per `ArenaKey`
-`(class, location, kind)`. Compaction already plans per pool (`plan_pool`).
+**What the exclusion actually protects.** A pass copies each source slot as it
+stands at the copy, and correctness does not depend on the pass reaching every
+holder: nothing frees a slot anyone names, so a holder it misses keeps reading
+the source, unchanged. What is unsafe is copying a slot **while it is being
+written** — a migrate's quantize destination before its convert lands. The
+holder the sweep rewrites to that copy reads unfinished bytes as its KV.
 
-- **Migrate.** A group takes a shared hold on exactly the pools it reads (its
-  source chunks' pools) and writes (its Q destination pools). The group
-  records them as it builds its copy table, and releases them when the group
-  installs, as today.
-- **Compaction.** Each pass freezes only the pools it is about to move, one at
-  a time, with `compare_exchange(0, FROZEN)` per pool. A pool held shared is
-  **skipped this pass, not waited on**, and compaction moves on to the next
-  pool. There is no `COMPACTION_WAITING`: compaction never asks a migrate to
-  step aside.
-- **A migrate meeting a frozen pool** waits at most for that one pool's move,
-  which is bounded by the per-pool share of the 80 ms budget. A refusal skips
-  **that group** only, never `continue 'policies`.
-- **Section persist** (`try_hold_chunk_locations`, `drain_in_held_groups`)
-  takes the same per-pool shared holds.
+**What was rejected.**
+- *Per-pool holds.* A migrate learns its destination classes only inside the
+  quantize, and it reads the native pools, which are where compaction is most
+  needed.
+- *Skipping slots whose refcount shows an extra holder.* `HeadGids` is a shared
+  `Arc<Vec<ChunkGid>>`, so six holders can read `strong_count() == 1`
+  (`compact.rs` header). The refcount is not a holder count.
+- *Pinning planned sources.* A free slot's refcount word holds its recycle-list
+  link, so a "retain if live" from a raw id can succeed on a freed slot.
 
-Correctness is unchanged. Today's word protects a migrate's copy table from a
-chunk being relocated under it, and protects compaction from installs carrying
-pre-compaction gids. Both races are within a pool: a relocation moves a chunk
-between slots of the same pool. Holding exactly the pools a migrate touches
-gives the same guarantee where the work actually is. Pools nobody touches
-compact freely, and migrations into untouched pools never wait.
+**What was built.**
+1. **The hold spans only the writes.** `try_migrate_flight` is taken before the
+   group's snapshot, as before. After the quantize (claims, records) and the
+   convert, `migrate_group_hot_to_warm` synchronises `copy_stream` and calls
+   `MigrateFlight::settle`, which drops the location hold. The in-flight count
+   (`migrate_in_flight`) stays until the marker drops.
+2. **The pass steps around what the group holds** (`HeldChunks`,
+   `migrate_flight.rs`). The group's native chunks are registered before the
+   migrate starts, and its quantized copies after the fence, both before
+   `settle`. So any pass overlapping the DtoH and install sees all of them.
+   `compact_with` drops every planned move whose source is registered
+   (`retain_unheld`) and reports the count as `held`. A plan that is all held
+   refuses `MigrateInFlight`. Without this the pass would spend claims on chunks
+   the group's handles keep alive, which the sweep reports as `unwitnessed`.
+3. **The install lands over a relocated copy.** A pass that relocates a
+   residence's hot copy replaces its `Arc<HotKv>`, so the install's `Arc::ptr_eq`
+   would refuse the group. `HotKv` now carries a lineage: a compaction rewrite
+   keeps it (`relocate_hot`), and every other copy starts its own. The install
+   and the section quantize compare lineages (`replace_hot`).
+4. **Every device handle the group drops goes through the reclaim queue.** The
+   group's clones are dropped before the `HotKv`s they share chunks with. Refused
+   installs, the evict-when-cold path and a failed group's quantized copies are
+   dropped as a `HotKv`. So no slot a pass planned is freed mid-pass off the
+   compacting thread.
 
-`compaction_epoch()` exists (`compact.rs:312`), but nothing in the migrate path
-consults it. It becomes a debug assertion at install: a group's pools' epochs
-are unchanged since its holds were taken.
+The fairness flag (`COMPACTION_WAITING`) and section persist's
+`try_hold_chunk_locations` are unchanged.
 
 ## 4. A refused wave relieves before it retries
 
@@ -314,13 +312,13 @@ Assertions are on exact counts and indices:
 4. **A migrate under a full reservation.** With every non-reserve region live
    and a wave open, a hot→warm pass quantizes into the reserve and lands in
    warm, with no arena created mid-wave and no deferral.
-5. **Pool grain.**
-   - A migrate holding pool A does not stop compaction packing pool B.
-   - Compaction holding pool B does not stop a migrate into pool A.
-   - A migrate whose pool is frozen skips only its group.
-6. **The relocation race is still closed.** A compaction cannot relocate a
-   chunk in a pool a migrate holds. A migrate's install finds its pools'
-   epochs unchanged.
+5. **The hold spans only the writes** (`migrate_flight` tests). A pass is
+   refused while a migrate is unsettled and admitted once it settles; the
+   migrate is still in flight; a new migrate waits for the pass.
+6. **A pass steps around held chunks**, counting a slot two groups share until
+   both let go (`held_chunks_are_skipped_until_every_holder_lets_go`). An install
+   lands over a relocation of the copy it read and over nothing newer
+   (`a_replace_lands_over_a_relocation_of_the_copy_it_read`).
 7. **A refused wave relieves.** A decode wave refused for its tier places
    after one relief cycle that evicts warm-backed KV, and is never failed.
 
@@ -334,14 +332,15 @@ Assertions are on exact counts and indices:
    - `finish_creation` moved to consumption;
    - replenishment at the gap (before compaction), at admission relief and at
      the pass top.
-3. The per-pool gate, replacing `migrate_flight.rs`'s global word; the group
-   skip; section persist on the same holds.
+3. The migrate's hold narrowed to its writes, held chunks stepped around, and
+   installs by lineage (§3).
 4. The relieving retry.
 5. Logs, once per pass: reserve per class (standing, owed), pools compaction
    skipped as held, groups a migrate skipped.
 
 **Measured against the night it broke**, on BlackWorld at 16 workers:
 - zero "needs a new arena" deferrals while the reserve stands;
-- zero "compaction declined: MigrateInFlight";
+- "compaction declined: MigrateInFlight" only during a group's quantize and
+  convert, and `unwitnessed` no higher than before;
 - zero "wave too wide" failures;
 - files per hour at least what the throttle gave (about 270/h).

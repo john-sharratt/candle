@@ -183,7 +183,8 @@ pub use head_gids::HeadGids;
 pub use meta_pool::MetaGid;
 pub use migrate_flight::{
     clear_compaction_waiting, migrate_in_flight, try_freeze_chunk_locations,
-    try_hold_chunk_locations, try_migrate_flight, LocationFreeze, LocationHold, MigrateFlight,
+    try_hold_chunk_locations, try_migrate_flight, HeldChunks, LocationFreeze, LocationHold,
+    MigrateFlight,
 };
 pub use size_class::{
     all_kv_formats, class_for_format, class_for_payload, elems_per_chunk, payload_bytes,
