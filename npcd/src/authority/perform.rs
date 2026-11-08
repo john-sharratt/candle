@@ -20,6 +20,7 @@ use super::npc_lease::{hand_back, leases_of, released};
 use super::ops::{Decided, OpReply, WorldOp};
 use crate::api::now_ms;
 use crate::bridge;
+use crate::house;
 use crate::discord::server::apply::channel_message;
 use crate::discord::world::apply::mirrored_message;
 use crate::engine::act::Act;
@@ -348,6 +349,8 @@ impl Runtime {
             self.compose(npc, act).await
         } else if bridge::is_mine(act.tool) {
             self.bridge_act(npc, act).await
+        } else if house::is_mine(act.tool) {
+            self.house_act(npc, act).await
         } else if build::is_mine(act.tool) {
             self.build_act(npc, act).await
         } else {

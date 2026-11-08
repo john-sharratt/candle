@@ -18,10 +18,11 @@ use crate::control::{Button, Control, Knob};
 use crate::midi::{Reading, Touch};
 use crate::plan::Move;
 
-/// Who has the decks.
+/// Who has the decks: a person, ZenJ beside them, or ZenJ. Named apart from
+/// the house's mode (`docs/house_modes.md`), of which the decks are one part.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Mode {
+pub enum Holder {
     /// A person: ZenJ keeps *NYE Next* stocked and touches nothing on air.
     #[default]
     Human,
@@ -31,20 +32,20 @@ pub enum Mode {
     Zenj,
 }
 
-impl Mode {
+impl Holder {
     pub fn name(self) -> &'static str {
         match self {
-            Mode::Human => "human",
-            Mode::Assist => "assist",
-            Mode::Zenj => "zenj",
+            Holder::Human => "human",
+            Holder::Assist => "assist",
+            Holder::Zenj => "zenj",
         }
     }
 
-    pub fn parse(s: &str) -> Option<Mode> {
+    pub fn parse(s: &str) -> Option<Holder> {
         match s {
-            "human" => Some(Mode::Human),
-            "assist" => Some(Mode::Assist),
-            "zenj" => Some(Mode::Zenj),
+            "human" => Some(Holder::Human),
+            "assist" => Some(Holder::Assist),
+            "zenj" => Some(Holder::Zenj),
             _ => None,
         }
     }
@@ -67,13 +68,13 @@ pub enum Change {
     TookBack(Knob),
     /// The person took the whole mixer back.
     HandedBack,
-    /// A pad combination asked for a mode.
-    Asked(Mode),
+    /// A pad combination asked for the decks to change hands.
+    Asked(Holder),
 }
 
 #[derive(Debug, Default)]
 pub struct Hands {
-    mode: Mode,
+    holder: Holder,
     /// Where each physical knob sits, as the FLX4 last said.
     physical: BTreeMap<Knob, f32>,
     /// Where ZenJ has put each knob it moved, while it holds it.
@@ -93,23 +94,24 @@ impl Hands {
         }
     }
 
-    pub fn mode(&self) -> Mode {
-        self.mode
+    pub fn holder(&self) -> Holder {
+        self.holder
     }
 
-    /// Enter `mode` explicitly. Back to a person starts the walk back.
-    pub fn set_mode(&mut self, mode: Mode) {
-        if mode == Mode::Human {
+    /// Give the decks to `holder` explicitly. Back to a person starts the
+    /// walk back.
+    pub fn set_holder(&mut self, holder: Holder) {
+        if holder == Holder::Human {
             self.taken.clear();
             self.held.clear();
         }
-        self.mode = mode;
+        self.holder = holder;
     }
 
     /// Whether ZenJ may move `knob` now: it mixes, and the person has not
     /// taken that control back.
     pub fn may_move(&self, knob: Knob) -> bool {
-        self.mode() == Mode::Zenj && !self.taken.contains(&knob)
+        self.holder() == Holder::Zenj && !self.taken.contains(&knob)
     }
 
     /// ZenJ moved `knob` to `to`.
@@ -126,7 +128,7 @@ impl Hands {
         match (t.control, t.reading) {
             (Control::Knob(k), Reading::At(at)) => {
                 self.physical.insert(k, at);
-                if self.mode() != Mode::Human && self.held.remove(&k).is_some() {
+                if self.holder() != Holder::Human && self.held.remove(&k).is_some() {
                     self.taken.insert(k);
                     return Some(Change::TookBack(k));
                 }
@@ -135,19 +137,19 @@ impl Hands {
             (Control::Button(b), Reading::Pressed) => {
                 self.down.insert(b);
                 // The conductor walks the mixer back, then lets go.
-                if b.is_transport() && self.mode() != Mode::Human {
+                if b.is_transport() && self.holder() != Holder::Human {
                     return Some(Change::HandedBack);
                 }
-                for (mode, combo) in [
-                    (Mode::Zenj, &self.combos.zenj),
-                    (Mode::Assist, &self.combos.assist),
+                for (holder, combo) in [
+                    (Holder::Zenj, &self.combos.zenj),
+                    (Holder::Assist, &self.combos.assist),
                 ] {
                     let held = !combo.is_empty()
                         && combo
                             .iter()
                             .all(|c| matches!(c, Control::Button(x) if self.down.contains(x)));
-                    if held && self.mode() != mode {
-                        return Some(Change::Asked(mode));
+                    if held && self.holder() != holder {
+                        return Some(Change::Asked(holder));
                     }
                 }
                 None
@@ -212,7 +214,7 @@ mod tests {
     #[test]
     fn a_touch_takes_back_a_control_or_the_mixer() {
         let mut h = Hands::new(combos());
-        h.set_mode(Mode::Zenj);
+        h.set_holder(Holder::Zenj);
         h.moved(Knob::Fader(2), 1.0);
         assert!(h.may_move(Knob::Fader(2)));
         assert_eq!(
@@ -230,14 +232,14 @@ mod tests {
             h.touch(&press(Button::Jog(1), true)),
             Some(Change::HandedBack)
         );
-        h.set_mode(Mode::Human);
+        h.set_holder(Holder::Human);
         assert!(!h.may_move(Knob::Fader(1)));
     }
 
     /// **More ZenJ is only ever asked for**: by a whole combination held at
     /// once, never by part of one.
     #[test]
-    fn a_combination_held_whole_asks_for_its_mode() {
+    fn a_combination_held_whole_asks_for_its_holder() {
         let mut h = Hands::new(combos());
         assert_eq!(h.touch(&press(Button::HotCue(2, 7), true)), None);
         assert_eq!(h.touch(&press(Button::HotCue(2, 7), false)), None);
@@ -248,13 +250,13 @@ mod tests {
         );
         assert_eq!(
             h.touch(&press(Button::HotCue(2, 7), true)),
-            Some(Change::Asked(Mode::Zenj))
+            Some(Change::Asked(Holder::Zenj))
         );
-        h.set_mode(Mode::Zenj);
+        h.set_holder(Holder::Zenj);
         assert_eq!(h.touch(&press(Button::HotCue(1, 7), true)), None);
         assert_eq!(
             h.touch(&press(Button::HotCue(1, 8), true)),
-            Some(Change::Asked(Mode::Assist))
+            Some(Change::Asked(Holder::Assist))
         );
     }
 
@@ -266,7 +268,7 @@ mod tests {
         let mut h = Hands::new(combos());
         h.touch(&knob(Knob::Fader(1), 0.2));
         h.touch(&knob(Knob::Eq(2, Band::Low), 0.5));
-        h.set_mode(Mode::Zenj);
+        h.set_holder(Holder::Zenj);
         h.moved(Knob::Fader(1), 1.0);
         h.moved(Knob::Eq(2, Band::Low), 0.5);
         h.moved(Knob::Filter(2), 0.1);

@@ -31,7 +31,7 @@ use self::watchdog::{fault, Watched};
 use crate::control::{Button, Control};
 use crate::deck::Snapshot;
 use crate::events::{Events, Kind};
-use crate::hands::{Change, Hands, Mode};
+use crate::hands::{Change, Hands, Holder};
 use crate::midi::{Map, Message, Out, Touch};
 use crate::music::{Grid, TrackId};
 use crate::plan::{Move, Plan, Step as PlanStep, Style};
@@ -63,7 +63,8 @@ pub enum Command {
     /// The grid and length of the track on each deck, for the beat and the
     /// watchdog.
     Tracks(Vec<(u8, Grid, u64)>),
-    Mode(Mode),
+    /// Give the decks to a person, to ZenJ beside them, or to ZenJ.
+    Hand(Holder),
     /// Fire sampler slot `slot`.
     Sample {
         slot: u8,
@@ -77,7 +78,7 @@ pub enum Command {
 /// screens.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct State {
-    pub mode: Mode,
+    pub holder: Holder,
     /// The armed plan's pair and style, while one runs.
     pub armed: Option<String>,
     pub loading: Option<String>,
@@ -149,7 +150,7 @@ impl Conductor {
         let open = self.out.is_some();
         self.publish(|s| {
             s.hands_open = open;
-            s.mode = Mode::Human;
+            s.holder = Holder::Human;
         });
         let mut next = Instant::now();
         while !stop.load(Ordering::Relaxed) {
@@ -162,7 +163,7 @@ impl Conductor {
                 match self.hands.touch(&t) {
                     Some(Change::TookBack(k)) => {
                         self.events.push(
-                            Kind::Mode,
+                            Kind::Hands,
                             format!("{} taken back by hand", Control::Knob(k)),
                         );
                     }
@@ -170,17 +171,17 @@ impl Conductor {
                         runner = None;
                         walk = self.walk_back(beat);
                         self.events
-                            .push(Kind::Mode, "the decks are a person's again");
+                            .push(Kind::Hands, "the decks are a person's again");
                         self.publish(|s| {
-                            s.mode = Mode::Human;
+                            s.holder = Holder::Human;
                             s.armed = None;
                         });
                     }
                     Some(Change::Asked(m)) => {
-                        self.hands.set_mode(m);
+                        self.hands.set_holder(m);
                         self.events
-                            .push(Kind::Mode, format!("{} asked for on the pads", m.name()));
-                        self.publish(|s| s.mode = m);
+                            .push(Kind::Hands, format!("{} asked for on the pads", m.name()));
+                        self.publish(|s| s.holder = m);
                     }
                     None => {}
                 }
@@ -200,16 +201,16 @@ impl Conductor {
                         self.publish(|s| s.loading = Some(line));
                     }
                     Ok(Command::Tracks(t)) => tracks = t,
-                    Ok(Command::Mode(m)) => {
-                        if m == Mode::Human && self.hands.mode() != Mode::Human {
+                    Ok(Command::Hand(m)) => {
+                        if m == Holder::Human && self.hands.holder() != Holder::Human {
                             walk = self.walk_back(beat);
                             runner = None;
                         } else {
-                            self.hands.set_mode(m);
+                            self.hands.set_holder(m);
                         }
                         self.publish(|s| {
-                            s.mode = m;
-                            if m == Mode::Human {
+                            s.holder = m;
+                            if m == Holder::Human {
                                 s.armed = None;
                             }
                         });
@@ -234,11 +235,11 @@ impl Conductor {
                 self.send(&sends);
                 if w.done() {
                     walk = None;
-                    self.hands.set_mode(Mode::Human);
+                    self.hands.set_holder(Holder::Human);
                 }
             } else if walk.is_some() && beat.is_none() {
                 walk = None;
-                self.hands.set_mode(Mode::Human);
+                self.hands.set_holder(Holder::Human);
             }
 
             if let (Some(r), Some(b)) = (runner.as_mut(), beat) {
@@ -302,7 +303,7 @@ impl Conductor {
                     last_bar = Some(bar);
                     self.bar(&snap, &tracks, runner.is_some());
                 }
-            } else if !pending.is_empty() && self.hands.mode() != Mode::Human {
+            } else if !pending.is_empty() && self.hands.holder() != Holder::Human {
                 for p in pending.drain(..) {
                     if let Some(o) = self.out.as_mut() {
                         let _ = o.send(
@@ -334,14 +335,14 @@ impl Conductor {
             (!steps.is_empty()).then(|| Runner::new(walk_plan(steps, at), at - 0.001))
         });
         if walk.is_none() {
-            self.hands.set_mode(Mode::Human);
+            self.hands.set_holder(Holder::Human);
         }
         walk
     }
 
     /// The watchdog, once a bar, while ZenJ mixes.
     fn bar(&mut self, snap: &Snapshot, tracks: &[(u8, Grid, u64)], armed: bool) {
-        if self.hands.mode() != Mode::Zenj {
+        if self.hands.holder() != Holder::Zenj {
             return;
         }
         let state = self.state.load_full();

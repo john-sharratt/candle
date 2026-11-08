@@ -1,5 +1,5 @@
 //! What happened, in order (§13 `zenj_events`): a track changed, a request
-//! arrived, the mode changed, a fault. Each event has a number; a reader asks
+//! arrived, the decks changed hands, rekordbox opened, a fault. Each event has a number; a reader asks
 //! for those after the last it saw. The newest few thousand are kept in
 //! memory, and every one is appended to the night's record (§14), one JSON
 //! line each, which outlives the process and is what the morning's write-up
@@ -24,7 +24,9 @@ pub enum Kind {
     Next,
     Transition,
     Request,
-    Mode,
+    Hands,
+    /// rekordbox opened or closed.
+    Rekordbox,
     Moment,
     Fault,
     Said,

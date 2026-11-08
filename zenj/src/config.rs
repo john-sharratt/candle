@@ -72,6 +72,8 @@ pub struct RekordboxCfg {
     pub decks: usize,
     /// `%APPDATA%/Pioneer/rekordbox`: `master.db` and `share/` are in it.
     pub dir: PathBuf,
+    /// Its executable, started to open it for the house.
+    pub program: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +218,13 @@ mod tests {
             "2027-01-01 00:00"
         );
         assert_eq!(c.rekordbox.version, "7.2.19");
+        assert!(
+            c.rekordbox
+                .program
+                .ends_with("rekordbox 7.2.19/rekordbox.exe"),
+            "the release the offsets are for: {}",
+            c.rekordbox.program.display()
+        );
         assert_eq!(
             c.spotify.provider.redirect,
             "http://127.0.0.1:43821/callback"

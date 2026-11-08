@@ -39,6 +39,7 @@ pub mod decisions;
 pub mod device;
 pub mod field;
 pub mod findings;
+pub mod house;
 pub mod item;
 pub mod ledger;
 pub mod missing;
@@ -138,6 +139,9 @@ pub struct Sim {
     /// restart and on every member. See [`built`].
     #[serde(default)]
     pub built: built::Built,
+    /// What the mirrored home is set up for, and its table — see [`house`].
+    #[serde(default)]
+    pub house: house::House,
 }
 
 impl Sim {

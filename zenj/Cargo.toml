@@ -34,6 +34,7 @@ cluster-dial = { path = "../cluster-dial" }
 cpal         = "0.15"
 # The screens (§8): MilkDrop scenes, the overlay's text, one window per output.
 glyphon      = "0.12"
+futures-util = "0.3"
 hmac         = "0.12"
 hyper        = { version = "1", features = ["server", "http1"] }
 hyper-util   = { version = "0.1", features = ["server", "server-auto", "http1", "tokio"] }
@@ -53,6 +54,8 @@ serde_json   = { version = "1.0.99", features = ["preserve_order"] }
 serde_yaml   = "0.9"
 sha2         = "0.10"
 tokio        = { version = "1", features = ["full"] }
+# The house's asks of rekordbox, over the gateway's bus socket (`bus`).
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
 tower        = { version = "0.5", features = ["util"] }
 tracing      = "0.1.37"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -68,6 +71,8 @@ windows-sys  = { version = "0.59", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
+    # rekordbox asked to close through its windows (`rekordbox::process`).
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

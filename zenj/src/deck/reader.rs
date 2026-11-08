@@ -2,7 +2,8 @@
 //! tempo, position and loaded track read out of rekordbox's memory through
 //! the offsets for its release, judged (`state::Judge`), and published for
 //! the conductor, the brain and the screens. rekordbox restarted or not yet
-//! running is a blind reader, retried each second.
+//! running is a blind reader, retried each second; whether it runs at all is
+//! what reserves the machine (`http::keep_status`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -38,12 +39,15 @@ pub fn read(mem: &dyn Memory, offsets: &Offsets, decks: usize) -> Result<(Vec<Ra
     Ok((raws, master))
 }
 
-/// Run the reader until `stop`, publishing each snapshot to `out`.
+/// Run the reader until `stop`, publishing each snapshot to `out`, and to
+/// `running` whether rekordbox runs at all — open, whether or not its memory
+/// reads.
 pub fn run(
     offsets: Offsets,
     decks: usize,
     tracks: Arc<dyn Tracks + Send + Sync>,
     out: Arc<ArcSwap<Snapshot>>,
+    running: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let mut judge = Judge::new();
@@ -51,11 +55,13 @@ pub fn run(
         let process = match Process::open(EXE) {
             Ok(p) => p,
             Err(e) => {
+                running.store(e != MemError::NotRunning, Ordering::Relaxed);
                 out.store(Arc::new(Snapshot::blind(e.to_string())));
                 thread::sleep(REOPEN);
                 continue;
             }
         };
+        running.store(true, Ordering::Relaxed);
         tracing::info!(version = %offsets.version, "deck reader: reading rekordbox");
         let mut next = Instant::now();
         while !stop.load(Ordering::Relaxed) {

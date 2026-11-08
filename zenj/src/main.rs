@@ -12,6 +12,7 @@
 //! | `zenj midi monitor` | each FLX4 message as the map names it, to check the map on the wire |
 //! | `zenj learn` | send each virtual control on Enter, for rekordbox's MIDI LEARN |
 
+use std::fs;
 use std::io::{self, BufRead, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -39,11 +40,12 @@ use zenj::brain::budget::Budget;
 use zenj::brain::curve::Curve;
 use zenj::brain::night::Night;
 use zenj::brain::run::{Ask, Brain};
+use zenj::bus::Bus;
 use zenj::conductor::{Command, Conductor, State as ConductorState};
 use zenj::config::Config;
 use zenj::control::Control;
 use zenj::deck::offsets;
-use zenj::deck::reader;
+use zenj::deck::reader::{self, EXE};
 use zenj::deck::Snapshot;
 use zenj::events::{Events, Kind};
 use zenj::hands::Hands;
@@ -56,6 +58,7 @@ use zenj::midi::{ports, Map, Out, Reading};
 use zenj::music::{Profile, TrackId};
 use zenj::oauth::{login, Account};
 use zenj::presence;
+use zenj::rekordbox::control::Rekordbox;
 use zenj::rekordbox::masterdb::{contents, decrypt_to};
 use zenj::room::capture;
 use zenj::room::{Analyser, Room, BLOCK};
@@ -413,8 +416,9 @@ fn night(config: Config) -> anyhow::Result<()> {
     );
     let events = Arc::new(Events::recorded_at(&config.record_path()).map_err(|e| anyhow!(e))?);
 
-    // The deck reader.
+    // The deck reader, which also says whether rekordbox runs.
     let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot::blind("not read yet")));
+    let rekordbox_running = Arc::new(AtomicBool::new(false));
     let all = offsets::parse(OFFSETS).map_err(|e| anyhow!(e))?;
     let off = all.get(&config.rekordbox.version).cloned().ok_or_else(|| {
         anyhow!(
@@ -424,15 +428,16 @@ fn night(config: Config) -> anyhow::Result<()> {
         )
     })?;
     {
-        let (snap, stop, tracks, decks) = (
+        let (snap, running, stop, tracks, decks) = (
             snapshot.clone(),
+            rekordbox_running.clone(),
             stop.clone(),
             Arc::new(library.clone()),
             config.rekordbox.decks,
         );
         thread::Builder::new()
             .name("zenj-deck-reader".into())
-            .spawn(move || reader::run(off, decks, tracks, snap, stop))?;
+            .spawn(move || reader::run(off, decks, tracks, snap, running, stop))?;
     }
 
     // The hands: the FLX4 observed, the virtual controller opened.
@@ -553,6 +558,7 @@ fn night(config: Config) -> anyhow::Result<()> {
                     conductor_state,
                     cmd_tx,
                     landing,
+                    rekordbox_running,
                 )) {
                     tracing::error!("zenj: {e:#}");
                 }
@@ -591,6 +597,7 @@ async fn serve(
     conductor: Arc<ArcSwap<ConductorState>>,
     commands: mpsc::Sender<Command>,
     landing: Arc<AtomicU32>,
+    rekordbox_running: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let curve = Curve::of(config.night, &config.curve).map_err(|e| anyhow!(e))?;
     let budget = Budget::new(
@@ -632,8 +639,31 @@ async fn serve(
         zen,
         tidal,
         landing,
+        rekordbox: rekordbox_running,
     };
     tokio::spawn(brain.run(ask_rx));
+
+    // rekordbox itself, opened and closed for the house: by Zen's tool, and
+    // by the house's mode switch over the gateway's bus.
+    let rekordbox = Arc::new(Rekordbox::new(
+        config.rekordbox.program.clone(),
+        EXE,
+        live.clone(),
+        events.clone(),
+    ));
+    match fs::read_to_string(&config.zen.key_file) {
+        Ok(key) => {
+            let bus = Bus::at(&config.zen.gateway, &config.zen.host, key.trim());
+            tokio::spawn(bus.serve(rekordbox.clone()));
+        }
+        Err(e) => events.push(
+            Kind::Fault,
+            format!(
+                "the house's asks of rekordbox are not answered: {}: {e}",
+                config.zen.key_file.display()
+            ),
+        ),
+    }
 
     // Requests from the phones.
     let requests_owner = config
@@ -702,6 +732,7 @@ async fn serve(
         live,
         events,
         asks: ask_tx,
+        rekordbox,
         people: config
             .people
             .iter()

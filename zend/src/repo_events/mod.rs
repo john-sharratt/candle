@@ -20,18 +20,8 @@ pub mod offline;
 
 use std::time::Duration;
 
+pub use host::cluster::bus::Unasked;
 use serde_json::Value;
-
-/// Why a request on the bus had no answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unasked {
-    /// No gateway has anything subscribed to the topic.
-    NoSubscriber,
-    /// Something heard it and did not answer in time.
-    Timeout,
-    /// No gateway could be reached, or one answered with an error.
-    Failed(String),
-}
 
 /// The bus, as zend uses it. Called from a tool's own thread, which may block.
 pub trait Bus: Send + Sync {

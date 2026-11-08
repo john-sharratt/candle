@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::control::{Button, Knob};
 use crate::deck::Snapshot;
-use crate::hands::{Hands, Mode};
+use crate::hands::{Hands, Holder};
 use crate::plan::{Move, Plan};
 
 /// What the conductor sends.
@@ -96,7 +96,7 @@ impl Runner {
         if to > self.ran_to {
             self.ran_to = to;
         }
-        let zenj = hands.mode() == Mode::Zenj;
+        let zenj = hands.holder() == Holder::Zenj;
         for (at, act) in due {
             match act {
                 Move::Set { knob, to } => self.set(knob, to, hands, &mut out),
@@ -184,7 +184,7 @@ mod tests {
 
     fn mixing() -> Hands {
         let mut h = Hands::new(Combos::default());
-        h.set_mode(Mode::Zenj);
+        h.set_holder(Holder::Zenj);
         h
     }
 
@@ -270,7 +270,7 @@ mod tests {
         assert!(!after
             .iter()
             .any(|x| matches!(x, Send::Set(Knob::Fader(2), _))));
-        h.set_mode(Mode::Human);
+        h.set_holder(Holder::Human);
         assert!(r.tick(256.0, 0.0, &s, &mut h).is_empty());
     }
 }

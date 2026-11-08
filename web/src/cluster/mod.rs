@@ -195,13 +195,7 @@ impl Gateway {
             .as_ref()
             .map(|o| OpsKey::load(&o.file, &o.admin))
             .transpose()?;
-        let service_keys = cluster
-            .service_keys
-            .iter()
-            .map(|k| {
-                ServiceKey::load(k).with_context(|| format!("the service key of `{}`", k.name))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let service_keys = service_key::load_present(&cluster.service_keys)?;
         Ok(Arc::new(Gateway {
             hub,
             node: voter,

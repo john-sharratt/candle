@@ -6,7 +6,7 @@
 //! | `/v1/zenj/mcp` | the tools |
 //! | `GET /v1/zenj/status` | the live view, for a page or a watcher |
 //! | `GET /v1/zenj/events?since=N` | the event log after a cursor |
-//! | `GET /v1/status` | what keep's guard reads: `refuse` while music plays |
+//! | `GET /v1/status` | what keep's guard reads: `refuse` while rekordbox is open |
 //!
 //! Identity headers are believed only from the socket and from a listed
 //! gateway, as the aggregator believes them; from anyone else they are
@@ -35,12 +35,21 @@ pub const EVENTS_PATH: &str = "/v1/zenj/events";
 /// keep's guard reads every service's status here.
 pub const KEEP_STATUS_PATH: &str = "/v1/status";
 
-/// What keep's guard is told: while music plays, every switch, restart and
-/// trial on this machine is refused.
+/// What keep's guard is told: while rekordbox is open the machine is
+/// reserved for the decks (`docs/house_modes.md` §4) — between tracks too,
+/// since a build or a deploy begun in a pause is still running when the
+/// music starts again.
 pub fn keep_status(l: &Live) -> Value {
-    let mut v = json!({"app": "zenj", "live": l.live, "mode": l.mode.name()});
+    let mut v = json!({
+        "app": "zenj",
+        "live": l.live,
+        "rekordbox": l.rekordbox,
+        "hands": l.holder.name(),
+    });
     if l.live {
-        v["refuse"] = json!("music is playing at the party (zenj is live)");
+        v["refuse"] = json!("music is playing at the party");
+    } else if l.rekordbox {
+        v["refuse"] = json!("rekordbox is open for the decks");
     }
     v
 }
@@ -103,23 +112,26 @@ mod tests {
     use super::*;
     use crate::tools::fixture::dj;
 
-    /// **While music plays, keep is told to refuse**; silent, nothing is
-    /// refused.
+    /// **While rekordbox is open, keep is told to refuse** — playing or
+    /// between tracks; with it closed, nothing is refused.
     #[test]
-    fn keep_is_refused_while_music_plays() {
-        let quiet = keep_status(&Live::default());
+    fn keep_is_refused_while_rekordbox_is_open() {
+        let closed = keep_status(&Live::default());
         assert_eq!(
-            quiet,
-            json!({"app": "zenj", "live": false, "mode": "human"})
+            closed,
+            json!({"app": "zenj", "live": false, "rekordbox": false, "hands": "human"})
         );
-        let live = keep_status(&Live {
+        let open = keep_status(&Live {
+            rekordbox: true,
+            ..Live::default()
+        });
+        assert_eq!(open["refuse"], "rekordbox is open for the decks");
+        let playing = keep_status(&Live {
+            rekordbox: true,
             live: true,
             ..Live::default()
         });
-        assert_eq!(
-            live["refuse"],
-            "music is playing at the party (zenj is live)"
-        );
+        assert_eq!(playing["refuse"], "music is playing at the party");
     }
 
     #[test]
