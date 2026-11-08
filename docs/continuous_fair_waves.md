@@ -218,6 +218,17 @@ was refused at the decode floor on every pass (21.5 GiB resident against a
 25.3 GiB floor), and the person's tool result waited for background work to drain
 before it was even admitted. Among equals the floors hold as before.
 
+**Only a band somebody waits on spends the hold.** The exemption is for a
+person, so it is a live band's (`DecodePriority::is_live`: `High`, `Urgent`). A
+band that outranks lower work with nobody waiting on it token by token — a
+calibration sweep at `Normal` over a `Low` ingest — is refused where its claim
+would leave residency under the decode floor (`admit::breaks_the_hold`); above it
+the trades judge it as any outranking turn. Judged on the prefill floor alone, it
+took every byte the decodes stood on: on BlackWorld (b5d60732, 2026-11-08) all 69
+admissions of a pass were outranking calibration, none refused, and residency
+fell to 4.1 GB against a 29.7 GB hold while the expert hit rate went from 99% to
+61%.
+
 The normalization warm-up replay (`scheduler/norm_warm.rs`) is the one piece of
 background work that does not ride a forward: it runs on the loop thread, one
 replayed turn per loop iteration, which a decode quantum bounds to one per

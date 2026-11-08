@@ -2146,7 +2146,10 @@ impl WaveRate {
 
     /// Offer a prefill that **outranks work the engine is already running** — a
     /// band above some active slot's. The row cap and the prefill floor are
-    /// judged; the decode floor and the gain rules are not.
+    /// judged; the decode floor and the gain rules are not. The fill offers it
+    /// here only for a live band, or above the decode floor: an outranking turn
+    /// nobody waits on is refused where it would leave residency under the
+    /// decode floor (`admit::breaks_the_hold`).
     ///
     /// The floors defend the residency the running work decodes at, and the gain
     /// rules defend the wave's rate. Neither is a reason to hold back a band the

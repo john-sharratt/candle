@@ -471,6 +471,30 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                 // all 46 admissions of four minutes outranked, none was refused,
                 // and the expert zone stood 6.4 GB under the residency the
                 // decodes were held to while their step went 98 → 614 ms.
+                // **Only a turn somebody waits on spends the decodes' hold.**
+                // The exemption above exists for a person: their tool result is
+                // not to wait for background work to drain. A band nobody waits
+                // on token by token that merely outranks lower work — a
+                // calibration sweep over a `Low` ingest — has no such claim, and
+                // judged on the prefill floor alone it took every byte the
+                // decodes stand on: on BlackWorld (b5d60732, 2026-11-08) every
+                // one of 69 admissions a pass was outranking calibration, none was
+                // refused, and residency fell to 4.1 GB against a 29.7 GB hold
+                // while the expert hit rate went from 99% to 61%. Such a turn is
+                // refused where it would leave residency under the decode floor;
+                // the trades and the floors judge it as before above it.
+                Kind::Prefill
+                    if ground.outranks_active(prio)
+                        && breaks_the_hold(prio, &cost, after, budget.decode_floor) =>
+                {
+                    let r = rate::Refusal::Floor {
+                        resident_after: after,
+                        floor: budget.decode_floor,
+                    };
+                    out.note(r);
+                    log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
+                    false
+                }
                 Kind::Prefill if ground.outranks_active(prio) => {
                     let peers = ground.decodes_at_or_above(prio);
                     let verdict = if cost.rows > 0 && peers > 0 {
@@ -642,6 +666,16 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
         }
     }
     out
+}
+
+/// Whether an outranking prefill of `prio` costing `cost` would leave the
+/// weight residency at `after`, under the decode floor the running decodes are
+/// held to, without a person waiting on it: a band that is not
+/// [`DecodePriority::is_live`] and dislodges something. A live band may spend
+/// the hold down to the prefill floor; a claim landing wholly in holes
+/// dislodges nothing and breaks no hold.
+fn breaks_the_hold(prio: DecodePriority, cost: &Cost, after: u64, decode_floor: u64) -> bool {
+    !prio.is_live() && cost.dislodged_bytes() > 0 && after < decode_floor
 }
 
 /// One decode offer as the rate model reads it: a verify block of `1 + draft`
@@ -932,6 +966,69 @@ mod tests {
         peer.prefill_prio = DecodePriority::High;
         let got = fill_once(&mut peer);
         assert_eq!(got.prefills, 0, "among equals the floor still holds");
+    }
+
+    /// **Only a turn somebody waits on spends the decodes' hold.** A `Normal`
+    /// turn outranking running `Low` work — a calibration sweep over an ingest
+    /// — is refused where it would leave residency under the decode floor,
+    /// though the prefill floor is far below; above the decode floor it is
+    /// admitted as before. A `High` turn in the same place is admitted past the
+    /// decode floor (`a_turn_outranking_the_running_slots_is_admitted_under_the_floor`).
+    #[test]
+    fn an_outranking_turn_nobody_waits_on_keeps_the_decodes_hold() {
+        let outranking = |prio: DecodePriority, resident: u64| {
+            let mut f = Fake::new(Vec::new(), vec![REGION], resident);
+            f.active = 14;
+            f.running_band = Some(DecodePriority::Low);
+            f.prefill_prio = prio;
+            f.prefill_floor = FLOOR - 8 * REGION;
+            let got = fill_once(&mut f);
+            (got.prefills, got.stopped_on_weights)
+        };
+        let under = FLOOR - 4 * REGION;
+        assert_eq!(
+            outranking(DecodePriority::Normal, under),
+            (0, true),
+            "under the hold, a turn nobody waits on waits"
+        );
+        assert_eq!(
+            outranking(DecodePriority::Normal, FLOOR + 4 * REGION),
+            (1, false),
+            "above the hold it is admitted"
+        );
+        assert_eq!(
+            outranking(DecodePriority::Normal, FLOOR + REGION / 2),
+            (0, true),
+            "a claim that would carry residency across the hold waits"
+        );
+        assert_eq!(
+            outranking(DecodePriority::Urgent, under),
+            (1, false),
+            "a person's turn spends the hold down to the prefill floor"
+        );
+    }
+
+    /// The hold is broken only by a band nobody waits on, only under the
+    /// decode floor, and only by a claim that dislodges weights.
+    #[test]
+    fn the_hold_is_broken_only_by_a_dislodging_claim_nobody_waits_on() {
+        let claim = Cost {
+            kv: REGION,
+            ..Default::default()
+        };
+        let in_holes = Cost {
+            kv: REGION,
+            hole_credit: REGION,
+            ..Default::default()
+        };
+        let breaks = |p: DecodePriority, c: &Cost, after: u64| breaks_the_hold(p, c, after, FLOOR);
+        use DecodePriority::{High, Low, Normal, Urgent};
+        assert!(breaks(Normal, &claim, FLOOR - 1));
+        assert!(breaks(Low, &claim, FLOOR - 1));
+        assert!(!breaks(Normal, &claim, FLOOR));
+        assert!(!breaks(High, &claim, 0));
+        assert!(!breaks(Urgent, &claim, 0));
+        assert!(!breaks(Normal, &in_holes, 0));
     }
 
     /// **Outranking orders the queue; it does not exempt the trade.** A `High`
