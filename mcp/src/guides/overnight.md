@@ -19,6 +19,9 @@ The user is away: nobody will answer a question until they are back.
   what blocks it.
 - **Parked items stay parked**: anything the user said to leave is left, and
   listed.
+- **Every task you start runs alone** (`driven: "alone"`, the `drive` guide):
+  its brief names where it lands, when it is done and what it must never do,
+  since you may not be here when it asks.
 
 ## Run
 

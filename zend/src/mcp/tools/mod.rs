@@ -44,7 +44,9 @@ pub mod cluster_audit;
 pub mod cluster_command;
 pub mod cluster_logs;
 pub mod cluster_status;
+mod file_download_and_commit;
 mod file_edit_and_commit;
+mod file_upload_and_commit;
 mod files;
 mod fit;
 pub mod gateway_command;
@@ -63,6 +65,7 @@ mod journal_grep;
 pub mod journal_link;
 pub mod journal_note;
 mod journal_read;
+mod landing;
 pub mod layer_read;
 pub mod layer_toggle;
 pub mod logs;
@@ -169,6 +172,8 @@ pub fn definitions() -> Value {
         files::definition("file_list"),
         files::definition("file_search"),
         file_edit_and_commit::definition(),
+        file_download_and_commit::definition(),
+        file_upload_and_commit::definition(),
         journal_read::definition(),
         journal_grep::definition(),
         journal_note::definition(),
@@ -243,6 +248,8 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
             blocking(ctx, args, move |ctx, args| files::call(ctx, &name, args)).await
         }
         file_edit_and_commit::NAME => blocking(ctx, args, file_edit_and_commit::call).await,
+        file_download_and_commit::NAME => blocking(ctx, args, file_download_and_commit::call).await,
+        file_upload_and_commit::NAME => blocking(ctx, args, file_upload_and_commit::call).await,
         journal_read::NAME => blocking(ctx, args, journal_read::call).await,
         journal_note::NAME => blocking(ctx, args, journal_note::call).await,
         journal_grep::NAME => blocking(ctx, args, journal_grep::call).await,
@@ -338,7 +345,10 @@ pub fn wait_secs(ctx: &Ctx, args: &Value) -> Wait {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use crate::mcp::npcd_tools;
 
     #[test]
     fn every_tool_has_a_name_a_description_and_an_object_schema() {
@@ -365,6 +375,8 @@ mod tests {
                 "file_list",
                 "file_search",
                 "file_edit_and_commit",
+                "file_download_and_commit",
+                "file_upload_and_commit",
                 "journal_read",
                 "journal_grep",
                 "journal_note",
@@ -407,6 +419,31 @@ mod tests {
                 "timeline_read",
                 "timeline_delete"
             ]
+        );
+    }
+
+    /// **Every tool a guide names is one the connector serves**: zend's, npcd's
+    /// — its bot reads and acts, which zend lists for its own workers, and
+    /// `image_upload`, its one tool no worker calls — or the aggregator's own
+    /// guide tools. The runtime half is the aggregator's `Library::unserved`
+    /// warning; this fails the build instead.
+    #[test]
+    fn every_tool_a_guide_names_is_served() {
+        let library = guides::embedded().unwrap();
+        let defs = definitions();
+        let mut served: BTreeSet<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["name"].as_str())
+            .collect();
+        served.extend(npcd_tools::READS);
+        served.extend(npcd_tools::ACTS);
+        served.extend(["image_upload", "guide_list", "guide_read"]);
+        let unserved = library.unserved(&served);
+        assert!(
+            unserved.is_empty(),
+            "guides name tools nothing serves: {unserved:?}"
         );
     }
 

@@ -1,4 +1,7 @@
-//! Overlay file tools: `file_{write,read,edit,list,search,grep,delete,present}`.
+//! Overlay file tools: `file_{write,read,edit,list,search,grep,delete,present}`,
+//! and the transfers between a URL and the overlay, `file_download` and
+//! `file_upload` (`docs/mcp_file_tools.md` §3.6), which fetch and send through
+//! [`crate::public_fetch`].
 //!
 //! # Finding things
 //!
@@ -166,6 +169,7 @@ impl Paging {
 }
 
 pub mod delete;
+pub mod download;
 pub mod edit;
 pub(crate) mod edit_changes;
 pub mod grep;
@@ -176,9 +180,12 @@ pub mod present;
 pub mod read;
 pub mod render;
 pub mod search;
+mod transfer_error;
+pub mod upload;
 pub mod write;
 
 pub use delete::FILE_DELETE;
+pub use download::FILE_DOWNLOAD;
 pub use edit::FILE_EDIT;
 pub use grep::FILE_GREP;
 pub use image::FILE_IMAGE;
@@ -187,6 +194,7 @@ pub use mv::FILE_MOVE;
 pub use present::FILE_PRESENT;
 pub use read::FILE_READ;
 pub use search::FILE_SEARCH;
+pub use upload::FILE_UPLOAD;
 pub use write::FILE_WRITE;
 
 #[derive(Debug, Error)]

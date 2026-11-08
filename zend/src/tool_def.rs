@@ -1010,6 +1010,9 @@ mod tests {
             "file_delete",
             "file_move",
             "file_image",
+            // The transfers move one file between a URL and one repository.
+            "file_download",
+            "file_upload",
             "journal_move",
             "journal_check",
             "file_present",

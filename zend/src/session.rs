@@ -3327,9 +3327,10 @@ impl InferenceState {
     /// Calibrate every branch layer that declares a `calibrate:` block
     /// (`crate::calibrate`): each ready unit without a calibration of its
     /// current version writes its questions, and they are prefilled as its
-    /// exemplars. Run ahead of each pass, for what an earlier one left, and
-    /// right after the branch pass, which reads a file layer's units without
-    /// calibrating them: that is where they are calibrated.
+    /// exemplars. Run right after the branch pass, which reads a file layer's
+    /// units without calibrating them, and never ahead of it: this sweep is
+    /// where they are calibrated, together with whatever an earlier pass or a
+    /// restart left.
     fn calibrate_layers(&self) {
         for (il, _) in &self.branch_layers {
             if crate::ingest_cancel::cancelled() {
@@ -3507,15 +3508,20 @@ impl InferenceState {
         // silent so a pass doesn't log "load step started Loading model".
         let progress = Arc::new(LoadProgress::silent());
         let mut any = false;
-        self.calibrate_layers();
         if !self.branch_layers.is_empty() {
             let passes = self.layer_passes()?;
             let ctx = self.refresh_ctx();
             any |= self
                 .branch_ingest
                 .pass(&ctx, &self.workspace, &passes, &progress)?;
-            // The branch pass reads files without calibrating them; what it
-            // committed is calibrated now, not at the next pass.
+            // **Read first, calibrate after — and only after.** The branch
+            // pass reads files without calibrating them; the sweep that
+            // follows calibrates what it committed and whatever an earlier
+            // pass or a restart left uncalibrated. A sweep ahead of the pass
+            // as well held every file back for its whole length: after the
+            // 2026-11-08 restarts, each boot spent 15–30 minutes calibrating
+            // the same 160 units, and with a deploy every ~20 minutes no file
+            // was read again at all.
             self.calibrate_layers();
         }
         for il in &self.ingest_layers {

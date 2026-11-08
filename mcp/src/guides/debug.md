@@ -10,7 +10,7 @@ A workaround is not a fix; a restart is not a diagnosis.
 
 ## Prompt
 
-`repo_task_start {thread, name: "debug-<symptom>", effort: "exhaustive", prompt}`:
+`repo_task_start {thread, name: "debug-<symptom>", role: "coder", effort: "exhaustive", prompt}`:
 
 ```
 GOAL: find the root cause of <symptom> in <repository>, and fix it.

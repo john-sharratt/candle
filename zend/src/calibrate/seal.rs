@@ -36,10 +36,12 @@ pub(crate) fn seal_calibration(
     cases: &[(String, String)],
 ) -> anyhow::Result<TimelineId> {
     let mut conv = engine
+        // Background, as the ingest is: its prefill creeps beside a live
+        // turn rather than competing with it (`scheduler::band`).
         .new_reserved_conversation(
             frame.system_prompt,
             Reserved::Calibration,
-            DecodePriority::Normal,
+            DecodePriority::Low,
             calibration_config(frame.config),
         )
         .map_err(|e| anyhow::anyhow!("calibration conversation: {e}"))?;

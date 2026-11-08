@@ -93,7 +93,10 @@ D3). Before a conversation's summary is built, the next conversation's
 "last time" is its newest three calls.
 
 Not recorded: a tool its listing marks `annotations.readOnlyHint` — the MCP
-annotation every tool that only reads carries, in zend and npcd alike — the
+annotation every tool that only reads carries, in zend and npcd alike; an
+aggregator that has not listed since it started lists once before it decides
+its first record, since a client keeps its list across restarts and would
+otherwise have every read recorded — the
 memory's own tools (`get_user_context`, `user_episode_note`, and every
 `journal_*` and `group_*` tool that writes the memory), and the guide tools. `user_episode_note` is in no listing,
 and the aggregator refuses it from a client, so no model is offered it.
@@ -111,6 +114,11 @@ A client's guide is the one whose `clients` holds the session's client
 the first-call context, and is readable like any guide with `guide_read`. It is
 written on a budget — it rides the first call of every conversation — and
 leans on the other guides and the tools' descriptions for detail.
+
+`claude` is the guide for every Claude client (`claude-code`, `claude-ai`) and
+any other: the frame, the write rules in brief, and which guide to read for
+the work, the full `memory` guide among them, which is read on demand and
+rides no first call.
 
 `grok` is the guide for Grok: answers are spoken and short; URLs, ids and
 code are never read out; memory is kept with `journal_note ~`; and the basics

@@ -6,8 +6,10 @@
 //! one-way startup state machine (`mark_ready` is permanent) and reports ONE
 //! linear step's `(progressed, total)` at a time; this counter empties and
 //! refills indefinitely while the daemon stays `ready`, spans both ingest
-//! layers plus uploads at once, and counts only units that are actually RUN —
-//! a unit already committed is not backlog.
+//! layers, uploads and the calibration sweep at once
+//! (`crate::calibrate::calibrate_layer`, its units named `<path> (calibrated)`),
+//! and counts only units that are actually RUN — a unit already committed is
+//! not backlog.
 //!
 //! A process-global, mirroring [`crate::ingest_report`]'s `publish`/`latest`
 //! shape: the counter is written from deep inside `repo_scan::run_dir_pool`

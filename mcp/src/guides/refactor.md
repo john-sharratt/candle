@@ -10,7 +10,7 @@ an old path — and behaviour must not change.
 
 ## Prompt
 
-`repo_task_start {thread, name: "refactor-<what>", effort: "deep", prompt}`:
+`repo_task_start {thread, name: "refactor-<what>", role: "coder", effort: "deep", prompt}`:
 
 ```
 GOAL: <the restructuring, in full> in <repository>, on branch

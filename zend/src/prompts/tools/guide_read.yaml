@@ -26,6 +26,7 @@ parameters:
       description: The guide's name, as guide_list gives it. Required.
       enum:
       - ab-trial
+      - approvals
       - ask
       - bot-campaign
       - bot-debrief
@@ -37,25 +38,27 @@ parameters:
       - bots
       - branch
       - briefing
+      - claude
       - cluster-care
       - compare
       - debug
       - delegate
       - deploy
       - docs-write
+      - drive
       - fact-check
       - feature
+      - files
       - gateway
       - grok
+      - groups
       - guide-change
       - handoff
       - health
       - image
       - implement
       - incident
-      - journal
       - journal-restructure
-      - knowledge
       - literature
       - logs
       - memory

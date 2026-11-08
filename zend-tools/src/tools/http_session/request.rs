@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use super::HttpSessionError;
-use crate::tools::web_fetch::is_private_url;
+use crate::public_fetch::is_private_url;
 use crate::{ConfirmationDetails, RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]

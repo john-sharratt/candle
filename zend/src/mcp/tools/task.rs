@@ -18,9 +18,13 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Delegate a task: start it on a new worker under a thread, and wait for it up to \
-            `wait_s`. A worker is a model conversation running on hardware the user owns, with the \
-            repository's analysis to read from and its own tools to read, run and edit with; its result is \
-            the journal entry it writes. Pass the thread you attached to. State the task in full in `prompt` — \
+            `wait_s`. Read the guide for the kind of work first (`delegate`, then `implement`, `review`, \
+            `research` …): it gives the prompt already shaped for it. A worker is a model conversation \
+            running on hardware the user owns, with the repository's analysis to read from and its own \
+            tools to read, run and edit with; its result is the journal entry it writes. It may start tasks \
+            of its own one level deep — a verify task, a reviewer — and a task it starts starts none. Work \
+            that must land — a change, a document — is `role: coder`, since only a coder commits. Pass the \
+            thread you attached to. State the task in full in `prompt` — \
             what to do, what to verify before answering, and the shape of the final response (verdict, \
             findings, pointers such as file:line). Name the worker for what it does, as a kebab-case slug \
             (`verify-expiry`), never a number; a name already used on the thread gets the next free one \

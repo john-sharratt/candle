@@ -8,7 +8,9 @@ tools: [job_status, repo_task_reply, journal_read, journal_grep, timeline_read]
 A worker's answer is evidence, not truth. A research run once cited "primary
 sources" it never opened and took its key figures from one aggregator page;
 its list of what happened was right, its details were not. Check before you
-rely on it, and check in proportion to what rides on it.
+rely on it, and check in proportion to what rides on it. A task that ran alone
+(`drive`) checked itself; its outcome on the thread is still evidence, read
+the same way.
 
 ## 1. Read the citation audit
 

@@ -1132,8 +1132,13 @@ connector's listing, says what this document says about that tool:
 - that the structure is never changed by a tool;
 - how paths and references resolve.
 
-Each client's guide (`mcp/src/guides/`) is written from §2.4, §2.5 and
-§2.6, and says the same thing to every client, in that client's voice:
+Each client's guide (`mcp/src/guides/` — `claude` for every Claude client,
+`grok` for Grok) is short, since it rides the first call of every
+conversation: the frame and the rules below in brief, and a pointer to the
+full `memory` guide, read on demand, which carries all of them, the note
+terms, proposals, reading and search, threads and projects, and the two
+skills. Between them they are written from §2.4, §2.5 and §2.6, and say the
+same thing to every client, in that client's voice:
 
 1. **This is Zen's memory.** The master, `@zen`, is Zen itself: what it
    is, who is in it, the few things that last.

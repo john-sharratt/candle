@@ -98,6 +98,9 @@ embed-watch = { path = "../embed-watch" }
 # writes — too coarse for a continuity oracle and impossible for a leak test.
 candle-conversation = { path = "../candle-conversation", features = ["hub", "test-helpers"] }
 tempfile = { workspace = true }
+# The served-tools test (`mcp::tools`): every tool a guide names is one the
+# connector serves, read from the guides the aggregator embeds.
+guides = { path = "../guides" }
 tracing-subscriber = { workspace = true }
 rayon = { workspace = true }
 half = { workspace = true }

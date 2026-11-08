@@ -10,8 +10,8 @@ use validator::Validate;
 
 use super::TcpError;
 use crate::net;
+use crate::public_fetch::is_private_ip;
 use crate::state::sessions::{SessionMeta, TcpEntry};
-use crate::tools::web_fetch::is_private_ip;
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]

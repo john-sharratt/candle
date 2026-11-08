@@ -16,7 +16,7 @@ cell of the comparison.
 ## Delegate
 
 One task per option when they are many, or one task for a short list, each
-`effort: "exhaustive"`:
+`role: "researcher"`, `effort: "exhaustive"`:
 
 ```
 GOAL: compare <options> for <purpose>.

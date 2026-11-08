@@ -50,6 +50,7 @@ use super::spec::CalibrateSpec;
 use super::thinking::{exemplar, thinking_of};
 use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
 use crate::code_read::PATH_KEY;
+use crate::ingest_backlog;
 use crate::ingest_lease::{self, Share};
 use crate::layers::keys::{FILE_KEY, SUBJECT_KEY};
 use crate::layers::run::{answer_of, LAYER_PARALLELISM};
@@ -191,11 +192,22 @@ pub fn calibrate_layer(
         retired = report.retired,
         "calibrating the layer's units",
     );
+    // **The sweep is backlog the bar shows.** A pass reads every file before
+    // it calibrates any (`docs/recurrent_reply_calibration.md` §6), so this
+    // sweep is where a re-read tree spends most of its decode; each unit is
+    // counted until it is sealed, failed or found to be another member's, and
+    // shown as `<path> (calibrated)`.
+    ingest_backlog::add_pending(todo.run.len() as u64);
+    let finished = AtomicUsize::new(0);
     let cursor = AtomicUsize::new(0);
     let sealed = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let elsewhere = AtomicUsize::new(0);
     let drafts = Permits::new(LAYER_PARALLELISM);
+    let done = |unit: &Unit| {
+        finished.fetch_add(1, Ordering::Relaxed);
+        ingest_backlog::item_done(&format!("{} (calibrated)", unit.subject));
+    };
     std::thread::scope(|s| {
         for _ in 0..CALIBRATE_PARALLELISM.min(todo.run.len()).max(1) {
             // Only a shutdown stops it.
@@ -213,17 +225,21 @@ pub fn calibrate_layer(
                 let _lease = match ingest_lease::share_calibration(&unit.marker) {
                     Share::Theirs => {
                         elsewhere.fetch_add(1, Ordering::Relaxed);
+                        done(unit);
                         continue;
                     }
                     Share::Mine(lease) => {
                         if lease.recheck() && calibrated(engine, &unit.marker) {
                             elsewhere.fetch_add(1, Ordering::Relaxed);
+                            done(unit);
                             continue;
                         }
                         lease
                     }
                 };
-                match calibrate_one(engine, spec, layer.base, frame, Some(&drafts), unit) {
+                let outcome = calibrate_one(engine, spec, layer.base, frame, Some(&drafts), unit);
+                done(unit);
+                match outcome {
                     Ok(()) => {
                         sealed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -261,6 +277,9 @@ pub fn calibrate_layer(
             });
         }
     });
+    // A shutdown stops the sweep between units: what it never started is
+    // handed back, so the bar still reaches zero.
+    ingest_backlog::drop_pending(todo.run.len().saturating_sub(finished.into_inner()) as u64);
     report.sealed = sealed.into_inner();
     report.failed = failed.into_inner();
     report.elsewhere = elsewhere.into_inner();
@@ -470,11 +489,15 @@ fn thoughts(
     let mut timelines: Vec<TimelineId> = Vec::with_capacity(questions.len());
     let opened: anyhow::Result<()> = questions.iter().try_for_each(|_| {
         let e = engine;
+        // **Background, as the ingest is.** A sweep thinks dozens of
+        // questions at once; at `Normal` they rode every forward beside a live
+        // turn, where `Low` rows step aside for an `Urgent` decode
+        // (`scheduler::band`, `urgent_hold`).
         let conv = e
             .new_reserved_conversation(
                 frame.system_prompt,
                 Reserved::Calibration,
-                DecodePriority::Normal,
+                DecodePriority::Low,
                 frame.config.clone(),
             )
             .map_err(|err| anyhow::anyhow!("thinking conversation: {err}"))?;

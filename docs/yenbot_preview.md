@@ -76,7 +76,9 @@ site. A preview shows how an app looks and behaves to the person using it.
 
 The toolbar's **Publish** lands the overlay:
 
-1. **Pictures and photos first**, the binary files of the overlay, with
+1. **New library art first**, the overlay's pictures under `library/` (the
+   only place the gate takes a binary; a photo a person adds in the preview is
+   the app's data, kept by `app.files`, never committed), with
    `file_upload_and_commit` (`docs/mcp_file_tools.md` §3.6). A picture an
    image tool drew is landed by its link with `file_download_and_commit`
    instead, so its bytes never reach the page.
