@@ -40,7 +40,7 @@ fn logged(gw: &Hub, node: u64, text: &str) -> bool {
 }
 
 /// A member whose volume falls under the floor stays connected in fault
-/// mode: it hands back its claims, applies nothing, still sends its own
+/// mode: it hands back its claims, applies nothing but tombstones, still sends its own
 /// events, and shows on the page. Once space is back above twice the floor it
 /// leaves by itself, catches up on what it missed, and is ready again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -75,7 +75,8 @@ async fn a_full_disk_faults_and_recovers_by_itself() {
     assert_eq!(rb.fault().unwrap().claims_released, 1);
     assert!(!b.ready() || state_on(&gw, 2) == Some("fault"));
 
-    // It applies nothing that arrives, and still sends what it writes.
+    // It applies nothing that arrives but a tombstone, and still sends what
+    // it writes.
     for k in 0..20u32 {
         a.store.write(format!("a/{k}").as_bytes(), b"x");
     }
@@ -87,7 +88,7 @@ async fn a_full_disk_faults_and_recovers_by_itself() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         (0..20u32).all(|k| b.store.value(format!("a/{k}").as_bytes()).is_none()),
-        "nothing is applied in fault mode"
+        "nothing but a tombstone is applied in fault mode"
     );
 
     // Space comes back, but not past twice the floor: it stays.
@@ -109,6 +110,44 @@ async fn a_full_disk_faults_and_recovers_by_itself() {
     .await;
     until("both logged", WITHIN, || {
         logged(&gw, 2, "entered fault mode") && logged(&gw, 2, "left fault mode")
+    })
+    .await;
+}
+
+/// **A member in fault mode still applies the tombstones.** They make dead the
+/// records maintenance reclaims, the only way a full disk gets back out, so
+/// the gateway still relays a faulted member live events and it applies the
+/// tombstones among them; every other record waits for its catch-up on leaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_faulted_member_applies_the_tombstones_it_hears() {
+    let gw = gateway("gw");
+    let a = member(&[&gw], 1, store(1), MemoryVotes::new(), true);
+    let b = member(&[&gw], 2, store(2), MemoryVotes::new(), true);
+    until("ready", WITHIN, || a.ready() && b.ready()).await;
+
+    b.store.set_disk(GIB, 100 * GIB, false);
+    let rb = b.app.replicator().unwrap().clone();
+    until("b in fault mode", WITHIN, || rb.faulted()).await;
+    until("the gateway sees the fault", WITHIN, || {
+        state_on(&gw, 2) == Some("fault")
+    })
+    .await;
+
+    a.store.write(b"a/kept", b"x");
+    a.store.write(b"tombstone/conv-1", b"");
+    until("b applied the tombstone", WITHIN, || {
+        b.store.value(b"tombstone/conv-1").is_some()
+    })
+    .await;
+    assert!(rb.faulted(), "it applied the tombstone from fault mode");
+    assert!(
+        b.store.value(b"a/kept").is_none(),
+        "every other record waits for the catch-up"
+    );
+
+    b.store.set_disk(10 * GIB, 100 * GIB, false);
+    until("b left fault mode and caught up", WITHIN, || {
+        !rb.faulted() && b.ready() && converged(&[&a.store, &b.store])
     })
     .await;
 }

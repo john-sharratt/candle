@@ -64,7 +64,11 @@ impl Hub {
                         let Some(m) = s.registry.member(app, *n) else {
                             continue;
                         };
-                        if matches!(m.state(), MemberState::Upgrading | MemberState::Fault) {
+                        // A member in fault mode still hears live events: it
+                        // applies the tombstones among them, which is how a
+                        // full disk frees itself, and drops the rest at once,
+                        // to be fetched by its catch-up on leaving (§7.7).
+                        if m.state() == MemberState::Upgrading {
                             continue;
                         }
                         if m.lagging {

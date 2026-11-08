@@ -78,13 +78,24 @@ impl Replicator {
             *at = (*at).max(upto);
             advanced
         };
-        // In fault mode nothing is applied: what arrives is fetched again by
-        // the catch-up that leaving starts (§7.7). It counts as handled, so a
-        // request waiting on it is not held for it.
-        if self.faulted() {
-            self.applied_upto.send_if_modified(advance);
-            return;
-        }
+        // In fault mode only what frees space is applied — the tombstones,
+        // whose dead records maintenance reclaims, which is the only way a
+        // full disk gets back out (§7.7). The rest is fetched again by the
+        // catch-up that leaving starts; it counts as handled, so a request
+        // waiting on it is not held for it.
+        let records = if self.faulted() {
+            let freeing: Vec<_> = records
+                .into_iter()
+                .filter(|(_, w, _)| self.store.frees(&w.bytes))
+                .collect();
+            if freeing.is_empty() {
+                self.applied_upto.send_if_modified(advance);
+                return;
+            }
+            freeing
+        } else {
+            records
+        };
         // Per record, in the batch's order: its socket, identity and length
         // when it was fetched for a catch-up.
         let fetched: Vec<Option<(usize, u64, u64, u64)>> = records
@@ -163,14 +174,18 @@ impl Replicator {
     /// Apply records `origin` wrote that `origin` sent here itself, outside
     /// any socket's stream — what a member handing work on carries of its own
     /// records the member taking it lacks — counted as arrivals are, and
-    /// reloaded when the store asks. How many the store took; none in fault
-    /// mode. Each one that also arrives by the stream is a duplicate there.
+    /// reloaded when the store asks. How many the store took; in fault mode
+    /// only what frees space is taken (§7.7). Each one that also arrives by
+    /// the stream is a duplicate there.
     pub async fn apply_carried(
         self: &Arc<Self>,
         origin: u64,
-        records: Vec<(u64, Vec<u8>)>,
+        mut records: Vec<(u64, Vec<u8>)>,
     ) -> usize {
-        if records.is_empty() || self.faulted() {
+        if self.faulted() {
+            records.retain(|(_, bytes)| self.store.frees(bytes));
+        }
+        if records.is_empty() {
             return 0;
         }
         let batch: Vec<(u64, u64, Vec<u8>)> = records

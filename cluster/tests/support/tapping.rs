@@ -52,6 +52,9 @@ impl Store for TappingWhileAsked {
     fn apply(&self, records: &[(u64, u64, Vec<u8>)]) -> Applied {
         self.inner.apply(records)
     }
+    fn frees(&self, bytes: &[u8]) -> bool {
+        self.inner.frees(bytes)
+    }
     fn list(&self, origin: u64, from: u64, to: u64) -> Listing {
         self.inner.list(origin, from, to)
     }

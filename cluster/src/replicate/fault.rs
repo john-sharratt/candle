@@ -1,10 +1,12 @@
 //! Fault mode for a full disk (§7.7), and for a build that failed
 //! certification (§3.8). A member whose volume falls below the floor, or whose
 //! write failed for lack of space, stays connected and says so:
-//! it hands back its claims and leases, proposes nothing, stops applying
-//! remote events and sending `ACK`s — but keeps voting through its vote
-//! journal, keeps sending its own events and answering fetches, and frees what
-//! it can by dropping dead segments, which needs no scratch space.
+//! it hands back its claims and leases, proposes nothing, applies no remote
+//! event but a tombstone and sends no `ACK`s — but keeps voting through its
+//! vote journal, keeps sending its own events and answering fetches, and frees
+//! what it can by dropping dead segments, which needs no scratch space. The
+//! tombstones it still applies are what make those segments dead: with the
+//! disk full, the space the group has deleted is the only way back out.
 //!
 //! It leaves once free space is back above twice the floor and a test append
 //! and commit succeed — the hysteresis keeps it from flapping at the floor —

@@ -358,6 +358,17 @@ impl RecordType {
         )
     }
 
+    /// Whether a record of this type, applied, only makes other records dead:
+    /// a tombstone of a timeline, of a section or of a file. The records it
+    /// names are reclaimed by maintenance, so it is the one kind a member
+    /// whose disk is full still applies (`docs/replicated_substrate.md` §7.7).
+    pub fn frees_space(self) -> bool {
+        matches!(
+            self,
+            RecordType::Tombstone | RecordType::SectionTombstone | RecordType::VfsTombstone
+        )
+    }
+
     /// The type a header names `name` — `"chunk"`, `"stream_decl"` — or
     /// [`RecordType::Unknown`] for a name this build does not know, by the
     /// header's own rule.
@@ -3214,6 +3225,24 @@ mod tests {
         assert_eq!(RecordType::from_tag(6), RecordType::Unknown);
         assert_eq!(RecordType::from_tag(8), RecordType::Unknown);
         assert_eq!(RecordType::from_tag(200), RecordType::Unknown);
+    }
+
+    /// **Only the tombstones free space**: a timeline's, a section's and a
+    /// file's. Every other type, tag 0 to 255, adds what it carries.
+    #[test]
+    fn only_the_tombstones_free_space() {
+        let freeing: Vec<RecordType> = (0..=u8::MAX)
+            .map(RecordType::from_tag)
+            .filter(|t| t.frees_space())
+            .collect();
+        assert_eq!(
+            freeing,
+            [
+                RecordType::Tombstone,
+                RecordType::SectionTombstone,
+                RecordType::VfsTombstone
+            ]
+        );
     }
 
     #[test]

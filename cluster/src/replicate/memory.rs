@@ -26,6 +26,9 @@ const GENERATION: &[u8] = b"cluster/gen/";
 /// Keys a timeline's turns are written under: `turn/<timeline>/…`. A turn
 /// ranked below one held asks for a reload (§6.6).
 const TURN: &[u8] = b"turn/";
+/// Keys a tombstone is written under: `tombstone/<what it ends>`. The one kind
+/// of record a member in fault mode still applies (§7.7).
+pub const TOMBSTONE: &[u8] = b"tombstone/";
 
 /// A record's version stamp: `(gen, epoch, hlc, origin)`.
 pub type Stamp = (u64, u64, u64, u64);
@@ -452,6 +455,10 @@ impl Store for MemoryStore {
             out.taken.push(true);
         }
         out
+    }
+
+    fn frees(&self, bytes: &[u8]) -> bool {
+        MemoryRecord::decode(bytes).is_some_and(|r| r.key.starts_with(TOMBSTONE))
     }
 
     fn list(&self, origin: u64, from: u64, to: u64) -> Listing {

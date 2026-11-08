@@ -1241,7 +1241,7 @@ stream.
 
 | From a member | To |
 |---|---|
-| `EVENT` (live) | every *other* admitted member of the same app — never back to the sender, never to another app, and not to a member that is upgrading (§3.5), lagging (§4.4) or in fault mode for a full disk (§7.7) |
+| `EVENT` (live) | every *other* admitted member of the same app — never back to the sender, never to another app, and not to a member that is upgrading (§3.5) or lagging (§4.4); a member in fault mode still receives them, for the tombstones (§7.7) |
 | anything carrying `reply_to` that answers a request — `HEADERS`, an addressed `EVENT`, `DONE`, `LOST` | **only** the member `reply_to` names, so catch-up traffic reaches the one member that asked for it |
 | `CATCHUP` | the member `to` names; without `to`, one other ready member of the app, picked round robin (§7.2) |
 | `FETCH` | the member `from_node` names |
@@ -3158,7 +3158,7 @@ empty stream.
 | NPC leases (§9.3) | stops its characters at their next turn boundary; their world's authority lends the leases elsewhere, as it would for any joined member that hands them back |
 | Paxos acceptor (§5.9) | **keeps voting.** Its votes go to the preallocated vote journal, which never needs new space, so its promises stay durable with the volume full. A faulted member still counts toward the quorum, and a small group does not lose its majority because one machine's disk filled. |
 | Paxos proposer and lease holder | proposes nothing and holds no lease. Holding a world means writing its state, which it cannot do. |
-| Applying remote events (§6.5) | stops for a full disk, since it cannot append them, and it sends no further `ACK`s. A member faulted by certification keeps applying. |
+| Applying remote events (§6.5) | stops for a full disk, **except tombstones** (`Store::frees`: a timeline's, a section's or a file's), and it sends no further `ACK`s. A tombstone is a few hundred bytes and makes dead the records it names, which maintenance then reclaims: with the disk full, the space the group has deleted is the only way back out, and a member that applied none of it stayed faulted for as long as the group kept writing. Everything else is fetched by the catch-up on leaving. |
 | Serving API requests | the gateways route nothing to it, apart from `/v1/status`, `x-tokera-node` admin requests and aggregates, which it answers with its fault |
 
 **What it keeps doing:**
@@ -3168,15 +3168,18 @@ empty stream.
   needs no free space, so what it wrote before the disk filled still reaches the
   group;
 - **answering catch-up `FETCH`es** for records it holds, which are reads;
+- **applying the tombstones it hears**, live or carried (`replicate/receive.rs`), so the
+  records the group deleted become dead here too and maintenance can reclaim them;
 - **trying to free space.** Once a second it runs a maintenance `Drop`, which unlinks a
   segment holding only dead records and needs no scratch space
   (`persistence/maintenance.rs`). It does not start a `Compact` or `Combine`, which would
   need room it does not have — nor expire tombstones, since a tombstone shrinks only
   inside a full compaction (§6.8).
 
-**The gateway stops relaying live events to it** and does not queue them. Queuing them
-would only fill the gateway's ordered lane and make the member lagging (§4.4). What the
-member misses is what its catch-up fetches later.
+**The gateway still relays live events to it.** The gateway never decodes a record, so it
+cannot pick the tombstones out; the member does, applies them, and drops the rest at
+once, so its lane drains as fast as it fills and the lag cap (§4.4) still bounds it. What
+the member drops is what its catch-up fetches later.
 
 **When it leaves.** Free space has to come back above twice the floor, and a test append
 plus commit must succeed. The member then:

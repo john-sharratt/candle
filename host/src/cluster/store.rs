@@ -206,6 +206,10 @@ impl Store for ConversationStore {
         Applied { taken, reload }
     }
 
+    fn frees(&self, bytes: &[u8]) -> bool {
+        decode_header(bytes).is_ok_and(|(h, _)| h.record_type.frees_space())
+    }
+
     fn list(&self, origin: u64, from: u64, to: u64) -> Listing {
         let held = self.conversation.list_held(origin, from, to);
         Listing {
