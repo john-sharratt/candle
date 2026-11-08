@@ -1,0 +1,77 @@
+# The DDJ-FLX4's own messages, observed beside rekordbox (docs/zenj.md §6.3),
+# from Pioneer's DDJ-FLX4 MIDI message list. `zenj midi monitor` prints each
+# message the controller sends with the control this map names for it, which
+# is how an entry is checked on the wire; a wrong one is corrected here.
+#
+# Deck 1 is channel 0, deck 2 channel 1; the mixer is channel 6; the pads are
+# channel 7 (deck 1) and 9 (deck 2), hot cue mode on notes 0x00–0x07 and
+# sampler mode on 0x30–0x37. Faders and knobs are 14-bit: MSB, then the LSB
+# 0x20 above it.
+port: DDJ-FLX4
+controls:
+  deck1.play:      {channel: 0, note: 0x0B}
+  deck1.cue:       {channel: 0, note: 0x0C}
+  deck1.sync:      {channel: 0, note: 0x58}
+  deck1.jog:       {channel: 0, note: 0x36}
+  deck1.loop_in:   {channel: 0, note: 0x10}
+  deck1.loop_out:  {channel: 0, note: 0x11}
+  deck1.auto_loop: {channel: 0, note: 0x14}
+  deck1.tempo:     {channel: 0, cc: 0x00, lsb: 0x20}
+  deck1.trim:      {channel: 0, cc: 0x04, lsb: 0x24}
+  deck1.eq_high:   {channel: 0, cc: 0x07, lsb: 0x27}
+  deck1.eq_mid:    {channel: 0, cc: 0x0B, lsb: 0x2B}
+  deck1.eq_low:    {channel: 0, cc: 0x0F, lsb: 0x2F}
+  deck1.fader:     {channel: 0, cc: 0x13, lsb: 0x33}
+  deck1.hotcue1:   {channel: 7, note: 0x00}
+  deck1.hotcue2:   {channel: 7, note: 0x01}
+  deck1.hotcue3:   {channel: 7, note: 0x02}
+  deck1.hotcue4:   {channel: 7, note: 0x03}
+  deck1.hotcue5:   {channel: 7, note: 0x04}
+  deck1.hotcue6:   {channel: 7, note: 0x05}
+  deck1.hotcue7:   {channel: 7, note: 0x06}
+  deck1.hotcue8:   {channel: 7, note: 0x07}
+
+  deck2.play:      {channel: 1, note: 0x0B}
+  deck2.cue:       {channel: 1, note: 0x0C}
+  deck2.sync:      {channel: 1, note: 0x58}
+  deck2.jog:       {channel: 1, note: 0x36}
+  deck2.loop_in:   {channel: 1, note: 0x10}
+  deck2.loop_out:  {channel: 1, note: 0x11}
+  deck2.auto_loop: {channel: 1, note: 0x14}
+  deck2.tempo:     {channel: 1, cc: 0x00, lsb: 0x20}
+  deck2.trim:      {channel: 1, cc: 0x04, lsb: 0x24}
+  deck2.eq_high:   {channel: 1, cc: 0x07, lsb: 0x27}
+  deck2.eq_mid:    {channel: 1, cc: 0x0B, lsb: 0x2B}
+  deck2.eq_low:    {channel: 1, cc: 0x0F, lsb: 0x2F}
+  deck2.fader:     {channel: 1, cc: 0x13, lsb: 0x33}
+  deck2.hotcue1:   {channel: 9, note: 0x00}
+  deck2.hotcue2:   {channel: 9, note: 0x01}
+  deck2.hotcue3:   {channel: 9, note: 0x02}
+  deck2.hotcue4:   {channel: 9, note: 0x03}
+  deck2.hotcue5:   {channel: 9, note: 0x04}
+  deck2.hotcue6:   {channel: 9, note: 0x05}
+  deck2.hotcue7:   {channel: 9, note: 0x06}
+  deck2.hotcue8:   {channel: 9, note: 0x07}
+
+  deck1.filter:     {channel: 6, cc: 0x17, lsb: 0x37}
+  deck2.filter:     {channel: 6, cc: 0x18, lsb: 0x38}
+  mixer.crossfader: {channel: 6, cc: 0x1F, lsb: 0x3F}
+  browser.load1:    {channel: 6, note: 0x46}
+  browser.load2:    {channel: 6, note: 0x47}
+
+  sampler.1:  {channel: 7, note: 0x30}
+  sampler.2:  {channel: 7, note: 0x31}
+  sampler.3:  {channel: 7, note: 0x32}
+  sampler.4:  {channel: 7, note: 0x33}
+  sampler.5:  {channel: 7, note: 0x34}
+  sampler.6:  {channel: 7, note: 0x35}
+  sampler.7:  {channel: 7, note: 0x36}
+  sampler.8:  {channel: 7, note: 0x37}
+  sampler.9:  {channel: 9, note: 0x30}
+  sampler.10: {channel: 9, note: 0x31}
+  sampler.11: {channel: 9, note: 0x32}
+  sampler.12: {channel: 9, note: 0x33}
+  sampler.13: {channel: 9, note: 0x34}
+  sampler.14: {channel: 9, note: 0x35}
+  sampler.15: {channel: 9, note: 0x36}
+  sampler.16: {channel: 9, note: 0x37}

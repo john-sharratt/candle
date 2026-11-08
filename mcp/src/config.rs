@@ -156,6 +156,12 @@ mod tests {
                     host: "bot.tokera.com".into(),
                     path: "/v1/npc/mcp".into(),
                     memory: None,
+                },
+                BackendConfig {
+                    name: "dj".into(),
+                    host: "code.tokera.com".into(),
+                    path: "/v1/zenj/mcp".into(),
+                    memory: None,
                 }
             ]
         );

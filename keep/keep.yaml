@@ -18,6 +18,11 @@ cluster:
   name: tokera.com
   group_key: web/secrets/group.key
   host: blackworld
+# Processes keep does not run whose refusal holds for every service here:
+# zenj, started at John's logon in the console session (docs/zenj.md §3.2),
+# says `refuse` on its status while music is playing, so no switch, restart or
+# trial lands under a party.
+guards: ["127.0.0.1:8097"]
 services:
   - name: web
     stable: keep/stable/web.exe

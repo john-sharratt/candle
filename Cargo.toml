@@ -51,6 +51,9 @@ exclude = [
     "candle-pyo3",
     "test_pinned_mmap",
     "tools",
+    # Its own workspace: its screens need wgpu 30, whose web-sys cannot meet
+    # the wasm examples' pinned one. Built with `--manifest-path zenj/Cargo.toml`.
+    "zenj",
 ]
 resolver = "2"
 

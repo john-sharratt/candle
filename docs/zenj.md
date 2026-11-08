@@ -1,6 +1,7 @@
 # ZenJ — Zen as DJ
 
-**Status: design, not built.** First use: New Year's Eve 2026, at home, on BlackWorld. Supersedes
+**Status: built (`zenj/`, 2026-11-08); the spikes of §11 run on BlackWorld against it.** First
+use: New Year's Eve 2026, at home, on BlackWorld. Supersedes
 the listener design on branch `zen/docs-midi-dj-set` (`docs/midi_dj_set.md`), whose findings about
 MIDI are kept where they still apply (§6.1) and whose architecture — a passive listener inside
 `npcd` — is replaced by this one.
@@ -97,11 +98,12 @@ Requests reach it only on routes it declares (`Registry::declaring`,
 
 **Live.** `MemberState` has no "live" and `Capacity` no field to carry one
 (`cluster/src/frame/types.rs:77-91`, `cluster/src/frame/membership.rs:30-100`). `zenj` reports
-`live` in its `/v1/status` instead, and keep's guard gains a generic refusal: a service whose status
-says `refuse: "<why>"` is not switched, restarted or stopped. Today the guard covers only the
-last-member case (`keep/src/guard.rs:27-40`), applies to local switch/accept/restart/stop, and is
-**not** consulted by the cluster's own trial (`keep/src/remote.rs:303-353`), so the refusal is
-added there too.
+`live` on its listener's `/v1/status` instead, with `refuse: "<why>"` while music plays
+(`zenj/src/http.rs`). keep's guard reads that refusal (`keep::guard::declined`) both from a
+service's own status and from the machine's **guards** — `keep.yaml`'s `guards:`, the statuses of
+processes keep does not run, which on BlackWorld is `zenj`'s. While one refuses, no switch,
+accept, restart, stop or cluster trial of any service on the machine goes ahead, unless forced with
+`X-Keep-Force`. So nothing is deployed under a party, by hand or by the cluster.
 
 ### 3.2 The machine and the session
 
@@ -121,27 +123,33 @@ logged-in Windows desktop — the console session**. BlackWorld today is run as 
 
 So for the party BlackWorld runs a console session: John's account signed in at the machine, with
 automatic sign-in at boot, and no RDP connection during the set (an RDP connection would take the
-session from the console). `zenj` is started at that logon — a scheduled task "at log on",
-interactive — and restarts itself through a small watchdog launched the same way. keep keeps
+session from the console). The logon task — "at log on", interactive, from the repository's
+root — runs `zenj watch`, which runs `zenj` and starts it again whenever it stops. keep keeps
 supervising motherd and web in session 0 as today. Teaching keep to launch a service into the
 console session (`WTSQueryUserToken` + `CreateProcessAsUser`) is the cleaner end state and is not
 needed for New Year's Eve.
 
+`zenj` is its own Cargo workspace (`zenj/Cargo.toml`, excluded from the repository's): its screens
+need wgpu 30, whose `web-sys` the wasm examples' pinned `=0.3.70` cannot meet. Its cluster crates
+are path dependencies. Build and test with `--manifest-path zenj/Cargo.toml`.
+
 ### 3.3 Threads
 
-Each thread does one thing; they talk through lock-free single-producer queues (`rtrb`), so nothing
-waits on anything else.
+Each thread does one thing. Samples and touches travel through lock-free single-producer queues
+(`rtrb`), and snapshots and state are published whole (`arc-swap`), so no one waits on anyone.
 
-| Thread | Priority | Does |
-|---|---|---|
-| MIDI in | high | decodes the FLX4's messages (observed, not proxied — §6.3) |
-| Conductor | high | runs transition plans at beat boundaries; owns the virtual MIDI out port |
-| Deck reader | high | samples rekordbox's live deck state (§4.2) every ~5 ms |
-| Audio capture | high | captures the FLX4's output for loudness and the visuals (§4.4) |
-| Brain | normal | set plan, shortlist, transition plans; calls Zen |
-| Library | low | Spotify/TIDAL sync, matching, track profiles |
-| Render, one per screen | normal | the visuals (§8) |
-| Cluster | normal | membership, tools in, events out |
+| Thread | Does |
+|---|---|
+| MIDI in (midir's callback) | decodes the FLX4's messages (observed, not proxied — §6.3) |
+| Conductor | runs transition plans at beat boundaries every 2 ms; owns the virtual MIDI out port |
+| Deck reader | samples rekordbox's live deck state (§4.2) every 5 ms |
+| Audio capture (cpal's callback) | captures the FLX4's output for the room and every screen (§4.4) |
+| Room | levels and landing from the captured audio |
+| Runtime (tokio) | the brain (per 500 ms), the request watcher, the tools, the cluster socket |
+| Main | the screens: every window, each frame (§8) |
+
+The library is built ahead of the night by commands, not by a thread: `zenj library sync` (taste →
+TIDAL → crates) and `zenj library analyse` (rekordbox's analysis → profiles).
 
 ## 4. Perception — what ZenJ knows
 
@@ -268,9 +276,15 @@ The main decision, split so that hard rules can never pick a clash and Zen suppl
    the list when someone asked for something specific. It says why in one line. The line goes on the
    screens and into the journal.
 
-The next track is always decided before the current one is half way through, and the one after it
-tentatively, so a slow or failed model call is never felt. If Zen does not answer in time, the
-shortlist's top entry is taken.
+The next track is decided as soon as the current one is on air, so a slow or failed model call is
+never felt. If Zen does not answer in time (20 s), the shortlist's top entry is taken.
+
+Zen is asked through the gateway's `/v1/chat/completions`, as the service `zenj` — a service key,
+as yenbot acts as itself (`web.yaml` `cluster.service_keys`, `host/roles.yaml`) — with no tools and
+no thinking, on one conversation for the night (`zenj-2026-12-31`). Every choice and its reason
+therefore stays in Zen's memory of the night. The key is made once on BlackWorld, **before the
+gateway next starts** (a missing key file stops it): `target\release\web.exe --new-ops-key
+web/secrets/zenj.key`.
 
 A request is placed, not obeyed blindly: ZenJ puts it where it fits (usually within two tracks) and
 says where. "Play it now" from the requester skips the fit and mixes at the next phrase.
@@ -364,7 +378,7 @@ music.
 | Deck reader is blind (§4.2) | ZenJ drops to Automix on *NYE Live*; Zen keeps curating it |
 | A load cannot be confirmed (§6.2) | Automix takes that transition |
 | Zen does not answer in time | The shortlist's top entry is taken (§5.2) |
-| `zenj` crashes | keep restarts it; rekordbox keeps playing the loaded track and Automix continues |
+| `zenj` crashes | `zenj watch` starts it again; rekordbox keeps playing the loaded track and Automix continues |
 | rekordbox crashes | Restarted by hand; the crates live in TIDAL and the offline store, so nothing is lost |
 | motherd is busy or restarting | No effect: `zenj` needs Zen only for choices, and falls back to the shortlist |
 
@@ -457,12 +471,11 @@ rekordbox at all.
 ## 13. Zen's surface
 
 Tools on the `/mcp` surface, served by `zenj` itself, each answering from memory within the 30 ms
-rule. Tools do not have to live in zend: npcd already serves its own through the `mcp-server` crate
-(`mcp-server/src/lib.rs`). So `zenj` mounts `mcp_server` at `/v1/zenj/mcp` and declares it in its
-route table; `web/web.yaml` gains a site route `cluster: zenj` for that prefix (longest prefix
-wins, `web/src/config.rs:589`; a fallback upstream is required, `config.rs:872-889`); and
-`mcp/served.yaml` gains a `zenj` backend, so the aggregator lists and routes its tools
-(`mcp/src/app.rs:62-79`). No change to zend.
+rule. `zenj` mounts `mcp_server` at `/v1/zenj/mcp` and declares it, with `/v1/zenj/status` and
+`/v1/zenj/events`, in its route table (`zenj/src/presence.rs`). `web/web.yaml`'s `code.tokera.com`
+site routes the `/v1/zenj` prefix to `cluster: zenj`, falling back to `127.0.0.1:8097`, and
+`mcp/served.yaml` names the `dj` backend, so the aggregator lists and routes its tools. Only the
+night's people may call them (`zenj.yaml` `people[].email`). No change to zend.
 
 | Tool | Does |
 |---|---|
@@ -473,22 +486,23 @@ wins, `web/src/config.rs:589`; a fallback upstream is required, `config.rs:872-8
 | `zenj_moment` | schedule a moment: a track at a time, a dedication, an effect |
 | `zenj_sfx` | fire a sampler slot now or on the next beat or bar |
 | `zenj_events` | the event stream since a cursor: track changed, request arrived, mode changed, fault |
+| `zenj_said` | a line the room said, which Zen hears at the next choice |
+| `zenj_midnight` | the midnight track, whose drop lands on 00:00:00 |
+| `zenj_energy` | more or less energy for a while: the curve's target moved from now |
 
 ## 14. The journal
 
 Every pick and its reason, every transition and its plan, every request and where it went, every
-mode change and fault: written to the `@zen` journal as the set runs, `by` the writer that made the
-decision (`zenj` for the conductor, Zen for its choices).
+mode change and fault is an event (`zenj/src/events.rs`), and every event is appended, one JSON line
+each, to the night's record in ZenJ's data folder (`D:/zenj/nights/2026-12-31.jsonl`). The record
+outlives the process, and `zenj_events` reads it back from any cursor. Zen's own choices are also in
+its conversation for the night (§5.2).
 
-There is no such writer today. A line's `by` is a `Writer` — a channel, `server`, `zend`, `npcd` or
-`worker` (`journals/src/line.rs:107-118`) — set from an `Actor`, never from what a caller says of
-itself (`journals/src/actor.rs`); and the one HTTP write path, `POST /v1/journals` on zend, takes a
-signed-in person only (`zend/src/api/journals/mod.rs:101-114`). So the journal needs a `zenj`
-`Writer` and `Actor`, and a member-authenticated write route on the members that hold the memory
-(declared like `MEMORY_ROUTES`, `zend/src/api/mod.rs:60-85`) that `zenj` reaches up its own cluster
-socket. The next morning Zen writes the set up from
-that record: what the night was, what landed, what to do differently. That record is also how the
-next party's ZenJ starts out knowing what worked.
+The next morning Zen writes the set up from that record, as John's AI, through the ordinary journal
+tools: what the night was, what landed, what to do differently. That entry is also how the next
+party's ZenJ starts out knowing what worked. `zenj` writes nothing to the journal itself: a writer
+of its own would need a `zenj` `Writer` and `Actor` in the journals crate and a service-authenticated
+write route on zend, and the night's record makes neither necessary.
 
 ## 15. Open questions
 

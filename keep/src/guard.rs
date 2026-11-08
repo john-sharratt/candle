@@ -1,5 +1,12 @@
-//! The last-member guard: a request by hand that would stop the only member
-//! serving an app is refused.
+//! The guards on stopping a service: a request by hand that would stop the
+//! only member serving an app is refused, and so is any switch, restart or
+//! stop of a service whose own status refuses it.
+//!
+//! **A service may refuse for itself.** A status carrying `refuse: "<why>"`
+//! says the process is doing something a restart would break — `zenj` while
+//! music is playing (`docs/zenj.md` §3.1). That refusal holds for a trial the
+//! cluster asks for too ([`crate::remote`]), since nothing in the cluster
+//! knows what the service knows.
 //!
 //! Every app's quorum is on the service's own `/v1/status`. An app this member
 //! is ready for, in a group of two or more, with one member ready, is served by
@@ -58,7 +65,29 @@ fn status_at(addr: &str) -> Option<Value> {
     serde_json::from_str(body).ok()
 }
 
-/// Why stopping the service whose status is at `addr` is refused, if it is.
+/// What `status` says when the service refuses to be stopped: its `refuse`,
+/// when it is a non-empty string.
+pub fn declined(status: &Value) -> Option<String> {
+    status["refuse"]
+        .as_str()
+        .map(str::trim)
+        .filter(|why| !why.is_empty())
+        .map(|why| {
+            format!(
+                "refused: the service says {why}. Wait for it to clear, or send \
+                 `{FORCE_HEADER}: 1` to do it anyway\n"
+            )
+        })
+}
+
+/// Why the service whose status is at `addr` refuses to be stopped, if it
+/// says so itself.
+pub fn own_refusal(addr: &str) -> Option<String> {
+    declined(&status_at(addr)?)
+}
+
+/// Why stopping the service whose status is at `addr` is refused by the
+/// last-member guard, if it is.
 pub fn refusal(addr: &str) -> Option<String> {
     let alone = served_alone(&status_at(addr)?);
     if alone.is_empty() {
@@ -94,6 +123,23 @@ mod tests {
         );
         assert!(served_alone(&status("ready", 1, 1)).is_empty(), "no group");
         assert!(served_alone(&json!({})).is_empty(), "no cluster");
+    }
+
+    /// **A service's own `refuse` is its refusal**, worded with the way past
+    /// it; an empty or missing one, or one that is not text, refuses nothing.
+    #[test]
+    fn a_service_refuses_for_itself_when_its_status_says_why() {
+        assert_eq!(
+            declined(&json!({"refuse": "music is playing on deck 1"})).as_deref(),
+            Some(
+                "refused: the service says music is playing on deck 1. Wait for it to clear, or \
+                 send `X-Keep-Force: 1` to do it anyway\n"
+            )
+        );
+        assert_eq!(declined(&json!({"refuse": "  "})), None);
+        assert_eq!(declined(&json!({"refuse": null})), None);
+        assert_eq!(declined(&json!({"refuse": true})), None);
+        assert_eq!(declined(&json!({})), None);
     }
 
     #[test]

@@ -1,0 +1,74 @@
+[package]
+name = "zenj"
+version = "0.1.0"
+edition = "2021"
+description = "ZenJ, Zen as DJ (docs/zenj.md): the brain and hands above rekordbox — set plan, next track, transitions on the beat through a virtual MIDI controller, the screens — joined to the cluster as the app `zenj`"
+
+# Its own workspace, beside the repository's: the screens need wgpu 30, whose
+# web-sys the wasm examples' pinned one cannot meet. The cluster crates it
+# joins with are path dependencies, built here with their own workspace's
+# settings. Build and test with `--manifest-path zenj/Cargo.toml`.
+[workspace]
+
+[[bin]]
+name = "zenj"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# rekordbox's master.db is SQLCipher 4: its pages are decrypted here
+# (`rekordbox::sqlcipher`) and the plain copy read with SQLite.
+aes          = "0.8"
+anyhow       = "1"
+arc-swap     = "1.7"
+axum         = { version = "0.7" }
+base64       = "0.22"
+chrono       = { version = "0.4", features = ["clock", "serde"] }
+clap         = { version = "4.2.4", features = ["derive"] }
+# Its membership of the app `zenj`, and keep's proof line.
+cluster      = { path = "../cluster" }
+cluster-dial = { path = "../cluster-dial" }
+# The FLX4's output, captured by WASAPI loopback (§4.4).
+cpal         = "0.15"
+# The screens (§8): MilkDrop scenes, the overlay's text, one window per output.
+glyphon      = "0.12"
+hmac         = "0.12"
+hyper        = { version = "1", features = ["server", "http1"] }
+hyper-util   = { version = "0.1", features = ["server", "server-auto", "http1", "tokio"] }
+lactea       = "0.2.2"
+mcp-server   = { path = "../mcp-server" }
+# The FLX4 observed and the virtual controller driven (§6).
+midir        = "0.11"
+pbkdf2       = "0.12"
+pollster     = "1"
+rand         = "0.9"
+reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rtrb         = "0.4"
+rusqlite     = { version = "0.31", features = ["bundled"] }
+rustfft      = "6"
+serde        = { version = "1.0.171", features = ["derive"] }
+serde_json   = { version = "1.0.99", features = ["preserve_order"] }
+serde_yaml   = "0.9"
+sha2         = "0.10"
+tokio        = { version = "1", features = ["full"] }
+tower        = { version = "0.5", features = ["util"] }
+tracing      = "0.1.37"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url          = "2"
+web          = { path = "../web" }
+wgpu         = "30"
+winit        = "0.30"
+
+[target.'cfg(windows)'.dependencies]
+# rekordbox's live deck state, read from its memory (§4.2).
+windows-sys  = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile     = "3"

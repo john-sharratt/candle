@@ -333,6 +333,9 @@ fn trial(body: &[u8], slots: &[Slot], probe: &dyn Probe) -> Response<Full<Bytes>
     if let Err(e) = mainline(&ask.artifact, probe) {
         return refuse(StatusCode::CONFLICT, e);
     }
+    if let Some(why) = slot.declined() {
+        return refuse(StatusCode::CONFLICT, why.trim().to_string());
+    }
     // Checked and on the board before the answer, so a trial accepted is a
     // trial the state shows — running, then ended.
     let artifact = ask.artifact.display().to_string();

@@ -47,7 +47,8 @@ server:
   icon: /brand/zen.png
 
 # The MCP servers whose tools are served, each at its path on its site, by
-# the name a failure tells the client: zend's tools, then npcd's. zend's
+# the name a failure tells the client: zend's tools, then npcd's, then the
+# DJ's (zenj, docs/zenj.md §13). zend's
 # memory calls go to `memory`, the same server declared only by the members
 # that hold the journal repository, so the gateway sends them only there.
 backends:
@@ -58,3 +59,6 @@ backends:
   - name: bot
     host: bot.tokera.com
     path: /v1/npc/mcp
+  - name: dj
+    host: code.tokera.com
+    path: /v1/zenj/mcp

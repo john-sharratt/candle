@@ -394,7 +394,7 @@ mod tests {
     /// whichever joined first — neither closed 4410 nor sent to upgrade.
     #[test]
     fn a_service_is_admitted_on_any_build() {
-        for app in ["keep", "mcp"] {
+        for app in ["keep", "mcp", "zenj"] {
             let mut a = Admission::new();
             let first = admit(&mut a, hello(app, 1, build(4900, ""), None, NOW)).unwrap();
             assert_eq!(first.floor, None);

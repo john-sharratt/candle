@@ -104,9 +104,9 @@ pub const MEMBERS_EVERY: Duration = Duration::from_secs(5);
 /// How many refused handshakes the status page lists.
 pub const REFUSALS_KEPT: usize = 100;
 
-/// The apps a member may join (§3.1). `keep` and `mcp` are [`SERVICES`]:
-/// listed on the status page, and not replication groups.
-pub const APPS: [&str; 5] = ["zend", "npcd", AGENT_APP, KEEP, MCP];
+/// The apps a member may join (§3.1). `keep`, `mcp` and `zenj` are
+/// [`SERVICES`]: listed on the status page, and not replication groups.
+pub const APPS: [&str; 6] = ["zend", "npcd", AGENT_APP, KEEP, MCP, ZENJ];
 
 /// The agents' app (§11).
 const AGENT_APP: &str = "agent";
@@ -118,10 +118,14 @@ pub const KEEP: &str = "keep";
 /// The MCP aggregator's app (`docs/mcp_app.md`): the `/mcp` route's members.
 pub const MCP: &str = "mcp";
 
+/// The DJ's app (`docs/zenj.md`): the `/v1/zenj` routes' member, on the
+/// machine the decks are cabled to.
+pub const ZENJ: &str = "zenj";
+
 /// The apps keep runs on each machine and releases there itself: each member
 /// is admitted on whatever build it runs, holds no substrate and no model,
 /// and is never certified or rolled out. Their members serve as they join.
-pub const SERVICES: [&str; 2] = [KEEP, MCP];
+pub const SERVICES: [&str; 3] = [KEEP, MCP, ZENJ];
 
 /// Whether `app` is one of the [`SERVICES`].
 pub fn is_service(app: &str) -> bool {

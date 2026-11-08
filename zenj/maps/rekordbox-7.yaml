@@ -1,0 +1,79 @@
+# The virtual controller rekordbox learns (docs/zenj.md §6.1): what ZenJ
+# sends for each control. rekordbox tells devices apart, so these may reuse
+# the FLX4's numbers; each is learned once in MIDI LEARN, against this port,
+# with `zenj learn`, which sends one control's message per key press.
+#
+# Each deck on its own channel (deck 1 on 0 … deck 4 on 3), the mixer and the
+# browser on 6, the sampler on 7. Knobs are 7-bit: MIDI LEARN binds one CC.
+port: ZenJ
+controls:
+  deck1.play:      {channel: 0, note: 0x0B}
+  deck1.cue:       {channel: 0, note: 0x0C}
+  deck1.sync:      {channel: 0, note: 0x58}
+  deck1.loop_in:   {channel: 0, note: 0x10}
+  deck1.loop_out:  {channel: 0, note: 0x11}
+  deck1.auto_loop: {channel: 0, note: 0x14}
+  deck1.fx:        {channel: 0, note: 0x47}
+  deck1.hotcue1:   {channel: 0, note: 0x30}
+  deck1.hotcue2:   {channel: 0, note: 0x31}
+  deck1.hotcue3:   {channel: 0, note: 0x32}
+  deck1.hotcue4:   {channel: 0, note: 0x33}
+  deck1.hotcue5:   {channel: 0, note: 0x34}
+  deck1.hotcue6:   {channel: 0, note: 0x35}
+  deck1.hotcue7:   {channel: 0, note: 0x36}
+  deck1.hotcue8:   {channel: 0, note: 0x37}
+  deck1.fader:     {channel: 0, cc: 0x13}
+  deck1.trim:      {channel: 0, cc: 0x04}
+  deck1.eq_high:   {channel: 0, cc: 0x07}
+  deck1.eq_mid:    {channel: 0, cc: 0x0B}
+  deck1.eq_low:    {channel: 0, cc: 0x0F}
+  deck1.filter:    {channel: 0, cc: 0x17}
+  deck1.tempo:     {channel: 0, cc: 0x00}
+
+  deck2.play:      {channel: 1, note: 0x0B}
+  deck2.cue:       {channel: 1, note: 0x0C}
+  deck2.sync:      {channel: 1, note: 0x58}
+  deck2.loop_in:   {channel: 1, note: 0x10}
+  deck2.loop_out:  {channel: 1, note: 0x11}
+  deck2.auto_loop: {channel: 1, note: 0x14}
+  deck2.fx:        {channel: 1, note: 0x47}
+  deck2.hotcue1:   {channel: 1, note: 0x30}
+  deck2.hotcue2:   {channel: 1, note: 0x31}
+  deck2.hotcue3:   {channel: 1, note: 0x32}
+  deck2.hotcue4:   {channel: 1, note: 0x33}
+  deck2.hotcue5:   {channel: 1, note: 0x34}
+  deck2.hotcue6:   {channel: 1, note: 0x35}
+  deck2.hotcue7:   {channel: 1, note: 0x36}
+  deck2.hotcue8:   {channel: 1, note: 0x37}
+  deck2.fader:     {channel: 1, cc: 0x13}
+  deck2.trim:      {channel: 1, cc: 0x04}
+  deck2.eq_high:   {channel: 1, cc: 0x07}
+  deck2.eq_mid:    {channel: 1, cc: 0x0B}
+  deck2.eq_low:    {channel: 1, cc: 0x0F}
+  deck2.filter:    {channel: 1, cc: 0x17}
+  deck2.tempo:     {channel: 1, cc: 0x00}
+
+  mixer.crossfader: {channel: 6, cc: 0x1F}
+  mixer.fx_level:   {channel: 6, cc: 0x02}
+  mixer.automix:    {channel: 6, note: 0x60}
+  browser.up:       {channel: 6, note: 0x40}
+  browser.down:     {channel: 6, note: 0x41}
+  browser.load1:    {channel: 6, note: 0x46}
+  browser.load2:    {channel: 6, note: 0x47}
+
+  sampler.1:  {channel: 7, note: 0x00}
+  sampler.2:  {channel: 7, note: 0x01}
+  sampler.3:  {channel: 7, note: 0x02}
+  sampler.4:  {channel: 7, note: 0x03}
+  sampler.5:  {channel: 7, note: 0x04}
+  sampler.6:  {channel: 7, note: 0x05}
+  sampler.7:  {channel: 7, note: 0x06}
+  sampler.8:  {channel: 7, note: 0x07}
+  sampler.9:  {channel: 7, note: 0x08}
+  sampler.10: {channel: 7, note: 0x09}
+  sampler.11: {channel: 7, note: 0x0A}
+  sampler.12: {channel: 7, note: 0x0B}
+  sampler.13: {channel: 7, note: 0x0C}
+  sampler.14: {channel: 7, note: 0x0D}
+  sampler.15: {channel: 7, note: 0x0E}
+  sampler.16: {channel: 7, note: 0x0F}

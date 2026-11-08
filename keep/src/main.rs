@@ -88,6 +88,12 @@ struct Config {
     services: Vec<ServiceCfg>,
     #[serde(default)]
     cluster: Option<presence::ClusterJoin>,
+    /// The `host:port` statuses of processes keep does not run whose own
+    /// refusal holds for every service here (`guard::declined`): `zenj`, which
+    /// refuses while music is playing, so nothing on the machine is switched
+    /// under a party.
+    #[serde(default)]
+    guards: Vec<String>,
 }
 
 struct Service {
@@ -108,8 +114,22 @@ struct Slot {
     tx: Sender<Req>,
     /// See [`ServiceCfg::status`].
     status: Option<String>,
+    /// See [`Config::guards`].
+    guards: Arc<[String]>,
     /// See [`Service::trial_log`]: read back for the cluster.
     trial_log: PathBuf,
+}
+
+impl Slot {
+    /// Why switching, restarting or stopping this service is refused by a
+    /// process that says so itself — the service, or one of the machine's
+    /// guards — if one does.
+    fn declined(&self) -> Option<String> {
+        self.status
+            .iter()
+            .chain(self.guards.iter())
+            .find_map(|addr| guard::own_refusal(addr))
+    }
 }
 
 /// What a service's supervisor is asked to do.
@@ -160,6 +180,7 @@ fn main() -> anyhow::Result<()> {
     owner_access::grant_owner()
         .map_err(|e| anyhow::anyhow!("granting the owner its children: {e}"))?;
     let mut slots = Vec::new();
+    let guards: Arc<[String]> = cfg.guards.clone().into();
     for svc in cfg.services {
         let status = svc.status.clone();
         let svc = prepare(&cfg.state, svc)?;
@@ -170,6 +191,7 @@ fn main() -> anyhow::Result<()> {
             stable: svc.stable.clone(),
             tx,
             status,
+            guards: guards.clone(),
             trial_log: svc.trial_log.clone(),
         });
         let name = svc.name.clone();
@@ -200,6 +222,7 @@ impl Clone for Slot {
             stable: self.stable.clone(),
             tx: self.tx.clone(),
             status: self.status.clone(),
+            guards: self.guards.clone(),
             trial_log: self.trial_log.clone(),
         }
     }
@@ -657,7 +680,9 @@ fn guarded(slot: &Slot, forced: bool) -> Option<Answer> {
     if forced {
         return None;
     }
-    let why = guard::refusal(slot.status.as_deref()?)?;
+    let why = slot
+        .declined()
+        .or_else(|| guard::refusal(slot.status.as_deref()?))?;
     Some(Answer {
         status: 409,
         reason: "Conflict",
