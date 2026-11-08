@@ -11,6 +11,7 @@ use cluster::machine::toolchains;
 use zend_vfs::{CommandPolicy, GitSource, Repo, Sandbox, SandboxServer, ORIGIN};
 
 use crate::config::{AgentConfig, SweepConfig};
+use crate::stale_locks;
 
 /// One repository's checkout.
 pub struct Checkout {
@@ -51,7 +52,8 @@ pub struct Checkouts {
 impl Checkouts {
     /// Open each checkout `cfg` names, its sandbox starting what `policy`
     /// allows and logging to the configured jobs folder; each recovered first
-    /// from any job a crash cut short.
+    /// from any job a crash cut short, the git locks such a job left cleared
+    /// ([`stale_locks`]).
     pub fn open(cfg: &AgentConfig, policy: &CommandPolicy) -> anyhow::Result<Checkouts> {
         let allowed: Vec<&str> = policy.programs().collect();
         let toolchains = toolchains(&allowed);
@@ -67,6 +69,23 @@ impl Checkouts {
                 .map(|r| r.fetch_url)
                 .unwrap_or_default();
             let source = GitSource::open(&c.dir).map_err(|e| what(&e))?;
+            // Before the recovery, which runs git there: a job the restart cut
+            // short can have left a lock that refuses every git after it.
+            let swept = stale_locks::clear(&c.dir);
+            for lock in &swept.removed {
+                tracing::warn!(
+                    "checkout `{}`: removed a stale git lock a cut-short job left: {}",
+                    c.name,
+                    lock.display(),
+                );
+            }
+            for lock in &swept.held {
+                tracing::warn!(
+                    "checkout `{}`: left a git lock a running git may hold: {}",
+                    c.name,
+                    lock.display(),
+                );
+            }
             let sandbox = Sandbox::new(repo, policy.clone());
             if let Err(e) = sandbox.recover() {
                 tracing::warn!("checkout `{}`: {e}", c.name);

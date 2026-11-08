@@ -9,6 +9,7 @@
 //! |---|---|
 //! | [`config`] | the agent's file: its checkouts, its job slots, its jobs folder |
 //! | [`checkouts`] | each checkout: its repository, sandbox and origin |
+//! | [`stale_locks`] | the git locks a job cut short by a restart left in a checkout |
 //! | [`wire`] | the job API's bodies |
 //! | [`overlay`] | a run's overlay, its chains named by digest |
 //! | [`chains`] | the chains an agent has been sent, by digest |
@@ -32,6 +33,7 @@ pub mod member;
 pub mod overlay;
 pub mod pusher;
 pub mod routes;
+pub mod stale_locks;
 pub mod sweep;
 pub mod switch;
 pub mod wire;
