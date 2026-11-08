@@ -115,12 +115,14 @@ Settled before the build; a phase that meets one of these does not reopen it.
 | # | Decision |
 |---|---|
 | D1 | **One branch, `zen/memory-and-guides`, from `origin/main`.** Every phase commits and pushes to it. It merges to `main` once, after Phase 8's review, and is rolled out once. |
-| D2 | **Owned conversations see only their owner's groups' journal units; ownerless conversations (ingest, calibration, the summariser) see every group's.** |
+| D2 | **A conversation sees only its person's groups' journal content, on every route into a prompt** (the `guidance` draw, hub files, folder units, derived layers, `persons/`). Its person is the `/mcp` owner, or, for a dialogue from the Zen app or VS Code, the person signed in when it was opened, recorded on the conversation. **Only the ingest and calibration readers, named in the code, see every group.** |
 | D3 | **Episodes leave the memory tree.** A conversation's tool activity is kept in its own journal's folds — so "where the last conversation left off" still works — and is never an entry file, so provenance never ingests it. |
 | D4 | **Maintenance is a mission.** This build includes the drone ↔ zend-task bridge (`mission_templates.md` §7) and the `journal-maintenance` and `guide-maintenance` templates on it. There is no second maintenance mechanism. |
 | D5 | **A task is driven `attended` or `alone`**, defaulting from the client: `alone` for Grok, `attended` otherwise. A drone driving a task is an attended coordinator. |
 | D6 | **No backward compatibility.** Existing episode entry files, stale lines and the old guide text are replaced, not kept beside the new. |
-| D7 | **Simplicity cuts** (from the review of the first draft): no verify task chained by zend after an alone task — the templates carry one; no automatic restart of a lost alone task — it is reported; no store migration for `T:`/`P:` — one resolver; the live path reuses lineage sections; maintenance checks live in `journals check`. |
+| D7 | **Simplicity cuts** (from the review of the first draft): no verify task chained by zend after an alone task — the templates carry one; no automatic restart of a lost alone task — it is reported; the live path reuses lineage sections; maintenance checks live in `journals check`. |
+| D8 | **A drone's zend task runs as Zen's own person**, a service person added for Zen: its tasks, threads and outcomes are its own, it grants nothing, and its held calls go to the authorizers (the Creator, Yen). |
+| D9 | **Thread results are exported into the memory tree** (`memory_backbone.md` §7.3): a thread's notes and its tasks' outcomes are written to memory journals under `threads/` and referenced from the topics they are about. `T:`/`P:` stay the work records; there is no resolver over them. |
 
 ---
 
@@ -385,3 +387,51 @@ Templates, parameters, `work.checks` and the `critical` gate are built
 - **The cluster is not stable yet** (the re-ingest backlog, WhiteWorld's NaN
   fault, KV back pressure). Nothing reaches the cluster before Phase 8, and the
   one rollout brings one guide and journal re-ingest, not one per phase.
+
+---
+
+## 6. Readiness: what the phases must absorb before the build starts
+
+An independent review (2026-11-08) judged §4 **not ready**: the approach holds,
+but several phases were written against an older tree and would leave a worker
+guessing. Decisions D2, D8 and D9 settle its design questions. This list is what
+the rewrite of §4 must clear, re-checked against `origin/main`; the build starts
+when a second review finds none of it open.
+
+- **Phase 0** — questions 0.1–0.3 are answered by the code (tasks nest one level,
+  `zen_tasks.rs:80, 157`; no group filter, `retrieval_scope.rs:61, 273`; note
+  numbers shift, `threads.rs:439-440, 479`). Only 0.4, the backlog count, stays,
+  with its data source named.
+- **Phase 1** — the filter applies in `scope_of` to every route, not the
+  `guidance` draw alone; `persons/<slug>/person.yaml` is its person's only; a
+  line hidden by `expires`/`replaces` leaves the scope too; the dialogue's
+  person is recorded at open (D2).
+- **Phase 2** — the activity record is new: its YAML shape and cap on the
+  conversation journal's `journal.yaml`, its writer, and the summary job reading
+  it (only the master and `people/` carry a digest today, `check.rs:32-43`);
+  conversation journals leave every provenance group; the conversation key moves
+  with the session across restarts and members
+  (`mcp/memory/conversations.rs:10-13, 102-108`); note terms gain `by`; the
+  import tool is named; `journal_check` gains `--against`/`--budget`.
+- **Phase 3** — the recency term is built (`projection.yaml:1048`,
+  `guidance_layer.md:187`): its bullet goes. The resolver goes (D9); the export
+  is specified instead. The live path's cap is stated against
+  `lineage::MAX_CHARS`; the activity record stays out of `here`'s section; which
+  conversations carry a memory `here` is named; memory sections get their own
+  heading. Search pages by an `until` cursor, not `offset`, and maps `kind` and
+  `speaker` onto `T:`/`P:` notes, which carry neither today.
+- **Phase 4** — outcomes extend the settle notes zend already writes
+  (`workers.rs:1573-1628`, a `kind` on `Note`); `mcp::tending` writes the lost
+  state; `get_user_context` reads an `mcp/outcome/<owner>/` index with
+  `last_under` and a count cap, never a scan.
+- **Phase 5** — the served-set test is placed where all three tool lists are
+  visible, or replaced by `Library::unserved` (`guides/src/library.rs:137`); the
+  calibrated zend tool YAMLs (`zend/src/prompts/tools/`) change with their `/mcp`
+  definitions, and their recalibration is counted in Phase 8.
+- **Phase 6** — the Zen service person (D8); the in-process path and its auth
+  from npcd to zend inside motherd; the task acts granted through the routine's
+  `grants`; drone-driven tasks keep `high_risk` holds.
+- **Phase 7** — the library is `battle-mind:missions/<world>/maintenance/`
+  (`world.rs:22-25, 229-236`); how the carrier's task edits the journals
+  checkout is stated; `check --against` allows the episode moves the cleanup
+  pass makes; the report is a drone-task outcome, not an alone one.
