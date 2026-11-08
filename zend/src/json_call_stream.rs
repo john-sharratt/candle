@@ -371,7 +371,10 @@ mod tests {
                 match (all.last_mut(), o) {
                     (
                         Some(JsonOut::Arg { name: a, text: t }),
-                        JsonOut::Arg { name: b, text: more },
+                        JsonOut::Arg {
+                            name: b,
+                            text: more,
+                        },
                     ) if *a == b => t.push_str(&more),
                     (_, o) => all.push(o),
                 }

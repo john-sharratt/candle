@@ -496,7 +496,6 @@ impl PartSplit {
         self.unanswered.push_back(id.clone());
         out.push(close(id, error));
     }
-
 }
 
 /// Where the undecided tail of a value starts: at a `</parameter>` whose
