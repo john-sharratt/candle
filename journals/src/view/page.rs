@@ -103,7 +103,10 @@ mod tests {
             lines[1],
             format!("@zen/topics, the 2 lines before #{}, oldest first:", ids[4])
         );
-        assert!(lines[2].ends_with("n2") && lines[3].ends_with("n3"), "{page}");
+        assert!(
+            lines[2].ends_with("n2") && lines[3].ends_with("n3"),
+            "{page}"
+        );
         assert_eq!(
             lines[4],
             format!("2 older — page on with `after: @zen/topics#{}`.", ids[2])

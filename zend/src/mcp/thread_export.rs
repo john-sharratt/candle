@@ -69,7 +69,10 @@ pub fn thread_path(group: &Slug, thread: &str) -> Result<JournalPath, String> {
 
 /// Whether a write failed only because what it makes is already there.
 fn already(e: &WriteError) -> bool {
-    matches!(e, WriteError::Store(StoreError::Journal(Error::Conflict(_))))
+    matches!(
+        e,
+        WriteError::Store(StoreError::Journal(Error::Conflict(_)))
+    )
 }
 
 /// Open the thread's memory journal, when it is not yet, as zend.
@@ -136,7 +139,13 @@ pub fn spawn_export(
 }
 
 /// Write `label text` on a bound thread's memory journal, as zend.
-pub fn export(memory: &Memory, b: &Bound, thread: &str, label: &str, text: &str) -> Result<(), String> {
+pub fn export(
+    memory: &Memory,
+    b: &Bound,
+    thread: &str,
+    label: &str,
+    text: &str,
+) -> Result<(), String> {
     let group = Slug::parse(&b.group)?;
     let path = thread_path(&group, thread)?;
     ensure(memory, &path, thread)?;
@@ -146,7 +155,10 @@ pub fn export(memory: &Memory, b: &Bound, thread: &str, label: &str, text: &str)
         speaker: None,
         terms: Terms::default(),
     };
-    memory.write(&Actor::Zend, &op).map(|_| ()).map_err(|e| e.to_string())
+    memory
+        .write(&Actor::Zend, &op)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

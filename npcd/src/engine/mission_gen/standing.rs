@@ -401,7 +401,10 @@ mod tests {
                 ("start the journal maintenance task", false),
                 ("see the task through", false),
                 ("land the held branch", true),
-                ("go back to the table in the command room and report it", false),
+                (
+                    "go back to the table in the command room and report it",
+                    false
+                ),
             ]
         );
         let e = Standing::parse("f", &yaml.replace("task_nudge", "task_delete")).unwrap_err();

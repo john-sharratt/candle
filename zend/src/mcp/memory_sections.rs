@@ -159,7 +159,10 @@ mod tests {
     fn two_topics_are_two_sections_by_place() {
         let s = sections(&[
             topic("@zen/topics/candle", &["#a1 note: never push main"]),
-            topic("@zen/topics/dj", &["#b1 note: set at nine", "#b2 note: bring cables"]),
+            topic(
+                "@zen/topics/dj",
+                &["#b1 note: set at nine", "#b2 note: bring cables"],
+            ),
         ]);
         assert_eq!(
             s,
@@ -187,7 +190,10 @@ mod tests {
     /// reseals from its own section on.
     #[test]
     fn a_topic_with_no_lines_keeps_the_others_places() {
-        let before = sections(&[topic("@zen/topics/a", &[]), topic("@zen/topics/b", &["#1 x"])]);
+        let before = sections(&[
+            topic("@zen/topics/a", &[]),
+            topic("@zen/topics/b", &["#1 x"]),
+        ]);
         let after = sections(&[
             topic("@zen/topics/a", &["#1 new"]),
             topic("@zen/topics/b", &["#1 x"]),
@@ -203,7 +209,9 @@ mod tests {
     #[test]
     fn the_cap_drops_the_later_topics_oldest_lines() {
         let long = "x".repeat(MEMORY_MAX_CHARS / 2);
-        let many: Vec<String> = (0..2_000).map(|i| format!("#{i} {}", "y".repeat(20))).collect();
+        let many: Vec<String> = (0..2_000)
+            .map(|i| format!("#{i} {}", "y".repeat(20)))
+            .collect();
         let many_refs: Vec<&str> = many.iter().map(String::as_str).collect();
         let s = sections(&[
             topic("@zen/topics/a", &[long.as_str()]),
@@ -239,8 +247,11 @@ mod tests {
             channel: Channel::Grok,
             admin: false,
         };
-        m.write(&john, &note("The build runs on WhiteWorld.", Terms::default()))
-            .unwrap();
+        m.write(
+            &john,
+            &note("The build runs on WhiteWorld.", Terms::default()),
+        )
+        .unwrap();
         let expired = Terms {
             expires: Some(Stamp::parse("2026-01-01T00:00:00Z").unwrap()),
             ..Terms::default()

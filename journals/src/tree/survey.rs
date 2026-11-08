@@ -205,8 +205,14 @@ mod tests {
         assert_eq!(
             got,
             [
-                format!("@zen/topics#{}: expired at 2026-10-31T00:00:00Z", reminder.id),
-                format!("@zen/topics#{}: says again what #{} says", again.id, first.id),
+                format!(
+                    "@zen/topics#{}: expired at 2026-10-31T00:00:00Z",
+                    reminder.id
+                ),
+                format!(
+                    "@zen/topics#{}: says again what #{} says",
+                    again.id, first.id
+                ),
                 format!(
                     "@zen/topics#{}: its source zend/src/branch_ingest/keys.rs has changed since \
                      it was written",

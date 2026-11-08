@@ -164,9 +164,10 @@ impl Filter {
 
     fn keeps(&self, l: &Line) -> bool {
         self.only.is_none_or(|o| o.keeps(l))
-            && self.speaker.as_ref().is_none_or(|s| {
-                l.speaker.as_ref() == Some(s) || l.account.as_ref() == Some(s)
-            })
+            && self
+                .speaker
+                .as_ref()
+                .is_none_or(|s| l.speaker.as_ref() == Some(s) || l.account.as_ref() == Some(s))
     }
 }
 
@@ -613,9 +614,8 @@ mod tests {
     #[test]
     fn a_filter_keeps_lines_and_pages_newest_first() {
         let t = seeded();
-        let lines = |filter: &Filter, limit| {
-            grep_by(now(), &t, &john(), "permit", None, filter, limit)
-        };
+        let lines =
+            |filter: &Filter, limit| grep_by(now(), &t, &john(), "permit", None, filter, limit);
         let all = lines(&Filter::default(), 50).0;
         let notes = Filter {
             only: Some(Only::Notes),
@@ -623,7 +623,9 @@ mod tests {
         };
         let (every, total) = lines(&notes, 50);
         assert!(!every.is_empty());
-        assert!(every.iter().all(|h| h.found != Found::Journal && h.found != Found::Summary));
+        assert!(every
+            .iter()
+            .all(|h| h.found != Found::Journal && h.found != Found::Summary));
         assert!(every.len() <= all.len());
         let first = lines(&notes, 1).0;
         let after = (first[0].path.clone(), first[0].id.clone().unwrap());
@@ -634,9 +636,17 @@ mod tests {
             },
             50,
         );
-        assert_eq!(first.len() + rest.1, total, "the pages hold every line once");
+        assert_eq!(
+            first.len() + rest.1,
+            total,
+            "the pages hold every line once"
+        );
         assert!(!rest.0.contains(&first[0]));
-        assert_eq!(&every[1..], rest.0.as_slice(), "the next page goes on in order");
+        assert_eq!(
+            &every[1..],
+            rest.0.as_slice(),
+            "the next page goes on in order"
+        );
         let yen = Filter {
             speaker: Some(slug("yen")),
             ..notes
