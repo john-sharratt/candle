@@ -17,7 +17,7 @@ use journals::view::NOT_INSTRUCTIONS;
 use serde_json::{json, Value};
 use zend_tools::tools::journal::address;
 
-use super::fit::clip_lines;
+use super::fit::{clip_lines, MAX_ANSWER};
 use super::mem::PATHS;
 use super::{mem, string, Answer, Ctx, LOADING};
 use crate::mcp::memory::{is_memory_path, Memory};
@@ -218,7 +218,7 @@ fn read_memory(ctx: &Ctx, journal: &str, args: &Value) -> Answer {
     // A page of what came before a line: `after` is the line the page before
     // began with, as its answer names it.
     match args.get("after").and_then(Value::as_str) {
-        None => Answer::ok(open(&m.tree, &path, j, WINDOW, Stamp::now())),
+        None => Answer::ok(open(&m.tree, &path, j, WINDOW, MAX_ANSWER, Stamp::now())),
         Some(after) => {
             let address = match m.find_address(after) {
                 Ok(a) if a.path == path => a,
@@ -234,7 +234,15 @@ fn read_memory(ctx: &Ctx, journal: &str, args: &Value) -> Answer {
                 .get("limit")
                 .and_then(Value::as_u64)
                 .map_or(WINDOW, |n| n as usize);
-            match before(&m.tree, &path, j, &address.id, lines, Stamp::now()) {
+            match before(
+                &m.tree,
+                &path,
+                j,
+                &address.id,
+                lines,
+                MAX_ANSWER,
+                Stamp::now(),
+            ) {
                 Some(page) => Answer::ok(page),
                 None => Answer::error(format!("{address} is no line")),
             }
@@ -307,13 +315,20 @@ fn notes_answer(path: &str, notes: &[Numbered], entry: Option<u64>, first: usize
             lines.join("\n")
         ));
     };
-    match notes.iter().find(|e| e.number == n) {
-        Some(e) => Answer::ok(format!("{path}{}", threads::note_line(e))),
-        None => Answer::error(format!(
+    // Two members numbering a note at once can give two notes one number:
+    // the number reads as each of them, so neither is out of reach.
+    let numbered: Vec<String> = notes
+        .iter()
+        .filter(|e| e.number == n)
+        .map(|e| format!("{path}{}", threads::note_line(e)))
+        .collect();
+    if numbered.is_empty() {
+        return Answer::error(format!(
             "{path} has no entry {n}: it holds {} entries",
             notes.len()
-        )),
+        ));
     }
+    Answer::ok(numbered.join("\n"))
 }
 
 /// A worker's journal as the tool prints it: each entry from `first` on under
@@ -376,6 +391,14 @@ mod tests {
         assert_eq!(
             notes_answer("T:review", &notes, Some(2), 1).text,
             "T:review#2 Decided: parts cite their files"
+        );
+        let mut twice = notes.clone();
+        twice.push(entry(2, "Decided:", "another member's, numbered at once"));
+        assert_eq!(
+            notes_answer("T:review", &twice, Some(2), 1).text,
+            "T:review#2 Decided: parts cite their files\n\
+             T:review#2 Decided: another member's, numbered at once",
+            "a number two members gave reads as both"
         );
         let past = notes_answer("T:review", &notes, Some(3), 1);
         assert!(past.is_error);

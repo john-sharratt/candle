@@ -1,7 +1,9 @@
-//! A call that changed something, kept on its conversation's `journal.yaml`
-//! (`docs/zen_memory_and_guides.md` D3): what the server records after each
-//! such call, in place of an episode line, so a conversation's own journal
-//! says what it did without filling its window or its group's provenance.
+//! Calls that changed something, kept on their conversation's `journal.yaml`
+//! (`docs/zen_memory_and_guides.md` D3): what the server records of such
+//! calls, in place of episode lines, so a conversation's own journal says what
+//! it did without filling its window or its group's provenance. The server
+//! gathers a conversation's calls and writes them together, each at the time
+//! it was made.
 
 use crate::error::{Error, Result};
 use crate::ops::Applied;
@@ -9,16 +11,20 @@ use crate::path::JournalPath;
 use crate::time::Stamp;
 use crate::tree::Tree;
 
-/// Keep `tool`, asked `subject`, on the conversation `path`.
-pub fn record(
-    tree: &mut Tree,
-    path: &JournalPath,
-    tool: &str,
-    subject: &str,
-    now: Stamp,
-) -> Result<Applied> {
-    let tool = tool.trim();
-    if tool.is_empty() {
+/// One call: when it was made, its tool, and what it was asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Call {
+    pub at: Stamp,
+    pub tool: String,
+    pub subject: String,
+}
+
+/// Keep `calls` on the conversation `path`, in their order.
+pub fn record(tree: &mut Tree, path: &JournalPath, calls: &[Call]) -> Result<Applied> {
+    if calls.is_empty() {
+        return Err(Error::invalid("an activity record holds at least one call"));
+    }
+    if calls.iter().any(|c| c.tool.trim().is_empty()) {
         return Err(Error::invalid("a call names its tool"));
     }
     let j = tree.need_mut(path)?;
@@ -32,7 +38,9 @@ pub fn record(
         .meta
         .as_mut()
         .ok_or_else(|| Error::invalid(format!("{path} has no journal.yaml to keep it on")))?;
-    meta.activity.push(now, tool, subject.trim());
+    for c in calls {
+        meta.activity.push(c.at, c.tool.trim(), c.subject.trim());
+    }
     Ok(Applied::touching(
         format!("Activity on {path}"),
         vec![path.clone()],
@@ -73,28 +81,46 @@ mod tests {
         )
         .unwrap();
         let conv = p("conversations/2026-11-08-0308-claude-code");
+        let calls = vec![
+            Call {
+                at: now(),
+                tool: "log_grep".into(),
+                subject: " wave too wide ".into(),
+            },
+            Call {
+                at: now().plus(20),
+                tool: "job_status".into(),
+                subject: "task:x".into(),
+            },
+        ];
         let op = |path: &JournalPath| Op::Activity {
             path: path.clone(),
-            tool: "log_grep".into(),
-            subject: " wave too wide ".into(),
+            calls: calls.clone(),
         };
-        let a = apply(&mut t, &server(), &op(&conv), now()).unwrap();
+        let a = apply(&mut t, &server(), &op(&conv), now().plus(60)).unwrap();
         assert_eq!(a.subject, format!("Activity on {conv}"));
         let j = t.get(&conv).unwrap();
         assert!(j.window.is_empty(), "no line was written");
         let done = &j.meta.as_ref().unwrap().activity.done;
         assert_eq!(
-            (done[0].tool.as_str(), done[0].subject.as_str()),
-            ("log_grep", "wave too wide")
+            done.iter()
+                .map(|d| (d.at, d.tool.as_str(), d.subject.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (now(), "log_grep", "wave too wide"),
+                (now().plus(20), "job_status", "task:x")
+            ],
+            "each call at its own time, not the write's"
         );
         assert!(apply(&mut t, &server(), &op(&p("topics")), now())
             .unwrap_err()
             .to_string()
             .contains("record a conversation's calls there"));
         // Past the permit, the op itself holds the same line.
-        assert!(record(&mut t, &p("topics"), "log_grep", "x", now())
+        assert!(record(&mut t, &p("topics"), &calls)
             .unwrap_err()
             .to_string()
             .contains("no conversation"));
+        assert!(record(&mut t, &conv, &[]).is_err());
     }
 }

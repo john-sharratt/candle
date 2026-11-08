@@ -217,7 +217,13 @@ mod tests {
                     "repo_task_start",
                     "permits: tidy",
                 );
-                a.before.insert("log_grep".into(), 2);
+                a.push(
+                    at("2026-10-30T10:01:00Z"),
+                    "file_edit_and_commit",
+                    "permits, tidy",
+                );
+                a.done[1].id = Some(LineId::parse("2026-10-30-1001-7e3a").unwrap());
+                a.folded.insert("log_grep".into(), 2);
                 a
             },
             summary: Some(Summary {
@@ -265,8 +271,14 @@ mod tests {
                  \x20 speaker: yen\n\
                  \x20 about: [topics/house-extension/permits]\n\
                  activity:\n\
-                 \x20 - {{at: 2026-10-30T10:00:00Z, tool: repo_task_start, subject: \"permits: tidy\"}}\n\
-                 activity_before:\n\
+                 \x20 - at: 2026-10-30T10:00:00Z\n\
+                 \x20   tool: repo_task_start\n\
+                 \x20   subject: \"permits: tidy\"\n\
+                 \x20 - at: 2026-10-30T10:01:00Z\n\
+                 \x20   tool: file_edit_and_commit\n\
+                 \x20   subject: permits, tidy\n\
+                 \x20   id: 2026-10-30-1001-7e3a\n\
+                 activity_folded:\n\
                  \x20 log_grep: 2\n\
                  summary:\n  over: {}\n  built: 2026-10-30T11:02:40Z\n  lines: 12\n  children: 2\n  stale: true\n\
                  \x20 digest: \"Candle: releases go through keep.\"\n  sentences:\n\

@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use serde_yaml::Value;
 
 use crate::error::Problem;
+use crate::line::LineId;
 use crate::time::Stamp;
 use crate::yaml::{item_line, scalar, Fields};
 
@@ -25,6 +26,9 @@ pub struct Done {
     pub tool: String,
     /// What it was asked, cut to [`MAX_SUBJECT`].
     pub subject: String,
+    /// The id of the episode line it was kept as, when one was moved in from
+    /// its entry file: the line's id is kept with it.
+    pub id: Option<LineId>,
 }
 
 /// A conversation's calls.
@@ -33,12 +37,12 @@ pub struct Activity {
     /// The newest [`MAX_DONE`], oldest first.
     pub done: Vec<Done>,
     /// How many calls of each tool were let go past the cap.
-    pub before: BTreeMap<String, u64>,
+    pub folded: BTreeMap<String, u64>,
 }
 
 impl Activity {
     pub fn is_empty(&self) -> bool {
-        self.done.is_empty() && self.before.is_empty()
+        self.done.is_empty() && self.folded.is_empty()
     }
 
     /// Keep a call, letting the oldest go past the cap.
@@ -47,10 +51,11 @@ impl Activity {
             at,
             tool: tool.to_string(),
             subject: subject.chars().take(MAX_SUBJECT).collect(),
+            id: None,
         });
         while self.done.len() > MAX_DONE {
             let gone = self.done.remove(0);
-            *self.before.entry(gone.tool).or_insert(0) += 1;
+            *self.folded.entry(gone.tool).or_insert(0) += 1;
         }
     }
 
@@ -59,22 +64,24 @@ impl Activity {
         self.done.iter().rev().take(n)
     }
 
-    /// Its fields of a `journal.yaml`.
+    /// Its fields of a `journal.yaml`. Each call is a block mapping, a field
+    /// to a line, so a subject is quoted by the rules of a plain value — in a
+    /// flow mapping a comma would end it.
     pub(crate) fn render(&self, out: &mut String) {
         if !self.done.is_empty() {
             out.push_str("activity:\n");
             for d in &self.done {
-                out.push_str(&format!(
-                    "  - {{at: {}, tool: {}, subject: {}}}\n",
-                    d.at,
-                    scalar(&d.tool),
-                    scalar(&d.subject)
-                ));
+                out.push_str(&format!("  - at: {}\n", d.at));
+                out.push_str(&format!("    tool: {}\n", scalar(&d.tool)));
+                out.push_str(&format!("    subject: {}\n", scalar(&d.subject)));
+                if let Some(id) = &d.id {
+                    out.push_str(&format!("    id: {}\n", scalar(id.as_str())));
+                }
             }
         }
-        if !self.before.is_empty() {
-            out.push_str("activity_before:\n");
-            for (tool, n) in &self.before {
+        if !self.folded.is_empty() {
+            out.push_str("activity_folded:\n");
+            for (tool, n) in &self.folded {
                 out.push_str(&format!("  {}: {n}\n", scalar(tool)));
             }
         }
@@ -89,6 +96,7 @@ impl Activity {
                 at: df.parsed("at", Stamp::parse)?,
                 tool: df.str("tool")?,
                 subject: df.opt_str("subject")?.unwrap_or_default(),
+                id: df.opt_parsed("id", LineId::parse)?,
             });
             df.done()?;
         }
@@ -98,19 +106,19 @@ impl Activity {
                 format!("{} calls kept: at most {MAX_DONE}", done.len()),
             ));
         }
-        let mut before = BTreeMap::new();
-        if let Some(Value::Mapping(m)) = f.opt_map("activity_before")? {
+        let mut folded = BTreeMap::new();
+        if let Some(Value::Mapping(m)) = f.opt_map("activity_folded")? {
             for (k, v) in m {
                 let (Some(tool), Some(n)) = (k.as_str(), v.as_u64()) else {
                     return Err(f.problem(
-                        "activity_before",
-                        "`activity_before` counts each tool's calls: `tool: n`",
+                        "activity_folded",
+                        "`activity_folded` counts each tool's calls: `tool: n`",
                     ));
                 };
-                before.insert(tool.to_string(), n);
+                folded.insert(tool.to_string(), n);
             }
         }
-        Ok(Activity { done, before })
+        Ok(Activity { done, folded })
     }
 }
 
@@ -137,7 +145,7 @@ mod tests {
             );
         }
         assert_eq!(a.done.len(), MAX_DONE);
-        assert_eq!(a.before, BTreeMap::from([("log_grep".to_string(), 1)]));
+        assert_eq!(a.folded, BTreeMap::from([("log_grep".to_string(), 1)]));
         assert_eq!(a.newest(1).next().unwrap().at, at("2026-11-08T03:03:20Z"));
     }
 
@@ -154,12 +162,20 @@ mod tests {
             "log_grep",
             "^2026-11-08T0: wave",
         );
-        a.before.insert("service_status".into(), 3);
+        a.push(
+            at("2026-11-08T03:28:00Z"),
+            "log_grep",
+            "repo_task_start, job_status",
+        );
+        a.done[1].id = Some(LineId::parse("2026-11-08-0328-7e3a").unwrap());
+        a.folded.insert("service_status".into(), 3);
         a.render(&mut out);
         assert_eq!(
             out,
-            "activity:\n  - {at: 2026-11-08T03:27:00Z, tool: log_grep, subject: \"^2026-11-08T0: wave\"}\n\
-             activity_before:\n  service_status: 3\n"
+            "activity:\n  - at: 2026-11-08T03:27:00Z\n    tool: log_grep\n    \
+             subject: \"^2026-11-08T0: wave\"\n  - at: 2026-11-08T03:28:00Z\n    \
+             tool: log_grep\n    subject: repo_task_start, job_status\n    \
+             id: 2026-11-08-0328-7e3a\nactivity_folded:\n  service_status: 3\n"
         );
     }
 }

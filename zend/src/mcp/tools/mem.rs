@@ -114,11 +114,28 @@ pub fn read(ctx: &Ctx) -> Result<Mem, String> {
 /// a conversation of their own. A conversation that could not be opened
 /// leaves the call without it: what fails is the write that needs it.
 pub fn open(ctx: &Ctx) -> Result<Mem, String> {
-    let mut m = Mem::of(&ctx.session, &ctx.caller, channel_of(ctx.mcp.client))?;
+    open_for(
+        &ctx.session,
+        &ctx.caller,
+        channel_of(ctx.mcp.client),
+        &ctx.mcp_id,
+    )
+}
+
+/// [`open`] for `caller` through `channel` on the MCP session `mcp_id`,
+/// where no call is in hand: what a conversation's noted calls are written
+/// with, off the request path.
+pub fn open_for(
+    session: &ZendSession,
+    caller: &Caller,
+    channel: Channel,
+    mcp_id: &str,
+) -> Result<Mem, String> {
+    let mut m = Mem::of(session, caller, channel)?;
     if let (Who::Person(person), Some(group)) = (&m.who, &m.group) {
         if writes_in(&m.tree, person, group) {
-            let followed = conversations::followed_by(m.channel, person, group, &ctx.mcp_id);
-            let records = ctx.session.shared_substrate();
+            let followed = conversations::followed_by(m.channel, person, group, mcp_id);
+            let records = session.shared_substrate();
             let records = records.as_ref().map(|r| r as &dyn Records);
             match conversations::open(&m.memory, records, person, group, m.channel, &followed) {
                 Ok(here) => {

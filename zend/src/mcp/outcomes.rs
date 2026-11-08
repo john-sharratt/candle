@@ -3,20 +3,22 @@
 //! is raised in their next conversation, from any client, by
 //! `get_user_context`.
 //!
-//! The newest [`RING`] are kept per owner, each in a slot of its own under
-//! `mcp/outcome/<owner>/`, the next slot named by a count — so a frame reads
-//! at most [`RING`] small records, never a thread's history, and reading marks
+//! Each is kept under `mcp/outcome/<owner>/<at>-<task>` — when it ended, then
+//! a digest of the task's handle, so two members keeping outcomes at once
+//! each keep their own and neither takes the other's place. Past [`RING`] the
+//! oldest are let go as a new one is kept, so a frame reads at most a few more
+//! than [`RING`] small records, never a thread's history, and reading marks
 //! nothing.
 
 use std::cmp::Reverse;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::records::Records;
 
 /// How many outcomes are kept per owner.
-pub const RING: u64 = 10;
+pub const RING: usize = 10;
 
 /// An alone task's end.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,25 +31,27 @@ pub struct Outcome {
     pub text: String,
 }
 
-fn count_key(owner: &str) -> String {
-    format!("mcp/outcome-count/{owner}")
-}
-
 fn prefix(owner: &str) -> String {
     format!("mcp/outcome/{owner}/")
 }
 
-/// Keep `outcome` for `owner`, in place of the oldest past [`RING`].
+/// Where `outcome` is kept: by when it ended, so key order is time order,
+/// then by its task, so no two tasks' outcomes share a key.
+fn key(owner: &str, outcome: &Outcome) -> String {
+    let task = Sha256::digest(format!("{}/{}", outcome.thread, outcome.name).as_bytes());
+    let task: String = task[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}{:016}-{task}", prefix(owner), outcome.at_ms)
+}
+
+/// Keep `outcome` for `owner`, letting the oldest go past [`RING`].
 pub fn keep(records: &dyn Records, owner: &str, outcome: &Outcome) -> anyhow::Result<()> {
-    let n = records
-        .get(&count_key(owner))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    records.put(
-        &format!("{}{:02}", prefix(owner), n % RING),
-        serde_json::to_value(outcome)?,
-    )?;
-    records.put(&count_key(owner), Value::from(n + 1))
+    records.put(&key(owner, outcome), serde_json::to_value(outcome)?)?;
+    let kept = records.under(&prefix(owner));
+    let over = kept.len().saturating_sub(RING);
+    for (old, _) in kept.into_iter().take(over) {
+        records.cease(&old)?;
+    }
+    Ok(())
 }
 
 /// `owner`'s newest `n` outcomes, newest first.
@@ -99,13 +103,34 @@ mod tests {
     #[test]
     fn the_newest_are_kept_past_the_ring() {
         let r = MemRecords::default();
-        for at in 1..=RING + 3 {
+        let last = RING as u64 + 3;
+        for at in 1..=last {
             keep(&r, "o", &outcome(at)).unwrap();
         }
-        assert_eq!(r.count_under("mcp/outcome/o/"), RING as usize);
+        assert_eq!(r.count_under("mcp/outcome/o/"), RING);
         let kept: Vec<u64> = newest(&r, "o", 3).iter().map(|o| o.at_ms).collect();
-        assert_eq!(kept, [RING + 3, RING + 2, RING + 1]);
+        assert_eq!(kept, [last, last - 1, last - 2]);
         assert!(newest(&r, "other", 3).is_empty());
+    }
+
+    /// **Two tasks ending in the same millisecond keep an outcome each**, as
+    /// two members keeping theirs at once do.
+    #[test]
+    fn two_outcomes_at_once_are_both_kept() {
+        let r = MemRecords::default();
+        let mut a = outcome(7);
+        a.name = "a".into();
+        let mut b = outcome(7);
+        b.name = "b".into();
+        keep(&r, "o", &a).unwrap();
+        keep(&r, "o", &b).unwrap();
+        let mut names: Vec<String> = newest(&r, "o", 5).into_iter().map(|o| o.name).collect();
+        names.sort();
+        assert_eq!(names, ["a", "b"]);
+        let k = key("o", &a);
+        assert!(k.starts_with("mcp/outcome/o/0000000000000007-"), "{k}");
+        assert_eq!(k.len(), "mcp/outcome/o/0000000000000007-".len() + 16);
+        assert_ne!(k, key("o", &b));
     }
 
     /// **The block names each task's handle and how it ended**, and is nothing

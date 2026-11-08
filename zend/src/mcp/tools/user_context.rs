@@ -80,11 +80,11 @@ pub fn call(ctx: &Ctx, _args: &Value) -> Answer {
     Answer::ok(text)
 }
 
-/// How many outcomes a frame carries: one, aloud; three, written.
+/// How many outcomes a frame carries: one, aloud; five, written.
 fn outcomes_shown(channel: Channel) -> usize {
     match context::budget(channel) {
         Budget::Voice => 1,
-        Budget::Chat | Budget::Worker => 3,
+        Budget::Chat | Budget::Worker => 5,
     }
 }
 

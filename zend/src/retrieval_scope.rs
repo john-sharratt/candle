@@ -142,7 +142,7 @@ impl RetrievalScope {
     }
 
     /// `conv_id`'s reader: nobody, until the session names the readers.
-    fn reader_of(&self, conv_id: &str) -> Reader {
+    pub(crate) fn reader_of(&self, conv_id: &str) -> Reader {
         self.readers
             .get()
             .map_or_else(Reader::nobody, |r| r.of(conv_id))

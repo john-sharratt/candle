@@ -460,6 +460,9 @@ fn number_of(value: &Value, place: usize) -> u64 {
 /// Add `note` to the thread's journal, numbered one past both the entries it
 /// holds and its newest entry's number — the count takes in a note another
 /// member wrote that replicated in behind the newest; answers that number.
+/// Two members numbering at once, before either's note reaches the other,
+/// give one number to both notes: it names each of them, and the next note
+/// goes past it.
 pub fn add_note(
     records: &dyn Records,
     owner: &str,

@@ -1,14 +1,18 @@
-//! `user_episode_note {tool, summary?}`: record on this conversation's
-//! `journal.yaml` that a tool did something for the user, through this
-//! session's channel (`docs/mcp_user_context.md` §2.3,
+//! `user_episode_note {tool, summary?}`: note that a tool did something for
+//! the user, through this session's channel, for this conversation's
+//! `journal.yaml` (`docs/mcp_user_context.md` §2.3,
 //! `docs/zen_memory_and_guides.md` D3) — its activity, never a line of its
 //! own. The aggregator calls it by name after each call that changed
 //! something; it is in no listing, so no model is offered it — what was done
 //! is kept whether or not the model thought to note it.
+//!
+//! The call only notes it, in memory: [`crate::mcp::noted_calls`] writes a
+//! conversation's calls into its journal at most once a minute, off the
+//! request path, opening the journal first when this is its first.
 
-use journals::actor::Actor;
 use journals::ops::guard::refuse_instructions;
-use journals::ops::Op;
+use journals::ops::Call;
+use journals::time::Stamp;
 use serde_json::Value;
 
 use super::{mem, string, Answer, Ctx};
@@ -34,11 +38,11 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     // aggregator tries a failed record again for minutes, and that will not
     // change in them. A passing failure — the repository still being read —
     // stays an error, and the record is tried again until it lands.
-    let m = match mem::open(ctx) {
+    let m = match mem::read(ctx) {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
     };
-    let (Some(person), Some(path)) = (m.person(), m.here.clone()) else {
+    let (Some(_), Some(path)) = (m.person(), m.here.clone()) else {
         return Answer::ok(format!("Not recorded: {}.", m.why_no_here()));
     };
     // What a call was asked is the model's own words: when they read as an
@@ -47,24 +51,20 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(()) => summary.trim(),
         Err(_) => "(what it was asked reads as an instruction, and is not kept)",
     };
-    let server = Actor::Server {
-        person: person.clone(),
-        channel: m.channel,
-    };
-    match m.memory.write(
-        &server,
-        &Op::Activity {
-            path: path.clone(),
+    ctx.session.mcp().noted().note(
+        &ctx.caller,
+        &ctx.mcp_id,
+        m.channel,
+        Call {
+            at: Stamp::now(),
             tool: tool.to_string(),
             subject: subject.to_string(),
         },
-    ) {
-        Ok(_) => Answer::ok(format!(
-            "Recorded on {path}: {}.",
-            episode_text(tool, subject)
-        )),
-        Err(e) => Answer::error(e),
-    }
+    );
+    Answer::ok(format!(
+        "Recorded on {path}: {}.",
+        episode_text(tool, subject)
+    ))
 }
 
 #[cfg(test)]

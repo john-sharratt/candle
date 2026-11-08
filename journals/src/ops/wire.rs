@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::files::summary::{Cite, Fingerprint, Sentence};
 use crate::files::{AccountKey, Email, Role, Who};
 use crate::line::LineId;
-use crate::ops::{OnTaken, Op, Which};
+use crate::ops::{Call, OnTaken, Op, Which};
 use crate::path::{Address, Below, JournalPath};
 use crate::period::Period;
 use crate::scope::Channel;
@@ -220,11 +220,12 @@ pub fn op_to_wire(op: &Op) -> Value {
             text,
             speaker,
         } => json!({"op": "episode", "path": p(path), "text": text, "speaker": slug(speaker)}),
-        Op::Activity {
-            path,
-            tool,
-            subject,
-        } => json!({"op": "activity", "path": p(path), "tool": tool, "subject": subject}),
+        Op::Activity { path, calls } => json!({
+            "op": "activity", "path": p(path),
+            "calls": calls.iter().map(|c| json!({
+                "at": c.at.to_string(), "tool": c.tool, "subject": c.subject,
+            })).collect::<Vec<_>>(),
+        }),
         Op::Edit { address, text } => {
             json!({"op": "edit", "path": p(&address.path), "id": address.id.as_str(), "text": text})
         }
@@ -351,8 +352,21 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
         },
         "activity" => Op::Activity {
             path: o.path("path")?,
-            tool: o.str("tool")?.to_string(),
-            subject: o.str("subject")?.to_string(),
+            calls: o
+                .0
+                .get("calls")
+                .and_then(Value::as_array)
+                .ok_or_else(|| Error::invalid("`calls` is missing"))?
+                .iter()
+                .map(|c| {
+                    let co = Obj::of(c)?;
+                    Ok(Call {
+                        at: Stamp::parse(co.str("at")?).map_err(Error::Invalid)?,
+                        tool: co.str("tool")?.to_string(),
+                        subject: co.str("subject")?.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
         },
         "edit" => Op::Edit {
             address: address()?,
@@ -527,8 +541,18 @@ mod tests {
             },
             Op::Activity {
                 path: p("conversations/2026-10-31-0712-grok"),
-                tool: "log_grep".into(),
-                subject: "wave \"too\" wide".into(),
+                calls: vec![
+                    Call {
+                        at: Stamp::parse("2026-10-31T07:12:00Z").unwrap(),
+                        tool: "log_grep".into(),
+                        subject: "wave \"too\" wide".into(),
+                    },
+                    Call {
+                        at: Stamp::parse("2026-10-31T07:12:30Z").unwrap(),
+                        tool: "job_status".into(),
+                        subject: "".into(),
+                    },
+                ],
             },
             Op::Edit {
                 address: Address {

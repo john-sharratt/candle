@@ -45,6 +45,7 @@ pub mod lineage;
 pub mod memory;
 pub mod memory_sections;
 pub mod names;
+pub mod noted_calls;
 pub mod npcd_tools;
 pub mod nudges;
 pub mod ops;

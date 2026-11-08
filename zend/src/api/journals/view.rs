@@ -142,7 +142,8 @@ pub fn journal(m: &Mem, path: &JournalPath, j: &Journal, lines: usize, now: Stam
         "archived": archived,
         "closed": j.is_closed(),
         "problems": j.problems.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "text": open(&m.tree, path, j, lines, now),
+        // The HTTP API answers whole: no model's context bounds it.
+        "text": open(&m.tree, path, j, lines, usize::MAX, now),
     })
 }
 
@@ -339,7 +340,7 @@ mod tests {
         assert_eq!(v["framing"], NOT_INSTRUCTIONS);
         assert_eq!(
             v["text"],
-            open(&m.tree, &trip, j, 1, at("2026-10-30T00:00:00Z"))
+            open(&m.tree, &trip, j, 1, usize::MAX, at("2026-10-30T00:00:00Z"))
         );
         let topics = m.path("topics").unwrap();
         let t = journal(

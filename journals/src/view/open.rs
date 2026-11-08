@@ -8,6 +8,7 @@ use crate::terms::shown;
 use crate::time::Stamp;
 use crate::tree::{Journal, Tree};
 use crate::view::index::{index, index_line, refs_lines};
+use crate::view::room::{fitting, taken, CURSOR_ROOM};
 use crate::view::who::{ago, render_line};
 use crate::view::NOT_INSTRUCTIONS;
 
@@ -27,8 +28,16 @@ pub fn focus_line(f: &Focus) -> String {
     format!("Focus: {speaker}; {about}.")
 }
 
-/// `j` at `path` as a reader sees it, its window cut to the newest `lines`.
-pub fn open(tree: &Tree, path: &JournalPath, j: &Journal, lines: usize, now: Stamp) -> String {
+/// `j` at `path` as a reader sees it, its window cut to the newest `lines` —
+/// fewer when they would not fit in an answer of `fit` characters.
+pub fn open(
+    tree: &Tree,
+    path: &JournalPath,
+    j: &Journal,
+    lines: usize,
+    fit: usize,
+    now: Stamp,
+) -> String {
     let mut out = vec![NOT_INSTRUCTIONS.to_string(), index_line(path, j, now)];
     if !j.problems.is_empty() {
         out.push("Its files are broken; until a commit fixes them it is read as nothing and takes no writes:".into());
@@ -67,34 +76,47 @@ pub fn open(tree: &Tree, path: &JournalPath, j: &Journal, lines: usize, now: Sta
         out.extend(refs.into_iter().map(|l| format!("  - {l}")));
     }
     let archived: usize = j.archives.values().map(|lines| lines.len()).sum();
+    let folded = (archived > 0).then(|| {
+        let periods: Vec<String> = j.archives.keys().rev().map(ToString::to_string).collect();
+        format!(
+            "{archived} older line{} folded into {} — grep finds them, and each fold line above says what they held.",
+            if archived == 1 { "" } else { "s" },
+            periods.join(", ")
+        )
+    });
     let window = shown(&j.window, now);
     if window.is_empty() {
         out.push("No lines.".into());
     } else {
-        let count = window.len().min(lines);
+        // Newest first, so what fits in the answer is the newest lines.
+        let newest: Vec<String> = window[window.len() - window.len().min(lines)..]
+            .iter()
+            .rev()
+            .map(|l| format!("  {}", render_line(tree, l)))
+            .collect();
+        let used: usize = out.iter().map(|l| taken(l)).sum::<usize>()
+            + folded.as_deref().map_or(0, taken)
+            + taken(&format!(
+                "Lines (the newest {} of {}):",
+                lines,
+                window.len()
+            ));
+        let count = fitting(&newest, fit.saturating_sub(used + CURSOR_ROOM));
         let head = if count == window.len() {
             format!("Lines ({count}):")
         } else {
             format!("Lines (the newest {count} of {}):", window.len())
         };
         out.push(head);
-        let page = &window[window.len() - count..];
-        out.extend(page.iter().map(|l| format!("  {}", render_line(tree, l))));
+        out.extend(newest[..count].iter().rev().cloned());
         if count < window.len() || !j.archives.is_empty() {
             out.push(format!(
                 "Older lines: page on with `after: {path}#{}`.",
-                page[0].id
+                window[window.len() - count].id
             ));
         }
     }
-    if archived > 0 {
-        let periods: Vec<String> = j.archives.keys().rev().map(ToString::to_string).collect();
-        out.push(format!(
-            "{archived} older line{} folded into {} — grep finds them, and each fold line above says what they held.",
-            if archived == 1 { "" } else { "s" },
-            periods.join(", ")
-        ));
-    }
+    out.extend(folded);
     out.join("\n")
 }
 
@@ -147,7 +169,14 @@ mod tests {
             .unwrap()
             .archives
             .insert(Period::parse("2026-09-01").unwrap(), Arc::new(vec![old]));
-        let text = open(&t, &path, t.get(&path).unwrap(), 2, now().plus(600));
+        let text = open(
+            &t,
+            &path,
+            t.get(&path).unwrap(),
+            2,
+            usize::MAX,
+            now().plus(600),
+        );
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], NOT_INSTRUCTIONS);
         assert_eq!(lines[1], "@zen. 4 lines; no summary yet");
@@ -201,7 +230,7 @@ mod tests {
         .unwrap()
         .created
         .unwrap();
-        let text = |t: &Tree| open(t, &conv, t.get(&conv).unwrap(), 50, now());
+        let text = |t: &Tree| open(t, &conv, t.get(&conv).unwrap(), 50, usize::MAX, now());
         assert!(!text(&t).contains("Focus:"), "none yet");
         apply(
             &mut t,
@@ -230,10 +259,43 @@ mod tests {
             Some(2),
             "bad",
         ));
-        let text = open(&t, &path, t.get(&path).unwrap(), 50, now());
+        let text = open(&t, &path, t.get(&path).unwrap(), 50, usize::MAX, now());
         assert!(
             text.ends_with("  - groups/zen/topics/journal.yaml:2: bad"),
             "{text}"
         );
+    }
+
+    /// **A window that would not fit its answer opens with the newest lines
+    /// that do**, and names where to page on from.
+    #[test]
+    fn a_long_window_opens_with_what_fits_and_its_cursor() {
+        let mut t = zen();
+        let path = p("topics");
+        let ids: Vec<_> = (0..10)
+            .map(|i| {
+                apply(
+                    &mut t,
+                    &john(),
+                    &Op::Note {
+                        path: path.clone(),
+                        text: format!("{i}{}", "x".repeat(1_900)),
+                        speaker: None,
+                        terms: Terms::default(),
+                    },
+                    now().plus(i * 60),
+                )
+                .unwrap()
+                .line
+                .unwrap()
+            })
+            .collect();
+        let text = open(&t, &path, t.get(&path).unwrap(), 50, 8_000, now().plus(600));
+        assert!(text.chars().count() <= 8_000, "{}", text.chars().count());
+        assert!(text.contains("Lines (the newest 3 of 10):"), "{text}");
+        assert!(text.ends_with(&format!(
+            "Older lines: page on with `after: @zen/topics#{}`.",
+            ids[7]
+        )));
     }
 }

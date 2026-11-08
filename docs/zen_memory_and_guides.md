@@ -328,8 +328,10 @@ quoted in Phase 8's report.
 - **Outcomes.** The settle notes `workers.rs:1573-1628` writes gain `kind:
   outcome` on `Note` for an alone task, with where it landed and what waits on
   approval; `mcp::tending` writes the same note for an alone task it finds lost.
-  Each outcome is indexed at `mcp/outcome/<owner>/<at>`, and `get_user_context`
-  reads the newest five with `last_under` — no scan, nothing marked read. The
+  Each outcome is indexed at `mcp/outcome/<owner>/<at>-<task digest>` — so two
+  members keeping one at once each keep theirs — and the oldest past ten are
+  let go as one is kept. `get_user_context` reads that owner's few records and
+  shows the newest five (one, aloud) — no scan, nothing marked read. The
   export (Phase 3) carries outcomes into memory too.
 - **Tests:** the sealed section's raw text per mode; the channel default; an
   outcome note and index entry per settled state, the lost one from `tending`;

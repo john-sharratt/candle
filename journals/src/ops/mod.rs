@@ -29,6 +29,8 @@ pub mod remap;
 pub mod summarize;
 pub mod wire;
 
+pub use activity::Call;
+
 use crate::actor::Actor;
 use crate::error::{Error, Result};
 use crate::files::{AccountKey, Email, Fingerprint, Role, Sentence, Who};
@@ -76,8 +78,7 @@ pub enum Op {
     /// `journal.yaml` rather than as a line of its own (D3).
     Activity {
         path: JournalPath,
-        tool: String,
-        subject: String,
+        calls: Vec<Call>,
     },
     Edit {
         address: Address,
@@ -264,11 +265,7 @@ fn run(
             text,
             speaker,
         } => append::episode(tree, actor, path, speaker.as_ref(), text, now, keep),
-        Op::Activity {
-            path,
-            tool,
-            subject,
-        } => activity::record(tree, path, tool, subject, now),
+        Op::Activity { path, calls } => activity::record(tree, path, calls),
         Op::Edit { address, text } => edit::edit(tree, address, text),
         Op::Forget { path, which } => forget::forget(tree, path, which),
         Op::Accept { address } => accept::accept(tree, address),
