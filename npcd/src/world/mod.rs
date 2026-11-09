@@ -29,11 +29,12 @@ pub mod mapstore;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::slice;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result};
 use npc_map::delta::{Attention, Delta};
-use npc_map::world::World;
+use npc_map::world::{Event, Where, World};
 use npc_map::{MapEdit, MapSet};
 
 use crate::discord::dm::record::Dms;
@@ -87,6 +88,40 @@ pub struct Hosted {
     /// The world's own Discord server and what is mirrored into it (§4.4) —
     /// held as the DMs are.
     mirror: Mutex<Mirror>,
+    /// Whether this world has changed here since its records were last taken
+    /// in ([`Hosted::take_in`]) — set by every method that can change what the
+    /// records hold, and by nothing else. A replica whose world is not local
+    /// and whose records have not changed has nothing to take in.
+    local: AtomicBool,
+    /// How many times records have been taken in.
+    taken_in: AtomicU64,
+}
+
+/// A world's halves while its records are taken in ([`Hosted::take_in`]):
+/// what they are put into, through accessors that leave the world not local.
+pub struct TakeIn<'a> {
+    hosted: &'a Hosted,
+}
+
+impl TakeIn<'_> {
+    /// The world and its sim, under one hold of the lock.
+    pub fn both<T>(&self, f: impl FnOnce(&mut World, &mut Sim) -> T) -> T {
+        let mut state = self.hosted.state();
+        let State { world, sim, .. } = &mut *state;
+        f(world, sim)
+    }
+
+    pub fn dms<T>(&self, f: impl FnOnce(&mut Dms) -> T) -> T {
+        f(&mut self.hosted.dms.lock().expect("dms lock"))
+    }
+
+    pub fn servers<T>(&self, f: impl FnOnce(&mut Servers) -> T) -> T {
+        f(&mut self.hosted.servers.lock().expect("servers lock"))
+    }
+
+    pub fn mirror<T>(&self, f: impl FnOnce(&mut Mirror) -> T) -> T {
+        f(&mut self.hosted.mirror.lock().expect("mirror lock"))
+    }
 }
 
 struct State {
@@ -168,6 +203,8 @@ impl Hosted {
             dms: Mutex::new(Dms::default()),
             servers: Mutex::new(Servers::default()),
             mirror: Mutex::new(Mirror::default()),
+            local: AtomicBool::new(true),
+            taken_in: AtomicU64::new(0),
         })
     }
 
@@ -201,6 +238,8 @@ impl Hosted {
             dms: Mutex::new(Dms::default()),
             servers: Mutex::new(Servers::default()),
             mirror: Mutex::new(Mirror::default()),
+            local: AtomicBool::new(true),
+            taken_in: AtomicU64::new(0),
         })
     }
 
@@ -233,6 +272,8 @@ impl Hosted {
             dms: Mutex::new(Dms::default()),
             servers: Mutex::new(Servers::default()),
             mirror: Mutex::new(Mirror::default()),
+            local: AtomicBool::new(true),
+            taken_in: AtomicU64::new(0),
         }
     }
 
@@ -287,25 +328,25 @@ impl Hosted {
     /// — comes through here, so there is no path that reads the world without
     /// holding it still.
     pub fn with<T>(&self, f: impl FnOnce(&mut World) -> T) -> T {
-        let mut state = self.state.lock().expect("world lock");
+        let mut state = self.changing();
         f(&mut state.world)
     }
 
     /// Look at the world without changing it.
     pub fn read<T>(&self, f: impl FnOnce(&World) -> T) -> T {
-        let state = self.state.lock().expect("world lock");
+        let state = self.state();
         f(&state.world)
     }
 
     /// Change what the world holds — packs, machines, ground, the tower.
     pub fn with_sim<T>(&self, f: impl FnOnce(&mut Sim) -> T) -> T {
-        let mut state = self.state.lock().expect("world lock");
+        let mut state = self.changing();
         f(&mut state.sim)
     }
 
     /// Read what the world holds.
     pub fn sim<T>(&self, f: impl FnOnce(&Sim) -> T) -> T {
-        let state = self.state.lock().expect("world lock");
+        let state = self.state();
         f(&state.sim)
     }
 
@@ -316,7 +357,9 @@ impl Hosted {
 
     /// Change the DMs this world's bots hold.
     pub fn with_dms<T>(&self, f: impl FnOnce(&mut Dms) -> T) -> T {
-        f(&mut self.dms.lock().expect("dms lock"))
+        let mut dms = self.dms.lock().expect("dms lock");
+        self.touch();
+        f(&mut dms)
     }
 
     /// Read the servers this world's bots are in, and their channels.
@@ -326,7 +369,9 @@ impl Hosted {
 
     /// Change the servers this world's bots are in, and their channels.
     pub fn with_servers<T>(&self, f: impl FnOnce(&mut Servers) -> T) -> T {
-        f(&mut self.servers.lock().expect("servers lock"))
+        let mut servers = self.servers.lock().expect("servers lock");
+        self.touch();
+        f(&mut servers)
     }
 
     /// Read the world's Discord server and what is mirrored into it.
@@ -336,7 +381,9 @@ impl Hosted {
 
     /// Change the world's Discord server and what is mirrored into it.
     pub fn with_mirror<T>(&self, f: impl FnOnce(&mut Mirror) -> T) -> T {
-        f(&mut self.mirror.lock().expect("mirror lock"))
+        let mut mirror = self.mirror.lock().expect("mirror lock");
+        self.touch();
+        f(&mut mirror)
     }
 
     /// Both halves at once, under one acquisition.
@@ -345,9 +392,80 @@ impl Hosted {
     /// and writes what it now carries, and taking the lock twice would let the
     /// world move between the two.
     pub fn with_both<T>(&self, f: impl FnOnce(&mut World, &mut Sim) -> T) -> T {
-        let mut state = self.state.lock().expect("world lock");
+        let mut state = self.changing();
         let State { world, sim, .. } = &mut *state;
         f(world, sim)
+    }
+
+    /// Read both halves at once, under one acquisition.
+    pub fn read_both<T>(&self, f: impl FnOnce(&World, &Sim) -> T) -> T {
+        let state = self.state();
+        f(&state.world, &state.sim)
+    }
+
+    /// Take records in: the world is marked not local **before** the halves
+    /// are handed over, so a change racing the take-in marks it local again
+    /// and the next follow takes the records in once more.
+    pub fn take_in(&self) -> TakeIn<'_> {
+        self.local.store(false, Ordering::SeqCst);
+        self.taken_in.fetch_add(1, Ordering::Relaxed);
+        TakeIn { hosted: self }
+    }
+
+    /// Whether the world has changed here since its records were last taken
+    /// in — what a replica's follow beat asks before taking in records that
+    /// read as they did.
+    pub fn is_local(&self) -> bool {
+        self.local.load(Ordering::SeqCst)
+    }
+
+    /// How many times this world's records have been taken in.
+    pub fn times_taken_in(&self) -> u64 {
+        self.taken_in.load(Ordering::Relaxed)
+    }
+
+    /// Take the world's events from its authority into the log — what a
+    /// pulse carries. The log is not in the records, so the world stays as
+    /// local as it was.
+    pub fn witness(&self, events: impl IntoIterator<Item = Event>) {
+        self.state().world.witness(events);
+    }
+
+    /// Mark `body` as deciding where it stands, with whom — see
+    /// [`World::begin_decision`]. Not in the records.
+    pub fn begin_decision(&self, body: &str) {
+        self.state().world.begin_decision(body);
+    }
+
+    /// The deciding `body` has decided — see [`World::end_decision`].
+    pub fn end_decision(&self, body: &str) {
+        self.state().world.end_decision(body);
+    }
+
+    /// A decision begun on another member, put back here — see
+    /// [`World::restore_decision`].
+    pub fn restore_decision(&self, body: &str, at: Where, company: Vec<String>) {
+        self.state().world.restore_decision(body, at, company);
+    }
+
+    /// The world's lock.
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().expect("world lock")
+    }
+
+    /// The world's lock, for a change to what its records hold.
+    fn changing(&self) -> MutexGuard<'_, State> {
+        let state = self.state();
+        self.touch();
+        state
+    }
+
+    /// Mark the world changed here — always under the lock of the half being
+    /// changed. A take-in clears the flag before it takes that lock, so a
+    /// change behind it marks the world local again, and one ahead of it is
+    /// overwritten by the records the take-in puts there.
+    fn touch(&self) {
+        self.local.store(true, Ordering::SeqCst);
     }
 
     /// The folder this world's map was loaded from, when it was loaded from
@@ -484,8 +602,7 @@ impl Hosted {
     /// Returns how many bodies moved. Nobody walking is the common case and
     /// costs a lock and a scan of the actor map.
     pub fn tick(&self) -> usize {
-        let mut state = self.state.lock().expect("world lock");
-        state.world.tick()
+        self.changing().world.tick()
     }
 
     /// Let the building have its say in every room somebody is standing in.
@@ -493,7 +610,7 @@ impl Hosted {
     /// Returns how many rooms stirred, which is nearly always none — each room
     /// waits minutes between looks, and this runs twice a second.
     pub fn stir(&self) -> usize {
-        let mut state = self.state.lock().expect("world lock");
+        let mut state = self.changing();
         let State {
             world, sim, rooms, ..
         } = &mut *state;
@@ -503,7 +620,7 @@ impl Hosted {
     /// Let the tower have the time since the last beat, and tell the crew what
     /// that did to it. Returns how many lines were said.
     pub fn watch_tower(&self) -> usize {
-        let mut state = self.state.lock().expect("world lock");
+        let mut state = self.changing();
         let State {
             world, sim, watch, ..
         } = &mut *state;

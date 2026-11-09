@@ -66,9 +66,7 @@ impl Runtime {
         };
         match p.kind.as_str() {
             EVENTS => match pulse::decode(&p.body) {
-                Ok(events) => {
-                    hosted.with(|w| w.witness(events));
-                }
+                Ok(events) => hosted.witness(events),
                 Err(e) => tracing::warn!("world `{}`: a pulse would not decode: {e}", p.world),
             },
             TOLD => match told::decode(&p.body) {

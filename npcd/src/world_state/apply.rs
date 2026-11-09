@@ -19,7 +19,7 @@ use npc_map::world::{Where, World};
 use serde_json::Value;
 
 use super::keys::unescape;
-use super::snapshot::{Records, SIM, SIM_MAPS};
+use super::snapshot::{Records, SIM, SIM_FACETS, SIM_MAPS};
 use super::split::{join, META};
 use crate::engine::build::replay::replay;
 use crate::sim::Sim;
@@ -47,7 +47,7 @@ pub fn sim_of(records: &Records) -> Option<Sim> {
     if !sim.contains_key(META) {
         return None;
     }
-    match serde_json::from_value::<Sim>(join(&sim, SIM_MAPS)) {
+    match serde_json::from_value::<Sim>(join(&sim, SIM_MAPS, SIM_FACETS)) {
         Ok(s) => Some(s),
         Err(e) => {
             tracing::error!("a world's state records would not decode: {e}");
@@ -141,9 +141,13 @@ fn lift_of(v: &Value) -> LiftState {
 /// Put `records` into `hosted`, under one hold of its lock — and its bots'
 /// DMs, servers and channels, and its own Discord server and what is
 /// mirrored there (`docs/npcd_discord.md` §4.2), which are not under it.
+///
+/// Through [`Hosted::take_in`], so the world is not local afterwards unless
+/// something changed it while the records went in.
 pub fn apply(hosted: &Hosted, records: &Records) {
     let sim = sim_of(records);
-    hosted.with_both(|w, s| {
+    let into = hosted.take_in();
+    into.both(|w, s| {
         // The state first, and what the world's builders made laid over the map
         // from it (`docs/zen_moon_mind.md` §14) — so a body the records place in
         // a built room finds the room there.
@@ -153,9 +157,9 @@ pub fn apply(hosted: &Hosted, records: &Records) {
         replay(w, &s.built.unlaid());
         apply_world(w, records);
     });
-    hosted.with_dms(|dms| dms.take_in(records));
-    hosted.with_servers(|servers| servers.take_in(records));
-    hosted.with_mirror(|mirror| mirror.take_in(records));
+    into.dms(|dms| dms.take_in(records));
+    into.servers(|servers| servers.take_in(records));
+    into.mirror(|mirror| mirror.take_in(records));
 }
 
 #[cfg(test)]
@@ -167,6 +171,7 @@ mod tests {
     use super::*;
     use crate::discord::dm::record::Dm;
     use crate::discord::server::record::{Channel, Server};
+    use crate::engine::mission_gen::round::parse;
     use crate::sim::seed;
     use crate::world_state::records_of;
 
@@ -360,6 +365,63 @@ mod tests {
                 name: "zenworld".into()
             })
         );
+    }
+
+    /// **The round is the mind's, and outlives a take-in**: a world given a
+    /// round from its mind keeps it when records holding a Sim are applied.
+    #[test]
+    fn the_round_survives_an_apply() {
+        let source = vault();
+        let records = records_of(&source);
+        assert!(sim_of(&records).is_some());
+
+        let replica = vault();
+        let round = parse(
+            "missions/vault/round.yaml",
+            "round:\n  - id: watch-earth\n    brief: Watch Earth.\n    steps:\n      - go to the watch room\n",
+        )
+        .unwrap();
+        replica.with_sim(|s| s.missions.set_round(round));
+        apply(&replica, &records);
+        let ids: Vec<String> = replica.sim(|s| {
+            s.missions
+                .round_items()
+                .iter()
+                .map(|i| i.id.clone())
+                .collect()
+        });
+        assert_eq!(ids, ["watch-earth"]);
+    }
+
+    /// **A take-in leaves the world not local; a change marks it local.**
+    /// Reads, decisions and the witnessed log are not in the records and
+    /// leave it as it was.
+    #[test]
+    fn a_take_in_leaves_the_world_not_local() {
+        let source = vault();
+        source.with(|w| w.enter("a", "A", at("green-room")).unwrap());
+        let records = records_of(&source);
+        let events = source.read(|w| w.log().to_vec());
+
+        let replica = vault();
+        replica.with(|w| w.enter("a", "A", at("band-one")).unwrap());
+        assert!(replica.is_local(), "a world starts local");
+        apply(&replica, &records);
+        assert!(!replica.is_local());
+        assert_eq!(replica.times_taken_in(), 1);
+
+        replica.witness(events);
+        replica.begin_decision("a");
+        replica.end_decision("a");
+        let _ = replica.read_both(|w, s| (w.actor("a").is_some(), s.table_open));
+        let _ = replica.sweep();
+        assert!(!replica.is_local(), "nothing the records hold changed");
+
+        replica.with_dms(|_| ());
+        assert!(replica.is_local());
+        apply(&replica, &records);
+        replica.with_sim(|_| ());
+        assert!(replica.is_local());
     }
 
     /// A body not in the world yet keeps its place for when it is embodied;

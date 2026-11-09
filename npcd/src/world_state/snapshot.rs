@@ -6,7 +6,8 @@
 //! | each body | `body/<body>`: its place, the station it holds, and the journey it is on |
 //! | the lift car | `lift`: its floor, doors and stops, who is aboard and who is waiting for it, each with the floor it is bound for |
 //! | each entry of the world's entity maps — a mission, an operation, a body's working set, a pack, a device, a thread, a posting… | `sim/<map path>/<key>` ([`SIM_MAPS`]) |
-//! | everything else the world holds — the command table, the tower, the roster, the ledger's lists | `sim/meta` |
+//! | the tower's clock, and the contact closing on it — each changing every beat | `sim/tower/clock`, `sim/tower/contact` ([`SIM_FACETS`]) |
+//! | everything else the world holds — the command table, the rest of the tower, the roster, the ledger's lists | `sim/meta` |
 //!
 //! A body on its way between rooms is written at the end of each leg with the
 //! rest of its way: a member that runs its character without running the
@@ -57,6 +58,11 @@ pub const SIM_MAPS: &[&str] = &[
     "threads/threads",
     "postings/postings",
 ];
+
+/// The paths in a [`Sim`]'s JSON of the fields that change every beat while
+/// the rest of their object does not: each is a record of its own
+/// (`sim/<path>`), so the meta record is not rewritten for them.
+pub const SIM_FACETS: &[&str] = &["tower/clock", "tower/contact"];
 
 /// A world's state: every entity record, by its name under the world.
 pub type Records = BTreeMap<String, Value>;
@@ -146,7 +152,7 @@ pub fn sim_value(s: &Sim) -> Option<Value> {
 
 /// [`sim_value`]'s JSON split into one record per entity, outside the lock.
 pub fn sim_records_of(value: Value) -> Records {
-    split(value, SIM_MAPS)
+    split(value, SIM_MAPS, SIM_FACETS)
         .into_iter()
         .map(|(name, v)| (format!("{SIM}{name}"), v))
         .collect()
@@ -154,9 +160,15 @@ pub fn sim_records_of(value: Value) -> Records {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use npc_map::world::Where;
+    use std::time::Duration;
 
+    use npc_map::world::{Where, World};
+    use npc_map::MapSet;
+
+    use super::super::apply::sim_of;
+    use super::super::diff::{diff, Changes};
     use super::*;
+    use crate::engine::watch::Watch;
     use crate::sim::seed;
     use crate::world::Hosted;
 
@@ -224,5 +236,79 @@ pub(super) mod tests {
         );
         assert!(records.contains_key("sim/packs/m1"), "{:?}", records.keys());
         assert!(records.keys().all(|k| k.starts_with(SIM)));
+    }
+
+    fn shipped() -> MapSet {
+        MapSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"))
+            .expect("the shipped maps must load")
+    }
+
+    /// **The tower's clock and contact are records of their own**: the
+    /// battle-cities seed splits into its meta, holding the tower with
+    /// neither, the two facets, and its map records — and joins back into
+    /// the seed. The vault, with no tower, has no tower records.
+    #[test]
+    fn the_tower_s_clock_and_contact_are_records_of_their_own() {
+        let map = shipped();
+        let seed = seed::battle_cities(Some(&map));
+        let records = sim_records(&seed);
+        let tower = &records["sim/meta"]["tower"];
+        assert!(tower.is_object(), "{tower}");
+        assert!(tower.get("clock").is_none() && tower.get("contact").is_none());
+        assert_eq!(
+            records.get("sim/tower/clock"),
+            Some(&json!({"carry": 0, "tap_carry": 0, "quiet_ms": 0, "sightings": 0}))
+        );
+        assert_eq!(records.get("sim/tower/contact"), Some(&Value::Null));
+        let tower_records: Vec<&str> = records
+            .keys()
+            .filter(|k| k.starts_with("sim/tower/"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(tower_records, ["sim/tower/clock", "sim/tower/contact"]);
+        let back = sim_of(&records).expect("the seed decodes");
+        assert_eq!(sim_records(&back), records);
+
+        let vault = sim_records(&seed::vault(Some(&map)));
+        assert!(vault.keys().all(|k| !k.starts_with("sim/tower/")));
+    }
+
+    /// **A meta that still holds the tower's clock, with no clock record,
+    /// decodes with that clock** — what a build writing the tower whole
+    /// leaves behind.
+    #[test]
+    fn a_meta_holding_the_clock_decodes_with_it() {
+        let map = shipped();
+        let mut records = sim_records(&seed::battle_cities(Some(&map)));
+        records.remove("sim/tower/clock");
+        records.remove("sim/tower/contact");
+        let clock = json!({"carry": 7, "tap_carry": 1, "quiet_ms": 30, "sightings": 2});
+        records.get_mut("sim/meta").unwrap()["tower"]["clock"] = clock.clone();
+        let decoded = sim_of(&records).expect("decodes");
+        assert_eq!(sim_records(&decoded)["sim/tower/clock"], clock);
+    }
+
+    /// **A beat of the tower changes only its clock's record**: with a body
+    /// in the foundry and no contact, half a second puts exactly
+    /// `sim/tower/clock`, and nothing in meta churns.
+    #[test]
+    fn a_tower_beat_writes_only_its_clock() {
+        let map = shipped();
+        let mut sim = seed::battle_cities(Some(&map));
+        let mut w = World::new(map);
+        w.enter("c1", "Vael", Where::new("tower-redoubt", "foundry"))
+            .unwrap();
+        let before = sim_records(&sim);
+        Watch::new().watch_at(&mut w, &mut sim, Duration::from_millis(500));
+        assert_eq!(
+            diff(&before, &sim_records(&sim)),
+            Changes {
+                put: vec![(
+                    "sim/tower/clock".into(),
+                    json!({"carry": 10000, "tap_carry": 0, "quiet_ms": 500, "sightings": 0})
+                )],
+                ceased: vec![],
+            }
+        );
     }
 }

@@ -976,14 +976,15 @@ impl Missions {
         &self.authorizers
     }
 
-    /// Take `from`'s workflows and routines in place of these: they are the
-    /// mind's, not the world's, and a world taken in from elsewhere keeps the
-    /// ones this machine loaded.
+    /// Take `from`'s workflows, routines, authorizers and round in place of
+    /// these: they are the mind's, not the world's, and a world taken in from
+    /// elsewhere keeps the ones this machine loaded.
     pub fn adopt_workflows(&mut self, from: &mut Missions) {
         self.operations.adopt_workflows(&mut from.operations);
         self.routines = std::mem::take(&mut from.routines);
         self.draw = from.draw;
         self.authorizers = std::mem::take(&mut from.authorizers);
+        self.round_items = std::mem::take(&mut from.round_items);
     }
 
     /// Call off every operation not yet over, for `why` — what a world that

@@ -272,7 +272,7 @@ pub fn push_one(
     if delta.is_empty() {
         return false;
     }
-    let events = hosted.with_both(|w, s| carried(w, s, &delta));
+    let events = hosted.read_both(|w, s| carried(w, s, &delta));
     let at_ms = time(npc_id);
     for Perceived { kind, salience } in events {
         sched.deliver(npc_id, at_ms, salience, kind);
@@ -317,7 +317,7 @@ fn push_minds(
         if !(reach.here)(npc_id) {
             continue;
         }
-        let events = hosted.with_both(|w, s| carried(w, s, delta));
+        let events = hosted.read_both(|w, s| carried(w, s, delta));
         if events.is_empty() {
             continue;
         }

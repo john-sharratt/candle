@@ -125,12 +125,12 @@ impl Runtime {
                 let decided = decided.and_then(|d| Some((Where::parse(&d.at)?, d.company)));
                 let body = self.body_of(npc);
                 if let (Some((hosted, body)), Some((at, company))) = (&body, decided) {
-                    hosted.with(|w| w.restore_decision(body, at, company));
+                    hosted.restore_decision(body, at, company);
                 }
                 let pinned = pinned_at.as_deref().and_then(Where::parse);
                 let done = self.perform_here(npc, &act, pinned.as_ref()).await;
                 if let Some((hosted, body)) = &body {
-                    hosted.with(|w| w.end_decision(body));
+                    hosted.end_decision(body);
                 }
                 let r = done.recorded;
                 OpReply::Performed {

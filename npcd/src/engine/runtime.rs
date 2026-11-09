@@ -1625,7 +1625,7 @@ impl Runtime {
             commit: url_of("bench_commit"),
         };
         let (merge_status, merge_publish) = (url_of("merge_status"), url_of("merge_publish"));
-        hosted.with_both(|w, s| {
+        hosted.read_both(|w, s| {
             // Riding the lift, there is nothing to do but arrive: told the way
             // from the landing it is still standing on, a rider tried to call
             // the car it was already in.
@@ -2322,7 +2322,7 @@ impl Runtime {
     /// [`npc_map::world::World::begin_decision`].
     pub fn begin_decision(&self, npc_id: u64) {
         if let Some((hosted, body)) = self.body_of(npc_id) {
-            hosted.with(|w| w.begin_decision(&body));
+            hosted.begin_decision(&body);
         }
     }
 
@@ -2330,7 +2330,7 @@ impl Runtime {
     /// is. See [`npc_map::world::World::end_decision`].
     pub fn end_decision(&self, npc_id: u64) {
         if let Some((hosted, body)) = self.body_of(npc_id) {
-            hosted.with(|w| w.end_decision(&body));
+            hosted.end_decision(&body);
         }
     }
 

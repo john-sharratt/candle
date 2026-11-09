@@ -213,8 +213,16 @@ impl Runtime {
             let version = shared.custom_objects_version();
             if self.standing.followed(world) != Some(version) {
                 let records = store::read(&shared, world);
-                apply(hosted, &records);
-                self.standing.set_written(world, Written::of(records));
+                // **An unchanged world is not taken in again.** The version is
+                // substrate-wide, so most moves of it are some other object's
+                // write; with nothing changed here and the records as the last
+                // take-in had them, applying them would put back what is there.
+                let unchanged =
+                    !hosted.is_local() && self.standing.written(world).records == records;
+                if !unchanged {
+                    apply(hosted, &records);
+                    self.standing.set_written(world, Written::of(records));
+                }
                 self.standing.set_followed(world, version);
             }
         }
@@ -280,6 +288,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::discord::dm::record::Dm;
     use crate::mind::Mind;
     use crate::world_state::{records_of, sim_records, Records};
 
@@ -389,6 +398,126 @@ mod tests {
             "the former is retired"
         );
         assert_eq!(rt.standing.renamed_written(WORLD), None, "once");
+    }
+
+    /// An authority with `m1` standing in the green room, beaten once so its
+    /// records are written; and a second daemon on the same substrate
+    /// following the same world, restored from them.
+    fn authority_and_replica(
+        dir: &TempDir,
+    ) -> (
+        Arc<Runtime>,
+        Arc<Hosted>,
+        Arc<Runtime>,
+        Arc<Hosted>,
+        SharedSubstrate,
+    ) {
+        let (rt, s) = daemon(dir);
+        let world = rt.host(WORLD, Path::new(ROOMS)).unwrap();
+        rt.hold_world(WORLD, true);
+        world.with(|w| w.enter("m1", "Maker-01", at("green-room")).unwrap());
+        rt.beat(&world);
+
+        let follower = Runtime::new(Mind::new(None), dir.path()).unwrap();
+        follower.set_substrate(s.clone());
+        let hosted = follower.host(WORLD, Path::new(ROOMS)).unwrap();
+        follower.hold_world(WORLD, true);
+        hosted.with(|w| w.enter("m1", "Maker-01", at("band-one")).unwrap());
+        follower.restore(&hosted);
+        follower.standing.set_role(WORLD, Role::Replica, now_ms());
+        (rt, world, follower, hosted, s)
+    }
+
+    /// A custom object written that is no part of `WORLD`, moving the
+    /// substrate-wide version.
+    fn unrelated_write(s: &SharedSubstrate, n: u64) {
+        let mut records = Records::new();
+        records.insert("n".into(), serde_json::json!(n));
+        store::write(s, "elsewhere", diff(&Records::new(), &records), n).unwrap();
+    }
+
+    /// **A replica takes in nothing for another object's write.** Once its
+    /// world is taken in and not changed here, a version moved by a write
+    /// that is no part of it leaves the world as it is — and the follow is
+    /// still at the new version.
+    #[tokio::test]
+    async fn an_unrelated_write_takes_nothing_in() {
+        let dir = TempDir::new().unwrap();
+        let (_rt, _world, follower, hosted, s) = authority_and_replica(&dir);
+        unrelated_write(&s, 1);
+        follower.beat(&hosted);
+        assert!(!hosted.is_local(), "a follow beat changes nothing here");
+        let taken = hosted.times_taken_in();
+
+        unrelated_write(&s, 2);
+        follower.beat(&hosted);
+        assert_eq!(hosted.times_taken_in(), taken, "nothing taken in");
+        assert_eq!(
+            follower.standing.followed(WORLD),
+            Some(s.custom_objects_version())
+        );
+        assert_eq!(hosted.place_of("m1"), "vault-casting/green-room");
+    }
+
+    /// **A change made here is put right by the next follow**: a body moved
+    /// locally stands where its record says again, and a DM put on the
+    /// replica is gone — though the records themselves did not change.
+    #[tokio::test]
+    async fn a_local_change_is_taken_back_by_the_next_follow() {
+        let dir = TempDir::new().unwrap();
+        let (_rt, _world, follower, hosted, s) = authority_and_replica(&dir);
+        unrelated_write(&s, 1);
+        follower.beat(&hosted);
+
+        hosted.with(|w| w.place("m1", at("band-one")).unwrap());
+        assert_eq!(hosted.place_of("m1"), "vault-casting/band-one");
+        assert!(hosted.is_local());
+        unrelated_write(&s, 2);
+        follower.beat(&hosted);
+        assert_eq!(hosted.place_of("m1"), "vault-casting/green-room");
+
+        let dm = Dm {
+            channel_id: 31,
+            user_id: 77,
+            mirrored_through: 4,
+            last_seen_discord: 900,
+        };
+        hosted.with_dms(|d| d.put(42, "0a1b", dm));
+        unrelated_write(&s, 3);
+        follower.beat(&hosted);
+        assert_eq!(hosted.dms(|d| d.of(42)), []);
+    }
+
+    /// **A pulse and perception leave a replica's world not local**: the log
+    /// a pulse is witnessed into, and the sweep a follow beat pushes, are not
+    /// in the records.
+    #[tokio::test]
+    async fn a_pulse_and_a_push_leave_the_world_not_local() {
+        let dir = TempDir::new().unwrap();
+        let (_rt, world, follower, hosted, s) = authority_and_replica(&dir);
+        unrelated_write(&s, 1);
+        follower.beat(&hosted);
+        assert!(!hosted.is_local());
+        let (events, _) = world.read(|w| pulse::since(w.log(), 0));
+        assert!(!events.is_empty());
+        hosted.witness(events);
+        environment::push_one(&hosted, &follower.scheduler, 1, "m1", &|_| 0);
+        assert!(!hosted.is_local());
+    }
+
+    /// **The world its authority beats is local**, so handed over to be
+    /// followed, its first follow beat takes the records in.
+    #[tokio::test]
+    async fn a_world_handed_over_takes_its_records_in_on_its_first_follow() {
+        let dir = TempDir::new().unwrap();
+        let (rt, world, _follower, _hosted, s) = authority_and_replica(&dir);
+        rt.beat(&world);
+        assert!(world.is_local());
+        rt.standing.set_role(WORLD, Role::Replica, now_ms());
+        let taken = world.times_taken_in();
+        unrelated_write(&s, 1);
+        rt.beat(&world);
+        assert_eq!(world.times_taken_in(), taken + 1);
     }
 
     /// A beat that changed nothing writes nothing.
