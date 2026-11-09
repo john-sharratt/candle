@@ -580,7 +580,8 @@ pub const WIZ_OFF: Tool = Tool {
     category: "House",
     plane: Plane::World,
     availability: Availability::Embodied,
-    description: "Turn the light here off.",
+    description:
+        "Turn the light here off, so the room is dark where it shone until it is turned on again.",
     params: &[BULB],
     examples: &[Example {
         situation: "The room is empty and its light was left on.",
@@ -595,7 +596,7 @@ pub const WIZ_DIM: Tool = Tool {
     category: "House",
     plane: Plane::World,
     availability: Availability::Embodied,
-    description: "Dim the light here to a warm white at the brightness given.",
+    description: "Dim the light here to a warm white at the brightness given, from as dim as it goes to full.",
     params: &[
         BULB,
         Param {
