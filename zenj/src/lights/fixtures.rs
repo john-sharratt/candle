@@ -163,7 +163,7 @@ bulbs:
         let twice_ip = MAP.replace("192.168.50.21", "192.168.50.11");
         assert_eq!(
             Fixtures::parse("f", &twice_ip).unwrap_err(),
-            "f: 192.168.50.11 is the address of two bulbs, `t1` among them"
+            "f: 192.168.50.11 is the address of two bulbs, `d1` among them"
         );
         let unknown_aim = "bulbs:\n  - {id: x, ip: 1.2.3.4, mac: m, pos: 1, aim: ceiling}\n";
         assert!(Fixtures::parse("f", unknown_aim).is_err());

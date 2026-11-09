@@ -226,8 +226,11 @@ mod tests {
         let start = r.tick(224.0, 0.0, &s, &mut h);
         assert_eq!(
             start,
-            vec![Send::Press(Button::Play(2))],
-            "the ramp starts where it is"
+            vec![
+                Send::Press(Button::Play(2)),
+                Send::Light(Cue::Fade { beats: 32.0 })
+            ],
+            "the ramp starts where it is; the lights wash across the blend"
         );
         let s = snapshot(true, true, 128.0);
         let mid = r.tick(232.0, 0.0, &s, &mut h);
