@@ -44,7 +44,7 @@ const ENERGY_STEP: f32 = 0.05;
 const KEEP_BEHIND: Duration = Duration::from_millis(50);
 
 /// What the lights are doing, for the tools and the screens.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct View {
     /// How many bulbs the map names.
     pub bulbs: usize,
