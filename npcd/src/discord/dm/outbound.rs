@@ -78,6 +78,7 @@ pub async fn post(
         let written: Vec<Message> = waiting(&hosted, &person, &body, 0)
             .messages
             .into_iter()
+            .map(|(m, _)| m)
             .filter(|m| m.from == body && m.at_ms >= bot.since_ms)
             .collect();
         let (Some(first), Some(last)) = (written.first(), written.last()) else {

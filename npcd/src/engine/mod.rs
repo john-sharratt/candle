@@ -114,6 +114,7 @@ pub mod station;
 pub mod stir;
 pub mod substrate_views;
 pub mod survey;
+pub mod talk;
 pub mod tick;
 pub mod tools;
 pub mod watch;
@@ -149,7 +150,7 @@ use crate::engine::interaction::Interlocutor;
 use crate::engine::mind::Minds;
 use crate::npcs;
 use crate::projection;
-use crate::sim::phone::CHANNEL;
+use crate::sim::phone::{Who, CHANNEL};
 use host::guard::Api;
 
 /// The one refusal this module makes, worded once.
@@ -1261,7 +1262,7 @@ pub(crate) async fn post_message(
     };
     let op = WorldOp::Message {
         npc: npc_id,
-        from: me.clone(),
+        from: Who::new(&handle, &me),
         text: text.to_string(),
         origin: None,
     };
@@ -1298,7 +1299,7 @@ pub(crate) async fn get_messages(
     let said = s
         .runtime
         .as_ref()
-        .and_then(|rt| rt.messages_with(npc_id, &me));
+        .and_then(|rt| rt.messages_with(npc_id, &handle));
     let Some((them, messages)) = said else {
         // Not an error: a character with no body has nothing to say on a
         // handset yet, and the console renders an empty conversation.
@@ -1409,7 +1410,7 @@ pub(crate) async fn get_channel(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("reading a world's channel");
     };
-    let Some(said) = rt.channel(&wid, &me) else {
+    let Some(said) = rt.channel(&wid, &handle) else {
         return err(
             StatusCode::NOT_FOUND,
             "no_such_world",
@@ -1459,7 +1460,7 @@ pub(crate) async fn post_channel(
         return no_engine("speaking on a world's channel");
     };
     let op = WorldOp::Channel {
-        from: me.clone(),
+        from: Who::new(&handle, &me),
         text: text.to_string(),
         origin: None,
     };

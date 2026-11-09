@@ -91,6 +91,7 @@ use crate::engine::environment::{self, Reach};
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
+use crate::engine::talk::templates;
 use crate::engine::ingest;
 use crate::engine::invoke_body::Invokable;
 use crate::engine::journal::style::NPC;
@@ -2116,7 +2117,7 @@ impl Runtime {
 
     /// Post one line to the standing chat channel of every world this daemon
     /// runs, as the command table — the channel half of a call to the table.
-    pub fn say_to_all_channels(&self, from: &str, text: &str) {
+    pub fn say_to_all_channels(&self, from: &Who, text: &str) {
         for id in self.hosted.ids() {
             if self.standing.writes(&id) {
                 let _ = self.say_on_channel(&id, from, text);
@@ -5156,6 +5157,12 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         }
         None => identity::Installed::default(),
     };
+    // The talk templates a conversation's words are shaped by, and the
+    // `response` collection made one each turn offers from.
+    let templates = match projection.as_mut() {
+        Some(p) => templates::install(&mut p.builder, mind_files.as_deref())?,
+        None => templates::Installed::default(),
+    };
 
     if let (Some(p), Some(minds)) = (projection.as_ref(), rt.minds.read().unwrap().as_ref()) {
         minds.set_projection(Projected {
@@ -5164,6 +5171,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             layer: p.layer,
             group: p.group,
             identities: identities.clone(),
+            templates,
             // After everything is installed, so the acts and identities are in
             // it: a conversation written under a different set is superseded on
             // its next open rather than rejoined.
@@ -6674,10 +6682,23 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                             // write and a body's act each produce a
                             // `Recorded`, so the feed, the answer, and
                             // everything downstream are one shape.
-                            let said = rt.voice_post(id, a).await;
-                            let performed = rt
-                                .perform(id, a, pinned_at.as_ref(), said.as_deref(), &ActSource::Mind)
-                                .await;
+                            // A post on a group is said in the character's
+                            // own words, decoded here before the act goes to
+                            // the world; one whose words could not be decoded
+                            // is refused, never posted as its intent.
+                            let performed = match rt.voice_post(id, a).await {
+                                Ok(said) => {
+                                    rt.perform(
+                                        id,
+                                        a,
+                                        pinned_at.as_ref(),
+                                        said.as_deref(),
+                                        &ActSource::Mind,
+                                    )
+                                    .await
+                                }
+                                Err(e) => rt.unvoiced(a, &format!("{e:#}")),
+                            };
                             let r = performed.recorded;
                             // An act that moved the mission is answered by
                             // what comes next, and that is read at once.

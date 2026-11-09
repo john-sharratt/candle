@@ -34,6 +34,7 @@ use crate::discord::message::snowflake_at;
 use crate::discord::online::Online;
 use crate::discord::trace::note::{Direction, Note};
 use crate::discord::trace::{failed, note};
+use crate::sim::phone::Who;
 use crate::world::Hosted;
 
 /// What a room is called in the world: its channel's name, as Discord shows
@@ -44,14 +45,14 @@ pub fn room_name(channel: &str) -> String {
 
 /// Who a room has on it: everybody on the world's own channel — the cast,
 /// and the people enrolled in the world.
-fn cast(hosted: &Hosted) -> Vec<String> {
+fn cast(hosted: &Hosted) -> Vec<Who> {
     let Some(thread) = channel_thread(hosted) else {
         return Vec::new();
     };
     hosted.sim(|s| {
         s.threads
             .get(&thread)
-            .map(|t| t.members.clone())
+            .map(|t| t.members.iter().map(|m| Who::new(&m.id, &m.name)).collect())
             .unwrap_or_default()
     })
 }
@@ -104,7 +105,7 @@ pub async fn reconcile(a: &Authored, bot: &Online, hosted: &Hosted, guild: &Guil
 fn keep(
     hosted: &Hosted,
     standing: &BTreeMap<u64, &GuildChannel>,
-    cast: &[String],
+    cast: &[Who],
 ) -> Vec<((String, u64), bool)> {
     let mut changed = Vec::new();
     for (name, channel_id) in hosted.mirror(|m| m.parents()) {
@@ -180,8 +181,8 @@ mod tests {
     fn world() -> Hosted {
         let hosted = Hosted::load("creators-vault", ROOMS).unwrap();
         let open = hosted.with_sim(|s| {
-            s.threads.join_channel(CHANNEL, "Zen");
-            s.threads.join_channel(CHANNEL, "Wick")
+            s.threads.join_channel(CHANNEL, &Who::new("npc-1", "Zen"));
+            s.threads.join_channel(CHANNEL, &Who::new("npc-2", "Wick"))
         });
         hosted.with_mirror(|m| {
             m.put_thread(&open, Mirrored::new(7000, Kind::Channel, 0, 1));
@@ -203,7 +204,7 @@ mod tests {
                 thread.clone(),
                 t.name.clone(),
                 t.topic.clone(),
-                t.members.clone(),
+                t.members.iter().map(|m| m.name.clone()).collect(),
                 t.open,
             ))
         })
@@ -258,7 +259,7 @@ mod tests {
         keep(&hosted, &standing, &cast(&hosted));
         let (thread, ..) = room_of(&hosted, 7300).unwrap();
 
-        hosted.with_sim(|s| s.threads.join_channel(CHANNEL, "Jitter"));
+        hosted.with_sim(|s| s.threads.join_channel(CHANNEL, &Who::new("npc-3", "Jitter")));
         let renamed = [channel(7300, "lab", Some("  ")), channel(7001, "dms", None)];
         let standing: BTreeMap<u64, &GuildChannel> = renamed.iter().map(|c| (c.id, c)).collect();
         assert!(keep(&hosted, &standing, &cast(&hosted)).is_empty());

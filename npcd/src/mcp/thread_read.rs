@@ -18,8 +18,7 @@ use super::{Answer, Tool};
 use crate::accounts::public_id;
 use crate::api::Authored;
 use crate::discord::trace::render::utc;
-use crate::engine::speaking_as;
-use crate::sim::phone::{Kind, Origin, Thread};
+use crate::sim::phone::{direct_id, Kind, Origin, Thread, Who};
 use crate::world::Hosted;
 
 /// How many messages a thread read shows when not asked.
@@ -72,14 +71,15 @@ impl Tool for ThreadRead {
         let Some((hosted, body)) = s.runtime.as_ref().and_then(|rt| rt.body_of(npc)) else {
             return Answer::ok(format!("Bot {bot} is in no world, so it has no threads."));
         };
-        let Some(character) = hosted.read(|w| w.actor(&body).map(|a| a.name.clone())) else {
+        let Some(name) = hosted.read(|w| w.actor(&body).map(|a| a.name.clone())) else {
             return Answer::ok(format!("Bot {bot} is in no world, so it has no threads."));
         };
-        let mapped = mapped(s, &hosted, npc, &character).await;
+        let character = Who::new(&body, &name);
+        let mapped = mapped(&hosted, npc, &body);
         let threads: Vec<Thread> = hosted.sim(|sim| {
             sim.threads
                 .iter()
-                .filter(|t| t.has(&character))
+                .filter(|t| t.has(&body))
                 .cloned()
                 .collect()
         });
@@ -89,35 +89,26 @@ impl Tool for ThreadRead {
             .map_or(DEFAULT_LIMIT, |l| (l as usize).clamp(1, MAX_LIMIT));
         Answer::of(match optional(args, "thread") {
             None => Ok(list(bot, &character, &threads, &mapped)),
-            Some(named) => find(&threads, &character, named)
-                .map(|t| show(&character, t, mapped.get(&t.id).map(String::as_str), limit))
+            Some(named) => find(&threads, &character.id, named)
+                .map(|t| show(&character.id, t, mapped.get(&t.id).map(String::as_str), limit))
                 .ok_or_else(|| format!("bot {bot} is on no thread `{named}`")),
         })
     }
 }
 
 /// Which of character `npc`'s threads in `hosted` a Discord DM or channel
-/// mirrors.
-async fn mapped(a: &Authored, hosted: &Hosted, npc: u64, character: &str) -> Mapped {
+/// mirrors; `body` is the character's.
+fn mapped(hosted: &Hosted, npc: u64, body: &str) -> Mapped {
     let mut out: Mapped = hosted
         .servers(|s| s.channels_of(npc))
         .into_iter()
         .map(|(channel, c)| (c.thread, format!("Discord channel {channel}")))
         .collect();
     for (account, dm) in hosted.dms(|d| d.of(npc)) {
-        let identity = a.accounts.read().await.identity(&account);
-        let Some(person) = identity.map(|id| speaking_as(&id, &public_id(&account), &a.roles))
-        else {
-            continue;
-        };
-        let thread = hosted.sim(|s| {
-            s.threads
-                .direct_between(&person, character)
-                .map(|t| t.id.clone())
-        });
-        if let Some(thread) = thread {
-            out.insert(thread, format!("Discord DM channel {}", dm.channel_id));
-        }
+        out.insert(
+            direct_id(&public_id(&account), body),
+            format!("Discord DM channel {}", dm.channel_id),
+        );
     }
     out
 }
@@ -148,58 +139,62 @@ fn open(t: &Thread) -> &'static str {
 }
 
 /// Every thread `character` (bot `bot`) is on, a line each.
-pub fn list(bot: &str, character: &str, threads: &[Thread], mapped: &Mapped) -> String {
+pub fn list(bot: &str, character: &Who, threads: &[Thread], mapped: &Mapped) -> String {
+    let name = &character.name;
     if threads.is_empty() {
-        return format!("Bot {bot} ({character}) is on no thread.");
+        return format!("Bot {bot} ({name}) is on no thread.");
     }
     let lines: Vec<String> = threads
         .iter()
         .map(|t| {
+            let members: Vec<&str> = t.members.iter().map(|m| m.name.as_str()).collect();
             format!(
                 "  {} \"{}\" {}, {}; members {}; last seq {}; unread {}; {}",
                 t.id,
-                t.as_named_to(character),
+                t.as_named_to(&character.id),
                 kind(t),
                 open(t),
-                t.members.join(", "),
-                t.messages.last().map_or(0, |m| m.seq),
-                t.unread_for(character),
+                members.join(", "),
+                t.last_seq(),
+                t.unread_for(&character.id),
                 mapped.get(&t.id).map_or("not on Discord", String::as_str),
             )
         })
         .collect();
-    format!("Bot {bot} ({character})'s threads:\n{}", lines.join("\n"))
+    format!("Bot {bot} ({name})'s threads:\n{}", lines.join("\n"))
 }
 
-/// Thread `t`'s last `limit` messages, as `character` has them.
-pub fn show(character: &str, t: &Thread, mapped: Option<&str>, limit: usize) -> String {
+/// Thread `t`'s last `limit` messages, as the character `me` (by id) has
+/// them.
+pub fn show(me: &str, t: &Thread, mapped: Option<&str>, limit: usize) -> String {
     let from = t.messages.len().saturating_sub(limit);
+    let told = t.member(me).map_or(0, |m| m.delivered);
+    let name = |id: &str| t.member(id).map_or(id.to_string(), |m| m.name.clone());
     let lines: Vec<String> = t
         .messages
         .iter()
-        .enumerate()
         .skip(from)
-        .map(|(i, m)| {
+        .map(|m| {
             let origin = match m.origin {
                 Some(Origin::Discord { message, channel }) => {
                     format!("discord {message} in {channel}")
                 }
                 None => "world".into(),
             };
-            let reached = match (m.from == character, t.delivered_to(character, i)) {
+            let reached = match (m.from == me, m.seq <= told) {
                 (true, _) => "own",
                 (false, true) => "delivered",
                 (false, false) => "undelivered",
             };
             let to =
                 m.to.as_deref()
-                    .map_or_else(String::new, |to| format!(", to {to}"));
+                    .map_or_else(String::new, |to| format!(", to {}", name(to)));
             format!(
                 "  #{} {} {} [{origin}, {reached}{to}]: {}",
                 m.seq,
                 utc(m.at_ms),
-                m.from,
-                m.intent
+                name(&m.from),
+                m.text
             )
         })
         .collect();
@@ -207,7 +202,7 @@ pub fn show(character: &str, t: &Thread, mapped: Option<&str>, limit: usize) -> 
     let head = format!(
         "Thread {} \"{}\" ({}, {}{on}), last {} of {}",
         t.id,
-        t.as_named_to(character),
+        t.as_named_to(me),
         kind(t),
         open(t),
         lines.len(),
@@ -222,29 +217,34 @@ pub fn show(character: &str, t: &Thread, mapped: Option<&str>, limit: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::phone::Threads;
+    use crate::sim::phone::{Said, Threads};
 
     /// Noon UTC, 1 November 2026.
     const NOON: u64 = 1_793_534_400_000;
 
+    fn zen() -> Who {
+        Who::new("npc-1", "Zen")
+    }
+
     /// Zen on a server channel with Kit, and in a DM with Wren; Zen's mind
-    /// handed everything but Kit's last.
+    /// told of everything on the channel but Kit's last.
     fn threads() -> Vec<Thread> {
         let mut p = Threads::new();
-        let general = p.open_standing("zenworld #general", &["Zen".to_string()]);
-        p.join(&general, "Kit (@kit)");
-        let origin = Origin::Discord {
+        let general = p.open_standing("zenworld #general", &[zen()]);
+        p.join(&general, &Who::new("discord:41", "Kit (@kit)"));
+        let mut anyone = Said::words("anyone?");
+        anyone.origin = Some(Origin::Discord {
             message: 901,
             channel: 610,
-        };
-        p.send_on(&general, "Kit (@kit)", "anyone?", Some(origin))
-            .unwrap();
-        p.send_on(&general, "Zen", "I'm here.", None).unwrap();
-        p.reach("Wren S", "Zen");
-        p.send("Wren S", "Zen", "are you there?").unwrap();
-        p.mark_delivered_for("Zen");
-        p.send_to(&general, "Kit (@kit)", "good", None, Some("Zen"))
-            .unwrap();
+        });
+        p.send_on(&general, "discord:41", anyone).unwrap();
+        p.send_on(&general, "npc-1", Said::words("I'm here.")).unwrap();
+        let dm = p.reach(&Who::new("u_wren", "Wren S"), &zen());
+        p.send_on(&dm, "u_wren", Said::words("are you there?")).unwrap();
+        p.mark_delivered_for("npc-1");
+        let mut good = Said::words("good");
+        good.to = Some("npc-1".into());
+        p.send_on(&general, "discord:41", good).unwrap();
         let mut out: Vec<Thread> = p.iter().cloned().collect();
         for t in &mut out {
             for (i, m) in t.messages.iter_mut().enumerate() {
@@ -257,7 +257,10 @@ mod tests {
     fn mapped() -> Mapped {
         [
             ("th1".to_string(), "Discord channel 610".to_string()),
-            ("th2".to_string(), "Discord DM channel 31".to_string()),
+            (
+                "dm:npc-1:u_wren".to_string(),
+                "Discord DM channel 31".to_string(),
+            ),
         ]
         .into_iter()
         .collect()
@@ -267,15 +270,15 @@ mod tests {
     #[test]
     fn the_threads_list_as_these_lines() {
         assert_eq!(
-            list("1z", "Zen", &threads(), &mapped()),
+            list("1z", &zen(), &threads(), &mapped()),
             "Bot 1z (Zen)'s threads:\n\
+             \x20 dm:npc-1:u_wren \"Wren S\" direct, open; members Wren S, Zen; last seq 1; \
+             unread 1; Discord DM channel 31\n\
              \x20 th1 \"zenworld #general\" group, open; members Zen, Kit (@kit); last seq 3; \
-             unread 2; Discord channel 610\n\
-             \x20 th2 \"Wren S\" direct, open; members Wren S, Zen; last seq 1; unread 1; \
-             Discord DM channel 31"
+             unread 1; Discord channel 610"
         );
         assert_eq!(
-            list("1z", "Zen", &[], &mapped()),
+            list("1z", &zen(), &[], &mapped()),
             "Bot 1z (Zen) is on no thread."
         );
     }
@@ -285,23 +288,23 @@ mod tests {
     #[test]
     fn a_thread_shows_its_last_messages() {
         let threads = threads();
-        let general = find(&threads, "Zen", "ZENWORLD #general").unwrap();
+        let general = find(&threads, "npc-1", "ZENWORLD #general").unwrap();
         assert_eq!(
-            show("Zen", general, Some("Discord channel 610"), 20),
+            show("npc-1", general, Some("Discord channel 610"), 20),
             "Thread th1 \"zenworld #general\" (group, open; Discord channel 610), last 3 of 3:\n\
              \x20 #1 2026-11-01 12:00:00 UTC Kit (@kit) [discord 901 in 610, delivered]: anyone?\n\
              \x20 #2 2026-11-01 12:00:01 UTC Zen [world, own]: I'm here.\n\
              \x20 #3 2026-11-01 12:00:02 UTC Kit (@kit) [world, undelivered, to Zen]: good"
         );
         assert_eq!(
-            show("Zen", general, None, 1),
+            show("npc-1", general, None, 1),
             "Thread th1 \"zenworld #general\" (group, open), last 1 of 3:\n\
              \x20 #3 2026-11-01 12:00:02 UTC Kit (@kit) [world, undelivered, to Zen]: good"
         );
         assert_eq!(
-            find(&threads, "Zen", "th2").map(|t| t.id.as_str()),
-            Some("th2")
+            find(&threads, "npc-1", "dm:npc-1:u_wren").map(|t| t.id.as_str()),
+            Some("dm:npc-1:u_wren")
         );
-        assert!(find(&threads, "Zen", "nowhere").is_none());
+        assert!(find(&threads, "npc-1", "nowhere").is_none());
     }
 }

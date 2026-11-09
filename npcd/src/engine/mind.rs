@@ -102,12 +102,15 @@ use crate::engine::rendered;
 use crate::engine::retention;
 use crate::engine::schema::ReflectionTurns;
 use crate::engine::sleep::conversation_id;
+use crate::engine::talk::templates;
 use crate::engine::tick::Due;
 use crate::engine::tools::{self, for_mode, Mode};
 use crate::engine::window::Speaker;
 
 mod ask;
+mod voice;
 pub use ask::{Answer, Put};
+pub use voice::Voicing;
 
 /// How many completed exchanges the GPU sequence carries per turn.
 ///
@@ -314,6 +317,8 @@ pub struct Projected {
     pub group: GroupId,
     /// Which members exist, so a turn pins the right ones.
     pub identities: identity::Installed,
+    /// The response templates each destination's words are shaped by.
+    pub templates: templates::Installed,
     /// The fingerprint of everything a conversation under this schema is
     /// framed by — the authored YAML and every member installed into it. See
     /// [`crate::engine::schema::frame`] and [`frame_fingerprint`].

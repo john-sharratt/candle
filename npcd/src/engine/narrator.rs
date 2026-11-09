@@ -95,6 +95,9 @@ fn event_line(e: &Event) -> Option<String> {
         // A count, already written as what the character is told: passed
         // through.
         EventKind::Unread { threads } => Some(unread_line(threads)),
+        // A conversation's, never the mind's narrative: the scheduler hands
+        // both to the conversation runner.
+        EventKind::Talk { .. } | EventKind::Purpose { .. } => None,
         // Its own thought, not a happening: handed over as the character's
         // inner line so the narrator keeps it in the first person.
         EventKind::MindControl { text } => {

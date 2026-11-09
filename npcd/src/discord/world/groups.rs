@@ -66,7 +66,7 @@ fn groups(hosted: &Hosted) -> Vec<Group> {
             .map(|t| Group {
                 id: t.id.clone(),
                 name: t.name.clone(),
-                members: t.members.clone(),
+                members: t.members.iter().map(|m| m.id.clone()).collect(),
                 open: t.open && !t.members.is_empty(),
             })
             .collect()

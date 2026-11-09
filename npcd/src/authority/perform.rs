@@ -370,6 +370,21 @@ impl Runtime {
         }
     }
 
+    /// A post whose words could not be decoded: refused, and the character
+    /// told to say it again.
+    pub(crate) fn unvoiced(&self, act: &Act, why: &str) -> Performed {
+        tracing::warn!(tool = act.tool, "a post's words were not decoded: {why}");
+        Performed {
+            recorded: Recorded {
+                feed: format!("{} {REFUSED} the words did not come", act.summary()),
+                answer: "Nothing was sent: the words did not come. Say it again.".to_string(),
+                landed: false,
+                departing: false,
+            },
+            moved: false,
+        }
+    }
+
     fn unanswered(&self, act: &Act, why: &str) -> Performed {
         tracing::warn!(tool = act.tool, "an act did not reach its world: {why}");
         Performed {

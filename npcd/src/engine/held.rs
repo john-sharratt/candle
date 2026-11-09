@@ -53,6 +53,17 @@ fn source(kind: &EventKind) -> Source {
             format!("message on {thread}"),
             format!("messages on {thread}"),
         ),
+        // Held for the conversation, never the mind; named should one wait.
+        EventKind::Talk { thread, .. } => named(
+            format!("talk:{thread}"),
+            format!("line on {thread}"),
+            format!("lines on {thread}"),
+        ),
+        EventKind::Purpose { party, .. } => named(
+            format!("purpose:{party}"),
+            format!("thing meant for {party}"),
+            format!("things meant for {party}"),
+        ),
         EventKind::Speech { speaker, .. } => named(
             format!("speech:{speaker}"),
             format!("thing {speaker} said"),

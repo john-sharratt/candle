@@ -1,11 +1,13 @@
 //! A bot shown typing in a DM a person is waiting on
 //! (`docs/npcd_discord.md` §8 step 13).
 //!
-//! From when a person's DM from Discord is the last thing said to the
-//! character until the character answers — its answer is then the last
-//! thing said — and for two minutes at most, its bot shows typing in that
-//! DM. Discord shows typing for ten seconds from each ask, so it is asked
-//! again every eight while the DM waits.
+//! While a person's DM from Discord sits above the character's read cursor
+//! on their thread, and for two minutes at most, its bot shows typing in that
+//! DM. The character's conversation reads through the line it took up —
+//! whether it answered or wrote it down (`docs/npc_conversations.md` §8) — so
+//! typing stops when the turn ends, whatever it ended in. Discord shows typing
+//! for ten seconds from each ask, so it is asked again every eight while the
+//! DM waits.
 //!
 //! Stateless but for when each DM was last asked: whether a DM is waiting is
 //! read off its thread each beat, so a restart, a move, or an answer posted
@@ -15,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::outbound::speaking_name;
+use crate::accounts::public_id;
 use crate::api::{now_ms, Authored};
 use crate::discord::online::Online;
 use crate::discord::rejected::Rejected;
@@ -36,18 +38,17 @@ pub async fn show(a: &Arc<Authored>, bot: &Online, typed: &mut Typed) -> Result<
         return Ok(());
     };
     for (account, dm) in hosted.dms(|d| d.of(bot.npc)) {
-        let Some(person) = speaking_name(a, &account).await else {
-            continue;
-        };
+        let person = public_id(&account);
         let waiting = hosted.sim(|s| {
-            s.threads
-                .direct_between(&person, &character)
-                .and_then(|t| t.messages.last())
-                .is_some_and(|m| {
-                    m.from == person
-                        && m.origin.is_some()
-                        && now_ms().saturating_sub(m.at_ms) < TYPING_FOR.as_millis() as u64
-                })
+            s.threads.direct_waits_on(&character.id, &person)
+                && s.threads
+                    .direct_between(&character.id, &person)
+                    .and_then(|t| t.messages.last())
+                    .is_some_and(|m| {
+                        m.from == person
+                            && m.origin.is_some()
+                            && now_ms().saturating_sub(m.at_ms) < TYPING_FOR.as_millis() as u64
+                    })
         });
         if !waiting {
             typed.remove(&dm.channel_id);

@@ -178,9 +178,14 @@ pub enum Deliberation {
 /// actually ran.
 pub fn deliberation(thinking: Deliberation) -> SelectionState {
     let mut sel = SelectionState::new();
+    deliberate(&mut sel, thinking);
+    sel
+}
+
+/// Set `sel`'s deliberation to `thinking`, keeping everything else it holds.
+pub fn deliberate(sel: &mut SelectionState, thinking: Deliberation) {
     sel.set_optional(NO_THINK, thinking.suppressed());
     sel.select(THINKING_EFFORT, thinking.effort());
-    sel
 }
 
 impl Deliberation {
