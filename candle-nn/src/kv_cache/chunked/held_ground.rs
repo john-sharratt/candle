@@ -17,7 +17,7 @@
 //!   [`SpanHeldGround::provision`] tops them up **between forwards** to a headroom
 //!   learned from what recent forwards took, so a take inside a forward finds room
 //!   already there; it releases arenas nothing holds once the headroom is covered
-//!   without them. A take that finds no room goes to the CUDA pool, reported, and
+//!   without them. A take that finds no room goes to the driver, reported, and
 //!   the next provisioning covers it — a take never claims, because it arrives
 //!   under whatever locks its caller holds.
 //!
@@ -370,6 +370,28 @@ impl SpanHeldGround {
         }
     }
 
+    /// **From a known point between forwards:** make sure one take of `bytes`
+    /// fits, claiming an arena that holds it when no free range does.
+    ///
+    /// For a caller that knows its size before it takes and holds no lock a
+    /// claim could cycle with — an aside opening — so its take is covered now
+    /// rather than refused once and covered at the next provisioning. The arena
+    /// is the ground's like any other: kept or released by [`Self::provision`].
+    /// A claim the span refuses leaves the take to be refused, as before.
+    pub(crate) fn make_room(&self, device: &CudaDevice, bytes: usize) {
+        let fits = {
+            let mut inner = self.lock();
+            inner.reclaim(false);
+            inner.largest_free() >= bytes
+        };
+        if fits {
+            return;
+        }
+        if let Some(regions) = Self::claim_arena(device, bytes) {
+            self.lock().insert_arena(regions);
+        }
+    }
+
     /// **Between forwards:** fit the held arenas to what recent forwards took.
     ///
     /// Folds the window since the last call into the growth record — the most held
@@ -671,11 +693,11 @@ fn stats_of(inner: &Inner) -> HeldStats {
 /// File `site`'s refused request of `bytes` and, the first time that site is
 /// refused, report it with the holders that filled the ground.
 ///
-/// The refused buffer goes to the CUDA pool, and on a full card from there to
-/// the driver — which answers `CUDA_ERROR_OUT_OF_MEMORY` with no name attached.
-/// This line is the name: who asked, for how much, what the ground looked like,
-/// and who was holding it. Once per site, because a ground that is short stays
-/// short until the next provisioning; the ledger keeps counting.
+/// The refused buffer goes to the driver, outside the reservation — which, on a
+/// full card, answers `CUDA_ERROR_OUT_OF_MEMORY` with no name attached. This line
+/// is the name: who asked, for how much, what the ground looked like, and who was
+/// holding it. Once per site, because a ground that is short stays short until
+/// the next provisioning; the ledger keeps counting.
 #[cfg(feature = "cuda")]
 fn refuse(inner: &mut Inner, site: &'static Location<'static>, bytes: usize) {
     inner.refused_since += bytes;
@@ -711,7 +733,7 @@ fn refuse(inner: &mut Inner, site: &'static Location<'static>, bytes: usize) {
         largest_free = s.largest_free,
         arenas = s.arenas,
         holders = %holders,
-        "held ground had no room for a buffer inside a forward; it goes to the CUDA pool, \
+        "held ground had no room for a buffer inside a forward; it goes to the driver, \
          outside the reservation, and the next provisioning covers it"
     );
 }

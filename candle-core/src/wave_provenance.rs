@@ -89,6 +89,14 @@ pub const GUEST_ARENA: u32 = 3;
 /// when none is open. It never names a range and so can never alias one.
 pub const GUEST_ANY_EPOCH: u64 = u64::MAX;
 
+/// The arena index of an **aside**: a bump opened for ops that run between
+/// forwards — a sampler's pick read back, a harness comparing logits — whose
+/// operands no wave owns any more.
+///
+/// A ticket naming it carries the aside's own id as its epoch, so a ticket
+/// outliving its aside resolves to nothing rather than to the next one's range.
+pub const ASIDE_ARENA: u32 = 4;
+
 impl WaveTicket {
     /// The routing seed a guest stamps on memory it placed in its own ground.
     ///

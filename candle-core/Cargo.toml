@@ -94,6 +94,11 @@ vram-test-util = []
 # too slow for a production run, and the counters are a measurement tool, not a
 # guard rail.
 forbidden_allocations = ["dep:backtrace"]
+# Panic on every device allocation cudarc makes — memory the driver allocates
+# outside the span — naming the site and the stack (`cuda_backend/driver_alloc.rs`,
+# docs/driver_model.md §4). The tool for moving every allocation onto an arena of
+# the span. Off by default: until that is done, a run with it stops at the first one.
+driver-alloc-panic = ["cuda"]
 # `Tensor::assert("name")` / `QTensor::assert("name")`: fold a tensor's NaN
 # count, Inf count and finite min/max into a preallocated device slot with one
 # launch — no sync, no allocation, no copy. Off by default because the launches

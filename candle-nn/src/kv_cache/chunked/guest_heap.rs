@@ -36,9 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use candle::cuda_backend::cudarc::driver::{sys, CudaEvent, CudaStream};
-use candle::cuda_backend::wave_provenance::{
-    install_wave_release, SpanState, WaveCarve, WaveTicket, GUEST_ARENA,
-};
+use candle::cuda_backend::wave_provenance::{SpanState, WaveCarve, WaveTicket, GUEST_ARENA};
 
 use super::held_extents::{Extents, Taken};
 
@@ -155,7 +153,7 @@ static OPEN: AtomicBool = AtomicBool::new(false);
 /// ground — for the device `stream` is on. While it is open, a guest ticket on
 /// that device carves here rather than from the guest arena.
 pub fn open_guest_heap(stream: &Arc<CudaStream>, runs: &[(u64, usize)]) {
-    install_wave_release(release_carve);
+    super::wave_release::install();
     super::bump_arena::install_resolver();
     let heap = Heap {
         stream: Arc::clone(stream),
@@ -213,8 +211,9 @@ pub(crate) fn carve(ticket: WaveTicket, bytes: usize, align: usize) -> Option<Wa
     })
 }
 
-/// The release hook: a storage over `ptr` with a wave ticket has been dropped.
-fn release_carve(ticket: WaveTicket, ptr: u64) {
+/// A storage over `ptr` with a guest ticket has been dropped (through the
+/// dispatcher in `wave_release`).
+pub(super) fn release_carve(ticket: WaveTicket, ptr: u64) {
     if !OPEN.load(Ordering::Acquire) || ticket.arena != GUEST_ARENA {
         return;
     }

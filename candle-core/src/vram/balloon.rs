@@ -3,9 +3,14 @@
 //! allocations on WDDM), record the resident high-water as the capacity `C`,
 //! then free it. See `docs/archived/elastic_vram_partition.md` §5.
 
+#[cfg(feature = "cuda")]
+use cudarc::driver::result::{free_sync, malloc_sync, memset_d8_async};
+#[cfg(feature = "cuda")]
+use cudarc::driver::sys::CUdeviceptr;
+
 use super::budget::GovernorConfig;
 use super::reading::{ProbeKind, VramProbe, VramReading};
-use crate::{DType, Device, Result, Tensor};
+use crate::{DType, Device, Error, Result, Tensor};
 
 /// A source of touched device memory the balloon can claim and release. Abstracted
 /// so the balloon *logic* is unit-testable without a GPU.
@@ -182,12 +187,29 @@ pub fn balloon_measure(
     Ok(reserved)
 }
 
-/// A [`BalloonAllocator`] backed by real device memory. `Tensor::zeros` allocates
-/// **and** zero-fills (a full memset), which touches every page and forces
-/// residency — the mechanism that evicts colder tenants on WDDM.
+/// A [`BalloonAllocator`] backed by real device memory, zero-filled as it is
+/// claimed: the fill touches every page and forces residency — the mechanism
+/// that evicts colder tenants on WDDM.
+///
+/// **On CUDA it asks the driver directly** — `cuMemAlloc`, a synchronous memset,
+/// `cuMemFree` — because it measures what the driver will grant, before the span
+/// that measurement sizes exists. Nothing else may allocate from the driver
+/// (`docs/driver_model.md` §4); this and the span's own allocation are the
+/// measurement and the thing measured. The free is synchronous too, so the bytes
+/// are the card's again the moment [`BalloonAllocator::free_all`] returns, with
+/// no memory pool holding them.
 pub struct DeviceBalloonAllocator {
     device: Device,
-    held: Vec<Tensor>,
+    held: Vec<Held>,
+}
+
+/// One claim of the balloon.
+enum Held {
+    /// A driver allocation, freed in [`BalloonAllocator::free_all`].
+    #[cfg(feature = "cuda")]
+    Driver(CUdeviceptr),
+    /// Memory of a device with no driver to ask.
+    Tensor(Tensor),
 }
 
 impl DeviceBalloonAllocator {
@@ -201,21 +223,42 @@ impl DeviceBalloonAllocator {
 
 impl BalloonAllocator for DeviceBalloonAllocator {
     fn alloc_and_touch(&mut self, bytes: u64) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(d) = &self.device {
+            let bytes = bytes as usize;
+            let stream = d.cuda_stream();
+            stream.context().bind_to_thread().map_err(Error::wrap)?;
+            // SAFETY: a plain device allocation, filled whole below and freed in
+            // `free_all` or here on a failed fill.
+            let ptr = unsafe { malloc_sync(bytes) }.map_err(Error::wrap)?;
+            // Filled on the device's stream and waited for: the next probe
+            // reading must see these pages resident.
+            // SAFETY: `[ptr, ptr + bytes)` is the allocation just made.
+            let filled = unsafe { memset_d8_async(ptr, 0, bytes, stream.cu_stream()) }
+                .and_then(|()| stream.synchronize());
+            if let Err(e) = filled {
+                // SAFETY: the allocation above, freed once.
+                let _ = unsafe { free_sync(ptr) };
+                return Err(Error::wrap(e));
+            }
+            self.held.push(Held::Driver(ptr));
+            return Ok(());
+        }
         // U8 tensor of `bytes` elements: alloc + zero-fill = touch every page.
         let t = Tensor::zeros(bytes as usize, DType::U8, &self.device)?;
-        self.held.push(t);
+        self.held.push(Held::Tensor(t));
         Ok(())
     }
     fn free_all(&mut self) {
-        // Drop → cuMemFreeAsync back to the pool, then retire the frees and
-        // trim the pool so the ballooned bytes actually return to the OS.
-        // Without the sync+trim the async pool retains them and the post-balloon
-        // measurement would read them as still-used.
-        self.held.clear();
-        let _ = self.device.synchronize();
-        #[cfg(feature = "cuda")]
-        if let Device::Cuda(d) = &self.device {
-            let _ = d.trim_pool(0);
+        for held in self.held.drain(..) {
+            match held {
+                #[cfg(feature = "cuda")]
+                Held::Driver(ptr) => {
+                    // SAFETY: an allocation `alloc_and_touch` made, freed once.
+                    let _ = unsafe { free_sync(ptr) };
+                }
+                Held::Tensor(t) => drop(t),
+            }
         }
     }
 }

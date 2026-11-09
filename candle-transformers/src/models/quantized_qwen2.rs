@@ -563,7 +563,7 @@ impl ModelWeights {
 
         // Before the baseline, so the span's own mapping is not read as weight
         // bytes, and before any tensor, so the weights can be carved from it.
-        dense_span::open_for_load(device, &ct)?;
+        let _load = dense_span::open_for_load(device, &ct)?;
 
         // Driver-used VRAM baseline before any weights load (delta = weight footprint).
         #[cfg(feature = "cuda")]
@@ -736,7 +736,7 @@ impl ModelWeights {
         max_kv_cache_len: Option<usize>,
     ) -> Result<Self> {
         // Before the baseline and before any tensor — see the sibling loader.
-        dense_span::open_for_load(device, &ct)?;
+        let _load = dense_span::open_for_load(device, &ct)?;
         // Driver-used VRAM baseline before any weights load (delta = weight footprint).
         #[cfg(feature = "cuda")]
         let used_before = super::batched_model::driver_used_bytes(device);

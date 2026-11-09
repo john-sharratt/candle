@@ -1,226 +1,124 @@
-//! The VA reservation: address space first, physical memory second.
+//! The span's memory: one device allocation, claimed once, never moved.
 //!
 //! Everything above this file assumes one contiguous span whose address never
-//! changes. `cuMemAlloc` cannot give that — it hands back whatever the
-//! allocator has, and a later growth is a different pointer. The virtual memory
-//! management API separates the two halves of an allocation, which is what the
-//! design needs (`docs/archived/arena_unification.md` §3.2):
+//! changes. It is a single `cuMemAlloc`, made once when the region pool is
+//! created and freed only when the pool goes. It needs nothing beyond plain
+//! device allocation, so it runs under every driver model — WDDM, TCC and Linux
+//! alike (`docs/driver_model.md` §4); Windows' TCC driver offers no virtual
+//! memory management, which an address-space reservation would need.
 //!
-//! - **Reserve** a virtual address range. Costs no memory; fixes the addresses
-//!   every arena, region and transient span will ever use.
-//! - **Create** physical granules and **map** them into that range. This is the
-//!   part that can fail, and failing is informative: the point at which the
-//!   driver refuses is `C`, the capacity actually available to us.
+//! # Capacity is the allocation that succeeds
 //!
-//! Measuring `C` and claiming it are therefore the same act. A separate "how
-//! much is free?" query would be a lie by the time it returned — another
-//! process, or our own weight loading, moves it.
+//! The span asks for what it wants, capped at the free memory the driver reports
+//! less [`FREE_MARGIN`] for the driver's own allocations, and steps down on a
+//! refusal until one is granted ([`step_down`]). Under TCC and Linux the driver
+//! refuses honestly. Under WDDM an allocation past the OS's residency budget is
+//! granted and demoted instead, so the cap — and the governor that sized what is
+//! asked for from DXGI's budget — is what keeps the span resident there.
 //!
-//! # The refusal is a failed *touch*, not a failed create
+//! # A guard granule in front
 //!
-//! Under WDDM `cuMemCreate` does not tell the truth about capacity. Probed on
-//! the target machine (`vmm_overcommit_probe.py`, §9): it succeeded for every
-//! granule of a 32 GiB span on a 16 GiB card. The limit appears at the first
-//! **write** to a granule. So every granule this file maps is also written
-//! before it counts as claimed, and a failed write is the refusal that stops the
-//! balloon — the granule is unmapped and released, and the reservation ends
-//! there. Under TCC and Linux the driver owns the card and the create itself is
-//! expected to refuse (`docs/driver_model.md` §5); `CUDA_ERROR_OUT_OF_MEMORY`
-//! from the create, the map or the write is the capacity either way.
+//! The allocation's first [`GRANULARITY`] bytes are never handed out: the span's
+//! base is one granule in. A slice viewing span memory that reached the driver's
+//! free would free the whole span if it held the allocation's base, and nothing
+//! can hold that address now — an interior pointer is refused by the driver.
 //!
-//! The write is a zero-fill, which the region tier then relies on: a
-//! freshly-mapped region is already zeroed, exactly as `Tensor::zeros` left the
-//! slabs it replaces. That is not a convenience — `RegionPool` hands a region
-//! whose `dirty_epoch` is still zero to its first tenant *without* cleaning it,
-//! on the strength of this write.
+//! # Zeroed on claim
 //!
-//! The write is queued rather than awaited, and both of its readers are far
-//! enough downstream not to care. Its one hard rule is that the span must not be
-//! unmapped while it is still in flight, which [`Reservation::fence`] states and
-//! the two teardown paths obey.
-//!
-//! # There is no fallback, on purpose
-//!
-//! A device without the VMM API cannot run this allocator at all, and
-//! [`Reservation::reserve`] says so by name before it does anything else. The
-//! alternative — one giant `cuMemAlloc` behind the same interface — was
-//! considered and rejected: it is not a smaller version of this path but a
-//! different one. Its eviction unit is the whole buffer rather than a granule,
-//! so desktop pressure sheds the entire reservation at once; it cannot release
-//! part of itself back for weight loading; and capacity has to be found by
-//! binary search over whole allocations instead of falling out of the balloon.
-//! That is a second allocation path no test on the target hardware can
-//! exercise, which would be wrong by the time anything needed it.
-//!
-//! So the contract is: this either works or it stops, immediately, with a
-//! message naming the missing capability.
-//!
-//! # Granularity
-//!
-//! The driver maps in granules, not bytes, and the granule size is a device
-//! property. Every size here is rounded up to it; a reservation is always a
-//! whole number of granules, which is also why region carving can assume
-//! alignment without re-checking.
+//! Each range is zero-filled as it is claimed ([`Reservation::map_range`]),
+//! which the region tier relies on: `RegionPool` hands a region whose
+//! `dirty_epoch` is still zero to its first tenant *without* cleaning it, on the
+//! strength of this write. The fill is queued rather than awaited; its one hard
+//! rule is that the span must not be freed while it is still in flight, which
+//! [`Reservation::fence`] states and the teardown obeys.
 
 use std::sync::Arc;
 
-use candle::cuda_backend::cudarc::driver::result::device::get_attribute;
-use candle::cuda_backend::cudarc::driver::result::{mem_get_info, memset_d8_async};
-use candle::cuda_backend::cudarc::driver::sys::{
-    CUdevice, CUdevice_attribute_enum, CUdeviceptr, CUmemAccessDesc, CUmemAccess_flags_enum,
-    CUmemAllocationGranularity_flags_enum, CUmemAllocationHandleType_enum, CUmemAllocationProp_st,
-    CUmemAllocationType_enum, CUmemLocationType_enum, CUmemLocation_st, CUresult,
+use candle::cuda_backend::cudarc::driver::result::{
+    free_sync, malloc_sync, mem_get_info, memset_d8_async, DriverError,
 };
+use candle::cuda_backend::cudarc::driver::sys::{CUdeviceptr, CUresult};
 use candle::cuda_backend::cudarc::driver::{CudaContext, CudaStream};
 use candle::cuda_backend::graph::without_recording;
 use candle::Result;
 
-/// A contiguous virtual address span, backed by however much physical memory
-/// the driver would give us.
-///
-/// Dropping it unmaps and releases everything. Nothing hands out sub-ranges
-/// here — carving is the region layer's job; this owns only the span and the
-/// granules behind it.
-pub(crate) struct Reservation {
-    base: CUdeviceptr,
-    reserved: usize,
-    granularity: usize,
-    /// One entry per granule slot of the span; `Some(handle)` when mapped.
-    ///
-    /// Indexed rather than appended so a caller can map a range anywhere in the
-    /// span — the transient tier sits at the right end and must be backed even
-    /// when the KV side to its left was cut short by a refusal.
-    granules: Vec<Option<u64>>,
-    mapped: usize,
-    device: CUdevice,
-    context: Arc<CudaContext>,
-    /// The device's stream, which the mapping touch's fill is queued on.
-    stream: Arc<CudaStream>,
-    /// How many driver calls this span had to drain queued fills for — see
-    /// [`Self::retry_if_not_ready`].
-    ///
-    /// Counted so the condition stays visible. A retry that logs nothing turns a
-    /// real driver behaviour into folklore, and the number is the difference
-    /// between "the loop occasionally overtakes the driver, as designed" and
-    /// "every granule is now paying a full context sync", which is the
-    /// optimisation silently undone.
-    not_ready_retries: u32,
-}
+/// The unit every span size is a whole number of, and the guard in front of it.
+pub(crate) const GRANULARITY: usize = 2 << 20;
 
-/// Free memory a range leaves to the driver: its own allocations — module
-/// loads, a context's local memory, a library's workspace — are taken after
-/// the span is mapped and would otherwise find the card full.
+/// Free memory the span leaves to the driver: its own allocations — module
+/// loads, a context's local memory, a library's workspace — are taken after the
+/// span is claimed and would otherwise find the card full.
 const FREE_MARGIN: usize = 256 << 20;
 
-/// How many `granularity`-byte granules fit in `free` bytes of free device
-/// memory, [`FREE_MARGIN`] left over.
-fn granules_that_fit(free: usize, granularity: usize) -> usize {
-    free.saturating_sub(FREE_MARGIN) / granularity.max(1)
+/// The most of `want` bytes the span may ask for with `free` bytes free on the
+/// card: [`FREE_MARGIN`] and the guard granule left over, in whole granules.
+fn granted_at_most(want: usize, free: usize) -> usize {
+    let room = free.saturating_sub(FREE_MARGIN + GRANULARITY);
+    (want.min(room) / GRANULARITY) * GRANULARITY
 }
 
-fn check(res: CUresult, what: &str) -> Result<()> {
-    if res == CUresult::CUDA_SUCCESS {
-        return Ok(());
-    }
-    candle::bail!("{what} failed: {res:?}")
+/// The next size to ask for after `bytes` was refused: a thirty-second less,
+/// at least one granule, in whole granules — `0` when nothing smaller is left.
+fn step_down(bytes: usize) -> usize {
+    let less = (bytes / 32).max(GRANULARITY);
+    (bytes.saturating_sub(less) / GRANULARITY) * GRANULARITY
 }
 
-/// Stop here, by name, if this device has no virtual memory management API.
+/// One contiguous device allocation and the span it carries.
 ///
-/// Without it there is no reservation, and without a reservation there is no
-/// region tier, no fixed base pointer and no transient side — so every layer
-/// above would fail anyway, one indirection at a time, with whatever error the
-/// driver happened to return. This turns that into a single sentence naming the
-/// capability that is missing and where to read about it.
-fn require_vmm(device: CUdevice) -> Result<()> {
-    // SAFETY: `device` was obtained from a live CUDA context.
-    let supported = unsafe {
-        get_attribute(
-            device,
-            CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
-        )
-    }
-    .map_err(|e| candle::Error::Msg(format!("querying VMM support: {e}")))?;
-    if supported != 0 {
-        return Ok(());
-    }
-    candle::bail!(
-        "this CUDA device reports no virtual memory management support \
-         (CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = 0), and the KV \
-         reservation is built on it. There is deliberately no second allocation \
-         path — see docs/archived/arena_unification.md §3.2. VMM is commonly absent under \
-         WSL2, on vGPU/MIG-partitioned devices, and on older drivers; run on a \
-         device with native VMM support, or build the single-allocation variant \
-         behind `Reservation` for this target."
-    )
-}
-
-/// The allocation property block describing "pinned device memory on `device`".
-fn alloc_prop(device: CUdevice) -> CUmemAllocationProp_st {
-    let mut prop: CUmemAllocationProp_st = unsafe { std::mem::zeroed() };
-    prop.type_ = CUmemAllocationType_enum::CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.requestedHandleTypes = CUmemAllocationHandleType_enum::CU_MEM_HANDLE_TYPE_NONE;
-    prop.location = CUmemLocation_st {
-        type_: CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE,
-        id: device,
-    };
-    prop
+/// Dropping it frees the allocation. Nothing hands out sub-ranges here — carving
+/// is the region layer's job; this owns only the memory.
+pub(crate) struct Reservation {
+    /// The allocation the driver returned: the guard granule's first byte.
+    alloc_base: CUdeviceptr,
+    /// The span's first byte, one granule past `alloc_base`.
+    base: CUdeviceptr,
+    /// Bytes of span, past the guard.
+    reserved: usize,
+    /// Bytes from `base` claimed and zero-filled so far.
+    mapped: usize,
+    context: Arc<CudaContext>,
+    /// The device's stream, which the zero-fill is queued on.
+    stream: Arc<CudaStream>,
 }
 
 impl Reservation {
-    /// Reserve `bytes` of address space on `stream`'s device, mapping nothing.
-    ///
-    /// Rounded up to the device's granule size, so the span is always a whole
-    /// number of granules.
-    ///
-    /// Fails immediately, naming the capability, on a device without VMM — there
-    /// is no fallback path (see the module header).
+    /// Allocate a span of up to `bytes`, rounded down to whole granules, on
+    /// `stream`'s device — the most of it the card grants. Claims nothing yet:
+    /// [`Self::map_range`] zero-fills what the span hands out.
     pub(crate) fn reserve(stream: &Arc<CudaStream>, bytes: usize) -> Result<Self> {
-        let device = stream.context().cu_device();
-        require_vmm(device)?;
-        let prop = alloc_prop(device);
-        let mut granularity: usize = 0;
-        // SAFETY: `prop` is fully initialised above and `granularity` is a
-        // valid out-pointer; the call only reads the former and writes the
-        // latter.
-        check(
-            unsafe {
-                candle::cuda_backend::cudarc::driver::sys::cuMemGetAllocationGranularity(
-                    &mut granularity,
-                    &prop,
-                    CUmemAllocationGranularity_flags_enum::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
-                )
-            },
-            "cuMemGetAllocationGranularity",
-        )?;
-        if granularity == 0 {
-            candle::bail!("cuMemGetAllocationGranularity reported a zero granule size")
+        let context = stream.context().clone();
+        context
+            .bind_to_thread()
+            .map_err(|e| candle::Error::Msg(format!("reservation: bind: {e}")))?;
+        let (free, _) =
+            mem_get_info().map_err(|e| candle::Error::Msg(format!("cuMemGetInfo: {e}")))?;
+        let mut size = granted_at_most(bytes, free);
+        loop {
+            if size == 0 {
+                candle::bail!(
+                    "reservation: the card granted no span of the {bytes} B asked for \
+                     ({free} B free, {FREE_MARGIN} B left to the driver)"
+                );
+            }
+            // The guard granule rides in front of the span (see the module
+            // header). Straight to the driver: this is the span itself.
+            // SAFETY: a plain device allocation, freed in `drop`.
+            match unsafe { malloc_sync(size + GRANULARITY) } {
+                Ok(alloc_base) => {
+                    return Ok(Self {
+                        alloc_base,
+                        base: alloc_base + GRANULARITY as u64,
+                        reserved: size,
+                        mapped: 0,
+                        context,
+                        stream: stream.clone(),
+                    })
+                }
+                Err(DriverError(CUresult::CUDA_ERROR_OUT_OF_MEMORY)) => size = step_down(size),
+                Err(e) => candle::bail!("reservation: cuMemAlloc of {size} B failed: {e}"),
+            }
         }
-        let reserved = bytes.div_ceil(granularity) * granularity;
-
-        let mut base: CUdeviceptr = 0;
-        // SAFETY: a fresh reservation — `addr` 0 lets the driver choose the
-        // range, and `flags` 0 is the only defined value.
-        check(
-            unsafe {
-                candle::cuda_backend::cudarc::driver::sys::cuMemAddressReserve(
-                    &mut base, reserved, 0, 0, 0,
-                )
-            },
-            "cuMemAddressReserve",
-        )?;
-
-        Ok(Self {
-            base,
-            reserved,
-            granularity,
-            granules: vec![None; reserved / granularity],
-            mapped: 0,
-            device,
-            context: stream.context().clone(),
-            stream: stream.clone(),
-            not_ready_retries: 0,
-        })
     }
 
     /// Device address of the span's first byte.
@@ -228,456 +126,171 @@ impl Reservation {
         self.base
     }
 
-    /// Bytes of address space reserved (a whole number of granules).
+    /// Bytes of span the allocation holds (a whole number of granules).
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.reserved
     }
 
-    /// The device's granule size.
+    /// The unit every span size is a whole number of.
     pub(crate) fn granularity(&self) -> usize {
-        self.granularity
+        GRANULARITY
     }
 
-    /// Bytes of physical memory currently mapped into the span.
+    /// Bytes from the span's base claimed so far.
+    #[cfg(test)]
     pub(crate) fn mapped_bytes(&self) -> usize {
-        self.mapped * self.granularity
+        self.mapped
     }
 
-    /// Back granule `idx` with physical memory and prove it is usable.
-    ///
-    /// Returns `Ok(false)` when the driver refuses — either at create time or,
-    /// far more often, at the zero-fill that follows (see the module header).
-    /// That refusal is the measurement of `C`, not an error, so ballooning can
-    /// stop cleanly; anything else *is* an error.
-    pub(crate) fn map_granule(&mut self, idx: usize) -> Result<bool> {
-        if idx >= self.granules.len() {
-            return Ok(false);
+    /// Claim `[offset, offset + bytes)` of the span — rounded up to whole
+    /// granules and clipped at its end — zero-filling it. Returns the bytes of
+    /// the range claimed: the request, or less where it ran past the span.
+    pub(crate) fn map_range(&mut self, offset: usize, bytes: usize) -> Result<usize> {
+        let start = (offset / GRANULARITY) * GRANULARITY;
+        let end = (offset + bytes)
+            .div_ceil(GRANULARITY)
+            .saturating_mul(GRANULARITY)
+            .min(self.reserved);
+        if end <= start {
+            return Ok(0);
         }
-        if self.granules[idx].is_some() {
-            return Ok(true);
-        }
-        let len = self.granularity;
-        let addr = self.base + (idx * len) as u64;
-        let prop = alloc_prop(self.device);
-        let mut handle: u64 = 0;
-        // SAFETY: `prop` describes pinned device memory on this device; the
-        // handle is a valid out-pointer.
-        let res = unsafe {
-            candle::cuda_backend::cudarc::driver::sys::cuMemCreate(&mut handle, len, &prop, 0)
-        };
-        let res = self.retry_if_not_ready("cuMemCreate", idx, res, || unsafe {
-            candle::cuda_backend::cudarc::driver::sys::cuMemCreate(&mut handle, len, &prop, 0)
-        });
-        if res == CUresult::CUDA_ERROR_OUT_OF_MEMORY {
-            return Ok(false);
-        }
-        check(res, "cuMemCreate")?;
-
-        // SAFETY: `addr` names granule `idx` of this reservation, which is
-        // unmapped (checked above), and `handle` is a live allocation of
-        // exactly `len` bytes.
-        let mapped =
-            unsafe { candle::cuda_backend::cudarc::driver::sys::cuMemMap(addr, len, 0, handle, 0) };
-        let mapped = self.retry_if_not_ready("cuMemMap", idx, mapped, || unsafe {
-            candle::cuda_backend::cudarc::driver::sys::cuMemMap(addr, len, 0, handle, 0)
-        });
-        if mapped != CUresult::CUDA_SUCCESS {
-            // Release the granule rather than leak it: it is mapped nowhere.
-            // SAFETY: `handle` is live and unmapped.
-            unsafe { candle::cuda_backend::cudarc::driver::sys::cuMemRelease(handle) };
-            if mapped == CUresult::CUDA_ERROR_OUT_OF_MEMORY {
-                return Ok(false);
-            }
-            check(mapped, "cuMemMap")?;
-        }
-
-        // Mapping alone does not make the range usable; access has to be
-        // granted explicitly, and forgetting it fails later as an illegal
-        // address rather than here.
-        let desc = CUmemAccessDesc {
-            location: CUmemLocation_st {
-                type_: CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE,
-                id: self.device,
-            },
-            flags: CUmemAccess_flags_enum::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
-        };
-        // SAFETY: the range was just mapped, and `desc` names this device.
-        let access = unsafe {
-            candle::cuda_backend::cudarc::driver::sys::cuMemSetAccess(addr, len, &desc, 1)
-        };
-        // The call this was first seen on — see `retry_if_not_ready`. It is not
-        // special; it was simply the one the llama3 span reached first.
-        let access = self.retry_if_not_ready("cuMemSetAccess", idx, access, || unsafe {
-            candle::cuda_backend::cudarc::driver::sys::cuMemSetAccess(addr, len, &desc, 1)
-        });
-        if access != CUresult::CUDA_SUCCESS {
-            self.discard(addr, handle);
-            check(access, "cuMemSetAccess")?;
-        }
-
-        // The touch. This is the real capacity test, and it doubles as the
-        // zero-fill the region tier relies on — a region whose `dirty_epoch` is
-        // still zero is handed to its first tenant *without* cleaning, on the
-        // strength of this write.
-        //
-        // The fill is queued on the device's stream, not awaited. That is fine
-        // for the two things this write is for, because both are read long after
-        // the balloon finishes, behind it on the same stream. It is *not* fine
-        // against an unmap, so the span's teardown paths fence first; see
-        // [`Reservation::fence`]. Queued with no capture in flight
-        // (`without_recording`), which a span being mapped never waits on: it is
-        // mapped at creation and when the load's headroom is reclaimed, both
-        // before the first forward.
+        let len = end - start;
         self.context
             .bind_to_thread()
             .map_err(|e| candle::Error::Msg(format!("bind_to_thread: {e}")))?;
         let stream = self.stream.cu_stream();
-        // SAFETY: the range is mapped and read/write accessible from this
-        // device, and `len` is exactly its length.
-        let filled = without_recording(|_| unsafe { memset_d8_async(addr, 0, len, stream) })?;
-        if let Err(e) = filled {
-            self.discard(addr, handle);
-            log::debug!(
-                "reservation: granule {idx} refused at the touch ({e:?}) — {} B claimed",
-                self.mapped_bytes()
-            );
-            return Ok(false);
-        }
-
-        self.granules[idx] = Some(handle);
-        self.mapped += 1;
-        Ok(true)
+        let at = self.base + start as u64;
+        // Queued with no capture in flight (`without_recording`), which a span
+        // being claimed never waits on: it is claimed at creation, before the
+        // first forward.
+        // SAFETY: `[at, at + len)` lies inside this allocation.
+        without_recording(|_| unsafe { memset_d8_async(at, 0, len, stream) })?
+            .map_err(|e| candle::Error::Msg(format!("reservation: zero-fill: {e}")))?;
+        self.mapped = self.mapped.max(end);
+        Ok(len)
     }
 
-    /// Run one driver call, and if it refuses with `NOT_READY`, drain what this
-    /// span has queued and try once more.
-    ///
-    /// # Why the whole loop needs this, not one call
-    ///
-    /// `map_granule` queues an asynchronous zero-fill per granule and moves on,
-    /// which is the point — a host wait per granule is what queuing the fill
-    /// exists to remove, and a balloon maps hundreds of them. The consequence is
-    /// that every driver call the loop makes afterwards runs with earlier fills
-    /// still in flight, and the driver may answer `CUDA_ERROR_NOT_READY` rather
-    /// than serialising against them itself.
-    ///
-    /// That is not a failure of the call it is reported on. It surfaced on
-    /// `cuMemSetAccess` — a call with nothing wrong with it, reporting someone
-    /// else's pending work — and failed the whole span reservation:
-    /// `test_parallel_batched_forwarding_llama3` failed five times out of five,
-    /// while `_llama2`, whose span needs fewer granules, passed every time. The
-    /// bigger the span, the more fills in flight, the likelier the loop overtakes
-    /// the driver.
-    ///
-    /// So it is applied to **all three** of `cuMemCreate` / `cuMemMap` /
-    /// `cuMemSetAccess`: the condition belongs to the loop, and patching only the
-    /// call that happened to report it first leaves the same trap for the next
-    /// span shape that reaches a different one.
-    ///
-    /// # What the fence actually proves
-    ///
-    /// [`Self::fence`] is a full context synchronize, so it drains *any*
-    /// outstanding work, not specifically the fill. The fill is the only thing
-    /// this loop queues and so is the obvious culprit — but the repair does not
-    /// depend on that being right, which is deliberate: a retry that waits for
-    /// everything cannot be defeated by the diagnosis being incomplete.
-    ///
-    /// Retries are counted and reported (see [`Self::not_ready_retries`]) rather
-    /// than swallowed. A silent retry turns a real driver condition into folklore;
-    /// if this starts firing on every granule, that is a finding, not a shrug.
-    fn retry_if_not_ready(
-        &mut self,
-        what: &str,
-        idx: usize,
-        first: CUresult,
-        mut call: impl FnMut() -> CUresult,
-    ) -> CUresult {
-        if first != CUresult::CUDA_ERROR_NOT_READY {
-            return first;
-        }
-        self.not_ready_retries += 1;
-        log::debug!(
-            "reservation: {what} refused granule {idx} with NOT_READY — draining \
-             {} queued granule fill(s) and retrying",
-            self.mapped,
-        );
-        self.fence();
-        call()
-    }
-
-    /// Wait for every write this span has queued, before any of it is unmapped.
-    ///
-    /// The mapping touch ([`Reservation::map_granule`]) is a fill queued on the
-    /// device's stream, so a granule can still be being written when the code
-    /// below decides to tear it down. Unmapping under a live write is a hardware
-    /// exception — and one raised by whichever unrelated call synchronises next,
-    /// which is almost never the code that caused it. It showed up as three
-    /// unrelated tests in this crate failing about one run in eight, and it
-    /// disappeared under `CUDA_LAUNCH_BLOCKING=1`: the shape of every
-    /// async-lifetime bug.
-    ///
-    /// The cost is nil because the teardown paths are: the balloon's single
-    /// refusal, and dropping the span. Neither is per-granule and neither is on
-    /// a forward. Errors are swallowed on purpose — this runs from `Drop`, and a
-    /// context already faulted has a real failure being reported elsewhere.
+    /// Wait for every write this span has queued, before it is freed.
     ///
     /// **Through the record gate, waiting.** A context-wide synchronise
     /// invalidates any capture in flight, so it waits for none to be recording.
-    /// Waiting is safe here because every caller runs where no wave can be
-    /// recording or waiting on a lock this thread holds: the span is mapped at
-    /// creation and when the load's headroom is reclaimed, both before the
-    /// first forward, and dropped at the end of the process.
+    /// Waiting is safe here because the one caller is the drop at the end of
+    /// the process. Errors are swallowed on purpose — this runs from `Drop`, and
+    /// a context already faulted has a real failure being reported elsewhere.
     fn fence(&self) {
         let _ = without_recording(|quiet| quiet.synchronize_context(&self.context));
-    }
-
-    /// Unmap and release a granule that failed part-way through mapping.
-    fn discard(&self, addr: CUdeviceptr, handle: u64) {
-        self.fence();
-        // SAFETY: `addr` is mapped to `handle`, which is live; both are being
-        // abandoned together so neither is used again.
-        unsafe {
-            candle::cuda_backend::cudarc::driver::sys::cuMemUnmap(addr, self.granularity);
-            candle::cuda_backend::cudarc::driver::sys::cuMemRelease(handle);
-        }
-    }
-
-    /// Back every granule of `[offset, offset + bytes)`, stopping at a refusal.
-    ///
-    /// Returns the number of bytes of the range that are backed on return —
-    /// equal to the rounded-up request when the whole range was claimed, and
-    /// less when the driver refused part-way. Callers size themselves from the
-    /// return value rather than assuming they got what they asked for.
-    ///
-    /// **Never past what the card has free.** The touch cannot refuse in time:
-    /// it is queued, and a granule the card cannot back is not refused there but
-    /// faults the first kernel to reach it — an illegal address (Xid 13, MMU
-    /// NACK) long after this returned. On a card another process already fills,
-    /// that is every granule past its free memory: a gallery harness beside a
-    /// `motherd` holding 70.7 of 73.4 GiB faulted at a random scan in every run,
-    /// and pushed the daemon itself into a device assert. So the range stops at
-    /// the free memory the driver reports, less [`FREE_MARGIN`] for the
-    /// driver's own allocations, exactly as at a refusal. On a card this
-    /// process has to itself, that is the card.
-    pub(crate) fn map_range(&mut self, offset: usize, bytes: usize) -> Result<usize> {
-        let first = offset / self.granularity;
-        let last = (offset + bytes).div_ceil(self.granularity);
-        self.context
-            .bind_to_thread()
-            .map_err(|e| candle::Error::Msg(format!("bind_to_thread: {e}")))?;
-        let (free, _) =
-            mem_get_info().map_err(|e| candle::Error::Msg(format!("cuMemGetInfo: {e}")))?;
-        let fit = granules_that_fit(free, self.granularity);
-        let mut claimed = 0;
-        let retries_before = self.not_ready_retries;
-        for idx in (first..last.min(self.granules.len())).take(fit) {
-            if !self.map_granule(idx)? {
-                break;
-            }
-            claimed += self.granularity;
-        }
-        // Reported once per range rather than per retry: the useful figure is the
-        // RATE. A handful across a few hundred granules is the loop occasionally
-        // overtaking the driver, which is the design working. One per granule
-        // means every mapping is paying a full context sync, and the queued fill
-        // has quietly become a synchronous one — the optimisation undone without
-        // anything failing.
-        let retries = self.not_ready_retries - retries_before;
-        if retries > 0 {
-            let granules = claimed / self.granularity;
-            log::debug!(
-                "reservation: {retries} NOT_READY drain(s) over {granules} granule(s) \
-                 ({claimed} B claimed)",
-            );
-        }
-        Ok(claimed)
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        // Nothing may still be writing into the span we are about to unmap.
+        // Nothing may still be writing into the span about to be freed.
         self.fence();
-        for (idx, handle) in self.granules.drain(..).enumerate() {
-            let Some(handle) = handle else { continue };
-            // SAFETY: each granule was mapped at `base + idx × granularity` by
-            // `map_granule` and has not been unmapped since.
-            unsafe {
-                candle::cuda_backend::cudarc::driver::sys::cuMemUnmap(
-                    self.base + (idx * self.granularity) as u64,
-                    self.granularity,
-                );
-                candle::cuda_backend::cudarc::driver::sys::cuMemRelease(handle);
-            }
-        }
-        // SAFETY: the span is fully unmapped above, and `reserved` is the size
-        // it was reserved with.
-        unsafe {
-            candle::cuda_backend::cudarc::driver::sys::cuMemAddressFree(self.base, self.reserved);
-        }
+        // SAFETY: the allocation `reserve` made, freed once.
+        let _ = unsafe { free_sync(self.alloc_base) };
+    }
+}
+
+#[cfg(test)]
+mod sizing_tests {
+    use super::{granted_at_most, step_down, FREE_MARGIN, GRANULARITY};
+
+    const MIB: usize = 1 << 20;
+
+    /// **A span asks for at most the card's free memory, less the driver's
+    /// margin and the guard granule, in whole granules.** 1 GiB free leaves
+    /// 1024 − 256 − 2 = 766 MiB, granule-aligned to 766; asking for less gets
+    /// what was asked, rounded down.
+    #[test]
+    fn a_span_asks_for_the_free_memory_less_the_margin_and_the_guard() {
+        assert_eq!(granted_at_most(usize::MAX, 1024 * MIB), 766 * MIB);
+        assert_eq!(granted_at_most(100 * MIB + 1, 1024 * MIB), 100 * MIB);
+        assert_eq!(granted_at_most(usize::MAX, FREE_MARGIN + GRANULARITY), 0);
+        assert_eq!(granted_at_most(usize::MAX, 0), 0);
+    }
+
+    /// **A refusal steps down by a thirty-second, at least a granule**, to
+    /// nothing once a granule is refused.
+    #[test]
+    fn a_refused_size_steps_down_a_thirty_second_at_least_a_granule() {
+        assert_eq!(step_down(64 * 1024 * MIB), 62 * 1024 * MIB);
+        assert_eq!(step_down(32 * MIB), 30 * MIB);
+        assert_eq!(step_down(2 * MIB), 0);
+        assert_eq!(step_down(0), 0);
     }
 }
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
-    use super::{granules_that_fit, Reservation};
+    use super::{Reservation, GRANULARITY};
+    use candle::cuda_backend::cudarc::driver::result::{memcpy_dtoh_async, memcpy_htod_async};
+    use candle::cuda_backend::StreamLease;
     use candle::{Device, Result};
 
-    /// **A range maps only what the card has free, the margin left over.**
-    /// 1 GiB free in 2 MiB granules leaves 768 MiB past the 256 MiB margin:
-    /// 384 granules. Less free than the margin maps nothing.
-    #[test]
-    fn a_range_fits_in_the_free_memory_less_the_margin() {
-        assert_eq!(granules_that_fit(1 << 30, 2 << 20), 384);
-        assert_eq!(granules_that_fit(256 << 20, 2 << 20), 0);
-        assert_eq!(granules_that_fit(100 << 20, 2 << 20), 0);
-        assert_eq!(granules_that_fit((256 << 20) + (5 << 20), 2 << 20), 2);
-    }
+    use crate::kv_cache::chunked::gpu_test_lock::{gpu_serial, GpuGuard};
 
-    /// A CUDA stream **and** the crate-wide GPU serialisation guard.
-    ///
-    /// Returned together so the lock cannot be forgotten: these tests reserve
-    /// and map device address space, which is the same process-global resource
-    /// every `ChunkedKvBacking` draws on
-    /// (`crate::kv_cache::chunked::gpu_test_lock`). Running unserialised against
-    /// another GPU test surfaces as a failed mapping or an illegal access, and
-    /// the context stays poisoned for everything scheduled afterwards.
-    #[allow(clippy::type_complexity)]
-    fn stream() -> Option<(
-        candle::cuda_backend::StreamLease,
-        crate::kv_cache::chunked::gpu_test_lock::GpuGuard,
-    )> {
-        let guard = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
+    /// A CUDA stream **and** the crate-wide GPU serialisation guard, returned
+    /// together so the lock cannot be forgotten: these tests allocate device
+    /// memory, which every `ChunkedKvBacking` draws on too.
+    fn stream() -> Option<(StreamLease, GpuGuard)> {
+        let guard = gpu_serial();
         match Device::new_cuda(0) {
             Ok(Device::Cuda(d)) => Some((d.cuda_stream(), guard)),
             _ => None,
         }
     }
 
-    /// The allocator has no second path, so VMM support is a hard requirement
-    /// of the machine rather than a preference. Asserting it here means an
-    /// unsupported target says so in the test suite instead of at the first KV
-    /// cache of a benchmark run.
+    /// Sizes are whole granules, and the span starts one guard granule into
+    /// its allocation.
     #[test]
-    fn the_device_supports_vmm() -> Result<()> {
+    fn a_span_is_whole_granules_behind_a_guard() -> Result<()> {
         let Some((s, _gpu)) = stream() else {
             return Ok(());
         };
-        super::require_vmm(s.context().cu_device())
-    }
-
-    /// Reserving address space costs no physical memory, so a span far larger
-    /// than the card must still succeed. This is the property the whole design
-    /// rests on: addresses are fixed up front, memory is claimed later.
-    #[test]
-    fn reserving_more_than_the_card_costs_nothing() -> Result<()> {
-        let Some((s, _gpu)) = stream() else {
-            return Ok(());
-        };
-        let r = Reservation::reserve(&s, 64 * 1024 * 1024 * 1024)?;
-        assert!(r.base() != 0);
-        assert_eq!(r.mapped_bytes(), 0, "reserving must map nothing");
-        assert!(r.reserved_bytes() >= 64 * 1024 * 1024 * 1024);
+        let r = Reservation::reserve(&s, 3 * GRANULARITY + 1)?;
+        assert_eq!(r.reserved_bytes(), 3 * GRANULARITY);
+        assert_eq!(r.base(), r.alloc_base + GRANULARITY as u64);
+        assert_eq!(r.mapped_bytes(), 0, "reserving claims nothing");
         Ok(())
     }
 
-    /// Sizes round up to the granule, so a span is always a whole number of
-    /// granules — which is what lets region carving assume alignment.
+    /// Claimed memory is usable at the span's address and comes back zeroed.
     #[test]
-    fn reservations_are_whole_granules() -> Result<()> {
+    fn claimed_memory_is_zeroed_and_usable_at_the_span_address() -> Result<()> {
         let Some((s, _gpu)) = stream() else {
             return Ok(());
         };
-        let r = Reservation::reserve(&s, 1)?;
-        let g = r.granularity();
-        assert!(g > 0 && g.is_power_of_two(), "odd granule size {g}");
-        assert_eq!(r.reserved_bytes(), g, "1 byte should round to one granule");
-        Ok(())
-    }
-
-    /// Mapping makes memory real and readable at the reserved address, and
-    /// unmapping on drop returns it.
-    #[test]
-    fn mapped_memory_is_usable_at_the_reserved_address() -> Result<()> {
-        let Some((s, _gpu)) = stream() else {
-            return Ok(());
-        };
-        let mut r = Reservation::reserve(&s, 8 * 1024 * 1024)?;
-        assert!(
-            r.map_range(0, 1024 * 1024)? >= 1024 * 1024,
-            "mapping 1 MiB should succeed"
-        );
-        assert!(r.mapped_bytes() >= 1024 * 1024);
-
-        // Write a pattern through the reserved address and read it back: this
-        // is what proves `cuMemSetAccess` was applied, since a mapped-but-
-        // inaccessible range faults instead.
-        let bytes = vec![0xA5u8; 4096];
-        // SAFETY: the first granule is mapped and readable/writable, and 4096
-        // is well inside it.
-        unsafe {
-            candle::cuda_backend::cudarc::driver::result::memcpy_htod_async(
-                r.base(),
-                &bytes,
-                s.cu_stream(),
-            )
-        }
-        .map_err(|e| candle::Error::Msg(format!("htod into reservation: {e}")))?;
+        let mut r = Reservation::reserve(&s, 4 * GRANULARITY)?;
+        assert_eq!(r.map_range(0, GRANULARITY)?, GRANULARITY);
+        let mut zero = vec![0xFFu8; 4096];
+        // SAFETY: the first granule is claimed and 4096 is well inside it.
+        unsafe { memcpy_dtoh_async(&mut zero, r.base(), s.cu_stream()) }
+            .map_err(|e| candle::Error::Msg(format!("dtoh: {e}")))?;
+        let pattern = vec![0xA5u8; 4096];
+        // SAFETY: as above.
+        unsafe { memcpy_htod_async(r.base(), &pattern, s.cu_stream()) }
+            .map_err(|e| candle::Error::Msg(format!("htod: {e}")))?;
         let mut back = vec![0u8; 4096];
         // SAFETY: as above, reading the range just written.
-        unsafe {
-            candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async(
-                &mut back,
-                r.base(),
-                s.cu_stream(),
-            )
-        }
-        .map_err(|e| candle::Error::Msg(format!("dtoh from reservation: {e}")))?;
+        unsafe { memcpy_dtoh_async(&mut back, r.base(), s.cu_stream()) }
+            .map_err(|e| candle::Error::Msg(format!("dtoh: {e}")))?;
         s.synchronize()
             .map_err(|e| candle::Error::Msg(format!("sync: {e}")))?;
-        assert_eq!(back, bytes, "reservation did not hold what was written");
+        assert_eq!(zero, vec![0u8; 4096], "a claimed range must be zero");
+        assert_eq!(back, pattern, "the span did not hold what was written");
         Ok(())
     }
 
-    /// Mapping stops at the end of the span rather than running past it.
+    /// A claim stops at the span's end, and a range claimed twice is claimed.
     #[test]
-    fn mapping_stops_at_the_span_end() -> Result<()> {
+    fn a_claim_stops_at_the_span_end() -> Result<()> {
         let Some((s, _gpu)) = stream() else {
             return Ok(());
         };
-        let mut r = Reservation::reserve(&s, 1)?;
-        assert!(r.map_granule(0)?, "the single granule should map");
-        assert!(!r.map_granule(1)?, "a second granule must not fit");
-        assert_eq!(r.mapped_bytes(), r.reserved_bytes());
-        Ok(())
-    }
-
-    /// Every granule is written as it is mapped — both to prove the memory is
-    /// real (the create alone does not, §3.2) and to leave it zeroed, which the
-    /// region tier relies on for a freshly-claimed arena.
-    #[test]
-    fn mapping_leaves_the_granule_zeroed() -> Result<()> {
-        let Some((s, _gpu)) = stream() else {
-            return Ok(());
-        };
-        let mut r = Reservation::reserve(&s, 1)?;
-        assert!(r.map_granule(0)?);
-        let mut back = vec![0xFFu8; 4096];
-        // SAFETY: granule 0 is mapped read/write and 4096 is well inside it.
-        unsafe {
-            candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async(
-                &mut back,
-                r.base(),
-                s.cu_stream(),
-            )
-        }
-        .map_err(|e| candle::Error::Msg(format!("dtoh from reservation: {e}")))?;
-        s.synchronize()
-            .map_err(|e| candle::Error::Msg(format!("sync: {e}")))?;
-        assert!(
-            back.iter().all(|&b| b == 0),
-            "a mapped granule must be zero"
-        );
+        let mut r = Reservation::reserve(&s, 2 * GRANULARITY)?;
+        assert_eq!(r.map_range(GRANULARITY, 4 * GRANULARITY)?, GRANULARITY);
+        assert_eq!(r.map_range(4 * GRANULARITY, GRANULARITY)?, 0);
+        assert_eq!(r.mapped_bytes(), 2 * GRANULARITY);
         Ok(())
     }
 }

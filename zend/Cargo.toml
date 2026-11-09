@@ -135,6 +135,8 @@ profile = ["candle-conversation/profile", "host/profile"]
 # `Tensor::assert` / `QTensor::assert` — one launch per assert site, no sync and
 # no allocation. A debugging session, not a default: the launches are real work.
 tensor-assert = ["candle-conversation/tensor-assert"]
+# Panic on every driver allocation — see `candle-core/Cargo.toml`.
+driver-alloc-panic = ["candle-conversation/driver-alloc-panic"]
 # Name the call sites that allocate from the CUDA driver during a wave — see
 # `candle::forbidden_alloc`. Diagnostic; the daemon logs one report per wave
 # window that finds anything.

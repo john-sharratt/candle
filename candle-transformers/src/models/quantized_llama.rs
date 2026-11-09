@@ -841,7 +841,7 @@ impl ModelWeights {
         // After the governor, so the span is sized from a measured card, and
         // before the baseline below, so the span's own mapping is not read as
         // weight bytes (`dense_span`).
-        dense_span::open_for_load(device, &ct)?;
+        let _load = dense_span::open_for_load(device, &ct)?;
 
         // Driver-used VRAM baseline before any weights load (delta = weight footprint).
         #[cfg(feature = "cuda")]
@@ -1105,7 +1105,7 @@ impl ModelWeights {
         // After the governor, so the span is sized from a measured card, and
         // before the baseline below, so the span's own mapping is not read as
         // weight bytes (`dense_span`).
-        dense_span::open_for_load(device, &ct)?;
+        let _load = dense_span::open_for_load(device, &ct)?;
 
         // Driver-used VRAM baseline before any weights load (delta = weight footprint).
         #[cfg(feature = "cuda")]

@@ -645,7 +645,7 @@ impl ModelWeights {
         // Claim the reservation before the baseline below is taken, so the span's
         // own mapping is not read as weight bytes — and before any tensor, which
         // is what lets the weights be carved out of it (`dense_span`).
-        dense_span::open_for_load(device, &ct)?;
+        let _load = dense_span::open_for_load(device, &ct)?;
         let mut gg = Gguf::new(ct, reader, device.clone());
         // Driver-used VRAM baseline before any weights load — the delta to the
         // fully-built model is the fixed resident-weight footprint.
@@ -835,7 +835,7 @@ impl ModelWeights {
 
         // Before the baseline, so the span's own mapping is not read as weight
         // bytes, and before any tensor, so the weights can be carved from it.
-        dense_span::open_for_load(device, &ct)?;
+        let _load = dense_span::open_for_load(device, &ct)?;
 
         // Driver-used VRAM baseline before any weights load — the delta to the
         // fully-built model is the fixed resident-weight footprint.

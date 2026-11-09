@@ -59,6 +59,8 @@
 //! argmax always clears the threshold. At temperature zero the row is a point
 //! mass and the sample is the argmax, so greedy verification is unchanged.
 
+#[cfg(feature = "cuda")]
+use crate::models::held_tensor::held_empty;
 use candle::{DType, Result, Tensor};
 
 /// The Medusa typical-acceptance thresholds: a draft is accepted when its
@@ -361,7 +363,12 @@ impl TokenChooser for GreedyChooser {
             .as_ref()
             .is_some_and(|p| p.elem_count() >= n && p.device().same_device(logits.device()));
         if !fits {
-            self.picks = Some(Tensor::empty(n, DType::U32, logits.device())?);
+            // Kept across steps, so on held ground rather than the driver's.
+            #[cfg(feature = "cuda")]
+            let picks = held_empty(n, DType::U32, logits.device())?;
+            #[cfg(not(feature = "cuda"))]
+            let picks = Tensor::empty(n, DType::U32, logits.device())?;
+            self.picks = Some(picks);
         }
         let picks = self.picks.as_ref().expect("sized above").narrow(0, 0, n)?;
         logits.batched_sample_argmax_into(self.live_vocab, &picks)?;

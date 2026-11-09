@@ -4,7 +4,7 @@
 //! them:
 //!
 //! ```ignore
-//! dense_span::open_for_load(device, content)?;   // before the first tensor
+//! let _load = dense_span::open_for_load(device, content)?;   // before the first tensor
 //! …                                             // weights land in the span
 //! dense_span::close_load(device)?;               // before anything else claims
 //! ```
@@ -34,51 +34,92 @@
 //! as a backstop) which is exactly what makes the omission invisible, so the
 //! call is worth having one definition of.
 
+#[cfg(feature = "cuda")]
+use candle::cuda_backend::LoadWindow;
 use candle::quantized::{gguf_file, QTensor};
 use candle::{Device, Result};
 
-/// Claim the device reservation before a checkpoint's tensors are read.
+/// A model load in progress: open from [`open_for_load`] until the loader that
+/// holds it returns.
 ///
-/// Returns `true` when this call claimed it, meaning this load's weights become
-/// span tenants. `false` means a reservation already existed — a second model in
-/// the same process — and the load proceeds through the CUDA pool exactly as it
-/// did before any of this. Neither is an error, and a caller that does not care
-/// which happened can ignore the answer.
+/// It stands the device's [`LoadWindow`], so the load's own allocations — its
+/// sources, the repack's bands, the layer pack's build after [`close_load`] — go
+/// to the driver, and a driver allocation made outside every load is the
+/// `driver-alloc-panic` feature's to refuse. Held by the loader for its whole
+/// body (`let _load = …`), so everything that builds the model is inside it.
+#[must_use = "the load window closes when this drops: bind it for the loader's whole body"]
+pub struct Load {
+    #[cfg(feature = "cuda")]
+    _window: Option<LoadWindow>,
+}
+
+/// Claim the device reservation before a checkpoint's tensors are read, and open
+/// the load's window.
+///
+/// The reservation is claimed when none exists yet, and this load's weights then
+/// become span tenants. A reservation that already exists — a second model in the
+/// same process — leaves the load to the driver, as before the span could hold
+/// it. Neither is an error.
 ///
 /// A no-op off CUDA.
-pub fn open_for_load(device: &Device, content: &gguf_file::Content) -> Result<bool> {
+pub fn open_for_load(device: &Device, content: &gguf_file::Content) -> Result<Load> {
     open_for_load_sized(device, peak_load_pool_bytes(content.tensor_infos.values()))
 }
 
 /// [`open_for_load`] with the pool headroom already computed — for a load that reads some of
 /// its tensors from outside `content` (see `qwen35::TensorOverrides::effective_infos`), whose
 /// largest source is therefore not the one `content`'s header names.
-pub fn open_for_load_sized(device: &Device, headroom: usize) -> Result<bool> {
+pub fn open_for_load_sized(device: &Device, headroom: usize) -> Result<Load> {
     #[cfg(feature = "cuda")]
     {
-        if matches!(device, Device::Cuda(_)) {
+        if let Device::Cuda(cuda) = device {
+            let window = LoadWindow::open(cuda.cuda_stream().context().ordinal());
             let claimed = candle_nn::kv_cache::ensure_reservation(device, headroom)?;
             if claimed {
                 tracing::info!(
                     target: "candle_transformers::dense_span",
                     headroom_mib = headroom >> 20,
                     "device reservation claimed before load; the largest source tensor and the \
-                     repack's bounded f32 band stay with the pool"
+                     repack's bounded f32 band stay with the driver"
                 );
             } else {
                 tracing::info!(
                     target: "candle_transformers::dense_span",
                     "a reservation already exists — this model's weights load through the \
-                     CUDA pool, as every model did before the span could hold them"
+                     driver, as every model did before the span could hold them"
                 );
             }
-            return Ok(claimed);
+            return Ok(Load {
+                _window: Some(window),
+            });
         }
     }
     #[cfg(not(feature = "cuda"))]
     let _ = headroom;
     let _ = device;
-    Ok(false)
+    Ok(Load {
+        #[cfg(feature = "cuda")]
+        _window: None,
+    })
+}
+
+/// Open a load window without touching the reservation — for the construction a
+/// model's runtime wrapper does once over a model already loaded (its RoPE
+/// tables, its fixed buffers), which is part of loading it.
+pub fn open_window(device: &Device) -> Load {
+    #[cfg(feature = "cuda")]
+    {
+        if let Device::Cuda(cuda) = device {
+            return Load {
+                _window: Some(LoadWindow::open(cuda.cuda_stream().context().ordinal())),
+            };
+        }
+    }
+    let _ = device;
+    Load {
+        #[cfg(feature = "cuda")]
+        _window: None,
+    }
 }
 
 /// Move a weight that is used as stored — not repacked — into the dense block.
@@ -148,19 +189,11 @@ pub fn place_in_dense(device: &Device, weight: QTensor) -> Result<QTensor> {
 /// A no-op off CUDA, and harmless when [`open_for_load`] returned `false`: the
 /// block is empty, so freezing it locks nothing.
 pub fn close_load(device: &Device) -> Result<usize> {
-    let dense = freeze(device)?;
-    reclaim_headroom(device)?;
-    Ok(dense)
+    freeze(device)
 }
 
 /// Lock the dense block's right edge. Every weight-side address is measured from
 /// it, so nothing may size a zone until this has run.
-///
-/// Split from [`reclaim_headroom`] because the two have different deadlines: the
-/// freeze must happen *before* anything carves a zone, and the reclaim must
-/// happen *after* the last repack that draws on the CUDA pool. For a resident
-/// model there is nothing in between and [`close_load`] does both; a streamed one
-/// builds its layer pack in the gap.
 pub fn freeze(device: &Device) -> Result<usize> {
     #[cfg(feature = "cuda")]
     {
@@ -172,41 +205,6 @@ pub fn freeze(device: &Device) -> Result<usize> {
                 "dense block locked; every weight-side address is now fixed"
             );
             return Ok(dense);
-        }
-    }
-    let _ = device;
-    Ok(0)
-}
-
-/// Give the load headroom back to the span.
-///
-/// **Only once every repack that draws on the CUDA pool has finished.**
-/// `open_for_load` conceded this ground so the pool could hold the largest source
-/// tensor and the repack's bands ([`peak_load_pool_bytes`]); taking it back while
-/// a repack still needs it leaves that pass with nothing but the governor's
-/// cushion.
-///
-/// That is not hypothetical — it was the ordering in-tree. `close_load` reclaimed
-/// here and was then called *before* `build_layers`, which repacks a whole layer
-/// at a time through `WeightResidency::Pool` to build the layer pack. Both
-/// `layer_stream::build`'s header and `docs/archived/qwen38_layer_streaming.md` §12.2 say
-/// `peak_load_pool_bytes` is what reserves room for exactly that pass, so the
-/// invariant was stated in two places and violated in one.
-///
-/// Growing the span moves its right edge and the weight side is placed downward
-/// from it, so this must still precede anything that carves a zone.
-/// `reclaim_load_headroom` re-checks that for itself.
-pub fn reclaim_headroom(device: &Device) -> Result<usize> {
-    #[cfg(feature = "cuda")]
-    {
-        if let Device::Cuda(cuda) = device {
-            let reclaimed = candle_nn::kv_cache::reclaim_load_headroom(&cuda.cuda_stream())?;
-            tracing::info!(
-                target: "candle_transformers::dense_span",
-                reclaimed_mib = reclaimed >> 20,
-                "load headroom returned to the span; the remainder is runtime ground"
-            );
-            return Ok(reclaimed);
         }
     }
     let _ = device;

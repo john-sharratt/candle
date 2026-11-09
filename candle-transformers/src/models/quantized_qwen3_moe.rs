@@ -865,7 +865,7 @@ impl ModelWeights {
 
         // Before any tensor, so the weights are carved from the reservation
         // rather than from the CUDA pool (`dense_span`).
-        dense_span::open_for_load(device, ct)?;
+        let _load = dense_span::open_for_load(device, ct)?;
 
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),

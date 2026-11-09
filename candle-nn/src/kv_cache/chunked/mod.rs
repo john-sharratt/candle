@@ -29,6 +29,11 @@
 // Submodules
 mod alloc;
 mod arena;
+/// Device work between forwards, on a bump of held ground.
+#[cfg(feature = "cuda")]
+mod aside;
+#[cfg(not(feature = "cuda"))]
+mod aside_cpu;
 mod backing;
 mod band_codec;
 mod block_round_trip;
@@ -132,6 +137,8 @@ mod vram_bands;
 #[cfg(feature = "cuda")]
 mod wave_census;
 pub mod wave_plan;
+#[cfg(feature = "cuda")]
+mod wave_release;
 /// Unconditional: the phase spans are measurements, and everything that reads
 /// them — the region carve, the row pricing — is integer arithmetic.
 pub mod wave_spans;
@@ -212,6 +219,10 @@ pub use alloc::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use alloc::{ReserveClass, ReserveReport};
 #[cfg(feature = "cuda")]
+pub use aside::aside;
+#[cfg(not(feature = "cuda"))]
+pub use aside_cpu::aside;
+#[cfg(feature = "cuda")]
 pub use bump_arena::{
     begin_forward, begin_guest, begin_wave, close_guest_arena, cover_wave_transient,
     end_wave_transient, guest_chain, guest_domain_stats, guest_stage, open_guest_arena,
@@ -230,11 +241,11 @@ pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
     forget_recent_tiers, freeze_dense, held_ground_next_claim, held_ground_sites,
     held_ground_stats, held_ground_top_rank, initial_weight_bytes, kv_spare_regions,
-    provision_held_ground, reclaim_empty_arenas, reclaim_load_headroom, region_stats,
-    set_ground_broker, set_kv_free_target, set_prompts_waiting, set_weight_floor,
-    settle_held_ground, span_end, span_layout, span_partition, span_partition_now,
-    span_region_refusal, spare_tally, weight_capacity_bytes, weight_floor_after, RegionStats,
-    SpanClaims, SpanLayout, SpanPartition, SpanRegion, REGION_BYTES,
+    provision_held_ground, reclaim_empty_arenas, region_stats, set_ground_broker,
+    set_kv_free_target, set_prompts_waiting, set_weight_floor, settle_held_ground, span_end,
+    span_layout, span_partition, span_partition_now, span_region_refusal, spare_tally,
+    weight_capacity_bytes, weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanPartition,
+    SpanRegion, REGION_BYTES,
 };
 pub use region_runs::{runs_from, RegionRun};
 #[cfg(feature = "cuda")]

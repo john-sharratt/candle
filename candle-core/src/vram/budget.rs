@@ -118,21 +118,14 @@ pub struct GovernorConfig {
 /// **512 → 256 → 512.** What this covers is pool growth between `expert_budget` being computed
 /// and the load finishing — a load-time window, not a serving one. Two changes shrank that
 /// window rather than the memory behind it: the repack's f32 intermediate is a bounded band
-/// instead of the whole tensor (`REPACK_BAND_BYTES`, ~48 MiB against 4,850 for the 27B's head),
-/// and the load headroom it used to compete with is returned to the span at `close_load`. Every
-/// MiB here is a MiB neither the expert cache nor the KV side can use, and on a card that
-/// streams it is layer slots — so 256 looked right.
+/// instead of the whole tensor (`REPACK_BAND_BYTES`, ~48 MiB against 4,850 for the 27B's head).
+/// Every MiB here is a MiB neither the expert cache nor the KV side can use, and on a card that
+/// streams it is layer slots.
 ///
-/// # Why it went back up
-///
-/// A streamed model builds its **layer pack after `close_load`**, and that pass repacks a whole
-/// layer at a time through `WeightResidency::Pool`: one layer's source plus its twins plus the
-/// repack's two bands, ~390 MiB on the 27B. `peak_load_pool_bytes` reserves span headroom for
-/// exactly that — but the headroom has been handed back by then, and it cannot be held any
-/// longer: `build_layers` carves the layer zone itself, and growing the span moves the right
-/// edge every weight-side address is measured from, so `reclaim_load_headroom` refuses once a
-/// zone exists. The two deadlines conflict and the address one wins, which leaves this margin
-/// as the only thing covering that pass. At 256 MiB it does not.
+/// A streamed model builds its **layer pack after `close_load`**, repacking a whole layer at a
+/// time through `WeightResidency::Pool`: one layer's source plus its twins plus the repack's two
+/// bands, ~390 MiB on the 27B. The span is one allocation that never grows, so the load headroom
+/// `peak_load_pool_bytes` sized stays outside it and covers that pass beside this margin.
 ///
 /// The evidence to move it *down* again is the forbidden-allocation detector
 /// (`--features forbidden_allocations`), which says what actually allocates outside the

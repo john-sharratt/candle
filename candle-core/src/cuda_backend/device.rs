@@ -15,6 +15,7 @@ use std::marker::PhantomData;
 use std::panic::Location;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use super::driver_alloc::{at_site, install as install_driver_alloc_watch};
 use super::graph::{enter_wave, without_recording, CaptureHub, CaptureStats, Paused, WaveCapture};
 use super::held::{release_on_its_stream, Held, Release};
 use super::info_ring::InfoRing;
@@ -24,9 +25,10 @@ use super::staged::{pack_segments, SEGMENT_ALIGN};
 use super::stream_owner;
 use super::sync_watch;
 use super::{CudaError, CudaStorage, CudaStorageSlice, StreamLease, WrapErr};
-use crate::cuda_backend::{alloc_inheriting, Backing};
+use crate::cuda_backend::{alloc_inheriting, Backing, LeaseAnchor, INHERIT_ALIGN};
 use crate::forbidden_alloc;
-use crate::wave_provenance::LeaseOrigin;
+use crate::readonly_regions::forbid_write;
+use crate::wave_provenance::{wave_alloc_attributed, LeaseOrigin};
 use candle_kernels::simple::fill::{run_arange_op, FillDType};
 use cudarc::driver::DevicePtr;
 
@@ -158,7 +160,7 @@ impl CudaDevice {
     pub unsafe fn alloc<T: DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>> {
         forbidden_alloc::record("CudaDevice::alloc", len * std::mem::size_of::<T>());
         let _eager = self.pause_capture()?;
-        let s = self.cuda_stream().alloc::<T>(len).w()?;
+        let s = at_site(Location::caller(), || self.cuda_stream().alloc::<T>(len)).w()?;
         Self::guard_fresh_allocation("CudaDevice::alloc", &s, len * std::mem::size_of::<T>());
         Ok(s)
     }
@@ -167,7 +169,10 @@ impl CudaDevice {
     pub fn alloc_zeros<T: DeviceRepr + ValidAsZeroBits>(&self, len: usize) -> Result<CudaSlice<T>> {
         forbidden_alloc::record("CudaDevice::alloc_zeros", len * std::mem::size_of::<T>());
         let _eager = self.pause_capture()?;
-        let s = self.cuda_stream().alloc_zeros::<T>(len).w()?;
+        let s = at_site(Location::caller(), || {
+            self.cuda_stream().alloc_zeros::<T>(len)
+        })
+        .w()?;
         Self::guard_fresh_allocation(
             "CudaDevice::alloc_zeros",
             &s,
@@ -271,7 +276,7 @@ impl CudaDevice {
         let bytes = src.len() * std::mem::size_of::<T>();
         forbidden_alloc::record("CudaDevice::memcpy_stod", bytes);
         let _eager = self.pause_capture()?;
-        let s = self.cuda_stream().memcpy_stod(src).w()?;
+        let s = at_site(Location::caller(), || self.cuda_stream().memcpy_stod(src)).w()?;
         // Allocates as well as copying, so it is an allocation path like the
         // two above and needs the same guard — and unlike them it writes to the
         // range immediately, so a collision here corrupts before anything else
@@ -1523,6 +1528,9 @@ impl BackendDevice for CudaDevice {
         // Before the context: the driver reads its module-loading mode once, at
         // initialisation, and a lazy load breaks another thread's capture.
         module_loading::request_eager();
+        // Before the first allocation on any device, so none goes unnamed
+        // (`driver_alloc`).
+        install_driver_alloc_watch();
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         module_loading::verify_eager()?;
         Self::validate_compute_capability(&context)?;
@@ -1950,6 +1958,74 @@ impl CudaDevice {
             backing,
             anchor: None,
         })
+    }
+
+    /// Uninitialised storage of `shape` that outlives every wave: an **owned
+    /// copy** — values taken off a span to be kept past it (`to_owned_tensor`,
+    /// `cat_owned`).
+    ///
+    /// Taken from the span's held ground, not from the driver: the copy into it
+    /// stays one device-to-device copy, no driver call is made, and its release
+    /// is a fenced give-back rather than a free — which, with no memory pools
+    /// (TCC), would synchronise the stream. The storage anchors the [`Held`]
+    /// buffer, so every view and clone of it keeps the range, and the last one
+    /// to drop releases it behind everything queued on the stream. A ground with
+    /// no room for it hands the buffer to the driver, reported by the ground.
+    ///
+    /// # Safety
+    ///
+    /// Uninitialised, as [`Self::alloc_uninit_from`].
+    #[track_caller]
+    pub(crate) unsafe fn alloc_owned(&self, shape: &Shape, dtype: DType) -> Result<CudaStorage> {
+        let elem_count = shape.elem_count();
+        let held = Held::<u8>::alloc(self, elem_count * dtype.size_in_bytes())?;
+        let stream = self.cuda_stream();
+        let (ptr, guard) = held.device_ptr(&stream);
+        drop(guard);
+        // SAFETY: `ptr` names `elem_count` elements of `dtype` (256-aligned, as
+        // every held range is), kept live by the anchor for as long as any view
+        // of the storage exists.
+        CudaStorage::from_anchored_device_ptr(
+            ptr,
+            elem_count,
+            dtype,
+            self,
+            LeaseAnchor::new(Arc::new(held)),
+        )
+    }
+
+    /// Uninitialised storage for an op's output that follows its operand
+    /// `from`: carved from the operand's wave arena while its phase is open,
+    /// and otherwise an owned range of the held ground ([`Self::alloc_owned`]).
+    /// Never the driver's.
+    ///
+    /// # Safety
+    ///
+    /// Uninitialised, as [`Self::alloc_uninit_from`].
+    #[track_caller]
+    pub(crate) unsafe fn alloc_following(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+        from: &Backing,
+    ) -> Result<CudaStorage> {
+        let elem_count = shape.elem_count();
+        let bytes = elem_count * dtype.size_in_bytes();
+        if let Some((ptr, ticket)) =
+            wave_alloc_attributed(from.inherit_ticket(), bytes, INHERIT_ALIGN)?
+        {
+            forbid_write("wave arena lease (alloc_following)", ptr, bytes);
+            // SAFETY: a range of the open phase's arena, `bytes` long and
+            // aligned for every dtype, released with the phase.
+            return CudaStorage::from_leased_device_ptr(
+                ptr,
+                elem_count,
+                dtype,
+                self,
+                LeaseOrigin::Wave(ticket),
+            );
+        }
+        self.alloc_owned(shape, dtype)
     }
 
     /// Uninitialised storage taken from the arena `ticket` names, or from the

@@ -442,6 +442,18 @@ impl Device {
         }
     }
 
+    /// Uninitialised storage for an **owned copy**: values taken off a span to
+    /// outlive it. On CUDA it stands on the span's held ground
+    /// (`CudaDevice::alloc_owned`); elsewhere it is an ordinary allocation.
+    #[track_caller]
+    pub(crate) unsafe fn alloc_owned(&self, shape: &Shape, dtype: DType) -> Result<Storage> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Device::Cuda(device) => Ok(Storage::Cuda(device.alloc_owned(shape, dtype)?)),
+            _ => self.alloc_uninit(shape, dtype),
+        }
+    }
+
     pub(crate) unsafe fn alloc_uninit(&self, shape: &Shape, dtype: DType) -> Result<Storage> {
         match self {
             Device::Cpu => {

@@ -50,6 +50,8 @@ cuda = ["candle/cuda"]
 kernel-lineinfo = ["cuda", "candle/kernel-lineinfo"]
 # `Tensor::assert` / `QTensor::assert` — see `candle-core/Cargo.toml`.
 tensor-assert = ["cuda", "candle/tensor-assert"]
+# Panic on every driver allocation — see `candle-core/Cargo.toml`.
+driver-alloc-panic = ["cuda", "candle/driver-alloc-panic"]
 forbidden_allocations = ["candle/forbidden_allocations"]
 verbose = []
 dont_check = []

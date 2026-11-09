@@ -40,6 +40,9 @@ pub use arena_table::{
     LATENT_NOPE_BANDS, LATENT_N_BANDS, N_PALETTE,
 };
 pub use cache::{Cache, CacheIntegrityResult, KvCache};
+/// Device work between forwards, on a bump of held ground. Defined in both
+/// configurations, as the stages are: the callers are.
+pub use chunked::aside;
 pub use chunked::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use chunked::fletcher_golden::{fletcher32_golden, GoldenRecord};
@@ -96,8 +99,8 @@ pub use chunked::{
 #[cfg(feature = "cuda")]
 pub use chunked::{
     claim_dense, claim_span_region, dense_bytes, ensure_reservation, expect_kv_range,
-    expect_kv_range_in, freeze_dense, reclaim_load_headroom, span_layout, span_region_refusal,
-    SpanClaims, SpanLayout, SpanRegion,
+    expect_kv_range_in, freeze_dense, span_layout, span_region_refusal, SpanClaims, SpanLayout,
+    SpanRegion,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

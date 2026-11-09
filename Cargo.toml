@@ -54,6 +54,11 @@ exclude = [
     # Its own workspace: its screens need wgpu 30, whose web-sys cannot meet
     # the wasm examples' pinned one. Built with `--manifest-path zenj/Cargo.toml`.
     "zenj",
+    # cudarc 0.17.8, vendored and patched in below: its allocation and its
+    # `CudaSlice` drop go through the device heap candle installs
+    # (docs/driver_model.md §4), the one choke point every device allocation in
+    # the process passes.
+    "third_party/cudarc",
 ]
 resolver = "2"
 
@@ -290,3 +295,8 @@ opt-level = 2
 
 [profile.test.package.half]
 opt-level = 2
+
+# The vendored cudarc (see `exclude` above): every crate that depends on cudarc,
+# candle-kernels included, builds against this copy.
+[patch.crates-io]
+cudarc = { path = "third_party/cudarc" }

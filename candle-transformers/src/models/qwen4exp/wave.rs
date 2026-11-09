@@ -80,6 +80,7 @@ use crate::models::delta_net::{
     ArmKind, DeltaNetSeq, ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore,
     ReplyRows, SeqSpan, SpanArms, StagedSnapshot, ZGate, TIMELINE_ROWS,
 };
+use crate::models::dense_span;
 use crate::models::draft_blend::{blend, DraftTable};
 use crate::models::expert_lre::{
     PipelineStats, WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS, STAGED_HOPS,
@@ -1829,6 +1830,8 @@ impl Qwen4ExpBatched {
     }
 
     pub fn new(model: Qwen4ExpGpu) -> Result<Self> {
+        // Built once over the loaded model: part of its load.
+        let _load = dense_span::open_window(&model.device);
         let schedule = flash_next_schedule(&model.cfg)?;
         let rope = RopeRungs::new(&schedule, &model.device)?;
         // The indexer rotates with the attention's own rungs at the same rotary

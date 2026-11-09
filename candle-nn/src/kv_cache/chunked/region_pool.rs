@@ -959,15 +959,10 @@ impl RegionPool {
             target
         };
         let want = (for_span / REGION_BYTES) * REGION_BYTES;
-        // **Reserve address space for the WHOLE target, map only `want` of it.**
-        //
-        // `cuMemAddressReserve` takes address space, not memory — the physical granules are
-        // mapped separately below and can be mapped later. Sizing the reservation at `want`
-        // was what made the load headroom permanent: the span could never grow into ground it
-        // had no address for, so a concession made for the duration of a load was paid for the
-        // life of the process, and the weight zone and KV side (both carved from the span)
-        // could never reach it again. Reserving the full target costs nothing and is what lets
-        // [`reclaim_load_headroom`] hand the headroom back once the load is done.
+        // **The span is one device allocation of `want`, and it never grows.** The load
+        // headroom stays outside it for the life of the process: the driver's ground, where
+        // the load's own scratch and every allocation not yet carried by an arena of the span
+        // land (`docs/driver_model.md` §4).
         // **Everything on the card that is not ours, measured while that is
         // still true.** Taken before the reservation and therefore before the
         // weight load: the CUDA context, the driver's working set, the module
@@ -1000,13 +995,12 @@ impl RegionPool {
             .ok()
             .and_then(|()| candle::cuda_backend::cudarc::driver::result::mem_get_info().ok())
             .map(|(free, total)| (total as u64).saturating_sub(free as u64));
-        let va = (target / REGION_BYTES) * REGION_BYTES;
-        let mut reservation = Reservation::reserve(stream, va.max(want))?;
+        let mut reservation = Reservation::reserve(stream, want)?;
 
-        // Claim left to right across the whole span. A refusal part-way ends the
-        // span there, and because every other block is positioned relative to
-        // the right edge, the shortfall lands on the region count — the one
-        // tenant that degrades gracefully.
+        // Claim from the left. An allocation the card granted short of `want`
+        // ends the span there, and because every other block is positioned
+        // relative to the right edge, the shortfall lands on the region count —
+        // the one tenant that degrades gracefully.
         let claimed = reservation.map_range(0, want)?;
         let span_bytes = (claimed / REGION_BYTES) * REGION_BYTES;
         let span_base = reservation.base();
@@ -2514,10 +2508,9 @@ pub fn freeze_dense(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
         // **Retract a previous model's weight zone.**
         //
         // `POOLS` is process-global and never torn down, so `weight_floor`
-        // outlives the model that installed it. The load path assumes otherwise
-        // — see `reclaim_load_headroom`, which states as its precondition that
-        // at close_load "no weight floor has been installed" — and that holds
-        // only for the FIRST load in a process. A second load of a model with no
+        // outlives the model that installed it. The load path assumes that at
+        // close_load no weight floor has been installed, and that holds only for
+        // the FIRST load in a process. A second load of a model with no
         // weight side of its own installs nothing, so it silently inherits the
         // previous one's floor and runs with whatever KV area that left.
         //
@@ -2574,133 +2567,6 @@ pub fn freeze_dense(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
             }
         }
         Ok(pool.dense_bytes)
-    })
-}
-
-/// Map the address space the load's headroom was holding, and grow the span onto it.
-///
-/// Returns the bytes gained (0 if there were none to gain).
-///
-/// # The headroom was a loan, and this is where it comes back
-///
-/// [`RegionPool::create_with_headroom`] sizes the mapped span at `target − load_headroom` so
-/// the CUDA pool has room for the largest source tensor and the repack's bands while the model
-/// loads. Those are load-time transients; the moment the load closes they are gone. But the
-/// span used to be *reserved* at the reduced size too, and `cuMemAddressReserve` cannot be
-/// grown — so a loan for the duration of a load was never repaid. On the 27B that was 1,106 MiB
-/// (and, before the repack was banded, **4,850**) of a 14 GiB card, held idle from load until
-/// the process exited, unreachable by the weight zone and the KV side alike.
-///
-/// The reservation now takes address space for the whole target and maps only what the load
-/// needs; this maps the rest.
-///
-/// # Why this is safe exactly here and nowhere later
-///
-/// Growing the span moves `span_end`, and the weight side fills **downward from `span_end`** —
-/// so every expert and layer slot address is measured from it. Move it after a zone exists and
-/// every slot silently addresses ground that belongs to something else.
-///
-/// At `close_load` no such thing exists yet: `build_experts` and `build_layers` both run after
-/// it, no region has been claimed, and no weight floor has been installed. The three checks
-/// below are that argument made executable rather than trusted — if any fails, the call has
-/// moved and the right answer is to leave the span alone, not to grow it anyway.
-///
-/// `region_base` does not move: it sits left of the growth, past the persistence block and the
-/// dense weights, so the dense block keeps every address it handed out. The new regions are
-/// freshly mapped granules that have never been written, which is the same pristine state
-/// [`RegionPool::relayout_for_dense`] relies on after a dense claim.
-pub fn reclaim_load_headroom(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
-    with_pool(stream, |pool| {
-        // **"Nothing to reclaim" is answered before anything is policed.** The checks below
-        // guard a *growth*; with no growth there is nothing to protect, and running them first
-        // turns the ordinary second-model-in-a-process case into a fatal load error — the span
-        // is already full size, so of course a zone is installed and regions have been claimed.
-        let reserved = pool.reservation.reserved_bytes();
-        if reserved <= pool.span_bytes {
-            return Ok(0);
-        }
-        // **A span that is already serving has no load to reclaim for.**
-        //
-        // The check above catches the ordinary second load, where the first one
-        // mapped everything and `reserved == span_bytes`. It does not catch the
-        // case where the first load's reclaim came back *short* — the driver
-        // refusing part of `map_range`, or the CUDA pool still holding the
-        // repack scratch this ground was conceded for. Then `reserved >
-        // span_bytes` for the life of the process, this falls through, and the
-        // refusals below fire on a load that has done nothing wrong: zend
-        // reloading a model, or a test binary opening a second checkpoint, dies
-        // with "N regions already claimed".
-        //
-        // `dense_frozen` separates the two. A pool whose load phase has already
-        // closed is not mid-load, whatever `reserved` says, and the right answer
-        // is that there is nothing here for this load rather than an error.
-        if pool.dense_frozen && (pool.next > 0 || pool.live > 0) {
-            return Ok(0);
-        }
-        if pool.next > 0 || pool.live > 0 {
-            candle::bail!(
-                "reclaim_load_headroom: {} regions already claimed ({} live). Every weight-side \
-                 address is measured from the span's right edge, so growing it now would move \
-                 ground a live arena is standing on — this must run at close_load, before \
-                 anything claims.",
-                pool.next,
-                pool.live,
-            )
-        }
-        if pool.weight_floor != pool.span_end() {
-            candle::bail!(
-                "reclaim_load_headroom: a weight zone is already installed (floor {:#x}, span \
-                 end {:#x}). Its slots are placed from the right edge and would all shift.",
-                pool.weight_floor,
-                pool.span_end(),
-            )
-        }
-        let gained = pool
-            .reservation
-            .map_range(pool.span_bytes, reserved - pool.span_bytes)?;
-        let gained = (gained / REGION_BYTES) * REGION_BYTES;
-        if gained == 0 {
-            return Ok(0);
-        }
-        pool.span_bytes += gained;
-        // The floor tracks the right edge — there is no zone yet, so the whole of the new
-        // ground is the KV side's until one is installed.
-        pool.weight_floor = pool.span_end();
-        let layout = layout_span(
-            pool.span_base,
-            pool.persist_bytes,
-            pool.span_bytes,
-            pool.dense_bytes,
-            pool.weight_floor,
-        );
-        pool.region_base = layout.region_base;
-        pool.total = layout.total;
-        pool.dirty_epoch.resize(layout.total, 0);
-        pool.cover_regions(layout.total);
-        log::info!(
-            "reservation: reclaimed {} MiB of load headroom — span now {} MiB, {} regions",
-            gained / (1024 * 1024),
-            pool.span_bytes / (1024 * 1024),
-            pool.total,
-        );
-        // The partition as the load leaves it, on the same channel as `[reservation]` — which
-        // prints at *creation*, before the dense block exists and before this grows the span,
-        // so on its own it never showed where the card actually went. The dense figure is the
-        // measured block, not an estimate from tensor sizes.
-        if super::alloc::arena_stats_enabled() {
-            let mib = |b: usize| b / (1024 * 1024);
-            eprintln!(
-                "[reclaim] +{} MiB returned to the span | span {} MiB = persist {} + dense {} \
-                 + {} regions ({} MiB); weight zone not yet carved",
-                mib(gained),
-                mib(pool.span_bytes),
-                mib(pool.persist_bytes),
-                mib(pool.dense_bytes),
-                pool.total,
-                mib(pool.total * REGION_BYTES),
-            );
-        }
-        Ok(gained)
     })
 }
 
@@ -3301,6 +3167,15 @@ fn held_ground_of(device: &candle::CudaDevice) -> Option<Arc<SpanHeldGround>> {
 pub fn provision_held_ground(device: &candle::CudaDevice) {
     if let Some(held) = held_ground_of(device) {
         held.provision(device);
+    }
+}
+
+/// **From a known point between forwards:** make room on `device`'s held ground
+/// for one take of `bytes` — see `SpanHeldGround::make_room`. Does nothing
+/// before a reservation exists.
+pub(crate) fn make_held_room(device: &candle::CudaDevice, bytes: usize) {
+    if let Some(held) = held_ground_of(device) {
+        held.make_room(device, bytes);
     }
 }
 

@@ -52,7 +52,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{current, ThreadId};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
-use candle::cuda_backend::wave_provenance::{SpanState, WaveCarve, WaveTicket};
+use candle::cuda_backend::wave_provenance::{SpanState, WaveCarve, WaveTicket, ASIDE_ARENA};
 use candle::cuda_backend::{
     close_scratch_scope, install_scope_carve, open_scratch_scope, scratch_reserve, StreamLease,
 };
@@ -2494,6 +2494,9 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> WaveCar
     // the cheaper lookup and because `arenas.get(3)` would otherwise decide it
     // by returning `None` — the right answer for the wrong reason, and one that
     // would silently stop working if a fourth phase were ever added.
+    if ticket.arena == ASIDE_ARENA {
+        return super::aside::carve(ticket, bytes, align);
+    }
     if ticket.arena == GUEST_ARENA {
         // A guest that opened a heap carves there: it frees as tensors die,
         // which a graph without stages needs (`guest_heap`).

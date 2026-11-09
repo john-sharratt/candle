@@ -172,12 +172,14 @@ pub mod argmax_rows;
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
 mod device;
+mod driver_alloc;
 mod error;
 pub mod graph;
 mod held;
 mod info_ring;
 mod kernel_scratch;
 pub mod link_probe;
+mod load_window;
 mod module_loading;
 pub mod staged;
 mod stream_alloc;
@@ -192,6 +194,7 @@ pub use held::{ask_holders_to_move, install_held_ground, vacate_epoch, Held, Hel
 pub use kernel_scratch::{
     close_scratch_scope, install_scope_carve, open_scratch_scope, scratch_reserve, ScopeCarve,
 };
+pub use load_window::LoadWindow;
 pub use stream_alloc::{stream_alloc, stream_alloc_zeros, stream_memcpy_stod};
 pub use stream_lease::StreamLease;
 pub use thread_blas::BlasHandle;
@@ -2834,11 +2837,10 @@ pub unsafe fn alloc_inheriting<T: DeviceRepr>(
         // This is the one allocation path the pool never sees, so the check on
         // `CudaDevice::alloc` cannot cover it.
         crate::readonly_regions::forbid_write("wave arena lease (alloc_inheriting)", ptr, bytes);
-        // Dropping this slice bare would `cuMemFreeAsync` an address inside
-        // the VMM reservation the wave arenas are carved from — memory the
-        // stream-ordered pool never allocated — so the driver rejects it and
-        // nothing is freed. That is what makes the window between here and
-        // the caller stamping `Backing::Lease` harmless.
+        // Dropping this slice bare would ask the driver to free an address
+        // inside the span's allocation — one it never handed out — so the
+        // driver rejects it and nothing is freed. That is what makes the window
+        // between here and the caller stamping `Backing::Lease` harmless.
         let slice = dev
             .stream_unleased()
             .upgrade_device_ptr::<T>(ptr, elem_count);

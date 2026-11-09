@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{sys, CudaSlice, CudaStream, DeviceRepr, HostSlice, ValidAsZeroBits};
 
+use super::driver_alloc::at_site;
 use super::WrapErr;
 use crate::forbidden_alloc;
 use crate::Result;
@@ -60,7 +61,7 @@ pub unsafe fn stream_alloc<T: DeviceRepr>(
 ) -> Result<CudaSlice<T>> {
     refuse_while_capturing(stream, "CudaStream::alloc")?;
     forbidden_alloc::record("CudaStream::alloc", len * std::mem::size_of::<T>());
-    stream.alloc::<T>(len).w()
+    at_site(Location::caller(), || stream.alloc::<T>(len)).w()
 }
 
 /// `len` zeroed elements on `stream`.
@@ -71,7 +72,7 @@ pub fn stream_alloc_zeros<T: DeviceRepr + ValidAsZeroBits>(
 ) -> Result<CudaSlice<T>> {
     refuse_while_capturing(stream, "CudaStream::alloc_zeros")?;
     forbidden_alloc::record("CudaStream::alloc_zeros", len * std::mem::size_of::<T>());
-    stream.alloc_zeros::<T>(len).w()
+    at_site(Location::caller(), || stream.alloc_zeros::<T>(len)).w()
 }
 
 /// A fresh device copy of `src` on `stream`.
@@ -85,5 +86,5 @@ pub fn stream_memcpy_stod<T: DeviceRepr, Src: HostSlice<T> + ?Sized>(
         "CudaStream::memcpy_stod",
         src.len() * std::mem::size_of::<T>(),
     );
-    stream.memcpy_stod(src).w()
+    at_site(Location::caller(), || stream.memcpy_stod(src)).w()
 }

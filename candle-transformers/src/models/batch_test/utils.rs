@@ -13,7 +13,7 @@
 use candle::forbidden_alloc;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::kv_cache::{QuantFormat, REGION_BYTES};
+use candle_nn::kv_cache::{aside, QuantFormat, REGION_BYTES};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use tokenizers::Tokenizer;
 
 #[cfg(feature = "cuda")]
 use crate::models::batch_test::graph_report::print_graph_line;
-use crate::models::batch_test::greedy::{greedy_token, live_vocab, token_ids};
+use crate::models::batch_test::greedy::{aside_bytes, greedy_token, live_vocab, token_ids};
 use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
 use crate::models::batch_test::side_compression::{print_side_table, SideCompression};
 use crate::models::batch_test::span_report::print_span;
@@ -2395,23 +2395,37 @@ impl TestParams {
         // steps use — rather than an argmax and a synchronising read per session.
         let mut committed: Vec<u32> = Vec::with_capacity(sequence_indices.len());
         let mut active: Vec<bool> = Vec::with_capacity(sequence_indices.len());
-        let stacked = Tensor::cat(&runs.iter().map(|r| &r.logits).collect::<Vec<_>>(), 0)?;
-        // Every pick of this decode — the seed here and each accept-walk row —
-        // stops at the tokenizer's last id; the padded tail is not a token.
-        let live = live_vocab(self.token_ids, stacked.dim(1)?);
-        let seeds = stacked.batched_sample_argmax(live)?;
-        // The logit each seed was chosen at. Every value of a row being -inf or
-        // NaN is what a corrupted forward looks like from here, and the greedy
-        // pick of such a row is a token the model never scored. Caught at the
-        // seed because a bad seed feeds the drafter and the whole block, so the
-        // failure would otherwise surface as unreadable output several steps
-        // later.
-        let picked = stacked
-            .gather(&seeds.unsqueeze(1)?, 1)?
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let seeds = seeds.to_vec1::<u32>()?;
+        // The prefill's logits are owned copies — the forward that made them has
+        // closed — so the seed work runs in an aside: the stack, the picks and
+        // their logits are bumps of one held range, given back as one.
+        let logits_bytes: usize = runs
+            .iter()
+            .map(|r| r.logits.elem_count() * r.logits.dtype().size_in_bytes())
+            .sum();
+        let device = runs
+            .first()
+            .map(|r| r.logits.device().clone())
+            .unwrap_or(Device::Cpu);
+        let (picked, seeds, live) = aside(&device, aside_bytes(logits_bytes), || {
+            let stacked = Tensor::cat(&runs.iter().map(|r| &r.logits).collect::<Vec<_>>(), 0)?;
+            // Every pick of this decode — the seed here and each accept-walk
+            // row — stops at the tokenizer's last id; the padded tail is not a
+            // token.
+            let live = live_vocab(self.token_ids, stacked.dim(1)?);
+            let seeds = stacked.batched_sample_argmax(live)?;
+            // The logit each seed was chosen at. Every value of a row being
+            // -inf or NaN is what a corrupted forward looks like from here, and
+            // the greedy pick of such a row is a token the model never scored.
+            // Caught at the seed because a bad seed feeds the drafter and the
+            // whole block, so the failure would otherwise surface as unreadable
+            // output several steps later.
+            let picked = stacked
+                .gather(&seeds.unsqueeze(1)?, 1)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            Ok((picked, seeds.to_vec1::<u32>()?, live))
+        })?;
         for (i, run) in runs.iter_mut().enumerate() {
             let c = seeds[i];
             if picked[i].is_nan() || picked[i] == f32::NEG_INFINITY {
@@ -2944,10 +2958,12 @@ impl TestParams {
         }
     }
 
-    /// Tokenize text using a tokenizer JSON string
+    /// A prompt piece as the model is handed it: on the host, as the scheduler
+    /// hands its prompts over. A wave's ids reach the device in one upload onto
+    /// the forward's span (`wave_token_ids::device_token_ids`), never as one
+    /// device allocation per sequence ahead of it.
     fn tokens_to_tensor(&self, tokens: &[u32]) -> Result<Tensor> {
-        let input = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
-        Ok(input)
+        Tensor::new(tokens, &Device::Cpu)?.unsqueeze(0)
     }
 
     /// Print comparison table of test results

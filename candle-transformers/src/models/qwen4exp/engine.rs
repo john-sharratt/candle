@@ -155,9 +155,9 @@ impl Qwen4ExpGpu {
         let content = &pack.content;
         // Claim the reservation before the first tensor, so every KO weight is
         // carved into its dense block and the span is sized from the whole card
-        // rather than from what a lazily-created span found free mid-load; the
-        // headroom it concedes to the pool is returned at `close_load` below.
-        dense_span::open_for_load_sized(device, load_headroom_bytes(content))?;
+        // rather than from what a lazily-created span found free mid-load. The
+        // guard holds the load window open until this loader returns.
+        let _load = dense_span::open_for_load_sized(device, load_headroom_bytes(content))?;
 
         let f32t = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             g.qtensor(name, device)?.dequantize(device)
@@ -442,9 +442,8 @@ impl Qwen4ExpGpu {
             .ok_or_else(|| {
                 candle::Error::Msg("qwen4exp engine: the expert section is empty".into())
             })?;
-        // The dense stack is resident: lock the block's edge and return the
-        // load's pool headroom to the span, before the expert zone below is
-        // placed from the span's right edge.
+        // The dense stack is resident: lock the block's edge before the expert
+        // zone below is placed from the span's right edge.
         dense_span::close_load(device)?;
         // `SparseMoeBlock::moe_layer_idx` indexes the expert section's layers,
         // and every qwen4exp block routes — 512 experts on all of them, the head

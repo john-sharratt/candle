@@ -1667,7 +1667,7 @@ where
         None => dense_span::peak_load_pool_bytes(content.tensor_infos.values()),
     };
     // A plain `[rows, hidden]` residual, which the pool cushion covers: no runtime reserve.
-    dense_span::open_for_load_sized(device, headroom)?;
+    let _load = dense_span::open_for_load_sized(device, headroom)?;
 
     // A routed checkpoint's layers stay resident however the caller asked — see
     // this function's header. Resolved here, where the config is known, so the
@@ -1896,18 +1896,9 @@ where
     // Every dense tensor is placed; the block's right edge is final. It has to
     // close before `build_experts` — the expert cache sizes its zone from the
     // span's free ground, which is not knowable while the block can still grow.
-    //
-    // Deferring the *headroom* reclaim past `build_layers` was tried, because
-    // that pass repacks a whole layer at a time through `WeightResidency::Pool`
-    // and `peak_load_pool_bytes` is what reserves pool room for it. It cannot
-    // be: `build_layers` carves the layer zone itself (`carve_zone` before
-    // `upload_pinned`), and growing the span moves the right edge every
-    // weight-side address is measured from — so `reclaim_load_headroom` refuses
-    // once a zone is installed, and would refuse there. The two deadlines
-    // genuinely conflict, and the address one wins.
-    //
-    // What must therefore cover the layer-pack repack is the CUDA pool's own
-    // scratch margin, not the headroom. See `DEFAULT_SCRATCH_MARGIN_MB`.
+    // The load headroom stays outside the span for good, so it still covers
+    // `build_layers`, which repacks a whole layer at a time through
+    // `WeightResidency::Pool`.
     dense_span::close_load(device)?;
 
     let experts = build_experts(content, &cfg)?;

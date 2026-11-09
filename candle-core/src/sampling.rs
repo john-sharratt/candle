@@ -491,14 +491,20 @@ impl CustomOp1 for BatchedSampling {
             _ => crate::bail!("BatchedSampling: unsupported dtype, expected F32/F16/BF16"),
         };
 
-        // Allocate output buffer [batch_size] u32
-        let output_slice = unsafe { device.alloc::<u32>(batch_size)? };
+        // `[batch_size]` u32 tokens, beside the logits they are picked from: on
+        // their wave arena while it is open, an owned held range otherwise —
+        // never a driver allocation per pick (`alloc_following`).
+        let shape = Shape::from(batch_size);
+        let result_storage =
+            unsafe { device.alloc_following(&shape, DType::U32, &storage.backing)? };
         {
-            let (output_ptr, _out_guard) = output_slice.device_ptr(&stream);
+            let CudaStorageSlice::U32(output) = &result_storage.slice else {
+                crate::bail!("BatchedSampling: the token buffer is not U32");
+            };
+            let (output_ptr, _out_guard) = output.device_ptr(&stream);
             self.launch_cuda(storage, layout, output_ptr, dtype_code)?;
         }
-        let result_storage = CudaStorage::wrap_cuda_slice(output_slice, device.clone());
-        Ok((result_storage, Shape::from(batch_size)))
+        Ok((result_storage, shape))
     }
 
     fn bwd(&self, _arg: &Tensor, _res: &Tensor, _grad_res: &Tensor) -> Result<Option<Tensor>> {

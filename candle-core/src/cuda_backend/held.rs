@@ -26,8 +26,8 @@
 //! # When there is no ground
 //!
 //! Before the reservation exists, or when the ground is full, the buffer is an
-//! ordinary pool allocation and [`crate::forbidden_alloc`] records it — never a
-//! failure, because the buffers here are what keep a forward running, and a
+//! ordinary driver allocation and [`crate::forbidden_alloc`] records it — never
+//! a failure, because the buffers here are what keep a forward running, and a
 //! report that names the shortfall is the useful answer.
 
 use std::collections::HashMap;
@@ -88,7 +88,7 @@ pub fn install_held_ground(ordinal: usize, ground: Arc<dyn HeldGround>) {
     grounds().lock().unwrap().insert(ordinal, ground);
 }
 
-fn ground_for(ordinal: usize) -> Option<Arc<dyn HeldGround>> {
+pub(super) fn ground_for(ordinal: usize) -> Option<Arc<dyn HeldGround>> {
     grounds().lock().unwrap().get(&ordinal).cloned()
 }
 
@@ -280,13 +280,12 @@ impl Drop for Release {
                 stream,
             } => ground.give_back(*ptr, stream),
             Self::Pool { ptr, stream } => {
-                let ctx = stream.context();
-                ctx.record_err(ctx.bind_to_thread());
-                // SAFETY: a pool allocation this release owns, freed once,
-                // behind everything queued on its stream.
-                ctx.record_err(unsafe {
-                    cudarc::driver::result::free_async(*ptr, stream.cu_stream())
-                });
+                // Freed the way any slice is, with the driver's free for the
+                // card's driver model — stream-ordered where memory pools exist,
+                // synchronous where they do not (TCC).
+                // SAFETY: an allocation this release owns, freed once, behind
+                // everything queued on its stream.
+                drop(unsafe { stream.upgrade_device_ptr::<u8>(*ptr, 0) });
             }
         }
     }

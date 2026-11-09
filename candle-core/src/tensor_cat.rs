@@ -2,6 +2,15 @@ use crate::op::{BackpropOp, Op};
 use crate::wave_provenance::WaveTicket;
 use crate::{shape::Dim, Context, Error, LiveTensor, Result, Shape, Storage, Tensor};
 
+/// Where a concatenation's result is allocated.
+#[derive(Clone, Copy)]
+enum CatInto {
+    /// The arena `ticket` names, or an ordinary allocation without one.
+    Arena(Option<WaveTicket>),
+    /// An owned copy, outliving every wave (`Device::alloc_owned`).
+    Owned,
+}
+
 impl<'w> LiveTensor<'w> {
     /// Concatenates two or more tensors along a particular dimension.
     ///
@@ -153,12 +162,13 @@ impl<'w> LiveTensor<'w> {
         Ok(crate::tensor::from_storage(storage, shape, op, false))
     }
 
-    /// [`Self::cat`] into an **owned** allocation: a `'static` tensor from the
-    /// pool rather than the arena the arguments came from — what
+    /// [`Self::cat`] into an **owned** allocation: a `'static` tensor on the held
+    /// ground rather than the arena the arguments came from — what
     /// [`Self::to_owned_tensor`] is to a single tensor. One copy, with the same
     /// run merging as `cat`, where `cat` followed by `to_owned_tensor` would
     /// copy twice and put the intermediate on the very span the result is being
     /// taken off.
+    #[track_caller]
     pub fn cat_owned<A: AsRef<LiveTensor<'w>>, D: Dim>(args: &[A], dim: D) -> Result<Tensor> {
         if args.is_empty() {
             Err(Error::OpRequiresAtLeastOneTensor { op: "cat" }.bt())?
@@ -169,7 +179,7 @@ impl<'w> LiveTensor<'w> {
             // copy below reads ranges, which only a contiguous layout is.
             return Self::cat(args, dim)?.to_owned_tensor();
         }
-        let (storage, shape) = Self::cat_contiguous_storage(args, dim, None)?;
+        let (storage, shape) = Self::cat_contiguous_storage(args, dim, CatInto::Owned)?;
         Ok(crate::tensor::from_storage(
             storage,
             shape,
@@ -189,17 +199,19 @@ impl<'w> LiveTensor<'w> {
         // The concatenation lands in the arena its inputs came from — `arg0` is
         // representative because every argument shares one `'w`, so they cannot
         // come from different generations.
-        let (storage, shape) = Self::cat_contiguous_storage(args, dim, arg0.wave_ticket())?;
+        let (storage, shape) =
+            Self::cat_contiguous_storage(args, dim, CatInto::Arena(arg0.wave_ticket()))?;
         let op = BackpropOp::new(args, |args| Op::Cat(args, dim));
         Ok(crate::tensor::from_storage(storage, shape, op, false))
     }
 
     /// The contiguous concatenation's validation and copy, into storage
-    /// allocated against `ticket` (`None`: an owned pool allocation).
+    /// allocated where `into` says.
+    #[track_caller]
     fn cat_contiguous_storage<A: AsRef<LiveTensor<'w>>>(
         args: &[A],
         dim: usize,
-        ticket: Option<WaveTicket>,
+        into: CatInto,
     ) -> Result<(Storage, Shape)> {
         let arg0 = args[0].as_ref();
         let rank = arg0.rank();
@@ -258,7 +270,10 @@ impl<'w> LiveTensor<'w> {
         let cat_target_dim_len = cat_dims[dim];
         let block_size: usize = cat_dims.iter().skip(1 + dim).product();
         let shape = Shape::from(cat_dims);
-        let mut storage = unsafe { device.alloc_uninit_from(&shape, dtype, ticket)? };
+        let mut storage = match into {
+            CatInto::Arena(ticket) => unsafe { device.alloc_uninit_from(&shape, dtype, ticket)? },
+            CatInto::Owned => unsafe { device.alloc_owned(&shape, dtype)? },
+        };
         // Every argument shares the dims before `dim`, so this is one value.
         let d1: usize = first_dims.iter().take(dim).product();
         let dst_s = block_size * cat_target_dim_len;

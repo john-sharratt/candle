@@ -13,6 +13,7 @@
 //! speculative decode path bounds its picks with [`live_vocab`].
 
 use candle::{Result, Tensor, D};
+use candle_nn::kv_cache::aside;
 use tokenizers::Tokenizer;
 
 /// The ids `tokenizer` can name — its largest id + 1 — or `None` for an empty
@@ -33,16 +34,35 @@ pub fn live_vocab(token_ids: Option<usize>, row_width: usize) -> usize {
     token_ids.map_or(row_width, |n| n.min(row_width))
 }
 
+/// The aside a pick over logits rows of `rows_bytes` in all runs in: the rows
+/// stacked once, and a MiB for what is read from the stack — the picks, the
+/// logits they were picked at — each a few bytes per row.
+pub fn aside_bytes(rows_bytes: usize) -> usize {
+    rows_bytes + (1 << 20)
+}
+
 /// The greedy token of each row of `rows`, every row a `[1, vocab]` (or
 /// `[vocab]`) logits row: one launch over all of them and one read-back.
+///
+/// The rows are owned copies off a closed forward, so the stack runs in an
+/// aside on their device rather than in a driver allocation.
 pub fn greedy_rows(rows: &[&Tensor]) -> Result<Vec<u32>> {
-    let rows = rows
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let bytes = rows
         .iter()
-        .map(|r| r.reshape((1, r.dim(D::Minus1)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let stacked = Tensor::cat(&rows, 0)?;
-    let width = stacked.dim(1)?;
-    stacked.batched_sample_argmax(width)?.to_vec1::<u32>()
+        .map(|r| r.elem_count() * r.dtype().size_in_bytes())
+        .sum();
+    aside(first.device(), aside_bytes(bytes), || {
+        let rows = rows
+            .iter()
+            .map(|r| r.reshape((1, r.dim(D::Minus1)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let stacked = Tensor::cat(&rows, 0)?;
+        let width = stacked.dim(1)?;
+        stacked.batched_sample_argmax(width)?.to_vec1::<u32>()
+    })
 }
 
 /// The greedy token of one `[1, vocab]` (or `[vocab]`) logits row.

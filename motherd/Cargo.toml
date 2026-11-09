@@ -37,3 +37,5 @@ profile = ["host/profile", "zend/profile"]
 # The `tensor-assert` harness (CLAUDE.md): every wave drained for non-finite
 # sites, and the first one armed to capture its operands on the next pass.
 tensor-assert = ["zend/tensor-assert"]
+# Panic on every driver allocation — see `candle-core/Cargo.toml`.
+driver-alloc-panic = ["zend/driver-alloc-panic"]
