@@ -32,6 +32,7 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::authorize::Authorizer;
 use crate::engine::mission::{Mission, Origin, Todo, Work};
 use crate::mind::files::MindFiles;
 
@@ -196,11 +197,12 @@ pub struct WorldMissions {
     /// What a character with nothing set for it is handed — see [`Draw`].
     #[serde(default)]
     pub draw: Draw,
-    /// Who may approve a critical step (`docs/mission_templates.md` §6), by the
-    /// name the world writes for them — the Creator and Yen. Empty where none
-    /// is set, and then a critical step can only be held, never approved.
+    /// Who may approve a critical step (`docs/mission_templates.md` §6), by
+    /// account, each with the name the compass calls them — the Creator and
+    /// Yen. Empty where none is set, and then a critical step can only be
+    /// held, never approved.
     #[serde(default)]
-    pub authorizers: Vec<String>,
+    pub authorizers: Vec<Authorizer>,
 }
 
 /// The world-level config a `missions/<world>/world.yaml` carries.
@@ -210,7 +212,7 @@ struct WorldConfig {
     #[serde(default)]
     draw: Draw,
     #[serde(default)]
-    authorizers: Vec<String>,
+    authorizers: Vec<Authorizer>,
 }
 
 /// Whether an argument's value is a stand-in for one — empty, or a word that
@@ -305,7 +307,7 @@ impl WorldMissions {
     pub fn load(mind: &MindFiles, world: &str) -> Result<Option<WorldMissions>, String> {
         let mut routines: Vec<Routine> = Vec::new();
         let mut draw = Draw::default();
-        let mut authorizers: Vec<String> = Vec::new();
+        let mut authorizers: Vec<Authorizer> = Vec::new();
         let mut found = false;
 
         let file = path(world);

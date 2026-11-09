@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use super::agenda::{Agendum, Priority, KEEP};
 use super::kept_steps::kept_steps;
+use crate::engine::authorize::Authorizer;
 use super::operations::{Operation, Operations};
 use super::orders::{Filed, Notice, Orders, EVERY_POSTER};
 use super::round::RoundState;
@@ -206,10 +207,10 @@ pub struct Missions {
     /// mind's, with the routines.
     #[serde(skip)]
     draw: Draw,
-    /// Who may approve a critical step (`docs/mission_templates.md` §6), by the
-    /// name the world writes — the mind's, read afresh like the routines.
+    /// Who may approve a critical step (`docs/mission_templates.md` §6), by
+    /// account — the mind's, read afresh like the routines.
     #[serde(skip)]
-    authorizers: Vec<String>,
+    authorizers: Vec<Authorizer>,
     /// What the world's round has done — see [`super::round`].
     #[serde(default)]
     round: RoundState,
@@ -1012,12 +1013,12 @@ impl Missions {
 
     /// Set who may approve a critical step — empty for a world that sets none,
     /// so a critical step can then only be held.
-    pub fn set_authorizers(&mut self, authorizers: Vec<String>) {
+    pub fn set_authorizers(&mut self, authorizers: Vec<Authorizer>) {
         self.authorizers = authorizers;
     }
 
     /// Who may approve a critical step here (`docs/mission_templates.md` §6).
-    pub fn authorizers(&self) -> &[String] {
+    pub fn authorizers(&self) -> &[Authorizer] {
         &self.authorizers
     }
 

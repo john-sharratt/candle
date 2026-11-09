@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::engine::authorize::is_authorizer;
+use crate::engine::authorize::{is_authorizer, Authorizer};
 use crate::engine::talk::key::Party;
 
 /// When each character's mission last changed through a conversation, in
@@ -52,8 +52,8 @@ pub enum Standing {
 }
 
 /// `party`'s standing over the character owned by `owner`, in a world whose
-/// authorizers are `authorizers` (account handles).
-pub fn standing(party: &Party, owner: Option<&str>, authorizers: &[String]) -> Standing {
+/// authorizers are `authorizers`.
+pub fn standing(party: &Party, owner: Option<&str>, authorizers: &[Authorizer]) -> Standing {
     let Party::Person(handle) = party else {
         return Standing::Nobody;
     };
@@ -88,7 +88,10 @@ mod tests {
 
     #[test]
     fn the_owner_and_an_authorizer_have_standing_and_nobody_else_does() {
-        let authorizers = ["u_mira0002".to_string()];
+        let authorizers = [Authorizer {
+            account: "u_mira0002".into(),
+            name: "Mira".into(),
+        }];
         assert_eq!(standing(&john(), Some("u_john0001"), &authorizers), Standing::Owner);
         assert_eq!(
             standing(&Party::Person("u_mira0002".into()), Some("u_john0001"), &authorizers),
