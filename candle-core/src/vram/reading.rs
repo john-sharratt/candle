@@ -12,14 +12,25 @@ use crate::Result;
 /// Which backend produced a [`VramReading`] — for logging and test assertions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeKind {
-    /// Windows/WDDM: DXGI per-process `Budget − CurrentUsage` (the authoritative
-    /// residency signal on a virtualized display driver).
+    /// WDDM: DXGI per-process `Budget − CurrentUsage` (the authoritative
+    /// residency signal where the OS manages VRAM).
     Dxgi,
-    /// Linux / fallback: `cuMemGetInfo` free (accurate where the driver owns the
-    /// framebuffer directly).
+    /// TCC and Linux: `cuMemGetInfo` free (accurate where the driver owns the
+    /// card).
     Cuda,
     /// Test double.
     Fake,
+}
+
+impl ProbeKind {
+    /// Its name, as `/v1/memory` gives it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dxgi => "dxgi",
+            Self::Cuda => "cuda",
+            Self::Fake => "fake",
+        }
+    }
 }
 
 /// A physically-honest snapshot of VRAM residency for one GPU, in bytes.

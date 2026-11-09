@@ -1,9 +1,9 @@
 //! The CUDA measurement backend: `cuMemGetInfo` free/total.
 //!
-//! Primary on Linux (where the NVIDIA driver owns the framebuffer directly and
-//! `free` is honest) and the universal fallback on Windows when the DXGI probe
-//! can't initialise. On WDDM this `free` is polluted, so the governor prefers
-//! [`super::probe_dxgi::DxgiProbe`] there.
+//! The probe for a device the NVIDIA driver owns — under TCC or on Linux —
+//! where `free` is honest and an allocation past it is refused
+//! (`docs/driver_model.md` §2). Under WDDM this `free` is polluted by what the
+//! OS manages, and the governor reads the DXGI probe instead.
 
 use super::reading::{ProbeKind, VramProbe, VramReading};
 use crate::{Device, Error, Result};

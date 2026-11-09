@@ -1,4 +1,5 @@
-//! The Windows/WDDM measurement backend: DXGI per-process budget.
+//! The WDDM measurement backend: DXGI per-process budget. Chosen for a WDDM
+//! device only (`docs/driver_model.md` §2); a TCC device is invisible to DXGI.
 //!
 //! On WDDM the OS virtualizes VRAM and `cuMemGetInfo`'s `free` is polluted, so we
 //! read the OS-authoritative per-process signal instead:
@@ -7,6 +8,7 @@
 //! `CurrentUsage`. `Budget − CurrentUsage` is the real headroom. The adapter is
 //! matched to the CUDA device by LUID. See `docs/vram_governor_design.md` §6.
 
+use super::driver_model::{driver_model, DriverModel};
 use super::reading::{BudgetWatchHandle, ProbeKind, VramProbe, VramReading};
 use crate::cuda_backend::CudaDevice;
 use crate::{Error, Result};
@@ -34,7 +36,18 @@ unsafe impl Sync for DxgiProbe {}
 
 impl DxgiProbe {
     /// Build a probe for the DXGI adapter whose LUID matches `cuda`'s device.
+    ///
+    /// Refused for a device that is not under WDDM: DXGI does not enumerate a
+    /// TCC adapter, and "no adapter matched the LUID" would not say why.
     pub fn for_cuda_device(cuda: &CudaDevice) -> Result<Self> {
+        let model = driver_model(cuda.cuda_context().cu_device())?;
+        if model != DriverModel::Wddm {
+            return Err(Error::Msg(format!(
+                "the device runs under {}, which DXGI does not see: there is no DXGI budget \
+                 to read (docs/driver_model.md)",
+                model.name()
+            )));
+        }
         let want = cuda_luid(cuda)?;
         let (adapter, total) = find_adapter_by_luid(want)?;
         Ok(Self {

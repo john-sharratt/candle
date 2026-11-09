@@ -84,9 +84,10 @@ pub(crate) const SUMMARY_RING: usize = 64;
 pub(crate) const PIPELINE_CHANNEL_BOUND: usize = SUMMARY_RING;
 
 /// The longest a single worker waits for a cold expert before it gives the
-/// expert up and fails the forward (`fault`). A backstop well inside the
-/// display watchdog's 2 s (TDR), never meant to fire: a wait this long means the
-/// stager is not delivering.
+/// expert up and fails the forward (`fault`). A deadlock backstop, never meant
+/// to fire: a wait this long means the stager is not delivering. Under WDDM it
+/// also keeps the launch inside the display watchdog's 2 s (TDR); under TCC
+/// there is no watchdog and it stays the backstop.
 pub(crate) const SPIN_LIMIT_NS: u64 = 1_000_000_000;
 
 /// Ranks past the router's own top `k` each token names in the look-ahead's

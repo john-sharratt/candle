@@ -61,11 +61,16 @@ Qwen3 thresholds are model-specific and must be re-derived for each variant. Whe
 three, and none is "the" target — check what you are actually on (`nvidia-smi`)
 rather than assuming, because sizing decisions differ between them:
 
-| Machine | VRAM | SM | Host | Link |
-|---|---|---|---|---|
-| **RTX 4090 Mobile** | 16 GB | sm_89 (Ada) | Core Ultra 9 185H, 32 GB LPDDR5X-7467 | **PCIe 4.0 ×8, ~12 GB/s** |
-| **RTX 3090** | 24 GB | sm_86 (GA102) | i7-10700K 8C/16T, 64 GB RAM | **PCIe 3.0 ×16, ~12 GB/s** |
-| **RTX PRO 5000 Blackwell** | 72 GB | sm_120 | — | PCIe 5.0 ×16 |
+| Machine | VRAM | SM | Host | Link | Driver model |
+|---|---|---|---|---|---|
+| **RTX 4090 Mobile** | 16 GB | sm_89 (Ada) | Core Ultra 9 185H, 32 GB LPDDR5X-7467 | **PCIe 4.0 ×8, ~12 GB/s** | WDDM |
+| **RTX 3090** (WhiteWorld) | 24 GB | sm_86 (GA102) | i7-10700K 8C/16T, 64 GB RAM | **PCIe 3.0 ×16, ~12 GB/s** | WDDM (GeForce: no TCC) |
+| **RTX PRO 5000 Blackwell** (BlackWorld) | 72 GB | sm_120 | 189 GB RAM, AMD iGPU drives the console | PCIe 5.0 ×16 | WDDM; TCC-capable |
+
+The driver model changes the memory arithmetic — WDDM demotes VRAM past
+capacity and charges system commit for every allocation, TCC refuses and
+charges nothing — and is read from the device, never assumed
+(`docs/driver_model.md`).
 
 Two traps specific to the **3090 box**, both easy to miss because the card
 looks like the biggest consumer part in the fleet:

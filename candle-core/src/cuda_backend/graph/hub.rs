@@ -45,6 +45,7 @@ use super::thread_wave;
 use super::timing::SegmentTimer;
 use super::GraphError;
 use crate::cuda_backend::{set_kernel_breadcrumb, CudaDevice, StreamLease, WrapErr};
+use crate::vram::driver_model;
 use crate::Result;
 use cudarc::driver::{result, sys, CudaEvent, CudaStream};
 use std::hash::{Hash, Hasher};
@@ -419,7 +420,13 @@ fn act_on_transitions(st: &mut HubState, wave: u64) {
 ///
 /// Only between this thread's segments, or under a lease: a query on a stream
 /// that is capturing is refused, and refusing it invalidates the capture.
+///
+/// Under TCC and Linux a launch is submitted as it is issued, so there is
+/// nothing to nudge and no query is made (`docs/driver_model.md` §6).
 fn query_submits(compute: &Arc<CudaStream>) -> Result<()> {
+    if !driver_model(compute.context().cu_device())?.batches_submissions() {
+        return Ok(());
+    }
     // SAFETY: a query on the device's stream, made while nothing captures on
     // it. Its only purpose is the WDDM submission it forces; `NOT_READY` is the
     // expected answer.

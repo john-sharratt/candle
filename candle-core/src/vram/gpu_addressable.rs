@@ -16,27 +16,40 @@
 //! between 0.9 and 2.7 GiB of host RAM still free, so not a RAM shortage.
 //!
 //! [`gpu_addressable_room`] is what is left of that budget. A pinned tier sizes
-//! its locked part against it; `None` means the platform has no such budget to
-//! read (Linux, a TCC driver) and only the driver's own refusal bounds a lock.
+//! its locked part against it. Under TCC and Linux there is no such budget
+//! (`docs/driver_model.md` §3): `Ok(None)`, and only the driver's own refusal
+//! bounds a lock. Under WDDM the budget is read from DXGI, and a failure to read
+//! it is an error — answering "no budget" there would pin past what the device
+//! can address.
 
+use super::driver_model::{driver_model, DriverModel};
+#[cfg(windows)]
+use super::DxgiProbe;
 use crate::cuda_backend::CudaDevice;
+use crate::Result;
 
 /// Bytes of the NON_LOCAL segment budget not yet in use by this process, or
-/// `None` where the platform reports no such budget.
-pub fn gpu_addressable_room(device: &CudaDevice) -> Option<u64> {
-    gpu_addressable_budget(device).map(|(budget, usage)| budget.saturating_sub(usage))
+/// `None` where the driver model has no such budget.
+pub fn gpu_addressable_room(device: &CudaDevice) -> Result<Option<u64>> {
+    Ok(gpu_addressable_budget(device)?.map(|(budget, usage)| budget.saturating_sub(usage)))
 }
 
 /// The NON_LOCAL segment as `(Budget, CurrentUsage)`, or `None` where the
-/// platform reports no such budget. The OS revises the budget as the machine's
+/// driver model has no such budget. The OS revises the budget as the machine's
 /// memory changes, so a reading holds for the instant it was taken.
+pub fn gpu_addressable_budget(device: &CudaDevice) -> Result<Option<(u64, u64)>> {
+    match driver_model(device.cuda_context().cu_device())? {
+        DriverModel::Wddm => non_local(device).map(Some),
+        DriverModel::Tcc | DriverModel::Linux => Ok(None),
+    }
+}
+
 #[cfg(windows)]
-pub fn gpu_addressable_budget(device: &CudaDevice) -> Option<(u64, u64)> {
-    let probe = super::DxgiProbe::for_cuda_device(device).ok()?;
-    probe.non_local().ok()
+fn non_local(device: &CudaDevice) -> Result<(u64, u64)> {
+    DxgiProbe::for_cuda_device(device)?.non_local()
 }
 
 #[cfg(not(windows))]
-pub fn gpu_addressable_budget(_device: &CudaDevice) -> Option<(u64, u64)> {
-    None
+fn non_local(_device: &CudaDevice) -> Result<(u64, u64)> {
+    crate::bail!("a WDDM device off Windows has no NON_LOCAL budget to read")
 }

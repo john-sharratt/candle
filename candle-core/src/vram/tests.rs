@@ -37,6 +37,14 @@ fn governed(vram: &FakeVram, c: u64, weights: u64) -> VramGovernor {
     gov
 }
 
+/// **A governor built around a probe alone has no driver model**: only one
+/// built for a real device reads it (`docs/driver_model.md` §1).
+#[test]
+fn a_probe_only_governor_has_no_driver_model() {
+    let gov = governed(&FakeVram::new(GIB, 2 * GIB), GIB, 0);
+    assert_eq!(gov.driver_model(), None);
+}
+
 /// A model load records the session's WHOLE dense footprint, so recording it
 /// again must replace it, not stack on top.
 ///
@@ -609,6 +617,35 @@ mod real_cuda {
     /// Allocate `bytes` of real, touched device VRAM (tagged Kv), holding it.
     fn alloc_kv(device: &Device, bytes: u64) -> Result<Tensor> {
         Tensor::zeros(bytes as usize, crate::DType::U8, device)
+    }
+
+    /// **The probe follows the driver model** (`docs/driver_model.md` §2): DXGI
+    /// under WDDM, `cuMemGetInfo` under TCC and Linux — whichever this card
+    /// runs — and the governor keeps the model it read.
+    #[test]
+    fn real_cuda_the_probe_follows_the_driver_model() -> Result<()> {
+        let Some(device) = cuda_device() else {
+            return Ok(());
+        };
+        let Device::Cuda(cuda) = &device else {
+            unreachable!("cuda_device returns a CUDA device")
+        };
+        let model = super::driver_model(cuda.cuda_context().cu_device())?;
+        let _gpu = gpu_guard();
+        let gov = VramGovernor::from_device(&device, 0)?;
+        assert_eq!(gov.driver_model(), Some(model));
+        let expected = if model.os_manages_residency() {
+            ProbeKind::Dxgi
+        } else {
+            ProbeKind::Cuda
+        };
+        assert_eq!(gov.measure()?.source, expected, "under {}", model.name());
+        assert_eq!(
+            cfg!(windows),
+            model != super::DriverModel::Linux,
+            "Windows runs WDDM or TCC, every other OS the driver's own model"
+        );
+        Ok(())
     }
 
     #[test]

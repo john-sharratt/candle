@@ -22,11 +22,14 @@
 //! - [`managed`] — the capacity arithmetic the startup partition is sized from.
 //! - [`diag`] — the [`BudgetTable`] snapshot and logging.
 //! - [`balloon`] — the balloon-and-measure bootstrap.
+//! - [`driver_model`] — WDDM, TCC or Linux, read from the device
+//!   (`docs/driver_model.md`); the probe is chosen by it.
 //! - `probe_cuda` / `probe_dxgi` — the real measurement backends.
 
 pub mod balloon;
 mod budget;
 mod diag;
+mod driver_model;
 #[cfg(feature = "cuda")]
 mod gpu_addressable;
 mod host_probe;
@@ -41,6 +44,9 @@ mod probe_dxgi;
 
 pub use budget::GovernorConfig;
 pub use diag::{BudgetRow, BudgetTable};
+#[cfg(feature = "cuda")]
+pub use driver_model::driver_model;
+pub use driver_model::DriverModel;
 #[cfg(feature = "cuda")]
 pub use gpu_addressable::{gpu_addressable_budget, gpu_addressable_room};
 pub use host_probe::{
@@ -57,8 +63,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(feature = "cuda")]
+use crate::cuda_backend::CudaDevice;
 use crate::{Device, Result};
 use balloon::BalloonAllocator;
+#[cfg(feature = "cuda")]
+use probe_cuda::CudaProbe;
 use reading::VramReading as Reading;
 
 /// What an allocation is *for*. Drives evictability (which relief rung, if any,
@@ -128,6 +138,9 @@ pub struct VramGovernor {
     /// last drained it (see [`Self::signal_starvation`]). Lets a starved
     /// background compressor ask the scheduler for an escalated recovery.
     starvation: AtomicU64,
+    /// The device's driver model, read when the governor was built for a real
+    /// device; `None` for a governor built around a probe alone (tests).
+    driver_model: Option<DriverModel>,
 }
 
 impl std::fmt::Debug for VramGovernor {
@@ -150,7 +163,13 @@ impl VramGovernor {
             headroom_at_capacity: AtomicU64::new(0),
             class_reserved: Default::default(),
             starvation: AtomicU64::new(0),
+            driver_model: None,
         }
+    }
+
+    /// The device's driver model; `None` for a probe-only governor.
+    pub fn driver_model(&self) -> Option<DriverModel> {
+        self.driver_model
     }
 
     /// Report that a background allocator (e.g. the persistence hot→warm
@@ -279,37 +298,62 @@ impl VramGovernor {
 
 #[cfg(feature = "cuda")]
 impl VramGovernor {
-    /// Construct a governor for a real CUDA device: pick the best probe (DXGI on
-    /// Windows matched by LUID, else `cuMemGetInfo`) and wire the sync hook to the
-    /// device stream. Returns an `Arc` ready to [`install`].
-    pub fn from_device(device: &crate::Device, gpu_id: usize) -> Result<Arc<Self>> {
+    /// Construct a governor for a real CUDA device, with the probe its driver
+    /// model calls for (`docs/driver_model.md` §2). Returns an `Arc` ready to
+    /// [`install`].
+    pub fn from_device(device: &Device, gpu_id: usize) -> Result<Arc<Self>> {
         Self::from_device_with_config(device, gpu_id, GovernorConfig::default())
     }
 
     /// As [`Self::from_device`] but with an explicit config (tests / tuning).
     pub fn from_device_with_config(
-        device: &crate::Device,
+        device: &Device,
         gpu_id: usize,
         config: GovernorConfig,
     ) -> Result<Arc<Self>> {
-        let probe: Box<dyn VramProbe> = Self::pick_probe(device, gpu_id)?;
-        Ok(Arc::new(Self::new(gpu_id, probe, config)))
+        let (probe, model) = Self::pick_probe(device)?;
+        let mut gov = Self::new(gpu_id, probe, config);
+        gov.driver_model = Some(model);
+        Ok(Arc::new(gov))
     }
 
-    fn pick_probe(device: &crate::Device, _gpu_id: usize) -> Result<Box<dyn VramProbe>> {
-        #[cfg(windows)]
-        {
-            if let crate::Device::Cuda(cuda) = device {
-                match probe_dxgi::DxgiProbe::for_cuda_device(cuda) {
-                    Ok(p) => return Ok(Box::new(p)),
-                    Err(e) => tracing::warn!(
-                        target: "candle_core::vram",
-                        "DXGI probe unavailable ({e}); falling back to cuMemGetInfo"
-                    ),
-                }
-            }
+    /// The probe for `device`'s driver model, and the model.
+    ///
+    /// **WDDM requires DXGI.** The OS manages residency there, so `cuMemGetInfo`
+    /// is not the signal the balloon's live stop and wobble margin are built on,
+    /// and a governor sized from it would claim into demotion. A WDDM device
+    /// whose DXGI adapter cannot be opened gets no governor, by name. Under TCC
+    /// and Linux the driver owns the card and `cuMemGetInfo` is honest.
+    fn pick_probe(device: &Device) -> Result<(Box<dyn VramProbe>, DriverModel)> {
+        let Device::Cuda(cuda) = device else {
+            crate::bail!("a VRAM governor measures a CUDA device, and this is {device:?}");
+        };
+        let model = driver_model(cuda.cuda_context().cu_device())?;
+        tracing::info!(
+            target: "candle_core::vram",
+            driver_model = model.name(),
+            "vram: driver model"
+        );
+        if model.os_manages_residency() {
+            return Self::residency_probe(cuda).map(|p| (p, model));
         }
-        Ok(Box::new(probe_cuda::CudaProbe::new(device.clone())))
+        Ok((Box::new(CudaProbe::new(device.clone())), model))
+    }
+
+    #[cfg(windows)]
+    fn residency_probe(cuda: &CudaDevice) -> Result<Box<dyn VramProbe>> {
+        match DxgiProbe::for_cuda_device(cuda) {
+            Ok(p) => Ok(Box::new(p)),
+            Err(e) => crate::bail!(
+                "the device runs under WDDM, whose residency budget only DXGI reports, \
+                 and its DXGI probe could not be opened: {e}"
+            ),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn residency_probe(_cuda: &CudaDevice) -> Result<Box<dyn VramProbe>> {
+        crate::bail!("an OS-managed residency driver model off Windows: there is no probe for it")
     }
 }
 

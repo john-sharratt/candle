@@ -164,7 +164,7 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// against live free RAM instead. See `zend_run_iteration_traps.md` §4.
 pub const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
 
-use candle::vram::PAGEABLE_RESERVE;
+use candle::vram::{gpu_addressable_room, PAGEABLE_RESERVE};
 
 /// Layers of pad slots the stager owns: the layer a wave is computing, and the
 /// [`STAGED_HOPS`] after it, which a prefill launch's router votes stage into
@@ -727,11 +727,8 @@ impl ExpertCache {
                 if let Some(report) = progress {
                     report(LoadPhase::PinWarm, 0, 0);
                 }
-                let mut warm = WarmTier::new(
-                    membership.len(),
-                    stride,
-                    candle::vram::gpu_addressable_room(cuda_dev),
-                );
+                let mut warm =
+                    WarmTier::new(membership.len(), stride, gpu_addressable_room(cuda_dev)?);
                 // A refusal shortens the draw rather than leaving slots the tier
                 // does not have: `ram` must never name a slot outside it.
                 let membership = &membership[..membership.len().min(warm.num_slots())];

@@ -60,8 +60,10 @@ pub fn capacity_target(total: u64, reserve: u64) -> u64 {
 /// here is expert residency on the card where residency is what pays for
 /// decode.
 ///
-/// Everywhere else the refusal mechanism is honest and the margin is just the
-/// configured reserve.
+/// Under TCC and Linux the reading is `cuMemGetInfo`'s ([`ProbeKind::Cuda`]):
+/// the driver owns the card, nothing dips the budget and an allocation past it
+/// is refused rather than demoted, so the margin is just the configured reserve
+/// (`docs/driver_model.md` §4).
 pub fn wobble_margin(reading: &VramReading, config: &GovernorConfig) -> u64 {
     match reading.source {
         ProbeKind::Dxgi => (reading.headroom / WOBBLE_DIVISOR)

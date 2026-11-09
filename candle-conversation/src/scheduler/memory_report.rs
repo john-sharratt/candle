@@ -21,7 +21,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use candle::vram::{host_pinned_bytes, AllocClass};
+use candle::vram::{host_pinned_bytes, AllocClass, DriverModel};
 use candle::wave_provenance::last_wave_declines;
 use candle::Device;
 use candle_nn::kv_cache::{global_arena_memory_report, SlotTenant};
@@ -136,7 +136,9 @@ pub struct GallerySection {
 /// Device + pool + governor view of the card.
 #[derive(Debug, Clone, Serialize)]
 pub struct VramSection {
-    /// Driver-reported free/total (DXGI headroom path on WDDM).
+    /// `cuMemGetInfo` free/total — honest under TCC and Linux; under WDDM free
+    /// is polluted by what the OS manages, and the governor's DXGI headroom is
+    /// the residency signal.
     pub driver_free_bytes: u64,
     pub driver_total_bytes: u64,
     /// CUDA stream-ordered pool: live allocations vs OS-reserved footprint.
@@ -154,6 +156,12 @@ pub struct VramSection {
 /// The VRAM governor's budget model.
 #[derive(Debug, Clone, Serialize)]
 pub struct GovernorSection {
+    /// The device's driver model — `wddm`, `tcc` or `linux`
+    /// (`docs/driver_model.md`); absent for a probe-only governor.
+    pub driver_model: Option<&'static str>,
+    /// The probe the readings below come from: `dxgi` under WDDM, `cuda` under
+    /// TCC and Linux. The two measure headroom on different scales.
+    pub probe: &'static str,
     /// Balloon-measured resident capacity `C`.
     pub capacity_bytes: u64,
     /// Live measured headroom (honest, excludes the pool reuse gap).
@@ -565,14 +573,19 @@ impl Scheduler {
         // ── VRAM ────────────────────────────────────────────────────────────
         let vram = self.session.vram_free_total().map(|(free, total)| {
             let (pool_used, pool_reserved) = self.session.vram_pool_stats().unwrap_or((0, 0));
-            let governor = self.session.vram_governor().map(|gov| GovernorSection {
-                capacity_bytes: gov.capacity(),
-                headroom_bytes: gov.measure().map(|r| r.headroom).unwrap_or(0),
-                pool_cushion_bytes: gov.pool_cushion(),
-                reserved_weights_bytes: gov.class_reserved(AllocClass::Weights),
-                reserved_expert_bytes: gov.class_reserved(AllocClass::Expert),
-                reserved_scratch_bytes: gov.class_reserved(AllocClass::Scratch),
-                reserved_kv_bytes: gov.class_reserved(AllocClass::Kv),
+            let governor = self.session.vram_governor().map(|gov| {
+                let reading = gov.measure().ok();
+                GovernorSection {
+                    driver_model: gov.driver_model().map(DriverModel::name),
+                    probe: reading.map_or("unread", |r| r.source.name()),
+                    capacity_bytes: gov.capacity(),
+                    headroom_bytes: reading.map_or(0, |r| r.headroom),
+                    pool_cushion_bytes: gov.pool_cushion(),
+                    reserved_weights_bytes: gov.class_reserved(AllocClass::Weights),
+                    reserved_expert_bytes: gov.class_reserved(AllocClass::Expert),
+                    reserved_scratch_bytes: gov.class_reserved(AllocClass::Scratch),
+                    reserved_kv_bytes: gov.class_reserved(AllocClass::Kv),
+                }
             });
             VramSection {
                 driver_free_bytes: free as u64,
@@ -894,6 +907,8 @@ mod tests {
                 pool_reserved_bytes: 4,
                 budget_available_bytes: Some(5),
                 governor: Some(GovernorSection {
+                    driver_model: Some("tcc"),
+                    probe: "cuda",
                     capacity_bytes: 6,
                     headroom_bytes: 7,
                     pool_cushion_bytes: 8,
@@ -1109,6 +1124,8 @@ mod tests {
             "captured_unix_ms",
             "driver_free_bytes",
             "pool_reserved_bytes",
+            "\"driver_model\":\"tcc\"",
+            "\"probe\":\"cuda\"",
             "headroom_bytes",
             "\"arenas\"",
             "pending_warm_bytes",

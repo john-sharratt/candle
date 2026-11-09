@@ -109,7 +109,9 @@ slice. These are the closures the ladder registers — subsumed, not rewritten.
   push re-measure. `SetVideoMemoryReservation` = minimum-working-set hint (not a
   lock). Adapter matched to CUDA device by **LUID** (`cuDeviceGetLuid` ↔
   `DXGI_ADAPTER_DESC1.AdapterLuid`).
-- **Linux:** `cuMemGetInfo` is accurate (no WDDM virtualization).
+- **TCC and Linux:** `cuMemGetInfo` is accurate (no WDDM virtualization). The
+  driver model is read from the device (`CU_DEVICE_ATTRIBUTE_TCC_DRIVER`), never
+  inferred from the OS — `docs/driver_model.md`.
 - **Balloon:** `cuMemAlloc` + `cuMemsetD8` (touch) forces residency and evicts
   other processes' cold VRAM. No CUDA lock exists.
 - **Pool return:** `cuMemPoolTrimTo` reclaims *settled* memory without a sync but
@@ -211,8 +213,9 @@ pub trait VramProbe: Send + Sync {
 
 - `DxgiProbe` (`#[cfg(windows)]`) — LUID-matched `IDXGIAdapter3`, LOCAL segment,
   wires the budget-change event. **Primary on WDDM.**
-- `CudaProbe` — `cuMemGetInfo`. **Primary on Linux**, and the Windows fallback if
-  DXGI init fails.
+- `CudaProbe` — `cuMemGetInfo`. **The probe under TCC and Linux.** Never a
+  fallback for WDDM: a WDDM device whose DXGI probe cannot open gets no governor,
+  named in the log (`docs/driver_model.md` §2).
 
 **Dependency posture (minimal):** `CudaProbe` uses cudarc (already a dep).
 `DxgiProbe` needs DXGI COM — proposed as the `windows` crate gated to
@@ -637,7 +640,8 @@ candle-core/src/vram/
   mod.rs        VramGovernor, per-GPU global registry, AllocClass, Criticality
   reading.rs    VramReading, VramProbe trait, ProbeKind
   probe_dxgi.rs #[cfg(windows)] DXGI backend + LUID match + budget-change event
-  probe_cuda.rs cuMemGetInfo backend (Linux primary, universal fallback)
+  probe_cuda.rs cuMemGetInfo backend (TCC and Linux)
+  driver_model.rs WDDM / TCC / Linux, read from the device
   balloon.rs    strided balloon-and-measure
   budget.rs     evolving budget, variable band, kv_floor (abs+pct), per-class tally
   relief.rs     criticality ladder, thresholds, relief loop, evictable_estimate
@@ -669,7 +673,8 @@ Deps: `cudarc` (existing); `windows` crate (`#[cfg(windows)]`, minimal features)
 |---|---|
 | Balloon can't reach floor / card < model | log, fall back to `cuMemGetInfo total − margin`; never hang |
 | Ladder exhausted, still below floor | `Exhausted`; `allocate` → typed OOM; **no spin** |
-| DXGI init fails (no D3D / RDP) | fall back to `CudaProbe`; DXGI disabled this run |
+| DXGI init fails on a WDDM device | no governor, named in the log — a `cuMemGetInfo` reading there would size `C` into demotion |
+| Device under TCC (or Linux) | `CudaProbe` by design; DXGI does not see a TCC adapter (`docs/driver_model.md`) |
 | External app collapses our budget mid-decode | budget-change event → relieve toward `kv_floor`, hold; never below floor; don't thrash |
 | `Critical` sync storm | rate-limit `Critical` entry (min interval); hold at floor between |
 | Async frees not yet retired | measurement lags but gentle-early relief kept a buffer; if a physical alloc still fails, escalate to `Critical` (sync forces retirement) then retry |

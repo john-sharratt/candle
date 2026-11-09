@@ -18,12 +18,15 @@
 //!
 //! # The refusal is a failed *touch*, not a failed create
 //!
-//! `cuMemCreate` does not tell the truth about capacity. Probed on the target
-//! machine (`vmm_overcommit_probe.py`, §9): it succeeded for every granule of a
-//! 32 GiB span on a 16 GiB card. The limit appears at the first **write** to a
-//! granule. So every granule this file maps is also written before it counts as
-//! claimed, and a failed write is the refusal that stops the balloon — the
-//! granule is unmapped and released, and the reservation ends there.
+//! Under WDDM `cuMemCreate` does not tell the truth about capacity. Probed on
+//! the target machine (`vmm_overcommit_probe.py`, §9): it succeeded for every
+//! granule of a 32 GiB span on a 16 GiB card. The limit appears at the first
+//! **write** to a granule. So every granule this file maps is also written
+//! before it counts as claimed, and a failed write is the refusal that stops the
+//! balloon — the granule is unmapped and released, and the reservation ends
+//! there. Under TCC and Linux the driver owns the card and the create itself is
+//! expected to refuse (`docs/driver_model.md` §5); `CUDA_ERROR_OUT_OF_MEMORY`
+//! from the create, the map or the write is the capacity either way.
 //!
 //! The write is a zero-fill, which the region tier then relies on: a
 //! freshly-mapped region is already zeroed, exactly as `Tensor::zeros` left the

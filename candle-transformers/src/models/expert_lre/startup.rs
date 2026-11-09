@@ -87,12 +87,13 @@ impl<'a> StartupRing<'a> {
 fn addressable_state(cuda_dev: &candle::CudaDevice) -> String {
     const GIB: f64 = (1u64 << 30) as f64;
     match gpu_addressable_budget(cuda_dev) {
-        Some((budget, usage)) => format!(
+        Ok(Some((budget, usage))) => format!(
             "GPU-addressable budget {:.2} GiB, used {:.2} GiB",
             budget as f64 / GIB,
             usage as f64 / GIB
         ),
-        None => "GPU-addressable budget unreported".to_string(),
+        Ok(None) => "no GPU-addressable budget under this driver model".to_string(),
+        Err(e) => format!("GPU-addressable budget unread: {e}"),
     }
 }
 

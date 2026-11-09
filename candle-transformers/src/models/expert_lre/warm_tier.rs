@@ -64,8 +64,8 @@ pub(crate) const ADDRESSABLE_MARGIN: u64 = 3 * 1024 * 1024 * 1024;
 
 /// The most pinned slots of `slot_size` that leave [`ADDRESSABLE_MARGIN`] of
 /// `room` — GPU-addressable host memory not yet in use — unspent, capped at
-/// `want`. `None` is a platform with no such budget: the driver's own refusal
-/// is the only bound.
+/// `want`. `None` is a driver model with no such budget — TCC or Linux
+/// (`docs/driver_model.md` §3): the driver's own refusal is the only bound.
 pub(crate) fn addressable_pinned_slots(room: Option<u64>, slot_size: usize, want: usize) -> usize {
     match room {
         None => want,
