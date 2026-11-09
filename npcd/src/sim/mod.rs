@@ -43,6 +43,7 @@ pub mod house;
 pub mod item;
 pub mod ledger;
 pub mod missing;
+pub mod kept_steps;
 pub mod missions;
 pub mod operation_names;
 pub mod operations;
