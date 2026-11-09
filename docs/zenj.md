@@ -443,7 +443,9 @@ if the card's outputs are DisplayPort) — not cast, which adds seconds of delay
   dark and lit by stage lights playing the room's looks (§9): ZenJ puts the lights' planned looks
   in the same beat schedule it sends ahead for Zen's strikes, so the bulbs and the planet change on
   the same beat. Anyone in the game can listen to the set.
-  Designed in Battle Cities' `docs/03-GAMEPLAY/THE-END.md`.
+  Designed in Battle Cities' `docs/03-GAMEPLAY/THE-END.md`. ZenJ's side (BlackWorld) is the
+  `end/beats` schedule on the gateway's bus, the last words on an exact beat, and the stamped
+  stream; the interface and dates are in `docs/03-GAMEPLAY/THE-END-PLAN.md` there.
 
 While rekordbox is open BlackWorld is reserved (§3.1): no builds, no ingest or calibration, and its
 member drained while another serves every app, so the cores and the card's work are the decks' and
