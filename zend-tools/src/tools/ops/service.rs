@@ -11,9 +11,12 @@ use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 #[derive(Serialize, Deserialize, JsonSchema, Validate)]
 pub struct DeployRequest {
-    /// The machine to deploy to, by name, as `blackworld`. Required.
+    /// The machine to deploy to, by name, as `blackworld`. Optional: the
+    /// machine the cluster builds on first when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     #[validate(length(min = 1, max = 32))]
-    pub host: String,
+    pub host: Option<String>,
     /// The service to build and try. Required.
     pub service: Service,
 }

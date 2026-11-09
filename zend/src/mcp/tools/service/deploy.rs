@@ -11,6 +11,8 @@ use agent::client::Agents;
 use agent::overlay::Overlay;
 use agent::wire::{RunJob, Staged};
 use axum::http::Method;
+use cluster::machines::MachineTable;
+use host::machines::machines;
 use serde_json::{json, Value};
 use zend_vfs::JobStatus;
 
@@ -54,17 +56,22 @@ pub fn definition() -> Value {
             runs. Only \
             origin/main is built: merge and push first. `motherd` is the daemon — models, Zen, npcd; \
             trying it stops every app on that machine for the trial. `web` is the gateway; `mcp` is the \
-            connector; `yenbot` is Yen Bots, built from its own repository. One machine per call: a new motherd joins the cluster as a candidate and the others \
-            take it once it is certified, which is the user's decision (`cluster_command`); `web` and \
-            `mcp` are deployed machine by machine. Say on each step where it runs — the machine and the \
-            handle — so whoever watches knows. Admins only.",
+            connector; `yenbot` is Yen Bots, built from its own repository. One machine per call; \
+            leave out `host` and it goes to the machine the cluster builds on first (BlackWorld), \
+            which is where a motherd deploy belongs: the new motherd joins the cluster as a \
+            candidate and the other members take it once it is certified, so they never build it \
+            themselves — a build beside a model member pages its memory out. `web` and `mcp` are \
+            deployed machine by machine. A motherd trial restarts the build agent, which runs \
+            inside motherd, so its build's log is gone once the trial starts; the deploy is still \
+            followed through keep. Say on each step where it runs — the machine and the handle — \
+            so whoever watches knows. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "minLength": 1, "maxLength": 32, "description": "The machine to deploy to, by name, as `cluster_status` and `service_status` name it: `BlackWorld`, `WhiteWorld`."},
+                "host": {"type": "string", "minLength": 1, "maxLength": 32, "description": "The machine to deploy to, by name, as `cluster_status` and `service_status` name it: `BlackWorld`, `WhiteWorld`. Left out: the machine the cluster builds on first (`host/machines.yaml`'s `builds`)."},
                 "service": {"type": "string", "enum": SERVICES, "description": "`motherd` (the daemon), `web` (the gateway), `mcp` (the connector) or `yenbot` (Yen Bots)."}
             },
-            "required": ["host", "service"],
+            "required": ["service"],
             "additionalProperties": false
         }
     })
@@ -159,19 +166,30 @@ async fn drive(call: OpsCall, agents: Agents, h: Handle, host: String, service: 
     }
 }
 
+/// The machine a deploy that names none goes to: of the machines with an
+/// agent, the one the machine table most prefers to build on
+/// (`host/machines.yaml`'s `builds`). A daemon deployed there reaches the
+/// others through certification, so they never build it beside the model
+/// whose memory a build would page out.
+pub fn default_host<'a>(
+    table: &MachineTable,
+    hosts: impl IntoIterator<Item = &'a str>,
+) -> Result<String, String> {
+    table
+        .first_builder(hosts)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "no machine with an agent has a build preference in the machine table \
+         (`host/machines.yaml`'s `builds`): name the `host` to deploy to"
+                .to_string()
+        })
+}
+
 pub async fn run(call: &OpsCall, args: &Value) -> Answer {
-    let (host, service) = match (
-        string(args, "host"),
-        string(args, "service").and_then(service_of),
-    ) {
-        (Ok(h), Ok(s)) => (h.to_string(), s),
-        (Err(e), _) | (_, Err(e)) => return Answer::error(e),
+    let service = match string(args, "service").and_then(service_of) {
+        Ok(s) => s,
+        Err(e) => return Answer::error(e),
     };
-    if call.worker {
-        if let Err(why) = guard::check(call, &host, service).await {
-            return Answer::error(why);
-        }
-    }
     let Some(agents) = call.session.agents() else {
         return Answer::error(NO_AGENTS);
     };
@@ -179,6 +197,23 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
         Ok(l) => l,
         Err(e) => return Answer::error(format!("the agents could not be listed: {e}")),
     };
+    let host = match args.get("host") {
+        None | Some(Value::Null) => {
+            match default_host(&machines(), listed.iter().map(|a| a.host.as_str())) {
+                Ok(h) => h,
+                Err(e) => return Answer::error(e),
+            }
+        }
+        Some(_) => match string(args, "host") {
+            Ok(h) => h.to_string(),
+            Err(e) => return Answer::error(e),
+        },
+    };
+    if call.worker {
+        if let Err(why) = guard::check(call, &host, service).await {
+            return Answer::error(why);
+        }
+    }
     let node = match on_host(&listed, &host) {
         Ok(n) => n,
         Err(e) => {
@@ -325,6 +360,26 @@ mod tests {
             d["inputSchema"]["properties"]["service"]["enum"],
             json!(["motherd", "web", "mcp", "yenbot"])
         );
-        assert_eq!(d["inputSchema"]["required"], json!(["host", "service"]));
+        assert_eq!(d["inputSchema"]["required"], json!(["service"]));
+        assert!(d["inputSchema"]["properties"]["host"].is_object());
+    }
+
+    /// **A deploy that names no machine goes to the first builder** of those
+    /// with an agent — the shipped table's BlackWorld — and one with no
+    /// builder among them is refused, asking for the machine.
+    #[test]
+    fn a_deploy_naming_no_machine_goes_to_the_first_builder() {
+        assert_eq!(
+            default_host(&machines(), ["WhiteWorld", "BlackWorld"]),
+            Ok("BlackWorld".to_string())
+        );
+        assert_eq!(
+            default_host(&machines(), ["AlienWorld"]),
+            Err(
+                "no machine with an agent has a build preference in the machine table \
+                 (`host/machines.yaml`'s `builds`): name the `host` to deploy to"
+                    .to_string()
+            )
+        );
     }
 }

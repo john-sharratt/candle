@@ -144,6 +144,16 @@ impl MachineTable {
         self.get(host).and_then(|m| m.builds)
     }
 
+    /// Of `hosts`, the machine the table most prefers to build on — the lowest
+    /// `builds` — or `None` when it gives none of them one.
+    pub fn first_builder<'a>(&self, hosts: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+        hosts
+            .into_iter()
+            .filter_map(|h| self.builds(h).map(|rank| (rank, h)))
+            .min()
+            .map(|(_, h)| h)
+    }
+
     /// `host`'s share of the cast; zero for a machine the table does not name.
     pub fn characters(&self, host: &str) -> u32 {
         self.get(host).map_or(0, |m| m.characters)
@@ -204,6 +214,21 @@ AlienWorld: {}
                 t.builds("nowhere")
             ),
             (Some(1), None, None)
+        );
+    }
+
+    /// The first builder of some hosts is the one with the lowest `builds`; a
+    /// host the table gives none is never it.
+    #[test]
+    fn the_first_builder_is_the_lowest_build_preference() {
+        let t = MachineTable::from_yaml("A:\n  builds: 2\nB:\n  builds: 1\nC: {}\n").unwrap();
+        assert_eq!(t.first_builder(["A", "C", "b"]), Some("b"));
+        assert_eq!(t.first_builder(["A", "C"]), Some("A"));
+        assert_eq!(t.first_builder(["C", "nowhere"]), None);
+        let shipped = MachineTable::from_yaml(include_str!("../../host/machines.yaml")).unwrap();
+        assert_eq!(
+            shipped.first_builder(["WhiteWorld", "AlienWorld", "BlackWorld"]),
+            Some("BlackWorld")
         );
     }
 

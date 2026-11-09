@@ -121,10 +121,15 @@ maintenance jobs at `GET /v1/cluster/command/jobs`.
 
 ## 6. Deploys
 
-`service_deploy {host, service}`:
+`service_deploy {service, host?}`:
 
 1. Refuse what keep would refuse: the service is one keep runs (`motherd`,
-   `web`, `mcp`), and the machine has an agent.
+   `web`, `mcp`), and the machine has an agent. With no `host`, the machine is
+   the one of those with an agent that the machine table most prefers to build
+   on (`host/machines.yaml`'s `builds`: BlackWorld). That is where a `motherd`
+   deploy belongs: the other members take it through certification and never
+   build it beside their own model member, whose memory a release build pages
+   out.
 2. For a worker of Zen's: refuse a `motherd` trial on its own machine and one
    that takes an app's only ready member down
    (`zend/src/mcp/tools/service/guard.rs`).
@@ -138,6 +143,15 @@ maintenance jobs at `GET /v1/cluster/command/jobs`.
    that machine's keep with the deploy's handle.
 5. keep runs the trial: proven on `INFO serving` within ten minutes, the window
    restarting at each sync line, or rolled back.
+
+**A deploy outlives its build job.** The agent runs inside motherd, so a
+`motherd` trial restarts the agent that built it, and the build job — its log
+with it — goes with the old process. The deploy is then found on keep's board
+alone, by the handle keep recorded on the trial, under whichever service it
+tried (`service::resolve`, `service::trial_in`): its stage is the trial's, and
+its output is the marker and the trial's log. Only a handle neither the agent
+nor keep's board knows is refused, and the refusal says that nothing of it was
+tried.
 
 `job_cancel` on a deploy cancels the build while it runs, or asks keep to stop
 the trial, which rolls it back and records the end as cancelled.

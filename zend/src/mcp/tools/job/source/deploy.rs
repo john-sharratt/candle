@@ -32,6 +32,20 @@ fn tried(d: &Deploy) -> bool {
     matches!(d.stage, Stage::Trying(_) | Stage::Tried(_))
 }
 
+/// `ask` of the build's log: empty once the agent no longer holds the job
+/// ([`Deploy::build`]), so the deploy's output is then the marker and the
+/// trial's log.
+async fn build_log(call: &OpsCall, d: &Deploy, ask: &LogAsk) -> Result<LogRead, String> {
+    if d.build.is_none() {
+        return Ok(LogRead::default());
+    }
+    build::read(call, &d.handle, ask).await
+}
+
+/// What a deploy whose build job is gone says of its build.
+const BUILD_GONE: &str = "\nIts build's log is gone: the agent that built it restarted with the \
+     trial, and a job lives in its agent's process. The trial's log follows the marker on page 1.";
+
 /// `ask` of the trial's log.
 async fn trial(call: &OpsCall, d: &Deploy, ask: &LogAsk) -> Result<LogRead, String> {
     let body = json!({"service": d.service, "ask": ask});
@@ -43,12 +57,15 @@ async fn trial(call: &OpsCall, d: &Deploy, ask: &LogAsk) -> Result<LogRead, Stri
 fn line(job: &JobHandle, d: &Deploy, now: u64) -> String {
     let head = format!("{job}: {} to {}", d.service, d.host);
     match &d.stage {
-        Stage::Building => format!(
-            "{head} — building: {}, for {}, {} lines",
-            phase(&d.build.phase, d.handle.node),
-            span(now.saturating_sub(d.build.started_ms)),
-            d.build.lines
-        ),
+        Stage::Building => match &d.build {
+            Some(b) => format!(
+                "{head} — building: {}, for {}, {} lines",
+                phase(&b.phase, d.handle.node),
+                span(now.saturating_sub(b.started_ms)),
+                b.lines
+            ),
+            None => format!("{head} — building"),
+        },
         Stage::BuildFailed(why) => format!("{head} — the build failed ({why}); nothing was tried"),
         Stage::Built { stale: false, .. } => {
             format!("{head} — built; keep's trial is being asked for")
@@ -86,10 +103,13 @@ fn line(job: &JobHandle, d: &Deploy, now: u64) -> String {
 pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Standing, String> {
     let agents = agents(call)?;
     let d = resolve(call, &agents, h, now_ms()).await?;
-    let built = build::read(call, h, &LogAsk::Summary).await?;
+    let built = build_log(call, &d, &LogAsk::Summary).await?;
     let mut total = built.total;
     let mut size = built.size;
     let mut detail = String::new();
+    if d.build.is_none() {
+        detail.push_str(BUILD_GONE);
+    }
     match &d.stage {
         Stage::BuildFailed(_) => {
             if let Some(s) = &built.summary {
@@ -105,7 +125,7 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .replace('\n', " / ");
-            detail = format!("\nkeep: {why}");
+            detail.push_str(&format!("\nkeep: {why}"));
             if let Some(s) = &trial_read.summary {
                 detail.push_str(&summary_text(job, s));
             }
@@ -124,7 +144,7 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
             total = trial_read.total;
             size += trial_read.size;
             if let Some(l) = trial_read.lines.last() {
-                detail = format!("\nthe trial's last line {}: {}", l.n, l.text);
+                detail.push_str(&format!("\nthe trial's last line {}: {}", l.n, l.text));
             }
         }
         Stage::Building | Stage::Built { .. } => {
@@ -145,15 +165,9 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
 
 /// Lines `from..from+count` of the whole: the build's part, the marker, then
 /// the trial's part.
-async fn range(
-    call: &OpsCall,
-    d: &Deploy,
-    h: &Handle,
-    from: u64,
-    count: u32,
-) -> Result<LogRead, String> {
+async fn range(call: &OpsCall, d: &Deploy, from: u64, count: u32) -> Result<LogRead, String> {
     let to = from + u64::from(count);
-    let built = build::read(call, h, &LogAsk::Lines { from, count }).await?;
+    let built = build_log(call, d, &LogAsk::Lines { from, count }).await?;
     let b = built.total;
     let mut lines = built.lines;
     let mut total = b;
@@ -196,16 +210,14 @@ pub async fn read(call: &OpsCall, h: &Handle, ask: &LogAsk) -> Result<LogRead, S
     let agents = agents(call)?;
     let d = resolve(call, &agents, h, now_ms()).await?;
     match ask {
-        LogAsk::Lines { from, count } => range(call, &d, h, *from, *count).await,
+        LogAsk::Lines { from, count } => range(call, &d, *from, *count).await,
         LogAsk::Summary | LogAsk::Tail { .. } if tried(&d) => {
-            let b = build::read(call, h, &LogAsk::Tail { lines: 1 })
-                .await?
-                .total;
+            let b = build_log(call, &d, &LogAsk::Tail { lines: 1 }).await?.total;
             Ok(shifted(trial(call, &d, ask).await?, b + 1))
         }
-        LogAsk::Summary | LogAsk::Tail { .. } => build::read(call, h, ask).await,
+        LogAsk::Summary | LogAsk::Tail { .. } => build_log(call, &d, ask).await,
         LogAsk::Grep { .. } => {
-            let built = build::read(call, h, ask).await?;
+            let built = build_log(call, &d, ask).await?;
             if !tried(&d) {
                 return Ok(built);
             }

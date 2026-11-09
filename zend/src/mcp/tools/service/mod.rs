@@ -14,6 +14,7 @@
 //! the trial — never from the memory of the member that started it, so any
 //! member answers for any deploy ([`resolve`]).
 
+use std::fmt::Display;
 use std::time::Duration;
 
 use agent::client::Agents;
@@ -175,26 +176,44 @@ pub struct Deploy {
     pub handle: Handle,
     pub host: String,
     pub service: &'static str,
-    pub build: JobView,
+    /// Its build job, or `None` once the agent that ran it no longer holds it.
+    /// A motherd deploy always comes to that: the agent runs inside motherd,
+    /// so the trial that starts the new motherd restarts the agent, and the
+    /// job — its log with it — goes with the old process. The trial is still
+    /// keep's, on keep's board, under the deploy's handle.
+    pub build: Option<JobView>,
     pub stage: Stage,
+}
+
+/// The trial on `trials` — one service's board — that deploy `handle` asked
+/// for: `Trying` while keep runs it, `Tried` once it ended.
+fn trial_on(handle: &Handle, trials: Option<&Value>) -> Option<Stage> {
+    let name = handle.to_string();
+    let named = |key: &str| {
+        trials
+            .and_then(|t| t.get(key))
+            .filter(|t| t.get("deploy").and_then(Value::as_str) == Some(name.as_str()))
+            .cloned()
+    };
+    named("running")
+        .map(Stage::Trying)
+        .or_else(|| named("last").map(Stage::Tried))
+}
+
+/// The service and trial of deploy `handle` on keep's whole `state`, found by
+/// the handle keep recorded on it: how a deploy whose build job is gone is
+/// still answered for.
+pub fn trial_in(handle: &Handle, state: &Value) -> Option<(&'static str, Stage)> {
+    SERVICES
+        .iter()
+        .find_map(|s| trial_on(handle, trials_of(state, s)).map(|t| (*s, t)))
 }
 
 /// Where the deploy whose build is `view` stands, given keep's board for its
 /// service on its machine (`trials`), at `now`.
 pub fn stage_of(handle: &Handle, view: &JobView, trials: Option<&Value>, now: u64) -> Stage {
-    let name = handle.to_string();
-    let named = |t: &Value| t.get("deploy").and_then(Value::as_str) == Some(name.as_str());
-    let on_board = |key: &str| {
-        trials
-            .and_then(|t| t.get(key))
-            .filter(|t| !t.is_null() && named(t))
-            .cloned()
-    };
-    if let Some(trial) = on_board("running") {
-        return Stage::Trying(trial);
-    }
-    if let Some(trial) = on_board("last") {
-        return Stage::Tried(trial);
+    if let Some(trial) = trial_on(handle, trials) {
+        return trial;
     }
     if !view.status.is_finished() {
         return Stage::Building;
@@ -217,18 +236,42 @@ pub fn stage_of(handle: &Handle, view: &JobView, trials: Option<&Value>, now: u6
     }
 }
 
+/// What a deploy found neither on its agent nor on keep's board answers.
+pub fn untraced(handle: &Handle, host: &str, e: &impl Display) -> String {
+    format!(
+        "deploy:{handle}: its build job is not on the agent on {host} ({e}), and keep on {host} \
+         names no trial of it, so nothing of it was tried: the agent restarted before the trial \
+         was asked for. `service_status` says what {host} runs; deploy again"
+    )
+}
+
 /// Deploy `handle` as it stands now: its build from the agent, its trial from
-/// keep's board.
+/// keep's board. A build job the agent no longer holds is answered from the
+/// board alone ([`Deploy::build`]).
 pub async fn resolve(
     call: &OpsCall,
     agents: &Agents,
     handle: &Handle,
     now: u64,
 ) -> Result<Deploy, String> {
-    let build = agents
-        .view(handle.at(agents), &handle.id)
-        .await
-        .map_err(|e| lost(handle, &e))?;
+    let build = match agents.view(handle.at(agents), &handle.id).await {
+        Ok(b) => b,
+        Err(e) => {
+            let host = host_of(agents, handle.node).await;
+            let state = keep(call, Method::GET, KEEP_STATE, &host, None)
+                .await
+                .map_err(|k| format!("{}; and {k}", lost(handle, &e)))?;
+            let (service, stage) =
+                trial_in(handle, &state).ok_or_else(|| untraced(handle, &host, &e))?;
+            return Ok(Deploy {
+                handle: handle.clone(),
+                host,
+                service,
+                build: None,
+                stage,
+            });
+        }
+    };
     let service = built_service(&build.command).ok_or_else(|| {
         format!(
             "deploy:{handle} is not a deploy: it runs `{}`, not `cargo build --release -p \
@@ -249,7 +292,7 @@ pub async fn resolve(
         handle: handle.clone(),
         host,
         service,
-        build,
+        build: Some(build),
         stage,
     })
 }
@@ -332,6 +375,39 @@ mod tests {
             .contains("not a service keep runs"));
     }
 
+    /// **A deploy whose build job is gone is found on keep's board by its
+    /// handle**, under whichever service it tried — a motherd deploy's agent
+    /// restarts with the trial, taking the job with it. A trial of another
+    /// deploy, or none, is not found.
+    #[test]
+    fn a_deploy_with_no_build_job_is_found_on_the_board() {
+        let h = Handle::new(0x31f6, "0lt");
+        let state = json!({"keep": {"count": 1, "hash": "a"}, "services": [
+            {"name": "web", "trials": {"running": null,
+                "last": {"proven": true, "deploy": "0000000000031f6:Other"}}},
+            {"name": "motherd", "trials": {"last": null,
+                "running": {"artifact": "C:/keep/stage/motherd.exe", "deploy": h.to_string(),
+                    "started_ms": 7}}},
+        ]});
+        assert_eq!(
+            trial_in(&h, &state),
+            Some((
+                "motherd",
+                Stage::Trying(json!({"artifact": "C:/keep/stage/motherd.exe",
+                    "deploy": "00000000000031f6:0lt", "started_ms": 7}))
+            ))
+        );
+        assert_eq!(trial_in(&Handle::new(0x31f6, "Gone"), &state), None);
+        assert_eq!(trial_in(&h, &json!({"services": []})), None);
+        assert_eq!(
+            untraced(&h, "WhiteWorld", &"404"),
+            "deploy:00000000000031f6:0lt: its build job is not on the agent on WhiteWorld (404), \
+             and keep on WhiteWorld names no trial of it, so nothing of it was tried: the agent \
+             restarted before the trial was asked for. `service_status` says what WhiteWorld \
+             runs; deploy again"
+        );
+    }
+
     /// **A deploy's stage is read from its build and keep's board**: building,
     /// failed, built and waiting for its trial — gone stale past the grace —
     /// trying, tried. A trial of another deploy is not this one's.
@@ -371,6 +447,13 @@ mod tests {
         let tried = json!({"running": null, "last": {"proven": true, "deploy": h.to_string()}});
         let stage = stage_of(&h, &built, Some(&tried), 0);
         assert!(matches!(stage, Stage::Tried(_)) && stage.is_over());
+        assert_eq!(
+            trial_in(&h, &json!({"services": [{"name": "web", "trials": tried}]})),
+            Some((
+                "web",
+                Stage::Tried(json!({"proven": true, "deploy": h.to_string()}))
+            ))
+        );
         assert_eq!(
             trial_body("web", "D:/s/web.exe", &h),
             json!({"service": "web", "artifact": "D:/s/web.exe", "deploy": "00000000000000ab:Xe"})
