@@ -141,7 +141,8 @@ What does **not** exist, and this design builds:
 A conversation is keyed by `(npc, party)`:
 
 - `Party::Person(account)` — the npcd account a Discord user is linked to
-  (`npcd/src/discord/link/index.rs:1-50`), or a console user, by public handle;
+  (`npcd/src/discord/link/index.rs:1-50`), a console user, or a Battle Cities
+  player (§12), by public handle;
 - `Party::Npc(npc_id)`.
 
 Its conversation id is `npc-{npc}-talk-{party}-g{n}`, where `n` is the
@@ -1043,9 +1044,18 @@ before (`tools.rs:255-261`).
   without one can talk to nobody unless a person is present. That is the
   existing rule, and it is intended.
 
-**What "a person" is.** A person in a world is a `visitor:{handle}` body,
-placed by a physical interaction (`interaction.rs:105-112, 280-287`; already
-how npcd tells a person's body from a character's, `order_table.rs:56`).
+**What "a person" is.** In every world a person is a `visitor:{handle}` body,
+where `handle` is the person's **account handle** (`interaction.rs:105-112`;
+already how npcd tells a person's body from a character's, `order_table.rs:56`).
+- **One rule, both uses.** The handle is the same identity that authorizers,
+  owners and thread members use (D14). `Within.people` lists these bodies, and a
+  conversation with one is `Party::Person(account)`, with the account read
+  straight off the prefix. So no world needs an `is_player` mark, and no second lookup
+  turns a body into an account.
+- **How a body is placed.** Three existing world ops:
+  - `WorldOp::EnterBeside` places it (`npcd/src/authority/ops.rs:55-59`);
+  - `WorldOp::Place` moves it (`ops.rs:63`);
+  - `WorldOp::Leave` removes it (`ops.rs:61`).
 - **In the moon** visitors come only from console physical sessions
   (`npcd/src/engine/mod.rs:1032-1046`), so moon NPCs speak aloud only to someone
   standing in a console session. That is intended.
@@ -1059,8 +1069,9 @@ how npcd tells a person's body from a character's, `order_table.rs:56`).
     (`model/account.rs`).
   - **Respawn keeps the id.** A dead avatar comes back with the same id at its
     tower (`model/avatar/respawn.rs`).
-  - **So the rule is:** an avatar that is some tower's `main` is a person,
-    identified by the owning `AccountId`.
+  - **So the rule is:** an avatar that is some tower's `main` is a person.
+    In npcd's world it is the body `visitor:{handle}`, where `handle` is the
+    owning account's handle.
   - **Not people:**
     - companions (`tower.companions`), which are AI-driven bodies with their own
       minds;
@@ -1068,6 +1079,21 @@ how npcd tells a person's body from a character's, `order_table.rs:56`).
     - spectators, who enter with no body at all.
   - **Field play.** A spectator therefore never unlocks room speech, and a
     player's avatar in a fight is also in field play.
+  - **The bridge is the game's side of the contract.** npcd's `battle-cities`
+    world is its own seeded tower (`npcd/src/sim/seed.rs:254-288`), and today
+    nothing carries a game avatar into it. The Battle Cities server owns the
+    bridge:
+    - When an avatar that is a tower's `main` enters an npcd character's
+      surroundings, the server places it with `EnterBeside` as
+      `visitor:{handle}`, named for the avatar.
+    - It sends `Place` as the avatar moves, and `Leave` when the avatar dies
+      or the player disconnects. The respawn keeps the id, so the same
+      visitor re-enters.
+    - Companions, zenlings, critters and spectators are never sent.
+
+    npcd needs nothing beyond the three ops, which take the handle as given.
+    Until the bridge sends a body, a Battle Cities NPC simply has no person in
+    the room, and messaging works as it does everywhere else.
 - **NPC↔NPC room speech in front of a person** stays on the main loop (D2).
 
 **What "field play" is.** There are no squads in the field sim today
@@ -1235,16 +1261,10 @@ Live check, after the tests, in the moon (two NPCs and one Discord DM with Zen):
 
 ## 14. Open questions
 
-1. **How the Battle Cities "is a player" fact reaches npcd.** A player is the
-   avatar that is a tower's `main`, owned by an account (§12). What has not
-   been traced is how that reaches `Runtime::within` across the sim → npcd
-   boundary. The answer decides how `Within.people` and the conversation's
-   `Party::Person(account)` are filled for Battle Cities:
-   - an `is_player` mark on the body;
-   - or the account handle carried with the avatar.
-
-   Battle Cities companions are AI-driven avatars with a mind. If those minds
-   are npcd's, they are NPC parties like any other.
+None. The last one, how a Battle Cities player is known to npcd, is settled
+in §12: the player's body is `visitor:{account handle}`, and the game server
+places it through the existing visitor ops. A Battle Cities companion whose
+mind is npcd's is an NPC party like any other.
 
 ---
 
