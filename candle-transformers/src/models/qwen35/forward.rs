@@ -31,6 +31,8 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "cuda")]
+use candle::quantized::cuda::MOE_PREDICT_VOTES_MAX_TOKENS;
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
@@ -646,6 +648,22 @@ impl ManagedBatchedModel for HybridBatched {
         #[cfg(feature = "cuda")]
         {
             self.model().experts.as_ref().map(|c| c.expert_stats())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    /// With an expert cache, its dispatch's look-ahead counts each expert's
+    /// votes in 16 bits (`moe_predict_votes`), over every row of the forward.
+    fn forward_row_ceiling(&self) -> Option<usize> {
+        #[cfg(feature = "cuda")]
+        {
+            self.model()
+                .experts
+                .as_ref()
+                .map(|_| MOE_PREDICT_VOTES_MAX_TOKENS)
         }
         #[cfg(not(feature = "cuda"))]
         {

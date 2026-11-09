@@ -13,6 +13,8 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::driver_alloc::report_load_survivors;
+
 /// Devices a window can be opened on: one counter each.
 const MAX_DEVICES: usize = 64;
 
@@ -42,7 +44,12 @@ impl LoadWindow {
 
 impl Drop for LoadWindow {
     fn drop(&mut self) {
-        OPEN[self.ordinal].fetch_sub(1, Ordering::AcqRel);
+        // The last window on the device closing is the load ending: with the
+        // `driver-alloc-panic` census on, what it left standing outside the span
+        // is reported now, while the sites are still the load's.
+        if OPEN[self.ordinal].fetch_sub(1, Ordering::AcqRel) == 1 {
+            report_load_survivors(self.ordinal);
+        }
     }
 }
 

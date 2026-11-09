@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use candle::quantized::cuda::{to_dynamic, DynamicActs};
+use candle::quantized::cuda::{to_dynamic, DynamicActs, MOE_PREDICT_VOTES_MAX_TOKENS};
 use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
@@ -2595,6 +2595,12 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     /// The same ground the width cap sizes against — [`Self::placeable_tier_bytes`].
     fn prefill_ground_bytes(&self) -> Option<usize> {
         self.placeable_tier_bytes()
+    }
+
+    /// The expert dispatch's look-ahead counts each expert's votes in 16 bits
+    /// (`moe_predict_votes`), over every row of the forward.
+    fn forward_row_ceiling(&self) -> Option<usize> {
+        Some(MOE_PREDICT_VOTES_MAX_TOKENS)
     }
 
     /// K and V per KV head on the layers that page KV: the attention layers and

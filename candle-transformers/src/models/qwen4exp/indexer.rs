@@ -66,6 +66,7 @@ use crate::models::operand_guard::{expect_dense, expect_dense_dtype};
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::selection_strata::Recent;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
+use candle::cuda_backend::matmul_f32_into;
 use candle::wave_provenance::WaveTicket;
 use candle_kernels::simple::f32_rows_matmul::F32_ROWS_MATMUL_MAX_ROWS;
 #[cfg(feature = "cuda")]
@@ -148,9 +149,9 @@ pub struct ScoreRows {
 /// that does not yet ([`fresh_score_bound`]), so a wave priced before its
 /// sequence has run is priced by the same arithmetic as the wave itself. Mirrors
 /// the two routes: the paged scorer's page, offset and count tables, and — when
-/// the live tail goes to cuBLAS — the rotated tail, its page table and every
-/// tile's scoring product (a bump never rewinds within a phase, so the tiles add
-/// up). `page_chunks` is asked only when the paged scorer runs.
+/// the live tail goes to cuBLAS — the rotated tail, its page table and the one
+/// tile's scoring product every tile is written into. `page_chunks` is asked only
+/// when the paged scorer runs.
 pub fn score_bound_for(
     page_cols: usize,
     page_chunks: impl FnOnce() -> Result<usize>,
@@ -180,12 +181,9 @@ pub fn score_bound_for(
     }
     if !tail_in_paged && live_cols > 0 {
         bytes += a(live_cols.div_ceil(PAGE_BLOCKS) * 8) + a(live_cols * d * 4);
+        // One tile's product, which every tile is written into.
         let per_tile = (SCORE_TILE_BYTES / (heads * live_cols * 4)).clamp(1, t);
-        let (full, rem) = (t / per_tile, t % per_tile);
-        bytes += full * a(per_tile * heads * live_cols * 4);
-        if rem > 0 {
-            bytes += a(rem * heads * live_cols * 4);
-        }
+        bytes += a(per_tile * heads * live_cols * 4);
     }
     Ok(bytes)
 }
@@ -451,8 +449,7 @@ impl IndexCache {
     ///
     /// Mirrors the two routes: the paged scorer's page, offset and count
     /// tables, and — when the live tail goes to cuBLAS — the rotated tail, its
-    /// page table and every tile's scoring product (a bump never rewinds within
-    /// a phase, so the tiles add up).
+    /// page table and the one tile's scoring product every tile is written into.
     pub fn score_bound(
         &self,
         t: usize,
@@ -1312,6 +1309,20 @@ impl IndexCache {
         } else {
             None
         };
+        // **One tile's product, reused by every tile.** A fresh product per tile
+        // is a fresh carve, and the bump does not give a carve back inside its
+        // phase, so the tiles added up to the whole `[t·h, cand]` product the
+        // tiling exists to bound: at 200K of history a 2.8K-row prefill chunk
+        // carved ~2.2 GB of scores (BlackWorld, 2026-11-09), placed per layer
+        // window and bought from the expert zone each time. Written into one
+        // buffer instead (`matmul_f32_into`), a tile's fold has read it before
+        // the next tile's product lands — one stream, in order.
+        let tile = wave_empty_ticketed(
+            (rows_per_tile * h, live_cols),
+            DType::F32,
+            q.device(),
+            q.wave_ticket(),
+        )?;
         let mut row = 0usize;
         while row < t {
             let rows = rows_per_tile.min(t - row);
@@ -1329,7 +1340,8 @@ impl IndexCache {
             //
             // No per-head weight: this fold is a plain `Σ_h relu(·)`, which the
             // kernel spells as a null `w`.
-            let raw = q.narrow(0, row * h, rows * h)?.matmul(&keys_t)?;
+            let raw = tile.narrow(0, 0, rows * h)?;
+            matmul_f32_into(&q.narrow(0, row * h, rows * h)?, &keys_t, &raw)?;
             fold_heads_into(
                 &raw,
                 rows,
@@ -2871,13 +2883,13 @@ mod tests {
         }
     }
 
-    /// **A fresh 128K turn's deepest chunk prices its cuBLAS scoring tile by
+    /// **A fresh 128K turn's deepest chunk prices its cuBLAS scoring as one
     /// tile.** 8,192 rows over 32,000 live blocks is past the GEMM crossover:
-    /// the tail's page table (1,000 B → 1,024), the rotated tail (16,384,000 B),
-    /// thirty-one 262-row tiles of 134,144,000 B and a 70-row remainder of
-    /// 35,840,000 B — 4.2 GB, the term admission must not price at zero.
+    /// the tail's page table (1,000 B → 1,024), the rotated tail (16,384,000 B)
+    /// and one 262-row tile of 134,144,000 B that all thirty-two tiles are
+    /// written into — 150.5 MB, where a product per tile summed to 4.2 GB.
     #[test]
-    fn a_fresh_deep_chunk_prices_every_score_tile() {
+    fn a_fresh_deep_chunk_prices_one_score_tile() {
         let rows = ScoreRows {
             t: 8_192,
             cand_max: 32_000,
@@ -2886,7 +2898,7 @@ mod tests {
         };
         assert_eq!(
             fresh_score_bound(32_000 + 8_192 / 4 + 1, rows, 256),
-            4_210_689_024
+            150_529_024
         );
     }
 

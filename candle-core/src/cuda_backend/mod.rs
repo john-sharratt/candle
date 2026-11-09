@@ -180,6 +180,8 @@ mod info_ring;
 mod kernel_scratch;
 pub mod link_probe;
 mod load_window;
+mod local_memory;
+mod matmul_into;
 mod module_loading;
 pub mod staged;
 mod stream_alloc;
@@ -195,6 +197,8 @@ pub use kernel_scratch::{
     close_scratch_scope, install_scope_carve, open_scratch_scope, scratch_reserve, ScopeCarve,
 };
 pub use load_window::LoadWindow;
+pub use local_memory::local_memory_bytes;
+pub use matmul_into::matmul_f32_into;
 pub use stream_alloc::{stream_alloc, stream_alloc_zeros, stream_memcpy_stod};
 pub use stream_lease::StreamLease;
 pub use thread_blas::BlasHandle;

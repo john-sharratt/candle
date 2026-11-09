@@ -571,6 +571,9 @@ impl<T> Drop for CudaSlice<T> {
         if self.cu_device_ptr == 0 {
             return;
         }
+        if let Some(watch) = alloc_watch() {
+            watch.freed(self.cu_device_ptr);
+        }
         if ctx.has_async_alloc {
             ctx.record_err(unsafe {
                 result::free_async(self.cu_device_ptr, self.stream.cu_stream)
@@ -1247,14 +1250,19 @@ impl CudaStream {
         if bytes == 0 {
             return Ok(0);
         }
-        if let Some(watch) = alloc_watch() {
+        let watch = alloc_watch();
+        if let Some(watch) = watch {
             watch.alloc(self, bytes);
         }
-        if self.ctx.has_async_alloc {
+        let ptr = if self.ctx.has_async_alloc {
             result::malloc_async(self.cu_stream, bytes)
         } else {
             result::malloc_sync(bytes)
+        }?;
+        if let Some(watch) = watch {
+            watch.allocated(self, ptr, bytes);
         }
+        Ok(ptr)
     }
 
     /// Allocates an empty [CudaSlice] with 0 length.

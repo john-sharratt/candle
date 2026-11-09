@@ -159,7 +159,15 @@ impl Qwen4ExpGpu {
         // guard holds the load window open until this loader returns.
         let _load = dense_span::open_for_load_sized(device, load_headroom_bytes(content))?;
 
+        // A weight the model keeps as loaded, for its whole life: placed in the
+        // dense block rather than left on the driver's ground
+        // (`place_tensor_in_dense`).
         let f32t = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
+            dense_span::place_tensor_in_dense(device, g.qtensor(name, device)?.dequantize(device)?)
+        };
+        // A weight the load rebuilds into another form — the transient a
+        // repack reads, freed with the load.
+        let f32_source = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             g.qtensor(name, device)?.dequantize(device)
         };
         let qm = |g: &mut GgufModel, name: &str| -> Result<QMatMul> {
@@ -338,30 +346,36 @@ impl Qwen4ExpGpu {
                     // path reads: the indexer's arithmetic is small and its
                     // rounding decides ranks at the cut (hot-path invariant 1
                     // — the conversion the design calls for, done once).
+                    // On the driver's ground, not the dense block: placed there
+                    // (`place_tensor_in_dense`), the selection read them wrong
+                    // and a 4K prefill's logits came back non-finite
+                    // (`strata_bench_single_session`, 2026-11-10), with the
+                    // SSM weights beside them placed and reading right.
                     indexer: IndexerWeights {
-                        q_proj: f32t(g, &format!("{p}.indexer.q_proj.weight"))?,
-                        k_proj: f32t(g, &format!("{p}.indexer.k_proj.weight"))?,
-                        q_norm: f32t(g, &format!("{p}.indexer.q_norm.weight"))?,
-                        k_norm: f32t(g, &format!("{p}.indexer.k_norm.weight"))?,
+                        q_proj: f32_source(g, &format!("{p}.indexer.q_proj.weight"))?,
+                        k_proj: f32_source(g, &format!("{p}.indexer.k_proj.weight"))?,
+                        q_norm: f32_source(g, &format!("{p}.indexer.q_norm.weight"))?,
+                        k_norm: f32_source(g, &format!("{p}.indexer.k_norm.weight"))?,
                     },
                     compress_ratio: ratio,
                 },
             };
 
             if li == cfg.ple.layer {
+                // Rebuilt into the fused form below (`PleFusedWeights`).
                 ple_w = Some(PleWeights {
-                    key: f32t(g, &format!("{p}.ple_key.weight"))?,
-                    value: f32t(g, &format!("{p}.ple_value.weight"))?,
-                    norm_key: f32t(g, &format!("{p}.ple_norm_key.weight"))?,
-                    norm_query: f32t(g, &format!("{p}.ple_norm_query.weight"))?,
-                    norm_conv: f32t(g, &format!("{p}.ple_norm_conv.weight"))?,
-                    conv: f32t(g, &format!("{p}.ple_conv1d.weight"))?,
+                    key: f32_source(g, &format!("{p}.ple_key.weight"))?,
+                    value: f32_source(g, &format!("{p}.ple_value.weight"))?,
+                    norm_key: f32_source(g, &format!("{p}.ple_norm_key.weight"))?,
+                    norm_query: f32_source(g, &format!("{p}.ple_norm_query.weight"))?,
+                    norm_conv: f32_source(g, &format!("{p}.ple_norm_conv.weight"))?,
+                    conv: f32_source(g, &format!("{p}.ple_conv1d.weight"))?,
                 });
             }
 
             // The shared-expert gate is one row; stored padded to a KO tile and
             // read back at output 0, exactly as the qwen35 loader stores it.
-            let gate_row = f32t(g, &format!("{p}.ffn_gate_inp_shexp.weight"))?
+            let gate_row = f32_source(g, &format!("{p}.ffn_gate_inp_shexp.weight"))?
                 .reshape((1, cfg.hidden_size))?;
             let pad = Tensor::zeros(
                 (SHARED_GATE_TILE - 1, cfg.hidden_size),

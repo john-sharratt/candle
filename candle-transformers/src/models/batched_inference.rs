@@ -4543,6 +4543,14 @@ pub trait ManagedBatchedModel {
         )
     }
 
+    /// The most rows one forward can carry whatever the ground — a kernel's own
+    /// limit, not a price — or `None` where nothing bounds it. A caller that
+    /// sizes a forward against the ground alone (a sliced prefill) stops here
+    /// too.
+    fn forward_row_ceiling(&self) -> Option<usize> {
+        None
+    }
+
     /// KV bytes one prefill row writes: one K and one V element per KV head on
     /// every layer that pages KV — every layer, unless a model says otherwise.
     /// `None` when the geometry prices a row at nothing.

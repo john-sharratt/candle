@@ -1871,9 +1871,15 @@ impl TestParams {
                     };
                     // Starting from every remaining row, narrowed until the
                     // pass as composed (this many sequences at these depths)
-                    // fits — the widest pass the placement will take.
+                    // fits — the widest pass the placement will take — and
+                    // carries no more rows than one forward can
+                    // (`forward_row_ceiling`), whatever the ground.
+                    let ceiling = model.forward_row_ceiling().unwrap_or(usize::MAX);
                     let mut step = active.iter().map(|&i| lens[i] - done[i]).max().unwrap_or(1);
-                    while step > 1 && !prefill_pass_fits(model, &session, &idx, &takes_at(step)) {
+                    while step > 1
+                        && (takes_at(step).iter().sum::<usize>() > ceiling
+                            || !prefill_pass_fits(model, &session, &idx, &takes_at(step)))
+                    {
                         step = (step * 3 / 4).max(1);
                     }
                     let takes = takes_at(step);

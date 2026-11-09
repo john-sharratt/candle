@@ -37,7 +37,7 @@
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::LoadWindow;
 use candle::quantized::{gguf_file, QTensor};
-use candle::{Device, Result};
+use candle::{Device, Result, Tensor};
 
 /// A model load in progress: open from [`open_for_load`] until the loader that
 /// holds it returns.
@@ -175,6 +175,72 @@ pub fn place_in_dense(device: &Device, weight: QTensor) -> Result<QTensor> {
     {
         let _ = device;
         Ok(weight)
+    }
+}
+
+/// Move a plain tensor a model keeps for its whole life — a norm's gain, a
+/// gate, a scale — into the dense block.
+///
+/// The loader builds it where any tensor is built, the driver's ground, and
+/// there it stayed: on Flash-Next 298 such tensors, 91 MiB, held outside the
+/// reservation for the life of the process (the `driver-alloc-panic` census of a
+/// load's survivors). Copied into a dense claim, the driver's copy is a load
+/// transient and goes when the caller drops it. When the block declines — no
+/// reservation, a second model in the process — the tensor stays where it was.
+pub fn place_tensor_in_dense(device: &Device, t: Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        use candle::cuda_backend::cudarc::driver::result::memcpy_dtod_async;
+        use candle::cuda_backend::wave_provenance::LeaseOrigin;
+        use candle::cuda_backend::WrapErr;
+
+        let Device::Cuda(cuda) = device else {
+            return Ok(t);
+        };
+        let t = t.contiguous()?;
+        let bytes = t.elem_count() * t.dtype().size_in_bytes();
+        if bytes == 0 {
+            return Ok(t);
+        }
+        let stream = cuda.cuda_stream();
+        let at = match candle_nn::kv_cache::claim_dense(&stream, bytes) {
+            Ok(at) => at,
+            Err(e) => {
+                tracing::debug!(
+                    target: "candle_transformers::dense_span",
+                    bytes,
+                    "dense block declined a tensor ({e}); it stays on the driver's ground"
+                );
+                return Ok(t);
+            }
+        };
+        let src = {
+            let (storage, layout) = t.storage_and_layout();
+            let candle::Storage::Cuda(c) = &*storage else {
+                candle::bail!("dense placement: a CUDA tensor without CUDA storage");
+            };
+            c.slice.device_ptr(&stream) + (layout.start_offset() * t.dtype().size_in_bytes()) as u64
+        };
+        // SAFETY: `at` names `bytes` of the dense block, claimed for this tensor
+        // alone; `src` is the tensor's own contiguous payload, which `t` keeps
+        // alive until the copy below has been queued ahead of its free.
+        unsafe { memcpy_dtod_async(at, src, bytes, stream.cu_stream()) }.w()?;
+        // SAFETY: the dense block is never released, so the view outlives every
+        // user of it; nothing frees a `Foreign` lease.
+        unsafe {
+            Tensor::from_leased_cuda_ptr(
+                at,
+                t.dtype(),
+                t.dims().to_vec(),
+                device,
+                LeaseOrigin::Foreign,
+            )
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = device;
+        Ok(t)
     }
 }
 

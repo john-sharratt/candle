@@ -23,7 +23,7 @@ use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::tenant_rank::TenantRank;
 use crate::tree::ConversationTreeConfig;
 use crate::ManagedBatchedModel;
-use candle::cuda_backend::link_probe;
+use candle::cuda_backend::{link_probe, LoadWindow};
 use candle::quantized::Int8Mode;
 use candle::{DType, Device};
 use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
@@ -88,6 +88,35 @@ fn stated_inv_freq(inv: Option<Vec<f32>>) -> crate::Result<Vec<f32>> {
     inv.ok_or_else(|| {
         ConversationError::Model(candle::Error::Msg("model missing rope inv_freq".into()))
     })
+}
+
+/// `device`'s pinned host→device copy rate in bytes a second, or 0 where there
+/// is no link to measure (a CPU device, a probe that failed).
+///
+/// Measured the first time it is asked for and cached (`link_probe`), so the
+/// first ask decides when it is read. **That ask is before the model loads** —
+/// `load_model`'s first step, and `build`'s engine config ahead of its load —
+/// with the card empty and the bus idle: later the reading is contended by the
+/// expert cache's staging, and its landing window competes with a full
+/// reservation for ground it would then take from the driver.
+fn link_rate(device: &Device) -> f64 {
+    let Device::Cuda(d) = device else {
+        return 0.0;
+    };
+    // The probe is the load's first step, and its window is the load's ground
+    // (`docs/driver_model.md` §4): a driver allocation freed before the span is
+    // claimed. Once the figure is cached this measures nothing.
+    let _load = LoadWindow::open(d.cuda_stream().context().ordinal());
+    match link_probe::host_to_device_bytes_per_s(d) {
+        Ok(bps) => {
+            tracing::info!(link_gbps = bps / 1e9, "host→device link measured");
+            bps
+        }
+        Err(e) => {
+            tracing::warn!("host→device link probe failed: {e}");
+            0.0
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -929,24 +958,10 @@ impl ModelBuilder {
         // `ruler_stream` — gets the same pass as one from `build`: by the card's
         // VRAM and its host→device link (`prefill_width`).
         //
-        // The link is measured here, the first thing to ask for it — before the
-        // load, with the card empty and the bus idle — and cached for the wave
-        // planner (`link_probe`). Later, the reading would be contended by the
-        // expert cache's staging and its landing buffer would compete with a
-        // full reservation.
-        let link = match device {
-            Device::Cuda(d) => match link_probe::host_to_device_bytes_per_s(d) {
-                Ok(bps) => {
-                    tracing::info!(link_gbps = bps / 1e9, "host→device link measured");
-                    bps
-                }
-                Err(e) => {
-                    tracing::warn!("host→device link probe failed: {e}");
-                    0.0
-                }
-            },
-            _ => 0.0,
-        };
+        // The link is measured before the model loads (`link_rate`, which
+        // `load_model` asks first and `build` asks before it loads), and this
+        // reads the cached figure.
+        let link = link_rate(device);
         // **The card's width is a ceiling, and an ask is clamped to it.** Tenants
         // ask for what their workload wants — npcd the model's ceiling, so a slab
         // carries several documents — and the merge takes the largest ask
@@ -1149,6 +1164,10 @@ impl ModelBuilder {
         progress: Option<LoadProgress<'_>>,
     ) -> crate::Result<LoadedModel> {
         self.refuse_unsupported_settings()?;
+        // Before anything is loaded: the link is read with the card empty and
+        // the bus idle, and its landing window is the driver's, not the span's
+        // — which does not exist yet. Every later ask reads the cached figure.
+        link_rate(device);
         let int8_mode = ModelPack::open(&weights.pack)
             .map_err(ConversationError::Model)?
             .int8_mode;

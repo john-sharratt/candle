@@ -10,7 +10,7 @@
 //! counts: the two round in different units, and a boundary that moved eighty
 //! times accumulates exactly the sort of gap that otherwise gets inferred away.
 
-use candle::cuda_backend::scratch_reserve;
+use candle::cuda_backend::{local_memory_bytes, scratch_reserve};
 use candle::Device;
 use candle_nn::kv_cache::{
     arena_census, held_ground_sites, held_ground_stats, region_stats, span_partition_now,
@@ -203,6 +203,20 @@ pub fn print_span(title: &str, experts: Option<&PipelineStats>) {
                     mib(base),
                     mib(outside.saturating_sub(base)),
                 );
+                // The driver's own share of what arrived since: one stack per
+                // resident thread, at the limit the most demanding kernel raised
+                // it to.
+                if let Some(local) = Device::new_cuda(0)
+                    .ok()
+                    .and_then(|d| d.as_cuda_device().ok().cloned())
+                    .and_then(|c| local_memory_bytes(&c).ok())
+                {
+                    println!(
+                        "    local memory      {:>9.1} MiB   (a stack for every resident thread; \
+                         the driver's, not the engine's)",
+                        mib(local)
+                    );
+                }
             }
             None => println!(
                 "  outside the span    {:>9.1} MiB   (no pre-reservation baseline recorded)",

@@ -7318,6 +7318,10 @@ pub fn moe_route<'w>(
     Ok((weights, indices))
 }
 
+/// The most tokens one [`moe_predict_votes`] launch counts: each half of a vote
+/// word is a 16-bit count.
+pub const MOE_PREDICT_VOTES_MAX_TOKENS: usize = u16::MAX as usize;
+
 /// Router look-ahead votes: `rows` is a `[num_tokens, width]` f32 projection
 /// holding, from column `first_col`, `hops` later layers' router logits of
 /// `n_experts` columns each. For every hop, each token names its top `n`, and
@@ -7348,7 +7352,7 @@ pub fn moe_predict_votes(
         crate::bail!("moe_predict_votes: n_experts={n_experts}, k={k}, n={n} out of range");
     }
     // Each half of a vote word counts tokens.
-    if num_tokens > u16::MAX as usize {
+    if num_tokens > MOE_PREDICT_VOTES_MAX_TOKENS {
         crate::bail!("moe_predict_votes: {num_tokens} tokens overflow a 16-bit vote count");
     }
     if first_col + hops * n_experts > width {

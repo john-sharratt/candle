@@ -5290,7 +5290,16 @@ impl Scheduler {
         // trail and are discarded).
         if seq_ids.is_empty() {
             let section = if !self.wave_cohort_advanced && !self.wave_section_advanced {
-                if self.vram_under_pressure() {
+                // Relief for the section batch, and so only when there is one to
+                // build (`section_batch_band`, the predicate the build asks
+                // first). Run on every decode step with nothing to ingest, it
+                // packed for a batch that did not exist: on BlackWorld
+                // (2026-11-09, one dialogue reprojecting over 200K of history,
+                // `queued_sections=0` throughout) five of these in one reply
+                // spent 300–1,050 ms each repacking the pools after the
+                // projection's recalls, and every decode wave behind one ran at
+                // 60–98 ms a forward against 34–39.
+                if self.vram_under_pressure() && self.section_batch_band().is_some() {
                     self.relieve_vram_pressure("section", VramPhase::Load, ReliefNeed::Paced);
                 }
                 let _g = super::profile::span("loop:wave:build_section");

@@ -132,6 +132,26 @@ The runtime's homes, each the cheapest one that is not the driver:
 - **Host data** — prompt ids are built on the host, as the scheduler hands them
   over; the forward uploads a wave's ids once, onto its span.
 
+**What a load leaves behind.** The exemption is for a load's transients. With
+the feature on, the watch also keeps a census of every allocation made inside a
+load window — cudarc reports where each one landed and when it is freed — and
+when a device's last window closes it prints what is still standing, by size,
+by site and by the model frame that asked. That is driver memory the load left
+outside the span for the life of the model, and each line is a tensor that
+belongs in the dense block. A plain tensor a model keeps as loaded goes there
+through `dense_span::place_tensor_in_dense`, as a quantized one does through
+`place_in_dense`. The link probe (`link_probe`), the one measurement that
+allocates before the span exists, runs as the load's first step
+(`ModelBuilder::load_model`), inside its window.
+
+**What the driver keeps for itself.** Not everything outside the span is an
+allocation the engine made. The context's local memory — one stack per thread
+the device can hold resident, at the per-thread limit the most demanding kernel
+launched so far raised it to — is the driver's own, and the span report prints
+it (`local_memory_bytes`). Kernel modules loaded on first launch, CUDA graph
+executables and library handles are the rest of that ground; none of them is a
+cudarc allocation, and none can move onto the span.
+
 A run with the feature stops at the next site to move. Once none is left, the
 load headroom is no longer the driver's for anything and the span takes it.
 
