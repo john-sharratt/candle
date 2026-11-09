@@ -5204,6 +5204,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             builder: p.builder.clone(),
             layer: p.layer,
             group: p.group,
+            talk: p.talk,
             identities: identities.clone(),
             templates,
             // After everything is installed, so the acts and identities are in

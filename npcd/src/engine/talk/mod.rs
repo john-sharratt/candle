@@ -4,7 +4,9 @@
 //!
 //! | Module | |
 //! |---|---|
+//! | [`catchup`] | what the journal says happened since the last turn |
 //! | [`clock`] | when a turn starts, and when an activation does |
+//! | [`decide`] | where a decision's words go, and the decision restated |
 //! | [`guard`] | the conversation's own guards |
 //! | [`key`] | who a conversation is with, and its timeline |
 //! | [`state`] | what a conversation keeps between turns |
@@ -12,7 +14,9 @@
 //! | [`voice`] | a channel post's words, decoded before the act is sent |
 //! | [`within`] | what a conversation's turn can do |
 
+pub mod catchup;
 pub mod clock;
+pub mod decide;
 pub mod guard;
 pub mod key;
 pub mod state;

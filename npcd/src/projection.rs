@@ -275,11 +275,11 @@ mod tests {
         build();
     }
 
-    /// The nine layers, by name and order. Order is meaningful — a higher layer
+    /// The ten layers, by name and order. Order is meaningful — a higher layer
     /// attends to everything below it — so this pins the sequence, not just the
     /// set.
     #[test]
-    fn the_schema_declares_the_nine_layers_in_order() {
+    fn the_schema_declares_the_ten_layers_in_order() {
         let b = build();
         let names: Vec<&str> = b.schema().layers.iter().map(|l| l.name.as_str()).collect();
         assert_eq!(
@@ -288,6 +288,7 @@ mod tests {
                 "perception",
                 "action",
                 "interaction",
+                "talk",
                 "memory",
                 "world",
                 "environment",

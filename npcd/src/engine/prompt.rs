@@ -276,6 +276,10 @@ pub enum Stance {
     Reflecting,
     /// Asleep, running one dream. None of the acting instruction survives here.
     Dreaming,
+    /// On the phone with one party, in a conversation of the character's own
+    /// (`docs/npc_conversations.md` §6.5): it decides as calls from the thread's
+    /// catalog, then says the words.
+    Talking,
 }
 
 impl Stance {
@@ -285,7 +289,7 @@ impl Stance {
     /// needs no catalog, no grammar and no envelope, and handing it any of the
     /// three is how a reflection ends up emitting `<tool_call>`.
     pub fn acts(self) -> bool {
-        matches!(self, Stance::Acting)
+        matches!(self, Stance::Acting | Stance::Talking)
     }
 
     /// This stance's option in the mind's [`STANCE_SELECTOR`].
@@ -294,6 +298,7 @@ impl Stance {
             Stance::Acting => "acting",
             Stance::Reflecting => "reflecting",
             Stance::Dreaming => "dreaming",
+            Stance::Talking => "talking",
         }
     }
 }
@@ -326,8 +331,17 @@ pub fn frame_for(stance: Stance, mode: Mode, tools: &[&Tool], env: &ToolCallEnve
         Stance::Acting => frame_acting(mode, tools, env),
         Stance::Reflecting => frame_reflecting(tools, env),
         Stance::Dreaming => ASLEEP.to_string(),
+        Stance::Talking => format!("{}{TALKING}", frame_acting(mode, tools, env)),
     }
 }
+
+/// What a conversation's turn reads beside the acting frame, with no mind to
+/// author it: the `talking` branch of the mind's stance selector.
+const TALKING: &str = "You are on the phone with one person. Earlier turns in the history are \
+                       your own conversation with them; what happened in between is under \
+                       \"Since you last spoke with them\", from your own journal.\n\n\
+                       First decide what to do, as calls; then you will be asked for the words, \
+                       and you say them as you would type them, in your own voice.\n\n";
 
 /// How many tools a catalog needs before its category headings earn their lines.
 const GROUPING_FLOOR: usize = 4;

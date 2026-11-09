@@ -108,8 +108,10 @@ use crate::engine::tools::{self, for_mode, Catalog, Mode};
 use crate::engine::window::Speaker;
 
 mod ask;
+mod talk;
 mod voice;
 pub use ask::{Answer, Put};
+pub use talk::{Spoken, Talk, TalkTurn};
 pub use voice::Voicing;
 
 /// How many completed exchanges the GPU sequence carries per turn.
@@ -315,6 +317,9 @@ pub struct Projected {
     pub builder: Builder,
     pub layer: LayerId,
     pub group: GroupId,
+    /// Where a character's conversations are kept: the `talk` layer's group,
+    /// when the schema declares one.
+    pub talk: Option<(LayerId, GroupId)>,
     /// Which members exist, so a turn pins the right ones.
     pub identities: identity::Installed,
     /// The response templates each destination's words are shaped by.
@@ -2095,6 +2100,8 @@ impl Minds {
         if let Some(l) = gone {
             retire(&self.engine, &*l.conversation.lock().await);
         }
+        // Its conversations too, of every party and generation (§4.1).
+        self.retire_talks(npc_id);
     }
 
     /// Make `live` the character's conversation, with the handle it is asked
