@@ -64,6 +64,11 @@ fn source(kind: &EventKind) -> Source {
             format!("thing meant for {party}"),
             format!("things meant for {party}"),
         ),
+        EventKind::Concluded { party, .. } => named(
+            format!("concluded:{party}"),
+            format!("thing settled with {party}"),
+            format!("things settled with {party}"),
+        ),
         EventKind::Speech { speaker, .. } => named(
             format!("speech:{speaker}"),
             format!("thing {speaker} said"),

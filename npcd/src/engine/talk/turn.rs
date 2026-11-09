@@ -17,7 +17,7 @@ use journals::time::Stamp;
 use serde_json::Map;
 
 use crate::api::now_ms;
-use crate::authority::ops::ActSource;
+use crate::authority::ops::{ActSource, OpReply, WorldOp};
 use crate::engine::act::Act;
 use crate::engine::event::{EventKind, TalkLine};
 use crate::engine::experience::line;
@@ -25,6 +25,7 @@ use crate::engine::mind::TalkTurn;
 use crate::engine::runtime::Runtime;
 use crate::engine::talk::catchup::{self, CatchUp};
 use crate::engine::talk::clock::{self, Ended, Input};
+use crate::engine::talk::critical;
 use crate::engine::talk::guard::{self, Words};
 use crate::engine::talk::key::Party;
 use crate::engine::talk::runner::{Inputs, Key};
@@ -270,6 +271,41 @@ impl Runtime {
                 .iter()
                 .map(|p| format!("You wanted to tell {}: {p}", seen.party_name)),
         );
+
+        // A critical step: signed by the yes to what was asked, or asked for.
+        let next_critical = hosted.sim(|s| {
+            s.missions
+                .active(&body)
+                .and_then(|m| m.critical_next().map(str::to_string))
+        });
+        let said_by_them: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        let signed = critical::signs(
+            state.pending_critical.as_deref(),
+            next_critical.as_deref(),
+            standing,
+            &said_by_them,
+        );
+        if let (Some(step), Party::Person(handle)) = (signed, &party) {
+            let op = WorldOp::Authorize {
+                npc,
+                step: step.clone(),
+                by: handle.clone(),
+                name: seen.party_name.clone(),
+            };
+            if let Ok(OpReply::Done { ok: true }) = self.world_write(&world, op).await {
+                state.pending_critical = None;
+                arrived.push(format!("{} said yes: '{step}' is signed off.", seen.party_name));
+            }
+        }
+        if state.pending_critical.is_none() {
+            state.pending_critical = critical::asks(standing, next_critical.as_deref(), input);
+        }
+        if let Some(step) = &state.pending_critical {
+            arrived.push(format!(
+                "Your mission waits on {}'s yes to: {step}. Ask them for it plainly.",
+                seen.party_name
+            ));
+        }
         let spoken = minds
             .talk_turn(
                 &mut talk,

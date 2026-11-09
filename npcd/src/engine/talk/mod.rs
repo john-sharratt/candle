@@ -7,6 +7,7 @@
 //! | [`authority`] | who may change the mission through a conversation |
 //! | [`catchup`] | what the journal says happened since the last turn |
 //! | [`clock`] | when a turn starts, and when an activation does |
+//! | [`critical`] | a critical step: a request, then a yes |
 //! | [`decide`] | where a decision's words go, and the decision restated |
 //! | [`guard`] | the conversation's own guards |
 //! | [`key`] | who a conversation is with, and its timeline |
@@ -20,6 +21,7 @@
 pub mod authority;
 pub mod catchup;
 pub mod clock;
+pub mod critical;
 pub mod decide;
 pub mod guard;
 pub mod key;

@@ -192,6 +192,14 @@ impl Runtime {
             WorldOp::Cancel { npc } => OpReply::Done {
                 ok: self.cancel_mission(npc, self.world_ms(npc)),
             },
+            WorldOp::Authorize {
+                npc,
+                step,
+                by,
+                name,
+            } => OpReply::Done {
+                ok: self.authorize_step(npc, &step, &by, &name),
+            },
             WorldOp::Channel { from, text, origin } => OpReply::Heard {
                 by: self.say_on_channel_from(world, &from, &text, origin),
             },

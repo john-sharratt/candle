@@ -94,6 +94,17 @@ pub enum WorldOp {
     },
     /// A character's mission called off.
     Cancel { npc: u64 },
+    /// An authorizer said yes to the critical step a conversation asked them
+    /// to sign (`docs/npc_conversations.md` §7.2): signed when `step` is
+    /// still the mission's next and `by` — an account handle — is one of the
+    /// world's authorizers, both checked here, on the authority.
+    Authorize {
+        npc: u64,
+        step: String,
+        by: String,
+        /// Who said yes, by name, for what the character is told.
+        name: String,
+    },
     /// A person speaks on the world's open channel — from the console, with
     /// no `origin`, or from the world's Discord server's `#the-channel`.
     Channel {

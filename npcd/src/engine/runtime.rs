@@ -81,7 +81,7 @@ use crate::effector::station;
 use crate::effector::token::Tokens;
 use crate::engine::act::Act;
 use crate::engine::authoring;
-use crate::engine::authorize::critical_compass;
+use crate::engine::authorize::{self, critical_compass};
 use crate::engine::bearings;
 use crate::engine::body::{self, Outcome};
 use crate::engine::channels::{self, ChannelSection};
@@ -92,6 +92,7 @@ use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
 use crate::engine::experience::store::Journals;
+use journals::experience::ExperienceKind;
 use crate::engine::talk::authority::Changes;
 use crate::engine::talk::runner::Talks;
 use crate::engine::people;
@@ -2170,6 +2171,44 @@ impl Runtime {
             );
         }
         cancelled
+    }
+
+    /// Sign off `npc_id`'s critical step `step`, which `by` — an account
+    /// handle, `name` by name — said yes to on a conversation that asked them
+    /// (`docs/npc_conversations.md` §7.2). Refused unless `step` is still the
+    /// mission's next and `by` is one of the world's authorizers. The
+    /// character is told, and its journal keeps it.
+    pub fn authorize_step(&self, npc_id: u64, step: &str, by: &str, name: &str) -> bool {
+        let Some((hosted, body)) = self.body_of(npc_id) else {
+            return false;
+        };
+        let signed = hosted.with_sim(|s| {
+            let authorizer = authorize::is_authorizer(by, s.missions.authorizers());
+            let Some(m) = s.missions.active_mut(&body) else {
+                return false;
+            };
+            authorizer && m.critical_next() == Some(step) && m.authorize()
+        });
+        if signed {
+            let applied = format!("{name} signed off '{}'.", step.trim_end_matches('.'));
+            self.journals.note(
+                hosted.id(),
+                &body,
+                ExperienceKind::Mission,
+                &applied,
+                None,
+            );
+            self.tell(
+                npc_id,
+                self.world_ms(npc_id),
+                Salience::URGENT,
+                EventKind::Concluded {
+                    party: name.to_string(),
+                    applied,
+                },
+            );
+        }
+        signed
     }
 
     /// Cancel the open mission of every character in every world this daemon

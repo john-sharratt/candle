@@ -284,6 +284,11 @@ pub enum EventKind {
         party: String,
         intent: String,
     },
+    /// One of the character's conversations changed something of its own —
+    /// its mission, a critical step — so its next decision starts from the
+    /// new state and knows why (`docs/npc_conversations.md` §7.2). `party` is
+    /// who it was with, by name; `applied` what came of it.
+    Concluded { party: String, applied: String },
     /// Messages wait unread on the character's handset: each thread by the
     /// name the character calls it, and how many.
     ///
@@ -411,6 +416,7 @@ impl EventKind {
             EventKind::Message { .. } => "message",
             EventKind::Talk { .. } => "talk",
             EventKind::Purpose { .. } => "purpose",
+            EventKind::Concluded { .. } => "concluded",
             EventKind::Unread { .. } => "unread",
             EventKind::Situation { .. } => "situation",
             EventKind::Nudge { .. } => "nudge",
@@ -558,6 +564,9 @@ impl Event {
                 .collect::<Vec<_>>()
                 .join("\n"),
             EventKind::Purpose { intent, .. } => format!("You meant to say: {}", intent.trim()),
+            EventKind::Concluded { party, applied } => {
+                format!("On the phone with {party}: {}", applied.trim())
+            }
             EventKind::Unread { threads } => unread_line(threads),
             // Both arrive already written — a situation is generated from a
             // map, a nudge is authored beside the task it belongs to — so
