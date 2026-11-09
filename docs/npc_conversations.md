@@ -57,13 +57,13 @@ last two for every path.
 | D1 | A conversation is **the NPC's mind loop on a message clock**: same persona, same schema family, same decode path, with the beat replaced by the arrival of a message and perception narrowed to what changed since the last turn. Common code, not a second agent. |
 | D2 | A conversation is **one-to-one**: an NPC and one party, the party a person or another NPC. Group channels stay on the main loop's existing messaging (`message via: channel`), which is fire-and-forget and needs no turn structure (§11). |
 | D3 | **Parked between turns.** A conversation holds no scheduler slot and no live `Sequence` between messages. It is a persisted substrate timeline that resumes on the next message. Thousands can exist; only the ones decoding cost VRAM. |
-| D4 | **Mood, mission, beliefs, persona and memory are shared** with the main loop. It is the same person in two places. A conversation reads them each turn and writes back only through the tail (§7.3). |
+| D4 | **Mood, mission, beliefs, persona and memory are shared** with the main loop. It is the same person in two places. A conversation reads them each turn and writes back only through its acts' outcomes (§7.3). |
 | D5 | **Experience is journaled.** What an NPC does, hears and concludes is written as lines of its `bots/<bot>` journal, batched off the beat path. The world's in-memory event log stays the per-beat perception of the main loop. |
 | D6 | **Catch-up is a turn-scoped lock plus a cited summary.** The journal lines written since the conversation's last turn are carried into the turn as a section collection, a short decode summarises them with line citations into the user turn, the reply decodes with the lines still carried, and the collection is removed. |
-| D7 | **Every turn is one stencil tool call: `reply`, `end` or `note`, and every turn has an outcome.** A turn that changes nothing is a conversation that never happened. `note` is how an NPC chooses not to answer, and it must still leave something behind: at least a journal line saying what it took from the message and why it is not answering, or a stronger conclusion. There is no silent no-op. |
+| D7 | **One tool base. A conversation turn is the mind's act turn, using the existing catalog, compiled for a thread instead of a room.** It offers `reply`, `sign_off`, `reflect`, `promise`, `remind`, the `mission_*` acts, and `message`/`reach_out`, with no conversation-only tools. **Every turn has an outcome**: the turn must open with a call, and every act offered changes something. Choosing not to answer is `reflect`, whose line goes in the journal. There is no silent no-op. |
 | D11 | **Speech in the room needs a person in the room.** `tell`, `ask`, `whisper` and `shout` are offered only when a human's body (`visitor:*`) can hear them. NPCs reach each other by `message`, which is a conversation (§12). |
 | D8 | **A main-loop private `message` starts, resumes or injects into a conversation.** The main loop hands the conversation a *purpose*; the conversation decodes the words. In-room `tell` stays speech (`npcd/src/engine/body.rs:421-461`). |
-| D9 | **Conversations conclude.** A conclusion — noted, commit, change mission, hand-off — is the one way a conversation changes what the main loop does. It is applied by the world's authority under authority, critical-step and thrash rules, never by the conversation itself. |
+| D9 | **Conversations conclude.** A conclusion — noted (`reflect`), commit (`promise`), change mission (`mission_*`), hand-off (`message`/`reach_out`) — is the one way a conversation changes what the main loop does. It is applied by the world's authority under authority, critical-step and thrash rules, never by the conversation itself. |
 | D10 | **All NPCs, both directions.** Person↔NPC and NPC↔NPC use the same module. Zen and the moon household first; Battle Cities players are the scale target. |
 
 ---
@@ -100,7 +100,9 @@ What does **not** exist, and §4–§12 build:
 - a single-commit multi-op journal write;
 - a journal read of "everything after time T";
 - releasing a conversation's slot at the end of every turn;
-- the reply/end/note grammar, conclusions, and their application;
+- the act catalog compiled for a thread (`Within::on_thread`), the four
+  catalog changes in §6.2, and the authority rules for acts that come from a
+  conversation;
 - speech-act gates that tell a person in the room from an NPC;
 - Discord post idempotency.
 
@@ -151,7 +153,7 @@ turns live once, in the journal (§5).
    ENDED ─────────────────────▶ GATHERING ──(burst window)──▶ TURN ──▶ PARKED
      ▲                              ▲                          │         │
      │                              └─────── message ──────────┼─────────┘
-     └──────────────────── end ────────────────────────────────┘
+     └────────────────── sign_off ─────────────────────────────┘
 ```
 
 - **GATHERING** — a message or purpose has arrived; wait for the burst window
@@ -335,50 +337,104 @@ The cost is one extra prefill of the user half: `ask` and the real turn each
 prefill it (`ephemeral_turn.rs:94-110`). It is paid only when the gap holds more
 than six lines.
 
-### 6.2 The call
+### 6.2 The acts: the catalog the main loop already has
 
-The turn is forced to open with one tool call. It is compiled through
-`compile_action_loop` with `max_calls = 1` and `close_turn`
-(`candle-conversation/src/stencil/tool_call.rs:1207`), installed as
-`TurnOptions.turn_grammar`, and opened by `assistant_prefill` with a closed
-think block and the call marker. This is how npcd already forces its act turn
-(`mind.rs:1729-1742`).
+A conversation has **no tools of its own**. Its turn is the mind's act turn,
+with the same catalog (`npcd/src/engine/tools.rs`, `acts.rs`, `agenda/acts.rs`),
+the same grammar compiler (`grammar_for`, `mind.rs:1034`), the same parser
+(`act::parse`, `act.rs:372`) and the same performer (`Runtime::perform`,
+`perform.rs:272-322`). The only thing that differs is the situation it is
+compiled for:
 
-```
-reply { text: string, feeling?: Feeling, remember?: string, conclude?: Conclusion }
-end   { text: string, feeling?: Feeling, remember?: string, conclude:  Conclusion }
-note  {               feeling?: Feeling, remember?: string, conclude:  Conclusion }
-```
+- **The mode is `Mode::InstantMessage`.** That is the existing mode for a party
+  reached down a line (`npcd/src/engine/interaction.rs:44-58`).
+  `Availability::PhysicalOnly`, `Embodied`, `Nearby` and the rest already strike
+  the world acts in that mode (`tools.rs:1085-1108`).
+- **`Within` is the thread's, not the room's.** A conversation builds
+  `Within::on_thread(party)`, in which:
+  - every world-binding set is empty (places, rooms, parts, links, devices,
+    stations, carried, operable), so the empty-set rule takes the world acts
+    out of the grammar the way it already does for a character with nowhere to
+    go (`tools.rs:1952-1954`);
+  - the thread sets hold only this conversation's thread, so every `to`
+    (`Choices::Threads` / `Awaiting`) binds to exactly one value: the party.
+  - The talk itself cannot touch the body, so the runner never takes the
+    character's `Resident` mutex (`mind.rs:302, 1747`). What the conversation
+    decides about the world goes through the authority as conclusions (§7).
+
+What that leaves offered, every act an existing one:
+
+| Act | Exists at | In a conversation it… |
+|---|---|---|
+| `reply` | `acts.rs:1290-1333` | answers the party on this thread |
+| `sign_off` | `acts.rs:1058-1089` | ends the conversation, with a parting |
+| `reflect` | `tools.rs:766-860` | says nothing back. Its `situation` and `inner_thoughts` become the journal line, and `feeling` becomes the mood. This is the act for choosing not to answer. |
+| `promise` | `acts.rs:932-968` | commits to the party, held in the ledger (`enact.rs:952-973`) |
+| `remind` | `acts.rs:971-1007` | reminds the party of a promise they made |
+| `mission_add` / `_edit` / `_cancel` / `_done` | `agenda/acts.rs:19-138` | changes the mission (§7) |
+| `message` / `reach_out` | `acts.rs:1092-1276` | hands off to someone else: starts or adds to *that* conversation (§10) |
+
+Four catalog changes make these work on a thread. Each is a change to the
+existing act, made once for both loops. There is no conversation-only variant.
+
+- **`promise` and `remind` are offered on a private thread as well as in the
+  room.** Their availability becomes `Nearby` *or* a private thread with the
+  person, and `to`/`who` bind to the company plus the private-thread parties.
+  `enact::promise` resolves `to` against those parties as well as the room
+  (`here_named`, `enact.rs:957`). Its `w.tell(...)` announcement in the room
+  becomes a line on the thread when the party is not here (`enact.rs:969`).
+  Both loops gain this, because a promise made by text is as binding as one
+  made in person.
+- **`reflect` writes its journal line in both loops** (`Did`/`Inferred`, §5.1).
+  It already sets the mood through `note_feeling` (`runtime.rs:2949-2955`).
+  It still starts the reflection exactly as it does today
+  (`docs/reflection_and_dreams.md`).
+- **The mission acts are offered to an ordered body too, when the party has the
+  authority to change its mission** (§7.2). Today they are offered only to a
+  body that keeps an agenda (`agenda/acts.rs:1-5`). The act names and
+  parameters are unchanged.
+- **The phone acts mark the thread read** (§11). Again, this applies in both
+  loops.
 
 **Every turn has an outcome.** A turn that changes nothing anywhere might as
-well not have happened, so the grammar makes the do-nothing turn impossible to
-decode:
+well not have happened. Every act above has a consequence somewhere:
 
-- `reply` is an outcome in itself: the party hears something.
-- `end` and `note` send nothing further (or nothing at all), so their
-  `conclude` is **required**. The weakest conclusion is a `Noted` journal line,
-  and its `what` must say what the NPC took from the message and why it is not
-  answering ("Mira asked again about the parcel; already told her it's in. Not
-  repeating myself."). That line is in the NPC's journal, so every later
-  catch-up, every other conversation and the main loop all see it (§5.4).
+- a line sent, or a parting;
+- a journal line and a mood;
+- a promise in the ledger;
+- a mission changed;
+- another conversation started.
 
-- `Feeling` is the `Choices::Feelings` enum, the ids of `<mind>/moods/`
-  (`tenant.rs:744-764`). It is the same vocabulary `reflect` uses
-  (`npcd/src/engine/tools.rs:808-819`).
-- `Conclusion` is §7.1's tagged union.
-- **reply** appends `text` to the thread as the NPC. Discord mirrors it on the
-  next bot beat (`dm/outbound.rs:153`). The thread is marked read for the NPC
-  through the line answered (`Threads::read`, `phone.rs:849-863`), which stops
-  the unread reminder.
-- **end** does the same, then marks the conversation ENDED. `text` is the
-  closing line; it is required, because ending is something said. Its
-  conclusion is what the conversation came to.
-- **note** sends nothing and keeps the conversation open. It marks the thread
-  read, and its conclusion is applied like any other (§7.2).
+The turn is forced to open with a call (`assistant_prefill` with a closed think
+block and the call marker, as `mind.rs:1729-1742` does) and cannot close
+without one. So the do-nothing turn cannot be decoded. Choosing not to answer
+is `reflect`, and its required `inner_thoughts` must say what the NPC took from
+the message and why it is not answering ("Mira asked again about the parcel. I
+already told her it's in, and I won't say it twice."). That line is in the
+NPC's journal, where every later catch-up, every other conversation and the
+main loop see it (§5.4).
 
-Thinking is allowed, up to `THINK_TOKENS` = 256, then the prefill closes it.
-`text` is capped at 1,200 characters, below Discord's 2,000-character split
-point, so a conversation reply is one Discord message and never a split.
+**Up to three calls a turn.** The grammar is `compile_action_loop` with
+`max_calls` = 3 and `close_turn` (`candle-conversation/src/stencil/tool_call.rs:1207`).
+That allows "Sure, I'll bring it in" to be `promise` followed by `reply` in one
+turn. A `reply` or `sign_off` closes the turn, because what is said is said
+last.
+
+**The words.** `reply`/`sign_off` carry `intent`, not wording, exactly as they
+do in the main loop. The narration pass voices them (`narrate_act`,
+`mind.rs:972`; `runtime.rs:6685-6694`). That is the same path that writes
+the words of every DM today, so a conversation sounds like the character
+in the room. The voiced line is capped at 1,200 characters, below Discord's
+2,000-character split point, so a conversation line is one Discord message and
+never a split. Thinking is allowed, up to `THINK_TOKENS` = 256.
+
+After the acts:
+
+- a `reply` is appended to the thread as the NPC, and Discord mirrors it on the
+  next bot beat (`dm/outbound.rs:153`);
+- `sign_off` also marks the conversation ENDED;
+- every turn marks the thread read through the last line it took as input
+  (`Threads::read`, `phone.rs:849-863`).
 
 ### 6.3 Park
 
@@ -426,10 +482,10 @@ acting layers. It carries:
   event (`runtime.rs:5510-5532`). In a conversation it is read fresh each turn,
   because the main loop may have changed it since.
 
-It carries **no world tools**. A conversation cannot move the body, invoke
-effectors or touch the world directly. It speaks and concludes. That keeps the
-two loops from ever contending over the body, so the conversation runner never
-takes the character's `Resident` mutex (`mind.rs:302, 1747`).
+The `tools` collection is the same one the mind installs. A conversation's
+selection names the acts its grammar offers (`tools::show_within`,
+`mind.rs:2027`), so the list it reads and the list it can decode are the same,
+exactly as in the main loop.
 
 Bands: a person's conversation decodes at **High**, and an NPC↔NPC one at
 **Low**. The band is set through the timeline's `decode_band` metadata
@@ -443,30 +499,32 @@ a wave (`scheduler/mod.rs:7011`).
 
 ### 7.1 Kinds
 
-```
-Conclusion =
-  | Noted   { what: string }                         // remember it; changes nothing
-  | Commit  { step: string, reason: string }          // a step I will do
-  | Change  { mission: string, reason: string }       // drop / replace what I'm doing
-  | HandOff { to: Party, purpose: string, reason: string }  // go talk to someone
-```
+A conclusion is the outcome of an act from §6.2, not a separate structure. Every
+one of them is recorded as a `Concluded` journal line, naming the party.
 
-A conclusion is required on `end` and `note` (§6.2), and optional on `reply`:
-"Sure, I'll bring it in" is a reply *and* a commit.
+| Kind | Act | Effect |
+|---|---|---|
+| Noted | `reflect` | a journal line and a mood; nothing else changes |
+| Commit | `promise` | a ledger promise to the party (`s.ledger.promise`, `enact.rs:968`). It outlives the conversation and is reminded, whether or not the NPC wants it to be (`acts.rs:927-940`). |
+| Change | `mission_add` / `mission_edit` / `mission_cancel` / `mission_done` | the mission changes (§7.2) |
+| HandOff | `message` / `reach_out` to another party | a purpose delivered to that conversation (§10) |
+| Ended | `sign_off` | the conversation is ENDED; its last conclusion is what it came to |
 
 ### 7.2 Application
 
-A conclusion is sent as `WorldOp::Conclude{npc, party, conclusion}` through
-`Runtime::perform`'s routing (`perform.rs:272-322`). The world's authority
-applies it in its moment, which makes the authority the single owner of
-mission state, as it already is (`npcd/src/authority/worlds.rs:190-192`).
+Every act from a conversation goes through `Runtime::perform`'s routing
+(`perform.rs:272-322`), so on a member that does not write the world it travels
+to the authority as `WorldOp::Act`, as a main-loop act does. Mission state
+therefore has one writer, as it already does (`npcd/src/authority/worlds.rs:190-192`).
+The act carries `Origin::Talk{party}`, which the authority uses for the rules
+below.
 
-| Kind | Applied as | Rules |
+| Act | Applied as | Rules |
 |---|---|---|
-| Noted | a `Concluded` journal line | none |
-| Commit | `add_todo` on the active mission (`mission.rs:646-661`). For an unordered body (Zen), `mission_add` on the agenda (`agenda/acts.rs`). | at most 3 commits per conversation turn |
-| Change | **from the owner or an authorizer**: `WorldOp::Lodge` with `Origin::Own`, assigned, replacing the current mission (`perform.rs:406-447`); for Zen, `mission_edit` / `mission_cancel`. **From anyone else**: downgraded to a Commit, "raise '{mission}' with {lead}", so the main loop decides. | thrash guard |
-| HandOff | a purpose delivered to the conversation with `to` (§10) | the target's §8 guards |
+| `promise` | the ledger, as today | at most 3 promises per conversation turn |
+| `mission_*` on an unordered body (Zen) | the agenda, as today (`agenda/acts.rs`) | thrash guard |
+| `mission_*` on an ordered body | **party is the owner or an authorizer**: applied to the active mission. `mission_add` lodges and assigns with `Origin::Own`, replacing the current mission (`WorldOp::Lodge`, `perform.rs:406-447`). `_edit` edits it, `_cancel` withdraws it (`Runtime::cancel_mission`, `runtime.rs:2133-2148`), and `_done` hands it in. **Party is anyone else**: the act is not offered, because the binding sets are empty (§6.2). The NPC can still `promise` to raise it, and its main loop decides. | thrash guard |
+| `message` / `reach_out` | a purpose delivered (§10) | the target's §8 guards |
 
 **Authority.** The party is known exactly, which a phone `read` is not:
 
@@ -476,8 +534,8 @@ mission state, as it already is (`npcd/src/authority/worlds.rs:190-192`).
   `WorldMissions.authorizers` with `is_authorizer` (`authorize.rs:22-97`).
 - The match is on the linked account, not on a name typed in a message. That
   is the identity check `docs/mission_templates.md:187-195` asks for.
-- An NPC party is never an authority over another NPC's mission. Its Change is
-  always downgraded.
+- An NPC party is never an authority over another NPC's mission, so the
+  mission acts are never offered to an ordered body talking with an NPC.
 
 **Critical steps.** A conversation never signs off a critical step, just as
 `check_off` refuses to (`mission.rs:606`). If an authorizer's message in a
@@ -487,10 +545,11 @@ conversation is affirmative for the active mission's critical next step
 (`enact.rs:293-315`). The conversation's model output plays no part in that
 decision; it rests on the authorizer's own words.
 
-**Thrash guard.** A body's mission may change through a conclusion at most once
-per `CHANGE_COOLDOWN` = 10 min of world time. An owner or authorizer is
-exempt. Within the cooldown, a Change is downgraded to a Commit. When two
-conclusions conflict in one moment, the higher authority wins (owner, then
+**Thrash guard.** A body's mission may change through a conversation at most
+once per `CHANGE_COOLDOWN` = 10 min of world time. An owner or authorizer is
+exempt. Within the cooldown, the mission acts are struck from the conversation's
+grammar, as `cooling` strikes an act taken too recently (`tools.rs:1996-2002`).
+When two changes conflict in one moment, the higher authority wins (owner, then
 authorizer, then everyone else), and between equals the later one wins.
 
 **The main loop is told.** After applying, the authority delivers the character
@@ -498,15 +557,14 @@ an URGENT `Concluded{party, conclusion, applied_as}` event through
 `Scheduler::deliver` (`tick.rs:919-942`). The next main-loop decision therefore
 starts from the new mission and knows why.
 
-### 7.3 The write-only tail
+### 7.3 Outcomes flow out, not back
 
-`feeling`, `remember` and `conclude` flow out of the turn and never back into
-the same turn:
-
-- `feeling` goes through the existing `MoodSink` → `Npcs::remember_mood`
-  (`npcs.rs:477-500`; it writes only on change), shared by both loops;
-- `remember` is a `Noted` journal line;
-- `conclude` is §7.2.
+An act's outcome reaches the conversation's next turn as the main loop's
+outcomes reach its own: a `<tool_response>` ahead of the user turn
+(`compose_narrated`, `mind.rs:2400-2422`). Nothing re-enters the turn that
+produced it. Mood moves through the existing `MoodSink` →
+`Npcs::remember_mood` (`npcs.rs:477-500`; it writes only on change), shared
+by both loops.
 
 ---
 
@@ -516,16 +574,16 @@ the same turn:
 |---|---|---|
 | Burst window | A turn starts `BURST_MS` = 2,500 ms after the last unanswered message, and at most 8,000 ms after the first. | one answer to three quick lines |
 | One turn at a time | A message or purpose arriving during a turn is queued for the next turn boundary; it is never dropped and never starts a second decode. | injection without races |
-| A repeat becomes a note | A `reply`/`end` whose text overlaps ≥ 0.45 with any of the NPC's last 4 lines in this conversation (the loop guard's measure, `loopguard.rs:112-118`) is not sent. It is acted on as a `note`: its conclusion is applied, and if it had none, the line "Started to tell {party} again that …; had already said it." is written. Checked **before** the append. | no posted repeats, and still an outcome |
-| Activation cap | In an NPC↔NPC conversation, `TALK_TURNS` = 8 turns per side per activation (an activation starts at a main-loop purpose). After the cap, the grammar offers only `end` and `note` (a second compiled grammar, cached like `mind.rs:248`), both of which conclude. | two NPCs cannot talk forever, and the exchange ends in something |
-| Quiescence | A note sends nothing, so the other side gets no message and takes no turn. NPC↔NPC exchanges settle at the first note or end, and each of those leaves its conclusion behind. | no idle chatter |
+| A repeat is refused, and still leaves a line | The loop guard runs before the append, in both loops (§11). A `reply`/`sign_off` it catches (overlap ≥ 0.45 with the last 4 utterances, `loopguard.rs:112-118`) is refused, not sent. The refusal writes "Started to tell {party} again that …; had already said it." to the journal, so the turn still has an outcome. | no posted repeats, and still an outcome |
+| Activation cap | In an NPC↔NPC conversation, `TALK_TURNS` = 8 turns per side per activation (an activation starts at a main-loop purpose). After the cap, `reply` and `message` are struck from the grammar, as `cooling` strikes acts (`tools.rs:1996-2002`). What is left (`sign_off`, `reflect`, `promise`, the mission acts) all conclude. | two NPCs cannot talk forever, and the exchange ends in something |
+| Quiescence | `reflect` sends nothing, so the other side gets no message and takes no turn. NPC↔NPC exchanges settle at the first `reflect` or `sign_off`, each leaving its line. | no idle chatter |
 | Unprompted contact | A purpose for a party whose thread's last line is the NPC's own and unanswered is held until the party answers, or for `UNANSWERED_HOLD` = 1 h. | no message storms at a person who is away |
 | People are never capped | Person↔NPC conversations have no activation cap. A person may always get an answer. | the product |
 
-A note sends the party nothing. On Discord, the typing indicator
-(`npcd/src/discord/dm/typing`) shows while a turn decodes and stops on a note.
-What the note changed (a mission step, a journal line) shows wherever that
-change shows.
+A turn without a `reply` sends the party nothing. On Discord, the typing
+indicator (`npcd/src/discord/dm/typing`) shows while a turn decodes and stops
+when the turn ends. Whatever the turn changed (a journal line, a promise, a
+mission) shows wherever that change shows.
 
 ---
 
@@ -550,12 +608,14 @@ is lost for that turn. Its input messages are still unanswered
   learns of the exchange through `Elsewhere` (§5.4).
 - **The main loop wants to talk.** The existing `message{via: private, to, intent}`
   act (`npcd/src/engine/acts.rs:1171-1276`) no longer writes thread text for a
-  private thread. It delivers `Purpose{intent}` to the `(npc, to)`
-  conversation. The conversation's next user turn carries "You wanted to tell
-  {party}: {intent}", and its call decodes the words. `message{via: channel}`
+  private thread, and neither does `reach_out` (`acts.rs:1092-1123`). Each
+  delivers `Purpose{intent}` to the `(npc, to)` conversation, opening it if
+  there is none. The conversation's next user turn carries "You wanted to tell
+  {party}: {intent}", and its acts decide what is said. `message{via: channel}`
   is unchanged (§11).
-- **A hand-off** is a purpose delivered by the authority on a HandOff
-  conclusion.
+- **A hand-off** is a conversation performing `message` or `reach_out` toward
+  someone other than its party. It is the same act on the same path as the
+  main loop's, so it delivers a purpose to that other conversation.
 - **NPC↔NPC.** A's reply appended to the A–B thread is a message to B, so it
   starts or resumes B's conversation exactly as a person's DM does.
 
@@ -659,6 +719,33 @@ NPCs speak aloud to players, and in front of them.
   `:461-468`) are rewritten with a visitor present, because an example of an
   act the grammar would not offer is an example of nothing.
 
+**Messaging needs no person.** The gate covers room speech only. `message`,
+`reply`, `reach_out`, `sign_off`, `invite` and `open_group` stay
+`Availability::Always` (`acts.rs:1058-1385`). They bind to the threads on the
+character's handset, so an NPC alone with other NPCs, or alone entirely,
+always has them. The one precondition is the existing one: a character is on
+the threads from the moment it carries a handset (`npcd/src/sim/phone.rs:48,
+72-75`). Every NPC that talks carries one.
+
+**The guidance that pushed the other way is rewritten.** It tells NPCs to
+prefer the room to the phone, which was right while room speech was the
+conversation and is now the reverse:
+
+- `prompt::frame` (`npcd/src/engine/prompt.rs:529-542`): "Being with people
+  beats writing to them. If somebody is here, speak to them … two people in one
+  room texting is worse than either of them saying nothing." It becomes: "Speak
+  to the people here. To reach another character, here or anywhere, message
+  them." The advice to *ask* rather than announce, and to go where the answer
+  sends you for anything physical, stays.
+- `MESSAGE`'s description and doc comment (`acts.rs:1160-1170`, `:1189-1194`):
+  "If the person you want is standing in front of you, `tell` or `ask`." This
+  is replaced by the reach-anyone wording above.
+- The `message`/`reply` cooldown's rationale (`npcd/src/engine/cooldown.rs:240-254`)
+  says messaging is priced "dearer than being in the room". The six seconds
+  stays, because ten sends a minute is still a conversation. Its reason becomes
+  pacing a correspondence, not steering NPCs towards the room. NPC↔NPC
+  exchanges are bounded by the conversation's own clock and cap (§8).
+
 **What it does not break:**
 
 - Mission `met` steps sign off on presence (`runtime.rs:1551-1559`;
@@ -682,12 +769,11 @@ New, one concern per file:
 | `npcd/src/engine/talk/state.rs` | the §4.2 metadata, read/write | round-trip of each key's exact bytes |
 | `npcd/src/engine/talk/clock.rs` | burst window, one-at-a-time queue | turn start times for scripted arrival sequences |
 | `npcd/src/engine/talk/catchup.rs` | `since` read → `catchup` wants, verbatim-or-summary choice | wants for a fixture journal at given bookmarks; the 6-line threshold |
-| `npcd/src/engine/talk/grammar.rs` | reply/end/note grammar, capped variant | grammar accepts/rejects exact call strings, including a `note` or `end` without `conclude` (rejected) |
-| `npcd/src/engine/talk/call.rs` | parse the call → reply/end/note + tail | parsed structs from exact call text |
-| `npcd/src/engine/talk/guard.rs` | repeat-becomes-note, activation cap, unprompted hold | decisions and the written line for scripted line histories |
+| `npcd/src/engine/talk/within.rs` | `Within::on_thread(party)`: the thread's situation for the existing grammar | the exact offered act set for a person party, an NPC party, an owner and an authorizer party, an ordered and an unordered body, and after the activation cap or within the change cooldown |
+| `npcd/src/engine/talk/guard.rs` | activation cap, unprompted hold | decisions for scripted line histories |
 | `npcd/src/engine/talk/turn.rs` | resume → catch-up → ask → turn → act → release → park | an end-to-end turn on the test engine: sealed user text, thread append, bookmark |
 | `npcd/src/engine/talk/runner.rs` | per-world runner, routing from `deliver_messages` | a private DM reaches the runner, not the mind |
-| `npcd/src/engine/talk/conclude.rs` | `WorldOp::Conclude` application, authority, thrash guard | mission state before/after for each kind × authority |
+| `npcd/src/engine/talk/authority.rs` | the authority's rules for an act carrying `Origin::Talk{party}`: owner/authorizer match on the linked account, thrash guard, conflict order | mission state before and after for each mission act × party authority |
 | `npcd/src/engine/experience/{line,sink,buffer}.rs` | experience → journal line, batching | rendered line text per kind; flush ordering and cap |
 | `npcd/src/engine/experience/concern.rs` | which journals hear of a world change | for each change kind in §5.1.1, the exact journal paths returned, including none for an unconcerned NPC and one `bots/world-<world>` for a house mode |
 | `journals/src/store/write_all.rs` | multi-op single commit | one commit, exact tree after; whole batch refused on one refusal |
@@ -708,15 +794,21 @@ Changed:
   `heard_by_person`, the speech acts' gates, descriptions and examples (§12).
   Tests: the exact offered act set for NPC-only company, NPC-plus-visitor
   company, and a visitor in the next room within a shout's reach. Also the
-  `needs` strings pulse shows (`pulse.rs:1574-1578`).
+  `needs` strings pulse shows (`pulse.rs:1574-1578`), and that `message` and
+  `reply` are offered with NPC-only company and alone;
+- the `promise`/`remind` thread availability, `reflect`'s journal line, the
+  mission acts for an ordered body under an authorized party, and the phone
+  acts marking read (§6.2). These apply in both loops, and are tested in each
+  act's existing test module;
+- `prompt::frame`, `MESSAGE` and the cooldown rationale, rewritten (§12).
 
 Live check, after the tests: two moon NPCs and one Discord DM with Zen, with
 these outcomes:
 
 - every message is answered once;
 - every turn leaves an outcome: a message, a journal line or a mission change;
-- a note posts nothing and writes its line;
-- an NPC↔NPC exchange settles by the cap, a note or an end, each leaving a conclusion;
+- a `reflect` posts nothing and writes its line;
+- an NPC↔NPC exchange settles by the cap, a `reflect` or a `sign_off`, each leaving a line;
 - two NPCs in one room with no visitor exchange messages, never `tell`;
 - a Commit lands on the mission and the main loop's next turn reflects it;
 - `nvidia-smi` shows no slot held by a parked conversation.
