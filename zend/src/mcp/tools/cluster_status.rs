@@ -145,11 +145,13 @@ pub fn render_members(envelope: &Value, now: u64) -> String {
             ));
             continue;
         }
-        let mut line = format!(
-            "\n- {host} {node} build {}: {}",
-            build_of(&body, "build").as_deref().unwrap_or("?"),
-            str_of(&body, "state")
-        );
+        // The release build is the cluster block's; the top-level `build` is
+        // the UI's reload hash. A member outside any cluster has no block.
+        let build = body
+            .get("cluster")
+            .and_then(|c| build_of(c, "build"))
+            .map_or_else(String::new, |b| format!(" build {b}"));
+        let mut line = format!("\n- {host} {node}{build}: {}", str_of(&body, "state"));
         if let Some(d) = body
             .get("detail")
             .and_then(Value::as_str)
@@ -537,9 +539,10 @@ mod tests {
         let envelope = json!({
             "members": [
                 {"node": "00000000000000ab", "host": "blackworld", "status": 200, "body": {
-                    "state": "ready", "build": {"count": 5739, "hash": "c544", "local": ""}, "detail": "",
+                    "state": "ready", "build": "0123456789abcdef", "detail": "",
                     "started_at_ms": NOW - 7_200_000,
-                    "tenants": {"npcd": {"state": "ready"}, "zend": {"state": "loading"}}
+                    "tenants": {"npcd": {"state": "ready"}, "zend": {"state": "loading"}},
+                    "cluster": {"build": {"count": 5739, "hash": "c544", "local": ""}, "apps": {}}
                 }},
                 {"node": "00000000000000cd", "host": "whiteworld", "status": 504, "error": "deadline"}
             ],
@@ -552,6 +555,26 @@ mod tests {
              npcd ready, zend loading\n\
              - whiteworld 00000000000000cd: no answer (504 deadline)\n\
              group: {\"members\":2}"
+        );
+    }
+
+    /// **A member's build is its cluster block's**, never the top-level
+    /// `build`, which is the UI's reload hash; a member outside any cluster
+    /// names none.
+    #[test]
+    fn a_members_build_is_its_cluster_blocks() {
+        let envelope = json!({"members": [
+            {"node": "01", "host": "bw", "status": 200, "body": {
+                "state": "ready", "build": "0123456789abcdef",
+                "cluster": {"build": {"count": 4785, "hash": "1c17aadd0", "local": "9f"}, "apps": {}}}},
+            {"node": "02", "host": "ww", "status": 200, "body": {
+                "state": "ready", "build": "0123456789abcdef", "cluster": null}}
+        ]});
+        assert_eq!(
+            render_members(&envelope, NOW),
+            "Members answering /v1/status: 2\n\
+             - bw 01 build 4785-1c17aadd0 (local): ready\n\
+             - ww 02: ready"
         );
     }
 
@@ -695,9 +718,9 @@ mod tests {
     /// A member's `/v1/status` body as it writes its apps' replication.
     fn member_body(zend_phase: &str, zend_link: &str) -> Value {
         json!({
-            "state": "ready", "build": {"count": 4419, "hash": "6ecd6158", "local": ""},
+            "state": "ready", "build": "0123456789abcdef",
             "detail": "", "started_at_ms": NOW - 60_000,
-            "cluster": {"apps": {
+            "cluster": {"build": {"count": 4419, "hash": "6ecd6158", "local": ""}, "apps": {
                 "npcd": {"link": "joined", "replication": {"phase": "joined", "generation": 64,
                          "unsent": 0, "catchups": []}},
                 "zend": {"link": zend_link, "replication": {"phase": zend_phase, "generation": 64,
