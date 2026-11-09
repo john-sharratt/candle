@@ -68,7 +68,7 @@ use std::sync::OnceLock;
 
 use ahash::{AHashMap, AHashSet};
 use candle_nn::kv_cache::{rewrite_sealed, FormatCensus, QuantFormat, SealedSequence, Sweep};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -7169,6 +7169,37 @@ impl Substrate {
             .collect()
     }
 
+    /// The live timelines whose `custom[key]` is each of `values`, in one pass:
+    /// [`Self::timelines_with_metadata`] for many values at once. A value no
+    /// live timeline carries is absent from the map.
+    pub fn timelines_with_metadata_values(
+        &self,
+        key: &str,
+        values: &BTreeSet<String>,
+    ) -> BTreeMap<String, Vec<TimelineId>> {
+        let mut out: BTreeMap<String, Vec<TimelineId>> = BTreeMap::new();
+        for (tid, tl) in self.timelines.iter() {
+            if self.tombstoned_timelines.contains(tid) {
+                continue;
+            }
+            if let Some(v) = tl.custom.get(key).filter(|v| values.contains(*v)) {
+                out.entry(v.clone()).or_default().push(*tid);
+            }
+        }
+        out
+    }
+
+    /// Whether a live timeline whose own K/V is intact carries `custom[key] ==
+    /// value` — [`Self::metadata_values_for_key`]'s membership for one value,
+    /// stopping at the first match.
+    pub fn has_live_intact_metadata(&self, key: &str, value: &str) -> bool {
+        self.timelines.iter().any(|(tid, tl)| {
+            tl.custom.get(key).map(|v| v.as_str()) == Some(value)
+                && !self.tombstoned_timelines.contains(tid)
+                && self.timeline_kv_intact(*tid)
+        })
+    }
+
     /// The set of distinct `custom[key]` values across all **live**
     /// (non-tombstoned) timelines whose own K/V is intact. A one-pass snapshot
     /// so callers can probe membership in O(1) instead of an O(timelines) scan
@@ -8201,6 +8232,7 @@ mod tests {
     use crate::projection::{
         GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId,
     };
+    use crate::recovered::recovered_from;
     use crate::token_buffer::TokenBuffer;
 
     /// Blob writes for tests about what the substrate does with the bytes,
@@ -8299,6 +8331,56 @@ mod tests {
     // ── retrieval scope ─────────────────────────────────────────────────────
 
     /// Two targets and three ingest conversations in one group.
+    /// Three timelines carrying `key`: live `a`, live `b`, tombstoned `a`.
+    fn metadata_fixture() -> (Substrate, [TimelineId; 3]) {
+        let alloc = TimelineAllocator::new();
+        let mut sub = Substrate::new();
+        let tls = [alloc.next(), alloc.next(), alloc.next()];
+        for (tl, value) in tls.iter().zip(["a", "b", "a"]) {
+            sub.register_timeline(*tl, LayerId::for_test(1), GroupId::for_test(1));
+            arc_mut(&mut sub.timelines, tl)
+                .unwrap()
+                .custom
+                .insert("key".into(), value.into());
+        }
+        sub.tombstoned_timelines.insert(tls[2]);
+        (sub, tls)
+    }
+
+    /// **Many values are looked up in one pass**: each value maps to its live
+    /// timelines, a tombstoned one is not among them, and a value nothing
+    /// carries is absent.
+    #[test]
+    fn many_metadata_values_are_found_in_one_pass() {
+        let (sub, [tl1, tl2, _]) = metadata_fixture();
+        let asked = BTreeSet::from(["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            sub.timelines_with_metadata_values("key", &asked),
+            BTreeMap::from([("a".to_string(), vec![tl1]), ("b".to_string(), vec![tl2])])
+        );
+    }
+
+    /// **One value's membership stops at its first live, intact match**: a
+    /// value carried only by a tombstoned timeline is not there.
+    #[test]
+    fn one_metadata_value_is_probed_by_its_first_match() {
+        let (mut sub, [tl1, _, _]) = metadata_fixture();
+        assert!(sub.has_live_intact_metadata("key", "b"));
+        assert!(!sub.has_live_intact_metadata("key", "c"));
+        arc_mut(&mut sub.timelines, &tl1)
+            .unwrap()
+            .custom
+            .insert("key".into(), "z".into());
+        assert!(
+            !sub.has_live_intact_metadata("key", "a"),
+            "only the tombstoned timeline carries `a` now"
+        );
+        assert_eq!(
+            sub.has_live_intact_metadata("key", "b"),
+            sub.metadata_values_for_key("key").contains("b")
+        );
+    }
+
     fn scope_fixture() -> (Substrate, GroupId, [TimelineId; 2], [TimelineId; 3]) {
         let layer = LayerId::for_test(1);
         let group = GroupId::for_test(1);
@@ -9209,6 +9291,59 @@ mod tests {
             "a durable conversation must keep its snapshot: it is what restart \
              and fork-resume read"
         );
+    }
+
+    /// A sealed turn of `timeline` holding `user` and `assistant` text.
+    fn seal_text_turn(sub: &mut Substrate, timeline: TimelineId, user: &str, assistant: &str) {
+        let migrate = |_input: &[SealedSequence]| -> candle::Result<Vec<SealedSequence>> {
+            Ok(vec![minimal_sealed_layer(), minimal_sealed_layer()])
+        };
+        let write = TurnPartWrite {
+            layout: TurnLayout::from_flat_grid(
+                0,
+                0,
+                0,
+                3,
+                0,
+                0,
+                user.to_string(),
+                Some(assistant.to_string()),
+                false,
+            ),
+            token_count: 3,
+            block_end: 1,
+            sealed_gpu: Some(Arc::new(vec![])),
+            ..Default::default()
+        };
+        sub.append_complete(timeline, write, migrate).unwrap();
+    }
+
+    /// **A history read from a turn reads only from it on**: of three turns,
+    /// reading from turn 1 gives exactly turns 1's and 2's bubbles.
+    #[test]
+    fn a_history_from_a_turn_holds_only_the_turns_from_it() {
+        let alloc = TimelineAllocator::new();
+        let tl = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(tl, LayerId::for_test(1), GroupId::for_test(1));
+        for n in 0..3 {
+            seal_text_turn(
+                &mut sub,
+                tl,
+                &format!("asked {n}"),
+                &format!("answered {n}"),
+            );
+        }
+        let got: Vec<(u32, String)> = recovered_from(&sub, tl, false, 1, |_| 0, &[])
+            .into_iter()
+            .map(|m| (m.turn, m.text))
+            .collect();
+        let want: Vec<(u32, String)> = [1, 2]
+            .into_iter()
+            .flat_map(|n| [(n, format!("asked {n}")), (n, format!("answered {n}"))])
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(recovered_from(&sub, tl, false, 0, |_| 0, &[]).len(), 6);
     }
 
     /// A transient (scratch-fork) timeline's turns are flagged `no_cold_persist`

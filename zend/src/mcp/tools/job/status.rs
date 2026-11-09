@@ -3,12 +3,14 @@
 //! starts every job first and waits on them together; each step is said on the
 //! call's progress while it waits.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio::time::Instant;
 
 use super::source::standing;
-use super::{pages, JobHandle, Standing, LOOK_EVERY};
+use super::wait::wait_on;
+use super::{pages, JobHandle, Standing};
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::tools::{Answer, Ctx};
 
@@ -118,25 +120,23 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let (secs, asked) = call.wait_of(args, DEFAULT_WAIT_S);
     let until = Instant::now() + Duration::from_secs(secs);
     let mut said: Vec<String> = vec![String::new(); jobs.len()];
-    let standings = loop {
-        let mut now: Vec<Result<Standing, String>> = Vec::with_capacity(jobs.len());
-        for j in &jobs {
-            now.push(standing(call, j).await);
-        }
-        let any_ended = now.iter().any(|s| s.as_ref().map_or(true, |s| s.ended));
-        if any_ended || Instant::now() >= until {
-            break now;
-        }
-        for (i, s) in now.iter().enumerate() {
-            if let Ok(s) = s {
-                if s.line != said[i] {
-                    call.say(s.line.clone());
-                    said[i] = s.line.clone();
-                }
+    // Subscribed before the first look, so a task's change between the look
+    // and the wait still wakes it.
+    let wake = call.session.mcp().watch();
+    let standings = wait_on(
+        jobs.len(),
+        |i| matches!(jobs[i], JobHandle::Task { .. }),
+        until,
+        |i| standing(call, &jobs[i]),
+        Some(wake),
+        |i, s| {
+            if s.line != said[i] {
+                call.say(s.line.clone());
+                said[i] = s.line.clone();
             }
-        }
-        tokio::time::sleep(LOOK_EVERY.min(until.saturating_duration_since(Instant::now()))).await;
-    };
+        },
+    )
+    .await;
     let mut blocks = Vec::new();
     let mut marks = Vec::new();
     let mut running = Vec::new();
@@ -215,6 +215,7 @@ mod tests {
             line: "build:00000000000000ab:XeV_I_QPzpg on BlackWorld: exited 0".into(),
             detail: "\ntest results:\n  9: test result: ok".into(),
             total: 450,
+            size: 9_000,
             marks: Vec::new(),
         };
         assert_eq!(

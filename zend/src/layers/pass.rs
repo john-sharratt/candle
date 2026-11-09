@@ -349,9 +349,7 @@ fn settle(engine: &ConversationEngine, spec: &LayerSpec, below: &[Below], ground
 /// Whether `timeline` carries a content key — committed, so a stopped chain
 /// and not a unit another member is reading.
 fn is_keyed(engine: &ConversationEngine, timeline: TimelineId) -> bool {
-    engine
-        .conversation_metadata(timeline)
-        .is_some_and(|m| m.contains_key(super::keys::CONTENT_KEY))
+    engine.has_conversation_metadata_key(timeline, super::keys::CONTENT_KEY)
 }
 
 /// What stands in the layer, as the layer above builds on it: each held

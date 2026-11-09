@@ -122,8 +122,9 @@ pub fn retire_finished(engine: &ConversationEngine) -> usize {
 
 fn kind_is(engine: &ConversationEngine, timeline: TimelineId, kind: &str) -> bool {
     engine
-        .conversation_metadata(timeline)
-        .is_some_and(|m| m.get("kind").map(String::as_str) == Some(kind))
+        .conversation_metadata_value(timeline, "kind")
+        .as_deref()
+        == Some(kind)
 }
 
 #[cfg(test)]

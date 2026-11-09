@@ -117,7 +117,7 @@ use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
 use crate::journal::desk::{Asking, Compile, Record, ZendDesk, FOLD_TOKENS, WRITE_TOKENS};
 use crate::journal::notes::JOURNAL_NOTE_TOOL;
-use crate::journal::record::{kept_in, metadata_of};
+use crate::journal::record::{kept_in, metadata_of, KEY as JOURNAL_KEY};
 use crate::journal::registry::{Journals, Open};
 use crate::journal::shelf::{Above, Drafted, Lazy, Notes, Shelf};
 use crate::journal::state::{SessionJournal, FOLD_SWEEP_EVERY};
@@ -425,7 +425,7 @@ const TURN_ERROR_PREFIX: &str = "turn_error.";
 
 /// Every failed turn's error in a conversation's metadata, by turn index. A key
 /// whose suffix is not a turn index is not one of these.
-fn turn_errors(meta: &BTreeMap<String, String>) -> BTreeMap<u32, String> {
+fn turn_errors(meta: &POrdMap<String, String>) -> BTreeMap<u32, String> {
     meta.iter()
         .filter_map(|(k, v)| {
             let turn = k.strip_prefix(TURN_ERROR_PREFIX)?.parse().ok()?;
@@ -4100,8 +4100,7 @@ fn run_inference_stream(
         // keeps its in-memory identity.
         let stored_identity = state
             .engine
-            .conversation_metadata(timeline)
-            .and_then(|m| m.get("identity").cloned());
+            .conversation_metadata_value(timeline, "identity");
         // What the fork that mints this conversation hands back beside it: the
         // per-conversation exclusivity guard, and the file stores and mirror
         // that are restored from its events once it is open.
@@ -4362,8 +4361,12 @@ fn run_inference_stream(
         {
             let dials = dials_metadata(&selection, tools_mode);
             let engine = &state.engine;
-            let stored = engine.conversation_metadata(timeline).unwrap_or_default();
-            if dials.iter().any(|(k, v)| stored.get(k) != Some(v)) {
+            let differs = engine
+                .conversation_metadata_with(timeline, |stored| {
+                    dials.iter().any(|(k, v)| stored.get(k) != Some(v))
+                })
+                .unwrap_or(!dials.is_empty());
+            if differs {
                 if let Err(e) = engine.set_conversation_metadata_many(timeline, &dials) {
                     tracing::warn!(conv_id = %conv_id, "persist dials failed: {e}");
                 }
@@ -5470,10 +5473,7 @@ async fn withhold_read_files(
     let state = Arc::clone(state);
     let files = Arc::clone(files);
     if let Err(e) = tokio::task::spawn_blocking(move || {
-        let readings: Vec<TimelineId> = read
-            .iter()
-            .flat_map(|call| corpus::readings_of(&state.engine, &files, &state.workspace, call))
-            .collect();
+        let readings = corpus::readings_of_all(&state.engine, &files, &state.workspace, &read);
         state.engine.working_set_withhold(timeline, &readings);
     })
     .await
@@ -5600,8 +5600,12 @@ fn calibrate_guidance_reads(
 
 /// The journal `timeline`'s metadata records, if it records one.
 fn journal_record(state: &InferenceState, timeline: TimelineId) -> Option<Kept> {
-    let metadata = state.engine.conversation_metadata(timeline)?;
-    kept_in(&metadata)
+    kept_in(
+        state
+            .engine
+            .conversation_metadata_value(timeline, JOURNAL_KEY)
+            .as_deref(),
+    )
 }
 
 /// Bring the conversation's journal sections in line with its journal, and pin
@@ -5861,7 +5865,12 @@ fn begin_journal_draft(
         }
         held.journal().covered_to()
     };
-    let history = state.base_conv.recovered_history(timeline, false);
+    // Only the turns not yet covered: the covered part's own turn is read
+    // again, since its reply half may not be covered yet.
+    let from = origin::turn_of(covered).unwrap_or(0);
+    let history = state
+        .base_conv
+        .recovered_history_from(timeline, false, from);
     let newest = match cadence {
         Cadence::Due { newest, .. } => newest,
         Cadence::Now => history
@@ -8022,53 +8031,54 @@ impl ZendSession {
             return BTreeMap::new();
         };
         let timeline = conversation_timeline(conv_id);
-        let meta = state
+        state
             .engine
-            .conversation_metadata(timeline)
-            .unwrap_or_default();
-        turn_errors(&meta)
+            .conversation_metadata_with(timeline, turn_errors)
+            .unwrap_or_default()
     }
 
     pub fn conversation_dials(&self, conv_id: &str) -> Option<ConversationDials> {
         let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
-        let meta = state.engine.conversation_metadata(timeline)?;
-        let level = |key: &str, options: &[&str]| -> Option<u8> {
-            let id = meta.get(key)?;
-            options.iter().position(|o| o == id).map(|i| i as u8)
+        let dials = |meta: &POrdMap<String, String>| -> Option<ConversationDials> {
+            let level = |key: &str, options: &[&str]| -> Option<u8> {
+                let id = meta.get(key)?;
+                options.iter().position(|o| o == id).map(|i| i as u8)
+            };
+            let effort = level(DIAL_EFFORT_KEY, &EFFORT_OPTIONS);
+            let verbosity = level(DIAL_LENGTH_KEY, &RESPONSE_LENGTH_OPTIONS);
+            let tool_ids = ToolMode::ALL.map(ToolMode::id);
+            let tools = level(DIAL_TOOLS_KEY, &tool_ids);
+            let think = meta.get(DIAL_THINK_KEY).map(|v| v != "off");
+            // Nothing recorded at all: the conversation predates the dial record, or
+            // has never taken a turn. Say so rather than inventing levels.
+            //
+            // The test is whether any dial key is present, NOT whether effort parses
+            // to a level. `dials_metadata` writes all four keys on every turn and
+            // stores `""` for a selector the turn left unset, so a request carrying
+            // a tools dial but no thinking effort records `dial_effort = ""` — a
+            // record that plainly exists while parsing to no level. Gating on effort
+            // dropped the whole record there, and a resumed turn then ran the
+            // defaults rather than the tools mode the conversation was held at.
+            let recorded = [
+                DIAL_EFFORT_KEY,
+                DIAL_LENGTH_KEY,
+                DIAL_THINK_KEY,
+                DIAL_TOOLS_KEY,
+            ]
+            .iter()
+            .any(|key| meta.contains_key(*key));
+            if !recorded {
+                return None;
+            }
+            Some(ConversationDials {
+                effort: effort.unwrap_or(2),
+                verbosity: verbosity.unwrap_or(2),
+                think: think.unwrap_or(true),
+                tools: tools.unwrap_or(ToolMode::Comprehensive.level()),
+            })
         };
-        let effort = level(DIAL_EFFORT_KEY, &EFFORT_OPTIONS);
-        let verbosity = level(DIAL_LENGTH_KEY, &RESPONSE_LENGTH_OPTIONS);
-        let tool_ids = ToolMode::ALL.map(ToolMode::id);
-        let tools = level(DIAL_TOOLS_KEY, &tool_ids);
-        let think = meta.get(DIAL_THINK_KEY).map(|v| v != "off");
-        // Nothing recorded at all: the conversation predates the dial record, or
-        // has never taken a turn. Say so rather than inventing levels.
-        //
-        // The test is whether any dial key is present, NOT whether effort parses
-        // to a level. `dials_metadata` writes all four keys on every turn and
-        // stores `""` for a selector the turn left unset, so a request carrying
-        // a tools dial but no thinking effort records `dial_effort = ""` — a
-        // record that plainly exists while parsing to no level. Gating on effort
-        // dropped the whole record there, and a resumed turn then ran the
-        // defaults rather than the tools mode the conversation was held at.
-        let recorded = [
-            DIAL_EFFORT_KEY,
-            DIAL_LENGTH_KEY,
-            DIAL_THINK_KEY,
-            DIAL_TOOLS_KEY,
-        ]
-        .iter()
-        .any(|key| meta.contains_key(*key));
-        if !recorded {
-            return None;
-        }
-        Some(ConversationDials {
-            effort: effort.unwrap_or(2),
-            verbosity: verbosity.unwrap_or(2),
-            think: think.unwrap_or(true),
-            tools: tools.unwrap_or(ToolMode::Comprehensive.level()),
-        })
+        state.engine.conversation_metadata_with(timeline, dials)?
     }
 
     /// The conversation's sidebar title — the titler's label, or the one an
@@ -8079,6 +8089,18 @@ impl ZendSession {
         let timeline = passthrough::timeline_of(conv_id).unwrap_or_else(|| timeline_for(conv_id));
         let label = state.engine.conversation_label_of(timeline)?;
         (!label.is_empty()).then_some(label)
+    }
+
+    /// How many turns the conversation holds, read from the substrate's
+    /// snapshot — `0` when the model isn't loaded or the conversation is
+    /// unknown. What a job's view and the conversation's history both answer,
+    /// so a page that fetched one knows when the other has moved.
+    pub fn conversation_turn_count(&self, conv_id: &str) -> u32 {
+        let Some(state) = self.inference.load_full() else {
+            return 0;
+        };
+        let timeline = passthrough::timeline_of(conv_id).unwrap_or_else(|| timeline_for(conv_id));
+        state.engine.conversation().read().turn_count_of(timeline)
     }
 
     /// The branch the conversation works on in each repository, by repository
@@ -8191,8 +8213,7 @@ impl ZendSession {
         let timeline = timeline_for(conv_id);
         let engine = &state.engine;
         engine
-            .conversation_metadata(timeline)
-            .and_then(|m| m.get("uploads").cloned())
+            .conversation_metadata_value(timeline, "uploads")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }

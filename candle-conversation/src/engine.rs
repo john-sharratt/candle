@@ -38,6 +38,7 @@ use crate::tenant_rank::TenantRank;
 use heap_census::{set_thread, Scope};
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
 // disconnected, so nothing constructs a runner.
+use crate::substrate::pcoll::POrdMap;
 use crate::substrate::{ConvCompression, Substrate};
 use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
@@ -51,7 +52,7 @@ use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use candle_transformers::models::delta_net::release_seal_readback;
 use flume::{Receiver, Sender};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1281,6 +1282,45 @@ impl ConversationEngine {
     /// load to skip rebuilding units already present (tombstoned excluded).
     pub fn find_conversations_by_metadata(&self, key: &str, value: &str) -> Vec<TimelineId> {
         self.conversation.find_timelines_by_metadata(key, value)
+    }
+
+    /// [`Self::find_conversations_by_metadata`] for many values in one pass: a
+    /// value no live conversation carries is absent from the map.
+    pub fn find_conversations_by_metadata_values(
+        &self,
+        key: &str,
+        values: &BTreeSet<String>,
+    ) -> BTreeMap<String, Vec<TimelineId>> {
+        self.conversation
+            .find_timelines_by_metadata_values(key, values)
+    }
+
+    /// Whether a live conversation whose K/V is intact carries `key ==
+    /// value` — one membership of [`Self::conversation_metadata_values`],
+    /// stopping at the first match.
+    pub fn has_live_intact_metadata(&self, key: &str, value: &str) -> bool {
+        self.conversation.has_live_intact_metadata(key, value)
+    }
+
+    /// One value of `timeline`'s metadata, without copying the bag.
+    pub fn conversation_metadata_value(&self, timeline: TimelineId, key: &str) -> Option<String> {
+        self.conversation.conversation_metadata_value(timeline, key)
+    }
+
+    /// Whether `timeline`'s metadata holds `key`.
+    pub fn has_conversation_metadata_key(&self, timeline: TimelineId, key: &str) -> bool {
+        self.conversation
+            .has_conversation_metadata_key(timeline, key)
+    }
+
+    /// `f` over `timeline`'s metadata, read in place — for a reader of
+    /// several keys.
+    pub fn conversation_metadata_with<T>(
+        &self,
+        timeline: TimelineId,
+        f: impl FnOnce(&POrdMap<String, String>) -> T,
+    ) -> Option<T> {
+        self.conversation.conversation_metadata_with(timeline, f)
     }
 
     /// Whether every turn of `timeline` holds its content, so the conversation

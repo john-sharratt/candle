@@ -33,16 +33,45 @@ pub fn owner_of(conv_id: &str) -> Option<&str> {
     rest.split_once(':').map(|(owner, _)| owner)
 }
 
+/// Who is asking, resolved once — what deciding which conversations they may
+/// open needs of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Viewer {
+    /// Nobody the headers identify.
+    Nobody,
+    /// An Admin, or above: every conversation.
+    Admin,
+    /// Anyone else, by their key: the conversations `/mcp` started for them.
+    Person(String),
+}
+
+impl Viewer {
+    /// The caller `headers` name, as the role table ranks them.
+    pub fn of(headers: &HeaderMap, roles: &Roles) -> Viewer {
+        let Ok(identity) = identify(headers) else {
+            return Viewer::Nobody;
+        };
+        let person = Person::of(&identity);
+        if person.role(roles).at_least(Role::Admin) {
+            Viewer::Admin
+        } else {
+            Viewer::Person(person.key())
+        }
+    }
+
+    /// Whether this viewer may open `conv_id`.
+    pub fn may_open(&self, conv_id: &str) -> bool {
+        match self {
+            Viewer::Nobody => false,
+            Viewer::Admin => true,
+            Viewer::Person(key) => owner_of(conv_id) == Some(key.as_str()),
+        }
+    }
+}
+
 /// Whether the caller `headers` name may open `conv_id`.
 pub fn may_open(conv_id: &str, headers: &HeaderMap, roles: &Roles) -> bool {
-    let Ok(identity) = identify(headers) else {
-        return false;
-    };
-    let person = Person::of(&identity);
-    if person.role(roles).at_least(Role::Admin) {
-        return true;
-    }
-    owner_of(conv_id).is_some_and(|owner| person.key() == owner)
+    Viewer::of(headers, roles).may_open(conv_id)
 }
 
 /// `%XX` escapes in a path segment, decoded; a malformed escape is kept as
@@ -167,6 +196,28 @@ mod tests {
         assert!(may_open("c-123", &as_person("boss"), &roles));
         assert!(!may_open("c-123", &as_person("alice"), &roles));
         assert!(!may_open("c-123", &HeaderMap::new(), &roles));
+    }
+
+    /// **A viewer is resolved once and answers every row**: a person opens
+    /// their own `mcp:` conversation and not another's, an Admin both, and
+    /// nobody neither.
+    #[test]
+    fn a_viewer_opens_what_the_rule_gives_them() {
+        let roles: Roles = serde_yaml::from_str(
+            "people:\n  - sub: boss\n    role: admin\n  - sub: alice\n    role: user\n",
+        )
+        .unwrap();
+        let alices = format!("mcp:{}:review/verify", key("alice"));
+        let others = format!("mcp:{}:review/verify", key("mallory"));
+        let alice = Viewer::of(&as_person("alice"), &roles);
+        assert_eq!(alice, Viewer::Person(key("alice")));
+        assert!(alice.may_open(&alices) && !alice.may_open(&others));
+        let boss = Viewer::of(&as_person("boss"), &roles);
+        assert_eq!(boss, Viewer::Admin);
+        assert!(boss.may_open(&alices) && boss.may_open(&others));
+        let nobody = Viewer::of(&HeaderMap::new(), &roles);
+        assert_eq!(nobody, Viewer::Nobody);
+        assert!(!nobody.may_open(&alices) && !nobody.may_open(&others));
     }
 
     #[test]

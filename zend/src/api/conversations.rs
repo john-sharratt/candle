@@ -18,8 +18,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::Response,
-    Json,
+    response::{IntoResponse, Response},
 };
 use candle_conversation::turn_layout::ThinkingLength;
 use candle_conversation::{RecoveredMessage, Role as TurnRole};
@@ -29,7 +28,7 @@ use serde_json::Value;
 use super::chat;
 use super::compressed;
 use crate::chatml::split_turn;
-use crate::mcp::ownership;
+use crate::mcp::ownership::Viewer;
 use crate::parts::{parts_of, Part};
 use crate::projection_event::ProjectionSpanOut;
 use crate::session::{ConvEntry, ConversationDials, UploadInfo, UploadStats, ZendSession};
@@ -46,19 +45,43 @@ pub struct ListQuery {
     pub include_archived: bool,
 }
 
+/// Run `answer` on the blocking pool: reading a conversation back, encoding it
+/// and gzipping it are tens of milliseconds for a long one, and the runtime's
+/// threads are the ones `/mcp` answers on.
+async fn off_runtime(answer: impl FnOnce() -> Response + Send + 'static) -> Response {
+    tokio::task::spawn_blocking(answer)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("a conversations reply panicked: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })
+}
+
 pub async fn list(
     State(session): State<Arc<ZendSession>>,
     headers: HeaderMap,
     Query(q): Query<ListQuery>,
-) -> Json<ListBody> {
-    // A worker `/mcp` started is listed to its owner and an Admin alone
-    // (`crate::mcp::ownership`).
-    let conversations = session
-        .list_conversations(q.include_archived)
+) -> Response {
+    off_runtime(move || {
+        let viewer = Viewer::of(&headers, session.roles());
+        list_response(
+            session.list_conversations(q.include_archived),
+            &viewer,
+            &headers,
+        )
+    })
+    .await
+}
+
+/// The listing of `rows` that `viewer` may open — a worker `/mcp` started is
+/// listed to its owner and an Admin alone (`crate::mcp::ownership`) —
+/// compressed for a client that takes it, and never cached.
+pub fn list_response(rows: Vec<ConvEntry>, viewer: &Viewer, headers: &HeaderMap) -> Response {
+    let conversations = rows
         .into_iter()
-        .filter(|c| ownership::may_open(&c.id, &headers, session.roles()))
+        .filter(|c| viewer.may_open(&c.id))
         .collect();
-    Json(ListBody { conversations })
+    compressed::json(&ListBody { conversations }, headers)
 }
 
 pub async fn archive(
@@ -109,6 +132,18 @@ pub async fn get(
     State(session): State<Arc<ZendSession>>,
     Path(id): Path<String>,
     headers: HeaderMap,
+) -> Response {
+    off_runtime(move || {
+        history_response(&session, id, &headers).unwrap_or_else(IntoResponse::into_response)
+    })
+    .await
+}
+
+/// The conversation `id`'s history, as `GET` answers it.
+fn history_response(
+    session: &ZendSession,
+    id: String,
+    headers: &HeaderMap,
 ) -> Result<Response, StatusCode> {
     // Read before the history: a turn that finishes in between is then stored
     // in full and the client's follow finds nothing to follow, rather than the
@@ -251,6 +286,7 @@ pub async fn get(
     let title = session.conversation_label(&id);
     let branches = session.conversation_branches(&id);
     let dials = session.conversation_dials(&id);
+    let turns = session.conversation_turn_count(&id);
     Ok(compressed::json(
         &HistoryBody {
             id,
@@ -260,8 +296,9 @@ pub async fn get(
             uploads,
             dials,
             live: live.is_some(),
+            turns,
         },
-        &headers,
+        headers,
     ))
 }
 
@@ -365,6 +402,9 @@ pub struct HistoryBody {
     /// whole reply, from its start, until it ends.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub live: bool,
+    /// How many turns the conversation holds — what a job's view of the task
+    /// running in it says too, so the page knows when its copy is behind.
+    pub turns: u32,
 }
 
 #[derive(Serialize)]
@@ -509,6 +549,71 @@ mod tests {
         let mut ok = vec![bubble("assistant", "an answer")];
         attach_turn_error(&mut ok, None);
         assert_eq!(ok[0].error, None);
+    }
+
+    fn rows() -> Vec<ConvEntry> {
+        (0..12)
+            .map(|i| ConvEntry {
+                id: format!("c-{i:02}"),
+                label: format!("a conversation about the moon, number {i:02}"),
+                turn_count: i,
+                archived: false,
+                updated_ms: 100 + i as u64,
+            })
+            .collect()
+    }
+
+    /// The listing's exact bytes for an Admin: every row, in order.
+    fn listed() -> Vec<u8> {
+        let rows: Vec<String> = (0..12)
+            .map(|i| {
+                format!(
+                    "{{\"id\":\"c-{i:02}\",\"label\":\"a conversation about the moon, number \
+                     {i:02}\",\"turn_count\":{i},\"archived\":false,\"updated_ms\":{}}}",
+                    100 + i
+                )
+            })
+            .collect();
+        format!("{{\"conversations\":[{}]}}", rows.join(",")).into_bytes()
+    }
+
+    async fn body(res: Response) -> Vec<u8> {
+        axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// **The list goes out gzipped to a client that takes it**, never
+    /// cached, inflating to the exact listing — and as those bytes to one that
+    /// does not; a viewer is shown only what they may open.
+    #[tokio::test]
+    async fn the_list_is_compressed_and_never_cached() {
+        use std::io::Read;
+
+        use axum::http::{header, HeaderValue};
+        use flate2::read::GzDecoder;
+
+        let want = listed();
+        assert!(want.len() >= 860, "{}", want.len());
+        let mut gzip = HeaderMap::new();
+        gzip.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        let res = list_response(rows(), &Viewer::Admin, &gzip);
+        assert_eq!(res.headers()[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(res.headers()[header::VARY], "accept-encoding");
+        let mut inflated = Vec::new();
+        GzDecoder::new(&body(res).await[..])
+            .read_to_end(&mut inflated)
+            .unwrap();
+        assert_eq!(inflated, want);
+
+        let plain = list_response(rows(), &Viewer::Admin, &HeaderMap::new());
+        assert!(plain.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(body(plain).await, want);
+
+        let none = list_response(rows(), &Viewer::Nobody, &HeaderMap::new());
+        assert_eq!(body(none).await, b"{\"conversations\":[]}");
     }
 
     /// The reply's sealed rounds go, and the count says how many of them were

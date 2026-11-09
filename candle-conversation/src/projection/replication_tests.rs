@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 use tempfile::TempDir;
 
-use super::{Conversation, GroupId, LayerId};
+use super::{Conversation, GroupId, LayerId, TimelineId};
 use crate::persistence::identity::GEN_DETACHED;
 use crate::persistence::record::{decode_header, RecordType};
 use crate::persistence::SubstratePersistence;
@@ -103,6 +103,39 @@ fn an_edit_of_a_field_written_cut_off_returns() {
         conv.conversation_metadata_value(timeline, "forked_from"),
         Some(String::new())
     );
+}
+
+/// **One key is read in place**: its value for a present key, `None` for an
+/// absent one and for an unregistered timeline, and a reader of several keys
+/// sees exactly the keys set.
+#[test]
+fn one_metadata_key_is_read_without_the_bag() {
+    let dir = TempDir::new().unwrap();
+    let conv = open(&dir);
+    let timeline = conv.mint_timeline(LayerId::new(1), GroupId::new(1));
+    conv.set_conversation_metadata(timeline, "a", "1").unwrap();
+    conv.set_conversation_metadata(timeline, "b", "2").unwrap();
+    assert_eq!(
+        conv.conversation_metadata_value(timeline, "a"),
+        Some("1".to_string())
+    );
+    assert_eq!(conv.conversation_metadata_value(timeline, "c"), None);
+    assert!(conv.has_conversation_metadata_key(timeline, "b"));
+    assert!(!conv.has_conversation_metadata_key(timeline, "c"));
+    let never = TimelineId::from_raw(timeline.raw() + 1_000).unwrap();
+    assert_eq!(conv.conversation_metadata_value(never, "a"), None);
+    assert!(!conv.has_conversation_metadata_key(never, "a"));
+    assert_eq!(
+        conv.conversation_metadata_with(timeline, |m| m
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>()),
+        Some(vec![
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string())
+        ])
+    );
+    assert_eq!(conv.conversation_metadata_with(never, |m| m.len()), None);
 }
 
 /// A write through the writer thread is in the log, and tapped, once its

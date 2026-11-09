@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use crate::mcp::caller::Caller;
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::threads;
-use crate::mcp::tools::job::{source, JobHandle};
+use crate::mcp::tools::job::{source, JobHandle, Standing};
 use crate::session::ZendSession;
 
 /// The most lines a range answers.
@@ -104,14 +104,35 @@ pub async fn view(
             .map(|c| threads::conv_id(&c.key(), thread, name)),
         _ => None,
     };
-    Ok(Json(json!({
+    let turns = conversation
+        .as_deref()
+        .map(|id| session.conversation_turn_count(id));
+    Ok(Json(view_body(&job, &standing, conversation, turns)))
+}
+
+/// A job's view: its kind, whether it ended, its line, how long its output
+/// is in lines and bytes, and for a task the conversation its worker runs in
+/// with how many turns it holds — what the page compares to decide what to
+/// read again.
+pub fn view_body(
+    job: &JobHandle,
+    standing: &Standing,
+    conversation: Option<String>,
+    turns: Option<u32>,
+) -> Value {
+    let mut body = json!({
         "handle": job.to_string(),
         "kind": job.kind(),
         "ended": standing.ended,
         "line": standing.line,
         "total": standing.total,
+        "size": standing.size,
         "conversation": conversation,
-    })))
+    });
+    if let Some(turns) = turns {
+        body["turns"] = json!(turns);
+    }
+    body
 }
 
 pub async fn lines(
@@ -133,6 +154,55 @@ pub async fn lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn standing(ended: bool, total: u64, size: u64) -> Standing {
+        Standing {
+            ended,
+            line: "it stands".into(),
+            detail: String::new(),
+            total,
+            size,
+            marks: Vec::new(),
+        }
+    }
+
+    /// **A view answers its output's lines and bytes, and a task's turns**,
+    /// each exactly.
+    #[test]
+    fn a_view_answers_what_the_page_compares() {
+        let task = JobHandle::parse("task:review/verify").unwrap();
+        assert_eq!(
+            view_body(
+                &task,
+                &standing(false, 12, 480),
+                Some("mcp:k:review/verify".into()),
+                Some(4)
+            ),
+            json!({
+                "handle": "task:review/verify",
+                "kind": "task",
+                "ended": false,
+                "line": "it stands",
+                "total": 12,
+                "size": 480,
+                "conversation": "mcp:k:review/verify",
+                "turns": 4,
+            })
+        );
+        let build = JobHandle::parse("build:76c3a0f4d39bd9db:XeV_I_QPzpg").unwrap();
+        assert_eq!(
+            view_body(&build, &standing(true, 900, 51_200), None, None),
+            json!({
+                "handle": "build:76c3a0f4d39bd9db:XeV_I_QPzpg",
+                "kind": "build",
+                "ended": true,
+                "line": "it stands",
+                "total": 900,
+                "size": 51_200,
+                "conversation": null,
+            })
+        );
+    }
 
     /// **A range reads from where the GUI is, a page at a time; a tail is
     /// bounded.**

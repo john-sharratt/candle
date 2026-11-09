@@ -226,10 +226,10 @@ impl Framer {
     pub fn usage_chunk(&self) -> Option<anyhow::Result<Event>> {
         let usage = self.state.lock().unwrap().usage?;
         Some(encode(&ChatCompletionChunk {
-            id: self.id.clone(),
+            id: &self.id,
             object: "chat.completion.chunk",
             created: self.created,
-            model: self.model.clone(),
+            model: &self.model,
             choices: Vec::new(),
             usage: Some(usage),
         }))
@@ -300,10 +300,10 @@ impl Framer {
 
     fn chunk(&self, delta: Delta, finish_reason: Option<&'static str>) -> anyhow::Result<Event> {
         encode(&ChatCompletionChunk {
-            id: self.id.clone(),
+            id: &self.id,
             object: "chat.completion.chunk",
             created: self.created,
-            model: self.model.clone(),
+            model: &self.model,
             choices: vec![ChunkChoice {
                 index: 0,
                 delta,

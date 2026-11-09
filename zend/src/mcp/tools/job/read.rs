@@ -3,12 +3,14 @@
 //! fills, the job ends, or `wait_s` passes — `tail -f` in bounded chunks — and
 //! a page past the end answers the last page.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio::time::Instant;
 
 use super::source::{read, standing};
 use super::status::{allowed, job_schema};
+use super::wait::pause;
 use super::{page_ask, pages, JobHandle, LOOK_EVERY, PAGE_LINES};
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::tools::{string, Answer, Ctx};
@@ -53,6 +55,9 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let asked = args.get("page").and_then(Value::as_u64).unwrap_or(1).max(1);
     let (secs, _) = call.wait_of(args, DEFAULT_WAIT_S);
     let until = Instant::now() + Duration::from_secs(secs);
+    // A task's page fills as it changes, which wakes the wait; any other job
+    // is looked at on the cadence.
+    let mut wake = matches!(job, JobHandle::Task { .. }).then(|| call.session.mcp().watch());
     loop {
         let s = match standing(call, &job).await {
             Ok(s) => s,
@@ -97,7 +102,11 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
             }
             return Answer::ok(out);
         }
-        tokio::time::sleep(LOOK_EVERY.min(until.saturating_duration_since(Instant::now()))).await;
+        pause(
+            &mut wake,
+            LOOK_EVERY.min(until.saturating_duration_since(Instant::now())),
+        )
+        .await;
     }
 }
 

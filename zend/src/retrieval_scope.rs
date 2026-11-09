@@ -37,9 +37,10 @@ mod tree_scope;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use candle_conversation::projection::{Draws, GroupId, TimelineId};
 use candle_conversation::ConversationEngine;
 use zend_vfs::{Base, Oid, RepoFiles, VfsStore};
@@ -102,12 +103,14 @@ pub struct RetrievalScope {
     /// The groups that draw files out of `files_group` by path
     /// (`docs/guidance_layer.md` §1), each with what it draws.
     drawn: Vec<(GroupId, Draws)>,
-    index: RwLock<Arc<IngestIndex>>,
+    /// The published index: a turn reads it without a lock.
+    index: ArcSwap<IngestIndex>,
     /// Set when a unit commits: the index no longer holds all that is
     /// committed.
     stale: AtomicBool,
     /// When the index was last rebuilt — held across a rebuild, so rebuilds
-    /// publish in the order they read the substrate.
+    /// publish in the order they read the substrate. A turn never waits on it:
+    /// one that finds a rebuild running scopes by the published index.
     rebuilt: Mutex<Option<Instant>>,
     trees: Mutex<Kept<(String, Oid, u64), Arc<TreeScope>>>,
     /// Whole scopes, by index generation and every repository's base tree.
@@ -125,7 +128,7 @@ impl RetrievalScope {
             folders,
             derived: Vec::new(),
             drawn: Vec::new(),
-            index: RwLock::new(Arc::default()),
+            index: ArcSwap::default(),
             stale: AtomicBool::new(false),
             rebuilt: Mutex::new(None),
             trees: Mutex::new(Kept::new(KEPT_TREES)),
@@ -268,17 +271,22 @@ impl RetrievalScope {
 
     /// The index to scope a turn by — rebuilt first when a unit has
     /// committed since the last rebuild and that one is [`REBUILD_EVERY`]
-    /// old.
+    /// old. A turn that finds another rebuilding scopes by the published
+    /// index, a staleness the cadence allows, and leaves the index stale for
+    /// the next turn.
     fn current(&self, now: Instant, read: impl FnOnce(u64) -> IngestIndex) -> Arc<IngestIndex> {
         if self.stale.load(Ordering::SeqCst) {
-            let mut rebuilt = self.rebuilt.lock().unwrap();
-            let due = rebuilt.is_none_or(|at| now.saturating_duration_since(at) >= REBUILD_EVERY);
-            // A turn that waited on the lock may find the rebuild done.
-            if due && self.stale.load(Ordering::SeqCst) {
-                self.rebuild(&mut rebuilt, now, read);
+            if let Ok(mut rebuilt) = self.rebuilt.try_lock() {
+                let due =
+                    rebuilt.is_none_or(|at| now.saturating_duration_since(at) >= REBUILD_EVERY);
+                // The rebuild that held the lock a moment ago may have just
+                // cleared it.
+                if due && self.stale.load(Ordering::SeqCst) {
+                    self.rebuild(&mut rebuilt, now, read);
+                }
             }
         }
-        Arc::clone(&self.index.read().unwrap())
+        self.index.load_full()
     }
 
     /// Read the index again and publish it under the next generation. The
@@ -292,9 +300,9 @@ impl RetrievalScope {
         // Cleared before the read: a unit committing while it runs marks the
         // index stale again rather than being missed.
         self.stale.store(false, Ordering::SeqCst);
-        let generation = self.index.read().unwrap().generation() + 1;
+        let generation = self.index.load().generation() + 1;
         let index = read(generation);
-        *self.index.write().unwrap() = Arc::new(index);
+        self.index.store(Arc::new(index));
         *rebuilt = Some(now);
         self.trees
             .lock()
@@ -559,7 +567,7 @@ mod tests {
             Some(GroupId::from_raw(2).unwrap()),
             Some((GroupId::from_raw(1).unwrap(), folder_scope.clone())),
         );
-        *rs.index.write().unwrap() = Arc::new(index(root, &folder_scope, 1));
+        rs.index.store(Arc::new(index(root, &folder_scope, 1)));
         rs
     }
 
@@ -568,7 +576,7 @@ mod tests {
     }
 
     fn scope_as(rs: &RetrievalScope, files: &RepoFiles, reader: &Reader) -> Scope {
-        let index = Arc::clone(&rs.index.read().unwrap());
+        let index = rs.index.load_full();
         rs.scope_of(&index, files, reader)
     }
 
@@ -634,7 +642,8 @@ mod tests {
             Some(GroupId::from_raw(2).unwrap()),
             Some((GroupId::from_raw(1).unwrap(), folder_scope)),
         );
-        *rs.index.write().unwrap() = Arc::new(IngestIndex::of(by_key, Vec::new(), 1));
+        rs.index
+            .store(Arc::new(IngestIndex::of(by_key, Vec::new(), 1)));
         rs
     }
 
@@ -645,7 +654,7 @@ mod tests {
         files: &RepoFiles,
         units: impl Iterator<Item = &'a TimelineId>,
     ) -> Vec<String> {
-        let index = Arc::clone(&rs.index.read().unwrap());
+        let index = rs.index.load_full();
         let at = at_bases(files).into_iter().next().unwrap();
         let tree = rs.tree_scope(&index, &at).unwrap();
         let by_unit: HashMap<TimelineId, String> = tree
@@ -828,7 +837,7 @@ mod tests {
     }
 
     fn folder_in(rs: &RetrievalScope, files: &RepoFiles, repo: &str, inner: &str) -> Option<u64> {
-        let index = Arc::clone(&rs.index.read().unwrap());
+        let index = rs.index.load_full();
         rs.folder_in(&index, files, &Reader::nobody(), repo, inner)
             .map(TimelineId::raw)
     }
@@ -878,7 +887,8 @@ mod tests {
     fn with_no_folder_layer_no_folder_unit_is_found() {
         let (root, ws) = workspace();
         let rs = RetrievalScope::new(Some(GroupId::from_raw(2).unwrap()), None);
-        *rs.index.write().unwrap() = Arc::new(index(root.path(), &IngestScope::new("", None), 1));
+        rs.index
+            .store(Arc::new(index(root.path(), &IngestScope::new("", None), 1)));
         assert_eq!(
             folder_in(&rs, &RepoFiles::overlay(ws).unwrap(), "r", ""),
             None
@@ -906,7 +916,8 @@ mod tests {
     fn with_no_folder_layer_there_are_no_folders() {
         let (root, ws) = workspace();
         let rs = RetrievalScope::new(Some(GroupId::from_raw(2).unwrap()), None);
-        *rs.index.write().unwrap() = Arc::new(index(root.path(), &IngestScope::new("", None), 1));
+        rs.index
+            .store(Arc::new(index(root.path(), &IngestScope::new("", None), 1)));
         let scope = scope_of(&rs, &RepoFiles::overlay(ws).unwrap());
         assert!(scope.folders.is_empty());
         assert_eq!(*scope.files, set(&[1, 2, 30]));
@@ -958,6 +969,23 @@ mod tests {
         assert!(rs.stale.load(Ordering::SeqCst));
         let next = rs.current(t0 + REBUILD_EVERY, |g| only("b", g));
         assert_eq!((next.generation(), next.get("b")), (2, Some(tl(1))));
+    }
+
+    /// **A turn never waits on a rebuild**: with one running, a turn scopes by
+    /// the published index at once and leaves it stale, and the turn after the
+    /// rebuild lets go rebuilds.
+    #[test]
+    fn a_turn_does_not_wait_on_a_rebuild() {
+        let rs = RetrievalScope::new(None, None);
+        rs.mark_stale();
+        let held = rs.rebuilt.lock().unwrap();
+        let now = rs.current(Instant::now(), |_| {
+            panic!("a turn rebuilt under a held rebuild")
+        });
+        assert_eq!(now.generation(), 0);
+        assert!(rs.stale.load(Ordering::SeqCst));
+        drop(held);
+        assert_eq!(rs.current(Instant::now(), |g| only("a", g)).generation(), 1);
     }
 
     /// **A rebuild lets go of what was worked out against the old index.**

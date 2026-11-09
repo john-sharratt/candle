@@ -88,6 +88,7 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
     let d = resolve(call, &agents, h, now_ms()).await?;
     let built = build::read(call, h, &LogAsk::Summary).await?;
     let mut total = built.total;
+    let mut size = built.size;
     let mut detail = String::new();
     match &d.stage {
         Stage::BuildFailed(_) => {
@@ -98,6 +99,7 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
         Stage::Tried(t) => {
             let trial_read = shifted(trial(call, &d, &LogAsk::Summary).await?, total + 1);
             total = trial_read.total;
+            size += trial_read.size;
             let why = t
                 .get("detail")
                 .and_then(Value::as_str)
@@ -120,6 +122,7 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
                 total + 1,
             );
             total = trial_read.total;
+            size += trial_read.size;
             if let Some(l) = trial_read.lines.last() {
                 detail = format!("\nthe trial's last line {}: {}", l.n, l.text);
             }
@@ -135,6 +138,7 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
         line: line(job, &d, now_ms()),
         detail,
         total,
+        size,
         marks: Vec::new(),
     })
 }

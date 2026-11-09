@@ -75,8 +75,7 @@ pub fn clear_call_turn(engine: &ConversationEngine, timeline: TimelineId) {
 /// by writing empty, and a value that is not an index names nothing.
 pub fn marked_call_turn(engine: &ConversationEngine, timeline: TimelineId) -> Option<u32> {
     engine
-        .conversation_metadata(timeline)?
-        .get(CALL_TURN_KEY)?
+        .conversation_metadata_value(timeline, CALL_TURN_KEY)?
         .parse()
         .ok()
 }

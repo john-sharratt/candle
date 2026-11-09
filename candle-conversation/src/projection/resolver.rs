@@ -2,7 +2,7 @@
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -70,6 +70,7 @@ use crate::provenance::{
     FusionMode, GalleryArena, SigWindow, WideQSig,
 };
 use crate::scheduler::profile;
+use crate::substrate::pcoll::POrdMap;
 use crate::substrate::{
     ContentResolver, IndexPage, ProjectionScores, ResidenceIndex, ResidenceSlab, RestoredTurn,
     StoredSequence, Substrate, SubstrateLock, SubstrateRead, TreeNodeMeta, TurnPartWrite,
@@ -3794,6 +3795,40 @@ impl Conversation {
     /// which can hold a whole journal.
     pub fn conversation_metadata_value(&self, timeline: TimelineId, key: &str) -> Option<String> {
         self.read().custom_of(timeline)?.get(key).cloned()
+    }
+
+    /// Whether `timeline`'s `custom` metadata holds `key` — false when it is
+    /// unregistered.
+    pub fn has_conversation_metadata_key(&self, timeline: TimelineId, key: &str) -> bool {
+        self.read()
+            .custom_of(timeline)
+            .is_some_and(|m| m.contains_key(key))
+    }
+
+    /// `f` over `timeline`'s `custom` metadata, read in place under the
+    /// snapshot — `None` when it is unregistered. For a reader of several keys.
+    pub fn conversation_metadata_with<T>(
+        &self,
+        timeline: TimelineId,
+        f: impl FnOnce(&POrdMap<String, String>) -> T,
+    ) -> Option<T> {
+        self.read().custom_of(timeline).map(f)
+    }
+
+    /// The live timelines whose `custom[key]` is each of `values`, in one
+    /// pass of the snapshot. A value no live timeline carries is absent.
+    pub fn find_timelines_by_metadata_values(
+        &self,
+        key: &str,
+        values: &BTreeSet<String>,
+    ) -> BTreeMap<String, Vec<TimelineId>> {
+        self.read().timelines_with_metadata_values(key, values)
+    }
+
+    /// Whether a live timeline whose K/V is intact carries `key == value`,
+    /// stopping at the first.
+    pub fn has_live_intact_metadata(&self, key: &str, value: &str) -> bool {
+        self.read().has_live_intact_metadata(key, value)
     }
 
     /// Every live timeline whose `custom` metadata contains `key == value`.

@@ -1327,7 +1327,7 @@ impl Minds {
         let kept = engine
             .find_conversations_by_metadata(META_OF, &npc_id.to_string())
             .into_iter()
-            .filter_map(|tl| engine.conversation_metadata(tl)?.remove(META_KEPT))
+            .filter_map(|tl| engine.conversation_metadata_value(tl, META_KEPT))
             .filter_map(|record| section::restore(&record))
             .max_by_key(|k| k.newest());
         match kept {
@@ -2135,10 +2135,7 @@ pub fn frame_fingerprint(frame: &str) -> String {
 fn resumable(engine: &Arc<ConversationEngine>, id: &str, frame: &str) -> Option<TimelineId> {
     let mut best: Option<(u64, TimelineId)> = None;
     for timeline in engine.find_conversations_by_metadata(META_CONVERSATION, id) {
-        match engine
-            .conversation_metadata(timeline)
-            .and_then(|m| m.get(META_FRAME).cloned())
-        {
+        match engine.conversation_metadata_value(timeline, META_FRAME) {
             Some(under) if under == frame => {}
             Some(_) => {
                 tracing::info!(

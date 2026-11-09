@@ -3,6 +3,8 @@
 //! once it settles, and its turn's report, built from its replicated record so
 //! any member answers for it.
 
+use std::fmt::{self, Write};
+
 use cluster::log_read::{self, LogAsk, LogRead};
 
 use super::super::{pages, JobHandle, Standing};
@@ -33,34 +35,63 @@ fn worker(call: &OpsCall, thread: &str, name: &str) -> Result<(String, Worker), 
 
 /// A task's output, as text: what `job_read` pages.
 pub fn output(w: &Worker, now: u64) -> String {
-    let mut out = format!("{}: {}\n", handle(w), w.prompt.trim());
+    let mut out = String::new();
+    // Writing into a `String` cannot fail.
+    let _ = write_output(w, now, &mut out);
+    out
+}
+
+/// How long a task's output is, counted as it is written rather than built:
+/// what a status and a listing need of it.
+pub fn measure(w: &Worker, now: u64) -> Count {
+    let mut count = Count::default();
+    let _ = write_output(w, now, &mut count);
+    count
+}
+
+/// A task's output, written to `out`. Every segment ends in a newline, so
+/// counting newlines counts its lines.
+pub fn write_output(w: &Worker, now: u64, out: &mut impl Write) -> fmt::Result {
+    writeln!(out, "{}: {}", handle(w), w.prompt.trim())?;
     for e in &w.entries {
-        out.push_str(&format!(
-            "── journal entry {}#{} ──\n{}\n",
+        writeln!(
+            out,
+            "── journal entry {}#{} ──\n{}",
             w.path(),
             e.id,
             e.text.trim()
-        ));
+        )?;
     }
     match w.state {
-        State::Question => out.push_str(&format!(
-            "── it asks ──\n{}\n",
+        State::Question => writeln!(
+            out,
+            "── it asks ──\n{}",
             w.question.as_deref().unwrap_or("").trim()
-        )),
-        State::Done | State::Stuck => {
-            out.push_str(&format!("── its answer ──\n{}\n", w.final_text.trim()))
-        }
-        State::Error => out.push_str(&format!(
-            "── it failed ──\n{}\n",
+        )?,
+        State::Done | State::Stuck => writeln!(out, "── its answer ──\n{}", w.final_text.trim())?,
+        State::Error => writeln!(
+            out,
+            "── it failed ──\n{}",
             w.error.as_deref().unwrap_or("the task failed")
-        )),
+        )?,
         State::Running => {}
     }
-    out.push_str(&format!(
-        "── its turn ──\n{}\n",
-        turn_report::render(w, now)
-    ));
-    out
+    writeln!(out, "── its turn ──\n{}", turn_report::render(w, now))
+}
+
+/// The lines and bytes of what was written to it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Count {
+    pub lines: u64,
+    pub bytes: u64,
+}
+
+impl Write for Count {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.lines += s.bytes().filter(|b| *b == b'\n').count() as u64;
+        self.bytes += s.len() as u64;
+        Ok(())
+    }
 }
 
 pub fn standing(
@@ -73,8 +104,7 @@ pub fn standing(
     let records = call.session.shared_substrate().ok_or(LOADING)?;
     let seen = reported::last(&records, &owner, thread, name);
     let now = now_ms();
-    let text = output(&w, now);
-    let total = text.lines().count() as u64;
+    let count = measure(&w, now);
     let marks = w
         .entries
         .iter()
@@ -96,7 +126,8 @@ pub fn standing(
         ended: !w.state.working(),
         line: format!("{job}: {state}"),
         detail: format!("\n{}", result_of(&w, seen)),
-        total,
+        total: count.lines,
+        size: count.bytes,
         marks,
     })
 }
@@ -152,7 +183,7 @@ pub fn list(call: &OpsCall, running: bool) -> Result<Vec<Row>, String> {
                 State::Running => format!("running — {}", w.doing(now)),
                 other => format!("{other:?}").to_lowercase(),
             };
-            let lines = output(&w, now).lines().count() as u64;
+            let lines = measure(&w, now).lines;
             rows.push(Row {
                 line: format!(
                     "{job}: {state}; `{}`, {} pages",
@@ -171,4 +202,72 @@ pub fn list(call: &OpsCall, running: bool) -> Result<Vec<Row>, String> {
         }
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use web::auth::Role;
+
+    use super::*;
+    use crate::mcp::threads::Entry;
+
+    const NOW: u64 = 1_800_000;
+
+    fn worker() -> Worker {
+        Worker {
+            thread: "review".into(),
+            name: "v".into(),
+            conv_id: "c".into(),
+            prompt: "p".into(),
+            state: State::Done,
+            role: Role::User,
+            person: None,
+            priority: Default::default(),
+            effort: Default::default(),
+            kind: Default::default(),
+            driven: Default::default(),
+            started_ms: 1_000_000,
+            turn_ms: 1_000_000,
+            beat_ms: 0,
+            ended_ms: Some(1_500_000),
+            entries_after: None,
+            entries: vec![
+                Entry {
+                    id: 1,
+                    text: "first\nline".into(),
+                },
+                Entry {
+                    id: 2,
+                    text: "second".into(),
+                },
+            ],
+            final_text: "Verdict: ok".into(),
+            error: None,
+            question: None,
+            activity: None,
+            no_entry: None,
+            stopped: false,
+            resumable: false,
+            resumes: 0,
+            by_task: false,
+            audit: None,
+            checked: false,
+            runner: None,
+        }
+    }
+
+    /// **The output is counted as it is written**: the prompt's line, each
+    /// entry's header and lines (3 and 2), the answer's header and line, and
+    /// the turn's header and report — the same lines and bytes the text has.
+    #[test]
+    fn a_tasks_output_is_counted_without_building_it() {
+        let w = worker();
+        let text = output(&w, NOW);
+        let report = turn_report::render(&w, NOW).lines().count() as u64;
+        let count = measure(&w, NOW);
+        assert_eq!(count.lines, 1 + 3 + 2 + 2 + 1 + report);
+        assert_eq!(count.lines, text.lines().count() as u64);
+        assert_eq!(count.bytes, text.len() as u64);
+        assert!(text.starts_with(&format!("{}: p\n── journal entry ", handle(&w))));
+    }
 }

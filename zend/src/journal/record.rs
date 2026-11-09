@@ -11,9 +11,12 @@ use std::collections::BTreeMap;
 
 use journal_core::section::{restore, JournalPrompt, Kept, META_KEPT};
 
-/// The journal a conversation's metadata holds, if it holds one that reads.
-pub fn kept_in(metadata: &BTreeMap<String, String>) -> Option<Kept> {
-    restore(metadata.get(META_KEPT)?)
+/// The key the journal's record is kept under.
+pub const KEY: &str = META_KEPT;
+
+/// The journal a conversation's recorded [`KEY`] holds, if it reads.
+pub fn kept_in(recorded: Option<&str>) -> Option<Kept> {
+    restore(recorded?)
 }
 
 /// The metadata that records `prompt`'s journal.
@@ -41,13 +44,12 @@ mod tests {
             removed: vec![],
         };
         let metadata = metadata_of(&JournalPrompt::of(&kept, &CODING));
-        assert_eq!(kept_in(&metadata), Some(kept));
+        assert_eq!(kept_in(metadata.get(KEY).map(String::as_str)), Some(kept));
     }
 
     #[test]
     fn metadata_with_no_record_or_a_broken_one_holds_no_journal() {
-        assert_eq!(kept_in(&BTreeMap::new()), None);
-        let broken = BTreeMap::from([(META_KEPT.to_string(), "{".to_string())]);
-        assert_eq!(kept_in(&broken), None);
+        assert_eq!(kept_in(None), None);
+        assert_eq!(kept_in(Some("{")), None);
     }
 }

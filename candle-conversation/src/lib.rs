@@ -102,6 +102,7 @@ pub mod engine_slot;
 pub mod prompts;
 pub mod provenance;
 mod recorded_reply;
+mod recovered;
 mod recovered_message;
 pub mod recurrent_span;
 mod reply_wait;

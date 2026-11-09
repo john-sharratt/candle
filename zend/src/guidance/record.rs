@@ -42,8 +42,8 @@ pub fn record_use(
         .into_iter()
         .map(|(timeline, of)| {
             let used_at = engine
-                .conversation_metadata(timeline)
-                .and_then(|meta| meta.get(USED_AT_KEY)?.parse().ok())
+                .conversation_metadata_value(timeline, USED_AT_KEY)
+                .and_then(|at| at.parse().ok())
                 .unwrap_or(0);
             (timeline, of, used_at)
         })

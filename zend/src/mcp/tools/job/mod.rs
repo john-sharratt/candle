@@ -29,6 +29,7 @@ pub mod list;
 pub mod read;
 pub mod source;
 pub mod status;
+pub mod wait;
 
 pub use handle::JobHandle;
 
@@ -68,6 +69,9 @@ pub struct Standing {
     pub detail: String,
     /// Lines in its output.
     pub total: u64,
+    /// Bytes of its output: what moves when a line is rewritten in place, which
+    /// the line count does not.
+    pub size: u64,
     /// The journal entries `detail` hands over, kept as reported once the
     /// answer is delivered, so the next status gives only newer ones: a
     /// task's, and none for any other kind.
