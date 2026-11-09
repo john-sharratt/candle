@@ -169,9 +169,13 @@ pub async fn ask(address: Ipv4Addr, message: &str, wait: Duration) -> Result<Vec
         .send_to(message.as_bytes(), SocketAddrV4::new(address, PORT))
         .await?;
     let mut buf = vec![0u8; 2048];
+    // Nothing listening at the address is a bulb that did not answer too:
+    // Windows reports the port's refusal on the next receive.
     let n = timeout(wait, socket.recv(&mut buf))
         .await
-        .map_err(|_| anyhow!("the bulb at {address} did not answer"))??;
+        .ok()
+        .and_then(Result::ok)
+        .ok_or_else(|| anyhow!("the bulb at {address} did not answer"))?;
     buf.truncate(n);
     Ok(buf)
 }
@@ -291,9 +295,6 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            err.to_string().contains("did not answer") || err.to_string().contains("refused"),
-            "{err}"
-        );
+        assert_eq!(err.to_string(), "the bulb at 127.0.0.1 did not answer");
     }
 }
