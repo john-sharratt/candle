@@ -1012,7 +1012,7 @@ const BODY_ACTS: &[Tool] = &[
 /// genuinely different — different tools, different idle patience, one puts a
 /// body in a room and the other does not. That difference is the whole of what
 /// this type is for, and it takes two values to say it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     /// Face to face.
@@ -1352,6 +1352,37 @@ pub fn show_within(selection: &mut SelectionState, mode: Mode, within: &Within) 
 /// under [`MAX_TURN_PATHS`], so a future act with two enumerated arguments fails
 /// a test rather than a machine.
 pub const ACTS_PER_TURN: usize = 2;
+
+/// How many acts a conversation's decision may contain
+/// (`docs/npc_conversations.md` §6.2): a promise or a mission change beside the
+/// reply, and the reply itself. Its catalog is the thread's few acts, not a
+/// room's, so three stay inside [`MAX_TURN_PATHS`] where the main loop's two
+/// are already near it.
+pub const TALK_ACTS: usize = 3;
+
+/// What a turn's act grammar is compiled for: the mode its acts are offered
+/// under, and how many calls its loop admits. Part of the grammar cache's key,
+/// so a conversation's decision and the main loop's turn in the same room
+/// never share a tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Catalog {
+    pub mode: Mode,
+    pub calls: usize,
+}
+
+impl Catalog {
+    /// The main loop: a body in its room.
+    pub const ROOM: Catalog = Catalog {
+        mode: Mode::Physical,
+        calls: ACTS_PER_TURN,
+    };
+    /// A conversation's decision: a thread, to somebody who may be nowhere
+    /// near (`docs/npc_conversations.md` §6.2).
+    pub const THREAD: Catalog = Catalog {
+        mode: Mode::InstantMessage,
+        calls: TALK_ACTS,
+    };
+}
 
 /// The most tokens one argument of an act may run to before the grammar closes
 /// it where it stands.
@@ -2010,6 +2041,12 @@ pub struct Within {
     /// everything else here: a character cannot get stuck emitting an act it
     /// has no way to say. Nearly always empty.
     pub cooling: Vec<String>,
+    /// The only acts a conversation's turn may take (`docs/npc_conversations.md`
+    /// §6.2), set by [`crate::engine::talk::within`]; `None` for the main loop,
+    /// which the room alone bounds. Emptying the world's sets is not enough to
+    /// keep a thread's turn off the room: `sleep`, `read`, `invite` and the
+    /// rest need none of them.
+    pub allow: Option<Vec<String>>,
     /// The registers `<mind>/moods/` has a mood written for — see
     /// [`Choices::Feelings`]. The same list for every character in the daemon,
     /// because the library is ingested untagged and shared.
@@ -2352,7 +2389,11 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
 /// constrained again. A character in a room with nowhere to walk to genuinely
 /// cannot `move_to`.
 pub(super) fn performable(t: &Tool, within: &Within) -> bool {
-    !within.cooling.iter().any(|c| c == t.name)
+    within
+        .allow
+        .as_ref()
+        .is_none_or(|allow| allow.iter().any(|a| a == t.name))
+        && !within.cooling.iter().any(|c| c == t.name)
         && !t
             .params
             .iter()
@@ -2709,9 +2750,12 @@ fn live_empty(tool: &str, param: &str, within: &Within) -> bool {
 /// arguments took it to six hundred an act, which is 10¹¹ over a turn: the
 /// compile allocated about 390 MB a second, without bound, and took the machine
 /// down twice before the cause was understood.
-pub fn estimated_paths(specs: &[ToolSpec]) -> u128 {
+///
+/// `calls` is how many acts the turn's loop admits: [`ACTS_PER_TURN`] for the
+/// main loop, [`TALK_ACTS`] for a conversation's decision.
+pub fn estimated_paths(specs: &[ToolSpec], calls: usize) -> u128 {
     let per_act: u128 = specs.iter().map(|t| paths_of(&t.params)).sum();
-    per_act.saturating_pow(ACTS_PER_TURN as u32)
+    per_act.saturating_pow(calls as u32)
 }
 
 /// The paths through a list of sibling parameters: the product of each one's.
@@ -2774,6 +2818,9 @@ fn param_type(ty: &str) -> ParamType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::talk;
+    use crate::engine::talk::key::Party;
+    use crate::engine::talk::within::OnThread;
 
     /// **The catalog compiles into a grammar, and a required parameter becomes
     /// unskippable in it.**
@@ -3386,12 +3433,44 @@ mod tests {
         within.feelings = (0..116).map(|i| format!("mood-{i}")).collect();
 
         let specs = specs_within(Mode::Physical, &within);
-        let paths = estimated_paths(&specs);
+        let paths = estimated_paths(&specs, ACTS_PER_TURN);
         assert!(
             paths <= MAX_TURN_PATHS,
             "a turn in a busy room admits {paths} decodes, over the {MAX_TURN_PATHS} budget — \
              the compile is exponential in this and will allocate until the machine dies. \
              Fewer enumerated arguments per act, or fewer acts per turn."
+        );
+    }
+
+    /// **A conversation's decision stays inside the same budget at
+    /// [`TALK_ACTS`] calls**, with every act of the thread catalog offered:
+    /// an authority over the agenda, somebody who owes, a full phone and the
+    /// whole mood library.
+    #[test]
+    fn a_full_thread_stays_inside_the_path_budget() {
+        let mut zen = Within::nowhere();
+        zen.feelings = (0..116).map(|i| format!("mood-{i}")).collect();
+        zen.private = (0..12).map(|i| format!("friend-{i}")).collect();
+        zen.channels = vec!["the channel".into(), "#research".into()];
+        zen.threads = zen.private.iter().chain(&zen.channels).cloned().collect();
+        zen.contacts = (0..12).map(|i| format!("contact-{i}")).collect();
+        zen.agenda = (0..8).map(|i| format!("item-{i}")).collect();
+        zen.priorities = Priority::ALL.iter().map(|p| p.as_str().to_string()).collect();
+        let party = Party::Npc(12);
+        let within = zen.on_thread(&OnThread {
+            party: &party,
+            name: "friend-0",
+            owed: vec!["the garden report".into(), "the key".into()],
+            may_change_mission: true,
+            capped: false,
+            cooling: Vec::new(),
+        });
+        let specs = specs_within(Catalog::THREAD.mode, &within);
+        assert_eq!(specs.len(), talk::within::ACTS.len(), "{specs:?}");
+        let paths = estimated_paths(&specs, TALK_ACTS);
+        assert!(
+            paths <= MAX_TURN_PATHS,
+            "a conversation's decision admits {paths} decodes, over the {MAX_TURN_PATHS} budget"
         );
     }
 

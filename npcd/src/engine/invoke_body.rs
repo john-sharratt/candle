@@ -467,7 +467,7 @@ mod tests {
         let within = crowded();
         assert!(!within.invokable.is_empty());
         let specs = specs_within(Mode::Physical, &within);
-        let paths = estimated_paths(&specs);
+        let paths = estimated_paths(&specs, ACTS_PER_TURN);
         assert!(
             paths <= MAX_TURN_PATHS,
             "{} addresses admit {paths} decodes over a turn, over the {MAX_TURN_PATHS} budget",
