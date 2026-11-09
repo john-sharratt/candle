@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use journals::error::Problem;
+use journals::error::{Error, Problem};
+use journals::store::StoreError;
 use journals::files::{Cite, Sentence};
 use journals::scope::Channel;
 use journals::slug::Slug;
@@ -348,7 +349,7 @@ fn old_notes_move_onto_their_journal_and_leave_the_substrate() {
 fn a_read_does_not_wait_for_the_store() {
     let (_root, dir) = repo();
     let m = opened(dir);
-    let guard = held(&m.store);
+    let guard = m.live.hold_store();
     let started = Instant::now();
     assert!(m.tree().is_ok());
     assert!(started.elapsed() < Duration::from_secs(1));

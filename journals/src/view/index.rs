@@ -9,9 +9,12 @@ use crate::tree::fingerprint::is_dirty;
 use crate::tree::Journal;
 use crate::view::who::ago;
 
-/// `j`'s live children with something written in or below them, by name.
+/// `j`'s listed children with something written in or below them, by name.
 pub(crate) fn written(j: &Journal) -> Vec<(&Slug, &Journal)> {
-    j.live().filter(|(_, c)| !c.is_blank()).collect()
+    j.listed()
+        .into_iter()
+        .filter(|(_, c)| !c.is_blank())
+        .collect()
 }
 
 /// `path`'s line in its parent's index.
@@ -94,14 +97,21 @@ pub fn refs_lines(j: &Journal) -> Vec<String> {
 /// to write in — then how many are folded.
 pub fn index(path: &JournalPath, j: &Journal, now: Stamp) -> Vec<String> {
     let blank = |c: &Journal| c.is_fixed() && c.is_blank();
-    let mut out: Vec<String> = j
-        .live()
+    let listed = j.listed();
+    let mut out: Vec<String> = listed
+        .iter()
         .filter(|(_, child)| !blank(child))
         .map(|(name, child)| {
-            let child_path = path.child(name.clone()).expect("a child is at a place");
+            let child_path = path.child((*name).clone()).expect("a child is at a place");
             index_line(&child_path, child, now)
         })
         .collect();
+    let quieter = j.live_count() - listed.len();
+    if quieter > 0 {
+        out.push(format!(
+            "… and {quieter} quieter, each opened by its path"
+        ));
+    }
     let empty: Vec<&str> = j
         .live()
         .filter(|(_, child)| blank(child))

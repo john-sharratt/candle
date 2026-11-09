@@ -29,6 +29,7 @@ pub(crate) fn note(when: &str, text: &str) -> Line {
         folds: None,
         proposed: false,
         terms: Terms::default(),
+        experience: None,
         text: text.into(),
     }
 }

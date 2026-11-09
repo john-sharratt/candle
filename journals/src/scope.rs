@@ -127,6 +127,7 @@ impl Section {
         match (self, depth) {
             (Self::Conversations, _) => Eleventh::FoldOldest,
             (Self::Threads, _) => Eleventh::FoldIdlestClosed,
+            (Self::Bots, 0) => Eleventh::Unbounded,
             (Self::Bots, _) => Eleventh::FoldIdlest,
             (Self::Topics | Self::People, _) => Eleventh::Refuse,
         }
@@ -150,6 +151,10 @@ pub enum Eleventh {
     FoldIdlest,
     /// Refused: making room is a restructuring, a coding task (§2.6).
     Refuse,
+    /// No cap: the `bots` section holds a journal for every bot in its
+    /// worlds, each written by npcd and read by path, and its index names
+    /// only the most recently active.
+    Unbounded,
 }
 
 /// A channel: the client app a conversation comes through, named as
@@ -230,7 +235,8 @@ mod tests {
         assert_eq!(Section::Conversations.eleventh(0), Eleventh::FoldOldest);
         assert_eq!(Section::Threads.eleventh(0), Eleventh::FoldIdlestClosed);
         assert_eq!(Section::Threads.eleventh(2), Eleventh::FoldIdlestClosed);
-        assert_eq!(Section::Bots.eleventh(0), Eleventh::FoldIdlest);
+        assert_eq!(Section::Bots.eleventh(0), Eleventh::Unbounded);
+        assert_eq!(Section::Bots.eleventh(1), Eleventh::FoldIdlest);
         for s in [Section::Topics, Section::People] {
             assert_eq!(s.eleventh(0), Eleventh::Refuse);
             assert_eq!(s.eleventh(4), Eleventh::Refuse);

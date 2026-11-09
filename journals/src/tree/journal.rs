@@ -1,6 +1,7 @@
 //! One journal in memory: its metadata, window, archives and children, and
 //! whatever is wrong with its files.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use crate::files::{Meta, Summary};
 use crate::line::{Line, LineId};
 use crate::path::Place;
 use crate::period::Period;
+use crate::scope::Eleventh;
 use crate::slug::Slug;
 use crate::time::Stamp;
 
@@ -100,6 +102,30 @@ impl Journal {
 
     pub fn live_count(&self) -> usize {
         self.live().count()
+    }
+
+    /// Its live children are held to [`MAX_CHILDREN`]: everywhere but the
+    /// `bots` section ([`Eleventh::Unbounded`]).
+    pub fn caps_children(&self) -> bool {
+        let rule = match self.place {
+            Place::Root => return true,
+            Place::Section(s) => s.eleventh(0),
+            Place::Named { section, depth } => section.eleventh(depth),
+        };
+        rule != Eleventh::Unbounded
+    }
+
+    /// The live children its index names, by name: all of them, or for a
+    /// journal with no cap the [`MAX_CHILDREN`] most recently active, so an
+    /// index stays small enough to read whole.
+    pub fn listed(&self) -> Vec<(&Slug, &Journal)> {
+        let mut live: Vec<(&Slug, &Journal)> = self.live().collect();
+        if !self.caps_children() && live.len() > MAX_CHILDREN {
+            live.sort_by_key(|(n, j)| (Reverse(j.last_active()), (*n).clone()));
+            live.truncate(MAX_CHILDREN);
+            live.sort_by_key(|(n, _)| (*n).clone());
+        }
+        live
     }
 
     /// When anything last happened in it or below it: its newest line, or
@@ -231,6 +257,43 @@ mod tests {
         assert_eq!(parent.last_active(), at("2026-10-30T10:00:00Z"));
         assert_eq!(parent.walk().len(), 3);
         assert_eq!(parent.walk()[1].0, vec![slug("budget")]);
+    }
+
+    /// **The bots section has no cap and lists its ten most recently active**,
+    /// by name; every other journal lists all its live children.
+    #[test]
+    fn only_the_bots_section_is_uncapped_and_lists_its_busiest() {
+        let mut bots = Journal::new(Place::Section(Section::Bots), None);
+        assert!(!bots.caps_children());
+        for i in 0..12 {
+            let mut b = Journal::new(
+                Place::Named {
+                    section: Section::Bots,
+                    depth: 1,
+                },
+                Some(Meta::new(
+                    &format!("b{i:02}"),
+                    Some("x".into()),
+                    at("2026-10-01T00:00:00Z"),
+                )),
+            );
+            b.window.push(note(&format!("2026-10-{:02}T10:00:00Z", 2 + i), "x"));
+            bots.children.insert(slug(&format!("b{i:02}")), b);
+        }
+        let listed: Vec<&str> = bots.listed().iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            listed,
+            ["b02", "b03", "b04", "b05", "b06", "b07", "b08", "b09", "b10", "b11"],
+            "the two quietest are left out"
+        );
+        assert!(bots.children[&slug("b00")].caps_children(), "a bot's own journal is capped");
+        let mut topics = Journal::new(Place::Section(Section::Topics), None);
+        assert!(topics.caps_children());
+        topics
+            .children
+            .insert(slug("a"), named("a", "2026-10-01T00:00:00Z"));
+        assert_eq!(topics.listed().len(), 1);
+        assert!(Journal::new(Place::Root, None).caps_children());
     }
 
     #[test]

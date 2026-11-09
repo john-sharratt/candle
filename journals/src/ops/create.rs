@@ -46,7 +46,7 @@ fn to_fold(parent: &Journal, under: &JournalPath, rule: Eleventh) -> Result<Slug
         Eleventh::FoldIdlest => live()
             .min_by_key(|(n, j)| (j.last_active(), n.clone()))
             .map(|(n, _)| n),
-        Eleventh::Refuse => None,
+        Eleventh::Refuse | Eleventh::Unbounded => None,
     };
     pick.ok_or_else(|| {
         Error::refused(match rule {
@@ -133,7 +133,7 @@ pub fn create(
         created: Some(path.clone()),
         ..Applied::touching(format!("Create {path}"), vec![])
     };
-    if parent.live_count() >= MAX_CHILDREN {
+    if parent.caps_children() && parent.live_count() >= MAX_CHILDREN {
         let victim = to_fold(parent, under, rule)?;
         let folded = fold_child(parent, under, &victim, now)?;
         applied.touched.push(under.clone());
@@ -432,12 +432,12 @@ mod tests {
         assert_eq!(a.folded[0].show(), "@zen/threads/th3");
     }
 
+    /// **The bots section has no cap**: an eleventh bot and every one after it
+    /// is a live journal, and none folds.
     #[test]
-    fn an_eleventh_bot_folds_the_idlest() {
+    fn an_eleventh_bot_folds_nothing() {
         let mut t = zen();
-        let npcd = Actor::Npcd {
-            person: slug("john"),
-        };
+        let npcd = Actor::Npcd { group: slug("zen") };
         let mk = |t: &mut Tree, name: &str, at: Stamp| {
             apply(
                 t,
@@ -452,23 +452,11 @@ mod tests {
             )
             .unwrap()
         };
-        for i in 0..10 {
-            mk(&mut t, &format!("b{i}"), now().plus(i));
+        for i in 0..25 {
+            let a = mk(&mut t, &format!("b{i}"), now().plus(i));
+            assert!(a.folded.is_empty(), "b{i}");
         }
-        // b0 has news; b1 is now the idlest.
-        apply(
-            &mut t,
-            &npcd,
-            &Op::Episode {
-                path: p("bots/b0"),
-                text: "went to market".into(),
-                speaker: None,
-            },
-            now().plus(50),
-        )
-        .unwrap();
-        let a = mk(&mut t, "b10", now().plus(60));
-        assert_eq!(a.folded[0].show(), "@zen/bots/b1");
+        assert_eq!(t.get(&p("bots")).unwrap().live_count(), 25);
     }
 
     #[test]

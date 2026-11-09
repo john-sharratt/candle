@@ -57,6 +57,7 @@ pub(crate) fn fold_child(
         folds: Some(Folds::Journal(name.clone())),
         proposed: false,
         terms: Terms::default(),
+        experience: None,
         text,
     };
     parent.window.push(line);

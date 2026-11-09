@@ -193,7 +193,7 @@ impl Store {
     /// Apply `op` for `actor` at `now` and commit it onto the service's head.
     /// Nothing held here changes unless the commit and the ref move both do.
     pub fn write(&mut self, actor: &Actor, op: &Op, now: Stamp) -> Result<Applied, StoreError> {
-        let (next, applied) = applied_to(&self.tree, actor, op, now, None)?;
+        let (next, applied) = applied_to(&self.tree, actor, op, now, &[])?;
         let (new, ch) = self.commit(&self.head, &self.files, &next, &applied, actor, op, now)?;
         let txn = RefTransaction::new().push(RefOp::Update {
             name: journal_ref(),
@@ -243,7 +243,7 @@ impl Store {
         let author = Signature::new(writer, &format!("{writer}@journals.tokera"), git_time(now))?;
         let committer =
             Signature::new("journal service", "journals@tokera", git_time(Stamp::now()))?;
-        let msg = message(&applied.subject, actor, op, now, applied.line.as_ref());
+        let msg = message(&applied.subject, actor, op, now, &applied.written());
         let new = self
             .repo
             .commit_changes(base, &set, &msg, &author, &committer)?;
@@ -292,21 +292,26 @@ impl Store {
                 }
             };
             remap(&mut rec.op, &renamed);
-            match applied_to(&tree, &rec.actor, &rec.op, rec.at, rec.line.as_ref()) {
+            match applied_to(&tree, &rec.actor, &rec.op, rec.at, &rec.lines) {
                 Ok((next, applied)) => match self
                     .commit(&base, &files, &next, &applied, &rec.actor, &rec.op, rec.at)
                 {
                     Ok((new, ch)) => {
-                        // Only a write of a new line mints an id; an edit or a
+                        // Only a write of new lines mints ids; an edit or a
                         // forget names one that is already there.
                         let mints = matches!(
                             rec.op,
-                            Op::Note { .. } | Op::Episode { .. } | Op::FoldPeriod { .. }
+                            Op::Note { .. }
+                                | Op::Episode { .. }
+                                | Op::Episodes { .. }
+                                | Op::FoldPeriod { .. }
                         );
-                        if let (true, Some(was), Some(is)) = (mints, &rec.line, &applied.line) {
-                            if was != is {
-                                renamed.insert(was.clone(), is.clone());
-                                done.renamed.push((was.clone(), is.clone()));
+                        if mints {
+                            for (was, is) in rec.lines.iter().zip(applied.written()) {
+                                if *was != is {
+                                    renamed.insert(was.clone(), is.clone());
+                                    done.renamed.push((was.clone(), is));
+                                }
                             }
                         }
                         base = new;

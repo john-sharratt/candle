@@ -139,6 +139,7 @@ fn append(
         folds: None,
         proposed: said.proposed,
         terms: said.terms,
+        experience: None,
         text,
     };
     line.check().map_err(Error::Invalid)?;

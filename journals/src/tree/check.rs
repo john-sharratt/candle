@@ -297,7 +297,7 @@ fn check_journal(j: &mut Journal, path: &JournalPath) {
         }
     }
     let live = j.live_count();
-    if live > MAX_CHILDREN {
+    if j.caps_children() && live > MAX_CHILDREN {
         found.push(Problem::new(
             &meta_file,
             None,

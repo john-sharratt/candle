@@ -8,6 +8,7 @@ use std::ops::Range;
 use sha2::{Digest, Sha256};
 
 use crate::error::Problem;
+use crate::experience::{about_from_text, about_to_text, Experience, ExperienceKind};
 use crate::period::{Level, Period};
 use crate::scope::Channel;
 use crate::slug::Slug;
@@ -174,6 +175,8 @@ pub struct Line {
     /// What a note says about itself: concluded, its source, its expiry, the
     /// line it replaces.
     pub terms: Terms,
+    /// For an episode npcd wrote for a bot: what it was to the bot.
+    pub experience: Option<Experience>,
     pub text: String,
 }
 
@@ -207,6 +210,9 @@ impl Line {
         self.terms.check()?;
         if self.kind != Kind::Note && self.terms != Terms::default() {
             return Err("only a note states its terms".into());
+        }
+        if self.kind != Kind::Episode && self.experience.is_some() {
+            return Err("only an episode is an experience".into());
         }
         match (self.kind, &self.folds) {
             (Kind::Fold, None) => Err("a fold names its `period` or `journal`".into()),
@@ -248,6 +254,12 @@ impl Line {
         if self.proposed {
             out.push_str("proposed: true\n");
         }
+        if let Some(e) = &self.experience {
+            out.push_str(&format!("experience: {}\n", e.kind));
+            if let Some(about) = &e.about {
+                out.push_str(&format!("about: {}\n", quote(&about_to_text(about))));
+            }
+        }
         out.push_str(&self.terms.render());
         out.push_str(&text_field("", "text", &self.text));
         out
@@ -282,6 +294,18 @@ impl Line {
             (None, None) => None,
         };
         let proposed = f.opt_bool("proposed")?.unwrap_or(false);
+        let kind_of = f.opt_parsed("experience", ExperienceKind::parse)?;
+        let about = f.opt_parsed("about", about_from_text)?;
+        let experience = match (kind_of, about) {
+            (Some(kind), about) => Some(Experience { kind, about }),
+            (None, Some(_)) => {
+                return Err(f.problem(
+                    "about",
+                    "`about` names whose journal an experience was with: it needs `experience`",
+                ))
+            }
+            (None, None) => None,
+        };
         let terms = Terms::read(f)?;
         let text = f.str("text")?;
         let line = Line {
@@ -295,6 +319,7 @@ impl Line {
             folds,
             proposed,
             terms,
+            experience,
             text,
         };
         line.check()
@@ -306,6 +331,7 @@ impl Line {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path::Viewer;
     use crate::testing::note;
     use crate::testing::slug;
     use crate::yaml::parse_doc;
@@ -395,10 +421,53 @@ mod tests {
                 } else {
                     Terms::default()
                 },
+                experience: None,
                 text: "a: b, {c} #d \"e\"\nf".into(),
             };
             assert_eq!(read_as(&line.id, &line.render()).unwrap(), line);
         }
+    }
+
+    /// **An episode's experience is written exactly and read back**: its kind,
+    /// and the journal it was with when there is one.
+    #[test]
+    fn an_experience_is_written_exactly_and_read_back() {
+        let at = Stamp::parse("2026-11-10T09:12:40Z").unwrap();
+        let line = |experience: Option<Experience>| Line {
+            id: LineId::mint(at, Writer::Npcd, "x", 0),
+            at,
+            kind: Kind::Episode,
+            by: Writer::Npcd,
+            account: None,
+            speaker: None,
+            channel: None,
+            folds: None,
+            proposed: false,
+            terms: Terms::default(),
+            experience,
+            text: "Mira, on the phone: the parcel is at the door.".into(),
+        };
+        let mira = Viewer {
+            group: None,
+            here: None,
+        }
+        .parse("@moon/people/mira")
+        .unwrap();
+        let heard = line(Some(Experience::about(ExperienceKind::Heard, mira)));
+        assert_eq!(
+            heard.render(),
+            "at: 2026-11-10T09:12:40Z\nkind: episode\nby: npcd\nexperience: heard\n\
+             about: \"@moon/people/mira\"\n\
+             text: \"Mira, on the phone: the parcel is at the door.\"\n"
+        );
+        assert_eq!(read_as(&heard.id, &heard.render()).unwrap(), heard);
+        let did = line(Some(Experience::of(ExperienceKind::Did)));
+        assert_eq!(
+            did.render(),
+            "at: 2026-11-10T09:12:40Z\nkind: episode\nby: npcd\nexperience: did\n\
+             text: \"Mira, on the phone: the parcel is at the door.\"\n"
+        );
+        assert_eq!(read_as(&did.id, &did.render()).unwrap(), did);
     }
 
     #[test]
@@ -465,6 +534,21 @@ mod tests {
                 "kind: episode\nby: server\nsource: a.md\ntext: x\n",
                 Some(5),
                 "only a note states its terms",
+            ),
+            (
+                "kind: note\nby: grok\nexperience: heard\ntext: x\n",
+                Some(5),
+                "only an episode is an experience",
+            ),
+            (
+                "kind: episode\nby: npcd\nexperience: saw\ntext: x\n",
+                Some(4),
+                "not an experience",
+            ),
+            (
+                "kind: episode\nby: npcd\nabout: \"@moon/people/mira\"\ntext: x\n",
+                Some(4),
+                "it needs `experience`",
             ),
             (
                 "kind: note\nby: grok\nexpires: soon\ntext: x\n",
@@ -540,6 +624,7 @@ mod tests {
             folds: Some(Folds::Period(Period::parse("2026").unwrap())),
             proposed: false,
             terms: Terms::default(),
+            experience: None,
             text: "The year.".into(),
         };
         assert!(line.render().contains("period: \"2026\""));

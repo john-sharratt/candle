@@ -10,10 +10,11 @@ use serde_json::{json, Map, Value};
 
 use crate::actor::Actor;
 use crate::error::{Error, Result};
+use crate::experience::{Experience, ExperienceKind};
 use crate::files::summary::{Cite, Fingerprint, Sentence};
 use crate::files::{AccountKey, Email, Role, Who};
 use crate::line::LineId;
-use crate::ops::{Call, OnTaken, Op, Which};
+use crate::ops::{Call, Lived, OnTaken, Op, Which};
 use crate::path::{Address, Below, JournalPath};
 use crate::period::Period;
 use crate::scope::Channel;
@@ -51,7 +52,7 @@ pub fn actor_to_wire(a: &Actor) -> Value {
         }
         Actor::Zend => json!({"kind": "zend"}),
         Actor::Worker { person } => json!({"kind": "worker", "person": person.as_str()}),
-        Actor::Npcd { person } => json!({"kind": "npcd", "person": person.as_str()}),
+        Actor::Npcd { group } => json!({"kind": "npcd", "group": group.as_str()}),
         Actor::Bot { bot } => json!({"kind": "bot", "bot": bot.as_str()}),
         Actor::Guest { channel } => json!({"kind": "guest", "channel": channel.name()}),
         Actor::System => json!({"kind": "system"}),
@@ -150,7 +151,7 @@ pub fn actor_from_wire(v: &Value) -> Result<Actor> {
             person: o.slug("person")?,
         },
         "npcd" => Actor::Npcd {
-            person: o.slug("person")?,
+            group: o.slug("group")?,
         },
         "bot" => Actor::Bot {
             bot: o.slug("bot")?,
@@ -220,6 +221,14 @@ pub fn op_to_wire(op: &Op) -> Value {
             text,
             speaker,
         } => json!({"op": "episode", "path": p(path), "text": text, "speaker": slug(speaker)}),
+        Op::Episodes { path, lines } => json!({
+            "op": "episodes", "path": p(path),
+            "lines": lines.iter().map(|l| json!({
+                "at": l.at.to_string(), "text": l.text,
+                "experience": l.experience.kind.name(),
+                "about": l.experience.about.as_ref().map(p),
+            })).collect::<Vec<_>>(),
+        }),
         Op::Activity { path, calls } => json!({
             "op": "activity", "path": p(path),
             "calls": calls.iter().map(|c| json!({
@@ -349,6 +358,28 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
             path: o.path("path")?,
             text: text()?,
             speaker: o.opt_slug("speaker")?,
+        },
+        "episodes" => Op::Episodes {
+            path: o.path("path")?,
+            lines: o
+                .0
+                .get("lines")
+                .and_then(Value::as_array)
+                .ok_or_else(|| Error::invalid("`lines` is missing"))?
+                .iter()
+                .map(|l| {
+                    let lo = Obj::of(l)?;
+                    Ok(Lived {
+                        at: Stamp::parse(lo.str("at")?).map_err(Error::Invalid)?,
+                        text: lo.str("text")?.to_string(),
+                        experience: Experience {
+                            kind: ExperienceKind::parse(lo.str("experience")?)
+                                .map_err(Error::Invalid)?,
+                            about: lo.opt_str("about")?.map(path_from_wire).transpose()?,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
         },
         "activity" => Op::Activity {
             path: o.path("path")?,
@@ -539,6 +570,21 @@ mod tests {
                 text: "x".into(),
                 speaker: None,
             },
+            Op::Episodes {
+                path: p("bots/zen"),
+                lines: vec![
+                    Lived {
+                        at: Stamp::parse("2026-11-10T09:12:40Z").unwrap(),
+                        text: "Mira, on the phone: \"the parcel\"\nis here".into(),
+                        experience: Experience::about(ExperienceKind::Heard, p("people/mira")),
+                    },
+                    Lived {
+                        at: Stamp::parse("2026-11-10T09:12:00Z").unwrap(),
+                        text: "Turned the TV off.".into(),
+                        experience: Experience::of(ExperienceKind::Did),
+                    },
+                ],
+            },
             Op::Activity {
                 path: p("conversations/2026-10-31-0712-grok"),
                 calls: vec![
@@ -701,7 +747,7 @@ mod tests {
                 person: slug("john"),
             },
             Actor::Npcd {
-                person: slug("thanhlong"),
+                group: slug("moon"),
             },
             Actor::Bot {
                 bot: slug("c3f1a07e"),
