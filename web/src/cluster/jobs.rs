@@ -82,7 +82,7 @@ pub async fn answer(gateway: &Arc<Gateway>, from: u64, peer: IpAddr, req: Reques
     let addressed =
         header(req.headers(), NODE_HEADER).and_then(|n| u64::from_str_radix(n, 16).ok());
     let node = if let Some(node) = addressed {
-        if hub.member(AGENT_APP, node).is_none() {
+        if !hub.has_member(AGENT_APP, node) {
             return no_agent(format!("agent {node:016x} has no socket on this gateway"));
         }
         node

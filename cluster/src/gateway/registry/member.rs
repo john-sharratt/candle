@@ -1,5 +1,7 @@
 //! One admitted member, as the gateway sees it.
 
+use std::sync::Arc;
+
 use crate::dispatch::RouteTable;
 use crate::frame::{BuildId, Capacity, MemberInfo, MemberState, RepoAd};
 
@@ -21,7 +23,9 @@ pub struct MemberView {
     pub repos: Vec<RepoAd>,
     /// Its last `CAPACITY`; a member is loading until it sends one.
     pub capacity: Option<Capacity>,
-    pub routes: Option<RouteTable>,
+    /// Its dispatch table, shared: a request takes an `Arc` of it, never a
+    /// copy.
+    pub routes: Option<Arc<RouteTable>>,
     /// Its own highest `oseq`, from its `ACK`s (§7.1).
     pub high_water: u64,
     /// Its last `ACK`: through which `oseq` it has applied each origin.

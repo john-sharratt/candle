@@ -31,10 +31,11 @@ pub const FUSE_FIELD: &str = "fuse";
 
 /// `bodies` — the members' answers — as the cluster's one, or `None` when no
 /// answer declares how it fuses.
-pub fn fuse(bodies: &[Value]) -> Option<Value> {
+pub fn fuse(bodies: &[&Value]) -> Option<Value> {
     let spec = bodies.iter().find_map(|b| b.get(FUSE_FIELD))?;
     let declaring: Vec<&Value> = bodies
         .iter()
+        .copied()
         .filter(|b| b.get(FUSE_FIELD).is_some())
         .collect();
     let mut out = Map::new();
@@ -185,7 +186,7 @@ mod tests {
             ]
         });
         assert_eq!(
-            fuse(&[a, b]).unwrap(),
+            fuse(&[&a, &b]).unwrap(),
             json!({ "waves": [
                 { "at": 5000, "tok": 1, "ws": 100, "wave_ms": 3.0, "vram": { "kv": 2, "free": 2 } },
                 { "at": 10000, "tok": 1000, "ws": 5000, "wave_ms": 52.0, "vram": { "kv": 300, "free": 75 } },
@@ -208,7 +209,7 @@ mod tests {
             { "at": 5000, "kind": "decode", "dur": 4000, "win": 4900, "tok": 700, "peak": 450.5 }
         ]});
         assert_eq!(
-            fuse(&[a, b]).unwrap(),
+            fuse(&[&a, &b]).unwrap(),
             json!({ "points": [
                 { "at": 5000, "kind": "decode", "dur": 4000, "win": 4900, "tok": 1200, "peak": 750.5 },
                 { "at": 5000, "kind": "prefill", "dur": 1000, "win": 4800, "tok": 9000, "peak": 2500.0 }
@@ -226,7 +227,7 @@ mod tests {
         let b = json!({ "fuse": spec, "host": { "total_mib": 32000, "free_mib": null, "swap_mib": 2 },
                         "mix_formats": ["c6", "c8"] });
         assert_eq!(
-            fuse(&[a, b]).unwrap(),
+            fuse(&[&a, &b]).unwrap(),
             json!({ "host": { "total_mib": 96000, "free_mib": null, "swap_mib": 6 },
                     "mix_formats": ["c4", "c6", "c8"] })
         );
@@ -239,9 +240,9 @@ mod tests {
         let a = json!({ "fuse": { "series": { "waves": [] } }, "waves": [{ "at": 0, "tok": 5 }] });
         let old = json!({ "waves": [{ "at": 0, "tok": 99 }] });
         assert_eq!(
-            fuse(&[old.clone(), a]).unwrap(),
+            fuse(&[&old, &a]).unwrap(),
             json!({ "waves": [{ "at": 0, "tok": 5 }] })
         );
-        assert_eq!(fuse(&[old]), None);
+        assert_eq!(fuse(&[&old]), None);
     }
 }

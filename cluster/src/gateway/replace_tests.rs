@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 
 use super::hub::{take_pending, undo_pending, Hub, Socket, Taken, PENDING_CAP};
-use super::registry::MemberView;
+use super::member_fixture::member;
 use crate::close::{AfterClose, CloseCode};
 use crate::delivery::ReceiptPacer;
 use crate::frame::{
@@ -56,30 +56,6 @@ fn hello(node: u64) -> Hello {
 fn handle() -> SessionHandle {
     let (_member, gateway) = pair(1 << 16);
     start(Role::Gateway, gateway.tx, gateway.rx).handle
-}
-
-fn member(node: u64, session: u64) -> MemberView {
-    MemberView {
-        node,
-        host: format!("m{node}"),
-        card: node,
-        app: "zend".into(),
-        build: hello(node).build,
-        weight: 100,
-        session,
-        repos: Vec::new(),
-        capacity: None,
-        routes: None,
-        high_water: 0,
-        applied: Vec::new(),
-        lagging: false,
-        syncing: false,
-        silent: false,
-        in_flight: 0,
-        drawing: 0,
-        handed: 0,
-        closing: false,
-    }
 }
 
 /// Node 1 admitted on a session whose socket stands, as `run` leaves it; its

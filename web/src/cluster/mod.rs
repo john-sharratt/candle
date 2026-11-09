@@ -31,6 +31,7 @@ pub mod endpoint;
 pub mod jobs;
 pub mod keeps;
 pub mod load;
+pub mod merge_by_id;
 pub mod merge_ws;
 pub mod mirror;
 pub mod ops_key;

@@ -224,7 +224,7 @@ async fn member(
     let Ok(node) = u64::from_str_radix(&node, 16) else {
         return refuse(StatusCode::BAD_REQUEST, format!("{node:?} is not a node"));
     };
-    if s.gateway.hub.member(&app, node).is_none() {
+    if !s.gateway.hub.has_member(&app, node) {
         return refuse(
             StatusCode::NOT_FOUND,
             format!("no {app} member {node:016x} on this gateway"),

@@ -206,11 +206,7 @@ impl Registry {
         let ready = self.ready_but(app, None);
         let declaring: Vec<u64> = ready
             .iter()
-            .filter(|m| {
-                m.routes
-                    .as_ref()
-                    .is_some_and(|t| t.lookup(method, path).is_some())
-            })
+            .filter(|m| m.routes.as_ref().is_some_and(|t| t.answers(method, path)))
             .map(|m| m.node)
             .collect();
         (declaring.len() < ready.len()).then_some(declaring)

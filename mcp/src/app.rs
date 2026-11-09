@@ -32,6 +32,7 @@ use crate::context::{self, Conversations};
 use crate::guides::tools as guide_tools;
 use crate::guides::Library;
 use crate::last_listed::LastListed;
+use crate::listing::{self, Listing};
 use crate::reading::{Read, Readings};
 use crate::routes::Routes;
 use crate::served::Served;
@@ -61,6 +62,8 @@ pub struct App {
     /// The context reads first calls answered ahead of, for each
     /// conversation's next call.
     pub readings: Readings,
+    /// Whether this process has listed, and the record tasks' turn to.
+    pub listing: Listing,
 }
 
 /// Every backend's tools in backend order, and which backend runs each: a
@@ -105,27 +108,23 @@ enum Ran {
 
 /// What listing every backend found: the tools of those that answered, why
 /// each of the others did not, and the listing version each answered on.
-struct Listed {
+pub(crate) struct Listed {
     tools: Vec<Value>,
     failed: Vec<String>,
     versions: Vec<Option<String>>,
 }
 
 impl App {
-    /// Every backend's tools, as `call`'s caller may call them; the routes
-    /// learned from them kept.
-    async fn list(&self, call: &Call<Self>) -> Listed {
-        let on = OnBehalf {
-            id: &call.session_id,
-            session: &call.session,
-        };
+    /// Every backend's tools, as `caller` may call them, on behalf of `on`;
+    /// the routes learned from them kept.
+    pub(crate) async fn list(&self, caller: &Caller, on: &OnBehalf<'_>) -> Listed {
         let listed = join_all(self.backends.iter().map(|b| async {
             let started = Instant::now();
-            let got = self.link.tools(b, &call.caller, &on).await;
+            let got = self.link.tools(b, caller, on).await;
             (got, started.elapsed())
         }))
         .await;
-        let who = call.caller.key();
+        let who = caller.key();
         let mut lists = Vec::new();
         let mut why_failed = Vec::new();
         let mut versions = vec![None; self.backends.len()];
@@ -133,6 +132,7 @@ impl App {
             let backend = &self.backends[i].name;
             match got {
                 Ok((tools, version)) => {
+                    self.listing.mark_listed();
                     versions[i] = version;
                     tracing::info!(
                         backend,
@@ -194,8 +194,16 @@ impl App {
         answer
     }
 
-    fn route(&self, name: &str) -> Option<usize> {
+    pub(crate) fn route(&self, name: &str) -> Option<usize> {
         self.routes.get(name)
+    }
+
+    /// The session `call` is made on behalf of.
+    fn on_behalf<'a>(call: &'a Call<Self>) -> OnBehalf<'a> {
+        OnBehalf {
+            id: &call.session_id,
+            session: &call.session,
+        }
     }
 
     /// The call, run by the backend that lists `name` — the tools listed
@@ -211,7 +219,7 @@ impl App {
         let backend = match self.route(name) {
             Some(b) => b,
             None => {
-                let listed = self.list(call).await;
+                let listed = self.list(&call.caller, &Self::on_behalf(call)).await;
                 match self.route(name) {
                     Some(b) => b,
                     None if listed.failed.is_empty() => {
@@ -302,18 +310,8 @@ impl App {
         }))
     }
 
-    /// Whether this process has listed any backend, so its read-only set says
-    /// something.
-    fn has_listed(&self) -> bool {
-        !self
-            .read_only
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-    }
-
     /// Whether the last listing marked `name` as only reading.
-    fn reads_only(&self, name: &str) -> bool {
+    pub(crate) fn reads_only(&self, name: &str) -> bool {
         self.read_only
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -321,45 +319,36 @@ impl App {
     }
 }
 
-/// Record that `name`, called with `args`, did something for `call`'s caller
-/// — on the backend that keeps the memory, in the background, so the call's
-/// answer is never held for it. A record refused — the memory's backend
+/// Record `episode` — a call that did something for `caller` — on `backend`,
+/// the one that keeps the memory. A record refused — the memory's backend
 /// restarting, its model still loading — is tried again, every
 /// [`context::EPISODE_RETRY`] up to [`context::EPISODE_TRIES`] times, so a
 /// picture drawn while zend reloads is still remembered.
-fn record_episode(this: &Arc<App>, call: &Call<App>, name: &str, args: &Value) {
-    let Some(backend) = this.route(context::GET) else {
-        return;
-    };
-    let this = Arc::clone(this);
-    let caller = call.caller.clone();
-    let id = call.session_id.clone();
-    let session = call.session.clone();
-    let episode = json!({"tool": name, "summary": context::summary(args)});
-    tokio::spawn(async move {
-        let on = OnBehalf {
-            id: &id,
-            session: &session,
-        };
-        let tool = episode["tool"].as_str().unwrap_or("");
-        for attempt in 1..=context::EPISODE_TRIES {
-            let answer = this
-                .call_served(backend, &caller, &on, context::EPISODE, &episode, &|_| {})
-                .await;
-            if !context::is_error(&answer) {
-                return;
-            }
-            tracing::warn!(
-                tool,
-                attempt,
-                "mcp: an episode could not be recorded: {}",
-                first_line(context::text_of(&answer).unwrap_or(""))
-            );
-            if attempt < context::EPISODE_TRIES {
-                tokio::time::sleep(context::EPISODE_RETRY).await;
-            }
+pub(crate) async fn record_episode(
+    this: &App,
+    backend: usize,
+    caller: &Caller,
+    on: &OnBehalf<'_>,
+    episode: &Value,
+) {
+    let tool = episode["tool"].as_str().unwrap_or("");
+    for attempt in 1..=context::EPISODE_TRIES {
+        let answer = this
+            .call_served(backend, caller, on, context::EPISODE, episode, &|_| {})
+            .await;
+        if !context::is_error(&answer) {
+            return;
         }
-    });
+        tracing::warn!(
+            tool,
+            attempt,
+            "mcp: an episode could not be recorded: {}",
+            first_line(context::text_of(&answer).unwrap_or(""))
+        );
+        if attempt < context::EPISODE_TRIES {
+            tokio::time::sleep(context::EPISODE_RETRY).await;
+        }
+    }
 }
 
 impl Server for App {
@@ -395,7 +384,7 @@ impl Server for App {
     /// The guide tools come first, and each backend tool a guide lists carries
     /// the line naming its guides.
     async fn tools(this: &Arc<Self>, call: &Call<Self>) -> Result<Value, String> {
-        let mut listed = this.list(call).await;
+        let mut listed = this.list(&call.caller, &Self::on_behalf(call)).await;
         if listed.tools.is_empty() && !listed.failed.is_empty() {
             return Err(listed.failed.join("; "));
         }
@@ -483,29 +472,16 @@ impl Server for App {
                 "mcp: a conversation's first call carries its context"
             );
         }
-        // **Which tools only read is a listing's to say**, and this process
-        // may never have listed: a client keeps the list it was given across
-        // our restarts, so its calls arrive at a process whose read-only set
-        // is empty, and every read was recorded as an episode. Listed once
-        // here, before the first record is decided.
-        if !this.has_listed() {
-            this.list(call).await;
-        }
-        let after = context::after(
-            name,
-            begins,
-            context::is_error(&answer),
-            this.route(name).is_some(),
-            this.reads_only(name),
-            user.is_some(),
-        );
+        let failed = context::is_error(&answer);
         // A claim not kept is given up as it drops — here, or on any way out
         // above, the client gone included.
-        if after.stamp {
+        if context::stamps(name, begins, failed, user.is_some()) {
             claim.keep(now_ms());
         }
-        if after.record {
-            record_episode(this, call, name, args);
+        // Whether it is an episode is decided after the answer has gone, by a
+        // listing when this process has none yet (`crate::listing`).
+        if context::may_record(name, failed) {
+            listing::record_later(this, call, name, args);
         }
         answer
     }

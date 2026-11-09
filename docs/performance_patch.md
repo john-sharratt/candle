@@ -1035,22 +1035,24 @@ call, with the answer in hand: seconds after a restart, up to 60 s with a
 backend down, on every call while listings keep failing.
 
 **Change.** `context::after` splits into `stamps(name, begins, failed,
-delivered)` and `records(name, failed, from_backend, read_only)`. The call
-keeps or gives up its claim at once and returns its answer. A call that could
-record (not failed, not a memory or chat tool) hands its caller, session id,
-session and episode to a spawned task, which — when this process has not yet
-listed successfully (`listed: AtomicBool`, set on any backend's successful
-listing, so a listing that marks no tool read-only does not respawn forever)
-— lists under `listing: tokio::sync::Mutex<u64>`, a generation: a task that
-waited while another listed does not list again, and decides with what that
-listing found, as a call does today. Only then does it read `route(name)`,
+delivered)` and `records(name, failed, from_backend, read_only)`, with
+`may_record(name, failed)` the part of `records` known before a listing. The
+call keeps or gives up its claim at once and returns its answer. A call that
+could record (`may_record`: not failed, not a memory or chat tool) hands its
+caller, session id, session and episode to a spawned task, which — when this
+process has not yet listed successfully (`listed: AtomicBool`, set on any
+backend's successful listing, so a listing that marks no tool read-only does
+not respawn forever) — lists in its turn (`turn: tokio::sync::Mutex<()>`),
+counted by a `generation: AtomicU64` read before waiting: a task that waited
+while another listed does not list again, and decides with what that listing
+found, as a call does today. Only then does it read `route(name)`,
 `reads_only(name)` and `route(GET)` (today read before the listing, so a fresh
 process recorded nothing) and record as today. `list` takes
 `(&Caller, &OnBehalf<'_>)`, the task rebuilding its `OnBehalf` from an owned
 id and cloned session as `record_episode` does. The listing state and the
 record task live in `mcp/src/listing.rs`; `app.rs` calls it.
 
-**Locks.** `listing` is held across the listing's awaits, by background
+**Locks.** `turn` is held across the listing's awaits, by background
 tasks only; no request takes it. A tokio mutex does not poison, so a failed
 or panicked listing releases it.
 

@@ -42,7 +42,7 @@ use axum::response::Response;
 use cluster::dispatch::{
     draw_area, extract, Dispatch, Extracted, KeySource, Merge, Mirror, Reach, BODY_LIMIT,
 };
-use cluster::gateway::{Class, Pick, Placing, RouteAt, HOLD, NODE_HEADER};
+use cluster::gateway::{Class, Pick, Placing, RouteAt, Routing, Standing, HOLD, NODE_HEADER};
 use cluster::member::PREFER_PEER;
 use serde_json::Value;
 use tracing::Instrument;
@@ -180,26 +180,35 @@ pub fn restarting(app: &str, want_html: bool) -> Response {
 /// its loading page, and its own endpoints, which the performance and agents
 /// pages read while the app is down. [`restarting`] only when no admitted member
 /// is left to stand by.
-async fn none_ready(gateway: &Arc<Gateway>, app: &str, ctx: &Context<'_>, req: Request) -> Routed {
-    if !gateway.hub.admitted(app) {
-        return Routed::Dumb(req);
-    }
-    match gateway.hub.standing_by(app) {
-        Some(node) => Routed::Answered(forward(gateway, app, node, ctx, req).await),
-        None => Routed::Answered(restarting(app, ctx.want_html)),
+async fn none_ready(
+    gateway: &Arc<Gateway>,
+    app: &str,
+    standing: Standing,
+    ctx: &Context<'_>,
+    req: Request,
+) -> Routed {
+    match standing {
+        Standing::Unadmitted => Routed::Dumb(req),
+        Standing::By(Some(node)) => Routed::Answered(forward(gateway, app, node, ctx, req).await),
+        Standing::By(None) => Routed::Answered(restarting(app, ctx.want_html)),
     }
 }
 
-/// Route `req` for `app`, clustered on this gateway.
+/// Route `req` for `app`: through its members when any is admitted here,
+/// [`Routed::Dumb`] — its configured upstream — when none is.
 pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Request) -> Routed {
     let hub = &gateway.hub;
-    let Some(table) = hub.table_for(app, req.method().as_str(), req.uri().path()) else {
-        return none_ready(gateway, app, &ctx, req).await;
+    let table = match hub.routing(app, req.method().as_str(), req.uri().path()) {
+        Routing::Table(table) => table,
+        Routing::Unadmitted => return Routed::Dumb(req),
+        Routing::StandingBy(node) => {
+            return none_ready(gateway, app, Standing::By(node), &ctx, req).await
+        }
     };
     match addressed(&req, &ctx) {
         Err(p) => return Routed::Answered(errors::respond(*p, ctx.want_html)),
         Ok(Some(node)) => {
-            if hub.member(app, node).is_none() {
+            if !hub.has_member(app, node) {
                 return Routed::Answered(errors::respond(
                     Problem::not_found(format!("no {app} member {node:016x} on this gateway")),
                     ctx.want_html,
@@ -308,7 +317,7 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
         return Routed::Answered(full(app, ctx.want_html));
     };
     match picked.pick {
-        Pick::Configured => none_ready(gateway, app, &ctx, req).await,
+        Pick::Configured => none_ready(gateway, app, hub.standing(app), &ctx, req).await,
         Pick::Wait => Routed::Answered(full(app, ctx.want_html)),
         Pick::Unplaced => Routed::Answered(unplaced(app, ctx.want_html)),
         Pick::Member(node) => {

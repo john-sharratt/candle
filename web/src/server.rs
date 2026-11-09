@@ -718,11 +718,9 @@ async fn handle(
                     // Clustered, or members admitted and all still loading — the
                     // first of them to join then answers (§5.7). Only with no
                     // member admitted does the configured upstream serve.
-                    if gw.hub.admitted(cluster_app) {
-                        match route::route(gw, cluster_app, ctx(), req).await {
-                            Routed::Answered(res) => return res,
-                            Routed::Dumb(back) => req = back,
-                        }
+                    match route::route(gw, cluster_app, ctx(), req).await {
+                        Routed::Answered(res) => return res,
+                        Routed::Dumb(back) => req = back,
                     }
                     gw.hub.traffic.request(Class::Configured);
                 }

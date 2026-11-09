@@ -186,7 +186,7 @@ async fn members_join_route_and_carry_streams() {
     a.ready.store(true, Ordering::SeqCst);
     a.app.capacity_changed();
     until("clustered", || hub.clustered("zend")).await;
-    assert_eq!(hub.table("zend"), Some(routes()));
+    assert_eq!(hub.table("zend").as_deref(), Some(&routes()));
     // Only A is ready: every class goes to it.
     assert_eq!(
         hub.pick("zend", &Dispatch::Best, None, None, None).pick,

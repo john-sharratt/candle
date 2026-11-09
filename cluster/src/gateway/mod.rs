@@ -12,6 +12,8 @@ mod drain;
 mod hub;
 mod load;
 mod log;
+#[cfg(test)]
+mod member_fixture;
 mod open_answers;
 mod paxos_log;
 mod placement;
@@ -23,11 +25,14 @@ mod registry;
 mod relay;
 #[cfg(test)]
 mod replace_tests;
+mod routing;
 mod silence;
 mod status;
 mod tiebreak;
 mod traffic;
 pub mod upgrades;
+#[cfg(test)]
+mod view_tests;
 mod world_log;
 mod worlds_view;
 
@@ -49,6 +54,7 @@ pub use log::{CoordLog, Entry};
 pub use paxos_log::paxos_step;
 pub use queue::{Placing, RouteAt, Urgency, HOLD};
 pub use registry::{MemberView, Pick, Registry};
+pub use routing::{Routing, Standing};
 pub use status::{
     state_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
     TiebreakLease,
