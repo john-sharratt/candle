@@ -33,6 +33,7 @@ use npcd::engine::runtime::{Kind, Runtime};
 use npcd::engine::tick::Pace;
 use npcd::engine::workflow::parse_missions;
 use npcd::mind::Mind;
+use npcd::sim::phone::Who;
 use npcd::sim::shelf::Shelf;
 
 const ROOMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps");
@@ -123,7 +124,7 @@ fn standing(rt: &Arc<Runtime>, body: &str) -> Where {
 fn hand_out_phones(rt: &Arc<Runtime>, who: &[(&str, &str)]) {
     let world = rt.hosted.get(WORLD).expect("hosted");
     world.with_sim(|s| {
-        let roster: Vec<String> = who.iter().map(|(_, name)| (*name).to_string()).collect();
+        let roster: Vec<Who> = who.iter().map(|(body, name)| Who::new(body, name)).collect();
         s.set_roster(roster);
         for (body, name) in who {
             npcd::sim::seed::issue_handset(s, body, name);
@@ -131,32 +132,17 @@ fn hand_out_phones(rt: &Arc<Runtime>, who: &[(&str, &str)]) {
     });
 }
 
-/// **A message reaches the other character's mind.**
-///
-/// The one test that says the messaging system is real. A message is written
-/// into a thread, and nothing in the map carries it — the recipient may be on
-/// the other side of the world — so it arrives only if the sweep delivers it.
-/// Before that pass existed the sender was told "they will see it when they
-/// next look" and the recipient was never told there was anything to look at.
+/// **A private message is a purpose, not a line** (`docs/npc_conversations.md`
+/// §10): the pair's thread stands, nothing is written on it, and what was
+/// meant goes to the sender's conversation with the other, which says it.
 #[tokio::test]
-async fn a_message_reaches_the_other_characters_mind() {
+async fn a_private_message_is_a_purpose_for_the_conversation() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
-    // Deliberately in a *different room*: a phone is not a room, and this must
-    // not be arriving because they can see each other.
+    // Deliberately in a *different room*: a phone is not a room.
     maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
     hand_out_phones(&rt, &[("m1", "Maker-01"), ("m2", "Maker-02")]);
 
-    let opened = rt
-        .record_act(
-            1,
-            &act(
-                "reach_out",
-                json!({"to": "Maker-02", "intent": "that I need a word"}),
-            ),
-        )
-        .feed;
-    assert!(!opened.contains("meant to reach"), "{opened}");
     let sent = rt
         .record_act(
             1,
@@ -165,28 +151,17 @@ async fn a_message_reaches_the_other_characters_mind() {
                 json!({"via": "private", "to": "Maker-02", "intent": "that the redoubt burned twice"}),
             ),
         )
-        .feed;
-    assert!(!sent.contains("no conversation"), "{sent}");
-
-    // Nothing has reached the other mind until the world moves.
-    moment(&rt);
-    think(&rt, 1);
-
-    // What reaches it is a notice naming the sender; the words wait on the
-    // phone until it reads them.
-    let told = reads(&rt, 2);
+        .answer;
     assert!(
-        told.contains("a message from Maker-01"),
-        "the message never reached the other character: {told}"
+        sent.contains(
+            "You mean to tell Maker-02 that the redoubt burned twice; you will say it in your own words."
+        ),
+        "{sent}"
     );
-    assert!(
-        !told.contains("the redoubt burned twice"),
-        "the notice read the message out: {told}"
-    );
-    let read = rt
-        .record_act(2, &act("read", json!({"what": "Maker-01"})))
-        .feed;
-    assert!(read.contains("the redoubt burned twice"), "{read}");
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    let thread = world.sim(|s| s.threads.direct_between("m1", "m2").cloned());
+    let thread = thread.expect("the pair's thread stands");
+    assert!(thread.messages.is_empty(), "the intent was written on the thread");
 }
 
 // =========================================================================
@@ -206,17 +181,17 @@ async fn every_character_is_on_the_open_channel_without_asking_for_it() {
     hand_out_phones(&rt, &[("m1", "Maker-01"), ("m2", "Maker-02")]);
 
     let world = rt.hosted.get(WORLD).expect("hosted");
-    for name in ["Maker-01", "Maker-02"] {
-        let on = world.sim(|s| s.threads.names_for(name));
+    for body in ["m1", "m2"] {
+        let on = world.sim(|s| s.threads.names_for(body));
         assert!(
             on.iter().any(|t| t == npcd::sim::phone::CHANNEL),
-            "{name} is not on the channel: {on:?}"
+            "{body} is not on the channel: {on:?}"
         );
     }
 
     // And `message` binds to it, so it is reachable from the grammar rather
     // than merely present in the data.
-    let threads = world.sim(|s| s.threads_for("Maker-01", "m1"));
+    let threads = world.sim(|s| s.threads_for("m1"));
     assert!(threads.iter().any(|t| t == npcd::sim::phone::CHANNEL));
 }
 
@@ -291,9 +266,9 @@ async fn the_creator_can_speak_on_the_channel_and_the_cast_knows_who_it_is() {
     maker_at(&rt, 2, "m2", "vault-chronicle", "early-range");
     hand_out_phones(&rt, &[("m1", "Maker-01"), ("m2", "Maker-02")]);
 
-    let me = "Johnathan Sharratt (The Creator)";
+    let me = Who::new("u_creator", "Johnathan Sharratt (The Creator)");
     let heard = rt
-        .say_on_channel(WORLD, me, "that the lift on five has been left running")
+        .say_on_channel(WORLD, &me, "that the lift on five has been left running")
         .expect("the vault is hosted");
     assert_eq!(heard.len(), 2, "it did not reach the cast: {heard:?}");
 
@@ -525,7 +500,7 @@ async fn the_creator_can_leave_something_on_a_board_from_outside_the_world() {
 async fn speaking_on_a_channel_of_a_world_that_is_not_hosted_is_refused() {
     let rt = daemon();
     assert!(rt
-        .say_on_channel("no-such-world", "Somebody", "anything")
+        .say_on_channel("no-such-world", &Who::new("u_some", "Somebody"), "anything")
         .is_none());
     assert!(rt.channel("no-such-world", "Somebody").is_none());
 }
@@ -600,19 +575,23 @@ async fn your_own_message_does_not_come_back_to_you() {
 // A person talking to a character
 // =========================================================================
 
-/// **A person messaging a character is a party on a thread, not a side
-/// channel.** What the console posts lands in the same `sim::phone` the
-/// characters use, the character is told by the ordinary sweep, and it answers
-/// with the ordinary `message` act — so the reply is the character speaking
-/// from inside the world rather than a chat window bolted to the side of it.
+/// Wren, a person, by the account's public handle.
+fn wren() -> Who {
+    Who::new("u_wren", "Wren S")
+}
+
+/// **A person messaging a character is a party on the pair's thread, by
+/// account.** The line lands on the one thread the two of them have, said by
+/// the person's handle, and the character's conversation is handed it whole
+/// by the sweep — the words, not a notice for the mind.
 #[tokio::test]
-async fn a_person_can_message_a_character_and_it_is_told() {
+async fn a_person_can_message_a_character_and_its_conversation_is_handed_the_line() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     hand_out_phones(&rt, &[("m1", "Maker-01")]);
 
     let sent = rt
-        .message_npc(1, "Wren S", "that the third era will not reconcile", None)
+        .message_npc(1, &wren(), "the third era will not reconcile", None)
         .expect("the character has a body");
     assert_eq!(sent.with, "Maker-01");
     assert!(
@@ -620,69 +599,39 @@ async fn a_person_can_message_a_character_and_it_is_told() {
         "a character with a handset could not answer"
     );
     assert_eq!(sent.waiting_for_them, 1);
-
-    moment(&rt);
-    think(&rt, 1);
-    let told = reads(&rt, 1);
-    assert!(
-        told.contains("a message from Wren S"),
-        "the character was never told: {told}"
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    let line = world.sim(|s| {
+        s.threads
+            .direct_between("u_wren", "m1")
+            .and_then(|t| t.messages.first().cloned())
+    });
+    let line = line.expect("the line is on the pair's thread");
+    assert_eq!(
+        (line.from.as_str(), line.text.as_str(), line.account.as_deref()),
+        ("u_wren", "the third era will not reconcile", Some("u_wren"))
     );
-    let read = rt
-        .record_act(1, &act("read", json!({"what": "Wren S"})))
-        .feed;
-    assert!(read.contains("the third era will not reconcile"), "{read}");
-}
-
-/// And the character can answer, on the same thread, which the person then
-/// reads back.
-#[tokio::test]
-async fn a_character_answers_a_person_on_the_same_thread() {
-    let rt = daemon();
-    maker(&rt, 1, "m1", "band-one");
-    hand_out_phones(&rt, &[("m1", "Maker-01")]);
-    rt.message_npc(1, "Wren S", "that the third era will not reconcile", None);
-    moment(&rt);
-
-    // The character answers with the ordinary act, naming the thread the way it
-    // was told it — which is the person's own name.
-    let replied = rt
-        .record_act(
-            1,
-            &act(
-                "message",
-                json!({
-                    "via": "private",
-                    "to": "Wren S",
-                    "intent": "that I dated it against both neighbours",
-                }),
-            ),
-        )
-        .feed;
-    assert!(!replied.contains("no conversation"), "{replied}");
-
-    let (with, said) = rt.messages_with(1, "Wren S").expect("a body");
+    let (with, said) = rt.messages_with(1, "u_wren").expect("a body");
     assert_eq!(with, "Maker-01");
-    assert_eq!(said.len(), 2, "{said:?}");
-    assert_eq!(said[0].0, "Wren S");
-    assert_eq!(said[1].0, "Maker-01");
-    assert!(said[1].1.contains("dated it against both neighbours"));
+    assert_eq!(
+        said,
+        [("Wren S".to_string(), "the third era will not reconcile".to_string())]
+    );
 }
 
-/// A person is written onto the roster, or the character is offered nobody to
-/// answer — the messaging arguments are bound to who a handset can reach.
+/// A person is written onto the roster, so the character can reach them on
+/// the phone by name.
 #[tokio::test]
 async fn messaging_a_character_puts_the_person_within_its_reach() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     hand_out_phones(&rt, &[("m1", "Maker-01")]);
-    rt.message_npc(1, "Wren S", "anything", None);
+    rt.message_npc(1, &wren(), "anything", None);
 
     let within = rt.within(1);
     assert!(
-        within.threads.iter().any(|t| t == "Wren S"),
-        "the person is not a conversation the character can answer: {:?}",
-        within.threads
+        within.private.iter().any(|t| t == "Wren S"),
+        "the person is not someone the character can reach: {:?}",
+        within.private
     );
 }
 
@@ -693,7 +642,7 @@ async fn a_character_with_no_handset_says_it_cannot_answer() {
     let rt = daemon();
     maker(&rt, 1, "m1", "band-one");
     let sent = rt
-        .message_npc(1, "Wren S", "anything", None)
+        .message_npc(1, &wren(), "anything", None)
         .expect("has a body");
     assert!(!sent.can_reply);
 }
@@ -702,8 +651,8 @@ async fn a_character_with_no_handset_says_it_cannot_answer() {
 #[tokio::test]
 async fn messaging_a_character_with_no_body_reaches_nothing() {
     let rt = daemon();
-    assert!(rt.message_npc(404, "Wren S", "anything", None).is_none());
-    assert!(rt.messages_with(404, "Wren S").is_none());
+    assert!(rt.message_npc(404, &wren(), "anything", None).is_none());
+    assert!(rt.messages_with(404, "u_wren").is_none());
 }
 
 // =========================================================================

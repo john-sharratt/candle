@@ -276,7 +276,7 @@ fn dispatch(hosted: &Hosted, body: &str, act: &Act, said: Option<&str>) -> Outco
         // the larger of the two and its names are unambiguous.
         t if crate::engine::work::is_mine(t) => crate::engine::work::perform(hosted, body, act),
         t if agenda::is_mine(t) => agenda::perform(hosted, body, act),
-        _ => crate::engine::enact::perform(hosted, body, act, said),
+        _ => crate::engine::enact::perform_said(hosted, body, act, said),
     }
 }
 

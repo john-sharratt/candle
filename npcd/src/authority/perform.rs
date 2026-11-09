@@ -279,12 +279,17 @@ impl Runtime {
     /// mission moved. The world may run elsewhere: then the act goes to its
     /// authority with the decision it was made in, and a world that does not
     /// answer is told to the character as a refusal.
-    ///
-    /// `said` is the line the lease holder voiced for a phone act, and
-    /// `source` whether the act is the mind's or one of its conversations'
-    /// (`docs/npc_conversations.md` §7.1, §8): a conversation's act takes no
-    /// decision state and stamps none of the character's cooldowns.
-    pub async fn perform(
+    pub async fn perform(&self, npc: u64, act: &Act, pinned: Option<&Where>) -> Performed {
+        self.perform_said(npc, act, pinned, None, &ActSource::Mind)
+            .await
+    }
+
+    /// [`Self::perform`], where `said` is the line the lease holder voiced
+    /// for a phone act, and `source` whether the act is the mind's or one of
+    /// its conversations' (`docs/npc_conversations.md` §7.1, §8): a
+    /// conversation's act takes no decision state and stamps none of the
+    /// character's cooldowns.
+    pub async fn perform_said(
         &self,
         npc: u64,
         act: &Act,
@@ -422,7 +427,7 @@ impl Runtime {
         } else if zen_task::is_mine(act.tool) {
             self.zen_task_act(npc, act).await
         } else {
-            self.record_act(npc, act, said, source)
+            self.record_act_said(npc, act, said, source)
         };
         // What the act meant to tell somebody privately goes to the
         // character's conversation with them, wherever the character is held.

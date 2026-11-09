@@ -74,10 +74,13 @@ pub fn is_mine(tool: &str) -> bool {
 }
 
 /// Perform one act. [`Outcome::NotOfTheBody`] for anything not [`is_mine`].
-///
-/// `said` is the line the lease holder voiced for a phone act — what lands on
-/// the thread in place of its intent.
-pub fn perform(hosted: &Hosted, body: &str, act: &Act, said: Option<&str>) -> Outcome {
+pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
+    perform_said(hosted, body, act, None)
+}
+
+/// [`perform`], where `said` is the line the lease holder voiced for a phone
+/// act — what lands on the thread in place of its intent.
+pub fn perform_said(hosted: &Hosted, body: &str, act: &Act, said: Option<&str>) -> Outcome {
     let a = &act.args;
     match act.tool {
         "act" => act_on(hosted, body, a),
@@ -354,7 +357,7 @@ fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
         };
         let own = t
             .last_said_by(me)
-            .map(|m| format!(" You last said, {}: {}", ago(m.at_ms, now), m.text.trim()));
+            .map(|m| format!(" (you last said, {}: {})", ago(m.at_ms, now), m.text.trim()));
         let speaker = |id: &str| t.member(id).map_or(id.to_string(), |m| m.name.clone());
         let lines: Vec<String> = t
             .unread(me)
@@ -366,7 +369,7 @@ fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
         if lines.is_empty() {
             continue;
         }
-        said.push(format!("On {name}: {}.{own}", lines.join("; ")));
+        said.push(format!("On {name}: {}{own}", lines.join("; ")));
     }
     Some(match (said.is_empty(), all) {
         (true, true) => Outcome::Refused("Nothing on your phone is unread.".into()),
@@ -1679,57 +1682,67 @@ mod tests {
         let h = waste();
         h.with_sim(|s| {
             crate::sim::seed::issue_handset(s, "c1", "Wren");
-            s.threads.reach("Wren", "Soren");
+            let g = s.threads.open_group(
+                "the crew",
+                &[Who::new("c1", "Wren"), Who::new("c2", "Soren")],
+            );
             s.threads
-                .send("Soren", "Wren", "asks for the ore count")
+                .send_on(&g, "c2", Said::words("how much ore is left?"))
                 .unwrap();
         });
         let out = perform(&h, "c1", &act("scan", json!({})));
         let line = out.line().unwrap();
         assert!(line.contains("On your phone:\n"), "{line}");
-        assert!(line.contains("- Soren: 1 unread.\n"), "{line}");
-        assert!(
-            !line.contains("ore count"),
-            "the content stays in `read`: {line}"
-        );
+        assert!(line.contains("- the crew (a group of 2): 1 unread.\n"), "{line}");
+        assert!(!line.contains("ore"), "the content stays in `read`: {line}");
     }
 
-    /// **`read` reads a conversation on the phone**, by the name the character
-    /// calls it, or every one with something unread as its messages — marked
-    /// read as it is handed over, so nothing is left unread to remind it of.
+    /// **`read` reads a group on the phone**, by the name the character calls
+    /// it, or every one with something unread as its messages — marked read
+    /// as it is handed over, so nothing is left unread to remind it of — and
+    /// shows the reader its own last line there.
     #[test]
-    fn read_reads_a_conversation_on_the_phone() {
+    fn read_reads_a_group_on_the_phone() {
         let h = waste();
         h.with_sim(|s| {
             crate::sim::seed::issue_handset(s, "c1", "Wren");
-            s.threads.reach("Wren", "Soren");
+            let crew = s.threads.open_group(
+                "the crew",
+                &[Who::new("c1", "Wren"), Who::new("c2", "Soren")],
+            );
             s.threads
-                .send("Soren", "Wren", "asks for the ore count")
+                .send_on(&crew, "c1", Said::words("Back at noon."))
                 .unwrap();
-            s.threads.reach("Wren", "Kit");
-            s.threads.send("Kit", "Wren", "says hello").unwrap();
+            s.threads
+                .send_on(&crew, "c2", Said::words("How much ore is left?"))
+                .unwrap();
+            let ops = s.threads.open_group(
+                "ops",
+                &[Who::new("c1", "Wren"), Who::new("c3", "Kit")],
+            );
+            s.threads.send_on(&ops, "c3", Said::words("Hello.")).unwrap();
         });
-        let out = perform(&h, "c1", &act("read", json!({"what": "Soren"})));
+        let out = perform(&h, "c1", &act("read", json!({"what": "the crew"})));
         assert_eq!(
             out.line().unwrap(),
-            "On Soren: Soren: asks for the ore count\nTo answer, `reply` on the conversation \
-             it was said on, by that name."
+            "On the crew: Soren: How much ore is left? (you last said, just now: Back at noon.)\n\
+             To answer, `reply` on the conversation it was said on, by that name."
         );
-        let again = perform(&h, "c1", &act("read", json!({"what": "soren"})));
+        let again = perform(&h, "c1", &act("read", json!({"what": "The Crew"})));
         assert!(!again.happened(), "{again:?}");
         assert_eq!(
             again.line().unwrap(),
-            "You have read everything on Soren. Nothing has been said since."
+            "You have read everything on the crew. Nothing has been said since."
         );
 
         let all = perform(&h, "c1", &act("read", json!({"what": "messages"})));
         assert_eq!(
             all.line().unwrap(),
-            "On Kit: Kit: says hello\nTo answer, `reply` on the conversation it was said on, \
-             by that name."
+            "On ops: Kit: Hello.\nTo answer, `reply` on the conversation it was said on, by \
+             that name."
         );
         assert!(
-            h.sim(|s| s.threads.unread_threads("Wren").is_empty()),
+            h.sim(|s| s.threads.unread_threads("c1").is_empty()),
             "nothing left unread"
         );
         let none = perform(&h, "c1", &act("read", json!({"what": "messages"})));
@@ -1741,7 +1754,10 @@ mod tests {
     fn a_survey_leaves_out_a_phone_the_character_does_not_carry() {
         let h = tower_with(&[("c1", "Wren Weaver", "rampart")]);
         h.with_sim(|s| {
-            s.threads.reach("Wren Weaver", "Soren");
+            s.threads.open_group(
+                "the crew",
+                &[Who::new("c1", "Wren Weaver"), Who::new("c2", "Soren")],
+            );
         });
         let out = perform(&h, "c1", &act("scan", json!({})));
         assert!(!out.line().unwrap().contains("On your phone"), "{out:?}");

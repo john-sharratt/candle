@@ -35,7 +35,6 @@ use crate::discord::rejected::Rejected;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
 use crate::discord::world::hold::{FAILED_FOR, REFUSED_FOR};
-use crate::engine::speaking_as;
 use crate::sim::phone::Message;
 use crate::world::Hosted;
 
@@ -122,12 +121,6 @@ pub async fn post(
         deliver(a, bot, &hosted, &account, dm, &body, waiting).await?;
     }
     Ok(())
-}
-
-/// The name account `account`'s person speaks by in the world.
-pub(super) async fn speaking_name(a: &Authored, account: &str) -> Option<String> {
-    let identity = a.accounts.read().await.identity(account)?;
-    Some(speaking_as(&identity, &public_id(account), &a.roles))
 }
 
 /// What is waiting on a direct thread: its id, and its messages to post,

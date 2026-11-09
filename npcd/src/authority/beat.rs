@@ -480,6 +480,7 @@ mod tests {
             channel_id: 31,
             user_id: 77,
             mirrored_through: 4,
+            mirrored_part: 0,
             last_seen_discord: 900,
         };
         hosted.with_dms(|d| d.put(42, "0a1b", dm));

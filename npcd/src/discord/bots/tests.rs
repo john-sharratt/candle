@@ -20,7 +20,7 @@ use tokio::time::{sleep, timeout};
 use web::auth::session::Identity;
 
 use super::*;
-use crate::accounts::{key_of, user_id_of, Accounts, DiscordUser};
+use crate::accounts::{key_of, public_id, user_id_of, Accounts, DiscordUser};
 use crate::authority::Role;
 use crate::collections::Libraries;
 use crate::discord::client::Client;
@@ -36,7 +36,8 @@ use crate::mind::Mind;
 use crate::npcs::{self, Npcs};
 use crate::projection::Source;
 use crate::registry::Registry;
-use crate::sim::phone::{Message, Origin};
+use crate::discord::post::Target;
+use crate::sim::phone::{direct_id, Message, Origin, Said, Who};
 use crate::world::Hosted;
 use crate::world_state::store as world_store;
 
@@ -54,6 +55,8 @@ const WREN: u64 = 77;
 const CHANNEL: u64 = 31;
 /// What Wren is called in the world: the name the account speaks by.
 const WREN_S: &str = "Wren S";
+/// Zen's body in the vault.
+const ZEN_BODY: &str = "zen";
 
 struct Daemon {
     a: Arc<Authored>,
@@ -216,11 +219,16 @@ impl Daemon {
         key_of(&identity(OWNER))
     }
 
+    /// Wren on the threads: by the account's public handle.
+    fn wren(&self) -> Who {
+        Who::new(&public_id(&self.account()), WREN_S)
+    }
+
     /// Wren's thread with Zen.
     fn thread(&self) -> Vec<Message> {
         self.hosted.sim(|s| {
             s.threads
-                .direct_between(WREN_S, "Zen")
+                .direct_between(&self.wren().id, ZEN_BODY)
                 .map(|t| t.messages.clone())
                 .unwrap_or_default()
         })
@@ -232,10 +240,28 @@ impl Daemon {
 
     /// Zen says `text` to Wren.
     fn zen_says(&self, text: &str) {
+        let wren = self.wren();
         self.hosted.with_sim(|s| {
-            s.threads.reach("Zen", WREN_S);
-            s.threads.send("Zen", WREN_S, text).unwrap();
+            let id = s.threads.reach(&Who::new(ZEN_BODY, "Zen"), &wren);
+            s.threads.send_on(&id, ZEN_BODY, Said::words(text)).unwrap();
         });
+    }
+
+    /// Everything the fake Discord was sent, with each post's nonce left out:
+    /// the nonce is a digest of where the post goes, which
+    /// [`a_dm_post_carries_its_parts_nonce`] checks on its own.
+    fn seen(&self) -> Vec<Seen> {
+        self.discord
+            .seen()
+            .into_iter()
+            .map(|mut s| {
+                if let Some(o) = s.body.as_object_mut() {
+                    o.remove("nonce");
+                    o.remove("enforce_nonce");
+                }
+                s
+            })
+            .collect()
     }
 
     /// Every post the fake was sent, as `(channel path, content)`.
@@ -454,7 +480,7 @@ async fn echoes_and_server_messages_are_not_heard() {
     assert_eq!(
         d.thread()
             .iter()
-            .map(|m| m.intent.as_str())
+            .map(|m| m.text.as_str())
             .collect::<Vec<_>>(),
         ["the real one"]
     );
@@ -477,21 +503,24 @@ async fn a_dm_is_heard_in_the_world_and_answered_on_the_next_beat() {
     d.until("heard", |d| !d.thread().is_empty()).await;
 
     let heard = d.thread();
+    let wren = d.wren();
     assert_eq!(
         (
             heard[0].from.as_str(),
-            heard[0].intent.as_str(),
+            heard[0].text.as_str(),
             heard[0].seq,
-            heard[0].origin
+            heard[0].origin,
+            heard[0].account.as_deref(),
         ),
         (
-            WREN_S,
+            wren.id.as_str(),
             "are you there?",
             1,
             Some(Origin::Discord {
                 message: 901,
                 channel: CHANNEL
-            })
+            }),
+            Some(wren.id.as_str()),
         )
     );
     assert_eq!(
@@ -500,6 +529,7 @@ async fn a_dm_is_heard_in_the_world_and_answered_on_the_next_beat() {
             channel_id: CHANNEL,
             user_id: WREN,
             mirrored_through: 1,
+            mirrored_part: 0,
             last_seen_discord: 901,
         })
     );
@@ -515,7 +545,7 @@ async fn a_dm_is_heard_in_the_world_and_answered_on_the_next_beat() {
     // Typing while the DM waited on it, then the answer.
     let agent = d.discord.seen()[0].user_agent.clone();
     assert_eq!(
-        d.discord.seen(),
+        d.seen(),
         [
             as_bot(
                 "POST",
@@ -531,14 +561,48 @@ async fn a_dm_is_heard_in_the_world_and_answered_on_the_next_beat() {
     d.rt.beat(&d.hosted);
     let records = world_store::read(&d.a.npcs.substrate(), WORLD);
     assert_eq!(
-        records.get(&format!("discord/dm/{}/{}", d.zen, d.account())),
+        records.get(&format!("discord/direct/{}/{}", d.zen, d.account())),
         Some(&json!({
             "channel_id": CHANNEL,
             "user_id": WREN,
             "mirrored_through": 2,
+            "mirrored_part": 0,
             "last_seen_discord": 901,
         }))
     );
+}
+
+/// **A DM post carries its part's nonce, enforced**: the same part of the
+/// same line posted twice inside Discord's window is one message.
+#[tokio::test]
+async fn a_dm_post_carries_its_parts_nonce() {
+    let d = daemon(vec![Script::Serve]).await;
+    d.link(OWNER, WREN).await;
+    d.online().await;
+    d.gateway.dispatch(dm(901, WREN, "are you there?"));
+    d.until("heard", |d| !d.thread().is_empty()).await;
+    d.zen_says("I am.");
+    d.until("posted", |d| {
+        d.dm().is_some_and(|dm| dm.mirrored_through == 2)
+    })
+    .await;
+    let thread = direct_id(&d.wren().id, ZEN_BODY);
+    let want = Target {
+        kind: "dm",
+        channel: CHANNEL,
+        thread: &thread,
+        seq: 2,
+        part: 0,
+    }
+    .nonce(WORLD);
+    let sent = d
+        .discord
+        .seen()
+        .into_iter()
+        .find(|s| s.path.ends_with("/messages") && s.method == "POST")
+        .expect("the answer was posted");
+    assert_eq!(sent.body["nonce"], json!(want));
+    assert_eq!(sent.body["enforce_nonce"], json!(true));
 }
 
 /// The same Discord message twice is heard once.
@@ -578,7 +642,7 @@ async fn a_429_is_waited_out_and_the_posts_stay_in_order() {
             .into_iter()
             .map(|(_, content)| content)
             .collect::<Vec<_>>(),
-        ["One.", "One.", "Two."]
+        ["one", "one", "two"]
     );
 }
 
@@ -614,7 +678,7 @@ async fn a_500_is_posted_again_once_its_hold_is_over() {
             .into_iter()
             .map(|(_, content)| content)
             .collect::<Vec<_>>(),
-        ["One.", "One."]
+        ["one", "one"]
     );
 }
 
@@ -653,7 +717,7 @@ async fn the_character_writing_first_opens_a_dm() {
     .await;
     let agent = d.discord.seen()[0].user_agent.clone();
     assert_eq!(
-        d.discord.seen(),
+        d.seen(),
         [
             as_bot(
                 "POST",
@@ -719,6 +783,7 @@ async fn the_gap_fetch_hears_a_missed_dm() {
                 channel_id: CHANNEL,
                 user_id: WREN,
                 mirrored_through: 0,
+                mirrored_part: 0,
                 last_seen_discord: 900,
             },
         )
@@ -745,7 +810,7 @@ async fn the_gap_fetch_hears_a_missed_dm() {
     assert_eq!(
         d.thread()
             .iter()
-            .map(|m| (m.intent.as_str(), m.origin))
+            .map(|m| (m.text.as_str(), m.origin))
             .collect::<Vec<_>>(),
         [
             (

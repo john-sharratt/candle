@@ -41,6 +41,7 @@ use npcd::authority::Role;
 use npcd::engine::act::Act;
 use npcd::engine::runtime::Runtime;
 use npcd::mind::Mind;
+use npcd::sim::phone::Who;
 use npcd::world::Hosted;
 use npcd::world_state::sim_records;
 use serde_json::json;
@@ -515,7 +516,7 @@ async fn a_world_has_one_authority_and_its_cast_runs_where_it_is_lent() {
             world,
             WorldOp::Message {
                 npc: speaker,
-                from: "An Operator".into(),
+                from: Who::new("u_operator", "An Operator"),
                 text: "come up".into(),
                 origin: None,
             },

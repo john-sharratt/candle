@@ -2800,7 +2800,7 @@ impl Runtime {
             let _ = sim.threads.send_on(&id, &from.id, said);
             MessageSent {
                 with: them.clone(),
-                waiting_for_them: sim.threads.waiting_for(&body),
+                waiting_for_them: sim.threads.get(&id).map_or(0, |t| t.unread_for(&body)),
                 // A character with no handset cannot answer at all — the
                 // messaging acts are gated on carrying one — and saying so is
                 // better than a console that looks like it is working.
@@ -3097,7 +3097,19 @@ impl Runtime {
     /// ours for now` — which is what the character asked for, not what came of
     /// it. `body::ANSWERS` was an early, narrower version of exactly this
     /// concern, written when the feed was the only channel there was.
-    pub fn record_act(&self, npc_id: u64, act: &Act, said: Option<&str>, source: &ActSource) -> Recorded {
+    pub fn record_act(&self, npc_id: u64, act: &Act) -> Recorded {
+        self.record_act_said(npc_id, act, None, &ActSource::Mind)
+    }
+
+    /// [`Self::record_act`], with the line the lease holder voiced for a
+    /// phone act and where the act came from.
+    pub fn record_act_said(
+        &self,
+        npc_id: u64,
+        act: &Act,
+        said: Option<&str>,
+        source: &ActSource,
+    ) -> Recorded {
         let outcome = self.act_on_world_said(npc_id, act, said, source);
         let landed = outcome.happened();
         // What the character is told, whatever the verdict. `NotOfTheBody` has
@@ -3489,7 +3501,7 @@ impl Runtime {
                 .cloned()
                 .unwrap_or_default(),
         };
-        let wrote = self.record_act(npc_id, &write, None, &ActSource::Mind);
+        let wrote = self.record_act(npc_id, &write);
         if !wrote.landed {
             return refused(wrote.answer);
         }
@@ -6688,7 +6700,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                             // is refused, never posted as its intent.
                             let performed = match rt.voice_post(id, a).await {
                                 Ok(said) => {
-                                    rt.perform(
+                                    rt.perform_said(
                                         id,
                                         a,
                                         pinned_at.as_ref(),
@@ -7387,7 +7399,7 @@ mod tests {
         let hosted = rt.hosted.get(WORLD).expect("hosted");
 
         let sent = rt
-            .message_npc(1, "Johnathan Sharratt", "are you there", None)
+            .message_npc(1, &Who::new("u_john", "Johnathan Sharratt"), "are you there", None)
             .expect("the character could be messaged");
         assert_eq!(sent.with, "Maker-01");
         assert_eq!(sent.waiting_for_them, 1, "it was not written to the thread");
@@ -7415,7 +7427,7 @@ mod tests {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         let hosted = rt.hosted.get(WORLD).expect("hosted");
-        rt.message_npc(1, "Johnathan Sharratt", "are you there", None);
+        rt.message_npc(1, &Who::new("u_john", "Johnathan Sharratt"), "are you there", None);
         rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
 
         assert_eq!(

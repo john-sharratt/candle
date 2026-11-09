@@ -1684,7 +1684,7 @@ fn a_second_group_of_the_same_name_is_refused() {
     // One group of its own, beside the standing channel — so two arms, not the
     // three a duplicate would have made.
     h.sim(|s| {
-        let mut names = s.threads.names_for("Wren");
+        let mut names = s.threads.names_for("c1");
         names.sort();
         assert_eq!(names, vec!["none", npcd::sim::phone::CHANNEL], "{names:?}");
     });
@@ -1726,7 +1726,7 @@ fn leaving_a_group_does_not_end_it_for_everybody_else() {
         "the open channel was offered as something to leave"
     );
     h.sim(|s| {
-        let mut names = s.threads.names_for("Soren");
+        let mut names = s.threads.names_for("c2");
         names.sort();
         assert_eq!(names, vec!["the boundary", npcd::sim::phone::CHANNEL]);
     });
