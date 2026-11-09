@@ -1877,6 +1877,28 @@ impl TestParams {
                         step = (step * 3 / 4).max(1);
                     }
                     let takes = takes_at(step);
+                    if repeat == 0 {
+                        // Each pass's price beside the ground it was approved
+                        // against, and how much of that ground the weight side
+                        // was counted on to concede — what a placement that
+                        // refuses the pass is read beside.
+                        let depth = idx
+                            .iter()
+                            .map(|&s| session.sequence_offset(s).unwrap_or(0))
+                            .max()
+                            .unwrap_or(0);
+                        if let Some(c) = prefill_pass_cost(model, &session, &idx, &takes) {
+                            println!(
+                                "    pass: {} rows from depth {depth}: tier {} + KV {} of {} MiB \
+                                 ground ({} MiB of it the weight side's to concede)",
+                                takes.iter().sum::<usize>(),
+                                c.tier >> 20,
+                                c.kv >> 20,
+                                c.ground >> 20,
+                                model.reclaimable_kv_bytes() >> 20,
+                            );
+                        }
+                    }
                     let mut parts: Vec<Tensor> = Vec::with_capacity(active.len());
                     for (&i, &take) in active.iter().zip(&takes) {
                         let t = &user_tensors[i];
@@ -1886,6 +1908,17 @@ impl TestParams {
                     let logits = model
                         .forward_wave(&mut session, &[], &[], &idx, &parts, &[], &[], 0, nl, None)?
                         .logits_owned()?;
+                    // Each pass advances the sequences it wrote, as the scheduler
+                    // advances a chunk's members after their wave: the next
+                    // pass is priced from the depth this one left, and its
+                    // selection carve follows that depth. Left to the next
+                    // forward's entry reconciler, the logical offset trailed the
+                    // backing between passes, and a 128K prompt's second pass was
+                    // priced from depth 0 — a 42,992 MiB tier for a pass that
+                    // placed 57,280.
+                    for (&s, &take) in idx.iter().zip(&takes) {
+                        session.advance_sequence(s, take)?;
+                    }
                     for (k, &i) in active.iter().enumerate() {
                         if done[i] == lens[i] {
                             finals[i] = logits.get(k).cloned();
@@ -1946,20 +1979,17 @@ impl TestParams {
         // Advance each sequence to the offset its own (ragged) prompt puts it
         // at — **to a target, not by a length.**
         //
-        // A single prefill wave leaves the logical offset untouched, so adding
-        // `ulen` was right. A *chunked* prefill is not: at each wave after the
-        // first, the wave-entry reconciler finds the logical offset behind the
-        // physical backing the previous slices wrote and advances it to match.
-        // Adding `ulen` on top of that counts the prompt twice, and the second
-        // count is silent — it surfaces later, in the decode step, as a
-        // sequence standing at roughly twice its real depth: measured as
-        // "cannot truncate sequence 0 to 62934 tokens — it stands at 32172" on
-        // the recurrent lineage, and as "computed write len 30720 is invalid
-        // for chunk_size 32" on the qwen4exp engine.
+        // A single prefill wave leaves the logical offset untouched, so the whole
+        // prompt is still to be counted. A *sliced* prefill has counted it
+        // already, pass by pass. Adding `ulen` on top of that counts the prompt
+        // twice, and the second count is silent — it surfaces later, in the
+        // decode step, as a sequence standing at roughly twice its real depth:
+        // measured as "cannot truncate sequence 0 to 62934 tokens — it stands
+        // at 32172" on the recurrent lineage, and as "computed write len 30720
+        // is invalid for chunk_size 32" on the qwen4exp engine.
         //
         // Advancing to `base + ulen` is correct for both shapes and needs to
-        // know nothing about which of them ran, or about how much of the walk
-        // the reconciler already did.
+        // know nothing about which of them ran.
         for ((&seq_idx, &ulen), &base) in sequence_indices
             .iter()
             .zip(user_lens.iter())

@@ -32,10 +32,11 @@ references, below and in full in §6.8).
    footprint, on a slower bus: 138.1 t/s on a PCIe 3.0 RTX 3090 with 36–49% of
    the experts in VRAM, against 93–94 on a PCIe 5.0 RTX 5070 with 14% **[E90]**
    and 93.0 on a PCIe Gen4 RTX 3090 at 3-bit **[E93]**. On Strata's own benchmark
-   requests on Blackwell, Strata still leads single-session decode by 13–14%:
-   179.4 / 175.7 / 165.0 t/s on an RTX 5090 against our 156.6 / 152.5 / 141.6
-   through the engine on the RTX PRO 5000 at 4K / 32K / 128K, while our prefill
-   leads at 4K, 6,019.5 against 4,269.8 (§6.5).
+   requests on Blackwell, Strata still leads single-session decode by 5–14%,
+   median against median: 179.4 / 175.7 / 165.0 t/s on an RTX 5090 against our
+   168.4 / 167.2 / 141.6 on the RTX PRO 5000 at 4K / 32K / 128K, and our fastest
+   single run at 4K reached 181.9; our prefill leads at 4K, 6,064.3 against
+   4,269.8 (§6.5).
 
 2. **Context length is free.** Flash-Next keeps **99% of its prefill and 111% of
    its decode from 32K to 128K** — decode is *faster* at 128K — while the other
@@ -67,7 +68,7 @@ references, below and in full in §6.8).
    10–45× **[E66 · E67]**.
 
 5. **In aggregate, one card out-decodes llama.cpp's best published rate — by
-   24× like for like, and up to 36×.** Serving concurrent conversations from one card, this engine's
+   38× like for like.** Serving concurrent conversations from one card, this engine's
    aggregate decode beats the best published llama.cpp single-stream figure for
    the same model on the same class of card: **2.6–36.3× on the RTX 3090**
    (Qwen3-8B 383.8 vs 115.3 t/s; Qwen3.5-35B-A3B 1,228.8 vs 111.2; Qwen3.8-27B
@@ -75,7 +76,7 @@ references, below and in full in §6.8).
    a 130K context on UD-Q4_K_XL against our ~700-token prompt on Q2_KO experts, so
    the least like-for-like row),
    **1.4–3.7× on 16 GB cards** (Qwen3-8B; Qwen3.6-35B-A3B; Flash-Next), and
-   **3.1–24.2× on Blackwell** (Flash-Next 1,163.9 at ×16 vs 48.02 on an RTX 5090,
+   **3.2–37.9× on Blackwell** (Flash-Next 1,819.3 at ×16 vs 48.02 on an RTX 5090,
    both from a short prompt, ours on 4-bit experts to its 2-bit — the most
    like-for-like row; Qwen3.5-35B-A3B 2,869.9 vs 194.0) **[I8 · I16 · I18 ·
    E1 · E17 · E19 · E21 · E27 · E45 · E46 · E51]**. On 16 GB that now includes the
@@ -144,7 +145,7 @@ references, below and in full in §6.8).
 | **I13** | Thirteen gates: 213 rows on the RTX 3090 and 192 on the laptop with no failing session; the same gates on the 72 GB card | §3.7–§3.9; §5 provenance table |
 | **I14** | C10 on the RTX 3090's current build: Qwen3.5-35B 7.03×, Qwen3.6-35B 6.45×, Qwen3-8B 5.82×, Flash-Next 5.80× at ×8, every session validated | §3.8 |
 | **I15** | Engine probes. RTX 3090 (2026-10-05): Qwen3-30B-A3B 20/20, Qwen3.6-35B-A3B 16/16 with speculative decode, Flash-Next 8/8; worst sustained efficiency 99% / 99% / 98%; weight zone at its limit in all three. Again on 2026-10-07 at `7aecbeab3`, the same stories, 99% / 98% / 97%. On 2026-10-10 at `c375834c8`, the same stories, 59% / 98% / 79% — the Qwen3-30B and Flash-Next probes failing the efficiency gate. RTX 4090 Mobile, Flash-Next: story 8/8, efficiency 100%, uptake 73% (2026-09-30) and 88% (2026-09-29) | §3.8 *Engine probes*; §3.9 *Engine probes* |
-| **I16** | Aggregate decode against llama.cpp's best published single-stream rate, same model and card class. Each of ours is the best validated decode row of the latest sweep on that card. RTX 3090 (2026-10-10, `c375834c8`): Qwen3-8B C8 ×10 383.8 vs 115.3; Qwen3-30B-A3B BF16 ×10 400.5 vs 153.6; Qwen3.5-35B C10 ×16 1,228.8 vs 111.2; Qwen3.6-35B C10 ×16 1,346.3 vs 157.66; Qwen3.8-27B C8 ×20 358.7 vs 65.28 (MTP); Llama-2-7B BF16 ×48 934.9 vs 161.89; Flash-Next BF16 ×16 543.8 vs 15 (published at 130K context, UD-Q4_K_XL; ours Q2_KO experts, ~700-token prompt; I18). 16 GB (RTX 4090 Mobile, 2026-10-10, `21c36efbd`): Qwen3-8B C8 ×10 308.4 vs 102.7 (RTX 4080); Qwen3.6-35B C10 ×16 336.7 vs 183.29 / 249.33 MTP (RTX 4080, IQ3_S resident); Flash-Next BF16 ×8 108.5 vs 27.5–29 (RTX 5080). Blackwell (our RTX PRO 5000 vs a published RTX 5090, 2026-10-10, `21c36efbd`): Flash-Next BF16 ×16 1,163.9 vs 48.02 (E52, UD-Q2_K_XL, short prompt; ours Q4_KOEXP, ~700-token prompt); Qwen3-8B C8 ×10 622.3 vs 200.4; Qwen3-30B-A3B BF16 ×10 939.2 vs 226.1; Qwen3.5-35B C10 ×64 2,869.9 vs 194.0; Qwen3.6-35B C10 ×64 2,761.0 vs 333.55 (MTP); Llama-2-7B BF16 ×48 1,638.4 vs 300.40 | §3.7–§3.9 ladders; §6.2–§6.5 |
+| **I16** | Aggregate decode against llama.cpp's best published single-stream rate, same model and card class. Each of ours is the best validated decode row of the latest sweep on that card. RTX 3090 (2026-10-10, `c375834c8`): Qwen3-8B C8 ×10 383.8 vs 115.3; Qwen3-30B-A3B BF16 ×10 400.5 vs 153.6; Qwen3.5-35B C10 ×16 1,228.8 vs 111.2; Qwen3.6-35B C10 ×16 1,346.3 vs 157.66; Qwen3.8-27B C8 ×20 358.7 vs 65.28 (MTP); Llama-2-7B BF16 ×48 934.9 vs 161.89; Flash-Next BF16 ×16 543.8 vs 15 (published at 130K context, UD-Q4_K_XL; ours Q2_KO experts, ~700-token prompt; I18). 16 GB (RTX 4090 Mobile, 2026-10-10, `21c36efbd`): Qwen3-8B C8 ×10 308.4 vs 102.7 (RTX 4080); Qwen3.6-35B C10 ×16 336.7 vs 183.29 / 249.33 MTP (RTX 4080, IQ3_S resident); Flash-Next BF16 ×8 108.5 vs 27.5–29 (RTX 5080). Blackwell (our RTX PRO 5000 vs a published RTX 5090; the best validated row of the 2026-10-10 sweep at `21c36efbd` and the 2026-11-10 sweep at `3e51cb8c0`, `results/sweep_rtx_pro_5000_72gb_2026-11-10.md`): Flash-Next BF16 ×16 1,819.3 vs 48.02 (E52, UD-Q2_K_XL, short prompt; ours Q4_KOEXP, ~700-token prompt); Qwen3-8B C8 ×10 632.9 vs 200.4; Qwen3-30B-A3B BF16 ×10 997.4 vs 226.1; Qwen3.5-35B C10 ×64 2,869.9 vs 194.0; Qwen3.6-35B C10 ×64 2,761.0 vs 333.55 (MTP); Llama-2-7B BF16 ×48 1,675.0 vs 300.40 | §3.7–§3.9 ladders; §6.2–§6.5 |
 | **I17** | Flash-Next gate on the RTX 3090, build `e596fad8d` (2026-09-30) → `5776799ac` (2026-10-05) → `7aecbeab3` (2026-10-07) → `c375834c8` (2026-10-10): warm ×1 decode 24.3 → 73.3 → 122.8 → 138.1 t/s, ×8 113.2 → 233.8 → 413.7 → 477.2, C10 ×8 95.6 → 255.1 → 306.3 → 361.6, BF16 ×4 prefill 1,033.4 → 1,229.5 → 1,351.8 → 1,570.5, every row validated on all four. On the laptop, builds `9be7b182c` → `a475e852c`: prefill 430.7 → 627.0 t/s (BF16 ×4) | §3.8 *Qwen3.8-Flash-Next*; `results/performance_rtx_3090_24gb_rows_2026-09-30.tsv`, `results/performance_rtx_3090_24gb_rows_2026-10-05.tsv`, `results/sweep_rtx_3090_24gb_2026-10-07.md`, `results/sweep_rtx_3090_24gb_2026-10-10.md`; §7.3 |
 | **I18** | Flash-Next on the RTX 3090 (i7-10700K, 64 GB RAM), Q2_KO experts, build `c375834c8` (2026-10-10): full ladder incl. ×16, every row validated; BF16 ×1 warm 556.5 / 138.1 t/s, ×4 1,570.5 prefill and 320.5 aggregate decode, ×8 477.2, ×16 2,301.9 / 543.8, C10 ×8 361.6, C10 5.80–5.83×; engine probe story 8/8, efficiency 79% (97% at `7aecbeab3`), 110% weight uptake | §3.8 *Qwen3.8-Flash-Next*; `results/sweep_rtx_3090_24gb_2026-10-10.md` |
 
@@ -677,37 +678,41 @@ sits behind ~128K tokens of unrelated padding, and the rename still validates.
 
 #### Width
 
-The flagship's ladder on the RTX PRO 5000 (2026-10-10, build `21c36efbd`),
-aggregate across the batch, speculative decode on:
+The flagship's ladder on the RTX PRO 5000, aggregate across the batch,
+speculative decode on. Two sweeps: 2026-10-10 at build `21c36efbd` under WDDM,
+and 2026-11-10 at build `3e51cb8c0` under TCC, the best of three runs a row
+(`results/sweep_rtx_pro_5000_72gb_2026-11-10.md`):
 
-| Mode | Ctx | Prefill t/s | Decode t/s | Compress | Peak tokens |
-|---|---:|---:|---:|---:|---:|
-| BF16 | 1 (cold) | 3,719.5 | 274.2 | — | 905 |
-| BF16 | 1 (warm) | 4,688.0 | 295.2 | — | 905 |
-| BF16 | 4 | 7,024.1 | 828.3 | — | 3,662 |
-| BF16 | 8 | 6,938.7 | 1,008.2 | — | 7,284 |
-| BF16 | 16 | 6,857.5 | 1,163.9 | — | 14,554 |
-| C0 | 2 | 5,648.0 | 462.2 | 2.22× | 1,850 |
-| C5 | 2 | 5,657.6 | 455.5 | 4.15× | 1,850 |
-| C5 | 8 | 7,002.6 | 926.8 | 4.15× | 7,284 |
-| C8 | 2 | 5,648.8 | 453.1 | 5.53× | 1,850 |
-| C10 | 2 | 5,650.2 | 441.9 | 7.13× | 1,466 |
-| C10 | 8 | 7,000.8 | 885.8 | 7.13× | 5,748 |
+| Mode | Ctx | Prefill 10-10 | Decode 10-10 | Prefill 11-10 | Decode 11-10 | Compress | Peak tokens |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| BF16 | 1 (cold) | 3,719.5 | 274.2 | 2,570.6 | 255.9 | — | 905 |
+| BF16 | 1 (warm) | 4,688.0 | 295.2 | 4,970.0 | 308.2 | — | 905 |
+| BF16 | 4 | 7,024.1 | 828.3 | 6,749.8 | 822.4 | — | 3,662 |
+| BF16 | 8 | 6,938.7 | 1,008.2 | 7,164.4 | **1,272.8** | — | 7,284 |
+| BF16 | 16 | 6,857.5 | 1,163.9 | 6,655.6 | **1,819.3** | — | 14,554 |
+| C0 | 2 | 5,648.0 | 462.2 | 5,033.6 | 468.9 | 2.22× | 1,850 |
+| C5 | 2 | 5,657.6 | 455.5 | 5,903.2 | 466.8 | 4.15× | 1,850 |
+| C5 | 8 | 7,002.6 | 926.8 | 7,077.2 | 1,140.9 | 4.14× | 7,284 |
+| C8 | 2 | 5,648.8 | 453.1 | 5,942.2 | 436.2 | 5.52× | 1,850 |
+| C10 | 2 | 5,650.2 | 441.9 | 5,936.9 | 429.8 | 7.14× | 1,466 |
+| C10 | 8 | 7,000.8 | 885.8 | 7,396.7 ✗ | 1,051.6 ✗ | 7.14× | 5,748 |
 
-Decode returns **3.4× single-session throughput at 8 contexts** (295.2 → 1,008.2)
-and gains another 15% from 8 to 16; prefill is flat from ×4 to ×16 (6,858–7,024),
-so width buys decode, not prefill. The ladder's C0→C10 span costs **4% of decode
-at ×2** (462.2 → 441.9) for **3.2× more compression**, and C10 ×8 holds 88% of
-BF16 ×8 decode (885.8 against 1,008.2) at 7.13×. The ×1 rows are the gate's story
-rewrite, an easy task for the drafter; Strata's free-text requests decode 156.6 t/s
-through the engine at 4K (§6.5).
+On the later sweep decode returns **4.1× single-session throughput at 8 contexts**
+(308.2 → 1,272.8) and gains another 43% from 8 to 16; prefill is flat from ×4 to
+×16 (6,656–7,164), so width buys decode, not prefill. The rows from ×8 up gained
+23–56% between the sweeps and the rows below were flat, the shape of a per-step
+cost the wide waves no longer pay. C10 ×8 validated 7/8 sessions on all three runs
+of the later sweep — it sits on the validation boundary there — so 885.8 at 7.13×
+is the validated row. The ×1 rows are the gate's story rewrite, an easy task for
+the drafter; Strata's free-text requests decode 168.4 t/s at 4K (§6.5).
 
 ### 3.7 Width across the fleet
 
 BF16 at one context against each model's widest measured point. Prompts are
 ~700 tokens, so this axis is unaffected by context windows. Every cell is the
-latest sweep, 2026-10-10 at build `21c36efbd`
-(`results/sweep_rtx_pro_5000_72gb_2026-10-10_main.md`).
+2026-10-10 sweep at build `21c36efbd`
+(`results/sweep_rtx_pro_5000_72gb_2026-10-10_main.md`), except Flash-Next's, from
+the 2026-11-10 sweep at `3e51cb8c0` (§3.6).
 
 | Model | ctx=1 prefill / decode | widest measured | prefill / decode |
 |---|---|---|---|
@@ -721,14 +726,14 @@ latest sweep, 2026-10-10 at build `21c36efbd`
 | Llama-2-7B | 7,974.8 / 163.4 | ×48 | 11,353.2 / 1,638.4 |
 | Qwen3.5-9B | 10,192.3 / 199.8 | ×20 (C8) | 11,620.1 / 1,607.7 |
 | Qwen3.8-27B | 3,282.2 / 75.4 | ×40 (C10) | 3,420.7 / 734.3 |
-| Qwen3.8-Flash-Next | 4,688.0 / 295.2 (warm) ² | ×16 | 6,857.5 / 1,163.9 |
+| Qwen3.8-Flash-Next | 4,970.0 / 308.2 (warm) ² | ×16 | 6,655.6 / 1,819.3 |
 | DeepSeek-V4-Flash | 319.0 / 18.9 (warm) | ×16 | 1,177.1 / 114.4 |
 
 ¹ The ladder's early rows run slow: from Q4_0 ×4 on every row prefills at
 20,700–25,600 t/s, and the C0–C7 ×1 rows decode at 188–192 t/s.
 
 ² Speculative, at a draft ceiling of 4 on the gate's story rewrite, an easy task for
-the drafter. On Strata's free-text requests the engine decodes 156.6 t/s at 4K on the
+the drafter. On Strata's free-text requests the engine decodes 168.4 t/s at 4K on the
 same build (§6.5).
 
 Two shapes appear here. **Prefill saturates early** on every model — most are
@@ -2058,8 +2063,10 @@ Qwen3.8-Flash-Next is 125B + 51B n-gram + 4B MTP, 6B active** (§3.1, E60).
 | *RTX 5070 12 GB* | same | Strata 0.1.36, HTTP server, 4 concurrent | Q2_0 | same | n/s | 32K | — | 63.1 aggregate (70.7 for the same four requests run one at a time) | E92 |
 | RTX 3090 **(ours, §3.8)** | i7-10700K, 64 GB | this engine, BF16 ×1 warm / BF16 ×8 / C10 ×8 | Q2_KO experts | experts streamed VRAM→pinned RAM | BF16 / C10 | ~700-tok prompt | 556.5 / 2,051.7 / 2,078.9 | 138.1 / 477.2 / 361.6 (**MTP**) | — |
 | RTX 4090 Mobile **(ours, §3.9, `21c36efbd`)** | Core Ultra 9 185H, 32 GB | this engine, BF16 ×1 cold / ×1 warm / ×8 / C5 ×8 / C10 ×8 | Q2_KO experts | experts streamed VRAM→RAM→NVMe | BF16 / C5 / C10 | ~700-tok prompt | 145.4 / 269.1 / 1,127.5 / 1,127.6 / 1,128.7 | 33.4 / 34.9 / 108.5 / 107.9 / 101.3 (**MTP**) | — |
-| RTX PRO 5000 **(ours, §3.6)** | Ryzen 9 9950X3D, 189 GB | this engine, ×1 warm / ×8 | Q4_KOEXP | expert cache, mostly resident (20.6–24.6K of 25,088 experts, misses from pinned RAM) | BF16 | ~700-tok prompt | 4,688.0 / 6,938.7 | 295.2 / 1,008.2 (**MTP**) | — |
-| RTX PRO 5000 **(ours, Strata's workload)** | same | this engine through `ConversationEngine` (`kv_fragmentation::qwen38_flash_next_strata`), ×1 median of 3 | Q4_KOEXP | same | C5 | 4K / 32K / 128K | 6,019.5 / 5,397.9 / 4,776.9 | 156.6 / 152.5 / 141.6 (**MTP**, ceiling 4) | — |
+| RTX PRO 5000 **(ours, §3.6)** | Ryzen 9 9950X3D, 189 GB | this engine, ×1 warm / ×8 | Q4_KOEXP | expert cache, mostly resident (20.6–24.6K of 25,088 experts, misses from pinned RAM) | BF16 | ~700-tok prompt | 4,970.0 / 7,164.4 | 308.2 / 1,272.8 (**MTP**) | — |
+| RTX PRO 5000 **(ours, Strata's workload, 2026-10-10)** | same | this engine through `ConversationEngine` (`kv_fragmentation::qwen38_flash_next_strata`), ×1 median of 3 | Q4_KOEXP | same | C5 | 4K / 32K / 128K | 6,019.5 / 5,397.9 / 4,776.9 | 156.6 / 152.5 / 141.6 (**MTP**, ceiling 4) | — |
+| RTX PRO 5000 **(ours, Strata's workload, 2026-11-10)** | same | the same, `3e51cb8c0` | Q4_KOEXP | same | C5 | 4K / 32K / 128K | 5,794.4 / 5,228.2 / 4,065.2 | 168.4 / 159.1 / 125.3 (**MTP**, ceiling 4) | — |
+| RTX PRO 5000 **(ours, Strata's workload, forward, 2026-11-10)** | same | the model's batched forward (`strata_bench_single_session`), ×1 median of 3 | Q4_KOEXP | same | BF16 | 4K / 32K / 128K | 6,064.3 / 5,249.3 / 4,273.2 | 146.6 / 167.2 / 113.6 (**MTP**, ceiling 4; fastest run 181.9 at 4K) | — |
 
 **Flash-Next at an equal expert footprint.** Every run below carries 2-bit
 experts of about the same size — 1.32 MiB a slot here, ~1.38 MB a slot in Strata
@@ -2094,14 +2101,18 @@ engine as a daemon runs them (`kv_fragmentation::qwen38_flash_next_strata`,
 greedy, 256 tokens, one warm-up then the median of three, KV at C5), we decode
 **156.6 / 152.5 / 141.6 t/s at 4K / 32K / 128K against Strata's 179.4 / 175.7 /
 165.0** — 86–87% of its single-session decode — and prefill 6,019.5 / 5,397.9 /
-4,776.9 against 4,269.8 / 5,543.2 / 5,778.7, ahead at 4K and level at 32K. The
+4,776.9 against 4,269.8 / 5,543.2 / 5,778.7, ahead at 4K and level at 32K. On
+2026-11-10 (`3e51cb8c0`) the engine read 168.4 / 159.1 / 125.3 and the forward
+bench 146.6 / 167.2 / 113.6, so the best median at each length is **168.4 / 167.2 /
+141.6, 86–95% of Strata's**, and the fastest single run, 181.9 at 4K, is above its
+median there; at 128K both benches read below the earlier run. The
 remaining gap is the cost of a verify step, not the drafter: our MTP head commits
 2.7–3.2 tokens a step on these prompts against Strata's ~2.7 (its `engine.log`),
 and a step costs us 17.1–19.3 ms against its ~14–15. Its prompt-lookup ("suffix")
 drafter fired 0–3 times per 256-token answer there and is not what separates the
 two. The 295.2 above is our story-rewrite row, a different and easier task for the
 drafter, and is not comparable to the 179.4. Our ×8 aggregate on the PRO 5000 is
-1,008.2; Strata publishes no 4-bit row (its largest, IQ3_S, is 50 GB) and no
+1,272.8; Strata publishes no 4-bit row (its largest, IQ3_S, is 50 GB) and no
 batched run on a Blackwell card.
 
 **Strata has never run on our 3090 machine** (PCIe 3.0, i7-10700K, 64 GB DDR4),
@@ -2199,9 +2210,10 @@ figures, not a controlled comparison.
   Strata decodes 93.0 at 1K and 90.6 at 32K on larger 3-bit experts (E93). Its
   prefill is 2,650 on the 5070 and 869.7–2,160.4 on that 3090, against our 556.5.
   **On its own 5090 workload, rebuilt and run through our engine on the 72 GB
-  Blackwell card, we decode 141.6–156.6 t/s against its 165.0–179.4** (§6.5, *The
+  Blackwell card, we decode 141.6–168.4 t/s against its 165.0–179.4** (§6.5, *The
   Blackwell pair*): the like-for-like single-session row, and we trail it by
-  13–14%, on step cost rather than drafting, while prefilling faster at 4K. The
+  5–14%, median against median, on step cost rather than drafting, while
+  prefilling faster at 4K. The
   llama.cpp runs are far behind both: 15 t/s on an RTX 3090 with 128 GB of host
   RAM (E51, UD-Q4_K_XL, q8_0 KV at a 130K context) and 27.5–29 on an RTX 5080
   16 GB (E51) and 48.02 on an RTX 5090 (E52). Our 138.1 on the 3090 is above all
@@ -2210,7 +2222,7 @@ figures, not a controlled comparison.
   one at a time (E92); ours is 361.6 at C10 ×8 on the 3090 and 107.9 at C5 ×8 on
   the 16 GB laptop. On the 72 GB card our 295.2 t/s at ×1 with MTP (the story
   rewrite) is above the RTX PRO 6000's published 100 without MTP and 170 with it
-  (E53, on an unstated artifact and task), and our ×8 aggregate is 1,008.2.
+  (E53, on an unstated artifact and task), and our ×8 aggregate is 1,272.8.
 - **Quantized KV and decode depth.** llama.cpp's q8_0 KV costs Qwen3-8B 18% of
   decode at 8K and 45% at 64K (E64, A100); our C10 costs 3–31% at 32K and
   19–51% at 128K (§3.5) at 4.6–7.6× compression, against q8_0's ~1.9×. Both
