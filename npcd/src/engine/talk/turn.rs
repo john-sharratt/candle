@@ -33,6 +33,7 @@ use crate::engine::talk::state::TalkState;
 use crate::engine::talk::templates::Destination;
 use crate::engine::talk::within::OnThread;
 use crate::engine::talk::authority;
+use crate::sim::phone::other_of;
 
 /// How often the runner looks for a conversation whose turn is due.
 pub const TICK: Duration = Duration::from_millis(250);
@@ -54,15 +55,12 @@ impl Runtime {
         let now = now_ms();
         match kind {
             EventKind::Talk { thread, lines } => {
-                let Some((hosted, body)) = self.body_of(npc_id) else {
+                // Off the thread's id, not this member's copy of it: the
+                // lines arrive ahead of the thread's record (§9).
+                let Some((_, body)) = self.body_of(npc_id) else {
                     return;
                 };
-                let member = hosted.sim(|s| {
-                    s.threads
-                        .get(&thread)
-                        .and_then(|t| t.other_ids(&body).into_iter().next())
-                });
-                if let Some(member) = member {
+                if let Some(member) = other_of(&thread, &body) {
                     self.talks.lines(npc_id, &member, &thread, lines, now);
                 }
             }

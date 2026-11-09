@@ -16,6 +16,19 @@ pub fn direct_id(a: &str, b: &str) -> String {
     format!("dm:{lo}:{hi}")
 }
 
+/// The other member of direct thread `id`, to `me`: read off the id itself,
+/// so a member whose copy of the world has not caught up with the thread
+/// still knows who it is with (`docs/npc_conversations.md` §9). A member id
+/// may hold a colon (`discord:{id}`), so the known side is matched whole.
+pub fn other_of(id: &str, me: &str) -> Option<String> {
+    let pair = id.strip_prefix("dm:")?;
+    let other = match (pair.strip_prefix(&format!("{me}:")), pair.strip_suffix(&format!(":{me}"))) {
+        (Some(other), _) | (None, Some(other)) => other,
+        (None, None) => return None,
+    };
+    (direct_id(me, other) == id).then(|| other.to_string())
+}
+
 impl Threads {
     /// The direct thread between `a` and `b`, if there is one.
     pub fn direct_between(&self, a: &str, b: &str) -> Option<&Thread> {
@@ -87,6 +100,19 @@ mod tests {
         }
         assert_eq!(p.reach(&zen, &mira), id);
         assert_eq!(p.send_on(&id, "npc-1", Said::words("hi")).unwrap().0, 101);
+    }
+
+    /// **The other member is read off the id**, a colon in either id included.
+    #[test]
+    fn the_other_member_is_read_off_the_thread_id() {
+        assert_eq!(other_of("dm:npc-1:u_8", "npc-1").as_deref(), Some("u_8"));
+        assert_eq!(other_of("dm:npc-1:u_8", "u_8").as_deref(), Some("npc-1"));
+        let id = direct_id("discord:42", "npc-5");
+        assert_eq!(id, "dm:discord:42:npc-5");
+        assert_eq!(other_of(&id, "npc-5").as_deref(), Some("discord:42"));
+        assert_eq!(other_of(&id, "discord:42").as_deref(), Some("npc-5"));
+        assert_eq!(other_of("dm:npc-1:u_8", "npc-2"), None);
+        assert_eq!(other_of("group:7", "npc-1"), None);
     }
 
     /// **A name is refreshed when the pair is reached again** — the id is who

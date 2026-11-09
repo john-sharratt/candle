@@ -165,6 +165,24 @@ fn here_named(hosted: &Hosted, body: &str, name: &str) -> Option<String> {
     })
 }
 
+/// Who `name` is, for a promise or a reminder: somebody standing here, or
+/// the party of the pair's thread by that name — a conversation's promise is
+/// made on the phone (`docs/npc_conversations.md` §7.1). `Here` when they are
+/// in the room, so the room hears it.
+enum Reached {
+    Here(String),
+    OnThePhone,
+}
+
+fn party_named(hosted: &Hosted, body: &str, name: &str) -> Option<Reached> {
+    if let Some(id) = here_named(hosted, body, name) {
+        return Some(Reached::Here(id));
+    }
+    hosted
+        .sim(|s| s.threads.by_kind_for(body, ThreadKind::Direct, name).is_some())
+        .then_some(Reached::OnThePhone)
+}
+
 /// `act` — one body doing something to another.
 ///
 /// Named `act_on` rather than `act` because [`crate::engine::act::Act`] is the
@@ -965,7 +983,7 @@ fn promise(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     else {
         return Outcome::Refused("A promise needs somebody, something, and a time.".into());
     };
-    let Some(id) = here_named(hosted, body, &to) else {
+    let Some(party) = party_named(hosted, body, &to) else {
         return Outcome::Refused(format!("{to} is not here."));
     };
     // **Promises are kept under the names the world writes down, not under body
@@ -977,7 +995,10 @@ fn promise(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     // walked into on the first tool that needed it.
     let me = my_name(hosted, body);
     hosted.with_sim(|s| s.ledger.promise(&me, &to, &what, &by));
-    let _ = hosted.with(|w| w.tell(body, &id, format!("promising {what} by {by}")));
+    // Announced aloud in the room; on the phone the words carry it.
+    if let Reached::Here(id) = party {
+        let _ = hosted.with(|w| w.tell(body, &id, format!("promising {what} by {by}")));
+    }
     Outcome::Did(format!(
         "You promise {to}: {what}, by {by}. It stands until you keep it."
     ))
@@ -989,7 +1010,7 @@ fn remind(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             "You meant to remind somebody of something, but not who, or not what.".into(),
         );
     };
-    let Some(id) = here_named(hosted, body, &who) else {
+    let Some(party) = party_named(hosted, body, &who) else {
         return Outcome::Refused(format!("{who} is not here."));
     };
     // By name on both sides — see the note in `promise`.
@@ -997,7 +1018,13 @@ fn remind(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     if hosted.sim(|s| !s.owed_to(&me, &who).contains(&which)) {
         return Outcome::Refused(format!("{who} never promised you that."));
     }
-    match hosted.with(|w| w.tell(body, &id, format!("reminding them of {which}"))) {
+    let said = match party {
+        Reached::Here(id) => {
+            hosted.with(|w| w.tell(body, &id, format!("reminding them of {which}")))
+        }
+        Reached::OnThePhone => Ok(()),
+    };
+    match said {
         Ok(()) => Outcome::Did(format!("You put {who} in mind of it: {which}.")),
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
@@ -1632,6 +1659,40 @@ mod tests {
             &act("remind", json!({"who":"Wren","which":"the western sweep"})),
         );
         assert!(!bad.happened(), "a promise nobody made was recalled");
+    }
+
+    /// **A promise is made on the phone too** (§7.1): to the party of the
+    /// pair's thread, wherever they are, kept in the ledger, and heard by no
+    /// room.
+    #[test]
+    fn a_promise_on_the_phone_stands_without_the_party_in_the_room() {
+        let h = waste();
+        h.with_sim(|s| {
+            let id = s.threads.reach(&Who::new("c1", "Wren"), &Who::new("u_mira", "Mira"));
+            assert!(!id.is_empty());
+        });
+        let out = perform(
+            &h,
+            "c1",
+            &act(
+                "promise",
+                json!({"to":"Mira","what":"the garden report","by":"Friday"}),
+            ),
+        );
+        assert_eq!(
+            out,
+            Outcome::Did(
+                "You promise Mira: the garden report, by Friday. It stands until you keep it."
+                    .into()
+            )
+        );
+        assert_eq!(h.sim(|s| s.owed_to("Mira", "Wren")), ["the garden report"]);
+        let refused = perform(
+            &h,
+            "c1",
+            &act("promise", json!({"to":"Nobody","what":"x","by":"y"})),
+        );
+        assert!(!refused.happened(), "{refused:?}");
     }
 
     #[test]

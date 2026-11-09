@@ -38,6 +38,7 @@ use npcd::engine::body::{perform, Outcome};
 use npcd::engine::build::{self, BUILD_ACTS};
 use npcd::engine::mission::{Mission, Origin, Todo, Work};
 use npcd::engine::mission_gen::standing::HOUSE_LINK;
+use npcd::engine::people;
 use npcd::engine::tools::{self, specs_within, Mode, Within};
 use npcd::engine::witnessed;
 use npcd::engine::zen_task::TASK_ACTS;
@@ -140,17 +141,37 @@ fn stand(h: &Hosted, body: &str, area: &str, node: &str) {
 
 /// What the grammar would offer this body, standing where it is.
 fn offered(h: &Hosted, body: &str) -> Vec<String> {
+    specs_within(Mode::Physical, &within_of(h, body))
+        .into_iter()
+        .map(|t| t.name)
+        .collect()
+}
+
+/// What `body`'s grammar is built from here, read the way
+/// `engine::runtime::within` reads it: company, the people among them and
+/// whether a shout reaches one, the lift, the house and the sim.
+fn within_of(h: &Hosted, body: &str) -> Within {
     let place = h.place_of(body);
-    let company: Vec<String> = h.read(|w| {
+    let (company, people, heard_by_person) = h.read(|w| {
         let me = w.actor(body).expect("a body");
-        w.actors()
+        let here: Vec<_> = w
+            .actors()
             .filter(|a| a.id != body && a.at == me.at)
-            .map(|a| a.name.clone())
-            .collect()
+            .collect();
+        (
+            here.iter().map(|a| a.name.clone()).collect(),
+            here.iter()
+                .filter(|a| people::is_person(&a.id))
+                .map(|a| a.name.clone())
+                .collect(),
+            people::hear_a_shout(w, &me.at),
+        )
     });
     let (at_lift, lift_here, floors) = lift_within(h, body);
     let within = Within {
         company,
+        people,
+        heard_by_person,
         places: npcd::engine::body::reachable(h, body),
         me: h.read(|w| w.actor(body).map(|a| a.name.clone()).unwrap_or_default()),
         at_lift,
@@ -159,11 +180,7 @@ fn offered(h: &Hosted, body: &str) -> Vec<String> {
         ..Default::default()
     }
     .in_the_house(h, body);
-    let within = h.sim(|s| within.from_sim(s, body, &place));
-    specs_within(Mode::Physical, &within)
-        .into_iter()
-        .map(|t| t.name)
-        .collect()
+    h.sim(|s| within.from_sim(s, body, &place))
 }
 
 /// The lift half of what a body's grammar is built from — whether it is at a
@@ -202,27 +219,7 @@ fn message_to(h: &Hosted, body: &str) -> Option<Vec<String>> {
 /// The act `tool` as the grammar offers it to `body` here, `None` when it is
 /// not offered.
 fn spec_of(h: &Hosted, body: &str, tool: &str) -> Option<ToolSpec> {
-    let place = h.place_of(body);
-    let company: Vec<String> = h.read(|w| {
-        let me = w.actor(body).expect("a body");
-        w.actors()
-            .filter(|a| a.id != body && a.at == me.at)
-            .map(|a| a.name.clone())
-            .collect()
-    });
-    let (at_lift, lift_here, floors) = lift_within(h, body);
-    let within = Within {
-        company,
-        places: npcd::engine::body::reachable(h, body),
-        me: h.read(|w| w.actor(body).map(|a| a.name.clone()).unwrap_or_default()),
-        at_lift,
-        lift_here,
-        floors,
-        ..Default::default()
-    }
-    .in_the_house(h, body);
-    let within = h.sim(|s| within.from_sim(s, body, &place));
-    specs_within(Mode::Physical, &within)
+    specs_within(Mode::Physical, &within_of(h, body))
         .into_iter()
         .find(|t| t.name == tool)
 }
@@ -936,6 +933,11 @@ fn only_what_the_stockpile_covers_may_be_made() {
 #[test]
 fn a_promise_that_was_never_made_cannot_be_recalled() {
     let h = waste();
+    // Room speech needs a person here (§12 of `docs/npc_conversations.md`).
+    h.with(|w| {
+        w.enter("visitor:u_mira", "Mira", Where::new("the-waste", "ruins"))
+            .unwrap()
+    });
     // Nothing owed yet, so `remind` has nothing to name and is not offered.
     assert!(
         admits(&h, "c1", "remind", "which").is_none(),
@@ -1834,10 +1836,11 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
     // point of the test is that everything is reachable *somehow*.
     stand(&waste, "c2", "the-waste", "ruins");
     stand(&waste, "c1", "the-waste", "ruins");
-    // And a whisper needs a third: one to tell and one to keep it from — see
-    // `Availability::AmongOthers`. Every room above holds one other body at most.
+    // And room speech needs a person here, which no shipped room holds: a
+    // visitor, who is also the third a whisper needs — one to tell and one to
+    // keep it from (`Availability::PersonAmongOthers`).
     waste.with(|w| {
-        w.enter("c3", "Tace", Where::new("the-waste", "ruins"))
+        w.enter("visitor:u_tace", "Tace", Where::new("the-waste", "ruins"))
             .unwrap()
     });
     perform(

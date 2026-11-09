@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use super::unread::Reminded;
 
 pub use channel::{CHANNEL, KEEP_GROUPS};
-pub use direct::direct_id;
+pub use direct::{direct_id, other_of};
 pub use line::{Message, Origin, Said};
 pub use thread::{Kind, Member, Thread, KEEP_DIRECT, KEEP_GROUP};
 
