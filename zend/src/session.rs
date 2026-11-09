@@ -154,7 +154,7 @@ use crate::round_timing::{self, RoundTiming};
 use crate::self_check::{self, Report as SelfCheckReport};
 use crate::substrate_git::{self, Repositories};
 use crate::think_budget;
-use crate::think_progress::{ThinkProgress, ThinkUpdate};
+use crate::think_progress::{answer_start, ThinkProgress, ThinkUpdate};
 use crate::tool_availability::{announce_returned, unavailable, Unavailable};
 use crate::tool_round;
 use crate::tools::{
@@ -4712,12 +4712,15 @@ fn run_inference_stream(
                 }
             };
 
-            // Stream tokens to the client as they arrive.  We track emitted_len
-            // (byte offset into the full decoded string) so incremental deltas
-            // are correct across BPE byte-fallback sequences.  Fragments that
-            // still contain U+FFFD are held back until the sequence completes.
-            let mut tokens: Vec<u32> = Vec::new();
+            // Stream tokens to the client as they arrive, the round's text
+            // decoded token by token (`TextStream`). We track emitted_len (byte
+            // offset into the text) so incremental deltas are correct across
+            // BPE byte-fallback sequences. Fragments that still contain U+FFFD
+            // are held back until the sequence completes.
+            let mut text_stream = state.decoder.stream();
             let mut emitted_len: usize = 0;
+            // Where the answer starts: past the last `</think>` decoded so far.
+            let mut answer_at: usize = 0;
             // Byte offset where the answer's tool-call object begins: once set, the
             // object is held back (not streamed live) and re-emitted wrapped in
             // <tool_call> tags at the flush, so the GUI renders a card instead of
@@ -4785,9 +4788,11 @@ fn run_inference_stream(
                     match event {
                         TurnEvent::Token(id) => {
                             if turn_error.is_none() {
-                                tokens.push(id);
-                                let text = state.decoder.decode(&tokens);
-                                if let Some(update) = think_progress.observe(&text, tokens.len()) {
+                                let from = text_stream.push(id);
+                                let text = text_stream.text();
+                                if let Some(update) =
+                                    think_progress.observe(text, text_stream.tokens())
+                                {
                                     let (count, done) = match update {
                                         ThinkUpdate::Running(n) => (n, false),
                                         ThinkUpdate::Done(n) => (n, true),
@@ -4804,11 +4809,11 @@ fn run_inference_stream(
                                 // (usually un-tagged) tool-call object: stop streaming
                                 // here and hold the rest, so the flush can wrap it.
                                 if hold_from.is_none() {
-                                    let answer = text
-                                        .rfind("</think>")
-                                        .map(|i| i + "</think>".len())
-                                        .unwrap_or(0);
-                                    let rest = text[answer..].trim_start();
+                                    // Only the new bytes, and the tail of the old
+                                    // a `</think>` may straddle, are searched; the
+                                    // last one found moves the answer's start.
+                                    answer_at = answer_start(text, from, answer_at);
+                                    let rest = text[answer_at..].trim_start();
                                     if rest.starts_with('{') {
                                         hold_from = Some(text.len() - rest.len());
                                     }
@@ -6498,9 +6503,10 @@ async fn passthrough_turn(
         }
     };
 
-    // Deltas are cut at byte offsets into the decoded text, and a fragment that
-    // still holds U+FFFD waits for the rest of its byte-fallback sequence.
-    let mut tokens: Vec<u32> = Vec::new();
+    // Deltas are cut at byte offsets into the text, decoded token by token, and
+    // a fragment that still holds U+FFFD waits for the rest of its byte-fallback
+    // sequence.
+    let mut text_stream = state.decoder.stream();
     let mut emitted_len = 0usize;
     let mut done = None;
     let mut deletions = state.deletions.watch();
@@ -6532,8 +6538,8 @@ async fn passthrough_turn(
             };
             match event {
                 TurnEvent::Token(id) => {
-                    tokens.push(id);
-                    let text = state.decoder.decode(&tokens);
+                    text_stream.push(id);
+                    let text = text_stream.text();
                     if text.len() > emitted_len && text.is_char_boundary(emitted_len) {
                         let part = &text[emitted_len..];
                         if !part.contains('\u{FFFD}') {

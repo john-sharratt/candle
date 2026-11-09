@@ -29,31 +29,62 @@ pub struct ThinkProgress {
     open_at: Option<usize>,
     /// The block has closed; nothing more to report.
     closed: bool,
+    /// How much of the text has been searched: a marker can only end in what
+    /// came since, so each look searches from just before it.
+    scanned: usize,
+}
+
+/// The longest marker, less one: how far back a marker straddling the
+/// searched and the new text can start.
+const OVERLAP: usize = CLOSE.len() - 1;
+
+/// The first byte offset at or after `from` where `marker` starts in `text`.
+fn find_from(text: &str, from: usize, marker: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let from = from.min(bytes.len());
+    bytes[from..]
+        .windows(marker.len())
+        .position(|w| w == marker.as_bytes())
+        .map(|i| from + i)
+}
+
+/// Where the answer starts in `text` — past the last `</think>` — given that
+/// it started at `was` before the bytes from `from` on were added. Only the
+/// new bytes, and the tail of the old a close may straddle, are searched, so
+/// the last occurrence wins as a whole-text `rfind` would have it.
+pub fn answer_start(text: &str, from: usize, was: usize) -> usize {
+    let bytes = text.as_bytes();
+    let start = from.saturating_sub(OVERLAP).min(bytes.len());
+    bytes[start..]
+        .windows(CLOSE.len())
+        .rposition(|w| w == CLOSE.as_bytes())
+        .map_or(was, |i| start + i + CLOSE.len())
 }
 
 impl ThinkProgress {
-    /// Read the decode so far — `text`, `generated` tokens long — and say what
-    /// changed, if anything is worth reporting.
+    /// Read the decode so far — `text`, `generated` tokens long, grown from
+    /// what the last look read — and say what changed, if anything is worth
+    /// reporting.
     pub fn observe(&mut self, text: &str, generated: usize) -> Option<ThinkUpdate> {
         if self.closed {
             return None;
         }
+        let from = self.scanned.saturating_sub(OVERLAP);
+        self.scanned = text.len();
         let open = match self.open_at {
             Some(open) => open,
             None => {
-                let open = text.find(OPEN)?;
+                let open = find_from(text, from, OPEN)?;
                 self.open_at = Some(open);
                 open
             }
         };
-        // The text is re-decoded from the whole run each token; a byte-fallback
-        // sequence completing can reshape its tail, so read it defensively.
-        let inner = text.get(open + OPEN.len()..)?;
-        match inner.find(CLOSE) {
+        let inner_at = open + OPEN.len();
+        match find_from(text, from.max(inner_at), CLOSE) {
             None => Some(ThinkUpdate::Running(generated)),
             Some(end) => {
                 self.closed = true;
-                (!inner[..end].trim().is_empty()).then_some(ThinkUpdate::Done(generated))
+                (!text[inner_at..end].trim().is_empty()).then_some(ThinkUpdate::Done(generated))
             }
         }
     }
@@ -99,6 +130,30 @@ mod tests {
         assert_eq!(p.observe("<think>\n", 2), Some(ThinkUpdate::Running(2)));
         assert_eq!(p.observe("<think>\n\n</think>", 3), None);
         assert_eq!(p.observe("<think>\n\n</think>Hi", 4), None);
+    }
+
+    /// **A marker split across two looks is found**: each look searches only
+    /// what came since the last, and the tail a marker can straddle.
+    #[test]
+    fn a_marker_split_across_looks_is_found() {
+        let mut p = ThinkProgress::default();
+        assert_eq!(p.observe("<think>a</thi", 4), Some(ThinkUpdate::Running(4)));
+        assert_eq!(p.observe("<think>a</think>", 5), Some(ThinkUpdate::Done(5)));
+        let mut q = ThinkProgress::default();
+        assert_eq!(q.observe("<thi", 1), None);
+        assert_eq!(q.observe("<think>a", 2), Some(ThinkUpdate::Running(2)));
+    }
+
+    /// **The answer starts past the last close**, found in what was added —
+    /// a close straddling the old text and the new included — and stays where
+    /// it was when the new bytes hold none.
+    #[test]
+    fn the_answer_starts_past_the_last_close() {
+        let text = "<think>a</think>b";
+        assert_eq!(answer_start(text, 12, 0), 16, "a close cut by the step");
+        assert_eq!(answer_start(text, 16, 16), 16, "nothing new closes");
+        assert_eq!(answer_start("<think>a</think>b</think>c", 17, 16), 25);
+        assert_eq!(answer_start("plain", 3, 0), 0);
     }
 
     #[test]

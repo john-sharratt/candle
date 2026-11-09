@@ -88,19 +88,21 @@ owns.
 - Unit, on a synthetic ByteLevel/ByteFallback tokenizer built with
   `TokenizerBuilder` as in tokenizers' `DecodeStream` docs: `é` as two byte
   tokens yields `""` then `"é"`, the text's raw bytes `[0xC3, 0xA9]`. A
-  tokenizer built so that a step's prefix re-decodes differently (the decoder
-  construction that makes `DecodeStream::step` return `InvalidPrefix`, named
-  in the test) drives the fallback, and the text stays a prefix of the full
-  decode and equals it at the end. If no real decoder can produce
-  `InvalidPrefix` with `skip_special_tokens = true`, the fallback covers only
-  decode errors, and the test drives it with an id outside the vocabulary.
+  tokenizer built so that a step's prefix re-decodes differently — a `Fuse`
+  then a `Replace` of a trailing `ab`, so `a`, `b` decodes as `XYZ` and
+  `DecodeStream::step` returns `InvalidPrefix` — drives the fallback: the text
+  keeps `a` (it never shrinks), the next token undoes the rewrite so the full
+  decode extends the text again, streaming resumes, and the text equals the
+  full decode at the end. (An id outside the vocabulary is no decode error —
+  it is skipped — so it cannot drive the fallback.)
 - On every Qwen tokenizer in the HF hub cache, found as
   `candle-conversation/tests/literal_text_real_vocab.rs` finds them and
   skipped loudly when there is none (on the dev machines this includes
   `host::MODEL`'s Qwen3.8-Flash-Next, whose `<think>`/`</think>` are not
   special): the streamed text equals `decode(all, true)` byte for byte over
   a fixture holding `<think>`, `</think>`, `<tool_call>`, multi-byte text and
-  an emoji the test first asserts is split across byte tokens.
+  a character the vocabulary splits across byte tokens — the first of a
+  short list of rare ones that it does (🦀 is a single token in Qwen's).
 - `ThinkProgress` given `"<think>a</thi"` (4) then `"<think>a</think>"` (5)
   answers `Running(4)` then `Done(5)`; given `"<thi"` (1) then `"<think>a"`
   (2), `None` then `Running(2)`. The existing five `ThinkProgress` tests

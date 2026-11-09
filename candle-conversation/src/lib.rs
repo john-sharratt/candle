@@ -120,6 +120,7 @@ pub mod store_gauges;
 pub mod substrate;
 pub mod summary_tree;
 pub mod tenant_rank;
+pub mod text_stream;
 pub mod think_strip;
 pub mod throwaway;
 mod time_source;

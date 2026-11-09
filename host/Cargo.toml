@@ -73,6 +73,10 @@ tower    = { version = "0.5" }
 tokio    = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+# The prescribed model's tokenizer, fetched for the streamed-text gate
+# (`tests/text_stream_model_vocab.rs`).
+hf-hub     = { workspace = true }
+tokenizers = { workspace = true }
 
 [features]
 default = []
