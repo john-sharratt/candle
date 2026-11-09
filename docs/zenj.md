@@ -439,8 +439,10 @@ if the card's outputs are DisplayPort) — not cast, which adds seconds of delay
   next preset's file is read off the render thread a phrase ahead, so no change waits on the disk.
 - **The end of the world.** On New Year's Eve the main screen is Battle Cities' Phase 20: the set
   builds to midnight, and on the midnight drop Zen levels the game's planet on the beat, then hunts
-  down what is left until the last time zone reaches the new year. ZenJ sends the beat schedule
-  ahead from the same plan the lights use, and anyone in the game can listen to the set.
+  down what is left until the last time zone reaches the new year. Until then the game's planet is
+  dark and lit by stage lights playing the room's looks (§9): ZenJ puts the lights' planned looks
+  in the same beat schedule it sends ahead for Zen's strikes, so the bulbs and the planet change on
+  the same beat. Anyone in the game can listen to the set.
   Designed in Battle Cities' `docs/03-GAMEPLAY/THE-END.md`.
 
 While rekordbox is open BlackWorld is reserved (§3.1): no builds, no ingest or calibration, and its
