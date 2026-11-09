@@ -1378,11 +1378,15 @@ pub fn show_within(selection: &mut SelectionState, mode: Mode, within: &Within) 
 pub const ACTS_PER_TURN: usize = 2;
 
 /// How many acts a conversation's decision may contain
-/// (`docs/npc_conversations.md` §6.2): a promise or a mission change beside the
-/// reply, and the reply itself. Its catalog is the thread's few acts, not a
-/// room's, so three stay inside [`MAX_TURN_PATHS`] where the main loop's two
-/// are already near it.
-pub const TALK_ACTS: usize = 3;
+/// (`docs/npc_conversations.md` §6.2): a promise or a mission change, and the
+/// reply beside it.
+///
+/// **Two, for the same reason as the main loop's.** The thread's catalog is
+/// small, but `reflect` binds the whole mood library: with the shipped mind's
+/// hundred and sixteen moods and an agenda to change, one act is about three
+/// hundred paths, so three acts admitted 2.6 × 10⁷ decodes — over
+/// [`MAX_TURN_PATHS`] twelve times — and two admit under 10⁵.
+pub const TALK_ACTS: usize = 2;
 
 /// What a turn's act grammar is compiled for: the mode its acts are offered
 /// under, and how many calls its loop admits. Part of the grammar cache's key,
@@ -3517,6 +3521,10 @@ mod tests {
         });
         let specs = specs_within(Catalog::THREAD.mode, &within);
         assert_eq!(specs.len(), talk::within::ACTS.len(), "{specs:?}");
+        assert!(
+            estimated_paths(&specs, 3) > MAX_TURN_PATHS,
+            "three acts fit after all: `TALK_ACTS` can be three"
+        );
         let paths = estimated_paths(&specs, TALK_ACTS);
         assert!(
             paths <= MAX_TURN_PATHS,

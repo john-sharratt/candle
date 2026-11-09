@@ -91,6 +91,7 @@ use crate::engine::environment::{self, Reach};
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
+use crate::engine::experience::store::Journals;
 use crate::engine::people;
 use crate::engine::talk::templates;
 use crate::engine::ingest;
@@ -431,6 +432,9 @@ pub struct Runtime {
     pub data: PathBuf,
     /// The same mind, as the handle the schema is read through.
     pub mind_handle: Mind,
+    /// Every hosted world's bots' experience, written to npcd's checkout of
+    /// the journals repository (`docs/npc_conversations.md` §5).
+    pub journals: Arc<Journals>,
     /// The mind repository, loaded and followed, with `--mind-repo`.
     mind_repos: OnceLock<Repos>,
     /// How a device-bridge job reaches an agent (`docs/zen_moon_mind.md` §15):
@@ -1010,6 +1014,7 @@ impl Runtime {
             data: data.to_path_buf(),
 
             mind_handle,
+            journals: Journals::new(),
             mind_repos: OnceLock::new(),
             agents: OnceLock::new(),
             relaunch: OnceLock::new(),

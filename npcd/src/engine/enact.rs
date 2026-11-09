@@ -1694,7 +1694,7 @@ mod tests {
         let line = out.line().unwrap();
         assert!(line.contains("On your phone:\n"), "{line}");
         assert!(line.contains("- the crew (a group of 2): 1 unread.\n"), "{line}");
-        assert!(!line.contains("ore"), "the content stays in `read`: {line}");
+        assert!(!line.contains("ore is left"), "the content stays in `read`: {line}");
     }
 
     /// **`read` reads a group on the phone**, by the name the character calls

@@ -119,10 +119,13 @@ mod tests {
         within
     }
 
+    /// The acts offered, in [`ACTS`]'s order: which acts is the question,
+    /// not the catalog's order.
     fn offered(within: &Within) -> Vec<String> {
-        specs_within(Catalog::THREAD.mode, within)
-            .into_iter()
-            .map(|s| s.name)
+        let specs = specs_within(Catalog::THREAD.mode, within);
+        ACTS.iter()
+            .filter(|a| specs.iter().any(|s| s.name == **a))
+            .map(|a| a.to_string())
             .collect()
     }
 

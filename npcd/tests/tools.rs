@@ -42,6 +42,7 @@ use npcd::engine::tools::{self, specs_within, Mode, Within};
 use npcd::engine::witnessed;
 use npcd::engine::zen_task::TASK_ACTS;
 use npcd::sim::field::Resource;
+use npcd::sim::purpose::Purpose;
 use npcd::sim::record::{Item, Kind as RecordKind, State};
 use npcd::sim::seed;
 use npcd::world::Hosted;
@@ -1490,10 +1491,13 @@ fn losing_the_handset_is_something_the_world_can_do_to_you() {
     );
 }
 
-/// **A message reaches somebody who is not here** — which is the entire point,
-/// and the thing `tell` cannot do.
+/// **Reaching somebody who is not here** — which is the entire point, and the
+/// thing `tell` cannot do. The pair's thread stands from then on, and what the
+/// character meant goes to its conversation with them as a purpose
+/// (`docs/npc_conversations.md` §10): no line is written until the
+/// conversation says it.
 #[test]
-fn a_message_reaches_somebody_a_building_away() {
+fn reaching_out_opens_the_pair_s_thread_and_hands_the_conversation_a_purpose() {
     let h = phones();
     assert_ne!(h.place_of("c1"), h.place_of("c2"), "they must be apart");
 
@@ -1506,22 +1510,35 @@ fn a_message_reaches_somebody_a_building_away() {
         ),
     );
     assert!(out.happened(), "{out:?}");
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
+    let (thread, purposes) = h.sim(|s| (s.threads.direct_between("c1", "c2").cloned(), s.purposes.clone()));
+    assert!(thread.expect("the pair's thread").messages.is_empty());
+    assert_eq!(
+        purposes,
+        [Purpose {
+            from: "c1".into(),
+            to: "c2".into(),
+            intent: "the ridge is clear".into(),
+        }]
+    );
 }
 
-/// It waits. A room reaches you because you are standing in it; a phone reaches
-/// you because something arrived while you were doing something else.
+/// A group's line waits. A room reaches you because you are standing in it; a
+/// phone reaches you because something arrived while you were doing something
+/// else.
 #[test]
 fn a_message_waits_until_it_is_looked_at() {
     let h = phones();
     perform(
         &h,
         "c1",
-        &act("reach_out", json!({"to":"Soren","intent":"answer me"})),
+        &act(
+            "open_group",
+            json!({"called":"the ridge","with":"Soren","intent":"answer me"}),
+        ),
     );
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
+    assert_eq!(h.sim(|s| s.messages_waiting("c2")), 1);
     assert_eq!(
-        h.sim(|s| s.messages_waiting("Wren")),
+        h.sim(|s| s.messages_waiting("c1")),
         0,
         "your own message waited for you"
     );
@@ -1529,15 +1546,15 @@ fn a_message_waits_until_it_is_looked_at() {
     // Doing something else does not consume it.
     perform(&h, "c2", &act("observe", json!({"target":"the room"})));
     assert_eq!(
-        h.sim(|s| s.messages_waiting("Soren")),
+        h.sim(|s| s.messages_waiting("c2")),
         1,
         "a message was lost"
     );
 
     h.with_sim(|s| {
-        s.threads.read("Soren", "Wren").unwrap();
+        s.threads.read("c2", "the ridge").unwrap();
     });
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 0);
+    assert_eq!(h.sim(|s| s.messages_waiting("c2")), 0);
 }
 
 /// Several at once, which a room cannot do.
@@ -1564,10 +1581,10 @@ fn a_character_holds_more_than_one_conversation_at_a_time() {
     assert!(threads.contains(&npcd::sim::phone::CHANNEL.to_string()));
 }
 
-/// A direct thread becomes a group by gaining somebody, and one send then
-/// reaches all of them.
+/// A pair's thread is the two of them for ever: somebody is brought into a
+/// group, never into it (§11.1).
 #[test]
-fn a_conversation_becomes_a_group_and_one_message_reaches_everybody_on_it() {
+fn nobody_is_brought_into_a_pair_s_thread() {
     let h = phones();
     h.with_sim(|s| seed::issue_handset(s, "c3", "Orion Vance"));
     perform(
@@ -1575,11 +1592,32 @@ fn a_conversation_becomes_a_group_and_one_message_reaches_everybody_on_it() {
         "c1",
         &act("reach_out", json!({"to":"Soren","intent":"start"})),
     );
-
     let out = perform(
         &h,
         "c1",
         &act("invite", json!({"to":"Soren","who":"Orion Vance"})),
+    );
+    assert!(!out.happened(), "{out:?}");
+}
+
+/// A group grows by invitation, and one send then reaches all of them.
+#[test]
+fn a_group_grows_and_one_message_reaches_everybody_on_it() {
+    let h = phones();
+    h.with_sim(|s| seed::issue_handset(s, "c3", "Orion Vance"));
+    perform(
+        &h,
+        "c1",
+        &act(
+            "open_group",
+            json!({"called":"the ridge","with":"Soren","intent":"start"}),
+        ),
+    );
+
+    let out = perform(
+        &h,
+        "c1",
+        &act("invite", json!({"to":"the ridge","who":"Orion Vance"})),
     );
     assert!(out.happened(), "{out:?}");
 
@@ -1588,12 +1626,12 @@ fn a_conversation_becomes_a_group_and_one_message_reaches_everybody_on_it() {
         "c1",
         &act(
             "message",
-            json!({"via":"channel","to":"Soren","intent":"both of you"}),
+            json!({"via":"channel","to":"the ridge","intent":"both of you"}),
         ),
     );
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 2);
+    assert_eq!(h.sim(|s| s.messages_waiting("c2")), 2);
     assert_eq!(
-        h.sim(|s| s.messages_waiting("Orion Vance")),
+        h.sim(|s| s.messages_waiting("c3")),
         1,
         "the new member should see what was sent after they joined, and not before"
     );
@@ -1617,8 +1655,8 @@ fn a_group_can_be_opened_with_several_people_at_once() {
         ),
     );
     assert!(out.happened(), "{out:?}");
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
-    assert_eq!(h.sim(|s| s.messages_waiting("Orion Vance")), 1);
+    assert_eq!(h.sim(|s| s.messages_waiting("c2")), 1);
+    assert_eq!(h.sim(|s| s.messages_waiting("c3")), 1);
     assert!(message_to(&h, "c1")
         .unwrap()
         .contains(&"the boundary".to_string()));
@@ -1743,9 +1781,11 @@ fn what_is_said_on_a_thread_does_not_reach_the_room() {
         "c1",
         &act("reach_out", json!({"to":"Soren","intent":"quietly"})),
     );
-    // It went to the thread, not to the room: it is waiting to be read rather
-    // than having been heard.
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
+    // It went to the phone, not to the room: a purpose for the pair's
+    // conversation rather than something heard.
+    assert_eq!(h.sim(|s| s.purposes.len()), 1);
+    let heard = h.read(|w| w.log().iter().any(|e| e.actor == "c1" && matches!(e.what, Happening::Said { .. })));
+    assert!(!heard, "the room heard it");
 }
 
 // ── the whole catalog, held to its own rules ────────────────────────────────

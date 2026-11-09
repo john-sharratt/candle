@@ -618,6 +618,11 @@ impl Missions {
         self.active.get(body)
     }
 
+    /// Every body carrying a mission, with it.
+    pub fn carried(&self) -> impl Iterator<Item = (&str, &Mission)> {
+        self.active.iter().map(|(b, m)| (b.as_str(), m))
+    }
+
     /// The body's open mission, to change — what the critical gate signs off
     /// when an authorizer's go-ahead lands.
     pub fn active_mut(&mut self, body: &str) -> Option<&mut Mission> {

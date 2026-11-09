@@ -70,6 +70,7 @@ pub mod driver;
 pub mod enact;
 pub mod environment;
 pub mod event;
+pub mod experience;
 pub mod guardian;
 pub mod guardian_api;
 pub mod held;

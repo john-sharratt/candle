@@ -516,15 +516,8 @@ async fn a_message_is_delivered_once_and_not_again_every_moment() {
     rt.record_act(
         1,
         &act(
-            "reach_out",
-            json!({"to": "Maker-02", "intent": "that I need a word"}),
-        ),
-    );
-    rt.record_act(
-        1,
-        &act(
-            "message",
-            json!({"via": "private", "to": "Maker-02", "intent": "once only"}),
+            "open_group",
+            json!({"called": "the run", "with": "Maker-02", "intent": "once only"}),
         ),
     );
     for _ in 0..4 {

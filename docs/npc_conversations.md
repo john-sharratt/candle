@@ -525,9 +525,14 @@ The decision is the mind's act turn, run on an ephemeral fork with
 | `mission_*` | change the mission (§7.1) | offered only when the party is the owner or an authorizer, outside the thrash cooldown |
 | `message` / `reach_out` | hand off: a purpose to another conversation (§10) | `to` ∈ the NPC's threads and contacts **other than the party** |
 
-- **Calls per turn.** `compile_action_loop` with `max_calls` = `TALK_ACTS` = 3
-  (`candle-conversation/src/stencil/tool_call.rs:1207`). This is its own
-  constant beside the main loop's `ACTS_PER_TURN` = 2 (`tools.rs:1354`).
+- **Calls per turn.** `compile_action_loop` with `max_calls` = `TALK_ACTS` = 2
+  (`candle-conversation/src/stencil/tool_call.rs:1207`): a promise or a
+  mission change, and the reply beside it. This is its own constant beside the
+  main loop's `ACTS_PER_TURN` = 2 (`tools.rs:1354`). It is two, not three,
+  because of the path budget: `reflect` binds the whole mood library, so with
+  the shipped mind's 116 moods and an agenda to change one act is about 300
+  paths. Three acts admit 2.6 × 10⁷ decodes, twelve times `MAX_TURN_PATHS`;
+  two admit under 10⁵ (`tools::tests::a_full_thread_stays_inside_the_path_budget`).
 - **The destination.** The loop cannot make one call terminal
   (`tool_call.rs:1262-1294`), so the destination is read after parsing: the
   **last** of `reply`, `sign_off` or `reflect` in the list decides. A list with
@@ -690,7 +695,7 @@ handed over (§10).
 
 | Kind | Act | Applied as |
 |---|---|---|
-| Commit | `promise` | the ledger (`enact.rs:952-973`). `to` resolves against thread members as well as the room (`here_named`, `enact.rs:152-160`). The `w.tell` announcement (`:969`) becomes a thread line when the party is not in the room. At most 3 per turn. |
+| Commit | `promise` | the ledger (`enact.rs:952-973`). `to` resolves against thread members as well as the room (`here_named`, `enact.rs:152-160`). The `w.tell` announcement (`:969`) becomes a thread line when the party is not in the room. At most one per turn, beside the reply (`TALK_ACTS`). |
 | Remind | `remind` | as today, with `who` resolved against thread members (`enact.rs:975-990`) |
 | Change, Zen (unordered) | `mission_*` | the agenda (`npcd/src/engine/agenda/perform.rs`), with critical steps protected (below) |
 | Change, ordered body | `mission_*` (ordered specs) | below |
