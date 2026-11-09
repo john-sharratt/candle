@@ -362,13 +362,16 @@ that wrote it and before the response turn, in the order the turn decoded:
   it is what the reader wants to see;
 - **indented** a step in from the message column, so it reads as an aside to
   the work rather than part of the answer;
-- **like a speech bubble the turn says to itself**: a vivid pink-to-violet
-  tint with a bright border, rounded on three corners and pointed at the
-  fourth, a tail at its top left toward the reasoning above it, and the note's
-  text in a hand-written face (the platform's own — Segoe Print, Bradley Hand —
-  so nothing is fetched), so it reads as a thought rather than as output. The
-  thinking is the working, collapsed; the note is the conclusion, open and
-  easy to spot;
+- **a thought bubble**: a trail of three circles rising small to large from
+  the thinking block above to the bubble's top left, evenly rounded, drawn in
+  the brain icon's own salmon and peach — a warm tint, a clear salmon border,
+  a faint glow — so it reads as that thinking's conclusion and stands out
+  from the amber tool cards and the prose. Its text is the page's body face
+  in italic, the inner voice, a touch larger than before and close to body
+  colour: prominent by contrast and border, not by a face of its own. While
+  it is being written its edge is dashed and its trail pulses, as the
+  "Thinking…" label does. The thinking is the working, collapsed; the note is
+  the conclusion, open and easy to spot;
 - **both themes**: drawn in the page's own palette, as the thinking block is,
   so the light theme's filter over the page turns it with everything else, and
   its text keeps body contrast;

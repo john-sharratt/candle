@@ -189,14 +189,24 @@
   .zmd .approval-state { margin-top: .5rem; color: #e6c08a; font-weight: 600; }
   .zmd .approval-state.err { color: #e08a7a; }
   .zmd .approval-answer { margin: .35rem 0 0; white-space: pre-wrap; font-size: .76rem; color: #b9ab98; }
-  /* A journal note: a speech bubble the turn says to itself, its tail
-     pointing back up-left at the reasoning it concludes, in a hand-written
-     face so it reads as a thought rather than as output. The face is the
-     platform's own (Segoe Print, Bradley Hand), so nothing is fetched. */
-  .zmd .note-bubble { position: relative; margin: 1rem 0 .8rem 1.4rem; padding: .6rem 1rem .65rem; max-width: 46rem; width: fit-content; background: linear-gradient(135deg, rgba(240,128,170,0.22), rgba(176,124,236,0.18)); border: 1.5px solid rgba(240,140,184,0.55); border-radius: 18px 18px 18px 6px; color: #f6e4ee; font-family: "Segoe Print", "Bradley Hand", "Comic Neue", "Patrick Hand", "Chalkboard SE", cursive; font-size: .9em; line-height: 1.6; letter-spacing: .01em; box-shadow: 0 2px 14px rgba(232,120,176,0.16), inset 0 1px 0 rgba(255,255,255,0.06); white-space: pre-wrap; }
-  .zmd .note-bubble::before { content: ''; position: absolute; left: 14px; top: -10px; width: 16px; height: 10px; background: rgba(240,140,184,0.55); clip-path: polygon(0 0, 100% 100%, 0 100%); }
-  .zmd .note-bubble.writing { color: #d9c4cf; border-style: dashed; }
-  .zmd .note-bubble.writing::selection { background: rgba(240,128,170,0.3); }
+  /* A journal note: the thought the turn's reasoning concluded in. A thought
+     bubble, its trail of three circles rising small to large from the
+     thinking block above, drawn in the brain icon's own salmon and peach so
+     it reads as that thinking's conclusion, in the page's body face set in
+     italic — the inner voice — rather than as output. Prominent by contrast
+     and border, not by a face of its own. */
+  .zmd .note-bubble { position: relative; margin: 1.7rem 0 .9rem 1.4rem; padding: .65rem 1.05rem .7rem; max-width: 46rem; width: fit-content; background: rgba(232,145,127,0.10); border: 1.5px solid rgba(232,145,127,0.45); border-radius: 16px; color: #eadbd2; font-style: italic; font-size: .95em; line-height: 1.65; box-shadow: 0 0 16px rgba(232,145,127,0.10); white-space: pre-wrap; }
+  .zmd .note-trail { position: absolute; left: 0; top: 0; pointer-events: none; }
+  .zmd .note-trail i { position: absolute; border-radius: 50%; background: rgba(232,145,127,0.14); border: 1.5px solid rgba(232,145,127,0.45); }
+  .zmd .note-trail i:nth-child(1) { width: 5px; height: 5px; left: -10px; top: -26px; }
+  .zmd .note-trail i:nth-child(2) { width: 8px; height: 8px; left: -2px; top: -19px; }
+  .zmd .note-trail i:nth-child(3) { width: 12px; height: 12px; left: 9px; top: -11px; }
+  /* Still being written: a dashed edge, and the trail pulsing as the
+     "Thinking…" label does, until the note completes. */
+  .zmd .note-bubble.writing { color: #cbbab0; border-style: dashed; }
+  .zmd .note-bubble.writing .note-trail i { animation: zpulse 1.5s ease-in-out infinite; }
+  .zmd .note-bubble.writing .note-trail i:nth-child(2) { animation-delay: .2s; }
+  .zmd .note-bubble.writing .note-trail i:nth-child(3) { animation-delay: .4s; }
   .zmd .think-block { margin: .1rem 0 .9rem; }
   .zmd .think-summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: .45rem; font-size: .8rem; color: #7c736a; user-select: none; padding: .2rem 0; transition: color .13s; }
   .zmd .think-summary:hover { color: #9a9490; }
@@ -1186,9 +1196,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     return null;
   }
   // The note as an always-open thought bubble, indented under the call that
-  // wrote it; its `noted` result is never shown.
+  // wrote it, its trail of circles rising from the reasoning above; its
+  // `noted` result is never shown.
   function noteBubble(text, complete) {
-    return '<div class="note-bubble' + (complete ? '' : ' writing') + '">' + esc(text.trim()) + '</div>';
+    return '<div class="note-bubble' + (complete ? '' : ' writing') + '">' +
+      '<span class="note-trail" aria-hidden="true"><i></i><i></i><i></i></span>' + esc(text.trim()) + '</div>';
   }
   // The prefill of a tool round's results: tokens read so far of the total, as
   // a count and a bar, in the tool card's chrome.
