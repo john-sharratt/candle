@@ -291,11 +291,12 @@ mod tests {
         let Some(Job::Fold { path, plan }) = due(&t, now).into_iter().next() else {
             panic!("the first closed day folds");
         };
+        let over = lines_over(t.get(&path).unwrap(), &plan.ids);
         apply(
             &mut t,
             &Actor::Zend,
             &Op::FoldPeriod {
-                over: lines_over(t.get(&path).unwrap(), &plan.ids),
+                over,
                 path,
                 period: plan.period,
                 ids: plan.ids,

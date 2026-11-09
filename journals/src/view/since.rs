@@ -258,11 +258,12 @@ mod tests {
         let now = at("2026-10-04T00:00:00Z");
         let path = p("bots/zen");
         let plan = next_fold(t.get(&path).unwrap(), now).unwrap();
+        let over = lines_over(t.get(&path).unwrap(), &plan.ids);
         apply(
             &mut t,
             &Actor::Zend,
             &Op::FoldPeriod {
-                over: lines_over(t.get(&path).unwrap(), &plan.ids),
+                over,
                 path: path.clone(),
                 period: plan.period,
                 ids: plan.ids,
