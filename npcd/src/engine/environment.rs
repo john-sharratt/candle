@@ -43,10 +43,11 @@ use npc_map::world::{Happening, World};
 
 use crate::engine::at_work;
 use crate::engine::event::{EventKind, Salience, TalkLine};
+use crate::engine::people;
 use crate::engine::perceived::{digest, situation, Perceived};
 use crate::engine::reach;
 use crate::engine::tick::Scheduler;
-use crate::engine::tools::{self, Mode};
+use crate::engine::tools;
 use crate::engine::whereabouts;
 use crate::sim::phone;
 use crate::sim::unread::Due;
@@ -215,7 +216,7 @@ fn awaiting_line(world: &World, sim: &crate::sim::Sim, body: &str) -> Option<Str
     let mut s = String::from("Waiting on an answer from you:");
     s.push_str(&named.join(""));
     s.push_str(
-        "\n\nAnswer them: `tell` them if they are here, `message` them if they are not. A \
+        "\n\nAnswer them: `message` them, or speak to them if they are a person here. A \
          question you leave standing is one they asked into silence.",
     );
     Some(s)
@@ -226,18 +227,24 @@ fn awaiting_line(world: &World, sim: &crate::sim::Sim, body: &str) -> Option<Str
 /// Nothing when alone — and that emptiness is the mechanism, not an omission.
 /// A character shown a way to address people while there is nobody to address
 /// will address somebody, because a model handed a field fills it in.
+///
+/// It lists what is offered: room speech only when a person is among them
+/// (`docs/npc_conversations.md` §12), so a character in company that is all
+/// characters is not told to talk aloud to them.
 fn company_line(world: &World, body: &str) -> Option<String> {
     let here = world.actor(body)?.at.clone();
-    let others: Vec<String> = world
+    let present: Vec<_> = world
         .actors_at(&here)
         .into_iter()
         .filter(|a| a.id != body)
-        .map(|a| a.name.clone())
         .collect();
-    if others.is_empty() {
+    if present.is_empty() {
         return None;
     }
-    let tools: Vec<&str> = tools::nearby(Mode::Physical, others.len())
+    let others: Vec<String> = present.iter().map(|a| a.name.clone()).collect();
+    let people = present.iter().filter(|a| people::is_person(&a.id)).count();
+    let heard = people::hear_a_shout(world, &here);
+    let tools: Vec<&str> = tools::nearby(others.len(), people, heard)
         .into_iter()
         .map(|t| t.name)
         .collect();

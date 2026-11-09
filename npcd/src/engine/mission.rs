@@ -1034,7 +1034,7 @@ pub fn compass_line(next: &Todo, people: &[(String, Option<String>)], way: Optio
     for (who, room) in people.iter().filter(|(who, _)| mentions(&lower, who)) {
         match room {
             None if speak => line.push_str(&format!(
-                " {who} is here with you: say it to them now — `ask` or `tell` them."
+                " {who} is here with you: say it to them now — `message` them."
             )),
             None => line.push_str(&format!(" {who} is here with you.")),
             // Or by phone: somebody busy on their own errand keeps moving, and
@@ -1578,6 +1578,7 @@ pub fn judgement_then(later: &str, way: Option<&str>) -> String {
 const SPEAKING: &[&str] = &[
     "ask ",
     "tell ",
+    "message ",
     "talk to ",
     "talk with ",
     "speak to ",
@@ -1738,16 +1739,14 @@ pub mod bank {
                 let who = pick(facts.makers, seed, "visit")?;
                 Some(Mission::new(
                     format!(
-                        "Go and find {who}, wherever they are working, and review what they \
-                         are doing. Watch a while, understand it, and tell them plainly what \
-                         you think — what is good in it and what you would do differently."
+                        "Message {who}, wherever they are working, and review what they are \
+                         doing. Ask about it, understand it, and tell them plainly what you \
+                         think — what is good in it and what you would do differently."
                     ),
                     vec![
-                        Todo::new(format!("find where {who} is")),
-                        Todo::new(format!("travel to {who}")),
                         Todo::new(format!("ask {who} what they are working on")),
                         Todo::new("form your own view of it"),
-                        Todo::new(format!("give {who} your feedback, to their face")),
+                        Todo::new(format!("message {who} your feedback")),
                     ],
                     origin("visit-and-review"),
                 ))
@@ -1756,12 +1755,12 @@ pub mod bank {
                 let who = pick(facts.makers, seed, "hear")?;
                 Some(Mission::new(
                     format!(
-                        "Seek out {who} and hear them out — properly, for a good while, about \
+                        "Message {who} and hear them out — properly, for a good while, about \
                          what they have been working on and what they have concluded from it. \
                          Do not settle for a line and away."
                     ),
                     vec![
-                        Todo::new(format!("find {who}")),
+                        Todo::new(format!("message {who}")),
                         Todo::new(format!("draw {who} into talking about their work")),
                         Todo::new("stay with it, and follow what they mean"),
                     ],
@@ -1809,12 +1808,12 @@ pub mod bank {
                 Some(Mission::new(
                     format!(
                         "Two of the makers here, {a} and {b}, are each working on something. \
-                         Visit both, learn what each is doing, and come back able to say where \
-                         their work meets and where it pulls apart."
+                         Message both, learn what each is doing, and come back able to say \
+                         where their work meets and where it pulls apart."
                     ),
                     vec![
-                        Todo::new(format!("visit {a} and learn their work")),
-                        Todo::new(format!("visit {b} and learn their work")),
+                        Todo::new(format!("message {a} and learn their work")),
+                        Todo::new(format!("message {b} and learn their work")),
                         Todo::new("settle where the two meet and where they differ"),
                     ],
                     origin("compare-notes"),
@@ -1824,12 +1823,12 @@ pub mod bank {
                 let who = pick(facts.makers, seed, "thread")?;
                 Some(Mission::new(
                     format!(
-                        "Something {who} said, or made, has a thread you want to follow. Go to \
-                         them, ask about it, and follow it wherever it leads — another person, \
-                         a record, a room. Come back knowing where it goes."
+                        "Something {who} said, or made, has a thread you want to follow. \
+                         Message them, ask about it, and follow it wherever it leads — another \
+                         person, a record, a room. Come back knowing where it goes."
                     ),
                     vec![
-                        Todo::new(format!("go to {who} and ask about it")),
+                        Todo::new(format!("message {who} and ask about it")),
                         Todo::new("follow the thread it opens"),
                         Todo::new("come back knowing where it leads"),
                     ],
@@ -2489,7 +2488,7 @@ mod tests {
         assert_eq!(
             super::compass_line(&ask, &here, None),
             "Your mission, next: ask Paxon Vael what he has been working on. Paxon Vael is here \
-             with you: say it to them now — `ask` or `tell` them."
+             with you: say it to them now — `message` them."
         );
         assert_eq!(
             super::compass_line(

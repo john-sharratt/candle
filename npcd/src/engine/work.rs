@@ -46,6 +46,7 @@ use crate::engine::mission_gen::world::Routine;
 use crate::engine::mission_gen::{gates, leakage, rejection, round, write_template};
 use crate::engine::order_table;
 use crate::engine::passage;
+use crate::engine::people;
 use crate::engine::way::{self, Way};
 use crate::engine::workflow::OnFailed;
 use crate::engine::workflow::PUBLISHED;
@@ -1054,13 +1055,16 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
                     true => "`focus` on",
                     false => "`move_to`",
                 };
-                return Some(match a.at == here {
-                    true => format!("{} is here with you: `ask` or `tell` them.", a.name),
-                    false => format!(
+                // Room speech is for people; another character is messaged,
+                // here or anywhere (`docs/npc_conversations.md` §12).
+                return Some(match (a.at == here, people::is_person(&a.id)) {
+                    (true, true) => format!("{} is here with you: `ask` or `tell` them.", a.name),
+                    (false, true) => format!(
                         "{} is in {room}, within reach: {go} {room} and `ask` or `tell` them — \
                          or `message` them, which reaches them wherever they are.",
                         a.name
                     ),
+                    (_, false) => format!("{}: `message` them.", a.name),
                 });
             }
         }

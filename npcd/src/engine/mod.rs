@@ -94,6 +94,7 @@ pub mod on_you;
 pub mod operations_api;
 pub mod order_table;
 pub mod passage;
+pub mod people;
 pub mod perceived;
 pub mod persona;
 pub mod prompt;

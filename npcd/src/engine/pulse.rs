@@ -1152,7 +1152,9 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     // is not a fact about the channel.
                     Availability::Always
                     | Availability::Nearby
-                    | Availability::AmongOthers
+                    | Availability::PersonNearby
+                    | Availability::PersonAmongOthers
+                    | Availability::PersonInEarshot
                     | Availability::Embodied
                     | Availability::AwayFromHome
                     // What the hands hold is where the body is, not the channel.
@@ -1210,7 +1212,11 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                 "needs": match t.availability {
                     Availability::Always => Value::Null,
                     Availability::Nearby => json!("somebody else here"),
-                    Availability::AmongOthers => json!("two or more others here"),
+                    Availability::PersonNearby => json!("a person here"),
+                    Availability::PersonAmongOthers => json!("a person here, and somebody else"),
+                    Availability::PersonInEarshot => {
+                        json!("a person within earshot, or the field")
+                    }
                     Availability::Embodied => json!("a body"),
                     Availability::AwayFromHome => json!("being somewhere that is not home"),
                     Availability::Holding => json!("holding an order or a station"),

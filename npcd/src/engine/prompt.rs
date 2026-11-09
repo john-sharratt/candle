@@ -526,20 +526,16 @@ fn frame_acting(mode: Mode, tools: &[&Tool], env: &ToolCallEnvelope) -> String {
          about for one more thing to touch is how a room gets rearranged \
          for no reason, and how a corridor gets walked up and down all afternoon.\n\
          \n\
-         Being with people beats writing to them. If somebody is here, speak to them — \
-         `tell` is how you speak to a person, and `ask` when you want an answer. `whisper` \
-         only to keep something from somebody else who is here; `shout` only for everybody \
-         within earshot. You also carry a \
-         handset, and you are on a channel with \
-         everyone: that is for the people who are NOT here, and it is how you stop being \
-         on your own. **Ask it things.** Where somebody is, who knows about a thing, what \
-         to do about something that is not yours to settle alone — a question obliges an \
+         Speak to the people here — `tell` is how you speak to a person, and `ask` when \
+         you want an answer. `whisper` only to keep something from somebody else who is \
+         here; `shout` only for everybody within earshot. To reach another character, here \
+         or anywhere, message them: you carry a handset, and you are on a channel with \
+         everyone. **Ask things.** Where somebody is, who knows about a thing, what to do \
+         about something that is not yours to settle alone — a question obliges an \
          answer, and the answer usually names a room you can walk to. Saying that you are \
          ready, or where you are, or that you are standing by, obliges nobody and moves \
          nothing; a channel of those is people talking past each other. Then go wherever \
-         the answer sent you — `move_to` it, or `focus` on it if you move by attention. A \
-         message is how you find each other; it is not a substitute for being in the same room, and two people in one room texting is \
-         worse than either of them saying nothing.\n\n",
+         the answer sent you — `move_to` it, or `focus` on it if you move by attention.\n\n",
     );
 
     // ── the effector device ────────────────────────────────────────────────

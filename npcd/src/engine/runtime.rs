@@ -91,6 +91,7 @@ use crate::engine::environment::{self, Reach};
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
+use crate::engine::people;
 use crate::engine::talk::templates;
 use crate::engine::ingest;
 use crate::engine::invoke_body::Invokable;
@@ -784,7 +785,8 @@ pub const TO_THE_TABLE: &str =
      whatever you are doing or saying and go to it now. The table is in {room}, \
      on {level}: if you are on another floor, go to the lift, ride it to {level} \
      with `lift_use` — it calls the car and waits for it — and then `move_to` \
-     {room}; you cannot walk between floors. This comes before talk — do not answer the room, go. Once you are \
+     {room}; you cannot walk between floors. This comes before talk — answer no message and \
+     nobody here, go. Once you are \
      there, the table is on your effector device: `scan` to see what it offers, \
      then take up a mission by `invoke` on its `collect_mission`. Carry it out, \
      and when it is done come back and report it at the table the same way, then \
@@ -795,7 +797,7 @@ pub const TO_THE_TABLE: &str =
 pub const TO_THE_TABLE_ON_FOOT: &str =
     "The command table is open and there is work waiting for you. Leave off \
      whatever you are doing or saying and go to it now. The table is in {room}: \
-     `move_to` it. This comes before talk — do not answer the room, go. Once you \
+     `move_to` it. This comes before talk — answer no message and nobody here, go. Once you \
      are there, the table is on your effector device: `scan` to see what it \
      offers, then take up a mission by `invoke` on its `collect_mission`. Carry \
      it out, and when it is done come back and report it at the table the same \
@@ -912,10 +914,11 @@ const DECODE_RETRY_MS: u64 = 5_000;
 /// has: something it actually read or saw, which is why no example is given —
 /// a given example is the thing every character then reports having read.
 pub const IN_COMPANY: &str = "Nothing has been asked of you, and you are not alone. {who} \
-                              here with you. `tell` or `ask` something about the work, now, and \
-                              name a particular thing you have actually seen or read here — or \
-                              ask them what they have. Ask them something they have to answer, \
-                              or answer what they asked you. Address them exactly as written.";
+                              here with you. Say something about the work, now — speak to a \
+                              person here, `message` another character — and name a particular \
+                              thing you have actually seen or read here, or ask them what they \
+                              have. Ask them something they have to answer, or answer what they \
+                              asked you. Address them exactly as written.";
 
 /// What came of saying something to a character on its handset.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2222,15 +2225,27 @@ impl Runtime {
         // was shown. It used to carry the body ids alongside, to look up whose
         // mind was behind each name and ask what it was waiting for; nothing
         // waits any more, so the second half went with the wait.
-        let company: Vec<String> = hosted.read(|w| {
+        //
+        // The people among them are the `visitor:{handle}` bodies, and whether
+        // a shout from here reaches one is perception's own rule
+        // (`docs/npc_conversations.md` §12).
+        let (company, people, heard_by_person) = hosted.read(|w| {
             let Some(mine) = w.actor(&body) else {
-                return Vec::new();
+                return (Vec::new(), Vec::new(), false);
             };
-            w.actors_at(&mine.at.clone())
+            let here = mine.at.clone();
+            let others: Vec<_> = w
+                .actors_at(&here)
                 .into_iter()
                 .filter(|a| a.id != body)
+                .collect();
+            let company = others.iter().map(|a| a.name.clone()).collect();
+            let people = others
+                .iter()
+                .filter(|a| people::is_person(&a.id))
                 .map(|a| a.name.clone())
-                .collect()
+                .collect();
+            (company, people, people::hear_a_shout(w, &here))
         });
         // The lift, from where this body stands: whether it is on a landing,
         // whether the car is open there, and the floors it could ride to. What
@@ -2252,6 +2267,8 @@ impl Runtime {
         let invokable = self.invokable_urls(&hosted, &body);
         let base = tools::Within {
             company,
+            people,
+            heard_by_person,
             at_lift,
             lift_here,
             floors,
@@ -8308,10 +8325,11 @@ mod tests {
         // been looking at" got three characters agreeing about silence for a
         // hundred turns, because none of them had to name a thing.
         // **Naming the act is what makes an instruction land.** "Talk to them"
-        // is a wish; "`tell` or `ask`" is the branch the grammar has an arm for,
-        // and the difference showed up as a cast that only ever walked.
+        // is a wish; "`message`" is the branch the grammar has an arm for when
+        // the company is characters, and the difference showed up as a cast
+        // that only ever walked.
         assert!(
-            together.contains("`tell`") && together.contains("`ask`"),
+            together.contains("`message`"),
             "the instruction names no act to carry it out: {together}"
         );
         assert!(

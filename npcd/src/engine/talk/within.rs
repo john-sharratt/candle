@@ -76,6 +76,10 @@ impl Within {
             me: self.me.clone(),
             feelings: self.feelings.clone(),
             company: vec![party.clone()],
+            // On a thread the party is who hears what is said, so they stand
+            // where the room's people would for the speech gate: `promise` and
+            // `remind` bind them.
+            people: vec![party.clone()],
             awaiting: vec![party.clone()],
             leavable: vec![party.clone()],
             owed: thread.owed.clone(),

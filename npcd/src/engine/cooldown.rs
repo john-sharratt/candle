@@ -226,28 +226,23 @@ const COST: &[(&str, Cost)] = &[
     // because a rate limit on conversation is a rate limit on the only thing
     // the vault is for.
     //
-    // `message` is not that kind of speech. `tell`, `whisper` and `ask` need
-    // somebody standing there (`whisper`, two people): they reach
-    // that room and no further, and the company that makes them possible is
-    // what bounds them. `message` is `Always`, reaches every character in the
-    // world through the open channel, and is offered on every single turn
-    // including the ones where a character is completely alone — which is
-    // precisely when it is the most attractive thing on the list.
+    // `message` is not that kind of speech. `tell`, `whisper` and `ask` need a
+    // person standing there: they reach that room and no further, and the
+    // company that makes them possible is what bounds them. `message` is
+    // `Always`, reaches every character in the world through the open channel,
+    // and is offered on every single turn including the ones where a character
+    // is completely alone — which is precisely when it is the most attractive
+    // thing on the list.
     //
     // Untethered, that is the pacing failure this engine keeps relearning in a
     // new costume: the cheapest act that looks social becomes the whole loop,
-    // and a cast that texts all afternoon never walks anywhere.
+    // and a cast that posts all afternoon does nothing else.
     //
     // **But it is still conversation, and fifteen seconds was pricing it like
-    // a chore.** Two characters on a thread paid thirty seconds a round trip —
-    // long enough that an exchange never built, which is the failure at the
-    // other end of the same axis. The rate is not here to make messaging
-    // expensive; it is here to keep it *dearer than being in the room*, so that
-    // walking to somebody stays the better way to talk to them.
-    //
-    // Six seconds does that with room to spare: speech in a room costs nothing
-    // at all, so physical company is still an order of magnitude cheaper, while
-    // ten sends a minute is a conversation rather than a correspondence.
+    // a chore.** The rate paces a correspondence: it is how characters talk to
+    // each other, so it has to be quick enough for an exchange to build, and
+    // slow enough that posting never crowds out the work. Six seconds is ten
+    // sends a minute — a conversation rather than a flood.
     ("message", Cost::cools(6)),
     // The same send, offered only where somebody is waiting: priced as
     // `message`, so answering is never the cheaper way to keep texting.

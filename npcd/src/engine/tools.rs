@@ -118,14 +118,25 @@ pub enum Availability {
     /// invited to address somebody, because there is nobody to address and the
     /// invitation is what makes it try.
     Nearby,
-    /// Only while at least two other people are in the room.
+    /// Only while a **person** is in the room (`docs/npc_conversations.md` §12).
+    ///
+    /// **Room speech is for people.** Offering `tell` to a character whose only
+    /// company is other characters is what makes it talk to them aloud instead
+    /// of messaging them; characters reach each other by `message`, here or
+    /// anywhere. A person is a `visitor:{handle}` body — see
+    /// [`Within::people`].
+    PersonNearby,
+    /// Only while a person is in the room and somebody else besides.
     ///
     /// For an act that keeps something from somebody who is standing there —
     /// which needs one person to tell and another to keep it from. Offered with
     /// only one other person present, a whisper keeps nothing from anyone, and
     /// that is where the cast used it: every remark in a two-person exchange,
     /// narrated at the other one under its breath.
-    AmongOthers,
+    PersonAmongOthers,
+    /// Only while a person's body is where a shout reaches, or the body is in
+    /// field play — see [`Within::heard_by_person`] and [`Within::in_field`].
+    PersonInEarshot,
     /// Only while standing somewhere that is not home.
     ///
     /// **Being called back to where you already are is not a thing that can
@@ -276,19 +287,23 @@ pub struct Tool {
 ///
 /// That is a character narrating its world rather than reacting to it. So both
 /// addressed acts are absent when alone, and their `to` is bound to the people
-/// actually standing here. A shout is the one that is not, because a shout is
-/// how a character alone reaches the rooms around it — and it is its own
-/// deterrent: everybody within earshot hears it.
+/// actually standing here.
+///
+/// # Room speech is for people
+///
+/// Every voice here needs a **person** to hear it (`docs/npc_conversations.md`
+/// §12): characters reach each other by `message`, even standing side by side.
+/// A shout needs a person within its reach, or a fight it is part of.
 const SHOUT: Tool = Tool {
     name: "shout",
     at: &[],
     category: "Speech",
     plane: Plane::Speech,
-    availability: Availability::Always,
+    availability: Availability::PersonInEarshot,
     description: "Call out, for anybody within earshot — everyone in this room and in every room \
                   that can see into it. Aimed at nobody in particular. You give what you MEAN, \
-                  not the sentence; the narrator renders it in your own voice. Not for \
-                  talking to somebody who is with you — that is `tell`.",
+                  not the sentence; the narrator renders it in your own voice. How you talk to \
+                  the people within earshot all at once; one of them here is `tell`.",
     params: &[
         Param {
             name: "intent",
@@ -309,13 +324,14 @@ const SHOUT: Tool = Tool {
     examples: &[
         Example {
             situation: "You are alone in the green room and have just found the same era \
-                        written up twice, differently. People are working on the run outside.",
+                        written up twice, differently. Two visitors are looking round the run \
+                        outside.",
             call: r#"{"intent":"that the third era is written twice and the two do not agree, and that anybody who has been working from it should come and look","manner":"urgently"}"#,
             because: "It is for whoever can hear, and there is nobody here to tell. A shout \
                       reaches the rooms around you.",
         },
         Example {
-            situation: "The lift has jammed half-open, and people on the run outside are \
+            situation: "The lift has jammed half-open, and the visitors on the run outside are \
                         about to walk into it.",
             call: r#"{"intent":"that the lift is not safe and nobody should get in it","manner":"as a warning"}"#,
             because: "A warning is for everybody within earshot at once. Naming one person \
@@ -339,18 +355,19 @@ const TELL: Tool = Tool {
     at: &[],
     category: "Speech",
     plane: Plane::Speech,
-    // Offered only while somebody is here to be spoken to. A character alone has
+    // Offered only while a person is here to be spoken to. A character alone has
     // nobody to name, and being invited to name one is what makes it invent a
-    // person who is not there.
-    availability: Availability::Nearby,
+    // person who is not there; one with only characters for company messages
+    // them.
+    availability: Availability::PersonNearby,
     description: "Talk to somebody here. This is your ordinary speaking voice and how you talk \
-                  to a person — replies, news, questions you are not pressing, anything you \
-                  would say to their face. Name who you are talking to, by the name you know \
-                  them by; anybody else in the room overhears, and hears that it was for them. \
-                  You give what you MEAN, not the sentence; the narrator renders it in your own \
-                  voice. Use this unless you have a reason not to: `whisper` only when it must \
-                  be kept from somebody else who is standing here, `shout` only when it is for \
-                  everybody within earshot.",
+                  to the people here — replies, news, questions you are not pressing, anything \
+                  you would say to their face. Name who you are talking to, by the name you \
+                  know them by; anybody else in the room overhears, and hears that it was for \
+                  them. You give what you MEAN, not the sentence; the narrator renders it in \
+                  your own voice. Use this unless you have a reason not to: `whisper` only when \
+                  it must be kept from somebody else who is standing here, `shout` only when it \
+                  is for everybody within earshot.",
     params: &[
         Param {
             name: "to",
@@ -380,35 +397,35 @@ const TELL: Tool = Tool {
     ],
     examples: &[
         Example {
-            situation: "Maker-04 is in the green room with you. It has been working on the \
-                        third era, and you have just found that era written up twice.",
-            call: r#"{"to":"Maker-04","intent":"that the third era is written twice and the two do not agree, and that I would like to know which of them it has been working from","manner":"plainly"}"#,
+            situation: "Wren, a visitor, is in the green room with you. She has been reading \
+                        the third era, and you have just found that era written up twice.",
+            call: r#"{"to":"Wren","intent":"that the third era is written twice and the two do not agree, and that I would like to know which of them she has been reading","manner":"plainly"}"#,
             because: "Aimed at the one person who can answer it. Anyone else in the room hears \
                       it too and hears that it was not for them, which is the difference \
                       between being asked and overhearing a question.",
         },
         Example {
-            situation: "Somebody has just come in and said they are not going to interrupt.",
-            call: r#"{"to":"Maker-02","intent":"that they are not interrupting and I would rather have the company","manner":"warmly"}"#,
+            situation: "A visitor has just come in and said they are not going to interrupt.",
+            call: r#"{"to":"Wren","intent":"that they are not interrupting and I would rather have the company","manner":"warmly"}"#,
             because: "A reply is addressed. Shouting it to everybody would leave the person \
                       who spoke to you unsure it was meant for them.",
         },
         Example {
-            situation: "The strip along the door has worked loose again, and Maker-04, who is \
-                        handier with the tools than you, is standing by it.",
-            call: r#"{"to":"Maker-04","intent":"that the strip along the door has worked loose again, and that I would be glad of a hand with it if they have the time","manner":"easily"}"#,
+            situation: "The strip along the door has worked loose again, and Wren, a visitor \
+                        who is handier with the tools than you, is standing by it.",
+            call: r#"{"to":"Wren","intent":"that the strip along the door has worked loose again, and that I would be glad of a hand with it if they have the time","manner":"easily"}"#,
             because: "A finding and a request leave them free to take it up or not. Saying they \
                       should fix it would be an order from somebody who has no standing to \
                       give one, and orders between equals are how everyone ends up waiting on \
                       everyone.",
         },
         Example {
-            situation: "Maker-04 and Maker-02 are both in the green room with you, and you \
-                        want Maker-04 to know the kiln has cooled enough to open.",
-            call: r#"{"to":"Maker-04","intent":"that the kiln has cooled and it can open it whenever it likes","manner":"easily"}"#,
-            because: "Nothing in it needs keeping from Maker-02. Whispering it would make an \
-                      ordinary remark look like a secret, and leave Maker-02 wondering what \
-                      is being kept from it.",
+            situation: "Wren and Orion, both visitors, are in the green room with you, and you \
+                        want Wren to know the kiln has cooled enough to open.",
+            call: r#"{"to":"Wren","intent":"that the kiln has cooled and she can open it whenever she likes","manner":"easily"}"#,
+            because: "Nothing in it needs keeping from Orion. Whispering it would make an \
+                      ordinary remark look like a secret, and leave Orion wondering what \
+                      is being kept from him.",
         },
     ],
 };
@@ -424,9 +441,9 @@ const WHISPER: Tool = Tool {
     at: &[],
     category: "Speech",
     plane: Plane::Speech,
-    // One person to whisper to and at least one more to keep it from — with
-    // only the listener here, it is `tell` said quietly.
-    availability: Availability::AmongOthers,
+    // A person here, and at least one more to keep it from — with only the
+    // listener here, it is `tell` said quietly.
+    availability: Availability::PersonAmongOthers,
     description: "Speak to one person here too quietly for anybody else to make out. Only for \
                   something that must be kept from somebody ELSE who is standing here — a \
                   secret, a warning about a person in the room, a thing you would not say in \
@@ -459,9 +476,9 @@ const WHISPER: Tool = Tool {
         },
     ],
     examples: &[Example {
-        situation: "Maker-04 is beside you in the green room, and so is Maker-02, whose \
-                    version of the third era you think is the wrong one.",
-        call: r#"{"to":"Maker-04","intent":"that I think Maker-02's version of the third era is the wrong one, and I would rather not say so in front of it","manner":"quietly"}"#,
+        situation: "Wren, a visitor, is beside you in the green room, and so is Maker-02, \
+                    whose version of the third era you think is the wrong one.",
+        call: r#"{"to":"Wren","intent":"that I think Maker-02's version of the third era is the wrong one, and I would rather not say so in front of it","manner":"quietly"}"#,
         because: "It is for one of them and about the other. Said aloud it would be an \
                   accusation in front of the accused. Had Maker-02 not been there, this would \
                   be `tell`.",
@@ -484,9 +501,9 @@ const ASK: Tool = Tool {
     at: &[],
     category: "Speech",
     plane: Plane::Speech,
-    // Same rule as `tell`: a character alone has nobody to ask, and being
-    // offered the act is what makes it invent somebody.
-    availability: Availability::Nearby,
+    // Same rule as `tell`: a person here to ask, or the act is absent — a
+    // character asks another by message.
+    availability: Availability::PersonNearby,
     description: "Ask one person here something, by the name you know them by. Everyone in the \
                   room hears it and hears who it was for. Use this when you want an answer — a \
                   statement lets them say nothing, a question does not.",
@@ -516,16 +533,16 @@ const ASK: Tool = Tool {
     ],
     examples: &[
         Example {
-            situation: "Maker-04 is here. You have just found the third era written up twice, \
-                        differently, and you cannot tell which is right.",
-            call: r#"{"to":"Maker-04","about":"which of the two versions of the third era it has been working from","manner":"plainly"}"#,
+            situation: "Wren, a visitor, is here. You have just found the third era written up \
+                        twice, differently, and she has read both.",
+            call: r#"{"to":"Wren","about":"which of the two versions of the third era she has been reading","manner":"plainly"}"#,
             because: "Only one person can answer this, and asking obliges them to. Saying it as \
                       a finding would have left them free to say nothing.",
         },
         Example {
-            situation: "Somebody has been in the room with you for a while and you have both \
+            situation: "A visitor has been in the room with you for a while and you have both \
                         been working in silence.",
-            call: r#"{"to":"Maker-02","about":"what they are working on"}"#,
+            call: r#"{"to":"Wren","about":"what they are working on"}"#,
             because: "The plainest way out of a silence, and it costs nothing to be wrong about \
                       whether they wanted to talk.",
         },
@@ -1092,7 +1109,10 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             Availability::AtPart => false,
             // Depends on who is standing next to you, which the prompt cannot
             // know and the situation can. See `nearby`.
-            Availability::Nearby | Availability::AmongOthers => false,
+            Availability::Nearby
+            | Availability::PersonNearby
+            | Availability::PersonAmongOthers
+            | Availability::PersonInEarshot => false,
             // Depends on where the body is standing, which changes every time
             // it walks. The prompt is written once, so this is the situation's
             // to offer — the same reason `Nearby` is absent here.
@@ -1122,15 +1142,19 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
 ///
 /// `company` is how many others are here, because not every one of these arrives
 /// with the first: a whisper needs somebody besides its listener to keep it from
-/// (see [`Availability::AmongOthers`]), and this line naming it to a character
-/// with one person beside it undid the grammar's rule in words.
-pub fn nearby(mode: Mode, company: usize) -> Vec<&'static Tool> {
-    let _ = mode;
+/// (see [`Availability::PersonAmongOthers`]), and this line naming it to a
+/// character with one person beside it undid the grammar's rule in words.
+/// `people` is how many of them are people, and `heard_by_person` whether a
+/// shout from here reaches one — room speech is for people (§12 of
+/// `docs/npc_conversations.md`).
+pub fn nearby(company: usize, people: usize, heard_by_person: bool) -> Vec<&'static Tool> {
     CATALOG
         .iter()
         .filter(|t| match t.availability {
             Availability::Nearby => company >= 1,
-            Availability::AmongOthers => company >= 2,
+            Availability::PersonNearby => people >= 1,
+            Availability::PersonAmongOthers => people >= 1 && company >= 2,
+            Availability::PersonInEarshot => heard_by_person,
             _ => false,
         })
         .collect()
@@ -1988,6 +2012,16 @@ const LIVE: &[(&str, &str, Choices)] = &[
 pub struct Within {
     /// Who is here, by the name the world writes down. Empty when alone.
     pub company: Vec<String>,
+    /// The subset of [`Self::company`] that are people — `visitor:{handle}`
+    /// bodies — by the same names. What room speech needs
+    /// ([`Availability::PersonNearby`]).
+    pub people: Vec<String>,
+    /// Whether a shout from here reaches a person's body, by perception's own
+    /// rule (`npc_map::witness::carries`).
+    pub heard_by_person: bool,
+    /// Whether this body is in field play: it holds a field stance, or a
+    /// hostile is within its reach.
+    pub in_field: bool,
     /// Everywhere this character may walk to, never including where it stands.
     /// Empty for a character with nowhere to go, which takes `move_to` out of
     /// the grammar entirely.
@@ -2177,9 +2211,18 @@ impl Within {
         Self::default()
     }
 
-    /// In company, somewhere with the ordinary two ways out, and nobody waiting
-    /// on you.
+    /// In the company of people, somewhere with the ordinary two ways out, and
+    /// nobody waiting on you.
     pub fn among(company: &[&str]) -> Self {
+        Self {
+            people: company.iter().map(|n| n.to_string()).collect(),
+            ..Self::among_characters(company)
+        }
+    }
+
+    /// [`Self::among`], with characters for company and no person here — who
+    /// are reached by `message`, not by room speech.
+    pub fn among_characters(company: &[&str]) -> Self {
         Self {
             company: company.iter().map(|n| n.to_string()).collect(),
             places: vec!["the green room".into(), "the chronicle".into()],
@@ -2203,6 +2246,9 @@ impl Within {
         self.device_modes = sim.modes_here(place);
         self.extractable = sim.extractable(place);
         self.hostiles = sim.hostiles(place);
+        // **Field play**: a stance held, or something hostile within reach. A
+        // shout is for the field as much as for a person within earshot.
+        self.in_field = sim.field.stance(body).is_some() || !self.hostiles.is_empty();
         // **A stance needs a fight.** Nothing hostile here means no posture to
         // take, which takes `engage` out of the grammar by the ordinary
         // empty-set rule rather than by a rule of its own.
@@ -2345,7 +2391,11 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             // in [`for_body`], which is what builds its prompt.
             Availability::Embodied => true,
             Availability::Nearby => !within.alone(),
-            Availability::AmongOthers => within.company.len() >= 2,
+            Availability::PersonNearby => !within.people.is_empty(),
+            Availability::PersonAmongOthers => {
+                !within.people.is_empty() && within.company.len() >= 2
+            }
+            Availability::PersonInEarshot => within.heard_by_person || within.in_field,
             // A journey home is only a journey from somewhere else.
             Availability::AwayFromHome => within.away_from_home,
             // Only a body with something in its hands can give it back.
@@ -3727,9 +3777,18 @@ mod tests {
             .into_iter()
             .map(|t| t.name)
             .collect();
-        // A shout is the one speech act offered alone: it is how a character
-        // with nobody here reaches the rooms around it.
-        assert!(alone.contains(&"shout".to_string()), "{alone:?}");
+        // A shout is the one speech act offered alone, while a person is
+        // within its reach: it is how a character with nobody here reaches the
+        // rooms around it.
+        assert!(!alone.contains(&"shout".to_string()), "{alone:?}");
+        let overheard = specs_within(
+            Mode::Physical,
+            &Within {
+                heard_by_person: true,
+                ..solitary.clone()
+            },
+        );
+        assert!(overheard.iter().any(|t| t.name == "shout"), "{overheard:?}");
         for needs_company in ["ask", "tell", "whisper", "gesture"] {
             assert!(
                 !alone.contains(&needs_company.to_string()),
@@ -3789,7 +3848,7 @@ mod tests {
         // The situation's "you can also use" line follows the same rule — it
         // named `whisper` beside one person, and the cast took it at its word.
         let told = |company: usize| -> Vec<&str> {
-            nearby(Mode::Physical, company)
+            nearby(company, company, false)
                 .into_iter()
                 .map(|t| t.name)
                 .collect()
@@ -3798,6 +3857,59 @@ mod tests {
         assert!(!told(1).contains(&"whisper"), "{:?}", told(1));
         assert!(told(1).contains(&"tell"), "{:?}", told(1));
         assert!(told(2).contains(&"whisper"), "{:?}", told(2));
+    }
+
+    /// **Room speech is for people** (`docs/npc_conversations.md` §12): the
+    /// exact speech acts offered for each kind of company.
+    #[test]
+    fn room_speech_is_offered_only_where_a_person_would_hear_it() {
+        // Sorted: which acts, not the catalog's order, is the question.
+        let speech = |w: &Within| -> Vec<String> {
+            let mut acts: Vec<String> = specs_within(Mode::Physical, w)
+                .into_iter()
+                .map(|t| t.name)
+                .filter(|n| {
+                    ["tell", "ask", "whisper", "shout", "promise", "remind", "gesture", "message", "reply"]
+                        .contains(&n.as_str())
+                })
+                .collect();
+            acts.sort();
+            acts
+        };
+        let phone = |mut w: Within| {
+            w.threads = vec!["Wick".into()];
+            w.private = vec!["Wick".into()];
+            w.awaiting = vec!["Wick".into()];
+            w
+        };
+        // Characters only: they gesture, and message each other.
+        let characters = phone(Within::among_characters(&["Wick", "Soren"]));
+        assert_eq!(speech(&characters), ["gesture", "message", "reply"]);
+        // Alone, the phone is all there is.
+        assert_eq!(speech(&phone(Within::among_characters(&[]))), ["message", "reply"]);
+        // A visitor among them, owing something: room speech, and a whisper
+        // with someone else to keep it from. A shout from the room a person
+        // stands in reaches them.
+        let mut with_wren = phone(Within::among_characters(&["Wick", "Wren"]));
+        with_wren.people = vec!["Wren".into()];
+        with_wren.heard_by_person = true;
+        with_wren.owed = vec!["the key".into()];
+        assert_eq!(
+            speech(&with_wren),
+            ["ask", "gesture", "message", "promise", "remind", "reply", "shout", "tell", "whisper"]
+        );
+        // A visitor within a shout's reach, and nobody here.
+        let heard = Within {
+            heard_by_person: true,
+            ..phone(Within::among_characters(&[]))
+        };
+        assert_eq!(speech(&heard), ["message", "reply", "shout"]);
+        // Field play.
+        let field = Within {
+            in_field: true,
+            ..phone(Within::among_characters(&["Wick"]))
+        };
+        assert_eq!(speech(&field), ["gesture", "message", "reply", "shout"]);
     }
 
     /// **An addressee can only be somebody who is here.**
