@@ -273,11 +273,11 @@ An **energy curve** over the night, from the start time to the end, with fixed p
 - **Moments** John or Yen ask for ("Yen's song at 22:30").
 - **Zen's last words.** *"It is time for the end of time"*, Zen's line from Battle Cities' Phase 20
   (`battle-cities/docs/03-GAMEPLAY/THE-END.md`), spoken over the midnight track's build so it ends
-  as the last ten seconds begin, and the room counts down from there. The line is Zen's own
+  a few seconds before midnight, two bars before the drop. The drop that follows is midnight, the
+  room's hit and the game's eruption, all at once. The line is Zen's own
   recorded voice from Battle Cities (`assets/narrative/zen-message-*.mp3`), loaded as a sampler
   clip in its own slot. Because the run-in is locked from 23:40, the beat it must start on is known:
-  the beat that falls ten seconds before midnight, less the clip's length in beats at the track's
-  tempo. The conductor fires the slot on that exact beat of the playing deck. It plays through the
+  the drop's beat less two bars, less the clip's length in beats at the track's tempo. The conductor fires the slot on that exact beat of the playing deck. It plays through the
   decks, so the room hears it and the players' stream carries it in time with everything else.
 
 A **budget** keeps the night balanced: John's taste, Yen's, both, requests, and genre spread, each
@@ -568,9 +568,9 @@ The scene vocabulary is small and named:
 
 ### 9.5 Midnight
 
-Midnight is driven from the clock, like the screens' countdown (`director.rs`): while Zen's last
-words play (§5.1) every bulb is dark but the floor; the last ten seconds are a gold wash dimming
-from full to the bulbs' floor; at 00:00:00 every bulb gets the hit,
+Midnight is driven from the clock, like the screens' countdown (`director.rs`): the last ten
+seconds are a gold wash dimming from full to the bulbs' floor, so the room darkens under Zen's last
+words (§5.1); at 00:00:00 every bulb gets the hit,
 sent twice; then a minute of gold pulse, and the set's scenes again. The midnight track's drop lands
 on that second (§5.1), so the hit and the drop are one. Both full rehearsals rehearse it.
 
