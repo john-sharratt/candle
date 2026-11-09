@@ -5,7 +5,9 @@ use std::fmt::Write;
 
 use serde_json::{json, Value};
 
+use super::lights::line;
 use super::{Answer, Dj, Tool};
+use crate::lights::View;
 use crate::live::Live;
 
 pub struct Now;
@@ -95,7 +97,11 @@ fn to_midnight(s: i64) -> String {
 }
 
 pub fn call(dj: &Dj) -> Answer {
-    Answer::ok(say(&dj.live.load()))
+    let lights = match &dj.lights {
+        Some(l) => line(&l.view.load()),
+        None => line(&View::default()),
+    };
+    Answer::ok(format!("{}\n{lights}", say(&dj.live.load())))
 }
 
 #[cfg(test)]

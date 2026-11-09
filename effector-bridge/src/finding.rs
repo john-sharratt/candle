@@ -21,6 +21,12 @@ pub const ANDROIDTV: &str = "androidtv";
 pub const RENDERER: &str = "renderer";
 /// A Pioneer or Onkyo AV receiver ([`crate::profile::receiver`]).
 pub const RECEIVER: &str = "receiver";
+/// A WiZ bulb ([`crate::profile::wiz`]).
+pub const WIZ: &str = "wiz";
+/// The hardware-address prefixes WiZ's bulbs are made with. A bulb announces
+/// nothing a survey hears — no mDNS, no UPnP — so it is known by these, or by
+/// the `wiz_` name it gives the router.
+pub const WIZ_PREFIXES: &[&str] = &["a8:bb:50", "44:4f:8e", "6c:29:90", "d8:a0:11"];
 /// An AirPlay receiver — an Apple TV, a HomePod, an AirPlay speaker.
 pub const AIRPLAY: &str = "airplay";
 /// A Spotify Connect endpoint.
@@ -104,6 +110,7 @@ pub fn reach(profile: &str) -> &'static str {
         CAST => "the world can work it (a Cast device)",
         WEBOS => "the world can work it (an LG webOS TV)",
         ANDROIDTV => "the world can work it (a Google TV)",
+        WIZ => "the world can work it (a WiZ bulb)",
         RENDERER => "the world can see it (a media player)",
         GATEWAY => "the world can see it (the router)",
         AIRPLAY => "the world can see it (AirPlay)",
@@ -116,7 +123,17 @@ pub fn reach(profile: &str) -> &'static str {
 /// Whether a part linked with `profile` has acts the world can take at it —
 /// what makes it a terminal rather than a thing merely seen.
 pub fn workable(profile: &str) -> bool {
-    matches!(profile, SONOS | RECEIVER | CAST | WEBOS | ANDROIDTV)
+    matches!(profile, SONOS | RECEIVER | CAST | WEBOS | ANDROIDTV | WIZ)
+}
+
+/// Whether `f` is a WiZ bulb: by its hardware address's maker prefix, or by
+/// the `wiz_…` name it gives the router.
+fn is_wiz(f: &Finding) -> bool {
+    let hw = f.hardware.to_ascii_lowercase().replace('-', ":");
+    WIZ_PREFIXES.iter().any(|p| hw.starts_with(p))
+        || f.names
+            .iter()
+            .any(|n| n.to_ascii_lowercase().starts_with("wiz_"))
 }
 
 /// Whether a device of `profile` earns its credentials by pairing before the
@@ -145,6 +162,8 @@ pub fn profile_of(f: &Finding) -> &'static str {
     };
     if said(&["sonos"]) {
         SONOS
+    } else if is_wiz(f) {
+        WIZ
     } else if said(&["pioneer", "onkyo"]) {
         RECEIVER
     } else if said(&["androidtvremote", "android tv", "google tv"]) {
@@ -273,11 +292,24 @@ mod tests {
             profile_of(&with(&[], "Samsung", "Galaxy S24 Ultra")),
             DEVICE
         );
+        // A WiZ bulb announces nothing: it is known by its maker's prefix, or
+        // by the name it gives the router.
+        let by_prefix = Finding {
+            hardware: "A8:BB:50:12:34:56".into(),
+            ..Finding::default()
+        };
+        assert_eq!(profile_of(&by_prefix), WIZ);
+        let by_name = Finding {
+            hardware: "02:00:00:00:00:01".into(),
+            names: vec!["wiz_6e1f2a".into()],
+            ..Finding::default()
+        };
+        assert_eq!(profile_of(&by_name), WIZ);
     }
 
     #[test]
     fn only_a_workable_profile_is_a_terminal() {
-        for p in [SONOS, RECEIVER, CAST, WEBOS, ANDROIDTV] {
+        for p in [SONOS, RECEIVER, CAST, WEBOS, ANDROIDTV, WIZ] {
             assert!(workable(p), "{p} should be workable");
         }
         for p in [RENDERER, GATEWAY, AIRPLAY, SPOTIFY, PRINTER, DEVICE] {

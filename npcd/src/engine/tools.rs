@@ -1459,6 +1459,8 @@ pub enum Choices {
     Receiver,
     /// A part here linked to a Cast device — what the cast acts work.
     Cast,
+    /// A part here linked to a WiZ bulb — what the light acts work.
+    Lights,
     /// A TV here the world pairs with and cannot work yet — what `pair_device`
     /// begins. Empty once it is paired, so the act is offered only while there
     /// is a TV to pair.
@@ -1891,6 +1893,12 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("cast_volume", "device", Choices::Cast),
     ("cast_cast", "device", Choices::Cast),
     ("cast_launch", "device", Choices::Cast),
+    ("wiz_status", "device", Choices::Lights),
+    ("wiz_on", "device", Choices::Lights),
+    ("wiz_off", "device", Choices::Lights),
+    ("wiz_dim", "device", Choices::Lights),
+    ("wiz_colour", "device", Choices::Lights),
+    ("wiz_white", "device", Choices::Lights),
     ("pair_device", "device", Choices::Pairable),
     ("pair_code", "device", Choices::Pairing),
     ("house_mode", "mode", Choices::HouseModes),
@@ -1967,6 +1975,8 @@ pub struct Within {
     pub receiver: Vec<String>,
     /// The parts here linked to a Cast device, by name — [`Choices::Cast`].
     pub cast: Vec<String>,
+    /// The parts here linked to a WiZ bulb, by name — [`Choices::Lights`].
+    pub lights: Vec<String>,
     /// The TVs here the world pairs with and has no key for yet, by name —
     /// [`Choices::Pairable`]. What `pair_device` begins; empty once a TV is
     /// paired, which takes the act away.
@@ -2603,6 +2613,7 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Sonos => within.sonos.clone(),
         Choices::Receiver => within.receiver.clone(),
         Choices::Cast => within.cast.clone(),
+        Choices::Lights => within.lights.clone(),
         Choices::Pairable => within.pairable.clone(),
         Choices::Pairing => within.pairing.clone(),
         Choices::HouseModes => within.house_modes.clone(),

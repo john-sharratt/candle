@@ -8,8 +8,8 @@
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
 
-use crate::finding::{ANDROIDTV, CAST, RECEIVER, SONOS, WEBOS};
-use crate::profile::{androidtv, cast, receiver, sonos, webos};
+use crate::finding::{ANDROIDTV, CAST, RECEIVER, SONOS, WEBOS, WIZ};
+use crate::profile::{androidtv, cast, receiver, sonos, webos, wiz};
 use crate::proto::udp::{self, WAKE_PORT};
 use crate::scope::LocalNet;
 
@@ -17,7 +17,7 @@ use crate::scope::LocalNet;
 /// profile and the action — `sonos_play` → (`sonos`, `play`). `None` for any
 /// other tool, including the cross-device `wake_device` and the survey.
 pub fn profile_act(tool: &str) -> Option<(&'static str, &str)> {
-    for p in [SONOS, RECEIVER, CAST, WEBOS, ANDROIDTV] {
+    for p in [SONOS, RECEIVER, CAST, WEBOS, ANDROIDTV, WIZ] {
         if let Some(action) = tool.strip_prefix(&format!("{p}_")) {
             return Some((p, action));
         }
@@ -42,6 +42,7 @@ pub async fn work(
         CAST => cast::work(name, address, action, args, nets).await,
         WEBOS => webos::work(name, address, action, args, nets).await,
         ANDROIDTV => androidtv::work(name, address, action, args, nets).await,
+        WIZ => wiz::work(name, address, action, args, nets).await,
         other => bail!("the world has no way to work a {other}"),
     }
 }
@@ -68,6 +69,7 @@ mod tests {
     fn a_profile_act_splits_into_profile_and_action() {
         assert_eq!(profile_act("sonos_play"), Some(("sonos", "play")));
         assert_eq!(profile_act("receiver_volume"), Some(("receiver", "volume")));
+        assert_eq!(profile_act("wiz_colour"), Some(("wiz", "colour")));
         assert_eq!(profile_act("wake_device"), None);
         assert_eq!(profile_act("survey_network"), None);
         assert_eq!(profile_act("tell"), None);

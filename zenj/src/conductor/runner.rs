@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use crate::control::{Button, Knob};
 use crate::deck::Snapshot;
 use crate::hands::{Hands, Holder};
+use crate::lights::Cue;
 use crate::plan::{Move, Plan};
 
 /// What the conductor sends.
@@ -16,6 +17,8 @@ use crate::plan::{Move, Plan};
 pub enum Send {
     Set(Knob, f32),
     Press(Button),
+    /// A cue for the lights thread.
+    Light(Cue),
 }
 
 /// Two tempos closer than this are one.
@@ -116,6 +119,7 @@ impl Runner {
                     });
                 }
                 Move::Press { button } if zenj => out.push(Send::Press(button)),
+                Move::Light { cue } if zenj => out.push(Send::Light(cue)),
                 Move::Start { deck: d } if zenj => {
                     if !deck.deck(d).is_some_and(|x| x.playing) {
                         out.push(Send::Press(Button::Play(d)));
@@ -222,8 +226,11 @@ mod tests {
         let start = r.tick(224.0, 0.0, &s, &mut h);
         assert_eq!(
             start,
-            vec![Send::Press(Button::Play(2))],
-            "the ramp starts where it is"
+            vec![
+                Send::Press(Button::Play(2)),
+                Send::Light(Cue::Fade { beats: 32.0 })
+            ],
+            "the ramp starts where it is; the lights wash across the blend"
         );
         let s = snapshot(true, true, 128.0);
         let mid = r.tick(232.0, 0.0, &s, &mut h);

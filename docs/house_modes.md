@@ -68,15 +68,24 @@ modes:
     - {device: stereo, act: off}
     - {device: Sonos speaker, act: pause}
     - {device: Chromecast, act: stop}
+    - {every: wiz, act: off}
   watching:
     - {device: stereo, act: off}
+    - {every: wiz, act: dim, level: 15}
   party:
     - {device: stereo, act: on}
 ```
 
 - **A step names its device and its act.** The device is a part by the name the room calls it. The
   act is the bridge's own (`on`, `off`, `input`, `volume` for a receiver; `pause` for a Sonos;
-  `stop` for a Cast device), with that act's arguments beside it (`source: tv`, `volume: 30`).
+  `stop` for a Cast device; `on`, `off`, `dim`, `colour`, `white` for a WiZ bulb), with that act's
+  arguments beside it (`source: tv`, `volume: 30`, `level: 20`).
+- **Or every device of a kind**: `every: wiz` works every part of the room linked to a WiZ bulb, so
+  the twenty bulbs of the ceiling track are one step. The answer counts them, and names any that
+  did not take it.
+- **A party leaves the lights out.** While rekordbox is open ZenJ drives them on the beat
+  (`docs/zenj.md` §9). Every other mode's light steps are the house's, and two never drive the
+  bulbs at once.
 - **A mode the file leaves out has no device steps.** It still opens or closes the decks.
 - **The file is refused whole for one fault:**
   - a room that is not `area/node`

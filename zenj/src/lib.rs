@@ -13,6 +13,7 @@
 //! | [`deck`] | rekordbox's live deck state, read from its memory |
 //! | [`rekordbox`] | rekordbox's library and analysis files; opening and closing it |
 //! | [`bus`] | The house's asks of rekordbox, over the gateway's bus |
+//! | [`lights`] | The WiZ bulbs on the beat: fixtures, scenes, the rate gate, the thread |
 //! | [`room`] | The FLX4's output captured, its levels, how it is landing |
 //! | [`oauth`] | Signing in to Spotify and TIDAL |
 //! | [`spotify`] | Taste and requests |
@@ -36,6 +37,7 @@ pub mod events;
 pub mod hands;
 pub mod http;
 pub mod library;
+pub mod lights;
 pub mod live;
 pub mod midi;
 pub mod music;

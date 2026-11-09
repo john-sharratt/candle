@@ -347,6 +347,7 @@ fn house_lines(parts: &[bridge::Here]) -> Vec<String> {
         (bridge::sonos_of(parts), Choices::Sonos),
         (bridge::receiver_of(parts), Choices::Receiver),
         (bridge::cast_of(parts), Choices::Cast),
+        (bridge::lights_of(parts), Choices::Lights),
         (bridge::pairable_of(parts), Choices::Pairable),
         (bridge::pairing_of(parts), Choices::Pairing),
     ]

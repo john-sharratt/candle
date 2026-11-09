@@ -53,6 +53,8 @@ use zenj::http::router;
 use zenj::library::crates::{crates_of, BUILD, LIVE, NEXT, PEAK};
 use zenj::library::sync::{analyse, build, file_crates, Person};
 use zenj::library::{tags, Library};
+use zenj::lights::wire::Udp;
+use zenj::lights::{Fixtures, Lights, View};
 use zenj::live::Live;
 use zenj::midi::{ports, Map, Out, Reading};
 use zenj::music::{Profile, TrackId};
@@ -65,6 +67,7 @@ use zenj::room::{Analyser, Room, BLOCK};
 use zenj::screens::{Screens, Shared};
 use zenj::spotify::{Spotify, Watch};
 use zenj::tidal::Tidal;
+use zenj::tools::lights::LightsHandle;
 use zenj::tools::Dj;
 use zenj::zen::Zen;
 
@@ -462,6 +465,23 @@ fn night(config: Config) -> anyhow::Result<()> {
         }
     };
 
+    // The lights' queues, when there are bulbs to drive: the thread itself
+    // starts once the live view it reads exists.
+    let fixtures = Fixtures::load(&config.lights.fixtures).map_err(|e| anyhow!(e))?;
+    let (cue_tx, cue_rx) = mpsc::channel();
+    let (light_ask_tx, light_ask_rx) = mpsc::channel();
+    let lights_view = Arc::new(ArcSwap::from_pointee(View {
+        bulbs: fixtures.len(),
+        ..View::default()
+    }));
+    let has_lights = !fixtures.is_empty();
+    if !has_lights {
+        tracing::info!(
+            map = %config.lights.fixtures.display(),
+            "lights: no bulbs mapped"
+        );
+    }
+
     // The conductor.
     let conductor_state = Arc::new(ArcSwap::from_pointee(ConductorState::default()));
     let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -478,6 +498,7 @@ fn night(config: Config) -> anyhow::Result<()> {
             // At ~125 BPM a beat is 480 ms: the lead in beats is near enough
             // constant across the night's tempos.
             lead_beats: config.midi.lead_ms / 480.0,
+            lights: has_lights.then(|| cue_tx.clone()),
         };
         let stop = stop.clone();
         thread::Builder::new()
@@ -531,6 +552,31 @@ fn night(config: Config) -> anyhow::Result<()> {
 
     // The brain, the tools and the cluster, on their runtime.
     let live = Arc::new(ArcSwap::from_pointee(Live::default()));
+
+    // The lights: their own thread, never on the audio's path.
+    if has_lights {
+        let wire = Udp::open().context("the lights' socket")?;
+        let l = Lights {
+            fixtures,
+            wire,
+            snapshot: snapshot.clone(),
+            live: live.clone(),
+            cues: cue_rx,
+            asks: light_ask_rx,
+            view: lights_view.clone(),
+            events: events.clone(),
+            rekordbox: rekordbox_running.clone(),
+            lead_ms: config.lights.lead_ms,
+        };
+        let stop = stop.clone();
+        thread::Builder::new()
+            .name("zenj-lights".into())
+            .spawn(move || l.run(stop))?;
+    }
+    let lights = has_lights.then(|| LightsHandle {
+        asks: light_ask_tx,
+        view: lights_view,
+    });
     let midnight = config.midnight().map_err(|e| anyhow!(e))?;
     {
         let (config, live, events, snapshot) = (
@@ -559,6 +605,7 @@ fn night(config: Config) -> anyhow::Result<()> {
                     cmd_tx,
                     landing,
                     rekordbox_running,
+                    lights,
                 )) {
                     tracing::error!("zenj: {e:#}");
                 }
@@ -598,6 +645,7 @@ async fn serve(
     commands: mpsc::Sender<Command>,
     landing: Arc<AtomicU32>,
     rekordbox_running: Arc<AtomicBool>,
+    lights: Option<LightsHandle>,
 ) -> anyhow::Result<()> {
     let curve = Curve::of(config.night, &config.curve).map_err(|e| anyhow!(e))?;
     let budget = Budget::new(
@@ -639,7 +687,7 @@ async fn serve(
         zen,
         tidal,
         landing,
-        rekordbox: rekordbox_running,
+        rekordbox: rekordbox_running.clone(),
     };
     tokio::spawn(brain.run(ask_rx));
 
@@ -650,6 +698,7 @@ async fn serve(
         EXE,
         live.clone(),
         events.clone(),
+        rekordbox_running.clone(),
     ));
     match fs::read_to_string(&config.zen.key_file) {
         Ok(key) => {
@@ -735,6 +784,7 @@ async fn serve(
         events,
         asks: ask_tx,
         rekordbox,
+        lights,
         people: config
             .people
             .iter()

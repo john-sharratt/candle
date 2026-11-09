@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 
 use crate::engine::mission_gen::standing::HOUSE_LINK;
 use crate::world::Hosted;
-use finding::{ANDROIDTV, CAST, RECEIVER, SONOS};
+use finding::{ANDROIDTV, CAST, RECEIVER, SONOS, WIZ};
 
 /// A reserved credential key, holding the id of the agent that began a Google
 /// TV's two-phase pairing, so `pair_code` finishes on that same agent (the TLS
@@ -98,6 +98,11 @@ pub fn receiver_of(parts: &[Here]) -> Vec<String> {
 /// The names of the parts among `parts` that stand for a Cast device.
 pub fn cast_of(parts: &[Here]) -> Vec<String> {
     on_profile(parts, CAST)
+}
+
+/// The names of the parts among `parts` that stand for a WiZ bulb.
+pub fn lights_of(parts: &[Here]) -> Vec<String> {
+    on_profile(parts, WIZ)
 }
 
 /// Whether `link` holds a credential the world actually works the device with —
@@ -522,6 +527,7 @@ mod tests {
             device_part("the Sonos", SONOS, &[]),
             device_part("the stereo", RECEIVER, &[]),
             device_part("the Chromecast", CAST, &[]),
+            device_part("ceiling light 1", WIZ, &[]),
             // An unpaired LG TV: pairable (one call), never pairing (no code).
             device_part("the LG TV", finding::WEBOS, &[]),
             // A Google TV not yet begun: pairable, not yet pairing.
@@ -536,6 +542,7 @@ mod tests {
         assert_eq!(sonos_of(&parts), vec!["the Sonos".to_string()]);
         assert_eq!(receiver_of(&parts), vec!["the stereo".to_string()]);
         assert_eq!(cast_of(&parts), vec!["the Chromecast".to_string()]);
+        assert_eq!(lights_of(&parts), vec!["ceiling light 1".to_string()]);
         assert_eq!(
             pairable_of(&parts),
             vec!["the LG TV".to_string(), "the den TV".to_string()]
