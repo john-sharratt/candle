@@ -36,6 +36,7 @@ use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
 use axum::http::HeaderMap;
+use mcp_server::listing;
 use mcp_server::protocol::text_result;
 use mcp_server::{Call, Identity, NoCaller, SealedStore, Server, Store};
 use serde_json::{json, Value};
@@ -66,7 +67,13 @@ static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     instructions: INSTRUCTIONS.into(),
     icon: None,
     version: env!("CARGO_PKG_VERSION").into(),
+    // Its client is the aggregator, which tells its own clients.
+    list_changed: false,
 });
+
+/// The version of what `tools/list` answers: every caller is listed the same
+/// tools, so one version, once.
+static TOOLS_VERSION: LazyLock<String> = LazyLock::new(|| listing::version(&definitions()));
 
 /// What a guest — signed in, not one of the night's people — is told.
 const NOT_LISTED: &str = "ZenJ is for the people whose party it is; ask John to add you";
@@ -219,6 +226,15 @@ impl Server for Dj {
 
     async fn call(this: &Arc<Self>, call: &Call<Self>, name: &str, args: &Value) -> Answer {
         self::call(this, &call.caller, name, args).await
+    }
+
+    fn tools_version(&self) -> Option<&str> {
+        Some(&TOOLS_VERSION)
+    }
+
+    /// zenj's client is the aggregator, which tells its own clients.
+    fn list_changed(&self, _call: &Call<Self>) -> bool {
+        false
     }
 
     fn result(&self, answer: &Answer) -> Value {
