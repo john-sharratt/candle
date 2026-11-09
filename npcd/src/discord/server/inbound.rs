@@ -33,7 +33,7 @@ use crate::discord::online::Online;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
 use crate::engine::speaking_as;
-use crate::sim::phone::Origin;
+use crate::sim::phone::{Origin, Who};
 
 /// What became of a message, for the trace and the tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,8 +117,8 @@ async fn judge(a: &Arc<Authored>, bot: &Online, m: &DiscordMessage) -> Heard {
         return Heard::Again;
     }
 
-    let from = author_name(a, m).await;
-    let text = written_out(&m.text(), &m.mentions, bot.user_id, &character);
+    let from = author(a, m).await;
+    let text = written_out(&m.text(), &m.mentions, bot.user_id, &character.name);
     if !text.is_empty() {
         let op = WorldOp::ChannelMessage {
             npc,
@@ -127,8 +127,8 @@ async fn judge(a: &Arc<Authored>, bot: &Online, m: &DiscordMessage) -> Heard {
             text,
             origin: Some(origin),
             to: m
-                .addresses(bot.user_id, &character)
-                .then(|| character.clone()),
+                .addresses(bot.user_id, &character.name)
+                .then(|| character.id.clone()),
         };
         let rt = a.runtime.as_ref().expect("a body is the runtime's");
         if let Err(e) = rt.world_write(&bot.world, op).await {
@@ -145,29 +145,29 @@ async fn judge(a: &Arc<Authored>, bot: &Online, m: &DiscordMessage) -> Heard {
             s.put_channel(npc, m.channel_id, record);
         }
     });
-    let seq = hosted.sim(|s| {
-        s.threads
-            .get(&record.thread)
-            .and_then(|t| t.messages.last())
-            .map_or(0, |m| m.seq)
-    });
+    let seq = hosted.sim(|s| s.threads.get(&record.thread).map_or(0, |t| t.last_seq()));
     Heard::Applied {
-        from,
+        from: from.name,
         thread: record.thread,
         seq,
     }
 }
 
-/// What `m`'s author is called in the world: the name their account speaks
-/// by, when their Discord account is linked to one.
-async fn author_name(a: &Authored, m: &DiscordMessage) -> String {
+/// Who `m`'s author is in the world: by their account's public handle and
+/// the name it speaks by, when their Discord account is linked to one; else
+/// by their Discord user, under their Discord name.
+pub async fn author(a: &Authored, m: &DiscordMessage) -> Who {
+    let unlinked = || Who::new(&format!("discord:{}", m.author.id), &unlinked_name(m));
     let linked = index::account_of(&a.npcs.substrate(), &m.author.id.to_string());
     let Some(account) = linked else {
-        return unlinked_name(m);
+        return unlinked();
     };
     let identity = a.accounts.read().await.identity(&account);
     match identity {
-        Some(identity) => speaking_as(&identity, &public_id(&account), &a.roles),
-        None => unlinked_name(m),
+        Some(identity) => {
+            let handle = public_id(&account);
+            Who::new(&handle, &speaking_as(&identity, &handle, &a.roles))
+        }
+        None => unlinked(),
     }
 }

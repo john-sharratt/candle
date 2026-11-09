@@ -11,6 +11,7 @@ use super::notice::thread_name;
 use super::record::Channel;
 use crate::api::now_ms;
 use crate::discord::message::snowflake_at;
+use crate::sim::phone::Who;
 use crate::world::Hosted;
 
 /// The Discord channel a thread is stood up for: its server's id and name,
@@ -29,14 +30,14 @@ pub struct Standing<'a> {
 /// it, and its record written. A channel recorded before keeps its thread and
 /// its cursors; a thread reopened takes up its mirror from what it holds, so
 /// nothing said before is posted.
-pub fn stand(hosted: &Hosted, npc: u64, character: &str, c: Standing<'_>) {
+pub fn stand(hosted: &Hosted, npc: u64, character: &Who, c: Standing<'_>) {
     let name = thread_name(c.server, c.channel);
     let recorded = hosted.servers(|s| s.channel(npc, c.channel_id));
     let kept = recorded.clone().and_then(|mut record| {
         let through = hosted.with_sim(|s| {
             let t = s.threads.get(&record.thread)?;
             let reopening = !t.open;
-            let last = t.messages.last().map_or(0, |m| m.seq);
+            let last = t.last_seq();
             if t.name != name {
                 s.threads.rename(&record.thread, &name);
             }
@@ -54,7 +55,7 @@ pub fn stand(hosted: &Hosted, npc: u64, character: &str, c: Standing<'_>) {
     });
     let record = kept.unwrap_or_else(|| {
         let thread = hosted.with_sim(|s| {
-            let id = s.threads.open_standing(&name, &[character.to_string()]);
+            let id = s.threads.open_standing(&name, &[character.clone()]);
             s.threads.describe(&id, c.topic);
             id
         });
@@ -62,6 +63,7 @@ pub fn stand(hosted: &Hosted, npc: u64, character: &str, c: Standing<'_>) {
             guild_id: c.guild_id,
             thread,
             mirrored_through: 0,
+            mirrored_part: 0,
             // What was written in the channel before the bot learned of it
             // is the channel's, never read back into the world.
             last_seen_discord: recorded

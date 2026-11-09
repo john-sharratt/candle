@@ -37,7 +37,7 @@ use crate::discord::server::embodied;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
 use crate::engine::speaking_as;
-use crate::sim::phone::Origin;
+use crate::sim::phone::{Member, Origin, Who};
 use crate::world::Hosted;
 
 /// What became of a message, for the trace and the tests.
@@ -128,12 +128,7 @@ async fn judge(a: &Arc<Authored>, bot: &Online, hosted: &Hosted, m: &DiscordMess
     }
     match heard {
         Heard::Applied { from, .. } => {
-            let seq = hosted.sim(|s| {
-                s.threads
-                    .get(&thread)
-                    .and_then(|t| t.messages.last())
-                    .map_or(0, |m| m.seq)
-            });
+            let seq = hosted.sim(|s| s.threads.get(&thread).map_or(0, |t| t.last_seq()));
             Heard::Applied { from, thread, seq }
         }
         other => other,
@@ -155,8 +150,9 @@ async fn speak(
     let Some(identity) = a.accounts.read().await.identity(&account) else {
         return Heard::Unlinked;
     };
-    let from = speaking_as(&identity, &public_id(&account), &a.roles);
-    let members: Vec<String> = hosted.sim(|s| {
+    let handle = public_id(&account);
+    let from = Who::new(&handle, &speaking_as(&identity, &handle, &a.roles));
+    let members: Vec<Member> = hosted.sim(|s| {
         s.threads
             .get(thread)
             .map(|t| t.members.clone())
@@ -164,14 +160,16 @@ async fn speak(
     });
     match kind {
         Kind::Channel if !a.roles.of(Some(&identity)).is_creator() => return Heard::NotCreator,
-        Kind::Group | Kind::Dm if !members.contains(&from) => return Heard::NotMember,
+        Kind::Group | Kind::Dm if !members.iter().any(|w| w.id == from.id) => {
+            return Heard::NotMember
+        }
         _ => {}
     }
-    let character = embodied(a, bot).map(|(_, name)| name).unwrap_or_default();
+    let character = embodied(a, bot).map(|(_, w)| w.name).unwrap_or_default();
     let text = written_out(&m.text(), &m.mentions, bot.user_id, &character);
     if text.is_empty() {
         return Heard::Applied {
-            from,
+            from: from.name,
             thread: thread.to_string(),
             seq: 0,
         };
@@ -190,8 +188,8 @@ async fn speak(
             origin,
         },
         Kind::Dm => {
-            let other = members.iter().find(|n| **n != from);
-            let Some(npc) = other.and_then(|n| character_of(a, hosted, n)) else {
+            let other = members.iter().find(|w| w.id != from.id);
+            let Some(npc) = other.and_then(|w| character_of(a, hosted, &w.id)) else {
                 return Heard::NotMember;
             };
             WorldOp::Message {
@@ -211,25 +209,25 @@ async fn speak(
         return Heard::Unapplied;
     }
     Heard::Applied {
-        from,
+        from: from.name,
         thread: thread.to_string(),
         seq: 0,
     }
 }
 
-/// The character of `members` that `m` is said to: the first it mentions or
-/// answers by its bot, or calls by name.
+/// The character of `members` that `m` is said to, by id: the first it
+/// mentions or answers by its bot, or calls by name.
 fn said_to(
     a: &Authored,
     hosted: &Hosted,
-    members: &[String],
+    members: &[Member],
     m: &DiscordMessage,
 ) -> Option<String> {
     members
         .iter()
-        .find(|name| {
-            character_of(a, hosted, name)
-                .is_some_and(|npc| m.addresses(bot_user(a, npc).unwrap_or_default(), name))
+        .find(|w| {
+            character_of(a, hosted, &w.id)
+                .is_some_and(|npc| m.addresses(bot_user(a, npc).unwrap_or_default(), &w.name))
         })
-        .cloned()
+        .map(|w| w.id.clone())
 }

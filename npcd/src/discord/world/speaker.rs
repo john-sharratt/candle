@@ -31,12 +31,13 @@ pub enum Speaker<'a> {
     },
 }
 
-/// Who posts what `from` said, in `guild_id`, among the bots `online`.
+/// Who posts what member `from` said, in `guild_id`, among the bots
+/// `online`; `name` is what they are called.
 pub fn of<'a>(
     a: &Authored,
     hosted: &Hosted,
     guild_id: u64,
-    from: &str,
+    (from, name): (&str, &str),
     online: &HashMap<u64, &'a Online>,
 ) -> Speaker<'a> {
     let npc = members::character(a, hosted, from);
@@ -45,16 +46,16 @@ pub fn of<'a>(
             return Speaker::Bot(bot);
         }
     }
-    hooked(a, hosted, from)
+    hooked(a, hosted, (from, name))
 }
 
-/// The webhook, posting what `from` said under their name and portrait —
-/// whoever they are. What a private thread is posted by: a bot is no member
-/// of one, and may not write there.
-pub fn hooked<'a>(a: &Authored, hosted: &Hosted, from: &str) -> Speaker<'a> {
+/// The webhook, posting what member `from` said under their name and
+/// portrait — whoever they are. What a private thread is posted by: a bot is
+/// no member of one, and may not write there.
+pub fn hooked<'a>(a: &Authored, hosted: &Hosted, (from, name): (&str, &str)) -> Speaker<'a> {
     let npc = members::character(a, hosted, from);
     Speaker::Hook {
-        username: webhook_name(from),
+        username: webhook_name(name),
         avatar_url: npc.and_then(|npc| portrait_url(a, npc)),
     }
 }

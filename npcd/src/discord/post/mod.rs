@@ -15,6 +15,7 @@ pub mod split;
 use std::future::Future;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 use crate::api::{now_ms, Authored};
@@ -51,8 +52,8 @@ pub enum Post {
     Unposted,
 }
 
-/// Where a post goes, and what of the world's it carries: a message of a
-/// thread, by its seq.
+/// Where a post goes, and what of the world's it carries: a part of a message
+/// of a thread, by its seq.
 #[derive(Debug, Clone, Copy)]
 pub struct Target<'a> {
     /// `dm` or `channel`: what the trace calls the post.
@@ -60,6 +61,8 @@ pub struct Target<'a> {
     pub channel: u64,
     pub thread: &'a str,
     pub seq: u64,
+    /// Which part of the message, when it goes in more than one.
+    pub part: u32,
 }
 
 impl Target<'_> {
@@ -69,18 +72,30 @@ impl Target<'_> {
             .thread(self.thread)
             .seq(self.seq)
     }
+
+    /// The nonce Discord holds this post to: one part of one line of one
+    /// thread, so the same part sent twice within Discord's window is posted
+    /// once (`docs/npc_conversations.md` §11.5). At most 25 characters.
+    pub fn nonce(&self, world: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(format!("{world}:{}:{}:{}", self.thread, self.seq, self.part).as_bytes());
+        let d = h.finalize();
+        d[..12].iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
-/// Post `text` to `to` as `bot`. A `429` is waited out and tried again, a
-/// few times.
+/// Post `text` to `to` as `bot`, under the part's nonce. A `429` is waited
+/// out and tried again, a few times.
 pub async fn post(
     a: &Authored,
     bot: &Online,
     to: Target<'_>,
     text: &str,
 ) -> Result<Post, Rejected> {
+    let nonce = to.nonce(&bot.world);
     tried(a, bot, to, || {
-        a.discord.create_message(&bot.token, to.channel, text)
+        a.discord
+            .create_message_once(&bot.token, to.channel, text, &nonce)
     })
     .await
 }
@@ -149,6 +164,32 @@ where
 /// of them Discord's message `id`.
 pub fn posted(a: &Authored, bot: &Online, to: Target<'_>, id: u64, parts: usize) {
     note(a, bot.npc, to.note("posted").message(id).parts(parts));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A part's nonce is fixed by what it is**: the same part of the same
+    /// line gets the same nonce, any other part or line another, and every
+    /// nonce fits Discord's 25 characters.
+    #[test]
+    fn a_nonce_names_one_part_of_one_line() {
+        let at = |seq, part| Target {
+            kind: "dm",
+            channel: 31,
+            thread: "dm:npc-7:u_8812",
+            seq,
+            part,
+        };
+        let a = at(4, 0).nonce("moon");
+        assert_eq!(a.len(), 24);
+        assert_eq!(a, at(4, 0).nonce("moon"));
+        assert_ne!(a, at(4, 1).nonce("moon"));
+        assert_ne!(a, at(5, 0).nonce("moon"));
+        assert_ne!(a, at(4, 0).nonce("battle-cities"));
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }
 
 /// A failure's status and Discord code, as the trace writes it:

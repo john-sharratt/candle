@@ -49,6 +49,7 @@ pub mod operations;
 pub mod orders;
 pub mod phone;
 pub mod posting;
+pub mod purpose;
 pub mod reading;
 pub mod record;
 pub mod round;
@@ -117,6 +118,11 @@ pub struct Sim {
     /// cast rather than from the room.
     #[serde(rename = "contacts", default)]
     roster: Vec<phone::Who>,
+    /// Purposes the acts just performed left for conversations, taken by the
+    /// authority as each act lands — see [`purpose`]. Never kept: an act's
+    /// purpose is handed on in the same hold that performed it.
+    #[serde(skip)]
+    pub purposes: Vec<purpose::Purpose>,
     /// Absent in a world with no tower — the vault has none, and Keeper's whole
     /// vocabulary goes with it.
     pub tower: Option<Tower>,

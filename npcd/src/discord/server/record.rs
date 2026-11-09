@@ -37,6 +37,10 @@ pub struct Channel {
     pub thread: String,
     /// The seq of the last message of the thread posted to the channel.
     pub mirrored_through: u64,
+    /// How many parts of the line after `mirrored_through` are already
+    /// posted, so a long line that failed part-way resumes where it stopped.
+    #[serde(default)]
+    pub mirrored_part: u32,
     /// The id of the last Discord message taken in from the channel.
     pub last_seen_discord: u64,
 }
@@ -180,6 +184,7 @@ mod tests {
             guild_id,
             thread: thread.into(),
             mirrored_through: 3,
+            mirrored_part: 0,
             last_seen_discord: 900,
         }
     }
@@ -206,6 +211,7 @@ mod tests {
                         "guild_id": 600,
                         "thread": "th7",
                         "mirrored_through": 3,
+                        "mirrored_part": 0,
                         "last_seen_discord": 900,
                     })
                 ),

@@ -2239,14 +2239,15 @@ impl Within {
         // The phone. Empty without a handset in the pack, which is what takes
         // every messaging act out of the grammar for somebody who has not got
         // one — or has had it taken off them.
-        self.threads = sim.threads_for(&self.me, body);
+        // Every phone set is read by the body's id, which is who it is on its
+        // threads, and named the way the character calls each one.
+        self.threads = sim.threads_for(body);
         // What waits unread is read by the name the character calls it — the
         // name its notice gave — and not only off whatever board is here.
-        self.readable
-            .extend(sim.unread_on_phone_for(&self.me, body));
-        self.private = sim.threads_of_kind_for(&self.me, body, ThreadKind::Direct);
-        self.channels = sim.threads_of_kind_for(&self.me, body, ThreadKind::Group);
-        self.awaiting = sim.awaiting_for(&self.me, body);
+        self.readable.extend(sim.unread_on_phone_for(body));
+        self.private = sim.threads_of_kind_for(body, ThreadKind::Direct);
+        self.channels = sim.threads_of_kind_for(body, ThreadKind::Group);
+        self.awaiting = sim.awaiting_for(body);
         // An agenda is kept by a character that takes no orders.
         if sim.missions.is_unordered(body) {
             self.agenda = sim.missions.agenda_titles(body);
@@ -2255,10 +2256,10 @@ impl Within {
                 .map(|p| p.as_str().to_string())
                 .collect();
         }
-        self.leavable = sim.leavable_for(&self.me, body);
-        self.invitable = sim.invitable_for(&self.me, body);
-        self.invitees = sim.invitees_for(&self.me, body);
-        self.contacts = sim.contacts_for(&self.me, body);
+        self.leavable = sim.leavable_for(body);
+        self.invitable = sim.invitable_for(body);
+        self.invitees = sim.invitees_for(body);
+        self.contacts = sim.contacts_for(body);
         self
     }
 

@@ -22,7 +22,6 @@ use crate::discord::post::{post as send, posted, Post, Target};
 use crate::discord::rejected::Rejected;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
-use crate::engine::reported::spoken;
 use crate::sim::phone::Message;
 
 /// Post what is waiting on `bot`'s channels' threads.
@@ -31,8 +30,8 @@ pub async fn post(a: &Arc<Authored>, bot: &Online) -> Result<(), Rejected> {
         return Ok(());
     };
     let npc = bot.npc;
-    'channels: for (channel_id, record) in hosted.servers(|s| s.channels_of(npc)) {
-        let waiting: Vec<Message> = hosted.sim(|s| {
+    'channels: for (channel_id, mut record) in hosted.servers(|s| s.channels_of(npc)) {
+        let waiting: Vec<(Message, String)> = hosted.sim(|s| {
             s.threads
                 .get(&record.thread)
                 .filter(|t| t.open)
@@ -40,27 +39,40 @@ pub async fn post(a: &Arc<Authored>, bot: &Online) -> Result<(), Rejected> {
                     t.messages
                         .iter()
                         .filter(|m| m.seq > record.mirrored_through && m.origin.is_none())
-                        .cloned()
+                        .map(|m| {
+                            let by = t.member(&m.from).map_or(m.from.clone(), |w| w.name.clone());
+                            (m.clone(), by)
+                        })
                         .collect()
                 })
                 .unwrap_or_default()
         });
-        for m in waiting {
-            let text = match m.from == character {
-                true => spoken(&m.intent),
-                false => format!("> **{}:** {}", m.from, m.intent),
+        for (m, by) in waiting {
+            let text = match m.from == character.id {
+                true => m.text.clone(),
+                false => format!("> **{by}:** {}", m.text),
             };
-            let to = Target {
+            let at = |part: u32| Target {
                 kind: "channel",
                 channel: channel_id,
                 thread: &record.thread,
                 seq: m.seq,
+                part,
             };
             let parts = split(&text, LIMIT);
             let mut last = 0;
-            for part in &parts {
-                match send(a, bot, to, part).await? {
-                    Post::Posted(id) => last = id,
+            for (i, part) in parts.iter().enumerate().skip(record.mirrored_part as usize) {
+                match send(a, bot, at(i as u32), part).await? {
+                    Post::Posted(id) => {
+                        last = id;
+                        record.mirrored_part = i as u32 + 1;
+                        hosted.with_servers(|s| {
+                            if let Some(mut now) = s.channel(npc, channel_id) {
+                                now.mirrored_part = record.mirrored_part;
+                                s.put_channel(npc, channel_id, now);
+                            }
+                        });
+                    }
                     Post::Forbidden => {
                         note(
                             a,
@@ -76,11 +88,14 @@ pub async fn post(a: &Arc<Authored>, bot: &Online) -> Result<(), Rejected> {
                     Post::Gone | Post::Unposted => continue 'channels,
                 }
             }
-            posted(a, bot, to, last, parts.len());
+            posted(a, bot, at(0), last, parts.len());
+            record.mirrored_through = m.seq;
+            record.mirrored_part = 0;
             hosted.with_servers(|s| {
-                if let Some(mut record) = s.channel(npc, channel_id) {
-                    record.mirrored_through = m.seq;
-                    s.put_channel(npc, channel_id, record);
+                if let Some(mut now) = s.channel(npc, channel_id) {
+                    now.mirrored_through = m.seq;
+                    now.mirrored_part = 0;
+                    s.put_channel(npc, channel_id, now);
                 }
             });
         }

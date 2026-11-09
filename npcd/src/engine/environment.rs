@@ -42,7 +42,7 @@ use npc_map::delta::Delta;
 use npc_map::world::{Happening, World};
 
 use crate::engine::at_work;
-use crate::engine::event::{EventKind, Salience};
+use crate::engine::event::{EventKind, Salience, TalkLine};
 use crate::engine::perceived::{digest, situation, Perceived};
 use crate::engine::reach;
 use crate::engine::tick::Scheduler;
@@ -428,36 +428,82 @@ fn deliver_messages(
     time: &WorldTimeOf,
     reach: &Reach,
 ) -> usize {
-    // Name → body, off the world: threads address people the way a room does,
-    // by the name the world writes down, and the bindings key on the body.
-    let who_is_where: Vec<(String, String)> =
-        hosted.read(|w| w.actors().map(|a| (a.name.clone(), a.id.clone())).collect());
-    if who_is_where.is_empty() {
+    // Every body on a thread is there by its id; the bindings key on it too.
+    let bodies: Vec<String> = hosted.read(|w| w.actors().map(|a| a.id.clone()).collect());
+    if bodies.is_empty() {
         return 0;
     }
     let mut told = 0;
-    for (name, body) in who_is_where {
+    for body in bodies {
         let Some(&npc_id) = minds.get(&body) else {
             continue;
         };
         let at_ms = time(npc_id);
-        // Taken and marked under one acquisition, so a message cannot be
-        // handed out twice by two moments overlapping. The reminder of what
-        // still waits unread is judged under the same hold (`sim::unread`).
-        let (waiting, due, unread) = hosted.with_sim(|s| {
-            let waiting = s.threads.undelivered_for(&name);
+        // Taken and marked under one acquisition, so a line cannot be handed
+        // out twice by two moments overlapping. The reminder of what still
+        // waits unread is judged under the same hold (`sim::unread`).
+        let (waiting, talk, due, unread) = hosted.with_sim(|s| {
+            let waiting: Vec<(String, phone::Kind, Vec<phone::Message>, Vec<String>)> = s
+                .threads
+                .undelivered_for(&body)
+                .into_iter()
+                .map(|(thread, kind, lines)| {
+                    let names = lines
+                        .iter()
+                        .map(|m| s.threads.name_of(&m.from).unwrap_or(&m.from).to_string())
+                        .collect();
+                    (thread, kind, lines, names)
+                })
+                .collect();
             if !waiting.is_empty() {
-                s.threads.mark_delivered_for(&name);
+                s.threads.mark_delivered_for(&body);
             }
+            // A direct thread's lines are its conversation's, handed over as
+            // they are: the words, by whom, with the account they came from.
+            let talk: Vec<(String, Vec<TalkLine>)> = s
+                .threads
+                .take_direct_for(&body)
+                .into_iter()
+                .map(|(thread, lines)| {
+                    let lines = lines
+                        .into_iter()
+                        .map(|m| TalkLine {
+                            name: s.threads.name_of(&m.from).unwrap_or(&m.from).to_string(),
+                            seq: m.seq,
+                            from: m.from,
+                            text: m.text,
+                            account: m.account,
+                            at_ms: m.at_ms,
+                        })
+                        .collect();
+                    (thread, lines)
+                })
+                .collect();
             // The unread count comes with the reminder: the same per-thread
             // counts, summed, so the threads are not walked again for it.
             let (due, unread) = s
                 .threads
-                .unread_due(&name, phone::now_ms(), !waiting.is_empty());
-            (waiting, due, unread)
+                .unread_due(&body, phone::now_ms(), !waiting.is_empty());
+            (waiting, talk, due, unread)
         });
         if let Some(due) = due {
             remind(npc_id, at_ms, due, sched, reach);
+            told += 1;
+        }
+        for (thread, lines) in talk {
+            tracing::info!(
+                npc = npc_id,
+                thread = %thread,
+                lines = lines.len(),
+                "lines land for the character's conversation"
+            );
+            let kind = EventKind::Talk { thread, lines };
+            match (reach.here)(npc_id) {
+                true => {
+                    sched.deliver(npc_id, at_ms, Salience::URGENT, kind);
+                }
+                false => (reach.elsewhere)(npc_id, at_ms, Salience::URGENT, kind),
+            }
             told += 1;
         }
         if waiting.is_empty() {
@@ -468,22 +514,19 @@ fn deliver_messages(
         // them over here left them counted unread for ever by a character
         // that had answered them. One notice per thread: who wrote there last,
         // and how much now waits in all.
-        for (thread, kind, messages) in waiting {
-            // **Somebody messaging you directly gets your attention; a group
-            // does not — unless it is said to you by name.** A direct thread is
-            // one person addressing this character and nobody else, which is
-            // the same claim on it as being spoken to in a room, and so is a
-            // group line said to it (`Message::to`). The rest of a group of six
+        for (thread, kind, messages, names) in waiting {
+            // **A group does not get a character's attention unless it is
+            // said to it by name** (`Message::to`): the rest of a group of six
             // would otherwise preempt whatever it was doing six times over a
             // conversation it is only one of the audience for.
             let to_me = messages
                 .iter()
-                .any(|m| m.to.as_deref() == Some(name.as_str()));
+                .any(|m| m.to.as_deref() == Some(body.as_str()));
             let salience = match (kind, to_me) {
                 (phone::Kind::Direct, _) | (phone::Kind::Group, true) => Salience::URGENT,
                 (phone::Kind::Group, false) => Salience::NORMAL,
             };
-            let Some(last) = messages.last() else {
+            let (Some(last), Some(from)) = (messages.last(), names.last()) else {
                 continue;
             };
             tracing::info!(
@@ -495,7 +538,7 @@ fn deliver_messages(
             );
             let kind = EventKind::Message {
                 thread: thread.clone(),
-                from: last.from.clone(),
+                from: from.clone(),
                 unread,
             };
             match (reach.here)(npc_id) {

@@ -355,7 +355,7 @@ pub fn battle_cities(map: Option<&MapSet>) -> Sim {
 pub fn issue_handset(sim: &mut Sim, body: &str, name: &str) {
     sim.pack_mut(body)
         .add(PackItem::new(phone::PHONE, "handset", ItemKind::Gear, 1));
-    sim.enrol(name);
+    sim.enrol(&phone::Who::new(body, name));
 }
 
 /// Kit a body out. What a companion walks out of the tower carrying.

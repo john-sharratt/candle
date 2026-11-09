@@ -25,7 +25,6 @@ use npc_map::world::Where;
 use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
-use crate::engine::authorize;
 use crate::engine::body::{destinations, refusal, rooms, Outcome};
 use crate::engine::survey;
 use crate::engine::tools::{CHANNEL_WAY, PRIVATE, SELF};
@@ -33,7 +32,8 @@ use crate::engine::whereabouts;
 use crate::sim::field::{Resource, Stance};
 use crate::sim::item::{Item, Kind as ItemKind};
 use crate::sim::ledger::OrderRefused;
-use crate::sim::phone::{Kind as ThreadKind, Threads, ALL_MESSAGES};
+use crate::sim::phone::{now_ms, Kind as ThreadKind, Said, Threads, Who, ALL_MESSAGES};
+use crate::sim::purpose::Purpose;
 use crate::sim::tower::{on_map, Coord, Posture, DRILL_COST_PER_METRE, EDGE, SIEGE_COST};
 use crate::sim::Sim;
 use crate::world::Hosted;
@@ -74,7 +74,10 @@ pub fn is_mine(tool: &str) -> bool {
 }
 
 /// Perform one act. [`Outcome::NotOfTheBody`] for anything not [`is_mine`].
-pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
+///
+/// `said` is the line the lease holder voiced for a phone act — what lands on
+/// the thread in place of its intent.
+pub fn perform(hosted: &Hosted, body: &str, act: &Act, said: Option<&str>) -> Outcome {
     let a = &act.args;
     match act.tool {
         "act" => act_on(hosted, body, a),
@@ -108,13 +111,13 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         // thread is named from — of the kind `via` said for `message`, the
         // ones waiting on the character for `reply` (`tools::Choices`).
         "message" => match via(a) {
-            Ok(kind) => message(hosted, body, a, Some(kind)),
+            Ok(kind) => message(hosted, body, a, Some(kind), said),
             Err(refused) => refused,
         },
-        "reply" => message(hosted, body, a, None),
+        "reply" => message(hosted, body, a, None, said),
         "invite" => invite(hosted, body, a),
-        "open_group" => open_group(hosted, body, a),
-        "sign_off" => sign_off(hosted, body, a),
+        "open_group" => open_group(hosted, body, a, said),
+        "sign_off" => sign_off(hosted, body, a, said),
         "reach_out" => reach_out(hosted, body, a),
         _ => Outcome::NotOfTheBody,
     }
@@ -286,32 +289,18 @@ fn read(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                 .join("; ");
             return Outcome::Did(format!("You read {what}: {said}"));
         }
-        // **A conversation on its phone, by the name it calls it** — or all of
-        // them with something unread, asked for as its messages or phone. Read
-        // as a board is: marked read as it is handed over, which is what ends
-        // the unread reminder (`sim::unread`).
+        // **A group or channel on its phone, by the name it calls it** — or
+        // all of them with something unread, asked for as its messages or
+        // phone. Read as a board is: marked read as it is handed over, which
+        // is what ends the unread reminder (`sim::unread`). A line read here
+        // signs off no critical step: only an authorizer's yes to the step a
+        // conversation asked them for does (`docs/npc_conversations.md` §7.2).
         if s.has_phone(body) {
-            if let Some((said, read)) = read_phone(&mut s.threads, &me, &what) {
+            if let Some(said) = read_phone(&mut s.threads, body, &what) {
                 // Reading its messages is a step of the reader's round, seen
                 // done as it lands.
                 if said.happened() {
                     s.missions.read_messages(body);
-                    // A critical step held open is let through only by an
-                    // authorizer's affirmative, read here off the phone.
-                    let authorizers = s.missions.authorizers().to_vec();
-                    if !authorizers.is_empty() {
-                        if let Some(m) = s.missions.active_mut(body) {
-                            if m.critical_next().is_some() {
-                                for (from, text) in &read {
-                                    if authorize::authorize_on_message(m, from, text, &authorizers)
-                                        .is_some()
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
                 return said;
             }
@@ -334,15 +323,15 @@ fn read(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     })
 }
 
-/// `what`, read off `me`'s phone: one of its conversations by the name it
-/// calls it, or every one with something unread when `what` asks for its
+/// `what`, read off `me`'s phone: one of its groups or channels by the name
+/// it calls it, or every one with something unread when `what` asks for its
 /// messages or its phone. `None` when `what` names neither, so the reading
 /// goes on to the room.
-fn read_phone(
-    threads: &mut Threads,
-    me: &str,
-    what: &str,
-) -> Option<(Outcome, Vec<(String, String)>)> {
+///
+/// **Each thread read shows the reader its own last line there**, so a
+/// character answering a channel knows what it already said on it rather
+/// than saying it again (`docs/npc_conversations.md` §11.3).
+fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
     let want = what.trim().to_lowercase();
     let all = want == ALL_MESSAGES
         || matches!(
@@ -355,23 +344,31 @@ fn read_phone(
             .into_iter()
             .map(|(n, _)| n)
             .collect(),
-        false => vec![threads.by_name_for(me, what)?.as_named_to(me)],
+        false => vec![threads.by_kind_for(me, ThreadKind::Group, what)?.as_named_to(me)],
     };
+    let now = now_ms();
     let mut said = Vec::new();
-    let mut read: Vec<(String, String)> = Vec::new();
     for name in &names {
-        let fresh = threads.read(me, name).ok()?;
-        if fresh.is_empty() {
+        let Some(t) = threads.by_kind_for(me, ThreadKind::Group, name) else {
+            continue;
+        };
+        let own = t
+            .last_said_by(me)
+            .map(|m| format!(" You last said, {}: {}", ago(m.at_ms, now), m.text.trim()));
+        let speaker = |id: &str| t.member(id).map_or(id.to_string(), |m| m.name.clone());
+        let lines: Vec<String> = t
+            .unread(me)
+            .iter()
+            .map(|m| format!("{}: {}", speaker(&m.from), m.text.trim()))
+            .collect();
+        let own = own.unwrap_or_default();
+        threads.read(me, name).ok()?;
+        if lines.is_empty() {
             continue;
         }
-        let lines: Vec<String> = fresh
-            .iter()
-            .map(|m| format!("{}: {}", m.from, m.intent.trim()))
-            .collect();
-        read.extend(fresh.iter().map(|m| (m.from.clone(), m.intent.clone())));
-        said.push(format!("On {name}: {}", lines.join("; ")));
+        said.push(format!("On {name}: {}.{own}", lines.join("; ")));
     }
-    let outcome = match (said.is_empty(), all) {
+    Some(match (said.is_empty(), all) {
         (true, true) => Outcome::Refused("Nothing on your phone is unread.".into()),
         (true, false) => Outcome::Refused(format!(
             "You have read everything on {}. Nothing has been said since.",
@@ -381,8 +378,19 @@ fn read_phone(
             "{}\nTo answer, `reply` on the conversation it was said on, by that name.",
             said.join("\n")
         )),
-    };
-    Some((outcome, read))
+    })
+}
+
+/// How long ago `then` was, as a character is told it: "just now", "4 min
+/// ago", "2 h ago".
+fn ago(then: u64, now: u64) -> String {
+    let s = now.saturating_sub(then) / 1000;
+    match s {
+        0..=59 => "just now".into(),
+        60..=3_599 => format!("{} min ago", s / 60),
+        3_600..=86_399 => format!("{} h ago", s / 3_600),
+        _ => format!("{} d ago", s / 86_400),
+    }
 }
 
 /// Leave words on something here, for whoever comes to it next.
@@ -1027,66 +1035,104 @@ fn via(args: &Map<String, Value>) -> Result<ThreadKind, Outcome> {
     }
 }
 
-/// Send `intent` on the conversation `to`, one of `kind` when it is said.
+/// The words a phone act puts on a thread: the line the lease holder voiced
+/// for it, carried with the act (`docs/npc_conversations.md` §7.1). An act
+/// made without one — a program calling a device route with the words it
+/// means — says its `intent` as given.
+fn words(said: Option<&str>, intent: &str) -> Said {
+    Said {
+        text: said.unwrap_or(intent).trim().to_string(),
+        intent: said.map(|_| intent.to_string()),
+        ..Said::default()
+    }
+}
+
+/// Send on the thread `to`: `kind` when `message` says how it goes, or a
+/// thread waiting on this character for `reply`.
+///
+/// **A private message is a purpose, not a line.** The character's
+/// conversation with that person says it, in its own words, on their thread
+/// — so a `message` to one person, from the main loop or as a hand-off from
+/// another conversation, hands that conversation what was meant
+/// (`docs/npc_conversations.md` §10). A channel or group takes the voiced
+/// line itself, as does a `reply` on a thread.
 fn message(
     hosted: &Hosted,
     body: &str,
     args: &Map<String, Value>,
     kind: Option<ThreadKind>,
+    said: Option<&str>,
 ) -> Outcome {
     let (Some(to), Some(intent)) = (text(args, "to"), text(args, "intent")) else {
         return Outcome::Refused(
             "You meant to send something, but not to which conversation, or not what.".into(),
         );
     };
-    let me = my_name(hosted, body);
-    let sent = hosted.with_sim(|s| match kind {
-        None => s.threads.send(&me, &to, &intent),
-        Some(kind) => {
-            let Some(id) = s.threads.by_kind_for(&me, kind, &to).map(|t| t.id.clone()) else {
-                return Err(match kind {
-                    ThreadKind::Direct => format!("You have no conversation with {to} alone."),
-                    ThreadKind::Group => {
-                        format!("You have no conversation called {to} among your channels.")
-                    }
-                });
-            };
-            s.threads.send_on(&id, &me, &intent, None)
+    if kind == Some(ThreadKind::Direct) {
+        return purpose(hosted, body, &to, &intent);
+    }
+    let sent = hosted.with_sim(|s| {
+        let found = match kind {
+            Some(kind) => s.threads.by_kind_for(body, kind, &to),
+            None => s.threads.by_name_for(body, &to),
+        };
+        let Some(id) = found.map(|t| t.id.clone()) else {
+            return Err(match kind {
+                Some(ThreadKind::Group) => {
+                    format!("You have no conversation called {to} among your channels.")
+                }
+                _ => format!("You have no conversation with {to}."),
+            });
+        };
+        let (_, reached) = s.threads.send_on(&id, body, words(said, &intent))?;
+        let names: Vec<String> = reached
+            .iter()
+            .map(|r| s.threads.name_of(r).unwrap_or(r).to_string())
+            .collect();
+        // **Answering by handset is answering**: a question a body left
+        // standing is cleared when it is answered here, as `tell` clears it.
+        // Members who are no body in this world had no question standing.
+        for asker in &reached {
+            s.ledger.answered(body, asker);
         }
+        Ok(names)
     });
     match sent {
-        Ok(reached) => {
-            // **Answering by handset is answering.** The obligation a question
-            // leaves is keyed on bodies and cleared when the two of them speak;
-            // `tell` cleared it and this did not, so a character that walked out
-            // of the room and texted the answer stayed marked as owing one — a
-            // standing nudge it could only discharge by finding the person
-            // again in the flesh.
-            //
-            // The thread deals in names and the ledger in body ids, so the
-            // names it reached are resolved back through the world. Anybody it
-            // reached who is not a body in this world — the Creator, somebody
-            // outside — simply matches nothing, which is the right answer:
-            // they had no question standing here to begin with.
-            let ids: Vec<String> = hosted.read(|w| {
-                w.actors()
-                    .filter(|a| reached.iter().any(|n| n.eq_ignore_ascii_case(&a.name)))
-                    .map(|a| a.id.clone())
-                    .collect()
-            });
-            hosted.with_sim(|s| {
-                for asker in &ids {
-                    s.ledger.answered(body, asker);
-                }
-            });
-            Outcome::Did(format!(
-                "You send it to {to}: {}. {} will see it when they next look.",
-                intent.trim_end_matches('.'),
-                npc_map::text::list(&reached)
-            ))
-        }
+        Ok(reached) => Outcome::Did(format!(
+            "You send it to {to}. {} will see it when they next look.",
+            npc_map::text::list(&reached)
+        )),
         Err(why) => Outcome::Refused(why),
     }
+}
+
+/// What this character means to tell `to`, handed to its conversation with
+/// them, which says it in its own words. The authority takes it from
+/// [`Sim::purposes`] and delivers it to whichever member holds the
+/// character (`authority::perform`).
+fn purpose(hosted: &Hosted, body: &str, to: &str, intent: &str) -> Outcome {
+    hosted.with_sim(|s| {
+        let party = s
+            .threads
+            .by_kind_for(body, ThreadKind::Direct, to)
+            .and_then(|t| t.other_ids(body).into_iter().next())
+            .or_else(|| s.roster_id(to).map(str::to_string));
+        let Some(party) = party else {
+            return Outcome::Refused(format!("You have no way to reach {to}."));
+        };
+        let name = s.roster_name(&party).unwrap_or(to).to_string();
+        let me = Who::new(body, s.roster_name(body).unwrap_or(body));
+        s.threads.reach(&me, &Who::new(&party, &name));
+        s.purposes.push(Purpose {
+            from: body.to_string(),
+            to: party,
+            intent: intent.trim().to_string(),
+        });
+        Outcome::Did(format!(
+            "You mean to tell {name} {}; you will say it in your own words.",
+            intent.trim().trim_end_matches('.')
+        ))
+    })
 }
 
 fn invite(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
@@ -1095,33 +1141,43 @@ fn invite(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             "You meant to bring somebody in, but not to which conversation, or not who.".into(),
         );
     };
-    let me = my_name(hosted, body);
-    hosted.with_sim(|s| match s.threads.invite(&me, &to, &who) {
-        Ok(kind) => Outcome::Did(match kind {
-            crate::sim::phone::Kind::Group => {
-                format!("{who} is on it. What is said there now reaches all of you.")
-            }
-            crate::sim::phone::Kind::Direct => format!("{who} is on it."),
-        }),
-        Err(why) => Outcome::Refused(why),
+    hosted.with_sim(|s| {
+        let Some(id) = s.roster_id(&who).map(str::to_string) else {
+            return Outcome::Refused(format!("You have no way to reach {who}."));
+        };
+        let name = s.roster_name(&id).unwrap_or(&who).to_string();
+        match s.threads.invite(body, &to, &Who::new(&id, &name)) {
+            Ok(_) => Outcome::Did(format!(
+                "{name} is on it. What is said there now reaches all of you."
+            )),
+            Err(why) => Outcome::Refused(why),
+        }
     })
 }
 
-fn open_group(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+fn open_group(
+    hosted: &Hosted,
+    body: &str,
+    args: &Map<String, Value>,
+    said: Option<&str>,
+) -> Outcome {
     let (Some(called), Some(with)) = (text(args, "called"), text(args, "with")) else {
         return Outcome::Refused("A group needs a name and somebody to be on it.".into());
     };
-    let me = my_name(hosted, body);
-    let mut members = vec![me.clone()];
-    members.extend(
-        with.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && *s != me),
-    );
-    if members.len() < 2 {
-        return Outcome::Refused("A group of one is a note to yourself.".into());
-    }
     hosted.with_sim(|s| {
+        let mut members = vec![Who::new(body, s.roster_name(body).unwrap_or(body))];
+        for name in with.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            let Some(id) = s.roster_id(name).map(str::to_string) else {
+                return Outcome::Refused(format!("You have no way to reach {name}."));
+            };
+            if members.iter().all(|m| m.id != id) {
+                let shown = s.roster_name(&id).unwrap_or(name).to_string();
+                members.push(Who::new(&id, &shown));
+            }
+        }
+        if members.len() < 2 {
+            return Outcome::Refused("A group of one is a note to yourself.".into());
+        }
         // **A name this character already uses is refused.** Two threads called
         // the same thing are ambiguous to every act that names one — `message`,
         // `invite` and `sign_off` all resolve by the name the character uses,
@@ -1131,54 +1187,65 @@ fn open_group(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome
         // and the character was told its output was not a call. Every turn,
         // permanently, because nothing it could do afterwards removed the
         // duplicate.
-        if s.threads.by_name_for(&me, &called).is_some() {
+        if s.threads.by_name_for(body, &called).is_some() {
             return Outcome::Refused(format!(
                 "You are already on something called {called}. Give this one a name of its own, \
                  or say what you meant to say on the one you have."
             ));
         }
-        s.threads.open_group(&called, &members);
+        let id = s.threads.open_group(&called, &members);
         if let Some(intent) = text(args, "intent") {
-            let _ = s.threads.send(&me, &called, &intent);
+            let _ = s.threads.send_on(&id, body, words(said, &intent));
         }
+        let others: Vec<String> = members[1..].iter().map(|m| m.name.clone()).collect();
         Outcome::Did(format!(
             "{called} is open, with {} on it.",
-            npc_map::text::list(&members[1..])
+            npc_map::text::list(&others)
         ))
     })
 }
 
-/// Leaving a thread. The thread carries on without you unless nobody is left.
-fn sign_off(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+/// Saying goodbye on a thread.
+///
+/// **On a direct thread it ends the conversation and leaves the thread
+/// standing**: the parting is said, the conversation is ENDED, and the next
+/// line either side says opens it again on the same thread
+/// (`docs/npc_conversations.md` §4.3, §11.1). On a group it is leaving: the
+/// parting is said, then the character goes.
+fn sign_off(hosted: &Hosted, body: &str, args: &Map<String, Value>, said: Option<&str>) -> Outcome {
     let (Some(to), Some(intent)) = (text(args, "to"), text(args, "intent")) else {
         return Outcome::Refused(
             "You meant to go, but not from which conversation, or not why.".into(),
         );
     };
-    let me = my_name(hosted, body);
     hosted.with_sim(|s| {
-        // Said before leaving, so the parting lands on the thread rather than
-        // vanishing with the leaver.
-        let _ = s.threads.send(&me, &to, &intent);
-        match s.threads.leave(&me, &to) {
-            Ok(()) => Outcome::Did(format!("You leave {to}, having said why: {intent}")),
-            Err(why) => Outcome::Refused(why),
+        let Some(t) = s.threads.by_name_for(body, &to) else {
+            return Outcome::Refused(format!("You have no conversation with {to}."));
+        };
+        let (id, kind) = (t.id.clone(), t.kind());
+        if let Err(why) = s.threads.send_on(&id, body, words(said, &intent)) {
+            return Outcome::Refused(why);
+        }
+        match kind {
+            ThreadKind::Direct => Outcome::Did(format!("You say goodbye to {to}.")),
+            ThreadKind::Group => match s.threads.leave(body, &to) {
+                Ok(()) => Outcome::Did(format!("You leave {to}, having said why.")),
+                Err(why) => Outcome::Refused(why),
+            },
         }
     })
 }
 
+/// Getting hold of somebody you have no thread with yet: the pair's thread is
+/// opened, and what was meant goes to the conversation with them, as a
+/// private `message` does.
 fn reach_out(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let (Some(to), Some(intent)) = (text(args, "to"), text(args, "intent")) else {
         return Outcome::Refused(
             "You meant to reach somebody, but not who, or not what about.".into(),
         );
     };
-    let me = my_name(hosted, body);
-    hosted.with_sim(|s| {
-        s.threads.reach(&me, &to);
-        let _ = s.threads.send(&me, &to, &intent);
-        Outcome::Did(format!("You get hold of {to}: {intent}"))
-    })
+    purpose(hosted, body, &to, &intent)
 }
 
 #[cfg(test)]

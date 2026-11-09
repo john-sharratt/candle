@@ -34,6 +34,7 @@ use crate::engine::zen_task::request::{
     zend_call, Standing, ZEND_MCP,
 };
 use crate::engine::zen_task::{task_grants, Task};
+use crate::sim::phone::{Kind as ThreadKind, Said, Who};
 use crate::sim::Sim;
 
 /// The service a drone's task is Zen's as: `service:zen`.
@@ -43,6 +44,9 @@ pub const ZEN_SERVICE: &str = "zen";
 /// service, kept apart from the moon's character Zen, whose thread with the
 /// carrier is its own.
 pub const FROM: &str = "Zen Code";
+
+/// The service's id on the threads it posts on.
+pub const FROM_ID: &str = "service:zen";
 
 /// How often each carried mission's task is asked how it stands.
 pub const POLL_EVERY: Duration = Duration::from_secs(15);
@@ -294,10 +298,21 @@ fn post_news(s: &mut Sim, body: &str, npc: u64, handle: &str, text: &str) {
     if !s.missions.is_news(body, said_digest) {
         return;
     }
-    let id = s.threads.reach(body, FROM);
+    // On a standing thread of the carrier's own, named for the service: news
+    // the carrier's mind loop reads and answers with `task_reply`, never a
+    // direct thread, which would be a conversation with a party that is no
+    // one to talk to.
+    let id = match s.threads.by_kind_for(body, ThreadKind::Group, FROM) {
+        Some(t) => t.id.clone(),
+        None => {
+            let me = Who::new(body, s.roster_name(body).unwrap_or(body));
+            s.threads
+                .open_standing(FROM, &[me, Who::new(FROM_ID, FROM)])
+        }
+    };
     // Noted as heard only once it is posted: a post that fails is tried again
     // on the next look.
-    if let Err(why) = s.threads.send_on(&id, FROM, &news(&said), None) {
+    if let Err(why) = s.threads.send_on(&id, FROM_ID, Said::words(&news(&said))) {
         tracing::warn!(npc, "a task's news could not be posted: {why}");
         return;
     }
@@ -427,7 +442,7 @@ mod tests {
                 .of("drone")
                 .iter()
                 .flat_map(|t| t.messages.iter())
-                .filter(|m| m.from == FROM)
+                .filter(|m| m.from == FROM_ID)
                 .count()
         })
     }

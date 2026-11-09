@@ -13,7 +13,7 @@
 //! in the listener's trace: the server's settings, not the world, decide
 //! whether the listener may write there.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +25,6 @@ use crate::api::Authored;
 use crate::discord::online::Online;
 use crate::discord::post::split::{split, LIMIT};
 use crate::discord::post::{post as send, post_hook, posted, Post, Target};
-use crate::engine::reported::spoken;
 use crate::sim::phone::Message;
 use crate::world::Hosted;
 
@@ -42,14 +41,13 @@ pub async fn post(
 ) -> Option<Duration> {
     let mut hold: Option<Duration> = None;
     let mut held = |wait: Duration| hold = Some(hold.map_or(wait, |h| h.max(wait)));
-    // A character's line is its intent, posted as it would say it; a
-    // person's words are posted as they wrote them.
-    let cast: HashSet<String> = hosted.read(|w| w.actors().map(|a| a.name.clone()).collect());
     'threads: for (thread, mirrored) in hosted.mirror(|m| m.threads()) {
         if mirrored.archived {
             continue;
         }
-        let waiting: Vec<Message> = hosted.sim(|s| {
+        // Every line as it was said — a character's voiced, a person's as
+        // written — with the name of who said it.
+        let waiting: Vec<(Message, String)> = hosted.sim(|s| {
             s.threads
                 .get(&thread)
                 .filter(|t| t.open)
@@ -57,29 +55,35 @@ pub async fn post(
                     t.messages
                         .iter()
                         .filter(|m| m.seq > mirrored.mirrored_through && m.origin.is_none())
-                        .cloned()
+                        .map(|m| {
+                            let by = t.member(&m.from).map_or(m.from.clone(), |w| w.name.clone());
+                            (m.clone(), by)
+                        })
                         .collect()
                 })
                 .unwrap_or_default()
         });
-        for m in waiting {
-            let to = Target {
+        let mut part_from = mirrored.mirrored_part;
+        for (m, by) in waiting {
+            let at = |part: u32| Target {
                 kind: "mirror",
                 channel: mirrored.channel_id,
                 thread: &thread,
                 seq: m.seq,
+                part,
             };
             let who = match mirrored.parent {
-                Some(_) => speaker::hooked(a, hosted, &m.from),
-                None => speaker::of(a, hosted, guild.guild_id, &m.from, online),
+                Some(_) => speaker::hooked(a, hosted, (&m.from, &by)),
+                None => speaker::of(a, hosted, guild.guild_id, (&m.from, &by), online),
             };
-            let text = match cast.contains(&m.from) {
-                true => spoken(&m.intent),
-                false => m.intent.clone(),
-            };
-            let parts = split(&text, LIMIT);
+            let parts = split(&m.text, LIMIT);
             let mut last = 0;
-            for part in &parts {
+            // **Each part is cursored**, so a long line that failed part-way
+            // resumes at the part it stopped at: a webhook post carries no
+            // nonce, so this is what keeps it from posting the first parts
+            // again.
+            for (i, part) in parts.iter().enumerate().skip(part_from as usize) {
+                let to = at(i as u32);
                 let sent = match &who {
                     Speaker::Bot(speaker) => send(a, speaker, to, part).await,
                     Speaker::Hook {
@@ -100,7 +104,15 @@ pub async fn post(
                     }
                 };
                 match sent {
-                    Ok(Post::Posted(id)) => last = id,
+                    Ok(Post::Posted(id)) => {
+                        last = id;
+                        hosted.with_mirror(|mirror| {
+                            if let Some(mut now) = mirror.thread(&thread) {
+                                now.mirrored_part = i as u32 + 1;
+                                mirror.put_thread(&thread, now);
+                            }
+                        });
+                    }
                     // A webhook deleted in the server's settings: the next
                     // beat makes another.
                     Ok(Post::Gone) => {
@@ -119,10 +131,12 @@ pub async fn post(
                     }
                 }
             }
-            posted(a, bot, to, last, parts.len());
+            posted(a, bot, at(0), last, parts.len());
+            part_from = 0;
             hosted.with_mirror(|mirror| {
                 if let Some(mut now) = mirror.thread(&thread) {
                     now.mirrored_through = m.seq;
+                    now.mirrored_part = 0;
                     mirror.put_thread(&thread, now);
                 }
             });

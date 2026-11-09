@@ -3,6 +3,7 @@
 //! it — and otherwise sent to the authority as `POST /v1/world/:wid/op`, which
 //! makes them through [`Runtime::make`], the same path.
 
+use std::mem;
 use std::sync::Arc;
 
 use axum::http::Method;
@@ -17,7 +18,7 @@ use crate::world::Hosted;
 
 use super::forward::{act_of, call_line};
 use super::npc_lease::{hand_back, released};
-use super::ops::{Decided, OpReply, WorldOp};
+use super::ops::{ActSource, Decided, OpReply, WorldOp};
 use crate::api::now_ms;
 use crate::bridge;
 use crate::discord::server::apply::channel_message;
@@ -115,6 +116,8 @@ impl Runtime {
                 call,
                 decided,
                 pinned_at,
+                said,
+                source,
             } => {
                 // The call line was decoded on another member, whose `Within`
                 // never crosses the wire, so the catalog read with is the whole
@@ -123,12 +126,19 @@ impl Runtime {
                 // decides here is only where a function block's values end.
                 let act = act_of(&call, &tools::specs()).map_err(|why| anyhow::anyhow!("{why}"))?;
                 let decided = decided.and_then(|d| Some((Where::parse(&d.at)?, d.company)));
-                let body = self.body_of(npc);
+                // A conversation's act was decided on a thread, not in the room:
+                // it restores no decision, and reads none of the body's.
+                let body = match source {
+                    ActSource::Mind => self.body_of(npc),
+                    ActSource::Talk { .. } => None,
+                };
                 if let (Some((hosted, body)), Some((at, company))) = (&body, decided) {
                     hosted.restore_decision(body, at, company);
                 }
                 let pinned = pinned_at.as_deref().and_then(Where::parse);
-                let done = self.perform_here(npc, &act, pinned.as_ref()).await;
+                let done = self
+                    .perform_here(npc, &act, pinned.as_ref(), said.as_deref(), &source)
+                    .await;
                 if let Some((hosted, body)) = &body {
                     hosted.end_decision(body);
                 }
@@ -269,9 +279,21 @@ impl Runtime {
     /// mission moved. The world may run elsewhere: then the act goes to its
     /// authority with the decision it was made in, and a world that does not
     /// answer is told to the character as a refusal.
-    pub async fn perform(&self, npc: u64, act: &Act, pinned: Option<&Where>) -> Performed {
+    ///
+    /// `said` is the line the lease holder voiced for a phone act, and
+    /// `source` whether the act is the mind's or one of its conversations'
+    /// (`docs/npc_conversations.md` §7.1, §8): a conversation's act takes no
+    /// decision state and stamps none of the character's cooldowns.
+    pub async fn perform(
+        &self,
+        npc: u64,
+        act: &Act,
+        pinned: Option<&Where>,
+        said: Option<&str>,
+        source: &ActSource,
+    ) -> Performed {
         let Some((hosted, body)) = self.body_of(npc) else {
-            return self.perform_here(npc, act, pinned).await;
+            return self.perform_here(npc, act, pinned, said, source).await;
         };
         let world = hosted.id().to_string();
         // An act that happens inside a head touches no world, wherever the
@@ -281,19 +303,24 @@ impl Runtime {
             || body::composes(act.tool)
             || body::is_of_the_house(act.tool);
         if self.standing.writes(&world) || !of_the_world {
-            return self.perform_here(npc, act, pinned).await;
+            return self.perform_here(npc, act, pinned, said, source).await;
         }
-        let decided = hosted
-            .read(|w| w.deliberation(&body))
-            .map(|(at, company)| Decided {
-                at: at.to_string(),
-                company,
-            });
+        let decided = match source {
+            ActSource::Mind => hosted
+                .read(|w| w.deliberation(&body))
+                .map(|(at, company)| Decided {
+                    at: at.to_string(),
+                    company,
+                }),
+            ActSource::Talk { .. } => None,
+        };
         let op = WorldOp::Act {
             npc,
             call: call_line(act),
             decided,
             pinned_at: pinned.map(|at| at.to_string()),
+            said: said.map(str::to_string),
+            source: source.clone(),
         };
         match self.world_write(&world, op).await {
             Ok(OpReply::Performed {
@@ -303,7 +330,7 @@ impl Runtime {
                 departing,
                 moved,
             }) => {
-                if landed {
+                if landed && *source == ActSource::Mind {
                     self.cooldowns.took_act(npc, act);
                 }
                 Performed {
@@ -318,6 +345,28 @@ impl Runtime {
             }
             Ok(other) => self.unanswered(act, &format!("the world answered {other:?}")),
             Err(e) => self.unanswered(act, &format!("{e:#}")),
+        }
+    }
+
+    /// Hand on what the acts just performed for `npc` meant to tell somebody
+    /// privately: each to the character's conversation with that party,
+    /// wherever the character is held (`docs/npc_conversations.md` §10).
+    fn hand_on_purposes(&self, npc: u64) {
+        let Some((hosted, _)) = self.body_of(npc) else {
+            return;
+        };
+        let purposes = hosted.with_sim(|s| mem::take(&mut s.purposes));
+        let at_ms = self.world_ms(npc);
+        for p in purposes {
+            self.tell(
+                npc,
+                at_ms,
+                Salience::URGENT,
+                EventKind::Purpose {
+                    party: p.to,
+                    intent: p.intent,
+                },
+            );
         }
     }
 
@@ -341,6 +390,8 @@ impl Runtime {
         npc: u64,
         act: &Act,
         pinned: Option<&Where>,
+        said: Option<&str>,
+        source: &ActSource,
     ) -> Performed {
         let before = self.mission_mark(npc);
         let recorded = if body::is_device(act.tool) {
@@ -356,8 +407,11 @@ impl Runtime {
         } else if zen_task::is_mine(act.tool) {
             self.zen_task_act(npc, act).await
         } else {
-            self.record_act(npc, act)
+            self.record_act(npc, act, said, source)
         };
+        // What the act meant to tell somebody privately goes to the
+        // character's conversation with them, wherever the character is held.
+        self.hand_on_purposes(npc);
         let moved = self.mission_mark(npc) != before;
         // A machine that refused is refused in front of the room, so a
         // colleague can see what went wrong rather than hear what it was taken

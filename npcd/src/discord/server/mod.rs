@@ -29,18 +29,20 @@ use std::sync::Arc;
 use crate::api::Authored;
 use crate::authority::ops::WorldOp;
 use crate::discord::online::Online;
+use crate::sim::phone::Who;
 use crate::world::Hosted;
 
-/// The world `bot`'s character has its body in — the bot's own — and what
-/// the character is called there.
-pub fn embodied(a: &Authored, bot: &Online) -> Option<(Arc<Hosted>, String)> {
+/// The world `bot`'s character has its body in — the bot's own — and the
+/// character there: its body id, which is who it is on its threads, and the
+/// name it is called.
+pub fn embodied(a: &Authored, bot: &Online) -> Option<(Arc<Hosted>, Who)> {
     let (hosted, body) = a
         .runtime
         .as_ref()?
         .body_of(bot.npc)
         .filter(|(hosted, _)| hosted.id() == bot.world)?;
-    let character = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
-    Some((hosted, character))
+    let name = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
+    Some((hosted, Who::new(&body, &name)))
 }
 
 /// Tell `bot`'s character `text`, as something that happened to it

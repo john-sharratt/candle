@@ -190,16 +190,17 @@ impl Thread {
     }
 
     /// Lines from others after `who`'s `cursor`, oldest first.
-    fn after<'a>(&'a self, who: &'a str, cursor: u64) -> impl Iterator<Item = &'a Message> + 'a {
+    fn after(&self, who: &str, cursor: u64) -> Vec<&Message> {
         self.since_joined(who)
             .iter()
-            .filter(move |m| m.seq > cursor && m.from != who)
+            .filter(|m| m.seq > cursor && m.from != who)
+            .collect()
     }
 
     /// What `who` has not read.
     pub fn unread(&self, who: &str) -> Vec<&Message> {
         let read = self.member(who).map_or(0, |m| m.read);
-        self.after(who, read).collect()
+        self.after(who, read)
     }
 
     pub fn unread_for(&self, who: &str) -> usize {
@@ -209,7 +210,7 @@ impl Thread {
     /// What `who`'s mind has not been told of.
     pub fn undelivered(&self, who: &str) -> Vec<&Message> {
         let told = self.member(who).map_or(0, |m| m.delivered);
-        self.after(who, told).collect()
+        self.after(who, told)
     }
 
     /// Mark `who`'s reading up to `seq` — never past what has been said, and
