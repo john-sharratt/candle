@@ -36,6 +36,7 @@ use zend_vfs::{
 
 use cluster::disk::volume_of;
 use cluster::log_read::{self, LogAsk, LogRead};
+use cluster::reserve::{machine as reservation, Reservation};
 
 use crate::chains::{Chains, Unresolved};
 use crate::checkouts::{Checkout, Checkouts};
@@ -68,12 +69,26 @@ pub enum JobError {
     Disabled,
     #[error("this agent is offline: origin is not reached until the host is `online` again")]
     Offline,
+    /// The machine is reserved (`docs/house_modes.md` §4): it runs no builds
+    /// or tests, which commit more memory than the guard can spare, until the
+    /// reservation is released. Pushes, fetches and bridge calls still run.
+    #[error("this machine is reserved — {0}: it runs no builds or tests until it is released")]
+    Reserved(String),
     /// The chains a run's overlay names that this agent does not hold, by
     /// digest: send the run again carrying them.
     #[error("this agent lacks {} of the overlay's chains", .0.len())]
     Missing(Vec<String>),
     #[error("{0}")]
     Bad(String),
+}
+
+/// Why `submit` is refused on a machine `reservation` holds: a run — a build
+/// or a test — is; a push, a fetch or a listing is light, and still goes.
+fn reserved_for(submit: &Submit, reservation: &Reservation) -> Option<String> {
+    match submit {
+        Submit::Run(_) => reservation.why(),
+        Submit::Push(_) | Submit::Fetch(_) | Submit::List(_) => None,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -301,6 +316,9 @@ impl Jobs {
         // (`cluster::offline`). A run works on what the checkouts hold.
         if cluster::offline::is_offline() && matches!(submit, Submit::Push(_) | Submit::Fetch(_)) {
             return Err(JobError::Offline);
+        }
+        if let Some(why) = reserved_for(&submit, &reservation()) {
+            return Err(JobError::Reserved(why));
         }
         match submit {
             Submit::Run(run) => self.run(run).await,
@@ -1084,7 +1102,46 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::overlay::Overlay;
     use crate::wire::PushLine;
+
+    /// **A reserved machine runs no build or test, and still pushes, fetches
+    /// and lists**: the light work a house needs goes on.
+    #[test]
+    fn a_reserved_machine_refuses_runs_alone() {
+        let run = Submit::Run(RunJob {
+            repo: "candle".into(),
+            branch: "main".into(),
+            overlay: Overlay::default(),
+            program: "cargo".into(),
+            args: vec!["build".into()],
+            timeout_secs: 60,
+            stage: None,
+        });
+        let list = Submit::List(ListJob {
+            repo: "candle".into(),
+        });
+        let push = Submit::Push(PushJob {
+            repo: "candle".into(),
+            bundle: None,
+            specs: Vec::new(),
+        });
+        let free = Reservation::new();
+        assert_eq!(reserved_for(&run, &free), None);
+        let reserved = Reservation::new();
+        reserved.observe(Some("rekordbox is open".into()), Instant::now());
+        assert_eq!(
+            reserved_for(&run, &reserved).as_deref(),
+            Some("rekordbox is open")
+        );
+        assert_eq!(reserved_for(&list, &reserved), None);
+        assert_eq!(reserved_for(&push, &reserved), None);
+        assert_eq!(
+            JobError::Reserved("rekordbox is open".into()).to_string(),
+            "this machine is reserved — rekordbox is open: it runs no builds or tests until it \
+             is released"
+        );
+    }
 
     /// **A push and a fetch are listed as the git command they make**: every
     /// ref of one atomic push, a delete as `:<ref>`.

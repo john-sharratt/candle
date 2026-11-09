@@ -111,26 +111,31 @@ open, the machine is the decks'.
   (`zenj/src/http.rs`). A build begun in a pause is still running when the music starts again.
 - Whether rekordbox runs is read by the deck reader as it opens rekordbox (`deck/reader.rs`).
 
-**What keep does with it** (`keep/src/reserve.rs`). keep reads its guards (`keep.yaml` `guards:`)
-every second. While one refuses, the machine is **reserved**:
-- **Every switch, accept, restart, stop and trial is refused** unless forced (`X-Keep-Force`). That
-  includes a start of a service that yields, and the cluster's own trials.
-- **Every service marked `yields: true` is held down** — BlackWorld's motherd. Holding it down
-  takes away the machine's:
-  - agent: no builds, no tests, and no `service_deploy` builds
-  - inference
-  - ingest and calibration
-  - claim on the card and on the memory
+**The reservation** (`cluster/src/reserve/`). keep and motherd each read the guards — keep's
+`keep.yaml` `guards:`, motherd's `host:` `guards:` — every second, into one reservation per
+process. While one refuses, the machine is **reserved**, and its heavy work steps aside.
 
-  The gateway places all of that work on WhiteWorld and AlienWorld. Zen's choices for the night
-  are served there, and the journals stay up, because WhiteWorld's agent serves them too.
-- **A forced start of a held service is left running** until the reservation ends: a person asked
-  for exactly that.
+**Zen is never taken down for it.** A party is run by Zen: it opens the decks, sets the house, and
+refuses to leave a party while a deck plays. A reservation that stopped the only member serving
+Zen would stop the thing running the party — on 2026-11-09 WhiteWorld was in fault for most of the
+day and AlienWorld was offline, and holding BlackWorld's motherd down would have left no Zen at
+all. So nothing is held down; each part steps aside as far as the group can absorb:
+
+| Part | While reserved |
+|---|---|
+| keep (`keep/src/main.rs`) | every switch, accept, restart, stop and trial is refused unless forced (`X-Keep-Force`), the cluster's own trials included. A start is not refused: it takes nothing down. |
+| the member (`host/src/cluster/reserve.rs`, `cluster::reserve::step_aside`) | **drains while another member is ready for every app it serves**: the gateways route it nothing new and its claims and leases go to the others. It stays connected, so it keeps seeing who else is ready, and **undrains the moment an app has nobody else** — serving it, reservation or not. Only the reservation's own drain is undone; one a person asked for stays. |
+| the agent (`agent/src/jobs.rs`, `member.rs`) | **no builds or tests** (`JobError::Reserved`, answered as `no_agent`, so a caller goes to another agent), and no free slot in its `CAPACITY`, so a gateway places them elsewhere. Pushes, fetches and the house's **bridge calls go on**: the party switches the devices through them. |
+| the tenants (`zend/src/ingest_lease.rs`) | **read, calibrate and seal nothing**: every unit, calibration and face is left as one another member holds is, for a member elsewhere or the first pass after release. A worker's turns go on: they are Zen doing what someone asked. |
+
+What stays on BlackWorld's card is the model's memory and, while it is the only member serving an
+app, Zen's own turns — chat and the party's tool calls. The builds that commit more memory than the
+machine has, and the bulk prefill of ingest and calibration, are what is gone.
 
 **It ends ten minutes after the guard last refused** (`RELEASE`). A `zenj` that crashes and is
-started again by `zenj watch`, or a rekordbox restarted by hand, does not let a motherd the size of
-the machine start in the gap. A refusal inside the ten minutes starts the count again. Once
-released, keep starts motherd again.
+started again by `zenj watch`, or a rekordbox restarted by hand, does not let a build or a deploy
+land in the gap. A refusal inside the ten minutes starts the count again. Once released, the
+member undrains and the agent and the tenants take their work back.
 
 ## 5. Nothing waits on a house that is not there
 

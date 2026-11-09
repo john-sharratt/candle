@@ -1,32 +1,37 @@
-//! The machine's reservation (`docs/house_modes.md` §4): while a process keep
-//! does not run says `refuse` on its status — one of `keep.yaml`'s `guards:`,
-//! `zenj` while rekordbox is open — the machine is **reserved**. Nothing is
-//! switched, restarted, stopped, started or tried on it unless forced, and
-//! every service marked `yields: true` is held down, so the machine's memory,
-//! cores and card are the guard's.
+//! The machine's reservation (`docs/house_modes.md` §4): while a guard — a
+//! process this machine runs for something other than the cluster, `zenj`
+//! while rekordbox is open — says `refuse` on its status, the machine is
+//! **reserved**, and the heavy work on it steps aside for the guard.
+//!
+//! What steps aside is each process's to say, from [`machine`]: keep refuses
+//! switches, restarts, stops and trials; a model member drains while another
+//! member is ready for every app it serves, and stays serving when none is —
+//! a party is run by Zen, so Zen is never taken down for one; its agent takes
+//! no builds or tests; its tenants read and calibrate nothing.
 //!
 //! **A reservation outlasts its guard by [`RELEASE`].** It ends only once every
 //! guard has been clear that long: a guard that crashes and is restarted in a
-//! moment must not let a service the size of motherd start under it, nor a
-//! deploy land in the gap. A guard that cannot be read is clear — a process not
-//! answering is reserving nothing — which is what makes a machine with no
-//! guard running exactly a machine with no guard.
+//! moment must not let a build or a deploy land in the gap. A guard that cannot
+//! be read is clear — a process not answering is reserving nothing — which is
+//! what makes a machine with no guard running exactly a machine with no guard.
 //!
-//! [`watch`] reads the guards every [`POLL`] on a thread of its own; everything
-//! else asks the [`Reservation`] what it last saw, so no request waits on a
-//! guard's socket.
+//! | Module | |
+//! |---|---|
+//! | [`guard`] | a guard's status, read |
+//! | [`watch`] | the thread that reads the guards into the reservation |
+//! | [`step_aside`] | whether a model member drains for it |
 
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
+pub mod guard;
+pub mod step_aside;
+pub mod watch;
+
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::guard::{self, FORCE_HEADER};
+use crate::upgrade::switch::FORCE_HEADER;
 
 /// How long every guard must have been clear before the reservation ends.
 pub const RELEASE: Duration = Duration::from_secs(10 * 60);
-
-/// How often the guards are read.
-pub const POLL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct State {
@@ -36,10 +41,19 @@ struct State {
     clear_since: Option<Instant>,
 }
 
-/// Whether this machine is reserved, as [`watch`] last read its guards.
+/// Whether this machine is reserved, as [`watch::watch`] last read its guards.
 #[derive(Default)]
 pub struct Reservation {
     state: Mutex<State>,
+}
+
+/// This process's reservation: never reserved until [`watch::watch`] is given
+/// a guard to read. One per process, so the parts that step aside for it —
+/// the agent, the tenants, the drain — read the same one without being handed
+/// it.
+pub fn machine() -> Arc<Reservation> {
+    static MACHINE: OnceLock<Arc<Reservation>> = OnceLock::new();
+    Arc::clone(MACHINE.get_or_init(|| Arc::new(Reservation::new())))
 }
 
 impl Reservation {
@@ -75,6 +89,11 @@ impl Reservation {
         self.state().why.is_some()
     }
 
+    /// What the guard said, while the machine is reserved.
+    pub fn why(&self) -> Option<String> {
+        self.state().why.clone()
+    }
+
     /// Why a request is refused at `now` because the machine is reserved,
     /// worded with the way past it — `None` when it is not reserved.
     pub fn refusal(&self, now: Instant) -> Option<String> {
@@ -107,39 +126,6 @@ fn minutes(d: Duration) -> String {
     }
 }
 
-/// Read `guards` every [`POLL`] into `reservation`, on a thread of its own,
-/// for as long as keep runs. With no guards there is nothing to read and the
-/// machine is never reserved.
-pub fn watch(guards: Vec<String>, reservation: Arc<Reservation>) {
-    if guards.is_empty() {
-        return;
-    }
-    let spawned = thread::Builder::new()
-        .name("keep-reservation".into())
-        .spawn(move || {
-            let mut was = false;
-            loop {
-                let refusing = guards.iter().find_map(|addr| guard::own_reason(addr));
-                reservation.observe(refusing.clone(), Instant::now());
-                let now = reservation.holds();
-                if now != was {
-                    match now {
-                        true => eprintln!(
-                            "keep: this machine is reserved: {}",
-                            refusing.as_deref().unwrap_or("")
-                        ),
-                        false => eprintln!("keep: this machine's reservation is released"),
-                    }
-                    was = now;
-                }
-                thread::sleep(POLL);
-            }
-        });
-    if let Err(e) = spawned {
-        eprintln!("keep: the guards are not watched: {e}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +143,7 @@ mod tests {
 
         r.observe(Some("rekordbox is open".into()), t0);
         assert!(r.holds());
+        assert_eq!(r.why().as_deref(), Some("rekordbox is open"));
         assert_eq!(
             r.refusal(t0).as_deref(),
             Some(
@@ -188,6 +175,7 @@ mod tests {
         r.observe(None, t2 + Duration::from_secs(1) + RELEASE);
         assert!(!r.holds(), "clear for the whole release");
         assert_eq!(r.refusal(t2 + RELEASE * 2), None);
+        assert_eq!(r.why(), None);
     }
 
     #[test]
@@ -196,5 +184,11 @@ mod tests {
         assert_eq!(minutes(Duration::from_secs(60)), "1 minute");
         assert_eq!(minutes(Duration::from_secs(61)), "2 minutes");
         assert_eq!(minutes(Duration::ZERO), "0 minutes");
+    }
+
+    /// **A process with no guard is never reserved.**
+    #[test]
+    fn the_machine_starts_unreserved() {
+        assert!(!machine().holds());
     }
 }

@@ -31,6 +31,11 @@ host:
   cluster_name: tokera.com
   group_key: web/secrets/group.key
   agent: motherd/agent.yaml
+  # zenj reserves the machine while rekordbox is open (docs/house_modes.md §4):
+  # the agent then takes no builds or tests, the tenants read and calibrate
+  # nothing, and the member drains while another serves every app it does. A
+  # machine with no zenj answering is never reserved.
+  guards: ["127.0.0.1:8097"]
   # DEBUG for every tenant and engine crate (`candle_nn` at INFO): the
   # per-reprojection timings and the scheduler's other per-event detail are
   # logged there, and a slow conversation cannot be diagnosed without them.

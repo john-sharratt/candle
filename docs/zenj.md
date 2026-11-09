@@ -100,11 +100,12 @@ Requests reach it only on routes it declares (`Registry::declaring`,
 (`cluster/src/frame/types.rs:77-91`, `cluster/src/frame/membership.rs:30-100`). `zenj` says so on
 its listener's `/v1/status` instead, with `refuse: "<why>"` **while rekordbox is open** — playing
 or between tracks, since a build begun in a pause is still running when the music starts again
-(`zenj/src/http.rs`). keep reads it as one of the machine's **guards** (`keep.yaml`'s `guards:`)
-and reserves BlackWorld: no switch, accept, restart, stop or cluster trial goes ahead unless forced,
-and motherd — its model's memory, its agent's builds, its share of the card — is held down. The
-reservation ends ten minutes after the guard last refused (`keep/src/reserve.rs`). The whole of it
-is `docs/house_modes.md` §4.
+(`zenj/src/http.rs`). keep and motherd read it as one of the machine's **guards** (`guards:` in
+`keep.yaml` and in motherd's `host:`) and reserve BlackWorld: no switch, accept, restart, stop or
+cluster trial goes ahead unless forced; the agent runs no builds or tests; the tenants read and
+calibrate nothing; and the member drains while another member serves every app it does. Zen is
+never taken down for it — a party is run by Zen. The reservation ends ten minutes after the guard
+last refused (`cluster/src/reserve/`). The whole of it is `docs/house_modes.md` §4.
 
 ### 3.2 The machine and the session
 
@@ -408,9 +409,10 @@ if the card's outputs are DisplayPort) — not cast, which adds seconds of delay
 - The visuals are driven from the predicted beat grid, so they can lead the sound by the TV's
   measured latency, and land on the beat on every screen.
 
-While rekordbox is open BlackWorld is reserved and its motherd is held down (§3.1), so the card,
-the cores and the memory are the decks' and the screens'. Zen's choices are served by the other
-members.
+While rekordbox is open BlackWorld is reserved (§3.1): no builds, no ingest or calibration, and its
+member drained while another serves every app, so the cores and the card's work are the decks' and
+the screens'. Zen's choices are served by the other members while they are up, and by BlackWorld's
+own member when they are not.
 
 ## 9. Models
 
@@ -429,8 +431,9 @@ runs during the set.
 ## 10. The night
 
 - **The house in Party** (`docs/house_modes.md`): rekordbox open, so BlackWorld is reserved for
-  as long as it is — nothing deployed there, its motherd held down, and with it its builds, its
-  inference, its ingest and its calibration. Zen runs on the other members for the night.
+  as long as it is — nothing deployed there, no builds, no ingest or calibration, and its member
+  drained while another serves every app. Zen runs on the other members for the night, and on
+  BlackWorld's when no other is ready.
 - **Freeze, 2026-12-20**: the rekordbox version rehearsed on is held with its update check off; `zenj`
   and the map file are frozen with it.
 - **Offline store** refreshed after 2026-12-10, with a TIDAL login in rekordbox on 2026-12-30.

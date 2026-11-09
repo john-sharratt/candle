@@ -15,7 +15,7 @@ impl Tool for RekordboxTool {
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Open or close rekordbox on BlackWorld, the machine the decks are cabled to. While it is open the machine is reserved for the decks: nothing is deployed there and its model member is held down, until ten minutes after it closes. Closing is refused while a deck is playing unless `force` is set, which only a person at the party asks for.",
+            "description": "Open or close rekordbox on BlackWorld, the machine the decks are cabled to. While it is open the machine is reserved for the decks: nothing is deployed or built there, it reads nothing in, and its model member steps aside while another serves Zen, until ten minutes after it closes. Closing is refused while a deck is playing unless `force` is set, which only a person at the party asks for.",
             "inputSchema": {"type": "object", "properties": {
                 "act": {"type": "string", "enum": ["open", "close"]},
                 "force": {"type": "boolean", "description": "Close it even with a deck playing: a person asked for exactly that."}

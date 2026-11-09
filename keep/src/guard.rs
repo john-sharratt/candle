@@ -6,7 +6,7 @@
 //! says the process is doing something a restart would break. That refusal
 //! holds for a trial the cluster asks for too ([`crate::remote`]), since
 //! nothing in the cluster knows what the service knows. A process keep does
-//! not run refuses the same way for the whole machine (`crate::reserve`).
+//! not run refuses the same way for the whole machine (`cluster::reserve`).
 //!
 //! Every app's quorum is on the service's own `/v1/status`. An app this member
 //! is ready for, in a group of two or more, with one member ready, is served by
@@ -19,14 +19,8 @@
 //! person who means it. A status that cannot be read refuses nothing: a service
 //! not answering is not serving anyone.
 
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
-
+use cluster::reserve::guard::{reason, status_at};
 use serde_json::Value;
-
-/// How long the status is waited for.
-const TIMEOUT: Duration = Duration::from_secs(3);
 
 pub use cluster::upgrade::switch::FORCE_HEADER;
 
@@ -46,35 +40,6 @@ pub fn served_alone(status: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The status at `addr`, `None` when it cannot be read.
-fn status_at(addr: &str) -> Option<Value> {
-    let addr: SocketAddr = addr.parse().ok()?;
-    let read = || -> io::Result<String> {
-        let mut stream = TcpStream::connect_timeout(&addr, TIMEOUT)?;
-        stream.set_read_timeout(Some(TIMEOUT))?;
-        write!(
-            stream,
-            "GET /v1/status HTTP/1.0\r\nHost: {addr}\r\nx-tokera-email: keep@test.invalid\r\n\r\n"
-        )?;
-        let mut answer = String::new();
-        stream.read_to_string(&mut answer)?;
-        Ok(answer)
-    };
-    let answer = read().ok()?;
-    let (_, body) = answer.split_once("\r\n\r\n")?;
-    serde_json::from_str(body).ok()
-}
-
-/// Why `status` says the service refuses to be stopped: its `refuse`, when it
-/// is a non-empty string.
-pub fn reason(status: &Value) -> Option<String> {
-    status["refuse"]
-        .as_str()
-        .map(str::trim)
-        .filter(|why| !why.is_empty())
-        .map(str::to_string)
-}
-
 /// What `status` says when the service refuses to be stopped: its
 /// [`reason`], worded with the way past it.
 pub fn declined(status: &Value) -> Option<String> {
@@ -90,12 +55,6 @@ pub fn declined(status: &Value) -> Option<String> {
 /// says so itself.
 pub fn own_refusal(addr: &str) -> Option<String> {
     declined(&status_at(addr)?)
-}
-
-/// The bare [`reason`] the process whose status is at `addr` gives, if it
-/// refuses: what a guard reserves the machine with (`crate::reserve`).
-pub fn own_reason(addr: &str) -> Option<String> {
-    reason(&status_at(addr)?)
 }
 
 /// Why stopping the service whose status is at `addr` is refused by the
@@ -148,10 +107,6 @@ mod tests {
                  send `X-Keep-Force: 1` to do it anyway\n"
             )
         );
-        assert_eq!(
-            reason(&json!({"refuse": " rekordbox is open "})).as_deref(),
-            Some("rekordbox is open")
-        );
         assert_eq!(declined(&json!({"refuse": "  "})), None);
         assert_eq!(declined(&json!({"refuse": null})), None);
         assert_eq!(declined(&json!({"refuse": true})), None);
@@ -162,6 +117,5 @@ mod tests {
     fn a_status_that_cannot_be_read_refuses_nothing() {
         assert_eq!(refusal("127.0.0.1:1"), None);
         assert_eq!(refusal("not an address"), None);
-        assert_eq!(own_reason("127.0.0.1:1"), None);
     }
 }

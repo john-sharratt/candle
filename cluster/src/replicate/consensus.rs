@@ -442,6 +442,15 @@ impl Replicator {
         self.ready_nodes().len() as u32
     }
 
+    /// How many members of this app other than this one are ready, across
+    /// every cluster: who would serve it if this member stepped aside.
+    pub fn peers_ready(&self) -> usize {
+        self.ready_nodes()
+            .iter()
+            .filter(|n| **n != self.node)
+            .count()
+    }
+
     /// The distinct ready members visible at once across every cluster, this
     /// one included when it is ready.
     fn ready_nodes(&self) -> BTreeSet<u64> {

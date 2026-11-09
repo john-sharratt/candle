@@ -22,20 +22,18 @@ cluster:
 # (docs/house_modes.md §4): zenj, started at John's logon in the console
 # session (docs/zenj.md §3.2), says `refuse` on its status while rekordbox is
 # open. While it does, and for ten minutes after, nothing here is switched,
-# restarted, stopped or tried, and motherd is held down.
+# restarted, stopped or tried. motherd steps aside by itself, and only while
+# another member serves every app it does.
 guards: ["127.0.0.1:8097"]
 services:
   - name: web
     stable: keep/stable/web.exe
     args: ["--config", "web/web.yaml"]
     cwd: D:/prog/candle
-  # Yields to the reservation: its model's memory, its agent's builds and its
-  # share of the card are the decks' while the house is in Party.
   - name: motherd
     stable: keep/stable/motherd.exe
     args: ["--config", "motherd/motherd.yaml"]
     cwd: D:/prog/candle
-    yields: true
   - name: mcp
     stable: keep/stable/mcp.exe
     args: ["--config", "mcp/mcp.yaml"]

@@ -43,6 +43,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cluster::replicate::{LeaseEvent, Replicator};
+use cluster::reserve::{machine as reservation, Reservation};
 use tokio::sync::broadcast::{self, Receiver};
 
 /// How long a reading may hold its unit. A crash frees it when this runs out
@@ -253,6 +254,18 @@ pub fn share_worker(conv_id: &str) -> Share {
 }
 
 fn share_key(key: Vec<u8>) -> Share {
+    share_on(key, &reservation())
+}
+
+/// [`share_key`] on `reservation`. **A reserved machine reads nothing**
+/// (`docs/house_modes.md` §4): every unit, calibration and face is left as one
+/// another member holds is, for the next pass after the reservation ends —
+/// or for a member elsewhere, whose pass finds it unread. A worker's turns are
+/// not leased here: they are Zen doing what someone asked of it.
+fn share_on(key: Vec<u8>, reservation: &Reservation) -> Share {
+    if reservation.holds() {
+        return Share::Theirs;
+    }
     let seat = SEAT.lock().unwrap_or_else(|e| e.into_inner()).clone();
     match seat {
         Some(seat) => claim(seat, key),
@@ -536,6 +549,19 @@ mod tests {
             assert!(o[8..].iter().all(|&i| !first(i)), "{o:?}");
         }
         assert_ne!(a[..8], b[..8], "the first ones in each member's own order");
+    }
+
+    /// **A reserved machine leaves every unit**, as one another member holds,
+    /// and asks no seat for it; an unreserved one with no seat reads it.
+    #[test]
+    fn a_reserved_machine_leaves_every_unit() {
+        let reserved = Reservation::new();
+        reserved.observe(Some("rekordbox is open".into()), Instant::now());
+        assert!(matches!(
+            share_on(calibration_key("m"), &reserved),
+            Share::Theirs
+        ));
+        assert!(matches!(share_on(lease_key("k"), &reserved), Share::Theirs));
     }
 
     #[test]

@@ -763,9 +763,11 @@ fn missing_of(status: StatusCode, body: &[u8]) -> Option<Vec<String>> {
 
 fn refused(e: JobError) -> AgentError {
     match e {
-        JobError::UnknownRepo(_) | JobError::NoPush(_) | JobError::Disabled | JobError::Offline => {
-            AgentError::NoAgent(e.to_string())
-        }
+        JobError::UnknownRepo(_)
+        | JobError::NoPush(_)
+        | JobError::Disabled
+        | JobError::Offline
+        | JobError::Reserved(_) => AgentError::NoAgent(e.to_string()),
         other => AgentError::Refused {
             status: 400,
             why: other.to_string(),

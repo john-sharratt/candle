@@ -17,6 +17,8 @@ use candle_conversation::engine_slot::CoreRequests;
 use candle_conversation::profile::set_gpu_span_period;
 use candle_conversation::{EngineSlot, TenantRank};
 use cluster::launch::{LaunchSpec, OneShot};
+use cluster::reserve::machine as reservation;
+use cluster::reserve::watch::{read_once, watch as watch_guards};
 use cluster::upgrade::artifacts::RunProbe;
 use cluster::upgrade::handoff::hand_off;
 use cluster::upgrade::runtime::{Setup, Upgrader};
@@ -33,6 +35,7 @@ use crate::cli::HostArgs;
 use crate::cluster::in_flight::IN_FLIGHT_WAIT;
 use crate::cluster::leave::drain_and_send;
 use crate::cluster::readiness::watch_readiness;
+use crate::cluster::reserve::step_aside;
 use crate::cluster::upgrade::{setup as upgrade_setup, HostInstaller};
 use crate::cluster::{standalone_agent, Cluster, Join};
 use crate::ctrl_c::accept_ctrl_c;
@@ -381,6 +384,16 @@ async fn serve_tenants(
     let names: Vec<&'static str> = uis.iter().map(|(n, _)| *n).collect();
     let machine = System::host_name().unwrap_or_else(|| listen.bind.to_string());
     state_expert_pin(&machine);
+    // The machine's reservation (`docs/house_modes.md` §4), read before the
+    // agent or a tenant starts, so neither starts work under one already
+    // standing.
+    read_once(&cfg.args.guards, &reservation());
+    if let Err(e) = watch_guards(cfg.args.guards.clone(), reservation(), |why| match why {
+        Some(why) => tracing::warn!(why, "this machine is reserved: its heavy work steps aside"),
+        None => tracing::warn!("this machine's reservation is released"),
+    }) {
+        tracing::error!("the guards are not watched: {e}");
+    }
     let cluster = match cfg.args.cluster(machine.clone())? {
         Some(settings) => {
             tracing::info!(
@@ -390,13 +403,15 @@ async fn serve_tenants(
             // A member upgrades with its group (§3.8–§3.11).
             let upgrader = Upgrader::new(upgrade, installer, Arc::new(RunProbe));
             upgrader.start();
-            Some(Cluster::new(
+            let cluster = Cluster::new(
                 settings,
                 &names,
                 Arc::clone(&telemetry),
                 Handle::current(),
                 upgrader,
-            )?)
+            )?;
+            step_aside(&cluster);
+            Some(cluster)
         }
         None => None,
     };

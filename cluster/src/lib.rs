@@ -25,6 +25,8 @@
 //! - [`launch`]: how this process was launched, to start an identical one.
 //! - [`peer`]: gateways linked to each other, for the state active-active
 //!   gateways share.
+//! - [`reserve`]: the machine's reservation, while a guard such as `zenj`
+//!   refuses, and what steps aside for it.
 //!
 //! No candle and no CUDA: the gateway links this crate, and a record inside an
 //! `EVENT` stays opaque bytes here.
@@ -52,6 +54,7 @@ pub mod offline;
 pub mod peer;
 pub mod pipe;
 pub mod replicate;
+pub mod reserve;
 pub mod session;
 pub mod upgrade;
 pub mod version;

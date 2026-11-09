@@ -99,6 +99,14 @@ pub struct HostArgs {
     #[arg(long, value_name = "N", default_value_t = KEEP_DEFAULT)]
     pub keep_builds: usize,
 
+    /// The `host:port` status of a process on this machine that reserves it
+    /// while it says `refuse` — `zenj`, while rekordbox is open
+    /// (`docs/house_modes.md` §4). Repeatable. While reserved the agent takes
+    /// no builds or tests, the tenants read and calibrate nothing, and the
+    /// member drains while another is ready for every app it serves.
+    #[arg(long = "guard", value_name = "HOST:PORT")]
+    pub guards: Vec<String>,
+
     /// The build an install restored this process from, `count-hash`: it is
     /// never tried again (§3.9). `keep` sets it when it restores this
     /// process; a relaunch drops it, and the config file cannot set it.
@@ -137,6 +145,7 @@ impl Default for HostArgs {
             cluster_quorum_max: None,
             agent: None,
             keep_builds: KEEP_DEFAULT,
+            guards: Vec::new(),
             upgrade_failed: None,
             after_pid: None,
             expert_split: ExpertSplitArgs::default(),

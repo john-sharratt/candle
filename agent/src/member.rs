@@ -23,6 +23,7 @@ use cluster::frame::{Capacity, MemberState};
 use cluster::handshake::GroupKey;
 use cluster::machine::measure;
 use cluster::member::{kept_node, AppMember, Identity};
+use cluster::reserve::{machine as reservation, Reservation};
 use cluster::session::VirtualConn;
 use cluster::upgrade::runtime::Upgrader;
 use cluster::version::this_build;
@@ -57,8 +58,15 @@ pub fn node_in(dir: &Path) -> anyhow::Result<u64> {
 }
 
 /// What `CAPACITY` reports for `jobs`, with `found` the toolchains on the
-/// `PATH`.
+/// `PATH`, on this machine's reservation.
 pub fn capacity(jobs: &Jobs, found: &[String]) -> Capacity {
+    capacity_on(jobs, found, &reservation())
+}
+
+/// [`capacity`] on `reservation`. A reserved machine is still `ready` — its
+/// pushes, fetches and the house's bridge calls go on — with no slot free, so
+/// a gateway places builds and tests on another agent.
+fn capacity_on(jobs: &Jobs, found: &[String], reservation: &Reservation) -> Capacity {
     let machine = measure();
     let (slots, running) = jobs.slots();
     Capacity {
@@ -69,7 +77,10 @@ pub fn capacity(jobs: &Jobs, found: &[String]) -> Capacity {
         },
         power: u32::from(machine.cores),
         idle: running == 0,
-        slots_free: slots.saturating_sub(running),
+        slots_free: match reservation.holds() {
+            true => 0,
+            false => slots.saturating_sub(running),
+        },
         cores: machine.cores,
         load_milli: machine.load_milli,
         os: machine.os,
@@ -290,6 +301,31 @@ mod tests {
         assert_eq!(capacity(&jobs, &[]).state, MemberState::Disabled);
         jobs.set_enabled(true).unwrap();
         assert_eq!(capacity(&jobs, &[]).state, MemberState::Ready);
+    }
+
+    /// **A reserved machine's agent stays `ready` with no slot free**: the
+    /// house's bridge calls still reach it, and builds go to another agent.
+    #[test]
+    fn a_reserved_machine_offers_no_slot_and_stays_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig {
+            jobs_dir: dir.path().join("jobs"),
+            slots: Some(2),
+            stage_dir: None,
+            checkouts: Vec::new(),
+            sweep: SweepConfig::default(),
+        };
+        let jobs = Jobs::new(
+            Checkouts::open(&cfg, &CommandPolicy::allowing(["cargo"])).unwrap(),
+            2,
+            Priority::Below,
+        );
+        let reserved = Reservation::new();
+        reserved.observe(Some("rekordbox is open".into()), Instant::now());
+        let cap = capacity_on(&jobs, &[], &reserved);
+        assert_eq!(cap.state, MemberState::Ready);
+        assert_eq!(cap.slots_free, 0);
+        assert_eq!(capacity_on(&jobs, &[], &Reservation::new()).slots_free, 2);
     }
 
     /// **The proof is printed once, and only once admitted.**

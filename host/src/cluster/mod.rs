@@ -15,6 +15,7 @@
 //! | [`store`] | a tenant's substrate as replication drives it (§6, §7) |
 //! | [`disk`] | the volume a substrate is on, for fault mode (§7.7) |
 //! | [`leave`] | draining and sending before the process stops (§12.4) |
+//! | [`reserve`] | stepping aside while the machine is reserved (`docs/house_modes.md` §4) |
 //! | [`up`] | requests between members, and the stamp naming the sender (§9.3) |
 //! | [`bus`] | a member's asks on the gateways' bus |
 //! | [`upgrade`] | what the upgrades start from, and installing a build (§3.9) |
@@ -41,6 +42,7 @@ pub mod in_flight;
 pub mod leave;
 pub mod listener;
 pub mod readiness;
+pub mod reserve;
 pub mod serve;
 pub mod sticky;
 pub mod store;
