@@ -207,6 +207,23 @@
   .zmd .note-bubble.writing .note-trail i { animation: zpulse 1.5s ease-in-out infinite; }
   .zmd .note-bubble.writing .note-trail i:nth-child(2) { animation-delay: .2s; }
   .zmd .note-bubble.writing .note-trail i:nth-child(3) { animation-delay: .4s; }
+  /* Light. The light theme is the dark page inverted with its hues turned
+     back (`invert(1) hue-rotate(180deg)` on the layout), so dark and vivid
+     stay exactly as designed. These touch it up where an inversion reads
+     wrong. Each colour here is written as the DARK colour that inverts to
+     the light one wanted: near-black warm brown becomes warm paper, black
+     becomes white. Pictures and icons are inverted back, so they show true. */
+  .zlight img, .zlight .think-brain, .zlight .job-icon { filter: invert(1) hue-rotate(180deg); }
+  .zlight .z-center, .zlight .z-composer-wrap { background: #0d0b08 !important; }
+  .zlight .z-composer { background: #030302 !important; border-color: #2c2823 !important; box-shadow: 0 2px 14px rgba(0,0,0,0.5) !important; }
+  .zlight .z-userbubble { background: #211c16 !important; border-color: #1a1612 !important; }
+  .zlight .zmd .tool-call-card, .zlight .zmd .tool-author, .zlight .zmd .tool-prefill { background: #060504; }
+  .zlight .zmd .tool-call-header { background: #060504; border-bottom-color: #1e1b18; }
+  /* An accent keeps its hue through the inversion but flips its lightness,
+     so a mid amber comes out muddy: a lighter one comes out a clear amber. */
+  .zlight .zmd .tool-call-name { color: #e2a050; }
+  .zlight .zmd .note-bubble { background: rgba(232,145,127,0.13); border-color: rgba(232,145,127,0.6); }
+  .zlight .zmd .note-trail i { background: rgba(232,145,127,0.18); border-color: rgba(232,145,127,0.6); }
   .zmd .think-block { margin: .1rem 0 .9rem; }
   .zmd .think-summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: .45rem; font-size: .8rem; color: #7c736a; user-select: none; padding: .2rem 0; transition: color .13s; }
   .zmd .think-summary:hover { color: #9a9490; }
@@ -2337,7 +2354,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     if (journalEntryEl) savedJournalEntryScroll = journalEntryEl.scrollTop;
     promptEl = chatEl = logEl = filesListEl = substrateEl = journalListEl = journalEntryEl = null;
 
-    const themeFilter = S.theme === 'light' ? 'invert(1) hue-rotate(180deg)' : S.theme === 'vivid' ? 'saturate(1.75) contrast(1.06)' : 'none';
+    // Light is the dark page inverted, its hues turned back; `zlight` marks it
+    // so the light-only rules below the stylesheet's `.zlight` heading apply.
+    const themeFilter = S.theme === 'light' ? 'invert(1) hue-rotate(180deg) contrast(1.05)' : S.theme === 'vivid' ? 'saturate(1.75) contrast(1.06)' : 'none';
     // The shell is pinned to the visible area. `--zvt`/`--zvh` are the visual
     // viewport's top and height (`fitVisualViewport`), so when a phone keyboard
     // opens the shell shrinks to what is left above it instead of being panned
@@ -2345,7 +2364,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // mobile 100vh is the tall viewport with the address bar hidden, which
     // pushes the composer under the browser's bottom bar; the vh line is a
     // fallback for old browsers.
-    const layout = h('div', { style: 'display:flex; position:fixed; left:0; top:var(--zvt,0px); height:100vh; height:var(--zvh,100dvh); width:100vw; overflow:hidden; filter:' + themeFilter + ';' });
+    const layout = h('div', { class: S.theme === 'light' ? 'zlight' : '', style: 'display:flex; position:fixed; left:0; top:var(--zvt,0px); height:100vh; height:var(--zvh,100dvh); width:100vw; overflow:hidden; filter:' + themeFilter + ';' });
 
     if (!S.sidebarCollapsed && !S.narrow) { layout.appendChild(buildSidebarExpanded()); layout.appendChild(buildResizer('l')); }
     else layout.appendChild(buildSidebarRail());
@@ -2518,7 +2537,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     if (!isEmpty && !pending) dropZone.appendChild(buildJournalDock());
     if (S.dragActive) dropZone.appendChild(buildDragOverlay());
 
-    return h('div', { style: 'flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; background:#1c1917;' },
+    return h('div', { class: 'z-center', style: 'flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; background:#1c1917;' },
       dropZone, buildIngestBar(), buildComposer());
   }
 
@@ -2653,7 +2672,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       }
       if (m.role === 'user') {
         scroller.appendChild(h('div', { class: 'z-turn z-selectable', style: 'display:flex; flex-direction:row-reverse; gap:0.85rem; margin-bottom:2rem; padding-left:3rem;' },
-          h('div', { style: 'background:#2f2c29; border:1px solid #252220; border-radius:16px 16px 3px 16px; padding:0.65rem 1.05rem; white-space:pre-wrap; word-break:break-word; line-height:1.6;' }, m.content),
+          h('div', { class: 'z-userbubble', style: 'background:#2f2c29; border:1px solid #252220; border-radius:16px 16px 3px 16px; padding:0.65rem 1.05rem; white-space:pre-wrap; word-break:break-word; line-height:1.6;' }, m.content),
           turnCopyBtn(m, 'right:0;')));
       } else {
         const open = !!S.thinkOpen[conv.id + ':' + idx];
@@ -3108,7 +3127,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   function buildComposer() {
     const conv = activeConv();
     const inputArchived = !!(conv && conv.archived);
-    const wrap = h('div', { style: 'flex-shrink:0; position:relative; padding:0 ' + (S.narrow ? '0.85rem' : '2rem') + ' calc(1.5rem + env(safe-area-inset-bottom)); background:#1c1917;' },
+    const wrap = h('div', { class: 'z-composer-wrap', style: 'flex-shrink:0; position:relative; padding:0 ' + (S.narrow ? '0.85rem' : '2rem') + ' calc(1.5rem + env(safe-area-inset-bottom)); background:#1c1917;' },
       h('div', { style: 'position:absolute; top:-2rem; left:0; right:0; height:2rem; background:linear-gradient(to bottom, transparent, #1c1917); pointer-events:none;' }));
     if (inputArchived) {
       wrap.appendChild(h('div', { style: 'text-align:center; color:#5a5652; font-size:0.85rem; font-style:italic; padding:0.9rem 1rem; border:1px dashed #38342f; border-radius:14px; background:rgba(35,33,32,0.6);' }, 'This conversation is archived.'));
@@ -3138,7 +3157,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const fileInput = h('input', { type: 'file', multiple: true, onChange: onPickFiles, style: 'display:none;' });
     const attachBtn = h('button', { 'aria-label': 'Attach files', title: 'Attach files', onClick: () => fileInput.click(), style: 'flex-shrink:0; width:32px; height:32px; border-radius:9px; border:1px solid #38342f; background:#232120; color:#8a8074; cursor:pointer; display:flex; align-items:center; justify-content:center; padding:0;', html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>' });
 
-    const box = h('div', { style: 'display:flex; flex-direction:column; background:#232120; border:1px solid #38342f; border-radius:16px; padding:0.7rem 0.7rem 0.55rem 1rem; box-shadow:0 2px 14px rgba(0,0,0,0.28);' },
+    const box = h('div', { class: 'z-composer', style: 'display:flex; flex-direction:column; background:#232120; border:1px solid #38342f; border-radius:16px; padding:0.7rem 0.7rem 0.55rem 1rem; box-shadow:0 2px 14px rgba(0,0,0,0.28);' },
       ta,
       h('div', { style: 'display:flex; align-items:center; justify-content:space-between; gap:0.5rem; margin-top:0.3rem;' },
         h('div', { style: 'display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap;' },

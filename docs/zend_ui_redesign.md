@@ -509,7 +509,15 @@ correctly.
 
 ### 1.10 Cross-cutting UI behaviors
 Appearance themes (Light/Dark/Vivid via CSS `filter` on the root, persisted to
-`localStorage['zend.theme']`); composer focus guard (mousedown `preventDefault`
+`localStorage['zend.theme']`). Light is the dark page inverted with its hues
+turned back, plus a little contrast, with a `zlight` class on the layout for
+touch-ups where an inversion reads wrong: pictures and icons (the brain, the
+job icons) inverted back so they show true; the page and composer area warm
+paper, the composer, tool cards and their headers white, the user's bubble a
+warm tone; the tool names a clear amber rather than a muddy one; the note
+bubble's salmon a shade stronger. The sidebar keeps its inverted pale blue —
+the light form of dark's navy-against-warm two-tone. Dark and Vivid are not
+touched. Composer focus guard (mousedown `preventDefault`
 on non-input targets keeps the textarea focused); Escape priority order
 (menu → file viewer → substrate → files pane); resizers for sidebar + log pane;
 responsive breakpoints (≤1024 / ≤720 / ≤560).
