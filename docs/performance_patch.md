@@ -3,23 +3,29 @@
 A set of small, low-risk changes across zend (server and GUI), npcd, the
 cluster gateway, the MCP aggregator and the tokera.com site. Each removes
 work the code does not need — a deep clone, a full scan, a re-render, a
-re-parse, a wait — without changing what any caller observes. None is a
-redesign.
+re-parse, a wait — without changing an answer a caller relies on: where an
+item changes what is observed — a header, a field added, a delay or
+staleness accepted, a record layout — it says so, and §7 records the
+decision. None is a redesign.
 
 **The standing rule for every item: no new lock on a hot path.** Where an
 item touches shared state it uses an immutable snapshot published through
 `arc_swap` (already a dependency of zend, npcd and the workspace), an atomic,
 an `Arc` in place of a deep copy, or work moved onto owned data outside the
-lock. Each item says which locks it touches and for how long. Besides
-atomics and `arc_swap` snapshots, the patch adds two locks, neither on a
-request's or a beat's path: the static-file cache's
-(W8), read for a lookup and written on a miss; and the MCP aggregator's
-listing generation (W5), held only by background tasks.
+lock. An item that touches shared state says which locks it takes and for
+how long; one with no **Locks** line touches none. Besides atomics and
+`arc_swap` snapshots, the patch adds two kinds of lock: the static-file
+store's std `RwLock` (W8, and W10's posts and manifest on the same store),
+read briefly per request and written on a miss, never across an await; and
+the MCP aggregator's listing generation (W5), held only by background tasks.
+Neither is on a beat's path.
 
 Each item: **what costs** (with the code it is in), **the change**,
 **locks**, **tests**, **risk**. Tests assert raw expected values, as the
 repository requires. File references are as the code stood when this was
-written; the validation pass (§6) re-checks each against the code.
+written; the validation pass (§6) re-checks each against the code. Paths here
+name where a type or function lives; the code `use`-imports each and refers
+to it by its short name.
 
 §5 lists what was considered and held back; §6 the validation, and §7 the
 decisions taken on the open questions and how the patch lands.
@@ -52,8 +58,8 @@ token, and a slice that can panic off a char boundary) and
   `push(&mut self, id) -> usize` appends what the step releases and returns
   the offset where the new bytes start; `text(&self) -> &str` and
   `tokens(&self) -> usize` read it. **The text only ever grows.** On a step
-  error (`InvalidPrefix`, or a decode error) the stream falls back, for the
-  rest of the round, to the full decode of its ids: a full decode that
+  error (`InvalidPrefix`, or a decode error) the stream falls back to the
+  full decode of its ids until it can resume: a full decode that
   extends the text appends the extension, one that does not appends nothing
   that step; once a full decode extends the text and does not end in
   U+FFFD, a fresh `DecodeStream` takes over from the next id (sound for a
@@ -81,8 +87,13 @@ owns.
 **Tests.**
 - Unit, on a synthetic ByteLevel/ByteFallback tokenizer built with
   `TokenizerBuilder` as in tokenizers' `DecodeStream` docs: `é` as two byte
-  tokens yields `""` then `"é"`, the text's raw bytes `[0xC3, 0xA9]`; a forced
-  fallback keeps the text a prefix of the full decode.
+  tokens yields `""` then `"é"`, the text's raw bytes `[0xC3, 0xA9]`. A
+  tokenizer built so that a step's prefix re-decodes differently (the decoder
+  construction that makes `DecodeStream::step` return `InvalidPrefix`, named
+  in the test) drives the fallback, and the text stays a prefix of the full
+  decode and equals it at the end. If no real decoder can produce
+  `InvalidPrefix` with `skip_special_tokens = true`, the fallback covers only
+  decode errors, and the test drives it with an id outside the vocabulary.
 - On every Qwen tokenizer in the HF hub cache, found as
   `candle-conversation/tests/literal_text_real_vocab.rs` finds them and
   skipped loudly when there is none (on the dev machines this includes
@@ -112,9 +123,9 @@ absent from the map. `corpus::readings_of_all` keys the round's calls first,
 looks them up once, and returns the timelines in call order, as `flat_map`
 over the calls did. `file_conversation` splits into `file_key_of` and
 `file_conversation_among`, so `Seeding::apply` keys every file seed first.
-(The per-call `committed()` git read stays; `guidance/reads.rs:63`,
-`code_read/link.rs:94` and `repo_scan/link.rs:68` scan the same way and are
-left for now.)
+(The per-call `committed()` git read stays. `guidance/reads.rs:63`,
+`code_read/link.rs:94` and `repo_scan/link.rs:68` scan the same way; they are
+outside this patch — §5.)
 
 **Locks.** One snapshot read instead of N; already inside `spawn_blocking`.
 
@@ -207,8 +218,8 @@ The list also does a `read_dir` per call (`session.rs:7609`), now off the
 runtime too. It gains `Cache-Control: no-store` and `Vary: accept-encoding`
 from `compressed::json`, which gzips at 860 bytes or more.
 
-**Tests.** The list's body is built by a pure `list_response(rows, viewer,
-headers) -> Response`: literal rows of at least 860 bytes of JSON with
+**Tests.** The list's body is built by a pure `list_response(rows, &Viewer,
+headers) -> Response` (Z6's `Viewer`, so Z5 lands after Z6): literal rows of at least 860 bytes of JSON with
 `Accept-Encoding: gzip` answer `Content-Encoding: gzip` and `Cache-Control:
 no-store`, the body inflating to the exact expected JSON bytes; without the
 header, those bytes plain. (A handler-level test cannot: a model-less
@@ -279,7 +290,9 @@ separate cost, listed in §5.)
 to count its lines, on every `job_status` round and every GUI poll.
 
 **Change.** `write_output(w, now, &mut impl fmt::Write)`, with a `String`
-sink for the text and a newline-counting sink for the count. Every segment
+sink for the text and a counting sink that counts both newlines and bytes,
+giving `Standing.total` (lines) and G3's `Standing.size` (bytes) from the one
+pass. Every segment
 ends in `\n`, so the count equals `lines().count()`.
 
 Call sites: `standing` (`:76-77`), `list` (`:155`); `read` (`:106`) keeps the
@@ -422,8 +435,9 @@ whole conversation.
   source fills it from the read it already makes (a task from Z9's counting
   sink, a build from the agent's `LogRead.size`, a cluster job from its
   output, a deploy from its two reads). `/v1/jobs/view` answers `size`; for a
-  task it adds `turns` (`ZendSession::conversation_turn_count`, a snapshot
-  read). `GET /v1/conversations/{id}` answers `turns` too, and the GUI keeps
+  task it adds `turns` (`ZendSession::conversation_turn_count`, new: the
+  length of `turn_indices(timeline)`, a snapshot read — the same count
+  `GET /v1/conversations/{id}`'s `turns` answers). `GET /v1/conversations/{id}` answers `turns` too, and the GUI keeps
   the turns of the conversation it actually fetched, so a lagging member
   cannot leave it stale.
 - `reads(job, view)` decides a poll's reads. A build's, deploy's or cluster
@@ -471,8 +485,8 @@ message answers `null` both times.
 
 **Costs.** `:4746-4759`: `find` per row and a `concat` per new row.
 
-**Change.** `mergeConversations(convs, list, activeId)` (a pure function in
-its own module): a `Map` by `String(id)` over the kept rows, each new row
+**Change.** `mergeConversations(convs, list, activeId)`
+(`conversation-merge.js`, UMD): a `Map` by `String(id)` over the kept rows, each new row
 added to it as it is collected (so an id the server lists twice is added
 once, as `find` did), the new rows concatenated once.
 
@@ -693,9 +707,10 @@ when the world has turned replica or the carrier is suspended.
 
 ### N9. Console pages poll only while visible
 
-**Costs.** Ten network polls run in hidden tabs: `pulse.js:540` (1.8 s,
-three calls), `npc.js:300,403,472,655,1240`, `operations.js:354`,
-`profile.js:315`, `life.js:269`; `app.js:720-727` hand-rolls its own pause.
+**Costs.** Nine network polls run in hidden tabs, and `app.js` a tenth with
+its own pause: `pulse.js:540` (1.8 s, three calls),
+`npc.js:300,403,472,655,1240`, `operations.js:354`, `profile.js:315`,
+`life.js:269`, `app.js:720-727`.
 `pulse.rs:226,252` runs `census()` twice.
 
 **Change.** Each uses W12's `/common/lib/visible.js` `pollWhileVisible(ms,
@@ -778,48 +793,58 @@ panicking.
 
 **Risk.** Low.
 
-### N13. The tower's clock is its own record (promoted, with a lease floor)
+### N13. The tower's clock is its own record (promoted)
 
-**Costs.** Every beat with anyone in the world, `tower.advance` (`engine/watch.rs:78`,
-`sim/upkeep.rs:181-218`) rewrites the clock's `carry`, `tap_carry` and
-`quiet_ms`. The tower is not in `SIM_MAPS` (`snapshot.rs:36-57`), so it lives
-in `sim/meta` — beside `built` (the map-edit history, which only grows),
-findings, the roster and `part_tools` — and the whole meta record is diffed,
-committed and replicated to every member twice a second. Each commit also
-bumps the substrate-wide version every replica watches (N14).
+**Costs.** Every beat with anyone in a world that has a tower, `tower.advance`
+(`engine/watch.rs:78`, `sim/upkeep.rs:181-218`) rewrites the clock's `carry`,
+`tap_carry` and `quiet_ms`, and a closing contact's `arrives_in_ms`. The tower
+is not in `SIM_MAPS` (`snapshot.rs:36-57`), so it lives in `sim/meta` beside
+`built`, findings, the roster and `part_tools`, and the whole meta record is
+diffed, committed and replicated twice a second. Nothing else in meta changes
+per beat; the stockpile's energy changes each time a whole unit drains (every
+3 s at the base draw, about 1.2 s with shields up). Only `battle-cities` has a
+tower.
 
 **Change.**
-- `SIM_FACETS = ["tower/clock", "tower/contact", "tower"]` in `snapshot.rs`.
-  `split(value, maps, facets)` takes the facets out whole, children first,
-  **only when the tower is present** (a `None` tower emits no tower records);
-  `join(records, maps, facets)` puts `tower` back first, then each child
-  whose record is present, and none when `tower` is absent or null — so a
-  null tower never becomes `{clock: …}`. Meta then never changes for tower
-  reasons; `sim/tower` changes only when stock or posture does.
-- **Lease floor.** An old-build member reading the new layout sees no tower,
-  and one that took a world's lease would diff against that and tombstone
-  `sim/tower*` for everyone — permanent loss. So the lease driver grants a
-  world lease only to a member whose build is at or above `TOWER_SPLIT_BUILD`,
-  the build that introduces this layout, once any member at or above it is
-  in the group: from then on no older member can write a world. A member
-  below the floor keeps running as a replica until it is upgraded.
-- Before landing, check which other meta fields change every beat (so the
-  tower is not assumed to be the only churn).
+- `SIM_FACETS = ["tower/clock", "tower/contact"]` in `snapshot.rs`.
+  `split(value, maps, facets)` takes each facet out whole, `null` included,
+  only when its parent is present, so a world with no tower emits no tower
+  records. `join(records, maps, facets)` sets a facet that has a record into
+  its parent only when the parent is an object — never creating it, so a null
+  tower never becomes `{clock: …}` — and leaves one with no record as meta
+  holds it. `sim_records_of` (N4) passes `SIM_FACETS`; `apply.rs`'s `sim_of`
+  joins with them; `split.rs`'s own tests pass `&[]`. Lands after N4.
+- **The rest of the tower stays in `sim/meta`, and no build reads this layout
+  as "no tower" — so no lease floor is needed.** Both facets are
+  `#[serde(default)]` on `Tower`, so the running build decodes the new
+  records with the tower whole (its clock at default, no contact) and ignores
+  the two new records. A build that writes meta after reading them writes
+  the tower back with its own clock and tombstones the two facets, and `join`
+  reads that too. A mixed or rolled-back cluster loses at most the tower's
+  clock and a contact that is closing. (A lease floor was considered and
+  cannot work: each member takes leases itself, so an old binary never runs a
+  new check. Moving the whole tower out of meta would need two releases — a
+  reader first, then the writer — and is not taken.)
+- `sim/tower/clock` changes every beat; `sim/tower/contact` every beat while a
+  contact closes; `sim/meta` for tower reasons only when stock, posture,
+  shields, siege, position or the queue does. A commit still happens every
+  beat, with less in it.
 
-**Locks.** None new; the same commit carries fewer bytes. The floor is read
-where the lease driver already decides.
+**Locks.** None new.
 
-**Tests.** `split` of a world with a tower gives exactly the four records
-`sim/meta`, `sim/tower`, `sim/tower/clock`, `sim/tower/contact` with their
-literal values, and `join` of them gives back the input; a world with no
-tower round-trips with no tower records; contact `None` and `Some` each
-round-trip. On the shipped seed with a body in the foundry, the diff across
-one `watch_at(+500 ms)` puts exactly `sim/tower/clock`. The lease driver
-grants no world lease to a member below the floor once one at or above it is
-present, and grants as today when none is.
+**Tests.** `split` of a facet whose parent is present, null or absent; a
+`null` facet round-trips; `join` never turns a null parent into an object.
+The battle-cities seed splits into exactly `sim/meta` (its tower with no
+`clock` or `contact`), `sim/tower/clock = {"carry":0,"tap_carry":0,
+"quiet_ms":0,"sightings":0}` and `sim/tower/contact = null`, plus its map
+records, and `sim_of` gives the seed back; the vault has no `sim/tower/`
+records; a meta whose tower still holds its `clock`, with no facet records,
+decodes with that clock. With a body in the foundry and no contact, the diff
+across one `watch_at(+500 ms)` puts exactly `sim/tower/clock = {"carry":10000,
+"tap_carry":0,"quiet_ms":500,"sightings":0}` — so no other meta field churns
+on a beat.
 
-**Risk.** Low with the floor; without it, a rolling upgrade could lose the
-tower.
+**Risk.** Low.
 
 ### N14. A replica skips re-applying an unchanged world (promoted, with a dirty flag)
 
@@ -829,27 +854,50 @@ custom-object write anywhere does: every world's beat, accounts, bot state.
 `apply` (`apply.rs:144-158`) decodes the Sim and replays it, under the world
 lock — about one full decode per world per beat on every replica.
 
-**Change.** After `store::read`, skip `apply` and `recompute_held` when the
-records equal `standing.written(world).records` (N1's `Arc`, compared
-without a clone) **and the world is clean**. A per-world `dirty: AtomicBool`
-on `Standing` is set by anything that changes a replica's world locally —
-an embody on a world this member does not write (embody restores only the
-place, so the body's hold, walk and lift wait for the next apply), and every
-move to Replica (a lost or cut lease; Discord tasks that land after a
-demotion) — and cleared by an apply. Equal records and a clean world give the
-same result as applying: every input to apply is in the records.
+**Change.**
+- **The flag lives in `Hosted`'s own methods, not at their callers** — a list
+  of call sites would miss one (Discord tasks landing after an apply, a
+  replica's task acts, handset issue, the mission loop's loads). `Hosted`
+  carries `local: AtomicBool`, "changed here since its records were last
+  taken in", starting set. Every method that can change what the records
+  hold sets it: `with`, `with_sim`, `with_both`, `with_dms`, `with_servers`,
+  `with_mirror`, `tick`, `stir`, `watch_tower`. What the records do not hold
+  does not: the attention sweep, the event log a pulse is witnessed into
+  (`Hosted::witness`), a body's decision (`begin_decision`, `end_decision`,
+  `restore_decision`), and reads — including a new `read_both`, which
+  `push`, `push_one` and `mission_compass` use (they use `with_both` today
+  only to read). `apply` clears the flag **before** it takes the records in,
+  through accessors that do not set it, so a mutation racing the apply leaves
+  the world local. A world its authority beats is always local, so a world
+  moved to Replica applies on its first follow beat.
+- `follow_world`, after `store::read`, skips `apply` and `set_written` (which
+  after N1 also recomputes the held set) when the world is not local and the
+  records equal `standing.written(world).records` (N1's `Arc`, compared
+  without a clone); it still sets `followed`. Every input to apply is then
+  what the last apply had, and apply is idempotent and touches neither
+  attention nor the scheduler. The skip saves the decode and the apply; the
+  `store::read` still copies the world.
+- `Missions::adopt_workflows` carries `round_items` as it carries the
+  routines. (Today every apply on a replica wipes the round, so `table_summons`
+  for a character running on a replica misses it — a live defect, fixed here
+  because N14's skip would otherwise make it intermittent.)
 
-**Locks.** The world lock is no longer taken on most follow beats; the
-`written` mutex is held for one comparison; the flag is an atomic.
+**Locks.** The world lock is not taken on a follow beat that skips; the flag
+is an atomic.
 
-**Tests.** A replica follows a world once; locally teleport a body; an
-unrelated custom-object write and a follow beat leave the body where it was
-teleported (proving apply was skipped) with `followed` at the new version;
-a changed `body/` record then places the body by the record. Embodying a
-body locally marks the world dirty, and the next follow beat applies it
-whole. A demotion marks it dirty.
+**Tests.**
+- A replica restored from records, then an unrelated custom-object write:
+  the follow beat takes nothing in (a take-in counter unchanged) and
+  `followed` is at the new version.
+- A body placed locally through `with`: the next follow beat takes the
+  records in and the body stands where its record says.
+- A DM put with `with_dms` on a replica is gone after the next follow beat.
+- A witnessed pulse and a `push` leave the world not local.
+- After an authority beat the world is local; `hand_over` to Replica, then
+  one follow beat, takes the records in.
+- The round set on a replica survives an apply.
 
-**Risk.** Low with the flag.
+**Risk.** Low, given the flag lives in `Hosted`'s mutating methods.
 
 ### N15. Percepts are composed only for bodies perceived here (promoted)
 
@@ -863,21 +911,35 @@ cast on a two-member cluster.
 `take` as today; a body not kept gets `shown.remove(id)` and
 `world.mark_seen(id)` — its cursor still advances, as `environment.rs:269-273`
 requires, so a character lent here later gets no backlog — and nothing is
-composed. The keep set is computed before the world lock, from N11's body →
-mind map and `runs()`. `wake_character` now calls `Hosted::forget` for the
-body it wakes, which nothing in production called: a character lent back
-here could otherwise have its first percept suppressed by a stale
-fingerprint. The first delta after a body starts being perceived here
-re-grounds it with a full percept.
+composed. `sweep` is `sweep_for` keeping every body; `Hosted::sweep_for(keep)`
+replaces `Hosted::sweep`. `push` builds the body → character map of the
+bodies perceived here (N11's map, filtered by `reach.here`) before the world
+lock, sweeps with it and delivers from it; the per-delta `mind_of` and
+`here` checks go. `wake_character` calls `Hosted::forget` for the body it
+wakes (nothing in production called it), so a character lent back is
+grounded afresh even if its fingerprint outlived its context. The first delta
+after a body starts being perceived here re-grounds it with a full percept;
+`shown` is read nowhere but `Attention`. With N1, a world's beat reconciles
+its own cast after its own sweep, on the same thread, so a wake cannot race
+the keep set.
 
 **Locks.** The world lock is held for less time on the beat; nothing new is
 taken inside it.
 
-**Tests.** Bodies m1 and m2, only m1 kept: after a third body speaks,
-`sweep_for` returns only m1's delta and m2's `since` is empty afterwards; with
-both kept, m2's next delta carries a percept. A character lent back here
-(`wake_character`) receives its percept on its first delta. Checked against
-the cooperative-admission tests before landing.
+**Tests.**
+- Bodies m1 and m2, only m1 kept: after a third body speaks, `sweep_for`
+  returns only m1's delta and m2's `since` is empty afterwards; with both
+  kept, m2's next delta carries a percept.
+- A character lent back here (`wake_character`) receives its percept on its
+  first delta.
+- `a_body_with_no_mind_still_has_its_cursor_advanced` changes to assert the
+  extra's `peek(..).events` is empty (its percept is now composed afresh when
+  asked).
+- `cargo test -p npcd --lib authority::` and `cargo test -p npcd --test
+  worlds` pass unchanged — in particular the four lending and authority
+  tests in `tests/worlds.rs`, `npc_lease.rs`'s
+  `characters_are_lent_by_the_plan`, and `environment.rs`'s
+  `a_character_running_elsewhere_is_told_its_messages_through_the_reach`.
 
 **Risk.** Low–medium; it lands in its own commit.
 
@@ -957,6 +1019,8 @@ the `Configured` path.
 
 **Change.** `std::mem::take(&mut parts.headers)`.
 
+**Tests.** The proxy tests unchanged.
+
 **Risk.** Low.
 
 ### W5. An MCP answer never waits for a listing
@@ -978,19 +1042,21 @@ listing found, as a call does today. Only then does it read `route(name)`,
 `reads_only(name)` and `route(GET)` (today read before the listing, so a fresh
 process recorded nothing) and record as today. `list` takes
 `(&Caller, &OnBehalf<'_>)`, the task rebuilding its `OnBehalf` from an owned
-id and cloned session as `record_episode` does.
+id and cloned session as `record_episode` does. The listing state and the
+record task live in `mcp/src/listing.rs`; `app.rs` calls it.
 
 **Locks.** `listing` is held across the listing's awaits, by background
 tasks only; no request takes it. A tokio mutex does not poison, so a failed
 or panicked listing releases it.
 
-**Tests.** In `app.rs`, against a fake gateway on a local port whose
+**Tests.** In `listing.rs`, against a fake gateway on a local port whose
 `tools/list` waits on a `Notify`: the first call returns while the listing is
 held; once released, a read-only tool's call records no `episode` and a write
 tool's records exactly one; three calls during one held listing cause one
 listing. (`mcp` is a binary crate; the fixture is new and in-module.)
 
-**Risk.** Low.
+**Risk.** Low. `mcp` is outside zend's `latency` gate, so this test is the
+item's only timing check.
 
 ### W6. Merging by id is linear
 
@@ -1031,13 +1097,17 @@ console about 6 ms per load.
 
 **Change.**
 - `asset/prepared.rs`: `Prepared { mime, tag, tag_gz: Option<String>,
-  plain: Bytes, gz: Option<Bytes> }`, built by `Prepared::of(name, bytes)`.
+  plain: Bytes, gz: Option<Bytes> }`, built by `Prepared::typed(mime,
+  bytes)`, with `Prepared::of(name, bytes)` its composition with
+  `mime_guess`.
   `respond(&Prepared, Cache, &HeaderMap)` picks the representation, the tag
   and the `Cache-Control` from `directive(mime, cache)` per answer — the
   policy is the caller's (the gateway's config, the host's default), never
   the cache's. Every `respond` call moves to it (`server.rs:811`,
   `host/src/ui.rs:89`, the `asset.rs` tests).
-- `content/` (from `content.rs`): `Roots { sources, stamped: Arc<Stamped> }`
+- `content/` (from `content.rs`): `Roots { sources, stamped:
+  Arc<Stamped<Prepared>> }`, `Stamped<V>` generic over the value kept (W10
+  reuses it)
   (with `Default` and a manual `Debug`), so every clone — the gateway's, the
   tokera router's, the host's — shares one cache.
   `Roots::resolve(rel)` walks the roots in order every request (canonicalise,
@@ -1131,10 +1201,13 @@ skips while hidden, polls once on becoming visible, `stop` clears the timer
 and removes the listener. Used by `perf.js:834` (its `stop` calls it; its
 pause and its age clock at `:826` stay its own), `substrate.js:483`,
 `zend/web/substrate.html:246`, `project.html:282`, and by N9's npcd sites
-(npcd serves `content/common`). `agents.html` and `npcd/app.js` already
-gate on `document.hidden` and are left.
+(npcd serves `content/common`). `agents.html` already gates on
+`document.hidden` and is left; `npcd/app.js` moves to the helper under N9.
+The zend console's job poll (`index.html`) is a single-flight timeout chain,
+not an interval, and keeps its own visibility gate (G3).
 
-**Tests.** N9's scan extended to `content/common` and `zend/web`:
+**Tests.** The `setInterval(` scan as two more tests beside N9's — host over
+`ui::COMMON` (`content/common`) and zend over `tenant::WEB` (`zend/web`):
 `setInterval(` appears only in `visible.js` and the listed non-polling files
 (`perf.js`'s age clock, `agents.html`, `index.html`'s retry tick, the mocks).
 
@@ -1147,8 +1220,9 @@ gate on `document.hidden` and are left.
 replaced together by a lossless 256×256 recompress — the size the MCP
 `serverInfo` icon declares (`mcp-server/src/protocol.rs:186-190`). The site's
 JSON-LD logo is `tokera/favicon.png`, a different file, untouched. The
-re-encode is done through Zen's `image_edit`; the file tools cannot write a
-binary.
+re-encode is done through Zen's `image_edit` (a 256×256 resize of the current
+mark, PNG); John places the returned file at the three paths, since no file
+tool writes a binary and the repository forbids a shell write into the tree.
 
 **Tests.** `the_switcher_icons_are_the_marks_their_sites_serve`
 (`page.rs:781`) also pins `zend/web/favicon.ico` to `brand/zen.png`; a new
@@ -1172,10 +1246,12 @@ test reads `brand/zen.png`'s IHDR and asserts width and height are exactly
   ingest-chain scan per file): a separate cost from Z8, worth its own change.
 - **npcd's persona source** (`tenant.rs:958,970`): a blocking read of the
   worlds and personalities registries per tick — the same trap as N12, a
-  follow-up on N12's snapshot.
+  outside this patch: it reads a second registry (personalities) that N12's
+  snapshot does not hold.
 - **The other per-call metadata scans** (`guidance/reads.rs:63`,
-  `code_read/link.rs:94`, `repo_scan/link.rs:68`): the same shape as Z2, left
-  for a follow-up once Z2's batched lookup exists.
+  `code_read/link.rs:94`, `repo_scan/link.rs:68`): the same shape as Z2,
+  outside this patch: each needs its callers restructured to batch, which Z2
+  does only for `file_read`.
 
 ## 6. Validation
 
@@ -1184,7 +1260,8 @@ adversarial pass that tried to break it (contention, lock order, staleness,
 behaviour changes, wrong premises), and an implementation pass that worked out
 every call site, signature, lifetime and test fixture as it would be written.
 Their findings are folded into the items above; none was found unworkable.
-What the passes changed most:
+N13–N15, promoted from §5 on 2026-11-09, went through the same checks plus a
+final cross-item pass over the whole document. What the passes changed most:
 
 - **N1** reconciles each world at its own beat instead of throttling across
   worlds, and computes the held set under the `written` lock.
@@ -1199,28 +1276,60 @@ What the passes changed most:
   seconds clock, so a memo alone would still rebuild the transcript every 2 s.
 - **G7** was found here: live history drops its parts, which left a
   sub-agent's tool results drawn as text.
+- **N13** splits only the tower's clock and contact out of meta, which every
+  build already reads, in place of a lease floor no old binary would obey.
+- **N14** sets its dirty flag inside `Hosted`'s mutating methods, and fixes
+  the replica round being wiped by every apply.
+- **The landing order** was corrected: G3 needs Z9's sink and Z5's `get`, and
+  Z5 needs Z6's `Viewer`.
+
+**Found in live code, outside this patch:** `zen_task_act` run on a replica
+sets the task's handle on the local copy only — it never reaches the
+authority and is wiped at the next apply, so the authority never polls that
+task. It needs its own fix (the act sent to the authority, as other acts of
+the world are).
 
 **Test harness additions.** zend's dev-dependency `tokio` gains `test-util`;
-the Playwright suite starts using `page.clock` (1.45+, installed before
-`goto`) and a frozen mock job; pure GUI modules (`job-poll.js`,
-`tool-responses.js`, the list merge) follow `partial-call.js` with
-`node --test`; `mcp` gains an in-module fake-gateway fixture.
+the Playwright suite (`zend/web-tests`, `@playwright/test` ^1.45) starts
+using `page.clock`, installed before `goto`; the zend mock gains a frozen job
+(`__ZEND_MOCK_JOB_STILL__`, G1), a streamed reply of three closed calls and a
+live think whose results count their `toJSON` calls (G2), and a sub-agent
+conversation whose history carries parts (G7); pure GUI modules
+(`job-poll.js`, `tool-responses.js`, `conversation-merge.js`) follow
+`partial-call.js` with `node --test`; `mcp` gains an in-module fake-gateway
+fixture (W5); `candle-conversation/tests/common/real_vocab.rs` takes
+`literal_text_real_vocab.rs`'s tokenizer finder, shared by it and Z1; a
+substrate helper sealing a turn's layout from user and assistant text (Z7);
+`cluster`'s `replace_tests` fixture lifted to a shared test helper (W1); and
+the `setInterval(` scan as three tests — npcd over `tenant::CONSOLE` (N9),
+host over `ui::COMMON` and zend over `tenant::WEB` (W12).
 
 ## 7. Decisions and landing
 
 **Decided (2026-11-09):**
 - **Z1 is in**, in a commit of its own, landed last, so any regression in the
-  streamed text points at one change.
+  streamed text points at one change. **Its gate is a landing requirement:**
+  `host/tests/text_stream_model_vocab.rs` holds `#[ignore]`d
+  `the_streamed_text_is_the_full_decode_for_the_prescribed_model`, which
+  fetches `MODEL.spec()`'s tokenizer through `hf-hub` (a cache hit on every
+  dev machine) and **fails, never skips**, when it cannot. BlackWorld runs it
+  through its agent before the Z1 commit, with motherd stopped:
+  `cargo test --release -p host --test text_stream_model_vocab -- --ignored
+  --nocapture`, and the passing line goes into the Z1 commit message. The
+  loud-skip test in `candle-conversation` stays for breadth across every Qwen
+  tokenizer in the cache.
 - **W9's pages use the gateway's short cache age** (60 s today), with an
   ETag and 304.
 - **N10's one-pass delay and Z10's briefly stale index are accepted.**
 - **N8's completion-order news is accepted.**
-- **N13, N14 and N15 are promoted** from §5: the tower split behind a lease
-  floor, the replica skip behind a dirty flag, and percepts only for bodies
-  perceived here.
+- **N13, N14 and N15 are promoted** from §5: the tower's clock split out of
+  meta, the replica skip behind a dirty flag, and percepts only for bodies
+  perceived here. (A lease floor was chosen for N13 first; the final check
+  showed it cannot bind an old binary, and a narrower split that every build
+  already reads made it unnecessary.)
 - **W13's favicon** is re-encoded through Zen's `image_edit` (a lossless
-  256×256 resize of the current mark), and the result committed in all three
-  places.
+  256×256 resize of the current mark, PNG), which John places at the three
+  paths.
 - **No before-and-after measurement**: the tests and the trial carry it.
 
 **Who and how.** BlackWorld implements and tests the patch in batches, each
@@ -1228,17 +1337,23 @@ its own commit, in this order:
 
 1. npcd beat: N1, N2, N3, N12, N4, N11, N7, N10, then W12's helper and N9
    (after N12), then N5, N6, N8.
-2. npcd promoted: N14, then N13 with its lease floor, then N15 (its own
-   commit).
+2. npcd promoted: N14, then N13, then N15 (its own commit).
 3. Gateway and aggregator: W1, W2 (after W1), W3, W4, W6, W7, W5.
 4. Static and site: W8, W10, W9, W11 (after W9), W12's remaining sites
    (the consoles' polls), W13.
-5. GUI: G1, G3, G2, G4, G5, G6, G7.
-6. zend server: Z9 (before Z4), Z2, Z3, Z4, Z5, Z6, Z7, Z8, Z10, Z11.
+5. zend server: Z9, then Z4 (after Z9), Z2, Z3, Z6, then Z5 (after Z6), Z7,
+   Z8, Z10, Z11.
+6. GUI: G1, G3 (after Z9 and Z5: its `size` is Z9's sink, its `turns` is
+   added to Z5's `get`), G2, G4, G5, G6, G7.
 7. Z1, alone.
 
-Dependencies within: Z9 before Z4; W1 before W2; W9 before W11; N12 before
-N9; W12's helper before N9.
+Dependencies within: N1 before N14 (the `Arc<Written>` compare); N4 before
+N13 (`split` by value, `sim_records_of`); N11 before N15 (the body → mind
+map); N12 before N9; W12's helper before N9; W1 before W2; W8 before W9 and
+W10 (`Prepared`, `respond_typed`, `Stamped<V>`); W9 before W11; Z9 before Z4
+and G3; Z6 before Z5; Z5 before G3; G1 before G3 (`setJob`, `rev`); G2
+before G7. W12's scan tests land in batch 4, once its last sites are
+converted.
 
 **Release.** The batches land on one branch and go out together as a single
 trial and release once every batch is done and green. Merging to main, the
