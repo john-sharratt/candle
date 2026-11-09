@@ -32,7 +32,7 @@ use crate::control::{Button, Control};
 use crate::deck::Snapshot;
 use crate::events::{Events, Kind};
 use crate::hands::{Change, Hands, Holder};
-use crate::lights::Cue;
+use crate::lights::{Cue, Cues};
 use crate::midi::{Map, Message, Out, Touch};
 use crate::music::{Grid, TrackId};
 use crate::plan::{Move, Plan, Step as PlanStep, Style};
@@ -98,7 +98,7 @@ pub struct Conductor {
     /// Beats sends lead the beat by, for the MIDI path's latency.
     pub lead_beats: f64,
     /// Where the plans' lighting cues go — `None` with no bulbs mapped.
-    pub lights: Option<mpsc::Sender<Cue>>,
+    pub lights: Option<mpsc::Sender<Cues>>,
 }
 
 struct Pending {
@@ -116,13 +116,6 @@ impl Conductor {
                 Send::Press(b) => {
                     msgs.extend(self.map.press(Control::Button(b)).unwrap_or_default())
                 }
-                // Never waited on: a lights thread that is gone takes nothing
-                // from the beat.
-                Send::Light(c) => {
-                    if let Some(lights) = &self.lights {
-                        let _ = lights.send(c);
-                    }
-                }
             }
         }
         if msgs.is_empty() {
@@ -134,6 +127,14 @@ impl Conductor {
                     .push(Kind::Fault, format!("the virtual controller: {e}"));
                 self.out = None;
             }
+        }
+    }
+
+    /// Tell the lights of the plan's cues — never waited on: a lights thread
+    /// that is gone takes nothing from the beat.
+    fn cues(&self, c: Cues) {
+        if let Some(lights) = &self.lights {
+            let _ = lights.send(c);
         }
     }
 
@@ -173,6 +174,7 @@ impl Conductor {
                     }
                     Some(Change::HandedBack) => {
                         runner = None;
+                        self.cues(Cues::Clear);
                         walk = self.walk_back(beat);
                         self.events
                             .push(Kind::Hands, "the decks are a person's again");
@@ -196,6 +198,7 @@ impl Conductor {
                     Ok(Command::Arm(plan)) => {
                         let now = on_air.as_ref().and_then(|d| d.beat).unwrap_or(0.0);
                         let line = format!("{} → {} ({})", plan.from, plan.to, plan.style.name());
+                        self.cues(Cues::Armed(light_cues(&plan)));
                         runner = Some(Runner::new(plan, now));
                         self.publish(|s| s.armed = Some(line));
                     }
@@ -209,6 +212,7 @@ impl Conductor {
                         if m == Holder::Human && self.hands.holder() != Holder::Human {
                             walk = self.walk_back(beat);
                             runner = None;
+                            self.cues(Cues::Clear);
                         } else {
                             self.hands.set_holder(m);
                         }
@@ -379,6 +383,17 @@ impl Conductor {
     }
 }
 
+/// `plan`'s lighting cues, each at its beat.
+pub fn light_cues(plan: &Plan) -> Vec<(f64, Cue)> {
+    plan.steps
+        .iter()
+        .filter_map(|s| match s.act {
+            Move::Light { cue } => Some((s.at, cue)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A plan of only the walk back's moves.
 fn walk_plan(steps: Vec<(f64, Move)>, at: f64) -> Plan {
     Plan {
@@ -394,5 +409,29 @@ fn walk_plan(steps: Vec<(f64, Move)>, at: f64) -> Plan {
             .map(|(at, act)| PlanStep { at, act })
             .collect(),
         why: "the walk back to the hardware".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brain::transition::{plan, Pair};
+    use crate::music::track::fixture::club;
+
+    /// **A plan's cues are the lights' the moment it is armed**, each at its
+    /// beat: a cut's bar dark before the drop, and the hit on it.
+    #[test]
+    fn a_plans_cues_are_handed_over_with_their_beats() {
+        let a = club("a", 128.0, "8A", 0.5);
+        let lift = club("l", 128.0, "8A", 0.8);
+        let p = plan(&Pair {
+            from: &a,
+            from_deck: 1,
+            to: &lift,
+            to_deck: 2,
+            now: 0.0,
+        });
+        assert_eq!(light_cues(&p), [(220.0, Cue::Blackout), (224.0, Cue::Hit)]);
+        assert!(light_cues(&walk_plan(Vec::new(), 0.0)).is_empty());
     }
 }

@@ -108,8 +108,8 @@ pub struct ScreenCfg {
 pub struct LightsCfg {
     /// The fixture map (`zenj/lights.yaml`); with no file, no bulbs.
     pub fixtures: PathBuf,
-    /// How late a bulb shows what it is sent, in milliseconds: what the
-    /// lights lead the beat by.
+    /// How late a bulb shows what it is sent past the network, in
+    /// milliseconds; the network's share is measured per bulb from its polls.
     pub lead_ms: f64,
 }
 

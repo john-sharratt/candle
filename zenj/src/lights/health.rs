@@ -13,8 +13,8 @@ pub const DEAD_AFTER: u32 = 3;
 
 #[derive(Debug, Clone, Default)]
 struct Bulb {
-    /// Asked, and not answered since.
-    waiting: bool,
+    /// When it was asked and has not answered since.
+    waiting: Option<Instant>,
     missed: u32,
     dead: bool,
 }
@@ -63,23 +63,27 @@ impl Health {
         self.next = (i + 1) % n;
         let b = &mut self.bulbs[i];
         let mut change = None;
-        if b.waiting {
+        if b.waiting.is_some() {
             b.missed += 1;
             if b.missed >= DEAD_AFTER && !b.dead {
                 b.dead = true;
                 change = Some(Change::Died(i));
             }
         }
-        b.waiting = true;
+        b.waiting = Some(now);
         (Some(i), change)
     }
 
-    /// Bulb `i` answered.
-    pub fn answered(&mut self, i: usize) -> Option<Change> {
-        let b = self.bulbs.get_mut(i)?;
-        b.waiting = false;
+    /// Bulb `i` answered at `now`: its round trip, when it was waited for,
+    /// and whether it came back.
+    pub fn answered(&mut self, i: usize, now: Instant) -> (Option<Duration>, Option<Change>) {
+        let Some(b) = self.bulbs.get_mut(i) else {
+            return (None, None);
+        };
+        let rtt = b.waiting.take().map(|at| now.saturating_duration_since(at));
         b.missed = 0;
-        std::mem::take(&mut b.dead).then_some(Change::Back(i))
+        let change = std::mem::take(&mut b.dead).then_some(Change::Back(i));
+        (rtt, change)
     }
 
     pub fn is_dead(&self, i: usize) -> bool {
@@ -122,8 +126,13 @@ mod tests {
         }
         assert_eq!(died, Some(Change::Died(0)));
         assert_eq!(h.dead(), [0]);
-        assert_eq!(h.answered(0), Some(Change::Back(0)));
+        let asked = at - EVERY;
+        assert_eq!(
+            h.answered(0, asked + Duration::from_millis(30)),
+            (Some(Duration::from_millis(30)), Some(Change::Back(0))),
+            "its round trip, and back"
+        );
         assert!(!h.is_dead(0));
-        assert_eq!(h.answered(0), None, "already back");
+        assert_eq!(h.answered(0, at), (None, None), "not asked since");
     }
 }

@@ -61,6 +61,12 @@ impl Scenes {
         (self.count > 0).then_some(self.at % self.count.max(1))
     }
 
+    /// The preset the next phrase changes to, without changing to it: what
+    /// is read ahead.
+    pub fn next(&self) -> Option<usize> {
+        (self.count > 0).then(|| (self.at + 1) % self.count)
+    }
+
     /// The preset to change to at `beat` — read `lead_ms` early at `bpm` —
     /// when a new phrase has begun; a preset that failed to load is passed
     /// over by calling again with `skip`.
@@ -102,6 +108,9 @@ mod tests {
         assert_eq!(Scenes::new(100, 0, 4).current(), Some(0));
         assert_eq!(Scenes::new(100, 3, 4).current(), Some(75));
         assert_eq!(Scenes::new(0, 1, 4).current(), None);
+        assert_eq!(Scenes::new(100, 3, 4).next(), Some(76));
+        assert_eq!(Scenes::new(100, 0, 1).next(), Some(1));
+        assert_eq!(Scenes::new(0, 0, 1).next(), None);
         let mut s = Scenes::new(10, 0, 1);
         assert_eq!(
             s.at_beat(5.0, 120.0, 0.0),

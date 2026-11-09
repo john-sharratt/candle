@@ -1,16 +1,17 @@
-//! What the room should look like now (§9.4–§9.7): pure — the night's state
-//! in, every bulb's state out — so each rule is tested without a socket.
+//! What the room looks like at a beat (§9.4–§9.7): pure — the night's state
+//! and one instant in, every bulb's state out — so the lights can be planned
+//! ahead and planned again, and each rule is tested without a socket.
 //!
 //! In order, the first that holds decides:
 //!
 //! 1. **rekordbox closed**: the lights are the house's (`docs/house_modes.md`),
 //!    and nothing is drawn.
 //! 2. **The house lights**, asked for by a person.
-//! 3. **Most bulbs dead**: the warm house scene, and the screens say so.
-//! 4. **Midnight**: the last ten seconds dim toward dark, the drop is the hit,
-//!    sent twice, then a minute of gold.
-//! 5. **A cue** of the armed plan: a blackout for its bar, a hit, a wash
-//!    across a long blend.
+//! 3. **Most bulbs dead**: the warm house scene.
+//! 4. **Midnight**: the last ten seconds dim toward dark, the instant itself is
+//!    the hit, then a minute of gold.
+//! 5. **A cue** of the armed plan: a blackout for its bar, the hit on its beat,
+//!    a wash across a blend.
 //! 6. **A scene a person held**, on its group.
 //! 7. **The scene of the phrase**: Zen's, by energy and phrase, while ZenJ or
 //!    its assist has the decks; a plain energy-following one while a person
@@ -25,8 +26,14 @@ use crate::hands::Holder;
 
 /// The beats of a phrase, on which the scene changes, as the screens' do.
 pub const PHRASE: f64 = 32.0;
+/// The beats a blackout cue holds: its bar.
+pub const BLACKOUT_BEATS: f64 = 4.0;
+/// The beats a hit is: what a planner samples it at.
+pub const HIT_BEATS: f64 = 0.5;
 /// The seconds before midnight the lights dim through.
 pub const COUNTDOWN_S: f64 = 10.0;
+/// The seconds midnight's hit is.
+pub const MIDNIGHT_HIT_S: f64 = 0.25;
 /// The seconds of gold after it.
 pub const AFTER_S: f64 = 60.0;
 /// The new year's colours.
@@ -35,16 +42,16 @@ pub const GOLD: Palette = Palette {
     b: (255, 255, 255),
 };
 
-/// What the director is given each tick.
+/// The night at one instant, as the director reads it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Input {
     pub rekordbox: bool,
     pub holder: Holder,
-    /// The night's energy now, `0..=1`.
+    /// The night's energy, `0..=1`.
     pub energy: f32,
-    /// The playing deck's beat, led by the bulbs' latency.
+    /// The playing deck's beat at the instant.
     pub beat: Option<f64>,
-    /// Seconds to midnight, negative after it.
+    /// Seconds from the instant to midnight, negative after it.
     pub to_midnight: f64,
     pub bulbs: usize,
     pub dead: usize,
@@ -61,27 +68,23 @@ pub enum Ask {
     House(bool),
 }
 
-/// What the room looks like this tick.
+/// What the room looks like at the instant.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Look {
     /// Every bulb's state, by index.
     pub bulbs: Vec<(usize, Pilot)>,
-    /// The ones sent at once, twice: a hit.
+    /// A hit: sent at once whatever the budget, and again.
     pub key: bool,
-    /// The scene it is, in a word, for the tools and the screens.
+    /// The look, in a word, for the tools and the screens.
     pub name: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Director {
     holds: Vec<(Option<String>, Scene)>,
     house: bool,
-    /// The cue in force, and the beat it began on.
-    cue: Option<(Cue, f64)>,
-    /// The beat of the last hit sent, so a hit is sent once.
-    hit_at: Option<f64>,
-    /// Whether midnight's hit has gone.
-    struck: bool,
+    /// The armed plan's cues, each with the beat it falls on.
+    cues: Vec<(f64, Cue)>,
 }
 
 impl Director {
@@ -92,10 +95,10 @@ impl Director {
     pub fn ask(&mut self, a: Ask) {
         match a {
             Ask::Hold { scene, group } => {
-                self.holds.retain(|(g, _)| *g != group);
                 if group.is_none() {
                     self.holds.clear();
                 }
+                self.holds.retain(|(g, _)| *g != group);
                 self.holds.push((group, scene));
             }
             Ask::Release => self.holds.clear(),
@@ -103,9 +106,31 @@ impl Director {
         }
     }
 
-    /// A cue of the plan, at `beat`.
-    pub fn cue(&mut self, c: Cue, beat: f64) {
-        self.cue = Some((c, beat));
+    /// The armed plan's cues, each at its beat — none once the plan is gone.
+    pub fn cues(&mut self, cues: Vec<(f64, Cue)>) {
+        self.cues = cues;
+    }
+
+    /// The beats the cues fall on: moments a planner samples.
+    pub fn cue_beats(&self) -> Vec<f64> {
+        self.cues.iter().map(|(b, _)| *b).collect()
+    }
+
+    /// The cue in force at `beat`: the latest begun whose window holds it.
+    fn cue_at(&self, beat: f64) -> Option<(Cue, f64)> {
+        self.cues
+            .iter()
+            .filter(|(from, c)| {
+                let since = beat - from;
+                let len = match c {
+                    Cue::Blackout => BLACKOUT_BEATS,
+                    Cue::Hit => HIT_BEATS,
+                    Cue::Fade { beats } => *beats,
+                };
+                (0.0..len).contains(&since)
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(from, c)| (*c, *from))
     }
 
     pub fn house(&self) -> bool {
@@ -120,79 +145,48 @@ impl Director {
             .collect()
     }
 
-    /// The look for `inp`, `groups(name)` naming a group's bulbs — `None`
-    /// while the lights are the house's.
-    pub fn look(
-        &mut self,
-        inp: &Input,
-        groups: &dyn Fn(Option<&str>) -> Vec<usize>,
-    ) -> Option<Look> {
+    /// The look at `inp`'s instant, `groups(name)` naming a group's bulbs —
+    /// `None` while the lights are the house's.
+    pub fn look(&self, inp: &Input, groups: &dyn Fn(Option<&str>) -> Vec<usize>) -> Option<Look> {
         if !inp.rekordbox {
-            self.struck = false;
             return None;
         }
         let all = groups(None);
-        let whole =
-            |scene: Scene, p: Palette, level: u8, beat: f64| draw(scene, p, level, beat, &all);
+        let whole = |s: Scene, p: Palette, level: u8, b: f64| draw(s, p, level, b, &all);
         let beat = inp.beat.unwrap_or(0.0);
         let p = palette::of(inp.energy);
         let level = palette::level(inp.energy);
+        let every = |pilot: Pilot| all.iter().map(|&i| (i, pilot)).collect::<Vec<_>>();
         if self.house {
-            return Some(plain(
-                all.iter().map(|&i| (i, HOUSE)).collect(),
-                "house lights",
-            ));
+            return Some(plain(every(HOUSE), "house lights"));
         }
         if inp.bulbs > 0 && inp.dead * 2 > inp.bulbs {
-            return Some(plain(
-                all.iter().map(|&i| (i, HOUSE)).collect(),
-                "house: most bulbs are not answering",
-            ));
+            return Some(plain(every(HOUSE), "house: most bulbs are not answering"));
         }
-        // Midnight.
         let t = inp.to_midnight;
         if t > 0.0 && t <= COUNTDOWN_S {
             let d = (10.0 + 90.0 * (t / COUNTDOWN_S)).round() as u8;
             return Some(plain(whole(Scene::Wash, GOLD, d, beat), "the countdown"));
         }
+        if t <= 0.0 && t > -MIDNIGHT_HIT_S {
+            return Some(keyed(every(HIT), "midnight"));
+        }
         if t <= 0.0 && t > -AFTER_S {
-            if !self.struck {
-                self.struck = true;
-                return Some(Look {
-                    bulbs: all.iter().map(|&i| (i, HIT)).collect(),
-                    key: true,
-                    name: "midnight".into(),
-                });
-            }
             return Some(plain(
                 whole(Scene::Pulse, GOLD, 100, beat),
                 "happy new year",
             ));
         }
-        // A cue of the plan.
-        if let Some((c, from)) = self.cue {
-            match c {
-                Cue::Blackout if beat < from + 4.0 => {
-                    return Some(plain(whole(Scene::Blackout, p, level, beat), "blackout"));
-                }
-                Cue::Hit if self.hit_at != Some(from) => {
-                    self.hit_at = Some(from);
-                    return Some(Look {
-                        bulbs: whole(Scene::Hit, p, level, beat),
-                        key: true,
-                        name: "hit".into(),
-                    });
-                }
-                Cue::Fade { beats } if beat < from + beats => {
-                    return Some(plain(
-                        whole(Scene::Wash, p, level, beat),
-                        "a wash across the blend",
-                    ));
-                }
-                _ => self.cue = None,
-            }
+        if let Some((c, _)) = inp.beat.and_then(|b| self.cue_at(b)) {
+            return Some(match c {
+                Cue::Blackout => plain(every(Pilot::Off), "blackout"),
+                Cue::Hit => keyed(every(HIT), "hit"),
+                Cue::Fade { .. } => plain(
+                    whole(Scene::Wash, p, level, beat),
+                    "a wash across the blend",
+                ),
+            });
         }
-        // The phrase's scene, then any held on top of it.
         let scene = match inp.holder {
             Holder::Human if inp.energy < 0.5 => Scene::Wash,
             Holder::Human => Scene::Pulse,
@@ -201,8 +195,7 @@ impl Director {
         let mut bulbs = whole(scene, p, level, beat);
         let mut name = scene.name().to_string();
         for (group, held) in &self.holds {
-            let members = groups(group.as_deref());
-            for (i, pilot) in draw(*held, p, level, beat, &members) {
+            for (i, pilot) in draw(*held, p, level, beat, &groups(group.as_deref())) {
                 if let Some(slot) = bulbs.iter_mut().find(|(j, _)| *j == i) {
                     slot.1 = pilot;
                 }
@@ -217,6 +210,14 @@ fn plain(bulbs: Vec<(usize, Pilot)>, name: &str) -> Look {
     Look {
         bulbs,
         key: false,
+        name: name.to_string(),
+    }
+}
+
+fn keyed(bulbs: Vec<(usize, Pilot)>, name: &str) -> Look {
+    Look {
+        bulbs,
+        key: true,
         name: name.to_string(),
     }
 }
@@ -259,74 +260,76 @@ mod tests {
         }
     }
 
-    fn look(d: &mut Director, i: &Input) -> Look {
+    fn look(d: &Director, i: &Input) -> Look {
         d.look(i, &groups).unwrap()
     }
 
     /// **With rekordbox closed the lights are the house's**: nothing drawn.
     #[test]
     fn with_rekordbox_closed_nothing_is_drawn() {
-        let mut d = Director::new();
         let closed = Input {
             rekordbox: false,
             ..inp()
         };
-        assert!(d.look(&closed, &groups).is_none());
+        assert!(Director::new().look(&closed, &groups).is_none());
     }
 
     /// **The phrase's scene follows the energy while ZenJ mixes**, and a
     /// plain one while a person does.
     #[test]
     fn the_phrase_scene_follows_who_mixes() {
-        let mut d = Director::new();
-        assert_eq!(look(&mut d, &inp()).name, "pulse");
-        let quiet = Input {
+        let d = Director::new();
+        assert_eq!(look(&d, &inp()).name, "pulse");
+        let middle = Input {
             energy: 0.6,
             beat: Some(33.0),
             ..inp()
         };
-        assert_eq!(look(&mut d, &quiet).name, "chase", "phrase 1 of the middle");
+        assert_eq!(look(&d, &middle).name, "chase", "phrase 1 of the middle");
         let person = Input {
             holder: Holder::Human,
-            ..quiet
+            ..middle
         };
-        assert_eq!(look(&mut d, &person).name, "pulse");
+        assert_eq!(look(&d, &person).name, "pulse");
         let person_low = Input {
             energy: 0.3,
             ..person
         };
-        assert_eq!(look(&mut d, &person_low).name, "wash");
+        assert_eq!(look(&d, &person_low).name, "wash");
     }
 
-    /// **A blackout holds its bar, then the hit is sent once, twice over.**
+    /// **A cue is a window of beats, the same however often it is asked**: a
+    /// blackout for its bar, a hit on its beat, keyed.
     #[test]
-    fn a_blackout_then_a_hit() {
+    fn a_cue_is_a_window_of_beats() {
         let mut d = Director::new();
-        d.cue(Cue::Blackout, 60.0);
-        let b = look(&mut d, &at_beat(61.0));
+        // A cut's cues: its bar dark, the hit on the drop.
+        d.cues(vec![(60.0, Cue::Blackout), (64.0, Cue::Hit)]);
+        assert_eq!(d.cue_beats(), [60.0, 64.0]);
+        assert_eq!(look(&d, &at_beat(59.5)).name, "pulse", "not yet");
+        let b = look(&d, &at_beat(61.0));
         assert_eq!(b.name, "blackout");
         assert!(b.bulbs.iter().all(|(_, p)| *p == Pilot::Off));
-        d.cue(Cue::Hit, 64.0);
-        let h = look(&mut d, &inp());
+        assert_eq!(look(&d, &at_beat(61.0)), b, "asked again, the same");
+        let h = look(&d, &at_beat(64.0));
         assert!(h.key && h.bulbs.iter().all(|(_, p)| *p == HIT));
-        assert_eq!(look(&mut d, &inp()).name, "pulse", "once, then the phrase");
+        assert_eq!(
+            look(&d, &at_beat(64.5)).name,
+            "pulse",
+            "a hit is half a beat"
+        );
+        d.cues(vec![(64.0, Cue::Fade { beats: 32.0 })]);
+        assert_eq!(look(&d, &at_beat(80.0)).name, "a wash across the blend");
+        assert_eq!(look(&d, &at_beat(96.0)).name, "pulse");
+        d.cues(Vec::new());
+        assert_eq!(look(&d, &at_beat(80.0)).name, "pulse", "the plan is gone");
     }
 
-    /// **A fade is a wash for its beats.**
-    #[test]
-    fn a_fade_is_a_wash_for_its_beats() {
-        let mut d = Director::new();
-        d.cue(Cue::Fade { beats: 32.0 }, 64.0);
-        let blend = look(&mut d, &at_beat(80.0));
-        assert_eq!(blend.name, "a wash across the blend");
-        assert_eq!(look(&mut d, &at_beat(96.0)).name, "pulse");
-    }
-
-    /// **Midnight**: the countdown dims, the drop is a hit once, then gold.
+    /// **Midnight**: the countdown dims, the instant is a keyed hit, then gold.
     #[test]
     fn midnight_dims_strikes_and_turns_gold() {
-        let mut d = Director::new();
-        let c = look(&mut d, &to_midnight(5.0));
+        let d = Director::new();
+        let c = look(&d, &to_midnight(5.0));
         assert_eq!(c.name, "the countdown");
         assert_eq!(
             c.bulbs[0].1,
@@ -337,10 +340,10 @@ mod tests {
                 dimming: 55
             }
         );
-        let strike = look(&mut d, &to_midnight(-0.1));
+        let strike = look(&d, &to_midnight(0.0));
         assert!(strike.key && strike.name == "midnight");
-        assert_eq!(look(&mut d, &to_midnight(-1.0)).name, "happy new year");
-        assert_eq!(look(&mut d, &to_midnight(-61.0)).name, "pulse");
+        assert_eq!(look(&d, &to_midnight(-1.0)).name, "happy new year");
+        assert_eq!(look(&d, &to_midnight(-61.0)).name, "pulse");
     }
 
     /// **A held scene sits on its group, over the phrase's**, until let go;
@@ -352,17 +355,17 @@ mod tests {
             scene: Scene::Blackout,
             group: Some("wall".into()),
         });
-        let l = look(&mut d, &inp());
+        let l = look(&d, &inp());
         assert_eq!(l.name, "pulse, blackout held");
         assert_eq!(l.bulbs[2].1, Pilot::Off);
         assert_ne!(l.bulbs[0].1, Pilot::Off);
         assert_eq!(d.held(), ["blackout on wall"]);
         d.ask(Ask::Release);
-        assert_eq!(look(&mut d, &inp()).name, "pulse");
+        assert_eq!(look(&d, &inp()).name, "pulse");
         d.ask(Ask::House(true));
-        assert!(look(&mut d, &inp()).bulbs.iter().all(|(_, p)| *p == HOUSE));
+        assert!(look(&d, &inp()).bulbs.iter().all(|(_, p)| *p == HOUSE));
         d.ask(Ask::House(false));
-        let dead = look(&mut d, &Input { dead: 3, ..inp() });
-        assert_eq!(dead.name, "house: most bulbs are not answering");
+        let dead = Input { dead: 3, ..inp() };
+        assert_eq!(look(&d, &dead).name, "house: most bulbs are not answering");
     }
 }

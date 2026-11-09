@@ -28,14 +28,20 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Fullscreen, Window, WindowId};
 
+use super::ahead::{LoadTime, Prefetch};
 use super::overlay::{overlay, Overlay};
 use super::scene::{presets, Scenes};
+use crate::beat::{reading, BeatClock};
 use crate::config::ScreensCfg;
+use crate::deck::Snapshot;
 use crate::live::Live;
 
 /// What every window reads.
 pub struct Shared {
     pub live: Arc<ArcSwap<Live>>,
+    /// The deck reader's, read each frame for the beat: the live view's is a
+    /// half-second old by the time it is published.
+    pub snapshot: Arc<ArcSwap<Snapshot>>,
     pub midnight: DateTime<Local>,
     pub sample_rate: u32,
 }
@@ -53,6 +59,12 @@ struct Screen {
     engine: Option<Engine>,
     scenes: Scenes,
     latency_ms: f64,
+    /// The beat, predicted between the reader's readings and through a gap.
+    clock: BeatClock,
+    /// The next scene's file, read ahead.
+    prefetch: Option<Prefetch>,
+    /// How long this screen's loads take.
+    load_time: LoadTime,
     pcm: Consumer<f32>,
     pcm_buf: Vec<f32>,
     atlas: TextAtlas,
@@ -65,9 +77,18 @@ struct Screen {
     window: Arc<Window>,
 }
 
-/// Load `scenes`' current preset from `library` into `engine`; one that does
-/// not load is passed over, a few at most.
-fn load(library: &[PathBuf], engine: &mut Engine, scenes: &mut Scenes, transition: Transition) {
+/// Load `scenes`' current preset from `library` into `engine` — from the
+/// bytes read ahead when they are there — timing the load into `took`; one
+/// that does not load is passed over, a few at most. Then the next phrase's
+/// file is read ahead.
+fn load(
+    library: &[PathBuf],
+    engine: &mut Engine,
+    scenes: &mut Scenes,
+    transition: Transition,
+    prefetch: &mut Option<Prefetch>,
+    took: &mut LoadTime,
+) {
     for _ in 0..library.len().min(8) {
         let Some(i) = scenes.current() else { return };
         let path = &library[i];
@@ -75,7 +96,10 @@ fn load(library: &[PathBuf], engine: &mut Engine, scenes: &mut Scenes, transitio
             .file_stem()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let loaded = std::fs::read(path)
+        let ahead = prefetch.as_mut().and_then(|p| p.take(i));
+        let started = Instant::now();
+        let loaded = ahead
+            .map_or_else(|| std::fs::read(path), Ok)
             .map_err(|e| e.to_string())
             .and_then(|b| {
                 engine
@@ -84,7 +108,13 @@ fn load(library: &[PathBuf], engine: &mut Engine, scenes: &mut Scenes, transitio
                     .map_err(|e| e.to_string())
             });
         match loaded {
-            Ok(()) => return,
+            Ok(()) => {
+                took.took(started.elapsed());
+                *prefetch = scenes
+                    .next()
+                    .map(|n| Prefetch::start(n, library[n].clone()));
+                return;
+            }
             Err(e) => {
                 tracing::debug!("screens: {name}: {e}");
                 scenes.skip();
@@ -204,6 +234,8 @@ impl Screens {
             };
             surface.configure(&gpu.device, &config);
             let mut scenes = Scenes::new(self.library.len(), n, total);
+            let mut prefetch = None;
+            let mut load_time = LoadTime::default();
             let mut engine = Engine::new(
                 &gpu.device,
                 &gpu.queue,
@@ -219,7 +251,14 @@ impl Screens {
             .map_err(|e| tracing::warn!("screens: the scene engine could not start: {e}"))
             .ok();
             if let Some(e) = engine.as_mut() {
-                load(&self.library, e, &mut scenes, Transition::Cut);
+                load(
+                    &self.library,
+                    e,
+                    &mut scenes,
+                    Transition::Cut,
+                    &mut prefetch,
+                    &mut load_time,
+                );
             }
             let cache = Cache::new(&gpu.device);
             let viewport = Viewport::new(&gpu.device, &cache);
@@ -243,6 +282,9 @@ impl Screens {
                     engine,
                     scenes,
                     latency_ms: out.latency_ms,
+                    clock: BeatClock::new(),
+                    prefetch,
+                    load_time,
                     pcm,
                     pcm_buf: Vec::new(),
                     atlas,
@@ -266,7 +308,8 @@ impl Screens {
         let live = self.shared.live.load_full();
         let now = Local::now();
         let ov = overlay(&live, now, self.shared.midnight);
-        let air = live.decks.iter().find(|d| d.on_air);
+        let snap = self.shared.snapshot.load_full();
+        let instant = Instant::now();
         let time = self.start.elapsed().as_secs_f64();
         let library = &self.library;
         let s = &mut self.screens[i].1;
@@ -281,12 +324,25 @@ impl Screens {
                 e.push_pcm_f32(&s.pcm_buf, 1);
             }
         }
-        let change = air
-            .and_then(|d| d.beat.map(|b| (b, d.bpm)))
-            .and_then(|(b, bpm)| s.scenes.at_beat(b, bpm, s.latency_ms));
+        // The change begins early by the screen's lag and by how long its
+        // loads take, so the new scene is up when the phrase is.
+        s.clock.read(instant, reading(&snap));
+        let lead_ms = s.latency_ms + s.load_time.lead_ms();
+        let change = s
+            .clock
+            .beat_at(instant)
+            .zip(s.clock.bpm())
+            .and_then(|(b, bpm)| s.scenes.at_beat(b, bpm as f32, lead_ms));
         if change.is_some() {
             if let Some(e) = s.engine.as_mut() {
-                load(library, e, &mut s.scenes, Transition::Soft { seconds: 2.0 });
+                load(
+                    library,
+                    e,
+                    &mut s.scenes,
+                    Transition::Soft { seconds: 2.0 },
+                    &mut s.prefetch,
+                    &mut s.load_time,
+                );
             }
         }
 
