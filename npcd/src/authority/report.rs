@@ -5,7 +5,7 @@
 
 use cluster::coord::{AppCoord, NpcLeaseLine, WorldLine};
 
-use super::npc_lease::{hex, leases_of, NpcLease};
+use super::npc_lease::{hex, NpcLease};
 use super::role::Role;
 use crate::engine::runtime::Runtime;
 
@@ -25,7 +25,8 @@ pub fn app_coord(rt: &Runtime) -> AppCoord {
     let mut coord = AppCoord::default();
     for world in rt.hosted.ids() {
         let role = rt.standing.role(&world);
-        let leases = leases_of(&rt.standing.written(&world));
+        let written = rt.standing.written(&world);
+        let leases = &written.leases;
         coord.worlds.push(WorldLine {
             world: world.clone(),
             role: role.name().to_string(),

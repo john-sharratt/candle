@@ -16,7 +16,7 @@ use tokio::time::timeout;
 use cluster::consensus::rendezvous::Weighted;
 use cluster::frame::MemberState;
 
-use super::npc_lease::{by_plan, hex, leases_of};
+use super::npc_lease::{by_plan, hex};
 use super::ops::{OpReply, WorldOp};
 use crate::engine::environment;
 use crate::engine::event::{EventKind, Salience};
@@ -87,7 +87,10 @@ impl Runtime {
             let Some(p) = self.persona_of_async(npc).await else {
                 continue;
             };
-            let remembered = place_of(&self.standing.written(&p.world_id), &Runtime::body_id(npc));
+            let remembered = place_of(
+                &self.standing.written(&p.world_id).records,
+                &Runtime::body_id(npc),
+            );
             match self.embody_in_world(
                 npc,
                 &p.world_id,
@@ -105,9 +108,10 @@ impl Runtime {
         }
     }
 
-    /// Wake each character lent here and put down each lent elsewhere; hand
-    /// back each the authority means to move, between its turns.
-    pub(crate) fn reconcile_cast(self: &Arc<Self>) {
+    /// Wake each of `world`'s characters lent here and put down each lent
+    /// elsewhere; hand back each the authority means to move, between its
+    /// turns. Run at the world's own beat.
+    pub(crate) fn reconcile_cast(self: &Arc<Self>, world: &str) {
         if !self.standing.clustered() {
             return;
         }
@@ -121,82 +125,81 @@ impl Runtime {
                 .and_then(|m| m.replicator().map(|r| r.applied_through(origin)))
                 .unwrap_or(0)
         };
-        for world in self.hosted.ids() {
-            let leases = leases_of(&self.standing.written(&world));
-            for (npc, _) in self.bodies.in_world(&world) {
-                let lease = leases.get(&npc);
-                let mine = lease.is_some_and(|l| l.holder == me);
-                let awake = self.scheduler.pace_of(npc).is_some();
-                let handing = self.standing.handing(npc);
-                if !self.standing.characters() {
-                    // **A member that runs no characters runs none**, whatever
-                    // its leases say. One still naming it — lent before it was
-                    // told so — is handed back once the authority names where
-                    // it goes next; until then it is held and not run.
-                    if awake {
-                        self.put_down(npc);
+        let written = self.standing.written(world);
+        let leases = &written.leases;
+        for (npc, _) in self.bodies.in_world(world) {
+            let lease = leases.get(&npc);
+            let mine = lease.is_some_and(|l| l.holder == me);
+            let awake = self.scheduler.pace_of(npc).is_some();
+            let handing = self.standing.handing(npc);
+            if !self.standing.characters() {
+                // **A member that runs no characters runs none**, whatever
+                // its leases say. One still naming it — lent before it was
+                // told so — is handed back once the authority names where
+                // it goes next; until then it is held and not run.
+                if awake {
+                    self.put_down(npc);
+                }
+                let next = lease.is_some_and(|l| l.next.is_some());
+                if mine && next {
+                    if self.standing.hand_back_due(npc, Instant::now()) {
+                        self.hand_back(world, npc);
                     }
-                    let next = lease.is_some_and(|l| l.next.is_some());
-                    if mine && next {
-                        if self.standing.hand_back_due(npc, Instant::now()) {
-                            self.hand_back(&world, npc);
+                } else if handing {
+                    self.standing.end_handing(npc);
+                }
+                continue;
+            }
+            let moving = lease.is_some_and(|l| l.next.is_some());
+            match (mine, awake) {
+                // **Held here, not running, and asked to move: handed back
+                // now**, with no turn to wait for. Woken first, it waited on
+                // its last holder's writes before it could move on; never
+                // woken, it was never handed back, and ran nowhere. The
+                // hand-back keeps every wait the lease names, so the next
+                // holder still waits for what this one never took in.
+                (true, false) if moving => {
+                    if self.standing.hand_back_due(npc, Instant::now()) {
+                        self.hand_back(world, npc);
+                    }
+                }
+                (true, false) if !handing => {
+                    let ready = lease.is_none_or(|l| l.ready(applied));
+                    let now = Instant::now();
+                    if ready {
+                        if let Some(waited) = self.standing.arrived(npc, now) {
+                            tracing::info!(
+                                target: "npcd::authority::lease",
+                                npc,
+                                waited_ms = waited.as_millis() as u64,
+                                "arrived"
+                            );
                         }
-                    } else if handing {
+                        self.wake_character(npc);
+                    } else {
+                        self.standing.arriving(npc, now);
+                    }
+                }
+                // Asked to move: held from its next turn and handed back
+                // once the turn in progress is over — see
+                // `Standing::hand_back_due`. No longer asked, it is let go
+                // on.
+                (true, true) if moving => {
+                    if self.standing.hand_back_due(npc, Instant::now()) {
+                        self.hand_back(world, npc);
+                    }
+                }
+                (true, _) if handing => self.standing.end_handing(npc),
+                // Lent elsewhere: put down before any hold on it is let
+                // go, so it takes no turn here in between.
+                (false, true) => {
+                    self.put_down(npc);
+                    if handing {
                         self.standing.end_handing(npc);
                     }
-                    continue;
                 }
-                let moving = lease.is_some_and(|l| l.next.is_some());
-                match (mine, awake) {
-                    // **Held here, not running, and asked to move: handed back
-                    // now**, with no turn to wait for. Woken first, it waited on
-                    // its last holder's writes before it could move on; never
-                    // woken, it was never handed back, and ran nowhere. The
-                    // hand-back keeps every wait the lease names, so the next
-                    // holder still waits for what this one never took in.
-                    (true, false) if moving => {
-                        if self.standing.hand_back_due(npc, Instant::now()) {
-                            self.hand_back(&world, npc);
-                        }
-                    }
-                    (true, false) if !handing => {
-                        let ready = lease.is_none_or(|l| l.ready(applied));
-                        let now = Instant::now();
-                        if ready {
-                            if let Some(waited) = self.standing.arrived(npc, now) {
-                                tracing::info!(
-                                    target: "npcd::authority::lease",
-                                    npc,
-                                    waited_ms = waited.as_millis() as u64,
-                                    "arrived"
-                                );
-                            }
-                            self.wake_character(npc);
-                        } else {
-                            self.standing.arriving(npc, now);
-                        }
-                    }
-                    // Asked to move: held from its next turn and handed back
-                    // once the turn in progress is over — see
-                    // `Standing::hand_back_due`. No longer asked, it is let go
-                    // on.
-                    (true, true) if moving => {
-                        if self.standing.hand_back_due(npc, Instant::now()) {
-                            self.hand_back(&world, npc);
-                        }
-                    }
-                    (true, _) if handing => self.standing.end_handing(npc),
-                    // Lent elsewhere: put down before any hold on it is let
-                    // go, so it takes no turn here in between.
-                    (false, true) => {
-                        self.put_down(npc);
-                        if handing {
-                            self.standing.end_handing(npc);
-                        }
-                    }
-                    (false, false) if handing => self.standing.end_handing(npc),
-                    _ => {}
-                }
+                (false, false) if handing => self.standing.end_handing(npc),
+                _ => {}
             }
         }
     }

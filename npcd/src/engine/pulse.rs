@@ -157,13 +157,9 @@ pub async fn feed(
     // Filtered *before* the limit, so asking for fifty rows gives fifty rows
     // this caller can see rather than fifty from the whole cast with most of
     // them removed. The scheduler's ring is the hard bound either way.
-    let mut ticks: Vec<_> = rt
-        .scheduler
-        .recent(MAX_FEED.max(limit))
-        .into_iter()
-        .filter(|t| scope.admits(t.npc_id))
-        .filter(|t| want.is_none_or(|want| t.npc_id == want))
-        .collect();
+    let mut ticks: Vec<_> = rt.scheduler.recent_where(MAX_FEED.max(limit), |t| {
+        scope.admits(t.npc_id) && want.is_none_or(|want| t.npc_id == want)
+    });
     let drop = ticks.len().saturating_sub(limit);
     ticks.drain(..drop);
 
@@ -222,14 +218,17 @@ pub async fn census(
     // than in the scheduler because the scheduler knows the day a character
     // thinks it is in and not what time the world says it is — those are
     // different questions, and the gap between them is what a roll-over closes.
+    // One census, filtered once, for both the rows and their names.
+    let seen: Vec<_> = rt
+        .scheduler
+        .census()
+        .into_iter()
+        .filter(|c| scope.admits(c.npc_id))
+        .collect();
+    let ids: Vec<u64> = seen.iter().map(|c| c.npc_id).collect();
     let mut characters: Vec<serde_json::Value> = Vec::new();
-    for c in rt.scheduler.census() {
-        if !scope.admits(c.npc_id) {
-            continue;
-        }
-        // `s.world_ms`, not `rt.world_ms`: this is inside the runtime, and the
-        // runtime's own resolver takes `blocking_read`, which panics here.
-        let world_ms = s.world_ms(c.npc_id).await;
+    for c in seen {
+        let world_ms = s.world_ms(c.npc_id);
         let mut v = serde_json::to_value(&c).unwrap_or_else(|_| json!({}));
         if let Some(o) = v.as_object_mut() {
             o.insert("world_ms".into(), json!(world_ms));
@@ -246,15 +245,7 @@ pub async fn census(
         }
         characters.push(v);
     }
-    let names = name_map(
-        &s,
-        rt.scheduler
-            .census()
-            .into_iter()
-            .map(|c| c.npc_id)
-            .filter(|id| scope.admits(*id)),
-    )
-    .await;
+    let names = name_map(&s, ids.into_iter()).await;
 
     Json(json!({
         "characters": characters,
@@ -741,7 +732,7 @@ pub async fn broadcast(
     // broadcast: the resolver is async, and the scheduler's is not.
     let mut when: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     for c in rt.scheduler.census() {
-        when.insert(c.npc_id, s.world_ms(c.npc_id).await);
+        when.insert(c.npc_id, s.world_ms(c.npc_id));
     }
     // Each character reads it on its own world's clock; there is no single
     // instant to stamp them all with.
@@ -807,7 +798,7 @@ pub async fn announce(
     // instant to stamp them all with — the same resolve `broadcast` makes.
     let mut when: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     for c in rt.scheduler.census() {
-        when.insert(c.npc_id, s.world_ms(c.npc_id).await);
+        when.insert(c.npc_id, s.world_ms(c.npc_id));
     }
     let reached = rt.scheduler.broadcast(
         |id| when.get(&id).copied().unwrap_or(0),
@@ -860,7 +851,7 @@ pub async fn inject(
         Err(e) => return err(StatusCode::BAD_REQUEST, "bad_command", &e.message()),
     };
 
-    let world_ms = s.world_ms(nid).await;
+    let world_ms = s.world_ms(nid);
     // `/sleep` carries a placeholder day the parser cannot know; the clock is
     // the only thing that can fill it in.
     let kind = match parsed.kind {
@@ -1006,7 +997,7 @@ pub async fn direct(
         );
     };
 
-    let world_ms = s.world_ms(nid).await;
+    let world_ms = s.world_ms(nid);
     deliver_and_report(rt, nid, world_ms, salience, kind, json!({}))
 }
 

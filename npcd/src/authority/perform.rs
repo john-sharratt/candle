@@ -16,7 +16,7 @@ use npc_map::world::Where;
 use crate::world::Hosted;
 
 use super::forward::{act_of, call_line};
-use super::npc_lease::{hand_back, leases_of, released};
+use super::npc_lease::{hand_back, released};
 use super::ops::{Decided, OpReply, WorldOp};
 use crate::api::now_ms;
 use crate::bridge;
@@ -247,8 +247,8 @@ impl Runtime {
             }
             WorldOp::HandBack { npc, through } => {
                 let lease = from.and_then(|from| {
-                    let current = leases_of(&self.standing.written(world));
-                    hand_back(current.get(&npc)?, from, through, now_ms())
+                    let current = self.standing.written(world);
+                    hand_back(current.leases.get(&npc)?, from, through, now_ms())
                 });
                 let ok = lease.is_some();
                 if let Some(lease) = lease {

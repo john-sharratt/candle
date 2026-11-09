@@ -34,7 +34,7 @@ use host::cluster::serve::serve;
 use host::cluster::store::ConversationStore;
 use host::guard::dispatch_table;
 use npc_map::world::{Happening, Where};
-use npcd::authority::npc_lease::{hex, leases_of, lent_to};
+use npcd::authority::npc_lease::{hex, lent_to};
 use npcd::authority::ops::{OpReply, WorldOp};
 use npcd::authority::routes;
 use npcd::authority::Role;
@@ -415,7 +415,7 @@ async fn a_world_has_one_authority_and_its_cast_runs_where_it_is_lent() {
 
     until("one authority, every character lent", WITHIN, || {
         let auth = authority_of(world, &both);
-        auth.len() == 1 && leases_of(&auth[0].rt.standing.written(world)).len() == cast.len()
+        auth.len() == 1 && auth[0].rt.standing.written(world).leases.len() == cast.len()
     })
     .await;
     let auth = authority_of(world, &both)[0];
@@ -431,7 +431,7 @@ async fn a_world_has_one_authority_and_its_cast_runs_where_it_is_lent() {
         })
     })
     .await;
-    let leases = leases_of(&auth.rt.standing.written(world));
+    let leases = auth.rt.standing.written(world).leases.clone();
     for &npc in &cast {
         assert_eq!(leases[&npc].holder, hex(lent_to(npc, &members).unwrap()));
     }
@@ -449,7 +449,7 @@ async fn a_world_has_one_authority_and_its_cast_runs_where_it_is_lent() {
     // The world's state is the same on both: the replica holds what the
     // authority wrote, and its world is that state.
     until("the replica follows the records", WITHIN, || {
-        replica.rt.standing.written(world) == auth.rt.standing.written(world)
+        replica.rt.standing.written(world).records == auth.rt.standing.written(world).records
     })
     .await;
     assert_eq!(replica.world.sim(sim_records), auth.world.sim(sim_records));
@@ -546,14 +546,14 @@ async fn a_member_that_takes_no_lease_runs_nothing() {
     let both = [&a, &b];
 
     until("a holds the world and every character", WITHIN, || {
-        let leases = leases_of(&a.rt.standing.written(world));
+        let leases = a.rt.standing.written(world).leases.clone();
         a.role(world).is_authority()
             && leases.len() == cast.len()
             && leases.values().all(|l| l.holder == hex(a.node()))
     })
     .await;
     until("b follows the records", WITHIN, || {
-        b.rt.standing.written(world) == a.rt.standing.written(world)
+        b.rt.standing.written(world).records == a.rt.standing.written(world).records
     })
     .await;
     until("every character awake on a alone", WITHIN, || {
@@ -592,6 +592,7 @@ async fn a_world_stays_and_its_characters_move_where_they_are_lent() {
     until("a writes it", WITHIN, || {
         a.rt.standing
             .written(&world)
+            .records
             .get("sim/meta")
             .is_some_and(|m| m["table_open"] == json!(false))
     })
@@ -601,7 +602,7 @@ async fn a_world_stays_and_its_characters_move_where_they_are_lent() {
     let b = member(&gw, sb, &world, &cast).await;
     let most = most_authorities(&world, &[&a, &b]);
     until("b follows the world", WITHIN, || {
-        b.rt.standing.written(&world) == a.rt.standing.written(&world)
+        b.rt.standing.written(&world).records == a.rt.standing.written(&world).records
             && !b.world.sim(|s| s.table_open)
     })
     .await;
@@ -618,7 +619,7 @@ async fn a_world_stays_and_its_characters_move_where_they_are_lent() {
         "each character runs where it is lent now",
         WITHIN,
         || {
-            let leases = leases_of(&a.rt.standing.written(&world));
+            let leases = a.rt.standing.written(&world).leases.clone();
             cast.iter().all(|&npc| {
                 let at = lent_to(npc, &members).unwrap();
                 leases
@@ -637,8 +638,8 @@ async fn a_world_stays_and_its_characters_move_where_they_are_lent() {
                 b.node(),
                 b.role(&world),
                 b.rt.moments(),
-                leases_of(&a.rt.standing.written(&world)),
-                leases_of(&b.rt.standing.written(&world)),
+                a.rt.standing.written(&world).leases.clone(),
+                b.rt.standing.written(&world).leases.clone(),
                 cast.iter().filter(|&&n| a.awake(n)).collect::<Vec<_>>(),
                 cast.iter().filter(|&&n| b.awake(n)).collect::<Vec<_>>(),
                 cast.iter()
@@ -654,7 +655,7 @@ async fn a_world_stays_and_its_characters_move_where_they_are_lent() {
         .filter(|&npc| lent_to(npc, &members) == Some(b.node()))
         .collect();
     assert!(!moved.is_empty());
-    let leases = leases_of(&a.rt.standing.written(&world));
+    let leases = a.rt.standing.written(&world).leases.clone();
     for npc in moved {
         let origins: Vec<u64> = leases[&npc].waits.iter().map(|w| w.origin).collect();
         assert_eq!(origins, vec![a.node()], "b waited for what a wrote");
@@ -696,7 +697,7 @@ async fn a_cut_off_member_runs_its_world_locally_and_scraps_it_on_return() {
     let walker = theirs[0];
     let body = Runtime::body_id(walker);
     until("the replica follows", WITHIN, || {
-        away.rt.standing.written(world) == auth.rt.standing.written(world)
+        away.rt.standing.written(world).records == auth.rt.standing.written(world).records
     })
     .await;
 
@@ -728,7 +729,7 @@ async fn a_cut_off_member_runs_its_world_locally_and_scraps_it_on_return() {
     );
     // Its characters stay its own while it is away.
     sleep(Duration::from_secs(3)).await;
-    let leases = leases_of(&auth.rt.standing.written(world));
+    let leases = auth.rt.standing.written(world).leases.clone();
     for npc in &theirs {
         assert_eq!(leases[npc].holder, hex(away.node()), "not lent again");
     }
@@ -771,10 +772,11 @@ async fn a_world_keeps_one_authority_across_the_loss_of_its_authority() {
     a.world.with_sim(|s| s.table_open = false);
     until("b and c hold what a wrote", WITHIN, || {
         [&b, &c].iter().all(|m| {
-            m.rt.standing.written(&world) == a.rt.standing.written(&world)
+            m.rt.standing.written(&world).records == a.rt.standing.written(&world).records
                 && m.rt
                     .standing
                     .written(&world)
+                    .records
                     .get("sim/meta")
                     .is_some_and(|v| v["table_open"] == json!(false))
         })

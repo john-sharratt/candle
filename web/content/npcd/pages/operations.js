@@ -16,6 +16,7 @@
 import { API } from '../lib/api.js';
 import { h, mount, fmtNum } from '/common/lib/dom.js';
 import { disclosure } from '/common/lib/lazy.js';
+import { pollWhileVisible } from '/common/lib/visible.js';
 
 /* How an operation ended. */
 const ENDS = {
@@ -351,6 +352,6 @@ export async function render(_params, _q) {
   }
 
   await paint();
-  const timer = setInterval(() => { if (!editing) paint(); }, 5000);
-  return { el, teardown: () => clearInterval(timer) };
+  const stop = pollWhileVisible(5000, () => { if (!editing) paint(); });
+  return { el, teardown: stop };
 }

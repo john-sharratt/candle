@@ -43,7 +43,7 @@ use web::auth::session::Identity;
 use candle_conversation::persistence::record::NpcPayload;
 use web::auth::{Role, Roles};
 
-use crate::accounts::{self, Accounts, NameError, PatchError};
+use crate::accounts::{self, account_of, Accounts, NameError, PatchError};
 use crate::authorize;
 use crate::authorize::{Cache as AuthorizationCache, Signer};
 use crate::clock::{self, Clock};
@@ -82,6 +82,7 @@ use crate::registry::{self, PutError, Record, Registry};
 use crate::sim::shelf::{Published, Shelf};
 use crate::suspend;
 use crate::visibility;
+use crate::world_clocks::WorldClocks;
 use crate::world_state::renamed;
 use host::guard::Api;
 
@@ -92,6 +93,9 @@ use host::guard::Api;
 /// never waits on another GUI editing one.
 pub struct Authored {
     pub worlds: RwLock<Registry>,
+    /// Every world's clock, as `worlds` last held it, read without a lock —
+    /// see [`crate::world_clocks`]. Stored whenever `worlds` is read again.
+    pub clocks: Arc<WorldClocks>,
     pub personalities: RwLock<Registry>,
     pub accounts: RwLock<Accounts>,
     /// The cast, in memory, backed by the substrate — see [`crate::npcs`]. No
@@ -205,6 +209,7 @@ impl Authored {
             .map(FsPath::to_path_buf)
             .unwrap_or_default();
         Self {
+            clocks: Arc::new(WorldClocks::of(&worlds)),
             worlds: RwLock::new(worlds),
             personalities: RwLock::new(personalities),
             accounts: RwLock::new(accounts),
@@ -277,12 +282,19 @@ impl Authored {
     /// now: after the mind folder moves to a newer record, or a write to a
     /// mind that keeps no drafts. A world that is gone stops running.
     pub async fn reload_authored(&self) {
-        let gone = match self.worlds.write().await.reload() {
-            Ok(gone) => gone,
-            Err(e) => {
-                tracing::warn!("worlds could not be read again: {e:#}");
-                Vec::new()
-            }
+        let gone = {
+            let mut worlds = self.worlds.write().await;
+            let gone = match worlds.reload() {
+                Ok(gone) => gone,
+                Err(e) => {
+                    tracing::warn!("worlds could not be read again: {e:#}");
+                    Vec::new()
+                }
+            };
+            // The clocks as the registry stands now, whether it read again or
+            // not, stored while it is still held.
+            self.clocks.store(&worlds);
+            gone
         };
         if let Err(e) = self.personalities.write().await.reload() {
             tracing::warn!("personalities could not be read again: {e:#}");
@@ -366,20 +378,11 @@ impl Authored {
         named
     }
 
-    /// What time it is in a character's world — the async route in.
-    ///
-    /// `Runtime::world_ms` reaches the same answer through a closure that takes
-    /// `blocking_read`, which is correct on the tick thread and **panics**
-    /// inside the runtime. A handler must come this way instead. Both end at
-    /// `clock::world_ms_for`, so there is one lookup and two ways to hold the
-    /// locks for it.
-    pub async fn world_ms(&self, npc_id: u64) -> u64 {
-        crate::clock::world_ms_for(
-            &self.npcs.view(),
-            &*self.worlds.read().await,
-            npc_id,
-            now_ms() as i64,
-        )
+    /// What time it is in a character's world: a lookup in [`Self::clocks`],
+    /// taking no lock, so a handler and the tick driver read it alike.
+    pub fn world_ms(&self, npc_id: u64) -> u64 {
+        self.clocks
+            .world_ms(&self.npcs.view(), npc_id, now_ms() as i64)
     }
 }
 
@@ -986,19 +989,14 @@ pub async fn owner_of(
     headers: &HeaderMap,
 ) -> Result<(Identity, String), Box<Response>> {
     let id = caller(s, headers)?;
-    let me = s
-        .accounts
-        .write()
-        .await
-        .upsert(&id, now_ms())
-        .map_err(|e| {
-            tracing::error!(error = %e, "account upsert failed");
-            Box::new(err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "account_write_failed",
-                &e.to_string(),
-            ))
-        })?;
+    let me = account_of(&s.accounts, &id, now_ms()).await.map_err(|e| {
+        tracing::error!(error = %e, "account upsert failed");
+        Box::new(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "account_write_failed",
+            &e.to_string(),
+        ))
+    })?;
     // The account's public handle (`u_1a2b3c4d`), not the provider's subject.
     // The subject never leaves `accounts`, and a character record is a durable
     // artifact in a store that outlives this daemon — the last place to write
@@ -1448,7 +1446,7 @@ async fn create_npc(
                     // it to (`docs/replicated_substrate.md` §9.3), which wakes
                     // it there; a daemon with no cluster runs them all.
                     if rt.standing.runs(id) {
-                        let world_ms = s.world_ms(id).await;
+                        let world_ms = s.world_ms(id);
                         rt.scheduler.wake(id, 0, world_ms);
                         // And its task with it — waking puts the inbox in the
                         // scheduler; the task is what waits on it and thinks.
@@ -2116,7 +2114,7 @@ async fn delete_npc(
 /// `Err` is the failed write, said once in the log; the host's answer then
 /// carries no account rather than a fabricated one.
 pub async fn account(s: &Authored, id: &Identity) -> Result<Value, String> {
-    s.accounts.write().await.upsert(id, now_ms()).map_err(|e| {
+    account_of(&s.accounts, id, now_ms()).await.map_err(|e| {
         tracing::error!(error = %e, "account upsert failed");
         e.to_string()
     })

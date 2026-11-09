@@ -16,12 +16,14 @@
 //! world, so nothing a copy builds a turn from is left out of them. Where this
 //! machine keeps the benches' documents is not part of the world, so it is not
 //! in the record.
+//!
+//! [`World::state`]: npc_map::world::World::state
 
 use std::collections::BTreeMap;
 
 use npc_map::lift::Doors;
 use npc_map::state::{BodyState, LiftState, State, WalkState};
-use npc_map::world::{Where, World};
+use npc_map::world::Where;
 use serde_json::{json, Value};
 
 use super::keys::escape;
@@ -72,9 +74,12 @@ pub fn place_name(at: &Where) -> String {
 }
 
 /// The records of every body and of the lift — everything the world's copies
-/// share ([`World::state`]).
-pub fn world_records(w: &World) -> Records {
-    let State { bodies, lift } = w.state();
+/// share — from `state`, the copy [`World::state`] makes under the world lock,
+/// so the records are built after it is let go.
+///
+/// [`World::state`]: npc_map::world::World::state
+pub fn world_records(state: State) -> Records {
+    let State { bodies, lift } = state;
     let mut out = Records::new();
     for (id, body) in bodies {
         let BodyState { at, hold, walk } = body;
@@ -115,19 +120,33 @@ pub fn world_records(w: &World) -> Records {
     out
 }
 
-/// The records of everything the world holds beyond its map.
+/// The records of everything the world holds beyond its map:
+/// [`sim_records_of`] [`sim_value`].
 pub fn sim_records(s: &Sim) -> Records {
+    sim_value(s).map(sim_records_of).unwrap_or_default()
+}
+
+/// Everything `s` holds, as the JSON its records are split from — the one
+/// part of taking a world's state that needs its lock. The benches' root is
+/// this machine's, so it is left out. `None`, and the reason logged, for a
+/// state that would not encode.
+pub fn sim_value(s: &Sim) -> Option<Value> {
     let mut value = match serde_json::to_value(s) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("a world's state would not encode: {e}");
-            return Records::new();
+            return None;
         }
     };
     if let Some(bench) = value.get_mut("bench").and_then(Value::as_object_mut) {
         bench.remove("root");
     }
-    split(&value, SIM_MAPS)
+    Some(value)
+}
+
+/// [`sim_value`]'s JSON split into one record per entity, outside the lock.
+pub fn sim_records_of(value: Value) -> Records {
+    split(value, SIM_MAPS)
         .into_iter()
         .map(|(name, v)| (format!("{SIM}{name}"), v))
         .collect()
@@ -161,7 +180,7 @@ pub(super) mod tests {
             w.enter("a", "A", at("band-one")).unwrap();
             w.enter("b", "B", at("band-one")).unwrap();
             w.set_off("b", at("green-room")).unwrap();
-            world_records(w)
+            world_records(w.state())
         });
         assert_eq!(
             records.get("body/a"),

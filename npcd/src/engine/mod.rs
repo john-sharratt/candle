@@ -1014,7 +1014,7 @@ async fn open_interaction(
     // Two clocks, and they are not interchangeable: going quiet is a fact about
     // a person at a console, and the world's own instant is only the label the
     // session carries. See `Interaction::last_ms`.
-    let world_ms = s.world_ms(npc_id).await;
+    let world_ms = s.world_ms(npc_id);
     let now = crate::api::now_ms();
     let who = as_interlocutor(&id, &handle, &s.roles);
     let world = rt
@@ -1142,7 +1142,7 @@ async fn inject(
         // worked.
         Err(e) => return err(StatusCode::BAD_REQUEST, "bad_command", &e.message()),
     };
-    let world_ms = s.world_ms(session.npc_id).await;
+    let world_ms = s.world_ms(session.npc_id);
     let kind = match parsed.kind {
         crate::engine::event::EventKind::Sleep { .. } => crate::engine::event::EventKind::Sleep {
             day: crate::clock::day_of(world_ms),
@@ -1553,14 +1553,7 @@ async fn stream(
 
     // The newest tick this character has taken. Where a fresh console starts,
     // so attaching to a live session does not replay the whole afternoon.
-    let latest: u64 = rt
-        .scheduler
-        .recent(512)
-        .iter()
-        .filter(|t| t.npc_id == npc_id)
-        .map(|t| t.tick)
-        .max()
-        .unwrap_or(0);
+    let latest: u64 = rt.scheduler.latest_tick_of(npc_id).unwrap_or(0);
 
     let mut seen: u64 = resume_from(q.get("since").map(String::as_str), latest);
 
@@ -1604,10 +1597,7 @@ async fn stream(
             }
             let fresh: Vec<_> = rt
                 .scheduler
-                .recent(512)
-                .into_iter()
-                .filter(|t| t.npc_id == npc_id && t.tick > seen)
-                .collect();
+                .recent_where(512, |t| t.npc_id == npc_id && t.tick > seen);
             for t in fresh {
                 seen = seen.max(t.tick);
                 for (n, act) in t.acts.iter().enumerate() {

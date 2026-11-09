@@ -153,7 +153,7 @@ pub async fn mind_control(
             "a thought needs something in it",
         );
     };
-    let world_ms = s.world_ms(npc_id).await;
+    let world_ms = s.world_ms(npc_id);
     let prose = Event::new(0, world_ms, salience, kind.clone()).prose();
     if !rt.scheduler.deliver(npc_id, world_ms, salience, kind) {
         return err(

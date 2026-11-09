@@ -12,6 +12,7 @@
 //! |---|---|
 //! | [`role`] | what this member is to each world |
 //! | [`worlds`] | what this member knows of its worlds: roles, what was written, who runs here |
+//! | [`written`] | a world's records as last written or applied, with their leases parsed |
 //! | [`beat`] | a world's beat, as the role has it, and its restore from records |
 //! | [`world_lease`] | asking for, renewing and handing over a world's lease |
 //! | [`driver`] | the leases driven, and the moves between roles |
@@ -45,6 +46,7 @@ pub mod routes;
 pub mod told;
 pub mod world_lease;
 pub mod worlds;
+pub mod written;
 pub mod zen_task;
 
 pub use role::{Role, Roles};

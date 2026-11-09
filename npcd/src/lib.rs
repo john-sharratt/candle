@@ -67,4 +67,5 @@ pub mod suspend;
 pub mod tenant;
 pub mod visibility;
 pub mod world;
+pub mod world_clocks;
 pub mod world_state;

@@ -152,6 +152,13 @@ pub fn since(world: &World, id: &str) -> Vec<Witnessed> {
     let Some(reader) = world.actor(id) else {
         return Vec::new();
     };
+    // **Nothing new is nothing to walk.** Every event is stamped from the
+    // world's advancing clock and the log drains only from the front, so it is
+    // ordered by `at`: when its newest is no later than the reader's last look,
+    // so is every other, and the walk below would skip them all.
+    if world.log().last().is_none_or(|e| e.at <= reader.looked) {
+        return Vec::new();
+    }
     // **Scope is where the reader was when the thing happened**, not where it
     // is standing now. Reading is not a second act of perception: walking to
     // the green room cannot let you overhear what was said there before you
@@ -552,6 +559,22 @@ mod tests {
         w.mark_seen("m1");
         assert!(since(&w, "m1").is_empty());
         assert!(narrate(&w, &[]).is_none());
+    }
+
+    /// **A reader that has looked since the last event has nothing to read**,
+    /// and one line said after its look is exactly that line, at its time.
+    #[test]
+    fn a_look_after_the_last_event_reads_nothing_and_the_next_line_alone() {
+        let mut w = vault();
+        w.enter("m1", "Maker-01", casting("band-one")).unwrap();
+        w.enter("m2", "Maker-02", casting("band-one")).unwrap();
+        w.mark_seen("m2");
+        assert!(since(&w, "m2").is_empty());
+        w.say("m1", "morning").unwrap();
+        let said_at = w.log().last().unwrap().at;
+        let seen = since(&w, "m2");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].at, said_at);
     }
 
     #[test]

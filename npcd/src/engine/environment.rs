@@ -36,6 +36,8 @@
 //! left, sitting where attention weights it highest. The changes accumulate,
 //! because a thing that happened stays happened.
 
+use std::collections::HashMap;
+
 use npc_map::delta::Delta;
 use npc_map::world::{Happening, World};
 
@@ -53,6 +55,20 @@ use crate::world::Hosted;
 
 /// A character's world time in milliseconds, by id.
 pub type WorldTimeOf<'a> = dyn Fn(u64) -> u64 + 'a;
+
+/// Which mind each body of a world is, by body id: read once per moment from
+/// the bindings — one range of them — and handed to each pass of the moment,
+/// in place of a lookup per delta. A bind made mid-moment is seen at the next.
+pub type Minds = HashMap<String, u64>;
+
+/// `hosted`'s bodies with a mind, from `bindings`.
+fn minds_of(hosted: &Hosted, bindings: &Bindings) -> Minds {
+    bindings
+        .in_world(hosted.id())
+        .into_iter()
+        .map(|(npc, body)| (body, npc))
+        .collect()
+}
 
 /// Who a sweep hands things to here, and how it tells a character that runs
 /// on another member (`docs/replicated_substrate.md` §9.3).
@@ -278,13 +294,24 @@ pub fn push(
     time: &WorldTimeOf,
     reach: &Reach,
 ) -> usize {
+    push_minds(hosted, &minds_of(hosted, bindings), sched, time, reach)
+}
+
+/// [`push`] with the moment's body → mind map already read.
+fn push_minds(
+    hosted: &Hosted,
+    minds: &Minds,
+    sched: &Scheduler,
+    time: &WorldTimeOf,
+    reach: &Reach,
+) -> usize {
     let deltas = hosted.sweep();
     if deltas.is_empty() {
         return 0;
     }
     let mut told = 0;
     for delta in &deltas {
-        let Some(npc_id) = bindings.mind_of(hosted.id(), &delta.who) else {
+        let Some(&npc_id) = minds.get(&delta.who) else {
             continue;
         };
         if !(reach.here)(npc_id) {
@@ -340,8 +367,9 @@ pub fn advance_for(
     let moved = hosted.tick();
     let stirred = hosted.stir();
     let sounded = hosted.watch_tower();
-    let told = push(hosted, bindings, sched, time, reach);
-    let messaged = deliver_messages(hosted, bindings, sched, time, reach);
+    let minds = minds_of(hosted, bindings);
+    let told = push_minds(hosted, &minds, sched, time, reach);
+    let messaged = deliver_messages(hosted, &minds, sched, time, reach);
     Moment {
         moved,
         stirred,
@@ -389,7 +417,7 @@ pub fn perceive(
 /// Returns how many minds were handed something.
 fn deliver_messages(
     hosted: &Hosted,
-    bindings: &Bindings,
+    minds: &Minds,
     sched: &Scheduler,
     time: &WorldTimeOf,
     reach: &Reach,
@@ -403,7 +431,7 @@ fn deliver_messages(
     }
     let mut told = 0;
     for (name, body) in who_is_where {
-        let Some(npc_id) = bindings.mind_of(hosted.id(), &body) else {
+        let Some(&npc_id) = minds.get(&body) else {
             continue;
         };
         let at_ms = time(npc_id);
@@ -415,10 +443,12 @@ fn deliver_messages(
             if !waiting.is_empty() {
                 s.threads.mark_delivered_for(&name);
             }
-            let due = s
+            // The unread count comes with the reminder: the same per-thread
+            // counts, summed, so the threads are not walked again for it.
+            let (due, unread) = s
                 .threads
                 .unread_due(&name, phone::now_ms(), !waiting.is_empty());
-            (waiting, due, s.threads.waiting_for(&name))
+            (waiting, due, unread)
         });
         if let Some(due) = due {
             remind(npc_id, at_ms, due, sched, reach);

@@ -15,11 +15,12 @@ use std::sync::Arc;
 
 use cluster::frame::Pulse;
 
-use super::npc_lease::{hold_still, leases_of, lend, moves, with_leases, LEASES};
+use super::npc_lease::{hold_still, lend, moves, with_leases};
 use super::pulse::{self, EVENTS};
 use super::role::Role;
 use super::told::{self, TOLD};
 use super::world_lease::epoch_for;
+use super::written::Written;
 use crate::api::now_ms;
 use crate::engine::environment::{self, Reach};
 use crate::engine::event::{EventKind, Salience};
@@ -67,8 +68,7 @@ impl Runtime {
         }
         self.standing
             .set_followed(id, shared.custom_objects_version());
-        self.standing.set_written(id, records);
-        self.standing.recompute_held();
+        self.standing.set_written(id, Written::of(records));
     }
 
     /// One beat of a world's metronome.
@@ -84,7 +84,9 @@ impl Runtime {
                 self.moment(hosted);
             }
         }
-        self.reconcile_cast();
+        // Its own cast only: nothing in the reconcile crosses worlds, and
+        // every hosted world beats, so each is reconciled once a beat.
+        self.reconcile_cast(hosted.id());
     }
 
     /// Write what changed of `hosted` since it was last written, stamped with
@@ -97,8 +99,11 @@ impl Runtime {
         let before = self.standing.written(world);
         let mut records = records_of(hosted);
         let handed = self.standing.take_handed(world);
+        // The leases the records carry once written: lent now when clustered,
+        // otherwise whatever lease records the world's own state holds.
+        let mut leases = None;
         if self.standing.clustered() {
-            let mut current = leases_of(&before);
+            let mut current = before.leases.clone();
             current.extend(handed.clone());
             let cast: Vec<u64> = self
                 .bodies
@@ -132,25 +137,21 @@ impl Runtime {
                 }
             }
             with_leases(&mut records, &lent);
+            leases = Some(lent);
         }
-        let changes = diff(&before, &records);
+        let changes = diff(&before.records, &records);
         if changes.is_empty() {
             return;
         }
-        let leases_changed = changes
-            .put
-            .iter()
-            .map(|(k, _)| k)
-            .chain(changes.ceased.iter())
-            .any(|k| k.starts_with(LEASES));
-        match store::write(&shared, world, &changes, epoch) {
+        match store::write(&shared, world, changes, epoch) {
             Ok(()) => {
-                self.standing.set_written(world, records);
+                let written = match leases {
+                    Some(lent) => Written::new(records, lent),
+                    None => Written::of(records),
+                };
+                self.standing.set_written(world, written);
                 self.standing
                     .set_followed(world, shared.custom_objects_version());
-                if leases_changed {
-                    self.standing.recompute_held();
-                }
                 if let Some(last) = self.standing.legacy_written(world) {
                     if let Err(e) = legacy::retire(&shared, world, last) {
                         tracing::error!("world `{world}`: the old objects were not retired: {e}");
@@ -213,9 +214,8 @@ impl Runtime {
             if self.standing.followed(world) != Some(version) {
                 let records = store::read(&shared, world);
                 apply(hosted, &records);
-                self.standing.set_written(world, records);
+                self.standing.set_written(world, Written::of(records));
                 self.standing.set_followed(world, version);
-                self.standing.recompute_held();
             }
         }
         let here = |npc_id: u64| self.standing.runs(npc_id);
@@ -262,10 +262,9 @@ impl Runtime {
         self.ops.scrap(world);
         let records = store::read(&shared, world);
         apply(hosted, &records);
-        self.standing.set_written(world, records);
+        self.standing.set_written(world, Written::of(records));
         self.standing
             .set_followed(world, shared.custom_objects_version());
-        self.standing.recompute_held();
     }
 }
 
@@ -317,7 +316,7 @@ mod tests {
         world.with(|w| w.enter("m1", "Maker-01", at("green-room")).unwrap());
         world.with_sim(|s| s.table_open = false);
         rt.beat(&world);
-        assert_eq!(rt.standing.written(WORLD), records_of(&world));
+        assert_eq!(rt.standing.written(WORLD).records, records_of(&world));
 
         let again = Runtime::new(Mind::new(None), dir.path()).unwrap();
         again.set_substrate(s.clone());
@@ -369,7 +368,7 @@ mod tests {
         world.with(|w| w.enter("m1", "Maker-01", at("green-room")).unwrap());
         world.with_sim(|s| s.table_open = false);
         let kept = records_of(&world);
-        store::write(&s, "old-vault", &diff(&Records::new(), &kept), 5).unwrap();
+        store::write(&s, "old-vault", diff(&Records::new(), &kept), 5).unwrap();
         assert!(rt.remove_world(WORLD));
 
         rt.standing.set_formers(BTreeMap::from([(

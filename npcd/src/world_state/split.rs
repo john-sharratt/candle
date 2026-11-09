@@ -20,8 +20,8 @@ pub const META: &str = "meta";
 /// `value` taken apart at `maps`, each a `/`-separated path to an object
 /// whose entries are entities. A map that is absent or not an object is left
 /// in `meta`.
-pub fn split(value: &Value, maps: &[&str]) -> BTreeMap<String, Value> {
-    let mut rest = value.clone();
+pub fn split(value: Value, maps: &[&str]) -> BTreeMap<String, Value> {
+    let mut rest = value;
     let mut out = BTreeMap::new();
     for path in maps {
         let Some(Value::Object(entries)) = take(&mut rest, path) else {
@@ -112,7 +112,7 @@ mod tests {
     /// left is `meta`.
     #[test]
     fn a_facet_splits_into_one_record_per_entity() {
-        let records = split(&facet(), MAPS);
+        let records = split(facet(), MAPS);
         let want: BTreeMap<String, Value> = [
             ("active/maker%2F2", json!({"step": 0})),
             ("active/maker-1", json!({"step": 2})),
@@ -128,10 +128,10 @@ mod tests {
     /// Joined, the records are the facet again — an emptied map included.
     #[test]
     fn records_join_back_into_the_facet() {
-        assert_eq!(join(&split(&facet(), MAPS), MAPS), facet());
+        assert_eq!(join(&split(facet(), MAPS), MAPS), facet());
         let mut emptied = facet();
         emptied["active"] = json!({});
-        let mut records = split(&facet(), MAPS);
+        let mut records = split(facet(), MAPS);
         records.retain(|k, _| !k.starts_with("active/"));
         assert_eq!(join(&records, MAPS), emptied);
     }
@@ -140,7 +140,7 @@ mod tests {
     /// empty when joining.
     #[test]
     fn an_absent_map_stays_in_meta() {
-        let records = split(&json!({"seed": 1}), MAPS);
+        let records = split(json!({"seed": 1}), MAPS);
         assert_eq!(records.len(), 1);
         assert_eq!(
             join(&records, MAPS),

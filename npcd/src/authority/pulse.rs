@@ -10,9 +10,13 @@ use npc_map::world::{Event, Tick};
 /// A pulse's kind: the world's events since the last one.
 pub const EVENTS: &str = "events";
 
-/// The events in `log` after tick `after`, and the tick of the last one.
+/// The events in `log` after tick `after`, and the tick of the last one. The
+/// log is ordered by `at` — every event is stamped from the world's advancing
+/// clock, and it drains only from the front — so the first one after `after`
+/// is found by a binary search, and a quiet beat copies nothing.
 pub fn since(log: &[Event], after: Tick) -> (Vec<Event>, Tick) {
-    let events: Vec<Event> = log.iter().filter(|e| e.at > after).cloned().collect();
+    let from = log.partition_point(|e| e.at <= after);
+    let events: Vec<Event> = log[from..].to_vec();
     let last = events.last().map_or(after, |e| e.at);
     (events, last)
 }
@@ -53,5 +57,16 @@ mod tests {
         assert_eq!(last, 8);
         assert_eq!(since(&log, 8), (Vec::new(), 8));
         assert_eq!(decode(&encode(&events)).unwrap(), events);
+    }
+
+    /// **Events sharing a tick are all after a tick before it**: the search
+    /// starts at the first event past `after`, whatever ties follow.
+    #[test]
+    fn a_pulse_takes_every_event_after_its_tick_ties_included() {
+        let log = vec![said(3, "a"), said(5, "b"), said(5, "c"), said(8, "d")];
+        assert_eq!(
+            since(&log, 4),
+            (vec![said(5, "b"), said(5, "c"), said(8, "d")], 8)
+        );
     }
 }

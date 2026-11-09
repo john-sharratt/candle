@@ -1,6 +1,7 @@
 //! A fixture and its object stay in step, and a building says nothing about
 //! objects the room does not hold.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::engine::stir::binding::{Report, Set};
@@ -214,7 +215,7 @@ fn breaker() -> Report {
 /// Everything a board room says over `steps`, with `standing` reported to it.
 fn board_lines(standing: Vec<Report>, steps: u64) -> Vec<Stirring> {
     let mut b = Building::new(31, Vec::new(), &["status-board"]);
-    b.hear_of(standing);
+    b.hear_of(standing.into());
     b.run(Duration::ZERO, step(30), steps as usize)
         .into_iter()
         .map(|(_, s)| s)
@@ -266,11 +267,11 @@ fn a_board_with_nothing_standing_files_nothing() {
 #[test]
 fn the_board_takes_down_a_fault_that_is_gone() {
     let mut b = Building::new(31, Vec::new(), &["status-board"]);
-    b.hear_of(vec![breaker()]);
+    b.hear_of(vec![breaker()].into());
     let filed = b.run(Duration::ZERO, step(30), 600);
     assert!(filed.iter().any(|(_, s)| s.text.contains("has come up")));
 
-    b.hear_of(Vec::new());
+    b.hear_of(Arc::from([]));
     let after = b.run(step(600 * 30), step(30), 600);
     let cleared = after
         .iter()

@@ -11,13 +11,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use cluster::member::AppMember;
 use npc_map::world::Tick;
 
-use super::npc_lease::{held_by, leases_of, NpcLease};
+use super::npc_lease::NpcLease;
 use super::role::{Role, Roles};
 use super::told::Told;
-use crate::world_state::Records;
+use super::written::{held_of, Written};
 
 /// Which characters are part-way through a turn, and which are held for a
 /// hand-back.
@@ -63,8 +64,9 @@ pub struct Standing {
     /// When each world took its role, in wall-clock milliseconds.
     since: Mutex<BTreeMap<String, u64>>,
     /// Each world's records as this member last wrote them, as its authority,
-    /// or applied them, following it.
-    written: Mutex<BTreeMap<String, Records>>,
+    /// or applied them, following it, with their leases parsed. Held only for
+    /// an `Arc` insert and the held set's store.
+    written: Mutex<BTreeMap<String, Arc<Written>>>,
     /// The substrate's custom-object version each world was last read at.
     followed: Mutex<BTreeMap<String, u64>>,
     /// The last tick of each world's events sent as a pulse.
@@ -79,8 +81,10 @@ pub struct Standing {
     handed: Mutex<BTreeMap<String, BTreeMap<u64, NpcLease>>>,
     /// Deliveries for characters that run elsewhere, gathered over a beat.
     told: Mutex<BTreeMap<String, Vec<Told>>>,
-    /// The characters this member runs.
-    held: Mutex<BTreeSet<u64>>,
+    /// The characters this member runs, computed from `written` and stored
+    /// while its lock is held, so [`Self::runs`] — lock-free — never disagrees
+    /// with it.
+    held: ArcSwap<BTreeSet<u64>>,
     /// Which characters are mid-turn and which are held for a hand-back, under
     /// one lock — see [`Turns`].
     turns: Mutex<Turns>,
@@ -119,7 +123,7 @@ impl Standing {
             busy: Mutex::new(BTreeMap::new()),
             handed: Mutex::new(BTreeMap::new()),
             told: Mutex::new(BTreeMap::new()),
-            held: Mutex::new(BTreeSet::new()),
+            held: ArcSwap::from_pointee(BTreeSet::new()),
             turns: Mutex::new(Turns::default()),
             arriving: Mutex::new(HashMap::new()),
             sending: Mutex::new(HashSet::new()),
@@ -191,7 +195,9 @@ impl Standing {
         !matches!(self.role(world), Role::Replica)
     }
 
-    pub fn written(&self, world: &str) -> Records {
+    /// `world`'s records as last written or applied, shared — empty for a
+    /// world with none.
+    pub fn written(&self, world: &str) -> Arc<Written> {
         self.written
             .lock()
             .unwrap()
@@ -200,11 +206,23 @@ impl Standing {
             .unwrap_or_default()
     }
 
-    pub fn set_written(&self, world: &str, records: Records) {
-        self.written
-            .lock()
-            .unwrap()
-            .insert(world.to_string(), records);
+    /// `world`'s records are now `written`: the characters this member runs
+    /// are recomputed from every world's leases, in the same hold.
+    pub fn set_written(&self, world: &str, written: Written) {
+        let mut all = self.written.lock().unwrap();
+        all.insert(world.to_string(), Arc::new(written));
+        self.store_held(&all);
+    }
+
+    /// Recompute the characters this member runs from `all`, under its lock.
+    /// The node is read here too, so a write racing [`Self::set_member`]
+    /// cannot store a set computed without it.
+    fn store_held(&self, all: &BTreeMap<String, Arc<Written>>) {
+        let Some(me) = self.node() else {
+            return;
+        };
+        self.held
+            .store(Arc::new(held_of(all.values().map(Arc::as_ref), me)));
     }
 
     /// The substrate's version `world` was last read at.
@@ -287,33 +305,17 @@ impl Standing {
     }
 
     /// Every world's leases as last written or applied, and which name this
-    /// member: the characters it runs. Recomputed whenever a world's records
-    /// change. Returns whether the set changed.
-    pub fn recompute_held(&self) -> bool {
-        let Some(me) = self.node() else {
-            return false;
-        };
-        let now: BTreeSet<u64> = self
-            .written
-            .lock()
-            .unwrap()
-            .values()
-            .flat_map(|records| held_by(&leases_of(records), me))
-            .collect();
-        let mut held = self.held.lock().unwrap();
-        let changed = *held != now;
-        *held = now;
-        changed
+    /// member: the characters it runs — for the moment it joins and learns
+    /// its node. Every [`Self::set_written`] recomputes them itself.
+    pub fn recompute_held(&self) {
+        let all = self.written.lock().unwrap();
+        self.store_held(&all);
     }
 
     /// Whether this member runs character `npc`. A daemon with no cluster
     /// runs them all; one that runs no characters, none.
     pub fn runs(&self, npc: u64) -> bool {
-        self.characters() && (!self.clustered() || self.held.lock().unwrap().contains(&npc))
-    }
-
-    pub fn held(&self) -> BTreeSet<u64> {
-        self.held.lock().unwrap().clone()
+        self.characters() && (!self.clustered() || self.held.load().contains(&npc))
     }
 
     pub fn end_handing(&self, npc: u64) {

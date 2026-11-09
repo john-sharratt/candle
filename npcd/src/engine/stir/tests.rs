@@ -13,6 +13,7 @@
 //! cargo test -p npcd --lib engine::stir -- --nocapture
 //! ```
 
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::engine::event::Salience;
@@ -49,7 +50,7 @@ fn watch(t: u64, conds: &[Cond]) -> Watch {
         // evening, far from any hour boundary.
         wall: UNIX_EPOCH + Duration::from_secs(70_200 + t),
         conds: conds.to_vec(),
-        standing: Vec::new(),
+        standing: Arc::from([]),
     }
 }
 
@@ -519,7 +520,7 @@ fn the_clock_strikes_each_hour_exactly_once() {
             since_start: Duration::from_secs(m * 60),
             wall: UNIX_EPOCH + Duration::from_secs(secs),
             conds: Vec::new(),
-            standing: Vec::new(),
+            standing: Arc::from([]),
         };
         if let Some(s) = chime.consider(&w) {
             if s.text.contains("strikes") {

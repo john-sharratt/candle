@@ -72,6 +72,7 @@
 //! told nothing. `npc_map::part::Part::short` carries the same rule for the same
 //! reason, and `every_line_names_its_own_subject` holds it here.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::engine::event::Salience;
@@ -187,7 +188,7 @@ pub struct Watch {
     /// Faults standing on real objects in the world, as the world has told this
     /// building. Only the status board reads it: a board is where a fault that
     /// is not in front of you is written down.
-    pub standing: Vec<Report>,
+    pub standing: Arc<[Report]>,
 }
 
 impl Watch {
@@ -394,8 +395,9 @@ pub struct Building {
     synced: Vec<bool>,
     /// Object modes the fixtures have changed and the world has not yet applied.
     outbox: Vec<Set>,
-    /// Faults standing in the world, handed to the board.
-    standing: Vec<Report>,
+    /// Faults standing in the world, handed to the board — one list for the
+    /// whole building, shared by every room and every look.
+    standing: Arc<[Report]>,
     started: SystemTime,
     /// Where [`ambient::Ambient`] sits, found by id rather than assumed, so
     /// reordering the list above cannot silently turn the dial off.
@@ -442,7 +444,7 @@ impl Building {
         Building {
             synced: vec![false; fixtures.len()],
             outbox: Vec::new(),
-            standing: Vec::new(),
+            standing: Arc::from([]),
             fixtures,
             started: SystemTime::now(),
             at_rest,
@@ -471,7 +473,7 @@ impl Building {
             since_start,
             wall: self.started + since_start,
             conds,
-            standing: self.standing.clone(),
+            standing: Arc::clone(&self.standing),
         }
     }
 

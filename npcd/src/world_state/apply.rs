@@ -183,7 +183,7 @@ mod tests {
             s.table_open = false;
             seed::issue_handset(s, "a", "A");
         });
-        let mut records = source.read(world_records);
+        let mut records = world_records(source.read(World::state));
         records.extend(source.sim(sim_records));
 
         let replica = vault();
@@ -219,7 +219,7 @@ mod tests {
             w.enter("b", "B", from.clone()).unwrap();
             assert!(w.ride_lift("a", dest));
         });
-        let records = source.read(world_records);
+        let records = world_records(source.read(World::state));
         assert_eq!(records["lift"]["waiting"], json!({"a": dest}));
         assert_eq!(records["lift"]["riders"], json!({}));
 
@@ -235,7 +235,11 @@ mod tests {
             assert_eq!(w.riding("b"), None, "not riding at the source");
             assert_eq!(w.lift_within("a"), (false, false, Vec::new()));
         });
-        assert_eq!(replica.read(world_records), records, "the same lift");
+        assert_eq!(
+            world_records(replica.read(World::state)),
+            records,
+            "the same lift"
+        );
     }
 
     /// **A replica given the records is the world the authority has.**
@@ -267,7 +271,7 @@ mod tests {
             assert!(w.ride_lift("waits", 0));
             w.set_off("walks", shaft[top].clone()).unwrap();
         });
-        let records = source.read(world_records);
+        let records = world_records(source.read(World::state));
         assert!(records["body/walks"]["walk"].is_object(), "{records:?}");
 
         let replica = vault();
@@ -278,7 +282,7 @@ mod tests {
         });
         apply(&replica, &records);
         assert_eq!(replica.read(World::state), source.read(World::state));
-        assert_eq!(replica.read(world_records), records);
+        assert_eq!(world_records(replica.read(World::state)), records);
     }
 
     /// **A bot's DM is one of the world's records**: written with them,

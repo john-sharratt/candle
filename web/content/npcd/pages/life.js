@@ -35,6 +35,7 @@
 
 import { API } from '../lib/api.js';
 import { h, mount } from '/common/lib/dom.js';
+import { pollWhileVisible } from '/common/lib/visible.js';
 import { toast, mayEdit, roNote, empty, confirmDialog } from '../lib/ui.js';
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
@@ -46,7 +47,7 @@ const dayKey = (y, m, d) => `${pad(y, 4)}-${pad(m)}-${pad(d)}`;
 /* Page state. Held in a module-level object rather than threaded through every
  * renderer: the page is one editor over one plan, and passing it down six
  * levels would be ceremony around a single subject. */
-const S = { who: null, plan: null, catalog: null, job: null, tab: 'story', year: null, month: null, poll: 0, writtenOnly: false };
+const S = { who: null, plan: null, catalog: null, job: null, tab: 'story', year: null, month: null, poll: null, writtenOnly: false };
 
 /* Whether a stratum has anything in it yet.
  *
@@ -132,7 +133,7 @@ export async function render(params, q) {
   /* The poll is the page's only timer and it belongs to the page. Left running,
    * the console would keep asking the daemon about a job nobody is watching for
    * as long as the tab stayed open. */
-  return { el: host, teardown: () => { if (S.poll) { clearInterval(S.poll); S.poll = 0; } } };
+  return { el: host, teardown: () => { if (S.poll) { S.poll(); S.poll = null; } } };
 }
 
 async function reload() {
@@ -266,14 +267,16 @@ function header(host) {
 function overlay(host) {
   const j = S.job;
   const pct = Math.round((j.progress || 0) * 100);
-  if (!S.poll) S.poll = setInterval(async () => {
+  if (!S.poll) S.poll = pollWhileVisible(1200, async () => {
     S.job = await API.getLifeJob(S.who).catch(() => null);
     /* Finished: the plan has changed underneath, so the whole page is redrawn.
      * Still running: only the overlay, because the rest of the page may hold an
      * editor with unsaved text in it. */
-    if (!S.job || S.job.outcome) { clearInterval(S.poll); S.poll = 0; redraw(host); }
-    else tick(host);
-  }, 1200);
+    if (!S.job || S.job.outcome) {
+      if (S.poll) { S.poll(); S.poll = null; }
+      redraw(host);
+    } else tick(host);
+  });
   return h('div', { class: 'life-progress' },
     h('div', { class: 'life-phases' },
       ...(cat().phases || []).map((p) => h('span', {

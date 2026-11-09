@@ -30,20 +30,19 @@ pub fn highest_epoch(shared: &SharedSubstrate, wid: &str) -> u64 {
 }
 
 /// Write a beat's `changes` to world `wid`, stamped with `epoch`, in one
-/// commit.
+/// commit. Taken by value: each changed value moves into its record.
 pub fn write(
     shared: &SharedSubstrate,
     wid: &str,
-    changes: &Changes,
+    changes: Changes,
     epoch: u64,
 ) -> PersistenceResult<()> {
-    let objs: Vec<CustomObjectPayload> = changes
-        .put
-        .iter()
-        .map(|(name, v)| CustomObjectPayload::new(key(wid, name), v.clone()))
+    let Changes { put, ceased } = changes;
+    let objs: Vec<CustomObjectPayload> = put
+        .into_iter()
+        .map(|(name, v)| CustomObjectPayload::new(key(wid, &name), v))
         .chain(
-            changes
-                .ceased
+            ceased
                 .iter()
                 .map(|name| CustomObjectPayload::ceased(key(wid, name))),
         )
@@ -94,13 +93,13 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        write(&s, "w1", &diff(&Records::new(), &first), 5).unwrap();
-        write(&s, "w2", &diff(&Records::new(), &first), 5).unwrap();
+        write(&s, "w1", diff(&Records::new(), &first), 5).unwrap();
+        write(&s, "w2", diff(&Records::new(), &first), 5).unwrap();
         assert_eq!(read(&s, "w1"), first);
 
         let mut second = first.clone();
         second.remove("body/a");
-        write(&s, "w1", &diff(&first, &second), 5).unwrap();
+        write(&s, "w1", diff(&first, &second), 5).unwrap();
         assert_eq!(read(&s, "w1"), second);
         assert_eq!(read(&s, "w2"), first);
         assert_eq!(highest_epoch(&s, "w1"), 5);
@@ -120,15 +119,15 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        write(&s, "w1", &diff(&Records::new(), &records), 5).unwrap();
-        write(&s, "w2", &diff(&Records::new(), &records), 5).unwrap();
+        write(&s, "w1", diff(&Records::new(), &records), 5).unwrap();
+        write(&s, "w2", diff(&Records::new(), &records), 5).unwrap();
         assert_eq!(cease_world(&s, "w1", 6).unwrap(), 2);
         assert!(read(&s, "w1").is_empty());
         assert_eq!(read(&s, "w2"), records);
         let late: Records = [("body/a".to_string(), json!({"at": "hall/window"}))]
             .into_iter()
             .collect();
-        write(&s, "w1", &diff(&Records::new(), &late), 5).unwrap();
+        write(&s, "w1", diff(&Records::new(), &late), 5).unwrap();
         assert!(read(&s, "w1").is_empty(), "an earlier epoch stays dead");
     }
 }
