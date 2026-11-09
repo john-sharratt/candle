@@ -458,10 +458,22 @@ const MOVES_PER_BATCH: usize = 512;
 ///
 /// A capped plan is reported as `plan_capped`, not as `clipped`: it is only progress
 /// when the pass also reclaimed something.
+///
+/// Sized for a pass of [`CAP_BUDGET`]; a pass given a longer budget plans in
+/// proportion, so it claims what that many passes would have.
 const PLANNED_MOVES_PER_POOL: usize = 32_768;
 
-/// One pool's plan cap: [`PLANNED_MOVES_PER_POOL`], or one whole arena of the pool
-/// when that is more.
+/// The pass budget [`PLANNED_MOVES_PER_POOL`] was measured against.
+const CAP_BUDGET: Duration = Duration::from_millis(80);
+
+/// One pool's plan cap for a pass of `budget`: [`PLANNED_MOVES_PER_POOL`] scaled by
+/// `budget / CAP_BUDGET`, or one whole arena of the pool when that is more.
+///
+/// **Scaled with the budget, so one long pass does the work of several short
+/// ones.** What a pass's holders cost to sweep does not depend on what it moved —
+/// the substrate walks every residence whatever the map holds — so a caller that
+/// would otherwise run passes back to back buys the same moves for one sweep by
+/// running one pass of their combined budget.
 ///
 /// **A pass must be able to empty the arena holding the frontier, not just drain
 /// it.** Allocation is leftmost by address, so once a pass has packed every lower
@@ -472,8 +484,10 @@ const PLANNED_MOVES_PER_POOL: usize = 32_768;
 /// emptied in one pass: on Qwen3-30B-A3B the class-0 arena at the frontier was
 /// planned first on pass after pass, and its live count went 2,499 → 7,266 →
 /// 4,957 → 2,750 → 5,228 with the frontier pinned at 364 regions.
-fn planned_moves_cap(key: ArenaKey) -> usize {
-    PLANNED_MOVES_PER_POOL.max(key.chunks())
+fn planned_moves_cap(key: ArenaKey, budget: Duration) -> usize {
+    let scaled =
+        (PLANNED_MOVES_PER_POOL as u128 * budget.as_micros() / CAP_BUDGET.as_micros()) as usize;
+    scaled.max(key.chunks())
 }
 
 /// The copy plan, as the migration kernel wants it: one entry per relocated slot,
@@ -811,7 +825,7 @@ impl super::backing::ChunkedKvBacking {
             .collect();
         let plans: Vec<CompactPlan> = census_by_pool
             .iter()
-            .filter_map(|(key, census)| plan_pool(census, *key, planned_moves_cap(*key)))
+            .filter_map(|(key, census)| plan_pool(census, *key, planned_moves_cap(*key, budget)))
             .collect();
         // A pool cut short has work left, which the next pass resumes — reported apart
         // from the budget's clip; see `CompactionReport::plan_capped`.
@@ -2031,9 +2045,32 @@ mod tests {
             ArenaLocation::Gpu,
         );
         assert_eq!(smallest.chunks(), 52_428);
-        assert_eq!(planned_moves_cap(smallest), 52_428);
+        assert_eq!(planned_moves_cap(smallest, CAP_BUDGET), 52_428);
         assert_eq!(largest.chunks(), 1_024);
-        assert_eq!(planned_moves_cap(largest), 32_768);
+        assert_eq!(planned_moves_cap(largest, CAP_BUDGET), 32_768);
+    }
+
+    /// A pass of three times the budget plans three times the moves a pool, so it
+    /// claims what three passes would and its holders are swept once; the one-arena
+    /// floor still holds under a short budget.
+    #[test]
+    fn a_pools_plan_cap_scales_with_the_budget() {
+        let smallest = ArenaKey::new(SizeClass::from_index(0).unwrap(), ArenaLocation::Gpu);
+        let largest = ArenaKey::new(
+            SizeClass::from_index(SizeClass::COUNT - 1).unwrap(),
+            ArenaLocation::Gpu,
+        );
+        let triple = Duration::from_millis(240);
+        assert_eq!(planned_moves_cap(largest, triple), 98_304);
+        assert_eq!(planned_moves_cap(smallest, triple), 98_304);
+        assert_eq!(
+            planned_moves_cap(largest, Duration::from_millis(40)),
+            16_384
+        );
+        assert_eq!(
+            planned_moves_cap(smallest, Duration::from_millis(40)),
+            52_428
+        );
     }
 
     /// The figure the pass is judged by is the frontier's fall, not the move count

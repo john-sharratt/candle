@@ -710,6 +710,19 @@ turn given fewer — a layer unit with two tools, a file's reading with
 - Named-tool steering (`scheduler/named_tool.rs`) picks among the held arms, so
   reasoning that names a tool the turn was not given steers nothing.
 
+**A tool called at most once a turn** (`never_twice` on its definition) is held
+out of every later name branch of the turn once a call has named it
+(`NeverTwice`, `stencil/never_twice.rs`). Which tools are spent is the walk's
+own record — the session notes each call's tool as its name branch completes —
+so the driver narrows each name branch as it enters it: the turn's held arms
+when it has them, the branch's whole catalog when it does not, less the spent
+tools' arms. A branch is never narrowed to nothing. `journal_note` is the case:
+a round's opening call is held to it, the calls after it to the turn's tools,
+and those offered the note again — a model wrote the same note twice, word for
+word, where its thinking had planned a listing. zend sets the flag in the tool's
+YAML and holds every name and alias of a flagged tool out
+(`tools::never_twice_names`).
+
 **Cost.** The compiled tree is shared and unchanged. A held registry adds one
 table of `(branch node, arms)` — a few tokens per given tool per call level —
 built once for the conversation that runs under it (a layer unit, or once at

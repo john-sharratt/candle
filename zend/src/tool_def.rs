@@ -82,6 +82,14 @@ pub struct ToolDef {
     /// not get them.
     #[serde(default)]
     pub mandatory: bool,
+    /// Called at most once a turn: once a call names it, the tool-call grammar
+    /// offers it to no later call of the same turn
+    /// (`candle_conversation::stencil::NeverTwice`). For a tool whose second
+    /// call in a turn is never what the turn needs — `journal_note`, the note a
+    /// round opens with, which a model wrote twice, word for word, in place of
+    /// the call its thinking had planned.
+    #[serde(default)]
+    pub never_twice: bool,
     /// JSON Schema for the call arguments (the tool's Request type).
     pub parameters: Value,
     /// ChatML selection-calibration trajectories (prompt + `<|im_end|>
@@ -401,6 +409,7 @@ mod tests {
             description: description.to_string(),
             high_risk: false,
             mandatory: false,
+            never_twice: false,
             parameters: params,
             examples: vec!["list the files<|im_end|>".to_string()],
             questions: vec!["what files are here".to_string()],

@@ -1711,8 +1711,11 @@ impl InferenceState {
             if tool_sections.is_empty() || specs.is_empty() {
                 return Ok(Arc::new(TriggerRegistry::new()));
             }
+            // A tool a turn calls once is held out of every later call of the
+            // turn, by every registry held from this one.
             engine
                 .compile_tool_stencil(&specs)
+                .map(|triggers| engine.never_twice(&triggers, &crate::tools::never_twice_names()))
                 .map_err(|e| anyhow::anyhow!("{} tool stencil compile: {e}", mode.id()))
         };
         let [none, restricted, comprehensive] = ToolMode::ALL.map(compile);

@@ -68,6 +68,7 @@ pub(crate) mod projection_assembler;
 mod projection_identity;
 mod rates_store;
 mod recurrent_park;
+mod relief_pacing;
 pub mod relief_trace;
 mod reproject_abandon;
 mod request_laps;
@@ -106,6 +107,7 @@ use section_pages::SectionPages;
 
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
+use self::relief_pacing::ReliefPacing;
 use self::request_laps::RequestLaps;
 use self::wave_timing::WaveTiming;
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
@@ -3925,6 +3927,8 @@ pub(crate) struct Scheduler {
     wave_step_creep_layer_rows: usize,
     /// The layers of creep the last wave step swept; zero as above.
     wave_step_creep_layers: usize,
+    /// When the section gate's relief may run next (`relief_pacing`).
+    section_relief_pacing: ReliefPacing,
     /// The query×key pairs the creep attended through those layers this step.
     wave_step_creep_layer_pairs: f64,
     /// Consecutive failures of the decode-less wave step and the wait owed
@@ -4291,6 +4295,7 @@ impl Scheduler {
             creep_layer_cost: None,
             wave_step_creep_layer_rows: 0,
             wave_step_creep_layers: 0,
+            section_relief_pacing: ReliefPacing::default(),
             wave_step_creep_layer_pairs: 0.0,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),

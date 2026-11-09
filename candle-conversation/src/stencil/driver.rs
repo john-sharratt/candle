@@ -15,6 +15,7 @@ use std::sync::Arc;
 use super::held_arms::HeldBranches;
 use super::held_values::HeldValues;
 use super::mask::AllowedSet;
+use super::never_twice::NeverTwice;
 use super::session::{Observe, StencilAction, StencilSession};
 use super::tree::{NodeId, StencilTree};
 use super::vocab::TokenId;
@@ -174,6 +175,8 @@ pub struct StencilDriver {
     stats: PathStats,
     /// The arms each held branch is narrowed to, for the whole walk.
     held: Option<Arc<HeldBranches>>,
+    /// The tools the turn may call once ([`Self::never_twice`]).
+    never_twice: Option<Arc<NeverTwice>>,
     /// The branch being written under a hold, if one is.
     hold: Option<ArmHold>,
 }
@@ -186,8 +189,21 @@ impl StencilDriver {
             done: false,
             stats: PathStats::default(),
             held: None,
+            never_twice: None,
             hold: None,
         }
+    }
+
+    /// Hold out of every name branch a tool of `tools` the walk has already
+    /// named ([`NeverTwice`]): a turn calls each of them at most once.
+    pub fn never_twice(&mut self, tools: Arc<NeverTwice>) {
+        self.never_twice = Some(tools);
+    }
+
+    /// The branch the cursor is in and whether it waits on its first token
+    /// ([`StencilSession::in_branch`]).
+    pub fn in_branch(&self) -> Option<(NodeId, bool)> {
+        self.session.in_branch()
     }
 
     /// Hold every branch `held` names to its arms: each masked step of such a
@@ -347,8 +363,19 @@ impl StencilDriver {
         if !at_root {
             return;
         }
-        if let Some(arms) = self.held.as_ref().and_then(|h| h.arms_at(node)) {
-            self.hold = ArmHold::new(node, Arc::clone(arms));
+        let held = self.held.as_ref().and_then(|h| h.arms_at(node)).cloned();
+        // A tool the turn calls once, already named, is held out of this name
+        // branch — narrowing the turn's hold when there is one, the branch's
+        // whole catalog when there is not.
+        let narrowed = self.never_twice.as_ref().and_then(|once| {
+            let arms: Vec<Vec<TokenId>> = match &held {
+                Some(arms) => arms.to_vec(),
+                None => self.tree().branch(node)?.arms(),
+            };
+            once.narrow(self.tree(), node, &arms, self.session.named_tools())
+        });
+        if let Some(arms) = narrowed.or(held) {
+            self.hold = ArmHold::new(node, arms);
         }
     }
 

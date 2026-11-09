@@ -29,7 +29,7 @@ use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
     compile, compile_steps_tail, compile_think_tree, compile_tool_call_loop, held_branches,
-    held_branches_first, HeldRules, HeldValues, HfVocab, StencilTree, ThinkMode,
+    held_branches_first, HeldRules, HeldValues, HfVocab, NeverTwice, StencilTree, ThinkMode,
     ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
     ValueHolds, MAX_TOOL_CALLS_PER_TURN,
 };
@@ -2270,6 +2270,25 @@ impl ConversationEngine {
             return Arc::clone(triggers);
         }
         Arc::new(triggers.holding_values(trigger, Arc::new(held)))
+    }
+
+    /// `triggers` with every turn's tool calls naming each of `tools` at most
+    /// once ([`NeverTwice`]): once a call names one, no later call of the turn
+    /// can. Applied to a compiled catalog, every registry held from it carries
+    /// it. `triggers` without a tool call, or no tools, come back as they are.
+    pub fn never_twice(
+        &self,
+        triggers: &Arc<TriggerRegistry>,
+        tools: &[String],
+    ) -> Arc<TriggerRegistry> {
+        let Some(trigger) = self.core.tokenizer.token_to_id("<tool_call>") else {
+            return Arc::clone(triggers);
+        };
+        let once = NeverTwice::new(tools);
+        if once.is_empty() || triggers.tree_for(trigger).is_none() {
+            return Arc::clone(triggers);
+        }
+        Arc::new(triggers.never_twice(trigger, Arc::new(once)))
     }
 
     /// `triggers` with an answer that ends written on into its `Steps:`

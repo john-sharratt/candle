@@ -18,6 +18,7 @@ questions:
 - keep the conclusion from my reasoning so I still have it later
 category: Journal
 mandatory: true
+never_twice: true
 description: "Note a short mental note: a conclusion your thinking reached — what you found, what you decided, what you mean to do next, what you ruled out and why. Your thinking is gone a turn after you write it; a note stays, kept in your journal's current entry, so you still see it as the work goes on and it feeds the entry written for this stretch. A turn that makes calls opens with one: leave `journal` out for it. Keep each to a sentence or two of what the thinking settled, not a retelling of it. Returns `noted`. Only to keep something in the shared memory — what was learned about a person, a topic — name its journal (`people/<person>`, `topics/<topic>`): everyone in the group reads that line, and from a turn that read the web or a remote session it waits for the person's approval. A memory line you concluded yourself is `by: assistant`, and on a topic it needs its `source` (a doc section, file:line, commit or URL); `expires` hides it from a date on, and `replaces: \"#<line id>\"` supersedes a line it corrects."
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

@@ -515,6 +515,22 @@ pub fn tool_catalog() -> &'static [ToolSpec] {
     })
 }
 
+/// Every name — a tool's own and each alias it answers to — of the tools a turn
+/// calls at most once ([`crate::tool_def::ToolDef::never_twice`]). The grammar
+/// names an alias's arm by the alias, so a tool held out under its own name
+/// would still be writable under another.
+pub fn never_twice_names() -> Vec<String> {
+    crate::tool_def::all()
+        .iter()
+        .filter(|d| d.never_twice)
+        .flat_map(|d| {
+            iter::once(d.name.as_str())
+                .chain(registry::aliases(&d.name).iter().copied())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// The specs of [`tool_catalog`] that `mode` offers, aliases included: what a
 /// turn in `mode` compiles its tool stencil from. The grammar admits only the
 /// names it was compiled from, so a turn cannot decode a call to a tool its
@@ -1030,7 +1046,23 @@ mod tests {
     use zend_tools::state::sessions::{CodeEntry, SessionMeta};
     use zend_vfs::RepoSpec;
 
+    use crate::journal::notes::JOURNAL_NOTE_TOOL;
     use crate::journal::shelf::{Lazy, Shelf};
+
+    /// **The note a round opens with is called at most once a turn**, under its
+    /// own name and every alias it answers to — and an ordinary tool is not.
+    #[test]
+    fn journal_note_is_called_at_most_once_a_turn() {
+        let once = never_twice_names();
+        assert!(once.contains(&JOURNAL_NOTE_TOOL.to_string()));
+        for alias in registry::aliases(JOURNAL_NOTE_TOOL) {
+            assert!(
+                once.contains(&alias.to_string()),
+                "alias {alias} is held out too"
+            );
+        }
+        assert!(!once.contains(&"file_list".to_string()));
+    }
 
     /// A code session opened by the round `ctx` runs.
     fn open_code_session(ctx: &ToolContext, id: &str) {

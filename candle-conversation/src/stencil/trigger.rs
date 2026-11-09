@@ -10,6 +10,7 @@ use std::sync::Arc;
 use super::driver::StencilDriver;
 use super::held_arms::HeldBranches;
 use super::held_values::HeldValues;
+use super::never_twice::NeverTwice;
 use super::session::StencilSession;
 use super::tree::StencilTree;
 use super::vocab::TokenId;
@@ -37,6 +38,8 @@ struct Binding {
     /// The values the walk's keyed fields are held to (see
     /// [`TriggerRegistry::holding_values`]).
     values: Option<Arc<HeldValues>>,
+    /// The tools a walk calls at most once (see [`TriggerRegistry::never_twice`]).
+    never_twice: Option<Arc<NeverTwice>>,
 }
 
 impl Binding {
@@ -48,6 +51,7 @@ impl Binding {
             min_reasoning: 0,
             unreasoned: None,
             values: None,
+            never_twice: None,
         }
     }
 }
@@ -188,6 +192,18 @@ impl TriggerRegistry {
         out
     }
 
+    /// A copy of this registry in which every walk `token` starts calls each of
+    /// `tools` at most once ([`StencilDriver::never_twice`]). An unbound
+    /// `token` leaves the registry as it is.
+    #[must_use]
+    pub fn never_twice(&self, token: TokenId, tools: Arc<NeverTwice>) -> Self {
+        let mut out = self.clone();
+        if let Some(binding) = out.by_token.get_mut(&token) {
+            binding.never_twice = Some(tools);
+        }
+        out
+    }
+
     /// The tree `token` starts, when it is a trigger.
     pub fn tree_for(&self, token: TokenId) -> Option<&Arc<StencilTree>> {
         self.by_token.get(&token).map(|b| &b.tree)
@@ -243,6 +259,9 @@ impl TriggerRegistry {
             }
             if let Some(values) = &b.values {
                 driver.hold_values(Arc::clone(values));
+            }
+            if let Some(tools) = &b.never_twice {
+                driver.never_twice(Arc::clone(tools));
             }
             driver
         })

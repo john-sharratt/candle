@@ -128,6 +128,10 @@ pub struct StencilSession {
     active: Option<Arc<ValueRule>>,
     /// What the walk has written of the call it is in.
     call: CallSoFar,
+    /// The tool of every call the walk has named, in order — what a tool that
+    /// may be called once a turn is held out against
+    /// ([`NeverTwice`](super::NeverTwice)).
+    named: Vec<Arc<str>>,
 }
 
 impl StencilSession {
@@ -144,7 +148,13 @@ impl StencilSession {
             held: None,
             active: None,
             call: CallSoFar::default(),
+            named: Vec::new(),
         }
+    }
+
+    /// The tool of every call the walk has named so far, in order.
+    pub fn named_tools(&self) -> &[Arc<str>] {
+        &self.named
     }
 
     /// Hold every keyed field the walk writes to `held`: entering a span that
@@ -552,6 +562,9 @@ impl StencilSession {
     /// names.
     fn name_call(&mut self, node: NodeId, arm: &[TokenId]) {
         let tool = self.tree.tool_named(node, arm).cloned();
+        if let Some(tool) = &tool {
+            self.named.push(Arc::clone(tool));
+        }
         self.call.named(tool);
     }
 

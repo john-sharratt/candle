@@ -272,6 +272,35 @@ impl PackGoal {
             Self::Ground => sched.ground_pass(),
         }
     }
+
+    /// Wall-clock one pass may spend **planning and claiming**; the pass plans in
+    /// proportion (`compact.rs`, `planned_moves_cap`).
+    ///
+    /// A budget rather than a move cap: the ladder spans 320 B to 16 KiB, so the
+    /// same "one move" is fifty times the bandwidth at one rung and a count cannot
+    /// bound a duration. The census and the claims are separately bounded inside it
+    /// (see `compact_backings`).
+    ///
+    /// **The wave loop's pass is 80 ms.** At 8 ms every pass clipped and handed back
+    /// a single arena; at 20 ms the census alone spent the budget and 37 of 40
+    /// attempts claimed nothing; at 40 ms 31 of 42 passes clipped and a mass eviction
+    /// left the pools at 71%. The loop's own housekeeping already spends 40–66 ms on
+    /// the promote pass at this point, so a pass of this order is in proportion to
+    /// the gap it runs in.
+    ///
+    /// **Relief's is three of those, because its passes ran back to back and each
+    /// paid the sweep.** The sweep walks every residence of every substrate whatever
+    /// the pass moved: on BlackWorld (2026-11-10) 111–158 ms a pass, ~75% of the
+    /// pass, against a census of ~6 ms and a plan of ~11. A relief's settle ran up to
+    /// three passes to absorb a burst, so one pass of the three budgets claims the
+    /// same moves and sweeps once — ~280 ms off a large relief. The settle loop still
+    /// follows a pass that clips.
+    fn budget(self) -> Duration {
+        match self {
+            Self::Frontier => Duration::from_millis(80),
+            Self::Ground => Duration::from_millis(240),
+        }
+    }
 }
 
 /// What one KV compaction pass did: the arenas it emptied and handed back, and whether
@@ -1513,27 +1542,6 @@ impl Scheduler {
     /// locations (a forward, a hot→warm migrate group, a cold-writer free), which is
     /// the one answer that changes by asking again shortly.
     pub(super) fn pack_kv_pools(&mut self, goal: PackGoal) -> Option<PackPass> {
-        /// Wall-clock a single pass may spend **planning and claiming**. A budget
-        /// rather than a move cap: the ladder spans 320 B to 16 KiB, so the same
-        /// "one move" is fifty times the bandwidth at one rung and a count cannot
-        /// bound a duration.
-        ///
-        /// Generous, because the copies are one launch and the *walks* are what the
-        /// clock bounds — the occupancy census over every arena of every rung, then
-        /// the claims. At 8 ms the pass clipped on every run and handed back a single
-        /// arena with the frontier where it started; at 20 ms the census alone spent
-        /// the budget and 37 of 40 attempts claimed nothing. Both halves are now
-        /// separately bounded (see `compact_backings`), and this is sized so each has
-        /// room: the wave loop's own housekeeping already spends 40–66 ms on the
-        /// promote pass at this point, so a pass of this order is in proportion to
-        /// what the gap already costs.
-        /// Measured at 40 ms: 31 of 42 passes clipped, and the pools held 94–99%
-        /// except through the first mass eviction, where 24 conversations retiring at
-        /// once left one 1.5 s sample at 71%. A clipped pass is not wasted — it packs a
-        /// prefix and the next resumes closer — but through a burst the arrival rate is
-        /// what has to be matched, and clipping every pass means it never is.
-        const BUDGET: std::time::Duration = std::time::Duration::from_millis(80);
-
         let Some((shape, FrontierPass::Kv)) = goal.pass(self) else {
             return Some(PackPass::default());
         };
@@ -1586,7 +1594,7 @@ impl Scheduler {
         let mut idle_us = 0u128;
         let outcome = {
             let _g = super::profile::span("compact:kv");
-            self.session.compact_kv(BUDGET, &mut |sweep| {
+            self.session.compact_kv(goal.budget(), &mut |sweep| {
                 for (s, idle) in substrates.iter().zip(&idle) {
                     let t = std::time::Instant::now();
                     swept += s.rewrite_for_compaction(sweep)?;
@@ -5290,17 +5298,30 @@ impl Scheduler {
         // trail and are discarded).
         if seq_ids.is_empty() {
             let section = if !self.wave_cohort_advanced && !self.wave_section_advanced {
-                // Relief for the section batch, and so only when there is one to
-                // build (`section_batch_band`, the predicate the build asks
-                // first). Run on every decode step with nothing to ingest, it
-                // packed for a batch that did not exist: on BlackWorld
+                // **Beside a person's turn, only for a section batch there is.**
+                // While an `Urgent` decode runs — someone waiting on it token by
+                // token — this relief is for the section batch alone, and runs
+                // only when there is one to build (`section_batch_band`, the
+                // predicate the build asks first). Run on every step regardless,
+                // it packed for a batch that did not exist: on BlackWorld
                 // (2026-11-09, one dialogue reprojecting over 200K of history,
                 // `queued_sections=0` throughout) five of these in one reply
                 // spent 300–1,050 ms each repacking the pools after the
                 // projection's recalls, and every decode wave behind one ran at
-                // 60–98 ms a forward against 34–39.
-                if self.vram_under_pressure() && self.section_batch_band().is_some() {
+                // 60–98 ms a forward against 34–39. With no one waiting it also
+                // keeps the setpoint for the work to come.
+                //
+                // **Paced either way** (`relief_pacing`): at most a tenth of the
+                // scheduler's time, each wait priced by the last relief's cost.
+                let urgent = self
+                    .foreground_decodes()
+                    .any(|sid| self.decode_priority_or_high(sid) == DecodePriority::Urgent);
+                let wanted = !urgent || self.section_batch_band().is_some();
+                let now = std::time::Instant::now();
+                if wanted && self.section_relief_pacing.ready(now) && self.vram_under_pressure() {
                     self.relieve_vram_pressure("section", VramPhase::Load, ReliefNeed::Paced);
+                    let ended = std::time::Instant::now();
+                    self.section_relief_pacing.ran(ended, ended - now);
                 }
                 let _g = super::profile::span("loop:wave:build_section");
                 self.build_section_batch()
