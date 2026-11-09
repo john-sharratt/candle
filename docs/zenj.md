@@ -429,6 +429,10 @@ if the card's outputs are DisplayPort) — not cast, which adds seconds of delay
   bars. A scene change begins early by the screen's lag (the TV's measured `latency_ms`) and by how
   long its preset loads have been taking, the slowest of late counted (`screens/ahead.rs`), and the
   next preset's file is read off the render thread a phrase ahead, so no change waits on the disk.
+- **The end of the world.** On New Year's Eve the main screen is Battle Cities' Phase 20: Zen ends
+  the game's world on the beat of the set, and the world ends at midnight. ZenJ writes Zen's pulse
+  schedule ahead from the same plan the lights use, and anyone in the game can listen to the set.
+  Designed in Battle Cities' `docs/03-GAMEPLAY/THE-END.md`.
 
 While rekordbox is open BlackWorld is reserved (§3.1): no builds, no ingest or calibration, and its
 member drained while another serves every app, so the cores and the card's work are the decks' and
