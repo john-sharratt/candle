@@ -246,6 +246,23 @@ fn means_the_same(a: &str, b: &str, close: f32) -> bool {
     shared / either >= close
 }
 
+/// Whether `text` says again what one of `lines` — a thread's last
+/// [`SPEECH_LOOKBACK`] lines of the speaker's own — already said: speech's
+/// overlap, [`SPEECH_CLOSE`].
+///
+/// **It judges and records nothing** (`docs/npc_conversations.md` §8). A
+/// conversation asks it of the words it is about to send on one thread, and a
+/// repeat changes where those words go, to the journal, rather than striking
+/// the character's speech: a strike carried forward would silence a person's
+/// next sixteen messages.
+pub fn would_repeat(lines: &[&str], text: &str) -> bool {
+    lines
+        .iter()
+        .rev()
+        .take(SPEECH_LOOKBACK)
+        .any(|said| means_the_same(said, text, SPEECH_CLOSE))
+}
+
 /// Two drafts that are the same text, whitespace aside.
 fn same_text(a: &str, b: &str) -> bool {
     a.split_whitespace().eq(b.split_whitespace())
@@ -411,6 +428,32 @@ impl LoopGuards {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A thread's own last four lines are what a new one repeats**, by
+    /// speech's looser overlap, and asking records nothing.
+    #[test]
+    fn a_line_repeats_only_what_its_thread_last_said() {
+        let parcel = "The parcel came this morning and is waiting at the front door beside the \
+                      green bins.";
+        let said = [parcel, "I put the bins out before breakfast."];
+        assert!(would_repeat(
+            &said,
+            "The parcel came this morning, and it is waiting by the front door beside the \
+             green bins."
+        ));
+        assert!(!would_repeat(&said, "Mira asked about the garden report."));
+        let old = [
+            parcel,
+            "seven eight nine ten eleven twelve thirteen",
+            "fourteen fifteen sixteen seventeen eighteen nineteen",
+            "twenty twentyone twentytwo twentythree twentyfour twentyfive",
+            "thirty thirtyone thirtytwo thirtythree thirtyfour thirtyfive",
+        ];
+        assert!(
+            !would_repeat(&old, parcel),
+            "a line five back is outside the lookback"
+        );
+    }
     use serde_json::json;
 
     fn act(tool: &'static str, args: serde_json::Value) -> Act {

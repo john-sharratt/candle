@@ -30,6 +30,7 @@ use host::guard::{Api, Guarded, Routes};
 use host::{OneShot, Running, Tenant, TenantContext, TenantUi, MODEL};
 use include_dir::{include_dir, Dir};
 use serde::Deserialize;
+use journals::slug::Slug;
 use serde_json::Value;
 use tokio::runtime::Handle;
 use tokio::task::{spawn_blocking, JoinHandle};
