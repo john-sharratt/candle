@@ -1,6 +1,6 @@
 # ZenJ — Zen as DJ
 
-**Status: built (`zenj/`, 2026-11-08), except the lights (§9), which are planned; the spikes of §12 run on BlackWorld against it.** First
+**Status: built (`zenj/`, 2026-11-08; the lights, §9, 2026-11-09, waiting on their bulbs); the spikes of §12 run on BlackWorld against it.** First
 use: New Year's Eve 2026, at home, on BlackWorld. Supersedes
 the listener design on branch `zen/docs-midi-dj-set` (`docs/midi_dj_set.md`), whose findings about
 MIDI are kept where they still apply (§6.1) and whose architecture — a passive listener inside
@@ -58,25 +58,25 @@ Automix stays, as the safety net below ZenJ (§7.4), not as ZenJ.
  │                         the conductor (§6) — beat-accurate, no model           │
  │                                   │ virtual MIDI          ▲ deck state        │
  │  visuals (§8) ◄── beat + audio     ▼                       │ (memory reader)   │
- │  lights (§9)  ◄── beat + energy   planned: UDP, no ack      │                   │
+ │  lights (§9)  ◄── beat + energy   UDP, no ack               │                   │
  └────────────────────────────── rekordbox 7 ─────────────────┘────────────────┘
                                     │ ▲
                           DDJ-FLX4  │ │  John's / Yen's hands
                       (sound card)  ▼ │
                                   speakers
 
- lights (§9), planned:  UDP JSON :38899 ──► the ~20 bulbs on their own 2.4 GHz SSID
+ lights (§9):           UDP JSON :38899 ──► the ~20 bulbs on their own 2.4 GHz SSID
                         (never through the cloud; never through rekordbox)
 ```
 
-Four loops, each at the speed its job needs — the lights thread planned (§9):
+Four loops, each at the speed its job needs:
 
 | Loop | Period | Runs | Never |
 |---|---|---|---|
 | Conductor | per beat, ~10 ms precision | executes the transition plan through MIDI; verifies what it did | calls a model, waits on the network |
 | Brain | per track, minutes; seconds when the conversation asks | set plan, next-track choice, transition plan | touches MIDI directly |
 | Zen | seconds | chooses among the shortlist, reacts to the conversation, writes the set up | runs the beat |
-| Lights *(planned)* | on beats and phrase boundaries, ≤ ~10 msg/s per bulb | sends state changes to the bulbs over UDP; never calls a model, never waits on the network |
+| Lights | on beats and phrase boundaries, ≤ ~10 msg/s per bulb | sends state changes to the bulbs over UDP | calls a model, waits on the network |
 
 The model is never on the beat. Zen has a whole track — three to five minutes — to make each
 choice, and the conductor makes it happen to the beat. That is the "super fast loop": instant
@@ -158,7 +158,7 @@ Each thread does one thing. Samples and touches travel through lock-free single-
 | Room | levels and landing from the captured audio |
 | Runtime (tokio) | the brain (per 500 ms), the request watcher, the tools, the cluster socket |
 | Main | the screens: every window, each frame (§8) |
-| Lights *(planned)* | reads the conductor's beat and the deck reader's snapshot, sends state changes to the bulbs over UDP (§9.3) |
+| Lights | reads the deck reader's snapshot, the live view and the conductor's cues, sends state changes to the bulbs over UDP (§9.3) |
 
 The library is built ahead of the night by commands, not by a thread: `zenj library sync` (taste →
 TIDAL → crates) and `zenj library analyse` (rekordbox's analysis → profiles).
@@ -394,8 +394,9 @@ music.
 | `zenj` crashes | `zenj watch` starts it again; rekordbox keeps playing the loaded track and Automix continues |
 | rekordbox crashes | Opened again by Zen (`zenj_rekordbox`) or by hand; the crates live in TIDAL and the offline store, so nothing is lost. The reservation outlasts it by ten minutes, so motherd is not started under the gap |
 | motherd is busy or restarting | No effect: `zenj` needs Zen only for choices, and falls back to the shortlist |
-| A bulb stops answering `getPilot` *(planned)* | marked dead and excluded; the rest of the track carries on (§9.7) |
-| The lights thread dies, or most bulbs are dead *(planned)* | a fixed warm house scene, set once; the screens say so; the audio is untouched |
+| A bulb stops answering `getPilot` | marked dead and excluded; the rest of the track carries on (§9.7) |
+| Most bulbs are dead | the warm house scene; `zenj_now` says which are not answering; the audio is untouched |
+| The lights thread dies | the bulbs hold what they were last sent; nothing else notices, since nothing reads a light |
 
 ### 7.3 Watchdog
 
@@ -428,10 +429,12 @@ While rekordbox is open BlackWorld is reserved and its motherd is held down (§3
 the cores and the memory are the decks' and the screens'. Zen's choices are served by the other
 members.
 
-## 9. Lights *(planned)*
+## 9. Lights
 
-Nothing in this section is built. It is written ahead of the work so the spikes have something to
-disprove, and it is marked planned throughout.
+Built in `zenj/src/lights/` against WiZ's protocol and its tests. The bulbs arrive and are fitted
+after it, and spikes 6–10 run against the real ones. Until `zenj/lights.yaml` names them there is no
+lights thread. ZenJ drives the bulbs **only while rekordbox is open** — the house in Party; the rest
+of the time they are the house's (§9.8).
 
 The party room has about twenty adjustable spotlights on a ceiling track: E27 sockets, A60 globes
 in deep black cowls, aimed in fixed directions. They are being refitted with **WiZ Colour A60 E27
@@ -447,7 +450,8 @@ measures here rather than trusting.
 
 ### 9.1 The fixture map
 
-`zenj/lights.yaml` (planned) lists each bulb once:
+`zenj/lights.yaml` lists each bulb once (`zenj/src/lights/fixtures.rs`), and is refused at load
+when an id or an address is given twice:
 
 | Field | What it is |
 |---|---|
@@ -471,35 +475,44 @@ WiZ is not a streaming protocol. Budget ~10 msg/s per bulb sustained, ~20 in a b
 that as the limit the renderer is designed against rather than the bulb's spec sheet.
 
 The renderer sends **state changes**, not a frame stream: on beats, half-beats at most, and at
-phrase boundaries. A per-bulb token bucket enforces the rate and coalesces — the latest state wins,
-so a bulb that missed four updates arrives at the fifth. Key moments (a drop, midnight) are sent
-twice, ~15 ms apart: UDP has no ack, and one lost datagram is one dark bulb at the moment the room
-was waiting for.
+phrase boundaries. A per-bulb token bucket (`zenj/src/lights/gate.rs`: 10 a second, a burst of 20)
+enforces the rate and coalesces — the latest state wins, so a bulb that missed four updates arrives
+at the fifth. Key moments (a drop, midnight) are sent at once whatever the bucket says, and again
+15 ms later: UDP has no ack, and one lost datagram is one dark bulb at the moment the room was
+waiting for.
 
 The load is twenty bulbs at ≤10 msg/s of ~100-byte datagrams — about 20 KB/s. The network is not
 the limit; the bulb is.
 
 ### 9.3 Where it runs
 
-A `lights` thread, planned under `zenj/src/lights/`, fed by the conductor's beat clock and the
-deck reader's snapshot — the same predicted beat grid the screens use (§4.2, §8). It leads the
-sound by the bulbs' measured latency, calibrated the way the TV's is: spike 8 measures the
-end-to-end delay, and the number goes in the config beside `midi.lead_ms` (`zenj/src/config.rs:85`)
-and each screen's `latency_ms` (`zenj/src/config.rs:101`).
+The `zenj-lights` thread (`zenj/src/lights/run.rs`), every 10 ms, reads the deck reader's
+snapshot — the same beat grid the screens use (§4.2, §8) — and the live view, and takes the
+conductor's cues and the tools' asks from queues. It leads the sound by the bulbs' latency,
+`lights.lead_ms` in `zenj.yaml`: 35 ms, the community figure, until spike 8 measures the room's.
 
-It never calls a model, and it never waits on the network. Sends are non-blocking, and a full
-socket buffer drops the oldest pending update rather than blocking the thread: a light that is late
-is a light that is late, not a beat that is late. Nothing in the audio path waits on a bulb.
+It never calls a model, and it never waits on the network. Its one UDP socket is non-blocking
+(`wire.rs`); a send the socket cannot take is dropped and the gate sends that bulb's state again: a
+light that is late is a light that is late, not a beat that is late. The conductor hands it a cue
+without waiting either. Nothing in the audio path waits on a bulb.
 
 ### 9.4 What drives the look
 
-Energy from the set plan (§5.1) and the room's levels (§4.4) choose the palette and the intensity.
-A phrase boundary changes the scene, on the same 32-beat beat the screens change on
-(`zenj/src/screens/scene.rs:10-11`). The transition plan (§5.3) gets lighting cues as actions in
-the same `(bar, beat, action)` list: a blackout on the bar before a drop, an all-white hit on the
-drop, a slow fade across a long blend. `Plan::steps` is a list of `Step { at, act }` and `Move` is
-where a new action belongs (`zenj/src/plan.rs:11-35`), so a cue is armed, logged and replayed like
-any other move.
+Energy — seven parts the set plan's target (§5.1), three the room's landing (§4.4) — chooses the
+palette and the brightness (`palette.rs`): deep and cool while it warms up, red and white at the
+peak. A phrase boundary changes the scene, on the same 32 beats the screens change on: a wash below
+0.4, a split and a chase in turn through the middle, a pulse from 0.75 (`scene.rs`).
+
+The transition plan (§5.3) carries lighting cues as `Move::Light` (`zenj/src/plan.rs`), so a cue is
+armed, logged and replayed like any other move, and runs only while ZenJ mixes
+(`brain/transition.rs`):
+
+| Style | Cues |
+|---|---|
+| cut | a blackout on the bar before the drop, the hit on it |
+| blend | a wash across the blend |
+| echo out | a wash for its 8 beats |
+| filter sweep | a wash across its 16 beats |
 
 The scene vocabulary is small and named:
 
@@ -515,25 +528,36 @@ The scene vocabulary is small and named:
 
 ### 9.5 Midnight
 
-The lights join the screens' takeover from 23:59:00 (§8). The last ten seconds dim toward dark;
-the midnight drop gets the hit, sent twice; then the planned midnight scene. The run-in is already
-scheduled back from midnight (`zenj/src/brain/midnight.rs:35-51`), so the lighting cues hang off
-the same slots as the tracks. Both full rehearsals rehearse it.
+Midnight is driven from the clock, like the screens' countdown (`director.rs`): the last ten
+seconds are a gold wash dimming from full to the bulbs' floor; at 00:00:00 every bulb gets the hit,
+sent twice; then a minute of gold pulse, and the set's scenes again. The midnight track's drop lands
+on that second (§5.1), so the hit and the drop are one. Both full rehearsals rehearse it.
 
-### 9.6 Modes
+### 9.6 Hands
 
-When a person has the decks (§6.3, `zenj/src/hands.rs:21-32`), the lights keep following the beat
-but Zen's scene choices pause to a simple energy-following default: the room stays lit to what is
-playing, and nothing Zen imagined is imposed on someone who is mixing. A house-lights control is
-available in every mode — the tool in §14 and a control on the screens.
+When a person has the decks (§6.3, `zenj/src/hands.rs`), the lights keep following the beat but
+Zen's scene choices pause to a plain energy-following default — a wash below 0.5, a pulse above —
+and no cue runs: nothing Zen imagined is imposed on someone who is mixing. The house lights are on
+call whoever has the decks (`lights_house`, §14).
 
 ### 9.7 Lights never touch the audio
 
 Lights are the one subsystem that can fail and leave the night untouched. A bulb that stops
-answering `getPilot` — polled at a low rate, every 10 s or so, staggered so twenty bulbs do not
-ask at once — is marked dead and excluded; the rest carry on. If the lights thread dies, or most
-of the bulbs are dead, lights fall to a fixed warm house scene set once and the screens say so.
-Nothing in the audio path reads a light.
+answering `getPilot` — each asked every 10 s, staggered so twenty bulbs do not answer at once, dead
+after three unanswered (`health.rs`) — is excluded and the rest carry on; one that answers again is
+sent its state afresh. With most of the bulbs dead the room falls to the warm house scene, and
+`zenj_now` names the ones not answering. If the thread itself dies the bulbs hold what they were
+last sent. Nothing in the audio path reads a light.
+
+### 9.8 Outside the party
+
+The bulbs are parts of the moon world's front room like the stereo and the TV
+(`docs/house_modes.md`): the survey knows a WiZ bulb by its maker's hardware prefix or the `wiz_`
+name it gives the router, and the world works one with `wiz_on`, `wiz_off`, `wiz_dim`,
+`wiz_colour`, `wiz_white` and `wiz_status` (`effector-bridge/src/profile/wiz.rs`). The house's
+table sets them all at once with `every: wiz`. ZenJ and the house share one wire,
+`effector_bridge::proto::wiz`, and never both drive the bulbs: ZenJ only while rekordbox is open,
+the house's table the rest of the time.
 
 ## 10. Models
 
@@ -601,10 +625,9 @@ Each is a day or less and decides something.
 |---|---|
 | 2026-11-09 → 11-15 | Spikes 1–5. Spotify exports requested. |
 | 11-16 → 11-29 | `zenj` crate: cluster membership, MIDI decoder and observer, conductor, deck reader, TIDAL client, Spotify request watcher, library matching and crates |
-| 11-16 → 11-22 | Lights *(planned)*: spikes 6–10 — fit, fleet, rate and latency, beat test, soak — run alongside the crate work, since the fixture map and the lead constant come out of them |
-| 11-23 → 11-29 | Lights *(planned)*: the sender and the fixture map (§9.1, §9.2, §9.3) |
-| 11-30 → 12-06 | The brain: set plan, shortlist, Zen's choice, transition plans; Zen's tools and event stream. Lights *(planned)*: scenes and cue actions (§9.4) |
-| 12-07 → 12-13 | Screens: scenes, the overlay, the countdown, event mode. Lights *(planned)*: midnight (§9.5), house lights and modes (§9.6) |
+| 11-14 → 11-22 | Lights: the bulbs arrive and are fitted; spikes 6–10 — fit, fleet, rate and latency, beat test, soak — write `zenj/lights.yaml` and replace the rate and the lead with the room's numbers (the lights are built, 2026-11-09) |
+| 11-30 → 12-06 | The brain: set plan, shortlist, Zen's choice, transition plans; Zen's tools and event stream |
+| 12-07 → 12-13 | Screens: scenes, the overlay, the countdown |
 | 12-14 → 12-20 | Rehearsals, fixes, freeze — both rehearsals with the lights on |
 | 12-30 | Offline refresh login |
 | 12-31 | The night |
@@ -621,8 +644,7 @@ rule. `zenj` mounts `mcp_server` at `/v1/zenj/mcp` and declares it, with `/v1/ze
 `/v1/zenj/events`, in its route table (`zenj/src/presence.rs`). `web/web.yaml`'s `code.tokera.com`
 site routes the `/v1/zenj` prefix to `cluster: zenj`, falling back to `127.0.0.1:8097`, and
 `mcp/served.yaml` names the `dj` backend, so the aggregator lists and routes its tools. Only the
-night's people may call them (`zenj.yaml` `people[].email`). No change to zend. The two light
-tools are planned (§9).
+night's people may call them (`zenj.yaml` `people[].email`). No change to zend.
 
 | Tool | Does |
 |---|---|
@@ -637,11 +659,12 @@ tools are planned (§9).
 | `zenj_said` | a line the room said, which Zen hears at the next choice |
 | `zenj_midnight` | the midnight track, whose drop lands on 00:00:00 |
 | `zenj_energy` | more or less energy for a while: the curve's target moved from now |
-| `lights_scene` *(planned)* | set or hold a scene from §9.4 — `wash`, `split`, `chase`, `pulse`, `hit`, `blackout`, `house` — on a group or the whole track |
-| `lights_house` *(planned)* | house lights on, or back to whatever the set wanted |
+| `lights_scene` | hold a scene from §9.4 — `wash`, `split`, `chase`, `pulse`, `hit`, `blackout`, `house` — on a group (a tag or an aim) or the whole track; `auto` lets every held scene go |
+| `lights_house` | house lights on, or back to whatever the set wanted |
+
 Both light tools are served by `zenj` on the same surface, gated by the same `people[].email` list,
 and answer from memory within the 30 ms rule; they hand the request to the lights thread and do not
-wait for the bulb.
+wait for the bulb (`zenj/src/tools/lights.rs`). With no bulbs mapped they say so.
 
 ## 15. The journal
 

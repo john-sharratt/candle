@@ -19,9 +19,9 @@ use host::cluster::bus::{ask, Unasked};
 use serde_json::{json, Map, Value};
 
 use super::mode::Mode;
-use super::table::Step;
+use super::table::{Step, Target};
 use crate::api::now_ms;
-use crate::bridge::{self, parts_here, Done};
+use crate::bridge::{self, parts_here, Done, Here};
 use crate::world::Hosted;
 
 /// What the house asks rekordbox on: `zenj`'s, on BlackWorld.
@@ -78,35 +78,76 @@ async fn ask_decks(member: Option<Arc<AppMember>>, act: &str) -> Decks {
     decks_heard(ask(&member, DECKS_TOPIC, payload, &reply, DECKS_WAIT).await)
 }
 
-/// The bridge act a step is, for a device of `profile`: its tool name, and
-/// its arguments with the device named.
-pub fn call_of(step: &Step, profile: &str) -> (String, Map<String, Value>) {
+/// The bridge act a step is, on the device `device` of `profile`: its tool
+/// name, and its arguments with the device named.
+pub fn call_of(step: &Step, device: &str, profile: &str) -> (String, Map<String, Value>) {
     let mut args = step.args.clone();
-    args.insert("device".into(), Value::from(step.device.clone()));
+    args.insert("device".into(), Value::from(device.to_string()));
     (format!("{profile}_{}", step.act), args)
 }
 
-/// One step done through the device's bridge, for `body` where it stands;
+/// The devices here a step works, each by its name and profile.
+fn targets(parts: &[Here], target: &Target) -> Vec<(String, String)> {
+    parts
+        .iter()
+        .filter_map(|p| {
+            let link = p.link.as_ref()?;
+            let hit = match target {
+                Target::Device(d) => p.name.eq_ignore_ascii_case(d),
+                Target::Every(profile) => link.profile == *profile,
+            };
+            hit.then(|| (p.name.clone(), link.profile.clone()))
+        })
+        .collect()
+}
+
+/// The line for a step that worked `of` devices — none, or several —
+/// `failed` of which did not take it.
+pub fn summed(step: &Step, of: usize, failed: &[String]) -> String {
+    match (of, failed) {
+        (0, _) => match &step.target {
+            Target::Device(d) => format!(
+                "{d} {}: there is no {d} here that the world can work",
+                step.act
+            ),
+            Target::Every(p) => format!(
+                "{} {}: there is no {p} device here that the world can work",
+                step.what(),
+                step.act
+            ),
+        },
+        (n, []) => format!("{} {}: all {n} did it", step.what(), step.act),
+        (n, f) => format!(
+            "{} {}: {} of {n} did it; not {}",
+            step.what(),
+            step.act,
+            n - f.len(),
+            f.join(", ")
+        ),
+    }
+}
+
+/// One step done through each device's bridge, for `body` where it stands;
 /// its line.
 async fn work(hosted: &Hosted, body: &str, step: &Step, agents: Option<Agents>) -> String {
-    let link = parts_here(hosted, body).into_iter().find_map(|p| {
-        p.name
-            .eq_ignore_ascii_case(&step.device)
-            .then_some(p.link)
-            .flatten()
-    });
-    let Some(link) = link else {
-        return format!(
-            "{} {}: there is no {} here that the world can work",
-            step.device, step.act, step.device
-        );
-    };
-    let (tool, args) = call_of(step, &link.profile);
-    let done: Done = bridge::enact(hosted, body, &tool, &args, agents).await;
-    let first = done.answer.lines().next().unwrap_or("").to_string();
-    match done.landed {
-        true => format!("{} {}: {first}", step.device, step.act),
-        false => format!("{} {} did not happen: {first}", step.device, step.act),
+    let found = targets(&parts_here(hosted, body), &step.target);
+    let mut failed = Vec::new();
+    let mut only = String::new();
+    for (device, profile) in &found {
+        let (tool, args) = call_of(step, device, profile);
+        let done: Done = bridge::enact(hosted, body, &tool, &args, agents.clone()).await;
+        let first = done.answer.lines().next().unwrap_or("").to_string();
+        only = match done.landed {
+            true => format!("{device} {}: {first}", step.act),
+            false => format!("{device} {} did not happen: {first}", step.act),
+        };
+        if !done.landed {
+            failed.push(device.clone());
+        }
+    }
+    match found.len() {
+        1 => only,
+        n => summed(step, n, &failed),
     }
 }
 
@@ -164,6 +205,8 @@ pub async fn switch(
 
 #[cfg(test)]
 mod tests {
+    use npc_map::part::PartLink;
+
     use super::*;
 
     /// **A party opens the decks and every other mode closes them.**
@@ -206,15 +249,73 @@ mod tests {
         let mut args = Map::new();
         args.insert("source".into(), Value::from("tv"));
         let step = Step {
-            device: "stereo".into(),
+            target: Target::Device("stereo".into()),
             act: "input".into(),
             args,
         };
-        let (tool, args) = call_of(&step, "receiver");
+        let (tool, args) = call_of(&step, "stereo", "receiver");
         assert_eq!(tool, "receiver_input");
         assert_eq!(
             Value::Object(args),
             json!({"source": "tv", "device": "stereo"})
+        );
+    }
+
+    fn part(name: &str, profile: Option<&str>) -> Here {
+        Here {
+            name: name.into(),
+            id: format!("device-{name}"),
+            link: profile.map(|p| PartLink {
+                profile: p.into(),
+                address: "192.168.0.1".into(),
+                hardware: String::new(),
+                creds: Default::default(),
+                notes: None,
+            }),
+        }
+    }
+
+    /// **A step works its one device, or every device of its kind here** —
+    /// a part linked to nothing is never one.
+    #[test]
+    fn a_step_works_its_device_or_every_one_of_its_kind() {
+        let parts = vec![
+            part("stereo", Some("receiver")),
+            part("light 1", Some("wiz")),
+            part("light 2", Some("wiz")),
+            part("dinner table", None),
+        ];
+        assert_eq!(
+            targets(&parts, &Target::Device("Stereo".into())),
+            [("stereo".to_string(), "receiver".to_string())]
+        );
+        assert_eq!(
+            targets(&parts, &Target::Every("wiz".into())),
+            [
+                ("light 1".to_string(), "wiz".to_string()),
+                ("light 2".to_string(), "wiz".to_string())
+            ]
+        );
+        assert!(targets(&parts, &Target::Device("dinner table".into())).is_empty());
+    }
+
+    /// **Every light at once is said as a count**, naming the ones that did
+    /// not take it.
+    #[test]
+    fn every_light_is_said_as_a_count() {
+        let step = Step {
+            target: Target::Every("wiz".into()),
+            act: "off".into(),
+            args: Map::new(),
+        };
+        assert_eq!(summed(&step, 20, &[]), "every wiz off: all 20 did it");
+        assert_eq!(
+            summed(&step, 20, &["light 3".into(), "light 9".into()]),
+            "every wiz off: 18 of 20 did it; not light 3, light 9"
+        );
+        assert_eq!(
+            summed(&step, 0, &[]),
+            "every wiz off: there is no wiz device here that the world can work"
         );
     }
 }

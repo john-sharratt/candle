@@ -5,6 +5,7 @@
 //! each outcome on the night's record.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -44,6 +45,10 @@ pub struct Rekordbox {
     pub exe: String,
     pub live: Arc<ArcSwap<Live>>,
     pub events: Arc<Events>,
+    /// Whether it runs — the deck reader's, set here the moment an open or a
+    /// close is done, so the lights let go of the bulbs before the house's
+    /// own table sets them.
+    pub running: Arc<AtomicBool>,
     /// One open or close at a time.
     one: Mutex<()>,
 }
@@ -54,12 +59,14 @@ impl Rekordbox {
         exe: impl Into<String>,
         live: Arc<ArcSwap<Live>>,
         events: Arc<Events>,
+        running: Arc<AtomicBool>,
     ) -> Rekordbox {
         Rekordbox {
             program,
             exe: exe.into(),
             live,
             events,
+            running,
             one: Mutex::new(()),
         }
     }
@@ -80,7 +87,10 @@ impl Rekordbox {
         .await
         .map_err(|e| format!("rekordbox could not be reached: {e}"))?;
         match &done {
-            Ok(line) => self.events.push(Kind::Rekordbox, line.clone()),
+            Ok(line) => {
+                self.running.store(act == Act::Open, Ordering::Relaxed);
+                self.events.push(Kind::Rekordbox, line.clone())
+            }
             Err(why) => self.events.push(Kind::Fault, why.clone()),
         };
         done
@@ -103,6 +113,7 @@ mod tests {
             "zenj-no-such-process.exe",
             Arc::new(ArcSwap::from_pointee(live)),
             Arc::new(Events::new()),
+            Arc::new(AtomicBool::new(true)),
         )
     }
 
@@ -121,11 +132,16 @@ mod tests {
         let refused = r.act(Act::Close { force: false }).await.unwrap_err();
         assert!(refused.starts_with("a deck is playing"), "{refused}");
         assert!(r.events.since(0, 10).is_empty());
+        assert!(r.running.load(Ordering::Relaxed));
         assert_eq!(
             r.act(Act::Close { force: true }).await,
             Ok("rekordbox is already closed".into())
         );
         assert_eq!(r.events.since(0, 10)[0].kind, Kind::Rekordbox);
+        assert!(
+            !r.running.load(Ordering::Relaxed),
+            "closed, the lights let go at once"
+        );
     }
 
     /// **An open that cannot start rekordbox is a fault on the record.**

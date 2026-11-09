@@ -16,7 +16,7 @@ pub mod runner;
 pub mod watchdog;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,6 +32,7 @@ use crate::control::{Button, Control};
 use crate::deck::Snapshot;
 use crate::events::{Events, Kind};
 use crate::hands::{Change, Hands, Holder};
+use crate::lights::Cue;
 use crate::midi::{Map, Message, Out, Touch};
 use crate::music::{Grid, TrackId};
 use crate::plan::{Move, Plan, Step as PlanStep, Style};
@@ -96,6 +97,8 @@ pub struct Conductor {
     pub hands: Hands,
     /// Beats sends lead the beat by, for the MIDI path's latency.
     pub lead_beats: f64,
+    /// Where the plans' lighting cues go — `None` with no bulbs mapped.
+    pub lights: Option<mpsc::Sender<Cue>>,
 }
 
 struct Pending {
@@ -112,6 +115,13 @@ impl Conductor {
                 Send::Set(k, v) => msgs.extend(self.map.set(k, v).unwrap_or_default()),
                 Send::Press(b) => {
                     msgs.extend(self.map.press(Control::Button(b)).unwrap_or_default())
+                }
+                // Never waited on: a lights thread that is gone takes nothing
+                // from the beat.
+                Send::Light(c) => {
+                    if let Some(lights) = &self.lights {
+                        let _ = lights.send(c);
+                    }
                 }
             }
         }

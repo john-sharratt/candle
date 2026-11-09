@@ -6,6 +6,7 @@
 //! load, so the plan needs no seek. Every move lands on a bar.
 
 use crate::control::{Band, Button, Knob};
+use crate::lights::Cue;
 use crate::music::{PhraseKind, Profile};
 use crate::plan::{Move, Plan, Step, Style};
 
@@ -230,6 +231,12 @@ pub fn plan(pair: &Pair<'_>) -> Plan {
                         to: 0.5,
                     },
                 ),
+                at(
+                    s,
+                    Move::Light {
+                        cue: Cue::Fade { beats: len },
+                    },
+                ),
             ]);
             s + len
         }
@@ -258,6 +265,9 @@ pub fn plan(pair: &Pair<'_>) -> Plan {
                     },
                 ),
                 at(s + 4.0, Move::Stop { deck: a }),
+                // The bar before the drop dark, the drop the hit.
+                at(s - 4.0, Move::Light { cue: Cue::Blackout }),
+                at(s, Move::Light { cue: Cue::Hit }),
             ]);
             s + 4.0
         }
@@ -306,6 +316,12 @@ pub fn plan(pair: &Pair<'_>) -> Plan {
                     },
                 ),
                 at(s + 8.0, Move::Stop { deck: a }),
+                at(
+                    s,
+                    Move::Light {
+                        cue: Cue::Fade { beats: 8.0 },
+                    },
+                ),
             ]);
             s + 8.0
         }
@@ -349,6 +365,12 @@ pub fn plan(pair: &Pair<'_>) -> Plan {
                     },
                 ),
                 at(s + 4.0, Move::Stop { deck: a }),
+                at(
+                    s - 16.0,
+                    Move::Light {
+                        cue: Cue::Fade { beats: 16.0 },
+                    },
+                ),
             ]);
             s + 4.0
         }
@@ -440,6 +462,12 @@ mod tests {
                     }
                 ),
                 (
+                    224.0,
+                    Move::Light {
+                        cue: Cue::Fade { beats: 32.0 }
+                    }
+                ),
+                (
                     240.0,
                     Move::Set {
                         knob: low(1),
@@ -512,6 +540,11 @@ mod tests {
         let p = plan(&pair(&a, &lift, 0.0));
         assert_eq!(p.style, Style::Cut);
         assert_eq!(p.why, "a lift of 0.30: cut in on the phrase");
+        assert!(
+            moves(&p).contains(&(220.0, Move::Light { cue: Cue::Blackout }))
+                && moves(&p).contains(&(224.0, Move::Light { cue: Cue::Hit })),
+            "the bar before the drop dark, the drop the hit"
+        );
         assert!(moves(&p).contains(&(
             224.0,
             Move::Set {

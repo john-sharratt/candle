@@ -13,10 +13,12 @@
 //! ```
 //!
 //! Each step is one act of the device's bridge, as a part linked to it offers
-//! it — `on`, `input`, `volume` for an AV receiver; `stop` for a Cast device —
-//! with the act's own arguments beside it. A mode the file does not list has
-//! no device steps: it still opens or closes the decks. The file is refused
-//! whole when one thing in it is wrong.
+//! it — `on`, `input`, `volume` for an AV receiver; `stop` for a Cast device;
+//! `dim`, `colour`, `white`, `off` for a WiZ bulb — with the act's own
+//! arguments beside it. A step names one `device`, or `every` part of the
+//! room linked to one kind — `every: wiz`, all the room's lights at once. A
+//! mode the file does not list has no device steps: it still opens or closes
+//! the decks. The file is refused whole when one thing in it is wrong.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,15 +34,33 @@ pub fn path(world: &str) -> String {
     format!("house/{world}.yaml")
 }
 
-/// One thing a mode does to one device.
+/// What a step works.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// The part standing for one device, by the name the room calls it.
+    Device(String),
+    /// Every part of the room linked to a device of this profile: `wiz`.
+    Every(String),
+}
+
+/// One thing a mode does to one device, or to every device of a kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
-    /// The part standing for the device, by the name the room calls it.
-    pub device: String,
+    pub target: Target,
     /// Its bridge's act: `on`, `input`, `stop`.
     pub act: String,
     /// The act's arguments.
     pub args: Map<String, Value>,
+}
+
+impl Step {
+    /// What it works, as its line names it.
+    pub fn what(&self) -> String {
+        match &self.target {
+            Target::Device(d) => d.clone(),
+            Target::Every(p) => format!("every {p}"),
+        }
+    }
 }
 
 /// The house as its table says.
@@ -61,7 +81,10 @@ struct File {
 
 #[derive(Deserialize)]
 struct StepFile {
-    device: String,
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    every: Option<String>,
     act: String,
     #[serde(flatten)]
     args: Map<String, Value>,
@@ -83,14 +106,35 @@ pub fn parse(file: &str, yaml: &str) -> Result<Table, String> {
         })?;
         let mut out = Vec::new();
         for s in steps {
-            let (device, act) = (s.device.trim(), s.act.trim());
-            if device.is_empty() || act.is_empty() {
+            let named = |v: &Option<String>| {
+                v.as_deref()
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+            };
+            let target = match (named(&s.device), named(&s.every)) {
+                (Some(d), None) => Target::Device(d),
+                (None, Some(p)) => Target::Every(p),
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "{file}: a step of `{name}` names a device and every one of a kind: \
+                         one or the other"
+                    ))
+                }
+                (None, None) => {
+                    return Err(format!(
+                        "{file}: a step of `{name}` names no device or no act"
+                    ))
+                }
+            };
+            let act = s.act.trim();
+            if act.is_empty() {
                 return Err(format!(
                     "{file}: a step of `{name}` names no device or no act"
                 ));
             }
             out.push(Step {
-                device: device.to_string(),
+                target,
                 act: act.to_string(),
                 args: s.args,
             });
@@ -119,12 +163,15 @@ impl Table {
         self.modes.get(&mode).map_or(&[], Vec::as_slice)
     }
 
-    /// Every device a mode names.
+    /// Every device a mode names by name.
     pub fn devices(&self) -> BTreeSet<&str> {
         self.modes
             .values()
             .flatten()
-            .map(|s| s.device.as_str())
+            .filter_map(|s| match &s.target {
+                Target::Device(d) => Some(d.as_str()),
+                Target::Every(_) => None,
+            })
             .collect()
     }
 }
@@ -144,6 +191,7 @@ modes:
   away:
     - {device: stereo, act: off}
     - {device: Chromecast, act: stop}
+    - {every: wiz, act: off}
 ";
 
     /// **A table reads as its room and each mode's steps in order**, an
@@ -155,9 +203,11 @@ modes:
         let watching = t.steps(Mode::Watching);
         assert_eq!(watching.len(), 2);
         assert_eq!(
-            (watching[1].device.as_str(), watching[1].act.as_str()),
-            ("stereo", "input")
+            (&watching[1].target, watching[1].act.as_str()),
+            (&Target::Device("stereo".into()), "input")
         );
+        assert_eq!(t.steps(Mode::Away)[2].target, Target::Every("wiz".into()));
+        assert_eq!(t.steps(Mode::Away)[2].what(), "every wiz");
         assert_eq!(
             Value::Object(watching[1].args.clone()),
             json!({"source": "tv"})
@@ -188,6 +238,14 @@ modes:
             )
             .unwrap_err(),
             "f: a step of `home` names no device or no act"
+        );
+        assert_eq!(
+            parse(
+                "f",
+                "room: a/b\nmodes:\n  home:\n    - {device: x, every: wiz, act: on}\n"
+            )
+            .unwrap_err(),
+            "f: a step of `home` names a device and every one of a kind: one or the other"
         );
         assert!(
             parse("f", "room: a/b\nrooms: []\n").is_err(),

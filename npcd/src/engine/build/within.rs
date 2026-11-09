@@ -51,6 +51,7 @@ impl Within {
             sonos: bridge::sonos_of(&parts),
             receiver: bridge::receiver_of(&parts),
             cast: bridge::cast_of(&parts),
+            lights: bridge::lights_of(&parts),
             pairable: bridge::pairable_of(&parts),
             pairing: bridge::pairing_of(&parts),
             house_modes,

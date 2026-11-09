@@ -103,6 +103,16 @@ pub struct ScreenCfg {
     pub latency_ms: f64,
 }
 
+/// The lights (§9).
+#[derive(Debug, Clone, Deserialize)]
+pub struct LightsCfg {
+    /// The fixture map (`zenj/lights.yaml`); with no file, no bulbs.
+    pub fixtures: PathBuf,
+    /// How late a bulb shows what it is sent, in milliseconds: what the
+    /// lights lead the beat by.
+    pub lead_ms: f64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScreensCfg {
     /// The MilkDrop presets the scenes are drawn from.
@@ -136,6 +146,7 @@ pub struct Config {
     pub audio_device: String,
     pub zen: ZenCfg,
     pub screens: ScreensCfg,
+    pub lights: LightsCfg,
 }
 
 impl Config {
@@ -234,6 +245,7 @@ mod tests {
             c.state.join("nights").join("2026-12-31.jsonl")
         );
         assert!(!c.midi.combos.zenj.is_empty() && !c.midi.combos.assist.is_empty());
+        assert_eq!(c.lights.fixtures, Path::new("zenj/lights.yaml"));
     }
 
     #[test]

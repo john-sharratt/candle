@@ -27,6 +27,8 @@ pub enum Kind {
     Hands,
     /// rekordbox opened or closed.
     Rekordbox,
+    /// A light came back, or the lights changed hands.
+    Lights,
     Moment,
     Fault,
     Said,

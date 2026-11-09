@@ -10,6 +10,7 @@
 //! | [`request`] | `zenj_request` — ask for a track |
 //! | [`hands`] | `zenj_hands` — Human, Assist or ZenJ |
 //! | [`rekordbox`] | `zenj_rekordbox` — open or close rekordbox |
+//! | [`lights`] | `lights_scene`, `lights_house` — a scene held, the house lights |
 //! | [`moment`] | `zenj_moment` — book a track, a dedication or a sample for a time |
 //! | [`sfx`] | `zenj_sfx` — fire a sample now or on the next beat or bar |
 //! | [`events`] | `zenj_events` — what happened since a cursor |
@@ -20,6 +21,7 @@
 pub mod energy;
 pub mod events;
 pub mod hands;
+pub mod lights;
 pub mod midnight;
 pub mod moment;
 pub mod now;
@@ -54,7 +56,8 @@ const INSTRUCTIONS: &str = "zenj_now says what is playing, who has the decks and
 with its reason. Requests go to zenj_request; a line someone in the room said to you goes to \
 zenj_said, so the next choice hears it. zenj_hands hands the decks between a person and ZenJ: \
 moving toward ZenJ needs a person's yes in this chat first. zenj_rekordbox opens or closes \
-rekordbox. zenj_events follows what happens.";
+rekordbox. lights_scene holds a lighting scene and lights_house turns the house lights on. \
+zenj_events follows what happens.";
 
 static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     name: "zenj".into(),
@@ -97,6 +100,8 @@ pub struct Dj {
     pub events: Arc<Events>,
     pub asks: mpsc::Sender<Ask>,
     pub rekordbox: Arc<Rekordbox>,
+    /// The lights thread — `None` with no bulbs mapped.
+    pub lights: Option<lights::LightsHandle>,
     /// Who may call, by email, and the name each is known by.
     pub people: Vec<(String, String)>,
     pub store: Arc<SealedStore>,
@@ -145,6 +150,8 @@ pub fn definitions() -> Value {
         said::Said::definition(),
         midnight::Midnight::definition(),
         energy::Energy::definition(),
+        lights::SceneTool::definition(),
+        lights::HouseTool::definition(),
     ])
 }
 
@@ -162,6 +169,8 @@ pub async fn call(dj: &Dj, who: &Person, name: &str, args: &Value) -> Answer {
         said::Said::NAME => said::call(dj, &by, args).await,
         midnight::Midnight::NAME => midnight::call(dj, args).await,
         energy::Energy::NAME => energy::call(dj, args).await,
+        lights::SceneTool::NAME => lights::scene(dj, args),
+        lights::HouseTool::NAME => lights::house(dj, args),
         other => Answer::error(format!("there is no tool `{other}`")),
     }
 }
@@ -221,6 +230,8 @@ impl Server for Dj {
 
 #[cfg(test)]
 pub mod fixture {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
 
     /// A server over a live view, an event log, and the receiving end of
@@ -236,10 +247,12 @@ pub mod fixture {
                     "zenj-no-such-process.exe",
                     live.clone(),
                     events.clone(),
+                    Arc::new(AtomicBool::new(false)),
                 )),
                 live,
                 events,
                 asks: tx,
+                lights: None,
                 people: vec![("john@example.com".into(), "john".into())],
                 store: Arc::new(SealedStore),
             },
@@ -289,7 +302,9 @@ mod tests {
                 "zenj_events",
                 "zenj_said",
                 "zenj_midnight",
-                "zenj_energy"
+                "zenj_energy",
+                "lights_scene",
+                "lights_house"
             ]
         );
     }

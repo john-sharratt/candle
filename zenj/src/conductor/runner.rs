@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use crate::control::{Button, Knob};
 use crate::deck::Snapshot;
 use crate::hands::{Hands, Holder};
+use crate::lights::Cue;
 use crate::plan::{Move, Plan};
 
 /// What the conductor sends.
@@ -16,6 +17,8 @@ use crate::plan::{Move, Plan};
 pub enum Send {
     Set(Knob, f32),
     Press(Button),
+    /// A cue for the lights thread.
+    Light(Cue),
 }
 
 /// Two tempos closer than this are one.
@@ -116,6 +119,7 @@ impl Runner {
                     });
                 }
                 Move::Press { button } if zenj => out.push(Send::Press(button)),
+                Move::Light { cue } if zenj => out.push(Send::Light(cue)),
                 Move::Start { deck: d } if zenj => {
                     if !deck.deck(d).is_some_and(|x| x.playing) {
                         out.push(Send::Press(Button::Play(d)));

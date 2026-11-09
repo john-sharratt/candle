@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::control::{Button, Knob};
+use crate::lights::Cue;
 use crate::music::TrackId;
 
 /// One move the conductor makes.
@@ -24,6 +25,8 @@ pub enum Move {
     Stop { deck: u8 },
     /// Sync a deck to the master if its tempo differs from the master's.
     Match { deck: u8 },
+    /// A lighting cue (§9.4), handed to the lights thread.
+    Light { cue: Cue },
 }
 
 /// A move at a beat of the playing track, counted from its first beat.

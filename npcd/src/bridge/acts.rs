@@ -528,6 +528,141 @@ pub const CAST_LAUNCH: Tool = Tool {
     }],
 };
 
+/// The bulb a WiZ act works.
+const BULB: Param = Param {
+    name: "device",
+    ty: "string",
+    required: true,
+    description: "The light here, by name, as the room calls it.",
+};
+
+/// How bright, for a WiZ act that sets it.
+const LEVEL: Param = Param {
+    name: "level",
+    ty: "integer",
+    required: false,
+    description: "How bright, from 10 (as dim as it goes) to 100.",
+};
+
+pub const WIZ_STATUS: Tool = Tool {
+    name: "wiz_status",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description: "Read what the light here is showing: on or off, its colour or white, how bright.",
+    params: &[BULB],
+    examples: &[Example {
+        situation: "You want to know whether the lights are on in the room.",
+        call: r#"{"device":"ceiling light 1"}"#,
+        because: "What a light shows is in the light, not in anybody's guess.",
+    }],
+};
+
+pub const WIZ_ON: Tool = Tool {
+    name: "wiz_on",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description: "Turn the light here on, warm white, at the brightness given or full.",
+    params: &[BULB, LEVEL],
+    examples: &[Example {
+        situation: "Somebody came into the dark room and asked for the light.",
+        call: r#"{"device":"ceiling light 1"}"#,
+        because: "The light is a switch the world holds; turning it on is the whole act.",
+    }],
+};
+
+pub const WIZ_OFF: Tool = Tool {
+    name: "wiz_off",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description: "Turn the light here off.",
+    params: &[BULB],
+    examples: &[Example {
+        situation: "The room is empty and its light was left on.",
+        call: r#"{"device":"ceiling light 1"}"#,
+        because: "A light left on is a light nobody turned off; off is the act.",
+    }],
+};
+
+pub const WIZ_DIM: Tool = Tool {
+    name: "wiz_dim",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description: "Dim the light here to a warm white at the brightness given.",
+    params: &[
+        BULB,
+        Param {
+            name: "level",
+            ty: "integer",
+            required: true,
+            description: "How bright, from 10 (as dim as it goes) to 100.",
+        },
+    ],
+    examples: &[Example {
+        situation: "A film is starting and the light is glaring on the screen.",
+        call: r#"{"device":"ceiling light 1","level":15}"#,
+        because: "Brightness is a number the light holds; set it, do not turn it off.",
+    }],
+};
+
+pub const WIZ_COLOUR: Tool = Tool {
+    name: "wiz_colour",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description: "Colour the light here: red, orange, amber, yellow, green, cyan, blue, purple, \
+                  magenta, pink or white, at the brightness given or full.",
+    params: &[
+        BULB,
+        Param {
+            name: "colour",
+            ty: "string",
+            required: true,
+            description: "The colour, by its name: red, orange, amber, yellow, green, cyan, \
+                          blue, purple, magenta, pink or white.",
+        },
+        LEVEL,
+    ],
+    examples: &[Example {
+        situation: "The family asked for the room in blue for the game.",
+        call: r#"{"device":"ceiling light 1","colour":"blue"}"#,
+        because: "The colour is the light's to show; name the one the room wants.",
+    }],
+};
+
+pub const WIZ_WHITE: Tool = Tool {
+    name: "wiz_white",
+    at: &[],
+    category: "House",
+    plane: Plane::World,
+    availability: Availability::Embodied,
+    description: "Set the light here to a white, from 2200 K (warm, like a candle) to 6500 K \
+                  (cool, like daylight), at the brightness given or full.",
+    params: &[
+        BULB,
+        Param {
+            name: "kelvin",
+            ty: "integer",
+            required: true,
+            description: "The white, in kelvin: 2200 warm to 6500 cool; 2700 is a lamp's.",
+        },
+        LEVEL,
+    ],
+    examples: &[Example {
+        situation: "Somebody is reading at the table and wants bright daylight white.",
+        call: r#"{"device":"ceiling light 1","kelvin":5000}"#,
+        because: "The white is a temperature the light holds; set it to the one asked for.",
+    }],
+};
+
 pub const PAIR_DEVICE: Tool = Tool {
     name: "pair_device",
     at: &[],
@@ -641,6 +776,12 @@ pub const BRIDGE_ACTS: &[Tool] = &[
     CAST_VOLUME,
     CAST_CAST,
     CAST_LAUNCH,
+    WIZ_STATUS,
+    WIZ_ON,
+    WIZ_OFF,
+    WIZ_DIM,
+    WIZ_COLOUR,
+    WIZ_WHITE,
     PAIR_DEVICE,
     PAIR_CODE,
     WAKE_DEVICE,

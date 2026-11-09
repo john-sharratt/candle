@@ -32,6 +32,8 @@ cluster      = { path = "../cluster" }
 cluster-dial = { path = "../cluster-dial" }
 # The FLX4's output, captured by WASAPI loopback (§4.4).
 cpal         = "0.15"
+# WiZ's wire (§9), shared with the house's bridge.
+effector-bridge = { path = "../effector-bridge" }
 # The screens (§8): MilkDrop scenes, the overlay's text, one window per output.
 glyphon      = "0.12"
 futures-util = "0.3"

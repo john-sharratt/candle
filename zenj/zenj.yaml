@@ -85,6 +85,15 @@ zen:
   conversation: zenj-2026-12-31
   deadline_s: 20
 
+# The ceiling track's WiZ bulbs (docs/zenj.md §9), driven while rekordbox is
+# open. The fixture map is written once they are fitted and each has its
+# reserved address (spike 7); until it exists there are no bulbs, and no
+# lights thread. The lead is the community-measured WiZ latency; spike 8
+# replaces it with the room's.
+lights:
+  fixtures: zenj/lights.yaml
+  lead_ms: 35
+
 screens:
   presets: D:/zenj/presets
   outputs:
