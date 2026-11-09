@@ -30,7 +30,7 @@ const TOP_BAR: &str = "{{TOP_BAR}}";
 
 /// The page itself: static, reading `status.json`, under the site's top bar.
 static PAGE: LazyLock<String> =
-    LazyLock::new(|| include_str!("gateway.html").replace(TOP_BAR, &nav_bar(Nav::Admin)));
+    LazyLock::new(|| include_str!("gateway.html").replace(TOP_BAR, nav_bar(Nav::Admin)));
 
 /// How many coordination-log entries `status.json` carries by default.
 const LOG_LIMIT: usize = 500;

@@ -6,17 +6,27 @@
 //! share the framework without either of them owning it.
 //!
 //! The two sources answer the same lookups. The gateway reads its sites from
-//! disk, each file when it is asked for, so saving one is the deployment: the
-//! next request serves it, with no rebuild and no restart. A daemon serves the
-//! UI it was built with, compiled in, so it ships as one file that needs no
-//! checkout beside it.
+//! disk, so saving a file is the deployment: the next request serves it, with
+//! no rebuild and no restart. A daemon serves the UI it was built with,
+//! compiled in, so it ships as one file that needs no checkout beside it.
+//!
+//! What is served from a file is prepared once per version of it and kept
+//! ([`Stamped`]): every request still resolves its path through the roots in
+//! order — so a file added to an earlier root shadows at once — and a disk
+//! file whose stamp has moved is prepared again.
+
+mod serve;
+pub mod stamped;
 
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use include_dir::Dir;
+use include_dir::{Dir, File};
 use tokio::fs;
+
+pub use serve::Kept;
+pub use stamped::{Key, Origin, Stamp, Stamped};
 
 /// Where one root's files come from.
 #[derive(Clone)]
@@ -36,11 +46,79 @@ impl Debug for Source {
     }
 }
 
-/// The ordered roots for one site, searched in order.
+/// The ordered roots for one site, searched in order, and what has been
+/// prepared from their files — shared by every clone.
 #[derive(Clone, Debug, Default)]
-pub struct Roots(pub Arc<Vec<Source>>);
+pub struct Roots {
+    sources: Arc<Vec<Source>>,
+    stamped: Arc<Stamped<Kept>>,
+}
+
+/// Where a path resolved to: a file on disk at its real path, as it stands
+/// now, or a compiled-in file.
+#[derive(Clone, Debug)]
+pub enum Resolved {
+    Disk { real: PathBuf, stamp: Stamp },
+    Embedded(&'static File<'static>),
+}
+
+impl Resolved {
+    /// The key of what is derived from this file as `kind`.
+    pub fn key(&self, kind: &str) -> Key {
+        let origin = match self {
+            Resolved::Disk { real, .. } => Origin::Disk(real.clone()),
+            Resolved::Embedded(f) => Origin::Embedded(*f as *const File<'static> as usize),
+        };
+        Key {
+            origin,
+            kind: kind.to_string(),
+        }
+    }
+
+    /// The file's version: its stamp on disk; none for a compiled-in file,
+    /// which cannot change while the process runs.
+    pub fn stamp(&self) -> Option<Stamp> {
+        match self {
+            Resolved::Disk { stamp, .. } => Some(*stamp),
+            Resolved::Embedded(_) => None,
+        }
+    }
+
+    /// Whether the file is still the version it resolved to — what is checked
+    /// after reading it, before keeping what was derived from the read.
+    pub async fn unchanged(&self) -> bool {
+        match self {
+            Resolved::Disk { real, stamp } => stamp_of(real).await == Some(*stamp),
+            Resolved::Embedded(_) => true,
+        }
+    }
+
+    /// The file's bytes.
+    pub async fn bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            Resolved::Disk { real, .. } => fs::read(real).await.ok(),
+            Resolved::Embedded(f) => Some(f.contents().to_vec()),
+        }
+    }
+}
+
+/// A disk file's stamp, or `None` when it is not a file.
+pub async fn stamp_of(path: &Path) -> Option<Stamp> {
+    let meta = fs::metadata(path).await.ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some((meta.modified().ok()?, meta.len()))
+}
 
 impl Roots {
+    fn of(sources: Vec<Source>) -> Self {
+        Roots {
+            sources: Arc::new(sources),
+            stamped: Arc::default(),
+        }
+    }
+
     /// Roots are canonicalised here rather than being trusted as given.
     ///
     /// [`read`](Self::read) canonicalises each candidate file and checks it is
@@ -51,23 +129,26 @@ impl Roots {
     /// and the site serves nothing at all. Doing it here means a `Roots` cannot
     /// be built in that state.
     pub fn disk(paths: &[PathBuf]) -> Self {
-        Roots(Arc::new(
+        Roots::of(
             paths
                 .iter()
                 .map(|p| Source::Disk(p.canonicalize().unwrap_or_else(|_| p.clone())))
                 .collect(),
-        ))
+        )
     }
 
     /// Directories compiled in with `include_dir!`, searched in order.
     pub fn embedded(dirs: &[&'static Dir<'static>]) -> Self {
-        Roots(Arc::new(
-            dirs.iter().copied().map(Source::Embedded).collect(),
-        ))
+        Roots::of(dirs.iter().copied().map(Source::Embedded).collect())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.sources.is_empty()
+    }
+
+    /// The roots, in the order they are searched.
+    pub fn sources(&self) -> &[Source] {
+        &self.sources
     }
 
     /// File names directly inside `rel`, across every root, deduplicated and
@@ -79,7 +160,7 @@ impl Roots {
     /// subfolder appear as a published post.
     pub async fn list(&self, rel: &str) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        for src in self.0.iter() {
+        for src in self.sources.iter() {
             match src {
                 Source::Disk(root) => {
                     let Ok(mut entries) = fs::read_dir(root.join(rel)).await else {
@@ -116,7 +197,7 @@ impl Roots {
     /// caller keys a cache by. `None` when no disk root holds it: compiled-in
     /// content has no path, and cannot change while the process runs.
     pub fn disk_path(&self, rel: &str) -> Option<PathBuf> {
-        self.0.iter().find_map(|src| match src {
+        self.sources.iter().find_map(|src| match src {
             Source::Disk(root) => {
                 let p = root.join(rel);
                 p.is_file().then_some(p)
@@ -125,39 +206,39 @@ impl Roots {
         })
     }
 
-    /// First root that has `rel`, as bytes. `rel` must already be validated by
-    /// [`safe_rel`].
-    pub async fn read(&self, rel: &str) -> Option<Vec<u8>> {
-        for src in self.0.iter() {
+    /// Where `rel` is: the first root that has it, looked for afresh. `rel`
+    /// must already be validated by [`safe_rel`].
+    pub async fn resolve(&self, rel: &str) -> Option<Resolved> {
+        for src in self.sources.iter() {
             match src {
                 Source::Disk(root) => {
                     // Re-check after canonicalisation: this is what closes the
                     // symlink route out of the site, which the component check
                     // in `safe_rel` cannot see.
-                    let Ok(real) = root.join(rel).canonicalize() else {
+                    let Ok(real) = fs::canonicalize(root.join(rel)).await else {
                         continue;
                     };
                     if !real.starts_with(root) {
                         continue;
                     }
-                    let Ok(meta) = fs::metadata(&real).await else {
-                        continue;
-                    };
-                    if !meta.is_file() {
-                        continue;
-                    }
-                    if let Ok(b) = fs::read(&real).await {
-                        return Some(b);
+                    if let Some(stamp) = stamp_of(&real).await {
+                        return Some(Resolved::Disk { real, stamp });
                     }
                 }
                 Source::Embedded(dir) => {
                     if let Some(f) = dir.get_file(rel) {
-                        return Some(f.contents().to_vec());
+                        return Some(Resolved::Embedded(f));
                     }
                 }
             }
         }
         None
+    }
+
+    /// First root that has `rel`, as bytes. `rel` must already be validated by
+    /// [`safe_rel`].
+    pub async fn read(&self, rel: &str) -> Option<Vec<u8>> {
+        self.resolve(rel).await?.bytes().await
     }
 }
 

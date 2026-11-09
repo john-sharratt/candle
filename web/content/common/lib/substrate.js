@@ -17,6 +17,7 @@
  * whatever the reader has open and throw away its fetched sub-tree. */
 
 import { memberWith } from './aggregate.js';
+import { pollWhileVisible } from './visible.js';
 
 const POLL_MS = 6000;
 
@@ -480,8 +481,7 @@ export function mountSubstrate({ tenant, prefix, mock, hosts, live }) {
   }
 
   refresh();
-  const timer = setInterval(refresh, POLL_MS);
-  return { stop: () => clearInterval(timer) };
+  return { stop: pollWhileVisible(POLL_MS, refresh) };
 }
 
 // ── mock preview data — mirrors the lazy endpoints ──────────────────────────

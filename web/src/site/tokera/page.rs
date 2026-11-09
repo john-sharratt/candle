@@ -6,6 +6,8 @@
 //! reading it on something old. The only script on the page is the few lines
 //! that swap "Sign in" for your name, and the page is complete without it.
 
+use std::sync::LazyLock;
+
 pub struct Meta<'a> {
     /// The `<h1>`, and the first half of the `<title>`.
     ///
@@ -356,7 +358,22 @@ pub fn head(m: &Meta) -> String {
     format!("{}<main class=\"{}\">\n", doc_open(m), m.width.class())
 }
 
-pub fn nav_bar(current: Nav) -> String {
+/// The bar for each [`Nav`], rendered once: it is made of constants.
+static NAV_BARS: LazyLock<[String; 4]> =
+    LazyLock::new(|| [Nav::Home, Nav::Blog, Nav::Papers, Nav::Admin].map(render_nav_bar));
+
+/// The site's bar, with `current` marked.
+pub fn nav_bar(current: Nav) -> &'static str {
+    let i = match current {
+        Nav::Home => 0,
+        Nav::Blog => 1,
+        Nav::Papers => 2,
+        Nav::Admin => 3,
+    };
+    &NAV_BARS[i]
+}
+
+fn render_nav_bar(current: Nav) -> String {
     let links = LINKS
         .iter()
         .map(|(href, label, which)| {
@@ -462,7 +479,14 @@ pub fn title_block(m: &Meta) -> String {
     s
 }
 
-fn footer() -> String {
+/// The footer, rendered once: it is made of constants.
+static FOOTER: LazyLock<String> = LazyLock::new(render_footer);
+
+fn footer() -> &'static str {
+    &FOOTER
+}
+
+fn render_footer() -> String {
     // Built from the same two lists the bar uses. The other-sites group is
     // hidden from the bar on a narrow screen, so the footer is where those
     // links have to survive — generating both from one source is what stops
@@ -801,6 +825,14 @@ mod tests {
                 .unwrap_or_else(|e| panic!("reading {}: {e}", original.display()));
             assert_eq!(a, b, "brand/{copy} has drifted from {}", original.display());
         }
+        // zend's `.ico` is the same PNG under the name browsers ask for.
+        let zen = std::fs::read(content.join("common").join("brand").join("zen.png")).unwrap();
+        let ico = std::fs::read(root.join("..").join("zend").join("web").join("favicon.ico"))
+            .expect("zend/web/favicon.ico");
+        assert_eq!(
+            ico, zen,
+            "zend/web/favicon.ico has drifted from brand/zen.png"
+        );
 
         // And every icon the list names actually exists to be served.
         for (_, name, _, icon) in ESTATE {
@@ -810,6 +842,23 @@ mod tests {
             );
             assert!(file.is_file(), "{name} has no icon at {}", file.display());
         }
+    }
+
+    /// **The Zen mark is 256×256** — the size the MCP `serverInfo` icon
+    /// declares (`mcp-server/src/protocol.rs`). Read from the PNG's `IHDR`:
+    /// width at bytes 16–19, height at 20–23, big-endian.
+    #[test]
+    fn the_zen_mark_is_256_square() {
+        let png = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("content")
+                .join("common")
+                .join("brand")
+                .join("zen.png"),
+        )
+        .unwrap();
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(&png[16..24], [0, 0, 1, 0, 0, 0, 1, 0]);
     }
 
     /// Every asset zend's pages ask for exists where the host serves it from:

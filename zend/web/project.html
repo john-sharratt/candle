@@ -279,7 +279,8 @@ document.addEventListener('DOMContentLoaded',()=>{
   if(MOCK){ document.getElementById('foot').textContent='zend project · /project · mock preview'; }
   document.getElementById('input').addEventListener('input', onInput);
   document.getElementById('input').focus();
-  setInterval(pollBuild, 5000);
+  // A classic script, so the shared helper comes in through a dynamic import.
+  import('/common/lib/visible.js').then(({ pollWhileVisible }) => pollWhileVisible(5000, pollBuild));
 });
 
 // Force-reload when the daemon is rebuilt (embedded UI hash changes).

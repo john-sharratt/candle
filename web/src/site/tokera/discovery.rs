@@ -95,7 +95,7 @@ pub async fn sitemap(state: Arc<State>) -> Response {
         });
     }
 
-    for paper in papers::manifest(&state).await.papers {
+    for paper in &papers::manifest(&state).await.papers {
         urls.push(Url {
             path: format!("/papers/{}", paper.slug),
             date: (!paper.date.is_empty()).then(|| paper.date.clone()),

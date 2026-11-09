@@ -26,18 +26,21 @@
 //!
 //! A hash of the bytes, not a modification time. Two boxes serving the same
 //! console agree, a file restored from a copy does not look new, and a file
-//! rewritten with identical bytes does not invalidate anything. It costs a hash
-//! per request — twenty microseconds on a forty-kilobyte stylesheet, against
-//! the forty kilobytes it saves sending.
+//! rewritten with identical bytes does not invalidate anything. It is hashed —
+//! and gzipped — once per version of the file ([`Prepared`]), not per request.
 
-use axum::body::Body;
+mod prepared;
+
+use std::io::Write;
+
+use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
-
-use crate::config::Cache;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use sha2::{Digest, Sha256};
-use std::io::Write;
+
+use crate::config::Cache;
+
+pub use prepared::{mime_of, tag_of, Prepared};
 
 /// Below this, a compressed body is not reliably smaller than the original once
 /// the gzip header and trailer are counted, and never enough to matter.
@@ -135,31 +138,63 @@ fn is_long(base: &str) -> bool {
     base.starts_with("image/") || base.starts_with("font/") || base == "application/font-woff"
 }
 
-/// The answer for one file: 304 when the client already has it, otherwise the
-/// bytes, compressed when that is both possible and worth it.
-pub fn respond(name: &str, bytes: Vec<u8>, cache: Cache, req: &HeaderMap) -> Response<Body> {
-    let mime = mime_guess::from_path(name).first_or_octet_stream();
-    let mime = mime.as_ref();
-    let cache_control = &directive(mime, cache);
+/// The answer for one prepared file: 304 when the client already has the
+/// representation it would be sent, otherwise that representation — gzipped
+/// when the client takes it and the file was worth compressing. The age is
+/// `cache`'s, the caller's policy, chosen per answer.
+pub fn respond(p: &Prepared, cache: Cache, req: &HeaderMap) -> Response<Body> {
+    let cache_control = &directive(&p.mime, cache);
+    let zipped = match (&p.gz, &p.tag_gz) {
+        (Some(body), Some(tag)) if accepts_gzip(req) => Some((body, tag)),
+        _ => None,
+    };
+    let gzip = zipped.is_some();
+    let (body, tag) = zipped.unwrap_or((&p.plain, &p.tag));
 
-    let gzip = accepts_gzip(req) && compressible(mime) && bytes.len() >= MIN_COMPRESS;
-    // The tag identifies the *representation*, so the compressed body carries a
-    // different one. A cache holding both must be able to tell them apart, and
-    // `Vary` alone does not do that for a client that revalidates.
-    let tag = etag(&bytes, gzip);
-
-    if none_match(req, &tag) {
+    if none_match(req, tag) {
         let mut res = Response::new(Body::empty());
         *res.status_mut() = StatusCode::NOT_MODIFIED;
-        headers(res.headers_mut(), None, cache_control, &tag, gzip);
+        headers(res.headers_mut(), None, cache_control, tag, gzip);
         return res;
     }
 
-    let body = if gzip { gz(&bytes) } else { bytes };
-    let mut res = Response::new(Body::from(body));
+    let mut res = Response::new(Body::from(body.clone()));
     *res.status_mut() = StatusCode::OK;
-    headers(res.headers_mut(), Some(mime), cache_control, &tag, gzip);
+    headers(res.headers_mut(), Some(&p.mime), cache_control, tag, gzip);
     res
+}
+
+/// A computed answer of type `mime` that is the same for every reader — a
+/// rendered page — answered as a file is: tagged, compressed, and 304 to a
+/// client already holding it.
+pub fn respond_typed(mime: &str, bytes: Bytes, cache: Cache, req: &HeaderMap) -> Response<Body> {
+    respond(&Prepared::typed(mime, bytes), cache, req)
+}
+
+/// Whether `req` already holds the file whose plain tag is `tag`, in the
+/// representation it would be sent — what a file whose bytes are not kept is
+/// answered from before they are read.
+pub fn not_modified(
+    mime: &str,
+    tag: &str,
+    cache: Cache,
+    req: &HeaderMap,
+) -> Option<Response<Body>> {
+    let gzip = accepts_gzip(req) && compressible(mime);
+    let gz_tag;
+    let tag = if gzip {
+        gz_tag = format!("{}-gz\"", tag.trim_end_matches('"'));
+        &gz_tag
+    } else {
+        tag
+    };
+    if !none_match(req, tag) {
+        return None;
+    }
+    let mut res = Response::new(Body::empty());
+    *res.status_mut() = StatusCode::NOT_MODIFIED;
+    headers(res.headers_mut(), None, &directive(mime, cache), tag, gzip);
+    Some(res)
 }
 
 /// A computed answer — an API reply, not a file: compressed when the client
@@ -203,22 +238,6 @@ fn headers(h: &mut HeaderMap, mime: Option<&str>, cache_control: &str, tag: &str
     h.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
     if gzip {
         h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-    }
-}
-
-/// A strong entity tag: the content, hashed.
-///
-/// Sixteen hex characters of SHA-256 — sixty-four bits, which is not a security
-/// boundary and does not need to be. The consequence of a collision is one
-/// stale file for one client until its next change, and the alternative is a
-/// longer header on every response for ever.
-fn etag(bytes: &[u8], gzip: bool) -> String {
-    let digest = Sha256::digest(bytes);
-    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    if gzip {
-        format!("\"{hex}-gz\"")
-    } else {
-        format!("\"{hex}\"")
     }
 }
 
@@ -280,7 +299,7 @@ pub(crate) fn compressible(mime: &str) -> bool {
         )
 }
 
-fn gz(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn gz(bytes: &[u8]) -> Vec<u8> {
     // Level 6: the default, and the knee of the curve. Level 9 spends roughly
     // twice the time for about one percent fewer bytes on this kind of source.
     let mut enc = GzEncoder::new(Vec::with_capacity(bytes.len() / 3), Compression::default());
@@ -310,6 +329,11 @@ mod tests {
 
     fn css(n: usize) -> Vec<u8> {
         ".a { color: red; }\n".repeat(n).into_bytes()
+    }
+
+    /// The answer for the file `name` holding `bytes`, prepared as a file is.
+    fn respond(name: &str, bytes: Vec<u8>, cache: Cache, req: &HeaderMap) -> Response<Body> {
+        super::respond(&Prepared::of(name, Bytes::from(bytes)), cache, req)
     }
 
     fn body_bytes(res: Response<Body>) -> Vec<u8> {

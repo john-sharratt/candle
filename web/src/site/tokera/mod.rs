@@ -12,14 +12,17 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Path, State as AxState};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 
-use crate::content::Roots;
-use crate::markdown::Cache;
+use crate::asset::respond_typed;
+use crate::config::Cache as Policy;
+use crate::content::{Roots, Stamped};
+use crate::markdown::{Cache, Post};
 
 pub mod blog;
 pub mod discovery;
@@ -28,6 +31,10 @@ pub mod page;
 pub mod papers;
 
 use page::{Kind, Meta, Nav, Width};
+use papers::Manifest;
+
+/// The type every page is answered as.
+pub const HTML: &str = "text/html; charset=utf-8";
 
 pub struct State {
     pub roots: Roots,
@@ -35,30 +42,57 @@ pub struct State {
     /// `papers:` directory configured — the section then says so rather than
     /// showing an empty list that looks like a content problem.
     pub papers_dir: Option<PathBuf>,
+    /// The rendered documents, by their file.
     pub cache: Cache,
+    /// How long a page may be reused — the server's age for its files.
+    pub policy: Policy,
+    /// Each post's front matter as last parsed, per version of its file:
+    /// `None` for a draft or one that does not parse, so a broken file is not
+    /// parsed again on every request.
+    pub posts: Stamped<Option<Arc<Post>>>,
+    /// The papers manifest as last parsed, per version of `papers.yaml`.
+    pub manifest: Stamped<Arc<Manifest>>,
+}
+
+/// `html`, answered as a file is: tagged, gzipped where the client takes it,
+/// `304` to a client already holding it, and kept for the short age. No page
+/// reads a cookie or an identity — sign-in is filled in by `/lib/auth.js` —
+/// so `public` is right for every one.
+pub fn page_answer(state: &State, html: String, req: &HeaderMap) -> Response {
+    respond_typed(HTML, Bytes::from(html), state.policy, req)
 }
 
 /// The site's routes. Mounted at the prefixes the site table gives them, so
 /// this is the whole of tokera.com apart from its static assets.
-pub fn router(roots: Roots, papers_dir: Option<PathBuf>) -> Router {
+pub fn router(roots: Roots, papers_dir: Option<PathBuf>, policy: Policy) -> Router {
     let state = Arc::new(State {
         roots,
         papers_dir,
         cache: Cache::new(),
+        policy,
+        posts: Stamped::default(),
+        manifest: Stamped::default(),
     });
 
     Router::new()
-        .route("/", get(|| async { home::show().await }))
+        .route(
+            "/",
+            get(|AxState(s): AxState<Arc<State>>, headers: HeaderMap| async move {
+                home::show(s.policy, &headers)
+            }),
+        )
         .route(
             "/blog",
-            get(|AxState(s): AxState<Arc<State>>| blog::index(s)),
+            get(|AxState(s): AxState<Arc<State>>, headers: HeaderMap| async move {
+                blog::index(s, &headers).await
+            }),
         )
         .route(
             "/blog/:slug",
             get(
-                |AxState(s): AxState<Arc<State>>, Path(slug): Path<String>| async move {
-                    blog::show(s, &slug).await
-                },
+                |AxState(s): AxState<Arc<State>>,
+                 Path(slug): Path<String>,
+                 headers: HeaderMap| async move { blog::show(s, &slug, &headers).await },
             ),
         )
         .route(
@@ -68,9 +102,9 @@ pub fn router(roots: Roots, papers_dir: Option<PathBuf>) -> Router {
         .route(
             "/papers/:slug",
             get(
-                |AxState(s): AxState<Arc<State>>, Path(slug): Path<String>| async move {
-                    papers::show(s, &slug).await
-                },
+                |AxState(s): AxState<Arc<State>>,
+                 Path(slug): Path<String>,
+                 headers: HeaderMap| async move { papers::show(s, &slug, &headers).await },
             ),
         )
         // What a crawler and a feed reader ask for before a page — generated
@@ -128,10 +162,16 @@ fn message(nav: Nav, heading: &str, detail: &str) -> Html<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{header, Request};
+    use flate2::read::GzDecoder;
+    use sha2::{Digest, Sha256};
     use tower::ServiceExt;
+
+    use crate::asset::tag_of;
 
     fn content_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("content")
@@ -144,8 +184,14 @@ mod tests {
             .join("docs")
             .canonicalize()
             .expect("the repo's docs/ directory");
-        router(roots, Some(docs))
+        router(roots, Some(docs), POLICY)
     }
+
+    /// The shipped policy: a minute for pages and code.
+    const POLICY: Policy = Policy {
+        short_secs: 60,
+        long_secs: 900,
+    };
 
     async fn get(path: &str) -> (StatusCode, String) {
         let res = site()
@@ -624,6 +670,72 @@ mod tests {
         let (status, html) = get(&format!("/blog/{slug}")).await;
         assert_eq!(status, 200);
         assert!(html.contains("<article class=\"prose\">"), "{html}");
+    }
+
+    async fn get_with(path: &str, headers: &[(header::HeaderName, &str)]) -> Response {
+        let mut req = Request::builder().uri(path);
+        for (k, v) in headers {
+            req = req.header(k, *v);
+        }
+        site()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn body_of(res: Response) -> Vec<u8> {
+        axum::body::to_bytes(res.into_body(), 64 << 20)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// **A page answers 304 to a client already holding it**: tagged with its
+    /// own bytes' hash, kept for the short age, and gzipped — under its own
+    /// tag — for a client that takes it. A missing page is a 404 with no tag.
+    #[tokio::test]
+    async fn a_page_is_tagged_and_revalidates_to_nothing() {
+        let res = get_with("/blog", &[]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::CACHE_CONTROL], "public, max-age=60");
+        assert_eq!(res.headers()[header::CONTENT_TYPE], HTML);
+        let tag = res.headers()[header::ETAG].to_str().unwrap().to_owned();
+        let plain = body_of(res).await;
+        assert_eq!(tag, tag_of(&hex(&plain), false));
+
+        let again = get_with("/blog", &[(header::IF_NONE_MATCH, &tag)]).await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        assert!(body_of(again).await.is_empty());
+
+        let zipped = get_with("/blog", &[(header::ACCEPT_ENCODING, "gzip")]).await;
+        let gz_tag = zipped.headers()[header::ETAG].to_str().unwrap().to_owned();
+        assert!(gz_tag.ends_with("-gz\""), "{gz_tag}");
+        let mut inflated = Vec::new();
+        GzDecoder::new(&body_of(zipped).await[..])
+            .read_to_end(&mut inflated)
+            .unwrap();
+        assert_eq!(inflated, plain);
+
+        let missing = get_with("/blog/nope", &[]).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert!(missing.headers().get(header::ETAG).is_none());
+    }
+
+    /// The `/papers` redirect may be reused for the short age.
+    #[tokio::test]
+    async fn the_papers_redirect_is_kept_for_the_short_age() {
+        let res = get_with("/papers", &[]).await;
+        assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(res.headers()[header::CACHE_CONTROL], "public, max-age=60");
+    }
+
+    /// The first sixteen hex characters of `bytes`' SHA-256.
+    fn hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     #[tokio::test]

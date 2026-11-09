@@ -19,7 +19,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use include_dir::{include_dir, Dir};
 use sha2::{Digest, Sha256};
-use web::asset::respond;
 use web::config::Cache;
 use web::content::safe_rel;
 use web::Roots;
@@ -85,8 +84,8 @@ async fn serve(roots: &Roots, path: &str, headers: &HeaderMap) -> Response {
     let Some(rel) = safe_rel(path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    match roots.read(&rel).await {
-        Some(bytes) => respond(&rel, bytes, Cache::default(), headers),
+    match roots.serve(&rel, Cache::default(), headers).await {
+        Some(res) => res,
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -99,9 +98,37 @@ mod tests {
     use axum::http::Request;
     use axum::routing::get;
     use axum::Router;
+    use include_dir::File;
     use tower::ServiceExt;
 
     static BRAND: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../web/content/common/brand");
+
+    fn every_file(dir: &'static Dir<'static>, out: &mut Vec<&'static File<'static>>) {
+        out.extend(dir.files());
+        for sub in dir.dirs() {
+            every_file(sub, out);
+        }
+    }
+
+    /// **The shared library polls only while it is seen**
+    /// (`docs/performance_patch.md` W12): the helper is the one file that
+    /// starts a poll's interval; the performance page's age clock is the
+    /// other interval, and it polls nothing.
+    #[test]
+    fn the_shared_library_polls_only_through_the_visibility_helper() {
+        let mut files = Vec::new();
+        every_file(&COMMON, &mut files);
+        let mut timed: Vec<String> = files
+            .into_iter()
+            .filter(|f| {
+                f.contents_utf8()
+                    .is_some_and(|text| text.contains("setInterval("))
+            })
+            .map(|f| f.path().to_string_lossy().replace('\\', "/"))
+            .collect();
+        timed.sort();
+        assert_eq!(timed, ["lib/perf.js", "lib/visible.js"]);
+    }
 
     /// The same content gives the same id; a new version, or different
     /// content, gives another.

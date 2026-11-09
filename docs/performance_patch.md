@@ -1110,13 +1110,16 @@ console about 6 ms per load.
   `respond(&Prepared, Cache, &HeaderMap)` picks the representation, the tag
   and the `Cache-Control` from `directive(mime, cache)` per answer — the
   policy is the caller's (the gateway's config, the host's default), never
-  the cache's. Every `respond` call moves to it (`server.rs:811`,
-  `host/src/ui.rs:89`, the `asset.rs` tests).
-- `content/` (from `content.rs`): `Roots { sources, stamped:
-  Arc<Stamped<Prepared>> }`, `Stamped<V>` generic over the value kept (W10
-  reuses it)
-  (with `Default` and a manual `Debug`), so every clone — the gateway's, the
-  tokera router's, the host's — shares one cache.
+  the cache's. Every `respond` call moves to it (through `Roots::serve` at
+  `server.rs:811` and `host/src/ui.rs:89`; the `asset.rs` tests directly).
+- `content.rs` with `content/stamped.rs` and `content/serve.rs`: `Roots {
+  sources, stamped: Arc<Stamped<Kept>> }`, `Stamped<V>` generic over the value
+  kept (W10 reuses it) (with `Default` and a manual `Debug`), so every clone —
+  the gateway's, the tokera router's, the host's — shares one cache. `Kept` is
+  `Whole(Arc<Prepared>)` or `Tagged { real, mime, hex }`; `Roots::serve(rel,
+  cache, req)` answers from it (a `Tagged` entry through
+  `asset::not_modified` before any read), and is what the gateway's static
+  path and the host's `/common` call.
   `Roots::resolve(rel)` walks the roots in order every request (canonicalise,
   `starts_with`, `metadata`) and yields `Disk { real, (mtime, len) }` or
   `Embedded(&'static File)`, so a file added to an earlier root still
@@ -1179,8 +1182,8 @@ body inflates to the plain page; a missing page 404 with no tag.
 **Change.** `content::Stamped<V>` is generic — the store under W8's file
 cache, keyed and validated the same way, by `Roots::resolve`. The tokera
 `State` keeps `posts: Stamped<Option<Arc<Post>>>` (`None` for a draft or
-broken front matter, so a broken file is not re-parsed per request) and a
-one-slot `Arc<Manifest>`. `listing`, `published` and `manifest` return
+broken front matter, so a broken file is not re-parsed per request) and
+`manifest: Stamped<Arc<Manifest>>`, which only ever holds `papers.yaml`. `listing`, `published` and `manifest` return
 `Arc`s; `discovery.rs` (`:86`, `:98`, `:135`) and the `pane_index` callers
 read them by reference. The directory is still listed per request (a
 `read_dir` and a stat per post — far cheaper than reading and parsing).
@@ -1227,9 +1230,11 @@ not an interval, and keeps its own visibility gate (G3).
 replaced together by a lossless 256×256 recompress — the size the MCP
 `serverInfo` icon declares (`mcp-server/src/protocol.rs:186-190`). The site's
 JSON-LD logo is `tokera/favicon.png`, a different file, untouched. The
-re-encode is done through Zen's `image_edit` (a 256×256 resize of the current
-mark, PNG); John places the returned file at the three paths, since no file
-tool writes a binary and the repository forbids a shell write into the tree.
+mark is already 256×256, so the bytes are the encoding's. It cannot go through
+Zen's `image_edit`: an upload is kept as a JPEG, so the round trip loses the
+transparency and is not lossless. John re-encodes it with a lossless PNG
+optimiser and places the result at the three paths, since no file tool writes
+a binary and the repository forbids a shell write into the tree.
 
 **Tests.** `the_switcher_icons_are_the_marks_their_sites_serve`
 (`page.rs:781`) also pins `zend/web/favicon.ico` to `brand/zen.png`; a new

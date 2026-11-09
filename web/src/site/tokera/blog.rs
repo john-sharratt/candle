@@ -13,18 +13,22 @@
 
 use std::sync::Arc;
 
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::HeaderMap;
+use axum::response::Response;
 
 use crate::markdown::{frontmatter, Post};
 
 use super::page::{self, Kind, Meta, Nav, Width};
-use super::State;
+use super::{page_answer, State};
 
 pub const DIR: &str = "blog";
 
+/// What a post's front matter is kept as.
+const KIND: &str = "post";
+
 struct Listed {
     slug: String,
-    meta: Post,
+    meta: Arc<Post>,
 }
 
 /// Every published post — slug, title, date and summary.
@@ -32,12 +36,39 @@ struct Listed {
 /// `pub(super)` so the sitemap and the feed are built from the same walk the
 /// index is. A second enumeration would be a second definition of "published",
 /// free to disagree about a draft.
-pub(super) async fn published(state: &State) -> Vec<(String, Post)> {
+pub(super) async fn published(state: &State) -> Vec<(String, Arc<Post>)> {
     listing(state)
         .await
         .into_iter()
         .map(|l| (l.slug, l.meta))
         .collect()
+}
+
+/// The front matter of the post at `rel`, when it is published: parsed once
+/// per version of its file and kept, a draft or a broken one as `None`.
+async fn post_at(state: &State, rel: &str) -> Option<Arc<Post>> {
+    let resolved = state.roots.resolve(rel).await?;
+    let key = resolved.key(KIND);
+    if let Some(kept) = state.posts.get(&key, resolved.stamp()) {
+        return kept;
+    }
+    let text = String::from_utf8(resolved.bytes().await?).ok()?;
+    let post = match frontmatter::post(&text) {
+        Ok((meta, _)) if !meta.draft => Some(Arc::new(meta)),
+        Ok(_) => None,
+        // A post with broken front matter is a mistake to fix, not a reason for
+        // the index to fail — the rest of the blog still lists.
+        Err(e) => {
+            tracing::warn!(post = %rel, error = %e, "skipping post");
+            None
+        }
+    };
+    if resolved.unchanged().await {
+        state
+            .posts
+            .put(key, resolved.stamp(), post.clone(), text.len());
+    }
+    post
 }
 
 async fn listing(state: &State) -> Vec<Listed> {
@@ -46,21 +77,11 @@ async fn listing(state: &State) -> Vec<Listed> {
         let Some(slug) = name.strip_suffix(".md") else {
             continue;
         };
-        let Some(bytes) = state.roots.read(&format!("{DIR}/{name}")).await else {
-            continue;
-        };
-        let Ok(text) = String::from_utf8(bytes) else {
-            continue;
-        };
-        match frontmatter::post(&text) {
-            Ok((meta, _)) if !meta.draft => out.push(Listed {
+        if let Some(meta) = post_at(state, &format!("{DIR}/{name}")).await {
+            out.push(Listed {
                 slug: slug.to_string(),
                 meta,
-            }),
-            Ok(_) => {}
-            // A post with broken front matter is a mistake to fix, not a reason
-            // for the index to fail — the rest of the blog still lists.
-            Err(e) => tracing::warn!(post = %name, error = %e, "skipping post"),
+            });
         }
     }
     // Featured posts lead, in the order they name; the rest follow by date,
@@ -110,7 +131,7 @@ fn pane_index(posts: &[Listed], current: Option<&str>) -> String {
     format!("<p class=\"pane-title\">Writing</p><ul class=\"pane-list\">{items}</ul>")
 }
 
-pub async fn index(state: Arc<State>) -> Response {
+pub async fn index(state: Arc<State>, req: &HeaderMap) -> Response {
     let posts = listing(&state).await;
     let mut body = String::from(
         "<header class=\"doc-head\"><h1>Blog</h1>\
@@ -157,15 +178,15 @@ pub async fn index(state: Arc<State>) -> Response {
     // Unlike the papers section, `/blog` renders an index rather than
     // redirecting to the newest post: with summaries to read, choosing what to
     // read next is a real decision rather than a page in the way.
-    Html(page::split(
+    let html = page::split(
         &meta,
         &pane_index(&posts, None),
         &format!("<div class=\"entries\">{body}</div>"),
-    ))
-    .into_response()
+    );
+    page_answer(&state, html, req)
 }
 
-pub async fn show(state: Arc<State>, slug: &str) -> Response {
+pub async fn show(state: Arc<State>, slug: &str, req: &HeaderMap) -> Response {
     // A slug is one path segment and nothing else — it is about to become a
     // file name.
     if slug.is_empty() || slug.contains(['/', '\\', '.']) {
@@ -223,7 +244,7 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
     // The tint goes on a wrapper around the whole document, so the heading
     // rules, links and callouts inside it all resolve `--post` to the same
     // colour without any of them naming it.
-    Html(page::split(
+    let html = page::split(
         &meta,
         &pane_index(&listing(&state).await, Some(slug)),
         &format!(
@@ -232,13 +253,69 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
             page::title_block(&meta),
             doc.html
         ),
-    ))
-    .into_response()
+    );
+    page_answer(&state, html, req)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::markdown::frontmatter;
+    use std::fs;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
+    use filetime::{set_file_mtime, FileTime};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::config::Cache as Policy;
+    use crate::content::{Roots, Stamped};
+    use crate::markdown::{frontmatter, Cache};
+
+    fn write_post(dir: &Path, slug: &str, title: &str, secs: u64) {
+        let path = dir.join(DIR).join(format!("{slug}.md"));
+        fs::write(
+            &path,
+            format!("---\ntitle: {title}\ndate: 2026-08-25\nsummary: s\n---\nbody\n"),
+        )
+        .unwrap();
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        set_file_mtime(&path, FileTime::from_system_time(at)).unwrap();
+    }
+
+    /// **A post is parsed once per version of its file**: two listings share
+    /// each post, and an edited post's alone is parsed again.
+    #[tokio::test]
+    async fn a_listing_parses_only_what_changed() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(DIR)).unwrap();
+        write_post(dir.path(), "a", "A", 1_000);
+        write_post(dir.path(), "b", "B", 1_000);
+        let state = State {
+            roots: Roots::disk(&[dir.path().to_path_buf()]),
+            papers_dir: None,
+            cache: Cache::new(),
+            policy: Policy {
+                short_secs: 60,
+                long_secs: 900,
+            },
+            posts: Stamped::default(),
+            manifest: Stamped::default(),
+        };
+        let first = listing(&state).await;
+        let second = listing(&state).await;
+        assert_eq!(first.len(), 2);
+        for (x, y) in first.iter().zip(&second) {
+            assert!(Arc::ptr_eq(&x.meta, &y.meta), "{}", x.slug);
+        }
+
+        write_post(dir.path(), "b", "B, revised", 2_000);
+        let third = listing(&state).await;
+        let by =
+            |l: &[Listed], slug: &str| Arc::clone(&l.iter().find(|p| p.slug == slug).unwrap().meta);
+        assert!(Arc::ptr_eq(&by(&first, "a"), &by(&third, "a")));
+        assert!(!Arc::ptr_eq(&by(&first, "b"), &by(&third, "b")));
+        assert_eq!(by(&third, "b").title, "B, revised");
+    }
 
     #[test]
     fn a_posts_front_matter_never_reaches_the_rendered_body() {

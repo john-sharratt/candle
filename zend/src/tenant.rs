@@ -319,7 +319,36 @@ fn modes_view(role: Role) -> Value {
 mod tests {
     use super::*;
 
+    use include_dir::File;
+
     use crate::loading::LoadStep;
+
+    fn every_file<'a>(dir: &'a Dir<'a>, out: &mut Vec<&'a File<'a>>) {
+        out.extend(dir.files());
+        for sub in dir.dirs() {
+            every_file(sub, out);
+        }
+    }
+
+    /// **The console polls only while it is seen** (`docs/performance_patch.md`
+    /// W12): every timed poll goes through `/common/lib/visible.js`. The only
+    /// files that start an interval of their own are the agents page, which
+    /// gates on visibility itself, the console's retry tick, and the mock.
+    #[test]
+    fn the_console_polls_only_through_the_visibility_helper() {
+        let mut files = Vec::new();
+        every_file(&WEB, &mut files);
+        let mut timed: Vec<String> = files
+            .into_iter()
+            .filter(|f| {
+                f.contents_utf8()
+                    .is_some_and(|text| text.contains("setInterval("))
+            })
+            .map(|f| f.path().to_string_lossy().replace('\\', "/"))
+            .collect();
+        timed.sort();
+        assert_eq!(timed, ["agents.html", "index.html", "zend-api.mock.js"]);
+    }
 
     #[test]
     fn a_load_is_reported_by_step_id() {

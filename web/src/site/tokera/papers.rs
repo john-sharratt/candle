@@ -14,12 +14,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
 use super::page::{self, Kind, Meta, Nav, Width};
-use super::State;
+use super::{page_answer, State};
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -84,23 +84,40 @@ impl Manifest {
     }
 }
 
-pub async fn manifest(state: &State) -> Manifest {
-    let Some(bytes) = state.roots.read("papers.yaml").await else {
-        return Manifest::default();
+/// The manifest, parsed once per version of `papers.yaml` and kept.
+pub async fn manifest(state: &State) -> Arc<Manifest> {
+    let Some(resolved) = state.roots.resolve(MANIFEST).await else {
+        return Arc::default();
     };
-    match std::str::from_utf8(&bytes)
+    let key = resolved.key(MANIFEST);
+    if let Some(kept) = state.manifest.get(&key, resolved.stamp()) {
+        return kept;
+    }
+    let Some(bytes) = resolved.bytes().await else {
+        return Arc::default();
+    };
+    let m = match std::str::from_utf8(&bytes)
         .map_err(anyhow::Error::from)
         .and_then(Manifest::parse)
     {
-        Ok(m) => m,
+        Ok(m) => Arc::new(m),
         Err(e) => {
             // Loud, because the symptom otherwise is an empty papers page with
             // no indication that the manifest was the problem.
             tracing::error!(error = %e, "papers.yaml is not usable — the section will be empty");
-            Manifest::default()
+            Arc::default()
         }
+    };
+    if resolved.unchanged().await {
+        state
+            .manifest
+            .put(key, resolved.stamp(), Arc::clone(&m), bytes.len());
     }
+    m
 }
+
+/// The manifest's name in the site's content.
+const MANIFEST: &str = "papers.yaml";
 
 /// The left pane: every published paper, with the one being read marked.
 ///
@@ -147,17 +164,25 @@ fn pane_index(m: &Manifest, current: Option<&str>) -> String {
 /// document does not exist at two addresses, and the index marks the right
 /// entry without special-casing.
 ///
-/// **302, never 301.** The target changes the moment a paper is added to the
-/// top of the manifest, and a permanent redirect would be cached against that.
+/// **307 (temporary), never 301.** The target changes the moment a paper is
+/// added to the top of the manifest, and a permanent redirect would be cached
+/// against that — so it is kept only for the short age a page is.
 pub async fn index(state: Arc<State>) -> Response {
     let m = manifest(&state).await;
     match m.papers.first() {
-        Some(top) => Redirect::temporary(&format!("/papers/{}", top.slug)).into_response(),
+        Some(top) => {
+            let mut res = Redirect::temporary(&format!("/papers/{}", top.slug)).into_response();
+            let age = format!("public, max-age={}", state.policy.short_secs);
+            if let Ok(v) = HeaderValue::from_str(&age) {
+                res.headers_mut().insert(header::CACHE_CONTROL, v);
+            }
+            res
+        }
         None => super::not_found(Nav::Papers, "No papers are published yet."),
     }
 }
 
-pub async fn show(state: Arc<State>, slug: &str) -> Response {
+pub async fn show(state: Arc<State>, slug: &str, req: &HeaderMap) -> Response {
     let m = manifest(&state).await;
     let Some(paper) = m.papers.iter().find(|p| p.slug == slug) else {
         return super::not_found(Nav::Papers, "No paper by that name.");
@@ -206,7 +231,7 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
         published: (!paper.date.is_empty()).then_some(paper.date.as_str()),
     };
 
-    Html(page::split(
+    let html = page::split(
         &meta,
         &pane_index(&m, Some(slug)),
         &format!(
@@ -217,8 +242,8 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
             body = doc.html,
             cite = cite_block(paper),
         ),
-    ))
-    .into_response()
+    );
+    page_answer(&state, html, req)
 }
 
 /// Plain-text citation, which is what a reader pastes. Deliberately not BibTeX:

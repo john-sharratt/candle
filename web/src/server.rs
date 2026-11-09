@@ -37,7 +37,6 @@ use cluster::upgrade::switch::PROOF;
 use crate::acme::names::groups;
 use crate::acme::peers::AcmePeers;
 use crate::acme::{Challenges, Manager};
-use crate::asset;
 use crate::auth::forwarded::identify;
 use crate::auth::{Auth, Gateways};
 use crate::bus;
@@ -52,6 +51,7 @@ use crate::content::{self, Roots};
 use crate::errors::{self, Problem};
 use crate::health::Health;
 use crate::proxy::{self, To};
+use crate::site;
 use crate::tls::{Entrance, Resolver, SecureEntrance};
 use crate::upstream_tls::Clients;
 
@@ -132,7 +132,7 @@ impl Builder {
             .iter()
             .filter_map(|s| {
                 let roots = b.roots.get(&s.name)?.clone();
-                crate::site::for_site(s, roots).map(|r| (s.name.clone(), r))
+                site::for_site(s, roots, b.cfg.server.cache).map(|r| (s.name.clone(), r))
             })
             .collect();
         for (name, router) in built_in {
@@ -516,7 +516,7 @@ fn announce(cfg: &Config, roots: &HashMap<String, Roots>, local: &HashMap<String
             // Said plainly, because a redirected host silently serving nothing
             // looks identical to a misconfigured one in this table.
             (Some(to), _) => format!("→ {to} (301)"),
-            (None, Some(rs)) if !rs.is_empty() => format!("{:?}", rs.0),
+            (None, Some(rs)) if !rs.is_empty() => format!("{:?}", rs.sources()),
             _ => "(no content)".into(),
         };
         tracing::info!(
@@ -803,10 +803,10 @@ async fn serve_files(app: &App, site: &Site, path: &str, headers: &header::Heade
     }
 
     for candidate in &tried {
-        if let Some(bytes) = roots.read(candidate).await {
-            // The request's own headers decide the answer: what it already
-            // holds, and what encodings it will take. See [`crate::asset`].
-            return asset::respond(candidate, bytes, app.cfg.server.cache, headers);
+        // The request's own headers decide the answer: what it already holds,
+        // and what encodings it will take. See [`crate::asset`].
+        if let Some(res) = roots.serve(candidate, app.cfg.server.cache, headers).await {
+            return res;
         }
     }
 
