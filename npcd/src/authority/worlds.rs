@@ -32,8 +32,10 @@ use super::written::{held_of, Written};
 struct Turns {
     /// Characters held for a hand-back, which take no turn meanwhile.
     handing: HashSet<u64>,
-    /// Characters part-way through a turn: a hand-back waits for its end.
-    turning: HashSet<u64>,
+    /// Characters part-way through a turn, and how many: the mind's and each
+    /// of its conversations' (`docs/npc_conversations.md` §9). A hand-back
+    /// waits for every one of them to end.
+    turning: HashMap<u64, usize>,
     /// Held characters whose hand-back has been sent: in flight, or to be sent
     /// again once an instant has passed.
     returning: HashMap<u64, Sending>,
@@ -335,7 +337,7 @@ impl Standing {
     pub fn hand_back_due(&self, npc: u64, now: Instant) -> bool {
         let mut turns = self.turns.lock().unwrap();
         turns.handing.insert(npc);
-        if turns.turning.contains(&npc) {
+        if turns.turning.contains_key(&npc) {
             return false;
         }
         let due = match turns.returning.get(&npc) {
@@ -383,23 +385,30 @@ impl Standing {
             .map(|since| now.duration_since(since))
     }
 
-    /// `npc`'s turn began; `false` if it is being handed back and must take
-    /// none.
+    /// A turn of `npc`'s began — its mind's or a conversation's; `false` if it
+    /// is being handed back and must take none.
     pub fn begin_turn(&self, npc: u64) -> bool {
         let mut turns = self.turns.lock().unwrap();
         if turns.handing.contains(&npc) {
             return false;
         }
-        turns.turning.insert(npc);
+        *turns.turning.entry(npc).or_insert(0) += 1;
         true
     }
 
+    /// One of `npc`'s turns ended.
     pub fn end_turn(&self, npc: u64) {
-        self.turns.lock().unwrap().turning.remove(&npc);
+        let mut turns = self.turns.lock().unwrap();
+        if let Some(n) = turns.turning.get_mut(&npc) {
+            *n -= 1;
+            if *n == 0 {
+                turns.turning.remove(&npc);
+            }
+        }
     }
 
     pub fn turning(&self, npc: u64) -> bool {
-        self.turns.lock().unwrap().turning.contains(&npc)
+        self.turns.lock().unwrap().turning.contains_key(&npc)
     }
 
     /// Mark the write `key` as on its way; `false` if it already is.
@@ -537,6 +546,23 @@ mod tests {
         w.mark_renamed("moon", "life");
         assert_eq!(w.renamed_written("moon").as_deref(), Some("life"));
         assert_eq!(w.renamed_written("moon"), None, "once");
+    }
+
+    /// **A hand-back waits for every turn a character has running** — its
+    /// mind's and its conversations' — not for the first to end.
+    #[test]
+    fn a_hand_back_waits_for_every_running_turn() {
+        let w = Standing::new(true);
+        assert!(w.begin_turn(1));
+        assert!(w.begin_turn(1));
+        w.end_turn(1);
+        assert!(w.turning(1));
+        assert!(!w.hand_back_due(1, Instant::now()));
+        w.end_turn(1);
+        assert!(!w.turning(1));
+        assert!(w.hand_back_due(1, Instant::now()));
+        w.end_turn(1);
+        assert!(!w.turning(1), "an extra end does not go below none");
     }
 
     /// A character being handed back takes no turn; one mid-turn is known

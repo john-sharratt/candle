@@ -92,6 +92,8 @@ use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
 use crate::engine::experience::store::Journals;
+use crate::engine::talk::authority::Changes;
+use crate::engine::talk::runner::Talks;
 use crate::engine::people;
 use crate::engine::talk::templates;
 use crate::engine::ingest;
@@ -435,6 +437,10 @@ pub struct Runtime {
     /// Every hosted world's bots' experience, written to npcd's checkout of
     /// the journals repository (`docs/npc_conversations.md` §5).
     pub journals: Arc<Journals>,
+    /// The conversations of the characters held here (§9).
+    pub talks: Arc<Talks>,
+    /// When each character's mission last changed through a conversation.
+    pub talk_changes: Changes,
     /// The mind repository, loaded and followed, with `--mind-repo`.
     mind_repos: OnceLock<Repos>,
     /// How a device-bridge job reaches an agent (`docs/zen_moon_mind.md` §15):
@@ -1015,6 +1021,8 @@ impl Runtime {
 
             mind_handle,
             journals: Journals::new(),
+            talks: Arc::new(Talks::new()),
+            talk_changes: Changes::new(),
             mind_repos: OnceLock::new(),
             agents: OnceLock::new(),
             relaunch: OnceLock::new(),
@@ -1060,6 +1068,15 @@ impl Runtime {
                 .upgrade()
                 .is_some_and(|rt| rt.standing.role(world) == Role::Disconnected)
         }));
+        // A conversation's lines and purposes go to its runner, never to the
+        // mind's inbox (`docs/npc_conversations.md` §9).
+        let talking = Arc::downgrade(&rt);
+        rt.scheduler.set_talk(Box::new(move |npc, kind| {
+            if let Some(rt) = talking.upgrade() {
+                rt.talk_arrived(npc, kind);
+            }
+        }));
+        rt.start_talking();
         Ok(rt)
     }
 
@@ -3732,7 +3749,7 @@ impl Runtime {
     /// the library where there is one, and where there is not the character is
     /// free-decoding — refusing what it said would mean a character that felt
     /// something the daemon had no vocabulary for felt nothing at all.
-    fn note_feeling(&self, npc_id: u64, act: &Act) {
+    pub(crate) fn note_feeling(&self, npc_id: u64, act: &Act) {
         if act.tool != "reflect" {
             return;
         }
@@ -6354,6 +6371,9 @@ impl Runtime {
     /// stopping) ends it. Idempotent — a character whose task is already
     /// running keeps it.
     pub fn spawn_character(self: &Arc<Self>, npc_id: u64) {
+        // What waited on its pair threads while it ran nowhere, or elsewhere:
+        // a `Told` pulse is not kept, so nothing else would answer it.
+        self.rescan_talks(npc_id);
         let Some(handle) = self.spawner.clone() else {
             // The unit tests exercise scheduling data without a runtime; the
             // daemon always has one.

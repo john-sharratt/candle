@@ -92,6 +92,27 @@ impl Threads {
             .collect()
     }
 
+    /// Every direct thread of `npc`'s where the other side said something
+    /// above `npc`'s read cursor: the thread, the other member, and those
+    /// lines, oldest first. What a conversation's rescan answers when the
+    /// character starts or wakes on a member (`docs/npc_conversations.md` §9).
+    pub fn unanswered_for(&self, npc: &str) -> Vec<(String, String, Vec<Message>)> {
+        self.direct_of(npc)
+            .into_iter()
+            .filter_map(|t| {
+                let read = t.member(npc).map_or(0, |m| m.read);
+                let lines: Vec<Message> = t
+                    .since_joined(npc)
+                    .iter()
+                    .filter(|m| m.from != npc && m.seq > read)
+                    .cloned()
+                    .collect();
+                let other = t.other_ids(npc).into_iter().next()?;
+                (!lines.is_empty()).then(|| (t.id.clone(), other, lines))
+            })
+            .collect()
+    }
+
     /// Whether a direct thread with `who` waits on `npc`'s answer: the other
     /// side's newest line is above `npc`'s read cursor. What Discord's typing
     /// indicator reads.

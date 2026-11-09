@@ -39,7 +39,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use journal_core::journal::Holds;
@@ -598,7 +598,14 @@ pub struct Scheduler {
     /// of it: it holds for a character this member is not lent, and it has to be
     /// standing already on the moment a lease brings one here and wakes it.
     suspended: Mutex<HashSet<u64>>,
+    /// Where a character's conversation lines and purposes go instead of its
+    /// inbox: its conversations answer them, never its mind
+    /// (`docs/npc_conversations.md` §9). Set once by the runtime.
+    talk: OnceLock<Talk>,
 }
+
+/// What takes a conversation's events off the scheduler.
+pub type Talk = Box<dyn Fn(u64, EventKind) + Send + Sync>;
 
 impl Default for Scheduler {
     fn default() -> Self {
@@ -616,6 +623,14 @@ impl Scheduler {
             recent_cap: recent_cap.max(1),
             born: Instant::now(),
             suspended: Mutex::new(HashSet::new()),
+            talk: OnceLock::new(),
+        }
+    }
+
+    /// Hand every character's conversation events to `talk`.
+    pub fn set_talk(&self, talk: Talk) {
+        if self.talk.set(talk).is_err() {
+            tracing::warn!("the scheduler's conversations were already set");
         }
     }
 
@@ -917,6 +932,12 @@ impl Scheduler {
 
     /// Deliver an event to a character. `false` if there is no such character.
     pub fn deliver(&self, npc_id: u64, world_ms: u64, salience: Salience, kind: EventKind) -> bool {
+        if let (EventKind::Talk { .. } | EventKind::Purpose { .. }, Some(talk)) =
+            (&kind, self.talk.get())
+        {
+            talk(npc_id, kind);
+            return true;
+        }
         let seq = self.seq.fetch_add(1, AtomicOrdering::Relaxed);
         let event = Event::new(seq, world_ms, salience, kind);
         let wakes = event.wakes();

@@ -247,6 +247,9 @@ impl Runtime {
     pub(crate) fn put_down(&self, npc: u64) {
         self.scheduler.retire(npc);
         self.stop_character(npc);
+        // Its conversations' turns too, before it is released: a
+        // conversation's timeline is written from one member only (§9).
+        self.talks.forget(npc);
         if let Some(minds) = self.minds.read().unwrap().clone() {
             minds.let_go(npc);
         }
