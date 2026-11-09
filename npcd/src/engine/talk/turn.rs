@@ -19,7 +19,7 @@ use serde_json::Map;
 use crate::api::now_ms;
 use crate::authority::ops::{ActSource, OpReply, WorldOp};
 use crate::engine::act::Act;
-use crate::engine::event::{EventKind, TalkLine};
+use crate::engine::event::{EventKind, Salience, TalkLine};
 use crate::engine::experience::line;
 use crate::engine::mind::TalkTurn;
 use crate::engine::runtime::Runtime;
@@ -327,6 +327,8 @@ impl Runtime {
         let source = ActSource::Talk {
             party: member.to_string(),
         };
+        // What the main loop is told this conversation did (§5.4).
+        let mut elsewhere: Vec<String> = Vec::new();
         for act in spoken
             .acts
             .iter()
@@ -338,14 +340,21 @@ impl Runtime {
             }
             let arg = |k: &str| act.args.get(k).and_then(|v| v.as_str()).unwrap_or_default();
             match act.tool {
-                "promise" => self.journals.note(
-                    &world,
-                    &body,
-                    ExperienceKind::Promised,
-                    &line::promised(arg("to"), arg("what"), arg("by")),
-                    about.clone(),
-                ),
-                t if t.starts_with("mission_") => self.talk_changes.mark(npc, world_ms),
+                "promise" => {
+                    let promised = line::promised(arg("to"), arg("what"), arg("by"));
+                    self.journals.note(
+                        &world,
+                        &body,
+                        ExperienceKind::Promised,
+                        &promised,
+                        about.clone(),
+                    );
+                    elsewhere.push(promised);
+                }
+                t if t.starts_with("mission_") => {
+                    self.talk_changes.mark(npc, world_ms);
+                    elsewhere.push(done.answer.clone());
+                }
                 _ => {}
             }
         }
@@ -361,18 +370,21 @@ impl Runtime {
             (Destination::Reply, Words::Send(w)) => {
                 let act = decided("reply").unwrap_or_else(|| to_party("reply", &seen.party_name));
                 self.say_to_party(npc, &act, &w, &source, &world, &body, &seen, about.clone())?;
+                elsewhere.push(format!("You said: {w}"));
                 Ended::Spoke
             }
             (Destination::Parting, Words::Send(w)) => {
                 let act =
                     decided("sign_off").unwrap_or_else(|| to_party("sign_off", &seen.party_name));
                 self.say_to_party(npc, &act, &w, &source, &world, &body, &seen, about.clone())?;
+                elsewhere.push(format!("You said goodbye: {w}"));
                 state.open = false;
                 Ended::Quiet
             }
             (_, Words::Send(w) | Words::Journal(w)) => {
                 self.journals
                     .note(&world, &body, ExperienceKind::Wrote, &w, about.clone());
+                elsewhere.push(format!("You wrote down: {w}"));
                 // Read through what it took in, so the party's typing
                 // indicator stops (§8).
                 if let Some(seq) = lines.iter().map(|l| l.seq).max() {
@@ -388,6 +400,17 @@ impl Runtime {
         state.last_turn = Stamp::now();
         state.seen = caught.seen;
         minds.set_talk_meta(&talk, &state.to_meta())?;
+        // Told quietly: it waits for the main loop's next turn rather than
+        // starting one.
+        self.scheduler.deliver(
+            npc,
+            world_ms,
+            Salience::IDLE,
+            EventKind::Elsewhere {
+                party: seen.party_name.clone(),
+                lines: elsewhere,
+            },
+        );
         minds.park_talk(talk).await;
         Ok(ended)
     }

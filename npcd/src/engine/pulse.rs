@@ -1566,15 +1566,12 @@ mod tests {
                 .clone()
         };
 
-        // Speech aimed at somebody needs somebody here to aim it at. A shout
-        // does not: it is for whoever is within earshot, including nobody.
-        assert_eq!(find("tell")["needs"], "somebody else here");
+        // Room speech is for people: aimed at somebody, it needs a person here
+        // to aim it at; a shout, a person within its reach, or the field.
+        assert_eq!(find("tell")["needs"], "a person here");
         // And a whisper needs somebody besides its listener to keep it from.
-        assert_eq!(find("whisper")["needs"], "two or more others here");
-        assert!(
-            find("shout")["needs"].is_null(),
-            "a shout needs nobody to be there"
-        );
+        assert_eq!(find("whisper")["needs"], "a person here, and somebody else");
+        assert_eq!(find("shout")["needs"], "a person within earshot, or the field");
         assert_eq!(find("gesture")["needs"], "somebody else here");
         assert!(
             find("reflect")["needs"].is_null(),

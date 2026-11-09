@@ -39,7 +39,7 @@
 
 use crate::clock::{WorldTime, DAY_MS};
 use crate::engine::event::{
-    message_line, mind_control_line, unread_line, Addressed, Event, EventKind,
+    elsewhere_line, message_line, mind_control_line, unread_line, Addressed, Event, EventKind,
 };
 
 /// How many people are named in `STATE` before the rest become "several others".
@@ -103,6 +103,7 @@ fn event_line(e: &Event) -> Option<String> {
         EventKind::Concluded { party, applied } => {
             Some(format!("On the phone with {party}: {}", applied.trim()))
         }
+        EventKind::Elsewhere { party, lines } => Some(elsewhere_line(party, lines)),
         // Its own thought, not a happening: handed over as the character's
         // inner line so the narrator keeps it in the first person.
         EventKind::MindControl { text } => {

@@ -162,9 +162,10 @@ mod tests {
     #[test]
     fn a_bot_s_buffer_keeps_its_newest_lines() {
         let b = Buffer::new();
-        for i in 0..(MAX_EPISODES + 5) {
-            b.restore(&bot("zen"), vec![line(i as i64, ExperienceKind::Said, &i.to_string())]);
-        }
+        let batch = (0..(MAX_EPISODES + 5))
+            .map(|i| line(i as i64, ExperienceKind::Said, &i.to_string()))
+            .collect();
+        b.restore(&bot("zen"), batch);
         let held = b.pending(&bot("zen"));
         assert_eq!(held.len(), MAX_EPISODES);
         assert_eq!(held.first().unwrap().text, "5");

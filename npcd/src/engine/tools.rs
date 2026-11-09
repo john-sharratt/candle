@@ -2220,6 +2220,8 @@ impl Within {
     pub fn among(company: &[&str]) -> Self {
         Self {
             people: company.iter().map(|n| n.to_string()).collect(),
+            // A person standing here hears a shout from here.
+            heard_by_person: !company.is_empty(),
             ..Self::among_characters(company)
         }
     }
@@ -2901,7 +2903,7 @@ mod tests {
         // pack, and a character carrying nothing has nothing to hand over.
         // Company is necessary for it and not sufficient.
         // `whisper` is absent too: with one other person here there is nobody
-        // to keep it from — see `Availability::AmongOthers`.
+        // to keep it from — see `Availability::PersonAmongOthers`.
         for expected in ["tell", "shout", "ask", "gesture", "act", "promise"] {
             assert!(
                 specs.iter().any(|s| s.name == expected),

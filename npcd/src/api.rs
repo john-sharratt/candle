@@ -6378,6 +6378,7 @@ layers:
                 "perception",
                 "action",
                 "interaction",
+                "talk",
                 "memory",
                 "world",
                 "environment",

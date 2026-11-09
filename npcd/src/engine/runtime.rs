@@ -91,6 +91,7 @@ use crate::engine::environment::{self, Reach};
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
+use crate::engine::experience;
 use crate::engine::experience::store::Journals;
 use journals::experience::ExperienceKind;
 use crate::engine::talk::authority::Changes;
@@ -3203,6 +3204,15 @@ impl Runtime {
             if let Some(line) = self.mark_spoken(npc_id, act) {
                 answer.push('\n');
                 answer.push_str(&line);
+            }
+            // A notable act of its own is its experience (§5.1): what changed
+            // the world, never walking, waiting or speech.
+            if experience::notable(act.tool) {
+                if let Some((hosted, body)) = self.body_of(npc_id) {
+                    let did = answer.lines().next().unwrap_or_default();
+                    self.journals
+                        .note(hosted.id(), &body, ExperienceKind::Did, did, None);
+                }
             }
         }
         // **Both halves, always, in one shape.**
@@ -7467,15 +7477,16 @@ mod tests {
         }
     }
 
-    /// **A message sent to a character has to reach its mind.**
+    /// **A message sent to a character has to reach its conversation.**
     ///
     /// The whole path, end to end, because every piece of it was individually
     /// correct while the thing a person actually does — message a character and
-    /// wait for an answer — did nothing at all. Sending writes a thread; the
-    /// world's next moment is what carries it to the inbox; and until it is in
-    /// the inbox the character has not been told anything.
+    /// wait for an answer — did nothing at all. Sending writes the pair's
+    /// thread; the world's next moment is what carries the line to the
+    /// character's conversation with them; the mind's inbox is never handed it
+    /// (`docs/npc_conversations.md` §9).
     #[tokio::test]
-    async fn a_message_reaches_the_characters_inbox_on_the_next_moment() {
+    async fn a_message_reaches_the_characters_conversation_on_the_next_moment() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         let hosted = rt.hosted.get(WORLD).expect("hosted");
@@ -7494,11 +7505,8 @@ mod tests {
         let moment = environment::advance(&hosted, &rt.bodies, &rt.scheduler, &|_| 0);
         assert_eq!(moment.messaged, 1, "the moment carried nothing to anybody");
 
-        assert_eq!(
-            rt.scheduler.inbox_depth(1),
-            Some(1),
-            "the message never reached the inbox"
-        );
+        assert_eq!(rt.talks.waiting(1), 1, "the line never reached the conversation");
+        assert_eq!(rt.scheduler.inbox_depth(1), Some(0), "the mind was handed it");
     }
 
     /// And it is handed over **once**. The sweep runs twice a second; a cursor

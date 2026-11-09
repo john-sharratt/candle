@@ -289,6 +289,11 @@ pub enum EventKind {
     /// new state and knows why (`docs/npc_conversations.md` §7.2). `party` is
     /// who it was with, by name; `applied` what came of it.
     Concluded { party: String, applied: String },
+    /// What one of the character's conversations said, wrote down or promised
+    /// (`docs/npc_conversations.md` §5.4), so the main loop knows it without
+    /// reading the conversation's timeline: walking the house, it knows it
+    /// just promised Mira the parcel. Rendered, never decoded.
+    Elsewhere { party: String, lines: Vec<String> },
     /// Messages wait unread on the character's handset: each thread by the
     /// name the character calls it, and how many.
     ///
@@ -402,6 +407,17 @@ pub fn message_line(thread: &str, from: &str, unread: usize) -> String {
 }
 
 /// How a [`EventKind::MindControl`] thought reads to the character.
+/// What a conversation did, as the main loop reads it: one line per thing,
+/// under who it was with.
+pub fn elsewhere_line(party: &str, lines: &[String]) -> String {
+    let mut s = format!("Meanwhile, on the phone with {party}:");
+    for l in lines {
+        s.push_str("\n- ");
+        s.push_str(l.trim());
+    }
+    s
+}
+
 pub fn mind_control_line(text: &str) -> String {
     format!("A thought you can't shake: {}", text.trim())
 }
@@ -417,6 +433,7 @@ impl EventKind {
             EventKind::Talk { .. } => "talk",
             EventKind::Purpose { .. } => "purpose",
             EventKind::Concluded { .. } => "concluded",
+            EventKind::Elsewhere { .. } => "elsewhere",
             EventKind::Unread { .. } => "unread",
             EventKind::Situation { .. } => "situation",
             EventKind::Nudge { .. } => "nudge",
@@ -494,13 +511,17 @@ impl Event {
     /// take part. Everything else — being addressed, a message, something done,
     /// somebody arriving, the room stirring — wakes, because an event nobody
     /// wakes for is one nobody ever reads.
+    ///
+    /// What a conversation did elsewhere wakes nothing either: the mind reads
+    /// it on its next turn, and a conversation that woke the mind on every
+    /// line would have it answering a phone call it is not on.
     pub fn wakes(&self) -> bool {
         !matches!(
             self.kind,
             EventKind::Speech {
                 to: Addressed::Other { .. },
                 ..
-            }
+            } | EventKind::Elsewhere { .. }
         )
     }
 
@@ -567,6 +588,7 @@ impl Event {
             EventKind::Concluded { party, applied } => {
                 format!("On the phone with {party}: {}", applied.trim())
             }
+            EventKind::Elsewhere { party, lines } => elsewhere_line(party, lines),
             EventKind::Unread { threads } => unread_line(threads),
             // Both arrive already written — a situation is generated from a
             // map, a nudge is authored beside the task it belongs to — so

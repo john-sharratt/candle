@@ -548,7 +548,7 @@ mod tests {
         .into_iter()
         .map(|n| (n, CorruptTurnPolicy::DropConversation))
         .collect();
-        for n in ["perception", "action", "interaction"] {
+        for n in ["perception", "action", "interaction", "talk"] {
             expected.insert(n, CorruptTurnPolicy::DropTurn);
         }
         assert_eq!(by_name, expected);
