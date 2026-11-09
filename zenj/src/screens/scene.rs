@@ -64,7 +64,7 @@ impl Scenes {
     /// The preset the next phrase changes to, without changing to it: what
     /// is read ahead.
     pub fn next(&self) -> Option<usize> {
-        (self.count > 0).then_some((self.at + 1) % self.count)
+        (self.count > 0).then(|| (self.at + 1) % self.count)
     }
 
     /// The preset to change to at `beat` — read `lead_ms` early at `bpm` —
