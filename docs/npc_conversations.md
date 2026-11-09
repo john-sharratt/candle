@@ -1049,7 +1049,26 @@ how npcd tells a person's body from a character's, `order_table.rs:56`).
 - **In the moon** visitors come only from console physical sessions
   (`npcd/src/engine/mod.rs:1032-1046`), so moon NPCs speak aloud only to someone
   standing in a console session. That is intended.
-- **NPC↔NPC room speech in front of a visitor** stays on the main loop (D2).
+- **In Battle Cities a player's body is an avatar, not a visitor.** The paths
+  below are in the Battle Cities repository, `crates/sim/src/`.
+  - **Bodies are born with a tower.** An avatar is born with its tower when
+    the tower is created. `MessageCreateTower` (`exports/region/create_tower.rs`)
+    spawns one `AvatarType::SuperSoldier` per tower, carrying the tower's name.
+  - **Ownership.** The tower records it as `main: AvatarId`
+    (`model/tower/mod.rs`), and the account records the tower
+    (`model/account.rs`).
+  - **Respawn keeps the id.** A dead avatar comes back with the same id at its
+    tower (`model/avatar/respawn.rs`).
+  - **So the rule is:** an avatar that is some tower's `main` is a person,
+    identified by the owning `AccountId`.
+  - **Not people:**
+    - companions (`tower.companions`), which are AI-driven bodies with their own
+      minds;
+    - zenlings and critters, which are object types of their own;
+    - spectators, who enter with no body at all.
+  - **Field play.** A spectator therefore never unlocks room speech, and a
+    player's avatar in a fight is also in field play.
+- **NPC↔NPC room speech in front of a person** stays on the main loop (D2).
 
 **What "field play" is.** There are no squads in the field sim today
 (`npcd/src/sim/field.rs:244-341`; `:25-27` is a module comment). Field play is
@@ -1216,9 +1235,16 @@ Live check, after the tests, in the moon (two NPCs and one Discord DM with Zen):
 
 ## 14. Open questions
 
-1. **How Battle Cities players appear in a world.** §12 assumes they are
-   `visitor:` bodies, like console visitors. The code does not show this. If
-   players arrive another way, `Within.people` must recognise them too.
+1. **How the Battle Cities "is a player" fact reaches npcd.** A player is the
+   avatar that is a tower's `main`, owned by an account (§12). What has not
+   been traced is how that reaches `Runtime::within` across the sim → npcd
+   boundary. The answer decides how `Within.people` and the conversation's
+   `Party::Person(account)` are filled for Battle Cities:
+   - an `is_player` mark on the body;
+   - or the account handle carried with the avatar.
+
+   Battle Cities companions are AI-driven avatars with a mind. If those minds
+   are npcd's, they are NPC parties like any other.
 
 ---
 
