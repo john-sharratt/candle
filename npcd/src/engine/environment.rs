@@ -286,7 +286,8 @@ pub fn push_one(
 /// their cursor has to advance, or the day they are finally bound to one they
 /// would be told a week of news at once — and so are the bodies of characters
 /// that run on another member, which perceive from that member's own copy of
-/// the world.
+/// the world. Neither has a percept composed: the first delta after a body
+/// starts being perceived here grounds it afresh.
 pub fn push(
     hosted: &Hosted,
     bindings: &Bindings,
@@ -305,18 +306,23 @@ fn push_minds(
     time: &WorldTimeOf,
     reach: &Reach,
 ) -> usize {
-    let deltas = hosted.sweep();
+    // The bodies perceived here, read before the world's lock: one with no mind,
+    // or whose character runs on another member, is swept without a percept
+    // being composed for it.
+    let perceived: Minds = minds
+        .iter()
+        .filter(|(_, &npc_id)| (reach.here)(npc_id))
+        .map(|(body, &npc_id)| (body.clone(), npc_id))
+        .collect();
+    let deltas = hosted.sweep_for(|body| perceived.contains_key(body));
     if deltas.is_empty() {
         return 0;
     }
     let mut told = 0;
     for delta in &deltas {
-        let Some(&npc_id) = minds.get(&delta.who) else {
+        let Some(&npc_id) = perceived.get(&delta.who) else {
             continue;
         };
-        if !(reach.here)(npc_id) {
-            continue;
-        }
         let events = hosted.read_both(|w, s| carried(w, s, delta));
         if events.is_empty() {
             continue;
@@ -696,8 +702,41 @@ mod tests {
             "only the extra could have heard it"
         );
         // The extra's cursor moved with everyone else's, so binding it now
-        // would start it at the present rather than at the beginning.
-        assert!(h.peek("extra").is_empty(), "{:?}", h.peek("extra"));
+        // would start it at the present rather than at the beginning. Its
+        // percept is composed afresh when asked, since nothing was shown it.
+        assert!(h.peek("extra").events.is_empty(), "{:?}", h.peek("extra"));
+    }
+
+    /// **Only a body perceived here has a percept composed**: with m1's
+    /// character running elsewhere, a push tells m2 alone, and m1's cursor
+    /// still moves past what was said.
+    #[test]
+    fn a_push_composes_only_for_bodies_perceived_here() {
+        let h = vault();
+        let b = Bindings::new();
+        let s = Scheduler::new(64);
+        h.with(|w| {
+            for (id, name) in [("m1", "Maker-01"), ("m2", "Maker-02"), ("m3", "Maker-03")] {
+                w.enter(id, name, at("green-room")).unwrap();
+            }
+        });
+        b.bind(1, h.id(), "m1").unwrap();
+        b.bind(2, h.id(), "m2").unwrap();
+        s.wake(1, 0, 0);
+        s.wake(2, 0, 0);
+        let only_two = |npc: u64| npc == 2;
+        let reach = Reach {
+            here: &only_two,
+            elsewhere: &nobody_else,
+        };
+        push(&h, &b, &s, &|_| 0, &reach);
+        h.with(|w| w.say("m3", "something").unwrap());
+        assert_eq!(push(&h, &b, &s, &|_| 0, &reach), 1);
+        assert!(h.peek("m1").events.is_empty(), "m1's cursor moved");
+        assert!(
+            h.peek("m1").percept.is_some(),
+            "m1 was never shown a percept here"
+        );
     }
 
     #[test]

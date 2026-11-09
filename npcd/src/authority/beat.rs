@@ -520,6 +520,33 @@ mod tests {
         assert_eq!(world.times_taken_in(), taken + 1);
     }
 
+    /// **A character lent back here is grounded afresh**: this member showed
+    /// its body where it stands before it was lent away, and on waking it the
+    /// character is still handed its percept on its first delta.
+    #[tokio::test]
+    async fn a_character_lent_back_receives_its_percept() {
+        let dir = TempDir::new().unwrap();
+        let (rt, _s) = daemon(&dir);
+        let world = rt.host(WORLD, Path::new(ROOMS)).unwrap();
+        rt.hold_world(WORLD, true);
+        world.with(|w| w.enter("m1", "Maker-01", at("green-room")).unwrap());
+        rt.bodies.bind(1, WORLD, "m1").unwrap();
+        assert!(world.delta("m1").percept.is_some(), "shown here once");
+
+        rt.wake_character(1);
+        let at_ms = 10_000_000;
+        for id in rt.scheduler.due_now(at_ms) {
+            rt.scheduler.tick(id, at_ms, at_ms, |_, _| Vec::new());
+        }
+        let turns = rt
+            .scheduler
+            .window_of(1, |win| {
+                win.turns().map(|t| t.text.clone()).collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(turns.iter().any(|t| t.starts_with("You are")), "{turns:?}");
+    }
+
     /// A beat that changed nothing writes nothing.
     #[tokio::test]
     async fn a_still_world_writes_nothing() {

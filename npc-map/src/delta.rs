@@ -140,11 +140,29 @@ impl Attention {
     /// because "costs nothing" has to mean *nothing*, including a row in a
     /// batch.
     pub fn sweep(&mut self, world: &mut World) -> Vec<Delta> {
+        self.sweep_for(world, |_| true)
+    }
+
+    /// [`Attention::sweep`] for the bodies `keep` names: a kept body is
+    /// [taken](Attention::take); one not kept has its cursor advanced and what
+    /// it was shown forgotten, and nothing is composed for it. Its cursor still
+    /// moves so that a body perceived here later is not handed a backlog, and
+    /// its first delta then grounds it afresh with a full percept.
+    pub fn sweep_for(&mut self, world: &mut World, keep: impl Fn(&str) -> bool) -> Vec<Delta> {
         let ids: Vec<String> = world.actors().map(|a| a.id.clone()).collect();
-        ids.iter()
-            .map(|id| self.take(world, id))
-            .filter(|d| !d.is_empty())
-            .collect()
+        let mut out = Vec::new();
+        for id in &ids {
+            if keep(id) {
+                let delta = self.take(world, id);
+                if !delta.is_empty() {
+                    out.push(delta);
+                }
+            } else {
+                self.shown.remove(id);
+                world.mark_seen(id);
+            }
+        }
+        out
     }
 
     /// Forget what a body was last shown, so the next delta grounds it again.
@@ -324,6 +342,30 @@ mod tests {
             .unwrap();
         let here = a.take(&mut w, "m1").percept.expect("it set off");
         assert!(here.contains("on your way"), "{here}");
+    }
+
+    /// **A body not kept is not composed for**: only the kept body's delta
+    /// comes back, the other's cursor still moves past what was said, and
+    /// once it is kept its next delta grounds it with a percept.
+    #[test]
+    fn a_sweep_composes_only_for_the_bodies_kept() {
+        let mut w = vault();
+        let mut a = Attention::new();
+        for (id, name) in [("m1", "Maker-01"), ("m2", "Maker-02"), ("m3", "Maker-03")] {
+            w.enter(id, name, at("band-one")).unwrap();
+        }
+        a.sweep(&mut w);
+        w.say("m3", "the line nobody kept hears").unwrap();
+
+        let only_m1 = a.sweep_for(&mut w, |id| id == "m1");
+        let who: Vec<&str> = only_m1.iter().map(|d| d.who.as_str()).collect();
+        assert_eq!(who, ["m1"]);
+        assert!(since(&w, "m2").is_empty(), "m2's cursor moved");
+
+        let both = a.sweep_for(&mut w, |id| id == "m1" || id == "m2");
+        let m2 = both.iter().find(|d| d.who == "m2").expect("m2 regrounded");
+        assert!(m2.percept.is_some());
+        assert!(m2.events.is_empty(), "no backlog");
     }
 
     #[test]

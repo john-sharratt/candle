@@ -633,17 +633,19 @@ impl Hosted {
         self.state.lock().expect("world lock").rooms.len()
     }
 
-    /// What every body has to be told, and nothing for the ones with nothing.
+    /// What every body `keep` names has to be told, and nothing for the ones
+    /// with nothing — see [`Attention::sweep_for`]. A body not kept is
+    /// composed nothing for; its cursor still advances.
     ///
     /// One pass under one lock, because the alternative — a lock per body — is
     /// sixteen acquisitions to answer one question and leaves the world free to
     /// move between two bodies' readings of the same moment.
-    pub fn sweep(&self) -> Vec<Delta> {
-        let mut state = self.state.lock().expect("world lock");
+    pub fn sweep_for(&self, keep: impl Fn(&str) -> bool) -> Vec<Delta> {
+        let mut state = self.state();
         let State {
             world, attention, ..
         } = &mut *state;
-        attention.sweep(world)
+        attention.sweep_for(world, keep)
     }
 
     /// What one body has to be told, marking it as delivered.
@@ -828,8 +830,11 @@ mod tests {
                     .unwrap();
             }
         });
-        assert_eq!(h.sweep().len(), 4);
-        assert!(h.sweep().is_empty(), "an idle world cost something");
+        assert_eq!(h.sweep_for(|_| true).len(), 4);
+        assert!(
+            h.sweep_for(|_| true).is_empty(),
+            "an idle world cost something"
+        );
     }
 
     #[test]

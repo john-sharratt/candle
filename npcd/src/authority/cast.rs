@@ -211,6 +211,9 @@ impl Runtime {
         self.scheduler.wake(npc, 0, world_ms);
         self.scheduler.set_pace(npc, Pace::WORKING, 0);
         if let Some((hosted, body)) = self.body_of(npc) {
+            // Grounded afresh, whatever this member last showed the body: its
+            // context here was let go when it was lent away.
+            hosted.forget(&body);
             environment::push_one(&hosted, &self.scheduler, npc, &body, &|id| {
                 self.world_ms(id)
             });

@@ -414,7 +414,7 @@ mod tests {
         replica.begin_decision("a");
         replica.end_decision("a");
         let _ = replica.read_both(|w, s| (w.actor("a").is_some(), s.table_open));
-        let _ = replica.sweep();
+        let _ = replica.sweep_for(|_| true);
         assert!(!replica.is_local(), "nothing the records hold changed");
 
         replica.with_dms(|_| ());
