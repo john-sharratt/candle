@@ -423,8 +423,12 @@ if the card's outputs are DisplayPort) — not cast, which adds seconds of delay
 - **The layer we own**: now playing and next, a request arriving ("Yen's request is up next"), Zen's
   one-line reasons, who has the decks (§6.3), and the midnight countdown, which takes over every
   screen from 23:59:00.
-- The visuals are driven from the predicted beat grid, so they can lead the sound by the TV's
-  measured latency, and land on the beat on every screen.
+- **Ahead of the beat.** Each screen keeps its own beat clock (`zenj/src/beat.rs`) on the deck
+  reader's snapshot, read every frame — never the live view's beat, which is half a second old by
+  the time it is published — predicted between readings and coasting through a gap in them for two
+  bars. A scene change begins early by the screen's lag (the TV's measured `latency_ms`) and by how
+  long its preset loads have been taking, the slowest of late counted (`screens/ahead.rs`), and the
+  next preset's file is read off the render thread a phrase ahead, so no change waits on the disk.
 
 While rekordbox is open BlackWorld is reserved (§3.1): no builds, no ingest or calibration, and its
 member drained while another serves every app, so the cores and the card's work are the decks' and
@@ -488,15 +492,34 @@ the limit; the bulb is.
 
 ### 9.3 Where it runs
 
-The `zenj-lights` thread (`zenj/src/lights/run.rs`), every 10 ms, reads the deck reader's
-snapshot — the same beat grid the screens use (§4.2, §8) — and the live view, and takes the
-conductor's cues and the tools' asks from queues. It leads the sound by the bulbs' latency,
-`lights.lead_ms` in `zenj.yaml`: 35 ms, the community figure, until spike 8 measures the room's.
+**Planned two bars ahead.** The lights run as two threads (`zenj/src/lights/run.rs`):
+
+- The **planner**, every 10 ms, keeps the coming 8 beats planned (`timeline.rs`): the look at every
+  half beat and at each moment between — a cue's beat, midnight — on a beat clock
+  (`zenj/src/beat.rs`) that predicts the beat from the deck reader's readings and coasts through a
+  gap in them for two bars. Each change is a send at the instant its beat falls, less that bulb's
+  lead. It tops the plan up as it runs out, and makes it again from now whenever what it was made
+  from changes: the clock jumps (a seek, a new track, the tempo nudged past half a BPM), the plan's
+  cues are armed or taken back, a person holds a scene or the house lights, the decks change hands,
+  the energy moves a step, a bulb dies or comes back. The director it plans with is pure — what the
+  room looks like at a given beat — so a plan thrown away loses nothing.
+- The **sender**, every millisecond, only plays the timeline through the rate gate, and asks the
+  bulbs whether they are there.
+
+The conductor hands the lights a plan's cues **the moment it is armed**, each with its beat, so they
+are in the plan bars before they fall, and takes them back when the decks are handed back.
+
+A stall upstream — the reader blind a moment, a slow tick, a busy machine — is then covered by the
+plan already made. What no buffer covers is the network to a bulb: a WiZ bulb acts on a message
+when it arrives, with no "at" to schedule it by, so a late datagram is a late light. Against that,
+each bulb is led by **its own measured lag** (`lead.rs`): half the round trip of its health polls,
+averaged, on top of `lights.lead_ms` — the bulb's own lag past the network, 30 ms by the community
+figure until spike 8 measures the room's.
 
 It never calls a model, and it never waits on the network. Its one UDP socket is non-blocking
 (`wire.rs`); a send the socket cannot take is dropped and the gate sends that bulb's state again: a
-light that is late is a light that is late, not a beat that is late. The conductor hands it a cue
-without waiting either. Nothing in the audio path waits on a bulb.
+light that is late is a light that is late, not a beat that is late. Nothing in the audio path waits
+on a bulb.
 
 ### 9.4 What drives the look
 

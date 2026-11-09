@@ -623,6 +623,7 @@ fn night(config: Config) -> anyhow::Result<()> {
         config.screens.clone(),
         Shared {
             live,
+            snapshot,
             midnight,
             sample_rate: rate,
         },

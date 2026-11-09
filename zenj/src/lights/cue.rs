@@ -1,8 +1,19 @@
 //! A lighting cue (§9.4): a move of a transition plan, armed, logged and
-//! replayed like any other, which the conductor hands to the lights thread
-//! when its beat comes.
+//! replayed like any other. The conductor hands the lights a plan's cues
+//! the moment it is armed — each with its beat, so they are planned ahead
+//! with everything else — and takes them back when the decks are handed
+//! back.
 
 use serde::{Deserialize, Serialize};
+
+/// What the conductor tells the lights of the plan's cues.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cues {
+    /// The armed plan's cues, each at its beat of the playing deck.
+    Armed(Vec<(f64, Cue)>),
+    /// The plan is gone: no cue stands.
+    Clear,
+}
 
 /// What a cue does to the room.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

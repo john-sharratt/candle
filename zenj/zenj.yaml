@@ -88,11 +88,12 @@ zen:
 # The ceiling track's WiZ bulbs (docs/zenj.md §9), driven while rekordbox is
 # open. The fixture map is written once they are fitted and each has its
 # reserved address (spike 7); until it exists there are no bulbs, and no
-# lights thread. The lead is the community-measured WiZ latency; spike 8
-# replaces it with the room's.
+# lights thread. `lead_ms` is a bulb's own lag past the network — the
+# community figure, until spike 8 measures the room's; the network's share is
+# measured per bulb from its polls and added on top.
 lights:
   fixtures: zenj/lights.yaml
-  lead_ms: 35
+  lead_ms: 30
 
 screens:
   presets: D:/zenj/presets

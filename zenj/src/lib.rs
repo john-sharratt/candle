@@ -5,6 +5,7 @@
 //! | [`music`] | A track: its key on the Camelot wheel, its profile |
 //! | [`control`] | Every control a mixer has, by one name |
 //! | [`plan`] | A transition plan: moves at beats |
+//! | [`beat`] | The beat as a clock: predicted, coasting, and when it jumps |
 //! | [`brain`] | The set plan, the shortlist, Zen's choice, transition plans |
 //! | [`conductor`] | The per-beat loop: plans run, loads confirmed, the watchdog |
 //! | [`hands`] | A person and ZenJ on one mixer: who holds it, taking back, the walk back |
@@ -27,6 +28,7 @@
 //! | [`config`] | The machine's file |
 //! | [`zen`] | Asking Zen, through the gateway, as the service `zenj` |
 
+pub mod beat;
 pub mod brain;
 pub mod bus;
 pub mod conductor;
