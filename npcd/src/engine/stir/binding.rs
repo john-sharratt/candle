@@ -32,6 +32,7 @@
 //! the standing faults of the world ([`Building::hear_of`]) as [`Report`]s and
 //! files an entry only for one that exists, and takes it down when it is gone.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::engine::stir::{Building, Stirring};
@@ -91,8 +92,9 @@ impl Building {
             .collect()
     }
 
-    /// Tell the building which faults stand in the world, for its board.
-    pub fn hear_of(&mut self, standing: Vec<Report>) {
+    /// Tell the building which faults stand in the world, for its board: the
+    /// one list every room's building is handed in a pass.
+    pub fn hear_of(&mut self, standing: Arc<[Report]>) {
         self.standing = standing;
     }
 

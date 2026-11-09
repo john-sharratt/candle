@@ -27,6 +27,7 @@ use candle_conversation::persistence::SharedSubstrate;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
 use web::auth::session::Identity;
 
 use crate::registry::Registry;
@@ -83,6 +84,26 @@ pub fn user_id_of(id: &Identity) -> String {
 /// records that point at it — a Discord link, a bot's DM with the person.
 pub fn key_of(id: &Identity) -> String {
     file_id(&id.provider, &id.sub)
+}
+
+/// `id`'s account, created or refreshed as a sign-in does it, through the
+/// shared store `accounts`: under its read lock when signing in changes
+/// nothing — every request but the first, and the first after the provider
+/// says something new — and under its write lock otherwise, where
+/// [`Accounts::upsert`] merges again, so no update is lost to a write that
+/// landed in between.
+pub async fn account_of(
+    accounts: &RwLock<Accounts>,
+    id: &Identity,
+    now_ms: u64,
+) -> anyhow::Result<Value> {
+    // Bound before the write lock is asked for: a read guard alive across it
+    // would wait on itself, the lock not being reentrant.
+    let current = accounts.read().await.current(id, now_ms);
+    if let Some(me) = current {
+        return Ok(me);
+    }
+    accounts.write().await.upsert(id, now_ms)
 }
 
 /// A person's Discord account, linked to their account here
@@ -169,6 +190,27 @@ impl Accounts {
     /// written here and never overwritten by a sign-in, or a name someone chose
     /// would be silently reverted every time they logged in.
     pub fn upsert(&mut self, id: &Identity, now_ms: u64) -> anyhow::Result<Value> {
+        let (key, existing, body) = self.merged(id, now_ms);
+        // Only write when something actually changed. A GET of `/v1/me` on
+        // every page load must not write a record every member then applies.
+        if existing.as_ref() != Some(&body) {
+            self.put(&key, body.clone())?;
+        }
+        Ok(with_public_id(&key, &body))
+    }
+
+    /// The public record for `id` when signing in now would change nothing —
+    /// what [`Self::upsert`] answers, read without writing — or `None` when it
+    /// would: a new identity, or one the provider has told something new.
+    /// What lets a request take the accounts' lock for reading.
+    pub fn current(&self, id: &Identity, now_ms: u64) -> Option<Value> {
+        let (key, existing, body) = self.merged(id, now_ms);
+        (existing.as_ref() == Some(&body)).then(|| with_public_id(&key, &body))
+    }
+
+    /// `id`'s record as it stands, and as signing in now would leave it: the
+    /// one merge [`Self::upsert`] writes and [`Self::current`] compares.
+    fn merged(&self, id: &Identity, now_ms: u64) -> (String, Option<Value>, Value) {
         let key = file_id(&id.provider, &id.sub);
 
         let existing = self.body(&key);
@@ -233,13 +275,7 @@ impl Accounts {
             normalise_profile(&mut profile);
             map.insert("profile".into(), profile);
         }
-
-        // Only write when something actually changed. A GET of `/v1/me` on
-        // every page load must not write a record every member then applies.
-        if existing.as_ref() != Some(&body) {
-            self.put(&key, body.clone())?;
-        }
-        Ok(with_public_id(&key, &body))
+        (key, existing, body)
     }
 
     /// Revise the profile: append a new turn, tombstone the previous one.
@@ -858,6 +894,29 @@ mod tests {
             a.shared.custom_objects_version(),
             first,
             "an unchanged upsert wrote a record"
+        );
+    }
+
+    /// **A sign-in that changes nothing is read, not written**: `current`
+    /// answers nothing for a new identity, the record once it is upserted,
+    /// nothing again when the provider sends a new name, and the record when a
+    /// field arrives empty — the stored value kept, as `upsert` keeps it.
+    #[test]
+    fn current_answers_only_when_signing_in_would_change_nothing() {
+        let dir = tmp();
+        let mut a = open(&dir);
+        let id = ident("g1", "wren@example.com", "Wren");
+        assert_eq!(a.current(&id, 1), None, "never seen");
+        let me = a.upsert(&id, 1).unwrap();
+        assert_eq!(a.current(&id, 2), Some(me));
+        assert_eq!(
+            a.current(&ident("g1", "wren@example.com", "Wren S"), 3),
+            None,
+            "a new name is a change"
+        );
+        assert!(
+            a.current(&ident("g1", "", "Wren"), 4).is_some(),
+            "an email not sent keeps the stored one"
         );
     }
 

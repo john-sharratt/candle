@@ -47,9 +47,6 @@
 use journal_core::period::{civil_from_days, days_from_civil};
 use serde_json::{json, Map, Value};
 
-use crate::npcs::Cast;
-use crate::registry::Registry;
-
 /// World-clock milliseconds in one narrative day.
 pub const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -165,7 +162,13 @@ impl Clock {
     /// these are hand-written: a document that says only `scale: 60` means a
     /// world running an hour a minute from now, not a malformed clock.
     pub fn of_world(body: &Value, now_ms: i64) -> Self {
-        let Some(t) = body.get("time").and_then(Value::as_object) else {
+        Self::of_time(body.get("time").and_then(Value::as_object), now_ms)
+    }
+
+    /// Read a world's `time` block itself — [`Self::of_world`] without the
+    /// document around it; the default when there is none.
+    pub fn of_time(time: Option<&Map<String, Value>>, now_ms: i64) -> Self {
+        let Some(t) = time else {
             return Self::started_now(now_ms);
         };
         let num = |k: &str| t.get(k).and_then(Value::as_i64);
@@ -280,37 +283,6 @@ pub fn with_clock(body: &Value, clock: Clock) -> Map<String, Value> {
     let mut map = body.as_object().cloned().unwrap_or_default();
     map.insert("time".into(), clock.to_document());
     map
-}
-
-/// What time it is for one character, given a view of the cast and an
-/// already-taken guard on the worlds.
-///
-/// **A guard in, not a lock.** The two callers reach the worlds registry by
-/// incompatible routes — the tick driver is a plain OS thread and takes
-/// `blocking_read`, an axum handler is inside the runtime and must `.await` —
-/// and `blocking_read` from a runtime thread does not contend, it *panics*.
-/// That is not a hypothetical: the census route did exactly this, and the whole
-/// Pulse page answered with a closed connection while the tick loop it was
-/// meant to be showing ran perfectly underneath.
-///
-/// So the locking is the caller's and the lookup is here, once. Zero for a
-/// character with no world, or a world with no clock — a character whose world
-/// cannot be read has no time of its own, and inventing one would put it in a
-/// day the world has never been in.
-pub fn world_ms_for(npcs: &Cast, worlds: &Registry, npc_id: u64, now_ms: i64) -> u64 {
-    let Some(world_id) = npcs.world_of(npc_id) else {
-        return 0;
-    };
-    worlds
-        .get(world_id)
-        .map(|r| Clock::of_world(&r.body, now_ms).now(now_ms).max(0) as u64)
-        .unwrap_or(0)
-}
-
-/// The calendar for one character's world, by the same route as
-/// [`world_ms_for`].
-pub fn world_time_for(npcs: &Cast, worlds: &Registry, npc_id: u64, now_ms: i64) -> WorldTime {
-    WorldTime::of(world_ms_for(npcs, worlds, npc_id, now_ms))
 }
 
 #[cfg(test)]

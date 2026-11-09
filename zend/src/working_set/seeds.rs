@@ -8,15 +8,16 @@
 //! faded like any other file, and the retrieval scope drops one the
 //! conversation has since changed.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::working_set::WorkingSetConfig;
 use candle_conversation::ConversationEngine;
 use zend_vfs::RepoFiles;
 
-use super::corpus::file_conversation;
+use super::corpus::{file_conversation_among, file_key_of};
 use super::coverage::Coverage;
+use crate::branch_ingest::keys::CONTENT_KEY;
 use crate::code_read::chain_finished;
 
 /// Finds the committed `repo_map` unit for a folder — repository and path
@@ -66,9 +67,29 @@ impl Seeding<'_> {
     pub fn apply(&self, target: TimelineId, config: &WorkingSetConfig) -> usize {
         let lineage: HashSet<TimelineId> =
             self.engine.inherited_chain(target).into_iter().collect();
+        // Every file seed keyed first, so the substrate is read once for all.
+        let seeds: Vec<(&str, Option<Seed<'_>>, Option<String>)> = config
+            .seeds
+            .iter()
+            .map(|path| {
+                let seed = parse(path);
+                let key = match seed {
+                    Some(Seed::File { repo, rel }) => file_key_of(self.files, repo, rel),
+                    _ => None,
+                };
+                (path.as_str(), seed, key)
+            })
+            .collect();
+        let keys: BTreeSet<String> = seeds.iter().filter_map(|(_, _, k)| k.clone()).collect();
+        let readings = if keys.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.engine
+                .find_conversations_by_metadata_values(CONTENT_KEY, &keys)
+        };
         let mut resolved: Vec<(TimelineId, &str)> = Vec::new();
-        for path in &config.seeds {
-            match self.resolve(path) {
+        for &(path, seed, ref key) in &seeds {
+            match self.resolve(seed, key.as_deref(), &readings) {
                 Some(timeline) if lineage.contains(&timeline) => {}
                 Some(timeline) => resolved.push((timeline, path)),
                 None => tracing::debug!(
@@ -102,15 +123,21 @@ impl Seeding<'_> {
         candidates.len() - refused.len()
     }
 
-    /// The conversation `path` names on this branch, if a finished one does.
-    fn resolve(&self, path: &str) -> Option<TimelineId> {
-        match parse(path)? {
+    /// The conversation `seed` names on this branch, if a finished one does:
+    /// a file's from the readings of its version, keyed `key`.
+    fn resolve(
+        &self,
+        seed: Option<Seed<'_>>,
+        key: Option<&str>,
+        readings: &BTreeMap<String, Vec<TimelineId>>,
+    ) -> Option<TimelineId> {
+        match seed? {
             Seed::Folder { repo, inner } => {
                 let unit = (self.folder_of)(repo, inner)?;
                 chain_finished(self.engine, unit).then_some(unit)
             }
-            Seed::File { repo, rel } => {
-                file_conversation(self.engine, self.files, self.coverage, repo, rel)
+            Seed::File { .. } => {
+                file_conversation_among(self.engine, self.coverage, readings.get(key?)?)
             }
         }
     }

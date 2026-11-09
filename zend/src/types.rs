@@ -368,14 +368,15 @@ impl Usage {
 
 // ── Streaming response (SSE) ──────────────────────────────────────────────────
 
-/// One SSE data frame in the OpenAI streaming format.
+/// One SSE data frame in the OpenAI streaming format, borrowing the reply's
+/// id and model rather than copying them into every token's frame.
 #[derive(Debug, Serialize)]
-pub struct ChatCompletionChunk {
-    pub id: String,
+pub struct ChatCompletionChunk<'a> {
+    pub id: &'a str,
     pub object: &'static str,
     /// Unix timestamp (seconds) at which the completion was created.
     pub created: u64,
-    pub model: String,
+    pub model: &'a str,
     pub choices: Vec<ChunkChoice>,
     /// The reply's token counts: only on the last chunk, whose `choices` is
     /// empty, and only when the request asked for them (`stream_options`).
@@ -473,12 +474,12 @@ pub struct ResponseToolCall {
 mod usage_tests {
     use super::*;
 
-    fn chunk(usage: Option<Usage>) -> ChatCompletionChunk {
+    fn chunk(usage: Option<Usage>) -> ChatCompletionChunk<'static> {
         ChatCompletionChunk {
-            id: "c".into(),
+            id: "c",
             object: "chat.completion.chunk",
             created: 7,
-            model: "passthrough".into(),
+            model: "passthrough",
             choices: Vec::new(),
             usage,
         }

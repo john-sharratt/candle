@@ -15,6 +15,7 @@ use axum::extract::{FromRequestParts, Request};
 use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
+use serde::de::IgnoredAny;
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 use tokio_tungstenite::client_async;
@@ -39,20 +40,60 @@ pub fn member_name(node: u64, host: &str) -> String {
     }
 }
 
-/// `line` from the member at `node` on `host`, tagged.
-pub fn tag(line: &str, node: u64, host: &str) -> String {
-    let mut o = match serde_json::from_str::<Value>(line) {
-        Ok(Value::Object(o)) => o,
-        _ => {
-            let mut o = Map::new();
-            o.insert("line".into(), Value::String(line.to_string()));
-            o
+/// How one member's lines are tagged: the three fields, written once.
+pub struct Tag {
+    node: String,
+    host: String,
+    member: String,
+    /// `,"node":…,"host":…,"member":…}` — spliced before an object's last
+    /// brace.
+    suffix: String,
+}
+
+impl Tag {
+    /// The tag of the member at `node` on `host`.
+    pub fn of(node: u64, host: &str) -> Tag {
+        let member = member_name(node, host);
+        let node = format!("{node:016x}");
+        let text = |s: &str| Value::String(s.to_string()).to_string();
+        let suffix = format!(
+            ",\"node\":{},\"host\":{},\"member\":{}}}",
+            text(&node),
+            text(host),
+            text(&member)
+        );
+        Tag {
+            node,
+            host: host.to_string(),
+            member,
+            suffix,
         }
-    };
-    o.insert("node".into(), Value::String(format!("{node:016x}")));
-    o.insert("host".into(), Value::String(host.to_string()));
-    o.insert("member".into(), Value::String(member_name(node, host)));
-    Value::Object(o).to_string()
+    }
+
+    /// `line`, tagged. A line that is a JSON object keeps its own bytes, the
+    /// fields spliced in before its closing brace — one already carrying one
+    /// of them then has it twice, and a reader keeps the last. Anything else
+    /// is wrapped as `{line, node, host, member}`.
+    pub fn tag(&self, line: &str) -> String {
+        let object = line.trim_end();
+        let is_object = object.starts_with('{')
+            && object.ends_with('}')
+            && serde_json::from_str::<IgnoredAny>(line).is_ok();
+        if is_object {
+            let open = &object[..object.len() - 1];
+            return if open[1..].trim().is_empty() {
+                format!("{open}{}", &self.suffix[1..])
+            } else {
+                format!("{open}{}", self.suffix)
+            };
+        }
+        let mut o = Map::new();
+        o.insert("line".into(), Value::String(line.to_string()));
+        o.insert("node".into(), Value::String(self.node.clone()));
+        o.insert("host".into(), Value::String(self.host.clone()));
+        o.insert("member".into(), Value::String(self.member.clone()));
+        Value::Object(o).to_string()
+    }
 }
 
 pub async fn merge(
@@ -141,10 +182,10 @@ async fn read_member(
         .hub
         .open(app, node, app)
         .ok_or("the member's socket is gone")?;
-    let host = gateway
-        .hub
-        .member(app, node)
-        .map_or(String::new(), |m| m.host);
+    let tag = Tag::of(
+        node,
+        &gateway.hub.member_host(app, node).unwrap_or_default(),
+    );
     let mut request = format!("ws://{app}{path}")
         .into_client_request()
         .map_err(|e| e.to_string())?;
@@ -157,7 +198,7 @@ async fn read_member(
     while let Some(message) = ws.next().await {
         match message.map_err(|e| e.to_string())? {
             MemberMessage::Text(text) => {
-                if tx.send(tag(&text, node, &host)).await.is_err() {
+                if tx.send(tag.tag(&text)).await.is_err() {
                     return Ok(());
                 }
             }
@@ -173,6 +214,10 @@ mod tests {
     use super::*;
 
     use serde_json::json;
+
+    fn tag(line: &str, node: u64, host: &str) -> String {
+        Tag::of(node, host).tag(line)
+    }
 
     #[test]
     fn a_line_is_tagged_with_its_member() {
@@ -202,6 +247,32 @@ mod tests {
                 "line": "plain",
             })
         );
+    }
+
+    /// **An object keeps its own bytes**, the member's fields spliced before
+    /// its closing brace — an empty one without a leading comma, whitespace
+    /// after the brace dropped; a line braced but not JSON, and one that is
+    /// not an object, are wrapped.
+    #[test]
+    fn an_object_line_is_spliced_exactly() {
+        let t = Tag::of(1, "h\"q");
+        let fields = r#""node":"0000000000000001","host":"h\"q","member":"h\"q 00000000""#;
+        assert_eq!(t.tag(r#"{"a": 1}"#), format!(r#"{{"a": 1,{fields}}}"#));
+        assert_eq!(t.tag("{}"), format!("{{{fields}}}"));
+        assert_eq!(t.tag("{ }"), format!("{{ {fields}}}"));
+        assert_eq!(t.tag("{\"a\":1}  \n"), format!(r#"{{"a":1,{fields}}}"#));
+        let wrapped = |line: &str| -> Value { serde_json::from_str(&t.tag(line)).unwrap() };
+        let want = |line: &str| {
+            json!({
+                "line": line,
+                "node": "0000000000000001",
+                "host": "h\"q",
+                "member": "h\"q 00000000",
+            })
+        };
+        assert_eq!(wrapped("{oops}"), want("{oops}"));
+        assert_eq!(wrapped("[1, 2]"), want("[1, 2]"));
+        assert_eq!(wrapped("plain"), want("plain"));
     }
 
     #[test]

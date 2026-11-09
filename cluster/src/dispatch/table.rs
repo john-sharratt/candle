@@ -125,6 +125,14 @@ impl RouteTable {
         })
     }
 
+    /// Whether a route answers `method` on `path` — [`Self::lookup`]'s answer
+    /// without collecting its parameters, so asking allocates nothing.
+    pub fn answers(&self, method: &str, path: &str) -> bool {
+        self.matcher
+            .at(path)
+            .is_ok_and(|m| m.value.iter().any(|i| self.routes[*i].answers(method)))
+    }
+
     /// The dispatch for `method` on `path`: a path no route declares is a UI
     /// file.
     pub fn dispatch(&self, method: &str, path: &str) -> Dispatch {
@@ -332,6 +340,37 @@ mod tests {
         // A path no route declares is a UI file.
         assert_eq!(t.dispatch("GET", "/index.html"), Dispatch::Ui);
         assert_eq!(t.dispatch("GET", "/v1/chat/completions"), Dispatch::Ui);
+    }
+
+    /// **`answers` is `lookup` without the parameters**: the two agree on
+    /// every route of the table, under each method, and on paths and methods
+    /// no route declares.
+    #[test]
+    fn answers_agrees_with_lookup() {
+        let t = zend_like();
+        let paths = [
+            "/v1/status",
+            "/v1/chat/completions",
+            "/v1/conversations/c-42",
+            "/v1/world/w1",
+            "/v1/local/tick/now",
+            "/v1/local",
+            "/index.html",
+            "/v1/world",
+            "/",
+        ];
+        for path in paths {
+            for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+                assert_eq!(
+                    t.answers(method, path),
+                    t.lookup(method, path).is_some(),
+                    "{method} {path}"
+                );
+            }
+        }
+        assert!(t.answers("PUT", "/v1/world/w1"));
+        assert!(!t.answers("POST", "/v1/world/w1"));
+        assert!(!t.answers("GET", "/index.html"));
     }
 
     #[test]

@@ -36,6 +36,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use npc_map::salience::Weight;
@@ -137,10 +138,17 @@ impl Rooms {
         occupied.sort();
         occupied.dedup();
 
+        // Every room fitted first, then the building-wide fault list read
+        // once for the pass. A fault raised in a room this pass reaches the
+        // rooms ordered before it at the next pass, 500ms on; rooms speak
+        // minutes apart.
+        for at in &occupied {
+            self.fit(world, at, since);
+        }
+        let standing: Arc<[Report]> = self.standing(world).into();
         let mut spoke = 0;
         for at in occupied {
-            self.fit(world, &at, since);
-            let standing = self.standing(world);
+            let standing = Arc::clone(&standing);
             let objects = objects_at(world, &at);
             let place = format!("{}/{}", at.area, at.node);
             let room = self.fitted.get_mut(&at).expect("fitted above");

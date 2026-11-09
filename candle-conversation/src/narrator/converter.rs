@@ -58,17 +58,15 @@ fn send_to_converter_streaming(
         .submit_turn(message)
         .map_err(|e: ConversationError| ConvertError::InferenceError(e.to_string()))?;
 
-    let mut all_tokens: Vec<u32> = Vec::new();
+    let mut text = decoder.stream();
     let mut response = None;
 
     for event in handle.stream() {
         match event {
             TurnEvent::Token(id) => {
-                let prev_len = decoder.decode(&all_tokens).len();
-                all_tokens.push(id);
-                let full = decoder.decode(&all_tokens);
-                // Append only the newly decoded suffix — avoids \r line-wrap mess.
-                eprint!("{}", &full[prev_len..]);
+                // Only what this token released — avoids \r line-wrap mess.
+                let from = text.push(id);
+                eprint!("{}", &text.text()[from..]);
                 std::io::stderr().flush().ok();
             }
             TurnEvent::Done(resp) => {

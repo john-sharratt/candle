@@ -33,10 +33,8 @@ pub fn mark(engine: &ConversationEngine, timeline: TimelineId, starter: &str) ->
 /// taken, or for one no conversation started.
 pub fn starter(engine: &ConversationEngine, timeline: TimelineId) -> Option<String> {
     engine
-        .conversation_metadata(timeline)?
-        .get(FROM_KEY)
+        .conversation_metadata_value(timeline, FROM_KEY)
         .filter(|from| !from.is_empty())
-        .cloned()
 }
 
 /// Put `files`, a fresh set, on `theirs`' branches with `theirs`' changes.

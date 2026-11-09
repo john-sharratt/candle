@@ -12,7 +12,7 @@ use std::env::current_dir;
 use std::net::SocketAddr;
 use std::path::{absolute, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::{ConnectInfo, Request};
@@ -32,7 +32,7 @@ use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::runtime::Handle;
-use tokio::task::{block_in_place, spawn_blocking, JoinHandle};
+use tokio::task::{spawn_blocking, JoinHandle};
 use tokio::time::interval;
 use web::auth::Roles;
 
@@ -40,7 +40,6 @@ use crate::accounts::Accounts;
 use crate::api::{self, Authored};
 use crate::authority;
 use crate::authorize::{self, Signer};
-use crate::clock;
 use crate::collections::Libraries;
 use crate::discord::bots;
 use crate::discord::client::{self as discord_client, Client as DiscordClient};
@@ -927,23 +926,10 @@ fn routes(
 /// The runtime's resolvers and sinks, each reading the authored state back.
 fn install_sinks(runtime: &Arc<Runtime>, authored: &Arc<Authored>, feelings: Vec<String>) {
     // The clock resolver closes over the state: worlds run at their own pace,
-    // and a character has to see its own world's time. `blocking_read` panics
-    // on a runtime worker, so a call from inside the runtime steps off it.
+    // and a character has to see its own world's time. It reads the clocks'
+    // snapshot, so it takes no lock and runs on any thread alike.
     let clock_state = authored.clone();
-    runtime.set_clock(Arc::new(move |npc_id: u64| {
-        let read = || {
-            clock::world_ms_for(
-                &clock_state.npcs.view(),
-                &clock_state.worlds.blocking_read(),
-                npc_id,
-                now_ms_i64(),
-            )
-        };
-        match Handle::try_current() {
-            Ok(_) => block_in_place(read),
-            Err(_) => read(),
-        }
-    }));
+    runtime.set_clock(Arc::new(move |npc_id: u64| clock_state.world_ms(npc_id)));
 
     runtime.set_feelings(feelings);
 
@@ -1087,20 +1073,40 @@ fn run_sink(write: impl FnOnce() + Send + 'static) {
     }
 }
 
-/// Wall-clock milliseconds as the narrative clock takes them — signed, because
-/// a world can be jumped backwards past its own epoch.
-fn now_ms_i64() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use clap::Parser;
+    use include_dir::File;
+
+    /// Every file under `dir`, at any depth.
+    fn every_file<'a>(dir: &'a Dir<'a>, out: &mut Vec<&'a File<'a>>) {
+        out.extend(dir.files());
+        for sub in dir.dirs() {
+            every_file(sub, out);
+        }
+    }
+
+    /// **The console polls only while it is seen** (`docs/performance_patch.md`
+    /// N9): every timed poll goes through `/common/lib/visible.js`, so the only
+    /// files that start an interval of their own are the landing page's
+    /// animation and the mock backend.
+    #[test]
+    fn the_console_polls_only_through_the_visibility_helper() {
+        let mut files = Vec::new();
+        every_file(&CONSOLE, &mut files);
+        let mut timed: Vec<String> = files
+            .into_iter()
+            .filter(|f| {
+                f.contents_utf8()
+                    .is_some_and(|text| text.contains("setInterval("))
+            })
+            .map(|f| f.path().to_string_lossy().replace('\\', "/"))
+            .collect();
+        timed.sort();
+        assert_eq!(timed, ["lib/api.mock.js", "pages/landing.js"]);
+    }
 
     /// **What npcd asks without loading is what its load asks** — its prefill
     /// pass — and no guests: a host running zend alone seats this in npcd's

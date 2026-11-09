@@ -21,6 +21,7 @@
 import { h, mount, fmtNum } from './dom.js';
 import { makeChart, makeStackChart } from './chart.js';
 import { pick } from './aggregate.js';
+import { pollWhileVisible } from './visible.js';
 
 const POLL_MS = 4000;
 const MiB = 1024;
@@ -831,11 +832,11 @@ export function mountPerf(page, { title }) {
   }, 1000);
 
   refresh();
-  const pollTimer = setInterval(refresh, POLL_MS);
+  const stopPolling = pollWhileVisible(POLL_MS, refresh);
 
   return {
     stop: () => {
-      clearInterval(pollTimer);
+      stopPolling();
       clearInterval(ageTimer);
       window.removeEventListener('resize', onResize);
       for (const c of charts) if (c.destroy) c.destroy();

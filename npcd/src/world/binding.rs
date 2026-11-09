@@ -158,12 +158,8 @@ impl Bindings {
     /// twice — a report that reshuffles between two reads is a report nobody
     /// can diff.
     pub fn in_world(&self, world: &str) -> Vec<(u64, String)> {
-        self.inner
-            .lock()
-            .expect("bindings lock")
-            .by_body
-            .iter()
-            .filter(|(at, _)| at.world == world)
+        let inner = self.inner.lock().expect("bindings lock");
+        of_world(&inner.by_body, world)
             .map(|(at, npc)| (*npc, at.body.clone()))
             .collect()
     }
@@ -182,11 +178,8 @@ impl Bindings {
     /// that were standing in it.
     pub fn release_world(&self, world: &str) -> usize {
         let mut inner = self.inner.lock().expect("bindings lock");
-        let gone: Vec<Bound> = inner
-            .by_body
-            .keys()
-            .filter(|at| at.world == world)
-            .cloned()
+        let gone: Vec<Bound> = of_world(&inner.by_body, world)
+            .map(|(at, _)| at.clone())
             .collect();
         for at in &gone {
             if let Some(npc) = inner.by_body.remove(at) {
@@ -203,6 +196,21 @@ impl Bindings {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// The bindings of `world`, in body order: a range of `by_body`, which orders
+/// by world first, so another world's bindings are never walked.
+fn of_world<'a>(
+    by_body: &'a BTreeMap<Bound, u64>,
+    world: &'a str,
+) -> impl Iterator<Item = (&'a Bound, &'a u64)> + 'a {
+    let from = Bound {
+        world: world.to_string(),
+        body: String::new(),
+    };
+    by_body
+        .range(from..)
+        .take_while(move |(at, _)| at.world == world)
 }
 
 #[cfg(test)]
@@ -341,5 +349,20 @@ mod tests {
         // And the reverse index went with them.
         assert!(b.mind_of("vault", "m1").is_none());
         b.bind(5, "vault", "m1").expect("the body was freed");
+    }
+
+    /// **A world's bindings are its own, not another's whose id it begins**:
+    /// `a` and `ab` sit side by side in body order, and each reads and
+    /// releases only what is its own.
+    #[test]
+    fn a_world_is_not_a_prefix_of_another() {
+        let b = Bindings::new();
+        b.bind(1, "a", "x").unwrap();
+        b.bind(2, "a", "y").unwrap();
+        b.bind(3, "ab", "x").unwrap();
+        assert_eq!(b.in_world("a"), vec![(1, "x".into()), (2, "y".into())]);
+        assert_eq!(b.release_world("a"), 2);
+        assert!(b.is_bound(3), "`ab` stays bound");
+        assert_eq!(b.in_world("ab"), vec![(3, "x".into())]);
     }
 }

@@ -70,6 +70,7 @@ use super::queue::{Placing, Queue, RouteAt, Urgency, HOLD, RESERVE_FOR};
 use super::registry::{
     is_errand, CardKey, MemberView, PeerAsk, Pick, Registry, HOSTING_APP, LATENCY_APP,
 };
+use super::routing::{standing_of, Routing, Standing};
 use super::status::{
     mode_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
 };
@@ -1839,13 +1840,14 @@ impl Hub {
     }
 
     /// The dispatch table `app`'s ready members declared.
-    pub fn table(&self, app: &str) -> Option<RouteTable> {
+    pub fn table(&self, app: &str) -> Option<Arc<RouteTable>> {
         self.state().registry.table(app).cloned()
     }
 
     /// The table a request for `method` on `path` is matched in
-    /// ([`super::registry::Registry::table_for`]).
-    pub fn table_for(&self, app: &str, method: &str, path: &str) -> Option<RouteTable> {
+    /// ([`super::registry::Registry::table_for`]) — shared, so the hub's lock
+    /// is held for a scan and a reference count.
+    pub fn table_for(&self, app: &str, method: &str, path: &str) -> Option<Arc<RouteTable>> {
         self.state().registry.table_for(app, method, path).cloned()
     }
 
@@ -1860,6 +1862,54 @@ impl Hub {
 
     pub fn member(&self, app: &str, node: u64) -> Option<MemberView> {
         self.state().registry.member(app, node).cloned()
+    }
+
+    /// How a request for `method` on `path` to `app` is routed, decided under
+    /// one hold of the hub: no member admitted; none ready, and which one
+    /// stands by; or the table it is matched in.
+    pub fn routing(&self, app: &str, method: &str, path: &str) -> Routing {
+        let s = self.state();
+        if let Some(table) = s.registry.table_for(app, method, path) {
+            return Routing::Table(Arc::clone(table));
+        }
+        match standing_of(&s.registry, app) {
+            Standing::Unadmitted => Routing::Unadmitted,
+            Standing::By(node) => Routing::StandingBy(node),
+        }
+    }
+
+    /// Whether `app` has a member admitted here, and which stands by while none
+    /// is ready — under one hold of the hub, never a table, so a request placed
+    /// already is not placed again.
+    pub fn standing(&self, app: &str) -> Standing {
+        standing_of(&self.state().registry, app)
+    }
+
+    /// Whether `node` is an admitted member of `app` — without copying it.
+    pub fn has_member(&self, app: &str, node: u64) -> bool {
+        self.state().registry.member(app, node).is_some()
+    }
+
+    /// The host `node` of `app` runs on, when it is admitted.
+    pub fn member_host(&self, app: &str, node: u64) -> Option<String> {
+        self.state()
+            .registry
+            .member(app, node)
+            .map(|m| m.host.clone())
+    }
+
+    /// Each of `nodes`' host and build count, in their order, under one lock —
+    /// `("", 0)` for a node not admitted.
+    pub fn member_labels(&self, app: &str, nodes: &[u64]) -> Vec<(String, u32)> {
+        let s = self.state();
+        nodes
+            .iter()
+            .map(|&n| {
+                s.registry
+                    .member(app, n)
+                    .map_or((String::new(), 0), |m| (m.host.clone(), m.build.count))
+            })
+            .collect()
     }
 
     /// Every agent of `app` admitted here, by host and then node (§11.7).

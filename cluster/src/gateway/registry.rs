@@ -12,6 +12,7 @@ mod pick;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use applied_set::AppliedSet;
 
@@ -208,7 +209,7 @@ impl Registry {
 
     pub fn routes(&mut self, app: &str, node: u64, routes: RouteTable) {
         if let Some(m) = self.app(app).members.get_mut(&node) {
-            m.routes = Some(routes);
+            m.routes = Some(Arc::new(routes));
         }
     }
 
@@ -410,6 +411,11 @@ impl Registry {
             .unwrap_or_default()
     }
 
+    /// Whether any member of `app` is admitted, ready or not.
+    pub fn admits(&self, app: &str) -> bool {
+        self.apps.get(app).is_some_and(|a| !a.members.is_empty())
+    }
+
     /// `MEMBERS`: the app's epoch and every admitted member.
     pub fn listing(&self, app: &str) -> (u64, Vec<MemberInfo>) {
         self.apps.get(app).map_or((0, Vec::new()), |a| {
@@ -440,7 +446,7 @@ impl Registry {
     }
 
     /// The dispatch table the app's ready members declared.
-    pub fn table(&self, app: &str) -> Option<&RouteTable> {
+    pub fn table(&self, app: &str) -> Option<&Arc<RouteTable>> {
         self.apps
             .get(app)?
             .members
@@ -453,14 +459,14 @@ impl Registry {
     /// member's that declares a route answering it — tables differ while a
     /// build that adds a route rolls out, and where a member declares a route
     /// only while it holds what the route needs — else [`Self::table`].
-    pub fn table_for(&self, app: &str, method: &str, path: &str) -> Option<&RouteTable> {
+    pub fn table_for(&self, app: &str, method: &str, path: &str) -> Option<&Arc<RouteTable>> {
         self.apps
             .get(app)?
             .members
             .values()
             .filter(|m| m.ready())
             .filter_map(|m| m.routes.as_ref())
-            .find(|t| t.lookup(method, path).is_some())
+            .find(|t| t.answers(method, path))
             .or_else(|| self.table(app))
     }
 }

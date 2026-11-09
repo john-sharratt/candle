@@ -12,18 +12,19 @@
 use axum::Router;
 use std::path::PathBuf;
 
-use crate::config::Site;
+use crate::config::{Cache, Site};
 use crate::content::Roots;
 
 pub mod tokera;
 
-/// The in-process router for a site this crate serves itself, if it has one.
+/// The in-process router for a site this crate serves itself, if it has one,
+/// its pages kept for the ages `policy` gives the server's files.
 ///
 /// The single place that maps a site name to its own backend, so `--check` and
 /// the running server can never disagree about which sites have one.
-pub fn for_site(site: &Site, roots: Roots) -> Option<Router> {
+pub fn for_site(site: &Site, roots: Roots, policy: Cache) -> Option<Router> {
     match site.name.as_str() {
-        "tokera" => Some(tokera::router(roots, site.papers_abs.clone())),
+        "tokera" => Some(tokera::router(roots, site.papers_abs.clone(), policy)),
         _ => None,
     }
 }

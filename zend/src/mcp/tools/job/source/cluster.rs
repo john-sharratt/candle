@@ -152,11 +152,13 @@ pub async fn standing(
         .map_or((summary.clone(), String::new()), |(a, b)| {
             (a.to_string(), format!("\n{b}"))
         });
+    let text = output(&ndjson);
     Ok(Standing {
         ended,
         line: format!("{job}: {line}"),
         detail,
-        total: output(&ndjson).lines().count() as u64,
+        total: text.lines().count() as u64,
+        size: text.len() as u64,
         marks: Vec::new(),
     })
 }

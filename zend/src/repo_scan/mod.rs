@@ -670,9 +670,7 @@ pub(crate) fn retire_crashed_partials(engine: &ConversationEngine) {
     let e = engine;
     let mut retired = 0usize;
     for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
-        if e.conversation_metadata(tl)
-            .is_some_and(|m| ingest_committed(&m))
-        {
+        if ingest_committed(|key| e.has_conversation_metadata_key(tl, key)) {
             continue;
         }
         match e.tombstone_timeline(tl) {
@@ -738,8 +736,8 @@ pub(crate) fn wipe_layer(engine: &ConversationEngine) {
 /// Named and separate so the rule is stated once and testable without an
 /// engine; the sweep that applies it needs a loaded model and so is covered by
 /// the engine-backed suite rather than here.
-fn ingest_committed(meta: &BTreeMap<String, String>) -> bool {
-    meta.contains_key(CONTENT_KEY)
+fn ingest_committed(holds: impl Fn(&str) -> bool) -> bool {
+    holds(CONTENT_KEY)
 }
 
 /// Metadata key holding a unit's directory. Distinct from `code_read`'s
@@ -907,8 +905,7 @@ fn run_dir_pool(
                                 Share::Mine(hold) => {
                                     let already = hold.recheck()
                                         && engine
-                                            .conversation_metadata_values(CONTENT_KEY)
-                                            .contains(&job.unit.key);
+                                            .has_live_intact_metadata(CONTENT_KEY, &job.unit.key);
                                     if already {
                                         Ok(())
                                     } else {
@@ -1093,8 +1090,7 @@ fn process_one_dir(
             .find_conversations_by_metadata(DIR_KEY, &unit.dir)
             .into_iter()
             .filter(|&tl| {
-                e.conversation_metadata(tl)
-                    .and_then(|m| m.get(CONTENT_KEY).cloned())
+                e.conversation_metadata_value(tl, CONTENT_KEY)
                     .is_some_and(|key| !live.contains(&key))
             })
             .collect();
@@ -1450,22 +1446,20 @@ mod tests {
     /// the whole layer, silently, one boot later.
     #[test]
     fn a_conversation_is_committed_only_once_it_carries_a_content_key() {
+        let committed = |m: &BTreeMap<String, String>| ingest_committed(|k| m.contains_key(k));
         let mut meta = BTreeMap::new();
-        assert!(
-            !ingest_committed(&meta),
-            "no metadata at all is not committed"
-        );
+        assert!(!committed(&meta), "no metadata at all is not committed");
 
         meta.insert(DIR_KEY.to_string(), "candle-nn/src/".to_string());
         assert!(
-            !ingest_committed(&meta),
+            !committed(&meta),
             "the directory tag alone is a crashed partial — it is written at \
              conversation creation, before any work"
         );
 
         meta.insert(CONTENT_KEY.to_string(), "abc123".to_string());
         assert!(
-            ingest_committed(&meta),
+            committed(&meta),
             "the content key is the commit, and is written only on success"
         );
 
@@ -1475,14 +1469,14 @@ mod tests {
         // this is belt-and-braces on the predicate itself.)
         let mut key_only = BTreeMap::new();
         key_only.insert(CONTENT_KEY.to_string(), "abc123".to_string());
-        assert!(ingest_committed(&key_only));
+        assert!(committed(&key_only));
 
         // A generation from before units were keyed by content carries only
         // the old hash, and is not committed.
         let mut old = BTreeMap::new();
         old.insert(DIR_KEY.to_string(), "candle-nn/src/".to_string());
         old.insert("content_sha256".to_string(), "abc123".to_string());
-        assert!(!ingest_committed(&old));
+        assert!(!committed(&old));
     }
 
     fn unit(dir: &str) -> DirUnit {

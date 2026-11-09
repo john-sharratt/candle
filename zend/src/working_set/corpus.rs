@@ -9,7 +9,7 @@
 //! dialogue, so the readings of the version it read are kept out of the
 //! working set for the rest of the turn's loop ([`readings_of`]).
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use candle_conversation::projection::TimelineId;
@@ -61,41 +61,55 @@ pub(crate) fn read_target(call: &ToolCall, workspace: &Workspace) -> Option<(Str
     Some((repo.to_string(), normalise(path, &dir)))
 }
 
-/// Every ingested reading of the version of the file `call` read: the
-/// conversations a turn that ran `call` keeps out of its working set.
+/// Every ingested reading of the versions of the files `calls` read, in call
+/// order: the conversations a turn that ran them keeps out of its working set.
+/// One pass of the substrate for the whole round.
 ///
-/// Empty for any call but a `file_read`, and for a file the conversation has
-/// changed — its read returned its own copy, which no reading holds.
-pub fn readings_of(
+/// Nothing for a call but a `file_read`, and nothing for a file the
+/// conversation has changed — its read returned its own copy, which no
+/// reading holds.
+pub fn readings_of_all(
     engine: &ConversationEngine,
     files: &RepoFiles,
     workspace: &Workspace,
-    call: &ToolCall,
+    calls: &[ToolCall],
 ) -> Vec<TimelineId> {
-    let Some((repo, rel)) = read_target(call, workspace) else {
+    let keys: Vec<String> = calls
+        .iter()
+        .filter_map(|call| {
+            let (repo, rel) = read_target(call, workspace)?;
+            file_key_of(files, &repo, &rel)
+        })
+        .collect();
+    if keys.is_empty() {
         return Vec::new();
-    };
-    let Some((blob, _)) = committed(files, &repo, &rel) else {
-        return Vec::new();
-    };
-    engine.find_conversations_by_metadata(CONTENT_KEY, &file_key(&format!("{repo}/{rel}"), &blob))
+    }
+    let wanted: BTreeSet<String> = keys.iter().cloned().collect();
+    let found = engine.find_conversations_by_metadata_values(CONTENT_KEY, &wanted);
+    keys.iter()
+        .flat_map(|k| found.get(k).into_iter().flatten().copied())
+        .collect()
 }
 
-/// The finished, complete `code_reading` conversation that read `rel` in
-/// `repo` at the blob the conversation's base holds — `None` when the
-/// conversation changed the file (its own copy is what its read must return),
-/// no conversation read that version, or none that read every line.
-pub fn file_conversation(
-    engine: &ConversationEngine,
-    files: &RepoFiles,
-    coverage: &Coverage,
-    repo: &str,
-    rel: &str,
-) -> Option<TimelineId> {
+/// The content key of `rel` in `repo` at the blob the conversation's base
+/// holds — `None` when the conversation changed the file (its own copy is
+/// what its read must return), or there is no such file.
+pub fn file_key_of(files: &RepoFiles, repo: &str, rel: &str) -> Option<String> {
     let (blob, _) = committed(files, repo, rel)?;
-    engine
-        .find_conversations_by_metadata(CONTENT_KEY, &file_key(&format!("{repo}/{rel}"), &blob))
-        .into_iter()
+    Some(file_key(&format!("{repo}/{rel}"), &blob))
+}
+
+/// The finished, complete `code_reading` conversation among `readings` — the
+/// conversations that read one version of a file — or `None` when none read
+/// every line.
+pub fn file_conversation_among(
+    engine: &ConversationEngine,
+    coverage: &Coverage,
+    readings: &[TimelineId],
+) -> Option<TimelineId> {
+    readings
+        .iter()
+        .copied()
         // A read whose chain never finished holds no summary: placed, it
         // would put an assistant that deliberates and answers nothing into
         // this conversation.
@@ -119,11 +133,15 @@ fn committed(files: &RepoFiles, repo: &str, rel: &str) -> Option<(Oid, u64)> {
 /// How many lines the file `timeline` read has, as its ingest recorded it.
 /// `None` for a conversation that recorded none.
 fn lines_of(engine: &ConversationEngine, timeline: TimelineId) -> Option<usize> {
-    lines_in(&engine.conversation_metadata(timeline)?)
+    lines_in(
+        engine
+            .conversation_metadata_value(timeline, LINES_KEY)
+            .as_deref(),
+    )
 }
 
-fn lines_in(meta: &BTreeMap<String, String>) -> Option<usize> {
-    meta.get(LINES_KEY)?.parse().ok()
+fn lines_in(recorded: Option<&str>) -> Option<usize> {
+    recorded?.parse().ok()
 }
 
 #[cfg(test)]
@@ -249,11 +267,8 @@ mod tests {
     /// that recorded none — or something that is no count — answers nothing.
     #[test]
     fn the_line_count_is_the_one_the_ingest_recorded() {
-        let mut meta = BTreeMap::from([(CONTENT_KEY.to_string(), "k".to_string())]);
-        assert_eq!(lines_in(&meta), None);
-        meta.insert(LINES_KEY.to_string(), "350".to_string());
-        assert_eq!(lines_in(&meta), Some(350));
-        meta.insert(LINES_KEY.to_string(), "many".to_string());
-        assert_eq!(lines_in(&meta), None);
+        assert_eq!(lines_in(None), None);
+        assert_eq!(lines_in(Some("350")), Some(350));
+        assert_eq!(lines_in(Some("many")), None);
     }
 }

@@ -504,9 +504,7 @@ pub(crate) fn retire_crashed_partials(engine: &ConversationEngine) {
     let e = engine;
     let mut retired = 0usize;
     for (tl, path) in e.conversations_with_metadata_key(PATH_KEY) {
-        let committed = e
-            .conversation_metadata(tl)
-            .is_some_and(|m| m.contains_key(CONTENT_KEY));
+        let committed = e.has_conversation_metadata_key(tl, CONTENT_KEY);
         if committed {
             continue;
         }
@@ -926,8 +924,7 @@ fn process_one_file(
             .find_conversations_by_metadata(PATH_KEY, &file.path)
             .into_iter()
             .filter(|&tl| {
-                e.conversation_metadata(tl)
-                    .and_then(|m| m.get(CONTENT_KEY).cloned())
+                e.conversation_metadata_value(tl, CONTENT_KEY)
                     .is_some_and(|key| key == job.key || !job.live.contains(&key))
             })
             .collect();

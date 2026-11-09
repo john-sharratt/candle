@@ -1625,7 +1625,7 @@ impl Runtime {
             commit: url_of("bench_commit"),
         };
         let (merge_status, merge_publish) = (url_of("merge_status"), url_of("merge_publish"));
-        hosted.with_both(|w, s| {
+        hosted.read_both(|w, s| {
             // Riding the lift, there is nothing to do but arrive: told the way
             // from the landing it is still standing on, a rider tried to call
             // the car it was already in.
@@ -2322,7 +2322,7 @@ impl Runtime {
     /// [`npc_map::world::World::begin_decision`].
     pub fn begin_decision(&self, npc_id: u64) {
         if let Some((hosted, body)) = self.body_of(npc_id) {
-            hosted.with(|w| w.begin_decision(&body));
+            hosted.begin_decision(&body);
         }
     }
 
@@ -2330,7 +2330,7 @@ impl Runtime {
     /// is. See [`npc_map::world::World::end_decision`].
     pub fn end_decision(&self, npc_id: u64) {
         if let Some((hosted, body)) = self.body_of(npc_id) {
-            hosted.with(|w| w.end_decision(&body));
+            hosted.end_decision(&body);
         }
     }
 
@@ -4334,9 +4334,8 @@ impl Runtime {
     }
 
     /// [`Self::persona_of`] for an async caller. The persona resolver reads the
-    /// app state's `tokio::sync::RwLock`s, so — like [`Self::world_ms_async`] —
-    /// a character or reflection task runs it on the blocking pool rather than
-    /// panicking on `blocking_read`. Placing the body afterwards reads only the
+    /// app state's `tokio::sync::RwLock`s, so a character or reflection task
+    /// runs it on the blocking pool rather than panicking on `blocking_read`. Placing the body afterwards reads only the
     /// runtime's own (non-async) world state, so it stays on the task.
     pub(crate) async fn persona_of_async(&self, npc_id: u64) -> Option<OwnedPersona> {
         let src = self.persona.read().unwrap().clone()?;
@@ -4446,28 +4445,15 @@ impl Runtime {
         (!seen.trim().is_empty()).then_some(seen)
     }
 
-    /// What time it is in this character's world.
+    /// What time it is in this character's world. The resolver reads a
+    /// lock-free snapshot of the worlds' clocks, so any thread may ask — the
+    /// tick driver and a character task alike.
     ///
     /// Zero before a clock is installed — a window between construction and
     /// startup that the driver is not running in, so nothing reads it.
     pub fn world_ms(&self, npc_id: u64) -> u64 {
         let g = self.clock.read().unwrap();
         g.as_ref().map_or(0, |f| f(npc_id))
-    }
-
-    /// [`Self::world_ms`] for an async caller. The clock resolver reads the
-    /// `tokio::sync::RwLock`s on the app state (it is shared with the blocking
-    /// loader thread that set it), and `blocking_read` panics on an async
-    /// worker — so a character task runs it on the blocking pool instead. The
-    /// resolver is a cheap map lookup; the hop is a boundary, not a cost.
-    pub async fn world_ms_async(&self, npc_id: u64) -> u64 {
-        let clock = self.clock.read().unwrap().clone();
-        match clock {
-            Some(f) => tokio::task::spawn_blocking(move || f(npc_id))
-                .await
-                .unwrap_or(0),
-            None => 0,
-        }
     }
 
     /// Whether the engine is loaded and the cast is thinking.
@@ -5481,8 +5467,8 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         // Where the world's records last saw its body standing — or, in a
         // world taken in this boot from the objects kept before world records,
         // where its own record said, once.
-        let remembered =
-            place_of(&rt.standing.written(world), &Runtime::body_id(id)).or_else(|| {
+        let remembered = place_of(&rt.standing.written(world).records, &Runtime::body_id(id))
+            .or_else(|| {
                 rt.standing
                     .from_legacy(world)
                     .then(|| casting.at.clone())
@@ -6460,9 +6446,8 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
         {
             // Per character, not once per pass: two characters in
             // different worlds are at different instants, and one of
-            // those worlds may be paused. Async: the clock resolver reads
-            // the app-state locks, and this runs on a tokio worker.
-            let world_ms = rt.world_ms_async(id).await;
+            // those worlds may be paused.
+            let world_ms = rt.world_ms(id);
             // The day boundary is checked before the tick, so a
             // character that has crossed midnight wakes into its new
             // conversation rather than acting once more in yesterday's.
@@ -7220,48 +7205,6 @@ mod tests {
         rt.set_clock(Arc::new(|npc_id| npc_id * 1_000));
         assert_eq!(rt.world_ms(3), 3_000);
         assert_eq!(rt.world_ms(7), 7_000);
-    }
-
-    /// **A resolver that reads a `tokio::sync` lock must be safe to ask from a
-    /// character task.**
-    ///
-    /// The clock and persona resolvers close over the daemon's app state, whose
-    /// locks are `tokio::sync::RwLock` — and `blocking_read` on one panics
-    /// inside an async execution context. The character loop runs on a tokio
-    /// worker, so calling the sync `world_ms`/`persona_of` there panicked the
-    /// task on its very first tick; the supervisor then restarted it into the
-    /// same panic forever, and the whole cast sat at zero ticks while its
-    /// inboxes filled. The model-free tests never caught it because no test
-    /// stands a character loop up against a real resolver. This does: a clock
-    /// that reads a `tokio` lock, asked through the async variant from a
-    /// multi-thread runtime, must return the value rather than panic.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_async_resolver_read_does_not_panic_on_a_tokio_lock() {
-        let rt = rt();
-        // The shape of the real clock resolver: a `tokio::sync::RwLock` the
-        // closure reads with `blocking_read`, exactly as the daemon's does.
-        let state = Arc::new(tokio::sync::RwLock::new(1_000u64));
-        let clock_state = Arc::clone(&state);
-        rt.set_clock(Arc::new(move |npc_id| {
-            *clock_state.blocking_read() * npc_id
-        }));
-
-        // The async variant the character loop uses: it must reach the value.
-        assert_eq!(rt.world_ms_async(3).await, 3_000);
-
-        // And it must keep working under a concurrent writer holding the lock
-        // across an await — the async caller waits on the blocking pool rather
-        // than deadlocking the worker.
-        {
-            let mut w = state.write().await;
-            let got = tokio::spawn({
-                let rt = Arc::clone(&rt);
-                async move { rt.world_ms_async(5).await }
-            });
-            *w = 2_000;
-            drop(w);
-            assert_eq!(got.await.unwrap(), 10_000);
-        }
     }
 
     // ── the world, hosted ───────────────────────────────────────────────────

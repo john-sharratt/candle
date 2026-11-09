@@ -146,9 +146,7 @@ pub fn retire_crashed_partials(engine: &ConversationEngine, layer: &str) {
     let e = engine;
     let mut retired = 0usize;
     for tl in e.find_conversations_by_metadata(LAYER_KEY, layer) {
-        let committed = e
-            .conversation_metadata(tl)
-            .is_some_and(|m| m.contains_key(CONTENT_KEY));
+        let committed = e.has_conversation_metadata_key(tl, CONTENT_KEY);
         if !committed && e.tombstone_timeline(tl).is_ok() {
             retired += 1;
         }
@@ -453,10 +451,7 @@ fn is_committed(engine: &ConversationEngine, key: &str) -> bool {
     [CONTENT_KEY, JOB_KEY].iter().any(|field| {
         e.find_conversations_by_metadata(field, key)
             .iter()
-            .any(|tl| {
-                e.conversation_metadata(*tl)
-                    .is_some_and(|m| m.contains_key(CONTENT_KEY))
-            })
+            .any(|tl| e.has_conversation_metadata_key(*tl, CONTENT_KEY))
     })
 }
 
@@ -767,12 +762,14 @@ fn log_provenance(
             continue;
         }
         let subject = TimelineId::from_raw(raw)
-            .and_then(|tl| e.conversation_metadata(tl))
-            .and_then(|m| {
-                m.get(SUBJECT_KEY)
-                    .or_else(|| m.get(crate::code_read::PATH_KEY))
-                    .cloned()
+            .and_then(|tl| {
+                e.conversation_metadata_with(tl, |m| {
+                    m.get(SUBJECT_KEY)
+                        .or_else(|| m.get(crate::code_read::PATH_KEY))
+                        .cloned()
+                })
             })
+            .flatten()
             .unwrap_or_else(|| format!("timeline {raw}"));
         *drawn.entry(format!("{}:{subject}", t.layer)).or_default() += 1;
         tokens += t.tokens;
@@ -808,8 +805,7 @@ fn log_provenance(
             continue;
         }
         let layer = e
-            .conversation_metadata(*tl)
-            .and_then(|m| m.get(LAYER_KEY).cloned())
+            .conversation_metadata_value(*tl, LAYER_KEY)
             .unwrap_or_default();
         let b = best.entry(layer).or_insert(f32::MIN);
         *b = b.max(*s);

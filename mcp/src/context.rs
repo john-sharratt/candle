@@ -123,16 +123,6 @@ pub struct Around {
     pub compose: bool,
 }
 
-/// What follows a call's answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct After {
-    /// Record the call as an episode.
-    pub record: bool,
-    /// The conversation has had its context: keep its claim. Otherwise the
-    /// call that claimed it gives the claim up.
-    pub stamp: bool,
-}
-
 /// What to do around a call of `name`, which `begins` a conversation or not.
 pub fn around(name: &str, begins: bool) -> Around {
     Around {
@@ -141,30 +131,29 @@ pub fn around(name: &str, begins: bool) -> Around {
     }
 }
 
-/// What follows a call of `name` whose answer `failed` or not, served by a
-/// backend (`from_backend`) that marks it `read_only` or not, when the
-/// context it went with was `delivered` — and when the conversation did not
-/// begin with it, `begins` false.
+/// Whether a call of `name` whose answer `failed` or not keeps its
+/// conversation's claim, when the context it went with was `delivered` — and
+/// when the conversation did not begin with it, `begins` false.
 ///
 /// The clock is stamped once the conversation has its context: by this
 /// answer, or by an earlier one. A first call whose context could not be read
 /// gives its claim up, so the next call tries again.
-pub fn after(
-    name: &str,
-    begins: bool,
-    failed: bool,
-    from_backend: bool,
-    read_only: bool,
-    delivered: bool,
-) -> After {
-    After {
-        record: !failed
-            && from_backend
-            && !read_only
-            && !MEMORY.contains(&name)
-            && !CHAT.contains(&name),
-        stamp: !begins || delivered || (name == GET && !failed),
-    }
+pub fn stamps(name: &str, begins: bool, failed: bool, delivered: bool) -> bool {
+    !begins || delivered || (name == GET && !failed)
+}
+
+/// Whether a call of `name` whose answer `failed` or not could be an episode
+/// at all: one that did not fail, and is neither the memory's own nor a chat's.
+/// Whether it is one is then [`records`]'.
+pub fn may_record(name: &str, failed: bool) -> bool {
+    !failed && !MEMORY.contains(&name) && !CHAT.contains(&name)
+}
+
+/// Whether a call of `name` whose answer `failed` or not, served by a backend
+/// (`from_backend`) that marks it `read_only` or not, is recorded as an
+/// episode.
+pub fn records(name: &str, failed: bool, from_backend: bool, read_only: bool) -> bool {
+    may_record(name, failed) && from_backend && !read_only
 }
 
 /// When each conversation last had a call: what tells the first call of the
@@ -456,10 +445,10 @@ mod tests {
     /// episode** — never the memory's own tools, a guide, or a failure.
     #[test]
     fn an_episode_is_a_successful_backend_call_that_does_more_than_read() {
-        let record = |name, failed, from_backend, read_only| {
-            after(name, false, failed, from_backend, read_only, false).record
-        };
+        let record = records;
         assert!(record("image_generate", false, true, false));
+        assert!(may_record("image_generate", false));
+        assert!(!may_record("image_generate", true));
         assert!(!record("image_generate", true, true, false), "failed");
         assert!(!record("bot_list", false, true, true), "only reads");
         assert!(
@@ -468,6 +457,7 @@ mod tests {
         );
         for memory in MEMORY {
             assert!(!record(memory, false, true, false), "{memory}");
+            assert!(!may_record(memory, false), "{memory}");
         }
     }
 
@@ -476,14 +466,8 @@ mod tests {
     #[test]
     fn no_chat_tool_is_ever_an_episode() {
         for tool in CHAT {
-            assert!(
-                !after(tool, false, false, true, false, false).record,
-                "{tool}"
-            );
-            assert!(
-                !after(tool, true, false, true, false, true).record,
-                "{tool}"
-            );
+            assert!(!records(tool, false, true, false), "{tool}");
+            assert!(!may_record(tool, false), "{tool}");
         }
     }
 
@@ -492,9 +476,7 @@ mod tests {
     /// whose context could not be read leaves the next call to try again.
     #[test]
     fn the_clock_is_stamped_only_once_the_context_was_given() {
-        let stamp = |name, begins, failed, delivered| {
-            after(name, begins, failed, true, false, delivered).stamp
-        };
+        let stamp = stamps;
         assert!(stamp("image_generate", true, false, true));
         assert!(
             !stamp("image_generate", true, false, false),

@@ -18,6 +18,8 @@
 //! what the words claim. A reply's reasoning block is left out: it is the model
 //! thinking, not anything it did.
 
+use std::collections::HashMap;
+
 use candle_conversation::projection::TurnIndex;
 use candle_conversation::{RecoveredMessage, Role};
 use journal_core::entry::Kind;
@@ -98,12 +100,8 @@ pub fn parts_after(
     written: &[(TurnIndex, u64)],
     after: u64,
 ) -> Vec<SpanTurn> {
-    let at = |turn: u32| {
-        written
-            .iter()
-            .find(|(t, _)| t.0 == turn)
-            .map_or(0, |(_, ms)| *ms)
-    };
+    let written: HashMap<u32, u64> = written.iter().map(|(t, ms)| (t.0, *ms)).collect();
+    let at = |turn: u32| written.get(&turn).copied().unwrap_or(0);
     history
         .iter()
         .filter_map(|message| {

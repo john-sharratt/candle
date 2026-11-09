@@ -216,7 +216,8 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    let mut headers = parts.headers.clone();
+    // Moved, not copied: nothing reads the request's own headers after this.
+    let mut headers = std::mem::take(&mut parts.headers);
     for h in HOP_BY_HOP {
         headers.remove(&h);
     }

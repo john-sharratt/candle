@@ -128,7 +128,7 @@ mod tests {
         let old = vault();
         old.with_sim(|s| s.table_open = !seeded);
         let kept = records_of(&old);
-        store::write(&s, "life", &diff(&Records::new(), &kept), 5).unwrap();
+        store::write(&s, "life", diff(&Records::new(), &kept), 5).unwrap();
         assert_ne!(records_of(&new), kept, "the seed is not what was kept");
         assert_eq!(
             take_in(&s, &new, &["gone".to_string(), "life".to_string()]),
@@ -138,7 +138,7 @@ mod tests {
 
         assert_eq!(retire(&s, "life", 6).unwrap(), kept.len());
         assert!(store::read(&s, "life").is_empty());
-        store::write(&s, "life", &diff(&Records::new(), &kept), 5).unwrap();
+        store::write(&s, "life", diff(&Records::new(), &kept), 5).unwrap();
         assert!(
             store::read(&s, "life").is_empty(),
             "an earlier epoch stays dead"

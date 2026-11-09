@@ -265,6 +265,19 @@ pub(crate) fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Whether two names are the same person's: trimmed, and compared without
+/// regard to case — ASCII without allocating, the full Unicode lowercase only
+/// when either side is not ASCII. Asked for every member of every thread a
+/// character is in, every beat.
+pub fn same_name(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a.to_lowercase() == b.to_lowercase()
+    }
+}
+
 impl Thread {
     pub fn kind(&self) -> Kind {
         match self.named || self.members.len() > 2 {
@@ -274,16 +287,14 @@ impl Thread {
     }
 
     pub fn has(&self, who: &str) -> bool {
-        let want = who.trim().to_lowercase();
-        self.members.iter().any(|m| m.to_lowercase() == want)
+        self.members.iter().any(|m| same_name(m, who))
     }
 
     /// Everybody but one.
     pub fn others(&self, than: &str) -> Vec<String> {
-        let me = than.trim().to_lowercase();
         self.members
             .iter()
-            .filter(|m| m.to_lowercase() != me)
+            .filter(|m| !same_name(m, than))
             .cloned()
             .collect()
     }
@@ -938,6 +949,17 @@ impl Threads {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A name is the same name whatever its case and its edges**, ASCII or
+    /// not; a longer name is another.
+    #[test]
+    fn names_compare_without_case() {
+        assert!(same_name("zen", "Zen"));
+        assert!(same_name(" Zen ", "zen"));
+        assert!(same_name("élan", "ÉLAN"));
+        assert!(!same_name("zen", "Zenith"));
+        assert!(!same_name("zen", "zén"));
+    }
 
     // ── conversations by kind ───────────────────────────────────────────────
 

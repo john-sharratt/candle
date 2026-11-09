@@ -204,6 +204,7 @@
  * zend's substrate, in this page's own look. */
 import { mountSubstrate } from '/common/lib/substrate.js';
 import { memberStatus } from '/common/lib/aggregate.js';
+import { pollWhileVisible } from '/common/lib/visible.js';
 
 const MOCK = new URLSearchParams(location.search).has('mock');
 const pill = document.getElementById('live');
@@ -243,7 +244,7 @@ async function pollBuild(){
     }
   }catch(_){}
 }
-setInterval(pollBuild, 5000);
+pollWhileVisible(5000, pollBuild);
 </script>
 </body>
 </html>

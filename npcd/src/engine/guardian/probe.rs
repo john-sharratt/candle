@@ -138,9 +138,8 @@ impl Probe for RuntimeProbe {
         let acts: Vec<String> = self
             .0
             .scheduler
-            .recent(RECENT_TICKS)
+            .recent_where(RECENT_TICKS, |t| t.npc_id == npc_id)
             .into_iter()
-            .filter(|t| t.npc_id == npc_id)
             .flat_map(|t| t.acts)
             .collect();
         let skip = acts.len().saturating_sub(limit);
@@ -168,7 +167,7 @@ impl Probe for RuntimeProbe {
     }
 
     async fn think(&self, npc_id: u64, text: String) -> bool {
-        let world_ms = self.0.world_ms_async(npc_id).await;
+        let world_ms = self.0.world_ms(npc_id);
         self.0.scheduler.deliver(
             npc_id,
             world_ms,
@@ -178,7 +177,7 @@ impl Probe for RuntimeProbe {
     }
 
     async fn rouse(&self, npc_id: u64, text: String) -> bool {
-        let world_ms = self.0.world_ms_async(npc_id).await;
+        let world_ms = self.0.world_ms(npc_id);
         self.0.scheduler.deliver(
             npc_id,
             world_ms,

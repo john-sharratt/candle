@@ -41,8 +41,8 @@ pub fn mark(
 /// given none.
 pub fn of(engine: &ConversationEngine, timeline: TimelineId) -> Vec<String> {
     engine
-        .conversation_metadata(timeline)
-        .and_then(|m| m.get(KEY).map(|v| steps_in(v)))
+        .conversation_metadata_value(timeline, KEY)
+        .map(|v| steps_in(&v))
         .unwrap_or_default()
 }
 

@@ -30,7 +30,9 @@ pub mod store;
 
 pub use apply::{apply, place_of, sim_of};
 pub use diff::{diff, Changes};
-pub use snapshot::{sim_records, world_records, Records};
+pub use snapshot::{sim_records, sim_records_of, sim_value, world_records, Records};
+
+use npc_map::world::World;
 
 use crate::discord::dm::record::Dms;
 use crate::discord::server::record::Servers;
@@ -41,10 +43,15 @@ use crate::world::Hosted;
 /// bots' DMs, servers and channels, and its own Discord server and what is
 /// mirrored there (`docs/npcd_discord.md` §4.2).
 ///
+/// Under the world lock only what needs it is done — the bodies' state copied
+/// out, the sim serialised — and the records are built and split after.
+///
 /// [`Sim`]: crate::sim::Sim
 pub fn records_of(hosted: &Hosted) -> Records {
-    let mut records = hosted.read(world_records);
-    records.extend(hosted.sim(sim_records));
+    let state = hosted.read(World::state);
+    let sim = hosted.sim(sim_value);
+    let mut records = world_records(state);
+    records.extend(sim.map(sim_records_of).unwrap_or_default());
     records.extend(hosted.dms(Dms::records));
     records.extend(hosted.servers(Servers::records));
     records.extend(hosted.mirror(Mirror::records));

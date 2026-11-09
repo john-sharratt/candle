@@ -10,7 +10,8 @@ use crate::handle::{SealResult, TurnEvent, TurnHandle, TurnResponse};
 use crate::index_pages::StoredPages;
 use crate::provenance::boundaries::BoundaryRule;
 use crate::recorded_reply::{recorded_reply, RecordedReply};
-use crate::recovered_message::{tool_response_lengths, RecoveredMessage, TOOL_RESPONSE_OPEN};
+use crate::recovered::recovered_from;
+use crate::recovered_message::{RecoveredMessage, TOOL_RESPONSE_OPEN};
 use candle_transformers::models::delta_net::ExportedLayerState;
 
 use crate::persistence::content_hash::{
@@ -4930,6 +4931,17 @@ impl Sequence {
         timeline: TimelineId,
         include_ghost_summaries: bool,
     ) -> Vec<RecoveredMessage> {
+        self.recovered_history_from(timeline, include_ghost_summaries, 0)
+    }
+
+    /// [`Self::recovered_history`] from turn `from_turn` on: the bubbles of
+    /// the turns before it are neither read nor built.
+    pub fn recovered_history_from(
+        &self,
+        timeline: TimelineId,
+        include_ghost_summaries: bool,
+        from_turn: u32,
+    ) -> Vec<RecoveredMessage> {
         let read = self.substrate.read();
         // Only a turn whose reasoning K/V was dropped needs this: its length is
         // then an estimate from the prose it kept.
@@ -4946,47 +4958,14 @@ impl Sequence {
             .encode(TOOL_RESPONSE_OPEN, false)
             .map(|e| e.get_ids().to_vec())
             .unwrap_or_default();
-        let mut out: Vec<RecoveredMessage> = Vec::new();
-        for idx in read.turn_indices(timeline) {
-            if !include_ghost_summaries
-                && read
-                    .tree_meta_of(timeline, idx)
-                    .is_some_and(|m| m.kind.is_summary())
-            {
-                continue;
-            }
-            let user_text = read.user_text_of(timeline, idx);
-            let assistant_text = read.assistant_text_of(timeline, idx);
-            let no_think = read.turn_no_think(timeline, idx);
-            if !user_text.is_empty() {
-                let tool_tokens = if user_text.contains(TOOL_RESPONSE_OPEN) {
-                    let body = read.user_body_ids(timeline, idx).unwrap_or_default();
-                    tool_response_lengths(body, &response_open)
-                } else {
-                    Vec::new()
-                };
-                out.push(RecoveredMessage {
-                    role: Role::User,
-                    text: user_text,
-                    turn: idx.0,
-                    no_think,
-                    thinking: None,
-                    tool_tokens,
-                });
-            }
-            if !assistant_text.is_empty() {
-                let thinking = read.thinking_length_of(timeline, idx, estimate);
-                out.push(RecoveredMessage {
-                    role: Role::Assistant,
-                    text: assistant_text,
-                    turn: idx.0,
-                    no_think: false,
-                    thinking,
-                    tool_tokens: Vec::new(),
-                });
-            }
-        }
-        out
+        recovered_from(
+            &read,
+            timeline,
+            include_ghost_summaries,
+            from_turn,
+            estimate,
+            &response_open,
+        )
     }
 
     /// Every turn of `timeline` as the substrate holds it — its sealed ids and

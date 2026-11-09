@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(status(&shared, 42, &bot(10)), Status::Offline);
 
         let records: Records = [("sim/meta".to_string(), json!({}))].into_iter().collect();
-        world_store::write(&shared, "life", &diff(&Records::new(), &records), 1_000).unwrap();
+        world_store::write(&shared, "life", diff(&Records::new(), &records), 1_000).unwrap();
         put(&shared, 42, &online(1_500, 10)).unwrap();
         assert_eq!(
             status(&shared, 42, &bot(10)),
@@ -207,7 +207,7 @@ mod tests {
         let moved: Records = [("sim/meta".to_string(), json!({"moved": true}))]
             .into_iter()
             .collect();
-        world_store::write(&shared, "life", &diff(&records, &moved), 2_000).unwrap();
+        world_store::write(&shared, "life", diff(&records, &moved), 2_000).unwrap();
         assert_eq!(status(&shared, 42, &bot(10)), Status::Offline);
 
         put(
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(status(&shared, 42, &bot(11)), Status::Offline);
 
         let records: Records = [("sim/meta".to_string(), json!({}))].into_iter().collect();
-        world_store::write(&shared, "life", &diff(&Records::new(), &records), 2_000).unwrap();
+        world_store::write(&shared, "life", diff(&Records::new(), &records), 2_000).unwrap();
         assert_eq!(
             status(&shared, 42, &bot(10)),
             Status::Offline,

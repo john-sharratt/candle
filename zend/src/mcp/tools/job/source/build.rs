@@ -93,6 +93,7 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
         line: describe(&job.to_string(), &host, &view, now_ms()),
         detail,
         total: read.total,
+        size: read.size,
         marks: Vec::new(),
     })
 }

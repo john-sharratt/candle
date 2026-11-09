@@ -7,6 +7,7 @@ import { toast } from './lib/ui.js';
 import { checkBuild, takeReloadState } from '/common/lib/build.js';
 import { state as vp, onBreakpoint } from '/common/lib/viewport.js';
 import { estateSwitcher } from '/common/lib/estate.js';
+import { pollWhileVisible } from '/common/lib/visible.js';
 
 // ── page registry ───────────────────────────────────────────────────────────
 // Adding a page touches exactly one entry here plus one file. Nav is derived.
@@ -717,14 +718,12 @@ async function boot() {
   // A hidden tab's status fetch fails when the browser wakes it. The build
   // check stays idle until the page is visible, then runs once.
   async function watchBuild() {
-    if (document.hidden) return;
     try { checkBuild(await API.getStatus(), { hash: location.hash }); } catch (_) {}
     // The count follows every save an admin makes, wherever on the console it
     // was made, without each page having to announce it.
     if (!draftsOpen && !draftsBusy) refreshDrafts();
   }
-  setInterval(watchBuild, 5000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) watchBuild(); });
+  pollWhileVisible(5000, watchBuild);
 
   // Keyboard: g-then-key jumps, "/" focuses search unless a composer has it.
   let g = false;

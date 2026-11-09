@@ -46,6 +46,7 @@ mod config;
 mod context;
 mod guides;
 mod last_listed;
+mod listing;
 mod presence;
 mod reading;
 mod routes;
@@ -57,6 +58,7 @@ use backend::{Backend, Link};
 use config::Config;
 use context::Conversations;
 use last_listed::LastListed;
+use listing::Listing;
 use reading::Readings;
 use routes::Routes;
 use served::Served;
@@ -122,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         read_only: RwLock::new(BTreeSet::new()),
         conversations: Conversations::default(),
         readings: Readings::default(),
+        listing: Listing::default(),
     });
     tracing::info!(guides = app.library.count(), "guides loaded");
     let gateways: Arc<[IpAddr]> = config.trusted_gateways.clone().into();

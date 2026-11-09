@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
-use crate::accounts::{key_of, user_id_of, DiscordUser};
+use crate::accounts::{account_of, key_of, user_id_of, DiscordUser};
 use crate::api::{account_holder, err, now_ms, Authored};
 use crate::discord::link::{code, linking};
 use crate::discord::store;
@@ -30,7 +30,7 @@ pub async fn post_link(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Re
         Err(r) => return *r,
     };
     let now = now_ms();
-    if let Err(e) = s.accounts.write().await.upsert(&id, now) {
+    if let Err(e) = account_of(&s.accounts, &id, now).await {
         tracing::error!(error = %e, "discord: the account was not written");
         return failed();
     }

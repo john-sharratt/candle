@@ -69,8 +69,8 @@ impl IngestIndex {
             }
             if let Some((_, group)) = engine.timeline_target(timeline) {
                 let deps = engine
-                    .conversation_metadata(timeline)
-                    .and_then(|m| m.get(DEPS_KEY).map(|v| parse_deps(v)))
+                    .conversation_metadata_value(timeline, DEPS_KEY)
+                    .map(|v| parse_deps(&v))
                     .unwrap_or_default();
                 let unit = DerivedUnit {
                     group,

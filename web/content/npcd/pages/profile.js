@@ -7,6 +7,7 @@ import { API } from '../lib/api.js';
 import { h, mount, ago } from '/common/lib/dom.js';
 import { toast, empty, confirmDialog } from '../lib/ui.js';
 import { go } from '/common/lib/router.js';
+import { pollWhileVisible } from '/common/lib/visible.js';
 import { AUTH_UNAVAILABLE, faceOf } from '../app.js';
 
 export async function render() {
@@ -244,7 +245,7 @@ function discordSection() {
   const host = h('div', { class: 'panel discord-panel' });
   let poll = null;
   const stop = () => {
-    if (poll) clearInterval(poll);
+    if (poll) poll();
     poll = null;
   };
   const paint = (d) => {
@@ -312,7 +313,7 @@ function discordSection() {
    * when it was, when it runs out, and when the page is left. */
   function watch(until) {
     stop();
-    poll = setInterval(async () => {
+    poll = pollWhileVisible(3000, async () => {
       if (!host.isConnected || Date.now() > until) {
         stop();
         return;
@@ -326,7 +327,7 @@ function discordSection() {
       } catch (_) {
         // A missed poll is tried again on the next tick.
       }
-    }, 3000);
+    });
   }
 
   host.hidden = true;

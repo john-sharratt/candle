@@ -1374,8 +1374,15 @@ impl Scheduler {
         }
     }
 
-    /// Recent ticks, newest last. The Pulse view's feed.
-    pub fn recent(&self, limit: usize) -> Vec<TickRecord> {
+    /// Of the newest `limit` ticks, those `keep` keeps, newest last — filtered
+    /// before any is copied, so a feed for one character copies only its own.
+    /// `keep` runs under the ring's lock and must take none of its own. The
+    /// Pulse view's feed.
+    pub fn recent_where(
+        &self,
+        limit: usize,
+        keep: impl Fn(&TickRecord) -> bool,
+    ) -> Vec<TickRecord> {
         // Once, outside the walk, so every row in one page is measured against
         // the same instant.
         let now = self.born.elapsed();
@@ -1383,12 +1390,25 @@ impl Scheduler {
         let skip = r.len().saturating_sub(limit);
         r.iter()
             .skip(skip)
+            .filter(|t| keep(t))
             .cloned()
             .map(|mut t| {
                 t.ms_ago = now.saturating_sub(t.at).as_millis() as u64;
                 t
             })
             .collect()
+    }
+
+    /// The newest tick of `npc` still in the ring, copying nothing: where a
+    /// stream of its acts starts from.
+    pub fn latest_tick_of(&self, npc: u64) -> Option<u64> {
+        self.recent
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|t| t.npc_id == npc)
+            .map(|t| t.tick)
     }
 
     /// A snapshot of every character's loop state.
@@ -2822,10 +2842,33 @@ mod tests {
             s.deliver(1, i, Salience::NORMAL, say("something"));
             s.tick(1, 0, 0, |_, _| vec![]);
         }
-        let r = s.recent(100);
+        let r = s.recent_where(100, |_| true);
         assert_eq!(r.len(), 4);
         // Newest last, and contiguous.
         assert!(r.windows(2).all(|w| w[1].tick == w[0].tick + 1));
+    }
+
+    /// **A feed for one character is filtered within the same window**, and
+    /// its newest tick is found without copying any: six ticks alternating
+    /// between two characters, ticks 0–5.
+    #[test]
+    fn the_feed_filters_within_its_window_and_finds_a_characters_newest() {
+        let s = Scheduler::new(8);
+        s.wake(1, 0, 0);
+        s.wake(2, 0, 0);
+        for i in 0..6 {
+            let npc = if i % 2 == 0 { 2 } else { 1 };
+            s.deliver(npc, i, Salience::NORMAL, say("something"));
+            s.tick(npc, 0, 0, |_, _| vec![]).expect("ticked");
+        }
+        let ones: Vec<u64> = s
+            .recent_where(4, |t| t.npc_id == 1)
+            .iter()
+            .map(|t| t.tick)
+            .collect();
+        assert_eq!(ones, [3, 5]);
+        assert_eq!(s.latest_tick_of(1), Some(5));
+        assert_eq!(s.latest_tick_of(9), None);
     }
 
     /// **An id past 2^53 must survive the wire.**
@@ -2847,7 +2890,7 @@ mod tests {
         s.tick(big, 0, 0, |_, _| vec![]).expect("ticked");
 
         let wire_id = npcs::npc_id_wire(big);
-        let json = serde_json::to_string(&s.recent(1)[0]).unwrap();
+        let json = serde_json::to_string(&s.recent_where(1, |_| true)[0]).unwrap();
         assert!(
             json.contains(&format!("\"npc_id\":\"{wire_id}\"")),
             "a tick's id is not a string: {json}"

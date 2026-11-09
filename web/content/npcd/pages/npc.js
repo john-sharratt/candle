@@ -9,6 +9,7 @@ import { API } from '../lib/api.js';
 import { h, mount, fmtNum, fmtK, ago, worldTime } from '/common/lib/dom.js';
 import { go, link } from '/common/lib/router.js';
 import { state as vp } from '/common/lib/viewport.js';
+import { pollWhileVisible } from '/common/lib/visible.js';
 import {
   avatar, stateDot, bandChip, pending, empty, toast, kv, bar, lineChart,
   // `modal` was missing, and `authorBelief` calls it — so "Author a belief"
@@ -162,9 +163,9 @@ export async function render(params) {
   const bodyHost = h('div', {});
   el.appendChild(bodyHost);
 
-  /// The Messages tab's poll, declared here because the tab switch below clears
-  /// it and a `let` beside the function it belongs to would be in the temporal
-  /// dead zone when that runs.
+  /// The Messages tab's poll — its stop — declared here because the tab switch
+  /// below stops it and a `let` beside the function it belongs to would be in
+  /// the temporal dead zone when that runs.
   let messagePoll = null;
 
   // ── tabs ──────────────────────────────────────────────────────────────────
@@ -180,7 +181,7 @@ export async function render(params) {
   const fn = TABS[tab] || (declared.includes(tab) ? () => streamLayer(tab) : overview);
   // Any tab other than Messages stops its poll — otherwise the timer runs
   // against a detached node for as long as the console is open.
-  if (tab !== 'messages') clearInterval(messagePoll);
+  if (tab !== 'messages' && messagePoll) { messagePoll(); messagePoll = null; }
   await fn();
 
   // ── pulse ─────────────────────────────────────────────────────────────────
@@ -297,11 +298,11 @@ export async function render(params) {
         windowHost));
 
     await tick();
-    const t = setInterval(tick, 2000);
+    const stopPoll = pollWhileVisible(2000, tick);
     /* The rail persists across tabs, so leaving this one has to stop the poll —
      * otherwise every visit leaves an interval running against a detached DOM
      * for the life of the session. */
-    teardowns.push(() => { stop = true; clearInterval(t); });
+    teardowns.push(() => { stop = true; stopPoll(); });
   }
 
   // ── scan ──────────────────────────────────────────────────────────────────
@@ -400,8 +401,8 @@ export async function render(params) {
           h('button', { class: 'btn', onClick: refresh }, '↻ Scan again')),
         host));
     await refresh();
-    const t = setInterval(refresh, 5000);
-    teardowns.push(() => { stop = true; clearInterval(t); });
+    const stopPoll = pollWhileVisible(5000, refresh);
+    teardowns.push(() => { stop = true; stopPoll(); });
   }
 
   // ── mission ───────────────────────────────────────────────────────────────
@@ -469,8 +470,8 @@ export async function render(params) {
     mount(bodyHost,
       h('div', { class: 'page' }, host));
     await refresh();
-    const t = setInterval(refresh, 3000);
-    teardowns.push(() => { stop = true; clearInterval(t); });
+    const stopPoll = pollWhileVisible(3000, refresh);
+    teardowns.push(() => { stop = true; stopPoll(); });
   }
 
   // ── journal ───────────────────────────────────────────────────────────────
@@ -652,8 +653,8 @@ export async function render(params) {
 
     mount(bodyHost, host);
     await refresh();
-    const t = setInterval(refresh, 5000);
-    teardowns.push(() => { stop = true; clearInterval(t); });
+    const stopPoll = pollWhileVisible(5000, refresh);
+    teardowns.push(() => { stop = true; stopPoll(); });
   }
 
   // ── overview ──────────────────────────────────────────────────────────────
@@ -1235,9 +1236,9 @@ export async function render(params) {
     // Poll while this tab is the one showing. Cleared by the tab switch, so
     // leaving stops the timer rather than leaving it running against a detached
     // node for as long as the console is open.
-    clearInterval(messagePoll);
+    if (messagePoll) { messagePoll(); messagePoll = null; }
     if (first.in_a_world) {
-      messagePoll = setInterval(async () => {
+      messagePoll = pollWhileVisible(4000, async () => {
         // The act lane moves whether or not anything was said to you — that is
         // the point of it — so it repaints every pass.
         paintActs();
@@ -1247,7 +1248,7 @@ export async function render(params) {
         if (n === count) return;
         count = n;
         paintThread(next);
-      }, 4000);
+      });
     }
   }
 

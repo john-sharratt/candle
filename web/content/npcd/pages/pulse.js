@@ -30,6 +30,7 @@
 
 import { API } from '../lib/api.js';
 import { h, mount, fmtNum } from '/common/lib/dom.js';
+import { pollWhileVisible } from '/common/lib/visible.js';
 
 /* Faster than the shortest heartbeat, so a preempted character's tick lands in
  * the feed while it is still fresh. */
@@ -183,7 +184,7 @@ export async function render() {
 
   let focus = null;        // npc_id (string) or null for the interlaced stream
   let names = {};
-  let timer = null;
+  let stopPoll = null;
   let stopped = false;
   let lastTick = -1;       // so only genuinely new rows animate in
 
@@ -537,6 +538,6 @@ export async function render() {
   );
 
   refresh();
-  timer = setInterval(refresh, POLL_MS);
-  return { el, teardown: () => { stopped = true; clearInterval(timer); } };
+  stopPoll = pollWhileVisible(POLL_MS, refresh);
+  return { el, teardown: () => { stopped = true; stopPoll(); } };
 }

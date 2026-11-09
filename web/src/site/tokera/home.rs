@@ -10,9 +10,16 @@
 //! Tokera gets answered by showing the work and where it overlaps, with the
 //! one administrative fact left to the colophon at the very bottom.
 
-use axum::response::{Html, IntoResponse, Response};
+use std::sync::LazyLock;
+
+use axum::body::Bytes;
+use axum::http::HeaderMap;
+use axum::response::Response;
 
 use super::page::{self, Kind, Meta, Nav, Width};
+use super::HTML;
+use crate::asset::{respond, Prepared};
+use crate::config::Cache as Policy;
 
 /// Measured, from the headline results of `docs/performance.md` (claims 1, 3, 5).
 const STATS: [(&str, &str); 4] = [
@@ -340,7 +347,15 @@ fn tile(w: &Work) -> String {
     )
 }
 
-pub async fn show() -> Response {
+/// The home page, rendered, tagged and gzipped once: it is made of constants.
+static HOME: LazyLock<Prepared> = LazyLock::new(|| Prepared::typed(HTML, Bytes::from(render())));
+
+/// `/`: the home page, as `req` holds or takes it.
+pub fn show(policy: Policy, req: &HeaderMap) -> Response {
+    respond(&HOME, policy, req)
+}
+
+fn render() -> String {
     let meta = Meta {
         heading: "Tokera",
         subtitle: None,
@@ -369,7 +384,7 @@ pub async fn show() -> Response {
         })
         .collect::<String>();
 
-    Html(format!(
+    format!(
         r#"{head}
 <section class="hero">
   <div class="hero-copy">
@@ -397,8 +412,7 @@ pub async fn show() -> Response {
         tiles = tiles,
         crossings = crossings,
         foot = page::foot()
-    ))
-    .into_response()
+    )
 }
 
 #[cfg(test)]
@@ -406,7 +420,14 @@ mod tests {
     use super::*;
 
     async fn rendered() -> String {
-        let body = axum::body::to_bytes(show().await.into_body(), 1 << 20)
+        let res = show(
+            Policy {
+                short_secs: 60,
+                long_secs: 900,
+            },
+            &HeaderMap::new(),
+        );
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
             .await
             .unwrap();
         String::from_utf8(body.to_vec()).unwrap()

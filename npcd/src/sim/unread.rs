@@ -63,23 +63,27 @@ impl Threads {
         })
     }
 
-    /// The reminder due `who` at `now_ms`, recording it as given — or `None`.
+    /// The reminder due `who` at `now_ms`, recording it as given — or `None`
+    /// — and how much waits unread for it in all, every thread together: the
+    /// sum the reminder is judged from, so a caller needs no second scan of
+    /// the threads for it.
     ///
     /// Due when something waits unread and it differs from what `who` was
     /// last reminded of, or [`REMIND_EVERY_MS`] has passed since. `told_now`
     /// says `who` was just handed new messages, which tell it all a reminder
     /// would: what waits is recorded as reminded, and nothing is due.
-    pub fn unread_due(&mut self, who: &str, now_ms: u64, told_now: bool) -> Option<Due> {
+    pub fn unread_due(&mut self, who: &str, now_ms: u64, told_now: bool) -> (Option<Due>, usize) {
         let threads = self.unread_threads(who);
+        let unread = threads.iter().map(|(_, n)| n).sum();
         if threads.is_empty() {
             self.reminded.remove(who);
-            return None;
+            return (None, unread);
         }
         let stale = self.reminded.get(who).is_none_or(|r| {
             r.threads != threads || now_ms.saturating_sub(r.at_ms) >= REMIND_EVERY_MS
         });
         if !stale {
-            return None;
+            return (None, unread);
         }
         let to_me = self.unread_to(who);
         self.reminded.insert(
@@ -89,7 +93,7 @@ impl Threads {
                 at_ms: now_ms,
             },
         );
-        (!told_now).then_some(Due { threads, to_me })
+        ((!told_now).then_some(Due { threads, to_me }), unread)
     }
 }
 
@@ -116,32 +120,51 @@ mod tests {
         let mut p = waiting();
         assert_eq!(
             p.unread_due("Zen", T0, false),
-            Some(Due {
-                threads: vec![("zenworld #general".to_string(), 2)],
-                to_me: false,
-            })
+            (
+                Some(Due {
+                    threads: vec![("zenworld #general".to_string(), 2)],
+                    to_me: false,
+                }),
+                2
+            )
         );
-        assert_eq!(p.unread_due("Zen", T0 + 1_000, false), None, "said already");
+        assert_eq!(
+            p.unread_due("Zen", T0 + 1_000, false),
+            (None, 2),
+            "said already, and still waiting"
+        );
         assert!(p
             .unread_due("Zen", T0 + REMIND_EVERY_MS, false)
+            .0
             .is_some_and(|d| d.threads == [("zenworld #general".to_string(), 2)]));
 
         p.reach("John", "Zen");
         p.send("John", "Zen", "are you there?").unwrap();
         assert_eq!(
             p.unread_due("Zen", T0 + REMIND_EVERY_MS + 1, false),
-            Some(Due {
-                threads: vec![
-                    ("zenworld #general".to_string(), 2),
-                    ("John".to_string(), 1),
-                ],
-                to_me: true,
-            }),
+            (
+                Some(Due {
+                    threads: vec![
+                        ("zenworld #general".to_string(), 2),
+                        ("John".to_string(), 1),
+                    ],
+                    to_me: true,
+                }),
+                3
+            ),
             "a new message changes it, and a direct one is said to it"
         );
+        assert_eq!(
+            p.unread_due("Zen", T0 + REMIND_EVERY_MS + 2, false).1,
+            p.waiting_for("Zen")
+        );
 
-        assert_eq!(p.unread_due("Kit (@kit)", T0, false), None, "its own lines");
-        assert_eq!(p.unread_due("Nobody", T0, false), None);
+        assert_eq!(
+            p.unread_due("Kit (@kit)", T0, false),
+            (None, 0),
+            "its own lines"
+        );
+        assert_eq!(p.unread_due("Nobody", T0, false), (None, 0));
     }
 
     /// **Reading clears it**: once every thread is read, nothing is due, and
@@ -149,15 +172,16 @@ mod tests {
     #[test]
     fn reading_clears_the_reminder() {
         let mut p = waiting();
-        assert!(p.unread_due("Zen", T0, false).is_some());
+        assert!(p.unread_due("Zen", T0, false).0.is_some());
         p.read("Zen", "zenworld #general").unwrap();
-        assert_eq!(p.unread_due("Zen", T0 + REMIND_EVERY_MS, false), None);
+        assert_eq!(p.unread_due("Zen", T0 + REMIND_EVERY_MS, false), (None, 0));
         assert!(p.reminded.is_empty());
         let general = p.of("Zen")[0].id.clone();
         p.send_on(&general, "Kit (@kit)", "still there?", None)
             .unwrap();
         assert_eq!(
             p.unread_due("Zen", T0 + REMIND_EVERY_MS + 1, false)
+                .0
                 .map(|d| d.threads),
             Some(vec![("zenworld #general".to_string(), 1)])
         );
@@ -168,9 +192,9 @@ mod tests {
     #[test]
     fn messages_just_handed_count_as_reminded() {
         let mut p = waiting();
-        assert_eq!(p.unread_due("Zen", T0, true), None);
-        assert_eq!(p.unread_due("Zen", T0 + 1_000, false), None);
-        assert!(p.unread_due("Zen", T0 + REMIND_EVERY_MS, false).is_some());
+        assert_eq!(p.unread_due("Zen", T0, true), (None, 2));
+        assert_eq!(p.unread_due("Zen", T0 + 1_000, false), (None, 2));
+        assert!(p.unread_due("Zen", T0 + REMIND_EVERY_MS, false).0.is_some());
     }
 
     /// **A group line said to the character by name makes it urgent.**
@@ -180,6 +204,6 @@ mod tests {
         let general = p.of("Zen")[0].id.clone();
         p.send_to(&general, "Kit (@kit)", "Zen?", None, Some("Zen"))
             .unwrap();
-        assert!(p.unread_due("Zen", T0, false).is_some_and(|d| d.to_me));
+        assert!(p.unread_due("Zen", T0, false).0.is_some_and(|d| d.to_me));
     }
 }

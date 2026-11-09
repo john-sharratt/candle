@@ -62,9 +62,7 @@ pub fn retie(
     let recorded: HashMap<TimelineId, Option<String>> = committed
         .iter()
         .map(|c| {
-            let value = e
-                .conversation_metadata(c.timeline)
-                .and_then(|m| m.get(BRANCHES_KEY).cloned());
+            let value = e.conversation_metadata_value(c.timeline, BRANCHES_KEY);
             (c.timeline, value)
         })
         .collect();
@@ -118,9 +116,7 @@ pub fn backfill_commits(
     let recorded: HashMap<TimelineId, Option<String>> = committed
         .iter()
         .map(|c| {
-            let value = e
-                .conversation_metadata(c.timeline)
-                .and_then(|m| m.get(COMMIT_KEY).cloned());
+            let value = e.conversation_metadata_value(c.timeline, COMMIT_KEY);
             (c.timeline, value)
         })
         .collect();

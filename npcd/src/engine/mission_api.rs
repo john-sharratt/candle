@@ -455,7 +455,7 @@ pub async fn command_table(
         .collect();
     let mut when: HashMap<u64, u64> = HashMap::new();
     for id in &called {
-        when.insert(*id, s.world_ms(*id).await);
+        when.insert(*id, s.world_ms(*id));
     }
     let reached = called
         .iter()
@@ -490,7 +490,7 @@ pub async fn cancel_all(State(s): State<Arc<Authored>>, headers: HeaderMap) -> R
     let mut when: HashMap<u64, u64> = HashMap::new();
     for world in rt.hosted.ids() {
         for (npc_id, _) in rt.bodies.in_world(&world) {
-            when.insert(npc_id, s.world_ms(npc_id).await);
+            when.insert(npc_id, s.world_ms(npc_id));
         }
     }
     let cancelled = rt.cancel_all_missions(|id| when.get(&id).copied().unwrap_or(0));

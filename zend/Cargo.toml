@@ -108,7 +108,10 @@ candle-nn = { workspace = true }
 # GUI/API integration harness (zend/tests/gui_api_harness.rs): boots the real
 # axum router model-less and drives it over HTTP. These mirror the runtime deps
 # so the test crate can construct the server + issue requests itself.
-tokio        = { version = "1", features = ["full"] }
+# A gzipped reply's bytes, inflated (`api::conversations`).
+flate2       = "1"
+# `test-util`: tests that pause time (`mcp::tools::job::wait`).
+tokio        = { version = "1", features = ["full", "test-util"] }
 axum         = { version = "0.7", features = ["ws"] }
 reqwest      = { version = "0.12", features = ["json", "multipart"] }
 serde_json   = { workspace = true }

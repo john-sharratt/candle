@@ -40,6 +40,7 @@ use npcd::engine::mission::{Mission, Origin, Todo, Work};
 use npcd::engine::mission_gen::standing::HOUSE_LINK;
 use npcd::engine::tools::{self, specs_within, Mode, Within};
 use npcd::engine::witnessed;
+use npcd::engine::zen_task::TASK_ACTS;
 use npcd::sim::field::Resource;
 use npcd::sim::record::{Item, Kind as RecordKind, State};
 use npcd::sim::seed;
@@ -2018,6 +2019,9 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
         .iter()
         .map(|t| t.name)
         .collect();
+    // A task act is lent by the mission that drives the task, wherever it is
+    // carried, never by a room (`engine::zen_task::task_grants`).
+    let lent_by_missions: Vec<&str> = TASK_ACTS.iter().map(|t| t.name).collect();
 
     for t in tools::CATALOG.iter() {
         // A migrated act is reached through the effector device, not a room's
@@ -2028,7 +2032,9 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
         if tools::routed(t.name) {
             continue;
         }
-        let reachable = seen.iter().any(|s| s == t.name) || messaging.contains(&t.name);
+        let reachable = seen.iter().any(|s| s == t.name)
+            || messaging.contains(&t.name)
+            || lent_by_missions.contains(&t.name);
         assert!(
             reachable,
             "`{}` is in the catalog and no room in either shipped world offers it",

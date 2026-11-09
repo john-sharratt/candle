@@ -2,6 +2,7 @@ use crate::cancel::CancelToken;
 use crate::error::ConversationError;
 use crate::recurrent_span::ReplyRows;
 use crate::scheduler::exported_state::ExportedState;
+use crate::text_stream::TextStream;
 use crate::token_buffer::TokenBuffer;
 use crate::turn_text::TurnText;
 use crate::TurnStats;
@@ -336,23 +337,20 @@ pub struct TurnResponse {
 
 /// Decodes token IDs into text strings.
 ///
-/// Wraps the tokenizer and abstracts away BPE details. Callers collect
-/// tokens into a `Vec<u32>` and call [`decode`](TokenDecoder::decode) to get
-/// the text. This is cheap (~microseconds for thousands of tokens).
+/// Wraps the tokenizer and abstracts away BPE details. A finished run of ids
+/// is [`decode`](TokenDecoder::decode)d whole; a round being streamed goes
+/// through [`stream`](TokenDecoder::stream), which decodes each token as it
+/// arrives instead of the whole round again.
 ///
-/// # Example — line-buffered streaming
+/// # Example — streaming a round's text
 ///
 /// ```ignore
 /// let decoder = engine.token_decoder();
-/// let mut line_tokens: Vec<u32> = Vec::new();
+/// let mut text = decoder.stream();
 /// for event in handle.stream() {
-///     match event {
-///         TurnEvent::Token(id) => {
-///             line_tokens.push(id);
-///             let text = decoder.decode(&line_tokens);
-///             // rewrite current line with `text`
-///         }
-///         _ => {}
+///     if let TurnEvent::Token(id) = event {
+///         let from = text.push(id);
+///         // `&text.text()[from..]` is what this token released
 ///     }
 /// }
 /// ```
@@ -375,6 +373,12 @@ impl TokenDecoder {
     /// Decode token IDs into text, including special tokens verbatim.
     pub fn decode_with_special(&self, tokens: &[u32]) -> String {
         self.tokenizer.decode(tokens, false).unwrap_or_default()
+    }
+
+    /// A round's text decoded token by token, each step costing what it adds
+    /// ([`TextStream`]) — special tokens skipped, as [`Self::decode`] skips them.
+    pub fn stream(&self) -> TextStream<'_> {
+        TextStream::new(&self.tokenizer)
     }
 }
 

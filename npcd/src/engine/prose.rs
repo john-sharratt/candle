@@ -413,7 +413,7 @@ async fn run_turn(
         prompt_words = prompt.split_whitespace().count(),
         "prose turn submitted"
     );
-    let mut ids: Vec<u32> = Vec::new();
+    let mut text = decoder.stream();
     let mut preview = Preview::default();
     let mut response = None;
     // **How long a prose turn waited, and how long it ran** — and, above, that
@@ -428,8 +428,8 @@ async fn run_turn(
             match event {
                 TurnEvent::Token(id) => {
                     first_token.get_or_insert_with(|| submitted.elapsed());
-                    ids.push(id);
-                    if let Some(delta) = preview.advance(visible(&decoder.decode(&ids))) {
+                    text.push(id);
+                    if let Some(delta) = preview.advance(visible(text.text())) {
                         on_fragment(&delta);
                     }
                 }
@@ -449,7 +449,7 @@ async fn run_turn(
         %seq,
         first_token_ms = first_token.map(|d| d.as_millis() as u64),
         total_ms = submitted.elapsed().as_millis() as u64,
-        tokens = ids.len(),
+        tokens = text.tokens(),
         "prose turn done"
     );
     sequence.finish_turn(handle, &r)?;

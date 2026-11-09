@@ -576,12 +576,7 @@ pub fn sample_axes(engine: &Arc<ConversationEngine>, npc_id: u64, n: usize) -> V
     let mut axes: Vec<String> = engine
         .find_conversations_by_metadata(META_OF, &npc_id.to_string())
         .into_iter()
-        .filter_map(|tl| {
-            engine
-                .conversation_metadata(tl)?
-                .get(META_ASSUMPTION)
-                .cloned()
-        })
+        .filter_map(|tl| engine.conversation_metadata_value(tl, META_ASSUMPTION))
         .filter(|a| !a.trim().is_empty())
         .collect();
     let seed = SystemTime::now()

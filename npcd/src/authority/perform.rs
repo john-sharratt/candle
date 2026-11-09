@@ -16,7 +16,7 @@ use npc_map::world::Where;
 use crate::world::Hosted;
 
 use super::forward::{act_of, call_line};
-use super::npc_lease::{hand_back, leases_of, released};
+use super::npc_lease::{hand_back, released};
 use super::ops::{Decided, OpReply, WorldOp};
 use crate::api::now_ms;
 use crate::bridge;
@@ -125,12 +125,12 @@ impl Runtime {
                 let decided = decided.and_then(|d| Some((Where::parse(&d.at)?, d.company)));
                 let body = self.body_of(npc);
                 if let (Some((hosted, body)), Some((at, company))) = (&body, decided) {
-                    hosted.with(|w| w.restore_decision(body, at, company));
+                    hosted.restore_decision(body, at, company);
                 }
                 let pinned = pinned_at.as_deref().and_then(Where::parse);
                 let done = self.perform_here(npc, &act, pinned.as_ref()).await;
                 if let Some((hosted, body)) = &body {
-                    hosted.with(|w| w.end_decision(body));
+                    hosted.end_decision(body);
                 }
                 let r = done.recorded;
                 OpReply::Performed {
@@ -247,8 +247,8 @@ impl Runtime {
             }
             WorldOp::HandBack { npc, through } => {
                 let lease = from.and_then(|from| {
-                    let current = leases_of(&self.standing.written(world));
-                    hand_back(current.get(&npc)?, from, through, now_ms())
+                    let current = self.standing.written(world);
+                    hand_back(current.leases.get(&npc)?, from, through, now_ms())
                 });
                 let ok = lease.is_some();
                 if let Some(lease) = lease {

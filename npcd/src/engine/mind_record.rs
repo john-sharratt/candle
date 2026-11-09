@@ -189,9 +189,7 @@ fn unmarked(engine: &ConversationEngine, rel: &str) -> Vec<TimelineId> {
                     .any(|tag| tag.ends_with(&format!(":{who}")))
             };
             let dated = |t: &TimelineId, key: &str| {
-                engine
-                    .conversation_metadata(*t)
-                    .is_some_and(|m| m.get(key).map(String::as_str) == Some(date.as_str()))
+                engine.conversation_metadata_value(*t, key).as_deref() == Some(date.as_str())
             };
             // The episode itself, and every consequence that names it.
             engine
