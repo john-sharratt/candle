@@ -12,6 +12,15 @@
 //! taker — the scheduler, between waves — pops without waiting on the writer,
 //! the persistence lock or the substrate. A snapshot appended but not yet
 //! committed is put back for the next take.
+//!
+//! **The queue is read once, by the scheduler alone.** Anyone else who needs
+//! to know a turn's state is down — a parked conversation, which drops its
+//! sequence only once the record would resume it — asks [`WrittenSnapshots::latest`],
+//! the newest snapshot written for each timeline, which taking never
+//! changes.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crossbeam::queue::SegQueue;
 
@@ -33,17 +42,43 @@ pub struct WrittenSnapshot {
     pub loc: RecordLoc,
 }
 
-/// The queue between the writer and the taker.
+/// The queue between the writer and the taker, and the newest snapshot
+/// written for each timeline.
 #[derive(Debug, Default)]
-pub struct WrittenSnapshots(SegQueue<WrittenSnapshot>);
+pub struct WrittenSnapshots {
+    queue: SegQueue<WrittenSnapshot>,
+    /// Per timeline, the turn and location of the newest snapshot written:
+    /// one entry a timeline, replaced in place, so it is bounded by the
+    /// timelines this process wrote state for.
+    newest: Mutex<HashMap<u64, (u32, RecordLoc)>>,
+}
 
 impl WrittenSnapshots {
     /// Record a snapshot the writer appended.
     pub fn push(&self, written: WrittenSnapshot) {
-        while self.0.len() >= WRITTEN_SNAPSHOTS_HELD {
-            self.0.pop();
+        {
+            let mut newest = self.newest.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = newest
+                .entry(written.timeline)
+                .or_insert((written.turn_index, written.loc));
+            if written.turn_index >= entry.0 {
+                *entry = (written.turn_index, written.loc);
+            }
         }
-        self.0.push(written);
+        while self.queue.len() >= WRITTEN_SNAPSHOTS_HELD {
+            self.queue.pop();
+        }
+        self.queue.push(written);
+    }
+
+    /// The turn and location of the newest snapshot written for `timeline`
+    /// in this process. Reading it takes nothing from the queue.
+    pub fn latest(&self, timeline: u64) -> Option<(u32, RecordLoc)> {
+        self.newest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&timeline)
+            .copied()
     }
 
     /// Every queued snapshot whose record `durable` says is down, as
@@ -52,14 +87,14 @@ impl WrittenSnapshots {
     /// going.
     pub fn take_durable(&self, durable: impl Fn(&RecordLoc) -> bool) -> Vec<(u64, u32)> {
         let mut taken = Vec::new();
-        for _ in 0..self.0.len() {
-            let Some(w) = self.0.pop() else {
+        for _ in 0..self.queue.len() {
+            let Some(w) = self.queue.pop() else {
                 break;
             };
             if durable(&w.loc) {
                 taken.push((w.timeline, w.turn_index));
             } else {
-                self.0.push(w);
+                self.queue.push(w);
             }
         }
         taken
@@ -67,12 +102,12 @@ impl WrittenSnapshots {
 
     /// How many are queued.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.queue.len()
     }
 
     /// Whether none are queued.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.queue.is_empty()
     }
 }
 
@@ -108,6 +143,23 @@ mod tests {
         assert_eq!(q.len(), 1, "the uncommitted one stays queued");
         assert_eq!(q.take_durable(|_| true), vec![(8, 2)]);
         assert!(q.is_empty());
+    }
+
+    /// **The newest snapshot of each timeline is answered whatever was
+    /// taken**: a take empties the queue and leaves `latest` as it was, and an
+    /// older turn written late never replaces a newer one.
+    #[test]
+    fn the_newest_of_each_timeline_survives_a_take() {
+        let q = WrittenSnapshots::default();
+        q.push(written(7, 3, 0));
+        q.push(written(7, 4, 64));
+        q.push(written(7, 2, 128));
+        q.push(written(8, 0, 192));
+        assert_eq!(q.take_durable(|_| true).len(), 4);
+        assert!(q.is_empty());
+        assert_eq!(q.latest(7), Some((4, written(7, 4, 64).loc)));
+        assert_eq!(q.latest(8), Some((0, written(8, 0, 192).loc)));
+        assert_eq!(q.latest(9), None);
     }
 
     /// A queue nobody takes from holds at most its bound, dropping the oldest.

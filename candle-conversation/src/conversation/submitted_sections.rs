@@ -738,6 +738,19 @@ impl Sequence {
         self.rebuild_projection();
     }
 
+    /// Bring the projection an ask reads up to date with the sections sealed
+    /// since the last submit, without submitting a turn.
+    ///
+    /// A section [`Carried::reconcile`](super::carried::Carried::reconcile)
+    /// waited on is sealed but not yet in the projection an
+    /// [`UnsealedAsker`](super::ephemeral_turn::UnsealedAsker) asks over: that
+    /// projection is republished at a submit or a removal. A caller that
+    /// carries a section and then asks before its next turn calls this between
+    /// the two, or the ask is made without the section it just carried.
+    pub fn publish_sections(&mut self) {
+        self.sync_submitted_sections();
+    }
+
     /// Recompute the projection as the base schema plus the sealed submitted
     /// sections.
     pub(super) fn rebuild_projection(&mut self) {
