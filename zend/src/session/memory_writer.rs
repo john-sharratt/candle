@@ -47,6 +47,7 @@ use journals::brief::held::Held;
 use journals::brief::summary::{Plan, MAX_SENTENCES};
 use journals::brief::{self, call_of, fold, gone_quiet, summary, Job};
 use journals::ops::{Applied, Op};
+use journals::scope::Section;
 use journals::time::Stamp;
 use journals::tree::Tree;
 use serde_json::Value;
@@ -67,8 +68,27 @@ const EVERY: Duration = Duration::from_secs(30);
 /// How long shutdown waits for the writer to let go once asked to stop.
 pub(super) const GRACE: Duration = Duration::from_secs(30);
 
-/// The most jobs one look takes; the rest wait for the next.
+/// The most jobs one look takes of people's journals; the rest wait for the
+/// next.
 const PER_PASS: usize = 8;
+
+/// The most jobs one look takes of the groups' `bots/` journals, beside
+/// [`PER_PASS`]: a cast's upkeep never starves people's folds and summaries
+/// (`docs/npc_conversations.md` §5.3).
+const BOTS_PER_PASS: usize = 16;
+
+/// The jobs one look takes: up to [`PER_PASS`] of people's journals and up to
+/// [`BOTS_PER_PASS`] of bots', each in the order they came.
+fn this_pass(jobs: Vec<Job>) -> Vec<Job> {
+    let (bots, people): (Vec<Job>, Vec<Job>) = jobs
+        .into_iter()
+        .partition(|j| j.path().section() == Some(Section::Bots));
+    people
+        .into_iter()
+        .take(PER_PASS)
+        .chain(bots.into_iter().take(BOTS_PER_PASS))
+        .collect()
+}
 
 /// The longest one field of an answer may run — a sentence, a digest, a cue,
 /// a fold's line, each far under it at its cap. A field that runs on is closed
@@ -482,7 +502,7 @@ pub(super) async fn run(state: Weak<InferenceState>, memory: Arc<Memory>, stop: 
         let jobs = writer.held.sift(&tree, brief::due(&tree, now), now);
         drop(tree);
         let mut failing = false;
-        for job in jobs.into_iter().take(PER_PASS) {
+        for job in this_pass(jobs) {
             if stop.is_cancelled() {
                 return;
             }
@@ -520,6 +540,30 @@ mod tests {
     use journals::tree::load::load;
 
     use super::*;
+
+    /// **A cast's journals have an allowance of their own**: a pass full of
+    /// bots' work still takes people's, and the other way about.
+    #[test]
+    fn a_pass_takes_people_s_and_bots_jobs_on_their_own_allowances() {
+        let close = |p: &str| Job::Close {
+            path: JournalPath::root(Slug::parse("moon").unwrap())
+                .child(Slug::parse(p.split('/').next().unwrap()).unwrap())
+                .unwrap()
+                .child(Slug::parse(p.split('/').nth(1).unwrap()).unwrap())
+                .unwrap(),
+        };
+        let mut jobs: Vec<Job> = (0..20).map(|i| close(&format!("bots/b{i}"))).collect();
+        jobs.extend((0..10).map(|i| close(&format!("people/p{i}"))));
+        let taken: Vec<String> = this_pass(jobs)
+            .iter()
+            .map(|j| j.path().show())
+            .collect();
+        assert_eq!(taken.len(), PER_PASS + BOTS_PER_PASS);
+        assert_eq!(taken[0], "@moon/people/p0");
+        assert_eq!(taken[PER_PASS - 1], "@moon/people/p7");
+        assert_eq!(taken[PER_PASS], "@moon/bots/b0");
+        assert_eq!(taken.last().unwrap(), "@moon/bots/b15");
+    }
 
     /// **Every call the writer offers builds as a grammar** in a checkpoint's
     /// own call form: a summary's, with its guided cites, and a fold's.
