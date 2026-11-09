@@ -47,6 +47,7 @@ use crate::machines::state_expert_pin;
 use crate::memory_census;
 use crate::model::{ModelView, MODEL};
 use crate::process::{abort_on_ctrl_c, init_logging, install_panic_hook, stop_signal};
+use crate::ram_census::spawn as spawn_ram_census;
 use crate::self_heal::spawn_watchdog;
 use crate::server::serve;
 use crate::starting::StartLine;
@@ -232,7 +233,7 @@ pub fn run_seated(cfg: HostConfig, seats: Vec<Seat>) -> ! {
     // context for good; nothing supervises this process, so it relaunches
     // itself (`self_heal.rs`).
     spawn_watchdog(launch.clone(), state_dir.clone(), resumed);
-    crate::process::spawn_ram_census();
+    spawn_ram_census();
     // A no-op without the `profile` feature.
     set_gpu_span_period(GPU_SPAN_PERIOD);
 

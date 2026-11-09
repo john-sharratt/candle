@@ -16,6 +16,7 @@ use serde::Serialize;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::memory_census::{latest as census_latest, CensusNow};
+use crate::ram_census::{latest as ram_latest, RamReading};
 
 /// Response body for `GET /v1/memory`.
 #[derive(Serialize)]
@@ -60,6 +61,10 @@ pub struct ProcessNow {
     /// the growth verdict over the last half hour. Absent before the first
     /// reading, a minute after start.
     pub census: Option<CensusNow>,
+    /// The address space's last walk (`ram_census`): committed and resident
+    /// bytes by kind, the largest allocations and the private size buckets —
+    /// what the commit charge is made of. Absent before the first walk.
+    pub ram: Option<RamReading>,
 }
 
 /// Read the OS and this process. A fresh `System` refreshed only for what is
@@ -103,6 +108,7 @@ pub fn dump() -> MemoryDump {
             virtual_bytes,
             heap,
             census,
+            ram: ram_latest().map(|r| RamReading::clone(&r)),
         },
         substrates: store_gauges(),
     }
@@ -134,6 +140,8 @@ mod tests {
             json["process"]["heap"]["allocator"],
             serde_json::Value::Null
         );
+        // No census thread runs in a test binary: no walk yet, so no reading.
+        assert_eq!(json["process"]["ram"], serde_json::Value::Null);
     }
 
     /// With no engine in this process the engine section stays absent rather

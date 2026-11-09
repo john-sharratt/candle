@@ -43,6 +43,7 @@ pub mod machines;
 pub mod memory_census;
 pub mod model;
 pub mod process;
+pub mod ram_census;
 pub mod run;
 pub mod self_heal;
 pub mod server;
