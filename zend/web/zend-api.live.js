@@ -37,6 +37,15 @@
     if (!r.ok && r.status !== 204) throw new Error('POST ' + path + ' -> ' + r.status);
   }
   const enc = (id) => encodeURIComponent(id);
+  // A conversation's history as the UI keeps it, from the daemon's messages.
+  // `thinking` ({tokens, exact}) is the turn's reasoning length; the UI keeps
+  // one per think block, in order. `error`: why a failed turn stopped, on its
+  // last assistant bubble. `parts`: an assistant bubble's prose, reasoning and
+  // calls, each call with its result (`zend/src/parts.rs`) — what the bubble,
+  // and a sub-agent's block, are drawn from.
+  function historyOf(messages) {
+    return (messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, thinking: m.thinking ? [m.thinking] : [], tool_tokens: m.tool_tokens || [], spans: m.spans || [], files: m.files || [], error: m.error || null, parts: m.parts && m.parts.length ? m.parts : null }));
+  }
   // How long one `/v1/status` poll may wait for an answer (see `getStatus`).
   // A live daemon answers it without the engine lock, in milliseconds.
   const STATUS_TIMEOUT_MS = 8000;
@@ -77,10 +86,10 @@
       return {
         id: String(id),
         title: body.title,
-        // `thinking` ({tokens, exact}) is the turn's reasoning length; the UI
-        // keeps one per think block, in order.
-        // `error`: why a failed turn stopped, on its last assistant bubble.
-        history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, thinking: m.thinking ? [m.thinking] : [], tool_tokens: m.tool_tokens || [], spans: m.spans || [], files: m.files || [], error: m.error || null })),
+        history: historyOf(body.messages),
+        // How many turns it holds: a job's view of the task running in it
+        // says the same, so its block knows when this copy is behind.
+        turns: Number(body.turns) || 0,
         uploads: body.uploads || [],
         // The composer dials this conversation last ran at, as levels. Absent
         // for one that has never taken a turn — the composer keeps its own.
@@ -571,5 +580,9 @@
     } catch (_) { /* ignore keepalive / partial */ }
   }
 
-  window.ZendLiveAPI = ZendLiveAPI;
+  ZendLiveAPI.historyOf = historyOf;
+  // The page takes the adapter; the Node test (zend/web-tests/live-history.test.js)
+  // takes the history mapping.
+  if (typeof module === 'object' && module.exports) module.exports = { historyOf };
+  else window.ZendLiveAPI = ZendLiveAPI;
 })();

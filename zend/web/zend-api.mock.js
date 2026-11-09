@@ -152,6 +152,32 @@
               '{"answer":"build:76c3a0f4d39bd9db:XzBY8ehGFz0 — running"}</tool_response>',
             ]) },
             { role: 'assistant', content: 'The check is running.' },
+            { role: 'user', content: 'Have a sub-agent verify it.' },
+            { role: 'assistant', content: '<tool_call>{"name":"repo_task_start","arguments":{"thread":"review","name":"verify","prompt":"Verify the check."}}</tool_call>' },
+            { role: 'user', content: J([
+              '<tool_response>',
+              '{"answer":"Started task:review/verify."}</tool_response>',
+            ]) },
+            { role: 'assistant', content: 'A sub-agent is verifying it.' },
+          ],
+        };
+      }
+      // A sub-agent's conversation as the daemon stores it, each reply with
+      // its parts: under `__ZEND_MOCK_SUBAGENT_PARTS__`, the worker conversation
+      // the task in conversation 7 runs in.
+      if (String(id) === '4' && window.__ZEND_MOCK_SUBAGENT_PARTS__) {
+        const reading = '{"path":"a.rs","text":"fn main() {}"}';
+        return {
+          id: '4', title, dials, archived: false, updated_ms: Date.now(), turn_count: 2, turns: 2,
+          history: [
+            { role: 'user', content: 'Verify the check.' },
+            { role: 'assistant', content: '<think>Read it first.</think><tool_call>{"name":"file_read","arguments":{"path":"a.rs"}}</tool_call>',
+              parts: [
+                { kind: 'think', text: 'Read it first.', closed: true },
+                { kind: 'call', tool: 'file_read', args: [['path', 'a.rs']], result: JSON.parse(reading), tokens: 7, ok: true, closed: true },
+              ] },
+            { role: 'user', content: '<tool_response>\n' + reading + '\n</tool_response>' },
+            { role: 'assistant', content: 'It compiles.', parts: [{ kind: 'prose', text: 'It compiles.' }] },
           ],
         };
       }
@@ -644,15 +670,20 @@
     // to follow: the stored conversation is always complete.
     // A job as the daemon reads one: a build that writes a line every call
     // and ends after twelve, and a task whose worker conversation is seeded.
+    // A test sets `window.__ZEND_MOCK_JOB_STILL__` to hold every job where it
+    // stands — running, one line written — so a poll finds nothing changed.
     _jobLines: {},
     async jobView(handle) {
       await delay(40);
-      const n = (this._jobLines[handle] = (this._jobLines[handle] || 0) + 1);
+      const n = window.__ZEND_MOCK_JOB_STILL__
+        ? (this._jobLines[handle] = 1)
+        : (this._jobLines[handle] = (this._jobLines[handle] || 0) + 1);
       const task = handle.startsWith('task:');
       return {
         handle, kind: task ? 'task' : handle.split(':')[0], ended: n >= 12,
         line: n >= 12 ? 'done — exited 0' : 'running — compiling zend',
-        total: n, conversation: task ? '4' : null,
+        total: n, size: n * 32, conversation: task ? '4' : null,
+        turns: task ? 2 : undefined,
       };
     },
     async jobLines(handle, ask) {
@@ -865,9 +896,32 @@
           'the records it can verify. A torn tail is truncated, not repaired.'].join('\n');
         streamCall('write', { path, content: body }, { path, bytes: body.length }, 24, () => prefillThen(6144, answer));
       };
+      // Under `__ZEND_MOCK_PARTS_STREAM__`: three calls closed and answered at
+      // once, then a long reasoning still streaming. Each result counts how
+      // often it is serialised into `window.__ZEND_RESULT_JSON__`, so a test
+      // can see a closed call's card drawn once, not every frame.
+      const partsRound = () => {
+        window.__ZEND_RESULT_JSON__ = [0, 0, 0];
+        for (let k = 0; k < 3; k++) {
+          const id = partId();
+          part({ op: 'open', id, kind: 'call' });
+          part({ op: 'tool', id, tool: 'file_read' });
+          part({ op: 'arg', id, name: 'path', text: 'f' + k + '.rs' });
+          part({ op: 'close', id, ok: true });
+          part({ op: 'result', id, result: { toJSON() { window.__ZEND_RESULT_JSON__[k]++; return { path: 'f' + k + '.rs' }; } }, tokens: 3 });
+        }
+        const id = partId();
+        part({ op: 'open', id, kind: 'think' });
+        const long = Array.from({ length: 120 }, (_, i) => 'step' + i + ' ');
+        drip(long, (w, i) => part({ op: 'text', id, text: w, tokens: i + 1 }), () => {
+          part({ op: 'close', id, ok: true });
+          answer();
+        });
+      };
       later(34, () => {
         handlers.onStatus('');
-        if (/\bread\b[\s\S]*\bfile\b/i.test(text || '')) toolRound();
+        if (window.__ZEND_MOCK_PARTS_STREAM__) partsRound();
+        else if (/\bread\b[\s\S]*\bfile\b/i.test(text || '')) toolRound();
         else if (/\bwrite\b/i.test(text || '')) writeRound();
         else answer();
       });

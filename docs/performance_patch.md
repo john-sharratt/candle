@@ -410,9 +410,11 @@ history's `thinking`, else its counted tokens); plus `S.toolSchemaGen` and
 a streaming reply is drawn from parts (the history is drawn from content
 until G7), so the gain is on the streaming reply.
 
-**Tests.** The mock streams three closed calls and a live think, each
-result an object whose `toJSON` counts its calls; over ten frames
-(`page.clock`) the first result's count is exactly 1.
+**Tests.** The mock (`__ZEND_MOCK_PARTS_STREAM__`) streams three closed
+calls and a live think, each result an object whose `toJSON` counts its
+calls; after 1.5 s of the think streaming — well over ten 80 ms frames, in real
+time, since the streaming patch runs on `requestAnimationFrame` — every
+result's count is exactly 1.
 
 **Risk.** Low.
 
@@ -444,10 +446,11 @@ whole conversation.
   job's tail is read when `total`, `size` or `ended` changed; a running
   task's tail every tick (its turn report carries a clock, and it is a local
   read). An open log reads from the line after the last held when `total`
-  grew, `ended` changed, or it has not been read since opening. An open
+  grew, `ended` changed, or it is `fresh` — not read since opening, or its
+  last read filled a whole page, so more is held. An open
   task's conversation is refetched when the view's `turns` differs from the
   fetched conversation's, when `ended` changed, or when it has not been read
-  since opening — so the `read` flag is always set eventually. Keyed on
+  since opening — so `fresh` is always cleared eventually. Keyed on
   `ended`, never on whether a turn is live: that is visible only on the
   member running it.
 

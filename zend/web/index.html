@@ -398,10 +398,22 @@
   </noscript>
 </div>
 
-<script src="zend-api.mock.js"></script>
+<script>
+  /* The mock backend (59 KB) is loaded only when it is asked for — the same
+   * two ways `zend-api.js` turns it on — and written in place, so it still
+   * runs before the scripts after it. */
+  (function () {
+    var mock = false;
+    try { mock = new URLSearchParams(location.search).has('mock') || window.ZEND_BACKEND === 'mock'; } catch (_) {}
+    if (mock) document.write('<script src="zend-api.mock.js"><\/script>');
+  })();
+</script>
 <script src="zend-api.live.js"></script>
 <script src="zend-api.js"></script>
 <script src="partial-call.js"></script>
+<script src="conversation-merge.js"></script>
+<script src="tool-responses.js"></script>
+<script src="job-poll.js"></script>
 <script type="module">
 /* ============================================================================
  * Zend UI — vanilla single-file app (plain DOM, no framework).
@@ -612,8 +624,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // does not open its siblings.
     toolOpen: {},
     approvals: {},                 // approval id → { pending, grant } | { state, answer } | { error }
-    jobs: {},                      // job handle → { kind, ended, line, conversation, lines, tail, open, began, messages }
-    jobGen: 0,                     // bumped whenever S.jobs changes, so memoised turns redraw their blocks
+    // job handle → { kind, ended, line, conversation, total, size, lines, tail,
+    // open, fresh, began, messages, turns, rev } — written through `setJob`.
+    jobs: {},
     upload: null,
     // The daemon's background ingestion backlog (GET /v1/status
     // `ingest_backlog`) — `{ processed, total, last_item }`, or null when
@@ -884,16 +897,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     }
     return html;
   }
-  // A user turn that is purely a tool result, e.g. `<tool_response>{…}</tool_response>`.
-  function isToolResponse(content) {
-    const t = (content || '').trim();
-    return t.indexOf('<tool_response>') !== -1 && t.indexOf('</tool_response>') !== -1;
-  }
-  // The `<tool_response>…</tool_response>` blocks of a tool-response turn, one
-  // per call, in order.
-  function toolResponseBlocks(content) {
-    return String(content || '').match(/<tool_response>[\s\S]*?<\/tool_response>/g) || [content];
-  }
+  // A user turn that is purely a tool result, e.g. `<tool_response>{…}</tool_response>`,
+  // and its blocks, one per call, in order (`tool-responses.js`).
+  const { isToolResponse, toolResponseBlocks, responsesOf } = window.ZendToolResponses;
   // Pull the inner payload out of a `<tool_response>…</tool_response>` turn and
   // classify it (an `error`/`detail` key ⇒ the call failed).
   function toolResponseInfo(content) {
@@ -1078,12 +1084,34 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     for (const m of (raw || '').matchAll(JOB_HANDLE)) if (seen.indexOf(m[1]) === -1) seen.push(m[1]);
     return seen;
   }
+  // Write a job's record. Its `rev` moves only when something its block or
+  // wait window draws changes (`job-poll.js`), so a message drawing it
+  // redraws only then. Answers whether it moved.
+  function setJob(h, patch) {
+    const prev = S.jobs[h];
+    const next = Object.assign({}, prev, patch);
+    const moved = window.ZendJobPoll.visiblyChanged(prev, next);
+    next.rev = ((prev && prev.rev) || 0) + (moved ? 1 : 0);
+    S.jobs = Object.assign({}, S.jobs, { [h]: next });
+    return moved;
+  }
+  // The jobs a memoised message draws, with the revs it drew them at: its
+  // cached HTML holds while each of them does (`nodeHtmlMemo`).
+  let jobFrame = null;
+  function drew(h) { if (jobFrame) jobFrame.push([h, S.jobs[h].rev]); }
   // Note a job the page now draws, so the poller follows it.
   function followJob(h) {
     if (S.jobs[h]) return;
-    S.jobs = Object.assign({}, S.jobs, { [h]: { kind: h.split(':')[0], line: '', ended: false, lines: [], tail: [], open: false, began: _now() } });
-    S.jobGen++;
+    setJob(h, { kind: h.split(':')[0], line: '', ended: false, lines: [], tail: [], open: false, began: _now() });
     setTimeout(pollJobs, 0);
+  }
+  // Each running job's clock, moved in place: what a poll that changed
+  // nothing does, and what every render ends with, so cached HTML never shows
+  // a stale clock.
+  function tickJobTimes() {
+    document.querySelectorAll('span.job-time[data-began]').forEach((s) => {
+      s.textContent = elapsed(_now() - Number(s.getAttribute('data-began')));
+    });
   }
   function elapsed(ms) {
     const s = Math.max(0, Math.round(ms / 1000));
@@ -1094,6 +1122,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   }
   function jobBlock(h) {
     followJob(h);
+    drew(h);
     const j = S.jobs[h];
     const mark = !j.ended ? '<span class="job-bar"></span>'
       : /fail|error|rolled back|lost|cancel/i.test(j.line) ? '<span class="job-end bad">✕</span>' : '<span class="job-end ok">✓</span>';
@@ -1106,14 +1135,16 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       (agent ? '<span class="job-agent">sub-agent</span>' : '') +
       '<span class="job-name">' + esc(h) + '</span>' +
       '<span class="job-line">' + esc(j.line || 'starting…') + '</span>' +
-      (j.ended ? '' : '<span class="job-time">' + elapsed(_now() - j.began) + '</span>') + mark + '</div>';
+      (j.ended ? '' : '<span class="job-time" data-began="' + j.began + '">' + elapsed(_now() - j.began) + '</span>') + mark + '</div>';
     const cls = 'job-block' + (agent ? ' agent' : '');
     if (!j.open) return '<div class="' + cls + '" data-job="' + esc(h) + '">' + head + '</div>';
     let body;
     if (agent) {
-      const msgs = (j.messages || []).filter((m) => m.role === 'assistant' || m.role === 'user');
+      const msgs = subAgentMessages(j.messages || []);
+      // Drawn with its thinking closed, always: `restoreToolOpen` opens what
+      // the reader opened, so no open state is baked into cached HTML.
       body = '<div class="job-conv">' + (msgs.length ? msgs.map((m, i) =>
-        '<div class="job-msg ' + m.role + '" data-jmsg="' + i + '">' + (m.role === 'assistant' ? '<div class="zmd">' + nodeHtml(m, !!S.thinkOpen[jobMsgKey(h, i)]) + '</div>' : esc(m.content || '')) + '</div>').join('') +
+        '<div class="job-msg ' + m.role + '" data-jmsg="' + i + '">' + (m.role === 'assistant' ? '<div class="zmd">' + nodeHtml(m, false) + '</div>' : esc(m.content || '')) + '</div>').join('') +
         (j.ended ? '' : '<div class="job-working"><span class="zdots"><i></i><i></i><i></i></span>working</div>')
         : '<div class="job-empty">Its conversation is loading…</div>') + '</div>';
     } else {
@@ -1121,43 +1152,101 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     }
     return '<div class="' + cls + ' open" data-job="' + esc(h) + '">' + head + body + '</div>';
   }
+  // A sub-agent's conversation as its block draws it: its assistant turns,
+  // and the user turns that are not tool results an assistant turn's parts
+  // already carry.
+  function subAgentMessages(messages) {
+    let parted = false;
+    return messages.filter((m) => {
+      if (m.role === 'assistant') { parted = !!(m.parts && m.parts.length); return true; }
+      return m.role === 'user' && !(parted && responsesOf(m));
+    });
+  }
   // A waited job's newest lines, in a fixed-height window: at most three
   // windows, the rest named in one line.
   function waitWindows(handles) {
     const shown = handles.slice(0, 3);
-    shown.forEach(followJob);
     const more = handles.length - shown.length;
-    return '<div class="job-waits">' + shown.map((h) => {
-      const j = S.jobs[h];
-      return '<div class="job-wait" data-job-open="' + esc(h) + '"><div class="job-wait-name">' + esc(h) + (j.ended ? ' · ended' : '') + '</div>' +
-        '<pre class="job-wait-tail">' + esc((j.tail || []).map((l) => l.text).join('\n')) + '</pre></div>';
-    }).join('') + (more > 0 ? '<div class="job-wait-more">+' + more + ' more</div>' : '') + '</div>';
+    return '<div class="job-waits">' + shown.map(waitWindow).join('') +
+      (more > 0 ? '<div class="job-wait-more">+' + more + ' more</div>' : '') + '</div>';
+  }
+  function waitWindow(h) {
+    followJob(h);
+    drew(h);
+    const j = S.jobs[h];
+    return '<div class="job-wait" data-job-open="' + esc(h) + '"><div class="job-wait-name">' + esc(h) + (j.ended ? ' · ended' : '') + '</div>' +
+      '<pre class="job-wait-tail">' + esc((j.tail || []).map((l) => l.text).join('\n')) + '</pre></div>';
   }
   // Follow every job the page draws: its line until it ends, its log from
   // the line after the last held while it is open, its tail while it runs,
-  // and a task's conversation while it is open. One request per job per tick.
+  // and a task's conversation while it is open — each read only when the
+  // job's view says it moved (`job-poll.js`). One poll at a time: a call
+  // while one is in flight runs once it settles. Visible tabs only.
   let jobPoll = null;
+  let jobPolling = false;
+  let jobPollAgain = false;
+  // Jobs that moved while the chat could not be redrawn under the reader.
+  const jobsMoved = new Set();
   function pollJobs() {
+    if (jobPolling) { jobPollAgain = true; return; }
     clearTimeout(jobPoll);
-    const live = Object.keys(S.jobs).filter((h) => !S.jobs[h].ended || (S.jobs[h].open && !S.jobs[h].read));
+    jobPoll = null;
+    if (document.hidden) return;
+    const live = Object.keys(S.jobs).filter((h) => !S.jobs[h].ended || (S.jobs[h].open && S.jobs[h].fresh));
     if (!live.length) return;
-    const set = (h, patch) => { S.jobs = Object.assign({}, S.jobs, { [h]: Object.assign({}, S.jobs[h], patch) }); S.jobGen++; };
+    jobPolling = true;
+    const set = (h, patch) => { if (setJob(h, patch)) jobsMoved.add(h); };
     Promise.all(live.map((h) => API.jobView(h).then((v) => {
       const j = S.jobs[h];
-      set(h, { kind: v.kind, ended: v.ended, line: v.line, conversation: v.conversation });
-      const reads = [API.jobLines(h, { tail: 8 }).then((r) => set(h, { tail: r.lines }))];
-      if (j.open && v.kind !== 'task') {
+      const want = window.ZendJobPoll.reads(j, v);
+      set(h, { kind: v.kind, ended: v.ended, line: v.line, conversation: v.conversation, total: v.total, size: v.size });
+      const reads = [];
+      if (want.includes('tail')) reads.push(API.jobLines(h, { tail: 8 }).then((r) => set(h, { tail: r.lines })));
+      if (want.includes('from')) {
         const from = j.lines.length ? j.lines[j.lines.length - 1].n + 1 : 1;
-        reads.push(API.jobLines(h, { from }).then((r) => set(h, { lines: j.lines.concat(r.lines), read: v.ended && r.lines.length < 200 })));
+        // A full page means more is held: the next poll reads on.
+        reads.push(API.jobLines(h, { from }).then((r) => set(h, { lines: S.jobs[h].lines.concat(r.lines), fresh: r.lines.length >= 200 })));
       }
-      if (j.open && v.kind === 'task' && v.conversation) {
-        reads.push(API.getConversation(v.conversation).then((c) => set(h, { messages: c.history || [], read: v.ended })));
+      if (want.includes('conversation') && v.conversation) {
+        reads.push(API.getConversation(v.conversation).then((c) => set(h, { messages: c.history || [], turns: c.turns, fresh: false })));
       }
       return Promise.all(reads);
-    }).catch(() => set(h, { line: 'not readable', ended: true })))).then(() => {
-      render();
-      jobPoll = setTimeout(pollJobs, 2000);
+    }).catch(() => set(h, { line: 'not readable', ended: true })))).finally(() => {
+      jobPolling = false;
+      redrawJobs();
+      if (jobPollAgain) { jobPollAgain = false; pollJobs(); return; }
+      if (!document.hidden) jobPoll = setTimeout(pollJobs, 2000);
     });
+  }
+  // Redraw, in place, the blocks and wait windows of the jobs that moved — a
+  // running job's line carries a seconds clock, so most polls move one — and
+  // nothing else. Never under a selection or a press in the chat, as the
+  // streaming patch holds off: those jobs wait for the next poll.
+  function redrawJobs() {
+    if (!jobsMoved.size) { tickJobTimes(); return; }
+    if (!chatEl) { jobsMoved.clear(); render(); return; }
+    const seln = window.getSelection && window.getSelection();
+    if (seln && !seln.isCollapsed && seln.rangeCount && chatEl.contains(seln.getRangeAt(0).commonAncestorContainer)) return;
+    if (chatPointerDown) return;
+    const follow = nearBottom(chatEl);
+    const moved = Array.from(jobsMoved);
+    jobsMoved.clear();
+    const swap = (el, html) => {
+      const row = el.closest('[data-msg]');
+      const zmd = el.closest('.zmd');
+      const idx = row ? Number(row.getAttribute('data-msg')) : -1;
+      if (zmd) harvestOpen(zmd, S.activeId, idx);
+      const box = document.createElement('div');
+      box.innerHTML = html;
+      el.replaceWith(box.firstElementChild);
+      if (zmd) restoreToolOpen(zmd, S.activeId, idx);
+    };
+    for (const h of moved) {
+      chatEl.querySelectorAll('.job-block[data-job="' + CSS.escape(h) + '"]').forEach((el) => swap(el, jobBlock(h)));
+      chatEl.querySelectorAll('.job-wait[data-job-open="' + CSS.escape(h) + '"]').forEach((el) => swap(el, waitWindow(h)));
+    }
+    tickJobTimes();
+    if (follow) chatEl.scrollTop = chatEl.scrollHeight;
   }
   // A call the conversation was not allowed to make alone, held for the
   // person's approval (docs/zen_tool_reach.md §5): its result says
@@ -1336,17 +1425,34 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // daemon split the reply with the rule the grammar closes values on, so a
   // value holding `</tool_call>` or `<think>` stays inside its call.
   // `thinking` labels the k-th reasoning block with its length.
+  // A part's HTML, kept on the part while `key` holds — for a part that can no
+  // longer change but by what `key` names, so a streaming reply redraws only
+  // its live part every frame.
+  function cachedPart(p, key, draw) {
+    const c = p._html;
+    if (c && c.key.length === key.length && c.key.every((k, i) => k === key[i])) return c.html;
+    const html = draw();
+    p._html = { key, html };
+    return html;
+  }
   function renderParts(parts, streaming, open, thinking) {
     let html = '';
     let thinkNo = 0;
     let callNo = 0;
     const lengths = Array.isArray(thinking) ? thinking : (thinking ? [thinking] : []);
-    for (const p of parts) {
-      if (p.kind === 'prose') { if (p.text) html += renderMd(p.text); continue; }
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (p.kind === 'prose') {
+        // Only the last prose part still grows.
+        if (p.text) html += i < parts.length - 1 ? cachedPart(p, [p.text], () => renderMd(p.text)) : renderMd(p.text);
+        continue;
+      }
       if (p.kind === 'think') {
         const closed = !streaming || p.closed;
         const length = lengths[thinkNo++] || (p.counted != null ? { tokens: p.counted, exact: true } : null);
-        html += renderThink({ kind: 'think', complete: closed, body: p.text || '', tokens: p.live != null ? p.live : null, length }, open);
+        const think = () => renderThink({ kind: 'think', complete: closed, body: p.text || '', tokens: p.live != null ? p.live : null, length }, open);
+        const label = length ? length.tokens + (length.exact ? '' : '~') : '';
+        html += closed ? cachedPart(p, [open, label], think) : think();
         continue;
       }
       const args = {};
@@ -1362,11 +1468,18 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       }
       // A call that failed to parse is drawn as failed, with why, until the
       // round's own answer to it arrives.
-      let output = null;
-      if (p.result != null) output = typeof p.result === 'string' ? p.result : JSON.stringify(p.result, null, 2);
-      else if (p.ok === false) output = JSON.stringify({ error: 'call_failed', detail: p.error || 'the call could not be read' });
-      const json = JSON.stringify({ name: p.tool || 'tool call', arguments: args });
-      html += toolCard(json, true, output, p.running ? [p.tool] : null, p.tokens != null ? p.tokens : null, callNo++);
+      const card = (n) => () => {
+        let output = null;
+        if (p.result != null) output = typeof p.result === 'string' ? p.result : JSON.stringify(p.result, null, 2);
+        else if (p.ok === false) output = JSON.stringify({ error: 'call_failed', detail: p.error || 'the call could not be read' });
+        const json = JSON.stringify({ name: p.tool || 'tool call', arguments: args });
+        return toolCard(json, true, output, p.running ? [p.tool] : null, p.tokens != null ? p.tokens : null, n);
+      };
+      const n = callNo++;
+      // A card that draws a job block follows its job's revs, which this key
+      // cannot see: it is drawn every time.
+      const draws = STARTS[p.tool] || WAITS[p.tool];
+      html += draws ? card(n)() : cachedPart(p, [p.result, p.running, p.tokens, p.ok, p.error, n, S.toolSchemaGen, S.approvals], card(n));
     }
     return html;
   }
@@ -1515,11 +1628,21 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // An approval settled under a card redraws its box, so its state is part
     // of the key too.
     const ap = S.approvals || null;
-    // A job block under a card redraws as its job moves.
-    const jg = S.jobGen;
-    if (c && c.content === msg.content && c.parts === msg.parts && c.open === open && sameOutputs(c.to, toArr) && c.thKey === thKey && c.gen === S.toolSchemaGen && c.ap === ap && c.jg === jg) return c.html;
-    const html = nodeHtml(msg, open, toolOutputs, toolTokens);
-    msg._htmlCache = { content: msg.content, parts: msg.parts, open: open, to: toArr, thKey: thKey, gen: S.toolSchemaGen, ap: ap, jg: jg, html: html };
+    // A job block under a card redraws as its job moves: the cache holds while
+    // every job it drew is at the rev it was drawn at.
+    const jobsHold = c && c.jobs.every(([h, rev]) => S.jobs[h] && S.jobs[h].rev === rev);
+    if (c && jobsHold && c.content === msg.content && c.parts === msg.parts && c.open === open && sameOutputs(c.to, toArr) && c.thKey === thKey && c.gen === S.toolSchemaGen && c.ap === ap) return c.html;
+    const outer = jobFrame;
+    jobFrame = [];
+    let html, jobs;
+    try {
+      html = nodeHtml(msg, open, toolOutputs, toolTokens);
+    } finally {
+      jobs = jobFrame;
+      jobFrame = outer;
+      if (outer) outer.push(...jobs);
+    }
+    msg._htmlCache = { content: msg.content, parts: msg.parts, open: open, to: toArr, thKey: thKey, gen: S.toolSchemaGen, ap: ap, jobs: jobs, html: html };
     return html;
   }
   function sameOutputs(a, b) {
@@ -2409,6 +2532,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       pendingScroll = null;
     }
     if (hadFocus && promptEl) { promptEl.focus(); if (caret != null) try { promptEl.setSelectionRange(caret, caret); } catch (_) {} }
+    // A memoised bubble's job clocks are as old as its HTML.
+    tickJobTimes();
   }
 
   // ── sidebar (expanded) ──────────────────────────────────────────────────
@@ -2652,10 +2777,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const toolTok = {};
     const skipMsg = {};
     conv.history.forEach((m, i) => {
-      if (m.role === 'user' && isToolResponse(m.content)) {
+      // Parsed once per message, so a render pairs the same block strings and
+      // the cards' memo compares them by identity.
+      const blocks = responsesOf(m);
+      if (blocks) {
         for (let j = i - 1; j >= 0; j--) {
           if (conv.history[j].role === 'assistant') {
-            const blocks = toolResponseBlocks(m.content);
             (toolOut[j] = toolOut[j] || []).push(...blocks);
             (toolTok[j] = toolTok[j] || []).push(...blocks.map((_, k) => (m.tool_tokens || [])[k]));
             break;
@@ -4459,8 +4586,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       const j = S.jobs[h];
       if (j) {
         const open = jt.hasAttribute('data-job-open') ? true : !j.open;
-        S.jobs = Object.assign({}, S.jobs, { [h]: Object.assign({}, j, { open, read: false }) });
-        S.jobGen++;
+        // Opened, it has not been read since: the next poll reads it.
+        setJob(h, { open, fresh: open });
         render();
         pollJobs();
         if (jt.hasAttribute('data-job-open')) {
@@ -4766,33 +4893,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     if (window.ZEND_BACKEND_ACTIVE !== 'live') return;
     Promise.resolve(API.seedConversations(now)).then((list) => {
       if (!Array.isArray(list)) return;
-      const serverIds = new Set(list.map((c) => String(c.id)));
-      let mutated = false;
-      // Drop entries the server no longer knows about — but keep the in-flight
-      // stream and a fresh local draft the user is still composing.
-      S.conversations = S.conversations.filter((c) => {
-        if (c.streaming || c.id === S.activeId) return true;
-        if (!serverIds.has(String(c.id))) { delete S.loaded[c.id]; mutated = true; return false; }
-        return true;
-      });
-      list.forEach((e) => {
-        const ex = S.conversations.find((c) => String(c.id) === String(e.id));
-        if (ex) {
-          if (e.title && e.title !== ex.title) { ex.title = e.title; mutated = true; }   // titler is authoritative
-          // Archiving is one-way, so the sync only ever sets the flag. The
-          // archive POST waits on the engine, and a list served before it lands
-          // still says "not archived" — copying that back resurrected the row
-          // the user had just archived.
-          if (e.archived && !ex.archived) { ex.archived = true; mutated = true; }
-          // The rank moves whenever any conversation is used — from this tab
-          // or another device — so a change reorders the list.
-          if (e.updated_ms && e.updated_ms !== ex.updated_ms) { ex.updated_ms = e.updated_ms; mutated = true; }
-        } else {
-          S.conversations = S.conversations.concat([Object.assign({}, e, { history: e.history || [] })]);
-          mutated = true;
-        }
-      });
-      if (mutated) render();
+      // Entries the server no longer knows are dropped — but never the
+      // in-flight stream or a fresh local draft the user is still composing.
+      const merged = window.ZendConversationMerge.mergeConversations(S.conversations, list, S.activeId);
+      S.conversations = merged.convs;
+      for (const id of merged.dropped) delete S.loaded[id];
+      if (merged.mutated) render();
     }).catch(() => {});
   }
 
@@ -4911,11 +5017,15 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     clearTimeout(syncTimer);
     statusGen++;
     if (statusAbort) statusAbort.abort();
+    // Nobody is looking at the jobs either.
+    clearTimeout(jobPoll);
+    jobPoll = null;
   }
   function onPageShown() {
     statusMisses = 0;
     if (reloadPolling) pollStatus();
     scheduleSync(0);
+    pollJobs();
   }
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) onPageHidden();
