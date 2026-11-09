@@ -918,9 +918,25 @@
           answer();
         });
       };
+      // Under `__ZEND_MOCK_TWO_THINKS__`: a finished thought, then a second
+      // one still streaming — one reply holding two think blocks as it decodes.
+      const twoThinks = () => {
+        const first = partId();
+        part({ op: 'open', id: first, kind: 'think' });
+        part({ op: 'text', id: first, text: 'Look at the log first.', tokens: 6 });
+        part({ op: 'close', id: first, ok: true });
+        const id = partId();
+        part({ op: 'open', id, kind: 'think' });
+        const long = Array.from({ length: 200 }, (_, i) => 'step' + i + ' ');
+        drip(long, (w, i) => part({ op: 'text', id, text: w, tokens: i + 1 }), () => {
+          part({ op: 'close', id, ok: true });
+          answer();
+        });
+      };
       later(34, () => {
         handlers.onStatus('');
-        if (window.__ZEND_MOCK_PARTS_STREAM__) partsRound();
+        if (window.__ZEND_MOCK_TWO_THINKS__) twoThinks();
+        else if (window.__ZEND_MOCK_PARTS_STREAM__) partsRound();
         else if (/\bread\b[\s\S]*\bfile\b/i.test(text || '')) toolRound();
         else if (/\bwrite\b/i.test(text || '')) writeRound();
         else answer();

@@ -19,8 +19,10 @@ use crate::session::StreamItem;
 
 /// One turn's streamed items so far.
 pub struct LiveTurn {
-    /// The message the reply answers.
-    user: String,
+    /// The message the reply answers. `None` for a turn resumed after a
+    /// restart: its question is already in the stored history, sealed with the
+    /// rounds that ran before the restart, and what it streams is the rest.
+    user: Option<String>,
     /// How many recovered history entries the conversation held when the reply
     /// started. Everything past them is the reply's own sealed rounds, which a
     /// follower receives from the stream instead.
@@ -36,7 +38,7 @@ struct State {
 }
 
 impl LiveTurn {
-    fn new(user: String, history_before: usize) -> Self {
+    fn new(user: Option<String>, history_before: usize) -> Self {
         Self {
             user,
             history_before,
@@ -48,9 +50,10 @@ impl LiveTurn {
         }
     }
 
-    /// The message the reply answers.
-    pub fn user(&self) -> &str {
-        &self.user
+    /// The message the reply answers, when the history does not already hold
+    /// it — see the field.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
     }
 
     /// History entries that predate the reply — see the field.
@@ -111,7 +114,12 @@ pub struct LiveTurns {
 impl LiveTurns {
     /// Start recording a turn for `conv_id` answering `user`, replacing any
     /// record left there.
-    pub fn begin(&self, conv_id: &str, user: String, history_before: usize) -> Arc<LiveTurn> {
+    pub fn begin(
+        &self,
+        conv_id: &str,
+        user: Option<String>,
+        history_before: usize,
+    ) -> Arc<LiveTurn> {
         let turn = Arc::new(LiveTurn::new(user, history_before));
         self.turns
             .lock()
@@ -157,8 +165,8 @@ mod tests {
     #[tokio::test]
     async fn a_late_follower_replays_then_follows_to_the_end() {
         let turns = LiveTurns::default();
-        let turn = turns.begin("c", "hi".into(), 4);
-        assert_eq!((turn.user(), turn.history_before()), ("hi", 4));
+        let turn = turns.begin("c", Some("hi".into()), 4);
+        assert_eq!((turn.user(), turn.history_before()), (Some("hi"), 4));
         turn.push(StreamItem::Status("thinking".into()));
         turn.push(StreamItem::Token("Hel".into()));
 
@@ -182,8 +190,8 @@ mod tests {
     #[test]
     fn ending_an_old_turn_leaves_its_successor_live() {
         let turns = LiveTurns::default();
-        let old = turns.begin("c", "first".into(), 0);
-        let new = turns.begin("c", "second".into(), 2);
+        let old = turns.begin("c", Some("first".into()), 0);
+        let new = turns.begin("c", Some("second".into()), 2);
         turns.end("c", &old);
         assert!(turns.get("c").is_some_and(|t| Arc::ptr_eq(&t, &new)));
     }
@@ -192,7 +200,7 @@ mod tests {
     /// stops.
     #[tokio::test]
     async fn following_a_finished_turn_yields_its_items_and_stops() {
-        let turn = Arc::new(LiveTurn::new(String::new(), 0));
+        let turn = Arc::new(LiveTurn::new(None, 0));
         turn.push(StreamItem::Token("done".into()));
         turn.finish();
         assert_eq!(text(turn.follow().collect().await), ["done"]);

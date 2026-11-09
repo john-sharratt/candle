@@ -347,20 +347,25 @@ fn dialogue_history(state: &InferenceState, conv_id: &str) -> Vec<RecoveredMessa
 /// Drains `ts` to the end whether or not the request is still there: the turn
 /// runs to completion either way, and a client that comes back mid-turn follows
 /// it from `live`. An error item is recorded as the turn error the request
-/// showed for it, so a follower sees the same failure.
+/// showed for it, so a follower sees the same failure. A turn no request
+/// started — one resumed after a restart — passes no `tx` and is followed from
+/// `live` alone.
 async fn relay_live(
     ts: &mut Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>>,
-    tx: &mpsc::Sender<anyhow::Result<StreamItem>>,
+    tx: Option<&mpsc::Sender<anyhow::Result<StreamItem>>>,
     live: &LiveTurn,
     conv_id: &str,
 ) {
-    let mut listening = true;
+    let mut listening = tx.is_some();
     while let Some(item) = ts.next().await {
         live.push(match &item {
             Ok(i) => i.clone(),
             Err(e) => StreamItem::Error(e.to_string()),
         });
-        if listening && tx.send(item).await.is_err() {
+        let Some(tx) = tx.filter(|_| listening) else {
+            continue;
+        };
+        if tx.send(item).await.is_err() {
             listening = false;
             tracing::info!(
                 conv_id,
@@ -6344,6 +6349,36 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
                 }
             }
 
+            // The conversation is this member's to write only while it holds
+            // its claim: another live member holding it is running this very
+            // round — the entry it reads here is that member's, replicated —
+            // and finishes it itself (`turn_claims::take`).
+            let claim = match turn_claims::take(&conv_id).await {
+                Ok(claim) => claim,
+                Err(holder) => {
+                    tracing::info!(
+                        conv_id = %conv_id,
+                        call_turn,
+                        holder = format_args!("{holder:016x}"),
+                        "resume: another member holds the conversation and runs its round",
+                    );
+                    continue;
+                }
+            };
+            // Read again under the claim: a member that held it until a moment
+            // ago may have finished the round in between.
+            let still_open = resume::marked_call_turn(&state.engine, timeline) == Some(call_turn)
+                && !resume::round_answered(&state.engine, timeline, call_turn);
+            if !still_open {
+                tracing::info!(
+                    conv_id = %conv_id,
+                    call_turn,
+                    "resume: the round was finished while this member waited for its claim",
+                );
+                turn_claims::release(claim, &conv_id).await;
+                continue;
+            }
+
             let (selection, tools_mode) = resume_dials(session.conversation_dials(&conv_id));
             // The turn carries no question of its own: its message is the tool
             // output, built inside the loop from the call turn's own request.
@@ -6361,9 +6396,15 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
                 may_hand: false,
             };
 
-            // Drained to completion with nothing listening: the turn's worth is
-            // the seal it writes, and the next client to open the conversation
-            // reads it from the substrate like any other.
+            // Run as a chat turn runs, with no request behind it: the claim
+            // is held until the turn's last record is written, so the gateway
+            // sends the page here, and the reply is recorded live, so a page
+            // open across the restart — or reloaded — follows the rest of it
+            // instead of finding each round only once it has sealed. Its
+            // question and the rounds before the restart are already in the
+            // history, which it therefore keeps.
+            let history_before = dialogue_history(&state, &conv_id).len();
+            let live = session.live_turns.begin(&conv_id, None, history_before);
             let mut turn = run_inference_stream(
                 Arc::clone(&state),
                 conv_id.clone(),
@@ -6378,7 +6419,10 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
                 selection,
                 start,
             );
-            while turn.next().await.is_some() {}
+            relay_live(&mut turn, None, &live, &conv_id).await;
+            session.live_turns.end(&conv_id, &live);
+            drop(turn);
+            turn_claims::release(claim, &conv_id).await;
             resumed += 1;
         }
 
@@ -9246,7 +9290,7 @@ impl ZendSession {
                 // The conversation stays this member's until the turn's last
                 // record is written, however soon its client goes.
                 let claim = turn_claims::hold(&conv_id);
-                let live = live_turns.begin(&conv_id, last_user.clone(), history_before);
+                let live = live_turns.begin(&conv_id, Some(last_user.clone()), history_before);
                 let mut ts = run_inference_stream(
                     state,
                     conv_id.clone(),
@@ -9261,7 +9305,7 @@ impl ZendSession {
                     selection,
                     start,
                 );
-                relay_live(&mut ts, &tx, &live, &conv_id).await;
+                relay_live(&mut ts, Some(&tx), &live, &conv_id).await;
                 live_turns.end(&conv_id, &live);
                 // The reply is over: its stream ends now, and the claim waits on
                 // the turn's commit behind it, where no client waits.

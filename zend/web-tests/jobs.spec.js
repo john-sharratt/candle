@@ -101,6 +101,30 @@ test.describe('G2 a streaming reply redraws only its live part', () => {
     await expect(last.locator('details.think-block')).toHaveCount(1);
     expect(await page.evaluate(() => window.__ZEND_RESULT_JSON__)).toEqual([1, 1, 1]);
   });
+
+  test('opening one thought while the reply decodes leaves the other shut', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_TWO_THINKS__ = true; });
+    await boot(page);
+    await page.getByText('Why is decode latency spiking under load?').click();
+    await expect(page.locator('.zmd').first()).toBeVisible();
+    const ta = page.locator('#zend-prompt');
+    await ta.fill('Think twice');
+    await ta.press('Enter');
+    const thinks = page.locator('[data-msg]').last().locator('details.think-block');
+    await expect(thinks).toHaveCount(2);
+    await thinks.nth(0).locator('summary').click();
+    // Many frames of the second thought streaming in, each a redraw.
+    await page.waitForTimeout(1500);
+    await expect(thinks.nth(0)).toHaveAttribute('open', '');
+    await expect(thinks.nth(1)).not.toHaveAttribute('open', '');
+    await thinks.nth(1).locator('summary').click();
+    await page.waitForTimeout(500);
+    await expect(thinks.nth(1)).toHaveAttribute('open', '');
+    await thinks.nth(0).locator('summary').click();
+    await page.waitForTimeout(500);
+    await expect(thinks.nth(0)).not.toHaveAttribute('open', '');
+    await expect(thinks.nth(1)).toHaveAttribute('open', '');
+  });
 });
 
 test.describe('G3 the job poll', () => {

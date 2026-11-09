@@ -249,10 +249,12 @@ fn history_response(
     // append at the end.
     emit_uploads(&mut messages, u32::MAX);
     attach_parts(&mut messages);
-    if let Some(turn) = &live {
+    // A resumed turn's question is already in the history, sealed with the
+    // rounds before the restart: it has none of its own to show.
+    if let Some(user) = live.as_ref().and_then(|turn| turn.user()) {
         messages.push(HistoryMessage {
             role: role_str(Role::User),
-            content: turn.user().to_string(),
+            content: user.to_string(),
             no_think: false,
             thinking: None,
             tool_tokens: Vec::new(),

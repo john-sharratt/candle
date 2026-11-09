@@ -122,6 +122,25 @@ test.describe('1.2 chat rendering', () => {
     await expect(page.locator('.tool-call-card .tool-call-name', { hasText: 'journal_note' })).toHaveCount(0);
     await expect(page.locator('.tool-call-card .tool-call-name', { hasText: 'read_file' })).toBeVisible();
   });
+  test('a note’s trail rises from under the brain icon, each circle markedly larger', async ({ page }) => {
+    await boot(page, { conv: '1' });
+    const zmd = page.locator('.zmd', { has: page.locator('.note-bubble') }).first();
+    await expect(zmd.locator('.note-bubble')).toBeVisible();
+    const geo = await zmd.evaluate((el) => {
+      const box = (n) => n.getBoundingClientRect();
+      const brain = box(el.querySelector('.think-brain'));
+      const dots = Array.from(el.querySelectorAll('.note-trail i')).map(box);
+      return { brainX: brain.left + brain.width / 2, dots: dots.map((d) => ({ x: d.left + d.width / 2, w: d.width, top: d.top })) };
+    });
+    expect(Math.abs(geo.dots[0].x - geo.brainX)).toBeLessThanOrEqual(1);
+    expect(geo.dots[1].w).toBeGreaterThanOrEqual(geo.dots[0].w * 2);
+    expect(geo.dots[2].w).toBeGreaterThanOrEqual(geo.dots[1].w * 1.6);
+    // Down and to the right, toward the bubble.
+    expect(geo.dots[1].x).toBeGreaterThan(geo.dots[0].x);
+    expect(geo.dots[2].x).toBeGreaterThan(geo.dots[1].x);
+    expect(geo.dots[1].top).toBeGreaterThan(geo.dots[0].top);
+    expect(geo.dots[2].top).toBeGreaterThan(geo.dots[1].top);
+  });
   test('a held call draws an approval, and approving it runs it and tells the conversation', async ({ page }) => {
     await boot(page, { conv: '6' });
     const box = page.locator('.approval').first();

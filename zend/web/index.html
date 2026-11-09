@@ -198,9 +198,14 @@
   .zmd .note-bubble { position: relative; margin: 1.7rem 0 .9rem 1.4rem; padding: .65rem 1.05rem .7rem; max-width: 46rem; width: fit-content; background: rgba(232,145,127,0.10); border: 1.5px solid rgba(232,145,127,0.45); border-radius: 16px; color: #eadbd2; font-style: italic; font-size: .95em; line-height: 1.65; box-shadow: 0 0 16px rgba(232,145,127,0.10); white-space: pre-wrap; }
   .zmd .note-trail { position: absolute; left: 0; top: 0; pointer-events: none; }
   .zmd .note-trail i { position: absolute; border-radius: 50%; background: rgba(232,145,127,0.14); border: 1.5px solid rgba(232,145,127,0.45); }
-  .zmd .note-trail i:nth-child(1) { width: 5px; height: 5px; left: -10px; top: -26px; }
-  .zmd .note-trail i:nth-child(2) { width: 8px; height: 8px; left: -2px; top: -19px; }
-  .zmd .note-trail i:nth-child(3) { width: 12px; height: 12px; left: 9px; top: -11px; }
+  /* Placed from the bubble's padding edge, 24px right of the brain icon's left
+     (1.4rem of margin plus the 1.5px border): the first circle is centred
+     under the 24px icon at 12px, each doubles or nearly so, and the last sits
+     in the bubble's rounded corner, so the trail reads as rising out of the
+     brain rather than drifting off beside it. */
+  .zmd .note-trail i:nth-child(1) { width: 5px; height: 5px; left: -14.5px; top: -31px; }
+  .zmd .note-trail i:nth-child(2) { width: 10px; height: 10px; left: -11px; top: -24px; }
+  .zmd .note-trail i:nth-child(3) { width: 16px; height: 16px; left: -4px; top: -15px; }
   /* Still being written: a dashed edge, and the trail pulsing as the
      "Thinking…" label does, until the note completes. */
   .zmd .note-bubble.writing { color: #cbbab0; border-style: dashed; }
@@ -737,7 +742,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // the page itself, so a block opened a moment ago — its `toggle` event
     // still queued — is not shut by this rewrite.
     harvestOpen(zmd, conv.id, idx);
-    const open = !!S.thinkOpen[conv.id + ':' + idx];
+    const open = openThinks(conv.id + ':' + idx);
     // Whether the reader is at the bottom, asked before the page changes.
     const follow = nearBottom(chatEl);
     // The hover popover is parented to `<body>` and hidden by the bar's own
@@ -765,14 +770,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   function harvestOpen(zmd, convId, idx) {
     const cards = zmd.querySelectorAll('details.tool-call-card');
     for (let i = 0; i < cards.length; i++) S.toolOpen[blockKey(cards[i], convId, idx)] = cards[i].open;
-    // A message's thinking blocks share one flag: any one open holds it open.
+    // Each thinking block under its own key, as the cards are.
     const thinks = zmd.querySelectorAll('details.think-block');
-    const open = {};
-    for (let i = 0; i < thinks.length; i++) {
-      const key = blockKey(thinks[i], convId, idx);
-      open[key] = open[key] || thinks[i].open;
-    }
-    Object.assign(S.thinkOpen, open);
+    for (let i = 0; i < thinks.length; i++) S.thinkOpen[blockKey(thinks[i], convId, idx)] = thinks[i].open;
   }
   // **A streaming reply never shrinks.** Its phases swap blocks of different
   // heights — a file being written is drawn in a box up to 18rem tall that
@@ -1144,7 +1144,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       // Drawn with its thinking closed, always: `restoreToolOpen` opens what
       // the reader opened, so no open state is baked into cached HTML.
       body = '<div class="job-conv">' + (msgs.length ? msgs.map((m, i) =>
-        '<div class="job-msg ' + m.role + '" data-jmsg="' + i + '">' + (m.role === 'assistant' ? '<div class="zmd">' + nodeHtml(m, false) + '</div>' : esc(m.content || '')) + '</div>').join('') +
+        '<div class="job-msg ' + m.role + '" data-jmsg="' + i + '">' + (m.role === 'assistant' ? '<div class="zmd">' + nodeHtml(m, '') + '</div>' : esc(m.content || '')) + '</div>').join('') +
         (j.ended ? '' : '<div class="job-working"><span class="zdots"><i></i><i></i><i></i></span>working</div>')
         : '<div class="job-empty">Its conversation is loading…</div>') + '</div>';
     } else {
@@ -1327,7 +1327,24 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     '</svg>';
   // "1,234 tokens" — the reasoning's length as the thinking block shows it.
   function fmtTokens(n) { return Number(n).toLocaleString() + (n === 1 ? ' token' : ' tokens'); }
-  function renderThink(seg, open) {
+  // The think blocks of the message keyed `base` that the reader has open, as
+  // `|k|…|` over their positions in the message — a string, so the memo and a
+  // part's cache compare it by value. Each block keeps its own flag: opening
+  // one never opens its siblings.
+  function openThinks(base) {
+    const pre = base + ':think:';
+    let out = '';
+    for (const key in S.thinkOpen) if (S.thinkOpen[key] && key.startsWith(pre)) out += '|' + key.slice(pre.length);
+    return out ? out + '|' : '';
+  }
+  // Whether the `k`-th think block of a message is open, in `open` as
+  // `openThinks` answers it.
+  function thinkOpenAt(open, k) { return !!open && open.indexOf('|' + k + '|') !== -1; }
+  // `k` is the block's position among its message's think blocks, the identity
+  // its open state is kept under (`blockKey`).
+  function renderThink(seg, openSet, k) {
+    const open = thinkOpenAt(openSet, k);
+    const at = ' data-think="' + k + '"';
     // Still thinking: a header with a ticker of the most recent words, right-
     // pinned so new words roll leftward — faded under the running token count
     // once the daemon reports one. It opens like a finished block does, onto
@@ -1339,7 +1356,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       const count = seg.tokens != null ? '<span class="think-count" aria-live="off">' + fmtTokens(seg.tokens) + '</span>' : '';
       // Escaped, not parsed: the text so far is redrawn on every patch.
       const body = open ? '<div class="think-body think-live">' + esc(text) + '</div>' : '';
-      return '<details class="think-block think-streaming"' + (open ? ' open' : '') + '><summary class="think-head">' +
+      return '<details class="think-block think-streaming"' + at + (open ? ' open' : '') + '><summary class="think-head">' +
         THINK_BRAIN +
         '<span class="think-label think-pulse">Thinking…</span>' +
         '<div class="think-track' + (count ? ' counted' : '') + '">' + count + '<div class="think-ticker">' + tick + '</div></div>' +
@@ -1360,7 +1377,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // Carry the think's raw char range so applyProjSegments can split its bar
     // proportionally when several projections fired inside it.
     const range = (seg.c0 != null) ? ' data-c0="' + seg.c0 + '" data-c1="' + seg.c1 + '"' : '';
-    return '<details class="think-block"' + range + (open ? ' open' : '') + '>' +
+    return '<details class="think-block"' + at + range + (open ? ' open' : '') + '>' +
       '<summary class="think-summary">' + THINK_BRAIN +
       '<span class="think-label">' + label + '</span>' +
       '<svg class="think-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
@@ -1403,11 +1420,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const parts = rem.split(/ SEG:(\d+) /);
     let html = '';
     let toolIdx = 0;
+    let thinkAt = 0;
     for (let i = 0; i < parts.length; i++) {
       if (i % 2 === 0) { if (parts[i]) html += renderMd(parts[i]); }
       else {
         const s = segs[parseInt(parts[i], 10)];
-        if (s.kind === 'think') { html += renderThink(s, open); }
+        if (s.kind === 'think') { html += renderThink(s, open, thinkAt++); }
         else {
           // A note keeps its place among the calls, so the results after it
           // still pair with theirs by position.
@@ -1449,10 +1467,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       }
       if (p.kind === 'think') {
         const closed = !streaming || p.closed;
-        const length = lengths[thinkNo++] || (p.counted != null ? { tokens: p.counted, exact: true } : null);
-        const think = () => renderThink({ kind: 'think', complete: closed, body: p.text || '', tokens: p.live != null ? p.live : null, length }, open);
+        const k = thinkNo++;
+        const length = lengths[k] || (p.counted != null ? { tokens: p.counted, exact: true } : null);
+        const think = () => renderThink({ kind: 'think', complete: closed, body: p.text || '', tokens: p.live != null ? p.live : null, length }, open, k);
         const label = length ? length.tokens + (length.exact ? '' : '~') : '';
-        html += closed ? cachedPart(p, [open, label], think) : think();
+        // Keyed on this block's own flag, so a sibling opening leaves it cached.
+        html += closed ? cachedPart(p, [thinkOpenAt(open, k), label, k], think) : think();
         continue;
       }
       const args = {};
@@ -1562,9 +1582,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   }
   // A tool card's identity across rebuilds: the conversation, the message it
   // sits in, and its position among that message's cards. Per card rather than
-  // per message — `thinkOpen` keys only to the message, so every think block in
-  // a bubble shares one flag, and repeating that here would make opening one
-  // tool card open its siblings.
+  // per message, so opening one tool card never opens its siblings — and the
+  // think blocks are keyed the same way, by position (`blockKey`).
   function toolOpenKey(convId, msgIdx, toolIdx) {
     return convId + ':' + msgIdx + ':' + toolIdx;
   }
@@ -1578,11 +1597,14 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   function blockKey(det, convId, msgIdx) {
     const sub = det.closest('[data-jmsg]');
     const tool = det.classList.contains('tool-call-card') ? ':' + (det.getAttribute('data-tool') || '0') : '';
+    // A think block by its position among the message's think blocks: each
+    // keeps its own flag, so opening one leaves its siblings shut.
+    const think = det.classList.contains('think-block') ? ':think:' + (det.getAttribute('data-think') || '0') : '';
     if (sub) {
       const job = sub.closest('[data-job]');
-      return jobMsgKey(job ? job.getAttribute('data-job') : '', sub.getAttribute('data-jmsg')) + tool;
+      return jobMsgKey(job ? job.getAttribute('data-job') : '', sub.getAttribute('data-jmsg')) + tool + think;
     }
-    return tool ? toolOpenKey(convId, msgIdx, det.getAttribute('data-tool') || '0') : convId + ':' + msgIdx;
+    return tool ? toolOpenKey(convId, msgIdx, det.getAttribute('data-tool') || '0') : convId + ':' + msgIdx + think;
   }
   // Put back what the reader had opened, after any rebuild of a bubble.
   //
@@ -2802,7 +2824,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
           h('div', { class: 'z-userbubble', style: 'background:#2f2c29; border:1px solid #252220; border-radius:16px 16px 3px 16px; padding:0.65rem 1.05rem; white-space:pre-wrap; word-break:break-word; line-height:1.6;' }, m.content),
           turnCopyBtn(m, 'right:0;')));
       } else {
-        const open = !!S.thinkOpen[conv.id + ':' + idx];
+        const open = openThinks(conv.id + ':' + idx);
         // A streaming reply keeps the height it has reached (`holdStreamHeight`)
         // across a full render as well as across its own live patches.
         const floor = m.streaming && m.heightFloor ? ' min-height:' + m.heightFloor + 'px;' : '';

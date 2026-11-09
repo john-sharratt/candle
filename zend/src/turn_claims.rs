@@ -23,7 +23,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use cluster::member::{AppMember, ClaimUse};
+use cluster::member::{AppMember, Check, ClaimUse};
 use tokio::time::{sleep, Instant};
 
 static MEMBER: Mutex<Option<Arc<AppMember>>> = Mutex::new(None);
@@ -121,4 +121,36 @@ pub fn install(member: Arc<AppMember>, forget: impl Fn(&str) + Send + Sync + 'st
 pub fn hold(key: &str) -> Option<ClaimUse> {
     let member = MEMBER.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
     Some(member.use_claim(key.as_bytes()))
+}
+
+/// How often [`take`] looks for the member's admission.
+const ADMISSION_POLL: Duration = Duration::from_millis(250);
+
+/// Take the conversation `key` names for a turn no request brought here — one
+/// resumed after a restart — and use the claim until the guard drops.
+///
+/// **A request's claim is taken by the host's sticky check before the turn
+/// runs; a resumed turn has no request, so it takes its own.** Without it a
+/// resumed round ran with no claim at all: the gateway sent the conversation's
+/// page and next turn to whichever member it liked, and a member restarting
+/// beside it read the replicated resume entry of the round still running and
+/// ran it a second time. On 2026-11-09 both members ran conversation 425bad8d
+/// at once, one sealing turns 85–87 over the other's recurrent state parked at
+/// 84, whose next turn then failed reading it back.
+///
+/// `Err(holder)` when another live member holds the claim: that member is
+/// writing the conversation, and this one must leave it alone. Waits for the
+/// member's admission first, because the claims are learned there — before it
+/// every key reads as free. `Ok(None)` on a member not joined to a cluster.
+pub async fn take(key: &str) -> Result<Option<ClaimUse>, u64> {
+    let Some(member) = MEMBER.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        return Ok(None);
+    };
+    while !member.admitted() {
+        sleep(ADMISSION_POLL).await;
+    }
+    match member.claim(key.as_bytes()) {
+        Check::Held(holder) => Err(holder),
+        Check::Mine | Check::Took(_) => Ok(Some(member.use_claim(key.as_bytes()))),
+    }
 }
