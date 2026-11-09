@@ -307,7 +307,7 @@ async fn the_creator_can_speak_on_the_channel_and_the_cast_knows_who_it_is() {
         )
         .feed;
     assert!(!replied.contains("no conversation"), "{replied}");
-    let back = rt.channel(WORLD, me).expect("hosted");
+    let back = rt.channel(WORLD, &me.id).expect("hosted");
     assert!(
         back.iter().any(|(_, t)| t.contains("go up and look")),
         "the answer never landed on the channel: {back:?}"
