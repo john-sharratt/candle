@@ -92,7 +92,10 @@ use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
 use crate::engine::experience;
+use crate::engine::experience::concern::{concern, Change, Hears};
+use crate::engine::experience::line::first_sentence;
 use crate::engine::experience::store::Journals;
+use crate::engine::talk::key::VISITOR;
 use journals::experience::ExperienceKind;
 use crate::engine::talk::authority::Changes;
 use crate::engine::talk::runner::Talks;
@@ -2158,10 +2161,17 @@ impl Runtime {
     /// character keeps working from its history and its own thread what the
     /// mission was, long after the mission is gone.
     pub fn cancel_mission(&self, npc_id: u64, world_ms: u64) -> bool {
-        let cancelled = self
-            .body_of(npc_id)
-            .is_some_and(|(hosted, body)| hosted.with_sim(|s| s.missions.cancel(&body)));
+        let Some((hosted, body)) = self.body_of(npc_id) else {
+            return false;
+        };
+        let title = hosted.sim(|s| s.missions.active(&body).map(|m| m.mission_text()));
+        let cancelled = hosted.with_sim(|s| s.missions.cancel(&body));
         if cancelled {
+            let line = match title {
+                Some(t) => format!("Your mission was withdrawn: {}", first_sentence(&t)),
+                None => "Your mission was withdrawn.".to_string(),
+            };
+            self.changed(&hosted, Change::Mission { body, line });
             self.tell(
                 npc_id,
                 world_ms,
@@ -2487,15 +2497,27 @@ impl Runtime {
     ) -> Option<npc_map::world::Where> {
         let (hosted, body) = self.body_of(npc_id)?;
         let at = hosted.read(|w| w.actor(&body).map(|a| a.at.clone()))?;
-        hosted.with(|w| {
+        let arrived = hosted.with(|w| {
             // Already here is not an error — a console that reopens the same
             // conversation is the ordinary case, and re-entering would log a
             // second arrival for somebody who never left.
             match w.actor(visitor).is_some() {
-                true => w.place(visitor, at.clone()).ok(),
-                false => w.enter(visitor, name, at.clone()).ok(),
+                true => w.place(visitor, at.clone()).ok().map(|_| false),
+                false => w.enter(visitor, name, at.clone()).ok().map(|_| true),
             }
         })?;
+        if let (true, Some(handle)) = (arrived, visitor.strip_prefix(VISITOR)) {
+            let room = hosted
+                .read(|w| w.node(&at).map(|n| n.name.clone()))
+                .unwrap_or_else(|| at.to_string());
+            self.changed(
+                &hosted,
+                Change::Party {
+                    member: handle.to_string(),
+                    line: format!("{name} arrived in {room}."),
+                },
+            );
+        }
         Some(at)
     }
 
@@ -2508,7 +2530,38 @@ impl Runtime {
             .ids()
             .iter()
             .filter_map(|id| self.hosted.get(id))
-            .any(|hosted| hosted.with(|w| w.leave(visitor).is_ok()))
+            .any(|hosted| {
+                let name = hosted.read(|w| w.name_of(visitor).map(str::to_string));
+                let left = hosted.with(|w| w.leave(visitor).is_ok());
+                if let (true, Some(name), Some(handle)) =
+                    (left, name, visitor.strip_prefix(VISITOR))
+                {
+                    self.changed(
+                        &hosted,
+                        Change::Party {
+                            member: handle.to_string(),
+                            line: format!("{name} left."),
+                        },
+                    );
+                }
+                left
+            })
+    }
+
+    /// Tell the journals a change concerns that `change` happened in
+    /// `hosted`, right where it was applied (`docs/npc_conversations.md`
+    /// §5.1.1).
+    pub(crate) fn changed(&self, hosted: &Hosted, change: Change) {
+        let world = hosted.id();
+        for (hears, line) in hosted.sim(|s| concern(&change, s)) {
+            match hears {
+                Hears::Bot(body) => {
+                    self.journals
+                        .note(world, &body, ExperienceKind::Changed, &line, None)
+                }
+                Hears::World => self.journals.note_world(world, &line),
+            }
+        }
     }
 
     /// Keep every visiting body with the character it came to see.

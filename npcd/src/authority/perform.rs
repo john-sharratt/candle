@@ -25,6 +25,8 @@ use crate::discord::server::apply::channel_message;
 use crate::discord::world::apply::mirrored_message;
 use crate::engine::act::Act;
 use crate::engine::event::{EventKind, Salience};
+use crate::engine::experience::concern::Change;
+use crate::engine::experience::line::first_sentence;
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::{Recorded, Runtime, REFUSED};
 use crate::engine::{body, build, tools, zen_task};
@@ -492,6 +494,7 @@ impl Runtime {
                 refused: false,
             };
         };
+        let brief = first_sentence(&mission.prompt);
         let lodged = hosted.with_sim(|sim| {
             if sim.missions.is_unordered(&character) {
                 return None;
@@ -522,6 +525,17 @@ impl Runtime {
                 EventKind::Nudge { text: text.clone() },
             );
         }
+        let line = match start {
+            true => format!("You were given a mission: {brief}"),
+            false => format!("A mission was lodged for you: {brief}"),
+        };
+        self.changed(
+            &hosted,
+            Change::Mission {
+                body: character,
+                line,
+            },
+        );
         OpReply::Lodged {
             now_text,
             refused: false,

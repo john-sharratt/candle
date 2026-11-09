@@ -35,6 +35,17 @@ fn trim_stop(s: &str) -> &str {
     s.trim().trim_end_matches('.')
 }
 
+/// A brief's first sentence, its whitespace flattened: what a journal line
+/// names a mission by.
+pub fn first_sentence(s: &str) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let end = flat
+        .char_indices()
+        .find(|&(i, c)| matches!(c, '.' | '!' | '?') && flat[i + c.len_utf8()..].starts_with(' '))
+        .map_or(flat.len(), |(i, c)| i + c.len_utf8());
+    flat[..end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +68,10 @@ mod tests {
             mission("John", "withdrew", "Tidy the lounge."),
             "John withdrew 'Tidy the lounge'."
         );
+        assert_eq!(
+            first_sentence("Tidy the\n lounge. Then the hall."),
+            "Tidy the lounge."
+        );
+        assert_eq!(first_sentence("Keep watch"), "Keep watch");
     }
 }
