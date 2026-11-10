@@ -355,6 +355,21 @@ impl BackingInner {
         }
     }
 
+    /// The lowest hole below the KV frontier that `key`'s arenas could move
+    /// down into: the lowest free region of a device arena's reservation, read
+    /// afresh on each call. `None` for a host arena, which stands on no region.
+    pub(super) fn lowest_hole(&self, key: ArenaKey) -> Option<usize> {
+        #[cfg(feature = "cuda")]
+        if key.location == ArenaLocation::Gpu {
+            if let candle::DeviceLocation::Cuda { gpu_id } = self.device.location() {
+                return super::region_pool::lowest_free_region(gpu_id);
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = key;
+        None
+    }
+
     pub(super) fn release_empty_arenas(&self) -> Result<usize> {
         let mut freed = 0;
 
@@ -362,7 +377,7 @@ impl BackingInner {
         // For each format key, repeatedly call next_tombstone until exhausted.
         let keys = self.pool.format_keys();
         for key in keys {
-            while let Some(arena_idx) = self.pool.next_tombstone(key) {
+            while let Some(arena_idx) = self.pool.next_tombstone(key, self.lowest_hole(key)) {
                 // Storage first, then the index: reissued any earlier, a registration
                 // could adopt the arena still standing at it (see `next_tombstone`).
                 // A release that fails leaves the index out of circulation for good —

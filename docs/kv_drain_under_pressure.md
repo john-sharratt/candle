@@ -79,6 +79,16 @@ keeps one for each native hot class (F16/R16) that sealing writes into.
   allows.
 - **Fixed.** Compaction packs other arenas around a reserve's region and never
   relocates it upward.
+- **Moved down, never kept above a hole.** The reserve an empty sweep keeps is
+  whatever empty arenas its class has, and compaction can leave one of those on
+  the top region. On WhiteWorld (2026-11-10) a 1,024 B class's reserve stood on
+  region 487 with ~430 free regions (6.7 GB) below it. The frontier could not
+  come down, and the expert zone sat 1 GB under its floor. So the sweep releases
+  an empty arena the reserve would keep when the lowest free region lies below
+  it (`try_tombstone`'s `lowest_hole`, read from `region_pool::lowest_free_region`).
+  The class then falls short, the next gap owes it an arena, and the claim takes
+  the lowest free region. The re-made arenas fill the lowest holes in order, so
+  one round settles it.
 
 **When it is used.** A reserve arena is allocated from only when its class has
 no free slot. Its first allocation makes it an ordinary arena, and its class is

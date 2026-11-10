@@ -3196,6 +3196,15 @@ pub fn held_ground_sites(ordinal: usize) -> Option<Vec<HeldSite>> {
 }
 
 /// Occupancy of a device's KV side, or `None` if it has no reservation yet.
+/// The lowest free region of `ordinal`'s KV side — the lowest hole below its
+/// frontier, the region the next claim takes — or `None` when no region is
+/// free or the device has no reservation. Reads the pool without making one.
+pub fn lowest_free_region(ordinal: usize) -> Option<usize> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&ordinal)
+        .and_then(|pool| pool.free.peek().map(|Reverse(i)| *i))
+}
+
 pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
     let map = pools().lock().unwrap_or_else(|e| e.into_inner());
     map.get(&ordinal).map(|pool| RegionStats {

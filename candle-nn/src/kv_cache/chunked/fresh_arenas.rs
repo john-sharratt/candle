@@ -249,7 +249,7 @@ mod tests {
         let owner = PoolOwner::new();
         let key = band_key();
         let idx = owner.fresh(key);
-        assert_eq!(owner.pool.next_tombstone(key), Some(idx));
+        assert_eq!(owner.pool.next_tombstone(key, None), Some(idx));
     }
 
     /// While the pass holds an arena no sweep can take it, and when the pass ends the
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(fresh.created(), 1);
 
         assert_eq!(
-            owner.pool.next_tombstone(key),
+            owner.pool.next_tombstone(key, None),
             None,
             "while the pass holds it, a provisioned arena must not be released — its \
              index could be re-tenanted under a plan or holders that still name it"
@@ -300,7 +300,7 @@ mod tests {
 
         drop(gid);
         assert_eq!(
-            owner.pool.next_tombstone(key),
+            owner.pool.next_tombstone(key, None),
             None,
             "an arena the pass still holds is not released by a sweep even once empty"
         );
@@ -324,11 +324,11 @@ mod tests {
             .expect("a fresh arena serves a claim");
         drop(fresh);
         assert!(owner.released().is_empty(), "an occupied arena is kept");
-        assert_eq!(owner.pool.next_tombstone(key), None);
+        assert_eq!(owner.pool.next_tombstone(key, None), None);
 
         drop(gid);
         assert_eq!(
-            owner.pool.next_tombstone(key),
+            owner.pool.next_tombstone(key, None),
             Some(idx),
             "and is an ordinary arena once the pass has gone, released with its last chunk"
         );
@@ -350,7 +350,7 @@ mod tests {
         });
         assert_eq!(owner.released(), vec![provisioned]);
         assert_eq!(
-            owner.pool.next_tombstone(key),
+            owner.pool.next_tombstone(key, None),
             None,
             "the writer arena stays protected after the pass"
         );

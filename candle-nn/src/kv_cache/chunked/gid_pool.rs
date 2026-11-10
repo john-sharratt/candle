@@ -1102,10 +1102,21 @@ impl ArenaPool {
     /// index: on BlackWorld (2026-11-08) an empty 2048 B reserve arena stood on
     /// region 3127, the top of the span, for hours, with 20 GB of holes below it
     /// that no pass could hand the expert zone.
+    ///
+    /// **A reserve does not hold the top while a hole lies below it.**
+    /// `lowest_hole` is the lowest free region under the frontier, `None`
+    /// where the pool has no regions. An empty arena a reserve would keep is
+    /// released all the same when it stands above that hole: the class falls
+    /// short of its target, the next gap owes it an arena, and a claim takes
+    /// the lowest free region — the reserve moves down instead of pinning the
+    /// frontier. On WhiteWorld (2026-11-10) a 1,024 B class kept an empty arena
+    /// on region 487 as its reserve, with ~430 free regions (6.7 GB) below it
+    /// and the expert zone 1 GB under its floor.
     fn try_tombstone(
         &self,
         protected_arenas: &AHashSet<usize>,
         reserve: Option<usize>,
+        lowest_hole: Option<usize>,
     ) -> Option<usize> {
         // Held across BOTH the emptiness test and the removal. Claims are gated
         // (`allocate_any` and friends take this before `tables.read()`), so with
@@ -1142,7 +1153,13 @@ impl ArenaPool {
                 .values()
                 .map(|t| self.arena_chunks.saturating_sub(t.live_count()))
                 .sum();
-            if free.saturating_sub(self.arena_chunks) < keep_free(target, self.arena_chunks) {
+            let above_a_hole = matches!(
+                (highest_empty, lowest_hole),
+                (Some((place, _)), Some(hole)) if place < RANKED_PLACES && hole < place
+            );
+            if free.saturating_sub(self.arena_chunks) < keep_free(target, self.arena_chunks)
+                && !above_a_hole
+            {
                 return None;
             }
         }
@@ -1760,11 +1777,11 @@ impl ChunkGidPool {
     /// still held the old arena, and `ensure_arena_exists` — which asks only whether
     /// an arena exists at the index — would adopt it under the new key with the old
     /// key's stride.
-    pub fn next_tombstone(&self, key: ArenaKey) -> Option<usize> {
+    pub fn next_tombstone(&self, key: ArenaKey, lowest_hole: Option<usize>) -> Option<usize> {
         let mut state = self.inner.metadata.lock().unwrap();
         let pool = self.inner.pools.get(&key)?;
         let reserve = state.reserve_keys.get(&key).copied();
-        let arena_idx = pool.try_tombstone(&state.protected_arenas, reserve)?;
+        let arena_idx = pool.try_tombstone(&state.protected_arenas, reserve, lowest_hole)?;
         state.arena_registry[arena_idx] = None;
         Some(arena_idx)
     }
@@ -2067,19 +2084,19 @@ mod tests {
         let high = standing_arena(&pool, key);
         assert!(low < high);
         assert_eq!(
-            pool.next_tombstone(key),
+            pool.next_tombstone(key, None),
             Some(high),
             "the higher goes first"
         );
         pool.recycle_arena_index(high);
-        assert_eq!(pool.next_tombstone(key), None, "the reserve stays");
+        assert_eq!(pool.next_tombstone(key, None), None, "the reserve stays");
         assert_eq!(pool.free_slots(key), test_arena_chunks());
 
         let a = standing_arena(&pool, other);
         let b = standing_arena(&pool, other);
-        assert_eq!(pool.next_tombstone(other), Some(a.max(b)));
+        assert_eq!(pool.next_tombstone(other, None), Some(a.max(b)));
         assert_eq!(
-            pool.next_tombstone(other),
+            pool.next_tombstone(other, None),
             Some(a.min(b)),
             "no reserve, swept bare"
         );
@@ -2109,13 +2126,37 @@ mod tests {
         pool.keep_reserve(key);
         let (high, low) = reversed_pair(&pool, key);
         assert_eq!(
-            pool.next_tombstone(key),
+            pool.next_tombstone(key, None),
             Some(high),
             "the arena higher in the span goes"
         );
         pool.recycle_arena_index(high);
-        assert_eq!(pool.next_tombstone(key), None, "the lower one stays");
+        assert_eq!(pool.next_tombstone(key, None), None, "the lower one stays");
         assert_eq!(pool.pool_arena_load(key)[0].0, low);
+    }
+
+    /// **A reserve does not hold the top while a hole lies below it.** The one
+    /// empty arena a reserve keeps is released when a free region stands below
+    /// it, so the reserve is made again at the lowest hole; with no hole below,
+    /// or one above, it stays.
+    #[test]
+    fn a_reserve_above_a_hole_is_released_to_move_down() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        pool.keep_reserve(key);
+        let only = standing_arena(&pool, key);
+        pool.set_arena_rank(key, only, 487);
+        assert_eq!(pool.next_tombstone(key, None), None, "no regions: it stays");
+        assert_eq!(
+            pool.next_tombstone(key, Some(600)),
+            None,
+            "the only hole is above it: it stays"
+        );
+        assert_eq!(
+            pool.next_tombstone(key, Some(57)),
+            Some(only),
+            "a hole below: it goes, to be made again there"
+        );
     }
 
     /// **A class with no reserve is swept from the top of the span down.**
@@ -2124,8 +2165,8 @@ mod tests {
         let pool = ChunkGidPool::new();
         let key = float_key();
         let (high, low) = reversed_pair(&pool, key);
-        assert_eq!(pool.next_tombstone(key), Some(high));
-        assert_eq!(pool.next_tombstone(key), Some(low));
+        assert_eq!(pool.next_tombstone(key, None), Some(high));
+        assert_eq!(pool.next_tombstone(key, None), Some(low));
     }
 
     /// **A slot goes to the arena lowest in the span, whatever its index** —
@@ -2178,7 +2219,7 @@ mod tests {
         let key = float_key();
         let first = standing_arena(&pool, key);
         pool.set_arena_rank(key, first, 0);
-        assert_eq!(pool.next_tombstone(key), Some(first));
+        assert_eq!(pool.next_tombstone(key, None), Some(first));
         pool.recycle_arena_index(first);
         let reused = standing_arena(&pool, key);
         assert_eq!(reused, first, "the index is recycled");
@@ -2204,13 +2245,16 @@ mod tests {
         let _second = standing_arena(&pool, key);
         assert_eq!(pool.free_slots(key), 2 * test_arena_chunks() - 1);
         assert_eq!(
-            pool.next_tombstone(key),
+            pool.next_tombstone(key, None),
             None,
             "one slot short of a reserve without it"
         );
         drop(held);
-        assert!(pool.next_tombstone(key).is_some(), "both empty: one may go");
-        assert_eq!(pool.next_tombstone(key), None, "and one stays");
+        assert!(
+            pool.next_tombstone(key, None).is_some(),
+            "both empty: one may go"
+        );
+        assert_eq!(pool.next_tombstone(key, None), None, "and one stays");
     }
 
     /// **A target above the floor holds that many slots free, with one arena
@@ -2227,18 +2271,24 @@ mod tests {
         for _ in 0..5 {
             standing_arena(&pool, key);
         }
-        let first = pool.next_tombstone(key).expect("five over a band of four");
+        let first = pool
+            .next_tombstone(key, None)
+            .expect("five over a band of four");
         pool.recycle_arena_index(first);
-        assert_eq!(pool.next_tombstone(key), None, "target plus the band stays");
+        assert_eq!(
+            pool.next_tombstone(key, None),
+            None,
+            "target plus the band stays"
+        );
         assert_eq!(pool.free_slots(key), 4 * arena);
 
         pool.set_reserve_target(key, 0);
         assert_eq!(pool.reserve_target(key), Some(arena), "held at the floor");
         for _ in 0..3 {
-            let idx = pool.next_tombstone(key).expect("above the floor");
+            let idx = pool.next_tombstone(key, None).expect("above the floor");
             pool.recycle_arena_index(idx);
         }
-        assert_eq!(pool.next_tombstone(key), None, "one arena stays");
+        assert_eq!(pool.next_tombstone(key, None), None, "one arena stays");
         assert_eq!(pool.free_slots(key), arena);
     }
 
@@ -2250,10 +2300,10 @@ mod tests {
         let key = float_key();
         pool.keep_reserve(key);
         let only = standing_arena(&pool, key);
-        assert_eq!(pool.next_tombstone(key), None);
+        assert_eq!(pool.next_tombstone(key, None), None);
         pool.clear_reserves();
         assert!(pool.reserve_keys().is_empty());
-        assert_eq!(pool.next_tombstone(key), Some(only));
+        assert_eq!(pool.next_tombstone(key, None), Some(only));
     }
 
     /// **An arena created ahead of demand is reclaimable once its creator is
@@ -2287,7 +2337,7 @@ mod tests {
         // recycled index under a live creator is cross-context contamination,
         // not a clean fault.
         assert_eq!(
-            pool.next_tombstone(key),
+            pool.next_tombstone(key, None),
             None,
             "an arena inside its creation window must not be tombstoned"
         );
@@ -2297,7 +2347,7 @@ mod tests {
         pool.finish_creation(key, idx);
 
         assert_eq!(
-            pool.next_tombstone(key),
+            pool.next_tombstone(key, None),
             Some(idx),
             "an empty arena whose creator has finished must be reclaimable, or \
              it pins its region until the process exits"
@@ -2316,14 +2366,14 @@ mod tests {
         let gid = pool.allocate_for(key).expect("fresh arena serves a claim");
         assert_eq!(gid.arena_idx(), idx);
         assert_eq!(
-            pool.next_tombstone(key),
+            pool.next_tombstone(key, None),
             None,
             "an occupied arena is not reclaimable"
         );
 
         drop(gid);
         assert_eq!(
-            pool.next_tombstone(key),
+            pool.next_tombstone(key, None),
             Some(idx),
             "a claimed-then-dropped arena is reclaimable with no explicit \
              finish_creation — `occupy` closes the window for its creator"
@@ -2417,7 +2467,7 @@ mod tests {
         let other = ArenaKey::new(SizeClass::at(1), ArenaLocation::Gpu);
         let a = pool.register_arena(key);
         pool.finish_creation(key, a);
-        assert_eq!(pool.next_tombstone(key), Some(a));
+        assert_eq!(pool.next_tombstone(key, None), Some(a));
         let b = pool.register_arena(other);
         assert_ne!(
             b, a,
@@ -2485,7 +2535,7 @@ mod tests {
         // `a` empties, its storage is released, and its index is recycled by the
         // next registration.
         drop(fill_a);
-        assert_eq!(pool.next_tombstone(key), Some(a));
+        assert_eq!(pool.next_tombstone(key, None), Some(a));
         pool.recycle_arena_index(a);
         assert_eq!(pool.register_arena(key), a);
 
@@ -2526,7 +2576,7 @@ mod tests {
         drop(b);
 
         assert_eq!(
-            pool.next_tombstone(key),
+            pool.next_tombstone(key, None),
             Some(freed_idx),
             "the empty arena is reclaimed"
         );
@@ -2758,8 +2808,8 @@ mod tests {
                 protected: 2,
             }
         );
-        assert_eq!(pool.next_tombstone(key), Some(released));
-        assert_eq!(pool.next_tombstone(key), None, "the rest are kept");
+        assert_eq!(pool.next_tombstone(key, None), Some(released));
+        assert_eq!(pool.next_tombstone(key, None), None, "the rest are kept");
         assert_eq!(
             pool.occupancy(),
             [KeyOccupancy {

@@ -951,7 +951,9 @@ impl ChunkedKvBacking {
                     let mut swept = 0usize;
                     if self.inner.pool.has_reclaimable() {
                         for k in self.inner.pool.format_keys() {
-                            while let Some(idx) = self.inner.pool.next_tombstone(k) {
+                            while let Some(idx) =
+                                self.inner.pool.next_tombstone(k, self.inner.lowest_hole(k))
+                            {
                                 arena_state.release_arena(idx);
                                 self.inner.pool.recycle_arena_index(idx);
                                 swept += 1;
