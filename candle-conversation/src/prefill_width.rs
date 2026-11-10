@@ -29,6 +29,14 @@
 //! The other cells are modelled from those two and the gate's prefill curve,
 //! and are what a width sweep on each machine refines.
 //!
+//! **That card's cell is 6,144, not the 3,072 that was its compute ceiling.**
+//! A `code_reading` file's tool response is 1–3k rows, so a 3,072-row cohort
+//! held one to four files and admission stopped on rows with twelve of the
+//! pool's sixteen waiting (BlackWorld, 2026-11-10, 4805): 11–12.5 files a
+//! minute, the expert zone at 96–98% hits. The zone need not stand that full —
+//! a decode hit rate of 70–80% is the operating target — so the cohort is
+//! widened into the ground between that and the 8,192 measurement above.
+//!
 //! [`MAX_PREFILL_TOKENS`](candle_transformers::models::batched_inference) is
 //! the model side's per-forward ceiling (8,192): the cards that hold the whole
 //! model with room to spare sit at it.
@@ -56,7 +64,7 @@ const WIDTH: [[usize; 6]; 7] = [
     [3072, 4096, 4096, 4096, 4096, 3072],
     [4096, 4096, 4096, 4096, 3072, 3072],
     [4096, 4096, 3072, 3072, 2048, 2048],
-    [6144, 4096, 3072, 2048, 2048, 2048],
+    [6144, 4096, 6144, 2048, 2048, 2048],
     [8192, 8192, 8192, 8192, 8192, 8192],
     [8192, 8192, 8192, 8192, 8192, 8192],
 ];
@@ -100,7 +108,7 @@ mod tests {
         );
         assert_eq!(
             prefill_pass_tokens(72 * GIB, 52e9),
-            3072,
+            6144,
             "RTX PRO 5000, PCIe 5.0"
         );
     }
@@ -115,7 +123,7 @@ mod tests {
             [3072, 4096, 4096, 4096, 4096, 3072],
             [4096, 4096, 4096, 4096, 3072, 3072],
             [4096, 4096, 3072, 3072, 2048, 2048],
-            [6144, 4096, 3072, 2048, 2048, 2048],
+            [6144, 4096, 6144, 2048, 2048, 2048],
             [8192, 8192, 8192, 8192, 8192, 8192],
             [8192, 8192, 8192, 8192, 8192, 8192],
         ];
@@ -139,7 +147,7 @@ mod tests {
         assert_eq!(prefill_pass_tokens(72 * GIB, 75e9), 2048, "PCIe 6.0 band");
         assert_eq!(
             prefill_pass_tokens(72 * GIB, 75e9 - 1.0),
-            3072,
+            6144,
             "PCIe 5.0 band"
         );
     }
