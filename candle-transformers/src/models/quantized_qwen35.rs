@@ -1495,6 +1495,34 @@ pub(crate) mod tests {
         )
     }
 
+    /// **Output fidelity against depth on the 9B** (`batch_test::fidelity`):
+    /// C0, C5 and C10 against BF16, teacher-forced on the needle answer, from
+    /// 4K to 128K. The hybrid's full-attention layers read the whole prefix,
+    /// so every stored token reaches every step.
+    #[test]
+    #[ignore = "downloads the pinned Qwen3.5-9B GGUF (7.5 GB) and prefills to 128K under four \
+                modes. Run with: cargo test --release --features cuda -p candle-transformers \
+                --lib quantized_qwen35::tests::fidelity_vs_depth_9b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn fidelity_vs_depth_9b() -> Result<()> {
+        use crate::models::batch_test::fidelity::{assert_sound, ladder, print_table};
+        use crate::models::batched_model::ensure_vram_governor;
+        use tokenizers::Tokenizer;
+
+        let device = Device::new_cuda(0)?;
+        let pack = qwen35_9b(&device, Some(Int8Mode::auto(&device)))?;
+        let tok = Tokenizer::from_bytes(tokenizer_json()?.as_bytes())
+            .map_err(|e| candle::Error::Msg(format!("tokenizer: {e}")))?;
+        ensure_vram_governor(&device);
+        let model = from_pack(&pack, &device)?;
+        let modes = [InferenceMode::C0, InferenceMode::C5, InferenceMode::C10];
+        let depths = [4_096, 16_384, 65_536, 131_072 - 4_096];
+        let rows = ladder(&model, &tok, InferenceMode::BF16, &modes, &depths)?;
+        print_table("Qwen3.5-9B (hybrid, whole-prefix attention)", &rows);
+        assert_sound("Qwen3.5-9B", &rows, InferenceMode::BF16);
+        Ok(())
+    }
+
     /// Greedily decode the story rewrite on the 9B, driving `forward_wave`
     /// directly instead of through the harness.
     ///

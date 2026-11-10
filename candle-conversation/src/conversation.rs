@@ -4509,6 +4509,20 @@ impl Sequence {
         self.rebuild_projection();
     }
 
+    /// Set when the turns submitted from now on reproject mid-decode: every
+    /// `every_n_tokens` decoded tokens (`0`: never by count), and at any of
+    /// `trigger_texts` once more than 16 tokens have passed (empty: never by
+    /// text). Both off runs a turn on the working set its opening projection
+    /// chose — the one-shot retrieval `docs/unbounded_agents.md` §9.12 ablates.
+    ///
+    /// The same rule cuts this conversation's later turns into gallery pages
+    /// ([`Self::boundary_rule`]), so a caller comparing the two should change it
+    /// for the turn being measured, after the history it reads is sealed.
+    pub fn set_reprojection(&mut self, every_n_tokens: usize, trigger_texts: Vec<String>) {
+        self.submitter.config.reproject_every_n_tokens = every_n_tokens;
+        self.submitter.config.reproject_trigger_texts = trigger_texts;
+    }
+
     /// The projection schema this sequence was last given — the getter paired
     /// with [`Self::set_projection`]. It does not include submitted sections,
     /// which [`Self::set_projection`] merges back in.

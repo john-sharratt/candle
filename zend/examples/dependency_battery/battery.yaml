@@ -1,0 +1,198 @@
+# The dependency battery of docs/unbounded_agents.md §9.12.
+#
+# Every question has an answer the source settles. `expect` lists what a
+# correct answer must name — a file, an identifier or a value — each checked
+# against the repository when the battery was written; `a|b` accepts either
+# spelling. Matching is case-insensitive and on substrings, so a path
+# (`candle-conversation/src/provenance/scan.rs`) names `scan.rs`.
+#
+#   direct         — one hop: where a thing is defined, and what calls it
+#   transitive     — a chain of three or more hops through the code
+#   architectural  — an assumption several components share with no single
+#                    call path between them
+
+questions:
+  # ── Direct ────────────────────────────────────────────────────────────────
+  - id: d1
+    category: direct
+    question: >-
+      In the candle-conversation crate, where is the function `recorded_reply`
+      defined, and which source file calls it outside its own tests?
+    expect: [recorded_reply.rs, conversation.rs]
+
+  - id: d2
+    category: direct
+    question: >-
+      Where is the function `tier_fits` defined in candle-nn's KV cache, and
+      which file calls it in production code?
+    expect: [span_geometry.rs, region_pool.rs]
+
+  - id: d3
+    category: direct
+    question: >-
+      Where is `elevate_to_hot` defined, and which module calls it outside of
+      tests?
+    expect: [elevate.rs, scheduler]
+
+  - id: d4
+    category: direct
+    question: >-
+      Where is the provenance function `heads_per_group` defined, and which
+      other provenance and projection source files call it?
+    expect: [scan.rs, window_score.rs, packed.rs, gpu.rs, resolver.rs, belief_files.rs]
+
+  - id: d5
+    category: direct
+    question: >-
+      Where is the Rust wrapper `moe_bucketize` defined, which CUDA source
+      holds the kernel it launches, and which model code calls it to dispatch
+      experts?
+    expect: [cuda.rs, moe_bucketize.cu, dispatch.rs, dspark_experts.rs]
+
+  - id: d6
+    category: direct
+    question: >-
+      In the expert cache, where is `set_eviction_costs` defined and which
+      file calls it?
+    expect: [cache.rs, pipeline.rs]
+
+  - id: d7
+    category: direct
+    question: >-
+      What is the value of `PINNED_LAYERS`, where is it defined, and which
+      model loader uses it?
+    expect: ["= 2|is 2|of 2|two", cache.rs, layer_loader.rs]
+
+  - id: d8
+    category: direct
+    question: >-
+      Where is `FoldParams::derive` defined, and which non-test module calls
+      it?
+    expect: [wide_sig.rs, scheduler]
+
+  # ── Transitive ────────────────────────────────────────────────────────────
+  - id: t1
+    category: transitive
+    question: >-
+      The provenance signature's fold is derived per model. Trace what has to
+      agree with it: from where the fold's group sizes are derived, through
+      the constant and helper that split a signature into fold groups, to the
+      scoring code that votes per group.
+    expect: [FoldParams, FOLD_GROUPS, heads_per_group, window_score]
+
+  - id: t2
+    category: transitive
+    question: >-
+      When zend replays a recorded conversation, how do the recorded token ids
+      end up committed in place of sampled ones? Trace it from the replay
+      harness through the turn option to the function that extracts the ids
+      to force.
+    expect: [replay.rs, recorded_turn, conversation.rs, recorded_reply]
+
+  - id: t3
+    category: transitive
+    question: >-
+      What breaks, and where, if the 32-token KV block size is changed on the
+      Rust side only? Name the constant on each side and the kernels' tables
+      that depend on it.
+    expect: [CHUNK_SIZE, blocks.cuh, types.rs, arena_table]
+
+  - id: t4
+    category: transitive
+    question: >-
+      Trace how a MoE layer's routing reaches the expert kernels without the
+      host reading it back: from the classifying kernel, through what it
+      writes, to how a cold expert is waited for.
+    expect: [bucketize, "mapped|pinned", stager, cold]
+
+  - id: t5
+    category: transitive
+    question: >-
+      Trace why the experts of the first two MoE layers are never evicted:
+      from the constant, through the victim search that skips them, to the
+      startup code that places them.
+    expect: [PINNED_LAYERS, best_victim, startup.rs]
+
+  - id: t6
+    category: transitive
+    question: >-
+      Which configuration fields decide when a conversation reprojects in the
+      middle of a decode, and through which functions do they reach the
+      policy the scheduler runs?
+    expect: [reproject_every_n_tokens, reproject_trigger_texts, boundary_rule, ReprojectionPolicy]
+
+  - id: t7
+    category: transitive
+    question: >-
+      How does the projection assembler avoid recomputing structural glue K/V
+      on every projection? Name the cache, what it is keyed by, and how long
+      an entry is retained.
+    expect: [glue_islands, "hash", GLUE_ISLAND_RETAIN_GENERATIONS]
+
+  - id: t8
+    category: transitive
+    question: >-
+      Trace how a sealed chunk in the warm tier gets back into VRAM when a
+      projection needs it: which module notices, which function lifts it, and
+      in which file that function lives.
+    expect: [scheduler, elevate_to_hot, elevate.rs]
+
+  # ── Architectural ─────────────────────────────────────────────────────────
+  - id: a1
+    category: architectural
+    question: >-
+      The KV cache's block size is shared between the Rust code and the CUDA
+      kernels. What is it, what is the constant called, and which crate holds
+      the CUDA side?
+    expect: ["32", CHUNK_SIZE, candle-kernels]
+
+  - id: a2
+    category: architectural
+    question: >-
+      The device memory span is shared by several tenants. Which elastic
+      boundary separates the KV side from the expert weights, and which check
+      refuses a wave's transient tier that would cross it?
+    expect: [weight_floor, tier_fits]
+
+  - id: a3
+    category: architectural
+    question: >-
+      Why can a projection for the Qwen3.8-Flash-Next model not contain live
+      structural glue between sealed turns, and what refuses it?
+    expect: ["recurren|DeltaNet", "gap-fill|gap fill|gapfill", reserve_glue_island]
+
+  - id: a4
+    category: architectural
+    question: >-
+      Stored keys must stay valid when a projection moves a sealed turn to a
+      new position. How are keys stored, and what is applied when they are
+      read?
+    expect: ["un-rotated|unrotated|without rope|before rope", "rope"]
+
+  - id: a5
+    category: architectural
+    question: >-
+      Which hot-path invariant forbids reading MoE routing back to the host,
+      and which kernel's output replaces that readback?
+    expect: ["readback|GPU→CPU|GPU-to-CPU|host", bucketize]
+
+  - id: a6
+    category: architectural
+    question: >-
+      What happens when two provenance signatures folded with different fold
+      parameters are compared, and why?
+    expect: [FoldParams, "refus|reject|mismatch"]
+
+  - id: a7
+    category: architectural
+    question: >-
+      When a decoded turn is sealed, what happens to its thinking tokens, and
+      which module states that contract?
+    expect: ["re-prefill|reprefill|prefill", think, turn_layout]
+
+  - id: a8
+    category: architectural
+    question: >-
+      Persistence is mandatory for the conversation substrate. What file is
+      its redo log, and which tier of the KV hierarchy is it?
+    expect: [substrate.log, cold]

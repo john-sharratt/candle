@@ -169,10 +169,12 @@ use crate::working_set::seeds::Seeding;
 use crate::working_set::{corpus, dialogue_config};
 use crate::workspace::UPLOADS_REPO;
 
+mod ask;
 pub mod diag;
 mod memory_writer;
 mod replay;
 pub mod restore;
+pub use ask::{AskOutcome, AskSpec};
 pub use replay::{
     Demonstration, RecordedTurn, ReplayOutcome, ReplayReport, ReplaySampling, ReplaySpec,
     TurnComparison,

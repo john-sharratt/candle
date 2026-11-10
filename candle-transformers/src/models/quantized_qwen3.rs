@@ -1574,6 +1574,53 @@ mod tests {
         )
     }
 
+    /// **Output fidelity against depth on the 8B** (`batch_test::fidelity`):
+    /// C0, C5 and C10 against BF16, teacher-forced on the needle answer, from
+    /// 4K to 32K of its 40,960 window. Classic full attention: every layer reads
+    /// every stored token.
+    #[test]
+    #[ignore = "downloads the Qwen3-8B Q6_K GGUF and prefills to 32K under four modes. \
+                Run with: cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen3::tests::fidelity_vs_depth_8b \
+                -- --ignored --nocapture --test-threads=1"]
+    fn fidelity_vs_depth_8b() -> Result<()> {
+        use crate::models::batch_test::fidelity::{assert_sound, ladder, print_table};
+        use crate::models::batch_test::test_helpers::api;
+        use crate::models::batched_model::ensure_vram_governor;
+        use hf_hub::{Repo, RepoType};
+        use tokenizers::Tokenizer;
+
+        let api = api().map_err(|e| candle::Error::Msg(format!("HF API: {e}")))?;
+        let tokenizer_path = api
+            .model("Qwen/Qwen3-8B".to_string())
+            .get("tokenizer.json")
+            .map_err(|e| candle::Error::Msg(format!("tokenizer.json: {e}")))?;
+        let tok = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| candle::Error::Msg(format!("tokenizer: {e}")))?;
+        let model_path = api
+            .repo(Repo::with_revision(
+                "unsloth/Qwen3-8B-GGUF".to_string(),
+                RepoType::Model,
+                "main".to_string(),
+            ))
+            .get("Qwen3-8B-Q6_K.gguf")
+            .map_err(|e| candle::Error::Msg(format!("model: {e}")))?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        ensure_vram_governor(&device);
+        let model = batched(
+            ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, int8mode)?,
+            4096,
+            &device,
+        )?;
+        let modes = [InferenceMode::C0, InferenceMode::C5, InferenceMode::C10];
+        let depths = [4_096, 8_192, 16_384, 32_768];
+        let rows = ladder(&model, &tok, InferenceMode::BF16, &modes, &depths)?;
+        print_table("Qwen3-8B (full attention)", &rows);
+        assert_sound("Qwen3-8B", &rows, InferenceMode::BF16);
+        Ok(())
+    }
+
     #[test]
     #[ignore] // cargo test --release --features cuda --lib -p candle-transformers quantized_qwen3::tests::test_ruler_eval -- --ignored --nocapture
     fn test_ruler_eval() -> Result<()> {

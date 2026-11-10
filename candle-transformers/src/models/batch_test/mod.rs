@@ -6,6 +6,10 @@
 //! batched decode/prefill/glue path end to end under `#[test]`, on the
 //! StoryRewrite prompts of the `story-rewrite` crate and a captured
 //! Qwen3-30B-A3B expert routing trace (`fixtures/`).
+/// Output fidelity against depth: a compressed cache's next-token
+/// distributions against the float cache's, teacher-forced, 4K to 128K.
+#[cfg(test)]
+pub mod fidelity;
 /// The gate's summary of what the wave chains did across a decode.
 #[cfg(feature = "cuda")]
 pub(crate) mod graph_report;

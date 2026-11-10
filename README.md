@@ -4,7 +4,7 @@
 
 > Research fork of [Hugging Face Candle](https://github.com/huggingface/candle).
 >
-> - Technical report, **v2**: [docs/unbounded_agents.md](docs/unbounded_agents.md) — complete except the dependency-analysis battery of §9.12, which is specified and not yet scored
+> - Technical report, **v2**: [docs/unbounded_agents.md](docs/unbounded_agents.md) — including its direct tests: output fidelity against depth (§9.6.8), recall past the working set (§9.11.2) and the codebase dependency battery (§9.12)
 > - Technical report, **v1 (published 13 May 2026)**: [docs/unbounded_agents_v1.md](docs/unbounded_agents_v1.md) · [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)
 > - **Every measured number, and every outside figure it is compared with**: [docs/performance.md](docs/performance.md), with the raw rows in [docs/results/](docs/results/)
 

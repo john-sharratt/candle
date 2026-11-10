@@ -2302,6 +2302,35 @@ mod tests {
         )
     }
 
+    /// **Output fidelity against depth on Flash-Next** (`batch_test::fidelity`):
+    /// C0, C5 and C10 against BF16, teacher-forced on the needle answer, from
+    /// 4K to 128K. Its full-attention layers select a bounded set through the
+    /// checkpoint's QSA indexer, so the stored tokens reaching a step do not
+    /// grow with depth past the indexer's budget.
+    #[test]
+    #[ignore = "loads this card's engine artifact and prefills to 128K under four modes. \
+                Run with: cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen38_moe::tests::fidelity_vs_depth_flash_next \
+                -- --ignored --nocapture --test-threads=1"]
+    fn fidelity_vs_depth_flash_next() -> Result<()> {
+        use crate::models::batch_test::fidelity::{assert_sound, ladder, print_table};
+        use crate::models::batched_inference::InferenceMode;
+        use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+        use tokenizers::Tokenizer;
+
+        let pack = engine()?;
+        let device = Device::new_cuda(0)?;
+        let tok = Tokenizer::from_bytes(tokenizer_json()?.as_bytes())
+            .map_err(|e| candle::Error::Msg(format!("tokenizer: {e}")))?;
+        let model = Qwen4ExpBatched::new(Qwen4ExpGpu::load(&pack, &device)?)?;
+        let modes = [InferenceMode::C0, InferenceMode::C5, InferenceMode::C10];
+        let depths = [4_096, 16_384, 65_536, 131_072 - 4_096];
+        let rows = ladder(&model, &tok, InferenceMode::BF16, &modes, &depths)?;
+        print_table("Qwen3.8-Flash-Next (QSA-bounded attention)", &rows);
+        assert_sound("Qwen3.8-Flash-Next", &rows, InferenceMode::BF16);
+        Ok(())
+    }
+
     /// The width ladder's task, run at the depth ladder's depths.
     ///
     /// [`profile_decode_vs_depth`] and [`test_parallel_batched_forwarding`]
