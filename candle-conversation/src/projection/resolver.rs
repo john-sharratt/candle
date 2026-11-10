@@ -49,7 +49,7 @@ use crate::persistence::record::{
     BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SectionGeneration,
     SnapshotPayload, TreeMetadataPayload,
 };
-use crate::persistence::remote::{turn_is_complete, RemoteBatch};
+use crate::persistence::remote::{turn_is_complete, PendingCensus, RemoteBatch};
 use crate::persistence::resume::{
     read_persisted_section_windows, RecoveredTurnMeta, TurnChunkGrid,
 };
@@ -3105,6 +3105,8 @@ impl Conversation {
         let mut restored = 0usize;
         let mut skipped_corrupt = 0usize;
         let mut pending_remote = 0usize;
+        // What each pending remote turn lacks — see `PendingCensus`.
+        let mut pending = PendingCensus::default();
         // Startup integrity repair (`persistence::integrity`): completeness is
         // judged here — and only here — because reconstruct is the one moment
         // with no live writer, so on-disk state is final and a half-written
@@ -3157,6 +3159,13 @@ impl Conversation {
             let remote = self.is_remote_turn(&decl);
             if remote && !self.is_turn_complete(&decl, n_layers) {
                 pending_remote += 1;
+                let (tokens, held) = {
+                    let read = self.read();
+                    read.stream_of(turn_stream_id(decl.timeline_id, decl.turn_index))
+                        .map_or((false, 0), |s| (s.tokens.is_some(), s.chunks.len()))
+                };
+                let wanted = n_layers * decl.block_end.saturating_sub(decl.block_start) as usize;
+                pending.note(decl.timeline_id, decl.turn_index, tokens, held, wanted);
                 self.restore_pending_turn(&decl);
                 continue;
             }
@@ -3227,6 +3236,7 @@ impl Conversation {
                          again: {e}",
                     );
                     pending_remote += 1;
+                    pending.note_unreadable(decl.timeline_id, decl.turn_index);
                     self.restore_pending_turn(&decl);
                     continue;
                 }
@@ -3451,6 +3461,18 @@ impl Conversation {
             reconstruct_ms = t_reconstruct.elapsed().as_millis() as u64,
             "substrate reload complete",
         );
+        if pending.total() > 0 {
+            tracing::info!(
+                pending = pending.total(),
+                no_tokens = pending.no_tokens,
+                no_chunks = pending.no_chunks,
+                some_chunks = pending.some_chunks,
+                unreadable = pending.unreadable,
+                n_layers,
+                samples = ?pending.samples,
+                "substrate reload: what the pending remote turns lack",
+            );
+        }
         // Orphaned KV — chunks on disk whose owning turn's StreamDecl is gone —
         // means turns were silently dropped in a prior generation (the compaction
         // re-emit-skip bug) and their KV is now unreachable dead weight. Surface

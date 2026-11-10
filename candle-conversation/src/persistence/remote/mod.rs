@@ -14,7 +14,9 @@ mod apply_tests;
 mod completeness;
 mod incoming;
 mod outcome;
+mod pending_census;
 
 pub use completeness::turn_is_complete;
 pub use incoming::Incoming;
 pub use outcome::{Checked, Refusal, RemoteBatch, RemoteOutcome};
+pub use pending_census::{PendingCensus, Sample as PendingSample};
