@@ -1,7 +1,7 @@
-//! Warming the ingest layers' per-file normalization hit levels where the GPU
+//! Warming the ingest layers' per-file normalization backgrounds where the GPU
 //! gallery arena is — the scheduler thread — a slice of files at a time.
 //!
-//! Every ingested file's hit levels are learned by self-match: a few of its own
+//! Every ingested file's backgrounds are learned by self-match: a few of its own
 //! turns scored against its own exchanges. On the host that is a probe × window
 //! scan per probe, and over 1,344 files it held eight cores for 270 s after
 //! every start. On the arena each file costs one batched launch for all of its
@@ -35,7 +35,7 @@ pub struct IngestWarmer {
 }
 
 impl IngestWarmer {
-    /// Warm every ingest group's per-file hit levels. Blocks until done. Call
+    /// Warm every ingest group's per-file backgrounds. Blocks until done. Call
     /// after an ingest pass has finished — never concurrently with an ingest
     /// writer, whose substrate lock the assembly reads under.
     pub fn run(&self, schema: &Schema) {
@@ -63,7 +63,7 @@ impl IngestWarmer {
         tracing::info!(
             timelines = warmed,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "normalization warm-up: learned per-file hit levels for ingest-layer timelines \
+            "normalization warm-up: learned per-file backgrounds for ingest-layer timelines \
              on the GPU gallery arena"
         );
     }

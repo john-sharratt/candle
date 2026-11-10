@@ -3,10 +3,11 @@
 //! Raw late-fusion scores are not comparable across candidates — a generic
 //! "stopword" cluster (the repo root, whose listing names every crate) scores
 //! high against almost any probe, drowning a specific target that is the genuine
-//! best *relative* match. This module rescales each candidate's raw score against
-//! its own learned **hit level** — the score it reaches when it *is* the answer —
-//! so a full hit lands at ~1000 and a decode lock-on rides above it, on a common
-//! 0–1000 band that makes selection thresholds uniform across scopes.
+//! best *relative* match. This module reads each candidate's raw score against
+//! its own learned **background** — the scores it reaches on probes that are not
+//! about it — as tail surprise, so a loud candidate wins no more often by chance
+//! than a quiet one, and puts that on a common band where a score beyond all but
+//! [`NormConfig::full_hit_tail`] of the background lands at 1000.
 //!
 //! See `docs/provenance_score_normalization.md`. The module is deliberately
 //! std-only: it knows nothing about the schema, substrate, or provenance types.
@@ -15,13 +16,14 @@
 //! `String`/`f32` arithmetic, so it unit-tests in isolation.
 //!
 //! Two operations, both driven from the scan:
-//! - [`NormalizationCache::normalize`] — read path, every reprojection: rescale a
-//!   scope's raw scores to 0–1000 for selection. Pure; never mutates.
-//! - [`NormalizationCache::observe`] — write path, **once per turn at seal**: fold
-//!   the turn's raw scores into each child's hit-level EWMA. The only writer.
+//! - [`NormalizationCache::normalize`] — read path, every reprojection: put a
+//!   scope's raw scores on the band for selection. Pure; never mutates.
+//! - [`NormalizationCache::observe`] — write path, once per turn at seal and in
+//!   the warm-ups: fold a probe's raw scores into the children's backgrounds.
+//!   The only writer.
 
+mod background;
 mod cache;
-mod hit_level;
 mod scope;
 
 #[cfg(test)]
@@ -49,12 +51,12 @@ pub enum ScopeKey {
     /// One PHASE of a section collection's gallery — the same competition scored
     /// over only the user / thinking / response region of each exemplar.
     ///
-    /// A hit level is a denominator, so it is only meaningful over the
-    /// distribution it was learned on. A live query is a *question*, and
+    /// A background is only meaningful over the distribution it was learned on.
+    /// A live query is a *question*, and
     /// `docs/tool_selection_provenance_results.md` §20.3 measured the phases as
     /// carrying very different signal for tool routing — `user` 65.6 against
-    /// `think+resp` 21.5. Folding all three into one level therefore normalizes
-    /// the question against a denominator that is mostly not questions.
+    /// `think+resp` 21.5. Kept for the offline phase analysis
+    /// (`substrate_inspect --gallery-phase`); the engine scans whole turns.
     CollectionPhase {
         group: u64,
         name: String,
@@ -130,41 +132,36 @@ impl ChildKey {
     }
 }
 
-/// Tuning constants for the hit-level normalizer. Defaults are the values §85
-/// calibrated (`docs/provenance_score_normalization.md` §7).
+/// The background normalizer's constants (`docs/provenance_score_normalization.md`
+/// §3).
 #[derive(Clone, Copy, Debug)]
 pub struct NormConfig {
-    /// EWMA rate when a probe beats the current hit level (rise fast).
-    pub alpha_up: f32,
-    /// EWMA rate otherwise (decay slow) — keeps a rarely-queried child's level
-    /// from collapsing between hits.
-    pub alpha_dn: f32,
-    /// Cold-start hit level for a child never yet observed.
-    pub hit_prior: f32,
-    /// Hard minimum on the denominator floor — stops a child whose level decayed
-    /// low from amplifying a partial match.
-    pub floor_min: f32,
-    /// Percentile of a scope's current hit levels used as the denominator floor.
-    pub floor_pctl: f32,
-    /// Output scale: a hit at the hit level maps to this (1000 = full hit).
+    /// The band value of a full hit: a score beyond all but
+    /// [`Self::full_hit_tail`] of the child's background.
     pub scale: f32,
+    /// The share of a child's background a full hit is beyond: 0.01, so 1000 is
+    /// a 1-in-100 score against the probes that are not about it, the median
+    /// background score lands near 150, a 1-in-10 near 500, and a score past
+    /// everything the background holds rides above 1000.
+    pub full_hit_tail: f32,
+    /// Samples a child's own background needs before a score is read against
+    /// it; fewer, and the scope's pooled background stands in.
+    pub min_background: u32,
     /// Reference probe length, in signature tokens, that every raw score is
     /// scaled to before it meets the band.
     ///
     /// **A raw provenance score is a SUM over probe tokens**, so it grows with
-    /// the probe. The learned level is one number per child, folded at seal from
-    /// a capped tail probe, while the read path runs at every reprojection with
-    /// whatever window is current — six tokens at submit, up to the cap
-    /// mid-decode. Dividing a six-token sum by a level learned at 256 is not a
-    /// smaller measurement of the same quantity, it is a different unit, and it
-    /// was measured: the same `datetime` match scored 4,658 against a six-token
-    /// query and ~82,850 against an eighty-token one, which then rode the belief
-    /// accumulator to 143,035 on a nominal 0–1000 band.
+    /// the probe. A background is learned at seal from a capped tail probe,
+    /// while the read path runs at every reprojection with whatever window is
+    /// current — six tokens at submit, up to the cap mid-decode. Comparing a
+    /// six-token sum with samples learned at 256 is not a smaller measurement of
+    /// the same quantity, it is a different unit, and it was measured: the same
+    /// `datetime` match scored 4,658 against a six-token query and ~82,850
+    /// against an eighty-token one.
     ///
     /// Scaling both the read and the write path to this reference makes the band
-    /// a RATE rather than a total, so a hit lands at [`Self::scale`] whatever the
-    /// probe length and the selection thresholds keep the meaning their sweeps
-    /// gave them. It also makes Concept F's `max(tail, question)` fusion mean
+    /// a RATE rather than a total, so a hit reads the same whatever the probe
+    /// length. It also makes Concept F's `max(tail, question)` fusion mean
     /// something: those two probes differ in length by an order of magnitude, so
     /// on raw sums the longer one won structurally rather than on evidence.
     ///
@@ -175,20 +172,16 @@ pub struct NormConfig {
     /// winning selections, the answer is a measured ceiling here — not a guess.
     ///
     /// 256 = `reproject_max_probe_tokens`, the live probe cap and therefore the
-    /// length the existing levels were in practice learned at, so they keep their
-    /// magnitudes across this change.
+    /// length the backgrounds are in practice learned at.
     pub probe_t_ref: usize,
 }
 
 impl Default for NormConfig {
     fn default() -> Self {
         NormConfig {
-            alpha_up: 0.30,
-            alpha_dn: 0.02,
-            hit_prior: 400.0,
-            floor_min: 50.0,
-            floor_pctl: 0.10,
             scale: 1000.0,
+            full_hit_tail: 0.01,
+            min_background: 8,
             probe_t_ref: 256,
         }
     }

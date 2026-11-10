@@ -423,7 +423,6 @@ mod tests {
             windows: vec![(0, 0, tokens.len(), 0)],
             cal_windows: Vec::new(),
             cal: None,
-            ex_tokens: vec![tokens.len()],
         }
     }
 

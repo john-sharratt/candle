@@ -242,15 +242,16 @@ with the migration: no dual thresholds, no per-collection opt-out.
 
 ### A.2 Right dimensions — the normalization contract
 
-Normalization divides each child's raw vote by that child's own learned strong-match
-level (per-child hit-level), then scales to 0–1000. The dimension choices, stated
-explicitly (today's behavior, kept, now universal):
+Normalization reads each child's raw vote against that child's own learned
+background — the scores it reaches on probes not about it — as tail surprise, on a
+shared band where 1000 is a 1-in-100 score (`docs/provenance_score_normalization.md`
+§3). The dimension choices, stated explicitly:
 
 | Dimension | Choice | Why |
 |---|---|---|
 | Learning key (child) | per exchange (turn groups) / per section (collections) | a promiscuous child (changelog file, verbose tool) self-mutes; a quiet child's rare hit stands out |
-| Scope | per `(group × timeline)` / per collection | levels learned where the competition happens |
-| Cross-scope comparability | shared 0–1000 output band | enables cross-layer mass comparison (Concept B) |
+| Scope | per `(group × timeline)` / per collection | backgrounds learned where the competition happens |
+| Cross-scope comparability | shared output band | enables cross-layer mass comparison (Concept B) |
 | Not normalized per-probe | — | needle gate + z already handle probe-side variance |
 
 ### A.3 Scoring diagnostics (the "layers that are not scoring" audit)
@@ -270,7 +271,16 @@ Layers with `conv_count = 0` cannot score and are out of scope here; a layer
 starts scoring the moment its ingest populates it, through exactly this path.
 (The analysis layers this once named were removed; see B.5.)
 
-### A.4 Level prior — the quiet-slot guard (measured requirement, F5)
+### A.4 Level prior — the quiet-slot guard (REMOVED 2026-11-11)
+
+> **Not in the engine.** The size floor below guarded a *division* by a learned
+> level. Normalization no longer divides: a score is read against the child's
+> background (`docs/provenance_score_normalization.md` §3.1), where a fragment's
+> chance match is a chance match against its own background — no denominator can
+> approach zero — and a cold child reads against its scope's pool rather than a
+> floor. The traffic-peak path it shipped measured R@1 0.134 with one file taking
+> 15.3% of every win (§3.1a there). `level_prior`, `ScanPolicy::level_floor` and
+> `FileScan::ex_tokens` are gone. The section is kept for the measurements.
 
 Dividing by a near-zero learned level turns a fragment's chance match into a
 top rank: the normalized ModelBuilder winner in the battery was the very
@@ -728,17 +738,14 @@ values proposed for the first iteration:
       anchor:
         member: first        # inject the timeline's first exchange when any is selected
 
-# Policy level — Concepts A (normalization + level prior), F (probe
-# composition), G (fusion). No momentum block: Concept E is measured-rejected
-# (F13) and ships no surface.
+# Policy level — Concepts A (normalization), F (probe composition), G
+# (fusion). No momentum block: Concept E is measured-rejected (F13) and ships
+# no surface.
 default_policy:
   preset: high_recall_scope
-  normalized: true           # all belief scoring on the 0–1000 band (the only mode
+  normalized: true           # all belief scoring on the normalized band (the only mode
                              # after migration; the key exists so presets can carry
                              # re-derived thresholds explicitly)
-  level_prior:
-    floor_base: 2.0          # per-preset; swept before the threshold migration
-    floor_cap: 10.0          # max size-scaling multiple for tiny children
   fusion:                    # additive | content_gated | consensus_min | consensus_geo
     mode: content_gated      # (per axis: content axes gated, tools additive — F8/F9)
     gate_group: 0            # which fold group gates (the content fold for this model)
@@ -752,10 +759,10 @@ default_policy:
 
 Parsing lands in `yaml.rs` beside the existing `parse_selection`/`parse_default`;
 validation (rails: `adaptive.max_percent ≥ max_percent ≥ min_percent`,
-`absolute_max ≥ k`, `decay ∈ (0,1]`, `gain ≥ 0`, `floor_cap ≥ 1`,
+`absolute_max ≥ k`, `decay ∈ (0,1]`, `gain ≥ 0`,
 `concentration_rho ≥ 0`, fusion ∈ the three modes) in `validate_policy`'s
 sibling. Every knob has a schema-level default equal to today's behavior
-(`fusion: additive`, `question_pin: false`, `level_prior` off, static mass), so
+(`fusion: additive`, `question_pin: false`, static mass), so
 existing YAML files parse and behave unchanged until they opt in.
 
 ---
@@ -782,8 +789,8 @@ substrate_inspect --log <snapshot> selection-replay <conversation> \
 
 Per dialogue turn of the target conversation it runs the **production
 content-axis chain** against the real substrate galleries — `content_gated`
-grouped-scan fusion (G) → hit-level normalization warmed by self-match with
-the A.4 size floors (A) → per-slot max of the head (question, F11) and tail
+grouped-scan fusion (G) → background normalization warmed by self-match, each
+slot its own probe's answer (A) → per-slot max of the head (question, F11) and tail
 scans (F) — and prints the top-N selected members per axis plus the
 code-vs-`repo_map` attention-mass contrast (B, on the ungated raw sum,
 `k=1, ρ=2`). `--limit` caps each gallery (the full snapshot code gallery is

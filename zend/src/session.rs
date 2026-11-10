@@ -2849,10 +2849,10 @@ impl InferenceState {
         //
         // That consistency is what the mark buys, and it is expensive to lose: it
         // is what `warm_ingest_normalization` recognises a layer by, and without it
-        // the gather divides raw scores in the millions by the `hit_prior` of 400 —
-        // a ~13,000x under-correction that put a repo_map file listing, the most
-        // promiscuous member in the corpus, at the top of an unrelated dialogue's
-        // context at a score of 13,315,007 against the live conversation's 0.
+        // every code scope stays unwarmed — a cold scope once put a repo_map file
+        // listing, the most promiscuous member in the corpus, at the top of an
+        // unrelated dialogue's context at a score of 13,315,007 against the live
+        // conversation's 0.
         //
         // `--disable-layer` means "this layer is out of service". No mark, so no
         // normalization warm; `gathered = false` (set before the builder was
@@ -9754,8 +9754,6 @@ mod projection_schema_tests {
         assert_eq!(g.policy.layer_weights, vec![0.0, 1.0, 1.0]);
         assert_eq!(g.policy.calibration_layer_weights, vec![0.0, 0.0, 1.0]);
         assert_eq!(g.policy.scan.calibration_weight, 0.25);
-        let scan = &g.policy.scan;
-        assert_eq!((scan.level_prior_base, scan.level_prior_cap), (2.0, 16.0));
         assert_eq!(
             layer("repo_map").groups[0].policy.scan.cases,
             ScanCases::Exchange

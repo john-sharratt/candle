@@ -391,10 +391,9 @@ fn calculator_probe_ranks_calculator_top1() {
 
 /// The production content-axis scoring chain over fixture slots, exactly as
 /// the daemon composes it (the R5-measured configuration, results doc §25):
-/// per-window content-gated grouped scan (`score_slots_fused`) → hit-level
-/// normalization with levels warmed by SELF-MATCH observes (the
-/// `warm_ingest_normalization` analog) and Concept A.4 size floors replacing
-/// the flat prior → per-slot max of the question and tail windows. Returns
+/// per-window content-gated grouped scan (`score_slots_fused`) → background
+/// normalization learned from the captured dialogue's seal-order observes →
+/// per-slot max of the question and tail windows. Returns
 /// `(normalized_fused, raw_tail)` — mass (Concept B) keys on the raw tail.
 fn production_pipeline_scores(
     f: &'static Fixture,
@@ -420,11 +419,11 @@ fn production_pipeline_scores(
             FusionMode::ContentGated { gate_group: 0 },
         )
     };
-    // Levels: the captured dialogue turns' seal-order observes — gated-fusion
-    // groups skip the self-match warm and normalize traffic-relative (the
-    // A.4 floored path keys on observed-traffic PEAKS). CAUSAL: the probed
-    // turn itself is excluded — live, a turn's seal observe fires AFTER the
-    // selections it is being scored for.
+    // Backgrounds: the captured dialogue turns' seal-order observes — gated-
+    // fusion groups skip the self-match warm and learn from traffic alone, a
+    // live turn about no known slot. CAUSAL: the probed turn itself is
+    // excluded — live, a turn's seal observe fires AFTER the selections it is
+    // being scored for.
     let scope = ScopeKey::turn_group(0, 0);
     let cache = NormalizationCache::new(NormConfig::default());
     let mut dialogue: Vec<(u64, u64)> = f.events.keys().copied().collect();
@@ -442,16 +441,8 @@ fn production_pipeline_scores(
             .collect();
         // Each dialogue turn is its own piece of evidence; `observe` folds a
         // given source once.
-        cache.observe(&scope, (dtl << 32) ^ didx, &pairs, probe.len());
+        cache.observe(&scope, (dtl << 32) ^ didx, &pairs, None, probe.len());
     }
-    // Concept A.4 size floors (the zend content-policy values).
-    let floors: Vec<f32> = slots
-        .iter()
-        .map(|(_, wins)| {
-            let t = wins.iter().map(|w| w.len()).sum::<usize>().max(1);
-            2.0 * (256.0 / t as f32).clamp(1.0, 16.0)
-        })
-        .collect();
     // Each scan is normalized on the length of the probe that produced it. A raw
     // score is a SUM over probe tokens and these two probes differ by ~4x (a
     // capped tail against the head-64 question window), so without this the
@@ -463,7 +454,7 @@ fn production_pipeline_scores(
             .map(|((name, _), &v)| (ChildKey::named(name.clone()), v))
             .collect();
         cache
-            .normalize_with_floors(&scope, &pairs, &floors, probe_tokens)
+            .normalize(&scope, &pairs, probe_tokens)
             .into_iter()
             .map(|(_, v)| v)
             .collect()

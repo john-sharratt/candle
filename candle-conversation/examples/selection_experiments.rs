@@ -1375,22 +1375,20 @@ fn r4c(f: &Fixture, level: &[f32], floor_base: f32, floor_cap: f32) {
 
 // ═══ Round 5 — locking the PRODUCTION chain configuration ═══════════════════
 //
-// The battery's wins used mean-based levels; production uses the EWMA
-// hit-level cache with priors/floors and warms content levels by SELF-MATCH
+// The battery's wins used mean-based levels; production reads each score
+// against its background and warms content backgrounds by SELF-MATCH
 // (`warm_ingest_normalization`). R5 evaluates the exact production scoring
 // chain (`score_slots_fused` + `NormalizationCache`) across the candidate
-// configurations, on the three headline targets, to pick the shipping config:
-//   fusion:  full-gated (additive × gate)  vs  grouped-sum (per-group tallies)
-//   levels:  self-match warm (production ingest warm)  vs  dialogue-traffic
-//   floors:  A.4 size floors REPLACING prior/scope-floor  vs  stacked default
+// configurations, on the three headline targets:
+//   fusion:       full-gated (additive × gate)  vs  grouped-sum (per-group tallies)
+//   backgrounds:  self-match warm (production ingest warm)  vs  dialogue-traffic
 
 use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
 use candle_conversation::provenance::{score_slots_fused, FusionMode};
 
 fn r5(f: &Fixture) {
-    println!("\n═══ R5: production-chain config sweep (fusion × levels × floors) ═══");
+    println!("\n═══ R5: production-chain config sweep (fusion × backgrounds) ═══");
     let (slots, n_junk, n_builder) = r3_pool(f);
-    let tokens: Vec<usize> = slots.iter().map(|s| s.windows[0].len()).collect();
     let n = slots.len();
     let n_code = n_junk + n_builder;
 
@@ -1418,24 +1416,27 @@ fn r5(f: &Fixture) {
     };
 
     for grouped_sum in [false, true] {
-        // Levels via the production cache. Self-match warm: each slot's own
-        // trailing window is the probe, its raw score observed — the
-        // `warm_ingest_normalization` analog. Dialogue warm: the captured
-        // turns' seal observes.
+        // Backgrounds via the production cache. Self-match warm: each slot's
+        // own trailing window is the probe, every slot's raw score observed
+        // with the slot as the answer — the `warm_ingest_normalization`
+        // analog. Dialogue warm: the captured turns' seal observes.
         for self_warm in [true, false] {
             let scope = ScopeKey::turn_group(0, 0);
             let cache = NormalizationCache::new(NormConfig::default());
+            let pairs_of = |raw: &[f32]| -> Vec<(ChildKey, f32)> {
+                slots
+                    .iter()
+                    .zip(raw)
+                    .map(|(s, &v)| (ChildKey::named(s.label.clone()), v))
+                    .collect()
+            };
             if self_warm {
                 for (i, s) in slots.iter().enumerate() {
                     let w = s.windows[0];
                     let probe = &w[w.len().saturating_sub(MAX_PROBE_TOKENS)..];
                     let raw = scan(probe, grouped_sum);
-                    cache.observe(
-                        &scope,
-                        i as u64,
-                        &[(ChildKey::named(slots[i].label.clone()), raw[i])],
-                        probe.len(),
-                    );
+                    let own = ChildKey::named(s.label.clone());
+                    cache.observe(&scope, i as u64, &pairs_of(&raw), Some(&own), probe.len());
                 }
             } else {
                 let mut dialogue: Vec<(u64, u64)> = f.events.keys().copied().collect();
@@ -1443,31 +1444,16 @@ fn r5(f: &Fixture) {
                 for (tl, idx) in dialogue {
                     let probe = f.probe(tl, idx);
                     let raw = scan(&probe, grouped_sum);
-                    let pairs: Vec<(ChildKey, f32)> = slots
-                        .iter()
-                        .zip(&raw)
-                        .map(|(s, &v)| (ChildKey::named(s.label.clone()), v))
-                        .collect();
-                    cache.observe(&scope, (tl << 32) ^ idx, &pairs, probe.len());
+                    cache.observe(&scope, (tl << 32) ^ idx, &pairs_of(&raw), None, probe.len());
                 }
             }
-            for replace_floors in [true, false] {
-                let floors: Vec<f32> = tokens
-                    .iter()
-                    .map(|&t| 2.0 * (256.0 / t.max(1) as f32).clamp(1.0, 16.0))
-                    .collect();
+            {
                 let normalize = |raw: Vec<f32>, probe_tokens: usize| -> Vec<f32> {
-                    let pairs: Vec<(ChildKey, f32)> = slots
-                        .iter()
-                        .zip(&raw)
-                        .map(|(s, &v)| (ChildKey::named(s.label.clone()), v))
-                        .collect();
-                    let out = if replace_floors {
-                        cache.normalize_with_floors(&scope, &pairs, &floors, probe_tokens)
-                    } else {
-                        cache.normalize(&scope, &pairs, probe_tokens)
-                    };
-                    out.into_iter().map(|(_, v)| v).collect()
+                    cache
+                        .normalize(&scope, &pairs_of(&raw), probe_tokens)
+                        .into_iter()
+                        .map(|(_, v)| v)
+                        .collect()
                 };
                 // Head and tail are probes of different lengths, so each carries
                 // its own — see the normalizer's `probe_t_ref`.
@@ -1506,15 +1492,10 @@ fn r5(f: &Fixture) {
                 };
                 let (rm, rc) = (mass(&recall), mass(&mb));
                 println!(
-                    "  fusion={} levels={} floors={}  tour cluster #{:<3} builder #{:<3} \
+                    "  fusion={} backgrounds={}  tour cluster #{:<3} builder #{:<3} \
                      mass recall/code {:.1}/{:.1} {}",
                     if grouped_sum { "grouped" } else { "fullgate" },
                     if self_warm { "self " } else { "dialog" },
-                    if replace_floors {
-                        "size-replace"
-                    } else {
-                        "stacked-dflt"
-                    },
                     rank_of_prefix(&tour, "cluster:"),
                     rank_of_prefix(&mb, "builder.rs"),
                     rm,

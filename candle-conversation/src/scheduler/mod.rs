@@ -453,7 +453,7 @@ pub(crate) enum SchedulerRequest {
     },
 
     /// Score a just-sealed turn's beliefs — the once-per-turn seal scan that
-    /// teaches the normalization hit levels — on the scheduler's gallery arena.
+    /// teaches the normalization backgrounds — on the scheduler's gallery arena.
     ///
     /// It comes here rather than scanning on the caller's thread because the
     /// arena has exactly one scan thread (see [`seal_scan`]). The CPU per-file
@@ -824,7 +824,7 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<()>,
     },
 
-    /// Warm the belief-driven section collections' hit levels from their own
+    /// Warm the belief-driven section collections' backgrounds from their own
     /// tag-scoped corpus — on this thread, because the GPU gallery arena that
     /// scores the corpus in batch lives here. Replies with what was warmed.
     WarmCollectionNormalization {
@@ -842,7 +842,7 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<GalleryPreload>,
     },
 
-    /// Warm one slice of an ingest group's per-file hit levels on this thread's
+    /// Warm one slice of an ingest group's per-file backgrounds on this thread's
     /// GPU gallery arena ([`Conversation::warm_ingest_timelines`]). Sent a slice
     /// at a time by [`crate::IngestWarmer`], and scored at ingest priority — in
     /// the gaps a dialogue leaves, one slice per loop iteration (`norm_warm`).

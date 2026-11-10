@@ -868,12 +868,12 @@ pub struct LayerSchema {
     /// it has no place in the document. It is the difference between the two
     /// flags: `--skip-layer` leaves a layer gathered and merely stops
     /// populating it, so its existing turns keep answering queries and its
-    /// hit levels keep being learned; `--disable-layer` takes it out of
+    /// backgrounds keep being learned; `--disable-layer` takes it out of
     /// retrieval altogether.
     ///
     /// Read by [`super::Conversation::score_belief_groups`] and by both
     /// normalization warm-ups — a layer that cannot be selected must not teach
-    /// hit levels either, or it would spend the warm-up's probe budget learning
+    /// backgrounds either, or it would spend the warm-up's probe budget learning
     /// denominators for candidates that can never be returned.
     pub gathered: bool,
     /// Continuous-fair-wave decode priority (`decode_priority:` in YAML).
@@ -1565,7 +1565,7 @@ pub struct Schema {
     /// promises it was given and may still be reading from. Nothing is gathered
     /// from another layer, unlocked working-set members are left out, and no
     /// other layer is scanned, so the projection teaches nothing back (no
-    /// momentum, no hit levels).
+    /// momentum, no backgrounds).
     ///
     /// **Not a YAML field.** Set at runtime on a copy of a builder by
     /// [`super::Builder::focused`], for a question put beside a conversation

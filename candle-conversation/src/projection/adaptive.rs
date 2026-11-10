@@ -1,7 +1,7 @@
 //! Provenance-adaptive projection mechanisms — the configuration types and
-//! pure algorithms of `docs/provenance_adaptive_projection.md` Concepts A.4
-//! (level prior), B (attention mass → adaptive budgets), C (turn locality),
-//! D (file-head anchor), F (question-anchored probing), and G (fusion mode).
+//! pure algorithms of `docs/provenance_adaptive_projection.md` Concepts B
+//! (attention mass → adaptive budgets), C (turn locality), D (file-head
+//! anchor), F (question-anchored probing), and G (fusion mode).
 //!
 //! Everything here is layer-agnostic by construction (the design's hard
 //! generalization invariant): each type is a knob any policy, group, or layer
@@ -14,14 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::provenance::gallery_arena::Keep;
 use crate::provenance::FusionMode;
 
-/// Reference window for the Concept A.4 size ratio — the live probe cap
-/// (`reproject_max_probe_tokens`).
-pub const LEVEL_PRIOR_T_REF: usize = 256;
-
 /// Scan-side policy knobs (per selection-policy node): Concept G's fusion
-/// mode, Concept F's question pinning, Concept B's mass constants, and
-/// Concept A.4's level-prior constants. Defaults are today's behavior — an
-/// absent block changes nothing.
+/// mode, Concept F's question pinning, and Concept B's mass constants.
+/// Defaults are today's behavior — an absent block changes nothing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScanPolicy {
     /// Concept G: how the fold groups' votes combine. `Additive` = the shipped
@@ -40,11 +35,6 @@ pub struct ScanPolicy {
     /// sum). Measured `ρ = 2`: squaring the top-1 share is what flips the
     /// raw-sum inversion (code 3470×0.579² = 1163 vs recall 5591×0.368² = 757).
     pub mass_rho: f32,
-    /// Concept A.4: base of the size-aware level-prior floor, in raw-score
-    /// units (the learned-level scale). `0` disables the size prior.
-    pub level_prior_base: f32,
-    /// Concept A.4: maximum size-scaling multiple for tiny children.
-    pub level_prior_cap: f32,
     /// What a turn group's scan scores as one case.
     pub cases: ScanCases,
     /// The weight of a file's vote in the calibration competition — every
@@ -87,27 +77,11 @@ impl Default for ScanPolicy {
             question_pin: false,
             mass_top_k: 1,
             mass_rho: 2.0,
-            level_prior_base: 0.0,
-            level_prior_cap: 8.0,
             cases: ScanCases::Exchange,
             calibration_weight: 1.0,
             gallery_keep: Keep::All,
             calibration_gallery_keep: Keep::All,
         }
-    }
-}
-
-impl ScanPolicy {
-    /// The Concept A.4 denominator floor for a child of `tokens` real tokens:
-    /// `base × clamp(t_ref / tokens, 1, cap)` — small children get
-    /// proportionally higher floors. `0.0` when the prior is disabled or the
-    /// size is unknown.
-    pub fn level_floor(&self, tokens: usize, t_ref: usize) -> f32 {
-        if self.level_prior_base <= 0.0 || tokens == 0 || t_ref == 0 {
-            return 0.0;
-        }
-        self.level_prior_base
-            * (t_ref as f32 / tokens as f32).clamp(1.0, self.level_prior_cap.max(1.0))
     }
 }
 
@@ -371,26 +345,5 @@ mod tests {
         let (out, boosted) = l.apply(&scores);
         assert_eq!(out, scores.to_vec());
         assert!(boosted.iter().all(|b| !b));
-    }
-
-    // ── Concept A.4: level floor ─────────────────────────────────────────────
-
-    #[test]
-    fn level_floor_scales_inverse_to_size_and_caps() {
-        let p = ScanPolicy {
-            level_prior_base: 100.0,
-            level_prior_cap: 8.0,
-            ..ScanPolicy::default()
-        };
-        assert_eq!(p.level_floor(256, 256), 100.0); // full window → base
-        assert_eq!(p.level_floor(512, 256), 100.0); // big window → clamped at 1×
-        assert_eq!(p.level_floor(64, 256), 400.0); // quarter window → 4×
-        assert_eq!(p.level_floor(8, 256), 800.0); // tiny fragment → capped 8×
-        assert_eq!(p.level_floor(0, 256), 0.0);
-        assert_eq!(
-            ScanPolicy::default().level_floor(8, 256),
-            0.0,
-            "off by default"
-        );
     }
 }

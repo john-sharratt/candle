@@ -2212,12 +2212,11 @@ fn selection_replay(
 
     // A content-axis gallery: turns tagged `tag`, grouped into slots keyed by the
     // member's non-`tag` tag (the file path / cluster path). Each slot carries
-    // its turns' sig windows + a total token size (for the Concept A.4 floor).
+    // its turns' sig windows.
     struct Gallery {
         names: Vec<String>,
         windows: Vec<Vec<WideQSig>>, // per member turn
         slot_of: Vec<usize>,         // window i → slot
-        tokens: Vec<usize>,          // per slot total real tokens
     }
     let build_gallery = |tag: &str| -> Gallery {
         let mut names: Vec<String> = Vec::new();
@@ -2252,15 +2251,10 @@ fn selection_replay(
             windows.push(win);
             slot_of.push(slot);
         }
-        let mut tokens = vec![0usize; names.len()];
-        for (wi, w) in windows.iter().enumerate() {
-            tokens[slot_of[wi]] += w.len();
-        }
         Gallery {
             names,
             windows,
             slot_of,
-            tokens,
         }
     };
 
@@ -2275,10 +2269,10 @@ fn selection_replay(
         (gate.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
     };
 
-    // Self-match warm the hit levels (the `warm_ingest_normalization` analog):
-    // each slot's own best turn as the probe, its raw gated score observed — so
-    // the traffic peak is learned. Under the A.4 floor path the denominator is
-    // max(peak, size_floor).
+    // Self-match warm the backgrounds (the `warm_ingest_normalization` analog):
+    // each slot's own best turn as the probe, every slot's raw gated score
+    // observed, the slot itself as the probe's answer — so each slot's
+    // background is what the other slots' probes score on it.
     let warm = |g: &Gallery, cache: &mut NormalizationCache, scope: &ScopeKey| {
         for slot in 0..g.names.len() {
             // The slot's longest own window is the strongest self-probe.
@@ -2291,20 +2285,16 @@ fn selection_replay(
             if let Some(w) = best {
                 let probe = &w[w.len().saturating_sub(PROBE)..];
                 let (fused, _) = scan(probe, g);
-                cache.observe(
-                    scope,
-                    slot as u64,
-                    &[(ChildKey::named(g.names[slot].clone()), fused[slot])],
-                    probe.len(),
-                );
+                let pairs: Vec<(ChildKey, f32)> = g
+                    .names
+                    .iter()
+                    .zip(&fused)
+                    .map(|(n, &v)| (ChildKey::named(n.clone()), v))
+                    .collect();
+                let own = ChildKey::named(g.names[slot].clone());
+                cache.observe(scope, slot as u64, &pairs, Some(&own), probe.len());
             }
         }
-    };
-    let floors = |g: &Gallery| -> Vec<f32> {
-        g.tokens
-            .iter()
-            .map(|&t| 2.0 * (PROBE as f32 / t.max(1) as f32).clamp(1.0, 16.0))
-            .collect()
     };
 
     let code = build_gallery(code_tag);
@@ -2314,8 +2304,6 @@ fn selection_replay(
     let mut cache = NormalizationCache::new(NormConfig::default());
     warm(&code, &mut cache, &code_scope);
     warm(&structure, &mut cache, &structure_scope);
-    let code_floors = floors(&code);
-    let structure_floors = floors(&structure);
 
     println!("\n══ §11.1 selection-replay — production content-axis pipeline ══\n");
     println!(
@@ -2331,7 +2319,7 @@ fn selection_replay(
     for (idx, sig) in &probes {
         let tail = &sig[sig.len().saturating_sub(PROBE)..];
         let head = &sig[..HEAD.min(sig.len())];
-        let axis = |g: &Gallery, scope: &ScopeKey, fl: &[f32]| -> (Vec<(String, f32)>, f32) {
+        let axis = |g: &Gallery, scope: &ScopeKey| -> (Vec<(String, f32)>, f32) {
             let normalize = |raw: Vec<f32>, probe_tokens: usize| -> Vec<f32> {
                 let pairs: Vec<(ChildKey, f32)> = g
                     .names
@@ -2340,7 +2328,7 @@ fn selection_replay(
                     .map(|(n, &v)| (ChildKey::named(n.clone()), v))
                     .collect();
                 cache
-                    .normalize_with_floors(scope, &pairs, fl, probe_tokens)
+                    .normalize(scope, &pairs, probe_tokens)
                     .into_iter()
                     .map(|(_, v)| v)
                     .collect()
@@ -2357,8 +2345,8 @@ fn selection_replay(
             ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
             (ranked, attention_mass(&mass_base, 0.0, f32::MAX, 1, 2.0))
         };
-        let (code_rank, code_mass) = axis(&code, &code_scope, &code_floors);
-        let (struct_rank, struct_mass) = axis(&structure, &structure_scope, &structure_floors);
+        let (code_rank, code_mass) = axis(&code, &code_scope);
+        let (struct_rank, struct_mass) = axis(&structure, &structure_scope);
         let winner = if struct_mass > code_mass {
             "structure"
         } else {
@@ -2712,24 +2700,21 @@ fn belief_eval(
     };
 
     let trials: Vec<Trial> = if normalize {
-        // Production per-scope hit-level normalization (docs/provenance_score_normalization.md),
-        // measured CAUSALLY to avoid a probe informing its own hit level. Walk the
-        // corpus in order; each probe is normalized against ONLY the levels learned
-        // from earlier turns, then folds its own-match score in — the exact ordering
-        // of the live path (`normalize` reads past seals; the turn then `observe`s at
-        // its own seal). Learning each file's own-match score mirrors the ingest-time
-        // scan, which is self-local so it only ever folds a file's own match. The
-        // whole gallery is one stable scope offline, keyed by file name. Sequential
-        // by necessity — the EWMA is order-dependent — but n is small and the O(n²)
-        // scan already ran in `per_lens`. Cold-start: the first turns of each file
-        // normalize against the prior until their level accrues (as in production
-        // before a scope warms).
+        // Production per-scope background normalization
+        // (docs/provenance_score_normalization.md), measured CAUSALLY so a probe
+        // never informs its own reading. Walk the corpus in order; each probe is
+        // normalized against ONLY the backgrounds earlier turns taught, then folds
+        // its scores in — every slot's but its own tool's, the warm-up's rule for
+        // an exemplar — the ordering of the live path (`normalize` reads past
+        // seals; the turn then `observe`s at its own seal). The whole gallery is
+        // one stable scope offline, keyed by name. Cold-start: the first turns
+        // read against the pool, then the probe itself, until backgrounds accrue
+        // (as in production before a scope warms).
         //
-        // One scope PER GALLERY LENS: a hit level is a denominator, and a lens
-        // reading 6% of each exemplar does not put its scores on the same scale
-        // as one reading all of it. Sharing a scope would make the fusion a
-        // comparison of scales rather than of evidence. The lenses are then
-        // max-fused on the common 0–1000 band, as production fuses them.
+        // One scope PER GALLERY LENS: a lens reading 6% of each exemplar does not
+        // put its scores on the same scale as one reading all of it, so each
+        // learns its own backgrounds. The lenses are then max-fused on the common
+        // band, as production fuses them.
         let scopes: Vec<ScopeKey> = gallery_phase
             .split(',')
             .map(|p| ScopeKey::collection(0, format!("{tag}/{}", p.trim())))
@@ -2753,15 +2738,13 @@ fn belief_eval(
                 }
             }
             out.push(build_trial(pi, &fused));
-            let gt = corpus[pi].1;
+            let own = ChildKey::named(slot_names[corpus[pi].1].clone());
             for (li, scope) in scopes.iter().enumerate() {
                 let (scores, t_probe) = &per_lens[li][k];
-                cache.observe(
-                    scope,
-                    pi as u64,
-                    &[(ChildKey::named(slot_names[gt].clone()), scores[gt])],
-                    *t_probe,
-                );
+                let raw: Vec<(ChildKey, f32)> = (0..n_slots)
+                    .map(|s| (ChildKey::named(slot_names[s].clone()), scores[s]))
+                    .collect();
+                cache.observe(scope, pi as u64, &raw, Some(&own), *t_probe);
             }
         }
         out
@@ -3659,10 +3642,10 @@ fn belief_sweep(
         })
         .collect();
 
-    // Under --normalize the sweep runs on the production 0–1000 hit-level band
-    // (the Concept A threshold-migration derivation): the same causal
-    // corpus-order pass as `belief-eval` — each row normalized against levels
-    // learned from earlier rows only, then its own-match observed.
+    // Under --normalize the sweep runs on the production background band: the
+    // same causal corpus-order pass as `belief-eval` — each row normalized
+    // against backgrounds earlier rows taught, then observed with its own tool
+    // as the answer.
     let matrix: Vec<(usize, Vec<f32>, usize)> = if normalize {
         let scope = ScopeKey::collection(0, tag);
         let cache = NormalizationCache::new(NormConfig::default());
@@ -3676,12 +3659,8 @@ fn belief_sweep(
                 .into_iter()
                 .map(|(_, v)| v)
                 .collect();
-            cache.observe(
-                &scope,
-                row as u64,
-                &[(ChildKey::named(slot_names[*gt].clone()), fresh[*gt])],
-                *t_probe,
-            );
+            let own = ChildKey::named(slot_names[*gt].clone());
+            cache.observe(&scope, row as u64, &raw, Some(&own), *t_probe);
             out.push((*gt, normed, *t_probe));
         }
         out

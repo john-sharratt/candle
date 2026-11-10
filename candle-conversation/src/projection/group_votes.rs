@@ -146,7 +146,6 @@ mod tests {
             arc_sids,
             windows: vec![(0, 0, 1, 0)],
             cal_windows,
-            ex_tokens: vec![1],
             cal: None,
         }
     }

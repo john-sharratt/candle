@@ -54,8 +54,6 @@ pub(crate) struct FileScan {
     /// They vote in the calibration competition, not among the file's own
     /// windows ([`scan_file_scans`]).
     pub cal_windows: Vec<(usize, usize, usize)>,
-    /// Real signature tokens per exchange slot — the Concept A.4 size input.
-    pub ex_tokens: Vec<usize>,
     /// The file's calibration signatures, shared rather than copied: the arcs
     /// past [`Self::arcs_kept`], so [`Self::cal_windows`] indexes one arc list
     /// with [`Self::windows`] ([`Self::arc`], [`Self::sid`]).
@@ -224,14 +222,10 @@ pub(crate) fn assemble_file_scans(
             exchange += t_exchange.elapsed();
             continue;
         }
-        let mut ex_tokens = vec![0usize; n_slots];
-        for &(_, s, e, slot) in &windows {
-            ex_tokens[slot] += e - s;
-        }
         exchange += t_exchange.elapsed();
         let t_cal = Instant::now();
         // Each calibration's questions, a window apiece, for the calibration
-        // competition. Counted in no exchange's size: they are not its content.
+        // competition.
         let cal = sub.calibration_record(timeline, &records, &mut fresh);
         let own = arcs_kept.len();
         let cal_windows: Vec<(usize, usize, usize)> = cal.as_ref().map_or(Vec::new(), |r| {
@@ -252,7 +246,6 @@ pub(crate) fn assemble_file_scans(
             arc_sids,
             windows,
             cal_windows,
-            ex_tokens,
             cal,
         });
     }
@@ -749,7 +742,6 @@ mod tests {
                 .collect(),
             windows: (0..exchanges).map(|e| (e, 0, tokens, e)).collect(),
             cal_windows: Vec::new(),
-            ex_tokens: vec![tokens; exchanges],
             arcs_kept: arcs,
             cal: None,
         }

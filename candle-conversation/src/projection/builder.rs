@@ -476,7 +476,7 @@ impl Builder {
     /// applied to the built schema rather than declared in YAML, and it must be
     /// applied BEFORE the first projection: the flag is read on every belief
     /// scan and by both normalization warm-ups, so a layer cleared afterwards
-    /// would already have taught hit levels and returned candidates.
+    /// would already have taught backgrounds and returned candidates.
     ///
     /// Distinct from suppressing a layer's ingest. A layer can be populated and
     /// not gathered (pointless), or gathered and not populated (`--skip-layer`,

@@ -2,9 +2,8 @@
 //! need for the projection is read from (`docs/provenance_adaptive_projection.md`
 //! Concept B).
 //!
-//! Everything here is over the RAW ungated scores, before hit-level
-//! normalization: normalization rescales every group's best member toward the
-//! same band, which is exactly what hides whether a group has anything worth
+//! Everything here is over the RAW ungated scores, before normalization:
+//! normalization puts every group's best member on the same band, which is exactly what hides whether a group has anything worth
 //! carrying. And everything is an order statistic, never a sum, so a group
 //! with ten thousand members reads the same as one with fifty when what stands
 //! out of them is the same.

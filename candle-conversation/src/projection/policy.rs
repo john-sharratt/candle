@@ -16,11 +16,11 @@
 /// A named, tuned policy preset (the §24.6 recommendations).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyPreset {
-    /// Stable, correct, small tool scope on the **normalized 0–1000 hit-level
-    /// band** (Concept A, `docs/provenance_adaptive_projection.md` §3): β0.40,
-    /// min 112 / evict 60, budget 1..4, plus an early-decode grace window
-    /// (35/26 through the first cadence reprojection). The thresholds come
-    /// from the full-corpus normalized sweep (results doc §25.8: 745 turns ×
+    /// Stable, correct, small tool scope on the **normalized band** (Concept A,
+    /// `docs/provenance_score_normalization.md` §3.2): β0.40, min 112 / evict
+    /// 60, budget 1..4, plus an early-decode grace window (35/26 through the
+    /// first cadence reprojection). The thresholds come from the full-corpus
+    /// sweep on the hit-level band that preceded it (results doc §25.8: 745 turns ×
     /// 93 tools — true-tool normalized scores sit at p25 ≈ 949 / p50 ≈ 1394;
     /// min 112 at budget 4 holds ~99.1 % recall at ~65 % exact-1 / 0.5 mean
     /// FP; the budget-3 recall ceiling on the grown corpus is 99.2 %, budget 4
@@ -225,8 +225,8 @@ pub struct SelectionPolicy {
     /// two competitions are weighed apart. Set via `policy.calibration_layer_weights`.
     pub calibration_layer_weights: Vec<f32>,
     /// Scan-side knobs (`docs/provenance_adaptive_projection.md`): fusion mode
-    /// (Concept G), question pinning (Concept F), mass constants (Concept B),
-    /// level-prior constants (Concept A.4). Defaults = today's behavior.
+    /// (Concept G), question pinning (Concept F), mass constants (Concept B).
+    /// Defaults = today's behavior.
     pub scan: ScanPolicy,
 }
 

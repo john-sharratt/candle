@@ -1087,14 +1087,14 @@ impl ConversationEngine {
     }
 
     /// Re-arm the score-normalization warm-up so the next projection re-learns
-    /// per-file hit levels — call after an ingest reconcile mints fresh timelines
+    /// per-file backgrounds — call after an ingest reconcile mints fresh timelines
     /// the prior warm never scanned. See
     /// [`crate::projection::Conversation::reset_normalization_warm`].
     pub fn reset_normalization_warm(&self) {
         self.conversation.reset_normalization_warm();
     }
 
-    /// A handle that warms the ingest layers' per-file hit levels on the
+    /// A handle that warms the ingest layers' per-file backgrounds on the
     /// scheduler's GPU gallery arena, a slice of files at a time, without
     /// holding this engine. Run it AFTER an ingest pass / reconcile finishes
     /// (never concurrently — it would starve the ingest writer).
@@ -1115,7 +1115,7 @@ impl ConversationEngine {
         }
     }
 
-    /// Warm one belief group's per-timeline hit levels by self-match — for a
+    /// Warm one belief group's per-timeline backgrounds by self-match — for a
     /// group nothing else teaches, such as a tag-scoped turn group, which
     /// learns only from probes inside its scope. Returns how many timelines
     /// were warmed. See
@@ -1128,7 +1128,7 @@ impl ConversationEngine {
         self.conversation.warm_group_normalization(schema, group)
     }
 
-    /// Warm one timeline's hit levels by self-match — a conversation written
+    /// Warm one timeline's backgrounds by self-match — a conversation written
     /// onto a belief group after the group was warmed. See
     /// [`crate::projection::Conversation::warm_timeline_normalization`].
     pub fn warm_timeline_normalization(
@@ -1140,7 +1140,7 @@ impl ConversationEngine {
             .warm_timeline_normalization(schema, timeline)
     }
 
-    /// Warm the belief-driven section collections' per-member hit levels from
+    /// Warm the belief-driven section collections' per-member backgrounds from
     /// their own tag-scoped corpus. Call after load, once the corpus is stable —
     /// without it a collection's levels are cold on every process start but the
     /// one that built the corpus, which changes both the scale and the RANKING of

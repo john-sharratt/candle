@@ -12,7 +12,7 @@
 //! ```text
 //! cargo run -p zend --example provenance_livemodel --release -- [workspace]
 //!   REPO_TL=<id>  FOCUS=candle-core  FOCUS_PROBES=0x..,0x..
-//!   OBSERVE_TRAIL=0|1   ALPHA_UP ALPHA_DN HIT_PRIOR FLOOR_MIN FLOOR_PCTL
+//!   OBSERVE_TRAIL=0|1   FULL_HIT_TAIL MIN_BACKGROUND
 //! ```
 
 use std::collections::HashMap;
@@ -62,11 +62,8 @@ fn main() -> anyhow::Result<()> {
     // the band's reference probe length — comes from the default, so a new
     // normalizer constant does not break this harness.
     let cfg = NormConfig {
-        alpha_up: env_f32("ALPHA_UP", d.alpha_up),
-        alpha_dn: env_f32("ALPHA_DN", d.alpha_dn),
-        hit_prior: env_f32("HIT_PRIOR", d.hit_prior),
-        floor_min: env_f32("FLOOR_MIN", d.floor_min),
-        floor_pctl: env_f32("FLOOR_PCTL", d.floor_pctl),
+        full_hit_tail: env_f32("FULL_HIT_TAIL", d.full_hit_tail),
+        min_background: env_f32("MIN_BACKGROUND", d.min_background as f32) as u32,
         ..NormConfig::default()
     };
 
@@ -143,7 +140,7 @@ fn main() -> anyhow::Result<()> {
     }
     dialogue.sort_by_key(|(_, tl, idx, _)| (*tl, *idx));
 
-    // WARM the hit levels from non-focus dialogue turns (a focus turn isn't sealed
+    // WARM the backgrounds from non-focus dialogue turns (a focus turn isn't sealed
     // when its own reprojections fire live, so it shouldn't warm its own test).
     let scope = ScopeKey::turn_group(1, 1);
     let cache = NormalizationCache::new(cfg);
@@ -161,13 +158,13 @@ fn main() -> anyhow::Result<()> {
             (0..n).map(|ci| (child_keys[ci].clone(), raw[ci])).collect();
         // The probe's own length: a raw score is a sum over probe tokens, and
         // OBSERVE_TRAIL switches this between a trailing window and the whole
-        // turn — so the level must be learned as a rate, not as a total.
-        cache.observe(&scope, *sid, &pairs, probe.len());
+        // turn — so the background must be learned as a rate, not as a total.
+        cache.observe(&scope, *sid, &pairs, None, probe.len());
     }
 
     println!(
-        "═══ §86 live-probe model | OBSERVE_TRAIL={} | floor_min {} floor_pctl {} ═══\n",
-        observe_trail, cfg.floor_min, cfg.floor_pctl
+        "═══ §86 live-probe model | OBSERVE_TRAIL={} | full_hit_tail {} min_background {} ═══\n",
+        observe_trail, cfg.full_hit_tail, cfg.min_background
     );
 
     let is_focus = |nm: &str| nm.contains(&focus);

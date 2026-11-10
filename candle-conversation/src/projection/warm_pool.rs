@@ -3,7 +3,7 @@
 //! # Why the warm-ups do not share rayon's global pool
 //!
 //! A warm-up replays stored turns as probes against every belief group and
-//! collection to learn their hit levels — up to 512 dialogue turns, or every
+//! collection to learn their backgrounds — up to 512 dialogue turns, or every
 //! ingested file, each scored on the CPU with `par_iter`. That is bulk work,
 //! seconds to minutes of it, and it runs while the daemon is serving: after
 //! `ready`, on the first dialogue query, and again after every file-watcher

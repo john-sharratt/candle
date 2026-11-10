@@ -13,7 +13,7 @@
 //!   REPO_TL=<id>            pin the repo_map timeline (else newest by turn count)
 //!   FOCUS=candle-core       substring of the "correct" cluster for focus probes
 //!   FOCUS_PROBES=0x..,0x..   dialogue turns whose correct answer is FOCUS
-//!   ALPHA_UP / ALPHA_DN / HIT_PRIOR / FLOOR_MIN / FLOOR_PCTL  NormConfig overrides
+//!   FULL_HIT_TAIL / MIN_BACKGROUND  NormConfig overrides
 //! ```
 
 use std::collections::HashMap;
@@ -59,11 +59,8 @@ fn main() -> anyhow::Result<()> {
     // band's reference probe length — come from the default, so a new normalizer
     // constant does not break this harness.
     let cfg = NormConfig {
-        alpha_up: env_f32("ALPHA_UP", defaults.alpha_up),
-        alpha_dn: env_f32("ALPHA_DN", defaults.alpha_dn),
-        hit_prior: env_f32("HIT_PRIOR", defaults.hit_prior),
-        floor_min: env_f32("FLOOR_MIN", defaults.floor_min),
-        floor_pctl: env_f32("FLOOR_PCTL", defaults.floor_pctl),
+        full_hit_tail: env_f32("FULL_HIT_TAIL", defaults.full_hit_tail),
+        min_background: env_f32("MIN_BACKGROUND", defaults.min_background as f32) as u32,
         ..NormConfig::default()
     };
 
@@ -195,8 +192,9 @@ fn main() -> anyhow::Result<()> {
             ));
         }
 
-        // WRITE: fold this turn into the hit levels (seal cadence, once per turn).
-        cache.observe(&scope, turn_i as u64, &raw_pairs, sig.len());
+        // WRITE: fold this turn into the backgrounds (seal cadence, once per
+        // turn), about no known cluster, as a live seal is.
+        cache.observe(&scope, turn_i as u64, &raw_pairs, None, sig.len());
         for ci in 0..n {
             raw_mean[ci] += (raw[ci] - raw_mean[ci]) / (turn_i + 1) as f32;
         }

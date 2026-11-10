@@ -2,7 +2,8 @@
 //!
 //! In-memory and **not persisted** — it is derived from query traffic and rebuilt
 //! empty each process load (see the module docs). `normalize` is the read path
-//! (every reprojection); `observe` is the sole writer (once per turn at seal).
+//! (every reprojection); `observe` is the sole writer (once per turn at seal, and
+//! the warm-ups).
 //!
 //! Shared by every thread that scores, and held by none: each scope's state is
 //! one immutable value behind an atomic cell. A read loads it and normalizes
@@ -16,8 +17,8 @@ use arc_swap::ArcSwap;
 use super::scope::ScopeState;
 use super::{ChildKey, NormConfig, ScopeKey};
 
-/// Per-scope hit-level normalization, keyed by [`ScopeKey`]. Starts empty; each
-/// scope fills in lazily as it is first observed.
+/// Per-scope background normalization, keyed by [`ScopeKey`]. Starts empty;
+/// each scope fills in lazily as it is first observed.
 #[derive(Default)]
 pub struct NormalizationCache {
     cfg: NormConfig,
@@ -41,146 +42,63 @@ impl NormalizationCache {
         &self.cfg
     }
 
-    /// Read path: normalized 0–1000 scores for a scope's children. A scope never
-    /// observed yet normalizes every child against the cold-start prior. Pure.
+    /// Read path: each child's raw score on the band, as tail surprise against
+    /// its background in `scope` ([`NormConfig::full_hit_tail`]). A scope
+    /// never observed reads every child against the probe's own scores. Pure.
     ///
     /// `probe_tokens` is the length of the probe `raw` was scored with, in
     /// signature tokens. It is required rather than optional because a raw score
     /// is a sum over the probe and the band is a rate — see
     /// [`NormConfig::probe_t_ref`].
+    ///
+    /// Normalize a competition's children in ONE call: a child too new to have
+    /// a background is read against the others, which a call naming it alone
+    /// cannot show it.
     pub fn normalize(
         &self,
         scope: &ScopeKey,
         raw: &[(ChildKey, f32)],
         probe_tokens: usize,
     ) -> Vec<(ChildKey, f32)> {
-        self.normalize_with_floors(scope, raw, &[], probe_tokens)
-    }
-
-    /// [`Self::normalize`] with a caller-supplied per-child denominator floor —
-    /// the Concept A.4 size-aware level prior, constants owned by the caller's
-    /// policy. Pure.
-    pub fn normalize_with_floors(
-        &self,
-        scope: &ScopeKey,
-        raw: &[(ChildKey, f32)],
-        floors: &[f32],
-        probe_tokens: usize,
-    ) -> Vec<(ChildKey, f32)> {
         match self.state(scope) {
-            Some(s) => s.normalize_with_floors(raw, floors, &self.cfg, probe_tokens),
-            None => {
-                ScopeState::default().normalize_with_floors(raw, floors, &self.cfg, probe_tokens)
-            }
+            Some(s) => s.normalize(raw, &self.cfg, probe_tokens),
+            None => ScopeState::default().normalize(raw, &self.cfg, probe_tokens),
         }
     }
 
-    /// [`Self::normalize_with_floors`] against `scope`, falling back to `parent`
-    /// for any child `scope` has not learned enough about.
-    ///
-    /// Subdividing a scope — by phase, say — multiplies the scopes and splits the
-    /// traffic between them, so some will be cold for a long time and some
-    /// (a tool's `response` phase) effectively forever. Dividing by a
-    /// learning-starved level is not a smaller version of normalizing, it
-    /// INVERTS the ranking: the A.4 note measured normalization dropping code
-    /// Top-1 57.1% → 47.5% on cold levels, and a cold tool lens scored 0/6 here
-    /// against 6/6 warm. So a child the subdivision has not taught is normalized
-    /// on the undivided parent instead of on noise, and the subdivision can only
-    /// ever add resolution where it has evidence.
-    pub fn normalize_with_fallback(
-        &self,
-        scope: &ScopeKey,
-        parent: &ScopeKey,
-        raw: &[(ChildKey, f32)],
-        floors: &[f32],
-        min_observations: u32,
-        probe_tokens: usize,
-    ) -> Vec<(ChildKey, f32)> {
-        let Some(state) = self.state(scope) else {
-            return self.normalize_with_floors(parent, raw, floors, probe_tokens);
-        };
-        let (mut warm, mut cold): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
-        for (i, (child, _)) in raw.iter().enumerate() {
-            if state.count_of(child).unwrap_or(0) >= min_observations {
-                warm.push(i);
-            } else {
-                cold.push(i);
-            }
-        }
-        if cold.is_empty() {
-            return state.normalize_with_floors(raw, floors, &self.cfg, probe_tokens);
-        }
-        if warm.is_empty() {
-            return self.normalize_with_floors(parent, raw, floors, probe_tokens);
-        }
-        // Mixed: normalize each half against the scope that actually knows the
-        // child, then reassemble in the caller's order.
-        let pick = |idx: &[usize]| -> (Vec<(ChildKey, f32)>, Vec<f32>) {
-            (
-                idx.iter().map(|&i| raw[i].clone()).collect(),
-                idx.iter()
-                    .map(|&i| floors.get(i).copied().unwrap_or(0.0))
-                    .collect(),
-            )
-        };
-        let (warm_raw, warm_floors) = pick(&warm);
-        let (cold_raw, cold_floors) = pick(&cold);
-        let warm_out =
-            state.normalize_with_floors(&warm_raw, &warm_floors, &self.cfg, probe_tokens);
-        let cold_out = self.normalize_with_floors(parent, &cold_raw, &cold_floors, probe_tokens);
-        let mut out = raw.to_vec();
-        for (slot, v) in warm.iter().zip(warm_out) {
-            out[*slot] = v;
-        }
-        for (slot, v) in cold.iter().zip(cold_out) {
-            out[*slot] = v;
-        }
-        out
-    }
-
-    /// Write path: fold a turn's raw scores into the scope's hit levels, creating
-    /// the scope on first observation. Call once per turn at seal, with the scope's
-    /// full current membership.
+    /// Write path: fold one probe's raw scores into `scope`'s backgrounds,
+    /// creating the scope on first observation — every child's but `answer`'s,
+    /// when the probe is known to be about one of them (a warm-up exemplar, a
+    /// file's own turn). A live seal knows no answer and teaches every child:
+    /// a hub that scores on everything then carries those scores as its own
+    /// background, which is what mutes it.
     ///
     /// Every `(group, timeline)` scope is retained independently. A belief group
     /// like `code_reading` has MANY simultaneously-active timelines — one per
-    /// ingested file — and each needs its own learned hit levels so a cross-file
-    /// query can rescale them onto the common 0–1000 band and compare them fairly.
-    /// (An earlier version evicted a group's *other* timelines on every observe,
-    /// assuming one active timeline per group. That holds for a re-scanned single
-    /// cluster but is catastrophic for code_read: it wiped every file but the last,
-    /// leaving the cache empty for all the others, so normalization degenerated to a
-    /// flat `scale/prior` multiple of the raw score and a promiscuous low-entropy
-    /// file won every query.) Stale scopes from a repo_map re-scan are left in place
-    /// — dead once their timeline is inactive, bounded by the re-scan count, and a
-    /// single small `ScopeState` each.
+    /// ingested file — and each keeps its own backgrounds. (An earlier version
+    /// evicted a group's *other* timelines on every observe, which wiped every
+    /// file but the last and let a promiscuous file win every query.) Stale
+    /// scopes from a repo_map re-scan are left in place — dead once their
+    /// timeline is inactive, bounded by the re-scan count.
+    ///
     /// **Idempotent per observation.** `source` identifies the evidence — the
     /// turn this scoring pass came from — and a scope folds each source exactly
-    /// once. Re-observing it is a no-op.
-    ///
-    /// That is what lets the levels be (re)built on EVERY load, from empty, even
-    /// against a substrate already on disk, while the same scopes keep learning
-    /// from live traffic afterwards. Without it the two paths fight: a replay
-    /// drags every level toward whatever it re-feeds, so the levels a load
-    /// reproduces differ from the ones it originally learned, and the ranking
-    /// they drive drifts with nothing but a restart.
-    ///
+    /// once. Re-observing it is a no-op, which is what lets the backgrounds be
+    /// rebuilt on EVERY load, from empty, against a substrate already on disk,
+    /// while the same scopes keep learning from live traffic afterwards.
     /// Deduplicating on the SCORE instead would be wrong: a promiscuous child
     /// scores about the same on everything, so it would be recorded once and
-    /// never learn that it is loud across all traffic — which is exactly what
-    /// the hit level exists to discount.
+    /// never learn that it is loud across all traffic.
     ///
     /// Fast on the hot path: one hash lookup rejects an already-folded source
-    /// before touching any child.
-    /// `probe_tokens` is the length of the probe `raw` was scored with. The write
-    /// path scales to the same reference the read path does — a level learned at
-    /// one probe length and a query measured at another is the unit mismatch this
-    /// carries the length to avoid. See [`NormConfig::probe_t_ref`].
+    /// before touching any child. `probe_tokens` is the length of the probe
+    /// `raw` was scored with; see [`NormConfig::probe_t_ref`].
     pub fn observe(
         &self,
         scope: &ScopeKey,
         source: u64,
         raw: &[(ChildKey, f32)],
+        answer: Option<&ChildKey>,
         probe_tokens: usize,
     ) {
         let scopes = self.scopes.pin();
@@ -190,19 +108,14 @@ impl NormalizationCache {
         cell.rcu(|current| {
             let mut next = ScopeState::clone(current);
             if next.mark_observed(source) {
-                next.observe(raw, &self.cfg, probe_tokens);
+                next.observe(raw, answer, &self.cfg, probe_tokens);
             }
             next
         });
     }
 
     #[cfg(test)]
-    pub(super) fn level_of(&self, scope: &ScopeKey, child: &ChildKey) -> Option<f32> {
-        self.state(scope).and_then(|s| s.level_of(child))
-    }
-
-    #[cfg(test)]
-    pub(super) fn count_of(&self, scope: &ScopeKey, child: &ChildKey) -> Option<u32> {
-        self.state(scope).and_then(|s| s.count_of(child))
+    pub(super) fn background_of(&self, scope: &ScopeKey, child: &ChildKey) -> Option<u32> {
+        self.state(scope).and_then(|s| s.background_of(child))
     }
 }

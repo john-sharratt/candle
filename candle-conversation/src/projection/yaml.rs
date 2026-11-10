@@ -222,9 +222,6 @@ struct YamlPolicy {
     /// Concept B: mass constants.
     #[serde(default)]
     mass: Option<YamlMass>,
-    /// Concept A.4: size-aware level-prior constants.
-    #[serde(default)]
-    level_prior: Option<YamlLevelPrior>,
     /// What a turn group's scan scores as one case: `exchange` | `file`.
     /// Omitted ⇒ inherit.
     #[serde(default)]
@@ -275,14 +272,6 @@ struct YamlMass {
     concentration_top_k: Option<usize>,
     #[serde(default)]
     concentration_rho: Option<f32>,
-}
-
-#[derive(Deserialize)]
-struct YamlLevelPrior {
-    #[serde(default)]
-    floor_base: Option<f32>,
-    #[serde(default)]
-    floor_cap: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1089,14 +1078,6 @@ fn parse_policy(
             scan.mass_rho = rho;
         }
     }
-    if let Some(lp) = &yp.level_prior {
-        if let Some(b) = lp.floor_base {
-            scan.level_prior_base = b;
-        }
-        if let Some(c) = lp.floor_cap {
-            scan.level_prior_cap = c;
-        }
-    }
     if let Some(c) = &yp.cases {
         scan.cases = match c.as_str() {
             "exchange" => ScanCases::Exchange,
@@ -1147,12 +1128,6 @@ fn validate_scan(name: &str, s: &ScanPolicy) -> Result<(), ConstructionError> {
     }
     if s.mass_rho < 0.0 {
         return Err(bad("mass.concentration_rho must be >= 0"));
-    }
-    if s.level_prior_base < 0.0 {
-        return Err(bad("level_prior.floor_base must be >= 0"));
-    }
-    if s.level_prior_cap < 1.0 {
-        return Err(bad("level_prior.floor_cap must be >= 1"));
     }
     if s.calibration_weight.is_nan() || s.calibration_weight < 0.0 {
         return Err(bad("calibration_weight must be >= 0"));

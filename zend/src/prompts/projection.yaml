@@ -901,11 +901,6 @@ layers:
           # probe (the question is weak but RIGHT; the decode tail is strong but
           # echoes whatever is already projected). Max-fused after normalization.
           question_pin: true
-          # Concept A.4 (§3): size-aware level prior — a cold (not yet
-          # self-match-warmed) cluster normalizes against its size floor, so a
-          # tiny stub can't explode under level division while a full cluster's
-          # rare hit still stands out.
-          level_prior: { floor_base: 2.0, floor_cap: 16.0 }
           # Repo_map folder identity concentrates in the L46 fold-group (§83):
           # peak the belief vote on group 1 and keep groups 0 (L0-45) and 2 (L47)
           # only as a faint tie-breaker. Group 0 alone ranks the target #17 (pure
@@ -1023,8 +1018,6 @@ layers:
           fusion: { mode: additive }
           # Concept F: pinned question window as a second scan.
           question_pin: true
-          # Concept A.4: cold-scope size floor (see repo_map's note).
-          level_prior: { floor_base: 2.0, floor_cap: 16.0 }
           # A file is taken whole, so it is one case, every file in one
           # competition: a file of several exchanges scored alone was scored
           # only against itself, and the large files read over several rounds
@@ -1068,7 +1061,6 @@ layers:
         policy:
           fusion: { mode: additive }
           question_pin: true
-          level_prior: { floor_base: 2.0, floor_cap: 16.0 }
           cases: file
           layer_weights: [0.0, 1.0, 1.0]
           calibration_layer_weights: [0.0, 0.0, 1.0]

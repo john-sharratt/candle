@@ -11,8 +11,8 @@
 //!   are spread evenly — the Gini of the wins, and the share the biggest
 //!   winner takes.
 //!
-//! The formulas: raw; production's two (over the traffic peak, over the hit
-//! level), taught with the same questions as traffic; and background-relative
+//! The formulas: raw; production's, taught with the same questions as
+//! traffic, each question's own file its answer; and background-relative
 //! ones — a z-score, a zero-inflated log-normal tail, the empirical tail, and
 //! the empirical tail blended with the score's size.
 
@@ -26,26 +26,20 @@ use crate::ranking::{rank_of, wins};
 use crate::remote_gallery::{Daemon, Questions, RemoteGallery};
 use crate::stats::{gini, mrr, recall};
 
-/// The file-scored groups' denominator floor: `level_prior.floor_base` — a
-/// file far longer than the reference probe takes the base unscaled.
-const PEAK_FLOOR: f32 = 2.0;
-
 /// One way of turning a probe's scores into the ones files are ranked by.
 #[derive(Clone, Copy, PartialEq)]
 enum Norm {
     Raw,
-    Peak,
-    Level,
+    Production,
     ZScore,
     LogNormalTail,
     /// The empirical tail plus `weight × ln(1 + score)`.
     Empirical(f32),
 }
 
-const NORMS: [(Norm, &str); 9] = [
+const NORMS: [(Norm, &str); 8] = [
     (Norm::Raw, "raw"),
-    (Norm::Peak, "over peak (code_reading today)"),
-    (Norm::Level, "over hit level"),
+    (Norm::Production, "production (background tail)"),
     (Norm::ZScore, "z-score"),
     (Norm::LogNormalTail, "log-normal tail surprise"),
     (Norm::Empirical(0.0), "empirical tail surprise"),
@@ -66,8 +60,10 @@ pub fn run(files: &[File], targets: &[String], daemon: &Daemon) -> anyhow::Resul
     let scaled = scaled_scores(&gpu, &probes, Questions::Without, n)?;
     let backgrounds = learn(&probes, &scaled, n);
 
-    // Production's cache, taught with every question as one turn of traffic.
-    // Fed reference-scaled scores at the reference length, the same values.
+    // Production's cache, taught with every question as one probe, its own
+    // file the answer left out of that file's background — as `learn` leaves a
+    // file's own questions out. Fed reference-scaled scores at the reference
+    // length, the same values.
     let t_ref = T_REF as usize;
     let scope = ScopeKey::pool(0);
     let child: Vec<ChildKey> = files
@@ -78,19 +74,24 @@ pub fn run(files: &[File], targets: &[String], daemon: &Daemon) -> anyhow::Resul
         child.iter().cloned().zip(scores.iter().copied()).collect()
     };
     let cache = NormalizationCache::default();
-    for (p, scores) in scaled.iter().enumerate() {
-        cache.observe(&scope, p as u64, &pairs(scores), t_ref);
+    for (p, ((owner, _), scores)) in probes.iter().zip(&scaled).enumerate() {
+        cache.observe(
+            &scope,
+            p as u64,
+            &pairs(scores),
+            Some(&child[*owner]),
+            t_ref,
+        );
     }
-    let peak_floors = vec![PEAK_FLOOR; n];
     let normed = |norm: Norm, p: usize| -> Vec<f32> {
-        let from_cache = |out: Vec<(ChildKey, f32)>| out.into_iter().map(|(_, s)| s).collect();
         let x = &scaled[p];
         match norm {
             Norm::Raw => x.clone(),
-            Norm::Peak => {
-                from_cache(cache.normalize_with_floors(&scope, &pairs(x), &peak_floors, t_ref))
-            }
-            Norm::Level => from_cache(cache.normalize(&scope, &pairs(x), t_ref)),
+            Norm::Production => cache
+                .normalize(&scope, &pairs(x), t_ref)
+                .into_iter()
+                .map(|(_, s)| s)
+                .collect(),
             Norm::ZScore => (0..n).map(|f| backgrounds[f].z(x[f])).collect(),
             Norm::LogNormalTail => (0..n)
                 .map(|f| backgrounds[f].log_normal_surprise(x[f]))

@@ -1,7 +1,9 @@
 # Provenance Score Normalization
 
-**Status:** design (module not yet built). Supersedes the per-node absolute
-threshold tuning for provenance selection.
+**Status:** built (`candle-conversation/src/normalization/`). Supersedes the
+per-node absolute threshold tuning for provenance selection. Since 2026-11-11 a
+score is read against the candidate's **background** (§3.1); the hit-level EWMA
+it replaced is recorded in §3.1a.
 
 This document captures what we learned diagnosing repo_map retrieval and specifies
 the **score-normalization module** that fixes it. It is authoritative for that
@@ -60,38 +62,74 @@ query traffic**.
 
 ---
 
-## 3. What works: per-scope hit-level normalization
+## 3. What works: per-scope background normalization
 
-### 3.1 Hit level, not mean
+### 3.1 Against the background, as tail surprise
 
-Two learned-from-traffic normalizers were validated:
-
-- **Running mean** of a candidate's raw scores across queries (its promiscuity).
-  Dividing by it discounts generic clusters correctly, but puts the output on a
-  ~0–10000 scale (a specific cluster's mean is tiny, so a hit is 10–40× it).
-- **Hit level** — the score a candidate reaches *when it is genuinely the answer*,
-  tracked as an **asymmetric EWMA** (rises fast toward a strong match, decays
-  slowly). Dividing by it puts a real hit at **≈ 1000 by construction**, with a
-  sustained decode lock-on riding above it. This is the chosen normalizer: the
-  0–1000 scale is legible for diagnostics and thresholds.
+A candidate's **background** is the distribution of the (reference-scaled, §4.2)
+scores it reaches on probes that are *not about it*. A probe's score is read as
+how far into that background's tail it sits:
 
 ```
-normalized(c | probe) = 1000 × raw(c | probe) / max(hit_level(c), floor(scope))
+surprise(c | x) = −ln P(background(c) ≥ x)          (add-one smoothed)
+normalized(c | x) = 1000 × surprise(c | x) / ln(1 / full_hit_tail)
 ```
 
-- `hit_level(c)` update, per probe, per candidate:
-  `hit += (raw > hit ? α_up : α_dn) × (raw − hit)`, with `α_up ≈ 0.30`,
-  `α_dn ≈ 0.02`, cold-start `HIT_PRIOR ≈ 400`.
-- `floor(scope)` = a low percentile of the scope's current hit levels, hard-floored
-  at the prior — kills "divide by ~0" explosions for cold/quiet candidates.
+Under the null — a probe not about `c` — every candidate's surprise follows the
+same distribution, so a loud candidate (a hub that scores on everything: the
+workspace root, a crate's `lib.rs`) wins no more often by chance than a quiet
+one, while a genuine hit sits in its own far tail. It is the empirical-tail
+formula the normalization gate measured best (`provenance_gates normalization`,
+§7.1).
 
-### 3.2 Semantics of the 0–1000 scale
+- **The background is counts.** Scores fall into log-spaced bins (8 per nat of
+  `ln(1 + x)`, a 13% step); a score's tail is the count above its bin plus the
+  share of its own bin above it. Counts commute, so a background — and every
+  score read against it — is the same whatever order its evidence arrived in.
+- **A probe's known answer is left out of its background.** A warm-up exemplar
+  is about its own tool, an ingest self-probe about its own exchange: those
+  scores are the hit, not what a hit is measured against. A live seal knows no
+  answer and teaches every candidate — which is what mutes a hub: its loud
+  scores on everything become its own background.
+- **Past everything the background holds** a score keeps rising one nat per nat
+  of `ln(1 + x)` from the top bin's edge, so two scores beyond the whole
+  background still rank by size.
+- **A candidate too new for a background** (fewer than `min_background`, 8,
+  samples) is read against its scope's pooled background — every sample any of
+  its siblings was taught — and a scope with too little pooled either, against
+  the probe's own scores across the competition. A competition is therefore
+  normalized in one call (`NormalizationCache::normalize`), the pooled documents
+  of a group included.
+- A score of no evidence (zero) reads zero.
 
-- **~1000** — a full hit: the probe matches the candidate as strongly as the
-  candidate matches when it is the answer.
-- **> 1000** — lock-on: a sustained strong match during decode (the clearest
-  query for a candidate locks on hardest).
-- **< ~450** — below the noise floor; not a real hit.
+### 3.1a The hit level it replaced
+
+From 2026-08 to 2026-11 a score was divided by the candidate's **hit level**, an
+asymmetric EWMA (`α_up 0.30`, `α_dn 0.02`, prior 400) meant to settle at the score
+it reaches when it is the answer, so a real hit landed near 1000. Every fold
+observed every candidate, so each probe *not* about a candidate pulled its level
+2% toward that probe's score: a candidate stays at its hit level only if it is
+the answer about once in fifty folds. The tool warm-up folded each tool's eight
+exemplars in catalog order, so an early tool sat through ~1,240 more folds
+(`0.98^1240 ≈ e^-25`) and ended at its background, scoring a real hit near
+10,000, while the last tools kept their hit level and were muted. Measured on
+2026-11-11: every out-of-band tool score belonged to an early name
+(`journal_check` 10,513, `file_grep` 8,138) and the tools that failed to qualify
+were all late ones (`signature_verify` 60, `ssh_open` 9, `web_fetch` 1.0) — a
+tool's score followed its place in the alphabet. code_reading's floored path
+divided by the traffic **peak** instead (`max(peak, size floor)`, Concept A.4),
+which the gate measured barely better than raw: R@1 0.134, one file taking 15.3%
+of every win.
+
+### 3.2 Semantics of the band
+
+`full_hit_tail` is 0.01, so:
+
+- **1000** — a full hit: beyond 99 in 100 of the candidate's background.
+- **> 1000** — past that: about 1500 is beyond 1 in 1000, and a score past the
+  whole background rides higher still.
+- **~500** — beyond 9 in 10; **~150** — the background's median. The tool gate's
+  `min_score 800` / `evict_score 600` are a 1-in-40 and a 1-in-16 score.
 
 ### 3.3 Per-scope = per score-competition node (verified against `project.rs`)
 
@@ -146,9 +184,9 @@ every character whatever it was doing.
 So `belief_files::competitions` pools a scan's one-exchange files into one
 gallery, a case each, and a file of several exchanges stays its own competition
 (zend's code reads). The pool is one score-competition scope —
-`ScopeKey::Pool { group }`, children keyed `ChildKey::Timeline` — so its floor is
-taken across the documents and a seal folds all of them at once. Its levels are
-**learned from traffic only**: a document probed by its own signature agrees with
+`ScopeKey::Pool { group }`, children keyed `ChildKey::Timeline` — normalized in
+one call and folded by a seal all at once. Its backgrounds are **learned from
+traffic only**: a document probed by its own signature agrees with
 itself on every bit and leaves the next document far behind, which is the
 self-match ceiling §2 rejects (measured live: every hit at 1–2% of the band), so
 the ingest warm-up self-matches only files of several exchanges. Measured on the
@@ -254,15 +292,14 @@ NOT persisted.** It is not part of the substrate/redo-log — it is a cache
 existing turns** (not started cold), then evolved as new turns seal. Not persisting
 it is fine because it is reconstructible from the substrate at any time.
 
-Proposed location: `candle-conversation/src/normalization/` (one concern per
-file):
+Location: `candle-conversation/src/normalization/` (one concern per file):
 
 | file | role |
 |---|---|
-| `mod.rs` | public API: `NormalizationCache`, `ScopeKey`, `normalize`/`observe` |
-| `hit_level.rs` | `HitLevel` (asymmetric-EWMA state + update), `Running` mean for diagnostics |
-| `scope.rs` | `ScopeState` — per-child hit-level map, floor, prior; `normalize_scores` + `observe` |
-| `cache.rs` | `NormalizationCache` — scope map keyed by `ScopeKey`; evicts a group's stale-timeline scopes on `observe` |
+| `mod.rs` | public API: `NormalizationCache`, `ScopeKey`, `ChildKey`, `NormConfig` |
+| `background.rs` | `Background` — one child's log-binned counts; `add`, tail `surprise` |
+| `scope.rs` | `ScopeState` — per-child backgrounds and their pool; `normalize` + `observe` |
+| `cache.rs` | `NormalizationCache` — scope map keyed by `ScopeKey`, each scope an atomically swapped immutable state |
 | `tests.rs` | unit tests (§6) |
 
 ### 4.1 Types
@@ -284,21 +321,20 @@ nothing per candidate and the cache can reason about them (§4.3 eviction):
 - `ChildKey` — a candidate within a scope: `Turn(u64)` (turn index — allocation-
   free, stable within a gallery version) or `Named(String)` (tool / section name,
   how `belief_gallery` already keys collection members via `slot_of(tag)`).
-- `HitLevel { level: f32, count: u32, peak: f32 }` — the EWMA state for one child,
-  plus the highest raw score it has ever been observed at (the Concept A.4
-  traffic-peak denominator) and how many distinct observations shaped it (what a
-  subdivided scope consults before trusting it, §3.4).
-- `ScopeState { children: HashMap<ChildKey, HitLevel>, observed: HashSet<u64> }` —
-  one scope's state, plus the evidence ids already folded into it (§4.2).
-- `NormalizationCache { cfg: NormConfig, scopes: HashMap<ScopeKey, ScopeState> }`.
+- `Background { zeros: u32, bins: Vec<(u16, u32)>, total: u32 }` — one child's
+  samples: those of no evidence, and the rest as `(bin, count)` ascending.
+- `ScopeState { children: HashMap<ChildKey, Background>, pooled: Background,
+  observed: HashSet<u64> }` — one scope's state: each child's background, all of
+  them pooled (§3.1, a new child), and the evidence ids already folded (§4.2).
+- `NormalizationCache { cfg: NormConfig, scopes: HashMap<ScopeKey, ArcSwap<ScopeState>> }`.
+- `NormConfig { scale 1000, full_hit_tail 0.01, min_background 8, probe_t_ref 256 }`.
 
 Turn groups key the child by index rather than by path *tag*: tag-keying (so
 learning survives a re-scan) would need an `all_streams()` scan per turn per
 reprojection — prohibitive on the hot path. Instead a re-scan makes a new
 `(group, timeline)` scope, which correctly resets learning for the regenerated
-clusters and rebuilds it via the cold-start prior over subsequent queries. (Future
-refinement: a cached path-tag→index map to preserve learning across re-scans, if
-the post-re-scan cold-start proves noticeable.)
+clusters and rebuilds it over subsequent queries, its children read against the
+pool and then the probe until they have backgrounds of their own (§3.1).
 
 ### 4.2 Lifecycle and API
 
@@ -306,25 +342,25 @@ The cache is owned alongside the live projection state (per conversation session
 per substrate handle — TBD in the plan, see §8). Two operations, both driven from
 the scan (`score_belief_groups` / `score_belief_collections`):
 
-1. `normalize(scope, &[(child, raw)]) -> Vec<(child, normalized)>` — read path.
-   For each child, `1000 × raw / max(hit_level, floor)`; a child absent from the
-   scope (never seen) uses the cold-start prior. Pure read; does not mutate. Runs
-   on **every reprojection**, so selection always sees normalized scores.
-2. `observe(scope, source, &[(child, raw)])` — write path. Fold each raw into the
-   child's hit-level EWMA (creating it at the prior if new). **Idempotent per
+1. `normalize(scope, &[(child, raw)], probe_tokens) -> Vec<(child, normalized)>` —
+   read path. Each child's reference-scaled score read against its background
+   (§3.1), a child without one against the pool or the probe. Pure read; does not
+   mutate. Runs on **every reprojection**, so selection always sees normalized
+   scores.
+2. `observe(scope, source, &[(child, raw)], answer, probe_tokens)` — write path.
+   Each raw, reference-scaled, joins its child's background and the pool — every
+   child's but `answer`'s, when the probe is known to be about one (a warm-up
+   exemplar, an ingest self-probe; `None` for a live seal). **Idempotent per
    observation:** `source` identifies the evidence (the turn this scoring pass came
    from) and a scope folds each source exactly once, so re-observing it is a no-op
    — one hash lookup rejects it before any child is touched.
 
-   That idempotency is what lets the levels be rebuilt on **every load, from
+   That idempotency is what lets the backgrounds be rebuilt on **every load, from
    empty**, against a substrate already on disk, while the same scopes keep
-   learning from live traffic afterwards. Without it the two paths fight: a replay
-   drags every level toward whatever it re-feeds, so the levels a load reproduces
-   differ from the ones originally learned and the ranking they drive drifts on
-   nothing but a restart. Deduplicating on the *score* instead would be wrong — a
-   promiscuous child scores about the same on everything, so it would be recorded
-   once and never learn that it is loud across all traffic, which is exactly what
-   the hit level exists to discount.
+   learning from live traffic afterwards. Deduplicating on the *score* instead
+   would be wrong — a promiscuous child scores about the same on everything, so it
+   would be recorded once and never learn that it is loud across all traffic,
+   which is exactly what its background exists to show.
 
    Runs **once per turn, at seal** — hooked into
    `Conversation::last_turn_belief_scores`
@@ -334,19 +370,14 @@ the scan (`score_belief_groups` / `score_belief_collections`):
 
 **Why observe is per-turn, not per-reprojection.** A turn fires many reprojections,
 each with a *different* sliding probe (query-head + trailing window). Observing on
-each would (a) update a child's level N times for one turn — over-decaying idle
-children in proportion to turn length — and (b) diverge from the §85 model, which
-saw one whole-turn probe per turn. Observing once at seal fixes both.
+each would weight a turn in every background by its length, and teach each
+background its own turn's partial windows. Observing once at seal makes each turn
+one sample.
 
-**Probe-scale caveat.** `observe` uses the whole-turn sig; `normalize` uses the
-sliding reprojection probe. For turns shorter than `max_probe_tokens` these are the
-same tokens; for longer turns the reprojection probe drops the middle, so its raw
-magnitude differs by a roughly constant factor. The **ratio** normalizer preserves
-ranking regardless; only the absolute 0–1000 band shifts by that factor. So the
-§7 thresholds are the validated *mechanism + ballpark* — `min_score` / `evict` get
-a final confirmation on the live reprojection scale. (If the shift proves
-material, observe with a reprojection-style probe at seal — query-head + trailing
-window — instead of the whole-turn sig.)
+**Probe scale.** `observe` uses the whole-turn sig; `normalize` uses the sliding
+reprojection probe. Both are restated over the 256-token reference
+(`NormConfig::probe_t_ref`) before they meet a background, so a score is a rate
+whatever the window.
 
 Selection consumes the **normalized** scores: `belief_step` runs on the 0–1000
 values, so belief accumulation, `min_score`, `evict_score`, and the early-decode
@@ -355,47 +386,49 @@ window all operate on the normalized scale.
 ### 4.3 Substrate change / bounded growth
 
 Because a turn group's scope is keyed by `(group, timeline)`, a **re-scan** simply
-produces a *new* scope — the regenerated clusters start fresh at the cold-start
-prior (correct: their content changed) and rebuild over subsequent queries.
+produces a *new* scope — the regenerated clusters start with no background
+(correct: their content changed) and rebuild over subsequent queries.
 
 **Every `(group, timeline)` scope is retained independently.** An earlier version
 evicted a group's *other* timelines on each observe, to hold one scope per active
 group. That assumed one active timeline per group. It is true of a re-scanned
 single cluster and **catastrophic for `code_reading`**, which has many
 simultaneously-active timelines — one per ingested file — each needing its own
-learned levels so a cross-file query can rescale them onto the common band and
+learned backgrounds so a cross-file query can put them on the common band and
 compare them fairly. The eviction wiped every file but the last, leaving the cache
-empty for all the others, so normalization degenerated to a flat `scale/prior`
-multiple of the raw score and a promiscuous low-entropy file won every query.
+empty for all the others, and a promiscuous low-entropy file won every query.
 
 Stale scopes from a re-scan are therefore left in place: dead once their timeline
-is inactive, bounded by the re-scan count, and one small `ScopeState` each.
+is inactive, bounded by the re-scan count, and one small `ScopeState` each. A
+background is a few hundred bytes — its occupied bins — whatever its sample
+count.
 
 *Within* one gallery version the membership is fixed (a re-scan makes a new scope,
-not a mutated one), so there is no per-child add/drop reconciliation to do. When
-the raw scale shifts (the gallery grows and the scorer's `z` term moves), the hit
-level — an EWMA *of raw scores* — rides the shift, so `raw / hit_level` is
-self-stabilizing; a change that *lowers* a child's magnitude re-settles slowly
-(α_dn), the deliberate cost of not letting rarely-queried children collapse.
-Collections (stable galleries) never re-mint, so their scopes are not evicted.
+not a mutated one), so there is no per-child add/drop reconciliation to do. A
+background keeps every sample it was taught, so when the raw scale shifts (the
+gallery grows and the scorer's `z` term moves) the old samples weigh with the new
+until enough traffic has arrived; it rebuilds from the current substrate on every
+load. Collections (stable galleries) never re-mint, so their scopes are not
+evicted.
 
 ### 4.4 Warm-on-load
 
 The cache is **not** left cold on restart. On the first belief scan after load,
 `ensure_normalization_warm` replays the substrate's existing **sealed dialogue
 turns** (empty-tagged; gallery turns are tagged) through the same turn-group scan
-with `observe = true`, so the hit levels are rebuilt to what live traffic would
-have produced. Details that matter:
+with `observe = true`, so the backgrounds are rebuilt to what live traffic would
+have produced. The tool collection's exemplars and each ingested file's own turns
+are folded too (`warm_collection_normalization`, `warm_ingest_normalization`),
+each with its own member or exchange as the probe's answer. Details that matter:
 
 - **Exactly once, no half-warm reads.** Guarded by `std::sync::Once`, which blocks
   any concurrent first callers until the replay completes — so a second session
   can't score against a partially-warmed cache.
-- **Deterministic order.** `all_streams()` is a `HashMap` walk (unordered), so the
-  turns are sorted by `(timeline, turn index)` before replay; the warmed levels
-  don't depend on iteration order across restarts.
+- **Order-free.** A background is counts, so the warmed state does not depend on
+  the order turns are folded in.
 - **Bounded cost.** Only the most recent `WARM_REPLAY_MAX_TURNS` (512) turns are
-  replayed — the asymmetric EWMA converges in a few dozen steps, so older turns
-  barely move the levels, and the one-time cost stays bounded on a huge substrate.
+  replayed — 512 samples read a background's tail to its 1-in-100 — and the
+  one-time cost stays bounded on a huge substrate.
 - The still-decoding current turn is excluded (no sealed signature yet). The replay
   reuses the live scan, so it also computes normalized scores it discards — reusing
   the scan beats duplicating the sub-window flattening for a marginal saving.
@@ -418,16 +451,12 @@ splits read from write:
   scheduler reproject loop (`mod.rs`, passes `false`).
 - **Write** (`observe = true`, once per turn): `conversation.rs::last_turn_belief_scores`
   is the seal-time whole-turn scan; it passes `observe = true`, so after computing
-  the same raw scores the group scan folds them into the hit levels. The only
-  writer — reprojections never learn.
+  the same raw scores the group scan folds them into the backgrounds. The only
+  live writer — reprojections never learn.
 
-**Status.** Wired for **turn groups** (repo_map). **Collections (tools) and
-sub-windows are not yet wired** — tools work well on their raw thresholds, and
-normalizing them needs their own threshold re-derivation on the 0–1000 scale
-(a tools-scope §85 pass); doing it blind would risk a working path. `layer_weights`
-(already shipped) stay upstream — they shape the raw vote; normalization rescales.
-Thresholds in `projection.yaml` for the wired group are re-interpreted on the
-0–1000 scale (§7) and get a final live confirmation (§4.2 probe-scale caveat).
+**Status.** Wired for turn groups (repo_map, code_reading, dialogue, the pooled
+one-exchange documents) and section collections (tools). Sub-windows are not.
+`layer_weights` stay upstream — they shape the raw vote; normalization reads it.
 
 ---
 
@@ -436,27 +465,49 @@ Thresholds in `projection.yaml` for the wired group are re-interpreted on the
 Build alongside the module (TDD), asserting against exact expected values where
 possible:
 
-- `HitLevel`: asymmetric EWMA math — rise-fast/decay-slow against hand-computed
-  sequences; cold-start prior; monotonic settling to a constant input.
-- `ScopeState::normalize`: a hit at the hit level → ~1000; a 2× hit → ~2000
-  (lock-on); a noise-floor score → < threshold; a never-seen child uses the prior.
-- Floor: a quiet child cannot amplify a partial match past the floor; floor tracks
-  the scope percentile.
-- Re-scan eviction: observing a new `(group, timeline)` scope drops that group's
-  stale-timeline scope while leaving other groups untouched.
-- Per-scope isolation: two scopes with different scales do not cross-contaminate;
-  the same child key in two scopes is independent.
-- Determinism: same probe stream → same normalized output (no `Date::now`/RNG).
-- Regression guard: a synthetic gallery reproducing the root-vs-candle-core shape
-  (one loud generic child, one quiet specific child) selects the specific child on
-  its query after warm-up.
+- `Background` (`background.rs`): log-spaced bins against hand-computed bin
+  indices; the tail read off the counts (99 samples of 1.0: the top of their bin is
+  `ln 100`, 1.0 itself `0.776`); the rise past the highest bin; zeros are no
+  evidence; the same evidence in any order is the same background.
+- `normalize` (`tests.rs`): a score beyond 99 in 100 is exactly 1000; **the warm-up
+  order does not decide a score** (three tools folded in either order land at the
+  same 1074.5 — the §3.1a regression); a loud child is muted by its own loudness
+  and the specific one wins its probe (43.2 against 587.9); a known answer is not
+  its own background; a new child reads against the pool; an untaught scope reads
+  the probe against itself.
+- Idempotency per source; scope isolation; sibling-timeline scopes retained.
+- The band is a rate: invariant to probe length on the read path and on the write
+  path; an equal raw total from a shorter probe scores as the larger rate.
 
 ---
 
-## 7. Calibration (measured, `provenance_calibrate` §85)
+## 7. Calibration
 
-Replaying all 56 dialogue turns through the repo_map group scope with hit-level
-normalization, cold-start prior, per-scope floor:
+### 7.1 The background tail (`provenance_gates normalization`, 2026-11-11)
+
+37,284 calibration questions over 1,740 code_reading files' own turns, scored on
+BlackWorld's gallery; production's cache taught with every question as one probe,
+its own file the answer. R@k: the question's own file in the top k; "top win":
+the share of every file's wins on other files' questions taken by the biggest
+winner.
+
+| formula | R@1 | R@10 | MRR | win Gini | top win |
+|---|---|---|---|---|---|
+| raw | 0.107 | 0.351 | 0.188 | 0.942 | 54.5% |
+| over peak (code_reading before, §3.1a) | 0.134 | 0.326 | 0.196 | 0.808 | 15.3% |
+| over hit level (§3.1a) | 0.225 | 0.383 | 0.280 | 0.471 | 1.3% |
+| **production — background tail** | **0.239** | **0.400** | **0.295** | **0.125** | **0.1%** |
+| empirical tail, exact sort | 0.242 | 0.400 | 0.297 | 0.127 | 0.1% |
+| z-score | 0.232 | 0.395 | 0.289 | 0.258 | 0.1% |
+
+The binned background reads within 0.003 of the exact empirical tail. The two
+"before" rows are the same gate on 2026-11-11 before the change (37,308 questions).
+
+### 7.2 The hit level (`provenance_calibrate` §85, historical)
+
+What the hit-level normalizer (§3.1a) measured when it was built. Replaying all
+56 dialogue turns through the repo_map group scope with hit-level normalization,
+cold-start prior, per-scope floor:
 
 Normalized-score distribution (0–1000 scale):
 
@@ -485,14 +536,12 @@ Tuning constants used: `α_up 0.30`, `α_dn 0.02`, `HIT_PRIOR 400`, `FLOOR_PCTL 
   substrate handle, or a scheduler-level singleton) and how concurrent sessions
   share or isolate scopes. `observe` runs from the seal path and `normalize` from
   the reprojection path, so both need a handle to the same cache.
-- **Tools + dialogue scope calibration**: §7 calibrated the repo_map turn-group
-  scope; extend the model to the tools collection and a dialogue turn group and
-  confirm the same parameters (or per-scope priors) hold.
 - **Live threshold confirmation**: re-measure the normalized distribution on the
-  live **reprojection** probe (not the whole-turn sig) to pin `min_score` / `evict`
-  after the probe-scale shift noted in §4.2.
-- **Gallery-change stress test**: inject/remove clusters mid-replay to measure the
-  re-settling lag empirically and lock the α values.
+  live reprojection probe to confirm `min_score` / `evict` on the background band
+  (§3.2).
+- **Popular members**: a live seal knows no answer, so a tool used on a large
+  share of turns carries its own hits in its background and reads lower over
+  time. Naming a sealed tool turn's called tool as its answer would remove that.
 - **Sub-window scope**: normalize file-within-listing selection (self-referencing
   sub-windows) once the coarser scopes are in — the fine half of the group →
   sub-window nesting (§3.3).

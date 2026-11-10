@@ -4042,7 +4042,7 @@ impl Sequence {
             .map(<[WideQSig]>::to_vec)
             .unwrap_or_default();
         // The seal scan is the once-per-turn learning point for the
-        // score-normalization hit levels — and it teaches only the scopes this
+        // score-normalization backgrounds — and it teaches only the scopes this
         // turn is inside, so a dialogue turn cannot rewrite a tag-scoped
         // collection's lens. The scheduler runs it on its gallery arena, the
         // only thread that may scan there.

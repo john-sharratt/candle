@@ -2,7 +2,7 @@
 //!
 //! When a turn seals, its stored wide-Q signature is scored against every
 //! belief node once more, and that scan — unlike every live reprojection —
-//! teaches the score-normalization hit levels. The caller holds the turn; the
+//! teaches the score-normalization backgrounds. The caller holds the turn; the
 //! scheduler holds the gallery arena, and the arena has exactly one scan thread
 //! (a re-seal frees a turn's pages on the grounds that nobody else can be
 //! holding a scan pin on them). So the caller sends the probe here
@@ -88,71 +88,71 @@ mod tests {
     /// **A seal scan sent to the scheduler teaches exactly what scanning in
     /// place taught.** The request carries the probe, the question window, the
     /// tags and the source across the channel; losing any of them scores or
-    /// teaches differently, and the levels read back afterwards say so.
+    /// teaches differently, and the scores read back afterwards say so. Eight
+    /// turns are sealed: a member's background is read once it holds that many.
     #[test]
     fn a_seal_scan_through_the_scheduler_learns_what_an_in_place_scan_learned() {
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
         let sp = &builder.schema().system_prompt;
-        let sealed = SealedProbe {
+        let coll = sp.collection_named("tools").expect("tools collection");
+        let sealed = |source: u64| SealedProbe {
             probe: (0..12).map(|_| sig(0xAAAA_AAAA_AAAA_AAAA)).collect(),
             probe_q: (0..5).map(|_| sig(0xABAB_ABAB_ABAB_ABAB)).collect(),
             tags: vec!["tool".to_string()],
-            source: 0x5EA1,
+            source,
             observe: true,
         };
         let later: Vec<WideQSig> = (0..6).map(|_| sig(0x5555_5555_5555_5555)).collect();
 
-        // The reference: the scan as the caller used to run it, in place.
         let ref_dir = tempfile::tempdir().unwrap();
         let reference = open(ref_dir.path());
         let target = record_corpus(&reference, &builder);
-        let (want, _) = reference.score_beliefs(
-            builder.schema(),
-            target,
-            &sealed.probe,
-            Some(sealed.probe_q.as_slice()),
-            Observe::Yes {
-                tags: &sealed.tags,
-                source: sealed.source,
-            },
-            None,
-        );
-
         let dir = tempfile::tempdir().unwrap();
         let conv = open(dir.path());
         record_corpus(&conv, &builder);
         let cold = conv.score_belief_collections(sp, &later, None, Observe::No, None);
         let (mut sched, _tx) = make_test_scheduler();
-        let (tx, rx) = flume::bounded(1);
-        sched.handle_request(SchedulerRequest::ScoreSealedTurn {
-            substrate: conv.clone(),
-            projection: Arc::clone(&builder),
-            target,
-            sealed: SealedProbe {
-                probe: sealed.probe.clone(),
-                probe_q: sealed.probe_q.clone(),
-                tags: sealed.tags.clone(),
-                source: sealed.source,
-                observe: true,
-            },
-            response_tx: tx,
-        });
-        let got = rx.recv().expect("the scheduler answers");
 
-        let coll = sp.collection_named("tools").expect("tools collection");
+        for source in 0x5EA1..0x5EA1 + 8 {
+            let turn = sealed(source);
+            // The reference: the scan as the caller used to run it, in place.
+            let (want, _) = reference.score_beliefs(
+                builder.schema(),
+                target,
+                &turn.probe,
+                Some(turn.probe_q.as_slice()),
+                Observe::Yes {
+                    tags: &turn.tags,
+                    source: turn.source,
+                },
+                None,
+            );
+            let (tx, rx) = flume::bounded(1);
+            sched.handle_request(SchedulerRequest::ScoreSealedTurn {
+                substrate: conv.clone(),
+                projection: Arc::clone(&builder),
+                target,
+                sealed: turn,
+                response_tx: tx,
+            });
+            let got = rx.recv().expect("the scheduler answers");
+            for s in &coll.sections {
+                assert_eq!(
+                    got.section(s.id).to_bits(),
+                    want.section(s.id).to_bits(),
+                    "section {}: the seal scan scored differently through the scheduler",
+                    s.name
+                );
+            }
+        }
+
         let learned_want = reference.score_belief_collections(sp, &later, None, Observe::No, None);
         let learned_got = conv.score_belief_collections(sp, &later, None, Observe::No, None);
         for s in &coll.sections {
             assert_eq!(
-                got.section(s.id).to_bits(),
-                want.section(s.id).to_bits(),
-                "section {}: the seal scan scored differently through the scheduler",
-                s.name
-            );
-            assert_eq!(
                 learned_got.section(s.id).to_bits(),
                 learned_want.section(s.id).to_bits(),
-                "section {}: the seal scan taught a different level",
+                "section {}: the seal scan taught a different background",
                 s.name
             );
         }
