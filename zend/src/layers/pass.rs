@@ -20,6 +20,7 @@ use super::keys::{termed, unit_key};
 use super::plan::{plan_holding, Below, Done, Held, LiveFiles, Plan, Queued};
 use super::run::{committed, ingest_units, EdgeFiles, UnitJob};
 use super::spec::{LayerSpec, UnitKind};
+use crate::branch_ingest::reader::{whose_reading, Whose};
 use crate::calibrate::CalibrateSpec;
 use crate::ingest_report::IngestReport;
 use crate::refresh_ctx::RefreshContext;
@@ -317,9 +318,16 @@ fn settle(engine: &ConversationEngine, spec: &LayerSpec, below: &[Below], ground
         &|path| ground.is_held_back(path),
         &expired,
     );
-    // A committed unit whose chain stopped part-way is stale too.
+    // A committed unit whose chain stopped part-way is stale too — this
+    // member's, or a peer's past its grace. A peer's just committed reads the
+    // same while its later turns are still on their way (`whose_reading`).
     let mut gone: Vec<TimelineId> = p.tombstone.clone();
-    gone.extend(broken.iter().copied().filter(|tl| is_keyed(engine, *tl)));
+    gone.extend(
+        broken
+            .iter()
+            .copied()
+            .filter(|tl| is_keyed(engine, *tl) && whose_reading(engine, *tl) == Whose::Ours),
+    );
     if !gone.is_empty() {
         let e = engine;
         for tl in &gone {

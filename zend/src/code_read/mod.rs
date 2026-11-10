@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_conversation::chain_health::{chain_break, ChainBreak};
+use candle_conversation::persistence::identity::now_ms;
 use candle_conversation::projection::{
     OptionalState, SelectionState, TimelineId, FORCE_TOOL_SELECTOR, NO_THINK_SELECTOR,
     TOOLS_ENABLED_SELECTOR,
@@ -55,6 +56,7 @@ use crate::branch_ingest::keys::{
     LINES_KEY,
 };
 use crate::branch_ingest::plan::Committed;
+use crate::branch_ingest::reader::{whose, whose_reading, Whose};
 use crate::calibrate::{calibrate_committed, CalibrateSpec};
 use crate::ingest_backlog::{self, Work};
 use crate::ingest_lease::{self, Share};
@@ -126,6 +128,8 @@ pub fn committed(engine: &ConversationEngine) -> Vec<Committed> {
     // One line per unfinished chain per pass. A handful is ordinary recovery; a
     // corpus-wide sweep of them means the decode budget or the opening prompt
     // is wrong for this model, and every pass will keep redoing the same work.
+    // A peer's chain whose later turns are still on their way is not among
+    // them: it is `arriving`, and left to the peer.
     for (path, why) in &scan.broken {
         if scan.finished.iter().any(|c| c.subject == *path) {
             continue; // a complete chain for the same file covers it
@@ -143,10 +147,25 @@ pub fn committed(engine: &ConversationEngine) -> Vec<Committed> {
         .collect()
 }
 
+/// Every keyed `code_reading` conversation a peer committed whose later turns
+/// have not arrived yet ([`Whose::Peers`]): what the pass plans against beside
+/// [`committed`], so a file a peer has just read is not queued here again and
+/// its reading is not superseded by a second one. Not a reading this member
+/// may serve — that waits for the turns ([`chain_finished`]).
+pub fn arriving(engine: &ConversationEngine) -> Vec<Committed> {
+    scan_ingest_chains(engine)
+        .arriving
+        .into_iter()
+        .filter(|c| !is_upload_path(&c.subject))
+        .collect()
+}
+
 /// What [`scan_ingest_chains`] found: the keyed conversations whose chain
-/// finished, and the paths whose chain stopped part-way.
+/// finished, the peers' whose later turns are on their way, and the paths
+/// whose chain stopped part-way.
 struct IngestChains {
     finished: Vec<Committed>,
+    arriving: Vec<Committed>,
     broken: Vec<(String, ChainBreak)>,
 }
 
@@ -162,40 +181,45 @@ fn scan_ingest_chains(engine: &ConversationEngine) -> IngestChains {
     let quants = quant_tags(eng);
     let conv = eng.conversation();
     let substrate = conv.read();
+    let (node, now) = (conv.node(), now_ms());
     let mut out = IngestChains {
         finished: Vec::new(),
+        arriving: Vec::new(),
         broken: Vec::new(),
     };
     for (timeline, path) in paths {
         let Some(key) = keys.get(&timeline) else {
             continue;
         };
+        let first = substrate.first_turn_stamp(timeline.raw());
+        let unit = |subject: String| Committed {
+            timeline,
+            key: key.clone(),
+            subject,
+            stamp: first.unwrap_or_default(),
+            quant: quants.get(&timeline).copied(),
+        };
         match chain_break(&substrate, timeline) {
+            None => out.finished.push(unit(path)),
+            Some(_) if whose(first, node, now) == Whose::Peers => out.arriving.push(unit(path)),
             Some(why) => out.broken.push((path, why)),
-            None => out.finished.push(Committed {
-                timeline,
-                key: key.clone(),
-                subject: path,
-                stamp: substrate
-                    .first_turn_stamp(timeline.raw())
-                    .unwrap_or_default(),
-                quant: quants.get(&timeline).copied(),
-            }),
         }
     }
     out
 }
 
-/// Content keys whose ingest chain finished, uploads included — the snapshot
-/// [`ingest_jobs`] probes before spending a conversation on a file.
+/// Content keys whose ingest chain finished, or a peer's is arriving, uploads
+/// included — the snapshot [`ingest_jobs`] probes before spending a
+/// conversation on a file.
 ///
 /// Replaces a bare sweep of every content key, which counted an unfinished
 /// chain's key as present and so skipped the very file the plan had just
 /// queued for rebuild.
 fn finished_content_keys(engine: &ConversationEngine) -> HashSet<String> {
-    scan_ingest_chains(engine)
-        .finished
+    let scan = scan_ingest_chains(engine);
+    scan.finished
         .into_iter()
+        .chain(scan.arriving)
         .map(|c| c.key)
         .collect()
 }
@@ -500,12 +524,18 @@ pub(crate) fn is_upload_path(path: &str) -> bool {
 /// named by `--disable-layer`, before any pool or upload runs. Never called
 /// from [`ingest_jobs`]: a pass can overlap a live pool, and an in-flight file
 /// is indistinguishable from a crashed one by metadata alone.
+///
+/// **Only this member's partials.** Nothing of this member's is in flight at
+/// boot, but a peer's readings are, and they replicate here begun and unkeyed.
+/// A partial is retired only when this member began it, or the peer that did
+/// is past [`PEER_GRACE`](crate::branch_ingest::reader::PEER_GRACE)
+/// ([`whose_reading`]).
 pub(crate) fn retire_crashed_partials(engine: &ConversationEngine) {
     let e = engine;
     let mut retired = 0usize;
     for (tl, path) in e.conversations_with_metadata_key(PATH_KEY) {
         let committed = e.has_conversation_metadata_key(tl, CONTENT_KEY);
-        if committed {
+        if committed || whose_reading(e, tl) != Whose::Ours {
             continue;
         }
         match e.tombstone_timeline(tl) {

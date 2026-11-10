@@ -16,6 +16,7 @@ pub mod monitored;
 pub mod order;
 pub mod plan;
 pub mod prime;
+pub mod reader;
 pub mod tie;
 pub mod units;
 pub mod walk;
@@ -223,7 +224,15 @@ impl BranchIngest {
             .into_iter()
             .filter(|c| !in_repos(&c.subject, held_back))
             .collect();
-        let p = plan(&live, &retain, &committed);
+        // A file a peer has just read stands as read here while its turns
+        // arrive: neither queued again nor tombstoned as a duplicate.
+        let planned: Vec<Committed> = committed
+            .iter()
+            .cloned()
+            .chain(code_read::arriving(ctx.engine))
+            .filter(|c| !in_repos(&c.subject, held_back))
+            .collect();
+        let p = plan(&live, &retain, &planned);
         tombstone(ctx.engine, layer.name, &p.tombstone);
         // A held file past the depth bound keeps its branches and its commit
         // current as well: the full-depth walk found it.

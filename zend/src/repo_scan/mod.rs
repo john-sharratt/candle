@@ -34,6 +34,7 @@ use zend_vfs::Oid;
 
 use crate::branch_ingest::keys::{branches_value, BRANCHES_KEY, CONTENT_KEY};
 use crate::branch_ingest::plan::Committed;
+use crate::branch_ingest::reader::{whose_reading, Whose};
 use crate::branch_ingest::units::FolderUnit;
 use crate::ingest_backlog::{self, Work};
 use crate::ingest_lease::{self, Share};
@@ -665,12 +666,18 @@ impl IngestPlan {
 /// mid-flight, and an in-flight unit is indistinguishable from a crashed one by
 /// metadata alone — both carry `dir` with no key — so sweeping there would
 /// tombstone the conversation a worker is still building. The pre-loop runs
-/// before the background ingest worker is even woken, so nothing is in flight.
+/// before the background ingest worker is even woken, so nothing of this
+/// member's is in flight — but a peer's readings are, and they replicate here
+/// begun and unkeyed, so only this member's partials, or a peer's past
+/// [`PEER_GRACE`](crate::branch_ingest::reader::PEER_GRACE), are retired
+/// ([`whose_reading`]).
 pub(crate) fn retire_crashed_partials(engine: &ConversationEngine) {
     let e = engine;
     let mut retired = 0usize;
     for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
-        if ingest_committed(|key| e.has_conversation_metadata_key(tl, key)) {
+        if ingest_committed(|key| e.has_conversation_metadata_key(tl, key))
+            || whose_reading(e, tl) != Whose::Ours
+        {
             continue;
         }
         match e.tombstone_timeline(tl) {
