@@ -51,6 +51,7 @@ use heap_census::{enter, set_thread, Scope};
 
 use super::cold_load::preallocate_pinned_scratch;
 use super::flush::{FlushRequest, PassFlush};
+use super::group_cap::GroupCap;
 use super::held_groups::{drain_in_held_groups, HeldDrain};
 use super::reserve_log::log_reserve;
 use super::resume::TurnChunkGrid;
@@ -1236,7 +1237,16 @@ fn run_pass(
     // refused 32–63 times a run while the pools sat at 41–64% efficiency through
     // the bursts. `MAX_GROUP_RESIDENCES` per hold, and a refused pass — which sets
     // `COMPACTION_WAITING` — gets in before the next one.
-    const MAX_GROUP_RESIDENCES: usize = 8;
+    //
+    // **A refused group shrinks before it waits** (`GroupCap`). The snapshot
+    // takes the oldest residences first, so a group too big for the slots its
+    // destination classes keep free is refused at the head of the queue on
+    // every pass while everything behind it waits: measured on BlackWorld
+    // (2026-11-10), the same three groups of eight refused short of 8,349 to
+    // 12,685 R16 slots for over forty minutes, `moved_residences=0` on every
+    // pass, 45 GB of native KV standing on the card and the expert zone on its
+    // floor. The ingest's own R16 writes took each gap's new arenas before the
+    // group came back. Halved, the group fits what is free and moves.
     // How often one pass waits for a gap and runs a turned-away group again,
     // and how long it waits for each: a gap is milliseconds under load, so the
     // bound is for a scheduler that has stopped looping, not a slow one.
@@ -1248,6 +1258,7 @@ fn run_pass(
     let mut hot_to_warm_count: usize = 0;
     let mut install_ms = 0u64;
     'policies: for cc in policies {
+        let mut cap = GroupCap::new();
         loop {
             let Some(mut group_guard) = try_migrate_flight() else {
                 deferred_groups += 1;
@@ -1267,8 +1278,8 @@ fn run_pass(
                     whole
                 })
                 .collect();
-            let more = read.len() > MAX_GROUP_RESIDENCES;
-            read.truncate(MAX_GROUP_RESIDENCES);
+            let more = read.len() > cap.get();
+            read.truncate(cap.get());
             let group: Vec<(ResidenceIndex, Vec<SealedSequence>)> =
                 read.iter().map(|(idx, hot)| (*idx, hot.to_vec())).collect();
             // The hot copies the migrate reads, which its installs replace only
@@ -1356,6 +1367,14 @@ fn run_pass(
             // one sent while this pass was already running — and the rest of the
             // backlog moves on without a caller waiting on it.
             flush.at_group(hot_to_warm_bytes);
+            if count > 0 {
+                cap.moved();
+            }
+            // A group turned away for want of slots runs again at once, at half
+            // its size, while it has a size to give up.
+            if wave_deferred && count == 0 && cap.refused() {
+                continue;
+            }
             // **A group a forward turned away runs again at the next gap, in
             // this pass.** It needed an arena that could only be made between
             // forwards; the scheduler makes every owed arena in its next gap,

@@ -183,7 +183,12 @@ target(c)   = clamp( ceil(pending × factor(c)),
 class's target (`ChunkGidPool::set_reserve_target`), and
 `BackingInner::owe_reserves` sets the targets and owes the shortfall at the
 top of every `create_deferred_arenas`. The native classes keep their one-arena
-floor because the migrate never writes them.
+floor. The migrate does write one of them: R16 is a K candidate, the fallback
+for a block no smaller format holds, so a group's quantize can need R16 slots
+too. But the native slots live in that class outnumber the migrate's share of
+it, so no factor read from it would size the migrate's demand, and the ingest's
+own R16 writes take the class's free slots as fast as the gap makes them. §2c
+is what keeps the migrate moving there.
 
 **Grows at the gap, shrinks under the sweep, never thrashes.**
 - **Grow.** `owe_reserves` owes class c an arena whenever
@@ -198,6 +203,32 @@ floor because the migrate never writes them.
 
 **What it replaces.** The fixed one-arena-per-class headroom of §2 becomes this
 target's floor. It is one rule, not two.
+
+## 2c. A refused group shrinks before it waits
+
+A pass snapshots the oldest pending residences first, up to
+`MAX_GROUP_RESIDENCES`, and a quantize short of destination slots refuses the
+whole group. Refused, the group used to wait for a gap and then end the pass.
+The next pass took the same residences, so a group too big for what its
+classes keep free stood at the head of the queue for good. Measured on
+BlackWorld on 4801 (2026-11-10, a full re-read of `code_reading`):
+- the same three groups of eight were refused short of 8,349, 8,857 and 12,685
+  R16 slots for over forty minutes;
+- every pass line read `moved_residences=0`;
+- 45 GB of native KV stood on the card, and the expert zone sat on its floor
+  at a 6–17% hit rate.
+
+Each gap made the arenas the group was owed. The ingest's R16 writes filled
+them before the group returned.
+
+So the group size is a cap the pass adjusts (`persistence/group_cap.rs`,
+`GroupCap`):
+- **Halved** by every refusal, and the smaller group is tried at once, before
+  any gap wait. One residence needs a few hundred to a few thousand slots of a
+  class, which the class almost always has free.
+- **Doubled back** towards `MAX_GROUP_RESIDENCES` by every group that moves.
+- **One residence refused** waits for the gap as before (`await_owed_arenas`,
+  `MAX_GAP_RETRIES`).
 
 ## 2b. Logging for the next attempt
 
