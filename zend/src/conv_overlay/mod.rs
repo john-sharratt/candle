@@ -13,12 +13,14 @@
 //! [`restore`] puts each store on its branch and replays its events back into
 //! it.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use candle_conversation::persistence::vfs::{VfsEventId, VfsEventPayload, VfsWrite};
 use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
-use store_events::FileLog;
+use store_events::replay::{by_repo, replay_repo};
+use store_events::{FileLog, UNRESTORED};
 use zend_vfs::RepoFiles;
 
 pub use store_events::Mirror;
@@ -78,11 +80,59 @@ pub fn restore(
     store_events::restore(&Engine(engine), timeline, files, mirror);
 }
 
+/// Make `files`, a fresh set, what `timeline` left them — each repository on
+/// the conversation's branch and its events replayed into it — **reading
+/// only**. What the connector's file tools read a conversation through
+/// (`docs/mcp_file_tools.md` §2.1).
+///
+/// Unlike [`restore`] it writes nothing: a repository whose events do not
+/// replay is answered rather than moved aside, and no mirror is made, so a
+/// read leaves the conversation exactly as it found it (MCP request-path
+/// invariant 2). Answers each repository that could not be put back, with why;
+/// one moved aside by an earlier restore is not a repository and is passed
+/// over.
+pub fn view(
+    engine: &ConversationEngine,
+    timeline: TimelineId,
+    files: &RepoFiles,
+) -> Result<Vec<(String, String)>, String> {
+    let branches = engine
+        .conversation_state(timeline)
+        .map(|state| state.branches)
+        .unwrap_or_default();
+    let events = engine
+        .conversation_files(timeline)
+        .map_err(|e| e.to_string())?;
+    Ok(put_back(files, &branches, events))
+}
+
+/// Put `files` on `branches` and replay `events` into them — [`view`]'s
+/// work, apart from the engine it reads them from. The repositories that
+/// could not be put back, each with why.
+fn put_back(
+    files: &RepoFiles,
+    branches: &BTreeMap<String, String>,
+    events: Vec<VfsEventPayload>,
+) -> Vec<(String, String)> {
+    let mut refused = files.set_branches(branches);
+    let mut snapshots = BTreeMap::new();
+    for (repo, events) in by_repo(events) {
+        if repo.contains(UNRESTORED) {
+            continue;
+        }
+        match replay_repo(&events) {
+            Ok(replayed) => {
+                snapshots.insert(repo, replayed.snapshot);
+            }
+            Err(why) => refused.push((repo, why)),
+        }
+    }
+    refused.extend(files.restore(snapshots));
+    refused
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use store_events::replay::{by_repo, replay_repo};
     use zend_vfs::{RepoSpec, Workspace};
 
     use super::*;
@@ -146,5 +196,51 @@ mod tests {
             fresh.repo("uploads").unwrap().read_bytes(&stored).unwrap(),
             Some(png)
         );
+    }
+
+    /// **A read puts a conversation's changes back and says what it could
+    /// not**: the change reads back from a fresh set, a repository moved aside
+    /// by an earlier restore is passed over, and one whose events are no
+    /// events is named with why — and no mirror is made, so nothing is
+    /// written.
+    #[test]
+    fn a_read_puts_the_changes_back_and_names_what_it_could_not() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("uploads")).unwrap();
+        let ws = Workspace::new(dir.path(), vec![RepoSpec::named("uploads")]).unwrap();
+        let files = RepoFiles::overlay(ws).unwrap();
+        let stored = crate::uploads::store(
+            &files.repo("uploads").unwrap(),
+            "notes.txt",
+            b"the 213 rows".to_vec(),
+        )
+        .unwrap();
+        let write = Mirror::of(BTreeMap::new()).diff(&files.snapshots());
+        let event = |repo: &str, seq: u64, key: &str, body: serde_json::Value| VfsEventPayload {
+            timeline_id: 1,
+            origin: 0xB,
+            seq,
+            repo: repo.into(),
+            key: key.into(),
+            body,
+        };
+        let mut events: Vec<VfsEventPayload> = write
+            .events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| event(&e.repo, i as u64, &e.key, e.body.clone()))
+            .collect();
+        let aside = format!("uploads{UNRESTORED}-1");
+        events.push(event(&aside, 90, "x", serde_json::json!({"kind": "base"})));
+        events.push(event("broken", 91, "x", serde_json::json!("no event")));
+
+        let fresh = files.fresh();
+        let refused = put_back(&fresh, &BTreeMap::new(), events);
+        assert_eq!(
+            fresh.repo("uploads").unwrap().read_bytes(&stored).unwrap(),
+            Some(b"the 213 rows".to_vec())
+        );
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].0, "broken");
     }
 }

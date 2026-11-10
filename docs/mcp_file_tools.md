@@ -47,6 +47,30 @@ reader can take a picture as well as a page. This is what an app preview loads
 itself from (`docs/yenbot_preview.md` §3): the framework and an app's files in
 one call rather than one call each.
 
+### 2.1 A conversation's files
+
+All three also take `conv`: a conversation's id, as the web UI's `#conv=` link
+names it, or a task's (`mcp:…`). With it they read the repositories **as that
+conversation left them** — each on the branch the conversation works on, with
+its uncommitted changes — rather than as committed. That is how a change a
+conversation made, and never committed, is taken out of it: read it here, then
+commit it with `file_edit_and_commit`.
+
+- **Who may name one is the web routes' rule** (`ownership`): a conversation
+  the web UI made opens for an Admin alone, a task's for its owner and an
+  Admin. One the caller may not open, and one that is not there, are answered
+  alike, so a refusal never says a conversation exists.
+- **It only reads.** The conversation's file events are replayed into fresh
+  stores (`conv_overlay::view`), never through the restore a conversation's own
+  turn uses, which moves a repository whose events do not replay aside and so
+  writes. A repository that cannot be put back is named in the answer, with
+  why, and reads as committed.
+- **It reads what this member has applied.** The events are replicated, so any
+  member answers; a round sealing on another member that very moment may not
+  have reached it yet.
+- A caller below an Admin never sees the memory's repository, here as
+  everywhere on the connector.
+
 ## 3. `file_edit_and_commit`
 
 ### 3.1 The call

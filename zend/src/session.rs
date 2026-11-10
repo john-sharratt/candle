@@ -503,6 +503,11 @@ fn dials_metadata(
     ])
 }
 
+/// A context over a conversation's files as it left them, and the
+/// repositories that could not be put back, each with why
+/// ([`ZendSession::conversation_tools`]).
+pub type ConversationTools = (Arc<ToolContext>, Vec<(String, String)>);
+
 /// The composer dials a conversation last ran under, as the levels the GUI's
 /// dials are set from.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -7853,6 +7858,37 @@ impl ZendSession {
             .tool_host
             .context_for(ToolMode::Comprehensive, &files, "");
         Some((ctx, state.base_branches.clone()))
+    }
+
+    /// What the connector's repository tools read a conversation's files
+    /// through (`docs/mcp_file_tools.md` §2.1): a context over the
+    /// repositories as `conv_id` left them — each on the conversation's
+    /// branch, with its uncommitted changes — made by replaying its file
+    /// events, which writes nothing. Answers the repositories that could not
+    /// be put back, each with why. The caller has already been checked against
+    /// the conversation (`ownership`); the memory's repository is hidden from
+    /// a caller below an admin, as [`Self::repository_tools`] hides it.
+    /// `None` while the model is not loaded.
+    pub fn conversation_tools(
+        &self,
+        role: AccessRole,
+        conv_id: &str,
+    ) -> Option<Result<ConversationTools, String>> {
+        let state = self.loaded()?;
+        let files = state.tool_host.conversation_files();
+        let refused =
+            match conv_overlay::view(&state.engine, conversation_timeline(conv_id), &files) {
+                Ok(refused) => refused,
+                Err(e) => return Some(Err(e)),
+            };
+        let files = match role.at_least(AccessRole::Admin) {
+            true => files,
+            false => Arc::new(memory_hidden(&files)),
+        };
+        let ctx = state
+            .tool_host
+            .context_for(ToolMode::Comprehensive, &files, "");
+        Some(Ok((ctx, refused)))
     }
 
     /// `GET /v1/conversations/{id}/journal`: the journal's entries as the

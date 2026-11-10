@@ -2,7 +2,8 @@
 //! (`docs/mcp_file_tools.md` §2): the workers' own tools — the same
 //! definitions, the same arguments, the same answers — run over the workspace
 //! as it is committed, so what claude.ai reads is what `file_edit_and_commit`
-//! edits. They only read.
+//! edits; or, given `conv`, over the workspace as that conversation left it
+//! (§2.1). They only read.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -11,6 +12,9 @@ use web::auth::Role;
 use zend_tools::ToolContext;
 
 use super::{Answer, Ctx, LOADING};
+use crate::mcp::chats::dialogue::not_there;
+use crate::mcp::ownership::{percent_decode, Viewer};
+use crate::session::ConversationTools;
 use crate::tool_def;
 use crate::tools::{run_tool, ToolCall};
 
@@ -20,8 +24,11 @@ pub const NAMES: [&str; 3] = ["file_read", "file_list", "file_search"];
 /// What the connector says beside a worker's description: where the files
 /// come from.
 const FROM: &str = " On the connector these read the repositories as they are committed \
-    (their main branch unless a tool names another), never a conversation's own changes; \
-    `file_edit_and_commit` edits them.";
+    (their main branch unless a tool names another) — or, given `conv`, as that conversation \
+    left them, its uncommitted changes included; `file_edit_and_commit` edits them.";
+
+/// The connector's own argument naming a conversation to read through.
+const CONV: &str = "conv";
 
 /// The most files one `file_read` with `paths` reads.
 const MAX_PATHS: usize = 64;
@@ -41,6 +48,10 @@ pub fn definition(name: &str) -> Value {
     let def = tool_def::find(name).unwrap_or_else(|| panic!("the catalog defines {name}"));
     let mut schema = def.parameters.clone();
     let mut description = format!("{}{FROM}", def.description);
+    schema["properties"][CONV] = json!({
+        "type": "string",
+        "description": "Read as this conversation left them: its id, as the web UI's `#conv=` link names it, or a task's. Only a conversation you may open is read.",
+    });
     if name == "file_read" {
         schema["properties"]["paths"] = json!({
             "type": "array",
@@ -102,14 +113,76 @@ fn read_paths(tools: &ToolContext, repo: &str, paths: &[String]) -> Answer {
     Answer::ok(json!({"repo": repo, "files": files}).to_string())
 }
 
+/// The context a call reads through — the repositories as committed, or,
+/// `conv` named, as that conversation left them — and the repositories the
+/// conversation's changes could not be put back into, each with why.
+/// `Ok(None)` while the model is loading.
+fn context(ctx: &Ctx, conv: Option<&str>) -> Result<Option<ConversationTools>, String> {
+    let Some(raw) = conv else {
+        return Ok(ctx
+            .session
+            .repository_tools(ctx.caller.role)
+            .map(|(tools, _)| (tools, Vec::new())));
+    };
+    let id = percent_decode(raw.trim());
+    // Checked as the web routes check it, and refused as not there either
+    // way: a refusal never says a conversation exists.
+    let listed = || {
+        ctx.session
+            .list_conversations(true)
+            .iter()
+            .any(|c| c.id == id)
+    };
+    if !Viewer::of_caller(&ctx.caller).may_open(&id) || !listed() {
+        return Err(not_there(&id));
+    }
+    match ctx.session.conversation_tools(ctx.caller.role, &id) {
+        None => Ok(None),
+        Some(Ok(tools)) => Ok(Some(tools)),
+        Some(Err(e)) => Err(format!(
+            "conversation `{id}`'s changes could not be read: {e}"
+        )),
+    }
+}
+
 /// Run worker tool `name` with `args`.
 pub fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
     if !ctx.caller.role.at_least(Role::User) {
         return Answer::error("reading the repositories is a user's; you are a guest");
     }
-    let Some((tools, _)) = ctx.session.repository_tools(ctx.caller.role) else {
-        return Answer::error(LOADING);
+    let conv = match args.get(CONV) {
+        None => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => return Answer::error("`conv` is a conversation's id"),
     };
+    let (tools, unrestored) = match context(ctx, conv) {
+        Ok(Some(found)) => found,
+        Ok(None) => return Answer::error(LOADING),
+        Err(e) => return Answer::error(e),
+    };
+    // The worker tool takes no `conv`: it reads whatever its context holds.
+    let mut args = args.clone();
+    if let Some(map) = args.as_object_mut() {
+        map.remove(CONV);
+    }
+    let answer = read(&tools, name, &args);
+    if unrestored.is_empty() {
+        return answer;
+    }
+    let mut note = String::from(
+        "\n\nThe conversation's changes could not be put back in these repositories, which read as committed:",
+    );
+    for (repo, why) in unrestored {
+        note.push_str(&format!("\n- {repo}: {why}"));
+    }
+    Answer {
+        text: answer.text + &note,
+        ..answer
+    }
+}
+
+/// Run worker tool `name` with `args` against `tools`.
+fn read(tools: &ToolContext, name: &str, args: &Value) -> Answer {
     if let (true, Some(paths)) = (name == "file_read", args.get("paths")) {
         let Some(repo) = args.get("repo").and_then(Value::as_str) else {
             return Answer::error("`repo` names the repository the paths are in");
@@ -118,10 +191,10 @@ pub fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
             Ok(p) => p,
             Err(e) => return Answer::error(format!("`paths` is not a list of paths: {e}")),
         };
-        return read_paths(&tools, repo, &paths);
+        return read_paths(tools, repo, &paths);
     }
     let answer = run_tool(
-        &tools,
+        tools,
         &ToolCall {
             name: name.to_string(),
             arguments: args.clone(),
@@ -147,8 +220,11 @@ mod tests {
         for name in ["file_list", "file_search"] {
             let def = definition(name);
             let catalog = tool_def::find(name).unwrap();
+            let mut want = catalog.parameters.clone();
+            want["properties"][CONV] = def["inputSchema"]["properties"][CONV].clone();
             assert_eq!(def["name"], name);
-            assert_eq!(def["inputSchema"], catalog.parameters);
+            assert_eq!(def["inputSchema"], want);
+            assert_eq!(def["inputSchema"]["properties"][CONV]["type"], "string");
             assert_eq!(def["annotations"]["readOnlyHint"], true);
             assert!(def["description"].as_str().unwrap().ends_with(FROM));
         }
@@ -162,6 +238,7 @@ mod tests {
         let catalog = tool_def::find("file_read").unwrap();
         let mut want = catalog.parameters.clone();
         want["properties"]["paths"] = def["inputSchema"]["properties"]["paths"].clone();
+        want["properties"][CONV] = def["inputSchema"]["properties"][CONV].clone();
         if let Some(r) = want["required"].as_array_mut() {
             r.retain(|r| r != "path");
         }
