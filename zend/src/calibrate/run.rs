@@ -33,7 +33,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle_conversation::chain_health::chain_break;
-use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::projection::{
     DecodePriority, GroupId, OptionalState, Reserved, SelectionState, TimelineId,
     NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
@@ -145,44 +144,6 @@ pub struct Frame<'a> {
     pub thinking: Arc<TriggerRegistry>,
 }
 
-/// Mark each archived calibration of `priors` not being retired, and not
-/// marked yet, provenance-only — the state [`seal_calibration`] leaves a
-/// calibration in. Returns how many it marked. A calibration's K/V is never
-/// written to disk, so until it is marked another member holds its turns as
-/// still arriving.
-fn mark_sealed_distilled(
-    engine: &ConversationEngine,
-    priors: &[Prior<'_>],
-    retired: &[TimelineId],
-) -> usize {
-    let mut marked = 0;
-    for prior in to_mark(priors, retired, |tl| engine.is_timeline_distilled(tl)) {
-        match engine.distill_timeline(prior, DistillMode::ProvenanceOnly) {
-            Ok(()) => marked += 1,
-            Err(e) => tracing::warn!(
-                target: "zend::calibrate",
-                timeline = prior.raw(),
-                "marking a sealed calibration provenance-only failed: {e}",
-            ),
-        }
-    }
-    marked
-}
-
-/// The archived calibrations of `priors` that are not in `retired` and that
-/// `distilled` does not already report marked.
-fn to_mark(
-    priors: &[Prior<'_>],
-    retired: &[TimelineId],
-    distilled: impl Fn(TimelineId) -> bool,
-) -> Vec<TimelineId> {
-    priors
-        .iter()
-        .filter(|p| p.archived && !retired.contains(&p.timeline) && !distilled(p.timeline))
-        .map(|p| p.timeline)
-        .collect()
-}
-
 /// Calibrate every unit of `layer` that is ready and not calibrated — those
 /// its ingest did not calibrate as it committed them ([`calibrate_committed`])
 /// — and retire every calibration of a unit no longer there.
@@ -221,15 +182,6 @@ pub fn calibrate_layer(
             if e.tombstone_timeline(tl).is_ok() {
                 report.retired += 1;
             }
-        }
-        let marked = mark_sealed_distilled(e, &priors, &todo.retire);
-        if marked > 0 {
-            tracing::info!(
-                target: "zend::calibrate",
-                layer = %spec.layer,
-                marked,
-                "sealed calibrations marked provenance-only",
-            );
         }
         todo
     };
@@ -723,31 +675,6 @@ mod tests {
         assert_eq!(failures_of(Some("m:1 2"), "m:1"), 2);
         assert_eq!(failures_of(Some("m:1 2"), "m:2"), 0);
         assert_eq!(failures_of(Some("garbled"), "m:1"), 0);
-    }
-
-    /// Only an archived calibration that is staying and is not marked yet is
-    /// marked: one still being sealed, one being retired, and one marked
-    /// already are left alone.
-    #[test]
-    fn only_a_sealed_unmarked_calibration_is_marked() {
-        let [sealed, sealing, retiring, marked] =
-            [21u64, 22, 23, 24].map(|raw| TimelineId::from_raw(raw).unwrap());
-        let prior = |timeline, archived| Prior {
-            timeline,
-            marker: "m",
-            unit: "u",
-            archived,
-        };
-        let priors = [
-            prior(sealed, true),
-            prior(sealing, false),
-            prior(retiring, true),
-            prior(marked, true),
-        ];
-        assert_eq!(
-            to_mark(&priors, &[retiring], |tl| tl == marked),
-            vec![sealed]
-        );
     }
 
     /// **Every keyed unit is found; only a whole, finished one is ready.** A

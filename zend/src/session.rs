@@ -99,7 +99,9 @@ use crate::branch_ingest::filter::IngestScope;
 use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY};
 use crate::branch_ingest::{moves_branches, BranchIngest, LayerPass};
 use crate::calibrate::thinking::thinking_of;
-use crate::calibrate::{calibrate_layer, Frame as CalibrateFrame, Layer as CalibrateLayer};
+use crate::calibrate::{
+    calibrate_layer, mark_sealed, Frame as CalibrateFrame, Layer as CalibrateLayer,
+};
 use crate::code_read::{FILE_READ_TOOL, PATH_KEY};
 use crate::coding_sampling;
 use crate::config::{DaemonConfig, SelfCheck};
@@ -3365,6 +3367,8 @@ impl InferenceState {
     /// where they are calibrated, together with whatever an earlier pass or a
     /// restart left.
     fn calibrate_layers(&self) {
+        // Every sealed calibration, of any layer, declaring one or not.
+        mark_sealed(&self.engine);
         for (il, _) in &self.branch_layers {
             if crate::ingest_cancel::cancelled() {
                 return;

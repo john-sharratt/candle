@@ -22,6 +22,7 @@
 //! are calibrated without being read again, and a unit read again — a new
 //! version, a changed prompt — is calibrated again.
 
+pub mod mark;
 pub mod permits;
 pub mod plan;
 pub mod questions;
@@ -31,6 +32,7 @@ pub mod seal;
 pub mod spec;
 pub mod thinking;
 
+pub use mark::mark_sealed;
 pub(crate) use run::calibration_meta;
 pub use run::{calibrate_committed, calibrate_layer, Frame, Layer, Report};
 pub(crate) use seal::seal_calibration;

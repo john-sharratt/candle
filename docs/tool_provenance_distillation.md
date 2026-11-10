@@ -86,10 +86,12 @@ happens:
   carried the same gate: 105,679 of BlackWorld's own turns in the calibration
   layer held no chunk and no marker. The marker is what completes them there:
   applying a remote `Distilled` record makes each of its timeline's turns a
-  candidate for adoption. Each pass marks what is already sealed — the tool
-  calibration's resume filter its archived exemplars, a layer's pass
-  (`calibrate_layer`) its archived calibrations — so a store sealed under the
-  gate is repaired at its next load.
+  candidate for adoption. What is already sealed is marked as it is found —
+  the tool calibration's resume filter its archived exemplars, and every
+  layer pass first every archived calibration in the substrate, of any layer
+  (`calibrate::mark_sealed`), since a layer that no longer declares
+  `calibrate:` runs no pass of its own — so a store sealed under the gate is
+  repaired at its next load.
 
 Together: the marker set is monotonic (it only grows, one marker a timeline),
 and the trigger is a ratio that the reclaim itself drives down.
