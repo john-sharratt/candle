@@ -196,6 +196,19 @@ impl Observe<'_> {
             }
         }
     }
+
+    /// The one of `members` this pass is about: the member its tags name. A
+    /// tool turn is tagged with the tool it called, as the warm-up's exemplars
+    /// are, so its seal leaves that tool out of the tool's own background — a
+    /// tool called on many turns would otherwise carry its own hits as
+    /// background and read lower the more it is used. `None` when the pass
+    /// teaches nothing, or its tags name no member.
+    fn answer<'m>(&self, members: impl IntoIterator<Item = &'m str>) -> Option<&'m str> {
+        match self {
+            Observe::No => None,
+            Observe::Yes { tags, .. } => members.into_iter().find(|m| tags.iter().any(|t| t == m)),
+        }
+    }
 }
 
 /// Whether a group's backgrounds can be learned by self-match.
@@ -207,8 +220,8 @@ impl Observe<'_> {
 /// additive-fusion group warms.
 ///
 /// And exchange-scored: a file-scored group's files are cases of its pool
-/// scope, whose levels live traffic teaches; a file's self-match would teach
-/// that scope nothing but the file's own ceiling.
+/// scope, whose backgrounds live traffic teaches; a file's self-match would
+/// teach that scope nothing but the file's own ceiling.
 fn is_warmable(group: &GroupSchema) -> bool {
     group.is_scanned()
         && group.policy.scan.fusion == FusionMode::Additive
@@ -1368,8 +1381,8 @@ impl Conversation {
             // Concept A: read each member's score against its background on the
             // collection's band, learned from the TAIL scan's raw scores (the
             // stored whole-turn signature, matching the turn-group learn path).
-            // `observe` runs at seal only, and knows no answer: a live turn
-            // teaches every member.
+            // `observe` runs at seal only: a turn teaches every member's
+            // background but the member it was for ([`Observe::answer`]).
             let scope = ScopeKey::collection(coll.id.raw() as u64, coll.name.as_str());
             let pairs = |v: &[f32]| -> Vec<(ChildKey, f32)> {
                 coll.sections
@@ -1398,7 +1411,10 @@ impl Conversation {
                 // achieve that.
                 if let (true, Some(source)) = (observe.teaches(&coll.policy.tags), observe.source())
                 {
-                    cache.observe(&scope, source, &raw_pairs, None, t_tail);
+                    let answer = observe
+                        .answer(coll.sections.iter().map(|s| s.name.as_str()))
+                        .map(ChildKey::named);
+                    cache.observe(&scope, source, &raw_pairs, answer.as_ref(), t_tail);
                 }
                 (normed, normed_q)
             };
@@ -5804,6 +5820,26 @@ mod tests {
 
     fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **A sealed tool turn is about the tool its tags name**, and a pass that
+    /// teaches nothing, or names no member, is about none.
+    #[test]
+    fn a_tool_turn_is_about_the_tool_its_tags_name() {
+        let members = ["datetime", "file_read", "git_grep"];
+        let turn = tags(&["tool", "file_read"]);
+        let seal = Observe::Yes {
+            tags: &turn,
+            source: 7,
+        };
+        assert_eq!(seal.answer(members), Some("file_read"));
+        let dialogue = tags(&["tool"]);
+        let none = Observe::Yes {
+            tags: &dialogue,
+            source: 8,
+        };
+        assert_eq!(none.answer(members), None);
+        assert_eq!(Observe::No.answer(members), None);
     }
 
     /// A conversation names its substrate's node and the last `oseq` it

@@ -87,10 +87,12 @@ formula the normalization gate measured best (`provenance_gates normalization`,
   share of its own bin above it. Counts commute, so a background — and every
   score read against it — is the same whatever order its evidence arrived in.
 - **A probe's known answer is left out of its background.** A warm-up exemplar
-  is about its own tool, an ingest self-probe about its own exchange: those
-  scores are the hit, not what a hit is measured against. A live seal knows no
-  answer and teaches every candidate — which is what mutes a hub: its loud
-  scores on everything become its own background.
+  is about its own tool, an ingest self-probe about its own exchange, a sealed
+  tool turn about the tool its tags name (`Observe::answer` — so a tool called
+  on many turns does not carry its own hits as background): those scores are
+  the hit, not what a hit is measured against. A dialogue seal names no answer
+  and teaches every candidate — which is what mutes a hub: its loud scores on
+  everything become its own background.
 - **Past everything the background holds** a score keeps rising one nat per nat
   of `ln(1 + x)` from the top bin's edge, so two scores beyond the whole
   background still rank by size.
@@ -539,9 +541,6 @@ Tuning constants used: `α_up 0.30`, `α_dn 0.02`, `HIT_PRIOR 400`, `FLOOR_PCTL 
 - **Live threshold confirmation**: re-measure the normalized distribution on the
   live reprojection probe to confirm `min_score` / `evict` on the background band
   (§3.2).
-- **Popular members**: a live seal knows no answer, so a tool used on a large
-  share of turns carries its own hits in its background and reads lower over
-  time. Naming a sealed tool turn's called tool as its answer would remove that.
 - **Sub-window scope**: normalize file-within-listing selection (self-referencing
   sub-windows) once the coarser scopes are in — the fine half of the group →
   sub-window nesting (§3.3).

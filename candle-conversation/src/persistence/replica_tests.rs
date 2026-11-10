@@ -1,6 +1,8 @@
 //! **The applied set, the deferred set and the location index through the
 //! store** (`docs/replicated_substrate.md` §6.2, §6.5, §14.1).
 
+use std::sync::{Arc, Mutex};
+
 use tempfile::TempDir;
 
 use super::identity::RecordIdentity;
@@ -192,4 +194,27 @@ fn a_standalone_node_writes_no_replica() {
     let (_, sp) = open(&dir);
     assert_eq!(sp.open_census.get(RecordType::Replica), 0);
     assert_eq!(sp.open_census.get(RecordType::DebugId), 1);
+}
+
+/// **A record that never leaves this member is not tapped to be sent**, and
+/// still counts as written: a peer's catch-up lists it gone instead of
+/// fetching it.
+#[test]
+fn a_local_only_record_is_written_but_never_tapped() {
+    let dir = TempDir::new().unwrap();
+    let (_, mut sp) = open(&dir);
+    let tapped = Arc::new(Mutex::new(Vec::new()));
+    let into = Arc::clone(&tapped);
+    sp.set_tap(Box::new(move |oseq| into.lock().unwrap().push(oseq)));
+    let template = sp
+        .append_record(RecordType::Template, 0, 0, 0, 0, 0, b"{{ messages }}")
+        .unwrap();
+    let tokens = sp
+        .append_record(RecordType::Tokens, 0, 9, 0, 0, 0, &[1, 2])
+        .unwrap();
+    assert_eq!(*tapped.lock().unwrap(), vec![tokens.identity.oseq]);
+    assert!(sp.own_written().contains(template.identity.oseq));
+    let node = sp.node();
+    let listing = sp.list(node, template.identity.oseq, tokens.identity.oseq);
+    assert_eq!(listing.gone, vec![template.identity.oseq]);
 }

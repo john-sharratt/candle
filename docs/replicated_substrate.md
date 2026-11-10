@@ -2469,7 +2469,11 @@ lists such a record gone (`persistence/listing.rs`), and a requester counts any 
 listed gone too (`Store::travels`, whatever the answerer runs): the requester marks the
 `oseq` applied, and its applied set has no hole there. Listed as a record, it was
 fetched, refused and fetched again on every try of every catch-up — a member joining
-`.5` on 2026-10-17 refused 164 of them and caught up on nothing.
+`.5` on 2026-10-17 refused 164 of them and caught up on nothing. **Nor is it sent
+live:** its writer counts it written but never taps it (`track_identity`), so a peer
+learns of the `oseq` from the writer's announced high water and a gap catch-up lists
+it gone. Tapped, the template every restart writes was sent, refused and left a hole
+on both members (2026-11-11).
 
 **Taking the substrate lock.** Apply takes the substrate write lock once per batch and
 never nests a read inside a held guard. Windows SRW locks deadlock on that
