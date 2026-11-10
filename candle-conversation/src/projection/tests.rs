@@ -560,6 +560,19 @@ fn every_declared_layer_is_gathered_until_the_mutator_clears_it() {
     assert!(b.layer(ground).unwrap().gathered);
 }
 
+/// A plain-prompt schema's dialogue window is its fixed 32,768 until the
+/// mutator sets another; a name that is not a layer changes nothing.
+#[test]
+fn a_layer_window_is_set_by_name() {
+    let mut b = Builder::for_plain_prompt("You are helpful.", SectionId::new(7));
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    assert_eq!(b.layer(dialogue).unwrap().window, 32_768);
+    assert!(b.set_layer_window("dialogue", 262_144));
+    assert_eq!(b.layer(dialogue).unwrap().window, 262_144);
+    assert!(!b.set_layer_window("response", 1));
+    assert_eq!(b.layer(dialogue).unwrap().window, 262_144);
+}
+
 #[test]
 fn decode_priority_defaults_to_low_and_parses_normal_and_high() {
     // Unset → Low.

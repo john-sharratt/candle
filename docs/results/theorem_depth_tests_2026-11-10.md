@@ -167,6 +167,47 @@ recurrent state, so this control alone does not separate K/V from recurrence;
 the needles-first and needles-last arms, whose recurrence saw the needles first
 and last respectively, argue against the recurrence.
 
+### Isolating the mechanism: the context a sealed turn's K/V was computed in
+
+Two further tests (`recall_against_sealing_depth`, `sealing_or_reading_under_projection`).
+
+**Sealing depth.** 131K of history, C10, production decode, the needles moved:
+
+| Needles at | Stream behind the first needle | Recalled | Needles projected |
+|---:|---:|---:|---:|
+| 0.00 | 5,039 | 4/4 | 4/4 |
+| 0.10 | 18,291 | 4/4 | 4/4 |
+| 0.20 | 31,337 | 1/4 | 4/4 |
+| 0.30 | 44,227 | 0/4 | 3/4 |
+| 0.45 | 65,112 | 0/4 | 2/4 |
+| 0.70 | 97,008 | 0/4 | 4/4 |
+
+The slot position of the needles does not decide it (at 0.20 they sat at 2.8K–8.7K
+of the slot, where the 0.00 and 0.10 needles also sat, and still failed).
+
+**Sealing against reading.** The needles 65K deep; the plain-prompt dialogue window
+(fixed at 32,768 — `Builder::set_layer_window` moves it) set to 262,144, so the
+conversation is never projected, or to the production 32,768, once for the inserts
+and again for the question:
+
+| Sealed under | Read under | Recalled | Turns held |
+|---|---|---:|---:|
+| 262K (the true history) | 262K (the true history) | **4/4** | 64 |
+| 262K | 32K (a selection) | 0/4 | 15 |
+| 32K (a projection) | 262K (the true history) | 1/4 | 64 |
+| 32K | 32K (production) | 0/4 | 18 |
+
+with the forwarded control above (sealed and read in the same 32K selection)
+recalling every code its selection held. Every match of sealing context and reading
+context recalls; every mismatch fails, in either direction. A sealed turn's K/V is
+readable in the context it was computed in, and — past ~20–30K tokens of preceding
+context at its sealing — not in another. RoPE does not enter: keys are stored
+un-rotated and the slot positions are within the first rung. What carries the
+context is the activation itself: a token's K and V at an attention layer are
+projections of its residual stream, which by the deep layers is dominated by what
+earlier attention and the DeltaNet recurrence wrote into it from the context before
+it.
+
 ### The first design, and why it was replaced
 
 A first run (same day) placed the needles in the first ~32K tokens. Every arm

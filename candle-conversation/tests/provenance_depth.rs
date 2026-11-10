@@ -43,10 +43,12 @@
 //! Run with the card to itself: the daemon stopped.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use candle::Device;
 use candle_conversation::decode_diag::{self, Arm as DiagCapture, Control};
+use candle_conversation::projection::Builder as Projection;
 use candle_conversation::{
     models::{Model, ModelBuilder},
     ConversationEngine, ProjectionEvent, SamplingConfig, SequenceConfig, TurnEvent,
@@ -757,6 +759,236 @@ fn recall_with_the_selection_forwarded() {
         !projected.selected.is_empty(),
         "the projected run recorded no selection to forward"
     );
+}
+
+/// Where in the 131K history the needles are sealed, for
+/// [`recall_against_sealing_depth`].
+const SEALING_DEPTHS: [f64; 6] = [0.0, 0.1, 0.2, 0.3, 0.45, 0.7];
+
+/// **Recall against the depth the needles were sealed at**, everything else
+/// held: 131K of history, C10, the production decode, the question last.
+///
+/// A projected question decodes through the recurrent state left by the whole
+/// history whichever arm it is, so the question side does not vary here; what
+/// varies is the recurrent state each needle turn was sealed through. A sealed
+/// turn's attention K/V is computed from a residual stream that passed the
+/// DeltaNet layers at its sealing, with the recurrence as it stood then, and
+/// each insert's attention context is capped at the working set. If recall
+/// falls with the depth of the stream behind the needles, the sealed K/V is
+/// conditioned by the recurrence it was sealed through.
+#[test]
+#[ignore = "loads Flash-Next and inserts 131K tokens of history per depth; \
+            run with --ignored --nocapture --test-threads=1, daemon stopped"]
+fn recall_against_sealing_depth() {
+    let device = Device::new_cuda(0).expect("CUDA device");
+    let b = builder();
+    let tok = b
+        .resolve_model(&device)
+        .expect("model pack resolved")
+        .tokenizer()
+        .expect("tokenizer");
+    let files = source_files();
+    let ws = workspace();
+    let eng = builder()
+        .workspace_path(ws.path())
+        .engine(&device)
+        .expect("engine");
+    let count = |s: &str| tok.encode(s, false).map(|e| e.len()).unwrap_or(0);
+    let mut rows = Vec::new();
+    for at in SEALING_DEPTHS {
+        let script = history(&tok, &files, DIAG_DEPTH, at);
+        let first = needle_positions(&script)[0] as usize;
+        let behind: usize = script[..first].iter().map(|t| count(t)).sum();
+        let arm = DiagArm {
+            label: "sealing depth",
+            control: Control::Sparse,
+            needles_at: at,
+        };
+        let d = diagnose(&eng, &b, &arm, &script);
+        println!(
+            "[sealed at {at:.2}] {behind} tokens of stream behind the first needle · {}/4 · \
+             {}/4 projected",
+            d.recalled, d.projected
+        );
+        rows.push((at, behind, d));
+    }
+    println!("\n### Recall against sealing depth — {DIAG_DEPTH} tokens, C10\n");
+    println!(
+        "| Needles at | Stream behind the first needle (tok) | Recalled | Needles projected | \
+         Queries reading a needle | Answer |"
+    );
+    println!("|---:|---:|---:|---:|---:|---|");
+    for (at, behind, d) in &rows {
+        println!(
+            "| {at:.2} | {behind} | {}/4 | {}/4 | {}/{} | {} |",
+            d.recalled,
+            d.projected,
+            d.reading,
+            d.queries,
+            d.answer.replace('\n', " / ")
+        );
+    }
+    assert_eq!(rows.len(), SEALING_DEPTHS.len(), "every depth ran");
+}
+
+/// A wider working set for [`recall_with_a_wider_working_set`].
+const WIDE_WORKING_SET: usize = 65_536;
+
+/// **The sealing-depth cliff, with the working set moved.** At a 32K slot,
+/// recall holds for needles sealed with 18K of stream behind them and is gone
+/// at 31K and beyond — the boundary at which a conversation's own turns start
+/// to be prefilled against a projected slot rather than against its contiguous
+/// history. With the slot at 64K, needles sealed 44K deep were prefilled
+/// against the contiguous history again: if recall returns there, and fails
+/// for needles sealed past 64K, the cause is sealing under a projection, not
+/// the depth of the stream.
+#[test]
+#[ignore = "loads Flash-Next at a 64K slot and inserts 131K tokens of history per cell; \
+            run with --ignored --nocapture --test-threads=1, daemon stopped"]
+fn recall_with_a_wider_working_set() {
+    let device = Device::new_cuda(0).expect("CUDA device");
+    let b = builder().max_seq_len(WIDE_WORKING_SET);
+    let tok = b
+        .resolve_model(&device)
+        .expect("model pack resolved")
+        .tokenizer()
+        .expect("tokenizer");
+    let files = source_files();
+    let ws = workspace();
+    let eng = builder()
+        .max_seq_len(WIDE_WORKING_SET)
+        .workspace_path(ws.path())
+        .engine(&device)
+        .expect("engine");
+    let count = |s: &str| tok.encode(s, false).map(|e| e.len()).unwrap_or(0);
+    let mut rows = Vec::new();
+    for at in [0.3, 0.6] {
+        let script = history(&tok, &files, DIAG_DEPTH, at);
+        let first = needle_positions(&script)[0] as usize;
+        let behind: usize = script[..first].iter().map(|t| count(t)).sum();
+        let arm = DiagArm {
+            label: "64K working set",
+            control: Control::Sparse,
+            needles_at: at,
+        };
+        let d = diagnose(&eng, &b, &arm, &script);
+        println!(
+            "[64K slot, sealed at {at:.2}] {behind} tokens of stream behind the first needle · \
+             {}/4 · {}/4 projected",
+            d.recalled, d.projected
+        );
+        rows.push((at, behind, d.recalled, d.projected));
+    }
+    assert_eq!(rows.len(), 2, "both cells ran");
+}
+
+/// A dialogue window wide enough that a 131K conversation is never projected.
+const WHOLE_WINDOW: usize = 262_144;
+
+/// The plain-prompt projection [`ConversationEngine::new_conversation`] builds,
+/// with its dialogue window set to `window`.
+fn plain_projection(
+    eng: &ConversationEngine,
+    cfg: &SequenceConfig,
+    prompt: &str,
+    window: usize,
+) -> Projection {
+    let inner = prompt
+        .strip_prefix(cfg.dialect.system_start)
+        .unwrap_or(prompt);
+    let inner = inner.strip_suffix(cfg.dialect.system_end).unwrap_or(inner);
+    let frame = eng.plain_prompt_section(inner).expect("the frame section");
+    let mut builder = Projection::for_plain_prompt(inner, frame);
+    assert!(
+        builder.set_layer_window("dialogue", window),
+        "a plain prompt has a dialogue layer"
+    );
+    builder
+}
+
+/// **Sealing under projection, against reading under projection.** At 131K
+/// of history with the needles sealed 65K deep, the dialogue window is set to
+/// 262K (the conversation is never projected: each turn is prefilled against
+/// its contiguous history, and read whole) or to the production 32K, once for
+/// the inserts and again for the question.
+#[test]
+#[ignore = "loads Flash-Next and inserts 131K tokens of history per arm; \
+            run with --ignored --nocapture --test-threads=1, daemon stopped"]
+fn sealing_or_reading_under_projection() {
+    let device = Device::new_cuda(0).expect("CUDA device");
+    let b = builder();
+    let tok = b
+        .resolve_model(&device)
+        .expect("model pack resolved")
+        .tokenizer()
+        .expect("tokenizer");
+    let files = source_files();
+    let ws = workspace();
+    let eng = builder()
+        .workspace_path(ws.path())
+        .engine(&device)
+        .expect("engine");
+    let script = history(&tok, &files, DIAG_DEPTH, NEEDLES_AT);
+    let needles = needle_positions(&script);
+    let mut rows = Vec::new();
+    for (seal, read) in [
+        (WHOLE_WINDOW, WHOLE_WINDOW),
+        (WHOLE_WINDOW, WORKING_SET),
+        (WORKING_SET, WHOLE_WINDOW),
+        (WORKING_SET, WORKING_SET),
+    ] {
+        let mut cfg = b.conversation_config();
+        cfg.kv_compression_level = Some(10);
+        let prompt = b.format_system_prompt();
+        let sealing = plain_projection(&eng, &cfg, &prompt, seal);
+        let layer = sealing.id_for_layer("dialogue").expect("dialogue layer");
+        let group = sealing.schema().layers[0].groups[0].id;
+        let mut conv = eng
+            .new_conversation_with_projection(&prompt, sealing, layer, group, cfg.clone())
+            .expect("new conversation");
+        for t in &script {
+            conv.insert_turn(t.as_str(), reply(t))
+                .unwrap_or_else(|e| panic!("[seal {seal}] insert_turn failed: {e}"));
+        }
+        conv.set_projection(Arc::new(plain_projection(&eng, &cfg, &prompt, read)));
+        let handle = conv.submit_turn(QUESTION).expect("submit the question");
+        let mut points: Vec<ProjectionEvent> = Vec::new();
+        let mut done = None;
+        for event in handle.stream() {
+            match event {
+                TurnEvent::Projection(p) => points.push(p),
+                TurnEvent::Done(r) => done = Some(r),
+                TurnEvent::Error(e) => panic!("[seal {seal}, read {read}] decoding failed: {e}"),
+                _ => {}
+            }
+        }
+        let response = done.expect("the question finished");
+        conv.finish_turn(handle, &response).expect("finish_turn");
+        conv.close().expect("close");
+        let last = points.last().map(|p| &p.selection.turns);
+        let held = last.map_or(0, |t| t.len());
+        let projected = last.map_or(0, |t| {
+            t.iter().filter(|s| needles.contains(&s.index)).count()
+        });
+        let got = recalled(&response.text);
+        println!(
+            "[sealed under a {seal} window, read under {read}] {got}/4 · needles projected \
+             {projected}/4 of {held} turns held — {:?}",
+            answer(&response.text)
+        );
+        rows.push((seal, read, got, projected, held));
+    }
+    println!(
+        "\n### Sealing or reading under projection — {DIAG_DEPTH} tokens, needles 65K deep, C10\n"
+    );
+    println!(
+        "| Sealed under window | Read under window | Recalled | Needles projected | Turns held |"
+    );
+    println!("|---:|---:|---:|---:|---:|");
+    for (seal, read, got, projected, held) in &rows {
+        println!("| {seal} | {read} | {got}/4 | {projected}/4 | {held} |");
+    }
+    assert_eq!(rows.len(), 4, "every arm ran");
 }
 
 #[cfg(test)]

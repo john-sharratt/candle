@@ -492,6 +492,24 @@ impl Builder {
         }
     }
 
+    /// Set a layer's token window, by schema name: the most of its turns one
+    /// projection carries. Returns whether the layer was found.
+    ///
+    /// A YAML schema states its windows; a programmatic one
+    /// ([`Self::for_plain_prompt`]) takes a fixed one, and this is how a caller
+    /// asks for another — a conversation held whole to a depth the fixed window
+    /// would project, for one. Like [`Self::set_layer_gathered`], it is applied
+    /// before the first projection.
+    pub fn set_layer_window(&mut self, name: &str, window: usize) -> bool {
+        match self.schema.layers.iter_mut().find(|l| l.name == name) {
+            Some(l) => {
+                l.window = window;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// This builder, held to the target's own conversation ([`Schema::focus`]):
     /// what a question about the conversation itself is projected under.
     pub fn focused(&self) -> Builder {
