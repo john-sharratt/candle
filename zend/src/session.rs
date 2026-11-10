@@ -161,7 +161,7 @@ use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, memory_hidden, run_tool_calls,
     Dispatch, ToolCall, ToolHost, ToolResult, CALIB_TOOL_SELECTOR,
 };
-use crate::turn_claims;
+use crate::turn_claims::{self, NotTaken};
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
 use crate::worker_hop;
 use crate::working_set::coverage::Coverage;
@@ -6355,12 +6355,23 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
             // and finishes it itself (`turn_claims::take`).
             let claim = match turn_claims::take(&conv_id).await {
                 Ok(claim) => claim,
-                Err(holder) => {
+                Err(NotTaken::Held(holder)) => {
                     tracing::info!(
                         conv_id = %conv_id,
                         call_turn,
                         holder = format_args!("{holder:016x}"),
                         "resume: another member holds the conversation and runs its round",
+                    );
+                    continue;
+                }
+                // Not held complete here: the member that let it go finished
+                // the round or left it for one that holds it.
+                Err(NotTaken::Incomplete) => {
+                    tracing::warn!(
+                        conv_id = %conv_id,
+                        call_turn,
+                        "resume: this member does not hold the conversation complete; its round \
+                         is left to one that does",
                     );
                     continue;
                 }

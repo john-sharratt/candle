@@ -54,6 +54,24 @@ pub fn committed_by(committed: impl Fn(&str) -> bool + Send + Sync + 'static) {
     let _ = COMMITTED.set(Box::new(committed));
 }
 
+/// Whether the conversation a claim key names was let go by another member
+/// through records this member has not yet applied — installed with the
+/// handovers (`handover::install`).
+type Awaited = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+static AWAITED: OnceLock<Awaited> = OnceLock::new();
+
+/// Answer [`take`]'s question with `awaited`.
+pub fn awaited_by(awaited: impl Fn(&str) -> bool + Send + Sync + 'static) {
+    let _ = AWAITED.set(Box::new(awaited));
+}
+
+/// Whether this member still awaits the records the conversation `key` was
+/// last let go through.
+fn awaiting(key: &str) -> bool {
+    AWAITED.get().is_some_and(|awaited| awaited(key))
+}
+
 /// Let a finished turn's claim go once its conversation is committed.
 ///
 /// **The seal is not the last record.** A turn seals in its own loop and the
@@ -123,6 +141,18 @@ pub fn hold(key: &str) -> Option<ClaimUse> {
     Some(member.use_claim(key.as_bytes()))
 }
 
+/// Whether another live member holds the conversation `key` names: something
+/// there — a turn, a request answering — is using it now. `false` on a member
+/// not joined to a cluster.
+pub fn held_elsewhere(key: &str) -> bool {
+    let Some(member) = MEMBER.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        return false;
+    };
+    member
+        .holder_of(key.as_bytes())
+        .is_some_and(|holder| holder != member.node())
+}
+
 /// How often [`take`] looks for the member's admission.
 const ADMISSION_POLL: Duration = Duration::from_millis(250);
 
@@ -138,19 +168,50 @@ const ADMISSION_POLL: Duration = Duration::from_millis(250);
 /// at once, one sealing turns 85–87 over the other's recurrent state parked at
 /// 84, whose next turn then failed reading it back.
 ///
-/// `Err(holder)` when another live member holds the claim: that member is
-/// writing the conversation, and this one must leave it alone. Waits for the
-/// member's admission first, because the claims are learned there — before it
-/// every key reads as free. `Ok(None)` on a member not joined to a cluster.
-pub async fn take(key: &str) -> Result<Option<ClaimUse>, u64> {
+/// **And it takes only a conversation it holds complete.** A request reaches a
+/// member the gateway placed it on, and after a release the gateway places it
+/// only on a member that has reported holding the conversation complete
+/// through the release (`handover`). A resumed turn is placed by nobody, so it
+/// asks the same thing itself: a member that took a conversation let go a
+/// moment ago, its last turns not yet applied here, would resume a round its
+/// releaser had already finished, from history that stops short of it — the
+/// duplicate run of 2026-11-09 was working from exactly such a copy, and
+/// believed the last question asked was a different one.
+///
+/// `Err` when another live member holds the claim — that member is writing
+/// the conversation, and this one must leave it alone — or when this member
+/// still lacks the records it was let go through after [`COMPLETE_WAIT`].
+/// Waits for the member's admission first, because the claims are learned
+/// there — before it every key reads as free. `Ok(None)` on a member not
+/// joined to a cluster.
+pub async fn take(key: &str) -> Result<Option<ClaimUse>, NotTaken> {
     let Some(member) = MEMBER.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return Ok(None);
     };
     while !member.admitted() {
         sleep(ADMISSION_POLL).await;
     }
+    let started = Instant::now();
+    while awaiting(key) {
+        if started.elapsed() >= COMPLETE_WAIT {
+            return Err(NotTaken::Incomplete);
+        }
+        sleep(ADMISSION_POLL).await;
+    }
     match member.claim(key.as_bytes()) {
-        Check::Held(holder) => Err(holder),
+        Check::Held(holder) => Err(NotTaken::Held(holder)),
         Check::Mine | Check::Took(_) => Ok(Some(member.use_claim(key.as_bytes()))),
     }
+}
+
+/// How long [`take`] waits for the records a conversation was let go through.
+const COMPLETE_WAIT: Duration = Duration::from_secs(60);
+
+/// Why [`take`] did not take a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotTaken {
+    /// Another live member, this node, holds it.
+    Held(u64),
+    /// It was let go through records this member has not applied.
+    Incomplete,
 }

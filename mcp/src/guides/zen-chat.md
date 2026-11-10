@@ -62,3 +62,20 @@ last number you read to page on.
 every message ceased. A chat left alone is deleted twelve hours after its last
 message. A call naming a deleted chat says it is not open: send with no `chat`
 to start again.
+
+## Speaking in one of the user's conversations
+
+When the user asks you to say something in one of their conversations in the
+web UI, pass that conversation's id — what its `#conv=` link names — as `chat`.
+`zen_chat_send {chat, text}` is then the conversation's next turn, exactly as if
+the user had typed it, at the conversation's own dials, and kept with it;
+`zen_chat_read {chat}` reads it from the user's last message on. Only a
+conversation the user can open is reached, and `zen_chat_close` never takes
+one.
+
+- **Only when the user asks.** It is their conversation: say in it what they
+  asked you to say, and nothing on your own account.
+- **Say the whole instruction.** The conversation reads its own history, not
+  your context.
+- **Read the reply before you report it**, and check what it says it did against
+  what it cites, as you would any worker's answer.

@@ -21,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 use web::auth::forwarded::identify;
 use web::auth::{Role, Roles};
 
-use super::caller::Person;
+use super::caller::{Caller, Person};
 use crate::api::CONVERSATION_HEADER;
 use crate::session::ZendSession;
 
@@ -59,6 +59,17 @@ impl Viewer {
         }
     }
 
+    /// `caller`, as the role table ranks them now — what a `/mcp` tool that
+    /// names a conversation asks with, so it opens exactly what the web
+    /// routes would open for the same person.
+    pub fn of_caller(caller: &Caller) -> Viewer {
+        if caller.is_admin() {
+            Viewer::Admin
+        } else {
+            Viewer::Person(caller.key())
+        }
+    }
+
     /// Whether this viewer may open `conv_id`.
     pub fn may_open(&self, conv_id: &str) -> bool {
         match self {
@@ -80,7 +91,7 @@ pub fn may_open(conv_id: &str, headers: &HeaderMap, roles: &Roles) -> bool {
 /// Not the gateway's `content::percent_decode`, which refuses `%2F` because it
 /// guards a file path: a worker's conversation id holds a `/`, written `%2F`
 /// in a path segment, and must decode to it.
-fn percent_decode(segment: &str) -> String {
+pub(crate) fn percent_decode(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -218,6 +229,29 @@ mod tests {
         let nobody = Viewer::of(&HeaderMap::new(), &roles);
         assert_eq!(nobody, Viewer::Nobody);
         assert!(!nobody.may_open(&alices) && !nobody.may_open(&others));
+    }
+
+    /// **A `/mcp` caller opens what the web routes would open for them**: an
+    /// Admin a web UI conversation, a user only their own task's.
+    #[test]
+    fn a_callers_viewer_is_the_web_routes_viewer() {
+        let caller = |sub: &str, role: Role| Caller {
+            person: Person {
+                provider: "google".into(),
+                sub: sub.into(),
+                email: String::new(),
+                name: String::new(),
+            },
+            role,
+        };
+        let admin = Viewer::of_caller(&caller("boss", Role::Admin));
+        let alice = Viewer::of_caller(&caller("alice", Role::User));
+        assert_eq!(admin, Viewer::Admin);
+        assert_eq!(alice, Viewer::Person(key("alice")));
+        let web = "425bad8d-769b-4e3c-a85b-d2e3eef0fd5c";
+        assert!(admin.may_open(web));
+        assert!(!alice.may_open(web));
+        assert!(alice.may_open(&format!("mcp:{}:review/verify", key("alice"))));
     }
 
     #[test]

@@ -9,7 +9,9 @@
 //! | [`talk`] | A send, a read, and Zen's answer said as a message |
 //! | [`dispose`] | Disposing of a chat: tombstone its conversations, cease its records |
 //! | [`sweep`] | The sweep that disposes of the chats closed or idle |
+//! | [`dialogue`] | The same tools on a conversation of the web UI's, named by its id |
 
+pub mod dialogue;
 pub mod dispose;
 pub mod naming;
 pub mod record;

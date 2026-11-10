@@ -79,6 +79,20 @@ pub fn install(
     timeline_of: fn(&str) -> TimelineId,
 ) {
     let awaited: Arc<Mutex<Awaited>> = Arc::default();
+    {
+        // A turn this member starts with no request behind it — a resumed one —
+        // takes the conversation only once it holds it complete, as the
+        // gateway places a request only on a member that does
+        // (`turn_claims::take`).
+        let awaited = awaited.clone();
+        turn_claims::awaited_by(move |id| {
+            awaited
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys
+                .contains_key(id.as_bytes())
+        });
+    }
     let holds = {
         let conversation = conversation.clone();
         move |key: &[u8], by: u64, through: u64| {

@@ -23,8 +23,8 @@ worker's evidence. A chat is a conversation, and disposing of it keeps nothing.
 
 | Tool | Does | Returns |
 |---|---|---|
-| `zen_chat_send {text, chat?, effort?, wait_s?}` | Sends `text` to Zen on the chat `chat` names, or opens a new chat when it names none, and waits up to `wait_s` (45 by default) for the answer. Zen thinks at `effort` — `balanced` by default, so a chat answers soonest | The chat's id, Zen's answer, or that Zen is still answering and what it is doing |
-| `zen_chat_read {chat, after?, wait_s?}` | Reads the chat's messages after message `after`; with no `after`, Zen's messages since Claude's last one. While Zen is answering and nothing new is there, waits up to `wait_s` (45 by default) | The messages, each numbered, and whether Zen is still answering |
+| `zen_chat_send {text, chat?, effort?, wait_s?}` | Sends `text` to Zen on the chat `chat` names, or opens a new chat when it names none, and waits up to `wait_s` (45 by default) for the answer. Zen thinks at `effort` — `balanced` by default, so a chat answers soonest. `chat` may instead name a web UI conversation (§6) | The chat's id, Zen's answer, or that Zen is still answering and what it is doing |
+| `zen_chat_read {chat, after?, wait_s?}` | Reads the chat's messages after message `after`; with no `after`, Zen's messages since Claude's last one. While Zen is answering and nothing new is there, waits up to `wait_s` (45 by default). `chat` may instead name a web UI conversation (§6) | The messages, each numbered, and whether Zen is still answering |
 | `zen_chat_close {chat}` | Disposes of the chat now. A Zen answer still running is stopped at its next tool round and the chat is disposed of as it ends | `disposed`, or `closing` until the answer stops |
 
 Every answer names the chat (``Chat `<id>` with Zen: …``), so the id is in
@@ -190,3 +190,55 @@ person's worker conversations to them and to Admins
 - `workers.rs`: a chat turn settles done with its reply, never as a question; a
   chat worker's notes are not entered.
 - `mcp/src/context.rs`: no chat tool is ever an episode.
+- `chats/dialogue/target.rs`: a chat's id names the chat, a web UI conversation's
+  id the conversation; a task's conversation, escaped or not, is pointed at
+  `repo_task_reply`; nothing else of any other shape is taken.
+- `chats/dialogue/mod.rs`: a send carries the conversation's own dials, and a
+  named effort overrides its effort; a read with no `after` starts after the last
+  message a person wrote; a read renders each message under its number.
+- `chats/dialogue/reply.rs`: a finished stream is its text and done; a failed one
+  says why after what it wrote; a body cut at the deadline is read to its last
+  whole frame.
+- `chats/dialogue/prose.rs`: a reply loses its reasoning and says its calls; an
+  unclosed block runs to the end; a round's results are counted.
+- `ownership.rs`: a `/mcp` caller's viewer opens what the web routes would open
+  for the same person.
+
+## 6. Speaking in a conversation of the web UI's
+
+`chat` may name a conversation of the web UI's by its id, as the UI's `#conv=`
+link names it (`chats/dialogue/`), when the user asks Claude to speak in it. The
+message is that conversation's next turn — kept, as the conversation is; nothing
+of §2–§4 applies to it, and `zen_chat_close` takes only a chat's id, so it can
+never dispose of one.
+
+**A send is the web UI's own request, sent for the caller.** It goes up the
+member's socket to a gateway as `POST /v1/chat/completions` for that
+conversation, stating the caller's identity (`ops::up`), so it meets everything a
+person's browser meets: the gateway places the turn on the member holding the
+conversation's claim — or, the claim let go, on one holding the conversation
+complete (`docs/cooperative_admission.md` §2.2) — and the route checks the
+caller's role and that they may open the conversation. Nothing in the tool
+decides where a turn runs or who may run one. The request carries the
+conversation's own dials (`ZendSession::conversation_dials`), since the web UI
+sends its composer's on every turn and a turn without them would reset them;
+an `effort` named overrides the effort.
+
+**Who may name one is the web routes' rule** (`ownership`): a conversation the
+web UI made names no owner and opens for an Admin alone. One the caller may not
+open, and one that is not there, are answered alike, so a refusal never says a
+conversation exists. A task's conversation (`mcp:…`) is refused and pointed at
+`repo_task_reply`, since a turn sent past its worker would leave the worker's
+state behind; an archived conversation takes no turn.
+
+A send is refused while the conversation answers — a turn live on the member
+asked, or the claim held by another — naming `zen_chat_read`. A send waits up to
+`wait_s` reading the turn's stream; a turn still running when the wait ends
+runs on, and `zen_chat_read` reads it.
+
+A read gives the conversation's messages as a reader wants them: reasoning
+dropped, each call as `[called <tool>]`, a round's results as a count, each
+message at most 6,000 characters. With no `after` it starts after the last
+message a person wrote. It waits, as a chat's read does, while Zen answers and
+nothing new is there; the turn's rounds reach the member asked replicated, so it
+looks every two seconds.
