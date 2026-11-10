@@ -2159,6 +2159,37 @@ mod tests {
         );
     }
 
+    /// **A moved reserve settles: it does not churn at the bottom.** Released
+    /// from region 487 over a hole at 57, the reserve is made again at 57 — the
+    /// lowest free region a claim takes — and the next sweep, whose lowest hole
+    /// is now the region it left, keeps it. Nothing below it is free, so nothing
+    /// releases it again: the free-and-remake loop at the bottom of the span
+    /// cannot come back.
+    #[test]
+    fn a_moved_reserve_settles_where_it_was_made_again() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        pool.keep_reserve(key);
+        let top = standing_arena(&pool, key);
+        pool.set_arena_rank(key, top, 487);
+        assert_eq!(pool.next_tombstone(key, Some(57)), Some(top));
+        pool.recycle_arena_index(top);
+
+        let remade = standing_arena(&pool, key);
+        pool.set_arena_rank(key, remade, 57);
+        assert_eq!(
+            pool.next_tombstone(key, Some(487)),
+            None,
+            "the only hole is the region it left, above it: it stays"
+        );
+        assert_eq!(
+            pool.next_tombstone(key, None),
+            None,
+            "nothing free at all: it stays"
+        );
+        assert_eq!(pool.pool_arena_load(key)[0].0, remade);
+    }
+
     /// **A class with no reserve is swept from the top of the span down.**
     #[test]
     fn an_unreserved_class_is_swept_from_the_highest_place() {
