@@ -1105,11 +1105,13 @@ fn process_one_dir(
             .fork_unit(base)
             .map_err(|err| anyhow::anyhow!("repo_map conv create: {err}"))?;
         ctx.link_stage("recording its parent");
-        // The priming chain is this conversation's parent, recorded BEFORE its
-        // own listing and summary run, so its turns are projected with the
-        // chain already in context (`Substrate::inherited_chain`). Metadata
-        // only: nothing is copied, and the parent needs no residency of its own.
-        if let Some(parent) = ctx.chain_end {
+        // A priming-chain link records the link before it as its parent BEFORE
+        // its own listing and summary run, so its turns are projected with the
+        // chain so far in context (`Substrate::inherited_chain`). Every other
+        // folder has no parent and is sealed behind the system prompt alone:
+        // a turn's K/V carries the context it was computed in
+        // (`RefreshContext::link_parent`).
+        if let Some(parent) = ctx.link_parent {
             engine
                 .set_forked_from(conv.timeline_id(), parent)
                 .map_err(|err| anyhow::anyhow!("repo_map priming-chain parent: {err}"))?;

@@ -42,7 +42,7 @@ pub(crate) fn ingest_link(
     }
     let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, layer_name)?;
     let link_ctx = RefreshContext {
-        chain_end: parent,
+        link_parent: parent,
         band: Some(PRIMING_BAND),
         ..ctx.clone()
     };

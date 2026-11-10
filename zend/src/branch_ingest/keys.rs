@@ -87,10 +87,17 @@ pub const COMMIT_KEY: &str = "commit";
 /// anchors written inline and `page` calls, which nothing reads any more, and
 /// its parts were carved with doc comments cut from their items.
 ///
+/// 5: a `code_reading` file or `repo_map` folder that is not a priming-chain
+/// link is sealed behind the system prompt alone, never parented on the chain
+/// (`RefreshContext::link_parent`). A unit read under 4 was sealed behind the
+/// chain's ~32K tokens, and its K/V is unreadable to a dialogue that does not
+/// hold the chain directly ahead of it
+/// (`docs/results/theorem_depth_tests_2026-11-10.md`).
+///
 /// Every key states its version as a `v<N>:` prefix ([`key_version`]), so a
 /// member can tell a unit read under a NEWER version — a peer's, upgraded before
 /// it — from one it should replace, and leaves it alone.
-pub const KEY_VERSION: u32 = 4;
+pub const KEY_VERSION: u32 = 5;
 
 /// The first key version that writes its `v<N>:` prefix — the oldest a
 /// folder's earlier reading can be recomputed at ([`dir_key_at`]). A key from
@@ -123,7 +130,7 @@ pub fn branches_value(names: &[String]) -> String {
 }
 
 /// A file's key: the [`KEY_VERSION`], its workspace-relative path and its blob
-/// id — `v4:candle/zend/src/main.rs@3f73f872…`. The path is in it because the
+/// id — `v5:candle/zend/src/main.rs@3f73f872…`. The path is in it because the
 /// ingested conversation names the path; the blob id is git's hash of the
 /// bytes `file_read` returns.
 pub fn file_key(path: &str, blob: &Oid) -> String {
@@ -131,7 +138,7 @@ pub fn file_key(path: &str, blob: &Oid) -> String {
 }
 
 /// The workspace-relative path a [`file_key`] names — `candle/zend/src/main.rs`
-/// out of `v4:candle/zend/src/main.rs@3f73f872…`. `None` for a key that is not a
+/// out of `v5:candle/zend/src/main.rs@3f73f872…`. `None` for a key that is not a
 /// file's.
 pub fn file_key_path(key: &str) -> Option<&str> {
     let rest = match key.strip_prefix('v').and_then(|r| r.split_once(':')) {
@@ -222,7 +229,7 @@ mod tests {
     fn a_file_key_is_its_path_and_blob() {
         assert_eq!(
             file_key("candle/zend/src/main.rs", &oid(A)),
-            "v4:candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
+            "v5:candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
         );
     }
 
@@ -252,6 +259,10 @@ mod tests {
         };
         assert_eq!(
             dir_key("r/a/", &listing, None),
+            "v5:ff2927dcd0d14d5f55786e927196c304a025b3325e3e647456e62916f8b3449c"
+        );
+        assert_eq!(
+            dir_key_at(4, "r/a/", &listing, None),
             "v4:5c5a50fdde36f12cb3a142b3bdccb922f3a0af5790a964a8a31a1830935f9302"
         );
         let hint = ModuleHint::CargoPackage {

@@ -1,12 +1,17 @@
-//! The priming chain: the foundational reading every conversation in the
-//! system — dialogue and ingest alike — descends from
+//! The priming chain: the foundational reading every dialogue descends from
 //! (`docs/zend_workspace_execution.md` §6).
 //!
 //! ```text
 //! for each repository, in the workspace's order:
 //!   its root listing -> README -> ARCHITECTURE -> AGENTS -> CLAUDE
-//! -> base_conv, and every other repo_map folder and code_reading file
+//! -> base_conv
 //! ```
+//!
+//! No other `repo_map` folder or `code_reading` file descends from it: each is
+//! sealed behind the system prompt alone, because a turn's K/V carries the
+//! context it was computed in, and a file sealed behind the chain is
+//! unreadable to a dialogue that does not hold the chain directly ahead of it
+//! (`RefreshContext::link_parent`).
 //!
 //! There is no link for the workspace itself: every file operation works
 //! inside one repository, and the repositories are named to the model by

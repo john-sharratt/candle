@@ -180,14 +180,16 @@ The base conversation every dialogue forks from descends from the **priming chai
 ```
 for each repository, in the manifest's order:
   its root listing -> README -> ARCHITECTURE -> AGENTS -> CLAUDE
--> base_conv, and every other repo_map folder and code_reading file
+-> base_conv
 ```
+
+Every dialogue descends from the chain through `base_conv`. No other `repo_map` folder or `code_reading` file does: each is sealed behind the system prompt alone, from the prompt's recurrent checkpoint, with no parent. A turn's K/V carries the context it was computed in. A file sealed behind the chain's ~32K tokens was measured unreadable by a reader that did not hold the chain directly ahead of it (0/4 codes recalled, every needle turn in the slot), and read whole by one that did. The same file sealed alone was read with the chain ahead of it (4/4; `recall_with_and_without_the_priming_prefix`, `docs/results/theorem_depth_tests_2026-11-10.md`). The analysis layers above still descend from the chain's end (`RefreshContext::chain_end`).
 
 There is no link for the workspace itself: every file operation works inside one repository, and the repositories are named to the model by every tool's `repo` enum.
 
 Each link records the one before it as its parent (`set_forked_from`) before its own reading starts, so every turn of it is projected with the chain behind it, and by the last link the conversation has genuinely read every listing and document before it, in order. The link is a durable pointer, not a copy. Every link is an ordinary unit of its layer, keyed by content (`docs/zend_branch_ingest.md` §6): a link already committed is re-pointed at the link before it, never read again, and the pass that follows finds every link committed. Each repository contributes the version its **default branch** holds — one base conversation serves every branch, and the default branch is the one a conversation starts on. An anchor a repository lacks is skipped (matched case-insensitively, at its root only), and a repository not under git contributes nothing.
 
-The chain is built once per boot, before `ready` (the `Priming` load step) and before the ingest worker's first pass, so the first question asked already has it and every unit ingested afterwards records its end as its parent. It follows the default branches as they stand at boot; a later move of one is picked up by the next boot's chain.
+The chain is built once per boot, before `ready` (the `Priming` load step) and before the ingest worker's first pass, so the first question asked already has it. It follows the default branches as they stand at boot; a later move of one is picked up by the next boot's chain.
 
 ---
 

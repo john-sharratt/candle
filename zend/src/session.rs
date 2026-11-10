@@ -3285,6 +3285,7 @@ impl InferenceState {
             ),
             retrieval: &self.retrieval_scope,
             chain_end: *self.chain_end.lock().unwrap(),
+            link_parent: None,
             band: None,
             think_for: Some({
                 let steering = self.think_steering.clone();
@@ -3332,8 +3333,9 @@ impl InferenceState {
     /// Build the priming chain and hang the base conversation off its end, so
     /// every dialogue — a fork of `base_conv` inherits its lineage — starts
     /// with the workspace listing, each repository's root listing and its
-    /// anchor documents already read. Every ingest unit read after this
-    /// records the same end as its parent (`RefreshContext::chain_end`).
+    /// anchor documents already read. An analysis layer's unit read after this
+    /// records the same end as its parent (`RefreshContext::chain_end`); a
+    /// `code_reading` file or `repo_map` folder records none.
     fn prime(&self, progress: &LoadProgress) -> anyhow::Result<()> {
         if self.branch_layers.is_empty() {
             return Ok(());

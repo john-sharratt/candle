@@ -51,12 +51,19 @@ pub struct RefreshContext<'a> {
     pub tool_ctx: Arc<ToolContext>,
     /// Told whenever a unit commits, so the next turn's scope can find it.
     pub retrieval: &'a RetrievalScope,
-    /// The conversation a unit's new conversation descends from: the priming
-    /// chain's end (`crate::branch_ingest::prime`), or — while the chain is
-    /// being built — the link before the one being read. Recorded as the
-    /// unit's parent before its reading starts, so its turns are projected
-    /// with the chain already in context. `None` when there is no chain.
+    /// The priming chain's end (`crate::branch_ingest::prime`): the conversation
+    /// an analysis layer's unit descends from when its job names no parent of
+    /// its own (`crate::layers`). `None` when there is no chain.
     pub chain_end: Option<TimelineId>,
+    /// The link before the one being read, while a priming-chain link is read
+    /// (`code_read::ingest_link`, `repo_scan::ingest_link`): recorded as the
+    /// link's parent before its reading starts, so the chain reads in order.
+    /// `None` for every other `code_reading` file and `repo_map` folder, which
+    /// are sealed behind the system prompt alone: a turn's K/V carries the
+    /// context it was computed in, and a file sealed behind the chain was
+    /// measured unreadable by a reader that does not hold the chain directly
+    /// ahead of it (`docs/results/theorem_depth_tests_2026-11-10.md`).
+    pub link_parent: Option<TimelineId>,
     /// The band a unit's new conversation decodes at in place of its layer's
     /// ([`Self::fork_unit`]). `None` for the layer's own: only a priming-chain
     /// link names one ([`PRIMING_BAND`]).

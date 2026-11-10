@@ -943,24 +943,26 @@ fn process_one_file(
         let conv = ctx
             .fork_unit(base)
             .map_err(|err| anyhow::anyhow!("code_reading conv create: {err}"))?;
-        // The priming chain is this conversation's parent, recorded BEFORE its
-        // own reading starts, so every turn below is projected with the chain
-        // already in context (`Substrate::inherited_chain`). Nothing is copied
-        // and the parent needs no residency of its own: an ancestor sitting
-        // warm or cold is elevated by the ordinary working-set path when it is
-        // selected.
+        // A priming-chain link records the link before it as its parent BEFORE
+        // its own reading starts, so its turns are projected with the chain so
+        // far in context (`Substrate::inherited_chain`). Every other file has
+        // no parent: it is sealed behind the system prompt alone, from the
+        // prompt's recurrent checkpoint the fork installed, because a turn's
+        // K/V carries the context it was computed in — a file sealed behind
+        // the chain is unreadable to a dialogue that does not hold the chain
+        // directly ahead of it (`RefreshContext::link_parent`).
         {
             let e = ctx.engine;
-            if let Some(parent) = ctx.chain_end {
+            if let Some(parent) = ctx.link_parent {
                 e.set_forked_from(conv.timeline_id(), parent)
                     .map_err(|err| anyhow::anyhow!("code_reading priming-chain parent: {err}"))?;
             }
             e.set_timeline_summarize(conv.timeline_id(), false);
         }
-        // Now that the lineage is on record, take the recurrent memory of the
-        // conversation this one continues — the slot was seeded from its own
-        // (empty) timeline when the fork returned.
-        if ctx.chain_end.is_some() {
+        // Now that a link's lineage is on record, take the recurrent memory of
+        // the link it continues — the slot was seeded with the system prompt's
+        // checkpoint when the fork returned.
+        if ctx.link_parent.is_some() {
             if let Err(err) = conv.seed_recurrent_from_lineage() {
                 tracing::warn!(
                     target: "zend::code_read::ingest",
@@ -1334,7 +1336,7 @@ mod tests {
         };
         assert_eq!(
             job.key(),
-            "v4:candle/src/lib.rs@ce013625030ba8dba906f756967f9e9ca394464a"
+            "v5:candle/src/lib.rs@ce013625030ba8dba906f756967f9e9ca394464a"
         );
     }
 

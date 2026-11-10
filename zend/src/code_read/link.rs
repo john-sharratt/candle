@@ -45,7 +45,7 @@ pub(crate) fn ingest_link(
         }
     }
     let link_ctx = RefreshContext {
-        chain_end: parent,
+        link_parent: parent,
         band: Some(PRIMING_BAND),
         ..ctx.clone()
     };
