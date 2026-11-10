@@ -430,15 +430,15 @@ pub(crate) fn quantize_layers_deferred_within(
     *select_ms += t_sel.elapsed().as_millis() as u64;
 
     // Split the flat rows per layer (chunk-major, then head; assignments also ×
-    // head_dim) and finish each layer, deferring its convert into `descs_acc`.
+    // head_dim) into each layer's formats, before any layer allocates: a layer
+    // refused mid-wave owes what every layer still to allocate needs.
     let rows_per_chunk = n_kv_head;
     let assign_per_chunk = n_kv_head * head_dim;
-    let mut out: Vec<Vec<SealedSequence>> = Vec::with_capacity(backings.len());
     let mut chunk_base = 0usize;
+    let mut plans: Vec<Option<(QuantBucket, LayerFormats)>> = Vec::with_capacity(backings.len());
     for (li, bucket) in buckets.into_iter().enumerate() {
-        let seqs = &per_layer_seqs[li];
         let Some(bucket) = bucket else {
-            out.push(seqs.iter().map(|s| (*s).clone()).collect());
+            plans.push(None);
             continue;
         };
         let n_chunks = chunk_counts[li];
@@ -459,17 +459,65 @@ pub(crate) fn quantize_layers_deferred_within(
             head_dim,
         )?;
         chunk_base += n_chunks;
-        out.push(quantize_sealed_in_place_impl(
+        plans.push(Some((bucket, formats)));
+    }
+
+    // Finish each layer, deferring its convert into `descs_acc`.
+    let mut out: Vec<Vec<SealedSequence>> = Vec::with_capacity(backings.len());
+    for li in 0..plans.len() {
+        let seqs = &per_layer_seqs[li];
+        let Some(plan) = plans[li].take() else {
+            out.push(seqs.iter().map(|s| (*s).clone()).collect());
+            continue;
+        };
+        let mut owed_if_refused: Vec<(ArenaKey, usize)> = Vec::new();
+        add_layer_demand(
+            backings[li],
+            policy,
+            &plan.1.k_palette_formats,
+            &plan.1.v_palette_formats,
+            n_kv_head,
+            &mut owed_if_refused,
+        )?;
+        match quantize_sealed_in_place_impl(
             backings[li],
             seqs,
             policy,
             device,
             copy_stream,
             pinned_scratch,
-            Some(descs_acc),
-            Some((bucket, formats)),
+            Some(&mut *descs_acc),
+            Some(plan),
             Some(&mut *alloc_ms),
-        )?);
+        ) {
+            Ok(layer) => out.push(layer),
+            // **Refused mid-wave: owe the rest of the group, not this layer.**
+            // The layers share one pool per class. A group refused at one layer
+            // and owed only that layer's arenas got past it at the retry and was
+            // refused at the next — thirteen layers, thirteen gaps, while the
+            // ingest's own writes took each gap's arenas. Measured on BlackWorld
+            // (2026-11-10): one residence short ~4,200 R16 slots a layer, every
+            // retry, for forty minutes. This owes the refused layer's demand
+            // together with every layer after it; `owe_capacity` counts the
+            // arenas the refused layer already owed, so the gap makes the rest
+            // at once. The layers before it free what they claimed as the group
+            // drops, and their retry claims it back.
+            Err(e) if super::backing::BackingInner::is_wave_deferral(&e) => {
+                for (_, formats) in plans[li + 1..].iter().flatten() {
+                    add_layer_demand(
+                        backings[li],
+                        policy,
+                        &formats.k_palette_formats,
+                        &formats.v_palette_formats,
+                        n_kv_head,
+                        &mut owed_if_refused,
+                    )?;
+                }
+                backings[li].inner.owe_capacity(&owed_if_refused);
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(out)
 }
@@ -621,6 +669,37 @@ fn derive_layer_formats(
         k_palette_maps: pack_head_palette_maps(k_assignments, n_chunks, n_kv_head, head_dim)?,
         v_palette_maps: pack_head_palette_maps(v_assignments, n_chunks, n_kv_head, head_dim)?,
     })
+}
+
+/// Add to `demand` the destination slots, by class, that quantizing chunks of
+/// these formats allocates: one per `(chunk, head, palette, side)` band, in its
+/// format's class, the policy's uniform overrides applied. What a refused
+/// allocation owes, read from the same formats the allocation reads.
+#[cfg(feature = "cuda")]
+fn add_layer_demand(
+    backing: &ChunkedKvBacking,
+    policy: &CompressionPolicy,
+    k_palette_formats: &[Vec<QuantFormat>],
+    v_palette_formats: &[Vec<QuantFormat>],
+    n_kv_head: usize,
+    demand: &mut Vec<(ArenaKey, usize)>,
+) -> Result<()> {
+    for (k_chunk, v_chunk) in k_palette_formats.iter().zip(v_palette_formats) {
+        for band in 0..n_kv_head * N_PALETTE {
+            let k = policy.override_k_quant.unwrap_or(k_chunk[band]);
+            let v = policy.override_v_quant.unwrap_or(v_chunk[band]);
+            for format in [k, v] {
+                let key = backing
+                    .inner
+                    .arena_key_for(KvFormat::Quantized(format), ArenaLocation::Gpu)?;
+                match demand.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, n)) => *n += 1,
+                    None => demand.push((key, 1)),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn quantize_sealed_in_place_impl(
@@ -888,22 +967,14 @@ fn quantize_sealed_in_place_impl(
         // attempt claimed went back when it failed, so the whole layer is owed.
         Err(e) if super::backing::BackingInner::is_wave_deferral(&e) => {
             let mut demand: Vec<(ArenaKey, usize)> = Vec::new();
-            let mut add =
-                |key: ArenaKey, slots: usize| match demand.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, n)) => *n += slots,
-                    None => demand.push((key, slots)),
-                };
-            for chunk_i in 0..n_chunks {
-                for h in 0..n_kv_head {
-                    let (k_fmts, v_fmts) = side_formats(chunk_i, h);
-                    for fmts in [&k_fmts, &v_fmts] {
-                        let keys = band_keys(fmts)?;
-                        for key in keys {
-                            add(key, 1);
-                        }
-                    }
-                }
-            }
+            add_layer_demand(
+                backing,
+                policy,
+                &k_palette_formats,
+                &v_palette_formats,
+                n_kv_head,
+                &mut demand,
+            )?;
             backing.inner.owe_capacity(&demand);
             return Err(e);
         }

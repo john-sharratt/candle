@@ -218,11 +218,21 @@ BlackWorld on 4801 (2026-11-10, a full re-read of `code_reading`):
 - 45 GB of native KV stood on the card, and the expert zone sat on its floor
   at a 6–17% hit rate.
 
-Each gap made the arenas the group was owed. The ingest's R16 writes filled
-them before the group returned.
+Two things kept it there.
 
-So the group size is a cap the pass adjusts (`persistence/group_cap.rs`,
-`GroupCap`):
+**A refusal owed one layer, and a group is every layer.** The quantize
+allocates layer by layer, and the layers share one pool per class. A refusal
+owed what the refused layer needed. The gap made that, and the retry got past
+that layer to be refused at the next one, so a group of one residence needed
+thirteen gaps for thirteen layers of ~4,200 R16 slots each. Meanwhile the
+ingest's own R16 writes filled each gap's arenas before the retry. So a
+refused layer owes its own demand together with every layer after it
+(`quantize_layers_deferred_within`, `add_layer_demand`), and one gap makes
+everything the group still needs. The layers before it give back what they
+claimed when the group drops, and the retry claims it again.
+
+**The group was as large as the backlog allowed.** So the group size is a cap
+the pass adjusts (`persistence/group_cap.rs`, `GroupCap`):
 - **Halved** by every refusal, and the smaller group is tried at once, before
   any gap wait. One residence needs a few hundred to a few thousand slots of a
   class, which the class almost always has free.
