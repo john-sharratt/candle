@@ -6266,6 +6266,26 @@ fn worker_runs_elsewhere(session: &ZendSession, conv_id: &str) -> bool {
     })
 }
 
+/// How long a resume waits for catch-up to fill a conversation's gaps.
+const WHOLE_WAIT: Duration = Duration::from_secs(120);
+/// How often it looks.
+const WHOLE_LOOK: Duration = Duration::from_millis(500);
+
+/// Whether this member holds `timeline` whole — every turn's content here, no
+/// gap — waiting up to [`WHOLE_WAIT`] for catch-up to fetch what is missing.
+async fn wait_whole(state: &InferenceState, timeline: TimelineId) -> bool {
+    let until = tokio::time::Instant::now() + WHOLE_WAIT;
+    loop {
+        if state.engine.holds_whole(timeline) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(WHOLE_LOOK).await;
+    }
+}
+
 /// Finish the tool rounds the previous run stopped in the middle of.
 ///
 /// Spawned once, just after `ready`. Only a conversation carrying a resume
@@ -6381,6 +6401,24 @@ fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>
                     continue;
                 }
             };
+            // **Only a conversation held whole is resumed.** Another member's
+            // turns arrive as gaps until their content is fetched, and the
+            // projection skips an empty turn — so a round resumed now would run
+            // over a history missing turns, answering as if they had never
+            // been said. On 2026-11-09 a member resumed 425bad8d moments after
+            // its restart, its copy still holding the other member's newest
+            // turns as gaps, and its rounds reasoned from a conversation that
+            // stopped short of them. Catch-up fills the gaps; this waits for it.
+            if !wait_whole(&state, timeline).await {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    call_turn,
+                    "resume: this member does not hold the conversation whole; its round is \
+                     left to one that does",
+                );
+                turn_claims::release(claim, &conv_id).await;
+                continue;
+            }
             // Read again under the claim: a member that held it until a moment
             // ago may have finished the round in between.
             let still_open = resume::marked_call_turn(&state.engine, timeline) == Some(call_turn)

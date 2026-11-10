@@ -4,6 +4,11 @@
 //! what was already there a second time. A coder replacing `mod tests {` with
 //! `#[cfg(test)]` / `mod tests {` / its new test left two `#[cfg(test)]`
 //! headers, twice in one task.
+//!
+//! **One line is enough to do it.** A paragraph of markdown is one line, so a
+//! `text` that retypes the whole paragraph around a few words of it is a
+//! single line — and the README's paragraph came out written twice over that
+//! way, on a revision of this repository's paper (2026-11-09).
 
 /// The fewest characters a retyped start or end of `old`'s own line must hold
 /// to count: a closing `)` or `;` after `old` is as often the new text's own.
@@ -11,12 +16,9 @@ const LINE_PART: usize = 3;
 
 /// Why replacing the one `old` in `unit` with `new` writes the unit's own text
 /// around it again, if it does: `new`, written over several lines, opens with
-/// the lines just above `old`'s line or closes with those just below, or
-/// repeats the part of `old`'s line before or after it.
+/// the lines just above `old`'s line or closes with those just below; or `new`,
+/// on one line or several, repeats the part of `old`'s line before or after it.
 pub(super) fn retyped(unit: &str, old: &str, new: &str) -> Option<String> {
-    if !new.contains('\n') {
-        return None;
-    }
     let at = unit.find(old)?;
     let start = unit[..at].rfind('\n').map_or(0, |i| i + 1);
     let old_end = at + old.trim_end_matches(['\r', '\n']).len();
@@ -167,5 +169,31 @@ mod tests {
         assert_eq!(retyped(PART, "fn a() {}", "fn a() {}\n    fn b() {}"), None);
         assert_eq!(retyped(PART, "mod tests {", "mod checks {"), None);
         assert_eq!(retyped("f(a)\n", "a", "g(\n    1)"), None);
+        assert_eq!(
+            retyped("Its column is prefill, summed.\n", "prefill", "**prefill**"),
+            None,
+            "one line that only replaces `old`"
+        );
+    }
+
+    /// **A one-line `text` that retypes its paragraph is refused**: the
+    /// paragraph around `old` stays, so it would be written twice over.
+    #[test]
+    fn a_paragraph_retyped_on_one_line_is_refused() {
+        let unit = "Each gate prints a table. Its `t/s (bulk)` column is prefill, summed.\n";
+        assert_eq!(
+            retyped(
+                unit,
+                "prefill",
+                "Each gate prints a table. Its `t/s (bulk)` column is **prefill**"
+            )
+            .as_deref(),
+            Some(
+                "with `old`, `text` replaces only those words, but it begins with `Each gate \
+                 prints a table. Its `t/s (bulk)` column is`, which their line already holds \
+                 around them and keeps, so the line would hold it twice. Give `text` as only \
+                 what replaces `old`, or replace whole lines with `from` and `to`"
+            )
+        );
     }
 }

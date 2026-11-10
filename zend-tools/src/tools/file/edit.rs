@@ -132,7 +132,23 @@ impl Tool for FileEdit {
             return Err(FileError::InvalidArguments(why));
         }
         let doc = Doc::new(&req.path, &content);
-        let done = apply(&doc, &edit).map_err(|e| refused(&doc, e))?;
+        let done = match apply(&doc, &edit) {
+            Ok(done) => done,
+            Err(EditError::Stale(_)) if already_in_place(&req, &content) => {
+                return Ok(EditResponse {
+                    result: format!(
+                        "Already in place: {} holds this text whole, so the part it named was \
+                         replaced by it before — a call sent again after a restart finds its \
+                         edit made. Nothing changed.",
+                        req.path
+                    ),
+                    bytes: content.len(),
+                    repo: req.repo,
+                    path: req.path,
+                });
+            }
+            Err(e) => return Err(refused(&doc, e)),
+        };
         let text = done.doc.text();
         let bytes = text.len();
         if let (None, None, "replace", Some(new)) =
@@ -220,6 +236,42 @@ fn numbered(text: &str) -> Option<String> {
         "every line of `text` starts with a `+N` number, as a read shows it beside the \
          line; write the lines without their numbers — they are not part of the file"
             .to_string()
+    })
+}
+
+/// The fewest characters a whole-part replace's text must hold to be taken as
+/// already standing: a short line — a heading, a closing brace — stands in a
+/// file by coincidence.
+const IN_PLACE_CHARS: usize = 64;
+
+/// Whether `req`, a whole-part replace whose anchor the file no longer has,
+/// already stands in `content`: its text, on whole lines of their own.
+///
+/// **A replace is safe to send again, and must say so when it is.** A turn
+/// resumed after a restart re-sends the calls of the round it stopped in, and
+/// a replace that landed before the restart then names the anchor it replaced.
+/// Refused as stale, the file is right and the answer wrong: on a revision of
+/// this repository's paper (2026-11-09) the model was told an edit had failed
+/// that had landed, and spent a round reading the file to find out. When the
+/// replacement stands whole in the file the edit is made, and the call is
+/// answered as made.
+fn already_in_place(req: &EditRequest, content: &str) -> bool {
+    let (None, None, "replace", Some(text)) = (&req.old, &req.from, req.action.as_str(), &req.text)
+    else {
+        return false;
+    };
+    let text = text.trim();
+    text.chars().count() >= IN_PLACE_CHARS && on_whole_lines(content, text)
+}
+
+/// Whether `text` stands in `content` on lines of its own: nothing but
+/// indentation before it on its first line, and nothing after it on its last.
+fn on_whole_lines(content: &str, text: &str) -> bool {
+    content.match_indices(text).any(|(at, _)| {
+        let line_start = content[..at].rfind('\n').map_or(0, |i| i + 1);
+        let end = at + text.len();
+        let line_end = content[end..].find('\n').map_or(content.len(), |i| end + i);
+        content[line_start..at].trim().is_empty() && content[end..line_end].trim().is_empty()
     })
 }
 
@@ -481,6 +533,44 @@ mod tests {
                 "{action} {from:?} {to:?}"
             );
         }
+    }
+
+    /// **A whole-part replace already standing is recognised**, on lines of
+    /// its own; a short text, one inside a longer line, one that is not in the
+    /// file, and any other kind of edit are not.
+    #[test]
+    fn a_replace_already_made_is_recognised() {
+        let para =
+            "The sliding-window alternative degrades by construction rather than gracefully.";
+        let content = format!("# Title\n\n    {para}\n\nNext.\n");
+        let replace = |text: &str| EditRequest {
+            action: "replace".into(),
+            from: None,
+            text: Some(text.into()),
+            ..request("replace", None, None)
+        };
+        assert!(already_in_place(&replace(para), &content));
+        assert!(
+            already_in_place(&replace(&format!("\n{para}\n")), &content),
+            "trimmed"
+        );
+        assert!(!already_in_place(&replace("Next."), &content), "short");
+        assert!(
+            !already_in_place(&replace(para), &format!("Before: {para}\n")),
+            "inside a longer line"
+        );
+        assert!(!already_in_place(
+            &replace(&format!("{para} More.")),
+            &content
+        ));
+        let mut with_old = replace(para);
+        with_old.old = Some("degrades".into());
+        assert!(!already_in_place(&with_old, &content), "a word replace");
+        let insert = EditRequest {
+            text: Some(para.into()),
+            ..request("insert_after", None, None)
+        };
+        assert!(!already_in_place(&insert, &content), "an insert");
     }
 
     /// **`old` is offered before `text`.** The tool grammar emits optional

@@ -271,8 +271,12 @@ documentation states the alignment that matters here: `file_edit`
 names the part it changes by a content anchor `file_read` shows — four
 characters hashed from that part's text, never a line number — so an anchor
 taken before somebody else changed the part is refused as stale rather than
-applied to the wrong text, and re-sending a replace or a delete that already
-landed is refused the same way (`docs/npcd_anchored_edits.md`).
+applied to the wrong text (`docs/npcd_anchored_edits.md`). Re-sending a delete
+that already landed is refused the same way; re-sending a whole-part replace
+that already landed — as a turn resumed after a restart does — is answered as
+already in place when its text stands whole in the file, so a call that
+succeeded is never reported as failed (`zend-tools/src/tools/file/edit.rs`,
+`already_in_place`).
 
 It is a workspace member with no candle dependency, so `npcd` can depend on it
 directly. Reusing it costs one dependency and buys names the model already has a
