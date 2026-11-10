@@ -82,9 +82,14 @@ happens:
   Each was then kept archived with its tokens and a declaration claiming K/V,
   and every other member held its turns as still arriving
   (`docs/replicated_substrate.md` §6.5) — 2,462 on BlackWorld, ~85K on
-  WhiteWorld (2026-11-11). The marker is what completes them there: applying
-  a remote `Distilled` record makes each of its timeline's turns a candidate
-  for adoption.
+  WhiteWorld (2026-11-11). A layer's calibrations (`zend/src/calibrate/seal.rs`)
+  carried the same gate: 105,679 of BlackWorld's own turns in the calibration
+  layer held no chunk and no marker. The marker is what completes them there:
+  applying a remote `Distilled` record makes each of its timeline's turns a
+  candidate for adoption. Each pass marks what is already sealed — the tool
+  calibration's resume filter its archived exemplars, a layer's pass
+  (`calibrate_layer`) its archived calibrations — so a store sealed under the
+  gate is repaired at its next load.
 
 Together: the marker set is monotonic (it only grows, one marker a timeline),
 and the trigger is a ratio that the reclaim itself drives down.
