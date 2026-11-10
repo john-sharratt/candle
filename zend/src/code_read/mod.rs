@@ -56,7 +56,7 @@ use crate::branch_ingest::keys::{
     LINES_KEY,
 };
 use crate::branch_ingest::plan::Committed;
-use crate::branch_ingest::reader::{whose, whose_reading, Whose};
+use crate::branch_ingest::reader::{settles_here, whose, Whose};
 use crate::calibrate::{calibrate_committed, CalibrateSpec};
 use crate::ingest_backlog::{self, Work};
 use crate::ingest_lease::{self, Share};
@@ -201,7 +201,11 @@ fn scan_ingest_chains(engine: &ConversationEngine) -> IngestChains {
         };
         match chain_break(&substrate, timeline) {
             None => out.finished.push(unit(path)),
-            Some(_) if whose(first, node, now) == Whose::Peers => out.arriving.push(unit(path)),
+            // Still arriving: a gap is a turn whose records are on their way,
+            // and a peer's reading inside its grace may be missing its last.
+            Some(_) if substrate.holds_gap(timeline) || whose(first, node, now) == Whose::Peers => {
+                out.arriving.push(unit(path))
+            }
             Some(why) => out.broken.push((path, why)),
         }
     }
@@ -528,14 +532,14 @@ pub(crate) fn is_upload_path(path: &str) -> bool {
 /// **Only this member's partials.** Nothing of this member's is in flight at
 /// boot, but a peer's readings are, and they replicate here begun and unkeyed.
 /// A partial is retired only when this member began it, or the peer that did
-/// is past [`PEER_GRACE`](crate::branch_ingest::reader::PEER_GRACE)
-/// ([`whose_reading`]).
+/// is past [`PEER_GRACE`](crate::branch_ingest::reader::PEER_GRACE), and none of
+/// its turns is still arriving ([`settles_here`]).
 pub(crate) fn retire_crashed_partials(engine: &ConversationEngine) {
     let e = engine;
     let mut retired = 0usize;
     for (tl, path) in e.conversations_with_metadata_key(PATH_KEY) {
         let committed = e.has_conversation_metadata_key(tl, CONTENT_KEY);
-        if committed || whose_reading(e, tl) != Whose::Ours {
+        if committed || !settles_here(e, tl) {
             continue;
         }
         match e.tombstone_timeline(tl) {

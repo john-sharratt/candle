@@ -28,7 +28,7 @@ use super::keys::{
 use super::plan::{dep_version, Done, LiveFiles};
 use super::spec::LayerSpec;
 use crate::branch_ingest::keys::branches_value;
-use crate::branch_ingest::reader::{whose_reading, Whose};
+use crate::branch_ingest::reader::settles_here;
 use crate::calibrate::{calibrate_committed, CalibrateSpec};
 use crate::ingest_backlog::{self, Work};
 use crate::ingest_lease::{self, Share};
@@ -144,13 +144,14 @@ pub fn all_of(engine: &ConversationEngine, layer: &str) -> Vec<TimelineId> {
 /// `code_read::retire_crashed_partials` is: a pass can overlap a pool, and an
 /// in-flight unit is indistinguishable from a crashed one by metadata alone.
 /// A peer's units in flight replicate here unkeyed too, so only this member's
-/// are retired, or a peer's past its grace ([`whose_reading`]).
+/// are retired, or a peer's past its grace, never one still arriving
+/// ([`settles_here`]).
 pub fn retire_crashed_partials(engine: &ConversationEngine, layer: &str) {
     let e = engine;
     let mut retired = 0usize;
     for tl in e.find_conversations_by_metadata(LAYER_KEY, layer) {
         let committed = e.has_conversation_metadata_key(tl, CONTENT_KEY);
-        if !committed && whose_reading(e, tl) == Whose::Ours && e.tombstone_timeline(tl).is_ok() {
+        if !committed && settles_here(e, tl) && e.tombstone_timeline(tl).is_ok() {
             retired += 1;
         }
     }

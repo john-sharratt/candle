@@ -67,6 +67,19 @@ pub fn whose_reading(engine: &ConversationEngine, timeline: TimelineId) -> Whose
     whose(first, conv.node(), now_ms())
 }
 
+/// Whether this member settles `timeline` — retires it unkeyed, rebuilds it
+/// broken. Never while a turn of it is a gap: those records are still on
+/// their way from the member that wrote them, and a gap reads as an empty turn,
+/// which a chain check takes for a turn that answered nothing. Under a lagging
+/// replica that is no brief window: on 2026-11-10 WhiteWorld, minutes behind
+/// BlackWorld's re-ingest, held readings hollow past [`PEER_GRACE`], rebuilt
+/// them, and so added to the very traffic it was behind on. Otherwise
+/// [`whose_reading`] decides.
+pub fn settles_here(engine: &ConversationEngine, timeline: TimelineId) -> bool {
+    !engine.conversation().read().holds_gap(timeline)
+        && whose_reading(engine, timeline) == Whose::Ours
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

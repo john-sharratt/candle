@@ -34,7 +34,7 @@ use zend_vfs::Oid;
 
 use crate::branch_ingest::keys::{branches_value, BRANCHES_KEY, CONTENT_KEY};
 use crate::branch_ingest::plan::Committed;
-use crate::branch_ingest::reader::{whose_reading, Whose};
+use crate::branch_ingest::reader::settles_here;
 use crate::branch_ingest::units::FolderUnit;
 use crate::ingest_backlog::{self, Work};
 use crate::ingest_lease::{self, Share};
@@ -670,13 +670,12 @@ impl IngestPlan {
 /// member's is in flight — but a peer's readings are, and they replicate here
 /// begun and unkeyed, so only this member's partials, or a peer's past
 /// [`PEER_GRACE`](crate::branch_ingest::reader::PEER_GRACE), are retired
-/// ([`whose_reading`]).
+/// ([`settles_here`]).
 pub(crate) fn retire_crashed_partials(engine: &ConversationEngine) {
     let e = engine;
     let mut retired = 0usize;
     for (tl, dir) in e.conversations_with_metadata_key(DIR_KEY) {
-        if ingest_committed(|key| e.has_conversation_metadata_key(tl, key))
-            || whose_reading(e, tl) != Whose::Ours
+        if ingest_committed(|key| e.has_conversation_metadata_key(tl, key)) || !settles_here(e, tl)
         {
             continue;
         }

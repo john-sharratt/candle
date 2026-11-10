@@ -61,6 +61,14 @@ impl Substrate {
             .is_some_and(|tl| tl.gaps.contains(&index))
     }
 
+    /// Whether some turn of `timeline` is a gap: another member's turn whose
+    /// records are still arriving.
+    pub fn holds_gap(&self, timeline: TimelineId) -> bool {
+        self.timelines
+            .get(&timeline)
+            .is_some_and(|tl| !tl.gaps.is_empty())
+    }
+
     /// Whether every turn of `timeline` holds its content: no gap — a turn
     /// still to arrive — and no other empty turn but a summary anchor, which
     /// holds none by design. A retired turn is emptied in place, as a reload

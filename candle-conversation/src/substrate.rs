@@ -8643,6 +8643,24 @@ mod tests {
         assert!(sub.working_set(target).unwrap().provenance().is_empty());
     }
 
+    /// **A gap is a turn still arriving.** A timeline holds one from its first
+    /// restored gap; one whose turns are all its own holds none, and an
+    /// unknown timeline holds none.
+    #[test]
+    fn a_timeline_holds_a_gap_while_a_turn_is_still_arriving() {
+        let (mut sub, _, _) = working_set_fixture(0, 10);
+        let pending = unshared_timeline(5);
+        sub.register_timeline(pending, LayerId::for_test(1), GroupId::for_test(1));
+        sub.append_with_blocks(pending, 10, 0, 1);
+        assert!(!sub.holds_gap(pending), "every turn its own");
+        sub.restore_gap_turn(pending);
+        assert!(sub.holds_gap(pending), "a turn still arriving");
+        assert!(
+            !sub.holds_gap(unshared_timeline(6)),
+            "a timeline it does not hold"
+        );
+    }
+
     /// **A conversation that is not whole is gone.** A gap — a turn another
     /// member wrote and this one has not fetched — and a retired turn are both
     /// empty, and the projection skips an empty turn: locked, the conversation

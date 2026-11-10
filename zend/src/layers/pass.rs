@@ -20,7 +20,7 @@ use super::keys::{termed, unit_key};
 use super::plan::{plan_holding, Below, Done, Held, LiveFiles, Plan, Queued};
 use super::run::{committed, ingest_units, EdgeFiles, UnitJob};
 use super::spec::{LayerSpec, UnitKind};
-use crate::branch_ingest::reader::{whose_reading, Whose};
+use crate::branch_ingest::reader::settles_here;
 use crate::calibrate::CalibrateSpec;
 use crate::ingest_report::IngestReport;
 use crate::refresh_ctx::RefreshContext;
@@ -326,7 +326,7 @@ fn settle(engine: &ConversationEngine, spec: &LayerSpec, below: &[Below], ground
         broken
             .iter()
             .copied()
-            .filter(|tl| is_keyed(engine, *tl) && whose_reading(engine, *tl) == Whose::Ours),
+            .filter(|tl| is_keyed(engine, *tl) && settles_here(engine, *tl)),
     );
     if !gone.is_empty() {
         let e = engine;
