@@ -31,9 +31,18 @@ const lineOf = (body, tenant) => (body.tenants || {})[tenant] || null;
 
 /* Every member's ingest backlog for `tenant` as one — the work is the
  * cluster's, split by lease, so the member that speaks for the app may have
- * none of its own while another reads on. Processed, total and the calibration
- * units still to go summed; the item named is the one being read by the member
- * with the most still to go. `null` when no member has a backlog. */
+ * none of its own while another reads on.
+ *
+ * **One backlog, not one per member.** Every member plans the same unread
+ * layer from the same replicated substrate, so each one's `total` is the whole
+ * layer, and the lease decides only who reads each unit. Summed, two members
+ * showed 3,300 files for a layer of 1,739. So the total is the largest
+ * member's. Each member counts what it read itself as it reads, and its
+ * peers' units only once it has nothing left of its own, so what the cluster
+ * has done is their sum, never more than the total. The calibration units
+ * still to go are planned the same way, so the largest member's count is
+ * the cluster's. The item named is the one being read by the member with the
+ * most still to go. `null` when no member has a backlog. */
 function clusterBacklog(members, tenant) {
   const backlogs = members
     .map((m) => (lineOf(m.body, tenant) || {}).ingest_backlog)
@@ -41,11 +50,14 @@ function clusterBacklog(members, tenant) {
   if (!backlogs.length) return null;
   const left = (b) => (b.total || 0) - (b.processed || 0);
   const busiest = backlogs.reduce((a, b) => (left(b) > left(a) ? b : a));
+  const most = (field) => backlogs.reduce((n, b) => ((b[field] || 0) > n ? b[field] : n), 0);
+  const total = most('total');
+  const done = backlogs.reduce((n, b) => n + (b.processed || 0), 0);
   return {
-    processed: backlogs.reduce((n, b) => n + (b.processed || 0), 0),
-    total: backlogs.reduce((n, b) => n + (b.total || 0), 0),
+    processed: done < total ? done : total,
+    total,
     last_item: busiest.last_item ?? null,
-    calibrating: backlogs.reduce((n, b) => n + (b.calibrating || 0), 0),
+    calibrating: most('calibrating'),
   };
 }
 

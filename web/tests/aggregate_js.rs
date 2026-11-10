@@ -159,7 +159,9 @@ fn a_page_picks_a_member_by_node() {
 /// **The ingest backlog is the cluster's.** The member that speaks for the
 /// app can have none of its own while another reads on — through a gateway
 /// with two members the indexing bar vanished whenever the first to answer
-/// was the idle one. Summed across members, naming the busiest one's item.
+/// was the idle one. Every member plans the same layer, so the total is the
+/// largest member's, the work done is what each read, summed, and the busiest
+/// member's item is named.
 #[test]
 fn the_ingest_backlog_is_every_members() {
     let line = |backlog: Value| {
@@ -168,14 +170,25 @@ fn the_ingest_backlog_is_every_members() {
     };
     let envelope = json!({ "members": [
         member("ww", ".6", line(Value::Null)),
-        member("bw", ".5", line(json!({ "processed": 5, "total": 233, "last_item": "candle/a.rs", "calibrating": 200 }))),
-        member("xx", ".7", line(json!({ "processed": 10, "total": 12, "last_item": "candle/b.rs" }))),
+        member("bw", ".5", line(json!({ "processed": 600, "total": 1739, "last_item": "candle/a.rs", "calibrating": 200 }))),
+        member("xx", ".7", line(json!({ "processed": 500, "total": 1572, "last_item": "candle/b.rs", "calibrating": 150 }))),
     ]});
     let got = call("memberStatus", &[envelope, json!("zend")]);
     assert_eq!(got["build"], "b");
     assert_eq!(
         got["tenants"]["zend"]["ingest_backlog"],
-        json!({ "processed": 15, "total": 245, "last_item": "candle/a.rs", "calibrating": 200 })
+        json!({ "processed": 1100, "total": 1739, "last_item": "candle/a.rs", "calibrating": 200 })
+    );
+    // A member with nothing of its own left counts its peers' units as theirs
+    // land, so the sum passes the layer near the end: it never shows more done
+    // than there is.
+    let finishing = json!({ "members": [
+        member("bw", ".5", line(json!({ "processed": 1730, "total": 1739, "last_item": "candle/c.rs" }))),
+        member("ww", ".6", line(json!({ "processed": 900, "total": 1572, "last_item": "candle/d.rs" }))),
+    ]});
+    assert_eq!(
+        call("memberStatus", &[finishing, json!("zend")])["tenants"]["zend"]["ingest_backlog"],
+        json!({ "processed": 1739, "total": 1739, "last_item": "candle/d.rs", "calibrating": 0 })
     );
     let idle = json!({ "members": [member("ww", ".6", line(Value::Null)), member("bw", ".5", line(Value::Null))] });
     assert_eq!(
