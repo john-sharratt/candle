@@ -353,16 +353,37 @@ dispatch, so the lines of one request join on `req`:
 
 | Line | When | Says |
 |---|---|---|
+| `routing standing` | the first pick for an app, and each pick after its members' standing changed | every member, `routable` or `passed over` with each reason — loading, upgrading, fault, draining, disabled, lagging, syncing, closing, silent |
 | `placed` | a `Best` or draw pick | how (`fill`, `round`, `full`, `draw`), and every candidate's machine, rank, `min`, `max`, units, drawing and reserved |
-| `routed` | a unit placed by something other than the policy: a key's holder, a canary's share | the member and why |
+| `routed` | a request placed by something other than the policy: a key's holder (`holder`), a canary's share (`canary`), an `Any` request or an errand dealt in turn (`turn`) | the member and why |
+| `routed among the members declaring the route` | an `Any` request whose route not every ready member declares | the route, the members declaring it, and the pick |
 | `queued` | a unit fits nowhere | its class and the queue's depth |
 | `released` | a queued unit is placed | the member and how long it waited |
 | `refused` | a queued unit times out | how long it waited |
 | `answered` | the answer's body ends, or its client goes away | the member, its status, the time to the first byte and to the end, and its bytes |
 
-and on every plan, under `cluster::gateway::plan`, one `cards` line — each
-card's live conversations and whether it is busy — and a `plan` line when the
-plan's epoch moves, naming the weights.
+and under `cluster::gateway::plan` a `cards` line — each card's live
+conversations and whether it is busy — on a plan whose cards differ from the
+line last written (the plan runs every few seconds, and an unchanged line each
+time buried every other), and a `plan` line when the plan's epoch moves,
+naming the weights.
+
+Every entry of the coordination log — the one the cluster page and the audit
+read: a member admitted, closed, lagging, its lane drained, in sync, silent,
+reporting again, a catch-up asked — is also written at `INFO` under
+`cluster::gateway::coord`, naming the app and the member, so a member leaving
+the routing reads beside the placement lines it changed. A catch-up frame
+dropped at a member's lane cap is a `WARN` under `cluster::gateway::relay`, at
+the socket's first drop and at each power of two after it.
+
+A member logs the replication it does itself: `answered a catch-up` (the
+requester, the ranges, the records listed and the records gone), `a fetch was
+answered short` (`WARN`: records asked for that it did not send, by count and
+span), `a catch-up finished` (with the span of `oseq`s it wanted, so the same
+gap fetched again and again shows as the same span), and a stall of its own
+receipts — `WARN` once events in flight have stood for a minute without a
+`RECEIPT` covering any (again every ten minutes while it lasts), `INFO` when
+they are receipted again.
 
 npcd logs each lease `lend()` changes — the character, its old and new holder,
 the weights it saw — and how long a new holder waited for the old holder's

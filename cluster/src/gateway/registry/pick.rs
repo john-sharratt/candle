@@ -181,6 +181,18 @@ impl Registry {
         self.round_robin_but(app, None)
     }
 
+    /// The next routable member in turn for a request with `dispatch`, named
+    /// in the placement log.
+    fn in_turn(&mut self, app: &str, dispatch: &Dispatch) -> Placed {
+        match self.round_robin(app) {
+            Some(node) => {
+                routed(app, dispatch, node, "turn");
+                Placed::To(node)
+            }
+            None => Placed::Nobody,
+        }
+    }
+
     fn round_robin_but(&mut self, app: &str, except: Option<u64>) -> Option<u64> {
         let nodes: Vec<u64> = self.ready_but(app, except).iter().map(|m| m.node).collect();
         self.round_robin_among(app, &nodes)
@@ -306,13 +318,11 @@ impl Registry {
                 self.best(app, draw, &self.weigh(app, &cards))
             }
             Dispatch::Best => self.best_for_peer(app, draw, ask, &self.weigh(app, &cards)),
-            Dispatch::Any => self.round_robin(app).map_or(Placed::Nobody, Placed::To),
+            Dispatch::Any => self.in_turn(app, dispatch),
             // A request routed by its subject that names none and draws
             // nothing — a listing, a read of the caller's own — is no unit of
             // work: it goes in turn, never held back for a card's room.
-            Dispatch::Owner(_) if is_errand(dispatch, key, draw) => {
-                self.round_robin(app).map_or(Placed::Nobody, Placed::To)
-            }
+            Dispatch::Owner(_) if is_errand(dispatch, key, draw) => self.in_turn(app, dispatch),
             // A key held by a member here goes to it — syncing, or still
             // loading, included: the conversation is the holder's, possibly
             // with turns it wrote cut off that no other member has, and a

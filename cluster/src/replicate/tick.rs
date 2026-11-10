@@ -13,6 +13,7 @@ use applied_set::AppliedSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use super::catchup::Purpose;
+use super::receipt_watch::Seen;
 use super::replicator::{Phase, Replicator};
 use super::watch::periodic_due;
 use crate::frame::{Ack, Frame};
@@ -134,6 +135,7 @@ impl Replicator {
         watched("refresh_group", self.refresh_group()).await;
         watched("mark_joined", self.mark_joined()).await;
         self.note_load();
+        self.watch_receipts();
         // In fault mode a member applies nothing, so it acknowledges nothing
         // and asks for nothing; leaving starts its catch-ups (§7.7).
         if self.faulted() {
@@ -270,6 +272,39 @@ impl Replicator {
                     self.finished(Purpose::Admission, c).await;
                 }
             }
+        }
+    }
+
+    /// Log a stall of this member's receipts, and its end (`receipt_watch`).
+    fn watch_receipts(&self) {
+        let (seen, unsent, oldest) = {
+            let mut s = self.state();
+            let (unsent, in_flight) = s.outbox.counts();
+            let oldest = s.outbox.oldest_in_flight();
+            (
+                s.receipts.observe(in_flight, Instant::now()),
+                unsent,
+                oldest,
+            )
+        };
+        match seen {
+            Seen::Quiet => {}
+            Seen::Stalled { in_flight, secs } => tracing::warn!(
+                node = format_args!("{:016x}", self.node),
+                in_flight,
+                unsent,
+                stalled_s = secs,
+                oldest_oseq = oldest.map(|(o, _)| o),
+                cluster = oldest.map(|(_, c)| c),
+                "own events in flight have had no receipt: the gateway is not taking them in"
+            ),
+            Seen::Resumed { in_flight, secs } => tracing::info!(
+                node = format_args!("{:016x}", self.node),
+                in_flight,
+                unsent,
+                stalled_s = secs,
+                "own events are being receipted again"
+            ),
         }
     }
 

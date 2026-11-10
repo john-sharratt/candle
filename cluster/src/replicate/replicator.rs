@@ -30,6 +30,7 @@ use super::lease::{LeaseEvent, Term, EVENTS_KEPT};
 use super::own_gaps::OwnGaps;
 use super::pulse::PULSES_KEPT;
 use super::quorum_governor::{Downgrade, Governor};
+use super::receipt_watch::ReceiptWatch;
 use super::store::Store;
 use super::tick::{ADMISSION_QUIET_LIMIT, QUIET};
 use super::watch::GapWatch;
@@ -202,6 +203,8 @@ pub(super) struct Rejoin {
 
 pub(super) struct State {
     pub outbox: Outbox,
+    /// Whether the outbox's events in flight stopped being receipted.
+    pub receipts: ReceiptWatch,
     /// Own events tapped and not yet sent, and when: a request's flush takes
     /// them onto its own socket before the round robin does.
     pub fresh: BTreeMap<u64, Instant>,
@@ -515,6 +518,7 @@ impl Replicator {
             node,
             s: Mutex::new(State {
                 outbox: Outbox::new(),
+                receipts: ReceiptWatch::default(),
                 fresh: BTreeMap::new(),
                 sockets: vec![None; clusters],
                 ready: vec![false; clusters],

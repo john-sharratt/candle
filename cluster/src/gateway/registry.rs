@@ -9,6 +9,7 @@ mod cards;
 mod handover;
 mod member;
 mod pick;
+mod standing;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -71,6 +72,8 @@ struct AppMembers {
     /// (`docs/static_placement.md` §3.2), as `(rank, node)` — the app's own, so
     /// another app's picks never move it.
     cursor: Cell<Option<(u32, u64)>>,
+    /// The members' standing last logged ([`Registry::standing_changed`]).
+    standing: String,
 }
 
 #[derive(Debug, Default)]

@@ -111,6 +111,9 @@ pub struct Requester {
     outstanding: u64,
     tries: HashMap<(u64, u64), u8>,
     progress: Progress,
+    /// The lowest and highest `oseq` the headers listed that this member
+    /// lacked: a gap fetched again and again names the same span each time.
+    wanted_span: Option<(u64, u64)>,
     /// `oseq`s the answer listed as gone.
     gone_learned: u64,
     /// What this member held when it asked: the request's `since`.
@@ -141,6 +144,7 @@ impl Requester {
             outstanding: 0,
             tries: HashMap::new(),
             progress: Progress::default(),
+            wanted_span: None,
             gone_learned: 0,
             since,
             started: Instant::now(),
@@ -177,6 +181,10 @@ impl Requester {
             }
             self.progress.wanted += 1;
             self.progress.wanted_bytes += r.len as u64;
+            self.wanted_span = Some(match self.wanted_span {
+                Some((lo, hi)) => (lo.min(r.oseq), hi.max(r.oseq)),
+                None => (r.oseq, r.oseq),
+            });
             wanted.push((h.origin, r.oseq));
             self.wanted.push_back(Want {
                 answerer: h.answerer,
@@ -347,6 +355,11 @@ impl Requester {
         &self.progress
     }
 
+    /// The lowest and highest `oseq` it wanted, once headers listed any.
+    pub fn wanted_span(&self) -> Option<(u64, u64)> {
+        self.wanted_span
+    }
+
     /// Bytes of fetched records outstanding.
     pub fn outstanding(&self) -> u64 {
         self.outstanding
@@ -399,6 +412,20 @@ mod tests {
             n += 1;
             n
         }
+    }
+
+    /// **The span of what a catch-up wanted spans every listing**, the held
+    /// records left out; nothing is spanned before a listing wants anything.
+    #[test]
+    fn the_wanted_span_covers_every_listing_but_the_held() {
+        let mut r = Requester::new(1, 0, Purpose::Gap(9), 7, AppliedSet::default());
+        assert_eq!(r.wanted_span(), None);
+        r.headers(listing(3, 9, 10, 12, &[1, 1, 1]), |_, oseq| oseq == 10);
+        assert_eq!(r.wanted_span(), Some((11, 12)));
+        r.headers(listing(3, 9, 4, 5, &[1, 1]), |_, _| false);
+        assert_eq!(r.wanted_span(), Some((4, 12)));
+        r.headers(listing(3, 9, 20, 20, &[1]), |_, _| true);
+        assert_eq!(r.wanted_span(), Some((4, 12)), "held, so not wanted");
     }
 
     /// Only records not held are wanted; fetches go to the member that listed

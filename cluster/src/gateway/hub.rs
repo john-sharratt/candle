@@ -317,6 +317,8 @@ pub(super) struct State {
     queue: Queue,
     /// The plan for the movable work (§4.4–§4.5).
     planner: Planner,
+    /// The cards line the plan last logged ([`log_plan`]).
+    cards_logged: String,
 }
 
 pub struct Hub {
@@ -480,23 +482,29 @@ fn plan_in(s: &mut State, now: Instant) {
             }
         }
     }
-    log_plan(&planned);
+    log_plan(&planned, &mut s.cards_logged);
 }
 
-/// The plan's log lines (`docs/static_placement.md` §5): every card on each
-/// plan, and the weights when they moved.
-fn log_plan(planned: &Planned) {
-    let cards: Vec<String> = planned
+/// The plan's log lines (`docs/static_placement.md` §5): the cards when any
+/// of them changed since the line last written (`logged`) — the plan runs
+/// every few seconds, and an unchanged line each time buried every other —
+/// and the weights when they moved.
+fn log_plan(planned: &Planned, logged: &mut String) {
+    let cards = planned
         .cards
         .iter()
         .map(|c| format!("{:?} latency={} busy={}", c.key, c.latency, c.busy))
-        .collect();
-    tracing::info!(
-        target: "cluster::gateway::plan",
-        epoch = planned.epoch,
-        cards = %cards.join("; "),
-        "cards"
-    );
+        .collect::<Vec<String>>()
+        .join("; ");
+    if cards != *logged {
+        tracing::info!(
+            target: "cluster::gateway::plan",
+            epoch = planned.epoch,
+            cards = %cards,
+            "cards"
+        );
+        *logged = cards;
+    }
     if planned.changed {
         let weights: Vec<String> = planned
             .weights
@@ -555,7 +563,17 @@ impl Hub {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A coordination decision, kept in the log the cluster page and the audit
+    /// read, and written to the gateway's own log beside its placement lines —
+    /// a member going lagging, syncing or silent changes where requests go, so
+    /// the two are read together.
     pub(super) fn note(&self, app: &str, subject: String, text: String) {
+        tracing::info!(
+            target: "cluster::gateway::coord",
+            app,
+            subject = %subject,
+            "{text}"
+        );
         self.log.push(Entry {
             at_ms: now_ms(),
             gateway: self.name.clone(),
@@ -1626,11 +1644,28 @@ impl Hub {
                 registry.closing(app, *node, socket.session);
             }
         }
+        if let Some(members) = registry.standing_changed(app) {
+            tracing::info!(
+                target: "cluster::gateway::placement",
+                app,
+                members = %members,
+                "routing standing"
+            );
+        }
         if let (Dispatch::Any, Some(at)) = (dispatch, route) {
             if let Some(nodes) = registry.declaring(app, &at.method, &at.path) {
                 let pick = registry
                     .round_robin_among(app, &nodes)
                     .map_or(Pick::Wait, Pick::Member);
+                let declaring: Vec<String> = nodes.iter().map(|n| hex(*n)).collect();
+                tracing::info!(
+                    target: "cluster::gateway::placement",
+                    app,
+                    route = %format!("{} {}", at.method, at.path),
+                    declaring = %declaring.join(" "),
+                    picked = ?pick,
+                    "routed among the members declaring the route"
+                );
                 return Picked { pick, load: None };
             }
         }

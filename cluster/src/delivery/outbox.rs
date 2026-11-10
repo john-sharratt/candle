@@ -177,6 +177,17 @@ impl Outbox {
         (self.unsent.len(), self.queued.len() + self.in_flight.len())
     }
 
+    /// The oldest event queued or in flight, with the socket it is on: what a
+    /// stall of the receipts names.
+    pub fn oldest_in_flight(&self) -> Option<(u64, SocketId)> {
+        let in_flight = self.in_flight.iter().next().map(|(o, (s, _))| (*o, *s));
+        let queued = self.queued.iter().next().map(|(o, s)| (*o, *s));
+        match (in_flight, queued) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (a, b) => a.or(b),
+        }
+    }
+
     fn forget_frame(&mut self, socket: SocketId, frame: u64, oseq: u64) {
         if let Some(frames) = self.by_frame.get_mut(&socket) {
             if let Some(list) = frames.get_mut(&frame) {
@@ -295,6 +306,29 @@ mod tests {
                 socket: 0,
                 frame: 1
             }
+        );
+    }
+
+    /// The oldest event owed to a socket is named whether it is queued or in
+    /// flight; nothing is named once every one is received.
+    #[test]
+    fn the_oldest_event_in_flight_is_named() {
+        let mut o = Outbox::new();
+        assert_eq!(o.oldest_in_flight(), None);
+        for oseq in 1..=4 {
+            o.written(oseq);
+        }
+        o.sent(3, 1, 7);
+        o.queue(2, 0);
+        assert_eq!(o.oldest_in_flight(), Some((2, 0)));
+        o.sent(2, 0, 8);
+        o.receipt(0, 8);
+        assert_eq!(o.oldest_in_flight(), Some((3, 1)));
+        o.receipt(1, 7);
+        assert_eq!(
+            o.oldest_in_flight(),
+            None,
+            "1 and 4 are unsent, not in flight"
         );
     }
 

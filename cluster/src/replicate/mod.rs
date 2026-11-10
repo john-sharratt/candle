@@ -19,6 +19,7 @@ mod memory;
 mod own_gaps;
 mod pulse;
 mod quorum_governor;
+mod receipt_watch;
 mod receive;
 mod replicator;
 mod send;

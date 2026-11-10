@@ -50,6 +50,7 @@ impl Hub {
                 Some(to) => match s.sockets.get_mut(&(app.to_string(), to)) {
                     Some(x) if over_cap(bytes, x.handle.gauges().catchup()) => {
                         x.dropped += 1;
+                        log_drop(app, to, x.dropped, bytes, x.handle.gauges().catchup());
                         Vec::new()
                     }
                     Some(x) => vec![x.handle.clone()],
@@ -362,9 +363,42 @@ impl Hub {
         };
         if dropped_at_cap(&frame, x.handle.gauges().catchup()) {
             x.dropped += 1;
+            log_drop(
+                app,
+                node,
+                x.dropped,
+                frame.encoded_len(),
+                x.handle.gauges().catchup(),
+            );
             return;
         }
         let _ = x.handle.catchup(frame);
+    }
+}
+
+/// Whether the `dropped`th catch-up frame dropped for one socket is logged:
+/// the first and then each power of two, so a lane that stays full is seen
+/// without a line for every frame it refuses.
+fn logs_drop(dropped: u64) -> bool {
+    dropped.is_power_of_two()
+}
+
+/// The log line for a catch-up frame of `bytes` dropped for `node` with
+/// `queued` bytes already on its lane, when [`logs_drop`] says so. A dropped
+/// record is fetched again by its requester; one that keeps being dropped is a
+/// catch-up that never finishes.
+fn log_drop(app: &str, node: u64, dropped: u64, bytes: usize, queued: usize) {
+    if logs_drop(dropped) {
+        tracing::warn!(
+            target: "cluster::gateway::relay",
+            app,
+            node = %hex(node),
+            dropped,
+            bytes,
+            queued,
+            cap = CATCHUP_CAP,
+            "a catch-up frame was dropped at the member's lane cap"
+        );
     }
 }
 
@@ -435,5 +469,14 @@ mod tests {
         assert!(!over_cap(CATCHUP_CAP - 10, 10));
         assert!(over_cap(CATCHUP_CAP - 10, 11));
         assert!(!over_cap(1 << 20, CATCHUP_CAP - (1 << 20)));
+    }
+
+    /// **A lane that keeps refusing is logged at doubling counts**: the first
+    /// drop and each power of two, not every frame.
+    #[test]
+    fn drops_are_logged_at_doubling_counts() {
+        let logged: Vec<u64> = (1..=40).filter(|d| logs_drop(*d)).collect();
+        assert_eq!(logged, vec![1, 2, 4, 8, 16, 32]);
+        assert!(!logs_drop(0));
     }
 }

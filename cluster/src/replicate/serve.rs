@@ -58,12 +58,16 @@ impl Replicator {
                 }
             }
             let mine = store.applied();
+            let (mut ranges, mut listed, mut gone) = (0usize, 0usize, 0usize);
             for (origin, from, to) in answer_ranges(&mine, &asked.since) {
                 if !ticket.live() {
                     me.state().answering.end(&ticket);
                     return;
                 }
                 let listing = store.list(origin, from, to);
+                ranges += 1;
+                listed += listing.records.len();
+                gone += listing.gone.len();
                 let frame = Frame::Headers(Headers {
                     request: asked.request,
                     reply_to: asked.reply_to,
@@ -84,6 +88,15 @@ impl Replicator {
                 reply_to: asked.reply_to,
             }));
             me.state().answering.end(&ticket);
+            tracing::info!(
+                node = format_args!("{node:016x}"),
+                requester = format_args!("{:016x}", asked.reply_to),
+                request = asked.request,
+                ranges,
+                listed,
+                gone,
+                "answered a catch-up"
+            );
         });
     }
 
@@ -96,26 +109,51 @@ impl Replicator {
         };
         self.state().stats.fetched_for_others += f.oseqs.len() as u64;
         let store = self.store.clone();
+        let node = self.node;
         tokio::spawn(async move {
             let sending = handle.clone();
-            let Ok(written) = tokio::task::spawn_blocking(move || {
+            let asked = f.oseqs.len();
+            let (origin, reply_to, request) = (f.origin, f.reply_to, f.request);
+            let Ok((written, unread)) = tokio::task::spawn_blocking(move || {
                 // Read together: a store whose reads take a lock takes it once
                 // for the whole fetch, or not at all (`Store::read_many`).
                 let read = store.read_many(f.origin, &f.oseqs);
-                f.oseqs
+                let mut unread = Vec::new();
+                let written = f
+                    .oseqs
                     .iter()
                     .zip(read)
                     .filter_map(|(oseq, bytes)| {
+                        let Some(bytes) = bytes else {
+                            unread.push(*oseq);
+                            return None;
+                        };
                         sending
-                            .event(f.origin, *oseq, &bytes?, Some(f.reply_to), true)
+                            .event(f.origin, *oseq, &bytes, Some(f.reply_to), true)
                             .ok()
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (written, unread)
             })
             .await
             else {
                 return;
             };
+            // A record asked for and not held is fetched again by the
+            // requester, and again: the same gap, every time it looks.
+            if !unread.is_empty() || written.len() < asked {
+                tracing::warn!(
+                    node = format_args!("{node:016x}"),
+                    requester = format_args!("{reply_to:016x}"),
+                    request,
+                    origin = format_args!("{origin:016x}"),
+                    asked,
+                    sent = written.len(),
+                    unread = unread.len(),
+                    unread_oseqs = ?unread.first().zip(unread.last()),
+                    "a fetch was answered short: records asked for were not sent"
+                );
+            }
             // `DONE` follows the last record onto the lane, never ahead of it.
             join_all(written).await;
             let _ = handle.catchup(Frame::Done(Done {
