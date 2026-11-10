@@ -4,7 +4,7 @@
 
 > Research fork of [Hugging Face Candle](https://github.com/huggingface/candle).
 >
-> - Technical report, **v2 (in preparation)**: [docs/unbounded_agents.md](docs/unbounded_agents.md)
+> - Technical report, **v2**: [docs/unbounded_agents.md](docs/unbounded_agents.md) — complete except the dependency-analysis battery of §9.12, which is specified and not yet scored
 > - Technical report, **v1 (published 13 May 2026)**: [docs/unbounded_agents_v1.md](docs/unbounded_agents_v1.md) · [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)
 > - **Every measured number, and every outside figure it is compared with**: [docs/performance.md](docs/performance.md), with the raw rows in [docs/results/](docs/results/)
 
@@ -12,13 +12,13 @@
 
 ## The problem
 
-Persistent agentic systems require context that grows without bound. Under standard full attention, numerical error per generation step grows monotonically with context depth — for any finite-precision arithmetic, any compression scheme, on any hardware — because every token participates in every subsequent computation with equal structural weight. This is not a compression problem; it is an architectural one. More VRAM defers the threshold; it does not eliminate the structural problem.
+Persistent agentic systems require context that grows without bound. Under standard full attention every cached token takes part in every subsequent step, so the stored error a step is exposed to — and the number of perturbed scores competing with the relevant tokens for attention — grows with context depth. This is not a compression problem; it is an architectural one. More VRAM defers the point at which tokens must be compressed or evicted; it does not change that coupling.
 
 ## The fix
 
-**Theorem (§11.2 — Asymptotic Numerical Stability):** Under provenance-selected attention over a tiered context, total numerical error per generation step is bounded by a constant **O(1) independent of context depth N**, in contrast with the O(N) scaling of standard full-attention systems.
+**Theorem (§11.2 — Asymptotic Numerical Stability):** Under provenance-selected attention over a tiered context, the summed stored error of the tokens entering a generation step is bounded by a constant **independent of context depth N**, where the same bound under full attention grows linearly in N. It bounds exposure, not output error: it does not show that full-attention output degrades, and §11.2 says what it does and does not establish.
 
-The fix is architectural: decouple the set of tokens participating in any generation step from the total number of tokens in context. Something functionally equivalent to provenance-selected sparse attention is *necessary* — not sufficient, but necessary — for a persistent-session LLM to maintain bounded quality as context grows. No full-attention system, on any hardware, can provide the same guarantee.
+The fix is architectural: decouple the set of tokens participating in any generation step from the total number of tokens in context. That decoupling is *sufficient* for the bound at any depth; a full-attention system cannot offer it, because the bound's terms are the tokens it attends.
 
 ---
 
@@ -28,13 +28,13 @@ Measured on three machines — an **RTX 4090 Laptop GPU (16 GB, 32 GB host RAM)*
 
 1. **A 180B-parameter model on a 16 GB laptop GPU with 32 GB of RAM.** Qwen3.8-Flash-Next (180B total, 6B active) streams its experts VRAM → RAM → NVMe and serves eight concurrent sessions at **108.5 t/s aggregate decode**, 8/8 sessions correct at every rung, with 5.79–5.82× KV compression at C10. Every published single-GPU run of the model that states its host uses 64–128 GB of RAM, and the fastest, an RTX 5090 with 128 GB, decodes at 48.0 t/s. On a 24 GB RTX 3090 with 64 GB of RAM the same artifact decodes **138.1 t/s at one session and 543.8 t/s aggregate at ×16**, every session validated. **[I1 · I2 · I18 · E49 · E51 · E52]**
 
-2. **Context length is free.** From 32K to 128K tokens, Flash-Next keeps **99% of its prefill and 111% of its decode** — decode is faster at 128K — and its speculative head accepts exactly 4.85 tokens a step on every row from 8K to 128K. Published llama.cpp runs of the same model lose a third of their decode between 6K and 110K. **[I3 · I4 · E49]**
+2. **Context length is free.** From 32K to 128K tokens, Flash-Next keeps **99% of its prefill and 111% of its decode** — decode is faster at 128K — and its speculative head accepts exactly 4.85 tokens a step on every row from 8K to 128K. The bound here is the model's own trained sparse-attention indexer, which caps each token's attended set; the engine adds no depth-dependent cost on top of it, where published llama.cpp runs of the same model lose a third of their decode between 6K and 110K. It is the bounded-working-set principle the theorem rests on, not a measurement of provenance. **[I3 · I4 · E49]**
 
-3. **Up to 7.6× KV-cache compression, written inline, every output validated — no calibration data, no per-model calibration.** Each 32-token block is compressed in the forward that produced it, choosing its own format. The top rung reaches **4.1×–7.6×** across the fleet, and with it on, prefill stays within 5% of uncompressed at every depth and runs faster at 128K. llama.cpp's q8_0 cache gives 1.9× and vLLM's FP8 2×. **[I5 · I6 · I7 · E64 · E72]**
+3. **Up to 7.6× KV-cache compression, written inline, every output validated — no calibration data.** Each 32-token block is compressed in the forward that produced it, choosing its own format. The top rung reaches **4.1×–7.6×** across the fleet, and with it on, prefill stays within 5% of uncompressed at every depth and runs faster at 128K. llama.cpp's q8_0 cache gives 1.9× and vLLM's FP8 2×. **[I5 · I6 · I7 · E64 · E72]**
 
 4. **Nearly 4× the compression of llama.cpp's q8_0 cache — while slowing decode less.** At 8K the top rung costs 0–8% of decode for 3.3×–6.3×. At 32K it costs 27–31% on the largest hybrids for 6.3–7.5×, where q8_0 costs 35% for 1.9×. **[I5 · I7 · E64 · E73]**
 
-5. **One card out-decodes llama.cpp's best published rate by up to 37.9×.** Serving concurrent conversations, aggregate decode beats the best published llama.cpp single-stream figure for the same model on the same class of card by **2.6–36.3× on the RTX 3090**, **1.4–3.7× on 16 GB cards**, and **3.2–37.9× on Blackwell** (Qwen3.5-35B-A3B: 2,869.9 t/s against 194.0; Flash-Next 1,819.3 at ×16 against 48.02 on an RTX 5090). One case goes the other way and is stated as such: on 16 GB, a 3-bit Qwen3.6-35B that fits wholly in VRAM decodes a single stream at 183–249 t/s, where our streamed Q6_K aggregate is 336.7 — more work in total, less per stream. **[I8 · I16 · I18 · E1 · E17 · E19 · E21 · E27 · E45 · E46 · E51]**
+5. **One card out-decodes llama.cpp's best published rate by up to 37.9×.** Serving concurrent conversations, aggregate decode beats the best published llama.cpp single-stream figure for the same model on the same class of card by **2.6–36.3× on the RTX 3090**, **1.4–3.7× on 16 GB cards**, and **3.2–37.9× on Blackwell** (Qwen3.5-35B-A3B: 2,869.9 t/s against 194.0; Flash-Next 1,819.3 at ×16 on the TCC build against 48.02 on an RTX 5090). One case goes the other way and is stated as such: on 16 GB, a 3-bit Qwen3.6-35B that fits wholly in VRAM decodes a single stream at 183–249 t/s, where our streamed Q6_K aggregate is 336.7 — more work in total, less per stream. **[I8 · I16 · I18 · E1 · E17 · E19 · E21 · E27 · E45 · E46 · E51]**
 
 6. **Sixty-four conversations on one card.** Qwen3.5-35B-A3B and Qwen3.6-35B-A3B on one 72 GB card: **2,869.9 and 2,761.0 t/s aggregate at ×64** under C10, from 230.2 and 476.6 t/s at one session — 12.5× and 5.8× — with every session validated and prefill holding across the range. Qwen3.5-0.8B serves 256 concurrent sessions at 10,805.3 t/s aggregate decode. The published single-card serving runs of these models stop at 5–10 concurrent requests. **[I8 · E47 · E48]**
 
@@ -114,15 +114,15 @@ A self-learning transition matrix predicts expert routing from actual inference 
 GPU VRAM (hot)  →  CPU RAM (warm)  →  NVMe (cold)
 ```
 
-Blocks are managed at 32-token granularity. Adaptive per-block quantization selects each block's K and V format from eleven compression levels (C0–C10) as the block is sealed. Two-phase prefill refresh at turn boundaries eliminates the autoregressive numerical drift that degrades generation quality beyond ~500 decode steps.
+Blocks are managed at 32-token granularity. Adaptive per-block quantization selects each block's K and V format from eleven compression levels (C0–C10) as the block is sealed. Two-phase prefill refresh at turn boundaries replaces each turn's decode-drifted K/V with K/V re-prefilled from the finished turn.
 
 The Asymptotic Numerical Stability theorem is proven over this architecture. Under provenance-selected attention with hot-tier blocks originating from prefill-refreshed activations, the error per step is bounded by two terms: the hot-tier rounding constant, plus the fixed retrieval budget times the per-token error of a retrieved block. Neither depends on how many blocks reside in the warm or cold tiers.
 
-### 3. Attentional provenance indexing with Speculative Context Decode
+### 3. Attentional provenance indexing with mid-decode reprojection
 
 **Provenance indexing:** Q vectors are captured live during decode as persistent cognitive-state fingerprints. A Binary Directional Provenance scan (sign agreement between folded Q signatures) ranks the whole corpus on the GPU over a VRAM-resident paged gallery. It uses a 1-bit tensor-core backend on Ada (~9.5 ms steady-state on the laptop) and an INT8 tensor-core backend on Blackwell, both bit-identical to the scalar reference.
 
-**Speculative Context Decode:** a probe session runs ahead of the kept decode session. Its Q fingerprints drive the next scan at each reasoning-step boundary, so the next context window is assembled while the current one decodes. Probe tokens are discarded and never enter the KV cache.
+**Mid-decode reprojection:** every 64 decoded tokens, or at a line break once more than 16 have passed, the signatures of the last 256 decoded tokens drive a scan, and its result assembles the working set for the next forward, so the scan never blocks the current one. A probe session that would decode ahead of the real one (Speculative Context Decode, paper §6.5) is specified and not built.
 
 ### 4. Native quantized inference stack
 
@@ -193,11 +193,11 @@ cargo clippy --workspace --tests --examples -- -D warnings
 
 ## Hardware
 
-| Machine | VRAM | Host | Link |
-|---|---|---|---|
-| RTX 4090 Laptop GPU | 16 GB | Core Ultra 9 185H, 32 GB | PCIe 4.0 ×16 |
-| RTX 3090 | 24 GB | i7-10700K, 64 GB | PCIe 3.0 ×16, no native FP8 |
-| RTX PRO 5000 Blackwell | 72 GB | Ryzen 9 9950X3D, 189 GB | PCIe 5.0 ×16 |
+| Machine | VRAM | Host | Link | Driver |
+|---|---|---|---|---|
+| RTX 4090 Laptop GPU | 16 GB | Core Ultra 9 185H, 32 GB | PCIe 4.0, trained ×8, ~12 GB/s | WDDM |
+| RTX 3090 | 24 GB | i7-10700K, 64 GB | PCIe 3.0 ×16, ~12 GB/s; no native FP8 | WDDM |
+| RTX PRO 5000 Blackwell | 72 GB | Ryzen 9 9950X3D, 189 GB | PCIe 5.0 ×16 | WDDM to 2026-10; TCC since |
 
 **Model size is not bounded by VRAM.** The expert cache streams VRAM → pinned RAM → mmap, so a mixture-of-experts model's resident footprint is its dense weights plus whatever expert working set fits. A bigger card buys speed, not feasibility.
 
