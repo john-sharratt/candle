@@ -227,6 +227,13 @@ from the lineage. C10, 32K slot:
 | sealed behind the chain, read without it | **0/4** — "I have not received any vault codes in this conversation." | 0 | 4/4 |
 | sealed behind the chain, read with it | 4/4 | 9 | 4/4 |
 | sealed behind the chain, asked where sealed | 4/4 | 9 | 4/4 |
+| sealed alone, read behind the chain | 4/4 | 9 | 4/4 |
+| sealed alone, read behind the chain, reader seeded from the lineage | 4/4 | 9 | 4/4 |
+
+The last two arms take the chain off the file and keep it on the dialogue: the needles
+are sealed behind nothing, then parented on the chain, so the reader holds the chain
+and then needles whose K/V never saw it. Both recall every code, with the reader's
+recurrence fresh or seeded from the needles' own snapshot.
 
 The same four turns are all in the reader's slot in every arm. Sealed behind
 nothing, they are read; sealed behind the 32K chain and read without it, the model

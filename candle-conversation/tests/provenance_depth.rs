@@ -1061,9 +1061,38 @@ enum Prefix {
     SealedBehindReadWith,
     /// Sealed behind the chain and asked in the conversation that sealed them.
     AskedWhereSealed,
+    /// Sealed behind the system prompt alone, then parented on the chain, so
+    /// the reader reads the chain and then the needles while the needles'
+    /// K/V never saw it — the chain kept on the dialogue, taken off the file.
+    /// The reader's recurrence starts fresh.
+    SealedAloneReadBehind,
+    /// [`Prefix::SealedAloneReadBehind`] with the reader's recurrence seeded
+    /// from the lineage: the nearest snapshot is the needles' own, written
+    /// without the chain.
+    SealedAloneReadBehindSeeded,
 }
 
-const PREFIX_ARMS: [(&str, Prefix); 4] = [
+impl Prefix {
+    /// Whether the needles are sealed with the chain ahead of them.
+    fn sealed_behind_chain(self) -> bool {
+        matches!(
+            self,
+            Prefix::SealedBehindReadWithout
+                | Prefix::SealedBehindReadWith
+                | Prefix::AskedWhereSealed
+        )
+    }
+
+    /// Whether the reader's recurrence is seeded from its lineage.
+    fn reader_seeded(self) -> bool {
+        matches!(
+            self,
+            Prefix::SealedBehindReadWith | Prefix::SealedAloneReadBehindSeeded
+        )
+    }
+}
+
+const PREFIX_ARMS: [(&str, Prefix); 6] = [
     ("no prefix", Prefix::None),
     (
         "sealed behind the chain, read without it",
@@ -1076,6 +1105,14 @@ const PREFIX_ARMS: [(&str, Prefix); 4] = [
     (
         "sealed behind the chain, asked where sealed",
         Prefix::AskedWhereSealed,
+    ),
+    (
+        "sealed alone, read behind the chain",
+        Prefix::SealedAloneReadBehind,
+    ),
+    (
+        "sealed alone, read behind the chain, reader seeded",
+        Prefix::SealedAloneReadBehindSeeded,
     ),
 ];
 
@@ -1183,7 +1220,7 @@ fn recall_with_and_without_the_priming_prefix() {
             .new_conversation(&prompt, cfg.clone())
             .expect("the needles' conversation");
         let needles = sealing.timeline_id();
-        if prefix != Prefix::None {
+        if prefix.sealed_behind_chain() {
             eng.set_forked_from(needles, chain)
                 .expect("parent the needles on the chain");
             assert!(
@@ -1204,16 +1241,21 @@ fn recall_with_and_without_the_priming_prefix() {
             asked
         } else {
             sealing.close().expect("close");
-            if prefix == Prefix::SealedBehindReadWithout {
-                eng.clear_forked_from(needles)
-                    .expect("cut the needles from the chain");
+            match prefix {
+                Prefix::SealedBehindReadWithout => eng
+                    .clear_forked_from(needles)
+                    .expect("cut the needles from the chain"),
+                Prefix::SealedAloneReadBehind | Prefix::SealedAloneReadBehindSeeded => eng
+                    .set_forked_from(needles, chain)
+                    .expect("parent the sealed needles on the chain"),
+                _ => {}
             }
             let mut reader = eng
                 .new_conversation(&prompt, cfg.clone())
                 .expect("the reader");
             eng.set_forked_from(reader.timeline_id(), needles)
                 .expect("parent the reader on the needles");
-            if prefix == Prefix::SealedBehindReadWith {
+            if prefix.reader_seeded() {
                 reader
                     .seed_recurrent_from_lineage()
                     .expect("seed the reader's recurrence");
