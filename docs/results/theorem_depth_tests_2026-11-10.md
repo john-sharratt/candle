@@ -208,6 +208,35 @@ projections of its residual stream, which by the deep layers is dominated by wha
 earlier attention and the DeltaNet recurrence wrote into it from the context before
 it.
 
+### The production prefix: the priming chain
+
+Every `code_reading` file's conversation is parented on the priming chain before its
+reading starts and seeds its recurrence from the chain's end
+(`zend/src/code_read/mod.rs`, `docs/zend_workspace_execution.md` §6), so every file
+turn is sealed behind the chain. `recall_with_and_without_the_priming_prefix` builds
+the chain from the workspace's own root listings and anchor documents, in chain
+order: 9 links, **32,003 tokens** (production logs 12 links; the committed default
+branches are what production reads, the working tree here). The four needle turns
+are sealed in their own conversation and asked for by a reader that continues it.
+Every reader's recurrence starts fresh except the read-with arm's, which is seeded
+from the lineage. C10, 32K slot:
+
+| Arm | Recalled | Chain pieces in the slot | Needle pieces |
+|---|---:|---:|---:|
+| no prefix | **4/4** | 0 | 4/4 |
+| sealed behind the chain, read without it | **0/4** — "I have not received any vault codes in this conversation." | 0 | 4/4 |
+| sealed behind the chain, read with it | 4/4 | 9 | 4/4 |
+| sealed behind the chain, asked where sealed | 4/4 | 9 | 4/4 |
+
+The same four turns are all in the reader's slot in every arm. Sealed behind
+nothing, they are read; sealed behind the 32K chain and read without it, the model
+denies they exist. With the chain back ahead of them, they are read again. The
+priming chain alone is enough prefix to make a file's K/V unreadable outside the
+context it was sealed in. Production's dialogue does descend from the chain, but it
+reads a file through its working set: other files and its own turns sit between
+the two, and its window decides how much of the chain it holds. That arrangement is
+not measured here.
+
 ### The first design, and why it was replaced
 
 A first run (same day) placed the needles in the first ~32K tokens. Every arm

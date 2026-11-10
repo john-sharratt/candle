@@ -48,10 +48,10 @@ use std::time::Instant;
 
 use candle::Device;
 use candle_conversation::decode_diag::{self, Arm as DiagCapture, Control};
-use candle_conversation::projection::Builder as Projection;
+use candle_conversation::projection::{Builder as Projection, TimelineId};
 use candle_conversation::{
     models::{Model, ModelBuilder},
-    ConversationEngine, ProjectionEvent, SamplingConfig, SequenceConfig, TurnEvent,
+    ConversationEngine, ProjectionEvent, SamplingConfig, Sequence, SequenceConfig, TurnEvent,
 };
 use tempfile::{Builder, TempDir};
 use tokenizers::Tokenizer;
@@ -989,6 +989,272 @@ fn sealing_or_reading_under_projection() {
         println!("| {seal} | {read} | {got}/4 | {projected}/4 | {held} |");
     }
     assert_eq!(rows.len(), 4, "every arm ran");
+}
+
+/// The workspace's repositories, in `D:\prog\workspace.yaml`'s order.
+const CHAIN_REPOS: [&str; 4] = ["candle", "battle-cities", "journals", "yenbot"];
+
+/// The anchor documents the priming chain reads from each repository's root,
+/// in chain order (`zend/src/branch_ingest/prime.rs`, `ANCHOR_FILES`).
+const CHAIN_ANCHORS: [&str; 4] = ["README.md", "ARCHITECTURE.md", "AGENTS.md", "CLAUDE.md"];
+
+/// The priming chain's reading, one turn a link: for each repository its root
+/// listing, then each anchor document it has at its root, whole — the prefix
+/// every `code_reading` file is sealed behind in production.
+fn chain_turns() -> Vec<String> {
+    let prog = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let mut turns = Vec::new();
+    for repo in CHAIN_REPOS {
+        let root = prog.join(repo);
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut names: Vec<(String, bool)> = entries
+            .flatten()
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.path().is_dir(),
+                )
+            })
+            .filter(|(n, _)| !n.starts_with('.') && n != "target" && n != "substrate")
+            .collect();
+        names.sort();
+        let listing: Vec<String> = names
+            .iter()
+            .map(|(n, dir)| if *dir { format!("{n}/") } else { n.clone() })
+            .collect();
+        turns.push(format!(
+            "Here is the root listing of `{repo}`:\n```\n{}\n```",
+            listing.join("\n")
+        ));
+        for anchor in CHAIN_ANCHORS {
+            let Some((name, _)) = names
+                .iter()
+                .find(|(n, dir)| !dir && n.eq_ignore_ascii_case(anchor))
+            else {
+                continue;
+            };
+            if let Ok(text) = std::fs::read_to_string(root.join(name)) {
+                turns.push(format!(
+                    "Here is `{repo}/{name}`:\n```markdown\n{text}\n```"
+                ));
+            }
+        }
+    }
+    turns
+}
+
+/// How the needles' conversation and the conversation that asks for them
+/// stand to the priming chain.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Prefix {
+    /// Sealed behind the system prompt alone; read by a reader that continues
+    /// the needles' conversation.
+    None,
+    /// Sealed behind the chain; the needles' conversation is cut from it once
+    /// sealed, so the reader reads the needles without the chain.
+    SealedBehindReadWithout,
+    /// Sealed behind the chain; the reader continues the needles'
+    /// conversation, so it reads the chain and then the needles, as sealed,
+    /// with the recurrence seeded from the lineage.
+    SealedBehindReadWith,
+    /// Sealed behind the chain and asked in the conversation that sealed them.
+    AskedWhereSealed,
+}
+
+const PREFIX_ARMS: [(&str, Prefix); 4] = [
+    ("no prefix", Prefix::None),
+    (
+        "sealed behind the chain, read without it",
+        Prefix::SealedBehindReadWithout,
+    ),
+    (
+        "sealed behind the chain, read with it",
+        Prefix::SealedBehindReadWith,
+    ),
+    (
+        "sealed behind the chain, asked where sealed",
+        Prefix::AskedWhereSealed,
+    ),
+];
+
+/// The question, asked under a diagnostic capture of `conv`'s decode: the
+/// answer, and how many distinct pieces of `chain` and of `needles` the
+/// slot held while it was decoded.
+fn ask_counting_pieces(
+    conv: &mut Sequence,
+    chain: TimelineId,
+    needles: TimelineId,
+) -> (String, usize, usize) {
+    assert!(
+        decode_diag::arm(DiagCapture {
+            control: Control::Sparse,
+            timeline: conv.timeline_id().raw(),
+            from: 0,
+            live_at: usize::MAX,
+        }),
+        "another diagnostic decode holds the capture"
+    );
+    let handle = conv.submit_turn(QUESTION).expect("submit the question");
+    let mut done = None;
+    for event in handle.stream() {
+        match event {
+            TurnEvent::Done(r) => done = Some(r),
+            TurnEvent::Error(e) => panic!("decoding failed: {e}"),
+            _ => {}
+        }
+    }
+    let capture = decode_diag::disarm();
+    let response = done.expect("the question finished");
+    conv.finish_turn(handle, &response).expect("finish_turn");
+    let count = |tl: TimelineId| {
+        let prefix = format!("turn:{}:", tl.raw());
+        let mut labels: Vec<&str> = capture
+            .pieces
+            .iter()
+            .map(|p| p.label.as_str())
+            .filter(|l| l.starts_with(&prefix))
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        labels.len()
+    };
+    (response.text, count(chain), count(needles))
+}
+
+/// **Recall with and without the priming chain's prefix.** In production every
+/// `code_reading` file's conversation is parented on the priming chain — the
+/// workspace's root listings and anchor documents — before its reading starts,
+/// with its recurrence seeded from the chain's end, so each of its turns is
+/// sealed behind the chain (`zend/src/code_read/mod.rs`). A dialogue later
+/// reads those turns' K/V.
+///
+/// The four needle turns stand in for one file's reading: sealed in their own
+/// conversation, behind the chain or behind nothing, and asked for by a
+/// reader that continues that conversation, with or without the chain in its
+/// lineage — and, as the control that the chain really was in the sealing
+/// slot, asked in the sealing conversation itself. The table counts the
+/// chain's and the needles' pieces in the slot each question decoded through.
+#[test]
+#[ignore = "loads Flash-Next and seals the priming chain's documents; \
+            run with --ignored --nocapture --test-threads=1, daemon stopped"]
+fn recall_with_and_without_the_priming_prefix() {
+    let device = Device::new_cuda(0).expect("CUDA device");
+    let b = builder();
+    let tok = b
+        .resolve_model(&device)
+        .expect("model pack resolved")
+        .tokenizer()
+        .expect("tokenizer");
+    let ws = workspace();
+    let eng = builder()
+        .workspace_path(ws.path())
+        .engine(&device)
+        .expect("engine");
+    let mut cfg = b.conversation_config();
+    cfg.kv_compression_level = Some(10);
+    let prompt = b.format_system_prompt();
+
+    let chain_script = chain_turns();
+    let chain_tokens: usize = chain_script
+        .iter()
+        .map(|t| tok.encode(t.as_str(), false).map(|e| e.len()).unwrap_or(0))
+        .sum();
+    let mut chain_conv = eng
+        .new_conversation(&prompt, cfg.clone())
+        .expect("the chain's conversation");
+    for t in &chain_script {
+        chain_conv
+            .insert_turn(t.as_str(), "Read.")
+            .unwrap_or_else(|e| panic!("sealing a chain link failed: {e}"));
+    }
+    let chain = chain_conv.timeline_id();
+    chain_conv.close().expect("close the chain");
+    println!(
+        "priming chain: {} links, {chain_tokens} tokens, timeline {}",
+        chain_script.len(),
+        chain.raw()
+    );
+
+    let mut rows = Vec::new();
+    for (label, prefix) in PREFIX_ARMS {
+        let mut sealing = eng
+            .new_conversation(&prompt, cfg.clone())
+            .expect("the needles' conversation");
+        let needles = sealing.timeline_id();
+        if prefix != Prefix::None {
+            eng.set_forked_from(needles, chain)
+                .expect("parent the needles on the chain");
+            assert!(
+                sealing
+                    .seed_recurrent_from_lineage()
+                    .expect("seed the recurrence"),
+                "[{label}] the chain left no recurrent snapshot to seed from"
+            );
+        }
+        for (vault, code) in NEEDLES {
+            sealing
+                .insert_turn(needle_turn(vault, code).as_str(), "OK")
+                .unwrap_or_else(|e| panic!("[{label}] sealing a needle failed: {e}"));
+        }
+        let (text, chain_pieces, needle_pieces) = if prefix == Prefix::AskedWhereSealed {
+            let asked = ask_counting_pieces(&mut sealing, chain, needles);
+            sealing.close().expect("close");
+            asked
+        } else {
+            sealing.close().expect("close");
+            if prefix == Prefix::SealedBehindReadWithout {
+                eng.clear_forked_from(needles)
+                    .expect("cut the needles from the chain");
+            }
+            let mut reader = eng
+                .new_conversation(&prompt, cfg.clone())
+                .expect("the reader");
+            eng.set_forked_from(reader.timeline_id(), needles)
+                .expect("parent the reader on the needles");
+            if prefix == Prefix::SealedBehindReadWith {
+                reader
+                    .seed_recurrent_from_lineage()
+                    .expect("seed the reader's recurrence");
+            }
+            let asked = ask_counting_pieces(&mut reader, chain, needles);
+            reader.close().expect("close");
+            asked
+        };
+        let got = recalled(&text);
+        println!(
+            "[{label}] {got}/4 · chain pieces in the slot {chain_pieces} · needle pieces \
+             {needle_pieces}/4 — {:?}",
+            answer(&text)
+        );
+        println!(
+            "[{label}] the whole reply:\n{}\n[{label}] end of reply",
+            text.trim()
+        );
+        rows.push((
+            label,
+            got,
+            chain_pieces,
+            needle_pieces,
+            answer(&text).to_string(),
+        ));
+    }
+
+    println!(
+        "\n### Recall with and without the priming prefix — chain {} links, {chain_tokens} \
+         tokens, C10\n",
+        chain_script.len()
+    );
+    println!("| Arm | Recalled | Chain pieces in the slot | Needle pieces | Answer |");
+    println!("|---|---:|---:|---:|---|");
+    for (label, got, chain_pieces, needle_pieces, a) in &rows {
+        println!(
+            "| {label} | {got}/4 | {chain_pieces} | {needle_pieces}/4 | {} |",
+            a.replace('\n', " / ")
+        );
+    }
+    assert_eq!(rows.len(), PREFIX_ARMS.len(), "every arm ran");
 }
 
 #[cfg(test)]
