@@ -133,6 +133,40 @@ code under Broome's name).
   quality does not degrade with depth, does not: recall falls from 4/4 inside
   the working set to 0–1/4 outside it.
 
+### Diagnosis: why selected turns are not used
+
+`why_recall_fails_past_the_working_set` and `recall_with_the_selection_forwarded`
+in the same test file run the failing cell (131K of history, C10) with the
+capped diagnostic capture (`decode_diag`) armed for the question's decode,
+which records for every attention layer's query which pieces of the slot the
+QSA index chose:
+
+| Arm | Recalled | Needle pieces in the slot | Queries reading a needle | Best needle rank |
+|---|---:|---|---:|---:|
+| sparse (production) | 0/4 | 3–4, at 11K–26K of ~31K | 77–81% | 0 |
+| dense (every cell attended) | 0/4 | 1–3 | — (no selection) | — |
+| fresh (every piece re-placed) | 0/4 | 3–4 | 78–83% | 0 |
+| needles last (just before the question) | 0/4 | 3, ending at the slot's end | 83–85% | 0 |
+| needles first (start of history) | **4/4** | 4, at 1.8K–6.7K | 100% | 0 |
+| needles first, dense | **4/4** | 4 | — | — |
+| **the failing selection, forwarded** | **3 of its 3** | the same 3, at the same positions | 100% | 0 |
+
+The failing reply's reasoning lists the history's file turns one by one and
+concludes *"At no point did the user tell me any vault codes"*; one run quoted
+a needle with another needle's vault name. The forwarded control takes the 17
+turns the failing projection selected, in its order, into a fresh conversation
+whose slot holds them whole: same tokens, same positions, same C10 storage, but
+every turn's K/V computed in this slot's context — and it gives every code the
+selection held. Retrieval, QSA selection, splicing, compression, position and
+distance from the cursor are each ruled out by an arm above; what differs is the
+context the sealed turns were computed in. A turn sealed 59K–106K tokens into a
+run of file readings carries that run in its K/V, and placed elsewhere it is
+attended but not taken as something the user said — the needles-first turns,
+sealed behind almost no context, are read. Forwarding also rebuilds the
+recurrent state, so this control alone does not separate K/V from recurrence;
+the needles-first and needles-last arms, whose recurrence saw the needles first
+and last respectively, argue against the recurrence.
+
 ### The first design, and why it was replaced
 
 A first run (same day) placed the needles in the first ~32K tokens. Every arm

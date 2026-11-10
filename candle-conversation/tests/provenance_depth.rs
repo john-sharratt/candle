@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use candle::Device;
+use candle_conversation::decode_diag::{self, Arm as DiagCapture, Control};
 use candle_conversation::{
     models::{Model, ModelBuilder},
     ConversationEngine, ProjectionEvent, SamplingConfig, SequenceConfig, TurnEvent,
@@ -231,13 +232,13 @@ fn file_turn(root: &Path, path: &Path) -> Option<String> {
 /// reached by those fills without any selection having found them; in the
 /// middle of a history several times the working set, only selection reaches
 /// them.
-fn history(tok: &Tokenizer, files: &[PathBuf], depth: usize) -> Vec<String> {
+fn history(tok: &Tokenizer, files: &[PathBuf], depth: usize, needles_at: f64) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let count = |s: &str| tok.encode(s, false).map(|e| e.len()).unwrap_or(0);
     let mut turns = Vec::new();
     let mut tokens = 0usize;
     let mut files = files.iter().filter_map(|p| file_turn(&root, p));
-    let lead = (depth as f64 * NEEDLES_AT) as usize;
+    let lead = (depth as f64 * needles_at) as usize;
     for t in files.by_ref() {
         if tokens >= lead {
             break;
@@ -405,7 +406,7 @@ fn recall_at_depth_past_the_working_set() {
     let files = source_files();
     let scripts: Vec<(usize, Vec<String>)> = DEPTHS
         .iter()
-        .map(|&d| (d, history(&tok, &files, d)))
+        .map(|&d| (d, history(&tok, &files, d, NEEDLES_AT)))
         .collect();
 
     let ws = workspace();
@@ -442,6 +443,320 @@ fn recall_at_depth_past_the_working_set() {
         );
     }
     assert_eq!(cells.len(), ARMS.len() * DEPTHS.len(), "every cell ran");
+}
+
+/// One diagnosis arm: how the question's decode attends, and where the
+/// needles sit in the history.
+struct DiagArm {
+    label: &'static str,
+    control: Control,
+    needles_at: f64,
+}
+
+const DIAG_DEPTH: usize = 131_072;
+
+const DIAG_ARMS: [DiagArm; 6] = [
+    DiagArm {
+        label: "sparse (production)",
+        control: Control::Sparse,
+        needles_at: NEEDLES_AT,
+    },
+    DiagArm {
+        label: "dense (every cell attended)",
+        control: Control::Dense,
+        needles_at: NEEDLES_AT,
+    },
+    DiagArm {
+        label: "fresh (every piece re-placed)",
+        control: Control::Fresh,
+        needles_at: NEEDLES_AT,
+    },
+    DiagArm {
+        label: "needles last, sparse",
+        control: Control::Sparse,
+        needles_at: 1.0,
+    },
+    DiagArm {
+        label: "needles first, sparse",
+        control: Control::Sparse,
+        needles_at: 0.0,
+    },
+    DiagArm {
+        label: "needles first, dense",
+        control: Control::Dense,
+        needles_at: 0.0,
+    },
+];
+
+/// What one diagnosed question read, reduced to the needle pieces.
+struct Diagnosis {
+    label: &'static str,
+    recalled: usize,
+    answer: String,
+    /// Needle turns in the last projection.
+    projected: usize,
+    /// The script positions of every turn the last projection held, in the
+    /// order it placed them.
+    selected: Vec<u32>,
+    /// The needle pieces' slot positions, and the slot's end.
+    needle_spans: Vec<(usize, usize)>,
+    slot_end: usize,
+    /// Attention-layer queries recorded, and how many read a needle piece.
+    queries: usize,
+    reading: usize,
+    /// Cells taken from needle pieces, over every recorded query.
+    needle_cells: usize,
+    /// Cells taken over every recorded query.
+    all_cells: usize,
+    /// The best rank any needle block reached in any query.
+    best_rank: Option<usize>,
+}
+
+fn diagnose(
+    eng: &ConversationEngine,
+    b: &ModelBuilder,
+    arm: &DiagArm,
+    turns: &[String],
+) -> Diagnosis {
+    let mut cfg = b.conversation_config();
+    cfg.kv_compression_level = Some(10);
+    let mut conv = eng
+        .new_conversation(&b.format_system_prompt(), cfg)
+        .expect("new_conversation");
+    for t in turns {
+        conv.insert_turn(t.as_str(), reply(t))
+            .unwrap_or_else(|e| panic!("[{}] insert_turn failed: {e}", arm.label));
+    }
+    let timeline = conv.timeline_id().raw();
+    assert!(
+        decode_diag::arm(DiagCapture {
+            control: arm.control,
+            timeline,
+            from: 0,
+            live_at: usize::MAX,
+        }),
+        "another diagnostic decode holds the capture"
+    );
+    let handle = conv.submit_turn(QUESTION).expect("submit the question");
+    let mut points: Vec<ProjectionEvent> = Vec::new();
+    let mut done = None;
+    for event in handle.stream() {
+        match event {
+            TurnEvent::Projection(p) => points.push(p),
+            TurnEvent::Done(r) => done = Some(r),
+            TurnEvent::Error(e) => panic!("[{}] decoding failed: {e}", arm.label),
+            _ => {}
+        }
+    }
+    let capture = decode_diag::disarm();
+    let response = done.expect("the question finished");
+    conv.finish_turn(handle, &response).expect("finish_turn");
+    conv.close().expect("close");
+
+    let needles = needle_positions(turns);
+    let labels: Vec<String> = needles
+        .iter()
+        .map(|i| format!("turn:{timeline}:{i}"))
+        .collect();
+    let projected = points.last().map_or(0, |p| {
+        p.selection
+            .turns
+            .iter()
+            .filter(|t| needles.contains(&t.index))
+            .count()
+    });
+    let needle_spans = capture
+        .pieces
+        .iter()
+        .filter(|p| labels.contains(&p.label))
+        .map(|p| (p.start, p.end))
+        .collect();
+    let slot_end = capture.pieces.iter().map(|p| p.end).max().unwrap_or(0);
+    let mut d = Diagnosis {
+        label: arm.label,
+        recalled: recalled(&response.text),
+        answer: answer(&response.text).to_string(),
+        projected,
+        selected: points.last().map_or_else(Vec::new, |p| {
+            p.selection
+                .turns
+                .iter()
+                .map(|t| t.index)
+                .filter(|&i| (i as usize) < turns.len())
+                .collect()
+        }),
+        needle_spans,
+        slot_end,
+        queries: capture.layers.len(),
+        reading: 0,
+        needle_cells: 0,
+        all_cells: 0,
+        best_rank: None,
+    };
+    for r in &capture.layers {
+        d.all_cells += r.attended_cells;
+        let hit: Vec<_> = r
+            .pieces
+            .iter()
+            .filter(|p| labels.contains(&p.label))
+            .collect();
+        let cells: usize = hit.iter().map(|p| p.attended_cells).sum();
+        if cells > 0 {
+            d.reading += 1;
+        }
+        d.needle_cells += cells;
+        for p in hit {
+            d.best_rank = Some(d.best_rank.map_or(p.best_rank, |b| b.min(p.best_rank)));
+        }
+    }
+    println!(
+        "[{}] {}/4 recalled · needle turns in the last projection {}/4 · needle pieces at {:?} \
+         of a {}-position slot · {} of {} layer queries read a needle piece · {} of {} cells \
+         · best needle rank {:?} — {:?}",
+        d.label,
+        d.recalled,
+        d.projected,
+        d.needle_spans,
+        d.slot_end,
+        d.reading,
+        d.queries,
+        d.needle_cells,
+        d.all_cells,
+        d.best_rank,
+        d.answer
+    );
+    println!(
+        "[{}] the whole reply, reasoning included:\n{}\n[{}] end of reply",
+        d.label,
+        response.text.trim(),
+        d.label
+    );
+    d
+}
+
+/// **Why recall fails past the working set**, at the failing cell (131K of
+/// history, C10, the engine's 32K slot): the question's decode under the
+/// capped diagnostic capture (`decode_diag`), which records for every
+/// attention layer's query which pieces of the slot QSA's index chose.
+///
+/// - **sparse** is the production decode;
+/// - **dense** attends every cell, so QSA's selection cannot be what drops the
+///   needles;
+/// - **fresh** places every piece anew at each reprojection, so nothing is
+///   spliced;
+/// - **needles last** states the same needles just before the question, so
+///   they are near the decode cursor in the slot and in the recurrence alike.
+#[test]
+#[ignore = "loads Flash-Next and inserts 131K tokens of history per arm; \
+            run with --ignored --nocapture --test-threads=1, daemon stopped"]
+fn why_recall_fails_past_the_working_set() {
+    let device = Device::new_cuda(0).expect("CUDA device");
+    let b = builder();
+    let tok = b
+        .resolve_model(&device)
+        .expect("model pack resolved")
+        .tokenizer()
+        .expect("tokenizer");
+    let files = source_files();
+    let ws = workspace();
+    let eng = builder()
+        .workspace_path(ws.path())
+        .engine(&device)
+        .expect("engine");
+    let rows: Vec<Diagnosis> = DIAG_ARMS
+        .iter()
+        .map(|arm| {
+            diagnose(
+                &eng,
+                &b,
+                arm,
+                &history(&tok, &files, DIAG_DEPTH, arm.needles_at),
+            )
+        })
+        .collect();
+
+    println!("\n### Why recall fails past the working set — {DIAG_DEPTH} tokens, C10\n");
+    println!(
+        "| Arm | Recalled | Needles projected | Needle pieces (slot positions) | Slot end | \
+         Queries reading a needle | Needle cells / all | Best needle rank |"
+    );
+    println!("|---|---:|---:|---|---:|---:|---:|---:|");
+    for d in &rows {
+        println!(
+            "| {} | {}/4 | {}/4 | {:?} | {} | {}/{} | {}/{} | {:?} |",
+            d.label,
+            d.recalled,
+            d.projected,
+            d.needle_spans,
+            d.slot_end,
+            d.reading,
+            d.queries,
+            d.needle_cells,
+            d.all_cells,
+            d.best_rank
+        );
+    }
+    assert_eq!(rows.len(), DIAG_ARMS.len(), "every arm ran");
+}
+
+/// **The fully-forwarded control** for the failing cell: the turns the
+/// production projection selected, in the order it placed them, inserted
+/// alone into a fresh conversation, which then holds them whole inside the
+/// working set — every turn's K/V computed in this slot's own context rather
+/// than borrowed from the one it was first sealed in.
+///
+/// If the forwarded selection recalls what the projected one does not, the
+/// cause is the borrowed K/V: a sealed turn carries the hidden states of the
+/// context it was computed in. If it fails as well, the selection's
+/// arrangement itself is what the model cannot read.
+#[test]
+#[ignore = "loads Flash-Next and inserts 131K tokens of history; \
+            run with --ignored --nocapture --test-threads=1, daemon stopped"]
+fn recall_with_the_selection_forwarded() {
+    let device = Device::new_cuda(0).expect("CUDA device");
+    let b = builder();
+    let tok = b
+        .resolve_model(&device)
+        .expect("model pack resolved")
+        .tokenizer()
+        .expect("tokenizer");
+    let files = source_files();
+    let ws = workspace();
+    let eng = builder()
+        .workspace_path(ws.path())
+        .engine(&device)
+        .expect("engine");
+    let script = history(&tok, &files, DIAG_DEPTH, NEEDLES_AT);
+    let projected = diagnose(&eng, &b, &DIAG_ARMS[0], &script);
+    let forwarded_turns: Vec<String> = projected
+        .selected
+        .iter()
+        .map(|&i| script[i as usize].clone())
+        .collect();
+    let arm = DiagArm {
+        label: "the same selection, forwarded",
+        control: Control::Sparse,
+        needles_at: NEEDLES_AT,
+    };
+    let forwarded = diagnose(&eng, &b, &arm, &forwarded_turns);
+    println!(
+        "\n### The fully-forwarded control — {DIAG_DEPTH} tokens, C10\n\n\
+         | Arm | Turns | Recalled | Needles projected |\n|---|---:|---:|---:|\n\
+         | projected from the history | {} | {}/4 | {}/4 |\n\
+         | the same selection, forwarded | {} | {}/4 | {}/4 |\n\
+         selection {:?}",
+        script.len(),
+        projected.recalled,
+        projected.projected,
+        forwarded_turns.len(),
+        forwarded.recalled,
+        forwarded.projected,
+        projected.selected
+    );
+    assert!(
+        !projected.selected.is_empty(),
+        "the projected run recorded no selection to forward"
+    );
 }
 
 #[cfg(test)]
