@@ -72,13 +72,22 @@ happens:
   COMPACTION_DEAD_RATIO_THRESHOLD` — a liveness-derived fraction that *falls* as
   the pass reclaims. So a pass that reclaims makes the next one less likely,
   regardless of how many markers are standing.
-- **Marking is KV-gated** — a calibration timeline is distill-marked only if it
-  `timeline_has_kv()` (content still present) and isn't already marked. Once
-  compaction has reclaimed a timeline's KV, it's never re-marked, so no new
+- **Marking is once per timeline** — a calibration timeline is distill-marked
+  unless it is marked already (`is_timeline_distilled`), and the marker is
+  resident, so a reclaimed timeline is never re-marked and no second
   `Distilled` record is written.
+- **Marking is not gated on K/V reaching disk.** An exemplar is transient
+  (`mark_timeline_transient`), so none of its chunks is ever written cold: a
+  gate on on-disk chunks was always false and no exemplar was ever marked.
+  Each was then kept archived with its tokens and a declaration claiming K/V,
+  and every other member held its turns as still arriving
+  (`docs/replicated_substrate.md` §6.5) — 2,462 on BlackWorld, ~85K on
+  WhiteWorld (2026-11-11). The marker is what completes them there: applying
+  a remote `Distilled` record makes each of its timeline's turns a candidate
+  for adoption.
 
-Together: the marker set is monotonic (it only grows, and only while there is KV
-left to reclaim), and the trigger is a ratio that the reclaim itself drives down.
+Together: the marker set is monotonic (it only grows, one marker a timeline),
+and the trigger is a ratio that the reclaim itself drives down.
 Reaches a steady sig-only state after one reclaim pass; never loops.
 
 - **Reload after compaction** — compaction rewrites the log, and while

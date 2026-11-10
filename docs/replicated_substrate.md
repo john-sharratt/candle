@@ -2486,6 +2486,11 @@ never nests a read inside a held guard. Windows SRW locks deadlock on that
   enough on its own. A turn whose declaration claims no K/V — a summary node — holds
   nothing more than its declaration, and a distilled timeline's turns were shed on
   purpose, so either is complete as declared (`persistence/remote/completeness.rs`).
+  The `Distilled` marker can arrive after the turns it covers, so applying one makes
+  every declared turn of its timeline a candidate for adoption, as a turn's own
+  records do (`persistence/remote/apply.rs`). A transient timeline's K/V is never
+  written, so the marker is the only thing that can complete its turns on another
+  member.
   - The turn goes in the slot its stamp gives it in the timeline's order (§6.6). A
     position below it that holds nothing is a **gap**: an empty placeholder the
     substrate records as one (`substrate/turn_placement.rs`). Reconstruction fills a

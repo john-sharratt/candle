@@ -1195,7 +1195,10 @@ fn mark_calibration_distill(
     timing.time(
         |t| &mut t.distill,
         || {
-            if engine.timeline_has_kv(timeline) && !engine.is_timeline_distilled(timeline) {
+            // Whether or not any chunk reached disk: an exemplar is transient,
+            // so none did, and without the marker a peer holds its turns as
+            // still arriving, waiting for K/V that is never written.
+            if !engine.is_timeline_distilled(timeline) {
                 // Calibration exemplars stay retrievable by signature — provenance-only.
                 if let Err(e) = engine.distill_timeline(timeline, DistillMode::ProvenanceOnly) {
                     tracing::warn!(tool = tool, "calibration distill mark failed: {e}");

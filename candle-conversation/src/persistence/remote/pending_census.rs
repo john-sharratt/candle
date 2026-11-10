@@ -6,8 +6,9 @@
 //! answers mean different faults:
 //!
 //! - **no tokens** — the turn's own records never arrived;
-//! - **no chunks** — its K/V was never written where replication carries it,
-//!   or every chunk was dropped on arrival;
+//! - **no chunks** — its K/V was never written where replication carries it
+//!   (a transient timeline whose `Distilled` marker has not arrived), or every
+//!   chunk was dropped on arrival;
 //! - **some chunks** — part of its K/V arrived, or the layer count a turn is
 //!   judged against differs from the one it was written with.
 //!

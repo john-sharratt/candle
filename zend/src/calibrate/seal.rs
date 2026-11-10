@@ -74,7 +74,10 @@ pub(crate) fn seal_calibration(
     engine
         .set_conversation_archived(timeline, true)
         .map_err(|err| anyhow::anyhow!("archiving the calibration: {err}"))?;
-    if engine.timeline_has_kv(timeline) && !engine.is_timeline_distilled(timeline) {
+    // Distilled whether or not any chunk reached disk: transient, none did,
+    // and a peer holds the turns as still arriving until the marker says
+    // their K/V was shed.
+    if !engine.is_timeline_distilled(timeline) {
         engine
             .distill_timeline(timeline, DistillMode::ProvenanceOnly)
             .map_err(|err| anyhow::anyhow!("distilling the calibration: {err}"))?;

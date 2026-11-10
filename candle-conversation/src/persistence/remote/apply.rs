@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use heap_census::{enter, Scope};
 
 use super::super::identity::{RecordIdentity, GEN_DETACHED};
-use super::super::record::{Record, RecordHeader, RecordType, SectionTombstonePayload};
+use super::super::record::{
+    DistillPayload, Record, RecordHeader, RecordType, SectionTombstonePayload,
+};
 use super::super::replica::DeferredRecord;
 use super::super::rewritten::Rewritten;
 use super::super::streams::{StreamDecl, StreamId};
@@ -49,6 +51,15 @@ fn completes_turns(rt: RecordType) -> bool {
         rt,
         RecordType::StreamDecl | RecordType::Tokens | RecordType::Chunk
     )
+}
+
+/// The timeline a `Distilled` record marks; `None` for any other record, or
+/// one whose payload does not decode.
+fn distilled_timeline(h: &RecordHeader, payload: &[u8]) -> Option<u64> {
+    if h.record_type != RecordType::Distilled {
+        return None;
+    }
+    DistillPayload::decode(payload).ok().map(|p| p.timeline_id)
 }
 
 impl SubstratePersistence {
@@ -317,6 +328,14 @@ impl SubstratePersistence {
             decided
                 .turns
                 .insert(StreamKey::of(StreamId(h.stream_id), &id));
+        }
+        // A distilled timeline's turns are complete as declared, so the marker
+        // completes every one of them still waiting for K/V that is never
+        // coming.
+        if let Some(timeline) = distilled_timeline(&h, &entry.record.payload) {
+            decided
+                .turns
+                .extend(substrate.turn_streams_of(timeline).map(|(_, key, _)| key));
         }
         decided.applied.push(Rewritten::keep(&entry));
         Ok(RemoteOutcome::Written(at))

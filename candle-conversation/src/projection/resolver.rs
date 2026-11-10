@@ -4379,25 +4379,6 @@ impl Conversation {
         self.read().is_distilled(timeline)
     }
 
-    /// Whether `timeline` still has KV chunks on any of its turns — i.e. content
-    /// not yet reclaimed. Callers gate distill-marking on this so a
-    /// content-reclaimed timeline is never re-marked (which would keep triggering
-    /// compaction forever).
-    pub fn timeline_has_kv(&self, timeline: TimelineId) -> bool {
-        use crate::persistence::content_hash::turn_stream_id;
-        let sub = self.inner.read();
-        // Scope to this timeline's own turn streams — O(turns), not a scan of the
-        // whole stream table.
-        for idx in 0..sub.turn_count(timeline) {
-            if let Some(e) = sub.stream_of(turn_stream_id(timeline.raw(), idx)) {
-                if !e.chunks.is_empty() {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// Flag every turn residence of `timeline` for full eviction once its KV is
     /// durable on disk — see [`crate::substrate::Substrate::mark_timeline_evict_when_cold`].
     /// The persistence pipeline then frees the turns' VRAM (at warm-land) and

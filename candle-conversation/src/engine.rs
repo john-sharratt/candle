@@ -1882,13 +1882,6 @@ impl ConversationEngine {
         }
     }
 
-    /// Whether `timeline` still has KV content (not yet reclaimed by a distill
-    /// compaction). Gate distill-marking on this to keep it idempotent and avoid
-    /// looping compaction.
-    pub fn timeline_has_kv(&self, timeline: TimelineId) -> bool {
-        self.conversation.timeline_has_kv(timeline)
-    }
-
     /// Fully evict a **completed ingest** `timeline`'s KV from VRAM + RAM once
     /// it is durable on disk: flag every turn residence `evict_when_cold` and
     /// wake the persistence thread so the hot→warm→cold pipeline runs promptly.

@@ -11,7 +11,8 @@ use tempfile::TempDir;
 
 use super::super::identity::{RecordIdentity, GEN_DETACHED};
 use super::super::record::{
-    encode_record, ChunkPayload, RecordHeader, RecordType, TombstonePayload,
+    encode_record, ChunkPayload, DistillMode, DistillPayload, RecordHeader, RecordType,
+    TombstonePayload,
 };
 use super::super::resume::encode_token_ids;
 use super::super::streams::{StreamDecl, TurnDecl};
@@ -134,6 +135,30 @@ impl Store {
         ids
     }
 
+    /// A transient turn as `origin` wrote it: its declaration claims a block,
+    /// and only its declaration and tokens are ever written.
+    fn write_transient_turn(
+        &mut self,
+        origin: u64,
+        hlc: u64,
+        tokens: &[u32],
+    ) -> Vec<RecordIdentity> {
+        let mut ids = self.write_turn(0, origin, hlc, tokens);
+        ids.truncate(2);
+        ids
+    }
+
+    fn distill(&mut self, origin: u64, hlc: u64) -> RecordIdentity {
+        let payload = DistillPayload {
+            timeline_id: TL,
+            mode: DistillMode::ProvenanceOnly,
+        }
+        .encode();
+        let id = at(origin, hlc);
+        self.append(RecordType::Distilled, 0, 0, &payload, id);
+        id
+    }
+
     fn tombstone(&mut self, origin: u64, hlc: u64) -> RecordIdentity {
         let payload = TombstonePayload {
             timeline_id: TL,
@@ -222,6 +247,36 @@ fn permute(items: &mut Vec<usize>, k: usize, out: &mut Vec<Vec<usize>>) {
         permute(items, k + 1, out);
         items.swap(k, i);
     }
+}
+
+/// A transient turn's K/V is never written, so its declaration and tokens
+/// leave it pending; the `Distilled` marker that follows completes it.
+#[test]
+fn a_distilled_marker_completes_a_turn_whose_kv_never_comes() {
+    let mut sender = store();
+    let turn = sender.write_transient_turn(A, 10, &[7, 8]);
+    let marker = sender.distill(A, 20);
+    let mut receiver = store();
+    let batch = receiver.apply(&sender.events(&turn));
+    assert_eq!(written(&batch), 2);
+    assert!(batch.adopted.is_empty(), "no chunk has come");
+    let batch = receiver.apply(&sender.events(&[marker]));
+    assert_eq!(written(&batch), 1);
+    assert_eq!(batch.adopted, vec![(tl(), TurnIndex(0))]);
+    assert_eq!(receiver.tokens(), vec![vec![7, 8]]);
+}
+
+/// The marker arriving first, the turn is adopted with its last record.
+#[test]
+fn a_turn_arriving_after_its_distilled_marker_is_adopted() {
+    let mut sender = store();
+    let turn = sender.write_transient_turn(A, 10, &[7, 8]);
+    let marker = sender.distill(A, 20);
+    let mut receiver = store();
+    let batch = receiver.apply(&sender.events(&[marker]));
+    assert!(batch.adopted.is_empty());
+    let batch = receiver.apply(&sender.events(&turn));
+    assert_eq!(batch.adopted, vec![(tl(), TurnIndex(0))]);
 }
 
 /// A turn whose predecessor has not arrived is adopted above a gap, and the
