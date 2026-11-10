@@ -50,6 +50,30 @@ nothing in the round to explain it. Rounds 47–57 dip and the longer rounds aft
 them recover, so the dip is not the conversation's length; the round log does
 not record what else the card was running at the time.
 
+## Against published agent traffic
+
+| | Output : new input | Output : all input sent |
+|---|---:|---:|
+| This session | 1 : 2.9 (82,963 : 238,619) | 1 : ~230 if re-sent as a stateless client would (~19M tokens) |
+| OpenRouter agentic traffic, Sept 2026 | ~1 : 12 (1% output, 12% novel prompt) | ~1 : 99 (1% output) |
+
+- OpenRouter, *Cache is Crucial* (8 October 2026,
+  https://openrouter.ai/data/newsletter/cache-is-crucial): "In September,
+  cached prompt tokens were just under 90% of all agentic tokens. Novel prompt
+  tokens made up most of the rest, and output plus reasoning was a sliver of
+  around 1%"; worked example "roughly 87% cached, 12% novel prompt, 1% output";
+  human traffic ~12% output. Agentic keys are classified by tool-call frequency,
+  turns per conversation and request spacing. Novel prompt tokens include
+  re-reads a provider did not cache.
+- *How Do AI Agents Spend Your Money?* (arXiv:2604.22750, October 2026),
+  SWE-bench Verified under OpenHands, eight models: "input tokens, not output
+  tokens, dominate the overall cost in agentic coding, even when token caching
+  is enabled"; agentic tasks consume ~1000× (abstract) to 3500× (§3) the tokens
+  of single-round reasoning. No numeric input : output ratio is stated in its
+  text.
+- The re-sent estimate is the sum, over rounds 0–84, of the conversation's
+  length at each round plus the round's new input: ~18.8M tokens.
+
 ## What the numbers do not separate
 
 The session had no control run. Whether the ratio is the provenance-selected
