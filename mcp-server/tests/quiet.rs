@@ -143,7 +143,9 @@ async fn a_quiet_call_leaves_no_line_in_the_log() {
         .with_state(app);
     let client = json!({"name": "claude-code"});
     let quiet = json!({"io.modelcontextprotocol/clientInfo": client, "com.tokera/quiet": true});
-    assert!(echo(&router, 1, "SYNTHETIC-QUIET", quiet).await.contains("SYNTHETIC-QUIET"));
+    assert!(echo(&router, 1, "SYNTHETIC-QUIET", quiet)
+        .await
+        .contains("SYNTHETIC-QUIET"));
     assert!(!kept.text().contains("mcp: handled"), "{}", kept.text());
     let plain = json!({"io.modelcontextprotocol/clientInfo": client});
     assert!(echo(&router, 2, "spoken", plain).await.contains("spoken"));

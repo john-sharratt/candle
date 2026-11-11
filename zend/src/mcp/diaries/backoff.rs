@@ -150,12 +150,18 @@ mod tests {
         let b = Backoff::default();
         for i in 0..FREE - 1 {
             fail(&b, "o", i as u64);
-            assert!(b.attempt("o", i as u64).map(|a| a.found(true)).is_ok(), "free");
+            assert!(
+                b.attempt("o", i as u64).map(|a| a.found(true)).is_ok(),
+                "free"
+            );
         }
         fail(&b, "o", 10);
         assert_eq!(b.attempt("o", 10).err(), Some(FIRST_WAIT_MS));
         fail(&b, "o", 10 + FIRST_WAIT_MS);
-        assert_eq!(b.attempt("o", 10 + FIRST_WAIT_MS).err(), Some(2 * FIRST_WAIT_MS));
+        assert_eq!(
+            b.attempt("o", 10 + FIRST_WAIT_MS).err(),
+            Some(2 * FIRST_WAIT_MS)
+        );
         assert!(b.attempt("other", 10).is_ok(), "per account");
         let mut at = 10_000_000;
         for _ in 0..40 {
@@ -165,7 +171,10 @@ mod tests {
             at += MAX_WAIT_MS;
         }
         assert_eq!(b.attempt("o", at - MAX_WAIT_MS).err(), Some(MAX_WAIT_MS));
-        assert!(b.attempt("o", at + FORGOTTEN_AFTER_MS + 1).is_ok(), "forgotten after a day");
+        assert!(
+            b.attempt("o", at + FORGOTTEN_AFTER_MS + 1).is_ok(),
+            "forgotten after a day"
+        );
     }
 
     /// **An open of one's own passphrase is no way round the waits**: it takes

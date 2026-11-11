@@ -102,17 +102,36 @@ mod tests {
         );
         assert!(text.starts_with(NOT_INSTRUCTIONS), "{text}");
         assert!(text.ends_with(HOW));
-        let spoken = render(&t, &zen, None, Channel::Grok, false, false, Stamp::from_secs(0));
+        let spoken = render(
+            &t,
+            &zen,
+            None,
+            Channel::Grok,
+            false,
+            false,
+            Stamp::from_secs(0),
+        );
         assert!(
             spoken.contains(VOICE_SPINE) && !spoken.contains(HOW),
             "{spoken}"
         );
-        let guest = render(&t, &zen, None, Channel::Other, true, false, Stamp::from_secs(0));
+        let guest = render(
+            &t,
+            &zen,
+            None,
+            Channel::Other,
+            true,
+            false,
+            Stamp::from_secs(0),
+        );
         assert!(guest.ends_with(GUEST_HOW));
         for channel in [Channel::ClaudeCode, Channel::Grok] {
             let private = render(&t, &zen, None, channel, false, true, Stamp::from_secs(0));
             assert!(private.ends_with(PRIVATE_HOW), "{private}");
-            assert!(!private.contains(HOW), "a private frame says nothing of writing");
+            assert!(
+                !private.contains(HOW),
+                "a private frame says nothing of writing"
+            );
         }
     }
 }

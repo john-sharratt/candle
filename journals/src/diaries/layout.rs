@@ -71,7 +71,10 @@ impl fmt::Display for DiaryId {
 /// Whether `path` is under [`DIR`]: a diary's, the salt, or anything else
 /// there — none of it any journal's, and none of it read as one.
 pub fn in_diaries(path: &str) -> bool {
-    path == DIR || path.strip_prefix(DIR).is_some_and(|rest| rest.starts_with('/'))
+    path == DIR
+        || path
+            .strip_prefix(DIR)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// A new salt, from the OS.
@@ -93,8 +96,14 @@ mod tests {
         assert_eq!(id.path(), format!("diaries/{}.bin", "ab".repeat(16)));
         assert_eq!(DiaryId::of_path(&id.path()), Some(id));
         assert_eq!(DiaryId::of_path("diaries/salt"), None);
-        assert_eq!(DiaryId::of_path(&format!("diaries/{}.bin", "AB".repeat(16))), None);
-        assert_eq!(DiaryId::of_path(&format!("groups/{}.bin", "ab".repeat(16))), None);
+        assert_eq!(
+            DiaryId::of_path(&format!("diaries/{}.bin", "AB".repeat(16))),
+            None
+        );
+        assert_eq!(
+            DiaryId::of_path(&format!("groups/{}.bin", "ab".repeat(16))),
+            None
+        );
         assert_ne!(DiaryId::random(), DiaryId::random());
     }
 

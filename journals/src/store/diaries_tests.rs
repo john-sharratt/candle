@@ -58,7 +58,10 @@ fn a_diary_is_one_commit_the_tree_never_reads() {
         git(&dir, &["log", "-1", "--format=%an <%ae>|%B", &head]),
         "journal service <journals@tokera>|diaries: update\n\nJournal-Diaries: update"
     );
-    assert!(s.write_diaries(&changes(&salt, &id, &file)).is_err(), "nothing changed");
+    assert!(
+        s.write_diaries(&changes(&salt, &id, &file)).is_err(),
+        "nothing changed"
+    );
     let stray = Changes::from([("groups/zen/x.bin".to_string(), Some(vec![1]))]);
     assert!(s.write_diaries(&stray).is_err(), "only diaries' files");
     s.sync().unwrap();
@@ -74,7 +77,8 @@ fn a_diary_commit_is_replayed_whole_onto_a_moved_origin() {
     let r = Repos::new();
     let mut a = Store::open(&r.clone("a")).unwrap();
     let mut b = Store::open(&r.clone("b")).unwrap();
-    b.write(&yen(), &note("Origin moved first."), now()).unwrap();
+    b.write(&yen(), &note("Origin moved first."), now())
+        .unwrap();
     b.sync().unwrap();
     let salt = new_salt();
     let (id, file) = sealed("synthetic pass", &salt);
@@ -87,7 +91,10 @@ fn a_diary_commit_is_replayed_whole_onto_a_moved_origin() {
     let deleted = Changes::from([(id.path(), None)]);
     a.write_diaries(&deleted).unwrap();
     a.sync().unwrap();
-    assert_eq!(Store::open(&r.clone("after")).unwrap().diary_file(&id), None);
+    assert_eq!(
+        Store::open(&r.clone("after")).unwrap().diary_file(&id),
+        None
+    );
 }
 
 /// **The salt is written once**: a write replacing it is refused, and a
@@ -107,7 +114,11 @@ fn the_salt_is_never_replaced() {
     let synced = a.sync().unwrap();
     assert_eq!(synced.dropped.len(), 1, "{:?}", synced.dropped);
     let check = Store::open(&r.clone("check")).unwrap();
-    assert_eq!(check.diary_salt(), Some(salt_b.as_slice()), "origin's salt stands");
+    assert_eq!(
+        check.diary_salt(),
+        Some(salt_b.as_slice()),
+        "origin's salt stands"
+    );
     assert_eq!(check.diary_file(&id_b), Some(file_b.as_slice()));
     let replaced = Changes::from([(SALT.to_string(), Some(salt_a.to_vec()))]);
     assert!(b.write_diaries(&replaced).is_err());

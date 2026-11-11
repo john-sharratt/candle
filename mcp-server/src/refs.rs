@@ -296,7 +296,10 @@ mod tests {
             named_in("This conversation's ref is `abc-_1`. Pass it on.\n\nMemory."),
             Some("abc-_1")
         );
-        assert_eq!(named_in("Memory first.\nThis conversation's ref is `x`."), None);
+        assert_eq!(
+            named_in("Memory first.\nThis conversation's ref is `x`."),
+            None
+        );
         assert_eq!(named_in(""), None);
     }
 

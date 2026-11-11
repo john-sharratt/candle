@@ -87,7 +87,10 @@ mod tests {
         assert!(r.reads("journals/persons/john/person.yaml"));
         assert!(!r.reads("journals/groups/guest/topics/a.yaml"));
         assert!(!r.reads("journals/persons/yen/person.yaml"));
-        assert!(!r.reads("journals/diaries/salt"), "no one retrieves a diary");
+        assert!(
+            !r.reads("journals/diaries/salt"),
+            "no one retrieves a diary"
+        );
         assert!(!r.reads(&format!("journals/diaries/{}.bin", "ab".repeat(16))));
     }
 

@@ -59,7 +59,11 @@ async fn a_private_conversation_opens_nothing_and_writes_nothing() {
     let fresh = ctx(&session, john(), None);
     let begun = tools::call(&fresh, "get_user_context", &json!({"private_mode": true})).await;
     assert!(!begun.is_error, "{}", begun.text);
-    assert!(begun.text.contains("This conversation is private"), "{}", begun.text);
+    assert!(
+        begun.text.contains("This conversation is private"),
+        "{}",
+        begun.text
+    );
     assert!(
         !begun.text.contains("conversations/"),
         "no journal is named for it: {}",
@@ -72,9 +76,15 @@ async fn a_private_conversation_opens_nothing_and_writes_nothing() {
     let read = tools::call(&c, "journal_read", &json!({"journal": "people/john"})).await;
     assert!(!read.is_error, "{}", read.text);
     for (tool, args) in [
-        ("journal_note", json!({"journal": "here", "text": "The synthetic gadget is red."})),
+        (
+            "journal_note",
+            json!({"journal": "here", "text": "The synthetic gadget is red."}),
+        ),
         ("journal_focus", json!({"speaker": "john"})),
-        ("user_episode_note", json!({"tool": "image_generate", "summary": "a synthetic cat"})),
+        (
+            "user_episode_note",
+            json!({"tool": "image_generate", "summary": "a synthetic cat"}),
+        ),
         ("thread_attach", json!({"thread": "synthetic-thread"})),
     ] {
         let refused = tools::call(&c, tool, &args).await;
@@ -90,7 +100,10 @@ async fn a_private_conversation_opens_nothing_and_writes_nothing() {
     assert_eq!(session.mcp().noted().waiting(), 0, "no episode was noted");
     assert_eq!(conversations(&session), 0);
     let again = tools::call(&c, "get_user_context", &json!({"ref": text})).await;
-    assert!(again.text.contains("This conversation is private"), "still private");
+    assert!(
+        again.text.contains("This conversation is private"),
+        "still private"
+    );
 }
 
 /// **In a private conversation zend refuses every write the table names,
@@ -119,7 +132,11 @@ async fn every_write_is_refused_and_no_read_leaves_a_record() {
     for tool in reads {
         tools::call(&c, tool, &json!({"wait_s": 0})).await;
     }
-    assert_eq!(records.under("mcp/"), before, "a private read wrote a record");
+    assert_eq!(
+        records.under("mcp/"),
+        before,
+        "a private read wrote a record"
+    );
     assert_eq!(conversations(&session), 0);
 }
 
@@ -128,7 +145,10 @@ async fn every_write_is_refused_and_no_read_leaves_a_record() {
 async fn a_diary_needs_a_private_conversation() {
     let (_dirs, session, _) = test_session::session(|_| {});
     let (_, normal) = conversation(&session, &john(), false);
-    for c in [ctx(&session, john(), None), ctx(&session, john(), Some(normal))] {
+    for c in [
+        ctx(&session, john(), None),
+        ctx(&session, john(), Some(normal)),
+    ] {
         let refused = tools::call(&c, "diary_list", &json!({})).await;
         assert_eq!(refused.text, DIARIES_PRIVATE);
     }
@@ -159,7 +179,10 @@ async fn a_diary_end_to_end_through_the_server() {
     let (text, _) = conversation(&session, &john(), true);
     let mine = served(&session, john(), &text);
     for tool in ["diary_open", "diary_read", "diary_write"] {
-        assert!(!session.logs(&mine, tool, &json!({})), "{tool} is logged nowhere");
+        assert!(
+            !session.logs(&mine, tool, &json!({})),
+            "{tool} is logged nowhere"
+        );
     }
     let call = |name: &'static str, args: Value| {
         let (session, mine) = (Arc::clone(&session), served(&session, john(), &text));
@@ -170,8 +193,15 @@ async fn a_diary_end_to_end_through_the_server() {
         }
     };
     let pass = "synthetic diary passphrase";
-    assert_eq!(call("diary_open", json!({"passphrase": pass})).await, "Opened 0 diaries.");
-    call("diary_create", json!({"topic": "synthetic-garden", "passphrase": pass})).await;
+    assert_eq!(
+        call("diary_open", json!({"passphrase": pass})).await,
+        "Opened 0 diaries."
+    );
+    call(
+        "diary_create",
+        json!({"topic": "synthetic-garden", "passphrase": pass}),
+    )
+    .await;
     call(
         "diary_write",
         json!({"topic": "synthetic-garden", "text": "Planted synthetic beans.", "author": "user"}),
@@ -183,7 +213,9 @@ async fn a_diary_end_to_end_through_the_server() {
                "ts": "2026-11-01T08:00:00Z"}),
     )
     .await;
-    let long: String = (0..2_000).map(|i| format!("synthetic line {i:05}\n")).collect();
+    let long: String = (0..2_000)
+        .map(|i| format!("synthetic line {i:05}\n"))
+        .collect();
     assert!(long.len() > 32_000, "longer than any answer is cut to");
     call(
         "diary_write",
@@ -201,7 +233,11 @@ async fn a_diary_end_to_end_through_the_server() {
         .unwrap()
         .to_string();
     assert_eq!(
-        call("diary_delete", json!({"topic": "synthetic-garden", "ids": [id]})).await,
+        call(
+            "diary_delete",
+            json!({"topic": "synthetic-garden", "ids": [id]})
+        )
+        .await,
         "Deleted 1 entry."
     );
     call("diary_close", json!({})).await;
@@ -213,10 +249,16 @@ async fn a_diary_end_to_end_through_the_server() {
     )
     .await;
     assert!(closed.is_error, "closed: {}", closed.text);
-    assert_eq!(call("diary_open", json!({"passphrase": pass})).await, "Opened 1 diary.");
+    assert_eq!(
+        call("diary_open", json!({"passphrase": pass})).await,
+        "Opened 1 diary."
+    );
     let read = call("diary_read", json!({"topic": "synthetic-garden"})).await;
     assert!(read.contains("Planted synthetic beans."), "{read}");
-    assert!(!read.contains("Dug the synthetic bed."), "the delete stands: {read}");
+    assert!(
+        !read.contains("Dug the synthetic bed."),
+        "the delete stands: {read}"
+    );
     assert_eq!(conversations(&session), 0, "a diary opens no journal");
 }
 
@@ -228,11 +270,20 @@ async fn the_server_opens_the_passed_ref_for_its_caller_only() {
     let (text, _) = conversation(&session, &john(), true);
     let call = |caller: Caller| served(&session, caller, &text);
     let mine = call(john());
-    assert!(!session.logs(&mine, "journal_read", &json!({})), "private: not logged");
+    assert!(
+        !session.logs(&mine, "journal_read", &json!({})),
+        "private: not logged"
+    );
     let refused = <ZendSession as Server>::call(&session, &mine, "journal_note", &json!({})).await;
-    assert_eq!(refused.text, PRIVATE, "opened as John's private conversation");
+    assert_eq!(
+        refused.text, PRIVATE,
+        "opened as John's private conversation"
+    );
     let mut someone = john();
     someone.person.sub = "someone-else".into();
     let theirs = call(someone);
-    assert!(session.logs(&theirs, "journal_read", &json!({})), "not theirs to open");
+    assert!(
+        session.logs(&theirs, "journal_read", &json!({})),
+        "not theirs to open"
+    );
 }

@@ -92,7 +92,10 @@ fn grow(dir: &Path) {
 fn session() -> (Vec<TempDir>, Ctx) {
     let (dirs, session, _) = test_session::session(grow);
     let (_, conversation) = test_session::conversation(&session, &john(), false);
-    (dirs, test_session::ctx(&session, john(), Some(conversation)))
+    (
+        dirs,
+        test_session::ctx(&session, john(), Some(conversation)),
+    )
 }
 
 /// The calls of one round, the `i`th: each tool that runs no model and needs

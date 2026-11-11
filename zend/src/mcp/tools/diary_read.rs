@@ -32,10 +32,7 @@ pub fn render(d: &Diary) -> String {
         1 => "1 entry".to_string(),
         n => format!("{n} entries"),
     };
-    let mut out = format!(
-        "Diary `{}`, created {} — {entries}.",
-        d.topic, d.created
-    );
+    let mut out = format!("Diary `{}`, created {} — {entries}.", d.topic, d.created);
     for e in &d.entries {
         out.push_str(&format!(
             "\n\n[{}] {} ({}):\n{}",

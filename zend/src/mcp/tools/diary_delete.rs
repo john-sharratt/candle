@@ -36,7 +36,11 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
             .and_then(Value::as_array)
             .ok_or("`ids` lists the entries to delete")?
             .iter()
-            .map(|v| v.as_str().map(str::to_string).ok_or("`ids` lists ids, as text"))
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or("`ids` lists ids, as text")
+            })
             .collect::<Result<_, _>>()?;
         ctx.session
             .mcp()

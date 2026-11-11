@@ -277,13 +277,25 @@ mod tests {
         let dek = Dek::random();
         let file = seal(&kek("synthetic right"), &dek, &id, b"synthetic marker text");
         let got = unwrap(&kek("synthetic right"), &id, &file).expect("its kek unwraps it");
-        assert_eq!(&open(&got, &id, &file).unwrap()[..], b"synthetic marker text");
+        assert_eq!(
+            &open(&got, &id, &file).unwrap()[..],
+            b"synthetic marker text"
+        );
         assert!(unwrap(&kek("synthetic wrong"), &id, &file).is_none());
-        assert!(unwrap(&kek("synthetic right"), &DiaryId([3; 16]), &file).is_none(), "another id");
+        assert!(
+            unwrap(&kek("synthetic right"), &DiaryId([3; 16]), &file).is_none(),
+            "another id"
+        );
         let mut changed = file.clone();
         changed[200] ^= 1;
-        assert_eq!(open(&got, &id, &changed).unwrap_err(), CryptoError::Unopenable);
-        assert!(!file.windows(7).any(|w| w == b"synthet"), "no plaintext in the file");
+        assert_eq!(
+            open(&got, &id, &changed).unwrap_err(),
+            CryptoError::Unopenable
+        );
+        assert!(
+            !file.windows(7).any(|w| w == b"synthet"),
+            "no plaintext in the file"
+        );
     }
 
     /// **Each seal is fresh**: the same text sealed twice differs everywhere
@@ -310,7 +322,10 @@ mod tests {
         assert!(unwrap(&kek("synthetic old"), &id, &moved).is_none());
         let got = unwrap(&kek("synthetic new"), &id, &moved).unwrap();
         assert_eq!(&open(&got, &id, &moved).unwrap()[..], b"kept");
-        assert!(open(&old_dek, &id, &moved).is_err(), "the old key opens nothing new");
+        assert!(
+            open(&old_dek, &id, &moved).is_err(),
+            "the old key opens nothing new"
+        );
         assert!(open(&old_dek, &id, &file).is_ok());
     }
 
@@ -321,6 +336,9 @@ mod tests {
         let started = Instant::now();
         let k = Kek::derive("synthetic pass", &[9; 16], KdfParams::PRODUCTION).unwrap();
         eprintln!("argon2id at production cost: {:?}", started.elapsed());
-        assert!(!k.same(&kek("synthetic pass")), "the cost is part of the key");
+        assert!(
+            !k.same(&kek("synthetic pass")),
+            "the cost is part of the key"
+        );
     }
 }

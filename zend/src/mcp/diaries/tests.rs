@@ -76,13 +76,18 @@ fn a_create_repeats_the_open_passphrase() {
     let d = diaries();
     assert_eq!(d.create(&m, "c1", TOPIC, PASS, NOW), Err(NOT_OPEN.into()));
     d.open(&m, "o", "c1", PASS, NOW).unwrap();
-    assert!(d.create(&m, "c1", TOPIC, "synthetic passphrase oen", NOW).is_err());
+    assert!(d
+        .create(&m, "c1", TOPIC, "synthetic passphrase oen", NOW)
+        .is_err());
     assert!(m.diaries().unwrap().0.is_empty(), "the typo made nothing");
     d.create(&m, "c1", TOPIC, PASS, NOW).unwrap();
     let (files, salt) = m.diaries().unwrap();
     assert_eq!(files.len(), 1);
     assert!(salt.is_some(), "the first diary wrote the salt");
-    assert!(d.create(&m, "c1", TOPIC, PASS, NOW).is_err(), "one diary a topic");
+    assert!(
+        d.create(&m, "c1", TOPIC, PASS, NOW).is_err(),
+        "one diary a topic"
+    );
 }
 
 /// **Two passphrases' diaries are invisible to each other**, and a
@@ -96,7 +101,11 @@ fn two_passphrases_diaries_are_invisible_to_each_other() {
     d.open(&m, "o", "c2", OTHER, NOW).unwrap();
     d.create(&m, "c2", "synthetic two", OTHER, NOW).unwrap();
     let topics = |c: &str| -> Vec<String> {
-        d.list(&m, c, NOW).unwrap().into_iter().map(|l| l.topic).collect()
+        d.list(&m, c, NOW)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.topic)
+            .collect()
     };
     assert_eq!(topics("c1"), ["synthetic one"]);
     assert_eq!(topics("c2"), ["synthetic two"]);
@@ -129,12 +138,19 @@ fn entries_go_in_time_order_and_deletes_and_compaction_stand() {
             .map(|e| e.text)
             .collect()
     };
-    assert_eq!(texts("c1"), ["monday", "tuesday, written last", "wednesday"]);
+    assert_eq!(
+        texts("c1"),
+        ["monday", "tuesday, written last", "wednesday"]
+    );
     assert_eq!(d.delete(&m, "c1", TOPIC, &[b.clone()], NOW), Ok(1));
     assert!(d.delete(&m, "c1", TOPIC, &[b], NOW).is_err(), "gone");
     assert!(d.close("c1"));
     d.open(&m, "o", "c1", PASS, NOW).unwrap();
-    assert_eq!(texts("c1"), ["monday", "tuesday, written last"], "after a reopen");
+    assert_eq!(
+        texts("c1"),
+        ["monday", "tuesday, written last"],
+        "after a reopen"
+    );
     // Compaction: both folded into one, at the first's moment.
     assert_eq!(d.delete(&m, "c1", TOPIC, &[a, c], NOW), Ok(2));
     w("2026-11-10T09:00:00Z", "monday and tuesday, in one");
@@ -150,13 +166,26 @@ fn a_rotated_diary_opens_under_the_new_passphrase_only() {
     let d = diaries();
     d.open(&m, "o", "c1", PASS, NOW).unwrap();
     d.create(&m, "c1", TOPIC, PASS, NOW).unwrap();
-    d.write(&m, "c1", TOPIC, at("2026-11-10T09:00:00Z"), Author::User, TEXT, NOW)
-        .unwrap();
-    assert!(d.rotate(&m, "c1", TOPIC, OTHER, "synthetic passphrase three", NOW).is_err());
+    d.write(
+        &m,
+        "c1",
+        TOPIC,
+        at("2026-11-10T09:00:00Z"),
+        Author::User,
+        TEXT,
+        NOW,
+    )
+    .unwrap();
+    assert!(d
+        .rotate(&m, "c1", TOPIC, OTHER, "synthetic passphrase three", NOW)
+        .is_err());
     d.rotate(&m, "c1", TOPIC, PASS, "synthetic passphrase three", NOW)
         .unwrap();
     assert_eq!(d.open(&m, "o", "c2", PASS, NOW), Ok(0), "not under the old");
-    assert_eq!(d.open(&m, "o", "c3", "synthetic passphrase three", NOW), Ok(1));
+    assert_eq!(
+        d.open(&m, "o", "c3", "synthetic passphrase three", NOW),
+        Ok(1)
+    );
     assert_eq!(d.read(&m, "c3", TOPIC, NOW).unwrap().entries[0].text, TEXT);
 }
 
@@ -176,7 +205,11 @@ fn a_rotation_is_not_undone_by_another_conversation() {
         Err(MOVED.into())
     );
     assert!(d.read(&m, "c2", TOPIC, NOW).is_err(), "closed there");
-    assert_eq!(d.open(&m, "o", "c3", OTHER, NOW), Ok(1), "still the new one's");
+    assert_eq!(
+        d.open(&m, "o", "c3", OTHER, NOW),
+        Ok(1),
+        "still the new one's"
+    );
     assert_eq!(d.open(&m, "o", "c4", PASS, NOW), Ok(0));
 }
 
@@ -231,8 +264,16 @@ fn a_five_megabyte_diary_reads_back_whole() {
     let big: String = (0..5 * 1024 * 1024 / 64)
         .map(|i| format!("{i:063}\n"))
         .collect();
-    d.write(&m, "c1", TOPIC, at("2026-11-10T09:00:00Z"), Author::User, &big, NOW)
-        .unwrap();
+    d.write(
+        &m,
+        "c1",
+        TOPIC,
+        at("2026-11-10T09:00:00Z"),
+        Author::User,
+        &big,
+        NOW,
+    )
+    .unwrap();
     let read = d.read(&m, "c1", TOPIC, NOW).unwrap();
     assert_eq!(read.entries[0].text.len(), big.len());
     assert_eq!(read.entries[0].text, big);
@@ -247,7 +288,10 @@ fn opens_that_find_nothing_back_off() {
         assert_eq!(d.open(&m, "o", "c1", PASS, NOW), Ok(0));
     }
     let refused = d.open(&m, "o", "c1", PASS, NOW).unwrap_err();
-    assert!(refused.starts_with("too many opens found nothing"), "{refused}");
+    assert!(
+        refused.starts_with("too many opens found nothing"),
+        "{refused}"
+    );
     assert_eq!(d.open(&m, "someone-else", "c9", PASS, NOW), Ok(0));
 }
 
@@ -266,7 +310,10 @@ fn a_rotation_seals_under_a_new_key() {
     let (_, salt) = m.diaries().unwrap();
     let old_kek = Kek::derive(PASS, &salt.unwrap(), FAST).unwrap();
     let old_dek = unwrap(&old_kek, &id, &before).expect("the old file opens under the old");
-    assert!(crypto::open(&old_dek, &id, &after).is_err(), "the old key opens nothing new");
+    assert!(
+        crypto::open(&old_dek, &id, &after).is_err(),
+        "the old key opens nothing new"
+    );
 }
 
 /// **No topic and no entry's text is anywhere in the repository**, every
@@ -278,8 +325,16 @@ fn no_topic_or_text_is_anywhere_in_the_repository() {
     d.open(&m, "o", "c1", PASS, NOW).unwrap();
     d.create(&m, "c1", TOPIC, PASS, NOW).unwrap();
     for i in 0..3 {
-        d.write(&m, "c1", TOPIC, at("2026-11-10T09:00:00Z"), Author::User, &format!("{TEXT} {i}"), NOW)
-            .unwrap();
+        d.write(
+            &m,
+            "c1",
+            TOPIC,
+            at("2026-11-10T09:00:00Z"),
+            Author::User,
+            &format!("{TEXT} {i}"),
+            NOW,
+        )
+        .unwrap();
     }
     for dir in [root.path().join("agent"), root.path().join("origin.git")] {
         let every = every_object(&dir);

@@ -20,7 +20,15 @@ use crate::conversation::EXPIRED;
 use crate::fake::{self, boss, call, call_as, ref_of, Fake, DIARY, LOOK, MAKE};
 
 async fn begin(app: &Arc<App>, private: bool) -> String {
-    ref_of(&App::call(app, &call("s0"), context::GET, &json!({"private_mode": private})).await)
+    ref_of(
+        &App::call(
+            app,
+            &call("s0"),
+            context::GET,
+            &json!({"private_mode": private}),
+        )
+        .await,
+    )
 }
 
 fn says(answer: &Value, why: &str) {
@@ -71,7 +79,13 @@ async fn a_private_conversation_reads_quietly_and_records_nothing() {
     let backend = Fake::open();
     let state = TempDir::new().unwrap();
     let app = fake::app(&fake::gateway(&backend).await, &state);
-    let begun = App::call(&app, &call("s0"), context::GET, &json!({"private_mode": true})).await;
+    let begun = App::call(
+        &app,
+        &call("s0"),
+        context::GET,
+        &json!({"private_mode": true}),
+    )
+    .await;
     let served = context::text_of(&begun).unwrap();
     assert!(served.contains("the `private-mode` guide:"), "{served}");
     assert!(
@@ -185,9 +199,18 @@ async fn a_grok_private_conversation_is_held_to_the_same() {
     let state = TempDir::new().unwrap();
     let app = fake::app(&fake::gateway(&backend).await, &state);
     let grok = |s: &str| call_as(boss(), Client::Grok, s);
-    let begun = App::call(&app, &grok("g0"), context::GET, &json!({"private_mode": true})).await;
+    let begun = App::call(
+        &app,
+        &grok("g0"),
+        context::GET,
+        &json!({"private_mode": true}),
+    )
+    .await;
     let r = ref_of(&begun);
-    says(&App::call(&app, &grok("g1"), MAKE, &json!({"ref": r})).await, PRIVATE);
+    says(
+        &App::call(&app, &grok("g1"), MAKE, &json!({"ref": r})).await,
+        PRIVATE,
+    );
     let read = App::call(&app, &grok("g2"), LOOK, &json!({"ref": r})).await;
     assert_eq!(read["isError"], false);
     let diary = App::call(&app, &grok("g3"), DIARY, &json!({"ref": r})).await;

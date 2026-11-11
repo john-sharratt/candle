@@ -95,7 +95,8 @@ fn check_passphrase(passphrase: &str) -> Result<(), String> {
 
 /// The diary sealed in `file`, under `dek`.
 fn opened(dek: &Dek, id: &DiaryId, file: &[u8]) -> Result<Diary, String> {
-    let plain = crypto::open(dek, id, file).map_err(|_| "a diary's file did not open".to_string())?;
+    let plain =
+        crypto::open(dek, id, file).map_err(|_| "a diary's file did not open".to_string())?;
     Diary::from_bytes(&plain).map_err(|_| "a diary's file holds no diary".to_string())
 }
 
@@ -188,7 +189,12 @@ impl Diaries {
     /// with: re-derived against the repository's salt when another
     /// conversation wrote one since this one opened. Stretches with no lock
     /// held.
-    fn confirm(&self, memory: &Memory, conversation: &str, passphrase: &str) -> Result<Confirmed, String> {
+    fn confirm(
+        &self,
+        memory: &Memory,
+        conversation: &str,
+        passphrase: &str,
+    ) -> Result<Confirmed, String> {
         let (held_kek, pending) = {
             let unlocked = held(&self.unlocked);
             let u = unlocked.get(conversation).ok_or(NOT_OPEN)?;
@@ -298,7 +304,12 @@ impl Diaries {
 
     /// The keys of `conversation`'s open diary on `topic` — copied out, and
     /// wiped when dropped — with the conversation marked used at `now_ms`.
-    fn keys(&self, conversation: &str, topic: &str, now_ms: u64) -> Result<(DiaryId, Kek, Dek), String> {
+    fn keys(
+        &self,
+        conversation: &str,
+        topic: &str,
+        now_ms: u64,
+    ) -> Result<(DiaryId, Kek, Dek), String> {
         let mut unlocked = held(&self.unlocked);
         let u = unlocked.get_mut(conversation).ok_or(NOT_OPEN)?;
         u.used_ms = u.used_ms.max(now_ms);
@@ -333,7 +344,12 @@ impl Diaries {
     /// The open diaries: each topic, how many entries, and the first's and
     /// last's moments — those another conversation made under this
     /// passphrase among them.
-    pub fn list(&self, memory: &Memory, conversation: &str, now_ms: u64) -> Result<Vec<Listed>, String> {
+    pub fn list(
+        &self,
+        memory: &Memory,
+        conversation: &str,
+        now_ms: u64,
+    ) -> Result<Vec<Listed>, String> {
         self.rescan(memory, conversation)?;
         let open: Vec<(DiaryId, Kek, Dek)> = {
             let mut unlocked = held(&self.unlocked);
@@ -363,7 +379,13 @@ impl Diaries {
     }
 
     /// The open diary on `topic`, whole.
-    pub fn read(&self, memory: &Memory, conversation: &str, topic: &str, now_ms: u64) -> Result<Diary, String> {
+    pub fn read(
+        &self,
+        memory: &Memory,
+        conversation: &str,
+        topic: &str,
+        now_ms: u64,
+    ) -> Result<Diary, String> {
         let (id, kek, dek) = self.keys(conversation, topic, now_ms)?;
         let file = self.current(memory, conversation, &id, &kek)?;
         opened(&dek, &id, &file)
@@ -414,7 +436,9 @@ impl Diaries {
         if text.trim().is_empty() {
             return Err("an entry holds some text".into());
         }
-        self.change(memory, conversation, topic, now_ms, |d| Ok(d.write(ts, author, text)))
+        self.change(memory, conversation, topic, now_ms, |d| {
+            Ok(d.write(ts, author, text))
+        })
     }
 
     /// Delete the entries `ids` from the open diary on `topic`; how many.
@@ -430,8 +454,9 @@ impl Diaries {
             return Err("name the entries to delete by their ids".into());
         }
         self.change(memory, conversation, topic, now_ms, |d| {
-            d.delete(ids)
-                .map_err(|_| "not every id names an entry of this diary; none was deleted".to_string())
+            d.delete(ids).map_err(|_| {
+                "not every id names an entry of this diary; none was deleted".to_string()
+            })
         })
     }
 

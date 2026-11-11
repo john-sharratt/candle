@@ -136,7 +136,10 @@ pub const DIARIES_PRIVATE: &str = "diaries are available only in private mode: b
 
 /// What `tool` does, when the table names it.
 pub fn classified(tool: &str) -> Option<Access> {
-    TOOLS.iter().find(|(name, _)| *name == tool).map(|(_, a)| *a)
+    TOOLS
+        .iter()
+        .find(|(name, _)| *name == tool)
+        .map(|(_, a)| *a)
 }
 
 /// What `tool` does: a tool the table does not name is a write.

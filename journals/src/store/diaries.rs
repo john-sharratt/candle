@@ -83,7 +83,11 @@ pub(super) fn moves_salt(files: &BTreeMap<String, Vec<u8>>, changes: &Changes) -
 
 /// `changes` committed onto `base` as a diaries commit: written by the
 /// service, at the time it was made, saying nothing.
-pub(super) fn commit_diaries(repo: &Repo, base: &Oid, changes: &Changes) -> Result<Oid, StoreError> {
+pub(super) fn commit_diaries(
+    repo: &Repo,
+    base: &Oid,
+    changes: &Changes,
+) -> Result<Oid, StoreError> {
     let mut set = ChangeSet::new();
     for (path, change) in changes {
         let path = RepoPath::parse(path)?;

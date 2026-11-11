@@ -40,8 +40,9 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
             .ok_or("`text` is missing: the entry")?;
         let now = now_ms();
         let ts = match args.get("ts").and_then(Value::as_str) {
-            Some(ts) => Stamp::parse(ts.trim())
-                .map_err(|e| format!("`ts` is not a moment: {e}"))?,
+            Some(ts) => {
+                Stamp::parse(ts.trim()).map_err(|e| format!("`ts` is not a moment: {e}"))?
+            }
             None => Stamp::from_secs((now / 1000) as i64),
         };
         let author = match args.get("author").and_then(Value::as_str) {

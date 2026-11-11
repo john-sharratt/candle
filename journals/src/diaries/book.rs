@@ -96,9 +96,7 @@ impl Diary {
             text: text.to_string(),
         };
         let id = entry.id.clone();
-        let at = self
-            .entries
-            .partition_point(|e| order(e) <= order(&entry));
+        let at = self.entries.partition_point(|e| order(e) <= order(&entry));
         self.entries.insert(at, entry);
         id
     }
@@ -106,7 +104,10 @@ impl Diary {
     /// Delete the entries `ids` names, every one of which must be here; none
     /// is deleted when one is not.
     pub fn delete(&mut self, ids: &[String]) -> Result<usize, BookError> {
-        if let Some(missing) = ids.iter().find(|id| !self.entries.iter().any(|e| &e.id == *id)) {
+        if let Some(missing) = ids
+            .iter()
+            .find(|id| !self.entries.iter().any(|e| &e.id == *id))
+        {
             return Err(BookError::NoEntry(missing.clone()));
         }
         let before = self.entries.len();
@@ -149,7 +150,10 @@ mod tests {
         d.write(at("2026-11-11T10:00:00Z"), Author::User, "third");
         let texts: Vec<&str> = d.entries.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(texts, ["first", "second", "third", "fourth"]);
-        assert_eq!(d.span(), Some(("2026-11-09T10:00:00Z", "2026-11-12T10:00:00Z")));
+        assert_eq!(
+            d.span(),
+            Some(("2026-11-09T10:00:00Z", "2026-11-12T10:00:00Z"))
+        );
         assert_eq!(d.entries[0].id.len(), 16);
     }
 
@@ -170,7 +174,11 @@ mod tests {
     #[test]
     fn a_diary_reads_back_as_written() {
         let mut d = Diary::new("synthetic topic", at("2026-11-11T09:00:00Z"));
-        d.write(at("2026-11-11T10:00:00Z"), Author::Assistant, "line\nwith a break");
+        d.write(
+            at("2026-11-11T10:00:00Z"),
+            Author::Assistant,
+            "line\nwith a break",
+        );
         let bytes = d.to_bytes();
         assert_eq!(Diary::from_bytes(&bytes), Ok(d));
         assert!(Diary::from_bytes(b"{}").is_err());
