@@ -4,7 +4,7 @@
 //! when it was given none. A ref that does not open for this caller is
 //! refused, never replaced — a forgery begins nothing.
 
-use mcp_server::refs::{Ref, Refs};
+use mcp_server::refs::{Ref, Refs, OPENING};
 
 /// The conversation a `get_user_context` answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,17 +66,27 @@ pub fn begin(
     })
 }
 
-/// The line the answer opens with: the ref, and that every call passes it.
+/// What a private conversation's answer says of it, after its ref.
+pub const PRIVATE_LINE: &str = "This conversation is private: Zen's memory is read-only in it \
+    to its end — nothing learned here is written to it, and every tool that would write, message, \
+    run or draw is refused.";
+
+/// The lines the answer opens with: the ref, that every call passes it, and
+/// — for a private conversation — that it is one.
 pub fn ref_line(b: &Begun) -> String {
     let renewed = match b.how {
         How::Renewed => " (the ref this conversation had expired; this one replaces it)",
         How::Same | How::New => "",
     };
-    format!(
-        "This conversation's ref is `{}`{renewed}. Pass it as `ref` on every Zen call in this \
-         conversation, get_user_context included: a call without it is refused.",
+    let line = format!(
+        "{OPENING}{}`{renewed}. Pass it as `ref` on every Zen call in this conversation, \
+         get_user_context included: a call without it is refused.",
         b.text
-    )
+    );
+    match b.r.private {
+        true => format!("{line}\n{PRIVATE_LINE}"),
+        false => line,
+    }
 }
 
 #[cfg(test)]
@@ -173,10 +183,23 @@ mod tests {
         );
         let renewed = Begun {
             how: How::Renewed,
-            ..b
+            ..b.clone()
         };
         assert!(ref_line(&renewed).starts_with(
-            "This conversation's ref is `R` (the ref this conversation had expired; this one replaces it)."
+            "This conversation's ref is `R` (the ref this conversation had expired; this one \
+             replaces it)."
         ));
+        let private = Begun {
+            r: begin(&refs(), "o", None, true, never, NOW).unwrap().r,
+            ..b
+        };
+        assert_eq!(
+            ref_line(&private),
+            format!(
+                "This conversation's ref is `R`. Pass it as `ref` on every Zen call in this \
+                 conversation, get_user_context included: a call without it is refused.\n\
+                 {PRIVATE_LINE}"
+            )
+        );
     }
 }

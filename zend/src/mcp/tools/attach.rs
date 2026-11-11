@@ -1,4 +1,4 @@
-//! `thread_attach {thread, about?}`: bind the MCP session to a thread,
+//! `thread_attach {thread, about?}`: bind the call's conversation to a thread,
 //! creating it on first use (`docs/claude_zend_gateway.md` §4), and — with
 //! `about` — the thread to the memory topics its work is about
 //! (`docs/zen_memory_and_guides.md` D9).
@@ -14,7 +14,6 @@ use super::{mem, string, Answer, Ctx};
 use crate::mcp::memory_sections::MAX_TOPICS;
 use crate::mcp::names;
 use crate::mcp::records::Records;
-use crate::mcp::state::ATTACHED;
 use crate::mcp::thread_export;
 use crate::mcp::threads;
 use crate::mcp::workers::{self, now_ms};
@@ -27,14 +26,13 @@ const MAX_ABOUT: usize = MAX_TOPICS;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Attach this session to a thread, creating it on first use. A thread is the place for \
-            one feature or area of work: the tasks you delegate for it run under it, and its journal keeps \
-            every task started and how it ended, and every decision you note. Attach before working on a \
-            feature, and again after your context is compacted. Name a thread for what it is about, as a \
+        "description": "Attach this conversation to a thread, creating it on first use. A thread is the place \
+            for one feature or area of work: the tasks you delegate for it run under it, and its journal \
+            keeps every task started and how it ended, and every decision you note. Attach before working on \
+            a feature, and again after your context is compacted. Name a thread for what it is about, as a \
             kebab-case slug (`review-layers`, `bc-wearables`); two unrelated pieces of work never share one. \
             Answers the thread's path and its journal. After attaching, `\"self\"` names this thread in the \
-            `journal_*` tools — but it is the thread last attached by any of the user's conversations open \
-            at once, so name the thread (`T:<thread>`) when another may be open.",
+            `journal_*` tools for this conversation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -69,7 +67,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     if let Err(e) = ctx
         .store
-        .hold(&ctx.mcp_id, &ctx.mcp, ATTACHED, thread, now_ms())
+        .hold(&ctx.mcp_id, &ctx.mcp, &ctx.attached_key(), thread, now_ms())
     {
         return Answer::error(e.to_string());
     }

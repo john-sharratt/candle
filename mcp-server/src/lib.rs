@@ -14,6 +14,7 @@
 //! | [`jsonrpc`] | One JSON-RPC message per POST |
 //! | [`listing`] | A listing's version on every answer, and the notification that it changed |
 //! | [`refs`] | Conversation refs: sealed handles carrying their private flag |
+//! | [`access`] | The one table of what every tool does: reads, writes, or keeps a diary |
 //! | [`server`] | What an app supplies: [`Server`], [`Identity`], [`Call`] |
 //! | [`session`] | Sessions and the [`Store`] they are kept in |
 //! | [`local_store`] | Sessions kept by one process, in memory or in a file |
@@ -21,6 +22,7 @@
 //! | [`client`] | Which client a session is for, which bounds a call's wait |
 //! | [`origin`] | The public origin a request reached the server at |
 
+pub mod access;
 pub mod client;
 pub mod http;
 pub mod jsonrpc;

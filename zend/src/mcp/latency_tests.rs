@@ -10,11 +10,8 @@
 //! --test-threads=1`.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use candle_conversation::projection::Conversation;
 use journals::actor::Actor;
 use journals::ops::{OnTaken, Op};
 use journals::path::JournalPath;
@@ -23,21 +20,13 @@ use journals::slug::Slug;
 use journals::store::Store as JournalStore;
 use journals::terms::Terms;
 use journals::time::Stamp;
-use mcp_server::protocol::MODERN;
-use mcp_server::{Client, Session, Store};
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use web::auth::Role;
 
-use super::caller::{Caller, Person};
 use super::chats::record;
-use super::memory::tests::repo;
-use super::state::RecordStore;
+use super::test_session::{self, john};
 use super::tools::{self, Ctx};
 use super::workers::now_ms;
-use crate::config::DaemonConfig;
-use crate::session::ZendSession;
-use crate::workspace::single_repo;
 
 /// The most a tool's 95th percentile may be.
 const P95_BUDGET: Duration = Duration::from_millis(30);
@@ -99,45 +88,11 @@ fn grow(dir: &Path) {
 /// A session on a real substrate, its memory open on a real journal
 /// repository grown past the real one's size ([`grow`]), and a call context
 /// for John — the repository's owner — as an admin, so every tool is his to
-/// call.
+/// call, in a conversation of his.
 fn session() -> (Vec<TempDir>, Ctx) {
-    let work = TempDir::new().unwrap();
-    let session = Arc::new(ZendSession::new(DaemonConfig::new(
-        single_repo(work.path(), "project").unwrap(),
-    )));
-    session.hold_substrate(Conversation::new());
-    let (journals, dir) = repo();
-    grow(&dir);
-    let memory = session.mcp().memory();
-    memory.start(dir);
-    let until = Instant::now() + Duration::from_secs(30);
-    while memory.tree().is_err() {
-        assert!(Instant::now() < until, "the memory never opened");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let caller = Caller {
-        person: Person {
-            provider: "google".into(),
-            sub: "john".into(),
-            email: "john@example.com".into(),
-            name: "John".into(),
-        },
-        role: Role::Admin,
-    };
-    let records = session.shared_substrate().unwrap();
-    let store: Arc<dyn Store> =
-        Arc::new(RecordStore::new(records, Arc::clone(session.mcp().used())));
-    let (_, conversation) = session.mcp().refs().issue(&caller.key(), false, now_ms());
-    let ctx = Ctx {
-        mcp: Session::new(&caller.key(), Client::ClaudeCode, MODERN, now_ms()),
-        mcp_id: "latency".into(),
-        conversation: Some(conversation),
-        session,
-        caller,
-        store,
-        progress: None,
-    };
-    (vec![work, journals], ctx)
+    let (dirs, session, _) = test_session::session(grow);
+    let (_, conversation) = test_session::conversation(&session, &john(), false);
+    (dirs, test_session::ctx(&session, john(), Some(conversation)))
 }
 
 /// The calls of one round, the `i`th: each tool that runs no model and needs

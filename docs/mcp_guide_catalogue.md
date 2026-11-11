@@ -108,6 +108,16 @@ compacted.
 - Close it when done; one left alone is deleted twelve hours after its last
   message.
 
+### A9. `private-mode`
+**Use when:** a conversation must not write to shared memory — incognito,
+off the record, confidential, a shared device, personal, a test — or the user
+wants a diary.
+**Tools:** `get_user_context`, and the `diary_*` tools
+- Begin with `get_user_context {private_mode: true}`; it is read-only to its
+  end, and the refusals are the server's (`docs/private_mode.md`).
+- Diaries only in private mode, only when asked: open, read the whole topic,
+  write as the conversation goes, close.
+
 ---
 
 ## B. Code

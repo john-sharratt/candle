@@ -24,6 +24,7 @@ use std::time::Instant;
 
 use axum::http::HeaderMap;
 use futures::future::join_all;
+use mcp_server::access::{self, Access};
 use mcp_server::http::now_ms;
 use mcp_server::protocol::text_result;
 use mcp_server::refs::{Ref, Refs};
@@ -34,6 +35,7 @@ use crate::backend::{Backend, Link, OnBehalf};
 use crate::caller::Caller;
 use crate::context;
 use crate::conversation::{self, EXPIRED, FORGED, NO_REF, REF};
+use crate::counters::Counters;
 use crate::guides::tools as guide_tools;
 use crate::guides::Library;
 use crate::last_listed::LastListed;
@@ -66,6 +68,8 @@ pub struct App {
     pub refs: Refs,
     /// Each ref's last use as this process saw it.
     pub seen: Seen,
+    /// How much private mode and diaries are used, as counts alone.
+    pub counters: Arc<Counters>,
     /// Whether this process has listed, and the record tasks' turn to.
     pub listing: Listing,
 }
@@ -202,26 +206,39 @@ impl App {
         self.routes.get(name)
     }
 
-    /// The session `call` is made on behalf of, in the conversation `named`.
-    fn on_behalf<'a>(call: &'a Call<Self>, named: Option<&'a str>) -> OnBehalf<'a> {
+    /// The session `call` is made on behalf of, in the conversation `named`;
+    /// `quiet` when it is not to be logged where it is handled.
+    fn on_behalf<'a>(call: &'a Call<Self>, named: Option<&'a str>, quiet: bool) -> OnBehalf<'a> {
         OnBehalf {
             id: &call.session_id,
             session: &call.session,
             conversation_ref: named,
+            quiet,
         }
     }
 
     /// The call, run by the backend that lists `name` — the tools listed
     /// first when none has, as for a tool new to every listing so far — or
     /// answered here when it is a guide tool; in the conversation `named`.
-    async fn run(&self, call: &Call<Self>, name: &str, args: &Value, named: Option<&str>) -> Ran {
+    /// A `quiet` call — a private conversation's, a diary's — is logged
+    /// nowhere, here or behind (`docs/private_mode.md` §4.4).
+    async fn run(
+        &self,
+        call: &Call<Self>,
+        name: &str,
+        args: &Value,
+        named: Option<&str>,
+        quiet: bool,
+    ) -> Ran {
         if guide_tools::is_guide_tool(name) {
             let answer = guide_tools::call(&self.library, name, args);
-            let guide = args.get("name").and_then(Value::as_str).unwrap_or("");
-            tracing::info!(tool = name, guide, "mcp: guide served");
+            if !quiet {
+                let guide = args.get("name").and_then(Value::as_str).unwrap_or("");
+                tracing::info!(tool = name, guide, "mcp: guide served");
+            }
             return Ran::Answered(answer);
         }
-        let on = Self::on_behalf(call, named);
+        let on = Self::on_behalf(call, named, quiet);
         let backend = match self.route(name) {
             Some(b) => b,
             None => {
@@ -246,11 +263,16 @@ impl App {
         let answer = tokio::select! {
             answer = self.call_served(backend, &call.caller, &on, name, args, &step) => answer,
             _ = call.abandoned() => {
-                tracing::info!(tool = name, backend = to, "mcp: the client left before the answer");
+                if !quiet {
+                    tracing::info!(tool = name, backend = to, "mcp: the client left before the answer");
+                }
                 return Ran::Left;
             }
         };
         let ms = started.elapsed().as_millis() as u64;
+        if quiet {
+            return Ran::Answered(answer);
+        }
         if context::is_error(&answer) {
             let text = context::text_of(&answer).unwrap_or("");
             tracing::warn!(
@@ -310,7 +332,7 @@ impl App {
             .open(&call.caller.key(), text)
             .map_err(|_| FORGED.to_string())?;
         if !this.seen.vouches(&r, now_ms) {
-            match Self::ask_used(this, call, text).await {
+            match Self::ask_used(this, call, text, r.private).await {
                 Ok(Some(used)) if r.live(Some(used), now_ms) => this.seen.heard(&r, used),
                 Ok(_) => return Err(EXPIRED.into()),
                 Err(why) => {
@@ -330,11 +352,12 @@ impl App {
         this: &Arc<Self>,
         call: &Call<Self>,
         text: &str,
+        quiet: bool,
     ) -> Result<Option<u64>, String> {
         let backend = this
             .route(context::GET)
             .ok_or("no backend lists the user's context yet")?;
-        let on = Self::on_behalf(call, Some(text));
+        let on = Self::on_behalf(call, Some(text), quiet);
         let answer = this
             .call_served(
                 backend,
@@ -369,11 +392,14 @@ impl App {
         let id = call.session_id.clone();
         let session = call.session.clone();
         let text = text.to_string();
+        let quiet = r.private;
+        let r = *r;
         tokio::spawn(async move {
             let on = OnBehalf {
                 id: &id,
                 session: &session,
                 conversation_ref: Some(&text),
+                quiet,
             };
             let answer = this
                 .call_served(
@@ -386,29 +412,60 @@ impl App {
                 )
                 .await;
             if context::is_error(&answer) {
-                tracing::warn!(
-                    "mcp: a conversation's use could not be told: {}",
-                    first_line(context::text_of(&answer).unwrap_or(""))
-                );
+                this.seen.untold(&r, now_ms);
+                if !quiet {
+                    tracing::warn!(
+                        "mcp: a conversation's use could not be told: {}",
+                        first_line(context::text_of(&answer).unwrap_or(""))
+                    );
+                }
             }
         });
     }
 
+    /// The conversation `get_user_context`'s `args` go on with, when they
+    /// name one of the caller's.
+    fn named_in(&self, call: &Call<Self>, args: &Value) -> Option<(String, Ref)> {
+        let text = args.get(REF).and_then(Value::as_str).map(str::trim)?;
+        let r = self.refs.open(&call.caller.key(), text).ok()?;
+        Some((text.to_string(), r))
+    }
+
+    /// Whether a `get_user_context` with `args` is in, or begins, a private
+    /// conversation.
+    fn begins_private(&self, call: &Call<Self>, args: &Value) -> bool {
+        let asked = args.get("private_mode").and_then(Value::as_bool) == Some(true);
+        asked || self.named_in(call, args).is_some_and(|(_, r)| r.private)
+    }
+
     /// `get_user_context`: run by the memory's backend, which begins or goes
     /// on with the conversation and answers its ref first; served with the
-    /// client's guide in front. A ref it went on with is a use.
+    /// client's guide after the ref. Whether the ref it names is live is
+    /// this side's to say, as for every other call: a live one goes with the
+    /// call in `_meta`, and is answered as it is, and a use; one that is not
+    /// is left for the backend to renew, and never noted used.
     async fn begin(this: &Arc<Self>, call: &Call<Self>, args: &Value) -> Value {
-        let Ran::Answered(mut answer) = this.run(call, context::GET, args, None).await else {
+        let quiet = this.begins_private(call, args);
+        let named = this.named_in(call, args);
+        if quiet && named.is_none() {
+            this.counters.begun_private();
+        }
+        let live = match &named {
+            Some((text, _)) => Self::conversation(this, call, Some(text), now_ms())
+                .await
+                .ok()
+                .map(|(text, _)| text),
+            None => None,
+        };
+        let ran = this
+            .run(call, context::GET, args, live.as_deref(), quiet)
+            .await;
+        let Ran::Answered(mut answer) = ran else {
             return text_result("the client stopped listening", true);
         };
         let client = call.session.client.name();
         if let Some(served) = this.served_context(client, &answer) {
             context::replace_text(&mut answer, &served);
-        }
-        if let Some(text) = args.get(REF).and_then(Value::as_str).map(str::trim) {
-            if let Ok(r) = this.refs.open(&call.caller.key(), text) {
-                Self::note_use(this, call, text, &r, now_ms());
-            }
         }
         answer
     }
@@ -480,7 +537,9 @@ impl Server for App {
     /// the line naming its guides, and every tool but `get_user_context`
     /// requires `ref`.
     async fn tools(this: &Arc<Self>, call: &Call<Self>) -> Result<Value, String> {
-        let mut listed = this.list(&call.caller, &Self::on_behalf(call, None)).await;
+        let mut listed = this
+            .list(&call.caller, &Self::on_behalf(call, None, false))
+            .await;
         if listed.tools.is_empty() && !listed.failed.is_empty() {
             return Err(listed.failed.join("; "));
         }
@@ -508,9 +567,11 @@ impl Server for App {
     }
 
     /// The call (`App::run`) in the conversation its `ref` names — refused
-    /// without a live one — or `get_user_context`, which begins or goes on
-    /// with one (`App::begin`). A call that did something is recorded as an
-    /// episode of its conversation (`docs/mcp_user_context.md` §2.3).
+    /// without a live one, and refused what the conversation may not do
+    /// (`docs/private_mode.md` §4) — or `get_user_context`, which begins or
+    /// goes on with one (`App::begin`). A call that did something in a
+    /// conversation that is not private is recorded as an episode of it
+    /// (`docs/mcp_user_context.md` §2.3).
     async fn call(this: &Arc<Self>, call: &Call<Self>, name: &str, args: &Value) -> Value {
         if context::is_internal(name) {
             return text_result(&format!("there is no tool `{name}`"), true);
@@ -519,20 +580,46 @@ impl Server for App {
             return Self::begin(this, call, args).await;
         }
         let (named, args) = conversation::take_ref(args);
-        let text = match Self::conversation(this, call, named.as_deref(), now_ms()).await {
-            Ok((text, _)) => text,
+        let (text, r) = match Self::conversation(this, call, named.as_deref(), now_ms()).await {
+            Ok(found) => found,
             Err(why) => return text_result(&why, true),
         };
-        let Ran::Answered(answer) = this.run(call, name, &args, Some(&text)).await else {
+        if let Err(why) = access::permits(name, r.private) {
+            return text_result(why, true);
+        }
+        let diary = access::access(name) == Access::Diary;
+        let quiet = r.private || diary;
+        if r.private {
+            this.counters.private_call(diary);
+        }
+        let Ran::Answered(answer) = this.run(call, name, &args, Some(&text), quiet).await else {
             // A client that left needs no record of an answer it never read.
             return text_result("the client stopped listening", true);
         };
         // Whether it is an episode is decided after the answer has gone, by a
-        // listing when this process has none yet (`crate::listing`).
-        if context::may_record(name, context::is_error(&answer)) {
+        // listing when this process has none yet (`crate::listing`). A
+        // private conversation records none.
+        if !r.private && context::may_record(name, context::is_error(&answer)) {
             listing::record_later(this, call, name, &args, text);
         }
         answer
+    }
+
+    /// Whether a call is logged as it is handled here: never a diary's, nor
+    /// one in a private conversation — the ref its arguments name says, or
+    /// the `private_mode` a `get_user_context` begins one with.
+    fn logs(&self, call: &Call<Self>, name: &str, args: &Value) -> bool {
+        if access::access(name) == Access::Diary {
+            return false;
+        }
+        if name == context::GET {
+            return !self.begins_private(call, args);
+        }
+        let (named, _) = conversation::take_ref(args);
+        let private = named
+            .and_then(|text| self.refs.open(&call.caller.key(), &text).ok())
+            .is_some_and(|r| r.private);
+        !private
     }
 
     /// The aggregator's listing is the sum of the backends'; each names its own.

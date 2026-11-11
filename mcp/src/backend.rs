@@ -16,7 +16,9 @@ use axum::http::header;
 use futures::StreamExt;
 use mcp_server::http::{PROGRESS_EVERY, VERSION_HEADER};
 use mcp_server::listing::TOOLS_VERSION_HEADER;
-use mcp_server::protocol::{text_result, CLIENT_META, MODERN, REF_META, SESSION_META};
+use mcp_server::protocol::{
+    text_result, CLIENT_META, MODERN, QUIET_META, REF_META, SESSION_META,
+};
 use mcp_server::Session;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -64,6 +66,9 @@ pub struct OnBehalf<'a> {
     pub id: &'a str,
     pub session: &'a Session,
     pub conversation_ref: Option<&'a str>,
+    /// The call is not to be logged where it is handled: a private
+    /// conversation's, or a diary's (§4.4).
+    pub quiet: bool,
 }
 
 /// What one message read off a backend's answer is.
@@ -152,6 +157,9 @@ impl Link {
         });
         if let Some(r) = on.conversation_ref {
             meta[REF_META] = json!(r);
+        }
+        if on.quiet {
+            meta[QUIET_META] = json!(true);
         }
         if progress {
             meta["progressToken"] = json!(1);
@@ -472,6 +480,7 @@ mod tests {
             id: "s1",
             session: &session,
             conversation_ref: Some("r1"),
+            quiet: true,
         };
         let req = link
             .request(
@@ -503,12 +512,14 @@ mod tests {
                     "io.modelcontextprotocol/clientInfo": {"name": "claude-code"},
                     "com.tokera/session": "s1",
                     "com.tokera/ref": "r1",
+                    "com.tokera/quiet": true,
                     "progressToken": 1
                 }
             })
         );
         let none = OnBehalf {
             conversation_ref: None,
+            quiet: false,
             ..on
         };
         let req = link
@@ -528,6 +539,7 @@ mod tests {
             body["params"]["_meta"].get("com.tokera/ref").is_none(),
             "a request in no conversation names none"
         );
+        assert!(body["params"]["_meta"].get("com.tokera/quiet").is_none());
     }
 
     /// **A memory call goes to the memory's path**, which only the members

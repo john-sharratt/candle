@@ -26,6 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use mcp_server::access::{self, Access};
 use mcp_server::refs::Ref;
 use mcp_server::{protocol, Session, Store};
 use serde_json::{json, Value};
@@ -114,9 +115,22 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// The thread the session is attached to, which `"self"` names.
+    /// What the thread `thread_attach` bound this call's conversation to is
+    /// held under on the session: one per conversation, so two chats carried
+    /// on one MCP session — as claude.ai carries all of a person's — attach
+    /// apart (`docs/private_mode.md` §3). A call in no conversation is its
+    /// session's.
+    pub fn attached_key(&self) -> String {
+        match &self.conversation {
+            Some(r) => format!("{ATTACHED}/{}", r.conversation()),
+            None => ATTACHED.to_string(),
+        }
+    }
+
+    /// The thread the call's conversation is attached to, which `"self"`
+    /// names.
     pub fn attached(&self) -> Option<String> {
-        self.mcp.held(ATTACHED).map(str::to_string)
+        self.mcp.held(&self.attached_key()).map(str::to_string)
     }
 }
 
@@ -241,8 +255,22 @@ async fn blocking(
         .unwrap_or_else(|e| Answer::error(format!("the tool failed: {e}")))
 }
 
+/// Whether `name` may run in the call's conversation (`docs/private_mode.md`
+/// §4): the aggregator refuses first, and zend holds to the same table for
+/// any call that reaches it. A call in no conversation keeps no diary.
+fn permitted(ctx: &Ctx, name: &str) -> Result<(), &'static str> {
+    match ctx.conversation {
+        Some(r) => access::permits(name, r.private),
+        None if access::access(name) == Access::Diary => Err(access::DIARIES_PRIVATE),
+        None => Ok(()),
+    }
+}
+
 /// Run tool `name` with `args`.
 pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
+    if let Err(why) = permitted(ctx, name) {
+        return Answer::error(why);
+    }
     match name {
         user_context::NAME => blocking(ctx, args, user_context::call).await,
         user_episode::NAME => blocking(ctx, args, user_episode::call).await,
@@ -498,6 +526,28 @@ mod tests {
                 "timeline_read"
             ]
         );
+    }
+
+    /// **Every tool zend lists is in the one table of what tools do**
+    /// (`docs/private_mode.md` §4.3), and so are the two the aggregator calls
+    /// it by name: a tool added without a line there fails here.
+    #[test]
+    fn every_tool_is_classified() {
+        assert_eq!(access::unclassified(&definitions()), Vec::<String>::new());
+        for internal in [user_episode::NAME, ref_seen::NAME] {
+            assert!(access::classified(internal).is_some(), "{internal}");
+        }
+    }
+
+    /// **The table and `readOnlyHint` agree**: what a listing says only
+    /// reads, the table lets a private conversation call, and nothing else.
+    #[test]
+    fn the_table_reads_what_the_listing_says_only_reads() {
+        for d in definitions().as_array().unwrap() {
+            let name = d["name"].as_str().unwrap();
+            let reads = d["annotations"]["readOnlyHint"] == true;
+            assert_eq!(access::access(name) == Access::Read, reads, "{name}");
+        }
     }
 
     /// **A wait its client cut short says so**, with what was asked and what

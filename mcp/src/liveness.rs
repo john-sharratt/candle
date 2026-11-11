@@ -13,11 +13,13 @@ use mcp_server::refs::{Ref, REF_TOUCH_EVERY_MS};
 /// with it is asked of the record again.
 const KEPT: usize = 16_384;
 
-/// One ref's mark: when it was last used here, and when that was last told.
+/// One ref's mark: when it was last used here, when that was last told, and
+/// when it was told before that — what a failed telling goes back to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Mark {
     used_ms: u64,
     told_ms: u64,
+    previous_told_ms: u64,
 }
 
 /// The refs this process has seen used.
@@ -43,6 +45,7 @@ impl Seen {
         let mark = marks.entry(r.conversation()).or_insert(Mark {
             used_ms,
             told_ms: used_ms,
+            previous_told_ms: used_ms,
         });
         mark.used_ms = mark.used_ms.max(used_ms);
         mark.told_ms = mark.told_ms.max(used_ms);
@@ -50,7 +53,9 @@ impl Seen {
 
     /// Note `r` used at `now_ms`; whether its use is now due to be told —
     /// [`REF_TOUCH_EVERY_MS`] since it was last told, or since its issue when
-    /// it never was.
+    /// it never was. A use due is marked told at once, so calls beside it
+    /// tell nothing more; [`Seen::untold`] takes the mark back when the
+    /// telling fails.
     pub fn used(&self, r: &Ref, now_ms: u64) -> bool {
         let mut marks = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let key = r.conversation();
@@ -66,13 +71,26 @@ impl Seen {
         let mark = marks.entry(key).or_insert(Mark {
             used_ms: now_ms,
             told_ms: r.issued_ms(),
+            previous_told_ms: r.issued_ms(),
         });
         mark.used_ms = mark.used_ms.max(now_ms);
         let due = now_ms.saturating_sub(mark.told_ms) >= REF_TOUCH_EVERY_MS;
         if due {
+            mark.previous_told_ms = mark.told_ms;
             mark.told_ms = now_ms;
         }
         due
+    }
+
+    /// The use of `r` marked told at `at` was not told after all: the next
+    /// call tells it again.
+    pub fn untold(&self, r: &Ref, at: u64) {
+        let mut marks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mark) = marks.get_mut(&r.conversation()) {
+            if mark.told_ms == at {
+                mark.told_ms = mark.previous_told_ms;
+            }
+        }
     }
 
     /// How many refs are marked.
@@ -130,6 +148,23 @@ mod tests {
         assert!(s.used(&r, NOW + REF_TOUCH_EVERY_MS));
         assert!(!s.used(&r, NOW + REF_TOUCH_EVERY_MS + 1));
         assert!(s.used(&r, NOW + 2 * REF_TOUCH_EVERY_MS));
+    }
+
+    /// **A telling that failed is told again by the next call.**
+    #[test]
+    fn a_use_whose_telling_failed_is_told_again() {
+        let s = Seen::default();
+        let r = r();
+        let at = NOW + REF_TOUCH_EVERY_MS;
+        assert!(s.used(&r, at));
+        assert!(!s.used(&r, at + 1), "marked told while it is told");
+        s.untold(&r, at);
+        assert!(s.used(&r, at + 2), "told again");
+        s.untold(&r, at);
+        assert!(
+            !s.used(&r, at + 3),
+            "a stale failure takes back nothing told since"
+        );
     }
 
     #[test]

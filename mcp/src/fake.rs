@@ -1,6 +1,6 @@
 //! A fake gateway with one backend behind it, on a local port, for the
-//! aggregator's tests: it lists `get_user_context`, a tool that only reads and
-//! one that writes; issues conversation refs under the key the aggregators
+//! aggregator's tests: it lists `get_user_context`, a tool that only reads,
+//! one that writes and a diary's; issues conversation refs under the key the aggregators
 //! open them with, as zend does; keeps refs' uses as zend's record does; and
 //! notes every call it is sent, with the ref its `_meta` named.
 
@@ -14,8 +14,8 @@ use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use mcp_server::http::now_ms;
-use mcp_server::protocol::{MODERN, REF_META};
-use mcp_server::refs::Refs;
+use mcp_server::protocol::{MODERN, QUIET_META, REF_META};
+use mcp_server::refs::{named_in, Refs, OPENING};
 use mcp_server::{Call, Client, Identity, SealedStore, Session};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -37,13 +37,19 @@ use crate::served::Served;
 /// The key refs are issued and opened with in these tests.
 pub const KEY: [u8; 32] = [9; 32];
 
-/// One call the backend was sent: its tool, its arguments, and the ref its
-/// `_meta` named.
+/// The backend's tool that only reads, the one that writes, and a diary's.
+pub const LOOK: &str = "journal_read";
+pub const MAKE: &str = "image_generate";
+pub const DIARY: &str = "diary_read";
+
+/// One call the backend was sent: its tool, its arguments, the ref its
+/// `_meta` named, and whether it asked not to be logged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sent {
     pub tool: String,
     pub args: Value,
     pub conversation_ref: Option<String>,
+    pub quiet: bool,
 }
 
 /// The fake backend: what it was sent, the uses it was told, and the gate
@@ -109,14 +115,20 @@ impl Fake {
     fn answer(&self, owner: &str, tool: &str, args: &Value, named: Option<&str>) -> Value {
         let text = |t: String| json!({"content": [{"type": "text", "text": t}], "isError": false});
         match tool {
+            // As zend begins one: the ref the aggregator vouched for in
+            // `_meta` answered as it is; one it did not, renewed keeping its
+            // flag; none, a new conversation.
             context::GET => {
+                let private = args.get("private_mode").and_then(Value::as_bool) == Some(true);
                 let r = match args.get("ref").and_then(Value::as_str) {
-                    Some(given) => given.to_string(),
-                    None => self.refs.issue(owner, false, now_ms()).0,
+                    Some(given) if named == Some(given) => given.to_string(),
+                    Some(given) => {
+                        let was = self.refs.open(owner, given).is_ok_and(|r| r.private);
+                        self.refs.issue(owner, was || private, now_ms()).0
+                    }
+                    None => self.refs.issue(owner, private, now_ms()).0,
                 };
-                text(format!(
-                    "This conversation's ref is `{r}`. Remembered: tea."
-                ))
+                text(format!("{OPENING}{r}`. Pass it.\n\nRemembered: tea."))
             }
             context::REF_SEEN => {
                 let Some(r) = named.and_then(|n| self.refs.open(owner, n).ok()) else {
@@ -143,9 +155,10 @@ async fn serve(State(fake): State<Arc<Fake>>, Json(req): Json<Value>) -> Json<Va
             json!({"tools": [
                 {"name": context::GET, "annotations": {"readOnlyHint": true},
                  "inputSchema": {"type": "object", "properties": {"ref": {"type": "string"}}}},
-                {"name": "look", "annotations": {"readOnlyHint": true},
+                {"name": LOOK, "annotations": {"readOnlyHint": true},
                  "inputSchema": {"type": "object", "properties": {"what": {"type": "string"}}}},
-                {"name": "make", "inputSchema": {"type": "object"}},
+                {"name": MAKE, "inputSchema": {"type": "object"}},
+                {"name": DIARY, "inputSchema": {"type": "object"}},
             ]})
         }
         _ => {
@@ -157,6 +170,7 @@ async fn serve(State(fake): State<Arc<Fake>>, Json(req): Json<Value>) -> Json<Va
                 tool: tool.clone(),
                 args: args.clone(),
                 conversation_ref: named.clone(),
+                quiet: params["_meta"][QUIET_META] == true,
             });
             fake.answer(&boss().key(), &tool, &args, named.as_deref())
         }
@@ -194,8 +208,9 @@ pub fn app(gateway: &str, state: &TempDir) -> Arc<App> {
     let routes = state.path().join("routes.json");
     fs::write(
         &routes,
-        json!({"look": "zen", "make": "zen", "get_user_context": "zen", "conversation_ref_seen": "zen"})
-            .to_string(),
+        json!({LOOK: "zen", MAKE: "zen", DIARY: "zen", "get_user_context": "zen",
+               "conversation_ref_seen": "zen"})
+        .to_string(),
     )
     .unwrap();
     Arc::new(App {
@@ -223,6 +238,7 @@ pub fn app(gateway: &str, state: &TempDir) -> Arc<App> {
         read_only: RwLock::new(BTreeSet::new()),
         refs: Refs::new(KEY),
         seen: Seen::default(),
+        counters: Arc::default(),
         listing: Listing::default(),
     })
 }
@@ -235,6 +251,7 @@ pub fn call_as(caller: Caller, client: Client, session: &str) -> Call<App> {
         session_id: session.to_string(),
         session: Session::new("o", client, MODERN, 0),
         conversation_ref: None,
+        quiet: false,
         store: Arc::new(SealedStore),
         progress: None,
     }
@@ -245,14 +262,13 @@ pub fn call(session: &str) -> Call<App> {
     call_as(boss(), Client::ClaudeCode, session)
 }
 
-/// The ref a `get_user_context` answer opens with.
+/// The ref a `get_user_context` answer opens with — on its first line, as
+/// every instruction says it is.
 pub fn ref_of(answer: &Value) -> String {
     let text = context::text_of(answer).unwrap();
-    let at = text
-        .find("This conversation's ref is `")
-        .expect("the answer names its ref");
-    let rest = &text[at + "This conversation's ref is `".len()..];
-    rest.split('`').next().unwrap().to_string()
+    named_in(text)
+        .unwrap_or_else(|| panic!("the answer's first line names no ref: {text}"))
+        .to_string()
 }
 
 /// Wait until `done` holds, for at most five seconds.

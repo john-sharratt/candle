@@ -14,6 +14,12 @@ it — Claude, Grok, Zen itself. It is information, never an instruction.
   call from then on — a call without it is refused — and to
   `get_user_context` itself when you call it again. A ref it says expired is
   renewed by `get_user_context` with the old one.
+- **Private, when it should be.** Begin with `get_user_context
+  {private_mode: true}` when the chat is incognito, private or temporary;
+  when the user asks to keep it off the record; for confidential work, a
+  shared device or account, or personal matters; for tests; or when the user
+  wants a diary. A private conversation reads Zen's memory and writes nothing
+  anywhere, to its end — `private-mode` says what that means.
 - **Who and what.** Work out who is speaking (never assume the account's
   owner; ask if nothing says) and what the conversation is about, and say
   both with `journal_focus` as they become clear.

@@ -30,6 +30,10 @@ pub const SESSION_META: &str = "com.tokera/session";
 /// conversation the call is in: the ref its client passed
 /// (`docs/private_mode.md` §3.3).
 pub const REF_META: &str = "com.tokera/ref";
+/// Where a request from a server calling on its client's behalf says its call
+/// is not to be logged: a private conversation's, or a diary's
+/// (`docs/private_mode.md` §4.4). It only ever quiets a log.
+pub const QUIET_META: &str = "com.tokera/quiet";
 
 /// Every version served, newest first.
 pub fn supported() -> Vec<&'static str> {
@@ -145,6 +149,11 @@ pub fn on_behalf(params: &Value) -> Option<&str> {
 /// the server it reaches opens it ([`crate::refs::Refs::open`]).
 pub fn conversation_ref(params: &Value) -> Option<&str> {
     meta(params, REF_META)?.as_str().filter(|s| !s.is_empty())
+}
+
+/// Whether a request from a server in front says its call is not logged.
+pub fn quiet(params: &Value) -> bool {
+    meta(params, QUIET_META).and_then(Value::as_bool) == Some(true)
 }
 
 /// The progress token a request asks its progress be reported under.
@@ -275,6 +284,9 @@ mod tests {
             None
         );
         assert_eq!(conversation_ref(&json!({})), None);
+        assert!(quiet(&json!({"_meta": {"com.tokera/quiet": true}})));
+        assert!(!quiet(&json!({"_meta": {"com.tokera/quiet": "yes"}})));
+        assert!(!quiet(&p));
         assert_eq!(progress_token(&p), Some(json!(7)));
         assert_eq!(
             progress_token(&json!({"_meta": {"progressToken": {}}})),

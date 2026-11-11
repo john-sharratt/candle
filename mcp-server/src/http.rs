@@ -275,6 +275,7 @@ async fn answer_post<S: Server>(
         session_id,
         session,
         conversation_ref: protocol::conversation_ref(&params).map(str::to_string),
+        quiet: protocol::quiet(&params),
         store,
         progress: None,
     };
@@ -349,10 +350,14 @@ async fn answer_post<S: Server>(
 
 /// `S::call`, its time logged: what the server itself spent on the call, so
 /// a caller in front of it — which times the call with its hops — can tell
-/// the two apart.
+/// the two apart. A call the server says is not logged leaves no line.
 async fn timed<S: Server>(server: &Arc<S>, call: &Call<S>, name: &str, args: &Value) -> S::Answer {
     let started = Instant::now();
+    let logged = server.logs(call, name, args);
     let answer = S::call(server, call, name, args).await;
+    if !logged {
+        return answer;
+    }
     tracing::info!(
         server = %server.identity().name,
         tool = name,

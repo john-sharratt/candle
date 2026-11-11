@@ -290,8 +290,24 @@ pub mod fixture {
 
 #[cfg(test)]
 mod tests {
+    use mcp_server::access::{self, Access};
+
     use super::fixture::*;
     use super::*;
+
+    /// **Every tool zenj lists is in the one table of what tools do**
+    /// (`docs/private_mode.md` §4.3), reading exactly where its listing says
+    /// it only reads: a tool added without a line there fails here.
+    #[test]
+    fn every_tool_is_classified() {
+        let defs = definitions();
+        assert_eq!(access::unclassified(&defs), Vec::<String>::new());
+        for d in defs.as_array().unwrap() {
+            let name = d["name"].as_str().unwrap();
+            let reads = d["annotations"]["readOnlyHint"] == true;
+            assert_eq!(access::access(name) == Access::Read, reads, "{name}");
+        }
+    }
 
     #[test]
     fn every_tool_has_its_name_a_description_and_an_object_schema() {

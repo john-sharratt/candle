@@ -35,6 +35,16 @@ pub const REF_IDLE_MS: u64 = 4 * 60 * 60 * 1000;
 /// read (`docs/private_mode.md` §3.2): the record is never further behind.
 pub const REF_TOUCH_EVERY_MS: u64 = 10 * 60 * 1000;
 
+/// How `get_user_context`'s answer opens: the ref follows, in backticks, on
+/// the answer's first line.
+pub const OPENING: &str = "This conversation's ref is `";
+
+/// The ref an answer opening with [`OPENING`] names.
+pub fn named_in(answer: &str) -> Option<&str> {
+    let first = answer.lines().next()?;
+    first.strip_prefix(OPENING)?.split('`').next()
+}
+
 const ID: usize = 16;
 const MAC: usize = 16;
 const LEN: usize = ID + 1 + 4 + MAC;
@@ -278,6 +288,16 @@ mod tests {
             r.live(Some(issued - 10), issued + 1),
             "a use older than the issue counts from the issue"
         );
+    }
+
+    #[test]
+    fn an_answers_ref_is_read_off_its_first_line() {
+        assert_eq!(
+            named_in("This conversation's ref is `abc-_1`. Pass it on.\n\nMemory."),
+            Some("abc-_1")
+        );
+        assert_eq!(named_in("Memory first.\nThis conversation's ref is `x`."), None);
+        assert_eq!(named_in(""), None);
     }
 
     /// **The conversation key is a digest of the id**, never the ref.

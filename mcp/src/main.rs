@@ -16,6 +16,7 @@
 //! | [`context`] | The user's context: the client's guide, and episodes |
 //! | [`conversation`] | A call's `ref`: taken from its arguments, required by every tool's schema |
 //! | [`liveness`] | Each conversation ref's last use as this process saw it |
+//! | [`counters`] | How much private mode and diaries are used, as counts alone |
 //! | [`routes`] | Which backend runs each tool, learned from every listing and kept across restarts |
 //! | [`config`] | Each machine's file, and the `served` file they share |
 
@@ -48,6 +49,7 @@ mod context;
 mod conversation;
 #[cfg(test)]
 mod conversation_tests;
+mod counters;
 #[cfg(test)]
 mod fake;
 mod guides;
@@ -55,6 +57,8 @@ mod last_listed;
 mod listing;
 mod liveness;
 mod presence;
+#[cfg(test)]
+mod private_tests;
 mod routes;
 mod served;
 mod sse;
@@ -135,8 +139,10 @@ async fn main() -> anyhow::Result<()> {
         read_only: RwLock::new(BTreeSet::new()),
         refs: Refs::new(group.derive(refs::PURPOSE)),
         seen: Seen::default(),
+        counters: Arc::default(),
         listing: Listing::default(),
     });
+    tokio::spawn(counters::saying(Arc::clone(&app.counters)));
     tracing::info!(guides = app.library.count(), "guides loaded");
     let gateways: Arc<[IpAddr]> = config.trusted_gateways.clone().into();
     let router = Router::new()

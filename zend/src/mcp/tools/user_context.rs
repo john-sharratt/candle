@@ -16,7 +16,7 @@ use journals::view::frame::Budget;
 use mcp_server::refs::Ref;
 use serde_json::{json, Value};
 
-use super::{mem, Answer, Ctx};
+use super::{mem, Answer, Ctx, LOADING};
 use crate::mcp::begin::{begin, ref_line};
 use crate::mcp::memory::context;
 use crate::mcp::memory::who::Who;
@@ -39,7 +39,16 @@ pub fn definition() -> Value {
             the group is and the few things that last — who you could be talking to, this conversation's own \
             journal and what it has worked out so far (who is speaking, what it is about), the journals that \
             names, where the last conversation in this app left off, and every topic by its cue; and how to \
-            work with the journals. It answers at once.",
+            work with the journals. It answers at once.\n\n\
+            Pass `private_mode: true` when beginning the conversation if: the client says it is incognito, \
+            private or temporary (a claude.ai incognito chat); the user asks to keep it off the record, private \
+            or out of memory; it is confidential work material that must not land in shared memory; the \
+            device or account is shared, and what one person says must not be recorded for others; it is \
+            personal — health, finances, anything the user says is theirs alone; it is an automated test or \
+            experiment that should not write to memory; or the user asks to open or work in a diary. Private \
+            mode makes the conversation read-only for shared memory — nothing is written, messaged, run or \
+            drawn — it cannot be turned off for the rest of the conversation, and it is the only mode \
+            diaries can be used in.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -47,6 +56,12 @@ pub fn definition() -> Value {
                     "type": "string",
                     "description": "This conversation's ref, when it has one: an earlier get_user_context's \
                         first line. Leave it out only at the start of a conversation."
+                },
+                "private_mode": {
+                    "type": "boolean",
+                    "description": "Begin this conversation in private mode: read-only for shared memory, to \
+                        its end, and the only mode diaries work in. Read when the conversation begins; it \
+                        changes nothing for one that has its ref."
                 }
             },
             "additionalProperties": false
@@ -63,25 +78,38 @@ pub fn nothing_kept(why: &str) -> String {
 }
 
 pub fn call(ctx: &Ctx, args: &Value) -> Answer {
+    let named = args.get("ref").and_then(Value::as_str);
+    // The aggregator says a ref is live by sending it in `_meta` too: then it
+    // is answered as it is. Otherwise its record says, and while the record
+    // cannot be read nothing is renewed on a guess.
+    let vouched = ctx.conversation;
     let records = ctx.session.shared_substrate();
-    let used = |r: &Ref| {
-        records
+    if named.is_some() && vouched.is_none() && records.is_none() {
+        return Answer::error(LOADING);
+    }
+    let now = now_ms();
+    let used = |r: &Ref| match vouched {
+        Some(v) if v == *r => Some(now),
+        _ => records
             .as_ref()
-            .and_then(|s| ref_records::used(s as &dyn Records, &r.conversation()))
+            .and_then(|s| ref_records::used(s as &dyn Records, &r.conversation())),
     };
     let begun = match begin(
         ctx.session.mcp().refs(),
         &ctx.caller.key(),
-        args.get("ref").and_then(Value::as_str),
-        false,
+        named,
+        args.get("private_mode").and_then(Value::as_bool) == Some(true),
         used,
-        now_ms(),
+        now,
     ) {
         Ok(b) => b,
         Err(e) => return Answer::error(e),
     };
     let opening = ref_line(&begun);
-    let m = match mem::read_in(ctx, Some(begun.r.conversation())) {
+    // A private conversation has no journal of its own, not even one named
+    // for its first write: it never writes one.
+    let conversation = (!begun.r.private).then(|| begun.r.conversation());
+    let m = match mem::read_in(ctx, conversation) {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
     };

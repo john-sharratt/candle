@@ -70,6 +70,8 @@ pub fn call(library: &Library, name: &str, args: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use mcp_server::access::{self, Access};
+
     use super::*;
     use crate::guides::Guide;
 
@@ -92,6 +94,17 @@ mod tests {
         assert!(described.contains("Call this once at the start"));
         assert!(described.ends_with("Guides: research."));
         assert_eq!(defs[1]["name"], READ);
+    }
+
+    /// **The guide tools are in the one table of what tools do**, as only
+    /// reading (`docs/private_mode.md` §4.3).
+    #[test]
+    fn the_guide_tools_are_classified() {
+        let listed = Value::Array(definitions(&library()));
+        assert_eq!(access::unclassified(&listed), Vec::<String>::new());
+        for name in [LIST, READ] {
+            assert_eq!(access::access(name), Access::Read, "{name}");
+        }
     }
 
     #[test]

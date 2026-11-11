@@ -259,9 +259,6 @@ impl Mem {
             return "this account is mapped to no one, so it reads @guest and writes nothing"
                 .into();
         };
-        if self.conversation.is_none() {
-            return NO_CONVERSATION.into();
-        }
         let groups = groups_of(&self.tree, person);
         match (&self.group, groups.as_slice()) {
             (_, []) => "you are in no group yet: an owner adds you with group_add".into(),
@@ -279,6 +276,7 @@ impl Mem {
                     "you read @{g} and write nothing there, not even a conversation of your own"
                 )
             }
+            (Some(_), _) if self.conversation.is_none() => NO_CONVERSATION.into(),
             (Some(_), _) => {
                 "this conversation's journal could not be opened; try again shortly".into()
             }
@@ -592,6 +590,16 @@ pub(crate) mod tests {
         assert_eq!(
             reader.why_no_here(),
             "you read @zen and write nothing there, not even a conversation of your own"
+        );
+        let mut unnamed = mem("john");
+        unnamed.conversation = None;
+        assert_eq!(unnamed.why_no_here(), NO_CONVERSATION);
+        let mut solo = mem("solo");
+        solo.conversation = None;
+        assert_eq!(
+            solo.why_no_here(),
+            "you are in no group yet: an owner adds you with group_add",
+            "the reason a conversation would not help comes first"
         );
     }
 

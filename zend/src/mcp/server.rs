@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 
 use axum::http::HeaderMap;
+use mcp_server::access::{self, Access};
 use mcp_server::{listing, Call, Identity, NoCaller, Server, Store};
 use serde_json::Value;
 use web::auth::Role;
@@ -126,6 +127,21 @@ impl Server for ZendSession {
 
     fn result(&self, answer: &Answer) -> Value {
         answer.result()
+    }
+
+    /// Never a diary's call, nor one in a private conversation — as the
+    /// aggregator asked, or as the ref it names says (`docs/private_mode.md`
+    /// §4.4).
+    fn logs(&self, call: &Call<Self>, name: &str, _args: &Value) -> bool {
+        if call.quiet || access::access(name) == Access::Diary {
+            return false;
+        }
+        let private = call
+            .conversation_ref
+            .as_deref()
+            .and_then(|text| self.mcp().refs().open(&call.caller.key(), text).ok())
+            .is_some_and(|r| r.private);
+        !private
     }
 
     /// The answer's marks are records, written on the blocking pool.

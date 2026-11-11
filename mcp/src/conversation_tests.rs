@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use crate::app::App;
 use crate::context;
 use crate::conversation::{EXPIRED, FORGED, NO_REF};
-use crate::fake::{self, boss, call, call_as, caller, ref_of, until, Fake};
+use crate::fake::{self, boss, call, call_as, caller, ref_of, until, Fake, LOOK, MAKE};
 
 fn refused(answer: &Value, why: &str) {
     assert_eq!(answer["isError"], true, "{answer}");
@@ -34,17 +34,17 @@ async fn a_call_without_a_live_ref_of_its_callers_is_refused() {
     let state = TempDir::new().unwrap();
     let app = fake::app(&fake::gateway(&backend).await, &state);
     refused(
-        &App::call(&app, &call("s1"), "make", &json!({})).await,
+        &App::call(&app, &call("s1"), MAKE, &json!({})).await,
         NO_REF,
     );
     refused(
-        &App::call(&app, &call("s1"), "make", &json!({"ref": "nonsense"})).await,
+        &App::call(&app, &call("s1"), MAKE, &json!({"ref": "nonsense"})).await,
         FORGED,
     );
     let r = begun(&app).await;
     let other = call_as(caller("someone-else"), Client::ClaudeCode, "s1");
     refused(
-        &App::call(&app, &other, "make", &json!({"ref": r})).await,
+        &App::call(&app, &other, MAKE, &json!({"ref": r})).await,
         FORGED,
     );
     refused(
@@ -52,7 +52,7 @@ async fn a_call_without_a_live_ref_of_its_callers_is_refused() {
         NO_REF,
     );
     assert!(
-        backend.sent("make").is_empty(),
+        backend.sent(MAKE).is_empty(),
         "nothing refused reached the backend"
     );
 }
@@ -65,9 +65,9 @@ async fn a_call_carries_its_ref_to_the_backend_and_not_in_its_arguments() {
     let state = TempDir::new().unwrap();
     let app = fake::app(&fake::gateway(&backend).await, &state);
     let r = begun(&app).await;
-    let answer = App::call(&app, &call("s1"), "look", &json!({"what": "x", "ref": r})).await;
+    let answer = App::call(&app, &call("s1"), LOOK, &json!({"what": "x", "ref": r})).await;
     assert_eq!(answer["isError"], false, "{answer}");
-    let sent = backend.sent("look");
+    let sent = backend.sent(LOOK);
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].args, json!({"what": "x"}));
     assert_eq!(sent[0].conversation_ref.as_deref(), Some(r.as_str()));
@@ -86,6 +86,59 @@ async fn get_user_context_with_its_ref_answers_the_same_ref() {
     let again = App::call(&app, &call("s9"), context::GET, &json!({"ref": r})).await;
     assert_eq!(ref_of(&again), r);
     assert_eq!(backend.sent(context::GET)[1].args, json!({"ref": r}));
+}
+
+/// **An expired ref given to `get_user_context` is renewed, never revived**:
+/// the answer names a new ref, keeping a private one's flag, and the expired
+/// one stays expired — its use is never told.
+#[tokio::test]
+async fn an_expired_ref_is_renewed_and_never_revived() {
+    let backend = Fake::open();
+    let state = TempDir::new().unwrap();
+    let app = fake::app(&fake::gateway(&backend).await, &state);
+    let five_hours_ago = (now_ms() - REF_IDLE_MS - 3_600_000) / 1000;
+    for private in [false, true] {
+        let old = app.refs.seal(
+            &boss().key(),
+            &Ref {
+                id: [private as u8 + 1; 16],
+                private,
+                issued_s: five_hours_ago as u32,
+            },
+        );
+        let renewed = App::call(&app, &call("s1"), context::GET, &json!({"ref": old})).await;
+        let new = ref_of(&renewed);
+        assert_ne!(new, old, "renewed");
+        assert_eq!(app.refs.open(&boss().key(), &new).unwrap().private, private);
+        refused(
+            &App::call(&app, &call("s1"), MAKE, &json!({"ref": old})).await,
+            EXPIRED,
+        );
+        let ok = App::call(&app, &call("s1"), LOOK, &json!({"ref": new})).await;
+        assert_eq!(ok["isError"], false, "{ok}");
+    }
+    assert!(
+        backend
+            .sent(context::REF_SEEN)
+            .iter()
+            .all(|s| s.args.get("used_ms").is_none()),
+        "no use of an expired ref was told"
+    );
+}
+
+/// **The answer's first line is its ref**, the client's guide after it.
+#[tokio::test]
+async fn the_answers_first_line_is_its_ref_and_the_guide_follows() {
+    let backend = Fake::open();
+    let state = TempDir::new().unwrap();
+    let app = fake::app(&fake::gateway(&backend).await, &state);
+    let answer = App::call(&app, &call("s0"), context::GET, &json!({})).await;
+    let text = context::text_of(&answer).unwrap();
+    assert!(text.starts_with("This conversation's ref is `"), "{text}");
+    assert!(
+        text.contains("\n\nHow to work with this user here (claude-code) — the `claude` guide:"),
+        "{text}"
+    );
 }
 
 /// **Every listed tool but `get_user_context` requires `ref`.**
@@ -177,14 +230,14 @@ async fn a_grok_conversation_spans_a_session_per_call() {
     let app = fake::app(&fake::gateway(&backend).await, &state);
     let grok = |s: &str| call_as(boss(), Client::Grok, s);
     let r = ref_of(&App::call(&app, &grok("g0"), context::GET, &json!({})).await);
-    for (session, tool) in [("g1", "look"), ("g2", "make"), ("g3", "guide_list")] {
+    for (session, tool) in [("g1", LOOK), ("g2", MAKE), ("g3", "guide_list")] {
         let answer = App::call(&app, &grok(session), tool, &json!({"ref": r})).await;
         assert_eq!(answer["isError"], false, "{tool}: {answer}");
     }
-    let sent = backend.sent("make");
+    let sent = backend.sent(MAKE);
     assert_eq!(sent[0].conversation_ref.as_deref(), Some(r.as_str()));
     refused(
-        &App::call(&app, &grok("g4"), "make", &json!({})).await,
+        &App::call(&app, &grok("g4"), MAKE, &json!({})).await,
         NO_REF,
     );
 }

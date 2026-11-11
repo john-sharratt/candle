@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use mcp_server::refs::OPENING;
 use serde_json::Value;
 
 use crate::guides::Guide;
@@ -133,15 +134,25 @@ pub fn records(name: &str, failed: bool, from_backend: bool, read_only: bool) ->
     may_record(name, failed) && from_backend && !read_only
 }
 
-/// The user context as served: the client's guide, when it has one, then
+/// The user context as served: the conversation's ref lines the memory
+/// answered first — the ref on the very first line, as every instruction
+/// says it is — then the client's guide, when it has one, then the rest of
 /// what the memory answered.
-pub fn compose(guide: Option<&Guide>, client: &str, memory: &str) -> String {
-    match guide {
+pub fn compose(guide: Option<&Guide>, client: &str, answered: &str) -> String {
+    let (opening, memory) = match answered.split_once("\n\n") {
+        Some((opening, memory)) if opening.starts_with(OPENING) => (Some(opening), memory),
+        _ => (None, answered),
+    };
+    let served = match guide {
         Some(g) => format!(
             "How to work with this user here ({client}) — the `{}` guide:\n\n{}\n\n{memory}",
             g.name, g.body
         ),
         None => memory.to_string(),
+    };
+    match opening {
+        Some(opening) => format!("{opening}\n\n{served}"),
+        None => served,
     }
 }
 
@@ -304,6 +315,30 @@ mod tests {
              briefly.\n\nWhat you know…"
         );
         assert_eq!(compose(None, "other", "What you know…"), "What you know…");
+    }
+
+    /// **The ref stays on the first line**: the guide goes after the
+    /// conversation's ref lines, never in front of them.
+    #[test]
+    fn the_ref_lines_come_before_the_guide() {
+        let g = Guide {
+            name: "claude".into(),
+            description: "Claude.".into(),
+            tools: vec![GET.into()],
+            clients: vec!["claude-code".into()],
+            body: "# Claude".into(),
+        };
+        let answered = "This conversation's ref is `R`. Pass it.\nIt is private.\n\nWhat you know…";
+        assert_eq!(
+            compose(Some(&g), "claude-code", answered),
+            "This conversation's ref is `R`. Pass it.\nIt is private.\n\nHow to work with this \
+             user here (claude-code) — the `claude` guide:\n\n# Claude\n\nWhat you know…"
+        );
+        assert_eq!(
+            compose(None, "other", answered),
+            answered,
+            "with no guide, as answered"
+        );
     }
 
     #[test]

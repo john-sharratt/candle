@@ -14,7 +14,7 @@ use tokio::time::{sleep, timeout};
 use super::Listing;
 use crate::app::App;
 use crate::context;
-use crate::fake::{self, call, ref_of, until, Fake};
+use crate::fake::{self, call, ref_of, until, Fake, LOOK, MAKE};
 
 /// **A call answers while the listing is held**; three calls during one held
 /// listing cause one listing; once it is let go, the read-only tool's calls
@@ -28,7 +28,7 @@ async fn a_call_answers_while_its_record_waits_for_a_listing() {
     let begun = App::call(&app, &call("s0"), context::GET, &json!({})).await;
     let r = ref_of(&begun);
 
-    for (session, tool) in [("s1", "look"), ("s2", "make"), ("s3", "look")] {
+    for (session, tool) in [("s1", LOOK), ("s2", MAKE), ("s3", LOOK)] {
         let answered = timeout(
             Duration::from_secs(5),
             App::call(&app, &call(session), tool, &json!({"what": "x", "ref": r})),
@@ -51,7 +51,7 @@ async fn a_call_answers_while_its_record_waits_for_a_listing() {
     sleep(Duration::from_millis(200)).await;
     let episodes = backend.sent(context::EPISODE);
     assert_eq!(episodes.len(), 1);
-    assert_eq!(episodes[0].args["tool"], "make");
+    assert_eq!(episodes[0].args["tool"], MAKE);
     assert_eq!(episodes[0].conversation_ref.as_deref(), Some(r.as_str()));
     assert_eq!(backend.lists.load(Ordering::SeqCst), 1, "one listing");
     assert!(app.listing.listed());

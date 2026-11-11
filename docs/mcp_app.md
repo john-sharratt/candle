@@ -135,9 +135,10 @@ caller's client, in `io.modelcontextprotocol/clientInfo`, the aggregator's own
 session id, in `com.tokera/session`, and — for every call but a listing — the
 conversation's ref, in `com.tokera/ref` (`docs/private_mode.md` §3.3), which
 is what a conversation is kept by. The backend keys what it
-holds by person, client and that session (`mcp_server::stateless_key`). So two
-claude.ai conversations of one person, each a session of the aggregator's, are
-two sessions at zend, each with its own attached thread. The aggregator holds
+holds by person, client and that session (`mcp_server::stateless_key`), and
+what it holds per conversation — the attached thread, the conversation's
+journal — by the ref: claude.ai carries all of a person's chats on one MCP
+session, and each chat is its own conversation all the same. The aggregator holds
 nothing on a session of its own, so it keeps none: each is carried whole in
 its id (`mcp_server::SealedStore`), as npcd's are. Any member reads a session
 another member opened, a restart loses none, and nothing sticks a caller to
@@ -201,7 +202,8 @@ the aggregator, which lists them whenever its own client does.
 zend's tools are the ones it always served (`zend/src/mcp/tools/`). Its
 sessions are records in its substrate (`zend/src/mcp/state.rs`,
 `RecordStore`), so any member answers. The thread `thread_attach` binds is held
-on the session under `attached`, which is what `"self"` names. The route is
+on the session under `attached/<conversation>`, one per conversation, which is
+what `"self"` names. The route is
 `Dispatch::Any`.
 
 ### npcd (`/v1/npc/mcp` on bot.tokera.com)

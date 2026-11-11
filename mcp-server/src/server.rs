@@ -56,6 +56,8 @@ pub struct Call<S: Server + ?Sized> {
     /// The conversation ref a server in front named for this call, as
     /// written and unopened (`docs/private_mode.md` §3.3).
     pub conversation_ref: Option<String>,
+    /// A server in front asked that this call not be logged (§4.4).
+    pub quiet: bool,
     pub store: Arc<dyn Store>,
     /// The call's event stream, when it is answered on one: each line sent is
     /// a progress notification.
@@ -128,6 +130,14 @@ pub trait Server: Send + Sync + 'static {
 
     /// The `tools/call` result an answer is sent as.
     fn result(&self, answer: &Self::Answer) -> Value;
+
+    /// Whether `call` of tool `name` with `args` is logged as it is handled:
+    /// not when a server in front asked it not be (`docs/private_mode.md`
+    /// §4.4). A server that reads the conversation itself says so too.
+    fn logs(&self, call: &Call<Self>, name: &str, args: &Value) -> bool {
+        let _ = (name, args);
+        !call.quiet
+    }
 
     /// What an answer changes once it reached the client.
     fn delivered(

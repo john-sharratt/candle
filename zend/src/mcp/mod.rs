@@ -70,6 +70,10 @@ pub mod threads;
 
 #[cfg(test)]
 mod latency_tests;
+#[cfg(test)]
+mod private_tests;
+#[cfg(test)]
+mod test_session;
 pub mod tools;
 pub mod workers;
 pub mod zen_tasks;

@@ -7,10 +7,11 @@
 
 use serde_json::{json, Value};
 
-use super::{Answer, Ctx};
+use super::{Answer, Ctx, LOADING};
 use crate::mcp::records::Records;
 use crate::mcp::ref_records;
 use crate::mcp::tools::mem::NO_CONVERSATION;
+use crate::mcp::workers::now_ms;
 
 pub const NAME: &str = "conversation_ref_seen";
 
@@ -19,10 +20,16 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         return Answer::error(NO_CONVERSATION);
     };
     let Some(records) = ctx.session.shared_substrate() else {
-        return Answer::error(super::LOADING);
+        return Answer::error(LOADING);
     };
     let conversation = r.conversation();
-    let used = match args.get("used_ms").and_then(Value::as_u64) {
+    // A use is never later than now: told one in the future, a ref would
+    // outlive its four idle hours.
+    let told = args
+        .get("used_ms")
+        .and_then(Value::as_u64)
+        .map(|at| at.min(now_ms()));
+    let used = match told {
         Some(at) => match ref_records::touch(&records as &dyn Records, &conversation, at) {
             Ok(at) => Some(at),
             Err(e) => return Answer::error(e.to_string()),
