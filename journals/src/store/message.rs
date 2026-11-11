@@ -75,6 +75,8 @@ pub fn read(message: &str) -> Result<Recorded> {
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use super::*;
     use crate::experience::{Experience, ExperienceKind};
     use crate::ops::fixture::{now, p, yen};
@@ -91,7 +93,7 @@ mod tests {
             terms: Terms::default(),
         };
         let id = LineId::parse("2026-10-30-1200-7e3a").unwrap();
-        let m = message("Note on @zen/topics", &yen(), &op, now(), &[id.clone()]);
+        let m = message("Note on @zen/topics", &yen(), &op, now(), slice::from_ref(&id));
         assert!(m.starts_with(
             "Note on @zen/topics\n\nJournal-Writer: grok\nJournal-Account: yen\nJournal-Channel: grok\nJournal-At: 2026-10-30T12:00:00Z\nJournal-Line: 2026-10-30-1200-7e3a\nJournal-Actor: "
         ), "{m}");

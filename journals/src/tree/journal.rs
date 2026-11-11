@@ -272,7 +272,7 @@ mod tests {
                     depth: 1,
                 },
                 Some(Meta::new(
-                    &format!("b{i:02}"),
+                    format!("b{i:02}"),
                     Some("x".into()),
                     at("2026-10-01T00:00:00Z"),
                 )),

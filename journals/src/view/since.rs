@@ -152,6 +152,8 @@ pub fn since(
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use super::*;
     use crate::experience::Experience;
     use crate::ops::fixture::{p, zen};
@@ -276,7 +278,7 @@ mod tests {
         // 24 the fold archived; read from the start of the 1st.
         let line = LINE_COST + "did 00".len();
         let budget = 27 * line + LINE_COST + "A day of chores.".len();
-        let s = since(&t, &npcd(), &[path.clone()], t0.plus(OVERLAP), &BTreeSet::new(), budget)
+        let s = since(&t, &npcd(), slice::from_ref(&path), t0.plus(OVERLAP), &BTreeSet::new(), budget)
             .unwrap();
         let read = texts(&s);
         assert_eq!(read.len(), 28, "{read:?}");
