@@ -176,7 +176,7 @@ mod tests {
         for i in 0..FREE {
             fail(&b, "o", i as u64 * 10_000_000);
         }
-        let later = 1_000_000_000;
+        let later = 30_000_000;
         b.attempt("o", later).unwrap().found(true);
         assert!(b.attempt("o", later).is_err(), "the misses still stand");
     }
