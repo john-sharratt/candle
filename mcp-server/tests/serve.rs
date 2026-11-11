@@ -20,6 +20,8 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Duration};
 use tower::ServiceExt;
+use tracing::callsite::rebuild_interest_cache;
+use tracing::subscriber::set_default;
 use tracing_subscriber::fmt::MakeWriter;
 
 /// An app with one tool, `remember {text}`, which holds its text on the
@@ -303,7 +305,10 @@ async fn a_quiet_call_leaves_no_line_in_the_log() {
         .with_writer(kept.clone())
         .with_ansi(false)
         .finish();
-    let _logging = tracing::subscriber::set_default(subscriber);
+    let _logging = set_default(subscriber);
+    // Tests beside this one may have met the log's callsite before any
+    // subscriber was here, and cached it as wanted by none.
+    rebuild_interest_cache();
     let (router, _) = stand();
     let modern = [(VERSION_HEADER, MODERN)];
     let quiet = json!({"io.modelcontextprotocol/clientInfo": {"name": "claude-code"},
