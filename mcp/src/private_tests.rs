@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use mcp_server::access::{self, Access, DIARIES_PRIVATE, PRIVATE, TOOLS};
 use mcp_server::http::now_ms;
-use mcp_server::refs::{Ref, REF_IDLE_MS};
+use mcp_server::refs::{diary_key, Ref, Refs, REF_IDLE_MS};
 use mcp_server::{Client, Server};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -122,6 +122,33 @@ async fn diaries_are_reached_only_from_a_private_conversation() {
     assert_eq!(read["isError"], false, "{read}");
     assert!(backend.sent(DIARY)[0].quiet);
     assert_eq!(app.counters.read().2, 1, "counted as a diary call");
+}
+
+/// **Every diary call of a conversation names its diary key**, so the
+/// gateway sends them all to the member holding what it unlocked; another
+/// conversation's name another key, and no other call names one.
+#[tokio::test]
+async fn every_diary_call_names_its_conversations_key() {
+    let backend = Fake::open();
+    let state = TempDir::new().unwrap();
+    let app = fake::app(&fake::gateway(&backend).await, &state);
+    let first = begin(&app, true).await;
+    let second = begin(&app, true).await;
+    for r in [&first, &first, &second] {
+        let read = App::call(&app, &call("s1"), DIARY, &json!({"ref": r})).await;
+        assert_eq!(read["isError"], false, "{read}");
+        let look = App::call(&app, &call("s1"), LOOK, &json!({"ref": r})).await;
+        assert_eq!(look["isError"], false, "{look}");
+    }
+    let key_of = |r: &str| {
+        let opened = Refs::new(fake::KEY).open(&boss().key(), r).unwrap();
+        Some(diary_key(&opened.conversation()))
+    };
+    let named: Vec<Option<String>> = backend.sent(DIARY).into_iter().map(|s| s.diary).collect();
+    assert_eq!(named, [key_of(&first), key_of(&first), key_of(&second)]);
+    assert_ne!(key_of(&first), key_of(&second));
+    assert!(backend.sent(LOOK).iter().all(|s| s.diary.is_none()));
+    assert!(backend.sent(context::GET).iter().all(|s| s.diary.is_none()));
 }
 
 /// **A private conversation's flag reaches no other**: a normal one begun

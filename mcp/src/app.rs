@@ -210,13 +210,20 @@ impl App {
     }
 
     /// The session `call` is made on behalf of, in the conversation `named`;
-    /// `quiet` when it is not to be logged where it is handled.
-    fn on_behalf<'a>(call: &'a Call<Self>, named: Option<&'a str>, quiet: bool) -> OnBehalf<'a> {
+    /// `quiet` when it is not to be logged where it is handled; `diary`, the
+    /// conversation's diary key, for a diary call.
+    fn on_behalf<'a>(
+        call: &'a Call<Self>,
+        named: Option<&'a str>,
+        quiet: bool,
+        diary: Option<&'a str>,
+    ) -> OnBehalf<'a> {
         OnBehalf {
             id: &call.session_id,
             session: &call.session,
             conversation_ref: named,
             quiet,
+            diary,
         }
     }
 
@@ -224,7 +231,8 @@ impl App {
     /// first when none has, as for a tool new to every listing so far — or
     /// answered here when it is a guide tool; in the conversation `named`.
     /// A `quiet` call — a private conversation's, a diary's — is logged
-    /// nowhere, here or behind (`docs/private_mode.md` §4.4).
+    /// nowhere, here or behind (`docs/private_mode.md` §4.4). A diary call
+    /// names its conversation's `diary` key, by which it is routed (§5.4).
     async fn run(
         &self,
         call: &Call<Self>,
@@ -232,6 +240,7 @@ impl App {
         args: &Value,
         named: Option<&str>,
         quiet: bool,
+        diary: Option<&str>,
     ) -> Ran {
         if guide_tools::is_guide_tool(name) {
             let answer = guide_tools::call(&self.library, name, args);
@@ -241,7 +250,7 @@ impl App {
             }
             return Ran::Answered(answer);
         }
-        let on = Self::on_behalf(call, named, quiet);
+        let on = Self::on_behalf(call, named, quiet, diary);
         let backend = match self.route(name) {
             Some(b) => b,
             None => {
@@ -364,7 +373,7 @@ impl App {
         let backend = this
             .route(context::GET)
             .ok_or("no backend lists the user's context yet")?;
-        let on = Self::on_behalf(call, Some(text), quiet);
+        let on = Self::on_behalf(call, Some(text), quiet, None);
         let answer = this
             .call_served(
                 backend,
@@ -407,6 +416,7 @@ impl App {
                 session: &session,
                 conversation_ref: Some(&text),
                 quiet,
+                diary: None,
             };
             let answer = this
                 .call_served(
@@ -465,7 +475,7 @@ impl App {
             None => None,
         };
         let ran = this
-            .run(call, context::GET, args, live.as_deref(), quiet)
+            .run(call, context::GET, args, live.as_deref(), quiet, None)
             .await;
         let Ran::Answered(mut answer) = ran else {
             return text_result("the client stopped listening", true);
@@ -553,7 +563,7 @@ impl Server for App {
     /// requires `ref`.
     async fn tools(this: &Arc<Self>, call: &Call<Self>) -> Result<Value, String> {
         let mut listed = this
-            .list(&call.caller, &Self::on_behalf(call, None, false))
+            .list(&call.caller, &Self::on_behalf(call, None, false, None))
             .await;
         if listed.tools.is_empty() && !listed.failed.is_empty() {
             return Err(listed.failed.join("; "));
@@ -607,7 +617,11 @@ impl Server for App {
         if r.private {
             this.counters.private_call(diary);
         }
-        let Ran::Answered(answer) = this.run(call, name, &args, Some(&text), quiet).await else {
+        let key = diary.then(|| refs::diary_key(&r.conversation()));
+        let ran = this
+            .run(call, name, &args, Some(&text), quiet, key.as_deref())
+            .await;
+        let Ran::Answered(answer) = ran else {
             // A client that left needs no record of an answer it never read.
             return text_result("the client stopped listening", true);
         };

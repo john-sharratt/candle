@@ -15,8 +15,10 @@ use std::time::Duration;
 use axum::http::header;
 use futures::StreamExt;
 use mcp_server::http::{PROGRESS_EVERY, VERSION_HEADER};
+use mcp_server::access::{self, Access};
 use mcp_server::listing::TOOLS_VERSION_HEADER;
 use mcp_server::protocol::{text_result, CLIENT_META, MODERN, QUIET_META, REF_META, SESSION_META};
+use mcp_server::refs::DIARY_HEADER;
 use mcp_server::Session;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -45,14 +47,20 @@ pub struct Backend {
     /// The path its memory's calls go to, when it serves one: declared only
     /// by the members that hold the memory.
     pub memory: Option<String>,
+    /// The path its diary calls go to, when it serves diaries: declared by
+    /// the same members, and routed by the conversation's [`DIARY_HEADER`] to
+    /// the one holding what the conversation unlocked.
+    pub diaries: Option<String>,
 }
 
 impl Backend {
-    /// The path a call of `tool` with `args` goes to: the memory's, for a
-    /// call that reads or writes the memory, on a backend that serves one.
+    /// The path a call of `tool` with `args` goes to: the diaries', for a
+    /// diary call; the memory's, for a call that reads or writes the memory;
+    /// each on a backend that serves one.
     pub fn path_for(&self, tool: &str, args: &Value) -> &str {
-        match &self.memory {
-            Some(memory) if context::needs_memory(tool, args) => memory,
+        match (&self.diaries, &self.memory) {
+            (Some(diaries), _) if access::access(tool) == Access::Diary => diaries,
+            (_, Some(memory)) if context::needs_memory(tool, args) => memory,
             _ => &self.path,
         }
     }
@@ -67,6 +75,9 @@ pub struct OnBehalf<'a> {
     /// The call is not to be logged where it is handled: a private
     /// conversation's, or a diary's (§4.4).
     pub quiet: bool,
+    /// For a diary call, its conversation's diary key, sent in
+    /// [`DIARY_HEADER`] (§5.4).
+    pub diary: Option<&'a str>,
 }
 
 /// What one message read off a backend's answer is.
@@ -164,13 +175,16 @@ impl Link {
         }
         params["_meta"] = meta;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let req = self
+        let mut req = self
             .client
             .post(format!("{}{path}", self.base))
             .header(header::HOST, &backend.host)
             .header(VERSION_HEADER, MODERN)
             .header(header::ACCEPT, "application/json, text/event-stream")
             .json(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        if let Some(key) = on.diary {
+            req = req.header(DIARY_HEADER, key);
+        }
         match caller.authorization() {
             Some((k, v)) => req.header(k, v),
             None => req,
@@ -472,6 +486,7 @@ mod tests {
             host: "bot.tokera.com".into(),
             path: "/v1/npc/mcp".into(),
             memory: None,
+            diaries: None,
         };
         let session = Session::new("o", Client::ClaudeCode, MODERN, 0);
         let on = OnBehalf {
@@ -479,6 +494,7 @@ mod tests {
             session: &session,
             conversation_ref: Some("r1"),
             quiet: true,
+            diary: None,
         };
         let req = link
             .request(
@@ -500,6 +516,7 @@ mod tests {
             req.headers().get("x-tokera-user").is_none(),
             "the token names the caller, never headers of the app's own"
         );
+        assert!(req.headers().get(DIARY_HEADER).is_none(), "no diary call");
         let body: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(body["method"], "tools/call");
         assert_eq!(
@@ -540,9 +557,46 @@ mod tests {
         assert!(body["params"]["_meta"].get("com.tokera/quiet").is_none());
     }
 
+    /// **A diary call names its conversation's diary key in its header**, by
+    /// which the gateway sends it to the member holding what it unlocked.
+    #[test]
+    fn a_diary_call_names_its_key() {
+        let link = Link::new("http://192.168.0.5/").unwrap();
+        let backend = Backend {
+            name: "coding".into(),
+            host: "code.tokera.com".into(),
+            path: "/v1/mcp".into(),
+            memory: Some("/v1/mcp/memory".into()),
+            diaries: Some("/v1/mcp/diaries".into()),
+        };
+        let session = Session::new("o", Client::ClaudeCode, MODERN, 0);
+        let on = OnBehalf {
+            id: "s1",
+            session: &session,
+            conversation_ref: Some("r1"),
+            quiet: true,
+            diary: Some("diary-0123456789abcdef"),
+        };
+        let req = link
+            .request(
+                &backend,
+                backend.path_for("diary_open", &json!({})),
+                &caller(),
+                &on,
+                "tools/call",
+                json!({"name": "diary_open"}),
+                true,
+            )
+            .build()
+            .unwrap();
+        assert_eq!(req.url().as_str(), "http://192.168.0.5/v1/mcp/diaries");
+        assert_eq!(req.headers()[DIARY_HEADER], "diary-0123456789abcdef");
+    }
+
     /// **A memory call goes to the memory's path**, which only the members
-    /// holding the memory declare; every other call, and every call to a
-    /// backend with no memory, to the server's own.
+    /// holding the memory declare; a diary call to the diaries' path, declared
+    /// by the same members; every other call, and every call to a backend
+    /// with neither, to the server's own.
     #[test]
     fn a_memory_call_goes_where_the_memory_is_served() {
         let coding = Backend {
@@ -550,6 +604,7 @@ mod tests {
             host: "code.tokera.com".into(),
             path: "/v1/mcp".into(),
             memory: Some("/v1/mcp/memory".into()),
+            diaries: Some("/v1/mcp/diaries".into()),
         };
         let none = json!({});
         let memory = json!({"journal": "people/yen"});
@@ -557,13 +612,18 @@ mod tests {
         assert_eq!(coding.path_for("get_user_context", &none), "/v1/mcp/memory");
         assert_eq!(coding.path_for("journal_note", &memory), "/v1/mcp/memory");
         assert_eq!(coding.path_for("journal_read", &thread), "/v1/mcp");
+        for diary in ["diary_open", "diary_create", "diary_read", "diary_close"] {
+            assert_eq!(coding.path_for(diary, &none), "/v1/mcp/diaries", "{diary}");
+        }
         for other in ["thread_attach", "repo_task_start", "cluster_status"] {
             assert_eq!(coding.path_for(other, &none), "/v1/mcp", "{other}");
         }
         let bot = Backend {
             memory: None,
+            diaries: None,
             ..coding
         };
         assert_eq!(bot.path_for("get_user_context", &none), "/v1/mcp");
+        assert_eq!(bot.path_for("diary_open", &none), "/v1/mcp");
     }
 }

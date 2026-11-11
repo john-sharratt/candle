@@ -1,13 +1,15 @@
 //! Diaries as zend serves them (`docs/private_mode.md` §5.4): unlocked per
 //! private conversation by a passphrase, read and written through the memory's
 //! store as sealed files, and locked again on `diary_close` or when the
-//! conversation's ref expires. The member that holds the journal checkout
-//! serves them; what is unlocked lives in its memory alone.
+//! conversation's ref expires. A member that holds the journal checkout
+//! serves them; what is unlocked lives in its memory alone, and that member
+//! holds the conversation's diary calls to itself while it is unlocked.
 //!
 //! | Module | |
 //! |---|---|
 //! | [`unlocked`] | what a conversation holds while its diaries are open |
 //! | [`backoff`] | the wait after opens that unlocked nothing, and the cap on stretching at once |
+//! | [`placement`] | every diary call of an unlocked conversation routed to the member holding it |
 //!
 //! **Locks.** A passphrase is stretched with no lock held. A change takes the
 //! write turn — so two conversations changing one diary keep both changes —
@@ -21,6 +23,7 @@
 //! the old.
 
 pub mod backoff;
+pub mod placement;
 pub mod unlocked;
 
 use std::collections::{BTreeMap, HashMap};
@@ -35,6 +38,7 @@ use mcp_server::refs::REF_IDLE_MS;
 use zeroize::Zeroizing;
 
 use self::backoff::{Backoff, Stretching};
+use self::placement::{Claims, Placement};
 use self::unlocked::{Opened, Unlocked};
 use super::memory::Memory;
 
@@ -72,6 +76,8 @@ pub struct Diaries {
     writing: Mutex<()>,
     backoff: Backoff,
     stretching: Stretching,
+    /// Holds an unlocked conversation's diary calls to this member.
+    placement: Box<dyn Placement>,
 }
 
 impl Default for Diaries {
@@ -136,7 +142,15 @@ impl Diaries {
             writing: Mutex::new(()),
             backoff: Backoff::default(),
             stretching: Stretching::default(),
+            placement: Box::new(Claims),
         }
+    }
+
+    /// These diaries, placing their conversations' calls through
+    /// `placement`.
+    pub fn placed_by(mut self, placement: Box<dyn Placement>) -> Self {
+        self.placement = placement;
+        self
     }
 
     /// `passphrase` stretched with `salt`, within the cap on stretches at
@@ -190,7 +204,8 @@ impl Diaries {
         let open = unwrapped(&kek, &files);
         let n = open.len();
         attempt.found(n > 0);
-        held(&self.unlocked).insert(
+        let mut unlocked = held(&self.unlocked);
+        unlocked.insert(
             conversation.to_string(),
             Unlocked {
                 kek,
@@ -199,6 +214,11 @@ impl Diaries {
                 used_ms: now_ms,
             },
         );
+        // Held whatever opened, none included: the conversation's next call
+        // — the `diary_create` a new passphrase is opened for — must find the
+        // passphrase here. Under the map, so the claim stands exactly while
+        // the conversation is unlocked.
+        self.placement.hold(conversation);
         Ok(n)
     }
 
@@ -520,9 +540,15 @@ impl Diaries {
         Ok(())
     }
 
-    /// Lock `conversation`'s diaries; whether any were open.
+    /// Lock `conversation`'s diaries, and let its calls be placed afresh;
+    /// whether any were open.
     pub fn close(&self, conversation: &str) -> bool {
-        held(&self.unlocked).remove(conversation).is_some()
+        let mut unlocked = held(&self.unlocked);
+        let was = unlocked.remove(conversation).is_some();
+        if was {
+            self.placement.let_go(conversation);
+        }
+        was
     }
 
     /// Lock every conversation's diaries idle past [`REF_IDLE_MS`] at
@@ -536,12 +562,17 @@ impl Diaries {
             .filter_map(|c| used(&c).map(|at| (c, at)))
             .collect();
         let mut unlocked = held(&self.unlocked);
-        let before = unlocked.len();
+        let mut locked = 0;
         unlocked.retain(|conversation, u| {
             let last = told.get(conversation).copied().unwrap_or(0).max(u.used_ms);
-            now_ms.saturating_sub(last) < REF_IDLE_MS
+            let live = now_ms.saturating_sub(last) < REF_IDLE_MS;
+            if !live {
+                self.placement.let_go(conversation);
+                locked += 1;
+            }
+            live
         });
-        before - unlocked.len()
+        locked
     }
 
     /// Whether `conversation` holds any passphrase open.

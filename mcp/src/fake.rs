@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use mcp_server::http::now_ms;
 use mcp_server::protocol::{MODERN, QUIET_META, REF_META};
-use mcp_server::refs::{named_in, Refs, OPENING};
+use mcp_server::refs::{named_in, Refs, DIARY_HEADER, OPENING};
 use mcp_server::{Call, Client, Identity, SealedStore, Session};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -43,13 +44,15 @@ pub const MAKE: &str = "image_generate";
 pub const DIARY: &str = "diary_read";
 
 /// One call the backend was sent: its tool, its arguments, the ref its
-/// `_meta` named, and whether it asked not to be logged.
+/// `_meta` named, whether it asked not to be logged, and the diary key its
+/// header named.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sent {
     pub tool: String,
     pub args: Value,
     pub conversation_ref: Option<String>,
     pub quiet: bool,
+    pub diary: Option<String>,
 }
 
 /// The fake backend: what it was sent, the uses it was told, and the gate
@@ -146,7 +149,11 @@ impl Fake {
     }
 }
 
-async fn serve(State(fake): State<Arc<Fake>>, Json(req): Json<Value>) -> Json<Value> {
+async fn serve(
+    State(fake): State<Arc<Fake>>,
+    headers: HeaderMap,
+    Json(req): Json<Value>,
+) -> Json<Value> {
     let id = req["id"].clone();
     let result = match req["method"].as_str() {
         Some("tools/list") => {
@@ -171,6 +178,10 @@ async fn serve(State(fake): State<Arc<Fake>>, Json(req): Json<Value>) -> Json<Va
                 args: args.clone(),
                 conversation_ref: named.clone(),
                 quiet: params["_meta"][QUIET_META] == true,
+                diary: headers
+                    .get(DIARY_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
             });
             fake.answer(&boss().key(), &tool, &args, named.as_deref())
         }
@@ -229,6 +240,7 @@ pub fn app(gateway: &str, state: &TempDir) -> Arc<App> {
             host: "code.tokera.com".into(),
             path: "/v1/mcp".into(),
             memory: None,
+            diaries: None,
         }],
         link: Link::new(gateway).unwrap(),
         routes: Routes::kept_in(&routes, vec!["zen".into()]),

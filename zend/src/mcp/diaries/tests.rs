@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::slice;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use journals::diaries::book::Author;
 use journals::diaries::crypto::{self, unwrap, KdfParams, Kek};
@@ -14,6 +14,7 @@ use journals::time::Stamp;
 use mcp_server::refs::REF_IDLE_MS;
 use tempfile::TempDir;
 
+use super::placement::Placement;
 use super::{Diaries, MOVED, NOT_OPEN};
 use crate::mcp::memory::tests::{opened, repo};
 use crate::mcp::memory::Memory;
@@ -67,6 +68,59 @@ fn an_unknown_passphrase_opens_nothing_and_creates_nothing() {
     assert!(files.is_empty() && salt.is_none(), "nothing was written");
     assert!(d.is_open("c1"), "the passphrase is open to create with");
     assert!(d.open(&m, "o", "c1", "short", NOW).is_err(), "too short");
+}
+
+/// What a placement was told, in order.
+#[derive(Clone, Default)]
+struct Told(Arc<Mutex<Vec<(&'static str, String)>>>);
+
+impl Told {
+    fn said(&self) -> Vec<(&'static str, String)> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl Placement for Told {
+    fn hold(&self, conversation: &str) {
+        self.0.lock().unwrap().push(("hold", conversation.into()));
+    }
+
+    fn let_go(&self, conversation: &str) {
+        self.0.lock().unwrap().push(("let go", conversation.into()));
+    }
+}
+
+fn told(said: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+    said.iter().map(|(a, c)| (*a, c.to_string())).collect()
+}
+
+/// **A conversation's diary calls are held here exactly while it is
+/// unlocked**: an open that finds nothing holds them too — the new
+/// passphrase's first diary is created by the next call, which must reach
+/// this member — and closing or going idle lets them go.
+#[test]
+fn an_open_conversation_is_held_here_until_it_locks() {
+    let (_root, m) = memory();
+    let placement = Told::default();
+    let d = diaries().placed_by(Box::new(placement.clone()));
+    assert_eq!(d.open(&m, "o", "c1", PASS, NOW), Ok(0));
+    assert_eq!(placement.said(), told(&[("hold", "c1")]));
+    d.create(&m, "c1", TOPIC, PASS, NOW).unwrap();
+    d.open(&m, "o", "c2", PASS, NOW).unwrap();
+    assert!(d.open(&m, "o", "c3", "short", NOW).is_err());
+    assert!(d.close("c1"));
+    assert!(!d.close("c1"), "closed already");
+    assert_eq!(d.sweep(NOW + REF_IDLE_MS, |_| None), 1);
+    assert_eq!(
+        placement.said(),
+        told(&[
+            ("hold", "c1"),
+            ("hold", "c2"),
+            ("let go", "c1"),
+            ("let go", "c2"),
+        ]),
+        "a refused open holds nothing, and each lock lets go once"
+    );
 }
 
 /// **A create must repeat the open passphrase**, so a typo makes no

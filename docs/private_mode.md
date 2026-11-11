@@ -252,7 +252,22 @@ In the journals repository, one encrypted file per diary:
 ### 5.4 Tools
 
 Every one requires a private ref and is refused otherwise. Each is served by
-the member that holds the journals checkout (zend's memory path).
+a member that holds the journals checkout, at zend's diaries path
+(`/v1/mcp/diaries`), which only those members declare.
+
+**Every diary call of a conversation reaches one member.** What a
+conversation unlocked is held in the memory of the member that opened it, and
+more than one member holds the checkout, so a call dealt to another would
+find nothing open. The aggregator names the conversation's diary key
+(`diary-` followed by its conversation key) in the `x-tokera-diary` header of
+every diary call; the diaries path is sticky on that header. The first call
+is placed among the members declaring the path; the member that serves a
+`diary_open` holds the key's claim — whatever the open found, zero included
+— until the conversation's diaries are locked by `diary_close` or by the
+sweep, and every later call goes to it. The claim is held past the request
+that took it, unlike a turn's. A member that restarts loses both what was
+unlocked and the claim, and the conversation opens again wherever its next
+open is placed.
 
 | Tool | Does |
 |---|---|

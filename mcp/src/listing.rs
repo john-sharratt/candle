@@ -86,6 +86,7 @@ pub fn record_later(
             session: &session,
             conversation_ref: Some(&conversation_ref),
             quiet: false,
+            diary: None,
         };
         this.listing
             .ensure(async {

@@ -21,6 +21,7 @@ use axum::middleware;
 use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror};
 use host::guard::{delete, get, post, put, Api, Guarded, Routes};
 use mcp_server::http as mcp_http;
+use mcp_server::refs::DIARY_HEADER;
 use web::auth::{Role, Roles};
 
 use crate::mcp;
@@ -74,10 +75,17 @@ const MEMORY_OPEN_WAIT: Duration = Duration::from_secs(120);
 /// `/v1/mcp`, declared only by the members that hold the journal repository.
 pub const MEMORY_MCP_PATH: &str = "/v1/mcp/memory";
 
+/// Where zend's MCP server is reached for diary calls: declared by the
+/// members that hold the journal repository, and routed by each
+/// conversation's diary key to the one holding what it unlocked
+/// (`docs/private_mode.md` §5.4).
+pub const DIARIES_MCP_PATH: &str = "/v1/mcp/diaries";
+
 /// The routes only a member holding the journal repository declares: the
-/// memory's MCP calls, and the journals by hand.
-const MEMORY_ROUTES: [&str; 4] = [
+/// memory's MCP calls, the diaries', and the journals by hand.
+const MEMORY_ROUTES: [&str; 5] = [
     MEMORY_MCP_PATH,
+    DIARIES_MCP_PATH,
     "/v1/journals",
     "/v1/journals/tree",
     "/v1/journals/grep",
@@ -396,6 +404,16 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
                 .get(mcp_http::get)
                 .delete(mcp_http::delete::<ZendSession>),
         )
+        // The same server, for diary calls: what a conversation unlocked is
+        // held in one member's memory alone, so each call goes by the
+        // conversation's diary key to the member holding it, which keeps the
+        // key while the diaries are open (`crate::mcp::diaries::placement`).
+        .route(
+            DIARIES_MCP_PATH,
+            Role::Unauthenticated,
+            Dispatch::Sticky(vec![KeySource::Header(DIARY_HEADER.into())]),
+            post(mcp_http::post::<ZendSession>),
+        )
         // A worker a slower member hands to this one at a round boundary
         // (`crate::worker_hop`). Open at the gateway, because a member asks it,
         // addressed by node; the handler believes only a member's stamp.
@@ -465,6 +483,7 @@ mod tests {
                 ("/v1/journals/grep", "user"),
                 ("/v1/mcp", "unauthenticated"),
                 ("/v1/mcp/memory", "unauthenticated"),
+                ("/v1/mcp/diaries", "unauthenticated"),
                 // Open at the gateway; its handler believes a member's stamp
                 // alone (`worker_continue`).
                 ("/v1/mcp/worker/continue", "unauthenticated"),
@@ -537,6 +556,12 @@ mod tests {
             ("GET", "/v1/journals/tree", Dispatch::Any),
             ("GET", "/v1/journals/grep", Dispatch::Any),
             ("POST", "/v1/mcp", Dispatch::Any),
+            ("POST", "/v1/mcp/memory", Dispatch::Any),
+            (
+                "POST",
+                "/v1/mcp/diaries",
+                Dispatch::Sticky(vec![KeySource::Header("x-tokera-diary".into())]),
+            ),
             ("DELETE", "/v1/substrate/zend/timeline/7", Dispatch::Best),
             ("POST", "/v1/substrate/zend/scan", Dispatch::Best),
             ("GET", "/v1/substrate/zend/system-prompt", Dispatch::Any),

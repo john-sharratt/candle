@@ -9,8 +9,8 @@ use std::time::Duration;
 use super::hub::Hub;
 use super::queue::{Placing, RouteAt, HOLD, RESERVE_FOR, TURN_ROUTE};
 use super::registry::{MemberView, Pick};
-use crate::dispatch::Dispatch;
-use crate::frame::{BuildId, Capacity, MemberState};
+use crate::dispatch::{Dispatch, KeySource, Route, RouteTable};
+use crate::frame::{BuildId, Capacity, Epoch, MemberState};
 use crate::handshake::GroupKey;
 use crate::machines::MachineTable;
 
@@ -170,6 +170,51 @@ async fn a_waiting_unit_is_placed_when_an_answer_ends() {
     assert!(
         third.load.is_some(),
         "counted against the card like any unit"
+    );
+}
+
+/// **A sticky request whose key nobody holds goes only to a member declaring
+/// its route**, as an `Any` one does; once a member holds the key, it goes
+/// there.
+#[tokio::test(start_paused = true)]
+async fn an_unheld_sticky_key_goes_to_a_member_declaring_its_route() {
+    let hub = hub(
+        "m1:\n  conversations: {rank: 1, min: 8}\nm2:\n  conversations: {rank: 1, min: 8}\n",
+        vec![member("zend", 1, "m1", 7), member("zend", 2, "m2", 7)],
+        0,
+    );
+    let header = Dispatch::Sticky(vec![KeySource::Header("x-tokera-diary".into())]);
+    {
+        let mut s = hub.state();
+        let plain = RouteTable::new(vec![Route::new(&["POST"], "/v1/mcp", Dispatch::Any)]).unwrap();
+        let diaries = RouteTable::new(vec![
+            Route::new(&["POST"], "/v1/mcp", Dispatch::Any),
+            Route::new(&["POST"], "/v1/mcp/diaries", header.clone()),
+        ])
+        .unwrap();
+        s.registry.routes("zend", 1, plain);
+        s.registry.routes("zend", 2, diaries);
+    }
+    let diary = || Placing {
+        dispatch: header.clone(),
+        key: Some("diary-0123456789abcdef".into()),
+        route: Some(RouteAt {
+            method: "POST".into(),
+            path: "/v1/mcp/diaries".into(),
+        }),
+        ..unit("zend")
+    };
+    for _ in 0..4 {
+        assert_eq!(hub.place(diary()).await.expect("room").pick, Pick::Member(2));
+    }
+    hub.state()
+        .registry
+        .claims("zend")
+        .claim(b"diary-0123456789abcdef", Epoch { ms: 1, node: 1 });
+    assert_eq!(
+        hub.place(diary()).await.expect("room").pick,
+        Pick::Member(1),
+        "the holder takes it"
     );
 }
 

@@ -45,6 +45,17 @@ pub fn named_in(answer: &str) -> Option<&str> {
     first.strip_prefix(OPENING)?.split('`').next()
 }
 
+/// The header a diary call names its conversation's [`diary_key`] in, so the
+/// gateway sends every diary call of a conversation to the one member holding
+/// what it unlocked (`docs/private_mode.md` §5.4).
+pub const DIARY_HEADER: &str = "x-tokera-diary";
+
+/// The sticky key a conversation's diaries are routed by, from its
+/// [`Ref::conversation`] key.
+pub fn diary_key(conversation: &str) -> String {
+    format!("diary-{conversation}")
+}
+
 const ID: usize = 16;
 const MAC: usize = 16;
 const LEN: usize = ID + 1 + 4 + MAC;
@@ -317,5 +328,11 @@ mod tests {
             key,
             "the flag is not the conversation"
         );
+    }
+
+    /// **A conversation's diaries are routed by its key**, never by its ref.
+    #[test]
+    fn the_diary_key_names_the_conversation_key() {
+        assert_eq!(diary_key("0123456789abcdef"), "diary-0123456789abcdef");
     }
 }

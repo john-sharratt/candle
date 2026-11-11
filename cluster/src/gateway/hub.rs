@@ -1618,7 +1618,8 @@ impl Hub {
 
     /// [`Self::pick_from`] under a hold of the state the caller already has.
     /// An `Any` request whose `route` not every ready member declares goes to
-    /// one that does, in turn, and waits while none is ready.
+    /// one that does, in turn, and waits while none is ready — as does a
+    /// sticky one whose key no member here holds.
     #[allow(clippy::too_many_arguments)]
     fn pick_in(
         self: &Arc<Self>,
@@ -1652,7 +1653,15 @@ impl Hub {
                 "routing standing"
             );
         }
-        if let (Dispatch::Any, Some(at)) = (dispatch, route) {
+        // A sticky request whose key nobody here holds is placed afresh, and
+        // only among the members declaring its route, as an `Any` one is;
+        // once a member holds the key, the key decides.
+        let unheld = match dispatch {
+            Dispatch::Any => true,
+            Dispatch::Sticky(_) => !key.is_some_and(|k| registry.is_held(app, k)),
+            _ => false,
+        };
+        if let (true, Some(at)) = (unheld, route) {
             if let Some(nodes) = registry.declaring(app, &at.method, &at.path) {
                 let pick = registry
                     .round_robin_among(app, &nodes)

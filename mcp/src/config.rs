@@ -89,6 +89,11 @@ pub struct BackendConfig {
     /// gateway sends those calls only to one of them.
     #[serde(default)]
     pub memory: Option<String>,
+    /// The path its diary calls go to, when it serves diaries: declared by
+    /// the members holding the memory, and routed by conversation to the one
+    /// holding what a conversation unlocked.
+    #[serde(default)]
+    pub diaries: Option<String>,
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
@@ -153,18 +158,21 @@ mod tests {
                     host: "code.tokera.com".into(),
                     path: "/v1/mcp".into(),
                     memory: Some("/v1/mcp/memory".into()),
+                    diaries: Some("/v1/mcp/diaries".into()),
                 },
                 BackendConfig {
                     name: "bot".into(),
                     host: "bot.tokera.com".into(),
                     path: "/v1/npc/mcp".into(),
                     memory: None,
+                    diaries: None,
                 },
                 BackendConfig {
                     name: "dj".into(),
                     host: "code.tokera.com".into(),
                     path: "/v1/zenj/mcp".into(),
                     memory: None,
+                    diaries: None,
                 }
             ]
         );

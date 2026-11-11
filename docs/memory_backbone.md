@@ -857,7 +857,10 @@ the agent. Any machine whose agent holds the checkout and runs zend serves the
 memory. Only those members declare the memory's routes, and the gateway sends
 a route only to the members that declare it, so a memory call always reaches
 one that serves it; the aggregator sends the memory's calls there
-(`mcp/served.yaml` `memory`).
+(`mcp/served.yaml` `memory`). Diary calls go to `/v1/mcp/diaries`, declared
+by the same members and sticky on each conversation's diary key, so all of a
+conversation's diary calls reach the member holding what it unlocked
+(`docs/private_mode.md` §5.4; `mcp/served.yaml` `diaries`).
 
 ### 6.2 Reads
 

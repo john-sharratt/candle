@@ -196,6 +196,21 @@ fn a_route_goes_only_to_the_members_declaring_it() {
     assert_eq!(r.round_robin_among("zend", &[]), None);
 }
 
+/// **A sticky key is held only by a member here**: a claim names the member
+/// its requests go to; an unclaimed key, or one claimed by a node that is no
+/// member, is placed afresh among the members declaring its route.
+#[test]
+fn a_sticky_key_is_held_by_a_member_here() {
+    let mut r = three();
+    assert!(!r.is_held("zend", "diary-0123456789abcdef"));
+    r.claims("zend")
+        .claim(b"diary-0123456789abcdef", Epoch { ms: 1, node: 2 });
+    assert!(r.is_held("zend", "diary-0123456789abcdef"));
+    r.claims("zend").claim(b"gone", Epoch { ms: 1, node: 9 });
+    assert!(!r.is_held("zend", "gone"), "no member holds it");
+    assert!(!r.is_held("npcd", "diary-0123456789abcdef"), "another app's");
+}
+
 /// A lagging member is routed nothing and never answers a catch-up, though it
 /// stays ready and the app stays clustered (§4.4).
 #[test]

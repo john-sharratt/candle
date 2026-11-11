@@ -132,6 +132,7 @@ use crate::layers::keys::SUBJECT_KEY;
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::mcp::chats::sweep as chat_sweep;
+use crate::mcp::diaries::placement as diary_placement;
 use crate::mcp::memory::readers::MemoryReaders;
 use crate::mcp::memory::Memory;
 use crate::mcp::ownership::owner_of;
@@ -3210,6 +3211,10 @@ impl InferenceState {
                         state.forget_conversation(key);
                     }
                 });
+                // An unlocked conversation's diary calls are held to the
+                // member holding what it unlocked (`docs/private_mode.md`
+                // §5.4).
+                diary_placement::install(Arc::clone(member));
                 // A worker's turn moves to a markedly faster member at a round
                 // boundary, signed so the member it moves to knows a member
                 // sent it (`worker_hop`).

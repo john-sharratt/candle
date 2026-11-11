@@ -224,6 +224,15 @@ impl Registry {
         (declaring.len() < ready.len()).then_some(declaring)
     }
 
+    /// Whether a member of `app` here holds sticky `key`: its requests go to
+    /// that member, wherever else its route is declared.
+    pub fn is_held(&self, app: &str, key: &str) -> bool {
+        self.apps
+            .get(app)
+            .and_then(|a| a.claims.holder(key.as_bytes()))
+            .is_some_and(|h| self.member(app, h).is_some())
+    }
+
     /// Which agent of `app` runs a job of `lineage` needing `need` (§11.3): the
     /// lineage's holder while it has a free slot, else the best idle agent; a
     /// standby agent only when no other can run it. The agent chosen is
