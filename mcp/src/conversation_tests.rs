@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use mcp_server::http::now_ms;
-use mcp_server::refs::{Ref, REF_IDLE_MS, REF_TOUCH_EVERY_MS};
+use mcp_server::refs::{Ref, ID, REF_IDLE_MS, REF_TOUCH_EVERY_MS};
 use mcp_server::{Client, Server};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -101,7 +101,7 @@ async fn an_expired_ref_is_renewed_and_never_revived() {
         let old = app.refs.seal(
             &boss().key(),
             &Ref {
-                id: [private as u8 + 1; 16],
+                id: [private as u8 + 1; ID],
                 private,
                 issued_s: five_hours_ago as u32,
             },

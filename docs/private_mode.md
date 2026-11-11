@@ -70,12 +70,21 @@ is keyed by, bound to, or spread across an MCP session.
 
 ### 3.1 What a ref is
 
-`mcp_server::refs`: 37 bytes, written base64url (50 characters) —
+`mcp_server::refs`: 15 bytes, written base64url — the alphabet of
+`file_read`'s part anchors — in 20 characters, short enough for a model to
+carry on every call —
 
 ```
-id (16, random) || flags (1: bit 0 private) || issued (4, Unix seconds, BE) || mac (16)
-mac = HMAC-SHA256(key, owner || 0x00 || id || flags || issued)[..16]
+id (6, random) || stamp (4, BE: bit 31 private, bits 0–30 seconds since 2026-01-01) || mac (5)
+mac = HMAC-SHA256(key, owner || 0x00 || id || stamp)[..5]
 ```
+
+- **Collisions:** two conversations share an id about once in 2^24 after
+  2^12 of them, once in 2^8 after 2^20.
+- **Guessing:** a ref opens only with its MAC, so forging one for one's own
+  account takes about 2^40 calls; naming another conversation's needs its
+  48-bit id as well, and another account's opens for nobody.
+- **The stamp** runs to 2094.
 
 The key is derived from the cluster's group key for `mcp conversation refs`
 (`GroupKey::derive`), so both aggregators and every zend member open a ref the

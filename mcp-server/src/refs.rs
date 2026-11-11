@@ -8,11 +8,14 @@
 //! or one changed by a byte, does not open.
 //!
 //! ```text
-//! id (16) || flags (1: bit 0 private) || issued (4, Unix seconds, BE) || mac (16)
-//! mac = HMAC-SHA256(key, owner || 0 || id || flags || issued)[..16]
+//! id (6) || stamp (4, BE: bit 31 private, bits 0–30 seconds since 2026-01-01) || mac (5)
+//! mac = HMAC-SHA256(key, owner || 0 || id || stamp)[..5]
 //! ```
 //!
-//! written base64url without padding: 50 characters.
+//! written base64url: 20 characters. The id is random, so two conversations
+//! share one about once in 2^24 after 2^12 of them; the MAC binds the ref to
+//! its account and its flag, so forging one takes about 2^40 tries online,
+//! and naming another conversation's takes guessing its id as well.
 
 use std::fmt::{self, Debug, Formatter};
 
@@ -56,10 +59,15 @@ pub fn diary_key(conversation: &str) -> String {
     format!("diary-{conversation}")
 }
 
-const ID: usize = 16;
-const MAC: usize = 16;
-const LEN: usize = ID + 1 + 4 + MAC;
-const PRIVATE: u8 = 1;
+/// How many bytes a ref's id is.
+pub const ID: usize = 6;
+const STAMP: usize = 4;
+const MAC: usize = 5;
+const LEN: usize = ID + STAMP + MAC;
+/// The stamp's bit for a private conversation.
+const PRIVATE: u32 = 1 << 31;
+/// 2026-01-01T00:00:00Z, in Unix seconds: what a stamp counts from.
+const EPOCH_S: u32 = 1_767_225_600;
 
 /// A conversation, as its ref names it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -160,10 +168,11 @@ impl Refs {
     pub fn seal(&self, owner: &str, r: &Ref) -> String {
         let mut bytes = [0u8; LEN];
         bytes[..ID].copy_from_slice(&r.id);
-        bytes[ID] = if r.private { PRIVATE } else { 0 };
-        bytes[ID + 1..ID + 5].copy_from_slice(&r.issued_s.to_be_bytes());
-        let mac = self.mac(owner, &bytes[..ID + 5]);
-        bytes[ID + 5..].copy_from_slice(&mac);
+        let since = r.issued_s.saturating_sub(EPOCH_S) & !PRIVATE;
+        let stamp = since | if r.private { PRIVATE } else { 0 };
+        bytes[ID..ID + STAMP].copy_from_slice(&stamp.to_be_bytes());
+        let mac = self.mac(owner, &bytes[..ID + STAMP]);
+        bytes[ID + STAMP..].copy_from_slice(&mac);
         URL_SAFE_NO_PAD.encode(bytes)
     }
 
@@ -179,19 +188,16 @@ impl Refs {
         let mut m = HmacSha256::new_from_slice(&self.key).expect("HMAC takes a key of any length");
         m.update(owner.as_bytes());
         m.update(&[0]);
-        m.update(&bytes[..ID + 5]);
-        m.verify_truncated_left(&bytes[ID + 5..])
+        m.update(&bytes[..ID + STAMP]);
+        m.verify_truncated_left(&bytes[ID + STAMP..])
             .map_err(|_| Refused::Forged)?;
-        // A flag no ref is issued with is no ref of ours.
-        if bytes[ID] & !PRIVATE != 0 {
-            return Err(Refused::Forged);
-        }
         let mut id = [0u8; ID];
         id.copy_from_slice(&bytes[..ID]);
+        let stamp = u32::from_be_bytes(bytes[ID..ID + STAMP].try_into().expect("four bytes"));
         Ok(Ref {
             id,
-            private: bytes[ID] & PRIVATE != 0,
-            issued_s: u32::from_be_bytes(bytes[ID + 1..ID + 5].try_into().expect("four bytes")),
+            private: stamp & PRIVATE != 0,
+            issued_s: EPOCH_S.saturating_add(stamp & !PRIVATE),
         })
     }
 
@@ -201,12 +207,14 @@ impl Refs {
         m.update(&[0]);
         m.update(body);
         let full: [u8; 32] = m.finalize().into_bytes().into();
-        full[..MAC].try_into().expect("sixteen bytes")
+        full[..MAC].try_into().expect("five bytes")
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     fn refs() -> Refs {
@@ -221,27 +229,41 @@ mod tests {
         }
     }
 
-    /// **A ref is written exactly as its layout says**: the id, the flag, the
-    /// issue time big-endian, and the MAC's first sixteen bytes, base64url.
+    /// **A ref is written exactly as its layout says**: the id, the stamp
+    /// big-endian — the private bit over the seconds since 2026 — and the
+    /// MAC's first five bytes, base64url: these exact twenty characters.
     #[test]
     fn a_ref_is_its_bytes_in_base64url() {
         let text = refs().seal("o1", &fixed(true));
-        assert_eq!(text.len(), 50);
+        assert_eq!(text.len(), 20);
         let bytes = URL_SAFE_NO_PAD.decode(&text).unwrap();
-        assert_eq!(&bytes[..16], &[0x11; 16]);
-        assert_eq!(bytes[16], 1);
-        assert_eq!(&bytes[17..21], &1_794_000_000u32.to_be_bytes());
+        assert_eq!(&bytes[..6], &[0x11; 6]);
+        let since = 1_794_000_000u32 - 1_767_225_600;
+        assert_eq!(&bytes[6..10], &(since | 1 << 31).to_be_bytes());
         let mut m = HmacSha256::new_from_slice(&[7; 32]).unwrap();
         m.update(b"o1\0");
-        m.update(&bytes[..21]);
+        m.update(&bytes[..10]);
         let mac: [u8; 32] = m.finalize().into_bytes().into();
-        assert_eq!(&bytes[21..], &mac[..16]);
-        assert_eq!(
-            URL_SAFE_NO_PAD
-                .decode(refs().seal("o1", &fixed(false)))
-                .unwrap()[16],
-            0
+        assert_eq!(&bytes[10..], &mac[..5]);
+        let normal = URL_SAFE_NO_PAD
+            .decode(refs().seal("o1", &fixed(false)))
+            .unwrap();
+        assert_eq!(&normal[6..10], &since.to_be_bytes());
+        assert!(
+            text.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "{text}"
         );
+    }
+
+    /// **Two refs share an id as rarely as their randomness allows**: ten
+    /// thousand issued, none twice.
+    #[test]
+    fn refs_issued_are_each_new() {
+        let mut seen = HashSet::new();
+        for _ in 0..10_000 {
+            assert!(seen.insert(refs().issue("o1", false, 0).1.id));
+        }
     }
 
     #[test]
@@ -269,7 +291,7 @@ mod tests {
         assert_eq!(refs().open("o2", &text), Err(Refused::Forged));
         assert_eq!(Refs::new([8; 32]).open("o1", &text), Err(Refused::Forged));
         let mut bytes = URL_SAFE_NO_PAD.decode(&text).unwrap();
-        bytes[16] = 1;
+        bytes[6] |= 0x80;
         assert_eq!(
             refs().open("o1", &URL_SAFE_NO_PAD.encode(&bytes)),
             Err(Refused::Forged),
@@ -320,7 +342,7 @@ mod tests {
         let r = fixed(false);
         let key = r.conversation();
         assert_eq!(key.len(), 16);
-        let digest = Sha256::digest([0x11u8; 16]);
+        let digest = Sha256::digest([0x11u8; 6]);
         let want: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(key, want);
         assert_eq!(

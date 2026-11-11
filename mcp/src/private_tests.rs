@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use mcp_server::access::{self, Access, DIARIES_PRIVATE, PRIVATE, TOOLS};
 use mcp_server::http::now_ms;
-use mcp_server::refs::{diary_key, Ref, Refs, REF_IDLE_MS};
+use mcp_server::refs::{diary_key, Ref, Refs, ID, REF_IDLE_MS};
 use mcp_server::{Client, Server};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -206,7 +206,7 @@ async fn an_expired_private_ref_still_refuses_writes() {
     let old = app.refs.seal(
         &boss().key(),
         &Ref {
-            id: [7; 16],
+            id: [7; ID],
             private: true,
             issued_s: five_hours_ago as u32,
         },
