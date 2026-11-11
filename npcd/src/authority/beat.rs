@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use cluster::frame::Pulse;
 
-use super::npc_lease::{hold_still, lend, moves, with_leases};
+use super::npc_lease::{hold_still, lend, moves, take_back, with_leases};
 use super::pulse::{self, EVENTS};
 use super::role::Role;
 use super::told::{self, TOLD};
@@ -112,10 +112,21 @@ impl Runtime {
                 .map(|(npc, _)| npc)
                 .collect();
             let (members, joined) = self.lending_members();
-            let mut lent = lend(&cast, &current, &members, &joined, now_ms());
+            let now = now_ms();
+            let mut lent = lend(&cast, &current, &members, &joined, now);
             // A suspended character stays where it is, by its record.
             if let Some(npcs) = self.npcs() {
                 hold_still(&mut lent, &npcs.view().suspended());
+            }
+            // A character held by a member that takes no lease is not run
+            // there, and moves without waiting for its hand-back.
+            for npc in take_back(&mut lent, &self.lease_free_members(), now) {
+                tracing::info!(
+                    target: "npcd::authority::lease",
+                    world,
+                    npc,
+                    "taken back from a member that takes no lease: moved without its hand-back"
+                );
             }
             let moved = moves(&current, &lent);
             if !moved.is_empty() {

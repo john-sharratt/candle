@@ -3568,8 +3568,16 @@ member that takes none never proposes for a world, so it is never a world's auth
 and never keeps a Makers' table, and no character is lent to it. It refuses on its own
 account too, so leases from before it was configured so do not run there: a world
 lease it still holds it hands over at once, and a character lease still naming it is
-handed back as soon as the authority names where the character goes next — held, and
-not run, until then. Everything else is as for any member: it replicates the
+held, and not run. **The authority moves that character itself** as soon as it names
+where it goes next (`npc_lease::take_back`): the lease goes to `next` as the holder's
+hand-back would send it, waiting for everything the holder wrote — its `high_water` in
+`MEMBERS` — and every wait the lease already named. A member that runs nothing has no
+turn boundary to wait for, and waiting on its own hand-back waited on its copy of the
+world's records showing it the move: on 2026-11-11 BlackWorld, configured so, held six
+characters WhiteWorld had asked to move, Zen among them, and handed none back. The
+member it is judged by is the one `MEMBERS` lists at weight 0 — never one the plan
+weighs 0, which still runs what it holds — and only while it is in the group: one away
+keeps its characters until it returns, as any holder does. Everything else is as for any member: it replicates the
 substrate, votes, applies the cast as records, and serves the routes the gateway places
 by its live power and reach (§5.3) — draws among them. With every member that takes
 leases away, the worlds wait for one to return; nothing moves to the member that takes

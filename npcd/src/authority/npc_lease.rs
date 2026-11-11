@@ -14,6 +14,9 @@
 //!   at its next turn boundary, and the authority then lends it to `next`,
 //!   naming what the old holder wrote — its turns, its journal — for the new
 //!   one to have applied before the character wakes there.
+//! - A holder in the group that takes no lease runs none of its characters, so
+//!   the authority moves each asked to move itself, as that holder's
+//!   hand-back would ([`take_back`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -295,6 +298,41 @@ pub fn hand_back(current: &NpcLease, from: u64, through: u64, now_ms: u64) -> Op
             .collect(),
         ..fresh(next, now_ms)
     })
+}
+
+/// Move each lease in `leases` that is asked to move and whose holder is in
+/// the group but takes no lease — `takes_none` names each such member with its
+/// own high water — to its `next`, as that holder's hand-back would, waiting
+/// for everything it wrote. Returns the characters moved.
+///
+/// **A member that takes no lease runs no character**: whatever its leases
+/// say, it puts each down (`Runtime::reconcile_cast`), so there is no turn to
+/// wait for and nothing running to be run twice. Waiting on its own hand-back
+/// waited on its copy of the world's records showing it the move, and nothing
+/// ran the character for as long as it did not: on 2026-11-11 BlackWorld,
+/// configured `characters: false`, held six characters WhiteWorld's authority
+/// had asked to move, Zen among them, and handed none back. A holder that takes
+/// leases is left to hand back at its turn boundary, and one away keeps its
+/// characters until it returns (`lend`).
+pub fn take_back(
+    leases: &mut BTreeMap<u64, NpcLease>,
+    takes_none: &BTreeMap<u64, u64>,
+    now_ms: u64,
+) -> Vec<u64> {
+    let mut moved = Vec::new();
+    for (nid, lease) in leases.iter_mut() {
+        let Some(holder) = node_of(&lease.holder) else {
+            continue;
+        };
+        let Some(&through) = takes_none.get(&holder) else {
+            continue;
+        };
+        if let Some(handed) = hand_back(lease, holder, through, now_ms) {
+            *lease = handed;
+            moved.push(*nid);
+        }
+    }
+    moved
 }
 
 /// An admin's release: the lease names nobody, and the authority lends it
@@ -602,6 +640,46 @@ mod tests {
                     next: None,
                 },
             ]
+        );
+    }
+
+    /// **A lease held by a member that takes no lease is moved without its
+    /// hand-back.** Member 1 takes none and has written through 40; member 3
+    /// takes leases. Asked to move to 2, 1's character goes there at once,
+    /// waiting for 1's writes and every wait the lease already named; 3's
+    /// waits for 3's own hand-back; 1's character with no move asked — held
+    /// still, or with nowhere to go — stays; a member away is not named.
+    #[test]
+    fn a_lease_held_by_a_member_that_takes_none_moves_without_its_hand_back() {
+        let asked = |holder: u64| NpcLease {
+            holder: hex(holder),
+            expires_ms: NOW + NPC_TTL_MS,
+            next: Some(hex(2)),
+            waits: vec![w(5, 9)],
+        };
+        let mut leases = BTreeMap::new();
+        leases.insert(7, asked(1));
+        leases.insert(8, asked(3));
+        leases.insert(9, fresh(1, NOW));
+        let before = leases.clone();
+        let takes_none = BTreeMap::from([(1, 40)]);
+
+        let moved = take_back(&mut leases, &takes_none, NOW + 1_000);
+        assert_eq!(moved, vec![7]);
+        assert_eq!(
+            leases[&7],
+            NpcLease {
+                holder: hex(2),
+                expires_ms: NOW + 1_000 + NPC_TTL_MS,
+                next: None,
+                waits: vec![w(1, 40), w(5, 9)],
+            }
+        );
+        assert_eq!(leases[&8], before[&8], "a leaseholder hands back itself");
+        assert_eq!(leases[&9], before[&9], "no move asked");
+        assert!(
+            take_back(&mut leases.clone(), &BTreeMap::new(), NOW).is_empty(),
+            "no member that takes none in the group"
         );
     }
 

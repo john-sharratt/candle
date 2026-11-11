@@ -7,7 +7,7 @@
 //! Every member hosts every world and embodies every character in it, so each
 //! world's copy here has every body; what differs is which minds think here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,23 @@ impl Runtime {
             .collect();
         let joined = group.iter().map(|m| m.node).collect();
         (ready, joined)
+    }
+
+    /// The npcd members in the group that take no lease, each with its own
+    /// high water: listed at weight 0 in `MEMBERS`, which a leaseholder never
+    /// is (§9.5). The group's weight, not the plan's — the plan weighs a
+    /// leaseholder 0 while its card is busy, and that member still runs the
+    /// characters it holds.
+    pub(crate) fn lease_free_members(&self) -> BTreeMap<u64, u64> {
+        let Some(member) = self.standing.member() else {
+            return BTreeMap::new();
+        };
+        member
+            .group()
+            .into_iter()
+            .filter(|m| m.weight == 0)
+            .map(|m| (m.node, m.high_water))
+            .collect()
     }
 
     /// The npcd members characters are lent among: [`Self::npcd_members`]
