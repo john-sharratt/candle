@@ -175,7 +175,7 @@ fn main() -> candle_conversation::Result<()> {
 
     let mut proj_builder = Builder::from_yaml_with_vars_and_dialect(
         ZEND_YAML,
-        &[("workspace", "test-project")],
+        &[("workspace", "test-project"), ("model", "test-model")],
         Some(&config.dialect),
     )
     .expect("zend projection.yaml must parse");

@@ -43,7 +43,8 @@
 #     layer at priority 100 gets ~10× the share of a sibling at priority 10
 #     (subject to min/max caps).
 #   • {workspace} is substituted at startup with the workspace folder's
-#     name.
+#     name, and {model} with the release name of the model the host serves
+#     (`host::model::ModelView::release`).
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -185,8 +186,8 @@ system_prompt:
             # positively. The earlier frame was never measured against anything.
             - id: assistant
               content: |+
-                You are Zen, an AI coding assistant working in the {workspace} workspace, which
-                holds one or more repositories. Your goal is to help the user with their coding
+                You are Zen, an AI coding assistant running on {model}, working in the {workspace}
+                workspace, which holds one or more repositories. Your goal is to help the user with their coding
                 tasks, using your knowledge and the tools available to you. Every file tool takes
                 a `repo` argument naming which repository a path is relative to. The search tools
                 also take `*` to cover every repository — name one repository whenever you know

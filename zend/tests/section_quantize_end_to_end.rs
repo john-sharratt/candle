@@ -69,7 +69,10 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
     let workspace_str = workspace.display().to_string();
     let mut proj_builder = projection::Builder::from_yaml_with_vars_and_dialect(
         PROJECTION_YAML,
-        &[("workspace", workspace_str.as_str())],
+        &[
+            ("workspace", workspace_str.as_str()),
+            ("model", "test-model"),
+        ],
         Some(&dialect),
     )
     .expect("parse projection.yaml");

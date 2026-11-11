@@ -34,7 +34,7 @@ fn build_projection(
 )> {
     let mut proj = Builder::from_yaml_with_vars_and_dialect(
         ZEND_YAML,
-        &[("workspace", "ts-sec")],
+        &[("workspace", "ts-sec"), ("model", "test-model")],
         Some(&cfg.dialect),
     )
     .map_err(|e| anyhow::anyhow!("projection parse: {e}"))?;

@@ -33,9 +33,12 @@ fn main() -> anyhow::Result<()> {
     // 1. Build the projection EXACTLY as the daemon does (build_projection_builder
     //    + install_tool_catalog).
     let dialect = Dialect::chat_ml();
-    let mut builder =
-        Builder::from_yaml_with_vars_and_dialect(YAML, &[("workspace", "candle")], Some(&dialect))
-            .expect("yaml parse");
+    let mut builder = Builder::from_yaml_with_vars_and_dialect(
+        YAML,
+        &[("workspace", "candle"), ("model", "test-model")],
+        Some(&dialect),
+    )
+    .expect("yaml parse");
     let tool_sections = zend::tools::install_tool_catalog(&mut builder)?;
     println!("installed {} tool sections", tool_sections.len());
 

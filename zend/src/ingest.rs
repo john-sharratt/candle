@@ -284,7 +284,7 @@ mod tests {
     fn the_journal_is_never_filled_from_a_folder() {
         let builder = Builder::from_yaml_with_vars_and_dialect(
             PROJECTION_SCHEMA_TEMPLATE,
-            &[("workspace", "demo")],
+            &[("workspace", "demo"), ("model", "test-model")],
             Some(&Dialect::chat_ml()),
         )
         .unwrap();

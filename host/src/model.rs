@@ -7,6 +7,8 @@
 //! refuses any other, so changing this is a code change that every substrate
 //! written under the previous model refuses until it is moved aside.
 
+use std::path::Path;
+
 use candle_conversation::models::{Model, ModelSpec};
 use serde::Serialize;
 
@@ -43,6 +45,21 @@ impl ModelView {
             bytes: spec.model_bytes,
         }
     }
+
+    /// The model as a prompt names it: the checkpoint's file name without its
+    /// extension.
+    pub fn release(&self) -> &str {
+        release_name(&self.name)
+    }
+}
+
+/// `file_name` without its extension — `Qwen3.8-Flash-Next.gguf` is
+/// `Qwen3.8-Flash-Next`; a name with none is itself.
+fn release_name(file_name: &str) -> &str {
+    Path::new(file_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file_name)
 }
 
 #[cfg(test)]
@@ -68,5 +85,20 @@ mod tests {
         assert_eq!(v.repo, spec.model_repo);
         assert_eq!(v.name, spec.model_filename);
         assert_eq!(v.bytes, spec.model_bytes);
+    }
+
+    /// A prompt names the release, not the file: the extension goes, and the
+    /// dots inside the name stay.
+    #[test]
+    fn the_release_is_the_file_name_without_its_extension() {
+        assert_eq!(
+            release_name("Qwen3.8-Flash-Next.gguf"),
+            "Qwen3.8-Flash-Next"
+        );
+        assert_eq!(
+            release_name("Qwen3.8-Flash-Next-Q4_KOEXP-189dd518216f.gguf"),
+            "Qwen3.8-Flash-Next-Q4_KOEXP-189dd518216f"
+        );
+        assert_eq!(release_name("model"), "model");
     }
 }

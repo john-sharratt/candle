@@ -61,6 +61,7 @@ use candle_conversation::{
     ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse, UnsealedAsker, Want,
 };
 use host::download::ensure_model_pack;
+use host::model::ModelView;
 use host::process::fatal;
 use host::substrate_views::{
     layer_conversations, overview, system_prompt, timeline, title, LayerConversations,
@@ -9739,8 +9740,13 @@ pub(crate) fn try_projection_builder(workspace: &Path) -> Result<Builder, String
         }
         None => (PROJECTION_SCHEMA_TEMPLATE, "embedded default".to_string()),
     };
-    Builder::from_yaml_with_vars_and_dialect(yaml, &[("workspace", name)], Some(&dialect))
-        .map_err(|e| format!("projection.yaml ({source}) failed to parse — check YAML syntax and {{workspace}} placeholder: {e:#}"))
+    let model = ModelView::of_prescribed();
+    Builder::from_yaml_with_vars_and_dialect(
+        yaml,
+        &[("workspace", name), ("model", model.release())],
+        Some(&dialect),
+    )
+    .map_err(|e| format!("projection.yaml ({source}) failed to parse — check YAML syntax and its {{workspace}} and {{model}} placeholders: {e:#}"))
 }
 
 /// Concatenate the content of every top-level Section that appears
@@ -9827,6 +9833,23 @@ mod projection_schema_tests {
             labels.iter().any(|l| l.starts_with("section tree (")),
             "the adaptive-thinking section tree is labelled: {labels:?}"
         );
+    }
+
+    /// The persona names the model the host serves, filled in where the schema
+    /// is loaded, beside the workspace it works in.
+    #[test]
+    fn the_persona_names_the_served_model() {
+        use crate::repo_scan::shared_prompt_body;
+        use host::model::ModelView;
+        let builder = build_projection_builder(Path::new("demo-project"));
+        let body = shared_prompt_body(&builder);
+        let model = ModelView::of_prescribed();
+        let expected = format!(
+            "You are Zen, an AI coding assistant running on {}, working in the demo-project\n\
+             workspace, which holds one or more repositories.",
+            model.release()
+        );
+        assert!(body.contains(&expected), "{body}");
     }
 
     /// The embedded schema carries the working set (`docs/zend_working_set.md`)

@@ -107,7 +107,7 @@ mod tests {
         let dialect = Dialect::chat_ml();
         let builder = Builder::from_yaml_with_vars_and_dialect(
             include_str!("../prompts/projection.yaml"),
-            &[("workspace", "test")],
+            &[("workspace", "test"), ("model", "test-model")],
             Some(&dialect),
         )
         .expect("projection.yaml must parse");

@@ -560,7 +560,10 @@ fn projection_for_yaml(
     let workspace_str = workspace.display().to_string();
     let mut b = projection::Builder::from_yaml_with_vars_and_dialect(
         yaml,
-        &[("workspace", workspace_str.as_str())],
+        &[
+            ("workspace", workspace_str.as_str()),
+            ("model", "test-model"),
+        ],
         Some(&dialect),
     )
     .expect("parse projection.yaml");

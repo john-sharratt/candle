@@ -9,9 +9,12 @@ const YAML: &str = include_str!("../src/prompts/projection.yaml");
 
 fn main() -> anyhow::Result<()> {
     let dialect = Dialect::chat_ml();
-    let mut b =
-        Builder::from_yaml_with_vars_and_dialect(YAML, &[("workspace", "candle")], Some(&dialect))
-            .map_err(|e| anyhow::anyhow!("parse: {e}"))?;
+    let mut b = Builder::from_yaml_with_vars_and_dialect(
+        YAML,
+        &[("workspace", "candle"), ("model", "test-model")],
+        Some(&dialect),
+    )
+    .map_err(|e| anyhow::anyhow!("parse: {e}"))?;
     install_tool_catalog(&mut b)?;
 
     {

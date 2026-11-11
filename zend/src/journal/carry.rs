@@ -54,7 +54,7 @@ mod tests {
     fn schema() -> Builder {
         Builder::from_yaml_with_vars_and_dialect(
             PROJECTION_SCHEMA_TEMPLATE,
-            &[("workspace", "demo")],
+            &[("workspace", "demo"), ("model", "test-model")],
             Some(&Dialect::chat_ml()),
         )
         .unwrap()
@@ -84,7 +84,7 @@ mod tests {
         assert_ne!(yaml, PROJECTION_SCHEMA_TEMPLATE);
         let mut b = Builder::from_yaml_with_vars_and_dialect(
             &yaml,
-            &[("workspace", "demo")],
+            &[("workspace", "demo"), ("model", "test-model")],
             Some(&Dialect::chat_ml()),
         )
         .unwrap();

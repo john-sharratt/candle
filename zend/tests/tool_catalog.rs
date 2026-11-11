@@ -40,7 +40,7 @@ fn build_test_projection() -> projection::Builder {
     let dialect = candle_conversation::models::Dialect::chat_ml();
     projection::Builder::from_yaml_with_vars_and_dialect(
         PROJECTION_YAML,
-        &[("workspace", "test")],
+        &[("workspace", "test"), ("model", "test-model")],
         Some(&dialect),
     )
     .expect("projection.yaml must parse")
@@ -501,9 +501,12 @@ fn bundled_schema_belief_gates_resolve_from_the_right_source() {
     use candle_conversation::projection::Builder;
     const YAML: &str = include_str!("../src/prompts/projection.yaml");
     let dialect = Dialect::chat_ml();
-    let builder =
-        Builder::from_yaml_with_vars_and_dialect(YAML, &[("workspace", "proj")], Some(&dialect))
-            .expect("bundled projection.yaml parses");
+    let builder = Builder::from_yaml_with_vars_and_dialect(
+        YAML,
+        &[("workspace", "proj"), ("model", "test-model")],
+        Some(&dialect),
+    )
+    .expect("bundled projection.yaml parses");
     let schema = builder.schema();
     let mut seen = std::collections::BTreeMap::new();
     for layer in &schema.layers {
