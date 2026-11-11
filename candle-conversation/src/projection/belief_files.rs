@@ -35,6 +35,7 @@ use crate::summary_tree::exchange::{exchanges, over_normals};
 
 /// One file's candidates: its turns grouped into exchanges, and the gallery
 /// windows that score them.
+#[derive(Clone)]
 pub(crate) struct FileScan {
     pub timeline: TimelineId,
     /// Every non-summary turn, in order — the subsequence couplings project onto.
@@ -61,6 +62,22 @@ pub(crate) struct FileScan {
 }
 
 impl FileScan {
+    /// This file with exchange `slot`'s windows taken out of its gallery, every
+    /// exchange still a case: a probe about `slot` scored against it shows what
+    /// the OTHER exchanges score on it, with nothing of its own to self-match.
+    /// The windows are shared handles, so this copies no signature.
+    pub fn without_exchange(&self, slot: usize) -> FileScan {
+        FileScan {
+            windows: self
+                .windows
+                .iter()
+                .copied()
+                .filter(|&(_, _, _, s)| s != slot)
+                .collect(),
+            ..self.clone()
+        }
+    }
+
     /// Arcs the file's windows can name: its own, then its calibrations'.
     pub fn n_arcs(&self) -> usize {
         self.arcs_kept.len() + self.cal.as_ref().map_or(0, |c| c.sigs.len())

@@ -6,12 +6,15 @@
 //! collection scans a tag gallery of past turns → section slots, a turn group's
 //! retrieval target IS the turn, so each candidate turn is its own slot.
 
+use candle_conversation::normalization::{ChildKey, NormalizationCache, ScopeKey};
 use candle_conversation::persistence::content_hash::turn_stream_id;
 use candle_conversation::projection::TurnIndex;
 use candle_conversation::projection::{
     Builder, CollectionWarm, Conversation, GalleryPreload, Observe, ProjectionTarget, TimelineId,
 };
-use candle_conversation::provenance::{encode_wide_sigs, GalleryArena, WideQSig};
+use candle_conversation::provenance::{
+    encode_wide_sigs, score_slots_weighted, GalleryArena, WideQSig,
+};
 use candle_conversation::substrate::{ProjectionScores, TurnPartWrite};
 use candle_conversation::turn::Role;
 
@@ -52,6 +55,16 @@ fn sig(fill: u64) -> WideQSig {
         n_heads: 12,
         words: vec![fill; 24],
     }
+}
+
+/// Six signature fills a warm-up can learn from: `n` leading one bits for `n`
+/// of 64, 60, 52, 40, 24 and 4, so the gaps between neighbours (4, 8, 12, 16,
+/// 20 bits) all differ. With its own exchange left out every probe has ONE
+/// nearest other exchange, and turn 1 is the nearest for turns 0 and 2. Six
+/// probes teach thirty samples, past the eight a background needs, where three
+/// one-token turns taught too few for the warmed read to differ from the cold.
+fn graded_fills() -> [u64; 6] {
+    [64u32, 60, 52, 40, 24, 4].map(|n| !0u64 << (64 - n))
 }
 
 #[test]
@@ -348,11 +361,7 @@ fn warm_ingest_normalization_still_warms_an_append_only_layer_when_not_gathered(
     let timeline = candle_conversation::projection::TimelineId::from_raw(7).expect("timeline id");
     conv.register_timeline(timeline, layer, group);
 
-    let fills = [
-        0xAAAA_AAAA_AAAA_AAAAu64, // turn 0
-        0x5555_5555_5555_5555u64, // turn 1
-        0xFFFF_FFFF_FFFF_FFFFu64, // turn 2
-    ];
+    let fills = graded_fills();
     for fill in fills {
         let idx = conv
             .record_turn(
@@ -402,6 +411,94 @@ fn warm_ingest_normalization_still_warms_an_append_only_layer_when_not_gathered(
          despite gathered = false, changing the same probe's normalized score \
          (cold={cold}, warmed={warmed})"
     );
+}
+
+/// **The ingest warm-up scores each self-probe without its own exchange** —
+/// bit for bit what the scorer gives over the file's other exchanges, folded
+/// with the probe's exchange as its answer.
+///
+/// A self-probe scored against a gallery that holds it matches itself on every
+/// token, so every other exchange's background sample is exactly 0 and a live
+/// hit reads past the whole background. The reference is built from the public
+/// scorer and a fresh cache, then read with a probe that is none of the turns
+/// (58 leading ones, nearest turn 1), so a warm-up that left the exchange in
+/// reads a different level.
+#[test]
+fn the_ingest_warm_up_scores_each_probe_without_its_own_exchange() {
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+    let builder = Builder::from_yaml(SCAN_YAML).unwrap();
+    let layer = builder.id_for_layer("mem").unwrap();
+    let group = builder.id_for_group("clusters").unwrap();
+    conv.mark_layer_append_only(layer);
+    let timeline = TimelineId::from_raw(9).expect("timeline id");
+    conv.register_timeline(timeline, layer, group);
+    let fills = graded_fills();
+    let mut sources = Vec::new();
+    for fill in fills {
+        let idx = conv
+            .record_turn(
+                timeline,
+                Role::User,
+                TurnPartWrite {
+                    token_count: 4,
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record_turn");
+        let sid = turn_stream_id(timeline.raw(), idx.0);
+        conv.persist_wide_q_sigs(sid, &encode_wide_sigs(&[sig(fill)]))
+            .expect("persist sigs");
+        sources.push(sid.0);
+    }
+
+    let windows: Vec<Vec<WideQSig>> = fills.iter().map(|&f| vec![sig(f)]).collect();
+    let n = windows.len();
+    let scored = |query: &[WideQSig], left_out: Option<usize>| -> Vec<(ChildKey, f32)> {
+        let kept: Vec<usize> = (0..n).filter(|&j| Some(j) != left_out).collect();
+        let gallery: Vec<&[WideQSig]> = kept.iter().map(|&j| windows[j].as_slice()).collect();
+        let raw = score_slots_weighted(query, &gallery, &kept, n, &[]);
+        (0..n).map(|j| ChildKey::turn(j as u64)).zip(raw).collect()
+    };
+    let reference = NormalizationCache::default();
+    let scope = ScopeKey::turn_group(group.raw() as u64, timeline.raw());
+    for (k, window) in windows.iter().enumerate() {
+        let answer = ChildKey::turn(k as u64);
+        reference.observe(
+            &scope,
+            sources[k],
+            &scored(window, Some(k)),
+            Some(&answer),
+            1,
+        );
+    }
+    let probe = vec![sig(!0u64 << 6)];
+    let want = reference.normalize(&scope, &scored(&probe, None), probe.len());
+
+    conv.warm_ingest_normalization(builder.schema());
+    let mut scores = ProjectionScores::new();
+    conv.score_belief_groups(
+        &builder.schema().layers[0],
+        ProjectionTarget {
+            layer,
+            group,
+            timeline,
+        },
+        &probe,
+        None,
+        &mut scores,
+        Observe::No,
+        None,
+    );
+    for (k, (_, want)) in want.iter().enumerate() {
+        let got = scores.turn(timeline, TurnIndex(k as u32));
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "turn {k}: the warm-up learned a different level ({got} vs {want})"
+        );
+    }
 }
 
 /// A coupled tool round-trip (a code-read scope) must be scored as ONE exchange:
@@ -1132,9 +1229,12 @@ layers:
 
 /// Record [`WARM_YAML`]'s corpus: two exemplars each for `alpha` and `beta`,
 /// none for `gamma`, windows of different lengths. Returns each exemplar's
-/// stream id and window in the order the warm-up plan folds them — members by
-/// name, then turns by index — which is recording order here.
-fn record_warm_corpus(conv: &Conversation, builder: &Builder) -> Vec<(u64, Vec<WideQSig>)> {
+/// member, stream id and window in the order the warm-up plan folds them —
+/// members by name, then turns by index — which is recording order here.
+fn record_warm_corpus(
+    conv: &Conversation,
+    builder: &Builder,
+) -> Vec<(&'static str, u64, Vec<WideQSig>)> {
     let layer = builder.id_for_layer("mem").unwrap();
     let group = builder.id_for_group("clusters").unwrap();
     let timeline = TimelineId::from_raw(31).expect("timeline id");
@@ -1164,46 +1264,57 @@ fn record_warm_corpus(conv: &Conversation, builder: &Builder) -> Vec<(u64, Vec<W
             let window: Vec<WideQSig> = (0..len).map(|_| sig(fill)).collect();
             conv.persist_wide_q_sigs(sid, &encode_wide_sigs(&window))
                 .expect("persist sigs");
-            (sid.0, window)
+            (member, sid.0, window)
         })
         .collect()
 }
 
-/// **The batched warm-up learns exactly what probe-by-probe scoring learned.**
+/// **The warm-up scores each exemplar against the gallery without its own
+/// member** — bit for bit what the scorer gives over the other members'
+/// windows, folded with the exemplar's member as its answer.
 ///
-/// The warm-up used to run every planned exemplar through the live collection
-/// scan with `Observe::Yes` — about half a second each on the CPU, seven to ten
-/// minutes of load on the tool catalog. It now gathers the exemplars once and
-/// folds their raw scores directly. On the CPU that must be bit-identical: the
-/// same scorer, the same observations, in the same order — so every normalized
-/// score read afterwards is the same bits.
+/// Scored against the whole gallery an exemplar self-matches: its own window
+/// takes nearly every vote, every other member's background sample is ~0, and
+/// a live score then lands past the top of every background. The reference
+/// here is built from the public scorer and a fresh cache, so a warm-up that
+/// left its own member in — or folded in another order, or under another
+/// answer — reads a different level.
 #[test]
-fn the_batched_collection_warm_up_learns_what_probe_by_probe_scoring_learned() {
+fn the_collection_warm_up_scores_each_exemplar_without_its_own_member() {
     let builder = Builder::from_yaml(WARM_YAML).unwrap();
     let sp = &builder.schema().system_prompt;
     let coll = sp.collection_named("tools").expect("tools collection");
-    let scope = vec!["tool".to_string()];
+    let names: Vec<&str> = coll.sections.iter().map(|s| s.name.as_str()).collect();
     let probe: Vec<WideQSig> = (0..6).map(|_| sig(0xAAAA_AAAA_AAAA_AAAA)).collect();
-
-    // The reference: the warm-up as it used to run.
-    let ref_dir = tempfile::tempdir().unwrap();
-    let reference = open_conversation(ref_dir.path());
-    for (source, window) in record_warm_corpus(&reference, &builder) {
-        let _ = reference.score_belief_collections(
-            sp,
-            &window,
-            None,
-            Observe::Yes {
-                tags: &scope,
-                source,
-            },
-            None,
-        );
-    }
 
     let dir = tempfile::tempdir().unwrap();
     let conv = open_conversation(dir.path());
-    record_warm_corpus(&conv, &builder);
+    let corpus = record_warm_corpus(&conv, &builder);
+    let case = |m: &str| names.iter().position(|n| *n == m).unwrap();
+    let weights = &coll.policy.layer_weights;
+    let scored = |query: &[WideQSig], left_out: Option<usize>| -> Vec<(ChildKey, f32)> {
+        let kept: Vec<&(&str, u64, Vec<WideQSig>)> = corpus
+            .iter()
+            .filter(|(m, _, _)| Some(case(m)) != left_out)
+            .collect();
+        let gallery: Vec<&[WideQSig]> = kept.iter().map(|(_, _, w)| w.as_slice()).collect();
+        let cases: Vec<usize> = kept.iter().map(|(m, _, _)| case(m)).collect();
+        let raw = score_slots_weighted(query, &gallery, &cases, names.len(), weights);
+        names
+            .iter()
+            .zip(raw)
+            .map(|(n, v)| (ChildKey::named(*n), v))
+            .collect()
+    };
+    let reference = NormalizationCache::default();
+    let scope = ScopeKey::collection(coll.id.raw() as u64, coll.name.as_str());
+    for (member, source, window) in &corpus {
+        let raw = scored(window, Some(case(member)));
+        let answer = ChildKey::named(*member);
+        reference.observe(&scope, *source, &raw, Some(&answer), window.len());
+    }
+    let want = reference.normalize(&scope, &scored(&probe, None), probe.len());
+
     let cold = conv.score_belief_collections(sp, &probe, None, Observe::No, None);
     let warm = conv.warm_collection_normalization(builder.schema(), None);
     assert_eq!(
@@ -1216,13 +1327,12 @@ fn the_batched_collection_warm_up_learns_what_probe_by_probe_scoring_learned() {
         "two members have exemplars; all four were folded, on the CPU"
     );
 
-    let want = reference.score_belief_collections(sp, &probe, None, Observe::No, None);
     let got = conv.score_belief_collections(sp, &probe, None, Observe::No, None);
-    for s in &coll.sections {
+    for (s, (_, want)) in coll.sections.iter().zip(&want) {
         assert_eq!(
             got.section(s.id).to_bits(),
-            want.section(s.id).to_bits(),
-            "section {}: the batched warm-up learned a different level",
+            want.to_bits(),
+            "section {}: the warm-up learned a different level",
             s.name
         );
     }
@@ -1297,11 +1407,7 @@ fn the_gpu_ingest_warm_up_learns_the_cpu_levels() {
     let layer = builder.id_for_layer("mem").unwrap();
     let group = builder.id_for_group("clusters").unwrap();
     let timeline = TimelineId::from_raw(21).expect("timeline id");
-    let fills = [
-        0xAAAA_AAAA_AAAA_AAAAu64,
-        0x5555_5555_5555_5555u64,
-        0xFFFF_FFFF_FFFF_FFFFu64,
-    ];
+    let fills = graded_fills();
     let corpus = |dir: &std::path::Path| -> Conversation {
         let conv = open_conversation(dir);
         conv.mark_layer_append_only(layer);

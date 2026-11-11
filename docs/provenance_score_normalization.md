@@ -93,6 +93,25 @@ formula the normalization gate measured best (`provenance_gates normalization`,
   the hit, not what a hit is measured against. A dialogue seal names no answer
   and teaches every candidate — which is what mutes a hub: its loud scores on
   everything become its own background.
+- **A warm-up probe is scored without its answer in the gallery.** The scan is
+  late fusion — each probe token votes for the case of its best-matching
+  gallery token — and a warm-up probe is a copy of something the gallery
+  holds: a tool's exemplar is one of that tool's windows, an ingest self-probe
+  one of its exchange's turns. Scored against the whole gallery it matches
+  itself on every token, its answer takes every vote, and every other
+  candidate's sample is 0. Eight zeros are a background, so a live score then
+  reads past the whole of it: measured on the tool catalog on 2026-11-11,
+  "hi, how are you doing today?" put five tools near 3000 and every probe put
+  a dozen tools past 2600 — a flat, high band nothing was told apart in. So
+  `fold_warm_probes` scores each tool's exemplars against the gallery minus
+  that whole tool (its sibling exemplars win every vote as surely as its own
+  window), and `warm_timeline` each self-probe against its file minus its
+  exchange (`FileScan::without_exchange`). Each sample is then what the
+  other candidates score on a probe that is not about them, which is what a
+  background is. One scan per member or exchange probed, the same probe work
+  as one batched scan. Pinned bit for bit against the public scorer by
+  `turn_belief_scan::the_collection_warm_up_scores_each_exemplar_without_its_own_member`
+  and `the_ingest_warm_up_scores_each_probe_without_its_own_exchange`.
 - **Past everything the background holds** a score keeps rising one nat per nat
   of `ln(1 + x)` from the top bin's edge, so two scores beyond the whole
   background still rank by size.
@@ -421,7 +440,8 @@ turns** (empty-tagged; gallery turns are tagged) through the same turn-group sca
 with `observe = true`, so the backgrounds are rebuilt to what live traffic would
 have produced. The tool collection's exemplars and each ingested file's own turns
 are folded too (`warm_collection_normalization`, `warm_ingest_normalization`),
-each with its own member or exchange as the probe's answer. Details that matter:
+each with its own member or exchange as the probe's answer, and scored against
+the gallery without it (§3.1). Details that matter:
 
 - **Exactly once, no half-warm reads.** Guarded by `std::sync::Once`, which blocks
   any concurrent first callers until the replay completes — so a second session

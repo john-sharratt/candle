@@ -118,6 +118,23 @@ struct Exemplar {
     sig: Vec<WideQSig>,
 }
 
+/// The collection warm-up's scans: each exemplar's index under the case its
+/// scan leaves out of the gallery — the member it is an exemplar of, or `None`
+/// for one about no member of the collection being taught. One round per case,
+/// in the order each case first appears, its probes in their own order.
+fn leave_out_rounds(
+    cases: impl IntoIterator<Item = Option<usize>>,
+) -> Vec<(Option<usize>, Vec<usize>)> {
+    let mut rounds: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
+    for (probe, case) in cases.into_iter().enumerate() {
+        match rounds.iter_mut().find(|(c, _)| *c == case) {
+            Some((_, at)) => at.push(probe),
+            None => rounds.push((case, vec![probe])),
+        }
+    }
+    rounds
+}
+
 /// Exemplar probes per GPU gallery scan during the collection warm-up. The whole
 /// corpus fits one launch comfortably (~744 probes on the tool catalog), but the
 /// probe upload is `probe tokens × words per token` and grows with the corpus, so
@@ -1965,89 +1982,65 @@ impl Conversation {
         }
         let weights = &taught.policy.layer_weights;
         let fusion = taught.policy.scan.fusion;
-        let queries: Vec<&[WideQSig]> = probes.iter().map(|p| p.sig.as_slice()).collect();
-        let gpu: Option<Vec<Vec<f32>>> = match (arena, fusion) {
-            (Some(arena), FusionMode::Additive) => {
-                let segments = [PagedSegment {
-                    windows: windows
-                        .iter()
-                        .zip(&sids)
-                        .zip(&slots)
-                        .map(|((w, sid), &case)| PagedWindow {
-                            sid: *sid,
-                            fingerprint: w.fingerprint(),
-                            turn: w.into(),
-                            start: 0,
-                            end: w.len(),
-                            case,
-                        })
-                        .collect(),
-                    n_cases: n,
-                    holder: Holder::Shared,
-                    groups: GroupSet::weighed(weights, arena.n_groups()),
-                    keep: taught.policy.scan.gallery_keep,
-                }];
-                let mut raw = Vec::with_capacity(queries.len());
-                for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
-                    if self.ingest_cancelled() {
-                        return None;
-                    }
-                    match arena.scan_weighted(&segments, batch, weights) {
-                        Ok(out) => raw.extend(out),
-                        Err(e) => {
-                            // **A failed GPU scan does NOT fall back to the CPU.**
-                            //
-                            // The CPU path below is a per-query walk of the whole
-                            // gallery. It is the right answer for the cheap cases
-                            // that never reach a kernel (no arena, an empty gallery,
-                            // a fusion law the arena does not scan) — but a gallery
-                            // big enough to want the GPU is one the host cannot
-                            // finish. Measured: a `CUDA_ERROR_INVALID_CONTEXT` here
-                            // put eight cores at 100% with the GPU idle and boot
-                            // never completed — 900 s and still going, which is the
-                            // same half-hour stall `warm_collection_normalization`
-                            // already records above.
-                            //
-                            // Warm-up is an optimisation: skipping it leaves this
-                            // collection's levels cold for the session, which costs
-                            // ranking quality. Hanging the boot costs everything.
-                            tracing::warn!(
-                                target: "candle_conversation::provenance",
-                                collection = %taught.name,
-                                windows = windows.len(),
-                                probes = probes.len(),
-                                "GPU warm-up scan FAILED: {e} — abandoning this \
-                                 collection's warm-up rather than falling back to a \
-                                 host scan that cannot finish a gallery this size. \
-                                 Its backgrounds stay COLD for this session, so its \
-                                 members' scores are not comparable to each other."
-                            );
-                            return None;
-                        }
-                    }
-                }
-                Some(raw)
-            }
+        // **Each exemplar is scored against the gallery WITHOUT its own member.**
+        //
+        // The scan is late fusion: every probe token votes for the case of its
+        // best-matching gallery token. An exemplar scored against a gallery that
+        // holds its own window — and its member's other exemplars — self-matches,
+        // so its member takes nearly every vote and every OTHER member's
+        // background sample is ~0. Every background then collapses to zeros, a
+        // live score lands past the top of all of them, and the band reads flat
+        // and high: measured on the tool catalog, "hi, how are you doing today?"
+        // put five tools at ~3000 and every probe put a dozen past 2600.
+        // Leaving the member out makes each sample what the other members score
+        // on a question that is NOT about them, which is what a background is.
+        // One scan per member, so the probe work is the same as one batched scan.
+        let case_of = |answer: &ChildKey| match answer {
+            ChildKey::Named(m) => members.iter().position(|x| x == m),
             _ => None,
         };
-        let on_gpu = gpu.is_some();
-        let raw = match gpu {
-            Some(raw) => raw,
-            None => {
-                let decoded: Vec<Vec<WideQSig>> = windows.iter().map(SigWindow::decode).collect();
-                let gallery: Vec<&[WideQSig]> = decoded.iter().map(Vec::as_slice).collect();
-                let mut raw = Vec::with_capacity(queries.len());
-                for query in &queries {
-                    if self.ingest_cancelled() {
-                        return None;
-                    }
-                    raw.push(score_slots_fused(
-                        query, &gallery, &slots, n, weights, fusion,
-                    ));
+        let rounds = leave_out_rounds(probes.iter().map(|p| case_of(&p.answer)));
+        let mut raw: Vec<Vec<f32>> = vec![Vec::new(); probes.len()];
+        let on_gpu = arena.is_some() && fusion == FusionMode::Additive;
+        // The host path's decoded windows: decoded once, on first use.
+        let host_windows: OnceCell<Vec<Vec<WideQSig>>> = OnceCell::new();
+        for (left_out, at) in &rounds {
+            let kept: Vec<usize> = (0..windows.len())
+                .filter(|&i| Some(slots[i]) != *left_out)
+                .collect();
+            if kept.is_empty() {
+                // The gallery holds no other member: nothing scores.
+                for &p in at {
+                    raw[p] = vec![0.0; n];
                 }
-                raw
+                continue;
             }
-        };
+            let queries: Vec<&[WideQSig]> = at.iter().map(|&p| probes[p].sig.as_slice()).collect();
+            let scored = match arena {
+                Some(arena) if on_gpu => self
+                    .fold_warm_scan_gpu(taught, arena, &windows, &slots, &sids, &kept, &queries)?,
+                _ => {
+                    let decoded = host_windows
+                        .get_or_init(|| windows.iter().map(SigWindow::decode).collect());
+                    let gallery: Vec<&[WideQSig]> =
+                        kept.iter().map(|&i| decoded[i].as_slice()).collect();
+                    let cases: Vec<usize> = kept.iter().map(|&i| slots[i]).collect();
+                    let mut out = Vec::with_capacity(queries.len());
+                    for query in &queries {
+                        if self.ingest_cancelled() {
+                            return None;
+                        }
+                        out.push(score_slots_fused(
+                            query, &gallery, &cases, n, weights, fusion,
+                        ));
+                    }
+                    out
+                }
+            };
+            for (&p, scores) in at.iter().zip(scored) {
+                raw[p] = scores;
+            }
+        }
         let scope = ScopeKey::collection(taught.id.raw() as u64, taught.name.as_str());
         let cache = &*self.normalization;
         for (probe, scores) in probes.iter().zip(&raw) {
@@ -2066,6 +2059,79 @@ impl Conversation {
             );
         }
         Some(on_gpu)
+    }
+
+    /// [`Self::fold_warm_probes`]'s arena scan of `queries` against the gallery
+    /// windows at `kept`, in [`WARM_GPU_PROBE_BATCH`] launches. `None` when it did
+    /// not complete: a shutdown asked, or the scan failed.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_warm_scan_gpu(
+        &self,
+        taught: &SectionCollection,
+        arena: &GalleryArena,
+        windows: &[SigWindow],
+        slots: &[usize],
+        sids: &[StreamId],
+        kept: &[usize],
+        queries: &[&[WideQSig]],
+    ) -> Option<Vec<Vec<f32>>> {
+        let weights = &taught.policy.layer_weights;
+        let segments = [PagedSegment {
+            windows: kept
+                .iter()
+                .map(|&i| PagedWindow {
+                    sid: sids[i],
+                    fingerprint: windows[i].fingerprint(),
+                    turn: (&windows[i]).into(),
+                    start: 0,
+                    end: windows[i].len(),
+                    case: slots[i],
+                })
+                .collect(),
+            n_cases: taught.sections.len(),
+            holder: Holder::Shared,
+            groups: GroupSet::weighed(weights, arena.n_groups()),
+            keep: taught.policy.scan.gallery_keep,
+        }];
+        let mut raw = Vec::with_capacity(queries.len());
+        for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
+            if self.ingest_cancelled() {
+                return None;
+            }
+            match arena.scan_weighted(&segments, batch, weights) {
+                Ok(out) => raw.extend(out),
+                Err(e) => {
+                    // **A failed GPU scan does NOT fall back to the CPU.**
+                    //
+                    // The host path is a per-query walk of the whole gallery.
+                    // It is the right answer for the cheap cases that never
+                    // reach a kernel (no arena, an empty gallery, a fusion law
+                    // the arena does not scan) — but a gallery big enough to
+                    // want the GPU is one the host cannot finish. Measured: a
+                    // `CUDA_ERROR_INVALID_CONTEXT` here put eight cores at 100%
+                    // with the GPU idle and boot never completed — 900 s and
+                    // still going, which is the same half-hour stall
+                    // `warm_collection_normalization` already records.
+                    //
+                    // Warm-up is an optimisation: skipping it leaves this
+                    // collection's levels cold for the session, which costs
+                    // ranking quality. Hanging the boot costs everything.
+                    tracing::warn!(
+                        target: "candle_conversation::provenance",
+                        collection = %taught.name,
+                        windows = kept.len(),
+                        probes = queries.len(),
+                        "GPU warm-up scan FAILED: {e} — abandoning this \
+                         collection's warm-up rather than falling back to a \
+                         host scan that cannot finish a gallery this size. \
+                         Its backgrounds stay COLD for this session, so its \
+                         members' scores are not comparable to each other."
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(raw)
     }
 
     /// Warm the append-only INGEST groups' per-file / per-cluster backgrounds from
@@ -2248,10 +2314,11 @@ impl Conversation {
     /// turn_group(group, timeline)` a live query reads back.
     ///
     /// The observation is the live seal scan's: each probe's raw per-exchange
-    /// scores against the file's own exchanges, the exchange the probe is a turn
-    /// of left out — it is the answer, not background. Every probe is scored in
-    /// one call — one launch on `arena` — where scoring probe by probe took the
-    /// host path.
+    /// scores against the file's own exchanges. The exchange the probe is a turn
+    /// of is its answer, so it is left out twice: out of the gallery the probe
+    /// is scored against, so it cannot take the votes the others' backgrounds
+    /// are made of, and out of the fold, since its score is the hit. The probes
+    /// of one exchange are scored in one call — one launch on `arena`.
     ///
     /// **A file of one exchange is not warmed.** It competes in its group's
     /// pool (`belief_files::competitions`), where a document probed by its own
@@ -2299,12 +2366,6 @@ impl Conversation {
         if probes.is_empty() || self.ingest_cancelled() {
             return;
         }
-        let probe_refs: Vec<&[WideQSig]> = probes.iter().map(|(_, _, p)| *p).collect();
-        let scan_span = profile::span("warm:scan");
-        let scanned = scan_file_scans(&files, group, &probe_refs, arena, holder);
-        scan_span.end();
-        let _g = profile::span("warm:fold");
-        let scope = ScopeKey::turn_group(group.id.raw() as u64, tl.raw());
         let child_of =
             |slot: usize| ChildKey::turn(file.arc_turn[file.ex_ranges[slot].start].0 as u64);
         // The exchange a turn belongs to: the probe's own, its answer.
@@ -2312,8 +2373,31 @@ impl Conversation {
             file.ex_ranges
                 .iter()
                 .position(|r| r.clone().any(|ai| file.arc_turn[ai].0 == turn))
-                .map(child_of)
         };
+        // **Each probe is scored against the file WITHOUT its own exchange.** A
+        // probe is one of the exchange's own turns, so in a gallery that holds
+        // it every token's best match is itself: the exchange takes every vote,
+        // and every other exchange's background sample is exactly 0. Eight
+        // zeros are a background, so a live hit then reads past the whole of it
+        // — the flat, high band the tool collection showed for the same reason
+        // ([`Self::fold_warm_probes`]). One scan per exchange probed.
+        let scan_span = profile::span("warm:scan");
+        let rounds = leave_out_rounds(probes.iter().map(|(_, turn, _)| exchange_of(*turn)));
+        let mut scanned: Vec<Vec<(Vec<f32>, Vec<f32>)>> = vec![Vec::new(); probes.len()];
+        for (own, at) in &rounds {
+            let without: Vec<FileScan> = match own {
+                Some(slot) => vec![file.without_exchange(*slot)],
+                None => files.clone(),
+            };
+            let probe_refs: Vec<&[WideQSig]> = at.iter().map(|&p| probes[p].2).collect();
+            let out = scan_file_scans(&without, group, &probe_refs, arena, holder);
+            for (&p, per_file) in at.iter().zip(out) {
+                scanned[p] = per_file;
+            }
+        }
+        scan_span.end();
+        let _g = profile::span("warm:fold");
+        let scope = ScopeKey::turn_group(group.id.raw() as u64, tl.raw());
         let cache = &*self.normalization;
         for ((source, turn, probe), per_file) in probes.iter().zip(&scanned) {
             // Self-match: the probe is this group's own turn, so it is inside
@@ -2331,7 +2415,7 @@ impl Conversation {
             let raw_pairs: Vec<(ChildKey, f32)> = (0..file.n_slots)
                 .map(|slot| (child_of(slot), fused.get(slot).copied().unwrap_or(0.0)))
                 .collect();
-            let answer = exchange_of(*turn);
+            let answer = exchange_of(*turn).map(child_of);
             cache.observe(&scope, *source, &raw_pairs, answer.as_ref(), probe.len());
         }
     }
@@ -5819,8 +5903,8 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collection_warm_plan, ingest_group, is_warmable, subwindow_bounds, warmable, Conversation,
-        Observe,
+        collection_warm_plan, ingest_group, is_warmable, leave_out_rounds, subwindow_bounds,
+        warmable, Conversation, Observe,
     };
 
     use std::collections::BTreeMap;
@@ -7063,6 +7147,23 @@ layers:
         write(chat, 3);
         let preload = conv.preload_galleries(builder.schema(), None);
         assert_eq!(preload.turns, 2, "only the shared layer's turns");
+    }
+
+    /// **The warm-up scans once per member, each scan leaving that member out.**
+    /// Probes are grouped under the case they are exemplars of, in the order
+    /// each case first appears; a probe about no member is a round of its own.
+    #[test]
+    fn the_warm_up_scans_each_members_exemplars_without_that_member() {
+        let rounds = leave_out_rounds([Some(2), Some(0), Some(2), None, Some(0), Some(2)]);
+        assert_eq!(
+            rounds,
+            vec![
+                (Some(2), vec![0, 2, 5]),
+                (Some(0), vec![1, 4]),
+                (None, vec![3]),
+            ]
+        );
+        assert!(leave_out_rounds([]).is_empty());
     }
 
     /// `(tags, timeline, index)` rows in the shape `collection_warm_plan` reads.
