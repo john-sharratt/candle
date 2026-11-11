@@ -4,6 +4,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::slice;
 use std::sync::Arc;
 
 use journals::diaries::book::Author;
@@ -142,7 +143,7 @@ fn entries_go_in_time_order_and_deletes_and_compaction_stand() {
         texts("c1"),
         ["monday", "tuesday, written last", "wednesday"]
     );
-    assert_eq!(d.delete(&m, "c1", TOPIC, &[b.clone()], NOW), Ok(1));
+    assert_eq!(d.delete(&m, "c1", TOPIC, slice::from_ref(&b), NOW), Ok(1));
     assert!(d.delete(&m, "c1", TOPIC, &[b], NOW).is_err(), "gone");
     assert!(d.close("c1"));
     d.open(&m, "o", "c1", PASS, NOW).unwrap();

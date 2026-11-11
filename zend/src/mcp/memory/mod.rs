@@ -53,6 +53,9 @@ pub const SYNC_EVERY: Duration = Duration::from_secs(5);
 pub const NO_MEMORY: &str =
     "this zend serves no journal repository: its agent has no `journal: true` checkout";
 
+/// Every diary's sealed file, by its id.
+pub type DiaryFiles = Vec<(DiaryId, Vec<u8>)>;
+
 /// Where the memory stands, read without the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Status {
@@ -294,7 +297,7 @@ impl Memory {
     /// Every diary's sealed file, by its id, and the repository's salt once
     /// there is one (`docs/private_mode.md` §5.2): read under the store, which
     /// holds them, never through the tree.
-    pub fn diaries(&self) -> Result<(Vec<(DiaryId, Vec<u8>)>, Option<Vec<u8>>), String> {
+    pub fn diaries(&self) -> Result<(DiaryFiles, Option<Vec<u8>>), String> {
         if let Some(why) = self.unavailable() {
             return Err(why);
         }
