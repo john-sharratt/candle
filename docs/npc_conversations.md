@@ -422,6 +422,13 @@ gets one `Elsewhere` event, rendered rather than decoded. It lists the `said`,
 loop's previous turn, read by the same `since` read as §6.1. Zen walking the
 house knows it just promised Mira the parcel.
 
+`Elsewhere` wakes nothing: a conversation that woke the mind on every line would
+have it answering a call it is not on. **A turn that settles something — a
+promise, or a mission change — tells it as `Concluded` instead, which does**
+(D10): that is how a conversation changes what the character does, and only the
+mind does it. Told quietly, it waited for whatever woke the mind next, and for
+a character standing in a quiet room that was nothing.
+
 ---
 
 ## 6. A turn

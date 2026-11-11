@@ -40,6 +40,9 @@ pub const LINE_TOKENS: usize = 320;
 /// The most a journal entry decodes.
 pub const JOURNAL_TOKENS: usize = 480;
 
+/// How much of a turn's decision its log line shows, in characters.
+const DECISION_SHOWN: usize = 600;
+
 /// How long a park waits for the turn's state to be durable before it lets
 /// the slot go regardless.
 const DURABLE_WAIT: Duration = Duration::from_secs(30);
@@ -271,10 +274,18 @@ impl Minds {
                 tokio::time::sleep,
             )
             .await;
+        // What it decided, by name, what the parse refused, and the decision's
+        // own opening: a conversation that keeps going to its journal when it
+        // was asked a question shows here whether it chose to or could not.
+        let named: Vec<&str> = parsed.acts.iter().map(|a| a.tool).collect();
+        let refused: Vec<String> = parsed.rejected.iter().map(|r| r.line()).collect();
+        let opening: String = decided.text.chars().take(DECISION_SHOWN).collect();
         tracing::info!(
             npc_id,
             to = ?to,
-            acts = parsed.acts.len(),
+            acts = ?named,
+            rejected = ?refused,
+            decided = %opening,
             ms = started.elapsed().as_millis() as u64,
             "a conversation's turn"
         );

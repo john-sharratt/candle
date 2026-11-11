@@ -367,8 +367,10 @@ impl Runtime {
         let source = ActSource::Talk {
             party: member.to_string(),
         };
-        // What the main loop is told this conversation did (§5.4).
+        // What the main loop is told this conversation did (§5.4), and whether
+        // it settled anything that changes what the character does.
         let mut elsewhere: Vec<String> = Vec::new();
+        let mut settled = false;
         for act in spoken
             .acts
             .iter()
@@ -393,12 +395,14 @@ impl Runtime {
                         about.clone(),
                     );
                     elsewhere.push(promised);
+                    settled = true;
                 }
                 // Marked here too: the authority's mark is on its own member,
                 // and this one offers the next turn's acts.
                 t if t.starts_with("mission_") => {
                     self.talk_changes.mark(npc, world_ms);
                     elsewhere.push(done.answer.clone());
+                    settled = true;
                 }
                 _ => {}
             }
@@ -481,17 +485,34 @@ impl Runtime {
         state.last_turn = Stamp::now();
         state.seen = caught.seen;
         minds.set_talk_meta(&talk, &state.to_meta())?;
-        // Told quietly: it waits for the main loop's next turn rather than
-        // starting one.
-        self.scheduler.deliver(
-            npc,
-            world_ms,
-            Salience::IDLE,
-            EventKind::Elsewhere {
-                party: seen.party_name.clone(),
-                lines: elsewhere,
-            },
-        );
+        if settled {
+            // **A promise or a mission change is told so it wakes the mind**
+            // (§5.4, D10): it is how a conversation changes what the character
+            // does, and the mind is what does it. Told quietly, it waited for
+            // whatever woke the mind next — for a character standing in a quiet
+            // room, nothing — so what was settled on the phone was never done.
+            self.scheduler.deliver(
+                npc,
+                world_ms,
+                Salience::NORMAL,
+                EventKind::Concluded {
+                    party: seen.party_name.clone(),
+                    applied: elsewhere.join(" "),
+                },
+            );
+        } else {
+            // Told quietly: it waits for the main loop's next turn rather than
+            // starting one.
+            self.scheduler.deliver(
+                npc,
+                world_ms,
+                Salience::IDLE,
+                EventKind::Elsewhere {
+                    party: seen.party_name.clone(),
+                    lines: elsewhere,
+                },
+            );
+        }
         minds.park_talk(talk).await;
         Ok(ended)
     }
