@@ -37,7 +37,7 @@ the context over on whatever tool the model calls first.
 | `user_episode_note` | zend, called by the aggregator only | Records a tool call that did something on the conversation's `journal.yaml`, its `activity` — never a line of its own. In no listing; the aggregator refuses it from a client. |
 | `readOnlyHint` | zend, npcd | The MCP annotation on every tool that only reads: what the aggregator tells an episode by. |
 | The client's guide | aggregator (`clients:` in a guide's frontmatter) | The client's "system prompt addition": how to work with the user there — in the car, spoken answers. |
-| Context on the first call | aggregator | The first call of a conversation, whatever tool it is, carries the user context after its own answer. |
+| The conversation's ref | zend, checked by the aggregator | `get_user_context` answers the conversation's ref first; every other call must pass it (`docs/private_mode.md` §3). |
 | `Client::Grok` | `mcp_server` | The client a session is for, read from `clientInfo.name`. |
 
 ### 2.1 The user's memory
@@ -112,15 +112,15 @@ clients: [grok]
 ```
 
 A client's guide is the one whose `clients` holds the session's client
-(`Client::name`). It is served as the first part of `get_user_context` and of
-the first-call context, and is readable like any guide with `guide_read`. It is
-written on a budget — it rides the first call of every conversation — and
-leans on the other guides and the tools' descriptions for detail.
+(`Client::name`). It is served as the first part of `get_user_context`, and is
+readable like any guide with `guide_read`. It is written on a budget — it rides
+the start of every conversation — and leans on the other guides and the tools'
+descriptions for detail.
 
 `claude` is the guide for every Claude client (`claude-code`, `claude-ai`) and
 any other: the frame, the write rules in brief, and which guide to read for
 the work, the full `memory` guide among them, which is read on demand and
-rides no first call.
+rides no conversation's start.
 
 `grok` is the guide for Grok: answers are spoken and short; URLs, ids and
 code are never read out; memory is kept with `journal_note ~`; and the basics
@@ -128,30 +128,15 @@ of changing the connector itself — a guide edit through a worker, merged with
 the user's spoken approval, then the `mcp` service rebuilt and trialled
 (`guide-change`).
 
-### 2.5 Context on the first call
+### 2.5 A conversation begins with its context
 
-A conversation is a person's MCP session through a client, for as long as the
-session lasts: a new session is a new conversation, and a long silence within
-one is not. The context is delivered once per session — re-sent after every
-half-hour pause, it cost a long working session about 2k tokens each time, and
-zend named a new conversation journal at each pause
-(`docs/zen_coding_session_fixes.md`, S5). zend's own boundary is the same
-(`zend/src/mcp/memory/conversations.rs`). The first call of a conversation reads the context *beside* its own
-work, and never waits for it: when the read has finished by the time the call
-answers, its answer gets a second text block, "Before you answer — …"
-followed by the user context (guide and memory). A read the call answered
-ahead of is left running (`mcp/src/reading.rs`), and the conversation's next
-call carries it instead of reading again. `get_user_context` itself is never
-given it twice.
-
-The conversation's clock is stamped only once it has had its context. A first
-call that answered ahead of its read, or whose context could not be read —
-the memory's backend restarting, or not listed yet — leaves it unstamped, and
-the next call carries it or tries again.
-
-Two aggregators serve `/mcp` in turn, so a conversation may get the block once
-from each; it is a few hundred tokens and says the same both times. A restart
-forgets the clocks, so the next call after one carries the block again.
+A conversation is its **ref** (`docs/private_mode.md` §3): the handle
+`get_user_context` answers on its first line, which every other Zen call must
+pass. So every conversation begins with `get_user_context` — a call without a
+ref is refused, naming it — and the context is never sent unasked. (Before
+refs, the aggregator added the context to whatever tool a conversation called
+first, timed by MCP session; claude.ai's one session per person and Grok's
+session per call made that boundary wrong, and it is gone.)
 
 ### 2.6 The client
 
@@ -159,8 +144,8 @@ forgets the clocks, so the next call after one carries the block again.
 `xai` — or, when the name says nothing this knows, a `User-Agent` that does.
 Grok's handshake names itself `connectors-manager`, agent
 `grok-connectors-manager/0.1.0` (seen 2026-10-30), and opens a new session for
-each conversation, so every Grok conversation's first call carries its
-context. Its calls wait as `Other`'s do. The aggregator passes it on to the
+every call; its conversation is its ref, as every client's is
+(`docs/private_mode.md` §9). Its calls wait as `Other`'s do. The aggregator passes it on to the
 backends as it already passes on the client (`backend::Link::request`), so
 zend reads the same client the aggregator does. `initialize` is logged with
 the client's name and its `User-Agent`, so a client that is not recognised is
@@ -206,9 +191,10 @@ takes on that machine; the other machine's aggregator serves meanwhile.
 - **The server records episodes; the model records facts.** No source shows a
   model reliably saving memory unprompted, so what was done does not depend on
   it; what the user wants kept still needs the model's judgement.
-- **Context rides the first call** rather than waiting for the model to ask
-  for it, because no client tested calls a recall tool reliably from its
-  description alone.
+- **Every conversation begins at `get_user_context`**, because every other
+  call needs the ref it answers (`docs/private_mode.md` §3). No client tested
+  called a recall tool reliably from its description alone; a refusal that
+  names it is a mechanism, where a description was only a request.
 - **The client is read from `clientInfo.name`**, which the client states
   about itself. It chooses a guide, not a permission, so a client that names
   itself wrongly only gets another client's advice.

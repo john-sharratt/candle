@@ -1,7 +1,9 @@
 //! The MCP sessions' bookkeeping, off the request path: every
 //! [`TEND_EVERY`], the uses calls noted in memory are written into their
 //! sessions' records and the stale are swept ([`RecordStore::tend`]), so a
-//! call itself only reads its session; and every [`WRITE_EVERY`], the calls
+//! call itself only reads its session, and every conversation ref idle past
+//! four hours has its record ceased ([`ref_records::sweep`]); and every
+//! [`WRITE_EVERY`], the calls
 //! noted for each conversation's activity are written into its journal
 //! ([`write_noted`]).
 
@@ -11,6 +13,7 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 
 use super::noted_calls::{write_noted, WRITE_EVERY};
+use super::ref_records;
 use super::state::RecordStore;
 use super::workers::now_ms;
 use crate::session::ZendSession;
@@ -32,14 +35,16 @@ pub async fn tending(session: Weak<ZendSession>) {
         // control can wait for room: off the runtime's threads.
         let tended = tokio::task::spawn_blocking(move || {
             let records = session.shared_substrate()?;
+            let refs = ref_records::sweep(&records, now_ms());
             let store = RecordStore::new(records, Arc::clone(session.mcp().used()));
-            Some(store.tend(now_ms()))
+            let (touched, ceased) = store.tend(now_ms());
+            Some((touched, ceased, refs))
         })
         .await;
         match tended {
-            Ok(Some((0, 0))) | Ok(None) => {}
-            Ok(Some((touched, ceased))) => {
-                tracing::info!(touched, ceased, "mcp: tended the sessions")
+            Ok(Some((0, 0, 0))) | Ok(None) => {}
+            Ok(Some((touched, ceased, refs))) => {
+                tracing::info!(touched, ceased, refs, "mcp: tended the sessions and the refs")
             }
             Err(e) => tracing::warn!("mcp: tending the sessions failed: {e}"),
         }

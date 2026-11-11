@@ -10,9 +10,12 @@
 //! `guide_read` (`crate::guides`), and adds to each backend tool a guide lists
 //! the line naming its guides.
 //!
-//! And it serves the user's context (`crate::context`): the client's guide in
-//! front of `get_user_context`, the same context after the first answer of a
-//! conversation, and an episode recorded for each call that did something.
+//! Every call but `get_user_context` names its conversation by `ref`
+//! (`docs/private_mode.md` §3): a call without a live one of the caller's is
+//! refused, and the ref goes on to the backend in `_meta`. `get_user_context`
+//! begins or goes on with a conversation, and is served with the client's
+//! guide in front (`crate::context`); a call that did something is recorded
+//! as an episode of its conversation.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -23,17 +26,19 @@ use axum::http::HeaderMap;
 use futures::future::join_all;
 use mcp_server::http::now_ms;
 use mcp_server::protocol::text_result;
+use mcp_server::refs::{Ref, Refs};
 use mcp_server::{Call, Identity, NoCaller, SealedStore, Server, Store};
 use serde_json::{json, Value};
 
 use crate::backend::{Backend, Link, OnBehalf};
 use crate::caller::Caller;
-use crate::context::{self, Conversations};
+use crate::context;
+use crate::conversation::{self, EXPIRED, FORGED, NO_REF, REF};
 use crate::guides::tools as guide_tools;
 use crate::guides::Library;
 use crate::last_listed::LastListed;
 use crate::listing::{self, Listing};
-use crate::reading::{Read, Readings};
+use crate::liveness::Seen;
 use crate::routes::Routes;
 use crate::served::Served;
 
@@ -57,11 +62,10 @@ pub struct App {
     pub library: Library,
     /// The backend tools the last listing marked as only reading.
     pub read_only: RwLock<BTreeSet<String>>,
-    /// When each conversation last had a call.
-    pub conversations: Conversations,
-    /// The context reads first calls answered ahead of, for each
-    /// conversation's next call.
-    pub readings: Readings,
+    /// What conversation refs open under: the key zend issues them with.
+    pub refs: Refs,
+    /// Each ref's last use as this process saw it.
+    pub seen: Seen,
     /// Whether this process has listed, and the record tasks' turn to.
     pub listing: Listing,
 }
@@ -175,7 +179,7 @@ impl App {
     /// the members serving the memory declare, so the gateway sends it to one
     /// of them ([`Backend::path_for`]). The listing the backend answered on is
     /// noted against what the session was served.
-    async fn call_served(
+    pub(crate) async fn call_served(
         &self,
         backend: usize,
         caller: &Caller,
@@ -198,28 +202,30 @@ impl App {
         self.routes.get(name)
     }
 
-    /// The session `call` is made on behalf of.
-    fn on_behalf<'a>(call: &'a Call<Self>) -> OnBehalf<'a> {
+    /// The session `call` is made on behalf of, in the conversation `named`.
+    fn on_behalf<'a>(call: &'a Call<Self>, named: Option<&'a str>) -> OnBehalf<'a> {
         OnBehalf {
             id: &call.session_id,
             session: &call.session,
+            conversation_ref: named,
         }
     }
 
     /// The call, run by the backend that lists `name` — the tools listed
     /// first when none has, as for a tool new to every listing so far — or
-    /// answered here when it is a guide tool.
-    async fn run(&self, call: &Call<Self>, name: &str, args: &Value) -> Ran {
+    /// answered here when it is a guide tool; in the conversation `named`.
+    async fn run(&self, call: &Call<Self>, name: &str, args: &Value, named: Option<&str>) -> Ran {
         if guide_tools::is_guide_tool(name) {
             let answer = guide_tools::call(&self.library, name, args);
             let guide = args.get("name").and_then(Value::as_str).unwrap_or("");
             tracing::info!(tool = name, guide, "mcp: guide served");
             return Ran::Answered(answer);
         }
+        let on = Self::on_behalf(call, named);
         let backend = match self.route(name) {
             Some(b) => b,
             None => {
-                let listed = self.list(&call.caller, &Self::on_behalf(call)).await;
+                let listed = self.list(&call.caller, &on).await;
                 match self.route(name) {
                     Some(b) => b,
                     None if listed.failed.is_empty() => {
@@ -231,10 +237,6 @@ impl App {
                     None => return Ran::Answered(text_result(&listed.failed.join("; "), true)),
                 }
             }
-        };
-        let on = OnBehalf {
-            id: &call.session_id,
-            session: &call.session,
         };
         let step = |line: String| call.step(line);
         let started = Instant::now();
@@ -284,38 +286,120 @@ impl App {
         ))
     }
 
-    /// Begin reading the user's context for `call`'s client from the backend
-    /// that keeps the memory, beside the call: `None` when no listing has
-    /// named that backend yet. A read that fails is `None` when it ends,
-    /// which is logged and costs the call nothing.
-    fn start_reading(this: &Arc<Self>, call: &Call<Self>) -> Option<Read> {
-        let client = call.session.client.name();
-        let Some(backend) = this.route(context::GET) else {
-            tracing::warn!(client, "mcp: no backend lists the user's context yet");
-            return None;
-        };
-        let this = Arc::clone(this);
-        let caller = call.caller.clone();
-        let id = call.session_id.clone();
-        let session = call.session.clone();
-        Some(tokio::spawn(async move {
-            let on = OnBehalf {
-                id: &id,
-                session: &session,
-            };
-            let answer = this
-                .call_served(backend, &caller, &on, context::GET, &json!({}), &|_| {})
-                .await;
-            this.served_context(session.client.name(), &answer)
-        }))
-    }
-
     /// Whether the last listing marked `name` as only reading.
     pub(crate) fn reads_only(&self, name: &str) -> bool {
         self.read_only
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .contains(name)
+    }
+
+    /// The conversation `named` names for `call`'s caller, live at `now_ms`:
+    /// its ref, as written, and what it names — or why the call is refused.
+    /// A ref older than this process can vouch for is asked of the record
+    /// both aggregators read (`docs/private_mode.md` §3.2).
+    pub(crate) async fn conversation(
+        this: &Arc<Self>,
+        call: &Call<Self>,
+        named: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(String, Ref), String> {
+        let text = named.ok_or(NO_REF)?;
+        let r = this
+            .refs
+            .open(&call.caller.key(), text)
+            .map_err(|_| FORGED.to_string())?;
+        if !this.seen.vouches(&r, now_ms) {
+            match Self::ask_used(this, call, text).await {
+                Ok(Some(used)) if r.live(Some(used), now_ms) => this.seen.heard(&r, used),
+                Ok(_) => return Err(EXPIRED.into()),
+                Err(why) => {
+                    return Err(format!(
+                        "this conversation's `ref` could not be checked ({why}); try the same call \
+                         again shortly"
+                    ))
+                }
+            }
+        }
+        Self::note_use(this, call, text, &r, now_ms);
+        Ok((text.to_string(), r))
+    }
+
+    /// When the record says the conversation `text` names was last used.
+    async fn ask_used(this: &Arc<Self>, call: &Call<Self>, text: &str) -> Result<Option<u64>, String> {
+        let backend = this
+            .route(context::GET)
+            .ok_or("no backend lists the user's context yet")?;
+        let on = Self::on_behalf(call, Some(text));
+        let answer = this
+            .call_served(backend, &call.caller, &on, context::REF_SEEN, &json!({}), &|_| {})
+            .await;
+        let said = context::text_of(&answer).unwrap_or("");
+        if context::is_error(&answer) {
+            return Err(first_line(said));
+        }
+        let read: Value =
+            serde_json::from_str(said).map_err(|_| format!("the record answered `{}`", first_line(said)))?;
+        Ok(read.get("used_ms").and_then(Value::as_u64))
+    }
+
+    /// Note the conversation `text` names used at `now_ms`, and tell the
+    /// record so in the background when that is due: the call never waits
+    /// for it.
+    fn note_use(this: &Arc<Self>, call: &Call<Self>, text: &str, r: &Ref, now_ms: u64) {
+        if !this.seen.used(r, now_ms) {
+            return;
+        }
+        let Some(backend) = this.route(context::GET) else {
+            return;
+        };
+        let this = Arc::clone(this);
+        let caller = call.caller.clone();
+        let id = call.session_id.clone();
+        let session = call.session.clone();
+        let text = text.to_string();
+        tokio::spawn(async move {
+            let on = OnBehalf {
+                id: &id,
+                session: &session,
+                conversation_ref: Some(&text),
+            };
+            let answer = this
+                .call_served(
+                    backend,
+                    &caller,
+                    &on,
+                    context::REF_SEEN,
+                    &json!({"used_ms": now_ms}),
+                    &|_| {},
+                )
+                .await;
+            if context::is_error(&answer) {
+                tracing::warn!(
+                    "mcp: a conversation's use could not be told: {}",
+                    first_line(context::text_of(&answer).unwrap_or(""))
+                );
+            }
+        });
+    }
+
+    /// `get_user_context`: run by the memory's backend, which begins or goes
+    /// on with the conversation and answers its ref first; served with the
+    /// client's guide in front. A ref it went on with is a use.
+    async fn begin(this: &Arc<Self>, call: &Call<Self>, args: &Value) -> Value {
+        let Ran::Answered(mut answer) = this.run(call, context::GET, args, None).await else {
+            return text_result("the client stopped listening", true);
+        };
+        let client = call.session.client.name();
+        if let Some(served) = this.served_context(client, &answer) {
+            context::replace_text(&mut answer, &served);
+        }
+        if let Some(text) = args.get(REF).and_then(Value::as_str).map(str::trim) {
+            if let Ok(r) = this.refs.open(&call.caller.key(), text) {
+                Self::note_use(this, call, text, &r, now_ms());
+            }
+        }
+        answer
     }
 }
 
@@ -381,10 +465,11 @@ impl Server for App {
     /// nothing at all can be listed is the list refused, since claude.ai shows
     /// a refused list as no tools at all.
     ///
-    /// The guide tools come first, and each backend tool a guide lists carries
-    /// the line naming its guides.
+    /// The guide tools come first, each backend tool a guide lists carries
+    /// the line naming its guides, and every tool but `get_user_context`
+    /// requires `ref`.
     async fn tools(this: &Arc<Self>, call: &Call<Self>) -> Result<Value, String> {
-        let mut listed = this.list(&call.caller, &Self::on_behalf(call)).await;
+        let mut listed = this.list(&call.caller, &Self::on_behalf(call, None)).await;
         if listed.tools.is_empty() && !listed.failed.is_empty() {
             return Err(listed.failed.join("; "));
         }
@@ -405,83 +490,36 @@ impl Server for App {
         this.library.decorate(&mut listed.tools);
         let mut tools = guide_tools::definitions(&this.library);
         tools.append(&mut listed.tools);
+        conversation::require_ref(&mut tools);
         this.served
             .listed(&call.session_id, listed.versions, now_ms());
         Ok(Value::Array(tools))
     }
 
-    /// The call (`App::run`), with the user's context: `get_user_context`
-    /// gets the client's guide in front, the first call of a conversation
-    /// gets the context after its answer, and a call that did something is
-    /// recorded as an episode (`docs/mcp_user_context.md` §2.2–§2.5).
+    /// The call (`App::run`) in the conversation its `ref` names — refused
+    /// without a live one — or `get_user_context`, which begins or goes on
+    /// with one (`App::begin`). A call that did something is recorded as an
+    /// episode of its conversation (`docs/mcp_user_context.md` §2.3).
     async fn call(this: &Arc<Self>, call: &Call<Self>, name: &str, args: &Value) -> Value {
-        if name == context::EPISODE {
+        if context::is_internal(name) {
             return text_result(&format!("there is no tool `{name}`"), true);
         }
-        let client = call.session.client.name();
-        let who = context::who(&call.caller.key(), client, &call.session_id);
-        let claim = this.conversations.claim(&who, now_ms());
-        let begins = claim.begins();
-        let around = context::around(name, begins);
-        // The context is read beside the call, and the call never waits for
-        // it: the read an earlier call left running is taken up, else one
-        // begins. Before any listing has said which backend keeps it, the
-        // call lists first, and the read begins after it.
-        let mut reading = around
-            .fetch_context
-            .then(|| {
-                this.readings
-                    .take(&who, Instant::now())
-                    .or_else(|| Self::start_reading(this, call))
-            })
-            .flatten();
-        let ran = this.run(call, name, args).await;
-        if around.fetch_context && reading.is_none() {
-            reading = Self::start_reading(this, call);
+        if name == context::GET {
+            return Self::begin(this, call, args).await;
         }
-        // The context goes with this answer when it is read by now; otherwise
-        // it is left running, and the conversation's next call — a first call
-        // still, since this one leaves it without its context — carries it.
-        let user = match reading {
-            Some(read) if read.is_finished() => read.await.ok().flatten(),
-            Some(read) => {
-                this.readings.leave(&who, read, Instant::now());
-                None
-            }
-            None => None,
+        let (named, args) = conversation::take_ref(args);
+        let text = match Self::conversation(this, call, named.as_deref(), now_ms()).await {
+            Ok((text, _)) => text,
+            Err(why) => return text_result(&why, true),
         };
-        // A client that left neither had the context nor needs a record of
-        // an answer it never read.
-        let Ran::Answered(mut answer) = ran else {
+        let Ran::Answered(answer) = this.run(call, name, &args, Some(&text)).await else {
+            // A client that left needs no record of an answer it never read.
             return text_result("the client stopped listening", true);
         };
-        if around.compose && !context::is_error(&answer) {
-            // The conversation has its context from this answer itself.
-            this.readings.forget(&who);
-        }
-        if around.compose {
-            if let Some(served) = this.served_context(client, &answer) {
-                context::replace_text(&mut answer, &served);
-            }
-        }
-        if let Some(user) = &user {
-            context::append(&mut answer, &context::first_call(user));
-            tracing::info!(
-                tool = name,
-                client,
-                "mcp: a conversation's first call carries its context"
-            );
-        }
-        let failed = context::is_error(&answer);
-        // A claim not kept is given up as it drops — here, or on any way out
-        // above, the client gone included.
-        if context::stamps(name, begins, failed, user.is_some()) {
-            claim.keep(now_ms());
-        }
         // Whether it is an episode is decided after the answer has gone, by a
         // listing when this process has none yet (`crate::listing`).
-        if context::may_record(name, failed) {
-            listing::record_later(this, call, name, args);
+        if context::may_record(name, context::is_error(&answer)) {
+            listing::record_later(this, call, name, &args, text);
         }
         answer
     }

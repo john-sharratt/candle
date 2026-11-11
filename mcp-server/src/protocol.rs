@@ -26,6 +26,10 @@ pub const CLIENT_META: &str = "io.modelcontextprotocol/clientInfo";
 /// server's own session, so what is held for the client is held per session
 /// of the server in front (`docs/mcp_app.md` §3).
 pub const SESSION_META: &str = "com.tokera/session";
+/// Where a request from a server calling on its client's behalf names the
+/// conversation the call is in: the ref its client passed
+/// (`docs/private_mode.md` §3.3).
+pub const REF_META: &str = "com.tokera/ref";
 
 /// Every version served, newest first.
 pub fn supported() -> Vec<&'static str> {
@@ -133,6 +137,14 @@ pub fn modern_client(params: &Value) -> Option<&str> {
 /// behalf.
 pub fn on_behalf(params: &Value) -> Option<&str> {
     meta(params, SESSION_META)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+}
+
+/// The conversation ref a request from a server in front names, as written:
+/// the server it reaches opens it ([`crate::refs::Refs::open`]).
+pub fn conversation_ref(params: &Value) -> Option<&str> {
+    meta(params, REF_META)?
         .as_str()
         .filter(|s| !s.is_empty())
 }
@@ -254,10 +266,14 @@ mod tests {
         let p = json!({"_meta": {
             "io.modelcontextprotocol/clientInfo": {"name": "claude-code"},
             "com.tokera/session": "s1",
+            "com.tokera/ref": "r1",
             "progressToken": 7
         }});
         assert_eq!(modern_client(&p), Some("claude-code"));
         assert_eq!(on_behalf(&p), Some("s1"));
+        assert_eq!(conversation_ref(&p), Some("r1"));
+        assert_eq!(conversation_ref(&json!({"_meta": {"com.tokera/ref": ""}})), None);
+        assert_eq!(conversation_ref(&json!({})), None);
         assert_eq!(progress_token(&p), Some(json!(7)));
         assert_eq!(
             progress_token(&json!({"_meta": {"progressToken": {}}})),

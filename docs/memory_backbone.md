@@ -971,14 +971,11 @@ account's group (§3.4), named for the minute of the conversation's first
 call. The server opens it at the conversation's first *write*. A
 conversation that only reads writes nothing: its frame names the journal as
 `here` all the same, and reads it as an empty one, so a read never waits on
-a commit. A conversation is an MCP session's run of calls with no 30-minute gap. Grok is
-the exception: it opens a session for every call it makes, sixteen
-conversations in six minutes on 2026-10-31. So a Grok conversation is
-followed by the person and the group, not the session. Two people driving
-on one account at once share a conversation, and the focus tells their lines
-apart. The aggregator then does three things:
+a commit. A conversation is its ref (`docs/private_mode.md` §3): the handle
+`get_user_context` answers, which every later call passes, whatever MCP
+sessions carry them — Grok opens one for every call, and claude.ai carries all
+of a person's conversations on one. The aggregator then does two things:
 - it puts the client's guide in front of `get_user_context`;
-- it adds the first-call context after the conversation's first answer;
 - after each call that did something, it writes an episode onto the
   conversation's journal.
 

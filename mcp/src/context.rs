@@ -1,15 +1,15 @@
 //! The user's context, as the aggregator serves it
-//! (`docs/mcp_user_context.md` §2.2–§2.5): `get_user_context` with the
-//! client's guide in front, the same on the first call of a conversation
-//! whatever tool it is, and an episode recorded for each call that did
-//! something. The memory itself is the coding backend's; the aggregator only
-//! knows when to ask for it and what to tell it.
+//! (`docs/mcp_user_context.md` §2.2–§2.4): `get_user_context` with the
+//! client's guide in front, and an episode recorded for each call that did
+//! something. Every conversation begins with `get_user_context`, which answers
+//! its ref (`docs/private_mode.md` §3), so the context is never sent unasked.
+//! The memory itself is the coding backend's; the aggregator only knows when
+//! to ask for it and what to tell it.
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::Mutex;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::guides::Guide;
 
@@ -18,6 +18,10 @@ pub const GET: &str = "get_user_context";
 /// The tool an episode is recorded with, on the backend that answers
 /// [`GET`]. It is in no backend's listing; a client calling it is refused.
 pub const EPISODE: &str = "user_episode_note";
+/// The tool a conversation ref's use is told and asked with, on the backend
+/// that answers [`GET`] (`docs/private_mode.md` §3.2). In no listing, and
+/// refused from a client, like [`EPISODE`].
+pub const REF_SEEN: &str = "conversation_ref_seen";
 /// How often, and how many times, a refused episode is recorded again: long
 /// enough together to outlast the memory's backend reloading its model.
 pub const EPISODE_RETRY: Duration = Duration::from_secs(30);
@@ -54,10 +58,6 @@ pub fn needs_memory(tool: &str, args: &Value) -> bool {
     }
     MEMORY.contains(&tool)
 }
-
-/// How many conversations' clocks are kept; past this, the idlest is let go,
-/// and its session's next call begins a conversation again.
-const CLOCKS_KEPT: usize = 4096;
 
 /// The memory's own tools: what they do is the memory, never an episode.
 const MEMORY: [&str; 14] = [
@@ -114,32 +114,9 @@ pub fn summary(args: &Value) -> String {
         .collect()
 }
 
-/// What the aggregator does around one call (`App::call`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Around {
-    /// Read the context alongside the call, to follow its answer.
-    pub fetch_context: bool,
-    /// The call is `get_user_context`: put the client's guide in front.
-    pub compose: bool,
-}
-
-/// What to do around a call of `name`, which `begins` a conversation or not.
-pub fn around(name: &str, begins: bool) -> Around {
-    Around {
-        fetch_context: begins && name != GET,
-        compose: name == GET,
-    }
-}
-
-/// Whether a call of `name` whose answer `failed` or not keeps its
-/// conversation's claim, when the context it went with was `delivered` — and
-/// when the conversation did not begin with it, `begins` false.
-///
-/// The clock is stamped once the conversation has its context: by this
-/// answer, or by an earlier one. A first call whose context could not be read
-/// gives its claim up, so the next call tries again.
-pub fn stamps(name: &str, begins: bool, failed: bool, delivered: bool) -> bool {
-    !begins || delivered || (name == GET && !failed)
+/// Whether `name` is a tool only the aggregator calls, refused from a client.
+pub fn is_internal(name: &str) -> bool {
+    name == EPISODE || name == REF_SEEN
 }
 
 /// Whether a call of `name` whose answer `failed` or not could be an episode
@@ -156,133 +133,6 @@ pub fn records(name: &str, failed: bool, from_backend: bool, read_only: bool) ->
     may_record(name, failed) && from_backend && !read_only
 }
 
-/// When each conversation last had a call: what tells the first call of the
-/// next. A conversation is a person's session through a client, for as long
-/// as the session lasts — a new session is a new conversation, and a long
-/// silence within one is not. Its context is delivered once, on its first
-/// call: re-sent after every pause, it cost a long session thousands of
-/// tokens a time.
-#[derive(Debug, Default)]
-pub struct Conversations(Mutex<HashMap<String, Clock>>);
-
-/// One conversation's clock: when it was last called, when the call that
-/// began it claimed it, and whether that call delivered its context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Clock {
-    used: u64,
-    claimed: u64,
-    delivered: bool,
-}
-
-impl Conversations {
-    /// A call at `now` on `who`, held for as long as the call runs: it
-    /// [`Claim::begins`] the conversation when the conversation has never been
-    /// stamped. Beginning claims the conversation in the same step, so a
-    /// client that opens with several calls at once has one of them begin it,
-    /// and the context is read once and follows one answer. A claim that
-    /// begins and is not kept — its context never delivered, the client gone,
-    /// the call unwound — is given up when it drops, and the next call begins
-    /// the conversation again.
-    pub fn claim(&self, who: &str, now_ms: u64) -> Claim<'_> {
-        Claim {
-            begins: self.begin(who, now_ms),
-            conversations: self,
-            who: who.to_string(),
-            at: now_ms,
-            kept: false,
-        }
-    }
-
-    /// Whether `who` begins at `now`, stamping it in the same step if so.
-    fn begin(&self, who: &str, now_ms: u64) -> bool {
-        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let begins = !last.contains_key(who);
-        if begins {
-            if last.len() >= CLOCKS_KEPT {
-                let idlest = last
-                    .iter()
-                    .min_by_key(|(_, clock)| clock.used)
-                    .map(|(w, _)| w.clone());
-                if let Some(idlest) = idlest {
-                    last.remove(&idlest);
-                }
-            }
-            last.insert(
-                who.to_string(),
-                Clock {
-                    used: now_ms,
-                    claimed: now_ms,
-                    delivered: false,
-                },
-            );
-        }
-        begins
-    }
-
-    /// `who`, claimed, was called again at `now`, and — when `delivered` —
-    /// that call carried its context. A conversation whose claim was given up
-    /// stays unclaimed, so its next call begins it.
-    fn stamp(&self, who: &str, now_ms: u64, delivered: bool) {
-        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(clock) = last.get_mut(who) {
-            clock.used = clock.used.max(now_ms);
-            clock.delivered |= delivered;
-        }
-    }
-
-    /// Give up the claim on `who` made at `at` — only if it is still that
-    /// claim, and its context was never delivered: one a later call made after
-    /// it was given up is its own, and a call that ran beside it and kept
-    /// going delivers nothing in its place.
-    fn release(&self, who: &str, at: u64) {
-        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if last
-            .get(who)
-            .is_some_and(|clock| clock.claimed == at && !clock.delivered)
-        {
-            last.remove(who);
-        }
-    }
-}
-
-/// One call's hold on its conversation's clock ([`Conversations::claim`]).
-#[derive(Debug)]
-pub struct Claim<'a> {
-    conversations: &'a Conversations,
-    who: String,
-    /// When it was claimed: the clock it set, when it began.
-    at: u64,
-    begins: bool,
-    kept: bool,
-}
-
-impl Claim<'_> {
-    /// This call begins its conversation, and carries its context.
-    pub fn begins(&self) -> bool {
-        self.begins
-    }
-
-    /// The conversation has its context: its clock runs on from `now`.
-    pub fn keep(mut self, now_ms: u64) {
-        self.conversations.stamp(&self.who, now_ms, self.begins);
-        self.kept = true;
-    }
-}
-
-impl Drop for Claim<'_> {
-    fn drop(&mut self) {
-        if self.begins && !self.kept {
-            self.conversations.release(&self.who, self.at);
-        }
-    }
-}
-
-/// The key a conversation is timed under: the person, the client, and the
-/// session they called on.
-pub fn who(owner: &str, client: &str, session: &str) -> String {
-    format!("{owner}/{client}/{session}")
-}
-
 /// The user context as served: the client's guide, when it has one, then
 /// what the memory answered.
 pub fn compose(guide: Option<&Guide>, client: &str, memory: &str) -> String {
@@ -295,14 +145,6 @@ pub fn compose(guide: Option<&Guide>, client: &str, memory: &str) -> String {
     }
 }
 
-/// What the first call of a conversation carries after its own answer.
-pub fn first_call(context: &str) -> String {
-    format!(
-        "Before you answer — this call opens a conversation with this user, so here is what you \
-         know of them (get_user_context answers the same at any time):\n\n{context}"
-    )
-}
-
 /// The text of an answer's first block, if it has one.
 pub fn text_of(answer: &Value) -> Option<&str> {
     answer["content"][0]["text"].as_str()
@@ -311,13 +153,6 @@ pub fn text_of(answer: &Value) -> Option<&str> {
 /// Whether `answer` is an error.
 pub fn is_error(answer: &Value) -> bool {
     answer.get("isError").and_then(Value::as_bool) == Some(true)
-}
-
-/// Add `text` to `answer` as one more text block, after what it says.
-pub fn append(answer: &mut Value, text: &str) {
-    if let Some(blocks) = answer.get_mut("content").and_then(Value::as_array_mut) {
-        blocks.push(json!({"type": "text", "text": text}));
-    }
 }
 
 /// The answer's first text block replaced by `text`.
@@ -333,6 +168,8 @@ pub fn replace_text(answer: &mut Value, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     /// **A listing marks and unmarks only the tools it lists**: one that
@@ -395,6 +232,7 @@ mod tests {
             "repo_task_start",
             "cluster_status",
             "bot_list",
+            REF_SEEN,
         ] {
             assert!(!needs_memory(tool, &none), "{tool}");
         }
@@ -414,31 +252,11 @@ mod tests {
         );
     }
 
-    /// **The context is read alongside a conversation's first call**, never
-    /// beside `get_user_context` itself, which gets the guide in front.
     #[test]
-    fn the_first_call_reads_the_context_and_get_user_context_composes() {
-        assert_eq!(
-            around("image_generate", true),
-            Around {
-                fetch_context: true,
-                compose: false
-            }
-        );
-        assert_eq!(
-            around("image_generate", false),
-            Around {
-                fetch_context: false,
-                compose: false
-            }
-        );
-        assert_eq!(
-            around(GET, true),
-            Around {
-                fetch_context: false,
-                compose: true
-            }
-        );
+    fn only_the_aggregator_calls_its_own_backend_tools() {
+        assert!(is_internal(EPISODE));
+        assert!(is_internal(REF_SEEN));
+        assert!(!is_internal(GET));
     }
 
     /// **Only a backend call that answered, and does more than read, is an
@@ -471,125 +289,6 @@ mod tests {
         }
     }
 
-    /// **The clock is stamped once the conversation has its context** — by
-    /// this answer, an earlier one, or `get_user_context` — so a first call
-    /// whose context could not be read leaves the next call to try again.
-    #[test]
-    fn the_clock_is_stamped_only_once_the_context_was_given() {
-        let stamp = stamps;
-        assert!(stamp("image_generate", true, false, true));
-        assert!(
-            !stamp("image_generate", true, false, false),
-            "not delivered"
-        );
-        assert!(
-            stamp("image_generate", false, false, false),
-            "had it already"
-        );
-        assert!(
-            stamp(GET, true, false, false),
-            "get_user_context is the context"
-        );
-        assert!(!stamp(GET, true, true, false), "a failed one is not");
-    }
-
-    /// **A conversation begins on a session's first call, and only then**:
-    /// however long the session is silent, its next call carries no context
-    /// again.
-    #[test]
-    fn a_conversation_begins_once_per_session() {
-        let c = Conversations::default();
-        let s1 = who("o", "grok", "s1");
-        c.claim(&s1, 1_000).keep(1_000);
-        let again = c.claim(&s1, 2_000);
-        assert!(!again.begins(), "kept, it does not begin again");
-        again.keep(2_000);
-        let hours_later = 2_000 + 6 * 60 * 60 * 1000;
-        assert!(
-            !c.claim(&s1, hours_later).begins(),
-            "a pause is not a new conversation"
-        );
-        assert!(
-            c.claim(&who("o", "grok", "s2"), 2_000).begins(),
-            "a new session"
-        );
-        assert!(c.claim(&who("o", "claude-code", "s1"), 2_000).begins());
-    }
-
-    /// **Calls opening a conversation together have one of them begin it**:
-    /// the context is read once, not after every answer of the opening burst.
-    #[test]
-    fn calls_opening_a_conversation_together_begin_it_once() {
-        let c = Conversations::default();
-        let s = who("o", "claude-code", "s");
-        let burst = [c.claim(&s, 1_000), c.claim(&s, 1_000), c.claim(&s, 1_001)];
-        let begun: Vec<bool> = burst.iter().map(Claim::begins).collect();
-        assert_eq!(begun, [true, false, false]);
-    }
-
-    /// **A claim not kept is given up when it drops** — the client gone, the
-    /// context never read — and the next call begins the conversation; a
-    /// call that never began it keeping its own claim does not take it back.
-    #[test]
-    fn a_claim_not_kept_is_begun_by_the_next_call() {
-        let c = Conversations::default();
-        let s = who("o", "grok", "s");
-        let first = c.claim(&s, 1_000);
-        let beside = c.claim(&s, 1_000);
-        assert!(first.begins() && !beside.begins());
-        drop(first);
-        beside.keep(1_001);
-        assert!(c.claim(&s, 1_002).begins());
-    }
-
-    /// **A call kept beside a first call that fails takes nothing from it**:
-    /// the first call's context was never delivered, so its giving up leaves
-    /// the next call to begin the conversation, though the call beside it
-    /// answered first and moved the clock on.
-    #[test]
-    fn a_failed_first_call_is_begun_again_after_one_beside_it_answered() {
-        let c = Conversations::default();
-        let s = who("o", "grok", "s");
-        let first = c.claim(&s, 1_000);
-        let beside = c.claim(&s, 1_000);
-        assert!(first.begins() && !beside.begins());
-        beside.keep(1_005);
-        drop(first);
-        assert!(c.claim(&s, 1_010).begins());
-    }
-
-    /// **A claim given up leaves a newer one standing**: a call that began
-    /// the conversation again after the first claim was given up keeps its
-    /// own.
-    #[test]
-    fn a_claim_given_up_leaves_a_newer_one() {
-        let c = Conversations::default();
-        let s = who("o", "grok", "s");
-        let slow = c.claim(&s, 1_000);
-        drop(slow);
-        let next = c.claim(&s, 1_001);
-        assert!(next.begins());
-        next.keep(1_002);
-        assert!(!c.claim(&s, 1_003).begins());
-    }
-
-    /// **Past the cap the idlest clock is let go**, and only it.
-    #[test]
-    fn the_idlest_clock_is_let_go_once_many_are_kept() {
-        let c = Conversations::default();
-        for i in 0..CLOCKS_KEPT {
-            c.claim(&format!("old{i}"), i as u64).keep(i as u64);
-        }
-        c.claim("new", CLOCKS_KEPT as u64).keep(CLOCKS_KEPT as u64);
-        assert_eq!(c.0.lock().unwrap().len(), CLOCKS_KEPT);
-        assert!(
-            c.claim("old0", CLOCKS_KEPT as u64 + 1).begins(),
-            "the idlest went"
-        );
-        assert!(!c.claim("old5", CLOCKS_KEPT as u64 + 1).begins());
-        assert!(!c.claim("new", CLOCKS_KEPT as u64 + 1).begins());
-    }
-
     #[test]
     fn the_context_is_the_clients_guide_then_the_memory() {
         let g = Guide {
@@ -608,14 +307,8 @@ mod tests {
     }
 
     #[test]
-    fn a_block_is_appended_after_the_answer_and_the_first_replaced() {
+    fn the_first_block_is_replaced() {
         let mut a = json!({"content": [{"type": "text", "text": "drawn"}], "isError": false});
-        append(&mut a, "context");
-        assert_eq!(
-            a,
-            json!({"content": [{"type": "text", "text": "drawn"}, {"type": "text", "text": "context"}],
-                   "isError": false})
-        );
         replace_text(&mut a, "redrawn");
         assert_eq!(text_of(&a), Some("redrawn"));
         assert!(!is_error(&a));

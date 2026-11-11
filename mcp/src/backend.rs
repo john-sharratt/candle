@@ -16,7 +16,7 @@ use axum::http::header;
 use futures::StreamExt;
 use mcp_server::http::{PROGRESS_EVERY, VERSION_HEADER};
 use mcp_server::listing::TOOLS_VERSION_HEADER;
-use mcp_server::protocol::{text_result, CLIENT_META, MODERN, SESSION_META};
+use mcp_server::protocol::{text_result, CLIENT_META, MODERN, REF_META, SESSION_META};
 use mcp_server::Session;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -58,10 +58,12 @@ impl Backend {
     }
 }
 
-/// The session a request is made on behalf of.
+/// The session a request is made on behalf of, and the conversation it is
+/// in when it names one (`docs/private_mode.md` §3.3).
 pub struct OnBehalf<'a> {
     pub id: &'a str,
     pub session: &'a Session,
+    pub conversation_ref: Option<&'a str>,
 }
 
 /// What one message read off a backend's answer is.
@@ -148,6 +150,9 @@ impl Link {
             CLIENT_META: {"name": on.session.client.name()},
             SESSION_META: on.id,
         });
+        if let Some(r) = on.conversation_ref {
+            meta[REF_META] = json!(r);
+        }
         if progress {
             meta["progressToken"] = json!(1);
         }
@@ -466,6 +471,7 @@ mod tests {
         let on = OnBehalf {
             id: "s1",
             session: &session,
+            conversation_ref: Some("r1"),
         };
         let req = link
             .request(
@@ -496,9 +502,23 @@ mod tests {
                 "_meta": {
                     "io.modelcontextprotocol/clientInfo": {"name": "claude-code"},
                     "com.tokera/session": "s1",
+                    "com.tokera/ref": "r1",
                     "progressToken": 1
                 }
             })
+        );
+        let none = OnBehalf {
+            conversation_ref: None,
+            ..on
+        };
+        let req = link
+            .request(&backend, &backend.path, &caller(), &none, "tools/list", json!({}), false)
+            .build()
+            .unwrap();
+        let body: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(
+            body["params"]["_meta"].get("com.tokera/ref").is_none(),
+            "a request in no conversation names none"
         );
     }
 

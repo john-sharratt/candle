@@ -1,5 +1,5 @@
 //! `user_episode_note {tool, summary?}`: note that a tool did something for
-//! the user, through this session's channel, for this conversation's
+//! the user, through this call's channel, for its conversation's
 //! `journal.yaml` (`docs/mcp_user_context.md` §2.3,
 //! `docs/zen_memory_and_guides.md` D3) — its activity, never a line of its
 //! own. The aggregator calls it by name after each call that changed
@@ -42,7 +42,9 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(m) => m,
         Err(e) => return Answer::error(e),
     };
-    let (Some(_), Some(path)) = (m.person(), m.here.clone()) else {
+    let (Some(_), Some(path), Some(conversation)) =
+        (m.person(), m.here.clone(), m.conversation.clone())
+    else {
         return Answer::ok(format!("Not recorded: {}.", m.why_no_here()));
     };
     // What a call was asked is the model's own words: when they read as an
@@ -53,7 +55,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     ctx.session.mcp().noted().note(
         &ctx.caller,
-        &ctx.mcp_id,
+        &conversation,
         m.channel,
         Call {
             at: Stamp::now(),

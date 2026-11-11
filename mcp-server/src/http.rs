@@ -274,6 +274,7 @@ async fn answer_post<S: Server>(
         headers,
         session_id,
         session,
+        conversation_ref: protocol::conversation_ref(&params).map(str::to_string),
         store,
         progress: None,
     };

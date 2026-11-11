@@ -18,8 +18,9 @@
 
 use std::collections::HashMap;
 use std::mem;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use mcp_server::refs::Refs;
 use mcp_server::session::TOUCH_EVERY_MS;
 use mcp_server::{Client, Session, Store};
 use tokio::sync::watch;
@@ -183,14 +184,15 @@ impl<R: Records> Store for RecordStore<R> {
 }
 
 /// What `/v1/mcp` holds in memory: the change signal, the runner of the ops
-/// tools, the memory backbone, the sessions' noted use, and the calls noted
-/// for their conversations' activity.
+/// tools, the memory backbone, the sessions' noted use, the calls noted for
+/// their conversations' activity, and the key conversation refs open under.
 pub struct McpState {
     changed: watch::Sender<u64>,
     ops: Arc<OpsTools>,
     memory: Arc<Memory>,
     used: Arc<Used>,
     noted: NotedCalls,
+    refs: OnceLock<Refs>,
 }
 
 impl Default for McpState {
@@ -201,11 +203,28 @@ impl Default for McpState {
             memory: Arc::default(),
             used: Arc::default(),
             noted: NotedCalls::default(),
+            refs: OnceLock::new(),
         }
     }
 }
 
 impl McpState {
+    /// Open conversation refs with `refs`, whose key every member and both
+    /// aggregators derive from the group key (`docs/private_mode.md` §3.1):
+    /// installed at load, before any call is served.
+    pub fn install_refs(&self, refs: Refs) {
+        if self.refs.set(refs).is_err() {
+            tracing::warn!("mcp: the conversation refs' key was already set; this one is not used");
+        }
+    }
+
+    /// What conversation refs are issued and opened with: the installed key,
+    /// or — for a daemon with no cluster, which no aggregator stands in front
+    /// of — one of this process's own.
+    pub fn refs(&self) -> &Refs {
+        self.refs.get_or_init(Refs::minted)
+    }
+
     /// The calls that changed something, waiting to be written into their
     /// conversations' activity.
     pub fn noted(&self) -> &NotedCalls {

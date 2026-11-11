@@ -130,9 +130,11 @@ streams becomes a step of the aggregator's own call, which the client sees as
 a progress notification. The backend's result is the answer.
 
 **Sessions.** Every backend is spoken to in the 2026-07-28 protocol, which
-keeps no handshake session to lose. Each request carries two things in its
-`_meta`: the caller's client, in `io.modelcontextprotocol/clientInfo`, and the
-aggregator's own session id, in `com.tokera/session`. The backend keys what it
+keeps no handshake session to lose. Each request carries in its `_meta` the
+caller's client, in `io.modelcontextprotocol/clientInfo`, the aggregator's own
+session id, in `com.tokera/session`, and — for every call but a listing — the
+conversation's ref, in `com.tokera/ref` (`docs/private_mode.md` §3.3), which
+is what a conversation is kept by. The backend keys what it
 holds by person, client and that session (`mcp_server::stateless_key`). So two
 claude.ai conversations of one person, each a session of the aggregator's, are
 two sessions at zend, each with its own attached thread. The aggregator holds

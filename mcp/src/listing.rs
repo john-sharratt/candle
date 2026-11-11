@@ -63,9 +63,17 @@ impl Listing {
     }
 }
 
-/// What a call of `name` with `args` that answered leaves to record, decided
-/// and recorded in the background: the call's answer is never held for it.
-pub fn record_later(this: &Arc<App>, call: &Call<App>, name: &str, args: &Value) {
+/// What a call of `name` with `args` that answered, in the conversation
+/// `conversation_ref` names, leaves to record — on that conversation —
+/// decided and recorded in the background: the call's answer is never held
+/// for it.
+pub fn record_later(
+    this: &Arc<App>,
+    call: &Call<App>,
+    name: &str,
+    args: &Value,
+    conversation_ref: String,
+) {
     let this = Arc::clone(this);
     let caller = call.caller.clone();
     let id = call.session_id.clone();
@@ -76,6 +84,7 @@ pub fn record_later(this: &Arc<App>, call: &Call<App>, name: &str, args: &Value)
         let on = OnBehalf {
             id: &id,
             session: &session,
+            conversation_ref: Some(&conversation_ref),
         };
         this.listing
             .ensure(async {

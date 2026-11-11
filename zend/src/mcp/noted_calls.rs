@@ -22,12 +22,12 @@ use crate::session::ZendSession;
 /// How often the noted calls are written.
 pub const WRITE_EVERY: Duration = Duration::from_secs(60);
 
-/// One conversation's calls not yet written, and who made them through
-/// which session, which is what opens the conversation's journal.
+/// One conversation's calls not yet written, and who made them in which
+/// conversation, by its ref's key — what opens the conversation's journal.
 #[derive(Clone, Debug)]
 struct Noted {
     caller: Caller,
-    mcp_id: String,
+    conversation: String,
     channel: Channel,
     calls: Vec<Call>,
 }
@@ -36,10 +36,10 @@ struct Noted {
 #[derive(Default)]
 pub struct NotedCalls(Mutex<HashMap<String, Noted>>);
 
-/// What names a conversation's calls: who, through which session and
-/// channel — as the conversation's journal is found.
-fn key(caller: &Caller, mcp_id: &str, channel: Channel) -> String {
-    format!("{}\0{mcp_id}\0{}", caller.key(), channel.name())
+/// What names a conversation's calls: who, in which conversation, through
+/// which channel — as the conversation's journal is found.
+fn key(caller: &Caller, conversation: &str, channel: Channel) -> String {
+    format!("{}\0{conversation}\0{}", caller.key(), channel.name())
 }
 
 /// `calls` cut to the newest an activity record keeps.
@@ -49,14 +49,14 @@ fn newest(calls: &mut Vec<Call>) {
 }
 
 impl NotedCalls {
-    /// Note `call`, made by `caller` through `channel` on `mcp_id`.
-    pub fn note(&self, caller: &Caller, mcp_id: &str, channel: Channel, call: Call) {
+    /// Note `call`, made by `caller` through `channel` in `conversation`.
+    pub fn note(&self, caller: &Caller, conversation: &str, channel: Channel, call: Call) {
         let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let n = held
-            .entry(key(caller, mcp_id, channel))
+            .entry(key(caller, conversation, channel))
             .or_insert_with(|| Noted {
                 caller: caller.clone(),
-                mcp_id: mcp_id.to_string(),
+                conversation: conversation.to_string(),
                 channel,
                 calls: Vec::new(),
             });
@@ -72,11 +72,11 @@ impl NotedCalls {
     /// Hold `n` again, before whatever was noted for it since it was taken.
     fn keep(&self, mut n: Noted) {
         let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(since) = held.remove(&key(&n.caller, &n.mcp_id, n.channel)) {
+        if let Some(since) = held.remove(&key(&n.caller, &n.conversation, n.channel)) {
             n.calls.extend(since.calls);
         }
         newest(&mut n.calls);
-        held.insert(key(&n.caller, &n.mcp_id, n.channel), n);
+        held.insert(key(&n.caller, &n.conversation, n.channel), n);
     }
 
     /// How many conversations have calls waiting.
@@ -114,7 +114,7 @@ pub fn write_noted(session: &ZendSession, noted: &NotedCalls) -> (usize, usize, 
 }
 
 fn write_one(session: &ZendSession, n: &Noted) -> Wrote {
-    let m = match open_for(session, &n.caller, n.channel, &n.mcp_id) {
+    let m = match open_for(session, &n.caller, n.channel, Some(n.conversation.clone())) {
         Ok(m) => m,
         Err(e) => {
             tracing::info!("journals: noted calls wait for the memory: {e}");
@@ -179,7 +179,7 @@ mod tests {
     }
 
     /// **A conversation's calls are held together, newest last, at most as
-    /// many as its record keeps**; another session's are held apart.
+    /// many as its record keeps**; another conversation's are held apart.
     #[test]
     fn calls_are_held_by_conversation_and_capped() {
         let noted = NotedCalls::default();
@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(noted.waiting(), 0);
         let grok = taken
             .iter()
-            .find(|n| n.mcp_id == "s1" && n.channel == Channel::Grok)
+            .find(|n| n.conversation == "s1" && n.channel == Channel::Grok)
             .unwrap();
         assert_eq!(grok.calls.len(), MAX_DONE);
         assert_eq!(grok.calls[0], call("log_grep", 3), "the oldest let go");

@@ -13,9 +13,10 @@
 //! | [`caller`] | Who is calling, from the believed headers |
 //! | [`presence`] | The cluster socket: joining as `mcp`, and serving its streams |
 //! | [`guides`] | The guide library: the methods for using the tools, served as tools |
-//! | [`context`] | The user's context: the client's guide, the first call's context, episodes |
+//! | [`context`] | The user's context: the client's guide, and episodes |
+//! | [`conversation`] | A call's `ref`: taken from its arguments, required by every tool's schema |
+//! | [`liveness`] | Each conversation ref's last use as this process saw it |
 //! | [`routes`] | Which backend runs each tool, learned from every listing and kept across restarts |
-//! | [`reading`] | The context reads a first call answered ahead of, for the conversation's next call |
 //! | [`config`] | Each machine's file, and the `served` file they share |
 
 use std::collections::BTreeSet;
@@ -44,22 +45,28 @@ mod believed;
 mod caller;
 mod config;
 mod context;
+mod conversation;
+#[cfg(test)]
+mod conversation_tests;
+#[cfg(test)]
+mod fake;
 mod guides;
 mod last_listed;
 mod listing;
+mod liveness;
 mod presence;
-mod reading;
 mod routes;
 mod served;
 mod sse;
 
 use app::App;
 use backend::{Backend, Link};
+use cluster::handshake::GroupKey;
 use config::Config;
-use context::Conversations;
 use last_listed::LastListed;
 use listing::Listing;
-use reading::Readings;
+use liveness::Seen;
+use mcp_server::refs::{self, Refs};
 use routes::Routes;
 use served::Served;
 
@@ -100,6 +107,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .with(to_file)
         .init();
+    // zend issues conversation refs under a key every member derives from
+    // the group key; both aggregators open them under the same.
+    let group = GroupKey::load(&config.cluster.group_key)
+        .map_err(|e| anyhow::anyhow!("group key: {e}"))?;
     let app = Arc::new(App {
         identity: config.identity(),
         store: Arc::new(SealedStore),
@@ -122,8 +133,8 @@ async fn main() -> anyhow::Result<()> {
         served: Served::default(),
         library: guides::embedded()?,
         read_only: RwLock::new(BTreeSet::new()),
-        conversations: Conversations::default(),
-        readings: Readings::default(),
+        refs: Refs::new(group.derive(refs::PURPOSE)),
+        seen: Seen::default(),
         listing: Listing::default(),
     });
     tracing::info!(guides = app.library.count(), "guides loaded");

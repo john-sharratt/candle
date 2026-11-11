@@ -23,8 +23,8 @@ pub fn definitions(library: &Library) -> Vec<Value> {
                 "List the guides: the methods for doing work well with these tools — delegating, \
                  waiting, verifying, research, code review, deploying, managing bots and more — each \
                  with when to use it. Call this once at the start of any conversation that uses \
-                 these tools, before starting work, then read the guide for the work with \
-                 guide_read. Guides: {}.",
+                 these tools, after get_user_context and before starting work, then read the \
+                 guide for the work with guide_read. Guides: {}.",
                 library.names().join(", ")
             ),
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}

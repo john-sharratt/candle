@@ -37,6 +37,7 @@ pub fn apply(store: &mut Store, person: &Slug, body: &Value, now: Stamp) -> Resu
         who: Who::Person(person.clone()),
         channel: req.channel,
         admin: true,
+        conversation: None,
         here: None,
     };
     let (status, answer) = batch(&m, &req.ops, now, req.speaker.as_ref(), |actor, op, at| {

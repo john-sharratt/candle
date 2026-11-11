@@ -28,6 +28,8 @@
 //! | [`caller`] | Who is calling, and the key their records are kept under |
 //! | [`ownership`] | Who may open a worker's conversation on zend's other routes |
 //! | [`records`] | The small records kept in the substrate |
+//! | [`begin`] | Which conversation a `get_user_context` begins or goes on with (`docs/private_mode.md` §3) |
+//! | [`ref_records`] | Each conversation ref's last use, read by every member and both aggregators |
 //! | [`state`] | Sessions as records, the attached thread, the change signal |
 //! | [`tending`] | The sessions' noted use written in, and the stale swept, off the request path |
 //! | [`chats`] | Zen chat: a private conversation named by its id, disposed of when closed or idle (`docs/zen_chat.md`) |
@@ -38,6 +40,7 @@ pub mod activity;
 pub mod approvals;
 pub mod archiving;
 pub mod audit;
+pub mod begin;
 pub mod caller;
 pub mod chats;
 pub mod driven;
@@ -53,6 +56,7 @@ pub mod ops_tools;
 pub mod outcomes;
 pub mod ownership;
 pub mod records;
+pub mod ref_records;
 pub mod reported;
 pub mod resuming;
 pub mod roles;

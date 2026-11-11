@@ -98,11 +98,17 @@ impl Server for ZendSession {
     }
 
     async fn call(this: &Arc<Self>, call: &Call<Self>, name: &str, args: &Value) -> Answer {
+        let owner = call.caller.key();
+        let conversation = call
+            .conversation_ref
+            .as_deref()
+            .and_then(|text| this.mcp().refs().open(&owner, text).ok());
         let ctx = Ctx {
             session: Arc::clone(this),
             caller: call.caller.clone(),
             mcp: call.session.clone(),
             mcp_id: call.session_id.clone(),
+            conversation,
             store: Arc::clone(&call.store),
             progress: call.progress.clone(),
         };

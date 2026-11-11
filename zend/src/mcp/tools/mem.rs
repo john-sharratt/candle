@@ -17,6 +17,7 @@ use journals::time::Stamp;
 use journals::tree::Tree;
 use journals::view::index::{index, refs_lines};
 use journals::view::who::name_of;
+use mcp_server::refs::Ref;
 use mcp_server::Client as McpClient;
 
 use super::Ctx;
@@ -37,6 +38,10 @@ pub const PATHS: &str = "A memory path starts at `@<group>`, or is bare for this
 pub const APPEND_ONLY: &str =
     "The tools only add: moving, merging, renaming or splitting journals is a \
     coding task, `repo_task_start` on the `journals` checkout.";
+
+/// Why a call that names no conversation has no journal of its own.
+pub const NO_CONVERSATION: &str = "this call names no conversation: get_user_context answers \
+    this conversation's ref, to pass as `ref` on every call";
 
 /// Why a path or an address names no journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +84,9 @@ pub struct Mem {
     /// The group paths are written from: the conversation's, else the
     /// person's home group; `@guest` for a guest.
     pub group: Option<Slug>,
+    /// The conversation the call is in, by its ref's key
+    /// (`docs/private_mode.md` §3.1): none for a call that names no ref.
+    pub conversation: Option<String>,
     /// This conversation's journal, once the person has a group to hold it.
     pub here: Option<JournalPath>,
 }
@@ -88,56 +96,70 @@ pub fn channel_of(c: McpClient) -> Channel {
     Channel::parse(c.name()).unwrap_or(Channel::Other)
 }
 
-/// The caller through an MCP session, for a call that only reads: who they
-/// are and this session's conversation as the tree already has them. It
-/// writes nothing — no account is bound and no conversation opened — so a
-/// read never waits on a commit. `here` names the conversation's journal
-/// whether or not a write has opened it yet.
+/// The caller, for a call that only reads: who they are and the call's
+/// conversation as the tree already has them. It writes nothing — no account
+/// is bound and no conversation opened — so a read never waits on a commit.
+/// `here` names the conversation's journal whether or not a write has opened
+/// it yet.
 pub fn read(ctx: &Ctx) -> Result<Mem, String> {
+    read_in(ctx, ctx.conversation.as_ref().map(Ref::conversation))
+}
+
+/// [`read`] in `conversation`, by its ref's key: what `get_user_context`
+/// reads with for the ref it is answering.
+pub fn read_in(ctx: &Ctx, conversation: Option<String>) -> Result<Mem, String> {
     let mut m = Mem::reading(&ctx.session, &ctx.caller, channel_of(ctx.mcp.client))?;
-    if let (Who::Person(person), Some(group)) = (&m.who, &m.group) {
+    m.conversation = conversation;
+    if let (Who::Person(person), Some(group), Some(conversation)) =
+        (&m.who, &m.group, &m.conversation)
+    {
         if writes_in(&m.tree, person, group) {
-            let followed = conversations::followed_by(m.channel, person, group, &ctx.mcp_id);
             let records = ctx.session.shared_substrate();
             let records = records.as_ref().map(|r| r as &dyn Records);
             m.here = Some(conversations::here(
-                &m.memory, records, group, m.channel, &followed,
+                &m.memory,
+                records,
+                group,
+                m.channel,
+                conversation,
             )?);
         }
     }
     Ok(m)
 }
 
-/// The caller through an MCP session, for a call that writes: [`Mem::of`],
-/// in this session's conversation — opened at its first write (§6.6), for a
-/// person who writes in their group. A reader writes nothing there, not even
-/// a conversation of their own. A conversation that could not be opened
-/// leaves the call without it: what fails is the write that needs it.
+/// The caller, for a call that writes: [`Mem::of`], in the call's
+/// conversation — opened at its first write (§6.6), for a person who writes
+/// in their group. A reader writes nothing there, not even a conversation of
+/// their own. A conversation that could not be opened leaves the call
+/// without it: what fails is the write that needs it.
 pub fn open(ctx: &Ctx) -> Result<Mem, String> {
     open_for(
         &ctx.session,
         &ctx.caller,
         channel_of(ctx.mcp.client),
-        &ctx.mcp_id,
+        ctx.conversation.as_ref().map(Ref::conversation),
     )
 }
 
-/// [`open`] for `caller` through `channel` on the MCP session `mcp_id`,
-/// where no call is in hand: what a conversation's noted calls are written
-/// with, off the request path.
+/// [`open`] for `caller` through `channel` in `conversation`, by its ref's
+/// key, where no call is in hand: what a conversation's noted calls are
+/// written with, off the request path.
 pub fn open_for(
     session: &ZendSession,
     caller: &Caller,
     channel: Channel,
-    mcp_id: &str,
+    conversation: Option<String>,
 ) -> Result<Mem, String> {
     let mut m = Mem::of(session, caller, channel)?;
-    if let (Who::Person(person), Some(group)) = (&m.who, &m.group) {
+    m.conversation = conversation;
+    if let (Who::Person(person), Some(group), Some(conversation)) =
+        (&m.who, &m.group, &m.conversation)
+    {
         if writes_in(&m.tree, person, group) {
-            let followed = conversations::followed_by(m.channel, person, group, mcp_id);
             let records = session.shared_substrate();
             let records = records.as_ref().map(|r| r as &dyn Records);
-            match conversations::open(&m.memory, records, person, group, m.channel, &followed) {
+            match conversations::open(&m.memory, records, person, group, m.channel, conversation) {
                 Ok(here) => {
                     m.tree = m.memory.tree()?;
                     m.here = Some(here);
@@ -202,6 +224,7 @@ impl Mem {
             channel,
             admin: caller.is_admin(),
             group,
+            conversation: None,
             here: None,
         })
     }
@@ -216,6 +239,7 @@ impl Mem {
             channel: self.channel,
             admin: self.admin,
             group: self.group.clone(),
+            conversation: self.conversation.clone(),
             here: self.here.clone(),
         }
     }
@@ -235,6 +259,9 @@ impl Mem {
             return "this account is mapped to no one, so it reads @guest and writes nothing"
                 .into();
         };
+        if self.conversation.is_none() {
+            return NO_CONVERSATION.into();
+        }
         let groups = groups_of(&self.tree, person);
         match (&self.group, groups.as_slice()) {
             (_, []) => "you are in no group yet: an owner adds you with group_add".into(),
@@ -455,6 +482,7 @@ pub(crate) mod tests {
             channel: Channel::Grok,
             admin: person == "john",
             group,
+            conversation: Some("c0ffee00c0ffee00".into()),
             here: None,
         }
     }

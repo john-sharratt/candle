@@ -127,9 +127,14 @@ fn session() -> (Vec<TempDir>, Ctx) {
     let records = session.shared_substrate().unwrap();
     let store: Arc<dyn Store> =
         Arc::new(RecordStore::new(records, Arc::clone(session.mcp().used())));
+    let (_, conversation) = session
+        .mcp()
+        .refs()
+        .issue(&caller.key(), false, now_ms());
     let ctx = Ctx {
         mcp: Session::new(&caller.key(), Client::ClaudeCode, MODERN, now_ms()),
         mcp_id: "latency".into(),
+        conversation: Some(conversation),
         session,
         caller,
         store,
@@ -144,6 +149,16 @@ fn session() -> (Vec<TempDir>, Ctx) {
 fn round(i: usize, chat: &str) -> Vec<(&'static str, &'static str, Value)> {
     vec![
         ("get_user_context", "get_user_context", json!({})),
+        (
+            "conversation_ref_seen told",
+            "conversation_ref_seen",
+            json!({"used_ms": now_ms()}),
+        ),
+        (
+            "conversation_ref_seen asked",
+            "conversation_ref_seen",
+            json!({}),
+        ),
         (
             "thread_attach",
             "thread_attach",

@@ -78,6 +78,7 @@ use journal_core::transcript::{Filed, Hits, Miss, Page};
 use journals::ops::wire::path_from_wire;
 use journals::path::JournalPath;
 use journals::time::Stamp;
+use mcp_server::refs::{self, Refs};
 use serde_json::{json, Value};
 use web::auth::{Role as AccessRole, Roles};
 use zend_tools::run_watch::{self, RunWatch};
@@ -3200,6 +3201,11 @@ impl InferenceState {
         // A conversation is this member's for one turn at a time, and what it
         // keeps of one goes when the conversation does.
         if let Some(join) = cluster.as_ref() {
+            // A ref one member or aggregator issued, any other opens
+            // (`docs/private_mode.md` §3.1).
+            state
+                .mcp()
+                .install_refs(Refs::new(join.derive_key(refs::PURPOSE)));
             if let Some(member) = join.link().member() {
                 let held = Arc::downgrade(&state);
                 turn_claims::install(Arc::clone(member), move |key| {

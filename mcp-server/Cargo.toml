@@ -7,6 +7,11 @@ description = "An MCP server, once: JSON-RPC, both protocol eras, sessions, the 
 [dependencies]
 anyhow       = { workspace = true }
 axum         = { version = "0.7" }
+# Conversation refs (`src/refs.rs`): base64url, HMAC-SHA256, random ids.
+base64       = { workspace = true }
+hmac         = "0.12"
+rand         = { workspace = true }
+sha2         = "0.10"
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 tokio        = { version = "1", features = ["rt", "macros", "sync", "time"] }

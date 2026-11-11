@@ -26,6 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use mcp_server::refs::Ref;
 use mcp_server::{protocol, Session, Store};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
@@ -74,6 +75,7 @@ pub mod member_memory;
 pub mod member_status;
 pub mod note_terms;
 mod nudge;
+mod ref_seen;
 mod reply;
 pub mod repo_job;
 pub mod service;
@@ -101,6 +103,10 @@ pub struct Ctx {
     /// The MCP session the call came on, its id, and where it is kept.
     pub mcp: Session,
     pub mcp_id: String,
+    /// The conversation the call is in: the ref the aggregator passed on,
+    /// opened for this caller (`docs/private_mode.md` §3.3). A call reaching
+    /// zend directly, or naming a ref that does not open, has none.
+    pub conversation: Option<Ref>,
     pub store: Arc<dyn Store>,
     /// Where the call says each step of the work it waits on: the call's event
     /// stream, when it is answered on one.
@@ -240,6 +246,7 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
     match name {
         user_context::NAME => blocking(ctx, args, user_context::call).await,
         user_episode::NAME => blocking(ctx, args, user_episode::call).await,
+        ref_seen::NAME => blocking(ctx, args, ref_seen::call).await,
         journal_forget::NAME => blocking(ctx, args, journal_forget::call).await,
         attach::NAME => blocking(ctx, args, attach::call).await,
         task::NAME => task::call(ctx, args).await,

@@ -53,6 +53,9 @@ pub struct Call<S: Server + ?Sized> {
     pub headers: HeaderMap,
     pub session_id: String,
     pub session: Session,
+    /// The conversation ref a server in front named for this call, as
+    /// written and unopened (`docs/private_mode.md` §3.3).
+    pub conversation_ref: Option<String>,
     pub store: Arc<dyn Store>,
     /// The call's event stream, when it is answered on one: each line sent is
     /// a progress notification.
