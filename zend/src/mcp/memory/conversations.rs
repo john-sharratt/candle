@@ -202,10 +202,7 @@ pub fn open(
     let op = Op::Create {
         under: section(group),
         name,
-        cue: format!(
-            "open for the conversation through {} begun {when}",
-            channel.spoken()
-        ),
+        cue: format!("open for the conversation begun {when}"),
         on_taken: OnTaken::Number,
     };
     let path = memory

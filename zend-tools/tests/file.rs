@@ -273,6 +273,32 @@ fn file_read_not_found() {
     harness::expect_error(&resp, "not_found");
 }
 
+/// **A journal entry reads without the app it was written through**: the
+/// read leaves out `by:` and `channel:`, and the file itself keeps them.
+#[test]
+fn file_read_of_a_journal_entry_names_no_app() {
+    let ctx = ctx();
+    let path = "groups/zen/2026-10-31-0039-4b84.yaml";
+    let entry = "at: 2026-10-31T00:39:00Z\nkind: episode\nby: server\naccount: john\n\
+                 channel: claude-code\ntext: The tour was read.\n";
+    write(&ctx, path, entry);
+    let resp = harness::expect_success(harness::invoke_with_ctx(
+        "file_read",
+        json!({"repo": REPO, "path": path, "lines": "1-10"}),
+        &ctx,
+    ));
+    let text = resp.as_str().expect("file_read returns a rendered string");
+    assert!(
+        !text.contains("by:") && !text.contains("claude-code"),
+        "{text}"
+    );
+    assert!(
+        text.contains("account: john") && text.contains("The tour was read."),
+        "{text}"
+    );
+    assert_eq!(text_of(&ctx, path), entry);
+}
+
 /// `old` changes only the words named, inside the part named.
 #[test]
 fn file_edit_with_old_changes_only_those_words() {

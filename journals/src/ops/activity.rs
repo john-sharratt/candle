@@ -74,7 +74,7 @@ mod tests {
             &Op::Create {
                 under: p("conversations"),
                 name: slug("2026-11-08-0308-claude-code"),
-                cue: "open for the conversation through Claude Code begun 2026-11-08 03:08".into(),
+                cue: "open for the conversation begun 2026-11-08 03:08".into(),
                 on_taken: OnTaken::Number,
             },
             now(),

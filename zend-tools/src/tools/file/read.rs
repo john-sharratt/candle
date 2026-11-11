@@ -1,6 +1,7 @@
 //! file_read tool.
 
 use doc_units::Doc;
+use journals::view::entry_file::{is_entry, shown};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use validator::Validate;
@@ -153,6 +154,11 @@ impl Tool for FileRead {
             .repo(&req.repo)?
             .read(&req.path)?
             .ok_or_else(|| FileError::NotFound(req.path.clone()))?;
+        // A journal entry is read as its views show it: by the person, not the app.
+        let content = match is_entry(&req.path) {
+            true => shown(&content),
+            false => content,
+        };
         let doc = Doc::new(&req.path, &content);
         Ok(match what {
             What::Part(anchor) => match doc.find(anchor) {

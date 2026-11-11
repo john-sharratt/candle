@@ -1,6 +1,7 @@
-//! How a line's writer and time read: "Yen via Grok on John's account",
-//! "John via Claude Code", "the server for John via Grok", "Zen" — and how
-//! long ago.
+//! How a line's writer and time read: "Yen on John's account", "John", "the
+//! server for John", "Zen" — and how long ago. A line names the person who
+//! wrote it, never the app they wrote through: the channel a line records is
+//! the store's, and no reader is shown it.
 
 use crate::line::{Line, Writer};
 use crate::slug::Slug;
@@ -14,22 +15,19 @@ pub fn name_of(tree: &Tree, person: &Slug) -> String {
         .unwrap_or_else(|| person.to_string())
 }
 
-/// Who wrote `line`, for whom, through what. The speaker is named first when
-/// the focus had one; the account it came through is said when it is
-/// someone else's (§3.2).
+/// Who wrote `line`, and for whom. The speaker is named first when the focus
+/// had one; the account it came through is said when it is someone else's
+/// (§3.2).
 pub fn who(tree: &Tree, line: &Line) -> String {
     let account = line.account.as_ref().map(|p| name_of(tree, p));
     let speaker = line.speaker.as_ref().map(|p| name_of(tree, p));
     match (line.by, account) {
-        (Writer::Channel(c), account) => match (speaker, account) {
-            (Some(s), Some(a)) if s != a => format!("{s} via {} on {a}'s account", c.spoken()),
-            (Some(s), _) | (None, Some(s)) => format!("{s} via {}", c.spoken()),
-            (None, None) => c.spoken().to_string(),
+        (Writer::Channel(_), account) => match (speaker, account) {
+            (Some(s), Some(a)) if s != a => format!("{s} on {a}'s account"),
+            (Some(s), _) | (None, Some(s)) => s,
+            (None, None) => "a guest".to_string(),
         },
-        (Writer::Server, Some(a)) => match line.channel {
-            Some(c) => format!("the server for {a} via {}", c.spoken()),
-            None => format!("the server for {a}"),
-        },
+        (Writer::Server, Some(a)) => format!("the server for {a}"),
         (Writer::Worker, Some(a)) => format!("a worker for {a}"),
         (Writer::Npcd, Some(a)) => format!("npcd for {a}"),
         (Writer::Zend, _) => "Zen".to_string(),
@@ -54,7 +52,7 @@ pub fn minute(at: Stamp) -> String {
     format!("{} {}", &s[..10], &s[11..16])
 }
 
-/// One line as a reader sees it: `#id 2026-10-30 09:12 note, Yen via Grok: text`.
+/// One line as a reader sees it: `#id 2026-10-30 09:12 note, Yen: text`.
 pub fn render_line(tree: &Tree, line: &Line) -> String {
     let kind = if line.proposed {
         "proposal"
@@ -77,24 +75,26 @@ mod tests {
     use crate::scope::Channel;
     use crate::testing::{at, note, slug};
 
+    /// **A line names who wrote it, never the app**: the channel it records
+    /// is said by no reading of it.
     #[test]
     fn writers_read_as_who_they_are() {
         let t = zen();
         let mut l = note("2026-10-30T09:12:00Z", "x");
-        assert_eq!(who(&t, &l), "john via Claude Code");
+        assert_eq!(who(&t, &l), "john");
         l.speaker = Some(slug("john"));
-        assert_eq!(who(&t, &l), "john via Claude Code", "his own account");
+        assert_eq!(who(&t, &l), "john", "his own account");
         l.by = Writer::Channel(Channel::Grok);
         l.speaker = Some(slug("yen"));
-        assert_eq!(who(&t, &l), "yen via Grok on john's account");
+        assert_eq!(who(&t, &l), "yen on john's account");
         l.account = None;
-        assert_eq!(who(&t, &l), "yen via Grok");
+        assert_eq!(who(&t, &l), "yen");
         l.speaker = None;
-        assert_eq!(who(&t, &l), "Grok");
+        assert_eq!(who(&t, &l), "a guest");
         l.by = Writer::Server;
         l.account = Some(slug("john"));
         l.channel = Some(Channel::Grok);
-        assert_eq!(who(&t, &l), "the server for john via Grok");
+        assert_eq!(who(&t, &l), "the server for john");
         l.by = Writer::Zend;
         l.account = None;
         assert_eq!(who(&t, &l), "Zen");
@@ -127,10 +127,7 @@ mod tests {
         l.proposed = true;
         assert_eq!(
             render_line(&t, &l),
-            format!(
-                "#{} 2026-10-30 09:12 proposal, john via Claude Code: Prefers tea.",
-                l.id
-            )
+            format!("#{} 2026-10-30 09:12 proposal, john: Prefers tea.", l.id)
         );
     }
 }

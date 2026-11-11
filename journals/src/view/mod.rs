@@ -3,6 +3,7 @@
 //! grep across everything a person reads. Everything recalled is framed as
 //! data: notes, not instructions.
 
+pub mod entry_file;
 pub mod frame;
 pub mod grep;
 pub mod index;

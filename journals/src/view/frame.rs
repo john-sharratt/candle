@@ -9,7 +9,7 @@
 use crate::actor::grants_of_bot;
 use crate::files::Focus;
 use crate::path::{JournalPath, Place};
-use crate::scope::{conversation_channel, Channel, Section};
+use crate::scope::{conversation_channel, Section};
 use crate::slug::Slug;
 use crate::terms::shown;
 use crate::time::Stamp;
@@ -367,11 +367,7 @@ pub fn frame(
         }
     }
     if let Some((p, s)) = at.and_then(|a| last_time(tree, a)) {
-        let channel = at
-            .and_then(|a| a.last())
-            .and_then(|n| conversation_channel(n.as_str()))
-            .map_or("this channel", Channel::spoken);
-        f.push(&format!("Last time on {channel}, {p}: {s}"));
+        f.push(&format!("Last time, {p}: {s}"));
     }
     // Last, in what is left: the cues of the journals the indexes name only
     // by name, so a reader picks one from the frame.
@@ -500,6 +496,7 @@ mod tests {
     use crate::files::summary::{Cite, Sentence};
     use crate::ops::fixture::{john, now, p, zen};
     use crate::ops::{apply, Call, OnTaken, Op};
+    use crate::scope::Channel;
     use crate::terms::Terms;
     use crate::testing::slug;
     use crate::tree::fingerprint::fingerprint;
@@ -852,9 +849,9 @@ mod tests {
             "This conversation, @zen/conversations/2026-10-30-0800-grok (here):",
             "  Focus: yen is speaking; it is about topics/candle.",
             "Speaking, @zen/people/yen: Yen runs the extension.",
-            "note, john via Claude Code: Yen prefers mornings.",
+            "note, john: Yen prefers mornings.",
             "About: @zen/topics/candle: nothing summarised yet.",
-            "Last time on Grok, @zen/conversations/2026-10-29-0800-grok: They drew a cat together.",
+            "Last time, @zen/conversations/2026-10-29-0800-grok: They drew a cat together.",
             "Below @zen, by cue:",
             "  - @zen/people/builder — open for the extension's builder",
             "  - @zen/topics/candle — open for the inference engine",

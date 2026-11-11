@@ -159,7 +159,8 @@ pub enum Eleventh {
 
 /// A channel: the client app a conversation comes through, named as
 /// `mcp_server::Client::name` names it. Not a journal: it is recorded on the
-/// lines it wrote and in each conversation's name (§2.1).
+/// lines it wrote and in each conversation's name (§2.1), for the store — no
+/// view of a line says it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Channel {
     ClaudeCode,
@@ -192,17 +193,6 @@ impl Channel {
 
     pub fn parse(s: &str) -> Option<Channel> {
         Self::ALL.into_iter().find(|c| c.name() == s)
-    }
-
-    /// How a line written through it reads: "via Claude Code".
-    pub fn spoken(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "Claude Code",
-            Self::Grok => "Grok",
-            Self::ClaudeAi => "claude.ai",
-            Self::Zen => "Zen",
-            Self::Other => "another app",
-        }
     }
 }
 

@@ -193,11 +193,7 @@ mod tests {
             "  - → household (people) — open for who is in the household"
         );
         assert_eq!(lines[7], "Lines (the newest 2 of 3):");
-        assert!(
-            lines[8].ends_with("note, john via Claude Code: Note 1."),
-            "{}",
-            lines[8]
-        );
+        assert!(lines[8].ends_with("note, john: Note 1."), "{}", lines[8]);
         assert!(lines[9].ends_with("Note 2."));
         assert!(
             lines[10].starts_with("Older lines: page on with `after: @zen#")

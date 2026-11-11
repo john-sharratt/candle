@@ -453,9 +453,12 @@ the same fields: `{at: …, kind: note, text: "…"}` on one line reads as well.
     has one.
   - `channel`: the client app, on an episode.
 
-  A line reads "Yen, via Grok on John's account". When the speaker is the
-  account's own person, it reads "John, via Claude Code". The commit says the
-  rest (§7.1).
+  A line reads "Yen on John's account". When the speaker is the account's own
+  person, it reads "John". **No reader is shown the app**: `by` and `channel`
+  are the store's, so no view of a line says them, and a `file_read` of an
+  entry's file leaves both fields out (`journals::view::entry_file`). A model
+  reading its memory reads who said a thing, not which assistant carried it.
+  The commit says the rest (§7.1).
 - **Editing a line is a commit** that changes it. Nothing is lost: history keeps
   every version, and `git log -L` / `git blame` answer when and by whom.
 - **A line stays in the journal it was written to.** Moving one is a
@@ -1000,8 +1003,9 @@ the ear, ≤ 1,600 chars, all from memory, in this order:
 2. **The master's voice digest**: what Zen is, in a sentence or two.
 3. **Who it could be**: each member's name and a few words from their cue,
    so a voice ("it's Yen") resolves to a people journal.
-4. **Last time on Grok**: the summary of the conversation before this one
-   on the channel, which is where a drive picks up.
+4. **Last time**: the summary of the conversation before this one on the
+   channel, which is where a drive picks up. The frame does not name the
+   channel.
 5. **Where things are**: the topics' names, the top level only, so a
    spoken subject maps to a path.
 6. **This conversation's path**, `conversations/<began>-grok`, which is
