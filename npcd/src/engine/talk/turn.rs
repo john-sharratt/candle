@@ -145,9 +145,21 @@ impl Runtime {
             rt: Arc::clone(&self),
             key: key.clone(),
         };
-        let ran = self.run_talk_turn(npc, &member, &inputs).await;
+        let mut wrote = false;
+        let ran = self.run_talk_turn(npc, &member, &inputs, &mut wrote).await;
         match ran {
             Ok(ended) => self.talks.finish(&key, Some(ended)),
+            // Nothing written yet: the same lines can be taken again with
+            // nothing said or noted twice.
+            Err(e) if !wrote => {
+                let wait = self.talks.put_back(&key, inputs, now_ms());
+                tracing::warn!(
+                    npc,
+                    party = %member,
+                    retry_in_ms = wait,
+                    "a conversation's turn could not start: {e:#} — its lines wait for the next"
+                );
+            }
             Err(e) => {
                 tracing::warn!(npc, party = %member, "a conversation's turn failed: {e:#}");
                 self.talks.finish(&key, None);
@@ -155,11 +167,15 @@ impl Runtime {
         }
     }
 
+    /// One turn on `inputs`. `wrote` is set before the turn first writes
+    /// anything — the character's journal, the world, the thread — so a turn
+    /// that fails with it unset changed nothing and may run again.
     async fn run_talk_turn(
         &self,
         npc: u64,
         member: &str,
         inputs: &Inputs,
+        wrote: &mut bool,
     ) -> anyhow::Result<Ended> {
         let minds = self
             .minds
@@ -214,7 +230,9 @@ impl Runtime {
             return Ok(inputs.last.unwrap_or(Ended::Quiet));
         }
 
-        // What was heard is the character's own experience.
+        // What was heard is the character's own experience — the turn's
+        // first write.
+        *wrote = true;
         let about = match &party {
             Party::Person(handle) => self.journals.person(&world, handle),
             Party::Npc(_) => self.journals.bot(&world, member),

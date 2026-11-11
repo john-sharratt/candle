@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use tokio::task::AbortHandle;
 
 use crate::engine::event::TalkLine;
-use crate::engine::talk::clock::{Ended, Phase};
+use crate::engine::talk::clock::{retry_delay, Ended, Phase};
 
 /// A conversation, as the runner keys it: the character and the party's
 /// member id — a body id, or an account handle.
@@ -36,6 +36,9 @@ pub struct Inputs {
 struct Conv {
     phase: Phase,
     inputs: Inputs,
+    /// Turns in a row that could not start: how long the next waits
+    /// ([`retry_delay`]).
+    failed: u32,
 }
 
 /// Every conversation on this member.
@@ -115,15 +118,23 @@ impl Talks {
             if let Some(c) = convs.get_mut(key) {
                 if ended.is_some() {
                     c.inputs.last = ended;
+                    c.failed = 0;
                 }
                 c.phase.end_turn();
             }
         });
     }
 
-    /// `key`'s turn could not run: what it took goes back ahead of what
-    /// arrived since, and gathers again from `now_ms`.
-    pub fn put_back(&self, key: &Key, mut inputs: Inputs, now_ms: u64) {
+    /// `key`'s turn could not start: what it took goes back ahead of what
+    /// arrived since, and gathers again once [`retry_delay`] has passed from
+    /// `now_ms` — longer for each turn in a row that could not start. Returns
+    /// that wait.
+    ///
+    /// **A line is never lost to a turn that wrote nothing.** Finished
+    /// instead, the lines it took were gone: on 2026-11-11 a message to Zen
+    /// was taken by a turn that failed for want of the mind's schema, and was
+    /// never answered.
+    pub fn put_back(&self, key: &Key, mut inputs: Inputs, now_ms: u64) -> u64 {
         self.with(|convs| {
             let c = convs.entry(key.clone()).or_default();
             inputs.lines.append(&mut c.inputs.lines);
@@ -133,9 +144,11 @@ impl Talks {
             inputs.last = c.inputs.last.or(inputs.last);
             inputs.thread = inputs.thread.or(c.inputs.thread.take());
             c.inputs = inputs;
-            c.phase.end_turn();
-            c.phase.arrive(now_ms);
-        });
+            let wait = retry_delay(c.failed);
+            c.failed = c.failed.saturating_add(1);
+            c.phase.retry_at(now_ms + wait);
+            wait
+        })
     }
 
     /// How many lines wait for `npc`'s conversations to take them.
@@ -193,7 +206,7 @@ impl Talks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::talk::clock::BURST_MS;
+    use crate::engine::talk::clock::{BURST_MS, RETRY_FIRST_MS};
 
     fn line(seq: u64, text: &str) -> TalkLine {
         TalkLine {
@@ -262,11 +275,41 @@ mod tests {
         t.due(BURST_MS);
         let taken = t.take(&mira());
         t.lines(7, "u_mira", "dm:npc-7:u_mira", vec![line(2, "hello?")], 100);
-        t.put_back(&mira(), taken, 5_000);
-        assert_eq!(t.due(5_000 + BURST_MS), [mira()]);
+        let wait = t.put_back(&mira(), taken, 5_000);
+        assert_eq!(wait, RETRY_FIRST_MS);
+        assert!(
+            t.due(5_000 + wait + BURST_MS - 1).is_empty(),
+            "not before the wait, even for a line that arrived during the turn"
+        );
+        assert_eq!(t.due(5_000 + wait + BURST_MS), [mira()]);
         let again = t.take(&mira());
         let seqs: Vec<u64> = again.lines.iter().map(|l| l.seq).collect();
         assert_eq!(seqs, [1, 2]);
+    }
+
+    /// **Each turn in a row that could not start waits longer**, and one that
+    /// runs puts the wait back to its first.
+    #[test]
+    fn the_wait_doubles_until_a_turn_runs() {
+        let t = Talks::new();
+        t.lines(7, "u_mira", "dm:npc-7:u_mira", vec![line(1, "hi")], 0);
+        let mut now = BURST_MS;
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(t.due(now), [mira()]);
+            let taken = t.take(&mira());
+            let wait = t.put_back(&mira(), taken, now);
+            waits.push(wait);
+            now += wait + BURST_MS;
+        }
+        assert_eq!(waits, [5_000, 10_000, 20_000]);
+        assert_eq!(t.due(now), [mira()]);
+        t.take(&mira());
+        t.finish(&mira(), Some(Ended::Spoke));
+        t.lines(7, "u_mira", "dm:npc-7:u_mira", vec![line(2, "again")], now);
+        assert_eq!(t.due(now + BURST_MS), [mira()]);
+        let taken = t.take(&mira());
+        assert_eq!(t.put_back(&mira(), taken, now), RETRY_FIRST_MS);
     }
 
     #[test]

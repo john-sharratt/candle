@@ -18,6 +18,23 @@ pub const BURST_MS: u64 = 2_500;
 /// The longest a turn waits after the first unanswered line.
 pub const BURST_MAX_MS: u64 = 8_000;
 
+/// How long a conversation whose turn could not start waits before it tries
+/// again, the first time.
+pub const RETRY_FIRST_MS: u64 = 5_000;
+
+/// The longest it waits, however many times in a row its turn could not start.
+pub const RETRY_MAX_MS: u64 = 300_000;
+
+/// How long a conversation waits before trying again after `failed` turns in a
+/// row could not start: [`RETRY_FIRST_MS`], doubling each time, at most
+/// [`RETRY_MAX_MS`]. A fault that outlasts every retry — a mind with no
+/// schema — costs one try every five minutes, not one every burst window.
+pub fn retry_delay(failed: u32) -> u64 {
+    RETRY_FIRST_MS
+        .saturating_mul(1u64 << failed.min(16))
+        .min(RETRY_MAX_MS)
+}
+
 /// What a conversation is doing, as its clock sees it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Phase {
@@ -70,6 +87,16 @@ impl Phase {
             }
             _ => false,
         }
+    }
+
+    /// The turn could not start: everything waiting gathers afresh from
+    /// `at_ms`, whenever it arrived, so the wait before trying again is not cut
+    /// short by [`BURST_MAX_MS`] from a line that came in long before.
+    pub fn retry_at(&mut self, at_ms: u64) {
+        *self = Phase::Gathering {
+            first_ms: at_ms,
+            last_ms: at_ms,
+        };
     }
 
     /// The turn ended: what arrived during it gathers from when it arrived.
@@ -156,6 +183,15 @@ mod tests {
         assert!(p.start_if_due(6_000));
         p.end_turn();
         assert_eq!(p, Phase::Idle);
+    }
+
+    #[test]
+    fn a_retry_waits_longer_each_time_up_to_five_minutes() {
+        assert_eq!(retry_delay(0), 5_000);
+        assert_eq!(retry_delay(1), 10_000);
+        assert_eq!(retry_delay(5), 160_000);
+        assert_eq!(retry_delay(6), RETRY_MAX_MS);
+        assert_eq!(retry_delay(u32::MAX), RETRY_MAX_MS);
     }
 
     #[test]
