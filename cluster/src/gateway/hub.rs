@@ -1619,7 +1619,7 @@ impl Hub {
     /// [`Self::pick_from`] under a hold of the state the caller already has.
     /// An `Any` request whose `route` not every ready member declares goes to
     /// one that does, in turn, and waits while none is ready — as does a
-    /// sticky one whose key no member here holds.
+    /// sticky one naming a key no member here holds.
     #[allow(clippy::too_many_arguments)]
     fn pick_in(
         self: &Arc<Self>,
@@ -1653,30 +1653,32 @@ impl Hub {
                 "routing standing"
             );
         }
-        // A sticky request whose key nobody here holds is placed afresh, and
-        // only among the members declaring its route, as an `Any` one is;
-        // once a member holds the key, the key decides.
-        let unheld = match dispatch {
-            Dispatch::Any => true,
-            Dispatch::Sticky(_) => !key.is_some_and(|k| registry.is_held(app, k)),
-            _ => false,
-        };
-        if let (true, Some(at)) = (unheld, route) {
-            if let Some(nodes) = registry.declaring(app, &at.method, &at.path) {
-                let pick = registry
-                    .round_robin_among(app, &nodes)
-                    .map_or(Pick::Wait, Pick::Member);
-                let declaring: Vec<String> = nodes.iter().map(|n| hex(*n)).collect();
-                tracing::info!(
-                    target: "cluster::gateway::placement",
-                    app,
-                    route = %format!("{} {}", at.method, at.path),
-                    declaring = %declaring.join(" "),
-                    picked = ?pick,
-                    "routed among the members declaring the route"
-                );
-                return Picked { pick, load: None };
+        // A sticky request naming a key nobody here holds, on a route some
+        // member's table leaves out, is placed afresh among the members
+        // declaring it, as an `Any` one is; once a member holds the key, the
+        // key decides. A route every member with a table declares — a
+        // conversation's turn — is placed as ever, its handovers with it.
+        let narrowed = match (dispatch, route) {
+            (Dispatch::Any, Some(at)) => registry.declaring(app, &at.method, &at.path),
+            (Dispatch::Sticky(_), Some(at)) if key.is_some_and(|k| !registry.is_held(app, k)) => {
+                registry.declaring_by_table(app, &at.method, &at.path)
             }
+            _ => None,
+        };
+        if let (Some(at), Some(nodes)) = (route, narrowed) {
+            let pick = registry
+                .round_robin_among(app, &nodes)
+                .map_or(Pick::Wait, Pick::Member);
+            let declaring: Vec<String> = nodes.iter().map(|n| hex(*n)).collect();
+            tracing::info!(
+                target: "cluster::gateway::placement",
+                app,
+                route = %format!("{} {}", at.method, at.path),
+                declaring = %declaring.join(" "),
+                picked = ?pick,
+                "routed among the members declaring the route"
+            );
+            return Picked { pick, load: None };
         }
         let canary = upgrades.canary(app);
         let peer_of = sender.filter(|_| matches!(dispatch, Dispatch::Best));

@@ -211,6 +211,33 @@ fn a_sticky_key_is_held_by_a_member_here() {
     assert!(!r.is_held("npcd", "diary-0123456789abcdef"), "another app's");
 }
 
+/// **A sticky route narrows only by the tables declared**: a member yet to
+/// declare one is no evidence it lacks the route, so a route every declared
+/// table holds — a conversation's turn — narrows nothing, while one a
+/// declared table leaves out goes to the members declaring it.
+#[test]
+fn a_sticky_route_narrows_only_by_declared_tables() {
+    let mut r = three();
+    let route = |path: &str| Route::new(&["POST"], path, Dispatch::Any);
+    assert_eq!(r.declaring_by_table("zend", "POST", "/v1/mcp/diaries"), None);
+    r.routes(
+        "zend",
+        2,
+        RouteTable::new(vec![route("/v1/mcp"), route("/v1/mcp/diaries")]).unwrap(),
+    );
+    assert_eq!(
+        r.declaring_by_table("zend", "POST", "/v1/mcp/diaries"),
+        None,
+        "the one table declared holds it"
+    );
+    r.routes("zend", 3, RouteTable::new(vec![route("/v1/mcp")]).unwrap());
+    assert_eq!(
+        r.declaring_by_table("zend", "POST", "/v1/mcp/diaries"),
+        Some(vec![2])
+    );
+    assert_eq!(r.declaring_by_table("zend", "POST", "/v1/mcp"), None);
+}
+
 /// A lagging member is routed nothing and never answers a catch-up, though it
 /// stays ready and the app stays clustered (§4.4).
 #[test]

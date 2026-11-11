@@ -224,6 +224,25 @@ impl Registry {
         (declaring.len() < ready.len()).then_some(declaring)
     }
 
+    /// The ready members of `app` declaring a route answering `method` on
+    /// `path`, when some member that has declared its table leaves it out:
+    /// a route only some members serve by what they hold. A member yet to
+    /// declare any table is no evidence either way, so it narrows nothing.
+    /// `None` when every member with a table declares it.
+    pub fn declaring_by_table(&self, app: &str, method: &str, path: &str) -> Option<Vec<u64>> {
+        let tabled: Vec<&MemberView> = self
+            .ready_but(app, None)
+            .into_iter()
+            .filter(|m| m.routes.is_some())
+            .collect();
+        let declaring: Vec<u64> = tabled
+            .iter()
+            .filter(|m| m.routes.as_ref().is_some_and(|t| t.answers(method, path)))
+            .map(|m| m.node)
+            .collect();
+        (declaring.len() < tabled.len()).then_some(declaring)
+    }
+
     /// Whether a member of `app` here holds sticky `key`: its requests go to
     /// that member, wherever else its route is declared.
     pub fn is_held(&self, app: &str, key: &str) -> bool {
