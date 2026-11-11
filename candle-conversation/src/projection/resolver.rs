@@ -5696,6 +5696,10 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             .is_locality_boosted(turn.timeline, turn.index)
     }
 
+    fn seed_timelines(&self) -> HashSet<TimelineId> {
+        self.read.seed_chain().into_iter().collect()
+    }
+
     fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
         let (layer, _) = self.read.timeline_target(turn.timeline)?;
         Some(layer)

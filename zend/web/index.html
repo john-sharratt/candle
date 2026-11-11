@@ -4225,11 +4225,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // `opts.open` (a still-decoding assistant).
     // Per-card badges: FOREST KIND (a `SoT`/`SoS` summary node standing in for
     // the turns beneath it) and WHY the projection picked it (provenance /
-    // coverage / recency / anchor, or recent / historical on the rule-based
-    // path). Both render inline on the card header so the materialized view
-    // shows, in place, when a slot holds a summary instead of the raw turn.
+    // coverage / recency / anchor, or seed / inherited / recent / historical on
+    // the rule-based path). Both render inline on the card header so the
+    // materialized view shows, in place, when a slot holds a summary instead of
+    // the raw turn.
     const tagBadge = (txt, fg, bg) => h('span', { style: 'font-size:8.5px; font-weight:700; letter-spacing:0.04em; padding:1px 6px; border-radius:4px; white-space:nowrap; flex-shrink:0; color:' + fg + '; background:' + bg + ';' }, txt);
-    const REASON_NAME = { hard_anchor: 'anchor', provenance_score: 'provenance', recency_decay: 'recency', coverage_fill: 'coverage', refill: 'refill', pending: 'pending', recent: 'recent', historical: 'historical' };
+    const REASON_NAME = { hard_anchor: 'anchor', provenance_score: 'provenance', recency_decay: 'recency', coverage_fill: 'coverage', refill: 'refill', pending: 'pending', seed: 'seed', inherited: 'inherited', recent: 'recent', historical: 'historical' };
     const kindBadge = (k) => k === 'summary_of_summaries' ? tagBadge('SUMMARY · SoS', '#e8893c', 'rgba(232,137,60,0.18)')
       : k === 'summary_of_turns' ? tagBadge('SUMMARY · SoT', '#d8a23a', 'rgba(216,162,58,0.18)') : null;
     const reasonBadge = (r) => r ? tagBadge('why: ' + (REASON_NAME[r] || r), '#a99cd6', 'rgba(169,156,214,0.15)') : null;

@@ -382,8 +382,9 @@ pub struct Projection {
     pub selection_scores: super::SelectionScores,
     /// Why each selected turn entered the slot, keyed by `(group, turn)`. The
     /// score-density path tags each pick from the summary forest (hard anchor /
-    /// provenance / coverage / …); the rule-based path tags `Recent` (inside the
-    /// recency window) vs `Historical` (top-k by score). Read by
+    /// provenance / coverage / …); the rule-based path tags `Seed` / `Inherited`
+    /// (the lineage), `Recent` (inside the recency window) or `Historical`
+    /// (top-k by score). Read by
     /// [`super::event::from_projection_with_origins`] so the persisted projection
     /// record / GUI can show "why is this turn in my context?". Empty entries
     /// (e.g. the live user message) carry no origin.
@@ -1708,25 +1709,36 @@ pub fn run_with_sink<R: ContentResolver>(
             }
 
             // Rule-based path has no per-pick origin; derive it from the
-            // `Sequence` rule's own recency split so the panel can still answer
-            // "why?": a turn inside the last `recent` window is `Recent`
-            // (inviolate), an older selected turn is `Historical` (top-k by
-            // score). Mirrors `select_conversation`'s `split_at = len - recent`.
+            // `Sequence` rule's own split so the panel can still answer "why?",
+            // mirroring `select_conversation`:
+            // - a turn on another timeline is inherited, inviolate and outside
+            //   the window: `Seed` when it is a link of this member's seed,
+            //   `Inherited` for any other ancestor;
+            // - of the conversation's own turns, one inside the last `recent` is
+            //   `Recent` (inviolate), an older one `Historical` (top-k by score).
             if !score_density_used {
                 if let SelectionRule::Sequence { recent, .. } = &group.selection {
-                    // `Sequence` is the live-conversation rule, so the group holds
-                    // one timeline and candidate order is exchange order. Read the
-                    // split off each pick's POSITION in `all_turns` rather than its
-                    // turn index: the candidates are exchanges, so position and
-                    // index only coincide when nothing on the timeline is coupled.
-                    let split = all_turns.len().saturating_sub(*recent);
-                    let position: HashMap<TurnKey, usize> = all_turns
+                    // The window splits the own turns alone. Read the split off
+                    // each pick's POSITION among them rather than its turn index:
+                    // the candidates are exchanges, so position and index only
+                    // coincide when nothing on the timeline is coupled.
+                    let own: Vec<TurnKey> = all_turns
                         .iter()
-                        .enumerate()
-                        .map(|(i, (key, _))| (*key, i))
+                        .map(|(key, _)| *key)
+                        .filter(|key| key.timeline == target.timeline)
                         .collect();
+                    let split = own.len().saturating_sub(*recent);
+                    let position: HashMap<TurnKey, usize> =
+                        own.iter().enumerate().map(|(i, key)| (*key, i)).collect();
+                    let seed = resolver.seed_timelines();
                     for (key, _) in &selected {
-                        let origin = if position.get(key).is_some_and(|p| *p >= split) {
+                        let origin = if key.timeline != target.timeline {
+                            if seed.contains(&key.timeline) {
+                                SelectionOrigin::Seed
+                            } else {
+                                SelectionOrigin::Inherited
+                            }
+                        } else if position.get(key).is_some_and(|p| *p >= split) {
                             SelectionOrigin::Recent
                         } else {
                             SelectionOrigin::Historical

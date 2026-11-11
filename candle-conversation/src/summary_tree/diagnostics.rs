@@ -51,6 +51,13 @@ pub enum SelectionOrigin {
     /// Rule-based path (no summary tree): an older turn pulled back by
     /// relevance score (`conversation.historical_top_k`).
     Historical,
+    /// Rule-based path: a turn of this member's seed, the priming chain the
+    /// conversation was founded on (`Substrate::seed_chain`). Inherited, so
+    /// inviolate and outside the recency window (`select_conversation`).
+    Seed,
+    /// Rule-based path: a turn of an ancestor conversation this one was forked
+    /// from, other than the seed. Inviolate like the seed.
+    Inherited,
     /// Belief-driven turn group (repo_map folders, code scopes): the turn won
     /// its slot from the RelLeak belief over its live wide-Q score, seeded from
     /// the carried prior — the turn-axis analogue of a collection's tool pick.

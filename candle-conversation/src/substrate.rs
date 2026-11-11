@@ -1148,6 +1148,13 @@ pub trait ContentResolver {
         false
     }
 
+    /// The timelines of this member's seed (`Substrate::seed_chain`), so
+    /// selection can name a turn that is there because the conversation was
+    /// founded on it.
+    fn seed_timelines(&self) -> HashSet<TimelineId> {
+        HashSet::new()
+    }
+
     /// Layer that produced a given turn.  Used to denormalise
     /// `layer_id` onto the emitted `TurnId` without a back-lookup
     /// through the schema.
@@ -3418,6 +3425,14 @@ impl Substrate {
     /// What [`Self::SEED_PARENT`] resolves to on this member.
     pub fn seed(&self) -> Option<TimelineId> {
         self.seed
+    }
+
+    /// Every link of this member's seed, oldest first: the priming chain a
+    /// dialogue opens on. Empty before a seed is named.
+    pub fn seed_chain(&self) -> Vec<TimelineId> {
+        self.seed
+            .map(|seed| self.inherited_chain(seed))
+            .unwrap_or_default()
     }
 
     /// Ceiling on the tokens an inherited chain may contribute *above* the
@@ -8101,6 +8116,10 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         self.scores.is_locality_boosted(turn.timeline, turn.index)
     }
 
+    fn seed_timelines(&self) -> HashSet<TimelineId> {
+        self.substrate.seed_chain().into_iter().collect()
+    }
+
     fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {
         let (layer, _) = self.substrate.timeline_target(turn.timeline)?;
         Some(layer)
@@ -8236,6 +8255,10 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
     fn turn_locality_boosted(&self, turn: TurnKey) -> bool {
         self.scores_or_empty()
             .is_locality_boosted(turn.timeline, turn.index)
+    }
+
+    fn seed_timelines(&self) -> HashSet<TimelineId> {
+        self.guard.seed_chain().into_iter().collect()
     }
 
     fn turn_origin(&self, turn: TurnKey) -> Option<LayerId> {

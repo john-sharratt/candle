@@ -65,6 +65,11 @@ struct MockResolver {
     turn_tags: HashMap<(u32, u32), Vec<String>>,
     /// (group_raw, turn_raw) → the face a dialogue holds that turn by.
     faces: HashMap<(u32, u32), TurnKey>,
+    /// group_raw → turns of ancestor timelines the group's conversation
+    /// inherits, offered ahead of its own as the substrate offers its lineage.
+    inherited: HashMap<u32, Vec<TurnKey>>,
+    /// The timelines `seed_timelines` reports.
+    seed: HashSet<TimelineId>,
 }
 
 impl MockResolver {
@@ -130,6 +135,18 @@ impl MockResolver {
             (group.raw(), idx.0),
             tags.iter().map(|t| t.to_string()).collect(),
         );
+        self
+    }
+
+    /// Offer `turn`, on an ancestor's timeline, ahead of `group`'s own turns.
+    fn with_inherited(mut self, group: GroupId, turn: TurnKey) -> Self {
+        self.inherited.entry(group.raw()).or_default().push(turn);
+        self
+    }
+
+    /// Name `timeline` a link of this member's seed.
+    fn with_seed(mut self, timeline: TimelineId) -> Self {
+        self.seed.insert(timeline);
         self
     }
 
@@ -203,9 +220,18 @@ impl ContentResolver for MockResolver {
 
     fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
         let tl = Self::timeline_of(group);
-        (0..self.turn_counts.get(&group.raw()).copied().unwrap_or(0))
-            .map(|i| TurnKey::new(tl, TurnIndex(i)))
+        let inherited = self.inherited.get(&group.raw()).into_iter().flatten();
+        inherited
+            .copied()
+            .chain(
+                (0..self.turn_counts.get(&group.raw()).copied().unwrap_or(0))
+                    .map(|i| TurnKey::new(tl, TurnIndex(i))),
+            )
             .collect()
+    }
+
+    fn seed_timelines(&self) -> HashSet<TimelineId> {
+        self.seed.clone()
     }
 
     /// Exchange closure over the fixture's couplings, derived exactly as the
@@ -1207,6 +1233,62 @@ fn ingest_self_projection_keeps_its_own_turns_past_the_window() {
     );
     let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     assert_eq!(indices, [0, 1, 2, 3], "every own turn is projected");
+}
+
+/// **A conversation's inherited turns are named for why they are there**, not
+/// by where they fall against the recency window. A dialogue on this member's
+/// seed (two links' turns) and on one other ancestor, with six turns of its own
+/// against `recent: 4`: the seed's turns are `Seed`, the other ancestor's
+/// `Inherited`, and the window splits the own turns alone — the last four
+/// `Recent`, the first two `Historical`. Labelled by position in the combined
+/// list, a new conversation's whole seed read `Recent`.
+#[test]
+fn inherited_turns_are_named_seed_or_inherited_and_the_window_splits_own_turns() {
+    let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let layer = b.id_for_layer("dialogue").unwrap();
+    let grp = b.id_for_group("conversation").unwrap();
+    let seed_link = TimelineId::for_test(900);
+    let ancestor = TimelineId::for_test(901);
+
+    let mut resolver = MockResolver::new();
+    for _ in 0..6 {
+        resolver.append(grp);
+    }
+    let resolver = resolver
+        .with_inherited(grp, TurnKey::new(seed_link, TurnIndex(0)))
+        .with_inherited(grp, TurnKey::new(seed_link, TurnIndex(1)))
+        .with_inherited(grp, TurnKey::new(ancestor, TurnIndex(0)))
+        .with_seed(seed_link);
+
+    let own = MockResolver::timeline_of(grp);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: own,
+        },
+        &resolver,
+    );
+    let origin = |timeline, index| {
+        proj.selection_origins
+            .get(&TurnKey::new(timeline, TurnIndex(index)))
+            .copied()
+    };
+    assert_eq!(origin(seed_link, 0), Some(SelectionOrigin::Seed));
+    assert_eq!(origin(seed_link, 1), Some(SelectionOrigin::Seed));
+    assert_eq!(origin(ancestor, 0), Some(SelectionOrigin::Inherited));
+    let own_origins: Vec<Option<SelectionOrigin>> = (0..6).map(|i| origin(own, i)).collect();
+    assert_eq!(
+        own_origins,
+        [
+            Some(SelectionOrigin::Historical),
+            Some(SelectionOrigin::Historical),
+            Some(SelectionOrigin::Recent),
+            Some(SelectionOrigin::Recent),
+            Some(SelectionOrigin::Recent),
+            Some(SelectionOrigin::Recent),
+        ]
+    );
 }
 
 /// A layer below an ingest target, and the target layer with a window far

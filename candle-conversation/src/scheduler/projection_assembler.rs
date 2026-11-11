@@ -681,7 +681,11 @@ pub(crate) fn materialize_conversation(
                         // ambiguous once a group holds many conversations.
                         tokens: key.map_or(0, |k| resolver.turn_token_count(k)) as u32,
                         kind: key.map_or(TurnKind::Normal, |k| resolver.turn_kind(k)),
-                        reason: key.and_then(|k| origins.get(&k)).copied(),
+                        // A face carries its unit's reason: the unit is what was
+                        // selected, as the selection record names it.
+                        reason: key
+                            .and_then(|k| origins.get(&resolver.unit_of(k).unwrap_or(k)))
+                            .copied(),
                         timeline: timeline.map(|tl| tl.raw()),
                         // Materialized display spine — the turn is shown, and
                         // neither the belief score nor its qualification is
@@ -3379,6 +3383,93 @@ mod tests {
 
     fn tl(raw: u64) -> TimelineId {
         TimelineId::from_raw(raw).expect("timeline id")
+    }
+
+    /// Names one face's unit; every turn costs ten tokens.
+    struct FaceResolver {
+        face: TurnKey,
+        unit: TurnKey,
+    }
+
+    impl ContentResolver for FaceResolver {
+        fn group_turns(&self, _group: GroupId) -> Vec<TurnKey> {
+            Vec::new()
+        }
+        fn turn_token_count(&self, _turn: TurnKey) -> usize {
+            10
+        }
+        fn turn_score(&self, _turn: TurnKey) -> f32 {
+            0.0
+        }
+        fn section_token_count(&self, _section: SectionId) -> usize {
+            0
+        }
+        fn unit_of(&self, turn: TurnKey) -> Option<TurnKey> {
+            (turn == self.face).then_some(self.unit)
+        }
+    }
+
+    /// **A face's card carries its unit's reason.** A dialogue holds a seed
+    /// link's opening by its face, so the spine names the face while the
+    /// selection's origins name the unit; looked up under the face, every seed
+    /// card was drawn with no reason at all.
+    #[test]
+    fn a_face_on_the_spine_carries_its_units_reason() {
+        let b = crate::projection::Builder::from_yaml(
+            r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+layers:
+  - name: dialogue
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    groups:
+      - id: conversation
+        selection: { kind: conversation, recent: 4 }
+"#,
+        )
+        .unwrap();
+        let layer = b.id_for_layer("dialogue").unwrap();
+        let group = b.id_for_group("conversation").unwrap();
+        let face = TurnKey::new(tl(31), TurnIndex(0));
+        let unit = TurnKey::new(tl(30), TurnIndex(0));
+        let segments = [ProjectionSegment::Sealed(SealedKind::Turn(
+            ResolvedTurn {
+                id: TurnId {
+                    layer_id: layer,
+                    group_id: group,
+                    index: face.index,
+                },
+                timeline: Some(face.timeline),
+            },
+            crate::Role::Assistant,
+        ))];
+        let origins = HashMap::from([(unit, SelectionOrigin::Seed)]);
+        let pieces = materialize_conversation(
+            &segments,
+            &origins,
+            &FaceResolver { face, unit },
+            b.schema(),
+            |_| String::new(),
+        );
+        let reasons: Vec<Option<SelectionOrigin>> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                MaterializedPiece::Turn { turn } => Some(turn.reason),
+                MaterializedPiece::Glue { .. } => None,
+            })
+            .collect();
+        assert_eq!(reasons, [Some(SelectionOrigin::Seed)]);
     }
 
     /// The turn the slot is continuing keeps its reasoning — the ordinary
