@@ -2395,7 +2395,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
           full: Object.assign({}, d.span, node, { selection: d.span.selection, materialized: d.span.materialized }),
           ctx: d,
         }))
-      : API.getProjectionContext(conv.id, (node.selection && node.selection.turns) || []).then((ctx) => ({ full: node, ctx }));
+      // The spine's turns as well as the selection's: a dialogue holds an
+      // ingest unit's opening by its face, which the selection names as the
+      // unit and the spine — which the cards are drawn from — as the face.
+      : API.getProjectionContext(conv.id, ((node.selection && node.selection.turns) || [])
+          .concat((node.materialized || []).filter((p) => p.kind === 'turn' && p.turn).map((p) => p.turn)))
+          .then((ctx) => ({ full: node, ctx }));
     req.then((r) => {
       if (!S.substrateOpen || S.substrateNode !== node) return;
       setState({ substrateNode: r.full, substrateLoading: false, substrateContent: r.ctx.sectionContent || {}, substrateTurnContent: r.ctx.turnContent || {}, substrateGlue: r.ctx.glue || null, substrateTargetLayer: r.ctx.targetLayer || '' });

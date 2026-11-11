@@ -357,10 +357,14 @@ own context is compacted.
 **A worker — one per task — is where a task's work runs.** `repo_task_start` creates
 it under the `name` the call gives it (§5.2). **A worker inherits its
 ancestors' journals, never their turns** (§5.1): it is minted like any
-dialogue, from `base_conv` and the priming chain (`zend/src/session.rs:3117-3123,
-3826-3839`), and its thread is recorded as its **journal parent** in its
-metadata — not as its `forked_from`, which every mint rewrites to `base_conv`
-(`session.rs:3826-3839`). So the worker opens with the thread's decisions and
+dialogue, from `base_conv` and parented on the **seed alias**
+(`ConversationEngine::set_forked_from_seed`), which each member resolves to the
+end of the priming chain it holds now; its thread is recorded as its **journal
+parent** in its metadata — not as its `forked_from`, which every mint writes to
+the alias. The chain's links are ingest units every member holds; `base_conv`
+is the process's own and no other member has it, so a dialogue parented on it
+lost its seed on any member but the one it was born on, and one parented on a
+chain end by id kept that chain after it was rebuilt. So the worker opens with the thread's decisions and
 earlier outcomes in its prompt, at no prefill, and its own task prompt states
 the task in full.
 

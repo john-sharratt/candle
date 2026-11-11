@@ -1257,6 +1257,32 @@ impl ConversationEngine {
         Ok(())
     }
 
+    /// Record that `child` continues **the seed** ([`Substrate::SEED_PARENT`]):
+    /// whatever priming chain the member reading it holds, resolved where the
+    /// lineage is read, so the conversation opens on the current chain on
+    /// every member and after every boot.
+    pub fn set_forked_from_seed(&self, child: TimelineId) -> crate::Result<()> {
+        self.set_conversation_metadata(child, Substrate::FORKED_FROM_KEY, Substrate::SEED_PARENT)
+    }
+
+    /// Name `seed` — the priming chain's end this boot built — as what
+    /// [`Substrate::SEED_PARENT`] resolves to on this member.
+    pub fn set_seed(&self, seed: Option<TimelineId>) {
+        self.conversation.update(|s| s.set_seed(seed));
+    }
+
+    /// Re-point every conversation parented on a base like `base`
+    /// ([`Substrate::parented_on_a_base`]) at the seed. Returns how many were
+    /// re-pointed. The rewrite is metadata, so it replicates: a member that
+    /// never held the base reads the alias, and the chain it holds.
+    pub fn reseed_base_children(&self, base: TimelineId) -> crate::Result<usize> {
+        let children = self.conversation.read().parented_on_a_base(base);
+        for child in &children {
+            self.set_forked_from_seed(*child)?;
+        }
+        Ok(children.len())
+    }
+
     /// Rewrite `key` of `timeline`'s `custom` metadata from the value it
     /// holds, as one step — see
     /// [`Conversation::update_conversation_metadata`]. Returns what was stored.
