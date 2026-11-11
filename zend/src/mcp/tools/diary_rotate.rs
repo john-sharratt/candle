@@ -1,6 +1,8 @@
 //! `diary_rotate {topic, passphrase, new_passphrase}`: hold an open diary
-//! under a new passphrase — its key rewrapped, its text untouched — after
-//! which the old passphrase no longer opens it (`docs/private_mode.md` §5.3).
+//! under a new passphrase — sealed again under a new key of its own, wrapped
+//! under the new passphrase — after which neither the old passphrase nor the
+//! old key opens any version written from then on (`docs/private_mode.md`
+//! §5.3).
 
 use serde_json::{json, Value};
 

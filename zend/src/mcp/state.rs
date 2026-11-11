@@ -191,7 +191,7 @@ pub struct McpState {
     used: Arc<Used>,
     noted: NotedCalls,
     refs: OnceLock<Refs>,
-    diaries: Diaries,
+    diaries: OnceLock<Diaries>,
 }
 
 impl Default for McpState {
@@ -203,15 +203,25 @@ impl Default for McpState {
             used: Arc::default(),
             noted: NotedCalls::default(),
             refs: OnceLock::new(),
-            diaries: Diaries::default(),
+            diaries: OnceLock::new(),
         }
     }
 }
 
 impl McpState {
-    /// The private conversations' open diaries, on this member.
+    /// The private conversations' open diaries, on this member: their
+    /// passphrases stretched at the production cost unless
+    /// [`Self::install_diaries`] said otherwise first.
     pub fn diaries(&self) -> &Diaries {
-        &self.diaries
+        self.diaries.get_or_init(Diaries::default)
+    }
+
+    /// Serve diaries with `diaries` — a cost of stretching of their own —
+    /// before any diary call is made.
+    pub fn install_diaries(&self, diaries: Diaries) {
+        if self.diaries.set(diaries).is_err() {
+            tracing::warn!("mcp: the diaries were already in use; these are not used");
+        }
     }
 
     /// Open conversation refs with `refs`, whose key every member and both

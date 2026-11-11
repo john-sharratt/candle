@@ -284,7 +284,9 @@ The committing file tools are the one exception, by design: `file_edit_and_commi
 `file_download_and_commit` and `file_upload_and_commit` push to origin, and to a gated
 repository only after the gate answers (up to 10 s, `docs/mcp_file_tools.md` §3.5, §3.6, §5.4);
 the download fetches each link first (30 s at most a link). None holds a lock another call takes
-while it waits.
+while it waits. So are the diary tools that stretch a passphrase — `diary_open`, `diary_create`
+and `diary_rotate` take Argon2id's ~1 s by design (`docs/private_mode.md` §5.3) — and a diary's
+read and write, which seal or open its whole file; none holds a lock while it stretches.
 
 1. **No network I/O under a lock a request takes.** The journal sync pushes and fetches with the
    store free and takes it only between the steps (`journals::store::sync`); `zend_vfs::Repo`

@@ -55,11 +55,12 @@ pub struct KdfParams {
 }
 
 impl KdfParams {
-    /// What every passphrase is stretched with: 64 MiB, three passes, one
-    /// lane — about a second on BlackWorld, and memory-hard.
+    /// What every passphrase is stretched with: 256 MiB, twelve passes, one
+    /// lane — about a second on BlackWorld in a release build (64 MiB and
+    /// three passes measured 63 ms there, 2026-11-11), and memory-hard.
     pub const PRODUCTION: KdfParams = KdfParams {
-        m_kib: 64 * 1024,
-        t: 3,
+        m_kib: 256 * 1024,
+        t: 12,
         p: 1,
     };
 }
@@ -73,10 +74,14 @@ pub enum CryptoError {
     Unopenable,
 }
 
-/// The key a passphrase's diaries are wrapped under.
+/// The key a passphrase's diaries are wrapped under. A copy is wiped when it
+/// is dropped, as the original is.
+#[derive(Clone)]
 pub struct Kek(Zeroizing<[u8; KEY]>);
 
-/// One diary's own key.
+/// One diary's own key: new for every diary, and again whenever it moves to
+/// another passphrase, so an old passphrase opens no later version.
+#[derive(Clone)]
 pub struct Dek(Zeroizing<[u8; KEY]>);
 
 fn random<const N: usize>() -> [u8; N] {
@@ -226,14 +231,6 @@ pub fn open(dek: &Dek, id: &DiaryId, file: &[u8]) -> Result<Zeroizing<Vec<u8>>, 
     Ok(Zeroizing::new(padded[4..4 + len].to_vec()))
 }
 
-/// `file`, diary `id`'s, with its `dek` wrapped under `kek` instead: what a
-/// new passphrase holds it by. The ciphertext is kept as it is.
-pub fn rewrap(kek: &Kek, dek: &Dek, id: &DiaryId, file: &[u8]) -> Vec<u8> {
-    let mut out = file.to_vec();
-    out[WRAP_AT..SEALED_AT].copy_from_slice(&wrap(kek, dek, id));
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -302,18 +299,19 @@ mod tests {
         assert_ne!(a[SEALED_AT..], b[SEALED_AT..]);
     }
 
-    /// **A rewrapped diary opens under the new passphrase, not the old**, its
-    /// ciphertext unchanged.
+    /// **A diary sealed again under a new key and passphrase opens under the
+    /// new passphrase only**, and its old key opens no part of it.
     #[test]
-    fn a_rewrapped_diary_opens_under_the_new_passphrase_only() {
+    fn a_resealed_diary_opens_under_the_new_passphrase_only() {
         let id = DiaryId([7; 16]);
-        let dek = Dek::random();
-        let file = seal(&kek("synthetic old"), &dek, &id, b"kept");
-        let moved = rewrap(&kek("synthetic new"), &dek, &id, &file);
-        assert_eq!(moved[SEALED_AT..], file[SEALED_AT..]);
+        let old_dek = Dek::random();
+        let file = seal(&kek("synthetic old"), &old_dek, &id, b"kept");
+        let moved = seal(&kek("synthetic new"), &Dek::random(), &id, b"kept");
         assert!(unwrap(&kek("synthetic old"), &id, &moved).is_none());
         let got = unwrap(&kek("synthetic new"), &id, &moved).unwrap();
         assert_eq!(&open(&got, &id, &moved).unwrap()[..], b"kept");
+        assert!(open(&old_dek, &id, &moved).is_err(), "the old key opens nothing new");
+        assert!(open(&old_dek, &id, &file).is_ok());
     }
 
     /// **The production cost stretches a passphrase**, and is what diaries

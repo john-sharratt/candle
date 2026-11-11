@@ -43,6 +43,9 @@ impl Store {
         if let Some(path) = changes.keys().find(|p| !in_diaries(p)) {
             return Err(Error::refused(format!("{path} is no diary's file")).into());
         }
+        if moves_salt(&self.files, changes) {
+            return Err(Error::conflict(SALT_KEPT).into());
+        }
         let changes: Changes = changes
             .iter()
             .filter(|(path, change)| self.files.get(*path) != change.as_ref())
@@ -61,6 +64,20 @@ impl Store {
         self.head = new;
         apply_changes(&mut self.files, &changes);
         Ok(())
+    }
+}
+
+/// What a write or a replay changing the salt is refused with.
+pub const SALT_KEPT: &str = "the diaries' salt is already kept, and every diary is stretched \
+    with it: it is never replaced";
+
+/// Whether `changes` would replace or remove a salt `files` already hold:
+/// written once, it is every diary's, and another would orphan them all.
+pub(super) fn moves_salt(files: &BTreeMap<String, Vec<u8>>, changes: &Changes) -> bool {
+    match (files.get(SALT), changes.get(SALT)) {
+        (Some(kept), Some(Some(new))) => kept != new,
+        (Some(_), Some(None)) => true,
+        _ => false,
     }
 }
 

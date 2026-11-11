@@ -113,7 +113,13 @@ impl Server for ZendSession {
             store: Arc::clone(&call.store),
             progress: call.progress.clone(),
         };
-        let mut answer = tools::fit(tools::call(&ctx, name, args).await);
+        // A diary is read whole (`docs/private_mode.md` §5.4): its answers
+        // are never cut to fit.
+        let answered = tools::call(&ctx, name, args).await;
+        let mut answer = match access::access(name) {
+            Access::Diary => answered,
+            Access::Read | Access::Write => tools::fit(answered),
+        };
         // A private conversation reads and leaves nothing behind: not even
         // which journal entries it was handed (`docs/private_mode.md` §4.4).
         if conversation.is_some_and(|r| r.private) {

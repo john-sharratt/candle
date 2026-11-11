@@ -7,13 +7,13 @@ use std::process::Command;
 use std::sync::Arc;
 
 use journals::diaries::book::Author;
-use journals::diaries::crypto::KdfParams;
+use journals::diaries::crypto::{self, unwrap, KdfParams, Kek};
 use journals::diaries::layout::SALT;
 use journals::time::Stamp;
 use mcp_server::refs::REF_IDLE_MS;
 use tempfile::TempDir;
 
-use super::{Diaries, NOT_OPEN};
+use super::{Diaries, MOVED, NOT_OPEN};
 use crate::mcp::memory::tests::{opened, repo};
 use crate::mcp::memory::Memory;
 
@@ -160,6 +160,46 @@ fn a_rotated_diary_opens_under_the_new_passphrase_only() {
     assert_eq!(d.read(&m, "c3", TOPIC, NOW).unwrap().entries[0].text, TEXT);
 }
 
+/// **A diary moved to a new passphrase stays moved**: another conversation
+/// that had it open under the old one may not write it back, and is told.
+#[test]
+fn a_rotation_is_not_undone_by_another_conversation() {
+    let (_root, m) = memory();
+    let d = diaries();
+    d.open(&m, "o", "c1", PASS, NOW).unwrap();
+    d.create(&m, "c1", TOPIC, PASS, NOW).unwrap();
+    d.open(&m, "o", "c2", PASS, NOW).unwrap();
+    d.rotate(&m, "c1", TOPIC, PASS, OTHER, NOW).unwrap();
+    let ts = at("2026-11-10T09:00:00Z");
+    assert_eq!(
+        d.write(&m, "c2", TOPIC, ts, Author::User, TEXT, NOW),
+        Err(MOVED.into())
+    );
+    assert!(d.read(&m, "c2", TOPIC, NOW).is_err(), "closed there");
+    assert_eq!(d.open(&m, "o", "c3", OTHER, NOW), Ok(1), "still the new one's");
+    assert_eq!(d.open(&m, "o", "c4", PASS, NOW), Ok(0));
+}
+
+/// **A passphrase's topics are one each, across conversations**, and a
+/// diary another conversation made is listed without reopening.
+#[test]
+fn a_topic_is_kept_once_under_a_passphrase() {
+    let (_root, m) = memory();
+    let d = diaries();
+    d.open(&m, "o", "c1", PASS, NOW).unwrap();
+    d.open(&m, "o", "c2", PASS, NOW).unwrap();
+    d.create(&m, "c1", TOPIC, PASS, NOW).unwrap();
+    assert!(d.create(&m, "c2", TOPIC, PASS, NOW).is_err(), "c1 made it");
+    let listed: Vec<String> = d
+        .list(&m, "c2", NOW)
+        .unwrap()
+        .into_iter()
+        .map(|l| l.topic)
+        .collect();
+    assert_eq!(listed, [TOPIC]);
+    assert_eq!(m.diaries().unwrap().0.len(), 1);
+}
+
 /// **What is unlocked goes on close, and when the ref has gone idle**.
 #[test]
 fn unlock_state_is_cleared_on_close_and_on_expiry() {
@@ -209,6 +249,24 @@ fn opens_that_find_nothing_back_off() {
     let refused = d.open(&m, "o", "c1", PASS, NOW).unwrap_err();
     assert!(refused.starts_with("too many opens found nothing"), "{refused}");
     assert_eq!(d.open(&m, "someone-else", "c9", PASS, NOW), Ok(0));
+}
+
+/// **A rotated diary's later versions open under no old key**: the old
+/// passphrase's file in history gives up nothing written since.
+#[test]
+fn a_rotation_seals_under_a_new_key() {
+    let (_root, m) = memory();
+    let d = diaries();
+    d.open(&m, "o", "c1", PASS, NOW).unwrap();
+    d.create(&m, "c1", TOPIC, PASS, NOW).unwrap();
+    let (files, _) = m.diaries().unwrap();
+    let (id, before) = files[0].clone();
+    d.rotate(&m, "c1", TOPIC, PASS, OTHER, NOW).unwrap();
+    let after = m.diary_file(&id).unwrap().unwrap();
+    let (_, salt) = m.diaries().unwrap();
+    let old_kek = Kek::derive(PASS, &salt.unwrap(), FAST).unwrap();
+    let old_dek = unwrap(&old_kek, &id, &before).expect("the old file opens under the old");
+    assert!(crypto::open(&old_dek, &id, &after).is_err(), "the old key opens nothing new");
 }
 
 /// **No topic and no entry's text is anywhere in the repository**, every

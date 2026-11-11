@@ -90,6 +90,31 @@ fn a_diary_commit_is_replayed_whole_onto_a_moved_origin() {
     assert_eq!(Store::open(&r.clone("after")).unwrap().diary_file(&id), None);
 }
 
+/// **The salt is written once**: a write replacing it is refused, and a
+/// replay meeting another salt on origin is dropped and said so — never
+/// copied over the one origin's diaries are stretched with.
+#[test]
+fn the_salt_is_never_replaced() {
+    let r = Repos::new();
+    let mut a = Store::open(&r.clone("a")).unwrap();
+    let mut b = Store::open(&r.clone("b")).unwrap();
+    let (salt_a, salt_b) = (new_salt(), new_salt());
+    let (id_b, file_b) = sealed("synthetic pass", &salt_b);
+    b.write_diaries(&changes(&salt_b, &id_b, &file_b)).unwrap();
+    b.sync().unwrap();
+    let (id_a, file_a) = sealed("synthetic pass", &salt_a);
+    a.write_diaries(&changes(&salt_a, &id_a, &file_a)).unwrap();
+    let synced = a.sync().unwrap();
+    assert_eq!(synced.dropped.len(), 1, "{:?}", synced.dropped);
+    let check = Store::open(&r.clone("check")).unwrap();
+    assert_eq!(check.diary_salt(), Some(salt_b.as_slice()), "origin's salt stands");
+    assert_eq!(check.diary_file(&id_b), Some(file_b.as_slice()));
+    let replaced = Changes::from([(SALT.to_string(), Some(salt_a.to_vec()))]);
+    assert!(b.write_diaries(&replaced).is_err());
+    let removed = Changes::from([(SALT.to_string(), None)]);
+    assert!(b.write_diaries(&removed).is_err());
+}
+
 /// **No topic and no entry's text is anywhere in the repository**: every
 /// object of the agent's checkout and of origin, every commit of history,
 /// read whole — after a diary was written, rewritten, a journal note made

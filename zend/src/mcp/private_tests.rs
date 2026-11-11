@@ -12,7 +12,7 @@ use mcp_server::access::{self, Access, DIARIES_PRIVATE, PRIVATE, TOOLS};
 use mcp_server::protocol::MODERN;
 use mcp_server::refs::named_in;
 use mcp_server::{Call, Client, Server, Session};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::caller::Caller;
 use super::memory::conversations::section;
@@ -134,18 +134,37 @@ async fn a_diary_needs_a_private_conversation() {
     }
 }
 
-/// **A diary end to end through the tools, at the production cost**: open
-/// finds none, create, write one entry now and one in the past, read them in
-/// time order, delete one, close, reopen and read what stands.
+/// A call by `caller` in the conversation `ref_text` names, as the aggregator
+/// passes it on.
+fn served(session: &Arc<ZendSession>, caller: Caller, ref_text: &str) -> Call<ZendSession> {
+    Call::<ZendSession> {
+        headers: HeaderMap::new(),
+        session_id: "s1".into(),
+        session: Session::new(&caller.key(), Client::ClaudeAi, MODERN, 0),
+        caller,
+        conversation_ref: Some(ref_text.to_string()),
+        quiet: false,
+        store: Arc::clone(&ctx(session, john(), None).store),
+        progress: None,
+    }
+}
+
+/// **A diary end to end through the server, as the aggregator reaches
+/// it**: open finds none, create, write one entry now and one in the past,
+/// read them in time order — whole, however long, never cut to fit — delete
+/// one, close, reopen and read what stands; and no diary call is logged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_diary_end_to_end_through_the_tools() {
+async fn a_diary_end_to_end_through_the_server() {
     let (_dirs, session, _) = test_session::session(|_| {});
-    let (_, r) = conversation(&session, &john(), true);
-    let c = ctx(&session, john(), Some(r));
-    let call = |name: &'static str, args: serde_json::Value| {
-        let c = c.clone();
+    let (text, _) = conversation(&session, &john(), true);
+    let mine = served(&session, john(), &text);
+    for tool in ["diary_open", "diary_read", "diary_write"] {
+        assert!(!session.logs(&mine, tool, &json!({})), "{tool} is logged nowhere");
+    }
+    let call = |name: &'static str, args: Value| {
+        let (session, mine) = (Arc::clone(&session), served(&session, john(), &text));
         async move {
-            let a = tools::call(&c, name, &args).await;
+            let a = <ZendSession as Server>::call(&session, &mine, name, &args).await;
             assert!(!a.is_error, "{name}: {}", a.text);
             a.text
         }
@@ -164,10 +183,18 @@ async fn a_diary_end_to_end_through_the_tools() {
                "ts": "2026-11-01T08:00:00Z"}),
     )
     .await;
+    let long: String = (0..2_000).map(|i| format!("synthetic line {i:05}\n")).collect();
+    assert!(long.len() > 32_000, "longer than any answer is cut to");
+    call(
+        "diary_write",
+        json!({"topic": "synthetic-garden", "text": long, "ts": "2026-11-20T08:00:00Z"}),
+    )
+    .await;
     let read = call("diary_read", json!({"topic": "synthetic-garden"})).await;
     let dug = read.find("Dug the synthetic bed.").unwrap();
     let planted = read.find("Planted synthetic beans.").unwrap();
-    assert!(dug < planted, "the past entry reads first: {read}");
+    assert!(dug < planted, "the past entry reads first");
+    assert!(read.contains(&long), "read whole, never cut");
     let id = past
         .strip_prefix("Wrote entry `")
         .and_then(|r| r.split('`').next())
@@ -178,7 +205,13 @@ async fn a_diary_end_to_end_through_the_tools() {
         "Deleted 1 entry."
     );
     call("diary_close", json!({})).await;
-    let closed = tools::call(&c, "diary_read", &json!({"topic": "synthetic-garden"})).await;
+    let closed = <ZendSession as Server>::call(
+        &session,
+        &mine,
+        "diary_read",
+        &json!({"topic": "synthetic-garden"}),
+    )
+    .await;
     assert!(closed.is_error, "closed: {}", closed.text);
     assert_eq!(call("diary_open", json!({"passphrase": pass})).await, "Opened 1 diary.");
     let read = call("diary_read", json!({"topic": "synthetic-garden"})).await;
@@ -193,16 +226,7 @@ async fn a_diary_end_to_end_through_the_tools() {
 async fn the_server_opens_the_passed_ref_for_its_caller_only() {
     let (_dirs, session, _) = test_session::session(|_| {});
     let (text, _) = conversation(&session, &john(), true);
-    let call = |caller: Caller| Call::<ZendSession> {
-        headers: HeaderMap::new(),
-        session_id: "s1".into(),
-        session: Session::new(&caller.key(), Client::ClaudeAi, MODERN, 0),
-        caller,
-        conversation_ref: Some(text.clone()),
-        quiet: false,
-        store: Arc::clone(&ctx(&session, john(), None).store),
-        progress: None,
-    };
+    let call = |caller: Caller| served(&session, caller, &text);
     let mine = call(john());
     assert!(!session.logs(&mine, "journal_read", &json!({})), "private: not logged");
     let refused = <ZendSession as Server>::call(&session, &mine, "journal_note", &json!({})).await;

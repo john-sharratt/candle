@@ -10,7 +10,7 @@ description = "The memory backbone: journal trees for people and their families,
 [dependencies]
 # Diaries (`src/diaries/`): passphrase stretching, key derivation, sealing,
 # random ids and nonces, and keys wiped when dropped.
-argon2           = "0.5"
+argon2           = { version = "0.5", features = ["zeroize"] }
 chacha20poly1305 = "0.10"
 hkdf             = "0.12"
 journal-core     = { path = "../journal-core" }

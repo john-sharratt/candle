@@ -37,7 +37,7 @@ use crate::error::Error;
 use crate::line::LineId;
 use crate::ops::remap::remap;
 use crate::ops::{applied_to, Applied, Op};
-use crate::store::diaries::{commit_diaries, diaries_changed};
+use crate::store::diaries::{commit_diaries, diaries_changed, moves_salt, SALT_KEPT};
 use crate::store::diff::{apply_changes, changes, Changes};
 use crate::store::message::{is_diaries, message, read};
 use crate::store::read::files_at;
@@ -287,9 +287,16 @@ impl Store {
         let mut done = Synced::default();
         let mut renamed: BTreeMap<LineId, LineId> = BTreeMap::new();
         for c in mine {
-            // A diaries commit carries its files whole onto the newer base.
+            // A diaries commit carries its files whole onto the newer base —
+            // unless the base keeps another salt, whose diaries it would
+            // orphan: then it is dropped, and said so.
             if is_diaries(&c.message) {
                 let ch = diaries_changed(&self.repo, &c)?;
+                if moves_salt(&files, &ch) {
+                    done.dropped
+                        .push((c.subject().to_string(), Error::conflict(SALT_KEPT)));
+                    continue;
+                }
                 if !ch.is_empty() {
                     base = commit_diaries(&self.repo, &base, &ch)?;
                     apply_changes(&mut files, &ch);

@@ -218,8 +218,9 @@ In the journals repository, one encrypted file per diary:
 
 ### 5.3 Crypto (`journals::diaries::crypto`)
 
-- passphrase + salt → **Argon2id** (m = 64 MiB, t = 3, p = 1: ~1 s on
-  BlackWorld) → 32-byte master key, derived once per `diary_open`.
+- passphrase + salt → **Argon2id** (m = 256 MiB, t = 12, p = 1: ~1 s on
+  BlackWorld in a release build, from 63 ms measured there at 64 MiB and
+  t = 3) → 32-byte master key, derived once per `diary_open`.
 - HKDF-SHA256(master, info `zen diary kek`) → **kek**.
 - File: `version (1) || wrapped_dek (16 + 32 + 24 nonce: XChaCha20-Poly1305
   under kek, AAD = diary_id) || nonce (24) || ciphertext (XChaCha20-Poly1305
@@ -229,10 +230,23 @@ In the journals repository, one encrypted file per diary:
 - Plaintext: `{topic, created, entries: [{id, ts, author: user|assistant,
   text}]}` as JSON. The topic is inside the ciphertext. Entry ids are 8 random
   bytes in hex, stable.
-- Rotation rewraps the DEK under the new passphrase's kek; the ciphertext is
-  rewritten under a fresh nonce.
-- Passphrases, master keys, keks and DEKs are zeroized after use and on close
-  (`zeroize`). No recovery path.
+- Rotation seals the diary again under a **new DEK**, wrapped under the new
+  passphrase's kek: git history keeps the old file, which the old passphrase
+  still opens, but neither the old passphrase nor the old DEK opens anything
+  written from then on. A conversation that had the diary open under the old
+  passphrase finds it moved at its next change, and it is closed there —
+  never sealed back under the old.
+- Master keys, keks and DEKs are zeroized when dropped, Argon2's working
+  memory with them (its `zeroize` feature), and so is every plaintext buffer
+  a diary is sealed from or opened into. What cannot be wiped is the request
+  itself: a passphrase and an entry's text arrive in the call's JSON, and a
+  diary read leaves in its answer. No recovery path.
+- **The salt is written once.** A write that would replace or remove it is
+  refused, and a replay meeting another salt on origin is dropped and said
+  so, since every diary is stretched with the one there.
+- **Limits**: a diary holds at most 32 MiB of plaintext, so its file — 64 MiB
+  padded — stays within what the repository's host takes in one file. Each
+  write is the whole file again; compaction is how a diary is kept small.
 
 ### 5.4 Tools
 
@@ -241,10 +255,10 @@ the member that holds the journals checkout (zend's memory path).
 
 | Tool | Does |
 |---|---|
-| `diary_open {ref, passphrase}` | Unlock every diary under this passphrase for this conversation. Answers how many opened, and nothing else. Zero is no error: the opened passphrase can then create diaries. Repeated zero-result opens back off exponentially. |
-| `diary_create {ref, topic, passphrase}` | Create a diary under the open passphrase, which must be repeated and match — a typo makes no orphan. |
-| `diary_list {ref}` | The open topics, each with its entry count and first and last entry `ts`. |
-| `diary_read {ref, topic}` | The whole diary: every entry in `ts` order, with ids. No summary, no cap. |
+| `diary_open {ref, passphrase}` | Unlock every diary under this passphrase for this conversation. Answers how many opened, and nothing else. Zero is no error: the opened passphrase can then create diaries. Every open is counted against the account before the passphrase is tried, one at a time; after three that found nothing each waits twice the last, up to an hour, and an open that finds a diary takes back only its own count. At most two passphrases are stretched at once on the member. |
+| `diary_create {ref, topic, passphrase}` | Create a diary under the open passphrase, which must be repeated and match — a typo makes no orphan. A passphrase's topics are one each, across every conversation it is open in. |
+| `diary_list {ref}` | The open topics, each with its entry count and first and last entry `ts`, those another conversation created under the passphrase among them. |
+| `diary_read {ref, topic}` | The whole diary: every entry in `ts` order, with ids. No summary, no cap: a diary's answers are never cut to fit, as other tools' are. |
 | `diary_write {ref, topic, text, ts?, author?}` | Insert an entry, at `ts` (default now; a past `ts` places it there). Answers its id. |
 | `diary_delete {ref, topic, ids}` | Delete one or more entries. |
 | `diary_rotate {ref, topic, passphrase, new_passphrase}` | Rewrap a diary under a new passphrase. |
