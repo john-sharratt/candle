@@ -20,17 +20,26 @@
 //! calibrate them, a boot found 1,011 to run at ~0.7 a second, and keep rolled
 //! back a sound build for it (BlackWorld, 2026-11-07). A calibration that keeps
 //! sealing exemplars is waited out like a catch-up that keeps receiving.
+//!
+//! So is the tool sections' prefill. Every boot prefills zend's tool catalog
+//! into its base conversation, and that runs as fast as the card prefills, not
+//! as the build: WhiteWorld's 3090 prefills it at ~50 tokens a second, in about
+//! seven minutes, and its boot of 4892 finished the catalog seven seconds
+//! after keep's limit and was rolled back with nothing wrong (2026-11-11). A
+//! prefill that keeps ingesting sections is waited out like the rest.
 
 use cluster::upgrade::switch::SYNCING;
 
 use crate::loading::LoadingView;
 
 /// The step ids whose progress is a backlog worked through: the catch-up both
-/// tenants give, a repository pull's packs, and calibration's exemplars.
-const SYNC_STEPS: [&str; 4] = [
+/// tenants give, a repository pull's packs, the tool sections' prefill, and
+/// calibration's exemplars.
+const SYNC_STEPS: [&str; 5] = [
     "catchup",
     "pulling_repositories",
     "repositories",
+    "sections",
     "calibrating_sections",
 ];
 
@@ -140,6 +149,20 @@ mod tests {
         assert!(
             next_syncing_line(0, Some(&view("calibrating_sections", 3_356)), &mut last).is_some()
         );
+    }
+
+    /// **A tool-section prefill that ingests more prints a line**, and one
+    /// that stands still prints none, so a stalled prefill still times out.
+    #[test]
+    fn a_section_prefill_that_ingests_more_prints_a_line() {
+        let mut last = 0;
+        let line = next_syncing_line(0, Some(&view("sections", 1_250)), &mut last).unwrap();
+        assert_eq!(line, "INFO syncing tenant 0 1250/5000 records");
+        assert_eq!(
+            next_syncing_line(0, Some(&view("sections", 1_250)), &mut last),
+            None
+        );
+        assert!(next_syncing_line(0, Some(&view("sections", 1_251)), &mut last).is_some());
     }
 
     /// A count that falls — a catch-up round that started over — is the new

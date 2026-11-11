@@ -841,7 +841,9 @@ build is certified (§3.8):
      the build, so one that keeps receiving is waited out; one that stalls prints
      nothing and is rolled back 10 minutes after its last line. Calibration's
      exemplars are a backlog of the same kind and print the same line as each
-     one seals (`host/src/syncing.rs`).
+     one seals, and so does the tool sections' prefill as each section is
+     ingested — on a card that prefills slowly it alone outlasted the limit
+     (`host/src/syncing.rs`).
    - **No line in that time, or the process dying,** kills the trial, puts the
      set-aside file back and starts it.
    - **The line** makes the trial the service: the set-aside file is deleted and
