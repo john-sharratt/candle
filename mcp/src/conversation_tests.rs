@@ -106,7 +106,8 @@ async fn an_idle_ref_expires_at_four_hours() {
     let r = begun(&app).await;
     let opened: Ref = app.refs.open(&boss().key(), &r).unwrap();
     let issued = opened.issued_ms();
-    let at = |ms| App::conversation(&app, &call("s1"), Some(&r), ms);
+    let c = call("s1");
+    let at = |ms| App::conversation(&app, &c, Some(&r), ms);
     assert!(at(issued + REF_IDLE_MS - 1).await.is_ok());
     assert_eq!(at(issued + 2 * REF_IDLE_MS).await.unwrap_err(), EXPIRED);
     let asked = backend
