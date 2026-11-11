@@ -1,7 +1,7 @@
 //! What a private conversation holds while its diaries are open: the kek its
 //! passphrase derived, each diary it unwrapped — its own key and its topic —
-//! and when it was last used. In memory only, never written, and zeroized
-//! when it goes (`docs/private_mode.md` §5.4).
+//! and when it was last used. In memory only and never written; its kek and
+//! keys are zeroized when it goes (`docs/private_mode.md` §5.3–§5.4).
 
 use std::collections::BTreeMap;
 

@@ -142,6 +142,31 @@ async fn private_reaches_no_other_conversation() {
     assert!(!backend.sent(MAKE)[0].quiet);
 }
 
+/// **`private_mode` with a live normal ref changes nothing**: the backend
+/// goes on with the normal conversation, so it is served the client's own
+/// guide — never the `private-mode` guide, which would tell the client it is
+/// off the record while its writes still go through.
+#[tokio::test]
+async fn private_mode_with_a_live_normal_ref_is_served_as_normal() {
+    let backend = Fake::open();
+    let state = TempDir::new().unwrap();
+    let app = fake::app(&fake::gateway(&backend).await, &state);
+    let normal = begin(&app, false).await;
+    let again = App::call(
+        &app,
+        &call("s1"),
+        context::GET,
+        &json!({"ref": normal, "private_mode": true}),
+    )
+    .await;
+    assert_eq!(ref_of(&again), normal, "the same conversation");
+    let served = context::text_of(&again).unwrap();
+    assert!(served.contains("the `claude` guide:"), "{served}");
+    assert!(!served.contains("the `private-mode` guide:"), "{served}");
+    let made = App::call(&app, &call("s1"), MAKE, &json!({"ref": normal})).await;
+    assert_eq!(made["isError"], false, "{made}");
+}
+
 /// **An expired private ref refuses writes still**: every write with it is
 /// refused whole, never served as a normal conversation's, and renewing it
 /// answers a private ref.

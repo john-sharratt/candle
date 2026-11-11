@@ -143,6 +143,12 @@ impl Diaries {
     /// once.
     fn derive(&self, passphrase: &str, salt: &[u8]) -> Result<Kek, String> {
         let _slot = self.stretching.take()?;
+        self.stretch(passphrase, salt)
+    }
+
+    /// `passphrase` stretched with `salt`, by a caller already holding a
+    /// place to stretch in.
+    fn stretch(&self, passphrase: &str, salt: &[u8]) -> Result<Kek, String> {
         Kek::derive(passphrase, salt, self.params)
             .map_err(|_| "the passphrase could not be stretched".to_string())
     }
@@ -150,7 +156,9 @@ impl Diaries {
     /// Unlock every diary `passphrase` holds for `conversation`, in place of
     /// any passphrase it held before; how many opened. Each open is counted
     /// against `owner` before the passphrase is tried, and opens that unlock
-    /// nothing wait longer each time ([`backoff`]).
+    /// nothing wait longer each time ([`backoff`]). An open refused before
+    /// its passphrase could be tried — the memory unavailable, the member
+    /// busy stretching others — is counted against no one.
     pub fn open(
         &self,
         memory: &Memory,
@@ -166,10 +174,19 @@ impl Diaries {
                 wait.div_ceil(1000)
             )
         })?;
-        let (files, salt) = memory.diaries()?;
+        let (files, salt, _slot) = match memory
+            .diaries()
+            .and_then(|(files, salt)| Ok((files, salt, self.stretching.take()?)))
+        {
+            Ok(ready) => ready,
+            Err(e) => {
+                attempt.untried();
+                return Err(e);
+            }
+        };
         let pending = salt.is_none().then(new_salt);
         let salt = salt.unwrap_or_else(|| pending.expect("made when none is there").to_vec());
-        let kek = self.derive(passphrase, &salt)?;
+        let kek = self.stretch(passphrase, &salt)?;
         let open = unwrapped(&kek, &files);
         let n = open.len();
         attempt.found(n > 0);
@@ -200,7 +217,7 @@ impl Diaries {
             let u = unlocked.get(conversation).ok_or(NOT_OPEN)?;
             (u.kek.clone(), u.pending_salt)
         };
-        let (_, repo_salt) = memory.diaries()?;
+        let repo_salt = memory.diary_salt()?;
         let opened_with = match (pending, &repo_salt) {
             (Some(p), _) => p.to_vec(),
             (None, Some(s)) => s.clone(),
@@ -480,10 +497,19 @@ impl Diaries {
         if !kek.same(&confirmed.kek) {
             return Err("that is not the passphrase this conversation opened".into());
         }
-        let (_, salt) = memory.diaries()?;
-        let salt = salt.ok_or("no diary salt is kept")?;
+        let salt = memory.diary_salt()?.ok_or("no diary salt is kept")?;
         let new = self.derive(new_passphrase, &salt)?;
         let _turn = held(&self.writing);
+        // No two of a passphrase's diaries share a topic: one the new
+        // passphrase already holds keeps it, and this one stays where it is.
+        let (files, _) = memory.diaries()?;
+        let topic = topic.trim();
+        if unwrapped(&new, &files)
+            .iter()
+            .any(|(other, o)| *other != id && o.topic == topic)
+        {
+            return Err("a diary on that topic is already kept under the new passphrase".into());
+        }
         let file = self.current(memory, conversation, &id, &kek)?;
         let plain = Zeroizing::new(opened(&dek, &id, &file)?.to_bytes());
         let moved = seal(&new, &Dek::random(), &id, &plain);
@@ -502,11 +528,17 @@ impl Diaries {
     /// Lock every conversation's diaries idle past [`REF_IDLE_MS`] at
     /// `now_ms` — by its own last diary call and by `used`, its ref's last
     /// use as the record says; how many were locked.
+    /// The record is read with nothing locked, so no diary call waits on it.
     pub fn sweep(&self, now_ms: u64, used: impl Fn(&str) -> Option<u64>) -> usize {
+        let open: Vec<String> = held(&self.unlocked).keys().cloned().collect();
+        let told: HashMap<String, u64> = open
+            .into_iter()
+            .filter_map(|c| used(&c).map(|at| (c, at)))
+            .collect();
         let mut unlocked = held(&self.unlocked);
         let before = unlocked.len();
         unlocked.retain(|conversation, u| {
-            let last = used(conversation).unwrap_or(0).max(u.used_ms);
+            let last = told.get(conversation).copied().unwrap_or(0).max(u.used_ms);
             now_ms.saturating_sub(last) < REF_IDLE_MS
         });
         before - unlocked.len()

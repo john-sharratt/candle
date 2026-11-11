@@ -27,7 +27,7 @@ use futures::future::join_all;
 use mcp_server::access::{self, Access};
 use mcp_server::http::now_ms;
 use mcp_server::protocol::text_result;
-use mcp_server::refs::{Ref, Refs};
+use mcp_server::refs::{self, Ref, Refs};
 use mcp_server::{Call, Identity, NoCaller, SealedStore, Server, Store};
 use serde_json::{json, Value};
 
@@ -470,8 +470,16 @@ impl App {
         let Ran::Answered(mut answer) = ran else {
             return text_result("the client stopped listening", true);
         };
+        // The conversation is private as the ref answered says: `private_mode`
+        // changes nothing for a live ref, so a normal one asked with it stays
+        // normal and is served the client's own guide. An answer naming no
+        // ref — an error — is held to what was asked.
+        let private = context::text_of(&answer)
+            .and_then(refs::named_in)
+            .and_then(|text| this.refs.open(&call.caller.key(), text).ok())
+            .map_or(quiet, |r| r.private);
         let client = call.session.client.name();
-        if let Some(served) = this.served_context(client, &answer, quiet) {
+        if let Some(served) = this.served_context(client, &answer, private) {
             context::replace_text(&mut answer, &served);
         }
         answer

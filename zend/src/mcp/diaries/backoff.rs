@@ -6,7 +6,8 @@
 //!   opens that unlock nothing are free; after them each waits twice the
 //!   last, up to [`MAX_WAIT_MS`]. An open that unlocks a diary takes back its
 //!   own count and nothing more, so a passphrase of one's own is no way
-//!   round the waits; a count unused for a day is let go.
+//!   round the waits; a count unused for a day is let go. An open refused
+//!   before its passphrase could be tried leaves the count as it found it.
 //! - **[`Stretching`]**: at most [`AT_ONCE`] passphrases are stretched at a
 //!   time on this member, since each takes the stretch's memory.
 
@@ -46,6 +47,8 @@ pub struct Attempt<'a> {
     backoff: &'a Backoff,
     owner: String,
     settled: bool,
+    /// The account's count as it stood before this open was counted.
+    before: Count,
 }
 
 impl Backoff {
@@ -64,6 +67,7 @@ impl Backoff {
         if c.trying {
             return Err(FIRST_WAIT_MS);
         }
+        let before = *c;
         c.trying = true;
         c.fails += 1;
         c.last_ms = now_ms;
@@ -75,6 +79,7 @@ impl Backoff {
             backoff: self,
             owner: owner.to_string(),
             settled: false,
+            before,
         })
     }
 }
@@ -93,6 +98,18 @@ impl Attempt<'_> {
                     c.until_ms = 0;
                 }
             }
+        }
+    }
+
+    /// The open was refused before its passphrase was tried — the memory
+    /// unavailable, the member busy stretching others: the account's count
+    /// is as it was before it, its wait with it. One open of an account's
+    /// runs at a time, so nothing was counted since.
+    pub fn untried(mut self) {
+        self.settled = true;
+        let mut held = self.backoff.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = held.get_mut(&self.owner) {
+            *c = self.before;
         }
     }
 }
@@ -188,6 +205,19 @@ mod tests {
         let later = 30_000_000;
         b.attempt("o", later).unwrap().found(true);
         assert!(b.attempt("o", later).is_err(), "the misses still stand");
+    }
+
+    /// **An open refused before its passphrase was tried counts nothing**:
+    /// however many, the account's free opens and its waits are as they were.
+    #[test]
+    fn an_untried_open_leaves_the_count_as_it_was() {
+        let b = Backoff::default();
+        fail(&b, "o", 0);
+        for _ in 0..10 {
+            b.attempt("o", 1).unwrap().untried();
+        }
+        fail(&b, "o", 2);
+        assert!(b.attempt("o", 3).is_ok(), "the third open is still free");
     }
 
     /// **One open at a time per account**, and the count stands for one that

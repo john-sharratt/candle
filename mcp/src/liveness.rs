@@ -26,6 +26,20 @@ struct Mark {
 #[derive(Debug, Default)]
 pub struct Seen(Mutex<HashMap<String, Mark>>);
 
+/// Room in `marks` for `key`'s: past [`KEPT`], the idlest other is let go.
+fn make_room(marks: &mut HashMap<String, Mark>, key: &str) {
+    if marks.len() < KEPT || marks.contains_key(key) {
+        return;
+    }
+    let idlest = marks
+        .iter()
+        .min_by_key(|(_, m)| m.used_ms)
+        .map(|(k, _)| k.clone());
+    if let Some(idlest) = idlest {
+        marks.remove(&idlest);
+    }
+}
+
 impl Seen {
     /// Whether `r` is live at `now_ms` on what this process knows alone:
     /// issued, or used here, within the four hours a ref lives idle.
@@ -42,7 +56,9 @@ impl Seen {
     /// The record says `r` was last used at `used_ms`.
     pub fn heard(&self, r: &Ref, used_ms: u64) {
         let mut marks = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let mark = marks.entry(r.conversation()).or_insert(Mark {
+        let key = r.conversation();
+        make_room(&mut marks, &key);
+        let mark = marks.entry(key).or_insert(Mark {
             used_ms,
             told_ms: used_ms,
             previous_told_ms: used_ms,
@@ -59,15 +75,7 @@ impl Seen {
     pub fn used(&self, r: &Ref, now_ms: u64) -> bool {
         let mut marks = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let key = r.conversation();
-        if marks.len() >= KEPT && !marks.contains_key(&key) {
-            let idlest = marks
-                .iter()
-                .min_by_key(|(_, m)| m.used_ms)
-                .map(|(k, _)| k.clone());
-            if let Some(idlest) = idlest {
-                marks.remove(&idlest);
-            }
-        }
+        make_room(&mut marks, &key);
         let mark = marks.entry(key).or_insert(Mark {
             used_ms: now_ms,
             told_ms: r.issued_ms(),
@@ -175,5 +183,9 @@ mod tests {
             s.used(&refs.issue("o", false, NOW).1, NOW + i);
         }
         assert_eq!(s.len(), KEPT);
+        for i in 0..3 {
+            s.heard(&refs.issue("o", false, NOW).1, NOW + i);
+        }
+        assert_eq!(s.len(), KEPT, "what the record says is held to the cap too");
     }
 }

@@ -126,6 +126,31 @@ fn the_salt_is_never_replaced() {
     assert!(b.write_diaries(&removed).is_err());
 }
 
+/// **Every diary written under a salt origin does not keep is dropped**: a
+/// later commit rewriting the first's diary, which names no salt of its own,
+/// is sealed under the same lost one and never lands on origin unopenable.
+#[test]
+fn a_later_diary_under_a_lost_salt_is_dropped_too() {
+    let r = Repos::new();
+    let mut a = Store::open(&r.clone("a")).unwrap();
+    let mut b = Store::open(&r.clone("b")).unwrap();
+    let (salt_a, salt_b) = (new_salt(), new_salt());
+    let (id_b, file_b) = sealed("synthetic pass", &salt_b);
+    b.write_diaries(&changes(&salt_b, &id_b, &file_b)).unwrap();
+    b.sync().unwrap();
+    let (id_a, file_a) = sealed("synthetic pass", &salt_a);
+    a.write_diaries(&changes(&salt_a, &id_a, &file_a)).unwrap();
+    let (_, again) = sealed("synthetic pass", &salt_a);
+    a.write_diaries(&Changes::from([(id_a.path(), Some(again))]))
+        .unwrap();
+    let synced = a.sync().unwrap();
+    assert_eq!(synced.dropped.len(), 2, "{:?}", synced.dropped);
+    assert_eq!(synced.replayed, 0);
+    let check = Store::open(&r.clone("check")).unwrap();
+    assert_eq!(check.diary_file(&id_a), None, "no orphan on origin");
+    assert_eq!(check.diary_file(&id_b), Some(file_b.as_slice()));
+}
+
 /// **No topic and no entry's text is anywhere in the repository**: every
 /// object of the agent's checkout and of origin, every commit of history,
 /// read whole — after a diary was written, rewritten, a journal note made

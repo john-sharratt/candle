@@ -286,13 +286,18 @@ impl Store {
         let mut base = onto.clone();
         let mut done = Synced::default();
         let mut renamed: BTreeMap<LineId, LineId> = BTreeMap::new();
+        // Once a diaries commit is dropped for its salt, every later one was
+        // sealed under that same lost salt — the store refuses a second — so
+        // none of them opens on the newer base either.
+        let mut salt_lost = false;
         for c in mine {
             // A diaries commit carries its files whole onto the newer base —
             // unless the base keeps another salt, whose diaries it would
-            // orphan: then it is dropped, and said so.
+            // orphan: then it is dropped, and said so, as is every one after.
             if is_diaries(&c.message) {
                 let ch = diaries_changed(&self.repo, &c)?;
-                if moves_salt(&files, &ch) {
+                if salt_lost || moves_salt(&files, &ch) {
+                    salt_lost = true;
                     done.dropped
                         .push((c.subject().to_string(), Error::conflict(SALT_KEPT)));
                     continue;

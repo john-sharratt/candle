@@ -214,7 +214,8 @@ In the journals repository, one encrypted file per diary:
   admits nothing under it; and retrieval never reads it. Tests hold each.
 - A diary commit not yet on origin is replayed by copying its `diaries/`
   files onto the new base: each write is the whole file, so the last one
-  stands.
+  stands. One dropped because origin keeps another salt (§5.3) drops every
+  diary commit after it too: they were sealed under the same lost salt.
 
 ### 5.3 Crypto (`journals::diaries::crypto`)
 
@@ -255,13 +256,13 @@ the member that holds the journals checkout (zend's memory path).
 
 | Tool | Does |
 |---|---|
-| `diary_open {ref, passphrase}` | Unlock every diary under this passphrase for this conversation. Answers how many opened, and nothing else. Zero is no error: the opened passphrase can then create diaries. Every open is counted against the account before the passphrase is tried, one at a time; after three that found nothing each waits twice the last, up to an hour, and an open that finds a diary takes back only its own count. At most two passphrases are stretched at once on the member. |
+| `diary_open {ref, passphrase}` | Unlock every diary under this passphrase for this conversation. Answers how many opened, and nothing else. Zero is no error: the opened passphrase can then create diaries. Every open is counted against the account before the passphrase is tried, one at a time; after three that found nothing each waits twice the last, up to an hour, and an open that finds a diary takes back only its own count. At most two passphrases are stretched at once on the member; an open refused before its passphrase is tried — the member busy stretching others, the memory unavailable — is counted against no one. |
 | `diary_create {ref, topic, passphrase}` | Create a diary under the open passphrase, which must be repeated and match — a typo makes no orphan. A passphrase's topics are one each, across every conversation it is open in. |
 | `diary_list {ref}` | The open topics, each with its entry count and first and last entry `ts`, those another conversation created under the passphrase among them. |
 | `diary_read {ref, topic}` | The whole diary: every entry in `ts` order, with ids. No summary, no cap: a diary's answers are never cut to fit, as other tools' are. |
 | `diary_write {ref, topic, text, ts?, author?}` | Insert an entry, at `ts` (default now; a past `ts` places it there). Answers its id. |
 | `diary_delete {ref, topic, ids}` | Delete one or more entries. |
-| `diary_rotate {ref, topic, passphrase, new_passphrase}` | Rewrap a diary under a new passphrase. |
+| `diary_rotate {ref, topic, passphrase, new_passphrase}` | Rewrap a diary under a new passphrase. Refused when the new passphrase already keeps a diary on that topic: its topics stay one each. |
 | `diary_close {ref}` | Lock. |
 
 - Unlock state lives in memory only, keyed by the conversation, and is never

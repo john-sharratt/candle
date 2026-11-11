@@ -296,6 +296,46 @@ fn opens_that_find_nothing_back_off() {
     assert_eq!(d.open(&m, "someone-else", "c9", PASS, NOW), Ok(0));
 }
 
+/// **An open refused while the member is busy stretching others costs the
+/// account nothing**: no passphrase was tried, so no wait follows.
+#[test]
+fn an_open_refused_as_busy_is_not_counted() {
+    let (_root, m) = memory();
+    let d = diaries();
+    {
+        let _a = d.stretching.take().unwrap();
+        let _b = d.stretching.take().unwrap();
+        for _ in 0..5 {
+            let busy = d.open(&m, "o", "c1", PASS, NOW).unwrap_err();
+            assert!(busy.starts_with("diaries are busy"), "{busy}");
+        }
+    }
+    for _ in 0..3 {
+        assert_eq!(d.open(&m, "o", "c1", PASS, NOW), Ok(0), "still free");
+    }
+}
+
+/// **A rotation keeps a passphrase's topics one each**: a diary moved onto a
+/// passphrase that already keeps its topic is refused, and stays where it
+/// was.
+#[test]
+fn a_rotation_onto_a_topic_the_new_passphrase_keeps_is_refused() {
+    let (_root, m) = memory();
+    let d = diaries();
+    d.open(&m, "o", "c1", PASS, NOW).unwrap();
+    d.create(&m, "c1", TOPIC, PASS, NOW).unwrap();
+    d.open(&m, "o", "c2", OTHER, NOW).unwrap();
+    d.create(&m, "c2", TOPIC, OTHER, NOW).unwrap();
+    assert!(d.rotate(&m, "c1", TOPIC, PASS, OTHER, NOW).is_err());
+    assert!(d.read(&m, "c1", TOPIC, NOW).is_ok(), "still open here");
+    assert_eq!(
+        d.open(&m, "o", "c3", PASS, NOW),
+        Ok(1),
+        "still the old one's"
+    );
+    assert_eq!(d.open(&m, "o", "c4", OTHER, NOW), Ok(1));
+}
+
 /// **A rotated diary's later versions open under no old key**: the old
 /// passphrase's file in history gives up nothing written since.
 #[test]

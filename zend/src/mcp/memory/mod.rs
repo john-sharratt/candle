@@ -311,6 +311,17 @@ impl Memory {
         Ok((files, store.diary_salt().map(<[u8]>::to_vec)))
     }
 
+    /// The repository's diary salt, once there is one: read alone, without
+    /// copying any diary's file.
+    pub fn diary_salt(&self) -> Result<Option<Vec<u8>>, String> {
+        if let Some(why) = self.unavailable() {
+            return Err(why);
+        }
+        let guard = held(&self.store);
+        let store = guard.as_ref().ok_or(NO_MEMORY)?;
+        Ok(store.diary_salt().map(<[u8]>::to_vec))
+    }
+
     /// One diary's sealed file, when it is there.
     pub fn diary_file(&self, id: &DiaryId) -> Result<Option<Vec<u8>>, String> {
         if let Some(why) = self.unavailable() {
