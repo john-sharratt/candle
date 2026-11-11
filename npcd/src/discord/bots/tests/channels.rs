@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 
 use super::*;
-use crate::authority::ops::{ActSource, OpReply, WorldOp};
+use crate::authority::ops::{ActSource, OpReply, Voiced, WorldOp};
 use crate::discord::fake::FIRST_POSTED;
 use crate::discord::gateway::fake::SESSION;
 use crate::discord::server::record::{Channel, Server};
@@ -320,7 +320,7 @@ async fn the_characters_message_on_a_channel_is_posted() {
                 call,
                 decided: None,
                 pinned_at: None,
-                said: Some("Hello, everyone!".into()),
+                said: Some(Voiced::words("Hello, everyone!")),
                 source: ActSource::Mind,
             },
             None,

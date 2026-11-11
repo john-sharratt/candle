@@ -165,8 +165,10 @@ generation (§9). It does not roll over with the world day or chapter.
   `npc-{npc}-talk-*` timeline when an NPC is deleted.
 - **NPC↔NPC** is two conversations, one in each mind, over the one direct thread
   the pair shares (§11.1).
-- **The console's chat.** The console's `InstantMessage` interactions
-  (`npcd/src/api.rs:4335-4338`) become conversations too, so there is one path.
+- **The console's chat.** The console's `InstantMessage` interactions become
+  conversations too, so there is one path: a line typed in one is a
+  `WorldOp::Message` on the person's thread by their account handle, and a
+  slash command stays the operator's (`npcd/src/engine/mod.rs`, `inject`).
 
 ### 4.2 State a conversation keeps
 
@@ -314,9 +316,17 @@ takes a change and the world, and returns the journals that should hear of it:
   Catch-up reads that journal alongside the bot's own.
 - **House modes** are set only by an NPC's house act, which is that NPC's `did`
   line plus one world line ("Zen set the house to away mode, as John asked").
-- **Reshape goes through the authority.** `/reshape` calls `hosted.reshape` on
-  whichever member received it (`npcd/src/effector/reshape.rs:96-125`). It
-  becomes `WorldOp::Reshape`, applied by the authority, so it is journaled once.
+- **Reshape goes through the authority.** `/reshape` called `hosted.reshape` on
+  whichever member received it. It is `WorldOp::Reshape`, applied by the
+  authority (`effector::reshape::reshape_here`), so it is journaled once, and
+  answered as `OpReply::Reshaped`.
+- **The day rolling over** is told once by the member that writes the world,
+  on the first moment of a new world day (`npcd/src/engine/experience/days.rs`);
+  the first sight of a world only marks its day.
+- **Acts that are not a body's own** — a device, a bridge, the house,
+  building — write their `did` line where they land, beside a room line for
+  whoever's standing mission is for that room, or the world line for a house
+  mode (`Runtime::landed_elsewhere`).
 - **Where `concern` runs.** It runs where the change is applied (the
   authority, `worlds.rs:188-192`), right after the change. A cut-off member that
   still writes deduplicates its lines on rejoin by `(world, change seq)`.
@@ -577,7 +587,7 @@ The decision is the mind's act turn, run on an ephemeral fork with
 |---|---|---|
 | `reply` | a line on the thread to the party (`said`), carried to the authority in `WorldOp::Act.said` (§7.1) | PARKED |
 | `sign_off` | the parting line on the thread | ENDED |
-| journal | a `wrote` line in `bots/<bot>`, verbatim. The thread is marked read through the input line, so Discord's typing indicator stops (§8). | PARKED |
+| journal | a `wrote` line in `bots/<bot>`, verbatim. The thread is marked read through the input line on the authority (`WorldOp::ReadThrough`), so Discord's typing indicator stops (§8). | PARKED |
 
 Every turn leaves a message or a journal entry, and it is the decoded text in
 both cases. Nothing is prefilled.
@@ -666,8 +676,10 @@ on the lease holder, before the op is built:
 - for a conversation, the voice turn (§6.3);
 - for a main-loop channel post, §11.4.
 
-`WorldOp::Act` and `perform_here` gain `said: Option<String>`, and
-`enact::message`/`reply`/`sign_off` append `said` in place of the intent.
+`WorldOp::Act` and `perform_here` gain `said: Option<Voiced>`, where
+`Voiced { text, requests }` is the voiced line and the critical step it asks
+an authorizer for (§7.2). `enact::message`/`reply`/`sign_off` append `said` in
+place of the intent, with its `requests` on the line.
 Today the op carries only `{npc, call, decided, pinned_at}`
 (`npcd/src/authority/ops.rs:38-44`), and the call is re-parsed against
 `tools::specs()` (`perform.rs:124`). Voicing runs after the mind's turn has
@@ -702,6 +714,11 @@ handed over (§10).
 | Hand-off | `message`/`reach_out` to someone else | a purpose delivered (§10) |
 | Noted | journal destination, with optional `reflect` | the `wrote` line; `feeling` → `note_feeling` |
 
+**Checked again where they land.** The lease holder offers the mission acts
+when the party had standing as the turn began; the authority asks again —
+owner, authorizers and thrash cooldown — before applying any of them, Zen's
+agenda acts included (`npcd/src/engine/talk/orders.rs`).
+
 **Ordered bodies get their own mission specs.**
 - **Why the agenda acts don't fit.** They refuse an ordered body
   (`agenda/perform.rs:31-35`). Their required `priority` binds
@@ -710,8 +727,17 @@ handed over (§10).
   2241-2247, 2343-2349`). An ordered mission has no title either: titles live
   on `agendum` (`mission.rs:284`).
 - **So.** The same names (`mission_add`, `mission_edit`, `mission_cancel`,
-  `mission_done`) get ordered-body specs with their own descriptions. `mission`
-  binds the active mission's prompt, and there is no `priority`.
+  `mission_done`) get ordered-body specs with their own descriptions
+  (`npcd/src/engine/agenda/ordered.rs`). `mission` binds the active mission's
+  prompt, and there is no `priority`.
+  - **How a turn takes them.** They are not in `CATALOG`, which is keyed by
+    name. A talk `Within` with `orders` set (an ordered body, a party with
+    standing) takes each in place of the agenda's act of its name
+    (`tools::variant`), and they are installed in the prompt under members of
+    their own (`tools/ordered/<name>`).
+  - **How they are read.** The parser asks a parameter for only when the
+    catalog the decode was drawn from takes it, and the authority reads a
+    conversation's call for an ordered body against `tools::specs_ordered()`.
   - `mission_add` → `lodge_mission(.., start: true)` with
     `Origin::Lodged { by: account }`, which assigns it, and calls off the
     current mission and its operation (`perform.rs:406-447`;
@@ -951,9 +977,10 @@ loop.
 
 - **Answering marks read** through the line answered.
 - **The phone shows your own last line.** `read_phone` adds "You last said, {ago}: …".
-- **Repeats are checked before posting.** `would_repeat` runs before the post,
-  and a repeat is refused with the guard's nudge, never posted and then struck
-  (`runtime.rs:6673, 6739-6799`).
+- **Repeats are checked before posting.** `would_repeat` runs on the voiced
+  words against the character's own lines on that thread, before the post
+  (`talk::voice::post`), and a repeat is refused with the guard's nudge, never
+  posted and then struck.
 
 ### 11.4 Voiced channel posts
 
@@ -1182,6 +1209,9 @@ New, one concern per file:
 | `npcd/src/engine/talk/runner.rs` | per-member runner; `Talk` delivery; rescan on spawn and wake; turn counting; cancel on `put_down` | a DM reaches the runner; a rescan answers a seq above the cursor; a hand-back waits for a running conversation turn |
 | `npcd/src/engine/talk/authority.rs` | `ActSource::Talk` rules: owner and authorizer by account, request-then-yes, thrash guard | mission and agenda state before and after for each act × party |
 | `npcd/src/engine/talk/critical.rs` | `pending_critical` recording and the affirmative match | authorize, or not, for scripted line pairs |
+| `npcd/src/engine/talk/orders.rs` | a conversation's mission acts on the authority: standing re-checked, an ordered body's applied | refusals for a stranger and inside the cooldown |
+| `npcd/src/engine/agenda/ordered.rs` | the ordered-body mission specs and the order each call makes | the specs' names and params; each order read off exact arguments |
+| `npcd/src/engine/experience/days.rs` | the world's day rolling over, once | a roll told once, a first sight told nothing |
 | `npcd/src/engine/experience/{line,buffer,concern,store}.rs` | lines, per-bot buffer and flush, `concern`, npcd's `journals::live::Live` per world | rendered lines and experience fields; flush order and caps; the exact journal paths per change; a flush lands under `groups/<g>/bots/<bot>` as `Actor::Npcd{group}` |
 | `npcd/src/sim/phone/{thread,direct,channel,read,line,roster}.rs` | the rebuilt phone (§11) | stable pair ids; seq continuity; `read_through` bounds; no eviction of direct threads; `invite` refused on direct threads |
 | `journals/src/live.rs` | the live store moved from zend (`zend/src/mcp/memory/mod.rs:121-290`) | as zend's existing memory tests |
