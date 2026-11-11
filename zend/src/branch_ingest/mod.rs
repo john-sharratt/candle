@@ -37,6 +37,7 @@ use crate::calibrate::CalibrateSpec;
 use crate::code_read::{self, is_upload_path, FileJob};
 use crate::faces;
 use crate::ingest::IngestMode;
+use crate::journal::opening::SeedRead;
 use crate::layers::plan::Below;
 use crate::layers::{Ground, LayerRun, LayerSpec, Reach};
 use crate::loading::LoadProgress;
@@ -95,9 +96,21 @@ pub struct BranchIngest {
     /// chain order: what [`Self::chain_moved`] holds the repositories against,
     /// so a link that changes is read into the chain again before the pass.
     primed: Mutex<Vec<String>>,
+    /// What that chain read, for the journal's opening
+    /// ([`crate::journal::opening`]).
+    seed_read: Mutex<SeedRead>,
 }
 
 impl BranchIngest {
+    /// What the chain [`Self::prime`] last built read: empty before the first
+    /// prime, and on a member with no chain.
+    pub fn seed_read(&self) -> SeedRead {
+        self.seed_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// The file keys found to be binary: this process's, and every one a
     /// reading recorded in the substrate (`code_read::binary_mark`) — on this
     /// member before a restart, or on another member, whose verdict arrived

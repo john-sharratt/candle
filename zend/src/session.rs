@@ -72,7 +72,7 @@ use journal_core::fold;
 use journal_core::folding::{self, Folded};
 use journal_core::journal::Holds;
 use journal_core::record::view as journal_view;
-use journal_core::section::{JournalPrompt, Kept, JOURNAL};
+use journal_core::section::{render_open, JournalPrompt, Kept, Section, JOURNAL, OPEN_SECTION};
 use journal_core::span::Span;
 use journal_core::transcript::{Filed, Hits, Miss, Page};
 use journals::ops::wire::path_from_wire;
@@ -120,6 +120,7 @@ use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
 use crate::journal::desk::{Asking, Compile, Record, ZendDesk, FOLD_TOKENS, WRITE_TOKENS};
 use crate::journal::notes::JOURNAL_NOTE_TOOL;
+use crate::journal::opening::{OPENING_SEAL_WAIT, SEED_SECTION};
 use crate::journal::record::{kept_in, metadata_of, KEY as JOURNAL_KEY};
 use crate::journal::registry::{Journals, Open};
 use crate::journal::shelf::{Above, Drafted, Lazy, Notes, Shelf};
@@ -5695,10 +5696,21 @@ async fn carry_journal(
     let journal = state
         .journals
         .of(conv_id, || journal_record(state, timeline));
-    let prompt = {
+    let (prompt, nothing_open) = {
         let held = journal.lock().unwrap();
-        held.journal().prompt(held.style())
+        (
+            held.journal().prompt(held.style()),
+            render_open(&[], held.style()),
+        )
     };
+    // The journal opens with what the dialogue read before its session
+    // began (`journal::opening`), and a journal that holds nothing else yet
+    // still says where it ends.
+    let opening = journal_opening(state, timeline);
+    let ending = (prompt.is_empty() && !opening.is_empty()).then(|| Section {
+        name: OPEN_SECTION.to_string(),
+        text: nothing_open,
+    });
     // A conversation owned through `/mcp` carries its ancestors' journals
     // ahead of its own, and the reader's line after it (`mcp::lineage`).
     let inherited = inherited_journals(state, conv_id);
@@ -5709,9 +5721,11 @@ async fn carry_journal(
     // Then the memory its thread is about, before its own journal
     // (`mcp::memory_sections`).
     let memory = carried_memory(state, conv_id);
-    let mut wants: Vec<Want<'_>> = before.iter().map(inherited_want).collect();
+    let mut wants: Vec<Want<'_>> = opening.iter().map(section_want).collect();
+    wants.extend(before.iter().map(inherited_want));
     wants.extend(memory.iter().map(inherited_want));
     wants.extend(carry::wants(&prompt));
+    wants.extend(ending.iter().map(section_want));
     wants.extend(reader.map(inherited_want));
     let lineage_sweep = lineage::sweep_names();
     let memory_sweep = memory_sections::sweep_names();
@@ -5725,7 +5739,7 @@ async fn carry_journal(
         journal: carried,
         ..
     } = cs;
-    let sealed = carried
+    let mut sealed = carried
         .reconcile(
             conv,
             JOURNAL,
@@ -5736,8 +5750,46 @@ async fn carry_journal(
             tokio::time::sleep,
         )
         .await;
+    // The opening is what a conversation's first round answers its opening
+    // question from, so a round that would go without it gives it a moment
+    // to seal. Everything is submitted by now: this reconcile only waits.
+    if !opening.is_empty() && !sealed.iter().any(|s| s == SEED_SECTION) {
+        sealed = carried
+            .reconcile(
+                conv,
+                JOURNAL,
+                &wants,
+                Linking::Chain,
+                &sweep,
+                Some(OPENING_SEAL_WAIT),
+                tokio::time::sleep,
+            )
+            .await;
+    }
     journal.lock().unwrap().journal_mut().swept(&prompt);
     carry::select(selection, &sealed);
+}
+
+/// The journal's opening for the conversation at `timeline`
+/// (`journal::opening`): what the priming chain read, for a conversation that
+/// descends from it, and nothing for one that does not.
+fn journal_opening(state: &InferenceState, timeline: TimelineId) -> Vec<Section> {
+    let seeded = state
+        .engine
+        .conversation_metadata_value(timeline, Substrate::FORKED_FROM_KEY)
+        .is_some_and(|parent| parent == Substrate::SEED_PARENT);
+    if !seeded {
+        return Vec::new();
+    }
+    state.branch_ingest.seed_read().sections()
+}
+
+/// A section of the journal's own as the reconcile wants it.
+fn section_want(s: &Section) -> Want<'_> {
+    Want {
+        name: &s.name,
+        text: &s.text,
+    }
 }
 
 /// The journals `conv_id` inherits, as the sections that carry them — none for

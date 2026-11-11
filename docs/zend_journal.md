@@ -152,16 +152,41 @@ before `system_close`:
 
 `journal::carry::install` scopes the collection to the members a conversation
 names (`SelectionRule::Named`). It has no member of its own: the sections are
-the conversation's — one per entry the journal holds (`journal/<id>`), plus
-`journal/open` while any item is open — submitted to its own timeline.
+the conversation's — its opening, one per entry the journal holds
+(`journal/<id>`), plus `journal/open` — submitted to its own timeline.
 
-- **A round pins exactly the sections that have sealed.** A conversation that
-  has written nothing, or whose sections are all still sealing, pins none, so
-  neither the collection nor its intro emits, and every other layer's prompt
-  reads exactly as if no journal were declared. There is no `journal_none` and
-  no placeholder: the prompt never shows a journal heading without the entries
-  under it. (A placeholder member was tried and dropped: a reply that read it
-  instead of the entries, asked what its journal held, made them up.)
+- **The journal opens with what was read before the session began.** A
+  dialogue descends from the priming chain and holds its working set's files
+  ahead of the user's first message, all of it as its own reading, and its
+  entries say nothing of that: asked what it had read, a dialogue read the
+  seed's files again. So a conversation that descends from the chain
+  (`forked_from` is the seed alias) carries two unnumbered lines first
+  (`journal::opening`):
+  - `journal/seed` — `Before this session — I read the workspace: the root
+    listings of …; <repo>/README.md, …`, built from the links the member's
+    last prime chained (`BranchIngest::seed_read`). A repository or anchor
+    added or gone changes the text, and a carried section whose text changed is
+    sealed again; the chain re-primes on any link's content key moving
+    (`chain_moved`), which is what rebuilds it.
+  - `journal/reading` — `Then — I read other files that seemed relevant to the
+    work here, and the user asked their opening question of this session,
+    which I must answer.`
+
+  Neither is numbered, because an entry's number is what `journal_read` opens
+  and these have no turns behind them. A journal with an opening and no entry
+  yet still closes on `journal/open` (`Still open: nothing.` and the end line),
+  so the intro emits from the first round. The opening is what that round
+  answers its opening question from, so a round whose opening has not sealed
+  waits for it briefly (`OPENING_SEAL_WAIT`, 2 s) — past that it answers
+  without it, and the next round has it.
+- **A round pins exactly the sections that have sealed.** A conversation with
+  neither an opening nor an entry, or whose sections are all still sealing,
+  pins none, so neither the collection nor its intro emits, and every other
+  layer's prompt reads exactly as if no journal were declared. There is no
+  `journal_none` and no placeholder: the prompt never shows a journal heading
+  without the entries under it. (A placeholder member was tried and dropped: a
+  reply that read it instead of the entries, asked what its journal held, made
+  them up.)
 - **The sections are a chain.** Each is sealed as the continuation of the ones
   before it (`Sequence::submit_section`'s `after`): its K/V attends to them,
   and its recurrence runs on from the state they leave — itself run on from
@@ -573,6 +598,7 @@ them.
 | `zend/src/journal/desk.rs` | `ZendDesk`: the draft's question on a focused fork at `Normal`, the record write |
 | `zend/src/journal/draft.rs` | one draft and its record |
 | `zend/src/journal/carry.rs` | the schema install, the wanted sections, the round's selection |
+| `zend/src/journal/opening.rs` | `SeedRead` and the journal's opening: what was read before the session began |
 | `zend/src/journal/record.rs` | the metadata record |
 | `zend/src/journal/text.rs` | `JournalText`: the turns behind each entry as custom objects |
 | `zend/src/journal/shelf.rs` | the tools' `JournalShelf`: a dialogue's own journal and those above it, each a `JournalBook` |

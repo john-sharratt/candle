@@ -48,6 +48,7 @@ use super::walk::{walk, FileItem, UnitItem};
 use super::{record_branches, BranchIngest, LayerPass};
 use crate::code_read::{self, FileJob};
 use crate::ingest::IngestMode;
+use crate::journal::opening::SeedRead;
 use crate::loading::LoadProgress;
 use crate::priming_watch::{self, Watch};
 use crate::refresh_ctx::RefreshContext;
@@ -301,6 +302,8 @@ impl BranchIngest {
         // parent.
         let mut end: Option<TimelineId> = None;
         let mut end_key: Option<&str> = None;
+        // The links the chain holds: what the journal's opening says was read.
+        let mut chained: Vec<Link<'_>> = Vec::new();
         for (done, link) in chain.iter().enumerate() {
             if crate::ingest_cancel::cancelled() {
                 break;
@@ -357,6 +360,7 @@ impl BranchIngest {
             if read.is_some() {
                 end = read;
                 end_key = Some(link.key());
+                chained.push(*link);
             }
             progress.set_step_progress(done as u64 + 1, total);
         }
@@ -372,9 +376,25 @@ impl BranchIngest {
         // the keys as they were makes the next pass prime again.
         if !crate::ingest_cancel::cancelled() {
             *self.primed.lock().unwrap_or_else(|e| e.into_inner()) = plan.keys();
+            *self.seed_read.lock().unwrap_or_else(|e| e.into_inner()) = seed_read(&chained);
         }
         Ok(end)
     }
+}
+
+/// What `chained`, the links a chain holds, read: each root listing by its
+/// repository, each anchor by its path — the names the file tools take.
+fn seed_read(chained: &[Link<'_>]) -> SeedRead {
+    let mut read = SeedRead::default();
+    for link in chained {
+        match link {
+            Link::Folder(u) => read
+                .listings
+                .push(u.unit.dir.trim_end_matches('/').to_string()),
+            Link::File(f) => read.documents.push(f.file.path.clone()),
+        }
+    }
+    read
 }
 
 #[cfg(test)]
@@ -502,6 +522,25 @@ mod tests {
             &keys(slice::from_ref(&root), &[readme, claude], &repos)
         ));
         assert!(moved(&primed, &keys(&[root], &[], &repos)));
+    }
+
+    /// **The opening names what the chain holds**: each root listing by its
+    /// repository and each anchor by its path, in chain order.
+    #[test]
+    fn the_seed_read_is_the_chained_links_by_name() {
+        let units = [unit("a/", &["main"]), unit("b/", &["main"])];
+        let files = [
+            file("a/README.md", &["main"]),
+            file("b/AGENTS.md", &["main"]),
+        ];
+        let repos = [
+            ("a".to_string(), "main".to_string()),
+            ("b".to_string(), "main".to_string()),
+        ];
+        let read = seed_read(&links(&units, &files, &repos));
+        assert_eq!(read.listings, ["a", "b"]);
+        assert_eq!(read.documents, ["a/README.md", "b/AGENTS.md"]);
+        assert_eq!(seed_read(&[]), SeedRead::default());
     }
 
     #[test]

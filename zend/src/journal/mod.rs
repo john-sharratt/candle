@@ -17,6 +17,7 @@
 //! | [`desk`] | the draft's question put to a focused fork of the dialogue, at `Normal` |
 //! | [`draft`] | one draft — write or skip in one answer — and its record |
 //! | [`carry`] | the journal as the system prompt carries it |
+//! | [`opening`] | the journal's opening: what was read before the session began |
 //! | [`record`] | the record a restart rebuilds the journal from |
 //! | [`text`] | the turns behind each entry, whole, for `journal_read` and `journal_grep` |
 //! | [`shelf`] | the journals a dialogue's journal tools reach by name: its own, and those above it |
@@ -31,6 +32,7 @@ pub mod carry;
 pub mod desk;
 pub mod draft;
 pub mod notes;
+pub mod opening;
 pub mod origin;
 pub mod pressure;
 pub mod record;

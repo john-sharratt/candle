@@ -664,14 +664,16 @@ system_prompt:
       depends_on: tools
 
     # ── WHAT THIS SESSION HAS WRITTEN DOWN (per conversation · daemon-filled) ──
-    # The dialogue's working journal (`docs/zend_journal.md`): one section per
-    # kept entry, its newest five, and one for what is still open. zend submits
-    # them to the conversation's own timeline as entries are written, so they
-    # are sealed, persisted and tombstoned with it and no other conversation
-    # sees them. The collection selects by name (`journal::carry::install`):
-    # a conversation that has written nothing pins nothing, so neither this
-    # intro nor the collection emits, and every other layer's prompt reads as
-    # if the journal were not declared.
+    # The dialogue's working journal (`docs/zend_journal.md`): for a dialogue
+    # that descends from the priming chain, its opening — what the chain read,
+    # then that the user asked their opening question (`journal::opening`) —
+    # then one section per kept entry, its newest five, and one for what is
+    # still open. zend submits them to the conversation's own timeline, so
+    # they are sealed, persisted and tombstoned with it and no other
+    # conversation sees them. The collection selects by name
+    # (`journal::carry::install`): a conversation with neither an opening nor
+    # an entry pins nothing, so neither this intro nor the collection emits,
+    # and every other layer's prompt reads as if the journal were not declared.
     #
     # Last before the close, so a new entry changes nothing above it.
     - kind: section
@@ -682,7 +684,7 @@ system_prompt:
 
         This is your journal for this conversation: entries you wrote yourself about earlier stretches of it, kept here so you do not lose them as the conversation grows. It is not the notes tool — the notes tools hold something else, and you never need a tool to read your journal: it is right here. When you are asked what you have written down, what your journal says, or what happened earlier in this conversation, answer from these entries.
 
-        Each entry is one line: its number and the task or step that stretch of the conversation was. The day and hour stand above the entries where they changed. "Still open:" is what you have left unfinished, and the journal ends where it says so.
+        It opens with what you read before this session began. Each entry after that is one line: its number and the task or step that stretch of the conversation was. The day and hour stand above the entries where they changed. "Still open:" is what you have left unfinished, and the journal ends where it says so.
 
         Behind each entry are the turns it was written from, whole. When a line is not enough — the exact words, a file's contents, an error from back then — read them with journal_read, giving journal "self" and the entry's number, or find which entry holds something with journal_grep.
 
