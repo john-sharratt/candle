@@ -31,6 +31,7 @@ use candle_transformers::models::expert_lre::is_expert_stall;
 use candle_transformers::models::residual_rows::{compact_creeps, CreepResidual};
 use candle_transformers::models::wave_driver::{StepCreep, StepRows, StepSpec};
 use std::collections::HashSet;
+use std::slice;
 
 /// Free KV regions kept in hand before [`Scheduler::vram_under_pressure_for`]
 /// calls it pressure, as a divisor of the reservation's KV side plus an absolute
@@ -5963,7 +5964,17 @@ impl Scheduler {
     /// gathering scattered rows into a block of their own would be a
     /// vocabulary-wide carve per finishing turn. A wave whose finishing rows
     /// are one run — the common case, and always when one turn finishes — is a
-    /// single dispatch. A dispatch that fails fails every turn it carried.
+    /// single dispatch.
+    ///
+    /// **A row with NaN fails its own turn, not the run's.** A dispatch that
+    /// fails is read row by row: a row holding NaN is its own prefill's forward
+    /// gone bad and fails, and each row that holds none is sampled again alone.
+    /// Scoring leaves every state as it found it (`BatchedSampler::score_rows`)
+    /// and the failure is raised before any row commits, so the second draw is
+    /// the one the first would have made. Failed together, one character's bad
+    /// forward took every turn beside it: on WhiteWorld (2026-11-11) Zen's mind
+    /// failed every turn for twenty minutes with its own row clean, sampled
+    /// beside another character's NaN.
     fn sample_first_tokens(
         &self,
         rows: &[Tensor],
@@ -5990,13 +6001,43 @@ impl Scheduler {
                     )))
                 })),
                 Err(e) => {
-                    // The dispatch fails every turn it carried, so say which
-                    // row was at fault: a non-finite row is its own prefill's
-                    // forward gone bad, and the others failed only beside it.
+                    // Read row by row: a row with NaN fails its own turn, and
+                    // a clean one beside it is sampled again alone.
                     let msg = e.to_string();
-                    for (k, row) in rows[start..end].iter().enumerate() {
-                        let seq = self.active_prefills[prepared[start + k].0].work.sequence_id;
+                    for k in 0..n {
+                        let row = &rows[start + k];
+                        let seq = self.active_prefills[run[k].0].work.sequence_id;
                         let clean = row_is_nan_free(row);
+                        if n > 1 && clean == Some(true) {
+                            let alone = Tensor::cat_view(slice::from_ref(row), 0)
+                                .expect("one row is named as one view");
+                            let mut state = [&mut run[k].1.sampling_state];
+                            match self
+                                .sampler
+                                .sample_batch(&alone, &mut state, &[&configs[k]])
+                            {
+                                Ok(tokens) if tokens.len() == 1 => {
+                                    tracing::warn!(
+                                        seq = seq.0,
+                                        "first-token sample failed for a block of {n} turn(s); \
+                                         this turn's row holds no NaN and was sampled alone: {msg}"
+                                    );
+                                    out.push(Ok(tokens[0]));
+                                    continue;
+                                }
+                                Ok(tokens) => out.push(Err(ConversationError::Channel(format!(
+                                    "first-token sample returned {} tokens for 1 turn",
+                                    tokens.len()
+                                )))),
+                                Err(alone) => out.push(Err(ConversationError::Model(
+                                    candle::Error::Msg(format!(
+                                        "{alone} (this turn's own row holds no NaN; sampled \
+                                         alone after a block of {n} failed: {msg})"
+                                    )),
+                                ))),
+                            }
+                            continue;
+                        }
                         tracing::warn!(
                             seq = seq.0,
                             row_nan_free = ?clean,
@@ -6004,11 +6045,7 @@ impl Scheduler {
                         );
                         let why = match clean {
                             Some(false) => format!("{msg} (this turn's prefill row holds NaN)"),
-                            Some(true) => format!(
-                                "{msg} (this turn's own row holds no NaN: it was sampled beside \
-                                 one that did)"
-                            ),
-                            None => msg.clone(),
+                            Some(true) | None => msg.clone(),
                         };
                         out.push(Err(ConversationError::Model(candle::Error::Msg(why))));
                     }

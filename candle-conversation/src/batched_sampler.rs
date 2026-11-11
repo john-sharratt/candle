@@ -3862,6 +3862,38 @@ mod tests {
         assert_eq!(tokens[0], 20);
     }
 
+    /// **A batch that fails on one NaN row leaves every state as it found it**,
+    /// so a clean row beside it, sampled again alone, draws exactly what it
+    /// would have drawn alone from the start — what the scheduler's first
+    /// sample relies on to fail only the bad row (`sample_first_tokens`). Two
+    /// sampled allow-list rows: the clean one spread over its allowed tokens,
+    /// the other NaN throughout, as a forward gone bad leaves it.
+    #[test]
+    fn a_batch_failed_by_a_nan_row_leaves_the_clean_rows_state_untouched() {
+        let sampler = make_sampler();
+        let config = sampled_config(7).with_stencil(vec![10, 20, 30]);
+        let clean = logits_from_rows(&[&[(10, 2.0), (20, 2.2), (30, 1.9)]]);
+        let mut data = clean.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        data.extend(vec![f32::NAN; VOCAB_SIZE]);
+        let block = Tensor::from_vec(data, (2, VOCAB_SIZE), &Device::Cpu).unwrap();
+
+        let mut state = make_state();
+        let mut beside = make_state();
+        let failed =
+            sampler.sample_batch(&block, &mut [&mut state, &mut beside], &[&config, &config]);
+        assert!(failed.is_err(), "a NaN row fails the batch it is in");
+        let again = sampler
+            .sample_batch(&clean, &mut [&mut state], &[&config])
+            .expect("the clean row alone");
+
+        let mut fresh = make_state();
+        let alone = make_sampler()
+            .sample_batch(&clean, &mut [&mut fresh], &[&config])
+            .expect("the clean row from the start");
+        assert_eq!(again, alone, "the failed batch moved the clean row's draw");
+        assert_eq!(state.rng_offset, fresh.rng_offset);
+    }
+
     /// Constrained rows are issued in the pass over the batch and finished
     /// after the unconstrained rows' kernel: each must land in its OWN row, and
     /// advance its own state, with an unconstrained row between them. Every row
