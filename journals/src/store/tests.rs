@@ -22,7 +22,7 @@ use crate::testing::{note as testing_note, slug};
 use crate::tree::render::render_all;
 
 /// A `git` command for the fixture, failing the test on failure.
-fn git(dir: &Path, args: &[&str]) -> String {
+pub(super) fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(dir)
         .args([
@@ -46,14 +46,14 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-struct Repos {
+pub(super) struct Repos {
     _root: TempDir,
     root: PathBuf,
-    origin: PathBuf,
+    pub(super) origin: PathBuf,
 }
 
 impl Repos {
-    fn new() -> Repos {
+    pub(super) fn new() -> Repos {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().to_path_buf();
         let origin = path.join("origin.git");
@@ -77,7 +77,7 @@ impl Repos {
     }
 
     /// A clone for one agent.
-    fn clone(&self, name: &str) -> PathBuf {
+    pub(super) fn clone(&self, name: &str) -> PathBuf {
         git(
             &self.root,
             &["clone", "-q", self.origin.to_str().unwrap(), name],
@@ -92,7 +92,7 @@ impl Repos {
     }
 
     /// A commit straight to origin, as a person or a job would make one.
-    fn hand_edit(&self, name: &str, file: &str, text: &str) {
+    pub(super) fn hand_edit(&self, name: &str, file: &str, text: &str) {
         let dir = self.clone(name);
         let at = dir.join(file);
         std::fs::create_dir_all(at.parent().unwrap()).unwrap();
@@ -103,7 +103,7 @@ impl Repos {
     }
 }
 
-fn note(text: &str) -> Op {
+pub(super) fn note(text: &str) -> Op {
     note_on("topics", text)
 }
 

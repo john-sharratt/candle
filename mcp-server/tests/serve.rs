@@ -3,7 +3,6 @@
 //! front names, a call answered on an event stream with its progress, and the
 //! refusals.
 
-use std::io;
 use std::mem;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -20,9 +19,6 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Duration};
 use tower::ServiceExt;
-use tracing::callsite::rebuild_interest_cache;
-use tracing::subscriber::set_default;
-use tracing_subscriber::fmt::MakeWriter;
 
 /// An app with one tool, `remember {text}`, which holds its text on the
 /// session and answers what was held there before; and `slow`, which says two
@@ -271,66 +267,6 @@ async fn a_stateless_caller_is_kept_apart_by_the_session_it_calls_on_behalf_of()
     )
     .await;
     assert!(body(again).await.contains("ann held blue"));
-}
-
-/// What a subscriber writes, kept to be read back.
-#[derive(Clone, Default)]
-struct Kept(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for Kept {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Kept {
-    type Writer = Kept;
-
-    fn make_writer(&'a self) -> Kept {
-        self.clone()
-    }
-}
-
-/// **A call a server in front asks not be logged leaves no line**
-/// (`docs/private_mode.md` §4.4); any other is logged as it is handled.
-#[tokio::test]
-async fn a_quiet_call_leaves_no_line_in_the_log() {
-    let kept = Kept::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(kept.clone())
-        .with_ansi(false)
-        .finish();
-    let _logging = set_default(subscriber);
-    // Tests beside this one may have met the log's callsite before any
-    // subscriber was here, and cached it as wanted by none.
-    rebuild_interest_cache();
-    let (router, _) = stand();
-    let modern = [(VERSION_HEADER, MODERN)];
-    let quiet = json!({"io.modelcontextprotocol/clientInfo": {"name": "claude-code"},
-                       "com.tokera/quiet": true});
-    let res = send(
-        &router,
-        rpc(Some("ann"), &modern, call(1, "slow", json!({}), quiet)),
-    )
-    .await;
-    assert!(body(res).await.contains("done"));
-    let logged = String::from_utf8(kept.0.lock().unwrap().clone()).unwrap();
-    assert!(!logged.contains("mcp: handled"), "{logged}");
-    let plain = json!({"io.modelcontextprotocol/clientInfo": {"name": "claude-code"}});
-    let res = send(
-        &router,
-        rpc(Some("ann"), &modern, call(2, "slow", json!({}), plain)),
-    )
-    .await;
-    assert!(body(res).await.contains("done"));
-    let logged = String::from_utf8(kept.0.lock().unwrap().clone()).unwrap();
-    assert!(logged.contains("mcp: handled"), "{logged}");
-    assert!(logged.contains("tool=\"slow\"") || logged.contains("tool=slow"), "{logged}");
 }
 
 #[tokio::test]

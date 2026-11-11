@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use mcp_server::access::{self, Access};
 use mcp_server::refs::OPENING;
 use serde_json::Value;
 
@@ -49,7 +50,9 @@ fn names_memory(journal: &str) -> bool {
 
 /// `tool` called with `args` reads or writes the memory: it is sent where the
 /// memory is served ([`crate::backend::Backend::path_for`]). A thread's or a
-/// project's journal is any member's to serve.
+/// project's journal is any member's to serve. Diaries are kept in the
+/// memory's repository, and what a conversation unlocked is held by the
+/// member serving it (`docs/private_mode.md` §5.4).
 pub fn needs_memory(tool: &str, args: &Value) -> bool {
     if JOURNAL_TOOLS.contains(&tool) {
         return args
@@ -57,7 +60,7 @@ pub fn needs_memory(tool: &str, args: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(names_memory);
     }
-    MEMORY.contains(&tool)
+    MEMORY.contains(&tool) || access::access(tool) == Access::Diary
 }
 
 /// The memory's own tools: what they do is the memory, never an episode.
@@ -214,6 +217,9 @@ mod tests {
             "user_episode_note",
             "journal_focus",
             "group_add",
+            "diary_open",
+            "diary_read",
+            "diary_close",
         ] {
             assert!(needs_memory(tool, &none), "{tool}");
         }

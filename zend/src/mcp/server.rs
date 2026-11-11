@@ -113,7 +113,13 @@ impl Server for ZendSession {
             store: Arc::clone(&call.store),
             progress: call.progress.clone(),
         };
-        tools::fit(tools::call(&ctx, name, args).await)
+        let mut answer = tools::fit(tools::call(&ctx, name, args).await);
+        // A private conversation reads and leaves nothing behind: not even
+        // which journal entries it was handed (`docs/private_mode.md` §4.4).
+        if conversation.is_some_and(|r| r.private) {
+            answer.marks.clear();
+        }
+        answer
     }
 
     fn tools_version(&self) -> Option<&str> {

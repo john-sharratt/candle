@@ -43,6 +43,10 @@ pub const APPEND_ONLY: &str =
 pub const NO_CONVERSATION: &str = "this call names no conversation: get_user_context answers \
     this conversation's ref, to pass as `ref` on every call";
 
+/// Why a private conversation has no journal of its own.
+pub const NO_JOURNAL_IN_PRIVATE: &str =
+    "this conversation is private: it keeps no journal of its own";
+
 /// Why a path or an address names no journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Miss {
@@ -85,8 +89,11 @@ pub struct Mem {
     /// person's home group; `@guest` for a guest.
     pub group: Option<Slug>,
     /// The conversation the call is in, by its ref's key
-    /// (`docs/private_mode.md` §3.1): none for a call that names no ref.
+    /// (`docs/private_mode.md` §3.1): none for a call that names no ref, or
+    /// for a private conversation, which keeps no journal.
     pub conversation: Option<String>,
+    /// The call is in a private conversation (§4).
+    pub private: bool,
     /// This conversation's journal, once the person has a group to hold it.
     pub here: Option<JournalPath>,
 }
@@ -102,7 +109,17 @@ pub fn channel_of(c: McpClient) -> Channel {
 /// `here` names the conversation's journal whether or not a write has opened
 /// it yet.
 pub fn read(ctx: &Ctx) -> Result<Mem, String> {
-    read_in(ctx, ctx.conversation.as_ref().map(Ref::conversation))
+    read_in(ctx, journaled(ctx))
+}
+
+/// The call's conversation, by its ref's key, when it may have a journal: a
+/// private one never does, nor a name reserved for one
+/// (`docs/private_mode.md` §4.4).
+fn journaled(ctx: &Ctx) -> Option<String> {
+    ctx.conversation
+        .filter(|r| !r.private)
+        .as_ref()
+        .map(Ref::conversation)
 }
 
 /// [`read`] in `conversation`, by its ref's key: what `get_user_context`
@@ -110,6 +127,7 @@ pub fn read(ctx: &Ctx) -> Result<Mem, String> {
 pub fn read_in(ctx: &Ctx, conversation: Option<String>) -> Result<Mem, String> {
     let mut m = Mem::reading(&ctx.session, &ctx.caller, channel_of(ctx.mcp.client))?;
     m.conversation = conversation;
+    m.private = ctx.conversation.is_some_and(|r| r.private);
     if let (Who::Person(person), Some(group), Some(conversation)) =
         (&m.who, &m.group, &m.conversation)
     {
@@ -138,7 +156,7 @@ pub fn open(ctx: &Ctx) -> Result<Mem, String> {
         &ctx.session,
         &ctx.caller,
         channel_of(ctx.mcp.client),
-        ctx.conversation.as_ref().map(Ref::conversation),
+        journaled(ctx),
     )
 }
 
@@ -225,6 +243,7 @@ impl Mem {
             admin: caller.is_admin(),
             group,
             conversation: None,
+            private: false,
             here: None,
         })
     }
@@ -240,6 +259,7 @@ impl Mem {
             admin: self.admin,
             group: self.group.clone(),
             conversation: self.conversation.clone(),
+            private: self.private,
             here: self.here.clone(),
         }
     }
@@ -276,6 +296,7 @@ impl Mem {
                     "you read @{g} and write nothing there, not even a conversation of your own"
                 )
             }
+            (Some(_), _) if self.private => NO_JOURNAL_IN_PRIVATE.into(),
             (Some(_), _) if self.conversation.is_none() => NO_CONVERSATION.into(),
             (Some(_), _) => {
                 "this conversation's journal could not be opened; try again shortly".into()
@@ -481,6 +502,7 @@ pub(crate) mod tests {
             admin: person == "john",
             group,
             conversation: Some("c0ffee00c0ffee00".into()),
+            private: false,
             here: None,
         }
     }
@@ -594,6 +616,8 @@ pub(crate) mod tests {
         let mut unnamed = mem("john");
         unnamed.conversation = None;
         assert_eq!(unnamed.why_no_here(), NO_CONVERSATION);
+        unnamed.private = true;
+        assert_eq!(unnamed.why_no_here(), NO_JOURNAL_IN_PRIVATE);
         let mut solo = mem("solo");
         solo.conversation = None;
         assert_eq!(

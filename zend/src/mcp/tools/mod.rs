@@ -32,9 +32,10 @@ use mcp_server::{protocol, Session, Store};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::attached;
 use super::caller::Caller;
 use super::reported::{self, Mark};
-use super::state::{ATTACHED, DEFAULT_WAIT_S};
+use super::state::DEFAULT_WAIT_S;
 use crate::session::ZendSession;
 
 pub use fit::fit;
@@ -43,6 +44,15 @@ mod approval_grant;
 mod archive;
 mod attach;
 pub mod cluster_audit;
+mod diary;
+mod diary_close;
+mod diary_create;
+mod diary_delete;
+mod diary_list;
+mod diary_open;
+mod diary_read;
+mod diary_rotate;
+mod diary_write;
 pub mod cluster_command;
 pub mod cluster_logs;
 pub mod cluster_status;
@@ -115,22 +125,12 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// What the thread `thread_attach` bound this call's conversation to is
-    /// held under on the session: one per conversation, so two chats carried
-    /// on one MCP session — as claude.ai carries all of a person's — attach
-    /// apart (`docs/private_mode.md` §3). A call in no conversation is its
-    /// session's.
-    pub fn attached_key(&self) -> String {
-        match &self.conversation {
-            Some(r) => format!("{ATTACHED}/{}", r.conversation()),
-            None => ATTACHED.to_string(),
-        }
-    }
-
     /// The thread the call's conversation is attached to, which `"self"`
-    /// names.
+    /// names (`crate::mcp::attached`). A call in no conversation has none.
     pub fn attached(&self) -> Option<String> {
-        self.mcp.held(&self.attached_key()).map(str::to_string)
+        let conversation = self.conversation?.conversation();
+        let records = self.session.shared_substrate()?;
+        attached::attached(&records, &self.caller.key(), &conversation)
     }
 }
 
@@ -214,6 +214,14 @@ pub fn definitions() -> Value {
         zen_chat_send::definition(),
         zen_chat_read::definition(),
         zen_chat_close::definition(),
+        diary_open::definition(),
+        diary_create::definition(),
+        diary_list::definition(),
+        diary_read::definition(),
+        diary_write::definition(),
+        diary_delete::definition(),
+        diary_rotate::definition(),
+        diary_close::definition(),
         job::list::definition(),
         job::status::definition(),
         job::read::definition(),
@@ -305,6 +313,14 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         zen_chat_send::NAME => zen_chat_send::call(ctx, args).await,
         zen_chat_read::NAME => zen_chat_read::call(ctx, args).await,
         zen_chat_close::NAME => blocking(ctx, args, zen_chat_close::call).await,
+        diary_open::NAME => blocking(ctx, args, diary_open::call).await,
+        diary_create::NAME => blocking(ctx, args, diary_create::call).await,
+        diary_list::NAME => blocking(ctx, args, diary_list::call).await,
+        diary_read::NAME => blocking(ctx, args, diary_read::call).await,
+        diary_write::NAME => blocking(ctx, args, diary_write::call).await,
+        diary_delete::NAME => blocking(ctx, args, diary_delete::call).await,
+        diary_rotate::NAME => blocking(ctx, args, diary_rotate::call).await,
+        diary_close::NAME => blocking(ctx, args, diary_close::call).await,
         job::list::NAME => job::list::call(ctx, args).await,
         job::status::NAME => job::status::call(ctx, args).await,
         job::read::NAME => job::read::call(ctx, args).await,
@@ -434,6 +450,14 @@ mod tests {
                 "zen_chat_send",
                 "zen_chat_read",
                 "zen_chat_close",
+                "diary_open",
+                "diary_create",
+                "diary_list",
+                "diary_read",
+                "diary_write",
+                "diary_delete",
+                "diary_rotate",
+                "diary_close",
                 "job_list",
                 "job_status",
                 "job_read",

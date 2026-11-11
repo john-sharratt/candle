@@ -10,7 +10,9 @@ use journals::path::JournalPath;
 use journals::scope::Section;
 use serde_json::{json, Value};
 
+use super::mem::NO_CONVERSATION;
 use super::{mem, string, Answer, Ctx};
+use crate::mcp::attached;
 use crate::mcp::memory_sections::MAX_TOPICS;
 use crate::mcp::names;
 use crate::mcp::records::Records;
@@ -50,6 +52,9 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(t) => t,
         Err(e) => return Answer::error(e),
     };
+    let Some(conversation) = ctx.conversation.map(|r| r.conversation()) else {
+        return Answer::error(NO_CONVERSATION);
+    };
     let Some(records) = ctx.session.shared_substrate() else {
         return Answer::error("the model is still loading; try again shortly");
     };
@@ -65,10 +70,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(created) => created,
         Err(e) => return Answer::error(e.to_string()),
     };
-    if let Err(e) = ctx
-        .store
-        .hold(&ctx.mcp_id, &ctx.mcp, &ctx.attached_key(), thread, now_ms())
-    {
+    if let Err(e) = attached::attach(&records, &owner, &conversation, thread, now_ms()) {
         return Answer::error(e.to_string());
     }
     if let Some(about) = args.get("about") {

@@ -174,6 +174,10 @@ Write, refused while private:
   `mcp: called` nor any server's `mcp: handled` — and no error text. A
   `diary_*` call's arguments and results are never logged, private or not.
   `mcp_server::Server::logs` asks the server whether a call is logged.
+- No reported marks: what `job_status` and the like hand over is not marked
+  reported for a private conversation.
+- Its context is served with the `private-mode` guide, and zend's frame for
+  it ends with how it reads, never with how to write.
 - What remains of a private conversation is its ref record (§3.2): a digest
   and a time, ceased four hours after its last use.
 
@@ -358,3 +362,22 @@ opening a new MCP session for every call.
 - **The guide tools need a ref too**: every conversation then starts at
   `get_user_context`, which makes "context on the first call" redundant, and
   it is removed.
+- **What a conversation holds follows its ref, never a session**: the thread
+  `thread_attach` binds is a record per account and conversation
+  (`mcp/attached/<owner>/<conversation>`), ceased four hours after the ref's
+  last use, rather than a value held on the MCP session — on which Grok's
+  next call would not find it, and claude.ai's one session would gather one
+  per chat for ever.
+- **Liveness is the aggregator's to say, `get_user_context` included**: a
+  ref it finds live goes to zend in `_meta` and is answered as it is; one it
+  does not is renewed. Its use is told only once it is found live, so an
+  expired ref is never revived by naming it.
+- **A private conversation's context is served with the `private-mode`
+  guide** in place of the client's, and zend's frame ends with how a private
+  conversation reads rather than how to write: every client's guide says to
+  write.
+- **A private call keeps no reported marks**: `job_status` and the other
+  readers that hand over journal entries mark them reported once delivered —
+  a record, keyed by account — and a private conversation leaves none.
+- **The ref is the conversation's key everywhere, but it is never written**:
+  records, journals and noted calls are kept under a digest of its id.

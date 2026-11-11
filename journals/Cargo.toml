@@ -8,13 +8,21 @@ description = "The memory backbone: journal trees for people and their families,
 # operation on it — is plain code over bytes and builds and tests in seconds.
 # Only `store` touches git, through zend-vfs.
 [dependencies]
-journal-core = { path = "../journal-core" }
-serde_json   = { workspace = true }
-serde_yaml   = { workspace = true }
-sha2         = "0.10"
-thiserror    = { workspace = true }
-tracing      = { workspace = true }
-zend-vfs     = { path = "../zend-vfs" }
+# Diaries (`src/diaries/`): passphrase stretching, key derivation, sealing,
+# random ids and nonces, and keys wiped when dropped.
+argon2           = "0.5"
+chacha20poly1305 = "0.10"
+hkdf             = "0.12"
+journal-core     = { path = "../journal-core" }
+rand             = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+serde_yaml       = { workspace = true }
+sha2             = "0.10"
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+zend-vfs         = { path = "../zend-vfs" }
+zeroize          = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

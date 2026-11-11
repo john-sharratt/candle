@@ -13,6 +13,20 @@ const AT: &str = "Journal-At";
 const LINE: &str = "Journal-Line";
 const ACTOR: &str = "Journal-Actor";
 const OP: &str = "Journal-Op";
+/// The trailer a diaries commit carries, by which a replay knows it: it
+/// names nothing — no diary, no topic, no writer (`docs/private_mode.md`
+/// §5.2).
+const DIARIES: &str = "Journal-Diaries: update";
+
+/// The message of every commit that changes diaries: the same each time.
+pub fn diaries_message() -> String {
+    format!("diaries: update\n\n{DIARIES}\n")
+}
+
+/// Whether `message` is a diaries commit's.
+pub fn is_diaries(message: &str) -> bool {
+    message.lines().any(|l| l == DIARIES)
+}
 
 /// The message of `op`'s commit; `line` is the line it wrote, when it wrote
 /// one, so a replay keeps that line's id.
@@ -93,6 +107,17 @@ mod tests {
         );
         let no_line = message("x", &yen(), &op, now(), None);
         assert_eq!(read(&no_line).unwrap().line, None);
+    }
+
+    #[test]
+    fn a_diaries_commit_says_nothing_but_that_it_is_one() {
+        assert_eq!(
+            diaries_message(),
+            "diaries: update\n\nJournal-Diaries: update\n"
+        );
+        assert!(is_diaries(&diaries_message()));
+        assert!(!is_diaries("Note on @zen/topics\n\nJournal-At: x\n"));
+        assert!(read(&diaries_message()).is_err(), "no operation to replay");
     }
 
     #[test]

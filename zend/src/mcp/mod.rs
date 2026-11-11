@@ -30,19 +30,23 @@
 //! | [`records`] | The small records kept in the substrate |
 //! | [`begin`] | Which conversation a `get_user_context` begins or goes on with (`docs/private_mode.md` §3) |
 //! | [`ref_records`] | Each conversation ref's last use, read by every member and both aggregators |
-//! | [`state`] | Sessions as records, the attached thread, the change signal |
+//! | [`state`] | Sessions as records, the change signal |
+//! | [`attached`] | The thread each conversation is attached to, which `"self"` names |
 //! | [`tending`] | The sessions' noted use written in, and the stale swept, off the request path |
 //! | [`chats`] | Zen chat: a private conversation named by its id, disposed of when closed or idle (`docs/zen_chat.md`) |
+//! | [`diaries`] | Diaries: unlocked per private conversation by passphrase, sealed in the memory's repository (`docs/private_mode.md` §5) |
 //! | [`driven`] | Whether anyone drives a task: `attended`, or `alone` and told so |
 //! | [`thread_export`] | A thread's notes and tasks' ends kept in the memory's `threads/`, referenced from its topics |
 
 pub mod activity;
 pub mod approvals;
 pub mod archiving;
+pub mod attached;
 pub mod audit;
 pub mod begin;
 pub mod caller;
 pub mod chats;
+pub mod diaries;
 pub mod driven;
 pub mod lineage;
 pub mod memory;

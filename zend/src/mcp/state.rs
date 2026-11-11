@@ -6,10 +6,10 @@
 //!   client's opened by `initialize`, a 2026-07-28 client's keyed by its
 //!   person, its client and — when the aggregator calls on its behalf — the
 //!   aggregator's own session. zend keeps them in its substrate
-//!   ([`RecordStore`]), so every member reads the same ones, and holds one
-//!   thing on each: the thread `thread_attach` bound it to ([`ATTACHED`]), which
-//!   `"self"` names. Which client opened it bounds how long a call may wait
-//!   (§3.3).
+//!   ([`RecordStore`]), so every member reads the same ones. What a
+//!   conversation holds is kept by its ref, not on a session
+//!   (`docs/private_mode.md` §3). Which client opened a session bounds how
+//!   long a call may wait (§3.3).
 //! - **A change signal**, bumped whenever a worker's state moves on this
 //!   member, which a waiting `repo_task_start` or `repo_task_reply` wakes on; it
 //!   also re-reads every few seconds,
@@ -26,6 +26,7 @@ use mcp_server::{Client, Session, Store};
 use tokio::sync::watch;
 use web::auth::oidc::random_token;
 
+use super::diaries::Diaries;
 use super::memory::Memory;
 use super::noted_calls::NotedCalls;
 use super::ops_tools::OpsTools;
@@ -35,9 +36,6 @@ use super::records::Records;
 /// running worker reports what it has done every 45 seconds, and Claude can
 /// stop waiting on what it reads.
 pub const DEFAULT_WAIT_S: u64 = 45;
-
-/// What a session holds the thread `thread_attach` bound it to under.
-pub const ATTACHED: &str = "attached";
 
 const PREFIX: &str = "mcp/session/";
 
@@ -193,6 +191,7 @@ pub struct McpState {
     used: Arc<Used>,
     noted: NotedCalls,
     refs: OnceLock<Refs>,
+    diaries: Diaries,
 }
 
 impl Default for McpState {
@@ -204,11 +203,17 @@ impl Default for McpState {
             used: Arc::default(),
             noted: NotedCalls::default(),
             refs: OnceLock::new(),
+            diaries: Diaries::default(),
         }
     }
 }
 
 impl McpState {
+    /// The private conversations' open diaries, on this member.
+    pub fn diaries(&self) -> &Diaries {
+        &self.diaries
+    }
+
     /// Open conversation refs with `refs`, whose key every member and both
     /// aggregators derive from the group key (`docs/private_mode.md` §3.1):
     /// installed at load, before any call is served.
@@ -265,37 +270,40 @@ mod tests {
     use super::*;
     use crate::mcp::records::MemRecords;
 
+    /// What these tests hold on a session.
+    const HELD: &str = "held";
+
     fn store() -> RecordStore<MemRecords> {
         RecordStore::new(MemRecords::default(), Arc::default())
     }
 
     #[test]
-    fn a_session_records_its_owner_and_its_attached_thread() {
+    fn a_session_records_its_owner_and_what_it_holds() {
         let r = store();
         let id = r.open("o", Client::Other, "2025-11-25", 10).unwrap();
         let s = r.get(&id, 11).unwrap();
-        assert_eq!(s.held(ATTACHED), None);
-        r.hold(&id, &s, ATTACHED, "review", 12).unwrap();
-        assert_eq!(r.get(&id, 13).unwrap().held(ATTACHED), Some("review"));
+        assert_eq!(s.held(HELD), None);
+        r.hold(&id, &s, HELD, "review", 12).unwrap();
+        assert_eq!(r.get(&id, 13).unwrap().held(HELD), Some("review"));
         assert_eq!(r.get(&id, 13).unwrap().owner, "o");
         r.close(&id).unwrap();
         assert!(r.get(&id, 14).is_none());
     }
 
-    /// **Each session of the aggregator in front has its own attached
-    /// thread**, though they are one person on one client.
+    /// **Each session of the aggregator in front holds its own**, though
+    /// they are one person on one client.
     #[test]
-    fn sessions_on_behalf_of_two_aggregator_sessions_attach_apart() {
+    fn sessions_on_behalf_of_two_aggregator_sessions_hold_apart() {
         let r = store();
         let a = stateless_key("o", Client::Other, Some("s1"));
         let b = stateless_key("o", Client::Other, Some("s2"));
         let sa = r.ensure(&a, "o", Client::Other, "2026-07-28", 10).unwrap();
         let sb = r.ensure(&b, "o", Client::Other, "2026-07-28", 10).unwrap();
-        r.hold(&a, &sa, ATTACHED, "review", 11).unwrap();
-        r.hold(&b, &sb, ATTACHED, "bc-wearables", 11).unwrap();
+        r.hold(&a, &sa, HELD, "review", 11).unwrap();
+        r.hold(&b, &sb, HELD, "bc-wearables", 11).unwrap();
         let again = r.ensure(&a, "o", Client::Other, "2026-07-28", 12).unwrap();
-        assert_eq!(again.held(ATTACHED), Some("review"));
-        assert_eq!(r.get(&b, 12).unwrap().held(ATTACHED), Some("bc-wearables"));
+        assert_eq!(again.held(HELD), Some("review"));
+        assert_eq!(r.get(&b, 12).unwrap().held(HELD), Some("bc-wearables"));
     }
 
     /// **A request only reads**: a stateless session holding nothing is
@@ -310,7 +318,7 @@ mod tests {
             r.records.under(PREFIX).is_empty(),
             "nothing held, nothing kept"
         );
-        r.hold(&id, &s, ATTACHED, "review", 11).unwrap();
+        r.hold(&id, &s, HELD, "review", 11).unwrap();
         let later = 11 + TOUCH_EVERY_MS + 1;
         let used = r.get(&id, later).unwrap();
         assert_eq!(used.used_ms, later, "the call sees itself as the last use");

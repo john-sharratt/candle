@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use journals::slug::Slug;
-use mcp_server::access::{DIARIES_PRIVATE, PRIVATE};
+use mcp_server::access::{self, Access, DIARIES_PRIVATE, PRIVATE, TOOLS};
 use mcp_server::protocol::MODERN;
 use mcp_server::refs::named_in;
 use mcp_server::{Call, Client, Server, Session};
@@ -16,6 +16,7 @@ use serde_json::json;
 
 use super::caller::Caller;
 use super::memory::conversations::section;
+use super::records::Records;
 use super::test_session::{self, conversation, ctx, john};
 use super::tools;
 use crate::session::ZendSession;
@@ -80,10 +81,46 @@ async fn a_private_conversation_opens_nothing_and_writes_nothing() {
         assert!(refused.is_error, "{tool}");
         assert_eq!(refused.text, PRIVATE, "{tool}");
     }
+    let here = tools::call(&c, "journal_read", &json!({"journal": "here"})).await;
+    assert!(
+        !here.text.contains("conversations/"),
+        "no journal is named for it: {}",
+        here.text
+    );
     assert_eq!(session.mcp().noted().waiting(), 0, "no episode was noted");
     assert_eq!(conversations(&session), 0);
     let again = tools::call(&c, "get_user_context", &json!({"ref": text})).await;
     assert!(again.text.contains("This conversation is private"), "still private");
+}
+
+/// **In a private conversation zend refuses every write the table names,
+/// and no read it serves leaves a record**: the lists are the table's and
+/// zend's own, so a tool added to either is held to this too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_write_is_refused_and_no_read_leaves_a_record() {
+    let (_dirs, session, _) = test_session::session(|_| {});
+    let (_, r) = conversation(&session, &john(), true);
+    let c = ctx(&session, john(), Some(r));
+    for (tool, _) in TOOLS.iter().filter(|(_, a)| *a == Access::Write) {
+        let refused = tools::call(&c, tool, &json!({})).await;
+        assert_eq!(refused.text, PRIVATE, "{tool}");
+    }
+    let records = session.shared_substrate().unwrap();
+    let before = records.under("mcp/");
+    let defs = tools::definitions();
+    let reads: Vec<&str> = defs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["name"].as_str())
+        .filter(|name| access::access(name) == Access::Read)
+        .collect();
+    assert!(reads.len() > 15, "{reads:?}");
+    for tool in reads {
+        tools::call(&c, tool, &json!({"wait_s": 0})).await;
+    }
+    assert_eq!(records.under("mcp/"), before, "a private read wrote a record");
+    assert_eq!(conversations(&session), 0);
 }
 
 /// **A diary needs a private conversation**, at zend as at the aggregator.
@@ -95,6 +132,59 @@ async fn a_diary_needs_a_private_conversation() {
         let refused = tools::call(&c, "diary_list", &json!({})).await;
         assert_eq!(refused.text, DIARIES_PRIVATE);
     }
+}
+
+/// **A diary end to end through the tools, at the production cost**: open
+/// finds none, create, write one entry now and one in the past, read them in
+/// time order, delete one, close, reopen and read what stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_diary_end_to_end_through_the_tools() {
+    let (_dirs, session, _) = test_session::session(|_| {});
+    let (_, r) = conversation(&session, &john(), true);
+    let c = ctx(&session, john(), Some(r));
+    let call = |name: &'static str, args: serde_json::Value| {
+        let c = c.clone();
+        async move {
+            let a = tools::call(&c, name, &args).await;
+            assert!(!a.is_error, "{name}: {}", a.text);
+            a.text
+        }
+    };
+    let pass = "synthetic diary passphrase";
+    assert_eq!(call("diary_open", json!({"passphrase": pass})).await, "Opened 0 diaries.");
+    call("diary_create", json!({"topic": "synthetic-garden", "passphrase": pass})).await;
+    call(
+        "diary_write",
+        json!({"topic": "synthetic-garden", "text": "Planted synthetic beans.", "author": "user"}),
+    )
+    .await;
+    let past = call(
+        "diary_write",
+        json!({"topic": "synthetic-garden", "text": "Dug the synthetic bed.",
+               "ts": "2026-11-01T08:00:00Z"}),
+    )
+    .await;
+    let read = call("diary_read", json!({"topic": "synthetic-garden"})).await;
+    let dug = read.find("Dug the synthetic bed.").unwrap();
+    let planted = read.find("Planted synthetic beans.").unwrap();
+    assert!(dug < planted, "the past entry reads first: {read}");
+    let id = past
+        .strip_prefix("Wrote entry `")
+        .and_then(|r| r.split('`').next())
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        call("diary_delete", json!({"topic": "synthetic-garden", "ids": [id]})).await,
+        "Deleted 1 entry."
+    );
+    call("diary_close", json!({})).await;
+    let closed = tools::call(&c, "diary_read", &json!({"topic": "synthetic-garden"})).await;
+    assert!(closed.is_error, "closed: {}", closed.text);
+    assert_eq!(call("diary_open", json!({"passphrase": pass})).await, "Opened 1 diary.");
+    let read = call("diary_read", json!({"topic": "synthetic-garden"})).await;
+    assert!(read.contains("Planted synthetic beans."), "{read}");
+    assert!(!read.contains("Dug the synthetic bed."), "the delete stands: {read}");
+    assert_eq!(conversations(&session), 0, "a diary opens no journal");
 }
 
 /// **The server opens the ref the aggregator passes, for its caller only**,

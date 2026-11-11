@@ -201,9 +201,10 @@ the aggregator, which lists them whenever its own client does.
 
 zend's tools are the ones it always served (`zend/src/mcp/tools/`). Its
 sessions are records in its substrate (`zend/src/mcp/state.rs`,
-`RecordStore`), so any member answers. The thread `thread_attach` binds is held
-on the session under `attached/<conversation>`, one per conversation, which is
-what `"self"` names. The route is
+`RecordStore`), so any member answers. The thread `thread_attach` binds a
+conversation to is a record of its own, `mcp/attached/<owner>/<conversation>`
+(`zend/src/mcp/attached.rs`), which is what `"self"` names; it goes when the
+conversation's ref has been idle four hours. The route is
 `Dispatch::Any`.
 
 ### npcd (`/v1/npc/mcp` on bot.tokera.com)

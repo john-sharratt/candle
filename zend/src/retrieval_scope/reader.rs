@@ -63,6 +63,7 @@ impl Reader {
         match memory_paths::owner(path) {
             Owner::Group(group) => self.groups.contains(group),
             Owner::Person(person) => self.person.as_deref() == Some(person),
+            Owner::Diaries => false,
             Owner::Repository => true,
         }
     }
@@ -86,6 +87,8 @@ mod tests {
         assert!(r.reads("journals/persons/john/person.yaml"));
         assert!(!r.reads("journals/groups/guest/topics/a.yaml"));
         assert!(!r.reads("journals/persons/yen/person.yaml"));
+        assert!(!r.reads("journals/diaries/salt"), "no one retrieves a diary");
+        assert!(!r.reads(&format!("journals/diaries/{}.bin", "ab".repeat(16))));
     }
 
     /// **A folder is read as its files are**: a group's folder by its members,

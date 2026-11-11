@@ -98,6 +98,9 @@ pub fn merge(lists: Vec<(usize, Vec<Value>)>) -> (Vec<Value>, HashMap<String, us
     (tools, routes)
 }
 
+/// The guide a private conversation's context is served with.
+const PRIVATE_GUIDE: &str = "private-mode";
+
 /// The first line of `text`, at most 200 characters: what a log line quotes.
 fn first_line(text: &str) -> String {
     text.lines()
@@ -289,23 +292,27 @@ impl App {
     }
 
     /// The user's context as served to `client`, from the memory's answer
-    /// to `get_user_context`: the client's guide in front of it. `None` when
-    /// the memory answered an error, which is logged.
-    fn served_context(&self, client: &str, answer: &Value) -> Option<String> {
+    /// to `get_user_context`: the client's guide after its ref — for a
+    /// private conversation, the `private-mode` guide, since every client's
+    /// says to write. `None` when the memory answered an error, which is
+    /// logged unless the conversation is private.
+    fn served_context(&self, client: &str, answer: &Value, private: bool) -> Option<String> {
         let text = context::text_of(answer).unwrap_or("");
         if context::is_error(answer) {
-            tracing::warn!(
-                client,
-                "mcp: the user's context could not be read: {}",
-                first_line(text)
-            );
+            if !private {
+                tracing::warn!(
+                    client,
+                    "mcp: the user's context could not be read: {}",
+                    first_line(text)
+                );
+            }
             return None;
         }
-        Some(context::compose(
-            self.library.for_client(client),
-            client,
-            text,
-        ))
+        let guide = match private {
+            true => self.library.get(PRIVATE_GUIDE),
+            false => self.library.for_client(client),
+        };
+        Some(context::compose(guide, client, text))
     }
 
     /// Whether the last listing marked `name` as only reading.
@@ -464,7 +471,7 @@ impl App {
             return text_result("the client stopped listening", true);
         };
         let client = call.session.client.name();
-        if let Some(served) = this.served_context(client, &answer) {
+        if let Some(served) = this.served_context(client, &answer, quiet) {
             context::replace_text(&mut answer, &served);
         }
         answer

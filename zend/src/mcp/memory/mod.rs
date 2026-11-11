@@ -33,10 +33,12 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "memory-census")]
 use heap_census::{set_thread, Scope};
 use journals::actor::{need_read, Actor};
+use journals::diaries::layout::DiaryId;
 use journals::error::Error;
 use journals::ops::{Applied, Op};
 use journals::path::{JournalPath, HERE};
 use journals::scope::Section;
+use journals::store::diff::Changes;
 use journals::store::sync::sync;
 use journals::store::{Store, StoreError};
 use journals::time::Stamp;
@@ -287,6 +289,46 @@ impl Memory {
         let applied = store.write(actor, op, at).map_err(WriteError::Store)?;
         self.publish(store.shared());
         Ok(applied)
+    }
+
+    /// Every diary's sealed file, by its id, and the repository's salt once
+    /// there is one (`docs/private_mode.md` §5.2): read under the store, which
+    /// holds them, never through the tree.
+    pub fn diaries(&self) -> Result<(Vec<(DiaryId, Vec<u8>)>, Option<Vec<u8>>), String> {
+        if let Some(why) = self.unavailable() {
+            return Err(why);
+        }
+        let guard = held(&self.store);
+        let store = guard.as_ref().ok_or(NO_MEMORY)?;
+        let files = store
+            .diary_files()
+            .into_iter()
+            .map(|(id, bytes)| (id, bytes.to_vec()))
+            .collect();
+        Ok((files, store.diary_salt().map(<[u8]>::to_vec)))
+    }
+
+    /// One diary's sealed file, when it is there.
+    pub fn diary_file(&self, id: &DiaryId) -> Result<Option<Vec<u8>>, String> {
+        if let Some(why) = self.unavailable() {
+            return Err(why);
+        }
+        let guard = held(&self.store);
+        let store = guard.as_ref().ok_or(NO_MEMORY)?;
+        Ok(store.diary_file(id).map(<[u8]>::to_vec))
+    }
+
+    /// Write `changes` to diaries' files as one commit, pushed at the next
+    /// sync.
+    pub fn write_diaries(&self, changes: &Changes) -> Result<(), WriteError> {
+        if let Some(why) = self.unavailable() {
+            return Err(WriteError::Unavailable(why));
+        }
+        let mut guard = held(&self.store);
+        let Some(store) = guard.as_mut() else {
+            return Err(WriteError::Unavailable(NO_MEMORY.into()));
+        };
+        store.write_diaries(changes).map_err(WriteError::Store)
     }
 
     /// The journal at `path`, which `actor` may read.

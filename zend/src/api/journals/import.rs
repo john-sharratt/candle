@@ -38,6 +38,7 @@ pub fn apply(store: &mut Store, person: &Slug, body: &Value, now: Stamp) -> Resu
         channel: req.channel,
         admin: true,
         conversation: None,
+        private: false,
         here: None,
     };
     let (status, answer) = batch(&m, &req.ops, now, req.speaker.as_ref(), |actor, op, at| {

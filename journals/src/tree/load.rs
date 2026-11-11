@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::diaries::layout::in_diaries;
 use crate::error::Problem;
 use crate::files::{entry_id, in_order, read_entry, GroupFile, Meta, PersonFile, README};
 use crate::line::Line;
@@ -35,14 +36,16 @@ pub fn load(files: &BTreeMap<String, Vec<u8>>) -> Tree {
     let mut groups: BTreeMap<Slug, GroupFiles<'_>> = BTreeMap::new();
     for (path, bytes) in files {
         let segs: Vec<&str> = path.split('/').collect();
-        if segs.len() == 1 && TOP_FILES.contains(&segs[0]) {
+        // Diaries are sealed, no journal's, and never read as one
+        // (`crate::diaries`).
+        if (segs.len() == 1 && TOP_FILES.contains(&segs[0])) || in_diaries(path) {
             continue;
         }
         if segs.len() < 3 || ![PERSONS, GROUPS].contains(&segs[0]) {
             tree.problems.push(Problem::new(
                 path.as_str(),
                 None,
-                "is no part of the layout: the top holds persons/, groups/, .gitattributes and README.md",
+                "is no part of the layout: the top holds persons/, groups/, diaries/, .gitattributes and README.md",
             ));
             continue;
         }
@@ -238,7 +241,9 @@ mod tests {
     use super::*;
     use crate::files::entry_file;
     use crate::line::Line;
+    use crate::ops::fixture::zen;
     use crate::testing::{note, slug};
+    use crate::tree::render::render_all;
 
     fn files(pairs: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
         pairs
@@ -304,6 +309,21 @@ mod tests {
         assert_eq!(candle.problems, vec![]);
         assert_eq!(tree.problems, vec![]);
         assert_eq!(candle.cue().as_deref(), Some("open for the engine"));
+    }
+
+    /// **The tree never reads `diaries/`** (`docs/private_mode.md` §5.2): a
+    /// repository holding diaries loads exactly as one without them, with no
+    /// problem for their files — so no fold, summary, digest, cue, index,
+    /// grep or frame, all of which read the tree, ever sees one.
+    #[test]
+    fn diaries_are_no_part_of_the_tree() {
+        let files = render_all(&zen());
+        let mut with = files.clone();
+        with.insert("diaries/salt".into(), vec![1; 16]);
+        with.insert(format!("diaries/{}.bin", "ab".repeat(16)), vec![2; 4096]);
+        with.insert("diaries/anything-else".into(), b"stray".to_vec());
+        assert_eq!(load(&with), load(&files));
+        assert!(load(&with).problems.is_empty());
     }
 
     #[test]

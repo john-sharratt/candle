@@ -4,6 +4,8 @@
 //! is a write. Each server's tests hold every tool it lists to being named
 //! here, so a tool added without a line here fails the build.
 
+use serde_json::Value;
+
 /// What a tool does to what lasts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
@@ -154,12 +156,12 @@ pub fn permits(tool: &str, private: bool) -> Result<(), &'static str> {
 
 /// The tools of `listed` — a server's `tools/list` — the table does not
 /// name: what each server's tests hold empty.
-pub fn unclassified(listed: &serde_json::Value) -> Vec<String> {
+pub fn unclassified(listed: &Value) -> Vec<String> {
     listed
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|t| t.get("name").and_then(serde_json::Value::as_str))
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
         .filter(|name| classified(name).is_none())
         .map(str::to_string)
         .collect()

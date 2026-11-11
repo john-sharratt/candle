@@ -20,6 +20,7 @@
 
 pub mod actor;
 pub mod brief;
+pub mod diaries;
 pub mod error;
 pub mod files;
 pub mod line;

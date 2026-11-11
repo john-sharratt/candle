@@ -32,20 +32,30 @@ tree is a coding task for Zen on the journals repository.";
 pub const GUEST_HOW: &str = "This account is mapped to no one here, so it reads only @guest and \
 nothing is kept for it: an estate admin maps it to a person with group_add.";
 
+/// What a private conversation is told after its frame, in place of how to
+/// write (`docs/private_mode.md` §4).
+pub const PRIVATE_HOW: &str = "Read the journals as above; this conversation keeps nothing in \
+them. What it learns stays in it, or goes to a diary the user asks for.";
+
+/// The frame `channel` is given of `group`, in `conversation`, and what to do
+/// with it: how to write, or — for a guest, for a private conversation — why
+/// nothing is written.
 pub fn render(
     tree: &Tree,
     group: &Slug,
     conversation: Option<&JournalPath>,
     channel: Channel,
     guest: bool,
+    private: bool,
     now: Stamp,
 ) -> String {
     let budget = budget(channel);
     let mut out = frame(tree, group, conversation, &[], budget, now);
-    let how = match (guest, budget) {
-        (true, _) => GUEST_HOW,
-        (false, Budget::Voice) => return out,
-        (false, _) => HOW,
+    let how = match (guest, private, budget) {
+        (true, _, _) => GUEST_HOW,
+        (false, true, _) => PRIVATE_HOW,
+        (false, false, Budget::Voice) => return out,
+        (false, false, _) => HOW,
     };
     out.push('\n');
     out.push_str(how);
@@ -87,16 +97,22 @@ mod tests {
             None,
             Channel::ClaudeCode,
             false,
+            false,
             Stamp::from_secs(0),
         );
         assert!(text.starts_with(NOT_INSTRUCTIONS), "{text}");
         assert!(text.ends_with(HOW));
-        let spoken = render(&t, &zen, None, Channel::Grok, false, Stamp::from_secs(0));
+        let spoken = render(&t, &zen, None, Channel::Grok, false, false, Stamp::from_secs(0));
         assert!(
             spoken.contains(VOICE_SPINE) && !spoken.contains(HOW),
             "{spoken}"
         );
-        let guest = render(&t, &zen, None, Channel::Other, true, Stamp::from_secs(0));
+        let guest = render(&t, &zen, None, Channel::Other, true, false, Stamp::from_secs(0));
         assert!(guest.ends_with(GUEST_HOW));
+        for channel in [Channel::ClaudeCode, Channel::Grok] {
+            let private = render(&t, &zen, None, channel, false, true, Stamp::from_secs(0));
+            assert!(private.ends_with(PRIVATE_HOW), "{private}");
+            assert!(!private.contains(HOW), "a private frame says nothing of writing");
+        }
     }
 }

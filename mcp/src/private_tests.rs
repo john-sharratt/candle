@@ -7,7 +7,8 @@
 use std::sync::Arc;
 
 use mcp_server::access::{self, Access, DIARIES_PRIVATE, PRIVATE, TOOLS};
-use mcp_server::refs::REF_IDLE_MS;
+use mcp_server::http::now_ms;
+use mcp_server::refs::{Ref, REF_IDLE_MS};
 use mcp_server::{Client, Server};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -70,7 +71,14 @@ async fn a_private_conversation_reads_quietly_and_records_nothing() {
     let backend = Fake::open();
     let state = TempDir::new().unwrap();
     let app = fake::app(&fake::gateway(&backend).await, &state);
-    let r = begin(&app, true).await;
+    let begun = App::call(&app, &call("s0"), context::GET, &json!({"private_mode": true})).await;
+    let served = context::text_of(&begun).unwrap();
+    assert!(served.contains("the `private-mode` guide:"), "{served}");
+    assert!(
+        !served.contains("the `claude` guide:"),
+        "no guide that says to write: {served}"
+    );
+    let r = ref_of(&begun);
     let read = App::call(&app, &call("s1"), LOOK, &json!({"ref": r})).await;
     assert_eq!(read["isError"], false, "{read}");
     let guide = App::call(&app, &call("s1"), "guide_list", &json!({"ref": r})).await;
@@ -120,22 +128,36 @@ async fn private_reaches_no_other_conversation() {
     assert!(!backend.sent(MAKE)[0].quiet);
 }
 
-/// **An expired private ref refuses writes still**: it is refused whole,
-/// never served as a normal conversation.
+/// **An expired private ref refuses writes still**: every write with it is
+/// refused whole, never served as a normal conversation's, and renewing it
+/// answers a private ref.
 #[tokio::test]
 async fn an_expired_private_ref_still_refuses_writes() {
     let backend = Fake::open();
     let state = TempDir::new().unwrap();
     let app = fake::app(&fake::gateway(&backend).await, &state);
-    let r = begin(&app, true).await;
-    let issued = app.refs.open(&boss().key(), &r).unwrap().issued_ms();
-    assert_eq!(
-        App::conversation(&app, &call("s1"), Some(&r), issued + 2 * REF_IDLE_MS)
-            .await
-            .unwrap_err(),
-        EXPIRED
+    let five_hours_ago = (now_ms() - REF_IDLE_MS - 3_600_000) / 1000;
+    let old = app.refs.seal(
+        &boss().key(),
+        &Ref {
+            id: [7; 16],
+            private: true,
+            issued_s: five_hours_ago as u32,
+        },
     );
-    assert!(backend.sent(MAKE).is_empty());
+    for tool in [MAKE, LOOK, DIARY] {
+        says(
+            &App::call(&app, &call("s1"), tool, &json!({"ref": old})).await,
+            EXPIRED,
+        );
+    }
+    assert!(backend.sent(MAKE).is_empty() && backend.sent(DIARY).is_empty());
+    let renewed = ref_of(&App::call(&app, &call("s1"), context::GET, &json!({"ref": old})).await);
+    assert!(app.refs.open(&boss().key(), &renewed).unwrap().private);
+    says(
+        &App::call(&app, &call("s1"), MAKE, &json!({"ref": renewed})).await,
+        PRIVATE,
+    );
 }
 
 /// **Nothing private, and no diary, is logged here**; anything else is.

@@ -21,7 +21,8 @@ server:
   instructions: >-
     Call get_user_context first: its first line is this conversation's ref,
     and every other Zen call passes it as `ref` — a call without it is
-    refused. Zen reaches what you cannot: the user's repositories, machines,
+    refused. Diaries are personal: touch them only when the user asks.
+    Zen reaches what you cannot: the user's repositories, machines,
     cluster and bots. Work in a repository — reading, implementing against a written spec,
     building, testing, reviewing — goes to Zen's workers with repo_task_start;
     keep orchestration, design and approvals yourself, and do web research with

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use tokio::runtime::Handle;
 
+use super::attached;
 use super::noted_calls::{write_noted, WRITE_EVERY};
 use super::ref_records;
 use super::state::RecordStore;
@@ -35,6 +36,16 @@ pub async fn tending(session: Weak<ZendSession>) {
         // control can wait for room: off the runtime's threads.
         let tended = tokio::task::spawn_blocking(move || {
             let records = session.shared_substrate()?;
+            // A conversation idle past its ref's four hours has its diaries
+            // locked, before its ref's record goes.
+            let locked = session
+                .mcp()
+                .diaries()
+                .sweep(now_ms(), |c| ref_records::used(&records, c));
+            if locked > 0 {
+                tracing::info!(locked, "mcp: idle conversations' diaries locked");
+            }
+            attached::sweep(&records, now_ms(), |c| ref_records::used(&records, c));
             let refs = ref_records::sweep(&records, now_ms());
             let store = RecordStore::new(records, Arc::clone(session.mcp().used()));
             let (touched, ceased) = store.tend(now_ms());

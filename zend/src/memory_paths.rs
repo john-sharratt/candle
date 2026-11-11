@@ -14,6 +14,8 @@
 
 use std::sync::OnceLock;
 
+use journals::diaries::layout::in_diaries;
+
 /// What the memory's repository is called when the session names none.
 pub const REPO: &str = "journals";
 
@@ -46,12 +48,19 @@ pub enum Owner<'a> {
     Group(&'a str),
     /// This person's own file.
     Person(&'a str),
+    /// A diary's sealed file, or the salt beside them
+    /// (`docs/private_mode.md` §5.2): no one reads it but through its
+    /// passphrase, and nothing ingests or retrieves it.
+    Diaries,
     /// The repository's own files — its README, its tooling — nobody's.
     Repository,
 }
 
 /// Whose the file at `path` is.
 pub fn owner(path: &str) -> Owner<'_> {
+    if in_diaries(path) {
+        return Owner::Diaries;
+    }
     let mut parts = path.split('/');
     match (parts.next(), parts.next(), parts.next()) {
         (Some("groups"), Some(group), Some(_)) => Owner::Group(group),
@@ -85,6 +94,11 @@ mod tests {
         assert_eq!(owner("persons/yen/person.yaml"), Owner::Person("yen"));
         assert_eq!(owner("README.md"), Owner::Repository);
         assert_eq!(owner("groups"), Owner::Repository);
+        assert_eq!(owner("diaries/salt"), Owner::Diaries);
+        assert_eq!(
+            owner(&format!("diaries/{}.bin", "ab".repeat(16))),
+            Owner::Diaries
+        );
         assert_eq!(
             owner("groups/zen"),
             Owner::Repository,

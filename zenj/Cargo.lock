@@ -2313,8 +2313,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
+ "hmac",
+ "rand 0.9.5",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tracing",

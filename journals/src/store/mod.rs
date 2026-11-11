@@ -14,7 +14,9 @@
 //! | [`diff`] | the files an operation changes |
 //! | [`message`] | a commit's subject, trailers, and the operation it carries |
 //! | [`sync`] | the push and fetch, run with the store free for writes |
+//! | [`diaries`] | the diaries' sealed files: read, written as one neutral commit, carried across a replay |
 
+pub mod diaries;
 pub mod diff;
 pub mod message;
 pub mod read;
@@ -35,8 +37,9 @@ use crate::error::Error;
 use crate::line::LineId;
 use crate::ops::remap::remap;
 use crate::ops::{applied_to, Applied, Op};
+use crate::store::diaries::{commit_diaries, diaries_changed};
 use crate::store::diff::{apply_changes, changes, Changes};
-use crate::store::message::{message, read};
+use crate::store::message::{is_diaries, message, read};
 use crate::store::read::files_at;
 use crate::time::Stamp;
 use crate::tree::load::load;
@@ -284,6 +287,16 @@ impl Store {
         let mut done = Synced::default();
         let mut renamed: BTreeMap<LineId, LineId> = BTreeMap::new();
         for c in mine {
+            // A diaries commit carries its files whole onto the newer base.
+            if is_diaries(&c.message) {
+                let ch = diaries_changed(&self.repo, &c)?;
+                if !ch.is_empty() {
+                    base = commit_diaries(&self.repo, &base, &ch)?;
+                    apply_changes(&mut files, &ch);
+                    done.replayed += 1;
+                }
+                continue;
+            }
             let mut rec = match read(&c.message) {
                 Ok(rec) => rec,
                 Err(e) => {
@@ -334,5 +347,7 @@ impl Store {
     }
 }
 
+#[cfg(test)]
+mod diaries_tests;
 #[cfg(test)]
 mod tests;

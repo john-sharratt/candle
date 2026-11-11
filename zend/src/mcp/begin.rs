@@ -69,7 +69,7 @@ pub fn begin(
 /// What a private conversation's answer says of it, after its ref.
 pub const PRIVATE_LINE: &str = "This conversation is private: Zen's memory is read-only in it \
     to its end — nothing learned here is written to it, and every tool that would write, message, \
-    run or draw is refused.";
+    run or draw is refused. Diaries are available: the `private-mode` guide says how.";
 
 /// The lines the answer opens with: the ref, that every call passes it, and
 /// — for a private conversation — that it is one.

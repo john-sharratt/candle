@@ -256,6 +256,7 @@ fn the_memory_opens_on_its_thread_binds_a_caller_and_writes_through() {
         Some(&conv),
         Channel::ClaudeCode,
         false,
+        false,
         Stamp::now(),
     );
     assert!(text.contains("This conversation"), "{text}");
