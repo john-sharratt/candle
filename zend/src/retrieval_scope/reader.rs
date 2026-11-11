@@ -88,10 +88,10 @@ mod tests {
         assert!(!r.reads("journals/groups/guest/topics/a.yaml"));
         assert!(!r.reads("journals/persons/yen/person.yaml"));
         assert!(
-            !r.reads("journals/diaries/salt"),
+            !r.reads("journals/.diaries/salt"),
             "no one retrieves a diary"
         );
-        assert!(!r.reads(&format!("journals/diaries/{}.bin", "ab".repeat(16))));
+        assert!(!r.reads(&format!("journals/.diaries/{}.bin", "ab".repeat(16))));
     }
 
     /// **A folder is read as its files are**: a group's folder by its members,

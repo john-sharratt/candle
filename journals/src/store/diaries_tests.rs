@@ -49,7 +49,7 @@ fn a_diary_is_one_commit_the_tree_never_reads() {
     let salt = new_salt();
     let (id, file) = sealed("synthetic pass", &salt);
     s.write_diaries(&changes(&salt, &id, &file)).unwrap();
-    assert_eq!(s.tree(), &before, "the tree does not read diaries/");
+    assert_eq!(s.tree(), &before, "the tree does not read .diaries/");
     assert!(s.tree().problems.is_empty(), "{:?}", s.tree().problems);
     assert_eq!(s.diary_files(), vec![(id, file.as_slice())]);
     assert_eq!(s.diary_salt(), Some(salt.as_slice()));

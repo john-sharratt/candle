@@ -45,7 +45,7 @@ pub fn load(files: &BTreeMap<String, Vec<u8>>) -> Tree {
             tree.problems.push(Problem::new(
                 path.as_str(),
                 None,
-                "is no part of the layout: the top holds persons/, groups/, diaries/, .gitattributes and README.md",
+                "is no part of the layout: the top holds persons/, groups/, .diaries/, .gitattributes and README.md",
             ));
             continue;
         }
@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(candle.cue().as_deref(), Some("open for the engine"));
     }
 
-    /// **The tree never reads `diaries/`** (`docs/private_mode.md` §5.2): a
+    /// **The tree never reads `.diaries/`** (`docs/private_mode.md` §5.2): a
     /// repository holding diaries loads exactly as one without them, with no
     /// problem for their files — so no fold, summary, digest, cue, index,
     /// grep or frame, all of which read the tree, ever sees one.
@@ -319,9 +319,9 @@ mod tests {
     fn diaries_are_no_part_of_the_tree() {
         let files = render_all(&zen());
         let mut with = files.clone();
-        with.insert("diaries/salt".into(), vec![1; 16]);
-        with.insert(format!("diaries/{}.bin", "ab".repeat(16)), vec![2; 4096]);
-        with.insert("diaries/anything-else".into(), b"stray".to_vec());
+        with.insert(".diaries/salt".into(), vec![1; 16]);
+        with.insert(format!(".diaries/{}.bin", "ab".repeat(16)), vec![2; 4096]);
+        with.insert(".diaries/anything-else".into(), b"stray".to_vec());
         assert_eq!(load(&with), load(&files));
         assert!(load(&with).problems.is_empty());
     }

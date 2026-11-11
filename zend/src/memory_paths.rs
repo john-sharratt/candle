@@ -94,9 +94,9 @@ mod tests {
         assert_eq!(owner("persons/yen/person.yaml"), Owner::Person("yen"));
         assert_eq!(owner("README.md"), Owner::Repository);
         assert_eq!(owner("groups"), Owner::Repository);
-        assert_eq!(owner("diaries/salt"), Owner::Diaries);
+        assert_eq!(owner(".diaries/salt"), Owner::Diaries);
         assert_eq!(
-            owner(&format!("diaries/{}.bin", "ab".repeat(16))),
+            owner(&format!(".diaries/{}.bin", "ab".repeat(16))),
             Owner::Diaries
         );
         assert_eq!(
