@@ -29,7 +29,7 @@ Two invariants are amended (§4). Strata is the reference implementation (§2).
 Related designs:
 - `docs/moe_live_dispatch_design.md`: the dispatch this extends.
 - `docs/expert_cache_design.md`: the tiers.
-- `CLAUDE.md`: hot-path invariants 3, 4 and 7.
+- `AGENTS.md`: hot-path invariants 3, 4 and 7.
 
 ---
 
@@ -237,7 +237,7 @@ Experts are Q3_KO under 64 GiB of VRAM and Q4_KO at or above it
 - **The laptop's link is Gen4 ×8.** `nvidia-smi` read on 2026-10-16:
   `pcie.link.width.current = 8` against a maximum of 16. The generation reads
   1 at idle and trains up to 4 under load. `dispatch.rs:112` and the
-  CPU-throttle memory note were right; `CLAUDE.md` and
+  CPU-throttle memory note were right; `AGENTS.md` and
   `docs/performance.md:229` (×16, ~25 GB/s) are corrected in this change.
 - **The laptop's memory is LPDDR5X-7467** on Meteor Lake's 128-bit bus (SMBIOS
   type 35, 8 × 4 GB packages), for a 119.5 GB/s peak. Measurement 1 on
@@ -329,7 +329,7 @@ token over 48 layers.
 
 ## 4. Invariants this touches
 
-The amendments below land in `CLAUDE.md` and
+The amendments below land in `AGENTS.md` and
 `docs/deepseek/deepseek_hot_path_invariants.md` in the same change as the code.
 **The author approved both as written on 2026-10-16.**
 
@@ -1498,7 +1498,7 @@ or the device's own order.
    all-CPU, to confirm the per-model `*_KV_FACTORS` thresholds still hold under
    CPU-computed experts.
 
-**Codec pieces are exact.** `CLAUDE.md`'s rule for codec code applies to the
+**Codec pieces are exact.** `AGENTS.md`'s rule for codec code applies to the
 parts that are codecs, and those tests assert raw bytes:
 - unpacking Q3_KO/Q4_KO codes;
 - permuting the activation block;

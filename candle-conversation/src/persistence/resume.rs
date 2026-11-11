@@ -1221,7 +1221,7 @@ mod tests {
     /// hook itself: reproducing the actual `snapshot_sequence_per_layer`
     /// seal failure needs a live `BatchedInferenceSession` on a real model,
     /// which this crate's unit tests cannot stand up (see the `tensor-assert`
-    /// / GPU-test guidance in `CLAUDE.md` — this suite runs CPU-only). What
+    /// / GPU-test guidance in `AGENTS.md` — this suite runs CPU-only). What
     /// this DOES cover, against real on-disk records rather than a
     /// synthetic shape:
     ///

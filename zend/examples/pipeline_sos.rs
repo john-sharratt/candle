@@ -24,7 +24,7 @@ use candle_conversation::SamplingConfig;
 /// shape the leaf compression produces.
 fn children() -> Vec<&'static str> {
     vec![
-        "(workspace root) - CHANGELOG.md - CLAUDE.md - Cargo.toml - README.md - candle-core/ - \
+        "(workspace root) - CHANGELOG.md - AGENTS.md - Cargo.toml - README.md - candle-core/ - \
          candle-nn/ - candle-transformers/ - candle-kernels/ - candle-conversation/ - \
          candle-examples/",
         "candle-core/src/ - tensor.rs - device.rs - dtype.rs - shape.rs - cpu_backend/ - \

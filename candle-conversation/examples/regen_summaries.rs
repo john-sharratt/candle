@@ -45,7 +45,7 @@ fn repo_fixture() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "Repository index — workspace root:",
-            "(workspace root)\n  - CHANGELOG.md (113 lines, Markdown)\n  - CLAUDE.md (194 lines, \
+            "(workspace root)\n  - CHANGELOG.md (113 lines, Markdown)\n  - AGENTS.md (194 lines, \
              Markdown)\n  - Cargo.toml (125 lines, TOML, workspace: 11 members)\n  - README.md \
              (171 lines, Markdown)\n  - candle-core/ (crate)\n  - candle-nn/ (crate)\n  - \
              candle-transformers/ (crate)\n  - candle-kernels/ (crate)\n  - candle-conversation/ \

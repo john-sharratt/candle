@@ -530,7 +530,7 @@ Changed:
 - `candle-kernels/src/provenance/api.rs` — FFI signature (§7.3).
 - `candle-conversation/src/provenance/gpu.rs` — `scan_weighted` reads from the
   arena (page_ptr/pos_map) instead of a contiguous pinned buffer; the contiguous
-  `from_segments` path is **removed** (no backward-compat shim — CLAUDE.md), its
+  `from_segments` path is **removed** (no backward-compat shim — AGENTS.md), its
   parity role assumed by test 1.
 - `candle-conversation/src/projection/resolver.rs` — Phase B calls
   `ensure_resident` + the index builder instead of `BatchedGpuGallery::from_segments`;
@@ -544,7 +544,7 @@ Changed:
 
 ## 12. Implementation phases
 
-Every phase lands complete — no stubs, no deferred cleanup (CLAUDE.md).
+Every phase lands complete — no stubs, no deferred cleanup (AGENTS.md).
 
 - **Phase 0 — the arena allocator.** `GalleryGidPool`/`PageGid`/slab storage +
   unit tests (alloc/free/recycle/tombstone/hwm, mirror the `gid_pool.rs` tests).

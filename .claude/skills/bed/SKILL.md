@@ -1,6 +1,6 @@
 ---
 name: bed
-description: Overnight autonomous run — gather everything remaining (memory, design docs, open items, the working tree), finish every task without asking questions, fix forward, audit the CLAUDE.md invariants, full code review (code-review skill + manual review against design intent) with every finding fixed, clean up intermediate files and debug logic, run /fast-test and /sweep, and leave an HTML morning report. Never commits.
+description: Overnight autonomous run — gather everything remaining (memory, design docs, open items, the working tree), finish every task without asking questions, fix forward, audit the AGENTS.md invariants, full code review (code-review skill + manual review against design intent) with every finding fixed, clean up intermediate files and debug logic, run /fast-test and /sweep, and leave an HTML morning report. Never commits.
 disable-model-invocation: true
 ---
 
@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 **The user has gone to bed.** Nobody will answer a question until morning, so do not ask
 any — not with `AskUserQuestion`, not as a question at the end of a message. When a decision
-is needed, make the one most consistent with the design documents and `CLAUDE.md`, write down
+is needed, make the one most consistent with the design documents and `AGENTS.md`, write down
 what was decided and why, and keep going. Every task on the list gets finished. Stopping
 early, handing back half-done work, or parking a task "for the user to decide" is a failure
 of this skill; the only things left for the morning are the ones listed under *Holds* below.
@@ -20,7 +20,7 @@ there. "Pre-existing" is not a category.
 **Never commit, never push, never open a PR during the night.** Leave every change in the
 working tree. The morning report proposes the commits; the user makes them.
 
-All of `CLAUDE.md` applies throughout, and these especially: file tools only for reading and
+All of `AGENTS.md` applies throughout, and these especially: file tools only for reading and
 writing files; never mask an exit status; no env-var feature flags, no stubs, no `TODO`s, no
 compatibility shims; one concern per file; `use` imports; TDD with raw expected values;
 never pass `--ignored` to the whole zend suite (three tests destroy or copy the substrate);
@@ -46,7 +46,7 @@ Build the picture from every source there is — not from recollection alone:
 
 For every area the remaining work touches, find and read the design document it is built
 from (`docs/`, `docs/deepseek/`, anything a module doc or commit message cites) — end to end,
-not skimmed. `CLAUDE.md`: **design docs are authoritative**; where the code disagrees with the
+not skimmed. `AGENTS.md`: **design docs are authoritative**; where the code disagrees with the
 document, the code is wrong unless the document is, and then the document is fixed in the
 same change. Note the design intent and the expected *outcome* (numbers, invariants,
 behaviour) for each area — the manual review in step 5 judges against these.
@@ -70,11 +70,11 @@ sweeps) is batched rather than interleaved with builds.
 
 ## 4. Do the work — every task on the list
 
-For each task: implement it fully, with its unit test written alongside (`CLAUDE.md` TDD),
+For each task: implement it fully, with its unit test written alongside (`AGENTS.md` TDD),
 verify it with the test or gate named in `tasks.md`, then mark it done. A task is done when
 its verification passes on the current code — not when the code is written.
 
-**Audit the `CLAUDE.md` invariants** over everything changed tonight and over the hot paths
+**Audit the `AGENTS.md` invariants** over everything changed tonight and over the hot paths
 the work touched (`forward_wave` and what it calls, per layer, per wave):
 
 1. no `to_dtype` in the loop; **1b** validate with `expect_dtype`, never a defensive cast;

@@ -1152,7 +1152,7 @@ adaptive prefetch depth and its late-load and copy-bandwidth signals
 ### 0.18 Documentation to update
 
 As §18's audit, plus: `docs/expert_cache_design.md` (warm tier no longer the
-only pinned tier; demand misses no longer load), CLAUDE.md hot-path invariant 3
+only pinned tier; demand misses no longer load), AGENTS.md hot-path invariant 3
 (the MoE routing readback is gone — propose the edit, do not commit it),
 `docs/performance.md` (new rows from acceptance), and the module docs of
 `expert_lre` (`pipeline.rs`, `dispatch.rs`, `streamer.rs` — deleted —
@@ -1866,7 +1866,7 @@ tests), `moe_bucketize`, `fused_deterministic_scatter`.
 - **Shared-expert order.** Qwen3.5/3.6/Flash-Next enqueue the shared expert
   before the router (`qwen35/quantized_moe.rs:136`); with no sync left between
   them it no longer matters where it sits, so it stays.
-- **CLAUDE.md hot-path invariant 3** sanctions the MoE routing readback
+- **AGENTS.md hot-path invariant 3** sanctions the MoE routing readback
   "because the streaming ExpertCache schedules pinned→VRAM uploads by expert
   id". It becomes: the MoE routing *summary* goes to the host on a side stream
   and **nothing on the device waits for the host to read it**.
@@ -1904,7 +1904,7 @@ up another test's device:
 6. **ordering stress** — a free-running forward over a cache sized to the floor
    with demand and speculative eviction on every layer, run for minutes with
    `readonly_regions` armed over resident slots; it is the instrument for Rules
-   D, S, P and J and must run at production throughput (CLAUDE.md, the fence
+   D, S, P and J and must run at production throughput (AGENTS.md, the fence
    that suppresses the race it hunts).
 
 Pipeline, `expert_lre`:
@@ -2141,10 +2141,10 @@ Counting from the routing summary fixes that by construction.
 > `docs/README.md`, `docs/archived/README.md`), the §18.2 design docs, the §18.3
 > superseded-by pointers, and the §18.5 code comments are updated. `docs/decode_graphs.md`
 > already described the live dispatch and needed no change. The paper (§18.4) is still
-> flagged, not edited. `CLAUDE.md` (invariants 3, 4 and 7's example) and the `bed` and
+> flagged, not edited. `AGENTS.md` (invariants 3, 4 and 7's example) and the `bed` and
 > `sweep` skills are updated too.
 
-Audited across `docs/`, `CLAUDE.md`, the skills, the READMEs and every Rust and
+Audited across `docs/`, `AGENTS.md`, the skills, the READMEs and every Rust and
 CUDA doc comment. **A** = states behaviour this change makes false; rewrite with
 the code. **B** = a historical record; leave it, add a superseded-by pointer
 where noted. **C** = paper text; flagged, not edited here. Comments sitting on
@@ -2152,7 +2152,7 @@ code §12 deletes go with that code and are not repeated.
 
 ### 18.1 Repository guidance (A)
 
-- **`CLAUDE.md`** — invariant 3 (lines 193-196) and invariant 4's "the two
+- **`AGENTS.md`** — invariant 3 (lines 193-196) and invariant 4's "the two
   transfers in #3" (line 200), per §13; invariant 7's MoE-table example
   (lines 232-237) cites the concession count this design deletes — keep the
   rule, replace the example with clear-before-re-tenant; the `SlotIntegrity`
@@ -2177,7 +2177,7 @@ code §12 deletes go with that code and are not repeated.
 - **`docs/vram_span_partition.md`** — §4 lines 205-210 and §7 rule 5
   lines 475-476: the cached-slot-address rule and concession count.
 - **`docs/deepseek/deepseek_hot_path_invariants.md`** (authoritative per
-  CLAUDE.md) — lines 243-247, 258-260, 276-281, and the invariant 3/4 tables at
+  AGENTS.md) — lines 243-247, 258-260, 276-281, and the invariant 3/4 tables at
   348, 349, 360: the routing readback is no longer sanctioned-and-load-bearing.
 - **`docs/decode_graphs.md`** — rewritten for every model with the readback and
   the pipeline round trip gone: the whole MoE layer is one capturable region, with the

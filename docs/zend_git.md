@@ -208,7 +208,7 @@ What a caller may name as a revision: `Head`, an `Oid`, a `BranchName`, a `TagNa
 
 ### 5.6 `Signature`
 
-`{ name, email, when: GitTime }`, where `GitTime` is seconds since the epoch plus a UTC offset in minutes. A name or email containing `<`, `>` or a control character is refused. Every commit carries an explicit author and committer; nothing falls back to the user's configured `user.name`. Author and committer are both the **human** on whose behalf zend acts — the signed-in user (`--local-signin`, or the gateway identity). No commit names a model or assistant, in any field or trailer (CLAUDE.md, "No AI attribution").
+`{ name, email, when: GitTime }`, where `GitTime` is seconds since the epoch plus a UTC offset in minutes. A name or email containing `<`, `>` or a control character is refused. Every commit carries an explicit author and committer; nothing falls back to the user's configured `user.name`. Author and committer are both the **human** on whose behalf zend acts — the signed-in user (`--local-signin`, or the gateway identity). No commit names a model or assistant, in any field or trailer (AGENTS.md, "No AI attribution").
 
 Explicit time makes commits reproducible: the same base, changes, message and signatures give the same commit id, which is what lets the tests assert exact ids.
 

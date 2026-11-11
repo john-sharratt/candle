@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn the_ladder_turns_at_eighteen() {
         let gb = |n: u64| n * (1 << 30);
-        // The fleet, by the numbers in CLAUDE.md.
+        // The fleet, by the numbers in AGENTS.md.
         assert_eq!(ZQuant::for_vram(gb(16)), ZQuant::Q6K, "4090 Mobile");
         assert_eq!(ZQuant::for_vram(gb(24)), ZQuant::Q8_0, "3090");
         assert_eq!(ZQuant::for_vram(gb(72)), ZQuant::Q8_0, "PRO 5000");

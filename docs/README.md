@@ -3,7 +3,7 @@
 Design documents for the unbounded-context inference engine, its two products
 (Zen Code / `zend`, Battle Cities), and the research programme around them.
 
-**These documents are authoritative.** Per the repo-wide rule in `CLAUDE.md`:
+**These documents are authoritative.** Per the repo-wide rule in `AGENTS.md`:
 when a design doc and the code disagree, the doc wins and the code is the bug
 — fix the code (or, if the doc's design genuinely changed, fix the doc in the
 same commit). Several documents below carry an explicit `Status:` line stating

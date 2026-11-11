@@ -84,7 +84,7 @@ Five parts:
    what needs the user's approval, and what Claude does if zend is down. A
    skill is a markdown file: tuning a workflow is an edit, with no build and
    no deploy.
-5. **Routing rules** in each project's `CLAUDE.md` (§10).
+5. **Routing rules** in each project's `AGENTS.md` (§10).
 
 **Remote, not local.** The endpoint is served over HTTPS through the gateway, so the
 same tools reach the cluster from Claude Code on any machine and from an
@@ -542,7 +542,7 @@ the lineage and the worker's own journal (`docs/memory_backbone.md` §7.3).
 
 **The project's journal holds the standing rules.** `P:<repo>` is a journal of
 notes like a thread's — records under the owner, `threads::project_journal` —
-written by Claude with `journal_note` from the repository's `CLAUDE.md`
+written by Claude with `journal_note` from the repository's `AGENTS.md`
 conventions and whatever the user states as standing, so every worker in every
 thread starts with them. Every repository of the workspace has one.
 
@@ -1206,7 +1206,7 @@ the motherd being replaced.
 
 ## 10. Routing
 
-Each project's `CLAUDE.md` names the split of §1, and the default is to
+Each project's `AGENTS.md` names the split of §1, and the default is to
 delegate:
 
 - **Delegated:** anything reading-heavy or mechanical — implementing a spec,
@@ -1238,7 +1238,7 @@ endpoint and by zend, not asked of anyone in a prompt:
   `approval_grant` and `confirm` only with the user's approval, or the person
   grants from their own browser.
 - **Trials only of `origin/main`** (§8.4).
-- **Merging to `main` and committing under `CLAUDE.md`'s rule need the user's
+- **Merging to `main` and committing under `AGENTS.md`'s rule need the user's
   approval**, whoever did the work.
 - **Wipes are the user's.** Deleting a substrate, a member's data or a
   repository is never a tool.

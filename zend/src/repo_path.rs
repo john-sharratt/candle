@@ -36,8 +36,8 @@ mod tests {
     #[test]
     fn a_unit_is_shown_as_its_repository_and_the_path_inside_it() {
         assert_eq!(
-            shown("candle/CLAUDE.md"),
-            ("candle", "CLAUDE.md".to_string())
+            shown("candle/AGENTS.md"),
+            ("candle", "AGENTS.md".to_string())
         );
         assert_eq!(
             shown("candle/zend/src/"),

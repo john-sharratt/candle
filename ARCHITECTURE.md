@@ -242,7 +242,7 @@ across the warp.
 - **Hot** — live `ChunkedKvBacking` arenas in VRAM.
 - **Warm** — pageable CPU arenas driven by `candle-conversation/src/persistence/`
   (not the pinned `warm_pool.rs` originally designed in
-  `docs/archived/kv_tier_migration.md` — see the divergence note in `CLAUDE.md`). An
+  `docs/archived/kv_tier_migration.md` — see the divergence note in `AGENTS.md`). An
   evicted `SealedSequence` becomes `ArenaLocation::Cpu` with its GIDs
   re-pointed via `HeadGids::map_unique`; the original GPU GIDs drop,
   reclaiming VRAM through the allocator's RAII.

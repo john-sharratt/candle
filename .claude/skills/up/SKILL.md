@@ -11,7 +11,7 @@ disable-model-invocation: true
 
 `docs/deployment.md` is the description of the deployment — read it first. It names the
 machines, what each runs, the launch lines to replay, and what healthy looks like. The
-repository rules in `CLAUDE.md` apply: files are read and edited with the file tools only,
+repository rules in `AGENTS.md` apply: files are read and edited with the file tools only,
 never mask an exit status, commit only finished work.
 
 ## 1. Which machine, and what to start

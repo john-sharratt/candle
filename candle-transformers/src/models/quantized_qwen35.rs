@@ -703,7 +703,7 @@ pub(crate) mod tests {
             // VRAM at 99.3% and made the figure irreproducible. At ×128 it was
             // 881 ms of a 1,152 ms forward. Fixing it took ×128 from 286/957 t/s
             // to 3,812/3,846 and left decode layer-bound (`fwd:layer` is now 78%
-            // of the forward, was 19%). See invariant 2 in CLAUDE.md.
+            // of the forward, was 19%). See invariant 2 in AGENTS.md.
             //
             // Two claims died with it. There is no memory ceiling here at these
             // widths — KV is ~7.8 GB at ×128, not the 70 GB the sampled figure

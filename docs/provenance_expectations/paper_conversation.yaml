@@ -17,7 +17,7 @@ messages:
     should:
       - candle/README.md
       - candle/ARCHITECTURE.md
-      - candle/CLAUDE.md
+      - candle/AGENTS.md
       - candle/Cargo.toml
       - candle/candle-core/src/lib.rs
       - candle/candle-nn/src/lib.rs
@@ -53,7 +53,7 @@ messages:
       - candle/candle-conversation/src/provenance/wide_sig.rs
       - candle/candle-conversation/src/projection/project.rs
       - candle/candle-conversation/src/config.rs
-      - candle/CLAUDE.md
+      - candle/AGENTS.md
     should_not:
       - "*/tests/*"
       - "*_tests.rs"
@@ -67,7 +67,7 @@ messages:
       - candle/docs/unbounded_agents.md
       - candle/README.md
       - candle/ARCHITECTURE.md
-      - candle/CLAUDE.md
+      - candle/AGENTS.md
     should_not:
       - "*/tests/*"
       - "*_tests.rs"

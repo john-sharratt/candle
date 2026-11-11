@@ -125,7 +125,7 @@ Top kernels by launch count in that window:
 
 ### 3a. Hot-path invariant violations, by the numbers
 
-Two CLAUDE.md invariants are being broken at scale in this window alone:
+Two AGENTS.md invariants are being broken at scale in this window alone:
 
 - **Invariant 1 (no `to_dtype` in the loop — kernels emit the final type):**
   `cast_f16_f32` 8,640 + `cast_f32_bf16` 4,744 = **13,384 conversion launches**.
@@ -409,7 +409,7 @@ directly.
 3. **Batch the decode seals.** 260 launches × 7.2 ms at **2 blocks** on a 110-SM
    card. One launch across sequences/layers via a descriptor table would put real
    work in the grid — the pattern already exists (`bdp_recall_batched`'s
-   per-gallery pointer table; CLAUDE.md invariant 2b).
+   per-gallery pointer table; AGENTS.md invariant 2b).
 4. **Rework the selection kernel's block mapping.** 0.44% SM throughput, 4
    blocks/SM, 320k bank conflicts. One block per `(chunk, head)` cannot fill the
    GPU at these chunk counts regardless of `HB`. Only worth doing after 1–3, but

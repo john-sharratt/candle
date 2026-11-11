@@ -852,7 +852,7 @@ diagnostics). The ModelBuilder turn is the headline number: today it selects a
 two-line `ops.rs` fragment; the target is `builder.rs` scopes + file-head within
 budget.
 
-### 11.3 Unit tests (per CLAUDE.md, built alongside each mechanism)
+### 11.3 Unit tests (per AGENTS.md, built alongside each mechanism)
 
 - **A:** collection normalization — same probe, promiscuous vs quiet section,
   normalized ordering flips vs raw; `observe` at seal only; warm replay

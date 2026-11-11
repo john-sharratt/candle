@@ -10,7 +10,7 @@ These are the everyday checks, so they must be **fast and green**. The loop is: 
 re-run, until every pass is green. **A failure is fixed forward — never waved off as
 "pre-existing", "flaky", or "not from this change".** If it fails, it is ours to fix now.
 
-The repository rules in `CLAUDE.md` apply: read logs with Read/Grep (never
+The repository rules in `AGENTS.md` apply: read logs with Read/Grep (never
 `cat`/`Select-String`), never mask an exit status, no env-var feature flags, no stubs, no
 `TODO`s, commit only finished work.
 
@@ -214,7 +214,7 @@ RUSTC_BOOTSTRAP=1 target/debug/deps/<name>-<hash>.exe -Z unstable-options --repo
   fix. If the test itself is wrong (a stale expectation, a harness bug), correct the test and
   say why it was wrong.
 - Pre-existing or not makes no difference — it is fixed in this run.
-- Add or update a unit test at the level the bug lives (`CLAUDE.md`: TDD, raw expected
+- Add or update a unit test at the level the bug lives (`AGENTS.md`: TDD, raw expected
   values).
 - Re-run the failing pass (one line, as above); when it is green, re-run **every** pass once
   more, because a fix in a shared crate (`candle-core`, `candle-nn`, `candle-conversation`)

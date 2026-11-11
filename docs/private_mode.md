@@ -401,7 +401,7 @@ diaries hold what is written to them from private conversations on.
   key derived from the group key, so a private flag is enforced with no hop on
   any call; only liveness is shared, through a record.
 - **Refs are mandatory from the change that adds them**, without a flag
-  (CLAUDE.md: no feature flags). The clients are models reading the tools'
+  (AGENTS.md: no feature flags). The clients are models reading the tools'
   schemas and descriptions, which change in the same release.
 - **The guide tools need a ref too**: every conversation then starts at
   `get_user_context`, which makes "context on the first call" redundant, and

@@ -25,7 +25,7 @@ Review <branch | these files | this diff> of <repository> for:
 - correctness bugs: what input or state gives a wrong result or a crash;
 - regressions against the code before the change;
 - missing tests for behaviour the change adds;
-- breaks of the repository's conventions (its CLAUDE.md; the project journal holds them).
+- breaks of the repository's conventions (its AGENTS.md; the project journal holds them).
 
 Read every file you cite. For each finding, re-read the lines and quote them.
 Before you answer, start a reviewer task named verify-findings with repo_task_start, giving it

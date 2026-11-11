@@ -31,7 +31,7 @@ Implement this specification on a new branch `zen/<what>` of <repository>:
 <the spec, in full — what to change, where, the behaviour, the edge cases>
 
 Work rules:
-- Follow the repository's conventions (its CLAUDE.md; the project journal holds the standing rules).
+- Follow the repository's conventions (its AGENTS.md; the project journal holds the standing rules).
 - Write the tests alongside the code, at the level the behaviour lives.
 - Build and run the tests with your agent tools; read the outcome from the output, never assume it.
 - Commit on the branch with clear messages, and push the branch. Never push to the default branch.

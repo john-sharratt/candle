@@ -38,7 +38,7 @@ default branch as origin holds it — the branches zend already watches and
 fetches within seconds of a move (`docs/zend_branch_ingest.md` §4), and that
 `file_edit_and_commit` advances itself. They take the connector's repository
 enum, run no model, and answer within the MCP request-path budget (30 ms at
-p95, `CLAUDE.md`).
+p95, `AGENTS.md`).
 
 `file_read` also takes `paths` in place of `path`: up to 64 files in one call,
 each answered in full, in order, under its path, with a total of 4 MiB. A file
@@ -145,7 +145,7 @@ The addresses live in the manifest on the machine, never in this public
 repository.
 
 The committer is the author. A commit carries no attribution to a model or an
-assistant (`CLAUDE.md`, "No AI attribution anywhere"). A repository's `gate`
+assistant (`AGENTS.md`, "No AI attribution anywhere"). A repository's `gate`
 names the service that answers its `gate/<repo>` requests (§5.4); every push
 Zen makes to it — this tool's, a worker task's, an agent job's — goes through
 the gate.
@@ -162,8 +162,8 @@ someone else's.
 A push to origin cannot answer within 30 ms. `file_edit_and_commit` is the
 request-path budget's documented exception, as the deploy tools are: it
 answers when the push has landed, about one to two seconds, and holds no lock
-another call takes while it waits on the network (`CLAUDE.md`, MCP
-request-path invariant 1). `CLAUDE.md`'s MCP section lists it, and the two
+another call takes while it waits on the network (`AGENTS.md`, MCP
+request-path invariant 1). `AGENTS.md`'s MCP section lists it, and the two
 `_and_commit` transfers below with it.
 
 ### 3.6 The transfers
@@ -521,7 +521,7 @@ request-path budget.
 | `web/web.yaml`, `web/src/` | `logs` on a site; the gateway gathering a site's `/v1/logs` beside the members'. |
 | `zend-tools/src/state/sessions.rs`, `zend/src/mcp/archiving.rs` | Each session records its conversation; archiving a worker closes every session it opened (§4.2). |
 | `zend-vfs/src/workspace.rs`, zend's push paths | `gate:` in the manifest; every push to a gated repository through `gate/<repo>` first. |
-| `CLAUDE.md` | `file_edit_and_commit` as the request-path budget's exception. |
+| `AGENTS.md` | `file_edit_and_commit` as the request-path budget's exception. |
 | `mcp/src/guides/` | The connector's guides name the file and log tools, `log_grep` where they named `cluster_logs`, and when a task is the better tool. |
 
 ## 9. Order of work

@@ -23,7 +23,7 @@ LOOK FOR:
 - correctness bugs: what input or state gives a wrong result or a crash;
 - regressions against the code before the change;
 - missing tests for behaviour the change adds;
-- breaks of the repository's conventions (its CLAUDE.md; the project journal).
+- breaks of the repository's conventions (its AGENTS.md; the project journal).
 
 METHOD:
 1. Read every file you will cite.

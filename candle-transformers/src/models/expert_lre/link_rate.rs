@@ -4,7 +4,7 @@
 //! A copy from pinned host memory into VRAM on the copy stream, timed by the
 //! host around a stream synchronize — the best of a few, after one to warm the
 //! path. It measures the link the workers read remote experts over, on this
-//! machine as it is: a PCIe 3.0 host halves it (`CLAUDE.md`, the 3090 box), and
+//! machine as it is: a PCIe 3.0 host halves it (`AGENTS.md`, the 3090 box), and
 //! a figure carried over from another machine would size the window twice too
 //! wide there.
 

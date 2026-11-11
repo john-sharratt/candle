@@ -251,7 +251,7 @@ Properties that shape several results, worth stating before the tables:
   the MTP head's 512): 20.6–24.6K resident across a run, the zone shrinking as KV
   grows, hit rate 98.8–100%, with the misses copied from pinned RAM by the expert
   kernels.
-- **The 3090's two traps** (both from `CLAUDE.md`'s fleet notes, and both real
+- **The 3090's two traps** (both from `AGENTS.md`'s fleet notes, and both real
   in the numbers). Its host caps the link at **PCIe 3.0** — ~12 GB/s, roughly
   half the 4090 Mobile's despite 50% more VRAM — so any warm↔hot KV or
   expert-stream cost is paid at that rate; and **sm_86 has no native FP8**, so

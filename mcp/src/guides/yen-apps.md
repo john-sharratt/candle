@@ -42,7 +42,7 @@ expect. She shows you a page by pasting a screenshot.
 
 ## The order of work
 
-1. `file_read` `CLAUDE.md` in the `yenbot` repository, then `docs/index.md`;
+1. `file_read` `AGENTS.md` in the `yenbot` repository, then `docs/index.md`;
    read only the docs the task needs.
 2. `journal_grep` the app's name, and read Yen's taste entries.
 3. **For a new app, read `docs/building-an-app.md` in full** — the gate

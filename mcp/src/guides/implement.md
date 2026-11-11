@@ -26,7 +26,7 @@ SPEC:
 change>
 
 CONSTRAINTS:
-- Follow the repository's conventions (its CLAUDE.md; the project journal
+- Follow the repository's conventions (its AGENTS.md; the project journal
   holds the standing rules).
 - Push the branch; never push to the default branch, and never force-push. If
   the branch already exists on origin, build on it.

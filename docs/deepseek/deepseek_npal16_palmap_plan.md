@@ -58,7 +58,7 @@ record) are a *different* subsystem and stay 2-bit/4-palette.
 ## Staging strategy (why two encoding/geometry phases, not one)
 
 The 4-bit-map change and the 8→16 geometry change are **independent axes**. We
-land them in sequence so each is validated in isolation (TDD, per CLAUDE.md):
+land them in sequence so each is validated in isolation (TDD, per AGENTS.md):
 
 - **Phase 1** flips the map encoding to 4-bit **at NPAL=8** (map faithful but
   still identity/dead — `MAPPED=false`). This isolates the record-serializer /

@@ -5155,7 +5155,7 @@ impl BackendStorage for CudaStorage {
             // `k == 0` with real output elements is an empty SUM, which is zero
             // — the value cuBLAS itself would have written with `beta = 0`. It
             // has to be materialised rather than left uninitialised, so this is
-            // one of the few places `alloc_zeros` is right (CLAUDE.md invariant
+            // one of the few places `alloc_zeros` is right (AGENTS.md invariant
             // 6 excepts buffers read before they are written, and every element
             // here is read without any kernel writing it).
             let slice = match (&self.slice, &rhs.slice) {

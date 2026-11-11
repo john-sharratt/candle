@@ -2737,7 +2737,7 @@ fn tensor_norm() -> Result<()> {
 /// `contiguous()` short-circuits to `self.clone()` and returns a view. Both
 /// halves of that are load-bearing and neither is obvious at a call site:
 /// reading `contiguous()` as "give me my own copy" is wrong, and reaching for
-/// `force_contiguous()` to *get* one is wrong too — CLAUDE.md's hot-path
+/// `force_contiguous()` to *get* one is wrong too — AGENTS.md's hot-path
 /// invariant 2 counts it as the same prohibited allocate-plus-copy as `cat`
 /// and `slice_set`. A consumer that needs its own storage needs a lifetime,
 /// not a layout operation.

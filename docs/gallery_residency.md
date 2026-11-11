@@ -108,7 +108,7 @@ scanned.
   groups only: its probe is narrowed to them and its tally weighs them.
 - **The index addresses a (page, group), not a page.** `page_ptr[page × G + g]`
   is the address of launch-group `g`'s words in that page — a descriptor table
-  (CLAUDE.md invariant 2b) — so the kernels read any packing. A group a turn
+  (AGENTS.md invariant 2b) — so the kernels read any packing. A group a turn
   does not hold, scanned only because another segment of the launch weighs it,
   points at one resident zero page; the segment's tally weighs it zero.
 - **Readers weighing different groups share an index.** The index cache is

@@ -226,7 +226,7 @@ impl HostEmbedding {
     /// deliberately — see the module header.
     ///
     /// `dtype` is the residual stream's type, and the dequantize kernel emits it
-    /// directly (CLAUDE.md invariant 1). That is not a convenience: it is where
+    /// directly (AGENTS.md invariant 1). That is not a convenience: it is where
     /// the PCIe saving is realised. What crosses the bus is the QUANTIZED row —
     /// 4352 B for a Q8_0 4096-wide row against 16 KiB dequantized, 8704 B against
     /// 32 KiB for the 9B's 8192 — and the widening to `dtype` happens on the far

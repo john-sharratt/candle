@@ -285,7 +285,7 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
     // harness: `readonly_regions` declares the ground that must never be written
     // again and names the *writer* at the moment of the write, on the thread
     // that did it, before the corruption — rather than leaving an address to
-    // decode afterwards. See CLAUDE.md.
+    // decode afterwards. See AGENTS.md.
     //
     // `--generate-line-info` costs nothing at runtime and is two thirds of the
     // build's output on disk. Measured across a cubin: 175 KB of `.text` SASS

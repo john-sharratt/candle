@@ -4652,7 +4652,7 @@ GPU, and uses loopback sockets or in-memory duplex pipes.
 the burst harnesses would measure an unoptimised codec (the block today covers
 `candle-*`, not `web`, `host`, `zend` or `npcd`).
 
-### 14.1 Unit tests (raw expected bytes, per `CLAUDE.md`)
+### 14.1 Unit tests (raw expected bytes, per `AGENTS.md`)
 
 | Module | Asserts |
 |---|---|
@@ -4738,7 +4738,7 @@ dependency order:
   its own before anything is built on it.
 - **Every later chunk builds only on chunks already finished**, and ends at an exit bar
   that is a test result, not a judgement.
-- **Nothing is half-built.** A chunk lands complete, or it does not land (`CLAUDE.md`).
+- **Nothing is half-built.** A chunk lands complete, or it does not land (`AGENTS.md`).
 
 | Chunk | Builds on | Deliverable |
 |---|---|---|

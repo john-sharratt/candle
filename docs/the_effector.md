@@ -1087,7 +1087,7 @@ the migration:
 
 # Part F — Testing and build order
 
-House conventions hold (`CLAUDE.md`): TDD with raw expected values, one concern per
+House conventions hold (`AGENTS.md`): TDD with raw expected values, one concern per
 file, no stubs, no env-flags, file tools only. Three properties make this testable:
 
 - **The `local` router is `oneshot`-testable on CPU**, no GPU, no server — the path
@@ -2394,7 +2394,7 @@ The map has derived state that is never authored — `Node::exits` and `Node::vi
 An earlier draft named the Makers' `map_*` verbs (`map_add_place`, `map_settle_border`,
 `map_remove_place`, …) as the effector face of this surface. Building it made plain that
 those verbs are a *different map*, and this records the correction (design docs are
-authoritative; a draft the code disproves is fixed, §CLAUDE.md):
+authoritative; a draft the code disproves is fixed, §AGENTS.md):
 
 - The `map_*` verbs author **cartography lore** — `sim.record` items of `Kind::Place`,
   the fictional world-map the Makers draw as content (`work.rs:342`, `map_add_place`
@@ -2454,7 +2454,7 @@ An earlier draft of this appendix split these acts by target and mounted the
 target-facing ones (`claim`, `operate`, `record_verdict`, …) on a target's *instance id*
 (`POST http://local/<ns>/<id>/claim`). Building it made plain that the shape does not fit
 the world model, so the design changed and this records the change (design docs are
-authoritative; a draft the code disproves is corrected, §CLAUDE.md):
+authoritative; a draft the code disproves is corrected, §AGENTS.md):
 
 - These acts name their targets **by the name the world writes down**, resolved against
   the live `Choices` sets — not by a map instance id. "The blast door" is a
@@ -2510,7 +2510,7 @@ when a fight gives it a posture to take.
 The same act reaches `body::perform` two ways — as a compiled body act in a turn's
 grammar, and as a `/here` route — exactly as an `AtPart` act reaches it both as a
 compiled act and as a station route. One implementation (the world's own dispatch), two
-front doors: the no-dual-path rule (§CLAUDE.md) is kept.
+front doors: the no-dual-path rule (§AGENTS.md) is kept.
 
 *As-built: mounted. `npcd/src/effector/here.rs` is the `/here` surface; the near-you
 index advertises `http://local/here`.*

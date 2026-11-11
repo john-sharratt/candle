@@ -148,7 +148,7 @@ impl EmbeddingTable {
     /// immediately after.
     ///
     /// The result is `dtype` with no conversion after the fact: the dequantize
-    /// emits it (CLAUDE.md invariant 1), and under `Host` the CPU-side cast
+    /// emits it (AGENTS.md invariant 1), and under `Host` the CPU-side cast
     /// happens before the upload so the narrower type is what crosses the bus.
     ///
     /// The rows are the forward's residual, written where `residual` names:
@@ -371,7 +371,7 @@ mod tests {
     /// wave to serve a producer that does not exist: every token source in this
     /// engine holds `u32` (the scheduler's `&[u32]`, the drafter's argmax).
     /// Validating states the requirement where a cast only hid it
-    /// (CLAUDE.md invariant 1b).
+    /// (AGENTS.md invariant 1b).
     #[test]
     fn ids_of_the_wrong_type_are_refused_rather_than_retyped() -> Result<()> {
         let t = table(6, 4)?;

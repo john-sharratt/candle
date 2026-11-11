@@ -417,7 +417,7 @@ person's decision.
   line. Asserted as exact text.
 - The latency gate (`zend/src/mcp/latency_tests.rs`) gains `member_status`
   and the extended `cluster_status`. Neither runs a model, so each answers
-  inside 30 ms at the 95th percentile (`CLAUDE.md`, "MCP Request-Path
+  inside 30 ms at the 95th percentile (`AGENTS.md`, "MCP Request-Path
   Invariants").
 
 ## 9. Changes to other documents

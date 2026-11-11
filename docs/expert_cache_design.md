@@ -691,7 +691,7 @@ sizing decision — which is exactly what this table is for.
 | dev — 4090 Mobile 16 GB | **PCIe 4.0 ×8** (live width, read 2026-10-16) | single, ~3–7 GB/s | **~12 GB/s** (copy engine, `dispatch.rs:112`) | 2–4× — earns its keep |
 | dev — RTX 3090 24 GB (i7-10700K) | **PCIe 3.0 ×16** | single | **~12 GB/s** (gen-3 cap, 15.75 theoretical) | 2–4× — earns its keep, more so |
 | dev — RTX PRO 5000 72 GB | PCIe 5.0 ×16 | single | ~25 GB/s+ | large VRAM makes it mostly moot |
-| production (`CLAUDE.md`) | PCIe 5.0 ×16 | 16 TB PCIe 5.0 RAID 0 **@ 45 GB/s** | ~25 GB/s | disk is *faster than the bus* — buys ≈ nothing |
+| production (`AGENTS.md`) | PCIe 5.0 ×16 | 16 TB PCIe 5.0 RAID 0 **@ 45 GB/s** | ~25 GB/s | disk is *faster than the bus* — buys ≈ nothing |
 
 The two consumer boxes land on the same link speed by different routes. The
 3090 box's **i7-10700K is Comet Lake and caps the link at gen 3**. The 4090

@@ -813,7 +813,7 @@ is where the number becomes dramatic: at 1M tokens dense FP16 is hundreds of GB;
 bounded window + a pooled corpus.
 
 - **Test:** raw-byte unit test on both accounting functions for a synthetic `N` (assert exact byte
-  counts, not a tolerance — CLAUDE.md TDD rule for codec/accounting code), plus a `ratio vs FP16
+  counts, not a tolerance — AGENTS.md TDD rule for codec/accounting code), plus a `ratio vs FP16
   linear` line printed alongside the Paris/RULER stats.
 - **Gate:** host forward is untouched, so the streaming/engine Paris goldens are unaffected — this
   step lands independent of the kernel.
@@ -854,7 +854,7 @@ rung 2 *before* any live data. Substrate enters only at rung 4. This is why the 
 `ConversationBuilder::workspace_path(dir)` roots persistence at `dir/substrate/` (builder.rs:71).
 For tests, point it at a `TempDir` under the scratchpad: a `deepseek_test_conversation(tmp)` helper
 builds a no-daemon `Conversation` with a real-or-tiny model (gated on file presence, like the existing
-`#[ignore]` goldens) and a throwaway substrate. Persistence stays mandatory (CLAUDE.md) — it is simply
+`#[ignore]` goldens) and a throwaway substrate. Persistence stays mandatory (AGENTS.md) — it is simply
 rooted in a directory dropped at test end, so we get full persist/reboot/resume coverage without Zend.
 Only rung 4 uses it; rungs 1–3 never construct a `Conversation` at all (they are kernel/engine tests
 below candle-conversation). **Never pass `workspace_path = None` in a test:** `None` does not disable

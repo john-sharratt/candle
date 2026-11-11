@@ -84,7 +84,7 @@ compacted.
 **Tools:** `journal_note`, `journal_read`, `journal_grep`
 - Thread notes: decisions and why, user statements, constraints.
 - Project notes (`P:<repository>`): standing rules every task should start
-  with — conventions from CLAUDE.md, things the user says always hold.
+  with — conventions from AGENTS.md, things the user says always hold.
 - Find evidence with `journal_grep` across a thread's workers (`T:<thread>/*`).
 
 ### A7. `handoff`

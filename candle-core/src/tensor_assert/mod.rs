@@ -38,7 +38,7 @@
 //!   presented as finite, plausibly-shaped expert weights that were simply
 //!   another tenant's activations. Finiteness is necessary, not sufficient —
 //!   when the operands and weights all pass and the output is still wrong,
-//!   suspect memory, not arithmetic (CLAUDE.md hot-path invariant 7).
+//!   suspect memory, not arithmetic (AGENTS.md hot-path invariant 7).
 //! * **The order of the report is the kernel's, not the host's.** Nothing is
 //!   read back until the drain, so host call order says nothing about which site
 //!   went bad first. The `seq` ticket does; sort by it.

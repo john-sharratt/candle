@@ -130,7 +130,7 @@ mod tests {
     }
 
     /// The fleet, by the machine each figure belongs to — the sizing table in
-    /// CLAUDE.md names its machine per row for exactly this reason.
+    /// AGENTS.md names its machine per row for exactly this reason.
     #[test]
     fn the_ladder_places_every_card_in_the_fleet() {
         // RTX PRO 5000 Blackwell, 72 GiB — under 86, so Q4_KO, which is also

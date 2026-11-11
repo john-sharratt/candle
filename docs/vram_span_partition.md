@@ -15,7 +15,7 @@ Related documents, and how they differ from this one:
 | [`archived/arena_unification.md`](archived/arena_unification.md) | Why KV moved to one reservation with shared size classes. Historical. |
 | [`vram_partition_behavioural_tests.md`](vram_partition_behavioural_tests.md) | The tests that hold the invariants below. |
 
-`CLAUDE.md`'s **Hot-Path Invariant 7** is the normative statement of the rules
+`AGENTS.md`'s **Hot-Path Invariant 7** is the normative statement of the rules
 here. This document explains the machine those rules protect.
 
 ---
@@ -684,7 +684,7 @@ One arena kind, distinct from the band arenas, drawing regions from the same poo
 
   Before this, a record was a *dead copy* of a fact the gid owned — the address
   `base_ptr + chunk_idx · chunk_byte_stride`, stored with no reference to its subject —
-  and that is the general rule `CLAUDE.md` states as "a captured device address is
+  and that is the general rule `AGENTS.md` states as "a captured device address is
   invalidated by anything that moves what it names, and a reference count is not a
   location". It is why a compaction that rewrote holders' gids and left records behind
   read another chunk's K/V, and why the pass can now leave them alone instead. See §6.

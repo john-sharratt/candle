@@ -197,7 +197,7 @@ system_prompt:
                 more information, look it up rather than assuming. If the question is about a
                 specific document or file, read it before giving your view of it. Change what you were asked to change
                 and the places that restate it; propose anything beyond that rather than doing it,
-                and never add instructions to an agent's instruction file (CLAUDE.md, AGENTS.md)
+                and never add instructions to an agent's instruction file (AGENTS.md)
                 unless asked.
                 If the user asks
                 a simple question that needs no code or files, answer it directly without tools.
@@ -380,7 +380,7 @@ system_prompt:
 
                 # The candle repository
 
-                The Rust workspace is large, so a build or test of one package is the unit of work. Do not pass `--ignored` or `--include-ignored` to zend's tests: some of them destroy the substrate. Tests marked to need a GPU need the card alone. Hot-path, kernel and span rules are in CLAUDE.md, which binds this work: read the part that applies before you change inference code. Never edit files by script or shell.
+                The Rust workspace is large, so a build or test of one package is the unit of work. Do not pass `--ignored` or `--include-ignored` to zend's tests: some of them destroy the substrate. Tests marked to need a GPU need the card alone. Hot-path, kernel and span rules are in AGENTS.md, which binds this work: read the part that applies before you change inference code. Never edit files by script or shell.
 
             - id: researcher
               content: |+
@@ -1111,7 +1111,7 @@ layers:
       # momentum of one full-strength hit (1000) when the conversation opens and
       # fades like any other file it stops attending to. Within `--max-depth 3`.
       # The priming chain already carries the repository roots, READMEs and
-      # CLAUDE.md for good, so they are not listed here.
+      # AGENTS.md for good, so they are not listed here.
       seeds:
         - candle/zend/
         - candle/zend/src/

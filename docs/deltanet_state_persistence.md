@@ -210,7 +210,7 @@ re-opened by mistake:
 
 ### 0a.5 Standing constraints
 
-`CLAUDE.md` governs: no back-compat shims, no env flags, no TODOs or stubs, one
+`AGENTS.md` governs: no back-compat shims, no env flags, no TODOs or stubs, one
 concern per file, imports not fully-qualified paths, **only Edit/Write may
 modify files**, and **never commit without explicit permission**. The whole run
 so far is uncommitted on branch `fused-kernels`.
@@ -235,7 +235,7 @@ range and assume.
 
 | file | lines | why |
 |---|---|---|
-| `CLAUDE.md` (repo root) | — | the standing rules this work is bound by: no back-compat shims, no env flags, no TODOs/stubs, one concern per file, TDD, **only Edit/Write may modify files**, never commit without permission |
+| `AGENTS.md` (repo root) | — | the standing rules this work is bound by: no back-compat shims, no env flags, no TODOs/stubs, one concern per file, TDD, **only Edit/Write may modify files**, never commit without permission |
 | `candle-transformers/src/models/delta_net/state_store.rs` | 615 | `RecurrentStateStore` — the thing being persisted, forked and restored. `export`/`import`, and the **ping-pong** wave discipline (two `s` buffers per layer; commit is a `mem::swap`, rollback is nothing). **P1, P2, P4, P7 all edit this.** |
 | `candle-transformers/src/models/delta_net/types.rs` | 58 | `DeltaNetDims`, `LayerKind` — the geometry every size calculation uses |
 | `candle-transformers/src/models/delta_net/kv_layout.rs` | 220 | `KvLayerMap` — why `session.num_layers()` is 10 and `model.num_layers()` is 40; `snap_to_attention` |
@@ -989,7 +989,7 @@ compatibility concession:
   can be *injected* by a non-glue model **and** *regenerated* by a glue-capable
   one, which is free to ignore the stored K/V. A turn sealed ethereally can
   only be regenerated. So `Option` already means "is this boundary's K/V
-  available" — a real hit/miss, which CLAUDE.md explicitly permits, rather than
+  available" — a real hit/miss, which AGENTS.md explicitly permits, rather than
   optionality-as-a-feature-flag, which it forbids.
 - Forcing it mandatory would make `NoThink` unrepresentable and would bake
   boundaries for glue-capable models that gain nothing from it.
@@ -1317,7 +1317,7 @@ layers transforming the residual between the two captures. That could sharpen
 the signal or scatter it, and reading the code cannot say which.
 
 So `[n−2,1,1]` is the **default**, not the answer. Treat the fold shape as a
-per-model constant to be re-derived by measurement — the same rule CLAUDE.md
+per-model constant to be re-derived by measurement — the same rule AGENTS.md
 already applies to the quantization thresholds ("must be re-derived for each
 variant"). That measurement is the Phase 4 exit criterion risk 5 already asks
 for, so it is scheduled work, not new work.

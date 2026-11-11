@@ -41,7 +41,7 @@ closing chat counts until it is disposed of.
 
 `zen_chat_read` only reads (`readOnlyHint`): it writes nothing, not even a read
 cursor, so the caller passes `after` to page on (MCP request-path invariant 2,
-`CLAUDE.md`). It runs no model and is in the latency gate
+`AGENTS.md`). It runs no model and is in the latency gate
 (`zend/src/mcp/latency_tests.rs`).
 
 A send while Zen is still answering is refused, naming `zen_chat_read`: one

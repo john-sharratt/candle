@@ -245,7 +245,7 @@ impl DeltaNetState {
     /// Allocate the buffers **without zeroing** — for a write half the kernels
     /// fully overwrite before anything reads it.
     ///
-    /// Hot-path invariant 6 (`CLAUDE.md`): a buffer a kernel stamps end to end
+    /// Hot-path invariant 6 (`AGENTS.md`): a buffer a kernel stamps end to end
     /// must not be memset first. The zeroed twin costs a full-width device
     /// memset per layer (~2 MB × 30 layers ≈ 63 MiB per fork) on the exact
     /// bytes the next wave overwrites, and forks run ~3× per turn.

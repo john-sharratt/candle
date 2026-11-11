@@ -12,7 +12,7 @@ everything a dialogue's projection has to get right:
 
 | Turn | Message | What it needs from the projection |
 |---|---|---|
-| a | `Give me a tour of the codebase — main crates, key files, and how everything connects.` | Broad structure: folders, crate roots, ARCHITECTURE/README/CLAUDE.md. Nothing deep. |
+| a | `Give me a tour of the codebase — main crates, key files, and how everything connects.` | Broad structure: folders, crate roots, ARCHITECTURE/README/AGENTS.md. Nothing deep. |
 | b | `what do you think of the unbounded context paper?` | The paper (`docs/unbounded_agents.md`, 7 pages) in full, and the model owning it as its own reading. |
 | c | `if you were to improve the paper then what would you change?` | The paper plus the evidence behind its claims — `docs/performance.md`, the code it describes — without mixing up which document says what. |
 | d | `ok. make those changes first then ill help you with more` | A long agentic turn: ~20–60 `file_edit` calls over up to 32 rounds against the placed paper, plus the places that restate what changed. |
@@ -21,7 +21,7 @@ The turns run in order, each only after the previous stream has ended.
 
 ## 2. How to run it
 
-Run against a daemon **outside the cluster** (CLAUDE.md "Test locally, not
+Run against a daemon **outside the cluster** (AGENTS.md "Test locally, not
 clustered") or with the cluster reduced to one member — everything a clustered
 member writes replicates and is permanent. The edits turn d makes land in the
 conversation's own file overlay, never on disk.
@@ -222,8 +222,8 @@ better informed, not just tidier.
 2. `web/src/markdown/math.rs:332` pins the superseded `O(1/N)` formula.
 3. Two blog posts carry the "identical KV cache" claim §7 contradicts
    (`one-card-unbounded-context.md:421-422`, `the-journal-is-king.md:245`).
-4. CLAUDE.md:37 says `sign(Q_PCA^T @ K)`; the code is Q·Q with no PCA.
-   CLAUDE.md:459 says C0–C9; the code has C0–C10.
+4. AGENTS.md:37 says `sign(Q_PCA^T @ K)`; the code is Q·Q with no PCA.
+   AGENTS.md:459 says C0–C9; the code has C0–C10.
 5. The paper's probe window is 64 tokens in six places; the code's is 256
    (`config.rs:1855-1859`).
 6. §5's "template K/V never persisted" describes a removed mechanism —
@@ -232,7 +232,7 @@ better informed, not just tidier.
    rows.
 8. C10 is calibrated against the same story-rewrite test that validates it.
 9. §6.2/§9.10 describe the three-band index; `WideQSig` (§6.6) is what ships.
-10. The laptop link is PCIe ×8 in CLAUDE.md, ×16 in the README and §9.2.
+10. The laptop link is PCIe ×8 in AGENTS.md, ×16 in the README and §9.2.
 11. §7 (persist KV, not tokens) contradicts §9.12/§11.5 ("prefill the tokens
     and reconstruct the identical KV").
 12. The GitHub handle is `john-sharratt` in Appendix C, `john-sharrat` in the

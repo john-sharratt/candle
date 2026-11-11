@@ -171,7 +171,7 @@ half). Each seam is announced to the other session when it is pushed.
   warnings` are clean; its owner has read the diff; its design-doc revision is in
   the same commits. A phase that fails its gate is fixed before it is called
   done — never carried forward.
-- **Standing rules bind every phase:** CLAUDE.md (file tools only, no shims, no
+- **Standing rules bind every phase:** AGENTS.md (file tools only, no shims, no
   flags, no TODOs, imports not paths, one concern per file, tests asserting raw
   expected values) and the MCP request-path invariants (30 ms at p95 for a tool
   that runs no model; a read never writes; no full scans; no network under a lock

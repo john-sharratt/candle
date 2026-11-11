@@ -124,7 +124,7 @@ pub struct SharedPm {
     /// launched their attention kernels against that device address and may
     /// still be reading it. Freeing and reallocating mid-forward could hand the
     /// same pool address to this layer's upload while that read is in flight — a
-    /// wild read or wrong attention with no attribution (CLAUDE.md invariant 7).
+    /// wild read or wrong attention with no attribution (AGENTS.md invariant 7).
     /// Carrying the superseded buffer here defers its free to forward end, which
     /// is after the logits readback — i.e. after every kernel has retired.
     #[cfg(feature = "cuda")]

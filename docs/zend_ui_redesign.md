@@ -5,7 +5,7 @@
 > that was imported to `docs/design/zend-ui/`. That prototype has since been
 > consumed into the shipped UI and removed from the repo; this document and
 > `zend/web/index.html` are now the reference. It is meant to be edited in place
-> as we agree on details — design docs take precedence over the code (CLAUDE.md),
+> as we agree on details — design docs take precedence over the code (AGENTS.md),
 > so when we change our minds, we change this file in the same commit.
 
 ## 1. Goal & scope
@@ -103,7 +103,7 @@ structured JSON record on the socket — no client-side parsing (see §2.6).
   markdown.
 - `marked.min.js`, `favicon.svg`.
 
-The redesign **replaces** `index.html` outright (no dual UI path — CLAUDE.md
+The redesign **replaces** `index.html` outright (no dual UI path — AGENTS.md
 "no backward compatibility"). The new file is larger but the same kind of
 artifact.
 
@@ -757,7 +757,7 @@ and the switch end to end through an in-process gateway.
 ### Encoding / glyphs
 The design bundle arrived with CP1252→UTF-8 mojibake. The rebuilt
 `index.html` and `zend-api.mock.js` MUST use correct UTF-8. Write/Edit tools
-only — **never** PowerShell `Set-Content`/`Out-File` (CLAUDE.md). Glyph table:
+only — **never** PowerShell `Set-Content`/`Out-File` (AGENTS.md). Glyph table:
 
 | Intended | Mojibake seen | Where |
 |---|---|---|
@@ -788,7 +788,7 @@ The composer placeholder, for reference, should read:
 - **No TODOs/stubs in committed code:** the only intentional "throw not
   implemented" is `zend-api.live.js` methods *during Phase 1*, and they are all
   replaced by the end of their Phase-2 sub-step — none survive Phase 2.7.
-- **Commits need explicit approval**, each one (CLAUDE.md).
+- **Commits need explicit approval**, each one (AGENTS.md).
 
 ### Tooling note (Playwright)
 Playwright is a dev/test-only dependency (not embedded, not shipped, not a build

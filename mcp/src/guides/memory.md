@@ -84,7 +84,7 @@ is true, `journal_accept {journal: "<path>#<line id>"}`; when they don't,
   constraint every later task must keep. It is the first thing to re-read
   after your context is compacted.
 - On the **project**: a rule of the whole repository — a convention from its
-  CLAUDE.md, something the user says always holds, a lesson from a bad run.
+  AGENTS.md, something the user says always holds, a lesson from a bad run.
 - A worker's entry with `entry` (or `T:<thread>/<name>#12`) reads the turns
   behind it — the evidence for what it claims. `journal_grep` over
   `T:<thread>/*` finds which worker learned something.

@@ -318,7 +318,7 @@ export function mountSubstrate({ tenant, prefix, mock, hosts, live }) {
     const head=[
       h('span',{class:'title'},[
         // An ingested unit's repository, left of the path inside it — the way
-        // the tools address it (`repo: candle, path: CLAUDE.md`).
+        // the tools address it (`repo: candle, path: AGENTS.md`).
         c.repo ? h('span',{class:'repo',text:c.repo}) : null,
         document.createTextNode(c.label && c.label.trim() ? c.label : '(untitled)'),
         versionLine(c),

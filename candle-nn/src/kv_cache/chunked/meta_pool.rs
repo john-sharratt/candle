@@ -313,7 +313,7 @@ pub(crate) fn serialize_kv_heads(
 /// Without it the record was a *dead copy* of a fact the gid owned — the address
 /// `base_ptr + chunk_idx · chunk_byte_stride`, stored with no reference to the thing
 /// it was derived from — and nothing structurally stopped the copy outliving its
-/// subject. That is the general rule `CLAUDE.md` states as "a captured device address
+/// subject. That is the general rule `AGENTS.md` states as "a captured device address
 /// is invalidated by anything that moves what it names, and a reference count is not
 /// a location", and it is what made a KV compaction corrupt K/V: the pass rewrote the
 /// holders' gids, the source lost its last refcount, the allocator reissued that

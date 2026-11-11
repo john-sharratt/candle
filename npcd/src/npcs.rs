@@ -1035,7 +1035,7 @@ pub fn npc_id_wire(mut n: u64) -> String {
 /// this format replaced**, because every decimal numeral is also a valid
 /// base-36 one — a caller holding a pre-migration decimal id decodes it here
 /// as a base-36 number instead of getting a clean parse failure. No shim
-/// carries that old format forward (`CLAUDE.md`: no backward compatibility in
+/// carries that old format forward (`AGENTS.md`: no backward compatibility in
 /// this pre-publication codebase), so the residual risk is bounded by how the
 /// id itself is minted rather than guarded against here: character ids are
 /// drawn across the full `u64` range, so a real id's base-36 form is 13

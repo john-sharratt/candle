@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn the_ladder_turns_at_eighteen_gigabytes() {
         let gb = |n: u64| n * (1 << 30);
-        // The fleet's three cards, by the numbers in CLAUDE.md.
+        // The fleet's three cards, by the numbers in AGENTS.md.
         assert_eq!(FluxQuant::for_vram(gb(16)), FluxQuant::Q4KS, "4090 Mobile");
         assert_eq!(FluxQuant::for_vram(gb(24)), FluxQuant::Q8_0, "3090");
         assert_eq!(FluxQuant::for_vram(gb(72)), FluxQuant::Q8_0, "PRO 5000");

@@ -29,7 +29,7 @@ METHOD:
    show it fails without the fix.
 
 CONSTRAINTS:
-- Follow the repository's test conventions (its CLAUDE.md, the project
+- Follow the repository's test conventions (its AGENTS.md, the project
   journal).
 - Push the branch; never the default branch.
 

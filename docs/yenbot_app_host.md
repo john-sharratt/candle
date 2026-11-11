@@ -44,7 +44,7 @@ by rule — before it goes live.
 | A landing page of apps | `/` lists the apps the person may open, as icons; signed out, it shows the site and a sign-in button (§13.1). |
 | AI and pictures through Zen, from this site only | Browsers and workflows call yenbot; yenbot calls zend for text and Zen's image engine for pictures, with a service key nothing else holds. No budget (§14). |
 | A library to draw on | Tile icons, illustrations, empty-state art, backgrounds and stickers drawn with Zen's image engine in one house style, catalogued and reused (§15). |
-| Yen is not a coder | The framework, templates, the art library, guides, an extensive `CLAUDE.md` and the checks are all there from the first day (§8, §15–§17). |
+| Yen is not a coder | The framework, templates, the art library, guides, an extensive `AGENTS.md` and the checks are all there from the first day (§8, §15–§17). |
 | The app-building guide is read for every new app | Every app's manifest carries the guide's edition it was built to; the gate refuses an app built against an older one (§17.3). |
 | No command line | Everything is done with the connector's file tools or a Zen task; the platform does on load what a tool would otherwise do — sizing art, renaming apps, migrating data (§15.2, §20.1). |
 | The styling must be amazing, to her attention to detail | One design system with fixed tokens, hot like the apps; an app may override a few named tokens for itself; a living catalogue; and Yen's eye on the result (§8.5). |
@@ -107,7 +107,7 @@ it does candle. Two working copies on BlackWorld, never the same one:
 
 ```text
 yenbot/
-  CLAUDE.md                   the repository's rules and map, read first (§17.2)
+  AGENTS.md                   the repository's rules and map, read first (§17.2)
   Cargo.toml                  the one binary
   src/                        the platform, one concern per file
     main.rs  config.rs  serve/  api/  store/  accounts/  jobs/  workflows/
@@ -1233,7 +1233,7 @@ template, by a Zen task for a large one.
 toolbar and the SDK's preview backend every preview on claude.ai is published
 with (`docs/yenbot_preview.md` §6). It passes the same checks.
 
-## 17. Docs, CLAUDE.md, the checks and the connector's guide
+## 17. Docs, AGENTS.md, the checks and the connector's guide
 
 ### 17.1 The manual
 
@@ -1281,9 +1281,9 @@ request ("add a photo to each entry", "let only me see it", "remind me the
 night before", "send me a summary every Sunday", "draw a picture for each
 recipe") is mapped to the exact pieces that do it.
 
-### 17.2 CLAUDE.md
+### 17.2 AGENTS.md
 
-The repository's `CLAUDE.md` is what every session reads first, and it is
+The repository's `AGENTS.md` is what every session reads first, and it is
 extensive:
 
 - **What Yen Bots is and who it is for** — Yen, how she works (claude.ai
@@ -1329,7 +1329,7 @@ A rule a model might skip is enforced where it can be:
   is older than the guide's current edition. When the guide changes its
   edition, an app changed afterwards must be brought up to it, which means
   reading it again.
-- `CLAUDE.md` and the Zen MCP guide both open with the rule, and the
+- `AGENTS.md` and the Zen MCP guide both open with the rule, and the
   building guide ends with a short checklist the session confirms to Yen
   before it publishes.
 
@@ -1389,7 +1389,7 @@ spent on it. It says what Yen Bots is, the tools the work uses
 `repo_task_start` and its watching — which is also how the API is called), the
 order of work, when a change is made in a preview and published from it
 (`docs/yenbot_preview.md`), and that
-everything else is in the yenbot repository: `CLAUDE.md` first, then
+everything else is in the yenbot repository: `AGENTS.md` first, then
 `docs/index.md`, reading only the docs the task needs. Every Claude session
 Yen opens, on any device, reads it first, as `guide_list` already asks.
 
@@ -1708,7 +1708,7 @@ Taken 2026-11-07:
 1. The gateway and zend: sign-in per domain, the yenbot site, its route and
    disk root, and `docs/mcp_file_tools.md` — service keys, sessions closed on
    archive, the bus, `repo/<name>`, gates, the connector's file and log tools.
-2. The repository, `CLAUDE.md`, and the binary's skeleton: serving, identity,
+2. The repository, `AGENTS.md`, and the binary's skeleton: serving, identity,
    accounts, the landing page, the store and its migrations, backups, the
    watcher and the publisher, its logs and `/v1/logs`, health, keep and
    `INFO serving`.
@@ -1729,7 +1729,7 @@ Taken 2026-11-07:
     the gateway's connect flow.
 12. The admin page, usage, export, import, deleting and archiving.
 13. Templates, the repository's `docs/` derived from this design (with
-    `docs/calling-the-api.md`), `CLAUDE.md`, the connector's `yen-apps` guide,
+    `docs/calling-the-api.md`), `AGENTS.md`, the connector's `yen-apps` guide,
     the `yenbot` journal, the `yenbot` Zen credential, and the connector's
     instructions naming the guide.
 14. `service_deploy`, `service_control` and `service_status` for yenbot, no

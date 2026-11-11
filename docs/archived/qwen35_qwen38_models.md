@@ -269,7 +269,7 @@ projection.
   revisit after profiling.
 - KV compression: C0–C10 candidate tables are head-dim-agnostic (32-element
   blocks), but **thresholds are model-specific** — full `PRODUCTION_*`
-  re-derivation per new model (per CLAUDE.md), plus new `*_KV_FACTORS`
+  re-derivation per new model (per AGENTS.md), plus new `*_KV_FACTORS`
   entries. Pin the GGUF revision in every new gate test — the 2026-08-16
   C10 incident (upstream re-upload silently invalidating a tuning) must not
   be repeatable.

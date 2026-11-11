@@ -46,7 +46,7 @@ cargo test --release --features cuda,verbose --lib --package candle-transformers
 ```
 
 The `quantized_llama` story-rewrite tests run against the VibeStudio/Nidum
-Llama-3.2-3B fine-tune (per `CLAUDE.md`'s `Llama-3.2-3B` / batch_test
+Llama-3.2-3B fine-tune (per `AGENTS.md`'s `Llama-3.2-3B` / batch_test
 integration-testing entry) via `test_helpers::api()` — the repository is named
 in full at the test's call site; the base model is gated, which is why a
 fine-tune stands in for it.

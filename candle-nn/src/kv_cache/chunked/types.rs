@@ -1646,7 +1646,7 @@ impl SequenceState {
         // fail in a kernel with no way back to the omission. Checking it costs
         // an integer compare against two numbers already in hand — no launch,
         // no allocation — so it is
-        // checked rather than trusted (CLAUDE.md invariant 1b: validate the
+        // checked rather than trusted (AGENTS.md invariant 1b: validate the
         // agreement, do not paper over it by rebuilding defensively).
         Self::slot_counts_agree(host_n, self.gpu_chunks.n_chunks())?;
         let wi = self.decode_write_chunk_idx();

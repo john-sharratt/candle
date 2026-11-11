@@ -94,4 +94,4 @@ starting points for exercising a backend directly without going through
 
 - `docs/vram_governor_design.md` — the VRAM accounting/eviction policy built
   on `src/vram.rs` and `src/gpu_memory.rs`
-- `CLAUDE.md` — crate stack overview and build commands
+- `AGENTS.md` — crate stack overview and build commands

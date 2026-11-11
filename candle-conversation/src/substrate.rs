@@ -3625,7 +3625,7 @@ impl Substrate {
     /// recorded size and its share — or `None` when it cannot be a member at
     /// all: it cannot deliver ([`Self::deliverable`]), it is a link of
     /// `target`'s inherited chain (projected as the conversation's own opening
-    /// already — admitted again it emitted twice: `CLAUDE.md`'s 46K characters
+    /// already — admitted again it emitted twice: `AGENTS.md`'s 46K characters
     /// stood in both the working set and the chain), or the scope of its group
     /// no longer offers it to `target`.
     fn working_set_candidate(&self, target: TimelineId, timeline: TimelineId) -> Option<Candidate> {

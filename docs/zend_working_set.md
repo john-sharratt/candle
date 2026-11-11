@@ -32,7 +32,7 @@ working set until the next question, so it is never carried twice.
 ```
 
 What every conversation must always carry is the **priming chain**'s — the
-repository roots, `README`, `ARCHITECTURE`, `CLAUDE.md` — inherited through
+repository roots, `README`, `ARCHITECTURE`, `AGENTS.md` — inherited through
 lineage, not held by the working set. A new dialogue records the **seed alias**
 (`forked_from = "seed"`, `Substrate::SEED_PARENT`) as its parent, never a
 timeline id: each member resolves it to the end of the chain it holds now
@@ -204,7 +204,7 @@ it provenance.
 
 **No link of the dialogue's own chain is ever a member.** The chain is projected
 as the conversation's opening already; admitted on momentum it emitted twice —
-measured: `CLAUDE.md`'s 46K characters in both the working set and the chain
+measured: `AGENTS.md`'s 46K characters in both the working set and the chain
 (`Substrate::working_set_candidate`).
 
 Two budgets because the two groups' scores are normalised separately and cannot
@@ -252,7 +252,7 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
   alias `file_write` releases as `write` does. (`code_run`/`code_session_exec`
   write the conversation's files too.)
 - Seeds leave out what the priming chain already carries — the repository roots,
-  `README`, `CLAUDE.md` — because lineage emits them anyway. Resolution skips any
+  `README`, `AGENTS.md` — because lineage emits them anyway. Resolution skips any
   seed whose timeline is in the dialogue's `inherited_chain`, so an overlap in
   the list costs nothing.
 - Every seed sits within `--max-depth 3`; a deeper file has no conversation.

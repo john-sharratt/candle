@@ -260,7 +260,7 @@ load-bearing epsilon gets lost — that has already happened once in this lineag
 
 ### 0.7 Test-driven, alongside the code
 
-Per CLAUDE.md: tests are built as the code is written, not after. Every building
+Per AGENTS.md: tests are built as the code is written, not after. Every building
 block is testable in isolation — the n-gram hash, the cache eviction, the NVMe
 gather, the QSA block selection, the GR gates, the PLE conv state, the delta
 rule. Codec- and layout-level tests assert **raw expected bytes**, never error
@@ -272,7 +272,7 @@ re-proven here, because this model has *three* carried states rather than one
 ### 0.8 Keep it simple
 
 No speculative generality, no configuration surface for cases that do not exist,
-no dual paths. Per CLAUDE.md: no backward compatibility, no environment-variable
+no dual paths. Per AGENTS.md: no backward compatibility, no environment-variable
 feature flags, no `TODO`s, no stubs. When a new path is correct it replaces the
 old one; when it is not correct, it does not land.
 
@@ -768,7 +768,7 @@ the loader does not treat the vision tensors as unknown.
 
 ## 7. Sizing against our hardware
 
-Per CLAUDE.md, model size is not bounded by VRAM: the expert cache streams
+Per AGENTS.md, model size is not bounded by VRAM: the expert cache streams
 VRAM → pinned RAM → mmap, so the resident footprint is dense weights plus the
 expert working set. Two things make this model unusually favourable on that
 axis and one makes it unusually hostile.
@@ -824,7 +824,7 @@ consequence to hold in view: all three quants on C: leaves it at roughly 164 GB
 free. Single-quant-per-machine is the normal case and costs ~185 GB here.
 
 Reclaimable if headroom is wanted, in order of size: `target/` at 1,441.6 GB
-(`cargo prune`, which keeps the two newest generations — CLAUDE.md notes cargo
+(`cargo prune`, which keeps the two newest generations — AGENTS.md notes cargo
 never collects it); ~530 GB of DeepSeek redundancy in `D:\models`, where the
 4-way split set, the merged GGUF and `MXFP4_KO` are three forms of one model
 alongside a stale 84.7 GB partial experts pack; and a 20.6 GB orphaned blob in

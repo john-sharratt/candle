@@ -324,7 +324,7 @@ GGML MXFP4 (type id **39**): 32 elements/block, 17 bytes:
 `{ uint8 e; uint8 qs[16] }` — `e` is an E8M0 power-of-two scale, nibbles index the
 E2M1 value table `{0, .5, 1, 1.5, 2, 3, 4, 6}` × sign (ggml stores the ×2 integer
 table and folds ×0.5 into the scale). Exact layout to be locked in with raw-byte
-tests against `ggml_quantize`/reference vectors (per CLAUDE.md: byte assertions, no
+tests against `ggml_quantize`/reference vectors (per AGENTS.md: byte assertions, no
 tolerance thresholds). NVFP4 (type id 40) exists in ggml but is not needed for this
 model; note the id so the loader errors informatively.
 

@@ -632,7 +632,7 @@ measured computation at the load instant.
 
 ## 12. Module layout
 
-Per CLAUDE.md ("one concern per file", subfolder). In **candle-core** (owns the
+Per AGENTS.md ("one concern per file", subfolder). In **candle-core** (owns the
 device; reachable by both consumers):
 
 ```
@@ -751,7 +751,7 @@ Open / defaulted (flag if you disagree):
    clear a wide prefill's transient activations + the grow-once scratch pools. (§9.1, §11)
 6. **`ABS_i`/`PCT_i` ladder constants.** The specific `{2.0/4%, 1.5/3%, 1.0/1.5%,
    0.5/0.5%}` values are a starting shape to validate against real runs and
-   re-derive per card class (CLAUDE.md: measure, don't guess). (§8)
+   re-derive per card class (AGENTS.md: measure, don't guess). (§8)
 
 ---
 

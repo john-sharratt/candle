@@ -9580,7 +9580,7 @@ fn unit_of(s: &Substrate, tl: TimelineId) -> Unit {
         .and_then(|m| m.get(COMMIT_KEY))
         .cloned()
         .unwrap_or_default();
-    // An ingested unit is keyed workspace-relative (`candle/CLAUDE.md`); the
+    // An ingested unit is keyed workspace-relative (`candle/AGENTS.md`); the
     // view shows it the way the tools address it — its repository, and the
     // path inside it.
     let (repo, label) = match custom.and_then(committed_unit_key) {

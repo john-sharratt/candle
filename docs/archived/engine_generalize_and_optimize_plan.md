@@ -421,7 +421,7 @@ far it can be pushed before quality breaks.
 1. Enable compression-mode selection for single-latent chunks (per-32-token block format selection
    via the cosine-distance thresholds) — reusing the existing policy, not a new one. The K/V
    asymmetry (`PRODUCTION_K_*` / `PRODUCTION_V_*`) must be re-derived by measurement for
-   DeepSeek-V4-Flash (they are model-specific — see the CLAUDE.md note).
+   DeepSeek-V4-Flash (they are model-specific — see the AGENTS.md note).
 2. Sweep compression levels against the StoryRewrite suite + a longer-context quality probe: for each
    level C0..C9, record whether the tests hold and the memory/throughput won. Find the highest level
    that keeps n=1/4/8 passing.

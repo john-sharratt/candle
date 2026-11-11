@@ -104,7 +104,7 @@ Apps are a fixed list in the `cluster` crate, and that is where the change is:
   motherd deploys must never touch.
 
 Requests reach it only on routes it declares (`Registry::declaring`,
-`cluster/src/gateway/registry/pick.rs:205-217`; MCP invariant 5, `CLAUDE.md`).
+`cluster/src/gateway/registry/pick.rs:205-217`; MCP invariant 5, `AGENTS.md`).
 
 **The reservation.** `MemberState` has no "live" and `Capacity` no field to carry one
 (`cluster/src/frame/types.rs:77-91`, `cluster/src/frame/membership.rs:30-100`). `zenj` says so on

@@ -11,7 +11,7 @@ A sweep is one release run of each model's `test_parallel_batched_forwarding*` g
 passes.** Anything that fails is fixed forward (step 9) — it does not matter whether this
 session introduced the bug or it was already there.
 
-The repository rules in `CLAUDE.md` apply throughout: read logs with Read/Grep (never
+The repository rules in `AGENTS.md` apply throughout: read logs with Read/Grep (never
 `cat`/`Select-String`), never mask an exit status, commit only finished work.
 
 ## 1. Size the sweep from VRAM
@@ -27,7 +27,7 @@ nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader,nouni
 - **Qwen3.8-Flash-Next (`qwen38-fn`) runs on every machine, full sweep or partial** — both
   its gate `quantized_qwen38_moe` and the `qwen38_flash_next` engine probe of step 4b
   (which runs the preset for this card's rung — `Q3_KO` under 64 GiB, `Q4_KO` at 64+).
-  Model size is not bounded by VRAM (`CLAUDE.md`): the expert cache streams VRAM → pinned
+  Model size is not bounded by VRAM (`AGENTS.md`): the expert cache streams VRAM → pinned
   RAM → mmap, and on a 16 GB card it runs from the prepared Q3_KO hybrid artifact
   (`qwen4exp::prepare`, recipe-hashed, cached under
   `~/.cache/zend/models/unsloth--Qwen3.8-Flash-Next-GGUF/`). The gate sizes its ladder from
@@ -255,7 +255,7 @@ again by the same procedure.
 
 - Finish the remaining gates first so the sweep's whole picture is known, then fix.
 - Fix the root cause in the code, with a unit test at the level the bug lives where one
-  can be written (`CLAUDE.md`: TDD, raw expected values, no stubs, no env flags, no
+  can be written (`AGENTS.md`: TDD, raw expected values, no stubs, no env flags, no
   compatibility shims).
 - Re-run the failing gate until it passes; if the fix touched shared code (kernels,
   `candle-nn` KV cache, the batched harness), re-run the whole sweep.
