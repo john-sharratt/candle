@@ -59,7 +59,7 @@ impl Replicator {
             }
             let mine = store.applied();
             let (mut ranges, mut listed, mut gone) = (0usize, 0usize, 0usize);
-            for (origin, from, to) in answer_ranges(&mine, &asked.since) {
+            for (origin, from, to) in answer_ranges(&mine, &asked.since, asked.reply_to) {
                 if !ticket.live() {
                     me.state().answering.end(&ticket);
                     return;

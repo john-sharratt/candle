@@ -35,9 +35,19 @@ pub fn complete_ranges(mine: &OriginApplied, since: u64) -> Vec<(u64, u64)> {
     out
 }
 
-/// The `(origin, from, to)` each `HEADERS` of one answer to `since` lists,
-/// each spanning at most [`HEADERS_PER_FRAME`] `oseq`s, in origin order, and
-/// at most [`FRAMES_PER_ANSWER`] of them.
+/// The `(origin, from, to)` each `HEADERS` of one answer to `requester`'s
+/// `since` lists, each spanning at most [`HEADERS_PER_FRAME`] `oseq`s, in
+/// origin order but for the requester's own, and at most
+/// [`FRAMES_PER_ANSWER`] of them.
+///
+/// **The requester's own origin comes last.** It wrote those records, so all
+/// it can lack of them is what a purge dropped (§7.8); every other origin is
+/// news to it. In origin order, a requester lacking a span of its own it
+/// could not mark gone had every bounded answer filled with that span:
+/// WhiteWorld's npcd (`b2e6…`) was answered 131,072 of its own `oseq`s gone,
+/// every 5 s for hours, and never reached BlackWorld's `db1fde…` — so a
+/// gap catch-up addressed to `db1fde…` fetched nothing, and the characters
+/// resumed there stayed suspended on WhiteWorld (2026-11-11).
 ///
 /// **Only what the requester lacks.** `since` is the requester's whole applied
 /// set, not its `through` alone: a range it already covers above a gap is
@@ -46,9 +56,15 @@ pub fn complete_ranges(mine: &OriginApplied, since: u64) -> Vec<(u64, u64)> {
 /// same first 131,072 `oseq`s of held records every time, and nothing above
 /// them was ever fetched — WhiteWorld held its `through` at a hole in
 /// BlackWorld's own set while 45 million `oseq`s above it went unasked.
-pub fn answer_ranges(mine: &AppliedSet, since: &AppliedSet) -> Vec<(u64, u64, u64)> {
+pub fn answer_ranges(
+    mine: &AppliedSet,
+    since: &AppliedSet,
+    requester: u64,
+) -> Vec<(u64, u64, u64)> {
     let mut out = Vec::new();
-    for (origin, applied) in mine.origins() {
+    let others = mine.origins().filter(|(origin, _)| *origin != requester);
+    let own = mine.origins().filter(|(origin, _)| *origin == requester);
+    for (origin, applied) in others.chain(own) {
         let lacking = |from: u64, to: u64| match since.origin(origin) {
             Some(theirs) => theirs.uncovered(from, to),
             None => vec![(from, to)],
@@ -74,6 +90,9 @@ pub fn answer_ranges(mine: &AppliedSet, since: &AppliedSet) -> Vec<(u64, u64, u6
 mod tests {
     use super::*;
 
+    /// A requester none of these sets holds an origin of.
+    const STRANGER: u64 = 99;
+
     /// A hole in the answerer's own set ends a range: nothing past it is
     /// claimed, and the covered range above it is listed on its own.
     #[test]
@@ -97,10 +116,13 @@ mod tests {
         since.insert_range(4, 1, 5);
         since.insert_range(9, 1, 3);
         assert_eq!(
-            answer_ranges(&mine, &since),
+            answer_ranges(&mine, &since, STRANGER),
             vec![(4, 6, 8197), (4, 8198, 16389), (4, 16390, 20_000)]
         );
-        assert_eq!(answer_ranges(&mine, &AppliedSet::default())[3], (9, 1, 3));
+        assert_eq!(
+            answer_ranges(&mine, &AppliedSet::default(), STRANGER)[3],
+            (9, 1, 3)
+        );
     }
 
     /// An answer stops at its frame bound, mid-origin; asked again from where
@@ -111,14 +133,14 @@ mod tests {
         let mut mine = AppliedSet::default();
         mine.insert_range(4, 1, n * 20);
         mine.insert_range(9, 1, 3);
-        let first = answer_ranges(&mine, &AppliedSet::default());
+        let first = answer_ranges(&mine, &AppliedSet::default(), STRANGER);
         assert_eq!(first.len(), FRAMES_PER_ANSWER);
         assert_eq!(first[0], (4, 1, n));
         assert_eq!(first[15], (4, 15 * n + 1, 16 * n));
 
         let mut since = AppliedSet::default();
         since.insert_range(4, 1, 16 * n);
-        let next = answer_ranges(&mine, &since);
+        let next = answer_ranges(&mine, &since, STRANGER);
         assert_eq!(
             next,
             vec![
@@ -147,6 +169,33 @@ mod tests {
         let mut since = AppliedSet::default();
         since.insert_range(4, 1, 10);
         since.insert_range(4, 12, held_to);
-        assert_eq!(answer_ranges(&mine, &since), vec![(4, lacked.0, lacked.1)]);
+        assert_eq!(
+            answer_ranges(&mine, &since, STRANGER),
+            vec![(4, lacked.0, lacked.1)]
+        );
+    }
+
+    /// **The requester's own origin is listed after every other.** It lacks
+    /// a whole answer's worth of its own (origin 4, sorting first) and three
+    /// records of origin 9's: the answer lists origin 9's first, where in
+    /// origin order the bound was spent on origin 4 and origin 9 was never
+    /// reached, however often it was asked.
+    #[test]
+    fn the_requesters_own_origin_is_listed_last() {
+        let n = HEADERS_PER_FRAME;
+        let mut mine = AppliedSet::default();
+        mine.insert_range(4, 1, n * 20);
+        mine.insert_range(9, 1, 3);
+        let mut since = AppliedSet::default();
+        since.insert_range(4, 1, 1);
+        let answer = answer_ranges(&mine, &since, 4);
+        assert_eq!(answer.len(), FRAMES_PER_ANSWER);
+        assert_eq!(answer[0], (9, 1, 3));
+        assert_eq!(answer[1], (4, 2, n + 1));
+        assert_eq!(
+            answer_ranges(&mine, &since, STRANGER)[0],
+            (4, 2, n + 1),
+            "anyone else's catch-up is answered in origin order"
+        );
     }
 }

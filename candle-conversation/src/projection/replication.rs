@@ -15,7 +15,7 @@ use super::ids::TimelineId;
 use super::resolver::Conversation;
 use crate::persistence::identity::{now_ms, MintGeneration, VersionStamp, GEN_DETACHED};
 use crate::persistence::joined;
-use crate::persistence::listing::ListedRecord;
+use crate::persistence::listing::{gone_runs, ListedRecord};
 use crate::persistence::record::{decode_header, CustomObjectPayload};
 use crate::persistence::replica::AppliedSet;
 use crate::persistence::streams::StreamDecl;
@@ -230,11 +230,13 @@ impl Conversation {
         }
     }
 
-    /// `oseq`s of `origin` a catch-up learned are gone (§7.2).
+    /// `oseq`s of `origin` a catch-up learned are gone (§7.2), marked a run of
+    /// consecutive `oseq`s at a time.
     pub fn record_gone(&self, origin: u64, gone: &[u64]) {
+        let runs = gone_runs(gone);
         self.persistence.call(|p| {
-            for oseq in gone {
-                p.mark_gone(origin, *oseq, *oseq);
+            for (start, end) in runs {
+                p.mark_gone(origin, start, end);
             }
         });
     }

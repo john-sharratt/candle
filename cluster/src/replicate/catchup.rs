@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use applied_set::AppliedSet;
+use applied_set::{AppliedSet, OriginApplied};
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{Fetch, Headers};
@@ -344,11 +344,16 @@ impl Requester {
     /// count of them alone asked again for ever: WhiteWorld's admission on
     /// d7f850f79 (2026-10-20) ran 660,000 catch-ups at ~400 a second and never
     /// served. The same answer to the same question is the whole answer.
+    ///
+    /// What this member wrote of its own since it asked is not moving on
+    /// ([`moved_on`]): it changes the set every moment the member writes, so a
+    /// member whose answers it could not take asked again for ever — WhiteWorld's
+    /// npcd, every 5 s for hours, never serving (2026-11-11).
     pub fn asks_again(&self, now: &AppliedSet) -> bool {
         self.purpose == Purpose::Admission
             && self.finished()
             && (self.progress.wanted > self.progress.left || self.gone_learned > 0)
-            && *now != self.since
+            && moved_on(now, &self.since, self.node)
     }
 
     pub fn progress(&self) -> &Progress {
@@ -364,6 +369,26 @@ impl Requester {
     pub fn outstanding(&self) -> u64 {
         self.outstanding
     }
+}
+
+/// Whether member `node` holding `now` has moved on from holding `since`: it
+/// holds more of some other origin, or of its own below where its own stood
+/// when it asked — a gap a purge left, filled. What it wrote of its own above
+/// that is its own work, not anything an answer brought.
+pub fn moved_on(now: &AppliedSet, since: &AppliedSet, node: u64) -> bool {
+    let own_top = since.origin(node).map_or(0, OriginApplied::top);
+    now.origins().any(|(origin, held)| {
+        let before = since.origin(origin);
+        if origin != node {
+            return before != Some(held);
+        }
+        let empty = OriginApplied::default();
+        let before = before.unwrap_or(&empty);
+        held.ranges()
+            .into_iter()
+            .filter(|(start, _)| *start <= own_top)
+            .any(|(start, end)| !before.contains_range(start, end.min(own_top)))
+    })
 }
 
 #[cfg(test)]
@@ -612,6 +637,36 @@ mod tests {
         let mut further = since;
         further.insert(9, 3);
         assert!(r.asks_again(&further), "what it holds moved: ask again");
+    }
+
+    /// **What the member wrote of its own meanwhile is not moving on.** It
+    /// asked holding its own (7) through 10 but for a purge gap at 6..=7, and
+    /// was answered that gap gone, which it could not take. Its own writes
+    /// above 10 since then leave it where it was; the gap filled, or another
+    /// origin grown, is moving on.
+    #[test]
+    fn its_own_new_writes_are_not_moving_on() {
+        let mut since = moved();
+        since.insert_range(7, 1, 5);
+        since.insert_range(7, 8, 10);
+        let mut r = Requester::new(1, 0, Purpose::Admission, 7, since.clone());
+        let mut h = listing(3, 7, 6, 7, &[]);
+        h.gone = vec![6, 7];
+        r.headers(h, |_, _| false);
+        r.headers_done(counter());
+        assert!(r.finished());
+
+        let mut wrote = since.clone();
+        wrote.insert_range(7, 11, 40);
+        assert!(!r.asks_again(&wrote), "only its own new writes");
+
+        let mut filled = wrote.clone();
+        filled.insert_range(7, 6, 7);
+        assert!(r.asks_again(&filled), "the purge gap filled");
+
+        let mut other = wrote;
+        other.insert(9, 2);
+        assert!(r.asks_again(&other), "another origin grew");
     }
 
     /// Nothing moved on — every record held already, or left undeliverable —

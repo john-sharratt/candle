@@ -2090,10 +2090,26 @@ impl SubstratePersistence {
     /// Record `start..=end` of `origin` as gone — `oseq`s a catch-up learned
     /// no member holds any more (§7.2), this node's own among them when a
     /// purge dropped them (§7.8). The next commit persists it.
+    ///
+    /// Of this node's own, only what lies at or below its written top is taken:
+    /// above it is what it has not written yet, and covering that would leave a
+    /// record it writes there untapped. A peer saying such an `oseq` is gone
+    /// holds this origin past what this node wrote — said, because a catch-up
+    /// then lists the same span every time it asks.
     pub fn mark_gone(&mut self, origin: u64, start: u64, end: u64) {
         let added = if origin == self.node() {
-            self.own_written
-                .insert_range(start, end.min(self.own_written.top()))
+            let top = self.own_written.top();
+            if end > top {
+                tracing::warn!(
+                    node = format!("{origin:016x}"),
+                    from = start.max(top + 1),
+                    to = end,
+                    written_top = top,
+                    next_oseq = self.minter.origination().next_oseq(),
+                    "a peer lists own oseqs gone above what this node has written: not taken"
+                );
+            }
+            self.own_written.insert_range(start, end.min(top))
         } else {
             self.replica.applied.insert_range(origin, start, end)
         };

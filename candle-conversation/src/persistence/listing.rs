@@ -75,11 +75,36 @@ impl SubstratePersistence {
     }
 }
 
+/// `gone` `oseq`s, ascending, as the runs of consecutive ones they make:
+/// what a requester marks gone a run at a time.
+pub fn gone_runs(gone: &[u64]) -> Vec<(u64, u64)> {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &oseq in gone {
+        match runs.last_mut() {
+            Some((_, end)) if oseq == *end + 1 => *end = oseq,
+            _ => runs.push((oseq, oseq)),
+        }
+    }
+    runs
+}
+
 #[cfg(test)]
 mod tests {
+    use super::gone_runs;
     use crate::persistence::record::{decode_header, RecordType};
     use crate::persistence::SubstratePersistence;
     use crate::substrate::Substrate;
+
+    /// Consecutive `oseq`s are one run; a step past one starts the next.
+    #[test]
+    fn gone_oseqs_are_marked_a_run_at_a_time() {
+        assert_eq!(gone_runs(&[]), vec![]);
+        assert_eq!(gone_runs(&[4]), vec![(4, 4)]);
+        assert_eq!(
+            gone_runs(&[3, 4, 5, 9, 11, 12]),
+            vec![(3, 5), (9, 9), (11, 12)]
+        );
+    }
 
     /// Every record held is listed by its header; an `oseq` no record holds is
     /// gone.
