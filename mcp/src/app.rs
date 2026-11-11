@@ -326,20 +326,31 @@ impl App {
     }
 
     /// When the record says the conversation `text` names was last used.
-    async fn ask_used(this: &Arc<Self>, call: &Call<Self>, text: &str) -> Result<Option<u64>, String> {
+    async fn ask_used(
+        this: &Arc<Self>,
+        call: &Call<Self>,
+        text: &str,
+    ) -> Result<Option<u64>, String> {
         let backend = this
             .route(context::GET)
             .ok_or("no backend lists the user's context yet")?;
         let on = Self::on_behalf(call, Some(text));
         let answer = this
-            .call_served(backend, &call.caller, &on, context::REF_SEEN, &json!({}), &|_| {})
+            .call_served(
+                backend,
+                &call.caller,
+                &on,
+                context::REF_SEEN,
+                &json!({}),
+                &|_| {},
+            )
             .await;
         let said = context::text_of(&answer).unwrap_or("");
         if context::is_error(&answer) {
             return Err(first_line(said));
         }
-        let read: Value =
-            serde_json::from_str(said).map_err(|_| format!("the record answered `{}`", first_line(said)))?;
+        let read: Value = serde_json::from_str(said)
+            .map_err(|_| format!("the record answered `{}`", first_line(said)))?;
         Ok(read.get("used_ms").and_then(Value::as_u64))
     }
 

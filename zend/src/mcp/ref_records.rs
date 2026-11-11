@@ -73,7 +73,11 @@ mod tests {
         assert_eq!(used(&r, "c1"), Some(1_000), "and not written");
         touch(&r, "c1", 1_000 + REF_TOUCH_EVERY_MS).unwrap();
         assert_eq!(used(&r, "c1"), Some(1_000 + REF_TOUCH_EVERY_MS));
-        assert_eq!(touch(&r, "c1", 5).unwrap(), 1_000 + REF_TOUCH_EVERY_MS, "an older use moves nothing");
+        assert_eq!(
+            touch(&r, "c1", 5).unwrap(),
+            1_000 + REF_TOUCH_EVERY_MS,
+            "an older use moves nothing"
+        );
         assert_eq!(used(&r, "c1"), Some(1_000 + REF_TOUCH_EVERY_MS));
     }
 

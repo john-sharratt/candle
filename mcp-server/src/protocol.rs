@@ -144,9 +144,7 @@ pub fn on_behalf(params: &Value) -> Option<&str> {
 /// The conversation ref a request from a server in front names, as written:
 /// the server it reaches opens it ([`crate::refs::Refs::open`]).
 pub fn conversation_ref(params: &Value) -> Option<&str> {
-    meta(params, REF_META)?
-        .as_str()
-        .filter(|s| !s.is_empty())
+    meta(params, REF_META)?.as_str().filter(|s| !s.is_empty())
 }
 
 /// The progress token a request asks its progress be reported under.
@@ -272,7 +270,10 @@ mod tests {
         assert_eq!(modern_client(&p), Some("claude-code"));
         assert_eq!(on_behalf(&p), Some("s1"));
         assert_eq!(conversation_ref(&p), Some("r1"));
-        assert_eq!(conversation_ref(&json!({"_meta": {"com.tokera/ref": ""}})), None);
+        assert_eq!(
+            conversation_ref(&json!({"_meta": {"com.tokera/ref": ""}})),
+            None
+        );
         assert_eq!(conversation_ref(&json!({})), None);
         assert_eq!(progress_token(&p), Some(json!(7)));
         assert_eq!(

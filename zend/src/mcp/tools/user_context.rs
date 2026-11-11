@@ -64,8 +64,11 @@ pub fn nothing_kept(why: &str) -> String {
 
 pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     let records = ctx.session.shared_substrate();
-    let used =
-        |r: &Ref| records.as_ref().and_then(|s| ref_records::used(s as &dyn Records, &r.conversation()));
+    let used = |r: &Ref| {
+        records
+            .as_ref()
+            .and_then(|s| ref_records::used(s as &dyn Records, &r.conversation()))
+    };
     let begun = match begin(
         ctx.session.mcp().refs(),
         &ctx.caller.key(),

@@ -101,9 +101,15 @@ mod tests {
         let s = Seen::default();
         let r = r();
         assert!(s.vouches(&r, NOW + REF_IDLE_MS - 1));
-        assert!(!s.vouches(&r, NOW + REF_IDLE_MS), "only the record can say now");
+        assert!(
+            !s.vouches(&r, NOW + REF_IDLE_MS),
+            "only the record can say now"
+        );
         s.heard(&r, NOW + REF_IDLE_MS - 5);
-        assert!(s.vouches(&r, NOW + REF_IDLE_MS), "the record said it was used");
+        assert!(
+            s.vouches(&r, NOW + REF_IDLE_MS),
+            "the record said it was used"
+        );
         let later = NOW + 3 * REF_IDLE_MS;
         assert!(!s.vouches(&r, later));
         s.used(&r, later);
@@ -116,7 +122,10 @@ mod tests {
     fn a_use_is_told_at_most_every_ten_minutes() {
         let s = Seen::default();
         let r = r();
-        assert!(!s.used(&r, NOW + 1), "just issued: its issue vouches for it");
+        assert!(
+            !s.used(&r, NOW + 1),
+            "just issued: its issue vouches for it"
+        );
         assert!(!s.used(&r, NOW + REF_TOUCH_EVERY_MS - 1));
         assert!(s.used(&r, NOW + REF_TOUCH_EVERY_MS));
         assert!(!s.used(&r, NOW + REF_TOUCH_EVERY_MS + 1));

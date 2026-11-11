@@ -214,7 +214,10 @@ pub fn open(
         .expect("create makes a journal");
     held(&memory.conversations.sessions).keep(conversation, Kept::Open(path.clone()), now);
     if let Some(r) = records {
-        if let Err(e) = r.put(&record_key(group, conversation), Value::String(path.folder())) {
+        if let Err(e) = r.put(
+            &record_key(group, conversation),
+            Value::String(path.folder()),
+        ) {
             tracing::warn!(%path, "journals: this conversation's journal was not recorded for the other members: {e}");
         }
     }

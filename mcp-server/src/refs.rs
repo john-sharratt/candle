@@ -215,7 +215,12 @@ mod tests {
         m.update(&bytes[..21]);
         let mac: [u8; 32] = m.finalize().into_bytes().into();
         assert_eq!(&bytes[21..], &mac[..16]);
-        assert_eq!(URL_SAFE_NO_PAD.decode(refs().seal("o1", &fixed(false))).unwrap()[16], 0);
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(refs().seal("o1", &fixed(false)))
+                .unwrap()[16],
+            0
+        );
     }
 
     #[test]
@@ -228,7 +233,11 @@ mod tests {
         assert_eq!(issued.issued_s, 1_794_000_000);
         assert_eq!(issued.issued_ms(), 1_794_000_000_000);
         assert_eq!(refs().open("o1", &text), Ok(issued));
-        assert_ne!(refs().issue("o1", true, 0).1.id, issued.id, "each id is new");
+        assert_ne!(
+            refs().issue("o1", true, 0).1.id,
+            issued.id,
+            "each id is new"
+        );
     }
 
     /// **Another account's ref, another key's, and one changed by a bit are
@@ -261,7 +270,10 @@ mod tests {
         assert!(!r.live(None, issued + REF_IDLE_MS), "idle from its issue");
         let used = issued + 3 * REF_IDLE_MS;
         assert!(r.live(Some(used), used + REF_IDLE_MS - 1));
-        assert!(!r.live(Some(used), used + REF_IDLE_MS), "idle from its last use");
+        assert!(
+            !r.live(Some(used), used + REF_IDLE_MS),
+            "idle from its last use"
+        );
         assert!(
             r.live(Some(issued - 10), issued + 1),
             "a use older than the issue counts from the issue"
@@ -277,6 +289,10 @@ mod tests {
         let digest = Sha256::digest([0x11u8; 16]);
         let want: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(key, want);
-        assert_eq!(fixed(true).conversation(), key, "the flag is not the conversation");
+        assert_eq!(
+            fixed(true).conversation(),
+            key,
+            "the flag is not the conversation"
+        );
     }
 }

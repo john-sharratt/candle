@@ -37,7 +37,10 @@ async fn a_call_answers_while_its_record_waits_for_a_listing() {
         .expect("the call answered while the listing was held");
         assert_eq!(answered["isError"], false, "{answered}");
     }
-    until("a listing began", || backend.lists.load(Ordering::SeqCst) == 1).await;
+    until("a listing began", || {
+        backend.lists.load(Ordering::SeqCst) == 1
+    })
+    .await;
     assert!(backend.sent(context::EPISODE).is_empty());
 
     backend.release();

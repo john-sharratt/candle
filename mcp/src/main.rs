@@ -109,8 +109,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
     // zend issues conversation refs under a key every member derives from
     // the group key; both aggregators open them under the same.
-    let group = GroupKey::load(&config.cluster.group_key)
-        .map_err(|e| anyhow::anyhow!("group key: {e}"))?;
+    let group =
+        GroupKey::load(&config.cluster.group_key).map_err(|e| anyhow::anyhow!("group key: {e}"))?;
     let app = Arc::new(App {
         identity: config.identity(),
         store: Arc::new(SealedStore),

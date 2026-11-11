@@ -127,10 +127,7 @@ fn session() -> (Vec<TempDir>, Ctx) {
     let records = session.shared_substrate().unwrap();
     let store: Arc<dyn Store> =
         Arc::new(RecordStore::new(records, Arc::clone(session.mcp().used())));
-    let (_, conversation) = session
-        .mcp()
-        .refs()
-        .issue(&caller.key(), false, now_ms());
+    let (_, conversation) = session.mcp().refs().issue(&caller.key(), false, now_ms());
     let ctx = Ctx {
         mcp: Session::new(&caller.key(), Client::ClaudeCode, MODERN, now_ms()),
         mcp_id: "latency".into(),

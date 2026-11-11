@@ -44,7 +44,12 @@ pub async fn tending(session: Weak<ZendSession>) {
         match tended {
             Ok(Some((0, 0, 0))) | Ok(None) => {}
             Ok(Some((touched, ceased, refs))) => {
-                tracing::info!(touched, ceased, refs, "mcp: tended the sessions and the refs")
+                tracing::info!(
+                    touched,
+                    ceased,
+                    refs,
+                    "mcp: tended the sessions and the refs"
+                )
             }
             Err(e) => tracing::warn!("mcp: tending the sessions failed: {e}"),
         }

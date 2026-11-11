@@ -114,7 +114,9 @@ impl Fake {
                     Some(given) => given.to_string(),
                     None => self.refs.issue(owner, false, now_ms()).0,
                 };
-                text(format!("This conversation's ref is `{r}`. Remembered: tea."))
+                text(format!(
+                    "This conversation's ref is `{r}`. Remembered: tea."
+                ))
             }
             context::REF_SEEN => {
                 let Some(r) = named.and_then(|n| self.refs.open(owner, n).ok()) else {
@@ -246,7 +248,9 @@ pub fn call(session: &str) -> Call<App> {
 /// The ref a `get_user_context` answer opens with.
 pub fn ref_of(answer: &Value) -> String {
     let text = context::text_of(answer).unwrap();
-    let at = text.find("This conversation's ref is `").expect("the answer names its ref");
+    let at = text
+        .find("This conversation's ref is `")
+        .expect("the answer names its ref");
     let rest = &text[at + "This conversation's ref is `".len()..];
     rest.split('`').next().unwrap().to_string()
 }

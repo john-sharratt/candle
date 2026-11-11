@@ -53,9 +53,7 @@ pub fn require_ref(tools: &mut [Value]) {
         let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else {
             continue;
         };
-        let properties = schema
-            .entry("properties")
-            .or_insert_with(|| json!({}));
+        let properties = schema.entry("properties").or_insert_with(|| json!({}));
         if let Some(p) = properties.as_object_mut() {
             p.insert(REF.into(), ref_field());
         }
@@ -98,7 +96,10 @@ mod tests {
         require_ref(&mut tools);
         require_ref(&mut tools);
         assert_eq!(tools[0]["inputSchema"].get("required"), None);
-        assert_eq!(tools[1]["inputSchema"]["required"], json!(["journal", "ref"]));
+        assert_eq!(
+            tools[1]["inputSchema"]["required"],
+            json!(["journal", "ref"])
+        );
         assert_eq!(tools[1]["inputSchema"]["properties"]["ref"], ref_field());
         assert_eq!(tools[1]["inputSchema"]["additionalProperties"], false);
         assert_eq!(tools[2]["inputSchema"]["required"], json!(["ref"]));

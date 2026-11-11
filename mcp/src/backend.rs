@@ -512,7 +512,15 @@ mod tests {
             ..on
         };
         let req = link
-            .request(&backend, &backend.path, &caller(), &none, "tools/list", json!({}), false)
+            .request(
+                &backend,
+                &backend.path,
+                &caller(),
+                &none,
+                "tools/list",
+                json!({}),
+                false,
+            )
             .build()
             .unwrap();
         let body: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();

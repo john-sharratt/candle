@@ -114,7 +114,10 @@ mod tests {
         let again = begin(&refs(), "o", Some(&normal.text), true, never, NOW + 1).unwrap();
         assert_eq!(again.how, How::Same);
         assert_eq!(again.text, normal.text);
-        assert!(!again.r.private, "private_mode cannot change a conversation");
+        assert!(
+            !again.r.private,
+            "private_mode cannot change a conversation"
+        );
         let private = begin(&refs(), "o", None, true, never, NOW).unwrap();
         let again = begin(&refs(), "o", Some(&private.text), false, never, NOW + 1).unwrap();
         assert_eq!(again.text, private.text);
@@ -130,7 +133,10 @@ mod tests {
         let renewed = begin(&refs(), "o", Some(&private.text), false, never, later).unwrap();
         assert_eq!(renewed.how, How::Renewed);
         assert_ne!(renewed.text, private.text);
-        assert!(renewed.r.private, "an expired private ref never falls back to normal");
+        assert!(
+            renewed.r.private,
+            "an expired private ref never falls back to normal"
+        );
         let normal = begin(&refs(), "o", None, false, never, NOW).unwrap();
         let asked = begin(&refs(), "o", Some(&normal.text), true, never, later).unwrap();
         assert!(asked.r.private, "a renewal may begin private mode");
@@ -143,8 +149,14 @@ mod tests {
     #[test]
     fn a_ref_not_ours_is_refused() {
         let b = begin(&refs(), "o", None, false, never, NOW).unwrap();
-        assert_eq!(begin(&refs(), "other", Some(&b.text), false, never, NOW), Err(NOT_OURS.into()));
-        assert_eq!(begin(&refs(), "o", Some("nonsense"), false, never, NOW), Err(NOT_OURS.into()));
+        assert_eq!(
+            begin(&refs(), "other", Some(&b.text), false, never, NOW),
+            Err(NOT_OURS.into())
+        );
+        assert_eq!(
+            begin(&refs(), "o", Some("nonsense"), false, never, NOW),
+            Err(NOT_OURS.into())
+        );
     }
 
     #[test]

@@ -33,19 +33,28 @@ async fn a_call_without_a_live_ref_of_its_callers_is_refused() {
     let backend = Fake::open();
     let state = TempDir::new().unwrap();
     let app = fake::app(&fake::gateway(&backend).await, &state);
-    refused(&App::call(&app, &call("s1"), "make", &json!({})).await, NO_REF);
+    refused(
+        &App::call(&app, &call("s1"), "make", &json!({})).await,
+        NO_REF,
+    );
     refused(
         &App::call(&app, &call("s1"), "make", &json!({"ref": "nonsense"})).await,
         FORGED,
     );
     let r = begun(&app).await;
     let other = call_as(caller("someone-else"), Client::ClaudeCode, "s1");
-    refused(&App::call(&app, &other, "make", &json!({"ref": r})).await, FORGED);
+    refused(
+        &App::call(&app, &other, "make", &json!({"ref": r})).await,
+        FORGED,
+    );
     refused(
         &App::call(&app, &call("s1"), "guide_list", &json!({})).await,
         NO_REF,
     );
-    assert!(backend.sent("make").is_empty(), "nothing refused reached the backend");
+    assert!(
+        backend.sent("make").is_empty(),
+        "nothing refused reached the backend"
+    );
 }
 
 /// **A call with its ref is run in its conversation**: the backend is told
@@ -129,11 +138,18 @@ async fn a_ref_used_on_one_aggregator_is_live_on_the_other() {
     let r = begun(&a).await;
     let issued = a.refs.open(&boss().key(), &r).unwrap().issued_ms();
     let used = issued + REF_TOUCH_EVERY_MS;
-    App::conversation(&a, &call("s1"), Some(&r), used).await.unwrap();
-    until("the use was told", || !backend.used.lock().unwrap().is_empty()).await;
+    App::conversation(&a, &call("s1"), Some(&r), used)
+        .await
+        .unwrap();
+    until("the use was told", || {
+        !backend.used.lock().unwrap().is_empty()
+    })
+    .await;
     let later = used + REF_IDLE_MS - 1;
     assert!(
-        App::conversation(&b, &call("s2"), Some(&r), later).await.is_ok(),
+        App::conversation(&b, &call("s2"), Some(&r), later)
+            .await
+            .is_ok(),
         "live by the record, past its issue's four hours"
     );
     let sc = TempDir::new().unwrap();
@@ -144,7 +160,9 @@ async fn a_ref_used_on_one_aggregator_is_live_on_the_other() {
     })
     .await;
     assert_eq!(
-        App::conversation(&c, &call("s3"), Some(&r), gone).await.unwrap_err(),
+        App::conversation(&c, &call("s3"), Some(&r), gone)
+            .await
+            .unwrap_err(),
         EXPIRED,
         "idle four hours since the last use either told"
     );
@@ -165,7 +183,10 @@ async fn a_grok_conversation_spans_a_session_per_call() {
     }
     let sent = backend.sent("make");
     assert_eq!(sent[0].conversation_ref.as_deref(), Some(r.as_str()));
-    refused(&App::call(&app, &grok("g4"), "make", &json!({})).await, NO_REF);
+    refused(
+        &App::call(&app, &grok("g4"), "make", &json!({})).await,
+        NO_REF,
+    );
 }
 
 /// **A client may not call the aggregator's own backend tools.**
@@ -176,7 +197,13 @@ async fn a_client_cannot_call_the_aggregators_own_backend_tools() {
     let app = fake::app(&fake::gateway(&backend).await, &state);
     let r = begun(&app).await;
     for tool in [context::EPISODE, context::REF_SEEN] {
-        let answer = App::call(&app, &call("s1"), tool, &json!({"ref": r, "used_ms": now_ms()})).await;
+        let answer = App::call(
+            &app,
+            &call("s1"),
+            tool,
+            &json!({"ref": r, "used_ms": now_ms()}),
+        )
+        .await;
         assert_eq!(answer["isError"], true, "{tool}");
     }
     assert!(backend.sent(context::REF_SEEN).is_empty());
