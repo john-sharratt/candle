@@ -831,8 +831,9 @@ struct InferenceState {
     /// so they have no reasoning to protect and stay on their existing
     /// from-scratch construction (`raw_read::ingest_raw`).
     ingest_bases: HashMap<String, Sequence>,
-    /// The priming chain's final link (`BranchIngest::prime`, built once per
-    /// boot before `ready`): this member's seed, which every dialogue's
+    /// The priming chain's final link (`BranchIngest::prime`, built at boot
+    /// before `ready` and again whenever a link changes): this member's seed,
+    /// which every dialogue's
     /// `forked_from` alias resolves to (`Substrate::SEED_PARENT`), and the
     /// parent every ingest unit's conversation records before its reading
     /// starts. `None` when there is no chain — no git repository, or no
@@ -3569,6 +3570,22 @@ impl InferenceState {
         let mut any = false;
         if !self.branch_layers.is_empty() {
             let passes = self.layer_passes()?;
+            // **A changed chain link is read into the chain before the pass.**
+            // The pass reads it as an ordinary unit and retires the old one,
+            // and the link after it — still pointing at the retired one — cut
+            // every dialogue's seed there until the next boot: a diary's first
+            // write named `diaries/` in the memory's root listing, and the seed
+            // lost its first eight links (2026-11-11).
+            if self
+                .branch_ingest
+                .chain_moved(&self.refresh_ctx(), &self.workspace, &passes)
+            {
+                tracing::info!(
+                    target: "zend::priming_chain",
+                    "a chain link changed: priming the chain again before the pass",
+                );
+                self.prime(&progress)?;
+            }
             let ctx = self.refresh_ctx();
             any |= self
                 .branch_ingest

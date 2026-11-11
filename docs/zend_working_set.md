@@ -36,7 +36,8 @@ repository roots, `README`, `ARCHITECTURE`, `CLAUDE.md` — inherited through
 lineage, not held by the working set. A new dialogue records the **seed alias**
 (`forked_from = "seed"`, `Substrate::SEED_PARENT`) as its parent, never a
 timeline id: each member resolves it to the end of the chain it holds now
-(`Substrate::set_seed`, named by every boot's prime). The chain's links are
+(`Substrate::set_seed`, named by every prime: at boot, and whenever a link
+changes). The chain's links are
 ingest units every member holds, so the seed is there whichever member serves
 the conversation, and a chain rebuilt on a later boot is the one every existing
 conversation opens on — nothing on the conversation is rewritten. Prime also

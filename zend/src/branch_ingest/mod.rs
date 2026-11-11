@@ -91,6 +91,10 @@ pub struct BranchIngest {
     trees: Mutex<TreeCache>,
     /// File keys found to be binary: never read again.
     binary: Mutex<HashSet<String>>,
+    /// The key of every link of the chain [`Self::prime`] last built, in
+    /// chain order: what [`Self::chain_moved`] holds the repositories against,
+    /// so a link that changes is read into the chain again before the pass.
+    primed: Mutex<Vec<String>>,
 }
 
 impl BranchIngest {

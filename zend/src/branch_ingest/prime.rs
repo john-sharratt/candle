@@ -85,6 +85,45 @@ impl Link<'_> {
             Link::File(f) => &f.file.path,
         }
     }
+
+    /// The content key the link is read under: a new one is a link the chain
+    /// has not read.
+    fn key(&self) -> &str {
+        match self {
+            Link::Folder(u) => &u.unit.key,
+            Link::File(f) => &f.key,
+        }
+    }
+}
+
+/// The chain as the repositories hold it now: the units and files its links
+/// are drawn from, each repository's default branch, and what a link's commit
+/// may retire — judged at full depth, as the pass judges it.
+struct ChainPlan {
+    units: Vec<UnitItem>,
+    files: Vec<FileItem>,
+    defaults: Vec<(String, String)>,
+    unit_keys: HashSet<String>,
+    file_keys: HashSet<String>,
+}
+
+impl ChainPlan {
+    fn links(&self) -> Vec<Link<'_>> {
+        links(&self.units, &self.files, &self.defaults)
+    }
+
+    /// Every link's key, in chain order.
+    fn keys(&self) -> Vec<String> {
+        self.links().iter().map(|l| l.key().to_string()).collect()
+    }
+}
+
+/// Whether the chain the repositories hold, `now`, differs from the one last
+/// primed, `primed` — a link added, removed, reordered or read under a new key.
+/// Any of these leaves a link pointing at a parent the pass retires, and the
+/// chain cut there until it is primed again.
+fn moved(primed: &[String], now: &[String]) -> bool {
+    primed != now
 }
 
 /// The chain's links, in order: for each of `repos` — `(name, default
@@ -151,21 +190,14 @@ pub(crate) fn repoint(
 }
 
 impl BranchIngest {
-    /// Build the priming chain over `layers` and return its final link —
-    /// `None` when there is nothing to chain (no git repository, or neither
-    /// layer ingested). Run once per boot, before any pass: the pass then
-    /// finds every link committed.
-    pub fn prime(
+    /// The chain as the repositories hold it now ([`ChainPlan`]).
+    fn plan(
         &self,
         ctx: &RefreshContext<'_>,
         workspace: &Workspace,
         layers: &[LayerPass<'_>],
-        progress: &LoadProgress,
-    ) -> anyhow::Result<Option<TimelineId>> {
-        let _watch = Watch::start(ctx.engine.conversation());
-        priming_watch::link("the chain's plan");
+    ) -> ChainPlan {
         let (repos, _unreadable) = record_branches(workspace);
-        priming_watch::stage("walking the repositories");
         let folders = layers.iter().find(|l| l.mode == IngestMode::Folders);
         let files = layers.iter().find(|l| l.mode == IngestMode::Files);
         let (folder_corpus, file_corpus) = {
@@ -177,22 +209,7 @@ impl BranchIngest {
             };
             (corpus_of(folders), corpus_of(files))
         };
-        priming_watch::stage("finding binary files");
         let binary = self.known_binary(ctx);
-        let file_items: Vec<FileItem> = file_corpus
-            .ingest
-            .files
-            .into_iter()
-            .filter(|f| !binary.contains(&f.key))
-            .collect();
-        let units = folder_corpus.ingest.units;
-        let defaults: Vec<(String, String)> = repos
-            .iter()
-            .filter_map(|r| Some((r.name.clone(), r.tips.first()?.name.as_str().to_string())))
-            .collect();
-        let chain = links(&units, &file_items, &defaults);
-        // What a link's commit may retire is judged at full depth, as the
-        // pass judges it.
         let unit_keys: HashSet<String> = folder_corpus
             .retain
             .units
@@ -206,6 +223,62 @@ impl BranchIngest {
             .filter(|f| !binary.contains(&f.key))
             .map(|f| f.key.clone())
             .collect();
+        ChainPlan {
+            units: folder_corpus.ingest.units,
+            files: file_corpus
+                .ingest
+                .files
+                .into_iter()
+                .filter(|f| !binary.contains(&f.key))
+                .collect(),
+            defaults: repos
+                .iter()
+                .filter_map(|r| Some((r.name.clone(), r.tips.first()?.name.as_str().to_string())))
+                .collect(),
+            unit_keys,
+            file_keys,
+        }
+    }
+
+    /// Whether the chain the repositories hold now differs from the one
+    /// [`Self::prime`] last built: a link read under a new key — an anchor
+    /// edited, a root listing that gained or lost an entry — or one added or
+    /// removed. The pass reads a changed link as an ordinary unit and retires
+    /// the old one, and the link after it, still pointing there, cuts every
+    /// dialogue's seed at that point; so the chain is primed again first.
+    /// `true` before the first prime.
+    pub fn chain_moved(
+        &self,
+        ctx: &RefreshContext<'_>,
+        workspace: &Workspace,
+        layers: &[LayerPass<'_>],
+    ) -> bool {
+        let now = self.plan(ctx, workspace, layers).keys();
+        let primed = self.primed.lock().unwrap_or_else(|e| e.into_inner());
+        moved(&primed, &now)
+    }
+
+    /// Build the priming chain over `layers` and return its final link —
+    /// `None` when there is nothing to chain (no git repository, or neither
+    /// layer ingested). Run at boot, before any pass, and again before any
+    /// pass that finds the chain moved ([`Self::chain_moved`]): a link already
+    /// committed is re-pointed at the link before it, a changed one is read,
+    /// and the pass then finds every link committed.
+    pub fn prime(
+        &self,
+        ctx: &RefreshContext<'_>,
+        workspace: &Workspace,
+        layers: &[LayerPass<'_>],
+        progress: &LoadProgress,
+    ) -> anyhow::Result<Option<TimelineId>> {
+        let _watch = Watch::start(ctx.engine.conversation());
+        priming_watch::link("the chain's plan");
+        priming_watch::stage("walking the repositories");
+        let plan = self.plan(ctx, workspace, layers);
+        let folders = layers.iter().find(|l| l.mode == IngestMode::Folders);
+        let files = layers.iter().find(|l| l.mode == IngestMode::Files);
+        let chain = plan.links();
+        let (unit_keys, file_keys) = (&plan.unit_keys, &plan.file_keys);
 
         let total = chain.len() as u64;
         progress.set_step_progress(0, total);
@@ -233,7 +306,7 @@ impl BranchIngest {
                         at: u.at.clone(),
                         branches: u.branches.clone(),
                     },
-                    &unit_keys,
+                    unit_keys,
                     end,
                 )?,
                 (Link::File(f), _, Some(layer)) => code_read::ingest_link(
@@ -246,7 +319,7 @@ impl BranchIngest {
                         at: Some(f.at.clone()),
                         branches: f.branches.clone(),
                     },
-                    &file_keys,
+                    file_keys,
                     &self.binary,
                     end,
                 )?,
@@ -273,12 +346,19 @@ impl BranchIngest {
                 "priming chain built",
             );
         }
+        // A prime cut short is not the chain the repositories hold: leaving
+        // the keys as they were makes the next pass prime again.
+        if !crate::ingest_cancel::cancelled() {
+            *self.primed.lock().unwrap_or_else(|e| e.into_inner()) = plan.keys();
+        }
         Ok(end)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use zend_vfs::Oid;
 
     use super::*;
@@ -362,6 +442,44 @@ mod tests {
             ],
             "b/ is listed on main, not b's default branch trunk, so it is not a link"
         );
+    }
+
+    /// The keys of `units` and `files` chained over `repos`, in chain order.
+    fn keys(units: &[UnitItem], files: &[FileItem], repos: &[(String, String)]) -> Vec<String> {
+        links(units, files, repos)
+            .iter()
+            .map(|l| l.key().to_string())
+            .collect()
+    }
+
+    /// **The chain moves when a link is read under a new key, or is added or
+    /// removed** — and not when nothing in it changed. A root listing that
+    /// gained an entry is a new key for the same folder: the case that cut
+    /// the seed when a diary's first write named `diaries/`.
+    #[test]
+    fn a_link_under_a_new_key_moves_the_chain() {
+        let repos = [("a".to_string(), "main".to_string())];
+        let root = unit("a/", &["main"]);
+        let readme = file("a/README.md", &["main"]);
+        let primed = keys(slice::from_ref(&root), slice::from_ref(&readme), &repos);
+        assert!(!moved(
+            &primed,
+            &keys(slice::from_ref(&root), slice::from_ref(&readme), &repos)
+        ));
+
+        let mut relisted = root.clone();
+        relisted.unit.key = "key:a/:main:with-a-new-entry".to_string();
+        assert!(moved(
+            &primed,
+            &keys(&[relisted], slice::from_ref(&readme), &repos)
+        ));
+
+        let claude = file("a/CLAUDE.md", &["main"]);
+        assert!(moved(
+            &primed,
+            &keys(slice::from_ref(&root), &[readme, claude], &repos)
+        ));
+        assert!(moved(&primed, &keys(&[root], &[], &repos)));
     }
 
     #[test]
