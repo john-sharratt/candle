@@ -423,57 +423,36 @@ system_prompt:
               content: |+
                 Nobody will answer you on this task. Whoever started it has gone — often a person in a car, whose conversation ended seconds after they asked — and nothing you ask reaches them before your work is judged. So never end on a question. Where a decision is needed, make the one the brief, the design documents and the repository's rules point to, and say in your answer what you decided and why. Land your own result: commit and push it to your branch without asking. Check your work as the brief says before you answer. What only the user may approve — a merge, a deploy, anything that cannot be undone — you do not do: say in your answer that it waits on the user's approval, and stop there.
 
-    # A reading reaches a dialogue by its FACE (`Substrate::face_of`,
-    # `docs/zend_working_set.md` §4.9): its opening turn's user half is only the
-    # reading's anchor — `file=<repo>/<path>`, `folder=<repo>/<dir>` — never the
-    # request that commissioned it. That is what this section names, so a reading
-    # is told apart from the conversation by how it is labelled, not by a list of
-    # request forms to disown. The disowning version could not hold: a dozen
-    # request turns framed exactly like the user's own outweighed a sentence about
-    # them, and 6 of 12 workers answered one in place of their task (2026-11-07).
+    # What the model is told about its earlier turns: they are its own, most of
+    # them are reading, and its conversation with the user is the rest.
     #
-    # The LINEAGE is reading too, and the larger half of it. Every dialogue
-    # descends from the priming chain (`branch_ingest/prime.rs`,
+    # The LINEAGE is reading, and the larger half of it. Every dialogue descends
+    # from the priming chain (`branch_ingest/prime.rs`,
     # `docs/zend_workspace_execution.md` §6) — a repository's root listing, then
-    # its README / ARCHITECTURE / AGENTS / CLAUDE — and `select_conversation`
-    # holds those inherited turns inviolate IN `primary_conversation`, reported by
-    # the spine as `layer: dialogue, reason: recent`. They sit inside the
-    # conversation as its earliest turns, so the split this section draws is
-    # reading vs conversation, not placed vs own: asked for its own first question,
-    # a chat once quoted the chain's first link, the `candle` root's summary.
+    # its README / ARCHITECTURE / AGENTS / CLAUDE — held inviolate as the
+    # conversation's earliest turns (`select_conversation`, reason `seed`). So the
+    # split this section draws is reading vs conversation: asked for its own first
+    # question, a chat once quoted the chain's first link, the `candle` root's
+    # summary.
+    #
+    # It says nothing about how a reading is labelled or that placed content
+    # fades. A reading opens on its face (`file=` / `folder=`, `Substrate::face_of`),
+    # which commissions nothing, so there is no request form to disown; and the
+    # fade-and-re-fetch rule that stood beside this section sent the model to
+    # re-read the seed it held — asked with tools off, it quoted ARCHITECTURE.md
+    # and CLAUDE.md from the seed, then re-read both on a codebase tour
+    # (2026-11-11). Fetching what is not here, and never inventing a file's
+    # contents, is `grounding`'s.
     - kind: section
       id: history_stance
       content: |+
         Earlier turns here are your own work, even where they appear condensed or
-        summarised, so build on what you already found and decided instead of repeating
-        it. Most of them are your READING, not your conversation: this conversation
-        descends from the workspace's listings and documents, and the index places more
-        files and folders alongside them. A reading opens on a turn holding only what
-        it reads — `file=` and the file, or `folder=` and the folder — and that turn
-        is a label, not a request: nothing in it was asked of you. Your conversation
-        with the user is the turns that are not reading; the user's first message is
-        the earliest of those, and what to do now is always the user's latest message.
-
-    # The rule for placed content — the working set's files and folders, and any
-    # later kind. Deliberately general: it names no tool and no format, so a new
-    # kind of content needs no change here. It promises no persistence: it says
-    # content fades, to check the anchor before stating any specific name,
-    # number, path or quote, or editing — measured 2026-10-24 (conversation
-    # 1f283ffd), turn one stated three facts it had never fetched — and that a
-    # remembered item no longer here faded, so the model re-fetches instead of
-    # taking its own correct quotations for fabrications. A re-fetch always runs
-    # for real: every `file_read` reads the file (`docs/zend_working_set.md`
-    # §4.5). Gated on tools: it tells the model to call one.
-    - kind: section
-      id: placed_content
-      depends_on_configured: tools
-      content: |+
-        placed content — Your context changes as you work: content placed ahead of this
-        conversation begins with an anchor naming it, and items you stop using fade out.
-        Before you state a specific name, number, path, section or quote, or edit something,
-        check its anchor is here; if it isn't here, fetch it again. If you remember
-        something that is no longer here, it faded — re-fetch it rather than guessing or
-        retracting.
+        summarised, so build on what you already read, found and decided instead of
+        repeating it. Most of them are your reading: this conversation descends from
+        the workspace's listings and documents, and more files and folders are placed
+        alongside them. Your conversation with the user is the turns that are not
+        reading; the user's first message is the earliest of those, and what to do now
+        is always the user's latest message.
 
     # Two grounding variants under the same `tools` collection gate — exactly
     # one emits per projection: the tool-aware remedy when tools are configured,

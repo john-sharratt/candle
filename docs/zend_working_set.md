@@ -384,9 +384,11 @@ lineage and its own turns only, and its 116K window is its own again.
 
 **There is no screen.** A `file_read` runs and its page is prefilled as the
 tool's response, like every other call. `zend/src/fast_path.rs`, the lock
-promises and their restore are gone, and so is the `in_context` reply; the
-system prompt's rule for placed content (`placed_content`, `projection.yaml`)
-keeps the anchor and fade guidance and names no tool.
+promises and their restore are gone, and so is the `in_context` reply. No
+system-prompt rule tells the model that placed content fades or to check an
+anchor before stating a fact: that rule sent it to re-read the seed it held
+(2026-11-11). `grounding` covers fetching what is not here and never inventing
+a file's contents.
 
 **The loop withholds what it read** (`zend::session::withhold_read_files`,
 `zend::working_set::corpus::readings_of`, `WorkingSet::withhold`). After a

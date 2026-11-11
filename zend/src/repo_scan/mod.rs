@@ -1397,7 +1397,6 @@ pub(crate) fn shared_prompt_body(builder: &projection::Builder) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::faces::{anchor, Reading};
 
     /// **A folder is asked after as a folder**, one closing `/`, however its
     /// unit spells it.
@@ -1622,16 +1621,12 @@ mod tests {
         );
     }
 
-    /// A dialogue holds each placed reading by its face, whose opening turn is
-    /// only the reading's anchor (`crate::faces::anchor`), so `history_stance`
-    /// names a reading by that label — **in the form the faces really render**.
-    ///
-    /// This asserts against the renderer, not against a copy of its output: each
-    /// label below is read off a freshly rendered anchor, so changing the face's
-    /// form fails this test instead of silently leaving the section describing a
-    /// label that no longer occurs.
+    /// `history_stance` owns the lineage as reading and draws the line between
+    /// reading and conversation — and names no face label: a reading's face
+    /// commissions nothing, and telling the model a reading opens on "a label,
+    /// not a request" taught it the seed was labels rather than what it read.
     #[test]
-    fn history_stance_names_a_reading_by_its_faces_label() {
+    fn history_stance_owns_the_lineage_as_reading() {
         let builder = bundled_builder();
         let stance = builder
             .schema()
@@ -1651,28 +1646,12 @@ mod tests {
         // wording, not the wrapping.
         let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        // One real face per placed unit kind: a file, and a folder.
-        for (what, label, reading) in [
-            ("a file", "file=", Reading::File),
-            ("a folder", "folder=", Reading::Folder),
-        ] {
-            let rendered = anchor(reading, "candle/zend/src");
+        for label in ["file=", "folder="] {
             assert!(
-                rendered.starts_with(label),
-                "{what}'s face no longer opens {label:?}, so history_stance names a \
-                 label that does not occur: {rendered:?}",
-            );
-            assert!(
-                stance.contains(&format!("`{label}`")),
-                "history_stance must name {what}'s face by its real label {label:?}: \
-                 {stance:?}",
+                !stance.contains(label),
+                "history_stance names no face label: {stance:?}",
             );
         }
-
-        assert!(
-            stance.contains("nothing in it was asked of you"),
-            "a reading's label must not answer \"what was I asked\": {stance:?}",
-        );
         // The priming chain's links are inherited INTO `primary_conversation` and
         // sit as the conversation's earliest turns, so a section that spoke only of
         // content "placed ahead of the conversation" did not reach them. The split
