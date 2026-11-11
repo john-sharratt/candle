@@ -118,8 +118,9 @@ the dormant `summary:` block, for the false memories it wrote). A forgotten
 read is read again when it is needed.
 
 The recurrence still carries a decayed trace of a forgotten read — the mirror
-of §3, a state that remembers reading what attention no longer holds — so the
-model is told how to treat it: the system prompt's `placed_content` rule says
-that something remembered and no longer here has faded, and to fetch it again
-rather than guess. What a forgotten read leaves is that rule and the turns
-around it; nothing stands in its place.
+of §3, a state that remembers reading what attention no longer holds. The
+system prompt's `grounding` section covers it: fetch what has not appeared, and
+never make up a file's contents. A dedicated fade-and-re-fetch rule stood here
+and was removed (2026-11-11): it sent the model to re-read the seed it still
+held. What a forgotten read leaves is that rule and the turns around it;
+nothing stands in its place.

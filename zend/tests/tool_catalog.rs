@@ -234,7 +234,7 @@ fn install_tool_catalog_leaves_static_sections_untouched() {
     // (`grounding` / `grounding_no_tools` are commented out in projection.yaml.)
     // (`frame` is now the `assistant` option of the `persona` selector, not a
     // standalone section — see `projection.yaml`.)
-    for name in ["history_stance", "placed_content", "tools_overview"] {
+    for name in ["history_stance", "tools_overview"] {
         assert!(
             builder.id_for_system_section(name).is_some(),
             "static section {name:?} must still resolve",

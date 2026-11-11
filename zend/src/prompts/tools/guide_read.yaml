@@ -65,6 +65,7 @@ parameters:
       - overnight
       - perf
       - postmortem
+      - private-mode
       - refactor
       - release
       - release-watch
