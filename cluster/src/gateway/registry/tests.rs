@@ -208,7 +208,10 @@ fn a_sticky_key_is_held_by_a_member_here() {
     assert!(r.is_held("zend", "diary-0123456789abcdef"));
     r.claims("zend").claim(b"gone", Epoch { ms: 1, node: 9 });
     assert!(!r.is_held("zend", "gone"), "no member holds it");
-    assert!(!r.is_held("npcd", "diary-0123456789abcdef"), "another app's");
+    assert!(
+        !r.is_held("npcd", "diary-0123456789abcdef"),
+        "another app's"
+    );
 }
 
 /// **A sticky route narrows only by the tables declared**: a member yet to
@@ -219,7 +222,10 @@ fn a_sticky_key_is_held_by_a_member_here() {
 fn a_sticky_route_narrows_only_by_declared_tables() {
     let mut r = three();
     let route = |path: &str| Route::new(&["POST"], path, Dispatch::Any);
-    assert_eq!(r.declaring_by_table("zend", "POST", "/v1/mcp/diaries"), None);
+    assert_eq!(
+        r.declaring_by_table("zend", "POST", "/v1/mcp/diaries"),
+        None
+    );
     r.routes(
         "zend",
         2,

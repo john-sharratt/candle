@@ -205,7 +205,10 @@ async fn an_unheld_sticky_key_goes_to_a_member_declaring_its_route() {
         ..unit("zend")
     };
     for _ in 0..4 {
-        assert_eq!(hub.place(diary()).await.expect("room").pick, Pick::Member(2));
+        assert_eq!(
+            hub.place(diary()).await.expect("room").pick,
+            Pick::Member(2)
+        );
     }
     hub.state()
         .registry

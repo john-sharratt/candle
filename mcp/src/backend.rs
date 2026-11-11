@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use axum::http::header;
 use futures::StreamExt;
-use mcp_server::http::{PROGRESS_EVERY, VERSION_HEADER};
 use mcp_server::access::{self, Access};
+use mcp_server::http::{PROGRESS_EVERY, VERSION_HEADER};
 use mcp_server::listing::TOOLS_VERSION_HEADER;
 use mcp_server::protocol::{text_result, CLIENT_META, MODERN, QUIET_META, REF_META, SESSION_META};
 use mcp_server::refs::DIARY_HEADER;
