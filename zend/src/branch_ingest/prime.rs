@@ -17,13 +17,16 @@
 //! inside one repository, and the repositories are named to the model by
 //! every tool's `repo` enum.
 //!
-//! Each link records the one before it as its PARENT
-//! (`ConversationEngine::set_forked_from`) before its own reading starts, so
-//! the projection for every one of its turns carries the whole chain behind
-//! it (`Substrate::inherited_chain`): by the time the last CLAUDE.md is read,
-//! the conversation reading it has genuinely read every listing and document
-//! before it, in order. The link is a durable pointer, not a copy — nothing
-//! is duplicated onto the child and no ancestor has to stay resident.
+//! Each link is read behind the one before it, which it records as its
+//! PARENT, so the projection for every one of its turns carries the whole
+//! chain behind it (`Substrate::inherited_chain`): by the time the last
+//! CLAUDE.md is read, the conversation reading it has genuinely read every
+//! listing and document before it, in order. The link is a durable pointer,
+//! not a copy — nothing is duplicated onto the child and no ancestor has to
+//! stay resident. It names the parent by content key
+//! (`Substrate::UNIT_PARENT`), not timeline id: two members that read a
+//! changed link at once each hold a copy, and a parent named by id was the
+//! copy one member retired.
 //!
 //! Every link is an ordinary unit of its layer, keyed by content like any
 //! other: the pass that follows finds it committed and does not read it
@@ -160,11 +163,20 @@ pub fn links<'a>(
     out
 }
 
-/// Re-point `held`, a link committed on an earlier boot, at `parent` — the
-/// link before it in this boot's chain. The first link has no parent and
-/// drops whatever it recorded before: a stale parent kept there is a link
-/// that may now come after it, and the next link re-pointed at it would close
-/// a cycle.
+/// The link a chain link is read behind: its conversation, which the reading
+/// forks on, and its content key, which the link records as its parent.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChainParent<'a> {
+    pub timeline: TimelineId,
+    pub key: &'a str,
+}
+
+/// Re-point `held`, a committed link, at `parent` — the link before it in the
+/// chain, named by its content key (`Substrate::UNIT_PARENT`), so every member
+/// records the same parent whichever copy of that link it holds. The first
+/// link has no parent and drops whatever it recorded before: a stale parent
+/// kept there is a link that may now come after it, and the next link
+/// re-pointed at it would close a cycle.
 ///
 /// `false` when `held` was tombstoned since it was found: nothing is written,
 /// and the caller reads the unit again rather than chain onto a dead link.
@@ -172,18 +184,20 @@ pub fn links<'a>(
 pub(crate) fn repoint(
     engine: &ConversationEngine,
     held: TimelineId,
-    parent: Option<TimelineId>,
+    parent: Option<&str>,
 ) -> candle_conversation::Result<bool> {
-    let (mut dead, mut cycle) = (false, false);
+    let (mut dead, mut cycle) = (false, None);
     engine.update_conversation_metadata(held, Substrate::FORKED_FROM_KEY, |s, _| {
         dead = s.is_tombstoned(held);
-        cycle = parent.is_some_and(|p| s.lineage_contains(p, held));
-        (!dead && !cycle).then(|| parent.map_or_else(String::new, |p| p.raw().to_string()))
+        cycle = parent
+            .and_then(|key| s.unit_holding(key))
+            .filter(|&p| s.lineage_contains(p, held));
+        (!dead && cycle.is_none()).then(|| parent.map_or_else(String::new, Substrate::unit_parent))
     });
-    if cycle {
+    if let Some(p) = cycle {
         return Err(ConversationError::ForkCycle {
             child: held.raw(),
-            parent: parent.map_or(0, |p| p.raw()),
+            parent: p.raw(),
         });
     }
     Ok(!dead)
@@ -282,11 +296,18 @@ impl BranchIngest {
 
         let total = chain.len() as u64;
         progress.set_step_progress(0, total);
+        // The chain so far ends on `end`, the conversation read under
+        // `end_key`: what the next link is read behind and records as its
+        // parent.
         let mut end: Option<TimelineId> = None;
+        let mut end_key: Option<&str> = None;
         for (done, link) in chain.iter().enumerate() {
             if crate::ingest_cancel::cancelled() {
                 break;
             }
+            let parent = end
+                .zip(end_key)
+                .map(|(timeline, key)| ChainParent { timeline, key });
             let began = Instant::now();
             tracing::info!(
                 target: "zend::priming_chain",
@@ -307,7 +328,7 @@ impl BranchIngest {
                         branches: u.branches.clone(),
                     },
                     unit_keys,
-                    end,
+                    parent,
                 )?,
                 (Link::File(f), _, Some(layer)) => code_read::ingest_link(
                     ctx,
@@ -321,7 +342,7 @@ impl BranchIngest {
                     },
                     file_keys,
                     &self.binary,
-                    end,
+                    parent,
                 )?,
                 _ => None,
             };
@@ -335,6 +356,7 @@ impl BranchIngest {
             );
             if read.is_some() {
                 end = read;
+                end_key = Some(link.key());
             }
             progress.set_step_progress(done as u64 + 1, total);
         }

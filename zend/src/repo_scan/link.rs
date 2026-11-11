@@ -10,31 +10,32 @@ use candle_conversation::{ConversationEngine, Sequence};
 
 use super::{process_one_dir, IngestPlan, UnitJob};
 use crate::branch_ingest::keys::CONTENT_KEY;
-use crate::branch_ingest::prime::repoint;
+use crate::branch_ingest::prime::{repoint, ChainParent};
 use crate::ingest_report::Failures;
 use crate::priming_watch;
 use crate::refresh_ctx::{RefreshContext, PRIMING_BAND};
 
-/// Ingest `job` with `parent` recorded as its parent before it is read, and
-/// return the conversation that holds it — `None` when its ingest failed (the
-/// failure is logged; the chain continues from the link before it).
+/// Ingest `job` behind `parent`, the link before it, and return the
+/// conversation that holds it — `None` when its ingest failed (the failure is
+/// logged; the chain continues from the link before it).
 ///
-/// A unit already committed is not read again: it is re-pointed at `parent`,
-/// since the chain it hangs off is rebuilt every boot and the link before it
-/// may be another conversation now. `live` is every unit key on any branch,
-/// as a pool is given it, so a link's ingest retires only what no branch
-/// holds.
+/// Its parent is recorded by `parent`'s content key ([`repoint`]). A unit
+/// already committed is not read again: it is re-pointed, since the link
+/// before it may be another conversation now. `live` is every unit key on any
+/// branch, as a pool is given it, so a link's ingest retires only what no
+/// branch holds.
 pub(crate) fn ingest_link(
     ctx: &RefreshContext<'_>,
     base: &Sequence,
     layer_name: &str,
     job: &UnitJob,
     live: &HashSet<String>,
-    parent: Option<TimelineId>,
+    parent: Option<ChainParent<'_>>,
 ) -> anyhow::Result<Option<TimelineId>> {
+    let named = parent.map(|p| p.key);
     if let Some(held) = holder(ctx.engine, &job.unit.key) {
         priming_watch::stage("re-pointing the held link");
-        if repoint(ctx.engine, held, parent)
+        if repoint(ctx.engine, held, named)
             .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", job.unit.dir))?
         {
             return Ok(Some(held));
@@ -42,7 +43,7 @@ pub(crate) fn ingest_link(
     }
     let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, layer_name)?;
     let link_ctx = RefreshContext {
-        link_parent: parent,
+        link_parent: parent.map(|p| p.timeline),
         band: Some(PRIMING_BAND),
         ..ctx.clone()
     };
@@ -59,7 +60,14 @@ pub(crate) fn ingest_link(
         );
         return Ok(None);
     }
-    Ok(holder(ctx.engine, &job.unit.key))
+    // Its reading recorded the parent's timeline as it forked; the chain
+    // names it by key.
+    let held = holder(ctx.engine, &job.unit.key);
+    if let Some(tl) = held {
+        repoint(ctx.engine, tl, named)
+            .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", job.unit.dir))?;
+    }
+    Ok(held)
 }
 
 /// The committed conversation holding the folder key `key`.

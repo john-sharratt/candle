@@ -3,14 +3,17 @@
 
 use std::fmt::Write;
 
+use candle_conversation::substrate::Substrate;
 use sha2::{Digest, Sha256};
 use zend_vfs::Oid;
 
 use crate::repo_scan::types::ModuleHint;
 
 /// Conversation metadata: the unit's content key. Written only once its
-/// ingest succeeds, so a conversation carrying it is committed.
-pub const CONTENT_KEY: &str = "content_key";
+/// ingest succeeds, so a conversation carrying it is committed. The
+/// substrate's own constant: it indexes units by it, so a parent named by key
+/// resolves (`Substrate::UNIT_PARENT`).
+pub const CONTENT_KEY: &str = Substrate::CONTENT_KEY;
 
 /// Conversation metadata: the bits per weight of the model that wrote the unit
 /// — `3` for a Q3 pack, `4` for a Q4 — as `candle_conversation::guest::

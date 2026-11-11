@@ -245,6 +245,12 @@ pub struct Substrate {
     /// so a scan reads a unit's calibrations without walking every timeline.
     /// Tombstoned calibrations stay listed and are filtered at the read.
     calibrations_of: PMap<TimelineId, PVec<TimelineId>>,
+    /// Every timeline by the content key it was read under
+    /// ([`Self::CONTENT_KEY`]) — kept as that metadata is applied, so a
+    /// parent named by key ([`Self::UNIT_PARENT`]) resolves without walking
+    /// every timeline. Tombstoned and archived ones stay listed and are
+    /// filtered at the read.
+    units_by_key: PMap<String, PVec<TimelineId>>,
     /// Each calibrated conversation's calibration signatures as one unit, shared
     /// by every version ([`calibration_record`]).
     calibration_records: Arc<CalRecords>,
@@ -3416,6 +3422,28 @@ impl Substrate {
     /// on the chain the member serving it holds now.
     pub const SEED_PARENT: &'static str = "seed";
 
+    /// Metadata key under which a reading records the content key it was read
+    /// under: a file's `v{N}:{path}@{blob}`, a folder's listing hash.
+    pub const CONTENT_KEY: &'static str = "content_key";
+
+    /// The prefix of a `forked_from` that names its parent by **content key**
+    /// rather than timeline id — `unit:<key>`, resolved where the lineage is
+    /// read to the conversation holding that key ([`Self::unit_holding`]).
+    ///
+    /// A priming-chain link names the link before it this way. Two members
+    /// that read a changed link at once each mint a conversation for it, and
+    /// each re-pointed the next link at its own; the pointer that replicated
+    /// last won, and on the member whose copy was retired as the duplicate the
+    /// next link's parent read as absent — every dialogue's seed cut there
+    /// (2026-11-11). Named by key, both members write the same parent, and
+    /// whichever copy survives satisfies it.
+    pub const UNIT_PARENT: &'static str = "unit:";
+
+    /// The `forked_from` value naming the unit read under `key` as a parent.
+    pub fn unit_parent(key: &str) -> String {
+        format!("{}{key}", Self::UNIT_PARENT)
+    }
+
     /// Name `seed` as what [`Self::SEED_PARENT`] resolves to on this member;
     /// `None` while there is no chain.
     pub fn set_seed(&mut self, seed: Option<TimelineId>) {
@@ -3450,11 +3478,15 @@ impl Substrate {
     /// error: a chain link can be retired by its own layer's reconciliation
     /// long after a child recorded it, and a dangling pointer must degrade to
     /// "no inheritance" instead of failing the child. A parent recorded as
-    /// [`Self::SEED_PARENT`] is this member's seed.
+    /// [`Self::SEED_PARENT`] is this member's seed; one recorded as
+    /// [`Self::UNIT_PARENT`] is the unit holding that content key.
     pub fn parent_timeline(&self, tl: TimelineId) -> Option<TimelineId> {
         let recorded = self.timelines.get(&tl)?.custom.get(Self::FORKED_FROM_KEY)?;
         let parent = match recorded.as_str() {
             Self::SEED_PARENT => self.seed?,
+            unit if unit.starts_with(Self::UNIT_PARENT) => {
+                self.unit_holding(&unit[Self::UNIT_PARENT.len()..])?
+            }
             raw => TimelineId::from_raw(raw.parse().ok()?)?,
         };
         if self.tombstoned_timelines.contains(&parent) {
@@ -4949,6 +4981,9 @@ impl Substrate {
                         v,
                     );
                 }
+                if k == Self::CONTENT_KEY {
+                    Self::index_unit(&mut self.units_by_key, timeline, before.as_deref(), v);
+                }
             }
         }
     }
@@ -4973,6 +5008,37 @@ impl Substrate {
                 list.insert(at, calibration);
             }
         }
+    }
+
+    /// Move `unit` in `index` from the content key `before` to `now`.
+    fn index_unit(
+        index: &mut PMap<String, PVec<TimelineId>>,
+        unit: TimelineId,
+        before: Option<&str>,
+        now: &str,
+    ) {
+        if let Some(old) = before {
+            if let Some(list) = index.get_mut(old) {
+                list.retain(|&t| t != unit);
+            }
+        }
+        let list = index.entry(now.to_string()).or_default();
+        if let Err(at) = list.binary_search(&unit) {
+            list.insert(at, unit);
+        }
+    }
+
+    /// The live, unarchived timeline read under the content key `key`, the
+    /// oldest when more than one is: two members that read the same unit at
+    /// once each hold one, and every member must resolve a parent named by
+    /// that key to the same conversation, whichever of the two survives.
+    pub fn unit_holding(&self, key: &str) -> Option<TimelineId> {
+        self.units_by_key.get(key)?.iter().copied().find(|tl| {
+            !self.tombstoned_timelines.contains(tl)
+                && self.timelines.get(tl).is_some_and(|e| {
+                    !e.archived && e.custom.get(Self::CONTENT_KEY).map(String::as_str) == Some(key)
+                })
+        })
     }
 
     /// A record `id` named `entry`'s `conv_id`: rank the conversation by the
@@ -7527,6 +7593,7 @@ impl Substrate {
         self.owned_sections.clear_ownership();
         self.timeline_token_totals.clear();
         self.calibrations_of.clear();
+        self.units_by_key.clear();
         self.section_token_total = 0;
         self.gallery_epoch += 1;
         self.sig_rewrites += 1;
@@ -8996,6 +9063,42 @@ mod tests {
             vec![chain[0], dialogue],
             "a rebuilt chain is followed"
         );
+    }
+
+    /// **A parent named by content key resolves to whichever copy survives.**
+    /// Two members read the same changed link at once and each holds a copy;
+    /// the next link names it by key, so it resolves to the oldest live copy,
+    /// then to the other once that one is retired — never to an archived one,
+    /// and to nothing when no copy is left.
+    #[test]
+    fn a_parent_named_by_key_resolves_to_the_live_copy() {
+        let alloc = TimelineAllocator::new();
+        let (layer, group) = (LayerId::for_test(1), GroupId::for_test(1));
+        let [first, second, child] = std::array::from_fn(|_| alloc.next());
+        let mut sub = Substrate::new();
+        for tl in [first, second, child] {
+            sub.register_timeline(tl, layer, group);
+            sub.append_with_blocks(tl, 10, 0, 1);
+        }
+        let key = "v5:journals/@listing";
+        let kv = |k: &str, v: &str| BTreeMap::from([(k.to_string(), v.to_string())]);
+        for copy in [first, second] {
+            sub.merge_custom(copy, &kv(Substrate::CONTENT_KEY, key), RecordIdentity::NONE);
+        }
+        sub.merge_custom(
+            child,
+            &kv(Substrate::FORKED_FROM_KEY, &Substrate::unit_parent(key)),
+            RecordIdentity::NONE,
+        );
+        assert_eq!(sub.parent_timeline(child), Some(first), "the oldest copy");
+        sub.tombstoned_timelines.insert(first);
+        assert_eq!(
+            sub.parent_timeline(child),
+            Some(second),
+            "the surviving copy"
+        );
+        arc_mut(&mut sub.timelines, &second).unwrap().archived = true;
+        assert_eq!(sub.parent_timeline(child), None, "no live copy is left");
     }
 
     /// **The repair finds every conversation parented on a base** — a
