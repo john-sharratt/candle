@@ -3,6 +3,10 @@
 //!
 //! - `state` is `"ready"` once every tenant is, `"loading"` while any is, and
 //!   `"fault"` while the device cannot take a turn — whatever the tenants say.
+//!   A tenant whose app has fewer ready members than it needs to commit stays
+//!   ready — it is the member serving — and carries `quorum_wait`, a load on
+//!   the `quorum` step (`quorum_wait`), which a console shows as its loading
+//!   page rather than opening onto routes that wait.
 //! - `loading` is the load in progress — the highest-ranked tenant still
 //!   loading, which is the one loading the model when there is a model to load.
 //! - `engine_connected` is whether the model is loaded: some tenant is past its
@@ -18,9 +22,11 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::Json;
 use candle::gpu_poison::device_failing;
+use cluster::replicate::QuorumView;
 use futures::future::join_all;
 use serde_json::{json, Map, Value};
 
+use super::quorum_wait::with_quorum_wait;
 use super::Shared;
 use crate::cluster::view::status_block;
 use crate::cluster::Cluster;
@@ -39,10 +45,20 @@ pub async fn status(State(s): State<Arc<Shared>>) -> Json<Value> {
         .zip(lines)
         .map(|(n, line)| match &stopping {
             Some(step) => (n, draining(line, step)),
-            None => (n, line),
+            None => (n, with_quorum_wait(line, n, quorum_of(&s, n).as_ref())),
         })
         .collect();
     Json(assemble(&head_of(&s), &s.build, named))
+}
+
+/// Tenant `app`'s group as this member counts it, once it replicates: what
+/// [`with_quorum_wait`] reads. `None` standalone, and before the app connects.
+fn quorum_of(s: &Shared, app: &str) -> Option<QuorumView> {
+    s.cluster
+        .as_deref()?
+        .link(app)?
+        .replication()
+        .map(|r| r.quorum)
 }
 
 /// What the body says of the process, apart from its tenants.

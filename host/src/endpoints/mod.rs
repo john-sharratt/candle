@@ -14,6 +14,7 @@ mod log_grep;
 mod logs;
 mod me;
 mod profile;
+mod quorum_wait;
 mod slots;
 pub(crate) mod status;
 mod telemetry;

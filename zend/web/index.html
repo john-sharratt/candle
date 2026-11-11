@@ -4492,7 +4492,17 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // zend's own line in the host's `/v1/status`: its state, its load, its
   // substrate maintenance and its ingest backlog. The host serves zend beside
   // other tenants, so the top level speaks for the process, not for zend.
-  function zendLine(st) { return (st && st.tenants && st.tenants.zend) || {}; }
+  // zend's line in a status. A member whose cluster is short of quorum stays
+  // `ready` — it is the one serving — and carries `quorum_wait`
+  // (host::endpoints::quorum_wait): its routes that commit wait until another
+  // member joins, so the page shows that wait as its loading card rather than
+  // opening onto a chat whose every action hangs.
+  function zendLine(st) {
+    const line = (st && st.tenants && st.tenants.zend) || {};
+    return (line.state === 'ready' && line.quorum_wait)
+      ? Object.assign({}, line, { state: 'loading', loading: line.quorum_wait })
+      : line;
+  }
 
   // ── first paint, and the startup / model-loading overlay (GET /v1/status) ─
   // Before the daemon has answered, the page is arriving, not starting: a
@@ -4572,8 +4582,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // A stopping process shows its drain on this same card (`current:
     // "draining"`, host::endpoints::status) — headed as what it is.
     const stopping = ld.current === 'draining';
+    // A member short of quorum shows its wait on this card too (`current:
+    // "quorum"`, host::endpoints::quorum_wait).
+    const waiting = ld.current === 'quorum';
     const card = h('div', { class: 'z-load-card' },
-      h('div', { class: 'z-load-eyebrow' }, stopping ? 'Stopping' : 'Starting up'),
+      h('div', { class: 'z-load-eyebrow' },
+        stopping ? 'Stopping' : waiting ? 'Waiting for the cluster' : 'Starting up'),
       h('div', { class: 'z-load-row' },
         spinner(),
         // Show the specific current action prominently (e.g. "Scanning
