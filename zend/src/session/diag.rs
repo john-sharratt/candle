@@ -43,7 +43,7 @@ pub use splice::Splice;
 use splice::{splice_grid, splice_text};
 
 use super::replay::{
-    compare_turns, replay_history, turn_selection, Demonstration, ReplaySampling, TurnComparison,
+    compare_turns, replay_history, turn_selection, ReplaySampling, TurnComparison,
 };
 use super::{
     think_mode_from_selection, timeline_for, turn_projection, turn_sampling, turn_triggers,
@@ -464,7 +464,6 @@ impl ZendSession {
             &recorded,
             &reply,
             spec.tools_mode,
-            Demonstration::FirstStepOnly,
             &mut |index, conv| {
                 let script = script_of(&events[index], conv);
                 conv.set_projection(builder.with_script(script).into());
@@ -534,7 +533,7 @@ impl ZendSession {
         let half_text = half.text();
         let (recurrent_spans, spans) = armed_spans(run, &half_text, captures)?;
         tracing::info!(run = run_index, spans = ?spans, "diag: the target's armed spans");
-        let selection = turn_selection(&reply, &target.user, Demonstration::FirstStepOnly);
+        let selection = turn_selection(&reply, &target.user);
         let think_mode = think_mode_from_selection(&selection);
         let (explicit, seed) = match run.sampling {
             ReplaySampling::Argmax => (Some(SamplingConfig::argmax()), None),

@@ -57,9 +57,8 @@ use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
     CancelToken, Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers,
-    GroupScanner, Linking, OptionalState, ProjectionEvent, PromptDump, SamplingConfig,
-    SelectionState, Sequence, ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse,
-    UnsealedAsker, Want,
+    GroupScanner, Linking, ProjectionEvent, PromptDump, SamplingConfig, SelectionState, Sequence,
+    ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse, UnsealedAsker, Want,
 };
 use host::download::ensure_model_pack;
 use host::process::fatal;
@@ -72,7 +71,7 @@ use journal_core::fold;
 use journal_core::folding::{self, Folded};
 use journal_core::journal::Holds;
 use journal_core::record::view as journal_view;
-use journal_core::section::{render_open, JournalPrompt, Kept, Section, JOURNAL, OPEN_SECTION};
+use journal_core::section::{JournalPrompt, Kept, Section, JOURNAL};
 use journal_core::span::Span;
 use journal_core::transcript::{Filed, Hits, Miss, Page};
 use journals::ops::wire::path_from_wire;
@@ -89,8 +88,7 @@ use zend_vfs::{RepoFiles, Workspace};
 
 use crate::answer_steps;
 use crate::api::chat::{
-    apply_tools_dial, dial_selection, tool_round_selection, EFFORT_OPTIONS,
-    RESPONSE_LENGTH_OPTIONS, TOOL_EXAMPLE_SELECTOR,
+    apply_tools_dial, dial_selection, tool_round_selection, EFFORT_OPTIONS, RESPONSE_LENGTH_OPTIONS,
 };
 use crate::api::substrate::{
     ProjectTile, ProjectView, SelectedNodeView, SelectionView, SystemPromptRetired, ToolView,
@@ -120,7 +118,7 @@ use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
 use crate::journal::desk::{Asking, Compile, Record, ZendDesk, FOLD_TOKENS, WRITE_TOKENS};
 use crate::journal::notes::JOURNAL_NOTE_TOOL;
-use crate::journal::opening::{OPENING_SEAL_WAIT, SEED_SECTION};
+use crate::journal::opening::OPENING_SEAL_WAIT;
 use crate::journal::record::{kept_in, metadata_of, KEY as JOURNAL_KEY};
 use crate::journal::registry::{Journals, Open};
 use crate::journal::shelf::{Above, Drafted, Lazy, Notes, Shelf};
@@ -129,6 +127,7 @@ use crate::journal::style::style_for;
 use crate::journal::text::JournalText;
 use crate::journal::world::{Citable, JournalsAbove};
 use crate::journal::{carry, draft, origin, pressure};
+use crate::layers::expiry::now_ms;
 use crate::layers::keys::SUBJECT_KEY;
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
@@ -181,8 +180,7 @@ mod replay;
 pub mod restore;
 pub use ask::{AskOutcome, AskSpec};
 pub use replay::{
-    Demonstration, RecordedTurn, ReplayOutcome, ReplayReport, ReplaySampling, ReplaySpec,
-    TurnComparison,
+    RecordedTurn, ReplayOutcome, ReplayReport, ReplaySampling, ReplaySpec, TurnComparison,
 };
 
 pub const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
@@ -2563,13 +2561,6 @@ impl InferenceState {
                     // Pin exactly this tool: `SelectionRule::Named` emits only the
                     // catalog member whose name matches the selector value.
                     opts.selection.select(CALIB_TOOL_SELECTOR, name);
-                    // An exemplar is a tool-using turn, so it is sealed behind the
-                    // prefix a tool-using chat turn gets — the demonstration
-                    // included. Selected explicitly because the schema defaults it
-                    // ABSENT for the ingest layers, which cannot select anything
-                    // (see `projection.yaml`).
-                    opts.selection
-                        .set_optional(TOOL_EXAMPLE_SELECTOR, OptionalState::Present);
                     // Fast path: prefill the tool file's ChatML trajectory verbatim
                     // in one batched forward pass instead of decoding it token by
                     // token — the wide-Q is captured identically at seal. Prefill
@@ -5696,37 +5687,9 @@ async fn carry_journal(
     let journal = state
         .journals
         .of(conv_id, || journal_record(state, timeline));
-    let (prompt, nothing_open) = {
-        let held = journal.lock().unwrap();
-        (
-            held.journal().prompt(held.style()),
-            render_open(&[], held.style()),
-        )
-    };
-    // The journal opens with what the dialogue read before its session
-    // began (`journal::opening`), and a journal that holds nothing else yet
-    // still says where it ends.
-    let opening = journal_opening(state, timeline);
-    let ending = (prompt.is_empty() && !opening.is_empty()).then(|| Section {
-        name: OPEN_SECTION.to_string(),
-        text: nothing_open,
-    });
-    // A conversation owned through `/mcp` carries its ancestors' journals
-    // ahead of its own, and the reader's line after it (`mcp::lineage`).
-    let inherited = inherited_journals(state, conv_id);
-    let (before, reader) = match inherited.split_last() {
-        Some((reader, before)) => (before, Some(reader)),
-        None => (&inherited[..], None),
-    };
-    // Then the memory its thread is about, before its own journal
-    // (`mcp::memory_sections`).
-    let memory = carried_memory(state, conv_id);
-    let mut wants: Vec<Want<'_>> = opening.iter().map(section_want).collect();
-    wants.extend(before.iter().map(inherited_want));
-    wants.extend(memory.iter().map(inherited_want));
-    wants.extend(carry::wants(&prompt));
-    wants.extend(ending.iter().map(section_want));
-    wants.extend(reader.map(inherited_want));
+    let opened = open_journal(state, timeline, &journal);
+    let (prompt, sections) = journal_sections(state, conv_id, &journal);
+    let wants: Vec<Want<'_>> = sections.iter().map(section_want).collect();
     let lineage_sweep = lineage::sweep_names();
     let memory_sweep = memory_sections::sweep_names();
     let mut sweep = prompt.sweep();
@@ -5751,9 +5714,9 @@ async fn carry_journal(
         )
         .await;
     // The opening is what a conversation's first round answers its opening
-    // question from, so a round that would go without it gives it a moment
-    // to seal. Everything is submitted by now: this reconcile only waits.
-    if !opening.is_empty() && !sealed.iter().any(|s| s == SEED_SECTION) {
+    // question from, so the round that wrote it gives it a moment to seal.
+    // Everything is submitted by now: this reconcile only waits.
+    if opened && sealed.len() < wants.len() {
         sealed = carried
             .reconcile(
                 conv,
@@ -5770,18 +5733,80 @@ async fn carry_journal(
     carry::select(selection, &sealed);
 }
 
-/// The journal's opening for the conversation at `timeline`
-/// (`journal::opening`): what the priming chain read, for a conversation that
-/// descends from it, and nothing for one that does not.
-fn journal_opening(state: &InferenceState, timeline: TimelineId) -> Vec<Section> {
+/// The journal sections the conversation `conv_id` carries, in the order its
+/// collection holds them, beside its journal's prompt: what `carry_journal`
+/// reconciles, and what the projection panel shows as their text.
+fn journal_sections(
+    state: &InferenceState,
+    conv_id: &str,
+    journal: &Mutex<SessionJournal>,
+) -> (JournalPrompt, Vec<Section>) {
+    let prompt = {
+        let held = journal.lock().unwrap();
+        held.journal().prompt(held.style())
+    };
+    // A conversation owned through `/mcp` carries its ancestors' journals
+    // ahead of its own, and the reader's line after it (`mcp::lineage`).
+    let mut inherited = inherited_journals(state, conv_id);
+    let reader = inherited.pop();
+    // Then the memory its thread is about, before its own journal
+    // (`mcp::memory_sections`).
+    let memory = carried_memory(state, conv_id);
+    let as_section = |i: lineage::Inherited| Section {
+        name: i.name,
+        text: i.text,
+    };
+    let mut sections: Vec<Section> = inherited.into_iter().map(as_section).collect();
+    sections.extend(memory.into_iter().map(as_section));
+    sections.extend(prompt.sections.iter().cloned());
+    sections.extend(reader.map(as_section));
+    (prompt, sections)
+}
+
+/// Open the journal of the conversation at `timeline` with what it read
+/// before its session began (`journal::opening`): the two entries, kept and
+/// recorded, for a conversation that descends from the priming chain and
+/// whose journal has never kept an entry. A forgotten opening is not written
+/// again. Whether it wrote them.
+fn open_journal(
+    state: &InferenceState,
+    timeline: TimelineId,
+    journal: &Mutex<SessionJournal>,
+) -> bool {
+    if journal.lock().unwrap().journal().written() > 0 {
+        return false;
+    }
     let seeded = state
         .engine
         .conversation_metadata_value(timeline, Substrate::FORKED_FROM_KEY)
         .is_some_and(|parent| parent == Substrate::SEED_PARENT);
-    if !seeded {
-        return Vec::new();
+    let entries = state.branch_ingest.seed_read().entries(now_ms());
+    if !seeded || entries.is_empty() {
+        return false;
     }
-    state.branch_ingest.seed_read().sections()
+    let prompt = {
+        let mut held = journal.lock().unwrap();
+        // Asked again under the lock: a draft kept since the check above is
+        // the conversation's own journal begun, and the opening comes before
+        // its first entry or not at all.
+        if held.journal().written() > 0 {
+            return false;
+        }
+        for entry in entries {
+            held.journal_mut().keep_closing(entry);
+        }
+        held.journal().prompt(held.style())
+    };
+    if let Err(e) = state
+        .engine
+        .set_conversation_metadata_many(timeline, &metadata_of(&prompt))
+    {
+        tracing::warn!(
+            timeline = timeline.raw(),
+            "the journal's opening could not be recorded: {e}"
+        );
+    }
+    true
 }
 
 /// A section of the journal's own as the reconcile wants it.
@@ -5804,14 +5829,6 @@ fn inherited_journals(state: &InferenceState, conv_id: &str) -> Vec<lineage::Inh
         .map(|a| a.ancestor)
         .collect();
     lineage::sections(&format!("T:{thread}/{name}"), &nearest_first)
-}
-
-/// An inherited section as the reconcile wants it.
-fn inherited_want(i: &lineage::Inherited) -> Want<'_> {
-    Want {
-        name: &i.name,
-        text: &i.text,
-    }
 }
 
 /// The memory sections `conv_id` carries: the topics its thread is about that
@@ -8515,17 +8532,27 @@ impl ZendSession {
             .collect()
     }
 
-    /// `(section name, authored content)` for every system-prompt section in the
-    /// schema, plus the runtime tool summary matching this conversation's tools
-    /// mode. Backs the projection panel's expandable section text — resolved on
-    /// demand, never stored in the projection event. The schema is workspace-wide;
-    /// `conv_id` selects which tool summary (restricted vs comprehensive) to serve.
+    /// `(section name, content)` for every system-prompt section in the schema,
+    /// the journal sections this conversation carries, and the runtime tool
+    /// summary matching its tools mode. Backs the projection panel's expandable
+    /// section text — resolved on demand, never stored in the projection event.
+    /// The schema is workspace-wide; `conv_id` selects the journal and which
+    /// tool summary (restricted vs comprehensive) to serve.
     pub fn section_content(&self, conv_id: &str) -> Option<Vec<(String, String)>> {
         let state = self.inference.load_full()?;
         let mut out = {
             let base = &state.base_conv;
             base.section_contents()
         };
+        // A conversation's journal sections are its own, submitted to its
+        // timeline rather than declared by the schema: served as the round
+        // carries them (`journal_sections`).
+        let timeline = conversation_timeline(conv_id);
+        let journal = state
+            .journals
+            .of(conv_id, || journal_record(&state, timeline));
+        let (_, sections) = journal_sections(&state, conv_id, &journal);
+        out.extend(sections.into_iter().map(|s| (s.name, s.text)));
         // The `tools` collection's summary section is generated at runtime (not a
         // schema section), so its text isn't in `section_contents`. Serve the
         // summary matching this conversation's tools mode — the tools that mode

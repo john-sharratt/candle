@@ -50,17 +50,6 @@ use crate::api::chat::tool_round_selection;
 use crate::tools::tool_round_text;
 use crate::types::ToolMode;
 
-/// Where a turn projects the tool-call demonstration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Demonstration {
-    /// On every turn, tool rounds included — how conversations recorded before
-    /// tool rounds dropped it ran.
-    EveryTurn,
-    /// On a reply's first step only — the chat as it runs now
-    /// (`tool_round_selection`).
-    FirstStepOnly,
-}
-
 /// How one run samples its decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplaySampling {
@@ -83,7 +72,6 @@ pub struct ReplaySpec {
     /// `apply_tools_dial`).
     pub selection: SelectionState,
     pub tools_mode: ToolMode,
-    pub demonstration: Demonstration,
     /// One decode of the resume turn per entry.
     pub runs: Vec<ReplaySampling>,
 }
@@ -246,17 +234,13 @@ pub fn recorded_turns(history: &[RecoveredMessage]) -> anyhow::Result<Vec<Record
     Ok(turns)
 }
 
-/// The selection a turn projects with: the reply's own, less the demonstration
-/// on a tool round when the chat drops it there.
-pub fn turn_selection(
-    reply: &SelectionState,
-    user: &str,
-    demonstration: Demonstration,
-) -> SelectionState {
-    let tool_round = user.starts_with("<tool_response>");
-    match demonstration {
-        Demonstration::FirstStepOnly if tool_round => tool_round_selection(reply),
-        _ => reply.clone(),
+/// The selection a turn projects with: the reply's own, marked as a tool round
+/// when its user half is one, as the chat marks it.
+pub fn turn_selection(reply: &SelectionState, user: &str) -> SelectionState {
+    if user.starts_with("<tool_response>") {
+        tool_round_selection(reply)
+    } else {
+        reply.clone()
     }
 }
 
@@ -276,7 +260,6 @@ pub(super) fn replay_history(
     recorded: &[SealedTurn],
     reply: &SelectionState,
     tools_mode: ToolMode,
-    demonstration: Demonstration,
     before: &mut dyn FnMut(usize, &mut Sequence),
     sealed: &mut OnSealed<'_>,
 ) -> anyhow::Result<()> {
@@ -285,7 +268,7 @@ pub(super) fn replay_history(
             bail!("turn {index} has no sealed record to replay");
         };
         before(index, conv);
-        let selection = turn_selection(reply, &turn.user, demonstration);
+        let selection = turn_selection(reply, &turn.user);
         let options = TurnOptions {
             sampling: Some(turn_sampling(
                 conv,
@@ -398,7 +381,6 @@ impl ZendSession {
                 &recorded,
                 &spec.selection,
                 spec.tools_mode,
-                spec.demonstration,
                 &mut |_, _| {},
                 &mut |_, _, _, _| Ok(()),
             )
@@ -412,7 +394,7 @@ impl ZendSession {
             );
             on_history(run, &history, replay_secs);
 
-            let selection = turn_selection(&spec.selection, &resume.user, spec.demonstration);
+            let selection = turn_selection(&spec.selection, &resume.user);
             let think_mode = think_mode_from_selection(&selection);
             let (explicit, seed) = match sampling {
                 ReplaySampling::Argmax => (Some(SamplingConfig::argmax()), 0),
@@ -480,7 +462,7 @@ impl ZendSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_conversation::{OptionalState, SealedPages};
+    use candle_conversation::{OptionalState, SealedPages, TOOL_ROUND_SELECTOR};
 
     fn sealed(index: u32, ids: &[u32], pages: SealedPages) -> SealedTurn {
         SealedTurn {
@@ -614,29 +596,19 @@ mod tests {
         );
     }
 
-    /// The demonstration leaves a tool round only when the chat drops it there;
-    /// a reply's first step keeps it either way.
+    /// A replayed tool round is marked as the chat marks it; a reply's first
+    /// step keeps the reply's selection as it is.
     #[test]
-    fn a_turn_selects_the_demonstration_as_the_chat_does() {
-        let mut reply = SelectionState::new();
-        reply.set_optional("tool_call_example", OptionalState::Present);
-        let demo = |sel: SelectionState| sel.get("tool_call_example").map(str::to_string);
+    fn a_turn_is_marked_a_tool_round_as_the_chat_marks_it() {
+        let reply = SelectionState::new();
         let round = "<tool_response>x</tool_response>\n";
         assert_eq!(
-            demo(turn_selection(&reply, round, Demonstration::FirstStepOnly)),
-            Some("absent".to_string())
+            turn_selection(&reply, round).optional(TOOL_ROUND_SELECTOR),
+            Some(OptionalState::Present)
         );
         assert_eq!(
-            demo(turn_selection(&reply, round, Demonstration::EveryTurn)),
-            Some("present".to_string())
-        );
-        assert_eq!(
-            demo(turn_selection(
-                &reply,
-                "Read the paper",
-                Demonstration::FirstStepOnly
-            )),
-            Some("present".to_string())
+            turn_selection(&reply, "Read the paper").optional(TOOL_ROUND_SELECTOR),
+            None
         );
     }
 }

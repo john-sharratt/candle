@@ -36,19 +36,11 @@ use crate::types::{
 /// the tools dial so a no-tools turn omits the block entirely.
 const TOOLS_ENABLED_SELECTOR: &str = "tools_enabled";
 
-/// The `optional` node holding the tool-call FORMAT demonstration (its `id:` in
-/// `projection.yaml`). Tracks the tools dial: a no-tools turn must not be shown
-/// a worked tool call, which would contradict a prompt that lists no tools.
-pub(crate) const TOOL_EXAMPLE_SELECTOR: &str = "tool_call_example";
-
-/// Map the composer's tools dial onto the tool block: the whole block
-/// (`tools_enabled`) and its worked demonstration (`tool_call_example`) are
-/// present together or absent together.
+/// Map the composer's tools dial onto the tool block (`tools_enabled`): present
+/// for every mode that offers tools, absent for `None`.
 ///
 /// Public so a harness driving the session directly projects the same tool
-/// prompt the HTTP API does. The schema defaults the demonstration ABSENT —
-/// the ingest layers cannot select it away — so a caller that skips this shows
-/// the model a tool catalog with no worked call, which no chat turn ever sees.
+/// prompt the HTTP API does.
 pub fn apply_tools_dial(selection: &mut SelectionState, tools_mode: ToolMode) {
     let tools_present = if matches!(tools_mode, ToolMode::None) {
         OptionalState::Absent
@@ -56,33 +48,20 @@ pub fn apply_tools_dial(selection: &mut SelectionState, tools_mode: ToolMode) {
         OptionalState::Present
     };
     selection.set_optional(TOOLS_ENABLED_SELECTOR, tools_present);
-    // The worked example follows the block it demonstrates.
-    selection.set_optional(TOOL_EXAMPLE_SELECTOR, tools_present);
 }
 
 /// The selection for a tool round — a turn whose user message is the results
-/// of the calls the turn before it made: the reply's own selection, less the
-/// worked demonstration, and marked as a tool round
-/// ([`TOOL_ROUND_SELECTOR`]) so the layers that declare `in_tool_rounds: false`
-/// sit it out.
+/// of the calls the turn before it made: the reply's own selection, marked as
+/// a tool round ([`TOOL_ROUND_SELECTOR`]) so the layers that declare
+/// `in_tool_rounds: false` sit it out.
 ///
-/// The demonstration is there to teach the call's shape, and by a tool round
-/// the model has already made its call. What it does instead there is supply a
-/// question: the round's last user turn is a tool response, so the model looks
-/// back for the question it is answering, and the demonstration's ("what is the
-/// IP address of example.com") sits at the end of the system prompt, the
-/// nearest one to find. A chat that had asked for a paper to be read answered
-/// the demonstration instead, four rounds in, with the request still in its
-/// context. The code_reading ingest had failed the same way and leaves the
-/// demonstration out for the same reason (see `projection.yaml`).
-///
-/// The repo_map layer's turns supplied the same competing question: each is a
-/// request — "Summarize the root folder of this project in one or two complete
-/// sentences" — and a chat that had fetched a crate's docs to list its modules
-/// described the workspace instead, two runs of two.
+/// The repo_map layer's turns are why it does: each is a request — "Summarize
+/// the root folder of this project in one or two complete sentences" — and a
+/// round's last user turn is a tool response, so the model looks back for the
+/// question it is answering. A chat that had fetched a crate's docs to list
+/// its modules described the workspace instead, two runs of two.
 pub fn tool_round_selection(selection: &SelectionState) -> SelectionState {
     let mut round = selection.clone();
-    round.set_optional(TOOL_EXAMPLE_SELECTOR, OptionalState::Absent);
     round.set_optional(TOOL_ROUND_SELECTOR, OptionalState::Present);
     round
 }
@@ -721,12 +700,10 @@ mod dial_tests {
         assert_eq!(sel.get("response_length"), Some("standard"));
     }
 
-    /// The tools dial moves the tool block and its worked call together: every
-    /// mode that shows tools shows the demonstration too, and `None` hides both.
-    /// The schema defaults the demonstration absent, so a caller that skipped
-    /// this would show a catalog with no worked call.
+    /// The tools dial shows the tool block for every mode that offers tools,
+    /// and `None` hides it.
     #[test]
-    fn tools_dial_moves_the_block_and_its_demonstration_together() {
+    fn tools_dial_shows_the_block_for_every_mode_that_offers_tools() {
         for (mode, want) in [
             (ToolMode::Comprehensive, OptionalState::Present),
             (ToolMode::Restricted, OptionalState::Present),
@@ -735,22 +712,17 @@ mod dial_tests {
             let mut sel = SelectionState::new();
             apply_tools_dial(&mut sel, mode);
             assert_eq!(sel.optional(TOOLS_ENABLED_SELECTOR), Some(want), "{mode:?}");
-            assert_eq!(sel.optional(TOOL_EXAMPLE_SELECTOR), Some(want), "{mode:?}");
         }
     }
 
     /// A tool round keeps everything the reply selected — the dials and the
-    /// tool block — except the worked demonstration, and leaves the reply's own
+    /// tool block — marks itself a tool round, and leaves the reply's own
     /// selection as it was for the next user turn.
     #[test]
-    fn a_tool_round_drops_the_demonstration_and_keeps_the_rest() {
+    fn a_tool_round_is_marked_and_keeps_the_rest() {
         let mut reply = dial_selection(Some(2), Some(3), None);
         apply_tools_dial(&mut reply, ToolMode::Comprehensive);
         let round = tool_round_selection(&reply);
-        assert_eq!(
-            round.optional(TOOL_EXAMPLE_SELECTOR),
-            Some(OptionalState::Absent)
-        );
         assert_eq!(
             round.optional(TOOLS_ENABLED_SELECTOR),
             Some(OptionalState::Present)
@@ -763,10 +735,6 @@ mod dial_tests {
         assert_eq!(reply.optional(TOOL_ROUND_SELECTOR), None);
         assert_eq!(round.get("thinking_effort"), Some("balanced"));
         assert_eq!(round.get("response_length"), Some("detailed"));
-        assert_eq!(
-            reply.optional(TOOL_EXAMPLE_SELECTOR),
-            Some(OptionalState::Present)
-        );
     }
 
     #[test]

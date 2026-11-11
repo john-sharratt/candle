@@ -1,37 +1,32 @@
-//! The journal's opening: what a dialogue had read before its session began,
-//! then that the user asked their opening question.
+//! The journal's opening: two entries a dialogue's journal begins with — what
+//! it had read before its session began, then that the user asked their
+//! opening question.
 //!
 //! A dialogue descends from the priming chain — every repository's root
 //! listing and its anchor documents — and from the working set's files, and
 //! all of it stands ahead of the user's first message as the dialogue's own
-//! reading. Its own entries say nothing of that, so a dialogue asked what it
-//! had read went and read it again. The opening says it plainly, in the
-//! journal the dialogue already answers "what have I done" from, and its first
-//! line is built from the chain the member last primed: a repository or
-//! anchor added or gone changes the text, and a carried section whose text
-//! changed is sealed again.
+//! reading. Its drafted entries say nothing of that, so a dialogue asked what
+//! it had read went and read it again. The opening says it plainly, as
+//! ordinary entries written when the conversation opens: the prompt, the
+//! journal tools and the journal's view read them as they read any other. The
+//! first is built from the chain the member last primed.
 //!
-//! Neither line is numbered. An entry's number is what `journal_read` opens,
-//! and these two have no turns behind them to open.
+//! Neither has turns behind it: they are about what happened before the
+//! conversation's first turn.
 
 use std::time::Duration;
 
-use journal_core::section::Section;
+use journal_core::entry::Entry;
+use journal_core::period::Period;
 
-/// How long a round that would go without the opening waits for it to seal.
-/// It is two short lines, so a seal past this is a GPU queue the round should
-/// not stand behind: it answers without the opening, and the next round has it.
+/// How long the round that wrote the opening waits for it to seal. It is two
+/// short lines, so a seal past this is a GPU queue the round should not stand
+/// behind: it answers without the opening, and the next round has it.
 pub const OPENING_SEAL_WAIT: Duration = Duration::from_secs(2);
 
-/// The section the chain's reading is carried under.
-pub const SEED_SECTION: &str = "journal/seed";
-
-/// The section the rest of the opening is carried under.
-pub const READING_SECTION: &str = "journal/reading";
-
-/// The opening's second line.
-pub const READING: &str = "Then — I read other files that seemed relevant to the work here, \
-and the user asked their opening question of this session, which I must answer.";
+/// The opening's second entry.
+pub const READING: &str = "Then read other files that seemed relevant to the work here, and \
+the user asked their opening question of this session, which I must answer.";
 
 /// What the priming chain read, in chain order: each repository whose root
 /// listing it read, and each anchor document, as `{repo}/{path}`.
@@ -42,7 +37,7 @@ pub struct SeedRead {
 }
 
 impl SeedRead {
-    /// The opening's first line, or `None` when the chain read nothing.
+    /// The opening's first entry's line, or `None` when the chain read nothing.
     pub fn line(&self) -> Option<String> {
         let mut read: Vec<String> = Vec::new();
         if !self.listings.is_empty() {
@@ -58,28 +53,40 @@ impl SeedRead {
         }
         (!read.is_empty()).then(|| {
             format!(
-                "Before this session — I read the workspace: {}.",
+                "Before this session began, read the workspace: {}.",
                 read.join("; ")
             )
         })
     }
 
-    /// The opening's sections, in order: both lines, or none when the chain
-    /// read nothing.
-    pub fn sections(&self) -> Vec<Section> {
+    /// The opening as entries written at `now_ms`, in order — both, or none
+    /// when the chain read nothing. Their ids are the journal's to give.
+    pub fn entries(&self, now_ms: u64) -> Vec<Entry> {
         let Some(line) = self.line() else {
             return Vec::new();
         };
-        vec![
-            Section {
-                name: SEED_SECTION.to_string(),
-                text: line,
-            },
-            Section {
-                name: READING_SECTION.to_string(),
-                text: READING.to_string(),
-            },
-        ]
+        [line, READING.to_string()]
+            .into_iter()
+            .map(|summary| opening_entry(summary, now_ms))
+            .collect()
+    }
+}
+
+/// An entry of the opening: a step at `now_ms` over no turns.
+fn opening_entry(summary: String, now_ms: u64) -> Entry {
+    Entry {
+        id: 0,
+        from_turn: 0,
+        to_turn: 0,
+        from_ms: now_ms,
+        to_ms: now_ms,
+        summary,
+        claims: Vec::new(),
+        intend: Vec::new(),
+        opened: Vec::new(),
+        resolved: Vec::new(),
+        period: Period::Step,
+        digest: String::new(),
     }
 }
 
@@ -101,17 +108,17 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    /// **The first line names what the chain read** — the listings, then the
+    /// **The first entry names what the chain read** — the listings, then the
     /// documents, in chain order, by the paths the file tools take.
     #[test]
-    fn the_first_line_names_every_listing_and_document_the_chain_read() {
+    fn the_first_entry_names_every_listing_and_document_the_chain_read() {
         let read = SeedRead {
             listings: strings(&["candle", "battle-cities", "yenbot"]),
             documents: strings(&["candle/README.md", "candle/AGENTS.md", "yenbot/README.md"]),
         };
         assert_eq!(
             read.line().unwrap(),
-            "Before this session — I read the workspace: the root listings of `candle`, \
+            "Before this session began, read the workspace: the root listings of `candle`, \
              `battle-cities` and `yenbot`; `candle/README.md`, `candle/AGENTS.md` and \
              `yenbot/README.md`."
         );
@@ -125,7 +132,7 @@ mod tests {
         };
         assert_eq!(
             read.line().unwrap(),
-            "Before this session — I read the workspace: the root listing of `candle`; \
+            "Before this session began, read the workspace: the root listing of `candle`; \
              `candle/README.md`."
         );
         let listings_only = SeedRead {
@@ -134,24 +141,32 @@ mod tests {
         };
         assert_eq!(
             listings_only.line().unwrap(),
-            "Before this session — I read the workspace: the root listing of `candle`."
+            "Before this session began, read the workspace: the root listing of `candle`."
         );
     }
 
-    /// **Both lines, in order, or none.** A chain that read nothing has no
-    /// opening: there is nothing the dialogue read before it began.
+    /// **Both entries, in order, or none** — steps written at the moment the
+    /// conversation opened, over no turns.
     #[test]
-    fn the_opening_is_both_lines_or_none() {
-        assert!(SeedRead::default().sections().is_empty());
+    fn the_opening_is_both_entries_or_none() {
+        assert!(SeedRead::default().entries(5).is_empty());
         let read = SeedRead {
             listings: strings(&["candle"]),
             documents: Vec::new(),
         };
-        let sections = read.sections();
+        let entries = read.entries(1_700_000_000_000);
         assert_eq!(
-            sections.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            [SEED_SECTION, READING_SECTION]
+            entries
+                .iter()
+                .map(|e| e.summary.as_str())
+                .collect::<Vec<_>>(),
+            [read.line().unwrap().as_str(), READING]
         );
-        assert_eq!(sections[1].text, READING);
+        for e in &entries {
+            assert_eq!((e.from_turn, e.to_turn), (0, 0));
+            assert_eq!((e.from_ms, e.to_ms), (1_700_000_000_000, 1_700_000_000_000));
+            assert_eq!(e.period, Period::Step);
+            assert!(e.claims.is_empty());
+        }
     }
 }

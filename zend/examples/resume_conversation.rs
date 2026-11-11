@@ -19,7 +19,7 @@
 //! cargo run -p zend --release --example resume_conversation -- \
 //!   --workspace D:\prog\candle --conv cc89befa-04d9-4c32-9e03-1076e691d754 \
 //!   --resume 14 --max-tokens 400 --seeds 1,2,3 --argmax \
-//!   --demonstration every-turn --fail-if "example\.com"
+//!   --fail-if "example\.com"
 //! ```
 
 use std::path::PathBuf;
@@ -33,9 +33,7 @@ use regex::Regex;
 use tracing_subscriber::EnvFilter;
 use zend::api::chat::{apply_tools_dial, dial_selection};
 use zend::config::DaemonConfig;
-use zend::session::{
-    Demonstration, ReplayOutcome, ReplaySampling, ReplaySpec, TurnComparison, ZendSession,
-};
+use zend::session::{ReplayOutcome, ReplaySampling, ReplaySpec, TurnComparison, ZendSession};
 use zend::types::ToolMode;
 
 #[derive(Parser)]
@@ -69,11 +67,6 @@ struct Args {
     /// The tools dial.
     #[arg(long, value_enum, default_value_t = Tools::Comprehensive)]
     tools: Tools,
-    /// Where the tool-call demonstration is projected: `first-step` is the
-    /// chat as it runs now; `every-turn` is how conversations recorded before
-    /// tool rounds dropped it ran.
-    #[arg(long, value_enum, default_value_t = DemonstrationArg::FirstStep)]
-    demonstration: DemonstrationArg,
     /// Layers out of service, as the daemon's `--disable-layer`.
     #[arg(long = "disable-layer", default_value = "code_reading")]
     disable_layer: Vec<String>,
@@ -92,12 +85,6 @@ enum Tools {
     None,
     Restricted,
     Comprehensive,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum DemonstrationArg {
-    EveryTurn,
-    FirstStep,
 }
 
 fn label(sampling: ReplaySampling) -> String {
@@ -216,11 +203,6 @@ async fn main() -> anyhow::Result<()> {
         Tools::Restricted => ToolMode::Restricted,
         Tools::Comprehensive => ToolMode::Comprehensive,
     };
-    let demonstration = match args.demonstration {
-        DemonstrationArg::EveryTurn => Demonstration::EveryTurn,
-        DemonstrationArg::FirstStep => Demonstration::FirstStepOnly,
-    };
-
     let config = DaemonConfig {
         disabled_layers: args.disable_layer.iter().cloned().collect(),
         read_only_substrate: true,
@@ -272,7 +254,6 @@ async fn main() -> anyhow::Result<()> {
         max_tokens: args.max_tokens,
         selection,
         tools_mode,
-        demonstration,
         runs,
     };
 

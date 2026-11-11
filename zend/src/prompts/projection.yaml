@@ -192,10 +192,12 @@ system_prompt:
                 also take `*` to cover every repository — name one repository whenever you know
                 which one holds what you are looking for.
 
-                Gather the context a task needs before you act: read the relevant files, and follow
-                the conventions, frameworks, and libraries the codebase already uses. If you need
-                more information, look it up rather than assuming. If the question is about a
-                specific document or file, read it before giving your view of it. Change what you were asked to change
+                Gather the context a task needs before you act — from the files already read in this
+                conversation, and from any others it needs — and follow the conventions, frameworks,
+                and libraries the codebase already uses. If you need more information, look it up
+                rather than assuming. If the question is about a specific document or file, base
+                your view of it on what it says: its reading in this conversation, or a read of it
+                now when it has none. Change what you were asked to change
                 and the places that restate it; propose anything beyond that rather than doing it,
                 and never add instructions to an agent's instruction file (AGENTS.md)
                 unless asked.
@@ -475,7 +477,8 @@ system_prompt:
       id: grounding
       depends_on_configured: tools
       content: |+
-        Answer from what is actually in this conversation. Your tools run for real in the
+        Answer from what is actually in this conversation, the reading done before this
+        session began included. Your tools run for real in the
         user's workspace: when you need something that has not appeared yet — a file's
         contents, a search, the time — call the tool that gets it, and its result arrives
         as the next message. Anything that changes over time — the latest version or
@@ -503,8 +506,42 @@ system_prompt:
       id: grounding_no_tools
       depends_on_unconfigured: tools
       content: |+
-        Answer from what is actually in this conversation. If you need something that has
-        not appeared yet, say so. Never make up a value, a file's contents, or a result.
+        Answer from what is actually in this conversation, the reading done before this
+        session began included. If you need something that has not appeared yet, say so.
+        Never make up a value, a file's contents, or a result.
+
+    # ── WHAT THIS SESSION HAS WRITTEN DOWN (per conversation · daemon-filled) ──
+    # The dialogue's working journal (`docs/zend_journal.md`): one section per
+    # kept entry, its newest five, and one for what is still open — for a
+    # dialogue that descends from the priming chain, opening on two entries
+    # kept as it starts: what the chain read, then that the user asked their
+    # opening question (`journal::opening`). zend submits them to the
+    # conversation's own timeline, so they are sealed, persisted and
+    # tombstoned with it and no other conversation sees them. The collection
+    # selects by name (`journal::carry::install`): a conversation that has
+    # kept no entry pins nothing, so neither this intro nor the collection
+    # emits, and every other layer's prompt reads as if the journal were not
+    # declared.
+    #
+    # Straight after the grounding and ahead of the tool block: "answer from
+    # what is in this conversation" is followed at once by what this
+    # conversation has read and done, and only then by what can be called.
+    - kind: section
+      id: journal_intro
+      depends_on: journal
+      content: |+
+        # Your journal
+
+        This is your journal for this conversation: entries you wrote yourself about earlier stretches of it, kept here so you do not lose them as the conversation grows. It is not the notes tool — the notes tools hold something else, and you never need a tool to read your journal: it is right here. When you are asked what you have written down, what your journal says, or what happened earlier in this conversation, answer from these entries.
+
+        Each entry is one line: its number and the task or step that stretch of the conversation was. The day and hour stand above the entries where they changed. "Still open:" is what you have left unfinished, and the journal ends where it says so.
+
+        Behind each entry are the turns it was written from, whole. When a line is not enough — the exact words, a file's contents, an error from back then — read them with journal_read, giving journal "self" and the entry's number, or find which entry holds something with journal_grep.
+
+    - kind: collection
+      name: journal
+      selection: { kind: always_visible }
+      sections: []
 
     - kind: section
       id: tools_overview
@@ -538,8 +575,8 @@ system_prompt:
         # Tools
 
         You may call one or more functions to assist with the user query. A request for
-        something a tool provides — a file, a search, the time, a calculation — is answered
-        by calling that tool, not from memory.
+        something a tool provides — a file not yet read in this conversation, a search, the
+        time, a calculation — is answered by calling that tool.
 
         For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags, one block per call:
         <tool_call>
@@ -663,125 +700,16 @@ system_prompt:
       dialect: tool_block_close
       depends_on: tools
 
-    # ── WHAT THIS SESSION HAS WRITTEN DOWN (per conversation · daemon-filled) ──
-    # The dialogue's working journal (`docs/zend_journal.md`): for a dialogue
-    # that descends from the priming chain, its opening — what the chain read,
-    # then that the user asked their opening question (`journal::opening`) —
-    # then one section per kept entry, its newest five, and one for what is
-    # still open. zend submits them to the conversation's own timeline, so
-    # they are sealed, persisted and tombstoned with it and no other
-    # conversation sees them. The collection selects by name
-    # (`journal::carry::install`): a conversation with neither an opening nor
-    # an entry pins nothing, so neither this intro nor the collection emits,
-    # and every other layer's prompt reads as if the journal were not declared.
-    #
-    # Last before the close, so a new entry changes nothing above it.
-    - kind: section
-      id: journal_intro
-      depends_on: journal
-      content: |+
-        # Your journal
-
-        This is your journal for this conversation: entries you wrote yourself about earlier stretches of it, kept here so you do not lose them as the conversation grows. It is not the notes tool — the notes tools hold something else, and you never need a tool to read your journal: it is right here. When you are asked what you have written down, what your journal says, or what happened earlier in this conversation, answer from these entries.
-
-        It opens with what you read before this session began. Each entry after that is one line: its number and the task or step that stretch of the conversation was. The day and hour stand above the entries where they changed. "Still open:" is what you have left unfinished, and the journal ends where it says so.
-
-        Behind each entry are the turns it was written from, whole. When a line is not enough — the exact words, a file's contents, an error from back then — read them with journal_read, giving journal "self" and the entry's number, or find which entry holds something with journal_grep.
-
-    - kind: collection
-      name: journal
-      selection: { kind: always_visible }
-      sections: []
-
     - kind: template
       id: system_close
       dialect: system_end
 
-    # Tool-call FORMAT demonstration for the live dialogue.
-    #
-    # `tools_overview` already states the format in prose and shows the tags
-    # inline, and Qwen3.6-35B-A3B does not follow it: asked "what is the time"
-    # with `datetime` projected and selected, it reasons — correctly, and often
-    # in its own words — that it must call the tool and must not invent a
-    # result, and then emits a fabricated timestamp instead of a call. Told
-    # outright to "emit the tool call", it produces bare `{"tool": "datetime",
-    # …}`: no tags, and the wrong key. Measured 0/6 tool calls across the
-    # battery, at every effort dial including `/no_think`.
-    #
-    # ONE demonstrated exchange fixes it, and the fix generalizes across tools:
-    # shown only a `dns_lookup` example, the same question produced
-    # `<tool_call>{"name": "datetime", …}</tool_call>`, the runner dispatched it,
-    # and the reply carried the real clock time. So what the model is missing is
-    # the SHAPE, not the instruction and not the tool — a demonstration teaches
-    # it where prose does not.
-    #
-    # `dns_lookup` is deliberately unlike the things tools are usually asked for
-    # here (times, arithmetic, files): an example teaches the SUBJECT as much as
-    # the format, so the demonstrated tool is one no ordinary request should be
-    # drawn toward. The `absent` option exists for
-    # a tool-free projection, where demonstrating a call would contradict a
-    # prompt that lists no tools.
-    #
-    # The code_reading / repo_map ingest selects `absent` too. Its chain prefills
-    # its own calls, and its closing decode — whose last user turn is a tool
-    # response — looks back for the question it is answering: with this
-    # demonstration in the prompt it answered "I cannot provide the IP address
-    # for example.com…" instead of summarizing the file.
-    - kind: section_tree
-      nodes:
-        # DEFAULT ABSENT, and the default is what matters here. Priming injects
-        # each tree's default branch (`SectionTree::default_present_ids`), and an
-        # append-only ingest never re-projects — so whatever this default is, the
-        # code_reading / repo_map / raw layers are sealed behind it and no
-        # selection can change that. With the demonstration on by default their
-        # closing decode, whose last user turn is a tool response, looked back for
-        # the question it was answering and answered the demonstrated one instead
-        # ("I cannot provide the IP address for example.com…"), which then seals as
-        # that file's summary. Every caller that DOES re-project and wants the
-        # demonstration selects it: the chat per turn with its tools dial
-        # (`api/chat.rs`), calibration alongside its tool pin (`session.rs`).
-        # The chat's TOOL ROUNDS drop it again (`tool_round_selection`): their
-        # last user turn is a tool response too, and a chat four rounds into
-        # reading a paper answered "the IP of example.com" the same way. The
-        # model has made its call by then; the demonstration has nothing left
-        # to teach it.
-        - kind: optional
-          id: tool_call_example
-          default: absent
-          # The demonstration STOPS at the call, and carries no `<tool_response>`
-          # and no prose answer. That is the whole difference between working and
-          # not: the model copies the last assistant turn it was shown. Given the
-          # full round-trip (call → response → "example.com resolves to …"), the
-          # last assistant behaviour on display is ANSWERING, and the model duly
-          # answered — from memory, with a fabricated clock time, in the same run
-          # where this section was verifiably in its prompt. Given the identical
-          # exchange truncated at the call, the same daemon and same question
-          # produced `<tool_call>{"name": "datetime", …}</tool_call>`, dispatched
-          # it, and reported the real time. Teaching the round-trip teaches the
-          # wrong half of it.
-          #
-          # The request is a SYSTEM turn, and the demonstration holds no user turn
-          # at all. This block is emitted after `system_close`, so a
-          # `<|im_start|>user` here is a real user turn in the token stream and
-          # sits exactly where the conversation's own first exchange would: a chat
-          # asked "what was the very first question I asked?" three turns in quoted
-          # "what is the IP address of example.com" and offered to re-run the
-          # lookup. Labelling the content did NOT fix it — the same question quoted
-          # the example again with the label verifiably in the prompt — because
-          # what the model reads as the first question is the turn structure, not a
-          # parenthetical inside it. Prose does not work either (see above), so the
-          # exchange has to stay an exchange; what it does not have to be is the
-          # USER's. The load-bearing half is untouched: the last assistant turn on
-          # display is still a bare call, which is what the model copies.
-          content: |+
-            <|im_start|>system
-            Tool-call format example, not part of this conversation. Asked "what is
-            the IP address of example.com", you reply with exactly this and nothing
-            else:<|im_end|>
-            <|im_start|>assistant
-            <tool_call>
-            {"name": "dns_lookup", "arguments": {"host": "example.com"}}
-            </tool_call><|im_end|>
+    # No worked tool call follows the system prompt. The call's shape is held by
+    # the constrained-decode stencil (`compile_tool_stencil`): once a turn opens
+    # `<tool_call>`, the grammar admits only an offered tool's exact JSON, so
+    # there is no shape left for an example to teach — and an example is an
+    # exchange the model reads as its own, which made a chat quote it as the
+    # conversation's first question.
 
 
 layers:

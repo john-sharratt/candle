@@ -3398,8 +3398,7 @@ impl Sequence {
         // (the schema's sections at each tree's default branch) and
         // `skip_projection` means no turn ever rebuilds it. The ingest's prompt is
         // therefore the same shared prompt KV a chat conversation uses, and the
-        // schema's defaults are where its content is decided — see the
-        // `tool_call_example` note in `projection.yaml`.
+        // schema's defaults are where its content is decided.
         //
         // The tool pin below stays because it is not ingest-only: any caller that
         // DOES re-project needs a coherent tool context, since the chain PREFILLS

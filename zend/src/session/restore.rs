@@ -24,7 +24,7 @@ use candle_conversation::SelectionState;
 use serde::Serialize;
 
 use super::diag::HistoryDiffers;
-use super::replay::{compare_turns, replay_history, Demonstration};
+use super::replay::{compare_turns, replay_history};
 use super::{timeline_for, turn_projection, ZendSession};
 use crate::types::ToolMode;
 
@@ -122,7 +122,6 @@ impl ZendSession {
             &recorded,
             &spec.selection,
             spec.tools_mode,
-            Demonstration::FirstStepOnly,
             &mut |_, _| {},
             // The points its decode streamed and the one at its seal, as the
             // chat persists a turn's.

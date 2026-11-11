@@ -152,35 +152,34 @@ before `system_close`:
 
 `journal::carry::install` scopes the collection to the members a conversation
 names (`SelectionRule::Named`). It has no member of its own: the sections are
-the conversation's — its opening, one per entry the journal holds
-(`journal/<id>`), plus `journal/open` — submitted to its own timeline.
+the conversation's — one per entry the journal holds (`journal/<id>`), plus
+`journal/open` — submitted to its own timeline.
 
 - **The journal opens with what was read before the session began.** A
   dialogue descends from the priming chain and holds its working set's files
   ahead of the user's first message, all of it as its own reading, and its
-  entries say nothing of that: asked what it had read, a dialogue read the
-  seed's files again. So a conversation that descends from the chain
-  (`forked_from` is the seed alias) carries two unnumbered lines first
-  (`journal::opening`):
-  - `journal/seed` — `Before this session — I read the workspace: the root
+  drafted entries say nothing of that: asked what it had read, a dialogue read
+  the seed's files again. So when a conversation that descends from the chain
+  (`forked_from` is the seed alias) first carries its journal and the journal
+  has never kept an entry, two ordinary entries are kept and recorded before
+  anything else (`journal::opening`, `open_journal`):
+  - `Entry 1 — Before this session began, read the workspace: the root
     listings of …; <repo>/README.md, …`, built from the links the member's
-    last prime chained (`BranchIngest::seed_read`). A repository or anchor
-    added or gone changes the text, and a carried section whose text changed is
-    sealed again; the chain re-primes on any link's content key moving
-    (`chain_moved`), which is what rebuilds it.
-  - `journal/reading` — `Then — I read other files that seemed relevant to the
-    work here, and the user asked their opening question of this session,
-    which I must answer.`
+    last prime chained (`BranchIngest::seed_read`).
+  - `Entry 2 — Then read other files that seemed relevant to the work here,
+    and the user asked their opening question of this session, which I must
+    answer.`
 
-  Neither is numbered, because an entry's number is what `journal_read` opens
-  and these have no turns behind them. A journal with an opening and no entry
-  yet still closes on `journal/open` (`Still open: nothing.` and the end line),
-  so the intro emits from the first round. The opening is what that round
-  answers its opening question from, so a round whose opening has not sealed
-  waits for it briefly (`OPENING_SEAL_WAIT`, 2 s) — past that it answers
-  without it, and the next round has it.
+  They are steps dated when the conversation opened and cover no turns, so
+  the prompt, the journal's tools and the journal's view read them as they
+  read any entry, and a fold takes them with the rest of their day. A
+  forgotten opening is not written again: the opening is written only into a
+  journal that has kept nothing. The round that writes it is the one that
+  answers the opening question, so it waits for the two to seal briefly
+  (`OPENING_SEAL_WAIT`, 2 s) — past that it answers without them, and the
+  next round has them.
 - **A round pins exactly the sections that have sealed.** A conversation with
-  neither an opening nor an entry, or whose sections are all still sealing,
+  no entry, or whose sections are all still sealing,
   pins none, so neither the collection nor its intro emits, and every other
   layer's prompt reads exactly as if no journal were declared. There is no
   `journal_none` and no placeholder: the prompt never shows a journal heading
@@ -598,7 +597,7 @@ them.
 | `zend/src/journal/desk.rs` | `ZendDesk`: the draft's question on a focused fork at `Normal`, the record write |
 | `zend/src/journal/draft.rs` | one draft and its record |
 | `zend/src/journal/carry.rs` | the schema install, the wanted sections, the round's selection |
-| `zend/src/journal/opening.rs` | `SeedRead` and the journal's opening: what was read before the session began |
+| `zend/src/journal/opening.rs` | `SeedRead` and the two entries a dialogue's journal opens with: what was read before the session began |
 | `zend/src/journal/record.rs` | the metadata record |
 | `zend/src/journal/text.rs` | `JournalText`: the turns behind each entry as custom objects |
 | `zend/src/journal/shelf.rs` | the tools' `JournalShelf`: a dialogue's own journal and those above it, each a `JournalBook` |

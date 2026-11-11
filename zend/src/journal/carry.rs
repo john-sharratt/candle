@@ -16,8 +16,8 @@
 //! still in the conversation.
 
 use candle_conversation::projection::{Builder, SelectionRule};
-use candle_conversation::{SelectionState, Want};
-use journal_core::section::{JournalPrompt, JOURNAL};
+use candle_conversation::SelectionState;
+use journal_core::section::JOURNAL;
 
 /// Scope the schema's `journal` collection to the members a conversation
 /// names. `false` when the schema declares no journal: the dialogue then
@@ -37,18 +37,6 @@ pub fn install(builder: &mut Builder) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// The sections `prompt` should be carried as.
-pub fn wants(prompt: &JournalPrompt) -> Vec<Want<'_>> {
-    prompt
-        .sections
-        .iter()
-        .map(|s| Want {
-            name: &s.name,
-            text: &s.text,
-        })
-        .collect()
-}
-
 /// Pin the journal sections that have `sealed` for a round to read.
 pub fn select(selection: &mut SelectionState, sealed: &[String]) {
     selection.select_all(JOURNAL, sealed.iter().map(String::as_str));
@@ -58,11 +46,9 @@ pub fn select(selection: &mut SelectionState, sealed: &[String]) {
 mod tests {
     use candle_conversation::models::Dialect;
     use candle_conversation::projection::SystemPromptItem;
-    use journal_core::entry::Item;
-    use journal_core::section::{render_open, Kept, OPEN_SECTION};
+    use journal_core::section::OPEN_SECTION;
 
     use super::*;
-    use crate::journal::style::CODING;
     use crate::session::PROJECTION_SCHEMA_TEMPLATE;
 
     fn schema() -> Builder {
@@ -117,27 +103,5 @@ mod tests {
         assert_eq!(sel.members(JOURNAL), ["journal/3", "journal/open"]);
         select(&mut sel, &[]);
         assert!(sel.members(JOURNAL).is_empty(), "replaced, not added to");
-    }
-
-    #[test]
-    fn the_wanted_sections_are_the_prompts_in_order() {
-        let mut kept = Kept {
-            entries: vec![],
-            open: vec![],
-            next_item: 1,
-            covered_to: 0,
-            removed: vec![],
-        };
-        assert!(wants(&JournalPrompt::of(&kept, &CODING)).is_empty());
-        kept.open = vec![Item {
-            id: 1,
-            text: "rerun".into(),
-        }];
-        let prompt = JournalPrompt::of(&kept, &CODING);
-        let w = wants(&prompt);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].name, OPEN_SECTION);
-        assert_eq!(w[0].text, render_open(&kept.open, &CODING));
-        assert!(w[0].text.starts_with("Still open:\n#1 rerun\n\n"));
     }
 }

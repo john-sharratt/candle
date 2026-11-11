@@ -1538,15 +1538,9 @@ mod tests {
 
     /// The prompt every ingest layer frames on is the SHARED one at the schema's
     /// default branch — the same content priming injects as K/V, and the same
-    /// sections a chat conversation injects. Two things must hold: the dialogue
-    /// persona (an ingest turn is borrowed into dialogue projections and carries
-    /// the framing it was computed under), and NO tool-call demonstration (its
-    /// question sits in the prompt, and the closing decode — whose last user turn
-    /// is a tool response — answers that question instead of summarizing).
-    ///
-    /// The demonstration is asserted against the DEFAULT branch deliberately:
-    /// an append-only ingest cannot select anything, so the default is the only
-    /// thing that decides this.
+    /// sections a chat conversation injects. It must hold the dialogue persona
+    /// (an ingest turn is borrowed into dialogue projections and carries the
+    /// framing it was computed under), and no second persona or worked request.
     #[test]
     fn the_ingest_prompt_is_the_shared_prompt_at_its_default_branch() {
         let builder = bundled_builder();
@@ -1564,60 +1558,6 @@ mod tests {
         assert!(
             !prompt.contains("Summarize the `worker/scheduling/` folder"),
             "no worked summarize examples — they teach the dialogue to summarize too",
-        );
-        assert!(
-            !prompt.contains("what is the IP address of example.com"),
-            "no tool-call demonstration — the ingest decode answers its question \
-             instead of summarizing",
-        );
-    }
-
-    /// The tool-call demonstration is emitted after `system_close`, so anything
-    /// it frames as a user turn IS one — sitting where the conversation's own
-    /// first exchange would, which made a chat quote the demonstration when asked
-    /// for its own first question. It must carry NO user turn: the request is a
-    /// system turn, and the exchange still ends at the assistant's bare call,
-    /// which is the half the model copies.
-    #[test]
-    fn the_tool_call_demonstration_holds_no_user_turn() {
-        let builder = bundled_builder();
-        let demo = builder
-            .schema()
-            .system_prompt
-            .items
-            .iter()
-            .find_map(|item| match item {
-                projection::SystemPromptItem::SectionTree(tree) => tree
-                    .nodes
-                    .iter()
-                    .find(|node| node.name == "tool_call_example"),
-                _ => None,
-            })
-            .expect("projection.yaml declares tool_call_example");
-        let present = demo
-            .options
-            .iter()
-            .find(|option| option.id == "present")
-            .expect("tool_call_example has a present option");
-
-        assert!(
-            !present.content.contains("<|im_start|>user"),
-            "a user turn here is the conversation's own first exchange: {:?}",
-            present.content,
-        );
-        assert!(
-            present.content.starts_with("<|im_start|>system\n"),
-            "the request is a system turn: {:?}",
-            present.content,
-        );
-        assert!(
-            present
-                .content
-                .trim_end()
-                .ends_with("</tool_call><|im_end|>"),
-            "the exchange must stop at the call — teaching the round-trip teaches \
-             answering from memory: {:?}",
-            present.content,
         );
     }
 
