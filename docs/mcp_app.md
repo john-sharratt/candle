@@ -311,14 +311,19 @@ carrying.
 | `gateway` | The gateway entrance every backend is reached through (`http://127.0.0.1` on BlackWorld, `http://192.168.0.4` — BlackWorld's wired address — on WhiteWorld) |
 | `cluster` | The gateway it joins as `mcp`: `urls` (space-separated, best first), `name` (the certificate's), `group_key`, and `host`, its name on the status page |
 | `state` | The folder its node is kept in |
-| `served` | The file beside it every machine serves alike, `mcp/served.yaml` |
 
-`served.yaml` holds:
+What every machine serves alike is `mcp/served.yaml`, **built into the
+binary**, never read from the machine's working tree. A deploy ships a build
+and nothing else, so a file read at run time from the checkout keep starts
+the binary in lags the build: on 2026-11-11 the release that routed diary
+calls to `/v1/mcp/diaries` ran against a checkout whose `served.yaml` had no
+`diaries` path, and every diary call went to the round-robin memory path
+instead. It holds:
 
 | Key | Meaning |
 |---|---|
 | `server` | Its card: `name`, `title`, `description`, `instructions`, `icon` |
-| `backends` | The servers whose tools it serves, in list order: `{name, host, path}` each — the path is the app's own MCP route on that site. The name is what a failed listing tells the client — `coding` (zend) and `bot` (npcd), never the app's own name |
+| `backends` | The servers whose tools it serves, in list order: `{name, host, path, memory?, diaries?}` each — the path is the app's own MCP route on that site; `memory` the route only the members holding the journals declare; `diaries` the route sticky on a conversation's diary key (`docs/private_mode.md` §5.4). The name is what a failed listing tells the client — `coding` (zend) and `bot` (npcd), never the app's own name |
 
 | Module | What |
 |---|---|
@@ -328,7 +333,7 @@ carrying.
 | `believed` | Whose identity headers are kept: the socket's, and a listed gateway's |
 | `caller` | Who is calling, from the believed headers, and the token that names them |
 | `presence` | The cluster socket: joining as `mcp`, declaring `/mcp`, serving the gateway's streams |
-| `config` | Each machine's file, and the `served` file they share |
+| `config` | Each machine's file, and the `served` card and backends built in |
 | `guides` | The guide library: the embedded `.md` files, `guide_list` / `guide_read`, the "Guides:" lines |
 
 ## 6. Deployment

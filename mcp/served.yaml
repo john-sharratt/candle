@@ -1,6 +1,7 @@
 # What every machine's MCP aggregator serves alike (docs/mcp_app.md §5): its
-# card and the backends whose tools it lists. Each machine's own file
-# (`mcp.yaml`, `mcp.whiteworld.yaml`) names this one.
+# card and the backends whose tools it lists. Built into the binary
+# (`mcp/src/config.rs`): a deploy ships the build, never this file, so a change
+# here reaches a machine with its next release.
 
 # What a client shows. Plain, so the server is treated as the tool it is: the
 # name and the moon are branding from Battle Cities, whose lore lives on the

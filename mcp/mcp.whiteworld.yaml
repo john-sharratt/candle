@@ -28,5 +28,5 @@ cluster:
 # Where its node is kept.
 state: "mcp/state"
 
-# The card and backends every machine serves, beside this file.
-served: served.yaml
+# The card and backends every machine serves are `served.yaml`, built into
+# the binary.

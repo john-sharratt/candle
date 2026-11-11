@@ -1,7 +1,9 @@
 //! The aggregator's configuration (`docs/mcp_app.md` §5): one file per
 //! machine — `mcp/mcp.yaml` on BlackWorld, `mcp/mcp.whiteworld.yaml` on
-//! WhiteWorld — each naming the one `served` file every machine serves the
-//! same card and backends from.
+//! WhiteWorld — and the card and backends every machine serves alike,
+//! `mcp/served.yaml`, built into the binary. A deploy ships a build, never the
+//! working tree a machine runs it from, so what the build's code expects of
+//! its backends — a path it routes a tool to — must come with the build.
 
 use std::fs;
 use std::net::IpAddr;
@@ -40,9 +42,10 @@ struct Machine {
     gateway: String,
     cluster: ClusterJoin,
     state: PathBuf,
-    /// The card and backends, beside this file.
-    served: PathBuf,
 }
+
+/// The card and backends every machine serves, as built.
+const SERVED: &str = include_str!("../served.yaml");
 
 /// What every machine serves alike.
 #[derive(Debug, Deserialize)]
@@ -102,15 +105,13 @@ fn read<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
 }
 
 impl Config {
-    /// The machine's file at `path`, and the `served` file it names, read
-    /// from beside it.
+    /// The machine's file at `path`, with the card and backends built in.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let machine: Machine = read(path)?;
         if !machine.gateway.starts_with("http://") && !machine.gateway.starts_with("https://") {
             anyhow::bail!("`gateway` is an http(s) URL: {}", machine.gateway);
         }
-        let beside = path.parent().unwrap_or(Path::new(""));
-        let served: Served = read(&beside.join(&machine.served))?;
+        let served: Served = serde_yaml::from_str(SERVED).context("parsing mcp/served.yaml")?;
         if served.backends.is_empty() {
             anyhow::bail!("`backends` names no server to serve the tools of");
         }
@@ -216,17 +217,11 @@ mod tests {
     #[test]
     fn a_gateway_that_is_not_a_url_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("served.yaml"),
-            "server: {name: n, title: t, description: d, instructions: i}\n\
-             backends: [{name: b, host: h, path: /p}]\n",
-        )
-        .unwrap();
         let machine = |gateway: &str| {
             format!(
                 "bind: 127.0.0.1:1\ntrusted_gateways: []\ngateway: \"{gateway}\"\n\
                  cluster: {{urls: \"https://g:1\", name: g, group_key: k, host: h}}\n\
-                 state: s\nserved: served.yaml\n"
+                 state: s\n"
             )
         };
         let path = dir.path().join("m.yaml");
@@ -234,6 +229,29 @@ mod tests {
         let err = Config::load(&path).unwrap_err().to_string();
         assert_eq!(err, "`gateway` is an http(s) URL: 192.168.0.5");
         fs::write(&path, machine("http://g")).unwrap();
-        assert_eq!(Config::load(&path).unwrap().backends.len(), 1);
+        assert_eq!(Config::load(&path).unwrap().backends.len(), 3);
+    }
+
+    /// **The card and backends come with the build**: a machine's file
+    /// beside a stale `served.yaml` — or one still naming it — serves what
+    /// the build was made with, its diaries' path included.
+    #[test]
+    fn the_backends_are_the_builds_whatever_lies_beside() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("served.yaml"),
+            "server: {name: old, title: Old, description: d, instructions: i}\n\
+             backends: [{name: coding, host: code.tokera.com, path: /v1/mcp, memory: /v1/mcp/memory}]\n",
+        )
+        .unwrap();
+        let path = dir.path().join("m.yaml");
+        fs::write(
+            &path,
+            "bind: 127.0.0.1:1\ntrusted_gateways: []\ngateway: \"http://g\"\n\
+             cluster: {urls: \"https://g:1\", name: g, group_key: k, host: h}\n\
+             state: s\nserved: served.yaml\n",
+        )
+        .unwrap();
+        served_alike(&Config::load(&path).unwrap());
     }
 }
