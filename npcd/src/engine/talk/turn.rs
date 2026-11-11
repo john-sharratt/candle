@@ -230,22 +230,10 @@ impl Runtime {
             return Ok(inputs.last.unwrap_or(Ended::Quiet));
         }
 
-        // What was heard is the character's own experience — the turn's
-        // first write.
-        *wrote = true;
         let about = match &party {
             Party::Person(handle) => self.journals.person(&world, handle),
             Party::Npc(_) => self.journals.bot(&world, member),
         };
-        for l in &lines {
-            self.journals.note(
-                &world,
-                &body,
-                ExperienceKind::Heard,
-                &line::heard(&l.name, &line::on_thread(true, ""), &l.text),
-                about.clone(),
-            );
-        }
         let input = match lines.is_empty() {
             true => Input::Purpose,
             false => Input::Line,
@@ -315,6 +303,8 @@ impl Runtime {
             &said_by_them,
         );
         if let (Some(step), Party::Person(handle)) = (signed, &party) {
+            // Signing the step off writes the world.
+            *wrote = true;
             let op = WorldOp::Authorize {
                 npc,
                 step: step.clone(),
@@ -354,6 +344,23 @@ impl Runtime {
                 },
             )
             .await?;
+
+        // What was heard is the character's own experience, written once the
+        // turn has decided — the turn's first write but a sign-off's. Written
+        // before the decision, a turn the model could not run (no room on the
+        // card, a forward that failed) had already written and could not be
+        // tried again, and its lines were lost; the turn carries them in its
+        // body either way.
+        *wrote = true;
+        for l in &lines {
+            self.journals.note(
+                &world,
+                &body,
+                ExperienceKind::Heard,
+                &line::heard(&l.name, &line::on_thread(true, ""), &l.text),
+                about.clone(),
+            );
+        }
 
         // What it decided reaches the world as a conversation's acts, through
         // the world's authority wherever that runs (§7.1).
