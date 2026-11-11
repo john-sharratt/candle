@@ -25,6 +25,21 @@
 (function () {
   'use strict';
 
+  // **A 401 is the sign-in gone, not a failed call.** The session cookie
+  // expires while the page stays open; `/v1/status` is open to anyone, so the
+  // page still reads zend as ready, and every call that needs a session failed
+  // into an empty sidebar and a chat that would not start. Every request this
+  // adapter makes goes through this `fetch`, which tells the page once
+  // (`zend:signed-out`) so it can ask the reader to sign in again.
+  let signedOut = false;
+  const fetch = (...args) => window.fetch(...args).then((r) => {
+    if (r.status === 401 && !signedOut) {
+      signedOut = true;
+      window.dispatchEvent(new CustomEvent('zend:signed-out'));
+    }
+    return r;
+  });
+
   const ni = (name) => () => { throw new Error('ZendLiveAPI.' + name + ' not implemented yet (Phase 2)'); };
 
   async function getJSON(path) {

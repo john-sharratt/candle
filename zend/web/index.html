@@ -2460,6 +2460,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // A re-render rebuilds the dots, so drop any open hover popover — it would
     // otherwise dangle, anchored to a destroyed dot.
     hideProjPopover();
+    if (S.signedOut) {
+      promptEl = chatEl = logEl = filesListEl = null;
+      root.innerHTML = '';
+      root.appendChild(buildSignedOut());
+      return;
+    }
     if (S.unreachable) {
       promptEl = chatEl = logEl = filesListEl = null;
       root.innerHTML = '';
@@ -4530,6 +4536,28 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       h('div', { class: 'z-load-detail', 'data-unreachable': '' }, unreachableDetail(u)));
     return h('div', { style: 'position:fixed; inset:0; background:#1c1917; display:flex; align-items:center; justify-content:center; z-index:500;' }, card);
   }
+  // The session expired while the page was open (`zend:signed-out`, raised by
+  // the live adapter on a 401): every call that needs it fails, so the page
+  // says so and signs in again through the gateway, back to where it was,
+  // rather than showing an empty sidebar and a chat that will not start.
+  function buildSignedOut() {
+    const back = location.pathname + location.search + location.hash;
+    const card = h('div', { class: 'z-load-card', role: 'alert' },
+      h('div', { class: 'z-load-eyebrow' }, 'Signed out'),
+      h('div', { class: 'z-load-row' },
+        h('span', { class: 'z-load-cur' }, 'Your sign-in has expired.')),
+      h('div', { class: 'z-load-detail' },
+        'Zen needs you signed in to read and start conversations. Sign in again to carry on where you were.'),
+      h('a', {
+        href: '/auth/login?next=' + encodeURIComponent(back),
+        style: 'display:inline-block; margin-top:14px; padding:8px 16px; border-radius:8px; background:#d6a35c; color:#1c1917; font-weight:600; text-decoration:none;',
+      }, 'Sign in again'));
+    return h('div', { style: 'position:fixed; inset:0; background:#1c1917; display:flex; align-items:center; justify-content:center; z-index:500;' }, card);
+  }
+  window.addEventListener('zend:signed-out', () => {
+    S.signedOut = true;
+    render();
+  });
   // The countdown to the poll's next attempt, as the gateway's page words it.
   function retryMessage(u) {
     const left = u && u.retryAt ? Math.ceil((u.retryAt - Date.now()) / 1000) : 0;
