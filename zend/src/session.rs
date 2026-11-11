@@ -3201,11 +3201,6 @@ impl InferenceState {
         // A conversation is this member's for one turn at a time, and what it
         // keeps of one goes when the conversation does.
         if let Some(join) = cluster.as_ref() {
-            // A ref one member or aggregator issued, any other opens
-            // (`docs/private_mode.md` §3.1).
-            state
-                .mcp()
-                .install_refs(Refs::new(join.derive_key(refs::PURPOSE)));
             if let Some(member) = join.link().member() {
                 let held = Arc::downgrade(&state);
                 turn_claims::install(Arc::clone(member), move |key| {
@@ -8543,6 +8538,12 @@ impl ZendSession {
         let summarize = self.config.summarize;
         let tombstone_retention = self.config.tombstone_retention;
         let cluster = self.config.cluster.clone();
+        // A ref one member or aggregator issued, any other opens
+        // (`docs/private_mode.md` §3.1); installed before `/mcp` serves.
+        if let Some(join) = &cluster {
+            self.mcp
+                .install_refs(Refs::new(join.derive_key(refs::PURPOSE)));
+        }
         let ops: Arc<dyn OpsRunner> = Arc::clone(self.mcp.ops()) as _;
         // The memory its writer keeps current once the engine is up.
         let memory = Arc::clone(self.mcp.memory());
