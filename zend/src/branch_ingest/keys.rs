@@ -7,6 +7,7 @@ use candle_conversation::substrate::Substrate;
 use sha2::{Digest, Sha256};
 use zend_vfs::Oid;
 
+use super::prime::{is_link_dir, is_link_file};
 use crate::repo_scan::types::ModuleHint;
 
 /// Conversation metadata: the unit's content key. Written only once its
@@ -97,10 +98,30 @@ pub const COMMIT_KEY: &str = "commit";
 /// hold the chain directly ahead of it
 /// (`docs/results/theorem_depth_tests_2026-11-10.md`).
 ///
+/// 6: a part's block names a `scope` only for a part with a label of its own
+/// (`doc_units::render::block`). A unit read under 5 shows every paragraph with
+/// its first line again, cut at 72 characters and marked `…`, which a dialogue
+/// read as the file cut short and read again.
+///
 /// Every key states its version as a `v<N>:` prefix ([`key_version`]), so a
 /// member can tell a unit read under a NEWER version — a peer's, upgraded before
 /// it — from one it should replace, and leaves it alone.
-pub const KEY_VERSION: u32 = 5;
+pub const KEY_VERSION: u32 = 6;
+
+/// The version of what a priming-chain link's turns say beyond what
+/// [`KEY_VERSION`] covers: a link's key alone carries it ([`file_key`],
+/// [`dir_key_at`]), so a change to how the chain reads re-reads the chain and
+/// nothing else. Every dialogue opens on the chain, so its links are the
+/// units a reading change matters to first; the rest are read under the new
+/// rendering as their own content changes, or all at once by a
+/// [`KEY_VERSION`] bump.
+///
+/// 2: a part's block names a `scope` only for a part with a label of its own
+/// (`doc_units::render::block`). A link read under 1 shows every paragraph
+/// with its first line again, cut at 72 characters and marked `…` — which a
+/// dialogue holding the whole file read as the file cut short, and read again.
+/// Keys from before carry no mark and read as 1.
+pub const LINK_VERSION: u32 = 2;
 
 /// The first key version that writes its `v<N>:` prefix — the oldest a
 /// folder's earlier reading can be recomputed at ([`dir_key_at`]). A key from
@@ -133,15 +154,20 @@ pub fn branches_value(names: &[String]) -> String {
 }
 
 /// A file's key: the [`KEY_VERSION`], its workspace-relative path and its blob
-/// id — `v5:candle/zend/src/main.rs@3f73f872…`. The path is in it because the
+/// id — `v6:candle/zend/src/main.rs@3f73f872…`. The path is in it because the
 /// ingested conversation names the path; the blob id is git's hash of the
-/// bytes `file_read` returns.
+/// bytes `file_read` returns. A priming-chain link's ends in its
+/// [`LINK_VERSION`]: `v6:candle/README.md@3f73f872…#link2`.
 pub fn file_key(path: &str, blob: &Oid) -> String {
-    format!("v{KEY_VERSION}:{path}@{blob}")
+    let mut key = format!("v{KEY_VERSION}:{path}@{blob}");
+    if is_link_file(path) {
+        key.push_str(&format!("#link{LINK_VERSION}"));
+    }
+    key
 }
 
 /// The workspace-relative path a [`file_key`] names — `candle/zend/src/main.rs`
-/// out of `v5:candle/zend/src/main.rs@3f73f872…`. `None` for a key that is not a
+/// out of `v6:candle/zend/src/main.rs@3f73f872…`. `None` for a key that is not a
 /// file's.
 pub fn file_key_path(key: &str) -> Option<&str> {
     let rest = match key.strip_prefix('v').and_then(|r| r.split_once(':')) {
@@ -200,6 +226,11 @@ pub fn dir_key_at(
         h.update(b"\0hint\0");
         h.update(hint.render().as_bytes());
     }
+    // A repository's root folder is a priming-chain link: its digest covers
+    // the chain's own reading version too.
+    if is_link_dir(dir) {
+        h.update(format!("\0link\0{LINK_VERSION}").as_bytes());
+    }
     let mut out = format!("v{version}:");
     for b in h.finalize() {
         let _ = write!(out, "{b:02x}");
@@ -232,7 +263,40 @@ mod tests {
     fn a_file_key_is_its_path_and_blob() {
         assert_eq!(
             file_key("candle/zend/src/main.rs", &oid(A)),
-            "v5:candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
+            "v6:candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
+        );
+    }
+
+    /// **A priming-chain link's key carries the chain's own version**, so a
+    /// change to how the chain reads re-reads it alone: a root anchor's key
+    /// ends in the mark, and a root folder's digest covers it — computed
+    /// independently over the layout's bytes. A file below the root keeps the
+    /// plain key.
+    #[test]
+    fn a_chain_links_key_carries_the_links_version() {
+        assert_eq!(
+            file_key("candle/README.md", &oid(A)),
+            "v6:candle/README.md@ce013625030ba8dba906f756967f9e9ca394464a#link2"
+        );
+        assert_eq!(
+            file_key("candle/docs/README.md", &oid(A)),
+            "v6:candle/docs/README.md@ce013625030ba8dba906f756967f9e9ca394464a"
+        );
+        assert_eq!(
+            file_key_path(&file_key("candle/README.md", &oid(A))),
+            Some("candle/README.md")
+        );
+        let listing = Listing {
+            total: 0,
+            page: &[],
+        };
+        assert_eq!(
+            dir_key("r/", &listing, None),
+            "v6:3ed71bf9c6216a897cf14bf1103e5d0fdeae867f0ad9b60409abdb1180ee1fe4"
+        );
+        assert_eq!(
+            key_version(&file_key("candle/README.md", &oid(A))),
+            KEY_VERSION
         );
     }
 
@@ -262,6 +326,10 @@ mod tests {
         };
         assert_eq!(
             dir_key("r/a/", &listing, None),
+            "v6:cadfe7668dafa5b701726db41905fd6922726ec449c3e9853548e57296061de9"
+        );
+        assert_eq!(
+            dir_key_at(5, "r/a/", &listing, None),
             "v5:ff2927dcd0d14d5f55786e927196c304a025b3325e3e647456e62916f8b3449c"
         );
         assert_eq!(

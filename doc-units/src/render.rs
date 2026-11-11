@@ -9,7 +9,10 @@
 //! ````
 //!
 //! The fence names the file, the part's anchor, the lines of the file it holds
-//! and its scope: a code item's path, or else its own first line. Every line of
+//! and, for a part with a label of its own — a code item's path — that scope.
+//! A part without one shows none: its first line follows at once, and a first
+//! line cut short in the fence read as a part cut short, so a reader that had
+//! the whole file in front of it read it again. Every line of
 //! the part follows behind its number in the part, from `+1`, so an edit names
 //! lines by the part and that number and never counts. The number also keeps
 //! the content off the start of the line: a line of the file that holds
@@ -143,11 +146,15 @@ pub fn block(doc: &Doc, i: usize, source: Source<'_>) -> String {
         false => source.file.to_string(),
     };
     let mut out = format!(
-        "```{tag} file={file} part={} lines={} scope={}\n",
+        "```{tag} file={file} part={} lines={}",
         u.anchor,
-        lines_of(doc, i),
-        quoted(&scope(doc, i)),
+        lines_of(doc, i)
     );
+    if let Some(label) = &u.label {
+        out.push_str(" scope=");
+        out.push_str(&quoted(label));
+    }
+    out.push('\n');
     for (k, line) in doc.lines()[u.start..u.end].iter().enumerate() {
         let line = bare(line);
         out.push_str(&gutter(k + 1));
@@ -221,19 +228,25 @@ mod tests {
         tag: "rust",
     };
 
+    /// **Prose shows each paragraph as its own block, with no scope**: its
+    /// first line is the block's first line, and a long one cut short in the
+    /// fence read as a part cut short.
     #[test]
     fn prose_shows_each_paragraph_as_its_own_block() {
-        let doc = Doc::new("a.md", "One.\nStill one.\n\nTwo.\n");
+        let long = "word ".repeat(40);
+        let doc = Doc::new("a.md", &format!("One.\nStill one.\n\n{long}\n"));
         let [a, b] = [&doc.units()[0].anchor, &doc.units()[1].anchor];
         assert_eq!(
             blocks(&doc, 0..2, MD),
             format!(
-                "```markdown file=r/a.md part={a} lines=1-2 scope=\"One.\"\n +1 One.\n +2 Still one.\n```\n\
-                 ```markdown file=r/a.md part={b} lines=4 scope=\"Two.\"\n +1 Two.\n```\n"
+                "```markdown file=r/a.md part={a} lines=1-2\n +1 One.\n +2 Still one.\n```\n\
+                 ```markdown file=r/a.md part={b} lines=4\n +1 {long}\n```\n"
             )
         );
     }
 
+    /// **Code shows its item's path as the scope**, and a part with no item —
+    /// a block of imports — shows none.
     #[test]
     fn code_shows_its_scope_then_its_lines_behind_their_numbers() {
         let doc = Doc::new("a.rs", "use x;\n\nfn go() {\n\n    1\n}\n");
@@ -241,14 +254,14 @@ mod tests {
         assert_eq!(
             blocks(&doc, 0..2, RS),
             format!(
-                "```rust file=r/a.rs part={a} lines=1 scope=\"use x;\"\n +1 use x;\n```\n\
+                "```rust file=r/a.rs part={a} lines=1\n +1 use x;\n```\n\
                  ```rust file=r/a.rs part={b} lines=3-6 scope=\"fn go\"\n +1 fn go() {{\n +2\n +3     1\n +4 }}\n```\n"
             )
         );
     }
 
     /// **Content cannot close a block or pass for a fence**: every line sits
-    /// behind its number, and a quote in a scope is escaped.
+    /// behind its number.
     #[test]
     fn a_fence_or_a_quote_in_the_content_stays_content() {
         let doc = Doc::new("a.md", "```text\nr7Lm| x\n```\n\nSay \"hi\".\n");
@@ -256,10 +269,16 @@ mod tests {
         assert_eq!(
             blocks(&doc, 0..2, MD),
             format!(
-                "```markdown file=r/a.md part={a} lines=1-3 scope=\"```text\"\n +1 ```text\n +2 r7Lm| x\n +3 ```\n```\n\
-                 ```markdown file=r/a.md part={b} lines=5 scope=\"Say \\\"hi\\\".\"\n +1 Say \"hi\".\n```\n"
+                "```markdown file=r/a.md part={a} lines=1-3\n +1 ```text\n +2 r7Lm| x\n +3 ```\n```\n\
+                 ```markdown file=r/a.md part={b} lines=5\n +1 Say \"hi\".\n```\n"
             )
         );
+    }
+
+    /// A quote in a scope is escaped, so it stays one attribute.
+    #[test]
+    fn a_quote_in_a_scope_is_escaped() {
+        assert_eq!(quoted("fn \"go\""), "\"fn \\\"go\\\"\"");
     }
 
     #[test]
@@ -275,7 +294,7 @@ mod tests {
                 }
             ),
             format!(
-                "```text file=r/a.txt part={} lines=1-2 scope=\"One.\"\n +1 One.\n +2 Two.\n```\n",
+                "```text file=r/a.txt part={} lines=1-2\n +1 One.\n +2 Two.\n```\n",
                 doc.units()[0].anchor
             )
         );
@@ -292,8 +311,8 @@ mod tests {
         assert_eq!(
             block(&doc, 0, source),
             format!(
-                "```markdown file=\"layers/bram/The Body.md\" part={} lines=1 scope=\"You said \
-                 fourteen.\"\n +1 You said fourteen.\n```\n",
+                "```markdown file=\"layers/bram/The Body.md\" part={} lines=1\n +1 You said \
+                 fourteen.\n```\n",
                 doc.units()[0].anchor
             )
         );
@@ -351,7 +370,7 @@ mod tests {
             around(&doc, &[1], 2, MD),
             format!(
                 "part={} lines=1 One.\n\
-                 ```markdown file=r/a.md part={} lines=3-4 scope=\"Two.\"\n +1 Two.\n +2 more\n```\n\
+                 ```markdown file=r/a.md part={} lines=3-4\n +1 Two.\n +2 more\n```\n\
                  part={} lines=6 Three.\n",
                 a(0),
                 a(1),

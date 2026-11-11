@@ -1370,7 +1370,7 @@ mod tests {
         };
         assert_eq!(
             job.key(),
-            "v5:candle/src/lib.rs@ce013625030ba8dba906f756967f9e9ca394464a"
+            "v6:candle/src/lib.rs@ce013625030ba8dba906f756967f9e9ca394464a"
         );
     }
 

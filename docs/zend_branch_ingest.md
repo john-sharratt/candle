@@ -114,7 +114,7 @@ The walk's output is a **corpus**: every distinct `code_reading` unit and every 
 
 ## 6. Content keys
 
-Every key carries a **version** (`KEY_VERSION`, `branch_ingest/keys.rs`, now 5):
+Every key carries a **version** (`KEY_VERSION`, `branch_ingest/keys.rs`, now 6):
 the version of what a unit's turns say beyond its content — the calls and
 responses rendered around it. A change to that rendering bumps it, which re-reads
 every unit: each new key is queued, the old conversation stays readable until its
@@ -124,7 +124,9 @@ from 1; version 3 read a file's parts under inline anchors; version 4 shows each
 part as a fenced block, its lines numbered from `+1`, and reads a file by
 `lines` ranges of whole parts (`docs/zen_coding_challenge_fixes.md` Cause 4);
 version 5 seals every unit that is not a priming-chain link behind the system
-prompt alone, never parented on the chain (`docs/zend_workspace_execution.md` §6). A
+prompt alone, never parented on the chain (`docs/zend_workspace_execution.md` §6);
+version 6 names a part's `scope` only for a part with a label of its own, so no
+paragraph opens on its first line cut at 72 characters and marked `…`. A
 file unit records the file's line count (`lines`), which the working set checks
 the chain's reads covered before it serves the reading.
 

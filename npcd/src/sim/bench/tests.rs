@@ -401,8 +401,7 @@ fn an_edit_changes_the_paragraph_its_anchor_names() {
         reply,
         format!(
             "layers/eras/third.md: Changed {at}.\n```markdown file=layers/eras/third.md \
-             part={now} lines=1-2 scope=\"the third era\"\n +1 the third era\n +2 burned in the \
-             autumn\n```\n"
+             part={now} lines=1-2\n +1 the third era\n +2 burned in the autumn\n```\n"
         )
     );
 }
@@ -1003,8 +1002,7 @@ fn a_short_document_comes_back_whole_and_anchored() {
         out,
         format!(
             "\nlayers/eras/third.md (1 paragraph):\n\n```markdown file=layers/eras/third.md \
-             part={a} lines=1-2 scope=\"the third era\"\n +1 the third era\n +2 burned in the \
-             spring\n```\n"
+             part={a} lines=1-2\n +1 the third era\n +2 burned in the spring\n```\n"
         )
     );
 }

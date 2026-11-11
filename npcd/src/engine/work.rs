@@ -3277,8 +3277,8 @@ mod tests {
         assert_eq!(
             out.line().unwrap(),
             format!(
-                "{path}: Changed {at}.\n```markdown file={path} part={now} lines=1-2 scope=\"the \
-                 third era\"\n +1 the third era\n +2 burned in the autumn\n```\n"
+                "{path}: Changed {at}.\n```markdown file={path} part={now} lines=1-2\n +1 the \
+                 third era\n +2 burned in the autumn\n```\n"
             )
         );
         perform(

@@ -670,9 +670,7 @@ fn a_read_of_lines_holds_whole_parts_and_names_the_next() {
             blocks(&doc, 2..4, source)
         ),
     );
-    assert!(
-        read("161-320").contains("lines=161-240 scope=\"line 161\"\n +1 line 161\n +2 line 162\n")
-    );
+    assert!(read("161-320").contains("lines=161-240\n +1 line 161\n +2 line 162\n"));
     // Asked for more than a read holds, it holds what fits and says where on.
     assert_eq!(
         read("1-900"),

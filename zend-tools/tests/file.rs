@@ -74,7 +74,7 @@ fn file_write_unicode() {
     assert_eq!(
         resp,
         format!(
-            "```text file={REPO}/uni.txt part={anchor} lines=1 scope=\"{content}\"\n +1 {content}\n```\n\
+            "```text file={REPO}/uni.txt part={anchor} lines=1\n +1 {content}\n```\n\
              end of {REPO}/uni.txt lines 1 of 1 — the end of the file\n"
         )
     );
@@ -224,7 +224,7 @@ fn file_edit_round_trip() {
     assert_eq!(
         resp["result"],
         format!(
-            "Replaced {at}.\n```text file={REPO}/rt.txt part={now} lines=1 scope=\"hello Rust\"\n \
+            "Replaced {at}.\n```text file={REPO}/rt.txt part={now} lines=1\n \
              +1 hello Rust\n```\nChanged lines:\n- hello world\n+ hello Rust\n"
         )
     );
@@ -243,9 +243,7 @@ fn file_write_read_roundtrip() {
     let a = anchor_of(&ctx, "hello.txt", "hello");
     assert_eq!(
         parts_read(&resp),
-        format!(
-            "```text file={REPO}/hello.txt part={a} lines=1 scope=\"hello world\"\n +1 hello world\n```\n"
-        )
+        format!("```text file={REPO}/hello.txt part={a} lines=1\n +1 hello world\n```\n")
     );
 }
 

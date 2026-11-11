@@ -535,8 +535,8 @@ mod tests {
         assert!(
             q.contains(&format!(
                 "\n# `layers/stories/the-count.md` as it stands, each paragraph a block naming \
-                 its anchor\n\n```markdown file=layers/stories/the-count.md part={a} lines=1 \
-                 scope=\"You count the fleet.\"\n +1 You count the fleet.\n```\n"
+                 its anchor\n\n```markdown file=layers/stories/the-count.md part={a} lines=1\n \
+                 +1 You count the fleet.\n```\n"
             )),
             "{q}"
         );

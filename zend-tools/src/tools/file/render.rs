@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(
             lines_read("r", "a.rs", &doc, 1, 5),
             format!(
-                "```rust file=r/a.rs part={} lines=1 scope=\"use x;\"\n +1 use x;\n```\n\
+                "```rust file=r/a.rs part={} lines=1\n +1 use x;\n```\n\
                  ```rust file=r/a.rs part={} lines=3-5 scope=\"fn go\"\n +1 fn go() {{\n +2     1\n +3 }}\n```\n\
                  end of r/a.rs lines 1-5 of 5 — the end of the file\n",
                 a[0], a[1]
@@ -272,7 +272,7 @@ mod tests {
         assert_eq!(w, vec![(1, 300), (301, 450)]);
         let first = lines_read("r", "a.md", &doc, 1, 300);
         assert_eq!(first.matches("```markdown").count(), 100);
-        assert!(first.contains("lines=298-299 scope=\"p99 a\""), "{first}");
+        assert!(first.contains("lines=298-299\n +1 p99 a"), "{first}");
         assert!(first.ends_with("end of r/a.md lines 1-300 of 450 — next: lines=301-450\n"));
         let last = lines_read("r", "a.md", &doc, 301, 450);
         assert_eq!(last.matches("```markdown").count(), 50);
