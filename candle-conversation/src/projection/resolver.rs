@@ -5163,6 +5163,20 @@ impl Conversation {
             .collect()
     }
 
+    /// Whether the recurrent state `timeline` reached at `turn` — or a later
+    /// turn's — is in a durable record, so a resume on a new slot restores it.
+    ///
+    /// Non-consuming: unlike [`Self::drain_durable_snapshots`], whose queue
+    /// is the scheduler's alone, asking this takes nothing from anyone. It is
+    /// what a caller waits on before it drops a sequence whose next turn may
+    /// run on another slot. Lock-free on the log, like the drain.
+    pub fn snapshot_durable(&self, timeline: TimelineId, turn: u32) -> bool {
+        self.persistence
+            .written_snapshots()
+            .latest(timeline.raw())
+            .is_some_and(|(written, loc)| written >= turn && self.sealed.is_durable(&loc))
+    }
+
     /// The timeline's snapshot location if the index now names a different one
     /// than `stale` — the record was relocated since `stale` was read. `None`
     /// when it has not moved, or when no snapshot is indexed any more.
@@ -7357,6 +7371,12 @@ mod recurrent_snapshot_read_tests {
         assert!(conv.drain_durable_snapshots().is_empty(), "reported once");
 
         let (release, holder) = hold_owner(&conv);
+        // Asked of the timeline, the turn is durable whatever the drain took,
+        // and so is every earlier one; a later one is not.
+        assert!(conv.snapshot_durable(timeline, 6));
+        assert!(conv.snapshot_durable(timeline, 5));
+        assert!(!conv.snapshot_durable(timeline, 7));
+        assert!(!conv.snapshot_durable(TimelineId::for_test(99), 0));
         let reader = conv.clone();
         let (tx, rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {

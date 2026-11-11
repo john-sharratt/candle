@@ -291,6 +291,53 @@ layers:
         budget:
           priority: 100
 
+  # ── Talk ───────────────────────────────────────────────────────────────────
+  # A character's conversations with one person or character each
+  # (`docs/npc_conversations.md` §4): one timeline per pair, parked between
+  # turns, its band the timeline's own.
+  - name: talk
+    description: |
+      A character's conversation with one party, kept for ever and parked
+      between turns.
+    window: 16000
+    score_threshold: 0.0
+    gather_scope: conversation
+    decode_priority: high
+    on_corrupt_turn: drop_turn
+    budget:
+      priority: 100
+      min_percent: 40
+    summary:
+      turns:
+        max_tokens: 192
+        assistant:
+          system_prompt: |
+            You compress an exchange into a faithful, shorter version. Keep what
+            was actually said and decided, in the original voice, as if it were the
+            exchange only abridged. Add nothing; answer nothing that was not
+            answered. If there is little substance, one short sentence.
+          user_prompt: |
+            Compress the exchange above into a faithful shorter version in the
+            original voice, adding nothing.
+      summaries:
+        max_tokens: 192
+        assistant:
+          system_prompt: |
+            The sections below are already compressed. Merge them into one faithful
+            shorter section in the original voice, keeping what still matters and
+            dropping superseded detail. Represent every section. Invent nothing.
+          user_prompt: |
+            Merge the sections above into one faithful section in the original
+            voice, covering every section.
+    groups:
+      - id: talk_conversation
+        selection:
+          kind: conversation
+          recent: 16
+          historical_top_k: 8
+        budget:
+          priority: 100
+
   # ── Memory ─────────────────────────────────────────────────────────────────
   - name: memory
     description: |

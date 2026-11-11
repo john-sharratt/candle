@@ -112,7 +112,8 @@ pub const ACT: Tool = Tool {
                   take something out of their hand, put yourself between them and something \
                   else — or put them on the floor, break their grip, hurt them. **This is not \
                   how you say anything, and not how you go anywhere.** To tell, ask, warn, \
-                  promise or order somebody, use `tell`, `ask`, `whisper` or `shout`; to signal \
+                  promise or order a person here, use `tell`, `ask`, `whisper` or `shout`, and \
+                  `message` another character; to signal \
                   without touching, `gesture`; to stop and take stock, `reflect`; **to set off \
                   somewhere — a room, another level, back the way you came — use `move_to`, \
                   or `focus` if you move by attention, never this.** This is only ever the act \
@@ -343,8 +344,8 @@ pub const POST_NOTICE: Tool = Tool {
     description: "Write something on a board, a panel or a page here, for whoever comes to it \
                   next. It stays until it is pushed off the bottom by newer things, and everybody \
                   who reads it is told you wrote it. Use this when what you have to say outlives \
-                  the people currently in the room — `tell` reaches whoever is standing here now \
-                  and is gone.",
+                  the people currently in the room — speak to the people here, message the \
+                  others; both are gone once said.",
     params: &[
         Param {
             name: "on",
@@ -934,7 +935,9 @@ pub const PROMISE: Tool = Tool {
     at: &[],
     category: "Speech",
     plane: Plane::World,
-    availability: Availability::Nearby,
+    // A person here to hear it, or the party of a conversation: room speech is
+    // for people, and a promise is announced aloud.
+    availability: Availability::PersonNearby,
     description: "Commit to somebody that you will do a thing, by a time. Unlike saying you will, \
                   this is written down: they can hold you to it, and you will be reminded of it \
                   whether or not you want to be.",
@@ -943,7 +946,7 @@ pub const PROMISE: Tool = Tool {
             name: "to",
             ty: "string",
             required: true,
-            description: "Who you are promising. They must be here.",
+            description: "Who you are promising: somebody here, or who you are talking with.",
         },
         Param {
             name: "what",
@@ -960,8 +963,8 @@ pub const PROMISE: Tool = Tool {
         },
     ],
     examples: &[Example {
-        situation: "Somebody is blocked on a thing you are holding and has asked when it will be \
-                    done.",
+        situation: "Perrin Vastwood, on the phone to you, is blocked on a thing you are holding \
+                    and has asked when it will be done.",
         call: r#"{"to":"Perrin Vastwood","what":"the eastern span read through and marked","by":"nightfall"}"#,
         because: "Saying \"soon\" is `tell`. This is the one that can be held against you.",
     }],
@@ -973,7 +976,7 @@ pub const REMIND: Tool = Tool {
     at: &[],
     category: "Speech",
     plane: Plane::Speech,
-    availability: Availability::Nearby,
+    availability: Availability::PersonNearby,
     description: "Put somebody in mind of a thing they promised you and have not done. You can \
                   only name something they actually promised — which is what keeps this from \
                   being an accusation about a thing that was never said.",
@@ -982,7 +985,7 @@ pub const REMIND: Tool = Tool {
             name: "who",
             ty: "string",
             required: true,
-            description: "Who you are reminding. They must be here.",
+            description: "Who you are reminding: somebody here, or who you are talking with.",
         },
         Param {
             name: "which",
@@ -1157,17 +1160,14 @@ pub const REACH_OUT: Tool = Tool {
 /// than made into a find-people feature. Finding people is downstream of
 /// ordinary talk, not a separate mechanism.
 ///
-/// # Why the description insists on speaking first
+/// # How characters reach each other
 ///
-/// A handset that reaches everybody, offered on every turn, is an invitation to
-/// stop walking anywhere — and this catalogue has the scars to prove that a
-/// model takes the cheapest act that looks social. Two characters standing in
-/// one room texting each other is worse than either of them saying nothing.
-///
-/// So the rule is in the description, in the examples, and in
-/// `prompt::frame`: if they are here, speak. The grammar cannot enforce it —
-/// `tell` and `whisper` appear only in company, but `message` is `Always`, and it
-/// has to be, because the whole point is reaching people who are not here.
+/// Room speech is for people (`docs/npc_conversations.md` §12): `tell`, `ask`
+/// and `whisper` appear only with a person in the room, so this is how a
+/// character reaches another character, even one standing beside it. `message`
+/// is `Always`, and has to be. A private message is not written on the thread
+/// here: it becomes a purpose for the character's conversation with that
+/// person, which says it in its own words (§10).
 pub const MESSAGE: Tool = Tool {
     name: "message",
     at: &[],
@@ -1186,9 +1186,8 @@ pub const MESSAGE: Tool = Tool {
                   answer something said to you, use `reply`, which goes back where it was \
                   said.\n\
                   \n\
-                  **For people who are not here.** If the person you want is standing in front of \
-                  you, `tell` or `ask` — texting somebody in the same room is a worse version of \
-                  talking to them. The channel reaches everyone at once, so it is for anything \
+                  **How you reach another character, even one standing beside you.** Speak \
+                  aloud only to the people here. The channel reaches everyone at once, so it is for anything \
                   that concerns whoever happens to be listening: a question you need an answer \
                   to, something the others need to know before they act, a decision that is not \
                   yours alone.\n\

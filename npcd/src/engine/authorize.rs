@@ -5,29 +5,38 @@
 //! data, wipe a substrate, force-push, drop a device's pairing). The engine
 //! never signs a critical step off from what it sees and the carrier may not
 //! tick it itself (`engine::mission`), so it holds the mission until an
-//! **authorizer** approves — the Creator or Yen, reached on Discord. It holds
+//! **authorizer** approves — the Creator or Yen, reached on the phone. It holds
 //! *safe*: no reply, or a refusal, leaves the step undone and the mission
 //! stalled at it, never done without leave.
 //!
 //! This module is the pure half: who is an authorizer, whether a reply grants
 //! the go-ahead, and what the compass tells a carrier stopped at a critical
-//! step. The engine calls [`authorize_on_message`] when a message reaches a
-//! carrier that holds one, with the world's authorizer list.
+//! step. A step is signed only through a conversation that asked for it
+//! (`docs/npc_conversations.md` §7.2, `engine::talk::critical`).
 
-use crate::engine::mission::Mission;
+use serde::Deserialize;
 
-/// Whether `from` is one of the world's authorizers, by the name the world
-/// writes for them. Case- and space-insensitive; empty list means nobody can
-/// approve, so a critical step can only be held.
-pub fn is_authorizer(from: &str, authorizers: &[String]) -> bool {
-    let from = from.trim();
-    authorizers
-        .iter()
-        .any(|a| a.trim().eq_ignore_ascii_case(from))
+/// One who may approve a critical step: known by the public handle of their
+/// account (`u_…`), never by a name — an identity provider can change a name,
+/// and two people can share one (`docs/npc_conversations.md` §7.2). The name
+/// is what the compass calls them.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Authorizer {
+    pub account: String,
+    pub name: String,
+}
+
+/// Whether the account with handle `account` is one of the world's
+/// authorizers. An empty list means nobody can approve, so a critical step
+/// can only be held.
+pub fn is_authorizer(account: &str, authorizers: &[Authorizer]) -> bool {
+    let account = account.trim();
+    !account.is_empty() && authorizers.iter().any(|a| a.account.trim() == account)
 }
 
 /// Whether a reply grants the go-ahead — a forgiving read of a family member's
-/// Discord reply: an affirmative word, and no refusal. A reply that says both
+/// reply: an affirmative word, and no refusal. A reply that says both
 /// ("yes, but wait") is treated as withheld, because a critical step is held
 /// safe.
 pub fn is_affirmative(text: &str) -> bool {
@@ -80,25 +89,9 @@ fn has_word(text: &str, word: &str) -> bool {
         .any(|tok| tok == word)
 }
 
-/// Apply an authorizer's reply to a carrier's mission. When the carrier's next
-/// step is critical, `from` is an authorizer and the reply grants it, the step
-/// is signed off and its text returned; otherwise the mission is left held at
-/// the step and `None` is returned (a refusal, a stranger, or a step that is
-/// not critical).
-pub fn authorize_on_message(
-    mission: &mut Mission,
-    from: &str,
-    text: &str,
-    authorizers: &[String],
-) -> Option<String> {
-    let step = mission.critical_next()?.to_string();
-    (is_authorizer(from, authorizers) && is_affirmative(text) && mission.authorize())
-        .then_some(step)
-}
-
 /// The compass line for a carrier stopped at a critical step: it may not do the
 /// thing until an authorizer approves, so it reaches out and waits.
-pub fn critical_compass(step: &str, authorizers: &[String]) -> String {
+pub fn critical_compass(step: &str, authorizers: &[Authorizer]) -> String {
     let who = name_them(authorizers);
     let step = step.trim().trim_end_matches('.');
     format!(
@@ -111,10 +104,11 @@ pub fn critical_compass(step: &str, authorizers: &[String]) -> String {
 
 /// The authorizers named for the compass: "the Creator", "the Creator or Yen",
 /// "A, B or C"; "an authorizer" when none is set.
-fn name_them(authorizers: &[String]) -> String {
-    match authorizers {
+fn name_them(authorizers: &[Authorizer]) -> String {
+    let names: Vec<&str> = authorizers.iter().map(|a| a.name.as_str()).collect();
+    match names.as_slice() {
         [] => "an authorizer".to_string(),
-        [one] => one.clone(),
+        [one] => one.to_string(),
         [most @ .., last] => format!("{} or {last}", most.join(", ")),
     }
 }
@@ -122,19 +116,40 @@ fn name_them(authorizers: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::mission::{Mission, Origin, Todo};
 
-    fn authorizers() -> Vec<String> {
-        vec!["the Creator".to_string(), "Yen".to_string()]
+    fn authorizers() -> Vec<Authorizer> {
+        vec![
+            Authorizer {
+                account: "u_creator1".into(),
+                name: "the Creator".into(),
+            },
+            Authorizer {
+                account: "u_yen00002".into(),
+                name: "Yen".into(),
+            },
+        ]
     }
 
     #[test]
-    fn an_authorizer_is_matched_by_name_case_insensitively() {
+    fn an_authorizer_is_known_by_account_and_never_by_name() {
         let a = authorizers();
-        assert!(is_authorizer("Yen", &a));
-        assert!(is_authorizer("  the creator ", &a));
-        assert!(!is_authorizer("Wick", &a));
-        assert!(!is_authorizer("Yen", &[]), "nobody approves with no list");
+        assert!(is_authorizer("u_yen00002", &a));
+        assert!(is_authorizer(" u_creator1 ", &a));
+        assert!(!is_authorizer("Yen", &a), "a name is not an account");
+        assert!(!is_authorizer("u_wick0003", &a));
+        assert!(!is_authorizer("", &a));
+        assert!(
+            !is_authorizer("u_yen00002", &[]),
+            "nobody approves with no list"
+        );
+    }
+
+    #[test]
+    fn an_authorizer_reads_from_its_file_by_account_and_name() {
+        let a: Vec<Authorizer> =
+            serde_yaml::from_str("- account: u_creator1\n  name: the Creator\n").unwrap();
+        assert_eq!(a, authorizers()[..1]);
+        assert!(serde_yaml::from_str::<Vec<Authorizer>>("- the Creator\n").is_err());
     }
 
     #[test]
@@ -149,54 +164,6 @@ mod tests {
         // Whole-word matching, not substrings.
         assert!(!is_refusal("now is good"), "`no` is not in `now`");
         assert!(is_affirmative("now is good, do it"));
-    }
-
-    fn mission_with_critical() -> Mission {
-        let todo = vec![
-            Todo::new("check what is safe to remove"),
-            Todo::critical("delete the old logs"),
-            Todo::report("go back to the table and report it"),
-        ];
-        let mut m = Mission::new(
-            "Clear the old logs.",
-            todo,
-            Origin::Random {
-                routine: "clear".into(),
-            },
-        );
-        // The ordinary first step is signed off, so the critical one is next.
-        m.check_off(
-            "check what is safe to remove",
-            crate::engine::mission::StepOutcome::Achieved,
-        );
-        m
-    }
-
-    #[test]
-    fn an_affirmative_from_an_authorizer_signs_off_the_critical_step() {
-        let a = authorizers();
-        let mut m = mission_with_critical();
-        assert_eq!(m.critical_next(), Some("delete the old logs"));
-        // A stranger's yes does nothing.
-        assert_eq!(authorize_on_message(&mut m, "Wick", "yes", &a), None);
-        assert_eq!(m.critical_next(), Some("delete the old logs"), "still held");
-        // An authorizer's refusal does nothing.
-        assert_eq!(
-            authorize_on_message(&mut m, "Yen", "no, hold off", &a),
-            None
-        );
-        assert_eq!(m.critical_next(), Some("delete the old logs"), "still held");
-        // An authorizer's yes signs it off.
-        assert_eq!(
-            authorize_on_message(&mut m, "the Creator", "yes, go ahead", &a),
-            Some("delete the old logs".to_string())
-        );
-        assert_eq!(m.critical_next(), None, "no longer held");
-        assert_eq!(
-            m.next_step().map(|t| t.text.as_str()),
-            Some("go back to the table and report it"),
-            "only the report remains"
-        );
     }
 
     #[test]

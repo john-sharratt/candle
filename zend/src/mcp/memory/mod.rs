@@ -12,10 +12,9 @@
 //! | [`readers`] | whom each conversation reads the memory as, for its retrieval scope |
 //!
 //! Reads answer from a published snapshot of the tree and never take the
-//! store. Writes take the store, commit at once, and publish the new
-//! snapshot. The thread keeps the store in step with origin every
-//! [`SYNC_EVERY`], holding it only between the push and fetch, never across
-//! them (`journals::store::sync`), so no write waits on the network.
+//! store; writes take it, commit at once, and publish the new snapshot. The
+//! checkout is a [`Live`], kept in step with origin every
+//! [`journals::live::SYNC_EVERY`] without any write waiting on the network.
 
 pub mod context;
 pub mod conversations;
@@ -24,109 +23,32 @@ pub mod readers;
 pub mod who;
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 #[cfg(feature = "memory-census")]
 use heap_census::{set_thread, Scope};
 use journals::actor::{need_read, Actor};
 use journals::diaries::layout::DiaryId;
-use journals::error::Error;
+use journals::live::Live;
 use journals::ops::{Applied, Op};
 use journals::path::{JournalPath, HERE};
 use journals::scope::Section;
 use journals::store::diff::Changes;
-use journals::store::sync::sync;
-use journals::store::{Store, StoreError};
 use journals::time::Stamp;
 use journals::tree::{Journal, Tree};
 
 use conversations::Conversations;
 
-/// How often the store pushes what it wrote and fetches what origin has.
-pub const SYNC_EVERY: Duration = Duration::from_secs(5);
+pub use journals::live::{DiaryFiles, WriteError};
 
 /// What a tool says when this zend serves no journal repository.
 pub const NO_MEMORY: &str =
     "this zend serves no journal repository: its agent has no `journal: true` checkout";
 
-/// Every diary's sealed file, by its id.
-pub type DiaryFiles = Vec<(DiaryId, Vec<u8>)>;
-
-/// Where the memory stands, read without the store.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Status {
-    /// No journal checkout on this machine.
-    Absent,
-    /// Being read; tools wait for it.
-    Opening,
-    Failed(String),
-    Open,
-}
-
-/// Why a write was not made.
-#[derive(Debug)]
-pub enum WriteError {
-    /// The memory cannot be written now: none here, or not yet read.
-    Unavailable(String),
-    /// The store refused it, or failed to commit it.
-    Store(StoreError),
-}
-
-impl WriteError {
-    /// What it was based on changed underneath it: made again over the
-    /// journal as it now stands, it may be kept.
-    pub fn is_conflict(&self) -> bool {
-        matches!(
-            self,
-            WriteError::Store(StoreError::Journal(Error::Conflict(_)))
-        )
-    }
-
-    /// The rules' answer to the write as made: made again unchanged, it is
-    /// refused again.
-    pub fn is_refusal(&self) -> bool {
-        matches!(
-            self,
-            WriteError::Store(StoreError::Journal(
-                Error::Invalid(_) | Error::NotFound(_) | Error::Forbidden(_) | Error::Refused(_)
-            ))
-        )
-    }
-
-    /// A file the write touches is broken: refused until another commit
-    /// mends it, which may be a file the write's own journal does not show.
-    /// Nothing about the store as a whole.
-    pub fn is_broken(&self) -> bool {
-        matches!(
-            self,
-            WriteError::Store(StoreError::Journal(Error::Broken(_)))
-        )
-    }
-}
-
-impl fmt::Display for WriteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            WriteError::Unavailable(why) => f.write_str(why),
-            WriteError::Store(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl From<WriteError> for String {
-    fn from(e: WriteError) -> String {
-        e.to_string()
-    }
-}
-
 pub struct Memory {
-    status: RwLock<Status>,
-    store: Mutex<Option<Store>>,
-    tree: RwLock<Arc<Tree>>,
+    pub(crate) live: Arc<Live>,
     pub(crate) conversations: Conversations,
     /// The accounts whose old notes were moved, or are moving, in this
     /// process: each account's own, since each kept its notes under its key.
@@ -136,93 +58,26 @@ pub struct Memory {
 impl Default for Memory {
     fn default() -> Self {
         Memory {
-            status: RwLock::new(Status::Absent),
-            store: Mutex::new(None),
-            tree: RwLock::new(Arc::new(Tree::default())),
+            live: Arc::new(Live::new(NO_MEMORY)),
             conversations: Conversations::default(),
             moved: Mutex::new(BTreeSet::new()),
         }
     }
 }
 
-/// `m` locked, whatever a panic elsewhere left in it: the store's state is
-/// changed only once a write has committed, so what it holds is sound.
+/// `m` locked, whatever a panic elsewhere left in it.
 pub(crate) fn held<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Memory {
-    fn set_status(&self, s: Status) {
-        *self.status.write().unwrap_or_else(|e| e.into_inner()) = s;
-    }
-
     /// Open the journal checkout at `dir` on a thread of its own, and keep it
     /// in step with origin there for the process's life.
     pub fn start(self: &Arc<Self>, dir: PathBuf) {
-        self.set_status(Status::Opening);
-        let me = Arc::clone(self);
-        let spawned = thread::Builder::new()
-            .name("journal-sync".into())
-            .spawn(move || {
-                #[cfg(feature = "memory-census")]
-                set_thread(Scope::Journals);
-                me.run(dir)
-            });
-        if let Err(e) = spawned {
-            self.set_status(Status::Failed(format!(
-                "the journal thread did not start: {e}"
-            )));
-        }
-    }
-
-    fn run(self: Arc<Self>, dir: PathBuf) {
-        match Store::open(&dir) {
-            Ok(store) => {
-                tracing::info!(dir = %dir.display(), head = %store.head(), "journals: open");
-                self.publish(store.shared());
-                *held(&self.store) = Some(store);
-                self.set_status(Status::Open);
-            }
-            Err(e) => {
-                tracing::error!(dir = %dir.display(), "journals: could not open: {e}");
-                self.set_status(Status::Failed(format!(
-                    "the journal repository could not be read: {e}"
-                )));
-                return;
-            }
-        }
-        loop {
-            thread::sleep(SYNC_EVERY);
-            let Some(synced) = sync(&self.store) else {
-                return;
-            };
-            match synced {
-                Ok(synced) => {
-                    for (subject, why) in &synced.dropped {
-                        tracing::warn!(
-                            "journals: a write origin refused on replay is gone: {subject}: {why}"
-                        );
-                    }
-                    for (was, is) in &synced.renamed {
-                        tracing::warn!(
-                            "journals: a replayed line's id was taken: {was} is now {is}"
-                        );
-                    }
-                    if synced.fetched || synced.replayed > 0 {
-                        // Under the store, so a write's newer tree is never
-                        // published over.
-                        if let Some(store) = held(&self.store).as_ref() {
-                            self.publish(store.shared());
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("journals: sync: {e}"),
-            }
-        }
-    }
-
-    fn publish(&self, tree: Arc<Tree>) {
-        *self.tree.write().unwrap_or_else(|e| e.into_inner()) = tree;
+        self.live.start(dir, "journal-sync", || {
+            #[cfg(feature = "memory-census")]
+            set_thread(Scope::Journals);
+        });
     }
 
     /// Whether the memory opened, waiting up to `within` while it is still
@@ -230,119 +85,52 @@ impl Memory {
     /// routes, so a member whose checkout could not be read never draws a
     /// memory call, nor one still reading it.
     pub fn opened_within(&self, within: Duration) -> bool {
-        let until = Instant::now() + within;
-        loop {
-            match &*self.status.read().unwrap_or_else(|e| e.into_inner()) {
-                Status::Open => return true,
-                Status::Absent | Status::Failed(_) => return false,
-                Status::Opening => {}
-            }
-            if Instant::now() >= until {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        self.live.opened_within(within)
     }
 
     /// This zend serves the memory: its agent holds the journal checkout, and
     /// it opened or is opening.
     pub fn serves(&self) -> bool {
-        !matches!(
-            *self.status.read().unwrap_or_else(|e| e.into_inner()),
-            Status::Absent | Status::Failed(_)
-        )
-    }
-
-    /// Why the memory cannot be used now, when it cannot.
-    fn unavailable(&self) -> Option<String> {
-        match &*self.status.read().unwrap_or_else(|e| e.into_inner()) {
-            Status::Open => None,
-            Status::Absent => Some(NO_MEMORY.into()),
-            Status::Opening => {
-                Some("the journal repository is still being read; try again shortly".into())
-            }
-            Status::Failed(why) => Some(why.clone()),
-        }
+        self.live.serves()
     }
 
     /// The tree as last published.
     pub fn tree(&self) -> Result<Arc<Tree>, String> {
-        if let Some(why) = self.unavailable() {
-            return Err(why);
-        }
-        Ok(Arc::clone(
-            &self.tree.read().unwrap_or_else(|e| e.into_inner()),
-        ))
+        self.live.tree()
     }
 
     /// Apply `op` for `actor` now, commit it, and publish the new tree.
     pub fn write(&self, actor: &Actor, op: &Op) -> Result<Applied, WriteError> {
-        self.write_at(actor, op, Stamp::now())
+        self.live.write(actor, op)
     }
 
     /// [`Self::write`], recorded as happening at `at`.
     pub fn write_at(&self, actor: &Actor, op: &Op, at: Stamp) -> Result<Applied, WriteError> {
-        if let Some(why) = self.unavailable() {
-            return Err(WriteError::Unavailable(why));
-        }
-        let mut guard = held(&self.store);
-        let Some(store) = guard.as_mut() else {
-            return Err(WriteError::Unavailable(NO_MEMORY.into()));
-        };
-        let applied = store.write(actor, op, at).map_err(WriteError::Store)?;
-        self.publish(store.shared());
-        Ok(applied)
+        self.live.write_at(actor, op, at)
     }
 
     /// Every diary's sealed file, by its id, and the repository's salt once
     /// there is one (`docs/private_mode.md` §5.2): read under the store, which
     /// holds them, never through the tree.
     pub fn diaries(&self) -> Result<(DiaryFiles, Option<Vec<u8>>), String> {
-        if let Some(why) = self.unavailable() {
-            return Err(why);
-        }
-        let guard = held(&self.store);
-        let store = guard.as_ref().ok_or(NO_MEMORY)?;
-        let files = store
-            .diary_files()
-            .into_iter()
-            .map(|(id, bytes)| (id, bytes.to_vec()))
-            .collect();
-        Ok((files, store.diary_salt().map(<[u8]>::to_vec)))
+        self.live.diaries()
     }
 
     /// The repository's diary salt, once there is one: read alone, without
     /// copying any diary's file.
     pub fn diary_salt(&self) -> Result<Option<Vec<u8>>, String> {
-        if let Some(why) = self.unavailable() {
-            return Err(why);
-        }
-        let guard = held(&self.store);
-        let store = guard.as_ref().ok_or(NO_MEMORY)?;
-        Ok(store.diary_salt().map(<[u8]>::to_vec))
+        self.live.diary_salt()
     }
 
     /// One diary's sealed file, when it is there.
     pub fn diary_file(&self, id: &DiaryId) -> Result<Option<Vec<u8>>, String> {
-        if let Some(why) = self.unavailable() {
-            return Err(why);
-        }
-        let guard = held(&self.store);
-        let store = guard.as_ref().ok_or(NO_MEMORY)?;
-        Ok(store.diary_file(id).map(<[u8]>::to_vec))
+        self.live.diary_file(id)
     }
 
     /// Write `changes` to diaries' files as one commit, pushed at the next
     /// sync.
     pub fn write_diaries(&self, changes: &Changes) -> Result<(), WriteError> {
-        if let Some(why) = self.unavailable() {
-            return Err(WriteError::Unavailable(why));
-        }
-        let mut guard = held(&self.store);
-        let Some(store) = guard.as_mut() else {
-            return Err(WriteError::Unavailable(NO_MEMORY.into()));
-        };
-        store.write_diaries(changes).map_err(WriteError::Store)
+        self.live.write_diaries(changes)
     }
 
     /// The journal at `path`, which `actor` may read.

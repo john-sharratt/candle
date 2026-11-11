@@ -266,6 +266,32 @@ impl Client {
         Ok(made.id)
     }
 
+    /// [`Self::create_message`], held to `nonce` with `enforce_nonce`: the
+    /// same nonce posted again within Discord's window answers the message
+    /// already made rather than making a second.
+    pub async fn create_message_once(
+        &self,
+        token: &str,
+        channel_id: u64,
+        content: &str,
+        nonce: &str,
+    ) -> Result<u64, DiscordError> {
+        let made: Made = self
+            .call(
+                Method::POST,
+                &format!("/channels/{channel_id}/messages"),
+                token,
+                Some(json!({
+                    "content": content,
+                    "allowed_mentions": { "parse": [] },
+                    "nonce": nonce,
+                    "enforce_nonce": true,
+                })),
+            )
+            .await?;
+        Ok(made.id)
+    }
+
     /// The bot's DM channel with Discord user `user_id`, opened if it was not.
     pub async fn open_dm(&self, token: &str, user_id: u64) -> Result<u64, DiscordError> {
         let made: Made = self

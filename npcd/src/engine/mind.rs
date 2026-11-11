@@ -102,12 +102,17 @@ use crate::engine::rendered;
 use crate::engine::retention;
 use crate::engine::schema::ReflectionTurns;
 use crate::engine::sleep::conversation_id;
+use crate::engine::talk::templates;
 use crate::engine::tick::Due;
-use crate::engine::tools::{self, for_mode, Mode};
+use crate::engine::tools::{self, for_mode, Catalog, Mode};
 use crate::engine::window::Speaker;
 
 mod ask;
+mod talk;
+mod voice;
 pub use ask::{Answer, Put};
+pub use talk::{Spoken, Talk, TalkTurn};
+pub use voice::Voicing;
 
 /// How many completed exchanges the GPU sequence carries per turn.
 ///
@@ -245,7 +250,7 @@ pub struct Minds {
     /// A cast is small and rooms are stable, so this hits almost always; the
     /// miss costs one compile of a nine-act catalog, against a decode measured
     /// in seconds.
-    acts: LockFreeMap<(identity::Deliberation, tools::Within), Arc<StencilTree>>,
+    acts: LockFreeMap<(identity::Deliberation, Catalog, tools::Within), Arc<StencilTree>>,
     /// Whether the catalog compiled at boot. `false` means this checkpoint
     /// cannot be held to a shape at all, and every turn free-decodes — asked
     /// once here rather than inferred from an empty cache, which would also be
@@ -312,8 +317,13 @@ pub struct Projected {
     pub builder: Builder,
     pub layer: LayerId,
     pub group: GroupId,
+    /// Where a character's conversations are kept: the `talk` layer's group,
+    /// when the schema declares one.
+    pub talk: Option<(LayerId, GroupId)>,
     /// Which members exist, so a turn pins the right ones.
     pub identities: identity::Installed,
+    /// The response templates each destination's words are shaped by.
+    pub templates: templates::Installed,
     /// The fingerprint of everything a conversation under this schema is
     /// framed by — the authored YAML and every member installed into it. See
     /// [`crate::engine::schema::frame`] and [`frame_fingerprint`].
@@ -373,6 +383,7 @@ fn compile_act_loop(
     engine: &Arc<ConversationEngine>,
     cfg: &SequenceConfig,
     thinking: identity::Deliberation,
+    catalog: Catalog,
     within: &tools::Within,
 ) -> anyhow::Result<Arc<StencilTree>> {
     let e = engine;
@@ -417,16 +428,16 @@ fn compile_act_loop(
             Some(compile_think_tree(thinking.mode(), &steer))
         }
     };
-    let specs = act_specs(within);
-    compile_calls(e, cfg, &specs, tools::ACTS_PER_TURN, prelude.as_ref())
+    let specs = act_specs(catalog, within);
+    compile_calls(e, cfg, &specs, catalog.calls, prelude.as_ref())
 }
 
 /// The catalog the act grammar is compiled from, and so the catalog every
 /// reader of a character's decode must hold: the same list, from the same
-/// `Within`, so the grammar and the reader cannot disagree about where a
-/// function block's value ends.
-pub(super) fn act_specs(within: &tools::Within) -> Vec<ToolSpec> {
-    tools::specs_within(Mode::Physical, within)
+/// `Within` under the same mode, so the grammar and the reader cannot disagree
+/// about where a function block's value ends.
+pub(super) fn act_specs(catalog: Catalog, within: &tools::Within) -> Vec<ToolSpec> {
+    tools::specs_within(catalog.mode, within)
 }
 
 /// A grammar for a turn made of calls to `specs`, at most `max_calls` of them.
@@ -560,9 +571,10 @@ impl Minds {
         let acts = LockFreeMap::new();
         let mut ok = true;
         for level in LEVELS {
-            match compile_act_loop(&engine, &base_config, level, &tools::Within::nowhere()) {
+            let nowhere = tools::Within::nowhere();
+            match compile_act_loop(&engine, &base_config, level, Catalog::ROOM, &nowhere) {
                 Ok(tree) => {
-                    acts.pin().insert((level, tools::Within::nowhere()), tree);
+                    acts.pin().insert((level, Catalog::ROOM, nowhere), tree);
                 }
                 Err(e) => {
                     ok = false;
@@ -591,7 +603,8 @@ impl Minds {
             "collect_mission",
         )];
         for level in LEVELS {
-            if let Err(e) = compile_act_loop(&engine, &base_config, level, &at_table) {
+            if let Err(e) = compile_act_loop(&engine, &base_config, level, Catalog::ROOM, &at_table)
+            {
                 tracing::error!(
                     "the {level:?} grammar at the command table would not compile: {e:#} — \
                      characters there will free-decode"
@@ -858,8 +871,8 @@ impl Minds {
         // The acts this turn can take, and only those — the same set, under the
         // same mode, the grammar below is compiled from. See `compile_act_loop`.
         let mut selection = selection;
-        tools::show_within(&mut selection, Mode::Physical, within);
-        let turn_grammar = self.grammar_for(thinking, within);
+        tools::show_within(&mut selection, Catalog::ROOM.mode, within);
+        let turn_grammar = self.grammar_for(thinking, Catalog::ROOM, within);
         let options = TurnOptions {
             assistant_prefill: self.opening(thinking, turn_grammar.is_some()),
             turn_grammar,
@@ -873,7 +886,7 @@ impl Minds {
         let raw = response.text.clone();
 
         Ok(Probe {
-            parsed: act::parse(&raw, &act_specs(within)),
+            parsed: act::parse(&raw, &act_specs(Catalog::ROOM, within)),
             // **Reasoned, not merely "contains `<think>`".**
             //
             // On a family whose suppression *is* a prefilled empty block —
@@ -1031,30 +1044,32 @@ impl Minds {
     /// stands, and which names are real. Both were advisory before — advertised
     /// in the prompt, enforced by nothing — and a request the mask contradicts
     /// is a request the model is free to ignore, which it did.
-    fn grammar_for(
+    pub(super) fn grammar_for(
         &self,
         thinking: identity::Deliberation,
+        catalog: Catalog,
         within: &tools::Within,
     ) -> Option<Arc<StencilTree>> {
         if !self.grammar_ok {
             return None;
         }
-        let key = (thinking, within.clone());
+        let key = (thinking, catalog, within.clone());
         if let Some(tree) = self.acts.pin().get(&key) {
             return Some(Arc::clone(tree));
         }
         // A compile takes a while, and a second character arriving mid-compile
         // does not wait behind it: it compiles too.
-        let built = match compile_act_loop(&self.engine, &self.base_config, thinking, within) {
-            Ok(tree) => tree,
-            Err(e) => {
-                tracing::error!(
+        let built =
+            match compile_act_loop(&self.engine, &self.base_config, thinking, catalog, within) {
+                Ok(tree) => tree,
+                Err(e) => {
+                    tracing::error!(
                     "the {thinking:?} grammar would not compile for this room: {e:#} — this turn \
                      free-decodes"
                 );
-                return None;
-            }
-        };
+                    return None;
+                }
+            };
         // Last writer wins: two characters in one room race to build the same
         // tree and either is correct, since the key determines the contents.
         self.acts.pin().insert(key, Arc::clone(&built));
@@ -1726,7 +1741,8 @@ impl Minds {
         // The selection is made under the character's lock, after its mission
         // section has been reconciled, because which member the `mission`
         // collection pins depends on whether that section has sealed.
-        let turn_grammar = self.grammar_for(identity::Deliberation::default(), within);
+        let turn_grammar =
+            self.grammar_for(identity::Deliberation::default(), Catalog::ROOM, within);
         let mut options = TurnOptions {
             assistant_prefill: self
                 .opening(identity::Deliberation::default(), turn_grammar.is_some()),
@@ -1894,7 +1910,7 @@ impl Minds {
                 thought.retired = retired;
             }
         }
-        thought.parsed = act::parse(&response.text, &act_specs(within));
+        thought.parsed = act::parse(&response.text, &act_specs(Catalog::ROOM, within));
         Ok(thought)
     }
 
@@ -2024,7 +2040,7 @@ impl Minds {
         if persona.journal.is_some() {
             identity::carry_journal(&mut selection, journal_sealed);
         }
-        tools::show_within(&mut selection, Mode::Physical, within);
+        tools::show_within(&mut selection, Catalog::ROOM.mode, within);
         selection
     }
 
@@ -2079,6 +2095,8 @@ impl Minds {
         if let Some(l) = gone {
             retire(&self.engine, &*l.conversation.lock().await);
         }
+        // Its conversations too, of every party and generation (§4.1).
+        self.retire_talks(npc_id);
     }
 
     /// Make `live` the character's conversation, with the handle it is asked

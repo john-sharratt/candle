@@ -219,50 +219,60 @@ pub fn since(world: &World, id: &str) -> Vec<Witnessed> {
     out
 }
 
+/// Whether the words of something said in `voice` reach a listener at
+/// `reach`, given whether it was aimed at them.
+///
+/// **Perception's one rule for speech**, public so the grammar asks the same
+/// question when it decides whether a shout would reach a person (npcd's
+/// `Within::heard_by_person`): the two can then never disagree about who
+/// hears what.
+///
+/// - In the room, everything but a whisper aimed at somebody else.
+/// - Through a doorway, a shout — nobody lip-reads across a room — and a line
+///   called after the listener as they left.
+/// - Across the building, only that line: the one called after you carries to
+///   wherever you have got to. This is the reciprocal of
+///   [`crate::world::World::call_after`], the only way such a line is ever
+///   logged away from its addressee.
+pub fn carries(voice: Voice, reach: Reach, aimed_at_reader: bool) -> bool {
+    match reach {
+        Reach::Here => aimed_at_reader || voice != Voice::Whispered,
+        Reach::InSight => aimed_at_reader || voice == Voice::Shouted,
+        Reach::OutOfReach => aimed_at_reader,
+    }
+}
+
 /// How much of a happening carries at a given nearness, if any of it does,
-/// to `reader` — who matters only for a whisper, whose words reach one person.
+/// to `reader` — who matters only for a line aimed at them.
 fn legible(reach: Reach, what: &Happening, reader: &str) -> Option<Happening> {
     // Where somebody meant to go, and their own sense of having got there or
     // given up, happen inside a head. Standing next to them does not help.
     if what.is_private() {
         return None;
     }
+    let heard =
+        |to: &Option<String>, voice: Voice| carries(voice, reach, to.as_deref() == Some(reader));
     match reach {
-        // Nothing carries across the building, except a line aimed at you: the
-        // one called after you as you left carries to wherever you have got to.
-        // This is the reciprocal of [`crate::world::World::call_after`], which
-        // is the only way such a line is ever logged away from its addressee.
         Reach::OutOfReach => match what {
-            Happening::Said { to: Some(t), .. } if t == reader => Some(what.clone()),
+            Happening::Said { to, voice, .. } if heard(to, *voice) => Some(what.clone()),
             _ => None,
         },
         Reach::Here => match what {
             // A whisper is seen by the room and heard by one person: everybody
             // else is told it happened, and to whom, and not a word of it.
-            Happening::Said {
-                to,
-                voice: Voice::Whispered,
-                ..
-            } if to.as_deref() != Some(reader) => Some(Happening::Said {
+            Happening::Said { to, voice, .. } if !heard(to, *voice) => Some(Happening::Said {
                 to: to.clone(),
                 words: String::new(),
-                voice: Voice::Whispered,
+                voice: *voice,
             }),
             other => Some(other.clone()),
         },
         Reach::InSight => match what {
-            // A shout carries through a doorway. Nothing quieter does — nobody
-            // lip-reads across a room.
-            Happening::Said {
-                voice: Voice::Shouted,
-                ..
-            } => Some(what.clone()),
             // An aimed line called after somebody as they leave carries to the
             // one it was aimed at, and to nobody else. Everybody in the room
             // the speaker is in still hears it (that is `Reach::Here`); a
             // bystander one doorway away, who is not who it was for, does not.
-            Happening::Said { to: Some(t), .. } if t == reader => Some(what.clone()),
-            Happening::Said { .. } => None,
+            Happening::Said { to, voice, .. } => heard(to, *voice).then(|| what.clone()),
             // A building noise belongs to the room it happened in. Carrying it
             // through a doorway would put the same fan, the same rat and the
             // same failing tube in two rooms at once, and a character that
@@ -540,6 +550,45 @@ fn place_of(world: &World, at: &Where) -> String {
 mod tests {
     use super::*;
     use crate::load::MapSet;
+
+    /// **The rule speech is heard by**, every voice at every nearness, aimed
+    /// and not.
+    #[test]
+    fn what_carries_is_the_voice_the_nearness_and_the_aim() {
+        let table: Vec<(Voice, Reach, bool, bool)> =
+            [Voice::Said, Voice::Shouted, Voice::Whispered]
+                .into_iter()
+                .flat_map(|v| {
+                    [Reach::Here, Reach::InSight, Reach::OutOfReach]
+                        .into_iter()
+                        .flat_map(move |r| {
+                            [false, true].map(|aimed| (v, r, aimed, carries(v, r, aimed)))
+                        })
+                })
+                .collect();
+        let heard: Vec<(Voice, Reach, bool)> = table
+            .iter()
+            .filter(|(_, _, _, c)| *c)
+            .map(|(v, r, a, _)| (*v, *r, *a))
+            .collect();
+        assert_eq!(
+            heard,
+            [
+                (Voice::Said, Reach::Here, false),
+                (Voice::Said, Reach::Here, true),
+                (Voice::Said, Reach::InSight, true),
+                (Voice::Said, Reach::OutOfReach, true),
+                (Voice::Shouted, Reach::Here, false),
+                (Voice::Shouted, Reach::Here, true),
+                (Voice::Shouted, Reach::InSight, false),
+                (Voice::Shouted, Reach::InSight, true),
+                (Voice::Shouted, Reach::OutOfReach, true),
+                (Voice::Whispered, Reach::Here, true),
+                (Voice::Whispered, Reach::InSight, true),
+                (Voice::Whispered, Reach::OutOfReach, true),
+            ]
+        );
+    }
 
     fn vault() -> World {
         World::new(

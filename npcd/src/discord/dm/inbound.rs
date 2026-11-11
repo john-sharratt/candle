@@ -36,7 +36,7 @@ use crate::discord::rejected::Rejected;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
 use crate::engine::speaking_as;
-use crate::sim::phone::Origin;
+use crate::sim::phone::{Origin, Who};
 
 /// What became of a message, for the trace and the tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,10 +190,12 @@ async fn judge(
     else {
         return Ok(Heard::Unapplied);
     };
-    let from = speaking_as(&identity, &handle, &a.roles);
-    let Some(character) = hosted.read(|w| w.actor(&body).map(|a| a.name.clone())) else {
+    // The person is on the thread by their account's public handle, and
+    // shown by the name they speak by.
+    let from = Who::new(&handle, &speaking_as(&identity, &handle, &a.roles));
+    if hosted.read(|w| w.actor(&body).is_none()) {
         return Ok(Heard::Unapplied);
-    };
+    }
     let origin = Origin::Discord {
         message: m.id,
         channel: m.channel_id,
@@ -201,7 +203,7 @@ async fn judge(
     let before = hosted.dms(|d| d.get(bot.npc, &account));
     let recorded = hosted.sim(|s| {
         s.threads
-            .direct_between(&from, &character)
+            .direct_between(&handle, &body)
             .is_some_and(|t| t.messages.iter().any(|x| x.origin == Some(origin)))
     });
     if before.is_some_and(|dm| m.id <= dm.last_seen_discord) || recorded {
@@ -229,19 +231,26 @@ async fn judge(
     // said in the console before is the console's.
     let (thread, through) = hosted.sim(|s| {
         s.threads
-            .direct_between(&from, &character)
-            .map(|t| (t.id.clone(), t.messages.last().map_or(0, |last| last.seq)))
+            .direct_between(&handle, &body)
+            .map(|t| (t.id.clone(), t.last_seq()))
             .unwrap_or_default()
     });
-    let dm = Dm {
-        channel_id: m.channel_id,
-        user_id: m.author.id,
-        mirrored_through: before.map_or(through, |dm| dm.mirrored_through),
-        last_seen_discord: m.id,
+    let dm = match before {
+        Some(dm) => Dm {
+            last_seen_discord: m.id,
+            ..dm
+        },
+        None => Dm {
+            channel_id: m.channel_id,
+            user_id: m.author.id,
+            mirrored_through: through,
+            mirrored_part: 0,
+            last_seen_discord: m.id,
+        },
     };
     hosted.with_dms(|d| d.put(bot.npc, &account, dm));
     Ok(Heard::Applied {
-        from,
+        from: from.name,
         thread,
         seq: through,
     })

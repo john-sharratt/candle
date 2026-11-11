@@ -48,8 +48,8 @@ impl Daemon {
     fn serve_world(&self) {
         self.discord.channels(&[(GENERAL, 0, "general")]);
         self.hosted.with_sim(|s| {
-            s.enrol("Zen");
-            s.enrol("Wick");
+            s.enrol(&Who::new("zen", "Zen"));
+            s.enrol(&Who::new("wick", "Wick"));
         });
         self.hosted.with_mirror(|m| {
             m.set_guild(Some(Guild {
@@ -72,23 +72,17 @@ impl Daemon {
             .expect("the world's channel")
     }
 
-    /// `who` says `text` on the world's channel.
+    /// `who`, by the name they go by, says `text` on the world's channel.
     fn on_channel(&self, who: &str, text: &str) {
-        self.hosted
-            .with_sim(|s| s.threads.send(who, THE_CHANNEL, text).unwrap());
+        self.hosted.with_sim(|s| {
+            let id = s.roster_id(who).expect("on the roster").to_string();
+            s.threads.send(&id, THE_CHANNEL, Said::words(text)).unwrap();
+        });
     }
 
-    /// What the world's channel carries, as `(from, text, from_discord)`.
+    /// What the world's channel carries, as `(who, text, from_discord)`.
     fn channel_said(&self) -> Vec<(String, String, bool)> {
-        let thread = self.the_channel();
-        self.hosted.sim(|s| {
-            s.threads.get(&thread).map_or_else(Vec::new, |t| {
-                t.messages
-                    .iter()
-                    .map(|m| (m.from.clone(), m.intent.clone(), m.origin.is_some()))
-                    .collect()
-            })
-        })
+        self.said_on(&self.the_channel())
     }
 
     /// The webhook posts the fake was sent, as `(username, content)`.
@@ -134,13 +128,17 @@ impl Daemon {
         self.a.bots.tick(&self.a).await;
     }
 
-    /// What `thread` carries, as `(from, text, from_discord)`.
+    /// What `thread` carries, as `(who, text, from_discord)`, each by the
+    /// name they are shown by.
     fn said_on(&self, thread: &str) -> Vec<(String, String, bool)> {
         self.hosted.sim(|s| {
             s.threads.get(thread).map_or_else(Vec::new, |t| {
                 t.messages
                     .iter()
-                    .map(|m| (m.from.clone(), m.intent.clone(), m.origin.is_some()))
+                    .map(|m| {
+                        let by = t.member(&m.from).map_or(m.from.clone(), |w| w.name.clone());
+                        (by, m.text.clone(), m.origin.is_some())
+                    })
                     .collect()
             })
         })
@@ -273,7 +271,7 @@ async fn the_world_is_posted_by_its_speakers() {
         d.hooked(),
         [
             ("Wick".to_string(), "the hatchery is warm".to_string()),
-            ("Zen".to_string(), "Good.".to_string()),
+            ("Zen".to_string(), "good".to_string()),
         ]
     );
 
@@ -305,7 +303,7 @@ async fn the_world_is_posted_by_its_speakers() {
         d.posts(),
         [(
             format!("/channels/{MADE}/messages"),
-            "I am watching.".to_string()
+            "I am watching".to_string()
         )]
     );
     assert_eq!(d.hooked().len(), 2, "something was posted twice");
@@ -442,10 +440,15 @@ async fn a_group_is_a_channel_only_its_members_see() {
     d.link(OWNER, WREN).await;
     d.link(CREATOR, ADA).await;
     d.wick();
+    let wren = d.wren();
     let sweep = d.hosted.with_sim(|s| {
         s.threads.open_group(
             "The Eastern Sweep",
-            &["Zen".into(), "Wick".into(), WREN_S.into()],
+            &[
+                Who::new("zen", "Zen"),
+                Who::new("wick", "Wick"),
+                wren.clone(),
+            ],
         )
     });
     d.mirroring().await;
@@ -478,12 +481,12 @@ async fn a_group_is_a_channel_only_its_members_see() {
 
     d.hosted.with_sim(|s| {
         s.threads
-            .send_on(&sweep, "Wick", "the east is clear", None)
+            .send_on(&sweep, "wick", Said::words("the east is clear"))
             .unwrap()
     });
     d.until("posted", |d| {
         d.hooked()
-            .contains(&("Wick".to_string(), "The east is clear.".to_string()))
+            .contains(&("Wick".to_string(), "the east is clear".to_string()))
     })
     .await;
 
@@ -505,7 +508,7 @@ async fn a_group_is_a_channel_only_its_members_see() {
 
     // Wren leaves: taken out of the channel.
     d.hosted
-        .with_sim(|s| s.threads.leave(WREN_S, "The Eastern Sweep").unwrap());
+        .with_sim(|s| s.threads.leave(&wren.id, "The Eastern Sweep").unwrap());
     d.reconcile_now().await;
     assert_eq!(
         d.discord.overwrites_of(GROUP),
@@ -514,9 +517,7 @@ async fn a_group_is_a_channel_only_its_members_see() {
 
     // Wren is let back in, and then everybody goes: archived, read-only.
     d.hosted.with_sim(|s| {
-        s.threads
-            .invite("Zen", "The Eastern Sweep", WREN_S)
-            .unwrap();
+        s.threads.invite("zen", "The Eastern Sweep", &wren).unwrap();
     });
     d.reconcile_now().await;
     assert!(d
@@ -524,7 +525,7 @@ async fn a_group_is_a_channel_only_its_members_see() {
         .overwrites_of(GROUP)
         .contains(&(WREN, 1, MEMBER, 0)));
     d.hosted.with_sim(|s| {
-        for who in ["Zen", "Wick", WREN_S] {
+        for who in ["zen", "wick", wren.id.as_str()] {
             let _ = s.threads.leave(who, "The Eastern Sweep");
         }
     });
@@ -549,17 +550,13 @@ async fn a_dm_with_a_character_without_a_bot_is_a_private_thread() {
     let d = daemon(vec![Script::Serve]).await;
     d.link(OWNER, WREN).await;
     d.wick();
-    d.hosted.with_sim(|s| {
-        s.threads.reach(WREN_S, "Wick");
+    let wren = d.wren();
+    let dm = d.hosted.with_sim(|s| {
+        let id = s.threads.reach(&wren, &Who::new("wick", "Wick"));
         s.threads
-            .send(WREN_S, "Wick", "said before the server")
+            .send_on(&id, &wren.id, Said::words("said before the server"))
             .unwrap();
-    });
-    let dm = d.hosted.sim(|s| {
-        s.threads
-            .direct_between(WREN_S, "Wick")
-            .map(|t| t.id.clone())
-            .unwrap()
+        id
     });
     d.mirroring().await;
     d.until("the DM opened", |d| {
@@ -601,8 +598,11 @@ async fn a_dm_with_a_character_without_a_bot_is_a_private_thread() {
         ]
     );
 
-    d.hosted
-        .with_sim(|s| s.threads.send("Wick", WREN_S, "hello, Wren").unwrap());
+    d.hosted.with_sim(|s| {
+        s.threads
+            .send_on(&dm, "wick", Said::words("hello, Wren"))
+            .unwrap()
+    });
     d.until("posted into the thread", |d| {
         d.discord.seen().iter().any(|s| {
             s.path
@@ -616,7 +616,7 @@ async fn a_dm_with_a_character_without_a_bot_is_a_private_thread() {
     .await;
     assert_eq!(
         d.hooked(),
-        [("Wick".to_string(), "Hello, Wren.".to_string())],
+        [("Wick".to_string(), "hello, Wren".to_string())],
         "what was said before the server was posted"
     );
 
@@ -645,18 +645,16 @@ async fn two_characters_dm_stays_in_the_world() {
     let d = daemon(vec![Script::Serve]).await;
     d.link(OWNER, WREN).await;
     d.wick();
-    d.hosted.with_sim(|s| {
-        s.threads.reach("Zen", "Wick");
-    });
-    let dm = d.hosted.sim(|s| {
+    let dm = d.hosted.with_sim(|s| {
         s.threads
-            .direct_between("Zen", "Wick")
-            .map(|t| t.id.clone())
-            .unwrap()
+            .reach(&Who::new("zen", "Zen"), &Who::new("wick", "Wick"))
     });
     d.mirroring().await;
-    d.hosted
-        .with_sim(|s| s.threads.send("Zen", "Wick", "report at dusk").unwrap());
+    d.hosted.with_sim(|s| {
+        s.threads
+            .send_on(&dm, "zen", Said::words("report at dusk"))
+            .unwrap()
+    });
     d.reconcile_now().await;
     d.settle().await;
     assert!(d.hosted.mirror(|m| m.thread(&dm)).is_none());
@@ -707,7 +705,8 @@ async fn a_channel_a_person_made_is_a_channel_of_the_world() {
     let (research, _) = d.hosted.mirror(|m| m.by_channel(RESEARCH)).unwrap();
     let (name, topic, members) = d.hosted.sim(|s| {
         let t = s.threads.get(&research).unwrap();
-        (t.name.clone(), t.topic.clone(), t.members.clone())
+        let members: Vec<String> = t.members.iter().map(|m| m.name.clone()).collect();
+        (t.name.clone(), t.topic.clone(), members)
     });
     assert_eq!(name, "#research");
     assert_eq!(topic.as_deref(), Some("Findings and open questions"));
@@ -715,7 +714,7 @@ async fn a_channel_a_person_made_is_a_channel_of_the_world() {
 
     d.hosted.with_sim(|s| {
         s.threads
-            .send_on(&research, "Wick", "the seam runs east", None)
+            .send_on(&research, "wick", Said::words("the seam runs east"))
             .unwrap()
     });
     d.until("posted in #research", |d| {
@@ -739,10 +738,10 @@ async fn a_channel_a_person_made_is_a_channel_of_the_world() {
         let m = t.messages.last().unwrap();
         (
             (m.from.clone(), m.to.clone(), m.origin.is_some()),
-            t.has(WREN_S),
+            t.has(&d.wren().id),
         )
     });
-    assert_eq!(heard, (WREN_S.to_string(), Some("Zen".to_string()), true));
+    assert_eq!(heard, (d.wren().id, Some("zen".to_string()), true));
     assert!(on, "the person was not brought onto the room");
 
     d.discord
@@ -829,7 +828,7 @@ async fn a_bot_shows_typing_while_a_dm_waits_on_it() {
 
     d.zen_says("I am here");
     d.until("answered", |d| {
-        d.posts().iter().any(|(_, text)| text == "I am here.")
+        d.posts().iter().any(|(_, text)| text == "I am here")
     })
     .await;
     d.settle().await;

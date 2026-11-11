@@ -32,7 +32,11 @@ use crate::engine::mission::{Mission, Origin, Todo};
 use crate::engine::mission_gen::config::Config;
 use crate::engine::mission_gen::run;
 use crate::engine::{no_engine, owned, owned_by, speaking_as, world_unreached};
+use crate::sim::phone::Who;
 use npc_map::route;
+
+/// The command table's id on the channels it speaks on.
+const COMMAND_ID: &str = "service:command";
 
 /// `POST /v1/npc/:nid/mission` — lodge a mission for a character
 /// ([`LodgeRequest`]): queued for it to collect at the command table, or, with
@@ -441,7 +445,7 @@ pub async fn command_table(
         )
     };
     // The chat channel — a line on every world's standing channel.
-    rt.say_to_all_channels("Command", &line);
+    rt.say_to_all_channels(&Who::new(COMMAND_ID, "Command"), &line);
     // The tannoy — one announcement to everybody the table gives work to, loud
     // enough on opening to break a character off what it is doing. Each reads
     // it on its own clock. A character that takes no orders is not called

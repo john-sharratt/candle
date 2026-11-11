@@ -1,11 +1,14 @@
 //! A bot's DM with a linked person, as the world keeps it
 //! (`docs/npcd_discord.md` §4.2).
 //!
-//! One record per character and person, `discord/dm/<npc_id>/<account>` under
-//! the world: the DM channel Discord gave the pair, the person's Discord user,
-//! how far the thread has been posted there (`mirrored_through`, a
-//! [`crate::sim::phone::Message::seq`]) and the last Discord message taken in
-//! (`last_seen_discord`). It is a world record because the world's authority
+//! One record per character and person, `discord/direct/<npc_id>/<account>`
+//! under the world: the DM channel Discord gave the pair, the person's Discord
+//! user, how far the pair's direct thread has been posted there
+//! (`mirrored_through`, a [`crate::sim::phone::Message::seq`], and
+//! `mirrored_part`, how many parts of the next line already went) and the last
+//! Discord message taken in (`last_seen_discord`). Kept under `direct/` since
+//! the pair's thread is the one thread of theirs for ever: a cursor into a
+//! thread of the phone as it was is not read. It is a world record because the world's authority
 //! is the one member that posts and hears the DM: it writes the record with
 //! the world's other records each beat, every other member holds it as they
 //! replicate, and the member that takes the world over next goes on from
@@ -22,7 +25,7 @@ use serde_json::Value;
 use crate::world_state::Records;
 
 /// Where the DM records are among a world's records.
-pub const PREFIX: &str = "discord/dm/";
+pub const PREFIX: &str = "discord/direct/";
 
 /// One DM between a character's bot and a person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +38,12 @@ pub struct Dm {
     /// The seq of the last message of the thread posted to the channel, or
     /// taken in from it.
     pub mirrored_through: u64,
+    /// How many parts of the line after `mirrored_through` are already
+    /// posted: a line longer than one Discord message goes in parts, and one
+    /// that failed part-way resumes at the part it stopped at rather than
+    /// posting the first parts again.
+    #[serde(default)]
+    pub mirrored_part: u32,
     /// The id of the last Discord message taken in from the channel; `0` for
     /// none.
     pub last_seen_discord: u64,
@@ -123,12 +132,13 @@ mod tests {
             channel_id,
             user_id: 77,
             mirrored_through: 4,
+            mirrored_part: 1,
             last_seen_discord: 900,
         }
     }
 
-    /// **A DM is the record `discord/dm/<npc_id>/<account>`**, in exactly this
-    /// shape.
+    /// **A DM is the record `discord/direct/<npc_id>/<account>`**, in exactly
+    /// this shape.
     #[test]
     fn a_dm_is_a_world_record_of_this_shape() {
         let mut dms = Dms::default();
@@ -137,11 +147,12 @@ mod tests {
         assert_eq!(
             records,
             [(
-                "discord/dm/42/0a1b".to_string(),
+                "discord/direct/42/0a1b".to_string(),
                 json!({
                     "channel_id": 31,
                     "user_id": 77,
                     "mirrored_through": 4,
+                    "mirrored_part": 1,
                     "last_seen_discord": 900,
                 })
             )]
@@ -160,7 +171,8 @@ mod tests {
         dms.put(43, "0a1b", dm(33));
         let mut records = dms.records();
         records.insert("sim/meta".into(), json!({"table_open": true}));
-        records.insert("discord/dm/notanumber/x".into(), json!({}));
+        records.insert("discord/direct/notanumber/x".into(), json!({}));
+        records.insert("discord/dm/42/0a1b".into(), json!({"channel_id": 1}));
         let mut back = Dms::default();
         back.put(1, "stale", dm(1));
         back.take_in(&records);

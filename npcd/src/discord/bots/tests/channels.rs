@@ -3,13 +3,15 @@
 //! threads opened, a message in each way, renames, a removal, what `READY`
 //! says of the servers left and joined while offline, and a `4014`.
 
+use std::slice;
+
 use axum::body::to_bytes;
 use axum::extract::{Path as Wire, State as Shared};
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 
 use super::*;
-use crate::authority::ops::{OpReply, WorldOp};
+use crate::authority::ops::{ActSource, OpReply, Voiced, WorldOp};
 use crate::discord::fake::FIRST_POSTED;
 use crate::discord::gateway::fake::SESSION;
 use crate::discord::server::record::{Channel, Server};
@@ -17,7 +19,17 @@ use crate::discord::trace::note::Direction;
 use crate::discord::trace::route::get_trace;
 use crate::engine::event::EventKind;
 use crate::npcs::npc_id_wire;
-use crate::sim::phone::Thread;
+use crate::sim::phone::{Kind as ThreadKind, Thread};
+
+/// The name member `id` of `t` is shown by.
+fn names(t: &Thread, id: &str) -> String {
+    t.member(id).map_or(id.to_string(), |m| m.name.clone())
+}
+
+/// `t`'s members, by the names they are shown by.
+fn member_names(t: &Thread) -> Vec<String> {
+    t.members.iter().map(|m| m.name.clone()).collect()
+}
 
 /// The server the bot is added to, and its text channels.
 const GUILD: u64 = 600;
@@ -105,13 +117,14 @@ impl Daemon {
         self.hosted.sim(|s| s.threads.get(&record.thread).cloned())
     }
 
-    /// What is said on the thread mirroring `channel`, as `(from, text)`.
+    /// What is said on the thread mirroring `channel`, as `(who, text)` by
+    /// the name each is shown by.
     fn heard(&self, channel: u64) -> Vec<(String, String)> {
         self.channel_thread(channel)
             .map(|t| {
                 t.messages
                     .iter()
-                    .map(|m| (m.from.clone(), m.intent.clone()))
+                    .map(|m| (names(&t, &m.from), m.text.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -146,16 +159,16 @@ async fn a_join_is_told_and_opens_the_threads() {
         assert_eq!(
             (
                 t.name.as_str(),
-                t.members.as_slice(),
+                member_names(&t),
                 t.open,
-                t.named,
+                t.kind() == ThreadKind::Group,
                 t.permanent
             ),
-            (name, ["Zen".to_string()].as_slice(), true, true, true)
+            (name, vec!["Zen".to_string()], true, true, true)
         );
     }
     assert_eq!(d.hosted.servers(|s| s.channel(d.zen, 620)), None);
-    let mut names = d.hosted.sim(|s| s.threads.names_for("Zen"));
+    let mut names = d.hosted.sim(|s| s.threads.names_for(ZEN_BODY));
     names.sort();
     assert_eq!(names, ["zenworld #general", "zenworld #lore"]);
 
@@ -168,6 +181,7 @@ async fn a_join_is_told_and_opens_the_threads() {
             "guild_id": GUILD,
             "thread": general.thread,
             "mirrored_through": 0,
+            "mirrored_part": 0,
             "last_seen_discord": general.last_seen_discord,
         }))
     );
@@ -214,7 +228,7 @@ async fn a_guild_message_is_heard_from_who_wrote_it_and_wakes_the_character() {
         ]
     );
     let t = d.channel_thread(GENERAL).unwrap();
-    assert_eq!(t.members, ["Zen", "Kit (@kit)", WREN_S]);
+    assert_eq!(member_names(&t), ["Zen", "Kit (@kit)", WREN_S]);
     assert_eq!(
         t.messages.iter().map(|m| m.origin).collect::<Vec<_>>(),
         [
@@ -308,6 +322,8 @@ async fn the_characters_message_on_a_channel_is_posted() {
                 call,
                 decided: None,
                 pinned_at: None,
+                said: Some(Voiced::words("Hello, everyone!")),
+                source: ActSource::Mind,
             },
             None,
         )
@@ -319,9 +335,9 @@ async fn the_characters_message_on_a_channel_is_posted() {
     );
     let thread = d.record(GENERAL).unwrap().thread;
     d.hosted.with_sim(|s| {
-        s.threads.join(&thread, "Kettle");
+        s.threads.join(&thread, &Who::new("npc-kettle", "Kettle"));
         s.threads
-            .send_on(&thread, "Kettle", "Tea is ready.", None)
+            .send_on(&thread, "npc-kettle", Said::words("Tea is ready."))
             .unwrap();
     });
     d.until("posted", |d| {
@@ -330,11 +346,12 @@ async fn the_characters_message_on_a_channel_is_posted() {
     .await;
     let agent = d.discord.seen()[0].user_agent.clone();
     assert_eq!(
-        d.discord.seen(),
+        d.seen(),
         [
-            post(GENERAL, "Hello, zenworld.", &agent),
+            post(GENERAL, "Hello, everyone!", &agent),
             post(GENERAL, "> **Kettle:** Tea is ready.", &agent),
-        ]
+        ],
+        "the line voiced for the act is posted, never its intent"
     );
     d.settle().await;
     assert_eq!(d.discord.seen().len(), 2, "a post was made twice");
@@ -361,7 +378,11 @@ async fn a_403_closes_the_thread_and_is_not_retried() {
     );
     d.hosted.with_sim(|s| {
         s.threads
-            .send("Zen", "zenworld #general", "Can anyone hear me?")
+            .send(
+                ZEN_BODY,
+                "zenworld #general",
+                Said::words("Can anyone hear me?"),
+            )
             .unwrap();
     });
     d.until("closed", |d| {
@@ -371,7 +392,7 @@ async fn a_403_closes_the_thread_and_is_not_retried() {
     d.settle().await;
     assert_eq!(d.posts().len(), 1, "a forbidden post was tried again");
     assert_eq!(
-        d.hosted.sim(|s| s.threads.names_for("Zen")),
+        d.hosted.sim(|s| s.threads.names_for(ZEN_BODY)),
         ["zenworld #lore"]
     );
     assert_eq!(d.a.bots.online().await, [d.zen], "a 403 refused the bot");
@@ -408,7 +429,7 @@ async fn a_removal_is_told_and_closes_the_servers_threads() {
     for channel in [GENERAL, LORE] {
         assert!(!d.channel_thread(channel).unwrap().open);
     }
-    assert!(d.hosted.sim(|s| s.threads.names_for("Zen")).is_empty());
+    assert!(d.hosted.sim(|s| s.threads.names_for(ZEN_BODY)).is_empty());
 }
 
 /// **`READY` against the records**: a recorded server it does not name was
@@ -418,11 +439,12 @@ async fn a_removal_is_told_and_closes_the_servers_threads() {
 #[tokio::test]
 async fn ready_tells_of_the_servers_left_and_joined_while_offline() {
     let d = daemon(vec![Script::Serve]).await;
+    let zen = Who::new(ZEN_BODY, "Zen");
     let (gone, home) = d.hosted.with_sim(|s| {
         (
             s.threads
-                .open_standing("oldplace #chat", &["Zen".to_string()]),
-            s.threads.open_standing("home #hall", &["Zen".to_string()]),
+                .open_standing("oldplace #chat", slice::from_ref(&zen)),
+            s.threads.open_standing("home #hall", slice::from_ref(&zen)),
         )
     });
     d.hosted.with_servers(|s| {
@@ -437,6 +459,7 @@ async fn ready_tells_of_the_servers_left_and_joined_while_offline() {
                     guild_id: guild,
                     thread: thread.clone(),
                     mirrored_through: 0,
+                    mirrored_part: 0,
                     last_seen_discord: 900,
                 },
             );
@@ -499,7 +522,7 @@ async fn renames_rename_the_threads_and_channels_come_and_go() {
     );
     d.until("changed", |d| d.record(LORE).is_none()).await;
 
-    let mut names = d.hosted.sim(|s| s.threads.names_for("Zen"));
+    let mut names = d.hosted.sim(|s| s.threads.names_for(ZEN_BODY));
     names.sort();
     assert_eq!(names, ["zen world #lobby", "zen world #news"]);
     assert_eq!(d.record(GENERAL).unwrap().thread, general, "a new thread");
@@ -526,7 +549,7 @@ async fn the_gap_fetch_hears_what_a_channel_missed() {
     let d = daemon(vec![Script::Serve]).await;
     let thread = d.hosted.with_sim(|s| {
         s.threads
-            .open_standing("zenworld #general", &["Zen".to_string()])
+            .open_standing("zenworld #general", &[Who::new(ZEN_BODY, "Zen")])
     });
     d.hosted.with_servers(|s| {
         s.put_server(
@@ -543,6 +566,7 @@ async fn the_gap_fetch_hears_what_a_channel_missed() {
                 guild_id: GUILD,
                 thread,
                 mirrored_through: 0,
+                mirrored_part: 0,
                 last_seen_discord: 900,
             },
         );
@@ -675,7 +699,7 @@ async fn the_trace_keeps_each_post_and_each_failure() {
     );
     d.hosted.with_sim(|s| {
         s.threads
-            .send("Zen", "zenworld #general", "Hello?")
+            .send(ZEN_BODY, "zenworld #general", Said::words("Hello?"))
             .unwrap();
     });
     d.until("posted", |d| {

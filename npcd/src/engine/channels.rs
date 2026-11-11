@@ -50,8 +50,10 @@ fn line(name: &str, topic: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use super::*;
-    use crate::sim::phone::CHANNEL;
+    use crate::sim::phone::{Who, CHANNEL};
 
     /// **Each channel the character is on is one section**, its line its
     /// name and what it is for; a group, a direct thread, a channel it is not
@@ -59,17 +61,19 @@ mod tests {
     /// it reads none.
     #[test]
     fn each_channel_is_a_section_with_what_it_is_for() {
+        let zen = Who::new("npc-1", "Zen");
+        let wick = Who::new("npc-2", "Wick");
         let mut p = Threads::new();
-        let open = p.join_channel(CHANNEL, "Zen");
-        let research = p.open_standing("#research", &["Zen".to_string()]);
+        let open = p.join_channel(CHANNEL, &zen);
+        let research = p.open_standing("#research", slice::from_ref(&zen));
         p.describe(&research, Some("Findings and open questions"));
-        let elsewhere = p.open_standing("#ops", &["Wick".to_string()]);
-        let gone = p.open_standing("#old", &["Zen".to_string()]);
+        let elsewhere = p.open_standing("#ops", slice::from_ref(&wick));
+        let gone = p.open_standing("#old", slice::from_ref(&zen));
         p.close(&gone);
-        p.open_group("the sweep", &["Zen".to_string(), "Wick".to_string()]);
-        p.reach("Zen", "Wick");
+        p.open_group("the sweep", &[zen.clone(), wick.clone()]);
+        p.reach(&zen, &wick);
 
-        let mut got = sections(&p, "Zen", true);
+        let mut got = sections(&p, "npc-1", true);
         got.sort_by(|a, b| a.name.cmp(&b.name));
         let mut want = vec![
             ChannelSection {
@@ -84,6 +88,6 @@ mod tests {
         want.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(got, want);
         assert!(!got.iter().any(|s| s.name.ends_with(&elsewhere)));
-        assert_eq!(sections(&p, "Zen", false), []);
+        assert_eq!(sections(&p, "npc-1", false), []);
     }
 }

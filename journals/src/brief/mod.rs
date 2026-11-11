@@ -21,7 +21,9 @@ pub mod summary;
 use journal_core::tools::arguments;
 use serde_json::{Map, Value};
 
+use crate::line::Folds;
 use crate::path::{JournalPath, Place};
+use crate::scope::Section;
 use crate::time::Stamp;
 use crate::tree::fingerprint::dirty;
 use crate::tree::window::{next_fold, PeriodFold};
@@ -110,6 +112,14 @@ pub fn due(tree: &Tree, now: Stamp) -> Vec<Job> {
         }
     }
     let summaries = dirty(tree).into_iter().filter_map(|d| {
+        // A bot's journal takes a line for nearly everything it hears, says
+        // and does: summarised on every lull it would be summarised all day.
+        // It is rebuilt when a period of it folds, and its section when a
+        // bot's summary has.
+        if d.path.section() == Some(Section::Bots) {
+            let j = tree.get(&d.path)?;
+            return (refolded(j) || child_rebuilt(j)).then_some(Job::Summary { path: d.path });
+        }
         let settle = if d.reads_children {
             PARENT_QUIET_SECS
         } else {
@@ -123,12 +133,36 @@ pub fn due(tree: &Tree, now: Stamp) -> Vec<Job> {
     closes.into_iter().chain(folds).chain(summaries).collect()
 }
 
+/// A period of `j`'s window folded since its summary was built: its window
+/// holds fewer lines than the summary read — a bot's lines are only ever
+/// added, so only a fold takes them away — or it has a fold and no summary.
+fn refolded(j: &Journal) -> bool {
+    match j.summary() {
+        Some(s) => j.window.len() < s.lines,
+        None => j
+            .window
+            .iter()
+            .any(|l| matches!(l.folds, Some(Folds::Period(_)))),
+    }
+}
+
+/// A child of `j` was summarised after `j` was, or `j` has no summary and a
+/// child has one.
+fn child_rebuilt(j: &Journal) -> bool {
+    let built = j.summary().map(|s| s.built);
+    j.live()
+        .filter_map(|(_, c)| c.summary().map(|s| s.built))
+        .any(|b| built.is_none_or(|own| b > own))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::actor::Actor;
+    use crate::experience::{Experience, ExperienceKind};
     use crate::ops::fixture::{john, p, zen};
-    use crate::ops::{apply, OnTaken, Op};
+    use crate::ops::period_fold::lines_over;
+    use crate::ops::{apply, Lived, OnTaken, Op};
     use crate::scope::Channel;
     use crate::terms::Terms;
     use crate::testing::{at, slug};
@@ -205,6 +239,73 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(masters(built.plus(PARENT_QUIET_SECS)), ["@zen"]);
+    }
+
+    /// **A bot's journal is summarised when a period of it folds, never on a
+    /// lull or a count**: quiet for an hour and fifty lines new, it waits.
+    #[test]
+    fn a_bots_journal_is_summarised_only_when_a_period_folds() {
+        let mut t = zen();
+        let npcd = Actor::Npcd { group: slug("zen") };
+        let t0 = at("2026-10-01T00:00:00Z");
+        apply(
+            &mut t,
+            &npcd,
+            &Op::Create {
+                under: p("bots"),
+                name: slug("zen"),
+                cue: "open for Zen".into(),
+                on_taken: OnTaken::Refuse,
+            },
+            t0,
+        )
+        .unwrap();
+        let lines: Vec<Lived> = (0..=WINDOW)
+            .map(|i| Lived {
+                at: t0.plus(3600 * i as i64),
+                text: format!("did {i}"),
+                experience: Experience::of(ExperienceKind::Did),
+            })
+            .collect();
+        apply(
+            &mut t,
+            &npcd,
+            &Op::Episodes {
+                path: p("bots/zen"),
+                lines,
+            },
+            t0,
+        )
+        .unwrap();
+        let summaries = |t: &Tree, now| -> Vec<String> {
+            due(t, now)
+                .iter()
+                .filter(|j| matches!(j, Job::Summary { .. }))
+                .filter(|j| j.path().section() == Some(Section::Bots))
+                .map(|j| j.path().show())
+                .collect()
+        };
+        let later = at("2026-10-01T03:00:00Z").plus(10 * PARENT_QUIET_SECS);
+        assert_eq!(summaries(&t, later), Vec::<String>::new());
+        let now = at("2026-10-04T00:00:00Z");
+        let Some(Job::Fold { path, plan }) = due(&t, now).into_iter().next() else {
+            panic!("the first closed day folds");
+        };
+        let over = lines_over(t.get(&path).unwrap(), &plan.ids);
+        apply(
+            &mut t,
+            &Actor::Zend,
+            &Op::FoldPeriod {
+                over,
+                path,
+                period: plan.period,
+                ids: plan.ids,
+                text: "A day of chores.".into(),
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(summaries(&t, now), ["@zen/bots/zen"]);
     }
 
     #[test]

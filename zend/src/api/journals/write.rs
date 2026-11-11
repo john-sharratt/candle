@@ -161,7 +161,7 @@ pub fn batch(
                 return stopped(StatusCode::NOT_FOUND, "not_found", i, e, Vec::new())
             }
         };
-        match applied_to(&tree, &actor, &p.op, p.at, None) {
+        match applied_to(&tree, &actor, &p.op, p.at, &[]) {
             Ok((next, _)) => tree = Arc::new(next),
             Err(e) => {
                 let (status, code) = status_of_journal(&e);

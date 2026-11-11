@@ -9,17 +9,17 @@
 //! whose origin the thread already holds is not said twice.
 
 use super::record::Channel;
-use crate::sim::phone::Origin;
+use crate::sim::phone::{Origin, Said, Who};
 use crate::world::Hosted;
 
 /// Say `text`, from `from`, on the thread of character `npc`'s server
-/// channel `channel`, to member `to` when it was said to one: whether the
-/// thread holds it now.
+/// channel `channel`, to the member `to` (by id) when it was said to one:
+/// whether the thread holds it now.
 pub fn channel_message(
     hosted: &Hosted,
     npc: u64,
     channel: u64,
-    from: &str,
+    from: &Who,
     text: &str,
     origin: Option<Origin>,
     to: Option<&str>,
@@ -35,7 +35,14 @@ pub fn channel_message(
             return true;
         }
         s.threads.join(&thread, from);
-        s.threads.send_to(&thread, from, text, origin, to).is_ok()
+        let said = Said {
+            text: text.to_string(),
+            origin,
+            to: to.map(str::to_string),
+            account: Some(from.id.clone()),
+            ..Said::default()
+        };
+        s.threads.send_on(&thread, &from.id, said).is_ok()
     })
 }
 
@@ -50,11 +57,14 @@ mod tests {
     #[test]
     fn a_channel_message_joins_its_author_and_is_said_once() {
         let hosted = Hosted::load("creators-vault", ROOMS).unwrap();
+        let wren = Who::new("discord:31", "Wren (@wren)");
         let thread = hosted.with_sim(|s| {
             let id = s
                 .threads
-                .open_standing("zenworld #general", &["Zen".to_string()]);
-            s.threads.send_on(&id, "Zen", "earlier", None).unwrap();
+                .open_standing("zenworld #general", &[Who::new("npc-1", "Zen")]);
+            s.threads
+                .send_on(&id, "npc-1", Said::words("earlier"))
+                .unwrap();
             id
         });
         hosted.with_servers(|s| {
@@ -65,6 +75,7 @@ mod tests {
                     guild_id: 600,
                     thread: thread.clone(),
                     mirrored_through: 1,
+                    mirrored_part: 0,
                     last_seen_discord: 900,
                 },
             )
@@ -74,71 +85,48 @@ mod tests {
             channel: 610,
         });
         let said = |text: &str, origin: Option<Origin>, to: Option<&str>| {
-            channel_message(&hosted, 42, 610, "Wren (@wren)", text, origin, to)
+            channel_message(&hosted, 42, 610, &wren, text, origin, to)
         };
         assert!(said("hi", origin, None));
         assert!(said("hi", origin, None));
-        assert!(said("Zen, you there?", None, Some("Zen")));
+        assert!(said("Zen, you there?", None, Some("npc-1")));
         let (members, said, waiting) = hosted.sim(|s| {
             let t = s.threads.get(&thread).unwrap();
             (
-                t.members.clone(),
+                t.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
                 t.messages
                     .iter()
                     .map(|m| {
                         (
                             m.seq,
                             m.from.clone(),
-                            m.intent.clone(),
+                            m.text.clone(),
                             m.origin,
                             m.to.clone(),
                         )
                     })
                     .collect::<Vec<_>>(),
-                t.unread_for("Wren (@wren)"),
+                t.unread_for("discord:31"),
             )
         });
-        assert_eq!(members, ["Zen", "Wren (@wren)"]);
+        assert_eq!(members, ["npc-1", "discord:31"]);
         assert_eq!(
             said,
             [
-                (1, "Zen".to_string(), "earlier".to_string(), None, None),
-                (
-                    2,
-                    "Wren (@wren)".to_string(),
-                    "hi".to_string(),
-                    origin,
-                    None
-                ),
+                (1, "npc-1".to_string(), "earlier".to_string(), None, None),
+                (2, "discord:31".to_string(), "hi".to_string(), origin, None),
                 (
                     3,
-                    "Wren (@wren)".to_string(),
+                    "discord:31".to_string(),
                     "Zen, you there?".to_string(),
                     None,
-                    Some("Zen".to_string())
+                    Some("npc-1".to_string())
                 ),
             ]
         );
         assert_eq!(waiting, 0, "a newcomer was handed the backlog");
-
-        assert!(!channel_message(
-            &hosted,
-            42,
-            611,
-            "Wren (@wren)",
-            "x",
-            None,
-            None
-        ));
+        assert!(!channel_message(&hosted, 42, 611, &wren, "x", None, None));
         hosted.with_sim(|s| s.threads.close(&thread));
-        assert!(!channel_message(
-            &hosted,
-            42,
-            610,
-            "Wren (@wren)",
-            "x",
-            None,
-            None
-        ));
+        assert!(!channel_message(&hosted, 42, 610, &wren, "x", None, None));
     }
 }

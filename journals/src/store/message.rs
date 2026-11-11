@@ -28,15 +28,15 @@ pub fn is_diaries(message: &str) -> bool {
     message.lines().any(|l| l == DIARIES)
 }
 
-/// The message of `op`'s commit; `line` is the line it wrote, when it wrote
-/// one, so a replay keeps that line's id.
-pub fn message(subject: &str, actor: &Actor, op: &Op, now: Stamp, line: Option<&LineId>) -> String {
+/// The message of `op`'s commit; `lines` are the lines it wrote, in order —
+/// one, or a batch's — so a replay keeps their ids.
+pub fn message(subject: &str, actor: &Actor, op: &Op, now: Stamp, lines: &[LineId]) -> String {
     let mut out = format!("{subject}\n\n");
     for (k, v) in actor.trailers() {
         out.push_str(&format!("{k}: {v}\n"));
     }
     out.push_str(&format!("{AT}: {now}\n"));
-    if let Some(id) = line {
+    for id in lines {
         out.push_str(&format!("{LINE}: {id}\n"));
     }
     out.push_str(&format!("{ACTOR}: {}\n", actor_to_wire(actor)));
@@ -50,12 +50,22 @@ pub struct Recorded {
     pub actor: Actor,
     pub op: Op,
     pub at: Stamp,
-    pub line: Option<LineId>,
+    /// The lines it wrote, in order: none, one, or a batch's.
+    pub lines: Vec<LineId>,
 }
 
 fn trailer<'a>(message: &'a str, k: &str) -> Option<&'a str> {
     let prefix = format!("{k}: ");
     message.lines().rev().find_map(|l| l.strip_prefix(&prefix))
+}
+
+/// Every `k` trailer, in the order written.
+fn trailers<'a>(message: &'a str, k: &str) -> Vec<&'a str> {
+    let prefix = format!("{k}: ");
+    message
+        .lines()
+        .filter_map(|l| l.strip_prefix(&prefix))
+        .collect()
 }
 
 pub fn read(message: &str) -> Result<Recorded> {
@@ -69,17 +79,22 @@ pub fn read(message: &str) -> Result<Recorded> {
         actor: actor_from_wire(&json(need(ACTOR)?)?)?,
         op: op_from_wire(&json(need(OP)?)?)?,
         at: Stamp::parse(need(AT)?).map_err(Error::Invalid)?,
-        line: trailer(message, LINE)
+        lines: trailers(message, LINE)
+            .into_iter()
             .map(LineId::parse)
-            .transpose()
+            .collect::<std::result::Result<_, _>>()
             .map_err(Error::Invalid)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use super::*;
+    use crate::experience::{Experience, ExperienceKind};
     use crate::ops::fixture::{now, p, yen};
+    use crate::ops::Lived;
     use crate::terms::Terms;
     use crate::testing::slug;
 
@@ -92,7 +107,13 @@ mod tests {
             terms: Terms::default(),
         };
         let id = LineId::parse("2026-10-30-1200-7e3a").unwrap();
-        let m = message("Note on @zen/topics", &yen(), &op, now(), Some(&id));
+        let m = message(
+            "Note on @zen/topics",
+            &yen(),
+            &op,
+            now(),
+            slice::from_ref(&id),
+        );
         assert!(m.starts_with(
             "Note on @zen/topics\n\nJournal-Writer: grok\nJournal-Account: yen\nJournal-Channel: grok\nJournal-At: 2026-10-30T12:00:00Z\nJournal-Line: 2026-10-30-1200-7e3a\nJournal-Actor: "
         ), "{m}");
@@ -102,11 +123,35 @@ mod tests {
                 actor: yen(),
                 op: op.clone(),
                 at: now(),
-                line: Some(id)
+                lines: vec![id]
             }
         );
-        let no_line = message("x", &yen(), &op, now(), None);
-        assert_eq!(read(&no_line).unwrap().line, None);
+        let no_line = message("x", &yen(), &op, now(), &[]);
+        assert_eq!(read(&no_line).unwrap().lines, vec![]);
+    }
+
+    /// **A batch's commit names each of its lines, in order**, so a replay
+    /// keeps every id.
+    #[test]
+    fn a_batch_names_every_line_in_order() {
+        let op = Op::Episodes {
+            path: p("bots/zen"),
+            lines: vec![Lived {
+                at: now(),
+                text: "x".into(),
+                experience: Experience::of(ExperienceKind::Did),
+            }],
+        };
+        let ids = [
+            LineId::parse("2026-10-30-1200-aaaa").unwrap(),
+            LineId::parse("2026-10-30-1159-bbbb").unwrap(),
+        ];
+        let npcd = Actor::Npcd { group: slug("zen") };
+        let m = message("2 episodes on @zen/bots/zen", &npcd, &op, now(), &ids);
+        assert!(
+            m.contains("Journal-Line: 2026-10-30-1200-aaaa\nJournal-Line: 2026-10-30-1159-bbbb\n")
+        );
+        assert_eq!(read(&m).unwrap().lines, ids);
     }
 
     #[test]

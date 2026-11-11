@@ -36,6 +36,7 @@ pub fn remap(op: &mut Op, renamed: &BTreeMap<LineId, LineId>) {
         }
         Op::Note { .. }
         | Op::Episode { .. }
+        | Op::Episodes { .. }
         | Op::Activity { .. }
         | Op::Forget {
             which: Which::Says(_),

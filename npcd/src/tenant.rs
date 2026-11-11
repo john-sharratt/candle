@@ -29,6 +29,7 @@ use futures::future::BoxFuture;
 use host::guard::{Api, Guarded, Routes};
 use host::{OneShot, Running, Tenant, TenantContext, TenantUi, MODEL};
 use include_dir::{include_dir, Dir};
+use journals::slug::Slug;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::runtime::Handle;
@@ -107,6 +108,14 @@ pub struct NpcdArgs {
     /// The branch of `--mind-repo` that is the record.
     #[arg(long, value_name = "BRANCH", default_value = DEFAULT_MIND_BRANCH)]
     pub mind_branch: String,
+
+    /// npcd's checkout of the journals repository, `journals-npcd`: where a
+    /// world that names a journals group writes its bots' experience
+    /// (`docs/npc_conversations.md` §5.0). Its own clone, never zend's — a
+    /// store commits on a private ref, so two never share a checkout. With
+    /// none, no world keeps journals on this member.
+    #[arg(long, value_name = "DIR")]
+    pub journals_dir: Option<PathBuf>,
 
     /// Log the identity each request to npcd's own routes arrived with, the
     /// peer it came from, and the role it resolved to. Header **values are
@@ -218,6 +227,7 @@ impl Default for NpcdArgs {
             data: None,
             mind_repo: None,
             mind_branch: DEFAULT_MIND_BRANCH.to_string(),
+            journals_dir: None,
             log_identity: false,
             forget_conversations: false,
             forget_dreams: false,
@@ -547,6 +557,11 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // handed to the state, then given the resolvers that read that state back.
     // That order breaks the cycle between them.
     let runtime = Runtime::new(mind_for_engine, &data)?;
+    // npcd's own checkout of the journals repository, when this member keeps
+    // one: the worlds that name a group write their bots' experience there.
+    if let Some(dir) = &args.journals_dir {
+        runtime.journals.start(dir.clone());
+    }
 
     // The engine adopts the substrate the cast was just loaded from: one
     // `substrate/` takes one writable handle. See `Npcs::substrate`.
@@ -990,6 +1005,13 @@ async fn host_worlds(runtime: &Arc<Runtime>, authored: &Arc<Authored>, authored_
     // hosted, and a former id is never a world of its own
     // (`docs/world_rename.md` §2).
     authored.renamings(runtime).await;
+    // Each world's journals group, from its file (`docs/npc_conversations.md`
+    // §5.0): a world that names none keeps no journal memory.
+    for record in authored.worlds.read().await.iter() {
+        runtime
+            .journals
+            .set_group(&record.id, journals_group(&record.body));
+    }
     let ids: Vec<String> = authored
         .worlds
         .read()
@@ -1014,6 +1036,19 @@ async fn host_worlds(runtime: &Arc<Runtime>, authored: &Arc<Authored>, authored_
                 w.read(|w| w.map().areas().map(|a| a.nodes.len()).sum::<usize>())
             ),
             Err(e) => tracing::error!("world `{id}`: its map did not load: {e:#}"),
+        }
+    }
+}
+
+/// The journals group a world's file names, `journals: {group: moon}`: `None`
+/// for a world with none, or one whose group is not a name.
+fn journals_group(world: &Value) -> Option<Slug> {
+    let named = world.get("journals")?.get("group")?.as_str()?;
+    match Slug::parse(named) {
+        Ok(group) => Some(group),
+        Err(e) => {
+            tracing::error!("a world's journals group: {e} — it keeps no journals");
+            None
         }
     }
 }

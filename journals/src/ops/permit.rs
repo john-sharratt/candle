@@ -6,7 +6,7 @@
 //! | the server | episodes anywhere its person reads but `bots`; create and close conversations |
 //! | zend | summaries, period folds, stale marks; episodes anywhere; notes, journals and closes under `threads` |
 //! | a worker | notes to its thread; to `topics` and `people` only as proposals |
-//! | npcd | notes, episodes, journals and closes under a group's `bots` |
+//! | npcd | a bot's journal in its group's `bots`, and batches of episodes into it; it reads its group's `bots` and `people` alone |
 //! | a bot, a guest | nothing: a bot reads its grants, a guest `@guest` |
 //! | the system | binding an account |
 //!
@@ -76,6 +76,7 @@ fn texts(op: &Op) -> Vec<&str> {
         Op::Episode { text, .. } | Op::Edit { text, .. } | Op::FoldPeriod { text, .. } => {
             vec![text]
         }
+        Op::Episodes { lines, .. } => lines.iter().map(|l| l.text.as_str()).collect(),
         Op::Activity { calls, .. } => calls.iter().map(|c| c.subject.as_str()).collect(),
         Op::Create { cue, .. } | Op::Link { cue, .. } => vec![cue],
         Op::Summarize {
@@ -173,9 +174,6 @@ pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
             Ok(())
         }
         (Actor::Zend, Op::Note { path, .. }) if in_sections(path, &[Section::Threads]) => Ok(()),
-        (Actor::Npcd { .. }, Op::Note { path, .. }) if in_sections(path, &[Section::Bots]) => {
-            Ok(())
-        }
         (_, Op::Note { .. }) => Err(no(actor, "note there")),
 
         // Episodes.
@@ -185,10 +183,19 @@ pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
             Ok(())
         }
         (Actor::Zend, Op::Episode { .. }) => Ok(()),
-        (Actor::Npcd { .. }, Op::Episode { path, .. }) if in_sections(path, &[Section::Bots]) => {
+        (_, Op::Episode { .. }) => Err(no(actor, "record episodes there")),
+
+        // A bot's experience: npcd's alone, a bot's journal at a time.
+        (Actor::Npcd { .. }, Op::Episodes { path, .. })
+            if path.place()?
+                == Place::Named {
+                    section: Section::Bots,
+                    depth: 1,
+                } =>
+        {
             Ok(())
         }
-        (_, Op::Episode { .. }) => Err(no(actor, "record episodes there")),
+        (_, Op::Episodes { .. }) => Err(no(actor, "record a bot's episodes there")),
 
         // What a conversation's calls did: the server's record alone.
         (Actor::Server { .. }, Op::Activity { path, .. })
@@ -260,8 +267,10 @@ pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
         {
             Ok(())
         }
-        (Actor::Npcd { .. }, Op::Create { under, .. } | Op::Close { path: under })
-            if in_sections(under, &[Section::Bots]) =>
+        // npcd opens a bot's journal; nothing below one, and it never closes
+        // one: a bot's journal is its for as long as the bot is.
+        (Actor::Npcd { .. }, Op::Create { under, .. })
+            if under.place()? == Place::Section(Section::Bots) =>
         {
             Ok(())
         }
@@ -391,6 +400,7 @@ fn paths(op: &Op) -> Vec<&JournalPath> {
     match op {
         Op::Note { path, .. }
         | Op::Episode { path, .. }
+        | Op::Episodes { path, .. }
         | Op::Activity { path, .. }
         | Op::Forget { path, .. }
         | Op::Close { path }

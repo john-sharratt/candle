@@ -39,6 +39,7 @@ use serde_json::{Map, Value};
 use npc_map::world::{Refused, Voice, Where};
 use npc_map::NodeKind;
 
+use crate::authority::ops::Voiced;
 use crate::bridge;
 use crate::engine::act::Act;
 use crate::engine::agenda;
@@ -225,7 +226,14 @@ pub fn is_of_the_house(tool: &str) -> bool {
 
 /// Perform one act against the world a body stands in.
 pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
-    let done = dispatch(hosted, body, act);
+    perform_said(hosted, body, act, None)
+}
+
+/// [`perform`], with the line the lease holder voiced for a phone act: what
+/// lands on the thread in place of the act's intent
+/// (`docs/npc_conversations.md` §7.1).
+pub fn perform_said(hosted: &Hosted, body: &str, act: &Act, said: Option<&Voiced>) -> Outcome {
+    let done = dispatch(hosted, body, act, said);
     // **A refusal is the world saying a way is shut**, and the stuck desk
     // believes a report only after one (`Mission::refuse_stuck_on_the_way`).
     // The desk's own answers are not the world refusing the way.
@@ -246,7 +254,7 @@ const DESK_REPORTS: &[&str] = &[
     "order_results",
 ];
 
-fn dispatch(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
+fn dispatch(hosted: &Hosted, body: &str, act: &Act, said: Option<&Voiced>) -> Outcome {
     match act.tool {
         // `speak` is not offered any more, but a model that has seen it will
         // reach for it — and reading it as what it plainly means costs one arm
@@ -269,7 +277,7 @@ fn dispatch(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         // the larger of the two and its names are unambiguous.
         t if crate::engine::work::is_mine(t) => crate::engine::work::perform(hosted, body, act),
         t if agenda::is_mine(t) => agenda::perform(hosted, body, act),
-        _ => crate::engine::enact::perform(hosted, body, act),
+        _ => crate::engine::enact::perform_said(hosted, body, act, said),
     }
 }
 

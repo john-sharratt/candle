@@ -62,52 +62,45 @@ pub fn say(threads: &[String], lately: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::sim::phone::Threads;
+    use crate::sim::phone::{Said, Threads, Who};
 
     use super::*;
 
+    fn crew() -> Vec<Who> {
+        vec![
+            Who::new("npc-1", "Wren"),
+            Who::new("npc-2", "Pax"),
+            Who::new("npc-3", "Soren"),
+        ]
+    }
+
     fn talk() -> Threads {
         let mut t = Threads::new();
-        t.reach("Wren", "Pax");
-        t.send("Pax", "Wren", "asks where the ledger went").unwrap();
+        let id = t.open_group("repair crew", &crew());
+        t.send_on(&id, "npc-2", Said::words("where did the ledger go?"))
+            .unwrap();
         t
     }
 
     #[test]
-    fn a_direct_thread_reads_with_its_unread_and_none_of_its_content() {
+    fn a_group_reads_with_its_unread_and_none_of_its_content() {
         let t = talk();
-        let th = t.of("Wren").into_iter().next().unwrap();
-        assert_eq!(thread_line(th, "Wren"), "Pax: 1 unread.");
+        let th = t.groups_of("npc-1").into_iter().next().unwrap();
+        assert_eq!(
+            thread_line(th, "npc-1"),
+            "repair crew (a group of 3): 1 unread."
+        );
+        assert!(!thread_line(th, "npc-1").contains("ledger"));
     }
 
     #[test]
     fn a_thread_with_nothing_unread_says_so() {
         let mut t = Threads::new();
-        t.reach("Wren", "Pax");
-        let th = t.of("Wren").into_iter().next().unwrap();
-        assert_eq!(thread_line(th, "Wren"), "Pax: nothing unread.");
-    }
-
-    #[test]
-    fn what_was_said_never_appears_in_the_line() {
-        let mut t = talk();
-        t.send("Wren", "Pax", "says it is in the vault").unwrap();
-        let th = t.of("Wren").into_iter().next().unwrap();
-        assert!(!thread_line(th, "Wren").contains("vault"));
-    }
-
-    #[test]
-    fn a_group_is_named_and_counted() {
-        let mut t = Threads::new();
-        t.open_group(
-            "repair crew",
-            &["Wren".into(), "Pax".into(), "Soren".into()],
-        );
-        let th = t.of("Wren").into_iter().next().unwrap();
-        assert!(
-            thread_line(th, "Wren").starts_with("repair crew (a group of 3): "),
-            "{}",
-            thread_line(th, "Wren")
+        t.open_group("repair crew", &crew());
+        let th = t.groups_of("npc-1").into_iter().next().unwrap();
+        assert_eq!(
+            thread_line(th, "npc-1"),
+            "repair crew (a group of 3): nothing unread."
         );
     }
 

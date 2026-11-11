@@ -39,6 +39,13 @@
 //! reason when the change is live but was not kept — so the operator learns
 //! the change took but is not yet safe from a restart, rather than being told a
 //! comfortable half-truth.
+//!
+//! # Made by the world's authority
+//!
+//! Whichever member the route reaches, the edit travels as
+//! [`WorldOp::Reshape`] and is applied by the world's authority
+//! ([`reshape_here`]), which writes the world — so it is made once, and the
+//! world's journal is told once (`docs/npc_conversations.md` §5.1.1).
 
 use std::path::Component;
 
@@ -52,11 +59,13 @@ use serde_json::{json, Value};
 use npc_map::MapEdit;
 
 use crate::api::err;
+use crate::authority::ops::{OpReply, WorldOp};
 use crate::drafts::disk::Disk;
 use crate::drafts::Author;
 use crate::effector::auth::DeviceCaller;
 use crate::effector::router::Local;
 use crate::effector::token::Scope;
+use crate::engine::experience::concern::Change;
 use crate::engine::runtime::Runtime;
 use crate::world::mapstore::Keep;
 use crate::world::{Durability, Hosted};
@@ -93,13 +102,13 @@ async fn reshape_world(
             "the world is not running",
         );
     };
-    let Some(hosted) = runtime.hosted.get(&world) else {
+    if runtime.hosted.get(&world).is_none() {
         return err(
             StatusCode::NOT_FOUND,
             "no_such_world",
             &format!("no world `{world}` is hosted here"),
         );
-    };
+    }
     // The edit is the body, parsed prescriptively so a malformed one teaches
     // rather than crashes (§12).
     let Some(Json(raw)) = payload else {
@@ -121,32 +130,26 @@ async fn reshape_world(
         }
     };
 
-    let keep = keep_for(&runtime, &hosted, caller.npc_id).await;
-    match hosted.reshape(&edit, keep) {
-        Ok(reshaped) => {
-            let (durable, detail) = match reshaped.durability {
-                Durability::Written => ("written", None),
-                Durability::Drafted => (
-                    "drafted",
-                    Some(
-                        "the change is in its author's drafts: publish them to make it the \
-                         authored map"
-                            .to_string(),
-                    ),
-                ),
-                Durability::Ephemeral => (
-                    "ephemeral",
-                    Some(
-                        "this world has no authored map, or nobody to keep the change for, so it \
-                         holds for this run only"
-                            .to_string(),
-                    ),
-                ),
-                Durability::Failed(reason) => ("failed", Some(reason)),
-            };
+    // Applied by the world's authority, wherever this was asked, so the
+    // change is made — and journaled — once.
+    let op = WorldOp::Reshape {
+        npc: caller.npc_id,
+        edit,
+    };
+    match runtime.world_write(&world, op).await {
+        Ok(OpReply::Reshaped {
+            refused: Some(reason),
+            ..
+        }) => err(StatusCode::CONFLICT, "refused", &reason),
+        Ok(OpReply::Reshaped {
+            relocated,
+            durable,
+            detail,
+            refused: None,
+        }) => {
             let mut body = json!({
                 "ok": true,
-                "relocated": reshaped.relocated,
+                "relocated": relocated,
                 "durable": durable,
             });
             if let Some(detail) = detail {
@@ -154,9 +157,92 @@ async fn reshape_world(
             }
             Json(body).into_response()
         }
-        // The world's own words on why it would not take the edit.
-        Err(reason) => err(StatusCode::CONFLICT, "refused", &reason),
+        Ok(other) => err(
+            StatusCode::BAD_GATEWAY,
+            "no_answer",
+            &format!("the world answered {other:?}"),
+        ),
+        Err(e) => err(
+            StatusCode::BAD_GATEWAY,
+            "no_answer",
+            &format!("the world did not answer: {e:#}"),
+        ),
     }
+}
+
+/// Reshape `world`, which this member writes, by `edit` asked through
+/// character `npc`'s token, and tell the world's journal
+/// (`docs/npc_conversations.md` §5.1.1).
+pub(crate) async fn reshape_here(rt: &Runtime, world: &str, edit: &MapEdit, npc: u64) -> OpReply {
+    let refused = |why: String| OpReply::Reshaped {
+        relocated: Vec::new(),
+        durable: String::new(),
+        detail: None,
+        refused: Some(why),
+    };
+    let Some(hosted) = rt.hosted.get(world) else {
+        return refused(format!("no world `{world}` is hosted here"));
+    };
+    let keep = keep_for(rt, &hosted, npc).await;
+    let reshaped = match hosted.reshape(edit, keep) {
+        Ok(reshaped) => reshaped,
+        // The world's own words on why it would not take the edit.
+        Err(why) => return refused(why),
+    };
+    rt.changed(
+        &hosted,
+        Change::World {
+            line: reshaped_line(edit),
+        },
+    );
+    let (durable, detail) = match reshaped.durability {
+        Durability::Written => ("written", None),
+        Durability::Drafted => (
+            "drafted",
+            Some(
+                "the change is in its author's drafts: publish them to make it the authored map"
+                    .to_string(),
+            ),
+        ),
+        Durability::Ephemeral => (
+            "ephemeral",
+            Some(
+                "this world has no authored map, or nobody to keep the change for, so it holds \
+                 for this run only"
+                    .to_string(),
+            ),
+        ),
+        Durability::Failed(reason) => ("failed", Some(reason)),
+    };
+    OpReply::Reshaped {
+        relocated: reshaped.relocated,
+        durable: durable.to_string(),
+        detail,
+        refused: None,
+    }
+}
+
+/// What the world's journal is told of a reshape: what changed, in words a
+/// reader with no map in front of them can follow.
+pub fn reshaped_line(edit: &MapEdit) -> String {
+    let what = match edit {
+        MapEdit::AddArea(_) => "a new area was added".to_string(),
+        MapEdit::RemoveArea(id) => format!("the area {id} was taken away"),
+        MapEdit::AddNode { area, .. } => format!("a room was added to {area}"),
+        MapEdit::RemoveNode(at) => format!("the room {at} was taken away"),
+        MapEdit::Retitle { at, name } => format!("{at} is now called {name}"),
+        MapEdit::AddPortal { area, .. } => format!("a new way through was opened in {area}"),
+        MapEdit::RemovePortal { area, between } => format!(
+            "the way between {} and {} in {area} was closed",
+            between[0], between[1]
+        ),
+        MapEdit::PlacePart { at, .. } => format!("something was put in {at}"),
+        MapEdit::UnplacePart { at, part } => format!("{part} was taken out of {at}"),
+        MapEdit::DefinePart(_) => "a new kind of thing was made".to_string(),
+        MapEdit::LinkPart { part, .. } => format!("{part} was linked to a device"),
+        MapEdit::Describe { at, .. } => format!("{at} was described anew"),
+    };
+    format!("The world was reshaped: {what}.")
 }
 
 /// Where a reshape of `hosted`, asked for through character `npc`'s token, is
@@ -211,7 +297,7 @@ mod tests {
     use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
     use axum::http::{Request, StatusCode};
     use npc_map::world::{Where, World};
-    use npc_map::MapSet;
+    use npc_map::{MapEdit, MapSet};
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -391,5 +477,30 @@ mod tests {
         let (status, out) = send(&rt, &tokens, &token, "/reshape/creators-vault", Some(edit)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{out}");
         assert_eq!(out["error"], json!("refused"), "{out}");
+    }
+
+    /// **What the world's journal is told of a reshape**, in words.
+    #[test]
+    fn a_reshape_is_told_to_the_journal_in_words() {
+        let at = Where::parse("vault-casting/green-room").unwrap();
+        assert_eq!(
+            super::reshaped_line(&MapEdit::Retitle {
+                at: at.clone(),
+                name: "the blue room".into(),
+            }),
+            "The world was reshaped: vault-casting/green-room is now called the blue room."
+        );
+        assert_eq!(
+            super::reshaped_line(&MapEdit::RemoveArea("vault-casting".into())),
+            "The world was reshaped: the area vault-casting was taken away."
+        );
+        assert_eq!(
+            super::reshaped_line(&MapEdit::RemovePortal {
+                area: "vault-casting".into(),
+                between: ["green-room".into(), "hall".into()],
+            }),
+            "The world was reshaped: the way between green-room and hall in vault-casting was \
+             closed."
+        );
     }
 }

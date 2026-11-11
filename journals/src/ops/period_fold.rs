@@ -38,6 +38,12 @@ pub fn lines_over(j: &Journal, ids: &[LineId]) -> Fingerprint {
 /// One line's fields as [`lines_over`] reads them, each closed by a NUL.
 fn line_bytes(l: &Line) -> Vec<u8> {
     let mut bytes = Vec::new();
+    let about = l
+        .experience
+        .as_ref()
+        .and_then(|e| e.about.as_ref())
+        .map(JournalPath::show)
+        .unwrap_or_default();
     for field in [
         l.at.to_string().as_str(),
         l.kind.name(),
@@ -46,6 +52,8 @@ fn line_bytes(l: &Line) -> Vec<u8> {
         l.speaker.as_ref().map_or("", |p| p.as_str()),
         l.channel.map_or("", |c| c.name()),
         if l.proposed { "proposed" } else { "" },
+        l.experience.as_ref().map_or("", |e| e.kind.name()),
+        about.as_str(),
         l.text.as_str(),
     ] {
         bytes.extend_from_slice(field.as_bytes());
@@ -104,6 +112,7 @@ pub fn fold_period(
         folds: Some(Folds::Period(period)),
         proposed: false,
         terms: Terms::default(),
+        experience: None,
         text,
     };
     let id = fold.id.clone();
@@ -119,6 +128,7 @@ pub fn fold_period(
 mod tests {
     use super::*;
     use crate::actor::Actor;
+    use crate::experience::{Experience, ExperienceKind};
     use crate::ops::fixture::{john, p, zen};
     use crate::ops::{apply, Op};
     use crate::path::Address;
@@ -292,6 +302,16 @@ mod tests {
         let mut respoken = j.clone();
         respoken.window[1].speaker = Some(slug("yen"));
         assert_ne!(lines_over(&j, &ids), lines_over(&respoken, &ids));
+        let mut reexperienced = j.clone();
+        reexperienced.window[1].experience = Some(Experience::of(ExperienceKind::Heard));
+        assert_ne!(lines_over(&j, &ids), lines_over(&reexperienced, &ids));
+        let mut readdressed = reexperienced.clone();
+        readdressed.window[1].experience =
+            Some(Experience::about(ExperienceKind::Heard, p("people/yen")));
+        assert_ne!(
+            lines_over(&reexperienced, &ids),
+            lines_over(&readdressed, &ids)
+        );
         assert_ne!(lines_over(&j, &ids), lines_over(&j, &ids[..1]));
         let mut reordered = j.clone();
         reordered.window.swap(0, 1);

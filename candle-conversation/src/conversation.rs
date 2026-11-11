@@ -5177,6 +5177,25 @@ impl Sequence {
         self.target.timeline
     }
 
+    /// Whether the state this sequence's newest sealed turn left is in a
+    /// durable record, so dropping the sequence now and resuming the timeline
+    /// later, on any slot, restores it rather than an older turn's.
+    ///
+    /// A model that carries no recurrent state has nothing to restore beyond
+    /// the timeline's K/V, which sealing made durable: true at once. So is a
+    /// timeline with no turn sealed yet.
+    pub fn sealed_state_durable(&self) -> bool {
+        if !self.model_core.carries_recurrent_state {
+            return true;
+        }
+        let timeline = self.target.timeline;
+        let sealed = self.substrate.read().turn_count(timeline);
+        match sealed.checked_sub(1) {
+            None => true,
+            Some(newest) => self.substrate.snapshot_durable(timeline, newest),
+        }
+    }
+
     /// Seed this sequence's recurrent memory from the nearest ancestor that has
     /// a snapshot — the conversation it continues.
     ///

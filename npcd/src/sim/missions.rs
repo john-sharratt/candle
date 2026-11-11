@@ -33,11 +33,13 @@ use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Serialize};
 
 use super::agenda::{Agendum, Priority, KEEP};
+use super::kept_steps::kept_steps;
 use super::operations::{Operation, Operations};
 use super::orders::{Filed, Notice, Orders, EVERY_POSTER};
 use super::round::RoundState;
+use crate::engine::authorize::Authorizer;
 use crate::engine::mission::bank::{self, Duty, Facts};
-use crate::engine::mission::{Mission, MissionPrompt, Origin, Outcome, StepOutcome, Todo};
+use crate::engine::mission::{Mission, MissionPrompt, Origin, Outcome, StepOutcome};
 use crate::engine::mission_gen::round::{Item as RoundItem, STALE_MS};
 use crate::engine::mission_gen::world::{self, Draw, Routine};
 use crate::engine::workflow::{Next, Taker, Where, Workflow, STUCK};
@@ -205,10 +207,10 @@ pub struct Missions {
     /// mind's, with the routines.
     #[serde(skip)]
     draw: Draw,
-    /// Who may approve a critical step (`docs/mission_templates.md` §6), by the
-    /// name the world writes — the mind's, read afresh like the routines.
+    /// Who may approve a critical step (`docs/mission_templates.md` §6), by
+    /// account — the mind's, read afresh like the routines.
     #[serde(skip)]
-    authorizers: Vec<String>,
+    authorizers: Vec<Authorizer>,
     /// What the world's round has done — see [`super::round`].
     #[serde(default)]
     round: RoundState,
@@ -386,21 +388,42 @@ impl Missions {
             m.prompt = brief;
         }
         if let Some(steps) = steps {
-            let was = std::mem::take(&mut m.todo);
-            m.todo = steps
-                .into_iter()
-                .map(|text| {
-                    was.iter()
-                        .find(|t| t.text.trim().eq_ignore_ascii_case(text.trim()))
-                        .cloned()
-                        .unwrap_or_else(|| Todo::new(text))
-                })
-                .collect();
+            m.todo = kept_steps(&m.todo, steps);
         }
         if let (Some(p), Some(a)) = (priority, m.agendum.as_mut()) {
             a.priority = p;
         }
         self.agenda_rank(body);
+        Ok(())
+    }
+
+    /// Rewrite the mission `body` carries — an ordered body's, through a
+    /// conversation with its owner or an authorizer (§7.1): a new brief, and
+    /// new steps that keep every one already done and every critical one.
+    /// Refused for a mission that carries an operation, whose steps are the
+    /// operation's.
+    pub fn edit_active(
+        &mut self,
+        body: &str,
+        brief: Option<String>,
+        steps: Option<Vec<String>>,
+    ) -> Result<(), String> {
+        let m = self
+            .active
+            .get_mut(body)
+            .ok_or_else(|| "You are carrying no mission to change.".to_string())?;
+        if m.operation().is_some() {
+            return Err(
+                "This mission's steps are its operation's: it is changed at the table, not here."
+                    .into(),
+            );
+        }
+        if let Some(brief) = brief.filter(|b| !b.trim().is_empty()) {
+            m.prompt = brief;
+        }
+        if let Some(steps) = steps {
+            m.todo = kept_steps(&m.todo, steps);
+        }
         Ok(())
     }
 
@@ -423,6 +446,24 @@ impl Missions {
             })
             .filter(|m| matches!(m.origin, Origin::Round { .. }))
             .map(|m| m.next_step().map(|t| t.text.clone()));
+        // **A critical step is signed by an authorizer, never by saying the
+        // mission is done** (`docs/npc_conversations.md` §7.1).
+        let unsigned = self
+            .agenda(body)
+            .into_iter()
+            .find(|m| {
+                m.agendum
+                    .as_ref()
+                    .is_some_and(|a| a.title.eq_ignore_ascii_case(title))
+            })
+            .and_then(|m| m.todo.iter().find(|t| t.critical && !t.done))
+            .map(|t| t.text.clone());
+        if let Some(step) = unsigned {
+            return Err(format!(
+                "\"{title}\" waits on an authorizer's yes to \"{step}\": it is not done until \
+                 they sign it."
+            ));
+        }
         if let Some(step) = round_step {
             let next = match step {
                 Some(step) => {
@@ -616,6 +657,11 @@ impl Missions {
     /// The body's open mission, if it is on one.
     pub fn active(&self, body: &str) -> Option<&Mission> {
         self.active.get(body)
+    }
+
+    /// Every body carrying a mission, with it.
+    pub fn carried(&self) -> impl Iterator<Item = (&str, &Mission)> {
+        self.active.iter().map(|(b, m)| (b.as_str(), m))
     }
 
     /// The body's open mission, to change — what the critical gate signs off
@@ -967,12 +1013,12 @@ impl Missions {
 
     /// Set who may approve a critical step — empty for a world that sets none,
     /// so a critical step can then only be held.
-    pub fn set_authorizers(&mut self, authorizers: Vec<String>) {
+    pub fn set_authorizers(&mut self, authorizers: Vec<Authorizer>) {
         self.authorizers = authorizers;
     }
 
     /// Who may approve a critical step here (`docs/mission_templates.md` §6).
-    pub fn authorizers(&self) -> &[String] {
+    pub fn authorizers(&self) -> &[Authorizer] {
         &self.authorizers
     }
 

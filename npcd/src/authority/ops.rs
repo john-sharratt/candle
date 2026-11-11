@@ -12,12 +12,45 @@
 
 use std::collections::BTreeMap;
 
+use npc_map::MapEdit;
 use serde::{Deserialize, Serialize};
 
 use crate::discord::world::record::Guild;
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::MessageSent;
-use crate::sim::phone::Origin;
+use crate::sim::phone::{Origin, Who};
+
+/// Where an act came from (`docs/npc_conversations.md` §7.1): the
+/// character's mind loop, or one of its conversations, with the party.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum ActSource {
+    #[default]
+    Mind,
+    /// A conversation with `party`: a body id or an account handle.
+    Talk { party: String },
+}
+
+/// The line the lease holder voiced for a phone act
+/// (`docs/npc_conversations.md` §7.1), and the critical step it asks an
+/// authorizer to approve, when it asks for one (§7.2): what lands on the
+/// thread in place of the act's intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Voiced {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<String>,
+}
+
+impl Voiced {
+    /// Words that ask for nothing.
+    pub fn words(text: &str) -> Voiced {
+        Voiced {
+            text: text.to_string(),
+            requests: None,
+        }
+    }
+}
 
 /// The decision a character's act was made in: where it stood and who was with
 /// it when its turn began, so the authority answers the act from the company
@@ -41,12 +74,19 @@ pub enum WorldOp {
         decided: Option<Decided>,
         /// Where its body stood when the turn's grammar was built, `area/node`.
         pinned_at: Option<String>,
+        /// The line the lease holder voiced for a phone act: what lands on
+        /// the thread in place of the act's intent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        said: Option<Voiced>,
+        #[serde(default)]
+        source: ActSource,
     },
     /// A person's message to a character, on its handset — from the console,
-    /// with no `origin`, or from where `origin` says.
+    /// with no `origin`, or from where `origin` says. `from` is the person
+    /// by their account.
     Message {
         npc: u64,
-        from: String,
+        from: Who,
         text: String,
         #[serde(default)]
         origin: Option<Origin>,
@@ -76,10 +116,31 @@ pub enum WorldOp {
     },
     /// A character's mission called off.
     Cancel { npc: u64 },
+    /// An authorizer said yes to the critical step a conversation asked them
+    /// to sign (`docs/npc_conversations.md` §7.2): signed when `step` is
+    /// still the mission's next and `by` — an account handle — is one of the
+    /// world's authorizers, both checked here, on the authority.
+    Authorize {
+        npc: u64,
+        step: String,
+        by: String,
+        /// Who said yes, by name, for what the character is told.
+        name: String,
+    },
+    /// `npc` read `thread` through `seq`: a conversation that answered what
+    /// it took in with a journal entry rather than a line
+    /// (`docs/npc_conversations.md` §8), so the party's typing indicator —
+    /// the authority's — stops.
+    ReadThrough { npc: u64, thread: String, seq: u64 },
+    /// An operator reshapes the world's walkable map, through the token of
+    /// character `npc`, whose owner keeps the change
+    /// (`docs/npc_conversations.md` §5.1.1): applied by the authority, so it
+    /// is journaled once, wherever `/reshape` was asked.
+    Reshape { npc: u64, edit: MapEdit },
     /// A person speaks on the world's open channel — from the console, with
     /// no `origin`, or from the world's Discord server's `#the-channel`.
     Channel {
-        from: String,
+        from: Who,
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<Origin>,
@@ -94,7 +155,7 @@ pub enum WorldOp {
     /// said to, when it mentions, answers or names one.
     Mirrored {
         thread: String,
-        from: String,
+        from: Who,
         text: String,
         origin: Origin,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,7 +169,7 @@ pub enum WorldOp {
     ChannelMessage {
         npc: u64,
         channel: u64,
-        from: String,
+        from: Who,
         text: String,
         origin: Option<Origin>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,6 +245,20 @@ pub enum OpReply {
     Heard { by: Option<Vec<String>> },
     /// How many lines the surface holds now; `None` with no such place.
     Posted { lines: Option<usize> },
+    /// A world's map reshaped: who it relocated, and whether the change was
+    /// kept — `written`, `drafted`, `ephemeral` or `failed`, with `detail`
+    /// saying more — or `refused`, the world's own words on why it would not
+    /// take the edit, with nothing changed.
+    Reshaped {
+        #[serde(default)]
+        relocated: Vec<String>,
+        #[serde(default)]
+        durable: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refused: Option<String>,
+    },
     /// Whether the write took.
     Done { ok: bool },
 }
@@ -205,6 +280,8 @@ mod tests {
                 company: vec!["m2".into()],
             }),
             pinned_at: None,
+            said: None,
+            source: ActSource::Mind,
         };
         let wire = serde_json::to_value(&op).unwrap();
         assert_eq!(
@@ -215,16 +292,41 @@ mod tests {
                 "call": "{\"tool\":\"speak\",\"intent\":\"hello\"}",
                 "decided": {"at": "vault-casting/green-room", "company": ["m2"]},
                 "pinned_at": null,
+                "source": {"from": "mind"},
             })
         );
         assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), op);
+        let voiced = WorldOp::Act {
+            npc: 7,
+            call: r#"{"tool":"reply","to":"Mira","intent":"that it is in"}"#.into(),
+            decided: None,
+            pinned_at: None,
+            said: Some(Voiced {
+                text: "It's at the door.".into(),
+                requests: Some("Sign the lease".into()),
+            }),
+            source: ActSource::Talk {
+                party: "u_8812".into(),
+            },
+        };
+        let wire = serde_json::to_value(&voiced).unwrap();
+        assert_eq!(
+            wire["said"],
+            json!({"text": "It's at the door.", "requests": "Sign the lease"})
+        );
+        assert_eq!(
+            serde_json::to_value(Voiced::words("Hi.")).unwrap(),
+            json!({"text": "Hi."})
+        );
+        assert_eq!(wire["source"], json!({"from": "talk", "party": "u_8812"}));
+        assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), voiced);
         assert_eq!(
             serde_json::to_value(OpReply::Done { ok: true }).unwrap(),
             json!({"reply": "done", "ok": true})
         );
         let message = WorldOp::Message {
             npc: 9,
-            from: "Wren S".into(),
+            from: Who::new("u_8812", "Wren S"),
             text: "hello".into(),
             origin: Some(Origin::Discord {
                 message: 31,
@@ -237,25 +339,12 @@ mod tests {
             json!({
                 "op": "message",
                 "npc": 9,
-                "from": "Wren S",
+                "from": {"id": "u_8812", "name": "Wren S"},
                 "text": "hello",
                 "origin": {"kind": "discord", "message": 31, "channel": 32},
             })
         );
         assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), message);
-        assert_eq!(
-            serde_json::from_value::<WorldOp>(
-                json!({"op": "message", "npc": 9, "from": "Wren S", "text": "hello"})
-            )
-            .unwrap(),
-            WorldOp::Message {
-                npc: 9,
-                from: "Wren S".into(),
-                text: "hello".into(),
-                origin: None,
-            },
-            "a member that sends no origin sends one from the console"
-        );
         let back = WorldOp::HandBack {
             npc: 3,
             through: 40,
@@ -268,10 +357,11 @@ mod tests {
     /// **A server channel's message and a notice travel as these**, exactly.
     #[test]
     fn a_channel_message_and_a_notice_travel_as_tagged_json() {
+        let wren = Who::new("discord:31", "Wren (@wren)");
         let said = WorldOp::ChannelMessage {
             npc: 9,
             channel: 610,
-            from: "Wren (@wren)".into(),
+            from: wren.clone(),
             text: "hi all".into(),
             origin: Some(Origin::Discord {
                 message: 901,
@@ -286,7 +376,7 @@ mod tests {
                 "op": "channel_message",
                 "npc": 9,
                 "channel": 610,
-                "from": "Wren (@wren)",
+                "from": {"id": "discord:31", "name": "Wren (@wren)"},
                 "text": "hi all",
                 "origin": {"kind": "discord", "message": 901, "channel": 610},
             })
@@ -295,10 +385,10 @@ mod tests {
         let said_to = WorldOp::ChannelMessage {
             npc: 9,
             channel: 610,
-            from: "Wren (@wren)".into(),
+            from: wren,
             text: "Zen, you there?".into(),
             origin: None,
-            to: Some("Zen".into()),
+            to: Some("npc-9".into()),
         };
         let wire = serde_json::to_value(&said_to).unwrap();
         assert_eq!(
@@ -307,10 +397,10 @@ mod tests {
                 "op": "channel_message",
                 "npc": 9,
                 "channel": 610,
-                "from": "Wren (@wren)",
+                "from": {"id": "discord:31", "name": "Wren (@wren)"},
                 "text": "Zen, you there?",
                 "origin": null,
-                "to": "Zen",
+                "to": "npc-9",
             })
         );
         assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), said_to);

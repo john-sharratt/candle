@@ -41,7 +41,7 @@ pub async fn run(
     guild: &Guild,
     online: &HashMap<u64, &Online>,
 ) {
-    let people = members::linked_people(a).await;
+    let people = members::linked_people(a);
     groups::reconcile(a, bot, hosted, guild, &people).await;
     dms::reconcile(a, bot, hosted, guild, &people).await;
     rooms::reconcile(a, bot, hosted, guild).await;
@@ -79,10 +79,10 @@ pub async fn pictured(a: &Authored, bot: &Online) {
     let Some(mut record) = store::get(&shared, bot.npc) else {
         return;
     };
-    let Some((_, name)) = embodied(a, bot) else {
+    let Some((_, character)) = embodied(a, bot) else {
         return;
     };
-    let rename = profile::username(&name).filter(|n| *n != record.username);
+    let rename = profile::username(&character.name).filter(|n| *n != record.username);
     let portrait = a
         .npcs
         .view()

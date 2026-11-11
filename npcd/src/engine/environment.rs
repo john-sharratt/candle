@@ -42,11 +42,12 @@ use npc_map::delta::Delta;
 use npc_map::world::{Happening, World};
 
 use crate::engine::at_work;
-use crate::engine::event::{EventKind, Salience};
+use crate::engine::event::{EventKind, Salience, TalkLine};
+use crate::engine::people;
 use crate::engine::perceived::{digest, situation, Perceived};
 use crate::engine::reach;
 use crate::engine::tick::Scheduler;
-use crate::engine::tools::{self, Mode};
+use crate::engine::tools;
 use crate::engine::whereabouts;
 use crate::sim::phone;
 use crate::sim::unread::Due;
@@ -215,7 +216,7 @@ fn awaiting_line(world: &World, sim: &crate::sim::Sim, body: &str) -> Option<Str
     let mut s = String::from("Waiting on an answer from you:");
     s.push_str(&named.join(""));
     s.push_str(
-        "\n\nAnswer them: `tell` them if they are here, `message` them if they are not. A \
+        "\n\nAnswer them: `message` them, or speak to them if they are a person here. A \
          question you leave standing is one they asked into silence.",
     );
     Some(s)
@@ -226,18 +227,24 @@ fn awaiting_line(world: &World, sim: &crate::sim::Sim, body: &str) -> Option<Str
 /// Nothing when alone — and that emptiness is the mechanism, not an omission.
 /// A character shown a way to address people while there is nobody to address
 /// will address somebody, because a model handed a field fills it in.
+///
+/// It lists what is offered: room speech only when a person is among them
+/// (`docs/npc_conversations.md` §12), so a character in company that is all
+/// characters is not told to talk aloud to them.
 fn company_line(world: &World, body: &str) -> Option<String> {
     let here = world.actor(body)?.at.clone();
-    let others: Vec<String> = world
+    let present: Vec<_> = world
         .actors_at(&here)
         .into_iter()
         .filter(|a| a.id != body)
-        .map(|a| a.name.clone())
         .collect();
-    if others.is_empty() {
+    if present.is_empty() {
         return None;
     }
-    let tools: Vec<&str> = tools::nearby(Mode::Physical, others.len())
+    let others: Vec<String> = present.iter().map(|a| a.name.clone()).collect();
+    let people = present.iter().filter(|a| people::is_person(&a.id)).count();
+    let heard = people::hear_a_shout(world, &here);
+    let tools: Vec<&str> = tools::nearby(others.len(), people, heard)
         .into_iter()
         .map(|t| t.name)
         .collect();
@@ -428,36 +435,82 @@ fn deliver_messages(
     time: &WorldTimeOf,
     reach: &Reach,
 ) -> usize {
-    // Name → body, off the world: threads address people the way a room does,
-    // by the name the world writes down, and the bindings key on the body.
-    let who_is_where: Vec<(String, String)> =
-        hosted.read(|w| w.actors().map(|a| (a.name.clone(), a.id.clone())).collect());
-    if who_is_where.is_empty() {
+    // Every body on a thread is there by its id; the bindings key on it too.
+    let bodies: Vec<String> = hosted.read(|w| w.actors().map(|a| a.id.clone()).collect());
+    if bodies.is_empty() {
         return 0;
     }
     let mut told = 0;
-    for (name, body) in who_is_where {
+    for body in bodies {
         let Some(&npc_id) = minds.get(&body) else {
             continue;
         };
         let at_ms = time(npc_id);
-        // Taken and marked under one acquisition, so a message cannot be
-        // handed out twice by two moments overlapping. The reminder of what
-        // still waits unread is judged under the same hold (`sim::unread`).
-        let (waiting, due, unread) = hosted.with_sim(|s| {
-            let waiting = s.threads.undelivered_for(&name);
+        // Taken and marked under one acquisition, so a line cannot be handed
+        // out twice by two moments overlapping. The reminder of what still
+        // waits unread is judged under the same hold (`sim::unread`).
+        let (waiting, talk, due, unread) = hosted.with_sim(|s| {
+            let waiting: Vec<(String, phone::Kind, Vec<phone::Message>, Vec<String>)> = s
+                .threads
+                .undelivered_for(&body)
+                .into_iter()
+                .map(|(thread, kind, lines)| {
+                    let names = lines
+                        .iter()
+                        .map(|m| s.threads.name_of(&m.from).unwrap_or(&m.from).to_string())
+                        .collect();
+                    (thread, kind, lines, names)
+                })
+                .collect();
             if !waiting.is_empty() {
-                s.threads.mark_delivered_for(&name);
+                s.threads.mark_delivered_for(&body);
             }
+            // A direct thread's lines are its conversation's, handed over as
+            // they are: the words, by whom, with the account they came from.
+            let talk: Vec<(String, Vec<TalkLine>)> = s
+                .threads
+                .take_direct_for(&body)
+                .into_iter()
+                .map(|(thread, lines)| {
+                    let lines = lines
+                        .into_iter()
+                        .map(|m| TalkLine {
+                            name: s.threads.name_of(&m.from).unwrap_or(&m.from).to_string(),
+                            seq: m.seq,
+                            from: m.from,
+                            text: m.text,
+                            account: m.account,
+                            at_ms: m.at_ms,
+                        })
+                        .collect();
+                    (thread, lines)
+                })
+                .collect();
             // The unread count comes with the reminder: the same per-thread
             // counts, summed, so the threads are not walked again for it.
             let (due, unread) = s
                 .threads
-                .unread_due(&name, phone::now_ms(), !waiting.is_empty());
-            (waiting, due, unread)
+                .unread_due(&body, phone::now_ms(), !waiting.is_empty());
+            (waiting, talk, due, unread)
         });
         if let Some(due) = due {
             remind(npc_id, at_ms, due, sched, reach);
+            told += 1;
+        }
+        for (thread, lines) in talk {
+            tracing::info!(
+                npc = npc_id,
+                thread = %thread,
+                lines = lines.len(),
+                "lines land for the character's conversation"
+            );
+            let kind = EventKind::Talk { thread, lines };
+            match (reach.here)(npc_id) {
+                true => {
+                    sched.deliver(npc_id, at_ms, Salience::URGENT, kind);
+                }
+                false => (reach.elsewhere)(npc_id, at_ms, Salience::URGENT, kind),
+            }
             told += 1;
         }
         if waiting.is_empty() {
@@ -468,22 +521,19 @@ fn deliver_messages(
         // them over here left them counted unread for ever by a character
         // that had answered them. One notice per thread: who wrote there last,
         // and how much now waits in all.
-        for (thread, kind, messages) in waiting {
-            // **Somebody messaging you directly gets your attention; a group
-            // does not — unless it is said to you by name.** A direct thread is
-            // one person addressing this character and nobody else, which is
-            // the same claim on it as being spoken to in a room, and so is a
-            // group line said to it (`Message::to`). The rest of a group of six
+        for (thread, kind, messages, names) in waiting {
+            // **A group does not get a character's attention unless it is
+            // said to it by name** (`Message::to`): the rest of a group of six
             // would otherwise preempt whatever it was doing six times over a
             // conversation it is only one of the audience for.
             let to_me = messages
                 .iter()
-                .any(|m| m.to.as_deref() == Some(name.as_str()));
+                .any(|m| m.to.as_deref() == Some(body.as_str()));
             let salience = match (kind, to_me) {
                 (phone::Kind::Direct, _) | (phone::Kind::Group, true) => Salience::URGENT,
                 (phone::Kind::Group, false) => Salience::NORMAL,
             };
-            let Some(last) = messages.last() else {
+            let (Some(last), Some(from)) = (messages.last(), names.last()) else {
                 continue;
             };
             tracing::info!(
@@ -495,7 +545,7 @@ fn deliver_messages(
             );
             let kind = EventKind::Message {
                 thread: thread.clone(),
-                from: last.from.clone(),
+                from: from.clone(),
                 unread,
             };
             match (reach.here)(npc_id) {
@@ -572,7 +622,7 @@ mod tests {
 
     use super::*;
     use crate::engine::event::EventKind;
-    use crate::sim::phone::ALL_MESSAGES;
+    use crate::sim::phone::{Said, Who, ALL_MESSAGES};
     use crate::sim::seed::issue_handset;
     use crate::sim::upkeep::CONTACT_EVERY;
     use npc_map::world::Where;
@@ -1006,69 +1056,83 @@ mod tests {
         assert_eq!(push(&h, &b, &s, &|_| 0, &Reach::everyone()), 1);
     }
 
-    /// **A character that runs on another member is not perceived for here,
-    /// and its messages go to it through the reach.** Its own member's copy of
-    /// the world shows it the room; only this world holds its threads.
+    /// **A direct line is handed to the character's conversation as the line
+    /// itself, through the reach when it runs elsewhere** — a `Talk`, never a
+    /// notice for the mind. Its own member's copy of the world shows it the
+    /// room; only this world holds its threads.
     #[test]
-    fn a_character_running_elsewhere_is_told_its_messages_through_the_reach() {
+    fn a_direct_line_goes_to_the_conversation_through_the_reach() {
         let (h, b, s) = crew(2);
         run(&s, 0);
         h.with_sim(|sim| {
             issue_handset(sim, "m1", "Maker-01");
             issue_handset(sim, "m2", "Maker-02");
-            sim.threads.reach("Maker-01", "Maker-02");
-            sim.threads.send("Maker-01", "Maker-02", "come up").unwrap();
+            let id = sim
+                .threads
+                .reach(&Who::new("m1", "Maker-01"), &Who::new("m2", "Maker-02"));
+            sim.threads
+                .send_on(&id, "m1", Said::words("Come up when you can."))
+                .unwrap();
         });
         h.with(|w| w.say("m1", "for the room").unwrap());
         let elsewhere = Mutex::new(Vec::new());
-        let tell = |npc: u64, _: u64, _: Salience, kind: EventKind| {
-            elsewhere.lock().unwrap().push((npc, kind));
+        let tell = |npc: u64, _: u64, salience: Salience, kind: EventKind| {
+            elsewhere.lock().unwrap().push((npc, salience, kind));
         };
         let reach = Reach {
             here: &|npc| npc != 102,
             elsewhere: &tell,
         };
-        let m = advance_for(&h, &b, &s, &|_| 0, &reach);
-        assert_eq!(m.told, 0, "only 102 heard the room, and it runs elsewhere");
+        advance_for(&h, &b, &s, &|_| 0, &reach);
         assert_eq!(s.inbox_depth(102), Some(0), "nothing reached it here");
         let told = elsewhere.into_inner().unwrap();
         assert_eq!(told.len(), 1, "{told:?}");
+        let (npc, salience, kind) = &told[0];
+        assert_eq!((*npc, *salience), (102, Salience::URGENT));
+        let EventKind::Talk { thread, lines } = kind else {
+            panic!("a direct line is a Talk: {kind:?}");
+        };
+        assert_eq!(thread, "dm:m1:m2");
         assert_eq!(
-            told[0],
-            (
-                102,
-                EventKind::Message {
-                    thread: "Maker-01".into(),
-                    from: "Maker-01".into(),
-                    unread: 1,
-                }
-            )
+            lines
+                .iter()
+                .map(|l| (l.seq, l.from.as_str(), l.name.as_str(), l.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "m1", "Maker-01", "Come up when you can.")]
+        );
+        assert_eq!(
+            h.sim(|sim| sim.unread_on_phone_for("m2")),
+            Vec::<String>::new(),
+            "a direct line is never the mind's to read"
         );
     }
 
     /// **What a notice names, `read` is offered**, and reading it is what
-    /// ends it: noticed, the conversation is readable by the name the notice
-    /// gave; read, nothing on the phone is offered and nothing waits.
+    /// ends it: noticed, the group is readable by the name the notice gave;
+    /// read, nothing on the phone is offered and nothing waits.
     #[test]
-    fn a_noticed_message_is_readable_until_it_is_read() {
+    fn a_noticed_group_line_is_readable_until_it_is_read() {
         let (h, b, s) = crew(2);
         run(&s, 0);
         h.with_sim(|sim| {
             issue_handset(sim, "m1", "Maker-01");
             issue_handset(sim, "m2", "Maker-02");
-            sim.threads.reach("Maker-01", "Maker-02");
-            sim.threads.send("Maker-01", "Maker-02", "come up").unwrap();
+            let id = sim.threads.open_group(
+                "the bench",
+                &[Who::new("m1", "Maker-01"), Who::new("m2", "Maker-02")],
+            );
+            sim.threads
+                .send_on(&id, "m1", Said::words("Come up."))
+                .unwrap();
         });
         advance(&h, &b, &s, &|_| 0);
         assert_eq!(
-            h.sim(|sim| sim.unread_on_phone_for("Maker-02", "m2")),
-            [ALL_MESSAGES, "Maker-01"]
+            h.sim(|sim| sim.unread_on_phone_for("m2")),
+            [ALL_MESSAGES, "the bench"]
         );
-        h.with_sim(|sim| sim.threads.read("Maker-02", "Maker-01").unwrap());
-        assert!(h
-            .sim(|sim| sim.unread_on_phone_for("Maker-02", "m2"))
-            .is_empty());
-        assert_eq!(h.sim(|sim| sim.threads.waiting_for("Maker-02")), 0);
+        h.with_sim(|sim| sim.threads.read("m2", "the bench").unwrap());
+        assert!(h.sim(|sim| sim.unread_on_phone_for("m2")).is_empty());
+        assert_eq!(h.sim(|sim| sim.threads.waiting_for("m2")), 0);
     }
 
     /// **A group line said to one member is urgent for that member alone**;
@@ -1084,13 +1148,17 @@ mod tests {
             issue_handset(sim, "m3", "Maker-03");
             let id = sim.threads.open_group(
                 "the bench",
-                &["Maker-01".into(), "Maker-02".into(), "Maker-03".into()],
+                &[
+                    Who::new("m1", "Maker-01"),
+                    Who::new("m2", "Maker-02"),
+                    Who::new("m3", "Maker-03"),
+                ],
             );
+            let mut said_to = Said::words("Maker-02, come up");
+            said_to.to = Some("m2".into());
+            sim.threads.send_on(&id, "m1", said_to).unwrap();
             sim.threads
-                .send_to(&id, "Maker-01", "Maker-02, come up", None, Some("Maker-02"))
-                .unwrap();
-            sim.threads
-                .send_on(&id, "Maker-01", "anyone?", None)
+                .send_on(&id, "m1", Said::words("anyone?"))
                 .unwrap();
         });
         let elsewhere = Mutex::new(Vec::new());
@@ -1117,7 +1185,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            h.sim(|s| s.threads.waiting_for("Maker-02")),
+            h.sim(|s| s.threads.waiting_for("m2")),
             2,
             "noticed is not read"
         );

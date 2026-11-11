@@ -24,7 +24,7 @@ use crate::discord::online::Online;
 use crate::discord::store;
 use crate::discord::trace::note::{Direction, Note};
 use crate::discord::trace::{failed, note};
-use crate::sim::phone::Kind as ThreadKind;
+use crate::sim::phone::{Kind as ThreadKind, Member};
 use crate::world::Hosted;
 
 /// What the channel the DMs are made under is called.
@@ -41,14 +41,15 @@ pub fn thread_name(character: &str, person: &str) -> String {
         .collect()
 }
 
-/// The world's direct threads between a linked person, of `people`, and a
-/// character without a bot: `(thread, character, person, their user)`.
+/// The world's direct threads between a linked person, of `people` (by
+/// handle), and a character without a bot: `(thread, character's name,
+/// person's name, their user)`.
 fn dms(
     a: &Authored,
     hosted: &Hosted,
     people: &BTreeMap<String, u64>,
 ) -> Vec<(String, String, String, u64)> {
-    let pairs: Vec<(String, Vec<String>)> = hosted.sim(|s| {
+    let pairs: Vec<(String, Vec<Member>)> = hosted.sim(|s| {
         s.threads
             .iter()
             .filter(|t| t.open && t.kind() == ThreadKind::Direct && t.members.len() == 2)
@@ -61,12 +62,12 @@ fn dms(
         .filter_map(|(thread, members)| {
             let (who, user) = members
                 .iter()
-                .find_map(|m| people.get(m).map(|u| (m.clone(), *u)))?;
-            let other = members.iter().find(|m| **m != who)?.clone();
-            let npc = character(a, hosted, &other)?;
+                .find_map(|m| people.get(&m.id).map(|u| (m.clone(), *u)))?;
+            let other = members.iter().find(|m| m.id != who.id)?.clone();
+            let npc = character(a, hosted, &other.id)?;
             store::get(&shared, npc)
                 .is_none()
-                .then_some((thread, other, who, user))
+                .then_some((thread, other.name, who.name, user))
         })
         .collect()
 }

@@ -70,6 +70,7 @@ pub mod driver;
 pub mod enact;
 pub mod environment;
 pub mod event;
+pub mod experience;
 pub mod guardian;
 pub mod guardian_api;
 pub mod held;
@@ -94,6 +95,7 @@ pub mod on_you;
 pub mod operations_api;
 pub mod order_table;
 pub mod passage;
+pub mod people;
 pub mod perceived;
 pub mod persona;
 pub mod prompt;
@@ -114,6 +116,7 @@ pub mod station;
 pub mod stir;
 pub mod substrate_views;
 pub mod survey;
+pub mod talk;
 pub mod tick;
 pub mod tools;
 pub mod watch;
@@ -149,7 +152,7 @@ use crate::engine::interaction::Interlocutor;
 use crate::engine::mind::Minds;
 use crate::npcs;
 use crate::projection;
-use crate::sim::phone::CHANNEL;
+use crate::sim::phone::{Who, CHANNEL};
 use host::guard::Api;
 
 /// The one refusal this module makes, worded once.
@@ -1097,6 +1100,10 @@ async fn end_interaction(State(s): State<Arc<Authored>>, Path(ix): Path<String>)
 
 /// Say something to the character, inside a session.
 ///
+/// In an instant-message session a line is a message on the person's thread
+/// with the character, answered by their conversation; everything else below
+/// is a physical session's, and a slash command's in either.
+///
 /// **The same door everything else goes through.** The line is parsed by
 /// [`crate::engine::slash`] and delivered by the scheduler, exactly as
 /// `/v1/npc/:nid/pulse` does — so what is said here is a thing that happened to
@@ -1132,6 +1139,39 @@ async fn inject(
             "empty_line",
             "there is nothing in that to say",
         );
+    }
+    // **A chat is a conversation** (`docs/npc_conversations.md` §4.1): what is
+    // typed in an instant-message session goes on the person's direct thread
+    // with the character, by their account, and the character's conversation
+    // with them answers it — the one path a Discord DM takes too. A slash
+    // command is still the operator reaching into the character.
+    if session.mode == crate::engine::tools::Mode::InstantMessage && !line.starts_with('/') {
+        let Some((hosted, _)) = rt.body_of(session.npc_id) else {
+            return err(
+                StatusCode::CONFLICT,
+                "not_in_a_world",
+                "that character has no body in a world, so there is nothing to reach it on",
+            );
+        };
+        let who = &session.interlocutor;
+        let op = WorldOp::Message {
+            npc: session.npc_id,
+            from: Who::new(&who.id, &who.display),
+            text: line.to_string(),
+            origin: None,
+        };
+        return match rt.world_write(hosted.id(), op).await {
+            Ok(OpReply::Sent { sent: Some(_) }) => {
+                rt.interactions.touched(&ix, now);
+                Json(json!({ "delivered": true, "on_the_phone": true })).into_response()
+            }
+            Ok(_) => err(
+                StatusCode::CONFLICT,
+                "not_in_a_world",
+                "that character has no handset to reach it on",
+            ),
+            Err(e) => world_unreached(&e),
+        };
     }
     let parsed = match crate::engine::slash::parse(line) {
         // Named, or the character is told "you says to you" — see
@@ -1261,7 +1301,7 @@ pub(crate) async fn post_message(
     };
     let op = WorldOp::Message {
         npc: npc_id,
-        from: me.clone(),
+        from: Who::new(&handle, &me),
         text: text.to_string(),
         origin: None,
     };
@@ -1298,7 +1338,7 @@ pub(crate) async fn get_messages(
     let said = s
         .runtime
         .as_ref()
-        .and_then(|rt| rt.messages_with(npc_id, &me));
+        .and_then(|rt| rt.messages_with(npc_id, &handle));
     let Some((them, messages)) = said else {
         // Not an error: a character with no body has nothing to say on a
         // handset yet, and the console renders an empty conversation.
@@ -1409,7 +1449,7 @@ pub(crate) async fn get_channel(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("reading a world's channel");
     };
-    let Some(said) = rt.channel(&wid, &me) else {
+    let Some(said) = rt.channel(&wid, &handle) else {
         return err(
             StatusCode::NOT_FOUND,
             "no_such_world",
@@ -1459,7 +1499,7 @@ pub(crate) async fn post_channel(
         return no_engine("speaking on a world's channel");
     };
     let op = WorldOp::Channel {
-        from: me.clone(),
+        from: Who::new(&handle, &me),
         text: text.to_string(),
         origin: None,
     };

@@ -38,10 +38,12 @@ use npcd::engine::body::{perform, Outcome};
 use npcd::engine::build::{self, BUILD_ACTS};
 use npcd::engine::mission::{Mission, Origin, Todo, Work};
 use npcd::engine::mission_gen::standing::HOUSE_LINK;
+use npcd::engine::people;
 use npcd::engine::tools::{self, specs_within, Mode, Within};
 use npcd::engine::witnessed;
 use npcd::engine::zen_task::TASK_ACTS;
 use npcd::sim::field::Resource;
+use npcd::sim::purpose::Purpose;
 use npcd::sim::record::{Item, Kind as RecordKind, State};
 use npcd::sim::seed;
 use npcd::world::Hosted;
@@ -139,17 +141,37 @@ fn stand(h: &Hosted, body: &str, area: &str, node: &str) {
 
 /// What the grammar would offer this body, standing where it is.
 fn offered(h: &Hosted, body: &str) -> Vec<String> {
+    specs_within(Mode::Physical, &within_of(h, body))
+        .into_iter()
+        .map(|t| t.name)
+        .collect()
+}
+
+/// What `body`'s grammar is built from here, read the way
+/// `engine::runtime::within` reads it: company, the people among them and
+/// whether a shout reaches one, the lift, the house and the sim.
+fn within_of(h: &Hosted, body: &str) -> Within {
     let place = h.place_of(body);
-    let company: Vec<String> = h.read(|w| {
+    let (company, people, heard_by_person) = h.read(|w| {
         let me = w.actor(body).expect("a body");
-        w.actors()
+        let here: Vec<_> = w
+            .actors()
             .filter(|a| a.id != body && a.at == me.at)
-            .map(|a| a.name.clone())
-            .collect()
+            .collect();
+        (
+            here.iter().map(|a| a.name.clone()).collect(),
+            here.iter()
+                .filter(|a| people::is_person(&a.id))
+                .map(|a| a.name.clone())
+                .collect(),
+            people::hear_a_shout(w, &me.at),
+        )
     });
     let (at_lift, lift_here, floors) = lift_within(h, body);
     let within = Within {
         company,
+        people,
+        heard_by_person,
         places: npcd::engine::body::reachable(h, body),
         me: h.read(|w| w.actor(body).map(|a| a.name.clone()).unwrap_or_default()),
         at_lift,
@@ -158,11 +180,7 @@ fn offered(h: &Hosted, body: &str) -> Vec<String> {
         ..Default::default()
     }
     .in_the_house(h, body);
-    let within = h.sim(|s| within.from_sim(s, body, &place));
-    specs_within(Mode::Physical, &within)
-        .into_iter()
-        .map(|t| t.name)
-        .collect()
+    h.sim(|s| within.from_sim(s, body, &place))
 }
 
 /// The lift half of what a body's grammar is built from — whether it is at a
@@ -201,27 +219,7 @@ fn message_to(h: &Hosted, body: &str) -> Option<Vec<String>> {
 /// The act `tool` as the grammar offers it to `body` here, `None` when it is
 /// not offered.
 fn spec_of(h: &Hosted, body: &str, tool: &str) -> Option<ToolSpec> {
-    let place = h.place_of(body);
-    let company: Vec<String> = h.read(|w| {
-        let me = w.actor(body).expect("a body");
-        w.actors()
-            .filter(|a| a.id != body && a.at == me.at)
-            .map(|a| a.name.clone())
-            .collect()
-    });
-    let (at_lift, lift_here, floors) = lift_within(h, body);
-    let within = Within {
-        company,
-        places: npcd::engine::body::reachable(h, body),
-        me: h.read(|w| w.actor(body).map(|a| a.name.clone()).unwrap_or_default()),
-        at_lift,
-        lift_here,
-        floors,
-        ..Default::default()
-    }
-    .in_the_house(h, body);
-    let within = h.sim(|s| within.from_sim(s, body, &place));
-    specs_within(Mode::Physical, &within)
+    specs_within(Mode::Physical, &within_of(h, body))
         .into_iter()
         .find(|t| t.name == tool)
 }
@@ -935,6 +933,11 @@ fn only_what_the_stockpile_covers_may_be_made() {
 #[test]
 fn a_promise_that_was_never_made_cannot_be_recalled() {
     let h = waste();
+    // Room speech needs a person here (§12 of `docs/npc_conversations.md`).
+    h.with(|w| {
+        w.enter("visitor:u_mira", "Mira", Where::new("the-waste", "ruins"))
+            .unwrap()
+    });
     // Nothing owed yet, so `remind` has nothing to name and is not offered.
     assert!(
         admits(&h, "c1", "remind", "which").is_none(),
@@ -1490,10 +1493,13 @@ fn losing_the_handset_is_something_the_world_can_do_to_you() {
     );
 }
 
-/// **A message reaches somebody who is not here** — which is the entire point,
-/// and the thing `tell` cannot do.
+/// **Reaching somebody who is not here** — which is the entire point, and the
+/// thing `tell` cannot do. The pair's thread stands from then on, and what the
+/// character meant goes to its conversation with them as a purpose
+/// (`docs/npc_conversations.md` §10): no line is written until the
+/// conversation says it.
 #[test]
-fn a_message_reaches_somebody_a_building_away() {
+fn reaching_out_opens_the_pair_s_thread_and_hands_the_conversation_a_purpose() {
     let h = phones();
     assert_ne!(h.place_of("c1"), h.place_of("c2"), "they must be apart");
 
@@ -1506,38 +1512,52 @@ fn a_message_reaches_somebody_a_building_away() {
         ),
     );
     assert!(out.happened(), "{out:?}");
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
+    let (thread, purposes) = h.sim(|s| {
+        (
+            s.threads.direct_between("c1", "c2").cloned(),
+            s.purposes.clone(),
+        )
+    });
+    assert!(thread.expect("the pair's thread").messages.is_empty());
+    assert_eq!(
+        purposes,
+        [Purpose {
+            from: "c1".into(),
+            to: "c2".into(),
+            intent: "the ridge is clear".into(),
+        }]
+    );
 }
 
-/// It waits. A room reaches you because you are standing in it; a phone reaches
-/// you because something arrived while you were doing something else.
+/// A group's line waits. A room reaches you because you are standing in it; a
+/// phone reaches you because something arrived while you were doing something
+/// else.
 #[test]
 fn a_message_waits_until_it_is_looked_at() {
     let h = phones();
     perform(
         &h,
         "c1",
-        &act("reach_out", json!({"to":"Soren","intent":"answer me"})),
+        &act(
+            "open_group",
+            json!({"called":"the ridge","with":"Soren","intent":"answer me"}),
+        ),
     );
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
+    assert_eq!(h.sim(|s| s.messages_waiting("c2")), 1);
     assert_eq!(
-        h.sim(|s| s.messages_waiting("Wren")),
+        h.sim(|s| s.messages_waiting("c1")),
         0,
         "your own message waited for you"
     );
 
     // Doing something else does not consume it.
     perform(&h, "c2", &act("observe", json!({"target":"the room"})));
-    assert_eq!(
-        h.sim(|s| s.messages_waiting("Soren")),
-        1,
-        "a message was lost"
-    );
+    assert_eq!(h.sim(|s| s.messages_waiting("c2")), 1, "a message was lost");
 
     h.with_sim(|s| {
-        s.threads.read("Soren", "Wren").unwrap();
+        s.threads.read("c2", "the ridge").unwrap();
     });
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 0);
+    assert_eq!(h.sim(|s| s.messages_waiting("c2")), 0);
 }
 
 /// Several at once, which a room cannot do.
@@ -1564,10 +1584,10 @@ fn a_character_holds_more_than_one_conversation_at_a_time() {
     assert!(threads.contains(&npcd::sim::phone::CHANNEL.to_string()));
 }
 
-/// A direct thread becomes a group by gaining somebody, and one send then
-/// reaches all of them.
+/// A pair's thread is the two of them for ever: somebody is brought into a
+/// group, never into it (§11.1).
 #[test]
-fn a_conversation_becomes_a_group_and_one_message_reaches_everybody_on_it() {
+fn nobody_is_brought_into_a_pair_s_thread() {
     let h = phones();
     h.with_sim(|s| seed::issue_handset(s, "c3", "Orion Vance"));
     perform(
@@ -1575,11 +1595,32 @@ fn a_conversation_becomes_a_group_and_one_message_reaches_everybody_on_it() {
         "c1",
         &act("reach_out", json!({"to":"Soren","intent":"start"})),
     );
-
     let out = perform(
         &h,
         "c1",
         &act("invite", json!({"to":"Soren","who":"Orion Vance"})),
+    );
+    assert!(!out.happened(), "{out:?}");
+}
+
+/// A group grows by invitation, and one send then reaches all of them.
+#[test]
+fn a_group_grows_and_one_message_reaches_everybody_on_it() {
+    let h = phones();
+    h.with_sim(|s| seed::issue_handset(s, "c3", "Orion Vance"));
+    perform(
+        &h,
+        "c1",
+        &act(
+            "open_group",
+            json!({"called":"the ridge","with":"Soren","intent":"start"}),
+        ),
+    );
+
+    let out = perform(
+        &h,
+        "c1",
+        &act("invite", json!({"to":"the ridge","who":"Orion Vance"})),
     );
     assert!(out.happened(), "{out:?}");
 
@@ -1588,12 +1629,12 @@ fn a_conversation_becomes_a_group_and_one_message_reaches_everybody_on_it() {
         "c1",
         &act(
             "message",
-            json!({"via":"channel","to":"Soren","intent":"both of you"}),
+            json!({"via":"channel","to":"the ridge","intent":"both of you"}),
         ),
     );
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 2);
+    assert_eq!(h.sim(|s| s.messages_waiting("c2")), 2);
     assert_eq!(
-        h.sim(|s| s.messages_waiting("Orion Vance")),
+        h.sim(|s| s.messages_waiting("c3")),
         1,
         "the new member should see what was sent after they joined, and not before"
     );
@@ -1617,8 +1658,8 @@ fn a_group_can_be_opened_with_several_people_at_once() {
         ),
     );
     assert!(out.happened(), "{out:?}");
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
-    assert_eq!(h.sim(|s| s.messages_waiting("Orion Vance")), 1);
+    assert_eq!(h.sim(|s| s.messages_waiting("c2")), 1);
+    assert_eq!(h.sim(|s| s.messages_waiting("c3")), 1);
     assert!(message_to(&h, "c1")
         .unwrap()
         .contains(&"the boundary".to_string()));
@@ -1684,7 +1725,7 @@ fn a_second_group_of_the_same_name_is_refused() {
     // One group of its own, beside the standing channel — so two arms, not the
     // three a duplicate would have made.
     h.sim(|s| {
-        let mut names = s.threads.names_for("Wren");
+        let mut names = s.threads.names_for("c1");
         names.sort();
         assert_eq!(names, vec!["none", npcd::sim::phone::CHANNEL], "{names:?}");
     });
@@ -1726,7 +1767,7 @@ fn leaving_a_group_does_not_end_it_for_everybody_else() {
         "the open channel was offered as something to leave"
     );
     h.sim(|s| {
-        let mut names = s.threads.names_for("Soren");
+        let mut names = s.threads.names_for("c2");
         names.sort();
         assert_eq!(names, vec!["the boundary", npcd::sim::phone::CHANNEL]);
     });
@@ -1743,9 +1784,15 @@ fn what_is_said_on_a_thread_does_not_reach_the_room() {
         "c1",
         &act("reach_out", json!({"to":"Soren","intent":"quietly"})),
     );
-    // It went to the thread, not to the room: it is waiting to be read rather
-    // than having been heard.
-    assert_eq!(h.sim(|s| s.messages_waiting("Soren")), 1);
+    // It went to the phone, not to the room: a purpose for the pair's
+    // conversation rather than something heard.
+    assert_eq!(h.sim(|s| s.purposes.len()), 1);
+    let heard = h.read(|w| {
+        w.log()
+            .iter()
+            .any(|e| e.actor == "c1" && matches!(e.what, Happening::Said { .. }))
+    });
+    assert!(!heard, "the room heard it");
 }
 
 // ── the whole catalog, held to its own rules ────────────────────────────────
@@ -1794,10 +1841,11 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
     // point of the test is that everything is reachable *somehow*.
     stand(&waste, "c2", "the-waste", "ruins");
     stand(&waste, "c1", "the-waste", "ruins");
-    // And a whisper needs a third: one to tell and one to keep it from — see
-    // `Availability::AmongOthers`. Every room above holds one other body at most.
+    // And room speech needs a person here, which no shipped room holds: a
+    // visitor, who is also the third a whisper needs — one to tell and one to
+    // keep it from (`Availability::PersonAmongOthers`).
     waste.with(|w| {
-        w.enter("c3", "Tace", Where::new("the-waste", "ruins"))
+        w.enter("visitor:u_tace", "Tace", Where::new("the-waste", "ruins"))
             .unwrap()
     });
     perform(

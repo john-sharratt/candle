@@ -72,7 +72,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, json, to_string, to_vec, Value};
 use tower::ServiceExt;
 
-use crate::authority::ops::WorldOp;
+use crate::authority::ops::{ActSource, Voiced, WorldOp};
 use crate::authority::told::Told;
 use crate::authority::{Role, Standing};
 use crate::effector::auth::PinnedStandpoint;
@@ -80,8 +80,9 @@ use crate::effector::router::address_of;
 use crate::effector::station;
 use crate::effector::token::Tokens;
 use crate::engine::act::Act;
+use crate::engine::agenda::{self, ordered::ORDERED_ACTS};
 use crate::engine::authoring;
-use crate::engine::authorize::critical_compass;
+use crate::engine::authorize::{self, critical_compass};
 use crate::engine::bearings;
 use crate::engine::body::{self, Outcome};
 use crate::engine::channels::{self, ChannelSection};
@@ -89,6 +90,11 @@ use crate::engine::compose;
 use crate::engine::driver::{self, Metronome};
 use crate::engine::environment::{self, Reach};
 use crate::engine::event::{Event, EventKind, Salience};
+use crate::engine::experience;
+use crate::engine::experience::concern::{concern, Change, Hears};
+use crate::engine::experience::days::Days;
+use crate::engine::experience::line::first_sentence;
+use crate::engine::experience::store::Journals;
 use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
 use crate::engine::ingest;
@@ -111,11 +117,16 @@ use crate::engine::mission_gen::config::Config;
 use crate::engine::mission_gen::gates::{life_voice, Form};
 use crate::engine::mission_gen::material::strip_calls;
 use crate::engine::mission_gen::round;
+use crate::engine::people;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::prose::{decode_call, CallAsk, WORK_BAND};
 use crate::engine::reflect;
-use crate::engine::reported::spoken;
 use crate::engine::schema;
+use crate::engine::talk::authority::Changes;
+use crate::engine::talk::key::VISITOR;
+use crate::engine::talk::runner::Talks;
+use crate::engine::talk::templates;
+use crate::engine::talk::voice::Post;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
 use crate::engine::watcher::{is_ingestible, Ledger, Reconcile};
@@ -130,7 +141,7 @@ use crate::npcs::{Casting, Npcs, SUSPENDED};
 use crate::opstore::MindStores;
 use crate::projection;
 use crate::sim::orders::{Notice, EVERY_POSTER};
-use crate::sim::phone::Origin;
+use crate::sim::phone::{Kind as ThreadKind, Origin, Said, Who, CHANNEL};
 use crate::sim::Sim;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
@@ -150,6 +161,7 @@ use host::download::ensure_model_pack;
 use host::process::fatal;
 use host::stopping::{Ending, Stopping};
 use host::MODEL;
+use journals::experience::ExperienceKind;
 use npc_map::schema::NodeKind;
 use npc_map::world::Where;
 use npc_map::{describe, perceive, route};
@@ -430,6 +442,16 @@ pub struct Runtime {
     pub data: PathBuf,
     /// The same mind, as the handle the schema is read through.
     pub mind_handle: Mind,
+    /// Every hosted world's bots' experience, written to npcd's checkout of
+    /// the journals repository (`docs/npc_conversations.md` §5).
+    pub journals: Arc<Journals>,
+    /// The conversations of the characters held here (§9).
+    pub talks: Arc<Talks>,
+    /// When each character's mission last changed through a conversation.
+    pub talk_changes: Changes,
+    /// The day each world this member writes was last seen in, so its
+    /// journal hears once of a new one.
+    days: Days,
     /// The mind repository, loaded and followed, with `--mind-repo`.
     mind_repos: OnceLock<Repos>,
     /// How a device-bridge job reaches an agent (`docs/zen_moon_mind.md` §15):
@@ -784,7 +806,8 @@ pub const TO_THE_TABLE: &str =
      whatever you are doing or saying and go to it now. The table is in {room}, \
      on {level}: if you are on another floor, go to the lift, ride it to {level} \
      with `lift_use` — it calls the car and waits for it — and then `move_to` \
-     {room}; you cannot walk between floors. This comes before talk — do not answer the room, go. Once you are \
+     {room}; you cannot walk between floors. This comes before talk — answer no message and \
+     nobody here, go. Once you are \
      there, the table is on your effector device: `scan` to see what it offers, \
      then take up a mission by `invoke` on its `collect_mission`. Carry it out, \
      and when it is done come back and report it at the table the same way, then \
@@ -795,7 +818,7 @@ pub const TO_THE_TABLE: &str =
 pub const TO_THE_TABLE_ON_FOOT: &str =
     "The command table is open and there is work waiting for you. Leave off \
      whatever you are doing or saying and go to it now. The table is in {room}: \
-     `move_to` it. This comes before talk — do not answer the room, go. Once you \
+     `move_to` it. This comes before talk — answer no message and nobody here, go. Once you \
      are there, the table is on your effector device: `scan` to see what it \
      offers, then take up a mission by `invoke` on its `collect_mission`. Carry \
      it out, and when it is done come back and report it at the table the same \
@@ -912,10 +935,11 @@ const DECODE_RETRY_MS: u64 = 5_000;
 /// has: something it actually read or saw, which is why no example is given —
 /// a given example is the thing every character then reports having read.
 pub const IN_COMPANY: &str = "Nothing has been asked of you, and you are not alone. {who} \
-                              here with you. `tell` or `ask` something about the work, now, and \
-                              name a particular thing you have actually seen or read here — or \
-                              ask them what they have. Ask them something they have to answer, \
-                              or answer what they asked you. Address them exactly as written.";
+                              here with you. Say something about the work, now — speak to a \
+                              person here, `message` another character — and name a particular \
+                              thing you have actually seen or read here, or ask them what they \
+                              have. Ask them something they have to answer, or answer what they \
+                              asked you. Address them exactly as written.";
 
 /// What came of saying something to a character on its handset.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1007,6 +1031,10 @@ impl Runtime {
             data: data.to_path_buf(),
 
             mind_handle,
+            journals: Journals::new(),
+            talks: Arc::new(Talks::new()),
+            talk_changes: Changes::new(),
+            days: Days::new(),
             mind_repos: OnceLock::new(),
             agents: OnceLock::new(),
             relaunch: OnceLock::new(),
@@ -1052,6 +1080,15 @@ impl Runtime {
                 .upgrade()
                 .is_some_and(|rt| rt.standing.role(world) == Role::Disconnected)
         }));
+        // A conversation's lines and purposes go to its runner, never to the
+        // mind's inbox (`docs/npc_conversations.md` §9).
+        let talking = Arc::downgrade(&rt);
+        rt.scheduler.set_talk(Box::new(move |npc, kind| {
+            if let Some(rt) = talking.upgrade() {
+                rt.talk_arrived(npc, kind);
+            }
+        }));
+        rt.start_talking();
         Ok(rt)
     }
 
@@ -2117,7 +2154,7 @@ impl Runtime {
 
     /// Post one line to the standing chat channel of every world this daemon
     /// runs, as the command table — the channel half of a call to the table.
-    pub fn say_to_all_channels(&self, from: &str, text: &str) {
+    pub fn say_to_all_channels(&self, from: &Who, text: &str) {
         for id in self.hosted.ids() {
             if self.standing.writes(&id) {
                 let _ = self.say_on_channel(&id, from, text);
@@ -2131,10 +2168,17 @@ impl Runtime {
     /// character keeps working from its history and its own thread what the
     /// mission was, long after the mission is gone.
     pub fn cancel_mission(&self, npc_id: u64, world_ms: u64) -> bool {
-        let cancelled = self
-            .body_of(npc_id)
-            .is_some_and(|(hosted, body)| hosted.with_sim(|s| s.missions.cancel(&body)));
+        let Some((hosted, body)) = self.body_of(npc_id) else {
+            return false;
+        };
+        let title = hosted.sim(|s| s.missions.active(&body).map(|m| m.mission_text()));
+        let cancelled = hosted.with_sim(|s| s.missions.cancel(&body));
         if cancelled {
+            let line = match title {
+                Some(t) => format!("Your mission was withdrawn: {}", first_sentence(&t)),
+                None => "Your mission was withdrawn.".to_string(),
+            };
+            self.changed(&hosted, Change::Mission { body, line });
             self.tell(
                 npc_id,
                 world_ms,
@@ -2145,6 +2189,39 @@ impl Runtime {
             );
         }
         cancelled
+    }
+
+    /// Sign off `npc_id`'s critical step `step`, which `by` — an account
+    /// handle, `name` by name — said yes to on a conversation that asked them
+    /// (`docs/npc_conversations.md` §7.2). Refused unless `step` is still the
+    /// mission's next and `by` is one of the world's authorizers. The
+    /// character is told, and its journal keeps it.
+    pub fn authorize_step(&self, npc_id: u64, step: &str, by: &str, name: &str) -> bool {
+        let Some((hosted, body)) = self.body_of(npc_id) else {
+            return false;
+        };
+        let signed = hosted.with_sim(|s| {
+            let authorizer = authorize::is_authorizer(by, s.missions.authorizers());
+            let Some(m) = s.missions.active_mut(&body) else {
+                return false;
+            };
+            authorizer && m.critical_next() == Some(step) && m.authorize()
+        });
+        if signed {
+            let applied = format!("{name} signed off '{}'.", step.trim_end_matches('.'));
+            self.journals
+                .note(hosted.id(), &body, ExperienceKind::Mission, &applied, None);
+            self.tell(
+                npc_id,
+                self.world_ms(npc_id),
+                Salience::URGENT,
+                EventKind::Concluded {
+                    party: name.to_string(),
+                    applied,
+                },
+            );
+        }
+        signed
     }
 
     /// Cancel the open mission of every character in every world this daemon
@@ -2222,15 +2299,27 @@ impl Runtime {
         // was shown. It used to carry the body ids alongside, to look up whose
         // mind was behind each name and ask what it was waiting for; nothing
         // waits any more, so the second half went with the wait.
-        let company: Vec<String> = hosted.read(|w| {
+        //
+        // The people among them are the `visitor:{handle}` bodies, and whether
+        // a shout from here reaches one is perception's own rule
+        // (`docs/npc_conversations.md` §12).
+        let (company, people, heard_by_person) = hosted.read(|w| {
             let Some(mine) = w.actor(&body) else {
-                return Vec::new();
+                return (Vec::new(), Vec::new(), false);
             };
-            w.actors_at(&mine.at.clone())
+            let here = mine.at.clone();
+            let others: Vec<_> = w
+                .actors_at(&here)
                 .into_iter()
                 .filter(|a| a.id != body)
+                .collect();
+            let company = others.iter().map(|a| a.name.clone()).collect();
+            let people = others
+                .iter()
+                .filter(|a| people::is_person(&a.id))
                 .map(|a| a.name.clone())
-                .collect()
+                .collect();
+            (company, people, people::hear_a_shout(w, &here))
         });
         // The lift, from where this body stands: whether it is on a landing,
         // whether the car is open there, and the floors it could ride to. What
@@ -2252,6 +2341,8 @@ impl Runtime {
         let invokable = self.invokable_urls(&hosted, &body);
         let base = tools::Within {
             company,
+            people,
+            heard_by_person,
             at_lift,
             lift_here,
             floors,
@@ -2408,15 +2499,27 @@ impl Runtime {
     ) -> Option<npc_map::world::Where> {
         let (hosted, body) = self.body_of(npc_id)?;
         let at = hosted.read(|w| w.actor(&body).map(|a| a.at.clone()))?;
-        hosted.with(|w| {
+        let arrived = hosted.with(|w| {
             // Already here is not an error — a console that reopens the same
             // conversation is the ordinary case, and re-entering would log a
             // second arrival for somebody who never left.
             match w.actor(visitor).is_some() {
-                true => w.place(visitor, at.clone()).ok(),
-                false => w.enter(visitor, name, at.clone()).ok(),
+                true => w.place(visitor, at.clone()).ok().map(|_| false),
+                false => w.enter(visitor, name, at.clone()).ok().map(|_| true),
             }
         })?;
+        if let (true, Some(handle)) = (arrived, visitor.strip_prefix(VISITOR)) {
+            let room = hosted
+                .read(|w| w.node(&at).map(|n| n.name.clone()))
+                .unwrap_or_else(|| at.to_string());
+            self.changed(
+                &hosted,
+                Change::Party {
+                    member: handle.to_string(),
+                    line: format!("{name} arrived in {room}."),
+                },
+            );
+        }
         Some(at)
     }
 
@@ -2429,7 +2532,38 @@ impl Runtime {
             .ids()
             .iter()
             .filter_map(|id| self.hosted.get(id))
-            .any(|hosted| hosted.with(|w| w.leave(visitor).is_ok()))
+            .any(|hosted| {
+                let name = hosted.read(|w| w.name_of(visitor).map(str::to_string));
+                let left = hosted.with(|w| w.leave(visitor).is_ok());
+                if let (true, Some(name), Some(handle)) =
+                    (left, name, visitor.strip_prefix(VISITOR))
+                {
+                    self.changed(
+                        &hosted,
+                        Change::Party {
+                            member: handle.to_string(),
+                            line: format!("{name} left."),
+                        },
+                    );
+                }
+                left
+            })
+    }
+
+    /// Tell the journals a change concerns that `change` happened in
+    /// `hosted`, right where it was applied (`docs/npc_conversations.md`
+    /// §5.1.1).
+    pub(crate) fn changed(&self, hosted: &Hosted, change: Change) {
+        let world = hosted.id();
+        for (hears, line) in hosted.sim(|s| concern(&change, s)) {
+            match hears {
+                Hears::Bot(body) => {
+                    self.journals
+                        .note(world, &body, ExperienceKind::Changed, &line, None)
+                }
+                Hears::World => self.journals.note_world(world, &line),
+            }
+        }
     }
 
     /// Keep every visiting body with the character it came to see.
@@ -2543,6 +2677,14 @@ impl Runtime {
         if self.standing.writes(hosted.id()) {
             for notice in hosted.with_sim(|s| s.missions.take_notices()) {
                 self.give_notice(hosted, notice);
+            }
+            // A new day is the world's news, told once by the member that
+            // writes it, on the clock of any character in it.
+            let clock = self.bodies.in_world(hosted.id()).first().map(|(id, _)| *id);
+            if let Some(line) =
+                clock.and_then(|id| self.days.rolled(hosted.id(), self.world_ms(id)))
+            {
+                self.changed(hosted, Change::World { line });
             }
         }
         self.keep_visitors_with_their_hosts(hosted);
@@ -2777,23 +2919,30 @@ impl Runtime {
     pub fn message_npc(
         &self,
         npc_id: u64,
-        from: &str,
+        from: &Who,
         text: &str,
         origin: Option<Origin>,
     ) -> Option<MessageSent> {
         let (hosted, body) = self.body_of(npc_id)?;
         let them = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
         let sent = hosted.with_sim(|sim| {
-            sim.threads.reach(from, &them);
-            let _ = sim.threads.send_from(from, &them, text, origin);
             // Everybody a handset can reach comes from the cast rather than the
             // room, so a person messaging in from outside has to be made known
             // to the world's phones or the character is offered nobody to
             // answer. See [`crate::sim::Sim::enrol`].
             sim.enrol(from);
+            let id = sim.threads.reach(from, &Who::new(&body, &them));
+            // A person is a member by their account, and says so on the line.
+            let said = Said {
+                text: text.to_string(),
+                origin,
+                account: Some(from.id.clone()),
+                ..Said::default()
+            };
+            let _ = sim.threads.send_on(&id, &from.id, said);
             MessageSent {
                 with: them.clone(),
-                waiting_for_them: sim.threads.waiting_for(&them),
+                waiting_for_them: sim.threads.get(&id).map_or(0, |t| t.unread_for(&body)),
                 // A character with no handset cannot answer at all — the
                 // messaging acts are gated on carrying one — and saying so is
                 // better than a console that looks like it is working.
@@ -2803,7 +2952,8 @@ impl Runtime {
         Some(sent)
     }
 
-    /// The conversation between a person and a character, oldest first.
+    /// The conversation between a person and a character, oldest first: who
+    /// said each line, by name, and its words.
     pub fn messages_with(
         &self,
         npc_id: u64,
@@ -2811,16 +2961,15 @@ impl Runtime {
     ) -> Option<(String, Vec<(String, String)>)> {
         let (hosted, body) = self.body_of(npc_id)?;
         let them = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
-        // The character's lines as it would say them; the person's as written.
         let said = hosted.sim(|sim| {
             sim.threads
-                .direct_between(from, &them)
+                .direct_between(from, &body)
                 .map(|t| {
                     t.messages
                         .iter()
-                        .map(|m| match m.from == them {
-                            true => (m.from.clone(), spoken(&m.intent)),
-                            false => (m.from.clone(), m.intent.clone()),
+                        .map(|m| {
+                            let by = t.member(&m.from).map_or(m.from.clone(), |w| w.name.clone());
+                            (by, m.text.clone())
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2842,17 +2991,18 @@ impl Runtime {
     ///
     /// Returns who is on the channel to hear it. `None` when the world is not
     /// hosted.
-    pub fn say_on_channel(&self, world_id: &str, from: &str, text: &str) -> Option<Vec<String>> {
+    pub fn say_on_channel(&self, world_id: &str, from: &Who, text: &str) -> Option<Vec<String>> {
         self.say_on_channel_from(world_id, from, text, None)
     }
 
     /// [`Self::say_on_channel`], for words that came from `origin` outside
     /// the world — the world's Discord server's `#the-channel`, whose bridge
-    /// never posts them back — or from inside it, with `None`.
+    /// never posts them back — or from inside it, with `None`. Answers who
+    /// heard it, by name.
     pub fn say_on_channel_from(
         &self,
         world_id: &str,
-        from: &str,
+        from: &Who,
         text: &str,
         origin: Option<Origin>,
     ) -> Option<Vec<String>> {
@@ -2862,30 +3012,35 @@ impl Runtime {
             // channel before their own words go onto it — otherwise `send`
             // refuses, having correctly found that they are on no such thread.
             sim.enrol(from);
-            sim.threads
-                .send_from(from, crate::sim::phone::CHANNEL, text, origin)
-                .unwrap_or_default()
+            let said = Said {
+                text: text.to_string(),
+                origin,
+                account: Some(from.id.clone()),
+                ..Said::default()
+            };
+            match sim.threads.send(&from.id, CHANNEL, said) {
+                Ok((_, reached)) => reached
+                    .iter()
+                    .map(|r| sim.threads.name_of(r).unwrap_or(r).to_string())
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
         }))
     }
 
-    /// What has been said on a world's standing channel, oldest first.
-    ///
-    /// Read as `who`, because a channel is named the same way to everybody on
-    /// it but only shows what was said after each member arrived.
+    /// What has been said on a world's standing channel since `who` came
+    /// onto it, oldest first: who said each line, by name, and its words.
     pub fn channel(&self, world_id: &str, who: &str) -> Option<Vec<(String, String)>> {
         let hosted = self.hosted.get(world_id)?;
-        // The cast's lines as they would say them; a person's as written.
-        let cast: HashSet<String> = hosted.read(|w| w.actors().map(|a| a.name.clone()).collect());
         Some(hosted.sim(|sim| {
             sim.threads
-                .by_name_for(who, crate::sim::phone::CHANNEL)
+                .by_kind_for(who, ThreadKind::Group, CHANNEL)
                 .map(|t| {
-                    t.messages
+                    t.since_joined(who)
                         .iter()
-                        .skip(t.arrived_at(who))
-                        .map(|m| match cast.contains(&m.from) {
-                            true => (m.from.clone(), spoken(&m.intent)),
-                            false => (m.from.clone(), m.intent.clone()),
+                        .map(|m| {
+                            let by = t.member(&m.from).map_or(m.from.clone(), |w| w.name.clone());
+                            (by, m.text.clone())
                         })
                         .collect::<Vec<_>>()
                 })
@@ -3010,6 +3165,20 @@ impl Runtime {
     /// that succeeded must not read the same afterwards, or a character spends
     /// the rest of the day reasoning from a move it never made.
     pub fn act_on_world(&self, npc_id: u64, act: &Act) -> Outcome {
+        self.act_on_world_said(npc_id, act, None, &ActSource::Mind)
+    }
+
+    /// [`Self::act_on_world`], with the line the lease holder voiced for a
+    /// phone act and where the act came from. A conversation's act stamps
+    /// none of the character's cooldowns: its guards are its own
+    /// (`docs/npc_conversations.md` §8).
+    pub fn act_on_world_said(
+        &self,
+        npc_id: u64,
+        act: &Act,
+        said: Option<&Voiced>,
+        source: &ActSource,
+    ) -> Outcome {
         if !body::is_of_the_body(act.tool) {
             return Outcome::NotOfTheBody;
         }
@@ -3024,11 +3193,16 @@ impl Runtime {
         // The actor is not left in the dark meanwhile: a refusal comes back in
         // the same turn, which is the whole reason it is rendered rather than
         // logged.
-        let done = body::perform(&hosted, &body, act);
+        // A conversation's mission act is checked again where it lands, and
+        // an ordered body's is its own (`engine::talk::orders`).
+        if let (true, ActSource::Talk { party }) = (agenda::is_mine(act.tool), source) {
+            return self.talk_mission_act(npc_id, &hosted, &body, act, party, said);
+        }
+        let done = body::perform_said(&hosted, &body, act, said);
         // **Only what actually happened costs a wait.** A refused act is not a
         // thing the body did, and charging for one would leave a character that
         // mis-named a room standing still for fifteen seconds over a typo.
-        if done.happened() {
+        if done.happened() && *source == ActSource::Mind {
             // The act, not its name: `act` is two rates wearing one word, and
             // this is the only caller that knows which of them happened.
             self.cooldowns.took_act(npc_id, act);
@@ -3075,7 +3249,19 @@ impl Runtime {
     /// it. `body::ANSWERS` was an early, narrower version of exactly this
     /// concern, written when the feed was the only channel there was.
     pub fn record_act(&self, npc_id: u64, act: &Act) -> Recorded {
-        let outcome = self.act_on_world(npc_id, act);
+        self.record_act_said(npc_id, act, None, &ActSource::Mind)
+    }
+
+    /// [`Self::record_act`], with the line the lease holder voiced for a
+    /// phone act and where the act came from.
+    pub fn record_act_said(
+        &self,
+        npc_id: u64,
+        act: &Act,
+        said: Option<&Voiced>,
+        source: &ActSource,
+    ) -> Recorded {
+        let outcome = self.act_on_world_said(npc_id, act, said, source);
         let landed = outcome.happened();
         // What the character is told, whatever the verdict. `NotOfTheBody` has
         // no line of its own — nothing in a world happened — so it says so
@@ -3090,6 +3276,15 @@ impl Runtime {
             if let Some(line) = self.mark_spoken(npc_id, act) {
                 answer.push('\n');
                 answer.push_str(&line);
+            }
+            // A notable act of its own is its experience (§5.1): what changed
+            // the world, never walking, waiting or speech.
+            if experience::notable(act.tool) {
+                if let Some((hosted, body)) = self.body_of(npc_id) {
+                    let did = answer.lines().next().unwrap_or_default();
+                    self.journals
+                        .note(hosted.id(), &body, ExperienceKind::Did, did, None);
+                }
             }
         }
         // **Both halves, always, in one shape.**
@@ -3675,7 +3870,7 @@ impl Runtime {
     /// the library where there is one, and where there is not the character is
     /// free-decoding — refusing what it said would mean a character that felt
     /// something the daemon had no vocabulary for felt nothing at all.
-    fn note_feeling(&self, npc_id: u64, act: &Act) {
+    pub(crate) fn note_feeling(&self, npc_id: u64, act: &Act) {
         if act.tool != "reflect" {
             return;
         }
@@ -4390,11 +4585,8 @@ impl Runtime {
             }
             // The mission worked, with the rest of an agenda listed beneath it.
             who.mission = hosted.sim(|s| s.missions.agenda_prompt(&body));
-            let me = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()));
-            if let Some(me) = me {
-                who.channels =
-                    hosted.sim(|s| channels::sections(&s.threads, &me, s.has_phone(&body)));
-            }
+            who.channels =
+                hosted.sim(|s| channels::sections(&s.threads, &body, s.has_phone(&body)));
         }
         who.journal = self
             .scheduler
@@ -5093,7 +5285,11 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     // grammar is compiled from — so the list a character reads and the mask it
     // decodes under are one computation and cannot disagree.
     p.set_step(LoadStep::Tools);
-    let acts: Vec<&Tool> = tools::CATALOG.iter().chain(reflect::ASKED).collect();
+    let acts: Vec<&Tool> = tools::CATALOG
+        .iter()
+        .chain(ORDERED_ACTS)
+        .chain(reflect::ASKED)
+        .collect();
     let total = acts.len() as u64;
     p.set_progress(0, total);
     if let Some(built) = projection.as_mut() {
@@ -5137,6 +5333,12 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         }
         None => identity::Installed::default(),
     };
+    // The talk templates a conversation's words are shaped by, and the
+    // `response` collection made one each turn offers from.
+    let templates = match projection.as_mut() {
+        Some(p) => templates::install(&mut p.builder, mind_files.as_deref())?,
+        None => templates::Installed::default(),
+    };
 
     if let (Some(p), Some(minds)) = (projection.as_ref(), rt.minds.read().unwrap().as_ref()) {
         minds.set_projection(Projected {
@@ -5144,7 +5346,9 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             builder: p.builder.clone(),
             layer: p.layer,
             group: p.group,
+            talk: p.talk,
             identities: identities.clone(),
+            templates,
             // After everything is installed, so the acts and identities are in
             // it: a conversation written under a different set is superseded on
             // its next open rather than rejoined.
@@ -6292,6 +6496,9 @@ impl Runtime {
     /// stopping) ends it. Idempotent — a character whose task is already
     /// running keeps it.
     pub fn spawn_character(self: &Arc<Self>, npc_id: u64) {
+        // What waited on its pair threads while it ran nowhere, or elsewhere:
+        // a `Told` pulse is not kept, so nothing else would answer it.
+        self.rescan_talks(npc_id);
         let Some(handle) = self.spawner.clone() else {
             // The unit tests exercise scheduling data without a runtime; the
             // daemon always has one.
@@ -6655,7 +6862,36 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                             // write and a body's act each produce a
                             // `Recorded`, so the feed, the answer, and
                             // everything downstream are one shape.
-                            let performed = rt.perform(id, a, pinned_at.as_ref()).await;
+                            // A post on a group is said in the character's
+                            // own words, decoded here before the act goes to
+                            // the world; one whose words could not be decoded
+                            // is refused, never posted as its intent, and
+                            // one saying again what it just said there is
+                            // refused before it is posted.
+                            let performed = match rt.voice_post(id, a).await {
+                                Ok(Post::None) => {
+                                    rt.perform_said(
+                                        id,
+                                        a,
+                                        pinned_at.as_ref(),
+                                        None,
+                                        &ActSource::Mind,
+                                    )
+                                    .await
+                                }
+                                Ok(Post::Words(said)) => {
+                                    rt.perform_said(
+                                        id,
+                                        a,
+                                        pinned_at.as_ref(),
+                                        Some(&said),
+                                        &ActSource::Mind,
+                                    )
+                                    .await
+                                }
+                                Ok(Post::Repeat) => rt.repeated(a),
+                                Err(e) => rt.unvoiced(a, &format!("{e:#}")),
+                            };
                             let r = performed.recorded;
                             // An act that moved the mission is answered by
                             // what comes next, and that is read at once.
@@ -7330,21 +7566,27 @@ mod tests {
         }
     }
 
-    /// **A message sent to a character has to reach its mind.**
+    /// **A message sent to a character has to reach its conversation.**
     ///
     /// The whole path, end to end, because every piece of it was individually
     /// correct while the thing a person actually does — message a character and
-    /// wait for an answer — did nothing at all. Sending writes a thread; the
-    /// world's next moment is what carries it to the inbox; and until it is in
-    /// the inbox the character has not been told anything.
+    /// wait for an answer — did nothing at all. Sending writes the pair's
+    /// thread; the world's next moment is what carries the line to the
+    /// character's conversation with them; the mind's inbox is never handed it
+    /// (`docs/npc_conversations.md` §9).
     #[tokio::test]
-    async fn a_message_reaches_the_characters_inbox_on_the_next_moment() {
+    async fn a_message_reaches_the_characters_conversation_on_the_next_moment() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         let hosted = rt.hosted.get(WORLD).expect("hosted");
 
         let sent = rt
-            .message_npc(1, "Johnathan Sharratt", "are you there", None)
+            .message_npc(
+                1,
+                &Who::new("u_john", "Johnathan Sharratt"),
+                "are you there",
+                None,
+            )
             .expect("the character could be messaged");
         assert_eq!(sent.with, "Maker-01");
         assert_eq!(sent.waiting_for_them, 1, "it was not written to the thread");
@@ -7358,9 +7600,14 @@ mod tests {
         assert_eq!(moment.messaged, 1, "the moment carried nothing to anybody");
 
         assert_eq!(
+            rt.talks.waiting(1),
+            1,
+            "the line never reached the conversation"
+        );
+        assert_eq!(
             rt.scheduler.inbox_depth(1),
-            Some(1),
-            "the message never reached the inbox"
+            Some(0),
+            "the mind was handed it"
         );
     }
 
@@ -7372,7 +7619,12 @@ mod tests {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         let hosted = rt.hosted.get(WORLD).expect("hosted");
-        rt.message_npc(1, "Johnathan Sharratt", "are you there", None);
+        rt.message_npc(
+            1,
+            &Who::new("u_john", "Johnathan Sharratt"),
+            "are you there",
+            None,
+        );
         rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
 
         assert_eq!(
@@ -8253,10 +8505,11 @@ mod tests {
         // been looking at" got three characters agreeing about silence for a
         // hundred turns, because none of them had to name a thing.
         // **Naming the act is what makes an instruction land.** "Talk to them"
-        // is a wish; "`tell` or `ask`" is the branch the grammar has an arm for,
-        // and the difference showed up as a cast that only ever walked.
+        // is a wish; "`message`" is the branch the grammar has an arm for when
+        // the company is characters, and the difference showed up as a cast
+        // that only ever walked.
         assert!(
-            together.contains("`tell`") && together.contains("`ask`"),
+            together.contains("`message`"),
             "the instruction names no act to carry it out: {together}"
         );
         assert!(

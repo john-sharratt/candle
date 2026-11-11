@@ -41,6 +41,7 @@ pub mod field;
 pub mod findings;
 pub mod house;
 pub mod item;
+pub mod kept_steps;
 pub mod ledger;
 pub mod missing;
 pub mod missions;
@@ -49,6 +50,7 @@ pub mod operations;
 pub mod orders;
 pub mod phone;
 pub mod posting;
+pub mod purpose;
 pub mod reading;
 pub mod record;
 pub mod round;
@@ -59,6 +61,7 @@ pub mod unread;
 pub mod upkeep;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::iter;
 
 use serde::{Deserialize, Serialize};
 
@@ -98,7 +101,9 @@ pub struct Sim {
     pub table_open: bool,
     /// What the world is made of, as the Makers hold it — see [`record`].
     pub record: record::Record,
-    /// Every conversation carried on a handset — see [`phone`].
+    /// Every conversation carried on a handset — see [`phone`]. Kept under
+    /// `phone`: the threads a world kept by members' names are not read.
+    #[serde(rename = "phone", default)]
     pub threads: phone::Threads,
     /// Words left at a place for whoever comes by — see [`posting`].
     ///
@@ -107,12 +112,18 @@ pub struct Sim {
     /// is the correct reading of an absent field rather than a migration.
     #[serde(default)]
     pub postings: posting::Postings,
-    /// Everybody a phone could reach, by the name the world writes down.
+    /// Everybody a phone could reach: their id, and the name they go by.
     ///
     /// Not derived from who is standing where: the point of a handset is that
     /// it reaches somebody who is nowhere near, so the set has to come from the
     /// cast rather than from the room.
-    roster: Vec<String>,
+    #[serde(rename = "contacts", default)]
+    roster: Vec<phone::Who>,
+    /// Purposes the acts just performed left for conversations, taken by the
+    /// authority as each act lands — see [`purpose`]. Never kept: an act's
+    /// purpose is handed on in the same hold that performed it.
+    #[serde(skip)]
+    pub purposes: Vec<purpose::Purpose>,
     /// Absent in a world with no tower — the vault has none, and Keeper's whole
     /// vocabulary goes with it.
     pub tower: Option<Tower>,
@@ -444,105 +455,87 @@ impl Sim {
         self.pack(body).has(phone::PHONE)
     }
 
-    /// `message.to`, `invite.to`, `sign_off.to` — the conversations this
-    /// character has, as it names them. Empty without a handset.
-    pub fn threads_for(&self, me: &str, body: &str) -> Vec<String> {
+    /// `message.to` — the threads this character has, as it names them.
+    /// Empty without a handset.
+    pub fn threads_for(&self, body: &str) -> Vec<String> {
         match self.has_phone(body) {
-            true => self.threads.names_for(me),
+            true => self.threads.names_for(body),
             false => Vec::new(),
         }
     }
 
-    /// `message.to` once it has said how it goes — the conversations of
-    /// `kind` this character has: the people it talks to alone, or its
-    /// channels and groups. Empty without a handset.
-    pub fn threads_of_kind_for(&self, me: &str, body: &str, kind: phone::Kind) -> Vec<String> {
+    /// `message.to` once it has said how it goes — the threads of `kind` this
+    /// character has: the people it talks to alone, or its channels and
+    /// groups. Empty without a handset.
+    pub fn threads_of_kind_for(&self, body: &str, kind: phone::Kind) -> Vec<String> {
         match self.has_phone(body) {
-            true => self.threads.names_of_kind_for(me, kind),
+            true => self.threads.names_of_kind_for(body, kind),
             false => Vec::new(),
         }
     }
 
-    /// `read.what`, off the phone — each conversation with something unread
-    /// for this character, as it names them, led by `messages` for all of
-    /// them at once. Empty without a handset, or with nothing unread, which is
-    /// what keeps `read` from being offered a phone it has already read.
-    pub fn unread_on_phone_for(&self, me: &str, body: &str) -> Vec<String> {
+    /// `read.what`, off the phone — each group or channel with something
+    /// unread for this character, led by `messages` for all of them at once.
+    /// Empty without a handset, or with nothing unread. A direct thread is
+    /// never here: its lines are its conversation's.
+    pub fn unread_on_phone_for(&self, body: &str) -> Vec<String> {
         if !self.has_phone(body) {
             return Vec::new();
         }
         let unread: Vec<String> = self
             .threads
-            .unread_threads(me)
+            .unread_threads(body)
             .into_iter()
             .map(|(name, _)| name)
             .collect();
         match unread.is_empty() {
             true => unread,
-            false => std::iter::once(phone::ALL_MESSAGES.to_string())
+            false => iter::once(phone::ALL_MESSAGES.to_string())
                 .chain(unread)
                 .collect(),
         }
     }
 
-    /// `reply.to` — the conversations where somebody else spoke last, waiting
-    /// on this character. Empty without a handset.
-    pub fn awaiting_for(&self, me: &str, body: &str) -> Vec<String> {
+    /// `reply.to` on the main loop — the groups and channels where somebody
+    /// else spoke last. Empty without a handset. A direct thread's party is
+    /// answered by its conversation.
+    pub fn awaiting_for(&self, body: &str) -> Vec<String> {
         match self.has_phone(body) {
-            true => self.threads.awaiting_names_for(me),
+            true => self.threads.awaiting_names_for(body),
             false => Vec::new(),
         }
     }
 
-    /// `sign_off.to` — the conversations this character can actually leave.
-    ///
-    /// Its own threads, less the world's standing channels. Leaving a
-    /// conversation is a real decision and belongs to the character; leaving
-    /// the open channel is not one, because there is no way back to it and
-    /// nothing in the world would report that somebody had gone. See
-    /// [`crate::engine::tools::Choices::Leavable`].
-    pub fn leavable_for(&self, me: &str, body: &str) -> Vec<String> {
+    /// `sign_off.to` on the main loop — the groups this character can leave:
+    /// its own, less the world's standing channels, which there is no way
+    /// back to. A direct thread is never left.
+    pub fn leavable_for(&self, body: &str) -> Vec<String> {
         if !self.has_phone(body) {
             return Vec::new();
         }
         self.threads
-            .of(me)
+            .groups_of(body)
             .into_iter()
             .filter(|t| !t.permanent)
-            .map(|t| t.as_named_to(me))
+            .map(|t| t.as_named_to(body))
             .collect()
     }
 
-    /// `invite.to` — the conversations somebody could actually be brought into.
-    ///
-    /// Its own threads, less the ones every invitable person is **already on**.
-    ///
-    /// # Why this is not [`Self::threads_for`]
-    ///
-    /// [`phone::CHANNEL`] holds the entire cast, permanently, by construction —
-    /// so there is nobody alive who could be invited to it, and `invite` against
-    /// it fails the same way every time: `"X is already on it."` Offered the
-    /// whole thread list, a character picks the one thread it shares with
-    /// everybody, is refused, and picks it again.
-    ///
-    /// Measured over 48 turns of three characters: 17 invites, every one of
-    /// them to the channel, 16 refused. It was the second-most-called act in
-    /// the cast and it could never once have worked.
-    ///
-    /// A refusal a character cannot avoid is a defect in the branch, not a
-    /// lesson — so the thread leaves the set. Empty for a character whose only
-    /// thread is the channel, which takes `invite` out of the grammar entirely:
-    /// correct, because there is then nowhere to invite anybody.
-    pub fn invitable_for(&self, me: &str, body: &str) -> Vec<String> {
+    /// `invite.to` — the groups somebody could actually be brought into: its
+    /// own, less the ones every contact is **already on**. A direct thread
+    /// takes no third member, and the channel holds the whole cast, so
+    /// neither is ever offered; a character with neither has nowhere to
+    /// invite anybody, which takes `invite` out of the grammar.
+    pub fn invitable_for(&self, body: &str) -> Vec<String> {
         if !self.has_phone(body) {
             return Vec::new();
         }
-        let who = self.contacts_for(me, body);
+        let who = self.contact_ids_for(body);
         self.threads
-            .of(me)
+            .groups_of(body)
             .into_iter()
             .filter(|t| who.iter().any(|w| !t.has(w)))
-            .map(|t| t.as_named_to(me))
+            .map(|t| t.as_named_to(body))
             .collect()
     }
 
@@ -566,20 +559,22 @@ impl Sim {
     /// have been invited to the other — and that is the right trade here, where
     /// a refusal a character cannot foresee is worth more than a call it never
     /// gets to make.
-    pub fn invitees_for(&self, me: &str, body: &str) -> Vec<String> {
-        let threads = self.invitable_for(me, body);
+    pub fn invitees_for(&self, body: &str) -> Vec<String> {
+        let threads = self.invitable_for(body);
         if threads.is_empty() {
             return Vec::new();
         }
-        self.contacts_for(me, body)
-            .into_iter()
-            .filter(|who| {
+        self.roster
+            .iter()
+            .filter(|w| self.contact_ids_for(body).contains(&w.id))
+            .filter(|w| {
                 self.threads
-                    .of(me)
+                    .groups_of(body)
                     .into_iter()
-                    .filter(|t| threads.contains(&t.as_named_to(me)))
-                    .all(|t| !t.has(who))
+                    .filter(|t| threads.contains(&t.as_named_to(body)))
+                    .all(|t| !t.has(&w.id))
             })
+            .map(|w| w.name.clone())
             .collect()
     }
 
@@ -604,21 +599,44 @@ impl Sim {
     /// A direct thread is the right test because it is exactly what
     /// [`phone::Threads::reach`] would find: being on a channel with fifty
     /// people is not having a conversation with any of them.
-    pub fn contacts_for(&self, me: &str, body: &str) -> Vec<String> {
-        if !self.has_phone(body) {
-            return Vec::new();
-        }
-        self.roster
-            .iter()
-            .filter(|n| n.as_str() != me)
-            .filter(|n| self.threads.direct_between(me, n).is_none())
-            .cloned()
-            .collect()
+    pub fn contacts_for(&self, body: &str) -> Vec<String> {
+        self.contacts(body).map(|w| w.name.clone()).collect()
     }
 
-    /// Everybody a phone could reach, by the name the world writes down.
-    pub fn set_roster(&mut self, names: Vec<String>) {
-        self.roster = names;
+    /// [`Self::contacts_for`], by id.
+    pub fn contact_ids_for(&self, body: &str) -> Vec<String> {
+        self.contacts(body).map(|w| w.id.clone()).collect()
+    }
+
+    fn contacts<'a>(&'a self, body: &'a str) -> impl Iterator<Item = &'a phone::Who> + 'a {
+        let has = self.has_phone(body);
+        self.roster
+            .iter()
+            .filter(move |w| has && w.id != body)
+            .filter(move |w| self.threads.direct_between(body, &w.id).is_none())
+    }
+
+    /// The id of the somebody on the roster called `name`, as a character
+    /// names them in a call.
+    pub fn roster_id(&self, name: &str) -> Option<&str> {
+        let want = name.trim();
+        self.roster
+            .iter()
+            .find(|w| w.name.trim().eq_ignore_ascii_case(want) || w.id == want)
+            .map(|w| w.id.as_str())
+    }
+
+    /// The name `id` goes by on the roster.
+    pub fn roster_name(&self, id: &str) -> Option<&str> {
+        self.roster
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.name.as_str())
+    }
+
+    /// Everybody a phone could reach.
+    pub fn set_roster(&mut self, roster: Vec<phone::Who>) {
+        self.roster = roster;
     }
 
     /// Make somebody known to this world's phones: on the roster, and on the
@@ -633,17 +651,22 @@ impl Sim {
     ///
     /// Idempotent, and called on every arrival and every message from outside
     /// the world, because neither of those is a one-off event.
-    pub fn enrol(&mut self, name: &str) {
-        if !self.roster.iter().any(|n| n == name) {
-            self.roster.push(name.to_string());
-            self.roster.sort();
+    pub fn enrol(&mut self, who: &phone::Who) {
+        match self.roster.iter_mut().find(|w| w.id == who.id) {
+            Some(w) => w.name = who.name.clone(),
+            None => {
+                self.roster.push(who.clone());
+                self.roster
+                    .sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+            }
         }
-        self.threads.join_channel(phone::CHANNEL, name);
+        self.threads.enrol(&who.id, &who.name);
+        self.threads.join_channel(phone::CHANNEL, who);
     }
 
-    /// Who is on the roster now.
+    /// Who is on the roster now, by name.
     pub fn contacts_roster(&self) -> Vec<String> {
-        self.roster.clone()
+        self.roster.iter().map(|w| w.name.clone()).collect()
     }
 
     /// The material a random routine is built around, for a body named `me`: the
@@ -712,9 +735,9 @@ impl Sim {
         }
     }
 
-    /// How many messages are waiting for somebody across every thread.
-    pub fn messages_waiting(&self, me: &str) -> usize {
-        self.threads.waiting_for(me)
+    /// How many lines are waiting for a character across its groups.
+    pub fn messages_waiting(&self, body: &str) -> usize {
+        self.threads.waiting_for(body)
     }
 
     /// Every act the parts standing here carry, in a stable order.
@@ -1114,15 +1137,21 @@ mod tests {
         assert_eq!(in_the_redoubt.duties[0].device, "the gate winch");
     }
 
-    /// A cast whose phones are on the channel and nothing else.
+    /// A cast whose phones are on the channel and nothing else; each body's
+    /// id is its name.
     fn on_the_channel(names: &[&str]) -> Sim {
         let mut s = Sim::new();
         for n in names {
             s.pack_mut(n)
                 .add(Item::new(phone::PHONE, "handset", Kind::Gear, 1));
-            s.enrol(n);
+            s.enrol(&phone::Who::new(n, n));
         }
         s
+    }
+
+    fn reach(s: &mut Sim, a: &str, b: &str) {
+        s.threads
+            .reach(&phone::Who::new(a, a), &phone::Who::new(b, b));
     }
 
     /// **A machine is not offered the state it is already in.**
@@ -1183,15 +1212,13 @@ mod tests {
     fn the_channel_is_not_offered_as_somewhere_to_invite_anybody() {
         let s = on_the_channel(&["Wren", "Wailen Wylde", "Marek"]);
         assert!(
-            s.threads_for("Wren", "Wren")
-                .iter()
-                .any(|t| t == "the channel"),
+            s.threads_for("Wren").iter().any(|t| t == "the channel"),
             "the channel should still be a thread Wren can message"
         );
         assert!(
-            s.invitable_for("Wren", "Wren").is_empty(),
+            s.invitable_for("Wren").is_empty(),
             "the channel was offered as an invite target: {:?}",
-            s.invitable_for("Wren", "Wren")
+            s.invitable_for("Wren")
         );
     }
 
@@ -1202,7 +1229,7 @@ mod tests {
     fn a_character_with_only_the_channel_is_not_offered_invite_at_all() {
         use crate::engine::tools::Choices;
         let s = on_the_channel(&["Wren", "Marek"]);
-        assert!(s.invitable_for("Wren", "Wren").is_empty());
+        assert!(s.invitable_for("Wren").is_empty());
         assert!(
             Choices::Invitable.steers(),
             "an empty set must drop the act"
@@ -1219,27 +1246,29 @@ mod tests {
     #[test]
     fn nobody_offered_for_an_invite_is_already_on_a_thread_being_offered() {
         let mut s = on_the_channel(&["Wren", "Wailen Wylde", "Marek"]);
-        // Wren has a private thread with Wailen. Marek is on neither it nor any
-        // other private thread, so he is the only sound answer.
-        s.threads.reach("Wren", "Wailen Wylde");
-
-        let threads = s.invitable_for("Wren", "Wren");
-        let who = s.invitees_for("Wren", "Wren");
-        assert!(!threads.is_empty(), "there was nowhere to invite anybody");
-        assert!(who.iter().any(|w| w == "Marek"), "{who:?}");
-        assert!(
-            !who.iter().any(|w| w == "Wailen Wylde"),
-            "somebody already on the offered thread was offered: {who:?}"
+        // Wren has a group with Wailen. Marek is on no group of Wren's, so he
+        // is the only sound answer.
+        s.threads.open_group(
+            "the sweep",
+            &[
+                phone::Who::new("Wren", "Wren"),
+                phone::Who::new("Wailen Wylde", "Wailen Wylde"),
+            ],
         );
+
+        let threads = s.invitable_for("Wren");
+        let who = s.invitees_for("Wren");
+        assert_eq!(threads, ["the sweep"]);
+        assert_eq!(who, ["Marek"]);
 
         // The property, stated directly: no offered person is on any offered
         // thread, so no combination the character can name is refusable.
-        for t in s.threads.of("Wren") {
+        for t in s.threads.groups_of("Wren") {
             if !threads.contains(&t.as_named_to("Wren")) {
                 continue;
             }
             for w in &who {
-                assert!(!t.has(w), "{w} is already on {}", t.as_named_to("Wren"));
+                assert!(!t.has(s.roster_id(w).unwrap()), "{w} is already on it");
             }
         }
     }
@@ -1249,28 +1278,30 @@ mod tests {
     #[test]
     fn an_invite_with_nobody_to_bring_offers_nobody() {
         let mut s = on_the_channel(&["Wren", "Wailen Wylde"]);
-        s.threads.reach("Wren", "Wailen Wylde");
+        s.threads.open_group(
+            "the sweep",
+            &[
+                phone::Who::new("Wren", "Wren"),
+                phone::Who::new("Wailen Wylde", "Wailen Wylde"),
+            ],
+        );
         assert!(
-            s.invitees_for("Wren", "Wren").is_empty(),
-            "the only other person is already on the only thread"
+            s.invitees_for("Wren").is_empty(),
+            "the only other person is already on the only group"
         );
     }
 
-    /// A private thread still takes people — the fix removes the impossible
-    /// target, not the act.
+    /// **A direct thread is never somewhere to bring somebody**: it is the
+    /// pair's, for ever, and a group starts with `open_group`. Its other side
+    /// is no longer a contact to `reach_out` to.
     #[test]
-    fn a_private_thread_is_still_somewhere_to_bring_somebody() {
+    fn a_direct_thread_is_never_somewhere_to_bring_somebody() {
         let mut s = on_the_channel(&["Wren", "Wailen Wylde", "Marek"]);
-        s.threads.reach("Wren", "Wailen Wylde");
-        let invitable = s.invitable_for("Wren", "Wren");
-        assert!(
-            invitable.iter().any(|t| t == "Wailen Wylde"),
-            "the private thread should accept Marek: {invitable:?}"
-        );
-        assert!(
-            !invitable.iter().any(|t| t == "the channel"),
-            "the channel is still not invitable: {invitable:?}"
-        );
+        reach(&mut s, "Wren", "Wailen Wylde");
+        assert!(s.invitable_for("Wren").is_empty());
+        assert_eq!(s.contacts_for("Wren"), ["Marek"]);
+        assert_eq!(s.roster_id("marek"), Some("Marek"));
+        assert_eq!(s.roster_name("Marek"), Some("Marek"));
     }
 
     #[test]

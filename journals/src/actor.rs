@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::files::Role;
 use crate::line::Writer;
 use crate::path::{JournalPath, Viewer};
-use crate::scope::Channel;
+use crate::scope::{Channel, Section};
 use crate::slug::Slug;
 use crate::tree::Tree;
 
@@ -32,8 +32,12 @@ pub enum Actor {
     Zend,
     /// A Zen worker of `person`'s, on its own account.
     Worker { person: Slug },
-    /// npcd, for a bot of a group `person` belongs to.
-    Npcd { person: Slug },
+    /// npcd, for the bots of `group`: it writes their journals under the
+    /// group's `bots`, and reads those and the group's `people`, whose
+    /// journals are the parties its conversations are with. No person's
+    /// account is behind it, so its lines name none, and no member can edit
+    /// or forget them as their own.
+    Npcd { group: Slug },
     /// A bot, reading what its group grants it. It writes nothing.
     Bot { bot: Slug },
     /// An account no person lists, through `channel`: it reads `@guest` and
@@ -61,9 +65,12 @@ impl Actor {
         match self {
             Actor::Person { person, .. }
             | Actor::Server { person, .. }
-            | Actor::Worker { person }
-            | Actor::Npcd { person } => Some(person),
-            Actor::Zend | Actor::System | Actor::Bot { .. } | Actor::Guest { .. } => None,
+            | Actor::Worker { person } => Some(person),
+            Actor::Zend
+            | Actor::System
+            | Actor::Npcd { .. }
+            | Actor::Bot { .. }
+            | Actor::Guest { .. } => None,
         }
     }
 
@@ -85,8 +92,19 @@ impl Actor {
         if let Some(c) = self.channel() {
             out.push(("Journal-Channel", c.name().to_string()));
         }
+        if let Actor::Npcd { group } = self {
+            out.push(("Journal-Group", group.to_string()));
+        }
         out
     }
+}
+
+/// npcd for `group` may read `path`: the group's `bots`, which it keeps, and
+/// its `people`, the parties its conversations are with — never its
+/// conversations, threads or topics, which an NPC must not repeat to another
+/// party.
+pub fn npcd_may_read(group: &Slug, path: &JournalPath) -> bool {
+    path.group() == group && matches!(path.section(), Some(Section::Bots | Section::People))
 }
 
 /// `person` is a member of `group`, by its `group.yaml`; their role.
@@ -181,6 +199,7 @@ pub fn bot_may_read(tree: &Tree, bot: &Slug, path: &JournalPath) -> bool {
 pub fn need_read(tree: &Tree, actor: &Actor, path: &JournalPath) -> Result<()> {
     let may = match actor {
         Actor::Zend | Actor::System => true,
+        Actor::Npcd { group } => npcd_may_read(group, path),
         Actor::Bot { bot } => bot_may_read(tree, bot, path),
         Actor::Guest { .. } => path.group().as_str() == GUEST,
         _ => actor.person().is_some_and(|p| may_read(tree, p, path)),
@@ -246,6 +265,32 @@ mod tests {
         let bot = Actor::Bot { bot: slug("b1") };
         assert_eq!(bot.person(), None);
         assert_eq!(bot.writer(), Writer::Npcd);
+        let npcd = Actor::Npcd {
+            group: slug("moon"),
+        };
+        assert_eq!(npcd.person(), None, "no person's account is behind it");
+        assert_eq!(
+            npcd.trailers(),
+            vec![
+                ("Journal-Writer", "npcd".to_string()),
+                ("Journal-Group", "moon".to_string()),
+            ]
+        );
+    }
+
+    /// **npcd reads its group's bots and people, and nothing else**: not the
+    /// group's conversations, threads or topics, and nothing of another group.
+    #[test]
+    fn npcd_reads_its_groups_bots_and_people_alone() {
+        let t = zen();
+        let npcd = Actor::Npcd { group: slug("zen") };
+        for ok in ["bots", "bots/zen", "people", "people/john"] {
+            assert!(need_read(&t, &npcd, &p(ok)).is_ok(), "{ok}");
+        }
+        for no in ["@zen", "conversations", "threads", "topics", "topics/game"] {
+            assert!(need_read(&t, &npcd, &p(no)).is_err(), "{no}");
+        }
+        assert!(need_read(&t, &npcd, &p("@guest/bots")).is_err());
     }
 
     /// **A bot reads only its grants**: never the rest of its group, never

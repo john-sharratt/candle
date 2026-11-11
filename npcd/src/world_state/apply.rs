@@ -298,17 +298,19 @@ mod tests {
             channel_id: 31,
             user_id: 77,
             mirrored_through: 4,
+            mirrored_part: 0,
             last_seen_discord: 900,
         };
         let source = vault();
         source.with_dms(|d| d.put(42, "0a1b", dm));
         let records = records_of(&source);
         assert_eq!(
-            records.get("discord/dm/42/0a1b"),
+            records.get("discord/direct/42/0a1b"),
             Some(&json!({
                 "channel_id": 31,
                 "user_id": 77,
                 "mirrored_through": 4,
+                "mirrored_part": 0,
                 "last_seen_discord": 900,
             }))
         );
@@ -327,6 +329,7 @@ mod tests {
             guild_id: 600,
             thread: "th7".into(),
             mirrored_through: 2,
+            mirrored_part: 0,
             last_seen_discord: 901,
         };
         let source = vault();
@@ -347,6 +350,7 @@ mod tests {
                 "guild_id": 600,
                 "thread": "th7",
                 "mirrored_through": 2,
+                "mirrored_part": 0,
                 "last_seen_discord": 901,
             }))
         );

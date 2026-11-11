@@ -130,13 +130,14 @@ impl Survey {
                 return (Vec::new(), Vec::new(), None);
             };
             let at = actor.at.clone();
-            let me = actor.name.clone();
+            // Its groups and channels: a direct thread is its conversation's,
+            // answered there, never something to `read` off the phone.
             let threads: Vec<String> = match sim.has_phone(body) {
                 true => sim
                     .threads
-                    .of(&me)
+                    .groups_of(body)
                     .into_iter()
-                    .map(|t| on_you::thread_line(t, &me))
+                    .map(|t| on_you::thread_line(t, body))
                     .collect(),
                 false => Vec::new(),
             };

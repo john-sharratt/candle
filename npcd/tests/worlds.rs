@@ -41,6 +41,7 @@ use npcd::authority::Role;
 use npcd::engine::act::Act;
 use npcd::engine::runtime::Runtime;
 use npcd::mind::Mind;
+use npcd::sim::phone::Who;
 use npcd::world::Hosted;
 use npcd::world_state::sim_records;
 use serde_json::json;
@@ -507,15 +508,14 @@ async fn a_world_has_one_authority_and_its_cast_runs_where_it_is_lent() {
     .await;
 
     // A message to that character goes onto the authority's threads, and
-    // reaches the character where it runs.
-    let before = replica.rt.scheduler.inbox_depth(speaker).unwrap();
+    // reaches the character's conversation where it runs.
     let sent = auth
         .rt
         .make(
             world,
             WorldOp::Message {
                 npc: speaker,
-                from: "An Operator".into(),
+                from: Who::new("u_operator", "An Operator"),
                 text: "come up".into(),
                 origin: None,
             },
@@ -525,7 +525,7 @@ async fn a_world_has_one_authority_and_its_cast_runs_where_it_is_lent() {
         .unwrap();
     assert!(matches!(sent, OpReply::Sent { sent: Some(_) }), "{sent:?}");
     until("the message reaches the character's member", WITHIN, || {
-        replica.rt.scheduler.inbox_depth(speaker).unwrap() > before
+        replica.rt.talks.waiting(speaker) > 0 || replica.rt.talks.turning(speaker)
     })
     .await;
 }

@@ -35,8 +35,6 @@ use crate::discord::rejected::Rejected;
 use crate::discord::trace::note;
 use crate::discord::trace::note::{Direction, Note};
 use crate::discord::world::hold::{FAILED_FOR, REFUSED_FOR};
-use crate::engine::reported::spoken;
-use crate::engine::speaking_as;
 use crate::sim::phone::Message;
 use crate::world::Hosted;
 
@@ -58,16 +56,14 @@ pub async fn post(
     else {
         return Ok(());
     };
-    let Some(character) = hosted.read(|w| w.actor(&body).map(|a| a.name.clone())) else {
+    if hosted.read(|w| w.actor(&body).is_none()) {
         return Ok(());
-    };
+    }
 
     for (account, dm) in hosted.dms(|d| d.of(bot.npc)) {
-        let Some(person) = speaking_name(a, &account).await else {
-            continue;
-        };
-        let waiting = waiting(&hosted, &person, &character, dm.mirrored_through);
-        deliver(a, bot, &hosted, &account, dm, &character, waiting).await?;
+        let person = public_id(&account);
+        let waiting = waiting(&hosted, &person, &body, dm.mirrored_through);
+        deliver(a, bot, &hosted, &account, dm, &body, waiting).await?;
     }
 
     for (discord_id, account) in index::all(&a.npcs.substrate()) {
@@ -77,13 +73,12 @@ pub async fn post(
         let Ok(user_id) = discord_id.parse::<u64>() else {
             continue;
         };
-        let Some(person) = speaking_name(a, &account).await else {
-            continue;
-        };
-        let written: Vec<Message> = waiting(&hosted, &person, &character, 0)
+        let person = public_id(&account);
+        let written: Vec<Message> = waiting(&hosted, &person, &body, 0)
             .messages
             .into_iter()
-            .filter(|m| m.from == character && m.at_ms >= bot.since_ms)
+            .map(|(m, _)| m)
+            .filter(|m| m.from == body && m.at_ms >= bot.since_ms)
             .collect();
         let (Some(first), Some(last)) = (written.first(), written.last()) else {
             continue;
@@ -117,41 +112,40 @@ pub async fn post(
             channel_id,
             user_id,
             mirrored_through: first.seq - 1,
+            mirrored_part: 0,
             // Anything the person writes from now is newer than this.
             last_seen_discord: snowflake_at(now_ms()),
         };
         hosted.with_dms(|d| d.put(bot.npc, &account, dm));
-        let waiting = waiting(&hosted, &person, &character, dm.mirrored_through);
-        deliver(a, bot, &hosted, &account, dm, &character, waiting).await?;
+        let waiting = waiting(&hosted, &person, &body, dm.mirrored_through);
+        deliver(a, bot, &hosted, &account, dm, &body, waiting).await?;
     }
     Ok(())
 }
 
-/// The name account `account`'s person speaks by in the world.
-pub(super) async fn speaking_name(a: &Authored, account: &str) -> Option<String> {
-    let identity = a.accounts.read().await.identity(account)?;
-    Some(speaking_as(&identity, &public_id(account), &a.roles))
-}
-
-/// What is waiting on a direct thread: its id, and its messages to post.
+/// What is waiting on a direct thread: its id, and its messages to post,
+/// each with the name of who said it.
 struct Waiting {
     thread: String,
-    messages: Vec<Message>,
+    messages: Vec<(Message, String)>,
 }
 
-/// The messages of `person`'s direct thread with `character` past seq
-/// `through` that came from the world, oldest first.
-fn waiting(hosted: &Hosted, person: &str, character: &str, through: u64) -> Waiting {
+/// The messages of `person`'s direct thread with the character's `body` past
+/// seq `through` that came from the world, oldest first.
+fn waiting(hosted: &Hosted, person: &str, body: &str, through: u64) -> Waiting {
     hosted.sim(|s| {
         s.threads
-            .direct_between(person, character)
+            .direct_between(person, body)
             .map(|t| Waiting {
                 thread: t.id.clone(),
                 messages: t
                     .messages
                     .iter()
                     .filter(|m| m.seq > through && m.origin.is_none())
-                    .cloned()
+                    .map(|m| {
+                        let by = t.member(&m.from).map_or(m.from.clone(), |w| w.name.clone());
+                        (m.clone(), by)
+                    })
                     .collect(),
             })
             .unwrap_or(Waiting {
@@ -169,7 +163,7 @@ async fn deliver(
     hosted: &Hosted,
     account: &str,
     mut dm: Dm,
-    character: &str,
+    body: &str,
     waiting: Waiting,
 ) -> Result<(), Rejected> {
     // A DM Discord refused holds off as a world's mirror does
@@ -179,22 +173,31 @@ async fn deliver(
     if a.bots.mirror_held(&held) {
         return Ok(());
     }
-    for m in waiting.messages {
-        let text = match m.from == character {
-            true => spoken(&m.intent),
-            false => format!("> {} (console): {}", m.from, m.intent),
-        };
-        let to = Target {
-            kind: "dm",
-            channel: dm.channel_id,
-            thread: &waiting.thread,
-            seq: m.seq,
+    for (m, by) in waiting.messages {
+        // The character's line as it was said; the person's own from the
+        // console quoted, since a bot cannot post as a person.
+        let text = match m.from == body {
+            true => m.text.clone(),
+            false => format!("> {by} (console): {}", m.text),
         };
         let parts = split(&text, LIMIT);
         let mut last = 0;
-        for part in &parts {
+        // **Each part is cursored**: `split` is the same over the same text,
+        // so a line that failed part-way resumes at the part it stopped at.
+        for (i, part) in parts.iter().enumerate().skip(dm.mirrored_part as usize) {
+            let to = Target {
+                kind: "dm",
+                channel: dm.channel_id,
+                thread: &waiting.thread,
+                seq: m.seq,
+                part: i as u32,
+            };
             match send(a, bot, to, part).await? {
-                Post::Posted(id) => last = id,
+                Post::Posted(id) => {
+                    last = id;
+                    dm.mirrored_part = i as u32 + 1;
+                    hosted.with_dms(|d| d.put(bot.npc, account, dm));
+                }
                 Post::Forbidden | Post::Gone => {
                     a.bots.hold_mirror(&held, REFUSED_FOR);
                     return Ok(());
@@ -205,8 +208,16 @@ async fn deliver(
                 }
             }
         }
+        let to = Target {
+            kind: "dm",
+            channel: dm.channel_id,
+            thread: &waiting.thread,
+            seq: m.seq,
+            part: 0,
+        };
         posted(a, bot, to, last, parts.len());
         dm.mirrored_through = m.seq;
+        dm.mirrored_part = 0;
         hosted.with_dms(|d| d.put(bot.npc, account, dm));
         a.bots.mirror_cleared(&held);
     }

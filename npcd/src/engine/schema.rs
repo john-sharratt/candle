@@ -52,10 +52,18 @@ pub struct Projection {
     /// the whole point of writing it.
     pub layer: LayerId,
     pub group: GroupId,
+    /// The layer and group a character's conversations are kept on
+    /// (`docs/npc_conversations.md` §6.5): the layer named [`TALK_LAYER`].
+    /// `None` for a schema that declares none, whose characters hold no
+    /// conversations.
+    pub talk: Option<(LayerId, GroupId)>,
     /// The system-prompt prelude the schema declares, ChatML-wrapped by the
     /// model builder and handed to every conversation.
     pub prelude: String,
 }
+
+/// The layer a character's conversations are kept on.
+pub const TALK_LAYER: &str = "talk";
 
 /// Build the projection from the mind's `projection.yaml`.
 ///
@@ -94,6 +102,12 @@ pub fn build(mind: Option<&MindFiles>, world_name: &str) -> Option<Projection> {
     dreams::close(&mut builder);
 
     let (layer, group) = live_target(&builder)?;
+    let talk = talk_target(&builder);
+    if talk.is_none() {
+        tracing::warn!(
+            "projection.yaml declares no `{TALK_LAYER}` layer — no character holds a conversation"
+        );
+    }
     let prelude = prelude(&builder);
     let faults = boundary_faults(&builder);
     if !faults.is_empty() {
@@ -115,8 +129,25 @@ pub fn build(mind: Option<&MindFiles>, world_name: &str) -> Option<Projection> {
         builder,
         layer,
         group,
+        talk,
         prelude,
     })
+}
+
+/// The conversations' `(layer, group)`: the [`TALK_LAYER`] layer's group that
+/// selects by conversation.
+fn talk_target(builder: &Builder) -> Option<(LayerId, GroupId)> {
+    use candle_conversation::projection::SelectionRule;
+    let layer = builder
+        .schema()
+        .layers
+        .iter()
+        .find(|l| l.name == TALK_LAYER)?;
+    let group = layer
+        .groups
+        .iter()
+        .find(|g| matches!(g.selection, SelectionRule::Sequence { .. }))?;
+    Some((layer.id, group.id))
 }
 
 /// How many turns the mind's schema asks to keep verbatim in the redo log.
@@ -517,7 +548,7 @@ mod tests {
         .into_iter()
         .map(|n| (n, CorruptTurnPolicy::DropConversation))
         .collect();
-        for n in ["perception", "action", "interaction"] {
+        for n in ["perception", "action", "interaction", "talk"] {
             expected.insert(n, CorruptTurnPolicy::DropTurn);
         }
         assert_eq!(by_name, expected);

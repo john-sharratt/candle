@@ -83,6 +83,10 @@ pub struct Mirrored {
     pub kind: Kind,
     /// The seq of the last message of the thread posted to the channel.
     pub mirrored_through: u64,
+    /// How many parts of the line after `mirrored_through` are already
+    /// posted, so a long line that failed part-way resumes where it stopped.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub mirrored_part: u32,
     /// The id of the last Discord message taken in from the channel.
     pub last_seen_discord: u64,
     /// For a private thread, the channel it is under — whose webhook posts
@@ -98,6 +102,10 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 impl Mirrored {
     /// A channel or thread of `kind`, posted from after seq `from` and read
     /// from after Discord message `seen`.
@@ -106,6 +114,7 @@ impl Mirrored {
             channel_id,
             kind,
             mirrored_through: from,
+            mirrored_part: 0,
             last_seen_discord: seen,
             parent: None,
             archived: false,

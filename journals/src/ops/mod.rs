@@ -17,6 +17,7 @@ pub mod append;
 pub mod close;
 pub mod create;
 pub mod edit;
+pub mod episodes;
 pub mod focus;
 pub mod fold;
 pub mod forget;
@@ -30,6 +31,7 @@ pub mod summarize;
 pub mod wire;
 
 pub use activity::Call;
+pub use episodes::Lived;
 
 use crate::actor::Actor;
 use crate::error::{Error, Result};
@@ -73,6 +75,12 @@ pub enum Op {
         path: JournalPath,
         text: String,
         speaker: Option<Slug>,
+    },
+    /// A bot's experience since npcd last wrote: many episodes in one commit,
+    /// each at its own time ([`episodes`]).
+    Episodes {
+        path: JournalPath,
+        lines: Vec<Lived>,
     },
     /// A call that changed something, kept on a conversation's
     /// `journal.yaml` rather than as a line of its own (D3).
@@ -195,6 +203,8 @@ pub struct Applied {
     pub owners: Vec<OwnerFile>,
     /// The line written, edited or forgotten.
     pub line: Option<LineId>,
+    /// The lines a batch of episodes wrote, in the batch's order.
+    pub lines: Vec<LineId>,
     /// The journal created.
     pub created: Option<JournalPath>,
     /// Journals folded to make room.
@@ -209,22 +219,27 @@ impl Applied {
             ..Applied::default()
         }
     }
+
+    /// Every line it wrote, edited or forgotten: the one, or a batch's.
+    pub fn written(&self) -> Vec<LineId> {
+        self.line.iter().chain(&self.lines).cloned().collect()
+    }
 }
 
 /// Apply `op` for `actor` at `now`: checked, then done; refused, nothing.
 pub fn apply(tree: &mut Tree, actor: &Actor, op: &Op, now: Stamp) -> Result<Applied> {
-    apply_keeping(tree, actor, op, now, None)
+    apply_keeping(tree, actor, op, now, &[])
 }
 
-/// [`apply`], the line it writes taking the id `keep` when that is free in
-/// its journal — as a line replayed onto a newer origin keeps the id it was
-/// first written with.
+/// [`apply`], the lines it writes taking the ids `keep` when they are free in
+/// their journal — as a write replayed onto a newer origin keeps the ids it
+/// was first written with. An op that writes one line keeps the first.
 pub fn apply_keeping(
     tree: &mut Tree,
     actor: &Actor,
     op: &Op,
     now: Stamp,
-    keep: Option<&LineId>,
+    keep: &[LineId],
 ) -> Result<Applied> {
     let (next, applied) = applied_to(tree, actor, op, now, keep)?;
     *tree = next;
@@ -238,7 +253,7 @@ pub fn applied_to(
     actor: &Actor,
     op: &Op,
     now: Stamp,
-    keep: Option<&LineId>,
+    keep: &[LineId],
 ) -> Result<(Tree, Applied)> {
     permit::check(tree, actor, op)?;
     let mut next = tree.clone();
@@ -246,13 +261,8 @@ pub fn applied_to(
     Ok((next, applied))
 }
 
-fn run(
-    tree: &mut Tree,
-    actor: &Actor,
-    op: &Op,
-    now: Stamp,
-    keep: Option<&LineId>,
-) -> Result<Applied> {
+fn run(tree: &mut Tree, actor: &Actor, op: &Op, now: Stamp, keeping: &[LineId]) -> Result<Applied> {
+    let keep = keeping.first();
     match op {
         Op::Note {
             path,
@@ -265,6 +275,7 @@ fn run(
             text,
             speaker,
         } => append::episode(tree, actor, path, speaker.as_ref(), text, now, keep),
+        Op::Episodes { path, lines } => episodes::episodes(tree, actor, path, lines, keeping),
         Op::Activity { path, calls } => activity::record(tree, path, calls),
         Op::Edit { address, text } => edit::edit(tree, address, text),
         Op::Forget { path, which } => forget::forget(tree, path, which),

@@ -18,6 +18,10 @@ npc-map    = { path = "../npc-map" }
 # A character's journal — entries, their check, the write grammar, the draft —
 # shared with zend, whose coding sessions keep one the same way.
 journal-core = { path = "../journal-core" }
+# The journals repository its bots' experience is written to and a
+# conversation's catch-up reads (`docs/npc_conversations.md` §5), on a
+# checkout of npcd's own.
+journals     = { path = "../journals" }
 # The image guest hands back PNG bytes, and they ride in the JSON response
 # beside the seed that produced them — an operator who liked a draw needs the
 # seed to ask for it again, and a header is a worse place for it than the body.

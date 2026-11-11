@@ -46,6 +46,7 @@ use crate::engine::mission_gen::world::Routine;
 use crate::engine::mission_gen::{gates, leakage, rejection, round, write_template};
 use crate::engine::order_table;
 use crate::engine::passage;
+use crate::engine::people;
 use crate::engine::way::{self, Way};
 use crate::engine::workflow::OnFailed;
 use crate::engine::workflow::PUBLISHED;
@@ -198,6 +199,20 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "You meant to report it done, but did not say what you found.".into(),
                 );
             };
+            // **A critical step is signed by an authorizer, never by reporting
+            // the mission done** (`docs/npc_conversations.md` §7.1, §15).
+            let unsigned = hosted.sim(|s| {
+                s.missions
+                    .active(body)
+                    .and_then(|m| m.todo.iter().find(|t| t.critical && !t.done))
+                    .map(|t| t.text.clone())
+            });
+            if let Some(step) = unsigned {
+                return Outcome::Refused(format!(
+                    "This mission waits on an authorizer's yes to \"{step}\": it is not done \
+                     until they sign it. Message them and ask."
+                ));
+            }
             // **An account says what was found.** A character filed its own
             // name as the account of a reading, six times over; a few words are
             // not an answer anybody can use. Turned back with what the engine
@@ -1054,13 +1069,16 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
                     true => "`focus` on",
                     false => "`move_to`",
                 };
-                return Some(match a.at == here {
-                    true => format!("{} is here with you: `ask` or `tell` them.", a.name),
-                    false => format!(
+                // Room speech is for people; another character is messaged,
+                // here or anywhere (`docs/npc_conversations.md` §12).
+                return Some(match (a.at == here, people::is_person(&a.id)) {
+                    (true, true) => format!("{} is here with you: `ask` or `tell` them.", a.name),
+                    (false, true) => format!(
                         "{} is in {room}, within reach: {go} {room} and `ask` or `tell` them — \
                          or `message` them, which reaches them wherever they are.",
                         a.name
                     ),
+                    (_, false) => format!("{}: `message` them.", a.name),
                 });
             }
         }
@@ -4678,6 +4696,41 @@ mod tests {
                 assert!(why.contains("`move_to`"), "{why}");
             }
             other => panic!("a report past an unmade journey was taken: {other:?}"),
+        }
+    }
+
+    /// **A mission with an unsigned critical step is not reported done**: the
+    /// step is an authorizer's to sign (§15 of `docs/npc_conversations.md`).
+    #[test]
+    fn a_mission_waiting_on_a_signature_is_not_reported_done() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let h = vault();
+        let mut lease = Todo::new("sign the lease");
+        lease.critical = true;
+        h.with_sim(|s| {
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Rent the flat.",
+                    vec![lease],
+                    Origin::Lodged { by: "u_op".into() },
+                ),
+            )
+        });
+        match perform(
+            &h,
+            "m1",
+            &act(
+                "report_done",
+                json!({"found": "the flat is ours and the keys are here"}),
+            ),
+        ) {
+            Outcome::Refused(why) => assert_eq!(
+                why,
+                "This mission waits on an authorizer's yes to \"sign the lease\": it is not done \
+                 until they sign it. Message them and ask."
+            ),
+            other => panic!("reported done past an unsigned step: {other:?}"),
         }
     }
 

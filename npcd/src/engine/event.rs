@@ -199,6 +199,23 @@ pub enum Addressed {
 /// differently, not because the world model has that many nouns — a taxonomy
 /// that mirrors the game's object graph would need a new variant per content
 /// patch, and every one of them would render the same way.
+/// One line a [`EventKind::Talk`] carries: what a conversation answers.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TalkLine {
+    /// Its seq on the thread.
+    pub seq: u64,
+    /// Who said it, by id.
+    pub from: String,
+    /// The name they go by.
+    pub name: String,
+    pub text: String,
+    /// The account a person sent it from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// When it was said, in real milliseconds.
+    pub at_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
@@ -246,6 +263,37 @@ pub enum EventKind {
         /// Everything unread on the character's phone, this included.
         unread: usize,
     },
+    /// Lines that landed on a direct thread, for the character's
+    /// conversation with that party (`docs/npc_conversations.md` §9).
+    ///
+    /// **The lines themselves, not a notice**: delivery and the thread's
+    /// world record travel on different channels, so a conversation reading
+    /// its own copy of the thread could find nothing new. The scheduler hands
+    /// this to the conversation runner, never to the mind.
+    Talk {
+        /// The direct thread's id.
+        thread: String,
+        lines: Vec<TalkLine>,
+    },
+    /// What the character means to tell `party`, from a private `message` or
+    /// a `reach_out` of its own, for its conversation with them to say in its
+    /// own words (`docs/npc_conversations.md` §10). The scheduler hands it to
+    /// the conversation runner, never to the mind.
+    Purpose {
+        /// A body id or an account handle.
+        party: String,
+        intent: String,
+    },
+    /// One of the character's conversations changed something of its own —
+    /// its mission, a critical step — so its next decision starts from the
+    /// new state and knows why (`docs/npc_conversations.md` §7.2). `party` is
+    /// who it was with, by name; `applied` what came of it.
+    Concluded { party: String, applied: String },
+    /// What one of the character's conversations said, wrote down or promised
+    /// (`docs/npc_conversations.md` §5.4), so the main loop knows it without
+    /// reading the conversation's timeline: walking the house, it knows it
+    /// just promised Mira the parcel. Rendered, never decoded.
+    Elsewhere { party: String, lines: Vec<String> },
     /// Messages wait unread on the character's handset: each thread by the
     /// name the character calls it, and how many.
     ///
@@ -359,6 +407,17 @@ pub fn message_line(thread: &str, from: &str, unread: usize) -> String {
 }
 
 /// How a [`EventKind::MindControl`] thought reads to the character.
+/// What a conversation did, as the main loop reads it: one line per thing,
+/// under who it was with.
+pub fn elsewhere_line(party: &str, lines: &[String]) -> String {
+    let mut s = format!("Meanwhile, on the phone with {party}:");
+    for l in lines {
+        s.push_str("\n- ");
+        s.push_str(l.trim());
+    }
+    s
+}
+
 pub fn mind_control_line(text: &str) -> String {
     format!("A thought you can't shake: {}", text.trim())
 }
@@ -371,6 +430,10 @@ impl EventKind {
             EventKind::Announcement { .. } => "announcement",
             EventKind::Speech { .. } => "speech",
             EventKind::Message { .. } => "message",
+            EventKind::Talk { .. } => "talk",
+            EventKind::Purpose { .. } => "purpose",
+            EventKind::Concluded { .. } => "concluded",
+            EventKind::Elsewhere { .. } => "elsewhere",
             EventKind::Unread { .. } => "unread",
             EventKind::Situation { .. } => "situation",
             EventKind::Nudge { .. } => "nudge",
@@ -448,13 +511,17 @@ impl Event {
     /// take part. Everything else — being addressed, a message, something done,
     /// somebody arriving, the room stirring — wakes, because an event nobody
     /// wakes for is one nobody ever reads.
+    ///
+    /// What a conversation did elsewhere wakes nothing either: the mind reads
+    /// it on its next turn, and a conversation that woke the mind on every
+    /// line would have it answering a phone call it is not on.
     pub fn wakes(&self) -> bool {
         !matches!(
             self.kind,
             EventKind::Speech {
                 to: Addressed::Other { .. },
                 ..
-            }
+            } | EventKind::Elsewhere { .. }
         )
     }
 
@@ -510,6 +577,18 @@ impl Event {
                 from,
                 unread,
             } => message_line(thread, from, *unread),
+            // Never the mind's: the scheduler hands it to the conversation.
+            // Read as what it is should it be shown anywhere else.
+            EventKind::Talk { lines, .. } => lines
+                .iter()
+                .map(|l| format!("{}, on your phone: {}", l.name, l.text.trim()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            EventKind::Purpose { intent, .. } => format!("You meant to say: {}", intent.trim()),
+            EventKind::Concluded { party, applied } => {
+                format!("On the phone with {party}: {}", applied.trim())
+            }
+            EventKind::Elsewhere { party, lines } => elsewhere_line(party, lines),
             EventKind::Unread { threads } => unread_line(threads),
             // Both arrive already written — a situation is generated from a
             // map, a nudge is authored beside the task it belongs to — so
