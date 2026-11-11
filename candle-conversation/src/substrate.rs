@@ -479,6 +479,12 @@ pub struct Substrate {
     /// `--disable-summariser` also clears on dialogue.
     append_only_layers: PSet<LayerId>,
 
+    /// What a `forked_from` of [`Self::SEED_PARENT`] names on this member: the
+    /// priming chain's end, as this boot built it. Member-local and transient
+    /// like [`Self::append_only_layers`] — set by the daemon once the chain is
+    /// primed ([`Self::set_seed`]), never redo-logged.
+    seed: Option<TimelineId>,
+
     /// Groups of LOWER layers an append-only layer's projections still score
     /// and select across conversations — the layers it compounds on. An ingest
     /// unit that analyses a file draws the analyses below it of OTHER files by
@@ -3390,6 +3396,30 @@ impl Substrate {
     /// `splice_source_timelines` pin failed.
     pub const FORKED_FROM_KEY: &'static str = "forked_from";
 
+    /// The `forked_from` value that names no timeline but **the seed**: the
+    /// priming chain's end as the member reading it holds it ([`Self::seed`]).
+    ///
+    /// A dialogue opens on the priming chain, and the chain is rebuilt every
+    /// boot on every member — a changed anchor document is a new unit, and each
+    /// member's process mints its own base conversation. A parent recorded as a
+    /// timeline id named one of those, and it went stale: a conversation
+    /// parented on a boot's base kept that boot's chain for good, and on any
+    /// other member, which never held that base, inherited nothing at all. The
+    /// alias is resolved where the lineage is read, so every conversation opens
+    /// on the chain the member serving it holds now.
+    pub const SEED_PARENT: &'static str = "seed";
+
+    /// Name `seed` as what [`Self::SEED_PARENT`] resolves to on this member;
+    /// `None` while there is no chain.
+    pub fn set_seed(&mut self, seed: Option<TimelineId>) {
+        self.seed = seed;
+    }
+
+    /// What [`Self::SEED_PARENT`] resolves to on this member.
+    pub fn seed(&self) -> Option<TimelineId> {
+        self.seed
+    }
+
     /// Ceiling on the tokens an inherited chain may contribute *above* the
     /// target's own turns.
     ///
@@ -3404,16 +3434,14 @@ impl Substrate {
     /// A tombstoned or archived parent reads as absent rather than as an
     /// error: a chain link can be retired by its own layer's reconciliation
     /// long after a child recorded it, and a dangling pointer must degrade to
-    /// "no inheritance" instead of failing the child.
+    /// "no inheritance" instead of failing the child. A parent recorded as
+    /// [`Self::SEED_PARENT`] is this member's seed.
     pub fn parent_timeline(&self, tl: TimelineId) -> Option<TimelineId> {
-        let raw: u64 = self
-            .timelines
-            .get(&tl)?
-            .custom
-            .get(Self::FORKED_FROM_KEY)?
-            .parse()
-            .ok()?;
-        let parent = TimelineId::from_raw(raw)?;
+        let recorded = self.timelines.get(&tl)?.custom.get(Self::FORKED_FROM_KEY)?;
+        let parent = match recorded.as_str() {
+            Self::SEED_PARENT => self.seed?,
+            raw => TimelineId::from_raw(raw.parse().ok()?)?,
+        };
         if self.tombstoned_timelines.contains(&parent) {
             return None;
         }
@@ -3426,6 +3454,34 @@ impl Substrate {
             return None;
         }
         Some(parent)
+    }
+
+    /// Every conversation whose recorded parent is a **base** like `base`
+    /// rather than [`Self::SEED_PARENT`]: a timeline on `base`'s own layer and
+    /// group that holds no turn and no `conv_id` — a boot's base conversation,
+    /// which every dialogue of that boot was parented on before the alias. The
+    /// repair re-points them at the alias, so each opens on the chain this
+    /// member holds now. `base` itself is among them when it names a base.
+    pub fn parented_on_a_base(&self, base: TimelineId) -> Vec<TimelineId> {
+        let Some(target) = self.timeline_target(base) else {
+            return Vec::new();
+        };
+        let is_base = |tl: TimelineId| {
+            self.timelines.get(&tl).is_some_and(|e| {
+                (e.layer, e.group) == target && e.conv_id.is_none() && e.turns.is_empty()
+            }) && !self.tombstoned_timelines.contains(&tl)
+        };
+        self.timelines
+            .iter()
+            .filter(|(_, e)| {
+                e.custom
+                    .get(Self::FORKED_FROM_KEY)
+                    .and_then(|raw| raw.parse().ok())
+                    .and_then(TimelineId::from_raw)
+                    .is_some_and(is_base)
+            })
+            .map(|(tl, _)| *tl)
+            .collect()
     }
 
     /// Whether `ancestor` is `tl` or lies anywhere on its `forked_from`
@@ -8888,6 +8944,76 @@ mod tests {
             sub.lineage_contains(tls[0], tls[1]),
             "round a recorded cycle"
         );
+    }
+
+    /// **The seed alias resolves to whatever chain this member holds now**:
+    /// nothing before a seed is named, the chain's end once one is, and the
+    /// new end when the chain is rebuilt — with nothing rewritten on the
+    /// conversation.
+    #[test]
+    fn the_seed_alias_follows_this_members_chain() {
+        let (mut sub, chain) = forked_line(2, 10);
+        let dialogue = TimelineAllocator::new().next();
+        sub.register_timeline(dialogue, LayerId::for_test(1), GroupId::for_test(1));
+        sub.append_with_blocks(dialogue, 10, 0, 1);
+        let kv = BTreeMap::from([(
+            Substrate::FORKED_FROM_KEY.to_string(),
+            Substrate::SEED_PARENT.to_string(),
+        )]);
+        sub.merge_custom(dialogue, &kv, RecordIdentity::NONE);
+        assert_eq!(sub.parent_timeline(dialogue), None, "no seed yet");
+        sub.set_seed(Some(chain[1]));
+        assert_eq!(
+            sub.inherited_chain(dialogue),
+            vec![chain[0], chain[1], dialogue]
+        );
+        sub.set_seed(Some(chain[0]));
+        assert_eq!(
+            sub.inherited_chain(dialogue),
+            vec![chain[0], dialogue],
+            "a rebuilt chain is followed"
+        );
+    }
+
+    /// **The repair finds every conversation parented on a base** — a
+    /// timeline of the base's layer and group with no turn and no `conv_id`
+    /// — and none parented on the seed, on a unit, or on a named
+    /// conversation.
+    #[test]
+    fn the_children_of_every_base_are_found() {
+        let (mut sub, chain) = forked_line(1, 10);
+        let alloc = TimelineAllocator::new();
+        let (layer, group) = (LayerId::for_test(1), GroupId::for_test(1));
+        let [old_base, base, named, a, b, on_seed, on_unit, on_named] =
+            std::array::from_fn(|_| alloc.next());
+        for tl in [old_base, base, named] {
+            sub.register_timeline(tl, layer, group);
+        }
+        sub.set_conv_id(named, "a-conversation", RecordIdentity::NONE);
+        for (child, parent) in [
+            (a, old_base),
+            (b, base),
+            (on_unit, chain[0]),
+            (on_named, named),
+        ] {
+            sub.register_timeline(child, layer, group);
+            sub.append_with_blocks(child, 10, 0, 1);
+            set_parent(&mut sub, child, parent);
+        }
+        sub.register_timeline(on_seed, layer, group);
+        sub.merge_custom(
+            on_seed,
+            &BTreeMap::from([(
+                Substrate::FORKED_FROM_KEY.to_string(),
+                Substrate::SEED_PARENT.to_string(),
+            )]),
+            RecordIdentity::NONE,
+        );
+        let mut found = sub.parented_on_a_base(base);
+        found.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(found, want);
     }
 
     #[test]

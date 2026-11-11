@@ -33,9 +33,15 @@ working set until the next question, so it is never carried twice.
 
 What every conversation must always carry is the **priming chain**'s — the
 repository roots, `README`, `ARCHITECTURE`, `CLAUDE.md` — inherited through
-lineage, not held by the working set. A new dialogue records the chain's end as
-its parent: the chain's links are ingest units every member holds, so the seed
-is there whichever member serves the conversation.
+lineage, not held by the working set. A new dialogue records the **seed alias**
+(`forked_from = "seed"`, `Substrate::SEED_PARENT`) as its parent, never a
+timeline id: each member resolves it to the end of the chain it holds now
+(`Substrate::set_seed`, named by every boot's prime). The chain's links are
+ingest units every member holds, so the seed is there whichever member serves
+the conversation, and a chain rebuilt on a later boot is the one every existing
+conversation opens on — nothing on the conversation is rewritten. Prime also
+re-points any conversation still parented on a boot's base conversation at the
+alias (`ConversationEngine::reseed_base_children`).
 
 Everything enters at one **insertion point**: a lock just before it, so the
 oldest lock stays nearest the dialogue; provenance just after the provenance

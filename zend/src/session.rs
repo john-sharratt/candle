@@ -830,10 +830,11 @@ struct InferenceState {
     /// from-scratch construction (`raw_read::ingest_raw`).
     ingest_bases: HashMap<String, Sequence>,
     /// The priming chain's final link (`BranchIngest::prime`, built once per
-    /// boot before `ready`): `base_conv`'s parent, every new dialogue's
-    /// parent, and the parent every ingest unit's conversation records before
-    /// its reading starts. `None` when there is no chain — no git repository,
-    /// or no ingest layer.
+    /// boot before `ready`): this member's seed, which every dialogue's
+    /// `forked_from` alias resolves to (`Substrate::SEED_PARENT`), and the
+    /// parent every ingest unit's conversation records before its reading
+    /// starts. `None` when there is no chain — no git repository, or no
+    /// ingest layer.
     chain_end: Mutex<Option<TimelineId>>,
     /// Queue feeding the dedicated titler task. The request path enqueues a
     /// [`TitleJob`] (non-blocking, dropped if the task is backed up) instead
@@ -3336,12 +3337,18 @@ impl InferenceState {
             .collect()
     }
 
-    /// Build the priming chain and hang the base conversation off its end, so
-    /// every dialogue — a fork of `base_conv` inherits its lineage — starts
-    /// with the workspace listing, each repository's root listing and its
-    /// anchor documents already read. An analysis layer's unit read after this
-    /// records the same end as its parent (`RefreshContext::chain_end`); a
-    /// `code_reading` file or `repo_map` folder records none.
+    /// Build the priming chain and make its end this member's **seed**, so
+    /// every dialogue — each records the seed alias as its parent
+    /// (`Substrate::SEED_PARENT`) — starts with the workspace listing, each
+    /// repository's root listing and its anchor documents already read, on
+    /// the chain this member holds now. An analysis layer's unit read after
+    /// this records the same end as its parent (`RefreshContext::chain_end`);
+    /// a `code_reading` file or `repo_map` folder records none.
+    ///
+    /// Conversations a past boot parented on its own base conversation are
+    /// re-pointed at the alias here (`reseed_base_children`): a base is minted
+    /// per boot per member, so such a conversation kept that boot's chain on
+    /// the member that minted it and inherited nothing on any other.
     fn prime(&self, progress: &LoadProgress) -> anyhow::Result<()> {
         if self.branch_layers.is_empty() {
             return Ok(());
@@ -3350,12 +3357,20 @@ impl InferenceState {
         let end =
             self.branch_ingest
                 .prime(&self.refresh_ctx(), &self.workspace, &passes, progress)?;
-        if let Some(end) = end {
-            let base = self.base_conv.timeline_id();
-            self.engine
-                .set_forked_from(base, end)
-                .map_err(|e| anyhow::anyhow!("base_conv priming-chain parent: {e}"))?;
-        }
+        self.engine.set_seed(end);
+        let base = self.base_conv.timeline_id();
+        self.engine
+            .set_forked_from_seed(base)
+            .map_err(|e| anyhow::anyhow!("base_conv seed parent: {e}"))?;
+        let reseeded = self
+            .engine
+            .reseed_base_children(base)
+            .map_err(|e| anyhow::anyhow!("re-pointing conversations at the seed: {e}"))?;
+        tracing::info!(
+            seed = end.map(|t| t.raw()),
+            reseeded,
+            "priming chain primed: conversations open on its end"
+        );
         *self.chain_end.lock().unwrap() = end;
         Ok(())
     }
@@ -4203,27 +4218,18 @@ fn run_inference_stream(
             Some((guard, files)) => (Some(guard), Some(files)),
             None => (None, None),
         };
-        // Record the fork's lineage: the priming chain's end, so the anchor
-        // documents open a brand new conversation — nothing is copied, and the
-        // pointer is persisted metadata, so it survives a restart.
-        //
-        // **The chain's end, not `base_conv`.** The base is this process's own
-        // timeline, minted at boot and holding no turn; the chain's links are
-        // ingest units every member holds. Parented on the base, a conversation
-        // held its seed only on the member it was born on: on any other member
-        // the base was absent, the lineage ended there, and the conversation
-        // opened with none of the documents it had been answering from
-        // (2026-11-11). Before the chain is primed the base stands in — it is
-        // parented onto the chain's end once priming finishes.
+        // Record the fork's lineage: the seed alias (`Substrate::SEED_PARENT`),
+        // so the priming chain's anchor documents open a brand new
+        // conversation — nothing is copied, and the pointer is persisted
+        // metadata. The alias is resolved where the lineage is read, to the
+        // chain the serving member holds now: a timeline id here named one
+        // boot's chain on one member, and the conversation lost its seed on
+        // every other member and after the chain was rebuilt (2026-11-11).
         //
         // Best-effort: a conversation that answers without its inherited
         // context is far better than one that refuses to open.
         if minted {
-            let parent = dialogue_parent(
-                *state.chain_end.lock().unwrap(),
-                state.base_conv.timeline_id(),
-            );
-            if let Err(e) = state.engine.set_forked_from(timeline, parent) {
+            if let Err(e) = state.engine.set_forked_from_seed(timeline) {
                 tracing::warn!(
                     conv_id = %conv_id,
                     "recording fork lineage failed, conversation starts unprimed: {e}",
@@ -9456,17 +9462,6 @@ pub fn timeline_for(conv_id: &str) -> projection::TimelineId {
     projection::TimelineId::from_raw(h.lo.max(1)).expect("timeline id is non-zero")
 }
 
-/// The timeline a new dialogue records as its parent: the priming chain's end,
-/// an ingest unit every member holds, so the conversation keeps its seed on
-/// whichever member serves it; the process's own `base` only while there is no
-/// chain.
-fn dialogue_parent(
-    chain_end: Option<projection::TimelineId>,
-    base: projection::TimelineId,
-) -> projection::TimelineId {
-    chain_end.unwrap_or(base)
-}
-
 /// Cap the titler's prefill at `head + tail` tokens. For short messages
 /// (≤ head+tail) the text is returned verbatim; for long ones the head and
 /// tail token windows are decoded back to text and joined with `" … "`.
@@ -9679,22 +9674,6 @@ mod queued_status_tests {
             "Waiting for the GPU — 1 turn (512 tokens) ahead, 1 s"
         );
         assert_eq!(queued_status(0, 0, 3_200), "Waiting for the GPU — 3 s");
-    }
-}
-
-#[cfg(test)]
-mod dialogue_parent_tests {
-    use super::dialogue_parent;
-    use candle_conversation::projection::TimelineId;
-
-    /// **A new dialogue is parented on the priming chain's end**, which every
-    /// member holds, never on the process's own base while a chain exists.
-    #[test]
-    fn a_new_dialogue_is_parented_on_the_chain_not_the_base() {
-        let chain_end = TimelineId::from_raw(1_881_470_887_435_354_836).unwrap();
-        let base = TimelineId::from_raw(1_881_517_895_449_135_614).unwrap();
-        assert_eq!(dialogue_parent(Some(chain_end), base), chain_end);
-        assert_eq!(dialogue_parent(None, base), base, "no chain yet");
     }
 }
 
