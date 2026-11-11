@@ -3,6 +3,8 @@
 //! threads opened, a message in each way, renames, a removal, what `READY`
 //! says of the servers left and joined while offline, and a `4014`.
 
+use std::slice;
+
 use axum::body::to_bytes;
 use axum::extract::{Path as Wire, State as Shared};
 use axum::http::StatusCode;
@@ -436,8 +438,8 @@ async fn ready_tells_of_the_servers_left_and_joined_while_offline() {
     let zen = Who::new(ZEN_BODY, "Zen");
     let (gone, home) = d.hosted.with_sim(|s| {
         (
-            s.threads.open_standing("oldplace #chat", &[zen.clone()]),
-            s.threads.open_standing("home #hall", &[zen.clone()]),
+            s.threads.open_standing("oldplace #chat", slice::from_ref(&zen)),
+            s.threads.open_standing("home #hall", slice::from_ref(&zen)),
         )
     });
     d.hosted.with_servers(|s| {

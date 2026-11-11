@@ -166,6 +166,19 @@ pub fn posted(a: &Authored, bot: &Online, to: Target<'_>, id: u64, parts: usize)
     note(a, bot.npc, to.note("posted").message(id).parts(parts));
 }
 
+/// A failure's status and Discord code, as the trace writes it:
+/// `403/50013`.
+fn status_of(e: &DiscordError) -> String {
+    match e {
+        DiscordError::Status { status, code, .. } => format!("{status}/{code}"),
+        DiscordError::TokenRejected => "401".into(),
+        DiscordError::RateLimited { .. } => "429".into(),
+        DiscordError::NotABot => "not_a_bot".into(),
+        DiscordError::Transport(_) => "transport".into(),
+        DiscordError::Paused { .. } => "paused".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,18 +202,5 @@ mod tests {
         assert_ne!(a, at(5, 0).nonce("moon"));
         assert_ne!(a, at(4, 0).nonce("battle-cities"));
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-}
-
-/// A failure's status and Discord code, as the trace writes it:
-/// `403/50013`.
-fn status_of(e: &DiscordError) -> String {
-    match e {
-        DiscordError::Status { status, code, .. } => format!("{status}/{code}"),
-        DiscordError::TokenRejected => "401".into(),
-        DiscordError::RateLimited { .. } => "429".into(),
-        DiscordError::NotABot => "not_a_bot".into(),
-        DiscordError::Transport(_) => "transport".into(),
-        DiscordError::Paused { .. } => "paused".into(),
     }
 }

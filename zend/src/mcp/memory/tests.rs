@@ -3,10 +3,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use journals::error::{Error, Problem};
-use journals::store::StoreError;
+use journals::store::{Store, StoreError};
 use journals::files::{Cite, Sentence};
 use journals::scope::Channel;
 use journals::slug::Slug;

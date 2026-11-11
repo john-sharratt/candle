@@ -65,6 +65,8 @@ pub fn restated(party: &str, acts: &[Act]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use serde_json::json;
 
     use super::*;
@@ -85,10 +87,10 @@ mod tests {
             "promise",
             json!({"to": "Mira", "what": "the garden report", "by": "Friday"}),
         );
-        assert_eq!(destination(&[reply.clone()]), Destination::Reply);
+        assert_eq!(destination(slice::from_ref(&reply)), Destination::Reply);
         assert_eq!(destination(&[reply.clone(), bye.clone()]), Destination::Parting);
         assert_eq!(destination(&[bye, reflect.clone()]), Destination::Journal);
-        assert_eq!(destination(&[promise.clone()]), Destination::Journal);
+        assert_eq!(destination(slice::from_ref(&promise)), Destination::Journal);
         assert_eq!(destination(&[]), Destination::Journal);
         assert_eq!(destination(&[promise, reply]), Destination::Reply);
     }

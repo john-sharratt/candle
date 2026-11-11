@@ -7,6 +7,8 @@
 //! These run on the world's authority, in the bots' beat, so they write the
 //! world's threads and the channel's record in place.
 
+use std::slice;
+
 use super::notice::thread_name;
 use super::record::Channel;
 use crate::api::now_ms;
@@ -55,7 +57,7 @@ pub fn stand(hosted: &Hosted, npc: u64, character: &Who, c: Standing<'_>) {
     });
     let record = kept.unwrap_or_else(|| {
         let thread = hosted.with_sim(|s| {
-            let id = s.threads.open_standing(&name, &[character.clone()]);
+            let id = s.threads.open_standing(&name, slice::from_ref(character));
             s.threads.describe(&id, c.topic);
             id
         });

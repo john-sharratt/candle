@@ -50,6 +50,8 @@ fn line(name: &str, topic: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use super::*;
     use crate::sim::phone::{Who, CHANNEL};
 
@@ -63,10 +65,10 @@ mod tests {
         let wick = Who::new("npc-2", "Wick");
         let mut p = Threads::new();
         let open = p.join_channel(CHANNEL, &zen);
-        let research = p.open_standing("#research", &[zen.clone()]);
+        let research = p.open_standing("#research", slice::from_ref(&zen));
         p.describe(&research, Some("Findings and open questions"));
-        let elsewhere = p.open_standing("#ops", &[wick.clone()]);
-        let gone = p.open_standing("#old", &[zen.clone()]);
+        let elsewhere = p.open_standing("#ops", slice::from_ref(&wick));
+        let gone = p.open_standing("#old", slice::from_ref(&zen));
         p.close(&gone);
         p.open_group("the sweep", &[zen.clone(), wick.clone()]);
         p.reach(&zen, &wick);
