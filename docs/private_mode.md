@@ -353,11 +353,11 @@ opening a new MCP session for every call.
 2. The private flag, the table, `get_user_context`'s description, the
    footprint.
 3. Diaries: storage, crypto, tools, the `private-mode` guide.
-4. Move the plaintext secrets out of journals into a diary and strike them
-   from journal lines — with John's passphrase and his approval of each line
-   struck.
-5. Delete conversation journals that only ever held reads — with John's
+4. Delete conversation journals that only ever held reads — with John's
    approval of the list.
+
+Nothing already in the journals is moved into a diary (John, 2026-11-11):
+diaries hold what is written to them from private conversations on.
 
 ## 12. Decisions
 
