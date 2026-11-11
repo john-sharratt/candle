@@ -5702,6 +5702,10 @@ async fn carry_journal(
         journal: carried,
         ..
     } = cs;
+    // A conversation whose state was just built — its first turn, or one
+    // taken up again after its state was let go — holds no section yet, and
+    // this reconcile submits the whole journal.
+    let fresh = carried.holds_nothing();
     let mut sealed = carried
         .reconcile(
             conv,
@@ -5713,10 +5717,13 @@ async fn carry_journal(
             tokio::time::sleep,
         )
         .await;
-    // The opening is what a conversation's first round answers its opening
-    // question from, so the round that wrote it gives it a moment to seal.
-    // Everything is submitted by now: this reconcile only waits.
-    if opened && sealed.len() < wants.len() {
+    // A round whose journal was all just submitted would otherwise answer
+    // with none: a one-round turn taken up after its state was let go ("who
+    // are you?") had no journal at all, and the opening is what a first
+    // round answers its opening question from. So it gives the journal a
+    // moment to seal. Everything is submitted by now: this reconcile only
+    // waits. Later rounds take new entries as they seal, without waiting.
+    if (opened || fresh) && sealed.len() < wants.len() {
         sealed = carried
             .reconcile(
                 conv,

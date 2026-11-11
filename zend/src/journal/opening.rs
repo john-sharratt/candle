@@ -19,9 +19,11 @@ use std::time::Duration;
 use journal_core::entry::Entry;
 use journal_core::period::Period;
 
-/// How long the round that wrote the opening waits for it to seal. It is two
-/// short lines, so a seal past this is a GPU queue the round should not stand
-/// behind: it answers without the opening, and the next round has it.
+/// How long a round whose journal was all just submitted — the round that
+/// wrote the opening, or the first of a conversation whose state was just
+/// built — waits for it to seal. A journal is a few short lines, so a seal past
+/// this is a GPU queue the round should not stand behind: it answers without
+/// the journal, and the next round has it.
 pub const OPENING_SEAL_WAIT: Duration = Duration::from_secs(2);
 
 /// The opening's second entry.

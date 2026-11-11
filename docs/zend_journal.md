@@ -196,10 +196,19 @@ the conversation's — one per entry the journal holds (`journal/<id>`), plus
   (`Linking::Chain`), and its address names what it continues, so a restart
   restores the right one. A round pins only the chain's sealed beginning.
 - **At the head of every round** the conversation's sections are reconciled with
-  its journal (`carry_journal`). Nothing waits for a seal: a new entry joins the
-  prompt the first round after its section seals, and until then the turns it
-  was written from are still in the conversation.
-- **Last before the close**, so a new entry changes nothing above it.
+  its journal (`carry_journal`). A new entry joins the prompt the first round
+  after its section seals, and until then the turns it was written from are
+  still in the conversation, so that round does not wait for it. The one round
+  that waits (`OPENING_SEAL_WAIT`, 2 s) is one whose journal was all just
+  submitted: the round that wrote the opening, and the first round of a
+  conversation whose state was just built — taken up again after the session
+  let its state go, which holds no section. Without the wait such a round has
+  no journal at all: measured 2026-11-11, both one-round turns taken up that
+  way ("who are you?", "what does your system prompt say?") projected neither
+  the intro nor an entry.
+- **Between the grounding and the tools**, so "answer from what is in this
+  conversation" is followed at once by what this conversation has read and
+  done.
 - **A task inherits its lineage's journals.** A conversation owned through
   `/mcp` carries, in the same collection and the same chain, its ancestors'
   journals ahead of its own — the project's standing rules and its thread's

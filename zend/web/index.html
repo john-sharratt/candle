@@ -2087,6 +2087,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const token = {};
     streamToken = token;
     let ended = false;
+    // Whether this stream has read the journal yet. A conversation's journal
+    // can be written at the head of its first round — the entries it opens
+    // with — after the page last read it, so the turn's first part reads it
+    // again and the collapsed dock's count is right from then on.
+    let journalRead = false;
     const own = (fn) => (...args) => { if (!ended && streamToken === token) fn(...args); };
     const conv = S.conversations.find((c) => c.id === convId);
     const opts = { think: S.effortLevel !== 0, effort: S.effortLevel, verbosity: S.verbosityLevel, tools: TOOL_MODE_IDS[clampTools(S.toolsLevel)] };
@@ -2111,6 +2116,10 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       // whose history carries the same parts.
       onPart: (ev) => patchStream(convId, (m) => {
         if (!ev) return;
+        if (!journalRead) {
+          journalRead = true;
+          if (convId === S.activeId) loadJournal();
+        }
         applyPart(m, ev);
         if (ev.op === 'result' || ev.op === 'open') m.prefill = null;
         m.status = '';

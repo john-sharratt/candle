@@ -147,6 +147,12 @@ impl Carried {
         }
     }
 
+    /// Whether no section has been submitted yet: a conversation whose state
+    /// was just built, whose next reconcile submits everything it carries.
+    pub fn holds_nothing(&self) -> bool {
+        self.held.is_empty()
+    }
+
     /// Bring the conversation's sections in line with `wanted`, related as
     /// `kept` says, and return the names that are sealed and selectable, in the
     /// order they were wanted — for a chain, only its sealed beginning.
@@ -287,6 +293,14 @@ mod tests {
 
     fn names(n: &[&str]) -> Vec<String> {
         n.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A conversation's carried sections start empty, whether it was just
+    /// minted or taken up again: its first reconcile submits everything.
+    #[test]
+    fn a_new_carry_holds_nothing() {
+        assert!(Carried::new(true).holds_nothing());
+        assert!(Carried::new(false).holds_nothing());
     }
 
     #[test]
