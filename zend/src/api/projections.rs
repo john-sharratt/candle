@@ -16,8 +16,8 @@
 //!
 //! A point streamed live during a decode arrives in full but unaddressed — its
 //! turn has not sealed, and the history that would address it has not been
-//! fetched — so for that one the client posts the selected turns and asks for
-//! the context alone.
+//! fetched — so for that one the client posts the selected turns and those of
+//! its materialized spine, and asks for the context alone.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use axum::{
     response::Response,
     Json,
 };
-use candle_conversation::projection::TimelineId;
+use candle_conversation::projection::{MaterializedPiece, ProjectionEvent, TimelineId};
 use candle_conversation::turn_layout::TurnLayout;
 use candle_conversation::GlueMarkers;
 use serde::{Deserialize, Serialize};
@@ -52,12 +52,7 @@ pub async fn get(
         .nth(turn)
         .and_then(|points| points.into_iter().nth(event))
         .ok_or(StatusCode::NOT_FOUND)?;
-    let turns = span.event.selection.turns.iter().map(|t| TurnKey {
-        group: t.group.clone(),
-        timeline: t.timeline,
-        index: t.index,
-    });
-    let context = panel_context(&session, &id, glue, turns);
+    let context = panel_context(&session, &id, glue, panel_turns(&span.event));
     Ok(compressed::json(&DetailBody { span, context }, &headers))
 }
 
@@ -72,6 +67,26 @@ pub async fn context(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let context = panel_context(&session, &id, glue, query.turns.into_iter());
     Ok(compressed::json(&context, &headers))
+}
+
+/// Every turn a point's panel draws a body for: those its selection names, and
+/// those its materialized spine names.
+///
+/// The selection names what was chosen; the spine names what was injected,
+/// and the cards are drawn from the spine. They differ where a dialogue holds
+/// an ingest unit's opening by the unit's face: the record names the unit, the
+/// spine the face (`Substrate::face_of`). Bodies for the selection alone left
+/// every face's card without one — drawn blank, under the face's token count.
+fn panel_turns(event: &ProjectionEvent) -> impl Iterator<Item = TurnKey> + '_ {
+    let spine = event.materialized.iter().filter_map(|p| match p {
+        MaterializedPiece::Turn { turn } => Some(turn),
+        MaterializedPiece::Glue { .. } => None,
+    });
+    event.selection.turns.iter().chain(spine).map(|t| TurnKey {
+        group: t.group.clone(),
+        timeline: t.timeline,
+        index: t.index,
+    })
 }
 
 /// Everything the panel renders beside a point's selection.
@@ -151,7 +166,8 @@ pub struct ContextQuery {
 }
 
 /// A selected turn's identity — the fields of `SelectedTurn` that key its body.
-/// The client posts its `selection.turns` as they are; the rest are ignored.
+/// The client posts its `selection.turns` and its spine's turns as they are;
+/// the rest are ignored.
 #[derive(Deserialize)]
 pub struct TurnKey {
     pub group: String,
@@ -253,4 +269,61 @@ impl From<GlueMarkers> for Glue {
 pub struct SectionContent {
     pub name: String,
     pub content: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_conversation::projection::{
+        MaterializedPiece, ProjectionEvent, ProjectionSelection, SelectedTurn,
+    };
+    use candle_conversation::summary_tree::TurnKind;
+
+    use super::panel_turns;
+
+    fn turn(timeline: u64, index: u32, tokens: u32) -> SelectedTurn {
+        SelectedTurn {
+            layer: "dialogue".into(),
+            group: "primary_conversation".into(),
+            index,
+            role: "assistant".into(),
+            tokens,
+            kind: TurnKind::Normal,
+            reason: None,
+            timeline: Some(timeline),
+            selected: true,
+            score: 0.0,
+            qualified: false,
+        }
+    }
+
+    /// **A face's card gets its body**: the selection names the unit's
+    /// opening, the spine the face the model was shown, and the panel asks
+    /// for both, so the card drawn from the spine finds its text.
+    #[test]
+    fn the_panel_asks_for_the_spines_turns_as_well_as_the_selections() {
+        let unit = 1_881_470_790_753_706_315;
+        let face = 1_881_470_905_646_194_696;
+        let event = ProjectionEvent {
+            selection: ProjectionSelection {
+                turns: vec![turn(unit, 0, 45), turn(unit, 1, 743)],
+                ..ProjectionSelection::default()
+            },
+            materialized: vec![
+                MaterializedPiece::Glue {
+                    text: "<|im_start|>".into(),
+                },
+                MaterializedPiece::Turn {
+                    turn: turn(face, 0, 45),
+                },
+                MaterializedPiece::Turn {
+                    turn: turn(unit, 1, 743),
+                },
+            ],
+            ..ProjectionEvent::default()
+        };
+        let keys: Vec<(u64, u32)> = panel_turns(&event)
+            .map(|k| (k.timeline.unwrap(), k.index))
+            .collect();
+        assert_eq!(keys, vec![(unit, 0), (unit, 1), (face, 0), (unit, 1)]);
+    }
 }

@@ -108,7 +108,8 @@
       return Object.assign({ span: body.span }, panelContext(body));
     },
     // The panel context alone, for a point already held in full: `turns` is
-    // its `selection.turns`, sent as they are.
+    // its `selection.turns` and the turns of its materialized spine, sent as
+    // they are.
     async getProjectionContext(convId, turns) {
       const r = await fetch('/v1/conversations/' + enc(convId) + '/projection-context', {
         method: 'POST',

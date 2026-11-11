@@ -33,7 +33,9 @@ working set until the next question, so it is never carried twice.
 
 What every conversation must always carry is the **priming chain**'s — the
 repository roots, `README`, `ARCHITECTURE`, `CLAUDE.md` — inherited through
-lineage, not held by the working set.
+lineage, not held by the working set. A new dialogue records the chain's end as
+its parent: the chain's links are ingest units every member holds, so the seed
+is there whichever member serves the conversation.
 
 Everything enters at one **insertion point**: a lock just before it, so the
 oldest lock stays nearest the dialogue; provenance just after the provenance
@@ -649,7 +651,11 @@ its own opening, which is the request it is answering.
 and the window all run on the unit's turns. The projection event records the
 opening (`Substrate::unit_of`) with its score, origin and belief carry, and only
 its token count is the face's. A face's own layer is reserved, so no retrieval
-offers it as content of its own.
+offers it as content of its own. The materialized spine names the face, so the
+projection panel, which draws its cards from the spine, is sent the bodies of
+the spine's turns as well as the selection's (`zend/src/api/projections.rs`,
+`panel_turns`). Sent the selection's alone, every face's card had no body and
+drew blank under the face's token count (2026-11-11).
 
 **Rejected alternatives, recorded because each was proposed.**
 
