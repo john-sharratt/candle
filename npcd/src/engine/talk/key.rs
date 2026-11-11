@@ -136,6 +136,9 @@ mod tests {
         assert_eq!(wire, "{\"kind\":\"person\",\"id\":\"u_8812\"}");
         let wire = serde_json::to_string(&Party::Npc(12)).unwrap();
         assert_eq!(wire, "{\"kind\":\"npc\",\"id\":12}");
-        assert_eq!(serde_json::from_str::<Party>(&wire).unwrap(), Party::Npc(12));
+        assert_eq!(
+            serde_json::from_str::<Party>(&wire).unwrap(),
+            Party::Npc(12)
+        );
     }
 }

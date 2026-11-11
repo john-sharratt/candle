@@ -108,9 +108,7 @@ pub fn index(path: &JournalPath, j: &Journal, now: Stamp) -> Vec<String> {
         .collect();
     let quieter = j.live_count() - listed.len();
     if quieter > 0 {
-        out.push(format!(
-            "… and {quieter} quieter, each opened by its path"
-        ));
+        out.push(format!("… and {quieter} quieter, each opened by its path"));
     }
     let empty: Vec<&str> = j
         .live()

@@ -73,7 +73,15 @@ mod tests {
         ] {
             assert!(notable(yes), "{yes}");
         }
-        for no in ["move_to", "wait", "tell", "message", "reply", "reflect", "sonos_status"] {
+        for no in [
+            "move_to",
+            "wait",
+            "tell",
+            "message",
+            "reply",
+            "reflect",
+            "sonos_status",
+        ] {
             assert!(!notable(no), "{no}");
         }
     }

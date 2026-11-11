@@ -214,7 +214,13 @@ mod tests {
     fn a_burst_is_one_turn_that_takes_every_line() {
         let t = Talks::new();
         t.lines(7, "u_mira", "dm:npc-7:u_mira", vec![line(1, "hi")], 0);
-        t.lines(7, "u_mira", "dm:npc-7:u_mira", vec![line(2, "are you there?")], 1_000);
+        t.lines(
+            7,
+            "u_mira",
+            "dm:npc-7:u_mira",
+            vec![line(2, "are you there?")],
+            1_000,
+        );
         assert!(t.due(1_000 + BURST_MS - 1).is_empty());
         assert_eq!(t.due(1_000 + BURST_MS), [mira()]);
         assert!(t.turning(7));
@@ -234,7 +240,13 @@ mod tests {
         assert_eq!(t.due(BURST_MS), [mira()]);
         let first = t.take(&mira());
         assert_eq!(first.purposes, ["that the parcel is in"]);
-        t.lines(7, "u_mira", "dm:npc-7:u_mira", vec![line(3, "thanks!")], 3_000);
+        t.lines(
+            7,
+            "u_mira",
+            "dm:npc-7:u_mira",
+            vec![line(3, "thanks!")],
+            3_000,
+        );
         assert!(t.due(10_000).is_empty(), "one turn at a time");
         t.finish(&mira(), Some(Ended::Spoke));
         assert_eq!(t.due(3_000 + BURST_MS), [mira()]);

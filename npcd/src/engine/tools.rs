@@ -3553,7 +3553,10 @@ mod tests {
         zen.threads = zen.private.iter().chain(&zen.channels).cloned().collect();
         zen.contacts = (0..12).map(|i| format!("contact-{i}")).collect();
         zen.agenda = (0..8).map(|i| format!("item-{i}")).collect();
-        zen.priorities = Priority::ALL.iter().map(|p| p.as_str().to_string()).collect();
+        zen.priorities = Priority::ALL
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
         let party = Party::Npc(12);
         let within = zen.on_thread(&OnThread {
             party: &party,
@@ -3922,8 +3925,11 @@ mod tests {
                 .into_iter()
                 .map(|t| t.name)
                 .filter(|n| {
-                    ["tell", "ask", "whisper", "shout", "promise", "remind", "gesture", "message", "reply"]
-                        .contains(&n.as_str())
+                    [
+                        "tell", "ask", "whisper", "shout", "promise", "remind", "gesture",
+                        "message", "reply",
+                    ]
+                    .contains(&n.as_str())
                 })
                 .collect();
             acts.sort();
@@ -3939,7 +3945,10 @@ mod tests {
         let characters = phone(Within::among_characters(&["Wick", "Soren"]));
         assert_eq!(speech(&characters), ["gesture", "message", "reply"]);
         // Alone, the phone is all there is.
-        assert_eq!(speech(&phone(Within::among_characters(&[]))), ["message", "reply"]);
+        assert_eq!(
+            speech(&phone(Within::among_characters(&[]))),
+            ["message", "reply"]
+        );
         // A visitor among them, owing something: room speech, and a whisper
         // with someone else to keep it from. A shout from the room a person
         // stands in reaches them.
@@ -3949,7 +3958,10 @@ mod tests {
         with_wren.owed = vec!["the key".into()];
         assert_eq!(
             speech(&with_wren),
-            ["ask", "gesture", "message", "promise", "remind", "reply", "shout", "tell", "whisper"]
+            [
+                "ask", "gesture", "message", "promise", "remind", "reply", "shout", "tell",
+                "whisper"
+            ]
         );
         // A visitor within a shout's reach, and nobody here.
         let heard = Within {

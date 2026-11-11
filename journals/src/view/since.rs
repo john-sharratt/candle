@@ -278,17 +278,37 @@ mod tests {
         // 24 the fold archived; read from the start of the 1st.
         let line = LINE_COST + "did 00".len();
         let budget = 27 * line + LINE_COST + "A day of chores.".len();
-        let s = since(&t, &npcd(), slice::from_ref(&path), t0.plus(OVERLAP), &BTreeSet::new(), budget)
-            .unwrap();
+        let s = since(
+            &t,
+            &npcd(),
+            slice::from_ref(&path),
+            t0.plus(OVERLAP),
+            &BTreeSet::new(),
+            budget,
+        )
+        .unwrap();
         let read = texts(&s);
         assert_eq!(read.len(), 28, "{read:?}");
-        assert_eq!(read[0], "A day of chores.", "the fold, at its day's last line");
+        assert_eq!(
+            read[0], "A day of chores.",
+            "the fold, at its day's last line"
+        );
         assert!(read.contains(&"did 50"));
-        assert!(!read.contains(&"did 00"), "the archived originals did not fit");
+        assert!(
+            !read.contains(&"did 00"),
+            "the archived originals did not fit"
+        );
         assert_eq!(s.left_out, 0, "the fold stood in for them");
         // With room for everything, the originals are read instead of it.
-        let all = since(&t, &npcd(), &[path], t0.plus(OVERLAP), &BTreeSet::new(), 51 * line)
-            .unwrap();
+        let all = since(
+            &t,
+            &npcd(),
+            &[path],
+            t0.plus(OVERLAP),
+            &BTreeSet::new(),
+            51 * line,
+        )
+        .unwrap();
         assert_eq!(all.lines.len(), 51);
         assert_eq!(texts(&all)[0], "did 00");
     }

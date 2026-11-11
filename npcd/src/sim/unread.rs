@@ -110,10 +110,12 @@ mod tests {
         let mut p = Threads::new();
         let general = p.open_standing("zenworld #general", &[who("npc-1", "Zen")]);
         p.join(&general, &who("u_kit", "Kit"));
-        p.send_on(&general, "u_kit", Said::words("anyone?")).unwrap();
+        p.send_on(&general, "u_kit", Said::words("anyone?"))
+            .unwrap();
         p.send_on(&general, "u_kit", Said::words("hello?")).unwrap();
         let dm = p.reach(&who("u_john", "John"), &who("npc-1", "Zen"));
-        p.send_on(&dm, "u_john", Said::words("are you there?")).unwrap();
+        p.send_on(&dm, "u_john", Said::words("are you there?"))
+            .unwrap();
         (p, general)
     }
 
@@ -134,7 +136,10 @@ mod tests {
             "the DM is the conversation's, not the reminder's"
         );
         assert_eq!(p.unread_due("npc-1", T0 + 1_000, false), (None, 2));
-        assert!(p.unread_due("npc-1", T0 + REMIND_EVERY_MS, false).0.is_some());
+        assert!(p
+            .unread_due("npc-1", T0 + REMIND_EVERY_MS, false)
+            .0
+            .is_some());
         p.send_on(&general, "u_kit", Said::words("still?")).unwrap();
         assert_eq!(
             p.unread_due("npc-1", T0 + REMIND_EVERY_MS + 1, false)
@@ -150,7 +155,10 @@ mod tests {
         let (mut p, _) = waiting();
         assert!(p.unread_due("npc-1", T0, false).0.is_some());
         p.read("npc-1", "zenworld #general").unwrap();
-        assert_eq!(p.unread_due("npc-1", T0 + REMIND_EVERY_MS, false), (None, 0));
+        assert_eq!(
+            p.unread_due("npc-1", T0 + REMIND_EVERY_MS, false),
+            (None, 0)
+        );
         assert!(p.reminded.is_empty());
     }
 
@@ -159,7 +167,10 @@ mod tests {
         let (mut p, _) = waiting();
         assert_eq!(p.unread_due("npc-1", T0, true), (None, 2));
         assert_eq!(p.unread_due("npc-1", T0 + 1_000, false), (None, 2));
-        assert!(p.unread_due("npc-1", T0 + REMIND_EVERY_MS, false).0.is_some());
+        assert!(p
+            .unread_due("npc-1", T0 + REMIND_EVERY_MS, false)
+            .0
+            .is_some());
     }
 
     /// **A group line said to the character by name makes it urgent.**

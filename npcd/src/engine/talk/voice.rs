@@ -52,9 +52,9 @@ pub fn post_of(act: &Act) -> Option<(String, String)> {
 /// The user turn a post's words answer.
 pub fn post_prompt(tool: &str, to: &str, intent: &str) -> String {
     match tool {
-        "sign_off" => format!(
-            "Say goodbye on {to}, in your own words, as you would type it: {intent}"
-        ),
+        "sign_off" => {
+            format!("Say goodbye on {to}, in your own words, as you would type it: {intent}")
+        }
         _ => format!("Post to {to}, in your own words, as you would type it: {intent}"),
     }
 }
@@ -173,7 +173,10 @@ mod tests {
             Some(("the sweep".into(), "who is free?".into()))
         );
         assert_eq!(
-            post_of(&act("open_group", json!({"called": "the sweep", "with": "Wren"}))),
+            post_of(&act(
+                "open_group",
+                json!({"called": "the sweep", "with": "Wren"})
+            )),
             None,
             "opened with nothing to say"
         );
@@ -193,7 +196,10 @@ mod tests {
     fn a_repeated_post_is_caught_before_it_is_posted() {
         let own = ["The lift on level three is stuck again, I've reported it."];
         assert_eq!(
-            post(&own, "The lift on level three is stuck again; I've reported it."),
+            post(
+                &own,
+                "The lift on level three is stuck again; I've reported it."
+            ),
             Post::Repeat
         );
         assert_eq!(

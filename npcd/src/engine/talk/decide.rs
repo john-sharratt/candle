@@ -58,7 +58,11 @@ pub fn restated(party: &str, acts: &[Act]) -> String {
         }
     };
     for a in acts.iter().filter(|a| a.tool == "promise") {
-        out.push_str(&format!(" You promised: {}, by {}.", text(a, "what"), text(a, "by")));
+        out.push_str(&format!(
+            " You promised: {}, by {}.",
+            text(a, "what"),
+            text(a, "by")
+        ));
     }
     out
 }
@@ -80,7 +84,10 @@ mod tests {
 
     #[test]
     fn the_last_reply_goodbye_or_reflection_decides_where_the_words_go() {
-        let reply = act("reply", json!({"to": "Mira", "intent": "it is at the door"}));
+        let reply = act(
+            "reply",
+            json!({"to": "Mira", "intent": "it is at the door"}),
+        );
         let bye = act("sign_off", json!({"to": "Mira", "intent": "I'm off shift"}));
         let reflect = act("reflect", json!({"feeling": "calm"}));
         let promise = act(
@@ -88,7 +95,10 @@ mod tests {
             json!({"to": "Mira", "what": "the garden report", "by": "Friday"}),
         );
         assert_eq!(destination(slice::from_ref(&reply)), Destination::Reply);
-        assert_eq!(destination(&[reply.clone(), bye.clone()]), Destination::Parting);
+        assert_eq!(
+            destination(&[reply.clone(), bye.clone()]),
+            Destination::Parting
+        );
         assert_eq!(destination(&[bye, reflect.clone()]), Destination::Journal);
         assert_eq!(destination(slice::from_ref(&promise)), Destination::Journal);
         assert_eq!(destination(&[]), Destination::Journal);
@@ -102,7 +112,10 @@ mod tests {
                 "promise",
                 json!({"to": "Mira", "what": "the garden report.", "by": "Friday"}),
             ),
-            act("reply", json!({"to": "Mira", "intent": "that it is at the door."})),
+            act(
+                "reply",
+                json!({"to": "Mira", "intent": "that it is at the door."}),
+            ),
         ];
         assert_eq!(
             restated("Mira", &acts),
@@ -114,7 +127,13 @@ mod tests {
             "Write down what you make of this; you are not answering."
         );
         assert_eq!(
-            restated("Mira", &[act("sign_off", json!({"to": "Mira", "intent": "time for bed"}))]),
+            restated(
+                "Mira",
+                &[act(
+                    "sign_off",
+                    json!({"to": "Mira", "intent": "time for bed"})
+                )]
+            ),
             "You are saying goodbye to Mira: time for bed."
         );
     }

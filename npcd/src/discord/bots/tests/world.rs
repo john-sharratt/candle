@@ -444,7 +444,11 @@ async fn a_group_is_a_channel_only_its_members_see() {
     let sweep = d.hosted.with_sim(|s| {
         s.threads.open_group(
             "The Eastern Sweep",
-            &[Who::new("zen", "Zen"), Who::new("wick", "Wick"), wren.clone()],
+            &[
+                Who::new("zen", "Zen"),
+                Who::new("wick", "Wick"),
+                wren.clone(),
+            ],
         )
     });
     d.mirroring().await;
@@ -513,9 +517,7 @@ async fn a_group_is_a_channel_only_its_members_see() {
 
     // Wren is let back in, and then everybody goes: archived, read-only.
     d.hosted.with_sim(|s| {
-        s.threads
-            .invite("zen", "The Eastern Sweep", &wren)
-            .unwrap();
+        s.threads.invite("zen", "The Eastern Sweep", &wren).unwrap();
     });
     d.reconcile_now().await;
     assert!(d

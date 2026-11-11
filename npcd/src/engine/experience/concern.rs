@@ -105,7 +105,10 @@ mod tests {
             body: "zen".into(),
             line: "John withdrew 'Tidy the lounge'.".into(),
         };
-        assert_eq!(concern(&c, &sim()), [bot("zen", "John withdrew 'Tidy the lounge'.")]);
+        assert_eq!(
+            concern(&c, &sim()),
+            [bot("zen", "John withdrew 'Tidy the lounge'.")]
+        );
     }
 
     #[test]
@@ -115,7 +118,10 @@ mod tests {
             by: by.map(String::from),
             line: "The lounge TV was turned off.".into(),
         };
-        assert_eq!(concern(&c(Some("zen")), &sim()), [bot("wick", "The lounge TV was turned off.")]);
+        assert_eq!(
+            concern(&c(Some("zen")), &sim()),
+            [bot("wick", "The lounge TV was turned off.")]
+        );
         assert!(concern(&c(Some("wick")), &sim()).is_empty());
         let elsewhere = Change::Room {
             place: "house/kitchen".into(),

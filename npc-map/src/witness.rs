@@ -250,7 +250,8 @@ fn legible(reach: Reach, what: &Happening, reader: &str) -> Option<Happening> {
     if what.is_private() {
         return None;
     }
-    let heard = |to: &Option<String>, voice: Voice| carries(voice, reach, to.as_deref() == Some(reader));
+    let heard =
+        |to: &Option<String>, voice: Voice| carries(voice, reach, to.as_deref() == Some(reader));
     match reach {
         Reach::OutOfReach => match what {
             Happening::Said { to, voice, .. } if heard(to, *voice) => Some(what.clone()),
@@ -554,14 +555,17 @@ mod tests {
     /// and not.
     #[test]
     fn what_carries_is_the_voice_the_nearness_and_the_aim() {
-        let table: Vec<(Voice, Reach, bool, bool)> = [Voice::Said, Voice::Shouted, Voice::Whispered]
-            .into_iter()
-            .flat_map(|v| {
-                [Reach::Here, Reach::InSight, Reach::OutOfReach]
-                    .into_iter()
-                    .flat_map(move |r| [false, true].map(|aimed| (v, r, aimed, carries(v, r, aimed))))
-            })
-            .collect();
+        let table: Vec<(Voice, Reach, bool, bool)> =
+            [Voice::Said, Voice::Shouted, Voice::Whispered]
+                .into_iter()
+                .flat_map(|v| {
+                    [Reach::Here, Reach::InSight, Reach::OutOfReach]
+                        .into_iter()
+                        .flat_map(move |r| {
+                            [false, true].map(|aimed| (v, r, aimed, carries(v, r, aimed)))
+                        })
+                })
+                .collect();
         let heard: Vec<(Voice, Reach, bool)> = table
             .iter()
             .filter(|(_, _, _, c)| *c)

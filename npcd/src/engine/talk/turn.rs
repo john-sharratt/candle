@@ -23,6 +23,7 @@ use crate::engine::event::{EventKind, Salience, TalkLine};
 use crate::engine::experience::line;
 use crate::engine::mind::TalkTurn;
 use crate::engine::runtime::Runtime;
+use crate::engine::talk::authority;
 use crate::engine::talk::catchup::{self, CatchUp};
 use crate::engine::talk::clock::{self, Ended, Input};
 use crate::engine::talk::critical;
@@ -32,7 +33,6 @@ use crate::engine::talk::runner::{Inputs, Key};
 use crate::engine::talk::state::TalkState;
 use crate::engine::talk::templates::Destination;
 use crate::engine::talk::within::OnThread;
-use crate::engine::talk::authority;
 use crate::sim::phone::other_of;
 
 /// How often the runner looks for a conversation whose turn is due.
@@ -155,7 +155,12 @@ impl Runtime {
         }
     }
 
-    async fn run_talk_turn(&self, npc: u64, member: &str, inputs: &Inputs) -> anyhow::Result<Ended> {
+    async fn run_talk_turn(
+        &self,
+        npc: u64,
+        member: &str,
+        inputs: &Inputs,
+    ) -> anyhow::Result<Ended> {
         let minds = self
             .minds
             .read()
@@ -300,7 +305,10 @@ impl Runtime {
             };
             if let Ok(OpReply::Done { ok: true }) = self.world_write(&world, op).await {
                 state.pending_critical = None;
-                arrived.push(format!("{} said yes: '{step}' is signed off.", seen.party_name));
+                arrived.push(format!(
+                    "{} said yes: '{step}' is signed off.",
+                    seen.party_name
+                ));
             }
         }
         if state.pending_critical.is_none() {
@@ -341,7 +349,10 @@ impl Runtime {
             .iter()
             .filter(|a| !matches!(a.tool, "reply" | "sign_off" | "reflect"))
         {
-            let done = self.perform_said(npc, act, None, None, &source).await.recorded;
+            let done = self
+                .perform_said(npc, act, None, None, &source)
+                .await
+                .recorded;
             if !done.landed {
                 continue;
             }
@@ -385,8 +396,17 @@ impl Runtime {
             (Destination::Reply, Words::Send(w)) => {
                 let act = decided("reply").unwrap_or_else(|| to_party("reply", &seen.party_name));
                 let said = voiced(w);
-                self.say_to_party(npc, &act, &said, &source, &world, &body, &seen, about.clone())
-                    .await?;
+                self.say_to_party(
+                    npc,
+                    &act,
+                    &said,
+                    &source,
+                    &world,
+                    &body,
+                    &seen,
+                    about.clone(),
+                )
+                .await?;
                 elsewhere.push(format!("You said: {}", said.text));
                 Ended::Spoke
             }
@@ -394,8 +414,17 @@ impl Runtime {
                 let act =
                     decided("sign_off").unwrap_or_else(|| to_party("sign_off", &seen.party_name));
                 let said = voiced(w);
-                self.say_to_party(npc, &act, &said, &source, &world, &body, &seen, about.clone())
-                    .await?;
+                self.say_to_party(
+                    npc,
+                    &act,
+                    &said,
+                    &source,
+                    &world,
+                    &body,
+                    &seen,
+                    about.clone(),
+                )
+                .await?;
                 elsewhere.push(format!("You said goodbye: {}", said.text));
                 state.open = false;
                 Ended::Quiet
@@ -462,7 +491,10 @@ impl Runtime {
         let mut paths = vec![bot.clone()];
         paths.extend(self.journals.world(world));
         paths.extend(about.cloned());
-        let paths: Vec<_> = paths.into_iter().filter(|p| tree.get(p).is_some()).collect();
+        let paths: Vec<_> = paths
+            .into_iter()
+            .filter(|p| tree.get(p).is_some())
+            .collect();
         let pending = self.journals.pending(&bot);
         catchup::gather(
             &tree,

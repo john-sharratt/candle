@@ -4720,7 +4720,10 @@ mod tests {
         match perform(
             &h,
             "m1",
-            &act("report_done", json!({"found": "the flat is ours and the keys are here"})),
+            &act(
+                "report_done",
+                json!({"found": "the flat is ours and the keys are here"}),
+            ),
         ) {
             Outcome::Refused(why) => assert_eq!(
                 why,

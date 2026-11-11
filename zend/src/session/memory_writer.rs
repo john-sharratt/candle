@@ -554,10 +554,7 @@ mod tests {
         };
         let mut jobs: Vec<Job> = (0..20).map(|i| close(&format!("bots/b{i}"))).collect();
         jobs.extend((0..10).map(|i| close(&format!("people/p{i}"))));
-        let taken: Vec<String> = this_pass(jobs)
-            .iter()
-            .map(|j| j.path().show())
-            .collect();
+        let taken: Vec<String> = this_pass(jobs).iter().map(|j| j.path().show()).collect();
         assert_eq!(taken.len(), PER_PASS + BOTS_PER_PASS);
         assert_eq!(taken[0], "@moon/people/p0");
         assert_eq!(taken[PER_PASS - 1], "@moon/people/p7");

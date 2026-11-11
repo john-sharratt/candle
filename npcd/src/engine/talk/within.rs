@@ -28,7 +28,12 @@ pub const ACTS: &[&str] = &[
 
 /// The acts that change the character's mission: offered only to a party with
 /// authority over it, outside the thrash cooldown (§7.2).
-pub const MISSION_ACTS: &[&str] = &["mission_add", "mission_edit", "mission_cancel", "mission_done"];
+pub const MISSION_ACTS: &[&str] = &[
+    "mission_add",
+    "mission_edit",
+    "mission_cancel",
+    "mission_done",
+];
 
 /// The acts that keep a conversation talking, struck once an NPC↔NPC
 /// activation has run its turns (§8): what is left is the journal or a
@@ -125,7 +130,10 @@ mod tests {
         within.carried = vec!["a torch".into()];
         within.readable = vec!["the muster board".into()];
         within.agenda = vec!["Tidy the lounge".into()];
-        within.priorities = Priority::ALL.iter().map(|p| p.as_str().to_string()).collect();
+        within.priorities = Priority::ALL
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
         within
     }
 
@@ -161,8 +169,15 @@ mod tests {
         let within = zen().on_thread(&thread(&party, "Mira"));
         assert_eq!(
             offered(&within),
-            ["reply", "sign_off", "reflect", "promise", "message", "reach_out"]
-                .map(String::from)
+            [
+                "reply",
+                "sign_off",
+                "reflect",
+                "promise",
+                "message",
+                "reach_out"
+            ]
+            .map(String::from)
         );
     }
 
@@ -292,8 +307,16 @@ mod tests {
         });
         assert_eq!(
             offered(&within),
-            ["reply", "sign_off", "reflect", "promise", "remind", "message", "reach_out"]
-                .map(String::from)
+            [
+                "reply",
+                "sign_off",
+                "reflect",
+                "promise",
+                "remind",
+                "message",
+                "reach_out"
+            ]
+            .map(String::from)
         );
         assert_eq!(within.private, ["Mira"]);
     }

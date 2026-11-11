@@ -341,12 +341,14 @@ impl Runtime {
             return self.perform_here(npc, act, pinned, said, source).await;
         }
         let decided = match source {
-            ActSource::Mind => hosted
-                .read(|w| w.deliberation(&body))
-                .map(|(at, company)| Decided {
-                    at: at.to_string(),
-                    company,
-                }),
+            ActSource::Mind => {
+                hosted
+                    .read(|w| w.deliberation(&body))
+                    .map(|(at, company)| Decided {
+                        at: at.to_string(),
+                        company,
+                    })
+            }
             ActSource::Talk { .. } => None,
         };
         let op = WorldOp::Act {
@@ -433,7 +435,12 @@ impl Runtime {
         let Some((hosted, body)) = self.body_of(npc) else {
             return;
         };
-        let did = recorded.answer.lines().next().unwrap_or_default().to_string();
+        let did = recorded
+            .answer
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
         self.journals
             .note(hosted.id(), &body, ExperienceKind::Did, &did, None);
         let name = hosted

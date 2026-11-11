@@ -22,7 +22,10 @@ pub fn direct_id(a: &str, b: &str) -> String {
 /// may hold a colon (`discord:{id}`), so the known side is matched whole.
 pub fn other_of(id: &str, me: &str) -> Option<String> {
     let pair = id.strip_prefix("dm:")?;
-    let other = match (pair.strip_prefix(&format!("{me}:")), pair.strip_suffix(&format!(":{me}"))) {
+    let other = match (
+        pair.strip_prefix(&format!("{me}:")),
+        pair.strip_suffix(&format!(":{me}")),
+    ) {
         (Some(other), _) | (None, Some(other)) => other,
         (None, None) => return None,
     };
@@ -48,7 +51,11 @@ impl Threads {
             self.threads.insert(id.clone(), t);
         }
         for who in [from, to] {
-            if let Some(m) = self.threads.get_mut(&id).and_then(|t| t.member_mut(&who.id)) {
+            if let Some(m) = self
+                .threads
+                .get_mut(&id)
+                .and_then(|t| t.member_mut(&who.id))
+            {
                 m.name = who.name.clone();
             }
         }

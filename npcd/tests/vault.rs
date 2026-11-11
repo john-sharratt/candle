@@ -124,7 +124,10 @@ fn standing(rt: &Arc<Runtime>, body: &str) -> Where {
 fn hand_out_phones(rt: &Arc<Runtime>, who: &[(&str, &str)]) {
     let world = rt.hosted.get(WORLD).expect("hosted");
     world.with_sim(|s| {
-        let roster: Vec<Who> = who.iter().map(|(body, name)| Who::new(body, name)).collect();
+        let roster: Vec<Who> = who
+            .iter()
+            .map(|(body, name)| Who::new(body, name))
+            .collect();
         s.set_roster(roster);
         for (body, name) in who {
             npcd::sim::seed::issue_handset(s, body, name);
@@ -161,7 +164,10 @@ async fn a_private_message_is_a_purpose_for_the_conversation() {
     let world = rt.hosted.get(WORLD).expect("hosted");
     let thread = world.sim(|s| s.threads.direct_between("m1", "m2").cloned());
     let thread = thread.expect("the pair's thread stands");
-    assert!(thread.messages.is_empty(), "the intent was written on the thread");
+    assert!(
+        thread.messages.is_empty(),
+        "the intent was written on the thread"
+    );
 }
 
 // =========================================================================
@@ -600,14 +606,21 @@ async fn a_person_can_message_a_character_and_its_conversation_is_handed_the_lin
     });
     let line = line.expect("the line is on the pair's thread");
     assert_eq!(
-        (line.from.as_str(), line.text.as_str(), line.account.as_deref()),
+        (
+            line.from.as_str(),
+            line.text.as_str(),
+            line.account.as_deref()
+        ),
         ("u_wren", "the third era will not reconcile", Some("u_wren"))
     );
     let (with, said) = rt.messages_with(1, "u_wren").expect("a body");
     assert_eq!(with, "Maker-01");
     assert_eq!(
         said,
-        [("Wren S".to_string(), "the third era will not reconcile".to_string())]
+        [(
+            "Wren S".to_string(),
+            "the third era will not reconcile".to_string()
+        )]
     );
 }
 

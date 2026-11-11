@@ -7,10 +7,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use journals::error::{Error, Problem};
-use journals::store::{Store, StoreError};
 use journals::files::{Cite, Sentence};
 use journals::scope::Channel;
 use journals::slug::Slug;
+use journals::store::{Store, StoreError};
 use journals::terms::Terms;
 use journals::tree::fingerprint::fingerprint;
 use tempfile::TempDir;

@@ -261,13 +261,7 @@ pub fn applied_to(
     Ok((next, applied))
 }
 
-fn run(
-    tree: &mut Tree,
-    actor: &Actor,
-    op: &Op,
-    now: Stamp,
-    keeping: &[LineId],
-) -> Result<Applied> {
+fn run(tree: &mut Tree, actor: &Actor, op: &Op, now: Stamp, keeping: &[LineId]) -> Result<Applied> {
     let keep = keeping.first();
     match op {
         Op::Note {

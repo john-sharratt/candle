@@ -184,7 +184,10 @@ mod tests {
         // The day is full: a promise takes the oldest act's place, and the
         // next takes the heard line's.
         b.push(&bot("zen"), line(500, ExperienceKind::Promised, "promised"));
-        b.push(&bot("zen"), line(501, ExperienceKind::Promised, "promised-2"));
+        b.push(
+            &bot("zen"),
+            line(501, ExperienceKind::Promised, "promised-2"),
+        );
         let held = b.pending(&bot("zen"));
         assert_eq!(held.len(), DAY_LINES);
         assert_eq!(texts(&held[..2]), ["said-0", "said"]);

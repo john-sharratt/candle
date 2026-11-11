@@ -85,10 +85,15 @@ impl TalkState {
         );
         put(ANSWERED_SEQ, self.answered_seq.to_string());
         put(ACTIVATION, self.activation.to_string());
-        put(PENDING_CRITICAL, self.pending_critical.clone().unwrap_or_default());
+        put(
+            PENDING_CRITICAL,
+            self.pending_critical.clone().unwrap_or_default(),
+        );
         put(
             COMPASS,
-            self.compass.map(|c| format!("{c:016x}")).unwrap_or_default(),
+            self.compass
+                .map(|c| format!("{c:016x}"))
+                .unwrap_or_default(),
         );
         put(OPEN, self.open.to_string());
         put(GENERATION, self.generation.to_string());

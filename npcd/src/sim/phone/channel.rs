@@ -216,7 +216,8 @@ mod tests {
         let pair = p.reach(&who("npc-1"), &who("u_8"));
         let dead = p.open_group("dead air", &crew());
         let live = p.open_group("live", &crew());
-        p.send_on(&live, "npc-1", Said::words("still going")).unwrap();
+        p.send_on(&live, "npc-1", Said::words("still going"))
+            .unwrap();
         for i in 0..(KEEP_GROUPS * 2) {
             p.open_group(&format!("crew {i}"), &crew());
         }
@@ -261,7 +262,10 @@ mod tests {
         let mut p = Threads::new();
         let id = p.open_group("the sweep", &crew());
         p.send_on(&id, "npc-1", Said::words("before")).unwrap();
-        assert_eq!(p.invite("npc-1", "the sweep", &who("npc-4")), Ok(Kind::Group));
+        assert_eq!(
+            p.invite("npc-1", "the sweep", &who("npc-4")),
+            Ok(Kind::Group)
+        );
         assert!(p.get(&id).unwrap().unread("npc-4").is_empty());
         p.leave("npc-1", "the sweep").unwrap();
         assert_eq!(p.names_for("npc-2"), ["the sweep"]);

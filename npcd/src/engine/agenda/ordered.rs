@@ -189,11 +189,10 @@ pub fn order(tool: &str, args: &Map<String, Value>) -> Result<Order, String> {
     let mission = || text(args, "mission").ok_or("Say which mission: the one you carry.");
     match tool {
         "mission_add" => {
-            let brief = text(args, "brief")
-                .ok_or("A mission needs a brief of what is to be done.")?;
-            let steps = steps(args).ok_or(
-                "Give it at least one step, one to a line, that you can be seen to do.",
-            )?;
+            let brief =
+                text(args, "brief").ok_or("A mission needs a brief of what is to be done.")?;
+            let steps = steps(args)
+                .ok_or("Give it at least one step, one to a line, that you can be seen to do.")?;
             Ok(Order::Add { brief, steps })
         }
         "mission_edit" => {
@@ -239,7 +238,10 @@ mod tests {
         assert_eq!(names, agenda);
         for t in ORDERED_ACTS {
             assert!(is_ordered(t));
-            assert!(!t.params.iter().any(|p| p.name == "priority" || p.name == "title"));
+            assert!(!t
+                .params
+                .iter()
+                .any(|p| p.name == "priority" || p.name == "title"));
         }
         assert_eq!(member("mission_add"), "ordered/mission_add");
         assert!(counterpart("reply").is_none());
@@ -250,7 +252,9 @@ mod tests {
         assert_eq!(
             order(
                 "mission_add",
-                &args(r#"{"brief":"Check the doors.","steps":"- go to the garden\n\n* check the doors"}"#)
+                &args(
+                    r#"{"brief":"Check the doors.","steps":"- go to the garden\n\n* check the doors"}"#
+                )
             ),
             Ok(Order::Add {
                 brief: "Check the doors.".into(),
@@ -258,7 +262,10 @@ mod tests {
             })
         );
         assert_eq!(
-            order("mission_edit", &args(r#"{"mission":"Tidy.","steps":"dust"}"#)),
+            order(
+                "mission_edit",
+                &args(r#"{"mission":"Tidy.","steps":"dust"}"#)
+            ),
             Ok(Order::Edit {
                 mission: "Tidy.".into(),
                 brief: None,
@@ -266,14 +273,20 @@ mod tests {
             })
         );
         assert_eq!(
-            order("mission_cancel", &args(r#"{"mission":"Tidy.","why":"not needed"}"#)),
+            order(
+                "mission_cancel",
+                &args(r#"{"mission":"Tidy.","why":"not needed"}"#)
+            ),
             Ok(Order::Cancel {
                 mission: "Tidy.".into(),
                 why: "not needed".into(),
             })
         );
         assert_eq!(
-            order("mission_done", &args(r#"{"mission":"Tidy.","found":"it is tidy"}"#)),
+            order(
+                "mission_done",
+                &args(r#"{"mission":"Tidy.","found":"it is tidy"}"#)
+            ),
             Ok(Order::Done {
                 mission: "Tidy.".into(),
                 found: "it is tidy".into(),

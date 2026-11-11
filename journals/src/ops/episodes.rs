@@ -156,24 +156,26 @@ mod tests {
         let seen: Vec<(Stamp, &str, ExperienceKind)> = j
             .window
             .iter()
-            .map(|l| {
-                (
-                    l.at,
-                    l.text.as_str(),
-                    l.experience.as_ref().unwrap().kind,
-                )
-            })
+            .map(|l| (l.at, l.text.as_str(), l.experience.as_ref().unwrap().kind))
             .collect();
         assert_eq!(
             seen,
             [
-                (now().plus(-40), "Turned the lounge TV off.", ExperienceKind::Did),
+                (
+                    now().plus(-40),
+                    "Turned the lounge TV off.",
+                    ExperienceKind::Did
+                ),
                 (
                     now().plus(-30),
                     "John, on the phone: is the parcel in?",
                     ExperienceKind::Heard
                 ),
-                (now().plus(-25), "Told John it is at the door.", ExperienceKind::Said),
+                (
+                    now().plus(-25),
+                    "Told John it is at the door.",
+                    ExperienceKind::Said
+                ),
             ]
         );
         for l in &j.window {

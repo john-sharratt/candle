@@ -96,7 +96,15 @@ mod tests {
                 t.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
                 t.messages
                     .iter()
-                    .map(|m| (m.seq, m.from.clone(), m.text.clone(), m.origin, m.to.clone()))
+                    .map(|m| {
+                        (
+                            m.seq,
+                            m.from.clone(),
+                            m.text.clone(),
+                            m.origin,
+                            m.to.clone(),
+                        )
+                    })
                     .collect::<Vec<_>>(),
                 t.unread_for("discord:31"),
             )

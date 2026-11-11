@@ -53,7 +53,11 @@ mod tests {
             Some(day_line(DAY_MS * 4 + 1))
         );
         assert_eq!(days.rolled("moon", DAY_MS * 4 + 2), None, "rolled already");
-        assert_eq!(days.rolled("battle-cities", DAY_MS * 9), None, "its own first sight");
+        assert_eq!(
+            days.rolled("battle-cities", DAY_MS * 9),
+            None,
+            "its own first sight"
+        );
         assert_eq!(days.rolled("moon", DAY_MS * 2), None, "world time set back");
     }
 

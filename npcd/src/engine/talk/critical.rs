@@ -70,14 +70,27 @@ mod tests {
             "a yes to a question nobody asked"
         );
         assert_eq!(
-            signs(Some(LEASE), Some("Pay the deposit"), Standing::Authorizer, &yes),
+            signs(
+                Some(LEASE),
+                Some("Pay the deposit"),
+                Standing::Authorizer,
+                &yes
+            ),
             None,
             "the step moved on"
         );
         assert_eq!(
-            signs(Some(LEASE), Some(LEASE), Standing::Authorizer, &["No, wait."]),
+            signs(
+                Some(LEASE),
+                Some(LEASE),
+                Standing::Authorizer,
+                &["No, wait."]
+            ),
             None
         );
-        assert_eq!(signs(Some(LEASE), Some(LEASE), Standing::Nobody, &yes), None);
+        assert_eq!(
+            signs(Some(LEASE), Some(LEASE), Standing::Nobody, &yes),
+            None
+        );
     }
 }

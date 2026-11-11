@@ -86,7 +86,10 @@ mod tests {
     fn a_group_reads_with_its_unread_and_none_of_its_content() {
         let t = talk();
         let th = t.groups_of("npc-1").into_iter().next().unwrap();
-        assert_eq!(thread_line(th, "npc-1"), "repair crew (a group of 3): 1 unread.");
+        assert_eq!(
+            thread_line(th, "npc-1"),
+            "repair crew (a group of 3): 1 unread."
+        );
         assert!(!thread_line(th, "npc-1").contains("ledger"));
     }
 
@@ -95,7 +98,10 @@ mod tests {
         let mut t = Threads::new();
         t.open_group("repair crew", &crew());
         let th = t.groups_of("npc-1").into_iter().next().unwrap();
-        assert_eq!(thread_line(th, "npc-1"), "repair crew (a group of 3): nothing unread.");
+        assert_eq!(
+            thread_line(th, "npc-1"),
+            "repair crew (a group of 3): nothing unread."
+        );
     }
 
     #[test]

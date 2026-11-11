@@ -378,7 +378,11 @@ async fn a_403_closes_the_thread_and_is_not_retried() {
     );
     d.hosted.with_sim(|s| {
         s.threads
-            .send(ZEN_BODY, "zenworld #general", Said::words("Can anyone hear me?"))
+            .send(
+                ZEN_BODY,
+                "zenworld #general",
+                Said::words("Can anyone hear me?"),
+            )
             .unwrap();
     });
     d.until("closed", |d| {
@@ -438,7 +442,8 @@ async fn ready_tells_of_the_servers_left_and_joined_while_offline() {
     let zen = Who::new(ZEN_BODY, "Zen");
     let (gone, home) = d.hosted.with_sim(|s| {
         (
-            s.threads.open_standing("oldplace #chat", slice::from_ref(&zen)),
+            s.threads
+                .open_standing("oldplace #chat", slice::from_ref(&zen)),
             s.threads.open_standing("home #hall", slice::from_ref(&zen)),
         )
     });

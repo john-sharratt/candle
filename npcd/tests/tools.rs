@@ -1512,7 +1512,12 @@ fn reaching_out_opens_the_pair_s_thread_and_hands_the_conversation_a_purpose() {
         ),
     );
     assert!(out.happened(), "{out:?}");
-    let (thread, purposes) = h.sim(|s| (s.threads.direct_between("c1", "c2").cloned(), s.purposes.clone()));
+    let (thread, purposes) = h.sim(|s| {
+        (
+            s.threads.direct_between("c1", "c2").cloned(),
+            s.purposes.clone(),
+        )
+    });
     assert!(thread.expect("the pair's thread").messages.is_empty());
     assert_eq!(
         purposes,
@@ -1547,11 +1552,7 @@ fn a_message_waits_until_it_is_looked_at() {
 
     // Doing something else does not consume it.
     perform(&h, "c2", &act("observe", json!({"target":"the room"})));
-    assert_eq!(
-        h.sim(|s| s.messages_waiting("c2")),
-        1,
-        "a message was lost"
-    );
+    assert_eq!(h.sim(|s| s.messages_waiting("c2")), 1, "a message was lost");
 
     h.with_sim(|s| {
         s.threads.read("c2", "the ridge").unwrap();
@@ -1786,7 +1787,11 @@ fn what_is_said_on_a_thread_does_not_reach_the_room() {
     // It went to the phone, not to the room: a purpose for the pair's
     // conversation rather than something heard.
     assert_eq!(h.sim(|s| s.purposes.len()), 1);
-    let heard = h.read(|w| w.log().iter().any(|e| e.actor == "c1" && matches!(e.what, Happening::Said { .. })));
+    let heard = h.read(|w| {
+        w.log()
+            .iter()
+            .any(|e| e.actor == "c1" && matches!(e.what, Happening::Said { .. }))
+    });
     assert!(!heard, "the room heard it");
 }
 

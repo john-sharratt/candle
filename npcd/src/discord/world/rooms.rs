@@ -259,7 +259,10 @@ mod tests {
         keep(&hosted, &standing, &cast(&hosted));
         let (thread, ..) = room_of(&hosted, 7300).unwrap();
 
-        hosted.with_sim(|s| s.threads.join_channel(CHANNEL, &Who::new("npc-3", "Jitter")));
+        hosted.with_sim(|s| {
+            s.threads
+                .join_channel(CHANNEL, &Who::new("npc-3", "Jitter"))
+        });
         let renamed = [channel(7300, "lab", Some("  ")), channel(7001, "dms", None)];
         let standing: BTreeMap<u64, &GuildChannel> = renamed.iter().map(|c| (c.id, c)).collect();
         assert!(keep(&hosted, &standing, &cast(&hosted)).is_empty());

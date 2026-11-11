@@ -308,7 +308,10 @@ mod tests {
         let mut readdressed = reexperienced.clone();
         readdressed.window[1].experience =
             Some(Experience::about(ExperienceKind::Heard, p("people/yen")));
-        assert_ne!(lines_over(&reexperienced, &ids), lines_over(&readdressed, &ids));
+        assert_ne!(
+            lines_over(&reexperienced, &ids),
+            lines_over(&readdressed, &ids)
+        );
         assert_ne!(lines_over(&j, &ids), lines_over(&j, &ids[..1]));
         let mut reordered = j.clone();
         reordered.window.swap(0, 1);

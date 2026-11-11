@@ -83,10 +83,15 @@ impl Minds {
     /// The conversation between `npc_id` and `party`: its newest generation,
     /// rejoined when it was written under this frame, else a new generation
     /// above it. Every other generation is retired.
-    pub fn open_talk(&self, npc_id: u64, party: &Party, band: DecodePriority) -> anyhow::Result<Talk> {
-        let p = self
-            .projected()
-            .ok_or_else(|| anyhow::anyhow!("no projection: conversations need the mind's schema"))?;
+    pub fn open_talk(
+        &self,
+        npc_id: u64,
+        party: &Party,
+        band: DecodePriority,
+    ) -> anyhow::Result<Talk> {
+        let p = self.projected().ok_or_else(|| {
+            anyhow::anyhow!("no projection: conversations need the mind's schema")
+        })?;
         let (layer, group) = p
             .talk
             .ok_or_else(|| anyhow::anyhow!("the schema declares no `talk` layer"))?;
@@ -103,7 +108,10 @@ impl Minds {
         held.sort_by_key(|(g, _)| *g);
         let newest = held.last().copied();
         let rejoin = newest.filter(|(_, tl)| {
-            engine.conversation_metadata_value(*tl, META_FRAME).as_deref() == Some(frame.as_str())
+            engine
+                .conversation_metadata_value(*tl, META_FRAME)
+                .as_deref()
+                == Some(frame.as_str())
         });
         let (sequence, generation) = match rejoin {
             Some((generation, timeline)) => {
@@ -160,7 +168,11 @@ impl Minds {
     }
 
     /// Keep `meta` in the conversation's timeline metadata.
-    pub fn set_talk_meta(&self, talk: &Talk, meta: &BTreeMap<String, String>) -> anyhow::Result<()> {
+    pub fn set_talk_meta(
+        &self,
+        talk: &Talk,
+        meta: &BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
         talk.sequence.set_metadata_many(meta)?;
         Ok(())
     }
@@ -175,7 +187,9 @@ impl Minds {
         turn: TalkTurn<'_>,
     ) -> anyhow::Result<Spoken> {
         let started = Instant::now();
-        let selection = self.talk_selection(talk, npc_id, persona, within, turn.catchup).await;
+        let selection = self
+            .talk_selection(talk, npc_id, persona, within, turn.catchup)
+            .await;
         talk.sequence.publish_sections();
         let asker = talk.sequence.unsealed_asker();
 
@@ -194,7 +208,9 @@ impl Minds {
                     ..Default::default()
                 };
                 let q = catchup::summary_question(turn.party, turn.gap);
-                let r = asker.ask(&q, turn.band, AskScope::Conversation, options).await?;
+                let r = asker
+                    .ask(&q, turn.band, AskScope::Conversation, options)
+                    .await?;
                 plain_prose(&r.text)
             }
             _ => turn.catchup.text.clone(),
@@ -214,7 +230,9 @@ impl Minds {
             selection: selection.clone(),
             ..Default::default()
         };
-        let decided = asker.ask(&user, turn.band, AskScope::Whole, options).await?;
+        let decided = asker
+            .ask(&user, turn.band, AskScope::Whole, options)
+            .await?;
         let parsed = act::parse(&decided.text, &act_specs(Catalog::THREAD, within));
         let to = decide::destination(&parsed.acts);
 
@@ -235,7 +253,10 @@ impl Minds {
             ..Default::default()
         };
         let said = format!("{user}\n\n{}", decide::restated(turn.party, &parsed.acts));
-        let response = talk.sequence.send_turn_with_options_async(&said, options).await?;
+        let response = talk
+            .sequence
+            .send_turn_with_options_async(&said, options)
+            .await?;
         let words = plain_prose(&response.text);
 
         // Released once the words are sealed.
@@ -326,11 +347,19 @@ impl Minds {
                 tokio::time::sleep,
             )
             .await;
-        let mut selection =
-            self.selection(npc_id, persona, within, !mission_sealed.is_empty(), &journal_sealed);
+        let mut selection = self.selection(
+            npc_id,
+            persona,
+            within,
+            !mission_sealed.is_empty(),
+            &journal_sealed,
+        );
         tools::show_within(&mut selection, Catalog::THREAD.mode, within);
         selection.select(STANCE_SELECTOR, Stance::Talking.id());
-        selection.select_all(catchup::COLLECTION, catchup_sealed.iter().map(String::as_str));
+        selection.select_all(
+            catchup::COLLECTION,
+            catchup_sealed.iter().map(String::as_str),
+        );
         selection
     }
 
@@ -366,7 +395,10 @@ impl Minds {
     /// party: the character is gone.
     pub fn retire_talks(&self, npc_id: u64) -> usize {
         let mut retired = 0;
-        for (tl, id) in self.engine.conversations_with_conv_id_prefix(&key::all_of(npc_id)) {
+        for (tl, id) in self
+            .engine
+            .conversations_with_conv_id_prefix(&key::all_of(npc_id))
+        {
             match self.engine.tombstone_timeline(tl) {
                 Ok(()) => retired += 1,
                 Err(e) => tracing::warn!("conversation {id} could not be retired: {e:?}"),

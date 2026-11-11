@@ -119,7 +119,9 @@ impl Threads {
     pub fn direct_waits_on(&self, npc: &str, who: &str) -> bool {
         self.direct_between(npc, who).is_some_and(|t| {
             let read = t.member(npc).map_or(0, |m| m.read);
-            t.since_joined(npc).iter().any(|m| m.from != npc && m.seq > read)
+            t.since_joined(npc)
+                .iter()
+                .any(|m| m.from != npc && m.seq > read)
         })
     }
 }
@@ -142,13 +144,24 @@ mod tests {
         let ch = p.join_channel(CHANNEL, &who("npc-1"));
         p.join(&ch, &who("npc-2"));
         p.send_on(&pair, "u_8", Said::words("is it in?")).unwrap();
-        p.send_on(&ch, "npc-2", Said::words("lift is stuck")).unwrap();
+        p.send_on(&ch, "npc-2", Said::words("lift is stuck"))
+            .unwrap();
         let told = p.undelivered_for("npc-1");
         assert_eq!(told.len(), 1);
         assert_eq!(told[0].0, CHANNEL);
-        assert_eq!(p.waiting_for("npc-1"), 1, "the direct line is not the main loop's");
+        assert_eq!(
+            p.waiting_for("npc-1"),
+            1,
+            "the direct line is not the main loop's"
+        );
         let taken = p.take_direct_for("npc-1");
-        assert_eq!(taken, vec![(pair.clone(), vec![p.get(&pair).unwrap().messages[0].clone()])]);
+        assert_eq!(
+            taken,
+            vec![(
+                pair.clone(),
+                vec![p.get(&pair).unwrap().messages[0].clone()]
+            )]
+        );
         assert!(p.take_direct_for("npc-1").is_empty(), "taken twice");
     }
 
@@ -162,7 +175,11 @@ mod tests {
         assert_eq!(p.awaiting_names_for("npc-1"), ["zenworld #general"]);
         assert_eq!(p.read("npc-1", "zenworld #general").unwrap().len(), 1);
         assert_eq!(p.waiting_for("npc-1"), 0);
-        assert_eq!(p.awaiting_names_for("npc-1"), ["zenworld #general"], "read is not answered");
+        assert_eq!(
+            p.awaiting_names_for("npc-1"),
+            ["zenworld #general"],
+            "read is not answered"
+        );
         p.send_on(&g, "npc-1", Said::words("here")).unwrap();
         assert!(p.awaiting_names_for("npc-1").is_empty());
         assert!(p.read("npc-1", "U_8").unwrap_err().contains("no group"));

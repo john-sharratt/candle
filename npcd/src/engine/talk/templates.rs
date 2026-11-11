@@ -71,10 +71,7 @@ pub struct Installed {
 impl Installed {
     /// Offer `dest`'s templates on a turn, replacing whatever it offered.
     pub fn offer(&self, selection: &mut SelectionState, dest: Destination) {
-        selection.select_all(
-            COLLECTION,
-            self.by.get(&dest).cloned().unwrap_or_default(),
-        );
+        selection.select_all(COLLECTION, self.by.get(&dest).cloned().unwrap_or_default());
     }
 
     /// How many templates `dest` has.
@@ -105,16 +102,18 @@ pub fn install(builder: &mut Builder, files: Option<&MindFiles>) -> anyhow::Resu
     };
     for dest in Destination::ALL {
         let dir = format!("responses/talk/{}", dest.folder());
-        for file in files.list(&dir).into_iter().filter(|f| f.ends_with(".yaml")) {
+        for file in files
+            .list(&dir)
+            .into_iter()
+            .filter(|f| f.ends_with(".yaml"))
+        {
             let rel = format!("{dir}/{file}");
             let Some(text) = files.read(&rel) else {
                 tracing::warn!(%rel, "talk template unreadable, skipping");
                 continue;
             };
             let template = match serde_yaml::from_str::<TemplateFile>(&text) {
-                Ok(TemplateFile {
-                    template: Some(t),
-                }) if !t.trim().is_empty() => t,
+                Ok(TemplateFile { template: Some(t) }) if !t.trim().is_empty() => t,
                 Ok(_) => {
                     tracing::warn!(%rel, "talk template has no `template`, skipping");
                     continue;
@@ -140,8 +139,14 @@ mod tests {
 
     #[test]
     fn a_templates_member_names_its_destination() {
-        assert_eq!(member(Destination::Reply, "warm"), "response/talk/reply/warm");
-        assert_eq!(member(Destination::Journal, "note"), "response/talk/journal/note");
+        assert_eq!(
+            member(Destination::Reply, "warm"),
+            "response/talk/reply/warm"
+        );
+        assert_eq!(
+            member(Destination::Journal, "note"),
+            "response/talk/journal/note"
+        );
     }
 
     /// **A turn is offered only its destination's templates.**
@@ -151,9 +156,10 @@ mod tests {
         installed
             .by
             .insert(Destination::Reply, vec!["response/talk/reply/warm".into()]);
-        installed
-            .by
-            .insert(Destination::Journal, vec!["response/talk/journal/note".into()]);
+        installed.by.insert(
+            Destination::Journal,
+            vec!["response/talk/journal/note".into()],
+        );
         let mut sel = SelectionState::new();
         installed.offer(&mut sel, Destination::Journal);
         assert_eq!(sel.members(COLLECTION), ["response/talk/journal/note"]);

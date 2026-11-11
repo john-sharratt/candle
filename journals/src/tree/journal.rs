@@ -277,7 +277,8 @@ mod tests {
                     at("2026-10-01T00:00:00Z"),
                 )),
             );
-            b.window.push(note(&format!("2026-10-{:02}T10:00:00Z", 2 + i), "x"));
+            b.window
+                .push(note(&format!("2026-10-{:02}T10:00:00Z", 2 + i), "x"));
             bots.children.insert(slug(&format!("b{i:02}")), b);
         }
         let listed: Vec<&str> = bots.listed().iter().map(|(n, _)| n.as_str()).collect();
@@ -286,7 +287,10 @@ mod tests {
             ["b02", "b03", "b04", "b05", "b06", "b07", "b08", "b09", "b10", "b11"],
             "the two quietest are left out"
         );
-        assert!(bots.children[&slug("b00")].caps_children(), "a bot's own journal is capped");
+        assert!(
+            bots.children[&slug("b00")].caps_children(),
+            "a bot's own journal is capped"
+        );
         let mut topics = Journal::new(Place::Section(Section::Topics), None);
         assert!(topics.caps_children());
         topics

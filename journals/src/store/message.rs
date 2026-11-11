@@ -93,7 +93,13 @@ mod tests {
             terms: Terms::default(),
         };
         let id = LineId::parse("2026-10-30-1200-7e3a").unwrap();
-        let m = message("Note on @zen/topics", &yen(), &op, now(), slice::from_ref(&id));
+        let m = message(
+            "Note on @zen/topics",
+            &yen(),
+            &op,
+            now(),
+            slice::from_ref(&id),
+        );
         assert!(m.starts_with(
             "Note on @zen/topics\n\nJournal-Writer: grok\nJournal-Account: yen\nJournal-Channel: grok\nJournal-At: 2026-10-30T12:00:00Z\nJournal-Line: 2026-10-30-1200-7e3a\nJournal-Actor: "
         ), "{m}");
@@ -128,9 +134,9 @@ mod tests {
         ];
         let npcd = Actor::Npcd { group: slug("zen") };
         let m = message("2 episodes on @zen/bots/zen", &npcd, &op, now(), &ids);
-        assert!(m.contains(
-            "Journal-Line: 2026-10-30-1200-aaaa\nJournal-Line: 2026-10-30-1159-bbbb\n"
-        ));
+        assert!(
+            m.contains("Journal-Line: 2026-10-30-1200-aaaa\nJournal-Line: 2026-10-30-1159-bbbb\n")
+        );
         assert_eq!(read(&m).unwrap().lines, ids);
     }
 

@@ -1571,7 +1571,10 @@ mod tests {
         assert_eq!(find("tell")["needs"], "a person here");
         // And a whisper needs somebody besides its listener to keep it from.
         assert_eq!(find("whisper")["needs"], "a person here, and somebody else");
-        assert_eq!(find("shout")["needs"], "a person within earshot, or the field");
+        assert_eq!(
+            find("shout")["needs"],
+            "a person within earshot, or the field"
+        );
         assert_eq!(find("gesture")["needs"], "somebody else here");
         assert!(
             find("reflect")["needs"].is_null(),

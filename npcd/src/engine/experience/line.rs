@@ -53,7 +53,11 @@ mod tests {
     #[test]
     fn each_line_reads_as_its_journal_writes_it() {
         assert_eq!(
-            heard("Mira", &on_thread(true, "Mira"), " the parcel is at the door. "),
+            heard(
+                "Mira",
+                &on_thread(true, "Mira"),
+                " the parcel is at the door. "
+            ),
             "Mira, on the phone: the parcel is at the door."
         );
         assert_eq!(

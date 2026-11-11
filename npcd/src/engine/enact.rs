@@ -180,7 +180,11 @@ fn party_named(hosted: &Hosted, body: &str, name: &str) -> Option<Reached> {
         return Some(Reached::Here(id));
     }
     hosted
-        .sim(|s| s.threads.by_kind_for(body, ThreadKind::Direct, name).is_some())
+        .sim(|s| {
+            s.threads
+                .by_kind_for(body, ThreadKind::Direct, name)
+                .is_some()
+        })
         .then_some(Reached::OnThePhone)
 }
 
@@ -366,7 +370,9 @@ fn read_phone(threads: &mut Threads, me: &str, what: &str) -> Option<Outcome> {
             .into_iter()
             .map(|(n, _)| n)
             .collect(),
-        false => vec![threads.by_kind_for(me, ThreadKind::Group, what)?.as_named_to(me)],
+        false => vec![threads
+            .by_kind_for(me, ThreadKind::Group, what)?
+            .as_named_to(me)],
     };
     let now = now_ms();
     let mut said = Vec::new();
@@ -1245,7 +1251,12 @@ fn open_group(
 /// line either side says opens it again on the same thread
 /// (`docs/npc_conversations.md` §4.3, §11.1). On a group it is leaving: the
 /// parting is said, then the character goes.
-fn sign_off(hosted: &Hosted, body: &str, args: &Map<String, Value>, said: Option<&Voiced>) -> Outcome {
+fn sign_off(
+    hosted: &Hosted,
+    body: &str,
+    args: &Map<String, Value>,
+    said: Option<&Voiced>,
+) -> Outcome {
     let (Some(to), Some(intent)) = (text(args, "to"), text(args, "intent")) else {
         return Outcome::Refused(
             "You meant to go, but not from which conversation, or not why.".into(),
@@ -1671,7 +1682,9 @@ mod tests {
     fn a_promise_on_the_phone_stands_without_the_party_in_the_room() {
         let h = waste();
         h.with_sim(|s| {
-            let id = s.threads.reach(&Who::new("c1", "Wren"), &Who::new("u_mira", "Mira"));
+            let id = s
+                .threads
+                .reach(&Who::new("c1", "Wren"), &Who::new("u_mira", "Mira"));
             assert!(!id.is_empty());
         });
         let out = perform(
@@ -1757,8 +1770,14 @@ mod tests {
         let out = perform(&h, "c1", &act("scan", json!({})));
         let line = out.line().unwrap();
         assert!(line.contains("On your phone:\n"), "{line}");
-        assert!(line.contains("- the crew (a group of 2): 1 unread.\n"), "{line}");
-        assert!(!line.contains("ore is left"), "the content stays in `read`: {line}");
+        assert!(
+            line.contains("- the crew (a group of 2): 1 unread.\n"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("ore is left"),
+            "the content stays in `read`: {line}"
+        );
     }
 
     /// **`read` reads a group on the phone**, by the name the character calls
@@ -1780,11 +1799,12 @@ mod tests {
             s.threads
                 .send_on(&crew, "c2", Said::words("How much ore is left?"))
                 .unwrap();
-            let ops = s.threads.open_group(
-                "ops",
-                &[Who::new("c1", "Wren"), Who::new("c3", "Kit")],
-            );
-            s.threads.send_on(&ops, "c3", Said::words("Hello.")).unwrap();
+            let ops = s
+                .threads
+                .open_group("ops", &[Who::new("c1", "Wren"), Who::new("c3", "Kit")]);
+            s.threads
+                .send_on(&ops, "c3", Said::words("Hello."))
+                .unwrap();
         });
         let out = perform(&h, "c1", &act("read", json!({"what": "the crew"})));
         assert_eq!(

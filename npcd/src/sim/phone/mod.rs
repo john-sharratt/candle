@@ -190,7 +190,12 @@ impl Threads {
 
     /// Say `said` on thread `id` from `from`, who is on it, and it is open:
     /// its seq, and the other members' ids.
-    pub fn send_on(&mut self, id: &str, from: &str, said: Said) -> Result<(u64, Vec<String>), String> {
+    pub fn send_on(
+        &mut self,
+        id: &str,
+        from: &str,
+        said: Said,
+    ) -> Result<(u64, Vec<String>), String> {
         if !self.threads.get(id).is_some_and(|t| t.open && t.has(from)) {
             return Err(format!("{from} is on no open conversation {id}."));
         }
@@ -202,7 +207,12 @@ impl Threads {
     }
 
     /// Say `said` on one of `from`'s threads, named the way `from` names it.
-    pub fn send(&mut self, from: &str, named: &str, said: Said) -> Result<(u64, Vec<String>), String> {
+    pub fn send(
+        &mut self,
+        from: &str,
+        named: &str,
+        said: Said,
+    ) -> Result<(u64, Vec<String>), String> {
         let Some(id) = self.by_name_for(from, named).map(|t| t.id.clone()) else {
             return Err(format!("You have no conversation with {named}."));
         };
@@ -237,17 +247,26 @@ mod tests {
         let direct = p.reach(&who("npc-1", "Zen"), &who("u_8", "Wren"));
         let group = p.open_group(
             "Wren",
-            &[who("npc-1", "Zen"), who("u_8", "Wren"), who("npc-2", "Wick")],
+            &[
+                who("npc-1", "Zen"),
+                who("u_8", "Wren"),
+                who("npc-2", "Wick"),
+            ],
         );
         assert_eq!(
-            p.by_kind_for("npc-1", Kind::Direct, "wren").map(|t| t.id.clone()),
+            p.by_kind_for("npc-1", Kind::Direct, "wren")
+                .map(|t| t.id.clone()),
             Some(direct.clone())
         );
         assert_eq!(
-            p.by_kind_for("npc-1", Kind::Group, "Wren").map(|t| t.id.clone()),
+            p.by_kind_for("npc-1", Kind::Group, "Wren")
+                .map(|t| t.id.clone()),
             Some(group.clone())
         );
-        assert_eq!(p.by_name_for("npc-1", &direct).map(|t| t.id.clone()), Some(direct));
+        assert_eq!(
+            p.by_name_for("npc-1", &direct).map(|t| t.id.clone()),
+            Some(direct)
+        );
         assert_eq!(p.groups_of("npc-1").len(), 1);
     }
 
@@ -258,7 +277,11 @@ mod tests {
         let mut p = Threads::new();
         let g = p.open_group(
             "the sweep",
-            &[who("npc-1", "Wren"), who("npc-2", "Soren"), who("npc-3", "Orion")],
+            &[
+                who("npc-1", "Wren"),
+                who("npc-2", "Soren"),
+                who("npc-3", "Orion"),
+            ],
         );
         let (seq, reached) = p.send("npc-1", "the sweep", Said::words("moving")).unwrap();
         assert_eq!(seq, 1);
@@ -282,7 +305,9 @@ mod tests {
         p.join_channel(CHANNEL, &who("u_8", "Mira"));
         p.enrol("u_8", "Mira K.");
         assert_eq!(p.names_of_kind_for("npc-1", Kind::Direct), ["Mira K."]);
-        assert!(p.iter().all(|t| t.member("u_8").is_none_or(|m| m.name == "Mira K.")));
+        assert!(p
+            .iter()
+            .all(|t| t.member("u_8").is_none_or(|m| m.name == "Mira K.")));
         assert_eq!(p.name_of("u_8"), Some("Mira K."));
     }
 

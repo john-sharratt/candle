@@ -114,7 +114,9 @@ pub(crate) fn about_to_text(about: &JournalPath) -> String {
 /// `about` read back from a line's file.
 pub(crate) fn about_from_text(s: &str) -> Result<JournalPath, String> {
     if !s.starts_with('@') {
-        return Err(format!("`{s}` names no group: an experience's journal is `@group/…`"));
+        return Err(format!(
+            "`{s}` names no group: an experience's journal is `@group/…`"
+        ));
     }
     Viewer {
         group: None,
@@ -164,6 +166,8 @@ mod tests {
         let path = p("@moon/people/mira");
         assert_eq!(about_to_text(&path), "@moon/people/mira");
         assert_eq!(about_from_text("@moon/people/mira"), Ok(path));
-        assert!(about_from_text("people/mira").unwrap_err().contains("names no group"));
+        assert!(about_from_text("people/mira")
+            .unwrap_err()
+            .contains("names no group"));
     }
 }

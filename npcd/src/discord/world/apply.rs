@@ -85,7 +85,15 @@ mod tests {
                 t.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
                 t.messages
                     .iter()
-                    .map(|m| (m.seq, m.from.clone(), m.origin, m.to.clone(), m.account.clone()))
+                    .map(|m| {
+                        (
+                            m.seq,
+                            m.from.clone(),
+                            m.origin,
+                            m.to.clone(),
+                            m.account.clone(),
+                        )
+                    })
                     .collect::<Vec<_>>(),
                 t.unread_for("u_john"),
             )

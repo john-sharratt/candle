@@ -41,9 +41,9 @@ pub mod field;
 pub mod findings;
 pub mod house;
 pub mod item;
+pub mod kept_steps;
 pub mod ledger;
 pub mod missing;
-pub mod kept_steps;
 pub mod missions;
 pub mod operation_names;
 pub mod operations;
@@ -656,7 +656,8 @@ impl Sim {
             Some(w) => w.name = who.name.clone(),
             None => {
                 self.roster.push(who.clone());
-                self.roster.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+                self.roster
+                    .sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
             }
         }
         self.threads.enrol(&who.id, &who.name);

@@ -1059,22 +1059,17 @@ impl Minds {
         }
         // A compile takes a while, and a second character arriving mid-compile
         // does not wait behind it: it compiles too.
-        let built = match compile_act_loop(
-            &self.engine,
-            &self.base_config,
-            thinking,
-            catalog,
-            within,
-        ) {
-            Ok(tree) => tree,
-            Err(e) => {
-                tracing::error!(
+        let built =
+            match compile_act_loop(&self.engine, &self.base_config, thinking, catalog, within) {
+                Ok(tree) => tree,
+                Err(e) => {
+                    tracing::error!(
                     "the {thinking:?} grammar would not compile for this room: {e:#} — this turn \
                      free-decodes"
                 );
-                return None;
-            }
-        };
+                    return None;
+                }
+            };
         // Last writer wins: two characters in one room race to build the same
         // tree and either is correct, since the key determines the contents.
         self.acts.pin().insert(key, Arc::clone(&built));

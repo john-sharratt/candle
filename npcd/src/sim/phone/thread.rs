@@ -114,7 +114,10 @@ impl Thread {
 
     /// The ids of everybody but `than`.
     pub fn other_ids(&self, than: &str) -> Vec<String> {
-        self.others(than).into_iter().map(|m| m.id.clone()).collect()
+        self.others(than)
+            .into_iter()
+            .map(|m| m.id.clone())
+            .collect()
     }
 
     /// What this thread is called to member `who`: a group by its name, a

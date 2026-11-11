@@ -90,7 +90,14 @@ impl Tool for ThreadRead {
         Answer::of(match optional(args, "thread") {
             None => Ok(list(bot, &character, &threads, &mapped)),
             Some(named) => find(&threads, &character.id, named)
-                .map(|t| show(&character.id, t, mapped.get(&t.id).map(String::as_str), limit))
+                .map(|t| {
+                    show(
+                        &character.id,
+                        t,
+                        mapped.get(&t.id).map(String::as_str),
+                        limit,
+                    )
+                })
                 .ok_or_else(|| format!("bot {bot} is on no thread `{named}`")),
         })
     }
@@ -238,9 +245,11 @@ mod tests {
             channel: 610,
         });
         p.send_on(&general, "discord:41", anyone).unwrap();
-        p.send_on(&general, "npc-1", Said::words("I'm here.")).unwrap();
+        p.send_on(&general, "npc-1", Said::words("I'm here."))
+            .unwrap();
         let dm = p.reach(&Who::new("u_wren", "Wren S"), &zen());
-        p.send_on(&dm, "u_wren", Said::words("are you there?")).unwrap();
+        p.send_on(&dm, "u_wren", Said::words("are you there?"))
+            .unwrap();
         p.mark_delivered_for("npc-1");
         let mut good = Said::words("good");
         good.to = Some("npc-1".into());

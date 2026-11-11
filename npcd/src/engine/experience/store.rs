@@ -171,7 +171,13 @@ impl Journals {
         }
     }
 
-    fn push(&self, bot: &JournalPath, kind: ExperienceKind, text: &str, about: Option<JournalPath>) {
+    fn push(
+        &self,
+        bot: &JournalPath,
+        kind: ExperienceKind,
+        text: &str,
+        about: Option<JournalPath>,
+    ) {
         let text = text.trim();
         if text.is_empty() {
             return;
@@ -232,7 +238,9 @@ impl Journals {
         let exists = |live: &Live| live.tree().is_ok_and(|t| t.get(bot).is_some());
         if !exists(&self.live) {
             let (Some(under), Some(name)) = (bot.parent(), bot.last()) else {
-                return Err(WriteError::Unavailable(format!("{bot} is not a bot's journal")));
+                return Err(WriteError::Unavailable(format!(
+                    "{bot} is not a bot's journal"
+                )));
             };
             let made = self.live.write(
                 &actor,
@@ -264,7 +272,9 @@ impl Journals {
 /// nearest journal name.
 pub fn bot_in(group: &Slug, body: &str) -> Option<JournalPath> {
     let name = Slug::slugify(body)?;
-    JournalPath::of_section(group, Section::Bots).child(name).ok()
+    JournalPath::of_section(group, Section::Bots)
+        .child(name)
+        .ok()
 }
 
 /// The journal of the person of `group` whose account has public handle
@@ -277,9 +287,11 @@ pub fn person_of(tree: &Tree, group: &Slug, handle: &str) -> Option<JournalPath>
         .map(|(person, _)| person)
         .find(|person| {
             tree.person_file(person).is_some_and(|p| {
-                p.accounts
-                    .iter()
-                    .any(|a| a.key.as_ref().is_some_and(|k| k.as_str().starts_with(short)))
+                p.accounts.iter().any(|a| {
+                    a.key
+                        .as_ref()
+                        .is_some_and(|k| k.as_str().starts_with(short))
+                })
             })
         })
         .and_then(|person| JournalPath::person(group, person).ok())
@@ -297,8 +309,14 @@ mod tests {
     fn a_bot_writes_under_its_group_s_bots_by_body() {
         let bot = bot_in(&slug("moon"), "npc-12").unwrap();
         assert_eq!(bot.show(), "@moon/bots/npc-12");
-        assert_eq!(bot_in(&slug("moon"), "Zen").unwrap().show(), "@moon/bots/zen");
-        assert_eq!(bot_in(&slug("moon"), WORLD).unwrap().show(), "@moon/bots/world");
+        assert_eq!(
+            bot_in(&slug("moon"), "Zen").unwrap().show(),
+            "@moon/bots/zen"
+        );
+        assert_eq!(
+            bot_in(&slug("moon"), WORLD).unwrap().show(),
+            "@moon/bots/world"
+        );
     }
 
     #[test]
@@ -307,7 +325,13 @@ mod tests {
         j.note("moon", "zen", ExperienceKind::Heard, "anything", None);
         assert!(j.buffer.take().is_empty());
         j.set_group("moon", Some(slug("moon")));
-        j.note("moon", "zen", ExperienceKind::Heard, "Mira, on the phone: hi", None);
+        j.note(
+            "moon",
+            "zen",
+            ExperienceKind::Heard,
+            "Mira, on the phone: hi",
+            None,
+        );
         j.note_world("moon", "The house was set to away mode.");
         let taken = j.buffer.take();
         let bots: Vec<String> = taken.keys().map(|p| p.show()).collect();
@@ -318,7 +342,13 @@ mod tests {
     fn a_flush_with_no_checkout_keeps_its_lines_and_drops_instructions() {
         let j = Journals::new();
         j.set_group("moon", Some(slug("moon")));
-        j.note("moon", "zen", ExperienceKind::Heard, "Mira, on the phone: hi", None);
+        j.note(
+            "moon",
+            "zen",
+            ExperienceKind::Heard,
+            "Mira, on the phone: hi",
+            None,
+        );
         j.note(
             "moon",
             "zen",

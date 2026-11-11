@@ -80,6 +80,7 @@ use crate::effector::router::address_of;
 use crate::effector::station;
 use crate::effector::token::Tokens;
 use crate::engine::act::Act;
+use crate::engine::agenda::{self, ordered::ORDERED_ACTS};
 use crate::engine::authoring;
 use crate::engine::authorize::{self, critical_compass};
 use crate::engine::bearings;
@@ -89,20 +90,13 @@ use crate::engine::compose;
 use crate::engine::driver::{self, Metronome};
 use crate::engine::environment::{self, Reach};
 use crate::engine::event::{Event, EventKind, Salience};
-use crate::engine::guardian::GuardianLog;
-use crate::engine::identity;
 use crate::engine::experience;
 use crate::engine::experience::concern::{concern, Change, Hears};
 use crate::engine::experience::days::Days;
 use crate::engine::experience::line::first_sentence;
 use crate::engine::experience::store::Journals;
-use crate::engine::talk::key::VISITOR;
-use journals::experience::ExperienceKind;
-use crate::engine::talk::authority::Changes;
-use crate::engine::talk::runner::Talks;
-use crate::engine::people;
-use crate::engine::talk::templates;
-use crate::engine::talk::voice::Post;
+use crate::engine::guardian::GuardianLog;
+use crate::engine::identity;
 use crate::engine::ingest;
 use crate::engine::invoke_body::Invokable;
 use crate::engine::journal::style::NPC;
@@ -123,12 +117,17 @@ use crate::engine::mission_gen::config::Config;
 use crate::engine::mission_gen::gates::{life_voice, Form};
 use crate::engine::mission_gen::material::strip_calls;
 use crate::engine::mission_gen::round;
+use crate::engine::people;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::prose::{decode_call, CallAsk, WORK_BAND};
 use crate::engine::reflect;
 use crate::engine::schema;
+use crate::engine::talk::authority::Changes;
+use crate::engine::talk::key::VISITOR;
+use crate::engine::talk::runner::Talks;
+use crate::engine::talk::templates;
+use crate::engine::talk::voice::Post;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
-use crate::engine::agenda::{self, ordered::ORDERED_ACTS};
 use crate::engine::tools::{self, Mode, Tool};
 use crate::engine::watcher::{is_ingestible, Ledger, Reconcile};
 use crate::engine::way::{self, Way};
@@ -162,6 +161,7 @@ use host::download::ensure_model_pack;
 use host::process::fatal;
 use host::stopping::{Ending, Stopping};
 use host::MODEL;
+use journals::experience::ExperienceKind;
 use npc_map::schema::NodeKind;
 use npc_map::world::Where;
 use npc_map::{describe, perceive, route};
@@ -2209,13 +2209,8 @@ impl Runtime {
         });
         if signed {
             let applied = format!("{name} signed off '{}'.", step.trim_end_matches('.'));
-            self.journals.note(
-                hosted.id(),
-                &body,
-                ExperienceKind::Mission,
-                &applied,
-                None,
-            );
+            self.journals
+                .note(hosted.id(), &body, ExperienceKind::Mission, &applied, None);
             self.tell(
                 npc_id,
                 self.world_ms(npc_id),
@@ -2686,7 +2681,9 @@ impl Runtime {
             // A new day is the world's news, told once by the member that
             // writes it, on the clock of any character in it.
             let clock = self.bodies.in_world(hosted.id()).first().map(|(id, _)| *id);
-            if let Some(line) = clock.and_then(|id| self.days.rolled(hosted.id(), self.world_ms(id))) {
+            if let Some(line) =
+                clock.and_then(|id| self.days.rolled(hosted.id(), self.world_ms(id)))
+            {
                 self.changed(hosted, Change::World { line });
             }
         }
@@ -2957,7 +2954,11 @@ impl Runtime {
 
     /// The conversation between a person and a character, oldest first: who
     /// said each line, by name, and its words.
-    pub fn messages_with(&self, npc_id: u64, from: &str) -> Option<(String, Vec<(String, String)>)> {
+    pub fn messages_with(
+        &self,
+        npc_id: u64,
+        from: &str,
+    ) -> Option<(String, Vec<(String, String)>)> {
         let (hosted, body) = self.body_of(npc_id)?;
         let them = hosted.read(|w| w.actor(&body).map(|a| a.name.clone()))?;
         let said = hosted.sim(|sim| {
@@ -7580,7 +7581,12 @@ mod tests {
         let hosted = rt.hosted.get(WORLD).expect("hosted");
 
         let sent = rt
-            .message_npc(1, &Who::new("u_john", "Johnathan Sharratt"), "are you there", None)
+            .message_npc(
+                1,
+                &Who::new("u_john", "Johnathan Sharratt"),
+                "are you there",
+                None,
+            )
             .expect("the character could be messaged");
         assert_eq!(sent.with, "Maker-01");
         assert_eq!(sent.waiting_for_them, 1, "it was not written to the thread");
@@ -7593,8 +7599,16 @@ mod tests {
         let moment = environment::advance(&hosted, &rt.bodies, &rt.scheduler, &|_| 0);
         assert_eq!(moment.messaged, 1, "the moment carried nothing to anybody");
 
-        assert_eq!(rt.talks.waiting(1), 1, "the line never reached the conversation");
-        assert_eq!(rt.scheduler.inbox_depth(1), Some(0), "the mind was handed it");
+        assert_eq!(
+            rt.talks.waiting(1),
+            1,
+            "the line never reached the conversation"
+        );
+        assert_eq!(
+            rt.scheduler.inbox_depth(1),
+            Some(0),
+            "the mind was handed it"
+        );
     }
 
     /// And it is handed over **once**. The sweep runs twice a second; a cursor
@@ -7605,7 +7619,12 @@ mod tests {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         let hosted = rt.hosted.get(WORLD).expect("hosted");
-        rt.message_npc(1, &Who::new("u_john", "Johnathan Sharratt"), "are you there", None);
+        rt.message_npc(
+            1,
+            &Who::new("u_john", "Johnathan Sharratt"),
+            "are you there",
+            None,
+        );
         rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
 
         assert_eq!(

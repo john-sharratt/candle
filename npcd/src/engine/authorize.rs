@@ -138,7 +138,10 @@ mod tests {
         assert!(!is_authorizer("Yen", &a), "a name is not an account");
         assert!(!is_authorizer("u_wick0003", &a));
         assert!(!is_authorizer("", &a));
-        assert!(!is_authorizer("u_yen00002", &[]), "nobody approves with no list");
+        assert!(
+            !is_authorizer("u_yen00002", &[]),
+            "nobody approves with no list"
+        );
     }
 
     #[test]

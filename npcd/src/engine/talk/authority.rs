@@ -28,7 +28,11 @@ impl Changes {
     }
 
     pub fn last(&self, npc: u64) -> Option<u64> {
-        self.at.lock().unwrap_or_else(|e| e.into_inner()).get(&npc).copied()
+        self.at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&npc)
+            .copied()
     }
 
     pub fn mark(&self, npc: u64, world_ms: u64) {
@@ -71,9 +75,7 @@ pub fn standing(party: &Party, owner: Option<&str>, authorizers: &[Authorizer]) 
 pub fn may_change(standing: Standing, last_changed_ms: Option<u64>, now_ms: u64) -> bool {
     match standing {
         Standing::Owner => true,
-        Standing::Authorizer => {
-            last_changed_ms.is_none_or(|at| now_ms >= at + CHANGE_COOLDOWN_MS)
-        }
+        Standing::Authorizer => last_changed_ms.is_none_or(|at| now_ms >= at + CHANGE_COOLDOWN_MS),
         Standing::Nobody => false,
     }
 }
@@ -92,23 +94,45 @@ mod tests {
             account: "u_mira0002".into(),
             name: "Mira".into(),
         }];
-        assert_eq!(standing(&john(), Some("u_john0001"), &authorizers), Standing::Owner);
         assert_eq!(
-            standing(&Party::Person("u_mira0002".into()), Some("u_john0001"), &authorizers),
+            standing(&john(), Some("u_john0001"), &authorizers),
+            Standing::Owner
+        );
+        assert_eq!(
+            standing(
+                &Party::Person("u_mira0002".into()),
+                Some("u_john0001"),
+                &authorizers
+            ),
             Standing::Authorizer
         );
         assert_eq!(
-            standing(&Party::Person("u_stranger".into()), Some("u_john0001"), &authorizers),
+            standing(
+                &Party::Person("u_stranger".into()),
+                Some("u_john0001"),
+                &authorizers
+            ),
             Standing::Nobody
         );
-        assert_eq!(standing(&Party::Npc(7), None, &authorizers), Standing::Nobody);
+        assert_eq!(
+            standing(&Party::Npc(7), None, &authorizers),
+            Standing::Nobody
+        );
     }
 
     #[test]
     fn an_authorizer_waits_out_the_cooldown_and_the_owner_never_does() {
         assert!(may_change(Standing::Authorizer, None, 0));
-        assert!(!may_change(Standing::Authorizer, Some(1_000), 1_000 + CHANGE_COOLDOWN_MS - 1));
-        assert!(may_change(Standing::Authorizer, Some(1_000), 1_000 + CHANGE_COOLDOWN_MS));
+        assert!(!may_change(
+            Standing::Authorizer,
+            Some(1_000),
+            1_000 + CHANGE_COOLDOWN_MS - 1
+        ));
+        assert!(may_change(
+            Standing::Authorizer,
+            Some(1_000),
+            1_000 + CHANGE_COOLDOWN_MS
+        ));
         assert!(may_change(Standing::Owner, Some(1_000), 1_001));
         assert!(!may_change(Standing::Nobody, None, 0));
     }

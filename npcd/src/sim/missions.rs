@@ -34,10 +34,10 @@ use serde::{Deserialize, Serialize};
 
 use super::agenda::{Agendum, Priority, KEEP};
 use super::kept_steps::kept_steps;
-use crate::engine::authorize::Authorizer;
 use super::operations::{Operation, Operations};
 use super::orders::{Filed, Notice, Orders, EVERY_POSTER};
 use super::round::RoundState;
+use crate::engine::authorize::Authorizer;
 use crate::engine::mission::bank::{self, Duty, Facts};
 use crate::engine::mission::{Mission, MissionPrompt, Origin, Outcome, StepOutcome};
 use crate::engine::mission_gen::round::{Item as RoundItem, STALE_MS};
