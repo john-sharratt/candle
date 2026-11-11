@@ -60,7 +60,7 @@ impl IngestScope {
     /// conversation's journal in the memory — what a session's calls wrote,
     /// which no other conversation retrieves
     /// (`docs/zen_memory_and_guides.md` D3) — or anything under the memory's
-    /// `diaries/`, sealed and no one's to read (`docs/private_mode.md` §5.2).
+    /// `.diaries/`, sealed and no one's to read (`docs/private_mode.md` §5.2).
     pub fn admits(&self, repo: &str, path: &str, size: u64) -> Option<Language> {
         if size > MAX_FILE_BYTES || path.split('/').any(|c| c.starts_with('.')) {
             return None;
@@ -182,12 +182,12 @@ mod tests {
         );
     }
 
-    /// **Nothing under the memory's `diaries/` is ingested**, whatever its
+    /// **Nothing under the memory's `.diaries/` is ingested**, whatever its
     /// name says it is.
     #[test]
     fn nothing_under_the_memorys_diaries_is_read() {
         let s = IngestScope::new("", None);
-        for path in ["diaries/salt", "diaries/notes.md", "diaries/x.yaml"] {
+        for path in [".diaries/salt", ".diaries/notes.md", ".diaries/x.yaml"] {
             assert_eq!(s.admits("journals", path, 10), None, "{path}");
         }
         assert_eq!(

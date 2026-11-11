@@ -203,11 +203,16 @@ Write, refused while private:
 
 ### 5.2 Storage
 
-In the journals repository, one encrypted file per diary:
+In the journals repository, one encrypted file per diary, in a folder hidden by
+its leading dot so that no listing names it — a folder's children, a file list,
+an ingest and a folder unit's key all pass over what starts with a dot. A
+listing that named the folder changed the key of the repository root's
+priming-chain link the day the first diary was written:
 
-- `diaries/<diary_id>.bin`, where `diary_id` is 16 random bytes in hex — it
-  says nothing of the topic.
-- `diaries/salt`: one repository-wide random salt (16 bytes), created with the
+- `.diaries/<diary_id>.bin`, where `diary_id` is 16 random bytes in hex — it
+  says nothing of the topic. A file is bound to its id, never to its folder
+  (§5.3), so moving the folder leaves every diary readable.
+- `.diaries/salt`: one repository-wide random salt (16 bytes), created with the
   first diary.
 - Each write rewrites that diary's whole file, re-encrypted under a fresh
   nonce. A file shows only its padded size and its commit times; how many
@@ -216,12 +221,12 @@ In the journals repository, one encrypted file per diary:
 - Each commit's message is `diaries: update`, with one trailer,
   `Journal-Diaries: update`, by which a replay recognises it — no ids, no
   topic.
-- **The journal service treats `diaries/` as opaque**: the tree load skips it
+- **The journal service treats `.diaries/` as opaque**: the tree load skips it
   (`journals::tree::load`), so folds, summaries, voice digests, cues,
   `journal_grep`, `get_user_context` and every index — all of which read the
   tree — never see it; `journals check` passes over it; zend's branch ingest
   admits nothing under it; and retrieval never reads it. Tests hold each.
-- A diary commit not yet on origin is replayed by copying its `diaries/`
+- A diary commit not yet on origin is replayed by copying its `.diaries/`
   files onto the new base: each write is the whole file, so the last one
   stands. One dropped because origin keeps another salt (§5.3) drops every
   diary commit after it too: they were sealed under the same lost salt.
@@ -355,7 +360,7 @@ conversation.
 **Footprint**: a private `get_user_context` opens no conversation journal; a
 normal one opens none until the first write; no episode is recorded for a
 private ref; no log line carries a `diary_*` argument or result, and no
-private call is logged; `diaries/` is read by no fold, summary, grep, cue,
+private call is logged; `.diaries/` is read by no fold, summary, grep, cue,
 index or `get_user_context`, by no ingest and by no retrieval.
 
 **Diaries**: refused under a normal ref; `diary_open` with an unknown

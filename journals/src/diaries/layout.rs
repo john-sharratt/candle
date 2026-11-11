@@ -1,18 +1,21 @@
 //! Where diaries live in the journal repository (`docs/private_mode.md`
-//! §5.2): one file per diary, `diaries/<id>.bin`, named by a random id that
+//! §5.2): one file per diary, `.diaries/<id>.bin`, named by a random id that
 //! says nothing of its topic, and one salt every passphrase is stretched
-//! with, `diaries/salt`.
+//! with, `.diaries/salt`.
 
 use std::fmt;
 
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 
-/// The folder diaries are kept in, at the top of the repository.
-pub const DIR: &str = "diaries";
+/// The folder diaries are kept in, at the top of the repository. Hidden by
+/// its leading dot, so no listing of the repository names it: a folder's
+/// children, a file list, an ingest and a folder unit's key all pass over
+/// what starts with a dot.
+pub const DIR: &str = ".diaries";
 
 /// The repository's one salt.
-pub const SALT: &str = "diaries/salt";
+pub const SALT: &str = ".diaries/salt";
 
 /// How long the salt is, in bytes.
 pub const SALT_LEN: usize = 16;
@@ -93,11 +96,15 @@ mod tests {
     #[test]
     fn a_diary_is_kept_under_its_hex_id() {
         let id = DiaryId([0xab; 16]);
-        assert_eq!(id.path(), format!("diaries/{}.bin", "ab".repeat(16)));
+        assert_eq!(id.path(), format!(".diaries/{}.bin", "ab".repeat(16)));
         assert_eq!(DiaryId::of_path(&id.path()), Some(id));
-        assert_eq!(DiaryId::of_path("diaries/salt"), None);
+        assert_eq!(DiaryId::of_path(".diaries/salt"), None);
         assert_eq!(
-            DiaryId::of_path(&format!("diaries/{}.bin", "AB".repeat(16))),
+            DiaryId::of_path(&format!(".diaries/{}.bin", "AB".repeat(16))),
+            None
+        );
+        assert_eq!(
+            DiaryId::of_path(&format!("diaries/{}.bin", "ab".repeat(16))),
             None
         );
         assert_eq!(
@@ -109,10 +116,11 @@ mod tests {
 
     #[test]
     fn only_what_is_under_the_folder_is_in_diaries() {
-        assert!(in_diaries("diaries/salt"));
-        assert!(in_diaries("diaries/x.bin"));
-        assert!(in_diaries("diaries"));
-        assert!(!in_diaries("diariesx/salt"));
-        assert!(!in_diaries("groups/zen/diaries/x"));
+        assert!(in_diaries(".diaries/salt"));
+        assert!(in_diaries(".diaries/x.bin"));
+        assert!(in_diaries(".diaries"));
+        assert!(!in_diaries(".diariesx/salt"));
+        assert!(!in_diaries("diaries/salt"));
+        assert!(!in_diaries("groups/zen/.diaries/x"));
     }
 }

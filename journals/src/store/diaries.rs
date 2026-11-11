@@ -36,9 +36,9 @@ impl Store {
         self.files.get(SALT).map(Vec::as_slice)
     }
 
-    /// Write `changes` — every one a file under `diaries/` — as one commit
+    /// Write `changes` — every one a file under `.diaries/` — as one commit
     /// onto the service's head, which the next sync pushes. The tree is
-    /// unchanged: it never reads `diaries/`.
+    /// unchanged: it never reads `.diaries/`.
     pub fn write_diaries(&mut self, changes: &Changes) -> Result<(), StoreError> {
         if let Some(path) = changes.keys().find(|p| !in_diaries(p)) {
             return Err(Error::refused(format!("{path} is no diary's file")).into());
