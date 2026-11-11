@@ -56,3 +56,7 @@ zend:
 npcd:
   mind_repo: battle-mind
   data: ../npcd-data
+  # Its own clone of the journals repository, the agent's `journals-npcd`
+  # checkout: where a world naming a journals group writes its characters'
+  # experience (docs/npc_conversations.md §5.0).
+  journals_dir: D:/agent/journals-npcd

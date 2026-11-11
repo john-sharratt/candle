@@ -222,7 +222,17 @@ mod tests {
         assert_eq!(laptop.host.clusters, shipped.host.clusters);
         assert_eq!(laptop.host.cluster_name, shipped.host.cluster_name);
         assert_eq!(laptop.zend, shipped.zend);
-        assert_eq!(laptop.npcd, shipped.npcd);
+        // The same tenant, but its journals checkout is on the machine's own
+        // agent.
+        let anywhere = |npcd: &NpcdArgs| NpcdArgs {
+            journals_dir: None,
+            ..npcd.clone()
+        };
+        assert_eq!(anywhere(&laptop.npcd), anywhere(&shipped.npcd));
+        assert_eq!(
+            shipped.npcd.journals_dir.as_deref(),
+            Some(Path::new("D:/agent/journals-npcd"))
+        );
     }
 
     /// A key no section knows is refused, naming the file — a misspelt

@@ -27,6 +27,13 @@ checkouts:
     dir: D:/agent/journals
     push: true
     journal: true
+  # npcd's own clone of the journals repository (docs/npc_conversations.md
+  # §5.0): its bots' experience is written from here, as motherd.yaml's
+  # `journals_dir`. A store commits on a private ref, so it never shares
+  # zend's checkout; the two meet through origin.
+  - name: journals-npcd
+    dir: D:/agent/journals-npcd
+    push: true
   # Yen Bots (docs/yenbot_app_host.md §4, §5.5): built and released here by
   # `service_deploy {service: yenbot}`; its live checkout is the service's own.
   - name: yenbot

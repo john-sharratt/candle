@@ -28,3 +28,5 @@ zend:
 npcd:
   mind_repo: battle-mind
   data: ../npcd-data
+  # The laptop agent's `journals-npcd` checkout.
+  journals_dir: C:/Users/johna/prog/agent/journals-npcd
