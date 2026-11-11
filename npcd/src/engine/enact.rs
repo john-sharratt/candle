@@ -24,6 +24,7 @@
 use npc_map::world::Where;
 use serde_json::{Map, Value};
 
+use crate::authority::ops::Voiced;
 use crate::engine::act::Act;
 use crate::engine::body::{destinations, refusal, rooms, Outcome};
 use crate::engine::survey;
@@ -80,7 +81,7 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
 
 /// [`perform`], where `said` is the line the lease holder voiced for a phone
 /// act — what lands on the thread in place of its intent.
-pub fn perform_said(hosted: &Hosted, body: &str, act: &Act, said: Option<&str>) -> Outcome {
+pub fn perform_said(hosted: &Hosted, body: &str, act: &Act, said: Option<&Voiced>) -> Outcome {
     let a = &act.args;
     match act.tool {
         "act" => act_on(hosted, body, a),
@@ -1066,13 +1067,15 @@ fn via(args: &Map<String, Value>) -> Result<ThreadKind, Outcome> {
 }
 
 /// The words a phone act puts on a thread: the line the lease holder voiced
-/// for it, carried with the act (`docs/npc_conversations.md` §7.1). An act
-/// made without one — a program calling a device route with the words it
-/// means — says its `intent` as given.
-fn words(said: Option<&str>, intent: &str) -> Said {
+/// for it, carried with the act, and the critical step it asks an authorizer
+/// for (`docs/npc_conversations.md` §7.1, §7.2). An act made without one — a
+/// program calling a device route with the words it means — says its
+/// `intent` as given.
+fn words(said: Option<&Voiced>, intent: &str) -> Said {
     Said {
-        text: said.unwrap_or(intent).trim().to_string(),
+        text: said.map_or(intent, |v| v.text.as_str()).trim().to_string(),
         intent: said.map(|_| intent.to_string()),
+        requests: said.and_then(|v| v.requests.clone()),
         ..Said::default()
     }
 }
@@ -1091,7 +1094,7 @@ fn message(
     body: &str,
     args: &Map<String, Value>,
     kind: Option<ThreadKind>,
-    said: Option<&str>,
+    said: Option<&Voiced>,
 ) -> Outcome {
     let (Some(to), Some(intent)) = (text(args, "to"), text(args, "intent")) else {
         return Outcome::Refused(
@@ -1189,7 +1192,7 @@ fn open_group(
     hosted: &Hosted,
     body: &str,
     args: &Map<String, Value>,
-    said: Option<&str>,
+    said: Option<&Voiced>,
 ) -> Outcome {
     let (Some(called), Some(with)) = (text(args, "called"), text(args, "with")) else {
         return Outcome::Refused("A group needs a name and somebody to be on it.".into());
@@ -1242,7 +1245,7 @@ fn open_group(
 /// line either side says opens it again on the same thread
 /// (`docs/npc_conversations.md` §4.3, §11.1). On a group it is leaving: the
 /// parting is said, then the character goes.
-fn sign_off(hosted: &Hosted, body: &str, args: &Map<String, Value>, said: Option<&str>) -> Outcome {
+fn sign_off(hosted: &Hosted, body: &str, args: &Map<String, Value>, said: Option<&Voiced>) -> Outcome {
     let (Some(to), Some(intent)) = (text(args, "to"), text(args, "intent")) else {
         return Outcome::Refused(
             "You meant to go, but not from which conversation, or not why.".into(),

@@ -11,6 +11,7 @@
 //! | [`decide`] | where a decision's words go, and the decision restated |
 //! | [`guard`] | the conversation's own guards |
 //! | [`key`] | who a conversation is with, and its timeline |
+//! | [`orders`] | its mission acts, checked and applied where they land |
 //! | [`runner`] | every conversation held here, and whose turn is due |
 //! | [`state`] | what a conversation keeps between turns |
 //! | [`templates`] | the response templates a turn's words are shaped by |
@@ -25,6 +26,7 @@ pub mod critical;
 pub mod decide;
 pub mod guard;
 pub mod key;
+pub mod orders;
 pub mod runner;
 pub mod state;
 pub mod templates;

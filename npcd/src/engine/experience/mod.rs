@@ -10,11 +10,13 @@
 //! |---|---|
 //! | [`buffer`] | the unwritten lines, per bot, and their caps |
 //! | [`concern`] | which journals hear of a change in the world |
+//! | [`days`] | the world's day rolling over |
 //! | [`line`] | how each kind of line reads |
 //! | [`store`] | the checkout, the per-world groups, the flush |
 
 pub mod buffer;
 pub mod concern;
+pub mod days;
 pub mod line;
 pub mod store;
 
@@ -39,8 +41,12 @@ pub fn notable(tool: &str) -> bool {
         "file_edit",
         "compose",
         "onboard_part",
+        "onboard_thing",
         "link_part",
         "offboard_part",
+        "discover_door",
+        "undiscover_door",
+        "describe_room",
         "pair_device",
         "wake_device",
     ];
@@ -55,7 +61,16 @@ mod tests {
 
     #[test]
     fn what_changes_the_world_is_notable_and_nothing_else_is() {
-        for yes in ["give", "house_mode", "sonos_pause", "wiz_on", "report_done", "file_write"] {
+        for yes in [
+            "give",
+            "house_mode",
+            "sonos_pause",
+            "wiz_on",
+            "report_done",
+            "file_write",
+            "discover_door",
+            "describe_room",
+        ] {
             assert!(notable(yes), "{yes}");
         }
         for no in ["move_to", "wait", "tell", "message", "reply", "reflect", "sonos_status"] {

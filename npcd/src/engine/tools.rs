@@ -51,7 +51,7 @@ use candle_conversation::stencil::{Param as StencilParam, ParamType, Pick, ToolS
 use serde::Serialize;
 
 use crate::bridge::BRIDGE_ACTS;
-use crate::engine::agenda::AGENDA_ACTS;
+use crate::engine::agenda::{self, ordered, AGENDA_ACTS};
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::invoke_body::{self, Invokable};
 use crate::engine::zen_task::TASK_ACTS;
@@ -1299,7 +1299,7 @@ pub fn install<'a>(
     let mut n = 0;
     for t in tools {
         let id = builder
-            .add_section_to_collection(cid, member(t.name), entry(t), 100.0)
+            .add_section_to_collection(cid, member_of(t), entry(t), 100.0)
             .map_err(|e| anyhow::anyhow!("installing `{}` into `{COLLECTION}`: {e}", t.name))?;
         if routed(t.name) {
             builder
@@ -1310,13 +1310,6 @@ pub fn install<'a>(
         installed(n, t);
     }
     Ok(n)
-}
-
-/// Offer these tools on a turn, replacing whatever it offered before; the
-/// collection shows the most relevant of them. A name that was never installed
-/// offers nothing.
-fn offer<'a>(selection: &mut SelectionState, tools: impl IntoIterator<Item = &'a str>) {
-    selection.select_all(COLLECTION, tools.into_iter().map(member));
 }
 
 /// Show exactly these tools on a turn, replacing whatever it showed before,
@@ -1349,7 +1342,36 @@ pub fn show_within(selection: &mut SelectionState, mode: Mode, within: &Within) 
             names.push(act);
         }
     }
-    offer(selection, names);
+    // Offered, replacing whatever the turn offered before; the collection
+    // shows the most relevant of them. A name that was never installed offers
+    // nothing.
+    let members: Vec<String> = names
+        .into_iter()
+        .map(|name| match by_name(name) {
+            Some(t) => member_of(variant(t, within)),
+            None => member(name),
+        })
+        .collect();
+    selection.select_all(COLLECTION, members);
+}
+
+/// The act `t` is for a character standing *here*: an ordered body's
+/// mission acts in place of the agenda's of the same names
+/// ([`agenda::ordered`]), and every other act as it is.
+pub fn variant(t: &'static Tool, within: &Within) -> &'static Tool {
+    match within.orders && agenda::is_mine(t.name) {
+        true => ordered::counterpart(t.name).unwrap_or(t),
+        false => t,
+    }
+}
+
+/// The prompt member `t` is installed under: its name, or for an ordered
+/// mission act, a member of its own beside the agenda's.
+pub fn member_of(t: &Tool) -> String {
+    match ordered::is_ordered(t) {
+        true => format!("{COLLECTION}/{}", ordered::member(t.name)),
+        false => member(t.name),
+    }
 }
 
 /// How many acts one turn may contain.
@@ -1447,6 +1469,20 @@ pub const ACT_VALUE_TOKENS: u32 = 1024;
 /// at — the probe, and the tests.
 pub fn specs() -> Vec<ToolSpec> {
     specs_within(Mode::Physical, &Within::nowhere())
+}
+
+/// [`specs`] with an ordered body's mission acts in place of the agenda's
+/// ([`agenda::ordered`]): the catalog a conversation's call for a character
+/// that takes orders is read against where it lands, which has no `Within`
+/// of the turn that decided it.
+pub fn specs_ordered() -> Vec<ToolSpec> {
+    specs_within(
+        Mode::Physical,
+        &Within {
+            orders: true,
+            ..Within::nowhere()
+        },
+    )
 }
 
 /// Where a parameter's permitted values come from.
@@ -2154,6 +2190,11 @@ pub struct Within {
     /// The priorities an agenda takes, for a character that keeps one —
     /// [`Choices::Priorities`].
     pub priorities: Vec<String>,
+    /// Whether this is a character that takes orders, whose mission a
+    /// conversation's party may change: its mission acts are the ordered
+    /// ones ([`agenda::ordered`]), and [`Self::agenda`] holds the brief of
+    /// the mission it carries.
+    pub orders: bool,
     /// The subset of [`Self::threads`] it is able to leave — see
     /// [`Choices::Leavable`].
     pub leavable: Vec<String>,
@@ -2381,6 +2422,7 @@ impl Within {
 pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
     CATALOG
         .iter()
+        .map(|t| variant(t, within))
         // **An act that has migrated to the effector device is not in the
         // grammar** — it is reached by `invoke` on its resource, not
         // offered as a compiled call (effector design Step 6). The `Tool` stays
@@ -2604,7 +2646,7 @@ const BROUGHT_CHOICES: &[(&str, &str, &str, Choices)] = &[
 ];
 
 /// Every field some value of `tool`'s choices brings. See [`BRINGS`].
-fn brought(tool: &str) -> Vec<&'static str> {
+pub(crate) fn brought(tool: &str) -> Vec<&'static str> {
     BRINGS
         .iter()
         .filter(|(t, _, _)| *t == tool)
@@ -3518,6 +3560,7 @@ mod tests {
             name: "friend-0",
             owed: vec!["the garden report".into(), "the key".into()],
             may_change_mission: true,
+            carried: None,
             capped: false,
             cooling: Vec::new(),
         });

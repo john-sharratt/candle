@@ -72,7 +72,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, json, to_string, to_vec, Value};
 use tower::ServiceExt;
 
-use crate::authority::ops::{ActSource, WorldOp};
+use crate::authority::ops::{ActSource, Voiced, WorldOp};
 use crate::authority::told::Told;
 use crate::authority::{Role, Standing};
 use crate::effector::auth::PinnedStandpoint;
@@ -93,6 +93,7 @@ use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
 use crate::engine::experience;
 use crate::engine::experience::concern::{concern, Change, Hears};
+use crate::engine::experience::days::Days;
 use crate::engine::experience::line::first_sentence;
 use crate::engine::experience::store::Journals;
 use crate::engine::talk::key::VISITOR;
@@ -101,6 +102,7 @@ use crate::engine::talk::authority::Changes;
 use crate::engine::talk::runner::Talks;
 use crate::engine::people;
 use crate::engine::talk::templates;
+use crate::engine::talk::voice::Post;
 use crate::engine::ingest;
 use crate::engine::invoke_body::Invokable;
 use crate::engine::journal::style::NPC;
@@ -126,6 +128,7 @@ use crate::engine::prose::{decode_call, CallAsk, WORK_BAND};
 use crate::engine::reflect;
 use crate::engine::schema;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
+use crate::engine::agenda::{self, ordered::ORDERED_ACTS};
 use crate::engine::tools::{self, Mode, Tool};
 use crate::engine::watcher::{is_ingestible, Ledger, Reconcile};
 use crate::engine::way::{self, Way};
@@ -446,6 +449,9 @@ pub struct Runtime {
     pub talks: Arc<Talks>,
     /// When each character's mission last changed through a conversation.
     pub talk_changes: Changes,
+    /// The day each world this member writes was last seen in, so its
+    /// journal hears once of a new one.
+    days: Days,
     /// The mind repository, loaded and followed, with `--mind-repo`.
     mind_repos: OnceLock<Repos>,
     /// How a device-bridge job reaches an agent (`docs/zen_moon_mind.md` §15):
@@ -1028,6 +1034,7 @@ impl Runtime {
             journals: Journals::new(),
             talks: Arc::new(Talks::new()),
             talk_changes: Changes::new(),
+            days: Days::new(),
             mind_repos: OnceLock::new(),
             agents: OnceLock::new(),
             relaunch: OnceLock::new(),
@@ -2676,6 +2683,12 @@ impl Runtime {
             for notice in hosted.with_sim(|s| s.missions.take_notices()) {
                 self.give_notice(hosted, notice);
             }
+            // A new day is the world's news, told once by the member that
+            // writes it, on the clock of any character in it.
+            let clock = self.bodies.in_world(hosted.id()).first().map(|(id, _)| *id);
+            if let Some(line) = clock.and_then(|id| self.days.rolled(hosted.id(), self.world_ms(id))) {
+                self.changed(hosted, Change::World { line });
+            }
         }
         self.keep_visitors_with_their_hosts(hosted);
         self.show_out_the_expired();
@@ -3162,7 +3175,7 @@ impl Runtime {
         &self,
         npc_id: u64,
         act: &Act,
-        said: Option<&str>,
+        said: Option<&Voiced>,
         source: &ActSource,
     ) -> Outcome {
         if !body::is_of_the_body(act.tool) {
@@ -3179,6 +3192,11 @@ impl Runtime {
         // The actor is not left in the dark meanwhile: a refusal comes back in
         // the same turn, which is the whole reason it is rendered rather than
         // logged.
+        // A conversation's mission act is checked again where it lands, and
+        // an ordered body's is its own (`engine::talk::orders`).
+        if let (true, ActSource::Talk { party }) = (agenda::is_mine(act.tool), source) {
+            return self.talk_mission_act(npc_id, &hosted, &body, act, party, said);
+        }
         let done = body::perform_said(&hosted, &body, act, said);
         // **Only what actually happened costs a wait.** A refused act is not a
         // thing the body did, and charging for one would leave a character that
@@ -3239,7 +3257,7 @@ impl Runtime {
         &self,
         npc_id: u64,
         act: &Act,
-        said: Option<&str>,
+        said: Option<&Voiced>,
         source: &ActSource,
     ) -> Recorded {
         let outcome = self.act_on_world_said(npc_id, act, said, source);
@@ -5266,7 +5284,11 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     // grammar is compiled from — so the list a character reads and the mask it
     // decodes under are one computation and cannot disagree.
     p.set_step(LoadStep::Tools);
-    let acts: Vec<&Tool> = tools::CATALOG.iter().chain(reflect::ASKED).collect();
+    let acts: Vec<&Tool> = tools::CATALOG
+        .iter()
+        .chain(ORDERED_ACTS)
+        .chain(reflect::ASKED)
+        .collect();
     let total = acts.len() as u64;
     p.set_progress(0, total);
     if let Some(built) = projection.as_mut() {
@@ -6842,18 +6864,31 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                             // A post on a group is said in the character's
                             // own words, decoded here before the act goes to
                             // the world; one whose words could not be decoded
-                            // is refused, never posted as its intent.
+                            // is refused, never posted as its intent, and
+                            // one saying again what it just said there is
+                            // refused before it is posted.
                             let performed = match rt.voice_post(id, a).await {
-                                Ok(said) => {
+                                Ok(Post::None) => {
                                     rt.perform_said(
                                         id,
                                         a,
                                         pinned_at.as_ref(),
-                                        said.as_deref(),
+                                        None,
                                         &ActSource::Mind,
                                     )
                                     .await
                                 }
+                                Ok(Post::Words(said)) => {
+                                    rt.perform_said(
+                                        id,
+                                        a,
+                                        pinned_at.as_ref(),
+                                        Some(&said),
+                                        &ActSource::Mind,
+                                    )
+                                    .await
+                                }
+                                Ok(Post::Repeat) => rt.repeated(a),
                                 Err(e) => rt.unvoiced(a, &format!("{e:#}")),
                             };
                             let r = performed.recorded;

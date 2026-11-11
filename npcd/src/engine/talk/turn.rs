@@ -17,7 +17,7 @@ use journals::time::Stamp;
 use serde_json::Map;
 
 use crate::api::now_ms;
-use crate::authority::ops::{ActSource, OpReply, WorldOp};
+use crate::authority::ops::{ActSource, OpReply, Voiced, WorldOp};
 use crate::engine::act::Act;
 use crate::engine::event::{EventKind, Salience, TalkLine};
 use crate::engine::experience::line;
@@ -237,10 +237,17 @@ impl Runtime {
         let owner = self
             .npcs()
             .and_then(|n| n.view().payload(npc).map(|p| p.owner_id.clone()));
-        let (authorizers, owed) = hosted.sim(|s| {
+        let (authorizers, owed, carried) = hosted.sim(|s| {
+            // What a character that takes orders carries is what its ordered
+            // mission acts name.
+            let carried = match s.missions.is_unordered(&body) {
+                true => None,
+                false => s.missions.active(&body).map(|m| m.mission_text()),
+            };
             (
                 s.missions.authorizers().to_vec(),
                 s.owed_to(&seen.me, &seen.party_name),
+                carried,
             )
         });
         let standing = authority::standing(&party, owner.as_deref(), &authorizers);
@@ -253,6 +260,7 @@ impl Runtime {
                 self.talk_changes.last(npc),
                 world_ms,
             ),
+            carried,
             capped: guard::capped(&party, state.activation),
             cooling: guard::cooling(&party, seen.last_said_ms, now_ms()),
         });
@@ -321,7 +329,8 @@ impl Runtime {
             )
             .await?;
 
-        // What it decided reaches the world as a conversation's acts.
+        // What it decided reaches the world as a conversation's acts, through
+        // the world's authority wherever that runs (§7.1).
         let source = ActSource::Talk {
             party: member.to_string(),
         };
@@ -332,7 +341,7 @@ impl Runtime {
             .iter()
             .filter(|a| !matches!(a.tool, "reply" | "sign_off" | "reflect"))
         {
-            let done = self.record_act_said(npc, act, None, &source);
+            let done = self.perform_said(npc, act, None, None, &source).await.recorded;
             if !done.landed {
                 continue;
             }
@@ -349,6 +358,8 @@ impl Runtime {
                     );
                     elsewhere.push(promised);
                 }
+                // Marked here too: the authority's mark is on its own member,
+                // and this one offers the next turn's acts.
                 t if t.starts_with("mission_") => {
                     self.talk_changes.mark(npc, world_ms);
                     elsewhere.push(done.answer.clone());
@@ -364,18 +375,28 @@ impl Runtime {
         let own: Vec<&str> = seen.own_last.iter().map(String::as_str).collect();
         let words = guard::words_for(&seen.party_name, &own, &spoken.words);
         let decided = |tool: &str| spoken.acts.iter().rev().find(|a| a.tool == tool).cloned();
+        // A line said while a critical step waits on the party asks them for
+        // it (§7.2).
+        let voiced = |w: String| Voiced {
+            text: w,
+            requests: state.pending_critical.clone(),
+        };
         let ended = match (spoken.to, words) {
             (Destination::Reply, Words::Send(w)) => {
                 let act = decided("reply").unwrap_or_else(|| to_party("reply", &seen.party_name));
-                self.say_to_party(npc, &act, &w, &source, &world, &body, &seen, about.clone())?;
-                elsewhere.push(format!("You said: {w}"));
+                let said = voiced(w);
+                self.say_to_party(npc, &act, &said, &source, &world, &body, &seen, about.clone())
+                    .await?;
+                elsewhere.push(format!("You said: {}", said.text));
                 Ended::Spoke
             }
             (Destination::Parting, Words::Send(w)) => {
                 let act =
                     decided("sign_off").unwrap_or_else(|| to_party("sign_off", &seen.party_name));
-                self.say_to_party(npc, &act, &w, &source, &world, &body, &seen, about.clone())?;
-                elsewhere.push(format!("You said goodbye: {w}"));
+                let said = voiced(w);
+                self.say_to_party(npc, &act, &said, &source, &world, &body, &seen, about.clone())
+                    .await?;
+                elsewhere.push(format!("You said goodbye: {}", said.text));
                 state.open = false;
                 Ended::Quiet
             }
@@ -384,9 +405,17 @@ impl Runtime {
                     .note(&world, &body, ExperienceKind::Wrote, &w, about.clone());
                 elsewhere.push(format!("You wrote down: {w}"));
                 // Read through what it took in, so the party's typing
-                // indicator stops (§8).
+                // indicator stops (§8) — on the authority, which writes the
+                // thread and runs the indicator.
                 if let Some(seq) = lines.iter().map(|l| l.seq).max() {
-                    hosted.with_sim(|s| s.threads.read_through(&body, &seen.thread, seq));
+                    let op = WorldOp::ReadThrough {
+                        npc,
+                        thread: seen.thread.clone(),
+                        seq,
+                    };
+                    if let Err(e) = self.world_write(&world, op).await {
+                        tracing::warn!(npc, "a conversation's read did not reach its world: {e:#}");
+                    }
                 }
                 Ended::Quiet
             }
@@ -453,18 +482,21 @@ impl Runtime {
     /// Put the conversation's words on the pair's thread as `act`, and write
     /// them down as said.
     #[allow(clippy::too_many_arguments)]
-    fn say_to_party(
+    async fn say_to_party(
         &self,
         npc: u64,
         act: &Act,
-        words: &str,
+        said: &Voiced,
         source: &ActSource,
         world: &str,
         body: &str,
         seen: &OnTheThread,
         about: Option<JournalPath>,
     ) -> anyhow::Result<()> {
-        let done = self.record_act_said(npc, act, Some(words), source);
+        let done = self
+            .perform_said(npc, act, None, Some(said), source)
+            .await
+            .recorded;
         if !done.landed {
             anyhow::bail!("the conversation's words did not land: {}", done.answer);
         }
@@ -472,7 +504,7 @@ impl Runtime {
             world,
             body,
             ExperienceKind::Said,
-            &line::said(&seen.party_name, &line::on_thread(true, ""), words),
+            &line::said(&seen.party_name, &line::on_thread(true, ""), &said.text),
             about,
         );
         Ok(())

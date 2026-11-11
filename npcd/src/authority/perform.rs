@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use axum::http::Method;
 use host::cluster::up::request_up;
+use journals::experience::ExperienceKind;
 use std::collections::BTreeMap;
 
 use npc_map::mutate::MapEdit;
@@ -18,15 +19,18 @@ use crate::world::Hosted;
 
 use super::forward::{act_of, call_line};
 use super::npc_lease::{hand_back, released};
-use super::ops::{ActSource, Decided, OpReply, WorldOp};
+use super::ops::{ActSource, Decided, OpReply, Voiced, WorldOp};
 use crate::api::now_ms;
 use crate::bridge;
 use crate::discord::server::apply::channel_message;
 use crate::discord::world::apply::mirrored_message;
+use crate::effector::reshape::reshape_here;
 use crate::engine::act::Act;
 use crate::engine::event::{EventKind, Salience};
+use crate::engine::experience;
 use crate::engine::experience::concern::Change;
 use crate::engine::experience::line::first_sentence;
+use crate::engine::loopguard::NUDGE;
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::{Recorded, Runtime, REFUSED};
 use crate::engine::{body, build, tools, zen_task};
@@ -126,7 +130,17 @@ impl Runtime {
                 // one — the list the sender's grammar was drawn from, and the
                 // one `specs_within` is the room-narrowed fallback of. What it
                 // decides here is only where a function block's values end.
-                let act = act_of(&call, &tools::specs()).map_err(|why| anyhow::anyhow!("{why}"))?;
+                // A conversation's call for a character that takes orders was
+                // decoded against the ordered mission acts.
+                let ordered = matches!(source, ActSource::Talk { .. })
+                    && self
+                        .body_of(npc)
+                        .is_some_and(|(h, b)| !h.sim(|s| s.missions.is_unordered(&b)));
+                let catalog = match ordered {
+                    true => tools::specs_ordered(),
+                    false => tools::specs(),
+                };
+                let act = act_of(&call, &catalog).map_err(|why| anyhow::anyhow!("{why}"))?;
                 let decided = decided.and_then(|d| Some((Where::parse(&d.at)?, d.company)));
                 // A conversation's act was decided on a thread, not in the room:
                 // it restores no decision, and reads none of the body's.
@@ -139,7 +153,7 @@ impl Runtime {
                 }
                 let pinned = pinned_at.as_deref().and_then(Where::parse);
                 let done = self
-                    .perform_here(npc, &act, pinned.as_ref(), said.as_deref(), &source)
+                    .perform_here(npc, &act, pinned.as_ref(), said.as_ref(), &source)
                     .await;
                 if let Some((hosted, body)) = &body {
                     hosted.end_decision(body);
@@ -201,6 +215,12 @@ impl Runtime {
                 name,
             } => OpReply::Done {
                 ok: self.authorize_step(npc, &step, &by, &name),
+            },
+            WorldOp::Reshape { npc, edit } => reshape_here(self, world, &edit, npc).await,
+            WorldOp::ReadThrough { npc, thread, seq } => OpReply::Done {
+                ok: self.body_of(npc).is_some_and(|(hosted, body)| {
+                    hosted.with_sim(|s| s.threads.read_through(&body, &thread, seq))
+                }),
             },
             WorldOp::Channel { from, text, origin } => OpReply::Heard {
                 by: self.say_on_channel_from(world, &from, &text, origin),
@@ -304,7 +324,7 @@ impl Runtime {
         npc: u64,
         act: &Act,
         pinned: Option<&Where>,
-        said: Option<&str>,
+        said: Option<&Voiced>,
         source: &ActSource,
     ) -> Performed {
         let Some((hosted, body)) = self.body_of(npc) else {
@@ -334,7 +354,7 @@ impl Runtime {
             call: call_line(act),
             decided,
             pinned_at: pinned.map(|at| at.to_string()),
-            said: said.map(str::to_string),
+            said: said.cloned(),
             source: source.clone(),
         };
         match self.world_write(&world, op).await {
@@ -400,6 +420,59 @@ impl Runtime {
         }
     }
 
+    /// What a landed act that is not a body's own — a device, the house, a
+    /// bridge, building — writes in the journals (`docs/npc_conversations.md`
+    /// §5.1, §5.1.1): the character's `did` line when it changed the world,
+    /// the world's line for the house's mode, and the room's for a device
+    /// worked or a part built there, which concerns whoever's standing
+    /// mission is for it.
+    fn landed_elsewhere(&self, npc: u64, act: &Act, recorded: &Recorded) {
+        if !experience::notable(act.tool) {
+            return;
+        }
+        let Some((hosted, body)) = self.body_of(npc) else {
+            return;
+        };
+        let did = recorded.answer.lines().next().unwrap_or_default().to_string();
+        self.journals
+            .note(hosted.id(), &body, ExperienceKind::Did, &did, None);
+        let name = hosted
+            .sim(|s| s.roster_name(&body).map(str::to_string))
+            .unwrap_or_else(|| body.clone());
+        if house::is_mine(act.tool) {
+            let mode = act.args.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            let line = format!("{name} set the house to {} mode.", mode.trim());
+            self.changed(&hosted, Change::World { line });
+        } else if body::is_device(act.tool) || bridge::is_mine(act.tool) || build::is_mine(act.tool)
+        {
+            let place = hosted.standpoint_of(&body);
+            let line = format!("In {place}, {name}: {did}");
+            self.changed(
+                &hosted,
+                Change::Room {
+                    place,
+                    by: Some(body),
+                    line,
+                },
+            );
+        }
+    }
+
+    /// A post that would say again what the character just said on that
+    /// thread: refused with the loop guard's nudge, never posted
+    /// (`docs/npc_conversations.md` §11.3).
+    pub(crate) fn repeated(&self, act: &Act) -> Performed {
+        Performed {
+            recorded: Recorded {
+                feed: format!("{} {REFUSED} said already", act.summary()),
+                answer: format!("Nothing was sent. {NUDGE}"),
+                landed: false,
+                departing: false,
+            },
+            moved: false,
+        }
+    }
+
     fn unanswered(&self, act: &Act, why: &str) -> Performed {
         tracing::warn!(tool = act.tool, "an act did not reach its world: {why}");
         Performed {
@@ -420,10 +493,16 @@ impl Runtime {
         npc: u64,
         act: &Act,
         pinned: Option<&Where>,
-        said: Option<&str>,
+        said: Option<&Voiced>,
         source: &ActSource,
     ) -> Performed {
         let before = self.mission_mark(npc);
+        let bodily = !(body::is_device(act.tool)
+            || body::composes(act.tool)
+            || bridge::is_mine(act.tool)
+            || house::is_mine(act.tool)
+            || build::is_mine(act.tool)
+            || zen_task::is_mine(act.tool));
         let recorded = if body::is_device(act.tool) {
             self.enact_device(npc, act, pinned).await
         } else if body::composes(act.tool) {
@@ -439,6 +518,11 @@ impl Runtime {
         } else {
             self.record_act_said(npc, act, said, source)
         };
+        // A body's act writes its own experience as it is recorded; the
+        // others are written here, with whom else they concern.
+        if recorded.landed && !bodily {
+            self.landed_elsewhere(npc, act, &recorded);
+        }
         // What the act meant to tell somebody privately goes to the
         // character's conversation with them, wherever the character is held.
         self.hand_on_purposes(npc);

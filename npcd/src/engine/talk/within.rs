@@ -47,6 +47,10 @@ pub struct OnThread<'a> {
     /// Whether the party may change the character's mission: its owner or an
     /// authorizer, outside the thrash cooldown (§7.2).
     pub may_change_mission: bool,
+    /// The brief of the mission a character that takes orders carries — what
+    /// its ordered mission acts name (`engine::agenda::ordered`). `None` for
+    /// one carrying nothing, or keeping an agenda.
+    pub carried: Option<String>,
     /// Whether this NPC↔NPC activation has run its turns (§8).
     pub capped: bool,
     /// The conversation's own struck acts: the NPC↔NPC reply cooldown.
@@ -68,9 +72,14 @@ impl Within {
             .filter(|act| !thread.capped || !TALKING_ACTS.contains(act))
             .map(|act| act.to_string())
             .collect();
-        let (agenda, priorities) = match thread.may_change_mission {
-            true => (self.agenda.clone(), self.priorities.clone()),
-            false => (Vec::new(), Vec::new()),
+        // A character keeping an agenda is offered priorities; one without
+        // them takes orders, and its mission acts are the ordered ones, over
+        // the one mission it carries.
+        let orders = thread.may_change_mission && self.priorities.is_empty();
+        let (agenda, priorities) = match (thread.may_change_mission, orders) {
+            (false, _) => (Vec::new(), Vec::new()),
+            (true, false) => (self.agenda.clone(), self.priorities.clone()),
+            (true, true) => (thread.carried.iter().cloned().collect(), Vec::new()),
         };
         Within {
             me: self.me.clone(),
@@ -89,6 +98,7 @@ impl Within {
             contacts: others(&self.contacts),
             agenda,
             priorities,
+            orders,
             cooling: thread.cooling.clone(),
             allow: Some(allow),
             ..Within::default()
@@ -139,6 +149,7 @@ mod tests {
             name,
             owed: Vec::new(),
             may_change_mission: false,
+            carried: None,
             capped: false,
             cooling: Vec::new(),
         }
@@ -194,21 +205,82 @@ mod tests {
         );
     }
 
+    /// **An ordered body is offered the ordered acts**: the agenda's names
+    /// over the one mission it carries, with no title and no priority.
     #[test]
-    fn an_ordered_body_has_no_agenda_to_change_through_these_acts() {
+    fn an_ordered_body_is_offered_its_own_mission_acts_over_what_it_carries() {
         let party = mira();
-        let mut ordered = zen();
-        ordered.agenda.clear();
-        ordered.priorities.clear();
-        let within = ordered.on_thread(&OnThread {
+        let mut wick = zen();
+        wick.agenda.clear();
+        wick.priorities.clear();
+        let within = wick.on_thread(&OnThread {
+            may_change_mission: true,
+            carried: Some("Keep the lounge tidy.".into()),
+            ..thread(&party, "Mira")
+        });
+        assert!(within.orders);
+        assert_eq!(within.agenda, ["Keep the lounge tidy."]);
+        assert_eq!(
+            offered(&within),
+            [
+                "reply",
+                "sign_off",
+                "reflect",
+                "promise",
+                "message",
+                "reach_out",
+                "mission_add",
+                "mission_edit",
+                "mission_cancel",
+                "mission_done",
+            ]
+            .map(String::from)
+        );
+        let specs = specs_within(Catalog::THREAD.mode, &within);
+        let params = |name: &str| -> Vec<String> {
+            let spec = specs.iter().find(|s| s.name == name).unwrap();
+            spec.params.iter().map(|p| p.name.clone()).collect()
+        };
+        assert_eq!(params("mission_add"), ["brief", "steps"]);
+        assert_eq!(params("mission_edit"), ["mission", "brief", "steps"]);
+        let edit = specs.iter().find(|s| s.name == "mission_edit").unwrap();
+        assert_eq!(
+            edit.params[0].enum_values,
+            Some(vec!["Keep the lounge tidy.".to_string()])
+        );
+    }
+
+    /// Carrying nothing, it can only be given a mission.
+    #[test]
+    fn an_ordered_body_carrying_nothing_can_only_be_given_one() {
+        let party = mira();
+        let mut wick = zen();
+        wick.agenda.clear();
+        wick.priorities.clear();
+        let within = wick.on_thread(&OnThread {
             may_change_mission: true,
             ..thread(&party, "Mira")
         });
-        assert!(
-            !offered(&within).iter().any(|a| a.starts_with("mission_")),
-            "{:?}",
-            offered(&within)
-        );
+        let missions: Vec<String> = offered(&within)
+            .into_iter()
+            .filter(|a| a.starts_with("mission_"))
+            .collect();
+        assert_eq!(missions, ["mission_add"]);
+    }
+
+    /// Without standing, an ordered body is offered no mission act at all.
+    #[test]
+    fn an_ordered_body_offers_a_stranger_no_mission_act() {
+        let party = mira();
+        let mut wick = zen();
+        wick.agenda.clear();
+        wick.priorities.clear();
+        let within = wick.on_thread(&OnThread {
+            carried: Some("Keep the lounge tidy.".into()),
+            ..thread(&party, "Mira")
+        });
+        assert!(!within.orders);
+        assert!(!offered(&within).iter().any(|a| a.starts_with("mission_")));
     }
 
     #[test]

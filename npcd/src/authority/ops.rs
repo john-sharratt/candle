@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use npc_map::MapEdit;
 use serde::{Deserialize, Serialize};
 
 use crate::discord::world::record::Guild;
@@ -28,6 +29,27 @@ pub enum ActSource {
     Mind,
     /// A conversation with `party`: a body id or an account handle.
     Talk { party: String },
+}
+
+/// The line the lease holder voiced for a phone act
+/// (`docs/npc_conversations.md` §7.1), and the critical step it asks an
+/// authorizer to approve, when it asks for one (§7.2): what lands on the
+/// thread in place of the act's intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Voiced {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<String>,
+}
+
+impl Voiced {
+    /// Words that ask for nothing.
+    pub fn words(text: &str) -> Voiced {
+        Voiced {
+            text: text.to_string(),
+            requests: None,
+        }
+    }
 }
 
 /// The decision a character's act was made in: where it stood and who was with
@@ -55,7 +77,7 @@ pub enum WorldOp {
         /// The line the lease holder voiced for a phone act: what lands on
         /// the thread in place of the act's intent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        said: Option<String>,
+        said: Option<Voiced>,
         #[serde(default)]
         source: ActSource,
     },
@@ -105,6 +127,16 @@ pub enum WorldOp {
         /// Who said yes, by name, for what the character is told.
         name: String,
     },
+    /// `npc` read `thread` through `seq`: a conversation that answered what
+    /// it took in with a journal entry rather than a line
+    /// (`docs/npc_conversations.md` §8), so the party's typing indicator —
+    /// the authority's — stops.
+    ReadThrough { npc: u64, thread: String, seq: u64 },
+    /// An operator reshapes the world's walkable map, through the token of
+    /// character `npc`, whose owner keeps the change
+    /// (`docs/npc_conversations.md` §5.1.1): applied by the authority, so it
+    /// is journaled once, wherever `/reshape` was asked.
+    Reshape { npc: u64, edit: MapEdit },
     /// A person speaks on the world's open channel — from the console, with
     /// no `origin`, or from the world's Discord server's `#the-channel`.
     Channel {
@@ -213,6 +245,20 @@ pub enum OpReply {
     Heard { by: Option<Vec<String>> },
     /// How many lines the surface holds now; `None` with no such place.
     Posted { lines: Option<usize> },
+    /// A world's map reshaped: who it relocated, and whether the change was
+    /// kept — `written`, `drafted`, `ephemeral` or `failed`, with `detail`
+    /// saying more — or `refused`, the world's own words on why it would not
+    /// take the edit, with nothing changed.
+    Reshaped {
+        #[serde(default)]
+        relocated: Vec<String>,
+        #[serde(default)]
+        durable: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refused: Option<String>,
+    },
     /// Whether the write took.
     Done { ok: bool },
 }
@@ -255,13 +301,23 @@ mod tests {
             call: r#"{"tool":"reply","to":"Mira","intent":"that it is in"}"#.into(),
             decided: None,
             pinned_at: None,
-            said: Some("It's at the door.".into()),
+            said: Some(Voiced {
+                text: "It's at the door.".into(),
+                requests: Some("Sign the lease".into()),
+            }),
             source: ActSource::Talk {
                 party: "u_8812".into(),
             },
         };
         let wire = serde_json::to_value(&voiced).unwrap();
-        assert_eq!(wire["said"], "It's at the door.");
+        assert_eq!(
+            wire["said"],
+            json!({"text": "It's at the door.", "requests": "Sign the lease"})
+        );
+        assert_eq!(
+            serde_json::to_value(Voiced::words("Hi.")).unwrap(),
+            json!({"text": "Hi."})
+        );
         assert_eq!(wire["source"], json!({"from": "talk", "party": "u_8812"}));
         assert_eq!(serde_json::from_value::<WorldOp>(wire).unwrap(), voiced);
         assert_eq!(

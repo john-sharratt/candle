@@ -10,7 +10,9 @@
 
 use candle_conversation::projection::DecodePriority;
 
+use crate::authority::ops::Voiced;
 use crate::engine::act::Act;
+use crate::engine::loopguard::would_repeat;
 use crate::engine::mind::Voicing;
 use crate::engine::runtime::Runtime;
 use crate::engine::talk::templates::Destination;
@@ -57,13 +59,36 @@ pub fn post_prompt(tool: &str, to: &str, intent: &str) -> String {
     }
 }
 
+/// What a mind-loop act puts on a group, once its words are decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Post {
+    /// The act puts no words on a group.
+    None,
+    /// The words it says.
+    Words(Voiced),
+    /// The words say again what the character just said there: refused
+    /// before they are posted, never posted and then struck
+    /// (`docs/npc_conversations.md` §11.3).
+    Repeat,
+}
+
+/// What `words` would be on a thread where the character's own last lines
+/// are `own_last`, newest last.
+pub fn post(own_last: &[&str], words: &str) -> Post {
+    match would_repeat(own_last, words) {
+        true => Post::Repeat,
+        false => Post::Words(Voiced::words(words)),
+    }
+}
+
 impl Runtime {
-    /// The words a mind-loop act puts on a group, decoded for it — or `None`
-    /// for an act that puts none there. A post whose words could not be
-    /// decoded is `Err`: it is refused rather than posted as its intent.
-    pub async fn voice_post(&self, npc_id: u64, act: &Act) -> anyhow::Result<Option<String>> {
+    /// The words a mind-loop act puts on a group, decoded for it and checked
+    /// against what the character last said there. A post whose words could
+    /// not be decoded is `Err`: it is refused rather than posted as its
+    /// intent.
+    pub async fn voice_post(&self, npc_id: u64, act: &Act) -> anyhow::Result<Post> {
         let Some((to, intent)) = post_of(act) else {
-            return Ok(None);
+            return Ok(Post::None);
         };
         let minds = self
             .minds
@@ -90,7 +115,23 @@ impl Runtime {
                 },
             )
             .await?;
-        Ok(Some(words))
+        let own_last: Vec<String> = self
+            .body_of(npc_id)
+            .and_then(|(hosted, body)| {
+                hosted.sim(|s| {
+                    let t = s.threads.by_name_for(&body, &to)?;
+                    Some(
+                        t.since_joined(&body)
+                            .iter()
+                            .filter(|m| m.from == body)
+                            .map(|m| m.text.clone())
+                            .collect(),
+                    )
+                })
+            })
+            .unwrap_or_default();
+        let own: Vec<&str> = own_last.iter().map(String::as_str).collect();
+        Ok(post(&own, &words))
     }
 }
 
@@ -144,5 +185,21 @@ mod tests {
             post_prompt("sign_off", "the sweep", "I'm off shift"),
             "Say goodbye on the sweep, in your own words, as you would type it: I'm off shift"
         );
+    }
+
+    /// **A post saying again what was just said there is refused before it
+    /// is sent**; one that says something new goes out as its words.
+    #[test]
+    fn a_repeated_post_is_caught_before_it_is_posted() {
+        let own = ["The lift on level three is stuck again, I've reported it."];
+        assert_eq!(
+            post(&own, "The lift on level three is stuck again; I've reported it."),
+            Post::Repeat
+        );
+        assert_eq!(
+            post(&own, "Who is free to cover the night shift?"),
+            Post::Words(Voiced::words("Who is free to cover the night shift?"))
+        );
+        assert_eq!(post(&[], "Anyone?"), Post::Words(Voiced::words("Anyone?")));
     }
 }

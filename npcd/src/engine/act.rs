@@ -426,10 +426,23 @@ pub fn parse(output: &str, tools: &[ToolSpec]) -> Parsed {
                 // A missing required parameter is a rejection, not a
                 // best-effort act. `speak` with no intent is not a quieter
                 // `speak`; it is a call the character did not finish making.
+                //
+                // Required as the catalog the decode was drawn from has it:
+                // an ordered body's `mission_add` is the agenda's name with
+                // neither a title nor a priority (`engine::agenda::ordered`),
+                // so a parameter its spec does not take at all is not asked
+                // for. One a value brings is written after that value, never
+                // in the spec, and stays required.
+                let spec = tools.iter().find(|s| s.name == tool.name);
+                let brings = tools::brought(tool.name);
+                let taken = |name: &str| {
+                    spec.is_none_or(|s| s.params.iter().any(|sp| sp.name == name))
+                        || brings.contains(&name)
+                };
                 if let Some(p) = tool
                     .params
                     .iter()
-                    .find(|p| p.required && !obj.contains_key(p.name))
+                    .find(|p| p.required && taken(p.name) && !obj.contains_key(p.name))
                 {
                     out.rejected.push(Rejected::MissingParam {
                         tool: tool.name,
