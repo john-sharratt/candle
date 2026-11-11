@@ -36,6 +36,7 @@
 //! admission, never inside the layer loop: a page claim that needs a new arena
 //! takes the arena window, which a forward holds shut (hot-path invariant 7).
 
+use candle::engine_events::note;
 use candle::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -2539,13 +2540,9 @@ pub fn score_runs(spans: &[SeqSpan]) -> Vec<Range<usize>> {
 /// layout the attention walks through.
 fn log_bulk_selection(rows: usize, widest: usize, pages: usize) {
     if rows >= PREFILL_KV_STAGE_MIN_Q_LEN {
-        tracing::debug!(
-            target: "candle_transformers::prefill_launch",
-            rows,
-            widest_candidates = widest,
-            pages,
-            "bulk qsa selection",
-        );
+        note("bulk qsa selection", || {
+            format!("rows={rows} widest_candidates={widest} pages={pages}")
+        });
     }
 }
 

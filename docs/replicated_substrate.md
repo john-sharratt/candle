@@ -3940,6 +3940,20 @@ the vote names calibrates the unit; another leaves it and counts it `elsewhere`;
 calibration handed back is looked for again before it is asked for twice. A unit
 calibrated as its ingest commits it is already under that reading's `ingest/` lease.
 
+**A lease is held only while its work moves.** The holder renews on a timer, so a
+lease lasts exactly as long as the reading or calibration waiting under it — and every
+one of those waits gives its turn up once the turn has made no progress for a minute
+(`candle-conversation/src/handle.rs` `STALL`): no token decoded, no prefill chunk run.
+Being told it is still queued is not progress. Without that limit a member whose card
+was full held its units for as long as the card stayed full: on 2026-11-11 WhiteWorld,
+its 24 GB card carrying every character, held 48 calibration leases — one per thread
+of its pass — for over an hour with none admitted, and BlackWorld's idle 72 GB card,
+whose own pass found all 48 `elsewhere`, did nothing. A wait given up drops its turn,
+which withdraws it from the scheduler, and the unit's lease goes back with it; the
+next pass of whichever member takes the lease does the work. A batch — a calibration's
+questions — moves while any of its turns moves, so a question queued behind running
+siblings is not given up.
+
 Two members can still both finish a reading: one was not joined, or both passed the
 grant. Both units' conversations arrive everywhere. **The conversation whose first
 turn has the lower version stamp (§6.2) holds the unit**, the timeline breaking a

@@ -8,13 +8,24 @@
 //! | Parameter | |
 //! |---|---|
 //! | `grep` | a regular expression the whole line must match |
+//! | `exclude` | a regular expression no match may match — the noise a `grep` alone cannot leave out |
 //! | `level` | the least level kept: `TRACE` … `ERROR` |
 //! | `tenant` | only lines one tenant wrote (`zend`, `npcd`) |
 //! | `since` | only lines stamped at or after this, an RFC 3339 prefix such as `2026-10-16T00:20` |
 //! | `limit` | the most matches returned, the latest kept — [`DEFAULT_LIMIT`] when absent, at most [`MAX_LIMIT`] |
+//! | `lines_before`, `lines_after` | the file's lines around each match, as `grep -B`/`-A` — at most [`MAX_CONTEXT`] |
 //!
 //! Lines come back as written, full timestamps and all, oldest first: what a
 //! reader greps for is the text, and the file is already its own best format.
+//! With context asked for, runs of lines that do not touch are parted by a
+//! `--` line, as `grep` parts them; a match's context stays inside its file,
+//! and is the file's lines around it whatever the filters — `tenant`, `level`
+//! and `exclude` choose the matches, not what stands beside them, as `grep -B`
+//! shows the lines before a match whether or not they match.
+//! The answer says how far back the log reaches (`held_from`), so a search
+//! finding nothing older than that is read as the log not reaching back, not
+//! as nothing having happened.
+//!
 //! Only the last `limit` matches are held while the files are read, so a
 //! search costs its answer's memory, not the log's. A message's unstamped
 //! line at the head of a file is taken as stamped with that file's first
@@ -44,31 +55,45 @@ pub const DEFAULT_LIMIT: usize = 200;
 /// The most matches one request returns.
 pub const MAX_LIMIT: usize = 5000;
 
+/// The most lines of context asked for on either side of a match.
+pub const MAX_CONTEXT: usize = 20;
+
+/// The line that parts two runs of lines that do not touch.
+pub const SEPARATOR: &str = "--";
+
 #[derive(Debug, Default, Deserialize)]
 pub struct LogQuery {
     pub grep: Option<String>,
+    pub exclude: Option<String>,
     pub level: Option<String>,
     pub tenant: Option<String>,
     pub since: Option<String>,
     pub limit: Option<usize>,
+    pub lines_before: Option<usize>,
+    pub lines_after: Option<usize>,
 }
 
 /// A search, checked.
 pub struct Search {
     pattern: Option<Regex>,
+    exclude: Option<Regex>,
     /// Index into [`LEVELS`] of the least level kept.
     min_level: usize,
     tenant: Option<String>,
     since: Option<String>,
     limit: usize,
+    before: usize,
+    after: usize,
 }
 
 /// What a search found.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Found {
-    /// The last `limit` matching lines, oldest first.
+    /// The last `limit` matching lines, oldest first, each with the context
+    /// asked for and runs that do not touch parted by [`SEPARATOR`].
     pub lines: Vec<String>,
-    /// Every line that matched in the files read, `lines` and those before it.
+    /// Every line that matched in the files read, those answered and those
+    /// before them.
     pub matched: u64,
     /// Every line read.
     pub scanned: u64,
@@ -78,12 +103,19 @@ pub struct Found {
     /// stopped at its `limit` with older files left unread, which may hold
     /// earlier matches.
     pub complete: bool,
+    /// The stamp of the log's oldest line: every line written since is in it.
+    pub held_from: Option<String>,
+}
+
+/// One match and the context around it, each line by its place in its file.
+struct Hit {
+    lines: Vec<(u64, String)>,
 }
 
 /// What one file held for a search.
 struct InFile {
     /// Its last matches, at most as many as were asked for, oldest first.
-    kept: VecDeque<String>,
+    kept: VecDeque<Hit>,
     matched: u64,
     scanned: u64,
     /// It holds a line stamped before `since`: every older file is wholly
@@ -91,14 +123,35 @@ struct InFile {
     passed_since: bool,
 }
 
+/// The first stamp a line opens with: the first word, when it starts with a
+/// digit.
+fn stamp_of(text: &str) -> Option<&str> {
+    text.split_whitespace()
+        .next()
+        .filter(|w| w.as_bytes()[0].is_ascii_digit())
+}
+
+/// The stamp of the oldest line the file at `path` holds, read from its head.
+pub fn first_stamp(path: &Path) -> Option<String> {
+    let reader = BufReader::new(File::open(path).ok()?);
+    reader
+        .split(b'\n')
+        .map_while(Result::ok)
+        .find_map(|line| stamp_of(&String::from_utf8_lossy(&line)).map(str::to_string))
+}
+
 impl Search {
     /// `q`, checked: a pattern that does not compile or a level that does not
     /// exist is refused, not ignored.
     pub fn new(q: &LogQuery) -> Result<Self, String> {
-        let pattern = match &q.grep {
-            Some(p) => Some(Regex::new(p).map_err(|e| format!("`grep` is not a pattern: {e}"))?),
-            None => None,
+        let compile = |p: &Option<String>, name: &str| match p {
+            Some(p) => Regex::new(p)
+                .map(Some)
+                .map_err(|e| format!("`{name}` is not a pattern: {e}")),
+            None => Ok(None),
         };
+        let pattern = compile(&q.grep, "grep")?;
+        let exclude = compile(&q.exclude, "exclude")?;
         let min_level = match &q.level {
             Some(l) => LEVELS
                 .iter()
@@ -108,17 +161,20 @@ impl Search {
         };
         Ok(Self {
             pattern,
+            exclude,
             min_level,
             tenant: q.tenant.clone(),
             since: q.since.clone(),
             limit: q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
+            before: q.lines_before.unwrap_or(0).min(MAX_CONTEXT),
+            after: q.lines_after.unwrap_or(0).min(MAX_CONTEXT),
         })
     }
 
     /// Search `files`, given oldest first, newest first: the last `limit`
     /// matches, read no further back than they need.
     pub fn run(&self, bus: &LogBus, files: &[PathBuf]) -> io::Result<Found> {
-        let mut newest_first: Vec<VecDeque<String>> = Vec::new();
+        let mut newest_first: Vec<VecDeque<Hit>> = Vec::new();
         let (mut kept, mut matched, mut scanned, mut read) = (0usize, 0u64, 0u64, 0usize);
         let mut complete = true;
         for (i, path) in files.iter().enumerate().rev() {
@@ -137,21 +193,53 @@ impl Search {
             }
         }
         Ok(Found {
-            lines: newest_first.into_iter().rev().flatten().collect(),
+            lines: self.assemble(newest_first.into_iter().rev()),
             matched,
             scanned,
             files: read,
             complete,
+            held_from: files.first().and_then(|p| first_stamp(p)),
         })
     }
 
-    /// The last `want` matches in the file at `path`.
+    /// The files' hits, oldest file first, as the answer's lines: each line
+    /// once, and with context asked for, runs that do not touch — or that are
+    /// in different files — parted by [`SEPARATOR`].
+    fn assemble(&self, files: impl Iterator<Item = VecDeque<Hit>>) -> Vec<String> {
+        let context = self.before > 0 || self.after > 0;
+        let mut out = Vec::new();
+        for hits in files {
+            let mut last: Option<u64> = None;
+            for hit in hits {
+                for (at, text) in hit.lines {
+                    if last.is_some_and(|l| at <= l) {
+                        continue;
+                    }
+                    let touches = last.is_some_and(|l| at == l + 1);
+                    if context && !out.is_empty() && !touches {
+                        out.push(SEPARATOR.to_string());
+                    }
+                    out.push(text);
+                    last = Some(at);
+                }
+            }
+        }
+        out
+    }
+
+    /// The last `want` matches in the file at `path`, with their context.
     fn in_file(&self, bus: &LogBus, path: &Path, want: usize) -> io::Result<InFile> {
-        let mut found = InFile {
-            kept: VecDeque::with_capacity(want),
-            matched: 0,
-            scanned: 0,
-            passed_since: false,
+        let mut scan = Scan {
+            found: InFile {
+                kept: VecDeque::with_capacity(want),
+                matched: 0,
+                scanned: 0,
+                passed_since: false,
+            },
+            want,
+            next: 0,
+            ring: VecDeque::with_capacity(self.before + 1),
+            open_after: 0,
         };
         // A line without a stamp — the rest of a message that spans lines —
         // is as old as the stamped line before it; at the head of the file,
@@ -170,40 +258,54 @@ impl Search {
             if text.trim().is_empty() {
                 continue;
             }
-            found.scanned += 1;
-            if let Some(first) = text.split_whitespace().next() {
-                if first.as_bytes()[0].is_ascii_digit() {
-                    stamp = Some(first.to_string());
-                }
+            if let Some(s) = stamp_of(text) {
+                stamp = Some(s.to_string());
             }
             let Some(at) = &stamp else {
                 unstamped.push(text.to_string());
                 continue;
             };
             for head in unstamped.drain(..) {
-                self.take(bus, &head, at, want, &mut found);
+                self.take(bus, &head, at, &mut scan);
             }
-            self.take(bus, text, at, want, &mut found);
+            self.take(bus, text, at, &mut scan);
         }
         for head in unstamped {
-            self.take(bus, &head, "", want, &mut found);
+            self.take(bus, &head, "", &mut scan);
         }
-        Ok(found)
+        Ok(scan.found)
     }
 
-    /// Keep `text`, stamped `at`, in `found` when it matches.
-    fn take(&self, bus: &LogBus, text: &str, at: &str, want: usize, found: &mut InFile) {
+    /// Read `text`, stamped `at`: kept in `scan` as a match with the lines
+    /// before it, or as context after the last match.
+    fn take(&self, bus: &LogBus, text: &str, at: &str, scan: &mut Scan) {
+        scan.found.scanned += 1;
+        let place = scan.next;
+        scan.next += 1;
         if self.since.as_deref().is_some_and(|s| at < s) {
-            found.passed_since = true;
+            scan.found.passed_since = true;
         }
-        if !self.admits(bus, text, at) {
-            return;
+        if self.admits(bus, text, at) {
+            scan.found.matched += 1;
+            if scan.found.kept.len() == scan.want {
+                scan.found.kept.pop_front();
+            }
+            let mut lines: Vec<(u64, String)> = scan.ring.iter().cloned().collect();
+            lines.push((place, text.to_string()));
+            scan.found.kept.push_back(Hit { lines });
+            scan.open_after = self.after;
+        } else if scan.open_after > 0 {
+            if let Some(hit) = scan.found.kept.back_mut() {
+                hit.lines.push((place, text.to_string()));
+            }
+            scan.open_after -= 1;
         }
-        found.matched += 1;
-        if found.kept.len() == want {
-            found.kept.pop_front();
+        if self.before > 0 {
+            if scan.ring.len() == self.before {
+                scan.ring.pop_front();
+            }
+            scan.ring.push_back((place, text.to_string()));
         }
-        found.kept.push_back(text.to_string());
     }
 
     fn admits(&self, bus: &LogBus, text: &str, stamp: &str) -> bool {
@@ -211,6 +313,9 @@ impl Search {
             return false;
         }
         if self.pattern.as_ref().is_some_and(|p| !p.is_match(text)) {
+            return false;
+        }
+        if self.exclude.as_ref().is_some_and(|x| x.is_match(text)) {
             return false;
         }
         if self.min_level > 0 {
@@ -226,6 +331,19 @@ impl Search {
         }
         true
     }
+}
+
+/// One file's read in progress.
+struct Scan {
+    found: InFile,
+    /// The most matches kept.
+    want: usize,
+    /// The place of the next line read.
+    next: u64,
+    /// The last lines read, for the context before the next match.
+    ring: VecDeque<(u64, String)>,
+    /// Lines still owed to the last match's context after it.
+    open_after: usize,
 }
 
 pub async fn grep(State(s): State<Arc<Shared>>, Query(q): Query<LogQuery>) -> Response {
@@ -292,7 +410,7 @@ the dream's second line
     }
 
     /// The pattern is matched against the whole line, across every file, oldest
-    /// first.
+    /// first, and the answer says how far back the log reaches.
     #[test]
     fn a_pattern_finds_its_lines_across_the_files() {
         let f = run(LogQuery {
@@ -307,6 +425,7 @@ the dream's second line
             ]
         );
         assert_eq!((f.matched, f.scanned, f.files, f.complete), (2, 5, 2, true));
+        assert_eq!(f.held_from.as_deref(), Some("2026-10-16T00:01:00.0Z"));
     }
 
     /// **The search reads back no further than its answer needs**: the
@@ -411,6 +530,124 @@ the dream's second line
         );
     }
 
+    /// **`exclude` leaves its lines out of the matches**: the replication
+    /// lines without the one that is an error.
+    #[test]
+    fn exclude_leaves_its_lines_out() {
+        let f = run(LogQuery {
+            grep: Some("cluster::".into()),
+            exclude: Some("ERROR".into()),
+            ..LogQuery::default()
+        });
+        assert_eq!(
+            f.lines,
+            ["2026-10-16T00:02:00.0Z  WARN cluster::replicate::tick: a catch-up went quiet: asking again"]
+        );
+        assert_eq!(f.matched, 1);
+    }
+
+    const FILE: &str = "\
+2026-10-16T00:01:00.0Z  INFO a: one
+2026-10-16T00:02:00.0Z  INFO a: two
+2026-10-16T00:03:00.0Z  WARN a: three
+2026-10-16T00:04:00.0Z  INFO a: four
+2026-10-16T00:05:00.0Z  INFO a: five
+2026-10-16T00:06:00.0Z  INFO a: six
+2026-10-16T00:07:00.0Z  WARN a: seven
+2026-10-16T00:08:00.0Z  INFO a: eight
+";
+
+    fn one_file(q: LogQuery) -> Vec<String> {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("m.log");
+        fs::write(&path, FILE).unwrap();
+        let bus = LogBus::new(&["zend"]);
+        Search::new(&q).unwrap().run(&bus, &[path]).unwrap().lines
+    }
+
+    fn line(n: &str, level: &str, word: &str) -> String {
+        format!("2026-10-16T00:0{n}:00.0Z  {level} a: {word}")
+    }
+
+    /// **Context comes from the file around each match**, as `grep -B`/`-A`
+    /// gives it, and runs that do not touch are parted by `--`.
+    #[test]
+    fn context_lines_come_around_each_match() {
+        assert_eq!(
+            one_file(LogQuery {
+                grep: Some("WARN".into()),
+                lines_before: Some(1),
+                lines_after: Some(1),
+                ..LogQuery::default()
+            }),
+            [
+                line("2", "INFO", "two"),
+                line("3", "WARN", "three"),
+                line("4", "INFO", "four"),
+                SEPARATOR.to_string(),
+                line("6", "INFO", "six"),
+                line("7", "WARN", "seven"),
+                line("8", "INFO", "eight"),
+            ]
+        );
+    }
+
+    /// **Context that overlaps is one run**, each line once: three lines
+    /// after the first match reach the second's lines before it.
+    #[test]
+    fn overlapping_context_is_one_run() {
+        assert_eq!(
+            one_file(LogQuery {
+                grep: Some("WARN".into()),
+                lines_before: Some(1),
+                lines_after: Some(3),
+                ..LogQuery::default()
+            }),
+            [
+                line("2", "INFO", "two"),
+                line("3", "WARN", "three"),
+                line("4", "INFO", "four"),
+                line("5", "INFO", "five"),
+                line("6", "INFO", "six"),
+                line("7", "WARN", "seven"),
+                line("8", "INFO", "eight"),
+            ]
+        );
+    }
+
+    /// **Context counts no match against the limit**: the newest match is
+    /// kept with the line before it, and the older one is gone with its own.
+    #[test]
+    fn context_is_not_counted_against_the_limit() {
+        assert_eq!(
+            one_file(LogQuery {
+                grep: Some("WARN".into()),
+                lines_before: Some(1),
+                limit: Some(1),
+                ..LogQuery::default()
+            }),
+            [line("6", "INFO", "six"), line("7", "WARN", "seven")]
+        );
+    }
+
+    /// A file's oldest stamp is its first stamped line's, past any unstamped
+    /// head.
+    #[test]
+    fn a_files_first_stamp_is_its_first_stamped_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("m.log");
+        fs::write(
+            &path,
+            "a continued line\n2026-10-16T00:05:00.0Z  INFO a: x\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first_stamp(&path).as_deref(),
+            Some("2026-10-16T00:05:00.0Z")
+        );
+        assert_eq!(first_stamp(&dir.path().join("none.log")), None);
+    }
+
     /// A pattern that does not compile, or a level that does not exist, is
     /// refused rather than searched as nothing.
     #[test]
@@ -420,6 +657,11 @@ the dream's second line
             ..LogQuery::default()
         };
         assert!(Search::new(&bad).is_err());
+        let bad = LogQuery {
+            exclude: Some("(".into()),
+            ..LogQuery::default()
+        };
+        assert!(Search::new(&bad).err().unwrap().starts_with("`exclude`"));
         let bad = LogQuery {
             level: Some("LOUD".into()),
             ..LogQuery::default()

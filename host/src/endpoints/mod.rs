@@ -7,6 +7,7 @@
 //! `/v1/tools`, which are open on purpose (see each route).
 
 mod catalog;
+mod events;
 mod expert_split;
 mod format_mix;
 mod log_grep;
@@ -143,6 +144,8 @@ fn shared_table(roles: Roles) -> Api<Arc<Shared>> {
             get(waves::projections),
         )
         .route("/v1/layers", Role::User, each(), get(waves::layers))
+        // The engine's high-rate events, counted where they used to be logged.
+        .route("/v1/events", Role::User, each(), get(events::events))
         // Reading resets the counters, so two calls bracket a window — an
         // operator's, which a reader passing by must not be able to wipe.
         .route("/v1/profile", Role::Admin, each(), get(profile::profile))
@@ -435,6 +438,7 @@ mod tests {
                 ("/v1/phases", "user"),
                 ("/v1/projections", "user"),
                 ("/v1/layers", "user"),
+                ("/v1/events", "user"),
                 ("/v1/profile", "admin"),
                 ("/v1/expert_split", "admin"),
                 ("/v1/tools", "unauthenticated"),

@@ -1,6 +1,16 @@
 use crate::sequence_handle::SequenceId;
 use thiserror::Error;
 
+/// What a [`ConversationError::TurnStalled`] says, which a caller holding only
+/// its text finds with [`is_stall_message`].
+pub const TURN_STALLED: &str = "the turn made no progress for";
+
+/// Whether `msg` — an error as text, its chain included — is a stalled turn's:
+/// not a failure of the work the turn was for, which a member with room does.
+pub fn is_stall_message(msg: &str) -> bool {
+    msg.contains(TURN_STALLED)
+}
+
 /// Errors produced by the conversation engine.
 #[derive(Debug, Error)]
 pub enum ConversationError {
@@ -27,6 +37,14 @@ pub enum ConversationError {
     /// decode-failure budget.
     #[error("ingest cancelled during summary decode")]
     IngestCancelled,
+
+    /// A background turn produced no token and ran no prefill chunk for
+    /// `secs` — never admitted, held behind other work the whole time, or lost
+    /// — and its wait gave it up (`handle::STALL`). The caller drops its
+    /// handle, which withdraws the turn, and hands back whatever it held for
+    /// the work, so a member with room can do it.
+    #[error("the turn made no progress for {secs} s: it was not admitted, or was lost")]
+    TurnStalled { secs: u64 },
 
     #[error("cold store I/O error: {0}")]
     StoreIo(#[from] std::io::Error),
@@ -55,4 +73,21 @@ pub enum ConversationError {
 
     #[error("{0}")]
     Other(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stalled turn's text is found by its marker, however far down an
+    /// error chain it sits.
+    #[test]
+    fn a_stalled_turn_is_found_by_its_text() {
+        let stalled = ConversationError::TurnStalled { secs: 60 }.to_string();
+        assert!(stalled.starts_with(TURN_STALLED), "{stalled}");
+        assert!(is_stall_message(&format!("decode: {stalled}")));
+        assert!(!is_stall_message(
+            &ConversationError::SchedulerGone.to_string()
+        ));
+    }
 }

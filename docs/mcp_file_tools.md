@@ -438,7 +438,7 @@ does, `{"lines", "matched", "complete"}`.
 |---|---|
 | `log_list` | Every source: its name, what it is (a member's tenant, a site, an app), how many lines it holds and its newest line's time. |
 | `log_read {source, since?, level?, limit?}` | A source's newest lines, oldest first. |
-| `log_grep {grep, source?, level?, since?, limit?, node?}` | A regular expression over one source, or every source when none is named; each line under its source. `node` names one member, as `cluster_logs` did, for Admins. |
+| `log_grep {grep, source?, level?, since?, limit?, node?, exclude?, lines_before?, lines_after?}` | A regular expression over one source, or every source when none is named; each line under its source. `node` names one member, as `cluster_logs` did, for Admins. For the cluster, `exclude` leaves a pattern's lines out of the matches, `lines_before`/`lines_after` show the log around each match, and each member says how far back its log reaches. |
 
 `log_grep` with `source: "cluster"` is what `cluster_logs` answers, so the
 connector offers `cluster_logs` no more and the connector's guides name

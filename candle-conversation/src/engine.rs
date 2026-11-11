@@ -29,9 +29,9 @@ use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
     compile, compile_steps_tail, compile_think_tree, compile_tool_call_loop, held_branches,
-    held_branches_first, HeldRules, HeldValues, HfVocab, NeverTwice, StencilTree, ThinkMode,
-    ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
-    ValueHolds, MAX_TOOL_CALLS_PER_TURN,
+    held_branches_first, HeldRules, HeldValues, HfVocab, NeverTwice, OpeningCall, StencilTree,
+    ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec,
+    TriggerRegistry, ValueHolds, MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::tenant_rank::TenantRank;
 #[cfg(feature = "memory-census")]
@@ -2159,6 +2159,28 @@ impl ConversationEngine {
             );
             return Ok(Arc::new(TriggerRegistry::new()));
         };
+        let mut registry = TriggerRegistry::new();
+        registry.register(trigger, Arc::new(self.call_loop(tools)?));
+        Ok(Arc::new(registry))
+    }
+
+    /// The opening call of a turn that must call one of `tools` before it
+    /// does anything else ([`OpeningCall`]): the marker to prefill, and the
+    /// same call loop [`Self::compile_tool_stencil`] binds to the trigger,
+    /// over `tools`. `None` when the tokenizer has no single `<tool_call>`
+    /// token, as there is then no trigger whose loop to begin inside.
+    pub fn opening_call(&self, tools: &[ToolSpec]) -> crate::Result<Option<OpeningCall>> {
+        if self.core.tokenizer.token_to_id("<tool_call>").is_none() {
+            return Ok(None);
+        }
+        Ok(Some(OpeningCall {
+            marker: ToolCallEnvelope::for_dialect(&self.core.dialect).marker,
+            tree: Arc::new(self.call_loop(tools)?),
+        }))
+    }
+
+    /// The call loop over `tools` the `<tool_call>` trigger enters.
+    fn call_loop(&self, tools: &[ToolSpec]) -> crate::Result<StencilTree> {
         // The model emits the `<tool_call>` trigger itself, so the tree resumes
         // *after* that marker: its `open` is the envelope minus the marker.
         //
@@ -2207,9 +2229,7 @@ impl ConversationEngine {
             compile_ms = started.elapsed().as_millis() as u64 - spec_ms - vocab_ms,
             "tool stencil compiled"
         );
-        let mut registry = TriggerRegistry::new();
-        registry.register(trigger, Arc::new(tree));
-        Ok(Arc::new(registry))
+        Ok(tree)
     }
 
     /// `triggers` with every tool call held to `tools`: each name branch of

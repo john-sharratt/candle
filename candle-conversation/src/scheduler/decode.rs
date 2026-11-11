@@ -33,26 +33,26 @@ pub(super) struct HealPrefill {
 }
 
 impl Scheduler {
-    /// Emit the steering finish trace: a one-line summary of the path the
-    /// stencil walk took (so a malformed tool call is diagnosable — e.g.
+    /// Note the steering finish as an event: a one-line summary of the path
+    /// the stencil walk took (so a malformed tool call is diagnosable — e.g.
     /// `bailed=true`, or `free_tokens=0` where an argument value was expected).
     /// `reason` distinguishes a clean completion from a failsafe drop.
     fn log_stencil_finish(seq_id: usize, driver: &StencilDriver, reason: &str) {
         let s = driver.stats();
-        tracing::debug!(
-            target: "candle_conversation::stencil",
-            seq_id,
-            tree = driver.tree().label(),
-            reason,
-            prefills = s.prefills,
-            prefill_tokens = s.prefill_tokens,
-            branch_tokens = s.branch_tokens,
-            free_tokens = s.free_tokens,
-            heals = s.heals,
-            dropped_delimiters = s.dropped_delimiters,
-            bailed = s.bailed,
-            "stencil steering finished",
-        );
+        note("stencil steering finished", || {
+            format!(
+                "seq_id={seq_id} tree={} reason={reason} prefills={} prefill_tokens={} \
+                 branch_tokens={} free_tokens={} heals={} dropped_delimiters={} bailed={}",
+                driver.tree().label(),
+                s.prefills,
+                s.prefill_tokens,
+                s.branch_tokens,
+                s.free_tokens,
+                s.heals,
+                s.dropped_delimiters,
+                s.bailed,
+            )
+        });
     }
 
     /// Log the expert-pipeline cost of one gap-fill wave as a before/after

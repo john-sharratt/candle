@@ -964,7 +964,7 @@ Admin-only, the read-only ones included (`host/src/commands/mod.rs`), so
 | Tool | Wraps | Returns |
 |---|---|---|
 | `cluster_status` | `GET /v1/status` (any caller; every zend member's answer, gathered by the gateway with a `group` block, `web/src/cluster/aggregate.rs`) and, for an Admin, `GET /gateway/status.json` (`web/src/cluster/page.rs`), which lists every app's members — zend, npcd, the agents and keep — with their nodes | Each member: machine, node, build, state, when it started, its tenants; for an Admin, each app's floor and ready members, upgrade candidates, faults |
-| `cluster_logs {grep?, level?, tenant?, since?, limit?, node?}` | `GET /v1/logs` (`host/src/endpoints/log_grep.rs:1-50`; `Role::User`): every member's lines, oldest first, `limit` 200 by default and 5000 at most; `node` sets `x-tokera-node` for one member | Matching lines, newest last |
+| `cluster_logs {grep?, level?, tenant?, since?, limit?, node?, exclude?, lines_before?, lines_after?}` | `GET /v1/logs` (`host/src/endpoints/log_grep.rs`; `Role::User`): every member's lines, oldest first, `limit` 200 by default and 5000 at most; `exclude` a pattern no match may match, `lines_before`/`lines_after` the context around each match (at most 20); `node` sets `x-tokera-node` for one member | Matching lines, newest last, each member saying how far back its log reaches (`held_from`) |
 | `cluster_audit {entries?}` | `GET /gateway/status.json?log=N`: the coordination log, which records each command and who ran it (`cluster/src/gateway/coord_log.rs:37-57`), held in memory for 24 hours | Who ran which command, and how it ended |
 
 `cluster_logs` answers a page, never a stream; the gateway's `/ws/logs` takes

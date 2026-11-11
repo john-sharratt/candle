@@ -9,6 +9,16 @@ use crate::TurnStats;
 use flume::{Receiver, RecvTimeoutError};
 use futures_core::Stream;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// How long a background wait lets its turn stand still — no token decoded,
+/// no prefill chunk run — before it gives the turn up
+/// ([`ConversationError::TurnStalled`]). Measured from the turn's last
+/// movement, not its start, so a long decode or a long prefill that is
+/// running never reaches it: only a turn the card has not admitted, or has
+/// held behind other work, or has lost, does. The longest a running prompt
+/// was measured standing between chunks is 22 s (`scheduler::prefill_wait`).
+pub const STALL: Duration = Duration::from_secs(60);
 
 /// Handle to an in-flight inference turn. Returned by [`crate::Sequence::submit_turn`].
 ///
@@ -46,6 +56,21 @@ impl TurnHandle {
         }
     }
 
+    /// Whether `event` is the turn doing work: a token decoded, a prefill chunk
+    /// run, or the turn ending. A turn told it still waits
+    /// ([`TurnEvent::PrefillQueued`]) has not moved, and neither has one
+    /// reporting its statistics — a turn never admitted is told it waits once
+    /// a second, and counted as moving it would never stall.
+    pub(crate) fn moves(event: &TurnEvent) -> bool {
+        matches!(
+            event,
+            TurnEvent::Token(_)
+                | TurnEvent::PrefillProgress { .. }
+                | TurnEvent::Done(_)
+                | TurnEvent::Error(_)
+        )
+    }
+
     /// Block until the turn completes. Returns the full response.
     ///
     /// Token and PrefillProgress events are consumed silently.
@@ -65,34 +90,53 @@ impl TurnHandle {
 
     /// Block until the turn completes, but abandon the wait if a graceful
     /// shutdown latches `cancel` — the token of the substrate the turn belongs
-    /// to. Used by the ingest decode-waits
-    /// ([`crate::Sequence::ingest_scope_roundtrip_indices`]) so a Ctrl-C
-    /// mid-ingest doesn't have to wait out the in-flight summary decode.
+    /// to — or once the turn has not moved ([`Self::moves`]) for [`STALL`].
+    /// Used by the background decode-waits — ingest, calibration
+    /// ([`crate::Sequence::ingest_scope_roundtrip_indices`]) — so a Ctrl-C
+    /// mid-ingest doesn't have to wait out the in-flight summary decode, and so
+    /// a turn the card never admits ends its wait instead of holding the
+    /// unit's lease for as long as the card stays full.
     ///
-    /// On cancel this returns [`ConversationError::IngestCancelled`] WITHOUT
-    /// consuming the handle; the caller drops it, and the scheduler — seeing the
-    /// closed channel — stops decode at its next step and auto-finalizes the view
-    /// slot (see the type-level docs). The poll cadence only bounds how long
-    /// after the flag flips the wait returns; it does not busy-spin, since
-    /// `recv_timeout` still delivers `Done`/`Token`/etc. events the moment they
-    /// arrive.
+    /// On cancel this returns [`ConversationError::IngestCancelled`], and on a
+    /// stall [`ConversationError::TurnStalled`], WITHOUT consuming the handle;
+    /// the caller drops it, and the scheduler — seeing the closed channel —
+    /// withdraws the turn's prefill or stops its decode at the next step and
+    /// auto-finalizes the view slot (see the type-level docs). The poll cadence
+    /// only bounds how long after the flag flips the wait returns; it does not
+    /// busy-spin, since `recv_timeout` still delivers `Done`/`Token`/etc.
+    /// events the moment they arrive.
     pub fn wait_cancellable(&self, cancel: &CancelToken) -> crate::Result<TurnResponse> {
-        let poll = std::time::Duration::from_millis(100);
+        self.wait_moving(cancel, STALL)
+    }
+
+    /// [`Self::wait_cancellable`] with the stall limit given.
+    fn wait_moving(&self, cancel: &CancelToken, stall: Duration) -> crate::Result<TurnResponse> {
+        let poll = Duration::from_millis(100).min(stall);
+        let mut moved = Instant::now();
         loop {
             match self.rx.recv_timeout(poll) {
                 Ok(event) => {
+                    if Self::moves(&event) {
+                        moved = Instant::now();
+                    }
                     if let Some(settled) = Self::settle(event) {
                         return settled;
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    if cancel.is_cancelled() {
-                        return Err(ConversationError::IngestCancelled);
-                    }
-                }
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(ConversationError::SchedulerGone)
                 }
+            }
+            // Every time round, not only on a quiet poll: a turn told once a
+            // second that it still waits never lets a poll go quiet.
+            if cancel.is_cancelled() {
+                return Err(ConversationError::IngestCancelled);
+            }
+            if moved.elapsed() >= stall {
+                return Err(ConversationError::TurnStalled {
+                    secs: stall.as_secs(),
+                });
             }
         }
     }
@@ -528,5 +572,73 @@ pub(crate) mod tests {
             "with the handle gone the send must fail — that failure is the \
              scheduler's stop signal"
         );
+    }
+
+    fn queued() -> TurnEvent {
+        TurnEvent::PrefillQueued {
+            ahead_tokens: 1,
+            ahead_turns: 1,
+            waiting_ms: 1_000,
+        }
+    }
+
+    /// **A turn told only that it waits stalls**: being queued is not moving,
+    /// so a turn the card never admits ends its wait — told it waits more
+    /// often than the wait polls, so no poll is ever quiet.
+    #[test]
+    fn a_turn_only_ever_queued_stalls() {
+        let (tx, rx) = flume::unbounded();
+        let handle = TurnHandle::new(rx);
+        let stall = Duration::from_millis(300);
+        let feeder = std::thread::spawn(move || {
+            while tx.send(queued()).is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let got = handle.wait_moving(&CancelToken::new(), stall);
+        assert!(matches!(got, Err(ConversationError::TurnStalled { .. })));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(handle);
+        feeder.join().unwrap();
+    }
+
+    /// **A turn that keeps moving never stalls**, however long it runs: tokens
+    /// arriving more often than the limit carry it past many limits to its end.
+    #[test]
+    fn a_turn_that_keeps_moving_never_stalls() {
+        let (tx, rx) = flume::unbounded();
+        let handle = TurnHandle::new(rx);
+        let stall = Duration::from_millis(300);
+        let feeder = std::thread::spawn(move || {
+            for i in 0..12 {
+                tx.send(TurnEvent::Token(i)).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            tx.send(TurnEvent::PrefillProgress {
+                tokens_done: 1,
+                tokens_total: 2,
+            })
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            tx.send(TurnEvent::Done(response("finished"))).unwrap();
+        });
+        let got = handle.wait_moving(&CancelToken::new(), stall).unwrap();
+        assert_eq!(got.text, "finished", "ran for ~1.4 s against a 0.3 s limit");
+        feeder.join().unwrap();
+    }
+
+    /// What moves a turn: a token, a prefill chunk, its end. Being queued and
+    /// what it was prefilled with do not.
+    #[test]
+    fn what_moves_a_turn() {
+        assert!(TurnHandle::moves(&TurnEvent::Token(1)));
+        assert!(TurnHandle::moves(&TurnEvent::PrefillProgress {
+            tokens_done: 0,
+            tokens_total: 1
+        }));
+        assert!(TurnHandle::moves(&TurnEvent::Done(response("x"))));
+        assert!(!TurnHandle::moves(&queued()));
+        assert!(!TurnHandle::moves(&TurnEvent::Prefill("p".into())));
     }
 }

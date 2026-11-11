@@ -35,6 +35,15 @@
 //! cluster that cannot propose — rejoining, drained, in fault mode — leaves a
 //! worker's turns to whoever can. On 2026-11-01 WhiteWorld, rejoining after an
 //! upgrade, took a live BlackWorld worker this way and ran it for nine minutes.
+//!
+//! **A unit's lease lasts as long as its work moves.** [`Guard`] renews on a
+//! timer for as long as it lives, and it lives as long as the reading or
+//! calibration holding it waits — so every one of those waits gives up a turn
+//! that has stood still for `candle_conversation::handle::STALL`
+//! (`ConversationError::TurnStalled`), and the guard drops with the work. A
+//! card that cannot admit the unit's turns hands the unit back within a minute
+//! instead of holding it for as long as the card stays full
+//! (`docs/replicated_substrate.md` §10.4).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};

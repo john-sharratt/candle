@@ -18,7 +18,9 @@ use candle_conversation::projection::{
     NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
-use candle_conversation::{ConversationEngine, FinishReason, Sequence, TurnOptions, TurnText};
+use candle_conversation::{
+    is_stall_message, ConversationEngine, FinishReason, Sequence, TurnOptions, TurnText,
+};
 
 use super::edges::edges;
 use super::keys::{
@@ -210,7 +212,17 @@ pub fn ingest_units(
                     return;
                 };
                 if let Err(e) = read_one(ctx, spec, job, base, files, calibrate) {
-                    if !crate::ingest_cancel::cancelled() {
+                    // A stalled turn is no flood: a full card stalls every
+                    // unit in flight at once.
+                    if is_stall_message(&format!("{e:#}")) {
+                        tracing::warn!(
+                            target: "zend::layers",
+                            layer = %spec.layer,
+                            subject = %job.subject,
+                            "unit stalled (read again next pass; not counted against the \
+                             pass's cap): {e:#}",
+                        );
+                    } else if !crate::ingest_cancel::cancelled() {
                         let n = failures.record(&job.subject, format!("{e:#}"));
                         tracing::warn!(
                             target: "zend::layers",

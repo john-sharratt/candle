@@ -12,8 +12,10 @@
 //!   - `REPRIME=1` deletes the workspace for a clean fresh baseline.
 //!
 //! The always-on instrumentation prints, for the control projection:
-//!   reproject (zero-copy rebuild) … apply_ms=… turns=… sections=… segments=…
 //!   apply_segments breakdown … n_prefill=… prefill_tokens=…
+//! and the reprojection's own split (`apply_ms`, `turns`, `sections`,
+//! `segments`) is the `reproject (zero-copy rebuild)` engine event, read from
+//! `GET /v1/events`.
 //!
 //! Run:
 //!   cargo test -p zend --test reproject_control --features cuda -- --ignored --nocapture

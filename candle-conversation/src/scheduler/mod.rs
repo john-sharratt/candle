@@ -47,6 +47,7 @@ mod gang;
 mod graph_window;
 mod guest_room;
 mod high_drain;
+mod idle_wait;
 mod injected_piece;
 mod interleave;
 #[cfg(feature = "kv-zero-check")]
@@ -93,6 +94,7 @@ pub mod turn_status;
 mod urgent_hold;
 mod wave_logits;
 mod wave_retry;
+mod wave_telemetry;
 mod wave_timing;
 mod whole_conversations;
 
@@ -191,6 +193,7 @@ use self::projection_identity::{section_content_stamp, segments_identity, turn_s
 pub(crate) use self::seal_scan::SealedProbe;
 pub use self::settle::SettleReport;
 use self::turn_group::{GroupCaseId, TurnGroup};
+use candle::engine_events::note;
 use flume::{Receiver, Sender, TryRecvError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::take;
@@ -1938,17 +1941,16 @@ fn flush_page_cut(
     }
     let after = state.pending_page_cut_after.take();
     match model.close_positional_page(slot.0) {
-        // Every reasoning block closes a page: debug, read when a page's
+        // Every reasoning block closes a page: an event, read when a page's
         // bounds are in question.
-        Ok(closed) => tracing::debug!(
-            target: "candle_conversation::scheduler::unit_boundary",
-            seq_id = slot.0,
-            closed,
-            generated = state.generated_tokens.len(),
-            after = ?after,
-            think_close_at = ?state.think_close_at,
-            "index: closed a page at a reasoning boundary"
-        ),
+        Ok(closed) => note("index: closed a page at a reasoning boundary", || {
+            format!(
+                "seq_id={} closed={closed} generated={} after={after:?} think_close_at={:?}",
+                slot.0,
+                state.generated_tokens.len(),
+                state.think_close_at,
+            )
+        }),
         Err(e) => tracing::warn!(
             seq_id = slot.0,
             "closing the index page at a reasoning boundary failed ({e}); this turn's \
@@ -2413,6 +2415,10 @@ struct WaveChannel {
     ms_sum: u64,
 }
 
+/// The wave window: [`WaveStats`] closes one this often, busy or idle, and
+/// each closing is one telemetry sample (`phase_ring::push_wave`).
+const WAVE_WINDOW: Duration = Duration::from_secs(2);
+
 /// Periodic aggregator for forward-pass batch ("wave") sizes. Lets us see
 /// whether the scheduler is actually batching wide under load without
 /// per-forward log spam — it emits a single INFO line at most every 2 s and
@@ -2697,12 +2703,18 @@ impl WaveStats {
         }
     }
 
-    /// Whether the 2 s wave window has elapsed and [`Self::flush`] should run.
+    /// Whether the [`WAVE_WINDOW`] has elapsed and [`Self::flush`] should run.
     /// Split from `flush` so the caller only pays for the VRAM query (a couple
     /// of CUDA driver calls) on the wave it actually emits, not every loop
     /// iteration.
     fn due(&self) -> bool {
-        self.window_start.elapsed() >= std::time::Duration::from_secs(2)
+        self.window_start.elapsed() >= WAVE_WINDOW
+    }
+
+    /// How long until [`Self::due`] — zero once it is. What an idle wait blocks
+    /// for at most, so an idle card's windows close on time too.
+    fn until_due(&self) -> Duration {
+        WAVE_WINDOW.saturating_sub(self.window_start.elapsed())
     }
 
     /// Emit the wave summary + phase breakdown, then reset. `kv_vram` is
@@ -2765,7 +2777,8 @@ impl WaveStats {
                 s.fwds, avg(s.seq_sum, s.fwds), s.seq_max, avg(s.tok_sum, s.fwds), s.tok_sum, avg(s.kv_sum, s.fwds), s.kv_sum, avg(s.ms_sum, s.fwds),
             ));
         }
-        let body = if parts.is_empty() {
+        let ran_forwards = !parts.is_empty();
+        let body = if !ran_forwards {
             "(no forwards)".to_string()
         } else {
             parts.join(" | ")
@@ -2890,10 +2903,22 @@ impl WaveStats {
         } else {
             String::new()
         };
-        tracing::info!(
+        // An idle window — no forward, no backlog, nothing decoding, prefilling
+        // or ingesting — is a debug line: an idle card closes one every 2 s,
+        // and at info those lines would rotate the log's quieter sources out
+        // of the files. A window with work waiting and no forward stays at
+        // info, so a stall still shows its phase split. The telemetry sample
+        // below is pushed either way.
+        let idle = !ran_forwards && backlog == 0 && slots.1 == 0 && slots.2 == 0 && slots.3 == 0;
+        let line = format!(
             "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}{trades_str}{stores_str}",
             elapsed.as_secs_f64()
         );
+        if idle {
+            tracing::debug!("{line}");
+        } else {
+            tracing::info!("{line}");
+        }
         // Phase breakdown: where the wall-clock went on the scheduler thread.
         // `drain` rising over the run ⇒ per-turn reprojection/elevate growing;
         // `reproj` rising ⇒ continuous-reproject (provenance scan/glue) growing;
@@ -7703,9 +7728,9 @@ impl Scheduler {
                 // Not an error and not always worth a warning: a model with no
                 // recurrent state never writes one, and a conversation whose
                 // first turn has not sealed has nothing to write yet.
-                tracing::debug!(
-                    "no recurrent snapshot for timeline {timeline} or any ancestor; \
-                     starting from the sequence-start state"
+                note(
+                    "no recurrent snapshot: starting from the sequence-start state",
+                    || format!("timeline={timeline}"),
                 );
                 return false;
             }
@@ -11430,19 +11455,16 @@ impl Scheduler {
         // tier walk, and — only when something is not hot — the eviction and the
         // lift itself, with how much was lifted.
         let split = |evict_us: u64, lift_us: u64| {
-            tracing::debug!(
-                target: "candle_conversation::scheduler::reproject",
-                whence,
-                pins_us,
-                tier_us,
-                evict_us,
-                lift_us,
-                sections = sections.len(),
-                turns = turns.len(),
-                lifted_sections = secs_lift.len(),
-                lifted_turns = turns_lift.len(),
-                "elevate split"
-            );
+            note("elevate split", || {
+                format!(
+                    "whence={whence} pins_us={pins_us} tier_us={tier_us} evict_us={evict_us} \
+                     lift_us={lift_us} sections={} turns={} lifted_sections={} lifted_turns={}",
+                    sections.len(),
+                    turns.len(),
+                    secs_lift.len(),
+                    turns_lift.len(),
+                )
+            });
         };
         // Everything already hot → nothing to evict or lift.
         if secs_lift.is_empty() && turns_lift.is_empty() {
@@ -12316,20 +12338,16 @@ impl Scheduler {
         let build_ms = t_build.elapsed().as_millis() as u64;
         // The prepare half step by step, where the reproject line has one field
         // per phase: which part of `scan_ms` / `swap_ms` / `apply_ms` the time is.
-        tracing::debug!(
-            target: "candle_conversation::scheduler::reproject",
-            view = view_id.0,
-            warm_us,
-            score_us,
-            observe_us,
-            identity_us,
-            snapshot_us,
-            seal_us,
-            free_us,
-            build_us = t_build.elapsed().as_micros() as u64,
-            probe_tokens = probe.len(),
-            "reproject prepare split"
-        );
+        note("reproject prepare split", || {
+            format!(
+                "view={} warm_us={warm_us} score_us={score_us} observe_us={observe_us} \
+                 identity_us={identity_us} snapshot_us={snapshot_us} seal_us={seal_us} \
+                 free_us={free_us} build_us={} probe_tokens={}",
+                view_id.0,
+                t_build.elapsed().as_micros(),
+                probe.len(),
+            )
+        });
         Ok(Some(ReprojectInFlight {
             view_id,
             parent_id,
@@ -12663,31 +12681,19 @@ impl Scheduler {
         // total instead of summed by eye.
         let total_ms = t_repro.elapsed().as_millis() as u64;
 
-        // Per-reproject timing breakdown — a diagnostic detail line, not a
-        // heartbeat; debug so a continuous-reproject run doesn't flood info.
-        tracing::debug!(
-            target: "candle_conversation::scheduler::reproject",
-            from_view = view_id.0,
-            to_view = new_view_id.0,
-            new_prefix_blocks = new_prefix_block_count,
-            tail_tokens = tail_token_count,
-            parent_blocks_after = parent_block_count,
-            new_borrowed = new_borrowed.0,
-            total_ms,
-            probe_ms,
-            scan_ms,
-            project_ms,
-            swap_ms,
-            elevate_ms,
-            glue_ms,
-            apply_ms,
-            inject_ms,
-            view_ms,
-            sections = sections_len,
-            segments = segments_len,
-            turns = n_turns_selected,
-            "reproject (zero-copy rebuild)",
-        );
+        // Per-reproject timing breakdown — an event, not a log line: a
+        // continuous-reproject run reprojects several times a second.
+        note("reproject (zero-copy rebuild)", || {
+            format!(
+                "from_view={} to_view={} new_prefix_blocks={new_prefix_block_count} \
+                 tail_tokens={tail_token_count} parent_blocks_after={parent_block_count} \
+                 new_borrowed={} total_ms={total_ms} probe_ms={probe_ms} scan_ms={scan_ms} \
+                 project_ms={project_ms} swap_ms={swap_ms} elevate_ms={elevate_ms} \
+                 glue_ms={glue_ms} apply_ms={apply_ms} inject_ms={inject_ms} view_ms={view_ms} \
+                 sections={sections_len} segments={segments_len} turns={n_turns_selected}",
+                view_id.0, new_view_id.0, new_borrowed.0,
+            )
+        });
 
         Ok(new_view_id)
     }
@@ -16792,6 +16798,7 @@ mod tests {
     }
 
     mod faulted_turn;
+    mod idle_telemetry;
     mod positional_ledger;
     mod refused_decode_tier;
     mod reproject_abandoned;

@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use candle_conversation::projection::{Builder, DecodePriority, GroupId, TimelineId};
-use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
+use candle_conversation::stencil::{OpeningCall, ThinkMode, TriggerRegistry};
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
 use zend_tools::ToolContext;
 
@@ -43,6 +43,14 @@ pub struct RefreshContext<'a> {
     /// repo_map's folder summaries run under. Compiled from the REAL tool
     /// catalog (not an empty placeholder) — see `turn_triggers`.
     pub think_triggers: Arc<TriggerRegistry>,
+    /// A file reading's opening call: the `<tool_call>` marker and the call
+    /// loop over `file_read` alone, which a file's first turn begins inside
+    /// (`code_read::run_file_conversation`), so the turn reads before it can
+    /// end — measured ending on its first token, `<|im_end|>`, for three files
+    /// whose readings were then replaced by nothing (2026-11-11). `None` when
+    /// the tokenizer has no single `<tool_call>` token, as `think_triggers`
+    /// then holds no call grammar either.
+    pub read_opening: Option<OpeningCall>,
     /// Tool-execution context a hidden ingest conversation's real `file_read`
     /// calls run against — read-only grants, the daemon's own workspace
     /// (`ToolMode::Restricted`'s context, the same one an unprivileged live

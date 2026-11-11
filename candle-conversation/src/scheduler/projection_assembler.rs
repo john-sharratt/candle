@@ -37,6 +37,7 @@ use std::hash::Hasher;
 use std::sync::Arc;
 use std::time::Instant;
 
+use candle::engine_events::note;
 use candle::{Device, Tensor};
 use candle_nn::kv_cache::{ArenaLocation, SealedSequence, WriterTail, CHUNK_SIZE};
 use candle_transformers::models::batched_inference::{
@@ -1321,30 +1322,32 @@ pub(super) fn apply_segments_build(
     // turn by turn (`timeline:index`). What a "the model answered about the
     // wrong file" report needs first: whether the turn it should have attended
     // to was in front of it at all.
-    tracing::debug!(
-        target: "candle_conversation::scheduler::reproject",
-        slot = parent_id.0,
-        timeline = ctx.slot_target.map_or(0, |t| t.timeline.raw()),
-        pieces = %pieces.iter().map(piece_label).collect::<Vec<_>>().join(" "),
-        "apply_segments: projected pieces"
-    );
+    note("apply_segments: projected pieces", || {
+        format!(
+            "slot={} timeline={} pieces={}",
+            parent_id.0,
+            ctx.slot_target.map_or(0, |t| t.timeline.raw()),
+            pieces.iter().map(piece_label).collect::<Vec<_>>().join(" "),
+        )
+    });
     // What the rebuild keeps, splices and walks, and what stands where the walk
     // starts — the facts that say why a rebuild cost what it did.
-    tracing::debug!(
-        target: "candle_conversation::scheduler::reproject",
-        slot = parent_id.0,
-        placed = held_records.len(),
-        trusted,
-        kept = plan.kept(),
-        edits = plan.edits.len(),
-        inserted = plan.inserted(),
-        evicted = plan.evicted(),
-        cut_after = plan.cut_after,
-        walk_from = plan.walk_from,
-        pieces = pieces.len(),
-        first_walked = ?pieces.get(plan.walk_from).map(piece_label),
-        "apply_segments: splice plan"
-    );
+    note("apply_segments: splice plan", || {
+        format!(
+            "slot={} placed={} trusted={trusted} kept={} edits={} inserted={} evicted={} \
+             cut_after={} walk_from={} pieces={} first_walked={:?}",
+            parent_id.0,
+            held_records.len(),
+            plan.kept(),
+            plan.edits.len(),
+            plan.inserted(),
+            plan.evicted(),
+            plan.cut_after,
+            plan.walk_from,
+            pieces.len(),
+            pieces.get(plan.walk_from).map(piece_label),
+        )
+    });
     let t_cut = Instant::now();
     let cut_span = profile::span("apply:cut_to_kept");
     cut_slot(ctx, &held_records, plan.cut_after)?;
@@ -1608,29 +1611,33 @@ pub(super) fn apply_segments_build(
     let ranges_us = t_ranges.elapsed().as_micros() as u64;
     // What the rebuild cost, by what it walked — a kept piece is free, a spliced
     // one costs itself, and every piece walked onto the tail is re-injected.
-    tracing::debug!(
-        target: "candle_conversation::scheduler::reproject",
-        slot = parent_id.0,
-        identities_us,
-        cut_us,
-        splice_us,
-        edits = plan.edits.len(),
-        inserted = plan.inserted(),
-        evicted = plan.evicted(),
-        sections_us = walk_us[0],
-        sections = walked[0],
-        turns_us = walk_us[1],
-        turns = walked[1],
-        glue_us = walk_us[2],
-        glue = walked[2],
-        ranges_us,
-        turn_resolve_us = walker.turn_resolve_us,
-        turn_inject_us = walker.turn_inject_us,
-        turn_pages_us = walker.turn_pages_us,
-        kept = plan.kept(),
-        held_pages = state.placed_pieces.iter().filter(|p| p.page.is_some()).count(),
-        "apply split"
-    );
+    note("apply split", || {
+        format!(
+            "slot={} identities_us={identities_us} cut_us={cut_us} splice_us={splice_us} \
+             edits={} inserted={} evicted={} sections_us={} sections={} turns_us={} turns={} \
+             glue_us={} glue={} ranges_us={ranges_us} turn_resolve_us={} turn_inject_us={} \
+             turn_pages_us={} kept={} held_pages={}",
+            parent_id.0,
+            plan.edits.len(),
+            plan.inserted(),
+            plan.evicted(),
+            walk_us[0],
+            walked[0],
+            walk_us[1],
+            walked[1],
+            walk_us[2],
+            walked[2],
+            walker.turn_resolve_us,
+            walker.turn_inject_us,
+            walker.turn_pages_us,
+            plan.kept(),
+            state
+                .placed_pieces
+                .iter()
+                .filter(|p| p.page.is_some())
+                .count(),
+        )
+    });
 
     // Convention assert: the slot's chunks were built in logical order (gaps
     // reserved in place), so the slot offset (Σ chunk usage) must equal the
@@ -2014,8 +2021,9 @@ fn inject_sealed_section(
     // Measured over one daemon run, that cost 1,609 lines of a 4,315-line log —
     // 37% of it — and the anomaly fired **zero** times, so the volume was paid
     // entirely to restate the ordinary case. The count is not lost: the
-    // `reproject (zero-copy rebuild)` line already carries `sections`, so "did
-    // sections reach here" is answerable at debug without a line each.
+    // `reproject (zero-copy rebuild)` engine event already carries `sections`
+    // (`GET /v1/events`), so "did sections reach here" is answerable without
+    // a line each.
     if page.is_some() {
         tracing::trace!(
             target: "candle_conversation::scheduler::reproject",

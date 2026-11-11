@@ -22,6 +22,14 @@ slot's start in unix milliseconds. The slot still filling is not answered, so
 a row once answered never changes, and every member's rows for a moment carry
 the same `at`.
 
+**A member answers every slot, busy or idle.** The scheduler closes a wave
+window every 2 s whether or not anything runs: an idle loop waits for work in
+slices that end each time a window falls due, and closes it there
+(`candle-conversation/src/scheduler/idle_wait.rs`). An idle card's rows carry
+its card — the weights it holds, its free ground — with zero tokens and no
+waves (`wave_ms` and `quanta_ms` `null`). A slot with no row therefore means
+the member did not answer, never that it had nothing to do.
+
 Within a member, a slot's samples fold as follows:
 
 | Series | Field | Fold |

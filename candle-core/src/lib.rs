@@ -85,6 +85,7 @@ mod dtype;
 pub mod dummy_cuda_backend;
 mod dummy_metal_backend;
 pub mod eager;
+pub mod engine_events;
 pub mod error;
 pub mod fletcher;
 pub mod forbidden_alloc;

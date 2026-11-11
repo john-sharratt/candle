@@ -43,7 +43,7 @@ use candle_conversation::projection::{
 use candle_conversation::provenance::gallery_arena::GroupSet;
 use candle_conversation::provenance::FOLD_GROUPS;
 use candle_conversation::stencil::{
-    compile_action_loop, ThinkMode, ToolCallEnvelope, ToolSpec, TriggerRegistry,
+    compile_action_loop, OpeningCall, ThinkMode, ToolCallEnvelope, ToolSpec, TriggerRegistry,
 };
 use candle_conversation::substrate::pcoll::POrdMap;
 use candle_conversation::substrate::Substrate;
@@ -101,7 +101,7 @@ use crate::calibrate::thinking::thinking_of;
 use crate::calibrate::{
     calibrate_layer, mark_sealed, Frame as CalibrateFrame, Layer as CalibrateLayer,
 };
-use crate::code_read::{FILE_READ_TOOL, PATH_KEY};
+use crate::code_read::{read_opening, FILE_READ_TOOL, PATH_KEY};
 use crate::coding_sampling;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
@@ -948,6 +948,10 @@ struct InferenceState {
     /// file's reading decodes under, so it can call no other tool. Built once
     /// at startup beside the stencils it narrows.
     read_stencil: Arc<TriggerRegistry>,
+    /// A file reading's opening call, which its first turn begins inside
+    /// (`RefreshContext::read_opening`). Built once at startup beside
+    /// `read_stencil`.
+    read_opening: Option<OpeningCall>,
     /// Per-effort-dial thinking-block steering trees, compiled once at startup.
     /// `None` when the tokenizer has no single `<think>`/`</think>` token.  Each
     /// turn replaces the `<think>` trigger with the dial's tree (see
@@ -1750,6 +1754,7 @@ impl InferenceState {
                 None,
             )
             .map_err(|e| anyhow::anyhow!("file reading's tool stencil: {e}"))?;
+        let read_opening = read_opening(&engine)?;
         // The thinking-block steering trees (one per non-off effort dial),
         // compiled once and reused across turns alongside the tool-call base.
         let think_steering = engine
@@ -3187,6 +3192,7 @@ impl InferenceState {
             tool_stencils,
             held_stencils: ArcSwap::default(),
             read_stencil,
+            read_opening,
             think_steering,
             passthrough: PassthroughCache::new(),
             deletions: Deletions::default(),
@@ -3283,6 +3289,7 @@ impl InferenceState {
                 Some(ts) => ts.registry_for(&self.read_stencil, ThinkMode::Off),
                 None => Arc::clone(&self.read_stencil),
             },
+            read_opening: self.read_opening.clone(),
             // Ingest reads; it runs no job, so it belongs to no lineage.
             tool_ctx: self.tool_host.context_for(
                 ToolMode::Restricted,

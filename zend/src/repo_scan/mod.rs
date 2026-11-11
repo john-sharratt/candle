@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use candle_conversation::memory_report::MemoryReport;
 use candle_conversation::projection::{self, TimelineId};
 use candle_conversation::stencil::{ThinkMode, ToolCallEnvelope, TriggerRegistry};
-use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
+use candle_conversation::{is_stall_message, ConversationEngine, Sequence, SequenceConfig};
 use zend_tools::ToolContext;
 use zend_vfs::Oid;
 
@@ -1210,6 +1210,20 @@ fn process_one_dir(
                     target: "zend::repo_scan",
                     dir = %unit.dir,
                     "shutdown cancelled decode mid-directory — dropped partial; will re-ingest next run",
+                );
+                return Ok(());
+            }
+            // A turn the card did not move for a minute is no flood: a full
+            // card stalls every folder in flight at once, and counted, they
+            // would end the pass for every folder behind them.
+            let msg = format!("{e:#}");
+            if is_stall_message(&msg) {
+                tracing::warn!(
+                    target: "zend::repo_scan",
+                    dir = %unit.dir,
+                    superseded_kept = superseded.len(),
+                    "directory ingest stalled (read again next pass; prior generation kept \
+                     live; not counted against the pass's cap): {msg}",
                 );
                 return Ok(());
             }

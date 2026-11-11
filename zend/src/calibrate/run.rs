@@ -41,7 +41,7 @@ use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::{ConversationEngine, FinishOrder, Sequence, SequenceConfig, TurnOptions};
 
-use super::permits::Permits;
+use super::permits::{Permit, Permits};
 use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
 use super::retire_replies::retire_reply_records;
@@ -223,6 +223,20 @@ pub fn calibrate_layer(
                 let Some(unit) = todo.run.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
                     return;
                 };
+                // **A unit is leased only once it can start.** Its draft's
+                // permit first, then its lease: a member holds no more units
+                // than it is working on, and the units it has not reached stay
+                // unleased for whichever member reaches them first. Leased
+                // first, every thread of a pass held a unit while most waited
+                // for a draft's place — WhiteWorld (2026-11-11) held 48 at one
+                // unit every 2.5 minutes while BlackWorld, idle, found all 48
+                // `elsewhere`.
+                let t_permit = Instant::now();
+                let permit = drafts.acquire();
+                let permit_wait_ms = t_permit.elapsed().as_millis() as u64;
+                if crate::ingest_cancel::cancelled() {
+                    return;
+                }
                 // **One member calibrates a unit.** Every member's pass plans
                 // the same units from the same replicated substrate; the one
                 // the vote names asks for them, and a calibration handed back
@@ -242,7 +256,14 @@ pub fn calibrate_layer(
                         lease
                     }
                 };
-                let outcome = calibrate_one(engine, spec, layer.base, frame, Some(&drafts), unit);
+                let outcome = calibrate_one(
+                    engine,
+                    spec,
+                    layer.base,
+                    frame,
+                    Some((permit, permit_wait_ms)),
+                    unit,
+                );
                 done(unit);
                 match outcome {
                     Ok(()) => {
@@ -418,27 +439,23 @@ pub fn calibrate_committed(
     calibrate_one(ctx.engine, spec, base, &frame, None, &unit)
 }
 
-/// Ask `unit` for its questions — holding one of `drafts`, when given, while
-/// it does — and calibrate them.
+/// Ask `unit` for its questions — holding `draft_permit`, when given with how
+/// long it was waited for, while it does, and handing it back once the draft
+/// is written — and calibrate them.
 fn calibrate_one(
     engine: &ConversationEngine,
     spec: &CalibrateSpec,
     base: &Sequence,
     frame: &Frame<'_>,
-    drafts: Option<&Permits>,
+    draft_permit: Option<(Permit<'_>, u64)>,
     unit: &Unit,
 ) -> anyhow::Result<()> {
-    let t_wait = Instant::now();
-    let (asked, permit_wait_ms, draft_ms) = {
-        let _draft = drafts.map(Permits::acquire);
-        let waited = t_wait.elapsed();
+    let permit_wait_ms = draft_permit.as_ref().map_or(0, |(_, waited)| *waited);
+    let (asked, draft_ms) = {
+        let _draft = draft_permit;
         let t_draft = Instant::now();
         let asked = draft(engine, spec, base, unit)?;
-        (
-            asked,
-            waited.as_millis() as u64,
-            t_draft.elapsed().as_millis() as u64,
-        )
+        (asked, t_draft.elapsed().as_millis() as u64)
     };
     let found = questions(&asked, spec.questions);
     if found.is_empty() {

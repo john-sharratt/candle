@@ -6696,6 +6696,20 @@ impl Substrate {
             .unwrap_or_default()
     }
 
+    /// `f` of this turn's user text, read in place — for a check over many
+    /// turns whose user halves are long (a tool round's results), which
+    /// [`Self::user_text_of`] would copy each time. `None` for a turn the
+    /// substrate does not hold.
+    pub fn with_user_text<R>(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        f: impl FnOnce(&str) -> R,
+    ) -> Option<R> {
+        self.turn(timeline, index)
+            .map(|e| f(e.content.layout.user_text()))
+    }
+
     /// The assistant's decoded reply text for this turn — the full message
     /// (reasoning block + answer), reconstructed by [`TurnLayout::assistant_text`].
     pub fn assistant_text_of(&self, timeline: TimelineId, index: TurnIndex) -> String {

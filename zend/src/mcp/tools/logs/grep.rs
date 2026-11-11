@@ -1,14 +1,15 @@
-//! `log_grep {grep, source?, level?, since?, limit?, tenant?, node?}`: a
-//! regular expression over one source, or over every source when none is
-//! named, each line under its source. `source: "cluster"` is what the
-//! worker's `cluster_logs` answers.
+//! `log_grep {grep, source?, level?, since?, limit?, tenant?, node?, exclude?,
+//! lines_before?, lines_after?}`: a regular expression over one source, or
+//! over every source when none is named, each line under its source.
+//! `source: "cluster"` is what the worker's `cluster_logs` answers; `exclude`
+//! and the context are the cluster's.
 
 use futures::future::join_all;
 use serde_json::{json, Value};
 
 use super::{cluster_text, search_properties, site_entry, sites, Source};
 use crate::mcp::ops_tools::OpsCall;
-use crate::mcp::tools::cluster_logs::render;
+use crate::mcp::tools::cluster_logs::{context_properties, merge, render};
 use crate::mcp::tools::{string, Answer, Ctx};
 
 pub const NAME: &str = "log_grep";
@@ -19,15 +20,18 @@ pub fn definition() -> Value {
     properties["source"] = json!({"type": "string", "description": "One source — `cluster`, `yenbot`, `yenbot/<app>` — as `log_list` names them; every source when left out."});
     properties["tenant"] = json!({"type": "string", "enum": ["zend", "npcd"], "description": "For the cluster: only one app's lines — `zend`, the coding service, or `npcd`, the bots'."});
     properties["node"] = json!({"type": "string", "description": "For the cluster: one member's node id, as `cluster_status` lists it (Admins only)."});
+    merge(&mut properties, context_properties());
     json!({
         "name": NAME,
         "annotations": {"readOnlyHint": true},
         "description": "Search the logs for what they say about a symptom: every source's matching lines — the \
             cluster's machines, Yen Bots and each of its apps — or one source's, oldest first, each under \
             its source and cut at 400 characters. `grep` is a regular expression found anywhere in a line; \
-            narrow with `level`, `since` (UTC), and for the cluster `tenant` and `node`. When more lines \
-            match than `limit`, the newest are kept and the answer says earlier ones were left out. Cite \
-            the lines you rely on.",
+            narrow with `level`, `since` (UTC), and for the cluster `tenant`, `node` and `exclude`, and see \
+            the cluster's lines around each match with `lines_before` and `lines_after`. Each cluster \
+            member says how far back its log reaches: nothing found before that is the log not reaching \
+            back, not nothing having happened. When more lines match than `limit`, the newest are kept \
+            and the answer says earlier ones were left out. Cite the lines you rely on.",
         "inputSchema": {
             "type": "object",
             "properties": properties,

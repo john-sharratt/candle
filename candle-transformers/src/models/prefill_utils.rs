@@ -43,6 +43,8 @@ use std::sync::Arc;
 
 use crate::models::wave_buffers::KernelOutput;
 #[cfg(feature = "cuda")]
+use candle::engine_events::note;
+#[cfg(feature = "cuda")]
 use candle::LiveTensor;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::WaveGeneration;
@@ -1610,21 +1612,22 @@ impl<'k> PagedPrefillInt8<'k> {
                     // how many key chunks each row group re-stages and walks,
                     // and how wide a row's selection is.
                     if total_q >= PREFILL_KV_STAGE_MIN_Q_LEN {
-                        tracing::debug!(
-                            target: "candle_transformers::prefill_launch",
-                            seqs = self.batch_size,
-                            rows = total_q,
-                            max_q = self.max_q_len,
-                            max_kv = self.cut.max_kv_len,
-                            groups = self.cut.group_chunks.len(),
-                            chunks = self.cut.group_chunks.iter().sum::<u32>(),
-                            group_blocks = layout.group_blocks,
-                            stage_positions = layout.stage_positions,
-                            carry_tokens = layout.carry_tokens,
-                            selection_stride = sel_stride,
-                            paged = !sel_pages.is_null(),
-                            "bulk prefill attention launch",
-                        );
+                        note("bulk prefill attention launch", || {
+                            format!(
+                                "seqs={} rows={total_q} max_q={} max_kv={} groups={} \
+                                 chunks={} group_blocks={} stage_positions={} \
+                                 carry_tokens={} selection_stride={sel_stride} paged={}",
+                                self.batch_size,
+                                self.max_q_len,
+                                self.cut.max_kv_len,
+                                self.cut.group_chunks.len(),
+                                self.cut.group_chunks.iter().sum::<u32>(),
+                                layout.group_blocks,
+                                layout.stage_positions,
+                                layout.carry_tokens,
+                                !sel_pages.is_null(),
+                            )
+                        });
                     }
                     run_paged_prefill_int8(
                         q_ptr as *const core::ffi::c_void,

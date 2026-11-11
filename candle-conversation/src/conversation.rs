@@ -12,6 +12,7 @@ use crate::provenance::boundaries::BoundaryRule;
 use crate::recorded_reply::{recorded_reply, RecordedReply};
 use crate::recovered::recovered_from;
 use crate::recovered_message::{RecoveredMessage, TOOL_RESPONSE_OPEN};
+use candle::engine_events::note;
 use candle_transformers::models::delta_net::ExportedLayerState;
 
 use crate::persistence::content_hash::{
@@ -723,11 +724,9 @@ pub(crate) fn install_branch_states(
                 for _ in 0..n_slots {
                     note_branch_checkpoint_installed();
                 }
-                tracing::debug!(
-                    layers = n_layers,
-                    slots = n_slots,
-                    "installed prompt branch checkpoint"
-                );
+                note("installed prompt branch checkpoint", || {
+                    format!("layers={n_layers} slots={n_slots}")
+                });
             }
             // The scheduler reports `false` when no slot took the state — a
             // refused import, which leaves the recurrent layers at zero while
@@ -1247,18 +1246,19 @@ impl Sequence {
             prefix,
             payload,
         });
-        // Per-conversation, so `debug`: a phase that opens hundreds of them
-        // would otherwise emit hundreds of info lines. The parts are split
+        // Per-conversation, so an event: a phase that opens hundreds of them
+        // would otherwise write hundreds of lines. The parts are split
         // because they have very different characters — `ingest` is this
         // thread's own walk of the schema and `ckpt` is a memo hit or a forward.
-        tracing::debug!(
-            target: "candle_conversation::sequence_construction",
-            prompt_ms = prompt_ms.as_millis() as u64,
-            items_ms = items_ms.as_millis() as u64,
-            ingest_ms = ingest_ms.as_millis() as u64,
-            ckpt_ms = ckpt_ms.as_millis() as u64,
-            "sequence construction"
-        );
+        note("sequence construction", || {
+            format!(
+                "prompt_ms={} items_ms={} ingest_ms={} ckpt_ms={}",
+                prompt_ms.as_millis(),
+                items_ms.as_millis(),
+                ingest_ms.as_millis(),
+                ckpt_ms.as_millis(),
+            )
+        });
         // From here until the first turn advances it, this conversation's
         // state is exactly the installed prompt checkpoint — the window in
         // which a dial-selected branch may swap it.

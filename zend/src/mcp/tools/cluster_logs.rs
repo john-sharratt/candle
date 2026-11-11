@@ -39,45 +39,82 @@ const WITHIN: Duration = Duration::from_secs(30);
 const DEFAULT_LIMIT: u64 = 100;
 const MAX_LIMIT: u64 = 5000;
 
+/// The most lines of context a member shows on either side of a match.
+const MAX_CONTEXT: u64 = 20;
+
 /// The most of one line shown: a line that dumps a structure runs to
 /// kilobytes, and its head says what it is.
 const LINE_CHARS: usize = 400;
 
 pub fn definition() -> Value {
+    let mut properties = json!({
+        "grep": {"type": "string", "description": "A regular expression; a line is kept when it is found anywhere in it."},
+        "level": {"type": "string", "enum": ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"], "description": "The least level kept."},
+        "tenant": {"type": "string", "enum": ["zend", "npcd"], "description": "Only lines one app wrote: `zend`, the coding service these tools run on, or `npcd`, the bots'."},
+        "since": {"type": "string", "description": "Only lines stamped at or after this: an RFC 3339 prefix such as `2026-10-16T00:20`."},
+        "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "The most lines per member, the newest kept (100 by default)."},
+        "node": {"type": "string", "description": "One member's node id, as `cluster_status` lists it (Admins only)."}
+    });
+    merge(&mut properties, context_properties());
     json!({
         "name": NAME,
         "annotations": {"readOnlyHint": true},
         "description": "Search the logs of the cluster's members — the machines running the motherd daemon — for \
             what they say about a symptom: every member's matching lines, oldest first, each under its member, \
             each cut at 400 characters. `grep` is a regular expression found anywhere in a line; narrow with \
-            `level`, `tenant` and `since` (UTC). When more lines match than `limit`, the newest are kept and \
-            the answer says earlier ones were left out: narrow the search, or name `since`, to see them. Cite \
-            the lines you rely on.",
+            `level`, `tenant`, `since` (UTC) and `exclude`, and see the lines around each match with \
+            `lines_before` and `lines_after`. Each member says how far back its log reaches, so nothing \
+            found before that is the log not reaching back, not nothing having happened. When more lines \
+            match than `limit`, the newest are kept and the answer says earlier ones were left out: narrow \
+            the search, or name `since`, to see them. Cite the lines you rely on.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "grep": {"type": "string", "description": "A regular expression; a line is kept when it is found anywhere in it."},
-                "level": {"type": "string", "enum": ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"], "description": "The least level kept."},
-                "tenant": {"type": "string", "enum": ["zend", "npcd"], "description": "Only lines one app wrote: `zend`, the coding service these tools run on, or `npcd`, the bots'."},
-                "since": {"type": "string", "description": "Only lines stamped at or after this: an RFC 3339 prefix such as `2026-10-16T00:20`."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "The most lines per member, the newest kept (100 by default)."},
-                "node": {"type": "string", "description": "One member's node id, as `cluster_status` lists it (Admins only)."}
-            },
+            "properties": properties,
             "additionalProperties": false
         }
     })
 }
 
+/// `extra`'s fields added to `into`'s.
+pub fn merge(into: &mut Value, extra: Value) {
+    if let (Some(into), Value::Object(extra)) = (into.as_object_mut(), extra) {
+        into.extend(extra);
+    }
+}
+
+/// How far back a member's log reaches, from its search's answer's
+/// `held_from`; `None` when the member does not say.
+fn reach(body: &Value) -> Option<String> {
+    body.get("held_from")
+        .and_then(Value::as_str)
+        .map(|h| format!("its log holds every line from {h}"))
+}
+
 /// The `/v1/logs` request `args` asks for.
 pub fn path_of(args: &Value) -> String {
     let mut q = Serializer::new(String::new());
-    for key in ["grep", "level", "tenant", "since"] {
+    for key in ["grep", "exclude", "level", "tenant", "since"] {
         if let Some(v) = args.get(key).and_then(Value::as_str) {
             q.append_pair(key, v);
         }
     }
+    for key in ["lines_before", "lines_after"] {
+        if let Some(n) = args.get(key).and_then(Value::as_u64) {
+            q.append_pair(key, &n.min(MAX_CONTEXT).to_string());
+        }
+    }
     q.append_pair("limit", &limit_of(args).to_string());
     format!("/v1/logs?{}", q.finish())
+}
+
+/// The search options a member's `/v1/logs` takes beyond the pattern, the
+/// level and the window: shared by every tool that searches the cluster.
+pub fn context_properties() -> Value {
+    json!({
+        "exclude": {"type": "string", "description": "A regular expression; a line it is found in is no match — the noise `grep` alone cannot leave out."},
+        "lines_before": {"type": "integer", "minimum": 0, "maximum": MAX_CONTEXT, "description": "Lines of the log shown before each match, as `grep -B`; runs that do not touch are parted by `--`."},
+        "lines_after": {"type": "integer", "minimum": 0, "maximum": MAX_CONTEXT, "description": "Lines of the log shown after each match, as `grep -A`."}
+    })
 }
 
 /// The lines a search asks for: `limit`, or the default, at most the most.
@@ -269,6 +306,9 @@ pub fn render(envelope: &Value) -> String {
                 ));
             }
         }
+        if let Some(reach) = reach(&body) {
+            out.push_str(&format!(" ({reach})"));
+        }
         for line in lines {
             out.push('\n');
             if line.chars().count() > LINE_CHARS {
@@ -355,6 +395,36 @@ mod tests {
             "/v1/logs?grep=a+b%7Cc&level=WARN&limit=5000"
         );
         assert_eq!(path_of(&json!({})), "/v1/logs?limit=100");
+    }
+
+    /// The noise left out and the context asked for reach the member, the
+    /// context held to what a member shows.
+    #[test]
+    fn the_query_carries_exclude_and_context() {
+        assert_eq!(
+            path_of(&json!({"grep": "lease", "exclude": "relief|wave",
+                            "lines_before": 3, "lines_after": 99})),
+            "/v1/logs?grep=lease&exclude=relief%7Cwave&lines_before=3&lines_after=20&limit=100"
+        );
+    }
+
+    /// **Each member says how far back its log reaches**, so a search that
+    /// finds nothing older reads as the log not reaching back.
+    #[test]
+    fn a_member_says_how_far_back_its_logs_reach() {
+        let envelope = json!({"members": [
+            {"host": "ww", "node": "02", "status": 200,
+             "body": {"lines": ["2026 INFO z"], "matched": 1, "complete": true,
+                      "held_from": "2026-11-11T19:30:01.5Z"}},
+            {"host": "bw", "node": "01", "status": 200,
+             "body": {"lines": [], "matched": 0, "held_from": "2026-11-11T18:00:00.0Z"}}
+        ]});
+        assert_eq!(
+            render(&envelope),
+            "ww 02: 1 of 1 matching lines (its log holds every line from \
+             2026-11-11T19:30:01.5Z)\n2026 INFO z\n\n\
+             bw 01: 0 of 0 matching lines (its log holds every line from 2026-11-11T18:00:00.0Z)"
+        );
     }
 
     /// **Each member's lines come under it**, a long line cut, and lines

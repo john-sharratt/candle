@@ -147,7 +147,7 @@ pub use engine::{
     ConversationEngine, EngineAttacher, SubstrateReloadStatus, SubstrateReloader, ThinkSteering,
 };
 pub use engine_slot::{Capabilities, EngineSlot, EngineSource, EngineTicket};
-pub use error::ConversationError;
+pub use error::{is_stall_message, ConversationError};
 pub use finish_order::{FinishOrder, Finished};
 pub use group_scanner::{GroupScanner, ScanRefused};
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};

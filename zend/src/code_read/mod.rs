@@ -28,6 +28,7 @@ pub mod binary_mark;
 mod ingest_rate;
 mod lines;
 mod link;
+mod reading_break;
 
 pub(crate) use link::ingest_link;
 
@@ -35,21 +36,26 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::chain_health::{chain_break, ChainBreak};
+use candle_conversation::chain_health::produced_no_answer;
 use candle_conversation::persistence::identity::now_ms;
 use candle_conversation::projection::{
     OptionalState, SelectionState, TimelineId, FORCE_TOOL_SELECTOR, NO_THINK_SELECTOR,
     TOOLS_ENABLED_SELECTOR,
 };
-use candle_conversation::stencil::{TriggerRegistry, MAX_TOOL_CALLS_PER_TURN};
-use candle_conversation::{
-    is_ground_refusal_message, ConversationEngine, Sequence, TurnOptions, TurnText,
+use candle_conversation::stencil::{
+    OpeningCall, ToolSpec, TriggerRegistry, MAX_TOOL_CALLS_PER_TURN,
 };
+use candle_conversation::{
+    is_ground_refusal_message, is_stall_message, ConversationEngine, Sequence, TurnOptions,
+    TurnText,
+};
+use serde_json::Value;
 use zend_tools::tools::file::render::{range_value, windows, PAGE_LINES};
 use zend_tools::ToolContext;
 use zend_vfs::{ObjectFormat, Oid};
 
 use self::lines::line_count;
+use self::reading_break::{reading_break, Broken};
 use crate::branch_ingest::filter::{language_of, MAX_FILE_BYTES};
 use crate::branch_ingest::keys::{
     branches_value, file_key, quant_tags, BLOB_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY,
@@ -67,7 +73,8 @@ use crate::refresh_ctx::RefreshContext;
 use crate::repo_path::split;
 use crate::repo_scan::{is_binary_sample, Language};
 use crate::tool_round;
-use crate::tools::format_tool_responses;
+use crate::tools::{catalog_for, format_tool_responses, ToolResult};
+use crate::types::ToolMode;
 use crate::workspace::UPLOADS_REPO;
 
 /// Metadata key holding a file conversation's workspace-relative path.
@@ -111,8 +118,8 @@ impl FileJob {
 /// worked example of an assistant that deliberates and produces nothing, which
 /// later conversations then imitated.
 ///
-/// So each keyed timeline is asked whether its chain finished
-/// ([`chain_break`]). An unfinished one is left out of what the pass plans
+/// So each keyed timeline is asked whether its chain finished, and its reads
+/// found the file ([`reading_break`]). An unfinished one is left out of what the pass plans
 /// against, so its key reads as held by nothing and the file is queued again;
 /// [`process_one_file`] defers the unfinished generation and retires it only
 /// once the rebuild commits — recovery with nothing lost in between.
@@ -162,15 +169,16 @@ pub fn arriving(engine: &ConversationEngine) -> Vec<Committed> {
 
 /// What [`scan_ingest_chains`] found: the keyed conversations whose chain
 /// finished, the peers' whose later turns are on their way, and the paths
-/// whose chain stopped part-way.
+/// whose chain stopped part-way or never read its file.
 struct IngestChains {
     finished: Vec<Committed>,
     arriving: Vec<Committed>,
-    broken: Vec<(String, ChainBreak)>,
+    broken: Vec<(String, Broken)>,
 }
 
 /// Every keyed `code_reading` conversation, uploads included, sorted by
-/// whether the chain that wrote it finished ([`chain_break`]).
+/// whether it holds its file: its chain finished and its reads found the file
+/// ([`reading_break`]).
 fn scan_ingest_chains(engine: &ConversationEngine) -> IngestChains {
     let eng = engine;
     let keys: HashMap<TimelineId, String> = eng
@@ -199,7 +207,7 @@ fn scan_ingest_chains(engine: &ConversationEngine) -> IngestChains {
             stamp: first.unwrap_or_default(),
             quant: quants.get(&timeline).copied(),
         };
-        match chain_break(&substrate, timeline) {
+        match reading_break(&substrate, timeline) {
             None => out.finished.push(unit(path)),
             // Still arriving: a gap is a turn whose records are on their way,
             // and a peer's reading inside its grace may be missing its last.
@@ -231,7 +239,7 @@ fn finished_content_keys(engine: &ConversationEngine) -> HashSet<String> {
 /// Whether `timeline`'s ingest chain finished — the fast path's gate before it
 /// hands a file conversation to a live one as already read (see [`committed`]).
 pub(crate) fn chain_finished(engine: &ConversationEngine, timeline: TimelineId) -> bool {
-    chain_break(&engine.conversation().read(), timeline).is_none()
+    reading_break(&engine.conversation().read(), timeline).is_none()
 }
 
 /// Maximum tolerated per-file summary decode failures in a single
@@ -1032,14 +1040,29 @@ fn process_one_file(
     // stores of its own — reading the commit the file was found on: nothing
     // another unit, or a live dialogue, changed is what it reads.
     let unit_ctx = Arc::new(tools);
-    let summary = match run_file_conversation(
+    // **A reading that answered nothing failed.** Its chain is one a later
+    // pass finds broken (`ChainBreak::NoAnswer`) and reads again; committed,
+    // it superseded — tombstoned — the generation that did read the file, and
+    // every pass after replaced one empty reading with the next. Three files
+    // on 2026-11-11 lost their readings that way. So it fails here, as any
+    // failed attempt does: this attempt goes, and the prior generation stays.
+    let read = run_file_conversation(
         &mut conv,
         &file.path,
         lines,
         &ranges,
         &ctx.think_triggers,
+        ctx.read_opening.as_ref(),
         &unit_ctx,
-    ) {
+    )
+    .and_then(|text| match produced_no_answer(&text) {
+        true => Err(anyhow::anyhow!(
+            "{READ_NOTHING} ({} chars, none of them kept)",
+            text.len()
+        )),
+        false => Ok(text),
+    });
+    let summary = match read {
         Ok(text) => text,
         Err(e) => {
             // The deferred tombstone is the safety net here: the prior good
@@ -1091,6 +1114,23 @@ fn process_one_file(
                     resubmit.store(true, Ordering::Relaxed);
                     return Ok(());
                 }
+            }
+            // **One reading's own failure is no flood.** A turn the card did not
+            // move for a minute, a read that found some other path, an answer of
+            // nothing: each is this file's attempt failing, which the next pass
+            // reads again, not the systemic failure the cap stops a pass for. A
+            // full card stalls every reading in flight at once, and counted,
+            // sixteen of them would end the pass for every file behind them.
+            let msg = format!("{e:#}");
+            if is_stall_message(&msg) || is_reading_failure(&msg) {
+                tracing::warn!(
+                    target: "zend::code_read::ingest",
+                    file = %file.path,
+                    superseded_kept = superseded.len(),
+                    "file ingest failed (read again next pass; prior generation kept live; \
+                     not counted against the pass's cap): {msg}",
+                );
+                return Ok(());
             }
             let n = failures.record(&file.path, format!("{e:#}"));
             tracing::warn!(
@@ -1244,6 +1284,74 @@ fn file_selection() -> SelectionState {
     selection
 }
 
+/// What a reading that answered nothing fails with.
+const READ_NOTHING: &str = "the reading ended without an answer";
+
+/// What a reading whose `file_read` found no file fails with.
+const READ_ELSEWHERE: &str = "the reading's file_read found no file";
+
+/// Whether `msg` is a reading's own failure — it answered nothing, or read
+/// some other path — rather than the engine's.
+fn is_reading_failure(msg: &str) -> bool {
+    msg.contains(READ_NOTHING) || msg.contains(READ_ELSEWHERE)
+}
+
+/// The file a round's `file_read` found missing, as `repo:path`, when one did.
+///
+/// **A reading that read no file failed.** It reads the one file its prompt
+/// names, so a `not_found` means a call named something else — and a reading
+/// that went on from there searched for the file until its round cap and
+/// answered about the search: committed as finished, it superseded the reading
+/// that had read the file. On 2026-11-11 about 115 readings went that way,
+/// `candle-conversation/src/turn_layout.rs` read as `src/turn_layout.rs` nine
+/// times over. Failed, the attempt goes and the generation before it stays.
+fn read_not_found(results: &[ToolResult]) -> Option<String> {
+    results
+        .iter()
+        .filter(|r| r.call.name == FILE_READ_TOOL)
+        .find(|r| r.response.get("error").and_then(Value::as_str) == Some("not_found"))
+        .map(|r| {
+            let arg = |k: &str| {
+                r.call
+                    .arguments
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            };
+            format!("{}:{}", arg("repo"), arg("path"))
+        })
+}
+
+/// A file reading's opening call ([`RefreshContext::read_opening`]): the call
+/// loop over `file_read` as the Restricted catalog declares it, with the marker
+/// to prefill. `None` when the tokenizer has no `<tool_call>` token or the
+/// catalog offers no `file_read`, as no reading can call it then either.
+pub fn read_opening(engine: &ConversationEngine) -> anyhow::Result<Option<OpeningCall>> {
+    let tools: Vec<ToolSpec> = catalog_for(ToolMode::Restricted)
+        .into_iter()
+        .filter(|spec| spec.name == FILE_READ_TOOL)
+        .collect();
+    if tools.is_empty() {
+        return Ok(None);
+    }
+    engine
+        .opening_call(&tools)
+        .map_err(|e| anyhow::anyhow!("file reading's opening call: {e}"))
+}
+
+/// The options a file's first turn adds to its turn's: begin inside
+/// `opening`'s call loop, its marker prefilled, so the turn opens with a
+/// `file_read` call rather than choosing whether to. Only the first turn: the
+/// turns after it carry the reads' results, and the reading may answer once it
+/// holds the file.
+fn opening_options(options: TurnOptions, opening: &OpeningCall) -> TurnOptions {
+    TurnOptions {
+        assistant_prefill: Some(opening.marker.clone()),
+        turn_grammar: Some(Arc::clone(&opening.tree)),
+        ..options
+    }
+}
+
 /// Drive `conv` as a REAL, hidden tool-using conversation asking it to read and
 /// describe `path` — exactly the machinery a live chat turn uses
 /// (`submit_turn_with_options` → real decode → real tool dispatch → repeat, see
@@ -1253,12 +1361,17 @@ fn file_selection() -> SelectionState {
 /// if the file is long — before it answers; whatever it says once it stops
 /// calling tools IS the file's summary — there is no separate summary-decode
 /// step to run afterward.
+///
+/// The first turn begins inside `opening`'s call loop when given
+/// ([`opening_options`]): left to choose, a reading has ended on its first
+/// token with no call and no answer.
 fn run_file_conversation(
     conv: &mut Sequence,
     path: &str,
     lines: usize,
     ranges: &[(usize, usize)],
     triggers: &Arc<TriggerRegistry>,
+    opening: Option<&OpeningCall>,
     tool_ctx: &Arc<ToolContext>,
 ) -> anyhow::Result<String> {
     let tags = vec!["code".to_string(), path.to_string()];
@@ -1300,6 +1413,10 @@ fn run_file_conversation(
             tags: tags.clone(),
             ..Default::default()
         };
+        let options = match opening {
+            Some(opening) if round == 0 && !closing => opening_options(options, opening),
+            _ => options,
+        };
         let handle = conv
             .submit_turn_with_options(current_message, options)
             .map_err(|e| anyhow::anyhow!("submit_turn: {e}"))?;
@@ -1316,6 +1433,9 @@ fn run_file_conversation(
         }
 
         let results = tool_round::run(tool_ctx, steps);
+        if let Some(missing) = read_not_found(&results) {
+            anyhow::bail!("{READ_ELSEWHERE} {missing}: it read something other than `{path}`");
+        }
         let response = format_tool_responses(&results);
         // A tool round that produces no response text must NOT spawn a
         // follow-up turn — see `session::run_inference_stream`'s identical
@@ -1340,6 +1460,12 @@ fn run_file_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolCall;
+    use candle_conversation::stencil::{
+        compile, compile_tool_call_tree, parse_tools, TestVocab, ToolCallEnvelope,
+    };
+    use serde_json::json;
+    use std::slice::from_ref;
 
     /// **A file read runs with thinking off in both halves, and its one tool.**
     /// The prompt's no-think switch and the effort dial agree with the
@@ -1355,6 +1481,81 @@ mod tests {
             Some(OptionalState::Present)
         );
         assert_eq!(s.get(FORCE_TOOL_SELECTOR), Some(FILE_READ_TOOL));
+    }
+
+    /// **A file's first turn begins inside its call**: the marker prefilled
+    /// and the call loop armed, everything else the turn was given kept.
+    #[test]
+    fn the_opening_turn_begins_inside_the_file_read_call() {
+        let tools = parse_tools(
+            r#"[{"name":"file_read","params":[{"name":"path","type":"string","required":true}]}]"#,
+        )
+        .unwrap();
+        let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3()).unwrap();
+        let opening = OpeningCall {
+            marker: "<tool_call>".into(),
+            tree: Arc::new(compile(&spec, &TestVocab::new()).unwrap()),
+        };
+        let given = TurnOptions {
+            max_tokens: Some(7),
+            tags: vec!["code".into()],
+            ..Default::default()
+        };
+        let opened = opening_options(given, &opening);
+        assert_eq!(opened.assistant_prefill.as_deref(), Some("<tool_call>"));
+        assert!(opened
+            .turn_grammar
+            .as_ref()
+            .is_some_and(|t| Arc::ptr_eq(t, &opening.tree)));
+        assert_eq!(opened.max_tokens, Some(7));
+        assert_eq!(opened.tags, ["code"]);
+    }
+
+    /// **A read that found no file fails the reading**, naming what it asked
+    /// for; reads that found their file, and other tools' errors, do not.
+    #[test]
+    fn a_file_read_not_found_fails_the_reading() {
+        let result = |name: &str, path: &str, response: Value| ToolResult {
+            call: ToolCall {
+                name: name.into(),
+                arguments: json!({"repo": "candle", "path": path, "lines": "1-214"}),
+            },
+            response,
+        };
+        let found = result(
+            FILE_READ_TOOL,
+            "candle-conversation/src/turn_layout.rs",
+            json!({"parts": []}),
+        );
+        let missing = result(
+            FILE_READ_TOOL,
+            "src/turn_layout.rs",
+            json!({"error": "not_found", "detail": "file not found: src/turn_layout.rs"}),
+        );
+        let other = result(
+            "file_list",
+            "src",
+            json!({"error": "not_found", "detail": "x"}),
+        );
+        assert_eq!(read_not_found(from_ref(&found)), None);
+        assert_eq!(
+            read_not_found(&[other]),
+            None,
+            "only a file_read fails a reading"
+        );
+        assert_eq!(
+            read_not_found(&[found, missing]).as_deref(),
+            Some("candle:src/turn_layout.rs")
+        );
+    }
+
+    /// **An answer of nothing is no reading**: a turn that ended at once, or
+    /// one that only reasoned, keeps nothing a summary could be.
+    #[test]
+    fn an_empty_answer_is_no_reading() {
+        assert!(produced_no_answer(""));
+        assert!(produced_no_answer("<think>\nI will read it"));
+        assert!(!produced_no_answer("ladder.rs builds the load ladder."));
     }
 
     /// A file job's key is the branch walk's key for the same file — the one

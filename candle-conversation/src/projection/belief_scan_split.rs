@@ -2,8 +2,8 @@
 //! one scan visits.
 //!
 //! The per-group line is `trace` — there are ~17 groups a scan and it was a
-//! quarter of a daemon log — so the per-scan `belief scan phase split` line
-//! carries their totals: the one number per phase that says whether the group
+//! quarter of a daemon log — so the per-scan `belief scan phase split` engine
+//! event (`GET /v1/events`) carries their totals: the one number per phase that says whether the group
 //! half grew in its host walk (`select` / `assemble`), its launches (`score`) or
 //! its normalization.
 //!

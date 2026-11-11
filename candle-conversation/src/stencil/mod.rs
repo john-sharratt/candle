@@ -45,6 +45,7 @@ mod json_lexer;
 mod mask;
 mod named_arm;
 mod never_twice;
+mod opening_call;
 mod session;
 mod sim;
 mod spec;
@@ -86,6 +87,7 @@ pub use held_values::{literal_pattern, FieldHold, HeldRules, HeldValues, ValueHo
 pub use mask::{ban, boost, AllowedSet};
 pub use named_arm::{arm_name, named_arm};
 pub use never_twice::NeverTwice;
+pub use opening_call::OpeningCall;
 pub use session::{Observe, StencilAction, StencilSession};
 pub use sim::{lowest_arm_policy, simulate, Oracle, SimError, SimRun};
 pub use spec::{LabeledNode, LabeledTree, NodeSpec, SpecId, TreeSpec};

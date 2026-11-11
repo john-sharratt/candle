@@ -1,6 +1,7 @@
 //! [`Conversation`] — the workspace-shared substrate handle, and
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
+use candle::engine_events::note;
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
@@ -1633,40 +1634,46 @@ impl Conversation {
         profile::record("beliefs:arena:readback", us(arena.readback_us));
         profile::record("beliefs:arena:rows", us(arena.rows_us));
         profile::record("beliefs:arena:tally", us(arena.tally_us));
-        tracing::debug!(
-            target: "candle_conversation::provenance",
-            probe_windows = probe.len(),
-            collections_us = coll_us,
-            groups_us = t_groups.elapsed().as_micros() as u64,
-            groups_scanned = groups.scanned,
-            group_windows = groups.windows,
-            group_turns = groups.turns,
-            select_us = groups.select_us,
-            assemble_us = groups.assemble_us,
-            score_us = groups.score_us,
-            normalize_us = groups.normalize_us,
-            files = groups.files,
-            walk_us = groups.walk_us,
-            exchange_us = groups.exchange_us,
-            cal_built = groups.cal_built,
-            cal_windows = groups.cal_windows,
-            cal_us = groups.cal_us,
-            segments_us = groups.segments_us,
-            arena_scans = arena.scans,
-            arena_launches = arena.launches,
-            arena_segments = arena.segments,
-            arena_fresh_tokens = arena.fresh_tokens,
-            arena_index_us = arena.index_us,
-            arena_fingerprint_us = arena.fingerprint_us,
-            arena_windows = arena.windows,
-            arena_pinned = arena.pinned,
-            arena_upload_us = arena.upload_us,
-            arena_kernel_us = arena.kernel_us,
-            arena_readback_us = arena.readback_us,
-            arena_rows_us = arena.rows_us,
-            arena_tally_us = arena.tally_us,
-            "belief scan phase split"
-        );
+        note("belief scan phase split", || {
+            format!(
+                "probe_windows={} collections_us={coll_us} groups_us={} groups_scanned={} \
+                 group_windows={} group_turns={} select_us={} assemble_us={} score_us={} \
+                 normalize_us={} files={} walk_us={} exchange_us={} cal_built={} \
+                 cal_windows={} cal_us={} segments_us={} arena_scans={} arena_launches={} \
+                 arena_segments={} arena_fresh_tokens={} arena_index_us={} \
+                 arena_fingerprint_us={} arena_windows={} arena_pinned={} arena_upload_us={} \
+                 arena_kernel_us={} arena_readback_us={} arena_rows_us={} arena_tally_us={}",
+                probe.len(),
+                t_groups.elapsed().as_micros(),
+                groups.scanned,
+                groups.windows,
+                groups.turns,
+                groups.select_us,
+                groups.assemble_us,
+                groups.score_us,
+                groups.normalize_us,
+                groups.files,
+                groups.walk_us,
+                groups.exchange_us,
+                groups.cal_built,
+                groups.cal_windows,
+                groups.cal_us,
+                groups.segments_us,
+                arena.scans,
+                arena.launches,
+                arena.segments,
+                arena.fresh_tokens,
+                arena.index_us,
+                arena.fingerprint_us,
+                arena.windows,
+                arena.pinned,
+                arena.upload_us,
+                arena.kernel_us,
+                arena.readback_us,
+                arena.rows_us,
+                arena.tally_us,
+            )
+        });
         (scores, candidates)
     }
 
@@ -2785,8 +2792,8 @@ impl Conversation {
             //
             // `trace!`, because this is per group and there are ~17 of them per
             // scan: it was 1,262 lines of a 4,315-line daemon log, and the
-            // `belief scan phase split` line above already carries the per-scan
-            // totals that answer "did a phase grow". Raise the target to trace
+            // `belief scan phase split` engine event above already carries the
+            // per-scan totals that answer "did a phase grow". Raise the target to trace
             // when the question is which *group* grew.
             let normalize_us = t_normalize.elapsed().as_micros() as u64;
             tracing::trace!(
