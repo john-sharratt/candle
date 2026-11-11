@@ -1,5 +1,11 @@
 # KV drains under pressure: a quant reserve, and compaction that never blocks migration
 
+> **Superseded in part by `docs/kv_quantize_in_the_gap.md`.** That design
+> quantizes K/V on the scheduler thread in every gap and reduces persistence to
+> a copy. The hot→warm quantize, the backlog-sized reserve (§2a), the group cap
+> (§2c) and the quantize side of §3 are replaced by it. Until it is built, this
+> document describes the code.
+
 **What broke** (BlackWorld, 2026-11-08 02:11–02:16; every count is from its
 log). All 3,720 KV regions were live and the hot→warm migration barely ran: 93
 passes, 51 doing nothing and one moving data. Three things held it, each
