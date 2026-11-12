@@ -248,7 +248,6 @@ mod tests {
         mem[0] = 5;
         assert_eq!(b.read(7, 1, 3), None, "a publish under way");
         assert_eq!(b.read(7, 1, 12), None, "more pieces than the block holds");
-        drop(b);
     }
 
     #[test]
