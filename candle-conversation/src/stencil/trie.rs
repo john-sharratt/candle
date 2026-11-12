@@ -244,6 +244,13 @@ impl TokenTrie {
         &self.spills[id.0 as usize]
     }
 
+    /// The spills offered at `pos`, by token: what a walk holding the value
+    /// after an arm checks against its held rule, since a spill's bytes are
+    /// that value's first.
+    pub fn spills_at(&self, pos: TrieNodeId) -> &[(TokenId, SpillId)] {
+        &self.nodes[pos.0 as usize].spills
+    }
+
     /// How many spills the trie offers, at every position.
     pub fn spill_count(&self) -> usize {
         self.spills.len()

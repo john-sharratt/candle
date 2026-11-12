@@ -177,6 +177,54 @@ impl StencilSession {
         held.or_else(|| span.rule.clone())
     }
 
+    /// `offered`, the tokens branch `node` offers at `pos`, without a spill
+    /// whose bytes the value after the arm is held against
+    /// (`docs/stencil_tree.md` §9.2): a spill's bytes are that value's first,
+    /// and once taken they are committed — the held rule could only leave the
+    /// rest of the value free. Which spills a branch offers was settled at
+    /// compile time against the span's own rule; the held one is the turn's.
+    fn held_frontier(&self, node: NodeId, pos: TrieNodeId, offered: Vec<TokenId>) -> AllowedSet {
+        if self.held.is_none() {
+            return AllowedSet::from_tokens(offered);
+        }
+        let trie = self.branch_trie(node);
+        let barred: Vec<TokenId> = trie
+            .spills_at(pos)
+            .iter()
+            .filter(|(_, id)| !self.held_admits(node, trie.spill(*id)))
+            .map(|(token, _)| *token)
+            .collect();
+        AllowedSet::from_tokens(
+            offered
+                .into_iter()
+                .filter(|token| !barred.contains(token))
+                .collect(),
+        )
+    }
+
+    /// Whether `spill`, offered at branch `node`, keeps to the held rule of the
+    /// span it runs into; a span with no held rule takes it as its own rule did
+    /// at compile time. A spill that finishes a name names the call itself, so
+    /// its tool is the one its arm names.
+    fn held_admits(&self, node: NodeId, spill: &Spill) -> bool {
+        let StencilNode::FreeText(span) = self.tree.node(spill.next) else {
+            return true;
+        };
+        let tool = match self.tree.tool_named(node, &spill.arm) {
+            Some(named) => named.as_ref(),
+            None => self.call.tool(),
+        };
+        let held = self
+            .held
+            .as_ref()
+            .zip(self.tree.key_of(spill.next))
+            .and_then(|(held, key)| held.rule_for(tool, key, self.call.written()));
+        let Some(rule) = held else {
+            return true;
+        };
+        Self::value_start(span, Some(&rule)).is_some_and(|start| rule.admits(start, &spill.rest))
+    }
+
     /// Enter the span at `node`: take its rule, and begin recording its value
     /// when it writes a field.
     fn enter_span(&mut self, node: NodeId, span: &FreeTextSpan) {
@@ -283,10 +331,11 @@ impl StencilSession {
                 }
                 StencilNode::Branch { trie } => {
                     let pos = trie.root();
-                    let set = AllowedSet::from_tokens(match trie.led_by(&self.carried) {
+                    let offered = match trie.led_by(&self.carried) {
                         Some(tokens) => tokens.to_vec(),
                         None => trie.frontier(pos),
-                    });
+                    };
+                    let set = self.held_frontier(node, pos, offered);
                     self.carried.clear();
                     if self.tree.is_name_branch(node) {
                         self.call.begin_naming();
@@ -312,8 +361,8 @@ impl StencilSession {
                 }
             },
             Cursor::InBranch { node, pos } => {
-                let trie = self.branch_trie(node);
-                StencilAction::MaskedDecode(AllowedSet::from_tokens(trie.frontier(pos)))
+                let offered = self.branch_trie(node).frontier(pos);
+                StencilAction::MaskedDecode(self.held_frontier(node, pos, offered))
             }
             Cursor::InFreeText { node, emitted, .. } => {
                 let span = self.free_span(node);

@@ -765,6 +765,14 @@ call that was just refused for one.
   file the conversation never read), keeps the span's own rule. Each keyed
   span's value is recorded as the call writes it, so a later field can depend on
   it.
+- **A spill into a held span keeps to the held rule.** Which spills a branch
+  offers (§7.4) is settled at compile time against the span's *own* rule, and a
+  spill's bytes past the arm are the value's first — committed the moment the
+  token is taken. So the branch's mask leaves out each spill whose bytes the
+  held rule for the span it runs into refuses; a spill that finishes a name is
+  checked under the tool its arm names. Without this, `"path": ` closed by
+  `"src` began a value the held set did not have, the rule could only leave the
+  rest free, and a held reading still wrote `src/turn_layout.rs`.
 - **The call's tool is the arm its name branch took**, mapped at compile time
   from each arm's tokens to the tool it names. However the branch is left — its
   last token, a token running past the arm into a value (a spill, which carries

@@ -232,6 +232,73 @@ fn a_held_call_completes_and_an_unheld_file_keeps_its_pattern() {
     );
 }
 
+/// **A spill into a held value keeps to the held rule**: a token that closes
+/// the name and writes the value's first byte is offered only when that byte
+/// begins a held value. `"s` would begin `src/x.rs`, which the field's own
+/// pattern allows and the held set does not have; taken, the held rule could
+/// only have left the rest of the value free — the path the readings lost
+/// their first directory by.
+#[test]
+fn a_spill_into_a_held_value_keeps_to_the_held_rule() {
+    const QUOTE_S: TokenId = 301;
+    const QUOTE_C: TokenId = 302;
+    let v = TestVocab::new()
+        .with_special("\"s", QUOTE_S)
+        .with_special("\"c", QUOTE_C);
+    let mut spec = TreeSpec::new("spill");
+    let end = spec.push(NodeSpec::End);
+    let path = spec.push(NodeSpec::Value {
+        pattern: "[a-z/.-]+".into(),
+        opened: true,
+        limits: FreeTextLimits::json_string(),
+        next: end,
+    });
+    let name = spec.push(NodeSpec::Branch {
+        arms: vec![("ab\"".into(), path), ("cd\"".into(), path)],
+    });
+    spec.root = name;
+    spec.keys.insert(path, Arc::from("path"));
+    spec.name_branches.insert(name);
+    let tree = Arc::new(compile(&spec, &v).unwrap());
+    let holds = ValueHolds {
+        fields: vec![FieldHold {
+            tools: vec!["cd".into()],
+            field: "path".into(),
+            on: vec![],
+            table: HashMap::from([(vec![], vec!["candle-conversation/x.rs".into()])]),
+        }],
+    };
+    let mut session = StencilSession::new(tree);
+    session.hold_values(Arc::new(HeldValues::build(
+        &holds,
+        &v,
+        &mut HeldRules::default(),
+    )));
+    for (token, bytes) in [(b'c' as TokenId, &b"c"[..]), (b'd' as TokenId, b"d")] {
+        assert!(matches!(
+            session.next_action(),
+            StencilAction::MaskedDecode(_)
+        ));
+        session.observe(token, bytes).unwrap();
+    }
+    let StencilAction::MaskedDecode(after_name) = session.next_action() else {
+        panic!("the name's close is a choice");
+    };
+    assert!(
+        after_name.tokens().contains(&QUOTE_C),
+        "`\"c` begins the held path"
+    );
+    assert!(
+        !after_name.tokens().contains(&QUOTE_S),
+        "`\"s` would begin a path the set does not hold"
+    );
+    session.observe(QUOTE_C, b"\"c").unwrap();
+    let StencilAction::MaskedDecode(next) = session.next_action() else {
+        panic!("the path is held");
+    };
+    assert_eq!(next.tokens(), [b'a' as TokenId]);
+}
+
 /// **A name finished by a token that runs on names its call**: `cd"` closed by
 /// `"K`, which also writes the part's first character, is a call of `cd`, so
 /// the part goes on held to `cd`'s `KehT` — `e` and nothing else.
