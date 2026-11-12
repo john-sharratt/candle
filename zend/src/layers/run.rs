@@ -472,8 +472,8 @@ fn is_committed(engine: &ConversationEngine, key: &str) -> bool {
 }
 
 /// Tool rounds a unit may run before it is made to answer on what it has read
-/// — a backstop for a model that keeps reading, as `code_read`'s
-/// `MAX_FILE_READ_ROUNDS` is; an ordinary unit answers well before it.
+/// — a backstop for a model that keeps reading; an ordinary unit answers well
+/// before it.
 pub const MAX_TOOL_ROUNDS: usize = 16;
 
 /// The selection a unit's turns run under: the layer's thinking, and its

@@ -44,6 +44,7 @@ use candle_conversation::provenance::gallery_arena::GroupSet;
 use candle_conversation::provenance::FOLD_GROUPS;
 use candle_conversation::stencil::{
     compile_action_loop, OpeningCall, ThinkMode, ToolCallEnvelope, ToolSpec, TriggerRegistry,
+    MAX_TOOL_CALLS_PER_TURN,
 };
 use candle_conversation::substrate::pcoll::POrdMap;
 use candle_conversation::substrate::Substrate;
@@ -102,7 +103,7 @@ use crate::calibrate::thinking::thinking_of;
 use crate::calibrate::{
     calibrate_layer, mark_sealed, Frame as CalibrateFrame, Layer as CalibrateLayer,
 };
-use crate::code_read::{read_opening, FILE_READ_TOOL, PATH_KEY};
+use crate::code_read::{read_opening, reading_tools, PATH_KEY, READ_CALLS_PER_REPLY};
 use crate::coding_sampling;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
@@ -1740,20 +1741,17 @@ impl InferenceState {
             // A tool a turn calls once is held out of every later call of the
             // turn, by every registry held from this one.
             engine
-                .compile_tool_stencil(&specs)
+                .compile_tool_stencil(&specs, MAX_TOOL_CALLS_PER_TURN)
                 .map(|triggers| engine.never_twice(&triggers, &crate::tools::never_twice_names()))
                 .map_err(|e| anyhow::anyhow!("{} tool stencil compile: {e}", mode.id()))
         };
         let [none, restricted, comprehensive] = ToolMode::ALL.map(compile);
         let tool_stencils = [none?, restricted?, comprehensive?];
-        // A file's reading calls `file_read` and nothing else: the Restricted
-        // grammar, its calls held to that one tool.
+        // A file's reading calls `file_read` and nothing else, one page a
+        // reply (`docs/hit_driven_projection.md` §8.2): a loop of one call over
+        // that one tool.
         let read_stencil = engine
-            .holding_tools(
-                &tool_stencils[ToolMode::Restricted.level() as usize],
-                &[FILE_READ_TOOL.to_string()],
-                None,
-            )
+            .compile_tool_stencil(&reading_tools(), READ_CALLS_PER_REPLY)
             .map_err(|e| anyhow::anyhow!("file reading's tool stencil: {e}"))?;
         let read_opening = read_opening(&engine)?;
         // The thinking-block steering trees (one per non-off effort dial),

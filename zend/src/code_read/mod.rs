@@ -46,7 +46,6 @@ use candle_conversation::projection::{
 };
 use candle_conversation::stencil::{
     HeldRules, HeldValues, OpeningCall, ToolSpec, TriggerRegistry, TurnGrammar,
-    MAX_TOOL_CALLS_PER_TURN,
 };
 use candle_conversation::{
     is_ground_refusal_message, is_stall_message, ConversationEngine, Sequence, TurnOptions,
@@ -272,13 +271,29 @@ pub(crate) const FILE_READ_TOOL: &str = "file_read";
 /// to a reasoning block.
 const FILE_TURN_MAX_TOKENS: usize = 1536;
 
-/// Real `file_read` rounds a single file's conversation may run before being
-/// forced to answer on whatever it has already seen. The tool returns one range
-/// of whole parts, at most [`PAGE_LINES`] lines, per call, so a genuinely large
-/// file may take several calls to read in full; this bounds the pathological
-/// case (or a model that keeps re-reading) rather than the ordinary one, which
-/// typically answers well before the cap.
-const MAX_FILE_READ_ROUNDS: usize = 24;
+/// `file_read` calls a reading's reply may make: one. Each reply reads one page
+/// — one range of whole parts, at most [`PAGE_LINES`] lines — so each tool round
+/// of the reading is one page, and the projection places or drops it at that
+/// page's cost (`docs/hit_driven_projection.md` §8.2). A reply of several reads
+/// would be a round of several pages, placed or dropped together.
+pub const READ_CALLS_PER_REPLY: usize = 1;
+
+/// The tools a file's reading may call: `file_read`, as the Restricted catalog
+/// declares it, and nothing else.
+pub fn reading_tools() -> Vec<ToolSpec> {
+    catalog_for(ToolMode::Restricted)
+        .into_iter()
+        .filter(|spec| spec.name == FILE_READ_TOOL)
+        .collect()
+}
+
+/// Real `file_read` rounds a reading of `pages` pages may run before it is made
+/// to answer on what it has read: one a page, so a file of any length reads to
+/// its end, and a reading that re-reads a page runs out of rounds rather than
+/// running on.
+fn read_rounds(pages: usize) -> usize {
+    pages.max(1)
+}
 
 /// The opening instruction for a file's hidden conversation. Names the file
 /// and the one tool available, and REQUIRES reading it before answering —
@@ -298,17 +313,14 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 /// corpus as an assistant that deliberates and answers nothing. With the length
 /// given, the arithmetic is settled before the model starts.
 ///
-/// **It asks for the calls in PARALLEL, and that is a round-count decision.**
-/// `file_read` serves one range of at most [`PAGE_LINES`] lines per call, so a long file
-/// needs several — and a round is one decode plus one tool dispatch, so reading
-/// a 2,000-line file one call per turn costs ten decodes where a single turn
-/// carrying ten calls costs one. The loop already supports it in full:
-/// `tool_round::plan` returns every call an answer makes, `tool_round::run`
-/// executes them in order, and `format_tool_responses` hands back one
-/// `<tool_response>` block per result, so the whole file arrives in the next
-/// turn's context together. Naming every range in the prompt is what lets the
-/// model issue every call at once rather than discovering the file's length
-/// from the first read's closing line.
+/// **It asks for ONE call per reply, and that is a placement decision.** The
+/// projection places a reading by its tool rounds — one call and its result —
+/// and a round of one page is placed or dropped at that page's cost, so a
+/// question that reads two pages of a 48K-token file places two pages, not the
+/// file (`docs/hit_driven_projection.md` §8.2). More, shorter turns are the
+/// price. Naming every range in the prompt is what lets the model walk them in
+/// order rather than discovering the file's length from the first read's
+/// closing line.
 ///
 /// **It names the ranges, not a count.** The ranges hold whole parts, so where
 /// each ends depends on the file's content, not on its length; a model told
@@ -342,28 +354,17 @@ pub(crate) fn opening_prompt(key: &str, lines: usize, ranges: &[(usize, usize)])
             .collect::<Vec<_>>()
             .join(", "),
     };
-    // A reply holds at most `MAX_TOOL_CALLS_PER_TURN` calls — the tool grammar
-    // ends the turn after that many — so a longer file is asked for in replies
-    // of that size rather than told to fit in one.
-    let batching = if calls <= MAX_TOOL_CALLS_PER_TURN {
-        format!("issue all {calls} in the SAME reply, one per range, in this order: {named}")
-    } else {
-        format!(
-            "issue them {MAX_TOOL_CALLS_PER_TURN} to a reply — the most one reply can \
-             hold — in this order: {named}, putting as many as fit in the SAME reply \
-             each time"
-        )
-    };
+    // A reply holds one call — the reading's grammar ends the turn after it
+    // (`READ_CALLS_PER_REPLY`) — so each range is its own reply, in order.
     format!(
         "Read the entire contents of `{path}` in the `{repo}` repository — and only \
          this file — using {FILE_READ_TOOL}. The file is {lines} lines long and \
          reads in {calls} range(s) of whole parts, at most {PAGE_LINES} lines each — \
          so it takes exactly {calls} {FILE_READ_TOOL} call(s), each passing one range \
-         as `lines`: {batching}, instead of one call per reply. \
-         Every call you make in a reply is run together and all of their results \
-         come back to you at once. Once you've read the whole thing, summarize what \
-         it contains: its purpose, its main structures or functions, and how it fits \
-         into the codebase."
+         as `lines`, ONE call per reply, in this order: {named}. Each reply's result \
+         comes back to you before your next reply. Once you've read the whole thing, \
+         summarize what it contains: its purpose, its main structures or functions, \
+         and how it fits into the codebase."
     )
 }
 
@@ -1345,15 +1346,12 @@ fn read_not_found(results: &[ToolResult]) -> Option<String> {
 /// to prefill. `None` when the tokenizer has no `<tool_call>` token or the
 /// catalog offers no `file_read`, as no reading can call it then either.
 pub fn read_opening(engine: &ConversationEngine) -> anyhow::Result<Option<OpeningCall>> {
-    let tools: Vec<ToolSpec> = catalog_for(ToolMode::Restricted)
-        .into_iter()
-        .filter(|spec| spec.name == FILE_READ_TOOL)
-        .collect();
+    let tools = reading_tools();
     if tools.is_empty() {
         return Ok(None);
     }
     engine
-        .opening_call(&tools)
+        .opening_call(&tools, READ_CALLS_PER_REPLY)
         .map_err(|e| anyhow::anyhow!("file reading's opening call: {e}"))
 }
 
@@ -1405,11 +1403,12 @@ fn run_file_conversation(
 
     let mut current_message: TurnText = TurnText::from(opening_prompt(path, lines, ranges));
     let mut closing = false;
-    for round in 0..=MAX_FILE_READ_ROUNDS {
+    let rounds = read_rounds(ranges.len());
+    for round in 0..=rounds {
         if crate::ingest_cancel::cancelled() {
             anyhow::bail!("shutdown cancelled mid-file");
         }
-        if round == MAX_FILE_READ_ROUNDS {
+        if round == rounds {
             tracing::warn!(
                 target: "zend::code_read::ingest",
                 path,
@@ -1482,7 +1481,7 @@ fn run_file_conversation(
         }
         current_message = response;
     }
-    unreachable!("the closing round at MAX_FILE_READ_ROUNDS always returns")
+    unreachable!("the closing round after the last page always returns")
 }
 
 #[cfg(test)]
@@ -1656,8 +1655,7 @@ mod tests {
             one.contains(
                 "The file is 200 lines long and reads in 1 range(s) of whole parts, at most \
                  200 lines each — so it takes exactly 1 file_read call(s), each passing one \
-                 range as `lines`: issue all 1 in the SAME reply, one per range, in this \
-                 order: lines=1-200,"
+                 range as `lines`, ONE call per reply, in this order: lines=1-200."
             ),
             "{one:?}",
         );
@@ -1665,15 +1663,15 @@ mod tests {
         assert!(
             two.contains(
                 "reads in 2 range(s) of whole parts, at most 200 lines each — so it takes \
-                 exactly 2 file_read call(s), each passing one range as `lines`: issue all 2 \
-                 in the SAME reply, one per range, in this order: lines=1-196, lines=197-201,"
+                 exactly 2 file_read call(s), each passing one range as `lines`, ONE call per \
+                 reply, in this order: lines=1-196, lines=197-201."
             ),
             "{two:?}",
         );
         // An empty file still asks for one call rather than zero.
         let empty = opening_prompt("candle/src/empty.rs", 0, &[]);
         assert!(
-            empty.contains("exactly 1 file_read call(s)") && empty.contains("order: lines=1,"),
+            empty.contains("exactly 1 file_read call(s)") && empty.contains("order: lines=1."),
             "never zero calls: {empty:?}",
         );
     }
@@ -1685,7 +1683,7 @@ mod tests {
         let text: String = (0..150).map(|i| format!("p{i} a\np{i} b\n\n")).collect();
         assert_eq!(windows("candle/a.md", &text), vec![(1, 300), (301, 450)]);
         let p = opening_prompt("candle/a.md", 450, &windows("candle/a.md", &text));
-        assert!(p.contains("lines=1-300, lines=301-450,"), "{p:?}");
+        assert!(p.contains("lines=1-300, lines=301-450."), "{p:?}");
     }
 
     /// The measured failure this prompt exists to close: left as "read as much
@@ -1705,57 +1703,28 @@ mod tests {
         );
     }
 
-    /// **The prompt must ask for the calls in ONE reply, and must name the cap.**
-    ///
-    /// A round is a decode plus a tool dispatch, so a file read one call per reply
-    /// costs a decode per range — ten for a 2,000-line file where one reply
-    /// carrying ten calls costs one. The loop has always run every call an answer
-    /// makes (`tool_round::plan` → `tool_round::run`); it was the prompt that
-    /// asked for them one at a time. Naming every range is what lets the model
-    /// issue every call up front instead of learning the file's length from the
-    /// first read's closing line.
+    /// **One read per reply, whatever the file's length.** Each tool round of a
+    /// reading is one page, which the projection places or drops at that page's
+    /// cost (`docs/hit_driven_projection.md` §8.2); the grammar holds a reply to
+    /// [`READ_CALLS_PER_REPLY`] calls and the prompt asks for no more.
     #[test]
-    fn opening_prompt_asks_for_parallel_reads_and_names_the_cap() {
-        let ranges: Vec<(usize, usize)> = (0..10).map(|k| (k * 200 + 1, k * 200 + 200)).collect();
-        let p = opening_prompt("candle/src/big.rs", 2000, &ranges);
+    fn opening_prompt_asks_for_one_read_per_reply() {
+        assert_eq!(READ_CALLS_PER_REPLY, 1);
+        let ranges: Vec<(usize, usize)> = (0..20).map(|k| (k * 200 + 1, k * 200 + 200)).collect();
+        let p = opening_prompt("candle/src/big.rs", 4000, &ranges);
         assert!(
-            p.contains("at most 200 lines each — so it takes exactly 10 file_read call(s)"),
-            "must name the read size and the call count so every call can be issued \
-             up front: {p:?}",
+            p.contains("exactly 20 file_read call(s), each passing one range as `lines`, ONE call per reply"),
+            "{p:?}"
         );
-        assert!(
-            p.contains("SAME reply"),
-            "must ask for several calls in one reply: {p:?}",
-        );
-        assert!(
-            p.contains("instead of one call per reply"),
-            "must say what it is asking INSTEAD of — one call per reply is the \
-             behaviour this prompt exists to replace: {p:?}",
-        );
+        assert!(!p.contains("SAME reply"), "{p:?}");
     }
 
-    /// **The prompt never asks for more calls than a reply can hold.** The tool
-    /// grammar ends a turn after `MAX_TOOL_CALLS_PER_TURN` calls, so a file of
-    /// more ranges is asked for in replies of that size; one that fits is asked
-    /// for whole.
+    /// **A reading runs one round a page** and then answers, so a file of any
+    /// length reads to its end and no further.
     #[test]
-    fn opening_prompt_batches_within_the_per_reply_cap() {
-        let ranges: Vec<(usize, usize)> = (0..20).map(|k| (k * 200 + 1, k * 200 + 200)).collect();
-        let long = opening_prompt("candle/src/big.rs", 4000, &ranges);
-        assert!(
-            long.contains(&format!(
-                "issue them {MAX_TOOL_CALLS_PER_TURN} to a reply — the most one reply can hold"
-            )),
-            "{long:?}"
-        );
-        assert!(!long.contains("issue all 20"), "{long:?}");
-        let short = opening_prompt("candle/src/small.rs", 300, &[(1, 150), (151, 300)]);
-        assert!(
-            short.contains(
-                "issue all 2 in the SAME reply, one per range, in this order: lines=1-150, \
-                 lines=151-300"
-            ),
-            "{short:?}"
-        );
+    fn a_reading_runs_one_round_a_page() {
+        assert_eq!(read_rounds(0), 1, "an empty file is still one read");
+        assert_eq!(read_rounds(1), 1);
+        assert_eq!(read_rounds(37), 37);
     }
 }

@@ -34,7 +34,7 @@ use std::time::Instant;
 use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::projection;
-use candle_conversation::stencil::ThinkMode;
+use candle_conversation::stencil::{ThinkMode, MAX_TOOL_CALLS_PER_TURN};
 use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, TurnEvent};
 use common::quiet_turn;
 use tempfile::TempDir;
@@ -216,7 +216,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     // through `RefreshContext` — see `session.rs`. `code_reading`'s hidden
     // per-file conversations use these to frame identically to `dialogue`.
     let tool_stencil = engine
-        .compile_tool_stencil(tool_catalog())
+        .compile_tool_stencil(tool_catalog(), MAX_TOOL_CALLS_PER_TURN)
         .expect("tool stencil compile");
     let think_steering = engine
         .compile_think_steering()

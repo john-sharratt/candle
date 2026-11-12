@@ -31,7 +31,7 @@ use crate::stencil::{
     compile, compile_steps_tail, compile_think_tree, compile_tool_call_loop, held_branches,
     held_branches_first, HeldRules, HeldValues, HfVocab, NeverTwice, OpeningCall, StencilTree,
     ThinkMode, ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec,
-    TriggerRegistry, ValueHolds, MAX_TOOL_CALLS_PER_TURN,
+    TriggerRegistry, ValueHolds,
 };
 use crate::tenant_rank::TenantRank;
 #[cfg(feature = "memory-census")]
@@ -2151,7 +2151,15 @@ impl ConversationEngine {
             .map_err(|e| ConversationError::from(candle::Error::Msg(format!("stencil: {e}"))))
     }
 
-    pub fn compile_tool_stencil(&self, tools: &[ToolSpec]) -> crate::Result<Arc<TriggerRegistry>> {
+    /// The `<tool_call>` trigger bound to a call loop over `tools` of at most
+    /// `max_calls` calls a reply — `MAX_TOOL_CALLS_PER_TURN` for a dialogue,
+    /// one for a file's reading, whose every reply is one page
+    /// (`docs/hit_driven_projection.md` §8.2).
+    pub fn compile_tool_stencil(
+        &self,
+        tools: &[ToolSpec],
+        max_calls: usize,
+    ) -> crate::Result<Arc<TriggerRegistry>> {
         let Some(trigger) = self.core.tokenizer.token_to_id("<tool_call>") else {
             tracing::warn!(
                 "tokenizer has no single <tool_call> token — tool-call stencils are inactive \
@@ -2160,31 +2168,37 @@ impl ConversationEngine {
             return Ok(Arc::new(TriggerRegistry::new()));
         };
         let mut registry = TriggerRegistry::new();
-        registry.register(trigger, Arc::new(self.call_loop(tools)?));
+        registry.register(trigger, Arc::new(self.call_loop(tools, max_calls)?));
         Ok(Arc::new(registry))
     }
 
     /// The opening call of a turn that must call one of `tools` before it
     /// does anything else ([`OpeningCall`]): the marker to prefill, and the
     /// same call loop [`Self::compile_tool_stencil`] binds to the trigger,
-    /// over `tools`. `None` when the tokenizer has no single `<tool_call>`
-    /// token, as there is then no trigger whose loop to begin inside.
-    pub fn opening_call(&self, tools: &[ToolSpec]) -> crate::Result<Option<OpeningCall>> {
+    /// over `tools`, of at most `max_calls` calls. `None` when the tokenizer
+    /// has no single `<tool_call>` token, as there is then no trigger whose
+    /// loop to begin inside.
+    pub fn opening_call(
+        &self,
+        tools: &[ToolSpec],
+        max_calls: usize,
+    ) -> crate::Result<Option<OpeningCall>> {
         if self.core.tokenizer.token_to_id("<tool_call>").is_none() {
             return Ok(None);
         }
         Ok(Some(OpeningCall {
             marker: ToolCallEnvelope::for_dialect(&self.core.dialect).marker,
-            tree: Arc::new(self.call_loop(tools)?),
+            tree: Arc::new(self.call_loop(tools, max_calls)?),
         }))
     }
 
-    /// The call loop over `tools` the `<tool_call>` trigger enters.
-    fn call_loop(&self, tools: &[ToolSpec]) -> crate::Result<StencilTree> {
+    /// The call loop over `tools` the `<tool_call>` trigger enters, ending the
+    /// turn after `max_calls` calls.
+    fn call_loop(&self, tools: &[ToolSpec], max_calls: usize) -> crate::Result<StencilTree> {
         // The model emits the `<tool_call>` trigger itself, so the tree resumes
         // *after* that marker: its `open` is the envelope minus the marker.
         //
-        // **A turn may make up to [`MAX_TOOL_CALLS_PER_TURN`] calls.** After each
+        // **A turn may make up to `max_calls` calls.** After each
         // one the loop offers exactly two continuations — the marker, which opens
         // another call, or the assistant-turn terminator, which ends the turn — so
         // the decoder is never free between a call and whatever follows it. That
@@ -2210,7 +2224,7 @@ impl ConversationEngine {
         let envelope = ToolCallEnvelope::for_assistant_calls(&self.core.dialect);
         let close_turn = ToolCallEnvelope::turn_close(&self.core.dialect);
         let started = std::time::Instant::now();
-        let spec = compile_tool_call_loop(tools, &envelope, MAX_TOOL_CALLS_PER_TURN, &close_turn)
+        let spec = compile_tool_call_loop(tools, &envelope, max_calls, &close_turn)
             .map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;

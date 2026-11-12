@@ -34,7 +34,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use candle_conversation::projection::{
     Builder, DecodePriority, GroupId, LayerId, Reserved, SectionId, TimelineId, TurnIndex,
 };
-use candle_conversation::stencil::TriggerRegistry;
+use candle_conversation::stencil::{TriggerRegistry, MAX_TOOL_CALLS_PER_TURN};
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnText};
 
 use crate::openai_tools;
@@ -351,7 +351,7 @@ fn tool_stencil(
         return Ok(Arc::new(TriggerRegistry::new()));
     }
     engine
-        .compile_tool_stencil(&specs)
+        .compile_tool_stencil(&specs, MAX_TOOL_CALLS_PER_TURN)
         .map_err(|e| anyhow::anyhow!("compiling the client's tool grammar: {e}"))
 }
 
