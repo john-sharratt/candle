@@ -19,11 +19,12 @@ use candle::{DType, Device, Result};
 use super::compact_map::Replaced;
 use super::compact_plan::ArenaSlots;
 use super::fresh_arenas::FreshArenas;
+use super::gap_table::LayerShape;
 use super::head_gids::ChunkBands;
 use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
 #[cfg(feature = "cuda")]
 use super::slot_upload_batch::SlotUploadBatch;
-use super::types::DecodeGpuChunksSyncKind;
+use super::types::{ChunkWindow, DecodeGpuChunksSyncKind};
 use super::{
     Arena, ArenaKey, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta,
     CompressionPolicy, GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
@@ -1666,6 +1667,40 @@ impl ChunkedKvBacking {
         let state = self.state.read().ok()?;
         let seq = state.sequences.get(batch_idx)?.as_ref()?;
         Some(seq.writer_start_idx())
+    }
+
+    /// The sequence's first chunk not yet handed to a gap quantize. `None` if
+    /// the slot is unallocated.
+    pub(crate) fn gap_cursor_for_seq(&self, batch_idx: usize) -> Option<usize> {
+        let state = self.state.read().ok()?;
+        let seq = state.sequences.get(batch_idx)?.as_ref()?;
+        Some(seq.gap_cursor())
+    }
+
+    /// Move the sequence's gap cursor to `cursor`. No-op on an unallocated slot.
+    pub(crate) fn set_gap_cursor_for_seq(&self, batch_idx: usize, cursor: usize) {
+        let Ok(mut state) = self.state.write() else {
+            return;
+        };
+        if let Some(Some(seq)) = state.sequences.get_mut(batch_idx) {
+            seq.set_gap_cursor(cursor);
+        }
+    }
+
+    /// This layer's shape of the sequence from chunk `from` on, the part a gap
+    /// reads (`gap_table`). `None` if the slot is unallocated.
+    pub(crate) fn gap_layer_shape(&self, batch_idx: usize, from: usize) -> Option<LayerShape> {
+        let state = self.state.read().ok()?;
+        let seq = state.sequences.get(batch_idx)?.as_ref()?;
+        let writer_start = seq.writer_start_idx();
+        let first = from.max(writer_start).min(seq.block_count());
+        let chunks = &seq.chunks_slice()[first..];
+        Some(LayerShape {
+            writer_start,
+            first,
+            usage: chunks.iter().map(|c| c.usage).collect(),
+            native: chunks.iter().map(ChunkWindow::takes_writes).collect(),
+        })
     }
 
     /// `(block count, write chunk)` for a sequence — the shape a decode header

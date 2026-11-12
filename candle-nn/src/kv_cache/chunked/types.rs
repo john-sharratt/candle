@@ -25,6 +25,7 @@ pub use super::size_class::GID_STRIDE;
 
 #[cfg(feature = "cuda")]
 use super::compact_mint::RecordInputs;
+use super::gap_table::{cursor_after_front_eviction, cursor_after_splice, cursor_after_truncate};
 use super::gid_pool::ChunkGid;
 use super::gpu_chunks::{ChunkPin, GpuChunks};
 use super::head_gids::{band_tags, HeadGids};
@@ -423,6 +424,19 @@ pub(crate) struct ChunkWindow {
 }
 
 impl ChunkWindow {
+    /// Whether every band is still native — in a format the paged stores
+    /// write. A chunk sealed into a quantized format is read-only whatever room
+    /// it has left.
+    pub(crate) fn takes_writes(&self) -> bool {
+        self.k_fmt
+            .iter()
+            .all(|&t| ArenaFormatTag::from_u8(t).takes_active_k_writes())
+            && self
+                .v_fmt
+                .iter()
+                .all(|&t| ArenaFormatTag::from_u8(t).takes_active_v_writes())
+    }
+
     /// Iterate `(gid, format tag)` for every band slot, in the interleaved
     /// K,V order of [`HeadGids::as_slice`].
     ///
@@ -614,6 +628,12 @@ pub(crate) struct SequenceState {
     ///   the current writer boundary; the chunk itself is writer-owned
     ///   by construction)
     writer_start_idx: usize,
+    /// The first chunk not yet handed to a gap quantize
+    /// (`docs/kv_quantize_in_the_gap.md` §3.1): the gap's table takes complete
+    /// native chunks from here, so it never walks the sequence's history. Kept
+    /// pointing at the same chunk by every change to the chunk list below it,
+    /// and pulled back by a truncate that cuts it off.
+    gap_cursor: usize,
     /// Absolute token position of the FIRST resident chunk's first token —
     /// i.e. the count of tokens evicted off the front by the sliding-window
     /// ring ([`Self::evict_front_window`]). Every chunk's serialised
@@ -652,6 +672,7 @@ impl SequenceState {
             chunks: Vec::new(),
             gpu_chunks: GpuChunks::new(device),
             writer_start_idx: 0,
+            gap_cursor: 0,
             base_pos: 0,
             decode_stale_from: None,
             fill_from: None,
@@ -664,6 +685,7 @@ impl SequenceState {
             chunks: Vec::new(),
             gpu_chunks: GpuChunks::new(),
             writer_start_idx: 0,
+            gap_cursor: 0,
             base_pos: 0,
             decode_stale_from: None,
             fill_from: None,
@@ -680,6 +702,18 @@ impl SequenceState {
         self.writer_start_idx = idx;
     }
 
+    /// The first chunk not yet handed to a gap. See `gap_cursor`.
+    #[inline]
+    pub(crate) fn gap_cursor(&self) -> usize {
+        self.gap_cursor
+    }
+
+    /// Record that every chunk before `cursor` has been handed to a gap.
+    #[inline]
+    pub(crate) fn set_gap_cursor(&mut self, cursor: usize) {
+        self.gap_cursor = cursor;
+    }
+
     /// Move the writer boundary past every chunk in the writer region the
     /// paged stores cannot write, answering whether it moved.
     ///
@@ -689,18 +723,9 @@ impl SequenceState {
     /// swallows the next write without a fault. Below the boundary it is what
     /// every sealed partial tail is: a gap the next write steps over.
     pub(crate) fn seal_unwritable_writer_region(&mut self) -> bool {
-        let unwritable = |c: &ChunkWindow| {
-            !c.k_fmt
-                .iter()
-                .all(|&t| ArenaFormatTag::from_u8(t).takes_active_k_writes())
-                || !c
-                    .v_fmt
-                    .iter()
-                    .all(|&t| ArenaFormatTag::from_u8(t).takes_active_v_writes())
-        };
         let last = (self.writer_start_idx..self.chunks.len())
             .rev()
-            .find(|&i| unwritable(&self.chunks[i]));
+            .find(|&i| !self.chunks[i].takes_writes());
         match last {
             Some(i) => {
                 self.set_writer_start_idx(i + 1);
@@ -1261,6 +1286,7 @@ impl SequenceState {
     /// Clear all chunks and clear the GPU buffer.
     pub(crate) fn clear_chunks(&mut self) {
         self.chunks.clear();
+        self.gap_cursor = 0;
         self.gpu_chunks.as_mut().clear();
     }
 
@@ -1268,6 +1294,7 @@ impl SequenceState {
     /// the caller to drop.
     pub(crate) fn take_chunks(&mut self) -> Vec<ChunkWindow> {
         let chunks = std::mem::take(&mut self.chunks);
+        self.gap_cursor = 0;
         self.gpu_chunks.as_mut().clear();
         chunks
     }
@@ -1276,6 +1303,7 @@ impl SequenceState {
     pub(crate) fn drain_front_chunks(&mut self, n: usize) {
         let n = n.min(self.chunks.len());
         self.chunks.drain(..n).for_each(drop);
+        self.gap_cursor = cursor_after_front_eviction(self.gap_cursor, n);
         if n > 0 {
             self.gpu_chunks.as_mut().clear();
         }
@@ -1283,6 +1311,7 @@ impl SequenceState {
 
     /// Prepend `prefix` before all existing chunks; GPU buffer is cleared.
     pub(crate) fn prepend_chunks(&mut self, mut prefix: Vec<ChunkWindow>) {
+        self.gap_cursor = cursor_after_splice(self.gap_cursor, 0, 0, prefix.len());
         prefix.extend(std::mem::take(&mut self.chunks));
         self.chunks = prefix;
         self.gpu_chunks.as_mut().clear();
@@ -1291,6 +1320,7 @@ impl SequenceState {
     /// Replace all chunks with `new_chunks` and clear the GPU buffer.
     pub(crate) fn replace_chunks(&mut self, new_chunks: Vec<ChunkWindow>) {
         self.chunks = new_chunks;
+        self.gap_cursor = 0;
         self.gpu_chunks.as_mut().clear();
     }
 
@@ -1320,6 +1350,7 @@ impl SequenceState {
         let inserted = windows.len();
         self.chunks.splice(start..end, windows);
         self.writer_start_idx = self.writer_start_idx - (end - start) + inserted;
+        self.gap_cursor = cursor_after_splice(self.gap_cursor, start, end, inserted);
         self.gpu_chunks.as_mut().clear();
         Ok(())
     }
@@ -1328,6 +1359,7 @@ impl SequenceState {
     /// cleared because chunk count changes.
     pub(crate) fn split_off_chunks(&mut self, at: usize) -> Vec<ChunkWindow> {
         let tail = self.chunks.split_off(at);
+        self.gap_cursor = cursor_after_truncate(self.gap_cursor, self.chunks.len());
         self.gpu_chunks.as_mut().clear();
         tail
     }
@@ -1337,6 +1369,7 @@ impl SequenceState {
     pub(crate) fn truncate_chunks(&mut self, n: usize) {
         if n < self.chunks.len() {
             self.chunks.truncate(n);
+            self.gap_cursor = cursor_after_truncate(self.gap_cursor, n);
             self.gpu_chunks.as_mut().clear();
         }
     }

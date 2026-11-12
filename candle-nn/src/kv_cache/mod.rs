@@ -166,7 +166,8 @@ pub use chunked::{
     quantize_sealed_in_place, quantize_sealed_in_place_deferred,
 };
 pub use chunked::{
-    fragmentation, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation, GroundLost,
+    fragmentation, gap_take, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation,
+    GroundLost,
 };
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{

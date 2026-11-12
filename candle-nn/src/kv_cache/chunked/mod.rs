@@ -58,6 +58,7 @@ pub(super) mod cpu_selection;
 pub mod fletcher_golden;
 mod format_census;
 mod fresh_arenas;
+mod gap_table;
 mod gid_pool;
 #[cfg(feature = "cuda")]
 mod gpu_chunks;
@@ -184,6 +185,7 @@ pub use compression_policy::{
     QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS, QWEN4EXP_Q2KO_KV_FACTORS,
 };
 pub use format_census::FormatCensus;
+pub use gap_table::gap_take;
 pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
 pub use gpu_chunks::ChunkPin;
 pub use head_gids::HeadGids;
