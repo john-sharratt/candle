@@ -107,8 +107,9 @@ impl Kind {
 /// Who wrote a line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Writer {
-    /// A model, through the channel a person speaks to it in.
-    Channel(Channel),
+    /// A model, for the person whose account made the call: the line names
+    /// them by its `account` (and `speaker`), and is written with no `by`.
+    Person,
     /// The connector's server, recording what a call did.
     Server,
     /// zend: summaries, folds, a worker's export.
@@ -122,7 +123,7 @@ pub enum Writer {
 impl Writer {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Channel(c) => c.name(),
+            Self::Person => "person",
             Self::Server => "server",
             Self::Zend => "zend",
             Self::Npcd => "npcd",
@@ -130,9 +131,12 @@ impl Writer {
         }
     }
 
+    /// The writer a `by` names. A person's line is written with none; one
+    /// written before that named the app the person spoke through, which reads
+    /// as theirs ([`crate::ops::restamp`] writes it again without).
     pub fn parse(s: &str) -> Result<Writer, String> {
-        if let Some(c) = Channel::parse(s) {
-            return Ok(Self::Channel(c));
+        if Channel::parse(s).is_some() {
+            return Ok(Self::Person);
         }
         match s {
             "server" => Ok(Self::Server),
@@ -140,7 +144,7 @@ impl Writer {
             "npcd" => Ok(Self::Npcd),
             "worker" => Ok(Self::Worker),
             _ => Err(format!(
-                "`{s}` is not a writer: a channel, server, zend, npcd or worker"
+                "`{s}` is not a writer: server, zend, npcd or worker"
             )),
         }
     }
@@ -166,8 +170,6 @@ pub struct Line {
     /// Who the conversation's focus said was talking when it was written:
     /// the model's judgement, absent until it has one (§2.4).
     pub speaker: Option<Slug>,
-    /// The channel they spoke through, when it is not the writer itself.
-    pub channel: Option<Channel>,
     /// For a fold: what it folds.
     pub folds: Option<Folds>,
     /// A worker's note the person has not yet accepted.
@@ -229,20 +231,15 @@ impl Line {
     /// The line's own file, `<id>.yaml`: one field to a text line, its text
     /// last. The id is the file's name and is not written in it.
     pub fn render(&self) -> String {
-        let mut out = format!(
-            "at: {}\nkind: {}\nby: {}\n",
-            self.at,
-            self.kind.name(),
-            self.by.name()
-        );
+        let mut out = format!("at: {}\nkind: {}\n", self.at, self.kind.name());
+        if self.by != Writer::Person {
+            out.push_str(&format!("by: {}\n", self.by.name()));
+        }
         if let Some(a) = &self.account {
             out.push_str(&format!("account: {}\n", scalar(a.as_str())));
         }
         if let Some(s) = &self.speaker {
             out.push_str(&format!("speaker: {}\n", scalar(s.as_str())));
-        }
-        if let Some(c) = self.channel {
-            out.push_str(&format!("channel: {c}\n"));
         }
         match &self.folds {
             // A year is digits alone, which YAML reads as a number: quoted, so
@@ -269,10 +266,11 @@ impl Line {
     pub(crate) fn read(f: &mut Fields<'_>, id: LineId) -> Result<Line, Problem> {
         let at = f.parsed("at", Stamp::parse)?;
         let kind = f.parsed("kind", Kind::parse)?;
-        let by = f.parsed("by", Writer::parse)?;
+        let by = f.opt_parsed("by", Writer::parse)?.unwrap_or(Writer::Person);
         let account = f.opt_parsed("account", Slug::parse)?;
         let speaker = f.opt_parsed("speaker", Slug::parse)?;
-        let channel = f.opt_parsed("channel", |s| {
+        // The app a server's line once named: read, and not kept.
+        f.opt_parsed("channel", |s| {
             Channel::parse(s).ok_or_else(|| format!("`{s}` is not a channel"))
         })?;
         let period = match f.opt_text_or_whole("period")? {
@@ -315,7 +313,6 @@ impl Line {
             by,
             account,
             speaker,
-            channel,
             folds,
             proposed,
             terms,
@@ -361,10 +358,38 @@ mod tests {
         let text = line.render();
         assert_eq!(
             text,
-            "at: 2026-10-30T09:12:40Z\nkind: note\nby: claude-code\naccount: john\n\
+            "at: 2026-10-30T09:12:40Z\nkind: note\naccount: john\n\
              text: Workers push branches; merging is the user's decision.\n"
         );
         assert_eq!(read_as(&line.id, &text).unwrap(), line);
+    }
+
+    /// **A line that named the app it came through reads as the person's**,
+    /// and is written back without it: `by` and `channel` both go.
+    #[test]
+    fn a_line_that_named_its_app_is_written_back_without_it() {
+        let id = LineId::parse("2026-10-30-0912-7e3a").unwrap();
+        let person = read_as(
+            &id,
+            "at: 2026-10-30T09:12:40Z\nkind: note\nby: claude-code\naccount: john\ntext: x\n",
+        )
+        .unwrap();
+        assert_eq!(person.by, Writer::Person);
+        assert_eq!(
+            person.render(),
+            "at: 2026-10-30T09:12:40Z\nkind: note\naccount: john\ntext: x\n"
+        );
+        let server = read_as(
+            &id,
+            "at: 2026-10-30T09:12:40Z\nkind: episode\nby: server\naccount: john\n\
+             channel: grok\ntext: x\n",
+        )
+        .unwrap();
+        assert_eq!(server.by, Writer::Server);
+        assert_eq!(
+            server.render(),
+            "at: 2026-10-30T09:12:40Z\nkind: episode\nby: server\naccount: john\ntext: x\n"
+        );
     }
 
     /// **Long text is folded within the file's width**, and read back as
@@ -379,7 +404,7 @@ mod tests {
         );
         assert_eq!(
             line.render(),
-            "at: 2026-10-30T09:12:40Z\nkind: note\nby: claude-code\naccount: john\ntext: >-\n\
+            "at: 2026-10-30T09:12:40Z\nkind: note\naccount: john\ntext: >-\n\
              \x20 The candle fork powers two products: Zen Code, a persistent AI coding\n\
              \x20 assistant with institutional memory across sessions, and Battle Cities, an NPC\n\
              \x20 narrative game whose agents have unbounded memory.\n"
@@ -408,7 +433,6 @@ mod tests {
                 by: Writer::Zend,
                 account: Some(slug("john")),
                 speaker: Some(slug("yen")),
-                channel: Some(Channel::Grok),
                 folds,
                 proposed: kind == Kind::Note,
                 terms: if kind == Kind::Note {
@@ -440,7 +464,6 @@ mod tests {
             by: Writer::Npcd,
             account: None,
             speaker: None,
-            channel: None,
             folds: None,
             proposed: false,
             terms: Terms::default(),
@@ -572,6 +595,7 @@ mod tests {
             ),
             ("kind: remark\nby: grok\ntext: x\n", Some(2), "not a kind"),
             ("kind: note\nby: alice\ntext: x\n", Some(3), "not a writer"),
+            ("kind: note\nby: person\ntext: x\n", Some(3), "not a writer"),
             (
                 "kind: note\nby: grok\nchannel: tesla\ntext: x\n",
                 Some(4),
@@ -620,7 +644,6 @@ mod tests {
             by: Writer::Zend,
             account: None,
             speaker: None,
-            channel: None,
             folds: Some(Folds::Period(Period::parse("2026").unwrap())),
             proposed: false,
             terms: Terms::default(),

@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(
             render(&hits, total, usize::MAX),
             "@zen/topics/cpu-experts (journal) experts computed by the host pool\n\
-             @zen/topics #2026-10-30-1202-b082 2026-10-30 12:02 note, john: \
+             @zen/topics #2026-10-30-1202-80b3 2026-10-30 12:02 note, john: \
              The cpu experts pool is on by default."
         );
         let (by_cue, _) = grep(now(), &t, &john(), "host pool", None, 10);

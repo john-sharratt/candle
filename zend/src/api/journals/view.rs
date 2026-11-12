@@ -31,7 +31,6 @@ pub fn line(path: &JournalPath, l: &Line) -> Value {
         "by": l.by.name(),
         "account": l.account.as_ref().map(|p| p.as_str()),
         "speaker": l.speaker.as_ref().map(|p| p.as_str()),
-        "channel": l.channel.map(|c| c.name()),
         "folds": l.folds.as_ref().map(|f| match f {
             Folds::Period(p) => json!({"period": p.to_string()}),
             Folds::Journal(j) => json!({
@@ -225,7 +224,7 @@ mod tests {
         Stamp::parse(s).unwrap()
     }
 
-    /// A tree with one topic and two notes on it, written by John via Grok
+    /// A tree with one topic and two notes on it, written on John's account
     /// as Yen spoke.
     fn written() -> (Mem, JournalPath) {
         let mut m = mem("john");
@@ -289,10 +288,9 @@ mod tests {
                 "line": format!("@zen/topics/trip#{}", j.window[0].id.as_str()),
                 "at": "2026-10-29T10:01:00Z",
                 "kind": "note",
-                "by": "grok",
+                "by": "person",
                 "account": "john",
                 "speaker": "yen",
-                "channel": null,
                 "folds": null,
                 "proposed": false,
                 "text": "Flights booked.",

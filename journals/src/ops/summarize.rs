@@ -680,13 +680,12 @@ mod tests {
             None,
         )
         .unwrap();
-        let first = t.get(&path).unwrap().window[0].id.clone();
         apply(
             &mut t,
             &john(),
             &Op::Forget {
                 path: path.clone(),
-                which: Which::Id(first),
+                which: Which::Says("a".into()),
             },
             now(),
         )

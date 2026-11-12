@@ -103,7 +103,8 @@ fn texts(op: &Op) -> Vec<&str> {
         | Op::Close { .. }
         | Op::MarkStale { .. }
         | Op::RemoveMember { .. }
-        | Op::Bind { .. } => vec![],
+        | Op::Bind { .. }
+        | Op::Restamp => vec![],
     }
 }
 
@@ -153,6 +154,10 @@ pub fn check(tree: &Tree, actor: &Actor, op: &Op) -> Result<()> {
         (Actor::System, Op::Bind { .. }) => Ok(()),
         (_, Op::Bind { .. }) => Err(no(actor, "bind accounts")),
         (Actor::System, _) => Err(no(actor, "write journals")),
+
+        // Rewriting every journal's files as the store writes them: zend's.
+        (Actor::Zend, Op::Restamp) => Ok(()),
+        (_, Op::Restamp) => Err(no(actor, "rewrite every journal: zend does")),
 
         // Notes.
         (Actor::Person { .. }, Op::Note { path, .. }) => {
@@ -417,7 +422,8 @@ fn paths(op: &Op) -> Vec<&JournalPath> {
         | Op::AddMember { .. }
         | Op::AddBot { .. }
         | Op::RemoveMember { .. }
-        | Op::Bind { .. } => vec![],
+        | Op::Bind { .. }
+        | Op::Restamp => vec![],
     }
 }
 

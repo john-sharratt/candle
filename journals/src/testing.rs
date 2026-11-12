@@ -1,7 +1,6 @@
 //! Fixtures the tests share.
 
 use crate::line::{Kind, Line, LineId, Writer};
-use crate::scope::Channel;
 use crate::slug::Slug;
 use crate::terms::Terms;
 use crate::time::Stamp;
@@ -14,10 +13,10 @@ pub(crate) fn slug(s: &str) -> Slug {
     Slug::parse(s).unwrap()
 }
 
-/// A note John's Claude Code kept at `when`.
+/// A note John's assistant kept at `when`.
 pub(crate) fn note(when: &str, text: &str) -> Line {
     let at = at(when);
-    let by = Writer::Channel(Channel::ClaudeCode);
+    let by = Writer::Person;
     Line {
         id: LineId::mint(at, by, text, 0),
         at,
@@ -25,7 +24,6 @@ pub(crate) fn note(when: &str, text: &str) -> Line {
         by,
         account: Some(slug("john")),
         speaker: None,
-        channel: None,
         folds: None,
         proposed: false,
         terms: Terms::default(),

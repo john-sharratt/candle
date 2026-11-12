@@ -16,7 +16,6 @@ use crate::ops::fixture::{john, now, p, yen, zen};
 use crate::ops::{OnTaken, Which};
 use crate::path::Address;
 use crate::path::Below;
-use crate::scope::Channel;
 use crate::terms::Terms;
 use crate::testing::{note as testing_note, slug};
 use crate::tree::render::render_all;
@@ -154,7 +153,7 @@ fn a_write_is_committed_at_once_and_pushed_at_the_sync() {
         &dir,
         &["log", "-1", "--format=%an%n%B", "refs/journal/head"],
     );
-    assert!(log.starts_with("grok\nNote on @zen/topics\n\nJournal-Writer: grok\nJournal-Account: yen\nJournal-Channel: grok\n"), "{log}");
+    assert!(log.starts_with("yen\nNote on @zen/topics\n\nJournal-Writer: person\nJournal-Account: yen\nJournal-Channel: grok\n"), "{log}");
     assert!(log.contains("Journal-Op: {\"op\":\"note\""), "{log}");
 }
 
@@ -252,7 +251,7 @@ fn a_replayed_line_whose_id_was_taken_takes_a_new_one_and_its_edits_follow() {
     let mut b = Store::open(&r.clone("b")).unwrap();
     // Two different notes in one minute whose ids collide: a birthday
     // search over the id's sixteen bits finds a pair in a few hundred texts.
-    let by = Writer::Channel(Channel::ClaudeCode);
+    let by = Writer::Person;
     let mut seen: BTreeMap<LineId, String> = BTreeMap::new();
     let (xa, xb) = (0..)
         .map(|i| format!("note {i}"))

@@ -62,7 +62,6 @@ pub fn episodes(
             by,
             account: None,
             speaker: None,
-            channel: None,
             folds: None,
             proposed: false,
             terms: Terms::default(),

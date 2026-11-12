@@ -52,7 +52,7 @@ impl Actor {
     /// named for what runs them should a refusal be logged.
     pub fn writer(&self) -> Writer {
         match self {
-            Actor::Person { channel, .. } | Actor::Guest { channel } => Writer::Channel(*channel),
+            Actor::Person { .. } | Actor::Guest { .. } => Writer::Person,
             Actor::Server { .. } => Writer::Server,
             Actor::Zend | Actor::System => Writer::Zend,
             Actor::Worker { .. } => Writer::Worker,
@@ -231,11 +231,11 @@ mod tests {
             channel: Channel::Grok,
             admin: false,
         };
-        assert_eq!(a.writer(), Writer::Channel(Channel::Grok));
+        assert_eq!(a.writer(), Writer::Person);
         assert_eq!(
             a.trailers(),
             vec![
-                ("Journal-Writer", "grok".to_string()),
+                ("Journal-Writer", "person".to_string()),
                 ("Journal-Account", "yen".to_string()),
                 ("Journal-Channel", "grok".to_string()),
             ]
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(
             guest.trailers(),
             vec![
-                ("Journal-Writer", "other".to_string()),
+                ("Journal-Writer", "person".to_string()),
                 ("Journal-Channel", "other".to_string()),
             ]
         );

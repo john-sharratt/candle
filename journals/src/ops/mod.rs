@@ -27,6 +27,7 @@ pub mod link;
 pub mod period_fold;
 pub mod permit;
 pub mod remap;
+pub mod restamp;
 pub mod summarize;
 pub mod wire;
 
@@ -183,6 +184,9 @@ pub enum Op {
         email: Email,
         key: AccountKey,
     },
+    /// Every journal's files written again as the store now writes them
+    /// ([`restamp`]).
+    Restamp,
 }
 
 /// An owner file an operation changed: a `person.yaml` or a `group.yaml`.
@@ -344,6 +348,7 @@ fn run(tree: &mut Tree, actor: &Actor, op: &Op, now: Stamp, keeping: &[LineId]) 
         Op::AddBot { group, bot, reads } => group::add_bot(tree, group, bot, reads, now),
         Op::RemoveMember { group, who } => group::remove_member(tree, group, who),
         Op::Bind { person, email, key } => group::bind(tree, person, email, key),
+        Op::Restamp => restamp::restamp(tree),
     }
 }
 

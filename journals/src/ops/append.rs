@@ -130,12 +130,6 @@ fn append(
         by,
         account: actor.person().cloned(),
         speaker: said.speaker.cloned(),
-        channel: match actor {
-            // The server writes for the channel it serves; a channel writing
-            // for itself is already its writer.
-            Actor::Server { channel, .. } => Some(*channel),
-            _ => None,
-        },
         folds: None,
         proposed: said.proposed,
         terms: said.terms,
@@ -236,14 +230,13 @@ mod tests {
         assert_eq!(a.touched, vec![path.clone()]);
         let line = &t.get(&path).unwrap().window[0];
         assert_eq!(line.text, "The builder starts Monday.");
-        assert_eq!(line.by, Writer::Channel(Channel::Grok));
+        assert_eq!(line.by, Writer::Person);
         assert_eq!(
             line.account,
             Some(slug("yen")),
             "Yen's account made the call"
         );
         assert_eq!(line.speaker, Some(slug("john")), "John was speaking on it");
-        assert_eq!(line.channel, None);
         assert_eq!(line.at, now());
         assert_eq!(Some(&line.id), a.line.as_ref());
         // A speaker the group has no journal for is no one it knows.
@@ -265,8 +258,10 @@ mod tests {
         );
     }
 
+    /// **The server's line names the server and the person, never the app**
+    /// it served.
     #[test]
-    fn the_server_names_the_channel_it_wrote_for() {
+    fn the_server_writes_as_itself_for_the_person() {
         let mut t = zen();
         let path = p("conversations");
         let server = Actor::Server {
@@ -286,9 +281,10 @@ mod tests {
         .unwrap();
         let line = &t.get(&path).unwrap().window[0];
         assert_eq!(
-            (line.kind, line.by, line.channel),
-            (Kind::Episode, Writer::Server, Some(Channel::Grok))
+            (line.kind, line.by, line.account.as_ref()),
+            (Kind::Episode, Writer::Server, Some(&slug("john")))
         );
+        assert!(!line.render().contains("grok"), "{}", line.render());
     }
 
     /// **An episode that happens twice in a minute is two lines**, with two

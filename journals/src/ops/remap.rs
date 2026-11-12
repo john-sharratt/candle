@@ -53,7 +53,8 @@ pub fn remap(op: &mut Op, renamed: &BTreeMap<LineId, LineId>) {
         | Op::AddMember { .. }
         | Op::AddBot { .. }
         | Op::RemoveMember { .. }
-        | Op::Bind { .. } => {}
+        | Op::Bind { .. }
+        | Op::Restamp => {}
     }
 }
 

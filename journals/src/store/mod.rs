@@ -34,7 +34,7 @@ use zend_vfs::{
 
 use crate::actor::Actor;
 use crate::error::Error;
-use crate::line::LineId;
+use crate::line::{LineId, Writer};
 use crate::ops::remap::remap;
 use crate::ops::{applied_to, Applied, Op};
 use crate::store::diaries::{commit_diaries, diaries_changed, moves_salt, SALT_KEPT};
@@ -242,7 +242,11 @@ impl Store {
         // committer's is when this service committed it, so history orders
         // by when things reached the repository whatever a write says of
         // itself.
-        let writer = actor.writer().name();
+        // A person's line is authored by the person; any other by its writer.
+        let writer = match (actor.writer(), actor.person()) {
+            (Writer::Person, Some(p)) => p.as_str(),
+            (w, _) => w.name(),
+        };
         let author = Signature::new(writer, &format!("{writer}@journals.tokera"), git_time(now))?;
         let committer =
             Signature::new("journal service", "journals@tokera", git_time(Stamp::now()))?;

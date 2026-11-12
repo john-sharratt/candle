@@ -117,7 +117,7 @@ mod tests {
         let mut line = note("2026-11-08T05:00:00Z", "The ingest key version is 4.");
         assert_eq!(
             line.render(),
-            "at: 2026-11-08T05:00:00Z\nkind: note\nby: claude-code\naccount: john\n\
+            "at: 2026-11-08T05:00:00Z\nkind: note\naccount: john\n\
              text: The ingest key version is 4.\n"
         );
         line.terms = Terms {
@@ -128,7 +128,7 @@ mod tests {
         };
         assert_eq!(
             line.render(),
-            "at: 2026-11-08T05:00:00Z\nkind: note\nby: claude-code\naccount: john\n\
+            "at: 2026-11-08T05:00:00Z\nkind: note\naccount: john\n\
              concluded: true\nsource: zend/src/branch_ingest/keys.rs:12\n\
              expires: 2026-12-01T00:00:00Z\nreplaces: 2026-10-31-0034-7c25\n\
              text: The ingest key version is 4.\n"

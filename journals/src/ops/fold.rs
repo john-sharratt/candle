@@ -53,7 +53,6 @@ pub(crate) fn fold_child(
         by: Writer::Zend,
         account: None,
         speaker: None,
-        channel: None,
         folds: Some(Folds::Journal(name.clone())),
         proposed: false,
         terms: Terms::default(),

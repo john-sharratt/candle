@@ -1,7 +1,6 @@
 //! How a line's writer and time read: "Yen on John's account", "John", "the
-//! server for John", "Zen" — and how long ago. A line names the person who
-//! wrote it, never the app they wrote through: the channel a line records is
-//! the store's, and no reader is shown it.
+//! server for John", "Zen" — and how long ago. A line names the person it is
+//! from, never the app they spoke through, which no line records.
 
 use crate::line::{Line, Writer};
 use crate::slug::Slug;
@@ -22,7 +21,7 @@ pub fn who(tree: &Tree, line: &Line) -> String {
     let account = line.account.as_ref().map(|p| name_of(tree, p));
     let speaker = line.speaker.as_ref().map(|p| name_of(tree, p));
     match (line.by, account) {
-        (Writer::Channel(_), account) => match (speaker, account) {
+        (Writer::Person, account) => match (speaker, account) {
             (Some(s), Some(a)) if s != a => format!("{s} on {a}'s account"),
             (Some(s), _) | (None, Some(s)) => s,
             (None, None) => "a guest".to_string(),
@@ -72,7 +71,6 @@ pub fn render_line(tree: &Tree, line: &Line) -> String {
 mod tests {
     use super::*;
     use crate::ops::fixture::zen;
-    use crate::scope::Channel;
     use crate::testing::{at, note, slug};
 
     /// **A line names who wrote it, never the app**: the channel it records
@@ -84,7 +82,6 @@ mod tests {
         assert_eq!(who(&t, &l), "john");
         l.speaker = Some(slug("john"));
         assert_eq!(who(&t, &l), "john", "his own account");
-        l.by = Writer::Channel(Channel::Grok);
         l.speaker = Some(slug("yen"));
         assert_eq!(who(&t, &l), "yen on john's account");
         l.account = None;
@@ -93,7 +90,6 @@ mod tests {
         assert_eq!(who(&t, &l), "a guest");
         l.by = Writer::Server;
         l.account = Some(slug("john"));
-        l.channel = Some(Channel::Grok);
         assert_eq!(who(&t, &l), "the server for john");
         l.by = Writer::Zend;
         l.account = None;

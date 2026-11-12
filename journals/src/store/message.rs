@@ -115,7 +115,7 @@ mod tests {
             slice::from_ref(&id),
         );
         assert!(m.starts_with(
-            "Note on @zen/topics\n\nJournal-Writer: grok\nJournal-Account: yen\nJournal-Channel: grok\nJournal-At: 2026-10-30T12:00:00Z\nJournal-Line: 2026-10-30-1200-7e3a\nJournal-Actor: "
+            "Note on @zen/topics\n\nJournal-Writer: person\nJournal-Account: yen\nJournal-Channel: grok\nJournal-At: 2026-10-30T12:00:00Z\nJournal-Line: 2026-10-30-1200-7e3a\nJournal-Actor: "
         ), "{m}");
         assert_eq!(
             read(&m).unwrap(),

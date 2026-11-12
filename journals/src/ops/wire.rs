@@ -335,6 +335,7 @@ pub fn op_to_wire(op: &Op) -> Value {
         Op::Bind { person, email, key } => {
             json!({"op": "bind", "person": person.as_str(), "email": email.as_str(), "key": key.as_str()})
         }
+        Op::Restamp => json!({"op": "restamp"}),
     }
 }
 
@@ -534,6 +535,7 @@ pub fn op_from_wire(v: &Value) -> Result<Op> {
             email: Email::parse(o.str("email")?).map_err(Error::Invalid)?,
             key: AccountKey::parse(o.str("key")?).map_err(Error::Invalid)?,
         },
+        "restamp" => Op::Restamp,
         k => return Err(Error::invalid(format!("`{k}` is not an operation"))),
     })
 }
@@ -715,6 +717,7 @@ mod tests {
                 email: Email::parse("yen@example.com").unwrap(),
                 key: AccountKey::parse("3b1f09c2d47e8a60").unwrap(),
             },
+            Op::Restamp,
         ];
         for op in ops {
             let wire = op_to_wire(&op);

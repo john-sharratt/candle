@@ -444,21 +444,21 @@ the same fields: `{at: …, kind: note, text: "…"}` on one line reads as well.
   - `note`: a model was told or chose to keep it;
   - `episode`: the server recorded something that happened;
   - `fold`: a folded journal or period (§2.3, §4).
-- **Who wrote it** is four fields:
-  - `by`: the writer, either a channel or the server.
+- **Who wrote it** is up to three fields:
+  - `by`: the writer when it is not a person — `server`, `zend`, `npcd` or
+    `worker`. A person's line has none.
   - `account`: the person whose sign-in made the call, as the gateway
     verified it.
   - `speaker`: who the conversation's focus said was talking when the line
     was written. It is the model's judgement and is absent until the model
     has one.
-  - `channel`: the client app, on an episode.
 
   A line reads "Yen on John's account". When the speaker is the account's own
-  person, it reads "John". **No reader is shown the app**: `by` and `channel`
-  are the store's, so no view of a line says them, and a `file_read` of an
-  entry's file leaves both fields out (`journals::view::entry_file`). A model
-  reading its memory reads who said a thing, not which assistant carried it.
-  The commit says the rest (§7.1).
+  person, it reads "John". **No line names the app it came through.** A model
+  reading its memory reads who said a thing, not which assistant carried it: an
+  entry stamped `by: claude-code` was read by the model that wrote it as a
+  statement about itself. The app is the conversation's (its name, §2.1) and
+  the commit's (its `Journal-Channel` trailer, §7.1), never the line's.
 - **Editing a line is a commit** that changes it. Nothing is lost: history keeps
   every version, and `git log -L` / `git blame` answer when and by whom.
 - **A line stays in the journal it was written to.** Moving one is a
@@ -1197,8 +1197,9 @@ checked after, since a partial recalibration once skewed routing.
 
 ### 7.1 Who wrote it
 
-Each commit is made by the journal service and authored as the writer, the
-channel or service. The service stamps its trailers from the verified call
+Each commit is made by the journal service and authored as the writer: the
+person whose account made the call, or the service. The service stamps its
+trailers from the verified call
 and the conversation's focus, never from what a client says of itself:
 
 ```
@@ -1219,7 +1220,10 @@ Journal-Tool: journal_note
 - The speaker is the model's judgement, recorded in the focus.
 - The channel is what the caller's connection names itself (an MCP
   session's `clientInfo`, or an HTTP request's `channel`, §6.7). The service
-  records it but cannot check it.
+  records it on the commit, never on the line (§3.2), and cannot check it.
+  An entry written before that named it in `by` or `channel`; zend's
+  restamp (`journals::ops::restamp`), run once as its memory opens, writes
+  each one again without.
 
 ### 7.2 Who may read and write where
 

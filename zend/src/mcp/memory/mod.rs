@@ -25,6 +25,7 @@ pub mod who;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
 use std::time::Duration;
 
 #[cfg(feature = "memory-census")]
@@ -42,6 +43,9 @@ use journals::tree::{Journal, Tree};
 use conversations::Conversations;
 
 pub use journals::live::{DiaryFiles, WriteError};
+
+/// How long the restamp waits for the checkout to open: its fetch and read.
+const RESTAMP_WAIT: Duration = Duration::from_secs(600);
 
 /// What a tool says when this zend serves no journal repository.
 pub const NO_MEMORY: &str =
@@ -72,12 +76,37 @@ pub(crate) fn held<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Memory {
     /// Open the journal checkout at `dir` on a thread of its own, and keep it
-    /// in step with origin there for the process's life.
+    /// in step with origin there for the process's life; once it opens,
+    /// [`Self::restamp`] it.
     pub fn start(self: &Arc<Self>, dir: PathBuf) {
         self.live.start(dir, "journal-sync", || {
             #[cfg(feature = "memory-census")]
             set_thread(Scope::Journals);
         });
+        let me = Arc::clone(self);
+        if let Err(e) = thread::Builder::new()
+            .name("journal-restamp".into())
+            .spawn(move || me.restamp())
+        {
+            tracing::warn!("journals: the restamp thread did not start: {e}");
+        }
+    }
+
+    /// Once the checkout opens, every entry written as the store now writes
+    /// it (`journals::ops::restamp`): one commit, pushed at the next sync. A
+    /// tree already in that form has nothing to write, and the store says so.
+    fn restamp(&self) {
+        if !self.opened_within(RESTAMP_WAIT) {
+            return;
+        }
+        match self.write(&Actor::Zend, &Op::Restamp) {
+            Ok(applied) => tracing::info!(
+                journals = applied.touched.len(),
+                "journals: every entry restamped"
+            ),
+            Err(e) if e.is_refusal() => tracing::debug!("journals: restamp: {e}"),
+            Err(e) => tracing::warn!("journals: restamp: {e}"),
+        }
     }
 
     /// Whether the memory opened, waiting up to `within` while it is still
