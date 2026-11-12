@@ -356,20 +356,25 @@ scale whichever gap quantizes them.
   quantized blocks with the existing batch copy
   (`migrate_sealed_to_cpu_batch_async`). No `device.synchronize()` anywhere on
   this path.
-- **Pinned warm tier.** The DtoH lands in pinned host buffers that are both the
-  redo-log write buffer and the warm cache (`kv_tier_migration.md` §3). This
-  replaces today's pageable CPU arenas, so the copy runs at full link bandwidth.
-  On WDDM, pinned memory is charged to system commit (`docs/driver_model.md`),
-  so the pool's size is read from the machine's RAM and commit headroom, never
-  fixed. The three dev machines have 32, 64 and 189 GB. The pool is the
-  machine's and is one budget: each attachment's thread holds its share of it
-  through the `WarmLedger`, as it does of the warm tier today.
-- **A full pool.** When the pool has no free buffer, it drops its least recently
-  used blocks that the log already holds. Those blocks are then cold and are
-  read back from the log when wanted. A block the log does not yet hold is
-  never dropped. If every buffer holds such a block, the copy waits for the
-  log's append to release one. That wait is the persistence thread's alone: the
-  blocks stay hot and quantized, and the gap never waits on the pool.
+- **The warm tier stays where it is.** The copy already moves at the link's
+  full bandwidth: `migrate_sealed_to_cpu_batch_async` gathers the bands on the
+  device and copies them into pinned staging on its own stream, and only the
+  scatter from staging into the warm tier's host arenas runs on the host. The
+  warm arenas therefore stay pageable host memory, budgeted as today — one
+  `WarmLedger` share per attachment of the machine's KV warm budget
+  (`KV_WARM_FLOOR`), purged to its cold copy past it. A pinned pool would buy
+  no bandwidth and charge the machine's commit with every byte it held.
+- **A full tier.** Past its budget the tier drops its least recently used
+  blocks that the log already holds, which are then cold and are read back
+  from the log when wanted. A block the log does not yet hold is never
+  dropped. The gap never waits on the tier: a block that cannot be copied yet
+  stays hot and quantized.
+- **Read from cold into warm.** `PersistenceTrigger::warm_turns` asks the
+  persistence thread to bring a list of turns from the log into the warm tier,
+  without placing them hot: best-effort, skipping a turn already warm or hot,
+  and dropping what does not fit the thread's share. The hit-driven pool
+  (`docs/hit_driven_projection.md` §7.2) warms its pieces this way, so a round
+  the slot later chooses lifts at the link's speed rather than the disk's.
 - **Holding while copying.** The copy holds the quantized blocks' `ChunkGid`s
   until its own event completes, so no free or compaction can recycle them under
   it. `HeldChunks` already lets a copy run beside a compaction pass, which steps
@@ -564,10 +569,10 @@ Line numbers are as of commit `dc04b62ac`.
   the gap (§5). `BacklogGauge` stays, stamped with the copy backlog.
 - `candle-nn/src/kv_cache/chunked/chunk_ops.rs:1297`,
   `migrate_sealed_to_cpu_batch_async`: the copy, on the thread's own stream,
-  into the pool.
-- New `candle-conversation/src/persistence/warm_pool.rs`: the pinned pool, its
-  sizing and its full-pool rule. `persistence/warm_ledger.rs:27` gives each
-  thread its share.
+  through its pinned staging into the warm arenas.
+- `candle-conversation/src/persistence/`: `PersistenceTrigger::warm_turns`, a
+  cold-to-warm read on the persistence thread. `persistence/warm_ledger.rs`
+  gives each thread its share of the warm budget, as today.
 - `candle-nn/src/kv_cache/chunked/migrate_flight.rs:131` (`MigrateFlight`,
   deleted) and `:212` (`HeldChunks`, kept).
 - `candle-conversation/src/persistence/group_cap.rs` and `reserve_log.rs`:

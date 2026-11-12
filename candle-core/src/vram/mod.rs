@@ -398,9 +398,9 @@ static HOST_PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
 ///
 /// The total alone cannot answer the question a pinned-memory decision actually
 /// asks — "the tier is short, who else is holding the pages?" — because every
-/// consumer here is claiming from the same half-of-RAM ceiling
-/// ([`host_probe::PINNABLE_FRACTION`]). One 11 GB claimant and six small ones
-/// need telling apart before any of them is resized.
+/// consumer here is claiming from the same host-RAM partition
+/// ([`host_ram_budget`]). One 11 GB claimant and six small ones need telling
+/// apart before any of them is resized.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PinnedUse {
     /// A model's weight warm tier — the dominant claimant by an order of
@@ -494,7 +494,7 @@ pub fn host_pinned_bytes_for(use_: PinnedUse) -> u64 {
 
 /// Every consumer's current holding, for a report. Sums to
 /// [`host_pinned_bytes`].
-pub fn host_pinned_breakdown() -> [(PinnedUse, u64); 4] {
+pub fn host_pinned_breakdown() -> [(PinnedUse, u64); PinnedUse::ALL.len()] {
     PinnedUse::ALL.map(|u| (u, host_pinned_bytes_for(u)))
 }
 
