@@ -2733,12 +2733,10 @@ impl Substrate {
         installed
     }
 
-    /// Test/integration helper: the residence-slab index that a turn
-    /// addresses. Needed by tests that drive the tier transitions
-    /// (`install_warm`, `install_cold`, `evict_hot_except`) from
-    /// outside the substrate's own write methods. Returns `None`
-    /// when the turn isn't tracked.
-    #[cfg(any(test, feature = "test-helpers"))]
+    /// The residence-slab index that a turn addresses: what a tier
+    /// transition from outside the substrate's own write methods installs
+    /// on (`install_warm` for a warm-on-request read, the tests' `install_cold`
+    /// and `evict_hot_except`). Returns `None` when the turn isn't tracked.
     pub fn turn_residence(&self, timeline: TimelineId, index: TurnIndex) -> Option<ResidenceIndex> {
         self.turn(timeline, index).map(|e| e.content.residence)
     }
