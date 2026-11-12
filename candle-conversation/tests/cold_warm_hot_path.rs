@@ -40,6 +40,7 @@ use candle_conversation::persistence::warm_ledger::WarmLedger;
 use candle_conversation::projection::{
     Conversation, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
 };
+use candle_conversation::substrate::residence::{drain_reclaimed, own_device_frees};
 use candle_conversation::substrate::TierState;
 use candle_conversation::turn::Role;
 use candle_nn::kv_cache::{ChunkedKvBacking, KvFormat, QuantFormat, SealedSequence};
@@ -3669,7 +3670,13 @@ struct DemoteFixture {
 /// residence that has one, so a fixture that skipped the persistence pass
 /// would evict nothing and both tests below would be measuring an eviction
 /// that never happened.
+///
+/// The test's thread stands where the scheduler's does: it owns the device's
+/// frees ([`own_device_frees`]), so a hot copy dropped here is freed here, and
+/// one the persistence thread lets go waits in the reclaim queue until the
+/// test drains it ([`drain_reclaimed`]), as a wave boundary does.
 fn demote_fixture(device: &Device) -> DemoteFixture {
+    own_device_frees();
     let tmpdir = tempfile::tempdir().unwrap();
     let dir = tmpdir.path().to_path_buf();
     let conv = open_conversation(&dir);
@@ -3759,6 +3766,7 @@ fn demoting_every_turn_returns_its_vram() {
         purged.count, DEMOTE_TURNS,
         "an empty keep-set should demote every turn"
     );
+    drain_reclaimed();
     for &key in &f.turn_keys {
         let st = turn_state(&f.conv, key);
         assert!(!st.hot && st.warm, "post-demotion {key:?} is {st:?}");
@@ -3817,6 +3825,7 @@ fn a_kept_turn_keeps_its_vram_while_the_rest_comes_back() {
         DEMOTE_TURNS - 1,
         "every turn but the kept one should have been demoted"
     );
+    drain_reclaimed();
 
     release_empty(&f.backings);
 
