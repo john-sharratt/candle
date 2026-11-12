@@ -41,6 +41,8 @@ pub mod device_operand;
 pub mod draft;
 #[cfg(feature = "cuda")]
 pub mod engine;
+#[cfg(feature = "cuda")]
+pub mod hit_summary;
 pub mod hits;
 pub mod hyper;
 #[cfg(feature = "cuda")]

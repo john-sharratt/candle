@@ -5058,7 +5058,8 @@ pub trait ManagedBatchedModel {
     }
 
     /// What `seq`'s sampled layers chose of each declared piece since the
-    /// last read, zeroing the counts; `None` for a model with no selection to
+    /// last read, as far as the device has published it — read without
+    /// waiting on the device; `None` for a model with no selection to
     /// count, or a sequence with nothing declared.
     fn take_hits(&self, _seq: usize) -> Result<Option<PieceHits>> {
         Ok(None)

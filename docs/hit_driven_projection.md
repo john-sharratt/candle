@@ -291,10 +291,15 @@ device map takes each block to its round, loaded or pooled, rebuilt when a
 projection declares its rounds (`ManagedBatchedModel::set_hit_rounds`); after
 the selection at a sampled layer one batched launch adds each chosen block
 into its round's counter (`qsa_hits.cu`, a span table naming each sequence's
-rows, map and counters). Nothing is read inside a forward: the reprojection
-reads and zeroes the counts at the boundary (`take_hits`), where it already
-stands between forwards. A row inside the budget made no selection and counts
-nothing.
+rows, map and counters), and each row that selected adds one query. The
+counters live on the reservation's held ground and are cumulative over a
+declaration. After the wave's last sampled layer a second launch publishes
+each sequence's counters into a mapped pinned block (`qwen4exp/hit_summary.rs`)
+— a sequence word, the counts, the word again — as MoE routing publishes its
+summary. The reprojection reads the newest finished block at the boundary
+(`take_hits`) and takes the difference from its last read; nothing on either
+side waits, and what is still in flight is in the next read. A row inside the
+budget made no selection and counts nothing.
 
 A counter's identity is the round's: (piece id, round index), stable across
 projections (§13 step 5), so the hook that declares them is

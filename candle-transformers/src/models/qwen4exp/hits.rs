@@ -3,9 +3,14 @@
 //! A projection declares the pieces it placed, as position ranges; each
 //! becomes a run of blocks in a block→piece map, built once through the
 //! sequence's index layout. At every sampled layer, the selection's chosen
-//! blocks are counted into their pieces' counters by one batched launch
-//! (`qsa_hits.cu`), and the counters are read — and zeroed — when the
-//! projection next asks.
+//! blocks — and the rows that chose them — are counted into the sequence's
+//! counters by one batched launch (`qsa_hits.cu`). After the wave's last
+//! sampled layer a second launch publishes the counters into a mapped block
+//! ([`super::hit_summary`]), which the projection reads at its next boundary
+//! without waiting on the device (AGENTS hot-path invariant 3).
+//!
+//! The counters, the map and the launch table live on the reservation's held
+//! ground, never in loose allocations.
 
 #[cfg(feature = "cuda")]
 use std::collections::HashMap;
@@ -15,32 +20,56 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(feature = "cuda")]
 use candle::Storage;
 use candle::{DType, Device, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_kernels::simple::qsa_hits::{HitSpan, HIT_SPAN_WORDS};
 
 #[cfg(feature = "cuda")]
 use crate::models::delta_net::mix::SeqSpan;
+#[cfg(feature = "cuda")]
+use crate::models::held_tensor::{held_empty, held_zeros};
 use crate::models::hit_layers::PieceHits;
 #[cfg(feature = "cuda")]
 use crate::models::qsa_selection::QsaSelection;
+#[cfg(feature = "cuda")]
+use crate::models::wave_buffers::upload_into;
+
+#[cfg(feature = "cuda")]
+use super::hit_summary::{self, MappedBlock, HEADER_WORDS};
 
 /// A block no placed piece owns (`QSA_NO_PIECE` in `qsa_hits.cu`).
 pub const NO_PIECE: u32 = u32::MAX;
 
+/// Words a counter set holds past its hits: the queries counted, then the
+/// publish sequence word (`COUNTER_TAIL_WORDS` in the kernel's binding).
+const COUNTER_TAIL: usize = 2;
+
 /// One projection's declared pieces and their counters.
 #[derive(Debug)]
 struct Counts {
-    /// `[map_len]` U32 on the device: block → piece, [`NO_PIECE`] for none.
+    /// `[map_len]` U32: block → piece, [`NO_PIECE`] for none.
     map: Tensor,
     map_len: usize,
-    /// `[n_pieces]` U32 on the device: hits since the last read. An atomic
-    /// accumulator, so it starts — and is reset — at zero.
+    /// `[n_pieces + COUNTER_TAIL]` U32: hits per piece, the queries counted,
+    /// and the publish sequence word, cumulative over the declaration. Atomic
+    /// accumulators, so they start at zero; never reset while the
+    /// declaration stands — a read takes the difference from the last.
     counters: Tensor,
     n_pieces: usize,
     /// Blocks each piece owns in the map, host-side.
     blocks: Vec<u32>,
-    /// Query rows counted since the last read, summed over sampled layers.
-    queries: u64,
     /// Which declaration this is: each redeclaration counts one more.
     generation: u64,
+    /// Which holder the summary block belongs to.
+    token: u32,
+    /// Where the device publishes the counters. Off CUDA there is none, and a
+    /// read takes the counters themselves.
+    #[cfg(feature = "cuda")]
+    summary: Option<MappedBlock>,
+    /// The publish the last read took, and what it held: a read returns
+    /// what has landed since.
+    read_seq: u32,
+    read_hits: Vec<u32>,
+    read_queries: u32,
 }
 
 /// A sequence's hit counters, shared by every view carved from it.
@@ -70,7 +99,8 @@ pub struct HitHolder {
 
 /// The kernel's span table as last uploaded: the words and the device copy.
 /// A wave's spans and counter pointers are the same at every sampled layer,
-/// so the table goes up once per wave and is reused while its words match.
+/// and across waves until a declaration changes, so the table goes up only
+/// when its words do.
 pub type HitTable = Option<(Vec<u32>, Tensor)>;
 
 /// The blocks position range `r` covers under a layout whose
@@ -108,12 +138,33 @@ pub fn block_map(
     map
 }
 
+/// The hits and queries in `now` past `then`, both cumulative over one
+/// declaration. The counters are u32 and wrap, so the difference wraps too.
+fn since(now: &[u32], then: &[u32], q_now: u32, q_then: u32) -> (Vec<u32>, u64) {
+    let hits = now
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| n.wrapping_sub(then.get(i).copied().unwrap_or(0)))
+        .collect();
+    (hits, q_now.wrapping_sub(q_then) as u64)
+}
+
 impl SeqHits {
     /// Counters for `n_pieces` pieces over `map`.
     pub fn new(map: Vec<u32>, n_pieces: usize, device: &Device) -> Result<Self> {
-        Ok(Self(Arc::new(Mutex::new(Counts::new(
-            map, n_pieces, device,
-        )?))))
+        #[cfg(feature = "cuda")]
+        let token = hit_summary::next_token();
+        #[cfg(not(feature = "cuda"))]
+        let token = 0;
+        #[cfg(feature = "cuda")]
+        let c = {
+            let mut c = Counts::new(map, n_pieces, device, token, 0)?;
+            c.adopt(None, device)?;
+            c
+        };
+        #[cfg(not(feature = "cuda"))]
+        let c = Counts::new(map, n_pieces, device, token, 0)?;
+        Ok(Self(Arc::new(Mutex::new(c))))
     }
 
     /// Replace the declared pieces and their counters, for every holder. The
@@ -122,8 +173,12 @@ impl SeqHits {
     pub fn redeclare(&self, map: Vec<u32>, n_pieces: usize, device: &Device) -> Result<u64> {
         let mut c = self.lock()?;
         let generation = c.generation + 1;
-        *c = Counts::new(map, n_pieces, device)?;
-        c.generation = generation;
+        let fresh = Counts::new(map, n_pieces, device, c.token, generation)?;
+        #[cfg(feature = "cuda")]
+        let carried = c.summary.take();
+        *c = fresh;
+        #[cfg(feature = "cuda")]
+        c.adopt(carried, device)?;
         Ok(generation)
     }
 
@@ -132,10 +187,11 @@ impl SeqHits {
         Ok(self.lock()?.generation)
     }
 
-    /// The counts since the last read, and zero them.
+    /// What has been counted since the last read, as far as the device has
+    /// published it.
     ///
-    /// A device→host copy, made where the projection reads it — at a
-    /// boundary, between forwards — never inside one.
+    /// Reads the mapped summary the device last finished writing: no copy,
+    /// no wait. Counts still in flight are in the next read.
     pub fn take(&self) -> Result<PieceHits> {
         self.lock()?.take()
     }
@@ -148,7 +204,13 @@ impl SeqHits {
 }
 
 impl Counts {
-    fn new(map: Vec<u32>, n_pieces: usize, device: &Device) -> Result<Self> {
+    fn new(
+        map: Vec<u32>,
+        n_pieces: usize,
+        device: &Device,
+        token: u32,
+        generation: u64,
+    ) -> Result<Self> {
         let mut blocks = vec![0u32; n_pieces];
         for &p in &map {
             if let Some(b) = blocks.get_mut(p as usize) {
@@ -159,62 +221,131 @@ impl Counts {
         // An empty map still holds one slot, so the tensor is never zero-sized;
         // `map_len` says none of it is read.
         let map = match map_len {
-            0 => Tensor::from_vec(vec![NO_PIECE], 1, device)?,
-            n => Tensor::from_vec(map, n, device)?,
+            0 => vec![NO_PIECE],
+            _ => map,
         };
-        let counters = Tensor::zeros(n_pieces.max(1), DType::U32, device)?;
+        let (map, counters) = Self::buffers(map, n_pieces + COUNTER_TAIL, device)?;
+        // The summary block is the caller's to give it ([`Self::adopt`]): a
+        // redeclaration hands on the one it already holds.
         Ok(Self {
             map,
             map_len,
             counters,
             n_pieces,
             blocks,
-            queries: 0,
-            generation: 0,
+            generation,
+            token,
+            #[cfg(feature = "cuda")]
+            summary: None,
+            read_seq: 0,
+            read_hits: vec![0; n_pieces],
+            read_queries: 0,
         })
     }
 
+    /// The map, uploaded, and the counters, zeroed: on held ground on CUDA.
+    fn buffers(map: Vec<u32>, counters: usize, device: &Device) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "cuda")]
+        if device.is_cuda() {
+            let m = held_empty(map.len(), DType::U32, device)?;
+            upload_into(&m, &map)?;
+            return Ok((m, held_zeros(counters, DType::U32, device)?));
+        }
+        let n = map.len();
+        Ok((
+            Tensor::from_vec(map, n, device)?,
+            Tensor::zeros(counters, DType::U32, device)?,
+        ))
+    }
+
+    /// Take `carried` — the previous declaration's summary block — when it
+    /// holds this one's pieces, and a block that does otherwise. Off CUDA
+    /// there is no block.
+    #[cfg(feature = "cuda")]
+    fn adopt(&mut self, carried: Option<MappedBlock>, device: &Device) -> Result<()> {
+        let Device::Cuda(dev) = device else {
+            if let Some(b) = carried {
+                hit_summary::release(b);
+            }
+            return Ok(());
+        };
+        let words = HEADER_WORDS + self.n_pieces;
+        let block = match carried {
+            Some(b) if b.words() >= words => b,
+            other => {
+                if let Some(b) = other {
+                    hit_summary::release(b);
+                }
+                hit_summary::acquire(dev, words)?
+            }
+        };
+        self.summary = Some(block);
+        Ok(())
+    }
+
+    /// The newest cumulative counts: the summary's last finished publish on
+    /// CUDA, the counters themselves elsewhere. `None` while nothing new has
+    /// landed since the last read.
+    fn newest(&self) -> Result<Option<(u32, u32, Vec<u32>)>> {
+        #[cfg(feature = "cuda")]
+        if let Some(block) = &self.summary {
+            return Ok(block
+                .read(self.token, self.generation as u32, self.n_pieces)
+                .filter(|s| s.seq != self.read_seq)
+                .map(|s| (s.seq, s.queries, s.hits)));
+        }
+        let all = self.counters.to_vec1::<u32>()?;
+        let queries = all[self.n_pieces];
+        Ok(Some((0, queries, all[..self.n_pieces].to_vec())))
+    }
+
     fn take(&mut self) -> Result<PieceHits> {
-        // Nothing counted since the last read: the counters are still zero,
-        // so there is nothing to copy back and nothing to reset — and the
-        // cached span table, which names them, stays valid.
-        if self.queries == 0 {
+        let Some((seq, queries, now)) = self.newest()? else {
             return Ok(PieceHits {
                 hits: vec![0; self.n_pieces],
                 blocks: self.blocks.clone(),
                 queries: 0,
             });
-        }
-        let all = self.counters.to_vec1::<u32>()?;
-        let hits = all[..self.n_pieces].to_vec();
-        self.counters = self.counters.zeros_like()?;
-        let queries = std::mem::take(&mut self.queries);
+        };
+        let (hits, q) = since(&now, &self.read_hits, queries, self.read_queries);
+        self.read_seq = seq;
+        self.read_hits = now;
+        self.read_queries = queries;
         Ok(PieceHits {
             hits,
             blocks: self.blocks.clone(),
-            queries,
+            queries: q,
         })
     }
 }
 
+#[cfg(feature = "cuda")]
+impl Drop for Counts {
+    fn drop(&mut self) {
+        if let Some(b) = self.summary.take() {
+            hit_summary::release(b);
+        }
+    }
+}
+
 /// Count the hits of `sel` — one sampled layer's selection over a wave whose
-/// rows `spans` describe, `selecting[i]` of span `i`'s rows selecting — into
-/// each counted sequence's counters, in one launch. A sequence with no
+/// rows `spans` describe — into each counted sequence's counters, in one
+/// launch, and when `publish` (the wave's last sampled layer) publish every
+/// counted set into its summary block, in a second. A sequence with no
 /// declared pieces is not counted, nor a view carved under an older
 /// declaration. A dense row counts no hit and no query. The span table is
-/// `table`'s when its words match — every sampled layer of one wave — and is
-/// uploaded once otherwise.
+/// `table`'s when its words match and is uploaded otherwise.
 #[cfg(feature = "cuda")]
 pub fn count_hits(
     sel: &QsaSelection,
     spans: &[SeqSpan],
-    selecting: &[usize],
     hits: &HashMap<usize, HitHolder>,
     table: &mut HitTable,
+    publish: bool,
     device: &Device,
 ) -> Result<()> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
-    use candle_kernels::simple::qsa_hits::{run_qsa_count_hits, HitSpan};
+    use candle_kernels::simple::qsa_hits::{run_qsa_count_hits, run_qsa_publish_hits};
     use std::ffi::c_void;
 
     let Device::Cuda(dev) = device else {
@@ -225,18 +356,22 @@ pub fn count_hits(
     // test pins (`HitSpan::words`).
     let mut words: Vec<u32> = Vec::new();
     let mut guards = Vec::new();
+    let mut published: Vec<u64> = Vec::new();
     let mut max_rows = 0usize;
-    for (i, span) in spans.iter().enumerate() {
+    for span in spans {
         let Some(holder) = hits.get(&span.seq) else {
             continue;
         };
-        let mut h = holder.hits.lock()?;
+        let h = holder.hits.lock()?;
         if h.n_pieces == 0 || h.map_len == 0 {
             continue;
         }
         if !holder.owned && holder.generation != h.generation {
             continue;
         }
+        let Some(summary) = h.summary.as_ref() else {
+            continue;
+        };
         // Taken on the launch stream, which is the only stream the buffers
         // are ever touched on, so the access event the guard records orders
         // nothing the launch below does not already follow.
@@ -252,6 +387,11 @@ pub fn count_hits(
         };
         let map_ptr = ptr_of(&h.map)?;
         let cnt_ptr = ptr_of(&h.counters)?;
+        // A view counts into its parent's counters: the set is published once.
+        let first = !published.contains(&cnt_ptr);
+        if first {
+            published.push(cnt_ptr);
+        }
         let entry = HitSpan {
             row_lo: span.start as u32,
             row_hi: (span.start + span.len) as u32,
@@ -259,24 +399,29 @@ pub fn count_hits(
             n_pieces: h.n_pieces as u32,
             map: map_ptr as *const u32,
             counters: cnt_ptr as *mut u32,
+            summary: summary.dev_ptr() as *mut u32,
+            token: h.token,
+            generation: h.generation as u32,
+            publish: first as u32,
+            pad: 0,
         };
         words.extend_from_slice(&entry.words());
         guards.push((h.map.clone(), h.counters.clone()));
-        h.queries += selecting.get(i).copied().unwrap_or(span.len) as u64;
         max_rows = max_rows.max(span.len);
     }
-    let n_spans = words.len() / 8;
+    let n_spans = words.len() / HIT_SPAN_WORDS;
     if n_spans == 0 {
         return Ok(());
     }
     // Words name the counters' addresses, so a table built for other
-    // counters — a redeclaration, a read that zeroed them — never matches.
+    // counters — a redeclaration — never matches.
     let fresh = match table {
         Some((cached, _)) => *cached != words,
         None => true,
     };
     if fresh {
-        let t = Tensor::from_vec(words.clone(), (n_spans, 8), device)?;
+        let t = held_empty((n_spans, HIT_SPAN_WORDS), DType::U32, device)?;
+        upload_into(&t, &words)?;
         *table = Some((words, t));
     }
     let Some((_, table)) = table.as_ref() else {
@@ -315,8 +460,18 @@ pub fn count_hits(
             stream.cu_stream() as *mut c_void,
         );
     }
+    if publish {
+        candle::set_kernel_breadcrumb("run_qsa_publish_hits", file!(), line!());
+        unsafe {
+            run_qsa_publish_hits(
+                t_ptr as *const c_void,
+                n_spans as i32,
+                stream.cu_stream() as *mut c_void,
+            );
+        }
+    }
     // The map and counter buffers stay owned by their `SeqHits` across the
-    // launch; the clones above only pin them for its duration.
+    // launches; the clones above only pin them for their duration.
     drop(guards);
     Ok(())
 }
@@ -349,13 +504,30 @@ mod tests {
     #[test]
     fn no_piece_is_the_kernels() {
         assert_eq!(NO_PIECE, candle_kernels::simple::qsa_hits::NO_PIECE);
+        assert_eq!(
+            COUNTER_TAIL,
+            candle_kernels::simple::qsa_hits::COUNTER_TAIL_WORDS
+        );
+        assert_eq!(
+            HEADER_WORDS,
+            candle_kernels::simple::qsa_hits::SUMMARY_HEADER_WORDS
+        );
     }
 
-    /// **The device counts what the entries name, per sequence, per piece**:
-    /// two sequences in one launch, a dense row that counts nothing, a tail
-    /// entry past the map, and a view whose rows count into the counters of
-    /// the parent it was carved from — checked against the count taken on the
-    /// host from the same entries.
+    /// A read takes the difference from the last, wrapping as the counters do.
+    #[test]
+    fn a_read_takes_what_landed_since_the_last() {
+        assert_eq!(since(&[5, 9], &[2, 9], 30, 10), (vec![3, 0], 20));
+        assert_eq!(since(&[1], &[u32::MAX], 2, u32::MAX), (vec![2], 3));
+        assert_eq!(since(&[4, 4], &[], 4, 0), (vec![4, 4], 4));
+    }
+
+    /// **The device counts what the entries name, per sequence, per piece,
+    /// and publishes it where the host reads it**: two sequences in one
+    /// launch, a dense row that counts nothing, a tail entry past the map,
+    /// and a view whose rows count into the counters of the parent it was
+    /// carved from — checked against the count taken on the host from the
+    /// same entries.
     #[cfg(feature = "cuda")]
     #[test]
     fn the_device_counts_each_sequences_selected_blocks() -> Result<()> {
@@ -412,8 +584,6 @@ mod tests {
                 len: 1,
             },
         ];
-        // Seq 2's second row is dense, so one of its two rows selects.
-        let selecting = [2usize, 1, 1];
         let mut hits = HashMap::new();
         // Seq 1: piece 0 owns blocks 0..3, piece 1 owns 3..6.
         let parent = SeqHits::new(vec![0, 0, 0, 1, 1, 1], 2, &device)?;
@@ -437,12 +607,16 @@ mod tests {
                 generation: parent.generation()?,
             },
         );
+        // Nothing published yet: a read finds nothing.
+        assert_eq!(hits[&1].hits.take()?.queries, 0);
         let mut table: HitTable = None;
-        count_hits(&sel, &spans, &selecting, &hits, &mut table, &device)?;
+        // Two sampled layers of one wave: the second reuses the table and
+        // publishes.
+        count_hits(&sel, &spans, &hits, &mut table, false, &device)?;
         let words = table.as_ref().map(|(w, _)| w.clone());
-        // A second sampled layer of the same wave reuses the table.
-        count_hits(&sel, &spans, &selecting, &hits, &mut table, &device)?;
+        count_hits(&sel, &spans, &hits, &mut table, true, &device)?;
         assert_eq!(table.as_ref().map(|(w, _)| w.clone()), words);
+        device.synchronize()?;
         let one = hits[&1].hits.take()?;
         // Per layer — counted twice here — row 0: 0 → p0, 3 → p1, 5 → p1, 40 →
         // past the map. Row 1: 3, 4 → p1. Row 4, the view's: 0 → p0.
@@ -462,20 +636,28 @@ mod tests {
         );
         assert_eq!(two.queries, 2, "the dense row is no query");
 
+        // A second wave: a read takes only what it added.
+        count_hits(&sel, &spans, &hits, &mut table, true, &device)?;
+        device.synchronize()?;
+        let again = hits[&1].hits.take()?;
+        assert_eq!(again.hits, vec![2, 4]);
+        assert_eq!(again.queries, 3);
+
         // The parent is rebuilt and redeclares: the view, carved under the
         // old layout, stops counting; the parent's own rows go on.
         parent.redeclare(vec![0, 0, 0, 1, 1, 1], 2, &device)?;
-        count_hits(&sel, &spans, &selecting, &hits, &mut table, &device)?;
+        count_hits(&sel, &spans, &hits, &mut table, true, &device)?;
+        device.synchronize()?;
         let after = hits[&1].hits.take()?;
         assert_eq!(after.hits, vec![1, 4], "the parent's rows alone");
         assert_eq!(after.queries, 2);
         Ok(())
     }
 
-    /// The counters start at zero and a read zeroes them; a redeclaration
-    /// reaches every holder.
+    /// Off CUDA a read takes the counters themselves, the difference from the
+    /// last read; a redeclaration reaches every holder.
     #[test]
-    fn a_read_takes_the_counts_and_zeroes_them() -> Result<()> {
+    fn a_read_takes_the_counts_since_the_last() -> Result<()> {
         let h = SeqHits::new(vec![0, 0, 1, NO_PIECE], 2, &Device::Cpu)?;
         assert_eq!(
             h.take()?,
@@ -487,8 +669,7 @@ mod tests {
         );
         {
             let mut c = h.lock()?;
-            c.counters = Tensor::from_vec(vec![3u32, 9], 2, &Device::Cpu)?;
-            c.queries = 7;
+            c.counters = Tensor::from_vec(vec![3u32, 9, 7, 0], 4, &Device::Cpu)?;
         }
         assert_eq!(
             h.take()?,

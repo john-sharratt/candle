@@ -62,7 +62,7 @@ use super::paged_index::SealedIndex;
 use super::ple::{PleSpan, PleState};
 use super::ple_fused::ple_apply_spans_fused;
 use super::qsa::IndexerWeights;
-use super::qsa_select::{budget_fits_kernel, coalesce_ranges, selected_width, Strata, MAX_PINS};
+use super::qsa_select::{budget_fits_kernel, coalesce_ranges, Strata, MAX_PINS};
 use super::resident_page::{PageRegistry, ResidentPage};
 use super::select_bytes::select_layer_bytes;
 use super::spec::SpecCapture;
@@ -523,8 +523,10 @@ impl Qwen4ExpBatched {
 
     /// What `seq`'s sampled layers chose since the last read, per declared
     /// piece — its own rows and every view's carved from it; `None` when it
-    /// declared none of its own. Zeroes the counts. A view holding its
-    /// parent's counters reads nothing: they are the parent's to read.
+    /// declared none of its own. Read from the summary the device last
+    /// published, without waiting on it; what is still in flight is in the
+    /// next read. A view holding its parent's counters reads nothing: they
+    /// are the parent's to read.
     pub fn take_hits(&self, seq: usize) -> Result<Option<PieceHits>> {
         let hits = self
             .hits
@@ -4419,26 +4421,14 @@ impl Qwen4ExpBatched {
                     .read()
                     .map_err(|_| candle::Error::Msg("hits lock poisoned".into()))?;
                 if !hits.is_empty() {
-                    // A row at or below the budget's width attends densely and
-                    // chose nothing: it is no query of the density either.
-                    let width = selected_width(self.model.cfg.indexer.top_k, compress_ratio);
-                    let selecting: Vec<usize> = spans
-                        .iter()
-                        .zip(offsets)
-                        .map(|(s, &off)| s.len.saturating_sub(width.saturating_sub(off)))
-                        .collect();
+                    // The wave's last sampled layer publishes what every
+                    // sampled layer counted, for the next boundary to read.
+                    let publish = self.hit_kv.last() == Some(&kv);
                     let mut table = self
                         .hit_table
                         .lock()
                         .map_err(|_| candle::Error::Msg("hit table lock poisoned".into()))?;
-                    count_hits(
-                        sel,
-                        spans,
-                        &selecting,
-                        &hits,
-                        &mut table,
-                        &self.model.device,
-                    )?;
+                    count_hits(sel, spans, &hits, &mut table, publish, &self.model.device)?;
                 }
             }
         }
