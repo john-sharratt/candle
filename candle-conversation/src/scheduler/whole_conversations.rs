@@ -56,7 +56,7 @@ impl Scheduler {
 fn turn_of(seg: &ProjectionSegment) -> Option<(TimelineId, TurnIndex)> {
     match seg {
         ProjectionSegment::Sealed(SealedKind::Turn(rt, _))
-        | ProjectionSegment::Sealed(SealedKind::TurnHalf(rt)) => {
+        | ProjectionSegment::Sealed(SealedKind::TurnHalf(rt, _)) => {
             rt.timeline.map(|tl| (tl, rt.index()))
         }
         _ => None,

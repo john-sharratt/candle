@@ -105,7 +105,7 @@ use crate::summary_tree::{
     TurnKind, MERGE_FANOUT,
 };
 use crate::token_buffer::TokenBuffer;
-use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnSegment};
+use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnRecord, TurnSegment};
 use crate::working_set::{Candidate, Limits, Refusal, WorkingSet};
 use crate::ConversationError;
 use calibration_record::{standing, CalRecord, CalRecords, CalSnapshot};
@@ -6874,32 +6874,6 @@ impl Substrate {
         Some(Arc::new(hot.to_vec()))
     }
 
-    /// Sealed K/V for the turn's *user-message body* `[user_start, user_end)`
-    /// (the layout's user span), derived on demand as a zero-copy window
-    /// view over the turn's existing chunks via [`window_sealed_tokens`].
-    /// Content-only — no leading or trailing chat-template role marker — so
-    /// the compression assembler can inject it into the user-input region as
-    /// role-matched sealed K/V (no re-prefill) when laying down a
-    /// `SealedKind::TurnHalf` segment.
-    ///
-    /// Only the user half is injected; the assistant half is text-prefilled
-    /// instead (its assistant-role K/V would be incoherent in the
-    /// compression's user-input frame — see [`Self::turn_assistant_token_ids`]).
-    pub fn turn_user_sealed_half(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-    ) -> Option<Arc<Vec<SealedSequence>>> {
-        let full = self.turn_sealed_of(timeline, index)?;
-        let layout = &self.turn(timeline, index)?.content.layout;
-        let half = window_sealed_tokens(
-            &full,
-            layout.user_content_start() as usize,
-            layout.user_content_end() as usize,
-        );
-        Some(Arc::new(half))
-    }
-
     /// The turn's sealed K/V and index pages with its `<think>…</think>` span
     /// windowed out — what a projection injects for every turn but the most
     /// recent.
@@ -7024,11 +6998,113 @@ impl Substrate {
         Ok(Some((Arc::new(windowed), Some(Arc::new(filtered)))))
     }
 
-    /// Token ids of the turn's *assistant-response body* `[asst_start, total)`.
-    /// The compression path prefills the assistant half as text rather than
-    /// injecting it (its assistant-role K/V are incoherent in the
-    /// compression's user-input frame); the user half is injected instead
-    /// (see [`Self::turn_user_sealed_half`]).
+    /// One record of a turn — its user record or its assistant record — as
+    /// sealed K/V and the index pages that cover exactly it
+    /// (`docs/hit_driven_projection.md` §8.1). The slot places a tool round as
+    /// one turn's assistant record and the next turn's user record, so each is
+    /// placed alone, with rows of its own.
+    ///
+    /// The K/V is zero-copy windows of the turn's chunks, as
+    /// [`Self::turn_sealed_without_thinking`] takes them; an assistant record
+    /// whose reasoning is not kept (`keep_reasoning` false) has its
+    /// `<think>…</think>` span windowed out of both the K/V and the pages.
+    ///
+    /// `Ok(None)` when the turn is not held here. The pages are `None` when the
+    /// turn sealed none — a model that carries no index — and an `Err` when the
+    /// record's edges, or its reasoning's, do not fall on page boundaries:
+    /// rows for the wrong span are worse than none, and the seal cuts a page at
+    /// each edge so this does not happen.
+    pub fn turn_record_sealed(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        record: TurnRecord,
+        keep_reasoning: bool,
+        pages: Option<Arc<StoredPages>>,
+    ) -> Result<Option<(Arc<Vec<SealedSequence>>, Option<Arc<StoredPages>>)>, ConversationError>
+    {
+        let (Some(full), Some(turn)) = (
+            self.turn_sealed_of(timeline, index),
+            self.turn(timeline, index),
+        ) else {
+            return Ok(None);
+        };
+        let layout = &turn.content.layout;
+        let total = full.first().map_or(0, |s| s.token_count);
+        let Some(span) = layout.record_span(record, total as u32) else {
+            return Err(ConversationError::Channel(format!(
+                "turn {}#{} has no edge between its records — its message's closer is not in \
+                 its grid — so neither record can be placed alone",
+                timeline.raw(),
+                index.0,
+            )));
+        };
+        // The reasoning comes out of an assistant record that does not keep it,
+        // where it falls inside the record.
+        let reasoning = match (record, keep_reasoning) {
+            (TurnRecord::Assistant, false) => layout
+                .segments
+                .iter()
+                .find_map(|s| match s {
+                    TurnSegment::Thinking { kv, .. } => *kv,
+                    _ => None,
+                })
+                .map(|k| k.range())
+                .filter(|r| !r.is_empty() && r.start >= span.start && r.end <= span.end),
+            _ => None,
+        };
+        let refuse = |what: &str, stored: &StoredPages| {
+            let bounds = index_pages::boundaries(stored.bytes())
+                .map(|b| format!("{b:?}"))
+                .unwrap_or_else(|| "absent".to_string());
+            ConversationError::Channel(format!(
+                "turn {}#{}: the {record:?} record's {what} does not fall on its index page \
+                 boundaries {bounds} — the K/V can be windowed but the rows cannot",
+                timeline.raw(),
+                index.0,
+            ))
+        };
+        let pages = match pages.as_deref() {
+            None => None,
+            Some(stored) => {
+                let mine = stored
+                    .within_span(span.clone())
+                    .ok_or_else(|| refuse(&format!("span {span:?}"), stored))?;
+                let mine = match &reasoning {
+                    None => mine,
+                    Some(r) => mine
+                        .without_span(r.start - span.start..r.end - span.start)
+                        .ok_or_else(|| refuse(&format!("reasoning {r:?}"), stored))?,
+                };
+                Some(Arc::new(mine))
+            }
+        };
+        let ranges = match &reasoning {
+            None => vec![span.clone()],
+            Some(r) => vec![span.start..r.start, r.end..span.end],
+        };
+        let mut kv: Option<Vec<SealedSequence>> = None;
+        for r in ranges {
+            let part = window_sealed_tokens(&full, r.start, r.end);
+            kv = Some(match kv {
+                None => part,
+                Some(acc) => acc
+                    .into_iter()
+                    .zip(part)
+                    .map(|(h, t)| SealedSequence {
+                        token_count: h.token_count + t.token_count,
+                        chunks: h.chunks.into_iter().chain(t.chunks).collect(),
+                        chunk_size: h.chunk_size,
+                        location: h.location,
+                    })
+                    .collect(),
+            });
+        }
+        Ok(Some((Arc::new(kv.unwrap_or_default()), pages)))
+    }
+
+    /// Token ids of the turn's *assistant-response body* `[asst_start, total)`,
+    /// which the compression path prefills as text.
     pub fn turn_assistant_token_ids(
         &self,
         timeline: TimelineId,
@@ -7052,6 +7128,24 @@ impl Substrate {
         let start = (layout.user_content_start() as usize).min(total);
         let end = (layout.user_content_end() as usize).min(total).max(start);
         Some(toks[start..end].to_vec())
+    }
+
+    /// Tokens `record` of a turn holds: its span of the turn's grid, or 0 when
+    /// the turn is not held here or has no record edge.
+    pub fn turn_record_tokens(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        record: TurnRecord,
+    ) -> usize {
+        let Some(turn) = self.turn(timeline, index) else {
+            return 0;
+        };
+        let total = turn.content.token_count as u32;
+        turn.content
+            .layout
+            .record_span(record, total)
+            .map_or(0, |r| r.len())
     }
 
     /// Turn token count — pinned bytes the seal recorded.

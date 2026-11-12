@@ -592,8 +592,9 @@ pub fn from_projection_with_origins(
                 label: "current message".to_string(),
                 tokens: tokens.len() as u32,
             }),
-            // Compression-internal turn-half — not part of the displayed timeline.
-            ProjectionSegment::Sealed(SealedKind::TurnHalf(_)) => None,
+            // A record placed alone is part of its turn's display, not one of its
+            // own.
+            ProjectionSegment::Sealed(SealedKind::TurnHalf(..)) => None,
             // Structural framing — not materialized content.
             ProjectionSegment::Generated { .. } => None,
         })
@@ -683,8 +684,8 @@ fn build_selection(
                     qualified: false,
                 });
             }
-            // Compression-internal turn-half — not a displayed dialogue turn.
-            ProjectionSegment::Sealed(SealedKind::TurnHalf(_)) => {}
+            // A record placed alone is not a displayed dialogue turn of its own.
+            ProjectionSegment::Sealed(SealedKind::TurnHalf(..)) => {}
             ProjectionSegment::Generated { tokens, identity } => {
                 emitted_glue.insert(identity.name.as_str(), tokens.len() as u32);
             }

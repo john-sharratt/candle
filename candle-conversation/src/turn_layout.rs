@@ -149,6 +149,16 @@ pub fn phase_span_of(segments: &[TurnSegment], phase: Phase) -> Option<Range<usi
     (hi > lo && lo != usize::MAX).then_some(lo..hi)
 }
 
+/// One of a turn's two records (`docs/hit_driven_projection.md` §8.1): the
+/// user's message, or the assistant's reply to it. A tool round is one turn's
+/// assistant record — the call — and the next turn's user record — its result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnRecord {
+    User,
+    Assistant,
+}
+
 /// A turn as an ordered list of segments.  Turn-level metadata (role, block span,
 /// layer/group, scores, ids) lives on the owning turn entry, not here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -483,6 +493,44 @@ impl TurnLayout {
         self.user_span().end()
     }
 
+    /// Where the turn's **user record** ends and its **assistant record** begins
+    /// (`docs/hit_driven_projection.md` §8.1): one past the user message's
+    /// closing `<|im_end|>`, the token the index closes a page after. The user
+    /// record is `[0, end)` — its opening marker, the message and its closer —
+    /// and the assistant record `[end, total)`, opening with the newline before
+    /// `<|im_start|>assistant`. Each record is placed alone with the pages
+    /// that cover it, so the two meet where a page does.
+    ///
+    /// `None` when the message's closer is not in the turn's grid — a turn
+    /// sealed with ethereal boundaries, whose records have no edge of their own.
+    pub fn user_record_end(&self) -> Option<u32> {
+        let mut past_user = false;
+        for s in &self.segments {
+            match s {
+                TurnSegment::User { .. } => past_user = true,
+                TurnSegment::Glue {
+                    marker: GlueKind::ImEnd,
+                    kv,
+                } if past_user => {
+                    return kv.filter(|k| k.len > 0).map(|k| k.offset + 1);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The grid range `record` occupies in a turn of `total` tokens: the user
+    /// record up to [`Self::user_record_end`], the assistant record from it to
+    /// the end. `None` when the turn has no record edge.
+    pub fn record_span(&self, record: TurnRecord, total: u32) -> Option<Range<usize>> {
+        let edge = self.user_record_end()?.min(total) as usize;
+        Some(match record {
+            TurnRecord::User => 0..edge,
+            TurnRecord::Assistant => edge..total as usize,
+        })
+    }
+
     /// Whether this turn's grid **contains its own boundary markers** — a real
     /// (`kv: Some`) leading `UserStart`.
     ///
@@ -762,6 +810,53 @@ impl TurnLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The user record ends one past the message's `<|im_end|>`: the opener,
+    /// the message and its closer are the user's; the newline and
+    /// `<|im_start|>assistant` open the assistant's. A turn whose closer is
+    /// ethereal has no record edge.
+    #[test]
+    fn the_user_record_ends_past_the_messages_closer() {
+        // grid: [user_start(3)][user(4)][im_end(2)][a_start(3)][resp(4)][im_end(2)]
+        let baked = TurnLayout::from_flat_grid_with_tail(
+            3,
+            7,
+            12,
+            18,
+            2,
+            3,
+            2,
+            "hi".into(),
+            Some("ok".into()),
+            false,
+        );
+        assert_eq!(baked.validate_tiling(18), Ok(()));
+        assert_eq!(baked.user_record_end(), Some(8));
+        assert_eq!(baked.record_span(TurnRecord::User, 18), Some(0..8));
+        assert_eq!(baked.record_span(TurnRecord::Assistant, 18), Some(8..18));
+        // No message in the grid at all: the closer is not the user's.
+        let none = TurnLayout {
+            segments: vec![TurnSegment::Glue {
+                marker: GlueKind::ImEnd,
+                kv: Some(KvSpan::new(0, 2)),
+            }],
+        };
+        assert_eq!(none.user_record_end(), None);
+        // A closer recorded without K/V gives the records no edge.
+        let ethereal = TurnLayout {
+            segments: vec![
+                TurnSegment::User {
+                    text: "hi".into(),
+                    kv: KvSpan::new(0, 4),
+                },
+                TurnSegment::Glue {
+                    marker: GlueKind::ImEnd,
+                    kv: None,
+                },
+            ],
+        };
+        assert_eq!(ethereal.user_record_end(), None);
+    }
 
     /// A normal user→assistant turn's grid tiled by its segments, validated to
     /// reproduce the exact token ids.
@@ -1781,15 +1876,12 @@ mod tests {
         assert_eq!(rebuilt, grid);
     }
 
-    /// **The `TurnHalf` window excludes the baked opener** (P5b.8).
-    ///
-    /// The compression pass injects a sealed turn's user half and supplies its
-    /// own framing. `turn_user_sealed_half` windows on
-    /// `user_content_start..user_content_end`, which now starts *past* the baked
-    /// marker — so the marker and the compression pass's framing cannot both
-    /// land. This pins that the window is the user body alone.
+    /// **The user body's span excludes the baked opener.** The message body is
+    /// `user_content_start..user_content_end`, starting *past* the baked
+    /// marker, so a reader of the body alone never takes the role marker with
+    /// it. This pins that the span is the user body alone.
     #[test]
-    fn the_user_half_window_excludes_the_baked_opener() {
+    fn the_user_body_excludes_the_baked_opener() {
         let layout = TurnLayout::from_flat_grid_with_tail(
             4, // the opener occupies [0, 4)
             9,
@@ -1806,8 +1898,8 @@ mod tests {
         assert_eq!(
             span,
             KvSpan::new(4, 5),
-            "the user half must start past the opener, or a turn-half injection \
-             carries the role marker into a pass that supplies its own"
+            "the user body must start past the opener, or a reader of the body \
+             takes the role marker with it"
         );
         assert_eq!(layout.user_content_start(), 4);
         assert_eq!(layout.user_content_end(), 9);

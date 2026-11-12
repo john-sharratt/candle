@@ -329,6 +329,20 @@ impl StoredPages {
             whole_key: OnceLock::new(),
         })
     }
+
+    /// The pages inside `span`, keyed: what describes one record of a turn
+    /// (`docs/hit_driven_projection.md` §8.1). `None` when either edge of the
+    /// span falls inside a page, the span runs past the pages, or the payload
+    /// does not decode.
+    pub fn within_span(&self, span: std::ops::Range<usize>) -> Option<StoredPages> {
+        let total: usize = decode(&self.bytes).ok()?.iter().map(|(w, _)| *w).sum();
+        if span.start > span.end || span.end > total {
+            return None;
+        }
+        // The tail first, so the front's positions are still the turn's own.
+        self.without_span(span.end..total)?
+            .without_span(0..span.start)
+    }
 }
 
 impl Clone for StoredPages {
@@ -403,6 +417,41 @@ mod tests {
             decode(&blob).expect("decodes"),
             vec![(4, &[1u8, 2, 3][..]), (0, &[][..]), (9, &[9u8][..])]
         );
+    }
+
+    /// A record takes exactly the pages inside its span, as framed bytes; an
+    /// edge inside a page, or a span past the pages, takes none.
+    #[test]
+    fn a_record_takes_the_pages_inside_its_span() {
+        let stored = StoredPages::new(encode(&pages(&[(3, &[1]), (5, &[2, 2]), (4, &[3])])));
+        let bytes = |s: Option<StoredPages>| s.map(|p| p.bytes().to_vec());
+        assert_eq!(
+            bytes(stored.within_span(3..8)),
+            Some(encode(&pages(&[(5, &[2, 2])])))
+        );
+        assert_eq!(
+            bytes(stored.within_span(0..8)),
+            Some(encode(&pages(&[(3, &[1]), (5, &[2, 2])])))
+        );
+        assert_eq!(
+            bytes(stored.within_span(8..12)),
+            Some(encode(&pages(&[(4, &[3])])))
+        );
+        assert_eq!(
+            bytes(stored.within_span(0..12)),
+            Some(stored.bytes().to_vec())
+        );
+        assert_eq!(
+            bytes(stored.within_span(2..8)),
+            None,
+            "an edge inside a page"
+        );
+        assert_eq!(
+            bytes(stored.within_span(3..9)),
+            None,
+            "an edge inside a page"
+        );
+        assert_eq!(bytes(stored.within_span(8..13)), None, "past the pages");
     }
 
     #[test]

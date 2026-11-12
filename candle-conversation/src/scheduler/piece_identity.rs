@@ -98,8 +98,11 @@ pub(super) fn piece_label(piece: &AssembledPiece) -> String {
             index, timeline, ..
         } => format!("turn {}:{}", tl(timeline), index.0),
         AssembledPiece::TurnHalf {
-            index, timeline, ..
-        } => format!("turn half {}:{}", tl(timeline), index.0),
+            index,
+            timeline,
+            record,
+            ..
+        } => format!("{record:?} record {}:{}", tl(timeline), index.0),
         AssembledPiece::DeferredUser(tokens) => format!("user[{}]", tokens.len()),
     }
 }
@@ -133,11 +136,15 @@ fn write_piece(h: &mut DefaultHasher, piece: &AssembledPiece, reads: &PieceReads
             h.write_u8(timeline.is_some_and(|t| (reads.whole)(t, *index)) as u8);
         }
         AssembledPiece::TurnHalf {
-            index, timeline, ..
+            index,
+            timeline,
+            record,
+            ..
         } => {
             h.write_u8(4);
             h.write_u64(timeline.map_or(0, |t| t.raw()));
             h.write_u32(index.0);
+            h.write_u8(*record as u8);
         }
         AssembledPiece::DeferredUser(tokens) => {
             h.write_u8(5);

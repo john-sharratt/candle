@@ -6,13 +6,14 @@
 use std::fmt;
 
 use crate::projection::{SectionId, TimelineId, TurnIndex};
+use crate::turn_layout::TurnRecord;
 
 /// A sealed piece injected onto a slot, by its kind and stored identity.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum InjectedPiece {
     Section(SectionId),
     Turn(TimelineId, TurnIndex),
-    TurnHalf(TimelineId, TurnIndex),
+    TurnHalf(TimelineId, TurnIndex, TurnRecord),
     /// Glue K/V this slot forwarded once and re-injects from its cache.
     CachedGlue {
         tokens: usize,
@@ -28,7 +29,7 @@ impl fmt::Display for InjectedPiece {
         match self {
             Self::Section(id) => write!(f, "section {}", id.raw()),
             Self::Turn(t, i) => write!(f, "turn {}:{}", t.raw(), i.0),
-            Self::TurnHalf(t, i) => write!(f, "turn half {}:{}", t.raw(), i.0),
+            Self::TurnHalf(t, i, r) => write!(f, "{r:?} record {}:{}", t.raw(), i.0),
             Self::CachedGlue { tokens } => write!(f, "cached glue island[{tokens}]"),
             Self::CachedUserMessage { tokens } => write!(f, "cached user message[{tokens}]"),
         }
@@ -48,8 +49,8 @@ mod tests {
         );
         assert_eq!(InjectedPiece::Turn(t, TurnIndex(2)).to_string(), "turn 7:2");
         assert_eq!(
-            InjectedPiece::TurnHalf(t, TurnIndex(0)).to_string(),
-            "turn half 7:0"
+            InjectedPiece::TurnHalf(t, TurnIndex(0), TurnRecord::Assistant).to_string(),
+            "Assistant record 7:0"
         );
         assert_eq!(
             InjectedPiece::CachedGlue { tokens: 12 }.to_string(),

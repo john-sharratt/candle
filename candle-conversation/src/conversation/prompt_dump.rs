@@ -105,7 +105,7 @@ pub(crate) fn lay_out(
             ProjectionSegment::Sealed(SealedKind::Turn(turn, role)) => {
                 turn_piece(PieceKind::Turn, turn, Some(role_str(*role)), scores, source)
             }
-            ProjectionSegment::Sealed(SealedKind::TurnHalf(turn)) => {
+            ProjectionSegment::Sealed(SealedKind::TurnHalf(turn, _)) => {
                 turn_piece(PieceKind::TurnHalf, turn, None, scores, source)
             }
             ProjectionSegment::Generated { tokens, identity } => piece_of(

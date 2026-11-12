@@ -89,10 +89,11 @@ pub(super) fn segments_identity(
                 h.write_u32(rt.index().0);
                 h.write_u8(*role as u8);
             }
-            ProjectionSegment::Sealed(SealedKind::TurnHalf(rt)) => {
+            ProjectionSegment::Sealed(SealedKind::TurnHalf(rt, record)) => {
                 h.write_u8(3);
                 h.write_u64(rt.timeline.map_or(0, |t| t.raw()));
                 h.write_u32(rt.index().0);
+                h.write_u8(*record as u8);
             }
             ProjectionSegment::Generated { tokens, .. } => {
                 h.write_u8(4);

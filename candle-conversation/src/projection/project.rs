@@ -375,17 +375,12 @@ pub enum ProjectionSegment {
 pub enum SealedKind {
     Section(ResolvedSection),
     Turn(ResolvedTurn, crate::Role),
-    /// The *user half* of a turn — its user-message body, derived on
-    /// demand as a zero-copy window view over the turn's existing chunks.
-    /// Distinct from [`SealedKind::Turn`], which always injects the whole
-    /// turn: a `TurnHalf` injects only the user content (no per-turn
-    /// boundary-marker wrapping), so the compression path can assemble
-    /// many turns' user-halves into one coherent block.  The assistant
-    /// half is text-prefilled rather than injected — its assistant-role
-    /// K/V are incoherent in the compression's user-input frame — so only
-    /// the user half is ever injected.  Used solely by the summary-tree
-    /// compression passes.
-    TurnHalf(ResolvedTurn),
+    /// One record of a turn — its user record or its assistant record — placed
+    /// alone, as zero-copy windows over the turn's chunks with the index pages
+    /// that cover it (`docs/hit_driven_projection.md` §8.1). A tool round is
+    /// one turn's assistant record and the next turn's user record; a
+    /// [`SealedKind::Turn`] places both of one turn's together.
+    TurnHalf(ResolvedTurn, crate::turn_layout::TurnRecord),
 }
 
 /// Diagnostic identity for a [`ProjectionSegment::Generated`] run.
