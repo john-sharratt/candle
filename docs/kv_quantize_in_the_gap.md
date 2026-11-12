@@ -291,6 +291,26 @@ at the rate production produces K/V in decode, decides whether §7's 95% gate
 can be met by the kernels as they are. If it cannot, the kernels are made faster
 first. The gate is not loosened.
 
+**Measured: the kernels as they are meet it.** Qwen3.8-Flash-Next's batched
+forwarding gate on WhiteWorld (RTX 3090, card alone), 2026-11-13, at
+`f4717577c`, from each row's `seal core` lines (`models/seal_timing.rs`):
+
+| Row | Prefill seal | Decode seal | Decode K/V rate | Share of decode |
+|---|---|---|---|---|
+| C0 ×2 | 34.9 MiB, 0.25 ms/MiB | 13.0 MiB, 0.24 ms/MiB | 3.63 MiB/s | 0.09% |
+| C5 ×2 | 34.9 MiB, 0.27 ms/MiB | 13.0 MiB, 0.31 ms/MiB | 3.63 MiB/s | 0.11% |
+| C5 ×8 | 137.3 MiB, 0.26 ms/MiB | 52.0 MiB, 0.26 ms/MiB | 7.67 MiB/s | 0.20% |
+| C8 ×2 | 34.9 MiB, 0.50 ms/MiB | 13.0 MiB, 0.62 ms/MiB | 3.47 MiB/s | 0.21% |
+| C10 ×2 | 34.9 MiB, 1.47 ms/MiB | 3.2 MiB, 3.52 ms/MiB | 3.04 MiB/s | 1.07% |
+| C10 ×8 | 137.3 MiB, 1.47 ms/MiB | 13.0 MiB, 1.55 ms/MiB | 5.82 MiB/s | 0.90% |
+
+The cost per MiB is the selection plus the convert, the selection's host
+readback included, which the gap removes (§3.4). The selection dominates and
+grows with the level's candidate count (C10 searches the most formats); the
+convert stays at about 0.07 ms/MiB at every level. The worst row spends about
+1% of decode, a fifth of what §7 allows, so no kernel is made faster before
+the gap is built.
+
 ### 3.7 What the gap logs
 
 The scheduler writes one `kv_gap` line for each second in which a gap ran,
