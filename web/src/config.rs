@@ -246,7 +246,7 @@ impl Auth {
 }
 
 /// Whether cookie domain `domain` reaches `host`.
-fn covers(domain: &str, host: &str) -> bool {
+pub fn covers(domain: &str, host: &str) -> bool {
     let apex = domain.trim_start_matches('.').to_ascii_lowercase();
     !apex.is_empty() && (host == apex || host.ends_with(&format!(".{apex}")))
 }

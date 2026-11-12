@@ -1294,7 +1294,13 @@ other request, and never see what a token means. The site table forwards
   `https://claude.ai/oauth/claude-code-client-metadata` (Claude Code,
   redirects `http://localhost/callback` and `http://127.0.0.1/callback`).
 - **`/oauth/authorize`** checks the request (PKCE `S256` required, the resource
-  this one), fetches the client's document and matches the redirect — none of
+  this origin's `/mcp` or another site's in the same estate — the cookie
+  domain the sign-in is on — on the same scheme and default port: claude.ai
+  keeps the authorization server it first discovered for a connector, so a
+  connector moved from `tokera.com/mcp` to `code.tokera.com/mcp` signs in at
+  the first and asks for the second; the grant is bound to the resource asked
+  for, and honoured on that origin's `/mcp` alone), fetches the client's
+  document and matches the redirect — none of
   which redirects anywhere, since an unchecked redirect is not one to send a
   browser to. **The user is then asked.** Who they are is the gateway's own
   session cookie; nobody signed in is sent to `/auth/login?next=…`, which

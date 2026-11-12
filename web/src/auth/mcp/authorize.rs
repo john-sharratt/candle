@@ -32,10 +32,12 @@ use super::client::{self, ClientDoc};
 use super::grants::{
     self, Code, Consent, Grant, Kind, CODE_TTL_SECS, CONSENT_TTL_SECS, REFRESH_TTL_SECS,
 };
+use super::metadata::MCP_PATH;
 use super::page::respond;
 use crate::auth::oidc::urlencode;
 use crate::auth::session::{Identity, Key};
 use crate::auth::{Role, Roles};
+use crate::config::covers;
 use crate::html::escape;
 
 /// What a guest is told at the consent page.
@@ -66,8 +68,35 @@ pub struct Request {
     pub resource: String,
 }
 
-/// Check `query` as a request for `resource` — the `/mcp` this origin serves.
-pub fn parse(query: &HashMap<String, String>, resource: &str) -> Result<Request, String> {
+/// Whether `asked` is the `/mcp` of a site in the estate `estate` (a cookie
+/// domain), on `resource`'s scheme — a resource this gateway serves and signs
+/// tokens for, as it does this origin's own. A client may reach the sign-in on
+/// one of the estate's hosts while asking for another's `/mcp`: claude.ai keeps
+/// the authorization server it first discovered for a connector, so a
+/// connector whose URL moved from `tokera.com/mcp` to `code.tokera.com/mcp`
+/// signs in at the first and asks for the second. The token is bound to the
+/// resource asked for, and is honoured on that origin's `/mcp` alone.
+fn in_estate(asked: &str, resource: &str, estate: &str) -> bool {
+    let (Ok(asked), Ok(ours)) = (Url::parse(asked), Url::parse(resource)) else {
+        return false;
+    };
+    asked.scheme() == ours.scheme()
+        && asked.path() == MCP_PATH
+        && asked.query().is_none()
+        && asked.fragment().is_none()
+        && asked.username().is_empty()
+        && asked.password().is_none()
+        && asked.port().is_none()
+        && asked.host_str().is_some_and(|host| covers(estate, host))
+}
+
+/// Check `query` as a request for `resource` — the `/mcp` this origin serves —
+/// or for another site's `/mcp` in the estate `estate`.
+pub fn parse(
+    query: &HashMap<String, String>,
+    resource: &str,
+    estate: &str,
+) -> Result<Request, String> {
     let get = |k: &str| query.get(k).map(String::as_str).filter(|v| !v.is_empty());
     if get("response_type") != Some("code") {
         return Err("`response_type` must be `code`".into());
@@ -79,13 +108,15 @@ pub fn parse(query: &HashMap<String, String>, resource: &str) -> Result<Request,
     if get("code_challenge_method") != Some("S256") {
         return Err("`code_challenge_method` must be `S256`".into());
     }
-    if let Some(asked) = get("resource") {
-        if asked != resource {
+    let resource = match get("resource") {
+        None => resource,
+        Some(asked) if asked == resource || in_estate(asked, resource, estate) => asked,
+        Some(asked) => {
             return Err(format!(
                 "this server issues tokens for `{resource}`, not `{asked}`"
             ));
         }
-    }
+    };
     Ok(Request {
         client_id: client_id.to_string(),
         redirect_uri: redirect_uri.to_string(),
@@ -185,7 +216,9 @@ fn see_other(location: &str) -> Response {
 }
 
 /// Steps 1–3: the request checked, then the sign-in, or the consent page for
-/// `identity`.
+/// `identity`. `resource` is this origin's `/mcp`, and `estate` the cookie
+/// domain it signs in on.
+#[allow(clippy::too_many_arguments)]
 pub async fn ask(
     key: &Key,
     roles: &Roles,
@@ -193,9 +226,10 @@ pub async fn ask(
     path_and_query: &str,
     query: &HashMap<String, String>,
     resource: &str,
+    estate: &str,
     now: u64,
 ) -> Response {
-    let req = match parse(query, resource) {
+    let req = match parse(query, resource, estate) {
         Ok(req) => req,
         Err(why) => return page(StatusCode::BAD_REQUEST, &why),
     };
@@ -371,9 +405,55 @@ mod tests {
         ]
     }
 
+    const ESTATE: &str = ".tokera.com";
+
+    fn asking_for(resource: &str) -> HashMap<String, String> {
+        let mut q = good();
+        q.retain(|(k, _)| *k != "resource");
+        q.push(("resource", resource));
+        query(&q)
+    }
+
+    /// **A sign-in on one of the estate's hosts may ask for another's `/mcp`**,
+    /// as claude.ai does for a connector whose URL moved: the token is bound
+    /// to the resource asked for. Nothing outside the estate, and nothing but
+    /// `/mcp` exactly, is issued.
+    #[test]
+    fn a_sibling_sites_mcp_is_issued_for_and_nothing_else() {
+        let apex = "https://tokera.com/mcp";
+        let req = parse(&asking_for(RESOURCE), apex, ESTATE).unwrap();
+        assert_eq!(req.resource, RESOURCE);
+        let req = parse(&asking_for(apex), RESOURCE, ESTATE).unwrap();
+        assert_eq!(req.resource, apex);
+        for refused in [
+            "https://evil.example/mcp",
+            "https://tokera.com.evil.example/mcp",
+            "https://eviltokera.com/mcp",
+            "http://bot.tokera.com/mcp",
+            "https://bot.tokera.com/mcp/x",
+            "https://bot.tokera.com/other",
+            "https://bot.tokera.com/mcp?x=1",
+            "https://bot.tokera.com:8443/mcp",
+            "https://u@bot.tokera.com/mcp",
+            "not a url",
+        ] {
+            let err = parse(&asking_for(refused), apex, ESTATE).unwrap_err();
+            assert!(err.contains(refused), "{refused}: {err}");
+        }
+        let req = parse(&asking_for("https://bot.tokera.com/mcp"), apex, ESTATE).unwrap();
+        assert_eq!(req.resource, "https://bot.tokera.com/mcp");
+        // Another estate's gateway origin asks within its own estate only.
+        assert!(parse(
+            &asking_for(RESOURCE),
+            "https://yenbot.com.au/mcp",
+            ".yenbot.com.au"
+        )
+        .is_err());
+    }
+
     #[test]
     fn a_good_request_reads_and_each_missing_piece_is_named() {
-        let req = parse(&query(&good()), RESOURCE).unwrap();
+        let req = parse(&query(&good()), RESOURCE, ESTATE).unwrap();
         assert_eq!(req.state.as_deref(), Some("xyz"));
         for (drop, why) in [
             ("response_type", "response_type"),
@@ -383,13 +463,13 @@ mod tests {
             ("code_challenge_method", "S256"),
         ] {
             let q: Vec<_> = good().into_iter().filter(|(k, _)| *k != drop).collect();
-            let err = parse(&query(&q), RESOURCE).unwrap_err();
+            let err = parse(&query(&q), RESOURCE, ESTATE).unwrap_err();
             assert!(err.contains(why), "{drop}: {err}");
         }
         let mut other = good();
         other.retain(|(k, _)| *k != "resource");
         other.push(("resource", "https://evil.example/mcp"));
-        assert!(parse(&query(&other), RESOURCE).is_err());
+        assert!(parse(&query(&other), RESOURCE, ESTATE).is_err());
     }
 
     #[test]
@@ -455,6 +535,7 @@ mod tests {
             "/oauth/authorize",
             &query(&good()),
             RESOURCE,
+            ESTATE,
             100,
         )
         .await;

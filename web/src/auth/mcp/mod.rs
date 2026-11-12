@@ -26,7 +26,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use super::session::{self, Identity};
-use super::Auth;
+use super::{estate, Auth};
 
 pub mod authorize;
 pub mod client;
@@ -132,6 +132,7 @@ async fn authorize_ask(
         path_and_query,
         &query,
         &resource(&auth, &headers),
+        &estate(&auth, &headers).0.cookie_domain,
         session::now_secs(),
     )
     .await
