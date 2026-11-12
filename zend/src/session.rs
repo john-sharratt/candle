@@ -9938,15 +9938,14 @@ mod projection_schema_tests {
         assert_eq!(ws.beta, 0.2);
         assert_eq!(ws.min_momentum, 100.0);
         assert_eq!(ws.max_file_tokens, 48_000);
-        // The working set's shares and the reserve fit the trained window, and
-        // the dialogue's window — a cap each projection fits to what the slot
-        // has left — is inside it (`docs/hit_driven_projection.md` §4).
-        assert_eq!((ws.slot_tokens, ws.reserve_tokens), (262_144, 16_384));
-        assert!(
-            ws.budget_tokens + ws.lock_tokens + ws.guidance_tokens + ws.reserve_tokens
-                <= ws.slot_tokens
-        );
-        assert!(layer("dialogue").window <= ws.slot_tokens);
+        // The reserve and the locks fit Flash-Next's trained window, and the
+        // dialogue's window and the working set's budget are caps on one fill
+        // of it that together reach past it, so a thin working set leaves its
+        // room to the dialogue (`docs/hit_driven_projection.md` §4, §7.2).
+        assert_eq!(ws.reserve_tokens, 16_384);
+        assert_eq!(ws.check_fits(262_144), Ok(()));
+        assert_eq!(layer("dialogue").window, 180_000);
+        assert!(layer("dialogue").window + ws.budget_tokens > 262_144 - ws.reserve_tokens);
         // The persona and the journal are pinned, within 1,024 positions.
         assert!(!schema.system_prompt.pins.is_empty());
         assert_eq!(schema.system_prompt.pins.tokens, 1024);

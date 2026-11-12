@@ -991,17 +991,17 @@ layers:
   # before the historical pool gets a seat, so a window sized only for the
   # recent window would leave score-based recall with nothing at all.
   #
-  # Sized as `Substrate::INHERITED_CHAIN_TOKEN_CAP` (64k, the ceiling on what
-  # the lineage may contribute) plus 32k for its own recent turns and
-  # historical recall. Lower the cap and this can follow it down; the two
-  # numbers are a pair. With the working set's shares and its reserve it fits
-  # the slot, the trained window (docs/hit_driven_projection.md §4).
+  # On an engine whose attention selects, the window is a cap on the
+  # dialogue's rounds and its lineage in one fill of the trained window, not a
+  # share (docs/hit_driven_projection.md §7.2): with the working set's budget
+  # it sums past the slot, so a slot whose working set is thin is filled by
+  # the dialogue, and one whose dialogue is short by the working set.
   - name: dialogue
     persisted_id: 10
     description: |
       The active developer conversation served to the VS Code extension or
       web chat.
-    window: 96000
+    window: 180000
     score_threshold: 0.0
     # One chat's turns are read only by that chat's own projections (its scans
     # are masked to it), so they are resident in the provenance gallery only
@@ -1023,13 +1023,11 @@ layers:
     # fade when it stops. Every `file_read` runs for real, and a file the
     # turn's loop read is not placed again until the next question.
     working_set:
-      # The slot every share below fills, with the reserve: the trained
-      # window, so a dialogue runs the trained RoPE at every depth
-      # (docs/hit_driven_projection.md §4). The schema refuses shares that do
-      # not fit it. This layer's window is a cap, not a share: each
-      # projection gives the conversation what the slot has left after the
-      # system prompt and the working set, as emitted.
-      slot_tokens: 262144
+      # The slot is the engine's trained window, so a dialogue runs the
+      # trained RoPE at every depth (docs/hit_driven_projection.md §4). One
+      # fill places everything in it after the system prompt: locks, floors,
+      # then rounds by score. The shares below and this layer's window are
+      # caps on that fill, never reservations, so they may sum past the slot.
       # What arrives between two projections: one 64-token cadence, or one
       # prefill chunk of an opening (a tool result is prefilled in chunks of
       # this many, with a projection between them).

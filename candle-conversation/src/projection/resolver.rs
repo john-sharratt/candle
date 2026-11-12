@@ -82,7 +82,7 @@ use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
 use crate::tenant_rank::TenantRank;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
-use crate::turn_layout::{TurnLayout, TurnSegment};
+use crate::turn_layout::{TurnLayout, TurnRecord, TurnSegment};
 use crate::working_set::marks::is_dialogue;
 use candle_nn::kv_cache::{SealedSequence, Sweep};
 
@@ -5778,6 +5778,15 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 
     fn turn_token_count(&self, turn: TurnKey) -> usize {
         self.read.turn_token_count_of(turn.timeline, turn.index)
+    }
+
+    fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
+        self.read
+            .turn_record_tokens(turn.timeline, turn.index, record)
+    }
+
+    fn trained_window(&self) -> Option<usize> {
+        self.read.trained_window()
     }
 
     fn turn_score(&self, turn: TurnKey) -> f32 {

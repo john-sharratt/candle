@@ -47,15 +47,34 @@ pub struct WorkingSetConfig {
     /// and seeds are not counted — a lock answers a call the model just made.
     /// Never zero: the smallest cap still admits one whole conversation.
     pub max_admits: NonZeroUsize,
-    /// The most positions the dialogue's slot holds — the model's trained
-    /// window, so every sequence runs the trained RoPE
-    /// (`docs/hit_driven_projection.md` §4). Every share above, the layer's
-    /// window and [`Self::reserve_tokens`] fit inside it; the schema refuses
-    /// shares that do not.
-    pub slot_tokens: usize,
     /// What the slot keeps back for what can arrive between two projections:
-    /// one cadence of decoded tokens, or one prefill chunk of an opening.
+    /// one cadence of decoded tokens, or one prefill chunk of an opening. The
+    /// slot itself is the engine's trained window
+    /// (`docs/hit_driven_projection.md` §4).
     pub reserve_tokens: usize,
+}
+
+impl WorkingSetConfig {
+    /// Whether this working set can fill a slot of `window` positions: the
+    /// reserve must leave room in it, and no locked read may pass it on its
+    /// own. `Err` names what does not fit.
+    pub fn check_fits(&self, window: usize) -> Result<(), String> {
+        if self.reserve_tokens >= window {
+            return Err(format!(
+                "working_set: reserve_tokens {} leaves nothing of the engine's trained window \
+                 {window}",
+                self.reserve_tokens
+            ));
+        }
+        if self.lock_tokens + self.reserve_tokens > window {
+            return Err(format!(
+                "working_set: lock_tokens {} with reserve_tokens {} pass the engine's trained \
+                 window {window}",
+                self.lock_tokens, self.reserve_tokens
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl WorkingSetConfig {
@@ -105,9 +124,19 @@ mod tests {
             seeds: Vec::new(),
             release_on: vec!["write".into(), "file_edit".into()],
             max_admits: NonZeroUsize::new(2).unwrap(),
-            slot_tokens: 1_000_000,
             reserve_tokens: 16_384,
         }
+    }
+
+    #[test]
+    fn the_reserve_and_the_locks_must_fit_the_trained_window() {
+        let c = cfg();
+        assert_eq!(c.check_fits(262_144), Ok(()));
+        assert!(c.check_fits(16_384).is_err(), "the reserve leaves nothing");
+        assert!(
+            c.check_fits(200_000).is_err(),
+            "the locks with the reserve pass it"
+        );
     }
 
     #[test]

@@ -7478,6 +7478,15 @@ impl Scheduler {
 
     /// Record `conversation`'s substrate as attached to this core, once.
     pub fn register_substrate(&mut self, conversation: &Conversation) {
+        // A dialogue's slot is the engine's trained window when its attention
+        // selects (`docs/hit_driven_projection.md` §4): the projection fills
+        // to it.
+        let trained = self
+            .model
+            .carries_positional_state()
+            .then(|| self.model.rope_select().ceilings().first().copied())
+            .flatten();
+        conversation.update(|s| s.set_trained_window(trained));
         if !self
             .attached_substrates
             .iter()

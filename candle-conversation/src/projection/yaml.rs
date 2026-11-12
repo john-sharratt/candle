@@ -969,9 +969,6 @@ struct YamlWorkingSet {
     /// absent.
     #[serde(default)]
     max_admits: Option<usize>,
-    /// The most positions the dialogue's slot holds — the model's trained
-    /// window (`docs/hit_driven_projection.md` §4).
-    slot_tokens: usize,
     /// What the slot keeps back for what arrives between two projections:
     /// one cadence of decoded tokens or one prefill chunk.
     reserve_tokens: usize,
@@ -1036,11 +1033,9 @@ fn parse_draws(
 
 /// Resolve a layer's `working_set:` block, refusing values the arithmetic
 /// cannot use: a leak outside `(0, 1]`, a folder share larger than the whole,
-/// a negative floor, a zero file cap — and shares that, with the layer's own
-/// `window` and the reserve, would not fit the slot.
+/// a negative floor, a zero file cap.
 fn parse_working_set(
     layer: &str,
-    window: usize,
     yw: Option<&YamlWorkingSet>,
 ) -> Result<Option<WorkingSetConfig>, ConstructionError> {
     let Some(yw) = yw else {
@@ -1062,22 +1057,11 @@ fn parse_working_set(
     if yw.max_file_tokens == 0 {
         return Err(invalid("max_file_tokens must be > 0"));
     }
-    // The working set's shares are ceilings it may fill at once, so with the
-    // reserve they must fit the slot. The conversation's `window` is a cap on
-    // what flexes, not a share: each projection fits it to what the slot has
-    // left after the system prompt and the working set, as measured
-    // (`slot_room`), so it may be as large as the slot.
-    let filled = yw.budget_tokens + yw.guidance_tokens + yw.lock_tokens + yw.reserve_tokens;
-    if filled > yw.slot_tokens || window > yw.slot_tokens {
-        return Err(ConstructionError::InvalidPolicy {
-            name: layer.to_string(),
-            reason: format!(
-                "working_set: budget_tokens + guidance_tokens + lock_tokens + reserve_tokens is \
-                 {filled} and the layer's window {window}; neither may pass slot_tokens {}",
-                yw.slot_tokens
-            ),
-        });
-    }
+    // The slot is the engine's trained window, which the schema does not know:
+    // the shares and the window are caps on one fill of it
+    // (`docs/hit_driven_projection.md` §7.2), so they may sum past it; the
+    // reserve is checked against it when the engine is attached
+    // (`WorkingSetConfig::check_fits`).
     let max_admits = match yw.max_admits {
         None => DEFAULT_MAX_SWAPS,
         Some(n) => NonZeroUsize::new(n).ok_or_else(|| {
@@ -1095,7 +1079,6 @@ fn parse_working_set(
         seeds: yw.seeds.clone(),
         release_on: yw.release_on.clone(),
         max_admits,
-        slot_tokens: yw.slot_tokens,
         reserve_tokens: yw.reserve_tokens,
     }))
 }
@@ -1482,7 +1465,7 @@ fn build(
             description: yl.description.clone(),
             score_threshold: yl.score_threshold,
             window: yl.window,
-            working_set: parse_working_set(&yl.name, yl.window, yl.working_set.as_ref())?,
+            working_set: parse_working_set(&yl.name, yl.working_set.as_ref())?,
             budget: layer_budget,
             dials,
             summary: layer_summary,

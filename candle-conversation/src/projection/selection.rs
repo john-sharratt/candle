@@ -57,7 +57,7 @@ use super::schema::LINEAGE_BASE;
 
 /// What one step nearer in the ancestry adds to a lineage turn's rank — far
 /// below any score difference that means anything, enough to order ties.
-const LINEAGE_RANK_STEP: f32 = 1e-3;
+pub(super) const LINEAGE_RANK_STEP: f32 = 1e-3;
 
 /// Apply a selection rule to a group's turns.
 ///

@@ -96,22 +96,26 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::adaptive::AnchorMember;
+use super::dialogue_fill::{self, DialogueSlot, WorkingPiece};
+use super::fill::{Caps, Kind};
 use super::ids::{
     CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
 };
 use super::pins::{within_budget, Pin};
+use super::prompt_tokens::segment_tokens;
 use super::reconcile::{flexbox_distribute, FlexItem};
 use super::schema::{
     GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
     SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, WorkingSetShare,
 };
+use super::selection::LINEAGE_RANK_STEP;
 use super::selection::{apply_selection, trim_to_budget_low_score_first};
-use super::slot_room::{segment_tokens, slot_room};
 use super::swap_cap::{cap_new_members, SwapCap};
 use super::working_set_pick;
 use super::working_set_pick::Standing;
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{NodeId, SelectionDiagnostics, SelectionOrigin};
+use crate::turn_layout::TurnRecord;
 
 /// Collapse `keys` into exchange candidates: one `(representative, score)` per
 /// exchange, in first-appearance order, recording each representative's full
@@ -1971,11 +1975,21 @@ pub fn run_with_sink<R: ContentResolver>(
         .map(|l| l.window)
         .unwrap_or(0);
 
-    // The working set is sized by its own budget and never shares the target's
-    // `window`: its groups take no part in the flexbox, and a layer holding only
-    // such groups takes none either. The dialogue's window is distributed over
-    // the other groups exactly as if the working set were not there.
-    let flexed = |gs: &GroupState| gs.working_set.is_none();
+    // **A dialogue whose engine selects is filled, not flexed**
+    // (`docs/hit_driven_projection.md` §7.2): its lineage, its working set and
+    // its own exchanges go into one score-ordered fill of the engine's trained
+    // window, and neither its group nor the working set's take part in the
+    // flexbox. The other groups flex in the window as before.
+    let fill_target = schema
+        .layers
+        .iter()
+        .find(|l| l.id == target.layer)
+        .and_then(|l| l.working_set.as_ref().map(|ws| (l, ws)))
+        .zip(resolver.trained_window())
+        .filter(|_| declares_working_set);
+    let flexed = |gs: &GroupState| {
+        gs.working_set.is_none() && !(fill_target.is_some() && gs.schema.id == target.group)
+    };
     let flex_layer_indices: Vec<usize> = surviving_layer_indices
         .iter()
         .copied()
@@ -2014,31 +2028,6 @@ pub fn run_with_sink<R: ContentResolver>(
         own_window.max(below_windows)
     } else {
         own_window
-    };
-    // **The slot is fitted, not guessed** (`docs/hit_driven_projection.md` §4,
-    // §7.2). A target whose working set names a slot holds everything it
-    // places inside it: what the system prompt and the working set take is
-    // measured here, as emitted, and the conversation — the share that flexes
-    // — gets what is left of the slot after them and the reserve, never more
-    // than its window. So the slot stays in the trained window however large
-    // the prompt grows.
-    let turn_budget = match schema
-        .layers
-        .iter()
-        .find(|l| l.id == target.layer)
-        .and_then(|l| l.working_set.as_ref())
-    {
-        Some(ws) => {
-            let prompt = segment_tokens(&system_prompt_segments, resolver);
-            let carried: usize = group_states
-                .iter()
-                .filter(|gs| gs.working_set.is_some())
-                .flat_map(|gs| gs.selected.iter())
-                .map(|(k, _)| resolver.turn_token_count(*k))
-                .sum();
-            turn_budget.min(slot_room(ws, prompt + carried))
-        }
-        None => turn_budget,
     };
 
     // Natural token consumption per group (unbounded selection result).
@@ -2108,10 +2097,13 @@ pub fn run_with_sink<R: ContentResolver>(
 
     let mut final_selected: Vec<(GroupId, TurnKey)> = vec![];
 
-    // Working-set groups emit what Step 4b picked, verbatim and untrimmed.
-    for gs in group_states.iter().filter(|gs| !flexed(gs)) {
-        for (key, _) in &gs.selected {
-            push_exchange(&mut final_selected, gs.schema.id, &gs.members, *key);
+    // Working-set groups emit what Step 4b picked, verbatim and untrimmed —
+    // unless the dialogue is filled, which places them below.
+    if fill_target.is_none() {
+        for gs in group_states.iter().filter(|gs| !flexed(gs)) {
+            for (key, _) in &gs.selected {
+                push_exchange(&mut final_selected, gs.schema.id, &gs.members, *key);
+            }
         }
     }
 
@@ -2208,6 +2200,142 @@ pub fn run_with_sink<R: ContentResolver>(
 
             for idx in selected_indices {
                 push_exchange(&mut final_selected, gs.schema.id, &gs.members, idx);
+            }
+        }
+    }
+
+    // ── Step 11b: The dialogue's fill ────────────────────────────────────────
+    // Turns placed as one record alone, by the carving the fill chose.
+    let mut record_of: HashMap<TurnKey, TurnRecord> = HashMap::new();
+    if let Some(((layer, ws), window)) = fill_target {
+        if let Err(e) = ws.check_fits(window) {
+            tracing::error!(layer = %layer.name, "{e}");
+        }
+        // The room the fill has: the trained window less the reserve, the
+        // system prompt as emitted, what the turn has appended and what the
+        // groups that still flex took.
+        let flexed_tokens: usize = final_selected
+            .iter()
+            .map(|(_, k)| resolver.turn_token_count(*k))
+            .sum();
+        let room = window
+            .saturating_sub(ws.reserve_tokens)
+            .saturating_sub(segment_tokens(&system_prompt_segments, resolver))
+            .saturating_sub(decode_pos.unwrap_or(0))
+            .saturating_sub(flexed_tokens);
+        let (recent, lineage_base) = group_states
+            .iter()
+            .find(|gs| gs.schema.id == target.group)
+            .and_then(|gs| match gs.schema.selection {
+                SelectionRule::Sequence {
+                    recent,
+                    lineage_base,
+                    ..
+                } => Some((recent, lineage_base)),
+                _ => None,
+            })
+            .unwrap_or((0, LINEAGE_BASE));
+        let exchanges_of = |keys: &[TurnKey]| -> Vec<Vec<TurnKey>> {
+            let mut ex = resolver.group_exchanges(keys);
+            ex.sort_by_key(|e| e.first().copied());
+            ex
+        };
+        // The target's own turns and its lineage.
+        let own_group = group_states.iter().find(|gs| gs.schema.id == target.group);
+        let (own_keys, inherited): (Vec<TurnKey>, Vec<TurnKey>) = own_group
+            .map(|gs| gs.selected.iter().map(|(k, _)| *k).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .partition(|k| k.timeline == target.timeline);
+        let mut ancestors: Vec<TimelineId> = Vec::new();
+        for k in &inherited {
+            if !ancestors.contains(&k.timeline) {
+                ancestors.push(k.timeline);
+            }
+        }
+        let lineage: Vec<(Vec<TurnKey>, f32)> = exchanges_of(&inherited)
+            .into_iter()
+            .map(|ex| {
+                let rank = ex
+                    .first()
+                    .and_then(|k| ancestors.iter().position(|&t| t == k.timeline))
+                    .unwrap_or(0) as f32;
+                let s = ex
+                    .iter()
+                    .map(|k| resolver.turn_score(*k))
+                    .fold(0.0, f32::max)
+                    .max(lineage_base)
+                    + rank * LINEAGE_RANK_STEP;
+                (ex, s)
+            })
+            .collect();
+        // The working set: each member conversation a piece, in the set's order.
+        let mut working: Vec<WorkingPiece> = Vec::new();
+        let mut working_groups: Vec<GroupId> = Vec::new();
+        for gs in group_states.iter().filter(|gs| gs.working_set.is_some()) {
+            let kind = match gs.working_set {
+                Some(WorkingSetShare::Folders) => Kind::Folder,
+                Some(WorkingSetShare::Guidance) => Kind::Guidance,
+                _ => Kind::Reading,
+            };
+            let mut order: Vec<TimelineId> = Vec::new();
+            for (k, _) in &gs.selected {
+                if !order.contains(&k.timeline) {
+                    order.push(k.timeline);
+                }
+            }
+            for tl in order {
+                let keys: Vec<(TurnKey, f32)> = gs
+                    .selected
+                    .iter()
+                    .filter(|(k, _)| k.timeline == tl)
+                    .copied()
+                    .collect();
+                let locked = keys.iter().any(|(k, _)| {
+                    selection_origins.get(k) == Some(&SelectionOrigin::WorkingSetLock)
+                });
+                let score = keys.iter().map(|(_, s)| *s).fold(0.0, f32::max);
+                let ks: Vec<TurnKey> = keys.iter().map(|(k, _)| *k).collect();
+                working.push(WorkingPiece {
+                    kind,
+                    locked,
+                    score,
+                    exchanges: exchanges_of(&ks),
+                });
+                working_groups.push(gs.schema.id);
+            }
+        }
+        let slot = DialogueSlot {
+            room,
+            caps: Caps {
+                budget: ws.budget_tokens,
+                folder: ws.folder_tokens,
+                guidance: ws.guidance_tokens,
+                max_file: ws.max_file_tokens,
+                window: layer.window,
+            },
+            recent,
+            lineage,
+            working,
+            own: exchanges_of(&own_keys),
+        };
+        let plan = dialogue_fill::plan(
+            &slot,
+            |k| resolver.turn_score(k),
+            |k, r| resolver.record_tokens(k, r),
+        );
+        let mut push = |gid: GroupId, (key, record): (TurnKey, Option<TurnRecord>)| {
+            final_selected.push((gid, key));
+            if let Some(r) = record {
+                record_of.insert(key, r);
+            }
+        };
+        for p in plan.lineage.into_iter().chain(plan.own) {
+            push(target.group, p);
+        }
+        for (gid, placed) in working_groups.into_iter().zip(plan.working) {
+            for p in placed {
+                push(gid, p);
             }
         }
     }
@@ -2347,11 +2475,16 @@ pub fn run_with_sink<R: ContentResolver>(
     // injects `user_start` before / `assistant_end` after every
     // `Sealed::Turn` from its own pre-tokenised `BoundaryMarkers`
     // (held on the scheduler, threaded through `ApplyContext`).
-    segments.extend(
-        turns
-            .into_iter()
-            .map(|t| ProjectionSegment::Sealed(SealedKind::Turn(t, crate::Role::Assistant))),
-    );
+    // A turn the fill carved to one record goes in as that record alone.
+    segments.extend(turns.into_iter().map(|t| {
+        let carved = t
+            .timeline
+            .and_then(|tl| record_of.get(&TurnKey::new(tl, t.index())));
+        match carved {
+            Some(r) => ProjectionSegment::Sealed(SealedKind::TurnHalf(t, *r)),
+            None => ProjectionSegment::Sealed(SealedKind::Turn(t, crate::Role::Assistant)),
+        }
+    }));
     Projection {
         segments,
         selections: resolved_selections,

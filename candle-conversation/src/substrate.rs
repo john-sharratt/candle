@@ -190,6 +190,10 @@ pub struct Substrate {
     /// Every residence's KV across hot, warm and cold — shared by every
     /// version of the substrate.
     residences: Arc<ResidenceSlab>,
+    /// The trained window of the engine this substrate is attached to, when
+    /// its attention selects: the slot a dialogue's fill holds
+    /// (`docs/hit_driven_projection.md` §4). Set by the engine at attach.
+    trained_window: Option<usize>,
 
     /// Per-timeline directory — projection target, sidebar label,
     /// conv_id, and per-turn metadata (token counts, sig entries,
@@ -1155,6 +1159,24 @@ pub trait ContentResolver {
 
     /// Token count for a turn.  Stable across projection calls.
     fn turn_token_count(&self, turn: TurnKey) -> usize;
+
+    /// Tokens one record of a turn holds (`docs/hit_driven_projection.md`
+    /// §8.1). Default: the whole turn is its assistant record — a resolver
+    /// that keeps no record edges has turns that are not carved.
+    fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
+        match record {
+            TurnRecord::User => 0,
+            TurnRecord::Assistant => self.turn_token_count(turn),
+        }
+    }
+
+    /// The trained window of the engine the projection is for — the slot a
+    /// dialogue's fill holds (`docs/hit_driven_projection.md` §4). `None` for
+    /// an engine whose attention selects nothing, which is filled by its
+    /// layers' windows instead.
+    fn trained_window(&self) -> Option<usize> {
+        None
+    }
 
     /// Relevance score for a turn — the wide-Q belief score the scheduler
     /// recorded for this projection. Zero when unscored.
@@ -3963,6 +3985,17 @@ impl Substrate {
     /// The turns on `timeline` coupled to the tool response that follows them.
     /// Empty for a timeline that has never made a tool call — every turn is then
     /// its own exchange.
+    /// The engine's trained window, as [`Self::set_trained_window`] last set
+    /// it.
+    pub fn trained_window(&self) -> Option<usize> {
+        self.trained_window
+    }
+
+    /// Record the trained window of the engine this substrate serves.
+    pub fn set_trained_window(&mut self, window: Option<usize>) {
+        self.trained_window = window;
+    }
+
     pub fn couplings_of(&self, timeline: TimelineId) -> Couplings {
         self.timelines
             .get(&timeline)
