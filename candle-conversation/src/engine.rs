@@ -2298,17 +2298,36 @@ impl ConversationEngine {
         holds: &ValueHolds,
         kept: &mut HeldRules,
     ) -> Arc<TriggerRegistry> {
-        if holds.fields.is_empty() {
+        let Some(held) = self.held_values(holds, kept) else {
             return Arc::clone(triggers);
+        };
+        self.triggers_holding(triggers, held)
+    }
+
+    /// `holds` built over this checkpoint's vocabulary, each set's rule taken
+    /// from `kept` when the round before built it — what a turn that begins
+    /// inside a grammar is held to
+    /// ([`TurnGrammar::holding`](crate::stencil::TurnGrammar::holding)). `None`
+    /// when they build to nothing.
+    pub fn held_values(&self, holds: &ValueHolds, kept: &mut HeldRules) -> Option<Arc<HeldValues>> {
+        if holds.fields.is_empty() {
+            return None;
         }
+        let held = HeldValues::build(holds, &self.vocab(), kept);
+        (!held.is_empty()).then(|| Arc::new(held))
+    }
+
+    /// `triggers` with every tool call's keyed fields held to `held`.
+    /// `triggers` without a tool call come back as they are.
+    pub fn triggers_holding(
+        &self,
+        triggers: &Arc<TriggerRegistry>,
+        held: Arc<HeldValues>,
+    ) -> Arc<TriggerRegistry> {
         let Some(trigger) = self.core.tokenizer.token_to_id("<tool_call>") else {
             return Arc::clone(triggers);
         };
-        let held = HeldValues::build(holds, &self.vocab(), kept);
-        if held.is_empty() {
-            return Arc::clone(triggers);
-        }
-        Arc::new(triggers.holding_values(trigger, Arc::new(held)))
+        Arc::new(triggers.holding_values(trigger, held))
     }
 
     /// `triggers` with every turn's tool calls naming each of `tools` at most

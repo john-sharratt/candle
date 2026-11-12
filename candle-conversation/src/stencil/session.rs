@@ -350,7 +350,7 @@ impl StencilSession {
         rule: Option<&Arc<ValueRule>>,
     ) -> StencilAction {
         match (rule, value) {
-            (Some(rule), Some(state)) => StencilAction::MaskedDecode(rule.mask(state).clone()),
+            (Some(rule), Some(state)) => StencilAction::MaskedDecode(rule.mask(state)),
             _ => Self::free_decode_action(span, emitted),
         }
     }

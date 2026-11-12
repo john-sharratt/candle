@@ -156,7 +156,7 @@ use crate::recorded_reply::{RecordedReply, Replay};
 use crate::recurrent_span::TokenSpan;
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
-    Healed, StencilDriver, StencilTree, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL,
+    Healed, StencilDriver, StepMask, TriggerRegistry, TurnGrammar, TOOL_CALL_TREE_LABEL,
 };
 use crate::substrate::{HotKv, ProjectionScores, ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::scope::Scope;
@@ -415,7 +415,7 @@ pub(crate) enum SchedulerRequest {
         /// A grammar this turn *begins inside* — see [`TurnOptions::turn_grammar`].
         /// Its opening scaffold is already appended to `tokens`; the driver is
         /// armed at the prefill boundary so the first sampled token is masked.
-        turn_grammar: Option<Arc<StencilTree>>,
+        turn_grammar: Option<TurnGrammar>,
         /// Whether the schema asked for repetition penalties to be lifted inside
         /// tool calls — see
         /// [`crate::projection::Schema::free_tool_calls_from_penalties`].
@@ -2231,7 +2231,7 @@ pub(super) struct PrefillWork {
     pub(super) triggers: Arc<TriggerRegistry>,
     /// A grammar the turn begins inside — see [`TurnOptions::turn_grammar`].
     /// Armed at the prefill boundary, before the first token is sampled.
-    pub(super) turn_grammar: Option<Arc<StencilTree>>,
+    pub(super) turn_grammar: Option<TurnGrammar>,
     /// Whether this turn's schema asked for repetition penalties to be lifted
     /// while a tool call is emitted — see
     /// [`crate::projection::Schema::free_tool_calls_from_penalties`].

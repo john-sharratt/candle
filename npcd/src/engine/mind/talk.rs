@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use candle_conversation::projection::{DecodePriority, SelectionState};
+use candle_conversation::stencil::TurnGrammar;
 use candle_conversation::{AskScope, Carried, Linking, Sequence, TurnOptions, Want};
 
 use super::{
@@ -228,7 +229,7 @@ impl Minds {
         let grammar = self.grammar_for(Deliberation::None, Catalog::THREAD, within);
         let options = TurnOptions {
             assistant_prefill: self.opening(Deliberation::None, grammar.is_some()),
-            turn_grammar: grammar,
+            turn_grammar: grammar.map(TurnGrammar::of),
             sampling: Some(self.sampling_for(Deliberation::None)),
             selection: selection.clone(),
             ..Default::default()

@@ -1,7 +1,8 @@
 //! What a round holds its file calls' values to (`docs/stencil_tree.md`
-//! §9.2): for each file the conversation has read or edited, the anchors it
-//! carves into now and each part's line count — so `part` names a part the
-//! file has, and `from` and `to` a line the part has.
+//! §9.2): the repositories and paths that exist ([`held_paths`]), and for each
+//! file the conversation has read or edited, the anchors it carves into now and
+//! each part's line count — so `part` names a part the file has, and `from` and
+//! `to` a line the part has.
 //!
 //! Read from the conversation's own store each round, its edits included, so
 //! an anchor an edit retired is gone and one it made is there. A file is
@@ -22,6 +23,7 @@ use serde_json::Value;
 use zend_tools::registry;
 use zend_vfs::RepoFiles;
 
+use crate::held_paths;
 use crate::tools::ToolResult;
 
 /// The most files a round holds: the conversation's most recent.
@@ -161,7 +163,9 @@ impl FilesSeen {
                 Some((file.0.as_str(), file.1.as_str(), c.as_ref()))
             })
             .collect();
-        holds_of(&docs)
+        let mut holds = holds_of(&docs);
+        holds.fields.extend(held_paths::holds(files));
+        holds
     }
 }
 

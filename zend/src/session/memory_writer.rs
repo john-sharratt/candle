@@ -36,6 +36,7 @@ use candle_conversation::projection::{
 };
 use candle_conversation::stencil::{
     compile_tool_call_tree, StencilTree, ThinkMode, ToolCallEnvelope, ToolSpec, TreeSpec,
+    TurnGrammar,
 };
 use candle_conversation::throwaway::{HeldFrame, Retires, Throwaway};
 use candle_conversation::{
@@ -246,7 +247,7 @@ async fn ask(
         max_tokens: Some(max_tokens),
         selection,
         sampling: Some(sampling),
-        turn_grammar: Some(grammar),
+        turn_grammar: Some(TurnGrammar::of(grammar)),
         ..Default::default()
     };
     let turn = match seq.submit_turn_with_options(question, opts) {

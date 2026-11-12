@@ -55,7 +55,9 @@ mod tool_call;
 mod tree;
 mod trie;
 mod trigger;
+mod turn_grammar;
 mod value_rule;
+mod value_set;
 mod vocab;
 mod yaml;
 
@@ -83,7 +85,7 @@ pub use driver::{Healed, PathStats, StencilDriver, StepMask};
 pub use error::{BuildError, WalkError};
 pub use function_block::function_blocks_to_json;
 pub use held_arms::{held_branches, held_branches_first, HeldBranches};
-pub use held_values::{literal_pattern, FieldHold, HeldRules, HeldValues, ValueHolds};
+pub use held_values::{FieldHold, HeldRules, HeldValues, ValueHolds};
 pub use mask::{ban, boost, AllowedSet};
 pub use named_arm::{arm_name, named_arm};
 pub use never_twice::NeverTwice;
@@ -99,6 +101,7 @@ pub use tool_call::{
     ToolCallEnvelope, ToolSpec, INVOKE_BODY_TREE_LABEL, MAX_TOOL_CALLS_PER_TURN,
     TOOL_CALL_TREE_LABEL,
 };
+pub use turn_grammar::TurnGrammar;
 pub use value_rule::ValueRule;
 // `ToolCallEnvelope::style` is public, so a consumer has to be able to name its
 // type to match on it — and `npcd` does, to describe the call format in a

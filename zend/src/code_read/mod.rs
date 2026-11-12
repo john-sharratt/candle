@@ -29,8 +29,10 @@ mod ingest_rate;
 mod lines;
 mod link;
 mod reading_break;
+mod reading_holds;
 
 pub(crate) use link::ingest_link;
+use reading_holds::reading_holds;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,7 +45,8 @@ use candle_conversation::projection::{
     TOOLS_ENABLED_SELECTOR,
 };
 use candle_conversation::stencil::{
-    OpeningCall, ToolSpec, TriggerRegistry, MAX_TOOL_CALLS_PER_TURN,
+    HeldRules, HeldValues, OpeningCall, ToolSpec, TriggerRegistry, TurnGrammar,
+    MAX_TOOL_CALLS_PER_TURN,
 };
 use candle_conversation::{
     is_ground_refusal_message, is_stall_message, ConversationEngine, Sequence, TurnOptions,
@@ -1046,13 +1049,28 @@ fn process_one_file(
     // every pass after replaced one empty reading with the next. Three files
     // on 2026-11-11 lost their readings that way. So it fails here, as any
     // failed attempt does: this attempt goes, and the prior generation stays.
+    // **Every call of the reading names its own file**: `repo`, `path` and
+    // `lines` held to the ones its prompt names, in the opening turn's grammar
+    // and in every round's trigger after it.
+    let mut kept = HeldRules::default();
+    let held = ctx
+        .engine
+        .held_values(&reading_holds(&file.path, &ranges), &mut kept);
+    let triggers = match &held {
+        Some(held) => ctx
+            .engine
+            .triggers_holding(&ctx.think_triggers, Arc::clone(held)),
+        None => Arc::clone(&ctx.think_triggers),
+    };
     let read = run_file_conversation(
         &mut conv,
         &file.path,
         lines,
         &ranges,
-        &ctx.think_triggers,
-        ctx.read_opening.as_ref(),
+        &triggers,
+        ctx.read_opening
+            .as_ref()
+            .map(|opening| (opening, held.as_ref())),
         &unit_ctx,
     )
     .and_then(|text| match produced_no_answer(&text) {
@@ -1341,13 +1359,21 @@ pub fn read_opening(engine: &ConversationEngine) -> anyhow::Result<Option<Openin
 
 /// The options a file's first turn adds to its turn's: begin inside
 /// `opening`'s call loop, its marker prefilled, so the turn opens with a
-/// `file_read` call rather than choosing whether to. Only the first turn: the
-/// turns after it carry the reads' results, and the reading may answer once it
-/// holds the file.
-fn opening_options(options: TurnOptions, opening: &OpeningCall) -> TurnOptions {
+/// `file_read` call rather than choosing whether to, its values held to `held`
+/// — the reading's own file. Only the first turn: the turns after it carry the
+/// reads' results, and the reading may answer once it holds the file.
+fn opening_options(
+    options: TurnOptions,
+    opening: &OpeningCall,
+    held: Option<&Arc<HeldValues>>,
+) -> TurnOptions {
+    let grammar = TurnGrammar::of(Arc::clone(&opening.tree));
     TurnOptions {
         assistant_prefill: Some(opening.marker.clone()),
-        turn_grammar: Some(Arc::clone(&opening.tree)),
+        turn_grammar: Some(match held {
+            Some(held) => grammar.holding(Arc::clone(held)),
+            None => grammar,
+        }),
         ..options
     }
 }
@@ -1362,16 +1388,16 @@ fn opening_options(options: TurnOptions, opening: &OpeningCall) -> TurnOptions {
 /// calling tools IS the file's summary — there is no separate summary-decode
 /// step to run afterward.
 ///
-/// The first turn begins inside `opening`'s call loop when given
-/// ([`opening_options`]): left to choose, a reading has ended on its first
-/// token with no call and no answer.
+/// The first turn begins inside `opening`'s call loop when given, its values
+/// held to the second of the pair ([`opening_options`]): left to choose, a
+/// reading has ended on its first token with no call and no answer.
 fn run_file_conversation(
     conv: &mut Sequence,
     path: &str,
     lines: usize,
     ranges: &[(usize, usize)],
     triggers: &Arc<TriggerRegistry>,
-    opening: Option<&OpeningCall>,
+    opening: Option<(&OpeningCall, Option<&Arc<HeldValues>>)>,
     tool_ctx: &Arc<ToolContext>,
 ) -> anyhow::Result<String> {
     let tags = vec!["code".to_string(), path.to_string()];
@@ -1414,7 +1440,9 @@ fn run_file_conversation(
             ..Default::default()
         };
         let options = match opening {
-            Some(opening) if round == 0 && !closing => opening_options(options, opening),
+            Some((opening, held)) if round == 0 && !closing => {
+                opening_options(options, opening, held)
+            }
             _ => options,
         };
         let handle = conv
@@ -1501,14 +1529,23 @@ mod tests {
             tags: vec!["code".into()],
             ..Default::default()
         };
-        let opened = opening_options(given, &opening);
+        let opened = opening_options(given.clone(), &opening, None);
         assert_eq!(opened.assistant_prefill.as_deref(), Some("<tool_call>"));
-        assert!(opened
-            .turn_grammar
-            .as_ref()
-            .is_some_and(|t| Arc::ptr_eq(t, &opening.tree)));
+        let grammar = opened.turn_grammar.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&grammar.tree, &opening.tree));
+        assert!(grammar.held.is_none());
         assert_eq!(opened.max_tokens, Some(7));
         assert_eq!(opened.tags, ["code"]);
+
+        // Held, the grammar carries the reading's own holds.
+        let held = Arc::new(HeldValues::build(
+            &reading_holds("candle/a.rs", &[(1, 3)]),
+            &TestVocab::new(),
+            &mut HeldRules::default(),
+        ));
+        let opened = opening_options(given, &opening, Some(&held));
+        let grammar = opened.turn_grammar.as_ref().unwrap();
+        assert!(Arc::ptr_eq(grammar.held.as_ref().unwrap(), &held));
     }
 
     /// **A read that found no file fails the reading**, naming what it asked

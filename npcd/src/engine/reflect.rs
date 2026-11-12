@@ -59,7 +59,7 @@ use std::sync::Arc;
 
 use candle_conversation::stencil::{
     compile_think_tree, compile_tool_call_tree, Param as CallParam, ParamType, StencilTree,
-    ThinkMode, ThinkSteerEnvelope, ToolCallEnvelope, ToolSpec,
+    ThinkMode, ThinkSteerEnvelope, ToolCallEnvelope, ToolSpec, TurnGrammar,
 };
 use candle_conversation::throwaway::Throwaway;
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
@@ -1254,7 +1254,7 @@ impl<'t> Reflect<'t> {
         let for_dream = asking(&DREAM);
 
         let writing = || TurnOptions {
-            turn_grammar: dreaming.clone(),
+            turn_grammar: dreaming.clone().map(TurnGrammar::of),
             sampling: Some(sampling.clone()),
             selection: for_dream.clone(),
             ..Default::default()
@@ -1375,7 +1375,7 @@ impl<'t> Reflect<'t> {
         }
         opening.push_str(&self.turns.question_one);
         let thought_opts = TurnOptions {
-            turn_grammar: thinking.clone(),
+            turn_grammar: thinking.clone().map(TurnGrammar::of),
             sampling: Some(sampling.clone()),
             selection: for_reflection,
             ..Default::default()

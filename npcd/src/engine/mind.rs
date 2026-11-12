@@ -68,7 +68,7 @@ use candle_conversation::projection::{
 };
 use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, StencilTree, ThinkMode, ThinkSteerEnvelope,
-    ToolCallEnvelope, ToolSpec, TreeSpec,
+    ToolCallEnvelope, ToolSpec, TreeSpec, TurnGrammar,
 };
 use candle_conversation::throwaway::Throwaway;
 use candle_conversation::{
@@ -875,7 +875,7 @@ impl Minds {
         let turn_grammar = self.grammar_for(thinking, Catalog::ROOM, within);
         let options = TurnOptions {
             assistant_prefill: self.opening(thinking, turn_grammar.is_some()),
-            turn_grammar,
+            turn_grammar: turn_grammar.map(TurnGrammar::of),
             sampling: Some(self.sampling_for(thinking)),
             selection,
             ..Default::default()
@@ -1746,7 +1746,7 @@ impl Minds {
         let mut options = TurnOptions {
             assistant_prefill: self
                 .opening(identity::Deliberation::default(), turn_grammar.is_some()),
-            turn_grammar,
+            turn_grammar: turn_grammar.map(TurnGrammar::of),
             sampling: Some(self.sampling_for(identity::Deliberation::default())),
             // **Inside its own dreams' scope.** A turn teaches the hit levels of
             // the scopes its tags name, and the dream group is scoped to this

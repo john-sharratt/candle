@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use candle_conversation::projection::DecodePriority;
-use candle_conversation::stencil::{StencilTree, StencilTreeBuilder};
+use candle_conversation::stencil::{StencilTree, StencilTreeBuilder, TurnGrammar};
 use candle_conversation::{
     AskScope, ConversationEngine, SamplingConfig, SequenceConfig, TurnOptions, UnsealedAsker,
 };
@@ -90,7 +90,7 @@ impl Asker {
                 max_tokens: Some(MAX_ANSWER_TOKENS),
                 sampling: Some(self.sampling.clone()),
                 selection: selection.clone(),
-                turn_grammar: Some(Arc::clone(&self.grammar)),
+                turn_grammar: Some(TurnGrammar::of(Arc::clone(&self.grammar))),
                 assistant_prefill: Some(self.prefill.clone()),
                 ..Default::default()
             };

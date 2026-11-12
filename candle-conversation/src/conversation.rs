@@ -216,7 +216,7 @@ pub(crate) fn window_sealed_tokens(
 }
 
 use crate::recurrent_span::TokenSpan;
-use crate::stencil::{StencilDriver, StencilTree, ThinkMode, TriggerRegistry};
+use crate::stencil::{ThinkMode, TriggerRegistry, TurnGrammar};
 use crate::turn_text::{encode_pieces, token_span, TurnText};
 use flume::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -2249,8 +2249,8 @@ impl TurnSubmitter {
         // commit the shape and is then handed a fragment starting mid-JSON
         // cannot parse the shape it just enforced.
         let mut assistant_written = assistant_prefill.to_string();
-        if let Some(tree) = options.turn_grammar.clone() {
-            let (scaffold, _) = StencilDriver::new(tree).opening();
+        if let Some(grammar) = &options.turn_grammar {
+            let (scaffold, _) = grammar.driver().opening();
             // Specials kept: `<tool_call>` and friends are part of the syntax
             // the caller is going to parse, not decoration around it.
             assistant_written
@@ -2717,7 +2717,7 @@ impl TurnSubmitter {
         sampling: SamplingConfig,
         reprojection: Option<ReprojectionPolicy>,
         triggers: Arc<TriggerRegistry>,
-        turn_grammar: Option<Arc<StencilTree>>,
+        turn_grammar: Option<TurnGrammar>,
         free_tool_calls_from_penalties: bool,
         recorded_turn: Option<(Vec<u32>, Option<usize>, Vec<u32>)>,
         recurrent_spans: Vec<TokenSpan>,

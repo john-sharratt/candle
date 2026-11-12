@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::config::SamplingConfig;
 use crate::projection::SelectionState;
 use crate::recurrent_span::TextSpan;
-use crate::stencil::{StencilTree, TriggerRegistry};
+use crate::stencil::{TriggerRegistry, TurnGrammar};
 use crate::token_buffer::TokenBuffer;
 use serde::{Deserialize, Serialize};
 
@@ -87,9 +87,10 @@ pub struct TurnOptions {
     /// Set this instead and the driver is armed before the first sampled token.
     /// The tree's leading static runs are appended to the assistant prefill and
     /// written in the same pass as the rest of the prompt, and the first token
-    /// the model chooses is already under the tree's mask. `None` = the turn
-    /// starts free and may enter a grammar through `triggers`.
-    pub turn_grammar: Option<Arc<StencilTree>>,
+    /// the model chooses is already under the tree's mask, its value spans held
+    /// to the grammar's held values (`docs/stencil_tree.md` §9.2.2). `None` =
+    /// the turn starts free and may enter a grammar through `triggers`.
+    pub turn_grammar: Option<TurnGrammar>,
 
     /// Section-tree selector choices for this turn (e.g. the composer
     /// thinking-effort / response-length dials).  Becomes the conversation's
@@ -187,9 +188,9 @@ impl TurnOptions {
         self
     }
 
-    /// Builder: begin this turn inside `tree` (see [`Self::turn_grammar`]).
-    pub fn turn_grammar(mut self, tree: Arc<StencilTree>) -> Self {
-        self.turn_grammar = Some(tree);
+    /// Builder: begin this turn inside `grammar` (see [`Self::turn_grammar`]).
+    pub fn turn_grammar(mut self, grammar: TurnGrammar) -> Self {
+        self.turn_grammar = Some(grammar);
         self
     }
 }

@@ -20,7 +20,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use candle_conversation::projection::DecodePriority;
-use candle_conversation::stencil::StencilTree;
+use candle_conversation::stencil::{StencilTree, TurnGrammar};
 use candle_conversation::{AskScope, SamplingConfig, TurnOptions, UnsealedAsker};
 use journal_core::section::JournalPrompt;
 use journal_core::transcript::Filed;
@@ -64,7 +64,7 @@ impl Asking {
     async fn ask(&self, question: &str, tree: Arc<StencilTree>) -> anyhow::Result<String> {
         let options = TurnOptions {
             assistant_prefill: Some(self.prefill.clone()),
-            turn_grammar: Some(tree),
+            turn_grammar: Some(TurnGrammar::of(tree)),
             sampling: Some(self.sampling.clone()),
             max_tokens: Some(self.max_tokens),
             selection: self.asker.selection(),

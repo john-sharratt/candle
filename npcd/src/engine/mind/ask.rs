@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use candle_conversation::projection::DecodePriority;
-use candle_conversation::stencil::{Param, StencilTree, ToolSpec};
+use candle_conversation::stencil::{Param, StencilTree, ToolSpec, TurnGrammar};
 use candle_conversation::{AskScope, TurnOptions};
 
 use super::{compile_calls, Minds};
@@ -177,7 +177,7 @@ impl Minds {
         let prepare_ms = prepared.elapsed().as_millis();
         let options = TurnOptions {
             assistant_prefill: self.opening(Deliberation::None, true),
-            turn_grammar: Some(tree),
+            turn_grammar: Some(TurnGrammar::of(tree)),
             sampling: Some(self.sampling_for(Deliberation::None)),
             max_tokens: Some(max_tokens),
             selection,

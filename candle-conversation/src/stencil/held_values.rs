@@ -5,9 +5,11 @@
 //!
 //! [`ValueHolds`] is what a caller states — plain strings, no vocabulary.
 //! [`HeldValues`] is what a turn walks: each held set built into a
-//! [`ValueRule`] over the literal values, owned by the turn and dropped with
-//! it ([`ValueRule::owned`]). Never [`ValueRule::shared`], whose cache keeps
-//! every pattern for the process's life and would grow by one per round.
+//! [`ValueRule`] over the set ([`ValueRule::of_set`], `docs/stencil_tree.md`
+//! §9.2.1) — a set of any size, a repository's files as readily as a file's
+//! anchors — shared with every other holder of the same set and dropped with
+//! the last. Never [`ValueRule::shared`], whose cache keeps every pattern for
+//! the process's life and would grow by one per round.
 
 use std::collections::HashMap;
 use std::mem;
@@ -70,29 +72,11 @@ impl HeldRules {
     }
 }
 
-/// A pattern matching exactly `values`: each escaped, alternated.
-pub fn literal_pattern(values: &[String]) -> String {
-    let arms: Vec<String> = values.iter().map(|v| escape(v)).collect();
-    format!("(?:{})", arms.join("|"))
-}
-
-/// `value` with every character a pattern reads as an operator escaped.
-fn escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        if "\\.+*?()|[]{}^$#&-~".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 impl HeldValues {
     /// `holds` built over `vocab`, taking each set's rule from `kept` when
     /// the last build made it, and leaving `kept` with this build's. A set with
-    /// no values, or one whose rule cannot be built (past the rule's state
-    /// cap), is left out: its field keeps its own pattern.
+    /// no values, or none that can be written in `vocab`, is left out: its
+    /// field keeps its own pattern.
     pub fn build(holds: &ValueHolds, vocab: &dyn Vocab, kept: &mut HeldRules) -> HeldValues {
         let mut by_field = HashMap::new();
         let mut last = mem::take(&mut kept.rules);
@@ -107,12 +91,11 @@ impl HeldValues {
                 }
                 let rule = built.entry(values.clone()).or_insert_with(|| {
                     last.remove(values).unwrap_or_else(|| {
-                        ValueRule::owned(&literal_pattern(values), vocab)
+                        ValueRule::of_set(values, vocab)
                             .map_err(|e| {
                                 tracing::debug!(field = %hold.field, "a held value set was left to its pattern: {e}");
                             })
                             .ok()
-                            .map(Arc::new)
                     })
                 });
                 if let Some(rule) = rule {
@@ -158,18 +141,24 @@ impl HeldValues {
 
 #[cfg(test)]
 mod tests {
+    use super::super::value_rule::ValueState;
     use super::super::vocab::TestVocab;
     use super::*;
 
-    /// **A literal pattern matches its values and nothing else**, whatever
-    /// operators they hold — exactly these bytes.
+    /// **A held set holds exactly its values, whatever characters they hold**:
+    /// what a pattern would read as operators is written as itself.
     #[test]
-    fn a_literal_pattern_escapes_its_values() {
-        assert_eq!(
-            literal_pattern(&["+1".into(), "+12".into(), "a-b".into()]),
-            r"(?:\+1|\+12|a\-b)"
-        );
-        assert_eq!(literal_pattern(&["KehT".into()]), "(?:KehT)");
+    fn a_held_set_holds_its_values_as_written() {
+        let v = TestVocab::new();
+        let mut kept = HeldRules::default();
+        let held = HeldValues::build(&parts(&[("a.rs", &["+1", "+12", "a-b"])]), &v, &mut kept);
+        let field: Arc<str> = Arc::from("part");
+        let written = HashMap::from([(Arc::from("path"), "a.rs".to_string())]);
+        let rule = held.rule_for("file_edit", &field, &written).unwrap();
+        let start = rule.advance(ValueState::Open, b"\"").unwrap();
+        let walk = |text: &[u8]| text.iter().try_fold(start, |at, b| rule.advance(at, &[*b]));
+        assert!(walk(b"+12").is_some() && walk(b"a-b").is_some());
+        assert!(walk(b"+2").is_none() && walk(b"a").is_some() && walk(b"ab").is_none());
     }
 
     fn parts(table: &[(&str, &[&str])]) -> ValueHolds {

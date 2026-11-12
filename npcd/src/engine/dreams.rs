@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use candle_conversation::projection::{Builder, SelectionRule, SelectionState, TimelineId};
+use candle_conversation::stencil::TurnGrammar;
 use candle_conversation::throwaway::Throwaway;
 use candle_conversation::{ConversationEngine, SequenceConfig, TurnOptions};
 
@@ -296,7 +297,7 @@ pub async fn dream(
             brief,
             TurnOptions {
                 max_tokens: Some(DREAM_MAX_TOKENS),
-                turn_grammar: think_off(engine, base_config),
+                turn_grammar: think_off(engine, base_config).map(TurnGrammar::of),
                 sampling: Some(sampling),
                 selection,
                 ..Default::default()

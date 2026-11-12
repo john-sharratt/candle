@@ -10,7 +10,7 @@
 use super::*;
 use crate::guest::Guests;
 use crate::stencil::{
-    compile, compile_think_tree, TestVocab, ThinkMode, ThinkSteerEnvelope, Vocab,
+    compile, compile_think_tree, StencilTree, TestVocab, ThinkMode, ThinkSteerEnvelope, Vocab,
 };
 use candle::{Device, Result};
 use candle_nn::kv_cache::{ModelGeometry, TIER_REFUSED_MARKER};

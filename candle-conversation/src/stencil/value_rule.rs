@@ -5,9 +5,13 @@
 //! token at a time: the value is a walk through an automaton, and each step's
 //! mask is the tokens that keep the walk alive.
 //!
-//! **Compiled once, then only read.** Every state's mask is worked out when the
-//! rule is built and the rule is immutable after, so a turn's only cost is an
-//! index, and no decode ever waits on anything.
+//! **Two automata, one walk.** A pattern's rule ([`ValueRule::new`],
+//! [`ValueRule::shared`]) compiles a regular expression, and works out every
+//! state's mask when it is built: a turn's only cost is an index, and no decode
+//! ever waits on anything. A held set's rule ([`ValueRule::of_set`]) walks the
+//! set's byte trie ([`ValueSet`]) and makes a node's mask the first time a walk
+//! stands on it, kept for the rule's life — a set of any size, since only the
+//! nodes walked are ever made (`docs/stencil_tree.md` §9.2.1).
 //!
 //! **A rule can never leave a turn with nothing to say.** A mask with no token in
 //! it would stop the decode dead, so a state is *finishable* when some token from
@@ -31,7 +35,7 @@
 //! scheme and host — has no use for one.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use regex_automata::dfa::{dense, Automaton};
@@ -41,10 +45,14 @@ use regex_automata::util::syntax;
 use regex_automata::{Anchored, MatchKind};
 
 use super::mask::AllowedSet;
+use super::value_set::ValueSet;
 use super::vocab::{TokenId, Vocab};
 
 /// The rules built so far, by vocabulary and pattern.
 type RuleMap = HashMap<(u64, String), Arc<ValueRule>>;
+
+/// The set rules held anywhere, by vocabulary and the set's digest and size.
+type SetRules = HashMap<(u64, u64, usize), Weak<ValueRule>>;
 
 /// A vocabulary's non-empty tokens in byte order.
 type Sorted = Vec<(TokenId, Vec<u8>)>;
@@ -95,20 +103,40 @@ pub enum ValueState {
     Inside(u32),
 }
 
+/// What a rule walks, and when its masks are made.
+#[derive(Debug)]
+enum Machine {
+    /// A pattern's automaton, every state's mask made at build.
+    Pattern {
+        /// Each state's successor by byte, [`DEAD`] where the walk ends.
+        next: Vec<[u32; 256]>,
+        /// Whether a value may end at each state.
+        accepting: Vec<bool>,
+        /// The tokens allowed at each state.
+        masks: Vec<AllowedSet>,
+    },
+    /// A held set's trie, each node's mask made the first time a walk stands
+    /// on it.
+    Set {
+        set: ValueSet,
+        /// Which nodes a walk can finish from ([`ValueSet::finishable`]).
+        finishable: Vec<bool>,
+        /// The vocabulary a mask is scanned over.
+        tokens: Arc<Sorted>,
+        /// The masks made so far, by node.
+        masks: Mutex<HashMap<u32, AllowedSet>>,
+    },
+}
+
 /// One regular language over a value's bytes, with every step's mask.
 #[derive(Debug)]
 pub struct ValueRule {
     pattern: String,
-    /// Each state's successor by byte, [`DEAD`] where the walk ends.
-    next: Vec<[u32; 256]>,
-    /// Whether a value may end at each state.
-    accepting: Vec<bool>,
+    machine: Machine,
     /// The tokens allowed before the opening quote.
     open_mask: AllowedSet,
     /// The tokens allowed after the opening space.
     spaced_mask: AllowedSet,
-    /// The tokens allowed at each state.
-    masks: Vec<AllowedSet>,
 }
 
 impl ValueRule {
@@ -123,48 +151,127 @@ impl ValueRule {
         let (next, accepting) = states_of(pattern)?;
         let mut rule = ValueRule {
             pattern: pattern.to_string(),
-            next,
-            accepting,
+            machine: Machine::Pattern {
+                next,
+                accepting,
+                masks: Vec::new(),
+            },
             open_mask: AllowedSet::from_tokens(Vec::new()),
             spaced_mask: AllowedSet::from_tokens(Vec::new()),
-            masks: Vec::new(),
         };
         if !tokens.iter().any(|(_, bytes)| bytes == b"\"") {
             return Err(RuleError::NoQuote);
         }
-        let finishable = rule.finishable(tokens);
+        let finishable = rule.pattern_finishable(tokens);
         if !finishable[0] {
             return Err(RuleError::Unfinishable);
         }
-        let mask_at = |rule: &ValueRule, state| {
-            let mut admitted = Vec::new();
-            rule.scan(state, tokens, |token, land| {
-                let keeps = match land {
-                    Step::On(ValueState::Inside(s)) => finishable[s as usize],
-                    // The opening space, whose only way on is the quote.
-                    Step::On(_) => true,
-                    Step::Closes => true,
-                    Step::Dead => false,
-                };
-                if keeps {
-                    admitted.push(token);
-                }
-            });
-            AllowedSet::from_tokens(admitted)
-        };
-        rule.open_mask = mask_at(&rule, ValueState::Open);
-        rule.spaced_mask = mask_at(&rule, ValueState::Spaced);
-        rule.masks = (0..rule.next.len() as u32)
-            .map(|state| mask_at(&rule, ValueState::Inside(state)))
+        rule.open_mask = rule.mask_over(ValueState::Open, tokens, &finishable);
+        rule.spaced_mask = rule.mask_over(ValueState::Spaced, tokens, &finishable);
+        let states = rule.states();
+        let built: Vec<AllowedSet> = (0..states as u32)
+            .map(|state| rule.mask_over(ValueState::Inside(state), tokens, &finishable))
             .collect();
+        if let Machine::Pattern { masks, .. } = &mut rule.machine {
+            *masks = built;
+        }
         Ok(rule)
     }
 
-    /// Which states some run of whole tokens can finish from. Each state's
-    /// landings are read once, and the set grown over them until it stops.
-    fn finishable(&self, tokens: &Sorted) -> Vec<bool> {
-        let mut closes = vec![false; self.next.len()];
-        let mut lands: Vec<Vec<u32>> = Vec::with_capacity(self.next.len());
+    /// The rule holding a value to one of `values`, over `vocab`
+    /// (`docs/stencil_tree.md` §9.2.1): their byte trie, each node's mask made
+    /// the first time a walk stands on it. One rule per set while anything
+    /// holds it — a second call with the same values, from any caller, is the
+    /// same rule, and its masks are shared. `Err` when no value of the set can
+    /// be written in this vocabulary: its caller leaves the field to its own
+    /// rule.
+    pub fn of_set<S: AsRef<str>>(
+        values: &[S],
+        vocab: &dyn Vocab,
+    ) -> Result<Arc<ValueRule>, RuleError> {
+        static RULES: OnceLock<Mutex<SetRules>> = OnceLock::new();
+        let (digest, len) = ValueSet::key_of(values);
+        let key = (vocab.fingerprint(), digest, len);
+        let rules = RULES.get_or_init(Mutex::default);
+        if let Some(rule) = rules
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .and_then(Weak::upgrade)
+        {
+            return Ok(rule);
+        }
+        let rule = Arc::new(ValueRule::over_set(
+            ValueSet::of(values),
+            shared_sorted(vocab),
+        )?);
+        let mut held = rules.lock().unwrap_or_else(PoisonError::into_inner);
+        held.retain(|_, rule| rule.strong_count() > 0);
+        held.insert(key, Arc::downgrade(&rule));
+        Ok(rule)
+    }
+
+    fn over_set(set: ValueSet, tokens: Arc<Sorted>) -> Result<ValueRule, RuleError> {
+        if set.is_empty() {
+            return Err(RuleError::Empty);
+        }
+        let mut single = [false; 256];
+        let mut close = false;
+        for (_, bytes) in tokens.iter() {
+            if let [byte] = bytes.as_slice() {
+                single[*byte as usize] = true;
+                close |= *byte == b'"';
+            }
+        }
+        if !close {
+            return Err(RuleError::NoQuote);
+        }
+        let finishable = set.finishable(&single, close);
+        if !finishable[0] {
+            return Err(RuleError::Unfinishable);
+        }
+        let mut rule = ValueRule {
+            pattern: format!("one of {} values", set.len()),
+            machine: Machine::Set {
+                set,
+                finishable: finishable.clone(),
+                tokens: Arc::clone(&tokens),
+                masks: Mutex::default(),
+            },
+            open_mask: AllowedSet::from_tokens(Vec::new()),
+            spaced_mask: AllowedSet::from_tokens(Vec::new()),
+        };
+        rule.open_mask = rule.mask_over(ValueState::Open, &tokens, &finishable);
+        rule.spaced_mask = rule.mask_over(ValueState::Spaced, &tokens, &finishable);
+        Ok(rule)
+    }
+
+    /// The tokens allowed at `state`, scanned over `tokens`: those that close
+    /// the value, or land on a state some run of whole tokens finishes from.
+    fn mask_over(&self, state: ValueState, tokens: &Sorted, finishable: &[bool]) -> AllowedSet {
+        let mut admitted = Vec::new();
+        self.scan(state, tokens, |token, land| {
+            let keeps = match land {
+                Step::On(ValueState::Inside(s)) => finishable[s as usize],
+                // The opening space, whose only way on is the quote.
+                Step::On(_) => true,
+                Step::Closes => true,
+                Step::Dead => false,
+            };
+            if keeps {
+                admitted.push(token);
+            }
+        });
+        AllowedSet::from_tokens(admitted)
+    }
+
+    /// Which states of a pattern's automaton some run of whole tokens can
+    /// finish from. Each state's landings are read once, and the set grown over
+    /// them until it stops.
+    fn pattern_finishable(&self, tokens: &Sorted) -> Vec<bool> {
+        let states = self.states();
+        let mut closes = vec![false; states];
+        let mut lands: Vec<Vec<u32>> = Vec::with_capacity(states);
         for (state, closes) in closes.iter_mut().enumerate() {
             let mut targets = Vec::new();
             self.scan(
@@ -240,13 +347,32 @@ impl ValueRule {
                 _ => Step::Dead,
             },
             ValueState::Inside(s) => match byte {
-                b'"' if self.accepting[s as usize] => Step::Closes,
+                b'"' if self.accepting(s) => Step::Closes,
                 b'"' | b'\\' => Step::Dead,
-                _ => match self.next[s as usize][byte as usize] {
-                    DEAD => Step::Dead,
-                    target => Step::On(ValueState::Inside(target)),
+                _ => match self.next(s, byte) {
+                    None => Step::Dead,
+                    Some(target) => Step::On(ValueState::Inside(target)),
                 },
             },
+        }
+    }
+
+    /// Whether a value may end at automaton state `s`.
+    fn accepting(&self, s: u32) -> bool {
+        match &self.machine {
+            Machine::Pattern { accepting, .. } => accepting[s as usize],
+            Machine::Set { set, .. } => set.accepting(s),
+        }
+    }
+
+    /// The state `byte` leads to from `s`, when one does.
+    fn next(&self, s: u32, byte: u8) -> Option<u32> {
+        match &self.machine {
+            Machine::Pattern { next, .. } => match next[s as usize][byte as usize] {
+                DEAD => None,
+                target => Some(target),
+            },
+            Machine::Set { set, .. } => set.step(s, byte),
         }
     }
 
@@ -269,36 +395,74 @@ impl ValueRule {
         Ok(rule)
     }
 
-    /// The rule for `pattern` over `vocab`'s one sorted copy, kept by no cache:
-    /// a rule its caller owns and drops — a turn's held values
-    /// (`docs/stencil_tree.md` §9.2), new each round, which [`Self::shared`]
-    /// would keep for the process's life.
-    pub fn owned(pattern: &str, vocab: &dyn Vocab) -> Result<ValueRule, RuleError> {
-        ValueRule::over(pattern, &shared_sorted(vocab))
-    }
-
-    /// The pattern this rule holds to.
+    /// The pattern this rule holds to; a held set's rule names how many values
+    /// it holds.
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
 
     /// How many tokens the widest of this rule's masks allows: what a step
-    /// under it sends to the device.
+    /// under it sends to the device. A held set's counts the masks made so far.
     pub fn widest_mask(&self) -> usize {
-        self.masks.iter().map(AllowedSet::len).max().unwrap_or(0)
+        match &self.machine {
+            Machine::Pattern { masks, .. } => masks.iter().map(AllowedSet::len).max(),
+            Machine::Set { masks, .. } => masks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .values()
+                .map(AllowedSet::len)
+                .max(),
+        }
+        .unwrap_or(0)
     }
 
-    /// How many states the rule has.
+    /// How many states the rule's automaton has: a held set's, the nodes of
+    /// its trie.
     pub fn states(&self) -> usize {
-        self.masks.len()
+        match &self.machine {
+            Machine::Pattern { next, .. } => next.len(),
+            Machine::Set { set, .. } => set.nodes(),
+        }
     }
 
-    /// The mask at `state`.
-    pub fn mask(&self, state: ValueState) -> &AllowedSet {
-        match state {
-            ValueState::Open => &self.open_mask,
-            ValueState::Spaced => &self.spaced_mask,
-            ValueState::Inside(s) => &self.masks[s as usize],
+    /// How many masks a held set's rule has made so far; a pattern's makes all
+    /// of them at build.
+    pub fn masks_made(&self) -> usize {
+        match &self.machine {
+            Machine::Pattern { masks, .. } => masks.len(),
+            Machine::Set { masks, .. } => {
+                masks.lock().unwrap_or_else(PoisonError::into_inner).len()
+            }
+        }
+    }
+
+    /// The mask at `state`. A held set's is made here the first time a walk
+    /// stands on its node, and kept.
+    pub fn mask(&self, state: ValueState) -> AllowedSet {
+        let s = match state {
+            ValueState::Open => return self.open_mask.clone(),
+            ValueState::Spaced => return self.spaced_mask.clone(),
+            ValueState::Inside(s) => s,
+        };
+        match &self.machine {
+            Machine::Pattern { masks, .. } => masks[s as usize].clone(),
+            Machine::Set {
+                finishable,
+                tokens,
+                masks,
+                ..
+            } => {
+                if let Some(made) = masks.lock().unwrap_or_else(PoisonError::into_inner).get(&s) {
+                    return made.clone();
+                }
+                let made = self.mask_over(state, tokens, finishable);
+                masks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(s)
+                    .or_insert(made)
+                    .clone()
+            }
         }
     }
 
@@ -508,7 +672,7 @@ mod tests {
         for pattern in ["a|bc", "[0-9]{4}", "(ab)+", "x*y", "https?://[a-z]+"] {
             let (_, rule) = rule(pattern);
             assert!(!rule.mask(ValueState::Open).is_empty(), "{pattern}");
-            for state in 0..rule.next.len() as u32 {
+            for state in 0..rule.states() as u32 {
                 let mask = rule.mask(ValueState::Inside(state));
                 assert!(!mask.is_empty(), "{pattern} state {state}");
             }
@@ -628,7 +792,7 @@ mod tests {
         for pattern in ["ab", "a|ab", "[ab]+", "a*b"] {
             let rule = ValueRule::over(pattern, &sorted).unwrap();
             let mut starts = vec![ValueState::Open, ValueState::Spaced];
-            starts.extend((0..rule.next.len() as u32).map(ValueState::Inside));
+            starts.extend((0..rule.states() as u32).map(ValueState::Inside));
             for start in starts {
                 let mut scanned = Vec::new();
                 rule.scan(start, &sorted, |token, _| scanned.push(token));
@@ -640,6 +804,124 @@ mod tests {
                     .collect();
                 walked.sort_unstable();
                 assert_eq!(scanned, walked, "{pattern} from {start:?}");
+            }
+        }
+    }
+
+    /// **A held set is walked a token at a time, its masks made as the walk
+    /// reaches them**: each step offers exactly the bytes that continue some
+    /// value, the quote only where one ends, and a node's mask is made once.
+    #[test]
+    fn a_set_rule_holds_each_step_to_its_values() {
+        let vocab = TestVocab::new();
+        let rule = ValueRule::of_set(&["src/lib.rs", "src/main.rs", "README.md"], &vocab).unwrap();
+        assert_eq!(rule.pattern(), "one of 3 values");
+        assert!(rule.mask(ValueState::Open).contains(id(&vocab, "\"")));
+        assert_eq!(rule.masks_made(), 0, "no node walked yet");
+
+        let start = rule.advance(ValueState::Open, b"\"").unwrap();
+        let first = rule.mask(start);
+        assert!(first.contains(id(&vocab, "s")) && first.contains(id(&vocab, "R")));
+        assert!(!first.contains(id(&vocab, "c")), "no value begins with `c`");
+        assert!(
+            !first.contains(id(&vocab, "\"")),
+            "the empty value is not one"
+        );
+        assert_eq!(rule.masks_made(), 1);
+        rule.mask(start);
+        assert_eq!(rule.masks_made(), 1, "made once, then kept");
+
+        let dir = b"src/"
+            .iter()
+            .try_fold(start, |at, b| rule.advance(at, &[*b]))
+            .unwrap();
+        let next = rule.mask(dir);
+        assert!(next.contains(id(&vocab, "l")) && next.contains(id(&vocab, "m")));
+        assert!(
+            !next.contains(id(&vocab, "t")),
+            "`src/turn_layout.rs` is no value"
+        );
+        let whole = b"lib.rs"
+            .iter()
+            .try_fold(dir, |at, b| rule.advance(at, &[*b]))
+            .unwrap();
+        assert!(
+            rule.mask(whole).contains(id(&vocab, "\"")),
+            "a value ends here"
+        );
+        assert_eq!(rule.advance(whole, b"\""), None, "closed");
+    }
+
+    /// **One rule per set while anything holds it**: the same values, in any
+    /// order, are the same rule and share its masks; once let go, a set is
+    /// built afresh.
+    #[test]
+    fn the_same_set_is_one_rule_while_held() {
+        let vocab = TestVocab::new();
+        let a = ValueRule::of_set(&["one-rule/b.rs", "one-rule/a.rs"], &vocab).unwrap();
+        let b = ValueRule::of_set(&["one-rule/a.rs", "one-rule/b.rs", "one-rule/a.rs"], &vocab)
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let other = ValueRule::of_set(&["one-rule/a.rs"], &vocab).unwrap();
+        assert!(!Arc::ptr_eq(&a, &other));
+        let start = a.advance(ValueState::Open, b"\"").unwrap();
+        a.mask(start);
+        assert_eq!(b.masks_made(), 1, "one rule, one set of masks");
+        drop((a, b));
+        let again = ValueRule::of_set(&["one-rule/a.rs", "one-rule/b.rs"], &vocab).unwrap();
+        assert_eq!(again.masks_made(), 0, "built afresh");
+    }
+
+    /// **A set none of whose values can be written is refused**, and the
+    /// field keeps its own rule.
+    #[test]
+    fn an_unwritable_set_is_refused() {
+        let vocab = TestVocab::new();
+        let refused = |values: &[&str]| ValueRule::of_set(values, &vocab).map(|_| ()).unwrap_err();
+        assert_eq!(refused(&[]), RuleError::Empty);
+        assert_eq!(
+            refused(&["a\"b"]),
+            RuleError::Empty,
+            "no value it could write"
+        );
+    }
+
+    /// **A set rule's scan admits exactly what a token-by-token walk does**, as
+    /// a pattern's does, on tokens that share prefixes, close part-way, and run
+    /// past the end.
+    #[test]
+    fn a_set_rules_scan_agrees_with_the_walk() {
+        let tokens: Vec<&[u8]> = vec![
+            b"a", b"ab", b"abc", b"ab\"", b"ab\",", b"b", b"ba", b"\"", b"\",", b" ", b" \"",
+            b"\\", b"c", b"/", b"a/", b"a/b",
+        ];
+        let mut sorted: Sorted = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i as TokenId, b.to_vec()))
+            .collect();
+        sorted.sort_by(|a, b| a.1.cmp(&b.1));
+        let sorted = Arc::new(sorted);
+        for values in [
+            vec!["ab"],
+            vec!["a", "ab"],
+            vec!["a/b", "ab", "c"],
+            vec!["", "b"],
+        ] {
+            let rule = ValueRule::over_set(ValueSet::of(&values), Arc::clone(&sorted)).unwrap();
+            let mut starts = vec![ValueState::Open, ValueState::Spaced];
+            starts.extend((0..rule.states() as u32).map(ValueState::Inside));
+            for start in starts {
+                let mut scanned = Vec::new();
+                rule.scan(start, &sorted, |token, _| scanned.push(token));
+                scanned.sort_unstable();
+                let mut walked: Vec<TokenId> = sorted
+                    .iter()
+                    .filter(|(_, bytes)| rule.walk(start, bytes).is_some())
+                    .map(|(token, _)| *token)
+                    .collect();
+                walked.sort_unstable();
+                assert_eq!(scanned, walked, "{values:?} from {start:?}");
             }
         }
     }

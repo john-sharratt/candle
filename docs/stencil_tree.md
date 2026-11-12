@@ -755,8 +755,8 @@ call that was just refused for one.
 - **A turn's held values** (`HeldValues`, `stencil/held_values.rs`) map a key to
   the values its span may take, and a value may depend on fields already written
   in the same call: `file_edit.part` on `repo` and `path`, `from` and `to` on
-  `repo`, `path` and `part`. Each is a `ValueRule` over the literal values,
-  built with `ValueRule::owned` — never `ValueRule::shared`, whose cache keeps
+  `repo`, `path` and `part`. Each is a `ValueRule` over the set of values
+  (`ValueRule::of_set`, §9.2.1) — never `ValueRule::shared`, whose cache keeps
   every pattern for the process's life and would grow by one per round.
 - **The session holds a keyed span to its held rule** in place of the span's
   own: entering a span, it looks up the key with the call's tool and written
@@ -770,27 +770,98 @@ call that was just refused for one.
   last token, a token running past the arm into a value (a spill, which carries
   the arm it completed), or a delimiter pushed back from the span before it —
   the call is named the same way.
-- **What a turn holds is the conversation's own** (`zend/src/held_values.rs`):
-  for each file the conversation has read or edited, the anchors it
-  carves into now — in the conversation's store, its own edits included — and
-  each part's line count. `file_read.part`, `file_edit.part`, `file_edit.through`
-  and `file_edit.dest` are held to the anchors of the file named;
-  `file_edit.from` and `file_edit.to` to `+1` through the length of the part
-  named.
+- **What a turn holds is the conversation's own** (`zend/src/held_values.rs`),
+  read each round from the conversation's store, its own edits included:
+  - **which repository:** every file tool's `repo` is one of the workspace's
+    repositories (`RepoFiles::names`), and `file_grep.repo` and
+    `file_search.repo` may also be `*`;
+  - **which file:** the `path` of every tool that takes an existing file —
+    `file_read`, `file_edit`, `file_delete`, `file_move`, `file_upload`,
+    `file_image` — is one of the files of the repository named
+    (`VfsStore::paths`, which leaves out protected paths);
+  - **which directory:** `file_list.path` is one of the repository's
+    directories or `""`, its root; `file_grep.prefix` and `file_search.prefix`
+    one of its directories, with or without the closing `/`, or for `*` one
+    of any repository's;
+  - **which part and line:** for each file the conversation has read or edited,
+    the anchors it carves into now and each part's line count.
+    `file_read.part`, `file_edit.part`, `file_edit.through` and `file_edit.dest`
+    are held to the anchors of the file named; `file_edit.from` and
+    `file_edit.to` to `+1` through the length of the part named.
+
+  A path the tool will create — `write.path`, `file_download.path`,
+  `file_move.to`, `file_image`'s destination — names a file that does not
+  exist yet, so it is not held. Neither is a git tool's path, which names a
+  file at a revision, possibly one the working tree has since lost.
+
+  This is what ended the repository-prefix collision: a file whose first
+  directory is, or starts with, a repository's name (`candle-conversation/…`,
+  `journals/…` in `candle`) was written without it, as though it were the
+  repository prefix every read fence shows (`file=candle/…`), and the read came
+  back `not_found`. Held, `src/turn_layout.rs` cannot be written in `candle`,
+  whose root has no `src`.
 - **A refused value is not offered again**, because it is not offered at all:
   the held values are read again each round from the file as it stands, so an
   anchor or a line that does not exist — the repeat the guard used to end — is
   never among them. The files a conversation has read or edited are noted
   after each round (`FilesSeen::note`), its 32 most recent held.
 
-**Cost.** A held rule is a few literal values: a file of a hundred parts is a
-rule of about four hundred states, under `ValueRule`'s cap of 512 (a file past
-it keeps the pattern). A round builds only what changed since the last one: a
-file is carved again only when its content's digest differs from the one it
-was carved from, and a value set's rule is taken from the last round's
-(`HeldRules`) when the same set was built there. Both keep only what the
-current round used, so neither grows past one round's files. A file the store
-cannot read is held to nothing, and logged.
+**Cost.** A round builds only what changed since the last one: a file is
+carved again only when its content's digest differs from the one it was carved
+from, and a value set's rule is taken from the last round's (`HeldRules`) when
+the same set was built there. Both keep only what the current round used, so
+neither grows past one round's files. A file the store cannot read is held to
+nothing, and logged.
+
+#### 9.2.1 A held set of any size: the trie rule
+
+A pattern's `ValueRule` compiles every automaton state's mask when it is built,
+so a turn's only cost is an index — and it caps a rule at 512 states, since each
+state holds a mask. A literal set past that cap could not be held: one
+repository's files (`candle`: 6,099 paths, 254 KB) is hundreds of thousands of
+states.
+
+A held set is therefore not a pattern. `ValueRule::of_set` builds a **byte trie**
+of the set (`stencil/value_set.rs`), and a trie is already a deterministic
+automaton: its nodes are the states (`ValueState::Inside(node)`), a node's
+children its transitions, a value's last node accepting. What differs from a
+pattern's rule is when the masks are made:
+
+- **A node's mask is made the first time a walk stands on it**, by the same
+  byte-order scan a pattern's build runs (§7.1): tokens sharing a prefix
+  resume from it, and a prefix the trie refuses skips every token under it by
+  binary search, so a node with a few children visits only the few tokens that
+  could continue one. It is kept for the rule's life: a walk through
+  `candle-conversation/src/` makes each of those nodes' masks once, for every
+  later call.
+- **No state cap**, because only the nodes walked are ever made. A path is ten
+  to twenty tokens, so a call makes at most that many masks, each a scan of a
+  narrow prefix of the vocabulary.
+- **Finishable as a pattern's rule is**, but worked out over the trie at build:
+  a node is finishable when it accepts, or when one of its children is reached
+  by a token of that one byte and is finishable itself. That is exact for a
+  byte-level vocabulary, which has a token for every byte; on any other it may
+  hold back a node only multi-byte tokens reach, never offer one that strands
+  the walk. A set none of whose values can be written is refused, and the
+  field decodes under its own rule.
+- **A value holding `"` or `\`, or a byte below a space, is left out of the
+  set**: a rule admits no escape (§7.1), so no such value could be written.
+- **One rule per set, shared while anything holds it.** The rules built over a
+  vocabulary are kept by the set's digest behind a weak reference, so every
+  conversation holding the same repository's files walks one trie and shares
+  its masks, and a rule no round holds any longer is dropped.
+
+#### 9.2.2 A turn that begins inside a grammar holds its values too
+
+A turn armed by a trigger takes its registry's held values as the walk starts
+(§9). A turn that begins inside a grammar (`TurnOptions::turn_grammar`, §9.1's
+opening call) is armed before anything is sampled, with no trigger, so it
+carries its own: `TurnGrammar { tree, held }`. A file's reading
+(`zend/src/code_read`) uses it to hold its opening call to the one file it
+reads: `repo` to its repository, `path` to its path, `lines` to its ranges. The
+reading's prompt names all three, and the model — not the grammar — used to
+write them, which is how a reading came to read `src/turn_layout.rs` for
+`candle-conversation/src/turn_layout.rs` nine times over.
 
 ### 9.3 A tail: what an answer's end hands over to
 

@@ -6148,7 +6148,7 @@ impl Scheduler {
         // by replaying it: the driver has to sit at the same node the K/V does.
         // What is left is the first genuine choice the grammar leaves open, and
         // the first sampled token of the turn is taken under its mask.
-        let mut turn_driver = work.turn_grammar.clone().map(StencilDriver::new);
+        let mut turn_driver = work.turn_grammar.as_ref().map(TurnGrammar::driver);
         let mut sampling = work.sampling.clone();
         if let Some(driver) = turn_driver.as_mut() {
             let (scaffold, action) = driver.opening();

@@ -41,7 +41,7 @@ use candle_conversation::projection::{
 };
 use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, compile_tool_call_tree, StencilTree,
-    StencilTreeBuilder, ThinkMode, ThinkSteerEnvelope, ToolCallEnvelope, ToolSpec,
+    StencilTreeBuilder, ThinkMode, ThinkSteerEnvelope, ToolCallEnvelope, ToolSpec, TurnGrammar,
 };
 use candle_conversation::throwaway::{HeldFrame, Throwaway};
 use candle_conversation::{
@@ -366,7 +366,7 @@ async fn framed(
     let options = TurnOptions {
         max_tokens: Some(max_tokens),
         sampling: Some(sampling),
-        turn_grammar,
+        turn_grammar: turn_grammar.map(TurnGrammar::of),
         assistant_prefill: prefill.clone(),
         ..Default::default()
     };
