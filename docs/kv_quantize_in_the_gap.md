@@ -72,18 +72,24 @@ already quantized to pinned host memory, on its own stream, and appends them to
 the redo log. It never writes device memory and never changes what a residence
 points at.
 
+**The device converts; the host installs when it knows.** A gap launches the
+selection, the claim and the convert and reads nothing back. The host learns
+what was chosen from mapped memory, in a later gap, and only then points its
+records and the block tables at the quantized blocks. Until then everything
+still names the native blocks, which are still valid.
+
 ```
  forward ─▶ native writer chunk + newly complete native blocks
    │
- gap   ─▶ select + claim + convert + record fill   (one batched launch set,
-   │       primary stream), then the host's own header upload behind it
-   │       event E_gap recorded; completion word written last
+ gap N ─▶ select + claim + convert   (one batched launch set, primary stream)
+   │       summary and completion word written to mapped memory
+   │       event E_gap recorded
    │
-   ├────▶ next forward reads each block through its new record
-   │       (stream order: no fence)
+ forward ─▶ still reads those blocks native   (nothing has been re-pointed)
    │
-   ├────▶ host catch-up, once the completion word is set: gids re-pointed,
-   │       native blocks freed
+ gap N+1 ─▶ catch-up: the completion word is set, so the host installs gap N's
+   │         blocks (records, block tables) and drops the native ones
+   │       then its own select + claim + convert
    │
    └────▶ persistence: wait on E_gap on the copy stream ─▶ DtoH into the pinned
           warm buffer ─▶ log append ─▶ commit ─▶ has_warm published
@@ -102,34 +108,54 @@ deleted.
 
 ## 3. The gap quantize
 
+A gap does three things, in this order:
+
+1. **Catch-up** (§3.5), if a gap is outstanding and its completion word is set.
+2. The arena creation and the compaction the gap already does
+   (`scheduler/run.rs`).
+3. **Quantize** (§3.1–§3.4), if no gap is outstanding and there are blocks to
+   take.
+
+**At most one gap is outstanding.** A gap whose predecessor's completion word is
+not yet set quantizes nothing; its blocks wait for the next gap. The summary is
+therefore one buffer, a lease is never held by two gaps, and the host never
+reasons about two unread results.
+
 ### 3.1 Inputs, without a readback
 
 The host knows, without asking the device, every block that became complete in
 the forwards since the last gap. It scheduled those rows, so it knows each
 sequence's offset, and it allocated the native chunks those blocks live in. From
 its own bookkeeping it builds a **descriptor table**: one row per block, giving
-the source K/V pointers, the (layer, head) layout, the block's token range and
-its sequence's position (for attention-sink protection on positions 0–3). That
-is invariant 2b's shape. No block is copied together to be quantized.
+the source K/V pointers, the (layer, head) layout, the block's token range, its
+sequence's position (for attention-sink protection on positions 0–3) and its
+layer's thresholds. That is invariant 2b's shape. No block is copied together to
+be quantized.
 
-**A block is complete only in committed tokens.** The table is built from each
-sequence's committed offset, after the step's speculative rollback has settled
-(`truncate_sequence_to_tokens`). Rows a verify forward wrote past the committed
-position are in no table, so a rollback never has to trim a quantized block,
-which cannot take writes.
-
-A sealed residence's partial final block is quantized as a full block. Its dead
-slots are zero and the valid range is passed to the selection kernel, as
-`kv_tier_migration.md` §3 already specifies. A live sequence's writer chunk is
-not in the table.
-
-**Each row also names a record slot.** A block's `KvHead[n_kv_head]` record
-(`chunked/meta_pool.rs`: palette maps, formats, scales and band pointers) is
-what the attention kernels read the block through. For every row the host
-claims one record slot (`MetaGid`) from the record class before the gap's
-launches. That claim is exact, one per block, so the host knows each new
-record's device address before the device has chosen anything. A block the
-record class cannot serve is left out of the table for this gap.
+- **The builder is proportional to what changed.** Each sequence keeps a cursor:
+  the first block not yet handed to a gap. The builder visits the sequences a
+  forward touched and takes the blocks from the cursor to the writer chunk. It
+  never walks a sequence's history. An empty table launches nothing.
+- **A block is complete only in committed tokens.** The table is built from each
+  sequence's committed offset, after the step's speculative rollback has settled
+  (`truncate_sequence_to_tokens`). Rows a verify forward wrote past the
+  committed position are in no table, so a rollback never has to trim a
+  quantized block, which cannot take writes.
+- **A block is taken only when every layer has it.** A wave that died mid-sweep
+  leaves one layer a filled chunk ahead of the others. The row for a block
+  exists only when the block is complete on every layer, which is the rule
+  `assert_sealed_layers_aligned` enforces at a seal today.
+- **Thresholds ride in the row.** A layer can seal at its own level (the MTP
+  draft head, `layer_seal_cap`). Today that makes one selection run per policy
+  group. The row carries its thresholds, so the gap is one launch whatever the
+  mix.
+- **A sealed residence's partial final block** is quantized as a full block. Its
+  dead slots are zero and the valid range is passed to the selection kernel, as
+  `kv_tier_migration.md` §3 already specifies. A live sequence's writer chunk is
+  not in the table.
+- **A table is cut to what the gap's scratch can carry.** The selection runs in
+  held scratch (`SELECTION_BUDGET_BYTES`). Blocks past the cut wait for the next
+  gap.
 
 ### 3.2 Device-side band claim
 
@@ -139,27 +165,33 @@ the scheduler thread that would be a synchronous readback in the loop, against
 invariant 3. Instead, **the host leases slots ahead of time, and the device
 chooses among them.**
 
-- **Leases.** In each gap the host claims, for every reachable quant class, a
-  lease of free slots from that class's arenas (`ChunkGidPool`, lowest place
-  first). It holds their `ChunkGid`s and uploads the lease as a device-resident
-  **slot stack** per class: one `{arena ptr, slot}` entry per slot, plus a
-  device cursor.
-- **Claim.** The fused selection kernel picks each (block, head)'s K and V
-  palettes and formats exactly as today. For each band the record will name
-  (up to `N_PALETTE` a head, for K and for V), it then takes a destination by
-  `atomicAdd` on that band's class cursor. Nothing comes back to the host.
-- **A class that runs dry defers the block, never fails it.** If any of a
-  block's claims passes its lease, the whole block stays native and goes into
-  the next gap's table; the slots its other bands took are reported unused. The
-  attempt is counted in the summary (§3.4). A block that stays native for a gap
-  is still attended correctly, only larger, and this is the only way a complete
-  block misses its gap.
+- **Leases.** For every reachable quant class the host keeps a standing lease:
+  free slots claimed from that class's arenas (`ChunkGidPool`, lowest place
+  first), held as `ChunkGid`s, and mirrored on the device as a **slot stack**
+  of `{arena ptr, slot}` entries. In each gap the host tops the stack up and
+  uploads only the entries it added. Slots a gap does not take stay in the
+  stack for the next one.
+- **Claim, in table order.** The fused selection kernel picks each (block,
+  head)'s K and V palettes and formats exactly as today and writes each band's
+  class. A claim kernel then gives every band its index in its class: the count
+  of bands of that class before it in the table. The band's destination is that
+  entry of the class's stack. The claim is a prefix count, not a race on an
+  atomic cursor, so the same table against the same lease always takes the same
+  slots, and the lowest places fill first.
+- **A class that runs dry defers the block, never fails it.** A block is
+  deferred when any of its bands' indices falls past its class's lease. The
+  whole block stays native and goes into the next gap's table. The slots its
+  other bands would have taken are not written and stay leased. A block that
+  stays native for a gap is still attended correctly, only larger, and this is
+  the only way a complete block misses its gap.
+- **A band that stays as it is needs no slot.** Where the selection keeps a band
+  in its native format (C0's K), nothing is claimed or converted for it.
 - **Lease size is bounded by this gap's own demand.** The host built the table,
   so it knows the band count exactly: blocks × heads × `N_PALETTE` × 2. Only
-  the split across classes is unknown. Each class's lease is that count times
-  the class's recent peak share of claims (read from the summaries, kept
-  separately for prefill and decode gaps), plus one arena's headroom, and never
-  more than the count itself. The share is a fraction, not a volume, so a
+  the split across classes is unknown. Each class's lease is topped up to that
+  count times the class's recent peak share of claims (read from the summaries,
+  kept separately for prefill and decode gaps), plus one arena's headroom, and
+  never more than the count itself. The share is a fraction, not a volume, so a
   prefill arriving after an idle period is leased for its own size. Before any
   summary exists the count is split evenly across the reachable classes.
   This replaces §2a's backlog-sized reserve: the lease covers one gap's demand,
@@ -167,100 +199,87 @@ chooses among them.**
   `weight_floor` (invariant 7). When the ground cannot cover a lease, the class
   defers blocks for a gap rather than take ground from the experts.
 
-### 3.3 Convert, record and swap
+### 3.3 Convert
 
-- **Convert.** One batched launch over every claimed band, across every layer
-  and sequence (invariant 5). Destinations are allocated uninitialised
-  (invariant 6).
-- **Record fill.** The convert's epilogue writes each block's whole record into
-  the record slot its row names: palette maps, format tags, scales, and the
-  claimed slots' band pointers. This is `backing::fill_records_on_device`'s job
-  with the claim as its source, held byte-for-byte against
-  `serialize_kv_heads`. **A deferred block's record is filled too**, naming its
-  native bands with their float format. Every record slot in the table
-  therefore holds a valid record once the gap's launches have run, whichever
-  way the claim went.
-- **The host swaps the header, in the same gap.** A sequence's slot-state
-  buffer (`chunked/gpu_chunks.rs`) holds one 16-byte header per block, whose
-  `kvheads_ptr` names the block's record. The host rewrites that pointer to the
-  new record slot in its own copy of the buffer and uploads the header through
-  the ordinary staged path, queued behind the gap's launches on the same
-  stream. The next forward on that stream therefore reads the block through the
-  new record, with stream order as the fence. The device never writes a slot
-  buffer, so **the host's copy stays the authoritative one**: a later
-  `rebuild_decode`, `extend_decode` or `snapshot_into_generation` serialises
-  the swapped pointer, and a resident record is not rebased by a snapshot.
-- **Borrowers.** A block borrowed by several slots (a shared prefix) shares one
-  record slot, as sealed chunks do today. The host swaps the header in every
-  slot buffer that names the block.
-- **What still names the native bands.** After the swap, no header reaches the
-  native bands except through a deferred block's record. The host's chunk
-  records (`ChunkWindow`, `SealedChunk`) still hold the native `HeadGids`
-  until the catch-up (§3.5), and so does any `ChunkPin` a launch or a
-  generation snapshot took before the gap.
+One batched launch over every claimed band, across every layer and sequence
+(invariant 5), reading its destinations from the claim. Destinations are
+allocated uninitialised (invariant 6). The convert is launched once for the
+whole table, never once per layer.
+
+Nothing else is written on the device. No record is filled and no block table is
+touched in the gap: both are the host's to change, at the catch-up.
 
 ### 3.4 The summary
 
-The kernels write a per-gap summary into a mapped pinned ring, as the MoE
-dispatch does with its routing summary (`docs/moe_live_dispatch_design.md`).
-One gap's summary is:
+The kernels write the gap's summary into one mapped pinned buffer, as the MoE
+dispatch writes its routing summary (`expert_lre/dispatch.rs`, `SummaryRing`).
+It holds:
 - a header: the gap's sequence number and its row count;
-- one row per block: converted or deferred, and the block's record with each
-  band pointer replaced by the class and lease index it claimed. That carries
-  the palette maps, format tags and scales the host needs for its own records
-  and for the redo log;
-- each class's final cursor;
+- one row per block: converted or deferred, and for each head the palette tags,
+  scales and palette map the selection chose, and each band's lease index;
 - a **completion word**, written by the gap's last launch, holding the gap's
   sequence number.
 
-The host reads a summary only once its completion word matches. It looks at the
-head of every gap and at the end of every scheduler step, by reading the mapped
-word. No host CUDA call reads or waits on the ring.
-
-The ring is sized at start for two gaps of the largest table a gap can build:
-the widest forward's blocks across every layer, at one row each. When the unread
-part of the ring leaves no room for a gap's whole table, the table is cut to
-what fits and the remaining blocks stay native for a gap, as a deferral does. A
-summary the host has not read keeps its leases held.
+That is what the selection reads back to the host today, delivered through
+mapped memory. The host reads it only once the completion word matches, by
+reading the mapped word at the head of a gap. No host CUDA call reads or waits
+on the buffer. The buffer is sized at start for the largest table a gap can
+build (§3.1's cut).
 
 ### 3.5 The host catch-up and the native bound
 
-When the host reads a summary it:
-- marks the claimed band gids live and returns the unused ones to their pools;
-- re-points every holder of each converted block (`ChunkWindow`, `SealedChunk`)
-  from its native `HeadGids` to the claimed ones, with the formats and scales
-  from the row;
-- puts each deferred block into the next gap's table, where it is given a new
-  record slot;
-- updates each class's share for the next leases.
+When the completion word is set, the head of the next gap installs the
+outstanding gap's blocks. For each converted block the host:
+- takes the claimed slots out of the lease as the block's bands, with the
+  formats, scales and maps from the row;
+- claims a record slot and fills it with the existing device fill
+  (`fill_records_on_device`);
+- replaces the block in its owner, in place: the live sequence's chunk at that
+  index, or the sealed residence's chunk. No sequence is truncated and
+  re-injected;
+- re-serialises that block's header in the owner's slot buffer
+  (`update_chunk`), uploaded with the gap's other slot uploads in one scatter;
+- drops the owner's reference to the native bands.
 
-**A native band is freed by its last reference.** The catch-up drops the
-host records' references; a `ChunkPin` taken before the gap drops its own when
-its launch or generation is done. By then the convert that read the band has
-finished, because the completion word is set, so the slot is free for any
-stream to reuse and no fence is needed. A reprojection built between the gap
-and the catch-up clones a chunk whose header already names the new record. It
-attends the quantized block and merely holds the native gids a little longer.
+A deferred block is put into this gap's table. Each class's share is updated for
+the next leases. This is the install the persistence thread does today, moved to
+the thread that owns the sequences, with nothing left to fence: the convert has
+finished, and the header upload is queued on the stream ahead of the next
+forward.
+
+**A native band is freed by its last reference.** The owner's reference goes at
+the catch-up. A `ChunkPin` a launch or a generation snapshot took earlier drops
+its own when it is done. The convert that read the band has finished by then,
+so the slot is free for any stream to reuse and no fence is needed.
+
+**A clone made while its gap is outstanding stays native.** A seal or a
+reprojection that clones a block between its gap and its catch-up holds the
+native bands, and is not an owner the catch-up re-points. It reads correctly and
+is merely larger until it is dropped. A sequence is not sealed while it has
+blocks in an outstanding gap; the seal runs after that gap's catch-up, one step
+later. That leaves only a reprojection of a sealed residence's partial block,
+one block a residence at most.
 
 **The bound.** Native K/V standing in VRAM is at most:
 - every live sequence's writer chunk;
 - the blocks the latest forward completed, until their gap;
-- the blocks of gaps whose summary the host has not yet read, normally one gap;
-- the deferred blocks.
+- the blocks of the one outstanding gap;
+- the deferred blocks, and the clones above.
 
 In steady decode that is the writer chunks plus at most two blocks per
 sequence-layer. In a chained prefill it is the output of the two most recent
-forwards. A forward is admitted against ground that counts the previous gap's
-natives as still held.
+forwards. A forward is admitted against ground that counts the outstanding
+gap's natives as still held.
 
 ### 3.6 Cost in the gap
 
-The gap now does work proportional to the K/V produced since the last gap. That
-is one selection, one claim, one convert and one record fill, all batched. A
-6,144-row prefill forward produces 192 blocks per layer. Decode produces about
-one block per sequence-layer every 32 steps. The gap is not budgeted: everything
-complete is quantized. Its cost is measured, inside the timed windows (§7), and
-the rate model's decode step includes it.
+The gap now does work proportional to the K/V produced since the last gap: one
+selection, one claim and one convert, all batched, and at the next gap one
+record fill and one scatter of headers. A 6,144-row prefill forward produces
+192 blocks per layer. Decode produces about one block per sequence-layer every
+32 steps, so most decode gaps have an empty table and launch nothing. The gap
+is not budgeted: everything complete is quantized. Its cost is measured, inside
+the timed windows (§7), and the rate model's decode step includes it.
 
 The cost is real device work that now sits between forwards, so it is measured
 before anything is built (§8 step 1). `quantize_and_seal_sequences` runs the
@@ -273,17 +292,18 @@ first. The gate is not loosened.
 
 The scheduler writes one `kv_gap` line for each second in which a gap ran,
 summed over that second's gaps: blocks converted, blocks deferred and the class
-that ran dry, native bytes standing, lease bytes held, and the gaps' device
-time. It replaces the `kv_reserve: pass` line, which each attachment's
-persistence thread writes today about the one shared pool, so that every pass
-is logged once per tenant. §7's production gates are read from this line.
+that ran dry, gaps that quantized nothing because one was outstanding, native
+bytes standing, lease bytes held, and the gaps' device time. It replaces the
+`kv_reserve: pass` line, which each attachment's persistence thread writes
+today about the one shared pool, so that every pass is logged once per tenant.
+§7's production gates are read from this line.
 
 ## 4. What a forward attends
 
-Every forward attends a quantized prefix plus at most each sequence's writer
-chunk in native form. A long prefill's later forwards attend that same
-prefill's earlier blocks quantized. Decode attends its own earlier tokens of
-the turn quantized once each block completes.
+Every forward attends a quantized prefix plus, in native form, each sequence's
+writer chunk and the blocks of the outstanding gap. A long prefill's later
+forwards attend that same prefill's earlier blocks quantized. Decode attends its
+own earlier tokens of the turn quantized from the step after each block's gap.
 
 This is a change in what the model sees. Today a turn attends its own tokens
 native until the drain reaches them; the gates attend a quantized prefix and a
@@ -306,11 +326,13 @@ scale whichever gap quantizes them.
   persistence thread owns a non-primary stream of its own, so two tenants'
   copies never queue behind each other or behind a forward. Today both
   threads run their hot→warm pass on the shared primary stream and each fences
-  it. A thread copies a residence once the host catch-up has re-pointed the
+  it. A thread copies a residence once the catch-up has installed the
   residence's last block, so it reads the gids, formats and scales from the
   host's records. It makes its stream wait on the `E_gap` of the gap that
-  quantized that block (`cudaStreamWaitEvent`), then issues one DtoH of the
-  gathered quantized blocks. No `device.synchronize()` anywhere on this path.
+  quantized that block (`cudaStreamWaitEvent`), then gathers and copies the
+  quantized blocks with the existing batch copy
+  (`migrate_sealed_to_cpu_batch_async`). No `device.synchronize()` anywhere on
+  this path.
 - **Pinned warm tier.** The DtoH lands in pinned host buffers that are both the
   redo-log write buffer and the warm cache (`kv_tier_migration.md` §3). This
   replaces today's pageable CPU arenas, so the copy runs at full link bandwidth.
@@ -352,31 +374,32 @@ scale whichever gap quantizes them.
 - `MigrateFlight` as a quantize lock (§5).
 - The selection's host readback of palettes, scales and maps
   (`sampled_selection/gpu.rs`). The summary row carries them (§3.4).
-- `batch_test`'s boundary calls to `quantize_and_seal_sequences`. The test runs
-  the scheduler's gap quantize inside its timed loop. The function's selection
-  and convert core becomes the gap quantize; there is one implementation.
+- `batch_test`'s boundary calls to `quantize_and_seal_sequences`, and the
+  function's seal by truncate and re-inject. The test runs the scheduler's gap
+  quantize inside its timed loop. The function's selection and convert core
+  becomes the gap quantize; there is one implementation.
 
 ## 7. How it is verified
 
 Unit tests, written with the code, asserting raw expected bytes:
 - the descriptor table built from host bookkeeping for a known wave: complete
-  blocks in, writer chunks out, a sealed residence's partial block in, and rows
-  past the committed offset out;
+  blocks in, writer chunks out, a sealed residence's partial block in, rows
+  past the committed offset out, a block one layer lacks out, and nothing
+  before a sequence's cursor;
 - the lease for a known table: never more than the table's band count, split by
-  the recorded shares, and split evenly when there are none;
-- the device claim against a lease: the slot each band takes, a dry class
-  deferring exactly the blocks past its lease and reporting their other slots
-  unused;
-- the convert's quantized bytes and the record it fills, against the per-block
-  reference quantizer and `serialize_kv_heads`; a deferred block's record
-  naming its native bands;
-- the header swap: the slot buffer's host copy and its uploaded bytes name the
-  new record, and a rebuild and a generation snapshot taken afterwards keep it;
-- the summary: its rows, cursors and completion word, a summary whose word is
-  not yet set being left unread, and a table cut to the ring's free room;
-- the host catch-up: used gids marked live, unused ones returned, records
-  re-pointed with the row's formats and scales, and a native band freed only
-  when its last reference drops;
+  the recorded shares, split evenly when there are none, and topped up by only
+  the entries it lacks;
+- the device claim against a lease: the slot each band takes, the same on every
+  run; a dry class deferring exactly the blocks past its lease and writing none
+  of their other bands; a band kept native taking no slot;
+- the convert's quantized bytes, against the per-block reference quantizer;
+- the summary: its rows and completion word, and a summary whose word is not
+  yet set being left unread;
+- a gap that finds one outstanding quantizes nothing and keeps its blocks;
+- the host catch-up: the block replaced in place at its index, its record equal
+  to `serialize_kv_heads`, its header re-serialised, a rebuild and a generation
+  snapshot taken afterwards naming the quantized block, and a native band freed
+  only when its last reference drops;
 - persistence: a copy issued before its gap's event has completed reads only
   completed blocks, `has_warm` is never published before the copy's event, and
   a full pool drops only blocks the log holds.
@@ -387,7 +410,9 @@ Gates, run one model per `cargo` process with the daemon stopped:
 - in production, a decode with the persistence thread active shows forward time
   of at least 95% of each wave window;
 - native K/V in VRAM never exceeds §3.5's bound: the writer chunks, the two
-  most recent forwards' blocks, and the deferred blocks;
+  most recent forwards' blocks, the deferred blocks and the clones;
+- gaps that quantize nothing because one is outstanding are under 1% of the
+  gaps with a table;
 - p95 commit wait under 1 s.
 
 The before figures are those in §1 and §1.1. The production gates are run on
@@ -400,15 +425,180 @@ The measurement comes first and changes no behaviour:
    and set it against the decode K/V rate (§3.6).
 
 Everything after it lands in one change, with no dual path:
-2. the descriptor-table builder, with the record-slot claim;
+2. the descriptor-table builder and the per-sequence cursor;
 3. the lease and the device claim;
-4. the convert's record fill and the host's header swap;
+4. the convert reading its destinations from the claim;
 5. the summary and the host catch-up;
 6. the gap call in the scheduler and in `batch_test`;
 7. persistence reduced to copy-and-append on its own stream into the pinned
    warm pool;
 8. the deletions in §6;
-9. `kv_drain_under_pressure.md` and `turn_claims.rs`'s commit-wait comment
-   rewritten to match.
+9. `kv_drain_under_pressure.md`, `AGENTS.md`'s tiering note and
+   `turn_claims.rs`'s commit-wait comment rewritten to match.
 
-The gates in §7 decide whether it is done.
+The gates in §7 decide whether it is done. §9 gives each step its code.
+
+## 9. Tasks, with the code they touch
+
+Line numbers are as of commit `dc04b62ac`.
+
+**1. Measure the core (§8 step 1).**
+- `candle-transformers/src/models/batch_test/utils.rs:2056` and `:2195`: the two
+  boundary calls. Time them, and report device time per MiB of native K/V.
+- `candle-transformers/src/models/batched_inference.rs:2052`,
+  `quantize_and_seal_sequences`. Its convert is issued inside a loop over every
+  backing with the whole descriptor list each time, where
+  `convert_deferred_descs` says any one backing serves. Confirm whether that
+  repeats the convert once per layer before trusting the timing, and time a
+  single convert.
+
+**2. The descriptor table and the cursor (§3.1).**
+- New `candle-nn/src/kv_cache/chunked/gap_table.rs`: the row type and the
+  builder. One concern, tested alone.
+- `candle-nn/src/kv_cache/chunked/sequence_ops.rs`: the per-sequence cursor
+  beside `writer_start_idx`; `truncate_sequence_to_tokens` (`:2134`) keeps the
+  cursor at or below the committed block.
+- `candle-nn/src/kv_cache/chunked/types.rs:216`: `ChunkWindow` (`gids`, `meta`),
+  the source of a row's pointers.
+- `batched_inference.rs:2172`, `assert_sealed_layers_aligned`: the every-layer
+  rule the builder applies per block.
+- `batched_inference.rs:645`, `layer_seal_cap`: the per-layer thresholds a row
+  carries.
+- `candle-nn/src/kv_cache/chunked/compress.rs:69`, `SELECTION_BUDGET_BYTES`: the
+  cut.
+
+**3. The lease (§3.2).**
+- New `candle-nn/src/kv_cache/chunked/gap_lease.rs`: the standing per-class
+  lease, its device stack, the top-up and the share.
+- `candle-nn/src/kv_cache/chunked/gid_pool.rs:1428`, `ChunkGidPool`: claiming
+  free slots lowest place first; `set_reserve_target` (`:1465`) goes.
+- `candle-nn/src/kv_cache/chunked/alloc.rs:509`, `owe_reserves`, and
+  `reserve_target.rs:45`, `reserve_targets`: replaced by the lease's sizing.
+- `alloc.rs:664`, `create_deferred_arenas`: still makes the arenas a lease is
+  short of, in the gap.
+
+**4. The kernels (§3.2, §3.3).**
+- `candle-kernels/src/quantize/select_kv_format.cuh:2285` and `:3199`,
+  `select_kv_format_palette4_paged`: thresholds per row; each band's class
+  written for the claim; outputs written to the mapped summary.
+- New `candle-kernels/src/quantize/kv_gap_claim.cu`: the per-class prefix count
+  and the deferral rule. Registered in `candle-kernels/build.rs`, bound in
+  `candle-kernels/src/lib.rs`.
+- `candle-nn/src/kv_cache/chunked/compress.rs:1413`, `convert_deferred_descs`
+  and `convert_descs_batched`: destinations read from the claim, one launch for
+  the table.
+- `candle-nn/src/kv_cache/chunked/sampled_selection/gpu.rs:741`, `run_palette4`,
+  and the readback at `:1497–1538`: removed.
+
+**5. The summary and the catch-up (§3.4, §3.5).**
+- New `candle-nn/src/kv_cache/chunked/gap_summary.rs`: the mapped buffer, its
+  row layout and the completion word. Pattern:
+  `candle-transformers/src/models/expert_lre/dispatch.rs:156`, `SummaryRing`.
+- New `candle-nn/src/kv_cache/chunked/gap_install.rs`: the catch-up.
+- `candle-nn/src/kv_cache/chunked/backing.rs:1307`, `fill_records_on_device`,
+  and `meta_pool.rs:146`, `serialize_kv_heads`: the record, unchanged.
+- `candle-nn/src/kv_cache/chunked/gpu_chunks.rs:692`, `update_chunk`, and
+  `types.rs:1458` / `:1507`: the header re-serialisation and its upload.
+
+**6. The gap call (§3, §3.7).**
+- `candle-conversation/src/scheduler/run.rs:1363`: the gap. Catch-up before
+  `create_deferred_arenas`; the quantize after `compact_kv_if_fragmented`
+  (`scheduler/prefill.rs:1249`).
+- `candle-conversation/src/scheduler/decode.rs` (the rollback, around `:860`
+  and `:1051`): the table is built after it.
+- `batched_inference.rs:2361`: the session's gap entry beside
+  `create_deferred_arenas`.
+- The `kv_gap` line, in a file of its own under `candle-conversation/src/scheduler/`.
+- `batch_test/utils.rs:2056`, `:2195`, `batch_test/fidelity.rs:147` and
+  `quantized_qwen38_moe.rs:1867`: every caller of `quantize_and_seal_sequences`
+  moves to the gap call.
+
+**7. Persistence (§5).**
+- `candle-conversation/src/persistence/thread.rs`: `run_pass` (`:1036`) keeps
+  the copy and the append. Deleted: `await_owed_arenas` (`:694`),
+  `install_hot_to_warm` (`:710`), `migrate_group_hot_to_warm` (`:771`), the
+  syncs at `:1100`, `:1334` and `:1414`, `MAX_GAP_RETRIES` (`:1253`).
+- `candle-nn/src/kv_cache/chunked/chunk_ops.rs:1297`,
+  `migrate_sealed_to_cpu_batch_async`: the copy, on the thread's own stream,
+  into the pool.
+- New `candle-conversation/src/persistence/warm_pool.rs`: the pinned pool, its
+  sizing and its full-pool rule. `persistence/warm_ledger.rs:27` gives each
+  thread its share.
+- `candle-nn/src/kv_cache/chunked/migrate_flight.rs:131` (`MigrateFlight`,
+  deleted) and `:212` (`HeldChunks`, kept).
+- `candle-conversation/src/persistence/group_cap.rs` and `reserve_log.rs`:
+  deleted.
+
+**8. Documents and comments (§8 step 9).**
+- `docs/kv_drain_under_pressure.md` §2a–§2c and §3.
+- `AGENTS.md`, the "Tiering status" note under the KV cache subsystem, which
+  describes the hot→warm quantize and the pageable warm arenas.
+- `zend/src/turn_claims.rs`: the commit-wait comment.
+
+## 10. Things to be careful of
+
+**Addresses on the device.**
+- A slot stack holds raw arena addresses. Any move of the ground under it
+  invalidates them: a compaction, a vacate (`vacate_epoch`), a frontier or
+  `weight_floor` move (invariant 7). The stack is rebuilt after any of them,
+  and never inferred to be unchanged from the geometry.
+- While a gap is outstanding the host does not know which leased slots it
+  wrote. Compaction and the empty sweep treat the whole lease as held until the
+  catch-up, and never release an arena a lease stands in.
+- A record names its bands by raw address, so it must hold their gids
+  (`meta_pool.rs`). A record filled at the catch-up holds the claimed gids, not
+  the native ones.
+- A `ChunkPin` holds both the bands and the record (`gpu_chunks.rs`). Holding
+  only the first has already cost a night.
+
+**The sequence's layout.**
+- The catch-up replaces a chunk in place. It does not truncate and re-inject:
+  re-injecting shared chunks under a lone sequence has corrupted the decode
+  read before (`batched_inference.rs`, the float-mode comment in
+  `quantize_and_seal_sequences`).
+- The empty writer chunk and any pad after it are not blocks
+  (`drop_empty_tail`). A sealed chunk with room left in it can end up where
+  writes land.
+- A sliding ring drops front tokens (`base_pos`). Block indices, the cursor and
+  positions 0–3 are in absolute positions, not resident ones.
+- A block whose geometry the kernels do not quantize, and a float mode with no
+  policy, give the gap an empty table. Neither is an error.
+
+**Timing and order.**
+- The catch-up runs before anything in the step that seals, snapshots or
+  reprojects, so no new clone is made of a block it is about to replace.
+- Check that a prefill-only step waits for its forward before the next gap. If
+  it does not, the completion word is unset at that gap, the gap quantizes
+  nothing, and natives build up across forwards. §7 gates this at 1%; the
+  `kv_gap` line counts it.
+- The header upload at the catch-up goes through the slot-buffer staging path,
+  which never reads the live host copy and is aware of recorded waves
+  (`gpu_chunks.rs`). No other path writes a slot buffer.
+- A copy stream's wait on `E_gap` needs an event that carries no timing.
+  cudarc's `new_event(None)` already makes one. Events come from a small pool,
+  one per outstanding gap and one per copy in flight.
+- The persistence thread is its substrate's one owner thread. Waiting on a full
+  pool stops its other duties for that substrate, so the wait is bounded by the
+  log append it is waiting for and nothing else.
+
+**Memory on the small cards.**
+- The selection's scratch is held ground. WhiteWorld declined 27 scratch takes
+  in three hours, the largest 113 MB. The table's cut is sized from the scratch
+  actually held, not from a constant.
+- The persistence copy gathers into device staging before the DtoH
+  (`chunk_ops.rs`). That staging is transient VRAM and stays small.
+- The lease never buys ground from the experts. Deferral is the release valve,
+  and a run of deferrals is a finding to log, not a reason to raise the lease.
+- The pinned pool is charged to system commit under WDDM. WhiteWorld already
+  commits 119 of 206 GB.
+
+**Testing and measuring.**
+- An instrument that fences hides exactly what this change is meant to remove.
+  No `synchronize` is added to see what the gap does. The `kv_gap` line and the
+  spans are the instruments.
+- The claim is deterministic by design. A test that needs a retry to get the
+  expected slots has found a bug.
+- The model gates run one model per `cargo` process with the daemon stopped,
+  and the device tests need the card alone.
+- `elevate.rs` keeps its own `device.synchronize()` on the warm→hot path. It is
+  outside this change and will still show in the wave windows.
