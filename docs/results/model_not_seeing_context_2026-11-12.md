@@ -509,6 +509,35 @@ holding the card. And BlackWorld answers 401 to identity headers from
 192.168.1.3, so another member cannot fetch its diag dumps; WhiteWorld's own
 `/v1/logs` returns both members' lines.
 
+**WhiteWorld's code walk and research (later the same day):**
+
+- **The invented prompt is reported on other engines.** Hugging Face
+  discussion `Qwen/Qwen3.8-Flash-Next` #68 describes the model reconstructing
+  an "expert software engineer" instruction and an "always invoke a function
+  call" requirement that were never sent, at about 27.8K tokens, on MLX, vLLM
+  and llama.cpp; #57 and an NVIDIA forum thread report the same. Summarised
+  through a fetch tool and not yet checked against the pages; if it holds, the
+  invented prompt is the checkpoint's (H5), not this engine's.
+- **No defect found in the rotation code:** `yarn_freqs` matches the
+  transformers/vLLM formula (pairs 0–14 kept, 15–21 blended, 22–31 scaled);
+  the m² on Q's rotary pairs alone is equivalent to the reference scaling
+  cos/sin; the factored table, rung selection with its floor, `RotaryLayout`'s
+  permutation, slice rope bases and un-rotated index rows all check out. Not
+  read: most of the tile kernel, the prefill kernel, `indexer.rs`, `wave.rs`,
+  the DeltaNet state, q8a128.
+- **The reference pins no system prompt:** 512 blocks by score plus the tail,
+  nothing else; the indexer was trained at a 256K sequence length.
+- **`min_yarn_factor: 2` departs from the vendor's guidance**, which calls
+  static YaRN "potentially impacting performance on shorter texts" and advises
+  changing rope parameters only when long context is needed; a third-party PR
+  reports 4 of 5 short greedy answers changing with it on. No gate compares x1
+  with x2 inside 262,144, and `docs/progressive_yarn.md` has no Flash-Next row.
+- **Dense is not a neutral control here:** the checkpoint was trained reading
+  at most 2,051 cells a query.
+
+WhiteWorld's suggested order: confirm #68; run the same sub-262K conversation
+at `min_yarn_factor` 1 and 2; then the turn-16 diag below.
+
 **Next test, no rebuild:** the diag of **turn 16** (the first invention, §9.1),
 dense, same forced opening — run A as recorded, run B `without` the three
 `AGENTS.md` chain links, run C also without the journal-entry guidance turns. If
