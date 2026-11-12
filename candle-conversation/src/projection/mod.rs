@@ -204,6 +204,7 @@ mod belief_scan_split;
 mod builder;
 mod chunk_exclusion;
 mod cold_to_warm;
+pub mod dialogue_fill;
 mod error;
 pub mod fill;
 pub(crate) mod event;
