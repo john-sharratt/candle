@@ -104,6 +104,7 @@ use crate::summary_tree::{
     select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
     TurnKind, MERGE_FANOUT,
 };
+use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnRecord, TurnSegment};
 use crate::working_set::{Candidate, Limits, Refusal, WorkingSet};
@@ -3969,6 +3970,26 @@ impl Substrate {
             .get(&timeline)
             .map(|t| t.couplings.clone())
             .unwrap_or_default()
+    }
+
+    /// The exchanges of `timeline`'s `Normal` turns, each its turns in order:
+    /// a head turn and every turn its tool round-trips coupled after it
+    /// ([`exchanges`]). A summary node is in none.
+    pub fn exchanges_of(&self, timeline: TimelineId) -> Vec<Vec<TurnIndex>> {
+        let total = self.turn_count(timeline);
+        let normals: Vec<TurnIndex> = (0..total)
+            .map(TurnIndex)
+            .filter(|idx| {
+                !self
+                    .tree_meta_of(timeline, *idx)
+                    .is_some_and(|m| m.kind.is_summary())
+            })
+            .collect();
+        let couplings = over_normals(&self.couplings_of(timeline), &normals);
+        exchanges(&couplings, normals.len())
+            .into_iter()
+            .map(|r| r.map(|pos| normals[pos]).collect())
+            .collect()
     }
 
     // ── debug_id resume keys ────────────────────────────────────────────────

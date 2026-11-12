@@ -475,13 +475,13 @@ impl Qwen4ExpBatched {
             .collect()
     }
 
-    /// Declare the pieces `seq`'s projection placed, as position ranges in
+    /// Declare the rounds `seq`'s projection placed, as position ranges in
     /// declaration order, replacing any declared before — whose counts are
     /// dropped, so a caller reads them first ([`Self::take_hits`]).
     ///
     /// The ranges become blocks through the sequence's index layout at the
     /// first sampled layer; every layer of a sequence shares one layout.
-    pub fn set_hit_pieces(&self, seq: usize, pieces: &[Range<usize>]) -> Result<()> {
+    pub fn set_hit_rounds(&self, seq: usize, pieces: &[Range<usize>]) -> Result<()> {
         let ratio = self.selecting_ratio()?;
         let map = {
             let idx = self
@@ -3411,8 +3411,8 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Qwen4ExpBatched::set_hit_layers(self, layers)
     }
 
-    fn set_hit_pieces(&self, seq: usize, pieces: &[Range<usize>]) -> Result<()> {
-        Qwen4ExpBatched::set_hit_pieces(self, seq, pieces)
+    fn set_hit_rounds(&self, seq: usize, rounds: &[Range<usize>]) -> Result<()> {
+        Qwen4ExpBatched::set_hit_rounds(self, seq, rounds)
     }
 
     fn take_hits(&self, seq: usize) -> Result<Option<PieceHits>> {

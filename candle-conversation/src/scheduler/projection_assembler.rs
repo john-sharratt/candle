@@ -58,6 +58,7 @@ use crate::projection::{
     ContentResolver, Conversation, GroupId, HitMomentum, MaterializedPiece, Pin, ProjectionSegment,
     ProjectionTarget, Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex, TurnKey,
 };
+use crate::projection::rounds::{self, RoundKey};
 use crate::scheduler::hit_density::HitPart;
 use crate::scheduler::injected_piece::InjectedPiece;
 use candle_transformers::models::decode_diag::PieceSpan;
@@ -121,13 +122,13 @@ pub(super) struct SlotState {
     /// the first piece that differs (`super::piece_identity`). Emptied by an
     /// incomplete assembly, whose slot does not hold what its pieces describe.
     pub(super) placed_pieces: Vec<PlacedPiece>,
-    /// The turns the last assembly declared to the model as hit pieces, in
+    /// The rounds the last assembly declared to the model as hit pieces, in
     /// declaration order — what each count of `take_hits` belongs to
     /// (`docs/hit_driven_projection.md` §6.4).
-    pub(super) hit_keys: Vec<TurnKey>,
-    /// Hit momentum per placed turn, folded at every reprojection — what lifts
-    /// the turns' scores the next projection selects by.
-    pub(super) turn_hits: HitMomentum<TurnKey>,
+    pub(super) hit_keys: Vec<RoundKey>,
+    /// Hit momentum per placed round, folded at every reprojection — what lifts
+    /// the scores the next projection selects by.
+    pub(super) round_hits: HitMomentum<RoundKey>,
     /// What an assembly read back before it declared new pieces, waiting for
     /// the next reprojection to fold it in with its own read — so the counts
     /// a turn's tail ran up are not lost to the next turn's opening.
@@ -138,31 +139,79 @@ pub(super) struct SlotState {
 /// oldest goes.
 const UNREAD_HIT_PARTS: usize = 8;
 
-/// Every placed sealed turn as a hit piece: its key and the positions its
-/// piece took, in slot order. `placed[j]` records `pieces[j]`; pieces past the
-/// records, and turns with no conversation to name them by, are not declared.
-pub(super) fn hit_pieces_of(
+/// Every placed round as a hit piece (`docs/hit_driven_projection.md` §6.4,
+/// §8.1): its key and the positions it took, in slot order. A round is one or
+/// two records — a whole turn placed holds its two, split at its record edge,
+/// and a record placed alone holds one — so the records are found first, then
+/// grouped into the rounds of the exchanges they belong to. `placed[j]`
+/// records `pieces[j]`; pieces past the records, turns with no conversation to
+/// name them by, and a round whose records do not sit together are not
+/// declared.
+pub(super) fn hit_rounds_of(
     pieces: &[AssembledPiece],
     placed: &[PlacedPiece],
-) -> (Vec<TurnKey>, Vec<Range<usize>>) {
-    let mut keys = Vec::new();
-    let mut ranges = Vec::new();
+    conv: &Substrate,
+) -> (Vec<RoundKey>, Vec<Range<usize>>) {
+    let mut records: HashMap<TimelineId, Vec<(TurnIndex, TurnRecord, Range<usize>)>> =
+        HashMap::new();
     for (piece, p) in pieces.iter().zip(placed) {
-        let AssembledPiece::Turn {
-            index,
-            timeline: Some(timeline),
-            ..
-        } = piece
-        else {
-            continue;
-        };
         if p.tokens == 0 {
             continue;
         }
-        keys.push(TurnKey::new(*timeline, *index));
-        ranges.push((p.pos_after - p.tokens) as usize..p.pos_after as usize);
+        let span = (p.pos_after - p.tokens) as usize..p.pos_after as usize;
+        match piece {
+            AssembledPiece::Turn {
+                index,
+                timeline: Some(timeline),
+                ..
+            } => {
+                let Some(edge) = conv
+                    .turn_layout(*timeline, *index)
+                    .and_then(|l| l.user_record_end())
+                    .map(|e| span.start + e as usize)
+                    .filter(|e| *e <= span.end)
+                else {
+                    continue;
+                };
+                let at = records.entry(*timeline).or_default();
+                at.push((*index, TurnRecord::User, span.start..edge));
+                at.push((*index, TurnRecord::Assistant, edge..span.end));
+            }
+            AssembledPiece::TurnHalf {
+                index,
+                timeline: Some(timeline),
+                record,
+                ..
+            } => records
+                .entry(*timeline)
+                .or_default()
+                .push((*index, *record, span)),
+            _ => {}
+        }
     }
-    (keys, ranges)
+    let mut declared: Vec<(RoundKey, Range<usize>)> = Vec::new();
+    for (timeline, placed) in records {
+        for turns in conv.exchanges_of(timeline) {
+            let Some(&head) = turns.first() else {
+                continue;
+            };
+            if !placed.iter().any(|(t, _, _)| turns.contains(t)) {
+                continue;
+            }
+            for (index, span) in rounds::round_spans(&turns, &placed) {
+                declared.push((
+                    RoundKey {
+                        timeline,
+                        head,
+                        index: index as u32,
+                    },
+                    span,
+                ));
+            }
+        }
+    }
+    declared.sort_by_key(|(_, span)| span.start);
+    declared.into_iter().unzip()
 }
 
 impl SlotState {
@@ -351,7 +400,7 @@ impl SlotState {
             // projection; the parent's counts stay the parent's. What the
             // parent's indexer read of the shared history it carries on.
             hit_keys: Vec::new(),
-            turn_hits: self.turn_hits.clone(),
+            round_hits: self.round_hits.clone(),
             unread_hits: Vec::new(),
         }
     }
@@ -1866,8 +1915,11 @@ pub(super) fn apply_segments_build(
         Ok(_) => {}
         Err(e) => tracing::warn!(slot = parent_id.0, error = %e, "hits not read back"),
     }
-    let (hit_keys, hit_ranges) = hit_pieces_of(&pieces, &state.placed_pieces);
-    match ctx.model.set_hit_pieces(parent_id.0, &hit_ranges) {
+    let (hit_keys, hit_ranges) = {
+        let conv = ctx.conversation.read();
+        hit_rounds_of(&pieces, &state.placed_pieces, &conv)
+    };
+    match ctx.model.set_hit_rounds(parent_id.0, &hit_ranges) {
         Ok(()) => state.hit_keys = hit_keys,
         Err(e) => {
             tracing::warn!(

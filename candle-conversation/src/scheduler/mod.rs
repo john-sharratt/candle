@@ -11849,12 +11849,12 @@ impl Scheduler {
                 if let Some(h) = hits {
                     parts.push((state.hit_keys.clone(), h));
                 }
-                // Each placed turn's hit momentum moves, and lifts this
-                // reprojection's scores of the turns it keeps reading
-                // (`docs/hit_driven_projection.md` §7.1).
+                // Each placed round's hit momentum moves, and lifts this
+                // reprojection's scores of the turns whose rounds it keeps
+                // reading (`docs/hit_driven_projection.md` §7.1, §8.1).
                 state
-                    .turn_hits
-                    .fold(hit_density::turn_density(&parts), &schema.hits);
+                    .round_hits
+                    .fold(hit_density::round_density(&parts), &schema.hits);
                 // Reads are credited over the same base the target's lineage
                 // is ranked from, so a turn displaces the lineage only once
                 // its reads pass it (§8.2).
@@ -11877,9 +11877,19 @@ impl Scheduler {
                     .inherited_chain(policy.target.timeline)
                     .into_iter()
                     .collect();
-                projection_scores.lift_turns(state.turn_hits.lifts(&schema.hits), base, |k| {
-                    chain.contains(&k.timeline)
-                });
+                let turn_lifts = {
+                    let read = policy.substrate.read();
+                    let mut exchanges: HashMap<TimelineId, Vec<Vec<TurnIndex>>> = HashMap::new();
+                    hit_density::turn_lifts(state.round_hits.lifts(&schema.hits), |tl, head| {
+                        exchanges
+                            .entry(tl)
+                            .or_insert_with(|| read.exchanges_of(tl))
+                            .iter()
+                            .find(|turns| turns.first() == Some(&head))
+                            .cloned()
+                    })
+                };
+                projection_scores.lift_turns(turn_lifts, base, |k| chain.contains(&k.timeline));
                 hit_density::hit_density(&parts)
             }
             None => HashMap::new(),

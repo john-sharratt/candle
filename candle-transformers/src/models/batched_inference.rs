@@ -5049,11 +5049,11 @@ pub trait ManagedBatchedModel {
         Ok(())
     }
 
-    /// Declare the pieces `seq`'s projection placed, as position ranges in
+    /// Declare the rounds `seq`'s projection placed, as position ranges in
     /// declaration order, so its sampled layers count what their selections
     /// choose of each (`docs/hit_driven_projection.md` §6.4). Replaces any
     /// declared before, dropping their counts.
-    fn set_hit_pieces(&self, _seq: usize, _pieces: &[Range<usize>]) -> Result<()> {
+    fn set_hit_rounds(&self, _seq: usize, _rounds: &[Range<usize>]) -> Result<()> {
         Ok(())
     }
 
