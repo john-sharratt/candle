@@ -52,6 +52,12 @@
 
 use super::ids::{TimelineId, TurnKey};
 use super::schema::SelectionRule;
+#[cfg(test)]
+use super::schema::LINEAGE_BASE;
+
+/// What one step nearer in the ancestry adds to a lineage turn's rank — far
+/// below any score difference that means anything, enough to order ties.
+const LINEAGE_RANK_STEP: f32 = 1e-3;
 
 /// Apply a selection rule to a group's turns.
 ///
@@ -108,9 +114,11 @@ pub fn apply_selection(
         SelectionRule::Sequence {
             recent,
             historical_top_k,
+            lineage_base,
         } => select_conversation(
             *recent,
             *historical_top_k,
+            *lineage_base,
             threshold,
             turns,
             budget_tokens,
@@ -219,34 +227,54 @@ fn select_single(
 
 // ── Sequence ──────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn select_conversation(
     recent: usize,
     historical_top_k: usize,
+    lineage_base: f32,
     threshold: f32,
     turns: &[(TurnKey, f32)],
     budget_tokens: Option<usize>,
     token_counts: &dyn Fn(TurnKey) -> usize,
     own_timeline: Option<TimelineId>,
 ) -> Vec<TurnKey> {
-    // **Inherited turns are inviolate, all the way up the ancestry.**
+    // **Inherited turns are scored from a base, all the way up the ancestry**
+    // (`docs/hit_driven_projection.md` §8.2).
     //
     // A turn on a timeline other than this conversation's own is here because
     // the lineage put it here (`Substrate::inherited_chain` walks `forked_from`
     // recursively, so this covers every ancestor, not just the immediate
-    // parent). That is a structural statement — "this conversation continues
-    // those" — not a retrieval guess, so it must not be re-litigated by score.
+    // parent). It is never ranked below `lineage_base`, so it does not age out
+    // with the oldest history — `*s > 0.0` would drop an unscored turn
+    // outright, and a conversation would forget the documents it was founded
+    // on part-way through. But it is not exempt: when the window runs short it
+    // is trimmed with the history, lowest first, and a turn the model keeps
+    // reading — whose score its hits have lifted — outlasts one it does not.
     //
-    // Without this they age out: they sort oldest-first, so once the
-    // conversation passes `recent` turns they fall into the historical pool,
-    // where `*s > 0.0` drops an unscored turn outright. A conversation would
-    // silently forget the documents it was founded on, part-way through.
-    //
-    // The count is bounded by `Substrate::INHERITED_CHAIN_TOKEN_CAP`, which is
-    // what keeps "never dropped" from being "unbounded".
+    // The count is bounded by `Substrate::INHERITED_CHAIN_TOKEN_CAP`.
     let (inherited, own): (Vec<(TurnKey, f32)>, Vec<(TurnKey, f32)>) = match own_timeline {
         Some(own_tl) => turns.iter().partition(|(key, _)| key.timeline != own_tl),
         None => (Vec::new(), turns.to_vec()),
     };
+    // Ties at the base would trim by key, last first — the nearest ancestor
+    // and every document's tail. A whisker per ancestor, nearest highest,
+    // makes the trim take the oldest ancestor first and whole, as the chain's
+    // cap does (`Substrate::inherited_chain`). The turns arrive in the chain's
+    // order, oldest ancestor first, so an ancestor's rank is the order it
+    // first appears in — never an assumption about how its id was minted.
+    let mut ancestors: Vec<TimelineId> = Vec::new();
+    for (k, _) in &inherited {
+        if !ancestors.contains(&k.timeline) {
+            ancestors.push(k.timeline);
+        }
+    }
+    let inherited: Vec<(TurnKey, f32)> = inherited
+        .into_iter()
+        .map(|(k, s)| {
+            let rank = ancestors.iter().position(|&t| t == k.timeline).unwrap_or(0) as f32;
+            (k, s.max(lineage_base) + rank * LINEAGE_RANK_STEP)
+        })
+        .collect();
     let turns: &[(TurnKey, f32)] = &own;
 
     // Split: the last `recent` turns hold their seats regardless of score.
@@ -259,11 +287,11 @@ fn select_conversation(
     // ~15.6k tokens each — whole drafts and the table's verdicts on them — so
     // `recent: 16` under a 16k window projected ~170k tokens, 16 GB of hot K/V,
     // and image draws were refused beside it. The newest turn stays whatever it
-    // costs: it is the exchange the conversation is in. The lineage is charged
-    // first; it is bounded by its own cap, not by this.
+    // costs: it is the exchange the conversation is in. The recent window is
+    // charged first; the lineage competes with the history for what is left.
     let inviolate: Vec<(TurnKey, f32)> = match budget_tokens {
         Some(budget) => {
-            let mut spent: usize = inherited.iter().map(|(idx, _)| token_counts(*idx)).sum();
+            let mut spent: usize = 0;
             let mut kept: Vec<(TurnKey, f32)> = Vec::new();
             for (i, &(key, score)) in recent_turns.iter().enumerate().rev() {
                 let cost = token_counts(key);
@@ -296,15 +324,14 @@ fn select_conversation(
             .then(a.0.cmp(&b.0))
     });
     historical.truncate(historical_top_k);
+    // The lineage joins the history beside the top-k, never counted against
+    // it: it is the conversation's founding, not a recall.
+    historical.extend(inherited);
 
-    // Budget pass: trim historical (lowest-scored first) to what the recent
-    // window and the inherited lineage leave.
+    // Budget pass: trim the history and the lineage (lowest-scored first) to
+    // what the recent window leaves.
     if let Some(budget) = budget_tokens {
-        let kept_tokens: usize = inviolate
-            .iter()
-            .chain(inherited.iter())
-            .map(|(idx, _)| token_counts(*idx))
-            .sum();
+        let kept_tokens: usize = inviolate.iter().map(|(idx, _)| token_counts(*idx)).sum();
         let remaining = budget.saturating_sub(kept_tokens);
         trim_to_budget_low_score_first(&mut historical, remaining, token_counts);
     }
@@ -314,7 +341,6 @@ fn select_conversation(
         .iter()
         .map(|(idx, _)| *idx)
         .chain(inviolate.iter().map(|(idx, _)| *idx))
-        .chain(inherited.iter().map(|(idx, _)| *idx))
         .collect();
     selected.sort();
     selected
@@ -386,6 +412,7 @@ mod tests {
             &SelectionRule::Sequence {
                 recent: 2,
                 historical_top_k: 0,
+                lineage_base: LINEAGE_BASE,
             },
             0.0,
             &turns,
@@ -400,10 +427,10 @@ mod tests {
         assert!(r.contains(&t(2)) && r.contains(&t(3)), "recent window kept");
     }
 
-    /// Recursive: every ancestor in the lineage is inviolate, not just the
-    /// nearest one.
+    /// Recursive: every ancestor in the lineage is ranked from the base, not
+    /// just the nearest one.
     #[test]
-    fn every_ancestor_in_the_lineage_is_inviolate() {
+    fn every_ancestor_in_the_lineage_is_kept_from_the_base() {
         let turns = vec![
             (anc(7, 0), 0.0),
             (anc(8, 0), 0.0),
@@ -415,6 +442,7 @@ mod tests {
             &SelectionRule::Sequence {
                 recent: 1,
                 historical_top_k: 0,
+                lineage_base: LINEAGE_BASE,
             },
             0.0,
             &turns,
@@ -427,7 +455,57 @@ mod tests {
         }
     }
 
-    /// The budget trims the historical pool, never the lineage.
+    /// **The lineage gives way only to what outscores its base**: with room
+    /// for one more turn beside the recent window, a history turn whose score
+    /// (lifted by the model's own hits) passes the base takes the seat, and
+    /// the lineage keeps it against anything below.
+    #[test]
+    fn the_lineage_gives_way_only_to_a_stronger_turn() {
+        let rule = SelectionRule::Sequence {
+            recent: 1,
+            historical_top_k: 8,
+            lineage_base: LINEAGE_BASE,
+        };
+        let turns = vec![(anc(9, 0), 0.0), (t(0), 2_400.0), (t(1), 0.9)];
+        let r = apply_selection(&rule, 0.0, &turns, Some(20), &tc, Some(own()));
+        assert_eq!(
+            r,
+            vec![t(0), t(1)],
+            "the stronger turn takes the seat: {r:?}"
+        );
+        let turns = vec![(anc(9, 0), 0.0), (t(0), 600.0), (t(1), 0.9)];
+        let r = apply_selection(&rule, 0.0, &turns, Some(20), &tc, Some(own()));
+        assert!(r.contains(&anc(9, 0)) && !r.contains(&t(0)), "{r:?}");
+    }
+
+    /// **A tight budget gives up the oldest ancestor first, and whole**: three
+    /// unscored ancestors of two turns each, room for two of them beside the
+    /// recent turn, keep the two nearest.
+    #[test]
+    fn a_tight_budget_drops_the_oldest_ancestor_whole() {
+        let turns = vec![
+            (anc(7, 0), 0.0),
+            (anc(7, 1), 0.0),
+            (anc(8, 0), 0.0),
+            (anc(8, 1), 0.0),
+            (anc(9, 0), 0.0),
+            (anc(9, 1), 0.0),
+            (t(0), 0.9),
+        ];
+        let rule = SelectionRule::Sequence {
+            recent: 1,
+            historical_top_k: 0,
+            lineage_base: LINEAGE_BASE,
+        };
+        let r = apply_selection(&rule, 0.0, &turns, Some(50), &tc, Some(own()));
+        assert_eq!(
+            r,
+            vec![t(0), anc(8, 0), anc(8, 1), anc(9, 0), anc(9, 1)],
+            "{r:?}"
+        );
+    }
+
+    /// The budget trims the history below the base before the lineage.
     #[test]
     fn a_tight_budget_trims_history_before_touching_the_lineage() {
         let turns = vec![(anc(9, 0), 0.0), (t(0), 0.4), (t(1), 0.5), (t(2), 0.9)];
@@ -435,6 +513,7 @@ mod tests {
             &SelectionRule::Sequence {
                 recent: 1,
                 historical_top_k: 8,
+                lineage_base: LINEAGE_BASE,
             },
             0.0,
             &turns,
@@ -456,6 +535,7 @@ mod tests {
         let rule = SelectionRule::Sequence {
             recent: 4,
             historical_top_k: 0,
+            lineage_base: LINEAGE_BASE,
         };
         // Room for two of the 10-token turns.
         let r = apply_selection(&rule, 0.0, &turns, Some(25), &tc, Some(own()));
@@ -475,6 +555,7 @@ mod tests {
             &SelectionRule::Sequence {
                 recent: 1,
                 historical_top_k: 0,
+                lineage_base: LINEAGE_BASE,
             },
             0.0,
             &turns,
@@ -546,6 +627,7 @@ mod tests {
         let rule = SelectionRule::Sequence {
             recent: 1,
             historical_top_k: 2,
+            lineage_base: LINEAGE_BASE,
         };
         let r = apply_selection(&rule, 0.0, &turns, None, &tc, None);
         assert_eq!(
@@ -637,6 +719,7 @@ mod tests {
         let rule = SelectionRule::Sequence {
             recent: 2,
             historical_top_k: 1,
+            lineage_base: LINEAGE_BASE,
         };
         let r = apply_selection(&rule, 0.5, &turns, None, &tc, None);
         // t(0) below threshold, t(1) top-1 historical, t(2)+t(3) inviolate
@@ -654,6 +737,7 @@ mod tests {
         let rule = SelectionRule::Sequence {
             recent: 2,
             historical_top_k: 2,
+            lineage_base: LINEAGE_BASE,
         };
         // 4 * 10 = 40; budget 30; inviolate = 20; remaining for historical = 10
         // historical: t(0) 10 tokens fits, t(1) would be 20 total → drop t(1)
@@ -668,6 +752,7 @@ mod tests {
         let rule = SelectionRule::Sequence {
             recent: 2,
             historical_top_k: 1,
+            lineage_base: LINEAGE_BASE,
         };
         let r = apply_selection(&rule, 0.0, &turns, Some(5), &tc, None);
         assert_eq!(r, vec![t(1)]);
@@ -684,6 +769,7 @@ mod tests {
         let rule = SelectionRule::Sequence {
             recent: 2,
             historical_top_k: 2,
+            lineage_base: LINEAGE_BASE,
         };
         let r = apply_selection(&rule, 0.0, &turns, None, &tc, None);
         // Must be insertion order: t(0), t(1), t(2), t(3)

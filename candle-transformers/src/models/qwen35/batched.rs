@@ -397,13 +397,6 @@ impl HybridBatched {
         Ok(())
     }
 
-    /// Run no sequence on a rung whose YaRN factor is below `min`
-    /// ([`RopeRungs::with_min_factor`]). Set before any session opens.
-    pub fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
-        self.rope = self.rope.clone().with_min_factor(min)?;
-        Ok(())
-    }
-
     /// Let the elastic boundary grow into ground the weight side is no longer
     /// using. Legal only between forwards, which is where phase 0 calls it.
     pub fn reclaim_spare_ground(&self) {

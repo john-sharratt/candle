@@ -233,6 +233,7 @@ pub mod routing_capture;
 // DynamicActs, paged attention), so it is gated on cuda like those modules.
 #[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
 pub mod batch_test;
+pub mod hit_layers;
 pub mod recurrent_gemma;
 pub mod repvgg;
 pub mod resnet;

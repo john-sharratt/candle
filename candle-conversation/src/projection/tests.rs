@@ -13,7 +13,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::builder::{Builder, PLAIN_PROMPT_GROUP};
 use super::error::ConstructionError;
+use super::hits::HitsConfig;
 use super::ids::{GroupId, LayerId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
+use super::pins::Pin;
 use super::project::{
     OptionalState, ProjectionMode, ProjectionTarget, SelectionState, TOOL_ROUND_SELECTOR,
 };
@@ -430,29 +432,65 @@ fn tool_calls_keep_their_penalties_unless_the_schema_asks_otherwise() {
     assert!(built.schema().free_tool_calls_from_penalties);
 }
 
-/// `rope: min_yarn_factor:` reaches the schema; a schema that says nothing
-/// floors no rung, and a factor under 1 is refused at parse.
+/// `hits:` reaches the schema field by field, a block left out is the
+/// default, and a block the counting cannot run is refused at parse.
 #[test]
-fn rope_min_yarn_factor_parses_and_is_validated() {
+fn the_hits_block_parses_and_is_validated() {
     let quiet = Builder::from_yaml(SIMPLE_YAML).unwrap();
-    assert_eq!(quiet.schema().min_yarn_factor, None);
+    assert_eq!(quiet.schema().hits, HitsConfig::default());
 
-    let floored =
-        Builder::from_yaml(&format!("rope:\n  min_yarn_factor: 2\n{SIMPLE_YAML}")).unwrap();
-    assert_eq!(floored.schema().min_yarn_factor, Some(2.0));
+    let set = Builder::from_yaml(&format!(
+        "hits:\n  layers: [50]\n  gain: 2.5\n{SIMPLE_YAML}"
+    ))
+    .unwrap();
+    assert_eq!(set.schema().hits.layers.percentiles(), &[50]);
+    assert_eq!(set.schema().hits.gain, 2.5);
+    assert_eq!(set.schema().hits.beta, 0.2, "the default leak");
 
-    for bad in ["0.5", ".nan"] {
-        let err = Builder::from_yaml(&format!("rope:\n  min_yarn_factor: {bad}\n{SIMPLE_YAML}"))
+    for bad in [
+        "layers: []",
+        "layers: [120]",
+        "gain: -1",
+        "beta: 0",
+        "beta: 2",
+    ] {
+        let err = Builder::from_yaml(&format!("hits:\n  {bad}\n{SIMPLE_YAML}"))
             .err()
             .unwrap();
         assert!(
-            matches!(err, ConstructionError::InvalidMinYarnFactor(_)),
+            matches!(err, ConstructionError::InvalidHits(_)),
             "{bad}: {err}"
         );
     }
+    let unknown = Builder::from_yaml(&format!("hits:\n  gian: 2\n{SIMPLE_YAML}"));
+    assert!(unknown.is_err(), "a misspelt hits key must not be ignored");
+}
 
-    let unknown = Builder::from_yaml(&format!("rope:\n  min_yarn: 2\n{SIMPLE_YAML}"));
-    assert!(unknown.is_err(), "a misspelt rope key must not be ignored");
+/// An item flagged `pin: true` is pinned and an unflagged one is not; flags
+/// with no `pin_tokens` to hold them are refused.
+#[test]
+fn system_prompt_items_are_pinned_by_their_flag() {
+    const PROMPT: &str = "system_prompt:\n  sections:\n    - id: frame\n      content: \"You are a helpful assistant.\"\n    - id: values\n      content: \"Be honest.\"\n";
+    assert!(SIMPLE_YAML.contains(PROMPT), "the fixture's prompt block");
+    let with = |prompt: &str| SIMPLE_YAML.replacen(PROMPT, prompt, 1);
+    let quiet = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    assert!(quiet.schema().system_prompt.pins.is_empty());
+
+    let flagged = |bound: &str| {
+        format!(
+            "system_prompt:\n{bound}  items:\n    - kind: section\n      id: frame\n      pin: true\n      content: \"You are a helpful assistant.\"\n    - kind: section\n      id: values\n      content: \"Be honest.\"\n"
+        )
+    };
+    let pinned = Builder::from_yaml(&with(&flagged("  pin_tokens: 64\n"))).unwrap();
+    let sp = &pinned.schema().system_prompt;
+    let frame = pinned.id_for_system_section("frame").unwrap();
+    let values = pinned.id_for_system_section("values").unwrap();
+    assert_eq!(sp.pins.tokens, 64);
+    assert_eq!(sp.pins.pin_of(sp, frame), Pin::Whole);
+    assert_eq!(sp.pins.pin_of(sp, values), Pin::No, "unflagged, unpinned");
+
+    let unbounded = Builder::from_yaml(&with(&flagged("")));
+    assert!(matches!(unbounded, Err(ConstructionError::InvalidPins(_))));
 }
 
 #[test]

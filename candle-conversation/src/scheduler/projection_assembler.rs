@@ -34,6 +34,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::Hasher;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -54,9 +55,10 @@ use crate::index_pages::{self, StoredPages};
 use crate::persistence::content_hash::turn_stream_id;
 use crate::projection::event::{group_name_of, layer_name_of_group, role_str};
 use crate::projection::{
-    ContentResolver, Conversation, GroupId, MaterializedPiece, ProjectionSegment, ProjectionTarget,
-    Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex, TurnKey,
+    ContentResolver, Conversation, GroupId, HitMomentum, MaterializedPiece, Pin, ProjectionSegment,
+    ProjectionTarget, Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex, TurnKey,
 };
+use crate::scheduler::hit_density::HitPart;
 use crate::scheduler::injected_piece::InjectedPiece;
 use candle_transformers::models::decode_diag::PieceSpan;
 
@@ -118,6 +120,48 @@ pub(super) struct SlotState {
     /// the first piece that differs (`super::piece_identity`). Emptied by an
     /// incomplete assembly, whose slot does not hold what its pieces describe.
     pub(super) placed_pieces: Vec<PlacedPiece>,
+    /// The turns the last assembly declared to the model as hit pieces, in
+    /// declaration order — what each count of `take_hits` belongs to
+    /// (`docs/hit_driven_projection.md` §6.4).
+    pub(super) hit_keys: Vec<TurnKey>,
+    /// Hit momentum per placed turn, folded at every reprojection — what lifts
+    /// the turns' scores the next projection selects by.
+    pub(super) turn_hits: HitMomentum<TurnKey>,
+    /// What an assembly read back before it declared new pieces, waiting for
+    /// the next reprojection to fold it in with its own read — so the counts
+    /// a turn's tail ran up are not lost to the next turn's opening.
+    pub(super) unread_hits: Vec<HitPart>,
+}
+
+/// The most read-back parts a slot keeps between reprojections; past it the
+/// oldest goes.
+const UNREAD_HIT_PARTS: usize = 8;
+
+/// Every placed sealed turn as a hit piece: its key and the positions its
+/// piece took, in slot order. `placed[j]` records `pieces[j]`; pieces past the
+/// records, and turns with no conversation to name them by, are not declared.
+pub(super) fn hit_pieces_of(
+    pieces: &[AssembledPiece],
+    placed: &[PlacedPiece],
+) -> (Vec<TurnKey>, Vec<Range<usize>>) {
+    let mut keys = Vec::new();
+    let mut ranges = Vec::new();
+    for (piece, p) in pieces.iter().zip(placed) {
+        let AssembledPiece::Turn {
+            index,
+            timeline: Some(timeline),
+            ..
+        } = piece
+        else {
+            continue;
+        };
+        if p.tokens == 0 {
+            continue;
+        }
+        keys.push(TurnKey::new(*timeline, *index));
+        ranges.push((p.pos_after - p.tokens) as usize..p.pos_after as usize);
+    }
+    (keys, ranges)
 }
 
 impl SlotState {
@@ -236,6 +280,59 @@ fn prompt_end_of(pieces: &[AssembledPiece], placed: &[PlacedPiece]) -> u32 {
     }
 }
 
+/// The position ranges of the pinned sections in a slot `placed` describes:
+/// each section segment `segments` marks pinned, at the place its piece took.
+///
+/// Section pieces appear in `pieces` in the order their segments appear in
+/// `segments`, so the two walk together; `placed[j]` records `pieces[j]` for
+/// every piece before the deferred user message, which no section follows.
+/// Adjacent ranges merge.
+fn pin_ranges_of(
+    segments: &[ProjectionSegment],
+    pieces: &[AssembledPiece],
+    placed: &[PlacedPiece],
+) -> Vec<Range<usize>> {
+    let marks: Vec<Pin> = segments
+        .iter()
+        .filter_map(|s| match s {
+            ProjectionSegment::Sealed(SealedKind::Section(r)) => Some(r.pin),
+            _ => None,
+        })
+        .collect();
+    let section_pieces = pieces
+        .iter()
+        .filter(|p| matches!(p, AssembledPiece::Section(_)))
+        .count();
+    // The walk pairs the two lists in order; were they ever to disagree, the
+    // pins would land on other sections, so none is declared instead.
+    if marks.len() != section_pieces {
+        tracing::warn!(
+            segments = marks.len(),
+            pieces = section_pieces,
+            "section segments and pieces disagree: no ranges pinned this projection"
+        );
+        return Vec::new();
+    }
+    let mut pins = marks.into_iter();
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for (j, piece) in pieces.iter().enumerate() {
+        if !matches!(piece, AssembledPiece::Section(_)) {
+            continue;
+        }
+        let Some(pin) = pins.next() else { break };
+        let Some(p) = placed.get(j) else { break };
+        if pin == Pin::No || p.tokens == 0 {
+            continue;
+        }
+        let range = (p.pos_after - p.tokens) as usize..p.pos_after as usize;
+        match out.last_mut() {
+            Some(last) if last.end == range.start => last.end = range.end,
+            _ => out.push(range),
+        }
+    }
+    out
+}
+
 impl SlotState {
     /// What a fork of this slot starts its projections from: the record of the
     /// pieces placed and the glue cache, so the fork's rebuild keeps the shared
@@ -249,6 +346,12 @@ impl SlotState {
             glue_generation: self.glue_generation,
             placed: self.placed,
             placed_pieces: self.placed_pieces.clone(),
+            // A fork's model sequence declares its own pieces at its first
+            // projection; the parent's counts stay the parent's. What the
+            // parent's indexer read of the shared history it carries on.
+            hit_keys: Vec::new(),
+            turn_hits: self.turn_hits.clone(),
+            unread_hits: Vec::new(),
         }
     }
 
@@ -1701,6 +1804,66 @@ pub(super) fn apply_segments_build(
     ctx.model
         .set_selection_prompt(parent_id.0, prompt_end as usize)
         .map_err(ConversationError::Model)?;
+    // The pinned sections' places, which every selecting query attends whole
+    // (`docs/hit_driven_projection.md` §5) — declared from the same records,
+    // so they describe the layout the pages do.
+    let pins = pin_ranges_of(new_segments, &pieces, &state.placed_pieces);
+    ctx.model
+        .set_selection_pins(parent_id.0, &pins)
+        .map_err(ConversationError::Model)?;
+    // The placed turns, declared so the sampled layers count what the model's
+    // own selection reads of each until the next reprojection reads them back.
+    // The slot is sized to the trained window, but the system prompt is not
+    // counted where the shares are checked: a prompt past their margin takes
+    // the slot past it, and the rung schedule changes every position's
+    // rotation (`docs/hit_driven_projection.md` §4, §5).
+    let reach = state
+        .placed_pieces
+        .last()
+        .map_or(0, |p| p.pos_after as usize);
+    let trained = ctx
+        .model
+        .rope_select()
+        .ceilings()
+        .first()
+        .copied()
+        .unwrap_or(usize::MAX);
+    if reach > trained {
+        tracing::warn!(
+            slot = parent_id.0,
+            reach,
+            trained,
+            "projection placed past the trained window: the slot leaves the trained RoPE"
+        );
+    }
+    // Hits only advise the scoring, so a declaration that fails costs this
+    // stride its counts and nothing else. What the old pieces ran up since the
+    // last read is read back first and kept for the next reprojection.
+    match ctx.model.take_hits(parent_id.0) {
+        Ok(Some(h)) if h.queries > 0 && !state.hit_keys.is_empty() => {
+            state
+                .unread_hits
+                .push((std::mem::take(&mut state.hit_keys), h));
+            if state.unread_hits.len() > UNREAD_HIT_PARTS {
+                state.unread_hits.remove(0);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(slot = parent_id.0, error = %e, "hits not read back"),
+    }
+    let (hit_keys, hit_ranges) = hit_pieces_of(&pieces, &state.placed_pieces);
+    match ctx.model.set_hit_pieces(parent_id.0, &hit_ranges) {
+        Ok(()) => state.hit_keys = hit_keys,
+        Err(e) => {
+            tracing::warn!(
+                slot = parent_id.0,
+                pieces = hit_ranges.len(),
+                error = %e,
+                "hit pieces not declared: this stride counts no hits"
+            );
+            state.hit_keys.clear();
+        }
+    }
     prompt_span.end();
 
     let complete = walker.skipped_turns == 0 && walker.skipped_sections == 0;
@@ -3384,7 +3547,8 @@ fn log_placed_tokens(ctx: &mut ApplyContext<'_>, walker: &mut SegmentWalker, tok
 mod tests {
     use super::*;
     use crate::projection::{
-        GroupId, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId, WorkingSetShare,
+        GroupId, HitsConfig, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId,
+        WorkingSetShare,
     };
     use crate::working_set::Limits;
     use std::num::NonZeroUsize;
@@ -3545,6 +3709,8 @@ layers:
         sub.working_set_observe(
             dialogue,
             &HashMap::from([(other, 500.0)]),
+            &HashMap::new(),
+            &HitsConfig::default(),
             0.2,
             100.0,
             limits,
@@ -3623,9 +3789,9 @@ layers:
     }
 
     fn section_seg(id: u32) -> ProjectionSegment {
-        ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection {
-            id: SectionId::new(id),
-        }))
+        ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(SectionId::new(
+            id,
+        ))))
     }
 
     fn turn_seg(layer: u32, group: u32, index: u32) -> ProjectionSegment {
@@ -3773,6 +3939,59 @@ layers:
         // A projection that opens on a turn holds no prompt.
         let opens_on_a_turn = assemble_pieces(&[turn_seg(1, 2, 3), section_seg(9)]);
         assert_eq!(prompt_end_of(&opens_on_a_turn, &placed_at(&[200, 400])), 0);
+    }
+
+    /// **The pinned sections' places are the ranges the model attends whole**:
+    /// each marked section at the place its piece took, glue and unmarked
+    /// sections left out, and adjacent pinned sections merged into one range.
+    #[test]
+    fn the_pinned_sections_become_position_ranges() {
+        let placed = |ends: &[(u32, u32)]| -> Vec<PlacedPiece> {
+            ends.iter()
+                .map(|&(tokens, pos_after)| PlacedPiece {
+                    tokens,
+                    pos_after,
+                    ..PlacedPiece::ending_at(0)
+                })
+                .collect()
+        };
+        let pinned = |id: u32, pin: Pin| {
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection {
+                id: SectionId::new(id),
+                pin,
+            }))
+        };
+        let segments = vec![
+            generated_seg("open", 0, &[1, 2]),
+            pinned(7, Pin::Whole),
+            pinned(8, Pin::No),
+            pinned(9, Pin::Member),
+            pinned(10, Pin::Member),
+            generated_seg("glue", 0, &[3]),
+            pinned(11, Pin::Whole),
+            turn_seg(1, 2, 3),
+        ];
+        let pieces = assemble_pieces(&segments);
+        // open 0..2, s7 2..302, s8 302..5302, s9 5302..5402, s10 5402..5502,
+        // glue 5502..5503, s11 5503..5603, then the turn.
+        let records = placed(&[
+            (2, 2),
+            (300, 302),
+            (5000, 5302),
+            (100, 5402),
+            (100, 5502),
+            (1, 5503),
+            (100, 5603),
+            (40, 5643),
+        ]);
+        assert_eq!(
+            pin_ranges_of(&segments, &pieces, &records),
+            vec![2..302, 5302..5502, 5503..5603]
+        );
+        // Nothing marked, nothing pinned.
+        let plain = vec![section_seg(7), section_seg(8)];
+        let pieces = assemble_pieces(&plain);
+        assert!(pin_ranges_of(&plain, &pieces, &placed(&[(5, 5), (5, 10)])).is_empty());
     }
 
     /// **A sealed turn emits alone, and consecutive turns share no island.**

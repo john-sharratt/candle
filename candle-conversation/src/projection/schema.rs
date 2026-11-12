@@ -58,7 +58,9 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use super::adaptive::{AnchorConfig, BudgetAdaptive, LocalityConfig, MemberBudgetAdaptive};
+use super::hits::HitsConfig;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
+use super::pins::PinSet;
 use super::policy::{PolicyConfig, SelectionPolicy};
 use crate::summary_tree::scope::Scope;
 use crate::working_set::WorkingSetConfig;
@@ -86,6 +88,9 @@ pub struct SystemPromptSchema {
     /// In declaration order — interleaves single sections with
     /// collections.
     pub items: Vec<SystemPromptItem>,
+    /// The items every selecting query attends whole, and how many positions
+    /// they may cover (`pin: true` on the items, `pin_tokens:`).
+    pub pins: PinSet,
 }
 
 impl SystemPromptSchema {
@@ -1345,6 +1350,10 @@ impl Default for Budget {
     }
 }
 
+/// The score an inherited lineage turn is never ranked below — one
+/// full-strength hit, the top of the normalized band a reprojection scores on.
+pub const LINEAGE_BASE: f32 = 1000.0;
+
 /// Which turns from a group survive into the projection.
 ///
 /// # Decision tree
@@ -1419,9 +1428,16 @@ pub enum SelectionRule {
     ///                   historical          recent
     ///                  (top-K by score)   (inviolate, last `recent`)
     /// ```
+    ///
+    /// The lineage a conversation inherited — its ancestors' turns, the
+    /// priming chain — is scored like any history, from a base of
+    /// `lineage_base` (`docs/hit_driven_projection.md` §8.2): it holds its
+    /// seats while nothing outscores it and gives way to what does when the
+    /// window runs short.
     Sequence {
         recent: usize,
         historical_top_k: usize,
+        lineage_base: f32,
     },
 
     /// A turn group of whole ingest conversations sized by the projection
@@ -1552,13 +1568,9 @@ pub struct Schema {
     /// Off by default: the penalties a caller configured are the ones it gets.
     /// A schema that needs verbatim arguments asks for the exemption by name.
     pub free_tool_calls_from_penalties: bool,
-    /// The lowest progressive-YaRN factor any sequence runs at (`rope:
-    /// min_yarn_factor:`). With `2`, even a short sequence runs on the first
-    /// rung scaling by at least ×2 rather than on the trained RoPE. `None` lets
-    /// each sequence take the lowest rung its reach allows. Applied when the
-    /// model loads (`ModelBuilder::min_rope_factor`), which refuses a factor
-    /// that no rung of the model's schedule reaches.
-    pub min_yarn_factor: Option<f32>,
+    /// How a selecting model's hits are counted and how they move a placed
+    /// piece's score (`hits:`, [`HitsConfig`]).
+    pub hits: HitsConfig,
     /// A projection held to the target's own conversation: the system prompt,
     /// the target group's turns, and from every other layer only the
     /// working-set members the conversation was *served* — the locked ones,

@@ -3729,7 +3729,7 @@ mod tests {
             file: file.into(),
             weights: [weights; 32],
             tokenizer: [0; 32],
-            rope: "file-stated min=none".into(),
+            rope: "file-stated".into(),
         }
     }
 

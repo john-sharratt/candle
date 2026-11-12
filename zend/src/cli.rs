@@ -285,6 +285,7 @@ impl ZendArgs {
             window: self.qsa_window,
             recent: self.qsa_recent,
             mode: self.qsa_recent_mode,
+            pinned: 0,
         }
     }
 
@@ -400,20 +401,14 @@ mod tests {
     }
 
     /// **What zend asks without loading is what its load asks.** A host
-    /// running npcd alone seats these in zend's place; the RoPE floor among
-    /// them is part of the model key of every substrate written beside zend, so
-    /// an engine built without it refuses them.
+    /// running npcd alone seats these in zend's place, so its engine is the one
+    /// built beside zend.
     #[test]
-    fn the_engine_requests_carry_zends_floor_and_turn() {
+    fn the_engine_requests_carry_zends_turn_and_thinking() {
         let dir = tempfile::tempdir().unwrap();
         let asks = parse(&["--working-dir", dir.path().to_str().unwrap()])
             .engine_requests()
             .unwrap();
-        assert_eq!(
-            asks.min_rope_factor,
-            Some(2.0),
-            "the bundled schema's floor"
-        );
         assert_eq!(asks.max_response_tokens, MAX_TURN_TOKENS);
         assert_eq!(asks.thinking, Some(true));
     }
@@ -448,17 +443,19 @@ mod tests {
         assert!(Cli::try_parse_from(["zend", "--max-depth", "0"]).is_err());
     }
 
-    /// With no `--qsa-*` flags zend runs the measured default — 128K windows
-    /// and an 8K recent candidate; `0` and `0` is the checkpoint's own
-    /// selection, and each flag replaces its own part.
+    /// With no `--qsa-*` flags zend runs the default — trained-window windows
+    /// and an 8K recent candidate, so a slot inside the trained window is one
+    /// ranking; `0` and `0` is the checkpoint's own selection, and each flag
+    /// replaces its own part. The pinned bound is the schema's, not a flag's.
     #[test]
-    fn the_qsa_flags_default_to_the_measured_strata() {
+    fn the_qsa_flags_default_to_the_trained_window_strata() {
         assert_eq!(
             parse(&[]).qsa_strata(),
             StrataTokens {
-                window: 131_072,
+                window: 262_144,
                 recent: 8192,
                 mode: Recent::Candidate,
+                pinned: 0,
             }
         );
         assert_eq!(
@@ -471,6 +468,7 @@ mod tests {
                 window: 65_536,
                 recent: 8192,
                 mode: Recent::Forced,
+                pinned: 0,
             }
         );
         assert!(Cli::try_parse_from(["zend", "--qsa-recent-mode", "sometimes"]).is_err());

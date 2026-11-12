@@ -53,6 +53,8 @@ layers:
       min_momentum: 100
       max_file_tokens: 800
       release_on: [write]
+      slot_tokens: 4000
+      reserve_tokens: 500
     budget:
       priority: 100
     groups:

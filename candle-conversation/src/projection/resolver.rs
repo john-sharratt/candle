@@ -1507,11 +1507,17 @@ impl Conversation {
     /// (`docs/zend_working_set.md` §4.3). `candidates` is what
     /// [`Self::score_beliefs`] returned; a target whose layer declares no
     /// working set learns nothing.
+    ///
+    /// `hit_density` is each conversation's hit density over the stride since
+    /// the last reprojection — what the model's indexer read of it
+    /// (`docs/hit_driven_projection.md` §6.4); it lifts the momentum every
+    /// judgment of this reprojection weighs.
     pub fn observe_working_set(
         &self,
         schema: &Schema,
         target: ProjectionTarget,
         candidates: &[(GroupId, Vec<(TurnKey, f32)>)],
+        hit_density: &HashMap<TimelineId, f32>,
     ) {
         let Some(cfg) = working_set_config(schema, target) else {
             return;
@@ -1534,6 +1540,8 @@ impl Conversation {
             s.working_set_observe(
                 target.timeline,
                 &fresh,
+                hit_density,
+                &schema.hits,
                 cfg.beta,
                 cfg.min_momentum,
                 cfg.limits(),

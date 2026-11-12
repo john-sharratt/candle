@@ -92,7 +92,7 @@ use crate::persistence::tombstone_expiry::Expired;
 use crate::persistence::walker::WalkEntry;
 use crate::projection::scan_stats::GroupScan;
 use crate::projection::{
-    decode_events, CorruptTurnPolicy, GroupId, LayerId, OwnedSection, OwnedSections,
+    decode_events, CorruptTurnPolicy, GroupId, HitsConfig, LayerId, OwnedSection, OwnedSections,
     ProjectionEvent, ProjectionTarget, SectionId, SystemItem, TimelineAllocator, TimelineId,
     TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
 };
@@ -860,6 +860,34 @@ impl ProjectionScores {
     /// Number of scored turns.
     pub fn turn_count(&self) -> usize {
         self.turns.len()
+    }
+
+    /// Lift each turn among `lifts` by its factor `1 + gain · h` — a turn the
+    /// model's own selection keeps reading (`docs/hit_driven_projection.md`
+    /// §7.1). A scored turn is multiplied, `score · (1 + gain · h)`. A turn this
+    /// scan did not score, and that `credit` admits — the conversation's own
+    /// turns and its lineage, which share the lineage's scale — is given what
+    /// its reads alone are worth over a base of `base`, `base · gain · h`: a
+    /// turn the model reads holds evidence the scan missed, and one read once
+    /// barely registers. Any other unscored turn stays unscored.
+    pub fn lift_turns(
+        &mut self,
+        lifts: impl IntoIterator<Item = (TurnKey, f32)>,
+        base: f32,
+        credit: impl Fn(&TurnKey) -> bool,
+    ) {
+        for (key, factor) in lifts {
+            match self.turns.get_mut(&key) {
+                Some(s) => *s *= factor,
+                None if credit(&key) => {
+                    let read = base * (factor - 1.0);
+                    if read > 0.0 {
+                        self.turns.insert(key, read);
+                    }
+                }
+                None => {}
+            }
+        }
     }
 
     /// Every scored turn and its score, in no order.
@@ -3469,7 +3497,11 @@ impl Substrate {
     /// The chain is walked child-upward and stops once the next ancestor would
     /// cross this, so what gets dropped is the FRONT — the oldest, most
     /// general documents — while the nearest, most specific ancestors survive.
-    pub const INHERITED_CHAIN_TOKEN_CAP: usize = 100_000;
+    ///
+    /// Sized inside a dialogue's window, which seats the lineage and the
+    /// dialogue's own turns within the trained window's slot
+    /// (`docs/hit_driven_projection.md` §4): the priming chain is ~40K.
+    pub const INHERITED_CHAIN_TOKEN_CAP: usize = 64_000;
 
     /// The timeline `tl` was forked from, if it recorded one and that parent
     /// is still usable.
@@ -3734,11 +3766,16 @@ impl Substrate {
     }
 
     /// Fold one reprojection's per-file fresh scores into `target`'s working
-    /// set ([`WorkingSet::observe`]).
+    /// set ([`WorkingSet::observe`]), after the stride's hit densities
+    /// ([`WorkingSet::observe_hits`]) — so what the indexer read since the
+    /// last reprojection lifts every judgment this one makes.
+    #[allow(clippy::too_many_arguments)]
     pub fn working_set_observe(
         &mut self,
         target: TimelineId,
         fresh: &HashMap<TimelineId, f32>,
+        hit_density: &HashMap<TimelineId, f32>,
+        hits: &HitsConfig,
         beta: f32,
         min_momentum: f32,
         limits: Limits,
@@ -3749,6 +3786,7 @@ impl Substrate {
             .remove(&target)
             .map(Arc::unwrap_or_clone)
             .unwrap_or_default();
+        ws.observe_hits(hit_density, hits);
         ws.observe(fresh, beta, min_momentum, limits, max_admits, &|timeline| {
             self.working_set_candidate(target, timeline)
         });
@@ -8415,6 +8453,31 @@ mod tests {
         TimelineId::from_raw((1 << 62) | n).expect("non-zero timeline id")
     }
 
+    /// A lift multiplies a scored turn, gives an unscored one what its reads
+    /// are worth over the base, and leaves a turn it does not name alone.
+    #[test]
+    fn a_hit_lift_amplifies_scores_and_credits_reads() {
+        let tl = TimelineId::from_raw(7).unwrap();
+        let mut scores = ProjectionScores::new();
+        scores.set_turn(tl, TurnIndex(0), 200.0);
+        let other = TimelineId::from_raw(8).unwrap();
+        scores.lift_turns(
+            [
+                (TurnKey::new(tl, TurnIndex(0)), 2.5),
+                (TurnKey::new(tl, TurnIndex(1)), 4.0),
+                (TurnKey::new(tl, TurnIndex(2)), 1.0),
+                (TurnKey::new(other, TurnIndex(0)), 4.0),
+            ],
+            1000.0,
+            |k| k.timeline == tl,
+        );
+        assert_eq!(scores.turn(tl, TurnIndex(0)), 500.0);
+        assert_eq!(scores.turn(tl, TurnIndex(1)), 3000.0, "1000 · gain · h");
+        assert_eq!(scores.turn(tl, TurnIndex(2)), 0.0, "no reads, no credit");
+        assert_eq!(scores.turn(other, TurnIndex(0)), 0.0, "not credited");
+        assert_eq!(scores.turn_count(), 2);
+    }
+
     /// **An append-only layer reads every group self-local, but those of the
     /// layers it compounds on.** A unit of an analysis layer retrieves the
     /// analyses below it of other files; its own layer's siblings, and every
@@ -8751,6 +8814,8 @@ mod tests {
         sub.working_set_observe(
             target,
             &fresh,
+            &HashMap::new(),
+            &HitsConfig::default(),
             0.2,
             100.0,
             ws_limits(1000),
@@ -8926,6 +8991,8 @@ mod tests {
         sub.working_set_observe(
             target,
             &HashMap::from([(reads[2], 500.0)]),
+            &HashMap::new(),
+            &HitsConfig::default(),
             0.2,
             100.0,
             ws_limits(1000),
@@ -9000,9 +9067,9 @@ mod tests {
     /// the nearest ones, which are the most specific to the target.
     #[test]
     fn the_token_cap_drops_the_front_of_the_chain_and_keeps_the_nearest() {
-        // Four ancestors at 40k each: the target plus two ancestors fit inside
-        // the 100k ceiling (80k), a third would reach 120k.
-        let (sub, tls) = forked_line(5, 40_000);
+        // Four ancestors at two fifths of the ceiling each: two fit inside it
+        // (four fifths), a third would pass it (six fifths).
+        let (sub, tls) = forked_line(5, Substrate::INHERITED_CHAIN_TOKEN_CAP * 2 / 5);
         let target = *tls.last().unwrap();
         let chain = sub.inherited_chain(target);
         assert_eq!(chain, vec![tls[2], tls[3], target]);

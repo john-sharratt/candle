@@ -68,6 +68,15 @@
 // tail sit above every pool, so they follow the reduced entries in order and
 // are written without being sorted at all.
 //
+// PINNED RANGES (`docs/hit_driven_projection.md` §5)
+// ---------------------------------------------------
+// A row carries up to QSA_MAX_PINS block ranges its sequence pinned — the
+// system prompt's persona and journal. A pinned block is in no window's pool,
+// so it takes no candidate's seat, and it is attended whole: set straight into
+// the single window's bitmap, or gathered beside the windows' entries and
+// sorted in with them. Pins are clipped below the forced span, which attends
+// its own blocks.
+//
 // One window (`window_blocks == 0`, or wider than the row) makes the pool every
 // candidate: the prompt and recent spans fall inside it, nothing can repeat,
 // and the kernel does exactly the work of the checkpoint's selection.
@@ -162,15 +171,50 @@ struct Row {
     int forced_lo;  // first block of the forced span (`cand` when none)
     int win;        // blocks per window
     int n_win;      // windows
+    int pin_lo[QSA_MAX_PINS];  // pinned block ranges, clipped below `forced_lo`
+    int pin_hi[QSA_MAX_PINS];
+    int n_pinned;   // pinned blocks in all
 };
 
+// The overlap of three half-open ranges.
+__device__ __forceinline__ int overlap3(int a, int b, int c, int d, int e, int f) {
+    const int lo = a > c ? (a > e ? a : e) : (c > e ? c : e);
+    const int hi = b < d ? (b < f ? b : f) : (d < f ? d : f);
+    return span_len(lo, hi);
+}
+
+// Every pin test returns at once for a row that pins nothing — nearly every
+// row the engine selects for — so an unpinned selection pays one compare.
+__device__ __forceinline__ bool is_pinned(const Row& g, int b) {
+    if (g.n_pinned == 0) return false;
+#pragma unroll
+    for (int k = 0; k < QSA_MAX_PINS; ++k) {
+        if (b >= g.pin_lo[k] && b < g.pin_hi[k]) return true;
+    }
+    return false;
+}
+
+// Pinned blocks inside `[lo, hi)`.
+__device__ __forceinline__ int pinned_in(const Row& g, int lo, int hi) {
+    if (g.n_pinned == 0) return 0;
+    int n = 0;
+#pragma unroll
+    for (int k = 0; k < QSA_MAX_PINS; ++k) n += overlap(g.pin_lo[k], g.pin_hi[k], lo, hi);
+    return n;
+}
+
 // `false` for a dense row — every visible cell attended, nothing to select.
+//
+// `pins` is `[2·QSA_MAX_PINS, n_rows]`: row `r`'s range `k` is
+// `[pins[2k·n_rows + r], pins[(2k+1)·n_rows + r])`, empty when the two agree.
 __device__ __forceinline__ bool row_geometry(
     int row,
     const uint32_t* __restrict__ n_cand,
     const uint32_t* __restrict__ qpos,
     const uint32_t* __restrict__ tail_len,
     const uint32_t* __restrict__ prompt_blocks,
+    const uint32_t* __restrict__ pins,
+    int n_rows,
     int ratio,
     int top_k,
     int window_blocks,
@@ -207,6 +251,18 @@ __device__ __forceinline__ bool row_geometry(
     g.forced_lo = recent_forced ? g.recent_lo : g.cand;
     g.win = (window_blocks > 0 && window_blocks < g.cand) ? window_blocks : g.cand;
     g.n_win = g.win > 0 ? (g.cand + g.win - 1) / g.win : 0;
+    g.n_pinned = 0;
+#pragma unroll
+    for (int k = 0; k < QSA_MAX_PINS; ++k) {
+        int lo = (int)pins[(size_t)(2 * k) * n_rows + row];
+        int hi = (int)pins[(size_t)(2 * k + 1) * n_rows + row];
+        if (lo > g.forced_lo) lo = g.forced_lo;
+        if (hi > g.forced_lo) hi = g.forced_lo;
+        if (hi < lo) hi = lo;
+        g.pin_lo[k] = lo;
+        g.pin_hi[k] = hi;
+        g.n_pinned += hi - lo;
+    }
     return true;
 }
 
@@ -241,6 +297,37 @@ __device__ __forceinline__ int shared_pool(const Row& g, const Window& v) {
         n += span_len(g.recent_lo, g.cand) - overlap(g.recent_lo, g.cand, v.lo, v.hi)
             - overlap(g.recent_lo, g.cand, 0, g.prompt) + overlap(rw_lo, v.hi, 0, g.prompt);
     }
+    return n;
+}
+
+// The pinned blocks inside R2 and R3 — what `shared_pool` counts that no pass
+// offers. The same inclusion–exclusion as `shared_pool`, per pinned range.
+__device__ __forceinline__ int pinned_in_shared(const Row& g, const Window& v) {
+    if (g.n_pinned == 0) return 0;
+    int n = 0;
+#pragma unroll
+    for (int k = 0; k < QSA_MAX_PINS; ++k) {
+        const int a = g.pin_lo[k], b = g.pin_hi[k];
+        if (a >= b) continue;
+        n += overlap(a, b, 0, v.r2_hi) - overlap3(a, b, 0, v.r2_hi, v.lo, v.hi);
+        if (v.r3) {
+            n += overlap(a, b, g.recent_lo, g.cand)
+                - overlap3(a, b, g.recent_lo, g.cand, v.lo, v.hi)
+                - overlap3(a, b, g.recent_lo, g.cand, 0, g.prompt);
+            // R∩W∩P, with R∩W = [max(recent_lo, lo), hi).
+            const int rw_lo = g.recent_lo > v.lo ? g.recent_lo : v.lo;
+            n += overlap3(a, b, rw_lo, v.hi, 0, g.prompt);
+        }
+    }
+    return n;
+}
+
+// The blocks a pass over `[own_lo, own_hi)` — plus R2 and R3 when `shared` —
+// actually offers: the pool less its pinned blocks.
+__device__ __forceinline__ int offered(
+    const Row& g, const Window& v, int own_lo, int own_hi, bool shared) {
+    int n = span_len(own_lo, own_hi) - pinned_in(g, own_lo, own_hi);
+    if (shared) n += shared_pool(g, v) - pinned_in_shared(g, v);
     return n;
 }
 
@@ -379,11 +466,13 @@ __device__ __forceinline__ void survivors_finish(const Survivors& s, int keep, i
     survivors_select(s, n, keep, tid);
 }
 
-// Stream the scores of `[lo, hi)` that `skip` does not exclude.
+// Stream the scores of `[lo, hi)` that `skip` does not exclude and no pin
+// holds.
 template <typename Skip>
 __device__ void offer_scores(
     const Survivors& s,
     const float* __restrict__ srow,
+    const Row& g,
     int lo,
     int hi,
     Skip skip,
@@ -393,7 +482,8 @@ __device__ void offer_scores(
 ) {
     for (int base = lo; base < hi; base += THREADS) {
         const int b = base + tid;
-        const unsigned long long key = (b < hi && !skip(b)) ? score_key(srow[b], b) : 0ull;
+        const unsigned long long key =
+            (b < hi && !skip(b) && !is_pinned(g, b)) ? score_key(srow[b], b) : 0ull;
         survivors_offer(s, key, keep, n, tid);
     }
 }
@@ -413,18 +503,38 @@ __device__ int offer_pool(
     int tid
 ) {
     int n = 0;
-    offer_scores(s, srow, own_lo, own_hi, [](int) { return false; }, keep, n, tid);
+    offer_scores(s, srow, g, own_lo, own_hi, [](int) { return false; }, keep, n, tid);
     if (!shared) return n;
     const int lo = v.lo, hi = v.hi, prompt = g.prompt;
     offer_scores(
-        s, srow, 0, v.r2_hi, [lo, hi](int b) { return b >= lo && b < hi; }, keep, n, tid);
+        s, srow, g, 0, v.r2_hi, [lo, hi](int b) { return b >= lo && b < hi; }, keep, n, tid);
     if (v.r3) {
         offer_scores(
-            s, srow, g.recent_lo, g.cand,
+            s, srow, g, g.recent_lo, g.cand,
             [lo, hi, prompt](int b) { return (b >= lo && b < hi) || b < prompt; }, keep, n,
             tid);
     }
     return n;
+}
+
+// Gather the row's pinned blocks as whole-block entries beside the windows'
+// — sorted in with them by `finish_row`. The host sizes `ent_cap` for them.
+__device__ void emit_pins(const Row& g, int ratio, uint32_t* ent, int* n_ent, int tid) {
+    // Every window's count is in, and a row that ranked nothing has its zero.
+    __syncthreads();
+    const int base_e = *n_ent;
+    int at = 0;
+#pragma unroll
+    for (int k = 0; k < QSA_MAX_PINS; ++k) {
+        const int lo = g.pin_lo[k], n = g.pin_hi[k] - g.pin_lo[k];
+        for (int i = tid; i < n; i += THREADS) {
+            ent[base_e + at + i] = ((uint32_t)(lo + i) << 2) | (uint32_t)(ratio - 1);
+        }
+        at += n > 0 ? n : 0;
+    }
+    __syncthreads();
+    if (tid == 0) *n_ent = base_e + at;
+    __syncthreads();
 }
 
 // Append a settled buffer's `keep` keys as entries: whole blocks, except that
@@ -571,6 +681,14 @@ __device__ void finish_row_single(
         const uint32_t b = key_block(s.buf[r]);
         atomicOr(&bits[b >> 5], 1u << (b & 31));
     }
+    // The pinned blocks, whole: no window ranked them, so none is the
+    // threshold's block and none is cut.
+#pragma unroll
+    for (int k = 0; k < QSA_MAX_PINS; ++k) {
+        for (int b = g.pin_lo[k] + tid; b < g.pin_hi[k]; b += THREADS) {
+            atomicOr(&bits[b >> 5], 1u << (b & 31));
+        }
+    }
     __syncthreads();
     const bool part = g.rem > 0 && keep > g.full;
     const uint32_t last_block = key_block(*s.thr);
@@ -639,6 +757,7 @@ __device__ __forceinline__ Smem smem_layout(
 //                          Not derived here: a block's width is a property of
 //                          the page it belongs to.
 //   prompt  [n_rows] u32 — blocks wholly inside the row's system prompt
+//   pins    [2·QSA_MAX_PINS, n_rows] u32 — the row's pinned block ranges
 //   entries [n_rows, entry_stride] u32 — output, ascending by block
 //   cnt     [n_rows] u32 — entries written, or QSA_DENSE_ROW
 //
@@ -650,6 +769,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
     const uint32_t* __restrict__ qpos,
     const uint32_t* __restrict__ tail_len,
     const uint32_t* __restrict__ prompt_blocks,
+    const uint32_t* __restrict__ pins,
     uint32_t* __restrict__ entries,
     int entry_stride,
     uint32_t* __restrict__ cnt,
@@ -666,8 +786,8 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
     const int tid = (int)threadIdx.x;
     Row g;
     if (!row_geometry(
-            row, n_cand, qpos, tail_len, prompt_blocks, ratio, top_k, window_blocks,
-            recent_blocks, recent_forced, g)) {
+            row, n_cand, qpos, tail_len, prompt_blocks, pins, n_rows, ratio, top_k,
+            window_blocks, recent_blocks, recent_forced, g)) {
         // Every visible cell is attended — the identity, and the reason a
         // shallow context needs no indexer at all.
         if (tid == 0) cnt[row] = QSA_DENSE_ROW;
@@ -689,7 +809,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
     // its windows' entries and sorts them.
     if (g.n_win == 1 && (g.cand + 31) / 32 <= ent_cap) {
         const Window v = window_of(g, 0, recent_forced);
-        const int pool = span_len(v.lo, v.r1_hi) + shared_pool(g, v);
+        const int pool = offered(g, v, v.lo, v.r1_hi, true);
         const int keep = g.keep < pool ? g.keep : pool;
         uint32_t* out = entries + (size_t)row * (size_t)entry_stride;
         if (keep > 0) {
@@ -704,7 +824,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
     }
     for (int w = 0; w < g.n_win; ++w) {
         const Window v = window_of(g, w, recent_forced);
-        const int pool = span_len(v.lo, v.r1_hi) + shared_pool(g, v);
+        const int pool = offered(g, v, v.lo, v.r1_hi, true);
         const int keep = g.keep < pool ? g.keep : pool;
         if (keep <= 0) continue;
         survivors_reset(m.s, tid);
@@ -712,7 +832,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
         survivors_finish(m.s, keep, n, tid);
         emit_window(m.s, g, keep, ratio, m.ent, &s_n_ent, tid);
     }
-    __syncthreads();
+    emit_pins(g, ratio, m.ent, &s_n_ent, tid);
     finish_row(
         g, ratio, m.ent, s_n_ent, (int*)m.s.buf,
         entries + (size_t)row * (size_t)entry_stride, cnt + row, tid);
@@ -729,6 +849,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_segment_kernel(
     const uint32_t* __restrict__ qpos,
     const uint32_t* __restrict__ tail_len,
     const uint32_t* __restrict__ prompt_blocks,
+    const uint32_t* __restrict__ pins,
     unsigned long long* __restrict__ keys,
     int ratio,
     int top_k,
@@ -744,8 +865,8 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_segment_kernel(
     const int tid = (int)threadIdx.x;
     Row g;
     if (!row_geometry(
-            row, n_cand, qpos, tail_len, prompt_blocks, ratio, top_k, window_blocks,
-            recent_blocks, recent_forced, g)) {
+            row, n_cand, qpos, tail_len, prompt_blocks, pins, n_rows, ratio, top_k,
+            window_blocks, recent_blocks, recent_forced, g)) {
         return;
     }
     const int w = seg / parts;
@@ -764,7 +885,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_segment_kernel(
     const int own_lo = v.lo + (int)((long long)own * p / parts);
     const int own_hi = v.lo + (int)((long long)own * (p + 1) / parts);
     const bool shared = p == 0;
-    const int pool = (own_hi - own_lo) + (shared ? shared_pool(g, v) : 0);
+    const int pool = offered(g, v, own_lo, own_hi, shared);
     const int keep = g.keep < pool ? g.keep : pool;
 
     unsigned long long* out = keys + ((size_t)row * gridDim.y + (size_t)seg) * MAX_KEEP;
@@ -788,6 +909,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_merge_kernel(
     const uint32_t* __restrict__ qpos,
     const uint32_t* __restrict__ tail_len,
     const uint32_t* __restrict__ prompt_blocks,
+    const uint32_t* __restrict__ pins,
     uint32_t* __restrict__ entries,
     int entry_stride,
     uint32_t* __restrict__ cnt,
@@ -804,8 +926,8 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_merge_kernel(
     const int tid = (int)threadIdx.x;
     Row g;
     if (!row_geometry(
-            row, n_cand, qpos, tail_len, prompt_blocks, ratio, top_k, window_blocks,
-            recent_blocks, recent_forced, g)) {
+            row, n_cand, qpos, tail_len, prompt_blocks, pins, n_rows, ratio, top_k,
+            window_blocks, recent_blocks, recent_forced, g)) {
         if (tid == 0) cnt[row] = QSA_DENSE_ROW;
         return;
     }
@@ -821,7 +943,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_merge_kernel(
 
     for (int w = 0; w < g.n_win; ++w) {
         const Window v = window_of(g, w, recent_forced);
-        const int pool = span_len(v.lo, v.r1_hi) + shared_pool(g, v);
+        const int pool = offered(g, v, v.lo, v.r1_hi, true);
         const int keep = g.keep < pool ? g.keep : pool;
         if (keep <= 0) continue;
         survivors_reset(m.s, tid);
@@ -841,7 +963,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_merge_kernel(
         survivors_finish(m.s, keep, n, tid);
         emit_window(m.s, g, keep, ratio, m.ent, &s_n_ent, tid);
     }
-    __syncthreads();
+    emit_pins(g, ratio, m.ent, &s_n_ent, tid);
     finish_row(
         g, ratio, m.ent, s_n_ent, (int*)m.s.buf,
         entries + (size_t)row * (size_t)entry_stride, cnt + row, tid);
@@ -927,6 +1049,7 @@ extern "C" void run_qsa_topk_entries(
     const uint32_t* qpos,
     const uint32_t* tail_len,
     const uint32_t* prompt_blocks,
+    const uint32_t* pins,
     uint32_t* entries,
     int32_t entry_stride,
     uint32_t* cnt,
@@ -952,8 +1075,9 @@ extern "C" void run_qsa_topk_entries(
     if (parts == 0) {
         qsa_topk::opt_in_smem(qsa_topk::qsa_topk_entries_kernel, qsa_topk::entries_granted, smem);
         qsa_topk::qsa_topk_entries_kernel<<<(unsigned)n_rows, qsa_topk::THREADS, smem, s>>>(
-            scores, score_stride, n_cand, qpos, tail_len, prompt_blocks, entries, entry_stride,
-            cnt, ratio, top_k, window_blocks, recent_blocks, recent_forced, ent_cap, n_rows);
+            scores, score_stride, n_cand, qpos, tail_len, prompt_blocks, pins, entries,
+            entry_stride, cnt, ratio, top_k, window_blocks, recent_blocks, recent_forced, ent_cap,
+            n_rows);
         return;
     }
     const int win = (window_blocks > 0 && window_blocks < cand_max) ? window_blocks : cand_max;
@@ -961,10 +1085,10 @@ extern "C" void run_qsa_topk_entries(
     unsigned long long* keys = (unsigned long long*)split_keys;
     qsa_topk::qsa_topk_segment_kernel<<<dim3((unsigned)n_rows, (unsigned)segs),
                                        qsa_topk::THREADS, 0, s>>>(
-        scores, score_stride, n_cand, qpos, tail_len, prompt_blocks, keys, ratio, top_k,
+        scores, score_stride, n_cand, qpos, tail_len, prompt_blocks, pins, keys, ratio, top_k,
         window_blocks, recent_blocks, recent_forced, parts, n_rows);
     qsa_topk::opt_in_smem(qsa_topk::qsa_topk_merge_kernel, qsa_topk::merge_granted, smem);
     qsa_topk::qsa_topk_merge_kernel<<<(unsigned)n_rows, qsa_topk::THREADS, smem, s>>>(
-        keys, segs, n_cand, qpos, tail_len, prompt_blocks, entries, entry_stride, cnt, ratio,
-        top_k, window_blocks, recent_blocks, recent_forced, parts, n_rows);
+        keys, segs, n_cand, qpos, tail_len, prompt_blocks, pins, entries, entry_stride, cnt,
+        ratio, top_k, window_blocks, recent_blocks, recent_forced, parts, n_rows);
 }

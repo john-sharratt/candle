@@ -236,7 +236,7 @@ mod tests {
             file: "Qwen3.6-35B-A3B-AntiLoop.gguf".into(),
             weights: [7; 32],
             tokenizer: [1; 32],
-            rope: "lineage min=none".into(),
+            rope: "lineage".into(),
         }
     }
 
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn another_rope_schedule_is_refused() {
         let mut other = key();
-        other.rope = "lineage min=40000000".into();
+        other.rope = "file-stated".into();
         let k = RecordedModel::Key(other);
         assert_eq!(decide(Some(&k), None, &key()), Decision::Refuse);
     }

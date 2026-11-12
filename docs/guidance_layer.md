@@ -45,9 +45,10 @@ filter over the units it draws:
   (`working_set_members`) all follow that split, so a unit is placed through one
   group, never both.
 - **Its own pool.** `WorkingSetShare::Guidance` is bounded by the working set's
-  `guidance_tokens` (40K, eight to ten guides and journal notes at a time), a
-  pool beside `budget_tokens` (122K) rather than inside it; the two were sized
-  together, so the dialogue's total stays where it was.
+  `guidance_tokens` (16K, four to five guides and journal notes at a time), a
+  pool beside `budget_tokens` (64K) rather than inside it; the two are sized
+  together, inside the trained window's slot
+  (`docs/hit_driven_projection.md` §4).
   Guidance dislodges only guidance, and nothing else dislodges it: a guide never
   dislodges a code file, and no burst of code crowds out the guide the worker
   needs. Without `guidance_tokens` no guide enters.
@@ -191,4 +192,4 @@ Journals reach the same group by the same filter, with two differences:
    relevant, idle — from each placed unit's peak fresh score
    (`WorkingSet::fresh_of`).
 6. **Built.** Journals' recency term (§4: `Recency`, applied in
-   `working_set_fresh`), and the pool at 40K beside a 122K files budget (§1).
+   `working_set_fresh`), and the pool at 16K beside a 64K files budget (§1).

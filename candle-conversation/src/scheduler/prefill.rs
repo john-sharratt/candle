@@ -7672,7 +7672,7 @@ mod wave_chunk_tests {
         let (mut scheduler, _tx) = make_test_scheduler();
         scheduler
             .session
-            .set_rope_select(RungSelect::new(vec![64], 0).expect("ceilings"));
+            .set_rope_select(RungSelect::new(vec![64]).expect("ceilings"));
         let fits = SequenceId(scheduler.session.create_sequence().expect("create"));
         let over = SequenceId(scheduler.session.create_sequence().expect("create"));
         scheduler

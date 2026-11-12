@@ -22,7 +22,9 @@ pub enum Recent {
 /// A stratified selection in positions: the candidates cut into windows
 /// walking forward from the start, each spending the whole budget on its own
 /// blocks plus the system prompt's, with the recent span nearest the query
-/// ranked in, or forced into, every one.
+/// ranked in, or forced into, every one — and, outside every window, the
+/// sequence's pinned ranges attended whole
+/// (`docs/hit_driven_projection.md` §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StrataTokens {
     /// Positions per window; `0` is one window spanning every candidate.
@@ -31,32 +33,44 @@ pub struct StrataTokens {
     pub recent: usize,
     /// How the recent span enters the selection.
     pub mode: Recent,
+    /// The most positions one sequence may pin. Pinned blocks are attended in
+    /// addition to the budget, so this bounds every row's width; a row whose
+    /// pins cover more gives up the oldest of its last pinned range, and with
+    /// a bound of `0` nothing is pinned at all.
+    pub pinned: usize,
 }
 
 impl StrataTokens {
-    /// One window over every candidate and no recent span: the checkpoint's
-    /// own selection, exactly.
+    /// One window over every candidate, no recent span and nothing pinned: the
+    /// checkpoint's own selection, exactly.
     pub const WHOLE: Self = Self {
         window: 0,
         recent: 0,
         mode: Recent::Candidate,
+        pinned: 0,
     };
 
-    /// What an engine runs unless told otherwise: 128K-position windows — the
-    /// span a selecting checkpoint is trained to choose among — and the 8K
-    /// positions nearest the query ranked as a candidate in every window.
-    ///
-    /// Measured on Qwen3.8-Flash-Next at a 294–394K production prompt
-    /// (`docs/results/qsa_stratified_selection_2026-10-06.md`): every recall
-    /// probe answered, against the forced span's confused post-tool reasoning
-    /// at +93% decode; this costs about +15% decode over [`Self::WHOLE`]. Below
-    /// one window's depth it selects exactly what [`Self::WHOLE`] does — the
-    /// recent span and the prompt are then inside the only window.
+    /// What an engine runs unless told otherwise: windows of 262,144
+    /// positions — the trained window, the length a selecting checkpoint's
+    /// indexer was trained to rank — and the 8K positions nearest the query
+    /// ranked as a candidate in every window. A context inside the trained
+    /// window is one window, so this selects exactly what [`Self::WHOLE`] does
+    /// there; a deeper one is ranked a trained window at a time. Nothing is
+    /// pinned unless the engine says how much may be.
     pub const DEFAULT: Self = Self {
-        window: 131_072,
+        window: 262_144,
         recent: 8192,
         mode: Recent::Candidate,
+        pinned: 0,
     };
+
+    /// These strata, letting a sequence pin up to `positions` positions.
+    pub fn with_pinned(self, positions: usize) -> Self {
+        Self {
+            pinned: positions,
+            ..self
+        }
+    }
 }
 
 impl Default for StrataTokens {
@@ -70,15 +84,17 @@ mod tests {
     use super::{Recent, StrataTokens};
 
     #[test]
-    fn the_default_is_128k_windows_with_an_8k_recent_candidate() {
+    fn the_default_is_trained_window_windows_with_an_8k_recent_candidate() {
         assert_eq!(
             StrataTokens::default(),
             StrataTokens {
-                window: 131_072,
+                window: 262_144,
                 recent: 8192,
                 mode: Recent::Candidate,
+                pinned: 0,
             }
         );
         assert_ne!(StrataTokens::default(), StrataTokens::WHOLE);
+        assert_eq!(StrataTokens::WHOLE.with_pinned(1024).pinned, 1024);
     }
 }

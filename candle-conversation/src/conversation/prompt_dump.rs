@@ -299,9 +299,7 @@ mod tests {
     }
 
     fn section(n: u32) -> ProjectionSegment {
-        ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection {
-            id: SectionId::new(n),
-        }))
+        ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(SectionId::new(n))))
     }
 
     #[test]

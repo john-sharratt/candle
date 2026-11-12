@@ -31,6 +31,7 @@ use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::RecurrentCompaction;
 use crate::models::delta_net::TIMELINE_ROWS;
 use crate::models::delta_net::{ArmKind, ReplyRows};
+use crate::models::hit_layers::{HitPercentiles, PieceHits};
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::layer_parallel;
 use crate::models::piece_key::PieceKey;
@@ -5015,6 +5016,36 @@ pub trait ManagedBatchedModel {
         Ok(())
     }
 
+    /// `seq`'s pinned position ranges: spans of its system prompt every
+    /// selecting query attends whole, outside the selection's budget
+    /// (`docs/hit_driven_projection.md` §5). Replaces any declared before.
+    /// A model that attends every position has nothing to pin.
+    fn set_selection_pins(&self, _seq: usize, _ranges: &[Range<usize>]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Which selecting layers keep index rows for unloaded pieces and count
+    /// hits ([`HitPercentiles`]). A model that attends every position has no
+    /// selection to count.
+    fn set_hit_layers(&mut self, _layers: &HitPercentiles) -> Result<()> {
+        Ok(())
+    }
+
+    /// Declare the pieces `seq`'s projection placed, as position ranges in
+    /// declaration order, so its sampled layers count what their selections
+    /// choose of each (`docs/hit_driven_projection.md` §6.4). Replaces any
+    /// declared before, dropping their counts.
+    fn set_hit_pieces(&self, _seq: usize, _pieces: &[Range<usize>]) -> Result<()> {
+        Ok(())
+    }
+
+    /// What `seq`'s sampled layers chose of each declared piece since the
+    /// last read, zeroing the counts; `None` for a model with no selection to
+    /// count, or a sequence with nothing declared.
+    fn take_hits(&self, _seq: usize) -> Result<Option<PieceHits>> {
+        Ok(None)
+    }
+
     /// How the model's selection divides a query's candidates before ranking
     /// them, stated in positions ([`StrataTokens`]).
     ///
@@ -6060,17 +6091,10 @@ pub trait ManagedBatchedModel {
     }
 
     /// How a session's headers pick each sequence's RoPE rung — the model's
-    /// schedule's ceilings and floor (`docs/progressive_yarn.md` §8). One
-    /// unbounded rung for a model whose kernels read none.
+    /// schedule's ceilings (`docs/progressive_yarn.md` §8). One unbounded rung
+    /// for a model whose kernels read none.
     fn rope_select(&self) -> RungSelect {
         RungSelect::unbounded()
-    }
-
-    /// Run no sequence on a RoPE rung whose YaRN factor is below `min`
-    /// ([`crate::models::rope_schedule::RopeRungs::with_min_factor`]). Set
-    /// before any session opens; a model whose kernels read no rung refuses.
-    fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
-        candle::bail!("this model's kernels read no RoPE rung, so a minimum factor of {min} has nothing to raise")
     }
 
     /// Create a batched inference session configured for this model.
@@ -6374,10 +6398,6 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn rope_select(&self) -> RungSelect {
         self.rope().select().clone()
-    }
-
-    fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
-        BatchedInference::set_rope_min_factor(self, min)
     }
 
     fn maybe_change_dtype(&self, dtype: DType) -> Result<()> {

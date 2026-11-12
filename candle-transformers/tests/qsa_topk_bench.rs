@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use candle::{Device, Result, Tensor};
 use candle_transformers::models::qwen4exp::indexer::SelectionTable;
-use candle_transformers::models::qwen4exp::qsa_select::Strata;
+use candle_transformers::models::qwen4exp::qsa_select::{PinRow, Strata};
 use candle_transformers::models::selection_strata::Recent;
 
 const RATIO: usize = 4;
@@ -42,6 +42,7 @@ fn strata() -> [(&'static str, Strata); 3] {
         window_blocks: 32_768,
         recent_blocks: 2048,
         recent,
+        pin_blocks: 0,
     };
     [
         ("whole", Strata::WHOLE),
@@ -74,14 +75,19 @@ fn time_fill(rows: usize, blocks: usize, strata: &Strata, iters: usize) -> Resul
     let qpos: Vec<usize> = vec![blocks * RATIO; rows];
     let tail: Vec<u32> = vec![1; rows];
     let prompt: Vec<u32> = vec![PROMPT_BLOCKS; rows];
+    let pins: Vec<PinRow> = vec![PinRow::EMPTY; rows];
     let mut table = SelectionTable::new(rows, RATIO, TOP_K, blocks, strata, &device, None)?;
     for _ in 0..WARMUP {
-        table.fill_rows(&scores, &cand, &qpos, &tail, &prompt, RATIO, TOP_K, 0)?;
+        table.fill_rows(
+            &scores, &cand, &qpos, &tail, &prompt, &pins, RATIO, TOP_K, 0,
+        )?;
     }
     device.synchronize()?;
     let t = Instant::now();
     for _ in 0..iters {
-        table.fill_rows(&scores, &cand, &qpos, &tail, &prompt, RATIO, TOP_K, 0)?;
+        table.fill_rows(
+            &scores, &cand, &qpos, &tail, &prompt, &pins, RATIO, TOP_K, 0,
+        )?;
     }
     device.synchronize()?;
     Ok(t.elapsed().as_secs_f64() * 1e3 / iters as f64)

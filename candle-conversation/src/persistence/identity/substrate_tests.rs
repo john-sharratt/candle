@@ -54,7 +54,7 @@ fn model(file: &str) -> ModelKey {
         file: file.into(),
         weights: [1; 32],
         tokenizer: [0; 32],
-        rope: "file-stated min=none".into(),
+        rope: "file-stated".into(),
     }
 }
 

@@ -27,6 +27,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -51,6 +52,7 @@ use super::capture_rows::CaptureRows;
 use super::coverage::coverage_disagreements;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
+use super::hits::{block_map, block_range, count_hits, HitHolder, HitTable, SeqHits};
 use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::indexer::{
     compact_index_caches, select_layer, selection_stride, IndexCache, IndexSnapshot, SplicePiece,
@@ -60,7 +62,7 @@ use super::paged_index::SealedIndex;
 use super::ple::{PleSpan, PleState};
 use super::ple_fused::ple_apply_spans_fused;
 use super::qsa::IndexerWeights;
-use super::qsa_select::{budget_fits_kernel, Strata};
+use super::qsa_select::{budget_fits_kernel, coalesce_ranges, selected_width, Strata, MAX_PINS};
 use super::resident_page::{PageRegistry, ResidentPage};
 use super::select_bytes::select_layer_bytes;
 use super::spec::SpecCapture;
@@ -86,6 +88,7 @@ use crate::models::expert_lre::{
     PipelineStats, WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS, STAGED_HOPS,
 };
 use crate::models::head_rows::select_head_rows;
+use crate::models::hit_layers::{HitPercentiles, PieceHits};
 use crate::models::lazy_rope::LazyRope;
 use crate::models::operand_guard::expect_dense_view;
 use crate::models::piece_key::PieceKey;
@@ -101,7 +104,7 @@ use crate::models::qwen38_flash_next_sweep as flash_next_sweep;
 use crate::models::residency_rows::residency_decode_rows;
 use crate::models::residual_rows::{CreepResidual, ResidualArena, ResidualIn};
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
-use crate::models::selection_strata::StrataTokens;
+use crate::models::selection_strata::{Recent, StrataTokens};
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 
 use super::rope::flash_next_schedule;
@@ -258,6 +261,16 @@ pub struct Qwen4ExpBatched {
     /// The step open across a segmented sweep, if any — what its sequences
     /// entered it with ([`ManagedBatchedModel::begin_step`]).
     step: Mutex<Option<StepSnapshot>>,
+    /// The KV layers that count hits — the selecting layers at the engine's
+    /// percentiles (`docs/hit_driven_projection.md` §6.1), ascending.
+    hit_kv: Vec<usize>,
+    /// Per sequence, the pieces its projection declared and their hit
+    /// counters ([`super::hits`]). A sequence with none declared is not
+    /// counted.
+    hits: RwLock<HashMap<usize, HitHolder>>,
+    /// The hit kernel's span table as last uploaded, reused by every sampled
+    /// layer of a wave ([`HitTable`]).
+    hit_table: Mutex<HitTable>,
 }
 
 /// What a step's sequences carried when it opened: everything outside the K/V
@@ -394,6 +407,13 @@ impl Qwen4ExpBatched {
         let ratio = self.selecting_ratio()?;
         let strata = Strata::from_tokens(tokens, ratio);
         self.check_strata(self.model.cfg.indexer.top_k, ratio, &strata)?;
+        if strata.recent == Recent::Forced && strata.recent_blocks > 0 {
+            tracing::warn!(
+                recent = tokens.recent,
+                "a forced recent span names its blocks in every row whatever they score, so \
+                 no hits are counted: the hit-driven lift is off under these strata"
+            );
+        }
         self.model.cfg.indexer.strata = strata;
         Ok(())
     }
@@ -410,6 +430,14 @@ impl Qwen4ExpBatched {
     /// the sequence has not run a wave yet, so the declaration travels with the
     /// index through a fork, a move or a truncate.
     pub fn set_selection_prompt(&self, seq: usize, tokens: usize) -> Result<()> {
+        self.each_index_cache(seq, |cache| cache.set_prompt_end(tokens))
+    }
+
+    /// Run `f` on each of `seq`'s index caches, creating them if the sequence
+    /// has not run a wave yet — the one place a sequence's caches are made
+    /// for a declaration, so they travel with the index through a fork, a
+    /// move or a truncate.
+    fn each_index_cache(&self, seq: usize, mut f: impl FnMut(&mut IndexCache)) -> Result<()> {
         let cfg = &self.model.cfg;
         let mut idx = self
             .index
@@ -423,10 +451,115 @@ impl Qwen4ExpBatched {
                     .collect::<Result<Vec<_>>>()?,
             ),
         };
-        for cache in caches.iter_mut() {
-            cache.set_prompt_end(tokens);
+        caches.iter_mut().for_each(&mut f);
+        Ok(())
+    }
+
+    /// Count hits at the selecting layers `layers` lands on.
+    pub fn set_hit_layers(&mut self, layers: &HitPercentiles) -> Result<()> {
+        self.hit_kv = self.sampled_kv(layers);
+        Ok(())
+    }
+
+    /// The KV layers `layers`' percentiles land on, over the trunk's
+    /// SELECTING attention layers — those with an indexer — in layer order.
+    fn sampled_kv(&self, layers: &HitPercentiles) -> Vec<usize> {
+        let ratios = self.attention_ratios();
+        let selecting: Vec<usize> = (0..self.model.cfg.n_attention_layers())
+            .filter(|&kv| ratios.get(kv).is_some_and(|&r| r > 0))
+            .collect();
+        layers
+            .indices(selecting.len())
+            .into_iter()
+            .map(|i| selecting[i])
+            .collect()
+    }
+
+    /// Declare the pieces `seq`'s projection placed, as position ranges in
+    /// declaration order, replacing any declared before — whose counts are
+    /// dropped, so a caller reads them first ([`Self::take_hits`]).
+    ///
+    /// The ranges become blocks through the sequence's index layout at the
+    /// first sampled layer; every layer of a sequence shares one layout.
+    pub fn set_hit_pieces(&self, seq: usize, pieces: &[Range<usize>]) -> Result<()> {
+        let ratio = self.selecting_ratio()?;
+        let map = {
+            let idx = self
+                .index
+                .read()
+                .map_err(|_| candle::Error::Msg("index lock poisoned".into()))?;
+            let kv = self.hit_kv.first().copied().unwrap_or(0);
+            match idx.get(&seq).and_then(|c| c.get(kv)) {
+                Some(cache) => block_map(pieces, |r| cache.block_range(r, ratio)),
+                None => block_map(pieces, |r| block_range(r, |pos| (pos + 1) / ratio)),
+            }
+        };
+        let mut hits = self
+            .hits
+            .write()
+            .map_err(|_| candle::Error::Msg("hits lock poisoned".into()))?;
+        // In place when the sequence owns its counters, so every view carved
+        // from it counts against the new pieces too. A sequence holding a
+        // parent's — a fork projecting for itself — gets counters of its own
+        // and leaves the parent's as they were.
+        match hits.get_mut(&seq).filter(|h| h.owned) {
+            Some(h) => {
+                h.generation = h.hits.redeclare(map, pieces.len(), &self.model.device)?;
+            }
+            None => {
+                let h = SeqHits::new(map, pieces.len(), &self.model.device)?;
+                hits.insert(
+                    seq,
+                    HitHolder {
+                        hits: h,
+                        owned: true,
+                        generation: 0,
+                    },
+                );
+            }
         }
         Ok(())
+    }
+
+    /// What `seq`'s sampled layers chose since the last read, per declared
+    /// piece — its own rows and every view's carved from it; `None` when it
+    /// declared none of its own. Zeroes the counts. A view holding its
+    /// parent's counters reads nothing: they are the parent's to read.
+    pub fn take_hits(&self, seq: usize) -> Result<Option<PieceHits>> {
+        let hits = self
+            .hits
+            .read()
+            .map_err(|_| candle::Error::Msg("hits lock poisoned".into()))?;
+        hits.get(&seq)
+            .filter(|h| h.owned)
+            .map(|h| h.hits.take())
+            .transpose()
+    }
+
+    /// Declare `seq`'s pinned position ranges — spans of its system prompt
+    /// every selecting query attends whole (`docs/hit_driven_projection.md`
+    /// §5) — replacing any declared before.
+    ///
+    /// Coalesced to the selection's table of [`MAX_PINS`] ranges across the
+    /// smallest gaps, so the glue between a collection's members never splits
+    /// a pinned span past it; each row is then held to the strata's
+    /// [`Strata::pin_blocks`] as it is built ([`IndexCache::pin_row`]).
+    /// Recorded on every one of the sequence's index caches, as the prompt
+    /// span is, so it travels with the index.
+    pub fn set_selection_pins(&self, seq: usize, ranges: &[Range<usize>]) -> Result<()> {
+        let cfg = &self.model.cfg;
+        let merged = coalesce_ranges(ranges, MAX_PINS);
+        // Rows are trimmed to the bound inside the forward, silently; a bound
+        // of zero would leave every declared pin attending nothing.
+        if !merged.is_empty() && cfg.indexer.strata.pin_blocks == 0 {
+            tracing::warn!(
+                seq,
+                ranges = merged.len(),
+                "pinned ranges declared, but the selection strata pin nothing \
+                 (StrataTokens::pinned is 0): no range will be attended whole"
+            );
+        }
+        self.each_index_cache(seq, |cache| cache.set_pins(&merged))
     }
 
     /// Whether `seq` carries any of the recurrent classes yet.
@@ -590,6 +723,37 @@ impl Qwen4ExpBatched {
                  inherits none — the borrowed K/V is unindexed from the start",
             ),
             None => {}
+        }
+        // The view counts into the parent's hits: the parent's projection
+        // declared the pieces, the view's rows are the reads (`super::hits`).
+        {
+            let mut hits = self
+                .hits
+                .write()
+                .map_err(|_| candle::Error::Msg("hits lock poisoned".into()))?;
+            // The child counts under the layout its parent counts under: an
+            // owner's current one, or — carved from a view — the view's own,
+            // so a stale view's carve stays stale.
+            let held = match hits.get(&parent) {
+                Some(p) if p.owned => Some((p.hits.clone(), p.hits.generation()?)),
+                Some(p) => Some((p.hits.clone(), p.generation)),
+                None => None,
+            };
+            match held {
+                Some((h, generation)) => {
+                    hits.insert(
+                        child,
+                        HitHolder {
+                            hits: h,
+                            owned: false,
+                            generation,
+                        },
+                    );
+                }
+                None => {
+                    hits.remove(&child);
+                }
+            }
         }
         self.mark_seeded(child)?;
         Ok(())
@@ -1845,7 +2009,7 @@ impl Qwen4ExpBatched {
             &flash_next_sweep::CARD_72GB,
             (total / (1 << 20)) as u64,
         ));
-        Ok(Self {
+        let mut built = Self {
             model,
             draft,
             recurrent: RwLock::new(HashMap::new()),
@@ -1867,7 +2031,12 @@ impl Qwen4ExpBatched {
             qsa_rows: AtomicU64::new(0),
             rope,
             step: Mutex::new(None),
-        })
+            hit_kv: Vec::new(),
+            hits: RwLock::new(HashMap::new()),
+            hit_table: Mutex::new(None),
+        };
+        built.hit_kv = built.sampled_kv(&HitPercentiles::standard());
+        Ok(built)
     }
 
     pub fn engine(&self) -> &Qwen4ExpGpu {
@@ -2307,15 +2476,6 @@ impl Qwen4ExpBatched {
         let rope = RopeRungs::new(schedule, &self.model.device)?;
         self.index_rope = FactoredRope::over(&rope, &self.model.device)?;
         self.rope = rope;
-        Ok(())
-    }
-
-    /// Run no sequence on a rung whose YaRN factor is below `min`, for the
-    /// attention and the indexer alike ([`RopeRungs::with_min_factor`]). Set
-    /// before any session opens.
-    pub fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
-        self.rope = self.rope.clone().with_min_factor(min)?;
-        self.index_rope = self.index_rope.clone().with_min_factor(min)?;
         Ok(())
     }
 }
@@ -3237,12 +3397,24 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         self.rope.select().clone()
     }
 
-    fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
-        Qwen4ExpBatched::set_rope_min_factor(self, min)
-    }
-
     fn set_selection_prompt(&self, seq: usize, tokens: usize) -> Result<()> {
         Qwen4ExpBatched::set_selection_prompt(self, seq, tokens)
+    }
+
+    fn set_selection_pins(&self, seq: usize, ranges: &[Range<usize>]) -> Result<()> {
+        Qwen4ExpBatched::set_selection_pins(self, seq, ranges)
+    }
+
+    fn set_hit_layers(&mut self, layers: &HitPercentiles) -> Result<()> {
+        Qwen4ExpBatched::set_hit_layers(self, layers)
+    }
+
+    fn set_hit_pieces(&self, seq: usize, pieces: &[Range<usize>]) -> Result<()> {
+        Qwen4ExpBatched::set_hit_pieces(self, seq, pieces)
+    }
+
+    fn take_hits(&self, seq: usize) -> Result<Option<PieceHits>> {
+        Qwen4ExpBatched::take_hits(self, seq)
     }
 
     fn set_selection_strata(&mut self, strata: StrataTokens) -> Result<()> {
@@ -3333,6 +3505,14 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         if let Ok(mut m) = self.seed_spares.write() {
             m.clear();
         }
+        // A recycled id must not count into the previous conversation's
+        // pieces.
+        if let Ok(mut m) = self.hits.write() {
+            m.clear();
+        }
+        if let Ok(mut t) = self.hit_table.lock() {
+            *t = None;
+        }
         Ok(())
     }
 
@@ -3365,6 +3545,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             m.forget(seq);
         }
         if let Ok(mut m) = self.index.write() {
+            m.remove(&seq);
+        }
+        // A recycled id must not inherit the previous conversation's pieces.
+        if let Ok(mut m) = self.hits.write() {
             m.remove(&seq);
         }
         if let Ok(mut m) = self.retired.write() {
@@ -4204,7 +4388,7 @@ impl Qwen4ExpBatched {
         total_rows: usize,
         fwd_ticket: Option<candle::cuda_backend::wave_provenance::WaveTicket>,
     ) -> Result<Option<QsaSelection>> {
-        select_layer(
+        let sel = select_layer(
             kv,
             compress_ratio,
             indexer,
@@ -4220,7 +4404,45 @@ impl Qwen4ExpBatched {
             &self.model.device,
             &self.qsa_rows,
             fwd_ticket,
-        )
+        )?;
+        // At a sampled layer, what the selection chose is counted into its
+        // pieces (`docs/hit_driven_projection.md` §6.2) — one launch over the
+        // wave, nothing read back. Not under a forced recent span: every row
+        // names those blocks whatever they score, so they would count as read
+        // by the indexer when nothing chose them.
+        let strata = &self.model.cfg.indexer.strata;
+        let forced = strata.recent == Recent::Forced && strata.recent_blocks > 0;
+        if let Some(sel) = sel.as_ref().filter(|_| !forced) {
+            if self.hit_kv.contains(&kv) {
+                let hits = self
+                    .hits
+                    .read()
+                    .map_err(|_| candle::Error::Msg("hits lock poisoned".into()))?;
+                if !hits.is_empty() {
+                    // A row at or below the budget's width attends densely and
+                    // chose nothing: it is no query of the density either.
+                    let width = selected_width(self.model.cfg.indexer.top_k, compress_ratio);
+                    let selecting: Vec<usize> = spans
+                        .iter()
+                        .zip(offsets)
+                        .map(|(s, &off)| s.len.saturating_sub(width.saturating_sub(off)))
+                        .collect();
+                    let mut table = self
+                        .hit_table
+                        .lock()
+                        .map_err(|_| candle::Error::Msg("hit table lock poisoned".into()))?;
+                    count_hits(
+                        sel,
+                        spans,
+                        &selecting,
+                        &hits,
+                        &mut table,
+                        &self.model.device,
+                    )?;
+                }
+            }
+        }
+        Ok(sel)
     }
 
     /// The layer sweep proper — the oracle's algebra over the wave's packed

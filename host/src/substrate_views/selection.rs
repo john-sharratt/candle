@@ -13,7 +13,8 @@ pub fn fmt_selection(rule: &SelectionRule) -> String {
         SelectionRule::Sequence {
             recent,
             historical_top_k,
-        } => format!("recent {recent} + top {historical_top_k}"),
+            lineage_base,
+        } => format!("recent {recent} + top {historical_top_k}, lineage from {lineage_base}"),
         SelectionRule::WorkingSet { share } => match share {
             WorkingSetShare::Folders => "working set (folders)".to_string(),
             WorkingSetShare::Remainder => "working set (files)".to_string(),
@@ -49,8 +50,9 @@ mod tests {
             fmt_selection(&SelectionRule::Sequence {
                 recent: 16,
                 historical_top_k: 8,
+                lineage_base: 1000.0,
             }),
-            "recent 16 + top 8"
+            "recent 16 + top 8, lineage from 1000"
         );
         assert_eq!(
             fmt_selection(&SelectionRule::WorkingSet {

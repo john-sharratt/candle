@@ -1227,8 +1227,9 @@ layers:
                 crate::Role::Assistant,
             ))
         };
-        let section =
-            |id: SectionId| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }));
+        let section = |id: SectionId| {
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id)))
+        };
 
         let segments = vec![
             section(frame),
@@ -1402,8 +1403,9 @@ layers:
         res.section_tokens.insert(a.raw(), 10);
         res.section_tokens.insert(bb.raw(), 20);
 
-        let section =
-            |id: SectionId| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }));
+        let section = |id: SectionId| {
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id)))
+        };
         let segments = vec![section(a), section(bb)];
         let ev = from_projection(
             &segments,
@@ -1457,8 +1459,8 @@ layers:
 
         // Select frame + file_a, but NOT file_b, plus one turn.
         let segments = vec![
-            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: frame })),
-            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: file_a })),
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(frame))),
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(file_a))),
             ProjectionSegment::Sealed(SealedKind::Turn(
                 ResolvedTurn {
                     id: TurnId {
@@ -1565,7 +1567,7 @@ layers:
                     position: 0,
                 },
             },
-            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: frame })),
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(frame))),
             ProjectionSegment::Generated {
                 tokens: Arc::new(vec![9, 9]),
                 identity: GeneratedIdentity {
@@ -1680,7 +1682,7 @@ layers:
 
         // The projected order: summary OUTSIDE, then <tools>, member, </tools>.
         let segments = vec![
-            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: summary })),
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(summary))),
             ProjectionSegment::Generated {
                 tokens: Arc::new(vec![1]),
                 identity: GeneratedIdentity {
@@ -1688,7 +1690,7 @@ layers:
                     position: 0,
                 },
             },
-            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: t1 })),
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(t1))),
             ProjectionSegment::Generated {
                 tokens: Arc::new(vec![2]),
                 identity: GeneratedIdentity {

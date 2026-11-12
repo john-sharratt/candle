@@ -81,6 +81,7 @@ pub use pack_source::ResolvedModel;
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use candle::DType;
+pub use candle_transformers::models::hit_layers::HitPercentiles;
 pub use candle_transformers::models::rope_schedule::RopePreset;
 pub use candle_transformers::models::selection_strata::{Recent, StrataTokens};
 use std::path::Path;

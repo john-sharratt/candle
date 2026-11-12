@@ -149,12 +149,12 @@ pub fn qsa_selection_mask(
     // visible — the same identity the whole-segment early return above takes,
     // reached per row because a segment may straddle the threshold. The
     // reference forwards its whole sequence itself, so nothing ahead of it is a
-    // system prompt placed by a projection: no prompt span.
+    // system prompt placed by a projection: no prompt span and no pins.
     let mut mask = vec![f32::NEG_INFINITY; t * total];
     let mut entries: Vec<u32> = Vec::new();
     for (i, row) in scores.iter().enumerate() {
         let qpos = past + i;
-        match selection_entries(row, qpos, r, cfg.top_k, &cfg.strata, 0, &mut entries) {
+        match selection_entries(row, qpos, r, cfg.top_k, &cfg.strata, 0, &[], &mut entries) {
             RowSelection::Dense => {
                 for j in 0..=qpos {
                     mask[i * total + j] = 0.0;

@@ -359,8 +359,8 @@ differently today:
 | Setting | zend | npcd | Rule |
 |---|---|---|---|
 | `prefill_pass_tokens` | sized from the card (`prefill_width`: VRAM × link) | 8192 (`runtime.rs:163`) | max, then clamped to the card's width |
-| `min_rope_factor` | 2 (schema `rope.min_yarn_factor`, `session.rs:1253`) | unset | max — RoPE schedule is the model's |
-| `qsa_selection_budget`, `qsa_strata` | CLI (`session.rs:1249-1250`) | unset | zend's; npcd sets none |
+| `qsa_selection_budget`, `qsa_strata` | CLI (`session.rs:1249-1250`), the pinned bound from the schema's `pin_tokens` | unset | zend's; npcd sets none |
+| `hit_layers` | the schema's `hits.layers` | unset | zend's; npcd sets none |
 | `max_response_tokens` | 65,536 (`session.rs:349`) | 16,384 (the builder default) | max |
 | guests (`<data>/guests.yaml`) | none | npcd's, when the file exists (`runtime.rs:3757`) | union |
 | `max_concurrent` | the builder's | the builder's | sum — each tenant's sessions count against one scheduler |
@@ -684,7 +684,7 @@ pub struct ModelKey {
     pub file: String,        // the checkpoint's general.name + ".gguf" — a description too
     pub weights: [u8; 32],   // WeightFiles::digest over every file the model loads from
     pub tokenizer: [u8; 32], // SHA-256 of tokenizer.json
-    pub rope: String,        // rope_key: the schedule and the minimum YaRN factor
+    pub rope: String,        // rope_key: the schedule
 }
 ```
 
@@ -700,12 +700,12 @@ across its tensor data, so a file rewritten under an unchanged header is caught 
 tensor overrides, the gate donor, adapters. None of it reads the whole file: 125 GB is
 identified in seconds.
 
-**RoPE identity.** Keys are stored rotated, so the schedule is part of the model: a
-different preset, rung table or minimum YaRN factor makes every stored key wrong while
-every shape still matches. `rope_key` writes the schedule's floats as bit patterns, so
-two schedules are the same key exactly when they rotate identically. A shared engine's
-minimum factor is every tenant's merged (§3.3), and an attaching tenant binds under
-the engine's (§3.2).
+**RoPE identity.** The schedule is part of the model: a different preset or rung
+table changes every key a later layer computed — every layer past the first attended
+under it — while every shape still matches. `rope_key` writes the schedule's floats as
+bit patterns, so two schedules are the same key exactly when they rotate identically.
+Every sequence takes the rung its reach calls for; no deployment raises it
+(`docs/hit_driven_projection.md` §4).
 
 Everything model-derived in a substrate — KV, recurrent snapshots, auxiliary state,
 branch checkpoints, provenance signatures, index pages, content-addressed sections,
@@ -894,7 +894,7 @@ Each phase lands green on its own and is useful on its own.
 | 4 | **Shared endpoints** (§3.5) | the overlaps served once as their superset; one identity rule, one role table, host accounts; both UIs on the chosen field meanings | unit per endpoint with raw expected bodies — both tenants' sections present, shared parts once, `timeline` a string, signed-out `/v1/me` a 200; `/ws/logs` neither drops nor repeats a line across replay; a header from a non-gateway peer is not believed. GUI: zend's status overlay, substrate page and perf page; npcd's console sign-in, substrate, tools and system pages |
 | 5 | **The prescribed model** (§5) | `host::MODEL` for every tenant; zend's ladder and `--model` removed; the fine-tune in `PRESETS` | unit: `MODEL` passes both tenants' capabilities; a capability `MODEL` lacks is refused with the tenant's name. Live: zend on a new substrate under the prescribed model — ingest rebuilds, chat works |
 | 6 | **zend and npcd equal** (§3.6) | priority by band alone, whichever tenant | unit: two tenants' `Low` sequences do not pause each other; either tenant's `High` pauses both tenants' `Low`, and the pause lifts at `COOLDOWN`; an npcd decode throttles a zend ingest prompt by its band's ratio, and a zend section chunk yields to an npcd dialogue |
-| 7 | **`motherd` on `.5`** | `motherd` deployed: both daemons in one process on `:8081` / `:8444`; npcd's mind and data on `.5`; the gateway points `bot.tokera.com` at `:8444` beside `code.tokera.com`. npcd's substrate was written by the AntiLoop + StyleTune fine-tune, which the host no longer prescribes (§5.1), so it refuses at open, before anything in it is rewritten (§4.2), and npcd starts `motherd` on a new `--data`. The new one must also be written under the engine's minimum YaRN factor — zend's `rope: min_yarn_factor: 2` — or it refuses the first time npcd runs beside zend (§4.1) | live: both GUIs through the gateway, both on the LAN, a refused start when a substrate's model is swapped |
+| 7 | **`motherd` on `.5`** | `motherd` deployed: both daemons in one process on `:8081` / `:8444`; npcd's mind and data on `.5`; the gateway points `bot.tokera.com` at `:8444` beside `code.tokera.com`. npcd's substrate was written by the AntiLoop + StyleTune fine-tune, which the host no longer prescribes (§5.1), so it refuses at open, before anything in it is rewritten (§4.2), and npcd starts `motherd` on a new `--data`. The new one is written under the engine's RoPE schedule, which both tenants share (§4.1) | live: both GUIs through the gateway, both on the LAN, a refused start when a substrate's model is swapped |
 
 Phase 1 is worth doing first and on its own: it closes a live corruption path in both
 daemons regardless of whether the host is built.

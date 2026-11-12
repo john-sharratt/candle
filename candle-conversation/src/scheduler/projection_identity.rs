@@ -139,9 +139,9 @@ mod tests {
     use crate::turn::Role;
 
     fn section(id: u32) -> ProjectionSegment {
-        ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection {
-            id: SectionId::new(id),
-        }))
+        ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(SectionId::new(
+            id,
+        ))))
     }
 
     fn turn(timeline: u64, index: u32, role: Role) -> ProjectionSegment {

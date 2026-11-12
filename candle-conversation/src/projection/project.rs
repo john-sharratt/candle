@@ -99,12 +99,14 @@ use super::adaptive::AnchorMember;
 use super::ids::{
     CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
 };
+use super::pins::{within_budget, Pin};
 use super::reconcile::{flexbox_distribute, FlexItem};
 use super::schema::{
     GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
     SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, WorkingSetShare,
 };
 use super::selection::{apply_selection, trim_to_budget_low_score_first};
+use super::slot_room::{segment_tokens, slot_room};
 use super::swap_cap::{cap_new_members, SwapCap};
 use super::working_set_pick;
 use super::working_set_pick::Standing;
@@ -250,6 +252,46 @@ impl ProjectionMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSection {
     pub id: SectionId,
+    /// Whether every selecting query attends it whole — its item's `pin:
+    /// true`, marked as the section is emitted.
+    pub pin: Pin,
+}
+
+impl ResolvedSection {
+    /// Section `id`, not pinned.
+    pub fn new(id: SectionId) -> Self {
+        Self { id, pin: Pin::No }
+    }
+}
+
+/// Mark every emitted system-prompt section with how `sp` pins it, held to
+/// the schema's `pin_tokens`: every whole pin that fits, then a pinned
+/// collection's members newest first (`within_budget`). A section the budget
+/// leaves out is selected by score like any other.
+fn mark_pins<R: ContentResolver>(
+    sp: &SystemPromptSchema,
+    resolver: &R,
+    segments: &mut [ProjectionSegment],
+) {
+    if sp.pins.is_empty() {
+        return;
+    }
+    let mut marked: Vec<(usize, Pin, usize)> = Vec::new();
+    for (i, seg) in segments.iter().enumerate() {
+        if let ProjectionSegment::Sealed(SealedKind::Section(s)) = seg {
+            let pin = sp.pins.pin_of(sp, s.id);
+            if pin != Pin::No {
+                marked.push((i, pin, resolver.section_token_count(s.id)));
+            }
+        }
+    }
+    let wanted: Vec<(Pin, usize)> = marked.iter().map(|&(_, p, t)| (p, t)).collect();
+    let keep = within_budget(&wanted, sp.pins.tokens);
+    for (&(i, pin, _), kept) in marked.iter().zip(keep) {
+        if let ProjectionSegment::Sealed(SealedKind::Section(s)) = &mut segments[i] {
+            s.pin = if kept { pin } else { Pin::No };
+        }
+    }
 }
 
 /// One emitted turn reference, fully self-describing via [`TurnId`].
@@ -1511,8 +1553,9 @@ pub fn run_with_sink<R: ContentResolver>(
                 // exactly "this conversation's own turns", its fork lineage
                 // first — 2-4 for a repo_map folder, every page read so far for
                 // a code_read file. Neither is trimmed by the flexbox pass
-                // below: the lineage is inviolate and the own turns are the
-                // conversation itself.
+                // below: an ingest conversation keeps its lineage whole, and
+                // the own turns are the conversation itself. (A dialogue's
+                // lineage is scored instead — `select_conversation`.)
                 //
                 // Dialogue retrieving this same content is untouched — the target
                 // is then the dialogue layer, not an append-only one, so this arm
@@ -1894,7 +1937,7 @@ pub fn run_with_sink<R: ContentResolver>(
         }
         None => selection,
     };
-    let system_prompt_segments: Vec<ProjectionSegment> = emit_system_prompt_items(
+    let mut system_prompt_segments: Vec<ProjectionSegment> = emit_system_prompt_items(
         &schema.system_prompt,
         resolver,
         mode,
@@ -1904,6 +1947,7 @@ pub fn run_with_sink<R: ContentResolver>(
         &mut selection_scores,
         &mut resolved_selections,
     );
+    mark_pins(&schema.system_prompt, resolver, &mut system_prompt_segments);
 
     if group_states.is_empty() {
         return Projection {
@@ -1975,6 +2019,31 @@ pub fn run_with_sink<R: ContentResolver>(
         own_window.max(below_windows)
     } else {
         own_window
+    };
+    // **The slot is fitted, not guessed** (`docs/hit_driven_projection.md` §4,
+    // §7.2). A target whose working set names a slot holds everything it
+    // places inside it: what the system prompt and the working set take is
+    // measured here, as emitted, and the conversation — the share that flexes
+    // — gets what is left of the slot after them and the reserve, never more
+    // than its window. So the slot stays in the trained window however large
+    // the prompt grows.
+    let turn_budget = match schema
+        .layers
+        .iter()
+        .find(|l| l.id == target.layer)
+        .and_then(|l| l.working_set.as_ref())
+    {
+        Some(ws) => {
+            let prompt = segment_tokens(&system_prompt_segments, resolver);
+            let carried: usize = group_states
+                .iter()
+                .filter(|gs| gs.working_set.is_some())
+                .flat_map(|gs| gs.selected.iter())
+                .map(|(k, _)| resolver.turn_token_count(*k))
+                .sum();
+            turn_budget.min(slot_room(ws, prompt + carried))
+        }
+        None => turn_budget,
     };
 
     // Natural token consumption per group (unbounded selection result).
@@ -2100,10 +2169,11 @@ pub fn run_with_sink<R: ContentResolver>(
 
             let selected_indices: Vec<TurnKey> = if gs.ingest_self {
                 // An ingest conversation's own group is its lineage and its own
-                // turns, and neither is the budget's to trim. The lineage is
-                // inviolate wherever it appears (`apply_selection`'s rule; it is
-                // bounded by `Substrate::INHERITED_CHAIN_TOKEN_CAP`, not by the
-                // window), and the own turns are the conversation itself — its
+                // turns, and neither is the budget's to trim. Its lineage is
+                // kept whole here (bounded by
+                // `Substrate::INHERITED_CHAIN_TOKEN_CAP`, not by the window) —
+                // unlike a dialogue's, which `select_conversation` scores from
+                // `lineage_base` — and the own turns are the conversation itself — its
                 // request and every page it has read since, bounded by its own
                 // read rounds. Trimmed by score, both lost to a tie: the own
                 // turns carry no belief yet and sort last by key, so a file
@@ -2316,7 +2386,7 @@ fn emit_summary<R: ContentResolver>(
         .filter(|&id| resolver.section_token_count(id) > 0);
     for id in std::iter::once(summary).chain(notes) {
         out.push(ProjectionSegment::Sealed(SealedKind::Section(
-            ResolvedSection { id },
+            ResolvedSection::new(id),
         )));
     }
 }
@@ -2547,7 +2617,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
                     // Empty options (e.g. a binary node's `absent`) emit nothing.
                     if let Some(v) = option.variant_for(tree.pack(&selection, node.ancestor_dims)) {
                         out.push(ProjectionSegment::Sealed(SealedKind::Section(
-                            ResolvedSection { id: v.id },
+                            ResolvedSection::new(v.id),
                         )));
                     }
                 }
@@ -2588,7 +2658,7 @@ fn push_section_segment(out: &mut Vec<ProjectionSegment>, s: &SectionSchema) {
         return;
     }
     out.push(ProjectionSegment::Sealed(SealedKind::Section(
-        ResolvedSection { id: s.id },
+        ResolvedSection::new(s.id),
     )));
 }
 
@@ -2980,7 +3050,7 @@ fn select_tree_collection_segments<R: ContentResolver>(
         if let Some(v) = tc.member_variant(i, active_key) {
             push_member_glue(&mut out, &tc.collection);
             out.push(ProjectionSegment::Sealed(SealedKind::Section(
-                ResolvedSection { id: v.id },
+                ResolvedSection::new(v.id),
             )));
         }
     }

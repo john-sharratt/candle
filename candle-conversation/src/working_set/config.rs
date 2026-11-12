@@ -47,6 +47,15 @@ pub struct WorkingSetConfig {
     /// and seeds are not counted — a lock answers a call the model just made.
     /// Never zero: the smallest cap still admits one whole conversation.
     pub max_admits: NonZeroUsize,
+    /// The most positions the dialogue's slot holds — the model's trained
+    /// window, so every sequence runs the trained RoPE
+    /// (`docs/hit_driven_projection.md` §4). Every share above, the layer's
+    /// window and [`Self::reserve_tokens`] fit inside it; the schema refuses
+    /// shares that do not.
+    pub slot_tokens: usize,
+    /// What the slot keeps back for what can arrive between two projections:
+    /// one cadence of decoded tokens, or one prefill chunk of an opening.
+    pub reserve_tokens: usize,
 }
 
 impl WorkingSetConfig {
@@ -96,6 +105,8 @@ mod tests {
             seeds: Vec::new(),
             release_on: vec!["write".into(), "file_edit".into()],
             max_admits: NonZeroUsize::new(2).unwrap(),
+            slot_tokens: 1_000_000,
+            reserve_tokens: 16_384,
         }
     }
 

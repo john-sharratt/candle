@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
-use crate::projection::{TimelineId, WorkingSetShare};
+use crate::projection::{HitMomentum, HitsConfig, TimelineId, WorkingSetShare};
 
 /// How much stronger a newcomer must be than the provenance it dislodges.
 /// Without the margin two files near the floor trade places every
@@ -112,6 +112,14 @@ pub struct WorkingSet {
     /// ([`Self::observe`]) — whether the reasoning was on it then, apart from
     /// the momentum it has carried since.
     fresh: HashMap<TimelineId, f32>,
+    /// Hit momentum per conversation: how much of it the model's own indexer
+    /// keeps reading (`docs/hit_driven_projection.md` §7.1), folded in by
+    /// [`Self::observe_hits`]. It lifts a conversation's strength wherever
+    /// momentum is judged, by [`Self::score_of`].
+    hits: HitMomentum<TimelineId>,
+    /// The `hits:` block the momentum was last folded under — its gain is how
+    /// far the momentum lifts.
+    hits_cfg: HitsConfig,
 }
 
 impl WorkingSet {
@@ -166,6 +174,31 @@ impl WorkingSet {
     /// `timeline`'s momentum, when it has any.
     pub fn momentum_of(&self, timeline: TimelineId) -> Option<f32> {
         self.momentum.get(&timeline).copied()
+    }
+
+    /// `timeline`'s hit momentum — `0` for one the indexer has not read.
+    pub fn hits_of(&self, timeline: TimelineId) -> f32 {
+        self.hits.get(timeline)
+    }
+
+    /// What `timeline`'s momentum is lifted by: `1 + gain · h`.
+    fn lift(&self, timeline: TimelineId) -> f32 {
+        self.hits.lift(timeline, &self.hits_cfg)
+    }
+
+    /// `timeline`'s strength: its momentum lifted by its hit momentum,
+    /// `momentum · (1 + gain · h)` (`docs/hit_driven_projection.md` §7.1) —
+    /// what every admission, eviction and retention here judges by. `None`
+    /// for one with no momentum.
+    pub fn score_of(&self, timeline: TimelineId) -> Option<f32> {
+        self.momentum_of(timeline).map(|m| m * self.lift(timeline))
+    }
+
+    /// Fold one stride's hit densities in ([`HitMomentum::fold`]) under
+    /// `cfg`, whose gain then lifts every judgment.
+    pub fn observe_hits(&mut self, density: &HashMap<TimelineId, f32>, cfg: &HitsConfig) {
+        self.hits.fold(density.iter().map(|(&t, &d)| (t, d)), cfg);
+        self.hits_cfg = cfg.clone();
     }
 
     /// `timeline`'s fresh score in the last scan folded in: `0` for one that
@@ -361,8 +394,12 @@ impl WorkingSet {
             }
         }
         self.fresh.clone_from(fresh);
-        self.momentum
-            .retain(|timeline, m| *m >= min_momentum || locked.contains(timeline));
+        // Retention judges strength, so a file the indexer keeps reading
+        // outlasts its fading provenance score.
+        let (hits, hits_cfg) = (&self.hits, &self.hits_cfg);
+        self.momentum.retain(|timeline, m| {
+            *m * hits.lift(*timeline, hits_cfg) >= min_momentum || locked.contains(timeline)
+        });
 
         let leaving: Vec<usize> = self
             .members
@@ -391,7 +428,7 @@ impl WorkingSet {
             .filter(|(timeline, _)| {
                 !self.is_member(**timeline) && !self.withheld.contains(timeline)
             })
-            .map(|(timeline, m)| (*timeline, *m))
+            .map(|(timeline, m)| (*timeline, *m * self.lift(*timeline)))
             .collect();
         newcomers.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.raw().cmp(&b.0.raw())));
         let mut admitted = 0usize;
@@ -443,7 +480,7 @@ impl WorkingSet {
 
     /// The voluntary members that must leave for `tokens` more voluntary
     /// tokens of `share` to fit, weakest first among those `may_dislodge`
-    /// allows (judged on their momentum) — or `None` when no such set makes it
+    /// allows (judged on their strength, [`Self::score_of`]) — or `None` when no such set makes it
     /// fit. On a momentum tie the one nearest the insertion point goes first:
     /// it moves the fewest members on its left. Locks count against nothing
     /// here; they sit on top. Guidance is a pool apart: it is bounded by
@@ -482,7 +519,7 @@ impl WorkingSet {
             .iter()
             .enumerate()
             .filter(|(_, m)| in_pool(m))
-            .map(|(i, m)| (i, self.momentum_of(m.timeline).unwrap_or(0.0)))
+            .map(|(i, m)| (i, self.score_of(m.timeline).unwrap_or(0.0)))
             .filter(|&(_, m)| may_dislodge(m))
             .collect();
         pool.sort_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)));
@@ -571,6 +608,62 @@ mod tests {
     fn observe(ws: &mut WorkingSet, fresh: &[(u64, f32)], budget: usize) {
         let fresh: HashMap<TimelineId, f32> = fresh.iter().map(|&(r, s)| (tl(r), s)).collect();
         ws.observe(&fresh, 0.2, 100.0, limits(budget), NonZeroUsize::MAX, &info);
+    }
+
+    fn read(raws: &[u64]) -> HashMap<TimelineId, f32> {
+        raws.iter().map(|&r| (tl(r), 1.0)).collect()
+    }
+
+    /// **A file the indexer keeps reading outlasts its fading score**: two
+    /// seeds at one momentum, only one read each stride. Two reprojections
+    /// later the unread one's momentum is under the floor and it leaves; the
+    /// read one's strength is its momentum lifted by `1 + h`.
+    #[test]
+    fn a_read_file_outlasts_an_unread_one() {
+        let mut ws = WorkingSet::default();
+        ws.seed(&[(tl(1), cand(1)), (tl(2), cand(2))], limits(1000), 150.0);
+        let cfg = HitsConfig::default();
+        ws.observe_hits(&read(&[1]), &cfg);
+        observe(&mut ws, &[], 1000);
+        assert_eq!(order(&ws), vec![1, 2], "120 each, both above the floor");
+        ws.observe_hits(&read(&[1]), &cfg);
+        observe(&mut ws, &[], 1000);
+        assert_eq!(order(&ws), vec![1], "96 unread leaves; 96 · 2.8 stays");
+        assert!((ws.hits_of(tl(1)) - 1.8).abs() < 1e-6);
+        assert!((ws.score_of(tl(1)).unwrap() - 96.0 * 2.8).abs() < 1e-3);
+        assert_eq!(ws.hits_of(tl(2)), 0.0);
+    }
+
+    /// **The weakest by strength is the one dislodged**: two members at one
+    /// momentum, the newcomer strong enough to dislodge either; the one the
+    /// indexer reads stays, whichever it is.
+    #[test]
+    fn hits_decide_which_member_a_newcomer_dislodges() {
+        for (kept_by_hits, dislodged) in [(1u64, 2u64), (2, 1)] {
+            let mut ws = WorkingSet::default();
+            ws.seed(&[(tl(1), cand(1)), (tl(2), cand(2))], limits(200), 1000.0);
+            ws.observe_hits(&read(&[kept_by_hits]), &HitsConfig::default());
+            observe(&mut ws, &[(3, 2500.0)], 200);
+            let members = order(&ws);
+            assert!(members.contains(&kept_by_hits), "{members:?}");
+            assert!(members.contains(&3), "{members:?}");
+            assert!(!members.contains(&dislodged), "{members:?}");
+        }
+    }
+
+    /// Hit momentum leaks like momentum and leaves the map once it lifts
+    /// nothing; with no hits folded in, strength is momentum.
+    #[test]
+    fn hit_momentum_leaks_and_leaves() {
+        let mut ws = WorkingSet::default();
+        ws.seed(&[(tl(1), cand(1))], limits(1000), 1000.0);
+        assert_eq!(ws.score_of(tl(1)), ws.momentum_of(tl(1)));
+        let cfg = HitsConfig::default();
+        ws.observe_hits(&read(&[1]), &cfg);
+        for _ in 0..60 {
+            ws.observe_hits(&HashMap::new(), &cfg);
+        }
+        assert_eq!(ws.hits_of(tl(1)), 0.0, "0.8^60 is under the floor");
     }
 
     /// **A fresh score is the last scan's alone**, apart from momentum: a

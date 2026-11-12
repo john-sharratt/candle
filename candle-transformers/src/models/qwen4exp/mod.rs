@@ -41,6 +41,7 @@ pub mod device_operand;
 pub mod draft;
 #[cfg(feature = "cuda")]
 pub mod engine;
+pub mod hits;
 pub mod hyper;
 #[cfg(feature = "cuda")]
 mod index_keys;

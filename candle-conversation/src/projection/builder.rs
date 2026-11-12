@@ -42,7 +42,9 @@ use std::sync::Arc;
 
 use super::adaptive::ScanPolicy;
 use super::error::ConstructionError;
+use super::hits::HitsConfig;
 use super::ids::{CollectionId, GroupId, LayerId, Reserved, SectionId};
+use super::pins::PinSet;
 use super::policy::SelectionPolicy;
 use super::project::{
     run, run_with_sink, PriorBelief, Projection, ProjectionMode, ProjectionTarget, SelectionState,
@@ -210,6 +212,7 @@ fn validate_selection(name: &str, rule: &SelectionRule) -> Result<(), Constructi
         SelectionRule::Sequence {
             recent,
             historical_top_k,
+            ..
         } if *recent == 0 && *historical_top_k == 0 => {
             Err(ConstructionError::InvalidConversationK {
                 name: name.to_string(),
@@ -1416,9 +1419,7 @@ impl Builder {
             // arguments are quotations asks with
             // [`Builder::free_tool_calls_from_penalties`].
             free_tool_calls_from_penalties: false,
-            // A single-section schema leaves the model's rungs to each
-            // sequence's reach.
-            min_yarn_factor: None,
+            hits: HitsConfig::default(),
             focus: false,
             system_prompt: SystemPromptSchema {
                 items: vec![SystemPromptItem::Section(SectionSchema {
@@ -1433,6 +1434,7 @@ impl Builder {
                     is_template: false,
                     template_tokens: None,
                 })],
+                pins: PinSet::default(),
             },
             layers: vec![LayerSchema {
                 id: layer_id,

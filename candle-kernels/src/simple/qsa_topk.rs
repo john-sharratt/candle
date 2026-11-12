@@ -10,7 +10,10 @@
 //!   n_cand/qpos     device u32[n_rows]
 //!   tail_len        device u32[n_rows] — cells of its own block the query has
 //!   prompt_blocks   device u32[n_rows] — blocks wholly inside the system prompt
-//!   entries         device u32[n_rows * entry_stride] — ascending by block
+//!   pins            device u32[2 · MAX_PINS · n_rows] — row `r`'s pinned range
+//!                   `k` is `[pins[2k·n_rows + r], pins[(2k+1)·n_rows + r])`,
+//!                   disjoint, empty when the two agree
+//!   entries        device u32[n_rows * entry_stride] — ascending by block
 //!   cnt             device u32[n_rows] — entries written, or `DENSE_ROW`
 //!   window_blocks   candidate blocks per window; `0` is one window
 //!   recent_blocks   the recent span nearest the query
@@ -34,6 +37,10 @@ pub const MAX_KEEP: usize = 1024 - 256;
 /// `qsa_topk::MAX_ENTRIES` in the `.cu`: with the survivor buffer it is the
 /// kernel's dynamic shared memory, 8 KiB + 64 KiB.
 pub const MAX_ENTRIES: usize = 16384;
+
+/// The most pinned ranges one row carries. Mirrors `QSA_MAX_PINS` in
+/// `qsa_select.cuh`.
+pub const MAX_PINS: usize = 4;
 
 /// The most blocks a split launch runs. Mirrors `qsa_topk::SPLIT_BLOCKS`.
 pub const SPLIT_BLOCKS: usize = 512;
@@ -60,6 +67,7 @@ extern "C" {
         qpos: *const u32,
         tail_len: *const u32,
         prompt_blocks: *const u32,
+        pins: *const u32,
         entries: *mut u32,
         entry_stride: i32,
         cnt: *mut u32,

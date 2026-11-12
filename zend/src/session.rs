@@ -9933,13 +9933,25 @@ mod projection_schema_tests {
             .working_set
             .as_ref()
             .expect("the dialogue declares a working set");
-        assert_eq!(ws.budget_tokens, 122_000);
-        assert_eq!(ws.lock_tokens, 150_000);
+        assert_eq!(ws.budget_tokens, 64_000);
+        assert_eq!(ws.lock_tokens, 48_000);
         assert_eq!(ws.folder_tokens, 10_000);
-        assert_eq!(ws.guidance_tokens, 40_000);
+        assert_eq!(ws.guidance_tokens, 16_000);
         assert_eq!(ws.beta, 0.2);
         assert_eq!(ws.min_momentum, 100.0);
-        assert_eq!(ws.max_file_tokens, 100_000);
+        assert_eq!(ws.max_file_tokens, 48_000);
+        // The working set's shares and the reserve fit the trained window, and
+        // the dialogue's window — a cap each projection fits to what the slot
+        // has left — is inside it (`docs/hit_driven_projection.md` §4).
+        assert_eq!((ws.slot_tokens, ws.reserve_tokens), (262_144, 16_384));
+        assert!(
+            ws.budget_tokens + ws.lock_tokens + ws.guidance_tokens + ws.reserve_tokens
+                <= ws.slot_tokens
+        );
+        assert!(layer("dialogue").window <= ws.slot_tokens);
+        // The persona and the journal are pinned, within 1,024 positions.
+        assert!(!schema.system_prompt.pins.is_empty());
+        assert_eq!(schema.system_prompt.pins.tokens, 1024);
         assert_eq!(ws.seeds.len(), 17);
         assert_eq!(ws.seeds[0], "candle/zend/");
 
@@ -10095,14 +10107,6 @@ mod projection_schema_tests {
             },
         );
         assert_eq!(group.score_threshold, None);
-    }
-
-    /// The shipped schema floors every sequence at the ×2 YaRN rung — the
-    /// value `load` hands to `ModelBuilder::min_rope_factor`.
-    #[test]
-    fn projection_yaml_sets_the_min_yarn_factor() {
-        let builder = build_projection_builder(Path::new("demo-project"));
-        assert_eq!(builder.schema().min_yarn_factor, Some(2.0));
     }
 }
 

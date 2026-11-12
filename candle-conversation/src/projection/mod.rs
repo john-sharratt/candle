@@ -207,12 +207,14 @@ mod error;
 pub(crate) mod event;
 mod group_votes;
 mod held_index_pages;
+mod hits;
 mod ids;
 pub mod layer_toggle;
 pub mod operation;
 mod owned_prefix;
 mod owned_sections;
 mod persisted_ids;
+mod pins;
 mod plain_prompt;
 mod policy;
 mod project;
@@ -224,6 +226,7 @@ mod schema;
 mod score;
 mod script;
 mod selection;
+mod slot_room;
 mod swap_cap;
 pub mod warm_pool;
 pub(crate) mod working_set_observe;
@@ -264,12 +267,14 @@ pub use event::{
     SelectedSection, SelectedTurn, SelectionScores, SystemItem,
 };
 pub use group_votes::GroupVotes;
+pub use hits::{HitMomentum, HitsConfig};
 pub use ids::{
     process_timeline_allocator, CollectionId, GroupId, LayerId, Reserved, SectionId,
     TimelineAllocator, TimelineId, TurnId, TurnIndex, TurnKey,
 };
 pub use owned_prefix::prefix_before_collection;
 pub use owned_sections::{OwnedSection, OwnedSections};
+pub use pins::{within_budget, Pin, PinSet};
 pub use plain_prompt::PlainPromptFrames;
 pub use policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 pub(crate) use project::turn_belief_key;
@@ -290,6 +295,7 @@ pub use schema::{
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Recency, Schema, ScoreFormula,
     SectionCollection, SectionSchema, SectionTree, SelectionRule, SystemPromptItem,
     SystemPromptSchema, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
+    LINEAGE_BASE,
 };
 pub use script::{recorded_dials, ProjectionScript};
 pub use working_set_pick::{Standing, WorkingSetMembers};

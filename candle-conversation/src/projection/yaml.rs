@@ -75,8 +75,10 @@ use super::adaptive::{
     ScanPolicy,
 };
 use super::error::ConstructionError;
+use super::hits::HitsConfig;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::persisted_ids;
+use super::pins::PinSet;
 use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
@@ -84,7 +86,7 @@ use super::schema::{
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Recency, Schema, SectionCollection,
     SectionSchema, SectionTree, SelectionDefault, SelectionRule, SystemPromptItem,
     SystemPromptSchema, TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary,
-    WorkingSetShare,
+    WorkingSetShare, LINEAGE_BASE,
 };
 use super::swap_cap::DEFAULT_MAX_SWAPS;
 use crate::summary_tree::scope::Scope;
@@ -166,20 +168,36 @@ struct YamlSchema {
     /// other.** See [`super::schema::Schema::free_tool_calls_from_penalties`].
     #[serde(default)]
     free_tool_calls_from_penalties: bool,
-    /// Engine-wide RoPE settings — see [`YamlRope`].
+    /// How hits are counted and move a piece's score — see [`YamlHits`].
     #[serde(default)]
-    rope: YamlRope,
+    hits: Option<YamlHits>,
 }
 
-/// The top-level `rope:` block. RoPE is a property of the model every layer
-/// shares, so it sits beside `layers:`, not inside one.
-#[derive(Deserialize, Default)]
+/// The top-level `hits:` block (`docs/hit_driven_projection.md` §6.1, §7.1).
+/// Every field left out takes [`HitsConfig::default`]'s.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct YamlRope {
-    /// The lowest progressive-YaRN factor any sequence runs at — see
-    /// [`super::schema::Schema::min_yarn_factor`].
+struct YamlHits {
+    /// Percentiles over the selecting layers.
     #[serde(default)]
-    min_yarn_factor: Option<f32>,
+    layers: Option<Vec<u8>>,
+    #[serde(default)]
+    gain: Option<f32>,
+    #[serde(default)]
+    beta: Option<f32>,
+}
+
+impl YamlHits {
+    fn resolve(self) -> Result<HitsConfig, ConstructionError> {
+        let d = HitsConfig::default();
+        HitsConfig::new(
+            self.layers
+                .unwrap_or_else(|| d.layers.percentiles().to_vec()),
+            self.gain.unwrap_or(d.gain),
+            self.beta.unwrap_or(d.beta),
+        )
+        .map_err(ConstructionError::InvalidHits)
+    }
 }
 
 /// A `policy:` block: an optional preset base plus per-field overrides and an
@@ -296,6 +314,49 @@ struct YamlSystemPrompt {
     /// interleaved with selectable subsets.
     #[serde(default)]
     items: Vec<YamlSystemPromptItem>,
+    /// The most positions the items flagged `pin: true` may cover together
+    /// (`docs/hit_driven_projection.md` §5); required when any item is.
+    #[serde(default)]
+    pin_tokens: usize,
+}
+
+/// The names of the items flagged `pin: true`, in declaration order: top-level
+/// sections and collections, and section-tree nodes at any depth.
+fn pinned_names(items: &[YamlSystemPromptItem]) -> Vec<String> {
+    fn nodes(out: &mut Vec<String>, ns: &[YamlTreeNode]) {
+        for n in ns {
+            match n {
+                YamlTreeNode::Section { id, pin: true, .. }
+                | YamlTreeNode::Optional { id, pin: true, .. }
+                | YamlTreeNode::Selector { id, pin: true, .. } => out.push(id.clone()),
+                YamlTreeNode::Collection {
+                    name, pin: true, ..
+                } => out.push(name.clone()),
+                YamlTreeNode::SectionTree { nodes: inner } => nodes(out, inner),
+                YamlTreeNode::OptionalGroup {
+                    nodes: inner,
+                    absent,
+                    ..
+                } => {
+                    nodes(out, inner);
+                    nodes(out, absent);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            YamlSystemPromptItem::Section { id, pin: true, .. } => out.push(id.clone()),
+            YamlSystemPromptItem::Collection {
+                name, pin: true, ..
+            } => out.push(name.clone()),
+            YamlSystemPromptItem::SectionTree { nodes: ns } => nodes(&mut out, ns),
+            _ => {}
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -369,6 +430,10 @@ struct YamlLayerSummary {
 enum YamlSystemPromptItem {
     Section {
         id: String,
+        /// Every selecting query attends this section whole
+        /// (`docs/hit_driven_projection.md` §5).
+        #[serde(default)]
+        pin: bool,
         #[serde(default)]
         content: String,
         #[serde(default)]
@@ -410,6 +475,10 @@ enum YamlSystemPromptItem {
     },
     Collection {
         name: String,
+        /// Every selecting query attends the collection's members whole, the
+        /// newest first as far as `pin_tokens` allows.
+        #[serde(default)]
+        pin: bool,
         #[serde(default)]
         selection: YamlSelection,
         #[serde(default)]
@@ -464,6 +533,9 @@ enum YamlTreeNode {
     /// Mandatory single-content node — always emits its content.
     Section {
         id: String,
+        /// Attended whole by every selecting query.
+        #[serde(default)]
+        pin: bool,
         #[serde(default)]
         content: String,
         /// Dialect template source (e.g. `no_think_prefix`); resolved to a
@@ -482,6 +554,9 @@ enum YamlTreeNode {
     /// is the selector id the runtime flips.
     Optional {
         id: String,
+        /// Attended whole by every selecting query, when present.
+        #[serde(default)]
+        pin: bool,
         #[serde(default)]
         content: String,
         #[serde(default)]
@@ -494,6 +569,9 @@ enum YamlTreeNode {
     /// the node `id`).  Exactly one option emits.
     Selector {
         id: String,
+        /// Whichever option emits is attended whole by every selecting query.
+        #[serde(default)]
+        pin: bool,
         /// The option id used when the runtime supplies no selection.
         default: String,
         options: Vec<YamlTreeOption>,
@@ -524,6 +602,10 @@ enum YamlTreeNode {
     /// catalog never multiply it.
     Collection {
         name: String,
+        /// Every selecting query attends the members whole, the newest first
+        /// as far as `pin_tokens` allows.
+        #[serde(default)]
+        pin: bool,
         #[serde(default)]
         selection: YamlSelection,
         #[serde(default)]
@@ -813,6 +895,10 @@ struct YamlSelection {
     recent: Option<usize>,
     #[serde(default)]
     historical_top_k: Option<usize>,
+    /// `kind: conversation` only — the score an inherited lineage turn is
+    /// never ranked below; [`LINEAGE_BASE`] when absent.
+    #[serde(default)]
+    lineage_base: Option<f32>,
     #[serde(default)]
     selector: Option<String>,
     /// `kind: working_set` only — `folders` or `remainder`.
@@ -883,6 +969,12 @@ struct YamlWorkingSet {
     /// absent.
     #[serde(default)]
     max_admits: Option<usize>,
+    /// The most positions the dialogue's slot holds — the model's trained
+    /// window (`docs/hit_driven_projection.md` §4).
+    slot_tokens: usize,
+    /// What the slot keeps back for what arrives between two projections:
+    /// one cadence of decoded tokens or one prefill chunk.
+    reserve_tokens: usize,
 }
 
 // ── Conversion ────────────────────────────────────────────────────────────────
@@ -944,9 +1036,11 @@ fn parse_draws(
 
 /// Resolve a layer's `working_set:` block, refusing values the arithmetic
 /// cannot use: a leak outside `(0, 1]`, a folder share larger than the whole,
-/// a negative floor, a zero file cap.
+/// a negative floor, a zero file cap — and shares that, with the layer's own
+/// `window` and the reserve, would not fit the slot.
 fn parse_working_set(
     layer: &str,
+    window: usize,
     yw: Option<&YamlWorkingSet>,
 ) -> Result<Option<WorkingSetConfig>, ConstructionError> {
     let Some(yw) = yw else {
@@ -968,6 +1062,22 @@ fn parse_working_set(
     if yw.max_file_tokens == 0 {
         return Err(invalid("max_file_tokens must be > 0"));
     }
+    // The working set's shares are ceilings it may fill at once, so with the
+    // reserve they must fit the slot. The conversation's `window` is a cap on
+    // what flexes, not a share: each projection fits it to what the slot has
+    // left after the system prompt and the working set, as measured
+    // (`slot_room`), so it may be as large as the slot.
+    let filled = yw.budget_tokens + yw.guidance_tokens + yw.lock_tokens + yw.reserve_tokens;
+    if filled > yw.slot_tokens || window > yw.slot_tokens {
+        return Err(ConstructionError::InvalidPolicy {
+            name: layer.to_string(),
+            reason: format!(
+                "working_set: budget_tokens + guidance_tokens + lock_tokens + reserve_tokens is \
+                 {filled} and the layer's window {window}; neither may pass slot_tokens {}",
+                yw.slot_tokens
+            ),
+        });
+    }
     let max_admits = match yw.max_admits {
         None => DEFAULT_MAX_SWAPS,
         Some(n) => NonZeroUsize::new(n).ok_or_else(|| {
@@ -985,6 +1095,8 @@ fn parse_working_set(
         seeds: yw.seeds.clone(),
         release_on: yw.release_on.clone(),
         max_admits,
+        slot_tokens: yw.slot_tokens,
+        reserve_tokens: yw.reserve_tokens,
     }))
 }
 
@@ -1370,7 +1482,7 @@ fn build(
             description: yl.description.clone(),
             score_threshold: yl.score_threshold,
             window: yl.window,
-            working_set: parse_working_set(&yl.name, yl.working_set.as_ref())?,
+            working_set: parse_working_set(&yl.name, yl.window, yl.working_set.as_ref())?,
             budget: layer_budget,
             dials,
             summary: layer_summary,
@@ -1392,17 +1504,14 @@ fn build(
         });
     }
 
-    if let Some(f) = raw.rope.min_yarn_factor {
-        if !f.is_finite() || f < 1.0 {
-            return Err(ConstructionError::InvalidMinYarnFactor(f));
-        }
-    }
-
     let schema = Schema {
         layers,
         system_prompt,
         free_tool_calls_from_penalties: raw.free_tool_calls_from_penalties,
-        min_yarn_factor: raw.rope.min_yarn_factor,
+        hits: match raw.hits {
+            Some(h) => h.resolve()?,
+            None => HitsConfig::default(),
+        },
         focus: false,
     };
     Ok((schema, maps))
@@ -1491,6 +1600,7 @@ fn build_system_prompt(
         match entry {
             YamlSystemPromptItem::Section {
                 id,
+                pin: _,
                 content,
                 priority,
                 depends_on,
@@ -1582,6 +1692,7 @@ fn build_system_prompt(
             }
             YamlSystemPromptItem::Collection {
                 name,
+                pin: _,
                 selection,
                 score_threshold,
                 policy: coll_policy_yaml,
@@ -1680,7 +1791,13 @@ fn build_system_prompt(
         }
     }
 
-    Ok(SystemPromptSchema { items })
+    let mut sp = SystemPromptSchema {
+        items,
+        pins: PinSet::default(),
+    };
+    sp.pins = PinSet::resolve(&pinned_names(&raw_sp.items), raw_sp.pin_tokens, &sp)
+        .map_err(ConstructionError::InvalidPins)?;
+    Ok(sp)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1969,6 +2086,7 @@ fn flatten_tree_specs<'a>(
         let (id, options, default_option) = match n {
             YamlTreeNode::Section {
                 id,
+                pin: _,
                 content,
                 dialect: d,
                 inject_collection: _,
@@ -1985,6 +2103,7 @@ fn flatten_tree_specs<'a>(
             }
             YamlTreeNode::Optional {
                 id,
+                pin: _,
                 content,
                 dialect: d,
                 default,
@@ -2019,6 +2138,7 @@ fn flatten_tree_specs<'a>(
             }
             YamlTreeNode::Selector {
                 id,
+                pin: _,
                 default,
                 options,
             } => {
@@ -2050,6 +2170,7 @@ fn flatten_tree_specs<'a>(
             }
             YamlTreeNode::Collection {
                 name,
+                pin: _,
                 selection,
                 score_threshold,
                 sections,
@@ -2669,9 +2790,17 @@ fn parse_selection(name: &str, ys: &YamlSelection) -> Result<SelectionRule, Cons
                     name: name.to_string(),
                 });
             }
+            let lineage_base = ys.lineage_base.unwrap_or(LINEAGE_BASE);
+            if !lineage_base.is_finite() || lineage_base < 0.0 {
+                return Err(ConstructionError::InvalidPolicy {
+                    name: name.to_string(),
+                    reason: format!("lineage_base must be a finite score >= 0, got {lineage_base}"),
+                });
+            }
             Ok(SelectionRule::Sequence {
                 recent,
                 historical_top_k,
+                lineage_base,
             })
         }
         "working_set" => {

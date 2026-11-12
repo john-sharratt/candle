@@ -168,10 +168,6 @@ impl ManagedBatchedModel for HybridBatched {
         self.rope().select().clone()
     }
 
-    fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
-        HybridBatched::set_rope_min_factor(self, min)
-    }
-
     fn forward_wave(
         &self,
         session: &mut BatchedInferenceSession,

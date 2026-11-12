@@ -6,7 +6,7 @@
 
 ## 1. The idea
 
-Every dialogue carries a **working set**: a voluntary token budget (150K) of
+Every dialogue carries a **working set**: a voluntary token budget (64K) of
 already-ingested `code_reading` files and `repo_map` folders, projected ahead of
 its own turns as **one sequence in the order its members entered**. The unit is
 always a **whole ingest conversation** — one file or one folder.
@@ -124,7 +124,7 @@ system prompt
 inherited chain         the dialogue group's lineage turns
 repo_map/structure      provenance folders, then pinned       ┐ working set: provenance ≤ budget_tokens,
 code_reading/scopes     provenance files,   then pinned       ┘ locks ≤ lock_tokens on top
-dialogue                its own turns: recent 16 + historical 8, its own 116K window
+dialogue                its own turns: recent 16 + historical 8, its own 96K window
 ```
 
 The working set sits between the conversation's opening and its own turns, so
@@ -217,12 +217,15 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
 ```yaml
   - name: dialogue
     working_set:
-      budget_tokens: 150000      # seeds + provenance, folders and files together
-      lock_tokens: 150000        # the locks, on top of budget_tokens
+      slot_tokens: 262144        # the slot every share fills: the trained window
+      reserve_tokens: 16384      # what arrives between two projections
+      budget_tokens: 64000       # seeds + provenance, folders and files together
+      lock_tokens: 48000         # the locks, on top of budget_tokens
       folder_tokens: 10000       # repo_map's share of budget_tokens
+      guidance_tokens: 16000     # the guidance pool, beside budget_tokens
       beta: 0.2                  # per-file momentum leak (§4.3)
       min_momentum: 100          # below this a file is not a provenance candidate
-      max_file_tokens: 100000    # one file above this is never seeded or locked
+      max_file_tokens: 48000     # one file above this is never seeded or locked
       seeds:
         - candle/zend/
         - candle/zend/src/
@@ -379,7 +382,7 @@ which no longer selects anything here. The scan's own settings
 fresh scores momentum is built from.
 
 The dialogue group loses its injection splice (`resolver.rs:4546-4551`): it holds
-lineage and its own turns only, and its 116K window is its own again.
+lineage and its own turns only, and its 96K window is its own again.
 
 ### 4.5 Reads — every one runs, and the loop withholds what it read
 
@@ -695,15 +698,17 @@ or not yet sealed reads as absent, and the unit's own opening stands.
 
 ## 5. Constraints and cost
 
-- **Context length.** Flash-Next is trained to 262,144 positions; progressive
-  YaRN (`qwen4exp/rope.rs`) carries it ×2 to 524,288. 150K voluntary + 150K of
-  locks + the dialogue's 116K (which includes the 100K lineage cap) is ~416K at
-  the most, leaving ~108K before the slot climbs to ×4. A slot's rung follows its deepest position, so **a dialogue past
-  262K runs factor 2 at every position, its own turns included** — the working
-  set changes the whole conversation's rotation, not just its reach. The
-  shipped schema's `rope: min_yarn_factor: 2` puts every dialogue on ×2 from
-  its first token, so the rotation does not change when it crosses 262K. The only length checks are against the RoPE
-  reach (`prefill.rs:2052`); `max_seq_len` is ignored for this architecture.
+- **Context length.** Flash-Next is trained to 262,144 positions, and the
+  dialogue's slot stays inside them (`docs/hit_driven_projection.md` §4): 64K
+  voluntary + 16K of guidance + 48K of locks + the 16K reserve must fit
+  `slot_tokens` at parse, and each projection gives the conversation — at most
+  its 96K window, which includes the 64K lineage cap — what the slot has left
+  after the system prompt and the working set as emitted. A slot's rung follows its deepest
+  position, so a dialogue inside the trained window runs the trained RoPE at
+  every position. Progressive YaRN (`qwen4exp/rope.rs`) still carries a
+  sequence a caller drives deeper ×2 to 524,288. The only length checks are
+  against the RoPE reach (`prefill.rs:2052`); `max_seq_len` is ignored for this
+  architecture.
 - **Sparse attention.** Flash-Next has 12 attention layers (every 4th of 48) and
   36 recurrent. Spliced content reaches the attention layers only, through QSA's
   indexer, which keeps `top_k = 2048` index rows per query per layer. "The model
@@ -723,8 +728,9 @@ or not yet sealed reads as absent, and the unit's own opening stands.
   enabled, the draft head must be checked to rotate by the slot's rung past
   262K, or its drafts will be rejected at depth.
 
-Budget ships at 150K voluntary + 150K of locks (D10); the §7 measurement watches
-these numbers.
+Budget ships at 64K voluntary + 48K of locks + 16K of guidance (D10), inside the
+trained window's slot with the reserve, the conversation fitted to what is left; the §7
+measurement watches these numbers.
 
 ## 6. Code map
 
@@ -801,7 +807,7 @@ these numbers.
 
 | # | Question | Decided |
 |---|---|---|
-| D1 | Past the 262K trained length | Progressive YaRN ×2 reaches 524,288; the schema floors every sequence at ×2 (`rope: min_yarn_factor: 2`). |
+| D1 | Past the 262K trained length | The dialogue never goes there: its shares fit `slot_tokens`, the trained window, and every sequence takes the rung its reach calls for (`docs/hit_driven_projection.md` §4). |
 | D2 | What release does to locks | Demote to provenance with momentum `1000/β` (the settled level of a full-strength hit). |
 | D3 | Tie-break | Most recently locked wins. |
 | D4 | Which calls release | File writes (the written file's lock alone), git writes, `run_command`, `code_run`, `code_session_exec` (every lock) — registry-checked names. Plus the promising reply leaving the projection; never a user message. |
@@ -810,7 +816,7 @@ these numbers.
 | D7 | Provenance unit | Whole files and folders. |
 | D8 | Seed list | §4.2 draft, to be edited. |
 | D9 | Fade rate | Per-file momentum at β 0.2, leaking by its own value. |
-| D10 | Default budget | 150K voluntary, locks on top up to 150K. What fills the voluntary budget is arbitrary until the scores momentum is fed rank files against each other (§4.1, §4.3). |
+| D10 | Default budget | 64K voluntary, locks on top up to 48K, guidance 16K, with the 16K reserve inside the 262,144-position slot; the conversation gets what the slot leaves after the system prompt and the working set, at most its 96K window (`docs/hit_driven_projection.md` §4). Strength is momentum lifted by the model's own hits (§4.3, `hit_driven_projection.md` §7.1). |
 | D11 | Momentum store | In `WorkingSet`, not the belief carry; in-memory. |
 | D12 | Restart | Served calls are marked on their turn (`working_set:lock:<tl>`, `working_set:release:<tl>`, `working_set:release`) through the existing persisted turn tags, which every gather-scope reader ignores; locks rebuild from the marks. Momentum rebuilds from the scan. |
 | D13 | Folder vs file budget | `folder_tokens` slice for `repo_map`, the rest for `code_reading`. |

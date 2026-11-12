@@ -41,11 +41,12 @@ use candle::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::append_grids::AppendGrids;
 use super::capture_rows::CaptureRows;
 use super::config::IndexerConfig;
+use super::hits::block_range;
 /// Block keys per live-tail key page — see `index_keys`.
 pub use super::index_keys::PAGE_BLOCKS;
 use super::index_keys::{
@@ -54,8 +55,8 @@ use super::index_keys::{
 };
 use super::qsa::IndexerWeights;
 use super::qsa_select::{
-    entry_block, entry_cells, max_entries_for, max_gathered_for, max_keep, selected_width, Strata,
-    MAX_RATIO,
+    entry_block, entry_cells, max_entries_for, max_gathered_for, max_keep, merge_ranges,
+    selected_width, PinRow, Strata, MAX_PINS, MAX_RATIO,
 };
 use super::resident_page::ResidentPage;
 use super::rows_matmul::rows_matmul_t;
@@ -269,6 +270,18 @@ pub struct IndexCache {
     /// the pages do, and travel wherever they travel — a view carve, a move, a
     /// rebuild that keeps the prefix.
     prompt_end: usize,
+    /// The position ranges of the system prompt every query attends whole —
+    /// the pinned items (`docs/hit_driven_projection.md` §5). Sorted,
+    /// disjoint; empty when nothing is pinned. Like [`Self::prompt_end`] it
+    /// describes the page layout, so it moves with every splice and cut.
+    pins: Vec<Range<usize>>,
+    /// Counts every change to the pins or the page layout — what a cached
+    /// [`PinRow`] is valid for.
+    layout_gen: u64,
+    /// The last [`Self::pin_row`] built: `(layout_gen, ratio, max_blocks,
+    /// row)`. A row changes only when the pins or the pages do, and it is
+    /// asked for at every selecting layer of every wave.
+    pin_cache: Mutex<Option<(u64, usize, usize, PinRow)>>,
 }
 
 /// One thing [`IndexCache::splice_pages`] puts in place.
@@ -329,12 +342,62 @@ impl IndexCache {
             page_rows: vec![0],
             tail_base: 0,
             prompt_end: 0,
+            pins: Vec::new(),
+            layout_gen: 0,
+            pin_cache: Mutex::new(None),
         })
     }
 
     /// Record where the conversation's system prompt ends.
     pub fn set_prompt_end(&mut self, pos: usize) {
         self.prompt_end = pos;
+    }
+
+    /// Record the position ranges every query attends whole, replacing any
+    /// before. Sorted and merged here, so the cache always holds disjoint
+    /// ranges.
+    pub fn set_pins(&mut self, ranges: &[Range<usize>]) {
+        self.pins = merge_ranges(ranges);
+        self.layout_gen += 1;
+    }
+
+    /// The pinned position ranges, sorted and disjoint.
+    pub fn pins(&self) -> &[Range<usize>] {
+        &self.pins
+    }
+
+    /// The pinned ranges as blocks, through the page layout, as a row of at
+    /// most `max_blocks` ([`PinRow::new`]): a range covers from the block its
+    /// first position falls in to the last block wholly inside it. A pinned
+    /// block a query cannot see yet is clipped by the kernel at the row's
+    /// candidates.
+    pub fn pin_row(&self, ratio: usize, max_blocks: usize) -> PinRow {
+        if self.pins.is_empty() {
+            return PinRow::EMPTY;
+        }
+        let mut cache = self
+            .pin_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((g, r, m, row)) = *cache {
+            if (g, r, m) == (self.layout_gen, ratio, max_blocks) {
+                return row;
+            }
+        }
+        let blocks: Vec<Range<usize>> = self
+            .pins
+            .iter()
+            .map(|r| self.block_range(r, ratio))
+            .collect();
+        let row = PinRow::new(&blocks, max_blocks);
+        *cache = Some((self.layout_gen, ratio, max_blocks, row));
+        row
+    }
+
+    /// The blocks position range `r` covers through this cache's page layout
+    /// ([`block_range`]) — the rule pins and hit pieces both go by.
+    pub fn block_range(&self, r: &Range<usize>, ratio: usize) -> Range<usize> {
+        block_range(r, |pos| self.candidates_at(pos, ratio))
     }
 
     /// Where the conversation's system prompt ends — `0` when none was set.
@@ -669,6 +732,9 @@ impl IndexCache {
             tail_base: 0,
             // A restored cache holds no projection; the next one sets it.
             prompt_end: 0,
+            pins: Vec::new(),
+            layout_gen: 0,
+            pin_cache: Mutex::new(None),
         })
     }
 
@@ -711,6 +777,7 @@ impl IndexCache {
         self.page_rows.push(self.page_rows.last().unwrap() + rows);
         self.pages.push(PlacedPage { page, base, tokens });
         self.tail_base = base + tokens;
+        self.layout_gen += 1;
         Ok(())
     }
 
@@ -745,6 +812,7 @@ impl IndexCache {
             );
         }
         self.tail_base = base;
+        self.layout_gen += 1;
         Ok(())
     }
 
@@ -897,6 +965,9 @@ impl IndexCache {
             page_rows: self.page_rows.clone(),
             tail_base: self.tail_base,
             prompt_end: self.prompt_end,
+            pins: self.pins.clone(),
+            layout_gen: self.layout_gen,
+            pin_cache: Mutex::new(None),
         })
     }
 
@@ -950,6 +1021,8 @@ impl IndexCache {
         self.page_rows.truncate(1);
         self.tail_base = 0;
         self.prompt_end = 0;
+        self.pins.clear();
+        self.layout_gen += 1;
         self.pages.drain(..).map(|p| p.page).collect()
     }
 
@@ -998,6 +1071,14 @@ impl IndexCache {
         self.tail_base = pos;
         // A prompt is a prefix: a cut below its end keeps only what it kept.
         self.prompt_end = self.prompt_end.min(pos);
+        // So is each pin: a cut keeps what of it lies below.
+        self.pins = self
+            .pins
+            .iter()
+            .map(|r| r.start.min(pos)..r.end.min(pos))
+            .filter(|r| !r.is_empty())
+            .collect();
+        self.layout_gen += 1;
         Ok(self.pages.drain(keep..).map(|p| p.page).collect())
     }
 
@@ -1060,6 +1141,20 @@ impl IndexCache {
         } else if self.prompt_end > from {
             self.prompt_end = from;
         }
+        // A pin keeps what of it lies outside the splice, never the new
+        // content: its part before the splice stays, its part after moves with
+        // what follows, and a pin across the splice becomes the two.
+        self.pins = self
+            .pins
+            .iter()
+            .flat_map(|r| {
+                let before = r.start..r.end.min(from);
+                let after = moved(r.start.max(to))..moved(r.end.max(to));
+                [before, after]
+            })
+            .filter(|r| !r.is_empty())
+            .collect();
+        self.layout_gen += 1;
         Ok(taken)
     }
 
@@ -1960,6 +2055,9 @@ impl SelectionTable {
         // Blocks wholly inside each query's system prompt — ranked in every
         // window of a stratified selection. See `IndexCache::prompt_blocks`.
         prompt: &[u32],
+        // Each query's pinned block ranges — attended whole, outside every
+        // window. See `IndexCache::pin_row`.
+        pins: &[PinRow],
         ratio: usize,
         top_k: usize,
         row_base: usize,
@@ -1975,27 +2073,43 @@ impl SelectionTable {
             candle::bail!("qsa selection runs on CUDA");
         };
         let stream = dev.cuda_stream();
-        if tail.len() != rows || prompt.len() != rows {
+        if tail.len() != rows || prompt.len() != rows || pins.len() != rows {
             candle::bail!(
-                "qsa selection: {} tail lengths and {} prompt spans against {rows} rows",
+                "qsa selection: {} tail lengths, {} prompt spans and {} pin rows against \
+                 {rows} rows",
                 tail.len(),
-                prompt.len()
+                prompt.len(),
+                pins.len()
             );
         }
-        // **One upload, not four.** Every one of these is a host→device copy
+        // The row stride and the union buffer were sized for `pin_blocks`
+        // pinned blocks a row; a row past it would write into its neighbour.
+        if let Some(p) = pins.iter().find(|p| p.blocks() > self.strata.pin_blocks) {
+            candle::bail!(
+                "qsa selection: a row pins {} blocks, past the {} its strata allow",
+                p.blocks(),
+                self.strata.pin_blocks
+            );
+        }
+        // **One upload, not several.** Every one of these is a host→device copy
         // per layer per wave, and on WDDM a small transfer costs far more in
         // submission than in bytes — three of them measured ~5% of the whole
         // forward-batched ladder. They are the same length and the same dtype,
-        // so they travel as one `[4, rows]` block and the kernel takes four
-        // offsets into it.
-        let mut packed: Vec<u32> = Vec::with_capacity(rows * 4);
+        // so they travel as one `[4 + 2·MAX_PINS, rows]` block and the kernel
+        // takes offsets into it.
+        let meta_rows = 4 + 2 * MAX_PINS;
+        let mut packed: Vec<u32> = Vec::with_capacity(rows * meta_rows);
         packed.extend_from_slice(cand);
         packed.extend(qpos.iter().map(|&p| p as u32));
         packed.extend_from_slice(tail);
         packed.extend_from_slice(prompt);
+        for k in 0..MAX_PINS {
+            packed.extend(pins.iter().map(|p| p.0[k].0));
+            packed.extend(pins.iter().map(|p| p.0[k].1));
+        }
         // Beside the scores, on the layer's span, where the rest of the
         // selection lives.
-        let packed_t = scores.from_vec_beside(packed, (4, rows))?;
+        let packed_t = scores.from_vec_beside(packed, (meta_rows, rows))?;
 
         let (s_s, s_l) = scores.storage_and_layout();
         let s_slice = match &*s_s {
@@ -2039,6 +2153,7 @@ impl SelectionTable {
         let p_ptr = (c_ptr as *const u32).wrapping_add(rows);
         let t_ptr = (c_ptr as *const u32).wrapping_add(rows * 2);
         let pr_ptr = (c_ptr as *const u32).wrapping_add(rows * 3);
+        let pin_ptr = (c_ptr as *const u32).wrapping_add(rows * 4);
         let (e_ptr, _eg) = e_slice.device_ptr(&stream);
         let (n_ptr, _ng) = n_slice.device_ptr(&stream);
         // Null when the table holds no scratch: the kernel then runs the single
@@ -2062,6 +2177,7 @@ impl SelectionTable {
                 p_ptr,
                 t_ptr,
                 pr_ptr,
+                pin_ptr,
                 e_ptr,
                 self.stride as i32,
                 n_ptr,
@@ -2746,6 +2862,7 @@ pub fn select_layer(
             let mut cand: Vec<u32> = vec![0; rows];
             let mut tail: Vec<u32> = vec![1; rows];
             let mut prompt: Vec<u32> = vec![0; rows];
+            let mut pins: Vec<PinRow> = vec![PinRow::EMPTY; rows];
             for (span, &rung) in run_spans.iter().zip(&span_rungs[run.clone()]) {
                 let cache = idx_map
                     .get(&span.seq)
@@ -2785,6 +2902,8 @@ pub fn select_layer(
                     tail[at + r] = cache.tail_len(p, compress_ratio);
                 }
                 prompt[at..at + span.len].fill(cache.prompt_blocks(compress_ratio) as u32);
+                pins[at..at + span.len]
+                    .fill(cache.pin_row(compress_ratio, idx_cfg.strata.pin_blocks));
             }
             expect_dense(&scores, "qsa selection scores")?;
             table.fill_rows(
@@ -2793,6 +2912,7 @@ pub fn select_layer(
                 &positions[base..base + rows],
                 &tail,
                 &prompt,
+                &pins,
                 compress_ratio,
                 idx_cfg.top_k,
                 base,
@@ -2857,7 +2977,9 @@ pub fn select_layer(
     Ok(Some(sel.with_pages(pages_t, win_t)?))
 }
 
+// Pinned ranges are lists of ranges, and a list of one is the common case.
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
     use crate::models::gpu_test_lock::gpu_serial;
@@ -3352,12 +3474,37 @@ mod tests {
         const RATIO: usize = 4;
         let mut c = caged(&[7, 3, 9], RATIO);
         c.set_prompt_end(10);
+        c.set_pins(&[8..12]);
         c.splice_pages(0, 7, vec![width_page(2, RATIO)], RATIO)
             .expect("splice before the prompt end");
         assert_eq!(c.prompt_end(), 5);
+        assert_eq!(c.pins(), &[3..7], "a pin past the splice moves with it");
         c.splice_pages(5, 14, Vec::new(), RATIO)
             .expect("splice after it");
         assert_eq!(c.prompt_end(), 5);
+        assert_eq!(
+            c.pins(),
+            &[3..5],
+            "a pin end inside the splice closes at it"
+        );
+
+        // A pin that starts inside a splice and ends past it keeps only its
+        // part past the splice — never the content put in its place.
+        let mut c = caged(&[7, 3, 9], RATIO);
+        c.set_pins(&[8..15]);
+        c.splice_pages(7, 10, vec![width_page(30, RATIO)], RATIO)
+            .expect("splice the middle page");
+        // [7, 10) became [7, 37): positions from 10 on move by +27.
+        assert_eq!(c.pins(), &[37..42]);
+
+        // A pin exactly over the spliced span goes; one ending at the
+        // splice's start or starting at its end keeps clear of the new
+        // content.
+        let mut c = caged(&[7, 3, 9], RATIO);
+        c.set_pins(&[0..7, 7..10, 10..19]);
+        c.splice_pages(7, 10, vec![width_page(30, RATIO)], RATIO)
+            .expect("splice the middle page");
+        assert_eq!(c.pins(), &[0..7, 37..46]);
     }
 
     /// An empty cache, a single page, and a page narrower than `ratio` — the
@@ -3523,6 +3670,7 @@ mod tests {
             window_blocks: 1,
             recent_blocks: 0,
             recent: Recent::Candidate,
+            pin_blocks: 0,
         };
         assert!(err(selection_stride(4, 2048, 20_000, &tiny)).contains("gather"));
         assert_eq!(
@@ -3543,6 +3691,8 @@ mod tests {
         // Row r's prompt spans `prompt_blocks + r · prompt_spread` blocks.
         prompt_blocks: u32,
         prompt_spread: u32,
+        // Every row's pinned block ranges.
+        pins: Vec<Range<usize>>,
     }
 
     /// The selection kernel against the shared definition, row by row, on
@@ -3571,8 +3721,14 @@ mod tests {
             }
         }
         let scores = Tensor::from_vec(host.clone(), (rows, blocks), &device)?;
+        let pin_row = PinRow::new(&case.pins, usize::MAX);
+        let pinned = pin_row.ranges();
+        let strata = Strata {
+            pin_blocks: pin_row.blocks(),
+            ..case.strata
+        };
         let mut table =
-            SelectionTable::new(rows, ratio, case.top_k, blocks, &case.strata, &device, None)?;
+            SelectionTable::new(rows, ratio, case.top_k, blocks, &strata, &device, None)?;
         // Uniform blocks here, so the tail is what the kernel used to derive.
         let tail: Vec<u32> = case
             .qpos
@@ -3583,8 +3739,9 @@ mod tests {
         let prompt: Vec<u32> = (0..rows as u32)
             .map(|r| case.prompt_blocks + r * case.prompt_spread)
             .collect();
+        let pins = vec![pin_row; rows];
         table.fill_rows(
-            &scores, &cand, &case.qpos, &tail, &prompt, ratio, case.top_k, 0,
+            &scores, &cand, &case.qpos, &tail, &prompt, &pins, ratio, case.top_k, 0,
         )?;
 
         let mut want = Vec::new();
@@ -3595,8 +3752,9 @@ mod tests {
                 p,
                 ratio,
                 case.top_k,
-                &case.strata,
+                &strata,
                 prompt[r] as usize,
+                &pinned,
                 &mut want,
             );
             let got = table.row_to_host(r)?;
@@ -3629,7 +3787,85 @@ mod tests {
             window_blocks,
             recent_blocks,
             recent,
+            pin_blocks: 0,
         }
+    }
+
+    /// **Pinned ranges on the device match the definition**: one window
+    /// (the bitmap path) and several (the sorted union), on a tie grid, with
+    /// pins at the prompt, in the middle, and reaching into a forced span.
+    #[test]
+    fn pinned_selection_kernel_matches_the_definition() -> Result<()> {
+        let cases = [
+            (Strata::WHOLE, shallow_rows(), vec![0..3, 6..8]),
+            (Strata::WHOLE, shallow_rows(), vec![1..2]),
+            (
+                strata(32, 0, Recent::Candidate),
+                windowed_rows(),
+                vec![0..12, 40..44],
+            ),
+            (
+                strata(32, 8, Recent::Forced),
+                windowed_rows(),
+                vec![2..6, 150..400],
+            ),
+            (
+                strata(0, 0, Recent::Candidate),
+                (0..4).map(|i| 16000 + i * 3).collect(),
+                vec![0..30, 900..905, 2000..2001, 3000..3010],
+            ),
+            // Past `SPLIT_BLOCKS` rows, so the single pass runs them: one window
+            // (the bitmap) and several (the sorted union).
+            (
+                Strata::WHOLE,
+                (0..512).map(|i| 40 + (i % 16) * 7).collect(),
+                vec![0..3, 6..8],
+            ),
+            (
+                strata(32, 8, Recent::Forced),
+                (0..512).map(|i| 200 + (i % 16) * 37).collect(),
+                vec![2..6, 150..400],
+            ),
+        ];
+        for (n, (strata, qpos, pins)) in cases.into_iter().enumerate() {
+            for (quantize, seed) in [(None, 0x91 + n as u64), (Some(0.5), 0xA1 + n as u64)] {
+                kernel_matches(&KernelCase {
+                    qpos: qpos.clone(),
+                    top_k: if n == 4 { 64 } else { 8 },
+                    quantize,
+                    seed,
+                    strata,
+                    prompt_blocks: 5,
+                    prompt_spread: 0,
+                    pins: pins.clone(),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `IndexCache` keeps its pins as positions and moves them with the page
+    /// layout: merged when set, clipped by a cut, shifted by a splice past
+    /// them, closed by one inside them, and dropped by a reset.
+    #[test]
+    fn pins_travel_with_the_cache() -> Result<()> {
+        // Fifteen complete blocks at ratio 4: 60 positions.
+        let mut c = IndexCache::from_rows(&[0.0; 30], &[], 2, &Device::Cpu)?;
+        c.set_pins(&[40..60, 0..10, 8..20]);
+        assert_eq!(c.pins(), &[0..20, 40..60]);
+        // Uniform blocks of 4: [0, 20) is blocks 0..5; [40, 60) blocks 10..15.
+        assert_eq!(c.pin_row(4, 100).ranges(), vec![0..5, 10..15]);
+        // Held to a bound, the last range gives up its front first.
+        assert_eq!(c.pin_row(4, 7).ranges(), vec![0..5, 13..15]);
+        let fork = c.fork()?;
+        assert_eq!(fork.pins(), c.pins());
+        c.truncate_to(50)?;
+        assert_eq!(c.pins(), &[0..20, 40..50]);
+        c.truncate_to(10)?;
+        assert_eq!(c.pins(), &[0..10]);
+        c.reset();
+        assert!(c.pins().is_empty());
+        Ok(())
     }
 
     #[test]
@@ -3642,6 +3878,7 @@ mod tests {
             strata: Strata::WHOLE,
             prompt_blocks: 0,
             prompt_spread: 0,
+            pins: Vec::new(),
         })
     }
 
@@ -3658,6 +3895,7 @@ mod tests {
             strata: Strata::WHOLE,
             prompt_blocks: 0,
             prompt_spread: 0,
+            pins: Vec::new(),
         })
     }
 
@@ -3673,6 +3911,7 @@ mod tests {
             strata: Strata::WHOLE,
             prompt_blocks: 0,
             prompt_spread: 0,
+            pins: Vec::new(),
         })
     }
 
@@ -3690,6 +3929,7 @@ mod tests {
                 strata: strata(32, 0, Recent::Candidate),
                 prompt_blocks: 5,
                 prompt_spread: 0,
+                pins: Vec::new(),
             })?;
         }
         Ok(())
@@ -3706,6 +3946,7 @@ mod tests {
                 strata: strata(32, 12, Recent::Candidate),
                 prompt_blocks: 5,
                 prompt_spread: 0,
+                pins: Vec::new(),
             })?;
         }
         Ok(())
@@ -3722,6 +3963,7 @@ mod tests {
                 strata: strata(32, 12, Recent::Forced),
                 prompt_blocks: 5,
                 prompt_spread: 0,
+                pins: Vec::new(),
             })?;
         }
         Ok(())
@@ -3740,6 +3982,7 @@ mod tests {
                 strata: strata(1024, 300, recent),
                 prompt_blocks: 100,
                 prompt_spread: 0,
+                pins: Vec::new(),
             })?;
         }
         Ok(())
@@ -3791,6 +4034,7 @@ mod tests {
                         strata: strata(8, 12, recent),
                         prompt_blocks: if spread == 0 { 20 } else { 0 },
                         prompt_spread: spread,
+                        pins: Vec::new(),
                     })?;
                 }
             }
@@ -3820,6 +4064,7 @@ mod tests {
                 strata: strata(4, 6, recent),
                 prompt_blocks: 5,
                 prompt_spread: 0,
+                pins: Vec::new(),
             })?;
         }
         Ok(())
@@ -3843,6 +4088,7 @@ mod tests {
                 strata,
                 prompt_blocks: 5,
                 prompt_spread: 0,
+                pins: Vec::new(),
             })?;
         }
         Ok(())
@@ -3862,6 +4108,7 @@ mod tests {
                 strata,
                 prompt_blocks: 500,
                 prompt_spread: 0,
+                pins: Vec::new(),
             })?;
         }
         Ok(())
@@ -3881,6 +4128,7 @@ mod tests {
                 strata: strata(32_768, 2048, recent),
                 prompt_blocks: 2000,
                 prompt_spread: 0,
+                pins: Vec::new(),
             })?;
         }
         Ok(())
@@ -4031,12 +4279,14 @@ mod tests {
                 .map(|&p| cache.tail_len(p, self.ratio))
                 .collect();
             let prompt = vec![cache.prompt_blocks(self.ratio) as u32; t];
+            let pins = vec![cache.pin_row(self.ratio, self.cfg.strata.pin_blocks); t];
             table.fill_rows(
                 &scores,
                 &cand,
                 qpos,
                 &tail,
                 &prompt,
+                &pins,
                 self.ratio,
                 self.cfg.top_k,
                 0,
@@ -4818,7 +5068,10 @@ mod tests {
         )?;
         let tail: Vec<u32> = qpos.iter().map(|&p| cache.tail_len(p, ratio)).collect();
         let prompt = vec![0u32; t];
-        table.fill_rows(&scores, &cand, &qpos, &tail, &prompt, ratio, cfg.top_k, 0)?;
+        let pins = vec![PinRow::EMPTY; t];
+        table.fill_rows(
+            &scores, &cand, &qpos, &tail, &prompt, &pins, ratio, cfg.top_k, 0,
+        )?;
 
         // Oracle: the additive mask, from the same weights on the CPU.
         let w_cpu = w(&Device::Cpu)?;

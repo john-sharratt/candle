@@ -272,7 +272,7 @@ mod tests {
             file: "Qwen3.6-35B-A3B-AntiLoop.gguf".into(),
             weights: [0xab; 32],
             tokenizer: [0x01; 32],
-            rope: "lineage min=none".into(),
+            rope: "lineage".into(),
         }
     }
 
@@ -284,7 +284,7 @@ mod tests {
             file=Qwen3.6-35B-A3B-AntiLoop.gguf\n\
             weights=abababababababababababababababababababababababababababababababab\n\
             tokenizer=0101010101010101010101010101010101010101010101010101010101010101\n\
-            rope=lineage min=none\n";
+            rope=lineage\n";
         assert_eq!(key().encode(), expected.as_bytes());
     }
 
@@ -353,7 +353,7 @@ mod tests {
         retrained.weights[0] = 0;
         assert!(!key().same_model(&retrained));
         let mut rerotated = key();
-        rerotated.rope = "lineage min=40000000".into();
+        rerotated.rope = "file-stated".into();
         assert!(!key().same_model(&rerotated));
     }
 
@@ -369,7 +369,7 @@ mod tests {
         assert_eq!(
             key().describe(),
             "Qwen3.6-35B-A3B-AntiLoop.gguf (arch Qwen35Hybrid, weights abababab…, \
-             tokenizer 01010101…, rope lineage min=none)"
+             tokenizer 01010101…, rope lineage)"
         );
     }
 
@@ -383,11 +383,11 @@ mod tests {
             "f".into(),
             [7; 32],
             b"tok".to_vec(),
-            "lineage min=none".into(),
+            "lineage".into(),
         )
         .unwrap();
-        let under = own.clone().under_rope("lineage min=40000000".into());
-        assert_eq!(under.key().rope, "lineage min=40000000");
+        let under = own.clone().under_rope("file-stated".into());
+        assert_eq!(under.key().rope, "file-stated");
         assert_eq!(under.key().weights, own.key().weights);
         assert_eq!(under.key().tokenizer, own.key().tokenizer);
         assert_eq!(under.tokenizer_json(), own.tokenizer_json());
@@ -401,7 +401,7 @@ mod tests {
             "f".into(),
             [0; 32],
             b"abc".to_vec(),
-            "file-stated min=none".into(),
+            "file-stated".into(),
         )
         .unwrap();
         assert_eq!(
@@ -414,7 +414,7 @@ mod tests {
             "f".into(),
             [0; 32],
             Vec::new(),
-            "lineage min=none".into(),
+            "lineage".into(),
         )
         .is_err());
     }

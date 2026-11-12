@@ -47,6 +47,7 @@ mod gang;
 mod graph_window;
 mod guest_room;
 mod high_drain;
+mod hit_density;
 mod idle_wait;
 mod injected_piece;
 mod interleave;
@@ -145,7 +146,7 @@ use crate::projection::{
 };
 use crate::projection::{
     CollectionWarm, DecodePriority, GalleryPreload, GroupId, GroupVotes, LayerId, Schema,
-    SubstrateRef,
+    SelectionRule, SubstrateRef, LINEAGE_BASE,
 };
 use crate::provenance::gallery_arena::{GroupSet, Keep};
 use crate::provenance::{
@@ -5295,7 +5296,7 @@ impl Scheduler {
                     let segments: Vec<ProjectionSegment> = section_ids
                         .iter()
                         .map(|&id| {
-                            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }))
+                            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id)))
                         })
                         .collect();
                     let r = self.apply_projection(sequence_id, BlockCount(0), &segments);
@@ -6118,9 +6119,7 @@ impl Scheduler {
         // Segment list: compressor system section, then the children's full turns
         // in natural roles (sealed), then the instruction user-turn.
         let mut segments: Vec<ProjectionSegment> = vec![ProjectionSegment::Sealed(
-            SealedKind::Section(ResolvedSection {
-                id: summary_section,
-            }),
+            SealedKind::Section(ResolvedSection::new(summary_section)),
         )];
         for &child in children {
             segments.push(ProjectionSegment::Sealed(SealedKind::Turn(
@@ -11770,7 +11769,7 @@ impl Scheduler {
         // same ranking (see `examples/gpu_belief_parity.rs`). Seal-time learning
         // runs the same launch here (`SchedulerRequest::ScoreSealedTurn`), so the
         // levels are learned from the scores they later normalize.
-        let (projection_scores, group_candidates) = policy.substrate.score_beliefs(
+        let (mut projection_scores, group_candidates) = policy.substrate.score_beliefs(
             schema,
             policy.target,
             &probe,
@@ -11787,9 +11786,72 @@ impl Scheduler {
         // (`docs/zend_working_set.md` §4.3).
         let t_observe = Instant::now();
         let observe_span = profile::span("reproject:observe_working_set");
+        // What the model's own selection read of each placed conversation since
+        // the last projection — read once here, at the boundary, and zeroed.
+        // Hits only advise the scoring: a read that fails leaves this
+        // reprojection judging by momentum alone.
+        // The pieces were declared on the parent this view was carved from —
+        // the slot the projection rebuilds — and the view counts into them.
+        let slot = self
+            .turn_views
+            .get(&view_id)
+            .map_or(view_id, |v| v.parent_id);
+        // Read only where there is a slot state to fold them into: a read zeroes
+        // the counters.
+        let hits = match self.slot_projection_state.contains_key(&slot) {
+            true => match self.model.take_hits(slot.0) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(slot = slot.0, error = %e, "hits not read: scored without them");
+                    None
+                }
+            },
+            false => None,
+        };
+        let density = match self.slot_projection_state.get_mut(&slot) {
+            Some(state) => {
+                let mut parts = std::mem::take(&mut state.unread_hits);
+                if let Some(h) = hits {
+                    parts.push((state.hit_keys.clone(), h));
+                }
+                // Each placed turn's hit momentum moves, and lifts this
+                // reprojection's scores of the turns it keeps reading
+                // (`docs/hit_driven_projection.md` §7.1).
+                state
+                    .turn_hits
+                    .fold(hit_density::turn_density(&parts), &schema.hits);
+                // Reads are credited over the same base the target's lineage
+                // is ranked from, so a turn displaces the lineage only once
+                // its reads pass it (§8.2).
+                let base = schema
+                    .layers
+                    .iter()
+                    .find(|l| l.id == policy.target.layer)
+                    .and_then(|l| {
+                        l.groups.iter().find_map(|g| match g.selection {
+                            SelectionRule::Sequence { lineage_base, .. } => Some(lineage_base),
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or(LINEAGE_BASE);
+                // Credit for unscored reads goes to the conversation and its
+                // lineage alone: their turns are ranked on the lineage's scale.
+                let chain: HashSet<TimelineId> = policy
+                    .substrate
+                    .read()
+                    .inherited_chain(policy.target.timeline)
+                    .into_iter()
+                    .collect();
+                projection_scores.lift_turns(state.turn_hits.lifts(&schema.hits), base, |k| {
+                    chain.contains(&k.timeline)
+                });
+                hit_density::hit_density(&parts)
+            }
+            None => HashMap::new(),
+        };
         policy
             .substrate
-            .observe_working_set(schema, policy.target, &group_candidates);
+            .observe_working_set(schema, policy.target, &group_candidates, &density);
         observe_span.end();
         let observe_us = t_observe.elapsed().as_micros() as u64;
 

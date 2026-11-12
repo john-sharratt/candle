@@ -154,9 +154,9 @@ mod tests {
     fn ask(max_concurrent: usize) -> CoreRequests {
         CoreRequests {
             prefill_pass_tokens: None,
-            min_rope_factor: None,
             qsa_selection_budget: None,
             qsa_strata: StrataTokens::DEFAULT,
+            hit_layers: None,
             max_response_tokens: 16_384,
             max_concurrent,
             thinking: None,
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn a_standing_seat_is_merged_but_never_waited_for() {
         let mut zend = ask(4);
-        zend.min_rope_factor = Some(2.0);
+        zend.qsa_selection_budget = Some(4096);
         let r: Rendezvous<u32> = Rendezvous::new(&["npcd"], vec![(rank(0), zend)]);
         let got = r.arrive(
             rank(1),
@@ -292,7 +292,7 @@ mod tests {
             ask(3),
             &|w| panic!("a standing seat is not waited for, told {w:?}"),
             |m| {
-                assert_eq!(m.min_rope_factor, Some(2.0), "zend's floor");
+                assert_eq!(m.qsa_selection_budget, Some(4096), "zend's budget");
                 Ok((m.max_concurrent, 1))
             },
             |_| panic!("npcd is the only tenant that runs, so it builds"),

@@ -28,6 +28,9 @@
 
 #define QSA_CELL_BITS 2
 #define QSA_DENSE_ROW 0xFFFFFFFFu
+// The most pinned block ranges one selection row carries
+// (`qsa_select::MAX_PINS`).
+#define QSA_MAX_PINS 4
 
 // The per-launch selection view. `stride` is the row pitch of `entries` in
 // u32s; `ratio` the layer's compression ratio (cells per block).

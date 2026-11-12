@@ -45,6 +45,7 @@
 //! and the widest the packing admits without a second word per entry.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use crate::models::selection_strata::{Recent, StrataTokens};
 
@@ -203,25 +204,41 @@ pub struct Strata {
     pub recent_blocks: usize,
     /// How the recent span enters the selection.
     pub recent: Recent,
+    /// The most blocks one row may pin — what the row's width allows for
+    /// beside the budget. A row whose pinned ranges cover more is trimmed to
+    /// it ([`PinRow::new`]).
+    pub pin_blocks: usize,
 }
 
 impl Strata {
-    /// One window over every candidate and no recent span: the checkpoint's
-    /// selection.
+    /// One window over every candidate, no recent span, nothing pinned: the
+    /// checkpoint's selection.
     pub const WHOLE: Self = Self {
         window_blocks: 0,
         recent_blocks: 0,
         recent: Recent::Candidate,
+        pin_blocks: 0,
     };
 
     /// `tokens`, a strata stated in positions, in blocks of `ratio` positions.
     /// A window or span that does not divide into whole blocks rounds up, so it
-    /// never covers less than was asked for.
+    /// never covers less than was asked for. The pinned bound allows twice
+    /// the positions' blocks — a short block per sealed section — and one
+    /// straddling block per range.
     pub fn from_tokens(tokens: StrataTokens, ratio: usize) -> Self {
         Self {
             window_blocks: tokens.window.div_ceil(ratio),
             recent_blocks: tokens.recent.div_ceil(ratio),
             recent: tokens.mode,
+            pin_blocks: match tokens.pinned {
+                0 => 0,
+                // Twice the positions' blocks: every pinned section is its own
+                // sealed page, and each page can end on a short block, so a
+                // run of sections of at least `ratio` positions covers at
+                // most twice its positions' blocks — a journal of many short
+                // entries fits without its front being trimmed.
+                p => 2 * p.div_ceil(ratio) + MAX_PINS,
+            },
         }
     }
 
@@ -251,12 +268,14 @@ impl Strata {
 /// The most entries one query's selection can hold under `strata` over `cand`
 /// candidate blocks — what a selection table's row stride is sized from.
 ///
-/// Each window keeps at most [`max_keep`] blocks, the forced span adds its own,
-/// and no row can name more blocks than it has candidates; the tail takes one
-/// more. Under [`Strata::WHOLE`] with at least [`max_keep`] candidates this is
-/// [`max_entries`] — the checkpoint's row, unchanged.
+/// Each window keeps at most [`max_keep`] blocks, the forced span and the
+/// pinned ranges add their own, and no row can name more blocks than it has
+/// candidates; the tail takes one more. Under [`Strata::WHOLE`] with at least
+/// [`max_keep`] candidates this is [`max_entries`] — the checkpoint's row,
+/// unchanged.
 pub fn max_entries_for(top_k: usize, ratio: usize, cand: usize, strata: &Strata) -> usize {
-    let blocks = strata.windows(cand) * max_keep(top_k, ratio) + strata.forced(cand);
+    let blocks =
+        strata.windows(cand) * max_keep(top_k, ratio) + strata.forced(cand) + strata.pin_blocks;
     blocks.min(cand) + 1
 }
 
@@ -266,15 +285,132 @@ pub fn max_entries_for(top_k: usize, ratio: usize, cand: usize, strata: &Strata)
 /// [`max_entries_for`] bounds what survives the union. Before it, a block
 /// chosen by several windows (a prompt block, or a recent candidate) appears
 /// once per window that chose it, so the count is bounded by the sum of every
-/// window's keep, not by the row's candidates. The forced span and the tail sit
-/// above every window and never enter the sort.
+/// window's keep, not by the row's candidates. The pinned blocks are sorted in
+/// with them; the forced span and the tail sit above every window and never
+/// enter the sort.
 pub fn max_gathered_for(top_k: usize, ratio: usize, cand: usize, strata: &Strata) -> usize {
-    strata.windows(cand) * max_keep(top_k, ratio)
+    strata.windows(cand) * max_keep(top_k, ratio) + strata.pin_blocks
+}
+
+/// The most pinned ranges one row carries — the kernel's per-row table
+/// (`QSA_MAX_PINS` in `qsa_select.cuh`).
+pub const MAX_PINS: usize = 4;
+
+/// One row's pinned block ranges as the selection kernel reads them: up to
+/// [`MAX_PINS`] disjoint `[lo, hi)` pairs, unused ones empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PinRow(pub [(u32, u32); MAX_PINS]);
+
+impl PinRow {
+    /// No pins.
+    pub const EMPTY: Self = Self([(0, 0); MAX_PINS]);
+
+    /// `ranges` (block ranges) as a row of at most `max_blocks` pinned blocks:
+    /// sorted, merged where they touch, coalesced across the smallest gaps
+    /// down to [`MAX_PINS`] ranges ([`coalesce_ranges`]), then trimmed from
+    /// the front of the last range while the row pins more than `max_blocks`.
+    ///
+    /// Never refused, because it is built inside a forward, where a refusal
+    /// would fail the wave. The last range holds the newest pinned content
+    /// before the query — a journal's entries run oldest first — so trimming
+    /// its front gives up the oldest of it first; a range trimmed away leaves
+    /// the one before it to trim.
+    pub fn new(ranges: &[Range<usize>], max_blocks: usize) -> Self {
+        let mut ranges = coalesce_ranges(ranges, MAX_PINS);
+        let mut total: usize = ranges.iter().map(|r| r.len()).sum();
+        while total > max_blocks {
+            let Some(last) = ranges.last_mut() else {
+                break;
+            };
+            let cut = (total - max_blocks).min(last.len());
+            last.start += cut;
+            total -= cut;
+            if last.start >= last.end {
+                ranges.pop();
+            }
+        }
+        let mut row = Self::EMPTY;
+        for (slot, r) in row.0.iter_mut().zip(&ranges) {
+            *slot = (r.start as u32, r.end as u32);
+        }
+        row
+    }
+
+    /// The row's ranges, empty ones left out.
+    pub fn ranges(&self) -> Vec<Range<usize>> {
+        self.0
+            .iter()
+            .filter(|(lo, hi)| hi > lo)
+            .map(|&(lo, hi)| lo as usize..hi as usize)
+            .collect()
+    }
+
+    /// Blocks the row pins.
+    pub fn blocks(&self) -> usize {
+        self.0
+            .iter()
+            .map(|&(lo, hi)| hi.saturating_sub(lo) as usize)
+            .sum()
+    }
+}
+
+/// `ranges` merged ([`merge_ranges`]) and then, while more than `max` remain,
+/// the two nearest joined across the gap between them — the fewest unpinned
+/// positions attended to fit the table. A pinned span split only by the glue
+/// between a collection's members comes back whole.
+pub fn coalesce_ranges(ranges: &[Range<usize>], max: usize) -> Vec<Range<usize>> {
+    let mut out = merge_ranges(ranges);
+    while out.len() > max.max(1) {
+        let at = (0..out.len() - 1)
+            .min_by_key(|&i| out[i + 1].start - out[i].end)
+            .expect("two ranges at least");
+        out[at].end = out[at + 1].end;
+        out.remove(at + 1);
+    }
+    out
+}
+
+/// `ranges` sorted by start, empty ones dropped, overlapping or touching ones
+/// merged.
+pub fn merge_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut sorted: Vec<Range<usize>> = ranges.iter().filter(|r| !r.is_empty()).cloned().collect();
+    sorted.sort_by_key(|r| r.start);
+    let mut out: Vec<Range<usize>> = Vec::with_capacity(sorted.len());
+    for r in sorted {
+        match out.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// Whether block `b` is pinned by one of `pins` (block ranges).
+#[inline]
+pub fn is_pinned(pins: &[Range<usize>], b: usize) -> bool {
+    pins.iter().any(|p| p.contains(&b))
+}
+
+/// `pins` (block ranges) as a row of `cand` candidates whose forced span
+/// starts at `forced_lo` sees them: clipped below the forced span, empty
+/// ranges dropped. A pinned block inside the forced span is attended there.
+pub fn row_pins(pins: &[Range<usize>], forced_lo: usize) -> Vec<Range<usize>> {
+    pins.iter()
+        .map(|p| p.start.min(forced_lo)..p.end.min(forced_lo))
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// The candidate blocks window `w` ranks, ascending: its own blocks, the
-/// prompt's, and — as candidates — the recent span's, less the forced span.
-fn window_pool(strata: &Strata, cand: usize, prompt_blocks: usize, w: usize) -> Vec<u32> {
+/// prompt's, and — as candidates — the recent span's, less the forced span
+/// and the pinned blocks.
+fn window_pool(
+    strata: &Strata,
+    cand: usize,
+    prompt_blocks: usize,
+    pins: &[Range<usize>],
+    w: usize,
+) -> Vec<u32> {
     let width = strata.window_width(cand);
     let (lo, hi) = (w * width, ((w + 1) * width).min(cand));
     let forced_lo = cand - strata.forced(cand);
@@ -287,7 +423,7 @@ fn window_pool(strata: &Strata, cand: usize, prompt_blocks: usize, w: usize) -> 
     let mut pool: Vec<u32> = (lo..hi)
         .chain(0..prompt)
         .chain(recent)
-        .filter(|&b| b < forced_lo)
+        .filter(|&b| b < forced_lo && !is_pinned(pins, b))
         .map(|b| b as u32)
         .collect();
     pool.sort_unstable();
@@ -301,8 +437,10 @@ fn window_pool(strata: &Strata, cand: usize, prompt_blocks: usize, w: usize) -> 
 /// tail are read, so `scores` may be shorter than the sequence's block count
 /// as long as it covers `((qpos+1)/ratio·ratio)/ratio` entries.
 /// `prompt_blocks` is how many leading blocks hold the conversation's system
-/// prompt — ranked in every window. `out` is cleared first and grows to at most
-/// [`max_entries_for`].
+/// prompt — ranked in every window. `pins` are the sequence's pinned block
+/// ranges: attended whole, outside every window's ranking, so they take no
+/// candidate's seat (`docs/hit_driven_projection.md` §5). `out` is cleared
+/// first and grows to at most [`max_entries_for`].
 ///
 /// # Implementation note — why ranking blocks is ranking cells
 ///
@@ -317,6 +455,7 @@ fn window_pool(strata: &Strata, cand: usize, prompt_blocks: usize, w: usize) -> 
 /// Each window makes that cut over its own pool. A block two windows both
 /// choose — a prompt block, or a recent one ranked as a candidate — is attended
 /// once, at the wider of the two cuts.
+#[allow(clippy::too_many_arguments)]
 pub fn selection_entries(
     scores: &[f32],
     qpos: usize,
@@ -324,6 +463,7 @@ pub fn selection_entries(
     top_k: usize,
     strata: &Strata,
     prompt_blocks: usize,
+    pins: &[Range<usize>],
     out: &mut Vec<u32>,
 ) -> RowSelection {
     debug_assert!((1..=MAX_RATIO).contains(&ratio));
@@ -355,11 +495,12 @@ pub fn selection_entries(
     let mut choose = |b: u32, n: usize| {
         cells.entry(b).and_modify(|c| *c = (*c).max(n)).or_insert(n);
     };
+    let pins = row_pins(pins, n_cand - strata.forced(n_cand));
     for w in 0..strata.windows(n_cand) {
         // Rank the window's pool by (score desc, block asc). The cut needs the
         // first `full + 1` in that order, so a partial sort of the prefix is
         // enough.
-        let mut order = window_pool(strata, n_cand, prompt_blocks, w);
+        let mut order = window_pool(strata, n_cand, prompt_blocks, &pins, w);
         let n_pool = order.len();
         let keep = (full + usize::from(rem > 0)).min(n_pool);
         if keep < n_pool {
@@ -375,6 +516,9 @@ pub fn selection_entries(
                 choose(b, rem);
             }
         }
+    }
+    for b in pins.iter().flat_map(|p| p.clone()) {
+        choose(b as u32, ratio);
     }
     for b in n_cand - strata.forced(n_cand)..n_cand {
         choose(b as u32, ratio);
@@ -400,7 +544,9 @@ pub fn selects(entries: &[u32], pos: usize, ratio: usize) -> bool {
     }
 }
 
+// Pinned ranges are lists of ranges, and a list of one is the common case.
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 
@@ -429,9 +575,16 @@ mod tests {
                     // permutation rather than the identity.
                     let scores: Vec<f32> = (0..n_blocks).map(|b| (n_blocks - b) as f32).collect();
                     let mut out = Vec::new();
-                    if let RowSelection::Entries(n) =
-                        selection_entries(&scores, qpos, ratio, top_k, &Strata::WHOLE, 0, &mut out)
-                    {
+                    if let RowSelection::Entries(n) = selection_entries(
+                        &scores,
+                        qpos,
+                        ratio,
+                        top_k,
+                        &Strata::WHOLE,
+                        0,
+                        &[],
+                        &mut out,
+                    ) {
                         assert_eq!(n, out.len());
                         assert!(
                             n <= bound,
@@ -465,7 +618,7 @@ mod tests {
         let scores: Vec<f32> = (0..n_blocks).map(|b| (n_blocks - b) as f32).collect();
         let mut out = Vec::new();
         // qpos 4096 ⇒ visible 4097, tail_start 4096, n_tail 1.
-        let sel = selection_entries(&scores, 4096, 4, 2047, &Strata::WHOLE, 0, &mut out);
+        let sel = selection_entries(&scores, 4096, 4, 2047, &Strata::WHOLE, 0, &[], &mut out);
         assert_eq!(sel, RowSelection::Entries(514));
         assert!(out.len() <= max_entries(2047, 4));
     }
@@ -539,7 +692,16 @@ mod tests {
         let scores = lcg_scores(64, 11);
         let mut out = Vec::new();
         for qpos in 11..64 {
-            let sel = selection_entries(&scores, qpos, ratio, top_k, &Strata::WHOLE, 0, &mut out);
+            let sel = selection_entries(
+                &scores,
+                qpos,
+                ratio,
+                top_k,
+                &Strata::WHOLE,
+                0,
+                &[],
+                &mut out,
+            );
             let want = reference_cells(&scores, qpos, ratio, top_k);
             match sel {
                 RowSelection::Dense => {
@@ -561,8 +723,16 @@ mod tests {
             let scores = lcg_scores(64, 23 + ratio as u64);
             let mut out = Vec::new();
             for qpos in 0..64 {
-                let sel =
-                    selection_entries(&scores, qpos, ratio, top_k, &Strata::WHOLE, 0, &mut out);
+                let sel = selection_entries(
+                    &scores,
+                    qpos,
+                    ratio,
+                    top_k,
+                    &Strata::WHOLE,
+                    0,
+                    &[],
+                    &mut out,
+                );
                 let want = reference_cells(&scores, qpos, ratio, top_k);
                 match sel {
                     RowSelection::Dense => {
@@ -585,7 +755,16 @@ mod tests {
         let mut out = Vec::new();
         let qpos = 50; // tail = 48..=50, budget = 11 − 3 = 8 cells = 2 blocks
         assert_eq!(
-            selection_entries(&scores, qpos, ratio, top_k, &Strata::WHOLE, 0, &mut out),
+            selection_entries(
+                &scores,
+                qpos,
+                ratio,
+                top_k,
+                &Strata::WHOLE,
+                0,
+                &[],
+                &mut out
+            ),
             RowSelection::Entries(3)
         );
         assert_eq!(
@@ -608,11 +787,21 @@ mod tests {
                 top_k,
                 &Strata::WHOLE,
                 0,
+                &[],
                 &mut out
             ),
             RowSelection::Dense
         );
-        let sel = selection_entries(&scores, width, ratio, top_k, &Strata::WHOLE, 0, &mut out);
+        let sel = selection_entries(
+            &scores,
+            width,
+            ratio,
+            top_k,
+            &Strata::WHOLE,
+            0,
+            &[],
+            &mut out,
+        );
         let RowSelection::Entries(n) = sel else {
             panic!("position {width} must engage selection");
         };
@@ -627,9 +816,16 @@ mod tests {
         let scores = lcg_scores(64, 31);
         let mut out = Vec::new();
         for qpos in [13usize, 22, 47, 63] {
-            let RowSelection::Entries(_) =
-                selection_entries(&scores, qpos, ratio, top_k, &Strata::WHOLE, 0, &mut out)
-            else {
+            let RowSelection::Entries(_) = selection_entries(
+                &scores,
+                qpos,
+                ratio,
+                top_k,
+                &Strata::WHOLE,
+                0,
+                &[],
+                &mut out,
+            ) else {
                 continue;
             };
             let cells = expand(&out, ratio);
@@ -696,14 +892,133 @@ mod tests {
             window_blocks,
             recent_blocks,
             recent,
+            pin_blocks: 0,
         }
     }
 
     fn select(scores: &[f32], strata: &Strata, prompt_blocks: usize) -> Vec<u32> {
+        select_pinned(scores, strata, prompt_blocks, &[])
+    }
+
+    fn select_pinned(
+        scores: &[f32],
+        strata: &Strata,
+        prompt_blocks: usize,
+        pins: &[Range<usize>],
+    ) -> Vec<u32> {
         let mut out = Vec::new();
-        let sel = selection_entries(scores, Q, R, K, strata, prompt_blocks, &mut out);
+        let sel = selection_entries(scores, Q, R, K, strata, prompt_blocks, pins, &mut out);
         assert_eq!(sel, RowSelection::Entries(out.len()));
         out
+    }
+
+    /// **A pinned range is attended whole and takes no candidate's seat**:
+    /// the budget still buys the same number of ranked blocks, chosen from
+    /// what is not pinned, and the pinned blocks are added beside them.
+    #[test]
+    fn a_pinned_range_is_attended_beside_the_budget() {
+        // Unpinned, the top of the skew: blocks 0, 1 and the low 3 cells of 2.
+        assert_eq!(
+            select(&SKEWED, &Strata::WHOLE, 0),
+            entries(&[(0, 4), (1, 4), (2, 3)])
+        );
+        // Pin the two weakest blocks of window 1 (12 and 15 score lowest):
+        // the ranked part is unchanged and the pins ride on top.
+        assert_eq!(
+            select_pinned(&SKEWED, &Strata::WHOLE, 0, &[12..13, 15..16]),
+            entries(&[(0, 4), (1, 4), (2, 3), (12, 4), (15, 4)])
+        );
+        // Pin the strongest two: the budget moves down the ranking to 2, 3
+        // and the low cells of 4, and 0 and 1 are attended whole.
+        assert_eq!(
+            select_pinned(&SKEWED, &Strata::WHOLE, 0, &[0..2]),
+            entries(&[(0, 4), (1, 4), (2, 4), (3, 4), (4, 3)])
+        );
+    }
+
+    /// Pins reach every window, are never ranked in one, and stop below the
+    /// forced span, which attends its own blocks.
+    #[test]
+    fn pins_hold_under_strata_and_stop_at_the_forced_span() {
+        let two = strata(8, 0, Recent::Candidate);
+        // Each window spends 2 whole blocks and 3 cells. Window 1 ranks
+        // 11 (1.7), 9 (1.5), 14 (1.1), 8 (1.0): unpinned it keeps 11 and 9
+        // whole and 14's low cells.
+        let plain = select(&SKEWED, &two, 0);
+        let pinned = select_pinned(&SKEWED, &two, 0, &[11..12]);
+        assert!(plain.contains(&pack_entry(11, 4)));
+        assert!(pinned.contains(&pack_entry(11, 4)));
+        // Window 1 now ranks without 11: 9, 14 whole and the low cells of 8.
+        assert!(pinned.contains(&pack_entry(9, 4)));
+        assert!(pinned.contains(&pack_entry(14, 4)));
+        assert!(pinned.contains(&pack_entry(8, 3)));
+        // A pin reaching into a forced recent span is clipped there: the
+        // forced span attends those blocks itself, once.
+        let forced = strata(0, 2, Recent::Forced);
+        let got = select_pinned(&SKEWED, &forced, 0, &[13..16]);
+        let blocks: Vec<usize> = got.iter().map(|&e| entry_block(e)).collect();
+        assert_eq!(blocks.iter().filter(|&&b| b == 14).count(), 1);
+        assert_eq!(blocks.iter().filter(|&&b| b == 15).count(), 1);
+        assert!(got.contains(&pack_entry(13, 4)));
+    }
+
+    /// The pinned bound is part of the row's: twice the positions' blocks, for
+    /// the short block each sealed section can end on, plus one straddling
+    /// block per range — and both the entry and gathered bounds carry them.
+    #[test]
+    fn the_pinned_bound_widens_the_row() {
+        let s = Strata::from_tokens(StrataTokens::WHOLE.with_pinned(1024), 4);
+        assert_eq!(s.pin_blocks, 512 + MAX_PINS);
+        assert_eq!(max_entries_for(2048, 4, 73_728, &s), 514 + 512 + MAX_PINS);
+        assert_eq!(max_gathered_for(2048, 4, 73_728, &s), 513 + 512 + MAX_PINS);
+        assert_eq!(Strata::from_tokens(StrataTokens::WHOLE, 4).pin_blocks, 0);
+    }
+
+    /// The definition's pin table is the kernel's.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_pin_table_is_the_kernels() {
+        assert_eq!(MAX_PINS, candle_kernels::simple::qsa_topk::MAX_PINS);
+    }
+
+    /// A pin row is the ranges sorted and merged where they touch, padded
+    /// with empty pairs.
+    #[test]
+    fn a_pin_row_merges_and_pads() {
+        let row = PinRow::new(&[9..12, 0..3, 2..5, 12..14, 20..20], 100);
+        assert_eq!(row.0, [(0, 5), (9, 14), (0, 0), (0, 0)]);
+        assert_eq!(row.ranges(), vec![0..5, 9..14]);
+        assert_eq!(row.blocks(), 10);
+        assert_eq!(PinRow::new(&[], 100), PinRow::EMPTY);
+    }
+
+    /// **More ranges than the table holds coalesce across the smallest gaps**:
+    /// a persona and a journal whose entries are split by one-block glue come
+    /// back as the persona and one journal range.
+    #[test]
+    fn ranges_past_the_table_coalesce_across_the_smallest_gaps() {
+        let journal = [20..25, 26..30, 31..34, 35..40];
+        let mut ranges = vec![0..8];
+        ranges.extend(journal.iter().cloned());
+        let row = PinRow::new(&ranges, 100);
+        assert_eq!(row.ranges(), vec![0..8, 20..30, 31..34, 35..40]);
+        assert_eq!(coalesce_ranges(&ranges, 2), vec![0..8, 20..40]);
+        assert_eq!(coalesce_ranges(&ranges, 1), vec![0..40]);
+    }
+
+    /// **A row past its bound gives up its newest range's front first** —
+    /// the oldest of what the last pinned span holds — and never fails.
+    #[test]
+    fn a_row_past_its_bound_trims_the_last_ranges_front() {
+        let row = PinRow::new(&[0..8, 20..40], 18);
+        assert_eq!(row.ranges(), vec![0..8, 30..40]);
+        let row = PinRow::new(&[0..8, 20..24], 6);
+        assert_eq!(
+            row.ranges(),
+            vec![2..8],
+            "the last range gone, then the one before"
+        );
+        assert_eq!(PinRow::new(&[0..8], 0), PinRow::EMPTY);
     }
 
     fn entries(blocks: &[(usize, usize)]) -> Vec<u32> {
@@ -798,10 +1113,10 @@ mod tests {
             let scores = lcg_scores(64, 0x5157 + seed);
             for qpos in 11..256usize {
                 let n_cand = (qpos + 1) / R;
-                selection_entries(&scores, qpos, R, K, &Strata::WHOLE, 0, &mut want);
+                selection_entries(&scores, qpos, R, K, &Strata::WHOLE, 0, &[], &mut want);
                 for (window, prompt, recent) in [(n_cand, 0, 0), (n_cand + 7, 3, 5), (0, 9, 64)] {
                     let s = strata(window, recent, Recent::Candidate);
-                    selection_entries(&scores, qpos, R, K, &s, prompt, &mut out);
+                    selection_entries(&scores, qpos, R, K, &s, prompt, &[], &mut out);
                     assert_eq!(out, want, "seed {seed} qpos {qpos} window {window}");
                 }
             }
@@ -822,10 +1137,17 @@ mod tests {
                     for window in [0usize, 1, 3, 8] {
                         for recent_blocks in [0usize, 2, 9] {
                             for recent in [Recent::Candidate, Recent::Forced] {
-                                for prompt in [0usize, 2, 20] {
-                                    let s = strata(window, recent_blocks, recent);
+                                for (prompt, pins) in [
+                                    (0usize, vec![]),
+                                    (2, vec![0..1]),
+                                    (20, vec![0..2, 5..9]),
+                                    (0, vec![3..40]),
+                                ] {
+                                    let mut s = strata(window, recent_blocks, recent);
+                                    s.pin_blocks =
+                                        pins.iter().map(|p: &Range<usize>| p.len()).sum();
                                     let sel = selection_entries(
-                                        &scores, qpos, ratio, top_k, &s, prompt, &mut out,
+                                        &scores, qpos, ratio, top_k, &s, prompt, &pins, &mut out,
                                     );
                                     let RowSelection::Entries(n) = sel else {
                                         continue;
@@ -891,6 +1213,7 @@ mod tests {
             window: 131_072,
             recent: 8192,
             mode: Recent::Forced,
+            pinned: 0,
         };
         assert_eq!(
             Strata::from_tokens(deployed, 4),
@@ -898,12 +1221,13 @@ mod tests {
         );
         assert_eq!(
             Strata::from_tokens(StrataTokens::DEFAULT, 4),
-            strata(32_768, 2048, Recent::Candidate)
+            strata(65_536, 2048, Recent::Candidate)
         );
         let ragged = StrataTokens {
             window: 10,
             recent: 5,
             mode: Recent::Candidate,
+            pinned: 0,
         };
         assert_eq!(
             Strata::from_tokens(ragged, 4),

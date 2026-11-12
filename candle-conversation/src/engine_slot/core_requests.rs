@@ -7,18 +7,18 @@
 //! with the merge.
 
 use crate::guest::GuestRegistry;
-use crate::models::StrataTokens;
+use crate::models::{HitPercentiles, StrataTokens};
 
 /// The engine-wide settings one tenant asks for.
 pub struct CoreRequests {
     /// Tokens one prefill forward carries; `None` sizes it to the card.
     pub prefill_pass_tokens: Option<usize>,
-    /// The lowest progressive-YaRN factor any sequence runs at.
-    pub min_rope_factor: Option<f32>,
     /// A QSA selection budget in place of the checkpoint's own.
     pub qsa_selection_budget: Option<usize>,
     /// How a selecting attention divides the context.
     pub qsa_strata: StrataTokens,
+    /// Which selecting layers count hits; `None` asks for none in particular.
+    pub hit_layers: Option<HitPercentiles>,
     /// The longest reply any conversation may decode.
     pub max_response_tokens: usize,
     /// How many conversations may run at once.
@@ -36,8 +36,10 @@ impl CoreRequests {
     ///
     /// | setting | rule |
     /// |---|---|
-    /// | `prefill_pass_tokens`, `min_rope_factor`, `max_response_tokens` | the largest asked |
-    /// | `qsa_selection_budget`, `qsa_strata` | the highest-ranked tenant's |
+    /// | `prefill_pass_tokens`, `max_response_tokens` | the largest asked |
+    /// | `qsa_selection_budget`, `hit_layers` | the highest-ranked tenant that asks |
+    /// | `qsa_strata` | the highest-ranked tenant's |
+    /// | `qsa_strata.pinned` | the largest asked — every tenant's pins fit the rows |
     /// | `max_concurrent` | the sum — each tenant runs its own conversations |
     /// | `thinking` | on when any tenant turns it on; per-turn modes decide |
     /// | `guests` | the union |
@@ -49,11 +51,11 @@ impl CoreRequests {
         for ask in asks {
             merged.prefill_pass_tokens =
                 max_some(merged.prefill_pass_tokens, ask.prefill_pass_tokens);
-            merged.min_rope_factor = match (merged.min_rope_factor, ask.min_rope_factor) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
             merged.qsa_selection_budget = merged.qsa_selection_budget.or(ask.qsa_selection_budget);
+            merged.hit_layers = merged.hit_layers.take().or(ask.hit_layers);
+            // The strata are the first tenant's, but every tenant's pins must
+            // fit the rows they size, so the pinned bound is the largest asked.
+            merged.qsa_strata.pinned = merged.qsa_strata.pinned.max(ask.qsa_strata.pinned);
             merged.max_response_tokens = merged.max_response_tokens.max(ask.max_response_tokens);
             merged.max_concurrent += ask.max_concurrent;
             merged.thinking = match (merged.thinking, ask.thinking) {
@@ -80,9 +82,9 @@ mod tests {
     fn zend() -> CoreRequests {
         CoreRequests {
             prefill_pass_tokens: None,
-            min_rope_factor: Some(2.0),
             qsa_selection_budget: Some(4096),
             qsa_strata: StrataTokens::WHOLE,
+            hit_layers: Some(HitPercentiles::new(vec![50]).unwrap()),
             max_response_tokens: 65_536,
             max_concurrent: 4,
             thinking: Some(true),
@@ -93,9 +95,9 @@ mod tests {
     fn npcd() -> CoreRequests {
         CoreRequests {
             prefill_pass_tokens: Some(8192),
-            min_rope_factor: None,
             qsa_selection_budget: None,
             qsa_strata: StrataTokens::DEFAULT,
+            hit_layers: None,
             max_response_tokens: 16_384,
             max_concurrent: 4,
             thinking: None,
@@ -108,13 +110,26 @@ mod tests {
     fn two_tenants_merge_by_each_settings_rule() {
         let m = CoreRequests::merge(vec![zend(), npcd()]).unwrap();
         assert_eq!(m.prefill_pass_tokens, Some(8192), "max");
-        assert_eq!(
-            m.min_rope_factor,
-            Some(2.0),
-            "max — the RoPE schedule is the model's"
-        );
         assert_eq!(m.qsa_selection_budget, Some(4096), "the first tenant's");
         assert_eq!(m.qsa_strata, StrataTokens::WHOLE, "the first tenant's");
+        assert_eq!(
+            m.hit_layers.as_ref().map(HitPercentiles::percentiles),
+            Some(&[50u8][..]),
+            "the first tenant's"
+        );
+        // A tenant that asks for none takes the next one's.
+        let m = CoreRequests::merge(vec![npcd(), zend()]).unwrap();
+        assert_eq!(
+            m.hit_layers.as_ref().map(HitPercentiles::percentiles),
+            Some(&[50u8][..]),
+            "npcd asks none, so zend's"
+        );
+        // A lower-ranked tenant's pins still fit: the bound is the largest.
+        let mut pinning = npcd();
+        pinning.qsa_strata = pinning.qsa_strata.with_pinned(1024);
+        let m = CoreRequests::merge(vec![zend(), pinning]).unwrap();
+        assert_eq!(m.qsa_strata.window, StrataTokens::WHOLE.window);
+        assert_eq!(m.qsa_strata.pinned, 1024);
         assert_eq!(m.max_response_tokens, 65_536, "max");
         assert_eq!(m.max_concurrent, 8, "each tenant's conversations, summed");
         assert_eq!(m.thinking, Some(true));

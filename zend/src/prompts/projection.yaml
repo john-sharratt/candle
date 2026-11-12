@@ -72,17 +72,6 @@
 # PROSE wants the opposite. See `Schema::free_tool_calls_from_penalties`.
 free_tool_calls_from_penalties: true
 
-# ── RoPE ─────────────────────────────────────────────────────────────────────
-#
-# min_yarn_factor: the lowest progressive-YaRN factor any sequence runs at.
-# With 2, even a short conversation rotates on the first rung scaling by at
-# least ×2 instead of the trained RoPE, and a long one still climbs past it as
-# its reach crosses each ceiling (docs/progressive_yarn.md §8). Omit it to let
-# each sequence take the lowest rung its reach allows. Refused at load when no
-# rung of the model's schedule scales by at least this much.
-rope:
-  min_yarn_factor: 2
-
 default_policy:
   preset: high_recall_scope
   # The GPU gallery holds the first two tokens of each code within a turn,
@@ -142,6 +131,14 @@ system_prompt:
   # collection's `<tools>...</tools>` block — no blank line
   # between the intro and the first tool JSON, no blank line
   # between the last tool JSON and the outro.
+  #
+  # Items flagged `pin: true` — the persona, the journal's introduction and the
+  # journal — are attended whole by every selecting query, outside its budget,
+  # so who the model is and what it has written down are read at every depth
+  # (docs/hit_driven_projection.md §5). Whole pins first; the journal's entries
+  # newest first, as far as `pin_tokens` allows. The tool catalog is not
+  # pinned: forcing a span costs every query its cells.
+  pin_tokens: 1024
   items:
     - kind: template
       id: system_open
@@ -178,6 +175,7 @@ system_prompt:
         # select; the ingest changes only its length and thinking dials.
         - kind: selector
           id: persona
+          pin: true
           default: assistant
           options:
             # Written from the one baseline this daemon has — Cline's system prompt,
@@ -529,6 +527,7 @@ system_prompt:
     # conversation has read and done, and only then by what can be called.
     - kind: section
       id: journal_intro
+      pin: true
       depends_on: journal
       content: |+
         # Your journal
@@ -541,6 +540,7 @@ system_prompt:
 
     - kind: collection
       name: journal
+      pin: true
       selection: { kind: always_visible }
       sections: []
 
@@ -991,16 +991,17 @@ layers:
   # before the historical pool gets a seat, so a window sized only for the
   # recent window would leave score-based recall with nothing at all.
   #
-  # Sized as `Substrate::INHERITED_CHAIN_TOKEN_CAP` (100k, the ceiling on what
-  # the lineage may contribute) plus the 16k this layer used to have for its
-  # own recent turns and historical recall. Lower the cap and this can follow
-  # it down; the two numbers are a pair.
+  # Sized as `Substrate::INHERITED_CHAIN_TOKEN_CAP` (64k, the ceiling on what
+  # the lineage may contribute) plus 32k for its own recent turns and
+  # historical recall. Lower the cap and this can follow it down; the two
+  # numbers are a pair. With the working set's shares and its reserve it fits
+  # the slot, the trained window (docs/hit_driven_projection.md §4).
   - name: dialogue
     persisted_id: 10
     description: |
       The active developer conversation served to the VS Code extension or
       web chat.
-    window: 116000
+    window: 96000
     score_threshold: 0.0
     # One chat's turns are read only by that chat's own projections (its scans
     # are masked to it), so they are resident in the provenance gallery only
@@ -1022,22 +1023,30 @@ layers:
     # fade when it stops. Every `file_read` runs for real, and a file the
     # turn's loop read is not placed again until the next question.
     working_set:
+      # The slot every share below fills, with the reserve: the trained
+      # window, so a dialogue runs the trained RoPE at every depth
+      # (docs/hit_driven_projection.md §4). The schema refuses shares that do
+      # not fit it. This layer's window is a cap, not a share: each
+      # projection gives the conversation what the slot has left after the
+      # system prompt and the working set, as emitted.
+      slot_tokens: 262144
+      # What arrives between two projections: one 64-token cadence, or one
+      # prefill chunk of an opening (a tool result is prefilled in chunks of
+      # this many, with a projection between them).
+      reserve_tokens: 16384
       # What the set holds voluntarily — seeds and provenance. The model's own
       # reads sit on top under `lock_tokens`.
-      budget_tokens: 122000
+      budget_tokens: 64000
       # The locks sit on top: a read the model makes adds to what it carries
       # and never displaces the provenance around it, up to this ceiling.
-      # 122K + 150K + the 40K `guidance_tokens` + this layer's 116K window
-      # stays clear of the ×2 rung's
-      # ceiling of 524,288 (`rope: min_yarn_factor: 2`, §5).
-      lock_tokens: 150000
+      lock_tokens: 48000
       folder_tokens: 10000       # repo_map's share: pinned + provenance folders
-      # The guidance group's pool, beside `budget_tokens`: eight to ten guides
+      # The guidance group's pool, beside `budget_tokens`: four to five guides
       # and journal notes at a time (docs/guidance_layer.md §1).
-      guidance_tokens: 40000
+      guidance_tokens: 16000
       beta: 0.2                  # per-file momentum leak: m ← (1 − β)·m + fresh
       min_momentum: 100          # below this a file is no provenance candidate
-      max_file_tokens: 100000    # one file above this is never seeded or locked
+      max_file_tokens: 48000     # one file above this is never seeded or locked
       # What a dialogue starts out attending to: each enters provenance at the
       # momentum of one full-strength hit (1000) when the conversation opens and
       # fades like any other file it stops attending to. Within `--max-depth 3`.

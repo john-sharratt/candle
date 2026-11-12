@@ -29,6 +29,7 @@ use candle::{DType, Device};
 use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_model::{BatchedInference, BatchedModelCore};
+use candle_transformers::models::hit_layers::HitPercentiles;
 use candle_transformers::models::load_phase::{LoadPhase, LoadProgress};
 use candle_transformers::models::model_pack::keys::TOKENIZER_JSON;
 #[cfg(feature = "hub")]
@@ -247,10 +248,10 @@ pub struct ModelBuilder {
     /// How a selecting attention divides a query's candidates.
     /// [`StrataTokens::DEFAULT`] unless set. See [`ModelBuilder::qsa_strata`].
     qsa_strata: StrataTokens,
-    /// The lowest progressive-YaRN factor any sequence runs at. `None` lets a
-    /// sequence inside the trained window run the trained RoPE. See
-    /// [`ModelBuilder::min_rope_factor`].
-    min_rope_factor: Option<f32>,
+    /// Which selecting layers count hits. [`HitPercentiles::standard`] unless
+    /// set — `None` until a tenant asks, so a merge can take another tenant's.
+    /// See [`ModelBuilder::hit_layers`].
+    hit_layers: Option<HitPercentiles>,
 }
 
 impl ModelBuilder {
@@ -287,7 +288,7 @@ impl ModelBuilder {
             loras: Vec::new(),
             qsa_selection_budget: None,
             qsa_strata: StrataTokens::DEFAULT,
-            min_rope_factor: None,
+            hit_layers: None,
             spec,
         }
     }
@@ -473,20 +474,12 @@ impl ModelBuilder {
         self
     }
 
-    /// The lowest YaRN factor any sequence runs at (`docs/progressive_yarn.md`).
-    ///
-    /// Progressive YaRN runs a sequence on the trained RoPE (factor 1) while
-    /// it fits the trained window, and climbs to the next published factor as
-    /// it outgrows each ceiling. With a minimum of `2`, every sequence runs at
-    /// least the first rung scaling by 2 — even a short one — and still climbs
-    /// past it as it grows. Every rung's table stays; only the choice is
-    /// raised. `None` (the default) or `1` changes nothing.
-    ///
-    /// A schedule with no rung scaling by at least `min` is refused at load,
-    /// as is a model whose kernels read no rung — a setting that cannot take
-    /// effect is never accepted silently.
-    pub fn min_rope_factor(mut self, min: Option<f32>) -> Self {
-        self.min_rope_factor = min;
+    /// Which selecting layers keep index rows for unloaded pieces and count
+    /// hits (`docs/hit_driven_projection.md` §6.1), as percentiles over them.
+    /// Handed to every model through `ManagedBatchedModel::set_hit_layers`; a
+    /// model whose attention reads every position has nothing to count.
+    pub fn hit_layers(mut self, layers: HitPercentiles) -> Self {
+        self.hit_layers = Some(layers);
         self
     }
 
@@ -1073,7 +1066,7 @@ impl ModelBuilder {
             self.spec.model_filename.clone(),
             digest,
             tokenizer_json,
-            rope_key(&self.spec.rope, self.min_rope_factor),
+            rope_key(&self.spec.rope),
         )
         .map_err(ConversationError::Other)
     }
@@ -1152,9 +1145,7 @@ impl ModelBuilder {
 
     /// Load a model from its model pack ([`Self::resolve_model`]).
     ///
-    /// Uses the builder's `max_seq_len` for KV cache sizing, and raises the
-    /// model's RoPE floor to the builder's [`Self::min_rope_factor`] before any
-    /// session opens. The int8 mode is the one the pack was built for — chosen
+    /// Uses the builder's `max_seq_len` for KV cache sizing. The int8 mode is the one the pack was built for — chosen
     /// once, when it was resolved — and is returned with the model, never
     /// re-derived: `auto_sized` reads free VRAM, which the load itself changes.
     pub fn load_model(
@@ -1183,16 +1174,9 @@ impl ModelBuilder {
             mode = ?self.qsa_strata.mode,
             "selection strata (a model whose attention reads every position ignores it)"
         );
-        if let Some(min) = self.min_rope_factor {
-            model
-                .set_rope_min_factor(min)
-                .map_err(ConversationError::Model)?;
-            tracing::info!(
-                min_factor = min,
-                floor = model.rope_select().floor(),
-                "RoPE: no sequence runs below the minimum YaRN factor"
-            );
-        }
+        model
+            .set_hit_layers(&self.hit_layers.clone().unwrap_or_default())
+            .map_err(ConversationError::Model)?;
         Ok(LoadedModel { model, int8_mode })
     }
 
@@ -1437,9 +1421,9 @@ impl ModelBuilder {
     pub fn take_core_requests(&mut self) -> CoreRequests {
         CoreRequests {
             prefill_pass_tokens: self.prefill_pass_tokens,
-            min_rope_factor: self.min_rope_factor,
             qsa_selection_budget: self.qsa_selection_budget,
             qsa_strata: self.qsa_strata,
+            hit_layers: self.hit_layers.clone(),
             max_response_tokens: self.max_response_tokens,
             max_concurrent: self.max_concurrent,
             thinking: self.thinking,
@@ -1451,9 +1435,9 @@ impl ModelBuilder {
     /// this builder's own.
     pub fn apply_core_requests(&mut self, merged: CoreRequests) {
         self.prefill_pass_tokens = merged.prefill_pass_tokens;
-        self.min_rope_factor = merged.min_rope_factor;
         self.qsa_selection_budget = merged.qsa_selection_budget;
         self.qsa_strata = merged.qsa_strata;
+        self.hit_layers = merged.hit_layers;
         self.max_response_tokens = merged.max_response_tokens;
         self.max_concurrent = merged.max_concurrent;
         self.thinking = merged.thinking;
@@ -2309,9 +2293,10 @@ mod selection_budget_tests {
             assert_eq!(
                 model.builder().qsa_strata,
                 StrataTokens {
-                    window: 131_072,
+                    window: 262_144,
                     recent: 8192,
                     mode: Recent::Candidate,
+                    pinned: 0,
                 }
             );
         }

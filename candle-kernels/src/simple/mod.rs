@@ -88,6 +88,7 @@ pub mod ple_fused;
 pub mod ple_gather_dequant;
 // QSA block selection: indexer scores → the per-query packed entry list the
 // paged attention kernels read.
+pub mod qsa_hits;
 pub mod qsa_index_append;
 pub mod qsa_page_place;
 pub mod qsa_rope_rows;
