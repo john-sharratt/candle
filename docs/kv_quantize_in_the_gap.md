@@ -221,7 +221,10 @@ It holds:
   sequence number.
 
 That is what the selection reads back to the host today, delivered through
-mapped memory. The host reads it only once the completion word matches, by
+mapped memory. The palette maps are carried packed, two bits a channel as
+`PalMapBytes` holds them (`head_dim / 4` bytes per head for K and for V), not
+one byte a channel as today's readback widens them (`sampled_selection/gpu.rs`),
+so a row is a few hundred bytes per layer. The host reads it only once the completion word matches, by
 reading the mapped word at the head of a gap. No host CUDA call reads or waits
 on the buffer. The buffer is sized at start for the largest table a gap can
 build (§3.1's cut).
@@ -359,6 +362,23 @@ scale whichever gap quantizes them.
   later record supersedes (`kv_tier_migration.md` §5.5).
 - **Hot after warm.** The hot copy is already quantized and is left alone.
   Dropping it under pressure, or as an idle demote, is a free, not a copy.
+- **The persistence thread touches no arena topology.** Its pass opens with a
+  `device.synchronize()` that orders more than the migrate: the deferred arena
+  creation and the idle demote that follow it in the pass (`run_pass`) rely on
+  it too, and taking it away once raised `CUDA_ERROR_ILLEGAL_ADDRESS` from 0
+  to 199 in a run. Both leave the persistence thread. The gap already creates
+  the arenas a refusal owes (§3), and the idle demote runs in the gap after
+  compaction, between forwards, where every free is ordered behind the
+  forward that last read the block. With the copy on its own stream and
+  nothing else on the device, the persistence thread has nothing left that
+  the fence ordered.
+- **The backlog gauge measures the copy.** `pending_warm_bytes` is the
+  quantized bytes installed hot and not yet copied warm, stamped by the
+  persistence thread as today. `on_backlog_fall` still wakes the scheduler,
+  and `flush_blocking` / `flush_at_least` still wait for warm copies, because
+  a hot block is evictable only once a warm copy or the log holds it. The
+  figure is about a quarter of today's for the same K/V. `pinned_undrainable_bytes`
+  keeps its meaning.
 
 ## 6. What is deleted
 
@@ -445,12 +465,14 @@ Line numbers are as of commit `dc04b62ac`.
 **1. Measure the core (§8 step 1).**
 - `candle-transformers/src/models/batch_test/utils.rs:2056` and `:2195`: the two
   boundary calls. Time them, and report device time per MiB of native K/V.
-- `candle-transformers/src/models/batched_inference.rs:2052`,
-  `quantize_and_seal_sequences`. Its convert is issued inside a loop over every
+- `candle-transformers/src/models/batched_inference.rs`,
+  `quantize_and_seal_sequences`. Its convert was issued inside a loop over every
   backing with the whole descriptor list each time, where
-  `convert_deferred_descs` says any one backing serves. Confirm whether that
-  repeats the convert once per layer before trusting the timing, and time a
-  single convert.
+  `convert_deferred_descs` says any one backing serves: it ran the convert once
+  per KV layer. It now runs once, and the call answers its `SealTiming`
+  (`models/seal_timing.rs`), which both boundaries print as a `seal core` line:
+  native MiB, selection and convert time, ms per MiB and, at the decode
+  boundary, the share of decode the gap would take.
 
 **2. The descriptor table and the cursor (§3.1).**
 - New `candle-nn/src/kv_cache/chunked/gap_table.rs`: the row type and the
@@ -517,7 +539,9 @@ Line numbers are as of commit `dc04b62ac`.
 - `candle-conversation/src/persistence/thread.rs`: `run_pass` (`:1036`) keeps
   the copy and the append. Deleted: `await_owed_arenas` (`:694`),
   `install_hot_to_warm` (`:710`), `migrate_group_hot_to_warm` (`:771`), the
-  syncs at `:1100`, `:1334` and `:1414`, `MAX_GAP_RETRIES` (`:1253`).
+  syncs at `:1100`, `:1334` and `:1414`, `MAX_GAP_RETRIES` (`:1253`), and the
+  pass's deferred arena creation (`:1146`). The idle demote (`:1162`) moves to
+  the gap (§5). `BacklogGauge` stays, stamped with the copy backlog.
 - `candle-nn/src/kv_cache/chunked/chunk_ops.rs:1297`,
   `migrate_sealed_to_cpu_batch_async`: the copy, on the thread's own stream,
   into the pool.
