@@ -51,9 +51,10 @@ The findings this answers are in
 | **Rounds** | The carving unit: a request and its answer, or a call and its result. Every slot of rounds reads as a conversation that could have happened. |
 | **Slot** | The pool's best rounds, K/V loaded, at most the trained window (262,144 positions) less one append's reserve, seated at compact positions and selected as one window. |
 | **Hits** | Per round, how often the indexer selected its blocks (loaded) or would have (unloaded, the shadow scan), on a sample of the selecting layers, over every prefilled and decoded query. |
-| **Scoring prefill** | A turn's opening is prefilled once to count its hits, rewound, projected from them, and prefilled again against the slot it chose. |
+| **Openings** | A turn's opening is prefilled once, in chunks of at most `reserve_tokens` with a boundary between them; its hits move the slot at the next boundary. |
 | **Projection** | At each projection boundary, hits move each round's score, the pool is re-chosen by conversation, and the slot by round: locks, pins, floors, then score. |
 | **Journals** | What leaves the pool is carried by journal notes. |
+| **Kept objects** | What the substrate holds that no model computed — accounts, threads, tokens, world state, journal text — is exported as text before the model changes and imported after (§14.4). |
 
 ## 3. Terms
 
@@ -63,6 +64,13 @@ The findings this answers are in
 - **Round**: one unit the slot places or removes whole, carved from a piece by
   the round grammar (§8.1): its opening request, one tool call with its result,
   or its closing answer.
+- **Half**: one of a turn's two records, the user record or the assistant
+  record (`code_read::couple_turn`), sealed on its own (§8.1).
+- **Cell, block, chunk**: a cell is one position. A block is `ratio` cells
+  (four on Flash-Next), one row of the index and the unit the selection ranks
+  (`qsa_select.rs`); the checkpoint's budget is 2,051 cells, about 512 blocks.
+  A chunk is the 32-token unit K/V is stored and quantized in, and plays no
+  part in selection or hits. Hits are counted per block.
 - **Pool**: the pieces whose sampled index rows are resident for this sequence.
 - **Slot**: the rounds of the pool whose K/V is loaded. Only the slot is
   attended.
@@ -96,17 +104,21 @@ with.
   another model's, and the model binding refuses the old substrate
   (`persistence/model_binding.rs`). That is what it is: past the first
   attention layer, every block's K and V were computed by layers that attended
-  under ×2. Nothing is carried across. zend's and npcd's substrates are wiped
-  on every member when the build rolls out (§14.4); the priming chain is
-  primed again, code readings come back as they are asked for, and zend's
-  conversations and npcd's NPC memory start empty. Journals are git
-  repositories outside the substrate and are untouched.
+  under ×2. No model-derived record is carried across. zend's and npcd's
+  substrates are moved aside on every member when the build rolls out
+  (§14.4); the priming chain is primed again, code readings come back as they
+  are asked for, and zend's conversations and npcd's NPC memory start empty.
+  What no model computed — the custom objects and the blobs they name, and
+  npcd's cast — is exported as text first and imported into the new
+  substrates. Journals are git repositories outside the substrate and are
+  untouched.
 - **The reserve is one append, not a reply.** The slot's pieces fill
   `L0 − reserve_tokens` (default 16,384). The slot is re-chosen at every
   boundary (§7.2), so it only has to hold what can arrive between two of them:
   one cadence of decoded tokens, or one prefill chunk (§7.4). A reply of any
   length ends inside rung 1, because each boundary sheds what the next stride
-  needs.
+  needs, down to the floors of §8.5; what gives way when even those pass the
+  slot is in §7.2.
 - **The higher rungs stay for callers that drive a sequence past `L0`
   themselves** (the YaRN gates, a plain-prompt conversation), and for one case
   in zend's dialogue: locks the user asked for that alone pass the slot (§7.2).
@@ -159,14 +171,24 @@ at every selecting layer, whatever its score.
   (it is built inside a forward). The engine's bound is the largest any
   tenant asks; a sequence that declares pins on an engine bounded at zero is
   warned of at the declaration.
-- **The slot is fitted at every projection.** The working set's shares and
-  the reserve are checked against `slot_tokens` at parse; the shares and the
-  conversation's `window` are caps (§7.2). Each projection measures the system prompt and the
-  working set as it emits them and gives the conversation what the slot has
-  left after them and the reserve (`slot_room`), so the system prompt needs
+- **At most `MAX_PINS` ranges, the growing one last.** The pinned items' places
+  are fixed by the schema's declared order, and a collection's members sit
+  together, so the number of disjoint ranges is known at construction:
+  adjacent pinned items make one range, and a schema whose pins fall into more
+  than `MAX_PINS` (4) ranges is refused (`InvalidPins`). A pinned collection
+  is the one pin that grows, so it must be the last pinned item, or the schema
+  is refused; that is what makes "the front of the last range" its oldest
+  members. zend's pins are two ranges: the persona, and the journal's
+  introduction with the journal behind it.
+- **The slot is the model's trained window.** There is no `slot_tokens`: the
+  slot is `L0` as the engine reports it for its model, so the two cannot
+  disagree. The working set's shares and `reserve_tokens` are checked against
+  it when the engine is built; the shares and the conversation's `window` are
+  caps (§7.2). The system prompt is measured as it is emitted and the fill
+  (§7.2) places everything else in what it leaves, so the system prompt needs
   no margin and a slot never leaves the trained window on its own content.
-  Only shares and a prompt that alone pass the slot could carry it out, and
-  the assembler warns when a placement does.
+  Only locks, or floors that alone pass the slot, carry it out (§7.2), and the
+  assembler warns when a placement does.
 - **Cost.** Every pinned cell is read by every query at every selecting layer:
   at `pin_tokens`, half the checkpoint's own read. Forcing the 8K recent span
   cost +93% decode and confused reasoning after a tool call
@@ -205,7 +227,9 @@ ranks the history it can see.
 
 At a sampled layer, each selected block of a loaded round is one hit for that
 round. The lowest score the selection kept is that query's **cut** at that
-layer.
+layer. A row whose visible cells fit inside the budget attends all of them and
+ranks nothing: it has no cut, counts no hits, and keeps no query for the
+shadow scan.
 
 ### 6.3 The shadow scan
 
@@ -225,6 +249,13 @@ rounds' index rows.
   real selection used, rotated where it already is. The indexer ranks a
   context of the length the slot gives it, never longer than it was trained
   on, and its scores are on the scale of the real cut.
+- **Windows hold unloaded rows only.** The slot's prompt and pinned ranges are
+  already attended and are not repeated in any window. The work is bounded by
+  the pool, not by the window count: every unloaded row is scored once per
+  query whatever `p` is, and a window's top-k is linear in its length, so a
+  small `p` early in a dialogue makes many short windows for the same total.
+  A window no longer than the budget keeps every block, and the cut alone
+  decides its hits.
 - **A hit is a block that would have been read.** Each window ranks its blocks
   as the real selection ranks the slot's: the checkpoint's budget, one
   window. An unloaded block is one hit for its round when it is in its
@@ -257,7 +288,7 @@ rounds' index rows.
 
 Counters are per round per sequence, on the device (`qwen4exp/hits.rs`). A
 device map takes each block to its round, loaded or pooled, rebuilt when a
-projection declares its rounds (`ManagedBatchedModel::set_hit_pieces`); after
+projection declares its rounds (`ManagedBatchedModel::set_hit_rounds`); after
 the selection at a sampled layer one batched launch adds each chosen block
 into its piece's counter (`qsa_hits.cu`, a span table naming each sequence's
 rows, map and counters). Nothing is read inside a forward: the reprojection
@@ -265,10 +296,19 @@ reads and zeroes the counts at the boundary (`take_hits`), where it already
 stands between forwards. A row inside the budget made no selection and counts
 nothing.
 
-A round's **hit density** over a stride is its hits divided by its blocks and
-by the queries the stride held. Density, not count, so a long round does not
-outrank a short one by size. A piece's density is its rounds' hits over its
-blocks. A decoded stride is at most 64 queries, so one
+A counter's identity is the round's: (piece id, round index), stable across
+projections (§13 step 5), so the hook that declares them is
+`set_hit_rounds`. Counters are kept per sequence, and per round within it.
+
+A round's **hit density** over a stride is its hits divided by its blocks, by
+the number of sampled layers, and by the queries that could have hit it. A
+round is loaded or unloaded for a whole stride, since membership changes only
+at a boundary, so that count is one of two: for a loaded round, the stride's
+rows that made a selection (every such row of a prefill, every decoded token);
+for an unloaded round, the rows kept for the shadow scan (at most 64). Each
+query is then one unit of evidence whichever way it was counted. Density, not
+count, so a long round does not outrank a short one by size. A piece's
+density is its rounds' hits over its blocks, on the same denominators. A decoded stride is at most 64 queries, so one
 stride's density is noisy; the momentum (§7.1) is what the score reads, and at
 a leak of 0.2 it carries about the last five strides.
 
@@ -278,10 +318,15 @@ a leak of 0.2 it carries about the last five strides.
 
 Each round, and each piece, carries a base score and a hit momentum.
 
-- **Base** is what the projection gives it today: provenance's score for a
-  retrieved piece and each of its rounds, the seed momentum for a seeded one,
-  distance from the cursor for a round of the dialogue (nearer is higher), and
-  the lineage's base for a link of the inherited lineage (§8.4).
+- **Base** is what the projection gives it today, on the one band a
+  reprojection scores on, `0 ..= 1,000`, where 1,000 is one full-strength hit
+  (`LINEAGE_BASE`): provenance's normalized score for a retrieved piece and
+  each of its rounds, the seed momentum for a seeded one (normalized to the
+  same band), the turn's own belief score for a round of the dialogue, as the
+  history is scored today, and `lineage_base` for a link of the inherited
+  lineage (§8.4). There is no distance base: the dialogue's recent exchanges
+  hold their seats as floors (§8.5), and older rounds compete on evidence like
+  everything else. Ties break oldest first.
 - **Hit momentum** `h` follows the stride's density `d`:
   `h ← (1 − β) · h + d`, with `β` the working set's leak (0.2).
 - **Score** is `base · (1 + gain · h)`. A piece the indexer keeps reading holds
@@ -304,7 +349,11 @@ At each boundary:
    round of a file's reading is a candidate for the slot, or none is.
    `pool_tokens` is per card, as the deployment's machine config sets it:
    1,000,000 on the 72 GB card, 512,000 on the 24 GB card, 256,000 on the
-   16 GB card. The slot is the same on all three.
+   16 GB card. It lives in the machine config only, not in `projection.yaml`.
+   The slot is the same on all three. The pool is per sequence: each dialogue
+   chooses its own. On the 16 GB card it is barely larger than the slot and
+   the shadow scan has little to find; that is accepted, and the machine
+   config can raise it.
 2. **Shared index pages.** A piece's sampled-layer index pages are placed on
    the device once per card, whichever sequences pool it, and refcounted: a
    sequence pooling a piece takes a reference, one dropping it gives the
@@ -314,27 +363,50 @@ At each boundary:
    counters stay per sequence: the shared page says nothing about who read it.
    The pages are read-only once placed, so a sequence's selection, the shadow
    scan and the hit map all address them through the span's descriptor tables
-   (AGENTS invariant 2b) without a copy.
+   (AGENTS invariant 2b) without a copy. They live in the span's KV-regions
+   tenancy, beside the slot's index pages, allocated from the region pool.
+   Index pages are sealed and persisted with a record's K/V (warm, and in the
+   redo log), so a piece's rows come from wherever its K/V is: a cold piece's
+   rows are read from the log on admission and it is scored from the boundary
+   after they land.
 3. **Pooled K/V.** A piece entering the pool has its K/V brought to the warm
-   tier, so a
-   round chosen for the slot loads at PCIe speed. Where the warm tier has no
-   room for all of it, the pool takes what fits and leaves the rest cold; a
-   cold round chosen for the slot loads from the redo log, one boundary later.
-   A round placed in the slot is hot.
-4. **Slot, by round.** Rounds in this order, until the slot holds
-   `L0 − reserve_tokens` less what the turn has already appended:
+   tier, so a round chosen for the slot loads at PCIe speed. The warm tier is
+   the substrate's, one copy of a sealed record however many sequences pool
+   it, so warm K/V is shared per piece as the index pages are, and bounded by
+   the warm tier's own capacity, not by `pool_tokens`. Where the warm tier has
+   no room for all of it, the pool takes what fits and leaves the rest cold; a
+   cold round chosen for the slot loads from the redo log, one boundary later,
+   and holds no room while it is in flight: the slot is filled without it, and
+   it is placed at the next boundary if it still ranks. A round placed in the
+   slot is hot.
+4. **Slot, by round.** One fill replaces the budget passes of the working set
+   and `select_conversation`, and `slot_room` with them. Its room is
+   `L0 − reserve_tokens`, less the system prompt as emitted (pinned ranges
+   included) and what the turn has already appended. Rounds in this order:
    1. **Locks**, whole. A read the user asked for is placed entire, whatever
       it costs. If the locks alone pass the slot they are placed anyway, and
       the slot runs past `L0` on the rung its reach needs (§4).
-   2. **Pins** (§5).
-   3. **Floors** (§8.5): a reading's request and answer when any round of it
-      is placed, the dialogue's first request and its recent rounds.
-   4. **Everything else by score**, highest first, whichever piece it comes
-      from, each round admitted only while its kind is under its cap.
+   2. **Floors** (§8.5), in their own order: the current exchange (its
+      request, its newest tool round and the reply as it grows), the
+      dialogue's first request, then the recent exchanges newest first.
+   3. **Everything else by score**, highest first, whichever piece it comes
+      from, each round admitted only while its kind is under its cap. A
+      round of a piece not yet placed brings the piece's request and answer
+      with it (its floor, §8.1), and is admitted only if all three fit.
 
    Each tier takes its room from the tiers below it, so as locks grow,
    provenance's rounds and the lower-scored history of the dialogue shrink
    with them, never the locks themselves.
+
+   **When the floors pass the room, they give way from the bottom.** A recent
+   exchange that does not fit sheds its tool rounds, oldest first, and leaves
+   whole once it has none left; the recent exchanges go oldest first. If the
+   current exchange alone still passes the room, its own older tool rounds go,
+   oldest first; its request, its newest tool round and the reply stay. Only
+   when those, the first request and the system prompt alone pass the room
+   does the slot run past `L0`, as locks carry it, and the assembler warns. A
+   reply therefore stays on rung 1 unless one exchange's request, newest
+   result and reply alone outgrow the trained window.
 
    **The working set's shares are caps.** They bound how much of each kind the
    slot holds from the last tier, and never reserve room:
@@ -345,12 +417,18 @@ At each boundary:
    | `folder` (10,000) | folder-summary rounds |
    | `guidance` (16,000) | guide and journal-note rounds |
    | `max_file` (48,000) | one reading's rounds, its request and answer included |
-   | `window` (96,000) | the dialogue's own rounds, its floors included |
+   | `window` (180,000) | the dialogue's own rounds and the inherited lineage, its floors included |
 
    A round whose kind is at its cap is skipped and the fill goes on to the
    next by score, so a capped kind leaves its room to the others. Floors count
    toward their kind's cap but are never skipped for it. Locks are bounded by
-   `lock_tokens` alone. The pool has no caps but `pool_tokens`.
+   `lock_tokens` alone. The pool has no caps but `pool_tokens`. The caps may
+   sum past the room, and do: `budget` and `window` together are about 244K,
+   so a slot whose working set is thin is filled by the dialogue, and one
+   whose dialogue is short by the working set. The caps keep either from
+   taking the whole slot; they never leave it underfilled while either kind
+   has rounds to give. `window` is raised from 96,000 to 180,000 for that,
+   in the dialogue layer of `projection.yaml`.
 5. **Rounds in and out.** A round entering the slot has its K/V and its
    remaining layers' index rows brought to the device; one leaving keeps its
    sampled rows and its warm K/V while its piece stays pooled.
@@ -372,30 +450,24 @@ K/V comes up from the warm or cold tier while the sequence's next wave is
 built, and the sequence decodes against the slot once the placement lands. A
 piece leaving the slot is released at the same placement.
 
-### 7.4 The scoring prefill
+### 7.4 Openings
 
-A turn's opening projection runs before the turn is prefilled, so without
-more it would be chosen from the previous turn's hits and none of the new
-question's. The opening is therefore prefilled twice:
+A turn's opening — the user's turn, or a tool result — is prefilled once,
+against the slot the last boundary chose. Its prefill rows are selected
+(§6.2), so the sampled layers count real hits and its last 64 rows are kept
+for the shadow scan, exactly as decoded queries are. The boundary at its end
+re-chooses the slot from those hits, and the reply decodes against that slot
+(`wants_early_reprojection`, which fires at the first decoded token).
 
-1. **Snapshot.** The sequence's recurrent state and its index's open rows are
-   snapshot through the rewind buffers speculative decoding already uses
-   (`IndexCache::snapshot` / `restore`, `Qwen4ExpBatched::restore_recurrent`).
-2. **Score.** The opening — the user's turn, or a tool result — is prefilled
-   against the current slot. Its prefill rows are selected (§6.2), so the
-   sampled layers count real hits and keep their queries for the shadow scan,
-   exactly as decoded queries do.
-3. **Rewind and project.** The snapshot is restored, the shadow scan runs, and
-   the projection re-chooses the slot from the opening's hits.
-4. **Prefill.** The opening is prefilled again against the slot it chose. Its
-   K/V is computed by layers that attended what it asked for, and decoding
-   starts from there.
+An opening longer than `reserve_tokens` is cut into chunks of that length
+with a boundary between them, so a long tool result moves the slot as it
+arrives and the slot never passes `L0`. Each chunk is prefilled once, against
+the slot the boundary before it chose.
 
-An opening longer than `reserve_tokens` is cut into chunks of that length with
-a boundary between them; each chunk is scored, rewound and prefilled as
-above, so a long tool result moves the slot as it arrives and the slot never
-passes `L0`. A user's turn is usually a few hundred tokens, so its second
-prefill costs little against the reply it opens.
+An opening is not prefilled twice. The failure that would have justified it
+was attention never reaching a seat the slot held (§1), which the one window
+over a trained-length slot and the pinned ranges answer directly; a second
+prefill of every tool result is a cost with nothing left to buy.
 
 ### 7.5 What provenance does now
 
@@ -429,13 +501,15 @@ are placed with it. A carving keeps the grammar by construction. Dropping any
 tool round leaves a request, rounds that each answer the turn before them, and
 a closing answer to the request.
 
-Tool rounds cross turn records. The turn store keeps a turn as a user record
-and an assistant record (`code_read::couple_turn`). A round's call is the tail
-of one assistant record and its result is the head of the next user record,
-so a round spans two records. A round is carved from halves of records, not
-whole records, and each half carries its own index page.
+Tool rounds cross turns. The turn store keeps a turn as a user record and an
+assistant record (`code_read::couple_turn`): turn `n` is the result of call
+`n − 1` and the reply that makes call `n`. A round's call is one turn's
+assistant record and its result is the next turn's user record, so a round is
+two whole records from two adjacent turns, never a record split at the call.
+Those records are the **halves**: each is sealed on its own, with its own
+index page.
 
-- **Sealed per half.** Every turn record is sealed as two halves, each with
+- **Sealed per half.** Every turn is sealed as its two records, each with
   K/V and index rows of its own. A half placed alone
   (`inject_sealed_turn_half`) carries its index page, so the indexer scores it
   and the hit map counts it as a block range of its round. A half placed
@@ -443,6 +517,10 @@ whole records, and each half carries its own index page.
   rank it, and it would be attended only through the query's tail. The
   substrate starts empty under the new key (§4), so every record is sealed
   per half from its first write.
+- **Ragged, not padded.** Each half ends on its own partial chunk and partial
+  block, as every system-prompt section already does (§5). Seated halves take
+  consecutive positions; the short tail is a short page in storage, never dead
+  positions in the slot.
 - **Seated by the call that produced it.** A round's call and result keep
   their order and sit between the request and the answer. Rounds keep the
   order they were read in, so the pages they hold read in file order.
@@ -472,12 +550,19 @@ not cost 48K, only the pages the question reads.
 
 ### 8.3 The dialogue
 
-The dialogue is carved by the same grammar. One exchange is the user's turn,
-its tool rounds and the assistant's answer to it, never the user's turn
-without its answer. When the dialogue must shrink, its tool rounds go first,
-oldest first, and the user's question and the assistant's answer stay. What
-remains reads as a complete exchange. An exchange leaves whole once it has no
-rounds left to shed.
+The dialogue is carved by the same grammar, and each exchange is a piece of it
+for the floor rule: the user's turn, its tool rounds and the assistant's
+answer to it, never the user's turn without its answer.
+
+- **Recent exchanges are floors, whole.** The current exchange and the
+  `recent` (16) before it hold every round they have, tool rounds included,
+  and give way only as §7.2 says when the floors pass the room: tool rounds
+  oldest first, then the exchange whole.
+- **Older exchanges compete by score.** Each of their tool rounds is a round
+  of the fill, scored from the turn's base and lifted by its hits like any
+  other. Their request and answer are the exchange's floor: placed together,
+  with any of its tool rounds, or not at all. So the history is score-ordered,
+  and what remains of any exchange still reads as a complete exchange.
 
 ### 8.4 The inherited lineage
 
@@ -487,11 +572,13 @@ about 40K tokens and capped by `Substrate::INHERITED_CHAIN_TOKEN_CAP`. Today
 the lineage was inviolate in a dialogue. Here each turn of it is scored like the
 conversation's history from a base of its own — `lineage_base` on the
 conversation group's selection, default one full-strength hit (1,000,
-`LINEAGE_BASE`) — and competes with the history in the window's budget pass,
-lowest first (`select_conversation`). It holds its seat against everything
-below its base and gives way to a turn that outscores it: one the indexer keeps
-reading, whose score its hits have lifted (§7.1). Seated, the lineage keeps
-its order, after the system prompt and before everything else.
+`LINEAGE_BASE`), with the ancestor whisker that makes the oldest ancestor go
+first and whole — and competes in the slot fill's score tier (§7.2) as a
+round of the dialogue's kind, counted against `window`. It holds its seat
+against everything below its base and gives way to a turn that outscores it:
+one the indexer keeps reading, whose score its hits have lifted (§7.1).
+Seated, the lineage keeps its order, after the system prompt and before
+everything else.
 
 ### 8.5 Floors
 
@@ -502,10 +589,13 @@ Always in the pool and the slot, whatever their score, in the order of §7.2:
   everything below them gives up its room. `lock_tokens` still bounds what
   can be locked: a lock past it is refused and the read runs for real
   (`Refusal::Full`), its result in the dialogue's own rounds.
-- the pinned ranges;
-- each placed piece's request and answer (§8.1);
+- the system prompt, its pinned ranges with it (§5);
+- the current exchange: its request, its newest tool round and the reply as
+  it grows, and its older tool rounds until §7.2 sheds them;
 - the dialogue's first user turn;
-- the dialogue's most recent exchanges (`recent`, 16).
+- the dialogue's most recent exchanges (`recent`, 16), whole, newest first;
+- each placed piece's request and answer (§8.1), which come with the piece's
+  first placed round rather than on their own.
 
 Everything else is scored round by round. When provenance scores are low the
 dialogue fills the slot; when they are high the oldest unread rounds give way.
@@ -523,15 +613,16 @@ had said it is read back as something it said
 
 | Piece | File |
 |---|---|
-| `rope: min_yarn_factor` removed with its schema field, error and identity argument; the substrate wiped under the new key | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{schema,error,builder}.rs`, `candle-conversation/src/models/{builder.rs,identity/rope_key.rs}` |
-| `hits:` block; `pin: true` on system-prompt items and `pin_tokens`; `slot_tokens`, `reserve_tokens`, `pool_tokens`, `lock_tokens`; `lineage_base` on the conversation rule; the `working_set` shares and `window` as caps on the slot fill | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{yaml,schema}.rs` |
+| `rope: min_yarn_factor` removed with its schema field, error and identity argument; the substrate moved aside under the new key, its kept objects exported and imported | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{schema,error,builder}.rs`, `candle-conversation/src/models/{builder.rs,identity/rope_key.rs}` |
+| `hits:` block; `pin: true` on system-prompt items and `pin_tokens`; `reserve_tokens`, `lock_tokens`; `lineage_base` on the conversation rule; the `working_set` shares and `window` (180,000) as caps on the slot fill; `slot_tokens` removed, the slot read from the engine's `L0` | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{yaml,schema}.rs` |
 | Pinned ranges in place of the prompt span; forced in every row; one window over the slot | `candle-transformers/src/models/qwen4exp/{indexer,qsa_select,wave}.rs`, `candle-kernels/src/simple/qsa_topk.cu` |
 | Sampled layers from percentiles | `candle-transformers/src/models/selection_strata.rs` beside `StrataTokens` |
 | Index rows resident without K/V; the stride's kept queries and cuts; the shadow scan and its windows | `candle-transformers/src/models/qwen4exp/{paged_index,place,indexer}.rs`, the paged scorer |
 | The block-to-piece table, per-piece counters and the mapped summary | `candle-transformers/src/models/qwen4exp/indexer.rs`, read in `candle-conversation/src/scheduler/` |
-| The scoring prefill: snapshot, score, rewind, project, prefill; chunked openings | `candle-conversation/src/scheduler/{prefill,decode}.rs`, `candle-transformers/src/models/qwen4exp/wave.rs` |
+| Openings chunked at `reserve_tokens` with a boundary between chunks | `candle-conversation/src/scheduler/{prefill,decode}.rs` |
+| Text export and import of every kept custom object and the blobs it names | `zend/src/` and `npcd/src/` admin routes, over `candle-conversation/src/persistence/` |
 | Scores, the pool, the slot, floors, the lineage, exchanges and tool rounds as units | `candle-conversation/src/projection/` (resolver, working set, `select_conversation`), `candle-conversation/src/scheduler/projection_assembler.rs` |
-| `ManagedBatchedModel` hooks for pinned ranges, hit summaries and the scoring rewind (no-ops for a model that does not select) | `candle-transformers/src/models/batched_inference.rs` |
+| `ManagedBatchedModel` hooks for pinned ranges, hit rounds and summaries, and the trained window (no-ops for a model that does not select) | `candle-transformers/src/models/batched_inference.rs` |
 | `pool_tokens` per card; pooled K/V warmed, cold where warm runs short | the machine config, `candle-conversation/src/scheduler/projection_assembler.rs`, the tier migration (`persistence/`) |
 | Rounds carved by the grammar; slot order locks, pins, floors, score | `candle-conversation/src/projection/` (`select_conversation`, the working set), `candle-conversation/src/scheduler/projection_assembler.rs` |
 | Every turn record sealed per half, each half with its index page | `candle-conversation/src/scheduler/` (`inject_sealed_turn_half`), `candle-conversation/src/persistence/` |
@@ -555,8 +646,6 @@ had said it is read back as something it said
 - **Ingest.** One read per reply makes a reading take one reply per page:
   more, shorter turns than batched reads, and every turn record sealed in two
   halves.
-- **Scoring prefill.** One extra prefill of each opening, and the snapshot
-  copy of the recurrent state and the index's open rows.
 - **K/V.** At most the trained window, against about 428K of budget today.
 - **Decode.** One window instead of two halves the cells a query reads at a
   full slot. The pinned ranges add their cells to every query's read.
@@ -597,7 +686,8 @@ had said it is read back as something it said
    working set; a schema whose working-set shares and reserve pass the slot is
    refused, and every projection fits the conversation to what the slot has
    left after the system prompt and the working set as emitted
-   (`slot_room`).
+   (`slot_room`). §13 step 8 replaces both: the slot is the engine's `L0`
+   and the fill takes `slot_room`'s place.
 8. **The lineage (§8.4)** is scored from `lineage_base`, ancestors ranked so
    a tight window gives up the oldest first and whole.
 9. **Hits across views.** A view carved from a slot counts into the slot's
@@ -642,18 +732,39 @@ the order of dependence.
 7. **The pool (§7.2).** `pool_tokens` per card from the machine config; pool
    admission by piece; pooled K/V warmed, cold where warm runs short; the hit
    map covers loaded and pooled rounds.
-8. **The slot fill (§7.2).** Locks, pins, floors, score; the shares as caps;
-   locks past the slot run it past `L0`. This replaces today's budget passes in
-   the working set and `select_conversation`; the old passes are removed, not
-   kept beside it.
+8. **The slot fill (§7.2).** One score-ordered fill after the system prompt:
+   locks, floors in their order, score; the shares and `window` as caps;
+   floors that pass the room give way from the bottom; locks past the slot
+   run it past `L0`. This replaces today's budget passes in the working set
+   and `select_conversation`, and `slot_room`; the old passes are removed,
+   not kept beside it. `slot_tokens` leaves the schema; the slot is the
+   engine's `L0`, and the shares and reserve are checked against it when the
+   engine is built. Pins past `MAX_PINS` ranges, or a pinned collection that
+   is not the last pin, are refused at construction (§5).
 9. **The shadow scan (§6.3).** The stride's kept queries and cuts on the
    sampled layers, the last 64 rows of a prefill; one launch per boundary over
    the wave's sequences; windows seated behind the query; a hit is in its
-   window's top-k and above the cut; counted into the same counters.
-10. **The scoring prefill (§7.4).** Snapshot, score, rewind, project, prefill
-    again; openings longer than `reserve_tokens` chunked with a boundary
-    between chunks. This replaces `wants_early_reprojection` (§12 item 6).
-11. **Docs.** This document's §12 rewritten as everything built; §13 removed;
+   window's top-k and above the cut; counted into the same counters, with the
+   denominators of §6.4.
+10. **Chunked openings (§7.4).** An opening longer than `reserve_tokens`
+    prefilled in chunks of that length with a boundary between them;
+    `wants_early_reprojection` (§12 item 6) stays the opening's projection.
+11. **Kept objects, exported and imported (§14.4).** zend and npcd each
+    answer `GET /v1/admin/objects/export` and `POST
+    /v1/admin/objects/import` (admin, as `/v1/npcs/export` is). The export is
+    text, JSON Lines: a header line `{"format": "substrate-objects",
+    "version": 1, "daemon": "zend" | "npcd", "taken_at_ms": …}`, then one
+    line per live custom object, `{"object": <CustomObjectPayload>}` with its
+    key, metadata and JSON value as stored, then one line per blob a kept
+    object names, `{"blob": "<sha256 hex>", "bytes_b64": "…"}`. Every live
+    custom object is kept except those under `cluster/`
+    (`projection/replication.rs`), which are the cluster's own state and are
+    rebuilt when the app starts over. The import writes each blob, then each
+    object, under the importing member's node with fresh stamps, so it
+    replicates to the others like any write; a key already live is left as it
+    is and named in the import's answer, with counts of what was written. It
+    runs on one member per app.
+12. **Docs.** This document's §12 rewritten as everything built; §13 removed;
     `docs/zend_working_set.md`, `docs/guidance_layer.md`,
     `docs/shared_model_host.md` and `docs/performance.md` updated to match.
 
@@ -678,11 +789,16 @@ Each step lands with its unit tests. Beyond them:
   piece holds its request and answer.
 - **Fill.** Locks past the slot are placed and the slot leaves rung 1; a kind
   at its cap is skipped and its room goes to the next; floors count toward
-  caps and are never skipped.
+  caps and are never skipped; floors past the room give way in the order of
+  §7.2; a thin working set leaves its room to the dialogue.
+- **Density.** A loaded and an unloaded round hit by every query they could
+  have been hit by score the same density, whatever the stride's prefill and
+  shadow row counts.
 - **Refcount.** Two sequences pooling one reading share its pages; the pages
   outlive the first release and go with the last.
-- **Scoring prefill.** The second prefill's K/V matches a prefill run directly
-  against the chosen slot.
+- **Kept objects.** An export imported into an empty substrate exports again
+  byte for byte, but for the header's time; `cluster/` objects are not in
+  it; a live key is left as it was.
 - **Gates.** `/fast-test` and `/sweep` against a local, unclustered motherd
   (AGENTS "Test locally, not clustered"), and the MCP latency gate.
 
@@ -693,34 +809,51 @@ not on another machine.
 
 ### 14.4 Rollout
 
-The new build's identity key refuses every existing substrate, so the
-rollout wipes them on every member at once. A member left with an old
-substrate would refuse to open, and a wiped member catching up from an
-old-keyed peer would fetch what it then refuses (`replicated_substrate.md`
-§7.3), so no member serves on the old substrate once the wipe starts.
+The new build's identity key is another model's as far as the cluster is
+concerned: its substrate refuses the old one, and the app's model lock closes
+it 4412 at the handshake, so it is never a candidate, never certified and
+never distributed (`replicated_substrate.md` §3.6). It goes out by that
+section's operator procedure, which stops every member, moves each substrate
+aside and starts the members on the new build with empty substrates. The
+Zen MCP is served by the members it stops, so everything that needs it is
+done before step 3.
 
-1. **Export the cast.** `GET /v1/npcs/export` (admin) saves every
-   character's record: who exists, who owns them, where they stand. The cast
-   is not NPC memory and survives the wipe; its conversations, beliefs and
-   dreams do not.
-2. **Stop every member.** `curl -X POST http://127.0.0.1:8092/stop/motherd`
+1. **Build on every member's machine.** Push to `main`, then on each machine
+   that runs a member build `cargo build --release -p motherd -p web` at that
+   commit through `repo_job_start` pinned to its node, so each holds the new
+   `target\release\motherd.exe` before anything stops. Builds only; nothing
+   is staged.
+2. **Export.** From one member — the objects replicate, so any member holds
+   them all — save `GET /v1/npcs/export` (the cast) and `GET
+   /v1/admin/objects/export` on zend and on npcd (§13 step 11) to files
+   outside the data folders, and read each back to confirm its line count.
+   They hold everything the substrates keep that no model computed:
+   accounts, MCP threads, workers and OAuth tokens, journal text, Discord
+   links, world state, kept images.
+3. **Stop every member.** `curl -X POST http://127.0.0.1:8092/stop/motherd`
    on each machine's keep.
-3. **Wipe.** motherd takes no one-shot flags (`motherd.yaml` cannot carry
-   them, `motherd/src/main.rs`). zend's `--wipe-substrate` deletes the
-   substrate before it opens (`zend/src/cli.rs`), so on each member run the
-   new build's `zend` binary once with it against the zend data folder that
-   member's `motherd.yaml` names. npcd's `--wipe-conversations` opens the
-   substrate first, which the new key refuses, so npcd's substrate folder is
-   removed outright; the cast export holds what must come back. Confirm both
-   folders are gone or empty before moving on.
-4. **Deploy.** Roll the new build out through the `zend-deploy` skill; start
-   each member on it.
-5. **Restore the cast.** `POST /v1/npcs/import` (admin) with the export's
-   body writes the records verbatim (ids, owners, places); the characters
-   spawn on the next start, so restart motherd through keep once after the
-   import.
-6. **Check.** Prime the chain, then confirm on each card that a dialogue
-   places its pins, carves a reading by round, and stays on rung 1, and that
-   every character is back with its owner.
+4. **Move the substrates aside.** On each member, rename the zend and npcd
+   substrate folders its `motherd.yaml` names to `substrate.pre-hit` beside
+   them. Nothing is deleted: restoring them with the old build is the rollback
+   (`replicated_substrate.md` §15.1).
+5. **Restart the gateways.** Each gateway through its own machine's keep, so
+   it forgets its floors (§3.5) and the first member to join on the new build
+   sets them, with no certification against members that no longer exist.
+6. **Start the new build.** On each member, POST its `motherd.exe` to keep
+   (`keep/stage/motherd.exe`, AGENTS "Manual release"); keep trials it on the
+   empty substrates, and the first member admitted sets the app's new model
+   lock. Confirm every member reaches `state: ready`.
+7. **Ingest.** Prime the chain; the code readings come back as they are
+   asked for.
+8. **Import.** On one member, `POST /v1/admin/objects/import` to zend and to
+   npcd with the exports' bodies, then `POST /v1/npcs/import` with the
+   cast's; restart motherd through keep once so the characters spawn. Read
+   each import's answer: every key written, none left as it was. A key left
+   as it was means something was written between the start and the import
+   (a sign-in, a thread) and is reported for a decision.
+9. **Check.** On each card, a dialogue places its pins, carves a reading by
+   round and stays on rung 1; every character is back with its owner; Claude's
+   Zen connector answers without signing in again.
 
-Journals, keep's stable binaries and machine configs are untouched.
+Journals, keep's stable binaries, machine configs and the moved-aside
+substrates are untouched.
