@@ -148,6 +148,10 @@ fn seal_live(c: &IndexCache, last_cells: usize) -> Result<SealedIndex> {
 /// accepted/step column at C6 and above.
 pub const DRAFT_HEAD_MAX_COMPRESSION: u8 = 3;
 
+/// One sequence's pool: each pooled piece's resident pages at the sampled
+/// layers.
+type PooledPieces = HashMap<PieceKey, Vec<Arc<ResidentPage>>>;
+
 /// The batched model the scheduler drives.
 pub struct Qwen4ExpBatched {
     /// `pub(super)` so the draft head's own module can reach the engine it runs
@@ -187,7 +191,7 @@ pub struct Qwen4ExpBatched {
     /// with no K/V behind them in the slot, read by the shadow scan. Shared
     /// through [`Self::pages`] with every sequence that pools or places the
     /// same piece, and released with the last of them.
-    pooled: RwLock<HashMap<usize, HashMap<PieceKey, Vec<Arc<ResidentPage>>>>>,
+    pooled: RwLock<HashMap<usize, PooledPieces>>,
     /// Per-sequence carried residual for the draft head's next first row — the
     /// `h(t-1)` its input assembly needs across a wave boundary. Empty on a
     /// checkpoint with no head, and reset with the other carried state when a
