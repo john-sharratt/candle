@@ -3787,15 +3787,20 @@ fn demoting_every_turn_returns_its_vram() {
     // a free list. Whole-arena reclaim is what returns a region to the weight
     // zone, so an implementation that emptied every slot and released no arena
     // would satisfy the assertion above and still squeeze the partition shut.
+    //
+    // At most the baseline, not exactly it: the baseline's own arenas are
+    // empty too (nothing occupied them, `base_live` is their occupancy), and
+    // the sweep may give those back as well. What may not happen is an arena
+    // the turns held standing past the sweep.
     release_empty(&f.backings);
     let after = gpu_arenas(&f.backings);
-    assert_eq!(
-        after,
-        f.base,
+    assert!(
+        after <= f.base,
         "every GPU slot is free, yet {} of the {} arena(s) the turns held were \
-         not released",
+         not released ({after} standing, {} at baseline)",
         after.saturating_sub(f.base),
-        f.resident - f.base
+        f.resident - f.base,
+        f.base
     );
 }
 
