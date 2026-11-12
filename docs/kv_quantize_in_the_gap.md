@@ -19,9 +19,38 @@ quantized form (`persistence/thread.rs`, `migrate_group_hot_to_warm` and
 | Symptom | Cause | Measured |
 |---|---|---|
 | Decode stutters: 0.4–0.7 s with no forward in each 2 s window, while each forward takes 30–37 ms at 99.9% expert hits | Each group's work is queued on the device's primary stream, then fenced with a device-wide `device.synchronize()`. The fence exists because the install publishes the swap before the convert has finished, and a reprojection could otherwise borrow half-written V (the "V-only multi-turn duplication corruption"). | `kv_reserve` passes of 65–801 ms every ~2 s during decode, 80–566 MiB each |
-| A native backlog stands in VRAM at about 4× its final size | Quantization waits for the drain, which works oldest-first across every conversation and ingest reading on the member | `pending_mib` 1.4–2.2 GB for the whole turn |
+| A native backlog stands in VRAM at about 4× its final size | Only a sealed residence is quantized, and only when the drain reaches it, oldest-first across every conversation and ingest reading on the member. A live sequence's K/V is never eligible: it stays native for as long as the sequence lives. | `pending_mib` 1.4–2.2 GB for the whole turn |
 | The KV side takes ground from the expert zone | The quant reserve is sized from that backlog (`pending × factor`, capped at 25% of the KV regions) | `cap_mib=3111`, `kv_mib` up to 12,448; "grow class2048 by 24 arenas, reason=backlog" |
 | Durability lags by minutes | A turn's commit waits for its turn in the drain's queue | "a finished turn's commit landed … waited_s=319" |
+
+### 1.1 The same on WhiteWorld, with the NPCs running
+
+Measured on WhiteWorld (24 GB, WDDM), 2026-11-12 19:45–19:59 UTC, build
+4915-1e749473, with npcd's characters live and zend ingesting. The card had
+1.96 GB of driver headroom.
+
+| What | Measured |
+|---|---|
+| Native K/V standing | `pending_mib` 590–776 for the whole window, never lower. The two native-sized classes held about 677 MB live against about 538 MB in every quantized class together. |
+| What the drain moved | 0 or 1 residence and 0–3 MiB a pass. The backlog did not fall. |
+| How long a pass took | 1.0–5.1 s for passes that moved nothing; 181 passes over 1 s in three hours. |
+| The reserve | 227–840 MB held free against that backlog, `cap_mib` 2,055–2,803, arenas grown and released every few seconds. |
+| Expert ground | The weight zone conceded from 3,746 to 1,909 MiB in two minutes. Five decode forwards were then discarded on a cold expert not staged within 1,000 ms, and the learned decode step rose from 244 to 1,345 ms. |
+| Work lost | About 25 ingest readings failed with "the turn made no progress for 60 s". |
+
+The backlog here is mostly K/V the drain cannot reach. `pending` counts every
+live native slot (`chunked/alloc.rs`, `owe_reserves`), and the characters hold
+long-lived live sequences. A faster drain would not move it. The reserve is
+then sized against a backlog that never drains, so it stands free indefinitely.
+
+**What this design does not fix.** K/V was not the largest tenant on the KV
+side of that card: recurrent state held 2.79 GB and the QSA index cache
+1.03 GB, against about 1.2 GB of live K/V, and a promote's relief took 464 MiB
+from the experts on its own. This design returns the native backlog's excess
+and the standing reserve, roughly 0.7–1.3 GB there. The other tenants are
+outside it.
+
+### 1.2 The test does not see it
 
 The batched test (`batch_test/utils.rs`, `quantize_and_seal_sequences`) already
 quantizes in place, on the forward thread, at the prefill and decode
@@ -59,6 +88,13 @@ points at.
    └────▶ persistence: wait on E_gap on the copy stream ─▶ DtoH into the pinned
           warm buffer ─▶ log append ─▶ commit ─▶ has_warm published
 ```
+
+**One gap, however many tenants.** A process has one `EngineCore`, so one
+scheduler thread, one primary stream and one set of KV pools, shared by every
+attached substrate (`docs/shared_model_host.md` §3.2). The gap is that
+scheduler's. Its one table holds every tenant's blocks, and its one summary
+serves them all. Each attachment keeps its own persistence thread, which only
+copies (§5).
 
 The two products then match: the batched test and production run the **same**
 gap quantize, inside the timed windows. The test's two boundary calls are
@@ -233,6 +269,15 @@ at the rate production produces K/V in decode, decides whether §7's 95% gate
 can be met by the kernels as they are. If it cannot, the kernels are made faster
 first. The gate is not loosened.
 
+### 3.7 What the gap logs
+
+The scheduler writes one `kv_gap` line for each second in which a gap ran,
+summed over that second's gaps: blocks converted, blocks deferred and the class
+that ran dry, native bytes standing, lease bytes held, and the gaps' device
+time. It replaces the `kv_reserve: pass` line, which each attachment's
+persistence thread writes today about the one shared pool, so that every pass
+is logged once per tenant. §7's production gates are read from this line.
+
 ## 4. What a forward attends
 
 Every forward attends a quantized prefix plus at most each sequence's writer
@@ -257,8 +302,11 @@ scale whichever gap quantizes them.
 
 ## 5. Persistence
 
-- **A dedicated copy stream.** The persistence thread owns a non-primary
-  stream. It copies a residence once the host catch-up has re-pointed the
+- **A dedicated copy stream for each persistence thread.** Every attachment's
+  persistence thread owns a non-primary stream of its own, so two tenants'
+  copies never queue behind each other or behind a forward. Today both
+  threads run their hot→warm pass on the shared primary stream and each fences
+  it. A thread copies a residence once the host catch-up has re-pointed the
   residence's last block, so it reads the gids, formats and scales from the
   host's records. It makes its stream wait on the `E_gap` of the gap that
   quantized that block (`cudaStreamWaitEvent`), then issues one DtoH of the
@@ -268,7 +316,9 @@ scale whichever gap quantizes them.
   replaces today's pageable CPU arenas, so the copy runs at full link bandwidth.
   On WDDM, pinned memory is charged to system commit (`docs/driver_model.md`),
   so the pool's size is read from the machine's RAM and commit headroom, never
-  fixed. The three dev machines have 32, 64 and 189 GB.
+  fixed. The three dev machines have 32, 64 and 189 GB. The pool is the
+  machine's and is one budget: each attachment's thread holds its share of it
+  through the `WarmLedger`, as it does of the warm tier today.
 - **A full pool.** When the pool has no free buffer, it drops its least recently
   used blocks that the log already holds. Those blocks are then cold and are
   read back from the log when wanted. A block the log does not yet hold is
@@ -297,7 +347,8 @@ scale whichever gap quantizes them.
   `MAX_GAP_RETRIES`), and `GroupCap`.
 - The backlog-sized reserve: `pending`, `reserve_targets`' backlog terms, and
   `owe_reserves`' growth with the backlog (`kv_drain_under_pressure.md` §2a,
-  §2c). What remains of the reserve is the gap lease (§3.2).
+  §2c). What remains of the reserve is the gap lease (§3.2). The
+  `kv_reserve: pass` line and `persistence/reserve_log.rs` go with it (§3.7).
 - `MigrateFlight` as a quantize lock (§5).
 - The selection's host readback of palettes, scales and maps
   (`sampled_selection/gpu.rs`). The summary row carries them (§3.4).
@@ -339,7 +390,8 @@ Gates, run one model per `cargo` process with the daemon stopped:
   most recent forwards' blocks, and the deferred blocks;
 - p95 commit wait under 1 s.
 
-The before figures are those in §1.
+The before figures are those in §1 and §1.1. The production gates are run on
+BlackWorld and on WhiteWorld, the second with the characters live.
 
 ## 8. Order of work
 
