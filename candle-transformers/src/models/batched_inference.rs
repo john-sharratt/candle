@@ -5390,6 +5390,19 @@ pub trait ManagedBatchedModel {
         Ok(false)
     }
 
+    /// Hold `page`'s rows at the sampled layers in `seq`'s pool: a piece its
+    /// projection pools with no K/V in the slot, whose rows the shadow scan
+    /// reads (`docs/hit_driven_projection.md` §7.2). Returns the device bytes
+    /// newly placed; a model that selects nothing holds none.
+    fn pool_positional_state(&self, _seq: usize, _page: &[u8], _key: &PieceKey) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Let go of `seq`'s pooled pieces not in `keep`.
+    fn retain_pooled(&self, _seq: usize, _keep: &[PieceKey]) -> Result<()> {
+        Ok(())
+    }
+
     /// Device bytes [`Self::push_positional_state`] would newly place for
     /// `page`: zero when a piece with `key` is already resident (a placed page
     /// is shared across slots), else what placing it claims. What admission

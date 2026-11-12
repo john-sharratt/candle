@@ -182,6 +182,12 @@ pub struct Qwen4ExpBatched {
     /// every page it had a moment ago: measured at 12,372 placements against
     /// 12,503 lookups on one dialogue turn, 5.0 s of a 75 s turn.
     retired: RwLock<HashMap<usize, Vec<Arc<ResidentPage>>>>,
+    /// Per sequence, the pieces its pool holds and their resident pages at
+    /// the sampled layers (`docs/hit_driven_projection.md` §7.2): index rows
+    /// with no K/V behind them in the slot, read by the shadow scan. Shared
+    /// through [`Self::pages`] with every sequence that pools or places the
+    /// same piece, and released with the last of them.
+    pooled: RwLock<HashMap<usize, HashMap<PieceKey, Vec<Arc<ResidentPage>>>>>,
     /// Per-sequence carried residual for the draft head's next first row — the
     /// `h(t-1)` its input assembly needs across a wave boundary. Empty on a
     /// checkpoint with no head, and reset with the other carried state when a
@@ -875,7 +881,7 @@ impl Qwen4ExpBatched {
         let resolved: Vec<Option<Vec<Option<Arc<ResidentPage>>>>> = pieces
             .iter()
             .map(|p| match p {
-                PositionalPiece::Page { bytes, key } => self.resident_pages(bytes, key).map(Some),
+                PositionalPiece::Page { bytes, key } => self.resident_pages(bytes, key, |_| true).map(Some),
                 PositionalPiece::Gap(_) => Ok(None),
             })
             .collect::<Result<_>>()?;
@@ -1222,19 +1228,34 @@ impl Qwen4ExpBatched {
         Ok(blobs)
     }
 
-    /// The resident pages of an injected piece, one per KV layer (`None` where
-    /// the layer indexes nothing): the ones already standing when any slot still
-    /// holds this record's pages, otherwise decoded and placed now — every
-    /// indexed layer in one launch, into slots of the index tenant.
+    /// The resident pages of a piece at the KV layers `wanted` names, one per
+    /// KV layer (`None` where the layer indexes nothing or is not wanted): the
+    /// ones already standing when any slot or pool still holds them, the rest
+    /// decoded and placed now — every missing layer in one launch, into slots
+    /// of the index tenant. A piece pooled at its sampled layers and then
+    /// placed in a slot shares the sampled layers' rows and places the others.
     #[cfg(feature = "cuda")]
     fn resident_pages(
         &self,
         blob: &[u8],
         key: &PieceKey,
+        wanted: impl Fn(usize) -> bool,
     ) -> Result<Vec<Option<Arc<ResidentPage>>>> {
         let cfg = &self.model.cfg;
         let want = cfg.kv_layers().total();
-        if let Some(layers) = self.pages.get(key) {
+        let ratios = self.attention_ratios();
+        let mut layers: Vec<Option<Arc<ResidentPage>>> = vec![None; want];
+        let mut missing: Vec<usize> = Vec::new();
+        for (kv, &r) in ratios.iter().enumerate() {
+            if r == 0 || !wanted(kv) {
+                continue;
+            }
+            match self.pages.layer(key, kv) {
+                Some(p) => layers[kv] = Some(p),
+                None => missing.push(kv),
+            }
+        }
+        if missing.is_empty() {
             return Ok(layers);
         }
         let _place = span("qsa:page:decode_place");
@@ -1247,29 +1268,46 @@ impl Qwen4ExpBatched {
                 sealed.len()
             );
         }
-        let ratios = self.attention_ratios();
-        let host: Vec<(&[f32], usize)> = sealed
+        let host: Vec<(&[f32], usize)> = missing
             .iter()
-            .zip(ratios.iter())
-            .filter(|(_, &r)| r > 0)
-            .map(|(s, _)| (s.rows.as_slice(), s.last_cells))
+            .map(|&kv| (sealed[kv].rows.as_slice(), sealed[kv].last_cells))
             .collect();
-        let mut placed =
-            ResidentPage::place_host(&host, cfg.indexer.head_dim, &self.model.device)?.into_iter();
-        let layers: Vec<Option<Arc<ResidentPage>>> = ratios
+        let placed: Vec<(usize, Arc<ResidentPage>)> = missing
             .iter()
-            .map(|&r| if r > 0 { placed.next() } else { None })
+            .copied()
+            .zip(ResidentPage::place_host(
+                &host,
+                cfg.indexer.head_dim,
+                &self.model.device,
+            )?)
             .collect();
-        self.pages.insert(*key, &layers);
+        for (kv, page) in &placed {
+            layers[*kv] = Some(Arc::clone(page));
+        }
+        self.pages.insert(*key, want, &placed);
         Ok(layers)
     }
 
-    /// Device bytes pushing `blob` would newly place: zero when its piece is
-    /// already resident (the registry shares a placed page across slots), else
-    /// each attention layer's rows in whole `PAGE_BLOCKS` slots — the chunks
+    /// Device bytes pushing `blob` would newly place: each attention layer's
+    /// rows not already resident (the registry shares a placed page across
+    /// slots and pools), in whole `PAGE_BLOCKS` slots — the chunks
     /// [`ResidentPage::place_host`] claims.
     pub fn positional_lift_bytes(&self, blob: &[u8], key: &PieceKey) -> Result<usize> {
-        if self.pages.get(key).is_some() {
+        self.positional_lift_bytes_at(blob, key, |_| true)
+    }
+
+    /// [`Self::positional_lift_bytes`] for the KV layers `wanted` names alone.
+    fn positional_lift_bytes_at(
+        &self,
+        blob: &[u8],
+        key: &PieceKey,
+        wanted: impl Fn(usize) -> bool,
+    ) -> Result<usize> {
+        let ratios = self.attention_ratios();
+        let missing: Vec<usize> = (0..ratios.len())
+            .filter(|&kv| ratios[kv] > 0 && wanted(kv) && self.pages.layer(key, kv).is_none())
+            .collect();
+        if missing.is_empty() {
             return Ok(0);
         }
         let d = self.model.cfg.indexer.head_dim;
@@ -1277,12 +1315,54 @@ impl Qwen4ExpBatched {
         let slot = candle_nn::kv_cache::slot_stride(
             super::index_keys::PAGE_BLOCKS * d * DType::F32.size_in_bytes(),
         );
-        Ok(sealed
+        Ok(missing
             .iter()
-            .zip(self.attention_ratios())
-            .filter(|(_, r)| *r > 0)
-            .map(|(s, _)| (s.rows.len() / d.max(1)).div_ceil(super::index_keys::PAGE_BLOCKS) * slot)
+            .filter_map(|&kv| sealed.get(kv))
+            .map(|s| (s.rows.len() / d.max(1)).div_ceil(super::index_keys::PAGE_BLOCKS) * slot)
             .sum())
+    }
+
+    /// Hold `blob`'s pages at the sampled layers in `seq`'s pool — a piece the
+    /// pool admits with no K/V in the slot (`docs/hit_driven_projection.md`
+    /// §7.2). Placed once per card and shared: a piece another sequence pools
+    /// or places is not placed again. Returns the bytes newly placed.
+    #[cfg(feature = "cuda")]
+    pub fn pool_positional_state(&self, seq: usize, blob: &[u8], key: &PieceKey) -> Result<usize> {
+        let sampled = self.hit_kv.clone();
+        let before = self.positional_lift_bytes_at(blob, key, |kv| sampled.contains(&kv))?;
+        let layers: Vec<Arc<ResidentPage>> = self
+            .resident_pages(blob, key, |kv| sampled.contains(&kv))?
+            .into_iter()
+            .flatten()
+            .collect();
+        self.pooled
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: pool lock poisoned".into()))?
+            .entry(seq)
+            .or_default()
+            .insert(*key, layers);
+        Ok(before)
+    }
+
+    /// Let go of `seq`'s pooled pieces not in `keep`: the pool dropped them,
+    /// and their rows go back to the tenant once nothing else holds them.
+    pub fn retain_pooled(&self, seq: usize, keep: &[PieceKey]) -> Result<()> {
+        let mut pooled = self
+            .pooled
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: pool lock poisoned".into()))?;
+        if let Some(p) = pooled.get_mut(&seq) {
+            p.retain(|k, _| keep.contains(k));
+        }
+        Ok(())
+    }
+
+    /// The pieces `seq`'s pool holds.
+    pub fn pooled_keys(&self, seq: usize) -> Vec<PieceKey> {
+        self.pooled
+            .read()
+            .map(|p| p.get(&seq).map(|m| m.keys().copied().collect()).unwrap_or_default())
+            .unwrap_or_default()
     }
 
     /// Install a sealed page per attention layer ahead of `seq`'s live tail.
@@ -1293,7 +1373,7 @@ impl Qwen4ExpBatched {
         let want = cfg.kv_layers().total();
         let ratios = self.attention_ratios();
         // Resolved before the lock is taken: a placement is a launch.
-        let layers = self.resident_pages(blob, key)?;
+        let layers = self.resident_pages(blob, key, |_| true)?;
         let mut map = self
             .index
             .write()
@@ -2029,6 +2109,7 @@ impl Qwen4ExpBatched {
             index: RwLock::new(HashMap::new()),
             pages: PageRegistry::default(),
             retired: RwLock::new(HashMap::new()),
+            pooled: RwLock::new(HashMap::new()),
             index_rope,
             qsa_rows: AtomicU64::new(0),
             rope,
@@ -3025,6 +3106,14 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Ok(true)
     }
 
+    fn pool_positional_state(&self, seq: usize, blob: &[u8], key: &PieceKey) -> Result<usize> {
+        Qwen4ExpBatched::pool_positional_state(self, seq, blob, key)
+    }
+
+    fn retain_pooled(&self, seq: usize, keep: &[PieceKey]) -> Result<()> {
+        Qwen4ExpBatched::retain_pooled(self, seq, keep)
+    }
+
     fn positional_lift_bytes(&self, page: &[u8], key: &PieceKey) -> Result<usize> {
         Qwen4ExpBatched::positional_lift_bytes(self, page, key)
     }
@@ -3547,6 +3636,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             m.forget(seq);
         }
         if let Ok(mut m) = self.index.write() {
+            m.remove(&seq);
+        }
+        if let Ok(mut m) = self.pooled.write() {
             m.remove(&seq);
         }
         // A recycled id must not inherit the previous conversation's pieces.

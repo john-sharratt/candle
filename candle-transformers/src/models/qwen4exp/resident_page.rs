@@ -292,44 +292,44 @@ impl ResidentPage {
 /// projection selects into many slots, a fork's inherited prefix — holds the
 /// same rows.
 ///
+/// Pages are held **per layer**: a piece in a sequence's pool holds only its
+/// sampled layers' pages, and placing it in a slot later places the other
+/// layers and shares the sampled ones (`docs/hit_driven_projection.md` §7.2).
+///
 /// The registry holds no page alive: its entries are weak, so a piece's rows go
-/// back to the tenant when the last cache holding them drops, and the next push
-/// of that piece places it afresh. A dead entry is swept on the next insert.
+/// back to the tenant when the last cache or pool holding them drops, and the
+/// next push of that piece places it afresh. A dead entry is swept on the next
+/// insert.
 #[derive(Debug, Default)]
 pub struct PageRegistry {
-    /// One page per KV layer; `None` for a layer that indexes nothing.
+    /// One entry per KV layer; `None` where nothing of that layer is placed.
     map: Mutex<HashMap<PieceKey, Vec<Option<Weak<ResidentPage>>>>>,
 }
 
 impl PageRegistry {
-    /// The resident pages for `key`, when every layer's page is still held.
-    pub fn get(&self, key: &PieceKey) -> Option<Vec<Option<Arc<ResidentPage>>>> {
+    /// `key`'s resident page at KV layer `kv`, while something still holds it.
+    pub fn layer(&self, key: &PieceKey, kv: usize) -> Option<Arc<ResidentPage>> {
         let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(key)?
-            .iter()
-            .map(|w| match w {
-                Some(w) => w.upgrade().map(Some),
-                None => Some(None),
-            })
-            .collect()
+        map.get(key)?.get(kv)?.as_ref()?.upgrade()
     }
 
-    /// Record `layers` as the resident pages of `key`, sweeping entries whose
-    /// pages have all dropped.
-    pub fn insert(&self, key: PieceKey, layers: &[Option<Arc<ResidentPage>>]) {
+    /// Record `placed` — `(kv layer, page)` — as resident pages of `key`, in
+    /// an entry of `layers` layers, beside whatever of it is already resident;
+    /// entries whose pages have all dropped are swept.
+    pub fn insert(&self, key: PieceKey, layers: usize, placed: &[(usize, Arc<ResidentPage>)]) {
         let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, layers| {
             layers
                 .iter()
                 .any(|w| w.as_ref().is_some_and(|w| w.strong_count() > 0))
         });
-        map.insert(
-            key,
-            layers
-                .iter()
-                .map(|p| p.as_ref().map(Arc::downgrade))
-                .collect(),
-        );
+        let entry = map.entry(key).or_insert_with(|| vec![None; layers]);
+        if entry.len() < layers {
+            entry.resize(layers, None);
+        }
+        for (kv, page) in placed {
+            entry[*kv] = Some(Arc::downgrade(page));
+        }
     }
 
     /// Entries standing — for a test, and for the memory report.
@@ -458,16 +458,29 @@ mod tests {
         );
         assert_ne!(key, PieceKey::of(b"another piece"));
         let reg = PageRegistry::default();
-        reg.insert(key, &[None, Some(Arc::clone(&page))]);
+        reg.insert(key, 3, &[(1, Arc::clone(&page))]);
 
-        let got = reg.get(&key).expect("held pages are found");
-        assert!(got[0].is_none());
-        assert!(Arc::ptr_eq(got[1].as_ref().unwrap(), &page));
+        assert!(reg.layer(&key, 0).is_none(), "an unplaced layer");
+        let got = reg.layer(&key, 1).expect("a held page is found");
+        assert!(Arc::ptr_eq(&got, &page));
         drop(got);
 
+        // A later placement of another layer joins the entry.
+        let other = ResidentPage::from_key_pages(
+            vec![Tensor::zeros((PAGE_BLOCKS, 4), DType::F32, &Device::Cpu).unwrap()],
+            2,
+            1,
+            4,
+        )
+        .unwrap();
+        reg.insert(key, 3, &[(2, Arc::clone(&other))]);
+        assert!(reg.layer(&key, 1).is_some(), "the earlier layer stays");
+        assert!(reg.layer(&key, 2).is_some());
+
         drop(page);
-        assert!(reg.get(&key).is_none(), "a dropped page is not handed back");
-        reg.insert(PieceKey::of(b"another piece"), &[None]);
+        drop(other);
+        assert!(reg.layer(&key, 1).is_none(), "a dropped page is not handed back");
+        reg.insert(PieceKey::of(b"another piece"), 1, &[]);
         assert_eq!(reg.len(), 1, "the dead entry is swept on the next insert");
     }
 }
