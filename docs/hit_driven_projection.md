@@ -787,6 +787,12 @@ the order of dependence.
       takes several exports at once — one from each member — and writes the
       union, the latest original stamp winning per key, so an object a
       member held that had not reached the others yet is not lost.
+    - **Tombstones travel too.** The export also carries every ceased key it
+      holds, as an object line with `ceased: true`, in the same stamp order.
+      In the union a tombstone competes with a live object on its stamp like
+      any write, so a key deleted on one member before its tombstone reached
+      another stays deleted. A key whose winner is a tombstone is not written
+      at all: the new substrate never held it.
 12. **Docs.** This document's §12 rewritten as everything built; §13 removed;
     `docs/zend_working_set.md`, `docs/guidance_layer.md`,
     `docs/shared_model_host.md` and `docs/performance.md` updated to match.
