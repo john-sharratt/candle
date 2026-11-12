@@ -197,25 +197,29 @@ pub fn fill(input: &FillInput, caps: &Caps) -> Fill {
     // 3. Everything else by score, highest first, ties oldest first.
     let mut order: Vec<&Unit> = input.scored.iter().collect();
     order.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
-    let mut floors_in: HashSet<usize> = HashSet::new();
-    let already: HashSet<usize> = placed.iter().copied().collect();
+    // A unit is placed once, whether it came in by its own score or with a
+    // round of its piece; a piece's floor is brought by whichever of its
+    // units enters first.
+    let mut in_slot: HashSet<usize> = placed.iter().copied().collect();
     for u in order {
-        if already.contains(&u.id) {
+        if in_slot.contains(&u.id) {
             continue;
         }
         let mut with: Vec<Unit> = Vec::new();
-        if !floors_in.contains(&u.piece) {
-            if let Some(f) = input.piece_floors.get(&u.piece) {
-                with.extend(f.iter().filter(|f| !already.contains(&f.id)).copied());
-            }
+        if let Some(f) = input.piece_floors.get(&u.piece) {
+            with.extend(
+                f.iter()
+                    .filter(|f| f.id != u.id && !in_slot.contains(&f.id))
+                    .copied(),
+            );
         }
         with.push(*u);
         let cost: usize = with.iter().map(|w| w.tokens).sum();
         if used.total + cost > input.room || !used.under_caps(&with, caps) {
             continue;
         }
-        floors_in.insert(u.piece);
         for w in &with {
+            in_slot.insert(w.id);
             place(w, &mut used, &mut placed);
         }
     }
@@ -393,6 +397,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(fill(&input, &caps()).placed, vec![1, 2, 3]);
+    }
+
+    /// An older exchange's pair is a unit of its own and the floor of its
+    /// tool rounds: placed by its own score, it is not placed again when a
+    /// round of it follows; a round that ranks first brings it.
+    #[test]
+    fn a_pair_is_placed_once_whichever_comes_first() {
+        let pair = u(10, 1, Kind::Dialogue, 30, 0.9);
+        let mut floors = HashMap::new();
+        floors.insert(1, vec![pair]);
+        let input = FillInput {
+            room: 1_000,
+            scored: vec![pair, u(11, 1, Kind::Dialogue, 20, 0.5)],
+            piece_floors: floors.clone(),
+            ..Default::default()
+        };
+        assert_eq!(fill(&input, &caps()).placed, vec![10, 11]);
+        let round_first = FillInput {
+            room: 1_000,
+            scored: vec![
+                u(10, 1, Kind::Dialogue, 30, 0.1),
+                u(11, 1, Kind::Dialogue, 20, 0.5),
+            ],
+            piece_floors: floors,
+            ..Default::default()
+        };
+        assert_eq!(fill(&round_first, &caps()).placed, vec![10, 11]);
     }
 
     /// Ties go to the older unit — the lower id.
