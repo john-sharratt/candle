@@ -40,7 +40,7 @@ server:
   # person, never the address. Loopback is safe to list because no public
   # request arrives from it: Cloudflare reaches :80 from its own addresses,
   # and the TLS entrance sees the client's.
-  trusted_backends: ["127.0.0.1", "192.168.0.6"]
+  trusted_backends: ["127.0.0.1", "192.168.1.3"]
 
   # ── the TLS entrance ──────────────────────────────────────────────────────
   # HTTP/3 over QUIC on udp, with HTTP/2 and HTTP/1.1 over tcp for a client
@@ -336,10 +336,10 @@ sites:
     roots: ["content/npcd", "content", "content/common"]
     api:
       - prefix: /v1
-        upstream: "http://192.168.0.6:8081"
+        upstream: "http://192.168.1.3:8081"
         cluster: npcd
       - prefix: /ws
-        upstream: "http://192.168.0.6:8081"
+        upstream: "http://192.168.1.3:8081"
         cluster: npcd
 
   - name: zend
@@ -347,11 +347,11 @@ sites:
     roots: ["../zend/web", "content", "content/common"]
     api:
       - prefix: /v1
-        upstream: "https://192.168.0.5:8444"
+        upstream: "https://192.168.1.2:8444"
         self_signed: true
         cluster: zend
       - prefix: /ws
-        upstream: "https://192.168.0.5:8444"
+        upstream: "https://192.168.1.2:8444"
         self_signed: true
         cluster: zend
       # The MCP endpoint for Claude connectors, served by the mcp app's

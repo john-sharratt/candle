@@ -62,14 +62,15 @@ repository is readable by the model.
 
 ## Machines
 
-A machine is identified by its `192.168.0.x` address
-(`Get-NetIPAddress -AddressFamily IPv4`). Other interfaces (e.g. `wg0` 192.168.137.1) are
+A machine is identified by its address on the 10 GbE LAN, `192.168.1.x`
+(`Get-NetIPAddress -AddressFamily IPv4`); BlackWorld and WhiteWorld moved there from
+`192.168.0.x` on 2026-11-12. Other interfaces (e.g. `wg0` 192.168.137.1) are
 not identities.
 
 | Address | Hostname | Runs | Repo |
 |---|---|---|---|
-| `192.168.0.5` | BlackWorld | web, motherd, keep, cf-ddns | `D:\prog\candle` |
-| `192.168.0.6` | — | nothing — its standalone npcd was stopped on 2026-10-12, to be rebuilt as a member | the checkout `/up` is run from; its mind is `D:\prog\mind` |
+| `192.168.1.2` | BlackWorld | web, motherd, keep, cf-ddns | `D:\prog\candle` |
+| `192.168.1.3` | WhiteWorld | keep, and under it motherd and mcp, from `C:\prog\keep-local.yaml` and `C:\prog\motherd-local.yaml` | `C:\prog\candle`; its substrate on `D:\prog` |
 | `192.168.0.237` | AlienWorld (the laptop) | keep, and under it `tokera-agent`: the cluster's standby agent. No motherd since 2026-10-25 | `C:\Users\johna\prog\candle`; the agent's own checkouts under `C:\Users\johna\prog\agent` |
 
 ### AlienWorld's standby agent
