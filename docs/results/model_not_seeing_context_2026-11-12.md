@@ -417,6 +417,17 @@ curl -s http://192.168.1.2:8081/v1/conversations/1150d804-1f9a-4e29-ad6a-172b93c
   -H "x-tokera-provider: google" -H "x-tokera-email: johnathan.sharratt@gmail.com"
 ```
 
+**Result: sparse and dense invent the same prompt.** Both continue the forced
+`My system prompt begins: "` with `You are an expert software engineer working
+on the repository candle." It does not say "You are Zen."` — sparse going on
+"I should be honest and accurate. I should not fabricate.", dense "I should be
+honest and correct the user's recollection." (argmax; replays 304 s sparse,
+261 s dense). With every cell attended the answer does not change, so **H2 is
+ruled out**: sparse selection is not hiding the system prompt. H1, H3, H4 and
+H5 remain; the next runs are the forced persona opening (`You are Zen, an AI
+coding assistant running on`, does it complete verbatim?), the `fresh`
+control, and a fully forwarded prefill of the same slot.
+
 The dump is `%TEMP%\zend-diag-1794482390015.json` on the member that ran it.
 The request body's fields are `zend/src/api/diag.rs` `DecodeBody`/`RunBody`
 (controls `sparse`/`dense`/`fresh`; `without`, `catch_up`, `user`, `splices`,
@@ -449,7 +460,8 @@ sub as above — a forged sub binds his email to a new key in the journals.
 
 ## 10. Open questions worth an answer before any fix
 
-1. Does §9.1's dense run quote the real prompt? (Separates H2 from H1/H3/H4.)
+1. ~~Does §9.1's dense run quote the real prompt?~~ No: dense invents the same
+   prompt as sparse (§9.1). H2 is out.
 2. With the opening forced, does turn 17 complete the real persona verbatim?
    (Readable K/V vs judgment.)
 3. Does a fully forwarded prefill of §2.3's slot say "Zen"? (Engine vs content.)
