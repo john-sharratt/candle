@@ -428,6 +428,24 @@ H5 remain; the next runs are the forced persona opening (`You are Zen, an AI
 coding assistant running on`, does it complete verbatim?), the `fresh`
 control, and a fully forwarded prefill of the same slot.
 
+**What the attention read while writing it** (the capture's per-layer
+records, sparse run, steps 8–11, all 13 attention layers; about 3,000 cells
+attended per query from 59,595 candidate blocks):
+
+- The most-attended piece at nearly every layer and step is
+  `turn:7243667026945342701:16` — the conversation's own turn 16, the answer
+  that first claimed "an expert software engineer working on the repository
+  candle". It takes 50–144 blocks (200–576 cells) per layer, about a sixth of
+  each query's cells, its best block ranking 0–11.
+- The persona (`section:4`, positions 3–276, directly after the 3-token system
+  opener; the dump carries no section text, so it is identified by place and
+  size) is selected but thinly: 4–16 of its 69 blocks (16–64 cells) per layer
+  where it appears, its best block ranking 2–20.
+
+So the persona's K/V scores well and is read; the decode spends its attention
+on the model's own previous claim. Turn 17 repeats turn 16. **The diag that
+matters is turn 16**, where the invention first happens.
+
 The dump is `%TEMP%\zend-diag-1794482390015.json` on the member that ran it.
 The request body's fields are `zend/src/api/diag.rs` `DecodeBody`/`RunBody`
 (controls `sparse`/`dense`/`fresh`; `without`, `catch_up`, `user`, `splices`,
@@ -457,6 +475,45 @@ sub as above — a forged sub binds his email to a new key in the journals.
 | Diag decode | `zend/src/api/diag.rs`, `zend/src/session/diag.rs`, `candle-conversation` `decode_diag` |
 | Depth tests | `candle-conversation/tests/provenance_depth.rs` |
 | Earlier write-ups | `docs/inline_read_injection.md`, `docs/results/theorem_depth_tests_2026-11-10.md`, `docs/deltanet_state_persistence.md` |
+
+## 9a. WhiteWorld's second look (2026-11-12)
+
+1. **Symptom D is a name collision, not a context failure.** From BlackWorld's
+   log since 10:45 UTC: every "found no file" reading keeps `repo = candle`
+   correct and drops exactly the first directory, and every one is under
+   `candle-conversation/`, `journals/` or `candle-book/` — 20 distinct files,
+   176 failures. Files of the same shape under `web/`, `mcp/`, `motherd/`,
+   `docs/` (`web/src/config.rs`, `mcp/src/config.rs`) never drop a directory.
+   The dropped directory is always one that is, or starts with, a repository's
+   name; the model strips it as the repository prefix the tool text teaches it
+   to strip (`file_read`'s description shows `file=candle/npcd/src/…` and
+   `end of candle/src/lib.rs`; the path parameter's example is `src/main.rs`).
+   **Prediction:** `candle-core/`, `candle-nn/`, `candle-transformers/` files
+   fail the same way when next re-read. **Fix direction:** a reading knows its
+   calls exactly, so the opening call can write `repo` and `path` itself rather
+   than leave them to the model. This takes H6 out of the depth question.
+2. **The "invented" prompt is half real.** `calculator`, `datetime` and `random`
+   are real tools of the system section (`zend/src/prompts/tools/`). At depth the
+   model reads the tools part and loses only the persona sentence. Both are
+   pre-sealed sections placed the same way, so H1 (recurrence overwritten) and
+   H3 (sealing mismatch) should hit both alike; only the identity line is
+   contested by other text. That points at H4 (the context says who it is) or
+   H5 (the checkpoint's prior).
+3. **The dense result is stronger than §6.2:** there a forced opening recalled
+   the page verbatim; here, dense, it does not. This is not recall versus
+   judgment.
+
+Also seen: about 150 readings on BlackWorld failed with "the turn made no
+progress for 60 s" between 11:11 and 11:30 UTC, most likely the diag decode
+holding the card. And BlackWorld answers 401 to identity headers from
+192.168.1.3, so another member cannot fetch its diag dumps; WhiteWorld's own
+`/v1/logs` returns both members' lines.
+
+**Next test, no rebuild:** the diag of **turn 16** (the first invention, §9.1),
+dense, same forced opening — run A as recorded, run B `without` the three
+`AGENTS.md` chain links, run C also without the journal-entry guidance turns. If
+B or C completes "You are Zen", H4 is the answer. Then the fully forwarded
+prefill (question 3) to split engine from checkpoint.
 
 ## 10. Open questions worth an answer before any fix
 
