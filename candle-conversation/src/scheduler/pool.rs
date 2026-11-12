@@ -104,8 +104,9 @@ mod tests {
             "piece 2 does not fit beside the floor; 3 and 4 do"
         );
         assert_eq!(
-            choose_pool(&floors, &cands, 1_100),
-            vec![tl(1), tl(2), tl(3)]
+            choose_pool(&floors, &cands, 1_000),
+            vec![tl(1), tl(2), tl(3)],
+            "2 and 3 fill it; 4 is one past"
         );
         // The floors stand even past the pool.
         assert_eq!(choose_pool(&floors, &cands, 100), vec![tl(1)]);
