@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use super::answering::Answering;
 use super::busy_warnings::BusyWarnings;
 use super::catchup::{Progress, Purpose, Requester, FETCH_WINDOW};
+use super::consensus::VOTER_FRESH;
 use super::fault::Fault;
 use super::lease::{LeaseEvent, Term, EVENTS_KEPT};
 use super::own_gaps::OwnGaps;
@@ -428,6 +429,10 @@ pub struct QuorumView {
     pub max_members: u32,
     /// The distinct ready members seen now, this one included.
     pub ready: u32,
+    /// The voting gateway's tie-break has answered on this member's socket
+    /// within [`VOTER_FRESH`]: in a group of two it is the second vote, so one
+    /// member and it decide (§5.9).
+    pub voter: bool,
     pub downgrade: Option<Downgrade>,
 }
 
@@ -836,6 +841,7 @@ impl Replicator {
             quorum: QuorumView {
                 max_members: s.max_members,
                 ready,
+                voter: s.voter_seen.is_some_and(|at| at.elapsed() <= VOTER_FRESH),
                 downgrade: s.governor.view(Instant::now()),
             },
             leases,

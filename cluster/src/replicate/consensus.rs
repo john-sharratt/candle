@@ -33,7 +33,7 @@ pub const REJOIN_RETRY: Duration = Duration::from_secs(5);
 /// How recently a tie-break reply must have arrived on this member's socket
 /// for its gateway to count as the voter every round passes through. Leases
 /// renew every 10 s, so a live group hears from the voter far more often.
-const VOTER_FRESH: Duration = Duration::from_secs(10 * 60);
+pub(super) const VOTER_FRESH: Duration = Duration::from_secs(10 * 60);
 
 fn generation_key(k: u64) -> Vec<u8> {
     format!("gen/{k}").into_bytes()
