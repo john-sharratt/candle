@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use super::thread::PersistenceTrigger;
 
+use crate::projection::TurnKey;
+
 /// The id of the attachment an engine is built with; every later one takes the
 /// next.
 pub const FIRST_ATTACHMENT: u64 = 0;
@@ -56,6 +58,20 @@ impl PersistenceTriggers {
     pub fn fire(&self) {
         for (_, t) in &self.members {
             t.fire();
+        }
+    }
+
+    /// Ask every attached persistence thread to bring `turns` from cold into
+    /// warm ([`PersistenceTrigger::warm_turns`]). A turn names no attachment,
+    /// so each thread gets the whole list and warms only what its own
+    /// substrate holds: a turn another substrate owns has no tier there and
+    /// is skipped at a lookup's cost.
+    pub fn warm_turns(&self, turns: Vec<TurnKey>) {
+        if turns.is_empty() {
+            return;
+        }
+        for (_, t) in &self.members {
+            t.warm_turns(turns.clone());
         }
     }
 
