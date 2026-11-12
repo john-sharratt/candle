@@ -87,6 +87,8 @@ mod stencil_wave;
 mod step_census;
 mod submit_admit;
 mod sweep_forecast;
+pub mod pool;
+mod pool_refresh;
 #[cfg(test)]
 mod test_substrate;
 mod turn_airtime;
@@ -109,6 +111,7 @@ use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 
 use self::paused_creep::PausedCreep;
+use self::pool::default_pool_tokens;
 use self::phase_ring::{ProjectedKind, VramBands};
 use self::relief_pacing::ReliefPacing;
 use self::request_laps::RequestLaps;
@@ -3411,6 +3414,11 @@ pub(crate) struct Scheduler {
     /// The cut falls **after** the token, so a marker stays in the page it
     /// closes rather than heading the next one.
     page_break_tokens: Vec<u32>,
+    /// Tokens a dialogue's pool holds behind its slot
+    /// (`docs/hit_driven_projection.md` §7.2), by the card's size.
+    pool_tokens: usize,
+    /// Per slot, the conversations its pool holds ([`Self::refresh_pool`]).
+    pooled_pieces: HashMap<SequenceId, HashSet<TimelineId>>,
     /// EOS token ID (stops generation).
     eos_tokens: TokenBuffer,
     /// Device the model lives on.
@@ -4214,6 +4222,12 @@ impl Scheduler {
             ?page_break_tokens,
             "index page breaks resolved by name (<think>, </think>, turn closer)"
         );
+        let pool_tokens = default_pool_tokens(
+            model
+                .device()
+                .mem_get_info()
+                .map_or(0, |(_, total)| total as u64),
+        );
         Self {
             rx,
             model,
@@ -4225,6 +4239,8 @@ impl Scheduler {
             tokenizer,
             think_close,
             page_break_tokens,
+            pool_tokens,
+            pooled_pieces: HashMap::new(),
             eos_tokens,
             device,
             active_decodes: HashMap::new(),
@@ -11384,6 +11400,9 @@ impl Scheduler {
         if self.slot_projection_state.remove(&slot).is_none() {
             return;
         }
+        // The pool goes with the slot; the model's hold on its pages goes when
+        // the sequence is released.
+        self.pooled_pieces.remove(&slot);
         if let Some(conversation) = conversation {
             self.republish_pins(&conversation);
         }
@@ -11897,6 +11916,21 @@ impl Scheduler {
         policy
             .substrate
             .observe_working_set(schema, policy.target, &group_candidates, &density);
+        // The pool behind the slot, chosen from the same scan: each candidate
+        // conversation lifted by the most-read of its rounds (§7.2).
+        let pool_lifts: HashMap<TimelineId, f32> = self
+            .slot_projection_state
+            .get(&slot)
+            .map(|s| {
+                let mut by_piece: HashMap<TimelineId, f32> = HashMap::new();
+                for (key, lift) in s.round_hits.lifts(&schema.hits) {
+                    let at = by_piece.entry(key.timeline).or_insert(lift);
+                    *at = at.max(lift);
+                }
+                by_piece
+            })
+            .unwrap_or_default();
+        self.refresh_pool(slot, &policy.substrate, &group_candidates, &pool_lifts);
         observe_span.end();
         let observe_us = t_observe.elapsed().as_micros() as u64;
 

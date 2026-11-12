@@ -215,6 +215,20 @@ pub(super) fn hit_rounds_of(
 }
 
 impl SlotState {
+    /// The conversations whose turns the last assembly placed, each once, in
+    /// slot order — the pool's floor (`docs/hit_driven_projection.md` §7.2).
+    pub(super) fn placed_timelines(&self) -> Vec<TimelineId> {
+        let mut out: Vec<TimelineId> = Vec::new();
+        for p in &self.placed_pieces {
+            if let Some(PieceRange::Turn(tl, _)) = p.range {
+                if !out.contains(&tl) {
+                    out.push(tl);
+                }
+            }
+        }
+        out
+    }
+
     /// The placed pieces by position, each named by the turn or section it is.
     pub(super) fn placed_spans(&self) -> Vec<PieceSpan> {
         self.placed_pieces
