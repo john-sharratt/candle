@@ -100,11 +100,11 @@ use crate::provenance::chunk_exclusion::ChunkExclusion;
 use crate::provenance::SigWindow;
 use crate::scheduler::profile;
 use crate::summary_tree::exchange::Couplings;
+use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{
     select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
     TurnKind, MERGE_FANOUT,
 };
-use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnRecord, TurnSegment};
 use crate::working_set::{Candidate, Limits, Refusal, WorkingSet};

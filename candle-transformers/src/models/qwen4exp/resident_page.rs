@@ -479,7 +479,10 @@ mod tests {
 
         drop(page);
         drop(other);
-        assert!(reg.layer(&key, 1).is_none(), "a dropped page is not handed back");
+        assert!(
+            reg.layer(&key, 1).is_none(),
+            "a dropped page is not handed back"
+        );
         reg.insert(PieceKey::of(b"another piece"), 1, &[]);
         assert_eq!(reg.len(), 1, "the dead entry is swept on the next insert");
     }

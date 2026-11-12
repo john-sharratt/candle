@@ -63,6 +63,8 @@ mod phase_split;
 mod piece_identity;
 mod piece_splice;
 mod pinned_report;
+pub mod pool;
+mod pool_refresh;
 mod prefill;
 mod prefill_wait;
 pub(crate) mod profile;
@@ -87,8 +89,6 @@ mod stencil_wave;
 mod step_census;
 mod submit_admit;
 mod sweep_forecast;
-pub mod pool;
-mod pool_refresh;
 #[cfg(test)]
 mod test_substrate;
 mod turn_airtime;
@@ -111,8 +111,8 @@ use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 
 use self::paused_creep::PausedCreep;
-use self::pool::default_pool_tokens;
 use self::phase_ring::{ProjectedKind, VramBands};
+use self::pool::default_pool_tokens;
 use self::relief_pacing::ReliefPacing;
 use self::request_laps::RequestLaps;
 use self::wave_timing::WaveTiming;

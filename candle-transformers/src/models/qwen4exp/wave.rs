@@ -885,7 +885,9 @@ impl Qwen4ExpBatched {
         let resolved: Vec<Option<Vec<Option<Arc<ResidentPage>>>>> = pieces
             .iter()
             .map(|p| match p {
-                PositionalPiece::Page { bytes, key } => self.resident_pages(bytes, key, |_| true).map(Some),
+                PositionalPiece::Page { bytes, key } => {
+                    self.resident_pages(bytes, key, |_| true).map(Some)
+                }
                 PositionalPiece::Gap(_) => Ok(None),
             })
             .collect::<Result<_>>()?;
@@ -1365,7 +1367,11 @@ impl Qwen4ExpBatched {
     pub fn pooled_keys(&self, seq: usize) -> Vec<PieceKey> {
         self.pooled
             .read()
-            .map(|p| p.get(&seq).map(|m| m.keys().copied().collect()).unwrap_or_default())
+            .map(|p| {
+                p.get(&seq)
+                    .map(|m| m.keys().copied().collect())
+                    .unwrap_or_default()
+            })
             .unwrap_or_default()
     }
 

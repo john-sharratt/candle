@@ -2224,10 +2224,10 @@ impl ConversationEngine {
         let envelope = ToolCallEnvelope::for_assistant_calls(&self.core.dialect);
         let close_turn = ToolCallEnvelope::turn_close(&self.core.dialect);
         let started = std::time::Instant::now();
-        let spec = compile_tool_call_loop(tools, &envelope, max_calls, &close_turn)
-            .map_err(|e| {
-            ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
-        })?;
+        let spec =
+            compile_tool_call_loop(tools, &envelope, max_calls, &close_turn).map_err(|e| {
+                ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
+            })?;
         let spec_ms = started.elapsed().as_millis() as u64;
         let vocab = self.vocab();
         let vocab_ms = started.elapsed().as_millis() as u64 - spec_ms;
