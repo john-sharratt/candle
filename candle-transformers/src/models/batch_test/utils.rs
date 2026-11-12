@@ -2053,8 +2053,16 @@ impl TestParams {
         // immutable quantized tail. Deliberately outside the timing windows.
         #[cfg(feature = "cuda")]
         {
-            session.quantize_and_seal_sequences(&sequence_indices, true)?;
+            let seal = session.quantize_and_seal_sequences(&sequence_indices, true)?;
             self.device.synchronize()?;
+            eprintln!(
+                "{}",
+                seal.line(
+                    &format!("{:?} x{}", config.mode, sequence_indices.len()),
+                    "prefill",
+                    None,
+                )
+            );
         }
 
         // Generate phase. Budget and early-stop live inside the driver's per
@@ -2192,8 +2200,19 @@ impl TestParams {
         // the quantizer's preserve bucket unchanged.
         #[cfg(feature = "cuda")]
         {
-            session.quantize_and_seal_sequences(&sequence_indices, false)?;
+            let seal = session.quantize_and_seal_sequences(&sequence_indices, false)?;
             self.device.synchronize()?;
+            // Everything this seal converted is what the decode wrote: the
+            // prefill's blocks were sealed at the boundary above.
+            let decode_mib_per_s = seal.native_mib() / generate_duration.as_secs_f64();
+            eprintln!(
+                "{}",
+                seal.line(
+                    &format!("{:?} x{}", config.mode, sequence_indices.len()),
+                    "decode",
+                    Some(decode_mib_per_s),
+                )
+            );
         }
 
         // Calculate quantized token percentage for quantized modes (reads the

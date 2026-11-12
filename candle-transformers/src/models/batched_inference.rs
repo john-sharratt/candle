@@ -38,6 +38,8 @@ use crate::models::piece_key::PieceKey;
 use crate::models::positional_piece::PositionalPiece;
 use crate::models::residual_rows::CreepResidual;
 use crate::models::rope_schedule::RungSelect;
+#[cfg(feature = "cuda")]
+use crate::models::seal_timing::{native_bytes_per_desc, SealTiming};
 use crate::models::sealed_injection::{reconcile_sealed_prefix, SealedInjection};
 use crate::models::selection_strata::StrataTokens;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
@@ -2049,13 +2051,18 @@ impl BatchedInferenceSession {
     /// the shape is unquantizable (the palette4 quantizer supports `head_dim`
     /// 128 and 256; single-latent backings take the per-band latent
     /// compressor at any band-divisible head_dim).
+    ///
+    /// Answers with what the selection and convert core cost ([`SealTiming`]),
+    /// timed at the fences the call already has.
     #[cfg(feature = "cuda")]
     pub fn quantize_and_seal_sequences(
         &mut self,
         seq_indices: &[usize],
         start_new_chunk: bool,
-    ) -> Result<()> {
+    ) -> Result<SealTiming> {
         use candle::quantized::pinned_staging::PinnedBuf;
+        let t_call = std::time::Instant::now();
+        let mut timing = SealTiming::default();
         use candle_nn::kv_cache::{
             convert_deferred_descs, quantize_layers_deferred, ChunkedKvBacking, CompressionPolicy,
             SealedSequence,
@@ -2093,7 +2100,7 @@ impl BatchedInferenceSession {
         };
         let copy_stream = match &self.device {
             Device::Cuda(d) => d.cuda_stream(),
-            _ => return Ok(()),
+            _ => return Ok(timing),
         };
         // The fused palette4 quantizer supports head_dim 128 and 256;
         // single-latent backings route through the per-band latent compressor
@@ -2106,6 +2113,7 @@ impl BatchedInferenceSession {
         let policy = if quantizable { policy } else { None };
 
         let mut scratch: Option<PinnedBuf> = None;
+        let mut t_convert = std::time::Instant::now();
 
         // ── ONE format selection across the whole cohort ────────────────────
         //
@@ -2239,15 +2247,23 @@ impl BatchedInferenceSession {
                     }
                 }
             }
-            // The selection deferred every convert; run them all as one batch per
-            // backing before anything reads the quantized bytes or drops the
-            // float sources below.
+            // The selection deferred every convert; run them all as one batch
+            // before anything reads the quantized bytes or drops the float
+            // sources below. One launch over every layer's descriptors: they
+            // carry their own arena pointers, so any backing serves.
+            //
+            // The selection read its result back, so the stream is idle when the
+            // convert launches: from the launch to the fence below is the
+            // convert's own device time.
             if !descs.is_empty() {
                 let n_kv_head = self.backings[0].n_kv_head();
-                for backing in &self.backings {
-                    convert_deferred_descs(backing, &descs, n_kv_head, &self.device)?;
-                }
+                timing.native_bytes =
+                    descs.len() as u64 * native_bytes_per_desc(self.backings[0].head_dim());
+                t_convert = std::time::Instant::now();
+                convert_deferred_descs(&self.backings[0], &descs, n_kv_head, &self.device)?;
             }
+            timing.select_ms = select_ms;
+            timing.alloc_ms = alloc_ms;
         }
         // **The snapshots go before the swap loop, not after it.** Each one holds every
         // float chunk of its sequence, and the loop below is where those chunks are
@@ -2268,6 +2284,7 @@ impl BatchedInferenceSession {
             copy_stream
                 .synchronize()
                 .map_err(|e| candle::Error::Msg(format!("quantize sync: {e}")))?;
+            timing.convert_ms = t_convert.elapsed().as_secs_f64() * 1000.0;
         }
         for (s, &seq_idx) in seq_indices.iter().enumerate() {
             let quantized_per_layer = std::mem::take(&mut quantized_per_seq[s]);
@@ -2296,7 +2313,8 @@ impl BatchedInferenceSession {
                 self.push_empty_writer_chunk(seq_idx)?;
             }
         }
-        Ok(())
+        timing.total_ms = t_call.elapsed().as_secs_f64() * 1000.0;
+        Ok(timing)
     }
 
     /// Sweep fully-empty KV arenas across all backings, returning their regions
