@@ -126,6 +126,18 @@ impl Scheduler {
         if let Err(e) = self.model.retain_pooled(slot.0, &keep) {
             tracing::warn!(slot = slot.0, error = %e, "pool: dropped pieces not released");
         }
+        // Each pooled conversation's K/V to the warm tier, so a round the fill
+        // later chooses loads at PCIe speed rather than from the log. Turns
+        // already warm or hot cost a lookup; what the warm share has no room
+        // for stays cold.
+        let warm: Vec<TurnKey> = kept
+            .iter()
+            .flat_map(|&tl| {
+                (0..turns_of.get(&tl).copied().unwrap_or(0))
+                    .map(move |i| TurnKey::new(tl, TurnIndex(i)))
+            })
+            .collect();
+        self.persist_triggers.warm_turns(warm);
         self.pooled_pieces.insert(slot, kept);
     }
 }
