@@ -204,6 +204,7 @@ mod belief_scan_split;
 mod builder;
 mod chunk_exclusion;
 mod error;
+pub mod fill;
 pub(crate) mod event;
 mod group_votes;
 mod held_index_pages;
