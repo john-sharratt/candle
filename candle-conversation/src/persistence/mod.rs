@@ -102,6 +102,7 @@ pub mod triggers;
 mod vanished_segment;
 pub mod vfs;
 pub mod walker;
+pub mod warm_asks;
 pub mod warm_ledger;
 pub mod writer;
 pub mod writer_lock;

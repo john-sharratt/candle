@@ -41,6 +41,26 @@ use candle::Result;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
+/// One sealed chunk as the log holds it, borrowed from a read buffer: what
+/// [`ChunkedKvBacking::warm_from_cold`] rebuilds a warm copy from.
+#[derive(Debug, Clone, Copy)]
+pub struct ColdChunk<'a> {
+    /// The window's skip-count from the start of the chunk.
+    pub offset: u16,
+    /// Valid tokens in the window.
+    pub token_count: u16,
+    /// Per-`(head, palette)` K and V format tags, `n_kv_head × N_PALETTE` each.
+    pub k_fmt: &'a [u8],
+    pub v_fmt: &'a [u8],
+    /// Packed palette maps and outer scales, as the chunk recorded them.
+    pub k_pal: &'a [u8],
+    pub v_pal: &'a [u8],
+    pub k_scale: &'a [f32],
+    pub v_scale: &'a [f32],
+    /// Every band's payload, in `HeadGids` order.
+    pub kv_bytes: &'a [u8],
+}
+
 /// The arena keys a run of per-band formats allocates from.
 ///
 /// The one place formats are turned into keys, so the "can these bands share a
@@ -1522,6 +1542,118 @@ impl ChunkedKvBacking {
                 })
             })
             .collect()
+    }
+
+    /// Build a warm (host RAM) copy of one layer's sealed chunks from their
+    /// cold images, without touching the device.
+    ///
+    /// Each chunk is laid out as the log holds it (`ChunkPayload`): its
+    /// per-`(head, palette)` K and V format tags, palette maps and scales, and
+    /// one blob holding every band's payload in `HeadGids` order —
+    /// `(h * N_PALETTE + p) * 2 + is_value` — each as long as its own tag says.
+    /// Every band takes a slot of its own in the warm tier, as a cold load
+    /// gives it one on the device, and the chunk carries no device record.
+    #[cfg(feature = "cuda")]
+    pub fn warm_from_cold(&self, chunks: &[ColdChunk<'_>]) -> candle::Result<SealedSequence> {
+        let n_kv_head = self.inner.n_kv_head;
+        let want = n_kv_head * N_PALETTE;
+        let elems = self.inner.elems_per_chunk();
+
+        // Every band's key and byte range in its chunk's blob, checked before
+        // anything is allocated, so a malformed image leaves the tier untouched.
+        let mut plans: Vec<Vec<(ArenaKey, std::ops::Range<usize>)>> =
+            Vec::with_capacity(chunks.len());
+        for (c, chunk) in chunks.iter().enumerate() {
+            if chunk.k_fmt.len() != want || chunk.v_fmt.len() != want {
+                candle::bail!(
+                    "warm_from_cold: chunk {c} has {} K and {} V band formats, expected {want}",
+                    chunk.k_fmt.len(),
+                    chunk.v_fmt.len()
+                );
+            }
+            let mut bands = Vec::with_capacity(want * 2);
+            let mut off = 0usize;
+            for sub in 0..want {
+                for tag in [chunk.k_fmt[sub], chunk.v_fmt[sub]] {
+                    let fmt = KvFormat::from_tag(tag).ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "warm_from_cold: chunk {c} band tag {tag} names no storage format"
+                        ))
+                    })?;
+                    let len = payload_bytes_for_tag(ArenaFormatTag::from_u8(tag), elems)
+                        .ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "warm_from_cold: chunk {c} band tag {tag} has no payload length"
+                            ))
+                        })?;
+                    let key = self.inner.arena_key_for(fmt, ArenaLocation::Cpu)?;
+                    bands.push((key, off..off + len));
+                    off += len;
+                }
+            }
+            if off != chunk.kv_bytes.len() {
+                candle::bail!(
+                    "warm_from_cold: chunk {c}'s bands need {off} bytes, its image holds {}",
+                    chunk.kv_bytes.len()
+                );
+            }
+            plans.push(bands);
+        }
+
+        // One slot per band (one state.write), then every band's bytes (one
+        // storage.write), as the hot→warm copy does.
+        let gids: Vec<Vec<ChunkGid>> = {
+            let _state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            plans
+                .iter()
+                .map(|bands| {
+                    bands
+                        .iter()
+                        .map(|(key, _)| self.alloc_chunk_for_key(*key))
+                        .collect::<candle::Result<Vec<ChunkGid>>>()
+                })
+                .collect::<candle::Result<_>>()?
+        };
+        self.inner.storage.try_write(|s| -> candle::Result<()> {
+            for ((chunk, bands), chunk_gids) in chunks.iter().zip(&plans).zip(&gids) {
+                for ((_, range), gid) in bands.iter().zip(chunk_gids) {
+                    Self::write_chunk_from_pinned_bytes(
+                        s.arenas_mut(),
+                        gid.arena_idx(),
+                        gid.chunk_idx(),
+                        &chunk.kv_bytes[range.clone()],
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+
+        let sealed: Vec<SealedChunk> = chunks
+            .iter()
+            .zip(gids)
+            .map(|(chunk, chunk_gids)| SealedChunk {
+                gids: HeadGids::from_vec(chunk_gids),
+                offset: chunk.offset,
+                token_count: chunk.token_count,
+                k_pal: Arc::new(chunk.k_pal.to_vec()),
+                v_pal: Arc::new(chunk.v_pal.to_vec()),
+                k_scale: Arc::new(chunk.k_scale.to_vec()),
+                v_scale: Arc::new(chunk.v_scale.to_vec()),
+                k_fmt: Arc::new(chunk.k_fmt.to_vec()),
+                v_fmt: Arc::new(chunk.v_fmt.to_vec()),
+                byte_size: chunk.kv_bytes.len() as u64,
+                meta: None,
+            })
+            .collect();
+        Ok(SealedSequence {
+            token_count: sealed.iter().map(|c| c.token_count as usize).sum(),
+            chunks: sealed,
+            chunk_size: CHUNK_SIZE,
+            location: ArenaLocation::Cpu,
+        })
     }
 
     /// Cross-layer batched hot→warm DtoH. The per-layer

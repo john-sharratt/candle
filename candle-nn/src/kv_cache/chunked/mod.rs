@@ -160,8 +160,8 @@ pub use backing::{
     TIER_REFUSED_MARKER, TIER_SHORT_BY, TIER_STANDS_OVER_FREE,
 };
 pub use backing::{ChunkedKvBacking, DecodeGpuChunkSyncStats};
-pub use chunk_ops::BlockAllocSpec;
 pub use chunk_ops::MIGRATION_STAGING_CAP_BYTES;
+pub use chunk_ops::{BlockAllocSpec, ColdChunk};
 #[cfg(feature = "cuda")]
 pub use compact::{
     compact_backings, compaction_epoch, compaction_tally, CompactionRefused, CompactionReport,

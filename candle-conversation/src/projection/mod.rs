@@ -203,6 +203,7 @@ mod belief_files;
 mod belief_scan_split;
 mod builder;
 mod chunk_exclusion;
+mod cold_to_warm;
 mod error;
 pub mod fill;
 pub(crate) mod event;
@@ -261,6 +262,7 @@ pub use adaptive::{
 };
 pub use builder::Builder;
 pub use chunk_exclusion::ExclusionReport;
+pub use cold_to_warm::Warmed;
 pub use error::ConstructionError;
 pub use event::{
     aggregate, decode_events, decode_points, encode_events, from_projection,

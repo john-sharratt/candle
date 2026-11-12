@@ -23,8 +23,8 @@ use crate::kv_cache::chunked::compress::quantize_layers_deferred_within;
 use crate::kv_cache::chunked::selection_batches::selection_bytes;
 use crate::kv_cache::chunked::{ChunkedKvBacking, CompressionPolicy};
 use crate::kv_cache::{
-    convert_deferred_descs, quantize_sealed_in_place, quantize_sealed_in_place_deferred, KvFormat,
-    SealedSequence,
+    convert_deferred_descs, payload_bytes_for_tag, quantize_sealed_in_place,
+    quantize_sealed_in_place_deferred, ColdChunk, KvFormat, SealedSequence,
 };
 
 const N_KV_HEAD: usize = 2;
@@ -172,6 +172,121 @@ fn quantize_to_cpu_basic_round_trip_shape() {
         warm_bytes,
         src_bytes_per_chunk,
     );
+}
+
+/// A warm copy rebuilt from its cold image holds the same bytes, formats,
+/// palettes, scales and windows as the copy the image was taken from, in
+/// slots of its own, with no device record.
+///
+/// The image is built as the log holds it — every band's payload in
+/// `HeadGids` order, each as long as its tag says — from a turn of 40 tokens,
+/// so one chunk is full and the other a partial tail.
+#[test]
+fn a_warm_copy_rebuilt_from_its_cold_image_holds_the_same_bytes() {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
+        return;
+    };
+    let policy = CompressionPolicy::new(5);
+    let backing = cuda_backing_with_policy(&device, &policy);
+    let copy_stream = cuda_stream(&device);
+    let src = seed_f16_sealed(&backing, &device, 40, 7);
+    let mut pinned: Option<PinnedBuf> = None;
+    let warm = backing
+        .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&src])
+        .expect("hot → warm copy")
+        .remove(0);
+    assert_eq!(warm.location, ArenaLocation::Cpu);
+
+    let elems = backing.elems_per_chunk();
+    let band_bytes = |chunk: &crate::kv_cache::SealedChunk| -> Vec<u8> {
+        let mut blob = Vec::new();
+        for (gid, tag) in chunk.bands() {
+            let len = payload_bytes_for_tag(tag, elems).expect("a stored format");
+            let start = blob.len();
+            blob.resize(start + len, 0);
+            backing
+                .read_chunk_into_bytes(gid.arena_idx(), gid.chunk_idx(), &mut blob[start..])
+                .expect("read a warm band");
+        }
+        blob
+    };
+    let images: Vec<Vec<u8>> = warm.chunks.iter().map(band_bytes).collect();
+    let cold: Vec<ColdChunk<'_>> = warm
+        .chunks
+        .iter()
+        .zip(&images)
+        .map(|(c, bytes)| ColdChunk {
+            offset: c.offset,
+            token_count: c.token_count,
+            k_fmt: &c.k_fmt,
+            v_fmt: &c.v_fmt,
+            k_pal: &c.k_pal,
+            v_pal: &c.v_pal,
+            k_scale: &c.k_scale,
+            v_scale: &c.v_scale,
+            kv_bytes: bytes,
+        })
+        .collect();
+
+    let rebuilt = backing.warm_from_cold(&cold).expect("warm from cold");
+    assert_eq!(rebuilt.location, ArenaLocation::Cpu);
+    assert_eq!(rebuilt.token_count, 40);
+    assert_eq!(rebuilt.chunks.len(), warm.chunks.len());
+    for ((r, w), image) in rebuilt.chunks.iter().zip(&warm.chunks).zip(&images) {
+        assert_eq!(r.offset, w.offset);
+        assert_eq!(r.token_count, w.token_count);
+        assert_eq!(*r.k_fmt, *w.k_fmt);
+        assert_eq!(*r.v_fmt, *w.v_fmt);
+        assert_eq!(*r.k_pal, *w.k_pal);
+        assert_eq!(*r.v_pal, *w.v_pal);
+        assert_eq!(*r.k_scale, *w.k_scale);
+        assert_eq!(*r.v_scale, *w.v_scale);
+        assert_eq!(r.byte_size, image.len() as u64);
+        assert!(r.meta.is_none(), "a warm chunk carries no device record");
+        assert_eq!(
+            &band_bytes(r),
+            image,
+            "the rebuilt bands hold the image's bytes"
+        );
+        for ((rg, _), (wg, _)) in r.bands().zip(w.bands()) {
+            assert_ne!(
+                rg.raw(),
+                wg.raw(),
+                "the rebuilt copy takes slots of its own"
+            );
+        }
+    }
+    assert_eq!(
+        [rebuilt.chunks[0].token_count, rebuilt.chunks[1].token_count],
+        [32, 8]
+    );
+}
+
+/// An image whose bytes do not match its bands' formats is refused before
+/// anything is allocated.
+#[test]
+fn a_cold_image_shorter_than_its_bands_is_refused() {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
+        return;
+    };
+    let policy = CompressionPolicy::new(5);
+    let backing = cuda_backing_with_policy(&device, &policy);
+    let k_fmt = vec![KvFormat::Float(DType::F16).to_tag(); N_KV_HEAD * 4];
+    let v_fmt = k_fmt.clone();
+    let short = vec![0u8; 16];
+    let cold = [ColdChunk {
+        offset: 0,
+        token_count: 32,
+        k_fmt: &k_fmt,
+        v_fmt: &v_fmt,
+        k_pal: &[],
+        v_pal: &[],
+        k_scale: &[],
+        v_scale: &[],
+        kv_bytes: &short,
+    }];
+    let err = backing.warm_from_cold(&cold).unwrap_err().to_string();
+    assert!(err.contains("its image holds 16"), "{err}");
 }
 
 /// Multi-sequence input batches map 1-to-1 to outputs in the same order.

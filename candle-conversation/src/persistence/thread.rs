@@ -57,8 +57,9 @@ use super::reserve_log::log_reserve;
 use super::resume::TurnChunkGrid;
 use super::streams::StreamId;
 use super::transfer::seal_to_chunk_images;
+use super::warm_asks::WarmAsks;
 use super::warm_ledger::WarmShare;
-use crate::projection::{Conversation, MaintenanceOp};
+use crate::projection::{Conversation, MaintenanceOp, TurnKey};
 use crate::scheduler::phase_ring::{
     migrate_sample, mix_due, push_idle_migrate, push_migrate, push_mix,
 };
@@ -99,6 +100,8 @@ pub struct PersistenceTrigger {
     /// Live drain gauges, stamped by the persistence loop each pass. The
     /// scheduler polls them to throttle admission off a leading signal.
     backlog: BacklogGauge,
+    /// Turns asked to be brought from cold into warm ([`Self::warm_turns`]).
+    warm_asks: WarmAsks,
 }
 
 /// The persistence loop's drain gauges, shared with every
@@ -169,6 +172,22 @@ impl PersistenceTrigger {
     /// already full (one wake is as good as several).
     pub fn fire(&self) {
         let _ = self.tx.try_send(());
+    }
+
+    /// Ask the persistence thread to bring `turns` from cold into warm,
+    /// without placing them hot (`docs/kv_quantize_in_the_gap.md` §5). Returns
+    /// at once: the next pass reads each listed turn that holds only a cold
+    /// copy from the log into the warm tier, within this substrate's share of
+    /// the warm budget, and drops what does not fit. A turn already warm or
+    /// hot is skipped, so sending a whole list again costs a lookup a turn.
+    /// Nothing reports back; a turn's tier is read as usual
+    /// (`Substrate::turn_tier_state`).
+    pub fn warm_turns(&self, turns: Vec<TurnKey>) {
+        if turns.is_empty() {
+            return;
+        }
+        self.warm_asks.ask(turns);
+        self.fire();
     }
 
     /// Block until the persistence thread completes a pass that drains the
@@ -260,6 +279,7 @@ impl PersistenceTrigger {
             tx,
             flush_tx,
             backlog: BacklogGauge::default(),
+            warm_asks: WarmAsks::default(),
         }
     }
 }
@@ -280,6 +300,8 @@ pub struct PersistenceThread {
     /// Shared with the loop (which stamps them) and every [`PersistenceTrigger`]
     /// handed out (which reads them) — the live drain gauges.
     backlog: BacklogGauge,
+    /// Shared with the loop (which takes them) and every trigger (which asks).
+    warm_asks: WarmAsks,
 }
 
 impl PersistenceThread {
@@ -309,6 +331,8 @@ impl PersistenceThread {
         let (shutdown_tx, shutdown_rx) = channel::bounded::<()>(1);
         let backlog = BacklogGauge::default();
         let loop_backlog = backlog.clone();
+        let warm_asks = WarmAsks::default();
+        let loop_warm_asks = warm_asks.clone();
 
         // All persist-thread CUDA work runs on the device's one stream —
         // selection, convert, gather, DtoH — taken under a lease per group
@@ -336,6 +360,7 @@ impl PersistenceThread {
                     shutdown_rx,
                     loop_backlog,
                     warm,
+                    loop_warm_asks,
                 );
             })
             .expect("failed to spawn substrate-persistence thread");
@@ -346,6 +371,7 @@ impl PersistenceThread {
             flush_tx,
             shutdown_tx,
             backlog,
+            warm_asks,
         }
     }
 
@@ -363,6 +389,7 @@ impl PersistenceThread {
             tx: self.trigger_tx.clone(),
             flush_tx: self.flush_tx.clone(),
             backlog: self.backlog.clone(),
+            warm_asks: self.warm_asks.clone(),
         }
     }
 
@@ -395,6 +422,7 @@ fn run_loop(
     shutdown_rx: Receiver<()>,
     backlog: BacklogGauge,
     warm: WarmShare,
+    warm_asks: WarmAsks,
 ) {
     // Bind this thread to the device's CUDA context BEFORE any pinned
     // alloc — the CUDA context is per-thread on Windows and the
@@ -482,6 +510,7 @@ fn run_loop(
             },
             &backlog,
             &warm,
+            &warm_asks,
             &mut flush,
         );
         carried = flush.carried();
@@ -588,6 +617,9 @@ fn run_loop(
                     // reading would publish a deficit that never clears.
                     &backlog,
                     &warm,
+                    // A shutdown drain warms nothing: what it reads, it reads
+                    // to put away.
+                    &WarmAsks::default(),
                     // Nothing waits on the shutdown drain's passes.
                     &mut PassFlush::new(None, None),
                 );
@@ -1042,6 +1074,7 @@ fn run_pass(
     maintenance: PassMaintenance<'_>,
     backlog: &BacklogGauge,
     warm: &WarmShare,
+    warm_asks: &WarmAsks,
     flush: &mut PassFlush<'_>,
 ) {
     let t_pass = std::time::Instant::now();
@@ -1693,7 +1726,8 @@ fn run_pass(
     };
     backlog.stamp_residents(warm_resident as u64, warm_bytes, held);
     warm.hold(warm_bytes);
-    if warm_resident > 0 {
+    let asked = warm_asks.take();
+    if warm_resident > 0 || !asked.is_empty() {
         let mut sys = System::new();
         sys.refresh_memory();
         // Budget-based purge: warm may hold up to what RAM affords after the OS
@@ -1705,7 +1739,31 @@ fn run_pass(
         // summary (see substrate.rs).
         let budget = candle::vram::host_ram_budget(sys.total_memory());
         let target = warm.target(budget.kv_warm_budget_bytes);
-        let _ = conversation.read().purge_warm_to_budget(target, 0);
+        if warm_resident > 0 {
+            let _ = conversation.read().purge_warm_to_budget(target, 0);
+        }
+        // ── Phase 2.65: warm what was asked for, in the room the purge left ──
+        //
+        // After the purge, so an ask never pushes the tier past its share and
+        // the next pass's purge never sheds what this one just warmed. Every
+        // turn read here is cold-backed by construction, so a later purge may
+        // drop it again without loss.
+        if !asked.is_empty() {
+            let room = target.saturating_sub(conversation.read().warm_resident_bytes());
+            let warmed = conversation.warm_turns_from_cold(backings, &asked, room);
+            if warmed.turns > 0 || warmed.failed > 0 || warmed.dropped > 0 {
+                tracing::debug!(
+                    target: "candle_conversation::persistence::tier",
+                    asked = asked.len(),
+                    warmed = warmed.turns,
+                    mib = warmed.bytes / (1024 * 1024),
+                    skipped = warmed.skipped,
+                    dropped = warmed.dropped,
+                    failed = warmed.failed,
+                    "cold → warm on request"
+                );
+            }
+        }
     }
 
     // ── Phase 2.7: the memory census's gauge ──────────────────────────────

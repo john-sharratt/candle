@@ -600,6 +600,125 @@ fn full_cold_warm_hot_round_trip() {
     }
 }
 
+/// **Cold → warm on request, then warm → hot, byte for byte.**
+///
+/// Turns reloaded cold-only are warmed from the log without touching the
+/// device (`Conversation::warm_turns_from_cold`, what
+/// `PersistenceTrigger::warm_turns` runs at the next pass): each lands
+/// warm + cold and not hot. Asked again they are skipped; asked with no room
+/// they are dropped. The warm copies then lift to hot through the warm path,
+/// and the bytes equal those the turns were sealed with.
+#[test]
+fn cold_to_warm_on_request_round_trip() {
+    let _persist = persistence_serial();
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    let tmpdir = tempfile::tempdir().unwrap();
+    let dir = tmpdir.path().to_path_buf();
+    let layer_id = LayerId::from_raw(1).unwrap();
+    let group_id = GroupId::from_raw(1).unwrap();
+    let timeline = TimelineAllocator::new().next();
+    let pattern_bases: Vec<u32> = (0..N_TURNS)
+        .map(|i| 3000 + (i as u32) * 1_000_000)
+        .collect();
+
+    let (snapshots, turn_keys) = {
+        let conv = open_conversation(&dir);
+        let backings = make_backings(&device);
+        conv.register_timeline(timeline, layer_id, group_id);
+        let turn_keys: Vec<TurnKey> = pattern_bases
+            .iter()
+            .map(|&base| {
+                TurnKey::new(
+                    timeline,
+                    seed_turn(&conv, &backings, &device, timeline, base),
+                )
+            })
+            .collect();
+        let snapshots: Vec<(TurnKey, Vec<Vec<u8>>)> = turn_keys
+            .iter()
+            .map(|&k| {
+                (
+                    k,
+                    snapshot_turn_bytes(&conv, &backings, &device, k.timeline, k.index),
+                )
+            })
+            .collect();
+        let persist = PersistenceThread::spawn(
+            conv.clone(),
+            Arc::new(backings.clone()),
+            device.clone(),
+            None,
+            WarmLedger::new().join(),
+        );
+        persist.shutdown();
+        (snapshots, turn_keys)
+    };
+
+    let conv = open_conversation(&dir);
+    let backings = make_backings(&device);
+    conv.register_timeline(timeline, layer_id, group_id);
+    assert_eq!(conv.reconstruct_from_log(N_LAYERS, None).unwrap(), N_TURNS);
+    for &key in &turn_keys {
+        let st = turn_state(&conv, key);
+        assert!(
+            !st.hot && !st.warm && st.cold,
+            "reloaded {key:?} cold-only, got {st:?}"
+        );
+    }
+
+    // No room: every turn is dropped, none touched.
+    let none = conv.warm_turns_from_cold(&backings, &turn_keys, 0);
+    assert_eq!((none.turns, none.dropped), (0, N_TURNS));
+    for &key in &turn_keys {
+        assert!(!turn_state(&conv, key).warm, "nothing warmed without room");
+    }
+
+    let warmed = conv.warm_turns_from_cold(&backings, &turn_keys, u64::MAX);
+    assert_eq!(
+        warmed.turns, N_TURNS,
+        "every cold-only turn warmed: {warmed:?}"
+    );
+    assert_eq!((warmed.failed, warmed.dropped, warmed.skipped), (0, 0, 0));
+    assert!(warmed.bytes > 0);
+    for &key in &turn_keys {
+        let st = turn_state(&conv, key);
+        assert!(
+            !st.hot && st.warm && st.cold,
+            "{key:?} warm + cold, not hot, got {st:?}"
+        );
+    }
+
+    let again = conv.warm_turns_from_cold(&backings, &turn_keys, u64::MAX);
+    assert_eq!(
+        (again.turns, again.skipped),
+        (0, N_TURNS),
+        "a warm turn is skipped"
+    );
+
+    let main_stream = cuda_stream(&device);
+    let mut pinned: Option<PinnedBuf> = None;
+    let mut stager = ColdLoadStager::new();
+    let report = elevate_to_hot(
+        &conv,
+        &backings,
+        &device,
+        &main_stream,
+        &mut pinned,
+        &mut stager,
+        &[],
+        &turn_keys,
+    )
+    .unwrap();
+    assert_eq!(report.warm_to_hot, N_TURNS, "the lift took the warm path");
+    assert_eq!(report.cold_to_hot, 0);
+    for (key, original) in &snapshots {
+        let now = snapshot_turn_bytes(&conv, &backings, &device, key.timeline, key.index);
+        assert_eq!(&now, original, "cold → warm → hot changed {key:?}'s bytes");
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Quant blend round-trip
 // ════════════════════════════════════════════════════════════════════════════

@@ -185,7 +185,7 @@ pub use chunked::{
     QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS, QWEN4EXP_Q2KO_KV_FACTORS,
 };
 pub use chunked::{rewrite_sealed, CompactionMap, Sweep};
-pub use chunked::{ArenaKey, FormatCensus, StoragePolicy};
+pub use chunked::{ArenaKey, ColdChunk, FormatCensus, StoragePolicy};
 pub use chunked::{
     DetachedChunks, LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE,
 };
