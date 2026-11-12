@@ -290,7 +290,7 @@ Counters are per round per sequence, on the device (`qwen4exp/hits.rs`). A
 device map takes each block to its round, loaded or pooled, rebuilt when a
 projection declares its rounds (`ManagedBatchedModel::set_hit_rounds`); after
 the selection at a sampled layer one batched launch adds each chosen block
-into its piece's counter (`qsa_hits.cu`, a span table naming each sequence's
+into its round's counter (`qsa_hits.cu`, a span table naming each sequence's
 rows, map and counters). Nothing is read inside a forward: the reprojection
 reads and zeroes the counts at the boundary (`take_hits`), where it already
 stands between forwards. A row inside the budget made no selection and counts
@@ -403,8 +403,9 @@ At each boundary:
    whole once it has none left; the recent exchanges go oldest first. If the
    current exchange alone still passes the room, its own older tool rounds go,
    oldest first; its request, its newest tool round and the reply stay. Only
-   when those, the first request and the system prompt alone pass the room
-   does the slot run past `L0`, as locks carry it, and the assembler warns. A
+   when those and the first request alone pass the room (`L0 −
+   reserve_tokens − system prompt − appended`) does the slot run past `L0`,
+   as locks carry it, and the assembler warns. A
    reply therefore stays on rung 1 unless one exchange's request, newest
    result and reply alone outgrow the trained window.
 
@@ -558,11 +559,16 @@ answer to it, never the user's turn without its answer.
   `recent` (16) before it hold every round they have, tool rounds included,
   and give way only as §7.2 says when the floors pass the room: tool rounds
   oldest first, then the exchange whole.
-- **Older exchanges compete by score.** Each of their tool rounds is a round
-  of the fill, scored from the turn's base and lifted by its hits like any
-  other. Their request and answer are the exchange's floor: placed together,
-  with any of its tool rounds, or not at all. So the history is score-ordered,
-  and what remains of any exchange still reads as a complete exchange.
+- **Older exchanges compete by score.** An older exchange's request and
+  answer are one round of the fill, the **pair**, scored from their turns'
+  base and lifted by their hits; a plain question and answer is that pair
+  alone. Each of its tool rounds is a round of its own, scored the same way,
+  and is admitted only with the pair: a tool round that ranks before its pair
+  brings the pair with it and enters only if both fit. So the history is
+  score-ordered, and what remains of any exchange still reads as a complete
+  exchange. A reading's request and answer are not a pair of this kind: they
+  carry nothing without a page, so they come only with its first placed
+  round (§8.1).
 
 ### 8.4 The inherited lineage
 
@@ -754,16 +760,33 @@ the order of dependence.
     /v1/admin/objects/import` (admin, as `/v1/npcs/export` is). The export is
     text, JSON Lines: a header line `{"format": "substrate-objects",
     "version": 1, "daemon": "zend" | "npcd", "taken_at_ms": …}`, then one
-    line per live custom object, `{"object": <CustomObjectPayload>}` with its
-    key, metadata and JSON value as stored, then one line per blob a kept
-    object names, `{"blob": "<sha256 hex>", "bytes_b64": "…"}`. Every live
-    custom object is kept except those under `cluster/`
-    (`projection/replication.rs`), which are the cluster's own state and are
-    rebuilt when the app starts over. The import writes each blob, then each
-    object, under the importing member's node with fresh stamps, so it
-    replicates to the others like any write; a key already live is left as it
-    is and named in the import's answer, with counts of what was written. It
-    runs on one member per app.
+    line per kept custom object, `{"object": <CustomObjectPayload>}` with its
+    key, metadata and JSON value as stored, in the order of their original
+    stamps, then one line per blob a kept object names, `{"blob": "<sha256
+    hex>", "bytes_b64": "…"}`.
+    - **What is kept.** Every live custom object except those whose meaning
+      is a model-derived record, which the move-aside destroys. One list in
+      the code names the left-out prefixes: `cluster/` (the cluster's own
+      state, rebuilt when the app starts over), `recurrent/` (recurrent reply
+      rows, model state), `working_set:` (marks on turns that no longer
+      exist; the locks they rebuild go with the dialogue) and `channels/`
+      (sections npcd submits to a character's conversation, submitted again
+      when the character's conversation is rebuilt). A test walks every
+      custom-object prefix the workspace declares and fails on one that is
+      neither kept nor left out, so a new prefix is classified when it is
+      added. Kept objects that name a conversation, thread, turn or journal
+      by id (`mcp/conversation/`, `mcp/chat/`, `journal/turns/`, MCP threads)
+      keep the reference: a reader already resolves an id with no record
+      behind it as absent, as it does a tombstoned one, and none refuses on
+      it.
+    - **The import** writes each blob, then each object, under the importing
+      member's node with fresh stamps, in the export's order, so whatever is
+      ordered by stamp comes back in its original order and replicates to
+      the others like any write. A key already live is left as it is and
+      named in the import's answer, with counts of what was written. It
+      takes several exports at once — one from each member — and writes the
+      union, the latest original stamp winning per key, so an object a
+      member held that had not reached the others yet is not lost.
 12. **Docs.** This document's §12 rewritten as everything built; §13 removed;
     `docs/zend_working_set.md`, `docs/guidance_layer.md`,
     `docs/shared_model_host.md` and `docs/performance.md` updated to match.
@@ -822,11 +845,18 @@ done before step 3.
    that runs a member build `cargo build --release -p motherd -p web` at that
    commit through `repo_job_start` pinned to its node, so each holds the new
    `target\release\motherd.exe` before anything stops. Builds only; nothing
-   is staged.
-2. **Export.** From one member — the objects replicate, so any member holds
-   them all — save `GET /v1/npcs/export` (the cast) and `GET
-   /v1/admin/objects/export` on zend and on npcd (§13 step 11) to files
-   outside the data folders, and read each back to confirm its line count.
+   is staged. Every member's build must report the same identity — the
+   commit, with no local digest — or the members do not share one build
+   count. Compare them before step 3. A build that carries a local digest
+   names the uncommitted input behind it: an input that is not motherd's
+   (keep's own `keep.yaml`, a machine config) is taken out of motherd's
+   build inputs in this change; one that is goes into the commit or is
+   reverted by whoever owns it. Nothing stops until all match.
+2. **Export.** From every member — the objects replicate, but one not yet
+   carried to the others would be lost from a single export — save `GET
+   /v1/admin/objects/export` on zend and on npcd (§13 step 11), and once
+   `GET /v1/npcs/export` (the cast), to files outside the data folders. Read
+   each back to confirm its line count.
    They hold everything the substrates keep that no model computed:
    accounts, MCP threads, workers and OAuth tokens, journal text, Discord
    links, world state, kept images.
@@ -843,14 +873,19 @@ done before step 3.
    (`keep/stage/motherd.exe`, AGENTS "Manual release"); keep trials it on the
    empty substrates, and the first member admitted sets the app's new model
    lock. Confirm every member reaches `state: ready`.
-7. **Ingest.** Prime the chain; the code readings come back as they are
-   asked for.
-8. **Import.** On one member, `POST /v1/admin/objects/import` to zend and to
-   npcd with the exports' bodies, then `POST /v1/npcs/import` with the
-   cast's; restart motherd through keep once so the characters spawn. Read
-   each import's answer: every key written, none left as it was. A key left
-   as it was means something was written between the start and the import
-   (a sign-in, a thread) and is reported for a decision.
+7. **Import, first.** As soon as the members are ready and before any
+   reading is asked for, on one member, `POST /v1/admin/objects/import` to
+   zend and to npcd with every member's exports, then `POST /v1/npcs/import`
+   with the cast's; restart motherd through keep once so the characters
+   spawn. These are admin HTTP calls to the member's own port, so they need
+   none of the OAuth tokens they restore. Read each import's answer: every
+   key written, none left as it was. A key left as it was means something was
+   written between the start and the import (a sign-in, a thread) and is
+   reported for a decision.
+8. **Ingest.** The priming chain is built at boot, before a member reports
+   `ready` (`zend/src/session.rs`, `prime`), so it is already primed when
+   step 7 runs and writes nothing the export holds. The code readings come
+   back as they are asked for, after the import.
 9. **Check.** On each card, a dialogue places its pins, carves a reading by
    round and stays on rung 1; every character is back with its owner; Claude's
    Zen connector answers without signing in again.
