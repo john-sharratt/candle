@@ -100,7 +100,7 @@ impl MappedBlock {
             host: raw as *mut u32,
             dev: dev_ptr,
             words,
-            ordinal: dev.ordinal(),
+            ordinal: ordinal_of(dev),
         })
     }
 
@@ -168,6 +168,11 @@ static POOL: Mutex<Vec<MappedBlock>> = Mutex::new(Vec::new());
 /// Tokens name holders; zero is never one, so a fresh block matches none.
 static NEXT_TOKEN: AtomicU32 = AtomicU32::new(1);
 
+/// The device a block is mapped into: its context's ordinal.
+fn ordinal_of(dev: &CudaDevice) -> usize {
+    dev.cuda_stream().context().ordinal()
+}
+
 /// A fresh holder token.
 pub fn next_token() -> u32 {
     loop {
@@ -189,7 +194,7 @@ pub fn acquire(dev: &CudaDevice, words: usize) -> Result<MappedBlock> {
         let best = pool
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.ordinal == dev.ordinal() && b.words >= want)
+            .filter(|(_, b)| b.ordinal == ordinal_of(dev) && b.words >= want)
             .min_by_key(|(_, b)| b.words)
             .map(|(i, _)| i);
         if let Some(i) = best {
