@@ -32,6 +32,13 @@
 // (`qsa_select::MAX_PINS`).
 #define QSA_MAX_PINS 4
 
+// A selection row's cut record (`docs/hit_driven_projection.md` §6.2–§6.3),
+// QSA_CUT_WORDS u32 a row: the lowest score the ranking kept, as its f32 bits —
+// QSA_NO_CUT for a dense row or one that ranked nothing — then the query's
+// position, its candidate blocks and the cells of its own block.
+#define QSA_CUT_WORDS 4
+#define QSA_NO_CUT 0x7FC00000u  // a quiet NaN: no score compares above it
+
 // The per-launch selection view. `stride` is the row pitch of `entries` in
 // u32s; `ratio` the layer's compression ratio (cells per block).
 struct QsaSel {

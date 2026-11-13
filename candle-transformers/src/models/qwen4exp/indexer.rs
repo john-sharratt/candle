@@ -73,7 +73,7 @@ use candle::wave_provenance::WaveTicket;
 use candle_kernels::simple::f32_rows_matmul::F32_ROWS_MATMUL_MAX_ROWS;
 #[cfg(feature = "cuda")]
 use candle_kernels::simple::qsa_topk::{qsa_topk_split_parts, SPLIT_KEYS};
-use candle_kernels::simple::qsa_topk::{MAX_ENTRIES, MAX_KEEP};
+use candle_kernels::simple::qsa_topk::{CUT_WORDS, MAX_ENTRIES, MAX_KEEP, NO_CUT};
 use candle_nn::kv_cache::{
     arena_regions, plan_slot_moves, relocate_tensor, ArenaSlot, SlotTenant,
     PREFILL_KV_STAGE_MIN_Q_LEN,
@@ -1900,6 +1900,11 @@ pub fn selection_stride(
 pub struct SelectionTable {
     entries: Tensor,
     cnt: Tensor,
+    /// `[rows, CUT_WORDS]` U32: each row's cut record — the lowest score its
+    /// ranking kept, its position, candidates and tail cells — what the
+    /// shadow scan keeps of a query (`docs/hit_driven_projection.md` §6.3).
+    /// Every row is written by the selection kernel.
+    cuts: Tensor,
     stride: usize,
     // The kernel's union buffer, in entries: the gathered bound rounded up to
     // the power of two its bitonic sort runs over.
@@ -1983,6 +1988,7 @@ impl SelectionTable {
         Ok(Self {
             entries: wave_empty_ticketed((rows, stride), DType::U32, device, ticket)?,
             cnt: wave_empty_ticketed((rows,), DType::U32, device, ticket)?,
+            cuts: wave_empty_ticketed((rows, CUT_WORDS), DType::U32, device, ticket)?,
             stride,
             gather: max_gathered_for(top_k, ratio, cand_max, strata).next_power_of_two(),
             split_keys: split_scratch(rows, ratio, top_k, cand_max, strata, device, ticket)?,
@@ -2029,9 +2035,26 @@ impl SelectionTable {
         Ok(())
     }
 
-    /// The selection, as the attention kernels take it.
-    pub fn into_selection(self) -> Result<QsaSelection> {
-        QsaSelection::new(self.entries, self.cnt, self.ratio)
+    /// The selection, as the attention kernels take it, and the rows' cut
+    /// records.
+    pub fn into_selection(self) -> Result<(QsaSelection, Tensor)> {
+        Ok((
+            QsaSelection::new(self.entries, self.cnt, self.ratio)?,
+            self.cuts,
+        ))
+    }
+
+    /// Read `row`'s cut record back: the lowest score kept (`None` for a row
+    /// that ranked nothing), and its position, candidates and tail cells. A
+    /// test path.
+    pub fn cut_to_host(&self, row: usize) -> Result<(Option<f32>, [u32; 3])> {
+        let w = self
+            .cuts
+            .narrow(0, row, 1)?
+            .flatten_all()?
+            .to_vec1::<u32>()?;
+        let cut = (w[0] != NO_CUT).then(|| f32::from_bits(w[0]));
+        Ok((cut, [w[1], w[2], w[3]]))
     }
 
     /// Run the selection kernel over one tile of scores, writing rows
@@ -2135,6 +2158,12 @@ impl SelectionTable {
             _ => candle::bail!("qsa selection: cnt must be CUDA"),
         }
         .slice(n_l.start_offset()..);
+        let (u_s, u_l) = self.cuts.storage_and_layout();
+        let u_slice = match &*u_s {
+            candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle::bail!("qsa selection: cuts must be CUDA"),
+        }
+        .slice(u_l.start_offset()..);
         let k_store = self.split_keys.as_ref().map(|t| t.storage_and_layout());
         let k_slice = match &k_store {
             Some((k_s, k_l)) => Some(
@@ -2156,6 +2185,7 @@ impl SelectionTable {
         let pin_ptr = (c_ptr as *const u32).wrapping_add(rows * 4);
         let (e_ptr, _eg) = e_slice.device_ptr(&stream);
         let (n_ptr, _ng) = n_slice.device_ptr(&stream);
+        let (u_ptr, _ug) = u_slice.device_ptr(&stream);
         // Null when the table holds no scratch: the kernel then runs the single
         // pass.
         let k_dev = k_slice.as_ref().map(|k| k.device_ptr(&stream));
@@ -2167,6 +2197,7 @@ impl SelectionTable {
         // the offsets go on the pointers rather than through a narrowed view.
         let e_ptr = (e_ptr as *mut u32).wrapping_add(row_base * self.stride);
         let n_ptr = (n_ptr as *mut u32).wrapping_add(row_base);
+        let u_ptr = (u_ptr as *mut u32).wrapping_add(row_base * CUT_WORDS);
         let s = &self.strata;
         candle::set_kernel_breadcrumb("run_qsa_topk_entries", file!(), line!());
         unsafe {
@@ -2181,6 +2212,7 @@ impl SelectionTable {
                 e_ptr,
                 self.stride as i32,
                 n_ptr,
+                u_ptr,
                 ratio as i32,
                 top_k as i32,
                 s.window_blocks as i32,
@@ -2672,6 +2704,18 @@ pub fn selection_engages(max_visible: usize, cfg: &IndexerConfig, ratio: usize) 
     ratio > 0 && max_visible > selected_width(cfg.top_k, ratio)
 }
 
+/// What a layer's selection leaves of its query rows beside the table the
+/// attention reads: their rotated queries and their cut records — what the
+/// hit count keeps of a stride for the shadow scan
+/// (`docs/hit_driven_projection.md` §6.3). Both live on the layer's span.
+#[derive(Debug, Clone)]
+pub struct SelectedRows {
+    /// `[rows, n_heads, head_dim]` F32, rotated at each row's own position.
+    pub q: Tensor,
+    /// `[rows, CUT_WORDS]` U32 ([`SelectionTable::cut_to_host`]).
+    pub cuts: Tensor,
+}
+
 /// One full-attention layer's QSA work: append every sequence's index keys,
 /// then build the wave's selection table if any row is past the budget.
 ///
@@ -2710,7 +2754,7 @@ pub fn select_layer(
     // filled up partway through the sweep when they were put there instead.
     // `None` falls back to an ordinary upload.
     ticket: Option<WaveTicket>,
-) -> Result<Option<QsaSelection>> {
+) -> Result<Option<(QsaSelection, SelectedRows)>> {
     if compress_ratio == 0 {
         return Ok(None);
     }
@@ -2942,7 +2986,10 @@ pub fn select_layer(
     // in this wave holds an injected prefix. Every other wave passes null and
     // the kernels keep their inline `pos / ratio`.
     let sel = table.map(SelectionTable::into_selection).transpose()?;
-    let Some(sel) = sel else { return Ok(None) };
+    let (Some((sel, cuts)), Some(q)) = (sel, q_all) else {
+        return Ok(None);
+    };
+    let rows = SelectedRows { q, cuts };
     let needs_pages = spans.iter().any(|s| {
         idx_map
             .get(&s.seq)
@@ -2951,7 +2998,7 @@ pub fn select_layer(
     });
     if !needs_pages {
         log_bulk_selection(total_rows, widest, 0);
-        return Ok(Some(sel));
+        return Ok(Some((sel, rows)));
     }
     let mut pages: Vec<u32> = Vec::new();
     let mut win: Vec<u32> = vec![0; total_rows * 2];
@@ -2974,7 +3021,7 @@ pub fn select_layer(
     log_bulk_selection(total_rows, widest, n_pages);
     let pages_t = wave_from_vec_ticketed(pages, (n_pages, 2), device, ticket)?;
     let win_t = wave_from_vec_ticketed(win, (total_rows, 2), device, ticket)?;
-    Ok(Some(sel.with_pages(pages_t, win_t)?))
+    Ok(Some((sel.with_pages(pages_t, win_t)?, rows)))
 }
 
 // Pinned ranges are lists of ranges, and a list of one is the common case.
@@ -3758,11 +3805,39 @@ mod tests {
                 &mut want,
             );
             let got = table.row_to_host(r)?;
+            let (cut, geometry) = table.cut_to_host(r)?;
+            assert_eq!(
+                geometry,
+                [p as u32, cand[r], tail[r]],
+                "row {r}'s cut record carries its geometry"
+            );
             match sel {
-                RowSelection::Dense => assert!(got.is_none(), "row {r} should be dense"),
+                RowSelection::Dense => {
+                    assert!(got.is_none(), "row {r} should be dense");
+                    assert_eq!(cut, None, "a dense row has no cut");
+                }
                 RowSelection::Entries(_) => {
                     let got = got.unwrap_or_else(|| panic!("row {r} came back dense"));
                     assert_eq!(got, want, "row {r} (qpos {p}) selection differs");
+                    // The cut is the lowest score any window ranked in: every
+                    // selected block but the pinned ones, the forced span and
+                    // the query's own tail block.
+                    let c = cand[r] as usize;
+                    let forced_lo = match strata.recent {
+                        Recent::Forced => c.saturating_sub(strata.recent_blocks),
+                        _ => c,
+                    };
+                    let want_cut = want
+                        .iter()
+                        .map(|&e| entry_block(e))
+                        .filter(|&b| b < forced_lo && !pinned.iter().any(|g| g.contains(&b)))
+                        .map(|b| row_scores[b])
+                        .reduce(f32::min);
+                    assert_eq!(
+                        cut.map(f32::to_bits),
+                        want_cut.map(f32::to_bits),
+                        "row {r} (qpos {p}) cut differs"
+                    );
                 }
             }
         }
