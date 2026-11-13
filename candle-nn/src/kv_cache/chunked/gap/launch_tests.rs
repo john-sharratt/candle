@@ -20,7 +20,7 @@ use super::super::gid_pool::ChunkGid;
 use super::super::gpu_test_lock::{gpu_serial, GpuGuard};
 use super::super::head_gids::ChunkBands;
 use super::super::selection_batches::SELECTION_BUDGET_BYTES;
-use super::super::size_class::{payload_bytes, SizeClass};
+use super::super::size_class::{class_for_format, payload_bytes, SizeClass};
 use super::super::ChunkedKvBacking;
 use super::codes::CodeTables;
 use super::demand::{count_bands, gap_demand, PerClass};
@@ -204,7 +204,7 @@ fn jobs(srcs: &[SealedSequence]) -> Vec<GapJob> {
 }
 
 /// The classes the policy's candidates and overrides reach.
-fn reachable(backing: &ChunkedKvBacking, policy: &CompressionPolicy) -> PerClass<bool> {
+pub(super) fn reachable(backing: &ChunkedKvBacking, policy: &CompressionPolicy) -> PerClass<bool> {
     let sel = policy_selection(policy).unwrap();
     let mut formats: Vec<_> = sel
         .k
@@ -624,6 +624,91 @@ fn a_gap_cycle_returns_every_unused_slot_and_a_retry_places_every_deferred_block
     let used: usize = rows2.iter().map(|r| row_bands(r, &codes).len()).sum();
     assert_eq!(used, exact.iter().sum::<usize>());
     drop(installed);
+}
+
+/// A gap whose lease covers its table, through the catch-up: every block is
+/// installed, every index the summary names is a distinct slot of the lease,
+/// the summary's demand is the table's band count, and only the surplus goes
+/// back — with no override, and with each side under a uniform override,
+/// whose bands all claim from the override's class.
+#[test]
+fn an_ample_gap_installs_every_block_and_returns_only_the_surplus() {
+    let Some((device, cuda, _gpu)) = cuda() else {
+        return;
+    };
+    for (k, v) in [
+        (None, None),
+        (Some(QuantFormat::Q8_0), None),
+        (None, Some(QuantFormat::Q4_0)),
+    ] {
+        let mut policy = CompressionPolicy::new(5);
+        policy.override_k_quant = k;
+        policy.override_v_quant = v;
+        let (backings, srcs) = setup(&device, &policy);
+        let jobs = jobs(&srcs);
+        let codes = CodeTables::new(backings[0].elems_per_chunk()).unwrap();
+        let bands = jobs.len() * N_KV_HEAD * 2 * N_PALETTE;
+        let mut lease = lease_for(&backings[0], &policy, |_| bands);
+        let held = lease.held();
+        let groups = [GapGroup {
+            policy: &policy,
+            jobs: 0..jobs.len(),
+        }];
+        let (rows, deferred, errored) =
+            run_gap(&cuda, &device, &backings, &jobs, &groups, &stack(&lease));
+        assert!(!errored && deferred.iter().all(|&d| !d), "{k:?} {v:?}");
+
+        let demand = count_bands(&rows, |f| codes.class_of_fmt(f)).unwrap();
+        assert_eq!(demand.iter().sum::<usize>(), bands, "{k:?} {v:?}");
+        let mut by_class = vec![Vec::new(); SizeClass::COUNT];
+        for row in &rows {
+            for (class, idx) in row_bands(row, &codes) {
+                by_class[class].push(idx);
+            }
+        }
+        for (c, idx) in by_class.iter().enumerate() {
+            assert_eq!(idx.len(), demand[c], "{k:?} {v:?} class {c}");
+            let mut sorted = idx.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (0..idx.len() as u32).collect::<Vec<_>>(),
+                "{k:?} {v:?} class {c}: the first slots of the run, each once"
+            );
+        }
+        // Under an override, every band of that side claims its format's class.
+        let side_class = |q: QuantFormat| {
+            class_for_format(KvFormat::Quantized(q), backings[0].elems_per_chunk())
+                .unwrap()
+                .index()
+        };
+        for row in &rows {
+            if let Some(q) = k {
+                for &f in &row.k_fmt {
+                    assert_eq!(codes.class_of_fmt(f), Some(side_class(q)));
+                }
+            }
+            if let Some(q) = v {
+                for &f in &row.v_fmt {
+                    assert_eq!(codes.class_of_fmt(f), Some(side_class(q)));
+                }
+            }
+        }
+
+        let mut installed = Vec::new();
+        for (c, idx) in by_class.iter().enumerate() {
+            installed.extend(lease.take(c, idx).unwrap());
+        }
+        let back = lease.release();
+        for c in 0..SizeClass::COUNT {
+            assert_eq!(
+                back[c].len(),
+                held[c] - demand[c],
+                "{k:?} {v:?} class {c}: only the surplus goes back"
+            );
+        }
+        assert_eq!(installed.len(), bands);
+    }
 }
 
 /// One gap's fixture: the backings, the jobs, an ample lease and its stack.

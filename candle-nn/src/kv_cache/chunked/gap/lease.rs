@@ -229,6 +229,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nothing_can_be_taken_from_a_released_lease() {
+        let mut l = lease(&[(0, &[1, 2])]);
+        drop(l.release());
+        assert!(l.take(0, &[0]).is_err());
+        assert!(l.take(0, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn slots_added_after_a_take_follow_the_ones_left() {
+        let mut l = lease(&[(2, &[1, 2, 3])]);
+        l.take(2, &[0]).unwrap();
+        l.add(2, [(9, 0x900)]);
+        let img = l.stack_image().unwrap();
+        assert_eq!(img.addrs, vec![0x200, 0x300, 0x900]);
+        // Index 2 is now the added slot.
+        assert_eq!(l.take(2, &[2]).unwrap(), vec![9]);
+    }
+
+    #[test]
+    fn a_lease_refilled_after_its_release_starts_a_fresh_stack() {
+        let mut l = lease(&[(0, &[1]), (4, &[2, 3])]);
+        drop(l.release());
+        l.add(4, [(7, 0x700)]);
+        let img = l.stack_image().unwrap();
+        assert_eq!(img.addrs, vec![0x700]);
+        assert_eq!((img.off[4], img.len[4]), (0, 1));
+        assert_eq!(img.len[0], 0);
+    }
+
     /// Owning handles drop back to their pool when released: a handle that
     /// counts its drops shows each slot dropped once, after the release.
     #[test]

@@ -136,6 +136,118 @@ fn each_lease_takes_the_lowest_free_places() {
     drop(kept);
 }
 
+/// The gids of every slot `lease` holds in `class`, taken out in stack order.
+fn take_all(lease: &mut Lease<ChunkGid>, class: usize) -> Vec<ChunkGid> {
+    let n = lease.held()[class] as u32;
+    lease.take(class, &(0..n).collect::<Vec<_>>()).unwrap()
+}
+
+/// Each gid's address as the convert would resolve it.
+fn band_addrs(b: &ChunkedKvBacking, gids: &[ChunkGid]) -> Vec<u64> {
+    b.inner
+        .storage
+        .read(|s| {
+            gids.iter()
+                .map(|g| band_ptr(s, g, "test"))
+                .collect::<candle::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .unwrap()
+}
+
+/// A demand wider than one arena fills the pool's free slots, stamps fresh
+/// regions for the rest, and resolves every address across the arena
+/// changes.
+#[test]
+fn a_demand_wider_than_an_arena_spans_arenas_at_the_right_addresses() {
+    let Some((device, _cuda, _gpu)) = cuda() else {
+        return;
+    };
+    let b = backing(&device, &CompressionPolicy::new(5));
+    let (q8, _, _) = two_classes(&b, 0, 0);
+    let per_arena = key(q8).chunks();
+    let mut demand = [0; SizeClass::COUNT];
+    demand[q8] = 3 * per_arena + 7;
+    let (mut lease, short) = lease_demand(&b, &demand).unwrap();
+    assert_eq!(short, [0; SizeClass::COUNT]);
+    let image = lease.stack_image().unwrap();
+    let gids = take_all(&mut lease, q8);
+    let mut arenas: Vec<usize> = gids.iter().map(ChunkGid::arena_idx).collect();
+    arenas.dedup();
+    assert!(arenas.len() >= 4, "{} arenas", arenas.len());
+    assert_eq!(band_addrs(&b, &gids), image.addrs);
+    let mut distinct = image.addrs.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), demand[q8], "no slot leased twice");
+}
+
+/// Every class the deepest level reaches, leased at once: each run in its
+/// class, each address its gid's.
+#[test]
+fn every_class_a_level_reaches_is_leased_in_one_call() {
+    let Some((device, _cuda, _gpu)) = cuda() else {
+        return;
+    };
+    let policy = CompressionPolicy::new(10);
+    let b = backing(&device, &policy);
+    let reach = super::launch_tests::reachable(&b, &policy);
+    let demand: PerClass<usize> = std::array::from_fn(|c| if reach[c] { 5 + c } else { 0 });
+    assert!(reach.iter().filter(|&&r| r).count() > 2);
+    let (mut lease, short) = lease_demand(&b, &demand).unwrap();
+    assert_eq!(short, [0; SizeClass::COUNT]);
+    assert_eq!(lease.held(), demand);
+    let image = lease.stack_image().unwrap();
+    for c in (0..SizeClass::COUNT).filter(|&c| reach[c]) {
+        let (off, len) = (image.off[c] as usize, image.len[c] as usize);
+        let gids = take_all(&mut lease, c);
+        assert_eq!(
+            band_addrs(&b, &gids),
+            image.addrs[off..off + len],
+            "class {c}"
+        );
+        for g in &gids {
+            let arena_class = b
+                .inner
+                .storage
+                .read(|s| s.arena_key(g.arena_idx()).map(|k| k.class.index()))
+                .unwrap();
+            assert_eq!(arena_class, Some(c), "a slot of class {c} in its own class");
+        }
+    }
+}
+
+/// Lease and release, gap after gap: the pools end where they started, so the
+/// cycle leaks no slot.
+#[test]
+fn repeated_leases_and_releases_leak_nothing() {
+    let Some((device, _cuda, _gpu)) = cuda() else {
+        return;
+    };
+    let b = backing(&device, &CompressionPolicy::new(5));
+    let (q8, q4, demand) = two_classes(&b, 90, 40);
+    // Warm once so any arena the demand needs exists before the baseline.
+    drop(lease_demand(&b, &demand).unwrap().0.release());
+    let base = [q8, q4].map(|c| b.inner.pool.free_slots(key(c)));
+    for round in 0..5 {
+        let (mut lease, _) = lease_demand(&b, &demand).unwrap();
+        // An installed block keeps a few slots for the round, as the catch-up's take does.
+        let kept = lease.take(q8, &[0, 1, 2]).unwrap();
+        drop(lease.release());
+        assert_eq!(
+            b.inner.pool.free_slots(key(q8)),
+            base[0] - 3,
+            "round {round}"
+        );
+        drop(kept);
+        assert_eq!(
+            [q8, q4].map(|c| b.inner.pool.free_slots(key(c))),
+            base,
+            "round {round}"
+        );
+    }
+}
+
 /// A slot freed low in the arena — a truncate, an eviction — is the next
 /// lease's first, ahead of anything higher.
 #[test]

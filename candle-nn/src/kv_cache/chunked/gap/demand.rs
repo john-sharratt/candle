@@ -243,6 +243,39 @@ mod tests {
     }
 
     #[test]
+    fn a_share_recorded_for_a_class_the_level_no_longer_reaches_leases_nothing_new() {
+        // Shares recorded under a deeper level; the level now reaches only 0.
+        let mut shares = PeakShares::default();
+        shares.record(GapKind::Decode, &claims(&[(0, 1), (6, 3)]));
+        let peak = shares.peak(GapKind::Decode).unwrap();
+        let d = new_block_demand(40, Some(&peak), &only(&[0]));
+        assert_eq!((d[0], d[6]), (10, 0));
+    }
+
+    #[test]
+    fn peaks_over_several_gaps_may_sum_past_one() {
+        // Each class's peak comes from a different gap: the lease covers either
+        // split, at the cost of slots returned within the gap.
+        let mut shares = PeakShares::default();
+        shares.record(GapKind::Decode, &claims(&[(0, 9), (1, 1)]));
+        shares.record(GapKind::Decode, &claims(&[(0, 1), (1, 9)]));
+        let peak = shares.peak(GapKind::Decode).unwrap();
+        let d = new_block_demand(100, Some(&peak), &only(&[0, 1]));
+        assert_eq!((d[0], d[1]), (90, 90));
+    }
+
+    #[test]
+    fn prefill_and_decode_windows_fill_and_forget_independently() {
+        let mut shares = PeakShares::default();
+        shares.record(GapKind::Prefill, &claims(&[(2, 1)]));
+        for _ in 0..SHARE_WINDOW + 5 {
+            shares.record(GapKind::Decode, &claims(&[(3, 1)]));
+        }
+        assert_eq!(shares.peak(GapKind::Prefill).unwrap()[2], 1.0);
+        assert_eq!(shares.peak(GapKind::Decode).unwrap()[2], 0.0);
+    }
+
+    #[test]
     fn the_peak_is_the_largest_share_in_the_window_per_class() {
         let mut shares = PeakShares::default();
         shares.record(GapKind::Prefill, &claims(&[(0, 1), (1, 3)]));
