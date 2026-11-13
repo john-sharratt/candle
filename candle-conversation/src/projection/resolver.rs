@@ -1466,12 +1466,31 @@ impl Conversation {
                 .collect();
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let nonzero = finals.iter().filter(|&&s| s != 0.0).count();
-                let top = finals
+                // The strongest members with every figure that made them: the
+                // tail scan's raw score and its normalized reading, the question
+                // window's normalized reading, and the fused final. Which lens
+                // carried a member is the first question a wrong pick asks.
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| finals[b].total_cmp(&finals[a]));
+                let lens = |v: &Option<Vec<(ChildKey, f32)>>, i: usize| {
+                    v.as_ref().and_then(|x| x.get(i)).map_or(0.0, |(_, s)| *s)
+                };
+                let top = order
                     .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, s)| format!("{}={:.1}", coll.sections[i].name, s))
-                    .unwrap_or_default();
+                    .take(6)
+                    .map(|&i| {
+                        format!(
+                            "{}={:.0} (tail raw {:.1} → {:.0}, q raw {:.1} → {:.0})",
+                            coll.sections[i].name,
+                            finals[i],
+                            fresh[i],
+                            normed.get(i).map_or(0.0, |(_, s)| *s),
+                            fresh_q.as_ref().and_then(|q| q.get(i)).copied().unwrap_or(0.0),
+                            lens(&normed_q, i),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 tracing::trace!(
                     target: "candle_conversation::belief",
                     collection = %coll.name,
