@@ -1485,7 +1485,11 @@ impl Conversation {
                             finals[i],
                             fresh[i],
                             normed.get(i).map_or(0.0, |(_, s)| *s),
-                            fresh_q.as_ref().and_then(|q| q.get(i)).copied().unwrap_or(0.0),
+                            fresh_q
+                                .as_ref()
+                                .and_then(|q| q.get(i))
+                                .copied()
+                                .unwrap_or(0.0),
                             lens(&normed_q, i),
                         )
                     })
