@@ -31,6 +31,9 @@
 //!                         (directory target)
 //!   retire-faces          WRITES: tombstone every face and run maintenance to
 //!                         reclaim them (directory target, daemon stopped)
+//!   export-kept --daemon <zend|npcd> --out <file>
+//!                         the kept custom objects as the daemon's export,
+//!                         read-only under no model (directory target)
 //! ```
 //!
 //! `<stream-id>` accepts decimal or `0x`-prefixed hex (as printed by
@@ -51,6 +54,8 @@
 mod completeness;
 #[path = "substrate_inspect/faces.rs"]
 mod faces;
+#[path = "substrate_inspect/kept.rs"]
+mod kept;
 #[path = "substrate_inspect/liveness.rs"]
 mod liveness;
 
@@ -682,6 +687,18 @@ enum Cmd {
     /// recurrent snapshot per face. The daemon must be stopped. Directory
     /// target only.
     RetireFaces,
+    /// The store's kept custom objects as `daemon`'s export, the lines `GET
+    /// /v1/substrate/<daemon>/objects/export` answers — read-only, under no
+    /// model, so a store its new model key refuses still exports
+    /// (`docs/hit_driven_projection.md` §13.4). Directory target only.
+    ExportKept {
+        /// The daemon the export names: `zend` or `npcd`.
+        #[arg(long)]
+        daemon: String,
+        /// The file the export is written to.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Export a conversation's projection points + candidate/target galleries
     /// as an offline selection-replay fixture
     /// (`docs/provenance_adaptive_projection.md` §11): per dialogue turn the raw
@@ -1232,6 +1249,9 @@ fn main() -> Result<()> {
                 .context("the substrate directory has no parent workspace")?;
             return faces::retire_faces(workspace);
         }
+        if let Cmd::ExportKept { daemon, out } = &cli.cmd {
+            return kept::export_kept(&target, daemon, out);
+        }
         if let Cmd::Conversations { filter, limit } = &cli.cmd {
             return segment_conversations(&segs, filter, *limit);
         }
@@ -1314,6 +1334,9 @@ fn main() -> Result<()> {
         }
         Cmd::RetireFaces => {
             anyhow::bail!("retire-faces requires the segmented `substrate` DIRECTORY target")
+        }
+        Cmd::ExportKept { .. } => {
+            anyhow::bail!("export-kept requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Couplings { .. } => {
             anyhow::bail!("couplings requires the segmented `substrate` DIRECTORY target")
