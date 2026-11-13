@@ -1577,8 +1577,27 @@ impl BackingInner {
         key: super::arena::ArenaKey,
         n: usize,
     ) -> Result<Vec<super::gid_pool::ChunkGid>> {
+        let (out, stopped) = self.alloc_chunks_for_key_upto(key, n);
+        match stopped {
+            // What was claimed goes back to the pool as `out` drops.
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
+    /// Up to `n` slots of `key`, lowest place first, and why it stopped short
+    /// if it did: the pool's free slots first, then fresh regions, widening the
+    /// class when it cannot get one (as [`Self::alloc_chunks_for_key_bulk`]).
+    /// A refusal ends the claim and keeps what was claimed — what the gap's
+    /// lease wants, since a class short of ground defers blocks rather than
+    /// fail the gap.
+    pub(super) fn alloc_chunks_for_key_upto(
+        &self,
+        key: super::arena::ArenaKey,
+        n: usize,
+    ) -> (Vec<super::gid_pool::ChunkGid>, Option<candle::Error>) {
         if n == 0 {
-            return Ok(Vec::new());
+            return (Vec::new(), None);
         }
         let mut out: Vec<super::gid_pool::ChunkGid> = Vec::with_capacity(n);
         let mut key = key;
@@ -1586,24 +1605,32 @@ impl BackingInner {
         // Each placement either feeds the batch or is lost that way; a run of losses is
         // contention, not progress, and is not retried forever.
         let mut fruitless = 0usize;
+        let mut stopped = None;
         while out.len() < n {
             let remaining = n - out.len();
             let mut batch = self.pool.allocate_n_for(key, remaining);
             if batch.is_empty() {
                 if fruitless == STAMP_ATTEMPTS {
-                    candle::bail!(
+                    stopped = Some(candle::Error::Msg(format!(
                         "alloc_chunks_for_key_bulk: {STAMP_ATTEMPTS} placements for {key:?} \
                          in a row were taken by other claimers before this batch could \
                          claim from them ({} of {n} allocated)",
                         out.len(),
-                    );
+                    )));
+                    break;
                 }
                 // Pool exhausted — stamp a fresh region, widening if this
                 // class cannot get one. Later passes then fill from the class
                 // that could, so a partially-promoted batch is normal. The batch
                 // claims while the stamped arena's creation window is open, and
                 // closes it after — see `stamp_region_promoting`.
-                let (placed, arena_idx) = self.stamp_region_promoting(key)?;
+                let (placed, arena_idx) = match self.stamp_region_promoting(key) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        stopped = Some(e);
+                        break;
+                    }
+                };
                 key = placed;
                 batch = self.pool.allocate_n_for(key, remaining);
                 self.pool.finish_creation(key, arena_idx);
@@ -1618,11 +1645,20 @@ impl BackingInner {
             // path because the arena already exists.
             let mut seen: ahash::HashSet<usize> =
                 ahash::HashSet::with_capacity_and_hasher(4, ahash::RandomState::new());
+            let mut missing = None;
             for gid in &batch {
                 let ai = gid.arena_idx();
                 if seen.insert(ai) {
-                    self.ensure_arena_exists(ai, key)?;
+                    if let Err(e) = self.ensure_arena_exists(ai, key) {
+                        missing = Some(e);
+                        break;
+                    }
                 }
+            }
+            if let Some(e) = missing {
+                // The batch's slots go back as it drops; what came before stands.
+                stopped = Some(e);
+                break;
             }
             out.extend(batch);
         }
@@ -1631,8 +1667,10 @@ impl BackingInner {
         // this batch run again" has no cheap probe — but "is the class bone dry"
         // does, and a dry class is the case that costs the sealer a deferred
         // pass.
-        self.replenish_if_nearly_dry(key, 1);
-        Ok(out)
+        if stopped.is_none() {
+            self.replenish_if_nearly_dry(key, 1);
+        }
+        (out, stopped)
     }
 
     /// Keep the sealer one arena ahead of its demand: if `key`'s class could

@@ -2,13 +2,18 @@
 //!
 //! The scheduler thread compresses the K/V a forward made in the gap before the
 //! next one, on the compute stream: the host takes each sequence's completed
-//! blocks (`table`), leases destination slots per size class (`lease`), and the
-//! device claims among them by select code (`codes`) and converts in place.
+//! blocks (`table`), sizes the gap's demand per size class from the summaries
+//! (`demand`), leases exactly that from the pools for the one gap (`lease`,
+//! `lease_alloc`), and the device claims among the leased slots by select code
+//! (`codes`) and converts in place.
 
-// `launch`, `lease` and `summary` are reached from their tests alone, so the
-// dead-code lint is allowed over them.
+// `codes`, `demand`, `launch`, `lease`, `lease_alloc` and `summary` are reached
+// from their tests alone, so the dead-code lint is allowed over them.
 #[cfg(feature = "cuda")]
+#[allow(dead_code)]
 mod codes;
+#[allow(dead_code)]
+mod demand;
 #[cfg(feature = "cuda")]
 #[allow(dead_code)]
 mod launch;
@@ -16,6 +21,11 @@ mod launch;
 mod launch_tests;
 #[allow(dead_code)]
 mod lease;
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+mod lease_alloc;
+#[cfg(all(test, feature = "cuda"))]
+mod lease_alloc_tests;
 #[allow(dead_code)]
 mod summary;
 mod table;

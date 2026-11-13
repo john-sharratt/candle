@@ -117,7 +117,8 @@ A gap does these things, in this order:
 3. The arena creation and the compaction the gap already does
    (`scheduler/run.rs`), with this gap's demand set aside as ground, so that
    nothing is released that the lease would grow straight back.
-4. **Lease** (§3.2): allocate the demand from the pools, lowest place first.
+4. **Lease** (§3.2): allocate the demand from the pools, the lowest-placed
+   arena first.
 5. **Quantize** (§3.1–§3.4), if no gap is outstanding and there are blocks to
    take.
 
@@ -187,7 +188,8 @@ chooses among them.**
   writes the destination records, and the completion word.
 - **A lease lives for one gap.** Each gap the host allocates a lease for that
   gap's demand alone: free slots claimed from each class's arenas
-  (`ChunkGidPool`, lowest place first), held as `ChunkGid`s on the host, and
+  (`ChunkGidPool`: the lowest-placed arena with a free slot first, and within
+  an arena its own free-slot order), held as `ChunkGid`s on the host, and
   handed to the device as a **slot stack** of slot addresses, one run per
   class, built from the slots just allocated and uploaded with the gap's other
   inputs. The stack is about one eight-byte entry per band of this gap — some
@@ -195,7 +197,7 @@ chooses among them.**
   hundreds of bytes per band the convert moves. At the next catch-up every slot
   the gap did not install goes back to its pool, so no lease stands between
   gaps: compaction and the empty sweep see every free slot, the next lease is
-  packed lowest place first into the holes that truncates, evictions and freed
+  packed into the lowest arenas first, into the holes that truncates, evictions and freed
   natives opened, and the addresses on the device are never older than the gap
   that reads them. The host is the only owner of a leased slot; the device is
   told addresses and reports, through the summary, which of them it used.
@@ -256,7 +258,9 @@ chooses among them.**
 - **Ground, not slots, is what is kept.** Compaction and the empty sweep run
   with the gap's demand per class set aside, so an arena the lease is about to
   fill is not released and grown again within the same gap. Which slots fill
-  that ground is decided fresh each gap, lowest place first.
+  that ground is decided fresh each gap, the lowest-placed arena first: packing
+  is by arena, because an arena is released only when every slot in it is
+  free.
 
 ### 3.3 Convert
 

@@ -13,16 +13,20 @@ use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{CudaDevice, DType, Device, Tensor};
 use half::f16;
 
-use super::super::compress::{band_ptr, policy_selection, quantize_layers_deferred_within};
+use super::super::arena::ArenaKey;
+use super::super::compress::{policy_selection, quantize_layers_deferred_within};
 use super::super::compression_policy::CompressionPolicy;
 use super::super::gid_pool::ChunkGid;
 use super::super::gpu_test_lock::{gpu_serial, GpuGuard};
 use super::super::head_gids::ChunkBands;
 use super::super::selection_batches::SELECTION_BUDGET_BYTES;
-use super::super::size_class::payload_bytes;
+use super::super::size_class::{payload_bytes, SizeClass};
 use super::super::ChunkedKvBacking;
+use super::codes::CodeTables;
+use super::demand::{count_bands, gap_demand, PerClass};
 use super::launch::{GapDevice, GapGroup, GapJob};
 use super::lease::{Lease, StackImage};
+use super::lease_alloc::lease_demand;
 use super::summary::{completion_word, HeadRow};
 use crate::kv_cache::arena_table::{ArenaLocation, N_PALETTE};
 use crate::kv_cache::{
@@ -36,7 +40,7 @@ const LAYERS: usize = 3;
 /// Three full chunks a layer.
 const TOKENS: usize = 96;
 
-fn cuda() -> Option<(Device, CudaDevice, GpuGuard)> {
+pub(super) fn cuda() -> Option<(Device, CudaDevice, GpuGuard)> {
     match Device::cuda_if_available(0) {
         Ok(d @ Device::Cuda(_)) => {
             let Device::Cuda(c) = &d else { unreachable!() };
@@ -47,7 +51,7 @@ fn cuda() -> Option<(Device, CudaDevice, GpuGuard)> {
     }
 }
 
-fn backing(device: &Device, policy: &CompressionPolicy) -> ChunkedKvBacking {
+pub(super) fn backing(device: &Device, policy: &CompressionPolicy) -> ChunkedKvBacking {
     let b = ChunkedKvBacking::new_with_format(
         4,
         N_KV_HEAD,
@@ -199,13 +203,8 @@ fn jobs(srcs: &[SealedSequence]) -> Vec<GapJob> {
     jobs
 }
 
-/// A lease of `per_class(class)` slots for every class the policy's candidates
-/// and overrides reach, claimed from `backing`'s pools.
-fn lease_for(
-    backing: &ChunkedKvBacking,
-    policy: &CompressionPolicy,
-    per_class: impl Fn(usize) -> usize,
-) -> Lease<ChunkGid> {
+/// The classes the policy's candidates and overrides reach.
+fn reachable(backing: &ChunkedKvBacking, policy: &CompressionPolicy) -> PerClass<bool> {
     let sel = policy_selection(policy).unwrap();
     let mut formats: Vec<_> = sel
         .k
@@ -215,33 +214,37 @@ fn lease_for(
         .collect();
     formats.extend(policy.override_k_quant);
     formats.extend(policy.override_v_quant);
-    let mut lease = Lease::default();
-    let mut done = Vec::new();
+    let mut reach = [false; SizeClass::COUNT];
     for q in formats {
         let key = backing
             .inner
             .arena_key_for(KvFormat::Quantized(q), ArenaLocation::Gpu)
             .unwrap();
-        let class = key.class.index();
-        if done.contains(&class) {
-            continue;
-        }
-        done.push(class);
-        let slots: Vec<ChunkGid> = (0..per_class(class))
-            .map(|_| backing.alloc_chunk_for_key(key).expect("lease a slot"))
-            .collect();
-        lease.add(class, slots);
+        reach[key.class.index()] = true;
     }
+    reach
+}
+
+/// A lease of `per_class(class)` slots for every class the policy reaches,
+/// allocated from `backing`'s pools as a gap's lease is.
+fn lease_for(
+    backing: &ChunkedKvBacking,
+    policy: &CompressionPolicy,
+    per_class: impl Fn(usize) -> usize,
+) -> Lease<ChunkGid> {
+    let reach = reachable(backing, policy);
+    let demand: PerClass<usize> = std::array::from_fn(|c| if reach[c] { per_class(c) } else { 0 });
+    let (lease, short) = lease_demand(backing, &demand).expect("lease");
+    assert_eq!(
+        short,
+        [0; SizeClass::COUNT],
+        "the test card covers the lease"
+    );
     lease
 }
 
-fn stack(backing: &ChunkedKvBacking, lease: &Lease<ChunkGid>) -> StackImage {
-    backing
-        .inner
-        .storage
-        .read(|s| lease.stack_image(|g| band_ptr(s, g, "lease")))
-        .unwrap()
-        .unwrap()
+fn stack(lease: &Lease<ChunkGid>) -> StackImage {
+    lease.stack_image().unwrap()
 }
 
 /// Launch one gap and wait for it; every head's summary row and every job's
@@ -337,7 +340,7 @@ fn assert_matches_todays_seal(policy: &CompressionPolicy, split: bool) {
     let jobs = jobs(&srcs);
     let bands = jobs.len() * N_KV_HEAD * 2 * N_PALETTE;
     let lease = lease_for(&backings[0], policy, |_| bands);
-    let image = stack(&backings[0], &lease);
+    let image = stack(&lease);
     let groups = if split {
         // Two groups of one policy: the second continues the first's counts.
         vec![
@@ -412,7 +415,7 @@ fn a_short_lease_defers_the_tail_and_seals_the_rest() {
     let jobs = jobs(&srcs);
     const SHORT: usize = 40;
     let lease = lease_for(&backings[0], &policy, |_| SHORT);
-    let image = stack(&backings[0], &lease);
+    let image = stack(&lease);
     let groups = [GapGroup {
         policy: &policy,
         jobs: 0..jobs.len(),
@@ -484,7 +487,7 @@ fn one_gap_is_outstanding_at_a_time() {
     let jobs = jobs(&srcs);
     let bands = jobs.len() * N_KV_HEAD * 2 * N_PALETTE;
     let lease = lease_for(&backings[0], &policy, |_| bands);
-    let image = stack(&backings[0], &lease);
+    let image = stack(&lease);
     let groups = [GapGroup {
         policy: &policy,
         jobs: 0..jobs.len(),
@@ -501,14 +504,140 @@ fn one_gap_is_outstanding_at_a_time() {
     assert!(gap.poll());
 }
 
-/// One gap's fixture: the backings, the jobs, an ample lease's stack.
+/// Each band of `row` with the class its record format claimed from, in lease
+/// index order: palette-major, K before V.
+fn row_bands(row: &HeadRow, codes: &CodeTables) -> [(usize, u32); 8] {
+    std::array::from_fn(|b| {
+        let (p, side) = (b / 2, b % 2);
+        let fmt = if side == 0 {
+            row.k_fmt[p]
+        } else {
+            row.v_fmt[p]
+        };
+        let class = codes.class_of_fmt(fmt).expect("a claimed format");
+        (class, row.lease_idx[b])
+    })
+}
+
+/// One gap's whole cycle against the pools (§3, §3.5): a lease short of the
+/// table defers some blocks; the catch-up takes the installed blocks' slots by
+/// the summary's indices and returns every other slot to its pool; the next
+/// gap leases the deferred blocks' exact demand from their rows, leads with
+/// them, defers nothing, and seals them as today's seal does.
+#[test]
+fn a_gap_cycle_returns_every_unused_slot_and_a_retry_places_every_deferred_block() {
+    let Some((device, cuda, _gpu)) = cuda() else {
+        return;
+    };
+    let policy = CompressionPolicy::new(5);
+    let (backings, srcs) = setup(&device, &policy);
+    let want = todays_seal(&device, &backings, &srcs, &policy);
+    let jobs = jobs(&srcs);
+    let codes = CodeTables::new(backings[0].elems_per_chunk()).unwrap();
+    let per_job = N_KV_HEAD * 2 * N_PALETTE;
+
+    // ── Gap 1, on a short lease ──
+    let mut lease = lease_for(&backings[0], &policy, |_| 40);
+    let held = lease.held();
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..jobs.len(),
+    }];
+    let (rows, deferred, errored) =
+        run_gap(&cuda, &device, &backings, &jobs, &groups, &stack(&lease));
+    assert!(!errored);
+    assert!(deferred.iter().any(|&d| d) && deferred.iter().any(|&d| !d));
+
+    // The summary's demand: every band of the table, deferred or not.
+    let demand = count_bands(&rows, |f| codes.class_of_fmt(f)).unwrap();
+    assert_eq!(demand.iter().sum::<usize>(), jobs.len() * per_job);
+
+    // ── Catch-up: the installed blocks take their slots, the rest go back ──
+    let keys: Vec<ArenaKey> = (0..SizeClass::COUNT)
+        .map(|c| ArenaKey::new(SizeClass::from_index(c).unwrap(), ArenaLocation::Gpu))
+        .collect();
+    let free = |c: usize| backings[0].inner.pool.free_slots(keys[c]);
+    let free_leased: Vec<usize> = (0..SizeClass::COUNT).map(free).collect();
+    let mut taken_by_class = vec![Vec::new(); SizeClass::COUNT];
+    for (j, _) in deferred.iter().enumerate().filter(|(_, &d)| !d) {
+        for row in &rows[j * N_KV_HEAD..(j + 1) * N_KV_HEAD] {
+            for (class, idx) in row_bands(row, &codes) {
+                taken_by_class[class].push(idx);
+            }
+        }
+    }
+    let mut installed: Vec<ChunkGid> = Vec::new();
+    for (c, idx) in taken_by_class.iter().enumerate() {
+        installed.extend(lease.take(c, idx).expect("the summary matches its lease"));
+    }
+    drop(lease.release());
+    assert!(lease.is_empty());
+    for c in 0..SizeClass::COUNT {
+        assert_eq!(
+            free(c),
+            free_leased[c] + held[c] - taken_by_class[c].len(),
+            "class {c}: every slot not installed went back"
+        );
+    }
+
+    // ── Gap 2: the deferred blocks alone, leased at their exact demand ──
+    let retry: Vec<usize> = (0..jobs.len()).filter(|&j| deferred[j]).collect();
+    let retried = count_bands(
+        retry
+            .iter()
+            .flat_map(|&j| &rows[j * N_KV_HEAD..(j + 1) * N_KV_HEAD]),
+        |f| codes.class_of_fmt(f),
+    )
+    .unwrap();
+    let reach = reachable(&backings[0], &policy);
+    let exact = gap_demand(&retried, 0, None, &reach);
+    assert_eq!(exact, retried);
+    let (lease2, short) = lease_demand(&backings[0], &exact).unwrap();
+    assert_eq!(short, [0; SizeClass::COUNT]);
+    let retry_jobs: Vec<GapJob> = retry.iter().map(|&j| jobs[j].clone()).collect();
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..retry_jobs.len(),
+    }];
+    let (rows2, deferred2, errored2) = run_gap(
+        &cuda,
+        &device,
+        &backings,
+        &retry_jobs,
+        &groups,
+        &stack(&lease2),
+    );
+    assert!(!errored2);
+    assert!(
+        deferred2.iter().all(|&d| !d),
+        "the exact demand places every retried block"
+    );
+    let got = gap_bands(&cuda, &rows2, backings[0].elems_per_chunk());
+    for (k, &j) in retry.iter().enumerate() {
+        assert_eq!(
+            got[k * per_job..(k + 1) * per_job],
+            want[j * per_job..(j + 1) * per_job],
+            "retried job {j}"
+        );
+    }
+    // The retry used its whole lease and nothing more.
+    let used: usize = rows2.iter().map(|r| row_bands(r, &codes).len()).sum();
+    assert_eq!(used, exact.iter().sum::<usize>());
+    drop(installed);
+}
+
+/// One gap's fixture: the backings, the jobs, an ample lease and its stack.
+/// Fields drop in order: the lease's slots go back to their pools while the
+/// backings still stand, and the card is released last.
 struct Fixture {
-    device: Device,
-    cuda: CudaDevice,
-    _gpu: GpuGuard,
-    backings: Vec<ChunkedKvBacking>,
-    jobs: Vec<GapJob>,
+    /// Held for the fixture's life: the stack names these slots.
+    _lease: Lease<ChunkGid>,
     image: StackImage,
+    jobs: Vec<GapJob>,
+    backings: Vec<ChunkedKvBacking>,
+    cuda: CudaDevice,
+    device: Device,
+    _gpu: GpuGuard,
 }
 
 fn fixture(policy: &CompressionPolicy) -> Option<Fixture> {
@@ -517,14 +646,15 @@ fn fixture(policy: &CompressionPolicy) -> Option<Fixture> {
     let jobs = jobs(&srcs);
     let bands = jobs.len() * N_KV_HEAD * 2 * N_PALETTE;
     let lease = lease_for(&backings[0], policy, |_| bands);
-    let image = stack(&backings[0], &lease);
+    let image = stack(&lease);
     Some(Fixture {
-        device,
-        cuda,
-        _gpu: gpu,
-        backings,
-        jobs,
+        _lease: lease,
         image,
+        jobs,
+        backings,
+        cuda,
+        device,
+        _gpu: gpu,
     })
 }
 

@@ -1,0 +1,315 @@
+//! How many slots of each class a gap leases (`docs/kv_quantize_in_the_gap.md`
+//! §3.2).
+//!
+//! The demand comes from the summaries. The claim counts every band of its
+//! table into a class, deferred or not, so a summary row names the class of
+//! every band it saw, and a gap's demand is two parts:
+//!
+//! - **Retried blocks, exactly.** A deferred block's rows name each band's
+//!   format, so its demand per class is known to the slot. Deferred blocks lead
+//!   the next table and the claim hands out slots in table order, so leasing
+//!   their exact demand places them.
+//! - **New blocks, by measured share.** Their band count is exact; only the
+//!   split across classes is not yet known. It is each class's peak share of
+//!   claims over the recent summaries, kept apart for prefill and decode gaps,
+//!   capped at the band count, and an even split before any summary.
+//!
+//! An over-estimate costs slots allocated and returned within one gap; an
+//! under-estimate defers the blocks past it, whose exact demand the next
+//! summary reports.
+
+use std::collections::VecDeque;
+
+use candle::Result;
+
+use super::super::size_class::SizeClass;
+use super::summary::HeadRow;
+
+/// The gaps of each kind whose claims a peak share is taken over.
+pub(crate) const SHARE_WINDOW: usize = 32;
+
+/// One value per size class, in ladder order.
+pub(crate) type PerClass<T> = [T; SizeClass::COUNT];
+
+/// Which forwards a gap's blocks came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapKind {
+    Prefill,
+    Decode,
+}
+
+/// The recent shares of claims each class took, per gap kind.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PeakShares {
+    prefill: VecDeque<PerClass<f32>>,
+    decode: VecDeque<PerClass<f32>>,
+}
+
+impl PeakShares {
+    fn window(&self, kind: GapKind) -> &VecDeque<PerClass<f32>> {
+        match kind {
+            GapKind::Prefill => &self.prefill,
+            GapKind::Decode => &self.decode,
+        }
+    }
+
+    /// Record one gap's claims per class. A gap that claimed nothing says
+    /// nothing about the split and is not recorded.
+    pub(crate) fn record(&mut self, kind: GapKind, claims: &PerClass<usize>) {
+        let total: usize = claims.iter().sum();
+        if total == 0 {
+            return;
+        }
+        let share = claims.map(|c| c as f32 / total as f32);
+        let window = match kind {
+            GapKind::Prefill => &mut self.prefill,
+            GapKind::Decode => &mut self.decode,
+        };
+        if window.len() == SHARE_WINDOW {
+            window.pop_front();
+        }
+        window.push_back(share);
+    }
+
+    /// Each class's largest share over the recorded window, or `None` before
+    /// any gap of `kind` has reported.
+    pub(crate) fn peak(&self, kind: GapKind) -> Option<PerClass<f32>> {
+        let window = self.window(kind);
+        if window.is_empty() {
+            return None;
+        }
+        let mut peak = [0f32; SizeClass::COUNT];
+        for share in window {
+            for (p, s) in peak.iter_mut().zip(share) {
+                *p = p.max(*s);
+            }
+        }
+        Some(peak)
+    }
+}
+
+/// The slots each class leases for `new_bands` bands of blocks no summary has
+/// seen: `new_bands × peak share`, rounded up and capped at `new_bands`, for
+/// every class in `reachable`; zero for a class the level never selects. With
+/// no `peak`, `new_bands` split evenly (rounded up) across the reachable
+/// classes.
+pub(crate) fn new_block_demand(
+    new_bands: usize,
+    peak: Option<&PerClass<f32>>,
+    reachable: &PerClass<bool>,
+) -> PerClass<usize> {
+    let mut demand = [0usize; SizeClass::COUNT];
+    let n_reachable = reachable.iter().filter(|&&r| r).count();
+    if new_bands == 0 || n_reachable == 0 {
+        return demand;
+    }
+    let even = new_bands.div_ceil(n_reachable);
+    for (c, d) in demand.iter_mut().enumerate() {
+        if !reachable[c] {
+            continue;
+        }
+        let share = match peak {
+            Some(peak) => (new_bands as f64 * f64::from(peak[c])).ceil() as usize,
+            None => even,
+        };
+        *d = share.min(new_bands);
+    }
+    demand
+}
+
+/// A gap's lease, per class: the retried blocks' exact demand plus the new
+/// blocks' demand by share.
+pub(crate) fn gap_demand(
+    retried: &PerClass<usize>,
+    new_bands: usize,
+    peak: Option<&PerClass<f32>>,
+    reachable: &PerClass<bool>,
+) -> PerClass<usize> {
+    let new = new_block_demand(new_bands, peak, reachable);
+    std::array::from_fn(|c| retried[c] + new[c])
+}
+
+/// The bands of `rows` counted by the class each claimed from, through
+/// `class_of_fmt` (a record format byte's class). Refuses a band whose format
+/// byte has no class: the row is not one the claim wrote against these tables.
+pub(crate) fn count_bands<'r>(
+    rows: impl IntoIterator<Item = &'r HeadRow>,
+    class_of_fmt: impl Fn(u8) -> Option<usize>,
+) -> Result<PerClass<usize>> {
+    let mut counts = [0usize; SizeClass::COUNT];
+    for row in rows {
+        for &fmt in row.k_fmt.iter().chain(&row.v_fmt) {
+            let class = class_of_fmt(fmt)
+                .filter(|&c| c < SizeClass::COUNT)
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!("gap demand: record format {fmt} has no class"))
+                })?;
+            counts[class] += 1;
+        }
+    }
+    Ok(counts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const N: usize = SizeClass::COUNT;
+
+    fn only(classes: &[usize]) -> PerClass<bool> {
+        let mut r = [false; N];
+        for &c in classes {
+            r[c] = true;
+        }
+        r
+    }
+
+    fn claims(pairs: &[(usize, usize)]) -> PerClass<usize> {
+        let mut c = [0; N];
+        for &(class, n) in pairs {
+            c[class] = n;
+        }
+        c
+    }
+
+    #[test]
+    fn before_any_summary_new_bands_are_split_evenly() {
+        let d = new_block_demand(10, None, &only(&[0, 2, 3]));
+        assert_eq!(d, claims(&[(0, 4), (2, 4), (3, 4)]));
+    }
+
+    #[test]
+    fn new_bands_follow_the_recorded_peak_share() {
+        let mut shares = PeakShares::default();
+        shares.record(GapKind::Decode, &claims(&[(1, 3), (2, 1)]));
+        let peak = shares.peak(GapKind::Decode).unwrap();
+        let d = new_block_demand(100, Some(&peak), &only(&[1, 2]));
+        assert_eq!(d, claims(&[(1, 75), (2, 25)]));
+    }
+
+    #[test]
+    fn a_class_never_takes_more_than_the_new_band_count() {
+        let mut peak = [0f32; N];
+        peak[0] = 1.0;
+        assert_eq!(new_block_demand(40, Some(&peak), &only(&[0]))[0], 40);
+        // An even split of fewer bands than classes rounds up to one each.
+        let d = new_block_demand(2, None, &only(&[0, 1, 2]));
+        assert_eq!(&d[..3], &[1, 1, 1]);
+    }
+
+    #[test]
+    fn a_share_never_rounds_below_its_part_of_the_count() {
+        for bands in [3usize, 300, 301, 65_535 * 64] {
+            let mut shares = PeakShares::default();
+            shares.record(GapKind::Decode, &claims(&[(0, 1), (1, 1), (2, 1)]));
+            let peak = shares.peak(GapKind::Decode).unwrap();
+            let d = new_block_demand(bands, Some(&peak), &only(&[0, 1, 2]));
+            for (c, &n) in d.iter().take(3).enumerate() {
+                assert!(n * 3 >= bands, "bands {bands} class {c}: {n}");
+                assert!(n <= bands);
+            }
+        }
+    }
+
+    #[test]
+    fn a_reachable_class_with_no_recorded_share_leases_nothing_new() {
+        let mut peak = [0f32; N];
+        peak[0] = 1.0;
+        let d = new_block_demand(50, Some(&peak), &only(&[0, 1]));
+        assert_eq!((d[0], d[1]), (50, 0));
+    }
+
+    #[test]
+    fn no_bands_or_no_reachable_class_leases_nothing() {
+        assert_eq!(new_block_demand(0, None, &only(&[0, 1])), [0; N]);
+        assert_eq!(new_block_demand(100, None, &[false; N]), [0; N]);
+    }
+
+    #[test]
+    fn retried_blocks_lease_exactly_their_demand_on_top() {
+        let retried = claims(&[(1, 7), (4, 3)]);
+        let d = gap_demand(&retried, 0, None, &only(&[1, 4]));
+        assert_eq!(d, retried, "no new blocks: exactly the retried demand");
+        let d = gap_demand(&retried, 8, None, &only(&[1, 4]));
+        assert_eq!(d, claims(&[(1, 11), (4, 7)]));
+    }
+
+    #[test]
+    fn a_retried_class_the_level_does_not_reach_still_gets_its_slots() {
+        // A block deferred under one level, retried after the level changed:
+        // its exact demand stands whatever the new level reaches.
+        let d = gap_demand(&claims(&[(5, 2)]), 4, None, &only(&[0]));
+        assert_eq!((d[0], d[5]), (4, 2));
+    }
+
+    #[test]
+    fn the_peak_is_the_largest_share_in_the_window_per_class() {
+        let mut shares = PeakShares::default();
+        shares.record(GapKind::Prefill, &claims(&[(0, 1), (1, 3)]));
+        shares.record(GapKind::Prefill, &claims(&[(0, 1), (1, 1)]));
+        let peak = shares.peak(GapKind::Prefill).unwrap();
+        assert_eq!((peak[0], peak[1]), (0.5, 0.75));
+        assert!(shares.peak(GapKind::Decode).is_none());
+    }
+
+    #[test]
+    fn the_window_keeps_its_last_gaps_and_forgets_the_oldest() {
+        let mut shares = PeakShares::default();
+        shares.record(GapKind::Decode, &claims(&[(0, 1)]));
+        for _ in 1..SHARE_WINDOW {
+            shares.record(GapKind::Decode, &claims(&[(1, 1)]));
+        }
+        assert_eq!(shares.peak(GapKind::Decode).unwrap()[0], 1.0, "still in");
+        shares.record(GapKind::Decode, &claims(&[(1, 1)]));
+        let peak = shares.peak(GapKind::Decode).unwrap();
+        assert_eq!((peak[0], peak[1]), (0.0, 1.0), "pushed out");
+    }
+
+    #[test]
+    fn a_gap_that_claimed_nothing_is_not_recorded() {
+        let mut shares = PeakShares::default();
+        shares.record(GapKind::Decode, &[0; N]);
+        assert!(shares.peak(GapKind::Decode).is_none());
+    }
+
+    fn row(k: [u8; 4], v: [u8; 4]) -> HeadRow {
+        HeadRow {
+            k_pal: Vec::new(),
+            v_pal: Vec::new(),
+            k_fmt: k,
+            v_fmt: v,
+            k_scale: [1.0; 4],
+            v_scale: [1.0; 4],
+            k_ptr: [0; 4],
+            v_ptr: [0; 4],
+            lease_idx: [0; 8],
+        }
+    }
+
+    #[test]
+    fn a_rows_bands_are_counted_by_their_formats_class() {
+        // Format bytes 7 and 9 in class 2, 15 in class 0.
+        let class = |f: u8| match f {
+            7 | 9 => Some(2),
+            15 => Some(0),
+            _ => None,
+        };
+        let rows = [row([7, 7, 15, 9], [15, 15, 15, 7]), row([9; 4], [7; 4])];
+        let c = count_bands(&rows, class).unwrap();
+        assert_eq!(c, claims(&[(2, 12), (0, 4)]));
+        assert_eq!(c.iter().sum::<usize>(), 16, "every band counted once");
+    }
+
+    #[test]
+    fn a_band_whose_format_has_no_class_is_refused() {
+        let class = |f: u8| (f == 7).then_some(1);
+        assert!(count_bands(&[row([7; 4], [7, 7, 7, 3])], class).is_err());
+        // A class past the ladder is no class either.
+        assert!(count_bands(&[row([7; 4], [7; 4])], |_| Some(N)).is_err());
+    }
+
+    #[test]
+    fn no_rows_count_nothing() {
+        assert_eq!(count_bands(&[], |_| Some(0)).unwrap(), [0; N]);
+    }
+}

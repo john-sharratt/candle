@@ -19,11 +19,13 @@ use crate::kv_cache::KvFormat;
 pub(crate) const NO_CLASS: i8 = -1;
 
 /// Per select code: the size class its bands claim from, and the record format
-/// byte its destination record carries.
+/// byte its destination record carries. And the way back, per record format
+/// byte: the class, so the host can count a summary row's bands by class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CodeTables {
     pub class: [i8; N_CODES],
     pub fmt: [u8; N_CODES],
+    fmt_class: [i8; 256],
 }
 
 impl CodeTables {
@@ -35,6 +37,7 @@ impl CodeTables {
         }
         let mut class = [NO_CLASS; N_CODES];
         let mut fmt = [0u8; N_CODES];
+        let mut fmt_class = [NO_CLASS; 256];
         for format in all_kv_formats() {
             let KvFormat::Quantized(q) = format else {
                 continue;
@@ -57,10 +60,26 @@ impl CodeTables {
             if class[code] != NO_CLASS && class[code] != c {
                 candle::bail!("gap codes: select code {code} maps to two classes");
             }
+            let byte = ggml_dtype_to_arena_fmt_code(ggml)?;
+            let back = &mut fmt_class[byte as usize];
+            if *back != NO_CLASS && *back != c {
+                candle::bail!("gap codes: record format {byte} maps to two classes");
+            }
+            *back = c;
             class[code] = c;
-            fmt[code] = ggml_dtype_to_arena_fmt_code(ggml)?;
+            fmt[code] = byte;
         }
-        Ok(Self { class, fmt })
+        Ok(Self {
+            class,
+            fmt,
+            fmt_class,
+        })
+    }
+
+    /// The size class a band whose record carries format byte `fmt` claimed
+    /// from, or `None` for a byte no selectable format has.
+    pub(crate) fn class_of_fmt(&self, fmt: u8) -> Option<usize> {
+        usize::try_from(self.fmt_class[fmt as usize]).ok()
     }
 
     /// Refuse codes the tables do not cover. Run over a policy's candidates
@@ -169,6 +188,37 @@ mod tests {
             if !named.contains(&code) {
                 assert_eq!(t.class[code], NO_CLASS, "code {code}");
                 assert_eq!(t.fmt[code], 0, "code {code}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_record_format_byte_leads_back_to_its_codes_class() {
+        for hd in [128usize, 256] {
+            let t = CodeTables::new(elems_per_chunk(hd / 4)).unwrap();
+            for code in 0..N_CODES {
+                if t.class[code] == NO_CLASS {
+                    continue;
+                }
+                assert_eq!(
+                    t.class_of_fmt(t.fmt[code]),
+                    Some(t.class[code] as usize),
+                    "hd {hd} code {code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_byte_no_selectable_format_has_leads_nowhere() {
+        let t = CodeTables::new(EPC).unwrap();
+        let used: Vec<u8> = (0..N_CODES)
+            .filter(|&c| t.class[c] != NO_CLASS)
+            .map(|c| t.fmt[c])
+            .collect();
+        for byte in 0..=u8::MAX {
+            if !used.contains(&byte) {
+                assert_eq!(t.class_of_fmt(byte), None, "byte {byte}");
             }
         }
     }
