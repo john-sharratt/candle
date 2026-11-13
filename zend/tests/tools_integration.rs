@@ -382,6 +382,7 @@ mod tool_scenarios {
                     // Every point carries the WHOLE tools collection — picked and
                     // skipped alike — so the peak across the turn is the tool's
                     // best showing, not whatever the last point happened to hold.
+                    let mut point: Vec<(&str, f32, bool)> = Vec::new();
                     for item in &projection_event_out.event.selection.system {
                         let SystemItem::Collection { name, sections, .. } = item else {
                             continue;
@@ -395,8 +396,24 @@ mod tool_scenarios {
                             if s.selected {
                                 selected.insert(s.name.clone());
                             }
+                            point.push((s.name.as_str(), s.score, s.selected));
                         }
                     }
+                    // Each point as it arrived: which one picked what is the
+                    // first question a selection failure asks.
+                    point.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let shown: Vec<String> = point
+                        .iter()
+                        .filter(|(_, score, picked)| *picked || *score > 0.0)
+                        .map(|(n, score, picked)| {
+                            format!("{n}={score:.0}{}", if *picked { "*" } else { "" })
+                        })
+                        .collect();
+                    eprintln!(
+                        "\n[PROJECTION token {}] {}",
+                        projection_event_out.event.start_token,
+                        shown.join("  ")
+                    );
                 }
                 StreamItem::Tool(status) => {
                     eprintln!("\n[TOOL {}] {:?}", status.phase, status.tools);
