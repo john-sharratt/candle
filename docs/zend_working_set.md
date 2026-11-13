@@ -124,8 +124,13 @@ system prompt
 inherited chain         the dialogue group's lineage turns
 repo_map/structure      provenance folders, then pinned       ┐ working set: provenance ≤ budget_tokens,
 code_reading/scopes     provenance files,   then pinned       ┘ locks ≤ lock_tokens on top
-dialogue                its own turns: recent 16 + historical 8, its own 96K window
+dialogue                its own turns: recent 16 + historical 8, its own 180K window
 ```
+
+On an engine whose attention selects, this is the seating order of one slot
+fill (`docs/hit_driven_projection.md` §7.2): the lineage, the working set and
+the dialogue's exchanges are placed together by score after their locks and
+floors, and carved back into this order.
 
 The working set sits between the conversation's opening and its own turns, so
 the locks — the files the model was just told it has — are next to the turns
@@ -176,10 +181,12 @@ working set behind it.)
 The distance limit is not solved by ordering: as the dialogue grows, everything
 ahead of it moves further back. That remains open.
 
-**Budget.** The two groups are sized by the working set, not by the flexbox:
-`project.rs` takes their selections off the top and distributes the dialogue's
-`window` over the rest as today. Their `budget:` shares in `projection.yaml` are
-deleted.
+**Budget.** The two groups are sized by the working set, not by the flexbox.
+On a selecting engine the shares below are caps on the slot fill
+(`projection/fill.rs`), which places the working set and the dialogue in one
+pass; on any other engine `project.rs` takes the working set's selections off
+the top and distributes the dialogue's `window` over the rest. Their
+`budget:` shares in `projection.yaml` are deleted.
 
 - `repo_map` — pinned folders, then provenance folders up to `folder_tokens`.
 - `code_reading` — pinned files, then provenance files up to what remains of
@@ -217,8 +224,7 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
 ```yaml
   - name: dialogue
     working_set:
-      slot_tokens: 262144        # the slot every share fills: the trained window
-      reserve_tokens: 16384      # what arrives between two projections
+      reserve_tokens: 16384      # what arrives between two projections; the slot is the engine's trained window less this
       budget_tokens: 64000       # seeds + provenance, folders and files together
       lock_tokens: 48000         # the locks, on top of budget_tokens
       folder_tokens: 10000       # repo_map's share of budget_tokens
@@ -699,11 +705,14 @@ or not yet sealed reads as absent, and the unit's own opening stands.
 ## 5. Constraints and cost
 
 - **Context length.** Flash-Next is trained to 262,144 positions, and the
-  dialogue's slot stays inside them (`docs/hit_driven_projection.md` §4): 64K
-  voluntary + 16K of guidance + 48K of locks + the 16K reserve must fit
-  `slot_tokens` at parse, and each projection gives the conversation — at most
-  its 96K window, which includes the 64K lineage cap — what the slot has left
-  after the system prompt and the working set as emitted. A slot's rung follows its deepest
+  dialogue's slot stays inside them (`docs/hit_driven_projection.md` §4): the
+  slot is the engine's trained window less the 16K reserve, and one fill
+  places everything in it after the system prompt — locks, floors, then
+  rounds by score (`hit_driven_projection.md` §7.2). The 64K voluntary, 16K
+  of guidance, 48K of locks and the dialogue's 180K window are caps on that
+  fill, not reservations, so a thin working set leaves its room to the
+  dialogue and a short dialogue leaves it to the working set. Locks and
+  reserve that pass the trained window fill YaRN ×2 with one warning. A slot's rung follows its deepest
   position, so a dialogue inside the trained window runs the trained RoPE at
   every position. Progressive YaRN (`qwen4exp/rope.rs`) still carries a
   sequence a caller drives deeper ×2 to 524,288. The only length checks are
@@ -807,7 +816,7 @@ measurement watches these numbers.
 
 | # | Question | Decided |
 |---|---|---|
-| D1 | Past the 262K trained length | The dialogue never goes there: its shares fit `slot_tokens`, the trained window, and every sequence takes the rung its reach calls for (`docs/hit_driven_projection.md` §4). |
+| D1 | Past the 262K trained length | The dialogue goes there only when its locks and reserve pass the trained window, and then fills YaRN ×2 with one warning; otherwise the slot fill stays inside the trained window, and every sequence takes the rung its reach calls for (`docs/hit_driven_projection.md` §4, §7.2). |
 | D2 | What release does to locks | Demote to provenance with momentum `1000/β` (the settled level of a full-strength hit). |
 | D3 | Tie-break | Most recently locked wins. |
 | D4 | Which calls release | File writes (the written file's lock alone), git writes, `run_command`, `code_run`, `code_session_exec` (every lock) — registry-checked names. Plus the promising reply leaving the projection; never a user message. |
@@ -816,7 +825,7 @@ measurement watches these numbers.
 | D7 | Provenance unit | Whole files and folders. |
 | D8 | Seed list | §4.2 draft, to be edited. |
 | D9 | Fade rate | Per-file momentum at β 0.2, leaking by its own value. |
-| D10 | Default budget | 64K voluntary, locks on top up to 48K, guidance 16K, with the 16K reserve inside the 262,144-position slot; the conversation gets what the slot leaves after the system prompt and the working set, at most its 96K window (`docs/hit_driven_projection.md` §4). Strength is momentum lifted by the model's own hits (§4.3, `hit_driven_projection.md` §7.1). |
+| D10 | Default budget | 64K voluntary, locks on top up to 48K, guidance 16K, caps on one fill of the trained window less the 16K reserve, beside the dialogue's 180K window (`docs/hit_driven_projection.md` §4, §7.2). Strength is momentum lifted by the model's own hits (§4.3, `hit_driven_projection.md` §7.1). |
 | D11 | Momentum store | In `WorkingSet`, not the belief carry; in-memory. |
 | D12 | Restart | Served calls are marked on their turn (`working_set:lock:<tl>`, `working_set:release:<tl>`, `working_set:release`) through the existing persisted turn tags, which every gather-scope reader ignores; locks rebuild from the marks. Momentum rebuilds from the scan. |
 | D13 | Folder vs file budget | `folder_tokens` slice for `repo_map`, the rest for `code_reading`. |

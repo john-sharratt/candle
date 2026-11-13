@@ -1,5 +1,5 @@
 //! A substrate's kept custom objects as text, and back
-//! (`docs/hit_driven_projection.md` §13 step 11, §14.4).
+//! (`docs/hit_driven_projection.md` §12 item 17, §13.4).
 //!
 //! A substrate moved aside for a new model key keeps what is not
 //! model-derived: accounts, journals' records, MCP state, a character's world.

@@ -698,7 +698,7 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             get(export_npcs),
         )
         // Every kept custom object, out as text and back, for a substrate moved
-        // aside under a new model key (`docs/hit_driven_projection.md` §14.4).
+        // aside under a new model key (`docs/hit_driven_projection.md` §13.4).
         // Admin-only for the reason the cast's backup is.
         .route(
             "/v1/substrate/npcd/objects/export",

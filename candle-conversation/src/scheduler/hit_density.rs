@@ -148,7 +148,7 @@ mod tests {
 
     /// **A loaded and an unloaded round hit by every query that could have
     /// hit them score the same density, whatever the stride's row counts**
-    /// (`docs/hit_driven_projection.md` §14.2): a loaded round of 8 blocks hit
+    /// (`docs/hit_driven_projection.md` §13.2): a loaded round of 8 blocks hit
     /// at every block by each of 300 prefill rows, and a pooled round of 12
     /// blocks — declared over two pages — hit at every block by each of the 64
     /// rows the shadow scan kept, both read 1.0.

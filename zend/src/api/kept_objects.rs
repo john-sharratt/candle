@@ -2,7 +2,7 @@
 //! /v1/substrate/zend/objects/import` — every
 //! kept custom object out as JSON Lines and back
 //! (`candle_conversation::persistence::kept_objects`), for a substrate moved
-//! aside under a new model key (`docs/hit_driven_projection.md` §14.4).
+//! aside under a new model key (`docs/hit_driven_projection.md` §13.4).
 
 use std::sync::Arc;
 

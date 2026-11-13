@@ -1,4 +1,4 @@
-//! The export's lines (`docs/hit_driven_projection.md` §13 step 11).
+//! The export's lines (`docs/hit_driven_projection.md` §12 item 17).
 //!
 //! ```text
 //! {"format":"substrate-objects","version":1,"daemon":"zend","taken_at_ms":…}
