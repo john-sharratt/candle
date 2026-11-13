@@ -238,6 +238,8 @@ mod working_set_pick;
 mod yaml;
 
 #[cfg(test)]
+mod dialogue_fill_grammar_tests;
+#[cfg(test)]
 mod face_tests;
 #[cfg(test)]
 mod operation_tests;
