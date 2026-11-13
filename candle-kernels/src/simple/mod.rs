@@ -135,6 +135,11 @@ pub mod kv_hash;
 // addresses computed from an arena extent table rather than serialized on the host
 pub mod kv_record_fill;
 
+// The gap quantize's destination claim: each band's slot in its class's leased
+// stack by prefix count, the destination records the convert reads, and the
+// mapped summary and completion word the host catches up from
+pub mod kv_gap_claim;
+
 // NVTX3 range shim, so an nsys trace names the pipeline span that launched each
 // kernel (header-only NVTX3; nothing to link against)
 pub mod nvtx;

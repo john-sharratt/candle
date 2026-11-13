@@ -16,8 +16,8 @@
 
 use std::ops::Range;
 
-use super::backing::ChunkedKvBacking;
-use super::types::CHUNK_SIZE;
+use super::super::backing::ChunkedKvBacking;
+use super::super::types::CHUNK_SIZE;
 
 /// One layer's view of one sequence, as the builder reads it: the chunks from
 /// `first` on, so a deep sequence is read only past its cursor.

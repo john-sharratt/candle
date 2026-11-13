@@ -19,7 +19,7 @@ use candle::{DType, Device, Result};
 use super::compact_map::Replaced;
 use super::compact_plan::ArenaSlots;
 use super::fresh_arenas::FreshArenas;
-use super::gap_table::LayerShape;
+use super::gap::LayerShape;
 use super::head_gids::ChunkBands;
 use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
 #[cfg(feature = "cuda")]
@@ -1688,7 +1688,7 @@ impl ChunkedKvBacking {
     }
 
     /// This layer's shape of the sequence from chunk `from` on, the part a gap
-    /// reads (`gap_table`). `None` if the slot is unallocated.
+    /// reads (`gap::table`). `None` if the slot is unallocated.
     pub(crate) fn gap_layer_shape(&self, batch_idx: usize, from: usize) -> Option<LayerShape> {
         let state = self.state.read().ok()?;
         let seq = state.sequences.get(batch_idx)?.as_ref()?;

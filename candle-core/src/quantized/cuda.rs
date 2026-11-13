@@ -71,7 +71,9 @@ mod silu_matmul;
 mod split_k;
 use narrow::q8a128_dense_matmul_narrow_segmented;
 use palette4_block::select_palette4_owned;
-pub use palette4_block::{select_palette4_in, Palette4Layout, Palette4Result};
+pub use palette4_block::{
+    select_palette4_in, select_palette4_launch, Palette4Layout, Palette4Result,
+};
 pub(crate) use silu_matmul::q8a128_dense_matmul_silu;
 pub use split_k::ensure_split_k_scratch;
 use split_k::q8a128_dense_matmul_split_k_segmented;
@@ -1311,14 +1313,11 @@ pub fn quantize_palette4_convert_buffered(
     // KVHEAD_SIZE (dst), so no pointer arrays are needed. KVHEAD_SIZE is a
     // multiple of 8 at every supported head_dim, so the window array is
     // 4-byte aligned.
-    let n = expected;
-    let src_heads_off: usize = 0;
-    let dst_heads_off: usize = n * kvhead_bytes;
-    let ranges_off: usize = 2 * n * kvhead_bytes;
+    let layout = Palette4ConvertLayout::new(head_dim, expected);
     // Per-palette outer scales live inside each dst KvHead struct (f32 at
     // HD/2+72 / HD/2+88), so the encoder (multiply by outer) and decoder
     // (divide by outer) share a single source of truth.
-    let total_bytes = ranges_off + n * 4;
+    let total_bytes = layout.bytes();
 
     // Build the CPU image directly in pinned memory (no intermediate Vec).
     let mut buf = generation.alloc(total_bytes)?;
@@ -1347,50 +1346,106 @@ pub fn quantize_palette4_convert_buffered(
             &desc.v_dst_scales,
         )?;
 
-        let src_off = src_heads_off + i * kvhead_bytes;
-        let dst_off = dst_heads_off + i * kvhead_bytes;
+        let src_off = layout.src_off(i);
+        let dst_off = layout.dst_off(i);
         buf[src_off..src_off + kvhead_bytes].copy_from_slice(&src_bytes);
         buf[dst_off..dst_off + kvhead_bytes].copy_from_slice(&dst_bytes);
-        let range_off = ranges_off + i * 4;
+        let range_off = layout.ranges_off() + i * 4;
         buf[range_off..range_off + 4].copy_from_slice(&desc.valid_range.to_le_bytes());
     }
 
     // Async H2D upload via stager (deferred cleanup).
     let gpu_buf = generation.submit(buf)?;
 
-    // Launch K and V conversion passes.
-    // Grid: dim3(num_kv_heads, num_layers) → exactly n blocks per launch.
-    let base_ptr = gpu_buf.dev_ptr();
-    let ranges_ptr = (base_ptr + ranges_off as u64) as *const i32;
-    let raw_stream = stream.cu_stream() as *mut _;
+    // SAFETY: the buffer was just laid out for `n` descriptors and uploaded on
+    // `stream`; it drops stream-ordered after the launches.
     unsafe {
-        crate::set_kernel_breadcrumb("run_quantize_palette4_convert (K)", file!(), line!());
-        run_quantize_palette4_convert(
-            base_ptr as *const u8,
-            ranges_ptr,
-            n as i32,
-            num_kv_heads as i32,
-            num_layers as i32,
-            num_chunks as i32,
-            1, // K
-            head_dim as i32,
-            raw_stream,
-        );
-        crate::set_kernel_breadcrumb("run_quantize_palette4_convert (V)", file!(), line!());
-        run_quantize_palette4_convert(
-            base_ptr as *const u8,
-            ranges_ptr,
-            n as i32,
-            num_kv_heads as i32,
-            num_layers as i32,
-            num_chunks as i32,
-            0, // V
-            head_dim as i32,
-            raw_stream,
+        palette4_convert_launch(
+            gpu_buf.dev_ptr(),
+            head_dim,
+            num_kv_heads,
+            num_layers,
+            num_chunks,
+            stream,
         );
     }
     // gpu_buf drops here — stream-ordered after the kernel launches.
     Ok(())
+}
+
+/// Where each part of a palette-4 convert buffer of `n` descriptors sits:
+/// `n` source KvHead records, then `n` destination records, then `n` token
+/// windows (`i32`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette4ConvertLayout {
+    pub n: usize,
+    pub record_bytes: usize,
+}
+
+impl Palette4ConvertLayout {
+    pub fn new(head_dim: usize, n: usize) -> Self {
+        Self {
+            n,
+            record_bytes: kvhead_size(head_dim),
+        }
+    }
+
+    pub fn src_off(&self, i: usize) -> usize {
+        i * self.record_bytes
+    }
+
+    pub fn dst_off(&self, i: usize) -> usize {
+        (self.n + i) * self.record_bytes
+    }
+
+    pub fn ranges_off(&self) -> usize {
+        2 * self.n * self.record_bytes
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.ranges_off() + self.n * 4
+    }
+}
+
+/// Launch the palette-4 convert, K then V, over the buffer at `base_ptr`,
+/// laid out by [`Palette4ConvertLayout`] for `num_layers × num_kv_heads`
+/// descriptors.
+///
+/// # Safety
+///
+/// `base_ptr` is a device buffer of `Palette4ConvertLayout::bytes()` whose
+/// records and windows are written, ahead of this launch on `stream`, and
+/// which outlives it. Every pointer a record names is a writable (destination)
+/// or readable (source) band of the record's format.
+pub unsafe fn palette4_convert_launch(
+    base_ptr: u64,
+    head_dim: usize,
+    num_kv_heads: usize,
+    num_layers: usize,
+    num_chunks: usize,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) {
+    let layout = Palette4ConvertLayout::new(head_dim, num_layers * num_kv_heads);
+    // Grid: dim3(num_kv_heads, num_layers) → exactly n blocks per launch.
+    let ranges_ptr = (base_ptr + layout.ranges_off() as u64) as *const i32;
+    let raw_stream = stream.cu_stream() as *mut _;
+    for (is_k, label) in [
+        (1, "run_quantize_palette4_convert (K)"),
+        (0, "run_quantize_palette4_convert (V)"),
+    ] {
+        crate::set_kernel_breadcrumb(label, file!(), line!());
+        run_quantize_palette4_convert(
+            base_ptr as *const u8,
+            ranges_ptr,
+            layout.n as i32,
+            num_kv_heads as i32,
+            num_layers as i32,
+            num_chunks as i32,
+            is_k,
+            head_dim as i32,
+            raw_stream,
+        );
+    }
 }
 
 /// Thin unsafe wrapper around `run_select_kv_format_palette4_paged`.

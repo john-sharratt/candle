@@ -25,7 +25,7 @@ pub use super::size_class::GID_STRIDE;
 
 #[cfg(feature = "cuda")]
 use super::compact_mint::RecordInputs;
-use super::gap_table::{cursor_after_front_eviction, cursor_after_splice, cursor_after_truncate};
+use super::gap::{cursor_after_front_eviction, cursor_after_splice, cursor_after_truncate};
 use super::gid_pool::ChunkGid;
 use super::gpu_chunks::{ChunkPin, GpuChunks};
 use super::head_gids::{band_tags, HeadGids};

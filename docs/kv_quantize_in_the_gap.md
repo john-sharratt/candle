@@ -171,27 +171,43 @@ the scheduler thread that would be a synchronous readback in the loop, against
 invariant 3. Instead, **the host leases slots ahead of time, and the device
 chooses among them.**
 
+- **No existing kernel changes.** The selection and convert kernels run exactly
+  as today. The selection already leaves its results (palette tags, outer
+  scales, per-channel palette slots) in device memory before today's readback
+  copies them out; the claim reads them there. The convert already reads its
+  per-head source and destination records from one device buffer; the host
+  writes the source half and the claim writes the destination half. The gap
+  adds three small kernels of its own in `kv_gap_claim.cu`: the claim, the
+  record fill, and the completion word.
 - **Leases.** For every reachable quant class the host keeps a standing lease:
   free slots claimed from that class's arenas (`ChunkGidPool`, lowest place
   first), held as `ChunkGid`s, and mirrored on the device as a **slot stack**
-  of `{arena ptr, slot}` entries. In each gap the host tops the stack up and
-  uploads only the entries it added. Slots a gap does not take stay in the
-  stack for the next one.
-- **Claim, in table order.** The fused selection kernel picks each (block,
-  head)'s K and V palettes and formats exactly as today and writes each band's
-  class. A claim kernel then gives every band its index in its class: the count
-  of bands of that class before it in the table. The band's destination is that
-  entry of the class's stack. The claim is a prefix count, not a race on an
-  atomic cursor, so the same table against the same lease always takes the same
-  slots, and the lowest places fill first.
+  of slot addresses, one run per class. Each gap the host uploads the stack
+  whole, as it stands after the last catch-up: at most the gap's band count of
+  eight-byte entries, the one upload the claim needs. Slots a gap does not take
+  stay leased for the next one.
+- **Claim, in table order.** A band's format is the selection's palette tag,
+  or the policy's uniform override; a host-built table maps each format code to
+  its size class and its record format code. The claim gives every band its
+  index in its class: the count of bands of that class before it in the table,
+  bands ordered job, head, palette, K before V. A gap with several policy
+  groups claims once per group against a per-class count the groups share, so
+  the gap's indices are one sequence. The claim is a prefix count, not a race
+  on an atomic cursor, so the same table against the same lease always takes
+  the same slots, and the lowest places fill first.
 - **A class that runs dry defers the block, never fails it.** A block is
   deferred when any of its bands' indices falls past its class's lease. The
-  whole block stays native and goes into the next gap's table. The slots its
-  other bands would have taken are not written and stay leased. A block that
-  stays native for a gap is still attended correctly, only larger, and this is
-  the only way a complete block misses its gap.
-- **A band that stays as it is needs no slot.** Where the selection keeps a band
-  in its native format (C0's K), nothing is claimed or converted for it.
+  whole block stays native and goes into the next gap's table. Its bands still
+  hold their indices, so no later block's slot moves; the slots they name are
+  not written and stay leased. The convert runs over every row of the buffer,
+  so a deferred block's destinations are set to one **sink** slot as wide as
+  the widest class, which nothing ever reads: the convert writes a deferred
+  band there and nowhere else. A block that stays native for a gap is still
+  attended correctly, only larger, and this is the only way a complete block
+  misses its gap.
+- **Every band takes a slot.** The selection's candidates are all quantized
+  formats (R16 among them at C0), so every band is converted into a slot of its
+  class.
 - **Lease size is bounded by this gap's own demand.** The host built the table,
   so it knows the band count exactly: blocks × heads × `N_PALETTE` × 2. Only
   the split across classes is unknown. Each class's lease is topped up to that
@@ -210,7 +226,14 @@ chooses among them.**
 One batched launch over every claimed band, across every layer and sequence
 (invariant 5), reading its destinations from the claim. Destinations are
 allocated uninitialised (invariant 6). The convert is launched once for the
-whole table, never once per layer.
+whole table, never once per layer: the table is cut to the convert's single
+launch (65,535 jobs), which §3.1's scratch cut is already well inside.
+
+The record fill writes each head's destination record (palette maps packed two
+bits a channel, record format codes, outer scales, slot addresses) into the
+convert's buffer and into the summary row (§3.4), in one pass over the
+selection's results. Under a uniform override a side's map is the identity and
+its scales are one, as today.
 
 Nothing else is written on the device. No record is filled and no block table is
 touched in the gap: both are the host's to change, at the catch-up.
@@ -220,17 +243,17 @@ touched in the gap: both are the host's to change, at the catch-up.
 The kernels write the gap's summary into one mapped pinned buffer, as the MoE
 dispatch writes its routing summary (`expert_lre/dispatch.rs`, `SummaryRing`).
 It holds:
-- a header: the gap's sequence number and its row count;
-- one row per block: converted or deferred, and for each head the palette tags,
-  scales and palette map the selection chose, and each band's lease index;
-- a **completion word**, written by the gap's last launch, holding the gap's
-  sequence number.
+- one flag per block: converted or deferred;
+- for each head, its destination record exactly as the convert read it, and
+  each of its eight bands' lease index;
+- a **completion word**, written by the gap's last launch (after the convert),
+  holding the gap's sequence number.
 
 That is what the selection reads back to the host today, delivered through
-mapped memory. The palette maps are carried packed, two bits a channel as
-`PalMapBytes` holds them (`head_dim / 4` bytes per head for K and for V), not
+mapped memory. The record carries the palette maps packed, two bits a channel
+as `PalMapBytes` holds them (`head_dim / 4` bytes per head for K and for V), not
 one byte a channel as today's readback widens them (`sampled_selection/gpu.rs`),
-so a row is a few hundred bytes per layer. The host reads it only once the completion word matches, by
+so a head is `head_dim / 2 + 136` bytes. The host reads it only once the completion word matches, by
 reading the mapped word at the head of a gap. No host CUDA call reads or waits
 on the buffer. The buffer is sized at start for the largest table a gap can
 build (§3.1's cut).
@@ -598,15 +621,18 @@ Line numbers are as of commit `dc04b62ac`.
   short of, in the gap.
 
 **4. The kernels (§3.2, §3.3).**
-- `candle-kernels/src/quantize/select_kv_format.cuh:2285` and `:3199`,
-  `select_kv_format_palette4_paged`: thresholds stay scalar launch arguments,
-  one launch per policy group (§3.1); each band's class written for the claim; outputs written to the mapped summary.
-- New `candle-kernels/src/quantize/kv_gap_claim.cu`: the per-class prefix count
-  and the deferral rule. Registered in `candle-kernels/build.rs`, bound in
-  `candle-kernels/src/lib.rs`.
-- `candle-nn/src/kv_cache/chunked/compress.rs:1413`, `convert_deferred_descs`
-  and `convert_descs_batched`: destinations read from the claim, one launch for
-  the table.
+- `candle-kernels/src/quantize/select_kv_format.cuh`,
+  `select_kv_format_palette4_paged`: unchanged. One launch per policy group
+  (§3.1), its results left in the selection block for the claim.
+- `candle-kernels/src/quantize/palette4_convert.cuh`: unchanged. Its buffer's
+  destination half is written by the record fill.
+- New `candle-kernels/src/simple/kv_gap_claim.cu`: the claim (the per-class
+  prefix count and the deferral rule), the record fill and the completion word.
+  Listed in `SIMPLE_KERNELS` (`candle-kernels/build_utils.rs`), bound in
+  `candle-kernels/src/simple/kv_gap_claim.rs`.
+- `candle-core/src/quantized/cuda.rs`, `quantize_palette4_convert_buffered`:
+  split into building the buffer and launching on it, so the gap launches the
+  same convert on a buffer whose destination half the device wrote.
 - `candle-nn/src/kv_cache/chunked/sampled_selection/gpu.rs:741`, `run_palette4`,
   and the readback at `:1497–1538`: removed.
 

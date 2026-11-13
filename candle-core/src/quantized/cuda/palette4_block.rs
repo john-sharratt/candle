@@ -235,18 +235,21 @@ fn input_words(layout: &Palette4Layout, k: &[i32], v: &[i32], valid: &[i32]) -> 
     words
 }
 
-/// Run the fused palette-4 selection in `block`, a device range of at least
-/// [`Palette4Layout::bytes`] the caller holds for the call, and read back what
-/// it wrote. Synchronises `stream` once, for the readback.
+/// Launch the fused palette-4 selection in `block`, a device range of at least
+/// [`Palette4Layout::bytes`], and return the layout its results sit at. Nothing
+/// is read back and nothing waits: the results stay in `block` for whatever the
+/// caller launches next on `stream` — the gap's claim reads them there.
+///
+/// The inputs go up from pageable memory, so the copy is staged before this
+/// returns; `block` must stay the caller's until every launch reading it has
+/// run.
 ///
 /// # Safety
 ///
-/// `per_head_table_ptr` and `head_gids_ptr` are raw device addresses, laid out
-/// as the kernel expects — `PerHeadEntry` rows and the matching `HeadGids`
-/// block — and live on `stream` for the call. `block` names device memory of at
-/// least `layout.bytes()` that nothing else touches until this returns.
+/// As [`select_palette4_in`], except that `block` must outlive every launch
+/// the caller orders after this one that reads it, not just this call.
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn select_palette4_in(
+pub unsafe fn select_palette4_launch(
     per_head_table_ptr: u64,
     head_gids_ptr: u64,
     n_chunks: usize,
@@ -259,7 +262,7 @@ pub unsafe fn select_palette4_in(
     valid_ranges: &[i32],
     block: u64,
     stream: &Arc<CudaStream>,
-) -> Result<Palette4Result> {
+) -> Result<Palette4Layout> {
     if valid_ranges.len() != n_chunks {
         crate::bail!(
             "valid_ranges length {} != n_chunks {}",
@@ -277,7 +280,7 @@ pub unsafe fn select_palette4_in(
         v_codes.len(),
     );
     if layout.total_heads == 0 {
-        return Ok(Palette4Result::empty());
+        return Ok(layout);
     }
     let cu: CUstream = stream.cu_stream();
     let word = |at: usize| block + (at * 4) as u64;
@@ -324,6 +327,53 @@ pub unsafe fn select_palette4_in(
         word(layout.q_rel),
         cu as *mut std::ffi::c_void,
     );
+    Ok(layout)
+}
+
+/// Run the fused palette-4 selection in `block`, a device range of at least
+/// [`Palette4Layout::bytes`] the caller holds for the call, and read back what
+/// it wrote. Synchronises `stream` once, for the readback.
+///
+/// # Safety
+///
+/// `per_head_table_ptr` and `head_gids_ptr` are raw device addresses, laid out
+/// as the kernel expects — `PerHeadEntry` rows and the matching `HeadGids`
+/// block — and live on `stream` for the call. `block` names device memory of at
+/// least `layout.bytes()` that nothing else touches until this returns.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn select_palette4_in(
+    per_head_table_ptr: u64,
+    head_gids_ptr: u64,
+    n_chunks: usize,
+    k_candidates: &[GgmlDType],
+    v_candidates: &[GgmlDType],
+    thresholds: [f32; 4],
+    blocks_per_head: usize,
+    n_kv_head: usize,
+    arena_chunks: usize,
+    valid_ranges: &[i32],
+    block: u64,
+    stream: &Arc<CudaStream>,
+) -> Result<Palette4Result> {
+    let layout = select_palette4_launch(
+        per_head_table_ptr,
+        head_gids_ptr,
+        n_chunks,
+        k_candidates,
+        v_candidates,
+        thresholds,
+        blocks_per_head,
+        n_kv_head,
+        arena_chunks,
+        valid_ranges,
+        block,
+        stream,
+    )?;
+    if layout.total_heads == 0 {
+        return Ok(Palette4Result::empty());
+    }
+    let cu: CUstream = stream.cu_stream();
+    let word = |at: usize| block + (at * 4) as u64;
     let mut out = vec![0u32; layout.words - layout.outputs];
     // SAFETY: the output section lies inside the block; the copy is ordered
     // behind the launch and waited for below.
