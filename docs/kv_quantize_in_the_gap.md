@@ -128,8 +128,8 @@ the forwards since the last gap. It scheduled those rows, so it knows each
 sequence's offset, and it allocated the native chunks those blocks live in. From
 its own bookkeeping it builds a **descriptor table**: one row per block, giving
 the source K/V pointers, the (layer, head) layout, the block's token range, its
-sequence's position (for attention-sink protection on positions 0–3) and its
-layer's thresholds. That is invariant 2b's shape. No block is copied together to
+sequence's position (for attention-sink protection on positions 0–3) and the
+policy group it seals under. That is invariant 2b's shape. No block is copied together to
 be quantized.
 
 - **The builder is proportional to what changed.** Each sequence keeps a cursor:
@@ -145,10 +145,16 @@ be quantized.
   leaves one layer a filled chunk ahead of the others. The row for a block
   exists only when the block is complete on every layer, which is the rule
   `assert_sealed_layers_aligned` enforces at a seal today.
-- **Thresholds ride in the row.** A layer can seal at its own level (the MTP
-  draft head, `layer_seal_cap`). Today that makes one selection run per policy
-  group. The row carries its thresholds, so the gap is one launch whatever the
-  mix.
+- **One selection launch per policy group.** Thresholds and candidate formats
+  are fixed by the compression level and the model's `*_KV_FACTORS`, so every
+  block sealed under one policy shares them; they never vary block to block.
+  Policies differ only where a layer seals at its own level (the MTP draft head,
+  `layer_seal_cap`) or a conversation overrides its level or formats
+  (`effective_turn_policy`). The table is grouped by policy and the selection
+  kernel runs once per group, with the group's thresholds as its scalar launch
+  arguments, exactly as the seal groups layers today. A gap normally holds one
+  group, so it is one launch; a handful at most. The selection kernel's
+  threshold interface is unchanged.
 - **A sealed residence's partial final block** is quantized as a full block. Its
   dead slots are zero and the valid range is passed to the selection kernel, as
   `kv_tier_migration.md` §3 already specifies. A live sequence's writer chunk is
@@ -509,8 +515,8 @@ Line numbers are as of commit `dc04b62ac`.
   the source of a row's pointers.
 - `batched_inference.rs:2172`, `assert_sealed_layers_aligned`: the every-layer
   rule the builder applies per block.
-- `batched_inference.rs:645`, `layer_seal_cap`: the per-layer thresholds a row
-  carries.
+- `batched_inference.rs:645`, `layer_seal_cap`: the per-layer level that puts a
+  row in its policy group.
 - `candle-nn/src/kv_cache/chunked/compress.rs:69`, `SELECTION_BUDGET_BYTES`: the
   cut.
 
@@ -526,8 +532,8 @@ Line numbers are as of commit `dc04b62ac`.
 
 **4. The kernels (§3.2, §3.3).**
 - `candle-kernels/src/quantize/select_kv_format.cuh:2285` and `:3199`,
-  `select_kv_format_palette4_paged`: thresholds per row; each band's class
-  written for the claim; outputs written to the mapped summary.
+  `select_kv_format_palette4_paged`: thresholds stay scalar launch arguments,
+  one launch per policy group (§3.1); each band's class written for the claim; outputs written to the mapped summary.
 - New `candle-kernels/src/quantize/kv_gap_claim.cu`: the per-class prefix count
   and the deferral rule. Registered in `candle-kernels/build.rs`, bound in
   `candle-kernels/src/lib.rs`.
