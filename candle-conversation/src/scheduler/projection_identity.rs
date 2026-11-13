@@ -28,26 +28,43 @@ use crate::sequence_handle::SequenceId;
 
 impl Scheduler {
     /// Close a reprojection whose selection is the one `view_id`'s parent
-    /// already holds: the prefix stays, the view keeps decoding into it, and
-    /// only what a reprojection reports forward changes — the belief the next
-    /// one seeds from, and the projection point the GUI and the seal read.
+    /// already holds: the prefix stays, the view keeps decoding — or an opening
+    /// stopped at a boundary keeps prefilling — into it, and only what a
+    /// reprojection reports forward changes: the belief the next one seeds
+    /// from, and the projection point the GUI and the seal read.
     pub(super) fn keep_unchanged_projection(
         &mut self,
         view_id: SequenceId,
         composition: ProjectionEvent,
     ) {
-        let Some(ds) = self.active_decodes.get_mut(&view_id) else {
+        let belief = PriorBelief::from_selection(&composition.selection);
+        let now = Instant::now();
+        if let Some(ds) = self.active_decodes.get_mut(&view_id) {
+            ds.belief = belief;
+            let start_token = ds.generated_tokens.len() as u32;
+            let event = ProjectionEvent {
+                start_token,
+                seconds: now.duration_since(ds.decode_start).as_secs_f64(),
+                ..composition
+            };
+            let _ = ds.event_tx.send(TurnEvent::Projection(event));
+            ds.last_projection_end = start_token;
             return;
-        };
-        ds.belief = PriorBelief::from_selection(&composition.selection);
-        let start_token = ds.generated_tokens.len() as u32;
-        let event = ProjectionEvent {
-            start_token,
-            seconds: Instant::now().duration_since(ds.decode_start).as_secs_f64(),
-            ..composition
-        };
-        let _ = ds.event_tx.send(TurnEvent::Projection(event));
-        ds.last_projection_end = start_token;
+        }
+        if let Some(p) = self
+            .active_prefills
+            .iter_mut()
+            .find(|p| p.work.sequence_id == view_id && p.awaiting)
+        {
+            p.work.belief = belief;
+            let since = p.prefill_start.unwrap_or(p.work.submitted_at);
+            let event = ProjectionEvent {
+                start_token: 0,
+                seconds: now.duration_since(since).as_secs_f64(),
+                ..composition
+            };
+            let _ = p.work.event_tx.send(TurnEvent::Projection(event));
+        }
     }
 }
 

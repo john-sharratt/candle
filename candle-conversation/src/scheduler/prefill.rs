@@ -2663,6 +2663,8 @@ impl Scheduler {
             finished: None,
             error: Some(why),
             prefill_start: None,
+            stops_every: None,
+            awaiting: false,
         });
     }
 
@@ -2749,6 +2751,16 @@ impl Scheduler {
         // unit's K/V anchor (`Scheduler::close_unit_boundary`), and a second cut
         // on this slot would close whatever the unit has already forwarded into
         // a page of its own.
+        //
+        // An opening on a filled slot stops every `reserve_tokens` for a
+        // boundary (§7.4) — but not a calibration's staged or captured prefill,
+        // whose projection points and recurrent arms are its own.
+        let stops_every = work
+            .reprojection
+            .as_ref()
+            .filter(|_| work.projection_offsets.is_empty() && work.recurrent_spans.is_empty())
+            .and_then(|p| p.opening_chunk())
+            .filter(|&every| every < total);
         self.active_prefills.push(ActivePrefill {
             work,
             offset: 0,
@@ -2756,6 +2768,8 @@ impl Scheduler {
             finished: None,
             error,
             prefill_start: None,
+            stops_every,
+            awaiting: false,
         });
     }
 
@@ -3973,17 +3987,25 @@ impl Scheduler {
             });
         }
         for p in candidates {
-            if p.error.is_some() || p.finished.is_some() || p.offset >= p.work.tokens.len() {
+            // An opening stopped at a boundary waits for its reprojection to
+            // hand it back on its new view.
+            if p.error.is_some()
+                || p.finished.is_some()
+                || p.awaiting
+                || p.offset >= p.work.tokens.len()
+            {
                 continue;
             }
             // Every prompt that can advance is a candidate, each offering at
             // most a pass. Who rides and how far is decided below, where the
             // members share the budget — stopping here at the first prompt that
             // does not fit whole would decide it first, and hold every prompt
-            // behind that one back from a forward it could have shared.
+            // behind that one back from a forward it could have shared. An
+            // opening on a filled slot offers no further than its next
+            // boundary (§7.4); the shares below only cut an advance shorter.
             members.push(WaveMember::Prefill {
                 seq_id: p.work.sequence_id.0,
-                advance: (p.work.tokens.len() - p.offset).min(cap),
+                advance: p.advance_cap().min(cap),
             });
         }
         self.prefill_gang = gang;
@@ -4588,6 +4610,14 @@ impl Scheduler {
                                 tokens_total: total,
                             },
                         );
+                        // At a boundary the opening waits while the slot is
+                        // chosen again from what its rows hit (§7.4): the rest
+                        // prefills against that slot, on the view the
+                        // reprojection carves.
+                        if self.active_prefills[i].at_boundary() {
+                            self.active_prefills[i].awaiting = true;
+                            Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
+                        }
                         continue;
                     }
                     // Staged calibration prefill: emit every segment's pinned
@@ -5818,6 +5848,8 @@ impl Scheduler {
                 finished,
                 error,
                 prefill_start,
+                stops_every: _,
+                awaiting: _,
             } = p;
             // A compression-turn re-prefill carries no decode and reports to the
             // summariser, not a caller. Seal it directly off the wave (snapshot
@@ -7227,7 +7259,31 @@ mod wave_chunk_tests {
             finished: None,
             error: None,
             prefill_start: None,
+            stops_every: None,
+            awaiting: false,
         }
+    }
+
+    /// **An opening on a filled slot stops at every stride** (§7.4): a chunk
+    /// advances no further than the next multiple of `reserve_tokens`, the
+    /// opening stands at a boundary only on one with tokens still to come, and
+    /// one with no stride runs to its end.
+    #[test]
+    fn an_opening_stops_at_every_stride() {
+        let mut p = dialogue_prefill(SequenceId(1), vec![0; 40_000]);
+        p.stops_every = Some(16_384);
+        assert_eq!((p.advance_cap(), p.at_boundary()), (16_384, false));
+        p.offset = 10_000;
+        assert_eq!((p.advance_cap(), p.at_boundary()), (6_384, false));
+        p.offset = 16_384;
+        assert_eq!((p.advance_cap(), p.at_boundary()), (16_384, true));
+        p.offset = 32_768;
+        assert_eq!((p.advance_cap(), p.at_boundary()), (7_232, true));
+        p.offset = 40_000;
+        assert!(!p.at_boundary(), "the end of the opening is no boundary");
+        p.stops_every = None;
+        p.offset = 16_384;
+        assert_eq!((p.advance_cap(), p.at_boundary()), (23_616, false));
     }
 
     /// **Only a prefill that leaves opens the next admission.** Promotion runs
@@ -7406,6 +7462,43 @@ mod wave_chunk_tests {
         let rows = inputs[0].to_vec2::<u32>().expect("u32 rows");
         assert_eq!(rows[0].len(), 200, "the tail chunk is what remains");
         assert_eq!(rows[0][0], 14_800, "the chunk starts at the offset");
+    }
+
+    /// **An opening on a filled slot creeps to its next boundary and waits
+    /// there** (§7.4): a chunk ends on the stride, and an opening waiting for
+    /// its reprojection rides no group until the reprojection hands it back.
+    #[test]
+    fn an_opening_creeps_to_its_boundary_and_waits_there() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let cap = scheduler.max_prefill_pass_tokens;
+        let seq = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let mut p = dialogue_prefill(seq, (0..15_000u32).collect());
+        p.stops_every = Some(cap + 100);
+        p.offset = cap;
+        scheduler.active_prefills.push(p);
+
+        scheduler.form_wave_group(false);
+        let (_, _, inputs, _) = scheduler.build_wave_group_inputs();
+        assert_eq!(inputs[0].dims(), &[1, 100], "the chunk ends on the stride");
+
+        scheduler.reset_wave_prefill();
+        scheduler.active_prefills[0].offset = cap + 100;
+        assert!(scheduler.active_prefills[0].at_boundary());
+        scheduler.active_prefills[0].awaiting = true;
+        scheduler.form_wave_group(false);
+        assert!(
+            scheduler.wave_prefill_members.is_empty(),
+            "an opening waiting at its boundary rides no group"
+        );
+        assert!(scheduler.awaiting_opening(seq).is_some());
+
+        scheduler.resume_unreprojected(seq);
+        scheduler.form_wave_group(false);
+        assert_eq!(
+            scheduler.wave_prefill_members.len(),
+            1,
+            "handed back, it rides"
+        );
     }
 
     /// A queued turn of `len` tokens on a new slot at `band`.
