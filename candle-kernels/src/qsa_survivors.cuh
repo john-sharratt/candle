@@ -79,8 +79,9 @@ __device__ __forceinline__ void survivors_reset(const Survivors& s, int tid) {
 
 // Reduce the buffer's `n` keys to its top `keep`, compacted to the front, and
 // set the threshold to the smallest of them. `n ≥ keep`. Every thread calls
-// this, so its barriers are uniform.
-__device__ void survivors_select(const Survivors& s, int n, int keep, int tid) {
+// this, so its barriers are uniform. Inline: every translation unit that
+// includes this header gets its own copy, not one more definition to link.
+inline __device__ void survivors_select(const Survivors& s, int n, int keep, int tid) {
     unsigned long long k[PER_THREAD];
     bool live[PER_THREAD];
 #pragma unroll
