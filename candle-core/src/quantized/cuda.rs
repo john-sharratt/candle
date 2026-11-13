@@ -8037,6 +8037,10 @@ pub struct PromoRing {
 mod test;
 
 #[cfg(test)]
+#[path = "padding_tail_tests.rs"]
+mod padding_tail_tests;
+
+#[cfg(test)]
 #[path = "q0_v_decode_oracle_tests.rs"]
 mod q0_v_decode_oracle_tests;
 

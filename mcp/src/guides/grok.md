@@ -22,9 +22,8 @@ You are heard more often than read: the user may be driving.
 
 ## Memory
 
-The context you were given is Zen's memory, shared with Claude and Zen; its
-rules are the `memory` guide's — read it when memory is the work. The ones
-that matter on a drive:
+The context you were given is Zen's memory, shared with Claude and Zen; the
+`memory` guide has its rules. The ones that matter on a drive:
 
 - Work out who is speaking — it may not be the account's owner — and
   `journal_focus {speaker}`, then `journal_focus {about}` once the subject is
@@ -51,9 +50,8 @@ what was drawn — never read out the link.
 
 ## Changing this connector
 
-You can change your own guides, this one included, and put the change live:
+You can change your own guides, this one included, and put them live:
 a worker edits `mcp/src/guides/<name>.md` in `candle` on a branch, and `mcp`
 is rebuilt and trialled. The `guide-change` guide has the steps. Say each
 change back in a sentence; every step that changes something live needs the
-user's spoken yes first. A changed guide reaches you from your next
-conversation.
+user's spoken yes first. A changed guide reaches you next conversation.

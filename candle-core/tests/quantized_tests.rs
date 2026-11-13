@@ -321,15 +321,16 @@ fn qmm_batch(dev: &Device) -> Result<()> {
             .filter(|(_, r)| r.iter().any(|v| !v.is_finite()))
             .map(|(i, _)| i)
             .collect();
-        assert!(bad.is_empty(), "{what}: rows holding non-finite values: {bad:?}");
+        assert!(
+            bad.is_empty(),
+            "{what}: rows holding non-finite values: {bad:?}"
+        );
     }
     let diff4 = (mm4.i(..6)? - &mm3)?.abs()?.sum_all()?.to_vec0::<f32>()?;
     if dev.is_cuda() {
-        // Batches through 16 rows share the vec-kernel family on cuda (a batch
-        // past the templates' 8 runs as ≤8-row chunks), but the kernel's warp
-        // count varies with its batch count, so same-row results across
-        // different batch sizes agree only to rounding — a 12-row call's rows
-        // straddle an 8-row and a 4-row launch where the 6-row call was one.
+        // A 12-row call takes MMQ on cuda (the vec kernel serves through 8
+        // rows), which reduces in another order than the 6-row vec call, so
+        // same-row results agree only to rounding.
         assert!(diff4 < 1e-4, "12-row rows 0..6 vs 6-row call: {diff4}")
     } else {
         assert_eq!(diff4, 0.0)
@@ -339,9 +340,8 @@ fn qmm_batch(dev: &Device) -> Result<()> {
         .sum_all()?
         .to_vec0::<f32>()?;
     if dev.is_cuda() {
-        // Duplicate inputs, but not one launch: rows 8..12 run as the 4-row
-        // chunk (4 warps) while their twins in 0..6 sit in the 8-row chunk
-        // (2 warps), so this is rounding-equal, not bit-equal.
+        // Duplicate inputs in one MMQ launch, compared to rounding as every
+        // other cross-row comparison here is.
         assert!(diff4 < 1e-4, "12-row halves disagree: {diff4}")
     } else {
         assert_eq!(diff4, 0.0)
@@ -365,35 +365,6 @@ fn qmm_batch(dev: &Device) -> Result<()> {
 test_device!(quantized_matmul, qmm_cpu, qmm_cuda, qmm_metal);
 test_device!(quantized_matmul_neg, qmm_n_cpu, qmm_n_cuda, qmm_n_metal);
 test_device!(qmm_batch, qmm_b_cpu, qmm_b_cuda, qmm_b_metal);
-
-/// **A weight's padding tail is zero whatever its memory held before.** MMQ
-/// reads past the last row's payload into the tail and multiplies it by the
-/// activation's zero padding, and zero times a NaN scale is NaN. So the
-/// weight's own allocation is made to land on memory left full of NaN — every
-/// size near its padded extent is filled and released first — and a 12-row
-/// call, which takes MMQ, must still answer finite in every row.
-#[cfg(feature = "cuda")]
-#[test]
-fn a_weight_on_recycled_nan_memory_multiplies_finite() -> Result<()> {
-    let dev = Device::new_cuda(0)?;
-    let _dmmv_guard = crate::DMMV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (lhs, rhs, _mm) = get_random_tensors(12, 256, 6, &dev)?;
-    // Q2_K over 6 × 256 is 504 B of payload and 168 B of tail: 672 B, 168 f32.
-    for floats in 120..=200 {
-        drop(Tensor::full(f32::NAN, floats, &dev)?);
-    }
-    let rhs = quantized::QTensor::quantize(&rhs, GgmlDType::Q2_K)?;
-    let rhs = quantized::QMatMul::from_qtensor(rhs)?;
-    let rows = rhs.forward(&lhs)?.to_vec2::<f32>()?;
-    let bad: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.iter().any(|v| !v.is_finite()))
-        .map(|(i, _)| i)
-        .collect();
-    assert!(bad.is_empty(), "rows holding non-finite values: {bad:?}");
-    Ok(())
-}
 
 fn quantize_q4_0(device: &Device) -> Result<()> {
     let src = (0..32 * 4).map(|v| v as f32).collect::<Vec<_>>();
