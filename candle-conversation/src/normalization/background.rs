@@ -62,9 +62,15 @@ impl Background {
         }
     }
 
-    /// How many samples it holds.
+    /// How many samples it holds, scoring or not.
+    #[cfg(test)]
     pub(super) fn total(&self) -> u32 {
         self.total
+    }
+
+    /// How many of its samples scored: what a score is read against.
+    pub(super) fn evidence(&self) -> u32 {
+        self.total - self.zeros
     }
 
     /// How many samples score at least `x`, counting `x`'s own bin in
@@ -91,15 +97,24 @@ impl Background {
         n
     }
 
-    /// `-ln P(background ≥ x)`, add-one smoothed. Past the top of the highest
-    /// bin it goes on rising a nat for every nat of `ln(1 + x)`, so scores
-    /// beyond everything the background holds still rank by size. Zero for a
-    /// score of no evidence.
+    /// `-ln P(background ≥ x | the background scored)`, add-one smoothed: a
+    /// score is read against the samples that scored, never against the ones
+    /// that did not. Past the top of the highest bin it goes on rising a nat for
+    /// every nat of `ln(1 + x)`, so scores beyond everything the background
+    /// holds still rank by size. Zero for a score of no evidence.
+    ///
+    /// **Why the samples of no evidence are left out.** Late fusion gives each
+    /// probe token to one candidate, so on most probes most candidates score
+    /// nothing, and a background is mostly zeros. Counted, they made any score
+    /// at all a far-tail event: with 98% of samples at zero, one stray vote read
+    /// `-ln 0.02`, ~850 on the band — past a tool's 800 gate whatever its size.
+    /// Among the samples that scored, a stray vote reads as the stray votes it
+    /// resembles, and only a score past those is a hit.
     pub(super) fn surprise(&self, x: f32) -> f32 {
         if !is_evidence(x) {
             return 0.0;
         }
-        let n = self.total as f32;
+        let n = self.evidence() as f32;
         let tail = ((n + 1.0) / (self.at_least(x) + 1.0)).ln();
         let edge = self.bins.last().map_or(0.0, |(b, _)| *b as f32 + 1.0);
         let beyond = (position(x) - edge).max(0.0) / BINS_PER_NAT;
@@ -163,6 +178,21 @@ mod tests {
         // An empty background: nothing to beat but the axis itself.
         let empty = Background::default();
         approx(empty.surprise(at(8.0)), 1.0, 1e-4);
+    }
+
+    /// **A score is read against the samples that scored**: a background of
+    /// those samples and ninety-eight zeros reads every score exactly as the
+    /// samples alone do.
+    #[test]
+    fn samples_of_no_evidence_leave_every_reading_alone() {
+        let scored = [4.0, 30.0, 30.0, 250.0];
+        let alone = Background::of(scored);
+        let with_zeros = Background::of(scored.into_iter().chain(std::iter::repeat_n(0.0, 98)));
+        assert_eq!(with_zeros.total(), 102);
+        assert_eq!(with_zeros.evidence(), 4);
+        for x in [1.0, 4.0, 29.0, 30.0, 100.0, 250.0, 1e4] {
+            assert_eq!(with_zeros.surprise(x), alone.surprise(x), "x = {x}");
+        }
     }
 
     /// **The same evidence in any order is the same background.**

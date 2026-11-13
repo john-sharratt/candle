@@ -10,10 +10,10 @@
 use std::sync::{Arc, OnceLock};
 
 use candle_conversation::stencil::{
-    compile, compile_tool_call_loop, compile_tool_call_tree, AllowedSet, FreeTextLimits, HfVocab,
-    NodeSpec, Observe, Param, ParamType, Pick, StencilAction, StencilNode, StencilSession,
-    StencilTree, Terminator, TestVocab, ToolCallEnvelope, ToolSpec, TreeSpec, ValueRule, Vocab,
-    WalkError, MAX_TOOL_CALLS_PER_TURN,
+    compile, compile_tool_call_loop, compile_tool_call_tree, AllowedSet, FreeTextLimits, HeldRules,
+    HeldValues, HfVocab, NodeSpec, Observe, Param, ParamType, Pick, StencilAction, StencilNode,
+    StencilSession, StencilTree, Terminator, TestVocab, ToolCallEnvelope, ToolSpec, TreeSpec,
+    ValueHolds, ValueRule, Vocab, WalkError, MAX_TOOL_CALLS_PER_TURN,
 };
 use zend_vfs::{RepoSpec, Workspace};
 
@@ -1454,6 +1454,18 @@ fn walk_natural(
     target: &str,
     strict: bool,
 ) -> Result<(), String> {
+    walk_natural_held(tree, tok, target, strict, None)
+}
+
+/// [`walk_natural`] with the turn's calls held to `held`, as a round's are
+/// (`zend::held_values`).
+fn walk_natural_held(
+    tree: Arc<StencilTree>,
+    tok: &tokenizers::Tokenizer,
+    target: &str,
+    strict: bool,
+    held: Option<Arc<HeldValues>>,
+) -> Result<(), String> {
     // The first marker is the model's: decoding it is what fires the stencil,
     // so the walk starts after it and the natural encoding is of the rest.
     let body = target
@@ -1483,6 +1495,9 @@ fn walk_natural(
     let before = |b: usize| String::from_utf8_lossy(&bytes[b.saturating_sub(24)..b]).into_owned();
 
     let mut session = StencilSession::new(tree);
+    if let Some(held) = held {
+        session.hold_values(held);
+    }
     let mut b = 0usize;
     // How far the model's own tokens reach. A free span that closes inside a
     // token replays the rest of it into the next node; those bytes are the
@@ -1632,6 +1647,94 @@ fn a_repo_enum_then_a_path_drives_the_live_grammar() {
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A workspace as a round's path holds see it: `candle` with its crates at the
+/// root, `battle-cities` with a `crates/` folder.
+fn held_workspace(vocab: &HfVocab) -> Arc<HeldValues> {
+    let repos = vec![
+        (
+            "candle".to_string(),
+            vec![
+                "README.md".to_string(),
+                "candle-core/src/lib.rs".to_string(),
+                "docs/README.md".to_string(),
+            ],
+        ),
+        (
+            "battle-cities".to_string(),
+            vec!["crates/sim/src/lib.rs".to_string()],
+        ),
+    ];
+    let holds = ValueHolds {
+        fields: zend::held_paths::holds_of(&repos),
+    };
+    Arc::new(HeldValues::build(&holds, vocab, &mut HeldRules::default()))
+}
+
+/// **A listing names a directory the repository has, in every call of a
+/// turn.** The first round of a live tour wrote six listings in one turn, and
+/// the second, `crates` in `candle`, came back `not_found`: candle's crates sit
+/// at its root. Held, the walk refuses it — and still writes `crates` in
+/// `battle-cities`, which has one, and the rest of the turn.
+#[test]
+#[ignore = "requires the cached Qwen3.8 tokenizer.json"]
+fn a_turn_of_listings_names_only_directories_that_exist() {
+    let path = cached_live_tokenizer().expect("Qwen3.8 tokenizer cached");
+    let tok = tokenizers::Tokenizer::from_file(&path).unwrap();
+    let im_end = tok.token_to_id(TURN_CLOSE).unwrap();
+    let vocab = HfVocab::new(tok.clone(), &[im_end], 0);
+    let spec = compile_tool_call_loop(
+        &catalog(),
+        &production_envelope(),
+        MAX_TOOL_CALLS_PER_TURN,
+        TURN_CLOSE,
+    )
+    .unwrap();
+    let tree = Arc::new(compile(&spec, &vocab).unwrap());
+    let held = held_workspace(&vocab);
+    let turn = |calls: &[(&str, &str)]| {
+        let body = calls
+            .iter()
+            .map(|(repo, path)| {
+                format!(
+                    "{MARKER}\n{{\"name\": \"file_list\", \"arguments\": {{\"repo\": \"{repo}\", \
+                     \"path\": \"{path}\", \"page\": 1}}}}\n</tool_call>"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{body}{TURN_CLOSE}")
+    };
+    let exists = turn(&[
+        ("candle", ""),
+        ("candle", "docs"),
+        ("battle-cities", "crates"),
+    ]);
+    walk_natural_held(
+        Arc::clone(&tree),
+        &tok,
+        &exists,
+        false,
+        Some(Arc::clone(&held)),
+    )
+    .expect("a turn of listings that exist writes through");
+    for missing in [
+        turn(&[("candle", "crates")]),
+        turn(&[("candle", ""), ("candle", "crates"), ("candle", "docs")]),
+    ] {
+        let walked = walk_natural_held(
+            Arc::clone(&tree),
+            &tok,
+            &missing,
+            false,
+            Some(Arc::clone(&held)),
+        );
+        assert!(
+            walked.is_err(),
+            "a listing of `crates` in candle was written:\n{missing}"
+        );
+    }
 }
 
 /// The daemon's grammar compiled against the live checkpoint's tokenizer.

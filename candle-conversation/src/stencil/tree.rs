@@ -172,8 +172,9 @@ pub struct StencilTree {
     marks: TreeMarks,
 }
 
-/// Which spans write which argument field, and which branches choose a call's
-/// tool (`docs/stencil_tree.md` §9.2).
+/// Which spans write which argument field, which branches choose a call's
+/// tool or an argument's value, and what each tool's schema fixes
+/// (`docs/stencil_tree.md` §9.2).
 #[derive(Debug, Clone, Default)]
 pub struct TreeMarks {
     pub keys: HashMap<NodeId, Arc<str>>,
@@ -182,6 +183,11 @@ pub struct TreeMarks {
     /// shares is written before the branch, so its tokens alone may not spell
     /// the name.
     pub name_branches: HashMap<NodeId, Arc<HashMap<Vec<TokenId>, Arc<str>>>>,
+    /// Each branch choosing an argument's value: the field, and by an arm's
+    /// tokens the value it writes. By tokens, as a name branch's are.
+    pub chosen: HashMap<NodeId, (Arc<str>, Arc<HashMap<Vec<TokenId>, Arc<str>>>)>,
+    /// Each tool's arguments its schema leaves one value, by tool.
+    pub fixed: Arc<HashMap<Arc<str>, Vec<(Arc<str>, Arc<str>)>>>,
 }
 
 impl StencilTree {
@@ -218,6 +224,23 @@ impl StencilTree {
     /// The tool the name branch at `node` names when its arm took `tokens`.
     pub fn tool_named(&self, node: NodeId, tokens: &[TokenId]) -> Option<&Arc<str>> {
         self.marks.name_branches.get(&node)?.get(tokens)
+    }
+
+    /// Whether the branch at `node` chooses an argument's value.
+    pub fn is_chosen_branch(&self, node: NodeId) -> bool {
+        self.marks.chosen.contains_key(&node)
+    }
+
+    /// The field the branch at `node` chooses and the value its arm wrote when
+    /// it took `tokens`; `None` for an arm that writes no value.
+    pub fn value_chosen(&self, node: NodeId, tokens: &[TokenId]) -> Option<(&Arc<str>, &Arc<str>)> {
+        let (field, by_arm) = self.marks.chosen.get(&node)?;
+        Some((field, by_arm.get(tokens)?))
+    }
+
+    /// The arguments `tool`'s schema leaves one value: written on every call.
+    pub fn fixed_of(&self, tool: &str) -> &[(Arc<str>, Arc<str>)] {
+        self.marks.fixed.get(tool).map_or(&[], Vec::as_slice)
     }
 
     pub fn root(&self) -> NodeId {

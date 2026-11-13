@@ -57,9 +57,15 @@ use candle_transformers::models::dialect::{CallStyle, Dialect};
 use super::element_close::{Follows, FUNCTION_TAG, PARAM_CLOSE, PARAM_TAG};
 use super::error::BuildError;
 use super::field_order::Owed;
-use super::spec::{NodeSpec, SpecId, TreeSpec};
+use super::spec::{ChosenArms, NodeSpec, SpecId, TreeSpec};
 use super::terminator::Terminator;
 use super::tree::{FreeTextLimits, MAX_STRING_VALUE_TOKENS};
+
+/// The value one arm of a branch writes, when it writes one.
+type ArmValue = Option<Arc<str>>;
+
+/// A branch arm's text and successor, with the value it writes.
+type ValuedArm = (String, SpecId, ArmValue);
 
 /// A parameter's value type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1140,6 +1146,12 @@ fn splice(host: &mut TreeSpec, sub: &TreeSpec, tail: SpecId) -> SpecId {
     }
     host.name_branches
         .extend(sub.name_branches.iter().map(|id| SpecId(id.0 + base)));
+    for (id, chosen) in &sub.chosen {
+        host.chosen.insert(SpecId(id.0 + base), chosen.clone());
+    }
+    for (tool, fixed) in &sub.fixed {
+        host.fixed.insert(Arc::clone(tool), fixed.clone());
+    }
     remap(sub.root)
 }
 
@@ -1384,6 +1396,20 @@ impl<'a> ToolTreeBuilder<'a> {
         end: SpecId,
         shared: &mut HashMap<String, SpecId>,
     ) -> Result<SpecId, BuildError> {
+        // A required argument with one value is written into its key, no
+        // branch choosing it, so the call records it by its tool instead.
+        let fixed: Vec<(Arc<str>, Arc<str>)> = tool
+            .params
+            .iter()
+            .filter(|p| p.required && !p.nullable)
+            .filter_map(|p| match p.enum_values.as_deref() {
+                Some([only]) => Some((Arc::from(p.name.as_str()), Arc::from(only.as_str()))),
+                _ => None,
+            })
+            .collect();
+        if !fixed.is_empty() {
+            self.spec.fixed.insert(Arc::from(tool.name.as_str()), fixed);
+        }
         let key = format!("{:?}", tool.params);
         if self.body_override.is_none() {
             if let Some(&target) = shared.get(&key) {
@@ -1516,15 +1542,19 @@ impl<'a> ToolTreeBuilder<'a> {
             };
             arms.push((value.clone(), tail));
         }
-        let branch = match self.env.style {
+        let (branch, values) = match self.env.style {
             // The end marker rides on each arm, as in [`Self::build_value`].
             CallStyle::FunctionBlock => {
                 let marker = self.env.param_close;
+                let values = arms
+                    .iter()
+                    .map(|(v, _)| Some(Arc::from(v.as_str())))
+                    .collect();
                 let arms = arms
                     .into_iter()
                     .map(|(v, next)| (format!("{v}{marker}"), next))
                     .collect();
-                self.spec.push(NodeSpec::Branch { arms })
+                (self.spec.push(NodeSpec::Branch { arms }), values)
             }
             // Quoted, each carrying the first step of its own tail — so the
             // value and the key it requires next are one choice — and its
@@ -1532,16 +1562,20 @@ impl<'a> ToolTreeBuilder<'a> {
             CallStyle::JsonBlock | CallStyle::Lines => {
                 let quoted = arms
                     .into_iter()
-                    .map(|(v, next)| (Value::String(v).to_string(), next))
+                    .map(|(v, next)| {
+                        let value = Some(Arc::from(v.as_str()));
+                        (Value::String(v).to_string(), next, value)
+                    })
                     .collect();
-                let arms = self
-                    .with_continuations(quoted)
+                let (arms, values) = self.with_continuations(quoted);
+                let arms = arms
                     .into_iter()
                     .map(|(t, next)| (format!(" {t}"), next))
                     .collect();
-                self.spec.push(NodeSpec::Branch { arms })
+                (self.spec.push(NodeSpec::Branch { arms }), values)
             }
         };
+        self.chosen(branch, p, values);
         Ok(self.spec.push(NodeSpec::Static {
             text: self.key(p, first, ""),
             next: branch,
@@ -1682,6 +1716,8 @@ impl<'a> ToolTreeBuilder<'a> {
                         .map(|v| (format!("{v}{close}"), next))
                         .collect(),
                 });
+                let chosen = values.iter().map(|v| Some(Arc::from(v.as_str()))).collect();
+                self.chosen(branch, p, chosen);
                 return Ok((String::new(), branch));
             }
             // Every type is raw text here — there is no JSON to be structurally
@@ -1728,25 +1764,41 @@ impl<'a> ToolTreeBuilder<'a> {
         // An enum field's arms carry the first step of what follows the field
         // — the next key, or the close — so the value's closing quote and the
         // separator after it are one arm's text. See [`Self::continuations`].
-        let arms = self.value_arms(p, next)?.map(|arms| match p.enum_values {
-            Some(_) => self.with_continuations(arms),
-            None => arms,
-        });
+        // Each enum arm writes its value, in the order `value_arms` gives them
+        // — the values, then a nullable field's `null`, which writes none.
+        let (arms, values) = match (self.value_arms(p, next)?, &p.enum_values) {
+            (Some(arms), Some(enum_values)) => {
+                let valued = arms
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (text, n))| {
+                        (text, n, enum_values.get(i).map(|v| Arc::from(v.as_str())))
+                    })
+                    .collect();
+                let (arms, values) = self.with_continuations(valued);
+                (Some(arms), Some(values))
+            }
+            (arms, _) => (arms, None),
+        };
         match arms {
             // One way to begin — an object's `{`, an array's `[`, a one-value
-            // enum: it is the lead-in, folded into the key (`"filter": {`).
+            // enum: it is the lead-in, folded into the key (`"filter": {`). A
+            // one-value enum's value is its tool's to record (`TreeSpec::fixed`).
             Some(mut arms) if arms.len() == 1 => Ok(arms.remove(0)),
             // A choice — `true`/`false`, an enum, a value or `null`. The key
             // ends at the colon, so each arm carries its space.
-            Some(arms) => Ok((
-                String::new(),
-                self.spec.push(NodeSpec::Branch {
+            Some(arms) => {
+                let branch = self.spec.push(NodeSpec::Branch {
                     arms: arms
                         .into_iter()
                         .map(|(t, n)| (format!(" {t}"), n))
                         .collect(),
-                }),
-            )),
+                });
+                if let Some(values) = values {
+                    self.chosen(branch, p, values);
+                }
+                Ok((String::new(), branch))
+            }
             None => Ok((String::new(), self.free_value(next))),
         }
     }
@@ -2020,15 +2072,30 @@ impl<'a> ToolTreeBuilder<'a> {
     }
 
     /// `arms` with each one's successor's first step appended
-    /// ([`Self::continuations`]).
-    fn with_continuations(&self, arms: Vec<(String, SpecId)>) -> Vec<(String, SpecId)> {
-        arms.into_iter()
-            .flat_map(|(text, next)| {
-                self.continuations(next)
-                    .into_iter()
-                    .map(move |(tail, after)| (format!("{text}{tail}"), after))
-            })
-            .collect()
+    /// ([`Self::continuations`]), each carrying the value its arm writes — an
+    /// arm becomes one per continuation, every one writing the same value.
+    fn with_continuations(&self, arms: Vec<ValuedArm>) -> (Vec<(String, SpecId)>, Vec<ArmValue>) {
+        let mut out = Vec::with_capacity(arms.len());
+        let mut values = Vec::with_capacity(arms.len());
+        for (text, next, value) in arms {
+            for (tail, after) in self.continuations(next) {
+                out.push((format!("{text}{tail}"), after));
+                values.push(value.clone());
+            }
+        }
+        (out, values)
+    }
+
+    /// Mark `branch` as choosing `p`'s value, `values` the value of each of its
+    /// arms in arm order.
+    fn chosen(&mut self, branch: SpecId, p: &Param, values: Vec<ArmValue>) {
+        self.spec.chosen.insert(
+            branch,
+            ChosenArms {
+                field: Arc::from(p.name.as_str()),
+                values,
+            },
+        );
     }
 
     /// Any structurally-valid JSON value, lookahead-terminated at the enclosing
