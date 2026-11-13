@@ -108,17 +108,23 @@ deleted.
 
 ## 3. The gap quantize
 
-A gap does three things, in this order:
+A gap does these things, in this order:
 
-1. **Catch-up** (§3.5), if a gap is outstanding and its completion word is set.
-2. The arena creation and the compaction the gap already does
-   (`scheduler/run.rs`).
-3. **Quantize** (§3.1–§3.4), if no gap is outstanding and there are blocks to
+1. **Catch-up** (§3.5), if a gap is outstanding and its completion word is set:
+   install the converted blocks, record the summary's demand, and return every
+   leased slot no installed block took to its pool. The lease is then empty.
+2. **Demand** (§3.2): the classes and slot counts this gap's table needs.
+3. The arena creation and the compaction the gap already does
+   (`scheduler/run.rs`), with this gap's demand set aside as ground, so that
+   nothing is released that the lease would grow straight back.
+4. **Lease** (§3.2): allocate the demand from the pools, lowest place first.
+5. **Quantize** (§3.1–§3.4), if no gap is outstanding and there are blocks to
    take.
 
 **At most one gap is outstanding.** A gap whose predecessor's completion word is
-not yet set quantizes nothing; its blocks wait for the next gap. The summary is
-therefore one buffer, a lease is never held by two gaps, and the host never
+not yet set quantizes nothing; its blocks wait for the next gap, and the
+outstanding gap's lease stays held, untouched, until its catch-up. The summary
+is therefore one buffer, a lease is never held by two gaps, and the host never
 reasons about two unread results.
 
 ### 3.1 Inputs, without a readback
@@ -179,16 +185,20 @@ chooses among them.**
   writes the source half and the claim writes the destination half. The gap
   adds two kernels of its own in `kv_gap_claim.cu`: the claim, which also
   writes the destination records, and the completion word.
-- **Leases.** For every reachable quant class the host keeps a standing lease:
-  free slots claimed from that class's arenas (`ChunkGidPool`, lowest place
-  first), held as `ChunkGid`s, and mirrored on the device as a **slot stack**
-  of slot addresses, one run per class. Each gap the host uploads the stack
-  whole, as it stands after the last catch-up, the one upload the claim needs.
-  A class's target is capped at the gap's band count, but a lease is only ever
-  topped up, never trimmed, so the stack holds at most one eight-byte entry per
-  band of the widest gap so far **per reachable class**: the level's
-  reachable-class count times the band count, not the band count. Slots a gap does not take
-  stay leased for the next one.
+- **A lease lives for one gap.** Each gap the host allocates a lease for that
+  gap's demand alone: free slots claimed from each class's arenas
+  (`ChunkGidPool`, lowest place first), held as `ChunkGid`s on the host, and
+  handed to the device as a **slot stack** of slot addresses, one run per
+  class, built from the slots just allocated and uploaded with the gap's other
+  inputs. The stack is about one eight-byte entry per band of this gap — some
+  3 MB for an 8K prompt's prefill gap, a few KB for a decode gap — against the
+  hundreds of bytes per band the convert moves. At the next catch-up every slot
+  the gap did not install goes back to its pool, so no lease stands between
+  gaps: compaction and the empty sweep see every free slot, the next lease is
+  packed lowest place first into the holes that truncates, evictions and freed
+  natives opened, and the addresses on the device are never older than the gap
+  that reads them. The host is the only owner of a leased slot; the device is
+  told addresses and reports, through the summary, which of them it used.
 - **Claim, in table order.** A band's format is the selection's palette tag,
   or the policy's uniform override; a host-built table maps each format code to
   its size class and its record format code. The claim gives every band its
@@ -206,9 +216,10 @@ chooses among them.**
   256, so the gap as a whole takes those two and refuses the rest at setup.
 - **A class that runs dry defers the block, never fails it.** A block is
   deferred when any of its bands' indices falls past its class's lease. The
-  whole block stays native and goes into the next gap's table. Its bands still
-  hold their indices, so no later block's slot moves; the slots they name are
-  not written and stay leased. The convert runs over every row of the buffer,
+  whole block stays native and goes first into the next gap's table. Its bands
+  still hold their indices, so no later block's slot moves; the slots they name
+  are not written, and go back to their pools at the catch-up with the rest of
+  the unused lease. The convert runs over every row of the buffer,
   so a deferred block's destinations are set to one **sink** slot as wide as
   the widest class, which nothing ever reads: the convert writes a deferred
   band there and nowhere else. A block that stays native for a gap is still
@@ -217,18 +228,35 @@ chooses among them.**
 - **Every band takes a slot.** The selection's candidates are all quantized
   formats (R16 among them at C0), so every band is converted into a slot of its
   class.
-- **Lease size is bounded by this gap's own demand.** The host built the table,
-  so it knows the band count exactly: blocks × heads × `N_PALETTE` × 2. Only
-  the split across classes is unknown. Each class's lease is topped up to that
-  count times the class's recent peak share of claims (read from the summaries,
-  kept separately for prefill and decode gaps), plus one arena's headroom, and
-  never more than the count itself. The share is a fraction, not a volume, so a
-  prefill arriving after an idle period is leased for its own size. Before any
-  summary exists the count is split evenly across the reachable classes.
-  This replaces §2a's backlog-sized reserve: the lease covers one gap's demand,
-  not the whole backlog. The lease is KV ground and is bought below
-  `weight_floor` (invariant 7). When the ground cannot cover a lease, the class
-  defers blocks for a gap rather than take ground from the experts.
+- **The demand comes from the summaries, not from a model.** The claim counts
+  every band of the table into its class, deferred or not, so each summary
+  carries the exact per-class demand of the blocks it saw. A gap's demand is
+  two parts:
+  - **Retried blocks, exactly.** Each deferred block's rows name the format of
+    every band, so its demand per class is known to the slot. Deferred blocks
+    lead the next table, and the claim hands out slots in table order, so a
+    lease that covers their exact demand is certain to place them: the
+    selection is deterministic on native bytes that have not changed, and
+    chooses the same formats again.
+  - **New blocks, by measured share.** Their band count is exact — blocks ×
+    heads × `N_PALETTE` × 2 — and only the split across classes is not yet
+    known. It is taken from each class's peak share of claims over the recent
+    summaries, kept apart for prefill and decode gaps, and capped at the band
+    count. The share is a fraction, not a volume, so a prefill arriving after an
+    idle period is leased for its own size. Before any summary exists the count
+    is split evenly across the reachable classes.
+
+  An over-estimate costs only slots allocated and returned within one gap; an
+  under-estimate defers the blocks past it, whose exact demand the summary then
+  reports, and the next gap places them. Nothing is held against a backlog:
+  this replaces §2a's backlog-sized reserve. The lease is KV ground and is
+  bought below `weight_floor` (invariant 7), from free slots in existing arenas
+  first and then new arenas. When the ground cannot cover a class's demand, the
+  class defers blocks for a gap rather than take ground from the experts.
+- **Ground, not slots, is what is kept.** Compaction and the empty sweep run
+  with the gap's demand per class set aside, so an arena the lease is about to
+  fill is not released and grown again within the same gap. Which slots fill
+  that ground is decided fresh each gap, lowest place first.
 
 ### 3.3 Convert
 
@@ -286,8 +314,12 @@ outstanding gap's blocks. For each converted block the host:
   (`update_chunk`), uploaded with the gap's other slot uploads in one scatter;
 - drops the owner's reference to the native bands.
 
-A deferred block is put into this gap's table. Each class's share is updated for
-the next leases. This is the install the persistence thread does today, moved to
+Then the rest of the lease goes back: every slot no installed block took — the
+slots past every class's demand, the slots deferred blocks were given and
+never wrote, the slots of rows discarded as stale — returns to its pool, and
+the lease is empty. A deferred block leads this gap's table, its exact demand
+taken from its rows, and each class's share of the summary's claims is recorded
+for the new blocks' demand (§3.2). This is the install the persistence thread does today, moved to
 the thread that owns the sequences, with nothing left to fence: the convert has
 finished, and the header upload is queued on the stream ahead of the next
 forward.
@@ -383,10 +415,11 @@ of them is redesigned rather than excepted.
    gap by the stream itself. No host code has to remember to wait.
 3. **A slot has one owner: the free pool, a lease, or a sealed block.** A lease
    takes its slots out of `ChunkGidPool` before the gap that may write them is
-   launched, and nothing else hands them out while they are leased. The device
+   launched, and nothing else hands them out while they are leased. The lease
+   is the host's: the device is handed addresses and owns none of them. It
    writes only to `stack[class][i]` with `i` below the class's lease length, so
    no address it can write lies outside the lease. A slot leaves the lease only
-   at the catch-up, into a block or back to the stack.
+   at the catch-up, which empties it: into a block, or back to its pool.
 4. **A native band an outstanding gap reads is not freed until its catch-up.**
    The gap holds a `ChunkPin` on every native band in its table, and the
    catch-up drops it. A truncate, an eviction or a seal in the window drops
@@ -401,7 +434,7 @@ of them is redesigned rather than excepted.
    - Each row names the native gids it converted and its sequence's generation.
      The catch-up installs a row only when the block at that index still holds
      those gids under that generation. Otherwise the row is discarded and its
-     slots go back to the stack.
+     slots go back to their pools.
    - At most one gap is outstanding. A gap that finds one quantizes nothing, so
      no buffer, lease or row is ever shared by two gaps.
    - Arming a gap clears the summary's error and completion words. Completion
@@ -529,9 +562,11 @@ Unit tests, written with the code, asserting raw expected bytes:
   blocks in, writer chunks out, a sealed residence's partial block in, rows
   past the committed offset out, a block one layer lacks out, and nothing
   before a sequence's cursor;
-- the lease for a known table: never more than the table's band count, split by
-  the recorded shares, split evenly when there are none, and topped up by only
-  the entries it lacks;
+- the lease for a known table: the retried blocks' exact demand plus the new
+  blocks' band count split by the recorded peak shares (evenly when there are
+  none), never more than the table's band count per class, allocated lowest
+  place first; and the catch-up emptying it, every slot either in an installed
+  block or back in its pool;
 - the device claim against a lease: the slot each band takes, the same on every
   run; a dry class deferring exactly the blocks past its lease and writing none
   of their other bands; a band kept native taking no slot;
@@ -554,7 +589,7 @@ Unit tests, written with the code, asserting raw expected bytes:
   and that no block is both sealed and deferred. A failing interleaving is kept
   as a fixed regression test;
 - on the device, a truncate and an eviction landing while a gap is outstanding:
-  the stale rows are discarded, their slots return to the stack, and the
+  the stale rows are discarded, their slots return to their pools, and the
   surviving blocks hold exactly the bytes the per-block reference quantizer
   gives.
 
@@ -633,13 +668,18 @@ Line numbers are as of commit `dc04b62ac`.
   cut.
 
 **3. The lease (§3.2).**
-- New `candle-nn/src/kv_cache/chunked/gap/lease.rs`: the standing per-class
-  lease, its device stack, the top-up and the share.
-- `candle-nn/src/kv_cache/chunked/gid_pool.rs:1428`, `ChunkGidPool`: claiming
-  free slots lowest place first; `set_reserve_target` (`:1465`) goes.
+- New `candle-nn/src/kv_cache/chunked/gap/lease.rs`: the one-gap lease, its
+  demand (retried blocks exactly, new blocks by peak share), its device stack,
+  the take at the catch-up and the return of the rest.
+- `candle-nn/src/kv_cache/chunked/gid_pool.rs:1428`, `ChunkGidPool`: the lease
+  allocates through `allocate_n_for`, which already takes the lowest-placed
+  arena with a free slot (a find-first-set over the capacity bitmap); each
+  slot's address is computed as it is allocated, so building the stack is a
+  copy. `set_reserve_target` (`:1465`) goes.
 - `candle-nn/src/kv_cache/chunked/alloc.rs:509`, `owe_reserves`, and
-  `reserve_target.rs:45`, `reserve_targets`: replaced by the lease's sizing.
-- `alloc.rs:664`, `create_deferred_arenas`: still makes the arenas a lease is
+  `reserve_target.rs:45`, `reserve_targets`: replaced by the lease's demand.
+- `alloc.rs:664`, `create_deferred_arenas`, and the compaction: run with the
+  gap's demand per class set aside as ground, and make the arenas a lease is
   short of, in the gap.
 
 **4. The kernels (§3.2, §3.3).**
@@ -731,11 +771,13 @@ Line numbers are as of commit `dc04b62ac`.
 **Addresses on the device.**
 - A slot stack holds raw arena addresses. Any move of the ground under it
   invalidates them: a compaction, a vacate (`vacate_epoch`), a frontier or
-  `weight_floor` move (invariant 7). The stack is rebuilt after any of them,
-  and never inferred to be unchanged from the geometry.
+  `weight_floor` move (invariant 7). The stack is built each gap from slots
+  allocated after that gap's compaction, so it is never older than the gap
+  that reads it; nothing keeps it across gaps.
 - While a gap is outstanding the host does not know which leased slots it
   wrote. Compaction and the empty sweep treat the whole lease as held until the
-  catch-up, and never release an arena a lease stands in.
+  catch-up, and never release an arena a lease stands in. That is at most one
+  gap's lease, and only while that gap is outstanding.
 - A record names its bands by raw address, so it must hold their gids
   (`meta_pool.rs`). A record filled at the catch-up holds the claimed gids, not
   the native ones.
