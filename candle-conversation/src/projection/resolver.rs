@@ -1295,6 +1295,35 @@ impl Conversation {
                         groups: GroupSet::weighed(&coll.policy.layer_weights, arena.n_groups()),
                         keep: coll.policy.scan.gallery_keep,
                     };
+                    // Every probe token's vote in each fold group, as the needle
+                    // gate meets them: which member each token's best match
+                    // named, and how strongly. What a wrong pick was built from.
+                    if tracing::enabled!(target: "candle_conversation::belief::tokens", tracing::Level::TRACE)
+                    {
+                        if let Ok(votes) = arena.scan_votes(&[make_segment()], &[p]) {
+                            let rows: Vec<String> = (0..p.len())
+                                .map(|t| {
+                                    let groups: Vec<String> = (0..votes.n_groups)
+                                        .map(|g| match votes.at(t, g, 0) {
+                                            Some((c, v)) => format!(
+                                                "{}:{v:.0}",
+                                                coll.sections.get(c).map_or("?", |s| s.name.as_str())
+                                            ),
+                                            None => "-".to_string(),
+                                        })
+                                        .collect();
+                                    format!("t{t}[{}]", groups.join(" "))
+                                })
+                                .collect();
+                            tracing::trace!(
+                                target: "candle_conversation::belief::tokens",
+                                collection = %coll.name,
+                                tokens = p.len(),
+                                votes = %rows.join(" "),
+                                "probe token votes"
+                            );
+                        }
+                    }
                     let scan_w = |w: &[f32]| -> Option<Vec<f32>> {
                         match arena.scan_weighted(&[make_segment()], &[p], w) {
                             Ok(mut out) => Some(out.pop().unwrap_or_default()),
