@@ -84,6 +84,22 @@ pub struct TreeSpec {
     /// The branches whose arms are a call's tool names: what the walk reads a
     /// call's tool from.
     pub name_branches: HashSet<SpecId>,
+    /// The branches whose arms choose an argument's value — an enum's values,
+    /// a nullable one's `null` beside them: the field each writes and, arm by
+    /// arm, the value. What a held field depending on an enum reads it by
+    /// (`docs/stencil_tree.md` §9.2), as a span's value is read by `keys`.
+    pub chosen: HashMap<SpecId, ChosenArms>,
+    /// Each tool's required arguments whose schema leaves one value: written
+    /// on every call of the tool, with no branch to choose them.
+    pub fixed: HashMap<Arc<str>, Vec<(Arc<str>, Arc<str>)>>,
+}
+
+/// A branch's arms as an argument's values: the field, and the value each arm
+/// writes in arm order — `None` for an arm that writes none (`null`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenArms {
+    pub field: Arc<str>,
+    pub values: Vec<Option<Arc<str>>>,
 }
 
 impl TreeSpec {
@@ -95,6 +111,8 @@ impl TreeSpec {
             bail: String::new(),
             keys: HashMap::new(),
             name_branches: HashSet::new(),
+            chosen: HashMap::new(),
+            fixed: HashMap::new(),
         }
     }
 

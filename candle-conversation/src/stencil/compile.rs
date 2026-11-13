@@ -32,6 +32,7 @@ pub fn compile(spec: &TreeSpec, vocab: &dyn Vocab) -> Result<StencilTree, BuildE
     let encoder = EncodeCache::new(vocab);
     let vocab: &dyn Vocab = &encoder;
     let mut arena = Arena::default();
+    arena.marks.fixed = Arc::new(spec.fixed.clone());
     let root = lower(spec, vocab, spec.root, "", &mut arena)?;
     let Arena { nodes, marks, .. } = arena;
     verify_invariants(&nodes)?;
@@ -348,6 +349,18 @@ fn lower_branch(
             .map(|((text, _), (tokens, _))| (tokens.clone(), Arc::from(tool_name(text))))
             .collect();
         arena.marks.name_branches.insert(branch, Arc::new(named));
+    }
+    if let Some(chosen) = spec.chosen.get(&SpecId(node)) {
+        let by_arm = chosen
+            .values
+            .iter()
+            .zip(&trie_arms)
+            .filter_map(|(value, (tokens, _))| Some((tokens.clone(), Arc::clone(value.as_ref()?))))
+            .collect();
+        arena
+            .marks
+            .chosen
+            .insert(branch, (Arc::clone(&chosen.field), Arc::new(by_arm)));
     }
     if static_toks.is_empty() {
         Ok(branch)

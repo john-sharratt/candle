@@ -112,9 +112,19 @@ fn walk(
     values: &[(&str, &str)],
     stop: impl Fn(&str) -> bool,
 ) -> (String, BTreeSet<u8>) {
+    walk_on(v, driver(v), "file_edit", values, stop)
+}
+
+/// [`walk`] on `d`, a call of `tool`.
+fn walk_on(
+    v: &TestVocab,
+    mut d: StencilDriver,
+    tool: &str,
+    values: &[(&str, &str)],
+    stop: impl Fn(&str) -> bool,
+) -> (String, BTreeSet<u8>) {
     let mut values: HashMap<&str, &str> = values.iter().copied().collect();
-    values.insert("name", "file_edit");
-    let mut d = driver(v);
+    values.insert("name", tool);
     let mut text = String::new();
     for _ in 0..400 {
         let set: Option<AllowedSet> = match d.step() {
@@ -230,6 +240,96 @@ fn a_held_call_completes_and_an_unheld_file_keeps_its_pattern() {
         allowed.contains(&b'Z') && allowed.contains(&b'9'),
         "{allowed:?}"
     );
+}
+
+/// A listing whose `repo` is one of `repos` — an enum, as the daemon writes a
+/// workspace's repositories into it — and whose `path` names a directory.
+fn list_tool(repos: &[&str]) -> ToolSpec {
+    ToolSpec::from_json_schema(
+        "file_list",
+        &json!({
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "enum": repos},
+                "path": {"type": "string"}
+            },
+            "required": ["repo", "path"]
+        }),
+    )
+}
+
+/// `r` has `src` and `docs`; `s` has `crates`.
+fn dirs() -> ValueHolds {
+    ValueHolds {
+        fields: vec![FieldHold {
+            tools: vec!["file_list".into()],
+            field: "path".into(),
+            on: vec!["repo".into()],
+            table: HashMap::from([
+                (vec!["r".into()], vec!["src".into(), "docs".into()]),
+                (vec!["s".into()], vec!["crates".into()]),
+            ]),
+        }],
+    }
+}
+
+fn list_driver(v: &TestVocab, repos: &[&str]) -> StencilDriver {
+    let spec = compile_tool_call_tree(&[list_tool(repos), read_tool()], &ToolCallEnvelope::qwen3())
+        .unwrap();
+    let tree = Arc::new(compile(&spec, v).unwrap());
+    TriggerRegistry::new()
+        .with_trigger(TRIGGER, tree)
+        .holding_values(
+            TRIGGER,
+            Arc::new(HeldValues::build(&dirs(), v, &mut HeldRules::default())),
+        )
+        .driver_for(TRIGGER)
+        .unwrap()
+}
+
+/// **A field held on an enum is held by the value the enum's branch chose.**
+/// `repo` is a choice, not a span, so nothing but the branch can say which
+/// repository the call names: in `r` a listing's path begins `s` or `d`, in
+/// `s` only `c` — the directory `s` has. Read from spans alone, the path was
+/// free in every repository, and a live listing of `crates` in a repository
+/// without one came back `not_found`.
+#[test]
+fn a_field_held_on_an_enum_reads_the_value_it_chose() {
+    let v = TestVocab::new();
+    let at_path = |t: &str| t.ends_with("\"path\": \"");
+    let (_, in_r) = walk_on(
+        &v,
+        list_driver(&v, &["r", "s"]),
+        "file_list",
+        &[("repo", "r"), ("path", "src")],
+        at_path,
+    );
+    assert_eq!(in_r, bytes("ds"));
+    let (_, in_s) = walk_on(
+        &v,
+        list_driver(&v, &["r", "s"]),
+        "file_list",
+        &[("repo", "s"), ("path", "crates")],
+        at_path,
+    );
+    assert_eq!(in_s, bytes("c"));
+}
+
+/// **A one-value enum is written by the key, and still held by**: with `s`
+/// the workspace's only repository, `repo` has no branch to choose it, and the
+/// path is held to `s`'s directories all the same.
+#[test]
+fn a_one_value_enum_holds_by_its_value() {
+    let v = TestVocab::new();
+    let (text, allowed) = walk_on(
+        &v,
+        list_driver(&v, &["s"]),
+        "file_list",
+        &[("path", "crates")],
+        |t| t.ends_with("\"path\": \""),
+    );
+    assert!(text.contains("\"repo\": \"s\""), "{text}");
+    assert_eq!(allowed, bytes("c"));
 }
 
 /// **A spill into a held value keeps to the held rule**: a token that closes
