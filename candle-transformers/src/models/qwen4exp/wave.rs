@@ -68,6 +68,7 @@ use super::qsa::IndexerWeights;
 use super::qsa_select::{budget_fits_kernel, coalesce_ranges, Strata, MAX_PINS};
 use super::resident_page::{PageRegistry, ResidentPage};
 use super::select_bytes::select_layer_bytes;
+use super::sequence_pools::SequencePools;
 use super::shadow::{ShadowGeometry, ShadowRows, ShadowSegment};
 use super::spec::SpecCapture;
 use super::state_slots::state_buffer;
@@ -152,10 +153,6 @@ fn seal_live(c: &IndexCache, last_cells: usize) -> Result<SealedIndex> {
 /// accepted/step column at C6 and above.
 pub const DRAFT_HEAD_MAX_COMPRESSION: u8 = 3;
 
-/// One sequence's pool: each pooled piece's resident pages at the sampled
-/// layers.
-type PooledPieces = HashMap<PieceKey, Vec<Arc<ResidentPage>>>;
-
 /// The batched model the scheduler drives.
 pub struct Qwen4ExpBatched {
     /// `pub(super)` so the draft head's own module can reach the engine it runs
@@ -195,7 +192,7 @@ pub struct Qwen4ExpBatched {
     /// with no K/V behind them in the slot, read by the shadow scan. Shared
     /// through [`Self::pages`] with every sequence that pools or places the
     /// same piece, and released with the last of them.
-    pooled: RwLock<HashMap<usize, PooledPieces>>,
+    pooled: SequencePools,
     /// Per-sequence carried residual for the draft head's next first row — the
     /// `h(t-1)` its input assembly needs across a wave boundary. Empty on a
     /// checkpoint with no head, and reset with the other carried state when a
@@ -1419,38 +1416,19 @@ impl Qwen4ExpBatched {
             .into_iter()
             .flatten()
             .collect();
-        self.pooled
-            .write()
-            .map_err(|_| candle::Error::Msg("qwen4exp: pool lock poisoned".into()))?
-            .entry(seq)
-            .or_default()
-            .insert(*key, layers);
+        self.pooled.hold(seq, *key, layers)?;
         Ok(before)
     }
 
     /// Let go of `seq`'s pooled pieces not in `keep`: the pool dropped them,
     /// and their rows go back to the tenant once nothing else holds them.
     pub fn retain_pooled(&self, seq: usize, keep: &[PieceKey]) -> Result<()> {
-        let mut pooled = self
-            .pooled
-            .write()
-            .map_err(|_| candle::Error::Msg("qwen4exp: pool lock poisoned".into()))?;
-        if let Some(p) = pooled.get_mut(&seq) {
-            p.retain(|k, _| keep.contains(k));
-        }
-        Ok(())
+        self.pooled.retain(seq, keep)
     }
 
     /// The pieces `seq`'s pool holds.
     pub fn pooled_keys(&self, seq: usize) -> Vec<PieceKey> {
-        self.pooled
-            .read()
-            .map(|p| {
-                p.get(&seq)
-                    .map(|m| m.keys().copied().collect())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default()
+        self.pooled.keys(seq)
     }
 
     /// Install a sealed page per attention layer ahead of `seq`'s live tail.
@@ -2197,7 +2175,7 @@ impl Qwen4ExpBatched {
             index: RwLock::new(HashMap::new()),
             pages: PageRegistry::default(),
             retired: RwLock::new(HashMap::new()),
-            pooled: RwLock::new(HashMap::new()),
+            pooled: SequencePools::default(),
             index_rope,
             qsa_rows: AtomicU64::new(0),
             rope,
@@ -3731,9 +3709,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         if let Ok(mut m) = self.index.write() {
             m.remove(&seq);
         }
-        if let Ok(mut m) = self.pooled.write() {
-            m.remove(&seq);
-        }
+        self.pooled.release(seq);
         // A recycled id must not inherit the previous conversation's pieces.
         if let Ok(mut m) = self.hits.write() {
             m.remove(&seq);

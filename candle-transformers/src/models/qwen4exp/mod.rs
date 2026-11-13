@@ -79,6 +79,9 @@ pub mod rope;
 pub mod rows_matmul;
 #[cfg(feature = "cuda")]
 pub mod select_bytes;
+/// Each sequence's pool of index pages with no K/V behind them in its slot.
+#[cfg(feature = "cuda")]
+pub mod sequence_pools;
 /// The shadow scan's host side: the pooled rows a declaration names and the
 /// launch that scores the stride's kept queries against them.
 #[cfg(feature = "cuda")]
