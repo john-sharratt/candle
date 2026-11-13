@@ -421,6 +421,9 @@ impl SlotState {
             hit_keys: Vec::new(),
             round_hits: self.round_hits.clone(),
             unread_hits: Vec::new(),
+            // The model holds a pool's pages per sequence: the fork's holds
+            // none until its own first reprojection chooses one.
+            pool: PoolPages::new(),
         }
     }
 
