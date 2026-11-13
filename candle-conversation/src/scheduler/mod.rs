@@ -112,7 +112,7 @@ use section_pages::SectionPages;
 
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
-use self::pool::default_pool_tokens;
+use self::pool::pool_tokens_for;
 use self::relief_pacing::ReliefPacing;
 use self::request_laps::RequestLaps;
 use self::wave_timing::WaveTiming;
@@ -4222,7 +4222,7 @@ impl Scheduler {
             ?page_break_tokens,
             "index page breaks resolved by name (<think>, </think>, turn closer)"
         );
-        let pool_tokens = default_pool_tokens(
+        let pool_tokens = pool_tokens_for(
             model
                 .device()
                 .mem_get_info()

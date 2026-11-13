@@ -1060,8 +1060,8 @@ fn parse_working_set(
     // The slot is the engine's trained window, which the schema does not know:
     // the shares and the window are caps on one fill of it
     // (`docs/hit_driven_projection.md` §7.2), so they may sum past it; the
-    // reserve is checked against it when the engine is attached
-    // (`WorkingSetConfig::check_fits`).
+    // reserve and the locks are measured against it at each fill, which runs on
+    // the rung above when they pass it (`WorkingSetConfig::slot_window`).
     let max_admits = match yw.max_admits {
         None => DEFAULT_MAX_SWAPS,
         Some(n) => NonZeroUsize::new(n).ok_or_else(|| {

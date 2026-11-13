@@ -9944,7 +9944,7 @@ mod projection_schema_tests {
         // (244K of 246K), so a thin working set leaves its room to the
         // dialogue (`docs/hit_driven_projection.md` §4, §7.2).
         assert_eq!(ws.reserve_tokens, 16_384);
-        assert_eq!(ws.check_fits(262_144), Ok(()));
+        assert_eq!(ws.slot_window(262_144).window, 262_144);
         assert_eq!(layer("dialogue").window, 180_000);
         assert_eq!(layer("dialogue").window + ws.budget_tokens, 244_000);
         // The persona and the journal are pinned, within 1,024 positions.

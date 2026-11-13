@@ -12,10 +12,10 @@ use std::collections::HashMap;
 
 use crate::projection::TimelineId;
 
-/// The `pool_tokens` a card of `total_bytes` of device memory holds when its
-/// machine config names none: 1M tokens on the 72 GB card, 512K on the 24 GB
-/// card, 256K on the 16 GB card.
-pub fn default_pool_tokens(total_bytes: u64) -> usize {
+/// The `pool_tokens` a card of `total_bytes` of device memory holds, by its
+/// size alone: 1M tokens on the 72 GB card, 512K on the 24 GB card, 256K on
+/// the 16 GB card.
+pub fn pool_tokens_for(total_bytes: u64) -> usize {
     const GIB: u64 = 1 << 30;
     match total_bytes {
         b if b >= 48 * GIB => 1_000_000,
@@ -82,9 +82,9 @@ mod tests {
 
     #[test]
     fn each_card_has_its_pool() {
-        assert_eq!(default_pool_tokens(73_415 << 20), 1_000_000);
-        assert_eq!(default_pool_tokens(24_576 << 20), 512_000);
-        assert_eq!(default_pool_tokens(16_376 << 20), 256_000);
+        assert_eq!(pool_tokens_for(73_415 << 20), 1_000_000);
+        assert_eq!(pool_tokens_for(24_576 << 20), 512_000);
+        assert_eq!(pool_tokens_for(16_376 << 20), 256_000);
     }
 
     /// Floors first whatever they cost, then by score while each whole piece

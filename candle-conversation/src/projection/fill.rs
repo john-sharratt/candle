@@ -15,7 +15,8 @@
 //!    — a reading's request and answer, an older exchange's pair — with it, and
 //!    only if all of them fit.
 //!
-//! The working set's shares and the dialogue's window are **caps**: they bound
+//! The working set's shares, the dialogue's window and each other layer's
+//! window are **caps**: they bound
 //! how much of a kind the scored tier takes and never reserve room, and floors
 //! count toward their kind's cap without ever being skipped for it.
 
@@ -30,8 +31,12 @@ pub enum Kind {
     Folder,
     /// A round of a guide or a journal note — under `budget` and `guidance`.
     Guidance,
-    /// A round of the dialogue or of its inherited lineage — under `window`.
+    /// A round of the dialogue or of its inherited lineage, or an exchange of
+    /// another group on the dialogue's layer — under `window`.
     Dialogue,
+    /// An exchange of a group on another layer of the projection — under that
+    /// layer's `window`, `Caps::layers[i]`.
+    Layer(usize),
 }
 
 /// One unit the fill places or leaves: a round, or a floor pair placed as one.
@@ -54,13 +59,16 @@ pub struct FloorExchange {
 }
 
 /// How much of each kind the scored tier may take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caps {
     pub budget: usize,
     pub folder: usize,
     pub guidance: usize,
     pub max_file: usize,
     pub window: usize,
+    /// Each other layer's `window`, indexed by [`Kind::Layer`]. A layer with
+    /// no entry takes nothing.
+    pub layers: Vec<usize>,
 }
 
 /// Everything one fill decides over.
@@ -128,6 +136,10 @@ impl Used {
             && (!add.contains_key(&Kind::Folder) || after(Kind::Folder) <= caps.folder)
             && (!add.contains_key(&Kind::Guidance) || after(Kind::Guidance) <= caps.guidance)
             && (!add.contains_key(&Kind::Dialogue) || after(Kind::Dialogue) <= caps.window)
+            && add.keys().all(|k| match *k {
+                Kind::Layer(i) => after(*k) <= caps.layers.get(i).copied().unwrap_or(0),
+                _ => true,
+            })
             && by_piece
                 .iter()
                 .all(|(p, t)| self.by_piece.get(p).copied().unwrap_or(0) + t <= caps.max_file)
@@ -247,6 +259,7 @@ mod tests {
             guidance: 300,
             max_file: 500,
             window: 1_000,
+            layers: vec![100],
         }
     }
 
@@ -424,6 +437,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(fill(&round_first, &caps()).placed, vec![10, 11]);
+    }
+
+    /// Another layer's exchanges compete by score under that layer's window,
+    /// and a layer with no window entry takes nothing.
+    #[test]
+    fn another_layer_is_capped_by_its_own_window() {
+        let input = FillInput {
+            room: 10_000,
+            scored: vec![
+                u(1, 1, Kind::Layer(0), 60, 0.9),
+                u(2, 2, Kind::Layer(0), 60, 0.8),
+                u(3, 3, Kind::Layer(0), 40, 0.7),
+                u(4, 4, Kind::Layer(1), 10, 0.6),
+                u(5, 5, Kind::Dialogue, 100, 0.5),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(fill(&input, &caps()).placed, vec![1, 3, 5]);
     }
 
     /// Ties go to the older unit — the lower id.

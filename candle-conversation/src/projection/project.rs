@@ -94,9 +94,10 @@
 //! wrong, and visibly simpler.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::adaptive::AnchorMember;
-use super::dialogue_fill::{self, DialogueSlot, WorkingPiece};
+use super::dialogue_fill::{self, ContextExchange, DialogueSlot, WorkingPiece};
 use super::fill::{Caps, Kind};
 use super::ids::{
     CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
@@ -167,6 +168,10 @@ fn close_under_exchange(
     members.insert(rep, m);
     rep
 }
+
+/// Whether a working set past the engine's trained window has been reported:
+/// the configuration is fixed for the process, so it is said once.
+static SLOT_EXPANDED_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Emit a selected candidate: the exchange's turns in ascending order, right
 /// where the representative sat. Selection ranks representatives; this is the
@@ -1977,10 +1982,10 @@ pub fn run_with_sink<R: ContentResolver>(
         .unwrap_or(0);
 
     // **A dialogue whose engine selects is filled, not flexed**
-    // (`docs/hit_driven_projection.md` §7.2): its lineage, its working set and
-    // its own exchanges go into one score-ordered fill of the engine's trained
-    // window, and neither its group nor the working set's take part in the
-    // flexbox. The other groups flex in the window as before.
+    // (`docs/hit_driven_projection.md` §7.2): its lineage, its working set, its
+    // own exchanges and every other group's selections go into one
+    // score-ordered fill of the engine's trained window, and nothing takes
+    // part in the flexbox.
     let fill_target = schema
         .layers
         .iter()
@@ -1988,9 +1993,7 @@ pub fn run_with_sink<R: ContentResolver>(
         .and_then(|l| l.working_set.as_ref().map(|ws| (l, ws)))
         .zip(resolver.trained_window())
         .filter(|_| declares_working_set);
-    let flexed = |gs: &GroupState| {
-        gs.working_set.is_none() && !(fill_target.is_some() && gs.schema.id == target.group)
-    };
+    let flexed = |gs: &GroupState| gs.working_set.is_none() && fill_target.is_none();
     let flex_layer_indices: Vec<usize> = surviving_layer_indices
         .iter()
         .copied()
@@ -2208,22 +2211,24 @@ pub fn run_with_sink<R: ContentResolver>(
     // ── Step 11b: The dialogue's fill ────────────────────────────────────────
     // Turns placed as one record alone, by the carving the fill chose.
     let mut record_of: HashMap<TurnKey, TurnRecord> = HashMap::new();
-    if let Some(((layer, ws), window)) = fill_target {
-        if let Err(e) = ws.check_fits(window) {
-            tracing::error!(layer = %layer.name, "{e}");
+    if let Some(((layer, ws), trained)) = fill_target {
+        let slot_window = ws.slot_window(trained);
+        if let Some(why) = &slot_window.expanded {
+            if !SLOT_EXPANDED_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    layer = %layer.name,
+                    window = slot_window.window,
+                    "{why}: the slot fills YaRN ×2"
+                );
+            }
         }
-        // The room the fill has: the trained window less the reserve, the
-        // system prompt as emitted, what the turn has appended and what the
-        // groups that still flex took.
-        let flexed_tokens: usize = final_selected
-            .iter()
-            .map(|(_, k)| resolver.turn_token_count(*k))
-            .sum();
-        let room = window
+        // The room the fill has: the slot's window less the reserve, the
+        // system prompt as emitted and what the turn has appended.
+        let room = slot_window
+            .window
             .saturating_sub(ws.reserve_tokens)
             .saturating_sub(segment_tokens(&system_prompt_segments, resolver))
-            .saturating_sub(decode_pos.unwrap_or(0))
-            .saturating_sub(flexed_tokens);
+            .saturating_sub(decode_pos.unwrap_or(0));
         let (recent, lineage_base) = group_states
             .iter()
             .find(|gs| gs.schema.id == target.group)
@@ -2306,6 +2311,29 @@ pub fn run_with_sink<R: ContentResolver>(
                 working_groups.push(gs.schema.id);
             }
         }
+        // Every other group: each selected exchange whole, at its selection
+        // score — on the dialogue's layer under its window, on another layer
+        // under that layer's.
+        let mut context: Vec<ContextExchange> = Vec::new();
+        let mut context_of: Vec<GroupId> = Vec::new();
+        for gs in group_states
+            .iter()
+            .filter(|gs| gs.working_set.is_none() && gs.schema.id != target.group)
+        {
+            let kind = if visible_layers[gs.layer_idx].id == target.layer {
+                Kind::Dialogue
+            } else {
+                Kind::Layer(gs.layer_idx)
+            };
+            for (key, score) in &gs.selected {
+                context.push(ContextExchange {
+                    kind,
+                    exchange: gs.members.get(key).cloned().unwrap_or_else(|| vec![*key]),
+                    score: *score,
+                });
+                context_of.push(gs.schema.id);
+            }
+        }
         let slot = DialogueSlot {
             room,
             caps: Caps {
@@ -2314,11 +2342,13 @@ pub fn run_with_sink<R: ContentResolver>(
                 guidance: ws.guidance_tokens,
                 max_file: ws.max_file_tokens,
                 window: layer.window,
+                layers: visible_layers.iter().map(|l| l.window).collect(),
             },
             recent,
             lineage,
             working,
             own: exchanges_of(&own_keys),
+            context,
         };
         let plan = dialogue_fill::plan(
             &slot,
@@ -2335,6 +2365,13 @@ pub fn run_with_sink<R: ContentResolver>(
             push(target.group, p);
         }
         for (gid, placed) in working_groups.into_iter().zip(plan.working) {
+            for p in placed {
+                push(gid, p);
+            }
+        }
+        // In each group's own selection order, which a summary-forest group
+        // has already arranged with each summary above the turns it covers.
+        for (gid, placed) in context_of.into_iter().zip(plan.context) {
             for p in placed {
                 push(gid, p);
             }

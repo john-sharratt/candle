@@ -14,6 +14,9 @@
 //!   as its pair, scored, and its tool rounds, each scored and entering only
 //!   with the pair.
 //!
+//! - **every other group** of the projection: each selected exchange whole, at
+//!   its selection score, under its layer's window.
+//!
 //! What the fill places comes back as each exchange's carving
 //! ([`rounds::carve`]): whole turns where both records are kept, one record
 //! where only one is, in the order the slot seats them.
@@ -35,6 +38,16 @@ pub struct WorkingPiece {
     pub exchanges: Vec<Vec<TurnKey>>,
 }
 
+/// One selected exchange of another group: its kind for the caps
+/// ([`Kind::Dialogue`] on the dialogue's layer, [`Kind::Layer`] elsewhere), its
+/// turns in order and its selection score. It enters whole or not at all.
+#[derive(Debug, Clone)]
+pub struct ContextExchange {
+    pub kind: Kind,
+    pub exchange: Vec<TurnKey>,
+    pub score: f32,
+}
+
 /// Everything a dialogue's fill decides over.
 #[derive(Debug, Clone)]
 pub struct DialogueSlot {
@@ -47,6 +60,8 @@ pub struct DialogueSlot {
     pub working: Vec<WorkingPiece>,
     /// The dialogue's own exchanges, oldest first.
     pub own: Vec<Vec<TurnKey>>,
+    /// Every other group's selected exchanges.
+    pub context: Vec<ContextExchange>,
 }
 
 /// A turn placed whole (`None`) or one of its records alone.
@@ -59,6 +74,8 @@ pub struct DialoguePlan {
     /// One list per working piece, in [`DialogueSlot::working`]'s order.
     pub working: Vec<Vec<Placed>>,
     pub own: Vec<Placed>,
+    /// One list per context exchange, in [`DialogueSlot::context`]'s order.
+    pub context: Vec<Vec<Placed>>,
     /// How far locks and floors carried the slot past its room.
     pub over_room: usize,
 }
@@ -69,6 +86,7 @@ enum Part {
     Lineage(usize),
     Working(usize, usize),
     Own(usize),
+    Context(usize),
 }
 
 /// Units under construction: each unit's exchange and rounds.
@@ -141,6 +159,14 @@ pub fn plan(
         let all: Vec<usize> = (0..round_count(ex.len())).collect();
         let t = all.iter().map(|&r| round_tokens(ex, r)).sum();
         let u = units.add(Part::Lineage(i), all, piece(), Kind::Dialogue, t, *s);
+        input.scored.push(u);
+    }
+
+    // Every other group's exchanges: each whole, at its selection score.
+    for (i, cx) in slot.context.iter().enumerate() {
+        let all: Vec<usize> = (0..round_count(cx.exchange.len())).collect();
+        let t = all.iter().map(|&r| round_tokens(&cx.exchange, r)).sum();
+        let u = units.add(Part::Context(i), all, piece(), cx.kind, t, cx.score);
         input.scored.push(u);
     }
 
@@ -305,6 +331,12 @@ pub fn plan(
             .enumerate()
             .flat_map(|(e, ex)| carve_of(ex, Part::Own(e)))
             .collect(),
+        context: slot
+            .context
+            .iter()
+            .enumerate()
+            .map(|(i, cx)| carve_of(&cx.exchange, Part::Context(i)))
+            .collect(),
         over_room: filled.over_room,
     }
 }
@@ -325,6 +357,7 @@ mod tests {
             guidance: 10_000,
             max_file: 10_000,
             window: 10_000,
+            layers: vec![30],
         }
     }
 
@@ -348,6 +381,7 @@ mod tests {
                 exchanges: vec![vec![k(5, 0), k(5, 1), k(5, 2)]],
             }],
             own: vec![vec![k(1, 0)], vec![k(1, 1), k(1, 2)]],
+            context: vec![],
         };
         let p = plan(&slot, |_| 1.0, ten);
         assert_eq!(p.lineage, vec![(k(9, 0), None)]);
@@ -383,6 +417,7 @@ mod tests {
                 exchanges: vec![reading.clone()],
             }],
             own: vec![],
+            context: vec![],
         };
         let p = plan(&slot, |_| 0.0, ten);
         // Ties break oldest first, so page round 1 is the one kept: the
@@ -410,6 +445,7 @@ mod tests {
             lineage: vec![],
             working: vec![],
             own: vec![vec![k(1, 0)], vec![k(1, 1)], vec![k(1, 2)]],
+            context: vec![],
         };
         let p = plan(&slot, |_| 0.0, ten);
         assert_eq!(p.own, vec![(k(1, 0), None), (k(1, 2), None)]);
@@ -430,9 +466,33 @@ mod tests {
                 exchanges: vec![vec![k(5, 0), k(5, 1)]],
             }],
             own: vec![],
+            context: vec![],
         };
         let p = plan(&slot, |_| 0.0, ten);
         assert_eq!(p.working, vec![vec![(k(5, 0), None), (k(5, 1), None)]]);
         assert_eq!(p.over_room, 30);
+    }
+
+    /// Another layer's exchanges enter whole by score under that layer's
+    /// window: with room for 30, the higher-scored 20-token exchange goes in
+    /// and the next, which would make 40, stays out.
+    #[test]
+    fn another_layers_exchanges_enter_whole_under_its_window() {
+        let cx = |tl, s| ContextExchange {
+            kind: Kind::Layer(0),
+            exchange: vec![k(tl, 0)],
+            score: s,
+        };
+        let slot = DialogueSlot {
+            room: 10_000,
+            caps: caps(),
+            recent: 0,
+            lineage: vec![],
+            working: vec![],
+            own: vec![],
+            context: vec![cx(7, 0.5), cx(8, 0.9)],
+        };
+        let p = plan(&slot, |_| 0.0, ten);
+        assert_eq!(p.context, vec![vec![], vec![(k(8, 0), None)]]);
     }
 }

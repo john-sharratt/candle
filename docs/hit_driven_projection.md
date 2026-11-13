@@ -352,13 +352,13 @@ At each boundary:
    score — provenance's base lifted by the piece's hit momentum — until the
    pool holds `pool_tokens`. A piece enters or leaves the pool whole: every
    round of a file's reading is a candidate for the slot, or none is.
-   `pool_tokens` is per card, as the deployment's machine config sets it:
+   `pool_tokens` is per card, by the card's size and nothing else:
    1,000,000 on the 72 GB card, 512,000 on the 24 GB card, 256,000 on the
-   16 GB card. It lives in the machine config only, not in `projection.yaml`.
-   The slot is the same on all three. The pool is per sequence: each dialogue
-   chooses its own. On the 16 GB card it is barely larger than the slot and
-   the shadow scan has little to find; that is accepted, and the machine
-   config can raise it.
+   16 GB card (`scheduler::pool::pool_tokens_for`). No configuration
+   overrides it, in `projection.yaml` or the machine config. The slot is the
+   same on all three. The pool is per sequence: each dialogue chooses its own.
+   On the 16 GB card it is barely larger than the slot and the shadow scan has
+   little to find; that is accepted.
 2. **Shared index pages.** A piece's sampled-layer index pages are placed on
    the device once per card, whichever sequences pool it, and refcounted: a
    sequence pooling a piece takes a reference, one dropping it gives the
@@ -398,6 +398,18 @@ At each boundary:
       from, each round admitted only while its kind is under its cap. A
       round of a piece not yet placed brings the piece's request and answer
       with it (its floor, §8.1), and is admitted only if all three fit.
+
+   Every other group of the projection, on the dialogue's layer or any
+   other, is part of the last tier: each exchange it selects is a unit, whole,
+   at its selection score, under its layer's `window` as cap (the dialogue's
+   `window` for a group on the dialogue's layer). On a selecting engine
+   nothing is flexed; the flexbox sizes the layers only for a model that does
+   not select.
+
+   **A working set that cannot fit `L0` fills `2·L0`.** When `lock_tokens`
+   and `reserve_tokens` together pass the trained window, or the reserve
+   alone leaves nothing of it, the slot's window is the rung above, YaRN ×2,
+   and the assembler warns once; the fill runs as before against that room.
 
    Each tier takes its room from the tiers below it, so as locks grow,
    provenance's rounds and the lower-scored history of the dialogue shrink
@@ -634,7 +646,7 @@ had said it is read back as something it said
 | Text export and import of every kept custom object and the blobs it names | `zend/src/` and `npcd/src/` admin routes, over `candle-conversation/src/persistence/` |
 | Scores, the pool, the slot, floors, the lineage, exchanges and tool rounds as units | `candle-conversation/src/projection/` (resolver, working set, `select_conversation`), `candle-conversation/src/scheduler/projection_assembler.rs` |
 | `ManagedBatchedModel` hooks for pinned ranges, hit rounds and summaries, and the trained window (no-ops for a model that does not select) | `candle-transformers/src/models/batched_inference.rs` |
-| `pool_tokens` per card; pooled K/V warmed, cold where warm runs short | the machine config, `candle-conversation/src/scheduler/projection_assembler.rs`, the tier migration (`persistence/`) |
+| `pool_tokens` per card size; pooled K/V warmed, cold where warm runs short | `candle-conversation/src/scheduler/{pool,pool_refresh}.rs`, the tier migration (`persistence/`) |
 | Rounds carved by the grammar; slot order locks, pins, floors, score | `candle-conversation/src/projection/` (`select_conversation`, the working set), `candle-conversation/src/scheduler/projection_assembler.rs` |
 | Every turn record sealed per half, each half with its index page | `candle-conversation/src/scheduler/` (`inject_sealed_turn_half`), `candle-conversation/src/persistence/` |
 | One `file_read` per reply in code-reading ingest, the round limit the file's page count | `zend/src/code_read/mod.rs` |
@@ -740,7 +752,7 @@ the order of dependence.
    momentum follow it.
 6. **Shared index pages (§7.2).** Sampled-layer index pages placed once per
    card and refcounted; the pool's rows addressed by descriptor table.
-7. **The pool (§7.2).** `pool_tokens` per card from the machine config; pool
+7. **The pool (§7.2).** `pool_tokens` per card size; pool
    admission by piece; pooled K/V warmed, cold where warm runs short; the hit
    map covers loaded and pooled rounds.
 8. **The slot fill (§7.2).** One score-ordered fill after the system prompt:
@@ -749,8 +761,10 @@ the order of dependence.
    run it past `L0`. This replaces today's budget passes in the working set
    and `select_conversation`, and `slot_room`; the old passes are removed,
    not kept beside it. `slot_tokens` leaves the schema; the slot is the
-   engine's `L0`, and the shares and reserve are checked against it when the
-   engine is built. Pins past `MAX_PINS` ranges, or a pinned collection that
+   engine's `L0`, and a working set whose `lock_tokens` and `reserve_tokens`
+   pass it fills `2·L0` (YaRN ×2) and the assembler warns. Every other group
+   of the projection enters the same fill, so on a selecting engine nothing is
+   flexed. Pins past `MAX_PINS` ranges, or a pinned collection that
    is not the last pin, are refused at construction (§5).
 9. **The shadow scan (§6.3).** The stride's kept queries and cuts on the
    sampled layers, the last 64 rows of a prefill; one launch per boundary over

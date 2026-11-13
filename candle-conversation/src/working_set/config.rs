@@ -54,26 +54,45 @@ pub struct WorkingSetConfig {
     pub reserve_tokens: usize,
 }
 
+/// The window a working set fills, and why it left the trained one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotWindow {
+    pub window: usize,
+    /// Set when the reserve and the locks pass the engine's trained window and
+    /// the slot runs on the rung above it: what passed it.
+    pub expanded: Option<String>,
+}
+
 impl WorkingSetConfig {
-    /// Whether this working set can fill a slot of `window` positions: the
-    /// reserve must leave room in it, and no locked read may pass it on its
-    /// own. `Err` names what does not fit.
-    pub fn check_fits(&self, window: usize) -> Result<(), String> {
-        if self.reserve_tokens >= window {
-            return Err(format!(
+    /// The window this working set fills on an engine trained to `trained`
+    /// positions: the trained window itself while the reserve leaves room in
+    /// it and the locks with the reserve fit it; otherwise the rung above it,
+    /// twice the trained window under YaRN ×2 (`docs/hit_driven_projection.md`
+    /// §4), with the reason in [`SlotWindow::expanded`].
+    pub fn slot_window(&self, trained: usize) -> SlotWindow {
+        let expanded = if self.reserve_tokens >= trained {
+            Some(format!(
                 "working_set: reserve_tokens {} leaves nothing of the engine's trained window \
-                 {window}",
+                 {trained}",
                 self.reserve_tokens
-            ));
-        }
-        if self.lock_tokens + self.reserve_tokens > window {
-            return Err(format!(
+            ))
+        } else if self.lock_tokens + self.reserve_tokens > trained {
+            Some(format!(
                 "working_set: lock_tokens {} with reserve_tokens {} pass the engine's trained \
-                 window {window}",
+                 window {trained}",
                 self.lock_tokens, self.reserve_tokens
-            ));
+            ))
+        } else {
+            None
+        };
+        SlotWindow {
+            window: if expanded.is_some() {
+                trained * 2
+            } else {
+                trained
+            },
+            expanded,
         }
-        Ok(())
     }
 }
 
@@ -129,14 +148,20 @@ mod tests {
     }
 
     #[test]
-    fn the_reserve_and_the_locks_must_fit_the_trained_window() {
+    fn a_working_set_that_fits_fills_the_trained_window() {
+        let w = cfg().slot_window(262_144);
+        assert_eq!((w.window, w.expanded), (262_144, None));
+    }
+
+    #[test]
+    fn a_working_set_past_the_trained_window_fills_twice_it() {
         let c = cfg();
-        assert_eq!(c.check_fits(262_144), Ok(()));
-        assert!(c.check_fits(16_384).is_err(), "the reserve leaves nothing");
-        assert!(
-            c.check_fits(200_000).is_err(),
-            "the locks with the reserve pass it"
-        );
+        let reserve = c.slot_window(16_384);
+        assert_eq!(reserve.window, 32_768, "the reserve leaves nothing");
+        assert!(reserve.expanded.is_some());
+        let locks = c.slot_window(200_000);
+        assert_eq!(locks.window, 400_000, "the locks with the reserve pass it");
+        assert!(locks.expanded.is_some());
     }
 
     #[test]
