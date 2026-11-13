@@ -781,14 +781,21 @@ the order of dependence.
     prefilled in chunks of that length with a boundary between them;
     `wants_early_reprojection` (§12 item 6) stays the opening's projection.
 11. **Kept objects, exported and imported (§14.4).** zend and npcd each
-    answer `GET /v1/admin/objects/export` and `POST
-    /v1/admin/objects/import` (admin, as `/v1/npcs/export` is). The export is
+    answer `GET /v1/substrate/{zend,npcd}/objects/export` and `POST
+    /v1/substrate/{zend,npcd}/objects/import` (admin, as `/v1/npcs/export`
+    is; under each daemon's own substrate path, as its other substrate views
+    are, so the two tenants' routes never collide on one host). The library
+    is `candle-conversation/src/persistence/kept_objects/`. The export is
     text, JSON Lines: a header line `{"format": "substrate-objects",
     "version": 1, "daemon": "zend" | "npcd", "taken_at_ms": …}`, then one
-    line per kept custom object, `{"object": <CustomObjectPayload>}` with its
-    key, metadata and JSON value as stored, in the order of their original
-    stamps, then one line per blob a kept object names, `{"blob": "<sha256
-    hex>", "bytes_b64": "…"}`.
+    line per kept custom object, `{"object": <CustomObjectPayload>,
+    "stamp": [gen, epoch, hlc, origin]}` with its key, metadata and JSON value
+    as stored and its record's original stamp, in the order of those stamps,
+    then one line per blob a kept live object names, `{"blob": "<sha256
+    hex>", "bytes_b64": "…"}`. An object names a blob by spelling its SHA-256
+    in lowercase hex anywhere in its metadata or its value, the one spelling
+    every object that names a blob writes; a spelling no blob answers names
+    nothing.
     - **What is kept.** Every live custom object except those whose meaning
       is a model-derived record, which the move-aside destroys. One list in
       the code names the left-out prefixes: `cluster/` (the cluster's own
@@ -796,10 +803,11 @@ the order of dependence.
       rows, model state), `working_set:` (marks on turns that no longer
       exist; the locks they rebuild go with the dialogue) and `channels/`
       (sections npcd submits to a character's conversation, submitted again
-      when the character's conversation is rebuilt). A test walks every
-      custom-object prefix the workspace declares and fails on one that is
-      neither kept nor left out, so a new prefix is classified when it is
-      added. Kept objects that name a conversation, thread, turn or journal
+      when the character's conversation is rebuilt). Every other key is kept:
+      the prefixes are declared across both daemons and the host with no
+      registry to walk, so the classification is the left-out list alone
+      (`kept_objects::LEFT_OUT`), and a new prefix is kept unless it is added
+      there. Kept objects that name a conversation, thread, turn or journal
       by id (`mcp/conversation/`, `mcp/chat/`, `journal/turns/`, MCP threads)
       keep the reference: a reader already resolves an id with no record
       behind it as absent, as it does a tombstoned one, and none refuses on
@@ -809,7 +817,8 @@ the order of dependence.
       ordered by stamp comes back in its original order and replicates to
       the others like any write. A key already live is left as it is and
       named in the import's answer, with counts of what was written. It
-      takes several exports at once — one from each member — and writes the
+      takes several exports at once — one from each member, one after
+      another in the body, each starting at its header line — and writes the
       union, the latest original stamp winning per key, so an object a
       member held that had not reached the others yet is not lost.
     - **Tombstones travel too.** The export also carries every ceased key it
@@ -851,8 +860,10 @@ Each step lands with its unit tests. Beyond them:
 - **Refcount.** Two sequences pooling one reading share its pages; the pages
   outlive the first release and go with the last.
 - **Kept objects.** An export imported into an empty substrate exports again
-  byte for byte, but for the header's time; `cluster/` objects are not in
-  it; a live key is left as it was.
+  line for line, but for the header's time and the stamps the import mints
+  fresh, and with no tombstone the old one carried; `cluster/` objects are
+  not in it; a live key is left as it was; the union keeps a key one member
+  deleted after another last wrote it deleted.
 - **Gates.** `/fast-test` and `/sweep` against a local, unclustered motherd
   (AGENTS "Test locally, not clustered"), and the MCP latency gate.
 
