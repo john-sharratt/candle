@@ -605,7 +605,7 @@ Line numbers are as of commit `dc04b62ac`.
   boundary, the share of decode the gap would take.
 
 **2. The descriptor table and the cursor (§3.1).**
-- New `candle-nn/src/kv_cache/chunked/gap_table.rs`: the row type and the
+- New `candle-nn/src/kv_cache/chunked/gap/table.rs`: the row type and the
   builder. One concern, tested alone.
 - `candle-nn/src/kv_cache/chunked/sequence_ops.rs`: the per-sequence cursor
   beside `writer_start_idx`; `truncate_sequence_to_tokens` (`:2134`) keeps the
@@ -620,7 +620,7 @@ Line numbers are as of commit `dc04b62ac`.
   cut.
 
 **3. The lease (§3.2).**
-- New `candle-nn/src/kv_cache/chunked/gap_lease.rs`: the standing per-class
+- New `candle-nn/src/kv_cache/chunked/gap/lease.rs`: the standing per-class
   lease, its device stack, the top-up and the share.
 - `candle-nn/src/kv_cache/chunked/gid_pool.rs:1428`, `ChunkGidPool`: claiming
   free slots lowest place first; `set_reserve_target` (`:1465`) goes.
@@ -645,14 +645,28 @@ Line numbers are as of commit `dc04b62ac`.
 - `candle-core/src/quantized/cuda.rs`, `quantize_palette4_convert_buffered`:
   split into building the buffer and launching on it, so the gap launches the
   same convert on a buffer whose destination half the device wrote.
+- New `candle-nn/src/kv_cache/chunked/gap/codes.rs`: the per-code class and
+  record-format tables the claim reads.
+- New `candle-nn/src/kv_cache/chunked/gap/launch.rs`: one gap on the device —
+  every group's selection tables and the claim's inputs in one staged upload,
+  per group the selection and the claim, one convert over the table, the
+  completion word. It keeps, across gaps, the summary, the claim's status words
+  and epoch, the sink and held scratch for the selection blocks and the convert
+  buffer, and refuses a gap while one is outstanding. The candidates and
+  thresholds come from `compress.rs`'s `policy_selection`, which today's seal
+  reads too. `gap/launch_tests.rs` holds it to today's seal: the same native
+  chunks, through `quantize_layers_deferred` and through one gap, give every band
+  the same format, outer scale, palette map and payload bytes — at C5 and C10,
+  under a K override, split across two groups — and a short lease defers
+  exactly the jobs past it.
 - `candle-nn/src/kv_cache/chunked/sampled_selection/gpu.rs:741`, `run_palette4`,
   and the readback at `:1497–1538`: removed.
 
 **5. The summary and the catch-up (§3.4, §3.5).**
-- New `candle-nn/src/kv_cache/chunked/gap_summary.rs`: the mapped buffer, its
+- New `candle-nn/src/kv_cache/chunked/gap/summary.rs`: the mapped buffer, its
   row layout and the completion word. Pattern:
   `candle-transformers/src/models/expert_lre/dispatch.rs:156`, `SummaryRing`.
-- New `candle-nn/src/kv_cache/chunked/gap_install.rs`: the catch-up.
+- New `candle-nn/src/kv_cache/chunked/gap/install.rs`: the catch-up.
 - `candle-nn/src/kv_cache/chunked/backing.rs:1307`, `fill_records_on_device`,
   and `meta_pool.rs:146`, `serialize_kv_heads`: the record, unchanged.
 - `candle-nn/src/kv_cache/chunked/gpu_chunks.rs:692`, `update_chunk`, and

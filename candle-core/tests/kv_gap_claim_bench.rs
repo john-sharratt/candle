@@ -108,8 +108,15 @@ impl Case {
         let scale = |rng: &mut Rng| (rng.below(1 << 20) as f32) / (1 << 16) as f32 + 0.5;
         let k_scale = (0..heads * N_PAL).map(|_| scale(&mut rng)).collect();
         let v_scale = (0..heads * N_PAL).map(|_| scale(&mut rng)).collect();
-        let k_map = (0..heads * hd).map(|_| rng.below(4) as i32).collect();
-        let v_map = (0..heads * hd).map(|_| rng.below(4) as i32).collect();
+        // Mostly the selection's 0..3, with a few out-of-range values the
+        // packing must clamp exactly as the host readback does.
+        let slot = |rng: &mut Rng| match rng.below(64) {
+            0 => -1 - rng.below(5) as i32,
+            1 => 4 + rng.below(5) as i32,
+            _ => rng.below(4) as i32,
+        };
+        let k_map = (0..heads * hd).map(|_| slot(&mut rng)).collect();
+        let v_map = (0..heads * hd).map(|_| slot(&mut rng)).collect();
         let mut code_class = vec![-1i8; N_CODES];
         let mut code_fmt = vec![0u8; N_CODES];
         for (i, &c) in CODES.iter().enumerate() {
@@ -245,7 +252,7 @@ fn reference(case: &Case) -> Out {
                         let slot = if ov >= 0 {
                             dim / (hd / 4)
                         } else {
-                            (map[head * hd + dim] & 3) as usize
+                            map[head * hd + dim].clamp(0, 3) as usize
                         };
                         b |= (slot as u8) << (2 * q);
                     }

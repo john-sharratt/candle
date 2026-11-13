@@ -2,8 +2,8 @@
 //! (`docs/kv_quantize_in_the_gap.md` §3.2).
 //!
 //! The selection writes each band's format as a select code. The claim turns a
-//! code into the size class whose leased slot the band takes, and the record
-//! fill turns it into the format byte the destination record carries. Both are
+//! code into the size class whose leased slot the band takes, and into the
+//! format byte the destination record carries. Both are
 //! tables the host builds once per geometry and uploads with the gap, so the
 //! device never needs the format ladder.
 

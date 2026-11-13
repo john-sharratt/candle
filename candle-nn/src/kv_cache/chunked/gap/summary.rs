@@ -2,9 +2,9 @@
 //! (`docs/kv_quantize_in_the_gap.md` §3.4).
 //!
 //! One buffer, because at most one gap is outstanding (§3, §3.8 rule 5): the
-//! record fill writes each job's deferred flag and each head's destination
-//! record with its eight bands' lease indices; the claim writes the error word
-//! if it met a code its table did not cover; and the gap's last launch writes
+//! claim writes each job's deferred flag, each head's destination record with
+//! its eight bands' lease indices, and the error word if it met a code its
+//! table did not cover; and the gap's last launch writes
 //! the completion word, behind a system fence, after the convert. The host
 //! reads nothing until the completion word holds the gap's sequence number,
 //! read as a load of one mapped word at the head of the next gap. No host CUDA
@@ -108,7 +108,7 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 }
 
 impl HeadRow {
-    /// Decode a row from its bytes, laid out as the record fill writes them.
+    /// Decode a row from its bytes, laid out as the claim writes them.
     pub(crate) fn decode(row: &[u8], head_dim: usize) -> Result<Self> {
         let layout = SummaryLayout {
             max_jobs: 0,
@@ -311,7 +311,7 @@ mod tests {
         }
     }
 
-    /// A row as the record fill writes it, byte by byte, decodes field by
+    /// A row as the claim writes it, byte by byte, decodes field by
     /// field.
     #[test]
     fn a_row_decodes_from_the_bytes_the_fill_writes() {

@@ -100,9 +100,12 @@ __device__ __forceinline__ int lane_of(const int4& v, int i) {
     return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
 }
 
+// A channel's palette slot, clamped into 0..3 as the host readback of the
+// selection clamps it, so the two paths pack the same byte.
+__device__ __forceinline__ uint32_t slot(int x) { return (uint32_t)min(max(x, 0), 3); }
+
 __device__ __forceinline__ uint32_t pack4(const int4& v) {
-    return (uint32_t)(v.x & 3) | ((uint32_t)(v.y & 3) << 2) | ((uint32_t)(v.z & 3) << 4) |
-           ((uint32_t)(v.w & 3) << 6);
+    return slot(v.x) | (slot(v.y) << 2) | (slot(v.z) << 4) | (slot(v.w) << 6);
 }
 
 __device__ __forceinline__ uint64_t load_status(const uint64_t* p) {

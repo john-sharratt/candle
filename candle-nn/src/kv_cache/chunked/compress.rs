@@ -85,7 +85,11 @@ use crate::kv_cache::{KvFormat, QuantFormat};
 /// computed from a ggml block layout — and both were reconstructing an address
 /// the arena can hand over directly.
 #[cfg(feature = "cuda")]
-fn band_ptr(storage: &super::arena::ArenaStorageState, gid: &ChunkGid, what: &str) -> Result<u64> {
+pub(super) fn band_ptr(
+    storage: &super::arena::ArenaStorageState,
+    gid: &ChunkGid,
+    what: &str,
+) -> Result<u64> {
     let ai = gid.arena_idx();
     let arena = storage
         .arenas()
@@ -102,7 +106,7 @@ fn band_ptr(storage: &super::arena::ArenaStorageState, gid: &ChunkGid, what: &st
 /// (`docs/archived/arena_unification.md` principle 8) — so the tag is the only source,
 /// and it is the same byte the substrate persisted.
 #[cfg(feature = "cuda")]
-fn band_ggml_dtype(tag: u8) -> Result<GgmlDType> {
+pub(super) fn band_ggml_dtype(tag: u8) -> Result<GgmlDType> {
     let format = KvFormat::from_tag(tag).ok_or_else(|| {
         candle::Error::Msg(format!("chunk band carries unrecognised format tag {tag}"))
     })?;
@@ -110,6 +114,48 @@ fn band_ggml_dtype(tag: u8) -> Result<GgmlDType> {
         KvFormat::Quantized(qf) => Ok(qf.to_ggml_dtype()),
         KvFormat::Float(dt) => dtype_to_ggml_float(dt),
     }
+}
+
+/// What a policy hands the format selection: its level's quantized K and V
+/// candidates and the four error thresholds `[k_hi, k_lo, v_hi, v_lo]` — the
+/// production table's row for the level scaled by the policy's factors. Fixed
+/// by level and model, never per block.
+#[cfg(feature = "cuda")]
+pub(super) struct PolicySelection {
+    pub k: Vec<SampleFormat>,
+    pub v: Vec<SampleFormat>,
+    pub thresholds: [f32; 4],
+}
+
+#[cfg(feature = "cuda")]
+pub(super) fn policy_selection(policy: &CompressionPolicy) -> Result<PolicySelection> {
+    let (k_profile, v_profile) =
+        super::compression_policy::production_adaptive_candidates(policy.compression_level);
+    let quantized = |profile: Vec<KvFormat>| -> Vec<SampleFormat> {
+        profile
+            .into_iter()
+            .filter_map(SampleFormat::from_kv_format)
+            .filter(|f| !f.is_float())
+            .collect()
+    };
+    let (k, v) = (quantized(k_profile), quantized(v_profile));
+    if k.is_empty() || v.is_empty() {
+        candle::bail!(
+            "missing K/V production candidates for level {}",
+            policy.compression_level
+        );
+    }
+    let ti = policy.compression_level.min(10) as usize;
+    Ok(PolicySelection {
+        k,
+        v,
+        thresholds: [
+            PRODUCTION_K_QREL_HIGH_THRESHOLDS[ti] * policy.k_hi_error_threshold_factor,
+            PRODUCTION_K_QREL_LOW_THRESHOLDS[ti] * policy.k_low_error_threshold_factor,
+            PRODUCTION_V_QREL_HIGH_THRESHOLDS[ti] * policy.v_hi_error_threshold_factor,
+            PRODUCTION_V_QREL_LOW_THRESHOLDS[ti] * policy.v_low_error_threshold_factor,
+        ],
+    })
 }
 
 /// Pack per-dim palette assignments (one byte per dim, value in `{0..3}`)
@@ -354,32 +400,11 @@ pub(crate) fn quantize_layers_deferred_within(
     }
 
     // Candidates + thresholds are policy-derived — identical for every layer.
-    let (k_candidates, v_candidates) = {
-        let (k_profile, v_profile) =
-            super::compression_policy::production_adaptive_candidates(policy.compression_level);
-        let k: Vec<SampleFormat> = k_profile
-            .into_iter()
-            .filter_map(SampleFormat::from_kv_format)
-            .filter(|f| !f.is_float())
-            .collect();
-        let v: Vec<SampleFormat> = v_profile
-            .into_iter()
-            .filter_map(SampleFormat::from_kv_format)
-            .filter(|f| !f.is_float())
-            .collect();
-        if k.is_empty() || v.is_empty() {
-            candle::bail!(
-                "quantize_layers_deferred: missing K/V production candidates for level {}",
-                policy.compression_level
-            );
-        }
-        (k, v)
-    };
-    let ti = policy.compression_level.min(10) as usize;
-    let k_hi = PRODUCTION_K_QREL_HIGH_THRESHOLDS[ti] * policy.k_hi_error_threshold_factor;
-    let k_lo = PRODUCTION_K_QREL_LOW_THRESHOLDS[ti] * policy.k_low_error_threshold_factor;
-    let v_hi = PRODUCTION_V_QREL_HIGH_THRESHOLDS[ti] * policy.v_hi_error_threshold_factor;
-    let v_lo = PRODUCTION_V_QREL_LOW_THRESHOLDS[ti] * policy.v_low_error_threshold_factor;
+    let PolicySelection {
+        k: k_candidates,
+        v: v_candidates,
+        thresholds: [k_hi, k_lo, v_hi, v_lo],
+    } = policy_selection(policy)?;
 
     // ── One fused selection per batch of chunks, across every layer ─────
     //
@@ -804,39 +829,11 @@ fn quantize_sealed_in_place_impl(
     ) = match precomputed_formats {
         Some(f) => (f, None),
         None => {
-            let (k_candidates, v_candidates) = {
-                let (k_profile, v_profile) =
-                    super::compression_policy::production_adaptive_candidates(
-                        policy.compression_level,
-                    );
-                let k: Vec<SampleFormat> = k_profile
-                    .into_iter()
-                    .filter_map(SampleFormat::from_kv_format)
-                    .filter(|fmt| !fmt.is_float())
-                    .collect();
-                let v: Vec<SampleFormat> = v_profile
-                    .into_iter()
-                    .filter_map(SampleFormat::from_kv_format)
-                    .filter(|fmt| !fmt.is_float())
-                    .collect();
-                if k.is_empty() || v.is_empty() {
-                    candle::bail!(
-                        "quantize_sealed_in_place: missing K/V production candidates for level {}",
-                        policy.compression_level
-                    );
-                }
-                (k, v)
-            };
-
-            let threshold_idx = policy.compression_level.min(10) as usize;
-            let k_threshold_hi = PRODUCTION_K_QREL_HIGH_THRESHOLDS[threshold_idx]
-                * policy.k_hi_error_threshold_factor;
-            let k_threshold_lo = PRODUCTION_K_QREL_LOW_THRESHOLDS[threshold_idx]
-                * policy.k_low_error_threshold_factor;
-            let v_threshold_hi = PRODUCTION_V_QREL_HIGH_THRESHOLDS[threshold_idx]
-                * policy.v_hi_error_threshold_factor;
-            let v_threshold_lo = PRODUCTION_V_QREL_LOW_THRESHOLDS[threshold_idx]
-                * policy.v_low_error_threshold_factor;
+            let PolicySelection {
+                k: k_candidates,
+                v: v_candidates,
+                thresholds: [k_threshold_hi, k_threshold_lo, v_threshold_hi, v_threshold_lo],
+            } = policy_selection(policy)?;
 
             let sg = backing.begin_stager_generation_required();
             let gpu_inputs = PagedSelectionGpuInputs::from_head_gids(

@@ -7,13 +7,16 @@
 
 #[cfg(feature = "cuda")]
 mod codes;
-// The lease's sizing and holding are host arithmetic; only the gap launch that
-// reads them is CUDA, so they are tested anywhere.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+mod launch;
+#[cfg(all(test, feature = "cuda"))]
+mod launch_tests;
+// The lease's sizing and holding, and the summary's layout and row decoding,
+// are host arithmetic tested anywhere; their reader is the gap's catch-up.
+#[allow(dead_code)]
 mod lease;
-// The layout and the row decoding are host arithmetic, tested anywhere; the
-// mapped buffer itself is CUDA.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[allow(dead_code)]
 mod summary;
 mod table;
 
