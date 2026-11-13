@@ -310,6 +310,19 @@ fn qmm_batch(dev: &Device) -> Result<()> {
     let lhs4 = Tensor::cat(&[&lhs3, &lhs3], 0)?;
     let mm4 = rhs.forward(&lhs4)?;
     assert_eq!(mm4.shape().dims(), [12, 6]);
+    // Every row of every result is finite before any is compared: a NaN
+    // compared away reports only that a sum was NaN, not which call or row
+    // produced it.
+    for (what, t) in [("lhs4", &lhs4), ("mm3", &mm3), ("mm4", &mm4)] {
+        let bad: Vec<usize> = t
+            .to_vec2::<f32>()?
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.iter().any(|v| !v.is_finite()))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(bad.is_empty(), "{what}: rows holding non-finite values: {bad:?}");
+    }
     let diff4 = (mm4.i(..6)? - &mm3)?.abs()?.sum_all()?.to_vec0::<f32>()?;
     if dev.is_cuda() {
         // Batches through 16 rows share the vec-kernel family on cuda (a batch
