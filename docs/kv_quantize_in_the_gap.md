@@ -201,8 +201,9 @@ chooses among them.**
   a single-pass scan with decoupled look-back over tiles of whole jobs, sixteen
   class counters two to a word. Its look-back status words are scratch zeroed
   once at allocation; each launch carries a new epoch, so nothing is cleared
-  between launches. A job has at most 64 KV heads, and the head dimension is
-  64, 128, 256 or 512.
+  between launches. A job has at most 64 KV heads. The claim takes a head
+  dimension of 64, 128, 256 or 512; the convert has a record only at 128 and
+  256, so the gap as a whole takes those two and refuses the rest at setup.
 - **A class that runs dry defers the block, never fails it.** A block is
   deferred when any of its bands' indices falls past its class's lease. The
   whole block stays native and goes into the next gap's table. Its bands still

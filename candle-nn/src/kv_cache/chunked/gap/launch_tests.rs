@@ -5,6 +5,7 @@
 //! band. Only the slots differ: the gap's come from its lease.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async;
 use candle::quantized::cuda::{ggml_dtype_to_arena_fmt_code, identity_pal_map};
@@ -554,6 +555,194 @@ fn a_window_outside_its_chunk_is_refused_before_any_launch() {
     gap.launch(&refs, &f.jobs, &groups, &f.image, 1).unwrap();
     f.device.synchronize().unwrap();
     assert!(gap.poll());
+}
+
+/// Refuse `jobs` with `gap`, then show the refusal left nothing outstanding:
+/// the fixture's own table launches straight after.
+fn assert_refused(f: &Fixture, policy: &CompressionPolicy, jobs: &[GapJob], what: &str) {
+    let refs: Vec<&ChunkedKvBacking> = f.backings.iter().collect();
+    let mut gap = GapDevice::new(&f.cuda, N_KV_HEAD, HEAD_DIM, f.jobs.len()).unwrap();
+    let groups = [GapGroup {
+        policy,
+        jobs: 0..jobs.len(),
+    }];
+    assert!(
+        gap.launch(&refs, jobs, &groups, &f.image, 1).is_err(),
+        "{what}"
+    );
+    assert!(gap.poll(), "{what}: nothing outstanding");
+    let groups = [GapGroup {
+        policy,
+        jobs: 0..f.jobs.len(),
+    }];
+    gap.launch(&refs, &f.jobs, &groups, &f.image, 2).unwrap();
+    f.device.synchronize().unwrap();
+    assert!(gap.poll());
+}
+
+#[test]
+fn a_band_that_is_not_a_native_float_is_refused() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let q8 = KvFormat::Quantized(QuantFormat::Q8_0).to_tag();
+    let mut jobs = f.jobs.clone();
+    jobs[2].bands.v_fmt = Arc::new(vec![q8; N_KV_HEAD * N_PALETTE]);
+    assert_refused(&f, &policy, &jobs, "a quantized source band");
+}
+
+#[test]
+fn a_band_with_no_recorded_tag_is_refused() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let mut jobs = f.jobs.clone();
+    // One head short: the second head's bands have no tag.
+    jobs[0].bands.k_fmt = Arc::new(jobs[0].bands.k_fmt[..N_PALETTE].to_vec());
+    assert_refused(&f, &policy, &jobs, "an unrecorded band");
+}
+
+#[test]
+fn a_job_on_a_layer_past_the_backings_is_refused() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let mut jobs = f.jobs.clone();
+    let last = jobs.len() - 1;
+    jobs[last].layer = LAYERS;
+    assert_refused(&f, &policy, &jobs, "layer past the backings");
+}
+
+#[test]
+fn an_empty_gap_launches_nothing_and_leaves_the_device_free() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let refs: Vec<&ChunkedKvBacking> = f.backings.iter().collect();
+    let mut gap = GapDevice::new(&f.cuda, N_KV_HEAD, HEAD_DIM, f.jobs.len()).unwrap();
+    gap.launch(&refs, &[], &[], &f.image, 1).unwrap();
+    assert!(gap.poll(), "an empty gap is not outstanding");
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..f.jobs.len(),
+    }];
+    gap.launch(&refs, &f.jobs, &groups, &f.image, 2).unwrap();
+    f.device.synchronize().unwrap();
+    assert!(gap.poll());
+}
+
+#[test]
+fn a_gap_wider_than_its_device_is_refused() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let refs: Vec<&ChunkedKvBacking> = f.backings.iter().collect();
+    let mut gap = GapDevice::new(&f.cuda, N_KV_HEAD, HEAD_DIM, f.jobs.len() - 1).unwrap();
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..f.jobs.len(),
+    }];
+    assert!(gap.launch(&refs, &f.jobs, &groups, &f.image, 1).is_err());
+    assert!(gap.poll());
+}
+
+#[test]
+fn a_layer_of_another_geometry_is_refused() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let refs: Vec<&ChunkedKvBacking> = f.backings.iter().collect();
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..f.jobs.len(),
+    }];
+    for (nkh, hd) in [(N_KV_HEAD + 1, HEAD_DIM), (N_KV_HEAD, HEAD_DIM * 2)] {
+        let mut gap = GapDevice::new(&f.cuda, nkh, hd, f.jobs.len()).unwrap();
+        assert!(
+            gap.launch(&refs, &f.jobs, &groups, &f.image, 1).is_err(),
+            "{nkh} heads at {hd}"
+        );
+    }
+}
+
+#[test]
+fn the_device_refuses_a_shape_the_claim_and_convert_do_not_take() {
+    let Some((_device, cuda, _gpu)) = cuda() else {
+        return;
+    };
+    for (nkh, hd, jobs, what) in [
+        (0, 128, 8, "no heads"),
+        (65, 128, 8, "more heads than a tile"),
+        (4, 96, 8, "a head_dim with no record"),
+        // The claim takes 64 and 512; the convert has no record for them.
+        (4, 64, 8, "a head_dim the convert has no record for"),
+        (4, 512, 8, "a head_dim the convert has no record for"),
+        (4, 1024, 8, "a head_dim past the widest record"),
+        (4, 128, 0, "a table of no jobs"),
+        (4, 128, 65_536, "more jobs than one convert launch"),
+    ] {
+        assert!(GapDevice::new(&cuda, nkh, hd, jobs).is_err(), "{what}");
+    }
+    for (nkh, hd) in [(1, 128), (64, 128), (8, 256)] {
+        GapDevice::new(&cuda, nkh, hd, 4).unwrap_or_else(|e| panic!("{nkh} at {hd}: {e}"));
+    }
+}
+
+/// The claim is a prefix count, not a race: the same table against the same
+/// lease takes the same slots, gap after gap.
+#[test]
+fn the_same_table_claims_the_same_slots_every_time() {
+    let policy = CompressionPolicy::new(10);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let groups = [
+        GapGroup {
+            policy: &policy,
+            jobs: 0..1,
+        },
+        GapGroup {
+            policy: &policy,
+            jobs: 1..f.jobs.len(),
+        },
+    ];
+    let first = run_gap(&f.cuda, &f.device, &f.backings, &f.jobs, &groups, &f.image);
+    for _ in 0..3 {
+        let again = run_gap(&f.cuda, &f.device, &f.backings, &f.jobs, &groups, &f.image);
+        assert_eq!(again, first);
+    }
+}
+
+/// A gap over a single job of a single layer.
+#[test]
+fn a_gap_of_one_job_seals_it_as_today() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let one = &f.jobs[..1];
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..1,
+    }];
+    let (rows, deferred, errored) =
+        run_gap(&f.cuda, &f.device, &f.backings, one, &groups, &f.image);
+    assert!(!errored);
+    assert_eq!(deferred, vec![false]);
+    assert_eq!(rows.len(), N_KV_HEAD);
+    // Its bands are the only claimants, so each index is below its band count.
+    for r in &rows {
+        assert!(r
+            .lease_idx
+            .iter()
+            .all(|&i| (i as usize) < 2 * N_KV_HEAD * N_PALETTE));
+    }
 }
 
 /// A gap over jobs naming no layer it was given is refused, not a panic.

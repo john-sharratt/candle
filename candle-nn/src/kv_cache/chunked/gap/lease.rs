@@ -350,6 +350,123 @@ mod tests {
     }
 
     #[test]
+    fn a_gap_smaller_than_the_reachable_classes_leases_one_each() {
+        // Two bands over three classes: the even split rounds up to one each,
+        // and the cap keeps headroom from taking any class past the count.
+        let t = lease_targets(2, None, &only(&[0, 1, 2]), &[8; N]);
+        assert_eq!(&t[..3], &[2, 2, 2]);
+        let t = lease_targets(1, None, &only(&[0, 1, 2]), &[0; N]);
+        assert_eq!(&t[..3], &[1, 1, 1]);
+    }
+
+    #[test]
+    fn a_reachable_class_with_no_recorded_share_leases_its_headroom() {
+        let mut peak = [0f32; N];
+        peak[0] = 1.0;
+        let mut headroom = [0; N];
+        headroom[1] = 3;
+        let t = lease_targets(50, Some(&peak), &only(&[0, 1]), &headroom);
+        assert_eq!((t[0], t[1]), (50, 3));
+    }
+
+    #[test]
+    fn a_share_never_rounds_below_its_part_of_the_count() {
+        // Thirds of a count divisible by three, and of one that is not.
+        for bands in [3usize, 300, 301, 65_535 * 64] {
+            let mut shares = PeakShares::default();
+            let mut claims = [0; N];
+            claims[0] = 1;
+            claims[1] = 1;
+            claims[2] = 1;
+            shares.record(GapKind::Decode, &claims);
+            let peak = shares.peak(GapKind::Decode).unwrap();
+            let t = lease_targets(bands, Some(&peak), &only(&[0, 1, 2]), &[0; N]);
+            for (c, &t) in t.iter().take(3).enumerate() {
+                assert!(t * 3 >= bands, "bands {bands} class {c}: {t}");
+                assert!(t <= bands);
+            }
+        }
+    }
+
+    #[test]
+    fn no_reachable_class_leases_nothing() {
+        assert_eq!(lease_targets(100, None, &[false; N], &[8; N]), [0; N]);
+    }
+
+    #[test]
+    fn prefill_and_decode_shares_are_kept_apart() {
+        let mut shares = PeakShares::default();
+        let mut a = [0; N];
+        a[3] = 5;
+        shares.record(GapKind::Prefill, &a);
+        assert!(shares.peak(GapKind::Decode).is_none());
+        assert_eq!(shares.peak(GapKind::Prefill).unwrap()[3], 1.0);
+    }
+
+    #[test]
+    fn a_full_window_keeps_every_gap_in_it() {
+        let mut shares = PeakShares::default();
+        let mut first = [0; N];
+        first[0] = 1;
+        shares.record(GapKind::Decode, &first);
+        let mut rest = [0; N];
+        rest[1] = 1;
+        for _ in 1..SHARE_WINDOW {
+            shares.record(GapKind::Decode, &rest);
+        }
+        assert_eq!(shares.peak(GapKind::Decode).unwrap()[0], 1.0, "still in");
+        shares.record(GapKind::Decode, &rest);
+        assert_eq!(shares.peak(GapKind::Decode).unwrap()[0], 0.0, "pushed out");
+    }
+
+    #[test]
+    fn an_empty_lease_lays_out_an_empty_stack() {
+        let l: Lease<u64> = Lease::default();
+        let img = l.stack_image(|&a| Ok(a)).unwrap();
+        assert!(img.addrs.is_empty());
+        assert_eq!(img.off, [0; N]);
+        assert_eq!(img.len, [0; N]);
+    }
+
+    #[test]
+    fn an_address_that_cannot_be_read_fails_the_stack() {
+        let l = lease(&[(0, &[1, 2]), (1, &[3])]);
+        let r = l.stack_image(|&a| {
+            if a == 3 {
+                candle::bail!("slot 3 is not GPU-resident")
+            }
+            Ok(a)
+        });
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn taking_nothing_leaves_the_lease_as_it_was() {
+        let mut l = lease(&[(2, &[7, 8, 9])]);
+        assert!(l.take(2, &[]).unwrap().is_empty());
+        assert_eq!(l.held()[2], 3);
+    }
+
+    #[test]
+    fn taking_every_slot_in_reverse_empties_the_run_in_that_order() {
+        let mut l = lease(&[(0, &[1, 2, 3, 4])]);
+        assert_eq!(l.take(0, &[3, 2, 1, 0]).unwrap(), vec![4, 3, 2, 1]);
+        assert_eq!(l.held()[0], 0);
+        // An empty run has nothing to take.
+        assert!(l.take(0, &[0]).is_err());
+    }
+
+    #[test]
+    fn a_take_from_one_class_leaves_the_others_and_their_offsets() {
+        let mut l = lease(&[(0, &[1, 2]), (1, &[3, 4, 5]), (2, &[6])]);
+        l.take(1, &[1]).unwrap();
+        let img = l.stack_image(|&a| Ok(a)).unwrap();
+        assert_eq!(img.addrs, vec![1, 2, 3, 5, 6]);
+        assert_eq!((img.off[1], img.len[1]), (2, 2));
+        assert_eq!((img.off[2], img.len[2]), (4, 1));
+    }
+
+    #[test]
     fn a_take_naming_a_slot_twice_or_past_the_run_takes_nothing() {
         let mut l = lease(&[(0, &[1, 2, 3])]);
         assert!(l.take(0, &[1, 1]).is_err());

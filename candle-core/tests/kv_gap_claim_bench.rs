@@ -26,7 +26,7 @@ use candle_core::cuda_backend::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFA
 use candle_core::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr};
 use candle_core::cuda_backend::kernels::simple::kv_gap_claim::{
     claim_status_words, run_kv_gap_claim, summary_head_bytes, BANDS_PER_HEAD, MAX_CLASS,
-    NO_OVERRIDE, N_CODES,
+    MAX_KV_HEAD, NO_OVERRIDE, N_CODES,
 };
 use candle_core::cuda_backend::CudaDevice;
 use candle_core::{Device, Result};
@@ -418,8 +418,13 @@ fn cuda() -> Result<CudaDevice> {
 
 /// Launch once and compare every output byte with the reference.
 fn check(dev: &CudaDevice, case: &Case) -> Result<Out> {
-    let on = OnDevice::new(dev, case)?;
-    launch(dev, case, &on)?;
+    check_on(dev, case, &OnDevice::new(dev, case)?)
+}
+
+/// As [`check`], on device state the caller made — a status buffer and epoch
+/// carried over from earlier launches.
+fn check_on(dev: &CudaDevice, case: &Case, on: &OnDevice) -> Result<Out> {
+    launch(dev, case, on)?;
     dev.synchronize()?;
     let got = on.read(dev)?;
     let want = reference(case);
@@ -699,6 +704,210 @@ fn reference_takes_indices_in_band_order() {
     );
     assert_eq!(idx(1, 0), 8);
     assert_eq!(out.taken[class_of(3) as usize], 16);
+}
+
+// ── Edge cases ──
+
+/// Launch `cases` in order on ONE status buffer, its epoch starting at
+/// `epoch`, as a long-lived gap device does: each launch must match its
+/// reference whatever the earlier launches left in the status words.
+fn check_sequence(dev: &CudaDevice, cases: &[Case], epoch: u32) -> Result<Vec<Out>> {
+    let widest = cases.iter().map(Case::heads).max().unwrap_or(0);
+    let mut status = dev.alloc_zeros::<u64>(claim_status_words(widest))?;
+    let mut outs = Vec::new();
+    let mut next_epoch = epoch;
+    for case in cases {
+        let mut on = OnDevice::new(dev, case)?;
+        std::mem::swap(&mut on.status, &mut status);
+        on.epoch.set(next_epoch);
+        outs.push(check_on(dev, case, &on)?);
+        next_epoch = on.epoch.get();
+        std::mem::swap(&mut on.status, &mut status);
+    }
+    Ok(outs)
+}
+
+#[test]
+fn claim_reuses_one_status_buffer_across_launches_of_any_width() -> Result<()> {
+    let dev = cuda()?;
+    // Wide, narrow, wide again: the narrow launch meets only its own tiles'
+    // words, and the wide one after it meets words two epochs stale past them.
+    check_sequence(
+        &dev,
+        &[
+            Case::new(2000, 4, 128, 1.0, 81),
+            Case::new(100, 4, 128, 0.7, 82),
+            Case::new(2000, 4, 128, 0.9, 83),
+            Case::new(3, 64, 128, 1.0, 84),
+            Case::new(2001, 4, 128, 1.0, 85),
+        ],
+        0,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn claim_survives_the_epoch_wrapping_through_zero() -> Result<()> {
+    let dev = cuda()?;
+    // The launches run at epochs u32::MAX - 1, u32::MAX, 0, 1. Epoch 0 is the
+    // value a freshly zeroed status word carries, flagged nothing.
+    let cases: Vec<Case> = (0..4)
+        .map(|i| Case::new(700 + 300 * i, 4, 128, 0.8, 91 + i as u64))
+        .collect();
+    check_sequence(&dev, &cases, u32::MAX - 2)?;
+    // And the very first launch on a zeroed buffer at epoch 0.
+    check_sequence(&dev, &cases[..1], u32::MAX)?;
+    Ok(())
+}
+
+#[test]
+fn claim_at_every_tile_boundary() -> Result<()> {
+    let dev = cuda()?;
+    // A tile is 64 heads of whole jobs: 16 jobs at 4 heads, 21 at 3 (one head
+    // idle), one at 33..=64. Launch at, just under and just over 1 and 2 tiles.
+    for &nkh in &[3usize, 4, 7, 32, 33, 63, 64] {
+        let per_tile = 64 / nkh;
+        for jobs in [
+            1,
+            per_tile - 1,
+            per_tile,
+            per_tile + 1,
+            2 * per_tile,
+            2 * per_tile + 1,
+        ] {
+            if jobs == 0 {
+                continue;
+            }
+            check(
+                &dev,
+                &Case::new(jobs, nkh, 128, 0.9, (nkh * 1000 + jobs) as u64),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn claim_defers_exactly_the_job_holding_each_class_last_band() -> Result<()> {
+    let dev = cuda()?;
+    let mut case = Case::new(500, 4, 128, 1.0, 101);
+    // Each class one slot short of its demand: only the band past the end
+    // defers, and with it only its own job.
+    let full: Vec<u32> = case.lease_len.clone();
+    case.set_lease(|c| full[c].saturating_sub(1));
+    let want = check(&dev, &case)?;
+    let deferred = want.summary_flags.iter().filter(|&&f| f == 1).count();
+    let short_classes = full.iter().filter(|&&n| n > 0).count();
+    assert!(
+        (1..=short_classes).contains(&deferred),
+        "{deferred} jobs deferred"
+    );
+    Ok(())
+}
+
+#[test]
+fn claim_with_no_lease_left_defers_every_job() -> Result<()> {
+    let dev = cuda()?;
+    let mut case = Case::new(300, 4, 128, 1.0, 111);
+    case.taken = case.lease_len.clone();
+    let want = check(&dev, &case)?;
+    assert!(want.summary_flags.iter().all(|&f| f == 1));
+    assert_eq!(
+        want.error_word, 0,
+        "running dry is a deferral, not an error"
+    );
+    Ok(())
+}
+
+#[test]
+fn claim_with_every_band_in_one_class() -> Result<()> {
+    let dev = cuda()?;
+    let mut case = Case::new(4000, 4, 128, 1.0, 121);
+    for t in case.k_tags.iter_mut().chain(case.v_tags.iter_mut()) {
+        *t = CODES[7];
+    }
+    case.set_lease(|c| {
+        if c == class_of(7) as usize {
+            4000 * 32
+        } else {
+            0
+        }
+    });
+    let want = check(&dev, &case)?;
+    assert_eq!(want.taken[class_of(7) as usize], 4000 * 32);
+    Ok(())
+}
+
+#[test]
+fn claim_under_an_uncovered_override_defers_everything_and_reports_it() -> Result<()> {
+    let dev = cuda()?;
+    let mut case = Case::new(200, 4, 128, 1.0, 131);
+    case.k_override = 4; // no class covers it
+    let want = check(&dev, &case)?;
+    assert_eq!(want.error_word, 1);
+    assert!(want.summary_flags.iter().all(|&f| f == 1));
+    Ok(())
+}
+
+#[test]
+fn claim_treats_a_class_past_n_class_as_uncovered() -> Result<()> {
+    let dev = cuda()?;
+    let mut case = Case::new(200, 4, 128, 1.0, 141);
+    // A table entry naming a class the launch does not count.
+    case.code_class[CODES[3] as usize] = N_CLASS as i8;
+    let want = check(&dev, &case)?;
+    assert_eq!(want.error_word, 1);
+    Ok(())
+}
+
+#[test]
+fn claim_refuses_arguments_outside_its_contract_without_launching() -> Result<()> {
+    let dev = cuda()?;
+    let stream = dev.cuda_stream();
+    let null = std::ptr::null_mut::<u8>();
+    let call = |n_jobs: i32, nkh: i32, hd: i32, n_class: i32| unsafe {
+        run_kv_gap_claim(
+            null as *const i32,
+            null as *const i32,
+            null as *const f32,
+            null as *const f32,
+            null as *const i32,
+            null as *const i32,
+            NO_OVERRIDE,
+            NO_OVERRIDE,
+            null as *const i8,
+            null as *const u8,
+            null as *const u32,
+            null as *const u64,
+            null as *const u32,
+            null as *mut u32,
+            SINK,
+            null,
+            null,
+            null as *mut u32,
+            null as *mut u32,
+            null as *mut u64,
+            1,
+            n_jobs,
+            nkh,
+            hd,
+            n_class,
+            stream.cu_stream() as *mut std::ffi::c_void,
+        )
+    };
+    for (args, what) in [
+        ((0, 4, 128, 4), "no jobs"),
+        ((-1, 4, 128, 4), "negative jobs"),
+        ((10, 0, 128, 4), "no heads"),
+        ((10, MAX_KV_HEAD as i32 + 1, 128, 4), "too many heads"),
+        ((10, 4, 96, 4), "a head_dim with no kernel"),
+        ((10, 4, 128, 0), "no classes"),
+        ((10, 4, 128, MAX_CLASS as i32 + 1), "too many classes"),
+    ] {
+        let (j, k, h, c) = args;
+        assert_eq!(call(j, k, h, c), -1, "{what}");
+    }
+    Ok(())
 }
 
 // The synthetic ladder fits the kernel's class counters.

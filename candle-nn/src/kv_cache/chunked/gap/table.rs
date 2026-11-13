@@ -38,10 +38,13 @@ pub(crate) struct LayerShape {
 impl LayerShape {
     /// The end of the run of full native chunks that starts at `start`: the
     /// first chunk at or past `start` that is partial, empty or quantized, or
-    /// the chunk count.
+    /// the chunk count. A shape read from past `start` says nothing about the
+    /// chunks before its `first`, so none of the run is known complete.
     fn complete_end(&self, start: usize) -> usize {
+        if start < self.first {
+            return start;
+        }
         let end = self.first + self.usage.len().min(self.native.len());
-        let start = start.max(self.first);
         (start..end)
             .find(|&i| {
                 let at = i - self.first;
@@ -231,6 +234,88 @@ mod tests {
     #[test]
     fn no_layers_take_nothing() {
         assert_eq!(take_range(0, &[]), 0..0);
+    }
+
+    #[test]
+    fn a_shape_read_from_past_the_start_takes_nothing_it_did_not_read() {
+        // The shape begins at chunk 3, the take at the cursor, 1: chunks 1 and
+        // 2 were never read, so none of the range may be claimed.
+        let shape = LayerShape {
+            writer_start: 0,
+            first: 3,
+            usage: vec![FULL, FULL, 5],
+            native: vec![true; 3],
+        };
+        assert!(take_range(1, &[shape]).is_empty());
+    }
+
+    #[test]
+    fn usage_and_native_of_different_lengths_stop_at_the_shorter() {
+        let longer_usage = layer(0, &[FULL, FULL, FULL], &[true, true]);
+        assert_eq!(take_range(0, &[longer_usage]), 0..2);
+        let longer_native = layer(0, &[FULL], &[true, true, true]);
+        assert_eq!(take_range(0, &[longer_native]), 0..1);
+    }
+
+    #[test]
+    fn an_overfull_chunk_is_not_complete() {
+        let usage = [FULL, FULL + 1, FULL];
+        assert_eq!(take_range(0, &[layer(0, &usage, &[true; 3])]), 0..1);
+    }
+
+    #[test]
+    fn a_quantized_chunk_at_the_cursor_takes_nothing() {
+        let usage = [FULL, FULL, FULL];
+        let native = [true, false, true];
+        assert!(take_range(1, &[layer(0, &usage, &native)]).is_empty());
+    }
+
+    #[test]
+    fn layers_with_different_writer_boundaries_start_at_the_latest() {
+        let usage = [FULL; 6];
+        let native = [true; 6];
+        assert_eq!(
+            take_range(
+                0,
+                &[
+                    layer(1, &usage, &native),
+                    layer(4, &usage, &native),
+                    layer(2, &usage, &native)
+                ]
+            ),
+            4..6
+        );
+    }
+
+    #[test]
+    fn a_layer_with_no_chunks_takes_nothing_for_every_layer() {
+        let usage = [FULL, FULL];
+        assert!(take_range(0, &[layer(0, &usage, &[true; 2]), layer(0, &[], &[])]).is_empty());
+    }
+
+    #[test]
+    fn a_truncate_to_nothing_and_an_eviction_of_everything_zero_the_cursor() {
+        assert_eq!(cursor_after_truncate(7, 0), 0);
+        assert_eq!(cursor_after_front_eviction(7, 7), 0);
+        assert_eq!(cursor_after_front_eviction(0, 3), 0);
+    }
+
+    #[test]
+    fn a_pure_insertion_at_the_cursor_moves_it_past_the_inserted_chunks() {
+        // Nothing replaced, two chunks inserted at 4: the chunk the cursor
+        // named is now at 6.
+        assert_eq!(cursor_after_splice(4, 4, 4, 2), 6);
+        // Inserted after the cursor: untouched.
+        assert_eq!(cursor_after_splice(3, 4, 4, 2), 3);
+    }
+
+    #[test]
+    fn a_pure_deletion_pulls_a_cursor_inside_it_to_its_start() {
+        assert_eq!(cursor_after_splice(4, 2, 6, 0), 2);
+        assert_eq!(cursor_after_splice(6, 2, 6, 0), 2);
+        assert_eq!(cursor_after_splice(9, 2, 6, 0), 5);
+        // The cursor exactly at the deletion's start stays there.
+        assert_eq!(cursor_after_splice(2, 2, 6, 0), 2);
     }
 
     #[test]

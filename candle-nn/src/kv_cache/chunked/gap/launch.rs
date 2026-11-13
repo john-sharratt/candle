@@ -619,6 +619,31 @@ mod tests {
     }
 
     #[test]
+    fn group_edges() {
+        let p = policy();
+        let g = |r: Range<usize>| GapGroup {
+            policy: &p,
+            jobs: r,
+        };
+        // No groups over no jobs; no groups over some jobs.
+        assert!(check_groups(&[], 0).is_ok());
+        assert!(check_groups(&[], 3).is_err());
+        // One group a job.
+        assert!(check_groups(&[g(0..1), g(1..2), g(2..3)], 3).is_ok());
+        // Out of order, a gap, and past the table.
+        assert!(check_groups(&[g(1..3), g(0..1)], 3).is_err());
+        assert!(check_groups(&[g(0..1), g(2..3)], 3).is_err());
+        assert!(check_groups(&[g(0..4)], 3).is_err());
+    }
+
+    #[test]
+    fn an_unrecorded_or_unknown_tag_is_not_a_readable_source() {
+        use crate::kv_cache::ArenaFormatTag;
+        assert!(!readable_source(ArenaFormatTag::Invalid.as_u8()));
+        assert!(!readable_source(u8::MAX));
+    }
+
+    #[test]
     fn runs_split_where_the_key_changes() {
         let keys = [0, 0, 1, 1, 1, 0, 2];
         assert_eq!(

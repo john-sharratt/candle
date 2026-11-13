@@ -359,5 +359,90 @@ mod tests {
         assert_eq!(completion_word(0), 1);
         assert_eq!(completion_word(u32::MAX as u64), 1);
         assert_eq!(completion_word(41), 42);
+        assert_eq!(completion_word(u64::MAX), 1);
+        assert_eq!(completion_word((1 << 32) + 41), 42);
+    }
+
+    #[test]
+    fn consecutive_seqs_have_different_words_except_across_the_wrap() {
+        for seq in [0u64, 1, 1000, (1 << 32) - 3, (1 << 32), (1 << 40) + 7] {
+            assert_ne!(completion_word(seq), completion_word(seq + 1), "{seq}");
+        }
+        // The one collision `arm` exists for.
+        assert_eq!(completion_word((1 << 32) - 1), completion_word(1 << 32));
+    }
+
+    #[test]
+    fn the_flags_pad_to_eight_whatever_the_job_count() {
+        for (jobs, heads_off) in [(0, 0), (1, 8), (2, 8), (3, 16), (65_535, 262_144)] {
+            let l = SummaryLayout {
+                max_jobs: jobs,
+                n_kv_head: 4,
+                head_dim: 128,
+            };
+            assert_eq!(l.heads_off(), heads_off, "{jobs} jobs");
+        }
+    }
+
+    #[test]
+    fn a_table_of_no_jobs_holds_only_the_two_words() {
+        let l = SummaryLayout {
+            max_jobs: 0,
+            n_kv_head: 8,
+            head_dim: 512,
+        };
+        assert_eq!((l.error_off(), l.complete_off(), l.bytes()), (0, 4, 8));
+    }
+
+    #[test]
+    fn rows_at_every_head_dim_stay_eight_aligned_and_sized() {
+        for (hd, record) in [(64, 136), (128, 168), (256, 232), (512, 360)] {
+            let l = SummaryLayout {
+                max_jobs: 5,
+                n_kv_head: 3,
+                head_dim: hd,
+            };
+            assert_eq!(l.record_bytes(), record, "hd {hd}");
+            assert_eq!(l.head_stride(), record + 32, "hd {hd}");
+            assert_eq!(l.head_stride() % 8, 0, "hd {hd}");
+            assert_eq!(l.error_off() % 4, 0, "hd {hd}");
+        }
+    }
+
+    /// The last field of every kind, at the widest head: the offsets scale
+    /// with `head_dim` and nothing is read from the wrong side.
+    #[test]
+    fn a_row_at_head_dim_512_decodes_its_last_fields() {
+        let hd = 512;
+        let rec = hd / 2 + 104;
+        let mut row = vec![0u8; rec + 32];
+        row[hd / 4 - 1] = 0xC3; // last byte of the K map
+        row[hd / 2 - 1] = 0x3C; // last byte of the V map
+        let base = hd / 2;
+        row[base + 56..base + 64].copy_from_slice(&u64::MAX.to_le_bytes()); // V ptr 3
+        row[base + 71] = 33; // V fmt 3
+        row[base + 100..base + 104].copy_from_slice(&(-1.5f32).to_le_bytes()); // V scale 3
+        row[rec + 28..rec + 32].copy_from_slice(&u32::MAX.to_le_bytes()); // band 7
+        let r = HeadRow::decode(&row, hd).unwrap();
+        assert_eq!(r.k_pal.len(), 128);
+        assert_eq!(*r.k_pal.last().unwrap(), 0xC3);
+        assert_eq!(*r.v_pal.last().unwrap(), 0x3C);
+        assert_eq!(r.v_ptr[3], u64::MAX);
+        assert_eq!(r.k_ptr, [0; 4]);
+        assert_eq!(r.v_fmt[3], 33);
+        assert_eq!(r.v_scale[3], -1.5);
+        assert_eq!(r.lease_idx[7], u32::MAX);
+    }
+
+    #[test]
+    fn a_row_of_exactly_its_stride_decodes_and_one_byte_less_does_not() {
+        for hd in [64, 128, 256, 512] {
+            let stride = hd / 2 + 104 + 32;
+            assert!(HeadRow::decode(&vec![0u8; stride], hd).is_ok(), "hd {hd}");
+            assert!(
+                HeadRow::decode(&vec![0u8; stride - 1], hd).is_err(),
+                "hd {hd}"
+            );
+        }
     }
 }

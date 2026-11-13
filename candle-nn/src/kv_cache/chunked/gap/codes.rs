@@ -84,6 +84,7 @@ impl CodeTables {
 mod tests {
     use candle::quantized::GgmlDType;
 
+    use super::super::super::size_class::{elems_per_chunk, payload_bytes};
     use super::*;
     use crate::kv_cache::QuantFormat;
 
@@ -114,6 +115,67 @@ mod tests {
         let t = CodeTables::new(EPC).unwrap();
         assert_eq!(t.class[0], NO_CLASS);
         assert!(t.check_covers(&[0]).is_err());
+    }
+
+    /// Every quantized format the selection can name, at every geometry the
+    /// claim takes: its code carries its own record byte, and a class whose
+    /// slots hold its payload.
+    #[test]
+    fn every_selectable_format_lands_in_a_class_that_holds_it() {
+        for hd in [64usize, 128, 256, 512] {
+            let epc = elems_per_chunk(hd / 4);
+            let t = CodeTables::new(epc).unwrap();
+            let mut covered = 0;
+            for format in all_kv_formats() {
+                let KvFormat::Quantized(q) = format else {
+                    continue;
+                };
+                let Ok(c) = ggml_to_select_qtype(q.to_ggml_dtype()) else {
+                    continue;
+                };
+                let c = c as usize;
+                let Some(class) = class_for_format(format, epc) else {
+                    assert_eq!(t.class[c], NO_CLASS, "hd {hd} {q:?}");
+                    continue;
+                };
+                covered += 1;
+                assert_eq!(t.class[c], class.index() as i8, "hd {hd} {q:?}");
+                assert_eq!(
+                    t.fmt[c],
+                    ggml_dtype_to_arena_fmt_code(q.to_ggml_dtype()).unwrap(),
+                    "hd {hd} {q:?}"
+                );
+                let slot = SizeClass::from_index(class.index()).unwrap().bytes();
+                assert!(
+                    slot >= payload_bytes(format, epc),
+                    "hd {hd} {q:?}: {slot} B slot"
+                );
+            }
+            assert!(covered > 1, "hd {hd}: {covered} formats covered");
+        }
+    }
+
+    #[test]
+    fn codes_no_format_names_have_no_class() {
+        let t = CodeTables::new(EPC).unwrap();
+        let named: Vec<usize> = all_kv_formats()
+            .filter_map(|f| match f {
+                KvFormat::Quantized(q) => ggml_to_select_qtype(q.to_ggml_dtype()).ok(),
+                KvFormat::Float(_) => None,
+            })
+            .map(|c| c as usize)
+            .collect();
+        for code in 0..N_CODES {
+            if !named.contains(&code) {
+                assert_eq!(t.class[code], NO_CLASS, "code {code}");
+                assert_eq!(t.fmt[code], 0, "code {code}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_code_list_is_covered() {
+        assert!(CodeTables::new(EPC).unwrap().check_covers(&[]).is_ok());
     }
 
     #[test]
