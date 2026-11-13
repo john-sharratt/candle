@@ -908,7 +908,10 @@ palette4_convert_kernel(
 // C DISPATCHER
 // =============================================================================
 
-extern "C" void run_quantize_palette4_convert(
+// Returns the launch's own status (`cudaLaunchKernel`'s, never an error an
+// earlier launch on the thread left behind): 0 when nothing was asked of it or
+// the kernel was queued, -1 for a head_dim with no kernel.
+extern "C" int run_quantize_palette4_convert(
     const uint8_t* heads_base,
     const int32_t* valid_ranges,
     int32_t num_heads,
@@ -919,7 +922,7 @@ extern "C" void run_quantize_palette4_convert(
     int32_t head_dim,
     cudaStream_t stream
 ) {
-    if (num_kv_heads == 0 || num_layers == 0 || num_chunks == 0) return;
+    if (num_kv_heads == 0 || num_layers == 0 || num_chunks == 0) return 0;
 
     // cudaSharedmemCarveoutMaxShared partitions the SM's unified memory bank
     // to maximise shared memory (~100 KB on Ada Lovelace) at the cost of L1.
@@ -934,31 +937,17 @@ extern "C" void run_quantize_palette4_convert(
     dim3 grid(num_kv_heads, num_layers);
     dim3 block(head_dim);
 
-    #define P4C_LAUNCH(HD)                                                       \
-        do {                                                                     \
-            if (is_k) {                                                          \
-                cudaFuncSetAttribute(                                            \
-                    palette4_convert_kernel<HD, true>,                           \
-                    cudaFuncAttributePreferredSharedMemoryCarveout,              \
-                    cudaSharedmemCarveoutMaxShared);                             \
-                palette4_convert_kernel<HD, true><<<grid, block, 0, stream>>>(   \
-                    heads_base, valid_ranges, num_heads, num_kv_heads,           \
-                    num_chunks);                                                 \
-            } else {                                                             \
-                cudaFuncSetAttribute(                                            \
-                    palette4_convert_kernel<HD, false>,                          \
-                    cudaFuncAttributePreferredSharedMemoryCarveout,              \
-                    cudaSharedmemCarveoutMaxShared);                             \
-                palette4_convert_kernel<HD, false><<<grid, block, 0, stream>>>(  \
-                    heads_base, valid_ranges, num_heads, num_kv_heads,           \
-                    num_chunks);                                                 \
-            }                                                                    \
-        } while (0)
-
-    switch (head_dim) {
-        case 128: P4C_LAUNCH(128); break;
-        case 256: P4C_LAUNCH(256); break;
-        default: break; // the Rust dispatch bails on unsupported widths first
+    const void* kernel;
+    switch (head_dim * 2 + (is_k ? 1 : 0)) {
+        case 128 * 2 + 1: kernel = (const void*)palette4_convert_kernel<128, true>; break;
+        case 128 * 2: kernel = (const void*)palette4_convert_kernel<128, false>; break;
+        case 256 * 2 + 1: kernel = (const void*)palette4_convert_kernel<256, true>; break;
+        case 256 * 2: kernel = (const void*)palette4_convert_kernel<256, false>; break;
+        default: return -1;  // the Rust dispatch refuses unsupported widths first
     }
-    #undef P4C_LAUNCH
+    cudaFuncSetAttribute(
+        kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+    void* args[] = {(void*)&heads_base, (void*)&valid_ranges, (void*)&num_heads,
+                    (void*)&num_kv_heads, (void*)&num_chunks};
+    return (int)cudaLaunchKernel(kernel, grid, block, args, 0, stream);
 }

@@ -7,7 +7,8 @@
 //!
 //! - **Retried blocks, exactly.** A deferred block's rows name each band's
 //!   format, so its demand per class is known to the slot. Deferred blocks lead
-//!   the next table and the claim hands out slots in table order, so leasing
+//!   the next table in groups of their own, ahead of every group of new blocks,
+//!   and the claim hands out slots in table order across groups, so leasing
 //!   their exact demand places them.
 //! - **New blocks, by measured share.** Their band count is exact; only the
 //!   split across classes is not yet known. It is each class's peak share of

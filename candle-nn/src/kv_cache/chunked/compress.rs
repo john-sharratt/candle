@@ -52,6 +52,8 @@ use candle::{DType, Device, Result};
 use super::arena::{ArenaKey, ArenaStorageState};
 use super::backing::ChunkedKvBacking;
 #[cfg(feature = "cuda")]
+use super::band_addrs::BandAddrs;
+#[cfg(feature = "cuda")]
 use super::compression_policy::{
     CompressionPolicy, PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS,
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS,
@@ -123,10 +125,11 @@ pub(super) struct HeadSource {
 }
 
 /// Head `h`'s source bands of `bands`: the layout from each band's own tag,
-/// the address from its arena.
+/// the address from its arena, through `addrs` — one per walk, so a table's
+/// worth of heads looks each arena up once.
 #[cfg(feature = "cuda")]
 pub(super) fn head_source(
-    storage: &ArenaStorageState,
+    addrs: &mut BandAddrs<'_>,
     bands: &ChunkBands,
     h: usize,
 ) -> Result<HeadSource> {
@@ -140,8 +143,8 @@ pub(super) fn head_source(
         let (kt, vt) = bands.band_tags(h, p);
         src.k_fmts[p] = band_ggml_dtype(kt)?;
         src.v_fmts[p] = band_ggml_dtype(vt)?;
-        src.k_ptrs[p] = band_ptr(storage, bands.gids.k_gid_pal(h, p), "k src")?;
-        src.v_ptrs[p] = band_ptr(storage, bands.gids.v_gid_pal(h, p), "v src")?;
+        src.k_ptrs[p] = addrs.addr(bands.gids.k_gid_pal(h, p), "k src")?;
+        src.v_ptrs[p] = addrs.addr(bands.gids.v_gid_pal(h, p), "v src")?;
     }
     Ok(src)
 }
@@ -1015,13 +1018,15 @@ fn quantize_sealed_in_place_impl(
     let mut descs: Vec<PalHeadDesc> = Vec::with_capacity(n_chunks * n_kv_head);
 
     backing.inner.storage.try_write(|storage| {
+        let storage: &ArenaStorageState = storage;
+        let mut src_addrs = BandAddrs::new(storage);
         for (chunk_i, src_bands) in chunk_jobs.iter().enumerate() {
             let ident = identity_pal_map(head_dim);
             for h in 0..n_kv_head {
                 // Source — layout from the chunk's tags, addresses from the
                 // arena. `bucket_quant_chunks` already proved every band is
                 // Float or R16.
-                let src = head_source(storage, src_bands, h)?;
+                let src = head_source(&mut src_addrs, src_bands, h)?;
                 let mut k_dst_ptrs = [0u64; N_PALETTE];
                 let mut k_dst_fmts = [GgmlDType::F16; N_PALETTE];
                 let mut v_dst_ptrs = [0u64; N_PALETTE];

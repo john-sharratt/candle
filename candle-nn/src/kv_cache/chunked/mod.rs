@@ -35,6 +35,8 @@ mod aside;
 #[cfg(not(feature = "cuda"))]
 mod aside_cpu;
 mod backing;
+#[cfg(feature = "cuda")]
+mod band_addrs;
 mod band_codec;
 mod block_round_trip;
 #[cfg(feature = "cuda")]

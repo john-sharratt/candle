@@ -32,6 +32,22 @@ fn two_classes(backing: &ChunkedKvBacking, a: usize, b: usize) -> (usize, usize,
     (q8, q4, demand)
 }
 
+/// A lease for `demand` and each class's shortfall — and every class that came
+/// up short reported with its reason, exactly once.
+pub(super) fn leased(
+    b: &ChunkedKvBacking,
+    demand: &PerClass<usize>,
+) -> candle::Result<(Lease<ChunkGid>, PerClass<usize>)> {
+    let l = lease_demand(b, demand)?;
+    let short_classes: Vec<usize> = (0..SizeClass::COUNT).filter(|&c| l.short[c] > 0).collect();
+    let refused: Vec<usize> = l.refusals.iter().map(|r| r.class).collect();
+    assert_eq!(refused, short_classes, "a shortfall without its reason");
+    for r in &l.refusals {
+        assert_eq!(r.short, l.short[r.class]);
+    }
+    Ok((l.lease, l.short))
+}
+
 fn key(class: usize) -> ArenaKey {
     ArenaKey::new(SizeClass::from_index(class).unwrap(), ArenaLocation::Gpu)
 }
@@ -43,7 +59,7 @@ fn a_lease_holds_exactly_the_demand_each_slot_at_its_address() {
     };
     let b = backing(&device, &CompressionPolicy::new(5));
     let (q8, q4, demand) = two_classes(&b, 37, 5);
-    let (mut lease, short) = lease_demand(&b, &demand).unwrap();
+    let (mut lease, short) = leased(&b, &demand).unwrap();
     assert_eq!(short, [0; SizeClass::COUNT]);
     assert_eq!(lease.held(), demand);
     let image = lease.stack_image().unwrap();
@@ -71,7 +87,7 @@ fn an_empty_demand_leases_nothing() {
         return;
     };
     let b = backing(&device, &CompressionPolicy::new(5));
-    let (lease, short) = lease_demand(&b, &[0; SizeClass::COUNT]).unwrap();
+    let (lease, short) = leased(&b, &[0; SizeClass::COUNT]).unwrap();
     assert!(lease.is_empty());
     assert_eq!(short, [0; SizeClass::COUNT]);
     assert!(lease.stack_image().unwrap().addrs.is_empty());
@@ -84,7 +100,7 @@ fn released_slots_are_back_in_their_pools() {
     };
     let b = backing(&device, &CompressionPolicy::new(5));
     let (q8, q4, demand) = two_classes(&b, 300, 17);
-    let (mut lease, _) = lease_demand(&b, &demand).unwrap();
+    let (mut lease, _) = leased(&b, &demand).unwrap();
     let leased = [q8, q4].map(|c| b.inner.pool.free_slots(key(c)));
     drop(lease.release());
     for (i, c) in [q8, q4].into_iter().enumerate() {
@@ -114,18 +130,18 @@ fn each_lease_takes_the_lowest_free_places() {
     };
     let b = backing(&device, &CompressionPolicy::new(5));
     let (q8, _, demand) = two_classes(&b, 24, 0);
-    let (mut first, _) = lease_demand(&b, &demand).unwrap();
+    let (mut first, _) = leased(&b, &demand).unwrap();
     let a = slots(&first);
     drop(first.release());
 
-    let (mut again, _) = lease_demand(&b, &demand).unwrap();
+    let (mut again, _) = leased(&b, &demand).unwrap();
     assert_eq!(slots(&again), a, "the same places");
 
     // Keep one slot, as an installed block would.
     let kept_addr = again.stack_image().unwrap().addrs[0];
     let kept = again.take(q8, &[0]).unwrap();
     drop(again.release());
-    let (third, _) = lease_demand(&b, &demand).unwrap();
+    let (third, _) = leased(&b, &demand).unwrap();
     let c = slots(&third);
     assert!(!c.contains(&kept_addr), "a held slot is not leased");
     let common = c.iter().filter(|x| a.contains(x)).count();
@@ -168,7 +184,7 @@ fn a_demand_wider_than_an_arena_spans_arenas_at_the_right_addresses() {
     let per_arena = key(q8).chunks();
     let mut demand = [0; SizeClass::COUNT];
     demand[q8] = 3 * per_arena + 7;
-    let (mut lease, short) = lease_demand(&b, &demand).unwrap();
+    let (mut lease, short) = leased(&b, &demand).unwrap();
     assert_eq!(short, [0; SizeClass::COUNT]);
     let image = lease.stack_image().unwrap();
     let gids = take_all(&mut lease, q8);
@@ -194,7 +210,7 @@ fn every_class_a_level_reaches_is_leased_in_one_call() {
     let reach = super::launch_tests::reachable(&b, &policy);
     let demand: PerClass<usize> = std::array::from_fn(|c| if reach[c] { 5 + c } else { 0 });
     assert!(reach.iter().filter(|&&r| r).count() > 2);
-    let (mut lease, short) = lease_demand(&b, &demand).unwrap();
+    let (mut lease, short) = leased(&b, &demand).unwrap();
     assert_eq!(short, [0; SizeClass::COUNT]);
     assert_eq!(lease.held(), demand);
     let image = lease.stack_image().unwrap();
@@ -227,10 +243,10 @@ fn repeated_leases_and_releases_leak_nothing() {
     let b = backing(&device, &CompressionPolicy::new(5));
     let (q8, q4, demand) = two_classes(&b, 90, 40);
     // Warm once so any arena the demand needs exists before the baseline.
-    drop(lease_demand(&b, &demand).unwrap().0.release());
+    drop(leased(&b, &demand).unwrap().0.release());
     let base = [q8, q4].map(|c| b.inner.pool.free_slots(key(c)));
     for round in 0..5 {
-        let (mut lease, _) = lease_demand(&b, &demand).unwrap();
+        let (mut lease, _) = leased(&b, &demand).unwrap();
         // An installed block keeps a few slots for the round, as the catch-up's take does.
         let kept = lease.take(q8, &[0, 1, 2]).unwrap();
         drop(lease.release());
@@ -257,13 +273,13 @@ fn a_hole_opened_below_is_filled_first() {
     };
     let b = backing(&device, &CompressionPolicy::new(5));
     let (q8, _, demand) = two_classes(&b, 8, 0);
-    let (mut l, _) = lease_demand(&b, &demand).unwrap();
+    let (mut l, _) = leased(&b, &demand).unwrap();
     let a = l.stack_image().unwrap();
     let mut held = l.take(q8, &(0..8).collect::<Vec<_>>()).unwrap();
     // Free the third slot only.
     drop(held.remove(2));
     let mut one = [0; SizeClass::COUNT];
     one[q8] = 1;
-    let (next, _) = lease_demand(&b, &one).unwrap();
+    let (next, _) = leased(&b, &one).unwrap();
     assert_eq!(next.stack_image().unwrap().addrs, vec![a.addrs[2]]);
 }

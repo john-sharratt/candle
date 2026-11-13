@@ -451,12 +451,11 @@ extern "C" int run_kv_gap_claim(
     }
     const int jobs_per_tile = TILE_HEADS / n_kv_head;
     const unsigned grid = (unsigned)((n_jobs + jobs_per_tile - 1) / jobs_per_tile);
+    // The head dims the convert has a record for: the gap takes no other.
     const void* kernel;
     switch (head_dim) {
-        case 64: kernel = (const void*)gap_claim_kernel<64>; break;
         case 128: kernel = (const void*)gap_claim_kernel<128>; break;
         case 256: kernel = (const void*)gap_claim_kernel<256>; break;
-        case 512: kernel = (const void*)gap_claim_kernel<512>; break;
         default: return -1;
     }
     // Launched through the runtime call rather than `<<<>>>` so the status
@@ -470,6 +469,11 @@ extern "C" int run_kv_gap_claim(
     return (int)cudaLaunchKernel(kernel, dim3(grid), dim3(THREADS), args, 0, (cudaStream_t)stream);
 }
 
-extern "C" void run_kv_gap_complete(uint32_t* word, uint32_t seq, void* stream) {
-    kv_gap_claim::gap_complete_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(word, seq);
+// Returns the launch's own status, as the claim does: a completion word that
+// was never queued must not be waited for.
+extern "C" int run_kv_gap_complete(uint32_t* word, uint32_t seq, void* stream) {
+    void* args[] = {&word, &seq};
+    return (int)cudaLaunchKernel(
+        (const void*)kv_gap_claim::gap_complete_kernel, dim3(1), dim3(1), args, 0,
+        (cudaStream_t)stream);
 }

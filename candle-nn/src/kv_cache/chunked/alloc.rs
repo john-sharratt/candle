@@ -16,7 +16,7 @@ use std::time::Instant;
 // made this file unbuildable without the `cuda` feature.
 #[cfg(feature = "cuda")]
 use candle::wave_provenance::LeaseOrigin;
-use candle::{DType, Device, Result, Tensor};
+use candle::{DType, Device, Error, Result, Tensor};
 
 use super::arena::{ArenaKey, ArenaKind};
 use super::backing::ChunkedKvBacking;
@@ -1593,13 +1593,13 @@ impl BackingInner {
     /// fail the gap.
     pub(super) fn alloc_chunks_for_key_upto(
         &self,
-        key: super::arena::ArenaKey,
+        key: ArenaKey,
         n: usize,
-    ) -> (Vec<super::gid_pool::ChunkGid>, Option<candle::Error>) {
+    ) -> (Vec<ChunkGid>, Option<Error>) {
         if n == 0 {
             return (Vec::new(), None);
         }
-        let mut out: Vec<super::gid_pool::ChunkGid> = Vec::with_capacity(n);
+        let mut out: Vec<ChunkGid> = Vec::with_capacity(n);
         let mut key = key;
         // Placements in a row whose slots other claimers took before this batch could.
         // Each placement either feeds the batch or is lost that way; a run of losses is
@@ -1611,7 +1611,7 @@ impl BackingInner {
             let mut batch = self.pool.allocate_n_for(key, remaining);
             if batch.is_empty() {
                 if fruitless == STAMP_ATTEMPTS {
-                    stopped = Some(candle::Error::Msg(format!(
+                    stopped = Some(Error::Msg(format!(
                         "alloc_chunks_for_key_bulk: {STAMP_ATTEMPTS} placements for {key:?} \
                          in a row were taken by other claimers before this batch could \
                          claim from them ({} of {n} allocated)",

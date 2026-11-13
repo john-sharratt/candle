@@ -73,7 +73,8 @@ mod split_k;
 use narrow::q8a128_dense_matmul_narrow_segmented;
 use palette4_block::select_palette4_owned;
 pub use palette4_block::{
-    select_palette4_in, select_palette4_launch, Palette4Layout, Palette4Result,
+    select_palette4_in, select_palette4_inputs, select_palette4_launch,
+    select_palette4_launch_staged, Palette4Inputs, Palette4Layout, Palette4Result,
 };
 pub(crate) use silu_matmul::q8a128_dense_matmul_silu;
 pub use split_k::ensure_split_k_scratch;
@@ -1199,8 +1200,51 @@ pub fn build_kvhead_bytes_raw(
     if !kvhead_supported_head_dim(head_dim) {
         crate::bail!("build_kvhead_bytes_raw: unsupported head_dim {head_dim}");
     }
-    let pal_bytes = head_dim / 4;
     let mut head = vec![0u8; kvhead_size(head_dim)];
+    write_kvhead_bytes(
+        head_dim,
+        k_arena_ptrs,
+        v_arena_ptrs,
+        k_fmts,
+        v_fmts,
+        k_pal_map,
+        v_pal_map,
+        k_scales,
+        v_scales,
+        &mut head,
+    )?;
+    Ok(head)
+}
+
+/// [`build_kvhead_bytes_raw`] into `head`, the caller's slice of exactly one
+/// record (`head_dim / 2 + 104` bytes) — so a table of records is written
+/// into one buffer with no allocation per record. Every byte of `head` is
+/// written.
+#[allow(clippy::too_many_arguments)]
+pub fn write_kvhead_bytes(
+    head_dim: usize,
+    k_arena_ptrs: &[u64; KVHEAD_N_PAL],
+    v_arena_ptrs: &[u64; KVHEAD_N_PAL],
+    k_fmts: &[GgmlDType; KVHEAD_N_PAL],
+    v_fmts: &[GgmlDType; KVHEAD_N_PAL],
+    k_pal_map: &PalMapBytes,
+    v_pal_map: &PalMapBytes,
+    k_scales: &[f32; KVHEAD_N_PAL],
+    v_scales: &[f32; KVHEAD_N_PAL],
+    head: &mut [u8],
+) -> Result<()> {
+    if !kvhead_supported_head_dim(head_dim) {
+        crate::bail!("write_kvhead_bytes: unsupported head_dim {head_dim}");
+    }
+    if head.len() != kvhead_size(head_dim) {
+        crate::bail!(
+            "write_kvhead_bytes: a {} byte slice for a {} byte record",
+            head.len(),
+            kvhead_size(head_dim)
+        );
+    }
+    head.fill(0);
+    let pal_bytes = head_dim / 4;
     head[..pal_bytes].copy_from_slice(&k_pal_map[..pal_bytes]);
     head[kvhead_v_pal_off(head_dim)..kvhead_v_pal_off(head_dim) + pal_bytes]
         .copy_from_slice(&v_pal_map[..pal_bytes]);
@@ -1218,7 +1262,7 @@ pub fn build_kvhead_bytes_raw(
         head[ks..ks + 4].copy_from_slice(&k_f32);
         head[vs..vs + 4].copy_from_slice(&v_f32);
     }
-    Ok(head)
+    Ok(())
 }
 
 /// Palette4 KV-cache format conversion.
@@ -1373,7 +1417,7 @@ pub fn quantize_palette4_convert_buffered(
             num_layers,
             num_chunks,
             stream,
-        );
+        )?;
     }
     // gpu_buf drops here — stream-ordered after the kernel launches.
     Ok(())
@@ -1415,7 +1459,8 @@ impl Palette4ConvertLayout {
 
 /// Launch the palette-4 convert, K then V, over the buffer at `base_ptr`,
 /// laid out by [`Palette4ConvertLayout`] for `num_layers × num_kv_heads`
-/// descriptors.
+/// descriptors. A launch the driver refuses is an error, so a caller never
+/// treats a convert that did not run as written.
 ///
 /// # Safety
 ///
@@ -1430,7 +1475,7 @@ pub unsafe fn palette4_convert_launch(
     num_layers: usize,
     num_chunks: usize,
     stream: &Arc<CudaStream>,
-) {
+) -> Result<()> {
     let layout = Palette4ConvertLayout::new(head_dim, num_layers * num_kv_heads);
     // Grid: dim3(num_kv_heads, num_layers) → exactly n blocks per launch.
     let ranges_ptr = (base_ptr + layout.ranges_off() as u64) as *const i32;
@@ -1440,7 +1485,7 @@ pub unsafe fn palette4_convert_launch(
         (0, "run_quantize_palette4_convert (V)"),
     ] {
         crate::set_kernel_breadcrumb(label, file!(), line!());
-        run_quantize_palette4_convert(
+        let rc = run_quantize_palette4_convert(
             base_ptr as *const u8,
             ranges_ptr,
             layout.n as i32,
@@ -1451,7 +1496,11 @@ pub unsafe fn palette4_convert_launch(
             head_dim as i32,
             raw_stream,
         );
+        if rc != 0 {
+            crate::bail!("{label}: the launch was refused ({rc})");
+        }
     }
+    Ok(())
 }
 
 /// Thin unsafe wrapper around `run_select_kv_format_palette4_paged`.

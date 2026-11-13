@@ -26,7 +26,7 @@ use super::codes::CodeTables;
 use super::demand::{count_bands, gap_demand, PerClass};
 use super::launch::{GapDevice, GapGroup, GapJob};
 use super::lease::{Lease, StackImage};
-use super::lease_alloc::lease_demand;
+use super::lease_alloc_tests::leased;
 use super::summary::{completion_word, HeadRow};
 use crate::kv_cache::arena_table::{ArenaLocation, N_PALETTE};
 use crate::kv_cache::{
@@ -234,7 +234,7 @@ fn lease_for(
 ) -> Lease<ChunkGid> {
     let reach = reachable(backing, policy);
     let demand: PerClass<usize> = std::array::from_fn(|c| if reach[c] { per_class(c) } else { 0 });
-    let (lease, short) = lease_demand(backing, &demand).expect("lease");
+    let (lease, short) = leased(backing, &demand).expect("lease");
     assert_eq!(
         short,
         [0; SizeClass::COUNT],
@@ -519,6 +519,22 @@ fn row_bands(row: &HeadRow, codes: &CodeTables) -> [(usize, u32); 8] {
     })
 }
 
+/// One block's slots out of the lease, as the catch-up takes them: per class,
+/// the indices its rows name, in band order.
+fn take_block(lease: &mut Lease<ChunkGid>, rows: &[HeadRow], codes: &CodeTables) -> Vec<ChunkGid> {
+    let mut by_class = vec![Vec::new(); SizeClass::COUNT];
+    for row in rows {
+        for (class, idx) in row_bands(row, codes) {
+            by_class[class].push(idx);
+        }
+    }
+    let mut out = Vec::new();
+    for (c, idx) in by_class.iter().enumerate() {
+        out.extend(lease.take(c, idx).expect("the summary matches its lease"));
+    }
+    out
+}
+
 /// One gap's whole cycle against the pools (§3, §3.5): a lease short of the
 /// table defers some blocks; the catch-up takes the installed blocks' slots by
 /// the summary's indices and returns every other slot to its pool; the next
@@ -558,24 +574,27 @@ fn a_gap_cycle_returns_every_unused_slot_and_a_retry_places_every_deferred_block
         .collect();
     let free = |c: usize| backings[0].inner.pool.free_slots(keys[c]);
     let free_leased: Vec<usize> = (0..SizeClass::COUNT).map(free).collect();
-    let mut taken_by_class = vec![Vec::new(); SizeClass::COUNT];
+    // Block by block, as the catch-up installs them.
+    let mut taken_by_class = [0usize; SizeClass::COUNT];
+    let mut installed: Vec<ChunkGid> = Vec::new();
     for (j, _) in deferred.iter().enumerate().filter(|(_, &d)| !d) {
+        installed.extend(take_block(
+            &mut lease,
+            &rows[j * N_KV_HEAD..(j + 1) * N_KV_HEAD],
+            &codes,
+        ));
         for row in &rows[j * N_KV_HEAD..(j + 1) * N_KV_HEAD] {
-            for (class, idx) in row_bands(row, &codes) {
-                taken_by_class[class].push(idx);
+            for (class, _) in row_bands(row, &codes) {
+                taken_by_class[class] += 1;
             }
         }
-    }
-    let mut installed: Vec<ChunkGid> = Vec::new();
-    for (c, idx) in taken_by_class.iter().enumerate() {
-        installed.extend(lease.take(c, idx).expect("the summary matches its lease"));
     }
     drop(lease.release());
     assert!(lease.is_empty());
     for c in 0..SizeClass::COUNT {
         assert_eq!(
             free(c),
-            free_leased[c] + held[c] - taken_by_class[c].len(),
+            free_leased[c] + held[c] - taken_by_class[c],
             "class {c}: every slot not installed went back"
         );
     }
@@ -592,7 +611,7 @@ fn a_gap_cycle_returns_every_unused_slot_and_a_retry_places_every_deferred_block
     let reach = reachable(&backings[0], &policy);
     let exact = gap_demand(&retried, 0, None, &reach);
     assert_eq!(exact, retried);
-    let (lease2, short) = lease_demand(&backings[0], &exact).unwrap();
+    let (lease2, short) = leased(&backings[0], &exact).unwrap();
     assert_eq!(short, [0; SizeClass::COUNT]);
     let retry_jobs: Vec<GapJob> = retry.iter().map(|&j| jobs[j].clone()).collect();
     let groups = [GapGroup {
@@ -624,6 +643,97 @@ fn a_gap_cycle_returns_every_unused_slot_and_a_retry_places_every_deferred_block
     let used: usize = rows2.iter().map(|r| row_bands(r, &codes).len()).sum();
     assert_eq!(used, exact.iter().sum::<usize>());
     drop(installed);
+}
+
+/// Retried blocks keep their exact lease only if they claim first. The claim
+/// counts every group of the gap in table order, so the retried blocks lead in
+/// groups of their own, ahead of every group of new blocks — whatever the new
+/// blocks' policy. Leased exactly the retried demand, that order places every
+/// retried block and defers every new one; the reverse order lets the new
+/// blocks take the retried blocks' slots.
+#[test]
+fn retried_blocks_in_their_own_leading_groups_keep_their_exact_lease() {
+    let Some((device, cuda, _gpu)) = cuda() else {
+        return;
+    };
+    let c5 = CompressionPolicy::new(5);
+    let c10 = CompressionPolicy::new(10);
+    let (backings, srcs) = setup(&device, &c5);
+    let jobs = jobs(&srcs);
+    let codes = CodeTables::new(backings[0].elems_per_chunk()).unwrap();
+
+    // Gap 1 on a short lease: some blocks defer.
+    let lease = lease_for(&backings[0], &c5, |_| 40);
+    let all = [GapGroup {
+        policy: &c5,
+        jobs: 0..jobs.len(),
+    }];
+    let (rows, deferred, _) = run_gap(&cuda, &device, &backings, &jobs, &all, &stack(&lease));
+    drop(lease);
+    let retry: Vec<usize> = (0..jobs.len()).filter(|&j| deferred[j]).collect();
+    let fresh: Vec<usize> = (0..jobs.len()).filter(|&j| !deferred[j]).collect();
+    assert!(!retry.is_empty() && !fresh.is_empty());
+    let retried = count_bands(
+        retry
+            .iter()
+            .flat_map(|&j| &rows[j * N_KV_HEAD..(j + 1) * N_KV_HEAD]),
+        |f| codes.class_of_fmt(f),
+    )
+    .unwrap();
+
+    let table = |first: &[usize], then: &[usize]| -> Vec<GapJob> {
+        first.iter().chain(then).map(|&j| jobs[j].clone()).collect()
+    };
+    let (nr, nf) = (retry.len(), fresh.len());
+
+    // Retried first, under C5; the new blocks after them, under C10.
+    let (lease, short) = leased(&backings[0], &retried).unwrap();
+    assert_eq!(short, [0; SizeClass::COUNT]);
+    let ordered = table(&retry, &fresh);
+    let groups = [
+        GapGroup {
+            policy: &c5,
+            jobs: 0..nr,
+        },
+        GapGroup {
+            policy: &c10,
+            jobs: nr..nr + nf,
+        },
+    ];
+    let (_, d, errored) = run_gap(&cuda, &device, &backings, &ordered, &groups, &stack(&lease));
+    assert!(!errored);
+    assert!(d[..nr].iter().all(|&x| !x), "every retried block placed");
+    assert!(
+        d[nr..].iter().all(|&x| x),
+        "the exact lease leaves nothing new"
+    );
+    drop(lease);
+
+    // The new blocks first: they claim the retried blocks' slots.
+    let (lease, _) = leased(&backings[0], &retried).unwrap();
+    let reversed = table(&fresh, &retry);
+    let groups = [
+        GapGroup {
+            policy: &c10,
+            jobs: 0..nf,
+        },
+        GapGroup {
+            policy: &c5,
+            jobs: nf..nf + nr,
+        },
+    ];
+    let (_, d, _) = run_gap(
+        &cuda,
+        &device,
+        &backings,
+        &reversed,
+        &groups,
+        &stack(&lease),
+    );
+    assert!(
+        d[nf..].iter().any(|&x| x),
+        "behind the new blocks a retried block is deferred again"
+    );
 }
 
 /// A gap whose lease covers its table, through the catch-up: every block is
@@ -695,9 +805,14 @@ fn an_ample_gap_installs_every_block_and_returns_only_the_surplus() {
             }
         }
 
+        // Block by block, as the catch-up installs them.
         let mut installed = Vec::new();
-        for (c, idx) in by_class.iter().enumerate() {
-            installed.extend(lease.take(c, idx).unwrap());
+        for j in 0..jobs.len() {
+            installed.extend(take_block(
+                &mut lease,
+                &rows[j * N_KV_HEAD..(j + 1) * N_KV_HEAD],
+                &codes,
+            ));
         }
         let back = lease.release();
         for c in 0..SizeClass::COUNT {

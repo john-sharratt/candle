@@ -27,14 +27,15 @@ use candle::cuda_backend::kernels::simple::kv_gap_claim::{
 use candle::cuda_backend::staged::segment;
 use candle::cuda_backend::{CudaDevice, Held, WrapErr};
 use candle::quantized::cuda::{
-    build_kvhead_bytes_raw, check_token_window, ggml_to_select_qtype, identity_pal_map,
-    kvhead_supported_head_dim, palette4_convert_launch, select_palette4_launch,
-    Palette4ConvertLayout, Palette4Layout,
+    check_token_window, ggml_to_select_qtype, identity_pal_map, kvhead_supported_head_dim,
+    palette4_convert_launch, select_palette4_inputs, select_palette4_launch_staged,
+    write_kvhead_bytes, Palette4ConvertLayout, Palette4Inputs,
 };
 use candle::quantized::GgmlDType;
 use candle::Result;
 
 use super::super::backing::ChunkedKvBacking;
+use super::super::band_addrs::BandAddrs;
 use super::super::compress::{head_source, policy_selection};
 use super::super::compression_policy::CompressionPolicy;
 use super::super::head_gids::ChunkBands;
@@ -42,7 +43,7 @@ use super::super::size_class::{elems_per_chunk, SizeClass, GID_STRIDE};
 use super::codes::CodeTables;
 use super::lease::StackImage;
 use super::summary::{completion_word, MappedSummary, SummaryLayout};
-use crate::kv_cache::arena_table::{ArenaLocation, N_PALETTE};
+use crate::kv_cache::arena_table::N_PALETTE;
 use crate::kv_cache::{KvFormat, QuantFormat};
 
 /// The most jobs one gap's table holds: the convert's single launch
@@ -248,7 +249,7 @@ impl GapDevice {
         let mut select_bytes = 0usize;
         for p in &plans {
             select_at.push(select_bytes);
-            select_bytes = (select_bytes + p.layout.bytes()).next_multiple_of(BLOCK_ALIGN);
+            select_bytes = (select_bytes + p.inputs.layout.bytes()).next_multiple_of(BLOCK_ALIGN);
         }
         let select_base = self.select.at_least(&self.dev, select_bytes)?;
         let convert_base = self.convert.at_least(&self.dev, convert.bytes())?;
@@ -291,6 +292,7 @@ impl GapDevice {
         for p in &plans {
             segments.push(segment(&p.table));
             segments.push(segment(&p.head_gids));
+            segments.push(segment(&p.inputs.words));
         }
 
         self.summary.arm();
@@ -303,20 +305,20 @@ impl GapDevice {
                 [at[0], at[1], at[2], at[3], at[4], at[5]];
             for (g, (p, group)) in plans.iter().zip(groups).enumerate() {
                 let block = select_base + select_at[g] as u64;
-                // SAFETY: both tables are in the staging scratch, reused only
-                // in stream order; `block` holds `p.layout.bytes()`.
-                let sel = unsafe {
-                    select_palette4_launch(
-                        at[6 + 2 * g],
-                        at[7 + 2 * g],
-                        p.jobs.len(),
-                        &p.k_candidates,
-                        &p.v_candidates,
+                let sel = &p.inputs.layout;
+                // SAFETY: the tables and the input words are in the staging
+                // scratch, reused only in stream order; `block` holds
+                // `sel.bytes()`.
+                unsafe {
+                    select_palette4_launch_staged(
+                        at[6 + 3 * g],
+                        at[7 + 3 * g],
+                        &p.inputs,
+                        at[8 + 3 * g],
                         p.thresholds,
                         head_dim,
                         n_kv_head,
                         GID_STRIDE,
-                        &p.valid_ranges,
                         block,
                         &stream,
                     )?
@@ -365,12 +367,21 @@ impl GapDevice {
             // SAFETY: the source half and windows were uploaded above and the
             // destination half written by the claims, all ahead on `stream`.
             unsafe {
-                palette4_convert_launch(convert_base, head_dim, n_kv_head, jobs.len(), 1, &stream);
+                palette4_convert_launch(convert_base, head_dim, n_kv_head, jobs.len(), 1, &stream)
+                    .map_err(|e| e.context(format!("gap {seq}: the convert")))?;
+            }
+            // SAFETY: the completion word is in the mapped summary, live
+            // while `self` is.
+            let rc = unsafe {
                 run_kv_gap_complete(
                     summary.dev_at(layout.complete_off()) as *mut u32,
                     completion_word(seq),
                     stream.cu_stream() as *mut c_void,
-                );
+                )
+            };
+            if rc != 0 {
+                // Never outstanding: a word that was not queued is never stored.
+                candle::bail!("gap {seq}: the completion word was refused ({rc})");
             }
             Ok(())
         });
@@ -416,13 +427,12 @@ fn check_groups(groups: &[GapGroup<'_>], n_jobs: usize) -> Result<()> {
 /// One group's host-side inputs.
 struct GroupPlan {
     jobs: Range<usize>,
-    layout: Palette4Layout,
-    k_candidates: Vec<GgmlDType>,
-    v_candidates: Vec<GgmlDType>,
+    /// The selection's block layout and input words — candidates and windows —
+    /// uploaded with the gap's other inputs.
+    inputs: Palette4Inputs,
     thresholds: [f32; 4],
     k_override: i32,
     v_override: i32,
-    valid_ranges: Vec<i32>,
     /// The selection's per-(chunk, head) table and band gids, in job order.
     table: Vec<i64>,
     head_gids: Vec<i64>,
@@ -476,22 +486,21 @@ impl GroupPlan {
                 .gids
                 .extend_selection_gids(n_kv_head, &mut head_gids);
         }
-        let layout = Palette4Layout::new(
+        let valid_ranges: Vec<i32> = group_jobs.iter().map(|j| j.valid_range).collect();
+        let inputs = select_palette4_inputs(
             group_jobs.len(),
-            n_kv_head,
+            &k_candidates,
+            &v_candidates,
             head_dim,
-            k_candidates.len(),
-            v_candidates.len(),
-        );
+            n_kv_head,
+            &valid_ranges,
+        )?;
         Ok(Self {
             jobs: group.jobs.clone(),
-            layout,
-            k_candidates,
-            v_candidates,
+            inputs,
             thresholds: sel.thresholds,
             k_override,
             v_override,
-            valid_ranges: group_jobs.iter().map(|j| j.valid_range).collect(),
             table,
             head_gids,
         })
@@ -540,7 +549,8 @@ fn layer_backing<'b>(
 
 /// Every head's source KvHead record — the job's native bands as they lie, at
 /// the identity map and unit scales — and its token window, in table order.
-/// One read of a layer's storage per run of its jobs.
+/// One read of a layer's storage per run of its jobs, each arena looked up
+/// once per run, and every record written into one buffer sized up front.
 fn source_records(
     jobs: &[GapJob],
     backings: &[&ChunkedKvBacking],
@@ -549,34 +559,32 @@ fn source_records(
 ) -> Result<(Vec<u8>, Vec<i32>)> {
     let ident = identity_pal_map(head_dim);
     let record_bytes = Palette4ConvertLayout::new(head_dim, 1).record_bytes;
-    let mut records = Vec::with_capacity(jobs.len() * n_kv_head * record_bytes);
+    let mut records = vec![0u8; jobs.len() * n_kv_head * record_bytes];
     let mut ranges = Vec::with_capacity(jobs.len() * n_kv_head);
+    let mut out = records.chunks_exact_mut(record_bytes);
     for run in layer_runs(jobs) {
         let layer = jobs[run.start].layer;
         let backing = layer_backing(backings, layer)?;
         backing.inner.storage.read(|storage| -> Result<()> {
+            // An arena that is not GPU-resident has no slot address, so the
+            // address lookup refuses a band off the device.
+            let mut addrs = BandAddrs::new(storage);
             for job in &jobs[run] {
                 check_token_window(job.valid_range)
                     .map_err(|e| e.context(format!("gap: a job on layer {layer}")))?;
                 for h in 0..n_kv_head {
                     for p in 0..N_PALETTE {
                         let (kt, vt) = job.bands.band_tags(h, p);
-                        for (gid, tag) in [
-                            (job.bands.gids.k_gid_pal(h, p), kt),
-                            (job.bands.gids.v_gid_pal(h, p), vt),
-                        ] {
-                            let on_gpu = storage
-                                .arena_key(gid.arena_idx())
-                                .is_some_and(|k| k.location == ArenaLocation::Gpu);
-                            if !on_gpu || !readable_source(tag) {
+                        for tag in [kt, vt] {
+                            if !readable_source(tag) {
                                 candle::bail!(
-                                    "gap: a job's band (tag {tag}) is not a GPU float or R16 band"
+                                    "gap: a job's band (tag {tag}) is not a float or R16 band"
                                 );
                             }
                         }
                     }
-                    let src = head_source(storage, &job.bands, h)?;
-                    records.extend(build_kvhead_bytes_raw(
+                    let src = head_source(&mut addrs, &job.bands, h)?;
+                    write_kvhead_bytes(
                         head_dim,
                         &src.k_ptrs,
                         &src.v_ptrs,
@@ -586,7 +594,8 @@ fn source_records(
                         &ident,
                         &[1.0; N_PALETTE],
                         &[1.0; N_PALETTE],
-                    )?);
+                        out.next().expect("sized for every head"),
+                    )?;
                     ranges.push(job.valid_range);
                 }
             }

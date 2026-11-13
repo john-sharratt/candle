@@ -51,7 +51,7 @@ extern "C" {
     /// `dst_records` (the convert buffer's destination half) and into
     /// `summary_heads`, each band's lease index after the record and each job's
     /// deferred flag in `summary_flags`. Returns 0, or nonzero when it refused
-    /// the arguments (`head_dim` other than 64, 128, 256 or 512; `n_kv_head`
+    /// the arguments (`head_dim` other than 128 or 256, the convert's; `n_kv_head`
     /// past [`MAX_KV_HEAD`]; `n_class` past [`MAX_CLASS`]) or the launch failed.
     ///
     /// # Safety
@@ -100,5 +100,8 @@ extern "C" {
     ///
     /// `word` is a device-visible address of one `u32`, normally mapped host
     /// memory.
-    pub fn run_kv_gap_complete(word: *mut u32, seq: u32, stream: *mut c_void);
+    ///
+    /// Returns the launch's own status: 0 when queued, else the `cudaError_t`
+    /// the launch returned.
+    pub fn run_kv_gap_complete(word: *mut u32, seq: u32, stream: *mut c_void) -> i32;
 }

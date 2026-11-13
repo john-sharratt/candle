@@ -213,9 +213,9 @@ chooses among them.**
   a single-pass scan with decoupled look-back over tiles of whole jobs, sixteen
   class counters two to a word. Its look-back status words are scratch zeroed
   once at allocation; each launch carries a new epoch, so nothing is cleared
-  between launches. A job has at most 64 KV heads. The claim takes a head
-  dimension of 64, 128, 256 or 512; the convert has a record only at 128 and
-  256, so the gap as a whole takes those two and refuses the rest at setup.
+  between launches. A job has at most 64 KV heads, and the head dimension is
+  128 or 256 — the two the convert has a record for, and the only two the
+  claim is built at; the gap refuses any other at setup.
 - **A class that runs dry defers the block, never fails it.** A block is
   deferred when any of its bands' indices falls past its class's lease. The
   whole block stays native and goes first into the next gap's table. Its bands
@@ -235,11 +235,16 @@ chooses among them.**
   carries the exact per-class demand of the blocks it saw. A gap's demand is
   two parts:
   - **Retried blocks, exactly.** Each deferred block's rows name the format of
-    every band, so its demand per class is known to the slot. Deferred blocks
-    lead the next table, and the claim hands out slots in table order, so a
-    lease that covers their exact demand is certain to place them: the
-    selection is deterministic on native bytes that have not changed, and
-    chooses the same formats again.
+    every band, so its demand per class is known to the slot. The claim counts
+    every group of a gap in table order, against counts the groups share, so
+    the deferred blocks lead the next table **in groups of their own** — one
+    per policy among them — ahead of every group of new blocks, whatever the
+    new blocks' policy; a policy may hold a retry group and a new group in the
+    same gap. A lease that covers their exact demand is then certain to place
+    them: the selection is deterministic on native bytes that have not
+    changed, and chooses the same formats again. Were a retried block to sit
+    in a group behind new blocks, those blocks could take its slots first and
+    defer it again, gap after gap.
   - **New blocks, by measured share.** Their band count is exact — blocks ×
     heads × `N_PALETTE` × 2 — and only the split across classes is not yet
     known. It is taken from each class's peak share of claims over the recent
@@ -321,7 +326,8 @@ outstanding gap's blocks. For each converted block the host:
 Then the rest of the lease goes back: every slot no installed block took — the
 slots past every class's demand, the slots deferred blocks were given and
 never wrote, the slots of rows discarded as stale — returns to its pool, and
-the lease is empty. A deferred block leads this gap's table, its exact demand
+the lease is empty. A deferred block leads this gap's table in a retry group
+ahead of every new block's group (§3.2), its exact demand
 taken from its rows, and each class's share of the summary's claims is recorded
 for the new blocks' demand (§3.2). This is the install the persistence thread does today, moved to
 the thread that owns the sequences, with nothing left to fence: the convert has

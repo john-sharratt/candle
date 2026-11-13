@@ -29,9 +29,16 @@ pub(crate) struct StackImage {
 /// The slots held for one gap's claim, per class, in stack order, each with its
 /// device address. `T` is the slot's owning handle — a `ChunkGid` in
 /// production, which returns the slot to its pool when dropped.
+///
+/// **A position is fixed for the lease's life.** The summary names a band's
+/// slot by its position in the run the stack laid out, and the catch-up takes
+/// block by block, so a take leaves its places empty rather than closing the
+/// run up: every later take still finds its slots where the claim found them.
+/// Once anything is taken the stack no longer describes the lease, and is not
+/// built from it again.
 #[derive(Debug)]
 pub(crate) struct Lease<T> {
-    slots: PerClass<Vec<(T, u64)>>,
+    slots: PerClass<Vec<Option<(T, u64)>>>,
 }
 
 impl<T> Default for Lease<T> {
@@ -43,23 +50,25 @@ impl<T> Default for Lease<T> {
 }
 
 impl<T> Lease<T> {
-    /// The slots each class holds.
+    /// The slots each class still holds.
     pub(crate) fn held(&self) -> PerClass<usize> {
-        std::array::from_fn(|c| self.slots[c].len())
+        std::array::from_fn(|c| self.slots[c].iter().flatten().count())
     }
 
     /// Whether the lease holds no slot.
     pub(crate) fn is_empty(&self) -> bool {
-        self.slots.iter().all(Vec::is_empty)
+        self.slots.iter().all(|run| run.iter().all(Option::is_none))
     }
 
     /// Add `slots`, each with its address, to class `class`'s run, after the
     /// ones it holds.
     pub(crate) fn add(&mut self, class: usize, slots: impl IntoIterator<Item = (T, u64)>) {
-        self.slots[class].extend(slots);
+        self.slots[class].extend(slots.into_iter().map(Some));
     }
 
-    /// The stack image the claim reads: the held addresses, copied.
+    /// The stack image the claim reads: the held addresses, copied. Refused
+    /// once anything has been taken — the stack a claim ran against is the
+    /// lease as allocated.
     pub(crate) fn stack_image(&self) -> Result<StackImage> {
         let mut image = StackImage {
             addrs: Vec::with_capacity(self.slots.iter().map(Vec::len).sum()),
@@ -70,51 +79,50 @@ impl<T> Lease<T> {
                 .map_err(|_| candle::Error::Msg("gap lease: stack past u32".into()))?;
             image.len[c] = u32::try_from(run.len())
                 .map_err(|_| candle::Error::Msg("gap lease: class run past u32".into()))?;
-            image.addrs.extend(run.iter().map(|&(_, addr)| addr));
+            for slot in run {
+                let Some((_, addr)) = slot else {
+                    candle::bail!("gap lease: class {c} was taken from; its stack is spent");
+                };
+                image.addrs.push(*addr);
+            }
         }
         Ok(image)
     }
 
     /// Take class `class`'s slots at `indices` — positions in the run as the
-    /// stack image laid it out — out of the lease, in the order named. The
-    /// slots left keep their positions' order. Refuses an index past the run
-    /// or one named twice, taking nothing: either is a summary that does not
-    /// match the lease it was claimed against.
+    /// stack image laid it out — out of the lease, in the order named. Every
+    /// other slot keeps its position, so the next take resolves its indices
+    /// against the same run. Refuses an index past the run, one named twice, or
+    /// one an earlier take already took, taking nothing: each is a summary that
+    /// does not match the lease it was claimed against.
     pub(crate) fn take(&mut self, class: usize, indices: &[u32]) -> Result<Vec<T>> {
         let run = &mut self.slots[class];
         let mut named = vec![false; run.len()];
         for &i in indices {
             let i = i as usize;
-            if i >= run.len() || std::mem::replace(&mut named[i], true) {
+            let free = run.get(i).is_some_and(Option::is_some);
+            if !free || std::mem::replace(&mut named[i], true) {
                 candle::bail!(
-                    "gap lease: class {class} index {i} is past its {} slots or named twice",
+                    "gap lease: class {class} index {i} is past its {} slots, named twice, or \
+                     already taken",
                     run.len()
                 );
             }
         }
-        let mut taken: Vec<Option<T>> = std::iter::repeat_with(|| None).take(run.len()).collect();
-        let mut kept = Vec::with_capacity(run.len() - indices.len());
-        for (i, slot) in run.drain(..).enumerate() {
-            if named[i] {
-                taken[i] = Some(slot.0);
-            } else {
-                kept.push(slot);
-            }
-        }
-        *run = kept;
         Ok(indices
             .iter()
-            .map(|&i| taken[i as usize].take().expect("named exactly once"))
+            .map(|&i| run[i as usize].take().expect("checked above").0)
             .collect())
     }
 
-    /// Empty the lease: every slot still held, class by class, for the caller
-    /// to return to its pool. What the catch-up does once every installed
-    /// block has taken its slots.
+    /// Empty the lease: every slot still held, class by class in stack order,
+    /// for the caller to return to its pool. What the catch-up does once every
+    /// installed block has taken its slots.
     pub(crate) fn release(&mut self) -> PerClass<Vec<T>> {
         std::array::from_fn(|c| {
             std::mem::take(&mut self.slots[c])
                 .into_iter()
+                .flatten()
                 .map(|(slot, _)| slot)
                 .collect()
         })
@@ -161,18 +169,46 @@ mod tests {
     }
 
     #[test]
-    fn a_take_returns_slots_in_the_order_named_and_keeps_the_rest_in_order() {
+    fn a_take_returns_slots_in_the_order_named_and_keeps_the_rest_in_place() {
         let mut l = lease(&[(1, &[10, 11, 12, 13, 14])]);
         assert_eq!(l.take(1, &[3, 0]).unwrap(), vec![13, 10]);
-        assert_eq!(l.stack_image().unwrap().addrs, vec![0xB00, 0xC00, 0xE00]);
+        assert_eq!(l.held()[1], 3);
+        assert_eq!(l.release()[1], vec![11, 12, 14]);
+    }
+
+    /// The catch-up takes block by block. Each block's indices are positions
+    /// in the stack the claim read, so every take — not only the first —
+    /// must find exactly the slots the claim gave it.
+    #[test]
+    fn takes_block_by_block_each_find_the_slots_the_claim_named() {
+        let mut l = lease(&[(0, &[10, 11, 12, 13, 14, 15])]);
+        assert_eq!(l.take(0, &[0, 1]).unwrap(), vec![10, 11]);
+        assert_eq!(l.take(0, &[2, 3]).unwrap(), vec![12, 13]);
+        assert_eq!(l.take(0, &[5]).unwrap(), vec![15]);
+        assert_eq!(l.release()[0], vec![14]);
     }
 
     #[test]
-    fn a_take_naming_a_slot_twice_or_past_the_run_takes_nothing() {
+    fn a_take_naming_a_slot_twice_past_the_run_or_already_taken_takes_nothing() {
         let mut l = lease(&[(0, &[1, 2, 3])]);
         assert!(l.take(0, &[1, 1]).is_err());
         assert!(l.take(0, &[3]).is_err());
         assert_eq!(l.held()[0], 3);
+        l.take(0, &[1]).unwrap();
+        // A later block naming a slot an earlier one took: refused whole.
+        assert!(l.take(0, &[0, 1]).is_err());
+        assert_eq!(l.held()[0], 2, "the refused take took nothing");
+        assert_eq!(l.take(0, &[0, 2]).unwrap(), vec![1, 3]);
+    }
+
+    #[test]
+    fn a_lease_taken_from_lays_out_no_stack() {
+        let mut l = lease(&[(0, &[1, 2]), (3, &[4])]);
+        l.take(3, &[0]).unwrap();
+        assert!(
+            l.stack_image().is_err(),
+            "the stack is spent once taken from"
+        );
     }
 
     #[test]
@@ -191,13 +227,12 @@ mod tests {
     }
 
     #[test]
-    fn a_take_from_one_class_leaves_the_others_and_their_offsets() {
+    fn a_take_from_one_class_leaves_the_others_whole() {
         let mut l = lease(&[(0, &[1, 2]), (1, &[3, 4, 5]), (2, &[6])]);
         l.take(1, &[1]).unwrap();
-        let img = l.stack_image().unwrap();
-        assert_eq!(img.addrs, vec![0x100, 0x200, 0x300, 0x500, 0x600]);
-        assert_eq!((img.off[1], img.len[1]), (2, 2));
-        assert_eq!((img.off[2], img.len[2]), (4, 1));
+        assert_eq!(l.held()[..3], [2, 2, 1]);
+        assert_eq!(l.take(2, &[0]).unwrap(), vec![6]);
+        assert_eq!(l.take(0, &[1, 0]).unwrap(), vec![2, 1]);
     }
 
     /// The catch-up's shape: takes for installed blocks, then everything else
@@ -238,14 +273,12 @@ mod tests {
     }
 
     #[test]
-    fn slots_added_after_a_take_follow_the_ones_left() {
+    fn a_slot_added_after_a_take_takes_the_next_position() {
         let mut l = lease(&[(2, &[1, 2, 3])]);
         l.take(2, &[0]).unwrap();
         l.add(2, [(9, 0x900)]);
-        let img = l.stack_image().unwrap();
-        assert_eq!(img.addrs, vec![0x200, 0x300, 0x900]);
-        // Index 2 is now the added slot.
-        assert_eq!(l.take(2, &[2]).unwrap(), vec![9]);
+        // Positions 1 and 2 are unchanged; the added slot is position 3.
+        assert_eq!(l.take(2, &[2, 3]).unwrap(), vec![3, 9]);
     }
 
     #[test]

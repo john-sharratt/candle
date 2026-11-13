@@ -1970,6 +1970,10 @@ extern "C" {
     /// - `num_chunks`: Number of 32-token chunks per head to convert
     /// - `is_k`: 1 = convert K, 0 = convert V
     /// - `head_dim`: Number of dimensions per head (block size)
+    ///
+    /// Returns the launch's own status: 0 when queued or when there is
+    /// nothing to convert, -1 for a head_dim with no kernel, else the
+    /// `cudaError_t` the launch itself returned.
     pub fn run_quantize_palette4_convert(
         heads_base: *const u8,
         valid_ranges: *const c_int,
@@ -1979,8 +1983,8 @@ extern "C" {
         num_chunks: c_int,
         is_k: c_int,
         head_dim: c_int,
-        stream: *mut std::ffi::c_void,
-    );
+        stream: *mut c_void,
+    ) -> c_int;
 
     /// GPU winner summarization kernel — reduces a full `[n_thresholds × n_cells]` u8 winner
     /// array (output of `run_select_winners_kv_paged`) to `[n_thresholds × 3]` f32 accumulators

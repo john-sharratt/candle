@@ -518,11 +518,12 @@ fn claim_under_overrides_uses_identity_maps_and_unit_scales() -> Result<()> {
 }
 
 #[test]
-fn claim_at_other_head_dims() -> Result<()> {
+fn claim_at_the_other_head_dim() -> Result<()> {
+    // 128 and 256 are the head dims the convert has a record for, and so the
+    // only ones the claim is built at.
     let dev = cuda()?;
-    for &hd in &[64usize, 256, 512] {
-        check(&dev, &Case::new(900, 4, hd, 0.8, 51 + hd as u64))?;
-    }
+    check(&dev, &Case::new(900, 4, 256, 0.8, 307))?;
+    check(&dev, &Case::new(900, 4, 256, 1.0, 308))?;
     Ok(())
 }
 
@@ -685,14 +686,14 @@ fn profile_gap_claim() -> Result<()> {
 // The reference itself, on hand-checked values.
 #[test]
 fn reference_takes_indices_in_band_order() {
-    let mut case = Case::new(2, 1, 64, 1.0, 71);
+    let mut case = Case::new(2, 1, 128, 1.0, 71);
     for t in case.k_tags.iter_mut().chain(case.v_tags.iter_mut()) {
         *t = CODES[3];
     }
     case.set_lease(|_| 100);
     let out = reference(&case);
-    let rec = record_bytes(64);
-    let srow = summary_head_bytes(64);
+    let rec = record_bytes(128);
+    let srow = summary_head_bytes(128);
     // Job 1's head starts after job 0's eight bands of the one class.
     let idx = |head: usize, b: usize| {
         let o = head * srow + rec + b * 4;
@@ -901,6 +902,8 @@ fn claim_refuses_arguments_outside_its_contract_without_launching() -> Result<()
         ((10, 0, 128, 4), "no heads"),
         ((10, MAX_KV_HEAD as i32 + 1, 128, 4), "too many heads"),
         ((10, 4, 96, 4), "a head_dim with no kernel"),
+        ((10, 4, 64, 4), "a head_dim the convert has no record for"),
+        ((10, 4, 512, 4), "a head_dim the convert has no record for"),
         ((10, 4, 128, 0), "no classes"),
         ((10, 4, 128, MAX_CLASS as i32 + 1), "too many classes"),
     ] {

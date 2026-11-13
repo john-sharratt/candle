@@ -21,12 +21,33 @@ use std::sync::atomic::{fence, Ordering};
 
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::sys;
+#[cfg(feature = "cuda")]
+use candle::cuda_backend::kernels::simple::kv_gap_claim;
 
-/// Bands per head: four palettes, K and V.
-pub(crate) const BANDS_PER_HEAD: usize = 8;
+use crate::kv_cache::arena_table::N_PALETTE as N_PAL;
 
-/// The palettes a head's record names.
-const N_PAL: usize = 4;
+/// Bands per head: every palette, K and V.
+pub(crate) const BANDS_PER_HEAD: usize = 2 * N_PAL;
+
+/// Bytes of a head's destination record at `head_dim`: the convert's KvHead.
+pub(crate) const fn record_bytes(head_dim: usize) -> usize {
+    head_dim / 2 + 104
+}
+
+/// Bytes of a head's summary row at `head_dim`: its record, then its bands'
+/// lease indices.
+pub(crate) const fn row_bytes(head_dim: usize) -> usize {
+    record_bytes(head_dim) + BANDS_PER_HEAD * 4
+}
+
+// The row the host decodes is the row the claim writes: held to the kernel's
+// own constants at compile time, so the layout cannot drift between them.
+#[cfg(feature = "cuda")]
+const _: () = {
+    assert!(BANDS_PER_HEAD == kv_gap_claim::BANDS_PER_HEAD);
+    assert!(row_bytes(128) == kv_gap_claim::summary_head_bytes(128));
+    assert!(row_bytes(256) == kv_gap_claim::summary_head_bytes(256));
+};
 
 /// Where everything sits in the summary buffer, for a table of at most
 /// `max_jobs` jobs of `n_kv_head` heads at `head_dim`.
@@ -40,12 +61,12 @@ pub(crate) struct SummaryLayout {
 impl SummaryLayout {
     /// Bytes of a head's destination record: `head_dim / 2 + 104`.
     pub(crate) fn record_bytes(&self) -> usize {
-        self.head_dim / 2 + 104
+        record_bytes(self.head_dim)
     }
 
     /// Bytes of a head's row: its record, then its bands' lease indices.
     pub(crate) fn head_stride(&self) -> usize {
-        self.record_bytes() + BANDS_PER_HEAD * 4
+        row_bytes(self.head_dim)
     }
 
     /// The per-job deferred flags, one `u32` each, from the buffer's start.

@@ -13,7 +13,9 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::result::{memcpy_dtoh_async, memcpy_htod_async, memset_d8_async};
+use cudarc::driver::result::{
+    memcpy_dtod_async, memcpy_dtoh_async, memcpy_htod_async, memset_d8_async,
+};
 use cudarc::driver::sys::CUstream;
 use cudarc::driver::{CudaStream, DevicePtr};
 
@@ -235,10 +237,118 @@ fn input_words(layout: &Palette4Layout, k: &[i32], v: &[i32], valid: &[i32]) -> 
     words
 }
 
+/// One selection's inputs, built on the host: where everything sits in its
+/// block, and the words of the block's input section (`layout.outputs` words:
+/// the sorted candidate codes and the valid ranges, padded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Palette4Inputs {
+    pub layout: Palette4Layout,
+    pub words: Vec<u32>,
+    n_k_cand: usize,
+    n_v_cand: usize,
+}
+
+/// Build one selection's inputs.
+pub fn select_palette4_inputs(
+    n_chunks: usize,
+    k_candidates: &[GgmlDType],
+    v_candidates: &[GgmlDType],
+    blocks_per_head: usize,
+    n_kv_head: usize,
+    valid_ranges: &[i32],
+) -> Result<Palette4Inputs> {
+    if valid_ranges.len() != n_chunks {
+        crate::bail!(
+            "valid_ranges length {} != n_chunks {}",
+            valid_ranges.len(),
+            n_chunks
+        );
+    }
+    let k_codes = sorted_codes(k_candidates)?;
+    let v_codes = sorted_codes(v_candidates)?;
+    let layout = Palette4Layout::new(
+        n_chunks,
+        n_kv_head,
+        blocks_per_head,
+        k_codes.len(),
+        v_codes.len(),
+    );
+    let words = input_words(&layout, &k_codes, &v_codes, valid_ranges);
+    Ok(Palette4Inputs {
+        layout,
+        words,
+        n_k_cand: k_codes.len(),
+        n_v_cand: v_codes.len(),
+    })
+}
+
+/// Clear `block`'s output section and launch the selection over the inputs
+/// already in its input section.
+///
+/// # Safety
+///
+/// As [`select_palette4_launch`]; the input section holds `inputs.words`
+/// ahead of this on `cu`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_in_block(
+    per_head_table_ptr: u64,
+    head_gids_ptr: u64,
+    inputs: &Palette4Inputs,
+    thresholds: [f32; 4],
+    blocks_per_head: usize,
+    n_kv_head: usize,
+    arena_chunks: usize,
+    block: u64,
+    cu: CUstream,
+) -> Result<()> {
+    let layout = &inputs.layout;
+    let word = |at: usize| block + (at * 4) as u64;
+    let out_bytes = (layout.words - layout.outputs) * 4;
+    // SAFETY: the output section lies inside the block.
+    memset_d8_async(word(layout.outputs), 0, out_bytes, cu).w()?;
+    let [k_hi, k_lo, v_hi, v_lo] = thresholds;
+    select_kv_format_palette4_paged(
+        per_head_table_ptr,
+        head_gids_ptr,
+        word(layout.q_rel_median),
+        word(layout.q_rel_spread),
+        word(layout.k_head_amax),
+        word(layout.v_head_amax),
+        word(layout.k_head_p95),
+        word(layout.v_head_p95),
+        word(layout.k_cand),
+        word(layout.v_cand),
+        inputs.n_k_cand as i32,
+        inputs.n_v_cand as i32,
+        k_hi,
+        k_lo,
+        v_hi,
+        v_lo,
+        layout.total_heads as i32,
+        blocks_per_head as i32,
+        n_kv_head as i32,
+        arena_chunks as i32,
+        word(layout.valid_ranges),
+        word(layout.k_palette_tags),
+        word(layout.v_palette_tags),
+        word(layout.k_pal_scale),
+        word(layout.v_pal_scale),
+        word(layout.k_palette_map),
+        word(layout.v_palette_map),
+        word(layout.k_eff_block_tags),
+        word(layout.v_eff_block_tags),
+        word(layout.k_head_tags),
+        word(layout.v_head_tags),
+        word(layout.q_rel),
+        cu as *mut std::ffi::c_void,
+    );
+    Ok(())
+}
+
 /// Launch the fused palette-4 selection in `block`, a device range of at least
 /// [`Palette4Layout::bytes`], and return the layout its results sit at. Nothing
 /// is read back and nothing waits: the results stay in `block` for whatever the
-/// caller launches next on `stream` — the gap's claim reads them there.
+/// caller launches next on `stream`.
 ///
 /// The inputs go up from pageable memory, so the copy is staged before this
 /// returns; `block` must stay the caller's until every launch reading it has
@@ -263,71 +373,76 @@ pub unsafe fn select_palette4_launch(
     block: u64,
     stream: &Arc<CudaStream>,
 ) -> Result<Palette4Layout> {
-    if valid_ranges.len() != n_chunks {
-        crate::bail!(
-            "valid_ranges length {} != n_chunks {}",
-            valid_ranges.len(),
-            n_chunks
-        );
-    }
-    let k_codes = sorted_codes(k_candidates)?;
-    let v_codes = sorted_codes(v_candidates)?;
-    let layout = Palette4Layout::new(
+    let inputs = select_palette4_inputs(
         n_chunks,
-        n_kv_head,
+        k_candidates,
+        v_candidates,
         blocks_per_head,
-        k_codes.len(),
-        v_codes.len(),
-    );
-    if layout.total_heads == 0 {
-        return Ok(layout);
+        n_kv_head,
+        valid_ranges,
+    )?;
+    if inputs.layout.total_heads == 0 {
+        return Ok(inputs.layout);
     }
     let cu: CUstream = stream.cu_stream();
-    let word = |at: usize| block + (at * 4) as u64;
-    let inputs = input_words(&layout, &k_codes, &v_codes, valid_ranges);
-    // SAFETY: `inputs` is `layout.outputs` words and the block holds at least
-    // that many before its output section; pageable, so staged before return.
-    memcpy_htod_async(block, &inputs, cu).w()?;
-    let out_bytes = (layout.words - layout.outputs) * 4;
-    // SAFETY: the output section lies inside the block.
-    memset_d8_async(word(layout.outputs), 0, out_bytes, cu).w()?;
-    let [k_hi, k_lo, v_hi, v_lo] = thresholds;
-    select_kv_format_palette4_paged(
+    // SAFETY: `inputs.words` is `layout.outputs` words and the block holds at
+    // least that many before its output section; pageable, so staged before
+    // return.
+    memcpy_htod_async(block, &inputs.words, cu).w()?;
+    launch_in_block(
         per_head_table_ptr,
         head_gids_ptr,
-        word(layout.q_rel_median),
-        word(layout.q_rel_spread),
-        word(layout.k_head_amax),
-        word(layout.v_head_amax),
-        word(layout.k_head_p95),
-        word(layout.v_head_p95),
-        word(layout.k_cand),
-        word(layout.v_cand),
-        k_codes.len() as i32,
-        v_codes.len() as i32,
-        k_hi,
-        k_lo,
-        v_hi,
-        v_lo,
-        layout.total_heads as i32,
-        blocks_per_head as i32,
-        n_kv_head as i32,
-        arena_chunks as i32,
-        word(layout.valid_ranges),
-        word(layout.k_palette_tags),
-        word(layout.v_palette_tags),
-        word(layout.k_pal_scale),
-        word(layout.v_pal_scale),
-        word(layout.k_palette_map),
-        word(layout.v_palette_map),
-        word(layout.k_eff_block_tags),
-        word(layout.v_eff_block_tags),
-        word(layout.k_head_tags),
-        word(layout.v_head_tags),
-        word(layout.q_rel),
-        cu as *mut std::ffi::c_void,
-    );
-    Ok(layout)
+        &inputs,
+        thresholds,
+        blocks_per_head,
+        n_kv_head,
+        arena_chunks,
+        block,
+        cu,
+    )?;
+    Ok(inputs.layout)
+}
+
+/// As [`select_palette4_launch`], with the input words already on the device
+/// at `inputs_dev` — uploaded with the caller's other inputs — so no host copy
+/// is made here: one device copy places them in the block, whose sections
+/// keep the alignment the kernel's loads assume.
+///
+/// # Safety
+///
+/// As [`select_palette4_launch`]; `inputs_dev` holds `inputs.words` ahead of
+/// this on `stream` and stays until the copy has run.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn select_palette4_launch_staged(
+    per_head_table_ptr: u64,
+    head_gids_ptr: u64,
+    inputs: &Palette4Inputs,
+    inputs_dev: u64,
+    thresholds: [f32; 4],
+    blocks_per_head: usize,
+    n_kv_head: usize,
+    arena_chunks: usize,
+    block: u64,
+    stream: &Arc<CudaStream>,
+) -> Result<()> {
+    if inputs.layout.total_heads == 0 {
+        return Ok(());
+    }
+    let cu: CUstream = stream.cu_stream();
+    // SAFETY: both ranges are `layout.outputs` words, on the device, and
+    // ordered on `cu`.
+    memcpy_dtod_async(block, inputs_dev, inputs.words.len() * 4, cu).w()?;
+    launch_in_block(
+        per_head_table_ptr,
+        head_gids_ptr,
+        inputs,
+        thresholds,
+        blocks_per_head,
+        n_kv_head,
+        arena_chunks,
+        block,
+        cu,
+    )
 }
 
 /// Run the fused palette-4 selection in `block`, a device range of at least
