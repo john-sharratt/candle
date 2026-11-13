@@ -2,7 +2,7 @@ name: file_grep
 questions:
 - where is forward_wave defined
 - who calls reconcile_wave_offsets
-- grep the codebase for MATRIX_ROW_PADDING
+- grep the codebase for TAVILY_API_KEY
 - find every occurrence of unwrap in candle-nn
 - search the source for the string connection refused
 - are there any TODO or FIXME comments left in zend
