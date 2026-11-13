@@ -66,6 +66,10 @@ pub struct PooledRounds {
     pub layers: Vec<Arc<ShadowRows>>,
 }
 
+/// One publish's cumulative counts: its sequence word, the queries, the
+/// shadow queries and the hits per round.
+type Published = (u32, u32, u32, Vec<u32>);
+
 /// The kept-query buffer's shape: one set of [`KEEP_SLOTS`] slots per sampled
 /// layer, each a rotated query of `q_words` and its cut record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,7 +414,7 @@ impl Held {
     /// hits: the summary's last finished publish on CUDA, the counters
     /// themselves elsewhere. `None` while nothing new has landed since the
     /// last read.
-    fn newest(&self) -> Result<Option<(u32, u32, u32, Vec<u32>)>> {
+    fn newest(&self) -> Result<Option<Published>> {
         let c = &self.counts;
         #[cfg(feature = "cuda")]
         if let Some(block) = &self.summary {

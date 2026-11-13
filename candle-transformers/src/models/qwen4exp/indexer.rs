@@ -3829,7 +3829,7 @@ mod tests {
                     };
                     let want_cut = want
                         .iter()
-                        .map(|&e| entry_block(e) as usize)
+                        .map(|&e| entry_block(e))
                         .filter(|&b| b < forced_lo && !pinned.iter().any(|g| g.contains(&b)))
                         .map(|b| row_scores[b])
                         .reduce(f32::min);

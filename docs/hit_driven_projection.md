@@ -271,12 +271,18 @@ rounds' index rows.
 - **The same three layers.** The shadow scan runs at the sampled layers
   (§6.1) and nowhere else; those are the only layers whose index rows the
   pool holds for unloaded rounds.
-- **Once per boundary, in one launch.** The stride's index queries on the
-  sampled layers are kept beside the stride (four heads of 128 F32 per token
-  per layer: about 0.4 MB for 64 decoded tokens on three layers), with each
-  query's cut. At the boundary they are scored against every unloaded window
-  in one launch over the wave's sequences. Decode and prefill launch nothing
-  for it.
+- **Once per boundary, in one launch per sampled layer.** The stride's index
+  queries on the sampled layers are kept beside the stride (four heads of 128
+  F32 per token per layer: about 0.4 MB for 64 decoded tokens on three
+  layers), each with its cut record — the lowest score the real selection
+  kept, the query's position, its candidate blocks and its tail cells, which
+  the selection kernel writes per row. The hit count's own launch copies them
+  into slot `position mod 64` of the sequence's kept-query buffer, so decode
+  and prefill launch nothing for it. A boundary's read of the counters
+  (`take_hits`) asks for a scan; the first wave after it scores the kept
+  queries against every unloaded window at each sampled layer, in one launch
+  over the wave's asking sequences, before that layer's count writes the next
+  stride's queries over them.
 - **A prefill keeps its last 64 rows.** A prefilled opening or chunk keeps the
   queries of its last 64 positions, as many as a decoded stride, and only
   those enter the shadow scan. They are the queries nearest the reply, whose

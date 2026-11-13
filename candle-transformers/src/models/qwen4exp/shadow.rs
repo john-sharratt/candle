@@ -126,12 +126,13 @@ impl ShadowRows {
                 // Row `a` of the page is row `a − lo` of the chunk: `row_stride`
                 // float4 groups per row.
                 let off = (a - lo) as u64 * chunk.row_stride as u64 * 16;
-                desc.extend([
+                let entry: [i64; SHADOW_PAGE_WORDS] = [
                     (chunk.ptr + off) as i64,
                     chunk.group_stride,
                     chunk.row_stride,
                     0,
-                ]);
+                ];
+                desc.extend(entry);
                 at += (b - a) as u32;
                 first.push(at);
             }
@@ -249,9 +250,9 @@ pub fn reference(
         let hi = (lo + cand).min(rows.len());
         let seat = cand - (hi - lo);
         let mut above: Vec<(f64, usize)> = Vec::new();
-        for g in lo..hi {
-            let pos = (seat + g - lo) * ratio;
-            let k = &rows[g];
+        for (j, k) in rows[lo..hi].iter().enumerate() {
+            let g = lo + j;
+            let pos = (seat + j) * ratio;
             let mut rot = k.clone();
             for c in 0..pairs {
                 let (co, si) = cos_sin(pos, c);
