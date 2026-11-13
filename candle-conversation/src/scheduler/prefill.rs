@@ -5848,6 +5848,8 @@ impl Scheduler {
                 finished,
                 error,
                 prefill_start,
+                stops_every: _,
+                awaiting: _,
             } = p;
             // A compression-turn re-prefill carries no decode and reports to the
             // summariser, not a caller. Seal it directly off the wave (snapshot
