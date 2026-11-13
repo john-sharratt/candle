@@ -1507,6 +1507,117 @@ fn r5(f: &Fixture) {
     }
 }
 
+// ═══ Round 6 — the tool catalog through the production normalization ═══════
+//
+// R3a ranks tools on raw scores; production reads every tool's score against
+// its background (`warm_collection_normalization`) and gates on the band. R6
+// runs that chain over the fixture's tool gallery: each exemplar warms every
+// other tool's background with its own tool left out, then each exemplar is
+// asked leave-one-out as production asks a turn — its question window and its
+// trailing window, each normalized at its own length, max-fused. Reported:
+// Top-1 / Top-5 of the asked tool, and how many OTHER tools clear the 800 gate
+// per probe — a stray vote read as a hit shows up there and nowhere else.
+
+/// The tools collection's selection gate on the band (`projection.yaml`).
+const TOOL_GATE: f32 = 800.0;
+
+fn r6(f: &Fixture) {
+    println!("\n═══ R6: tool catalog LOO through warm-up + normalization ═══");
+    let mut by_tool: BTreeMap<String, Vec<&TurnRef>> = BTreeMap::new();
+    for t in &f.targets["tool"] {
+        let Some(tool) = t.tags.iter().find(|g| *g != "tool") else {
+            continue;
+        };
+        by_tool.entry(tool.clone()).or_default().push(t);
+    }
+    let tools: Vec<&String> = by_tool.keys().collect();
+    let key = |t: &TurnRef| (t.timeline, t.index);
+    // Every tool's windows but those of `skip` (a turn) and `without` (a tool).
+    let slots_without = |skip: Option<(u64, u64)>, without: Option<&str>| -> Vec<Slot> {
+        by_tool
+            .iter()
+            .map(|(name, ts)| Slot {
+                label: name.clone(),
+                windows: if Some(name.as_str()) == without {
+                    Vec::new()
+                } else {
+                    ts.iter()
+                        .filter(|t| Some(key(t)) != skip)
+                        .map(|t| f.sig(t.timeline, t.index))
+                        .collect()
+                },
+            })
+            .collect()
+    };
+    let pairs_of = |raw: &[f32]| -> Vec<(ChildKey, f32)> {
+        tools
+            .iter()
+            .zip(raw)
+            .map(|(t, &v)| (ChildKey::named((*t).clone()), v))
+            .collect()
+    };
+    let scope = ScopeKey::collection(0, "tools");
+    let cache = NormalizationCache::new(NormConfig::default());
+    // Warm-up: each exemplar, whole, against the gallery without its own tool.
+    let mut source = 0u64;
+    for (tool, turns) in &by_tool {
+        let gallery = slots_without(None, Some(tool));
+        for t in turns {
+            let probe = f.sig(t.timeline, t.index);
+            let raw = rank_weighted(probe, &gallery, &[]);
+            let own = ChildKey::named(tool.clone());
+            cache.observe(&scope, source, &pairs_of(&raw), Some(&own), probe.len());
+            source += 1;
+        }
+    }
+    let (mut top1, mut top5, mut probes, mut false_gate, mut raw_top1) = (0, 0, 0, 0, 0);
+    for (tool, turns) in &by_tool {
+        if turns.len() < 2 {
+            continue;
+        }
+        let idx = tools.iter().position(|t| *t == tool).unwrap();
+        for t in turns {
+            let gallery = slots_without(Some(key(t)), None);
+            let all = f.sig(t.timeline, t.index);
+            let q = &all[..HEAD_PROBE_TOKENS.min(all.len())];
+            let tail = &all[all.len().saturating_sub(MAX_PROBE_TOKENS)..];
+            let read = |p: &[WideQSig]| -> (Vec<f32>, Vec<f32>) {
+                let raw = rank_weighted(p, &gallery, &[]);
+                let normed = cache
+                    .normalize(&scope, &pairs_of(&raw), p.len())
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect();
+                (raw, normed)
+            };
+            let (raw_q, nq) = read(q);
+            let (_, nt) = read(tail);
+            let fused: Vec<f32> = nq.iter().zip(&nt).map(|(a, b)| a.max(*b)).collect();
+            let rank = fused.iter().filter(|&&s| s > fused[idx]).count() + 1;
+            top1 += usize::from(rank == 1);
+            top5 += usize::from(rank <= 5);
+            let raw_rank = raw_q.iter().filter(|&&s| s > raw_q[idx]).count() + 1;
+            raw_top1 += usize::from(raw_rank == 1);
+            false_gate += fused
+                .iter()
+                .enumerate()
+                .filter(|(i, &s)| *i != idx && s >= TOOL_GATE)
+                .count();
+            probes += 1;
+        }
+    }
+    let pct = |n: usize| 100.0 * n as f32 / probes.max(1) as f32;
+    println!(
+        "  {probes} LOO probes over {} tools: normalized Top-1 {:.1}%  Top-5 {:.1}%  \
+         (raw question Top-1 {:.1}%)  other tools ≥ {TOOL_GATE:.0}: {:.2} a probe",
+        by_tool.len(),
+        pct(top1),
+        pct(top5),
+        pct(raw_top1),
+        false_gate as f32 / probes.max(1) as f32,
+    );
+}
+
 fn main() {
     let f = load_fixture();
     let total_tokens: usize = f.sigs.values().map(Vec::len).sum();
@@ -1554,5 +1665,8 @@ fn main() {
     }
     if run("5") {
         r5(&f);
+    }
+    if run("6") {
+        r6(&f);
     }
 }
