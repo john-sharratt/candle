@@ -3308,6 +3308,7 @@ impl QCudaStorage {
         let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
         self.device
             .memcpy_htod(data.as_ref(), &mut inner.slice_mut(..data.len()))?;
+        zero_padding_tail(&self.device.cuda_stream(), &mut inner, data.len())?;
         // Dispose of the buffer being replaced before overwriting it: `data` is
         // `ManuallyDrop`, so an assignment alone would leak it. A lease must be
         // `leak`ed rather than dropped — its memory belongs to an arena — while
@@ -4635,6 +4636,23 @@ pub fn ko_repacked_bytes(shape: &Shape, ko_dtype: GgmlDType) -> Result<usize> {
     Ok(chunks * crate::quantized::ko_quant::ko_chunk_bytes(ko_dtype))
 }
 
+/// Zero the [`MATRIX_ROW_PADDING`] tail past a weight's `len`-byte payload.
+///
+/// The q-matmul kernels read into that tail by design — MMQ's tile loads run
+/// past the last row's payload — and multiply it by the activation's zero
+/// padding. Zero times a recycled NaN scale is NaN, so a tail left as the
+/// allocator found it poisons every output of the call: measured as a 12-row
+/// Q2_K matmul whose whole result was NaN once earlier allocations had left
+/// non-finite bytes where the tail landed. The tail is the only part zeroed;
+/// the payload is written by the copy beside this.
+fn zero_padding_tail(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    inner: &mut CudaSlice<u8>,
+    len: usize,
+) -> Result<()> {
+    stream.memset_zeros(&mut inner.slice_mut(len..)).w()
+}
+
 pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     device: &CudaDevice,
     data: &[T],
@@ -4646,6 +4664,7 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
     let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
     device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;
+    zero_padding_tail(&device.cuda_stream(), &mut inner, data.len())?;
     Ok(QStorage::Cuda(QCudaStorage {
         data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
             inner,
@@ -4683,6 +4702,7 @@ pub fn load_quantized_on_stream<T: super::GgmlType + Send + Sync + 'static>(
     stream
         .memcpy_htod(data, &mut inner.slice_mut(..data.len()))
         .map_err(crate::Error::wrap)?;
+    zero_padding_tail(stream, &mut inner, data.len())?;
     Ok(QStorage::Cuda(QCudaStorage {
         data: std::mem::ManuallyDrop::new(PaddedCudaSlice {
             inner,
@@ -8015,6 +8035,10 @@ pub struct PromoRing {
 #[cfg(test)]
 #[path = "cuda_tests.rs"]
 mod test;
+
+#[cfg(test)]
+#[path = "padding_tail_tests.rs"]
+mod padding_tail_tests;
 
 #[cfg(test)]
 #[path = "q0_v_decode_oracle_tests.rs"]
