@@ -488,6 +488,19 @@ with a boundary between them, so a long tool result moves the slot as it
 arrives and the slot never passes `L0`. Each chunk is prefilled once, against
 the slot the boundary before it chose.
 
+The prefill group carries an opening no further than its next multiple of
+`reserve_tokens` (`ActivePrefill::stops_every`). Where a chunk lands on one
+with tokens still to come, the opening waits (`awaiting`), rides no group,
+and its reprojection is queued like a decode's. The reprojection holds the
+turn as an opening rather than a decode (`scheduler/held_turn.rs`): the same
+swap, the opening's prefilled part captured as the turn's tail and counted
+against the slot's room, and on completion the opening goes back to the
+prefill group on the carved view to prefill its next chunk. A reprojection
+that does not run — a selection the slot already holds, or no ground for
+the scan — lets it go on against the slot it has. A staged or captured
+calibration prefill is not cut: its projection points and recurrent arms are
+its own.
+
 An opening is not prefilled twice. The failure that would have justified it
 was attention never reaching a seat the slot held (§1), which the one window
 over a trained-length slot and the pinned ranges answer directly; a second

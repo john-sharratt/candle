@@ -2433,8 +2433,14 @@ impl Scheduler {
         // view's `DecodeState` into the in-flight; does NOT fire the forward.
         let mut inflights: Vec<super::ReprojectInFlight> = Vec::new();
         for view_id in pending {
-            // The view may have finished (EOS/health) between trigger and drain.
-            if self.active_decodes.get(&view_id).is_none_or(|s| s.finished) {
+            // The view may have finished (EOS/health) between trigger and
+            // drain; an opening stopped at a boundary is reprojected like a
+            // decoding view (`held_turn`).
+            let decoding = self
+                .active_decodes
+                .get(&view_id)
+                .is_some_and(|s| !s.finished);
+            if !decoding && self.awaiting_opening(view_id).is_none() {
                 continue;
             }
             if decode_diag::fresh() {
@@ -2442,38 +2448,33 @@ impl Scheduler {
             }
             match self.reproject_view_prepare(view_id) {
                 Ok(Some(inflight)) => inflights.push(inflight),
-                Ok(None) => {}
+                // Nothing to swap — a selection the slot already holds, or no
+                // ground for a scan: the turn goes on as it stood.
+                Ok(None) => self.resume_unreprojected(view_id),
                 // **Refused ground before the turn's state moved: skip, not
                 // fail.** A reprojection is a refresh of a view the turn is
-                // still decoding on, and nothing of that view has changed yet,
-                // so the turn decodes on and a later trigger tries again —
-                // where failing it ended a live turn because the span was full
-                // that moment (`.5`, 2026-10-18).
-                Err(e)
-                    if self
-                        .active_decodes
-                        .get(&view_id)
-                        .is_some_and(|s| !s.finished)
-                        && is_ground_refusal(&e) =>
-                {
+                // still on, and nothing of that view has changed yet, so the
+                // turn goes on and a later trigger tries again — where failing
+                // it ended a live turn because the span was full that moment
+                // (`.5`, 2026-10-18).
+                Err(e) if self.turn_reading(view_id).is_some() && is_ground_refusal(&e) => {
                     tracing::warn!(
                         target: "candle_conversation::scheduler::reproject",
                         view_id = view_id.0, err = %e,
-                        "reprojection skipped: no ground for it now; the turn decodes on its view"
+                        "reprojection skipped: no ground for it now; the turn goes on on its view"
                     );
+                    self.resume_unreprojected(view_id);
                 }
                 Err(e) => {
                     tracing::warn!(
                         target: "candle_conversation::scheduler::reproject",
                         view_id = view_id.0, err = %e,
-                        "reprojection prepare failed; aborting decode for this view"
+                        "reprojection prepare failed; aborting the turn on this view"
                     );
                     // A failure before prepare took the turn's state leaves it
                     // here to fail; one after has told the turn already
                     // (`reproject_abandon.rs`).
-                    if let Some(state) = self.active_decodes.get_mut(&view_id) {
-                        state.fail(e);
-                    }
+                    self.fail_turn_in_place(view_id, e);
                 }
             }
         }
@@ -2530,9 +2531,13 @@ impl Scheduler {
                 if let Some(state) = self.slot_projection_state.get_mut(&inflight.plan.parent_id) {
                     state.placed_pieces.clear();
                 }
-                let _ = inflight.decode_state.event_tx.send(TurnEvent::Error(
-                    ConversationError::Channel(format!("gap-fill wave forward failed: {e}")),
-                ));
+                let _ =
+                    inflight
+                        .turn
+                        .event_tx()
+                        .send(TurnEvent::Error(ConversationError::Channel(format!(
+                            "gap-fill wave forward failed: {e}"
+                        ))));
             }
             return;
         }
