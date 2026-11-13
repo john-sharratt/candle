@@ -78,6 +78,13 @@ mod tool_scenarios {
     use zend::config::DaemonConfig;
     use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role, ToolMode};
+    use zend_tools::state::Secrets;
+
+    /// The secrets every scenario's daemon runs with: a search key, as every
+    /// deployed daemon has. A daemon without one withholds `web_search` from
+    /// every round (`zend::tool_availability`), so a scenario asking whether a
+    /// web question selects it would be asking a daemon built to hide it.
+    const SECRETS: &str = "tavily_api_key: tvly-tools-integration\n";
 
     /// How long a shut-down session's tasks may take to unwind and release
     /// what they pinned: well past any boot's wind-down, so only a leak waits
@@ -313,6 +320,7 @@ mod tool_scenarios {
             model,
             compact_substrate,
             agent: Some(agent(&workspace)),
+            secrets: Arc::new(Secrets::from_yaml(SECRETS, "tools_integration").expect("secrets")),
             ..DaemonConfig::new(served(&workspace))
         };
         let session = Arc::new(ZendSession::new(config));
