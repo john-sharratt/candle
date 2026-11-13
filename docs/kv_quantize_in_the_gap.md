@@ -183,8 +183,11 @@ chooses among them.**
   free slots claimed from that class's arenas (`ChunkGidPool`, lowest place
   first), held as `ChunkGid`s, and mirrored on the device as a **slot stack**
   of slot addresses, one run per class. Each gap the host uploads the stack
-  whole, as it stands after the last catch-up: at most the gap's band count of
-  eight-byte entries, the one upload the claim needs. Slots a gap does not take
+  whole, as it stands after the last catch-up, the one upload the claim needs.
+  A class's target is capped at the gap's band count, but a lease is only ever
+  topped up, never trimmed, so the stack holds at most one eight-byte entry per
+  band of the widest gap so far **per reachable class**: the level's
+  reachable-class count times the band count, not the band count. Slots a gap does not take
   stay leased for the next one.
 - **Claim, in table order.** A band's format is the selection's palette tag,
   or the policy's uniform override; a host-built table maps each format code to
@@ -400,6 +403,15 @@ of them is redesigned rather than excepted.
      slots go back to the stack.
    - At most one gap is outstanding. A gap that finds one quantizes nothing, so
      no buffer, lease or row is ever shared by two gaps.
+   - Arming a gap clears the summary's error and completion words. Completion
+     words repeat once the sequence number wraps `u32`, so the word a gap is
+     polled against is never one an earlier gap left behind.
+   - Everything that can refuse a gap — a token window outside its chunk, a
+     band that is not a GPU float or R16, a gid its arena no longer backs, a
+     code the tables do not place — refuses it on the host, before the first
+     launch. A launch the driver refuses part way is waited out before the
+     error returns, and the gap's device state waits out an outstanding gap
+     before it frees the summary, so no kernel writes memory that has gone.
 6. **Persistence sees a block only after its install.** The persistence thread
    is handed a quantized block at the catch-up, after the convert has finished.
    A sealed slot freed while a copy reads it goes through the reclaim queue, as
@@ -653,12 +665,16 @@ Line numbers are as of commit `dc04b62ac`.
   completion word. It keeps, across gaps, the summary, the claim's status words
   and epoch, the sink and held scratch for the selection blocks and the convert
   buffer, and refuses a gap while one is outstanding. The candidates and
-  thresholds come from `compress.rs`'s `policy_selection`, which today's seal
-  reads too. `gap/launch_tests.rs` holds it to today's seal: the same native
+  thresholds come from `compress.rs`'s `policy_selection`, each head's source
+  bands from its `head_source`, and the selection's gid order from
+  `HeadGids::extend_selection_gids` — all three shared with today's seal, and
+  the token-window check with today's convert (`check_token_window`). `gap/launch_tests.rs` holds it to today's seal: the same native
   chunks, through `quantize_layers_deferred` and through one gap, give every band
   the same format, outer scale, palette map and payload bytes — at C5 and C10,
   under a K override, split across two groups — and a short lease defers
-  exactly the jobs past it.
+  exactly the jobs past it. It also refuses a bad window and a gap over no
+  layers before launching, drops the device state mid-gap cleanly, and does
+  not see the gap after a sequence wrap complete early.
 - `candle-nn/src/kv_cache/chunked/sampled_selection/gpu.rs:741`, `run_palette4`,
   and the readback at `:1497–1538`: removed.
 

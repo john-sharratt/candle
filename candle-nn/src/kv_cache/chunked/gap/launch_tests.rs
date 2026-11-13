@@ -4,10 +4,12 @@
 //! with the same format, outer scale, palette map and payload bytes in every
 //! band. Only the slots differ: the gap's come from its lease.
 
+use std::collections::BTreeSet;
+
 use candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async;
 use candle::quantized::cuda::{ggml_dtype_to_arena_fmt_code, identity_pal_map};
 use candle::quantized::pinned_staging::PinnedBuf;
-use candle::{DType, Device, Tensor};
+use candle::{CudaDevice, DType, Device, Tensor};
 use half::f16;
 
 use super::super::compress::{band_ptr, policy_selection, quantize_layers_deferred_within};
@@ -20,9 +22,11 @@ use super::super::size_class::payload_bytes;
 use super::super::ChunkedKvBacking;
 use super::launch::{GapDevice, GapGroup, GapJob};
 use super::lease::{Lease, StackImage};
-use super::summary::HeadRow;
+use super::summary::{completion_word, HeadRow};
 use crate::kv_cache::arena_table::{ArenaLocation, N_PALETTE};
-use crate::kv_cache::{convert_deferred_descs, KvFormat, SealedSequence};
+use crate::kv_cache::{
+    all_kv_formats, convert_deferred_descs, KvFormat, QuantFormat, SealedSequence,
+};
 
 const N_KV_HEAD: usize = 2;
 const HEAD_DIM: usize = 128;
@@ -31,7 +35,7 @@ const LAYERS: usize = 3;
 /// Three full chunks a layer.
 const TOKENS: usize = 96;
 
-fn cuda() -> Option<(Device, candle::CudaDevice, GpuGuard)> {
+fn cuda() -> Option<(Device, CudaDevice, GpuGuard)> {
     match Device::cuda_if_available(0) {
         Ok(d @ Device::Cuda(_)) => {
             let Device::Cuda(c) = &d else { unreachable!() };
@@ -242,7 +246,7 @@ fn stack(backing: &ChunkedKvBacking, lease: &Lease<ChunkGid>) -> StackImage {
 /// Launch one gap and wait for it; every head's summary row and every job's
 /// deferred flag.
 fn run_gap(
-    cuda: &candle::CudaDevice,
+    cuda: &CudaDevice,
     device: &Device,
     backings: &[ChunkedKvBacking],
     jobs: &[GapJob],
@@ -269,7 +273,7 @@ fn run_gap(
 }
 
 /// A row's bands in table order, the payload read from each band's slot.
-fn gap_bands(cuda: &candle::CudaDevice, rows: &[HeadRow], elems: usize) -> Vec<Band> {
+fn gap_bands(cuda: &CudaDevice, rows: &[HeadRow], elems: usize) -> Vec<Band> {
     let stream = cuda.cuda_stream();
     let mut out = Vec::new();
     for row in rows {
@@ -300,7 +304,7 @@ fn gap_bands(cuda: &candle::CudaDevice, rows: &[HeadRow], elems: usize) -> Vec<B
 
 /// The quantized format a record format code names.
 fn arena_code_format(code: u8) -> KvFormat {
-    crate::kv_cache::all_kv_formats()
+    all_kv_formats()
         .find(|f| match f {
             KvFormat::Quantized(q) => {
                 ggml_dtype_to_arena_fmt_code(q.to_ggml_dtype()).ok() == Some(code)
@@ -356,7 +360,7 @@ fn assert_matches_todays_seal(policy: &CompressionPolicy, split: bool) {
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
         assert_eq!(g, w, "band {i} (job {}, head {})", i / 16, (i / 8) % 2);
     }
-    let formats: std::collections::BTreeSet<u8> = want.iter().map(|b| b.fmt).collect();
+    let formats: BTreeSet<u8> = want.iter().map(|b| b.fmt).collect();
     assert!(
         formats.len() > 1,
         "the selection chose more than one format: {formats:?}"
@@ -384,7 +388,7 @@ fn a_gap_of_two_groups_seals_the_same_bands_as_one() {
 #[test]
 fn the_gap_seals_the_same_bands_as_today_under_a_k_override() {
     let mut policy = CompressionPolicy::new(5);
-    policy.override_k_quant = Some(crate::kv_cache::QuantFormat::Q8_0);
+    policy.override_k_quant = Some(QuantFormat::Q8_0);
     assert_matches_todays_seal(&policy, false);
 }
 
@@ -455,7 +459,7 @@ fn a_short_lease_defers_the_tail_and_seals_the_rest() {
         let sinks = heads
             .iter()
             .flat_map(|r| r.k_ptr.iter().chain(&r.v_ptr))
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         if *d {
             assert_eq!(sinks.len(), 1, "job {j}'s bands all go to the sink");
             for (g, w) in got[span.clone()].iter().zip(&want[span]) {
@@ -493,5 +497,131 @@ fn one_gap_is_outstanding_at_a_time() {
     assert!(gap.poll());
     gap.launch(&refs, &jobs, &groups, &image, 2).unwrap();
     device.synchronize().unwrap();
+    assert!(gap.poll());
+}
+
+/// One gap's fixture: the backings, the jobs, an ample lease's stack.
+struct Fixture {
+    device: Device,
+    cuda: CudaDevice,
+    _gpu: GpuGuard,
+    backings: Vec<ChunkedKvBacking>,
+    jobs: Vec<GapJob>,
+    image: StackImage,
+}
+
+fn fixture(policy: &CompressionPolicy) -> Option<Fixture> {
+    let (device, cuda, gpu) = cuda()?;
+    let (backings, srcs) = setup(&device, policy);
+    let jobs = jobs(&srcs);
+    let bands = jobs.len() * N_KV_HEAD * 2 * N_PALETTE;
+    let lease = lease_for(&backings[0], policy, |_| bands);
+    let image = stack(&backings[0], &lease);
+    Some(Fixture {
+        device,
+        cuda,
+        _gpu: gpu,
+        backings,
+        jobs,
+        image,
+    })
+}
+
+/// A job whose token window is empty or runs past its chunk is refused before
+/// anything is launched, exactly as today's convert refuses it, and the gap is
+/// left free for the next launch.
+#[test]
+fn a_window_outside_its_chunk_is_refused_before_any_launch() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let refs: Vec<&ChunkedKvBacking> = f.backings.iter().collect();
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..f.jobs.len(),
+    }];
+    let mut gap = GapDevice::new(&f.cuda, N_KV_HEAD, HEAD_DIM, f.jobs.len()).unwrap();
+    for bad in [0, (8 << 8) | 25, (32 << 8) | 1, 33] {
+        let mut jobs = f.jobs.clone();
+        jobs[4].valid_range = bad;
+        let err = gap
+            .launch(&refs, &jobs, &groups, &f.image, 1)
+            .expect_err("a bad window");
+        assert!(format!("{err}").contains("token window"), "{bad:#x}: {err}");
+        assert!(gap.poll(), "a refused gap leaves nothing outstanding");
+    }
+    gap.launch(&refs, &f.jobs, &groups, &f.image, 1).unwrap();
+    f.device.synchronize().unwrap();
+    assert!(gap.poll());
+}
+
+/// A gap over jobs naming no layer it was given is refused, not a panic.
+#[test]
+fn a_gap_over_no_layers_is_refused() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..f.jobs.len(),
+    }];
+    let mut gap = GapDevice::new(&f.cuda, N_KV_HEAD, HEAD_DIM, f.jobs.len()).unwrap();
+    assert!(gap.launch(&[], &f.jobs, &groups, &f.image, 1).is_err());
+    assert!(gap.poll());
+}
+
+/// Dropping the gap's device state with a gap still in flight waits it out
+/// before the summary is freed: the stream drains clean afterwards.
+#[test]
+fn dropping_the_gap_mid_flight_waits_for_it() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let refs: Vec<&ChunkedKvBacking> = f.backings.iter().collect();
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..f.jobs.len(),
+    }];
+    for seq in 0..4 {
+        let mut gap = GapDevice::new(&f.cuda, N_KV_HEAD, HEAD_DIM, f.jobs.len()).unwrap();
+        gap.launch(&refs, &f.jobs, &groups, &f.image, seq).unwrap();
+        drop(gap);
+    }
+    f.device.synchronize().unwrap();
+}
+
+/// Completion words repeat once `seq` wraps `u32`: the gap after the wrap
+/// stores the same word as the gap before it, and is not seen complete until
+/// it has run, because arming clears the word.
+#[test]
+fn a_gap_after_the_seq_wrap_is_not_seen_complete_early() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let (before, after) = (u32::MAX as u64, 1u64 << 32);
+    assert_eq!(completion_word(before), completion_word(after));
+    let refs: Vec<&ChunkedKvBacking> = f.backings.iter().collect();
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..f.jobs.len(),
+    }];
+    let mut gap = GapDevice::new(&f.cuda, N_KV_HEAD, HEAD_DIM, f.jobs.len()).unwrap();
+    gap.launch(&refs, &f.jobs, &groups, &f.image, before)
+        .unwrap();
+    f.device.synchronize().unwrap();
+    assert!(gap.poll());
+    assert!(gap.summary().complete(completion_word(after)));
+    gap.summary().arm();
+    assert!(
+        !gap.summary().complete(completion_word(after)),
+        "an armed summary reads as no gap complete"
+    );
+    gap.launch(&refs, &f.jobs, &groups, &f.image, after)
+        .unwrap();
+    f.device.synchronize().unwrap();
     assert!(gap.poll());
 }

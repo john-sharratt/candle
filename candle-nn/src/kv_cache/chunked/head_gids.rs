@@ -161,6 +161,17 @@ impl HeadGids {
         self.v_gid_pal(h, 0)
     }
 
+    /// Append the first `n_kv_head` heads' raw gids in the order the selection
+    /// kernels stage them — `head * GIDS_PER_HEAD + palette * 2 + is_v`, which
+    /// is the order they are held in here.
+    pub fn extend_selection_gids(&self, n_kv_head: usize, out: &mut Vec<i64>) {
+        out.extend(
+            self.0[..n_kv_head * GIDS_PER_HEAD]
+                .iter()
+                .map(ChunkGid::raw),
+        );
+    }
+
     /// Number of KV heads (total slots / GIDS_PER_HEAD).
     #[inline]
     pub fn n_kv_head(&self) -> usize {

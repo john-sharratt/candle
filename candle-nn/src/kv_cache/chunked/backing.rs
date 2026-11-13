@@ -6,6 +6,7 @@
 
 use ahash::{HashMap, HashMapExt};
 use candle::quantized::GgmlDType;
+use std::borrow::Borrow;
 use std::cmp;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -2235,11 +2236,19 @@ impl BackingInner {
     /// Failing here converts the corrupt launch into a named, recoverable
     /// error carrying both sides of the mismatch.
     #[cfg(feature = "cuda")]
-    pub fn validate_selection_gids(&self, chunks: &[ChunkBands], label: &str) -> Result<()> {
+    pub fn validate_selection_gids<B: Borrow<ChunkBands>>(
+        &self,
+        chunks: &[B],
+        label: &str,
+    ) -> Result<()> {
         let stride = GID_STRIDE;
         let n_kv_head = self.n_kv_head;
         self.storage.read(|s| -> Result<()> {
-            for (ci, hg) in chunks.iter().map(|c| &c.gids).enumerate() {
+            for (ci, hg) in chunks
+                .iter()
+                .map(|c| &Borrow::<ChunkBands>::borrow(c).gids)
+                .enumerate()
+            {
                 for h in 0..n_kv_head {
                     for p in 0..N_PALETTE {
                         for (side, raw) in [
@@ -2318,7 +2327,7 @@ impl BackingInner {
     // Host-side table builder: the selection kernels consume it under `cuda`,
     // and `selection_table_tests` pins its row layout with or without one.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    pub fn per_head_table_host(&self, chunks: &[ChunkBands]) -> Result<Vec<i64>> {
+    pub fn per_head_table_host<B: Borrow<ChunkBands>>(&self, chunks: &[B]) -> Result<Vec<i64>> {
         use crate::kv_cache::arena_table::{PaletteSubEntry, N_PALETTE};
 
         let n_kv_head = self.n_kv_head;
@@ -2342,7 +2351,7 @@ impl BackingInner {
             // near-null device deref if it ever slips through.
             let mut resolved: HashMap<usize, (u64, i64)> = HashMap::new();
             for chunk in chunks {
-                for gid in chunk.gids.as_slice() {
+                for gid in Borrow::<ChunkBands>::borrow(chunk).gids.as_slice() {
                     let ai = gid.arena_idx();
                     if let std::collections::hash_map::Entry::Vacant(e) = resolved.entry(ai) {
                         let v = match arenas.get(&ai) {
@@ -2360,6 +2369,7 @@ impl BackingInner {
 
             let mut data: Vec<i64> = vec![0i64; chunks.len() * n_kv_head * PerHeadEntry::COLS];
             for (ci, chunk) in chunks.iter().enumerate() {
+                let chunk = Borrow::<ChunkBands>::borrow(chunk);
                 for h in 0..n_kv_head {
                     let palette: [PaletteSubEntry; N_PALETTE] = std::array::from_fn(|p| {
                         let (k_base, k_stride) = addr(chunk.gids.k_gid_pal(h, p).arena_idx());

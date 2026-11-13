@@ -451,20 +451,23 @@ extern "C" int run_kv_gap_claim(
     }
     const int jobs_per_tile = TILE_HEADS / n_kv_head;
     const unsigned grid = (unsigned)((n_jobs + jobs_per_tile - 1) / jobs_per_tile);
-    cudaStream_t s = (cudaStream_t)stream;
-#define KV_GAP_CLAIM_ARGS                                                                          \
-    k_tags, v_tags, k_scale, v_scale, k_map, v_map, k_override, v_override, code_class, code_fmt, \
-        lease_len, stack, stack_off, taken, sink, dst_records, summary_heads, summary_flags,      \
-        error_word, status, epoch, n_jobs, n_kv_head, n_class
+    const void* kernel;
     switch (head_dim) {
-        case 64: gap_claim_kernel<64><<<grid, THREADS, 0, s>>>(KV_GAP_CLAIM_ARGS); break;
-        case 128: gap_claim_kernel<128><<<grid, THREADS, 0, s>>>(KV_GAP_CLAIM_ARGS); break;
-        case 256: gap_claim_kernel<256><<<grid, THREADS, 0, s>>>(KV_GAP_CLAIM_ARGS); break;
-        case 512: gap_claim_kernel<512><<<grid, THREADS, 0, s>>>(KV_GAP_CLAIM_ARGS); break;
+        case 64: kernel = (const void*)gap_claim_kernel<64>; break;
+        case 128: kernel = (const void*)gap_claim_kernel<128>; break;
+        case 256: kernel = (const void*)gap_claim_kernel<256>; break;
+        case 512: kernel = (const void*)gap_claim_kernel<512>; break;
         default: return -1;
     }
-#undef KV_GAP_CLAIM_ARGS
-    return (int)cudaGetLastError();
+    // Launched through the runtime call rather than `<<<>>>` so the status
+    // returned is this launch's own, never an error an earlier launch on the
+    // thread left behind.
+    void* args[] = {&k_tags,    &v_tags,      &k_scale,       &v_scale,       &k_map,
+                    &v_map,     &k_override,  &v_override,    &code_class,    &code_fmt,
+                    &lease_len, &stack,       &stack_off,     &taken,         &sink,
+                    &dst_records, &summary_heads, &summary_flags, &error_word, &status,
+                    &epoch,     &n_jobs,      &n_kv_head,     &n_class};
+    return (int)cudaLaunchKernel(kernel, dim3(grid), dim3(THREADS), args, 0, (cudaStream_t)stream);
 }
 
 extern "C" void run_kv_gap_complete(uint32_t* word, uint32_t seq, void* stream) {

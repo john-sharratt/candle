@@ -49,7 +49,7 @@ use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result};
 
 #[cfg(feature = "cuda")]
-use super::arena::ArenaKey;
+use super::arena::{ArenaKey, ArenaStorageState};
 use super::backing::ChunkedKvBacking;
 #[cfg(feature = "cuda")]
 use super::compression_policy::{
@@ -85,11 +85,7 @@ use crate::kv_cache::{KvFormat, QuantFormat};
 /// computed from a ggml block layout — and both were reconstructing an address
 /// the arena can hand over directly.
 #[cfg(feature = "cuda")]
-pub(super) fn band_ptr(
-    storage: &super::arena::ArenaStorageState,
-    gid: &ChunkGid,
-    what: &str,
-) -> Result<u64> {
+pub(super) fn band_ptr(storage: &ArenaStorageState, gid: &ChunkGid, what: &str) -> Result<u64> {
     let ai = gid.arena_idx();
     let arena = storage
         .arenas()
@@ -114,6 +110,40 @@ pub(super) fn band_ggml_dtype(tag: u8) -> Result<GgmlDType> {
         KvFormat::Quantized(qf) => Ok(qf.to_ggml_dtype()),
         KvFormat::Float(dt) => dtype_to_ggml_float(dt),
     }
+}
+
+/// One head's native source bands as the convert reads them: per palette, each
+/// band's address and the GGML layout its tag names.
+#[cfg(feature = "cuda")]
+pub(super) struct HeadSource {
+    pub k_ptrs: [u64; N_PALETTE],
+    pub v_ptrs: [u64; N_PALETTE],
+    pub k_fmts: [GgmlDType; N_PALETTE],
+    pub v_fmts: [GgmlDType; N_PALETTE],
+}
+
+/// Head `h`'s source bands of `bands`: the layout from each band's own tag,
+/// the address from its arena.
+#[cfg(feature = "cuda")]
+pub(super) fn head_source(
+    storage: &ArenaStorageState,
+    bands: &ChunkBands,
+    h: usize,
+) -> Result<HeadSource> {
+    let mut src = HeadSource {
+        k_ptrs: [0; N_PALETTE],
+        v_ptrs: [0; N_PALETTE],
+        k_fmts: [GgmlDType::F16; N_PALETTE],
+        v_fmts: [GgmlDType::F16; N_PALETTE],
+    };
+    for p in 0..N_PALETTE {
+        let (kt, vt) = bands.band_tags(h, p);
+        src.k_fmts[p] = band_ggml_dtype(kt)?;
+        src.v_fmts[p] = band_ggml_dtype(vt)?;
+        src.k_ptrs[p] = band_ptr(storage, bands.gids.k_gid_pal(h, p), "k src")?;
+        src.v_ptrs[p] = band_ptr(storage, bands.gids.v_gid_pal(h, p), "v src")?;
+    }
+    Ok(src)
 }
 
 /// What a policy hands the format selection: its level's quantized K and V
@@ -986,31 +1016,19 @@ fn quantize_sealed_in_place_impl(
 
     backing.inner.storage.try_write(|storage| {
         for (chunk_i, src_bands) in chunk_jobs.iter().enumerate() {
-            let src_gids = &src_bands.gids;
             let ident = identity_pal_map(head_dim);
-            // The source chunk's own band tags. `bucket_quant_chunks` already
-            // proved every band is Float or R16, so the only question left per
-            // band is *which* of the two.
-            let src_bands = &chunk_jobs[chunk_i];
             for h in 0..n_kv_head {
-                let mut k_src_ptrs = [0u64; N_PALETTE];
+                // Source — layout from the chunk's tags, addresses from the
+                // arena. `bucket_quant_chunks` already proved every band is
+                // Float or R16.
+                let src = head_source(storage, src_bands, h)?;
                 let mut k_dst_ptrs = [0u64; N_PALETTE];
-                let mut k_src_fmts = [GgmlDType::F16; N_PALETTE];
                 let mut k_dst_fmts = [GgmlDType::F16; N_PALETTE];
-                let mut v_src_ptrs = [0u64; N_PALETTE];
                 let mut v_dst_ptrs = [0u64; N_PALETTE];
-                let mut v_src_fmts = [GgmlDType::F16; N_PALETTE];
                 let mut v_dst_fmts = [GgmlDType::F16; N_PALETTE];
 
                 for p in 0..N_PALETTE {
                     let gid_slot = h * GIDS_PER_HEAD + p * 2;
-
-                    // K source — layout from the chunk's tag, address from the
-                    // arena. `bucket_quant_chunks` already proved every band is
-                    // Float or R16.
-                    let k_src = src_gids.k_gid_pal(h, p);
-                    k_src_fmts[p] = band_ggml_dtype(src_bands.band_tags(h, p).0)?;
-                    k_src_ptrs[p] = band_ptr(storage, k_src, "k src")?;
 
                     // K destination — `policy.override_k_quant` decides
                     // between uniform override format and selection's
@@ -1023,11 +1041,6 @@ fn quantize_sealed_in_place_impl(
                     let k_qdtype = k_qfmt.to_ggml_dtype();
                     k_dst_fmts[p] = k_qdtype;
                     k_dst_ptrs[p] = band_ptr(storage, k_dst, "k dst")?;
-
-                    // V source — same shape as the K side above.
-                    let v_src = src_gids.v_gid_pal(h, p);
-                    v_src_fmts[p] = band_ggml_dtype(src_bands.band_tags(h, p).1)?;
-                    v_src_ptrs[p] = band_ptr(storage, v_src, "v src")?;
 
                     // V destination — `policy.override_v_quant` decides
                     // between uniform override format and selection's
@@ -1084,10 +1097,10 @@ fn quantize_sealed_in_place_impl(
                 };
 
                 descs.push(PalHeadDesc {
-                    k_src_arena_ptrs: k_src_ptrs,
-                    v_src_arena_ptrs: v_src_ptrs,
-                    k_src_fmts,
-                    v_src_fmts,
+                    k_src_arena_ptrs: src.k_ptrs,
+                    v_src_arena_ptrs: src.v_ptrs,
+                    k_src_fmts: src.k_fmts,
+                    v_src_fmts: src.v_fmts,
                     k_src_pal_map: ident,
                     v_src_pal_map: ident,
                     // Source is restricted to GPU Float (F16/F32/BF16) or
@@ -1554,7 +1567,7 @@ pub fn dequantize_sealed_in_place(
                 // tag byte round-trips through `KvFormat::from_tag`, the same
                 // inverse the substrate uses, so there is no second byte→format
                 // table to drift from `ArenaFormatTag::from_kv_format`.
-                let resolve_src = |storage: &super::arena::ArenaStorageState,
+                let resolve_src = |storage: &ArenaStorageState,
                                    gid: &ChunkGid,
                                    tag: u8|
                  -> Result<(u64, GgmlDType)> {

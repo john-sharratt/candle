@@ -195,5 +195,6 @@ fn sub_entries_carry_a_real_slot_stride() {
 #[test]
 fn empty_job_list_yields_an_empty_table() {
     let backing = backing_with_one_chunk();
-    assert!(backing.inner.per_head_table_host(&[]).unwrap().is_empty());
+    let none: [ChunkBands; 0] = [];
+    assert!(backing.inner.per_head_table_host(&none).unwrap().is_empty());
 }

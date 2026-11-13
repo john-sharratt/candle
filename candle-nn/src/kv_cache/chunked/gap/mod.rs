@@ -5,6 +5,8 @@
 //! blocks (`table`), leases destination slots per size class (`lease`), and the
 //! device claims among them by select code (`codes`) and converts in place.
 
+// `launch`, `lease` and `summary` are reached from their tests alone, so the
+// dead-code lint is allowed over them.
 #[cfg(feature = "cuda")]
 mod codes;
 #[cfg(feature = "cuda")]
@@ -12,8 +14,6 @@ mod codes;
 mod launch;
 #[cfg(all(test, feature = "cuda"))]
 mod launch_tests;
-// The lease's sizing and holding, and the summary's layout and row decoding,
-// are host arithmetic tested anywhere; their reader is the gap's catch-up.
 #[allow(dead_code)]
 mod lease;
 #[allow(dead_code)]

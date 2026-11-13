@@ -9,6 +9,7 @@ use super::{GgmlDType, Int8Mode, QStorage, SumScale};
 use crate::backend::{BackendDevice, BackendStorage};
 
 use std::ffi::CStr;
+use std::sync::Arc;
 
 use crate::cuda_backend::alloc_inheriting;
 use crate::cuda_backend::graph::outside_capture;
@@ -1119,6 +1120,17 @@ pub struct PalHeadDesc {
 /// [`PalHeadDesc::valid_range`] of a full 32-token chunk: offset 0, length 32.
 pub const FULL_CHUNK_WINDOW: i32 = 32;
 
+/// Refuse a packed `(offset << 8) | len` window that is not a non-empty run
+/// of tokens inside one 32-token chunk — what the selection and the convert
+/// read a chunk's live tokens by.
+pub fn check_token_window(range: i32) -> Result<()> {
+    let (lo, len) = (range >> 8, range & 0xff);
+    if !(0..32).contains(&lo) || len == 0 || lo + len > 32 {
+        crate::bail!("valid_range {range:#x} is not a token window inside one 32-token chunk");
+    }
+    Ok(())
+}
+
 /// Build the identity 2-bit-packed palette map for `head_dim` (only the first
 /// `head_dim / 4` bytes are live; the rest stay zero).
 pub fn identity_pal_map(head_dim: usize) -> PalMapBytes {
@@ -1292,14 +1304,8 @@ pub fn quantize_palette4_convert_buffered(
         check_ptrs(&desc.k_dst_arena_ptrs, &desc.k_dst_pal_map, "dst", "K")?;
         check_ptrs(&desc.v_src_arena_ptrs, &desc.v_src_pal_map, "src", "V")?;
         check_ptrs(&desc.v_dst_arena_ptrs, &desc.v_dst_pal_map, "dst", "V")?;
-        let (lo, len) = (desc.valid_range >> 8, desc.valid_range & 0xff);
-        if !(0..32).contains(&lo) || len == 0 || lo + len > 32 {
-            crate::bail!(
-                "quantize_palette4_convert_buffered: desc[{i}] valid_range {:#x} is not a \
-                 token window inside one 32-token chunk",
-                desc.valid_range
-            );
-        }
+        check_token_window(desc.valid_range)
+            .map_err(|e| e.context(format!("quantize_palette4_convert_buffered: desc[{i}]")))?;
     }
 
     // Pack everything into one GPU allocation:
@@ -1423,7 +1429,7 @@ pub unsafe fn palette4_convert_launch(
     num_kv_heads: usize,
     num_layers: usize,
     num_chunks: usize,
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    stream: &Arc<CudaStream>,
 ) {
     let layout = Palette4ConvertLayout::new(head_dim, num_layers * num_kv_heads);
     // Grid: dim3(num_kv_heads, num_layers) → exactly n blocks per launch.

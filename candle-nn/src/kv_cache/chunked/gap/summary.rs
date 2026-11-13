@@ -209,11 +209,16 @@ impl MappedSummary {
         unsafe { self.host.add(off) as *mut u32 }
     }
 
-    /// Clear the error word before a gap is launched. Only between gaps: no
-    /// kernel of an earlier gap is still running when the host gets here.
+    /// Clear the error word and the completion word before a gap is launched,
+    /// so neither carries the last gap's value — completion words repeat once
+    /// `seq` wraps `u32`, and zero is never one. Only between gaps: no kernel
+    /// of an earlier gap is still running when the host gets here.
     pub(crate) fn arm(&self) {
         // SAFETY: the mapped buffer, live while `self` is.
-        unsafe { write_volatile(self.word(self.layout.error_off()), 0) };
+        unsafe {
+            write_volatile(self.word(self.layout.error_off()), 0);
+            write_volatile(self.word(self.layout.complete_off()), 0);
+        }
     }
 
     /// Whether the gap that stores `word` has completed. The word is the last
@@ -268,8 +273,9 @@ impl MappedSummary {
 #[cfg(feature = "cuda")]
 impl Drop for MappedSummary {
     fn drop(&mut self) {
-        // SAFETY: allocated by `cuMemHostAlloc` in `new`. The owner drops it only
-        // with no gap outstanding, so no kernel still writes it.
+        // SAFETY: allocated by `cuMemHostAlloc` in `new`. Its owner, `GapDevice`,
+        // waits out an outstanding gap in its own drop, so no kernel still
+        // writes it.
         unsafe {
             sys::cuMemFreeHost(self.host as *mut c_void);
         }

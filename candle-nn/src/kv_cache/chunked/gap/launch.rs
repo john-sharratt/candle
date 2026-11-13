@@ -16,6 +16,7 @@
 //! grows to the widest gap. Every buffer is reused only in stream order behind
 //! the gap that last read it.
 
+use std::ffi::c_void;
 use std::ops::Range;
 
 use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
@@ -26,14 +27,15 @@ use candle::cuda_backend::kernels::simple::kv_gap_claim::{
 use candle::cuda_backend::staged::segment;
 use candle::cuda_backend::{CudaDevice, Held, WrapErr};
 use candle::quantized::cuda::{
-    build_kvhead_bytes_raw, ggml_to_select_qtype, identity_pal_map, kvhead_supported_head_dim,
-    palette4_convert_launch, select_palette4_launch, Palette4ConvertLayout, Palette4Layout,
+    build_kvhead_bytes_raw, check_token_window, ggml_to_select_qtype, identity_pal_map,
+    kvhead_supported_head_dim, palette4_convert_launch, select_palette4_launch,
+    Palette4ConvertLayout, Palette4Layout,
 };
 use candle::quantized::GgmlDType;
 use candle::Result;
 
 use super::super::backing::ChunkedKvBacking;
-use super::super::compress::{band_ggml_dtype, band_ptr, policy_selection};
+use super::super::compress::{head_source, policy_selection};
 use super::super::compression_policy::CompressionPolicy;
 use super::super::head_gids::ChunkBands;
 use super::super::size_class::{elems_per_chunk, SizeClass, GID_STRIDE};
@@ -231,10 +233,11 @@ impl GapDevice {
         }
 
         // ── Host images: each group's selection tables, every job's source
-        // records and windows ──
+        // records and windows. Everything that can refuse the gap does so
+        // here, before the first launch ──
         let plans = groups
             .iter()
-            .map(|g| GroupPlan::new(g, jobs, backings, &self.codes))
+            .map(|g| GroupPlan::new(g, jobs, backings, &self.codes, n_kv_head, head_dim))
             .collect::<Result<Vec<_>>>()?;
         let n_heads = jobs.len() * n_kv_head;
         let convert = Palette4ConvertLayout::new(head_dim, n_heads);
@@ -295,7 +298,7 @@ impl GapDevice {
         let sink = self.sink.device_ptr(&stream).0;
         let summary = &self.summary;
         let epoch = &mut self.epoch;
-        self.dev.with_staged_segments(&segments, |at| {
+        let launched = self.dev.with_staged_segments(&segments, |at| {
             let [class_at, fmt_at, lease_at, stack_at, off_at, taken_at] =
                 [at[0], at[1], at[2], at[3], at[4], at[5]];
             for (g, (p, group)) in plans.iter().zip(groups).enumerate() {
@@ -352,7 +355,7 @@ impl GapDevice {
                         n_kv_head as i32,
                         head_dim as i32,
                         SizeClass::COUNT as i32,
-                        stream.cu_stream() as *mut std::ffi::c_void,
+                        stream.cu_stream() as *mut c_void,
                     )
                 };
                 if rc != 0 {
@@ -366,13 +369,32 @@ impl GapDevice {
                 run_kv_gap_complete(
                     summary.dev_at(layout.complete_off()) as *mut u32,
                     completion_word(seq),
-                    stream.cu_stream() as *mut std::ffi::c_void,
+                    stream.cu_stream() as *mut c_void,
                 );
             }
             Ok(())
-        })?;
+        });
+        if let Err(e) = launched {
+            // A launch the driver refused part way leaves the gap's earlier
+            // launches queued, still writing the summary and the convert
+            // buffer. Wait them out, so the next gap's arm and uploads meet
+            // nothing in flight.
+            stream.synchronize().w()?;
+            return Err(e);
+        }
         self.outstanding = Some(completion_word(seq));
         Ok(())
+    }
+}
+
+impl Drop for GapDevice {
+    fn drop(&mut self) {
+        // The summary is freed with `self`, and an outstanding gap's kernels
+        // still write it: wait for them first. Nothing to report a failure to,
+        // and a failed wait means the context is already gone.
+        if self.outstanding.is_some() {
+            let _ = self.dev.cuda_stream().synchronize();
+        }
     }
 }
 
@@ -412,6 +434,8 @@ impl GroupPlan {
         jobs: &[GapJob],
         backings: &[&ChunkedKvBacking],
         codes: &CodeTables,
+        n_kv_head: usize,
+        head_dim: usize,
     ) -> Result<Self> {
         let policy = group.policy;
         let sel = policy_selection(policy)?;
@@ -434,43 +458,28 @@ impl GroupPlan {
         codes.check_covers(&reachable)?;
 
         let group_jobs = &jobs[group.jobs.clone()];
-        let n_kv_head = backings[0].n_kv_head();
         let mut table = Vec::new();
         let mut head_gids = Vec::with_capacity(group_jobs.len() * n_kv_head * 2 * N_PALETTE);
         // The table is built a layer's run at a time: one read of that layer's
         // storage per run.
-        let mut run_start = 0usize;
-        while run_start < group_jobs.len() {
-            let layer = group_jobs[run_start].layer;
-            let run_end = group_jobs[run_start..]
-                .iter()
-                .position(|j| j.layer != layer)
-                .map_or(group_jobs.len(), |n| run_start + n);
-            let backing = backings.get(layer).ok_or_else(|| {
-                candle::Error::Msg(format!("gap: job layer {layer} out of range"))
-            })?;
-            let run: Vec<ChunkBands> = group_jobs[run_start..run_end]
-                .iter()
-                .map(|j| j.bands.clone())
-                .collect();
+        for run in layer_runs(group_jobs) {
+            let layer = group_jobs[run.start].layer;
+            let backing = layer_backing(backings, layer)?;
+            let bands: Vec<&ChunkBands> = group_jobs[run].iter().map(|j| &j.bands).collect();
             backing
                 .inner
-                .validate_selection_gids(&run, &format!("gap layer {layer}"))?;
-            table.extend(backing.inner.per_head_table_host(&run)?);
-            run_start = run_end;
+                .validate_selection_gids(&bands, &format!("gap layer {layer}"))?;
+            table.extend(backing.inner.per_head_table_host(&bands)?);
         }
         for j in group_jobs {
-            for h in 0..n_kv_head {
-                for p in 0..N_PALETTE {
-                    head_gids.push(j.bands.gids.k_gid_pal(h, p).raw());
-                    head_gids.push(j.bands.gids.v_gid_pal(h, p).raw());
-                }
-            }
+            j.bands
+                .gids
+                .extend_selection_gids(n_kv_head, &mut head_gids);
         }
         let layout = Palette4Layout::new(
             group_jobs.len(),
             n_kv_head,
-            backings[0].head_dim(),
+            head_dim,
             k_candidates.len(),
             v_candidates.len(),
         );
@@ -498,8 +507,40 @@ fn readable_source(tag: u8) -> bool {
     )
 }
 
+/// The runs of consecutive jobs on one layer, as ranges into `jobs`.
+fn layer_runs(jobs: &[GapJob]) -> Vec<Range<usize>> {
+    runs_by(jobs.len(), |i| jobs[i].layer)
+}
+
+/// The maximal runs of `0..n` over which `key` holds one value, in order.
+fn runs_by(n: usize, key: impl Fn(usize) -> usize) -> Vec<Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for i in 1..=n {
+        if i == n || key(i) != key(start) {
+            runs.push(start..i);
+            start = i;
+        }
+    }
+    runs
+}
+
+/// The backing a job's layer names.
+fn layer_backing<'b>(
+    backings: &[&'b ChunkedKvBacking],
+    layer: usize,
+) -> Result<&'b ChunkedKvBacking> {
+    backings.get(layer).copied().ok_or_else(|| {
+        candle::Error::Msg(format!(
+            "gap: job layer {layer}, the gap is launched over {} layers",
+            backings.len()
+        ))
+    })
+}
+
 /// Every head's source KvHead record — the job's native bands as they lie, at
 /// the identity map and unit scales — and its token window, in table order.
+/// One read of a layer's storage per run of its jobs.
 fn source_records(
     jobs: &[GapJob],
     backings: &[&ChunkedKvBacking],
@@ -507,50 +548,47 @@ fn source_records(
     n_kv_head: usize,
 ) -> Result<(Vec<u8>, Vec<i32>)> {
     let ident = identity_pal_map(head_dim);
-    let mut records = Vec::with_capacity(jobs.len() * n_kv_head * (head_dim / 2 + 104));
+    let record_bytes = Palette4ConvertLayout::new(head_dim, 1).record_bytes;
+    let mut records = Vec::with_capacity(jobs.len() * n_kv_head * record_bytes);
     let mut ranges = Vec::with_capacity(jobs.len() * n_kv_head);
-    for job in jobs {
-        let backing = backings.get(job.layer).ok_or_else(|| {
-            candle::Error::Msg(format!("gap: job layer {} out of range", job.layer))
-        })?;
+    for run in layer_runs(jobs) {
+        let layer = jobs[run.start].layer;
+        let backing = layer_backing(backings, layer)?;
         backing.inner.storage.read(|storage| -> Result<()> {
-            for h in 0..n_kv_head {
-                let mut k_ptrs = [0u64; N_PALETTE];
-                let mut v_ptrs = [0u64; N_PALETTE];
-                let mut k_fmts = [GgmlDType::F16; N_PALETTE];
-                let mut v_fmts = [GgmlDType::F16; N_PALETTE];
-                for p in 0..N_PALETTE {
-                    let (kt, vt) = job.bands.band_tags(h, p);
-                    for (gid, tag) in [
-                        (job.bands.gids.k_gid_pal(h, p), kt),
-                        (job.bands.gids.v_gid_pal(h, p), vt),
-                    ] {
-                        let on_gpu = storage
-                            .arena_key(gid.arena_idx())
-                            .is_some_and(|k| k.location == ArenaLocation::Gpu);
-                        if !on_gpu || !readable_source(tag) {
-                            candle::bail!(
-                                "gap: a job's band (tag {tag}) is not a GPU float or R16 band"
-                            );
+            for job in &jobs[run] {
+                check_token_window(job.valid_range)
+                    .map_err(|e| e.context(format!("gap: a job on layer {layer}")))?;
+                for h in 0..n_kv_head {
+                    for p in 0..N_PALETTE {
+                        let (kt, vt) = job.bands.band_tags(h, p);
+                        for (gid, tag) in [
+                            (job.bands.gids.k_gid_pal(h, p), kt),
+                            (job.bands.gids.v_gid_pal(h, p), vt),
+                        ] {
+                            let on_gpu = storage
+                                .arena_key(gid.arena_idx())
+                                .is_some_and(|k| k.location == ArenaLocation::Gpu);
+                            if !on_gpu || !readable_source(tag) {
+                                candle::bail!(
+                                    "gap: a job's band (tag {tag}) is not a GPU float or R16 band"
+                                );
+                            }
                         }
                     }
-                    k_fmts[p] = band_ggml_dtype(kt)?;
-                    v_fmts[p] = band_ggml_dtype(vt)?;
-                    k_ptrs[p] = band_ptr(storage, job.bands.gids.k_gid_pal(h, p), "gap k src")?;
-                    v_ptrs[p] = band_ptr(storage, job.bands.gids.v_gid_pal(h, p), "gap v src")?;
+                    let src = head_source(storage, &job.bands, h)?;
+                    records.extend(build_kvhead_bytes_raw(
+                        head_dim,
+                        &src.k_ptrs,
+                        &src.v_ptrs,
+                        &src.k_fmts,
+                        &src.v_fmts,
+                        &ident,
+                        &ident,
+                        &[1.0; N_PALETTE],
+                        &[1.0; N_PALETTE],
+                    )?);
+                    ranges.push(job.valid_range);
                 }
-                records.extend(build_kvhead_bytes_raw(
-                    head_dim,
-                    &k_ptrs,
-                    &v_ptrs,
-                    &k_fmts,
-                    &v_fmts,
-                    &ident,
-                    &ident,
-                    &[1.0; N_PALETTE],
-                    &[1.0; N_PALETTE],
-                )?);
-                ranges.push(job.valid_range);
             }
             Ok(())
         })??;
@@ -578,6 +616,22 @@ mod tests {
         assert!(check_groups(&[g(0..3), g(2..5)], 5).is_err());
         assert!(check_groups(&[g(1..5)], 5).is_err());
         assert!(check_groups(&[g(0..0), g(0..5)], 5).is_err());
+    }
+
+    #[test]
+    fn runs_split_where_the_key_changes() {
+        let keys = [0, 0, 1, 1, 1, 0, 2];
+        assert_eq!(
+            runs_by(keys.len(), |i| keys[i]),
+            vec![0..2, 2..5, 5..6, 6..7]
+        );
+        assert_eq!(runs_by(1, |_| 3), vec![0..1]);
+        assert!(runs_by(0, |_| 0).is_empty());
+    }
+
+    #[test]
+    fn a_layer_past_the_backings_is_refused() {
+        assert!(layer_backing(&[], 0).is_err());
     }
 
     #[test]

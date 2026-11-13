@@ -1129,12 +1129,8 @@ impl PagedSelectionGpuInputs {
             // not any more.
             unified_table.extend_from_slice(&backing.per_head_table_host(gids_layer)?);
             for c in gids_layer.iter() {
-                for h in 0..n_kv_head {
-                    for p in 0..N_PALETTE {
-                        unified_head_gids.push(c.gids.k_gid_pal(h, p).raw());
-                        unified_head_gids.push(c.gids.v_gid_pal(h, p).raw());
-                    }
-                }
+                c.gids
+                    .extend_selection_gids(n_kv_head, &mut unified_head_gids);
             }
             chunk_counts.push(gids_layer.len());
             chunk_gids_keepalive.extend(gids_layer.iter().cloned());
