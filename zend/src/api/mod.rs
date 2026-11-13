@@ -38,6 +38,7 @@ pub mod files;
 pub mod jobs;
 pub mod journal;
 pub mod journals;
+pub mod kept_objects;
 pub mod models;
 pub mod projections;
 pub mod prompt_tokens;
@@ -136,6 +137,22 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Role::Unauthenticated,
             Dispatch::Any,
             get(models::list),
+        )
+        // Every kept custom object out as text and back, for a substrate moved
+        // aside under a new model key: an admin's, a full-estate read and a
+        // bulk write. The substrate replicates, so any member exports it, and
+        // the import's writes replicate from whichever member takes them.
+        .route(
+            "/v1/substrate/zend/objects/export",
+            Role::Admin,
+            Dispatch::Any,
+            get(kept_objects::export),
+        )
+        .route(
+            "/v1/substrate/zend/objects/import",
+            Role::Admin,
+            Dispatch::Any,
+            post(kept_objects::import),
         )
         // A dialogue's approvals, settled by its person (`docs/zen_tool_reach.md`
         // §5): records in the substrate, so any member reads and runs one.

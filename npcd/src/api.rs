@@ -697,6 +697,21 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Dispatch::Any,
             get(export_npcs),
         )
+        // Every kept custom object, out as text and back, for a substrate moved
+        // aside under a new model key (`docs/hit_driven_projection.md` §14.4).
+        // Admin-only for the reason the cast's backup is.
+        .route(
+            "/v1/substrate/npcd/objects/export",
+            Role::Admin,
+            Dispatch::Any,
+            get(export_objects),
+        )
+        .route(
+            "/v1/substrate/npcd/objects/import",
+            Role::Admin,
+            Dispatch::Best,
+            post(import_objects),
+        )
         .route(
             "/v1/npcs/import",
             Role::Admin,
@@ -1070,6 +1085,45 @@ async fn import_npcs(State(s): State<Arc<Authored>>, Json(body): Json<Value>) ->
             tracing::error!(error = ?e, "npc import failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "import failed").into_response()
         }
+    }
+}
+
+/// `GET /v1/substrate/npcd/objects/export` — every kept custom object, its tombstones
+/// and the blobs it names, as JSON Lines (`kept_objects`). Read off the async
+/// runtime: it reads every blob a kept object names.
+async fn export_objects(State(s): State<Arc<Authored>>) -> Response {
+    let shared = s.npcs.substrate();
+    match spawn_blocking(move || shared.export_kept_objects("npcd")).await {
+        Ok(Ok(text)) => ([(header::CONTENT_TYPE, "application/x-ndjson")], text).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(error = ?e, "object export failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("export failed: {e}"),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("export failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /v1/substrate/npcd/objects/import` — write the union of the exports the body
+/// holds, one after another — one from each member — leaving every key
+/// already live as it is, and answer what was written.
+async fn import_objects(State(s): State<Arc<Authored>>, body: String) -> Response {
+    let shared = s.npcs.substrate();
+    match spawn_blocking(move || shared.import_kept_objects(&body, "npcd")).await {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, format!("import refused: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("import failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -4216,6 +4270,8 @@ mod tests {
                 // The whole cast in and out as records, for backup/restore —
                 // `admin`, a full-estate read and a bulk write.
                 ("/v1/npcs/export", "admin"),
+                ("/v1/substrate/npcd/objects/export", "admin"),
+                ("/v1/substrate/npcd/objects/import", "admin"),
                 ("/v1/npcs/import", "admin"),
                 // Who owns what, and handing a character over: `admin`, the one
                 // write that crosses ownership.
