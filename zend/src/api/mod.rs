@@ -460,6 +460,8 @@ mod tests {
             [
                 ("/v1/chat/completions", "user"),
                 ("/v1/models", "unauthenticated"),
+                ("/v1/substrate/zend/objects/export", "admin"),
+                ("/v1/substrate/zend/objects/import", "admin"),
                 ("/v1/approvals/:id", "admin"),
                 ("/v1/approvals/:id/grant", "admin"),
                 ("/v1/approvals/:id/refuse", "admin"),
@@ -568,6 +570,8 @@ mod tests {
                 Dispatch::Any,
             ),
             ("GET", "/v1/substrate/zend/timeline/7", Dispatch::Any),
+            ("GET", "/v1/substrate/zend/objects/export", Dispatch::Any),
+            ("POST", "/v1/substrate/zend/objects/import", Dispatch::Any),
             ("GET", "/v1/journals", Dispatch::Any),
             ("POST", "/v1/journals", Dispatch::Any),
             ("GET", "/v1/journals/tree", Dispatch::Any),
