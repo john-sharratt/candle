@@ -327,6 +327,53 @@ bytes standing, lease bytes held, and the gaps' device time. It replaces the
 today about the one shared pool, so that every pass is logged once per tenant.
 §7's production gates are read from this line.
 
+### 3.8 Ownership: why the gap cannot race
+
+Every piece of state the gap touches has exactly one owner at any moment, and
+every hand-over between owners is ordered by the stream or by a word the
+receiver checks. These six rules are the change's safety argument. Each step of
+the build is checked against them, and a change that needs an exception to one
+of them is redesigned rather than excepted.
+
+1. **One thread changes the bookkeeping.** Chunk lists, the gid pools, the
+   leases, the gap cursors and the records are changed only on the scheduler
+   thread. The persistence thread copies sealed bytes it was handed and appends
+   them to the log. It changes no topology and takes no lock the scheduler
+   needs (§5). With one writer there is no host-side race to lose, which is why
+   the `MigrateFlight` lock is deleted rather than kept (§6).
+2. **The gap runs on the compute stream.** Selection, claim and convert are
+   queued on the stream the forwards run on. A later forward that writes a
+   chunk the gap reads, or reuses a slot the gap freed, is ordered after the
+   gap by the stream itself. No host code has to remember to wait.
+3. **A slot has one owner: the free pool, a lease, or a sealed block.** A lease
+   takes its slots out of `ChunkGidPool` before the gap that may write them is
+   launched, and nothing else hands them out while they are leased. The device
+   writes only to `stack[class][i]` with `i` below the class's lease length, so
+   no address it can write lies outside the lease. A slot leaves the lease only
+   at the catch-up, into a block or back to the stack.
+4. **A native band an outstanding gap reads is not freed until its catch-up.**
+   The gap holds a `ChunkPin` on every native band in its table, and the
+   catch-up drops it. A truncate, an eviction or a seal in the window drops
+   only its own reference, so the band cannot return to the pool and be
+   rewritten while the convert may still read it (§3.5, "a native band is
+   freed by its last reference").
+5. **The host reads only a finished summary, and installs only rows that still
+   match.**
+   - The gap's last launch writes the completion word after a system-scope
+     fence; the host reads the word first and the rows only once it holds the
+     gap's sequence number.
+   - Each row names the native gids it converted and its sequence's generation.
+     The catch-up installs a row only when the block at that index still holds
+     those gids under that generation. Otherwise the row is discarded and its
+     slots go back to the stack.
+   - At most one gap is outstanding. A gap that finds one quantizes nothing, so
+     no buffer, lease or row is ever shared by two gaps.
+6. **Persistence sees a block only after its install.** The persistence thread
+   is handed a quantized block at the catch-up, after the convert has finished.
+   A sealed slot freed while a copy reads it goes through the reclaim queue, as
+   every device free off the scheduler thread does today
+   (`drain_reclaimed`).
+
 ## 4. What a forward attends
 
 Every forward attends a quantized prefix plus, in native form, each sequence's
@@ -453,7 +500,25 @@ Unit tests, written with the code, asserting raw expected bytes:
   only when its last reference drops;
 - persistence: a copy issued before its gap's event has completed reads only
   completed blocks, `has_warm` is never published before the copy's event, and
-  a full pool drops only blocks the log holds.
+  a full pool drops only blocks the log holds;
+- the ownership rules (§3.8), as a randomised model test with no device: the
+  lease, the cursor, the pins and the catch-up's match check driven through
+  thousands of random interleavings of forwards, truncates, evictions, seals,
+  gaps and catch-ups against a reference model, asserting after every step that
+  each slot has exactly one owner, that no gid is freed twice or while pinned,
+  and that no block is both sealed and deferred. A failing interleaving is kept
+  as a fixed regression test;
+- on the device, a truncate and an eviction landing while a gap is outstanding:
+  the stale rows are discarded, their slots return to the stack, and the
+  surviving blocks hold exactly the bytes the per-block reference quantizer
+  gives.
+
+Under `tensor-assert`, at production throughput:
+- `readonly_regions` declares the free pool and every other tenant's ground
+  immutable while a gap is outstanding, so a stray write names its writer;
+- `SlotIntegrity` watches installed blocks for any change after their install;
+- the run's throughput is checked against production's. An instrumented run far
+  below it proves nothing (the `tensor-assert` harness's first danger).
 
 Gates, run one model per `cargo` process with the daemon stopped:
 - every model's fidelity ladder and the sweep, with quantization inside the
@@ -464,7 +529,9 @@ Gates, run one model per `cargo` process with the daemon stopped:
   most recent forwards' blocks, the deferred blocks and the clones;
 - gaps that quantize nothing because one is outstanding are under 1% of the
   gaps with a table;
-- p95 commit wait under 1 s.
+- p95 commit wait under 1 s;
+- a soak at full load on WhiteWorld with the characters live, clean for well
+  past the five minutes the last production corruption took to show.
 
 The before figures are those in §1 and §1.1. The production gates are run on
 BlackWorld and on WhiteWorld, the second with the characters live.
@@ -481,8 +548,8 @@ Everything after it lands in one change, with no dual path:
 4. the convert reading its destinations from the claim;
 5. the summary and the host catch-up;
 6. the gap call in the scheduler and in `batch_test`;
-7. persistence reduced to copy-and-append on its own stream into the pinned
-   warm pool;
+7. persistence reduced to copy-and-append on its own stream into the warm
+   tier;
 8. the deletions in §6;
 9. `kv_drain_under_pressure.md`, `AGENTS.md`'s tiering note and
    `turn_claims.rs`'s commit-wait comment rewritten to match.
@@ -644,8 +711,9 @@ Line numbers are as of commit `dc04b62ac`.
   (`chunk_ops.rs`). That staging is transient VRAM and stays small.
 - The lease never buys ground from the experts. Deferral is the release valve,
   and a run of deferrals is a finding to log, not a reason to raise the lease.
-- The pinned pool is charged to system commit under WDDM. WhiteWorld already
-  commits 119 of 206 GB.
+- Pinned staging is charged to system commit under WDDM. WhiteWorld already
+  commits 119 of 206 GB, so the copy's staging stays bounded and the warm tier
+  stays pageable.
 
 **Testing and measuring.**
 - An instrument that fences hides exactly what this change is meant to remove.
