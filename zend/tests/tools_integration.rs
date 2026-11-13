@@ -86,6 +86,10 @@ mod tool_scenarios {
     /// web question selects it would be asking a daemon built to hide it.
     const SECRETS: &str = "tavily_api_key: tvly-tools-integration\n";
 
+    /// The tools collection's selection gate on the normalized band
+    /// (`committed_tool_scope`'s `min_score`, `zend/src/prompts/projection.yaml`).
+    const TOOL_GATE: f32 = 800.0;
+
     /// How long a shut-down session's tasks may take to unwind and release
     /// what they pinned: well past any boot's wind-down, so only a leak waits
     /// it out.
@@ -288,15 +292,6 @@ mod tool_scenarios {
 
         fn peak(&self, tool: &str) -> f32 {
             self.peak_score.get(tool).copied().unwrap_or(0.0)
-        }
-
-        /// The `n` tools with the highest belief this turn, strongest first. A
-        /// tool whose belief never rose above zero is not ranked.
-        fn strongest(&self, n: usize) -> Vec<&str> {
-            let mut rows: Vec<(&String, &f32)> =
-                self.peak_score.iter().filter(|(_, s)| **s > 0.0).collect();
-            rows.sort_by(|a, b| b.1.total_cmp(a.1));
-            rows.iter().take(n).map(|(name, _)| name.as_str()).collect()
         }
 
         /// The strongest tools this turn, highest first. A selection failure is
@@ -897,29 +892,24 @@ mod tool_scenarios {
             "Search the web and tell me the latest stable Rust release version.",
             "test-search-domain",
         ));
-        // **Scale-free on purpose.** `SelectedSection::score` is the raw belief
-        // accumulator, not the normalized 0–1000 band the policy's `min_score`
-        // is written in — `belief-eval` defaults that gate to 35, the schema
-        // says 800, the results doc says 1000, and live scores run past 800,000.
-        // A threshold here would be a number with no defensible origin, so the
-        // assertion is on rank: the belief top-k admits up to three tools, and a
-        // repository search tool among the three strongest on a web question is
-        // a seed borrowing another tool's vocabulary.
-        //
-        // **On belief, not on `selected`.** `file_search` and `file_grep` are
-        // mandatory (`tool_def::ToolDef::mandatory`): they project on every turn,
-        // on top of the belief top-k and without taking a slot, so they are
-        // always selected and "selected" says nothing about their seeds. This
-        // test asserted `!selected` until they became mandatory, after which it
-        // failed on every run whatever the seeds did.
-        let strongest = out.strongest(3);
+        // **On the band, not on `selected` and not on rank.** `file_search` and
+        // `file_grep` are mandatory (`tool_def::ToolDef::mandatory`): they
+        // project on every turn without taking a slot, so "selected" says
+        // nothing about their seeds, and the score their rows carry is the
+        // scan's own reading on the normalized band — what the tools' 800 gate
+        // is written in. Rank says nothing either: on a question with two real
+        // contenders, third place goes to whichever stray vote is largest, and
+        // `file_grep` shares "search the" with this question by design. A seed
+        // borrowing another tool's vocabulary shows as a reading at the gate or
+        // past the tool the question is about.
+        let web = out.peak("web_search");
         for tool in ["file_search", "file_grep"] {
+            let score = out.peak(tool);
             assert!(
-                !strongest.contains(&tool),
-                "{tool} ranked in the belief top 3 for a web-search question \
-                 (belief {:.0}) — its question seeds are borrowing another tool's \
-                 vocabulary. Strongest tools: {}",
-                out.peak(tool),
+                score < TOOL_GATE && score < web,
+                "{tool} read {score:.0} on a web-search question, against the \
+                 {TOOL_GATE:.0} gate and web_search's {web:.0} — its question \
+                 seeds are borrowing another tool's vocabulary. Strongest tools: {}",
                 out.ranking(),
             );
         }
