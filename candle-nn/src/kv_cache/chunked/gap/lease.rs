@@ -164,7 +164,10 @@ impl<T> Lease<T> {
     }
 
     /// The stack image the claim reads, each slot's address from `addr`.
-    pub(crate) fn stack_image(&self, mut addr: impl FnMut(&T) -> Result<u64>) -> Result<StackImage> {
+    pub(crate) fn stack_image(
+        &self,
+        mut addr: impl FnMut(&T) -> Result<u64>,
+    ) -> Result<StackImage> {
         let mut image = StackImage::default();
         for (c, run) in self.slots.iter().enumerate() {
             image.off[c] = u32::try_from(image.addrs.len())

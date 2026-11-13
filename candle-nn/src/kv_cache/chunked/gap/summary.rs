@@ -201,7 +201,10 @@ impl MappedSummary {
     }
 
     fn word(&self, off: usize) -> *mut u32 {
-        assert!(off + 4 <= self.layout.bytes(), "gap summary word {off} out of range");
+        assert!(
+            off + 4 <= self.layout.bytes(),
+            "gap summary word {off} out of range"
+        );
         // SAFETY: in bounds by the assertion, and four-aligned by the layout.
         unsafe { self.host.add(off) as *mut u32 }
     }
@@ -251,7 +254,10 @@ impl MappedSummary {
     pub(crate) unsafe fn head_row(&self, head: usize) -> Result<HeadRow> {
         let off = self.layout.head_off(head);
         let len = self.layout.head_stride();
-        assert!(off + len <= self.layout.error_off(), "gap summary head {head} out of range");
+        assert!(
+            off + len <= self.layout.error_off(),
+            "gap summary head {head} out of range"
+        );
         HeadRow::decode(
             std::slice::from_raw_parts(self.host.add(off), len),
             self.layout.head_dim,

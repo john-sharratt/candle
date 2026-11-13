@@ -23,46 +23,48 @@ pub const fn summary_head_bytes(head_dim: usize) -> usize {
 /// The claim's "no override" value for a side's uniform format.
 pub const NO_OVERRIDE: i32 = -1;
 
-extern "C" {
-    /// Give every band of `n_jobs × n_kv_head` heads its index in its size
-    /// class, continuing from `taken`, and mark each job deferred when any band
-    /// falls past its class's lease. One block.
-    ///
-    /// # Safety
-    ///
-    /// Device pointers: `k_tags`/`v_tags` hold `n_jobs × n_kv_head × 4` select
-    /// codes; `code_class` holds [`N_CODES`] entries; `lease_len` and `taken`
-    /// hold `n_class` entries, `n_class <= MAX_CLASS`; `band_index` holds
-    /// `n_jobs × n_kv_head × 8`; `job_deferred` holds `n_jobs`; `error_word`
-    /// is one word, device or mapped host.
-    pub fn run_kv_gap_claim(
-        k_tags: *const i32,
-        v_tags: *const i32,
-        k_override: i32,
-        v_override: i32,
-        code_class: *const i8,
-        lease_len: *const u32,
-        taken: *mut u32,
-        band_index: *mut u32,
-        job_deferred: *mut u32,
-        error_word: *mut u32,
-        n_jobs: i32,
-        n_kv_head: i32,
-        n_class: i32,
-        stream: *mut c_void,
-    );
+/// The most KV heads a job may have: a block's tile holds whole jobs. Mirrors
+/// `MAX_KV_HEAD` in the `.cu`.
+pub const MAX_KV_HEAD: usize = 64;
 
-    /// Write every head's destination KvHead record into `dst_records` (the
-    /// convert buffer's destination half) and into `summary_heads`, with each
-    /// band's lease index after the record and each job's deferred flag in
-    /// `summary_flags`. One block per head.
+/// Heads per block's tile (whole jobs only). Mirrors `TILE_HEADS` in the `.cu`.
+pub const TILE_HEADS: usize = 64;
+
+/// Status words (`u64`) a claim launch over up to `n_heads` heads needs: one
+/// per (tile, class). At any `n_kv_head <= MAX_KV_HEAD <= TILE_HEADS` a tile
+/// holds more than half of `TILE_HEADS` heads.
+///
+/// Zero them once when they are allocated and hand them to nothing else, then
+/// pass a different `epoch` with every launch on them (a counter beside the
+/// buffer): a word an earlier launch left reads as not ready by its epoch, so
+/// nothing is cleared between launches. Launches sharing one status buffer
+/// must be ordered (one stream).
+pub const fn claim_status_words(n_heads: usize) -> usize {
+    n_heads.div_ceil(TILE_HEADS / 2) * MAX_CLASS
+}
+
+extern "C" {
+    /// One policy group's claim: give every band of `n_jobs × n_kv_head` heads
+    /// its index in its size class, continuing from `taken` (which it leaves
+    /// advanced past the group), defer each job any of whose bands falls past
+    /// its class's lease, and write every head's destination KvHead record into
+    /// `dst_records` (the convert buffer's destination half) and into
+    /// `summary_heads`, each band's lease index after the record and each job's
+    /// deferred flag in `summary_flags`. Returns 0, or nonzero when it refused
+    /// the arguments (`head_dim` other than 64, 128, 256 or 512; `n_kv_head`
+    /// past [`MAX_KV_HEAD`]; `n_class` past [`MAX_CLASS`]) or the launch failed.
     ///
     /// # Safety
     ///
-    /// Device pointers sized for `n_heads` heads at `head_dim`; `stack` holds
-    /// every leased slot address, `stack_off` each class's first entry;
-    /// `summary_heads` and `summary_flags` may be mapped host memory.
-    pub fn run_kv_gap_fill(
+    /// Device pointers: tags and scales hold `n_heads × 4`, maps
+    /// `n_heads × head_dim`; `code_class`/`code_fmt` hold [`N_CODES`];
+    /// `lease_len`, `stack_off` and `taken` hold `n_class <= MAX_CLASS`;
+    /// `stack` every leased slot address; `dst_records`, `summary_heads` and
+    /// `summary_flags` are sized for the group (the summary may be mapped host
+    /// memory); `error_word` is one word; `status` holds
+    /// [`claim_status_words`]`(n_heads)`, and `epoch` differs from every
+    /// earlier launch's on it.
+    pub fn run_kv_gap_claim(
         k_tags: *const i32,
         v_tags: *const i32,
         k_scale: *const f32,
@@ -73,19 +75,23 @@ extern "C" {
         v_override: i32,
         code_class: *const i8,
         code_fmt: *const u8,
+        lease_len: *const u32,
         stack: *const u64,
         stack_off: *const u32,
-        band_index: *const u32,
-        job_deferred: *const u32,
+        taken: *mut u32,
         sink: u64,
         dst_records: *mut u8,
         summary_heads: *mut u8,
         summary_flags: *mut u32,
-        n_heads: i32,
-        head_dim: i32,
+        error_word: *mut u32,
+        status: *mut u64,
+        epoch: u32,
+        n_jobs: i32,
         n_kv_head: i32,
+        head_dim: i32,
+        n_class: i32,
         stream: *mut c_void,
-    );
+    ) -> i32;
 
     /// Store `seq` in `word` after everything enqueued before it on `stream`,
     /// behind a system-scope fence: the host's signal that the gap is done.

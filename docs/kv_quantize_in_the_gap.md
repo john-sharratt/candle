@@ -177,8 +177,8 @@ chooses among them.**
   copies them out; the claim reads them there. The convert already reads its
   per-head source and destination records from one device buffer; the host
   writes the source half and the claim writes the destination half. The gap
-  adds three small kernels of its own in `kv_gap_claim.cu`: the claim, the
-  record fill, and the completion word.
+  adds two kernels of its own in `kv_gap_claim.cu`: the claim, which also
+  writes the destination records, and the completion word.
 - **Leases.** For every reachable quant class the host keeps a standing lease:
   free slots claimed from that class's arenas (`ChunkGidPool`, lowest place
   first), held as `ChunkGid`s, and mirrored on the device as a **slot stack**
@@ -194,7 +194,12 @@ chooses among them.**
   groups claims once per group against a per-class count the groups share, so
   the gap's indices are one sequence. The claim is a prefix count, not a race
   on an atomic cursor, so the same table against the same lease always takes
-  the same slots, and the lowest places fill first.
+  the same slots, and the lowest places fill first. It is one launch per group:
+  a single-pass scan with decoupled look-back over tiles of whole jobs, sixteen
+  class counters two to a word. Its look-back status words are scratch zeroed
+  once at allocation; each launch carries a new epoch, so nothing is cleared
+  between launches. A job has at most 64 KV heads, and the head dimension is
+  64, 128, 256 or 512.
 - **A class that runs dry defers the block, never fails it.** A block is
   deferred when any of its bands' indices falls past its class's lease. The
   whole block stays native and goes into the next gap's table. Its bands still
@@ -229,11 +234,15 @@ allocated uninitialised (invariant 6). The convert is launched once for the
 whole table, never once per layer: the table is cut to the convert's single
 launch (65,535 jobs), which §3.1's scratch cut is already well inside.
 
-The record fill writes each head's destination record (palette maps packed two
-bits a channel, record format codes, outer scales, slot addresses) into the
-convert's buffer and into the summary row (§3.4), in one pass over the
-selection's results. Under a uniform override a side's map is the identity and
-its scales are one, as today.
+The claim writes each head's destination record (palette maps packed two bits a
+channel, record format codes, outer scales, slot addresses) into the convert's
+buffer and into the summary row (§3.4), in the same launch that counts. It packs
+the maps, the bulk of its bytes, while its tile's predecessors resolve, and
+assembles each tile's rows in shared memory so they leave as two contiguous
+spans. Under a uniform override a side's map is the identity and its scales are
+one, as today. On the RTX 3090 it runs at the device copy roofline: 88 µs for an
+8K prompt's 12,288 jobs, 446 µs for a full 65,535-job table, against 87 µs and
+457 µs for a device copy of the same bytes (`candle-core/tests/kv_gap_claim_bench.rs`).
 
 Nothing else is written on the device. No record is filled and no block table is
 touched in the gap: both are the host's to change, at the catch-up.
@@ -625,11 +634,14 @@ Line numbers are as of commit `dc04b62ac`.
   `select_kv_format_palette4_paged`: unchanged. One launch per policy group
   (§3.1), its results left in the selection block for the claim.
 - `candle-kernels/src/quantize/palette4_convert.cuh`: unchanged. Its buffer's
-  destination half is written by the record fill.
+  destination half is written by the claim.
 - New `candle-kernels/src/simple/kv_gap_claim.cu`: the claim (the per-class
-  prefix count and the deferral rule), the record fill and the completion word.
-  Listed in `SIMPLE_KERNELS` (`candle-kernels/build_utils.rs`), bound in
-  `candle-kernels/src/simple/kv_gap_claim.rs`.
+  prefix count, the deferral rule and the destination records, one launch) and
+  the completion word. Listed in `SIMPLE_KERNELS`
+  (`candle-kernels/build_utils.rs`), bound in
+  `candle-kernels/src/simple/kv_gap_claim.rs`. Its harness,
+  `candle-core/tests/kv_gap_claim_bench.rs`, checks every output byte against a
+  sequential reference and holds the benchmark and the `ncu` target.
 - `candle-core/src/quantized/cuda.rs`, `quantize_palette4_convert_buffered`:
   split into building the buffer and launching on it, so the gap launches the
   same convert on a buffer whose destination half the device wrote.

@@ -97,7 +97,11 @@ mod tests {
     #[test]
     fn a_code_carries_its_formats_class_and_record_byte() {
         let t = CodeTables::new(EPC).unwrap();
-        for (q, byte) in [(QuantFormat::Q8_0, 7u8), (QuantFormat::Q4_0, 15), (QuantFormat::R16, 3)] {
+        for (q, byte) in [
+            (QuantFormat::Q8_0, 7u8),
+            (QuantFormat::Q4_0, 15),
+            (QuantFormat::R16, 3),
+        ] {
             let c = code(q.to_ggml_dtype());
             let class = class_for_format(KvFormat::Quantized(q), EPC).unwrap();
             assert_eq!(t.class[c], class.index() as i8, "{q:?}");
