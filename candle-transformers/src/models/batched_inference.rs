@@ -31,7 +31,7 @@ use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::RecurrentCompaction;
 use crate::models::delta_net::TIMELINE_ROWS;
 use crate::models::delta_net::{ArmKind, ReplyRows};
-use crate::models::hit_layers::{HitPercentiles, PieceHits};
+use crate::models::hit_layers::{HitPercentiles, PieceHits, PooledRound};
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::layer_parallel;
 use crate::models::piece_key::PieceKey;
@@ -5051,9 +5051,15 @@ pub trait ManagedBatchedModel {
 
     /// Declare the rounds `seq`'s projection placed, as position ranges in
     /// declaration order, so its sampled layers count what their selections
-    /// choose of each (`docs/hit_driven_projection.md` §6.4). Replaces any
-    /// declared before, dropping their counts.
-    fn set_hit_rounds(&self, _seq: usize, _rounds: &[Range<usize>]) -> Result<()> {
+    /// choose of each (`docs/hit_driven_projection.md` §6.4), and after them
+    /// the `pooled` rounds it did not place, which the shadow scan counts
+    /// (§6.3). Replaces any declared before, dropping their counts.
+    fn set_hit_rounds(
+        &self,
+        _seq: usize,
+        _rounds: &[Range<usize>],
+        _pooled: &[PooledRound],
+    ) -> Result<()> {
         Ok(())
     }
 

@@ -10,11 +10,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use candle_transformers::models::piece_key::PieceKey;
+
 use crate::index_pages;
 use crate::projection::{Conversation, GroupId, TimelineId, TurnIndex, TurnKey};
 use crate::sequence_handle::SequenceId;
 
 use super::pool::{choose_pool, PoolCandidate};
+use super::pooled_rounds::PoolPages;
 use super::Scheduler;
 
 /// Conversations a reprojection admits to the pool that it was not holding,
@@ -75,9 +78,13 @@ impl Scheduler {
             (floors, scored, turns_of)
         };
         let pool = choose_pool(&floors, &scored, self.pool_tokens);
-        let held: HashSet<TimelineId> = self.pooled_pieces.get(&slot).cloned().unwrap_or_default();
+        let held: HashSet<TimelineId> = self
+            .slot_projection_state
+            .get(&slot)
+            .map(|s| s.pool.keys().copied().collect())
+            .unwrap_or_default();
         let mut keep = Vec::new();
-        let mut kept: HashSet<TimelineId> = HashSet::new();
+        let mut kept: PoolPages = HashMap::new();
         let mut admitted = 0usize;
         for tl in pool {
             let fresh = !held.contains(&tl);
@@ -85,6 +92,7 @@ impl Scheduler {
                 continue;
             }
             let mut keys = Vec::new();
+            let mut layout: HashMap<TurnIndex, Vec<(usize, PieceKey)>> = HashMap::new();
             let mut whole = true;
             for i in 0..turns_of.get(&tl).copied().unwrap_or(0) {
                 let pages = match conversation.turn_index_page(tl, TurnIndex(i)) {
@@ -102,9 +110,12 @@ impl Scheduler {
                     whole = false;
                     break;
                 };
-                for ((_, bytes), key) in framed.iter().zip(pages.page_keys()) {
+                for ((width, bytes), key) in framed.iter().zip(pages.page_keys()) {
                     match self.model.pool_positional_state(slot.0, bytes, key) {
-                        Ok(_) => keys.push(*key),
+                        Ok(_) => {
+                            keys.push(*key);
+                            layout.entry(TurnIndex(i)).or_default().push((*width, *key));
+                        }
                         Err(e) => {
                             tracing::warn!(timeline = tl.raw(), error = %e,
                                 "pool: a page could not be held; the conversation is left out");
@@ -119,7 +130,7 @@ impl Scheduler {
             }
             if whole {
                 keep.extend(keys);
-                kept.insert(tl);
+                kept.insert(tl, layout);
                 admitted += fresh as usize;
             }
         }
@@ -131,13 +142,18 @@ impl Scheduler {
         // already warm or hot cost a lookup; what the warm share has no room
         // for stays cold.
         let warm: Vec<TurnKey> = kept
-            .iter()
+            .keys()
             .flat_map(|&tl| {
                 (0..turns_of.get(&tl).copied().unwrap_or(0))
                     .map(move |i| TurnKey::new(tl, TurnIndex(i)))
             })
             .collect();
         self.persist_triggers.warm_turns(warm);
-        self.pooled_pieces.insert(slot, kept);
+        // The pool's pages go with the slot's projection state, which the
+        // assembly declares the pooled rounds from, and leave with it. A slot
+        // with no state yet has placed nothing to hold a pool beside.
+        if let Some(state) = self.slot_projection_state.get_mut(&slot) {
+            state.pool = kept;
+        }
     }
 }

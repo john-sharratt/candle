@@ -65,6 +65,7 @@ mod piece_splice;
 mod pinned_report;
 pub mod pool;
 mod pool_refresh;
+mod pooled_rounds;
 mod prefill;
 mod prefill_wait;
 pub(crate) mod profile;
@@ -3417,8 +3418,6 @@ pub(crate) struct Scheduler {
     /// Tokens a dialogue's pool holds behind its slot
     /// (`docs/hit_driven_projection.md` §7.2), by the card's size.
     pool_tokens: usize,
-    /// Per slot, the conversations its pool holds ([`Self::refresh_pool`]).
-    pooled_pieces: HashMap<SequenceId, HashSet<TimelineId>>,
     /// EOS token ID (stops generation).
     eos_tokens: TokenBuffer,
     /// Device the model lives on.
@@ -4240,7 +4239,6 @@ impl Scheduler {
             think_close,
             page_break_tokens,
             pool_tokens,
-            pooled_pieces: HashMap::new(),
             eos_tokens,
             device,
             active_decodes: HashMap::new(),
@@ -11406,12 +11404,11 @@ impl Scheduler {
         slot: SequenceId,
         conversation: Option<Conversation>,
     ) {
+        // The pool goes with the slot's state; the model's hold on its pages
+        // goes when the sequence is released.
         if self.slot_projection_state.remove(&slot).is_none() {
             return;
         }
-        // The pool goes with the slot; the model's hold on its pages goes when
-        // the sequence is released.
-        self.pooled_pieces.remove(&slot);
         if let Some(conversation) = conversation {
             self.republish_pins(&conversation);
         }

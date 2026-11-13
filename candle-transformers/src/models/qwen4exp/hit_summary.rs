@@ -18,7 +18,8 @@
 //! word 2   generation — which of its declarations
 //! word 3   end    — the sequence word again, stored last
 //! word 4   queries counted, cumulative
-//! word 5.. hits per piece, cumulative
+//! word 5   shadow queries counted, cumulative
+//! word 6.. hits per round, cumulative
 //! ```
 //!
 //! A read takes `end`, then the header and the counts, then `begin` again: a
@@ -41,7 +42,7 @@ use candle::cuda_backend::cudarc::driver::sys;
 use candle::{CudaDevice, Result};
 
 /// Header words ahead of the counts (`HIT_SUMMARY_HEADER` in `qsa_hits.cu`).
-pub const HEADER_WORDS: usize = 5;
+pub const HEADER_WORDS: usize = 6;
 
 /// The smallest block handed out, in words: room for a few hundred pieces.
 const MIN_BLOCK_WORDS: usize = 512;
@@ -105,9 +106,9 @@ impl MappedBlock {
     }
 
     /// The newest finished publish for `token`'s declaration `generation` of
-    /// `n_pieces` pieces: its sequence word, the queries and the hits per
-    /// piece, all cumulative. `None` while nothing of that declaration has
-    /// landed.
+    /// `n_pieces` rounds: its sequence word, the queries, the shadow queries
+    /// and the hits per round, all cumulative. `None` while nothing of that
+    /// declaration has landed.
     pub fn read(&self, token: u32, generation: u32, n_pieces: usize) -> Option<Snapshot> {
         if HEADER_WORDS + n_pieces > self.words {
             return None;
@@ -134,6 +135,7 @@ impl MappedBlock {
                 continue;
             }
             let queries = unsafe { read_volatile(self.host.add(4)) };
+            let shadow_queries = unsafe { read_volatile(self.host.add(5)) };
             let hits: Vec<u32> = (0..n_pieces)
                 .map(|i| unsafe { read_volatile(self.host.add(HEADER_WORDS + i)) })
                 .collect();
@@ -144,6 +146,7 @@ impl MappedBlock {
             return Some(Snapshot {
                 seq: end,
                 queries,
+                shadow_queries,
                 hits,
             });
         }
@@ -158,7 +161,9 @@ pub struct Snapshot {
     pub seq: u32,
     /// Query rows counted, summed over the sampled layers.
     pub queries: u32,
-    /// Hits per piece.
+    /// Kept queries the shadow scan scored, summed over the sampled layers.
+    pub shadow_queries: u32,
+    /// Hits per round.
     pub hits: Vec<u32>,
 }
 
@@ -233,13 +238,14 @@ mod tests {
     fn a_read_takes_only_a_finished_publish_of_its_own_declaration() {
         let (mut mem, b) = block(16);
         assert_eq!(b.read(7, 1, 3), None, "fresh");
-        mem[..8].copy_from_slice(&[4, 7, 1, 4, 30, 5, 0, 9]);
+        mem[..9].copy_from_slice(&[4, 7, 1, 4, 30, 12, 5, 0, 9]);
         let snap = b.read(7, 1, 3);
         assert_eq!(
             snap,
             Some(Snapshot {
                 seq: 4,
                 queries: 30,
+                shadow_queries: 12,
                 hits: vec![5, 0, 9]
             })
         );

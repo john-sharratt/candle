@@ -32,7 +32,7 @@
 
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
 use std::ops::Range;
 use std::sync::Arc;
@@ -68,6 +68,7 @@ use crate::scheduler::piece_identity::{
     alignment_identities, chained_identities, piece_label, PieceReads,
 };
 use crate::scheduler::piece_splice::{plan_splice, HeldPiece, PieceKind, SplicePlan, WantedPiece};
+use crate::scheduler::pooled_rounds::{pooled_rounds, PoolPages};
 use crate::scheduler::profile;
 use crate::scheduler::projection_identity::section_content_stamp;
 use crate::scheduler::section_pages::SectionPages;
@@ -133,6 +134,10 @@ pub(super) struct SlotState {
     /// the next reprojection to fold it in with its own read — so the counts
     /// a turn's tail ran up are not lost to the next turn's opening.
     pub(super) unread_hits: Vec<HitPart>,
+    /// What the slot's pool holds ([`super::Scheduler::refresh_pool`]): the
+    /// pages of its pooled conversations, whose unplaced rounds the
+    /// declaration names for the shadow scan.
+    pub(super) pool: PoolPages,
 }
 
 /// The most read-back parts a slot keeps between reprojections; past it the
@@ -1918,7 +1923,7 @@ pub(super) fn apply_segments_build(
     // stride its counts and nothing else. What the old pieces ran up since the
     // last read is read back first and kept for the next reprojection.
     match ctx.model.take_hits(parent_id.0) {
-        Ok(Some(h)) if h.queries > 0 && !state.hit_keys.is_empty() => {
+        Ok(Some(h)) if (h.queries > 0 || h.shadow_queries > 0) && !state.hit_keys.is_empty() => {
             state
                 .unread_hits
                 .push((std::mem::take(&mut state.hit_keys), h));
@@ -1929,11 +1934,32 @@ pub(super) fn apply_segments_build(
         Ok(_) => {}
         Err(e) => tracing::warn!(slot = parent_id.0, error = %e, "hits not read back"),
     }
-    let (hit_keys, hit_ranges) = {
+    // The placed rounds, then every unplaced round of what the pool holds —
+    // the rounds the shadow scan reads (§6.3).
+    let (hit_keys, hit_ranges, pooled) = {
         let conv = ctx.conversation.read();
-        hit_rounds_of(&pieces, &state.placed_pieces, &conv)
+        let (mut keys, ranges) = hit_rounds_of(&pieces, &state.placed_pieces, &conv);
+        let placed: HashSet<RoundKey> = keys.iter().copied().collect();
+        let (pooled_keys, pooled) = pooled_rounds(
+            &state.pool,
+            &placed,
+            |tl| conv.exchanges_of(tl),
+            |tl, turn, record| {
+                let total = conv.turn_token_count_of(tl, turn);
+                let edge = conv
+                    .turn_layout(tl, turn)
+                    .and_then(|l| l.user_record_end())
+                    .map_or(0, |e| (e as usize).min(total));
+                match record {
+                    TurnRecord::User => 0..edge,
+                    TurnRecord::Assistant => edge..total,
+                }
+            },
+        );
+        keys.extend(pooled_keys);
+        (keys, ranges, pooled)
     };
-    match ctx.model.set_hit_rounds(parent_id.0, &hit_ranges) {
+    match ctx.model.set_hit_rounds(parent_id.0, &hit_ranges, &pooled) {
         Ok(()) => state.hit_keys = hit_keys,
         Err(e) => {
             tracing::warn!(
