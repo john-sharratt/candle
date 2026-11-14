@@ -11908,12 +11908,18 @@ impl Scheduler {
             },
             false => None,
         };
+        // What the read held and what it lifted, for the observe split: the
+        // turns whose rounds' momentum lifts their scores, and the strongest.
+        let mut hit_read = hit_density::HitSummary::default();
+        let mut lifted = 0usize;
+        let mut top_lift = 0.0f32;
         let density = match self.slot_projection_state.get_mut(&slot) {
             Some(state) => {
                 let mut parts = std::mem::take(&mut state.unread_hits);
                 if let Some(h) = hits {
                     parts.push((state.hit_keys.clone(), h));
                 }
+                hit_read = hit_density::hit_summary(&parts);
                 // Each placed round's hit momentum moves, and lifts this
                 // reprojection's scores of the turns whose rounds it keeps
                 // reading (`docs/hit_driven_projection.md` §7.1, §8.1).
@@ -11954,6 +11960,8 @@ impl Scheduler {
                             .cloned()
                     })
                 };
+                lifted = turn_lifts.len();
+                top_lift = turn_lifts.values().copied().fold(0.0, f32::max);
                 projection_scores.lift_turns(turn_lifts, base, |k| chain.contains(&k.timeline));
                 hit_density::hit_density(&parts)
             }
@@ -11991,12 +11999,23 @@ impl Scheduler {
             format!(
                 "view={} observe_us={observe_us} hits_us={hits_us} ws_us={ws_us} \
                  pool_us={pool_us} pooled={} pool_reused={} pool_walked_turns={} \
-                 candidates={}",
+                 candidates={} hit_parts={} queries={} shadow_queries={} \
+                 loaded_rounds={} loaded_hit={} loaded_hits={} pooled_rounds={} \
+                 pooled_hit={} pooled_hits={} turns_lifted={lifted} top_lift={top_lift:.3}",
                 view_id.0,
                 pool.pooled,
                 pool.reused,
                 pool.walked,
                 group_candidates.iter().map(|(_, c)| c.len()).sum::<usize>(),
+                hit_read.parts,
+                hit_read.queries,
+                hit_read.shadow_queries,
+                hit_read.loaded,
+                hit_read.loaded_hit,
+                hit_read.loaded_hits,
+                hit_read.pooled,
+                hit_read.pooled_hit,
+                hit_read.pooled_hits,
             )
         });
 
