@@ -813,9 +813,13 @@ answers to and where it lives.
     as stored and its record's original stamp, in the order of those stamps,
     then one line per blob a kept live object names, `{"blob": "<sha256
     hex>", "bytes_b64": "…"}`. An object names a blob by spelling its SHA-256
-    in lowercase hex anywhere in its metadata or its value, the one spelling
-    every object that names a blob writes; a spelling no blob answers names
-    nothing.
+    in lowercase hex as a segment of its key or anywhere in its metadata or
+    its value, the one spelling every object that names a blob writes; a
+    spelling no blob answers names nothing. The key counts because a
+    repository's pack record, `git/pack/<repo>/<sha256>`, names its pack there
+    alone: read from the value only, BlackWorld's export (2026-11-14) carried
+    3,659 packs' indexes and none of their packs, and the substrate it was
+    imported into could not load its repositories.
     - **What is kept.** Every live custom object except those whose meaning
       is a model-derived record, which the move-aside destroys. One list in
       the code names the left-out prefixes: `cluster/` (the cluster's own
