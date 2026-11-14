@@ -2,13 +2,14 @@
 //! second in which a gap ran, summed over that second's gaps — blocks installed
 //! and deferred, rows discarded and blocks found moved, gaps that quantized
 //! nothing because one was outstanding, jobs launched and how many led as
-//! retries, the classes whose lease came up short and the first reason given,
+//! retries, the turns whose seal ran gaps of its own (counted in with the
+//! rest), the classes whose lease came up short and the first reason given,
 //! the time the two calls took on the scheduler thread, and the caught-up
 //! gaps' time on the stream.
 
 use std::time::{Duration, Instant};
 
-use candle_nn::kv_cache::{GapCatchUp, GapQuantize};
+use candle_nn::kv_cache::{GapCatchUp, GapQuantize, GapSealed};
 
 /// How often the line is written while gaps run.
 const WINDOW: Duration = Duration::from_secs(1);
@@ -23,6 +24,8 @@ pub(super) struct KvGapLine {
     stale: u64,
     moved: u64,
     outstanding: u64,
+    /// Turns whose last blocks a seal's own gaps quantized.
+    seals: u64,
     jobs: u64,
     retried: u64,
     short_slots: u64,
@@ -68,6 +71,21 @@ impl KvGapLine {
         }
     }
 
+    /// Fold one seal's gaps in: they are gaps like any other, run and caught
+    /// up within the call, and its seals are counted apart.
+    pub(super) fn sealed(&mut self, s: &GapSealed) {
+        if s.gaps == 0 && s.installed == 0 {
+            return;
+        }
+        self.seals += 1;
+        self.gaps += s.gaps as u64;
+        self.jobs += s.jobs as u64;
+        self.installed += s.installed as u64;
+        self.stale += s.stale as u64;
+        self.deferred += s.deferred as u64;
+        self.device_us += (s.device_ms * 1e3) as u64;
+    }
+
     /// Time the gap's two calls took on the scheduler thread.
     pub(super) fn spent(&mut self, d: Duration) {
         self.host_us += d.as_micros() as u64;
@@ -90,6 +108,7 @@ impl KvGapLine {
                 stale = self.stale,
                 moved = self.moved,
                 outstanding = self.outstanding,
+                seals = self.seals,
                 jobs = self.jobs,
                 retried = self.retried,
                 short_slots = self.short_slots,
@@ -149,6 +168,23 @@ mod tests {
         });
         assert_eq!((l.gaps, l.jobs, l.retried, l.outstanding), (2, 12, 2, 1));
         assert_eq!((l.installed, l.deferred, l.stale, l.moved), (7, 2, 1, 1));
+    }
+
+    #[test]
+    fn a_seals_gaps_count_with_the_rest_and_a_seal_with_none_adds_nothing() {
+        let mut l = KvGapLine::default();
+        l.sealed(&GapSealed::default());
+        assert_eq!(l.seals, 0);
+        l.sealed(&GapSealed {
+            jobs: 6,
+            gaps: 2,
+            installed: 18,
+            stale: 0,
+            deferred: 0,
+            device_ms: 1.5,
+        });
+        assert_eq!((l.seals, l.gaps, l.jobs, l.installed), (1, 2, 6, 18));
+        assert_eq!(l.device_us, 1500);
     }
 
     #[test]

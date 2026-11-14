@@ -27,7 +27,7 @@ use super::super::gid_pool::ChunkGid;
 use super::super::head_gids::{ChunkBands, HeadGids};
 use super::super::meta_pool::{ChunkRecordSrc, MetaGid};
 use super::super::size_class::SizeClass;
-use super::super::types::{ChunkWindow, QSign, CHUNK_SIZE};
+use super::super::types::{ChunkWindow, QSign};
 use super::assemble::{block_state, take_block, BlockState};
 use super::codes::CodeTables;
 use super::cycle::CatchUpHost;
@@ -102,11 +102,14 @@ fn locate(chunks: &[ChunkWindow], job: &GapJob) -> Option<usize> {
     (0..chunks.len()).find(|&i| at(i))
 }
 
-/// The bands of the native chunk now at `job`'s index, when it is a complete
-/// native block behind its sequence's cursor that no gap will take again: what
-/// a compaction leaves when it relocates a block's bands while a gap reads the
-/// old ones. A chunk past the cursor is the next gap's anyway; a quantized or
-/// partial one is no block to quantize.
+/// The bands of the native chunk now at `job`'s index, when it is a native
+/// block of the job's own window behind its sequence's cursor that no gap will
+/// take again: what a compaction leaves when it relocates a block's bands while
+/// a gap reads the old ones. The window is the job's — a full block for a
+/// gap's, a seal's partial or writer chunk at its valid tokens — so a chunk
+/// written since, or another chunk at that index, is not the job's block. A
+/// chunk past the cursor is the next gap's anyway; a quantized one is no block
+/// to quantize.
 pub(super) fn requeue_at(
     backings: &[&ChunkedKvBacking],
     job: &GapJob,
@@ -124,8 +127,13 @@ pub(super) fn requeue_at(
         .and_then(Option::as_ref)
         .filter(|s| job.block < s.gap_cursor())
         .and_then(|s| s.chunks_slice().get(job.block))
-        .filter(|c| c.takes_writes() && c.usage as usize == CHUNK_SIZE)
+        .filter(|c| c.takes_writes() && window_of(c) == job.valid_range)
         .map(ChunkBands::from_window))
+}
+
+/// A chunk's valid-token window, as a job carries it: offset over usage.
+pub(super) fn window_of(c: &ChunkWindow) -> i32 {
+    (i32::from(c.offset) << 8) | c.usage as i32
 }
 
 /// [`locate`] in `job`'s layer.

@@ -28,14 +28,15 @@ use super::super::compression_policy::CompressionPolicy;
 use super::super::gid_pool::ChunkGid;
 use super::super::head_gids::ChunkBands;
 use super::super::size_class::{class_for_format, SizeClass};
+use super::super::types::ChunkWindow;
 use super::codes::CodeTables;
 use super::demand::{gap_demand, GapKind, PeakShares, PerClass};
-use super::install::{catch_up, requeue_at};
+use super::install::{catch_up, requeue_at, window_of};
 use super::launch::{GapDevice, GapGroup, GapJob, MAX_GAP_JOBS};
 use super::lease::Lease;
 use super::lease_alloc::{lease_demand, LeaseRefusal};
 use super::summary::BANDS_PER_HEAD;
-use super::table::gap_take;
+use super::table::{gap_take, seal_take};
 use crate::kv_cache::KvFormat;
 
 /// The gap launched and not yet caught up.
@@ -54,6 +55,31 @@ struct Outstanding {
 pub struct GapSeq {
     pub seq: usize,
     pub layer_policy: Vec<CompressionPolicy>,
+}
+
+/// What one seal's gaps did, summed over its catch-ups — the outstanding
+/// gap's it waited for among them.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct GapSealed {
+    /// The seal's own jobs launched, over `gaps` gaps.
+    pub jobs: usize,
+    pub gaps: usize,
+    /// Blocks quantized in place, and rows discarded as stale.
+    pub installed: usize,
+    pub stale: usize,
+    /// Blocks deferred at the last catch-up, waiting for a later gap.
+    pub deferred: usize,
+    /// The gaps' time on the stream.
+    pub device_ms: f64,
+}
+
+impl GapSealed {
+    fn add(&mut self, c: &GapCatchUp) {
+        self.installed += c.installed;
+        self.stale += c.stale;
+        self.deferred = c.deferred;
+        self.device_ms += c.device_ms;
+    }
 }
 
 /// What one catch-up did.
@@ -245,28 +271,10 @@ impl GapCycle {
         }
         let n_layers = backings.len();
         let t_table = Instant::now();
+        let retries = self.take_retries(backings)?;
 
-        // ── The table: retries first, in groups of their own ──
-        let mut jobs: Vec<GapJob> = Vec::new();
-        let mut groups: Vec<(CompressionPolicy, Range<usize>)> = Vec::new();
-        let retried_demand = std::mem::replace(&mut self.retried_demand, [0; SizeClass::COUNT]);
-        let unsized_retry = std::mem::take(&mut self.unsized_retry);
-        // Each retried block re-read at its index: the compaction that ran
-        // since the catch-up may have moved its bands, and moves no index. One
-        // no longer a complete native block behind its cursor is dropped.
-        let refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
-        let mut retry = Vec::with_capacity(self.retry.len());
-        for (p, mut job) in std::mem::take(&mut self.retry) {
-            if let Some(bands) = requeue_at(&refs, &job)? {
-                job.bands = bands;
-                retry.push((p, job));
-            }
-        }
-        let n_retry = retry.len();
-        push_grouped(&mut jobs, &mut groups, retry);
-
-        // ── Then every sequence's complete blocks, cut to the gap's room ──
-        let mut room_blocks = self.max_jobs.saturating_sub(jobs.len()) / n_layers.max(1);
+        // ── Every sequence's complete blocks, cut to the gap's room ──
+        let mut room_blocks = self.max_jobs.saturating_sub(retries.jobs.len()) / n_layers.max(1);
         let mut taken: Vec<(&GapSeq, Range<usize>)> = Vec::new();
         for s in seqs {
             if room_blocks == 0 {
@@ -294,19 +302,130 @@ impl GapCycle {
                     })?;
                 for block in range.clone() {
                     let w = &seq.chunks_slice()[block];
-                    fresh.push((
-                        s.layer_policy[layer],
-                        GapJob {
-                            layer,
-                            seq: s.seq,
-                            block,
-                            bands: ChunkBands::from_window(w),
-                            valid_range: (i32::from(w.offset) << 8) | w.usage as i32,
-                        },
-                    ));
+                    fresh.push((s.layer_policy[layer], job_for(layer, s.seq, block, w)));
                 }
             }
         }
+        self.launch_table(backings, retries, fresh, kind, t_table)
+    }
+
+    /// Quantize sequence `seq`'s blocks of `range` now, for its seal: the
+    /// writer chunk and every partial chunk with the rest, since the sequence
+    /// takes no more writes. Waits for the outstanding gap and catches it up
+    /// first, then runs gaps — each waited for and caught up — until every
+    /// native block of the range is in place, or two in a row place nothing:
+    /// what the ground cannot cover stays native, for the seal to store as it
+    /// stands. The deferred blocks of earlier gaps lead each table, as they
+    /// lead any gap's.
+    pub fn seal(
+        &mut self,
+        backings: &[ChunkedKvBacking],
+        seq: &GapSeq,
+        range: Range<usize>,
+    ) -> Result<GapSealed> {
+        if seq.layer_policy.len() != backings.len() {
+            candle::bail!(
+                "gap seal: sequence {} has {} layer policies for {} layers",
+                seq.seq,
+                seq.layer_policy.len(),
+                backings.len()
+            );
+        }
+        let mut out = GapSealed::default();
+        let mut idle = 0;
+        loop {
+            if self.outstanding.is_some() {
+                self.wait()?;
+                out.add(&self.catch_up(backings)?);
+            }
+            let t_table = Instant::now();
+            let retries = self.take_retries(backings)?;
+            let room = self.max_jobs.saturating_sub(retries.jobs.len());
+            let Some(blocks) = seal_take(backings, seq.seq, range.clone()) else {
+                self.put_back(retries);
+                return Ok(out);
+            };
+            let mut fresh: Vec<(CompressionPolicy, GapJob)> = Vec::new();
+            for (layer, (backing, blocks)) in backings.iter().zip(&blocks).enumerate() {
+                let state = backing
+                    .state
+                    .read()
+                    .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+                let Some(s) = state.sequences.get(seq.seq).and_then(Option::as_ref) else {
+                    continue;
+                };
+                for &block in blocks.iter().take(room.saturating_sub(fresh.len())) {
+                    let w = &s.chunks_slice()[block];
+                    fresh.push((seq.layer_policy[layer], job_for(layer, seq.seq, block, w)));
+                }
+            }
+            if fresh.is_empty() {
+                self.put_back(retries);
+                return Ok(out);
+            }
+            out.jobs += fresh.len();
+            out.gaps += 1;
+            // A seal's blocks are its turn's last: decode's, for the shares.
+            self.launch_table(backings, retries, fresh, GapKind::Decode, t_table)?;
+            self.wait()?;
+            let c = self.catch_up(backings)?;
+            out.add(&c);
+            idle = if c.installed == 0 { idle + 1 } else { 0 };
+            if idle >= SEAL_STALLED_GAPS {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// The deferred blocks standing, each re-read at its index — the
+    /// compaction that ran since the catch-up may have moved its bands, and
+    /// moves no index — with their demand. One no longer a native block of its
+    /// window behind its cursor is dropped.
+    fn take_retries(&mut self, backings: &[ChunkedKvBacking]) -> Result<Retries> {
+        let demand = std::mem::replace(&mut self.retried_demand, [0; SizeClass::COUNT]);
+        let unsized_jobs = std::mem::take(&mut self.unsized_retry);
+        let refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
+        let mut jobs = Vec::with_capacity(self.retry.len());
+        for (p, mut job) in std::mem::take(&mut self.retry) {
+            if let Some(bands) = requeue_at(&refs, &job)? {
+                job.bands = bands;
+                jobs.push((p, job));
+            }
+        }
+        Ok(Retries {
+            jobs,
+            demand,
+            unsized_jobs,
+        })
+    }
+
+    /// Retries a table was not launched for, kept for the next.
+    fn put_back(&mut self, retries: Retries) {
+        self.retry = retries.jobs;
+        self.retried_demand = retries.demand;
+        self.unsized_retry = retries.unsized_jobs;
+    }
+
+    /// Lay the table out — the retries first, in groups of their own, then
+    /// `fresh` — size its demand, lease it and launch it. Nothing when the
+    /// table is empty.
+    fn launch_table(
+        &mut self,
+        backings: &[ChunkedKvBacking],
+        retries: Retries,
+        fresh: Vec<(CompressionPolicy, GapJob)>,
+        kind: GapKind,
+        t_table: Instant,
+    ) -> Result<GapQuantize> {
+        let Retries {
+            jobs: retry,
+            demand: retried_demand,
+            unsized_jobs: unsized_retry,
+        } = retries;
+        let mut jobs: Vec<GapJob> = Vec::new();
+        let mut groups: Vec<(CompressionPolicy, Range<usize>)> = Vec::new();
+        let n_retry = retry.len();
+        push_grouped(&mut jobs, &mut groups, retry);
         let n_fresh = fresh.len();
         push_grouped(&mut jobs, &mut groups, fresh);
         if jobs.is_empty() {
@@ -371,6 +490,30 @@ impl GapCycle {
             refusals: leased.refusals,
             host,
         })
+    }
+}
+
+/// Gaps in a row a seal lets place nothing before it leaves the rest native:
+/// one is a retry finding its ground, a second the same blocks refused again.
+const SEAL_STALLED_GAPS: usize = 2;
+
+/// The deferred blocks a table leads with, and their demand.
+struct Retries {
+    jobs: Vec<(CompressionPolicy, GapJob)>,
+    demand: PerClass<usize>,
+    /// How many of the last of `jobs` no summary has sized.
+    unsized_jobs: usize,
+}
+
+/// The job that converts `block` of sequence `seq` on `layer`, over its valid
+/// tokens.
+fn job_for(layer: usize, seq: usize, block: usize, w: &ChunkWindow) -> GapJob {
+    GapJob {
+        layer,
+        seq,
+        block,
+        bands: ChunkBands::from_window(w),
+        valid_range: window_of(w),
     }
 }
 

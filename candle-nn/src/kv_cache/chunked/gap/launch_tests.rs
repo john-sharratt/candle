@@ -69,33 +69,44 @@ pub(super) fn backing(device: &Device, policy: &CompressionPolicy) -> ChunkedKvB
 /// `TOKENS` of an F16 pattern sealed as one turn: native F16 bands on the GPU.
 /// The pattern varies by layer and has structure across channels, so the
 /// selection picks more than one format.
-fn seed(backing: &ChunkedKvBacking, device: &Device, base: u32) -> SealedSequence {
-    let slot = write_turn(backing, device, base);
+fn seed(backing: &ChunkedKvBacking, device: &Device, base: u32, tokens: usize) -> SealedSequence {
+    let slot = write_tokens(backing, device, base, tokens);
     backing.record_turn(slot).unwrap()
 }
 
 /// `TOKENS` of the same pattern written into a fresh live sequence, left live:
 /// its batch index.
 pub(super) fn write_turn(backing: &ChunkedKvBacking, device: &Device, base: u32) -> usize {
+    write_tokens(backing, device, base, TOKENS)
+}
+
+/// [`write_turn`] of `tokens` tokens: a partial last chunk when they are not
+/// a whole number of blocks.
+pub(super) fn write_tokens(
+    backing: &ChunkedKvBacking,
+    device: &Device,
+    base: u32,
+    tokens: usize,
+) -> usize {
     let slot = backing.alloc_sequence().unwrap();
-    backing.ensure_for_offset(slot, 0, TOKENS).unwrap();
-    let total = N_KV_HEAD * TOKENS * HEAD_DIM;
+    backing.ensure_for_offset(slot, 0, tokens).unwrap();
+    let total = N_KV_HEAD * tokens * HEAD_DIM;
     let data: Vec<f16> = (0..total)
         .map(|i| {
             let d = i % HEAD_DIM;
-            let t = (i / HEAD_DIM) % TOKENS;
+            let t = (i / HEAD_DIM) % tokens;
             let wide = if d.is_multiple_of(7) { 8.0 } else { 1.0 };
             let x = ((base as usize + i) as f32 * 0.37).sin() * wide + (t as f32) * 0.01;
             f16::from_f32(x * (1.0 + (d / 32) as f32))
         })
         .collect();
-    let k = Tensor::from_vec(data, (1, N_KV_HEAD, TOKENS, HEAD_DIM), &Device::Cpu)
+    let k = Tensor::from_vec(data, (1, N_KV_HEAD, tokens, HEAD_DIM), &Device::Cpu)
         .unwrap()
         .to_device(device)
         .unwrap();
     let v = (&k * 0.5).unwrap();
     backing.write_contiguous(slot, 0, &k, &v).unwrap();
-    backing.set_len(slot, TOKENS);
+    backing.set_len(slot, tokens);
     slot
 }
 
@@ -334,11 +345,20 @@ pub(super) fn setup(
     device: &Device,
     policy: &CompressionPolicy,
 ) -> (Vec<ChunkedKvBacking>, Vec<SealedSequence>) {
+    setup_tokens(device, policy, TOKENS)
+}
+
+/// [`setup`] over `tokens` tokens a layer.
+pub(super) fn setup_tokens(
+    device: &Device,
+    policy: &CompressionPolicy,
+    tokens: usize,
+) -> (Vec<ChunkedKvBacking>, Vec<SealedSequence>) {
     let backings: Vec<_> = (0..LAYERS).map(|_| backing(device, policy)).collect();
     let srcs = backings
         .iter()
         .enumerate()
-        .map(|(l, b)| seed(b, device, (l as u32 + 1) * 1000))
+        .map(|(l, b)| seed(b, device, (l as u32 + 1) * 1000, tokens))
         .collect();
     (backings, srcs)
 }

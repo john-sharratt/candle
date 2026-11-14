@@ -587,8 +587,25 @@ scale whichever gap quantizes them.
 - **Publishing.** `has_warm` and the residence's commit are set once the copy's
   event has completed. The persistence thread polls it with `cudaEventQuery`.
   `turn_claims::release` waits only for that.
-- **The writer chunk** is persisted as today: a native `Chunk` record that a
-  later record supersedes (`kv_tier_migration.md` §5.5).
+- **The seal gap: a turn is sealed quantized.** A turn's seal
+  (`perform_seal_and_write`, `SealAction::Turn`) quantizes the turn's last
+  native blocks itself, on the scheduler thread, before its snapshot
+  (`BatchedInferenceSession::gap_seal` → `GapCycle::seal`): the complete blocks
+  the gaps had not reached, every partial chunk and the writer chunk, each over
+  its valid tokens. The sequence takes no more writes — the scheduler empties
+  the slot once sealed — so no chunk of the range is left for a later write.
+  The seal waits out the outstanding gap and catches it up first, then runs
+  gaps of its own, each waited for and caught up, until every native block of
+  the range is in place; the deferred blocks of earlier gaps lead each of its
+  tables, as they lead any gap's, and stay standing when it is done. Two gaps
+  in a row that place nothing leave the rest native, and the seal stores it as
+  it stands. A section is not sealed this way: it attends its own build under
+  its section policy, and its seal keeps that path. A partial chunk's window
+  is the job's own (`valid_range`), so a relocated partial is re-queued at its
+  window rather than dropped (`requeue_at`).
+- **The writer chunk** of a section, and of a turn whose seal gap the ground
+  could not cover, is persisted as today: a native `Chunk` record that a later
+  record supersedes (`kv_tier_migration.md` §5.5).
 - **Hot after warm.** The hot copy is already quantized and is left alone.
   Dropping it under pressure, or as an idle demote, is a free, not a copy.
 - **The persistence thread touches no arena topology.** Its pass opens with a

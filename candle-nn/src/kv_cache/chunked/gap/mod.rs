@@ -38,13 +38,15 @@ mod lease_alloc_tests;
 #[cfg(test)]
 mod ownership_tests;
 #[cfg(all(test, feature = "cuda"))]
+mod seal_tests;
+#[cfg(all(test, feature = "cuda"))]
 mod sign_tests;
 #[cfg(any(feature = "cuda", test))]
 mod summary;
 mod table;
 
 #[cfg(feature = "cuda")]
-pub use cycle::{CatchUpHost, GapCatchUp, GapCycle, GapQuantize, GapSeq, QuantizeHost};
+pub use cycle::{CatchUpHost, GapCatchUp, GapCycle, GapQuantize, GapSealed, GapSeq, QuantizeHost};
 #[cfg(feature = "cuda")]
 pub use demand::GapKind;
 #[cfg(feature = "cuda")]

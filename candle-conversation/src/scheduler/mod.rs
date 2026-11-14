@@ -9793,6 +9793,27 @@ impl Scheduler {
             return Ok(None);
         };
 
+        // **The turn's last native blocks are quantized here, before the
+        // snapshot** (`docs/kv_quantize_in_the_gap.md` §5): the complete blocks
+        // the gaps have not reached, the partial chunks and the writer chunk —
+        // the turn takes no more writes, and its slot is emptied once sealed.
+        // The snapshot below then holds every block quantized, with the signs
+        // the gap captured from its Q. A section is left to its own seal
+        // policy, which its build attends under first.
+        if matches!(seal_action, SealAction::Turn) {
+            let _g = profile::span("seal:gap");
+            let t_gap = Instant::now();
+            match self.session.gap_seal(seal_slot.0, block_from..block_to) {
+                Ok(s) => self.kv_gap.sealed(&s),
+                Err(e) => tracing::warn!(
+                    target: "candle_conversation::scheduler::kv_gap",
+                    "seal gap for slot {seal_slot} failed: {e} — its blocks are sealed as \
+                     they stand"
+                ),
+            }
+            self.kv_gap.spent(t_gap.elapsed());
+        }
+
         // GPU-resident sealed sequences.  No CPU round-trip: the
         // substrate stores `Arc<Vec<SealedSequence>>` with the same
         // GPU `ChunkGid`s the slot just prefilled into.  The
@@ -9867,10 +9888,10 @@ impl Scheduler {
         // upstream of anything the index did.
         let turn_grid_tokens = turn_content.as_ref().map(|c| c.token_ids.len());
 
-        // Capture the whole turn's wide per-token `sign(Q)` from R16 NOW — before
+        // Capture the whole turn's wide per-token `sign(Q)` NOW — before
         // `record_turn` (below) detaches the sealed KV. All heads / all layers,
-        // un-folded. Complete while the turn's KV is R16 (`kv_lossless`); a block
-        // whose R16 is already gone (compressed) simply contributes nothing.
+        // un-folded: from a block's R16 Q while it has one, and from the signs
+        // the gap captured before it converted the block otherwise.
         // This is the LIVE turn seal (dialogue + code-read roundtrip turns) — count
         // it for the GUI's sealing phase, timing the dominant sig-gather cost.
         let t_sig = Instant::now();

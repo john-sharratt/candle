@@ -109,6 +109,49 @@ pub fn gap_take(
     range
 }
 
+/// The blocks of `range` a seal quantizes on one layer, read from `shape`:
+/// every native chunk holding tokens, from the writer boundary on. A sealed
+/// sequence takes no more writes, so its writer chunk and a partial chunk are
+/// blocks like any other — quantized over their valid tokens — and no
+/// all-layer rule applies: each layer's job stands alone, and the seal's
+/// snapshot checks the layers agree.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn seal_blocks(range: Range<usize>, shape: &LayerShape) -> Vec<usize> {
+    let start = range.start.max(shape.writer_start).max(shape.first);
+    let end = range
+        .end
+        .min(shape.first + shape.usage.len().min(shape.native.len()));
+    (start..end.max(start))
+        .filter(|&i| {
+            let at = i - shape.first;
+            shape.native[at] && shape.usage[at] > 0
+        })
+        .collect()
+}
+
+/// Every layer's blocks of `range` for a seal of sequence `batch_idx`, and the
+/// cursor moved past `range` on every layer: what the seal takes no later gap
+/// takes again. `None` when a layer does not hold the sequence.
+#[cfg(feature = "cuda")]
+pub(crate) fn seal_take(
+    backings: &[ChunkedKvBacking],
+    batch_idx: usize,
+    range: Range<usize>,
+) -> Option<Vec<Vec<usize>>> {
+    let blocks = backings
+        .iter()
+        .map(|b| {
+            b.gap_layer_shape(batch_idx, range.start)
+                .map(|shape| seal_blocks(range.clone(), &shape))
+        })
+        .collect::<Option<Vec<Vec<usize>>>>()?;
+    for b in backings {
+        let cursor = b.gap_cursor_for_seq(batch_idx).unwrap_or(0);
+        b.set_gap_cursor_for_seq(batch_idx, cursor.max(range.end));
+    }
+    Some(blocks)
+}
+
 /// `range` cut to its first `max` chunks.
 fn cut(range: Range<usize>, max: usize) -> Range<usize> {
     range.start..range.end.min(range.start.saturating_add(max))
@@ -327,6 +370,35 @@ mod tests {
         assert_eq!(cursor_after_splice(9, 2, 6, 0), 5);
         // The cursor exactly at the deletion's start stays there.
         assert_eq!(cursor_after_splice(2, 2, 6, 0), 2);
+    }
+
+    #[test]
+    fn a_seal_takes_the_writer_and_partial_chunks_too() {
+        let shape = layer(1, &[FULL, FULL, 9, FULL, 7], &[true; 5]);
+        assert_eq!(seal_blocks(0..5, &shape), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_seal_skips_quantized_and_empty_chunks_and_keeps_to_its_range() {
+        let shape = layer(
+            0,
+            &[FULL, FULL, FULL, 0, 5],
+            &[true, false, true, true, true],
+        );
+        assert_eq!(seal_blocks(0..5, &shape), vec![0, 2, 4]);
+        assert_eq!(seal_blocks(2..4, &shape), vec![2]);
+        assert!(seal_blocks(7..9, &shape).is_empty());
+    }
+
+    #[test]
+    fn a_seal_reads_only_what_its_shape_holds() {
+        let shape = LayerShape {
+            writer_start: 0,
+            first: 3,
+            usage: vec![FULL, 4],
+            native: vec![true, true],
+        };
+        assert_eq!(seal_blocks(1..9, &shape), vec![3, 4]);
     }
 
     #[test]

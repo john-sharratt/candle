@@ -11,11 +11,14 @@
 //! the convert has no record for (a head_dim other than 128 or 256, or the
 //! single-latent layout, which has its own per-band compressor) take no gap.
 
+use std::ops::Range;
 use std::time::Instant;
 
 use candle::quantized::cuda::kvhead_supported_head_dim;
 use candle::{Device, Result};
-use candle_nn::kv_cache::{gap_jobs_within, GapCatchUp, GapCycle, GapKind, GapQuantize, GapSeq};
+use candle_nn::kv_cache::{
+    gap_jobs_within, GapCatchUp, GapCycle, GapKind, GapQuantize, GapSealed, GapSeq,
+};
 
 use super::BatchedInferenceSession;
 
@@ -97,6 +100,31 @@ impl BatchedInferenceSession {
         let mut q = cycle.quantize(&self.backings, &seqs, kind)?;
         q.host.setup = setup;
         Ok(q)
+    }
+
+    /// Quantize `seq_idx`'s blocks `blocks` now, for its seal — its writer
+    /// chunk and partial chunks with the rest — under its own seal, waiting
+    /// for the gaps it runs (§5). Nothing for a sequence left native, or when
+    /// the session does not quantize. What the ground cannot cover stays
+    /// native, and the seal stores it as it stands.
+    pub fn gap_seal(&mut self, seq_idx: usize, blocks: Range<usize>) -> Result<GapSealed> {
+        if !self.gaps_quantize() {
+            return Ok(GapSealed::default());
+        }
+        let (Some(session_policy), Some(seal)) = (self.seal_policy(), self.sequence_seal(seq_idx))
+        else {
+            return Ok(GapSealed::default());
+        };
+        let Some(policy) = seal.policy(&session_policy) else {
+            return Ok(GapSealed::default());
+        };
+        let seq = GapSeq {
+            seq: seq_idx,
+            layer_policy: self.layer_seal_policies(&policy),
+        };
+        self.ensure_gap()?;
+        let cycle = self.gap.as_mut().expect("made above");
+        cycle.seal(&self.backings, &seq, blocks)
     }
 
     /// Whether a gap is outstanding — launched and not yet caught up.

@@ -124,11 +124,21 @@ fn gap_and_catch_up(
 /// The bands of `slot`'s blocks `blocks` on every layer, in table order, as
 /// they now stand in the live sequences.
 pub(super) fn live_bands(l: &Live, blocks: Range<usize>) -> Vec<Band> {
-    let elems = l.layers[0].elems_per_chunk();
+    bands_of(&l.layers, l.slot, blocks)
+}
+
+/// The bands of `slot`'s blocks `blocks` on every layer of `layers`, in
+/// table order.
+pub(super) fn bands_of(
+    layers: &[ChunkedKvBacking],
+    slot: usize,
+    blocks: Range<usize>,
+) -> Vec<Band> {
+    let elems = layers[0].elems_per_chunk();
     let mut out = Vec::new();
-    for b in &l.layers {
+    for b in layers {
         let state = b.state.read().unwrap();
-        let seq = state.sequences[l.slot].as_ref().unwrap();
+        let seq = state.sequences[slot].as_ref().unwrap();
         for blk in blocks.clone() {
             let c = &seq.chunks_slice()[blk];
             for h in 0..N_KV_HEAD {
