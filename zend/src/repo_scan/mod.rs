@@ -23,25 +23,29 @@ pub mod types;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use candle_conversation::memory_report::MemoryReport;
 use candle_conversation::projection::{self, TimelineId};
-use candle_conversation::stencil::{ThinkMode, ToolCallEnvelope, TriggerRegistry};
+use candle_conversation::stencil::{
+    HeldRules, ThinkMode, ToolCallEnvelope, TriggerRegistry, ValueHolds,
+};
 use candle_conversation::{is_stall_message, ConversationEngine, Sequence, SequenceConfig};
 use zend_tools::ToolContext;
-use zend_vfs::Oid;
+use zend_vfs::{Oid, RepoFiles};
 
 use crate::branch_ingest::keys::{branches_value, BRANCHES_KEY, CONTENT_KEY};
 use crate::branch_ingest::plan::Committed;
 use crate::branch_ingest::reader::settles_here;
 use crate::branch_ingest::units::FolderUnit;
+use crate::held_paths;
 use crate::ingest_backlog::{self, Work};
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::{Failures, IngestReport};
 use crate::ingest_snapshots::{finished, Unit};
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
+use crate::types::ToolMode;
 
 pub use binary_sniff::is_binary_sample;
 pub use dir_unit::DirUnit;
@@ -581,7 +585,7 @@ pub fn ingest_units(
         sample = ?jobs.iter().take(5).map(|j| j.unit.dir.as_str()).collect::<Vec<_>>(),
         "repo map: ingesting the folders no conversation holds yet",
     );
-    let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, layer_name)?;
+    let plan = IngestPlan::new(ctx, layer_name)?;
     let report = run_dir_pool(ctx, base, &plan, jobs, live, progress);
     crate::ingest_report::publish(PASS_NAME, report.clone());
     Ok(report)
@@ -591,13 +595,22 @@ pub fn ingest_units(
 /// conversation. Assembled once so the pool's per-unit signature stays
 /// small.
 struct IngestPlan {
-    /// `<think>` bound to [`ThinkMode::Off`]'s tree, for every folder summary
-    /// decode in the pass.
+    /// The steering every folder's decodes run under: `<think>` bound to
+    /// [`ThinkMode::Off`]'s tree, over the call grammar of the mode ingest's
+    /// tools run in ([`ToolMode::Restricted`]), every call held to the chain's
+    /// tools ([`render::CHAIN_TOOLS`]). A folder conversation that answers a
+    /// listing with another call writes one of those tools, well-formed, with
+    /// every required argument — decoded free, it wrote `file_list` with no
+    /// arguments at all, three times in a row, and sealed an apology for a
+    /// summary (`candle-conversation/`, 2026-11-14).
     ///
-    /// Compiled ONCE here rather than per directory: the compile builds an
-    /// `HfVocab`, which clones the tokenizer — a 12 MB copy per folder for a
-    /// tree that is identical every time.
+    /// Held ONCE here rather than per directory: holding decodes the
+    /// catalog's name arms, identical for every folder.
     triggers: Arc<TriggerRegistry>,
+    /// The rules each folder's path holds are built into, kept across the
+    /// pass's folders: a set built for one folder is built again only when the
+    /// repositories' paths differ ([`HeldRules`]).
+    held_rules: Mutex<HeldRules>,
     /// The call syntax this checkpoint speaks, for the chain's PREFILLED
     /// `<tool_call>`s. Asked of the dialect so the prefills cannot teach a
     /// shape the chat stencil would refuse — see [`render::render_list_call`].
@@ -605,31 +618,69 @@ struct IngestPlan {
 }
 
 impl IngestPlan {
-    fn new(
-        engine: &ConversationEngine,
-        proj_builder: &projection::Builder,
-        config: &SequenceConfig,
-        layer_name: &str,
-    ) -> anyhow::Result<Self> {
-        let layer = proj_builder
+    fn new(ctx: &RefreshContext<'_>, layer_name: &str) -> anyhow::Result<Self> {
+        let layer = ctx
+            .proj_builder
             .id_for_layer(layer_name)
             .ok_or_else(|| anyhow::anyhow!("projection schema missing '{layer_name}' layer"))?;
+        let chain_tools: Vec<String> = render::CHAIN_TOOLS.iter().map(|t| t.to_string()).collect();
+        let triggers = ctx
+            .engine
+            .holding_tools(
+                &ctx.triggers_for(ThinkMode::Off, ToolMode::Restricted),
+                &chain_tools,
+                None,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("repo map: holding its calls to the chain's tools: {e}")
+            })?;
+        calls_are_held(&triggers, ctx.engine.tokenizer().token_to_id(TOOL_CALL))?;
         // Append-only ingest layer (in-memory flag, re-applied every load): folder
         // summaries score self-local during ingest, so a summary is grounded in its
         // own folder rather than derailed by cross-directory retrieval.
-        let triggers = {
-            let en = engine;
-            en.compile_think_steering()?
-                .map(|ts| ts.registry_for(&TriggerRegistry::new(), ThinkMode::Off))
-                // No single `<think>`/`</think>` token in this vocabulary, so
-                // there is no block to steer and nothing to bind the trigger to;
-                // `compile_think_steering` has already warned. The sampler-side
-                // `apply_think_mode` still runs.
-                .unwrap_or_else(|| Arc::new(TriggerRegistry::new()))
+        ctx.engine.mark_layer_append_only(layer);
+        let envelope = ToolCallEnvelope::for_dialect(&ctx.config.dialect);
+        Ok(Self {
+            triggers,
+            held_rules: Mutex::new(HeldRules::default()),
+            envelope,
+        })
+    }
+
+    /// The pass's steering with every call's paths held to what `files` — one
+    /// folder's commit-pinned stores — holds (`docs/stencil_tree.md` §9.2): a
+    /// listing names a directory that exists, a read a file that does.
+    fn unit_triggers(
+        &self,
+        engine: &ConversationEngine,
+        files: &RepoFiles,
+    ) -> Arc<TriggerRegistry> {
+        let holds = ValueHolds {
+            fields: held_paths::holds(files),
         };
-        engine.mark_layer_append_only(layer);
-        let envelope = ToolCallEnvelope::for_dialect(&config.dialect);
-        Ok(Self { triggers, envelope })
+        let mut rules = self
+            .held_rules
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        engine.holding_values(&self.triggers, &holds, &mut rules)
+    }
+}
+
+/// The token a model opens a call with.
+const TOOL_CALL: &str = "<tool_call>";
+
+/// Refuse steering that would leave a folder's calls free: a vocabulary with a
+/// `<tool_call>` token, and no call grammar bound to it. Holding passes such a
+/// registry through unchanged, so a pass built on one decoded every call free
+/// and said nothing — the repo map ran that way, on a registry holding only the
+/// `<think>` trigger, until 2026-11-14.
+fn calls_are_held(triggers: &TriggerRegistry, call: Option<u32>) -> anyhow::Result<()> {
+    match call {
+        Some(token) if !triggers.is_trigger(token) => Err(anyhow::anyhow!(
+            "repo map: no call grammar is bound to `{TOOL_CALL}`, so a folder's calls \
+             would decode free"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1175,7 +1226,7 @@ fn process_one_dir(
         unit,
         &prefilled,
         decode_user,
-        Arc::clone(&plan.triggers),
+        plan.unit_triggers(engine, &tools.files),
         &tools,
     );
 
@@ -1525,6 +1576,24 @@ mod tests {
             dir_tags(&unit("candle/")),
             vec!["repo_map".to_string(), "candle/".to_string()],
         );
+    }
+
+    /// **A folder's calls are never left free.** Steering with no call grammar
+    /// on `<tool_call>` is refused — the registry the repo map once ran on,
+    /// the `<think>` trigger alone, is exactly that — and one that binds the
+    /// grammar there passes, as does a vocabulary with no such token.
+    #[test]
+    fn a_pass_refuses_steering_that_leaves_its_calls_free() {
+        use candle_conversation::stencil::{compile, NodeSpec, TestVocab, TreeSpec};
+        let call = 7;
+        let empty = TriggerRegistry::new();
+        assert!(calls_are_held(&empty, Some(call)).is_err());
+        assert!(calls_are_held(&empty, None).is_ok());
+        let mut spec = TreeSpec::new("call");
+        spec.root = spec.push(NodeSpec::End);
+        let tree = Arc::new(compile(&spec, &TestVocab::new()).expect("an empty walk compiles"));
+        let held = empty.with_trigger(call, tree);
+        assert!(calls_are_held(&held, Some(call)).is_ok());
     }
 
     /// Every tool the prefilled chain calls must be pinned into the catalog, or

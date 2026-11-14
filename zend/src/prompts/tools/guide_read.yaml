@@ -28,6 +28,7 @@ parameters:
       - ab-trial
       - approvals
       - ask
+      - battle-cities
       - bot-campaign
       - bot-debrief
       - bot-discord

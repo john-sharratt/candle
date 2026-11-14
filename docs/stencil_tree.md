@@ -822,6 +822,16 @@ call that was just refused for one.
   repository prefix every read fence shows (`file=candle/…`), and the read came
   back `not_found`. Held, `src/turn_layout.rs` cannot be written in `candle`,
   whose root has no `src`.
+- **An ingest's calls are held like a dialogue's.** A `repo_map` folder
+  conversation answers its listing in a tool loop, and each decode runs under
+  the restricted catalog's call grammar held to the chain's tools (`file_list`,
+  `file_read`), with each folder's paths held to its commit-pinned stores
+  (`zend/src/repo_scan/mod.rs`, `IngestPlan`). The pass refuses steering with
+  no grammar on `<tool_call>` rather than run on it: holding passes such a
+  registry through unchanged, and the repo map ran on one — the `<think>`
+  trigger alone — until 2026-11-14, decoding its calls free. Live, a folder
+  wrote `file_list` with no arguments three times, and sealed "I have enough
+  evidence from the listing to summarize" as its summary.
 - **A refused value is not offered again**, because it is not offered at all:
   the held values are read again each round from the file as it stands, so an
   anchor or a line that does not exist — the repeat the guard used to end — is
