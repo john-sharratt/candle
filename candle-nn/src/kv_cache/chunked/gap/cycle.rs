@@ -47,7 +47,7 @@ struct Outstanding {
 }
 
 /// What one catch-up did.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct GapCatchUp {
     /// Whether a gap was outstanding and has completed: false while it still
     /// runs, and when there was none.
@@ -62,6 +62,9 @@ pub struct GapCatchUp {
     pub deferred: usize,
     /// Whether the claim met a code its tables did not cover.
     pub errored: bool,
+    /// The caught-up gap's time on the stream, from its first upload to its
+    /// completion word.
+    pub device_ms: f64,
 }
 
 /// What one quantize did.
@@ -133,6 +136,7 @@ impl GapCycle {
         let Some(finished) = self.device.finished() else {
             return Ok(GapCatchUp::default());
         };
+        let device_ms = finished.device_ms();
         let Outstanding {
             jobs,
             groups,
@@ -164,6 +168,7 @@ impl GapCycle {
             moved: done.moved,
             deferred: self.retry.len(),
             errored: done.errored,
+            device_ms,
         })
     }
 

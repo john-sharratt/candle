@@ -20,7 +20,8 @@ use std::ffi::c_void;
 use std::ops::Range;
 
 use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
-use candle::cuda_backend::cudarc::driver::DevicePtr;
+use candle::cuda_backend::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+use candle::cuda_backend::cudarc::driver::{CudaEvent, DevicePtr};
 use candle::cuda_backend::kernels::simple::kv_gap_claim::{
     claim_status_words, run_kv_gap_claim, run_kv_gap_complete, MAX_CLASS, MAX_KV_HEAD, NO_OVERRIDE,
 };
@@ -122,6 +123,9 @@ pub(crate) struct GapDevice {
     outstanding: Option<u32>,
     /// The job count of the gap launched and not yet read by a catch-up.
     unread: Option<usize>,
+    /// Events on the stream around that gap's work, from its first upload to
+    /// its completion word: its device time, read once it has completed.
+    timing: Option<(CudaEvent, CudaEvent)>,
 }
 
 impl GapDevice {
@@ -187,6 +191,7 @@ impl GapDevice {
             convert: Grown(None),
             outstanding: None,
             unread: None,
+            timing: None,
         })
     }
 
@@ -206,9 +211,16 @@ impl GapDevice {
             return None;
         }
         let jobs = self.unread.take()?;
+        // Both events are behind the completion word on the stream, so both
+        // have fired. A reading that fails reports no time, not a wrong one.
+        let device_ms = self
+            .timing
+            .take()
+            .and_then(|(start, end)| start.elapsed_ms(&end).ok())
+            .map_or(0.0, f64::from);
         // SAFETY: `poll` saw this gap's completion word, and no later gap has
         // been armed: `launch` refuses while a summary is unread.
-        Some(unsafe { Finished::new(&self.summary, jobs) })
+        Some(unsafe { Finished::new(&self.summary, jobs, device_ms) })
     }
 
     /// Whether the gap last launched has completed — a load of one mapped
@@ -285,6 +297,9 @@ impl GapDevice {
 
         let stream = self.dev.cuda_stream();
         let _eager = self.dev.pause_capture()?;
+        // The gap's device time runs from here — ahead of its first upload — to
+        // its completion word.
+        let started = stream.record_event(Some(CU_EVENT_DEFAULT)).w()?;
         // The convert buffer's source half and windows; the claim writes its
         // destination half.
         {
@@ -422,6 +437,8 @@ impl GapDevice {
             stream.synchronize().w()?;
             return Err(e);
         }
+        let ended = stream.record_event(Some(CU_EVENT_DEFAULT)).w()?;
+        self.timing = Some((started, ended));
         self.outstanding = Some(completion_word(seq));
         self.unread = Some(jobs.len());
         Ok(())

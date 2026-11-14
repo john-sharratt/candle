@@ -301,6 +301,7 @@ impl MappedSummary {
 pub(crate) struct Finished<'s> {
     summary: &'s MappedSummary,
     jobs: usize,
+    device_ms: f64,
 }
 
 #[cfg(feature = "cuda")]
@@ -309,13 +310,24 @@ impl<'s> Finished<'s> {
     ///
     /// [`MappedSummary::complete`] has returned true for the gap of `jobs`
     /// jobs whose summary `summary` is, and no later gap has been armed.
-    pub(crate) unsafe fn new(summary: &'s MappedSummary, jobs: usize) -> Self {
-        Self { summary, jobs }
+    /// `device_ms` is that gap's time on the stream.
+    pub(crate) unsafe fn new(summary: &'s MappedSummary, jobs: usize, device_ms: f64) -> Self {
+        Self {
+            summary,
+            jobs,
+            device_ms,
+        }
     }
 
     /// The jobs the gap's table held.
     pub(crate) fn jobs(&self) -> usize {
         self.jobs
+    }
+
+    /// The gap's time on the stream, from its first upload to its completion
+    /// word: what it held up the forward behind it by.
+    pub(crate) fn device_ms(&self) -> f64 {
+        self.device_ms
     }
 
     /// Whether the claim met a code its tables did not cover.

@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokenizers::Tokenizer;
 
 #[cfg(feature = "cuda")]
-use crate::models::batch_test::gap_tally::GapTally;
+use crate::models::batch_test::gap_tally::{rate_ex_gap, GapTally, Window};
 #[cfg(feature = "cuda")]
 use crate::models::batch_test::graph_report::print_graph_line;
 use crate::models::batch_test::greedy::{aside_bytes, greedy_token, live_vocab, token_ids};
@@ -630,7 +630,12 @@ pub struct TestResults {
     pub sessions: Vec<TestRun>,
     pub prompt_tokens_per_sec: f64, // Tokens/sec for bulk prompt processing
     pub generate_tokens_per_sec: f64, // Tokens/sec for single token generation
-    pub all_valid: bool,            // Whether all sessions passed validation
+    /// The prompt rate with the gap's time inside the prompt clock taken out
+    /// (`gap_tally`): the forwards' own rate, an upper bound.
+    pub prompt_ex_gap_tps: f64,
+    /// The decode rate with the gap's time inside the decode clock taken out.
+    pub generate_ex_gap_tps: f64,
+    pub all_valid: bool, // Whether all sessions passed validation
     pub quantized_token_percent: Option<f64>, // Percentage of tokens stored in quantized arenas
     pub compression_ratio: Option<f64>, // Float-equivalent bytes / actual quantized bytes
     /// K's side of `compression_ratio`: its ratio and format mix.
@@ -2064,6 +2069,8 @@ impl TestParams {
         // Generate phase. Budget and early-stop live inside the driver's per
         // sequence emit sinks now, so there is nothing to track out here.
         self.device.synchronize()?;
+        #[cfg(feature = "cuda")]
+        gaps.set_window(Window::Decode);
         let generate_start = std::time::Instant::now();
         let t_decode_total = profile_now();
         // The steady-state decode loop is the hot loop the transient tier
@@ -2196,14 +2203,31 @@ impl TestParams {
         // compression ratio cover every complete block the decode wrote; the
         // writer chunk each sequence still appends to stays native, as it does
         // between a daemon's waves. Outside the clocks.
+        // The rates with the gap's time taken out, read once the settle has
+        // caught up the last gap the decode launched.
         #[cfg(feature = "cuda")]
-        {
+        let (prompt_ex_gap_tps, generate_ex_gap_tps) = {
             gaps.settle(&mut session, &self.device)?;
             eprintln!(
                 "{}",
                 gaps.line(&format!("{:?} x{}", config.mode, sequence_indices.len()))
             );
-        }
+            (
+                rate_ex_gap(
+                    prompt_tokens,
+                    prompt_duration,
+                    gaps.window_cost(Window::Prefill).total(),
+                ),
+                rate_ex_gap(
+                    generate_tokens,
+                    generate_duration,
+                    gaps.window_cost(Window::Decode).total(),
+                ),
+            )
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (prompt_ex_gap_tps, generate_ex_gap_tps) =
+            (prompt_tokens_per_sec, generate_tokens_per_sec);
 
         // Calculate quantized token percentage for quantized modes (reads the
         // post-quantize arena formats set above).
@@ -2355,6 +2379,8 @@ impl TestParams {
             sessions: runs,
             prompt_tokens_per_sec,
             generate_tokens_per_sec,
+            prompt_ex_gap_tps,
+            generate_ex_gap_tps,
             all_valid: true,
             quantized_token_percent,
             compression_ratio,
@@ -3026,9 +3052,13 @@ impl TestParams {
         }
 
         println!("\n\n=== Performance Comparison ===");
-        println!("┌──────────┬──────┬─────────┬──────────┬───────┬────────────┬──────────────┬─────────────┬───────────────┬───────────┬──────────┬────────────┬──────────┬───────┐");
-        println!("│ KvMode   │ int8 │ Batched │ Contexts │ Valid │ t/s (bulk) │ t/s (single) │ perf (bulk) │ perf (single) │ %Quantized│ Compress │ Peak Tokens│ Frontier │ Eff%  │");
-        println!("├──────────┼──────┼─────────┼──────────┼───────┼────────────┼──────────────┼─────────────┼───────────────┼───────────┼──────────┼────────────┼──────────┼───────┤");
+        // `ex-gap` is the rate with the gap quantize's host and device time
+        // inside the clock taken out (`gap_tally`): the forwards' own rate,
+        // comparable with a run that sealed outside the clocks. Host and device
+        // time can overlap, so it is an upper bound.
+        println!("┌──────────┬──────┬─────────┬──────────┬───────┬────────────┬──────────────┬─────────────┬───────────────┬─────────────┬───────────────┬───────────┬──────────┬────────────┬──────────┬───────┐");
+        println!("│ KvMode   │ int8 │ Batched │ Contexts │ Valid │ t/s (bulk) │ t/s (single) │ ex-gap bulk │ ex-gap single │ perf (bulk) │ perf (single) │ %Quantized│ Compress │ Peak Tokens│ Frontier │ Eff%  │");
+        println!("├──────────┼──────┼─────────┼──────────┼───────┼────────────┼──────────────┼─────────────┼───────────────┼─────────────┼───────────────┼───────────┼──────────┼────────────┼──────────┼───────┤");
 
         // Baseline is the first config
         let baseline = &results[0];
@@ -3086,7 +3116,7 @@ impl TestParams {
             };
 
             println!(
-                "│ {:>8} │ {:>4} │ {} │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │ {} │ {:>8} │ {:>10} │ {:>8} │ {:>5} │",
+                "│ {:>8} │ {:>4} │ {} │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11.1} │ {:>13.1} │ {:>11} │ {:>13} │ {} │ {:>8} │ {:>10} │ {:>8} │ {:>5} │",
                 mode_str,
                 int8_str,
                 batched_str,
@@ -3094,6 +3124,8 @@ impl TestParams {
                 valid_str,
                 prompt_tps,
                 generate_tps,
+                result.prompt_ex_gap_tps,
+                result.generate_ex_gap_tps,
                 prompt_perf,
                 generate_perf,
                 quant_str,
@@ -3144,12 +3176,16 @@ impl TestParams {
             // formats per turn rather than running one mode, so there is no single figure
             // to report and a number here would invite a comparison that is not available.
             println!(
-                "│ {:>8} │  eng │  engine │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │      -    │ {:>8} │ {:>10} │ {:>8} │ {:>5} │",
+                "│ {:>8} │  eng │  engine │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │ {:>11} │ {:>13} │      -    │ {:>8} │ {:>10} │ {:>8} │ {:>5} │",
                 row.label,
                 row.contexts,
                 valid_str,
                 row.prompt_tokens_per_sec,
                 row.generate_tokens_per_sec,
+                // The engine runs its own gaps through the scheduler, which
+                // reports them on its `kv_gap` line rather than per row.
+                "-",
+                "-",
                 prompt_perf,
                 generate_perf,
                 compress_str,
@@ -3159,7 +3195,7 @@ impl TestParams {
             );
         }
 
-        println!("└──────────┴──────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┴──────────┴───────┘");
+        println!("└──────────┴──────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┴──────────┴───────┘");
         let side_rows: Vec<_> = results
             .iter()
             .filter(|r| r.compression_ratio.is_some())

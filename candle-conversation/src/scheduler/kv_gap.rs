@@ -3,7 +3,8 @@
 //! and deferred, rows discarded and blocks found moved, gaps that quantized
 //! nothing because one was outstanding, jobs launched and how many led as
 //! retries, the classes whose lease came up short and the first reason given,
-//! and the time the two calls took on the scheduler thread.
+//! the time the two calls took on the scheduler thread, and the caught-up
+//! gaps' time on the stream.
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,8 @@ pub(super) struct KvGapLine {
     refused: Option<String>,
     errored: bool,
     host_us: u64,
+    /// The caught-up gaps' time on the stream.
+    device_us: u64,
 }
 
 impl KvGapLine {
@@ -41,6 +44,7 @@ impl KvGapLine {
         self.stale += c.stale as u64;
         self.moved += c.moved as u64;
         self.errored |= c.errored;
+        self.device_us += (c.device_ms * 1e3) as u64;
     }
 
     /// Fold one quantize in.
@@ -92,6 +96,7 @@ impl KvGapLine {
                 refused = self.refused.as_deref().unwrap_or(""),
                 errored = self.errored,
                 host_us = self.host_us,
+                device_us = self.device_us,
                 "kv_gap"
             );
         }
@@ -138,6 +143,7 @@ mod tests {
             stale: 1,
             moved: 1,
             errored: false,
+            device_ms: 2.5,
         });
         assert_eq!((l.gaps, l.jobs, l.retried, l.outstanding), (2, 12, 2, 1));
         assert_eq!((l.installed, l.deferred, l.stale, l.moved), (7, 2, 1, 1));
