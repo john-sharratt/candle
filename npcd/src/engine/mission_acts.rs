@@ -20,9 +20,7 @@
 //! run on `Sim` state.
 
 use super::tools::{Availability, Example, Param, Plane, Tool};
-use crate::api::now_ms;
 use crate::engine::mission::Origin;
-use crate::engine::mission_gen::round;
 use crate::sim::Sim;
 
 /// The command desk, by the part id the map gives it. A mission is taken up and
@@ -295,10 +293,6 @@ pub struct Carrying {
     pub unordered: bool,
     /// A report on what it posted waits that it has not read.
     pub unread: bool,
-    /// It takes no orders, and its world's round has an item due for it —
-    /// what the table gives it when its agenda is empty
-    /// (`docs/zen_moon_mind.md` §17.3).
-    pub round_due: bool,
     /// That mission is its carrier's own — an item of its round, or one it
     /// made for its agenda — which the engine closes when its steps are seen
     /// done, or its carrier with `mission_done`, never with a report.
@@ -321,7 +315,6 @@ pub fn carrying(s: &Sim, body: &str) -> Carrying {
             .is_some_and(|w| !w.edit_optional),
         unordered: s.missions.is_unordered(body),
         unread: s.missions.unread_for(body),
-        round_due: s.missions.is_unordered(body) && round::due_for(s, body, now_ms()),
         own: mission.is_some_and(|m| matches!(m.origin, Origin::Round { .. } | Origin::Own)),
         given: mission.is_some_and(|m| m.writes_given()),
     }
@@ -361,9 +354,10 @@ const NOT_FOR_OPERATIONS: [&str; 9] = [
 /// all.
 pub fn offered(tool: &str, c: Carrying) -> bool {
     match tool {
-        // One that takes no orders collects only its round, and only with an
-        // empty agenda and something on the round due.
-        t if t == COLLECT_MISSION.name => !c.mission && (!c.unordered || c.round_due),
+        // One that takes no orders collects nothing: its round is put on its
+        // agenda by the engine as each item comes due (`docs/zen_moon_mind.md`
+        // §17.3).
+        t if t == COLLECT_MISSION.name => !c.mission && !c.unordered,
         // The table is the poster's to give work from and read back at, and only
         // a character that takes no orders gives them. What came back is read
         // once: the reading is offered only while something new waits in it.
@@ -411,7 +405,6 @@ mod tests {
             drafts: false,
             unordered: false,
             unread: false,
-            round_due: false,
             own: false,
             given: false,
         }
@@ -476,20 +469,6 @@ mod tests {
         };
         assert!(!offered("collect_mission", unordered));
         assert!(offered("present", unordered));
-        // Unless its round has something due and its agenda is empty: then the
-        // table gives it the next item.
-        let round = Carrying {
-            round_due: true,
-            ..unordered
-        };
-        assert!(offered("collect_mission", round));
-        assert!(!offered(
-            "collect_mission",
-            Carrying {
-                mission: true,
-                ..round
-            }
-        ));
         // And it is the one the table's orders are for; nobody else posts. What
         // came back is offered only while something new waits in it.
         assert!(offered("order_post", unordered));

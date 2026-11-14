@@ -1,6 +1,6 @@
-//! The round (`docs/zen_moon_mind.md` §17.3): what the order table gives a body
-//! that takes no orders when its agenda is empty, one item at a time, in order,
-//! for ever.
+//! The round (`docs/zen_moon_mind.md` §17.3): what the engine puts on the
+//! agenda of a body that takes no orders when its agenda is empty, one item at
+//! a time, in order, for ever.
 //!
 //! One file, `rounds/<world>.yaml`. Each item is a mission's brief and steps, with when it is due:
 //! only while a condition of the world holds (`when`), and not again until a
@@ -201,20 +201,9 @@ impl Item {
     }
 }
 
-/// Whether the round has an item due for `body` at `now_ms` — what offers it
-/// `collect_mission` with an empty agenda, and what wakes it.
-pub fn due_for(sim: &Sim, body: &str, now_ms: u64) -> bool {
-    next(
-        sim.missions.round_items(),
-        sim.missions.round(),
-        Holds::of(sim, body),
-        now_ms,
-    )
-    .is_some()
-}
-
 /// Give `body` the round's next due item at `now_ms`, on its agenda at
-/// `later`. Returns the mission given, or `None` when nothing is due.
+/// `later` — what wakes it when its agenda is empty. Returns the mission
+/// given, or `None` when nothing is due.
 pub fn collect(sim: &mut Sim, body: &str, now_ms: u64) -> Option<Mission> {
     let holds = Holds::of(sim, body);
     let item = next(
@@ -399,14 +388,14 @@ mod tests {
         assert!(next(&[], &s, ALL, 0).is_none(), "no round, nothing set");
     }
 
-    /// **Zen's round, end to end in the world**: collected at the table, the
+    /// **Zen's round, end to end in the world**: put on its empty agenda, the
     /// first due item — the table is empty, so setting the work — comes onto
     /// Zen's agenda at `later` under its title; the post it makes signs the
     /// step off as it lands; the engine closes the mission done, with no
-    /// report and no chapter turned; and the next item collected is the one
-    /// after it.
+    /// report and no chapter turned; and the next item given is the one after
+    /// it.
     #[test]
-    fn zen_collects_its_round_and_the_engine_closes_what_it_saw_done() {
+    fn zen_is_given_its_round_and_the_engine_closes_what_it_saw_done() {
         use serde_json::json;
 
         use crate::engine::order_table;
@@ -427,7 +416,6 @@ mod tests {
             s.missions.set_round(round());
         });
 
-        assert!(h.sim(|s| due_for(s, "zen", 0)));
         let got = h.with_sim(|s| collect(s, "zen", 0)).unwrap();
         assert_eq!(got.prompt, "Set the work.");
         assert_eq!(

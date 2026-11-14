@@ -196,7 +196,7 @@ still told who is there.
 | Notifications | Report → the poster, with "the table is empty" when it is. Post → every Drone waiting at the table, or the one named. |
 | Idle wake | `idle:` on a personality replaces `NO_MISSION` / `YOUR_OWN_TIME` for it — in a world with no round. |
 | Zen's agenda (§17) | Several missions per body that takes no orders, by priority, the highest worked; `mission_add` / `mission_edit` / `mission_cancel`, offered anywhere to such a body; `Choices::Agenda`. |
-| The round (§17.3) | `rounds/<world>.yaml`; `collect_mission` offered to a body that takes no orders when its agenda is empty and an item is due, given by the table's anti-loop rules (`mission_gen::round`); `Origin::Round { id }`, closed by the engine when its steps are signed off. Such a body with nothing due is not woken. |
+| The round (§17.3) | `rounds/<world>.yaml`; with a body that takes no orders on an empty agenda, the next due item is put on it by the engine (`runtime::take_up_round`), chosen by the round's anti-loop rules (`mission_gen::round`); `Origin::Round { id }`, closed by the engine when its steps are signed off. Such a body with nothing due is not woken. |
 
 ## 10. Build order
 
@@ -382,9 +382,9 @@ who made it.
 
 **Zen takes no orders, but it carries missions — several at once, in order of priority — and
 they are its own.** It makes them, in answer to what it hears and sees; it changes and drops them
-as things change; and when it has none left, it goes to the order table and takes up the next of
-its **round**: the world's list of what the moon's mind is for. A Drone carries one mission set
-for it; Zen keeps an agenda.
+as things change; and when it has none left, the next of its **round** — the world's list of what
+the moon's mind is for — is put on its agenda, so it always has the next thing to move on to. A
+Drone carries one mission set for it; Zen keeps an agenda.
 
 What this replaces: an idle thought (`idle:`) names no act, so a Zen woken with it had nothing to
 land on but talk, and a loop broken out of landed on whatever act was left — the phone, the
@@ -426,12 +426,13 @@ wants a Drone to do is still posted on the order table with `order_post` — or,
 (`docs/mission_templates.md`), issued as a template with its arguments. A mission of Zen's own is
 how Zen does a thing; a post is how it has a Drone do one.
 
-### 17.3 The round: what the table gives Zen when its agenda is empty
+### 17.3 The round: what keeps Zen moving when its agenda is empty
 
-With nothing on its agenda, **Zen takes up the next item of its round with the order table's
-`collect_mission`** — the act a Drone uses, reached by Zen from wherever its attention is (§8.1),
-and offered to it only when its agenda is empty and something on the round is due. The table decides which item; Zen does not choose. With nothing
-due, Zen rests (§17.4).
+With nothing on its agenda, **the engine puts the next due item of its round on it**, and Zen is
+woken already working on it (`ROUND_TAKEN`, then the mission). Zen needs no table for this and
+takes no act to get it: `collect_mission` is a Drone's, and the table refuses it to a character
+that takes no orders. The round decides which item; Zen does not choose. With nothing due, Zen
+rests (§17.4).
 
 #### The file
 
@@ -474,7 +475,7 @@ round:
 A round that names a `when` it does not know, a malformed period, a duplicate id, or an item with
 no step, is refused whole at load, naming the file and the fault.
 
-#### Which item the table gives — the anti-loop rules
+#### Which item the round gives — the anti-loop rules
 
 - **In order, from where it left off.** The next item is the first due one after the one given
   last, wrapping round to the start. An item is **due** when its `when` holds, its `every` has
@@ -491,7 +492,7 @@ A round item collected joins the agenda at `later`, so anything Zen adds of its 
 
 With an empty agenda and nothing on the round due, **Zen is not woken** — no idle thought, no
 restated task — until something reaches it: a message, a report, a tannoy, or an item of the round
-coming due, when its idle wake is `ROUND_DUE`, which names the table's `collect_mission`. A world with no round
+coming due, which is put on its agenda and wakes it with `ROUND_TAKEN` and the mission. A world with no round
 wakes Zen with its `idle:` as before (§7).
 
 ### 17.5 Done is seen, not said

@@ -745,17 +745,29 @@ pub const NO_MISSION: &str = "Nothing has been asked of you, and you are on your
 pub const YOUR_OWN_TIME: &str = "Nobody gives you orders, and nothing is waiting on you. Your \
                                  time is your own, to spend however you choose.";
 
-/// The idle wake for a character that takes no orders, with an empty agenda,
-/// while its world's round has something due (`docs/zen_moon_mind.md` §17.3).
+/// The wake for a character that takes no orders whose empty agenda the round
+/// has just filled (`docs/zen_moon_mind.md` §17.3), followed by the mission it
+/// was given.
 ///
-/// **It names the verb's address, not only the verb.** `collect_mission` is the
-/// order table's, reached through `invoke` — from anywhere, for a character
-/// that takes no orders (`docs/zen_moon_mind.md` §8.1). Told only "take it up
-/// with `collect_mission`", Zen looked for an act of its own by that name,
-/// found none, and reasoned that it had none.
-pub const ROUND_DUE: &str = "Nothing is on your agenda, and your round has something for you. The \
-                             order table answers you from wherever your attention is: `invoke` \
-                             its `collect_mission` to take it up.";
+/// **The round is put on the agenda, never fetched.** Woken with an address to
+/// `invoke` the table's `collect_mission` at, Zen had to reach the table before
+/// its routine could begin, and a turn spent answering its channel instead left
+/// the round waiting on an act nobody took. The engine takes the item up the
+/// moment it is due, so Zen wakes already working on it.
+pub const ROUND_TAKEN: &str = "Nothing was on your agenda, so your round has given you its next \
+                               item, and it is what you are working on now.";
+
+/// Put the round's next due item on `body`'s empty agenda and say what it was
+/// given ([`ROUND_TAKEN`] and the mission) — `None` when its agenda is not
+/// empty or nothing on the round is due.
+fn take_up_round(hosted: &Hosted, body: &str) -> Option<String> {
+    hosted
+        .with_sim(|s| match s.missions.is_on_mission(body) {
+            true => None,
+            false => round::collect(s, body, crate::api::now_ms()),
+        })
+        .map(|m| format!("{ROUND_TAKEN}\n{}", m.standing_text()))
+}
 
 /// What a character is told when its mission is called off: the errand is
 /// withdrawn, nothing of it is still owed, and what it said about it earlier is
@@ -1330,25 +1342,24 @@ impl Runtime {
         // what rouses a character gone quiet. It is told its own idle thought
         // when its personality has one, and otherwise only that its time is its
         // own. See [`YOUR_OWN_TIME`].
-        let (on_mission, table_open, unordered, waits, round, round_due) = hosted.sim(|s| {
+        let (on_mission, table_open, unordered, waits, round) = hosted.sim(|s| {
             (
                 s.missions.is_on_mission(&body),
                 s.table_open,
                 s.missions.is_unordered(&body),
                 !s.missions.draws() && !s.missions.has_work_for(&body),
                 s.missions.has_round(),
-                round::due_for(s, &body, crate::api::now_ms()),
             )
         });
         if on_mission {
             return None;
         }
-        // **In a world with a round, an empty agenda is the table's to fill**
+        // **In a world with a round, an empty agenda is the round's to fill**
         // for a character that takes no orders (`docs/zen_moon_mind.md`
-        // §17.3–§17.4): sent there while something on the round is due, and
-        // with nothing due not woken to find something to say.
+        // §17.3–§17.4): the next due item is put on it here, and with nothing
+        // due it is not woken to find something to say.
         if unordered && round {
-            return round_due.then(|| ROUND_DUE.to_string());
+            return take_up_round(&hosted, &body);
         }
         let idle = self.idles.read().unwrap().get(&npc_id).cloned();
         if unordered {
@@ -1423,21 +1434,24 @@ impl Runtime {
         // the slow one that must not repeat over a long journey, and a character
         // that has arrived is out of its scope.
         let (hosted, body) = self.body_of(npc_id)?;
-        let (on_mission, table_open, unordered, waits, round_due) = hosted.sim(|s| {
+        let (on_mission, table_open, unordered, waits, round) = hosted.sim(|s| {
             (
                 s.missions.is_on_mission(&body),
                 s.table_open,
                 s.missions.is_unordered(&body),
                 !s.missions.draws() && !s.missions.has_work_for(&body),
-                s.missions.has_round() && round::due_for(s, &body, crate::api::now_ms()),
+                s.missions.has_round(),
             )
         });
-        // **The table calls an unordered character only to its round**, with
-        // an empty agenda and an item due (`docs/zen_moon_mind.md` §17.3), on
-        // the same clock that reaches a character deep in conversation — one
-        // talking on its channels never falls quiet enough for the idle wake.
+        // **An unordered character is given its round here**, with an empty
+        // agenda and an item due (`docs/zen_moon_mind.md` §17.3), on the same
+        // clock that reaches a character deep in conversation — one talking on
+        // its channels never falls quiet enough for the idle wake.
         if unordered {
-            return (!on_mission && round_due).then(|| ROUND_DUE.to_string());
+            return match !on_mission && round {
+                true => take_up_round(&hosted, &body),
+                false => None,
+            };
         }
         if on_mission || !table_open || self.at_command_table(npc_id) {
             return None;
@@ -8740,13 +8754,14 @@ mod tests {
         );
     }
 
-    /// **The table calls an unordered character to its round, and only then.**
-    /// With an empty agenda and an item due, the call rides the summons clock
-    /// that reaches a character mid-conversation; with something on its agenda,
-    /// or nothing due, it is not called.
+    /// **An unordered character's round is put on its agenda, never fetched.**
+    /// With an empty agenda and an item due, the summons clock that reaches a
+    /// character mid-conversation takes the item up and wakes it working on it,
+    /// with no act at the table; with something on its agenda it is not
+    /// woken, and the round gives nothing more until the agenda is empty again.
     #[tokio::test]
-    async fn the_table_calls_an_unordered_character_to_its_round() {
-        use crate::engine::mission::{Mission, Origin, Todo};
+    async fn an_unordered_characters_round_is_put_on_its_agenda() {
+        use crate::engine::mission::Origin;
         use npc_map::world::Where;
         let rt = vaulted();
         let hosted = rt.hosted.get(WORLD).unwrap();
@@ -8774,18 +8789,18 @@ mod tests {
         )
         .unwrap();
         hosted.with_sim(|s| s.missions.set_round(items));
-        assert_eq!(rt.table_summons(1).as_deref(), Some(ROUND_DUE));
-
-        hosted.with_sim(|s| {
-            s.missions.assign(
-                "m1",
-                Mission::new(
-                    "Its own.",
-                    vec![Todo::new("go to the command room")],
-                    Origin::Own,
-                ),
-            )
-        });
+        let woken = rt.table_summons(1).expect("the due item wakes it");
+        assert!(
+            woken.starts_with(ROUND_TAKEN) && woken.contains("Set the work."),
+            "woken already working on the item: {woken}"
+        );
+        assert_eq!(
+            hosted.sim(|s| s.missions.active("m1").map(|m| m.origin.clone())),
+            Some(Origin::Round {
+                id: "set-the-work".into()
+            }),
+            "the item is on its agenda"
+        );
         assert_eq!(
             rt.table_summons(1),
             None,

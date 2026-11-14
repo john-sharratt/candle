@@ -31,7 +31,6 @@ use std::sync::Arc;
 use doc_units::{Doc, Edit, Op, Place};
 use serde_json::{Map, Value};
 
-use crate::api::now_ms;
 use crate::engine::act::Act;
 use crate::engine::archive;
 use crate::engine::body::Outcome;
@@ -43,7 +42,7 @@ use crate::engine::mission_gen::config::{
 };
 use crate::engine::mission_gen::copied::{self, BRIEF_COPIED};
 use crate::engine::mission_gen::world::Routine;
-use crate::engine::mission_gen::{gates, leakage, rejection, round, write_template};
+use crate::engine::mission_gen::{gates, leakage, rejection, write_template};
 use crate::engine::order_table;
 use crate::engine::passage;
 use crate::engine::people;
@@ -120,27 +119,14 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     let a = &act.args;
     match act.tool {
         // **The world gives an unordered character no orders** — see
-        // [`crate::sim::missions::Missions::set_unordered`] — but with its
-        // agenda empty the table gives it the next item of its world's round
-        // (`docs/zen_moon_mind.md` §17.3), and nothing else.
-        "collect_mission" if hosted.sim(|s| s.missions.is_unordered(body)) => {
-            hosted.with_sim(|s| {
-                if s.missions.is_on_mission(body) {
-                    return Outcome::Refused(
-                        "You have work on your agenda: the table gives you your round only when \
-                         it is empty."
-                            .into(),
-                    );
-                }
-                match round::collect(s, body, now_ms()) {
-                    Some(m) => Outcome::Did(format!("You take it up.\n{}", m.standing_text())),
-                    None => Outcome::Refused(
-                        "Nothing on your round is due now. Rest until something reaches you."
-                            .into(),
-                    ),
-                }
-            })
-        }
+        // [`crate::sim::missions::Missions::set_unordered`] — and the table
+        // gives it nothing either: its round is put on its agenda as each item
+        // comes due (`docs/zen_moon_mind.md` §17.3).
+        "collect_mission" if hosted.sim(|s| s.missions.is_unordered(body)) => Outcome::Refused(
+            "The table has nothing to give you: your round comes to your agenda by itself as \
+             each item falls due."
+                .into(),
+        ),
         // The table's orders are given by a character that takes none; the
         // table does not offer them to anybody else, and refuses them if asked.
         "order_post" | "order_results" | "mission_write"
