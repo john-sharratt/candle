@@ -112,8 +112,8 @@ pub fn render(t: &TimelineDetail, offset: usize, limit: usize) -> String {
     out
 }
 
-/// What a timeline is: its id, label, conversation, layer, size, lineage and
-/// metadata.
+/// What a timeline is: its id, label, conversation, layer, size, lineage, the
+/// calibrations that write questions for it, and metadata.
 pub fn head(t: &TimelineDetail) -> String {
     let mut out = format!(
         "timeline {} — {} ({}), layer {} group {}, {} tokens, {} turns{}",
@@ -136,6 +136,11 @@ pub fn head(t: &TimelineDetail) -> String {
     );
     if t.inherited_chain.len() > 1 {
         out.push_str(&format!("\nlineage: {}", t.inherited_chain.join(" → ")));
+    }
+    // Each is a timeline of its own, read the same way: its turns are the
+    // questions the unit wrote about itself and the thinking each started.
+    if !t.calibrations.is_empty() {
+        out.push_str(&format!("\ncalibrations: {}", t.calibrations.join(", ")));
     }
     if !t.custom.is_empty() {
         // The values too: the dials a worker ran with (`dial_effort`,
@@ -395,6 +400,18 @@ mod tests {
         );
     }
 
+    /// **A calibrated unit's head names its calibrations**, after its lineage.
+    #[test]
+    fn a_calibrated_units_head_names_its_calibrations() {
+        let mut t = timeline();
+        t.calibrations = vec!["90".into(), "91".into()];
+        assert_eq!(
+            head(&t),
+            "timeline 77 — Verify (mcp:o:review/verify), layer dialogue group chat, 1200 tokens, \
+             1 turns\nlineage: 1 → 77\ncalibrations: 90, 91\nmetadata: decode_band=normal"
+        );
+    }
+
     /// **A view that reads one turn asks for it** by name.
     #[test]
     fn a_view_of_one_turn_asks_for_the_turn() {
@@ -415,6 +432,7 @@ mod tests {
             total_tokens: 1200,
             custom: BTreeMap::from([("decode_band".into(), "normal".into())]),
             inherited_chain: vec!["1".into(), "77".into()],
+            calibrations: vec![],
             peaks: vec![],
             couplings: vec![],
             turn_count: 1,

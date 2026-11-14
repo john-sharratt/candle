@@ -27,6 +27,12 @@ pub struct TimelineDetail {
     /// `forked_from` to after dropping retired ancestors and applying the
     /// token cap. A single entry means it inherits nothing.
     pub inherited_chain: Vec<String>,
+    /// The live calibrations of this conversation, in timeline order — each a
+    /// conversation whose turns are the questions a unit wrote about itself and
+    /// the thinking each started (`docs/provenance_scoped_signatures.md` §2.5),
+    /// readable through this same view. Empty for a conversation nothing
+    /// calibrates, a calibration included.
+    pub calibrations: Vec<String>,
     /// Forest peaks — the orphan summary nodes that are the window entry points.
     pub peaks: Vec<u32>,
     /// Turn indices that open a coupled exchange (a tool-call turn joined with
@@ -141,6 +147,7 @@ pub fn timeline(s: &Substrate, schema: &Schema, tl_raw: u64) -> Option<TimelineD
             .into_iter()
             .map(|t| t.raw().to_string())
             .collect(),
+        calibrations: s.calibrations_of(tl).map(|t| t.raw().to_string()).collect(),
         peaks: {
             let mut p: Vec<u32> = peak_set.into_iter().collect();
             p.sort_unstable();
@@ -154,7 +161,7 @@ pub fn timeline(s: &Substrate, schema: &Schema, tl_raw: u64) -> Option<TimelineD
 
 #[cfg(test)]
 mod tests {
-    use candle_conversation::projection::{Builder, Conversation};
+    use candle_conversation::projection::{Builder, Conversation, GroupId, LayerId};
 
     use super::*;
 
@@ -185,5 +192,27 @@ layers:
         let read = conv.read();
         assert!(timeline(&read, builder.schema(), 0).is_none());
         assert!(timeline(&read, builder.schema(), 7).is_none());
+    }
+
+    /// **A unit's view names its calibrations, and a calibration names none**:
+    /// the questions are one more read of this view away.
+    #[test]
+    fn a_units_view_lists_its_calibrations() {
+        let builder = Builder::from_yaml(SCHEMA).unwrap();
+        let conv = Conversation::ephemeral();
+        let (layer, group) = (LayerId::from_raw(1).unwrap(), GroupId::from_raw(1).unwrap());
+        let (unit, cal) = (
+            TimelineId::from_raw(81).unwrap(),
+            TimelineId::from_raw(82).unwrap(),
+        );
+        conv.register_timeline(unit, layer, group);
+        conv.register_timeline(cal, layer, group);
+        conv.set_conversation_metadata(cal, Substrate::CALIBRATES_KEY, &unit.raw().to_string())
+            .unwrap();
+        let read = conv.read();
+        let of_unit = timeline(&read, builder.schema(), unit.raw()).expect("registered");
+        assert_eq!(of_unit.calibrations, vec![cal.raw().to_string()]);
+        let of_cal = timeline(&read, builder.schema(), cal.raw()).expect("registered");
+        assert!(of_cal.calibrations.is_empty());
     }
 }
