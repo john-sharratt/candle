@@ -189,6 +189,8 @@ pub use chunked::{ArenaKey, ColdChunk, FormatCensus, StoragePolicy};
 pub use chunked::{
     DetachedChunks, LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE,
 };
+#[cfg(feature = "cuda")]
+pub use chunked::{GapCatchUp, GapCycle, GapKind, GapQuantize, LeaseRefusal};
 pub use rotating::{
     IndicesAndMask, RotatingCache, RotatingKvCache, ScatteredCacheBuilder, ScatteredKvCache,
 };

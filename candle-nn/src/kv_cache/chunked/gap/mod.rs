@@ -7,41 +7,46 @@
 //! `lease_alloc`), and the device claims among the leased slots by select code
 //! (`codes`) and converts in place (`launch`). At the next gap the catch-up
 //! puts each converted block in place of its native chunk (`install`,
-//! `assemble`).
+//! `assemble`). [`GapCycle`] keeps all of it from one gap to the next.
 
-// `assemble`, `codes`, `demand`, `install`, `launch`, `lease`, `lease_alloc` and
-// `summary` are reached from their tests alone, so the dead-code lint is
-// allowed over them.
-#[allow(dead_code)]
+// The host arithmetic (`assemble`, `demand`, `lease`, `summary`) is read only
+// by the device path; built without a device for its own tests alone.
+#[cfg(any(feature = "cuda", test))]
 mod assemble;
 #[cfg(feature = "cuda")]
-#[allow(dead_code)]
 mod codes;
-#[allow(dead_code)]
+#[cfg(feature = "cuda")]
+mod cycle;
+#[cfg(all(test, feature = "cuda"))]
+mod cycle_tests;
+#[cfg(any(feature = "cuda", test))]
 mod demand;
 #[cfg(feature = "cuda")]
-#[allow(dead_code)]
 mod install;
 #[cfg(all(test, feature = "cuda"))]
 mod install_tests;
 #[cfg(feature = "cuda")]
-#[allow(dead_code)]
 mod launch;
 #[cfg(all(test, feature = "cuda"))]
 mod launch_tests;
-#[allow(dead_code)]
+#[cfg(any(feature = "cuda", test))]
 mod lease;
 #[cfg(feature = "cuda")]
-#[allow(dead_code)]
 mod lease_alloc;
 #[cfg(all(test, feature = "cuda"))]
 mod lease_alloc_tests;
 #[cfg(test)]
 mod ownership_tests;
-#[allow(dead_code)]
+#[cfg(any(feature = "cuda", test))]
 mod summary;
 mod table;
 
+#[cfg(feature = "cuda")]
+pub use cycle::{GapCatchUp, GapCycle, GapQuantize};
+#[cfg(feature = "cuda")]
+pub use demand::GapKind;
+#[cfg(feature = "cuda")]
+pub use lease_alloc::LeaseRefusal;
 pub use table::gap_take;
 pub(crate) use table::{
     cursor_after_front_eviction, cursor_after_splice, cursor_after_truncate, LayerShape,

@@ -295,7 +295,8 @@ fn gap(
     between: &mut dyn FnMut(&mut World),
 ) -> Vec<Job> {
     let (jobs, n_retry) = w.table(retry);
-    // Demand: the retried jobs exactly, the new ones split evenly.
+    // Demand: the retried jobs exactly, the new ones the whole count to every
+    // class, as before any summary.
     let new_bands = (jobs.len() - n_retry) * N_KV_HEAD * BANDS_PER_HEAD;
     let mut reach = [false; SizeClass::COUNT];
     for &c in &CLASSES {

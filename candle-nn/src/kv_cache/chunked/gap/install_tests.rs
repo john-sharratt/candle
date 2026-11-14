@@ -32,20 +32,20 @@ use crate::kv_cache::arena_table::{ArenaLocation, N_PALETTE};
 use crate::kv_cache::{KvFormat, QuantFormat};
 
 /// Live sequences ready for a gap, and what today's seal makes of the same K/V.
-struct Live {
+pub(super) struct Live {
     /// Layers over one set of pools, as a model's are; one live sequence each.
-    layers: Vec<ChunkedKvBacking>,
-    slot: usize,
+    pub layers: Vec<ChunkedKvBacking>,
+    pub slot: usize,
     /// Today's seal of identical K/V on separate backings, band by band in
     /// table order.
-    want: Vec<Band>,
+    pub want: Vec<Band>,
     _reference: Vec<ChunkedKvBacking>,
-    cuda: CudaDevice,
-    device: Device,
+    pub cuda: CudaDevice,
+    pub device: Device,
     _gpu: GpuGuard,
 }
 
-fn live(policy: &CompressionPolicy) -> Option<Live> {
+pub(super) fn live(policy: &CompressionPolicy) -> Option<Live> {
     let (device, cuda, gpu) = cuda()?;
     // The reference: the same pattern sealed and quantized by today's path.
     let (reference, srcs) = setup(&device, policy);
@@ -78,7 +78,7 @@ fn live(policy: &CompressionPolicy) -> Option<Live> {
 
 /// The gap's jobs for `slot`: what `gap_take` hands over, layer-major.
 fn take_jobs(layers: &[ChunkedKvBacking], slot: usize) -> Vec<GapJob> {
-    let range = gap_take(layers, slot);
+    let range = gap_take(layers, slot, usize::MAX);
     assert!(!range.is_empty(), "complete blocks to take");
     let mut jobs = Vec::new();
     for (layer, b) in layers.iter().enumerate() {
@@ -122,7 +122,7 @@ fn gap_and_catch_up(
 
 /// The bands of `slot`'s blocks `blocks` on every layer, in table order, as
 /// they now stand in the live sequences.
-fn live_bands(l: &Live, blocks: Range<usize>) -> Vec<Band> {
+pub(super) fn live_bands(l: &Live, blocks: Range<usize>) -> Vec<Band> {
     let elems = l.layers[0].elems_per_chunk();
     let mut out = Vec::new();
     for b in &l.layers {
@@ -163,7 +163,7 @@ fn live_bands(l: &Live, blocks: Range<usize>) -> Vec<Band> {
 
 /// Every layer's chunk at `blk`: quantized, with a record, sealed below the
 /// writer boundary.
-fn assert_installed(l: &Live, blk: usize) {
+pub(super) fn assert_installed(l: &Live, blk: usize) {
     for b in &l.layers {
         let state = b.state.read().unwrap();
         let seq = state.sequences[l.slot].as_ref().unwrap();

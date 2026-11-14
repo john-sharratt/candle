@@ -51,11 +51,13 @@ impl<T> Default for Lease<T> {
 
 impl<T> Lease<T> {
     /// The slots each class still holds.
+    #[cfg(test)]
     pub(crate) fn held(&self) -> PerClass<usize> {
         std::array::from_fn(|c| self.slots[c].iter().flatten().count())
     }
 
     /// Whether the lease holds no slot.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.iter().all(|run| run.iter().all(Option::is_none))
     }

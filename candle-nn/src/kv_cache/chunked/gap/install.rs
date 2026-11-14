@@ -23,10 +23,10 @@ use candle::Result;
 
 use super::super::backing::ChunkedKvBacking;
 use super::super::gid_pool::ChunkGid;
-use super::super::head_gids::HeadGids;
+use super::super::head_gids::{ChunkBands, HeadGids};
 use super::super::meta_pool::{ChunkRecordSrc, MetaGid};
 use super::super::size_class::SizeClass;
-use super::super::types::ChunkWindow;
+use super::super::types::{ChunkWindow, CHUNK_SIZE};
 use super::assemble::{block_state, take_block, BlockState};
 use super::codes::CodeTables;
 use super::demand::{count_bands, PerClass};
@@ -50,6 +50,12 @@ pub(crate) struct CatchUp {
     pub retry: Vec<(usize, GapJob)>,
     /// The exact per-class demand of `retry`.
     pub retried_demand: PerClass<usize>,
+    /// Blocks whose native chunk was replaced at its index by another native
+    /// chunk while the gap ran — a compaction relocating its bands — and sits
+    /// behind the cursor: re-queued with the bands it holds now, to be
+    /// quantized afresh, never installed from what the gap read. Their demand
+    /// is not known to the slot.
+    pub requeue: Vec<(usize, GapJob)>,
     /// Every band of the gap's table counted by class, deferred or not: what
     /// the shares are recorded from.
     pub claims: PerClass<usize>,
@@ -88,6 +94,32 @@ fn locate(chunks: &[ChunkWindow], job: &GapJob) -> Option<usize> {
         return Some(job.block);
     }
     (0..chunks.len()).find(|&i| at(i))
+}
+
+/// The bands of the native chunk now at `job`'s index, when it is a complete
+/// native block behind its sequence's cursor that no gap will take again: what
+/// a compaction leaves when it relocates a block's bands while a gap reads the
+/// old ones. A chunk past the cursor is the next gap's anyway; a quantized or
+/// partial one is no block to quantize.
+pub(super) fn requeue_at(
+    backings: &[&ChunkedKvBacking],
+    job: &GapJob,
+) -> Result<Option<ChunkBands>> {
+    let backing = backings.get(job.layer).ok_or_else(|| {
+        candle::Error::Msg(format!("gap install: job layer {} out of range", job.layer))
+    })?;
+    let state = backing
+        .state
+        .read()
+        .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+    Ok(state
+        .sequences
+        .get(job.seq)
+        .and_then(Option::as_ref)
+        .filter(|s| job.block < s.gap_cursor())
+        .and_then(|s| s.chunks_slice().get(job.block))
+        .filter(|c| c.takes_writes() && c.usage as usize == CHUNK_SIZE)
+        .map(ChunkBands::from_window))
 }
 
 /// [`locate`] in `job`'s layer.
@@ -146,12 +178,15 @@ fn catch_up_inner(
         moved: 0,
         retry: Vec::new(),
         retried_demand: [0; SizeClass::COUNT],
+        requeue: Vec::new(),
         claims: [0; SizeClass::COUNT],
         errored: finished.errored(),
     };
     let mut installs: Vec<Install> = Vec::new();
     // Deferred jobs whose native chunk still stands, and where it stands now.
     let mut retry: Vec<(usize, usize)> = Vec::new();
+    // Jobs whose index now holds another native chunk behind the cursor.
+    let mut requeue: Vec<(usize, ChunkBands)> = Vec::new();
     for (j, job) in jobs.iter().enumerate() {
         let rows: Vec<HeadRow> = finished.rows(j)?;
         let deferred = finished.deferred(j)?;
@@ -166,7 +201,10 @@ fn catch_up_inner(
             }
         }
         let Some(at) = locate_in(backings, job)? else {
-            out.stale += 1;
+            match requeue_at(backings, job)? {
+                Some(bands) => requeue.push((j, bands)),
+                None => out.stale += 1,
+            }
             continue;
         };
         if at != job.block {
@@ -303,12 +341,21 @@ fn catch_up_inner(
         .iter()
         .map(|&(j, _)| group_of(groups, j))
         .collect::<Result<_>>()?;
+    let requeue_groups: Vec<usize> = requeue
+        .iter()
+        .map(|(j, _)| group_of(groups, *j))
+        .collect::<Result<_>>()?;
     let mut retry = retry.into_iter().zip(groups_of).peekable();
+    let mut requeue = requeue.into_iter().zip(requeue_groups).peekable();
     for (j, mut job) in jobs.into_iter().enumerate() {
         if retry.peek().is_some_and(|&((r, _), _)| r == j) {
             let ((_, at), g) = retry.next().expect("peeked");
             job.block = at;
             out.retry.push((g, job));
+        } else if requeue.peek().is_some_and(|((r, _), _)| *r == j) {
+            let ((_, bands), g) = requeue.next().expect("peeked");
+            job.bands = bands;
+            out.requeue.push((g, job));
         }
     }
     Ok(out)

@@ -13,7 +13,8 @@
 //! - **New blocks, by measured share.** Their band count is exact; only the
 //!   split across classes is not yet known. It is each class's peak share of
 //!   claims over the recent summaries, kept apart for prefill and decode gaps,
-//!   capped at the band count, and an even split before any summary.
+//!   capped at the band count — and before any summary, the whole count to
+//!   every reachable class.
 //!
 //! An over-estimate costs slots allocated and returned within one gap; an
 //! under-estimate defers the blocks past it, whose exact demand the next
@@ -30,11 +31,11 @@ use super::summary::HeadRow;
 pub(crate) const SHARE_WINDOW: usize = 32;
 
 /// One value per size class, in ladder order.
-pub(crate) type PerClass<T> = [T; SizeClass::COUNT];
+pub type PerClass<T> = [T; SizeClass::COUNT];
 
 /// Which forwards a gap's blocks came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GapKind {
+pub enum GapKind {
     Prefill,
     Decode,
 }
@@ -91,27 +92,29 @@ impl PeakShares {
 
 /// The slots each class leases for `new_bands` bands of blocks no summary has
 /// seen: `new_bands × peak share`, rounded up and capped at `new_bands`, for
-/// every class in `reachable`; zero for a class the level never selects. With
-/// no `peak`, `new_bands` split evenly (rounded up) across the reachable
-/// classes.
+/// every class in `reachable`; zero for a class the level never selects.
+///
+/// With no `peak` — the first gap of its kind — every reachable class leases
+/// the whole `new_bands`. The split is unknown, and real K/V concentrates in a
+/// class or two, so an even split defers most of the first gap: a prompt's
+/// worth of K/V left native for a gap more. Leasing the count to every class
+/// costs only slots returned at that gap's catch-up, once.
 pub(crate) fn new_block_demand(
     new_bands: usize,
     peak: Option<&PerClass<f32>>,
     reachable: &PerClass<bool>,
 ) -> PerClass<usize> {
     let mut demand = [0usize; SizeClass::COUNT];
-    let n_reachable = reachable.iter().filter(|&&r| r).count();
-    if new_bands == 0 || n_reachable == 0 {
+    if new_bands == 0 {
         return demand;
     }
-    let even = new_bands.div_ceil(n_reachable);
     for (c, d) in demand.iter_mut().enumerate() {
         if !reachable[c] {
             continue;
         }
         let share = match peak {
             Some(peak) => (new_bands as f64 * f64::from(peak[c])).ceil() as usize,
-            None => even,
+            None => new_bands,
         };
         *d = share.min(new_bands);
     }
@@ -174,9 +177,9 @@ mod tests {
     }
 
     #[test]
-    fn before_any_summary_new_bands_are_split_evenly() {
+    fn before_any_summary_every_reachable_class_leases_the_whole_count() {
         let d = new_block_demand(10, None, &only(&[0, 2, 3]));
-        assert_eq!(d, claims(&[(0, 4), (2, 4), (3, 4)]));
+        assert_eq!(d, claims(&[(0, 10), (2, 10), (3, 10)]));
     }
 
     #[test]
@@ -193,9 +196,9 @@ mod tests {
         let mut peak = [0f32; N];
         peak[0] = 1.0;
         assert_eq!(new_block_demand(40, Some(&peak), &only(&[0]))[0], 40);
-        // An even split of fewer bands than classes rounds up to one each.
-        let d = new_block_demand(2, None, &only(&[0, 1, 2]));
-        assert_eq!(&d[..3], &[1, 1, 1]);
+        // A peak share over one is still the count.
+        peak[0] = 1.5;
+        assert_eq!(new_block_demand(40, Some(&peak), &only(&[0]))[0], 40);
     }
 
     #[test]
@@ -232,7 +235,7 @@ mod tests {
         let d = gap_demand(&retried, 0, None, &only(&[1, 4]));
         assert_eq!(d, retried, "no new blocks: exactly the retried demand");
         let d = gap_demand(&retried, 8, None, &only(&[1, 4]));
-        assert_eq!(d, claims(&[(1, 11), (4, 7)]));
+        assert_eq!(d, claims(&[(1, 15), (4, 11)]));
     }
 
     #[test]

@@ -188,6 +188,8 @@ pub use compression_policy::{
 };
 pub use format_census::FormatCensus;
 pub use gap::gap_take;
+#[cfg(feature = "cuda")]
+pub use gap::{GapCatchUp, GapCycle, GapKind, GapQuantize, LeaseRefusal};
 pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
 pub use gpu_chunks::ChunkPin;
 pub use head_gids::HeadGids;

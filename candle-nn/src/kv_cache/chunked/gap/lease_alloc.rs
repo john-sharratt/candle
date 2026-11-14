@@ -24,7 +24,7 @@ use crate::kv_cache::arena_table::ArenaLocation;
 /// A class the pools could not fully serve: how many slots short, and the
 /// refusal that stopped the claim.
 #[derive(Debug)]
-pub(crate) struct Refusal {
+pub struct LeaseRefusal {
     pub class: usize,
     pub short: usize,
     pub why: candle::Error,
@@ -37,7 +37,7 @@ pub(crate) struct Leased {
     /// Each class's shortfall, zero where the demand was met.
     pub short: PerClass<usize>,
     /// One entry per class that came up short, with its reason.
-    pub refusals: Vec<Refusal>,
+    pub refusals: Vec<LeaseRefusal>,
 }
 
 /// A lease for `demand`, from `backing`'s pools. The pools are the model's,
@@ -56,7 +56,7 @@ pub(crate) fn lease_demand(backing: &ChunkedKvBacking, demand: &PerClass<usize>)
         let (gids, stopped) = backing.inner.alloc_chunks_for_key_upto(key, want);
         short[c] = want - gids.len();
         if let Some(why) = stopped {
-            refusals.push(Refusal {
+            refusals.push(LeaseRefusal {
                 class: c,
                 short: short[c],
                 why,

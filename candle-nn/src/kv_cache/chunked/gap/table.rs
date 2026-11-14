@@ -74,11 +74,17 @@ pub(crate) fn take_range(cursor: usize, layers: &[LayerShape]) -> Range<usize> {
     start..end.max(start)
 }
 
-/// Hand sequence `batch_idx`'s complete blocks to a gap: the chunk range every
-/// layer of `backings` has complete past the sequence's cursor, with the
-/// cursor moved past it on every layer. Empty when nothing is complete, or
-/// when a layer does not hold the sequence.
-pub fn gap_take(backings: &[ChunkedKvBacking], batch_idx: usize) -> Range<usize> {
+/// Hand at most `max_blocks` of sequence `batch_idx`'s complete blocks to a
+/// gap: the chunk range every layer of `backings` has complete past the
+/// sequence's cursor, cut to `max_blocks`, with the cursor moved past what was
+/// taken on every layer — never past a block the gap's table had no room for,
+/// which the next gap takes. Empty when nothing is complete, when `max_blocks`
+/// is zero, or when a layer does not hold the sequence.
+pub fn gap_take(
+    backings: &[ChunkedKvBacking],
+    batch_idx: usize,
+    max_blocks: usize,
+) -> Range<usize> {
     let Some(cursor) = backings
         .iter()
         .map(|b| b.gap_cursor_for_seq(batch_idx))
@@ -94,13 +100,18 @@ pub fn gap_take(backings: &[ChunkedKvBacking], batch_idx: usize) -> Range<usize>
     else {
         return 0..0;
     };
-    let range = take_range(cursor, &shapes);
+    let range = cut(take_range(cursor, &shapes), max_blocks);
     if !range.is_empty() {
         for b in backings {
             b.set_gap_cursor_for_seq(batch_idx, range.end);
         }
     }
     range
+}
+
+/// `range` cut to its first `max` chunks.
+fn cut(range: Range<usize>, max: usize) -> Range<usize> {
+    range.start..range.end.min(range.start.saturating_add(max))
 }
 
 /// The cursor after a truncate leaves `chunks` chunks: a handed block the
@@ -316,6 +327,19 @@ mod tests {
         assert_eq!(cursor_after_splice(9, 2, 6, 0), 5);
         // The cursor exactly at the deletion's start stays there.
         assert_eq!(cursor_after_splice(2, 2, 6, 0), 2);
+    }
+
+    #[test]
+    fn a_cut_keeps_the_first_blocks_and_never_runs_past_the_range() {
+        assert_eq!(cut(2..9, 3), 2..5);
+        assert_eq!(cut(2..9, 100), 2..9);
+        assert_eq!(cut(2..9, 0), 2..2);
+        assert!(cut(2..9, 0).is_empty());
+        assert_eq!(cut(4..4, 3), 4..4);
+        assert_eq!(
+            cut(usize::MAX - 1..usize::MAX, usize::MAX),
+            usize::MAX - 1..usize::MAX
+        );
     }
 
     #[test]

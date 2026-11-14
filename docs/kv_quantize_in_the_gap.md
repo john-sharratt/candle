@@ -250,8 +250,11 @@ chooses among them.**
     known. It is taken from each class's peak share of claims over the recent
     summaries, kept apart for prefill and decode gaps, and capped at the band
     count. The share is a fraction, not a volume, so a prefill arriving after an
-    idle period is leased for its own size. Before any summary exists the count
-    is split evenly across the reachable classes.
+    idle period is leased for its own size. Before any summary of its kind
+    exists, every reachable class leases the whole count: the split is unknown
+    and real K/V concentrates in a class or two, so an even split defers most
+    of the first gap — a prompt's worth of K/V native for a gap more. The
+    over-lease is returned at that gap's catch-up, once.
 
   An over-estimate costs only slots allocated and returned within one gap; an
   under-estimate defers the blocks past it, whose exact demand the summary then
@@ -581,7 +584,8 @@ Unit tests, written with the code, asserting raw expected bytes:
   past the committed offset out, a block one layer lacks out, and nothing
   before a sequence's cursor;
 - the lease for a known table: the retried blocks' exact demand plus the new
-  blocks' band count split by the recorded peak shares (evenly when there are
+  blocks' band count split by the recorded peak shares (the whole count to each
+  reachable class when there are
   none), never more than the table's band count per class, allocated lowest
   place first; and the catch-up emptying it, every slot either in an installed
   block or back in its pool;

@@ -190,7 +190,9 @@ impl GapDevice {
         })
     }
 
-    /// The summary the last gap writes.
+    /// The summary the last gap writes, read raw by the tests; everything
+    /// else reads it through [`Self::finished`].
+    #[cfg(test)]
     pub(crate) fn summary(&self) -> &MappedSummary {
         &self.summary
     }
@@ -454,7 +456,6 @@ fn check_groups(groups: &[GapGroup<'_>], n_jobs: usize) -> Result<()> {
 
 /// One group's host-side inputs.
 struct GroupPlan {
-    jobs: Range<usize>,
     /// The selection's block layout and input words — candidates and windows —
     /// uploaded with the gap's other inputs.
     inputs: Palette4Inputs,
@@ -524,7 +525,6 @@ impl GroupPlan {
             &valid_ranges,
         )?;
         Ok(Self {
-            jobs: group.jobs.clone(),
             inputs,
             thresholds: sel.thresholds,
             k_override,
