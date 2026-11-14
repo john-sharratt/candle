@@ -841,8 +841,12 @@ layers:
       # 64-token cadence (`reproject_every_n_tokens`), so the probe that
       # decides what is pulled in has seen at most this much thinking.
       think: 64
+      # Code is asked about by name: "where is `tier_fits` defined, and what
+      # calls it?" (the §9.12 battery's direct and transitive questions, and
+      # most live ones). A file's stand-ins that only ask what it is for and how
+      # it works answer none of those, so most of them name what it defines.
       prompt: |
-        Write <<n>> different questions someone working in this workspace might ask whose answer needs what you just read in `<<path>>`. Vary what they ask: what it is for, how it works, where something is done, why it is built the way it is, how to change or extend it, what it relates to. Ask them as a person would, not as a summary. At most half may name the file. Write one question per line and nothing else.
+        Write <<n>> different questions someone working in this workspace might ask whose answer needs what you just read in `<<path>>`. Most of them name, exactly as written there, a function, type, constant, field, setting or command it defines, describes or uses, and ask what a developer asks about one: where it is defined, what calls or reads it, what it does or returns, what depends on it, what breaks if it changes. The rest ask what the file is for, how it works and why it is built the way it is. Ask them as a person would, not as a summary. At most half may name the file. Write one question per line and nothing else.
       # The guides and journals the `guidance` group draws are wanted at a
       # point in a worker's own reasoning, mid-task, so their seed questions
       # are the ones a worker asks itself there (docs/guidance_layer.md §2.2).
