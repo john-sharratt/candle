@@ -32,9 +32,6 @@ use crate::engine::talk::key::{self, Party};
 use crate::engine::talk::templates::Destination;
 use crate::engine::tools::{self, Catalog, Within};
 
-/// The tokens a conversation's words may not decode.
-const BANNED: [&str; 2] = ["<think>", "<tool_call>"];
-
 /// The most a line to the party decodes: one Discord message.
 pub const LINE_TOKENS: usize = 320;
 
@@ -42,7 +39,8 @@ pub const LINE_TOKENS: usize = 320;
 pub const JOURNAL_TOKENS: usize = 480;
 
 /// How a turn's words are decoded, as part of the frame a conversation is
-/// resumed under: with no act shown to them ([`tools::show_none`]).
+/// resumed under: with no act shown to them ([`tools::show_none`]), and no
+/// brace to open a call with (`words`).
 ///
 /// **A conversation's history teaches its next words.** Words decoded while the
 /// thread's acts were still listed came out as the decision written as text —
@@ -50,7 +48,7 @@ pub const JOURNAL_TOKENS: usize = 480;
 /// how this character answers. Naming the shape in the frame means a
 /// conversation sealed under another shape is not resumed: its next turn opens
 /// a new generation and retires the old ones (§4.1).
-const WORDS_SHAPE: &str = "words: no acts shown";
+const WORDS_SHAPE: &str = "words: no acts shown, no brace";
 
 /// How much of a turn's decision its log line shows, in characters.
 const DECISION_SHOWN: usize = 600;
@@ -222,7 +220,7 @@ impl Minds {
                 let options = TurnOptions {
                     sampling: Some(self.sampling_for(Deliberation::None)),
                     max_tokens: Some(catchup::SUMMARY_TOKENS),
-                    turn_banned_tokens: self.banned(),
+                    turn_banned_tokens: self.banned_in_words(),
                     selection: sel,
                     ..Default::default()
                 };
@@ -268,7 +266,7 @@ impl Minds {
                 Destination::Journal => JOURNAL_TOKENS,
                 _ => LINE_TOKENS,
             }),
-            turn_banned_tokens: self.banned(),
+            turn_banned_tokens: self.banned_in_words(),
             selection: sel,
             ..Default::default()
         };
@@ -389,16 +387,6 @@ impl Minds {
             catchup_sealed.iter().map(String::as_str),
         );
         selection
-    }
-
-    /// The turn's banned tokens: reasoning and calls.
-    fn banned(&self) -> Vec<i32> {
-        let tok = self.engine.tokenizer();
-        BANNED
-            .iter()
-            .filter_map(|t| tok.token_to_id(t))
-            .map(|id| id as i32)
-            .collect()
     }
 
     /// Let the conversation go: once the turn's state is durable, so a resume

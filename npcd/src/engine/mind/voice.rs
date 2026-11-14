@@ -7,8 +7,9 @@
 //! the words come back, as a question put to it is.
 //!
 //! **No call and no reasoning can be decoded.** There is no grammar, so the
-//! two are banned outright: `<think>` and the dialect's call marker are taken
-//! out of the vocabulary for the turn, and the no-think selector is set.
+//! two are banned outright (`words`): `<think>`, the dialect's call marker and
+//! every token that opens a brace are taken out of the vocabulary for the turn,
+//! no act is shown, and the no-think selector is set.
 
 use std::time::Instant;
 
@@ -21,9 +22,6 @@ use crate::engine::prompt::Persona;
 use crate::engine::reflect::plain_prose;
 use crate::engine::talk::templates::Destination;
 use crate::engine::tools::{self, Within};
-
-/// The tokens a voiced turn may not decode.
-const BANNED: [&str; 2] = ["<think>", "<tool_call>"];
 
 /// What to voice, and how.
 pub struct Voicing<'a> {
@@ -61,16 +59,10 @@ impl Minds {
         if let Some(p) = self.projection.load().as_ref() {
             p.templates.offer(&mut selection, v.to);
         }
-        let tok = self.engine.tokenizer();
-        let banned: Vec<i32> = BANNED
-            .iter()
-            .filter_map(|t| tok.token_to_id(t))
-            .map(|id| id as i32)
-            .collect();
         let options = TurnOptions {
             sampling: Some(self.sampling_for(Deliberation::None)),
             max_tokens: Some(v.max_tokens),
-            turn_banned_tokens: banned,
+            turn_banned_tokens: self.banned_in_words(),
             selection,
             ..Default::default()
         };
