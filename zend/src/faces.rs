@@ -21,6 +21,7 @@ use candle_conversation::substrate::Substrate;
 use candle_conversation::{ConversationEngine, Sequence};
 
 use crate::branch_ingest::plan::Committed;
+use crate::ingest_backlog::{self, Work};
 use crate::ingest_lease::{self, Share};
 use crate::refresh_ctx::{RefreshContext, PRIMING_BAND};
 
@@ -91,7 +92,13 @@ pub fn fill(ctx: &RefreshContext<'_>, units: &[(Reading, Committed)]) -> usize {
             return 0;
         }
     };
+    // **The faces are backlog the bar shows** (`Work::Facing`): a pass seals
+    // one for every unit it read, between its reading and its calibration
+    // sweep, and a backfill is thousands — without it the strip showed nothing
+    // for the quarter-hour a corpus takes. A shutdown hands back the rest.
+    ingest_backlog::add_pending(Work::Facing, of as u64);
     let mut tally = Tally::default();
+    let mut finished = 0usize;
     for (done, (reading, unit)) in faceless.into_iter().enumerate() {
         if crate::ingest_cancel::cancelled() {
             break;
@@ -114,6 +121,8 @@ pub fn fill(ctx: &RefreshContext<'_>, units: &[(Reading, Committed)]) -> usize {
                 }
             },
         }
+        finished += 1;
+        ingest_backlog::item_done(Work::Facing, &format!("{} (face)", unit.subject));
         if (done + 1) % PROGRESS_EVERY == 0 {
             tracing::info!(
                 target: "zend::faces",
@@ -127,6 +136,7 @@ pub fn fill(ctx: &RefreshContext<'_>, units: &[(Reading, Committed)]) -> usize {
             );
         }
     }
+    ingest_backlog::drop_pending(Work::Facing, (of - finished) as u64);
     tracing::info!(
         target: "zend::faces",
         of,

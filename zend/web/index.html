@@ -3228,10 +3228,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // of the queue and is left visible; the readout on the right is what
   // REMAINS, which is the number that only ever means one thing.
   //
-  // The calibration sweep shares the bar (`calibrating`: its units still to
-  // go). It follows every reading pass and costs many times the reading — 24
-  // questions decoded per file — so the strip names it: `Calibrating` when it
-  // is all that is left, and its own count beside the rest while both run.
+  // The faces a pass seals for what it read (`facing`) and the calibration
+  // sweep that follows (`calibrating`: its units still to go) share the bar.
+  // The sweep costs many times the reading — a file's questions decoded — so
+  // the strip names each phase: `Sealing faces` or `Calibrating` when it is
+  // all that is left, and its own count beside the rest while others run.
   const INGEST_ITEM_MAX = 56;
   function ingestView(b) {
     const total = b.total || 0;
@@ -3240,14 +3241,16 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const processed = Math.min(b.processed || 0, total);
     const remaining = Math.max(0, total - processed);
     const calibrating = Math.min(b.calibrating || 0, remaining);
-    const onlyCalibrating = calibrating > 0 && calibrating === remaining;
+    const facing = Math.min(b.facing || 0, remaining - calibrating);
+    const only = (n) => n > 0 && n === remaining;
+    const beside = (n, what) => (n > 0 && !only(n) ? ' · ' + n.toLocaleString() + ' ' + what : '');
     const item = b.last_item || '';
     return {
       total, processed,
       pct: total > 0 ? Math.round((processed / total) * 100) : 0,
-      label: onlyCalibrating ? 'Calibrating' : 'Indexing',
+      label: only(calibrating) ? 'Calibrating' : only(facing) ? 'Sealing faces' : 'Indexing',
       left: remaining.toLocaleString() + ' left'
-        + (calibrating > 0 && !onlyCalibrating ? ' · ' + calibrating.toLocaleString() + ' calibrating' : ''),
+        + beside(facing, 'faces') + beside(calibrating, 'calibrating'),
       item,
       // A path's tail (the file) identifies it; its head is repeated
       // boilerplate — clamp from the left. The CSS ellipsis then handles

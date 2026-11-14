@@ -302,6 +302,7 @@ fn backlog_view(b: BacklogSnapshot) -> Value {
         "total": b.total,
         "last_item": b.last_item,
         "calibrating": b.calibrating,
+        "facing": b.facing,
     })
 }
 
@@ -373,8 +374,8 @@ mod tests {
     }
 
     /// The backlog's wire shape: every kind of work in `processed` / `total`,
-    /// and the calibration units still to go in `calibrating`; maintenance's
-    /// is the host's (`host::Maintenance`).
+    /// the calibration units still to go in `calibrating` and the faces in
+    /// `facing`; maintenance's is the host's (`host::Maintenance`).
     #[test]
     fn the_backlog_keeps_its_wire_shape() {
         assert_eq!(
@@ -383,12 +384,14 @@ mod tests {
                 total: 9,
                 last_item: Some("src/lib.rs (calibrated)".into()),
                 calibrating: 4,
+                facing: 1,
             }),
             json!({
                 "processed": 3,
                 "total": 9,
                 "last_item": "src/lib.rs (calibrated)",
                 "calibrating": 4,
+                "facing": 1,
             })
         );
     }

@@ -40,8 +40,8 @@ const lineOf = (body, tenant) => (body.tenants || {})[tenant] || null;
  * member's. Each member counts what it read itself as it reads, and its
  * peers' units only once it has nothing left of its own, so what the cluster
  * has done is their sum, never more than the total. The calibration units
- * still to go are planned the same way, so the largest member's count is
- * the cluster's. The item named is the one being read by the member with the
+ * and the faces still to go are planned the same way, so the largest
+ * member's count of each is the cluster's. The item named is the one being read by the member with the
  * most still to go. `null` when no member has a backlog. */
 function clusterBacklog(members, tenant) {
   const backlogs = members
@@ -58,6 +58,7 @@ function clusterBacklog(members, tenant) {
     total,
     last_item: busiest.last_item ?? null,
     calibrating: most('calibrating'),
+    facing: most('facing'),
   };
 }
 

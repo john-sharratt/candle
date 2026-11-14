@@ -11,12 +11,14 @@
 //! and counts only units that are actually RUN — a unit already committed is
 //! not backlog.
 //!
-//! **Reading and calibrating are counted apart** ([`Work`]) and reported
-//! together: the bar's fill is all of it, and the calibration units still to
-//! go are named on their own, so a sweep of 24-question calibrations — which
-//! costs many times the reading it follows — reads as calibration and not as
-//! indexing. Each kind settles to empty on its own, so one kind's batch ending
-//! never clears the other's count.
+//! **Reading, facing and calibrating are counted apart** ([`Work`]) and
+//! reported together: the bar's fill is all of it, and the faces and the
+//! calibration units still to go are named on their own, so the faces a pass
+//! seals for every unit it read (`crate::faces::fill`) and the calibration
+//! sweep — which costs many times the reading it follows — read as what they
+//! are and not as indexing, and a pass between its reading and its sweep is
+//! never a daemon showing nothing. Each kind settles to empty on its own, so
+//! one kind's batch ending never clears another's count.
 //!
 //! A process-global, mirroring [`crate::ingest_report`]'s `publish`/`latest`
 //! shape: the counter is written from deep inside `repo_scan::run_dir_pool`
@@ -32,6 +34,8 @@ pub enum Work {
     Reading,
     /// A read unit asked for its questions and calibrated with them.
     Calibrating,
+    /// A read unit given the face a dialogue places it by (`crate::faces`).
+    Facing,
 }
 
 /// Snapshot for the API. `total == 0` never reaches the wire — see
@@ -44,6 +48,8 @@ pub struct BacklogSnapshot {
     pub last_item: Option<String>,
     /// Calibration units still to go — part of `total - processed`.
     pub calibrating: u64,
+    /// Faces still to seal — part of `total - processed`.
+    pub facing: u64,
 }
 
 #[derive(Default)]
@@ -71,6 +77,7 @@ impl Count {
 struct BacklogState {
     reading: Count,
     calibrating: Count,
+    facing: Count,
     last_item: Option<String>,
 }
 
@@ -79,14 +86,19 @@ impl BacklogState {
         match work {
             Work::Reading => &mut self.reading,
             Work::Calibrating => &mut self.calibrating,
+            Work::Facing => &mut self.facing,
         }
     }
 
-    /// Settle `work`'s count, and forget the last item once nothing of either
+    fn total(&self) -> u64 {
+        self.reading.total + self.calibrating.total + self.facing.total
+    }
+
+    /// Settle `work`'s count, and forget the last item once nothing of any
     /// kind is pending.
     fn settle(&mut self, work: Work) {
         self.count(work).settle();
-        if self.reading.total == 0 && self.calibrating.total == 0 {
+        if self.total() == 0 {
             self.last_item = None;
         }
     }
@@ -146,15 +158,16 @@ impl IngestBacklog {
     /// `None` when nothing is pending — the GUI hides the bar on this.
     pub fn snapshot(&self) -> Option<BacklogSnapshot> {
         let s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let total = s.reading.total + s.calibrating.total;
+        let total = s.total();
         if total == 0 {
             return None;
         }
         Some(BacklogSnapshot {
-            processed: s.reading.processed + s.calibrating.processed,
+            processed: s.reading.processed + s.calibrating.processed + s.facing.processed,
             total,
             last_item: s.last_item.clone(),
             calibrating: s.calibrating.left(),
+            facing: s.facing.left(),
         })
     }
 }
@@ -185,7 +198,7 @@ pub fn snapshot() -> Option<BacklogSnapshot> {
 
 #[cfg(test)]
 mod tests {
-    use super::Work::{Calibrating, Reading};
+    use super::Work::{Calibrating, Facing, Reading};
     use super::*;
 
     #[test]
@@ -200,6 +213,7 @@ mod tests {
                 total: 3,
                 last_item: None,
                 calibrating: 0,
+                facing: 0,
             })
         );
         b.item_done(Reading, "a.rs");
@@ -211,6 +225,7 @@ mod tests {
                 total: 3,
                 last_item: Some("b.rs".to_string()),
                 calibrating: 0,
+                facing: 0,
             })
         );
         b.item_done(Reading, "c.rs");
@@ -231,6 +246,7 @@ mod tests {
                 total: 2,
                 last_item: None,
                 calibrating: 0,
+                facing: 0,
             }),
             "a later pass must not inherit the prior pass's counts",
         );
@@ -264,6 +280,7 @@ mod tests {
                 total: 2,
                 last_item: Some("a".to_string()),
                 calibrating: 0,
+                facing: 0,
             }
         );
         // A file changed mid-drain: more work, not a miscount.
@@ -313,6 +330,7 @@ mod tests {
                 total: 7,
                 last_item: Some("a.rs (calibrated)".to_string()),
                 calibrating: 4,
+                facing: 0,
             })
         );
         b.item_done(Reading, "b.rs");
@@ -324,6 +342,7 @@ mod tests {
                 total: 5,
                 last_item: Some("c.rs".to_string()),
                 calibrating: 4,
+                facing: 0,
             }),
             "the reading settled on its own; the sweep's count stands",
         );
@@ -344,5 +363,39 @@ mod tests {
             b.item_done(Calibrating, "x (calibrated)");
         }
         assert_eq!(b.snapshot(), None);
+    }
+
+    /// **A pass between its reading and its sweep still shows**: the faces it
+    /// seals are backlog in their own name, counted with the rest and settling
+    /// on their own.
+    #[test]
+    fn faces_are_backlog_in_their_own_name() {
+        let b = IngestBacklog::new();
+        b.add_pending(Facing, 3);
+        b.item_done(Facing, "candle/a.rs (face)");
+        assert_eq!(
+            b.snapshot(),
+            Some(BacklogSnapshot {
+                processed: 1,
+                total: 3,
+                last_item: Some("candle/a.rs (face)".to_string()),
+                calibrating: 0,
+                facing: 2,
+            })
+        );
+        b.add_pending(Calibrating, 4);
+        b.item_done(Facing, "candle/b.rs (face)");
+        b.item_done(Facing, "candle/c.rs (face)");
+        assert_eq!(
+            b.snapshot(),
+            Some(BacklogSnapshot {
+                processed: 0,
+                total: 4,
+                last_item: Some("candle/c.rs (face)".to_string()),
+                calibrating: 4,
+                facing: 0,
+            }),
+            "the faces settled on their own; the sweep's count stands",
+        );
     }
 }
