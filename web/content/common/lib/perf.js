@@ -34,14 +34,16 @@ const last = (a) => a[a.length - 1] || {};
 const tokPerSec = (w) => (w.ws > 0 ? w.tok / (w.ws / 1000) : 0);
 
 /* One hue per scheduler phase, so the flip between small-batch decode and
- * large-batch prefill reads at a glance rather than by hunting a legend. */
+ * large-batch prefill reads at a glance rather than by hunting a legend.
+ * `kv_gap` is the K/V quantize the loop runs between forwards; `blocked` is
+ * only what no band names. */
 const PHASES = ['decode', 'prefill', 'projection', 'sealing', 'eviction', 'allocation',
-  'requests', 'housekeeping', 'blocked', 'sync', 'idle'];
+  'requests', 'housekeeping', 'kv_gap', 'blocked', 'sync', 'idle'];
 const PH = {
   decode: 'var(--ok)', prefill: 'var(--info)',
   projection: '#c084fc', sealing: 'var(--warn)', eviction: 'var(--crit)',
   allocation: '#94a3b8', requests: '#2dd4bf', housekeeping: '#a3e635',
-  blocked: '#ec4899', sync: '#e11d48', idle: 'var(--line-2)',
+  kv_gap: '#fb923c', blocked: '#ec4899', sync: '#e11d48', idle: 'var(--line-2)',
 };
 
 /* The card's bands, bottom of the stack first: what was there before us, the

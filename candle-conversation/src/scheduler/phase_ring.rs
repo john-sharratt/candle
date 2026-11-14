@@ -146,6 +146,11 @@ pub enum PhaseKind {
     /// queue + `flush_blocking` waiting on the hot→warm drain. The backpressure
     /// stall, distinct from Idle (no work) and Blocked (unattributed remainder).
     Sync,
+    /// The gap quantize between forwards (`docs/kv_quantize_in_the_gap.md`): the
+    /// last gap's catch-up installing its converted blocks, this gap's launch, and
+    /// the one native residence quantized a gap. Scheduler-thread work outside
+    /// every quantum, so without its own band it read as [`PhaseKind::Blocked`].
+    KvGap,
 }
 
 impl PhaseKind {
@@ -162,6 +167,7 @@ impl PhaseKind {
             PhaseKind::Requests => "requests",
             PhaseKind::Housekeeping => "housekeeping",
             PhaseKind::Sync => "sync",
+            PhaseKind::KvGap => "kv_gap",
         }
     }
 }
@@ -908,6 +914,7 @@ mod tests {
     fn requests_phase_has_stable_key() {
         assert_eq!(PhaseKind::Requests.as_str(), "requests");
         assert_eq!(PhaseKind::Housekeeping.as_str(), "housekeeping");
+        assert_eq!(PhaseKind::KvGap.as_str(), "kv_gap");
     }
 
     #[test]

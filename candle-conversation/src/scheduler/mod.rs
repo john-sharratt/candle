@@ -65,6 +65,8 @@ mod paused_creep;
 mod pending_ranges;
 pub mod phase_ring;
 mod phase_split;
+#[cfg(test)]
+mod phase_window_tests;
 mod piece_identity;
 mod piece_splice;
 mod pinned_report;
@@ -2560,6 +2562,11 @@ struct WaveStats {
     /// Real scheduler work, none of it inside a quantum, and none of it timed
     /// before — so it landed in the unattributed remainder and drew as "blocked".
     housekeeping_us: u64,
+    /// KvGap phase this window: the gap quantize the loop runs between forwards
+    /// — the last gap's catch-up, this gap's launch, and the native residence
+    /// quantized a gap (`docs/kv_quantize_in_the_gap.md`). Outside every quantum,
+    /// so untimed it drew as "blocked". Microseconds, as [`Self::requests_us`].
+    kv_gap_us: u64,
     /// Sync phase this window: deliberate GPU/persistence waits ([`WAIT_US`],
     /// swapped in at flush). Carved out of the compute phases + blocked so a
     /// device-sync / hot→warm flush stall is its own band, not hidden decode/prefill.
@@ -2623,6 +2630,7 @@ impl WaveStats {
             idle_ms: 0,
             requests_us: 0,
             housekeeping_us: 0,
+            kv_gap_us: 0,
             wait_ms: 0,
             maint_ms: 0,
             drain_prefill_ms: 0,
@@ -2712,6 +2720,11 @@ impl WaveStats {
     /// truncation hazard as [`Self::add_requests`].
     fn add_housekeeping(&mut self, us: u64) {
         self.housekeeping_us += us;
+    }
+
+    /// Accumulate one gap-quantize span — see [`Self::kv_gap_us`].
+    fn add_kv_gap(&mut self, us: u64) {
+        self.kv_gap_us += us;
     }
 
     /// Accumulate one scope-ingest seal's sub-step timings (microseconds).
@@ -3102,6 +3115,7 @@ impl WaveStats {
         self.idle_ms = 0;
         self.requests_us = 0;
         self.housekeeping_us = 0;
+        self.kv_gap_us = 0;
         self.wait_ms = 0;
         self.maint_ms = 0;
         self.drain_prefill_ms = 0;
@@ -3168,6 +3182,9 @@ impl WaveStats {
         // ever in the remainder. Carved BEFORE sealing, because the turn-reprefill
         // seal runs inside it and sealing must be able to take from it.
         let mut housekeeping_dur = carve_ms(self.housekeeping_us / 1000, &mut [&mut blocked_dur]);
+        // The gap quantize runs between forwards, outside every quantum, so its
+        // time is only ever in the remainder too.
+        let kv_gap_dur = carve_ms(self.kv_gap_us / 1000, &mut [&mut blocked_dur]);
 
         // Sealing runs in two places: the compression-turn seal inside
         // HOUSEKEEPING (`complete_compression_turn` → `perform_seal_and_write`,
@@ -3302,6 +3319,9 @@ impl WaveStats {
         }
         if requests_dur > 0 {
             push(&mut phases, PhaseKind::Requests, requests_dur, 0, 0);
+        }
+        if kv_gap_dur > 0 {
+            push(&mut phases, PhaseKind::KvGap, kv_gap_dur, 0, 0);
         }
         // Drained EVERY window, unconditionally — the sub-timers accumulate on
         // every wave, but the band they decompose is carved out of `blocked`,

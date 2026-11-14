@@ -1366,6 +1366,10 @@ impl Scheduler {
             // §3): the last gap's converted blocks go in place and its lease goes back
             // to the pools, so the arena creation and compaction below see every slot
             // the lease no longer needs.
+            // **Every span below is timed into its band** — the gap's own calls
+            // into `kv_gap`, the arena creation, compaction and idle demote into
+            // `housekeeping` — so the phase chart names them. Untimed, all of it
+            // fell into the window's remainder and drew as `blocked`.
             let t_gap = Instant::now();
             match self.session.gap_catch_up() {
                 Ok(c) => self.kv_gap.caught_up(&c),
@@ -1374,7 +1378,10 @@ impl Scheduler {
                     "gap catch-up failed: {e}"
                 ),
             }
-            self.kv_gap.spent(t_gap.elapsed());
+            let caught_up = t_gap.elapsed();
+            self.kv_gap.spent(caught_up);
+            self.wave_stats.add_kv_gap(caught_up.as_micros() as u64);
+            let t_upkeep = Instant::now();
             match self.session.create_deferred_arenas() {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(
@@ -1391,6 +1398,8 @@ impl Scheduler {
                 let _g = super::profile::span("loop:compact_kv");
                 self.compact_kv_if_fragmented();
             }
+            self.wave_stats
+                .add_housekeeping(t_upkeep.elapsed().as_micros() as u64);
             // **Then this gap's quantize**, over every complete block the wave's
             // forwards left — after compaction, so its lease is allocated over the
             // packed pools, the lowest-placed arenas first. A wave that ran prefill or
@@ -1415,6 +1424,9 @@ impl Scheduler {
                 // A turn stored with native chunks — its seal gap short of
                 // ground — is quantized here, one a gap.
                 self.quantize_a_native_residence();
+                self.wave_stats
+                    .add_kv_gap(t_gap.elapsed().as_micros() as u64);
+                let t_demote = Instant::now();
                 // **The counterpart to elevate** (`docs/vram_governor_design.md`
                 // §8.1), here between forwards, where every free is ordered
                 // behind the forward that last read the block: drop the hot
@@ -1423,6 +1435,8 @@ impl Scheduler {
                 // the same bytes. Without it the hot set only grows, and every
                 // shortfall is met by conceding expert-weight ground.
                 self.demote_idle_hot();
+                self.wave_stats
+                    .add_housekeeping(t_demote.elapsed().as_micros() as u64);
                 self.kv_gap.flush_due(Instant::now());
             }
 
