@@ -6,9 +6,10 @@ use super::super::arena::ArenaKey;
 use super::super::compress::band_ptr;
 use super::super::compression_policy::CompressionPolicy;
 use super::super::gid_pool::ChunkGid;
+use super::super::region_pool::{purchase_closed, without_purchase};
 use super::super::size_class::{class_for_format, SizeClass};
 use super::super::ChunkedKvBacking;
-use super::demand::PerClass;
+use super::demand::{GapDemand, PerClass};
 use super::launch_tests::{backing, cuda};
 use super::lease::Lease;
 use super::lease_alloc::lease_demand;
@@ -32,11 +33,25 @@ fn two_classes(backing: &ChunkedKvBacking, a: usize, b: usize) -> (usize, usize,
     (q8, q4, demand)
 }
 
-/// A lease for `demand` and each class's shortfall — and every class that came
-/// up short reported with its reason, exactly once.
+/// A lease for `demand`, all of it firm, and each class's shortfall — and
+/// every class that came up short reported with its reason, exactly once.
 pub(super) fn leased(
     b: &ChunkedKvBacking,
     demand: &PerClass<usize>,
+) -> candle::Result<(Lease<ChunkGid>, PerClass<usize>)> {
+    leased_with(
+        b,
+        &GapDemand {
+            firm: *demand,
+            spare: [0; SizeClass::COUNT],
+        },
+    )
+}
+
+/// [`leased`] for a demand with spare parts.
+fn leased_with(
+    b: &ChunkedKvBacking,
+    demand: &GapDemand,
 ) -> candle::Result<(Lease<ChunkGid>, PerClass<usize>)> {
     let l = lease_demand(b, demand)?;
     let short_classes: Vec<usize> = (0..SizeClass::COUNT).filter(|&c| l.short[c] > 0).collect();
@@ -79,6 +94,53 @@ fn a_lease_holds_exactly_the_demand_each_slot_at_its_address() {
             .unwrap();
         assert_eq!(addrs, image.addrs[off..off + len], "class {c}");
     }
+}
+
+/// A spare part is leased beside the firm one, from ground standing free, and
+/// counts as no shortfall: the lease holds both, and both go back on release.
+#[test]
+fn a_spare_part_is_leased_from_free_ground_beside_the_firm_one() {
+    let Some((device, _cuda, _gpu)) = cuda() else {
+        return;
+    };
+    let b = backing(&device, &CompressionPolicy::new(5));
+    let (q8, q4, firm) = two_classes(&b, 30, 4);
+    let (_, _, spare) = two_classes(&b, 12, 9);
+    let demand = GapDemand { firm, spare };
+    let (mut lease, short) = leased_with(&b, &demand).unwrap();
+    assert_eq!(short, [0; SizeClass::COUNT]);
+    let held = lease.held();
+    assert_eq!(
+        (held[q8], held[q4]),
+        (42, 13),
+        "free ground covers both parts"
+    );
+    let free = [q8, q4].map(|c| b.inner.pool.free_slots(key(c)));
+    drop(lease.release());
+    assert_eq!(b.inner.pool.free_slots(key(q8)), free[0] + 42);
+    assert_eq!(b.inner.pool.free_slots(key(q4)), free[1] + 13);
+}
+
+/// The spare part never buys: purchase is closed for the length of the scope,
+/// a nested scope leaves it closed for the outer one, and leaving — by return
+/// or by unwind — reopens it, so no later claim on the thread is refused
+/// ground it may buy.
+#[test]
+fn purchase_is_closed_inside_the_scope_and_reopened_after_it() {
+    assert!(!purchase_closed());
+    let seen = without_purchase(|| {
+        let inner = without_purchase(purchase_closed);
+        (inner, purchase_closed())
+    });
+    assert_eq!(
+        seen,
+        (true, true),
+        "closed inside, still closed after a nested scope"
+    );
+    assert!(!purchase_closed(), "reopened on return");
+    let unwound = std::panic::catch_unwind(|| without_purchase(|| panic!("unwound")));
+    assert!(unwound.is_err());
+    assert!(!purchase_closed(), "reopened on unwind");
 }
 
 #[test]

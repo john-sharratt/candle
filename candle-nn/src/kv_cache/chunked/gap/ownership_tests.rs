@@ -307,11 +307,11 @@ fn gap(
     for &c in &CLASSES {
         // The ground gives what it has, sometimes less than asked.
         let short = if w.rng.below(4) == 0 {
-            w.rng.below(demand[c] as u64 + 1) as usize
+            w.rng.below(demand.total(c) as u64 + 1) as usize
         } else {
             0
         };
-        lease.add(c, alloc(&w.pool, c, demand[c] - short));
+        lease.add(c, alloc(&w.pool, c, demand.total(c) - short));
     }
     let lease_len = lease.held();
     let (rows, deferred) = reference_claim(&jobs, &lease_len);

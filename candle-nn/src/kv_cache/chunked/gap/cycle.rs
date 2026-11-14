@@ -18,6 +18,7 @@
 //! no cursor moves past a block no gap will convert.
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use candle::{CudaDevice, Device, Result};
 
@@ -78,6 +79,21 @@ pub struct GapQuantize {
     /// Slots each class's lease came up short of its demand, with why.
     pub short: PerClass<usize>,
     pub refusals: Vec<LeaseRefusal>,
+    /// Where the call's host time went.
+    pub host: QuantizeHost,
+}
+
+/// The host time of one quantize, by phase.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QuantizeHost {
+    /// Building the gap's state, on the first gap of a session.
+    pub setup: Duration,
+    /// The table: retries re-read, blocks taken, jobs grouped.
+    pub table: Duration,
+    /// Demand sized and leased from the pools.
+    pub lease: Duration,
+    /// The host images, the uploads and the launches.
+    pub launch: Duration,
 }
 
 /// The gap's state, kept by the scheduler from gap to gap.
@@ -196,6 +212,7 @@ impl GapCycle {
             );
         }
         let n_layers = backings.len();
+        let t_table = Instant::now();
 
         // ── The table: retries first, in groups of their own ──
         let mut jobs: Vec<GapJob> = Vec::new();
@@ -263,6 +280,11 @@ impl GapCycle {
         }
 
         // ── Demand, lease, launch ──
+        let mut host = QuantizeHost {
+            table: t_table.elapsed(),
+            ..QuantizeHost::default()
+        };
+        let t_lease = Instant::now();
         let n_kv_head = backings[0].n_kv_head();
         let new_bands = (n_fresh + unsized_retry.min(n_retry)) * n_kv_head * BANDS_PER_HEAD;
         let reach = reachable(&groups, backings[0].elems_per_chunk())?;
@@ -270,6 +292,8 @@ impl GapCycle {
         let demand = gap_demand(&retried_demand, new_bands, peak.as_ref(), &reach);
         let leased = lease_demand(&backings[0], &demand)?;
         let mut lease = leased.lease;
+        host.lease = t_lease.elapsed();
+        let t_launch = Instant::now();
         let launched = {
             let refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
             let gap_groups: Vec<GapGroup<'_>> = groups
@@ -296,6 +320,7 @@ impl GapCycle {
             self.unsized_retry = self.retry.len();
             return Err(e);
         }
+        host.launch = t_launch.elapsed();
         self.seq = self.seq.wrapping_add(1);
         let n_jobs = jobs.len();
         self.outstanding = Some(Outstanding {
@@ -310,6 +335,7 @@ impl GapCycle {
             retried: n_retry,
             short: leased.short,
             refusals: leased.refusals,
+            host,
         })
     }
 }

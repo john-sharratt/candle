@@ -248,7 +248,7 @@ impl Drop for RegionHandle {
                 );
             }
             pool.owned[self.index] = false;
-            pool.dirty_epoch[self.index] = pool.quiesce_epoch;
+            pool.dirt[self.index] = Dirt::any(pool.quiesce_epoch);
             pool.free.push(Reverse(self.index));
             pool.live -= 1;
             log::debug!("region {} released, {} live", self.index, pool.live);
@@ -369,6 +369,62 @@ pub struct RegionStats {
     pub tiers_placed: u64,
 }
 
+/// [`Dirt::on`] for bytes any stream may still be touching.
+const ANY_STREAM: usize = 0;
+
+/// What a region's previous tenant left behind: when, and who may still be at
+/// it.
+///
+/// **The stream is what lets a claim skip the device-wide wait.** A released
+/// KV arena may still be read by the persistence thread's copy stream, so only
+/// a context-wide synchronise retires its readers. The wave transient tier is
+/// written and read on the compute stream alone — every forward re-places it
+/// over the same ground with no wait at all — so ground it leaves is retired,
+/// for a claim on that stream, by stream order: the claim's clean is queued
+/// behind the forward. Bytes left by tenants of both kinds within one epoch
+/// count as any stream's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Dirt {
+    /// The quiesce epoch when its bytes last belonged to someone else; zero
+    /// for never.
+    epoch: u64,
+    /// The one stream whose work alone may still touch them (its raw handle),
+    /// or [`ANY_STREAM`].
+    on: usize,
+}
+
+impl Dirt {
+    /// Left by a tenant any stream may be reading, at `epoch`.
+    fn any(epoch: u64) -> Self {
+        Self {
+            epoch,
+            on: ANY_STREAM,
+        }
+    }
+
+    /// The same region left again, at `epoch`, by a tenant only `on` touches
+    /// (or any stream, for [`ANY_STREAM`]): bytes still pending from an earlier
+    /// tenant this epoch keep their own readers.
+    fn left(self, epoch: u64, on: usize) -> Self {
+        let on = if self.epoch == epoch && self.on != on {
+            ANY_STREAM
+        } else {
+            on
+        };
+        Self { epoch, on }
+    }
+
+    /// Whether a claim on `stream` at `epoch` must quiesce the device first.
+    fn needs_sync(self, epoch: u64, stream: usize) -> bool {
+        self.epoch == epoch && (self.on == ANY_STREAM || self.on != stream)
+    }
+}
+
+/// A stream's identity for [`Dirt::on`].
+fn stream_id(stream: &CudaStream) -> usize {
+    stream.cu_stream() as usize
+}
+
 struct RegionPool {
     reservation: Reservation,
     /// Device bytes in use just before this pool reserved its span — see
@@ -472,13 +528,15 @@ struct RegionPool {
     /// what lets the counter below turn a per-claim wait into a per-batch one.
     quiesce_epoch: u64,
     /// Per region, the epoch current when its bytes last belonged to someone
-    /// else. **Zero means never** — the region has been untouched since the
+    /// else, and which streams may still be touching them ([`Dirt`]). **Epoch
+    /// zero means never** — the region has been untouched since the
     /// reservation was mapped, so it is already zeroed and has no readers.
     ///
-    /// A claim needs a *wait* only while this still equals
+    /// A claim needs a *wait* only while the epoch still equals
     /// [`Self::quiesce_epoch`] — otherwise a quiesce has happened since and the
-    /// region's readers are long gone — but any non-zero value means it needs
-    /// *cleaning*, because the last occupant's bytes are still there.
+    /// region's readers are long gone — and only when the claim's own stream
+    /// does not already order it behind them; but any non-zero epoch means it
+    /// needs *cleaning*, because the last occupant's bytes are still there.
     ///
     /// # Three ways ground changes hands, and all three land here
     ///
@@ -489,7 +547,7 @@ struct RegionPool {
     /// that was holding expert weights. A region arriving from either is exactly
     /// as dirty as a recycled one, and until this was written only the recycled
     /// path checked.
-    dirty_epoch: Vec<u64>,
+    dirt: Vec<Dirt>,
     /// Where the wave transient tier sits **while a forward is running**, and
     /// how big it is. `None` between forwards, when it occupies nothing.
     ///
@@ -671,6 +729,27 @@ thread_local! {
     /// a purchase that re-entered would deadlock on the pool mutex rather than
     /// fail visibly, so the invariant is enforced rather than assumed.
     static BUYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the weight side closed to purchase on this thread: a claim
+/// inside it takes free ground only, and one that finds none refuses exactly as
+/// it would with no seller. For allocations made on a guess — ground they may
+/// take if it stands free, never ground worth evicting an expert for.
+pub(crate) fn without_purchase<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BUYING.with(|b| b.set(self.0));
+        }
+    }
+    let _restore = Restore(BUYING.with(|b| b.replace(true)));
+    f()
+}
+
+/// Whether this thread's claims are closed to purchase right now.
+#[cfg(test)]
+pub(crate) fn purchase_closed() -> bool {
+    BUYING.with(|b| b.get())
 }
 
 /// Ask the weight side for `regions` of ground; answers the bytes it conceded.
@@ -1110,12 +1189,12 @@ impl RegionPool {
             span_live: 0,
             peak_live: 0,
             // **Epochs start at one**, so that zero can mean "never dirtied" in
-            // `dirty_epoch` without colliding with a real epoch. A pristine
+            // `dirt` without colliding with a real epoch. A pristine
             // region is zero from the mapping touch and has no readers, and that
             // has to be distinguishable from one dirtied before the first
             // quiesce — otherwise every region on the card claims as dirty once.
             quiesce_epoch: 1,
-            dirty_epoch: vec![0; total],
+            dirt: vec![Dirt::default(); total],
             owned: vec![false; total],
             transient_base: None,
             transient_bytes: 0,
@@ -1162,12 +1241,9 @@ impl RegionPool {
     /// Re-derive the region grid after the dense block grew.
     ///
     /// Only reachable from [`claim_dense`], which has already established that
-    /// no region has been handed out — so there is nothing to relocate and
-    /// `dirty_epoch` can simply be resized. Every region in the new grid is
-    /// still pristine (`0`), because the span was mapped and never written.
     /// Widen the ownership bitmap to cover `total` regions.
     ///
-    /// **Grow-only, unlike `dirty_epoch`.** A shrink that truncated this would
+    /// **Grow-only, unlike `dirt`.** A shrink that truncated this would
     /// throw away the record that a high region is still held, and the very next
     /// grow would restore it as `false` — so the pool would have forgotten the
     /// owner of a live region and the double-issue guard would wave it through.
@@ -1184,8 +1260,8 @@ impl RegionPool {
     ///
     /// Only reachable from [`claim_dense`], which has already established that
     /// no region has been handed out — so there is nothing to relocate and
-    /// `dirty_epoch` can simply be resized. Every region in the new grid is
-    /// still pristine (`0`), because the span was mapped and never written.
+    /// `dirt` can simply be resized. Every region in the new grid is still
+    /// pristine (epoch zero), because the span was mapped and never written.
     fn relayout_for_dense(&mut self) {
         let layout = layout_span(
             self.span_base,
@@ -1196,7 +1272,7 @@ impl RegionPool {
         );
         self.region_base = layout.region_base;
         self.total = layout.total;
-        self.dirty_epoch.resize(layout.total, 0);
+        self.dirt.resize(layout.total, Dirt::default());
         self.cover_regions(layout.total);
     }
 
@@ -1278,23 +1354,20 @@ impl RegionPool {
     }
 
     /// Mark every region overlapping `[base, base + len)` as holding someone
-    /// else's bytes, so the next claim quiesces and zeroes it.
+    /// else's bytes that only stream `on` may still be touching, so the next
+    /// claim zeroes it — after a quiesce, unless it claims on `on`.
     ///
     /// Rounds **outward**: a region half-covered is still dirty, and a byte of
     /// stale data is as bad as a region of it.
-    fn mark_dirty_span(&mut self, base: u64, len: usize) {
+    fn mark_dirty_span(&mut self, base: u64, len: usize, on: usize) {
         let start = base.saturating_sub(self.region_base) as usize / REGION_BYTES;
         let end = (base
             .saturating_add(len as u64)
             .saturating_sub(self.region_base) as usize)
             .div_ceil(REGION_BYTES);
-        for slot in self
-            .dirty_epoch
-            .iter_mut()
-            .take(end.min(self.total))
-            .skip(start)
-        {
-            *slot = self.quiesce_epoch;
+        let epoch = self.quiesce_epoch;
+        for slot in self.dirt.iter_mut().take(end.min(self.total)).skip(start) {
+            *slot = slot.left(epoch, on);
         }
     }
 
@@ -1412,12 +1485,12 @@ impl RegionPool {
         // the handover already quiesced (`quiesce_before_handover`), so there are
         // no readers left to wait for — but the bytes are still there, so it
         // still needs zeroing.
-        self.dirty_epoch.resize(layout.total, 0);
+        self.dirt.resize(layout.total, Dirt::default());
         self.cover_regions(layout.total);
         if gained > 0 {
             let stale = self.quiesce_epoch.saturating_sub(1);
-            for slot in self.dirty_epoch.iter_mut().skip(layout.total - gained) {
-                *slot = stale;
+            for slot in self.dirt.iter_mut().skip(layout.total - gained) {
+                *slot = Dirt::any(stale);
             }
             // **Every concession is the KV side's demand, whoever asked for it.**
             // A purchase through the broker said so already; one asked for
@@ -1779,7 +1852,7 @@ fn issue_region(
         //   (`quiesce_before_handover`), so there are no readers left, but the
         //   bytes are still there and a fresh claim would hand them to a KV
         //   arena unzeroed.
-        let dirty = pool.dirty_epoch[index] != 0;
+        let dirty = pool.dirt[index].epoch != 0;
         if dirty {
             // **Quiesce before re-tenanting.** A region returns to the free list
             // the moment its arena drops, and that says only that no host-side
@@ -1828,7 +1901,14 @@ fn issue_region(
             // when nothing records, and holds recordings off until it is done;
             // otherwise the region goes back and the claim is deferred like any
             // other mid-wave arena creation.
-            let needs_sync = pool.dirty_epoch[index] == pool.quiesce_epoch;
+            //
+            // **Nor when this stream already orders the clean behind them.** Ground
+            // the wave tier left is touched by the compute stream alone; a claim on
+            // that stream queues its memset behind the forward, as the next
+            // forward's tier placement does, and needs no device-wide wait
+            // ([`Dirt`]). Measured on the RTX 3090: the gap's first lease after a
+            // prefill waited 180–580 ms here for the prefill to drain.
+            let needs_sync = pool.dirt[index].needs_sync(pool.quiesce_epoch, stream_id(stream));
             let quiesce_epoch = &mut pool.quiesce_epoch;
             let cleaned = try_without_recording(|quiet| {
                 let bound = stream.context().bind_to_thread();
@@ -1870,7 +1950,7 @@ fn issue_region(
             }
             // Clean now, and its next tenant learns that from the stamp rather
             // than from having watched it happen.
-            pool.dirty_epoch[index] = 0;
+            pool.dirt[index] = Dirt::default();
         }
         // **Refuse to hand out a region somebody still holds.**
         //
@@ -2008,7 +2088,7 @@ fn try_claim_run(
                 // is ours: they are put back by hand, exactly as a drop would.
                 for h in issued {
                     pool.owned[h.index] = false;
-                    pool.dirty_epoch[h.index] = pool.quiesce_epoch;
+                    pool.dirt[h.index] = Dirt::any(pool.quiesce_epoch);
                     pool.free.push(Reverse(h.index));
                     pool.live -= 1;
                     std::mem::forget(h);
@@ -2272,7 +2352,8 @@ fn tier_poison_enabled() -> bool {
 pub(crate) fn release_transient(stream: &std::sync::Arc<CudaStream>) {
     let _ = with_pool(stream, |pool| {
         if let (Some(base), true) = (pool.transient_base, pool.transient_bytes > 0) {
-            pool.mark_dirty_span(base, pool.transient_bytes);
+            // Written and read by the forwards alone, on this stream.
+            pool.mark_dirty_span(base, pool.transient_bytes, stream_id(stream));
         }
         pool.transient_base = None;
         pool.transient_bytes = 0;
@@ -2362,7 +2443,7 @@ pub(crate) fn carve_persist(stream: &std::sync::Arc<CudaStream>, bytes: usize) -
 /// It is, for a reason specific to this block: the span is freshly mapped and
 /// the dense block is handed out exactly once, so nothing has ever written these
 /// bytes. That is a stronger guarantee than the region free list's — which needs
-/// `dirty_epoch` and a memset because a region can be recycled — and it holds
+/// its `dirt` record and a memset because a region can be recycled — and it holds
 /// only as long as the block keeps its no-release discipline. If a dense free
 /// path is ever added, the padding stops being defined and the q-matmul
 /// over-read becomes a read of another weight's bytes.
@@ -3353,6 +3434,64 @@ fn pool_partition(pool: &RegionPool, peak: usize) -> SpanPartition {
         pool.span_live,
         peak.max(pool.transient_bytes),
     )
+}
+
+#[cfg(test)]
+mod dirt_tests {
+    use super::{Dirt, ANY_STREAM};
+
+    const COMPUTE: usize = 0x1000;
+    const COPY: usize = 0x2000;
+
+    #[test]
+    fn pristine_ground_never_waits() {
+        let d = Dirt::default();
+        assert!(!d.needs_sync(1, COMPUTE));
+        assert!(!d.needs_sync(1, COPY));
+    }
+
+    #[test]
+    fn ground_any_stream_left_waits_for_every_claim_this_epoch_and_none_after() {
+        let d = Dirt::any(4);
+        assert!(d.needs_sync(4, COMPUTE));
+        assert!(d.needs_sync(4, COPY));
+        // A quiesce since retired its readers.
+        assert!(!d.needs_sync(5, COMPUTE));
+    }
+
+    #[test]
+    fn ground_one_stream_left_waits_only_for_a_claim_on_another_stream() {
+        let d = Dirt::default().left(4, COMPUTE);
+        assert_eq!((d.epoch, d.on), (4, COMPUTE));
+        // Stream order retires the forward; another stream is not ordered
+        // behind it.
+        assert!(!d.needs_sync(4, COMPUTE));
+        assert!(d.needs_sync(4, COPY));
+        assert!(!d.needs_sync(5, COPY));
+    }
+
+    #[test]
+    fn two_tenants_in_one_epoch_leave_any_streams_bytes() {
+        // A KV arena released (any stream), then the tier over it (compute).
+        let d = Dirt::any(4).left(4, COMPUTE);
+        assert_eq!(d.on, ANY_STREAM);
+        assert!(d.needs_sync(4, COMPUTE));
+        // Two streams' tenants in one epoch.
+        let d = Dirt::default().left(4, COMPUTE).left(4, COPY);
+        assert_eq!(d.on, ANY_STREAM);
+        // The same stream twice stays that stream's.
+        let d = Dirt::default().left(4, COMPUTE).left(4, COMPUTE);
+        assert_eq!(d.on, COMPUTE);
+    }
+
+    #[test]
+    fn an_earlier_epochs_bytes_do_not_widen_a_later_tenant() {
+        // Left by any stream before a quiesce, then by the tier after it: only
+        // the tier's readers remain.
+        let d = Dirt::any(3).left(4, COMPUTE);
+        assert_eq!((d.epoch, d.on), (4, COMPUTE));
+        assert!(!d.needs_sync(4, COMPUTE));
+    }
 }
 
 #[cfg(test)]

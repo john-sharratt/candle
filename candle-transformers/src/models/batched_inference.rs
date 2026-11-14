@@ -676,8 +676,9 @@ pub struct BatchedInferenceSession {
     stencil_rows: usize,
     /// The draft walk's token buffer — see [`Self::walk_tokens`].
     walk_tokens: Option<Tensor>,
-    /// The gap quantize's state from one gap to the next, made at the first
-    /// gap of a session that quantizes — see `gap`.
+    /// The gap quantize's state from one gap to the next, made with a session
+    /// that quantizes (and, for one built over shared backings, at its first
+    /// gap) — see `gap`.
     #[cfg(feature = "cuda")]
     gap: Option<GapCycle>,
 }
@@ -748,7 +749,7 @@ impl BatchedInferenceSession {
             backings.push(first_backing.new_layer(layer_idx, 1, config.initial_seq_len));
         }
 
-        Ok(Self {
+        let mut session = Self {
             backings,
             sequences: Vec::new(),
             reserved: HashSet::new(),
@@ -764,7 +765,12 @@ impl BatchedInferenceSession {
             walk_tokens: None,
             #[cfg(feature = "cuda")]
             gap: None,
-        })
+        };
+        // Before any forward: the gap's scratch is allocated with nothing in
+        // flight to wait behind.
+        #[cfg(feature = "cuda")]
+        session.ensure_gap()?;
+        Ok(session)
     }
 
     /// Set how the headers pick each sequence's rung — the model's own, from

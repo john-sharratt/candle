@@ -624,8 +624,9 @@ fn a_gap_cycle_returns_every_unused_slot_and_a_retry_places_every_deferred_block
     .unwrap();
     let reach = reachable(&backings[0], &policy);
     let exact = gap_demand(&retried, 0, None, &reach);
-    assert_eq!(exact, retried);
-    let (lease2, short) = leased(&backings[0], &exact).unwrap();
+    assert_eq!(exact.firm, retried);
+    assert_eq!(exact.spare, [0; SizeClass::COUNT]);
+    let (lease2, short) = leased(&backings[0], &exact.firm).unwrap();
     assert_eq!(short, [0; SizeClass::COUNT]);
     let retry_jobs: Vec<GapJob> = retry.iter().map(|&j| jobs[j].clone()).collect();
     let groups = [GapGroup {
@@ -655,7 +656,7 @@ fn a_gap_cycle_returns_every_unused_slot_and_a_retry_places_every_deferred_block
     }
     // The retry used its whole lease and nothing more.
     let used: usize = rows2.iter().map(|r| row_bands(r, &codes).len()).sum();
-    assert_eq!(used, exact.iter().sum::<usize>());
+    assert_eq!(used, exact.firm.iter().sum::<usize>());
     drop(installed);
 }
 

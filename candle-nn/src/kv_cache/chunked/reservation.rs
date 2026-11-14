@@ -27,7 +27,7 @@
 //!
 //! Each range is zero-filled as it is claimed ([`Reservation::map_range`]),
 //! which the region tier relies on: `RegionPool` hands a region whose
-//! `dirty_epoch` is still zero to its first tenant *without* cleaning it, on the
+//! dirt epoch is still zero to its first tenant *without* cleaning it, on the
 //! strength of this write. The fill is queued rather than awaited; its one hard
 //! rule is that the span must not be freed while it is still in flight, which
 //! [`Reservation::fence`] states and the teardown obeys.

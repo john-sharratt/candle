@@ -13,12 +13,13 @@
 //! - **New blocks, by measured share.** Their band count is exact; only the
 //!   split across classes is not yet known. It is each class's peak share of
 //!   claims over the recent summaries, kept apart for prefill and decode gaps,
-//!   capped at the band count — and before any summary, the whole count to
-//!   every reachable class.
+//!   capped at the band count. Before any summary, each reachable class takes
+//!   an even part of the count firm and the rest of it spare.
 //!
-//! An over-estimate costs slots allocated and returned within one gap; an
-//! under-estimate defers the blocks past it, whose exact demand the next
-//! summary reports.
+//! Firm demand may buy ground from the weight side; spare demand takes only
+//! ground standing free. An over-estimate costs slots allocated and returned
+//! within one gap; an under-estimate defers the blocks past it, whose exact
+//! demand the next summary reports.
 
 use std::collections::VecDeque;
 
@@ -90,47 +91,81 @@ impl PeakShares {
     }
 }
 
+/// A gap's demand per class, in two parts that differ in what ground they may
+/// take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GapDemand {
+    /// Measured demand, and a cold gap's even split: leased from free ground
+    /// first and, past it, from ground bought from the weight side.
+    pub firm: PerClass<usize>,
+    /// A cold gap's guess past its split: leased from free ground only, never
+    /// bought — no expert is evicted for slots that are likely returned.
+    pub spare: PerClass<usize>,
+}
+
+impl GapDemand {
+    /// Both parts of a class.
+    pub(crate) fn total(&self, c: usize) -> usize {
+        self.firm[c] + self.spare[c]
+    }
+}
+
 /// The slots each class leases for `new_bands` bands of blocks no summary has
 /// seen: `new_bands × peak share`, rounded up and capped at `new_bands`, for
-/// every class in `reachable`; zero for a class the level never selects.
+/// every class in `reachable`; zero for a class the level never selects. All
+/// of it firm.
 ///
-/// With no `peak` — the first gap of its kind — every reachable class leases
-/// the whole `new_bands`. The split is unknown, and real K/V concentrates in a
-/// class or two, so an even split defers most of the first gap: a prompt's
-/// worth of K/V left native for a gap more. Leasing the count to every class
-/// costs only slots returned at that gap's catch-up, once.
+/// With no `peak` — the first gap of its kind — the split is unknown, and real
+/// K/V concentrates in a class or two, so an even split alone defers most of
+/// the first gap: a prompt's worth of K/V left native for a gap more. Each
+/// reachable class leases its even part firm and the rest of the count spare,
+/// so the gap lands whole wherever free ground covers the guess, buys only one
+/// count's worth in all, and costs only slots returned at its catch-up, once.
 pub(crate) fn new_block_demand(
     new_bands: usize,
     peak: Option<&PerClass<f32>>,
     reachable: &PerClass<bool>,
-) -> PerClass<usize> {
-    let mut demand = [0usize; SizeClass::COUNT];
+) -> GapDemand {
+    let mut demand = GapDemand {
+        firm: [0; SizeClass::COUNT],
+        spare: [0; SizeClass::COUNT],
+    };
     if new_bands == 0 {
         return demand;
     }
-    for (c, d) in demand.iter_mut().enumerate() {
+    let n_reachable = reachable.iter().filter(|&&r| r).count();
+    for c in 0..SizeClass::COUNT {
         if !reachable[c] {
             continue;
         }
-        let share = match peak {
-            Some(peak) => (new_bands as f64 * f64::from(peak[c])).ceil() as usize,
-            None => new_bands,
-        };
-        *d = share.min(new_bands);
+        match peak {
+            Some(peak) => {
+                let share = (new_bands as f64 * f64::from(peak[c])).ceil() as usize;
+                demand.firm[c] = share.min(new_bands);
+            }
+            None => {
+                let split = new_bands.div_ceil(n_reachable);
+                demand.firm[c] = split;
+                demand.spare[c] = new_bands - split;
+            }
+        }
     }
     demand
 }
 
-/// A gap's lease, per class: the retried blocks' exact demand plus the new
-/// blocks' demand by share.
+/// A gap's lease, per class: the retried blocks' exact demand, firm, plus the
+/// new blocks' demand.
 pub(crate) fn gap_demand(
     retried: &PerClass<usize>,
     new_bands: usize,
     peak: Option<&PerClass<f32>>,
     reachable: &PerClass<bool>,
-) -> PerClass<usize> {
-    let new = new_block_demand(new_bands, peak, reachable);
-    std::array::from_fn(|c| retried[c] + new[c])
+) -> GapDemand {
+    let mut demand = new_block_demand(new_bands, peak, reachable);
+    for (f, r) in demand.firm.iter_mut().zip(retried) {
+        *f += r;
+    }
+    demand
 }
 
 /// The bands of `rows` counted by the class each claimed from, through
@@ -177,9 +212,21 @@ mod tests {
     }
 
     #[test]
-    fn before_any_summary_every_reachable_class_leases_the_whole_count() {
+    fn before_any_summary_each_class_leases_its_split_firm_and_the_rest_spare() {
         let d = new_block_demand(10, None, &only(&[0, 2, 3]));
-        assert_eq!(d, claims(&[(0, 10), (2, 10), (3, 10)]));
+        assert_eq!(d.firm, claims(&[(0, 4), (2, 4), (3, 4)]));
+        assert_eq!(d.spare, claims(&[(0, 6), (2, 6), (3, 6)]));
+        for c in [0, 2, 3] {
+            assert_eq!(d.total(c), 10, "class {c}: the whole count in all");
+        }
+        // The firm parts cover the count: what is bought is one count's worth.
+        assert!(d.firm.iter().sum::<usize>() >= 10);
+    }
+
+    #[test]
+    fn a_cold_gap_with_one_reachable_class_leases_it_all_firm() {
+        let d = new_block_demand(10, None, &only(&[5]));
+        assert_eq!((d.firm[5], d.spare[5]), (10, 0));
     }
 
     #[test]
@@ -188,17 +235,18 @@ mod tests {
         shares.record(GapKind::Decode, &claims(&[(1, 3), (2, 1)]));
         let peak = shares.peak(GapKind::Decode).unwrap();
         let d = new_block_demand(100, Some(&peak), &only(&[1, 2]));
-        assert_eq!(d, claims(&[(1, 75), (2, 25)]));
+        assert_eq!(d.firm, claims(&[(1, 75), (2, 25)]));
+        assert_eq!(d.spare, [0; N], "measured demand is all firm");
     }
 
     #[test]
     fn a_class_never_takes_more_than_the_new_band_count() {
         let mut peak = [0f32; N];
         peak[0] = 1.0;
-        assert_eq!(new_block_demand(40, Some(&peak), &only(&[0]))[0], 40);
+        assert_eq!(new_block_demand(40, Some(&peak), &only(&[0])).firm[0], 40);
         // A peak share over one is still the count.
         peak[0] = 1.5;
-        assert_eq!(new_block_demand(40, Some(&peak), &only(&[0]))[0], 40);
+        assert_eq!(new_block_demand(40, Some(&peak), &only(&[0])).firm[0], 40);
     }
 
     #[test]
@@ -208,7 +256,7 @@ mod tests {
             shares.record(GapKind::Decode, &claims(&[(0, 1), (1, 1), (2, 1)]));
             let peak = shares.peak(GapKind::Decode).unwrap();
             let d = new_block_demand(bands, Some(&peak), &only(&[0, 1, 2]));
-            for (c, &n) in d.iter().take(3).enumerate() {
+            for (c, &n) in d.firm.iter().take(3).enumerate() {
                 assert!(n * 3 >= bands, "bands {bands} class {c}: {n}");
                 assert!(n <= bands);
             }
@@ -220,22 +268,28 @@ mod tests {
         let mut peak = [0f32; N];
         peak[0] = 1.0;
         let d = new_block_demand(50, Some(&peak), &only(&[0, 1]));
-        assert_eq!((d[0], d[1]), (50, 0));
+        assert_eq!((d.firm[0], d.firm[1]), (50, 0));
     }
 
     #[test]
     fn no_bands_or_no_reachable_class_leases_nothing() {
-        assert_eq!(new_block_demand(0, None, &only(&[0, 1])), [0; N]);
-        assert_eq!(new_block_demand(100, None, &[false; N]), [0; N]);
+        for d in [
+            new_block_demand(0, None, &only(&[0, 1])),
+            new_block_demand(100, None, &[false; N]),
+        ] {
+            assert_eq!((d.firm, d.spare), ([0; N], [0; N]));
+        }
     }
 
     #[test]
-    fn retried_blocks_lease_exactly_their_demand_on_top() {
+    fn retried_blocks_lease_exactly_their_demand_on_top_firm() {
         let retried = claims(&[(1, 7), (4, 3)]);
         let d = gap_demand(&retried, 0, None, &only(&[1, 4]));
-        assert_eq!(d, retried, "no new blocks: exactly the retried demand");
+        assert_eq!(d.firm, retried, "no new blocks: exactly the retried demand");
+        assert_eq!(d.spare, [0; N]);
         let d = gap_demand(&retried, 8, None, &only(&[1, 4]));
-        assert_eq!(d, claims(&[(1, 15), (4, 11)]));
+        assert_eq!(d.firm, claims(&[(1, 11), (4, 7)]));
+        assert_eq!(d.spare, claims(&[(1, 4), (4, 4)]));
     }
 
     #[test]
@@ -243,7 +297,7 @@ mod tests {
         // A block deferred under one level, retried after the level changed:
         // its exact demand stands whatever the new level reaches.
         let d = gap_demand(&claims(&[(5, 2)]), 4, None, &only(&[0]));
-        assert_eq!((d[0], d[5]), (4, 2));
+        assert_eq!((d.firm[0], d.firm[5]), (4, 2));
     }
 
     #[test]
@@ -253,7 +307,7 @@ mod tests {
         shares.record(GapKind::Decode, &claims(&[(0, 1), (6, 3)]));
         let peak = shares.peak(GapKind::Decode).unwrap();
         let d = new_block_demand(40, Some(&peak), &only(&[0]));
-        assert_eq!((d[0], d[6]), (10, 0));
+        assert_eq!((d.firm[0], d.firm[6]), (10, 0));
     }
 
     #[test]
@@ -265,7 +319,7 @@ mod tests {
         shares.record(GapKind::Decode, &claims(&[(0, 1), (1, 9)]));
         let peak = shares.peak(GapKind::Decode).unwrap();
         let d = new_block_demand(100, Some(&peak), &only(&[0, 1]));
-        assert_eq!((d[0], d[1]), (90, 90));
+        assert_eq!((d.firm[0], d.firm[1]), (90, 90));
     }
 
     #[test]

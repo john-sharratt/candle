@@ -25,13 +25,14 @@ use candle::cuda_backend::cudarc::driver::{CudaEvent, DevicePtr};
 use candle::cuda_backend::kernels::simple::kv_gap_claim::{
     claim_status_words, run_kv_gap_claim, run_kv_gap_complete, MAX_CLASS, MAX_KV_HEAD, NO_OVERRIDE,
 };
-use candle::cuda_backend::staged::segment;
+use candle::cuda_backend::staged::{segment, SEGMENT_ALIGN};
 use candle::cuda_backend::{CudaDevice, Held, WrapErr};
 use candle::quantized::cuda::{
     check_token_window, ggml_to_select_qtype, identity_pal_map, kvhead_supported_head_dim,
     palette4_convert_launch, select_palette4_inputs, select_palette4_launch_staged,
-    write_kvhead_bytes, Palette4ConvertLayout, Palette4Inputs,
+    write_kvhead_bytes, Palette4ConvertLayout, Palette4Inputs, Palette4Layout,
 };
+use candle::quantized::pinned_staging::PinnedBuf;
 use candle::quantized::GgmlDType;
 use candle::Result;
 
@@ -39,12 +40,12 @@ use super::super::backing::ChunkedKvBacking;
 use super::super::band_addrs::BandAddrs;
 use super::super::compress::{head_source, policy_selection};
 use super::super::compression_policy::CompressionPolicy;
-use super::super::head_gids::ChunkBands;
+use super::super::head_gids::{ChunkBands, GIDS_PER_HEAD};
 use super::super::size_class::{elems_per_chunk, SizeClass, GID_STRIDE};
 use super::codes::CodeTables;
 use super::lease::StackImage;
-use super::summary::{completion_word, Finished, MappedSummary, SummaryLayout};
-use crate::kv_cache::arena_table::N_PALETTE;
+use super::summary::{completion_word, Finished, MappedSummary, SummaryLayout, BANDS_PER_HEAD};
+use crate::kv_cache::arena_table::{PerHeadEntry, N_PALETTE};
 use crate::kv_cache::{KvFormat, QuantFormat};
 
 /// The most jobs one gap's table holds: the convert's single launch
@@ -103,6 +104,119 @@ impl Grown {
     }
 }
 
+/// The host image's segments from here on are the launch inputs, copied as
+/// one block; the two before them land in the convert buffer.
+const INPUTS_FROM: usize = 2;
+
+/// The most candidates one side of a level's selection names — what the
+/// scratch is sized for.
+const MAX_CANDIDATES: usize = 16;
+
+/// The policy groups the scratch is sized for in one table: each group's
+/// selection block carries its own candidate sections and alignment.
+const SCRATCH_GROUPS: usize = 64;
+
+/// Sections in a selection block ([`Palette4Layout`]), each aligned apart.
+const SELECT_SECTIONS: usize = 21;
+
+/// What a table of `jobs` jobs takes of the gap's device scratch, at most:
+/// the selection blocks, the convert buffer, and the inputs the claim and the
+/// selections read. Allocated once, at this size, when the gap's state is
+/// made: a buffer grown between forwards waits for the forward ahead of it,
+/// because the held ground it comes from reuses ground behind that forward's
+/// fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GapScratch {
+    pub select: usize,
+    pub convert: usize,
+    pub inputs: usize,
+}
+
+impl GapScratch {
+    pub(crate) fn for_jobs(jobs: usize, n_kv_head: usize, head_dim: usize) -> Self {
+        let heads = jobs * n_kv_head;
+        let block = |n: usize| {
+            Palette4Layout::new(n, n_kv_head, head_dim, MAX_CANDIDATES, MAX_CANDIDATES).bytes()
+        };
+        // A group's own fixed sections, and the alignment it may add.
+        let per_group = block(0) + SELECT_SECTIONS * 4 * SECTION_PAD_WORDS + BLOCK_ALIGN;
+        let select = block(jobs).next_multiple_of(BLOCK_ALIGN) + SCRATCH_GROUPS * per_group;
+        let convert = Palette4ConvertLayout::new(head_dim, heads).bytes();
+        // Every class's lease stack holds at most every band of the table.
+        let bands = heads * BANDS_PER_HEAD;
+        let lease = SizeClass::COUNT * (bands * 8 + 3 * 4);
+        let tables = heads * (PerHeadEntry::COLS + GIDS_PER_HEAD) * 8;
+        // Each group's candidates and windows: its sections, and a word a job.
+        let words = SCRATCH_GROUPS * 3 * 4 * SECTION_PAD_WORDS + jobs * 4;
+        let codes = 2 * 256;
+        let segments = (6 + 3 * SCRATCH_GROUPS) * SEGMENT_ALIGN;
+        Self {
+            select,
+            convert,
+            inputs: lease + tables + words + codes + segments,
+        }
+    }
+
+    pub(crate) fn total(&self) -> usize {
+        self.select + self.convert + self.inputs
+    }
+}
+
+/// The words a selection section may be padded by.
+const SECTION_PAD_WORDS: usize = 64;
+
+/// The most jobs a table may hold for its scratch to fit `budget` bytes, at
+/// `n_kv_head` heads of `head_dim`: the gap's cut (§3.1), from the scratch it
+/// holds. At least one job; at most the convert's single launch.
+pub fn gap_jobs_within(budget: usize, n_kv_head: usize, head_dim: usize) -> usize {
+    let fits = |n: usize| GapScratch::for_jobs(n, n_kv_head, head_dim).total() <= budget;
+    let (mut lo, mut hi) = (1usize, MAX_GAP_JOBS + 1);
+    if !fits(lo) {
+        return 1;
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Where each of `segments` starts when laid end to end on
+/// [`SEGMENT_ALIGN`] boundaries, and the length of the whole — the layout
+/// [`pack_segments`](candle::cuda_backend::staged::pack_segments) packs.
+fn segment_offsets(segments: &[&[u8]]) -> (Vec<usize>, usize) {
+    let mut end = 0usize;
+    let offsets = segments
+        .iter()
+        .map(|s| {
+            let at = end.next_multiple_of(SEGMENT_ALIGN);
+            end = at + s.len();
+            at
+        })
+        .collect();
+    (offsets, end)
+}
+
+/// The gap's pinned host image, which only grows. Rewritten only once the gap
+/// that last copied out of it has completed.
+#[derive(Default)]
+struct HostImage(Option<PinnedBuf>);
+
+impl HostImage {
+    fn at_least(&mut self, bytes: usize) -> Result<&mut [u8]> {
+        let held = self.0.as_ref().map_or(0, PinnedBuf::len);
+        if held < bytes {
+            self.0 = None;
+            self.0 = Some(PinnedBuf::alloc_owned(bytes.max(held * 2))?);
+        }
+        Ok(&mut self.0.as_mut().expect("allocated above")[..bytes])
+    }
+}
+
 /// The gap's device state, kept across gaps.
 pub(crate) struct GapDevice {
     dev: CudaDevice,
@@ -119,6 +233,10 @@ pub(crate) struct GapDevice {
     sink: Held<u8>,
     select: Grown,
     convert: Grown,
+    /// The claim's and the selections' inputs, copied in from `host`.
+    inputs: Grown,
+    /// Everything a gap uploads, packed.
+    host: HostImage,
     /// The completion word of the gap launched and not yet seen complete.
     outstanding: Option<u32>,
     /// The job count of the gap launched and not yet read by a catch-up.
@@ -164,6 +282,12 @@ impl GapDevice {
         let widest = SizeClass::all().map(SizeClass::bytes).max().unwrap_or(0);
         // SAFETY: written by deferred bands' converts and never read.
         let sink = unsafe { Held::<u8>::alloc(dev, widest.max(BLOCK_ALIGN))? };
+        // The scratch for the widest table, now: nothing grows between forwards.
+        let scratch = GapScratch::for_jobs(max_jobs, n_kv_head, head_dim);
+        let (mut select, mut convert, mut inputs) = (Grown(None), Grown(None), Grown(None));
+        select.at_least(dev, scratch.select)?;
+        convert.at_least(dev, scratch.convert)?;
+        inputs.at_least(dev, scratch.inputs)?;
         {
             let stream = dev.cuda_stream();
             let _eager = dev.pause_capture()?;
@@ -187,8 +311,10 @@ impl GapDevice {
             status,
             epoch: 0,
             sink,
-            select: Grown(None),
-            convert: Grown(None),
+            select,
+            convert,
+            inputs,
+            host: HostImage::default(),
             outstanding: None,
             unread: None,
             timing: None,
@@ -295,27 +421,15 @@ impl GapDevice {
         let select_base = self.select.at_least(&self.dev, select_bytes)?;
         let convert_base = self.convert.at_least(&self.dev, convert.bytes())?;
 
-        let stream = self.dev.cuda_stream();
-        let _eager = self.dev.pause_capture()?;
-        // The gap's device time runs from here — ahead of its first upload — to
-        // its completion word.
-        let started = stream.record_event(Some(CU_EVENT_DEFAULT)).w()?;
-        // The convert buffer's source half and windows; the claim writes its
-        // destination half.
-        {
-            let held = self.convert.0.as_mut().expect("sized above");
-            stream
-                .memcpy_htod(&src_records, &mut held.slice_mut(..convert.dst_off(0)))
-                .w()?;
-            stream
-                .memcpy_htod(
-                    segment(&ranges),
-                    &mut held.slice_mut(convert.ranges_off()..convert.bytes()),
-                )
-                .w()?;
-        }
-
-        // ── Every input the claim and the selections read, in one upload ──
+        // ── Every byte the gap reads from the host, in one pinned image ──
+        //
+        // The convert buffer's source half and windows (the claim writes its
+        // destination half), then every input the claim and the selections
+        // read. Pinned, so each copy is queued behind the forward and returns at
+        // once: from pageable memory the driver stages a copy this size only
+        // once the stream reaches it, and the host would wait out the forward
+        // ahead of the gap — measured on the RTX 3090 at 250–430 ms for a
+        // ×8–×16 prefill gap.
         let lease_len: Vec<u32> = lease.len.to_vec();
         let stack_off: Vec<u32> = lease.off.to_vec();
         let stack: &[u64] = if lease.addrs.is_empty() {
@@ -326,6 +440,8 @@ impl GapDevice {
         let taken = vec![0u32; SizeClass::COUNT];
         let code_class: Vec<u8> = self.codes.class.iter().map(|&c| c as u8).collect();
         let mut segments: Vec<&[u8]> = vec![
+            &src_records,
+            segment(&ranges),
             &code_class,
             &self.codes.fmt,
             segment(&lease_len),
@@ -338,13 +454,56 @@ impl GapDevice {
             segments.push(segment(&p.head_gids));
             segments.push(segment(&p.inputs.words));
         }
+        let (offsets, image_len) = segment_offsets(&segments);
+        // The inputs start at the third segment, on a segment boundary; the
+        // device block is block-aligned, so every segment keeps its alignment.
+        let inputs_from = offsets[INPUTS_FROM];
+        let inputs_base = self.inputs.at_least(&self.dev, image_len - inputs_from)?;
+        // No copy out of the image is in flight: the last gap's completed
+        // before this one may launch, and its copies were behind its word.
+        let image = self.host.at_least(image_len)?;
+        for (s, &off) in segments.iter().zip(&offsets) {
+            image[off..off + s.len()].copy_from_slice(s);
+        }
+        let image: &[u8] = image;
+
+        let stream = self.dev.cuda_stream();
+        let _eager = self.dev.pause_capture()?;
+        // The gap's device time runs from here — ahead of its first upload — to
+        // its completion word.
+        let started = stream.record_event(Some(CU_EVENT_DEFAULT)).w()?;
+        {
+            let span = |i: usize| &image[offsets[i]..offsets[i] + segments[i].len()];
+            let held = self.convert.0.as_mut().expect("sized above");
+            stream
+                .memcpy_htod(span(0), &mut held.slice_mut(..convert.dst_off(0)))
+                .w()?;
+            stream
+                .memcpy_htod(
+                    span(1),
+                    &mut held.slice_mut(convert.ranges_off()..convert.bytes()),
+                )
+                .w()?;
+            let held = self.inputs.0.as_mut().expect("sized above");
+            stream
+                .memcpy_htod(
+                    &image[inputs_from..image_len],
+                    &mut held.slice_mut(..image_len - inputs_from),
+                )
+                .w()?;
+        }
+        let at: Vec<u64> = offsets[INPUTS_FROM..]
+            .iter()
+            .map(|&o| inputs_base + (o - inputs_from) as u64)
+            .collect();
 
         self.summary.arm();
         let status = self.status.device_ptr(&stream).0;
         let sink = self.sink.device_ptr(&stream).0;
         let summary = &self.summary;
         let epoch = &mut self.epoch;
-        let launched = self.dev.with_staged_segments(&segments, |at| {
+        let launched = (|| -> Result<()> {
+            let at = &at;
             let [class_at, fmt_at, lease_at, stack_at, off_at, taken_at] =
                 [at[0], at[1], at[2], at[3], at[4], at[5]];
             for (g, (p, group)) in plans.iter().zip(groups).enumerate() {
@@ -428,7 +587,7 @@ impl GapDevice {
                 candle::bail!("gap {seq}: the completion word was refused ({rc})");
             }
             Ok(())
-        });
+        })();
         if let Err(e) = launched {
             // A launch the driver refused part way leaves the gap's earlier
             // launches queued, still writing the summary and the convert
@@ -653,6 +812,56 @@ fn source_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle::cuda_backend::staged::pack_segments;
+
+    #[test]
+    fn the_scratch_grows_with_the_table_and_covers_its_convert_exactly() {
+        let small = GapScratch::for_jobs(10, 4, 128);
+        let large = GapScratch::for_jobs(1000, 4, 128);
+        assert!(large.select > small.select);
+        assert!(large.inputs > small.inputs);
+        assert_eq!(
+            large.convert,
+            Palette4ConvertLayout::new(128, 4000).bytes(),
+            "the convert buffer is the convert's own layout"
+        );
+        // A selection of every job in one group fits the scratch.
+        let one_group = Palette4Layout::new(1000, 4, 128, MAX_CANDIDATES, MAX_CANDIDATES).bytes();
+        assert!(large.select >= one_group);
+    }
+
+    #[test]
+    fn the_cut_is_the_most_jobs_whose_scratch_fits_the_budget() {
+        let budget = 64 << 20;
+        let n = gap_jobs_within(budget, 4, 128);
+        // The production budget's cut at the geometries the fleet runs.
+        assert_eq!(n, 3866);
+        assert_eq!(gap_jobs_within(budget, 2, 256), 4761);
+        assert_eq!(gap_jobs_within(budget, 8, 128), 1933);
+        assert!(GapScratch::for_jobs(n, 4, 128).total() <= budget);
+        assert!(GapScratch::for_jobs(n + 1, 4, 128).total() > budget);
+        // Wider heads take more a job, so fewer fit.
+        assert!(gap_jobs_within(budget, 4, 256) < n);
+        // A budget no job fits still cuts at one; a vast one at the convert's launch.
+        assert_eq!(gap_jobs_within(0, 4, 128), 1);
+        assert_eq!(gap_jobs_within(usize::MAX / 2, 4, 128), MAX_GAP_JOBS);
+    }
+
+    #[test]
+    fn the_host_image_is_laid_out_as_the_staged_upload_packs() {
+        let a = [1u8, 2, 3];
+        let b = [7u64, 8];
+        let c: [u8; 0] = [];
+        let d = [9u32; 5];
+        let segments: [&[u8]; 4] = [&a, segment(&b), &c, segment(&d)];
+        let (packed, packed_at) = pack_segments(&segments);
+        let (offsets, len) = segment_offsets(&segments);
+        assert_eq!(offsets, packed_at);
+        assert_eq!(offsets, vec![0, 16, 32, 32]);
+        assert_eq!(len, packed.len());
+        assert_eq!(len, 52);
+        assert_eq!(segment_offsets(&[]), (Vec::new(), 0));
+    }
 
     fn policy() -> CompressionPolicy {
         CompressionPolicy::new(5)

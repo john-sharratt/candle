@@ -42,9 +42,11 @@ mod summary;
 mod table;
 
 #[cfg(feature = "cuda")]
-pub use cycle::{GapCatchUp, GapCycle, GapQuantize};
+pub use cycle::{GapCatchUp, GapCycle, GapQuantize, QuantizeHost};
 #[cfg(feature = "cuda")]
 pub use demand::GapKind;
+#[cfg(feature = "cuda")]
+pub use launch::gap_jobs_within;
 #[cfg(feature = "cuda")]
 pub use lease_alloc::LeaseRefusal;
 pub use table::gap_take;

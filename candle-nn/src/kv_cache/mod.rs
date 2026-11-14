@@ -169,6 +169,10 @@ pub use chunked::{
     fragmentation, gap_take, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation,
     GroundLost,
 };
+#[cfg(feature = "cuda")]
+pub use chunked::{
+    gap_jobs_within, GapCatchUp, GapCycle, GapKind, GapQuantize, LeaseRefusal, QuantizeHost,
+};
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{
     is_arena_exhausted, is_device_oom, is_ground_refusal_message, is_span_full, is_tier_refusal,
@@ -189,8 +193,6 @@ pub use chunked::{ArenaKey, ColdChunk, FormatCensus, StoragePolicy};
 pub use chunked::{
     DetachedChunks, LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE,
 };
-#[cfg(feature = "cuda")]
-pub use chunked::{GapCatchUp, GapCycle, GapKind, GapQuantize, LeaseRefusal};
 pub use rotating::{
     IndicesAndMask, RotatingCache, RotatingKvCache, ScatteredCacheBuilder, ScatteredKvCache,
 };

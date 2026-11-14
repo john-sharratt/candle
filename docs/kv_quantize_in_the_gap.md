@@ -166,9 +166,15 @@ be quantized.
   dead slots are zero and the valid range is passed to the selection kernel, as
   `kv_tier_migration.md` §3 already specifies. A live sequence's writer chunk is
   not in the table.
-- **A table is cut to what the gap's scratch can carry.** The selection runs in
-  held scratch (`SELECTION_BUDGET_BYTES`). Blocks past the cut wait for the next
-  gap.
+- **A table is cut to what the gap's scratch can carry.** The selection blocks,
+  the convert buffer and the launch inputs run in held scratch allocated once,
+  with the gap's state, for the widest table that fits `GAP_SCRATCH_BYTES`.
+  Nothing is allocated between forwards: a buffer grown there comes from held
+  ground behind the forward's fence and waits the forward out — measured on
+  the RTX 3090 at 260–430 ms for a ×8–×16 prefill gap. Every byte the launch
+  uploads is packed into one pinned host image, so each copy is queued behind
+  the forward instead of staged once the stream reaches it. Blocks past the cut
+  wait for the next gap.
 
 ### 3.2 Device-side band claim
 
@@ -251,18 +257,28 @@ chooses among them.**
     summaries, kept apart for prefill and decode gaps, and capped at the band
     count. The share is a fraction, not a volume, so a prefill arriving after an
     idle period is leased for its own size. Before any summary of its kind
-    exists, every reachable class leases the whole count: the split is unknown
-    and real K/V concentrates in a class or two, so an even split defers most
-    of the first gap — a prompt's worth of K/V native for a gap more. The
-    over-lease is returned at that gap's catch-up, once.
+    exists, the split is unknown and real K/V concentrates in a class or two,
+    so an even split alone defers most of the first gap — a prompt's worth of
+    K/V native for a gap more. Each reachable class leases its even part of
+    the count **firm** and the rest of the count **spare**; the over-lease is
+    returned at that gap's catch-up, once.
 
   An over-estimate costs only slots allocated and returned within one gap; an
   under-estimate defers the blocks past it, whose exact demand the summary then
   reports, and the next gap places them. Nothing is held against a backlog:
-  this replaces §2a's backlog-sized reserve. The lease is KV ground and is
-  bought below `weight_floor` (invariant 7), from free slots in existing arenas
-  first and then new arenas. When the ground cannot cover a class's demand, the
-  class defers blocks for a gap rather than take ground from the experts.
+  this replaces §2a's backlog-sized reserve. The lease is KV ground below
+  `weight_floor` (invariant 7), from free slots in existing arenas first and
+  then new arenas. **Firm demand** — retried blocks' exact demand, the measured
+  shares, a cold gap's even split — may buy ground from the weight side when
+  the free ground runs out: it is measured, the blocks it converts give back
+  more native ground than they take, and in all it buys at most one count's
+  worth. **Spare demand** takes only ground standing free and never buys
+  (`region_pool::without_purchase`): a purchase blocks on the expert pipeline
+  and evicts resident experts, and a guess whose slots are mostly returned one
+  gap later is worth neither. Measured on the RTX 3090 before the split, a cold
+  prefill gap at C10 ×16 that bought its whole guess spent 577 ms in the lease
+  and left decode with 2.4 GB less expert residency. When the ground cannot
+  cover a class's firm demand, the class defers blocks for a gap.
 - **Ground, not slots, is what is kept.** Compaction and the empty sweep run
   with the gap's demand per class set aside, so an arena the lease is about to
   fill is not released and grown again within the same gap. Which slots fill
@@ -777,7 +793,9 @@ Line numbers are as of commit `dc04b62ac`.
   `layer_seal_policies` — the per-layer policies `quantize_and_seal_sequences`
   resolves too, through the same `seal_policy` — and no gap for a session that
   does not quantize, a head_dim the convert has no record for, or the
-  single-latent layout. A table holds `GAP_MAX_JOBS` (16,384) jobs.
+  single-latent layout. The gap's state is made with the session, before any
+  forward; a table holds the jobs whose scratch fits `GAP_SCRATCH_BYTES`
+  (64 MiB, `gap_jobs_within`): 3,866 at 4 KV heads of 128, 4,761 at 2 of 256.
 - The `kv_gap` line, `candle-conversation/src/scheduler/kv_gap.rs`: summed per
   second and written while gaps run.
 - `batch_test/utils.rs:2056`, `:2195`, `batch_test/fidelity.rs:147` and
@@ -858,8 +876,9 @@ Line numbers are as of commit `dc04b62ac`.
 
 **Memory on the small cards.**
 - The selection's scratch is held ground. WhiteWorld declined 27 scratch takes
-  in three hours, the largest 113 MB. The table's cut is sized from the scratch
-  actually held, not from a constant.
+  in three hours, the largest 113 MB. The gap takes its 64 MiB once, with the
+  session, and the table's cut is sized from that scratch, so no take of the
+  gap's is declined or grown later.
 - The persistence copy gathers into device staging before the DtoH
   (`chunk_ops.rs`). That staging is transient VRAM and stays small.
 - The lease never buys ground from the experts. Deferral is the release valve,

@@ -9,19 +9,35 @@
 //! the convert has no record for (a head_dim other than 128 or 256, or the
 //! single-latent layout, which has its own per-band compressor) take no gap.
 
+use std::time::Instant;
+
 use candle::quantized::cuda::kvhead_supported_head_dim;
 use candle::{Device, Result};
-use candle_nn::kv_cache::{GapCatchUp, GapCycle, GapKind, GapQuantize};
+use candle_nn::kv_cache::{gap_jobs_within, GapCatchUp, GapCycle, GapKind, GapQuantize};
 
 use super::BatchedInferenceSession;
 
-/// The most jobs — blocks × layers — one gap's table holds. An 8K-token
-/// prompt's prefill gap on a 48-layer model is 12,288; a table past it is cut,
-/// and the rest goes to the next gap. Sizes the summary in mapped memory:
-/// `jobs × n_kv_head × (head_dim / 2 + 136)` bytes, 13 MB at 4 heads of 128.
-pub const GAP_MAX_JOBS: usize = 16_384;
+/// The device scratch one gap's table runs in — its selection blocks, convert
+/// buffer and inputs, held for the session's life (§3.1). The table is cut to
+/// the jobs — blocks × layers — whose scratch fits ([`gap_jobs_within`]):
+/// 3,866 at 4 KV heads of 128, so an 8K-token prompt on a 48-layer model
+/// (12,288 jobs) is quantized over four gaps; the rest of a table goes to the
+/// next gap.
+pub const GAP_SCRATCH_BYTES: usize = 64 << 20;
 
 impl BatchedInferenceSession {
+    /// Make the gap's state, once, for a session that quantizes: its scratch
+    /// and summary are allocated here, never between two forwards.
+    pub(super) fn ensure_gap(&mut self) -> Result<()> {
+        if self.gap.is_some() || !self.gaps_quantize() {
+            return Ok(());
+        }
+        let first = &self.backings[0];
+        let max_jobs = gap_jobs_within(GAP_SCRATCH_BYTES, first.n_kv_head(), first.head_dim());
+        self.gap = Some(GapCycle::new(&self.backings, max_jobs)?);
+        Ok(())
+    }
+
     /// Whether this session's K/V is quantized in the gap.
     pub fn gaps_quantize(&self) -> bool {
         matches!(self.device, Device::Cuda(_))
@@ -60,11 +76,13 @@ impl BatchedInferenceSession {
             .enumerate()
             .filter_map(|(i, s)| s.as_ref().map(|_| i))
             .collect();
-        if self.gap.is_none() {
-            self.gap = Some(GapCycle::new(&self.backings, GAP_MAX_JOBS)?);
-        }
+        let t_setup = Instant::now();
+        self.ensure_gap()?;
+        let setup = t_setup.elapsed();
         let cycle = self.gap.as_mut().expect("made above");
-        cycle.quantize(&self.backings, &seqs, &policies, kind)
+        let mut q = cycle.quantize(&self.backings, &seqs, &policies, kind)?;
+        q.host.setup = setup;
+        Ok(q)
     }
 
     /// Whether a gap is outstanding — launched and not yet caught up.
