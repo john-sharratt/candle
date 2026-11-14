@@ -2938,7 +2938,13 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
 
      A fetch told `LOST` ends as one ending short does: its records are wanted again. A
      catch-up told `LOST` is timed by its own silence alone, so it is asked again at the
-     quiet's pace, not at once and over and over while no member can answer it.
+     quiet's pace, not at once and over and over while no member can answer it. The
+     quiet asks wait for a member that is away for a moment — restarting, still loading —
+     so an admission catch-up told `LOST` while its socket's `MEMBERS` lists no other
+     member has no one to wait for: it serves on what it holds at once, and what it lacks
+     arrives as gaps once an origin connects and announces it
+     (`replicate::tick::alone_in_listing`). A member starting while the rest of the
+     cluster is down sat out both asks, a minute, for nothing.
 
      `LOST` is a frame kind older members refuse, so members take a build that reads it
      before any gateway sends it: each gateway's `web` is restarted onto it only after
