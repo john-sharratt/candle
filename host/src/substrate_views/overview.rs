@@ -256,7 +256,10 @@ layers:
                         "description": "What the character is living through.",
                         "window": 9000,
                         "priority": 50.0,
-                        "groups": [{"name": "primary", "selection": "recent 4 + top 0"}],
+                        "groups": [{
+                            "name": "primary",
+                            "selection": "recent 4 + top 0, lineage from 1000",
+                        }],
                         "dials": [],
                         "conversation_count": 0,
                         "tokens": 0,

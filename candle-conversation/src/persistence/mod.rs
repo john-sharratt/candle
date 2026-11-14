@@ -57,6 +57,7 @@ pub mod integrity;
 pub mod joined;
 #[cfg(test)]
 mod joined_tests;
+pub mod kept_objects;
 mod le_reader;
 pub mod listing;
 pub mod live_indexes;
@@ -137,6 +138,7 @@ use identity::{
 };
 use inherit::InheritedSubstrate;
 use joined::Purge;
+use kept_objects::ImportReport;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
 pub use log_facts::LogFacts;
 use manifest::{ChunkLoc, Manifest, RecordLoc};
@@ -584,6 +586,24 @@ impl SharedSubstrate {
     /// (`docs/substrate_git.md` §4.1).
     pub fn has_blob(&self, sha256: &[u8; 32]) -> bool {
         self.persistence.call(|p| p.has_blob(sha256))
+    }
+
+    /// Every kept custom object, tombstones included, and the blobs they
+    /// name, as `daemon`'s export taken now ([`kept_objects`]).
+    pub fn export_kept_objects(&self, daemon: &str) -> anyhow::Result<String> {
+        let held = self.substrate.read().held_custom_objects();
+        kept_objects::export(held, |name| Ok(self.blob(name)?), daemon, now_ms())
+    }
+
+    /// Write the union of the exports `text` holds — one from each member —
+    /// leaving every key already live as it is ([`kept_objects`]).
+    pub fn import_kept_objects(&self, text: &str, daemon: &str) -> anyhow::Result<ImportReport> {
+        kept_objects::import(
+            kept_objects::union(text, daemon)?,
+            |key| self.custom_object(key).is_some(),
+            |bytes| Ok(self.put_blob(bytes)?),
+            |obj| Ok(self.put_custom_object(obj)?),
+        )
     }
 }
 

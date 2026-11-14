@@ -46,6 +46,7 @@ mod gallery_sweep;
 mod gang;
 mod graph_window;
 mod guest_room;
+mod held_turn;
 mod high_drain;
 mod hit_density;
 mod idle_wait;
@@ -65,6 +66,7 @@ mod piece_splice;
 mod pinned_report;
 pub mod pool;
 mod pool_refresh;
+mod pooled_rounds;
 mod prefill;
 mod prefill_wait;
 pub(crate) mod profile;
@@ -106,6 +108,7 @@ use census_stage::Stage;
 use detached::Detached;
 use expert_counters::ExpertCounters;
 use graph_window::graph_window;
+use held_turn::HeldTurn;
 use phase_split::cobatched_step_shares;
 use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
@@ -1429,6 +1432,24 @@ impl ReprojectionPolicy {
             .iter()
             .any(|i| matches!(i, SystemPromptItem::Collection(_)))
     }
+
+    /// How far an opening is prefilled before a boundary re-chooses the slot
+    /// (`docs/hit_driven_projection.md` §7.4): the target layer's
+    /// `reserve_tokens`, on an engine that selects. `None` where the slot is
+    /// not filled — a target with no working set, or an engine that attends
+    /// every position.
+    pub(crate) fn opening_chunk(&self) -> Option<usize> {
+        self.substrate.read().trained_window()?;
+        self.projection
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.id == self.target.layer)?
+            .working_set
+            .as_ref()
+            .map(|ws| ws.reserve_tokens)
+            .filter(|&r| r > 0)
+    }
 }
 
 /// Inputs the scheduler needs to run `Builder::project()` itself for a
@@ -1469,7 +1490,9 @@ struct ReprojectInFlight {
     /// travel rather than being discarded, so this list and a stored one are the
     /// same shape.
     tail_index_page: Vec<(usize, Vec<u8>)>,
-    decode_state: DecodeState,
+    /// The turn being swapped: a decode, or an opening stopped at a boundary
+    /// (`held_turn`).
+    turn: HeldTurn,
     sampling_state: Option<SequenceSamplingState>,
     sections_len: usize,
     segments_len: usize,
@@ -2279,6 +2302,36 @@ pub(super) struct ActivePrefill {
     pub(super) error: Option<ConversationError>,
     /// Wall-clock when prefill processing actually started (first chunk).
     pub(super) prefill_start: Option<Instant>,
+    /// Every how many tokens the opening stops for a boundary that re-chooses
+    /// the slot (`docs/hit_driven_projection.md` §7.4): its target's
+    /// `reserve_tokens` on an engine that selects. `None` for a prefill whose
+    /// slot is not filled — no working set, an engine that attends every
+    /// position, a section, a calibration's staged or captured prefill — which
+    /// runs to its end in one stride.
+    pub(super) stops_every: Option<usize>,
+    /// Stopped at a boundary, its reprojection queued: no wave takes it until
+    /// the reprojection hands it back on its new view.
+    pub(super) awaiting: bool,
+}
+
+impl ActivePrefill {
+    /// The most the next chunk may advance: the tokens left, cut at the next
+    /// boundary.
+    pub(super) fn advance_cap(&self) -> usize {
+        let left = self.work.tokens.len() - self.offset;
+        match self.stops_every {
+            Some(every) => left.min(every - self.offset % every),
+            None => left,
+        }
+    }
+
+    /// Whether the opening, now at `offset`, stands at a boundary it stops at:
+    /// a whole number of strides in, with tokens still to come.
+    pub(super) fn at_boundary(&self) -> bool {
+        self.stops_every
+            .is_some_and(|every| self.offset > 0 && self.offset.is_multiple_of(every))
+            && self.offset < self.work.tokens.len()
+    }
 }
 
 /// Resolve a seal's block range against the slot as it actually stands.
@@ -3417,8 +3470,6 @@ pub(crate) struct Scheduler {
     /// Tokens a dialogue's pool holds behind its slot
     /// (`docs/hit_driven_projection.md` §7.2), by the card's size.
     pool_tokens: usize,
-    /// Per slot, the conversations its pool holds ([`Self::refresh_pool`]).
-    pooled_pieces: HashMap<SequenceId, HashSet<TimelineId>>,
     /// EOS token ID (stops generation).
     eos_tokens: TokenBuffer,
     /// Device the model lives on.
@@ -4240,7 +4291,6 @@ impl Scheduler {
             think_close,
             page_break_tokens,
             pool_tokens,
-            pooled_pieces: HashMap::new(),
             eos_tokens,
             device,
             active_decodes: HashMap::new(),
@@ -11406,12 +11456,11 @@ impl Scheduler {
         slot: SequenceId,
         conversation: Option<Conversation>,
     ) {
+        // The pool goes with the slot's state; the model's hold on its pages
+        // goes when the sequence is released.
         if self.slot_projection_state.remove(&slot).is_none() {
             return;
         }
-        // The pool goes with the slot; the model's hold on its pages goes when
-        // the sequence is released.
-        self.pooled_pieces.remove(&slot);
         if let Some(conversation) = conversation {
             self.republish_pins(&conversation);
         }
@@ -11700,38 +11749,26 @@ impl Scheduler {
         if !self.decode_floor_holds_after(0) {
             return Ok(None);
         }
-        // Clone the policy out — `swap_view_with_new_ranges` mutates
-        // `active_decodes` so we cannot hold a borrow over it.
-        let policy = match self
-            .active_decodes
-            .get(&view_id)
-            .and_then(|s| s.reprojection.clone())
-        {
-            Some(p) => p,
-            None => return Ok(None),
+        // What the reprojection reads of its turn — a decode, or an opening
+        // stopped at a boundary (`held_turn`) — cloned out, since the swap below
+        // takes the turn out of the map it sits in.
+        let Some(reading) = self.turn_reading(view_id) else {
+            return Ok(None);
         };
-        // Seed this reprojection's belief from the last one on the decode state
-        // (empty on the first) — the RelLeak decay/reinforcement carries across
-        // the turn. The new belief is written back in `reproject_view_complete`.
-        let mut prior_belief = self
-            .active_decodes
-            .get(&view_id)
-            .map(|s| s.belief.clone())
-            .unwrap_or_default();
-        // Tokens generated so far this turn — drives the early-decode grace window
-        // (lowered band + carried-belief floor) so a correct pick whose decode-Q is
-        // still accruing over the first ~64 tokens isn't evicted at token 1.
-        let decode_pos = self
-            .active_decodes
-            .get(&view_id)
-            .map(|s| s.generated_tokens.len());
+        let policy = reading.policy;
+        // Seed this reprojection's belief from the last one (empty on the
+        // first) — the RelLeak decay/reinforcement carries across the turn.
+        // The new belief is written back in `reproject_view_complete`.
+        let mut prior_belief = reading.belief;
+        // What the turn has appended so far — the reply, or the opening's
+        // prefilled part: drives the early-decode grace window (lowered band +
+        // carried-belief floor), so a correct pick whose decode-Q is still
+        // accruing over the first ~64 tokens isn't evicted at token 1, and is
+        // what the slot's room is counted less.
+        let decode_pos = Some(reading.appended);
         // This turn's first reprojection is the turn boundary: no projection has
-        // run against the decoded content yet (`last_projection_end == 0`).
-        let is_turn_boundary = self
-            .active_decodes
-            .get(&view_id)
-            .map(|s| s.last_projection_end == 0)
-            .unwrap_or(false);
+        // run against the turn's own content yet.
+        let is_turn_boundary = reading.is_turn_boundary;
 
         // 1. Compute the probe's CHUNK range — the turn's own content, in the
         //    same chunk coordinates the seal captures for the belief gallery.
@@ -12297,15 +12334,13 @@ impl Scheduler {
                 .snapshot_sequence_tail(view_id.0, view_state.turn_start_parent_blocks)
                 .map_err(ConversationError::Model)?
         };
-        // Pull DecodeState / sampling_state off the old view id before
+        // Pull the turn and its sampling state off the old view id before
         // freeing the slot, then re-bind to the new view id after the
-        // rebuild.  Failing to find them is an internal invariant
-        // violation — the caller (decode loop) only fires reproject on
-        // an active view.
-        let decode_state = self.active_decodes.remove(&view_id).ok_or_else(|| {
-            ConversationError::Channel(format!(
-                "reproject: missing decode state for view {view_id}"
-            ))
+        // rebuild. Failing to find the turn is an internal invariant
+        // violation — a reprojection is queued only for a decoding view or an
+        // opening stopped at a boundary.
+        let turn = self.take_turn(view_id).ok_or_else(|| {
+            ConversationError::Channel(format!("reproject: missing turn state for view {view_id}"))
         })?;
         let sampling_state = self.sampling_states.remove(&view_id);
         // Carry the turn-scoped view metadata (the Concept F question boundary)
@@ -12363,7 +12398,7 @@ impl Scheduler {
             self,
             view_id,
             parent_id,
-            decode_state,
+            turn,
             true,
             self.model
                 .seal_positional_tail_span(view_id.0, turn_tokens)
@@ -12380,7 +12415,7 @@ impl Scheduler {
             self,
             view_id,
             parent_id,
-            decode_state,
+            turn,
             true,
             self.model
                 .move_recurrent(view_id.0, parent_id.0)
@@ -12394,7 +12429,7 @@ impl Scheduler {
             self,
             view_id,
             parent_id,
-            decode_state,
+            turn,
             true,
             self.session
                 .free_sequence(view_id.0)
@@ -12404,7 +12439,7 @@ impl Scheduler {
             self,
             view_id,
             parent_id,
-            decode_state,
+            turn,
             false,
             self.model
                 .release_sequence(view_id.0)
@@ -12420,7 +12455,7 @@ impl Scheduler {
             self,
             view_id,
             parent_id,
-            decode_state,
+            turn,
             false,
             self.session
                 .truncate_sequence_to_blocks(parent_id.0, view_state.turn_start_parent_blocks)
@@ -12481,7 +12516,7 @@ impl Scheduler {
             self,
             view_id,
             parent_id,
-            decode_state,
+            turn,
             false,
             self.apply_projection_build(parent_id, &projected_segments)
         );
@@ -12503,7 +12538,7 @@ impl Scheduler {
             parent_id,
             tail_per_layer,
             tail_index_page,
-            decode_state,
+            turn,
             sampling_state,
             sections_len: projected_sections.len(),
             segments_len: projected_segments.len(),
@@ -12537,7 +12572,7 @@ impl Scheduler {
             parent_id,
             tail_per_layer,
             tail_index_page,
-            mut decode_state,
+            mut turn,
             sampling_state,
             sections_len,
             segments_len,
@@ -12558,32 +12593,28 @@ impl Scheduler {
         // Carry the belief forward: the next reprojection seeds from what this one
         // selected, so the RelLeak decay/reinforcement accumulates across the turn.
         // Migrates with the decode state into `new_view_id` below.
-        decode_state.belief = PriorBelief::from_selection(&composition.selection);
+        turn.set_belief(PriorBelief::from_selection(&composition.selection));
 
         // A projection is a POINT, not a span: it is selected here (by the Q of
         // the tokens decoded so far) and governs everything forward until the next
         // projection supersedes it. So emit it the instant it occurs — `start_token`
         // is the generated-token position at which it was selected, `seconds` is the
-        // wall-clock elapsed since decode start. The consumer reconstructs each
-        // projection's effective interval `[pos_i, pos_{i+1})` and its throughput
-        // from the *sequence* of events; there is nothing to close or flush.
-        let repro_now = Instant::now();
-        let repro_gen = decode_state.generated_tokens.len() as u32;
+        // wall-clock elapsed since the turn began producing. The consumer
+        // reconstructs each projection's effective interval `[pos_i, pos_{i+1})`
+        // and its throughput from the *sequence* of events; there is nothing to
+        // close or flush. Marking the point advances a decode's span cursor for
+        // the next reprojection / final seal. (The wide `sign(Q)` history is
+        // captured continuously and persisted at seal — it is not tied to
+        // reprojections; the event is just a marker.)
         {
-            let elapsed = repro_now
-                .duration_since(decode_state.decode_start)
-                .as_secs_f64();
+            let (start_token, seconds) = turn.projection_point(Instant::now());
             let event = crate::projection::ProjectionEvent {
-                start_token: repro_gen,
-                seconds: elapsed,
+                start_token,
+                seconds,
                 ..composition
             };
-            let _ = decode_state.event_tx.send(TurnEvent::Projection(event));
+            let _ = turn.event_tx().send(TurnEvent::Projection(event));
         }
-        // Advance the span cursor for the next reprojection / final seal. (The wide
-        // `sign(Q)` history is captured continuously at decode time and persisted at
-        // seal — it is not tied to reprojections; the event is just a marker.)
-        decode_state.last_projection_end = repro_gen;
 
         // The turn's state is this reprojection's until it is re-bound below,
         // so every exit goes through `or_abandon!` (`reproject_abandon.rs`).
@@ -12595,7 +12626,7 @@ impl Scheduler {
             self,
             view_id,
             parent_id,
-            decode_state,
+            turn,
             false,
             self.apply_projection_finish(parent_id, plan)
         );
@@ -12616,7 +12647,7 @@ impl Scheduler {
             self,
             view_id,
             parent_id,
-            decode_state,
+            turn,
             false,
             self.session
                 .sequence_content_block_count(parent_id.0)
@@ -12652,7 +12683,7 @@ impl Scheduler {
                 self,
                 view_id,
                 parent_id,
-                decode_state,
+                turn,
                 false,
                 self.session
                     .inject_sealed_at_tail(parent_id.0, &tail_per_layer)
@@ -12666,7 +12697,7 @@ impl Scheduler {
                      windows — {} chunk(s) cut, {} of {tail_token_count} token(s) placed",
                     placed.cut_chunks, placed.tokens
                 )));
-                or_abandon!(self, view_id, parent_id, decode_state, false, cut);
+                or_abandon!(self, view_id, parent_id, turn, false, cut);
             }
             // The rows that describe those tokens, back at the position the
             // tokens landed. The rebuilt prefix ended flush with its last
@@ -12704,7 +12735,7 @@ impl Scheduler {
                              would hold the turn's K/V with nothing indexing it"
                         ))
                     });
-                    or_abandon!(self, view_id, parent_id, decode_state, false, refused);
+                    or_abandon!(self, view_id, parent_id, turn, false, refused);
                 }
             } else if self.model.carries_positional_state() {
                 tracing::warn!(
@@ -12745,18 +12776,11 @@ impl Scheduler {
             // Mirror the tail's tokens back into the slot_tokens log
             // (we recorded them at original prefill / decode time
             // under the now-freed view id, but the parent's log was
-            // also wiped above).  Reconstruct from DecodeState's
-            // authoritative `prefill_tokens` + `generated_tokens`.
-            Self::record_slot_tokens(
-                &mut self.slot_tokens,
-                parent_id,
-                &decode_state.prefill_tokens,
-            );
-            Self::record_slot_tokens(
-                &mut self.slot_tokens,
-                parent_id,
-                &decode_state.generated_tokens,
-            );
+            // also wiped above). Reconstruct from the turn's own record of
+            // what it forwarded: the opening, then what it decoded.
+            let (opening, decoded) = turn.slot_tokens();
+            Self::record_slot_tokens(&mut self.slot_tokens, parent_id, opening);
+            Self::record_slot_tokens(&mut self.slot_tokens, parent_id, decoded);
         }
 
         inject_span.end();
@@ -12790,7 +12814,7 @@ impl Scheduler {
             self,
             view_id,
             parent_id,
-            decode_state,
+            turn,
             false,
             self.carve_view(parent_id, &effective_ranges)
         );
@@ -12800,7 +12824,7 @@ impl Scheduler {
             }
             self.sampling_states.remove(&new_view_id);
             let e = ConversationError::Model(e);
-            self.abandon_reprojection(view_id, parent_id, decode_state, false, &e);
+            self.abandon_reprojection(view_id, parent_id, turn, false, &e);
             return Err(e);
         }
         view_span.end();
@@ -12820,8 +12844,10 @@ impl Scheduler {
             },
         );
         // `carve_view` seeded a fresh sampling state from the parent; the live
-        // one carried across keeps DRY history and per-turn counters.
-        self.active_decodes.insert(new_view_id, decode_state);
+        // one carried across keeps DRY history and per-turn counters. A decode
+        // goes back to the loop; an opening to the prefill group, its next
+        // stride against the rebuilt slot.
+        self.rebind_turn(view_id, new_view_id, turn);
         if let Some(state) = sampling_state {
             self.sampling_states.insert(new_view_id, state);
         }

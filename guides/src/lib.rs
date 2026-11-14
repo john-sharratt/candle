@@ -75,6 +75,7 @@ mod tests {
             "approvals",
             "groups",
             "files",
+            "battle-cities",
         ] {
             assert!(library.get(name).is_some(), "{name}");
         }

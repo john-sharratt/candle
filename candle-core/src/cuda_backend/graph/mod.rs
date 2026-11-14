@@ -53,6 +53,7 @@ mod thread_wave;
 mod timing;
 
 pub use budget::{budget_for as graph_budget_for, graph_budget_bytes};
+pub use capture::relaxed as relaxed_capture;
 pub use error::GraphError;
 pub use exec::GraphExec;
 pub(crate) use hub::CaptureHub;

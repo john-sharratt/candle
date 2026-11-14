@@ -183,10 +183,10 @@ fn a_new_child_reads_against_the_pool() {
     assert_eq!(fresh, seen);
 }
 
-/// **A scope never taught reads each child against the probe's own scores**:
-/// 100 against `{100, 10, 0}` is 7.9% into the top sample's bin, `ln(4 /
-/// 1.079)` nats, 284.5; 10 is below the 100 and 81.7% of its own bin, `ln(4 /
-/// 2.817)`, 76.1.
+/// **A scope never taught reads each child against the probe's own scores**,
+/// those that scored: 100 against `{100, 10}` is 7.9% into the top sample's
+/// bin, `ln(3 / 1.079)` nats, 222.0; 10 is below the 100 and 81.7% of its own
+/// bin, `ln(3 / 2.817)`, 13.7. The 0 is no evidence and no sample.
 #[test]
 fn an_untaught_scope_reads_the_probe_against_itself() {
     let cache = NormalizationCache::default();
@@ -197,9 +197,70 @@ fn an_untaught_scope_reads_the_probe_against_itself() {
         &[(a.clone(), 100.0), (b.clone(), 10.0), (c.clone(), 0.0)],
         T_REF,
     );
-    approx(val(&out, &a), 284.5, 0.2);
-    approx(val(&out, &b), 76.1, 0.2);
+    approx(val(&out, &a), 222.0, 0.2);
+    approx(val(&out, &b), 13.7, 0.2);
     assert_eq!(val(&out, &c), 0.0);
+}
+
+/// **A stray vote is not a hit.** A tool that scored on ten of a hundred
+/// probes, 20 each time, and nothing on the rest: a 20 is one of its ten stray
+/// votes — 64.4% of their bin is at least it, `ln(11 / 7.438)` nats, 85.0 —
+/// where reading it against all hundred samples put it past ninety of them,
+/// `ln(101 / 7.438)`, 566.4. A score well past every stray vote, 53.6 (bin 32
+/// against the votes' 24), is still a hit: `ln 11` plus 0.875 nats past the
+/// top bin, 710.7.
+#[test]
+fn a_stray_vote_is_not_a_hit() {
+    let scope = ScopeKey::collection(3, "tools");
+    let t = ChildKey::named("t");
+    let cache = NormalizationCache::default();
+    for i in 0..100 {
+        obs(
+            &cache,
+            &scope,
+            &[(t.clone(), if i % 10 == 0 { 20.0 } else { 0.0 })],
+        );
+    }
+    approx(
+        val(&cache.normalize(&scope, &[(t.clone(), 20.0)], T_REF), &t),
+        85.0,
+        0.2,
+    );
+    approx(
+        val(
+            &cache.normalize(&scope, &[(t.clone(), at(32.0))], T_REF),
+            &t,
+        ),
+        710.7,
+        0.2,
+    );
+}
+
+/// **A child with too few scoring samples reads against the pool**, however
+/// many samples of no evidence it holds: a hundred zeros are no background.
+#[test]
+fn samples_of_no_evidence_are_no_background() {
+    let scope = ScopeKey::collection(4, "tools");
+    let quiet = ChildKey::named("quiet");
+    let busy = ChildKey::named("busy");
+    let cache = NormalizationCache::default();
+    for i in 0..100 {
+        obs(
+            &cache,
+            &scope,
+            &[(quiet.clone(), 0.0), (busy.clone(), 5.0 + (i % 20) as f32)],
+        );
+    }
+    let as_pool = val(
+        &cache.normalize(&scope, &[(busy.clone(), 12.0)], T_REF),
+        &busy,
+    );
+    let quiet_12 = val(
+        &cache.normalize(&scope, &[(quiet.clone(), 12.0)], T_REF),
+        &quiet,
+    );
+    assert!(as_pool > 0.0);
+    assert_eq!(quiet_12, as_pool);
 }
 
 /// Re-observing evidence a scope has already folded changes nothing.

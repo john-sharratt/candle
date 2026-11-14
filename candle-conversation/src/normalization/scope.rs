@@ -46,10 +46,11 @@ impl ScopeState {
 
     /// Each child's raw score on the band: `scale × surprise / ln(1 /
     /// full_hit_tail)`, its tail surprise against its own background — so a
-    /// score beyond all but `full_hit_tail` of that background lands at
-    /// `scale`. A child with fewer than `min_background` samples here is read
-    /// against the scope's pool; a scope whose pool is that thin too, against
-    /// the probe's own scores across `raw`. Pure — does not mutate.
+    /// score beyond all but `full_hit_tail` of that background's scoring
+    /// samples lands at `scale`. A child with fewer than `min_background`
+    /// scoring samples here is read against the scope's pool; a scope whose
+    /// pool is that thin too, against the probe's own scores across `raw`.
+    /// Pure — does not mutate.
     pub(super) fn normalize(
         &self,
         raw: &[(ChildKey, f32)],
@@ -66,8 +67,8 @@ impl ScopeState {
             .zip(&scaled)
             .map(|((k, _), &x)| {
                 let background = match self.children.get(k) {
-                    Some(b) if b.total() >= cfg.min_background => b,
-                    _ if self.pooled.total() >= cfg.min_background => &self.pooled,
+                    Some(b) if b.evidence() >= cfg.min_background => b,
+                    _ if self.pooled.evidence() >= cfg.min_background => &self.pooled,
                     _ => probe_only.get_or_init(|| Background::of(scaled.iter().copied())),
                 };
                 (k.clone(), unit * background.surprise(x))

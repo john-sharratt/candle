@@ -765,6 +765,20 @@ call that was just refused for one.
   file the conversation never read), keeps the span's own rule. Each keyed
   span's value is recorded as the call writes it, so a later field can depend on
   it.
+- **A value chosen by a branch is recorded too.** An enum's value is a choice,
+  not a span — and every file tool's `repo` is an enum, the workspace's
+  repositories written into it at startup — so nothing a span records says
+  which repository a call names. The front-end marks each enum's branch in the
+  spec's `chosen` table with its field and, arm by arm, the value it writes (a
+  nullable enum's `null` writes none); `compile` maps each arm's tokens to its
+  value, as it maps a name branch's (`StencilTree::value_chosen`), and the
+  session records the value when the arm completes, however the branch is left.
+  A required enum with one value has no branch — its value is folded into the
+  key — so the front-end records it per tool in the spec's `fixed` table, and
+  naming the call writes it. Without this, every hold on `repo` found its
+  field unwritten and held nothing: live, a listing of `crates` in `candle`,
+  whose crates sit at its root, came back `not_found` while the holds were in
+  place (pinned by `a_turn_of_listings_names_only_directories_that_exist`).
 - **A spill into a held span keeps to the held rule.** Which spills a branch
   offers (§7.4) is settled at compile time against the span's *own* rule, and a
   spill's bytes past the arm are the value's first — committed the moment the

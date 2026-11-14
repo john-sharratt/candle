@@ -1295,6 +1295,35 @@ impl Conversation {
                         groups: GroupSet::weighed(&coll.policy.layer_weights, arena.n_groups()),
                         keep: coll.policy.scan.gallery_keep,
                     };
+                    // Every probe token's vote in each fold group, as the needle
+                    // gate meets them: which member each token's best match
+                    // named, and how strongly. What a wrong pick was built from.
+                    if tracing::enabled!(target: "candle_conversation::belief::tokens", tracing::Level::TRACE)
+                    {
+                        if let Ok(votes) = arena.scan_votes(&[make_segment()], &[p]) {
+                            let rows: Vec<String> = (0..p.len())
+                                .map(|t| {
+                                    let groups: Vec<String> = (0..votes.n_groups)
+                                        .map(|g| match votes.at(t, g, 0) {
+                                            Some((c, v)) => format!(
+                                                "{}:{v:.0}",
+                                                coll.sections.get(c).map_or("?", |s| s.name.as_str())
+                                            ),
+                                            None => "-".to_string(),
+                                        })
+                                        .collect();
+                                    format!("t{t}[{}]", groups.join(" "))
+                                })
+                                .collect();
+                            tracing::trace!(
+                                target: "candle_conversation::belief::tokens",
+                                collection = %coll.name,
+                                tokens = p.len(),
+                                votes = %rows.join(" "),
+                                "probe token votes"
+                            );
+                        }
+                    }
                     let scan_w = |w: &[f32]| -> Option<Vec<f32>> {
                         match arena.scan_weighted(&[make_segment()], &[p], w) {
                             Ok(mut out) => Some(out.pop().unwrap_or_default()),
@@ -1466,12 +1495,35 @@ impl Conversation {
                 .collect();
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let nonzero = finals.iter().filter(|&&s| s != 0.0).count();
-                let top = finals
+                // The strongest members with every figure that made them: the
+                // tail scan's raw score and its normalized reading, the question
+                // window's normalized reading, and the fused final. Which lens
+                // carried a member is the first question a wrong pick asks.
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| finals[b].total_cmp(&finals[a]));
+                let lens = |v: &Option<Vec<(ChildKey, f32)>>, i: usize| {
+                    v.as_ref().and_then(|x| x.get(i)).map_or(0.0, |(_, s)| *s)
+                };
+                let top = order
                     .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, s)| format!("{}={:.1}", coll.sections[i].name, s))
-                    .unwrap_or_default();
+                    .take(6)
+                    .map(|&i| {
+                        format!(
+                            "{}={:.0} (tail raw {:.1} → {:.0}, q raw {:.1} → {:.0})",
+                            coll.sections[i].name,
+                            finals[i],
+                            fresh[i],
+                            normed.get(i).map_or(0.0, |(_, s)| *s),
+                            fresh_q
+                                .as_ref()
+                                .and_then(|q| q.get(i))
+                                .copied()
+                                .unwrap_or(0.0),
+                            lens(&normed_q, i),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 tracing::trace!(
                     target: "candle_conversation::belief",
                     collection = %coll.name,

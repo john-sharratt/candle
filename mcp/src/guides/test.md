@@ -102,3 +102,6 @@ staged.
 - A failure in code your change did not touch is usually not yours: check it
   on `main` before chasing it.
 - If no agent is connected, say so and ask the user how to run the tests.
+- `battle-cities` takes jobs the same way, but its server and client are
+  built separately and its tests run as `cargo test-server`: read the
+  `battle-cities` guide first.

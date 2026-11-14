@@ -1,5 +1,6 @@
-//! A reprojection that fails after taking its turn's [`DecodeState`] out of
-//! [`Scheduler::active_decodes`].
+//! A reprojection that fails after taking its turn out of the loop's maps —
+//! a [`DecodeState`] out of [`Scheduler::active_decodes`], or an opening
+//! stopped at a boundary out of [`Scheduler::active_prefills`] ([`HeldTurn`]).
 //!
 //! A reprojection swaps a decoding turn onto a rebuilt view in two halves —
 //! prepare, then complete, with the batched gap-fill forward between — and
@@ -8,7 +9,7 @@
 //! dropped the state, and with it the turn's channel: the caller saw the turn
 //! end with neither `Done` nor `Error`, could not tell a fault from a vanished
 //! turn, and kept nothing of it. Every exit from those halves goes through
-//! [`or_abandon!`] instead, which tells the turn why ([`DecodeState::fail`])
+//! [`or_abandon!`] instead, which tells the turn why ([`HeldTurn::fail`])
 //! and discards it unsealed, like any faulted turn.
 
 use super::*;
@@ -40,11 +41,11 @@ impl Scheduler {
         &mut self,
         view_id: SequenceId,
         parent_id: SequenceId,
-        mut decode_state: DecodeState,
+        mut turn: HeldTurn,
         view_live: bool,
         error: &ConversationError,
     ) {
-        decode_state.fail(ConversationError::Channel(format!(
+        turn.fail(ConversationError::Channel(format!(
             "the reprojection failed: {error}"
         )));
         if view_live {
@@ -71,7 +72,7 @@ impl Scheduler {
         }
         // A group's case is looked up by the view it was carved on, which the
         // group's ledger still names.
-        if matches!(decode_state.seal_action, SealAction::GroupCase(_)) {
+        if turn.is_group_case() {
             self.lose_group_case(view_id);
         }
     }

@@ -103,15 +103,13 @@
 #include <stdint.h>
 
 #include "../qsa_select.cuh"
+#include "../qsa_survivors.cuh"
 
 namespace qsa_topk {
 
-constexpr int THREADS = 256;
-constexpr int CAP = 1024;          // shared candidate buffer, u64 keys
-// The append bound: a chunk adds at most THREADS keys into the free space
-// below the survivors, and the trim below fires as soon as the free space
-// could not absorb another chunk.
-constexpr int MAX_KEEP = CAP - THREADS;
+// The running top-`keep`, its buffer and its key order (`../qsa_survivors.cuh`).
+using namespace qsa_survivors;
+
 // The union's sort buffer ceiling, in u32 entries. With the survivor buffer it
 // is the kernel's dynamic shared memory: 8 KiB + 64 KiB, inside the opt-in
 // limit of every architecture the archive carries.
@@ -119,15 +117,6 @@ constexpr int MAX_ENTRIES = 16384;
 // The most blocks a split launch may run — the scratch the host provides holds
 // this many slices of MAX_KEEP keys.
 constexpr int SPLIT_BLOCKS = 512;
-
-__device__ __forceinline__ uint32_t key_block(unsigned long long key) {
-    return 0xFFFFFFFFu - (uint32_t)(key & 0xFFFFFFFFull);
-}
-
-__device__ __forceinline__ unsigned long long score_key(float score, int b) {
-    return ((unsigned long long)__float_as_uint(score) << 32)
-        | (unsigned long long)(0xFFFFFFFFu - (uint32_t)b);
-}
 
 __device__ __forceinline__ int span_len(int lo, int hi) {
     return hi > lo ? hi - lo : 0;
@@ -329,141 +318,6 @@ __device__ __forceinline__ int offered(
     int n = span_len(own_lo, own_hi) - pinned_in(g, own_lo, own_hi);
     if (shared) n += shared_pool(g, v) - pinned_in_shared(g, v);
     return n;
-}
-
-constexpr int PER_THREAD = CAP / THREADS;
-constexpr int BINS = 256;
-constexpr int WARP = 32;
-
-// The survivor buffer and the radix select's state, in shared memory.
-struct Survivors {
-    unsigned long long* buf;  // CAP keys; [0, count) live, in no order
-    int* count;
-    unsigned long long* thr;  // a key must exceed this to enter
-    int* hist;                // BINS counters
-    int* pick;                // the select's answer: digit, keys above it, its bin
-};
-
-__device__ __forceinline__ void survivors_reset(const Survivors& s, int tid) {
-    if (tid == 0) {
-        *s.count = 0;
-        *s.thr = 0ull;
-    }
-    __syncthreads();
-}
-
-// Reduce the buffer's `n` keys to its top `keep`, compacted to the front, and
-// set the threshold to the smallest of them. `n ≥ keep`. Every thread calls
-// this, so its barriers are uniform.
-__device__ void survivors_select(const Survivors& s, int n, int keep, int tid) {
-    unsigned long long k[PER_THREAD];
-    bool live[PER_THREAD];
-#pragma unroll
-    for (int j = 0; j < PER_THREAD; ++j) {
-        const int i = tid + j * THREADS;
-        live[j] = i < n;
-        k[j] = live[j] ? s.buf[i] : 0ull;
-    }
-
-    // The top `keep` are the keys whose masked bits are at least `prefix`.
-    unsigned long long prefix = 0ull, mask = 0ull;
-    int need = keep;
-    if (n > keep) {
-        for (int shift = 56; shift >= 0; shift -= 8) {
-            s.hist[tid] = 0;
-            __syncthreads();
-#pragma unroll
-            for (int j = 0; j < PER_THREAD; ++j) {
-                if (live[j] && (k[j] & mask) == prefix) {
-                    atomicAdd(&s.hist[(int)((k[j] >> shift) & 0xFFull)], 1);
-                }
-            }
-            __syncthreads();
-            if (tid < WARP) {
-                // Lane l holds bins [8l, 8l + 8); `above` counts the keys in
-                // every higher lane's bins.
-                int bins[BINS / WARP];
-                int t = 0;
-#pragma unroll
-                for (int b = 0; b < BINS / WARP; ++b) {
-                    bins[b] = s.hist[tid * (BINS / WARP) + b];
-                    t += bins[b];
-                }
-                int incl = t;
-#pragma unroll
-                for (int off = 1; off < WARP; off <<= 1) {
-                    const int v = __shfl_down_sync(0xFFFFFFFFu, incl, off);
-                    if (tid + off < WARP) incl += v;
-                }
-                int above = incl - t;
-                if (above < need && need <= incl) {
-                    for (int b = BINS / WARP - 1; b >= 0; --b) {
-                        if (above + bins[b] >= need) {
-                            s.pick[0] = tid * (BINS / WARP) + b;
-                            s.pick[1] = above;
-                            s.pick[2] = bins[b];
-                            break;
-                        }
-                        above += bins[b];
-                    }
-                }
-            }
-            __syncthreads();
-            prefix |= (unsigned long long)s.pick[0] << shift;
-            mask |= 0xFFull << shift;
-            need -= s.pick[1];
-            const bool whole_bin = s.pick[2] == need;
-            __syncthreads();
-            if (whole_bin) break;
-        }
-    }
-
-    if (tid == 0) {
-        *s.count = 0;
-        *s.thr = ~0ull;
-    }
-    __syncthreads();
-#pragma unroll
-    for (int j = 0; j < PER_THREAD; ++j) {
-        if (live[j] && (k[j] & mask) >= prefix) {
-            s.buf[atomicAdd(s.count, 1)] = k[j];
-            atomicMin(s.thr, k[j]);
-        }
-    }
-    __syncthreads();
-}
-
-// Offer one chunk's keys (each thread's `key`, `0` for none) to the buffer,
-// then trim it if another chunk might not fit. Every thread calls this the
-// same number of times, so the barriers inside are uniform.
-//
-// `n` is each thread's own copy of the buffer's count, advanced by the
-// barrier's own tally of the chunk. The trim decision has to be the same in
-// every thread, and a count read back from shared memory is not: a thread
-// that reads it late can see the next chunk's appends from a thread that ran
-// ahead, decide differently, and leave the block split across two barriers.
-__device__ __forceinline__ void survivors_offer(
-    const Survivors& s,
-    unsigned long long key,
-    int keep,
-    int& n,
-    int tid
-) {
-    const bool append = key > *s.thr;
-    if (append) {
-        const int slot = atomicAdd(s.count, 1);
-        s.buf[slot] = key;
-    }
-    n += __syncthreads_count(append);
-    if (n > CAP - THREADS) {
-        survivors_select(s, n, keep, tid);
-        n = keep;
-    }
-}
-
-// Settle the buffer to exactly its top `keep` once the pool is streamed.
-__device__ __forceinline__ void survivors_finish(const Survivors& s, int keep, int n, int tid) {
-    survivors_select(s, n, keep, tid);
 }
 
 // Stream the scores of `[lo, hi)` that `skip` does not exclude and no pin
@@ -723,6 +577,23 @@ __device__ void finish_row_single(
     }
 }
 
+// Write `row`'s cut record (`QSA_CUT_WORDS`, `../qsa_select.cuh`): `cut_bits`
+// the lowest score the ranking kept, or QSA_NO_CUT when it ranked nothing.
+__device__ __forceinline__ void write_cut(
+    uint32_t* __restrict__ cuts,
+    int row,
+    uint32_t cut_bits,
+    const uint32_t* __restrict__ n_cand,
+    const uint32_t* __restrict__ qpos,
+    const uint32_t* __restrict__ tail_len
+) {
+    uint32_t* c = cuts + (size_t)row * QSA_CUT_WORDS;
+    c[0] = cut_bits;
+    c[1] = qpos[row];
+    c[2] = n_cand[row];
+    c[3] = tail_len[row];
+}
+
 // The shared-memory layout every kernel here uses: CAP u64 survivors, then the
 // entry buffer.
 struct Smem {
@@ -760,6 +631,8 @@ __device__ __forceinline__ Smem smem_layout(
 //   pins    [2·QSA_MAX_PINS, n_rows] u32 — the row's pinned block ranges
 //   entries [n_rows, entry_stride] u32 — output, ascending by block
 //   cnt     [n_rows] u32 — entries written, or QSA_DENSE_ROW
+//   cuts    [n_rows, QSA_CUT_WORDS] u32 — each row's cut record: the lowest
+//                          score any window kept, with the row's geometry
 //
 // Dynamic shared memory: CAP u64 survivors, then `ent_cap` u32 entries.
 __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
@@ -773,6 +646,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
     uint32_t* __restrict__ entries,
     int entry_stride,
     uint32_t* __restrict__ cnt,
+    uint32_t* __restrict__ cuts,
     int ratio,
     int top_k,
     int window_blocks,
@@ -790,7 +664,10 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
             window_blocks, recent_blocks, recent_forced, g)) {
         // Every visible cell is attended — the identity, and the reason a
         // shallow context needs no indexer at all.
-        if (tid == 0) cnt[row] = QSA_DENSE_ROW;
+        if (tid == 0) {
+            cnt[row] = QSA_DENSE_ROW;
+            write_cut(cuts, row, QSA_NO_CUT, n_cand, qpos, tail_len);
+        }
         return;
     }
 
@@ -802,6 +679,10 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
     __shared__ int s_pick[3];
     const Smem m = smem_layout(smem_qsa_topk, &s_count, &s_thr, s_hist, s_pick);
     if (tid == 0) s_n_ent = 0;
+    // The lowest score any window kept: thread 0's, read from each window's
+    // settled threshold before the next window resets it.
+    float cut = INFINITY;
+    bool ranked = false;
 
     const float* srow = scores + (size_t)row * (size_t)score_stride;
     // One window whose bitmap fits the entry buffer writes its selection
@@ -820,6 +701,10 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
         __shared__ int s_warp_sums[THREADS / WARP];
         finish_row_single(
             m.s, g, keep > 0 ? keep : 0, ratio, m.ent, s_warp_sums, out, cnt + row, tid);
+        if (tid == 0) {
+            const uint32_t bits = keep > 0 ? __float_as_uint(key_score(*m.s.thr)) : QSA_NO_CUT;
+            write_cut(cuts, row, bits, n_cand, qpos, tail_len);
+        }
         return;
     }
     for (int w = 0; w < g.n_win; ++w) {
@@ -830,12 +715,19 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
         survivors_reset(m.s, tid);
         const int n = offer_pool(m.s, srow, g, v, v.lo, v.r1_hi, true, keep, tid);
         survivors_finish(m.s, keep, n, tid);
+        if (tid == 0) {
+            cut = fminf(cut, key_score(*m.s.thr));
+            ranked = true;
+        }
         emit_window(m.s, g, keep, ratio, m.ent, &s_n_ent, tid);
     }
     emit_pins(g, ratio, m.ent, &s_n_ent, tid);
     finish_row(
         g, ratio, m.ent, s_n_ent, (int*)m.s.buf,
         entries + (size_t)row * (size_t)entry_stride, cnt + row, tid);
+    if (tid == 0) {
+        write_cut(cuts, row, ranked ? __float_as_uint(cut) : QSA_NO_CUT, n_cand, qpos, tail_len);
+    }
 }
 
 // The split launch's first pass: block (row, w·parts + p) ranks slice `p` of
@@ -913,6 +805,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_merge_kernel(
     uint32_t* __restrict__ entries,
     int entry_stride,
     uint32_t* __restrict__ cnt,
+    uint32_t* __restrict__ cuts,
     int ratio,
     int top_k,
     int window_blocks,
@@ -928,9 +821,15 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_merge_kernel(
     if (!row_geometry(
             row, n_cand, qpos, tail_len, prompt_blocks, pins, n_rows, ratio, top_k,
             window_blocks, recent_blocks, recent_forced, g)) {
-        if (tid == 0) cnt[row] = QSA_DENSE_ROW;
+        if (tid == 0) {
+            cnt[row] = QSA_DENSE_ROW;
+            write_cut(cuts, row, QSA_NO_CUT, n_cand, qpos, tail_len);
+        }
         return;
     }
+    // The lowest score any window kept, as in `qsa_topk_entries_kernel`.
+    float cut = INFINITY;
+    bool ranked = false;
 
     extern __shared__ unsigned long long smem_qsa_topk[];
     __shared__ int s_count;
@@ -961,12 +860,19 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_merge_kernel(
             survivors_offer(m.s, key, keep, n, tid);
         }
         survivors_finish(m.s, keep, n, tid);
+        if (tid == 0) {
+            cut = fminf(cut, key_score(*m.s.thr));
+            ranked = true;
+        }
         emit_window(m.s, g, keep, ratio, m.ent, &s_n_ent, tid);
     }
     emit_pins(g, ratio, m.ent, &s_n_ent, tid);
     finish_row(
         g, ratio, m.ent, s_n_ent, (int*)m.s.buf,
         entries + (size_t)row * (size_t)entry_stride, cnt + row, tid);
+    if (tid == 0) {
+        write_cut(cuts, row, ranked ? __float_as_uint(cut) : QSA_NO_CUT, n_cand, qpos, tail_len);
+    }
 }
 
 constexpr int MAX_DEVICES = 64;
@@ -1053,6 +959,7 @@ extern "C" void run_qsa_topk_entries(
     uint32_t* entries,
     int32_t entry_stride,
     uint32_t* cnt,
+    uint32_t* cuts,
     int32_t ratio,
     int32_t top_k,
     int32_t window_blocks,
@@ -1076,8 +983,8 @@ extern "C" void run_qsa_topk_entries(
         qsa_topk::opt_in_smem(qsa_topk::qsa_topk_entries_kernel, qsa_topk::entries_granted, smem);
         qsa_topk::qsa_topk_entries_kernel<<<(unsigned)n_rows, qsa_topk::THREADS, smem, s>>>(
             scores, score_stride, n_cand, qpos, tail_len, prompt_blocks, pins, entries,
-            entry_stride, cnt, ratio, top_k, window_blocks, recent_blocks, recent_forced, ent_cap,
-            n_rows);
+            entry_stride, cnt, cuts, ratio, top_k, window_blocks, recent_blocks, recent_forced,
+            ent_cap, n_rows);
         return;
     }
     const int win = (window_blocks > 0 && window_blocks < cand_max) ? window_blocks : cand_max;
@@ -1090,5 +997,5 @@ extern "C" void run_qsa_topk_entries(
     qsa_topk::opt_in_smem(qsa_topk::qsa_topk_merge_kernel, qsa_topk::merge_granted, smem);
     qsa_topk::qsa_topk_merge_kernel<<<(unsigned)n_rows, qsa_topk::THREADS, smem, s>>>(
         keys, segs, n_cand, qpos, tail_len, prompt_blocks, pins, entries, entry_stride, cnt,
-        ratio, top_k, window_blocks, recent_blocks, recent_forced, parts, n_rows);
+        cuts, ratio, top_k, window_blocks, recent_blocks, recent_forced, parts, n_rows);
 }

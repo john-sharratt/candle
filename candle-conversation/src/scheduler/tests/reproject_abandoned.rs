@@ -45,10 +45,7 @@ fn failing_step(
     parent: SequenceId,
     view_live: bool,
 ) -> Result<(), ConversationError> {
-    let state = scheduler
-        .active_decodes
-        .remove(&view)
-        .expect("the turn is decoding");
+    let state = scheduler.take_turn(view).expect("the turn is decoding");
     let failed: Result<(), ConversationError> = Err(ConversationError::Channel(
         "glue convention violated: slot 27 offset 158079 != logical_pos 158047".into(),
     ));

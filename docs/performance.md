@@ -281,6 +281,15 @@ before the model loads. Three unit tests pin the check, including the boundary
 that actually bites: a prompt that fits with fewer than `generate` positions to
 spare does not fit once decoding starts.
 
+Production holds to the same window. zend's Flash-Next dialogue runs in a slot
+of the trained window less its `reserve_tokens`, filled by the indexer's own
+hits from a larger pool (`docs/hit_driven_projection.md`), so a live turn's
+attended context is at most 262,144 positions and every position is under the
+trained RoPE. The only exception is a working set whose locks and reserve pass
+the window: it fills YaRN ×2 and logs a warning. A production figure quoted
+beside a gate row is therefore an in-window figure too, unless that warning
+was logged.
+
 The window is a property of the checkpoint **as this code loads it**, which is
 not always the number the file advertises:
 

@@ -40,6 +40,8 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::{sys, CudaEvent, CudaStream};
 #[cfg(feature = "cuda")]
+use candle::cuda_backend::graph::relaxed_capture;
+#[cfg(feature = "cuda")]
 use candle::cuda_backend::{ask_holders_to_move, HeldGround};
 #[cfg(feature = "cuda")]
 use candle::{CudaDevice, Device};
@@ -49,7 +51,9 @@ use super::held_extents::{Extents, Taken};
 #[cfg(feature = "cuda")]
 use super::held_ledger::{HeldLedger, HeldSite};
 #[cfg(feature = "cuda")]
-use super::region_pool::{regions_open, run_free_below, SpanClaims, SpanRegion};
+use super::region_pool::{
+    regions_open, run_free_below, span_region_refusal, SpanClaims, SpanRegion,
+};
 use super::types::TARGET_ARENA_BYTES;
 
 /// Holders listed beside a refusal: enough to name what filled the ground.
@@ -133,6 +137,9 @@ struct Inner {
     growth_at: usize,
     /// The most held at once since the process started.
     peak: usize,
+    /// Why the last provisioning was left short of its headroom, when it was:
+    /// what [`SpanHeldGround::report_shortfall`] last said.
+    last_shortfall: Option<&'static str>,
 }
 
 #[cfg(feature = "cuda")]
@@ -141,13 +148,23 @@ impl Inner {
         self.bootstrap.used() + self.arenas.iter().map(|a| a.extents.used()).sum::<usize>()
     }
 
-    /// Free ground a take can land in — not a vacating arena's.
-    fn free(&self) -> usize {
-        self.bootstrap.capacity() - self.bootstrap.used()
-            + self
-                .staying()
-                .map(|a| a.extents.capacity() - a.extents.used())
-                .sum::<usize>()
+    /// Free ground in the held arenas a take can land in — not a vacating
+    /// arena's, and not the bootstrap block's: what the headroom is kept in.
+    ///
+    /// **The bootstrap's slack is not headroom.** The block is sized from what
+    /// a model load takes ([`BOOTSTRAP_HELD_BYTES`]); what the load leaves of
+    /// it is whatever the load left, not ground anything was provisioned for.
+    /// Counted as headroom, a fresh process provisioned nothing — the slack
+    /// passed for a region in hand — and its first forwards ran on it: a
+    /// slot-state slab, the penalty counts and the hit counters' strides
+    /// together came to a megabyte past it, inside a captured forward, where a
+    /// take that finds no room goes to the driver and the capture is lost. A
+    /// take still lands in the bootstrap when it has room; provisioning keeps
+    /// its headroom where it can grow.
+    fn arena_free(&self) -> usize {
+        self.staying()
+            .map(|a| a.extents.capacity() - a.extents.used())
+            .sum::<usize>()
     }
 
     /// [`SpanHeldGround::provision`]'s claims, worked out as it works them out
@@ -158,7 +175,7 @@ impl Inner {
         let grew = self.peak_since.saturating_sub(self.used_at_provision) + self.refused_since;
         let mut growth = self.growth;
         growth[self.growth_at] = grew;
-        let short = headroom_for(&growth).saturating_sub(self.free());
+        let short = headroom_for(&growth).saturating_sub(self.arena_free());
         let widest = if self.widest_refused > self.largest_free() {
             self.widest_refused.div_ceil(REGION).max(1) * REGION
         } else {
@@ -233,27 +250,35 @@ impl Inner {
 
     /// Return every pending range whose fence has fired; with `wait`, the
     /// oldest one is waited for first, so at least one comes back.
+    ///
+    /// The fences are read with this thread's capture mode relaxed: a take
+    /// arrives inside a recording forward, and there the driver refuses a
+    /// fence query or wait outright and invalidates the forward's capture —
+    /// measured on BlackWorld (2026-11-14), the first take of a decode after a
+    /// give-back lost the wave, and every boot crash-looped on it.
     fn reclaim(&mut self, wait: bool) {
-        if wait {
-            if let Some((event, _, _)) = self.pending.first() {
-                // A failed wait leaves the range pending rather than reusing
-                // memory a launch may still read.
-                let _ = event.synchronize();
+        relaxed_capture(|| {
+            if wait {
+                if let Some((event, _, _)) = self.pending.first() {
+                    // A failed wait leaves the range pending rather than
+                    // reusing memory a launch may still read.
+                    let _ = event.synchronize();
+                }
             }
-        }
-        let mut i = 0;
-        while i < self.pending.len() {
-            // `cuEventQuery`: SUCCESS once every launch queued before the
-            // record has completed; anything else leaves the range pending.
-            let fired = unsafe { sys::cuEventQuery(self.pending[i].0.cu_event()) }
-                == sys::CUresult::CUDA_SUCCESS;
-            if fired {
-                let (_, ground, t) = self.pending.swap_remove(i);
-                self.extents_mut(ground).release(t.start, t.len);
-            } else {
-                i += 1;
+            let mut i = 0;
+            while i < self.pending.len() {
+                // `cuEventQuery`: SUCCESS once every launch queued before the
+                // record has completed; anything else leaves the range pending.
+                let fired = unsafe { sys::cuEventQuery(self.pending[i].0.cu_event()) }
+                    == sys::CUresult::CUDA_SUCCESS;
+                if fired {
+                    let (_, ground, t) = self.pending.swap_remove(i);
+                    self.extents_mut(ground).release(t.start, t.len);
+                } else {
+                    i += 1;
+                }
             }
-        }
+        })
     }
 
     /// `bytes` from the bootstrap block, else the lowest arena that holds them and
@@ -320,6 +345,7 @@ impl SpanHeldGround {
                 growth: [0; RECENT],
                 growth_at: 0,
                 peak: 0,
+                last_shortfall: None,
             }),
         })
     }
@@ -354,20 +380,52 @@ impl SpanHeldGround {
         self.lock().ledger.sites()
     }
 
-    /// Claim `bytes` worth of held arena — one region, or a run when `bytes` is
-    /// wider than a region — or `None` when the span will not give it now: a
-    /// model still loading, a forward owning the partition, no ground spare.
-    fn claim_arena(device: &CudaDevice, bytes: usize) -> Option<Vec<SpanRegion>> {
-        if !regions_open(&device.cuda_stream()) {
-            return None;
+    /// Say once, each time the reason changes, that provisioning was left
+    /// short of its headroom and `why` the span refused — or that it is no
+    /// longer short. A take inside a forward that finds no room goes to the
+    /// driver, so a shortfall that stands is what a refused take follows.
+    fn report_shortfall(&self, why: Option<&'static str>) {
+        let mut inner = self.lock();
+        if inner.last_shortfall == why {
+            return;
         }
-        let claims = SpanClaims::open(&Device::Cuda(device.clone()), "held ground").ok()?;
+        inner.last_shortfall = why;
+        let stats = stats_of(&inner);
+        drop(inner);
+        match why {
+            Some(why) => tracing::warn!(
+                target: "candle_nn::kv_cache::held_ground",
+                used = stats.used,
+                capacity = stats.capacity,
+                arenas = stats.arenas,
+                "held ground could not be provisioned to its headroom: {why}"
+            ),
+            None => tracing::info!(
+                target: "candle_nn::kv_cache::held_ground",
+                used = stats.used,
+                capacity = stats.capacity,
+                arenas = stats.arenas,
+                "held ground is provisioned to its headroom again"
+            ),
+        }
+    }
+
+    /// Claim `bytes` worth of held arena — one region, or a run when `bytes` is
+    /// wider than a region — or why the span will not give it now: a model
+    /// still loading, a forward owning the partition, no ground spare.
+    fn claim_arena(device: &CudaDevice, bytes: usize) -> Result<Vec<SpanRegion>, &'static str> {
+        if !regions_open(&device.cuda_stream()) {
+            return Err("a model is still loading into the dense block");
+        }
+        let claims = SpanClaims::open(&Device::Cuda(device.clone()), "held ground")
+            .map_err(|_| "a forward owns the partition: the claims window is closed")?;
         let k = bytes.div_ceil(REGION).max(1);
-        if k == 1 {
+        let claimed = if k == 1 {
             claims.claim().ok().flatten().map(|r| vec![r])
         } else {
             claims.claim_run(k).ok().flatten()
-        }
+        };
+        claimed.ok_or_else(|| span_region_refusal(&Device::Cuda(device.clone())))
     }
 
     /// **From a known point between forwards:** make sure one take of `bytes`
@@ -387,7 +445,7 @@ impl SpanHeldGround {
         if fits {
             return;
         }
-        if let Some(regions) = Self::claim_arena(device, bytes) {
+        if let Ok(regions) = Self::claim_arena(device, bytes) {
             self.lock().insert_arena(regions);
         }
     }
@@ -421,21 +479,26 @@ impl SpanHeldGround {
             let headroom = headroom_for(&inner.growth);
             let widest = std::mem::take(&mut inner.widest_refused);
             let widest = (widest > inner.largest_free()).then_some(widest);
-            (headroom.saturating_sub(inner.free()), widest)
+            (headroom.saturating_sub(inner.arena_free()), widest)
         };
         if let Some(bytes) = widest {
-            if let Some(regions) = Self::claim_arena(device, bytes) {
+            if let Ok(regions) = Self::claim_arena(device, bytes) {
                 self.lock().insert_arena(regions);
             }
         }
         let mut need = short;
+        let mut refused = None;
         while need > 0 {
-            let Some(regions) = Self::claim_arena(device, REGION) else {
-                break;
-            };
-            self.lock().insert_arena(regions);
+            match Self::claim_arena(device, REGION) {
+                Ok(regions) => self.lock().insert_arena(regions),
+                Err(why) => {
+                    refused = Some(why);
+                    break;
+                }
+            }
             need = need.saturating_sub(REGION);
         }
+        self.report_shortfall(refused);
         // Released outside the lock: an arena's regions go back to the span
         // through the pool's lock.
         let released = {
@@ -453,7 +516,7 @@ impl SpanHeldGround {
                 let base = a.base;
                 let idle = a.extents.used() == 0 && !inner.holds(Ground::Arena(base));
                 let vacated = inner.vacating.contains(&base);
-                let spare = inner.free().saturating_sub(a.extents.capacity());
+                let spare = inner.arena_free().saturating_sub(a.extents.capacity());
                 if idle && (vacated || spare >= headroom + inner.vacating_bytes()) {
                     released.push(inner.arenas.remove(i));
                     inner.vacating.retain(|&b| b != base);
@@ -852,27 +915,37 @@ mod tests {
         assert_eq!(headroom_for(&g), 6 * REGION);
     }
 
-    /// **The next claim is the headroom short of free ground and the widest
-    /// refused take's arena, in whole regions.** On a ground of bootstrap only,
-    /// with no device: a quiet one claims nothing; a take of a region and a half
-    /// leaves a half free against two and a half of headroom, so two regions; a
-    /// refused take of three regions adds its own three-region arena and grows
-    /// the headroom by three more. The window's growth, rounded to regions, is
-    /// what each later window of a sweep may claim again.
+    /// **The next claim is the headroom short of free arena ground and the
+    /// widest refused take's arena, in whole regions.** On a ground of
+    /// bootstrap only, with no device: a quiet one still claims its region in
+    /// hand, the bootstrap's two free regions notwithstanding — they are the
+    /// load's slack, not headroom; a take of a region and a half, landed in the
+    /// bootstrap, grows the headroom to two and a half against no arena, so
+    /// three regions; a refused take of three regions grows it to five and a
+    /// half, so six, beside its own three-region arena. The window's growth,
+    /// rounded to regions, is what each later window of a sweep may claim
+    /// again.
     #[test]
     fn the_next_claim_is_what_provisioning_takes() {
         let held = SpanHeldGround::new(0x7f00_0000_0000, 2 * REGION);
         let site = Location::caller();
-        assert_eq!(held.next_claim(), HeldClaim::default(), "a quiet ground");
+        assert_eq!(
+            held.next_claim(),
+            HeldClaim {
+                growth: REGION,
+                ..HeldClaim::default()
+            },
+            "a quiet ground keeps a region in hand"
+        );
 
         held.take(REGION + REGION / 2, site)
             .expect("bootstrap room");
-        assert_eq!(held.next_claim().growth, 2 * REGION);
+        assert_eq!(held.next_claim().growth, 3 * REGION);
 
         assert_eq!(held.take(3 * REGION, site), None, "wider than any ground");
-        // Grew 4.5 regions → headroom 5.5, free 0.5: five regions short, and the
-        // refused take's own arena of three.
-        assert_eq!(held.next_claim().growth, (5 + 3) * REGION);
+        // Grew 4.5 regions → headroom 5.5 against no arena: six regions short,
+        // and the refused take's own arena of three.
+        assert_eq!(held.next_claim().growth, (6 + 3) * REGION);
         assert_eq!(held.next_claim().landing, 0, "no arena lives yet");
         assert_eq!(
             held.next_claim().per_window,

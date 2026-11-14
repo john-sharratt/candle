@@ -337,8 +337,8 @@ impl StencilSession {
                     };
                     let set = self.held_frontier(node, pos, offered);
                     self.carried.clear();
-                    if self.tree.is_name_branch(node) {
-                        self.call.begin_naming();
+                    if self.tracks_arm(node) {
+                        self.call.begin_arm();
                     }
                     self.cursor = Cursor::InBranch { node, pos };
                     StencilAction::MaskedDecode(set)
@@ -495,12 +495,12 @@ impl StencilSession {
             // the delimiter isn't legal here.
             StencilNode::Static { .. } | StencilNode::FreeText(_) | StencilNode::End => Out::Bad,
         };
-        // A name branch entered on a pushed-back delimiter names its call as
-        // one entered from `next_action` does.
-        let naming = self.tree.is_name_branch(node);
-        if naming {
-            self.call.begin_naming();
-            self.call.name(tok);
+        // A branch entered on a pushed-back delimiter names its call, or
+        // chooses its value, as one entered from `next_action` does.
+        let tracked = self.tracks_arm(node);
+        if tracked {
+            self.call.begin_arm();
+            self.call.take(tok);
         }
         match out {
             Out::Static { rest, next } => {
@@ -520,8 +520,8 @@ impl StencilSession {
                 StencilAction::MaskedDecode(AllowedSet::from_tokens(frontier))
             }
             Out::BranchAccept(n) => {
-                if naming {
-                    self.name_call(node, &[tok]);
+                if tracked {
+                    self.arm_done(node, &[tok]);
                 }
                 self.cursor = Cursor::At(n);
                 self.next_action()
@@ -530,8 +530,8 @@ impl StencilSession {
             // taken as written; anything the span would have rewritten is out
             // of reach, and bails like any token the grammar cannot take.
             Out::BranchSpill(spill) => {
-                if naming {
-                    self.name_call(node, &spill.arm);
+                if tracked {
+                    self.arm_done(node, &spill.arm);
                 }
                 let rest = spill.rest.clone();
                 match self.spill_into(spill, tok, &rest) {
@@ -558,9 +558,9 @@ impl StencilSession {
         match std::mem::replace(&mut self.cursor, Cursor::Done) {
             Cursor::InBranch { node, pos } => {
                 let step = self.branch_trie(node).step(pos, token);
-                let naming = self.tree.is_name_branch(node);
-                if naming {
-                    self.call.name(token);
+                let tracked = self.tracks_arm(node);
+                if tracked {
+                    self.call.take(token);
                 }
                 match step {
                     Some(Step::Descend(p)) => {
@@ -568,17 +568,17 @@ impl StencilSession {
                         Ok(Observe::Continue)
                     }
                     Some(Step::Accept(next)) => {
-                        if naming {
-                            let arm = self.call.naming().to_vec();
-                            self.name_call(node, &arm);
+                        if tracked {
+                            let arm = self.call.arm().to_vec();
+                            self.arm_done(node, &arm);
                         }
                         self.cursor = Cursor::At(next);
                         Ok(Observe::ArmComplete)
                     }
                     Some(Step::Spill(id)) => {
                         let spill = self.branch_trie(node).spill(id).clone();
-                        if naming {
-                            self.name_call(node, &spill.arm);
+                        if tracked {
+                            self.arm_done(node, &spill.arm);
                         }
                         Ok(self.spill_into(spill, token, bytes))
                     }
@@ -607,14 +607,41 @@ impl StencilSession {
         }
     }
 
+    /// Whether the walk records the arm it takes in the branch at `node`: a
+    /// branch naming a call's tool or choosing an argument's value.
+    fn tracks_arm(&self, node: NodeId) -> bool {
+        self.tree.is_name_branch(node) || self.tree.is_chosen_branch(node)
+    }
+
+    /// The branch at `node` completed `arm`: the call is of the tool it names,
+    /// or its field holds the value it chose.
+    fn arm_done(&mut self, node: NodeId, arm: &[TokenId]) {
+        if self.tree.is_name_branch(node) {
+            self.name_call(node, arm);
+            return;
+        }
+        match self.tree.value_chosen(node, arm) {
+            Some((field, value)) => {
+                let (field, value) = (Arc::clone(field), Arc::clone(value));
+                self.call.chose(&field, &value);
+            }
+            // An arm that writes no value — `null` — leaves the field unwritten.
+            None => self.call.begin_arm(),
+        }
+    }
+
     /// The name branch at `node` completed `arm`: the call is of the tool it
-    /// names.
+    /// names, written with the values its schema fixes.
     fn name_call(&mut self, node: NodeId, arm: &[TokenId]) {
         let tool = self.tree.tool_named(node, arm).cloned();
         if let Some(tool) = &tool {
             self.named.push(Arc::clone(tool));
         }
-        self.call.named(tool);
+        let fixed = tool
+            .as_deref()
+            .map(|t| self.tree.fixed_of(t).to_vec())
+            .unwrap_or_default();
+        self.call.named(tool, &fixed);
     }
 
     /// The value being recorded is the call's once the walk has left its span.

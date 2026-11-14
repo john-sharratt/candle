@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use candle::Result;
-use candle_kernels::simple::qsa_topk::SPLIT_KEYS;
+use candle_kernels::simple::qsa_topk::{CUT_WORDS, MAX_PINS, SPLIT_KEYS};
 
 use super::config::IndexerConfig;
 use super::indexer::{
@@ -65,7 +65,8 @@ pub fn select_layer_bytes(
         widest_candidates(spans, offsets, idx_map, kv, ratio),
         &cfg.strata,
     )?;
-    bytes += a(rows * stride * 4) + a(rows * 4);
+    // Its entries, its counts and its rows' cut records.
+    bytes += a(rows * stride * 4) + a(rows * 4) + a(rows * CUT_WORDS * 4);
     // The selection kernel's split scratch, a fixed size.
     bytes += a(SPLIT_KEYS * 8);
     // The queries: the projection, the norm's chain (the square, the mean, the
@@ -114,8 +115,9 @@ pub fn select_layer_bytes(
         let run_rows: usize = spans[run.clone()].iter().map(|s| s.len).sum();
         let run_widest = span_cand[run].iter().copied().max().unwrap_or(0).max(1);
         // The run's scores, and the selection kernel's packed row metadata for
-        // its rows: candidates, position, tail and prompt span.
-        bytes += a(run_rows * run_widest * 4) + a(4 * run_rows * 4);
+        // its rows: candidates, position, tail, prompt span and the two bounds
+        // of each pinned range.
+        bytes += a(run_rows * run_widest * 4) + a((4 + 2 * MAX_PINS) * run_rows * 4);
     }
     // The page layout the attention walks, when any sequence holds a prefix.
     if needs_pages {

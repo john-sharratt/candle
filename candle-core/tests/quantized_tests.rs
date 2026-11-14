@@ -310,13 +310,27 @@ fn qmm_batch(dev: &Device) -> Result<()> {
     let lhs4 = Tensor::cat(&[&lhs3, &lhs3], 0)?;
     let mm4 = rhs.forward(&lhs4)?;
     assert_eq!(mm4.shape().dims(), [12, 6]);
+    // Every row of every result is finite before any is compared: a NaN
+    // compared away reports only that a sum was NaN, not which call or row
+    // produced it.
+    for (what, t) in [("lhs4", &lhs4), ("mm3", &mm3), ("mm4", &mm4)] {
+        let bad: Vec<usize> = t
+            .to_vec2::<f32>()?
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.iter().any(|v| !v.is_finite()))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{what}: rows holding non-finite values: {bad:?}"
+        );
+    }
     let diff4 = (mm4.i(..6)? - &mm3)?.abs()?.sum_all()?.to_vec0::<f32>()?;
     if dev.is_cuda() {
-        // Batches through 16 rows share the vec-kernel family on cuda (a batch
-        // past the templates' 8 runs as ≤8-row chunks), but the kernel's warp
-        // count varies with its batch count, so same-row results across
-        // different batch sizes agree only to rounding — a 12-row call's rows
-        // straddle an 8-row and a 4-row launch where the 6-row call was one.
+        // A 12-row call takes MMQ on cuda (the vec kernel serves through 8
+        // rows), which reduces in another order than the 6-row vec call, so
+        // same-row results agree only to rounding.
         assert!(diff4 < 1e-4, "12-row rows 0..6 vs 6-row call: {diff4}")
     } else {
         assert_eq!(diff4, 0.0)
@@ -326,9 +340,8 @@ fn qmm_batch(dev: &Device) -> Result<()> {
         .sum_all()?
         .to_vec0::<f32>()?;
     if dev.is_cuda() {
-        // Duplicate inputs, but not one launch: rows 8..12 run as the 4-row
-        // chunk (4 warps) while their twins in 0..6 sit in the 8-row chunk
-        // (2 warps), so this is rounding-equal, not bit-equal.
+        // Duplicate inputs in one MMQ launch, compared to rounding as every
+        // other cross-row comparison here is.
         assert!(diff4 < 1e-4, "12-row halves disagree: {diff4}")
     } else {
         assert_eq!(diff4, 0.0)

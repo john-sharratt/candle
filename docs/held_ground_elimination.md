@@ -84,6 +84,24 @@ of **span regions** claimed as a tenant (`SlotTenant::Held`) instead of a fixed 
   the most any of the last 16 windows took, plus one region. A take inside a forward — a
   slot-state promotion at a 32-token boundary, a sampler pack growing — finds ground
   already there.
+- **The headroom is arena ground, never the bootstrap's slack.** A take lands in the
+  bootstrap block whenever it has room, but what the load left of the block is not ground
+  anything was provisioned for, so provisioning does not count it. Counted, a fresh
+  process provisioned nothing — the slack passed for a region in hand — and its first
+  forwards ran on whatever the load had left: on BlackWorld (2026-11-14) a slot-state slab
+  (16 MiB), the penalty counts and the hit counters' strides (1.9 MiB) came to a megabyte
+  past it, inside a captured forward, where the take went to the driver, the capture was
+  lost and the expert pipeline aborted — every boot, before a provisioning had any growth
+  to learn from. A process therefore holds one arena from its first forward on.
+- **A take reads its fences with the capture mode relaxed.** Every take first
+  returns the given-back ranges whose fences have fired, and a take arrives inside
+  a recording forward. Under the `ThreadLocal` mode the forward captures in, the
+  driver refuses a `cuEventQuery` or `cuEventSynchronize` on the recording thread
+  — even of a fence recorded outside any capture — and invalidates the capture.
+  So the reads run with the thread's mode exchanged for relaxed, which answers
+  both and leaves the capture recording (`graph::capture::relaxed`). Measured on
+  BlackWorld (2026-11-14): the first take of a decode after a give-back — the
+  hit counters' span table, refreshed — lost the wave at every boot.
 - **A take never claims.** A take arrives from arbitrary depth — a slot-state slab under
   the sequence-state lock, a staging scratch under the device's — and a region claim
   sweeps empty arenas and may buy ground from the weight side, each of which takes locks

@@ -366,6 +366,11 @@ differently today:
 | `max_concurrent` | the builder's | the builder's | sum — each tenant's sessions count against one scheduler |
 | `thinking` | `true` | unset | `true` if any tenant asks |
 
+A selecting engine's slot and pool are not among them: the slot is the engine's
+trained window less the target layer's `reserve_tokens`, read from each tenant's own
+schema, and `pool_tokens` is the card's (`scheduler/pool.rs`, `pool_tokens_for`), so
+both tenants size them alike on one card (`docs/hit_driven_projection.md` §7.2).
+
 `CoreRequests` carries these (`candle_conversation::engine_slot::CoreRequests`); the
 tenant that builds the engine merges every tenant's by the rule column before it
 builds (§3.2), and the merged values are what the engine logs at start.

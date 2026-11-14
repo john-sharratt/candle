@@ -50,8 +50,11 @@ pub(super) fn turn_lifts(
     out
 }
 
-/// Hits over blocks × queries per `group(key)`, summed across parts; a group
-/// with no blocks counted is left out.
+/// Hits over blocks × queries per `group(key)`, summed across parts — each
+/// declared entry over the queries that could have hit it, the selection's
+/// for a loaded round and the shadow scan's for a pooled one (§6.4). A key
+/// declared more than once — a pooled round over several pages — sums its
+/// entries. A group with no blocks counted is left out.
 fn density_by<G: Eq + Hash>(parts: &[HitPart], group: impl Fn(&RoundKey) -> G) -> HashMap<G, f32> {
     let mut sums: HashMap<G, (f64, f64)> = HashMap::new();
     for (keys, hits) in parts {
@@ -60,7 +63,7 @@ fn density_by<G: Eq + Hash>(parts: &[HitPart], group: impl Fn(&RoundKey) -> G) -
             let b = hits.blocks.get(i).copied().unwrap_or(0) as f64;
             let e = sums.entry(group(key)).or_insert((0.0, 0.0));
             e.0 += h;
-            e.1 += b * hits.queries as f64;
+            e.1 += b * hits.queries_of(i) as f64;
         }
     }
     sums.into_iter()
@@ -94,7 +97,9 @@ mod tests {
             PieceHits {
                 hits: vec![6, 2, 0],
                 blocks: vec![10, 30, 5],
+                loaded: 3,
                 queries: 4,
+                shadow_queries: 0,
             },
         );
         let d = hit_density(std::slice::from_ref(&part));
@@ -122,7 +127,9 @@ mod tests {
             PieceHits {
                 hits: vec![4],
                 blocks: vec![10],
+                loaded: 1,
                 queries: 2,
+                shadow_queries: 0,
             },
         );
         let second = (
@@ -130,11 +137,38 @@ mod tests {
             PieceHits {
                 hits: vec![1],
                 blocks: vec![10],
+                loaded: 1,
                 queries: 3,
+                shadow_queries: 0,
             },
         );
         let r = round_density(&[first, second]);
         assert!((r[&key(7, 0, 0)] - 0.1).abs() < 1e-7);
+    }
+
+    /// **A loaded and an unloaded round hit by every query that could have
+    /// hit them score the same density, whatever the stride's row counts**
+    /// (`docs/hit_driven_projection.md` §13.2): a loaded round of 8 blocks hit
+    /// at every block by each of 300 prefill rows, and a pooled round of 12
+    /// blocks — declared over two pages — hit at every block by each of the 64
+    /// rows the shadow scan kept, both read 1.0.
+    #[test]
+    fn a_loaded_and_a_pooled_round_read_alike() {
+        let part = (
+            vec![key(7, 0, 0), key(9, 0, 1), key(9, 0, 1)],
+            PieceHits {
+                hits: vec![8 * 300, 5 * 64, 7 * 64],
+                blocks: vec![8, 5, 7],
+                loaded: 1,
+                queries: 300,
+                shadow_queries: 64,
+            },
+        );
+        let r = round_density(std::slice::from_ref(&part));
+        assert_eq!(r[&key(7, 0, 0)], 1.0);
+        assert_eq!(r[&key(9, 0, 1)], 1.0);
+        let c = hit_density(std::slice::from_ref(&part));
+        assert_eq!((c[&tl(7)], c[&tl(9)]), (1.0, 1.0));
     }
 
     /// A turn takes the larger lift of the two rounds its records are in: in

@@ -1,24 +1,29 @@
 //! FFI binding for the QSA hit counter (`simple/qsa_hits.cu`).
 //!
 //! `run_qsa_count_hits` adds, for every block a selection row names, one hit
-//! to the counter of the placed piece the block belongs to, and one query for
-//! every row that selected — one launch over a whole wave's rows, each
-//! sequence's rows, block→piece map and counters named by one [`HitSpan`] of a
-//! device table (`docs/hit_driven_projection.md` §6.4). `run_qsa_publish_hits`
-//! copies each counter set into its mapped summary block, where the host reads
-//! it without waiting.
+//! to the counter of the declared round the block belongs to, and one query
+//! for every row that selected — one launch over a whole wave's rows, each
+//! sequence's rows, block→round map, counters and kept-query buffer named by
+//! one [`HitSpan`] of a device table (`docs/hit_driven_projection.md` §6.4).
+//! The same launch keeps the last [`KEEP_SLOTS`] rows of each span, query and
+//! cut record, for the shadow scan. `run_qsa_publish_hits` copies each counter
+//! set into its mapped summary block, where the host reads it without waiting.
 
 use std::ffi::c_void;
 
-/// A block no placed piece owns.
+/// A block no declared round owns.
 pub const NO_PIECE: u32 = u32::MAX;
 
-/// Words ahead of the counts in a summary block (`HIT_SUMMARY_HEADER`).
-pub const SUMMARY_HEADER_WORDS: usize = 5;
+/// Words ahead of the counts in a summary block (`HIT_SUMMARY_HEADER`): begin,
+/// token, generation, end, queries, shadow queries.
+pub const SUMMARY_HEADER_WORDS: usize = 6;
 
-/// Words a counter set holds past its hits: the queries counted, then the
-/// publish sequence word.
-pub const COUNTER_TAIL_WORDS: usize = 2;
+/// Words a counter set holds past its hits: the queries counted, the shadow
+/// queries counted, then the publish sequence word.
+pub const COUNTER_TAIL_WORDS: usize = 3;
+
+/// Kept queries per sequence per sampled layer (`QSA_KEEP_SLOTS`).
+pub const KEEP_SLOTS: usize = 64;
 
 /// One sequence's part of a hit-count launch. Mirrors `HitSpan` in the `.cu`.
 #[repr(C)]
@@ -32,13 +37,16 @@ pub struct HitSpan {
     pub map_len: u32,
     /// Hit counters the sequence holds.
     pub n_pieces: u32,
-    /// Device `[map_len]` u32: block → piece, [`NO_PIECE`] for none.
+    /// Device `[map_len]` u32: block → round, [`NO_PIECE`] for none.
     pub map: *const u32,
-    /// Device `[n_pieces + COUNTER_TAIL_WORDS]` u32: hits, queries and the
-    /// publish sequence, accumulated.
+    /// Device `[n_pieces + COUNTER_TAIL_WORDS]` u32: hits, queries, shadow
+    /// queries and the publish sequence, accumulated.
     pub counters: *mut u32,
     /// Device address of the mapped `[SUMMARY_HEADER_WORDS + n_pieces]` block.
     pub summary: *mut u32,
+    /// Device `[layers, KEEP_SLOTS, q_words + CUT_WORDS]` u32: the kept
+    /// queries, each its rotated query's f32 bits then its cut record.
+    pub keep: *mut u32,
     /// The holder the summary belongs to.
     pub token: u32,
     /// The holder's declaration.
@@ -49,10 +57,10 @@ pub struct HitSpan {
 }
 
 /// Words one [`HitSpan`] is uploaded as.
-pub const HIT_SPAN_WORDS: usize = 14;
+pub const HIT_SPAN_WORDS: usize = 16;
 
 impl HitSpan {
-    /// The span as the kernel reads it, fourteen little-endian `u32` words:
+    /// The span as the kernel reads it, sixteen little-endian `u32` words:
     /// the four counts, each pointer's low and high halves, then the token,
     /// the generation, the publish flag and the padding — what a table of
     /// spans is uploaded as.
@@ -60,6 +68,7 @@ impl HitSpan {
         let map = self.map as u64;
         let counters = self.counters as u64;
         let summary = self.summary as u64;
+        let keep = self.keep as u64;
         [
             self.row_lo,
             self.row_hi,
@@ -71,6 +80,8 @@ impl HitSpan {
             (counters >> 32) as u32,
             summary as u32,
             (summary >> 32) as u32,
+            keep as u32,
+            (keep >> 32) as u32,
             self.token,
             self.generation,
             self.publish,
@@ -81,11 +92,18 @@ impl HitSpan {
 
 extern "C" {
     /// `spans` is device memory holding `n_spans` [`HitSpan`]; `max_rows` the
-    /// most rows any span has.
+    /// most rows any span has. `q` is the wave's `[rows, q_words]` rotated
+    /// queries, `cuts` its `[rows, CUT_WORDS]` cut records, and `layer` the
+    /// sampled layer's index into each span's kept-query buffer.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_qsa_count_hits(
         entries: *const u32,
         entry_stride: i32,
         cnt: *const u32,
+        q: *const f32,
+        q_words: i32,
+        cuts: *const u32,
+        layer: i32,
         spans: *const c_void,
         n_spans: i32,
         max_rows: i32,
@@ -100,7 +118,7 @@ extern "C" {
 mod tests {
     use super::{HitSpan, HIT_SPAN_WORDS};
 
-    /// The layout the kernel reads: four u32, three pointers, four u32 — and
+    /// The layout the kernel reads: four u32, four pointers, four u32 — and
     /// the words a table is uploaded as are exactly the struct's bytes.
     #[test]
     fn a_span_is_the_kernels_layout() {
@@ -114,12 +132,13 @@ mod tests {
             map: 0x1122_3344_5566_7788 as *const u32,
             counters: 0x99aa_bbcc_ddee_ff00 as *mut u32,
             summary: 0x0102_0304_0506_0708 as *mut u32,
+            keep: 0x0a0b_0c0d_0e0f_1011 as *mut u32,
             token: 11,
             generation: 12,
             publish: 1,
             pad: 0,
         };
-        // SAFETY: `HitSpan` is `repr(C)`, 56 bytes, with no padding.
+        // SAFETY: `HitSpan` is `repr(C)`, 64 bytes, with no padding.
         let bytes: [u8; HIT_SPAN_WORDS * 4] = unsafe { std::mem::transmute_copy(&span) };
         let from_words: Vec<u8> = span.words().iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(bytes.to_vec(), from_words);
@@ -136,6 +155,8 @@ mod tests {
                 0x99aa_bbcc,
                 0x0506_0708,
                 0x0102_0304,
+                0x0e0f_1011,
+                0x0a0b_0c0d,
                 11,
                 12,
                 1,

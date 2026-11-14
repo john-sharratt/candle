@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use candle::cuda_backend::cudarc::driver::{sys, CudaEvent, CudaStream};
+use candle::cuda_backend::graph::relaxed_capture;
 use candle::cuda_backend::wave_provenance::{SpanState, WaveCarve, WaveTicket, GUEST_ARENA};
 
 use super::held_extents::{Extents, Taken};
@@ -79,25 +80,31 @@ impl Heap {
 
     /// Return every pending range whose fence has fired; with `wait`, the
     /// oldest is waited for first, so at least one comes back.
+    ///
+    /// Read with the capture mode relaxed, as held ground's are: a fence query
+    /// or wait on a thread recording a capture is refused by the driver and
+    /// invalidates that capture.
     fn reclaim(&mut self, wait: bool) {
-        if wait {
-            if let Some((event, _, _)) = self.pending.first() {
-                // A failed wait leaves the range pending rather than reusing
-                // memory a launch may still read.
-                let _ = event.synchronize();
+        relaxed_capture(|| {
+            if wait {
+                if let Some((event, _, _)) = self.pending.first() {
+                    // A failed wait leaves the range pending rather than
+                    // reusing memory a launch may still read.
+                    let _ = event.synchronize();
+                }
             }
-        }
-        let mut i = 0;
-        while i < self.pending.len() {
-            let fired = unsafe { sys::cuEventQuery(self.pending[i].0.cu_event()) }
-                == sys::CUresult::CUDA_SUCCESS;
-            if fired {
-                let (_, run, t) = self.pending.swap_remove(i);
-                self.runs[run].extents.release(t.start, t.len);
-            } else {
-                i += 1;
+            let mut i = 0;
+            while i < self.pending.len() {
+                let fired = unsafe { sys::cuEventQuery(self.pending[i].0.cu_event()) }
+                    == sys::CUresult::CUDA_SUCCESS;
+                if fired {
+                    let (_, run, t) = self.pending.swap_remove(i);
+                    self.runs[run].extents.release(t.start, t.len);
+                } else {
+                    i += 1;
+                }
             }
-        }
+        })
     }
 
     /// The lowest range that fits, in the first run that has one.

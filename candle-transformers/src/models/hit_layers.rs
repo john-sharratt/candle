@@ -11,17 +11,50 @@
 //! a model whose attention reads every position has no selection to count, and
 //! the setting is nothing to it.
 
+use std::ops::Range;
+
+use crate::models::piece_key::PieceKey;
+
 /// What one sequence's selecting layers chose since the last read: one count
-/// per declared piece, and how many queries (rows × sampled layers) were
-/// counted — what a hit density divides by.
+/// per declared round — the loaded rounds first, then the pooled ones the
+/// shadow scan reads (`docs/hit_driven_projection.md` §6.3) — and how many
+/// queries could have hit each kind, what a hit density divides by (§6.4).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PieceHits {
-    /// Hits per declared piece, in declaration order.
+    /// Hits per declared round, in declaration order.
     pub hits: Vec<u32>,
-    /// Blocks each declared piece owns — what its hits are out of.
+    /// Blocks each declared round owns — what its hits are out of.
     pub blocks: Vec<u32>,
-    /// Query rows counted, summed over the sampled layers.
+    /// How many of the declared rounds, from the first, are loaded; the rest
+    /// are pooled.
+    pub loaded: usize,
+    /// Query rows counted against the loaded rounds, summed over the sampled
+    /// layers.
     pub queries: u64,
+    /// Kept queries the shadow scan scored against the pooled rounds, summed
+    /// over the sampled layers.
+    pub shadow_queries: u64,
+}
+
+impl PieceHits {
+    /// The queries round `i` could have been hit by: the selection's for a
+    /// loaded round, the shadow scan's for a pooled one.
+    pub fn queries_of(&self, i: usize) -> u64 {
+        if i < self.loaded {
+            self.queries
+        } else {
+            self.shadow_queries
+        }
+    }
+}
+
+/// A pooled round the projection did not place, named for the shadow scan
+/// (`docs/hit_driven_projection.md` §6.3): the piece whose index pages hold
+/// it, and its positions within the piece.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PooledRound {
+    pub piece: PieceKey,
+    pub positions: Range<usize>,
 }
 
 /// Percentiles over a model's selecting layers, in `0..=100`.

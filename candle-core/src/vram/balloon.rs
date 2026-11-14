@@ -10,7 +10,9 @@ use cudarc::driver::sys::CUdeviceptr;
 
 use super::budget::GovernorConfig;
 use super::reading::{ProbeKind, VramProbe, VramReading};
-use crate::{DType, Device, Error, Result, Tensor};
+#[cfg(any(feature = "cuda", test, feature = "vram-test-util"))]
+use crate::Error;
+use crate::{DType, Device, Result, Tensor};
 
 /// A source of touched device memory the balloon can claim and release. Abstracted
 /// so the balloon *logic* is unit-testable without a GPU.
@@ -290,7 +292,7 @@ impl FakeBalloonAllocator {
 impl BalloonAllocator for FakeBalloonAllocator {
     fn alloc_and_touch(&mut self, bytes: u64) -> Result<()> {
         if self.claimed.saturating_add(bytes) > self.ceiling {
-            return Err(crate::Error::Msg("fake balloon: out of memory".into()));
+            return Err(Error::Msg("fake balloon: out of memory".into()));
         }
         self.claimed += bytes;
         self.vram.consume(bytes);

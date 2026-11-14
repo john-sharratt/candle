@@ -115,12 +115,26 @@ formula the normalization gate measured best (`provenance_gates normalization`,
 - **Past everything the background holds** a score keeps rising one nat per nat
   of `ln(1 + x)` from the top bin's edge, so two scores beyond the whole
   background still rank by size.
+- **A score is read against the samples that scored.** A background keeps its
+  samples of no evidence (zeros) as a count, and `P(background ≥ x)` is taken
+  over the others alone. Late fusion gives each probe token to one candidate, so
+  on most probes most candidates score nothing and a background is mostly zeros.
+  Counted, they made any score at all a far-tail event: on the 0.8B tool
+  catalog, 98% of a tool's warm-up samples were zero, so one stray vote read
+  `−ln 0.02` ≈ 850 — past the tools' 800 gate whatever its size (`file_grep` at
+  raw 84 read 859 on a web question; `layer_toggle` at raw 18.7 read 896). Among
+  the samples that scored, a stray vote reads as the stray votes it resembles,
+  and only a score past those is a hit. Measured on the selection-replay
+  fixture's tool catalog leave-one-out (`selection_experiments` round 6): other
+  tools past 800 fell from 1.49 a probe to 0.71, Top-1 82.1% → 80.0%, Top-5
+  98.9% → 97.9%.
 - **A candidate too new for a background** (fewer than `min_background`, 8,
-  samples) is read against its scope's pooled background — every sample any of
-  its siblings was taught — and a scope with too little pooled either, against
-  the probe's own scores across the competition. A competition is therefore
-  normalized in one call (`NormalizationCache::normalize`), the pooled documents
-  of a group included.
+  scoring samples) is read against its scope's pooled background — every sample
+  any of its siblings was taught — and a scope with too little pooled either,
+  against the probe's own scores across the competition. Samples of no evidence
+  never count toward the 8: a hundred zeros are no background. A competition is
+  therefore normalized in one call (`NormalizationCache::normalize`), the pooled
+  documents of a group included.
 - A score of no evidence (zero) reads zero.
 
 ### 3.1a The hit level it replaced

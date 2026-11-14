@@ -15,6 +15,10 @@
 //!                   disjoint, empty when the two agree
 //!   entries        device u32[n_rows * entry_stride] — ascending by block
 //!   cnt             device u32[n_rows] — entries written, or `DENSE_ROW`
+//!   cuts            device u32[n_rows * CUT_WORDS] — each row's cut record:
+//!                   the lowest score any window kept as f32 bits (`NO_CUT`
+//!                   when it ranked nothing), then its position, candidates
+//!                   and tail cells
 //!   window_blocks   candidate blocks per window; `0` is one window
 //!   recent_blocks   the recent span nearest the query
 //!   recent_forced   `1` attends the recent span whole; `0` ranks it everywhere
@@ -48,6 +52,13 @@ pub const SPLIT_BLOCKS: usize = 512;
 /// The split launch's scratch, in u64 keys: `MAX_KEEP` per block.
 pub const SPLIT_KEYS: usize = SPLIT_BLOCKS * MAX_KEEP;
 
+/// Words of a row's cut record. Mirrors `QSA_CUT_WORDS` in `qsa_select.cuh`.
+pub const CUT_WORDS: usize = 4;
+
+/// The cut of a row that ranked nothing — a dense row, or one whose pool was
+/// all pinned: a quiet NaN's bits. Mirrors `QSA_NO_CUT`.
+pub const NO_CUT: u32 = 0x7FC0_0000;
+
 extern "C" {
     /// How many slices each window of a launch over `n_rows` rows splits into;
     /// `0` runs the single pass. Depends on the current device's SM count.
@@ -71,6 +82,7 @@ extern "C" {
         entries: *mut u32,
         entry_stride: i32,
         cnt: *mut u32,
+        cuts: *mut u32,
         ratio: i32,
         top_k: i32,
         window_blocks: i32,

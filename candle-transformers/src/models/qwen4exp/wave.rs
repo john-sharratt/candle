@@ -52,7 +52,10 @@ use super::capture_rows::CaptureRows;
 use super::coverage::coverage_disagreements;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
-use super::hits::{block_map, block_range, count_hits, HitHolder, HitTable, SeqHits};
+use super::hits::{
+    block_map, block_range, count_hits, HitHolder, HitTable, KeepShape, PooledRounds, SeqHits,
+    ShadowScan,
+};
 use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::indexer::{
     compact_index_caches, select_layer, selection_stride, IndexCache, IndexSnapshot, SplicePiece,
@@ -65,6 +68,8 @@ use super::qsa::IndexerWeights;
 use super::qsa_select::{budget_fits_kernel, coalesce_ranges, Strata, MAX_PINS};
 use super::resident_page::{PageRegistry, ResidentPage};
 use super::select_bytes::select_layer_bytes;
+use super::sequence_pools::SequencePools;
+use super::shadow::{ShadowGeometry, ShadowRows, ShadowSegment};
 use super::spec::SpecCapture;
 use super::state_slots::state_buffer;
 use crate::models::batched_inference::{
@@ -88,7 +93,7 @@ use crate::models::expert_lre::{
     PipelineStats, WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS, STAGED_HOPS,
 };
 use crate::models::head_rows::select_head_rows;
-use crate::models::hit_layers::{HitPercentiles, PieceHits};
+use crate::models::hit_layers::{HitPercentiles, PieceHits, PooledRound};
 use crate::models::lazy_rope::LazyRope;
 use crate::models::operand_guard::expect_dense_view;
 use crate::models::piece_key::PieceKey;
@@ -148,10 +153,6 @@ fn seal_live(c: &IndexCache, last_cells: usize) -> Result<SealedIndex> {
 /// accepted/step column at C6 and above.
 pub const DRAFT_HEAD_MAX_COMPRESSION: u8 = 3;
 
-/// One sequence's pool: each pooled piece's resident pages at the sampled
-/// layers.
-type PooledPieces = HashMap<PieceKey, Vec<Arc<ResidentPage>>>;
-
 /// The batched model the scheduler drives.
 pub struct Qwen4ExpBatched {
     /// `pub(super)` so the draft head's own module can reach the engine it runs
@@ -191,7 +192,7 @@ pub struct Qwen4ExpBatched {
     /// with no K/V behind them in the slot, read by the shadow scan. Shared
     /// through [`Self::pages`] with every sequence that pools or places the
     /// same piece, and released with the last of them.
-    pooled: RwLock<HashMap<usize, PooledPieces>>,
+    pooled: SequencePools,
     /// Per-sequence carried residual for the draft head's next first row — the
     /// `h(t-1)` its input assembly needs across a wave boundary. Empty on a
     /// checkpoint with no head, and reset with the other carried state when a
@@ -485,14 +486,80 @@ impl Qwen4ExpBatched {
             .collect()
     }
 
-    /// Declare the rounds `seq`'s projection placed, as position ranges in
-    /// declaration order, replacing any declared before — whose counts are
-    /// dropped, so a caller reads them first ([`Self::take_hits`]).
-    ///
-    /// The ranges become blocks through the sequence's index layout at the
-    /// first sampled layer; every layer of a sequence shares one layout.
-    pub fn set_hit_rounds(&self, seq: usize, pieces: &[Range<usize>]) -> Result<()> {
+    /// The shadow scan's geometry at a layer selecting at `ratio`.
+    fn shadow_geometry(&self, ratio: usize) -> ShadowGeometry {
+        let ix = &self.model.cfg.indexer;
+        ShadowGeometry {
+            heads: ix.n_heads,
+            head_dim: ix.head_dim,
+            pairs: self.index_rope.pairs(),
+            ratio,
+            top_k: ix.top_k,
+        }
+    }
+
+    /// The kept-query buffer every sequence's counters carry: a set of slots
+    /// per sampled layer, each one indexer query.
+    fn keep_shape(&self) -> KeepShape {
+        let ix = &self.model.cfg.indexer;
+        KeepShape {
+            layers: self.hit_kv.len(),
+            q_words: ix.n_heads * ix.head_dim,
+        }
+    }
+
+    /// The unloaded rows of `pooled` — rounds of pieces whose index pages are
+    /// resident — at each sampled layer, counted from `first`; and each
+    /// round's blocks. A round whose page is not resident at a layer has no
+    /// rows there.
+    fn pooled_rows(&self, pooled: &[PooledRound], first: usize) -> Result<PooledRounds> {
         let ratio = self.selecting_ratio()?;
+        let mut blocks: Vec<u32> = Vec::with_capacity(pooled.len());
+        let mut layers: Vec<Vec<ShadowSegment>> = vec![Vec::new(); self.hit_kv.len()];
+        for (i, round) in pooled.iter().enumerate() {
+            let rows = block_range(&round.positions, |pos| (pos + 1) / ratio);
+            let mut held = 0usize;
+            for (li, &kv) in self.hit_kv.iter().enumerate() {
+                let Some(page) = self.pages.layer(&round.piece, kv) else {
+                    continue;
+                };
+                let r = rows.start.min(page.rows())..rows.end.min(page.rows());
+                held = held.max(r.len());
+                if !r.is_empty() {
+                    layers[li].push(ShadowSegment {
+                        page,
+                        rows: r,
+                        counter: (first + i) as u32,
+                    });
+                }
+            }
+            blocks.push(held as u32);
+        }
+        Ok(PooledRounds {
+            blocks,
+            layers: layers
+                .into_iter()
+                .map(|segments| ShadowRows::new(segments, &self.model.device).map(Arc::new))
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    /// Declare the rounds `seq`'s projection placed, as position ranges in
+    /// declaration order, and after them the `pooled` rounds it did not —
+    /// what the shadow scan reads (`docs/hit_driven_projection.md` §6.3) —
+    /// replacing any declared before, whose counts are dropped, so a caller
+    /// reads them first ([`Self::take_hits`]).
+    ///
+    /// The placed ranges become blocks through the sequence's index layout at
+    /// the first sampled layer; every layer of a sequence shares one layout.
+    pub fn set_hit_rounds(
+        &self,
+        seq: usize,
+        pieces: &[Range<usize>],
+        pooled: &[PooledRound],
+    ) -> Result<()> {
+        let ratio = self.selecting_ratio()?;
+        let pooled = self.pooled_rows(pooled, pieces.len())?;
         let map = {
             let idx = self
                 .index
@@ -514,10 +581,18 @@ impl Qwen4ExpBatched {
         // and leaves the parent's as they were.
         match hits.get_mut(&seq).filter(|h| h.owned) {
             Some(h) => {
-                h.generation = h.hits.redeclare(map, pieces.len(), &self.model.device)?;
+                h.generation = h
+                    .hits
+                    .redeclare(map, pieces.len(), pooled, &self.model.device)?;
             }
             None => {
-                let h = SeqHits::new(map, pieces.len(), &self.model.device)?;
+                let h = SeqHits::new(
+                    map,
+                    pieces.len(),
+                    pooled,
+                    self.keep_shape(),
+                    &self.model.device,
+                )?;
                 hits.insert(
                     seq,
                     HitHolder {
@@ -1341,38 +1416,19 @@ impl Qwen4ExpBatched {
             .into_iter()
             .flatten()
             .collect();
-        self.pooled
-            .write()
-            .map_err(|_| candle::Error::Msg("qwen4exp: pool lock poisoned".into()))?
-            .entry(seq)
-            .or_default()
-            .insert(*key, layers);
+        self.pooled.hold(seq, *key, layers)?;
         Ok(before)
     }
 
     /// Let go of `seq`'s pooled pieces not in `keep`: the pool dropped them,
     /// and their rows go back to the tenant once nothing else holds them.
     pub fn retain_pooled(&self, seq: usize, keep: &[PieceKey]) -> Result<()> {
-        let mut pooled = self
-            .pooled
-            .write()
-            .map_err(|_| candle::Error::Msg("qwen4exp: pool lock poisoned".into()))?;
-        if let Some(p) = pooled.get_mut(&seq) {
-            p.retain(|k, _| keep.contains(k));
-        }
-        Ok(())
+        self.pooled.retain(seq, keep)
     }
 
     /// The pieces `seq`'s pool holds.
     pub fn pooled_keys(&self, seq: usize) -> Vec<PieceKey> {
-        self.pooled
-            .read()
-            .map(|p| {
-                p.get(&seq)
-                    .map(|m| m.keys().copied().collect())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default()
+        self.pooled.keys(seq)
     }
 
     /// Install a sealed page per attention layer ahead of `seq`'s live tail.
@@ -2119,7 +2175,7 @@ impl Qwen4ExpBatched {
             index: RwLock::new(HashMap::new()),
             pages: PageRegistry::default(),
             retired: RwLock::new(HashMap::new()),
-            pooled: RwLock::new(HashMap::new()),
+            pooled: SequencePools::default(),
             index_rope,
             qsa_rows: AtomicU64::new(0),
             rope,
@@ -3510,8 +3566,13 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Qwen4ExpBatched::set_hit_layers(self, layers)
     }
 
-    fn set_hit_rounds(&self, seq: usize, rounds: &[Range<usize>]) -> Result<()> {
-        Qwen4ExpBatched::set_hit_rounds(self, seq, rounds)
+    fn set_hit_rounds(
+        &self,
+        seq: usize,
+        rounds: &[Range<usize>],
+        pooled: &[PooledRound],
+    ) -> Result<()> {
+        Qwen4ExpBatched::set_hit_rounds(self, seq, rounds, pooled)
     }
 
     fn take_hits(&self, seq: usize) -> Result<Option<PieceHits>> {
@@ -3648,9 +3709,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         if let Ok(mut m) = self.index.write() {
             m.remove(&seq);
         }
-        if let Ok(mut m) = self.pooled.write() {
-            m.remove(&seq);
-        }
+        self.pooled.release(seq);
         // A recycled id must not inherit the previous conversation's pieces.
         if let Ok(mut m) = self.hits.write() {
             m.remove(&seq);
@@ -4492,7 +4551,7 @@ impl Qwen4ExpBatched {
         total_rows: usize,
         fwd_ticket: Option<candle::cuda_backend::wave_provenance::WaveTicket>,
     ) -> Result<Option<QsaSelection>> {
-        let sel = select_layer(
+        let selected = select_layer(
             kv,
             compress_ratio,
             indexer,
@@ -4509,15 +4568,18 @@ impl Qwen4ExpBatched {
             &self.qsa_rows,
             fwd_ticket,
         )?;
+        let (sel, rows) = selected.unzip();
         // At a sampled layer, what the selection chose is counted into its
-        // pieces (`docs/hit_driven_projection.md` §6.2) — one launch over the
-        // wave, nothing read back. Not under a forced recent span: every row
-        // names those blocks whatever they score, so they would count as read
-        // by the indexer when nothing chose them.
+        // rounds (`docs/hit_driven_projection.md` §6.2), the stride's last
+        // queries are kept, and the first wave after a boundary scores the
+        // kept queries against the pooled rounds first (§6.3) — nothing read
+        // back. Not under a forced recent span: every row names those blocks
+        // whatever they score, so they would count as read by the indexer when
+        // nothing chose them.
         let strata = &self.model.cfg.indexer.strata;
         let forced = strata.recent == Recent::Forced && strata.recent_blocks > 0;
-        if let Some(sel) = sel.as_ref().filter(|_| !forced) {
-            if self.hit_kv.contains(&kv) {
+        if let (Some(sel), Some(rows)) = (sel.as_ref().filter(|_| !forced), rows.as_ref()) {
+            if let Some(layer) = self.hit_kv.iter().position(|&k| k == kv) {
                 let hits = self
                     .hits
                     .read()
@@ -4525,12 +4587,27 @@ impl Qwen4ExpBatched {
                 if !hits.is_empty() {
                     // The wave's last sampled layer publishes what every
                     // sampled layer counted, for the next boundary to read.
-                    let publish = self.hit_kv.last() == Some(&kv);
+                    let publish = layer + 1 == self.hit_kv.len();
                     let mut table = self
                         .hit_table
                         .lock()
                         .map_err(|_| candle::Error::Msg("hit table lock poisoned".into()))?;
-                    count_hits(sel, spans, &hits, &mut table, publish, &self.model.device)?;
+                    let scan = ShadowScan {
+                        geom: self.shadow_geometry(compress_ratio),
+                        rope,
+                    };
+                    count_hits(
+                        sel,
+                        rows,
+                        spans,
+                        offsets,
+                        &hits,
+                        &mut table,
+                        layer,
+                        publish,
+                        &scan,
+                        &self.model.device,
+                    )?;
                 }
             }
         }
