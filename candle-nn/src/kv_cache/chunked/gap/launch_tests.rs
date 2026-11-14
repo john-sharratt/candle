@@ -269,11 +269,14 @@ fn run_gap(
     let refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
     let mut gap = GapDevice::new(cuda, N_KV_HEAD, HEAD_DIM, jobs.len().max(4)).unwrap();
     gap.launch(&refs, jobs, groups, image, 7).unwrap();
-    device.synchronize().unwrap();
+    gap.wait().unwrap();
     assert!(
         gap.poll(),
         "the completion word is in once the stream drains"
     );
+    // As a catch-up does: the compute stream's later reads queue behind it.
+    gap.order_compute_after().unwrap();
+    device.synchronize().unwrap();
     let s = gap.summary();
     // SAFETY: the gap has completed.
     unsafe {
@@ -506,7 +509,7 @@ fn one_gap_is_outstanding_at_a_time() {
     gap.launch(&refs, &jobs, &groups, &image, 1).unwrap();
     // Not yet polled complete: refused whether or not the device has finished.
     assert!(gap.launch(&refs, &jobs, &groups, &image, 2).is_err());
-    device.synchronize().unwrap();
+    gap.wait().unwrap();
     assert!(gap.poll());
     // Complete but not yet read by a catch-up: still refused.
     assert!(gap.launch(&refs, &jobs, &groups, &image, 2).is_err());
@@ -514,8 +517,37 @@ fn one_gap_is_outstanding_at_a_time() {
     assert_eq!(finished.jobs(), jobs.len());
     assert!(gap.finished().is_none(), "a summary is handed out once");
     gap.launch(&refs, &jobs, &groups, &image, 2).unwrap();
-    device.synchronize().unwrap();
+    gap.wait().unwrap();
     assert!(gap.poll());
+}
+
+/// The gap runs on its own stream: a device synchronise does not wait for it,
+/// and the gap's wait does. Its kernels queue behind the compute stream's work
+/// at launch, so a launch made while the compute stream is busy completes only
+/// after that work.
+#[test]
+fn the_gap_runs_on_its_own_stream_behind_the_forward_that_launched_it() {
+    let policy = CompressionPolicy::new(5);
+    let Some(f) = fixture(&policy) else {
+        return;
+    };
+    let refs: Vec<&ChunkedKvBacking> = f.backings.iter().collect();
+    let groups = [GapGroup {
+        policy: &policy,
+        jobs: 0..f.jobs.len(),
+    }];
+    let mut gap = GapDevice::new(&f.cuda, N_KV_HEAD, HEAD_DIM, f.jobs.len()).unwrap();
+    assert_ne!(
+        gap.stream().cu_stream(),
+        f.cuda.cuda_stream().cu_stream(),
+        "not the compute stream"
+    );
+    gap.launch(&refs, &f.jobs, &groups, &f.image, 1).unwrap();
+    gap.wait().unwrap();
+    assert!(gap.poll(), "complete once its own stream drains");
+    gap.order_compute_after().unwrap();
+    f.device.synchronize().unwrap();
+    assert!(gap.finished().is_some());
 }
 
 /// Each band of `row` with the class its record format claimed from, in lease
@@ -898,7 +930,7 @@ fn a_window_outside_its_chunk_is_refused_before_any_launch() {
         assert!(gap.poll(), "a refused gap leaves nothing outstanding");
     }
     gap.launch(&refs, &f.jobs, &groups, &f.image, 1).unwrap();
-    f.device.synchronize().unwrap();
+    gap.wait().unwrap();
     assert!(gap.poll());
 }
 
@@ -921,7 +953,7 @@ fn assert_refused(f: &Fixture, policy: &CompressionPolicy, jobs: &[GapJob], what
         jobs: 0..f.jobs.len(),
     }];
     gap.launch(&refs, &f.jobs, &groups, &f.image, 2).unwrap();
-    f.device.synchronize().unwrap();
+    gap.wait().unwrap();
     assert!(gap.poll());
 }
 
@@ -976,7 +1008,7 @@ fn an_empty_gap_launches_nothing_and_leaves_the_device_free() {
         jobs: 0..f.jobs.len(),
     }];
     gap.launch(&refs, &f.jobs, &groups, &f.image, 2).unwrap();
-    f.device.synchronize().unwrap();
+    gap.wait().unwrap();
     assert!(gap.poll());
 }
 
@@ -1146,7 +1178,7 @@ fn a_gap_after_the_seq_wrap_is_not_seen_complete_early() {
     let mut gap = GapDevice::new(&f.cuda, N_KV_HEAD, HEAD_DIM, f.jobs.len()).unwrap();
     gap.launch(&refs, &f.jobs, &groups, &f.image, before)
         .unwrap();
-    f.device.synchronize().unwrap();
+    gap.wait().unwrap();
     assert!(gap.poll());
     assert!(gap.summary().complete(completion_word(after)));
     assert!(gap.finished().is_some());
@@ -1157,6 +1189,6 @@ fn a_gap_after_the_seq_wrap_is_not_seen_complete_early() {
     );
     gap.launch(&refs, &f.jobs, &groups, &f.image, after)
         .unwrap();
-    f.device.synchronize().unwrap();
+    gap.wait().unwrap();
     assert!(gap.poll());
 }

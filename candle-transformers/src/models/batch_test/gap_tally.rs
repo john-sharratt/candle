@@ -4,14 +4,15 @@
 //! and cost, summed over a config.
 //!
 //! **What the gap costs, by window.** Each call's host time is charged to the
-//! clock running when it was made, and each gap's device time — from its first
-//! upload to its completion word, on the stream the forwards share, so the
-//! forward behind it waits it out — to the clock running when it was launched.
-//! The settle after the decode runs outside both clocks and is charged to
-//! neither. A window's rate with its gap time taken out is the forward's own
-//! rate, comparable with a run that sealed outside the clocks. Host and device
-//! time can overlap — the host builds the next forward while a gap's kernels
-//! run — so the sum is an upper bound on what the gap added.
+//! clock running when it was made: the scheduler thread spends it between two
+//! forwards, so the next forward starts that much later. A window's rate with
+//! that taken out is the forwards' own rate, comparable with a run that sealed
+//! outside the clocks. Each gap's device time — from its first upload to its
+//! completion word — is reported beside it, charged to the window it was
+//! launched in, and not taken out: the gap runs on its own stream beside the
+//! next forward, so what it costs the forward is the contention, which the
+//! measured rate already holds. The settle after the decode runs outside both
+//! clocks and is charged to neither.
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -42,14 +43,14 @@ pub struct WindowCost {
     pub quantize: Duration,
     /// The quantizes' host time by phase.
     pub phases: QuantizeHost,
-    /// Gaps' time on the stream.
+    /// Gaps' time on their stream.
     pub device: Duration,
 }
 
 impl WindowCost {
-    /// Everything the gap added to the window, at most.
-    pub fn total(&self) -> Duration {
-        self.catch_up + self.quantize + self.device
+    /// The host time the gap took from the window: what the forwards waited.
+    pub fn host(&self) -> Duration {
+        self.catch_up + self.quantize
     }
 }
 
@@ -185,6 +186,7 @@ impl GapTally {
         self.set_window(Window::Outside);
         for _ in 0..SETTLE_GAPS {
             device.synchronize()?;
+            session.gap_wait()?;
             self.catch_up(session)?;
             let q = self.quantize(session, GapKind::Decode)?;
             if q.jobs == 0 && !session.gap_outstanding() {
@@ -213,9 +215,9 @@ impl GapTally {
         for (name, c) in [("prefill", self.prefill), ("decode", self.decode)] {
             let _ = write!(
                 s,
-                " | {name} {:.1} ms (catch-up {:.1}, quantize {:.1} [setup {:.1}, table {:.1}, \
-                 lease {:.1}, launch {:.1}], device {:.1})",
-                ms(c.total()),
+                " | {name} host {:.1} ms (catch-up {:.1}, quantize {:.1} [setup {:.1}, \
+                 table {:.1}, lease {:.1}, launch {:.1}]), device {:.1} ms beside it",
+                ms(c.host()),
                 ms(c.catch_up),
                 ms(c.quantize),
                 ms(c.phases.setup),
@@ -283,6 +285,8 @@ mod tests {
             Duration::from_millis(5)
         );
         assert_eq!(t.window_cost(Window::Decode).device, Duration::ZERO);
-        assert_eq!(t.window_cost(Window::Outside).total(), Duration::ZERO);
+        assert_eq!(t.window_cost(Window::Outside).device, Duration::ZERO);
+        // Device time is reported, not taken out of the window.
+        assert_eq!(t.window_cost(Window::Prefill).host(), Duration::ZERO);
     }
 }

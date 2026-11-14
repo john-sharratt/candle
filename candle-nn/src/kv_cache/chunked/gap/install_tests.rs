@@ -115,7 +115,8 @@ fn gap_and_catch_up(
     let mut gap = GapDevice::new(&l.cuda, N_KV_HEAD, HEAD_DIM, jobs.len()).unwrap();
     gap.launch(&refs, &jobs, &groups, &stack(lease), 1).unwrap();
     between();
-    l.device.synchronize().unwrap();
+    gap.wait().unwrap();
+    gap.order_compute_after().unwrap();
     let finished = gap.finished().expect("complete");
     catch_up(&finished, jobs, &groups, &refs, lease, &codes).unwrap()
 }
@@ -345,7 +346,7 @@ fn a_catch_up_refuses_a_table_other_than_its_gaps() {
     let mut gap = GapDevice::new(&l.cuda, N_KV_HEAD, HEAD_DIM, n).unwrap();
     gap.launch(&refs, &jobs, &groups, &stack(&lease), 1)
         .unwrap();
-    l.device.synchronize().unwrap();
+    gap.wait().unwrap();
     let finished = gap.finished().expect("complete");
     jobs.pop();
     assert!(catch_up(&finished, jobs, &groups, &refs, &mut lease, &codes).is_err());

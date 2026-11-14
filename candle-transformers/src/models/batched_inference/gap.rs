@@ -89,4 +89,13 @@ impl BatchedInferenceSession {
     pub fn gap_outstanding(&self) -> bool {
         self.gap.as_ref().is_some_and(GapCycle::is_outstanding)
     }
+
+    /// Wait for the outstanding gap's device work, which runs on its own
+    /// stream: a device synchronise does not cover it.
+    pub fn gap_wait(&self) -> Result<()> {
+        match &self.gap {
+            Some(cycle) => cycle.wait(),
+            None => Ok(()),
+        }
+    }
 }

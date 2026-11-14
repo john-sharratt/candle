@@ -1,6 +1,7 @@
 //! One gap on the device (`docs/kv_quantize_in_the_gap.md` §3.2–§3.4): the
 //! format selection, the claim and the convert, launched back to back on the
-//! compute stream with nothing read back and nothing waited for.
+//! gap's own stream — behind the forward that completed the blocks, beside the
+//! next — with nothing read back and nothing waited for.
 //!
 //! Per policy group the unchanged selection kernel leaves its tags, outer
 //! scales and per-channel palette slots in a held block, and the claim reads
@@ -10,18 +11,19 @@
 //! and the completion word goes last. The host learns the outcome from the
 //! summary once the word is in (§3.5).
 //!
-//! The device keeps, across gaps: the summary, the claim's look-back status
-//! words and their epoch, the sink slot a deferred job's bands are converted
-//! into, and held scratch for the selection blocks and the convert buffer that
-//! grows to the widest gap. Every buffer is reused only in stream order behind
-//! the gap that last read it.
+//! The device keeps, across gaps: its stream, the summary, the claim's
+//! look-back status words and their epoch, the sink slot a deferred job's bands
+//! are converted into, and held scratch for the selection blocks, the convert
+//! buffer and the inputs, sized once for the widest table. Every buffer is
+//! reused only in the gap stream's order behind the gap that last read it.
 
 use std::ffi::c_void;
 use std::ops::Range;
+use std::sync::Arc;
 
 use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
 use candle::cuda_backend::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
-use candle::cuda_backend::cudarc::driver::{CudaEvent, DevicePtr};
+use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaStream, DevicePtr};
 use candle::cuda_backend::kernels::simple::kv_gap_claim::{
     claim_status_words, run_kv_gap_claim, run_kv_gap_complete, MAX_CLASS, MAX_KV_HEAD, NO_OVERRIDE,
 };
@@ -83,12 +85,12 @@ pub(crate) struct GapGroup<'p> {
 
 /// A held buffer that only grows: kept while it is wide enough, replaced by a
 /// wider one when it is not. The old one is released in stream order, behind
-/// every launch already queued that reads it.
+/// every launch already queued on the gap's stream that reads it.
 struct Grown(Option<Held<u8>>);
 
 impl Grown {
     #[track_caller]
-    fn at_least(&mut self, dev: &CudaDevice, bytes: usize) -> Result<u64> {
+    fn at_least(&mut self, stream: &Arc<CudaStream>, bytes: usize) -> Result<u64> {
         let fits = self
             .0
             .as_mut()
@@ -97,10 +99,10 @@ impl Grown {
             self.0 = None;
             // SAFETY: every byte a launch reads is written ahead of it on the
             // stream — the uploads, the selection's own clear, or the claim.
-            self.0 = Some(unsafe { Held::alloc(dev, bytes.max(BLOCK_ALIGN))? });
+            self.0 = Some(unsafe { Held::alloc_on(stream, bytes.max(BLOCK_ALIGN))? });
         }
         let held = self.0.as_ref().expect("allocated above");
-        Ok(held.device_ptr(&dev.cuda_stream()).0)
+        Ok(held.device_ptr(stream).0)
     }
 }
 
@@ -223,6 +225,14 @@ pub(crate) struct GapDevice {
     n_kv_head: usize,
     head_dim: usize,
     codes: CodeTables,
+    /// The gap's own stream. Each gap waits on the compute stream as it
+    /// launches — for the forward that completed its blocks and for the lease's
+    /// region cleans — and then runs beside the next forward rather than ahead
+    /// of it; the compute stream waits on it once the catch-up has seen the
+    /// gap complete. Nothing a forward reads or writes is the gap's while it
+    /// runs: its sources are pinned by its jobs, its destinations are the
+    /// lease's, and its scratch is its own.
+    stream: Arc<CudaStream>,
     summary: MappedSummary,
     /// The claim's look-back status words, zeroed once.
     status: Held<u64>,
@@ -276,37 +286,41 @@ impl GapDevice {
             n_kv_head,
             head_dim,
         })?;
+        let stream = dev.cuda_context().new_stream().w()?;
         let words = claim_status_words(max_jobs * n_kv_head);
         // SAFETY: cleared just below, before any launch reads it.
-        let status = unsafe { Held::<u64>::alloc(dev, words)? };
+        let status = unsafe { Held::<u64>::alloc_on(&stream, words)? };
         let widest = SizeClass::all().map(SizeClass::bytes).max().unwrap_or(0);
         // SAFETY: written by deferred bands' converts and never read.
-        let sink = unsafe { Held::<u8>::alloc(dev, widest.max(BLOCK_ALIGN))? };
+        let sink = unsafe { Held::<u8>::alloc_on(&stream, widest.max(BLOCK_ALIGN))? };
         // The scratch for the widest table, now: nothing grows between forwards.
         let scratch = GapScratch::for_jobs(max_jobs, n_kv_head, head_dim);
         let (mut select, mut convert, mut inputs) = (Grown(None), Grown(None), Grown(None));
-        select.at_least(dev, scratch.select)?;
-        convert.at_least(dev, scratch.convert)?;
-        inputs.at_least(dev, scratch.inputs)?;
+        select.at_least(&stream, scratch.select)?;
+        convert.at_least(&stream, scratch.convert)?;
+        inputs.at_least(&stream, scratch.inputs)?;
+        // The held ground hands bytes out in the compute stream's order: the
+        // gap's stream starts behind it.
         {
-            let stream = dev.cuda_stream();
             let _eager = dev.pause_capture()?;
-            // SAFETY: the whole status buffer, just allocated on this stream.
-            unsafe {
-                memset_d8_async(
-                    status.device_ptr(&stream).0,
-                    0,
-                    words * std::mem::size_of::<u64>(),
-                    stream.cu_stream(),
-                )
-                .w()?;
-            }
+            stream.join(&dev.cuda_stream()).w()?;
+        }
+        // SAFETY: the whole status buffer, just allocated on this stream.
+        unsafe {
+            memset_d8_async(
+                status.device_ptr(&stream).0,
+                0,
+                words * std::mem::size_of::<u64>(),
+                stream.cu_stream(),
+            )
+            .w()?;
         }
         Ok(Self {
             dev: dev.clone(),
             n_kv_head,
             head_dim,
             codes,
+            stream,
             summary,
             status,
             epoch: 0,
@@ -328,6 +342,12 @@ impl GapDevice {
         &self.summary
     }
 
+    /// The gap's stream, for the tests.
+    #[cfg(test)]
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     /// The last launched gap's summary, once — when its completion word is in
     /// and no catch-up has read it yet. `None` while it runs, after it has been
     /// read, and before any gap with a table has been launched. Borrowing the
@@ -347,6 +367,21 @@ impl GapDevice {
         // SAFETY: `poll` saw this gap's completion word, and no later gap has
         // been armed: `launch` refuses while a summary is unread.
         Some(unsafe { Finished::new(&self.summary, jobs, device_ms) })
+    }
+
+    /// Order the compute stream after everything the gap's stream has queued:
+    /// once a catch-up has seen a gap complete, the forwards that read the
+    /// blocks it installs are queued behind its writes, not merely after them.
+    pub(crate) fn order_compute_after(&self) -> Result<()> {
+        let _eager = self.dev.pause_capture()?;
+        self.dev.cuda_stream().join(&self.stream).w()
+    }
+
+    /// Wait for everything queued on the gap's stream — for a caller that
+    /// must see the gap complete now rather than at a later gap: a settle
+    /// before figures are read, and the tests.
+    pub(crate) fn wait(&self) -> Result<()> {
+        self.stream.synchronize().w()
     }
 
     /// Whether the gap last launched has completed — a load of one mapped
@@ -418,8 +453,8 @@ impl GapDevice {
             select_at.push(select_bytes);
             select_bytes = (select_bytes + p.inputs.layout.bytes()).next_multiple_of(BLOCK_ALIGN);
         }
-        let select_base = self.select.at_least(&self.dev, select_bytes)?;
-        let convert_base = self.convert.at_least(&self.dev, convert.bytes())?;
+        let select_base = self.select.at_least(&self.stream, select_bytes)?;
+        let convert_base = self.convert.at_least(&self.stream, convert.bytes())?;
 
         // ── Every byte the gap reads from the host, in one pinned image ──
         //
@@ -458,7 +493,9 @@ impl GapDevice {
         // The inputs start at the third segment, on a segment boundary; the
         // device block is block-aligned, so every segment keeps its alignment.
         let inputs_from = offsets[INPUTS_FROM];
-        let inputs_base = self.inputs.at_least(&self.dev, image_len - inputs_from)?;
+        let inputs_base = self
+            .inputs
+            .at_least(&self.stream, image_len - inputs_from)?;
         // No copy out of the image is in flight: the last gap's completed
         // before this one may launch, and its copies were behind its word.
         let image = self.host.at_least(image_len)?;
@@ -467,10 +504,13 @@ impl GapDevice {
         }
         let image: &[u8] = image;
 
-        let stream = self.dev.cuda_stream();
+        let stream = self.stream.clone();
         let _eager = self.dev.pause_capture()?;
-        // The gap's device time runs from here — ahead of its first upload — to
-        // its completion word.
+        // Behind the forward that completed the table's blocks and the lease's
+        // region cleans, both queued on the compute stream.
+        stream.join(&self.dev.cuda_stream()).w()?;
+        // The gap's device time runs from here — once the forward ahead of it
+        // is done, ahead of its first upload — to its completion word.
         let started = stream.record_event(Some(CU_EVENT_DEFAULT)).w()?;
         {
             let span = |i: usize| &image[offsets[i]..offsets[i] + segments[i].len()];
@@ -610,7 +650,7 @@ impl Drop for GapDevice {
         // still write it: wait for them first. Nothing to report a failure to,
         // and a failed wait means the context is already gone.
         if self.outstanding.is_some() {
-            let _ = self.dev.cuda_stream().synchronize();
+            let _ = self.stream.synchronize();
         }
     }
 }

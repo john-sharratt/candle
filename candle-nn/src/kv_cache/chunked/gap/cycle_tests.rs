@@ -29,7 +29,7 @@ fn run_until_quiet(cycle: &mut GapCycle, l: &Live, policy: &CompressionPolicy) -
         if q.jobs == 0 && !cycle.is_outstanding() {
             return gaps;
         }
-        l.device.synchronize().unwrap();
+        cycle.wait().unwrap();
     }
     panic!("the cycle did not settle in 16 gaps");
 }
@@ -146,6 +146,7 @@ fn a_block_relocated_under_its_gap_is_quantized_afresh() {
         );
     }
     l.device.synchronize().unwrap();
+    cycle.wait().unwrap();
     let done = cycle.catch_up(&l.layers).unwrap();
     assert!(done.caught_up);
     assert_eq!(done.installed, 3 * LAYERS - 1);
@@ -165,7 +166,7 @@ fn a_block_relocated_under_its_gap_is_quantized_afresh() {
         .quantize(&l.layers, &[l.slot], &policies, GapKind::Prefill)
         .unwrap();
     assert_eq!((next.jobs, next.retried), (1, 1));
-    l.device.synchronize().unwrap();
+    cycle.wait().unwrap();
     let last = cycle.catch_up(&l.layers).unwrap();
     assert_eq!(last.installed, 1);
     for blk in 0..3 {

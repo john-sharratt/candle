@@ -630,10 +630,11 @@ pub struct TestResults {
     pub sessions: Vec<TestRun>,
     pub prompt_tokens_per_sec: f64, // Tokens/sec for bulk prompt processing
     pub generate_tokens_per_sec: f64, // Tokens/sec for single token generation
-    /// The prompt rate with the gap's time inside the prompt clock taken out
-    /// (`gap_tally`): the forwards' own rate, an upper bound.
+    /// The prompt rate with the gap's host time inside the prompt clock taken
+    /// out (`gap_tally`): the forwards' own rate.
     pub prompt_ex_gap_tps: f64,
-    /// The decode rate with the gap's time inside the decode clock taken out.
+    /// The decode rate with the gap's host time inside the decode clock taken
+    /// out.
     pub generate_ex_gap_tps: f64,
     pub all_valid: bool, // Whether all sessions passed validation
     pub quantized_token_percent: Option<f64>, // Percentage of tokens stored in quantized arenas
@@ -2216,12 +2217,12 @@ impl TestParams {
                 rate_ex_gap(
                     prompt_tokens,
                     prompt_duration,
-                    gaps.window_cost(Window::Prefill).total(),
+                    gaps.window_cost(Window::Prefill).host(),
                 ),
                 rate_ex_gap(
                     generate_tokens,
                     generate_duration,
-                    gaps.window_cost(Window::Decode).total(),
+                    gaps.window_cost(Window::Decode).host(),
                 ),
             )
         };
@@ -3052,10 +3053,11 @@ impl TestParams {
         }
 
         println!("\n\n=== Performance Comparison ===");
-        // `ex-gap` is the rate with the gap quantize's host and device time
-        // inside the clock taken out (`gap_tally`): the forwards' own rate,
-        // comparable with a run that sealed outside the clocks. Host and device
-        // time can overlap, so it is an upper bound.
+        // `ex-gap` is the rate with the gap quantize's host time inside the
+        // clock taken out (`gap_tally`): the forwards' own rate, comparable
+        // with a run that sealed outside the clocks. The gap's kernels run on
+        // their own stream beside the forwards; what they cost the forwards is
+        // in both columns.
         println!("┌──────────┬──────┬─────────┬──────────┬───────┬────────────┬──────────────┬─────────────┬───────────────┬─────────────┬───────────────┬───────────┬──────────┬────────────┬──────────┬───────┐");
         println!("│ KvMode   │ int8 │ Batched │ Contexts │ Valid │ t/s (bulk) │ t/s (single) │ ex-gap bulk │ ex-gap single │ perf (bulk) │ perf (single) │ %Quantized│ Compress │ Peak Tokens│ Frontier │ Eff%  │");
         println!("├──────────┼──────┼─────────┼──────────┼───────┼────────────┼──────────────┼─────────────┼───────────────┼─────────────┼───────────────┼───────────┼──────────┼────────────┼──────────┼───────┤");

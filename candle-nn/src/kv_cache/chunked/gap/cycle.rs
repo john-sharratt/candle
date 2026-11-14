@@ -143,12 +143,21 @@ impl GapCycle {
         self.outstanding.is_some()
     }
 
+    /// Wait for the outstanding gap's device work, so the next catch-up finds
+    /// it complete — for a settle before figures are read. The scheduler
+    /// never waits: a gap still running is caught up at a later gap.
+    pub fn wait(&self) -> Result<()> {
+        self.device.wait()
+    }
+
     /// Put the outstanding gap's converted blocks in place, once it has
     /// completed (§3.5). Nothing when no gap is outstanding or it still runs.
     pub fn catch_up(&mut self, backings: &[ChunkedKvBacking]) -> Result<GapCatchUp> {
-        if self.outstanding.is_none() {
+        if self.outstanding.is_none() || !self.device.poll() {
             return Ok(GapCatchUp::default());
         }
+        // The forwards that read what this installs queue behind the gap.
+        self.device.order_compute_after()?;
         let Some(finished) = self.device.finished() else {
             return Ok(GapCatchUp::default());
         };

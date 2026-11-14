@@ -356,9 +356,10 @@ the lease is empty. A deferred block leads this gap's table in a retry group
 ahead of every new block's group (§3.2), its exact demand
 taken from its rows, and each class's share of the summary's claims is recorded
 for the new blocks' demand (§3.2). This is the install the persistence thread does today, moved to
-the thread that owns the sequences, with nothing left to fence: the convert has
-finished, and the header upload is queued on the stream ahead of the next
-forward.
+the thread that owns the sequences, with one fence left and no wait: the
+convert has finished, the compute stream is set to wait on the gap's stream
+(§3.8 rule 2), and the header upload is queued on the compute stream ahead of
+the next forward.
 
 **A native band is freed by its last reference.** The owner's reference goes at
 the catch-up. A `ChunkPin` a launch or a generation snapshot took earlier drops
@@ -445,10 +446,20 @@ of them is redesigned rather than excepted.
    them to the log. It changes no topology and takes no lock the scheduler
    needs (§5). With one writer there is no host-side race to lose, which is why
    the `MigrateFlight` lock is deleted rather than kept (§6).
-2. **The gap runs on the compute stream.** Selection, claim and convert are
-   queued on the stream the forwards run on. A later forward that writes a
-   chunk the gap reads, or reuses a slot the gap freed, is ordered after the
-   gap by the stream itself. No host code has to remember to wait.
+2. **The gap runs on its own stream, fenced to the compute stream at both
+   ends.** Selection, claim and convert are queued on the gap's stream, which
+   first waits on the compute stream — so the gap reads its blocks only after
+   the forward that completed them, and writes its lease only after the region
+   cleans the lease's claims queued there — and then runs beside the next
+   forward instead of ahead of it. The catch-up, once it has seen the
+   completion word, has the compute stream wait on the gap's stream, so a
+   forward reading an installed block is queued behind the gap's writes.
+   Between the two, nothing a forward touches is the gap's: the native bands it
+   reads are pinned until its catch-up (rule 4), the slots it writes are its
+   lease's (rule 3), and its scratch, summary and status words are its own. On
+   the RTX 3090 at C10 this took the gap's kernels off the forward's critical
+   path: decode 748 → 888 t/s at ×8 and 1,024 → 1,130 at ×16, prefill
+   4,606 → 5,566 and 4,663 → 5,692.
 3. **A slot has one owner: the free pool, a lease, or a sealed block.** A lease
    takes its slots out of `ChunkGidPool` before the gap that may write them is
    launched, and nothing else hands them out while they are leased. The lease
