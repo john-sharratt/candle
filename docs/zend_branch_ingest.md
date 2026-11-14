@@ -105,6 +105,7 @@ A probe that fails for any other reason — a network error, 429, a 5xx — back
 - **The size cap**, `MAX_FILE_BYTES` (1 MiB), from the listing's size — above the largest hand-written source in the workspace (~710 KB), below the dumps that are text only by extension (SASS listings at 2.3–2.8 MB, a 13 MB JSON data file), each of which would be 600K+ tokens that no reading chain finishes. A file already ingested and now over the cap is retired, since the kept list passes the same gate.
 - **The scope**, `--ingest-dir <layer>=<repo>/<folder>`: only paths under that folder.
 - **The depth bound**, `--max-depth N`: path components below the walk's start — the repository's root, or the scope folder — so `1` is its own files. It bounds what is ingested, not what is kept (§7.2).
+- **Nothing ignored**, `--ignore <pattern>` (repeatable; `motherd.yaml`'s `zend: ignore:`): a workspace key `<repo>/<path>` in which `*` matches any run of characters, `/` included (`zend/src/branch_ingest/ignore.rs`). Unlike the depth bound, it bounds what is kept as well: the scope at full depth refuses an ignored path too, so a unit of one is in neither the ingest nor the retain list, and the pass tombstones the reading the substrate held of it (§7.2) — it is ejected, not merely left unread. A `…/*/*` pattern covers only what lies below a folder's own files.
 
 Binary content cannot be told from a listing. It is sniffed when a file is about to be ingested (§7.3).
 

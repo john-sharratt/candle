@@ -159,7 +159,9 @@ impl ProjectionScript {
     }
 
     /// Take `turns`, by `(timeline, index)`, out of every point: the control
-    /// that asks what a decode does without them.
+    /// that asks what a decode does without them. A placed unit is named by
+    /// its opening as the recording names it, not by the face that stands in
+    /// for it ([`ScriptedChoice::place_turns`]).
     pub fn without(mut self, turns: &HashSet<(u64, u32)>) -> Self {
         for point in &mut self.points {
             if let Some(choice) = &mut point.choice {
@@ -200,18 +202,30 @@ impl ScriptedChoice {
     /// projection's turns close it, after the system prompt. A recorded turn
     /// `holds` says is gone, its thread retired since, is left out: nothing
     /// could be placed for it.
-    pub fn place_turns(&self, projection: &mut Projection, holds: &dyn Fn(TurnKey) -> bool) {
+    ///
+    /// **A unit's opening goes in by its face, as live selection places it.**
+    /// A recording names the unit's opening (`docs/zend_working_set.md` §4.9),
+    /// and `face` gives the face a live projection put in its place — `None`
+    /// where it put the opening itself. Played back verbatim, a replay showed
+    /// the model every placed file's commissioning request, which the dialogue
+    /// it replays never saw.
+    pub fn place_turns(
+        &self,
+        projection: &mut Projection,
+        holds: &dyn Fn(TurnKey) -> bool,
+        face: &dyn Fn(TurnKey) -> Option<TurnKey>,
+    ) {
         projection
             .segments
             .retain(|s| !matches!(s, ProjectionSegment::Sealed(SealedKind::Turn(..))));
-        let kept: Vec<&ResolvedTurn> = self
-            .turns
+        let placed: Vec<ResolvedTurn> = self.turns.iter().map(|t| faced(t, face)).collect();
+        let kept: Vec<&ResolvedTurn> = placed
             .iter()
             .filter(|t| t.key().is_some_and(holds))
             .collect();
-        if kept.len() < self.turns.len() {
+        if kept.len() < placed.len() {
             tracing::warn!(
-                gone = self.turns.len() - kept.len(),
+                gone = placed.len() - kept.len(),
                 "a played-back projection names turns the substrate no longer holds"
             );
         }
@@ -219,6 +233,21 @@ impl ScriptedChoice {
             kept.into_iter()
                 .map(|t| ProjectionSegment::Sealed(SealedKind::Turn(*t, crate::Role::Assistant))),
         );
+    }
+}
+
+/// `turn`, or the face `face` gives its key: in the unit's layer and group,
+/// as a live projection places it.
+fn faced(turn: &ResolvedTurn, face: &dyn Fn(TurnKey) -> Option<TurnKey>) -> ResolvedTurn {
+    match turn.key().and_then(face) {
+        Some(at) => ResolvedTurn {
+            id: TurnId {
+                index: at.index,
+                ..turn.id
+            },
+            timeline: Some(at.timeline),
+        },
+        None => *turn,
     }
 }
 
@@ -328,6 +357,50 @@ mod tests {
         assert_eq!(choice.turns[0].id.group_id, GroupId::new(1));
     }
 
+    /// **A played-back unit opening is placed by its face**, in the unit's own
+    /// layer and group, and a turn with no face goes in as recorded.
+    #[test]
+    fn a_played_back_opening_is_placed_by_its_face() {
+        let s = script(&[event(
+            0,
+            vec![
+                turn("primary_conversation", Some(5), 0),
+                turn("primary_conversation", Some(6), 2),
+            ],
+        )]);
+        let choice = s.choice_at(0).unwrap();
+        let mut projection = Projection {
+            segments: Vec::new(),
+            selections: Vec::new(),
+            selection_scores: Default::default(),
+            selection_origins: Default::default(),
+        };
+        let face_of_five = TurnKey::new(timeline(55), TurnIndex(0));
+        choice.place_turns(&mut projection, &|_| true, &|key| {
+            (key == TurnKey::new(timeline(5), TurnIndex(0))).then_some(face_of_five)
+        });
+        let placed: Vec<(u64, u32, LayerId, GroupId)> = projection
+            .segments
+            .iter()
+            .filter_map(|s| match s {
+                ProjectionSegment::Sealed(SealedKind::Turn(t, _)) => Some((
+                    t.timeline.unwrap().raw(),
+                    t.index().0,
+                    t.id.layer_id,
+                    t.id.group_id,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                (55, 0, LayerId::new(1), GroupId::new(1)),
+                (6, 2, LayerId::new(1), GroupId::new(1)),
+            ]
+        );
+    }
+
     /// A selector's section gives back the option it ran under; a bare section
     /// names no selector.
     #[test]
@@ -433,7 +506,7 @@ mod tests {
             ],
             dials: Vec::new(),
         }
-        .place_turns(&mut projection, &|key| key.index == TurnIndex(2));
+        .place_turns(&mut projection, &|key| key.index == TurnIndex(2), &|_| None);
         assert_eq!(projection.segments.len(), 2);
         assert!(matches!(
             projection.segments[0],

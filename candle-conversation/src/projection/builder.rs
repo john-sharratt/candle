@@ -1257,7 +1257,14 @@ impl Builder {
             decode_pos,
             sink,
         );
-        choice.place_turns(&mut projection, &|key| resolver.turn_token_count(key) > 0);
+        // Faces as a live projection places them (`project.rs`): none when the
+        // target is an ingest unit reading itself.
+        let faces = !resolver.target_is_ingest_self();
+        choice.place_turns(
+            &mut projection,
+            &|key| resolver.turn_token_count(key) > 0,
+            &|key| faces.then(|| resolver.face_of(key)).flatten(),
+        );
         projection
     }
 

@@ -66,6 +66,10 @@ const MAX_STATES: usize = 512;
 /// A state with no way on.
 const DEAD: u32 = u32::MAX;
 
+/// What may stand between a raw value and its marker: nothing, or the one
+/// line break a model writes there, which every reader takes off the value.
+const RAW_FRAMING: [&str; 3] = ["", "\n", "\r\n"];
+
 /// Why a pattern cannot be a rule.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuleError {
@@ -132,7 +136,8 @@ enum Machine {
         masks: Mutex<HashMap<u32, AllowedSet>>,
         /// This set's rule for each way a raw value is closed, made the first
         /// time a span closed that way stands on it.
-        forms: Mutex<HashMap<Vec<String>, Arc<ValueRule>>>,
+        /// `None` for a way of closing no value of the set can be written in.
+        forms: Mutex<HashMap<Vec<String>, Option<Arc<ValueRule>>>>,
     },
 }
 
@@ -427,9 +432,13 @@ impl ValueRule {
     /// quotes: closed by `marker` and then one of `tails`, or by `marker`
     /// alone when there are none (`Terminator::Until`). Each value of the set
     /// can be written, and after it only what closes it, so the span's
-    /// terminator fires on the byte the rule closes on. Made once per way of
-    /// closing and kept. `None` for a pattern's rule, which holds a quoted
-    /// value only, and when no value can be closed in this vocabulary.
+    /// terminator fires on the byte the rule closes on. The close may open
+    /// on the line break a model writes before its marker (`\n`, `\r\n`),
+    /// which every reader of a block takes off the value
+    /// (`element_close`). Made once per way of closing and kept. `None` for a
+    /// pattern's rule, which holds a quoted value only, and when no value can
+    /// be closed in this vocabulary — warned once, since the field then
+    /// decodes unheld.
     pub fn closed_by(&self, marker: &str, tails: &[&str]) -> Option<Arc<ValueRule>> {
         let Machine::Set {
             set,
@@ -441,22 +450,32 @@ impl ValueRule {
         else {
             return None;
         };
-        let strings: Vec<String> = match tails {
+        let closing: Vec<String> = match tails {
             [] => vec![marker.to_string()],
             tails => tails.iter().map(|tail| format!("{marker}{tail}")).collect(),
         };
+        let strings: Vec<String> = RAW_FRAMING
+            .iter()
+            .flat_map(|framing| closing.iter().map(move |c| format!("{framing}{c}")))
+            .collect();
         let mut forms = forms.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(form) = forms.get(&strings) {
-            return Some(Arc::clone(form));
+            return form.clone();
         }
         let literal: Vec<&str> = strings.iter().map(String::as_str).collect();
         let closes = Arc::new(ValueSet::literal(&literal));
         let form = Self::over_closed(Arc::clone(set), Some(closes), Arc::clone(tokens))
-            .map_err(|e| tracing::debug!("a held set has no raw form closed by {marker:?}: {e}"))
-            .ok()?;
-        let form = Arc::new(form);
-        forms.insert(strings, Arc::clone(&form));
-        Some(form)
+            .map_err(|e| {
+                tracing::warn!(
+                    "a held set of {} values has no raw form closed by {marker:?}, so the \
+                     field decodes unheld: {e}",
+                    set.len()
+                )
+            })
+            .ok()
+            .map(Arc::new);
+        forms.insert(strings, form.clone());
+        form
     }
 
     /// Whether a value may end at automaton state `s`.
@@ -1070,11 +1089,17 @@ mod tests {
             Some(None)
         );
         assert_eq!(rule.walk(start, b"src/cancel.rs"), None);
+        assert_eq!(
+            rule.walk(start, b"src\n</parameter>\n</function>"),
+            Some(None),
+            "the framing line break the model writes before its marker"
+        );
+        assert_eq!(rule.walk(start, b"src\n\n</parameter>"), None);
         assert_eq!(rule.walk(start, b"src</parameter>x"), None);
         assert_eq!(rule.walk(start, b"src\""), None, "no quote closes it");
         let src = rule.advance(start, b"src").unwrap();
         let at_end = rule.mask(src);
-        assert!(at_end.contains(id(&vocab, "<")));
+        assert!(at_end.contains(id(&vocab, "<")) && at_end.contains(id(&vocab, "\n")));
         assert!(!at_end.contains(id(&vocab, "\"")) && !at_end.contains(id(&vocab, "/")));
         let open = rule.advance(start, b"src</parameter>\n").unwrap();
         let tag = rule.mask(open);

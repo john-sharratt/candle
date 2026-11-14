@@ -1,0 +1,142 @@
+# What each question of the §9.12 dependency battery should pull into its
+# working set (docs/unbounded_agents.md §9.12; zend/examples/dependency_battery/battery.yaml).
+#
+# Read by `candle-conversation/examples/provenance_gates` (`paper`), run over a
+# dialogue that asks the battery's questions, each opening with the question
+# itself. Every probe of a question's turns is graded on its top `top_k`
+# files: how many of `should` it holds — the file that defines what the
+# question names and the files that call or depend on it — and how many
+# matching `should_not` it holds. The battery's own results are never in the
+# substrate (`motherd.yaml`'s `ignore:`), so a probe ranking one is ranking a
+# stale reading.
+
+top_k: 10
+
+messages:
+  # ── Direct ──
+  - starts: "In the candle-conversation crate, where is the function `recorded_reply`"
+    should:
+      - candle/candle-conversation/src/recorded_reply.rs
+      - candle/candle-conversation/src/conversation.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "Where is the function `tier_fits` defined"
+    should:
+      - candle/candle-nn/src/kv_cache/chunked/span_geometry.rs
+      - candle/candle-nn/src/kv_cache/chunked/region_pool.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "Where is `elevate_to_hot` defined"
+    should:
+      - candle/candle-conversation/src/persistence/elevate.rs
+      - candle/candle-conversation/src/scheduler/mod.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "Where is the provenance function `heads_per_group` defined"
+    should:
+      - candle/candle-conversation/src/provenance/scan.rs
+      - candle/candle-conversation/src/provenance/window_score.rs
+      - candle/candle-conversation/src/provenance/gpu.rs
+      - candle/candle-conversation/src/projection/belief_files.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "Where is the Rust wrapper `moe_bucketize` defined"
+    should:
+      - candle/candle-core/src/quantized/cuda.rs
+      - candle/candle-kernels/src/simple/moe_bucketize.cu
+      - candle/candle-transformers/src/models/expert_lre/dispatch.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "In the expert cache, where is `set_eviction_costs` defined"
+    should:
+      - candle/candle-transformers/src/models/expert_lre/cache.rs
+      - candle/candle-transformers/src/models/expert_lre/pipeline.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "What is the value of `PINNED_LAYERS`"
+    should:
+      - candle/candle-transformers/src/models/expert_lre/cache.rs
+      - candle/candle-transformers/src/models/qwen35/layer_loader.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "Where is `FoldParams::derive` defined"
+    should:
+      - candle/candle-conversation/src/provenance/wide_sig.rs
+      - candle/candle-conversation/src/scheduler/mod.rs
+    should_not: ["candle/docs/results/*"]
+  # ── Transitive ──
+  - starts: "The provenance signature's fold is derived per model"
+    should:
+      - candle/candle-conversation/src/provenance/wide_sig.rs
+      - candle/candle-conversation/src/provenance/scan.rs
+      - candle/candle-conversation/src/provenance/window_score.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "When zend replays a recorded conversation"
+    should:
+      - candle/candle-conversation/src/recorded_reply.rs
+      - candle/candle-conversation/src/conversation.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "What breaks, and where, if the 32-token KV block size"
+    should:
+      - candle/candle-nn/src/kv_cache/chunked/types.rs
+      - candle/candle-kernels/src/blocks.cuh
+      - candle/candle-kernels/src/arena_table.cuh
+    should_not: ["candle/docs/results/*"]
+  - starts: "Trace how a MoE layer's routing reaches the expert kernels"
+    should:
+      - candle/candle-kernels/src/simple/moe_bucketize.cu
+      - candle/candle-transformers/src/models/expert_lre/dispatch.rs
+      - candle/candle-transformers/src/models/expert_lre/stager.rs
+      - candle/docs/moe_live_dispatch_design.md
+    should_not: ["candle/docs/results/*"]
+  - starts: "Trace why the experts of the first two MoE layers"
+    should:
+      - candle/candle-transformers/src/models/expert_lre/cache.rs
+      - candle/candle-transformers/src/models/expert_lre/startup.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "Which configuration fields decide when a conversation reprojects"
+    should:
+      - candle/candle-conversation/src/config.rs
+      - candle/candle-conversation/src/conversation.rs
+      - candle/candle-conversation/src/scheduler/mod.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "How does the projection assembler avoid recomputing structural glue"
+    should:
+      - candle/candle-conversation/src/scheduler/projection_assembler.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "Trace how a sealed chunk in the warm tier gets back into VRAM"
+    should:
+      - candle/candle-conversation/src/persistence/elevate.rs
+      - candle/candle-conversation/src/scheduler/mod.rs
+    should_not: ["candle/docs/results/*"]
+  # ── Architectural ──
+  - starts: "The KV cache's block size is shared between the Rust code"
+    should:
+      - candle/candle-nn/src/kv_cache/chunked/types.rs
+      - candle/candle-kernels/src/blocks.cuh
+    should_not: ["candle/docs/results/*"]
+  - starts: "The device memory span is shared by several tenants"
+    should:
+      - candle/candle-nn/src/kv_cache/chunked/region_pool.rs
+      - candle/candle-nn/src/kv_cache/chunked/span_geometry.rs
+      - candle/AGENTS.md
+    should_not: ["candle/docs/results/*"]
+  - starts: "Why can a projection for the Qwen3.8-Flash-Next model not contain live structural glue"
+    should:
+      - candle/candle-conversation/src/scheduler/projection_assembler.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "Stored keys must stay valid when a projection moves a sealed turn"
+    should:
+      - candle/docs/unbounded_agents.md
+    should_not: ["candle/docs/results/*"]
+  - starts: "Which hot-path invariant forbids reading MoE routing back to the host"
+    should:
+      - candle/AGENTS.md
+      - candle/docs/moe_live_dispatch_design.md
+    should_not: ["candle/docs/results/*"]
+  - starts: "What happens when two provenance signatures folded with different fold parameters"
+    should:
+      - candle/candle-conversation/src/provenance/wide_sig.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "When a decoded turn is sealed, what happens to its thinking tokens"
+    should:
+      - candle/candle-conversation/src/turn_layout.rs
+    should_not: ["candle/docs/results/*"]
+  - starts: "Persistence is mandatory for the conversation substrate"
+    should:
+      - candle/AGENTS.md
+      - candle/docs/archived/kv_tier_migration.md
+    should_not: ["candle/docs/results/*"]

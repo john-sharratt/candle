@@ -514,12 +514,14 @@ fn a_lone_tools_raw_values_are_held() {
         text.push(byte as char);
         d.accept(byte as TokenId, &[byte]);
     }
+    // The walk takes the framing line break before each marker where it is
+    // offered, as a model writes it.
     assert!(
-        text.contains("<parameter=repo>\ncandle</parameter>"),
+        text.contains("<parameter=repo>\ncandle\n</parameter>"),
         "{text:?}"
     );
     assert!(
-        text.contains("<parameter=path>\ncandle-conversation/src/cancel.rs</parameter>"),
+        text.contains("<parameter=path>\ncandle-conversation/src/cancel.rs\n</parameter>"),
         "{text:?}"
     );
 }

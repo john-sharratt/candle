@@ -287,6 +287,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+    use crate::branch_ingest::ignore::Ignore;
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -351,6 +352,22 @@ mod tests {
         cache: &mut TreeCache,
     ) -> (Corpus, Vec<String>) {
         walk(std::slice::from_ref(repo), scope, cache)
+    }
+
+    /// **An ignored file is not in the corpus at all** — neither read nor
+    /// retained — so a reading the layer holds of it is judged against a
+    /// corpus without it and tombstoned; the files beside it are untouched.
+    #[test]
+    fn an_ignored_file_is_neither_read_nor_retained() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = two_branches(root.path());
+        let scope = IngestScope::new("", None).ignoring(Ignore::new(&["r/src/*"]));
+        let (corpus, failed) = walk_one(&repo, &scope, &mut TreeCache::default());
+        assert!(failed.is_empty());
+        let read: Vec<&str> = paths(&corpus.ingest).iter().map(|(p, _)| *p).collect();
+        let held: Vec<&str> = paths(&corpus.retain).iter().map(|(p, _)| *p).collect();
+        assert_eq!(read, ["r/a.rs", "r/a.rs"]);
+        assert_eq!(held, ["r/a.rs", "r/a.rs"]);
     }
 
     /// **A repository with a tree that cannot be listed sits the pass out

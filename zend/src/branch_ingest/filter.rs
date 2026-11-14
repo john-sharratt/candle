@@ -1,6 +1,7 @@
 //! Which of a tree's files an ingest layer reads — decided from the listing
 //! alone, before any file is opened (`docs/zend_branch_ingest.md` §5).
 
+use super::ignore::Ignore;
 use crate::memory_paths::{is_conversation, is_memory_repo, owner, Owner};
 use crate::repo_scan::types::Language;
 
@@ -14,8 +15,8 @@ use crate::repo_scan::types::Language;
 /// the cost of hours of ingest.
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
-/// Where one ingest layer reads: a folder of the workspace (`--ingest-dir`)
-/// and a depth bound (`--max-depth`).
+/// Where one ingest layer reads: a folder of the workspace (`--ingest-dir`),
+/// a depth bound (`--max-depth`), and the paths it never reads (`--ignore`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct IngestScope {
     /// Workspace-relative, no leading or trailing `/`: empty for every
@@ -25,6 +26,8 @@ pub struct IngestScope {
     /// Path components below the walk's start — the repository's root, or
     /// `folder` — so `1` is the start's own files. `None` is unbounded.
     max_depth: Option<usize>,
+    /// The paths it never reads, at any depth ([`Ignore`]).
+    ignore: Ignore,
 }
 
 impl IngestScope {
@@ -33,7 +36,13 @@ impl IngestScope {
         Self {
             folder: if folder == "." { "" } else { folder }.to_string(),
             max_depth,
+            ignore: Ignore::default(),
         }
+    }
+
+    /// The same scope, never reading what `ignore` names.
+    pub fn ignoring(self, ignore: Ignore) -> Self {
+        Self { ignore, ..self }
     }
 
     /// The same scope at full depth — what a layer's held units are judged
@@ -45,6 +54,7 @@ impl IngestScope {
         Self {
             folder: self.folder.clone(),
             max_depth: None,
+            ignore: self.ignore.clone(),
         }
     }
 
@@ -69,6 +79,9 @@ impl IngestScope {
             return None;
         }
         let key = format!("{repo}/{path}");
+        if self.ignore.matches(&key) {
+            return None;
+        }
         let below = if self.folder.is_empty() {
             path
         } else {
@@ -97,6 +110,39 @@ pub fn language_of(path: &str) -> Option<Language> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An ignored path is not read, at any depth**, and the scope at full
+    /// depth — what a layer's held units are judged against — ignores it too,
+    /// so its reading is not retained either.
+    #[test]
+    fn an_ignored_path_is_neither_read_nor_retained() {
+        let s = IngestScope::new("", Some(5))
+            .ignoring(Ignore::new(&["candle/docs/results/dependency_battery_*"]));
+        assert_eq!(
+            s.admits(
+                "candle",
+                "docs/results/dependency_battery_2026-11-11.md",
+                10
+            ),
+            None
+        );
+        assert_eq!(
+            s.full_depth().admits(
+                "candle",
+                "docs/results/dependency_battery_2026-11-11.md",
+                10
+            ),
+            None
+        );
+        assert_eq!(
+            s.admits(
+                "candle",
+                "docs/results/theorem_depth_tests_2026-11-10.md",
+                10
+            ),
+            Some(Language::Markdown)
+        );
+    }
 
     #[test]
     fn an_unbounded_scope_reads_every_allowlisted_file() {
