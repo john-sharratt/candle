@@ -97,6 +97,8 @@ async fn main() -> anyhow::Result<()> {
     let checkouts = Checkouts::open(&cfg, &policy())?;
     let slots = cfg.slots(measure().cores);
     let jobs = Jobs::new(checkouts, slots, Priority::Normal);
+    // Each checkout's declared setup, before any job on it (§11.4).
+    jobs.set_up();
     let node = node_in(&cfg.jobs_dir)?;
     let host = args
         .host

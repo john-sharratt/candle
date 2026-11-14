@@ -14,6 +14,8 @@
 //! | [`overlay`] | a run's overlay, its chains named by digest |
 //! | [`chains`] | the chains an agent has been sent, by digest |
 //! | [`jobs`] | running jobs, pushes and fetches, and what each came to |
+//! | [`setup`] | the commands a repository declares for its checkout's start |
+//! | [`setting_up`] | which checkouts are still setting up, holding their runs |
 //! | [`switch`] | whether the agent takes jobs: an admin's, kept across restarts |
 //! | [`routes`] | the job API's routes |
 //! | [`member`] | joining the clusters as an `agent` member |
@@ -33,6 +35,8 @@ pub mod member;
 pub mod overlay;
 pub mod pusher;
 pub mod routes;
+pub mod setting_up;
+pub mod setup;
 pub mod stale_locks;
 pub mod sweep;
 pub mod switch;

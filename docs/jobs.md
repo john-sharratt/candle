@@ -53,7 +53,10 @@ A start never waits on work that can take seconds.
 - **The agent accepts a run before it fetches** (`agent/src/jobs.rs`). The
   request is checked, the job registered under its own id, and the answer goes
   back; fetching origin, building the store and waiting for the checkout are
-  phases of the job's own task.
+  phases of the job's own task. So is waiting for the checkout's setup, the
+  commands its repository declares for the agent's start
+  (`docs/replicated_substrate.md` §11.4): such a run is `waiting` behind the
+  setup's run.
 - **The gateway never holds a job back** (`cluster/src/gateway/agents.rs`). A
   busy lineage holder spills to the best free agent at once; with none free the
   job queues on its holder or the best agent.

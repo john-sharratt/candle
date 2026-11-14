@@ -4078,6 +4078,21 @@ fetch the base, then preserve → materialize → run → capture → restore
 deltas. The calling member applies the deltas to the store. They are then ordinary VFS
 events and replicate.
 
+**Setup at start.** A repository declares the tools its jobs need in `.agent/setup.yaml`,
+so no machine's agent file names them (`agent/src/setup.rs`):
+`commands: [{ program, args, timeout_s }]`, each a program and its arguments with no shell,
+under the same command policy as a run, `timeout_s` an hour when absent. When an agent
+starts — `tokera-agent`, or the agent in a `motherd`'s process — each checkout fetches
+origin and reads the file on the branch it has checked out, then runs its commands in
+order, each an ordinary run on that branch with no overlay (`Jobs::set_up`,
+`agent/src/jobs/start_setup.rs`). They hold the checkout as any run does and are kept and
+listed with their own ids and logs; a member's run on that checkout waits until the setup
+has ended, in phase `waiting` behind the setup's run. A command that fails is logged at
+`warn` with its job id and status, and the next one runs. A checkout without the file runs
+nothing and holds nothing back; a machine under a reservation (`docs/house_modes.md` §4)
+skips its setup and says so. The agent's log says, for each checkout, how many commands
+it runs, and for each its job id, command line, end and seconds taken.
+
 **A push** carries what the member built. Commits and merges are made in the member's
 own clone with the existing `zend-vfs` machinery; only the write to `origin` needs the
 credentials an agent holds. So the member bundles the objects `origin` lacks — a git

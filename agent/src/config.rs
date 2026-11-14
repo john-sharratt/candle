@@ -20,6 +20,10 @@
 //! `sweep` is when a run, as it takes its checkout, first takes back what the
 //! checkouts' build outputs hold ([`crate::sweep`]): prune, then clean.
 //!
+//! What a checkout runs when the agent starts is not this file's to say: each
+//! repository declares it in its own `.agent/setup.yaml` ([`crate::setup`]), so
+//! every machine holding the repository runs the same setup.
+//!
 //! `stage_dir` is where a run that asks for it stages the file it built —
 //! this machine's `keep/stage/`, which `keep` tries a build from
 //! (`docs/claude_zend_gateway.md` §8.4). Without it, a run asking to stage is
