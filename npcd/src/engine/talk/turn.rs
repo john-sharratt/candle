@@ -210,10 +210,7 @@ impl Runtime {
                 })
             })
             .ok_or_else(|| anyhow::anyhow!("npc {npc} has no thread with {member}"))?;
-        let band = match party.is_person() {
-            true => DecodePriority::High,
-            false => DecodePriority::Low,
-        };
+        let band = talk_band(&party);
         let mut talk = minds.open_talk(npc, &party, band)?;
         let now = Stamp::now();
         let first = inputs.lines.first().map_or(0, |l| l.seq.saturating_sub(1));
@@ -609,4 +606,33 @@ fn to_party(tool: &'static str, party: &str) -> Act {
     args.insert("to".into(), party.into());
     args.insert("intent".into(), "".into());
     Act { tool, args }
+}
+
+/// The band a conversation with `party` decodes at.
+///
+/// **A person on the other end is waiting on the turn right now** — the
+/// engine's `Urgent`, the band of zend's live dialogue. At `High` a direct
+/// message to Zen shared the card with the Makers' composing, which runs at
+/// `High` by design, and each answer took three to four minutes to come back.
+/// Another character is not waiting on anyone, and talks in the background.
+fn talk_band(party: &Party) -> DecodePriority {
+    match party.is_person() {
+        true => DecodePriority::Urgent,
+        false => DecodePriority::Low,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{talk_band, DecodePriority, Party};
+
+    /// A person is answered at `Urgent`; another character in the background.
+    #[test]
+    fn a_person_is_answered_at_urgent() {
+        assert_eq!(
+            talk_band(&Party::Person("u_154797f3".into())),
+            DecodePriority::Urgent
+        );
+        assert_eq!(talk_band(&Party::Npc(7)), DecodePriority::Low);
+    }
 }

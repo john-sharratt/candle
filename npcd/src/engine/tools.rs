@@ -1355,6 +1355,17 @@ pub fn show_within(selection: &mut SelectionState, mode: Mode, within: &Within) 
     selection.select_all(COLLECTION, members);
 }
 
+/// Offer no act at all: the selection a turn of plain words reads.
+///
+/// **A turn that is to say words must not be shown what it could call.** The
+/// words of a conversation's turn are decoded with `<tool_call>` banned, but
+/// under a selection still listing the thread's acts; Zen then wrote its
+/// decision out as text — `reply` and the call's JSON, sent to the person as
+/// its answer.
+pub fn show_none(selection: &mut SelectionState) {
+    selection.select_all(COLLECTION, Vec::<String>::new());
+}
+
 /// The act `t` is for a character standing *here*: an ordered body's
 /// mission acts in place of the agenda's of the same names
 /// ([`agenda::ordered`]), and every other act as it is.
@@ -2919,6 +2930,16 @@ mod tests {
     use crate::engine::talk;
     use crate::engine::talk::key::Party;
     use crate::engine::talk::within::OnThread;
+
+    /// **A turn of plain words is offered no act**, whatever its selection
+    /// listed before.
+    #[test]
+    fn plain_words_are_offered_no_act() {
+        let mut selection = SelectionState::new();
+        selection.select_all(COLLECTION, ["reply", "sign_off"]);
+        show_none(&mut selection);
+        assert!(selection.members(COLLECTION).is_empty());
+    }
 
     /// **The catalog compiles into a grammar, and a required parameter becomes
     /// unskippable in it.**

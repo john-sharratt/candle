@@ -20,7 +20,7 @@ use crate::engine::identity::{self, Deliberation};
 use crate::engine::prompt::Persona;
 use crate::engine::reflect::plain_prose;
 use crate::engine::talk::templates::Destination;
-use crate::engine::tools::Within;
+use crate::engine::tools::{self, Within};
 
 /// The tokens a voiced turn may not decode.
 const BANNED: [&str; 2] = ["<think>", "<tool_call>"];
@@ -57,6 +57,7 @@ impl Minds {
             Err(_) => asker.selection(),
         };
         identity::deliberate(&mut selection, Deliberation::None);
+        tools::show_none(&mut selection);
         if let Some(p) = self.projection.load().as_ref() {
             p.templates.offer(&mut selection, v.to);
         }

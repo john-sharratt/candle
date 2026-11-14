@@ -41,6 +41,17 @@ pub const LINE_TOKENS: usize = 320;
 /// The most a journal entry decodes.
 pub const JOURNAL_TOKENS: usize = 480;
 
+/// How a turn's words are decoded, as part of the frame a conversation is
+/// resumed under: with no act shown to them ([`tools::show_none`]).
+///
+/// **A conversation's history teaches its next words.** Words decoded while the
+/// thread's acts were still listed came out as the decision written as text —
+/// `reply` and its JSON — and once sealed, every later turn read them back as
+/// how this character answers. Naming the shape in the frame means a
+/// conversation sealed under another shape is not resumed: its next turn opens
+/// a new generation and retires the old ones (§4.1).
+const WORDS_SHAPE: &str = "words: no acts shown";
+
 /// How much of a turn's decision its log line shows, in characters.
 const DECISION_SHOWN: usize = 600;
 
@@ -99,7 +110,11 @@ impl Minds {
         let (layer, group) = p
             .talk
             .ok_or_else(|| anyhow::anyhow!("the schema declares no `talk` layer"))?;
-        let frame = frame_fingerprint(&format!("{}\n{}", p.frame, Stance::Talking.id()));
+        let frame = frame_fingerprint(&format!(
+            "{}\n{}\n{WORDS_SHAPE}",
+            p.frame,
+            Stance::Talking.id()
+        ));
         let mut cfg = self.base_config.clone();
         cfg.context_window_turns = CONTEXT_WINDOW_TURNS;
         let engine = &self.engine;
@@ -240,9 +255,10 @@ impl Minds {
         let parsed = act::parse(&decided.text, &act_specs(Catalog::THREAD, within));
         let to = decide::destination(&parsed.acts);
 
-        // The words: the real turn, sealed.
+        // The words: the real turn, sealed, shown no act to call.
         let mut sel = selection;
         identity::deliberate(&mut sel, Deliberation::None);
+        tools::show_none(&mut sel);
         if let Some(p) = self.projection.load().as_ref() {
             p.templates.offer(&mut sel, to);
         }
