@@ -720,6 +720,69 @@ fn cold_to_warm_on_request_round_trip() {
     }
 }
 
+/// **A retired turn is never read back from the log.**
+///
+/// Retention kills a turn's residence but leaves its cold reference, and
+/// compaction sheds the chunks that reference names together with their
+/// segment, so a read of it opens a file that is gone. The warming pass skips
+/// the retired turn — not read, not failed — and warms the rest.
+#[test]
+fn cold_to_warm_skips_a_retired_turn() {
+    let _persist = persistence_serial();
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    let tmpdir = tempfile::tempdir().unwrap();
+    let dir = tmpdir.path().to_path_buf();
+    let layer_id = LayerId::from_raw(1).unwrap();
+    let group_id = GroupId::from_raw(1).unwrap();
+    let timeline = TimelineAllocator::new().next();
+
+    let turn_keys = {
+        let conv = open_conversation(&dir);
+        let backings = make_backings(&device);
+        conv.register_timeline(timeline, layer_id, group_id);
+        let turn_keys: Vec<TurnKey> = (0..N_TURNS)
+            .map(|i| {
+                let base = 7000 + (i as u32) * 1_000_000;
+                TurnKey::new(
+                    timeline,
+                    seed_turn(&conv, &backings, &device, timeline, base),
+                )
+            })
+            .collect();
+        let persist = PersistenceThread::spawn(
+            conv.clone(),
+            Arc::new(backings.clone()),
+            device.clone(),
+            None,
+            WarmLedger::new().join(),
+        );
+        persist.shutdown();
+        turn_keys
+    };
+
+    let conv = open_conversation(&dir);
+    let backings = make_backings(&device);
+    conv.register_timeline(timeline, layer_id, group_id);
+    assert_eq!(conv.reconstruct_from_log(N_LAYERS, None).unwrap(), N_TURNS);
+    let retired = turn_keys[0];
+    conv.tombstone_turn(retired.timeline, retired.index.0)
+        .unwrap();
+    assert!(
+        turn_state(&conv, retired).cold,
+        "the retired turn keeps its cold reference"
+    );
+
+    let warmed = conv.warm_turns_from_cold(&backings, &turn_keys, u64::MAX);
+    assert_eq!(
+        (warmed.turns, warmed.skipped, warmed.failed, warmed.dropped),
+        (N_TURNS - 1, 1, 0, 0),
+        "the retired turn skipped, the rest warmed: {warmed:?}"
+    );
+    assert!(!turn_state(&conv, retired).warm, "nothing warmed onto it");
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Quant blend round-trip
 // ════════════════════════════════════════════════════════════════════════════

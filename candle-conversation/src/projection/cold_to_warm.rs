@@ -8,7 +8,7 @@
 //! read from the log and rebuilt in host RAM, one layer at a time, and
 //! installed as the residence's warm copy. Nothing touches the device.
 //!
-//! Best-effort by design: a turn already warm or hot is skipped, a turn the
+//! Best-effort by design: a turn already warm or hot, or retired, is skipped, a turn the
 //! log cannot read is passed over with a warning, and once `room` bytes are
 //! spent the rest of the list is dropped. The caller asks again later.
 
@@ -27,7 +27,7 @@ pub struct Warmed {
     pub turns: usize,
     /// Their warm bytes.
     pub bytes: u64,
-    /// Turns already warm or hot, or not cold-backed: nothing to do.
+    /// Turns already warm or hot, retired, or not cold-backed: nothing to do.
     pub skipped: usize,
     /// Turns left for want of room.
     pub dropped: usize,
@@ -66,6 +66,18 @@ impl Conversation {
         let mut spent = 0u64;
         for (i, &key) in turns.iter().enumerate() {
             let substrate = self.read();
+            let Some(residence) = substrate.turn_residence(key.timeline, key.index) else {
+                out.skipped += 1;
+                continue;
+            };
+            // A retired turn's residence is dead but keeps its cold reference,
+            // and compaction sheds the chunks it names with their segment
+            // (`maintenance::Shed`): reading it opens a file that is gone, and
+            // an install onto a dead residence takes nothing anyway.
+            if substrate.residence(residence).is_dead() {
+                out.skipped += 1;
+                continue;
+            }
             let cold_only = substrate
                 .turn_tier_state(key.timeline, key.index)
                 .is_some_and(|t| t.cold && !t.warm && !t.hot);
@@ -73,10 +85,6 @@ impl Conversation {
                 out.skipped += 1;
                 continue;
             }
-            let Some(residence) = substrate.turn_residence(key.timeline, key.index) else {
-                out.skipped += 1;
-                continue;
-            };
             // The turn's decl by its stream id, as the cold-to-hot load finds it:
             // one map lookup, never a walk of every stream.
             let Some(stream) = substrate.stream_of(turn_stream_id(key.timeline.raw(), key.index.0))
