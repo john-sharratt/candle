@@ -98,6 +98,7 @@ use crate::api::substrate::{
     ToolsView,
 };
 use crate::branch_ingest::filter::IngestScope;
+use crate::branch_ingest::ignore::Ignore;
 use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY};
 use crate::branch_ingest::{moves_branches, BranchIngest, LayerPass};
 use crate::calibrate::thinking::thinking_of;
@@ -1395,6 +1396,7 @@ impl InferenceState {
         wiped_layers: HashSet<String>,
         ingest_dirs: HashMap<String, String>,
         max_depth: Option<usize>,
+        ignore: Ignore,
         host_runtime: Option<Handle>,
         agent: Option<Arc<Jobs>>,
         compact_substrate: bool,
@@ -3055,7 +3057,7 @@ impl InferenceState {
             if disabled_layers.contains(&il.name) {
                 continue;
             }
-            let scope = IngestScope::new(&il.folder, max_depth);
+            let scope = IngestScope::new(&il.folder, max_depth).ignoring(ignore.clone());
             match il.mode {
                 IngestMode::Files => files_group = Some(group),
                 // Retrieval derives folders at full depth: the layer retains
@@ -8726,6 +8728,7 @@ impl ZendSession {
         let wiped_layers = self.config.wiped_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
         let max_depth = self.config.max_depth;
+        let ignore = self.config.ignore.clone();
         let agent = self.config.agent.clone();
         let compact_substrate = self.config.compact_substrate;
         let self_check = self.config.self_check;
@@ -8863,6 +8866,7 @@ impl ZendSession {
                     wiped_layers,
                     ingest_dirs,
                     max_depth,
+                    ignore,
                     host_runtime,
                     agent,
                     compact_substrate,

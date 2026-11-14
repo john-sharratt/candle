@@ -20,6 +20,7 @@ use clap::Args;
 use host::{OneShot, MODEL};
 use serde::{Deserialize, Deserializer};
 
+use crate::branch_ingest::ignore::Ignore;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::engine_asks;
 use crate::secrets;
@@ -87,6 +88,14 @@ pub struct ZendArgs {
     /// Unbounded when omitted.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub max_depth: Option<u32>,
+
+    /// A path the `repo_map` and `code_reading` layers never read, as a
+    /// workspace key `<repo>/<path>` in which `*` matches any run of
+    /// characters, `/` included. Repeatable. An ignored file is not read and
+    /// not retained: a reading the substrate already holds of it is
+    /// tombstoned by the next pass.
+    #[arg(long = "ignore", value_name = "PATTERN")]
+    pub ignore: Vec<String>,
 
     /// Force a whole-store redo-log compaction once during load (after the
     /// substrate reload, before serving) instead of leaving reclaim to the
@@ -178,6 +187,7 @@ impl Default for ZendArgs {
             wipe_layer: Vec::new(),
             ingest_dir: Vec::new(),
             max_depth: None,
+            ignore: Vec::new(),
             compact_substrate: false,
             self_check: false,
             dry_run: false,
@@ -337,6 +347,7 @@ impl ZendArgs {
         config.wiped_layers = self.wipe_layer.iter().cloned().collect();
         config.ingest_dirs = ingest_dirs;
         config.max_depth = self.max_depth.map(|d| d as usize);
+        config.ignore = Ignore::new(&self.ignore);
         config.compact_substrate = self.compact_substrate;
         config.self_check = match (self.self_check, self.dry_run) {
             (false, _) => SelfCheck::Off,
@@ -490,13 +501,15 @@ mod tests {
             "repo_map",
             "--max-depth",
             "2",
+            "--ignore",
+            "candle/docs/results/*",
             "--qsa-recent-mode",
             "forced",
             "--summarize",
         ]);
         let yaml: ZendArgs = serde_yaml::from_str(
             "working_dir: ../mind\ndisable_layer: [repo_map]\nmax_depth: 2\n\
-             qsa_recent_mode: forced\nsummarize: true\n",
+             ignore: [candle/docs/results/*]\nqsa_recent_mode: forced\nsummarize: true\n",
         )
         .unwrap();
         assert_eq!(flags, yaml);

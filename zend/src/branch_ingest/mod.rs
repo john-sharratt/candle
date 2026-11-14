@@ -10,6 +10,7 @@
 //! folder unit that has none ([`crate::faces`]).
 
 pub mod filter;
+pub mod ignore;
 pub mod keys;
 pub mod manifest;
 pub mod monitored;

@@ -44,10 +44,24 @@ host:
 # zend: the workspace folder holding `workspace.yaml`, and its `substrate/`. A
 # substrate is bound to the model that wrote it, so one written under another
 # model refuses to open — start on a new one, or move the old one aside.
-# `max_depth` bounds the folder walk three components below the workspace.
+# `max_depth` bounds the walk five components below each repository's root,
+# deep enough for the crates' module trees (`candle-nn/src/kv_cache/chunked/`,
+# `candle-transformers/src/models/expert_lre/`), whose files a dialogue is
+# asked about. `ignore` keeps out what that depth would otherwise bring in and
+# no question needs read: data and prose trees, upstream examples, and the
+# dependency battery's own results — a reading of those would answer the
+# battery from its last run's answers (docs/unbounded_agents.md §9.12). A
+# `…/*/*` pattern covers only below the folder's own files, which the walk
+# read at depth 3 before.
 zend:
   working_dir: ..
-  max_depth: 3
+  max_depth: 5
+  ignore:
+    - candle/docs/results/dependency_battery_*
+    - candle/candle-examples/examples/*/*
+    - candle/npc-map/maps/*/*
+    - battle-cities/docs/lore/*/*
+    - battle-cities/assets/*/*
 
 # npcd: its mind is the repository the agents hold as `battle-mind`, read from
 # the substrate at the commit the log names (docs/substrate_git.md §8) and
