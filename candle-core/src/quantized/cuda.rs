@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::cuda_backend::alloc_inheriting;
 use crate::cuda_backend::graph::outside_capture;
 use crate::cuda_backend::last_cuda_kernel_launch;
+use crate::cuda_backend::load_scratch;
 use crate::cuda_backend::stream_alloc;
 use crate::cuda_backend::wave_provenance::{self, wave_alloc_attributed, LeaseOrigin};
 use crate::cuda_backend::Backing;
@@ -4353,11 +4354,17 @@ impl QCudaStorage {
             );
         }
 
-        let mut f32_band = unsafe { self.device.alloc::<f32>(band_rows * ncols)? };
-        let mut ko_band = unsafe {
-            self.device
-                .alloc::<u8>(band_rows / 8 * k_blocks * chunk_bytes)?
-        };
+        // The bands die with this call, so a load serves them from its scratch at the span's
+        // top (`load_scratch`); the destination, which stays, is allocated outside the scope.
+        let (mut f32_band, mut ko_band) = load_scratch::transient(|| -> Result<_> {
+            Ok(unsafe {
+                (
+                    self.device.alloc::<f32>(band_rows * ncols)?,
+                    self.device
+                        .alloc::<u8>(band_rows / 8 * k_blocks * chunk_bytes)?,
+                )
+            })
+        })?;
         let (out, backing) = self.dest_slice(bytes, dst)?;
         // **The destination is wrapped before the first fallible step, not after.** `out` may
         // be a `Lease` into the dense block, and a bare `CudaSlice` dropped on an error path
@@ -4574,10 +4581,17 @@ pub fn repack_ko_from_host(
         * 8;
 
     // Three bounded buffers: the staged source bytes, their f32 expansion, and the KO chunks
-    // the quantize kernel writes. None scales with the tensor.
-    let mut stage = unsafe { device.alloc::<u8>(band_rows * ncols / bs * ts)? };
-    let mut f32_band = unsafe { device.alloc::<f32>(band_rows * ncols)? };
-    let mut ko_band = unsafe { device.alloc::<u8>(band_rows / 8 * k_blocks * chunk_bytes)? };
+    // the quantize kernel writes. None scales with the tensor, and all three die with this
+    // call, so a load serves them from its scratch at the span's top (`load_scratch`).
+    let (mut stage, mut f32_band, mut ko_band) = load_scratch::transient(|| -> Result<_> {
+        Ok(unsafe {
+            (
+                device.alloc::<u8>(band_rows * ncols / bs * ts)?,
+                device.alloc::<f32>(band_rows * ncols)?,
+                device.alloc::<u8>(band_rows / 8 * k_blocks * chunk_bytes)?,
+            )
+        })
+    })?;
 
     // **Wrapped before the first fallible step**, for the reason `repack_ko_into` gives at
     // length: `out` may be a lease into the dense block, and a bare `CudaSlice` dropped on an

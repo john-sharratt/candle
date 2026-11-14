@@ -67,18 +67,50 @@ Under every model the span is **one `cuMemAlloc`**. Nothing needs virtual
 memory management, so the same code runs under WDDM, TCC and Linux.
 
 - **The span** (`kv_cache/chunked/reservation.rs`) is allocated once at
-  `target − load_headroom`, capped at the free memory the driver reports less
-  256 MiB for the driver's own allocations, stepping down by a thirty-second on
-  a refusal. A guard granule sits in front of it, so no tenant ever holds the
-  allocation's base. It is zero-filled as it is claimed. Under WDDM an
-  allocation past the residency budget is granted and demoted rather than
-  refused, so the cap, and the governor sizing the target from DXGI's budget,
-  keeps it resident; the eviction unit there is the whole span.
-- **It never grows.** The load headroom (`peak_load_pool_bytes`: the largest
-  source tensor and the repack's two bands) stays outside the span for the life
-  of the process. It is the driver's ground: the load's scratch, the layer
-  pack's build after `close_load`, and every allocation not yet carried by an
-  arena of the span land there.
+  `target`, capped at the free memory the driver reports less 256 MiB for the
+  driver's own allocations, stepping down by a thirty-second on a refusal. A
+  guard granule sits in front of it, so no tenant ever holds the allocation's
+  base. It is zero-filled as it is claimed. Under WDDM an allocation past the
+  residency budget is granted and demoted rather than refused, so the cap, and
+  the governor sizing the target from DXGI's budget, keeps it resident; the
+  eviction unit there is the whole span.
+- **It never grows, so the load's scratch is inside it.** While a model loads,
+  the span's right end belongs to nobody: the dense block grows from the left,
+  and the weight side is placed from the right only once `close_load` has
+  frozen the block. So the top `load_headroom` bytes (`peak_load_pool_bytes`:
+  the largest source tensor read whole and the repack's two bands) are opened
+  as the load's scratch (`cuda_backend/load_scratch`), with the weight floor
+  held at their base so neither the dense block nor a KV region reaches them.
+  `freeze_dense` closes the scratch and raises the floor to the span's end, and
+  the expert zone is placed on that ground next; no weight side may be placed
+  while the scratch is open (`set_weight_floor` refuses). Left outside the span
+  instead, as a span that never grows forces, the headroom was the driver's for
+  the life of the process: on the 3090's 35B gate, 800 MiB of expert zone and
+  −9% BF16 prefill.
+- **The scratch serves only what the load scopes as transient.** A load also
+  makes allocations that outlive it — a weight kept as read, a table built once
+  — and one standing in the scratch when the expert zone is placed would be
+  overwritten by expert slots, silently. So cudarc's allocation watch serves
+  from the scratch only inside `load_scratch::transient`, on the device's
+  stream: a projection's source read whole to be repacked into a twin in the
+  dense block (`dense_span::transient`, under the rule `bands_from_host`
+  states), and the repack's bands (`repack_ko_into`, `repack_ko_from_host`). A
+  scoped request the scratch cannot hold goes to the driver, and is counted as
+  `spilled_mib` in the close's log line. `close` refuses while a served
+  allocation is live, so a transient that outlives the load fails the load at
+  `close_load` rather than under the experts.
+- **The headroom counts only what stands on the card whole.** A tensor the
+  load reads on the host is left out of the bound: the token embedding (on the
+  host for qwen35, copied from the host straight into the dense block for
+  Flash-Next — `dense_span::place_host_in_dense`) and an output head whose twin
+  is repacked from the file a band at a time (`dense_span::bands_from_host`).
+  Those two are a model's largest 2-D tensors. Counted, they held Flash-Next's
+  headroom at 1,384 MiB and the 35B's at 611; left out, the bound is the widest
+  projection read whole plus the two bands, 128 and 113 MiB — the scratch's
+  size, returned to the weight side when the load closes.
+- **The layer pack's build after `close_load`**, for a streamed model, runs
+  with the scratch already closed, on the driver's ground the pool cushion
+  leaves outside the span (`GovernorConfig::scratch_margin`).
 - **Everything else cudarc allocates is the driver's**, as upstream: a
   stream-ordered pool allocation where the card has memory pools (WDDM, Linux),
   a synchronous `cuMemAlloc` — and a stream synchronise plus `cuMemFree` on its
@@ -152,8 +184,9 @@ it (`local_memory_bytes`). Kernel modules loaded on first launch, CUDA graph
 executables and library handles are the rest of that ground; none of them is a
 cudarc allocation, and none can move onto the span.
 
-A run with the feature stops at the next site to move. Once none is left, the
-load headroom is no longer the driver's for anything and the span takes it.
+A run with the feature stops at the next site to move. The load headroom is
+already the span's: the load's scratch at its top, given to the weight side
+when the load closes (above).
 
 ## 5. The reservation's refusal
 

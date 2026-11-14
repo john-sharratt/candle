@@ -41,7 +41,7 @@ pub(crate) fn ingest_link(
             return Ok(Some(held));
         }
     }
-    let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, layer_name)?;
+    let plan = IngestPlan::new(ctx, layer_name)?;
     let link_ctx = RefreshContext {
         link_parent: parent.map(|p| p.timeline),
         band: Some(PRIMING_BAND),

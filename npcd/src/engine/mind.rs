@@ -79,7 +79,7 @@ use journal_core::folding::{self, Folded};
 use journal_core::journal::Holds;
 use journal_core::section::{self, entry_section, JournalPrompt, Kept, META_KEPT};
 use journal_core::verify::World;
-use journal_core::workflow::{self, Outcome, Timing};
+use journal_core::workflow::{self, Outcome, Skip, Timing};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -1243,7 +1243,17 @@ impl Minds {
             anyhow::bail!("no schema, so no journal collection to write to");
         }
         let mut desk = EngineDesk::new(self, npc_id, persona, within, WRITE_TOKENS);
-        Ok(workflow::run(&mut desk, &*due.state, &due.span, world, &NPC).await)
+        // A character's journal weighs every stretch against its latest entry:
+        // it has no requests to log one by one.
+        Ok(workflow::run(
+            &mut desk,
+            &*due.state,
+            &due.span,
+            world,
+            &NPC,
+            Skip::Allowed,
+        )
+        .await)
     }
 
     /// Fold every period of the character's journal that is over at world

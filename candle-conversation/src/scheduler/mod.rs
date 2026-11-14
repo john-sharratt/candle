@@ -11935,12 +11935,18 @@ impl Scheduler {
             },
             false => None,
         };
+        // What the read held and what it lifted, for the observe split: the
+        // turns whose rounds' momentum lifts their scores, and the strongest.
+        let mut hit_read = hit_density::HitSummary::default();
+        let mut lifted = 0usize;
+        let mut top_lift = 0.0f32;
         let density = match self.slot_projection_state.get_mut(&slot) {
             Some(state) => {
                 let mut parts = std::mem::take(&mut state.unread_hits);
                 if let Some(h) = hits {
                     parts.push((state.hit_keys.clone(), h));
                 }
+                hit_read = hit_density::hit_summary(&parts);
                 // Each placed round's hit momentum moves, and lifts this
                 // reprojection's scores of the turns whose rounds it keeps
                 // reading (`docs/hit_driven_projection.md` §7.1, §8.1).
@@ -11981,14 +11987,19 @@ impl Scheduler {
                             .cloned()
                     })
                 };
+                lifted = turn_lifts.len();
+                top_lift = turn_lifts.values().copied().fold(0.0, f32::max);
                 projection_scores.lift_turns(turn_lifts, base, |k| chain.contains(&k.timeline));
                 hit_density::hit_density(&parts)
             }
             None => HashMap::new(),
         };
+        let hits_us = t_observe.elapsed().as_micros() as u64;
+        let t_ws = Instant::now();
         policy
             .substrate
             .observe_working_set(schema, policy.target, &group_candidates, &density);
+        let ws_us = t_ws.elapsed().as_micros() as u64;
         // The pool behind the slot, chosen from the same scan: each candidate
         // conversation lifted by the most-read of its rounds (§7.2).
         let pool_lifts: HashMap<TimelineId, f32> = self
@@ -12003,9 +12014,37 @@ impl Scheduler {
                 by_piece
             })
             .unwrap_or_default();
-        self.refresh_pool(slot, &policy.substrate, &group_candidates, &pool_lifts);
+        let t_pool = Instant::now();
+        let pool = self.refresh_pool(slot, &policy.substrate, &group_candidates, &pool_lifts);
+        let pool_us = t_pool.elapsed().as_micros() as u64;
         observe_span.end();
         let observe_us = t_observe.elapsed().as_micros() as u64;
+        // `observe_us` by part, on every reprojection — one whose selection is
+        // unchanged reports no prepare split, and it is the one a decode waits
+        // on most often.
+        note("reproject observe split", || {
+            format!(
+                "view={} observe_us={observe_us} hits_us={hits_us} ws_us={ws_us} \
+                 pool_us={pool_us} pooled={} pool_reused={} pool_walked_turns={} \
+                 candidates={} hit_parts={} queries={} shadow_queries={} \
+                 loaded_rounds={} loaded_hit={} loaded_hits={} pooled_rounds={} \
+                 pooled_hit={} pooled_hits={} turns_lifted={lifted} top_lift={top_lift:.3}",
+                view_id.0,
+                pool.pooled,
+                pool.reused,
+                pool.walked,
+                group_candidates.iter().map(|(_, c)| c.len()).sum::<usize>(),
+                hit_read.parts,
+                hit_read.queries,
+                hit_read.shadow_queries,
+                hit_read.loaded,
+                hit_read.loaded_hit,
+                hit_read.loaded_hits,
+                hit_read.pooled,
+                hit_read.pooled_hit,
+                hit_read.pooled_hits,
+            )
+        });
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_belief_scan");

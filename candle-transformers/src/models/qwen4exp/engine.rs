@@ -36,7 +36,9 @@ use candle::{Device, Result, Tensor};
 use super::config::Qwen4ExpConfig;
 use super::hyper::ko::HcWeightsKo;
 use super::hyper::HcWeights;
-use super::loader::{load_headroom_bytes, offloaded_bytes, open_cached_ple};
+use super::loader::{
+    lm_head_name, load_headroom_bytes, offloaded_bytes, open_cached_ple, TOKEN_EMBD,
+};
 use super::model::PleSource;
 use super::mtp::{MtpDense, MtpHead};
 use super::ple::PleWeights;
@@ -157,7 +159,8 @@ impl Qwen4ExpGpu {
         // carved into its dense block and the span is sized from the whole card
         // rather than from what a lazily-created span found free mid-load. The
         // guard holds the load window open until this loader returns.
-        let _load = dense_span::open_for_load_sized(device, load_headroom_bytes(content))?;
+        let _load =
+            dense_span::open_for_load_sized(device, load_headroom_bytes(content, int8mode))?;
 
         // A weight the model keeps as loaded, for its whole life: placed in the
         // dense block rather than left on the driver's ground
@@ -170,8 +173,24 @@ impl Qwen4ExpGpu {
         let f32_source = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             g.qtensor(name, device)?.dequantize(device)
         };
+        // A source read whole only to be repacked into a twin in the dense block
+        // is a transient of the load, served from its scratch at the span's top
+        // (`dense_span::transient`); one that stays as read is not.
+        let twins = |g: &GgufModel, names: &[&str]| -> bool {
+            names.iter().all(|n| {
+                g.info(n)
+                    .is_some_and(|info| dense_span::bands_from_host(info, int8mode))
+            })
+        };
         let qm = |g: &mut GgufModel, name: &str| -> Result<QMatMul> {
-            QMatMul::from_qtensor_with_mode(g.qtensor(name, device)?, int8mode)
+            let read = |g: &mut GgufModel| {
+                QMatMul::from_qtensor_with_mode(g.qtensor(name, device)?, int8mode)
+            };
+            if twins(g, &[name]) {
+                dense_span::transient(|| read(g))
+            } else {
+                read(g)
+            }
         };
         // Several projections that read one activation over one contraction,
         // row-concatenated into a single weight so the block issues one GEMM
@@ -185,13 +204,23 @@ impl Qwen4ExpGpu {
         // rows interleaved, and the append is refused by name. This engine has
         // no per-tensor narrowing schedule — every projection takes the mode's
         // twin — so unlike the qwen35 streaming loader it is free to stack.
+        // The parts and their concatenation are the repack's sources: transients
+        // when every part takes a twin, as the stacked weight then does.
         let stack = |g: &mut GgufModel, names: &[String]| -> Result<QMatMul> {
-            let parts = names
-                .iter()
-                .map(|n| g.qtensor(n, device))
-                .collect::<Result<Vec<_>>>()?;
-            let refs: Vec<&QTensor> = parts.iter().collect();
-            QMatMul::from_qtensor_with_mode(QTensor::concat_rows_cuda(&refs)?, int8mode)
+            let read = |g: &mut GgufModel| {
+                let parts = names
+                    .iter()
+                    .map(|n| g.qtensor(n, device))
+                    .collect::<Result<Vec<_>>>()?;
+                let refs: Vec<&QTensor> = parts.iter().collect();
+                QMatMul::from_qtensor_with_mode(QTensor::concat_rows_cuda(&refs)?, int8mode)
+            };
+            let parts: Vec<&str> = names.iter().map(String::as_str).collect();
+            if twins(g, &parts) {
+                dense_span::transient(|| read(g))
+            } else {
+                read(g)
+            }
         };
         // The inject rows are stacked under the down projection at load, which
         // is what makes the read gate and the write weights one GEMM instead of
@@ -229,21 +258,42 @@ impl Qwen4ExpGpu {
         // F32 intermediate on the device to keep a 1.2 GiB BF16 table, for a
         // lookup that reads one row per token; the gather kernel widens only
         // those rows, into the residual's F32.
-        let embed = DeviceEmbedding::new(dense_span::place_in_dense(
-            device,
-            gguf.qtensor("token_embd.weight", device)?,
-        )?)?;
+        // Copied from the host straight into the dense block, so the table
+        // never stands on the card a second time beside its dense copy — the
+        // largest tensor the load reads, which the load headroom therefore
+        // leaves out (`load_headroom_bytes`).
+        let embed = {
+            let (bytes, info) = gguf.host_bytes(TOKEN_EMBD)?;
+            DeviceEmbedding::new(dense_span::place_host_in_dense(
+                device,
+                &bytes,
+                info.shape.dims(),
+                info.ggml_dtype,
+            )?)?
+        };
         // Tied embeddings, as the oracle loader handles them: a checkpoint
         // without `output.weight` projects through the embedding table. Reading
         // it unconditionally made the engine refuse artifacts the oracle
         // accepts, which is exactly the pair the oracle-vs-engine diff needs to
         // be able to run on the same checkpoint.
-        let lm_head_name = if gguf.info("output.weight").is_some() {
-            "output.weight"
-        } else {
-            "token_embd.weight"
+        let lm_head_name = lm_head_name(content);
+        // Repacked from the host a band at a time when the KO matmul takes it,
+        // which the headroom counts on; otherwise read the ordinary way, and
+        // counted there.
+        let banded = match gguf
+            .info(lm_head_name)
+            .filter(|info| dense_span::bands_from_host(info, int8mode))
+        {
+            Some(_) => {
+                let (bytes, info) = gguf.host_bytes(lm_head_name)?;
+                dense_span::twin_from_host(device, &bytes, &info, int8mode)?
+            }
+            None => None,
         };
-        let lm_head = qm(&mut gguf, lm_head_name)?;
+        let lm_head = match banded {
+            Some(head) => head,
+            None => qm(&mut gguf, lm_head_name)?,
+        };
         let out_hc = hc(&mut gguf, "output_hc", false)?;
 
         use crate::models::delta_net::LayerKind;

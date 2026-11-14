@@ -480,11 +480,10 @@ impl Cluster {
 pub fn standalone_agent(cfg: &AgentConfig) -> anyhow::Result<Arc<Jobs>> {
     let checkouts = Checkouts::open(cfg, &policy())?;
     tracing::info!("an agent in process, with no cluster");
-    Ok(Jobs::new(
-        checkouts,
-        cfg.slots(measure().cores),
-        Priority::Below,
-    ))
+    let jobs = Jobs::new(checkouts, cfg.slots(measure().cores), Priority::Below);
+    // Each checkout's declared setup, before any job on it (§11.4).
+    jobs.set_up();
+    Ok(jobs)
 }
 
 /// `--agent`: open the agent file's checkouts and join every cluster's agents
@@ -506,6 +505,8 @@ fn start_agent(
     let jobs = Jobs::new(checkouts, cfg.slots(measure().cores), Priority::Below);
     let node = node_in(&cfg.jobs_dir)?;
     let _on = runtime.enter();
+    // Each checkout's declared setup, before any job on it (§11.4).
+    jobs.set_up();
     let agent = Agent::new(
         node,
         settings.host.clone(),

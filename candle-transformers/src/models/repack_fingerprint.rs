@@ -44,6 +44,8 @@
 //! typical model — at open.
 
 #[cfg(feature = "cuda")]
+use candle::cuda_backend::LoadWindow;
+#[cfg(feature = "cuda")]
 use candle::quantized::repack_to_host;
 use candle::quantized::GgmlDType;
 #[cfg(feature = "cuda")]
@@ -135,6 +137,10 @@ pub(crate) fn pair_fingerprint_with(
 /// The fingerprint of `src → dtype` as this build's repack produces it.
 #[cfg(feature = "cuda")]
 pub(crate) fn pair_fingerprint(device: &CudaDevice, src: GgmlDType, dtype: GgmlDType) -> u64 {
+    // Part of opening a model's pack, so a load's: its reference tensor and the
+    // repack's buffers are the driver's while the check runs, inside a window,
+    // as the link probe is (`docs/driver_model.md` §4).
+    let _window = LoadWindow::open(device.cuda_stream().context().ordinal());
     pair_fingerprint_with(src, dtype, |bytes, rows, cols| {
         repack_to_host(device, bytes, rows, cols, src, dtype)
     })

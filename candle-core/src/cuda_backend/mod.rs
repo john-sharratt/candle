@@ -179,6 +179,7 @@ mod held;
 mod info_ring;
 mod kernel_scratch;
 pub mod link_probe;
+pub mod load_scratch;
 mod load_window;
 mod local_memory;
 mod matmul_into;

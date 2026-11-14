@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::element_close::PARAM_CLOSE;
 use super::vocab::TokenId;
 
 #[derive(Debug, Clone, Default)]
@@ -15,8 +16,18 @@ pub struct CallSoFar {
     /// a call's tool or chooses an argument's value.
     arm: Vec<TokenId>,
     written: HashMap<Arc<str>, String>,
-    /// The keyed span being written, and its bytes so far.
-    open: Option<(Arc<str>, Vec<u8>)>,
+    /// The keyed span being written, how its value is written, and its bytes
+    /// so far.
+    open: Option<(Arc<str>, ValueText, Vec<u8>)>,
+}
+
+/// How a span writes its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueText {
+    /// A JSON string, quoted and escaped.
+    Json,
+    /// A function block's raw value, ended by `</parameter>`.
+    Raw,
 }
 
 impl CallSoFar {
@@ -63,22 +74,26 @@ impl CallSoFar {
         self.written.insert(Arc::clone(field), value.to_string());
     }
 
-    /// A span writing `field` begins.
-    pub fn open(&mut self, field: Arc<str>) {
-        self.open = Some((field, Vec::new()));
+    /// A span writing `field`, as `text`, begins.
+    pub fn open(&mut self, field: Arc<str>, text: ValueText) {
+        self.open = Some((field, text, Vec::new()));
     }
 
     /// `bytes` of the span being written.
     pub fn feed(&mut self, bytes: &[u8]) {
-        if let Some((_, value)) = &mut self.open {
+        if let Some((_, _, value)) = &mut self.open {
             value.extend_from_slice(bytes);
         }
     }
 
     /// The span being written closed: its value is the call's.
     pub fn close(&mut self) {
-        if let Some((field, bytes)) = self.open.take() {
-            self.written.insert(field, value_of(&bytes));
+        if let Some((field, text, bytes)) = self.open.take() {
+            let value = match text {
+                ValueText::Json => value_of(&bytes),
+                ValueText::Raw => raw_value_of(&bytes),
+            };
+            self.written.insert(field, value);
         }
     }
 }
@@ -104,6 +119,16 @@ fn value_of(bytes: &[u8]) -> String {
     out
 }
 
+/// A raw value's content from the bytes its span took: up to its
+/// `</parameter>`, the one framing line break before it taken off, as every
+/// reader of a block takes it (`element_close`).
+fn raw_value_of(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let value = text.split(PARAM_CLOSE).next().unwrap_or_default();
+    let value = value.strip_suffix('\n').unwrap_or(value);
+    value.strip_suffix('\r').unwrap_or(value).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,7 +144,7 @@ mod tests {
         assert_eq!(call.arm(), [7, 9]);
         call.named(Some(Arc::from("file_edit")), &[]);
         assert_eq!(call.tool(), "file_edit");
-        call.open(Arc::from("part"));
+        call.open(Arc::from("part"), ValueText::Json);
         call.feed(b" \"Keh");
         call.feed(b"T\",");
         call.close();
@@ -159,5 +184,25 @@ mod tests {
         assert_eq!(value_of(b"src/a.rs\"}"), "src/a.rs");
         assert_eq!(value_of(br#" "a\"b""#), "a\"b");
         assert_eq!(value_of(b"+3"), "+3");
+    }
+
+    /// **A raw value is its content up to its `</parameter>`**, the closing
+    /// tags after it and one framing line break before it left out.
+    #[test]
+    fn a_raw_value_is_read_up_to_its_close() {
+        assert_eq!(
+            raw_value_of(b"candle-conversation/src/cancel.rs</parameter>\n<parameter="),
+            "candle-conversation/src/cancel.rs"
+        );
+        assert_eq!(raw_value_of(b"1-120\n</parameter>\n</function>"), "1-120");
+        assert_eq!(raw_value_of(b"a \"b\"\r\n</parameter>"), "a \"b\"");
+        assert_eq!(raw_value_of(b"src/a"), "src/a");
+        let mut call = CallSoFar::default();
+        call.named(Some(Arc::from("file_read")), &[]);
+        call.open(Arc::from("path"), ValueText::Raw);
+        call.feed(b"src/a.rs</para");
+        call.feed(b"meter>\n<parameter=");
+        call.close();
+        assert_eq!(call.written()[&Arc::from("path")], "src/a.rs");
     }
 }

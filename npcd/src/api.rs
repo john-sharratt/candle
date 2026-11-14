@@ -40,6 +40,7 @@ use tokio::sync::RwLock;
 use tokio::task::spawn_blocking;
 use web::auth::session::Identity;
 
+use candle_conversation::persistence::kept_objects::IMPORT_BODY_LIMIT;
 use candle_conversation::persistence::record::NpcPayload;
 use web::auth::{Role, Roles};
 
@@ -710,7 +711,7 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             "/v1/substrate/npcd/objects/import",
             Role::Admin,
             Dispatch::Best,
-            post(import_objects),
+            post(import_objects).body_limit(IMPORT_BODY_LIMIT),
         )
         .route(
             "/v1/npcs/import",

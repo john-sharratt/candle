@@ -23,8 +23,10 @@ use crate::style::Style;
 /// The collection a journal's sections are submitted to.
 pub const JOURNAL: &str = "journal";
 
-/// The section the open items are submitted under.
-pub const OPEN_SECTION: &str = "journal/open";
+/// The journal's closing section: the open items, and the line that says the
+/// journal ends there. Named for closing the journal, not for an entry still
+/// being written — it follows the entries and is none of them.
+pub const CLOSE_SECTION: &str = "journal/close";
 
 /// Conversation metadata: the kept entries and open items, as JSON.
 pub const META_KEPT: &str = "journal.kept";
@@ -106,7 +108,7 @@ impl JournalPrompt {
             .collect();
         if !(kept.entries.is_empty() && kept.open.is_empty()) {
             sections.push(Section {
-                name: OPEN_SECTION.to_string(),
+                name: CLOSE_SECTION.to_string(),
                 text: render_open(&kept.open, style),
             });
         }
@@ -189,7 +191,7 @@ mod tests {
     fn each_entry_is_a_section_named_for_it_and_open_items_come_last() {
         let p = JournalPrompt::of(&kept(&[3, 4], vec![item(2, " who holds it? ")]), &PLAIN);
         let names: Vec<&str> = p.sections.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["journal/3", "journal/4", "journal/open"]);
+        assert_eq!(names, ["journal/3", "journal/4", "journal/close"]);
         assert_eq!(p.sections[0].text, entry_with_claim(3).render(None, &PLAIN));
         assert_eq!(
             p.sections[1].text,
@@ -204,7 +206,7 @@ mod tests {
     fn nothing_open_is_said_and_the_journal_says_where_it_ends() {
         let p = JournalPrompt::of(&kept(&[1], vec![]), &PLAIN);
         let names: Vec<&str> = p.sections.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["journal/1", "journal/open"]);
+        assert_eq!(names, ["journal/1", "journal/close"]);
         assert_eq!(p.sections[1].text, "Open: nothing.\n\nEnd.");
     }
 

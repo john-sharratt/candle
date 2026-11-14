@@ -4,7 +4,7 @@ use super::block_guard::BlockGuard;
 use super::named_tool::steer_to_named_tool;
 use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{in_head_order, locate_rows, SpecChooser};
-use super::stencil_wave::{tail_start, StencilRow, StencilWave};
+use super::stencil_wave::{StencilRow, StencilWave};
 use super::step_census::HostPart;
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
@@ -358,58 +358,13 @@ impl Scheduler {
                 // Loop: the next action is the node after this static run.
             }
         }
-        if deferred.is_empty() {
-            return;
-        }
-
-        // What of each row a wave cannot carry is forwarded now: the pieces up
-        // to its last page break, each break closing its page, and anything
-        // past one forward's budget (`stencil_wave::tail_start`).
-        let pass = self.prefill_pass_budget();
-        let cuts: Vec<usize> = deferred
-            .iter()
-            .map(|(_, input)| tail_start(input, self.prefill_breaks(), pass))
-            .collect();
-        let leads: Vec<(SequenceId, &[u32])> = deferred
-            .iter()
-            .zip(&cuts)
-            .filter(|(_, &cut)| cut > 0)
-            .map(|((id, input), &cut)| (*id, &input[..cut]))
-            .collect();
-        let failed = if leads.is_empty() {
-            Vec::new()
-        } else {
-            self.run_prefill_batch(&leads)
-        };
-        // A failed forward leaves runs recorded whose K/V was never written —
-        // the turn would seal tokens with nothing behind them — so it fails,
-        // rather than dropping its stencil and decoding on over the gap.
-        let failed: Vec<SequenceId> = failed
-            .into_iter()
-            .map(|(id, e)| {
-                if let Some(s) = self.active_decodes.get_mut(&id) {
-                    if let Some(d) = &s.stencil {
-                        Self::log_stencil_finish(id.0, d, "prefill failed");
-                    }
-                    s.stencil = None;
-                }
-                self.fail_all_decodes(&[id], &format!("stencil prefill forward failed: {e}"));
-                id
-            })
-            .collect();
-        for ((id, input), cut) in deferred.into_iter().zip(cuts) {
-            if failed.contains(&id) {
-                continue;
-            }
-            // The lead ended on a break, and the page it closes ends there.
-            if cut > 0 && self.prefill_breaks().contains(&input[cut - 1]) {
-                self.close_page_at_break(id, &input[..cut]);
-            }
-            self.stencil_rows.push(StencilRow {
-                seq: id,
-                tokens: input[cut..].to_vec(),
-                ends_turn: ends.contains(&id),
-            });
+        // Each row rides the decode steps a piece at a time — at most the
+        // model's short span, each page break closing its page between two
+        // (`stencil_wave`). No part of it is forwarded on its own.
+        for (id, input) in deferred {
+            let ends_turn = ends.contains(&id);
+            self.stencil_rows
+                .push(StencilRow::played(id, input, ends_turn));
         }
     }
 

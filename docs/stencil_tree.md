@@ -208,17 +208,28 @@ Entering: in the `Free` state, `observe` checks the decoded token against the
 **trigger registry** (§9). A hit begins a session at the tree root; the trigger
 token has already been emitted, so walking starts after it.
 
-`Prefill` writes the node's whole buffer in one forward, not a decode per token —
-this is the §1 speedup. That forward is the decode step's own wave
-(`scheduler/stencil_wave.rs`): the buffer, behind the sequence's pending token,
+`Prefill` writes the node's buffer in the decode step's own wave, not a decode
+per token — this is the §1 speedup. The buffers up to the next choice, behind
+the sequence's pending token, make one row (`scheduler/stencil_wave.rs`) that
 rides the wave's prefill slot as a full-sweep member beside the decode rows and
-verify blocks, scored at its last row, and the token after it is sampled from
-that row. A run costs no forward of its own, which on a card that streams its
-experts is a second round of expert loads saved per stenciled step. The part of
-a buffer one wave cannot carry — pieces before its last page break, or more than
-one forward's budget — is forwarded ahead of the wave. A wave refused for ground
-keeps the run for the next step; the run's tokens are already recorded, so it is
-written by the retry rather than failing the turn.
+verify blocks. A run costs no forward of its own, which on a card that streams
+its experts is a second round of expert loads saved per stenciled step. A wave
+refused for ground keeps the row for the next step; the run's tokens are already
+recorded, so it is written by the retry rather than failing the turn.
+
+**A wave writes a row a piece at a time.** A piece is at most the model's short
+span (`ManagedBatchedModel::short_span_rows`) and never runs past a page break
+with something after it; the break's page closes before the next piece. Only
+the piece that completes the row is scored, and the token after the run is
+sampled from it. The span is the recurrent stack's timeline (8 rows): a longer
+span writes a second copy of the sequence's whole recurrent state, its prefill
+scratch (144 MiB on Flash-Next), which a decode would take at any step with no
+admission of its own. Cut to the span, a stencil decode claims nothing a cohort
+or admission sets aside. Measured over a minimal call of every tool in the live
+catalog on the live tokenizer, 80% of rows are within it; the rest are the row
+after the tool's name, its last token and `", "arguments": {"`, at 9 or 10, and
+each costs one more step as two pieces (`zend/tests/stencil_tool_call.rs`,
+`the_rows_a_tool_call_plays_on_the_live_tokenizer`).
 
 ---
 
@@ -765,6 +776,29 @@ call that was just refused for one.
   file the conversation never read), keeps the span's own rule. Each keyed
   span's value is recorded as the call writes it, so a later field can depend on
   it.
+- **A function block's raw value is held as a quoted one is.** Qwen3.5/3.8
+  write a call as elements (the edge-case table's raw-value row), each
+  value an `Element` span closed by `</parameter>` and the tag after it, with
+  no quotes. The front-end keys that span like any other
+  (`ToolTreeBuilder::element_value`), and the session walks the held set's
+  *raw form* there (`ValueRule::closed_by`): the set's trie, then — from a
+  node where a value ends — only the strings that close the span, the marker
+  followed by each tail its terminator closes on, so the rule closes on the
+  same byte the terminator fires on. The call records the value up to its
+  `</parameter>`, one framing line break taken off (`ValueText::Raw`). Until
+  2026-11-14 these spans were not keyed, so on the live checkpoint every hold
+  in this section held nothing: a reading of
+  `candle-conversation/src/cancel.rs` wrote `src/cancel.rs` on every pass and
+  was read again on every restart (pinned by
+  `a_reading_writes_only_its_own_path_in_a_function_block`).
+- **A catalog of one tool names its calls where it writes the name.** Every
+  hold is looked up by the call's tool, and a name branch of one arm is folded
+  into the run around it (§4), so a grammar over a lone tool — a file's
+  reading offers `file_read` and nothing else — had no branch to name its calls
+  and held none of them, in either dialect. `compile` marks the node such a run
+  lowers to with the tool it names (`TreeMarks::names_on_entry`), and the walk
+  begins a call of that tool on reaching it, as a name branch's arm begins one
+  (pinned by `a_lone_tools_raw_values_are_held`).
 - **A value chosen by a branch is recorded too.** An enum's value is a choice,
   not a span — and every file tool's `repo` is an enum, the workspace's
   repositories written into it at startup — so nothing a span records says
@@ -822,6 +856,16 @@ call that was just refused for one.
   repository prefix every read fence shows (`file=candle/…`), and the read came
   back `not_found`. Held, `src/turn_layout.rs` cannot be written in `candle`,
   whose root has no `src`.
+- **An ingest's calls are held like a dialogue's.** A `repo_map` folder
+  conversation answers its listing in a tool loop, and each decode runs under
+  the restricted catalog's call grammar held to the chain's tools (`file_list`,
+  `file_read`), with each folder's paths held to its commit-pinned stores
+  (`zend/src/repo_scan/mod.rs`, `IngestPlan`). The pass refuses steering with
+  no grammar on `<tool_call>` rather than run on it: holding passes such a
+  registry through unchanged, and the repo map ran on one — the `<think>`
+  trigger alone — until 2026-11-14, decoding its calls free. Live, a folder
+  wrote `file_list` with no arguments three times, and sealed "I have enough
+  evidence from the listing to summarize" as its summary.
 - **A refused value is not offered again**, because it is not offered at all:
   the held values are read again each round from the file as it stands, so an
   anchor or a line that does not exist — the repeat the guard used to end — is

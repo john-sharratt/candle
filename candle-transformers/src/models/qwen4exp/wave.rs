@@ -2953,6 +2953,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         true
     }
 
+    fn short_span_rows(&self) -> Option<usize> {
+        Some(TIMELINE_ROWS)
+    }
+
     fn has_recurrent_state(&self, seq: usize) -> bool {
         self.has_recurrent(seq).unwrap_or(false)
     }
@@ -3178,6 +3182,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     fn retain_pooled(&self, seq: usize, keep: &[PieceKey]) -> Result<()> {
         Qwen4ExpBatched::retain_pooled(self, seq, keep)
+    }
+
+    fn pooled_keys(&self, seq: usize) -> Vec<PieceKey> {
+        Qwen4ExpBatched::pooled_keys(self, seq)
     }
 
     fn positional_lift_bytes(&self, page: &[u8], key: &PieceKey) -> Result<usize> {

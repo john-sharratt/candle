@@ -40,12 +40,15 @@ use cluster::reserve::{machine as reservation, Reservation};
 
 use crate::chains::{Chains, Unresolved};
 use crate::checkouts::{Checkout, Checkouts};
+use crate::setting_up::SettingUp;
 use crate::sweep::{sweep, Bars, Target};
 use crate::switch::Switch;
 use crate::wire::{
     decode_bundle, AgentJobs, FetchJob, Fetched, JobKind, JobLine, JobView, ListJob, Listed,
     LogChunk, Phase, PushJob, Pushed, RunJob, Staged, Submit,
 };
+
+mod start_setup;
 
 /// Jobs kept after they end.
 pub const KEPT: usize = 256;
@@ -99,6 +102,8 @@ fn now_ms() -> u64 {
 
 /// How far a run has got towards its sandbox job.
 enum Prep {
+    /// Waiting for its checkout's setup to end ([`SettingUp`]).
+    SettingUp,
     /// Fetching origin and building its store: it has no sandbox job yet.
     Fetching,
     /// Its sandbox job, which says where it stands from here.
@@ -159,6 +164,17 @@ pub struct Jobs {
     /// The chains runs' overlays have carried, which a later run names
     /// instead of carrying.
     chains: Mutex<Chains>,
+    /// The checkouts still running the setup their repositories declare,
+    /// which a member's run on them waits for ([`Jobs::set_up`]).
+    setting_up: SettingUp,
+}
+
+/// Whether a run waits for its checkout's setup: a member's does; a setup
+/// command, which is that setup, does not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    AfterSetup,
+    IsSetup,
 }
 
 /// How recent a fetch of origin a slice past a run's first answers from: a
@@ -262,6 +278,7 @@ impl Jobs {
             table: Mutex::new((HashMap::new(), VecDeque::new())),
             fetched: Mutex::new(HashMap::new()),
             chains: Mutex::new(Chains::default()),
+            setting_up: SettingUp::default(),
         })
     }
 
@@ -321,7 +338,7 @@ impl Jobs {
             return Err(JobError::Reserved(why));
         }
         match submit {
-            Submit::Run(run) => self.run(run).await,
+            Submit::Run(run) => self.run(run, Gate::AfterSetup).await,
             Submit::Push(push) => self.push(push).await,
             Submit::Fetch(fetch) => self.fetch_for(fetch).await,
             Submit::List(list) => self.list_for(list).await,
@@ -496,8 +513,9 @@ impl Jobs {
     /// the checkout — happens in the job's own task, so a caller has the id
     /// in the time it takes to check the request. A run whose overlay names a
     /// chain this agent neither holds nor was sent is refused
-    /// [`JobError::Missing`], before anything is kept.
-    async fn run(self: &Arc<Self>, run: RunJob) -> Result<JobView, JobError> {
+    /// [`JobError::Missing`], before anything is kept. A member's run first
+    /// waits for its checkout's setup to end (`gate`).
+    async fn run(self: &Arc<Self>, run: RunJob, gate: Gate) -> Result<JobView, JobError> {
         self.checkout(&run.repo)?;
         let branch = BranchName::parse(&run.branch).map_err(|e| JobError::Bad(e.to_string()))?;
         let stage = match &run.stage {
@@ -534,7 +552,8 @@ impl Jobs {
             // Held while the job is kept: its task records how far it got
             // only once it is in the table.
             let mut t = self.table();
-            let task = tokio::spawn(async move { jobs.carry(&job, run, overlay, branch).await });
+            let task =
+                tokio::spawn(async move { jobs.carry(&job, run, overlay, branch, gate).await });
             keep_in(
                 &mut t,
                 id.clone(),
@@ -555,9 +574,22 @@ impl Jobs {
         self.view(&id)
     }
 
-    /// Run job `id` from its fetch to its end: fetch origin, start its
-    /// sandbox job, wait for it, and stage what it built.
-    async fn carry(self: Arc<Self>, id: &str, run: RunJob, overlay: Snapshot, branch: BranchName) {
+    /// Run job `id` from its fetch to its end: wait for its checkout's setup
+    /// (`gate`), fetch origin, start its sandbox job, wait for it, and stage
+    /// what it built.
+    async fn carry(
+        self: Arc<Self>,
+        id: &str,
+        run: RunJob,
+        overlay: Snapshot,
+        branch: BranchName,
+        gate: Gate,
+    ) {
+        if gate == Gate::AfterSetup && self.setting_up.behind(&run.repo).is_some() {
+            self.set_prep(id, Prep::SettingUp);
+            self.setting_up.until_ended(&run.repo).await;
+            self.set_prep(id, Prep::Fetching);
+        }
         let handle = match self.start(run, overlay, branch).await {
             Ok(started) => {
                 self.set_prep(id, Prep::Started(started.id));
@@ -804,7 +836,17 @@ impl Jobs {
             } => {
                 let ended = *e.ended.borrow();
                 let (status, lines, bytes, phase) = match prep {
-                    Prep::Fetching if ended => (JobStatus::Cancelled, 0, 0, Phase::Ended),
+                    Prep::SettingUp | Prep::Fetching if ended => {
+                        (JobStatus::Cancelled, 0, 0, Phase::Ended)
+                    }
+                    Prep::SettingUp => (
+                        JobStatus::Queued,
+                        0,
+                        0,
+                        Phase::Waiting {
+                            behind: self.setting_up.behind(&e.repo).unwrap_or_default(),
+                        },
+                    ),
                     Prep::Fetching => (JobStatus::Queued, 0, 0, Phase::Fetching),
                     Prep::Stopped(status) => (status.clone(), 0, 0, Phase::Ended),
                     Prep::Started(j) => {
@@ -974,7 +1016,7 @@ impl Jobs {
                     // or done: its own task records how it ended, and what it
                     // staged.
                     let ended = match prep {
-                        Prep::Fetching => false,
+                        Prep::SettingUp | Prep::Fetching => false,
                         Prep::Stopped(_) => true,
                         Prep::Started(j) => self
                             .checkout(&repo)
@@ -986,7 +1028,7 @@ impl Jobs {
                         None
                     } else {
                         task.abort();
-                        if matches!(prep, Prep::Fetching) {
+                        if matches!(prep, Prep::SettingUp | Prep::Fetching) {
                             *prep = Prep::Stopped(JobStatus::Cancelled);
                         }
                         Some(stage.is_some())

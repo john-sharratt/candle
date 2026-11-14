@@ -16,7 +16,7 @@ use super::catchup::Purpose;
 use super::receipt_watch::Seen;
 use super::replicator::{Phase, Replicator};
 use super::watch::periodic_due;
-use crate::frame::{Ack, Frame};
+use crate::frame::{Ack, Frame, Members};
 use crate::member::Link;
 
 /// How often the consensus engine's timers run.
@@ -74,6 +74,19 @@ pub const ADMISSION_QUIET_LIMIT: u32 = 2;
 pub fn is_quiet(now: Instant, word: Instant, arriving: Option<Instant>, lost: bool) -> bool {
     let silent = |at: Instant| now.duration_since(at) >= QUIET;
     silent(word) && (lost || arriving.is_none_or(silent))
+}
+
+/// Whether an admission catch-up the gateway told `LOST` has no one to wait
+/// for: the socket's member listing is in, and names no member but `node`.
+///
+/// The quiet asks exist for a member that is away for a moment — restarting,
+/// still loading — and will answer once it is back; the gateway answers `LOST`
+/// rather than `DONE` so that one still gets asked. With no other member
+/// connected at all there is no such member: waiting the asks out only keeps
+/// this one from serving, and what it lacks arrives as gaps once an origin
+/// connects and announces it. An unknown listing waits, as before.
+pub fn alone_in_listing(listing: Option<&Members>, node: u64) -> bool {
+    listing.is_some_and(|l| l.members.iter().all(|m| m.node == node))
 }
 
 /// What an admission catch-up that went quiet does next, given how many times
@@ -147,7 +160,7 @@ impl Replicator {
             return;
         };
         let now = Instant::now();
-        let (ack, gaps, periodic, quiet) = {
+        let (ack, gaps, periodic, quiet, alone) = {
             let mut s = self.state();
             let ack = replace(&mut s.ack_dirty, false).then(|| Ack {
                 applied: ack_lines(&applied, self.node, own_through),
@@ -203,6 +216,27 @@ impl Replicator {
                 Vec::new()
             };
 
+            // An admission catch-up told `LOST` on a socket where no other
+            // member is connected: there is no one to ask again
+            // (`alone_in_listing`). Dropped before the quiet check, which would
+            // otherwise ask it again.
+            let alone: Vec<(u64, usize)> = s
+                .catchups
+                .iter()
+                .filter(|(id, r)| {
+                    r.purpose == Purpose::Admission
+                        && s.lost.contains(id)
+                        && alone_in_listing(
+                            s.members.get(r.socket).and_then(Option::as_ref),
+                            self.node,
+                        )
+                })
+                .map(|(id, r)| (*id, r.socket))
+                .collect();
+            for (id, _) in &alone {
+                s.drop_catchup(*id);
+            }
+
             // A catch-up whose answerer went quiet.
             let socket_heard = |c: usize| {
                 s.sockets
@@ -223,8 +257,17 @@ impl Replicator {
             for (id, _, _) in &quiet {
                 s.drop_catchup(*id);
             }
-            (ack, gaps, periodic, quiet)
+            (ack, gaps, periodic, quiet, alone)
         };
+        for (_, c) in alone {
+            tracing::warn!(
+                node = self.node,
+                cluster = c,
+                "an admission catch-up was told no member can answer, and no other member is \
+                 connected: serving on what this member holds; what it lacks arrives as gaps"
+            );
+            self.finished(Purpose::Admission, c).await;
+        }
         if let Some(ack) = ack {
             for (_, handle) in self.state().admitted() {
                 let _ = handle.control(Frame::Ack(ack.clone()));
@@ -376,11 +419,49 @@ mod tests {
 
     use applied_set::AppliedSet;
 
+    use crate::frame::{BuildId, MemberInfo, MemberState, Members};
+
     use super::Phase;
     use super::{
-        ack_lines, after_quiet_admission, is_quiet, joined_mark_due, QuietAdmission,
-        ADMISSION_QUIET_LIMIT, JOINED_MARK, QUIET,
+        ack_lines, after_quiet_admission, alone_in_listing, is_quiet, joined_mark_due,
+        QuietAdmission, ADMISSION_QUIET_LIMIT, JOINED_MARK, QUIET,
     };
+
+    fn listing(nodes: &[u64]) -> Members {
+        Members {
+            epoch: 1,
+            members: nodes
+                .iter()
+                .map(|&node| MemberInfo {
+                    node,
+                    host: String::new(),
+                    app: "zend".into(),
+                    build: BuildId {
+                        count: 1,
+                        hash: String::new(),
+                        local: String::new(),
+                    },
+                    weight: 1,
+                    state: MemberState::default(),
+                    high_water: 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// **A lost admission with no other member connected has no one to wait
+    /// for**: a listing naming only this member, or none, serves at once; one
+    /// naming any other member — loading or not — keeps the quiet asks; and
+    /// no listing yet is not taken for an empty one.
+    #[test]
+    fn only_an_empty_group_skips_the_quiet_asks() {
+        const ME: u64 = 0x5;
+        assert!(alone_in_listing(Some(&listing(&[ME])), ME));
+        assert!(alone_in_listing(Some(&listing(&[])), ME));
+        assert!(!alone_in_listing(Some(&listing(&[ME, 0x7])), ME));
+        assert!(!alone_in_listing(Some(&listing(&[0x7])), ME));
+        assert!(!alone_in_listing(None, ME));
+    }
 
     /// **A member's own line passes a hole in what it holds of itself**;
     /// another origin's stays contiguous.

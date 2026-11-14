@@ -813,9 +813,13 @@ answers to and where it lives.
     as stored and its record's original stamp, in the order of those stamps,
     then one line per blob a kept live object names, `{"blob": "<sha256
     hex>", "bytes_b64": "…"}`. An object names a blob by spelling its SHA-256
-    in lowercase hex anywhere in its metadata or its value, the one spelling
-    every object that names a blob writes; a spelling no blob answers names
-    nothing.
+    in lowercase hex as a segment of its key or anywhere in its metadata or
+    its value, the one spelling every object that names a blob writes; a
+    spelling no blob answers names nothing. The key counts because a
+    repository's pack record, `git/pack/<repo>/<sha256>`, names its pack there
+    alone: read from the value only, BlackWorld's export (2026-11-14) carried
+    3,659 packs' indexes and none of their packs, and the substrate it was
+    imported into could not load its repositories.
     - **What is kept.** Every live custom object except those whose meaning
       is a model-derived record, which the move-aside destroys. One list in
       the code names the left-out prefixes: `cluster/` (the cluster's own
@@ -939,7 +943,10 @@ done before step 3.
    /v1/substrate/npcd/objects/import` with every member's exports, then `POST /v1/npcs/import`
    with the cast's; restart motherd through keep once so the characters
    spawn. These are admin HTTP calls to the member's own port, so they need
-   none of the OAuth tokens they restore. Read each import's answer: every
+   none of the OAuth tokens they restore — only an admin's identity, from a
+   peer the member believes (its gateway's address). Each route reads a body
+   of up to `IMPORT_BODY_LIMIT` (8 GiB): one member's zend export alone was
+   634 MB. Read each import's answer: every
    key written, none left as it was. A key left as it was means something was
    written between the start and the import (a sign-in, a thread) and is
    reported for a decision.

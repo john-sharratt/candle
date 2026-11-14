@@ -26,10 +26,40 @@ use super::Scheduler;
 /// bounded and the rest come at the next.
 const POOL_ADMITS_PER_BOUNDARY: usize = 2;
 
+/// What one refresh did, for the reprojection's observe split.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct PoolRefresh {
+    /// Conversations the pool holds after it.
+    pub pooled: usize,
+    /// Of them, kept from the last refresh without reading their held turns
+    /// again.
+    pub reused: usize,
+    /// Turns whose index pages it read.
+    pub walked: usize,
+}
+
+/// The turns of a pooled conversation a refresh reads: from `walked`, the
+/// count the slot's pool already holds pages for, when every key its layout
+/// names is still held; from the start otherwise. A conversation's turns are
+/// append-only, so held pages past a shrunken count would name turns that are
+/// gone, and that conversation is walked whole.
+pub(super) fn walk_from(walked: Option<u32>, turns: u32, layout_held: bool) -> u32 {
+    match walked {
+        Some(w) if layout_held && w <= turns => w,
+        _ => 0,
+    }
+}
+
 impl Scheduler {
     /// Choose `slot`'s pool from `candidates` — what the belief scan scored
     /// this reprojection, per group — and hold its pieces' sampled-layer
     /// index pages on the model.
+    ///
+    /// A conversation the pool already holds keeps the pages it holds: only
+    /// the turns it gained since the last refresh are read and held. Reading
+    /// every turn's pages again at every reprojection — from the log, for a
+    /// page not in memory — was most of a reprojection's time on a long
+    /// conversation, and the decode waited on it.
     ///
     /// The pool only advises: a page that cannot be read or held leaves its
     /// conversation out of this pool, and nothing about the slot changes.
@@ -39,7 +69,7 @@ impl Scheduler {
         conversation: &Conversation,
         candidates: &[(GroupId, Vec<(TurnKey, f32)>)],
         lifts: &HashMap<TimelineId, f32>,
-    ) {
+    ) -> PoolRefresh {
         let placed: Vec<TimelineId> = self
             .slot_projection_state
             .get(&slot)
@@ -78,23 +108,46 @@ impl Scheduler {
             (floors, scored, turns_of)
         };
         let pool = choose_pool(&floors, &scored, self.pool_tokens);
-        let held: HashSet<TimelineId> = self
+        let (mut prior, mut prior_walked) = self
             .slot_projection_state
-            .get(&slot)
-            .map(|s| s.pool.keys().copied().collect())
+            .get_mut(&slot)
+            .map(|s| {
+                (
+                    std::mem::take(&mut s.pool),
+                    std::mem::take(&mut s.pool_walked),
+                )
+            })
             .unwrap_or_default();
+        // What the model holds for the slot: a held conversation is reused only
+        // where every page its layout names is still there.
+        let model_held: HashSet<PieceKey> = self.model.pooled_keys(slot.0).into_iter().collect();
         let mut keep = Vec::new();
         let mut kept: PoolPages = HashMap::new();
+        let mut kept_walked: HashMap<TimelineId, u32> = HashMap::new();
+        let mut stats = PoolRefresh::default();
         let mut admitted = 0usize;
         for tl in pool {
-            let fresh = !held.contains(&tl);
+            let fresh = !prior.contains_key(&tl);
             if fresh && admitted == POOL_ADMITS_PER_BOUNDARY {
                 continue;
             }
+            let turns = turns_of.get(&tl).copied().unwrap_or(0);
+            let prior_layout = prior.remove(&tl).unwrap_or_default();
+            let layout_held = prior_layout
+                .values()
+                .flatten()
+                .all(|(_, key)| model_held.contains(key));
+            let from = walk_from(prior_walked.remove(&tl), turns, layout_held);
             let mut keys = Vec::new();
             let mut layout: HashMap<TurnIndex, Vec<(usize, PieceKey)>> = HashMap::new();
+            if from > 0 {
+                keys.extend(prior_layout.values().flatten().map(|(_, key)| *key));
+                layout = prior_layout;
+                stats.reused += 1;
+            }
             let mut whole = true;
-            for i in 0..turns_of.get(&tl).copied().unwrap_or(0) {
+            for i in from..turns {
+                stats.walked += 1;
                 let pages = match conversation.turn_index_page(tl, TurnIndex(i)) {
                     Ok(Some(p)) => p,
                     Ok(None) => continue,
@@ -131,9 +184,11 @@ impl Scheduler {
             if whole {
                 keep.extend(keys);
                 kept.insert(tl, layout);
+                kept_walked.insert(tl, turns);
                 admitted += fresh as usize;
             }
         }
+        stats.pooled = kept.len();
         if let Err(e) = self.model.retain_pooled(slot.0, &keep) {
             tracing::warn!(slot = slot.0, error = %e, "pool: dropped pieces not released");
         }
@@ -154,6 +209,25 @@ impl Scheduler {
         // with no state yet has placed nothing to hold a pool beside.
         if let Some(state) = self.slot_projection_state.get_mut(&slot) {
             state.pool = kept;
+            state.pool_walked = kept_walked;
         }
+        stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::walk_from;
+
+    /// A held conversation whose pages are all still held reads only the
+    /// turns it gained; one it never walked, one whose pages the model let
+    /// go, or one whose turn count shrank is read whole.
+    #[test]
+    fn a_held_conversation_reads_only_its_new_turns() {
+        assert_eq!(walk_from(Some(5), 7, true), 5);
+        assert_eq!(walk_from(Some(7), 7, true), 7);
+        assert_eq!(walk_from(None, 7, true), 0);
+        assert_eq!(walk_from(Some(5), 7, false), 0);
+        assert_eq!(walk_from(Some(9), 7, true), 0);
     }
 }

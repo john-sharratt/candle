@@ -7,7 +7,7 @@
 //! registry — and its rows stay resident while any pool or slot holds them,
 //! going back to the index tenant with the last.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use candle::Result;
@@ -41,7 +41,13 @@ impl SequencePools {
     }
 
     /// Let go of `seq`'s pooled pieces not in `keep`.
+    ///
+    /// By set, not by scanning `keep` for each held piece: a pool holds a key
+    /// per page of every turn it pools, and a refresh runs at every
+    /// reprojection, so the scan was the pool's size squared on the scheduler
+    /// thread each time.
     pub fn retain(&self, seq: usize, keep: &[PieceKey]) -> Result<()> {
+        let keep: HashSet<&PieceKey> = keep.iter().collect();
         let mut map = self.map.write().map_err(|_| poisoned())?;
         if let Some(p) = map.get_mut(&seq) {
             p.retain(|k, _| keep.contains(k));

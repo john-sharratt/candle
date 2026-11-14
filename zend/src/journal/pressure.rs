@@ -4,7 +4,8 @@
 //! The dialogue's projection keeps its most recent turns and the older ones its
 //! selection scores well, and leaves the rest out. A turn left out that no
 //! entry covers is one the session can no longer see and has not written down,
-//! so it asks for a draft now rather than at the next [`super::state::EVERY_TURNS`].
+//! so within a long request it asks for a draft now rather than at the next
+//! [`super::state::EVERY_ROUNDS`] of the request's turns.
 //! The projection event a round already records names every turn it selected,
 //! so the signal costs nothing.
 

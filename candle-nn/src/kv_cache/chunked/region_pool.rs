@@ -84,6 +84,7 @@ use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
 use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::cuda_backend::graph::{graph_budget_bytes, try_without_recording};
 use candle::cuda_backend::install_held_ground;
+use candle::cuda_backend::load_scratch;
 use candle::vram::AllocClass;
 use candle::Result;
 
@@ -970,20 +971,20 @@ fn layout_span(
 }
 
 impl RegionPool {
-    /// The span, with `load_headroom` bytes deliberately left outside it.
+    /// The span, with its top `load_headroom` bytes opened as the load's scratch.
     ///
     /// **The headroom exists because loading a weight costs more than storing
     /// it.** `repack_ko` reads the quantized source and writes the KO twin
-    /// through an F32 intermediate, both from the CUDA pool, which is outside
-    /// the span. Claiming the span before the model loads is what puts the
-    /// weights *inside* it, and it would otherwise leave the pool with only its
-    /// cushion and fail on the largest repack.
+    /// through an F32 intermediate. Claiming the span before the model loads is
+    /// what puts the weights *inside* it, and it would otherwise leave the pool
+    /// with only its cushion and fail on the largest repack.
     ///
     /// So the caller measures the peak from the checkpoint — the largest source
     /// tensor plus the repack's two f32 bands, knowable from the GGUF header
-    /// before a byte is read — and the span gives up exactly that much. Not an
-    /// estimate with a safety factor: an arithmetic bound on the allocations
-    /// that dominate.
+    /// before a byte is read — and that much of the span's top serves the load's
+    /// transients (`load_scratch`) until `freeze_dense` gives it to the weight
+    /// side. Not an estimate with a safety factor: an arithmetic bound on the
+    /// allocations that dominate.
     ///
     /// The band is what makes this a small number. The intermediate used to be
     /// the whole tensor in F32 — 4,850 MiB for the 27B's head, permanently out
@@ -1032,16 +1033,22 @@ impl RegionPool {
         let target = span_target(ordinal, graph_reserve)?;
         let measured = candle::vram::get(ordinal).is_some();
         let concedable = target.saturating_sub(span_minimum);
-        let for_span = if measured {
-            target - load_headroom.min(concedable)
+        // **The load's scratch is the top of the span, not ground beside it.** The span is
+        // one device allocation that never grows, so headroom left outside it is the
+        // driver's for the life of the process. Inside it, the top `scratch` bytes are
+        // nobody's while the model loads — the dense block grows from the left, and the
+        // weight side is placed from the right only once the block is frozen — so they
+        // serve the load's transients (`load_scratch`) and go to the weight side at
+        // `freeze_dense` (`docs/driver_model.md` §4).
+        let scratch = if measured {
+            load_headroom
+                .min(concedable)
+                .next_multiple_of(REGION_BYTES)
+                .min((concedable / REGION_BYTES) * REGION_BYTES)
         } else {
-            target
+            0
         };
-        let want = (for_span / REGION_BYTES) * REGION_BYTES;
-        // **The span is one device allocation of `want`, and it never grows.** The load
-        // headroom stays outside it for the life of the process: the driver's ground, where
-        // the load's own scratch and every allocation not yet carried by an arena of the span
-        // land (`docs/driver_model.md` §4).
+        let want = (target / REGION_BYTES) * REGION_BYTES;
         // **Everything on the card that is not ours, measured while that is
         // still true.** Taken before the reservation and therefore before the
         // weight load: the CUDA context, the driver's working set, the module
@@ -1094,10 +1101,17 @@ impl RegionPool {
 
         // No weight side yet: an expert cache installs one at load
         // (`set_weight_floor`), and a process without experts leaves the whole
-        // span to KV.
+        // span to KV. Until the load freezes the dense block the floor stands at
+        // the scratch's base, so neither the dense block nor a region reaches it.
         // No dense block yet: the weights are claimed out of it by `claim_dense`
         // as the loader walks the checkpoint, and until then it is empty.
-        let layout = layout_span(span_base, persist_bytes, span_bytes, 0, span_end);
+        let scratch =
+            scratch.min((span_bytes.saturating_sub(span_minimum) / REGION_BYTES) * REGION_BYTES);
+        let scratch_base = span_end - scratch as u64;
+        if scratch > 0 {
+            load_scratch::open(ordinal, stream.cu_stream() as usize, scratch_base, scratch)?;
+        }
+        let layout = layout_span(span_base, persist_bytes, span_bytes, 0, scratch_base);
         let total = layout.total;
         // The partition, on the one channel that survives a test binary (which
         // installs no tracing subscriber, so the log lines below are invisible
@@ -1181,7 +1195,7 @@ impl RegionPool {
             dense_bytes: 0,
             dense_capable: measured,
             dense_frozen: false,
-            weight_floor: span_end,
+            weight_floor: scratch_base,
             total,
             next: 0,
             free: BinaryHeap::new(),
@@ -2481,10 +2495,11 @@ pub fn claim_dense(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<
             .ok_or_else(|| candle::Error::Msg("dense weights: address overflow".into()))?;
         // Against the weight floor, not the span end: the expert zone is placed
         // from the right edge and the dense block grows from the left, so the
-        // floor is what they would collide at. At load the floor is still
-        // `span_end`, which is the whole span — this only binds once an expert
-        // cache has installed a zone, and a loader that reaches that state has
-        // its ordering wrong anyway.
+        // floor is what they would collide at. At load the floor stands at the
+        // load scratch's base, so the block never grows onto the transients
+        // served there; past that it binds only once an expert cache has
+        // installed a zone, and a loader that reaches that state has its
+        // ordering wrong anyway.
         if end > pool.weight_floor {
             candle::bail!(
                 "dense weights: {bytes} B does not fit — the block would end at \
@@ -2506,8 +2521,8 @@ pub fn dense_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
     with_pool(stream, |pool| Ok(pool.dense_bytes))
 }
 
-/// Claim the reservation **before the model loads**, leaving `load_headroom`
-/// bytes outside it for the load's own scratch.
+/// Claim the reservation **before the model loads**, its top `load_headroom`
+/// bytes opened as the load's own scratch until [`freeze_dense`].
 ///
 /// This is the call that makes the weights span tenants at all. The span used to
 /// be sized from `usable()` *after* the weights were resident, so it was
@@ -2584,7 +2599,26 @@ pub fn ensure_reservation(device: &candle::Device, load_headroom: usize) -> Resu
 /// have predicted anything: that is the point of loading into the span rather
 /// than sizing the span around a load that already happened.
 pub fn freeze_dense(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
+    let ordinal = stream.context().ordinal();
     with_pool(stream, |pool| {
+        // **The load's scratch closes first**, while its ground is still nobody
+        // else's: the weight side is placed there next. `close` refuses while a
+        // transient the load scoped is still live, and the load fails here rather
+        // than leave it under the expert slots that would overwrite it. Raising
+        // the floor to the span's end grows the KV side, so it never cuts a live
+        // region.
+        if let Some(report) = load_scratch::close(ordinal)? {
+            let regions = pool.set_weight_floor(pool.span_end())?;
+            tracing::info!(
+                target: "candle_nn::kv_cache::region_pool",
+                scratch_mib = report.bytes >> 20,
+                peak_mib = report.peak >> 20,
+                spilled_mib = report.spilled >> 20,
+                regions,
+                "close_load: the load's scratch at the span's top is closed and its ground \
+                 returned; the weight side is placed there next"
+            );
+        }
         pool.dense_frozen = true;
         // **Retract a previous model's weight zone.**
         //
@@ -2703,6 +2737,13 @@ pub fn set_weight_floor(stream: &std::sync::Arc<CudaStream>, floor: u64) -> Resu
     // wave guard. Callers must treat a refusal as a refusal — see
     // `renegotiate_boundary`, which for a while applied its half of the move and
     // then let this bail propagate as a warning.
+    if load_scratch::is_open(ordinal) {
+        candle::bail!(
+            "refusing to place a weight side while the load's scratch is open at the span's \
+             top: the load's transients stand there until `close_load` freezes the dense block \
+             (docs/driver_model.md §4)"
+        )
+    }
     if super::bump_arena::wave_is_live(ordinal) {
         candle::bail!(
             "refusing to move the weight boundary while a wave generation is open: \

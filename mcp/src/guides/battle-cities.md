@@ -68,8 +68,13 @@ Bevy — give it `timeout_s: 3600`.
 
 ## A machine that has never built it
 
-The first job on an agent finds out what the machine lacks. Read its failure
-before anything else:
+An agent sets up its battle-cities checkout itself when it starts: the
+repository's `.agent/setup.yaml` runs `cargo --version` there, which has
+rustup install the pinned nightly, then `cargo install cargo-nextest --locked`.
+Each is a run of its own on that agent — `job_list {kind: "build"}` shows them,
+with the checkout's command line, before the first job you start — and your
+job waits behind them. If a test job still fails for want of a tool, find the
+setup run that failed on that machine and `job_read` it first:
 
 | The log says | It lacks | Tell the user |
 |---|---|---|
@@ -77,8 +82,9 @@ before anything else:
 | `cargo-nextest is not installed on this machine` | cargo-nextest | `cargo install cargo-nextest --locked` on that machine |
 | `no such command: \`test-server\`` | the alias: the branch predates it | run it on a branch that has it |
 
-These are installs on the machine, not changes to the repository: say which
-machine and which command, and wait for the user.
+A setup run that failed is a machine problem the agent could not fix itself
+(no network, rustup's auto-install switched off, a full disk): say which
+machine, which setup command and what its log says, and wait for the user.
 
 ## Deploying
 

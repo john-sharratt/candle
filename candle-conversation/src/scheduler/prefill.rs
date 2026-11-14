@@ -4343,11 +4343,10 @@ impl Scheduler {
             // over one sweep is what the cohort must leave it
             // (`SweepForecast::held_growth_bytes`).
             let held_growth = held_growth.max(self.sweep_forecast.held_growth_bytes() as usize);
-            // And the scratch the decodes' static runs may claim between its
-            // windows (`glue_scratch_bytes`), on the same ground.
-            let claims = claims
-                .saturating_add(held_growth)
-                .saturating_add(self.glue_scratch_bytes());
+            // The decodes' static runs claim nothing between its windows: each
+            // rides a step a piece at a time, within the model's short span
+            // (`stencil_wave`).
+            let claims = claims.saturating_add(held_growth);
             let holes = holes.saturating_sub(held_landing);
             let at_frontier = frontier.and_then(|g| {
                 fitted_rows(
@@ -4426,7 +4425,6 @@ impl Scheduler {
                     stores,
                     scratch_mib = scratch >> 20,
                     growth_mib = growth >> 20,
-                    glue_scratch_mib = self.glue_scratch_bytes() >> 20,
                     held_growth_mib = held_growth >> 20,
                     held_landing_mib = held_landing >> 20,
                     held_regions,
@@ -4447,9 +4445,7 @@ impl Scheduler {
                 // hold back from the turns it lets in meanwhile
                 // (`held_claims_outstanding`): its own claims, and of them the K/V
                 // its windows write layer by layer.
-                let own = claims
-                    .saturating_sub(held_growth)
-                    .saturating_sub(self.glue_scratch_bytes()) as u64;
+                let own = claims.saturating_sub(held_growth) as u64;
                 self.held_fit_claims = Some((own, kv_blocks));
                 return;
             };

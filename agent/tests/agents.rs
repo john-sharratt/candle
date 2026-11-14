@@ -96,6 +96,12 @@ struct Repos {
 }
 
 fn repos() -> Repos {
+    repos_with(&[])
+}
+
+/// [`repos`], with `files` — each a path and its text — in `main`'s first
+/// commit beside `in.txt`.
+fn repos_with(files: &[(&str, &str)]) -> Repos {
     let root = TempDir::new().unwrap();
     let origin = root.path().join("origin.git");
     std::fs::create_dir(&origin).unwrap();
@@ -104,7 +110,12 @@ fn repos() -> Repos {
     std::fs::create_dir(&seed).unwrap();
     git(&seed, &["init", "-q", "-b", "main"]);
     std::fs::write(seed.join("in.txt"), b"hello\n").unwrap();
-    git(&seed, &["add", "in.txt"]);
+    for (path, text) in files {
+        let at = seed.join(path);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(at, text).unwrap();
+    }
+    git(&seed, &["add", "-A"]);
     git(&seed, &["commit", "-q", "-m", "first"]);
     git(&seed, &["push", "-q", origin.to_str().unwrap(), "main"]);
     let clone = |name: &str| {
@@ -213,6 +224,110 @@ async fn a_run_on_an_agent_comes_back_as_deltas() {
     assert!(jobs.log(&view.id).unwrap().unwrap().is_file());
     assert_eq!(view.phase, Phase::Ended);
     assert_eq!(jobs.slots(), (2, 0));
+}
+
+/// One `.agent/setup.yaml` command running `script` in the test's shell.
+fn setup_command(script: &str) -> String {
+    let (program, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    format!("  - program: {program}\n    args: ['{flag}', '{script}']\n")
+}
+
+/// The test shell's script writing `done` to `file`.
+fn write_marker(file: &Path) -> String {
+    if cfg!(windows) {
+        format!("echo done> {}", file.display())
+    } else {
+        format!("echo done > {}", file.display())
+    }
+}
+
+/// The test shell's script failing with exit code 1.
+fn fail() -> String {
+    "exit 1".to_string()
+}
+
+/// **A checkout's declared setup runs at start, before a member's run on
+/// it**: the run submitted at once — before the setup's command could have
+/// started — waits for it, and finds what it made; both are kept and listed.
+#[tokio::test]
+async fn a_checkouts_setup_runs_before_a_members_run_on_it() {
+    let marks = TempDir::new().unwrap();
+    let marker = marks.path().join("set-up");
+    let setup = format!("commands:\n{}", setup_command(&write_marker(&marker)));
+    let r = repos_with(&[(".agent/setup.yaml", &setup)]);
+    let jobs = jobs_over(&r, false);
+    jobs.set_up();
+    let (program, args) = copy(&marker.display().to_string(), "out.txt");
+    let run = RunJob {
+        program,
+        args,
+        ..run_job(&changed_store(&r))
+    };
+    let started = jobs.submit(Submit::Run(run)).await.unwrap();
+    let view = ended(&jobs, started).await;
+    assert_eq!(view.status, JobStatus::Exited { code: Some(0) }, "{view:?}");
+    let listed = jobs.list(10).jobs;
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    let setup_run = &listed[1];
+    assert_eq!(setup_run.status, JobStatus::Exited { code: Some(0) });
+    assert_eq!(setup_run.branch.as_deref(), Some("main"));
+    assert_eq!(setup_run.command[0], copy("a", "b").0);
+    assert!(setup_run.ended_ms.unwrap() <= view.ended_ms.unwrap());
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap().trim(),
+        "done",
+        "the setup's command ran"
+    );
+}
+
+/// **A setup command that fails is said and the next one still runs**, each
+/// kept as a run with its own status; a checkout with no setup file runs
+/// nothing and holds no run back.
+#[tokio::test]
+async fn a_failed_setup_command_is_kept_and_the_next_one_runs() {
+    let marks = TempDir::new().unwrap();
+    let marker = marks.path().join("second");
+    let setup = format!(
+        "commands:\n{}{}",
+        setup_command(&fail()),
+        setup_command(&write_marker(&marker))
+    );
+    let r = repos_with(&[(".agent/setup.yaml", &setup)]);
+    let jobs = jobs_over(&r, false);
+    jobs.set_up();
+    tokio::time::timeout(WITHIN, jobs.setup_ended("r"))
+        .await
+        .expect("the setup ends");
+    let listed = jobs.list(10).jobs;
+    let statuses: Vec<_> = listed.iter().rev().map(|l| l.status.clone()).collect();
+    assert_eq!(
+        statuses,
+        [
+            JobStatus::Exited { code: Some(1) },
+            JobStatus::Exited { code: Some(0) }
+        ]
+    );
+    assert!(marker.is_file(), "the command after the failed one ran");
+
+    let bare = repos();
+    let jobs = jobs_over(&bare, false);
+    jobs.set_up();
+    tokio::time::timeout(WITHIN, jobs.setup_ended("r"))
+        .await
+        .expect("no setup ends at once");
+    assert!(jobs.list(10).jobs.is_empty());
+    let view = ended(
+        &jobs,
+        jobs.submit(Submit::Run(run_job(&changed_store(&bare))))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(view.status, JobStatus::Exited { code: Some(0) }, "{view:?}");
 }
 
 /// **A run whose chains the agent lacks is refused naming them, and runs once

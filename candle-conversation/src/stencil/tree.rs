@@ -183,6 +183,9 @@ pub struct TreeMarks {
     /// shares is written before the branch, so its tokens alone may not spell
     /// the name.
     pub name_branches: HashMap<NodeId, Arc<HashMap<Vec<TokenId>, Arc<str>>>>,
+    /// Each node a walk names a call on reaching: where a catalog of one tool
+    /// writes its name, there being no branch to choose it.
+    pub names_on_entry: HashMap<NodeId, Arc<str>>,
     /// Each branch choosing an argument's value: the field, and by an arm's
     /// tokens the value it writes. By tokens, as a name branch's are.
     pub chosen: HashMap<NodeId, (Arc<str>, Arc<HashMap<Vec<TokenId>, Arc<str>>>)>,
@@ -219,6 +222,12 @@ impl StencilTree {
     /// Whether the branch at `node` chooses a call's tool.
     pub fn is_name_branch(&self, node: NodeId) -> bool {
         self.marks.name_branches.contains_key(&node)
+    }
+
+    /// The tool a walk reaching `node` names its call, when the grammar wrote
+    /// the name with no branch to choose it.
+    pub fn names_on_entry(&self, node: NodeId) -> Option<&Arc<str>> {
+        self.marks.names_on_entry.get(&node)
     }
 
     /// The tool the name branch at `node` names when its arm took `tokens`.

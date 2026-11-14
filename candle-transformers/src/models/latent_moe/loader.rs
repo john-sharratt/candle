@@ -117,6 +117,21 @@ impl GgufModel {
         Some((i, self.contents[i].tensor_data_offset + info.offset, info))
     }
 
+    /// A tensor's bytes as the file lays them out — whole blocks, row-major —
+    /// read to the host, with its info: what a load that never puts the source
+    /// on the card (`dense_span::place_host_in_dense`, `twin_from_host`) reads.
+    pub fn host_bytes(&self, name: &str) -> Result<(Vec<u8>, TensorInfo)> {
+        let (split, offset, info) = self
+            .raw_location(name)
+            .ok_or_else(|| candle::Error::msg(format!("missing tensor {name}")))?;
+        let info = info.clone();
+        let len =
+            info.shape.elem_count() / info.ggml_dtype.block_size() * info.ggml_dtype.type_size();
+        let mut bytes = vec![0u8; len];
+        self.read_at(split, offset, &mut bytes)?;
+        Ok((bytes, info))
+    }
+
     /// Positioned exact read from a split's file. Takes `&self` — positioned
     /// reads carry their own offset, so runtime readers (per-forward expert
     /// and PLE-row gathers) need no mutable handle and no seek state.

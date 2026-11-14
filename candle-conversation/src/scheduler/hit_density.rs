@@ -20,6 +20,53 @@ use crate::projection::{TimelineId, TurnIndex, TurnKey};
 /// what the model counted for them.
 pub(super) type HitPart = (Vec<RoundKey>, PieceHits);
 
+/// What a stride's read held, for the reprojection's observe split: whether
+/// the model's own indexer is reading what the projection placed, and whether
+/// the shadow scan finds anything in the pool.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HitSummary {
+    /// Parts read: the reprojection's own and any an assembly read before it.
+    pub parts: usize,
+    /// Query rows counted against loaded rounds, over every part.
+    pub queries: u64,
+    /// Kept queries the shadow scan scored against pooled rounds.
+    pub shadow_queries: u64,
+    /// Loaded rounds declared, and how many of them any query hit.
+    pub loaded: usize,
+    pub loaded_hit: usize,
+    /// Pooled rounds declared, and how many of them any shadow query hit.
+    pub pooled: usize,
+    pub pooled_hit: usize,
+    /// Hits counted on loaded and on pooled rounds.
+    pub loaded_hits: u64,
+    pub pooled_hits: u64,
+}
+
+/// [`HitSummary`] over `parts`.
+pub(super) fn hit_summary(parts: &[HitPart]) -> HitSummary {
+    let mut s = HitSummary {
+        parts: parts.len(),
+        ..HitSummary::default()
+    };
+    for (keys, hits) in parts {
+        s.queries += hits.queries;
+        s.shadow_queries += hits.shadow_queries;
+        for i in 0..keys.len() {
+            let h = hits.hits.get(i).copied().unwrap_or(0) as u64;
+            if i < hits.loaded {
+                s.loaded += 1;
+                s.loaded_hit += usize::from(h > 0);
+                s.loaded_hits += h;
+            } else {
+                s.pooled += 1;
+                s.pooled_hit += usize::from(h > 0);
+                s.pooled_hits += h;
+            }
+        }
+    }
+    s
+}
+
 /// Each conversation's hit density across `parts`.
 pub(super) fn hit_density(parts: &[HitPart]) -> HashMap<TimelineId, f32> {
     density_by(parts, |k| k.timeline)
@@ -189,5 +236,47 @@ mod tests {
         assert_eq!(lifts[&TurnKey::new(tl(7), TurnIndex(4))], 2.0);
         assert_eq!(lifts[&TurnKey::new(tl(7), TurnIndex(5))], 2.0);
         assert_eq!(lifts.len(), 2, "a round of no known exchange lifts nothing");
+    }
+
+    /// The summary counts each part's queries, and splits the declared rounds
+    /// at each part's `loaded`: hits on the first are the selection's, on the
+    /// rest the shadow scan's.
+    #[test]
+    fn the_summary_splits_loaded_and_pooled_rounds() {
+        let first = (
+            vec![key(7, 0, 0), key(7, 0, 1), key(8, 0, 0), key(9, 0, 0)],
+            PieceHits {
+                hits: vec![6, 0, 3, 0],
+                blocks: vec![10, 30, 5, 5],
+                loaded: 2,
+                queries: 4,
+                shadow_queries: 64,
+            },
+        );
+        let second = (
+            vec![key(7, 0, 0)],
+            PieceHits {
+                hits: vec![1],
+                blocks: vec![10],
+                loaded: 1,
+                queries: 3,
+                shadow_queries: 0,
+            },
+        );
+        assert_eq!(
+            hit_summary(&[first, second]),
+            HitSummary {
+                parts: 2,
+                queries: 7,
+                shadow_queries: 64,
+                loaded: 3,
+                loaded_hit: 2,
+                pooled: 2,
+                pooled_hit: 1,
+                loaded_hits: 7,
+                pooled_hits: 3,
+            }
+        );
+        assert_eq!(hit_summary(&[]), HitSummary::default());
     }
 }

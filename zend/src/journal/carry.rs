@@ -46,7 +46,7 @@ pub fn select(selection: &mut SelectionState, sealed: &[String]) {
 mod tests {
     use candle_conversation::models::Dialect;
     use candle_conversation::projection::SystemPromptItem;
-    use journal_core::section::OPEN_SECTION;
+    use journal_core::section::CLOSE_SECTION;
 
     use super::*;
     use crate::session::PROJECTION_SCHEMA_TEMPLATE;
@@ -98,9 +98,9 @@ mod tests {
         let mut sel = SelectionState::default();
         select(&mut sel, &[]);
         assert!(sel.members(JOURNAL).is_empty());
-        let sealed = ["journal/3".to_string(), OPEN_SECTION.to_string()];
+        let sealed = ["journal/3".to_string(), CLOSE_SECTION.to_string()];
         select(&mut sel, &sealed);
-        assert_eq!(sel.members(JOURNAL), ["journal/3", "journal/open"]);
+        assert_eq!(sel.members(JOURNAL), ["journal/3", "journal/close"]);
         select(&mut sel, &[]);
         assert!(sel.members(JOURNAL).is_empty(), "replaced, not added to");
     }

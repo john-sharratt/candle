@@ -138,6 +138,10 @@ pub(super) struct SlotState {
     /// pages of its pooled conversations, whose unplaced rounds the
     /// declaration names for the shadow scan.
     pub(super) pool: PoolPages,
+    /// How many of each pooled conversation's turns [`Self::pool`] has walked.
+    /// A conversation's turns are append-only, so a refresh that keeps it walks
+    /// only the turns past this — the earlier ones' pages are held already.
+    pub(super) pool_walked: HashMap<TimelineId, u32>,
 }
 
 /// The most read-back parts a slot keeps between reprojections; past it the
@@ -422,8 +426,10 @@ impl SlotState {
             round_hits: self.round_hits.clone(),
             unread_hits: Vec::new(),
             // The model holds a pool's pages per sequence: the fork's holds
-            // none until its own first reprojection chooses one.
+            // none until its own first reprojection chooses one, and walks
+            // each conversation it pools whole.
             pool: PoolPages::new(),
+            pool_walked: HashMap::new(),
         }
     }
 
@@ -1804,7 +1810,8 @@ pub(super) fn apply_segments_build(
         format!(
             "slot={} identities_us={identities_us} cut_us={cut_us} splice_us={splice_us} \
              edits={} inserted={} evicted={} sections_us={} sections={} turns_us={} turns={} \
-             glue_us={} glue={} ranges_us={ranges_us} turn_resolve_us={} turn_inject_us={} \
+             glue_us={} glue={} ranges_us={ranges_us} turn_resolve_us={} turn_fetch_us={} \
+             turn_fetched={} turn_lock_us={} turn_window_us={} turn_inject_us={} \
              turn_pages_us={} kept={} held_pages={}",
             parent_id.0,
             plan.edits.len(),
@@ -1817,6 +1824,10 @@ pub(super) fn apply_segments_build(
             walk_us[2],
             walked[2],
             walker.turn_resolve_us,
+            walker.turn_fetch_us,
+            walker.turn_fetched,
+            walker.turn_lock_us,
+            walker.turn_window_us,
             walker.turn_inject_us,
             walker.turn_pages_us,
             plan.kept(),
@@ -2049,6 +2060,13 @@ struct SegmentWalker<'c> {
     /// index rows, injecting the K/V, and pushing the index pages — the parts of
     /// a turn's cost the `apply split` line breaks out.
     turn_resolve_us: u64,
+    /// `turn_resolve_us` by part: reading each turn's index page (from the log
+    /// for `turn_fetched` of them), waiting for the substrate's read lock, and
+    /// windowing the reasoning out of the K/V and the rows.
+    turn_fetch_us: u64,
+    turn_fetched: u32,
+    turn_lock_us: u64,
+    turn_window_us: u64,
     turn_inject_us: u64,
     turn_pages_us: u64,
     /// The index page the piece being walked was placed with, taken into its
@@ -2090,6 +2108,10 @@ impl<'c> SegmentWalker<'c> {
             kept_pieces: 0,
             ranges: PendingRanges::new(conversation),
             turn_resolve_us: 0,
+            turn_fetch_us: 0,
+            turn_fetched: 0,
+            turn_lock_us: 0,
+            turn_window_us: 0,
             turn_inject_us: 0,
             turn_pages_us: 0,
             placed_page: None,
@@ -2462,13 +2484,22 @@ fn inject_sealed_turn(
     let fetch = profile::span("inject:turn:fetch_page");
     // Before the substrate lock: a page left in the log is read through the
     // persistence path, which takes its own.
+    let in_memory = ctx
+        .conversation
+        .turn_index_page_in_memory(timeline, index)
+        .is_some();
     let stored = ctx.conversation.turn_index_page(timeline, index)?;
+    walker.turn_fetched += u32::from(!in_memory && stored.is_some());
+    walker.turn_fetch_us += t_resolve.elapsed().as_micros() as u64;
     // The page as stored, before any windowing filters it: what the placed
     // piece holds, so the next rebuild finds it again by its record.
     let held_page = stored.clone();
     let (sealed, page) = {
         let lock = profile::span("inject:turn:substrate_read_lock");
+        let t_lock = Instant::now();
         let conv = ctx.conversation.read();
+        walker.turn_lock_us += t_lock.elapsed().as_micros() as u64;
+        let t_window = Instant::now();
         lock.end();
         fetch.end();
         let _window = profile::span("inject:turn:window");
@@ -2496,20 +2527,23 @@ fn inject_sealed_turn(
         let newest_span = profile::span("inject:turn:newest_index");
         let newest = conv.turn_indices(timeline).max();
         newest_span.end();
-        if keeps_reasoning(ctx.slot_target.map(|t| t.timeline), timeline, newest, index) {
-            let _g = profile::span("inject:turn:sealed_whole");
-            (conv.turn_sealed_of(timeline, index), stored)
-        } else {
-            let _g = profile::span("inject:turn:without_thinking");
-            // An `Err` here is a turn whose reasoning cannot be windowed. It is
-            // propagated rather than skipped: injecting it whole would show the
-            // reasoning the projection was asked to remove, and skipping it would
-            // silently drop a turn the selection chose.
-            match conv.turn_sealed_without_thinking(timeline, index, stored)? {
-                Some((kv, page)) => (Some(kv), page),
-                None => (None, None),
-            }
-        }
+        let resolved =
+            if keeps_reasoning(ctx.slot_target.map(|t| t.timeline), timeline, newest, index) {
+                let _g = profile::span("inject:turn:sealed_whole");
+                (conv.turn_sealed_of(timeline, index), stored)
+            } else {
+                let _g = profile::span("inject:turn:without_thinking");
+                // An `Err` here is a turn whose reasoning cannot be windowed. It is
+                // propagated rather than skipped: injecting it whole would show the
+                // reasoning the projection was asked to remove, and skipping it would
+                // silently drop a turn the selection chose.
+                match conv.turn_sealed_without_thinking(timeline, index, stored)? {
+                    Some((kv, page)) => (Some(kv), page),
+                    None => (None, None),
+                }
+            };
+        walker.turn_window_us += t_window.elapsed().as_micros() as u64;
+        resolved
     };
     walker.turn_resolve_us += t_resolve.elapsed().as_micros() as u64;
     let sealed = match sealed {

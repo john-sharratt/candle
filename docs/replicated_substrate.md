@@ -2938,7 +2938,13 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
 
      A fetch told `LOST` ends as one ending short does: its records are wanted again. A
      catch-up told `LOST` is timed by its own silence alone, so it is asked again at the
-     quiet's pace, not at once and over and over while no member can answer it.
+     quiet's pace, not at once and over and over while no member can answer it. The
+     quiet asks wait for a member that is away for a moment — restarting, still loading —
+     so an admission catch-up told `LOST` while its socket's `MEMBERS` lists no other
+     member has no one to wait for: it serves on what it holds at once, and what it lacks
+     arrives as gaps once an origin connects and announces it
+     (`replicate::tick::alone_in_listing`). A member starting while the rest of the
+     cluster is down sat out both asks, a minute, for nothing.
 
      `LOST` is a frame kind older members refuse, so members take a build that reads it
      before any gateway sends it: each gateway's `web` is restarted onto it only after
@@ -4077,6 +4083,21 @@ fetch the base, then preserve → materialize → run → capture → restore
 (`zend-vfs/src/sandbox/mod.rs:1-45`). It returns the exit code, the log, and the captured
 deltas. The calling member applies the deltas to the store. They are then ordinary VFS
 events and replicate.
+
+**Setup at start.** A repository declares the tools its jobs need in `.agent/setup.yaml`,
+so no machine's agent file names them (`agent/src/setup.rs`):
+`commands: [{ program, args, timeout_s }]`, each a program and its arguments with no shell,
+under the same command policy as a run, `timeout_s` an hour when absent. When an agent
+starts — `tokera-agent`, or the agent in a `motherd`'s process — each checkout fetches
+origin and reads the file on the branch it has checked out, then runs its commands in
+order, each an ordinary run on that branch with no overlay (`Jobs::set_up`,
+`agent/src/jobs/start_setup.rs`). They hold the checkout as any run does and are kept and
+listed with their own ids and logs; a member's run on that checkout waits until the setup
+has ended, in phase `waiting` behind the setup's run. A command that fails is logged at
+`warn` with its job id and status, and the next one runs. A checkout without the file runs
+nothing and holds nothing back; a machine under a reservation (`docs/house_modes.md` §4)
+skips its setup and says so. The agent's log says, for each checkout, how many commands
+it runs, and for each its job id, command line, end and seconds taken.
 
 **A push** carries what the member built. Commits and merges are made in the member's
 own clone with the existing `zend-vfs` machinery; only the write to `origin` needs the

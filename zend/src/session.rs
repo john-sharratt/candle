@@ -76,6 +76,7 @@ use journal_core::record::view as journal_view;
 use journal_core::section::{JournalPrompt, Kept, Section, JOURNAL};
 use journal_core::span::Span;
 use journal_core::transcript::{Filed, Hits, Miss, Page};
+use journal_core::workflow::Skip;
 use journals::ops::wire::path_from_wire;
 use journals::path::JournalPath;
 use journals::time::Stamp;
@@ -124,7 +125,7 @@ use crate::journal::opening::OPENING_SEAL_WAIT;
 use crate::journal::record::{kept_in, metadata_of, KEY as JOURNAL_KEY};
 use crate::journal::registry::{Journals, Open};
 use crate::journal::shelf::{Above, Drafted, Lazy, Notes, Shelf};
-use crate::journal::state::{SessionJournal, FOLD_SWEEP_EVERY};
+use crate::journal::state::{Request, SessionJournal, FOLD_SWEEP_EVERY};
 use crate::journal::style::style_for;
 use crate::journal::text::JournalText;
 use crate::journal::world::{Citable, JournalsAbove};
@@ -5281,14 +5282,22 @@ fn run_inference_stream(
                 }
             }
 
-            // The sealed turn may make a draft due. The draft runs on its own,
-            // on forks of this conversation at `Normal`; this reply does not
-            // wait for it.
+            // The sealed turn may make a draft due: always when it ends the
+            // request, and within a long one by the cadence or the selection
+            // pressure. The draft runs on its own, on forks of this
+            // conversation at `Normal`; this reply does not wait for it.
             if state.journaling {
                 if let Some(newest) = resp.seal.as_ref().and_then(|s| s.turn_index) {
+                    // Each round seals one turn, so the request opened at the
+                    // turn `iteration` rounds back — a resumed round's too.
+                    let rounds = u32::try_from(iteration).unwrap_or(u32::MAX);
                     let cadence = Cadence::Due {
                         newest,
                         selected: selected_turns.as_deref(),
+                        request: Request {
+                            from: newest.saturating_sub(rounds),
+                            finished: is_final,
+                        },
                     };
                     match begin_journal_draft(&state, &conv_id, timeline, cadence) {
                         Ok(span) => tracing::info!(
@@ -5965,15 +5974,19 @@ fn journal_of(state: &InferenceState, conv_id: &str) -> (Vec<String>, Vec<u64>) 
 /// When a journal draft starts.
 #[derive(Clone, Copy)]
 enum Cadence<'a> {
-    /// Turn `newest` has sealed, and its round's projection selected
-    /// `selected` of the conversation's turns: start one if the cadence or the
-    /// selection pressure asks for it.
+    /// Turn `newest` of `request` has sealed, and its round's projection
+    /// selected `selected` of the conversation's turns: start one if the
+    /// request finished, or if the cadence or the selection pressure asks for
+    /// one within it (`journal::state`).
     Due {
         newest: u32,
         selected: Option<&'a [u32]>,
+        request: Request,
     },
-    /// Start one now over whatever is not covered (`POST …/journal/draft`).
-    Now,
+    /// Start one now over whatever is not covered: on `POST …/journal/draft`,
+    /// which may skip, or for the finished request a running draft held back,
+    /// which may not.
+    Now { skip: Skip },
 }
 
 /// Why no journal draft started.
@@ -6003,19 +6016,32 @@ fn begin_journal_draft(
     let journal = state
         .journals
         .of(conv_id, || journal_record(state, timeline));
-    let covered = {
-        let held = journal.lock().unwrap();
-        if let Cadence::Due { newest, selected } = cadence {
-            let pressed = selected
-                .is_some_and(|s| pressure::left_out(s, held.first_uncovered_turn(), newest));
-            if !held.due(newest, pressed) {
-                return Err(NoDraft::NotDue);
+    let (covered, skip) = {
+        let mut held = journal.lock().unwrap();
+        let skip = match cadence {
+            Cadence::Due {
+                newest,
+                selected,
+                request,
+            } => {
+                let pressed = selected
+                    .is_some_and(|s| pressure::left_out(s, held.first_uncovered_turn(), newest));
+                let Some(due) = held.due(newest, pressed, request) else {
+                    return Err(NoDraft::NotDue);
+                };
+                // A finished request's entry is never lost to the single
+                // flight: it starts when the running draft ends.
+                if held.journal().pending() && request.finished {
+                    held.owe();
+                }
+                due.skip
             }
-        }
+            Cadence::Now { skip } => skip,
+        };
         if held.journal().pending() {
             return Err(NoDraft::Running);
         }
-        held.journal().covered_to()
+        (held.journal().covered_to(), skip)
     };
     // Only the turns not yet covered: the covered part's own turn is read
     // again, since its reply half may not be covered yet.
@@ -6025,7 +6051,7 @@ fn begin_journal_draft(
         .recovered_history_from(timeline, false, from);
     let newest = match cadence {
         Cadence::Due { newest, .. } => newest,
-        Cadence::Now => history
+        Cadence::Now { .. } => history
             .iter()
             .map(|m| m.turn)
             .max()
@@ -6049,6 +6075,7 @@ fn begin_journal_draft(
         open,
         journal,
         span.clone(),
+        skip,
     );
     Ok(span)
 }
@@ -6184,11 +6211,12 @@ fn spawn_journal_draft(
     open: Open,
     journal: Arc<Mutex<SessionJournal>>,
     span: Span,
+    skip: Skip,
 ) {
     tokio::spawn(async move {
         let mut desk = journal_desk(&state, &conv_id, timeline, open.asker, WRITE_TOKENS);
         let world = JournalsAbove(citable_above(&state, &conv_id));
-        let record = draft::draft(&mut desk, &journal, &span, &world).await;
+        let record = draft::draft(&mut desk, &journal, &span, &world, skip).await;
         tracing::info!(
             target: "zend::journal",
             conv_id = %conv_id,
@@ -6204,6 +6232,35 @@ fn spawn_journal_draft(
             "journal draft ended",
         );
         reconcile_journal_now(&state, &conv_id, timeline).await;
+        // A request that finished while this draft ran is owed its entry: it
+        // starts now, over what is still uncovered, and may not skip.
+        let owed = journal.lock().unwrap().take_owed();
+        if owed {
+            match begin_journal_draft(
+                &state,
+                &conv_id,
+                timeline,
+                Cadence::Now {
+                    skip: Skip::Refused,
+                },
+            ) {
+                Ok(span) => tracing::info!(
+                    target: "zend::journal",
+                    conv_id = %conv_id,
+                    from_part = span.from_turn,
+                    to_part = span.to_turn,
+                    parts = span.turns.len(),
+                    "journal draft started for a request that finished while one ran",
+                ),
+                Err(why) => tracing::debug!(
+                    target: "zend::journal",
+                    conv_id = %conv_id,
+                    ?why,
+                    "no draft for the owed request",
+                ),
+            }
+            return;
+        }
         // A draft held the journal; a period that ended meanwhile folds now.
         begin_journal_folds(&state, &conv_id, timeline);
     });
@@ -8092,7 +8149,15 @@ impl ZendSession {
         let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
         Some(
-            begin_journal_draft(&state, conv_id, timeline, Cadence::Now).map(|span| {
+            begin_journal_draft(
+                &state,
+                conv_id,
+                timeline,
+                Cadence::Now {
+                    skip: Skip::Allowed,
+                },
+            )
+            .map(|span| {
                 json!({
                     "from_turn": origin::turn_of(span.from_turn),
                     "to_turn": origin::turn_of(span.to_turn),

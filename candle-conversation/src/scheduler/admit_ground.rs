@@ -251,7 +251,6 @@ impl<'a> AdmitPass<'a> {
         let growth = sched.decode_growth_bytes();
         let standing_tier = (wave_tier as usize)
             .saturating_add(growth)
-            .saturating_add(sched.glue_scratch_bytes())
             .saturating_add(sched.held_claims_outstanding());
         tracing::debug!(
             target: "candle_conversation::scheduler::admission",
@@ -1152,10 +1151,13 @@ impl Scheduler {
     /// its 5.0 GB tier two regions short — ten decodes' claims over its 30 s.
     /// The group budget already withholds this forecast; admission now reads
     /// the same one.
+    ///
+    /// A decode's stencil adds nothing here: its static runs ride the steps a
+    /// piece at a time, each within the model's short span, so none claims its
+    /// sequence's prefill scratch (`stencil_wave`).
     pub(super) fn standing_ground_bytes(&self) -> usize {
         self.standing_tier_bytes()
             .saturating_add(self.decode_growth_bytes())
-            .saturating_add(self.glue_scratch_bytes())
             .saturating_add(self.held_claims_outstanding())
     }
 
@@ -1182,24 +1184,6 @@ impl Scheduler {
         } else {
             (kv as usize).saturating_mul(layers - cursor) / layers
         }
-    }
-
-    /// The prefill scratch the running decodes' static runs may claim: a
-    /// decode with a stencil plays its tool-call boilerplate as one prefill
-    /// span (`play_stencil_runs`), and a span past the timeline claims
-    /// its sequence's scratch at that step (`ensure_scratch`) — one slot per
-    /// recurrent layer, at its share of the region. Each decode with a stencil
-    /// that does not hold its scratch yet may take one, at any step, with no
-    /// admission of its own: priced nowhere, a 95-token run of two decodes
-    /// took 144 MiB inside a cohort fitted with 28 MiB to spare, and its next
-    /// window was refused five regions short (WhiteWorld, a5e6cc3ec,
-    /// 2026-10-19).
-    pub(super) fn glue_scratch_bytes(&self) -> usize {
-        self.active_decodes
-            .iter()
-            .filter(|(_, s)| !s.finished && s.stencil.as_ref().is_some_and(|d| !d.is_done()))
-            .map(|(id, _)| self.model.prefill_scratch_bytes(id.0))
-            .sum()
     }
 
     /// The K/V the running decodes will claim over one sweep, in whole regions

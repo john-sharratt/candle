@@ -175,6 +175,40 @@ fn lower_uncached(
     prefix: &str,
     arena: &mut Arena,
 ) -> Result<NodeId, BuildError> {
+    let id = lower_run(spec, vocab, cur, prefix, arena)?;
+    if let Some(tool) = folded_name(spec, cur) {
+        arena.marks.names_on_entry.insert(id, Arc::from(tool));
+    }
+    Ok(id)
+}
+
+/// The tool a run starting at `cur` names when it folds a name branch of one
+/// arm — a catalog of one tool, whose name the grammar writes: no branch is
+/// left to name the call, so the node the run lowers to names it on arrival
+/// (`TreeMarks::names_on_entry`).
+fn folded_name(spec: &TreeSpec, cur: SpecId) -> Option<&str> {
+    let mut node = cur;
+    loop {
+        match spec.node(node) {
+            NodeSpec::Static { next, .. } => node = *next,
+            NodeSpec::Branch { arms } if arms.len() == 1 => {
+                if spec.name_branches.contains(&node) {
+                    return Some(tool_name(&arms[0].0));
+                }
+                node = arms[0].1;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn lower_run(
+    spec: &TreeSpec,
+    vocab: &dyn Vocab,
+    cur: SpecId,
+    prefix: &str,
+    arena: &mut Arena,
+) -> Result<NodeId, BuildError> {
     // Gather a maximal run of statics and single-arm branches (fold + fuse).
     let mut run = String::new();
     let mut node = cur;

@@ -124,8 +124,9 @@ pub struct GovernorConfig {
 ///
 /// A streamed model builds its **layer pack after `close_load`**, repacking a whole layer at a
 /// time through `WeightResidency::Pool`: one layer's source plus its twins plus the repack's two
-/// bands, ~390 MiB on the 27B. The span is one allocation that never grows, so the load headroom
-/// `peak_load_pool_bytes` sized stays outside it and covers that pass beside this margin.
+/// bands, ~390 MiB on the 27B. The load's scratch at the span's top has closed by then (it goes
+/// to the weight side at `close_load`, `docs/driver_model.md` §4), so this margin is the only
+/// ground covering that pass — at 256 MiB it does not.
 ///
 /// The evidence to move it *down* again is the forbidden-allocation detector
 /// (`--features forbidden_allocations`), which says what actually allocates outside the

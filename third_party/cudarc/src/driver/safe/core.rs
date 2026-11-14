@@ -572,6 +572,9 @@ impl<T> Drop for CudaSlice<T> {
             return;
         }
         if let Some(watch) = alloc_watch() {
+            if watch.take_back(self.cu_device_ptr) {
+                return;
+            }
             watch.freed(self.cu_device_ptr);
         }
         if ctx.has_async_alloc {
@@ -1252,6 +1255,9 @@ impl CudaStream {
         }
         let watch = alloc_watch();
         if let Some(watch) = watch {
+            if let Some(ptr) = watch.serve(self, bytes) {
+                return Ok(ptr);
+            }
             watch.alloc(self, bytes);
         }
         let ptr = if self.ctx.has_async_alloc {

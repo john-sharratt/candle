@@ -26,5 +26,5 @@ pub mod union;
 pub use classify::{is_kept, LEFT_OUT};
 pub use export::export;
 pub use format::{Header, Line, Stamp, FORMAT, VERSION};
-pub use import::{import, ImportReport};
+pub use import::{import, ImportReport, IMPORT_BODY_LIMIT};
 pub use union::{union, Union};
