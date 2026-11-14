@@ -17,13 +17,10 @@
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use candle::{Device, Result};
+use candle::Result;
 use candle_nn::kv_cache::{CatchUpHost, GapCatchUp, GapKind, GapQuantize, QuantizeHost};
 
 use crate::models::batched_inference::BatchedInferenceSession;
-
-/// Gaps a settle runs at most before giving up on the cycle going quiet.
-const SETTLE_GAPS: usize = 64;
 
 /// The clock a gap's cost is charged to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +127,14 @@ impl GapTally {
         let host = t.elapsed();
         if let Some(cost) = self.cost(self.window) {
             cost.catch_up += host;
+        }
+        self.fold_catch_up(&c);
+        Ok(c)
+    }
+
+    /// One catch-up's counts and phases, into the current window.
+    fn fold_catch_up(&mut self, c: &GapCatchUp) {
+        if let Some(cost) = self.cost(self.window) {
             cost.caught.read += c.host.read;
             cost.caught.records += c.host.records;
             cost.caught.install += c.host.install;
@@ -146,7 +151,6 @@ impl GapTally {
                 }
             }
         }
-        Ok(c)
     }
 
     /// The tail of a gap: quantize what the forwards completed.
@@ -160,6 +164,14 @@ impl GapTally {
         let host = t.elapsed();
         if let Some(cost) = self.cost(self.window) {
             cost.quantize += host;
+        }
+        self.fold_quantize(&q);
+        Ok(q)
+    }
+
+    /// One quantize's counts and phases, into the current window.
+    fn fold_quantize(&mut self, q: &GapQuantize) {
+        if let Some(cost) = self.cost(self.window) {
             cost.phases.setup += q.host.setup;
             cost.phases.table += q.host.table;
             cost.phases.lease += q.host.lease;
@@ -180,25 +192,19 @@ impl GapTally {
                     .map(|r| format!("class {} short {}: {}", r.class, r.short, r.why));
             }
         }
-        Ok(q)
     }
 
-    /// Run gaps until the cycle is quiet — none outstanding and nothing left
-    /// to take — waiting for each on `device`. Outside every clock: what it
-    /// leaves is what the compression figures read. A gap launched inside the
-    /// decode clock and caught up here keeps its device time in the decode.
-    pub fn settle(&mut self, session: &mut BatchedInferenceSession, device: &Device) -> Result<()> {
+    /// Run gaps until the cycle is quiet ([`BatchedInferenceSession::
+    /// gap_settle`]), outside every clock: what it leaves is what the
+    /// compression figures read. A gap launched inside the decode clock and
+    /// caught up here keeps its device time in the decode.
+    pub fn settle(&mut self, session: &mut BatchedInferenceSession) -> Result<()> {
         self.set_window(Window::Outside);
-        for _ in 0..SETTLE_GAPS {
-            device.synchronize()?;
-            session.gap_wait()?;
-            self.catch_up(session)?;
-            let q = self.quantize(session, GapKind::Decode)?;
-            if q.jobs == 0 && !session.gap_outstanding() {
-                return Ok(());
-            }
+        for (c, q) in session.gap_settle(GapKind::Decode)? {
+            self.fold_catch_up(&c);
+            self.fold_quantize(&q);
         }
-        candle::bail!("the gap cycle did not go quiet in {SETTLE_GAPS} gaps")
+        Ok(())
     }
 
     /// The config's gap line.

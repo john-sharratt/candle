@@ -25,6 +25,8 @@
 //! depth in the first case and stays flat in the second is the question.
 
 use candle::{DType, Result, Tensor, D};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::GapKind;
 use tokenizers::Tokenizer;
 
 use super::yarn_gates::{decode_wave, needle_answer, needle_prompt, prefill};
@@ -127,11 +129,11 @@ pub fn config_for(mode: InferenceMode) -> BatchedConfig {
     }
 }
 
-/// Prefill `prompt` on a fresh session under `mode`, seal it as the substrate
-/// seals a turn — the prompt's K/V quantized in place at the mode's level, the
-/// answer decoding into a fresh chunk — and read `answer` back teacher-forced,
-/// keeping every step's log-probabilities. Sealing is where compression is
-/// paid (`BatchedInferenceSession::quantize_and_seal_sequences`); without it
+/// Prefill `prompt` on a fresh session under `mode`, quantize it as the
+/// scheduler's gaps do — every complete block of the prompt's K/V quantized in
+/// place at the mode's level, the writer chunk native — and read `answer` back
+/// teacher-forced, keeping every step's log-probabilities. The gap is where
+/// compression is paid (`BatchedInferenceSession::gap_settle`); without it
 /// every mode would decode against the prompt's float K/V. It is a no-op for
 /// a float mode.
 pub fn forced_trace<M: ManagedBatchedModel>(
@@ -144,7 +146,7 @@ pub fn forced_trace<M: ManagedBatchedModel>(
     let seq = session.create_sequence()?;
     let mut logits = prefill(model, &mut session, seq, prompt)?;
     #[cfg(feature = "cuda")]
-    session.quantize_and_seal_sequences(&[seq], true)?;
+    session.gap_settle(GapKind::Prefill)?;
     let mut steps = Vec::with_capacity(answer.len());
     for (i, &want) in answer.iter().enumerate() {
         steps.push(log_probs(&logits)?);

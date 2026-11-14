@@ -2208,7 +2208,7 @@ impl TestParams {
         // caught up the last gap the decode launched.
         #[cfg(feature = "cuda")]
         let (prompt_ex_gap_tps, generate_ex_gap_tps) = {
-            gaps.settle(&mut session, &self.device)?;
+            gaps.settle(&mut session)?;
             eprintln!(
                 "{}",
                 gaps.line(&format!("{:?} x{}", config.mode, sequence_indices.len()))

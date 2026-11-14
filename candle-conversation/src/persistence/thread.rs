@@ -1150,10 +1150,9 @@ fn run_pass(
     // BAND through `quantize_sealed_latent` — an IMMEDIATE select+convert with
     // no deferred-descs contract, which this drain's deferred cross-layer
     // batching (`quantize_layers_deferred` → `convert_deferred_descs`) cannot
-    // drive. Single-latent chunks therefore compress at the in-session seal
-    // (`quantize_and_seal_sequences`), and this hot→warm drain moves them
-    // format-preserving — already-compressed bands stay compressed, FP8 bands
-    // stay FP8.
+    // drive, and the gap quantize takes no single-latent backing. This hot→warm
+    // drain therefore moves single-latent chunks format-preserving —
+    // already-compressed bands stay compressed, FP8 bands stay FP8.
     let single_latent = backings.first().is_some_and(|b| b.single_latent());
     // Mark the hot→warm window in flight so the scheduler leaves the same
     // residences alone: a section quantize that converted them float→quant now

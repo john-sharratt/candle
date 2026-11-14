@@ -51,8 +51,9 @@ A caller building the batched engine starts from:
 - [`BatchedInferenceSession`](src/models/batched_inference.rs) — create with
   `new`/`new_with_backings`, then `create_sequence`/`fork_sequence`/`free_sequence`
   per conversation, `reserve_glue_gap`/`inject_sealed_at_tail` for
-  provenance-selected reprojection, `quantize_and_seal_sequences` to run the
-  adaptive KV compression kernel over a sequence's live chunks.
+  provenance-selected reprojection, and the gap quantize between forwards —
+  `gap_catch_up` then `gap_quantize` every wave, `gap_settle` to have every
+  complete block compressed now (`docs/kv_quantize_in_the_gap.md`).
 - [`BatchedConfig`](src/models/batched_inference.rs) / `InferenceMode` — choose
   KV storage: a fixed float/uniform-quant format, or an adaptive `C0`..`C10`
   compression level that engages `CompressionPolicy`'s per-block selection

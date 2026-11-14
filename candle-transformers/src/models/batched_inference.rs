@@ -39,7 +39,6 @@ use crate::models::positional_piece::PositionalPiece;
 use crate::models::residual_rows::CreepResidual;
 use crate::models::rope_schedule::RungSelect;
 #[cfg(feature = "cuda")]
-use crate::models::seal_timing::{native_bytes_per_desc, SealTiming};
 use crate::models::sealed_injection::{reconcile_sealed_prefix, SealedInjection};
 use crate::models::selection_strata::StrataTokens;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
@@ -2079,261 +2078,6 @@ impl BatchedInferenceSession {
             }
         }
         Ok(())
-    }
-
-    /// Quantize the live K/V chunks of each sequence in `seq_indices` in place
-    /// using the session's compression policy, then re-seal.
-    ///
-    /// Mirrors the substrate scheduler's boundary quantize (`SealAction::Turn` /
-    /// `PrimingProjection`): for every layer the live float chunks are
-    /// snapshotted with [`ChunkedKvBacking::record_turn`], run through
-    /// [`quantize_sealed_in_place`], and swapped back in via
-    /// `truncate_sequence_to_blocks(0)` + [`Self::inject_sealed_at_tail`]. The
-    /// quantized `SealedSequence`s are held across the truncate, so their
-    /// refcounted arena slots stay alive through the swap while the source float
-    /// arenas return to the pool.
-    ///
-    /// With `start_new_chunk`, a fresh writer chunk is pushed so the next writes
-    /// (decode) land in a new chunk instead of appending to the now-immutable
-    /// quantized tail. Already-quantized chunks pass through the quantizer's
-    /// preserve bucket unchanged, so this is safe to call after both prefill and
-    /// decode. No-op when the mode is uncompressed, the device is not CUDA, or
-    /// the shape is unquantizable (the palette4 quantizer supports `head_dim`
-    /// 128 and 256; single-latent backings take the per-band latent
-    /// compressor at any band-divisible head_dim).
-    ///
-    /// Answers with what the selection and convert core cost ([`SealTiming`]),
-    /// timed at the fences the call already has.
-    #[cfg(feature = "cuda")]
-    pub fn quantize_and_seal_sequences(
-        &mut self,
-        seq_indices: &[usize],
-        start_new_chunk: bool,
-    ) -> Result<SealTiming> {
-        use candle::quantized::pinned_staging::PinnedBuf;
-        let t_call = std::time::Instant::now();
-        let mut timing = SealTiming::default();
-        use candle_nn::kv_cache::{
-            convert_deferred_descs, quantize_layers_deferred, ChunkedKvBacking, CompressionPolicy,
-            SealedSequence,
-        };
-
-        // Quantization policy, or `None` for uncompressed (F16/BF16). When it's
-        // `None` we still SEAL + collapse the layout below (record_turn +
-        // re-inject + fresh writer) — only the quantize step is skipped. This is
-        // what keeps repeated prefills from leaving phantom empty chunks behind
-        // for float modes (which the quantized path already collapses).
-        let policy: Option<CompressionPolicy> = self.seal_policy();
-        let copy_stream = match &self.device {
-            Device::Cuda(d) => d.cuda_stream(),
-            _ => return Ok(timing),
-        };
-        // The fused palette4 quantizer supports head_dim 128 and 256;
-        // single-latent backings route through the per-band latent compressor
-        // instead (any head_dim divisible by N_PALETTE). Other shapes still
-        // collapse the layout below — just without quantizing.
-        let quantizable = self.backings.first().is_some_and(|b| {
-            candle::quantized::cuda::kvhead_supported_head_dim(b.head_dim())
-                || (b.single_latent() && b.head_dim() % 4 == 0)
-        });
-        let policy = if quantizable { policy } else { None };
-
-        let mut scratch: Option<PinnedBuf> = None;
-        let mut t_convert = std::time::Instant::now();
-
-        // ── ONE format selection across the whole cohort ────────────────────
-        //
-        // **The selection kernel's grid is `chunks × kv_heads`, so the batch axis
-        // is what fills it.** Selecting per (sequence, layer) — which this did —
-        // launches `sequences × layers` times with a 2–44 block grid each: an
-        // nsys trace of the ×128 batched-forward rung put
-        // `select_kv_format_palette4_paged` at **77.8% of all GPU time** (43.2 s
-        // over 4,644 launches, 9.3 ms each) with the two dominant shapes
-        // `grid=42` and `grid=2` — 38% and 1.8% of one wave on a 110-SM card.
-        // That is hot-path invariant 5 ("one launch over all slots, not a
-        // per-seq loop") violated on the axis that grows with width, which is
-        // why aggregate decode fell instead of holding from ×64 to ×128.
-        //
-        // `quantize_layers_deferred` already batches the selection across layers
-        // and takes a *list* of sequences per layer, so the cohort just becomes
-        // that list — the persistence thread's hot→warm drain has used it this
-        // way all along (`persistence::thread`, "ONE cross-layer selection").
-        //
-        // Grouped by resolved policy, because a capped layer (the MTP draft head
-        // seals at C3) genuinely selects against different thresholds and must
-        // not be folded in with the session's. In practice that is one group, or
-        // two when a cap is active.
-        let mut live_per_layer: Vec<Vec<SealedSequence>> = Vec::with_capacity(self.backings.len());
-        for (layer_idx, backing) in self.backings.iter().enumerate() {
-            let _ = layer_idx;
-            let mut per_seq = Vec::with_capacity(seq_indices.len());
-            for &seq_idx in seq_indices {
-                // The empty writer, and any pad pushed after it, goes: sealed it
-                // would be a quantized chunk with room left in it, which a later
-                // tail restore can stand where writes land (`drop_empty_tail`).
-                // The fresh writer pushed below replaces it.
-                //
-                // **This is also the cross-layer reconciliation.** A windowed
-                // creep leaves one layer with a trailing empty writer chunk the
-                // others do not yet have; dropping every layer's trailing empties
-                // brings them all back to their last real chunk, so the benign
-                // skew is gone before the alignment check below. What it cannot
-                // remove — a layer a *filled* chunk off the others — is a real
-                // divergence, which is exactly what that check must catch.
-                let mut live = backing.record_turn(seq_idx)?;
-                live.drop_empty_tail();
-                per_seq.push(live);
-            }
-            live_per_layer.push(per_seq);
-        }
-
-        // **Refuse to drain a per-layer skew to the warm tier.** The in-session
-        // `snapshot_sequence_per_layer` seal already refuses a sequence whose
-        // layers describe different token windows; this hot→warm drain is the
-        // other path that persists per-layer KV, and it must refuse the same
-        // thing. Without the check a wave that died mid-sweep — leaving the MTP
-        // head's layer a filled chunk off the trunk (`draft.rs` on why the head
-        // is a stream layer that must track it) — was sealed to warm, then cold,
-        // with no cross-layer record; every later projection that borrowed the
-        // turn re-injected the skew into a fresh slot per layer, which is the
-        // permanent corruption `assert_sealed_layers_aligned` exists to stop.
-        // Refused here, the slot stays hot and intact, and the next drain retries
-        // once the wave has advanced the lagging layers into line.
-        for (s, &seq_idx) in seq_indices.iter().enumerate() {
-            let per_layer: Vec<SealedSequence> = live_per_layer
-                .iter()
-                .map(|per_seq| per_seq[s].clone())
-                .collect();
-            assert_sealed_layers_aligned(&per_layer, seq_idx, "quantize_and_seal_sequences")?;
-        }
-
-        // `quantized_per_seq[seq][layer]`, seeded with the live snapshots so a
-        // layer the quantizer skips (no chunks, or no policy at all) passes
-        // through unchanged exactly as the per-sequence path did.
-        let mut quantized_per_seq: Vec<Vec<SealedSequence>> = (0..seq_indices.len())
-            .map(|s| {
-                live_per_layer
-                    .iter()
-                    .map(|per_seq| per_seq[s].clone())
-                    .collect()
-            })
-            .collect();
-
-        if let Some(session_policy) = policy.as_ref() {
-            // Resolve each layer's policy once, then bucket layers by it.
-            let layer_policies: Vec<CompressionPolicy> = self.layer_seal_policies(session_policy);
-            let mut groups: Vec<(CompressionPolicy, Vec<usize>)> = Vec::new();
-            for (layer_idx, lp) in layer_policies.iter().enumerate() {
-                match groups
-                    .iter_mut()
-                    .find(|(p, _)| p.compression_level == lp.compression_level)
-                {
-                    Some((_, layers)) => layers.push(layer_idx),
-                    None => groups.push((*lp, vec![layer_idx])),
-                }
-            }
-
-            let mut descs: Vec<candle::quantized::cuda::PalHeadDesc> = Vec::new();
-            let (mut select_ms, mut alloc_ms) = (0u64, 0u64);
-            for (group_policy, layers) in &groups {
-                let backing_refs: Vec<&ChunkedKvBacking> =
-                    layers.iter().map(|&l| &self.backings[l]).collect();
-                let per_layer_seqs: Vec<Vec<&SealedSequence>> = layers
-                    .iter()
-                    .map(|&l| live_per_layer[l].iter().collect())
-                    .collect();
-                let out = quantize_layers_deferred(
-                    &backing_refs,
-                    &per_layer_seqs,
-                    group_policy,
-                    &self.device,
-                    &copy_stream,
-                    &mut scratch,
-                    &mut descs,
-                    &mut select_ms,
-                    &mut alloc_ms,
-                )?;
-                // `out[i]` is group-layer `layers[i]`'s sequences, in
-                // `seq_indices` order — scatter back to (seq, layer).
-                for (gi, &layer_idx) in layers.iter().enumerate() {
-                    let layer_out = out.get(gi).ok_or_else(|| {
-                        candle::Error::Msg(
-                            "quantize_and_seal_sequences: quantizer returned no layer".into(),
-                        )
-                    })?;
-                    for (s, q) in layer_out.iter().enumerate() {
-                        quantized_per_seq[s][layer_idx] = q.clone();
-                    }
-                }
-            }
-            // The selection deferred every convert; run them all as one batch
-            // before anything reads the quantized bytes or drops the float
-            // sources below. One launch over every layer's descriptors: they
-            // carry their own arena pointers, so any backing serves.
-            //
-            // The selection read its result back, so the stream is idle when the
-            // convert launches: from the launch to the fence below is the
-            // convert's own device time.
-            if !descs.is_empty() {
-                let n_kv_head = self.backings[0].n_kv_head();
-                timing.native_bytes =
-                    descs.len() as u64 * native_bytes_per_desc(self.backings[0].head_dim());
-                t_convert = std::time::Instant::now();
-                convert_deferred_descs(&self.backings[0], &descs, n_kv_head, &self.device)?;
-            }
-            timing.select_ms = select_ms;
-            timing.alloc_ms = alloc_ms;
-        }
-        // **The snapshots go before the swap loop, not after it.** Each one holds every
-        // float chunk of its sequence, and the loop below is where those chunks are
-        // meant to die: a sequence's truncate drops the block table's hold, then its
-        // fresh writer is claimed. Kept to the end of the function, the snapshots held
-        // the whole cohort's float copy through every writer claim, so the loop's peak
-        // was float + quantized + writers for every sequence at once — measured on the
-        // Llama-2 MHA gate at Q8_0 x32 on a 16 GB card as all 639 regions live, 322
-        // arenas of them F32. A layer the quantizer skipped still has its snapshot, as
-        // a clone, in `quantized_per_seq`.
-        drop(live_per_layer);
-
-        // Convert kernels must finish before we drop the source float chunks
-        // (truncate) and before decode reads the quantized bytes. One fence
-        // covers the whole cohort — every convert was issued above. No convert
-        // kernel runs when quantization was skipped, so only sync then.
-        if policy.is_some() {
-            copy_stream
-                .synchronize()
-                .map_err(|e| candle::Error::Msg(format!("quantize sync: {e}")))?;
-            timing.convert_ms = t_convert.elapsed().as_secs_f64() * 1000.0;
-        }
-        for (s, &seq_idx) in seq_indices.iter().enumerate() {
-            let quantized_per_layer = std::mem::take(&mut quantized_per_seq[s]);
-            if policy.is_some() {
-                // Quantized modes must replace the float chunks with the quantized
-                // bytes: truncate the live float layout and re-inject the sealed
-                // quantized chunks.
-                self.truncate_sequence_to_blocks(seq_idx, 0)?;
-                // The live sequence's own layers, quantized: a cut would drop
-                // tokens it holds, so it is refused rather than absorbed.
-                let placed = self.inject_sealed_at_tail(seq_idx, &quantized_per_layer)?;
-                if placed.was_cut() {
-                    candle::bail!(
-                        "quantize in place: sequence {seq_idx}'s layers describe different \
-                         token windows — re-injecting its quantized chunks cut {} chunk(s)",
-                        placed.cut_chunks
-                    );
-                }
-            }
-            // Uncompressed (F16/BF16) modes keep their float chunks in place — the
-            // wave's admit phase (`wave_admit`) already collapses phantom
-            // chunks from repeated re-prefill, so the record_turn/truncate/re-inject
-            // round-trip is unnecessary (and re-injecting Arc-shared chunks under a
-            // lone sequence corrupted the decode read). Just open a fresh writer.
-            if start_new_chunk {
-                self.push_empty_writer_chunk(seq_idx)?;
-            }
-        }
-        timing.total_ms = t_call.elapsed().as_secs_f64() * 1000.0;
-        Ok(timing)
     }
 
     /// Sweep fully-empty KV arenas across all backings, returning their regions
@@ -6890,13 +6634,12 @@ mod seal_alignment_tests {
         assert!(assert_sealed_layers_aligned(&fixed, 0, "test").is_ok());
     }
 
-    /// **The drain's reconciliation: dropping trailing empties aligns a benign
-    /// creep skew.** A windowed creep leaves one layer with a trailing empty
-    /// writer chunk the others do not yet have — the skew is only in the tail,
-    /// and no token moves when it goes. `quantize_and_seal_sequences` runs
-    /// `drop_empty_tail` on every layer before it checks alignment for exactly
-    /// this reason: after the drop the layers describe the same token windows and
-    /// the drain proceeds, rather than refusing a sequence that is actually fine.
+    /// **Dropping trailing empties aligns a benign creep skew.** A windowed creep
+    /// leaves one layer with a trailing empty writer chunk the others do not yet
+    /// have — the skew is only in the tail, and no token moves when it goes.
+    /// After `drop_empty_tail` on every layer the layers describe the same token
+    /// windows and the alignment check passes, rather than refusing a sequence
+    /// that is actually fine.
     #[test]
     fn drop_empty_tail_reconciles_a_benign_trailing_writer_skew() {
         let ahead = layer(&[(0, 32), (0, 32), (0, 0)]);
@@ -6930,7 +6673,7 @@ mod seal_alignment_tests {
         trunk.drop_empty_tail();
         let mut per_layer: Vec<SealedSequence> = (0..10).map(|_| trunk.clone()).collect();
         per_layer.push(head);
-        let err = assert_sealed_layers_aligned(&per_layer, 9, "quantize_and_seal_sequences")
+        let err = assert_sealed_layers_aligned(&per_layer, 9, "test")
             .expect_err("a filled-chunk head skew must not drain");
         assert!(err.to_string().contains("chunk 2"), "{err}");
         assert!(err.to_string().contains("[10]"), "{err}");

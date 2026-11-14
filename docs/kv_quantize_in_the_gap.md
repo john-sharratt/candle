@@ -50,12 +50,13 @@ from the experts on its own. This design returns the native backlog's excess
 and the standing reserve, roughly 0.7–1.3 GB there. The other tenants are
 outside it.
 
-### 1.2 The test does not see it
+### 1.2 The test sees it
 
-The batched test (`batch_test/utils.rs`, `quantize_and_seal_sequences`) already
-quantizes in place, on the forward thread, at the prefill and decode
-boundaries. But it does so outside the timed windows, so the sweep has never
-seen any of these costs.
+The batched test (`batch_test/utils.rs`) runs the scheduler's gap quantize on
+the forward thread, inside its timed windows (§7), so its rates carry these
+costs; its `ex-gap` columns take the gap's host time back out. A boundary seal
+outside the timed windows, which is what the test ran before, hid every one of
+them from the sweep.
 
 ## 2. The model
 
@@ -396,8 +397,9 @@ is not budgeted: everything complete is quantized. Its cost is measured, inside
 the timed windows (§7), and the rate model's decode step includes it.
 
 The cost is real device work that now sits between forwards, so it is measured
-before anything is built (§8 step 1). `quantize_and_seal_sequences` runs the
-same selection and convert core today. Its device time per MiB of native K/V,
+before anything is built (§8 step 1). The boundary seal the batched test ran
+then (`quantize_and_seal_sequences`, since deleted) ran the same selection and
+convert core. Its device time per MiB of native K/V,
 at the rate production produces K/V in decode, decides whether §7's 95% gate
 can be met by the kernels as they are. If it cannot, the kernels are made faster
 first. The gate is not loosened.
@@ -598,10 +600,11 @@ scale whichever gap quantizes them.
 - `MigrateFlight` as a quantize lock (§5).
 - The selection's host readback of palettes, scales and maps
   (`sampled_selection/gpu.rs`). The summary row carries them (§3.4).
-- `batch_test`'s boundary calls to `quantize_and_seal_sequences`, and the
-  function's seal by truncate and re-inject. The test runs the scheduler's gap
-  quantize inside its timed loop. The function's selection and convert core
-  becomes the gap quantize; there is one implementation.
+- `BatchedInferenceSession::quantize_and_seal_sequences`, its seal by
+  truncate and re-inject, and its `SealTiming` (`models/seal_timing.rs`).
+  Deleted. The batched test runs the scheduler's gap quantize inside its timed
+  loop; a caller that needs every complete block quantized now — the fidelity
+  gate, the drafter test — calls `gap_settle`. There is one implementation.
 
 ## 7. How it is verified
 
@@ -801,17 +804,19 @@ Line numbers are as of commit `dc04b62ac`.
   (`gap_take` cuts each sequence's take to the gap's room).
 - `candle-transformers/src/models/batched_inference/gap.rs`: the session's
   `gap_catch_up` and `gap_quantize` over every live sequence, each layer under
-  `layer_seal_policies` — the per-layer policies `quantize_and_seal_sequences`
-  resolves too, through the same `seal_policy` — and no gap for a session that
+  `layer_seal_policies`, resolved through `seal_policy` — and `gap_settle`, gaps
+  run until the cycle is quiet, for a caller that must see every complete block
+  quantized now; no gap for a session that
   does not quantize, a head_dim the convert has no record for, or the
   single-latent layout. The gap's state is made with the session, before any
   forward; a table holds the jobs whose scratch fits `GAP_SCRATCH_BYTES`
   (64 MiB, `gap_jobs_within`): 3,866 at 4 KV heads of 128, 4,761 at 2 of 256.
 - The `kv_gap` line, `candle-conversation/src/scheduler/kv_gap.rs`: summed per
   second and written while gaps run.
-- `batch_test/utils.rs:2056`, `:2195`, `batch_test/fidelity.rs:147` and
-  `quantized_qwen38_moe.rs:1867`: every caller of `quantize_and_seal_sequences`
-  moves to the gap call.
+- `batch_test/utils.rs`, `batch_test/fidelity.rs` and `quantized_qwen38_moe.rs`:
+  every caller of `quantize_and_seal_sequences` moves to the gap — the batched
+  gate's loop to `gap_catch_up` and `gap_quantize`, the other two to
+  `gap_settle` — and the function is deleted.
 
 **7. Persistence (§5).**
 - `candle-conversation/src/persistence/thread.rs`: `run_pass` (`:1036`) keeps
@@ -858,8 +863,7 @@ Line numbers are as of commit `dc04b62ac`.
 **The sequence's layout.**
 - The catch-up replaces a chunk in place. It does not truncate and re-inject:
   re-injecting shared chunks under a lone sequence has corrupted the decode
-  read before (`batched_inference.rs`, the float-mode comment in
-  `quantize_and_seal_sequences`).
+  read before (the float-mode comment the deleted boundary seal carried).
 - The empty writer chunk and any pad after it are not blocks
   (`drop_empty_tail`). A sealed chunk with room left in it can end up where
   writes land.

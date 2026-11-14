@@ -1789,6 +1789,7 @@ mod tests {
         use crate::models::batched_inference::{BatchedConfig, InferenceMode, ManagedBatchedModel};
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::IndexOp;
+        use candle_nn::kv_cache::GapKind;
 
         let pack = engine()?;
         let device = Device::new_cuda(0)?;
@@ -1857,14 +1858,13 @@ mod tests {
                 None,
             )?;
             session.advance_sequence(seq, ids.len())?;
-            // **Seal the prefilled history, as the gate does.** Compression
-            // happens at seal, not at write, so a run that only decodes leaves
-            // every chunk open and float — and then C0, C5 and C6 produce
-            // byte-identical output, which reads as "the rungs do not differ"
-            // rather than "nothing was compressed". Mirrors
-            // `run_batched_config`, which seals after prefill for the same
-            // reason its %Quantized column is meaningful.
-            session.quantize_and_seal_sequences(&[seq], true)?;
+            // **Quantize the prefilled history, as the scheduler's gaps do.**
+            // Compression happens in the gap, not at write, so a run that only
+            // decodes leaves every chunk float — and then C0, C5 and C6
+            // produce byte-identical output, which reads as "the rungs do not
+            // differ" rather than "nothing was compressed". Every complete
+            // block is quantized before the decode below reads it.
+            session.gap_settle(GapKind::Prefill)?;
             let mut next = step.logits_owned()?[0]
                 .i(0)?
                 .argmax(0)?

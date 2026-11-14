@@ -795,10 +795,10 @@ Q8 ≈ FP8 (quality rung, not size); the size wins start at Q4 (≈1.78×) and g
 only where the threshold proves them. Gates: `latent_band_select_convert_matches_codec` (GPU/CPU
 codec byte contract), `mirror_bit_exact_mixed_band_formats` (decode dispatch, bit-exact),
 `prefill_mixed_rows_equal_decode_steps` (prefill dispatch), `latent_compressed_arena_roundtrip_decode`
-(the full production seal→compress→decode chain). The in-session seal
-(`quantize_and_seal_sequences`) drives compression; the persistence thread's hot→warm drain moves
-single-latent chunks format-preserving (the latent path is immediate-only — no deferred-descs
-contract). The compressed-corpus entries stay **float** (`FloatGalleryArena` `[G,512]`+`[G,128]`,
+(the full production seal→compress→decode chain). Nothing in the session drives it: the gap
+quantize (`docs/kv_quantize_in_the_gap.md`) takes no single-latent backing, and the persistence
+thread's hot→warm drain moves single-latent chunks format-preserving (the latent path is
+immediate-only — no deferred-descs contract). The compressed-corpus entries stay **float** (`FloatGalleryArena` `[G,512]`+`[G,128]`,
 §C/§D) — their job is retrieval, not compression.
 
 **Decision — the ratio we report:** re-baseline against *traditional FP16 linear attention*, as

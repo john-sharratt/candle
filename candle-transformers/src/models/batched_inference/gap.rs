@@ -25,6 +25,11 @@ use super::BatchedInferenceSession;
 /// next gap.
 pub const GAP_SCRATCH_BYTES: usize = 64 << 20;
 
+/// Gaps in a row a settle lets place nothing while blocks wait before it gives
+/// up: one is a retry finding its ground, a second is the same blocks refused
+/// again.
+const STALLED_GAPS: usize = 2;
+
 impl BatchedInferenceSession {
     /// Make the gap's state, once, for a session that quantizes: its scratch
     /// and summary are allocated here, never between two forwards.
@@ -88,6 +93,42 @@ impl BatchedInferenceSession {
     /// Whether a gap is outstanding — launched and not yet caught up.
     pub fn gap_outstanding(&self) -> bool {
         self.gap.as_ref().is_some_and(GapCycle::is_outstanding)
+    }
+
+    /// Run gaps — catch-up, then quantize — until the cycle is quiet: none
+    /// outstanding and nothing left to take, waiting for each on the device.
+    /// Every complete block of every live sequence is then quantized in place;
+    /// each writer chunk stays native, as it does between a daemon's waves.
+    /// For a caller that must see the K/V compressed now — a test after its
+    /// prefill, a harness before it reads its compression figures. The
+    /// scheduler never settles: a gap still running is caught up at a later
+    /// gap. Answers every call's outcome, in order.
+    pub fn gap_settle(&mut self, kind: GapKind) -> Result<Vec<(GapCatchUp, GapQuantize)>> {
+        let mut calls = Vec::new();
+        let mut idle = 0;
+        loop {
+            self.device.synchronize()?;
+            self.gap_wait()?;
+            let c = self.gap_catch_up()?;
+            let q = self.gap_quantize(kind)?;
+            let quiet = q.jobs == 0 && !self.gap_outstanding();
+            // A gap that put nothing in place while blocks wait is no progress:
+            // the same blocks deferred again. Two in a row and the ground will
+            // not cover them — say so rather than spin.
+            let stalled = c.caught_up && c.installed == 0 && c.stale == 0 && q.retried > 0;
+            idle = if stalled { idle + 1 } else { 0 };
+            calls.push((c, q));
+            if quiet {
+                return Ok(calls);
+            }
+            if idle >= STALLED_GAPS {
+                candle::bail!(
+                    "gap settle: {STALLED_GAPS} gaps in a row placed no block while {} waited \
+                     — the lease cannot cover them",
+                    calls.last().map_or(0, |(_, q)| q.retried)
+                )
+            }
+        }
     }
 
     /// Wait for the outstanding gap's device work, which runs on its own
