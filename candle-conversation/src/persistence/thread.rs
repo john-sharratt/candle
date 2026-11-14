@@ -6,11 +6,16 @@
 //! sends one after every turn-seal). On every wake it runs a single
 //! pass over the substrate:
 //!
+//! It copies and writes; it quantizes nothing. A turn's K/V is quantized on
+//! the scheduler thread, in the gap between forwards
+//! (`docs/kv_quantize_in_the_gap.md` §5), and a turn the gap has yet to finish
+//! is left until it has.
+//!
 //! ```text
 //!  ┌──────────────────────────────────────────────────────────────────┐
 //!  │ 1. Phase hot→warm                                                │
-//!  │    Walk `hot_lru`, find slots with `warm = None`, run            │
-//!  │    `migrate_sealed_to_cpu` per layer, install warm.              │
+//!  │    Walk `hot_lru`, find slots with `warm = None`, copy every     │
+//!  │    layer to the warm tier in one batched DtoH, install warm.     │
 //!  │                                                                  │
 //!  │ 2. Phase warm→cold                                               │
 //!  │    Walk `warm_lru`, find slots with `cold = None`, gather warm   │
@@ -51,9 +56,7 @@ use heap_census::{enter, set_thread, Scope};
 
 use super::cold_load::preallocate_pinned_scratch;
 use super::flush::{FlushRequest, PassFlush};
-use super::group_cap::GroupCap;
 use super::held_groups::{drain_in_held_groups, HeldDrain};
-use super::reserve_log::log_reserve;
 use super::resume::TurnChunkGrid;
 use super::streams::StreamId;
 use super::transfer::seal_to_chunk_images;
@@ -636,9 +639,11 @@ fn run_loop(
     }
 }
 
-/// Resolve the effective hot→warm quantize policy for a residence group.
+/// Resolve the effective policy a conversation's turns are quantized under —
+/// what the gap quantizes them with (`scheduler/turn_seal.rs`), and what tells
+/// this thread whether a native turn is still the gap's to finish.
 ///
-/// `base` is the engine-wide turn policy. `cc` is the group's
+/// `base` is the engine-wide turn policy. `cc` is the conversation's
 /// per-conversation override (from [`ConvCompression`]): when present it may
 /// replace the compression level, drop the global K-format override so K is
 /// adaptively quantized like V (`disable_k_override`), and/or pin K and V to
@@ -651,7 +656,7 @@ pub(crate) fn effective_turn_policy(
     cc: Option<ConvCompression>,
 ) -> Option<CompressionPolicy> {
     match (base, cc) {
-        // Lossless capture: skip the quantize pass so turns keep native R16/F16.
+        // Lossless capture: no quantize, so turns keep native R16/F16.
         (_, Some(c)) if c.lossless => None,
         (Some(b), Some(c)) => {
             let mut p = *b;
@@ -676,22 +681,14 @@ pub(crate) fn effective_turn_policy(
     }
 }
 
-/// Ask the VRAM governor to escalate recovery after a compress-to-free pass
-/// failed to allocate. Only fires for VRAM-exhaustion errors ([`is_device_oom`])
-/// — the compression couldn't fit even a small transient quant arena, the
-/// strongest "critically full" signal — where the scheduler making room lets the
-/// (untouched, still-consistent) turn's next compression attempt succeed. Other
-/// error kinds won't be helped by evicting, so they don't signal.
-///
-/// [`is_device_oom`]: candle_nn::kv_cache::is_device_oom
 /// Whether a hot→warm failure is the wave-in-flight deferral rather than a fault.
 ///
-/// A sealing pass allocates its quantize destinations and its CPU warm copies as
-/// it goes, and some of those need an arena that does not exist yet. Creating one
-/// claims a region and so moves the arena frontier a running wave's transient
-/// tier was placed against, which is why `enter_arena_window` refuses it.
+/// A copy allocates its CPU warm copies as it goes, and some of those need an
+/// arena that does not exist yet. Creating one moves the arena frontier a
+/// running wave's transient tier was placed against, which is why
+/// `enter_arena_window` refuses it.
 ///
-/// The refusal is **normal operation**, not an error: the group stays hot-float
+/// The refusal is **normal operation**, not an error: the group stays hot
 /// and consistent and the next pass finds the gap between forwards. It reaches
 /// the same `break 'work false` a genuine fault does, so the only thing that has
 /// to differ is what gets said about it — a warning with a CUDA breadcrumb reads
@@ -709,6 +706,11 @@ fn is_wave_deferral(err: &candle::Error) -> bool {
         || is_tier_standing_over_free(err)
 }
 
+/// Ask the VRAM governor to escalate recovery after a copy failed to
+/// allocate. Only fires for VRAM-exhaustion errors
+/// (`candle_nn::kv_cache::is_device_oom`), the strongest "critically full"
+/// signal; other error kinds won't be helped by evicting, so they don't
+/// signal.
 fn signal_vram_starvation(device: &Device, err: &candle::Error) {
     if !candle_nn::kv_cache::is_device_oom(err) {
         return;
@@ -736,13 +738,13 @@ fn await_owed_arenas(backings: &[ChunkedKvBacking], within: Duration) -> bool {
     }
 }
 
-/// Install one fenced group's `(idx, new_hot, new_warm)` triples on their
-/// residences, each only over the hot copy in `migrated` it was made from.
-/// Returns the warm bytes and the count installed.
+/// Install one copied group's `(idx, new_warm)` pairs on their residences,
+/// each only while the residence still holds the hot content in `copied` it
+/// was made from. Returns the warm bytes and the count installed.
 fn install_hot_to_warm(
     conversation: &Conversation,
-    migrated: &HashMap<ResidenceIndex, Arc<HotKv>>,
-    installs: Vec<(ResidenceIndex, Vec<SealedSequence>, Vec<SealedSequence>)>,
+    copied: &HashMap<ResidenceIndex, Arc<HotKv>>,
+    installs: Vec<(ResidenceIndex, Vec<SealedSequence>)>,
 ) -> (u64, usize) {
     if installs.is_empty() {
         return (0, 0);
@@ -750,8 +752,8 @@ fn install_hot_to_warm(
     let mut total_bytes = 0u64;
     let mut count = 0usize;
     let view = conversation.read();
-    for (idx, hot, warm) in installs {
-        let Some(from) = migrated.get(&idx) else {
+    for (idx, warm) in installs {
+        let Some(from) = copied.get(&idx) else {
             continue;
         };
         let bytes: u64 = warm
@@ -759,11 +761,11 @@ fn install_hot_to_warm(
             .flat_map(|s| s.chunks.iter())
             .map(|c| c.byte_size)
             .sum();
-        if !view.install_migrated(idx, from, hot, warm) {
+        if !view.install_copied(idx, from, warm) {
             tracing::debug!(
                 target: "candle_conversation::persistence::tier",
                 residence = idx.0,
-                "hot → warm dropped: the residence moved on during the migrate"
+                "hot → warm dropped: the residence moved on during the copy"
             );
             continue;
         }
@@ -771,7 +773,7 @@ fn install_hot_to_warm(
             target: "candle_conversation::persistence::tier",
             residence = idx.0,
             bytes,
-            "cached hot → warm (with hot Q-format replace)"
+            "cached hot → warm"
         );
         total_bytes = total_bytes.saturating_add(bytes);
         count += 1;
@@ -779,200 +781,45 @@ fn install_hot_to_warm(
     (total_bytes, count)
 }
 
-/// Migrate one policy-group's residences hot→warm: per layer, quantize the
-/// group's hot sequences in place (or pass them through when `policy` is
-/// `None`) and DtoH-copy the result to a format-preserving CPU warm copy.
-/// Successful residences (every layer migrated) are appended to `installs`
-/// as `(idx, new_hot, new_warm)`. Queues all work on the primary stream;
-/// the caller fences the group before [`install_hot_to_warm`].
+/// Copy one group's hot residences to the warm tier: one format-preserving
+/// DtoH of every layer's hot sequences into CPU warm copies. The hot copies
+/// are already in their stored formats — a turn's seal quantized it in the
+/// gap (`docs/kv_quantize_in_the_gap.md` §5) — so the copy changes nothing on
+/// the device. Each residence whose every layer copied is appended to
+/// `installs` as `(idx, new_warm)`.
 ///
-/// Returns whether a forward turned the group away — an arena it needed could
-/// not be created mid-wave — rather than anything failing. The group is intact
-/// and hot; the caller runs it again once the next gap has made those arenas.
+/// Returns whether a forward turned the group away — a warm arena it needed
+/// could not be created mid-wave — rather than anything failing. The group is
+/// intact and hot; the caller runs it again once the next gap has made those
+/// arenas.
 ///
-/// **A compaction is held off only while the group writes** (`flight`, see
-/// `candle_nn::kv_cache::migrate_flight`): the quantize claims its destinations
-/// and fills their records, the convert writes their bytes, and once those are
-/// fenced the quantized copies join `held` and the flight settles. The DtoH —
-/// most of the group's time — then runs beside any pass, which steps around
-/// every chunk `held` names.
-///
-/// Every device sequence it does not hand to `installs` goes back through a
-/// [`HotKv`], so it is freed on the device's own thread.
-#[allow(clippy::too_many_arguments)]
-fn migrate_group_hot_to_warm(
+/// **The copy writes nothing a compaction moves**, so the flight settles
+/// before it: the group's chunks are in `held`, which a pass steps around.
+fn copy_group_hot_to_warm(
     backings: &[ChunkedKvBacking],
     device: &Device,
     copy_stream: &Arc<CudaStream>,
-    policy: Option<&CompressionPolicy>,
     group: &[(ResidenceIndex, Vec<SealedSequence>)],
     flight: &mut MigrateFlight,
-    held: &mut HeldChunks,
     pinned_scratch: &mut Option<PinnedBuf>,
     n_layers: usize,
-    installs: &mut Vec<(ResidenceIndex, Vec<SealedSequence>, Vec<SealedSequence>)>,
-    quantize_ms: &mut u64,
+    installs: &mut Vec<(ResidenceIndex, Vec<SealedSequence>)>,
     copy_ms: &mut u64,
-    select_ms: &mut u64,
-    alloc_ms: &mut u64,
-    convert_ms: &mut u64,
 ) -> bool {
     if group.is_empty() {
         return false;
     }
-    // Per-residence (new_hot, new_warm) accumulators, one slot per layer.
-    let mut hot_per: Vec<Vec<SealedSequence>> = (0..group.len())
-        .map(|_| Vec::with_capacity(n_layers))
-        .collect();
+    flight.settle();
     let mut warm_per: Vec<Vec<SealedSequence>> = (0..group.len())
         .map(|_| Vec::with_capacity(n_layers))
         .collect();
-    let mut ok = vec![true; group.len()];
-    // K/V heads per layer (uniform across layers of one model) — the batched
-    // convert reads the accumulated descriptors as `[jobs × n_kv_head]`.
-    let n_kv_head = backings.first().map(|b| b.n_kv_head()).unwrap_or(0);
-    // Per-(chunk, head) convert descriptors accumulated across EVERY layer, so a
-    // single batched convert launch replaces the 48 per-layer launches.
-    let mut all_descs: Vec<candle::quantized::cuda::PalHeadDesc> = Vec::new();
-    // Each layer's quantized (but not-yet-converted) hot sequences, in layer
-    // order, one Vec-per-residence entry each.
-    let mut gpu_hot_per_layer: Vec<Vec<SealedSequence>> = Vec::with_capacity(n_layers);
-
-    // Set where a forward turned the group away rather than something failing:
-    // the caller waits for the next gap between forwards and runs it again.
     let mut wave_deferred = false;
     let success = 'work: {
-        // ── Phase 1: quantize EVERY layer with ONE cross-layer selection,
-        //    deferring the convert ─────────────────────────────────────────
-        // `quantize_layers_deferred` runs the palette-4 format selection as a
-        // SINGLE fused kernel + readback across all layers (not 48× per layer —
-        // the term that dominated the drain), allocates each layer's dst GPU-Q
-        // arenas, and appends every layer's per-(chunk, head) descriptors to
-        // `all_descs` WITHOUT launching the convert. Returned sequences already
-        // point at the (soon-to-be-filled) dst arenas. Partial trailing chunks
-        // quantize too (dead slots are zero; the packed valid-range window keeps
-        // amax correct); already-quant chunks pass through the preserve bucket.
-        // Bit-identical to the per-layer selection — see the compress-test A/B.
-        let t_q = std::time::Instant::now();
-        match policy {
-            Some(policy) => {
-                let per_layer_inputs: Vec<Vec<&SealedSequence>> = (0..n_layers)
-                    .map(|layer| group.iter().map(|(_, hot)| &hot[layer]).collect())
-                    .collect();
-                let backing_refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
-                match candle_nn::kv_cache::quantize_layers_deferred(
-                    &backing_refs,
-                    &per_layer_inputs,
-                    policy,
-                    device,
-                    copy_stream,
-                    pinned_scratch,
-                    &mut all_descs,
-                    select_ms,
-                    alloc_ms,
-                ) {
-                    Ok(v) => gpu_hot_per_layer = v,
-                    Err(e) if is_wave_deferral(&e) => {
-                        tracing::debug!(
-                            "cache: hot→warm quantize deferred — a wave holds the partition \
-                             and the destinations need a new arena; retrying at the next gap"
-                        );
-                        *quantize_ms += t_q.elapsed().as_millis() as u64;
-                        wave_deferred = true;
-                        break 'work false;
-                    }
-                    Err(e) => {
-                        // CUDA errors are async — surfaced on the next sync call,
-                        // not at the launch site; use the breadcrumb to identify it.
-                        tracing::warn!(
-                            "cache: hot→warm cross-layer quantize failed: {e} (last CUDA kernel on this thread: {})",
-                            candle::last_cuda_kernel_launch()
-                        );
-                        // Non-destructive: the group stays hot-float + consistent
-                        // and retries next pass. If it was VRAM exhaustion, the
-                        // retry needs room — signal the scheduler to escalate.
-                        signal_vram_starvation(device, &e);
-                        *quantize_ms += t_q.elapsed().as_millis() as u64;
-                        break 'work false;
-                    }
-                }
-            }
-            None => {
-                // No policy: pass each layer's hot sequences through unchanged.
-                for layer in 0..n_layers {
-                    gpu_hot_per_layer
-                        .push(group.iter().map(|(_, hot)| hot[layer].clone()).collect());
-                }
-            }
-        }
-        *quantize_ms += t_q.elapsed().as_millis() as u64;
-
-        // ── Phase 2: ONE batched convert across every layer's descriptors ───
-        // `n_layers × n_chunks × n_kv_head` blocks in a single launch (tiled at
-        // the grid.y cap), filling all dst arenas before the migrate DtoH reads
-        // them (same primary stream, FIFO). No-op when `policy` is None
-        // (`all_descs` empty). Counts toward `quantize_ms`. Bit-identical to the
-        // per-layer convert — proven by `quantize_layers_batched_matches_per_layer`.
-        if !all_descs.is_empty() {
-            let t_conv = std::time::Instant::now();
-            let conv = candle_nn::kv_cache::convert_deferred_descs(
-                &backings[0],
-                &all_descs,
-                n_kv_head,
-                device,
-            );
-            let dt = t_conv.elapsed().as_millis() as u64;
-            *quantize_ms += dt;
-            *convert_ms += dt;
-            if let Err(e) = conv {
-                if is_wave_deferral(&e) {
-                    tracing::debug!(
-                        "cache: hot→warm convert deferred — a wave holds the partition; \
-                         retrying at the next gap"
-                    );
-                    wave_deferred = true;
-                } else {
-                    tracing::warn!(
-                        "cache: hot→warm batched convert failed: {e} (last CUDA kernel on this thread: {})",
-                        candle::last_cuda_kernel_launch()
-                    );
-                    signal_vram_starvation(device, &e);
-                }
-                break 'work false;
-            }
-        }
-
-        // ── The writes are done: fence them, then let a compaction in ────────
-        // The quantize's claims, its records and the convert's bytes are the only
-        // device writes the group makes, all on `copy_stream`. Once they have
-        // landed, the quantized copies are registered beside the native ones the
-        // caller registered, and only then does the flight settle — so a pass that
-        // starts the moment it does already steps around every chunk this group
-        // holds.
-        if policy.is_some() {
-            let t_fence = std::time::Instant::now();
-            let fenced = copy_stream.synchronize();
-            *quantize_ms += t_fence.elapsed().as_millis() as u64;
-            if let Err(e) = fenced {
-                tracing::warn!(
-                    "cache: hot→warm fence after the convert failed: {e:?} (last CUDA kernel \
-                     on this thread: {})",
-                    candle::last_cuda_kernel_launch()
-                );
-                break 'work false;
-            }
-        }
-        held.hold(gpu_hot_per_layer.iter().flatten());
-        flight.settle();
-
-        // ── Phase 3: ONE batched hot → warm DtoH across every layer ─────────
-        // A single gather + DtoH + sync for all layers (vs 48 per-layer gathers +
-        // syncs), which was the dominant `copy_ms` term. Bit-identical to the
-        // per-layer migrate — proven by the compress-test A/B.
+        // ONE batched hot → warm DtoH across every layer: a single gather, DtoH
+        // and sync for all layers.
         let t_c = std::time::Instant::now();
-        let per_layer_refs: Vec<Vec<&SealedSequence>> = gpu_hot_per_layer
-            .iter()
-            .map(|v| v.iter().collect())
+        let per_layer_refs: Vec<Vec<&SealedSequence>> = (0..n_layers)
+            .map(|layer| group.iter().map(|(_, hot)| &hot[layer]).collect())
             .collect();
         let backing_refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
         let warm_result = ChunkedKvBacking::migrate_sealed_layers_to_cpu_batch(
@@ -983,7 +830,7 @@ fn migrate_group_hot_to_warm(
             &per_layer_refs,
         );
         *copy_ms += t_c.elapsed().as_millis() as u64;
-        drop(per_layer_refs); // release the borrow of gpu_hot_per_layer
+        drop(per_layer_refs);
         let warm_per_layer = match warm_result {
             Ok(v) => v,
             Err(e) if is_wave_deferral(&e) => {
@@ -999,11 +846,11 @@ fn migrate_group_hot_to_warm(
             // span (`staging_groups` over every layer's bands), so no hot set — not
             // a 128K turn's 84 MB layer, not a burst of lossless-R16 turns — can
             // exceed it. What is left is a CUDA or host-allocation error: reported,
-            // and the group stays hot-float and consistent for the next pass.
+            // and the group stays hot and consistent for the next pass.
             Err(e) => {
                 tracing::warn!(
-                    "cache: hot→warm batched DtoH failed: {e} — the group stays hot-float \
-                     and consistent and is retried next pass (last CUDA kernel on this \
+                    "cache: hot→warm batched DtoH failed: {e} — the group stays hot and \
+                     consistent and is retried next pass (last CUDA kernel on this \
                      thread: {})",
                     candle::last_cuda_kernel_launch()
                 );
@@ -1013,10 +860,10 @@ fn migrate_group_hot_to_warm(
         };
         // Distribute warm (per layer, in layer order) into per-residence order.
         for (layer, layer_warm) in warm_per_layer.into_iter().enumerate() {
-            if layer_warm.len() != gpu_hot_per_layer[layer].len() {
+            if layer_warm.len() != group.len() {
                 tracing::warn!(
                     "cache: hot→warm layer {layer} mismatch — {} hot vs {} warm",
-                    gpu_hot_per_layer[layer].len(),
+                    group.len(),
                     layer_warm.len()
                 );
                 break 'work false;
@@ -1025,37 +872,27 @@ fn migrate_group_hot_to_warm(
                 warm_per[i].push(w);
             }
         }
-
-        // Distribute the per-layer hot sequences into per-residence order.
-        for layer_hot in gpu_hot_per_layer.drain(..) {
-            for (i, h) in layer_hot.into_iter().enumerate() {
-                hot_per[i].push(h);
-            }
-        }
         true
     };
-
-    if !success {
-        ok.fill(false);
-    }
-
-    for (i, (idx, _)) in group.iter().enumerate() {
-        if ok[i] && hot_per[i].len() == n_layers && warm_per[i].len() == n_layers {
-            let hot = std::mem::take(&mut hot_per[i]);
-            let warm = std::mem::take(&mut warm_per[i]);
-            installs.push((*idx, hot, warm));
+    if success {
+        for ((idx, _), warm) in group.iter().zip(warm_per) {
+            if warm.len() == n_layers {
+                installs.push((*idx, warm));
+            }
         }
     }
-    // What no install took — a failed group's quantized copies — may be the last
-    // handle on its slots, and a pass may be running.
-    drop(HotKv::new(
-        gpu_hot_per_layer
-            .into_iter()
-            .flatten()
-            .chain(hot_per.into_iter().flatten())
-            .collect(),
-    ));
     wave_deferred
+}
+
+/// The most pending residences one copy group takes: the bound that keeps the
+/// migrate flight short enough for compaction to get in between groups.
+const MAX_GROUP_RESIDENCES: usize = 8;
+
+/// Whether a hot copy still holds a native chunk with tokens in it — a turn
+/// the gap has yet to quantize.
+fn holds_native(hot: &HotKv) -> bool {
+    hot.iter()
+        .any(|s| s.chunks.iter().any(|c| c.token_count > 0 && c.is_native()))
 }
 
 /// A pass's segment maintenance: the op an earlier pass left in flight, and
@@ -1081,54 +918,29 @@ fn run_pass(
 
     // ── Phase 1: hot → warm ─────────────────────────────────────────────
     //
-    // One group per compression override, so a single batched per-layer
-    // quantize call covers each policy. Most residences share `None` (the
-    // engine-wide turn policy); utility layers such as `code_reading` form
-    // their own group at a higher level with the K override dropped (see
-    // `ConvCompression`). Only the overrides are read here: each group's
-    // sequences are cloned under its own migrate guard below.
-    //
-    // Per group we:
-    //  - run `quantize_sealed_in_place` (selection + convert kernels,
-    //    primary stream),
-    //  - run `migrate_sealed_to_cpu_batch_async` (kv_migrate gather +
-    //    DtoH into pinned host scratch, primary stream),
-    //  - fence, and install the group's (hot, warm) pairs under one
-    //    substrate write lock.
+    // A copy, not a quantize: a turn's seal quantized it in the gap
+    // (`docs/kv_quantize_in_the_gap.md` §5), and a turn the seal gap left
+    // native is the gap's to finish (`scheduler/gap_residence.rs`) — the
+    // groups below leave it be until it is. One group per compression
+    // override, as the residences are listed by it; each group's sequences
+    // are cloned under its own migrate guard below, copied to the warm tier in
+    // one batched DtoH, and installed under one substrate read.
     let policies = conversation.read().pending_warm_policies();
     let n_layers = backings.len();
 
-    // Cross-thread write→read barrier. This persist pass runs on the background
-    // persistence thread and reads each freshly-sealed turn's K/V for the
-    // hot→warm migrate below. Those K/V bytes were WRITTEN by the scheduler
-    // thread's decode. Both threads queue on the same primary CUDA stream, but
-    // the ordering between two host threads issuing onto one stream is not
-    // guaranteed — the migrate could begin reading a turn's arena before the
-    // decode's writes to it have retired on the GPU, capturing half-written
-    // K/V. Synchronize the device once, up front, so every prior decode write
-    // is retired before we read any source arena.
+    // Cross-thread write→read barrier. This pass reads each sealed turn's K/V
+    // for the copy below, bytes the scheduler thread's forwards wrote — a
+    // lossless turn's native K/V among them. The ordering between two host
+    // threads issuing onto one stream is not guaranteed, so the device is
+    // synchronised once, up front, so every prior write is retired before the
+    // copy reads a source arena.
     //
-    // **It fences more than the migrate, and the whole pass depends on that.**
-    // The obvious economy is to skip it when there is nothing to migrate, since
-    // the drain costs the depth of whatever inference is in flight — one full
-    // forward, ~285 ms, several when waves are queued — regardless of payload:
-    // a `residences=1 mib=0` pass measured 831 ms where an uncontended
-    // zero-byte pass measures 3 ms, and making it conditional on a non-empty
-    // work list took the worst pass to 18 ms.
-    //
-    // It also took `CUDA_ERROR_ILLEGAL_ADDRESS` from 0 to 199 in the same run.
-    // What comes AFTER the migrate — the deferred arena creation this pass owes
-    // the last one, and the maintenance sweep — touches arena topology the
-    // in-flight wave is still reading, and this is the only thing retiring it.
-    // The drain is a pass-wide fence wearing a migrate-shaped comment. Anything
-    // that removes it has to give those two their own ordering first.
-    // Timed from HERE, not from the top of the pass. The barrier used to be the
-    // pass's first statement, so `t_pass.elapsed()` was the barrier; it now sits
-    // below the snapshot and grouping above, and measuring from `t_pass` would
-    // book that host-side work as device-wait. This number is read to decide
-    // whether the drain keeps up with the ingest seal rate, and the whole reason
-    // the barrier is still here is a measurement — 831 ms against 3 ms — so it
-    // has to keep meaning what it says.
+    // **It fences the maintenance sweep as well.** The sweep after the copy
+    // touches segment state an in-flight wave may still be reading, and this is
+    // what retires it; removing the barrier took `CUDA_ERROR_ILLEGAL_ADDRESS`
+    // from 0 to 199 in a run. The drain costs the depth of whatever inference is
+    // in flight — a `residences=1 mib=0` pass measured 831 ms against 3 ms
+    // uncontended — and is timed from here, so the figure means the wait.
     let t_sync = std::time::Instant::now();
     if let Err(e) = device.synchronize() {
         tracing::warn!(
@@ -1141,82 +953,11 @@ fn run_pass(
     let sync_pre_ms = t_sync.elapsed().as_millis() as u64;
     let t_migrate = std::time::Instant::now();
 
-    let mut quantize_ms = 0u64;
     let mut copy_ms = 0u64;
-    let mut select_ms = 0u64;
-    let mut alloc_ms = 0u64;
-    let mut convert_ms = 0u64;
     // A single-latent backing (DeepSeek's K≡V window) compresses per 128-dim
-    // BAND through `quantize_sealed_latent` — an IMMEDIATE select+convert with
-    // no deferred-descs contract, which this drain's deferred cross-layer
-    // batching (`quantize_layers_deferred` → `convert_deferred_descs`) cannot
-    // drive, and the gap quantize takes no single-latent backing. This hot→warm
-    // drain therefore moves single-latent chunks format-preserving —
-    // already-compressed bands stay compressed, FP8 bands stay FP8.
+    // band through its own compressor, and the gap takes no single-latent
+    // backing: its turns are copied as they stand, never left for a gap.
     let single_latent = backings.first().is_some_and(|b| b.single_latent());
-    // Mark the hot→warm window in flight so the scheduler leaves the same
-    // residences alone: a section quantize that converted them float→quant now
-    // would be redoing the conversion this pass is already doing. Advisory
-    // only — it excludes nothing and guarantees nothing.
-    //
-    // It used to be a process-global read lock over arena topology, held from
-    // before `per_head_table_host` captured base pointers through the
-    // post-migrate sync, because the scheduler was otherwise free to unmap
-    // those arenas underneath the select kernel. Nothing unmaps any more; see
-    // `candle_nn::kv_cache::migrate_flight`.
-    // **Create what the last pass was refused, before this one starts.**
-    //
-    // A pass that needed a new arena mid-wave was turned away at the leaf of the
-    // allocator and recorded the size class it wanted. Here — between forwards,
-    // with no KV lock held and no wave in flight — is where that can be made.
-    // The pass below then finds the arena already there and only *fills* it,
-    // which is legal at any point in a wave, so it no longer matters whether a
-    // forward starts underneath it.
-    //
-    // Silent when there is nothing owed, and silently deferred again if a
-    // forward has already started: the demand stays recorded for the next gap.
-    for backing in backings.iter() {
-        match backing.create_deferred_arenas() {
-            Ok(0) => {}
-            Ok(n) => tracing::debug!(
-                "cache: created {n} arena(s) a wave-deferred sealing pass asked for"
-            ),
-            // A wave started first: the demand stays recorded, and the scheduler's
-            // own between-forwards creation or this thread's next pass meets it.
-            // Normal operation — see `is_wave_deferral` — so it is not a warning.
-            Err(e) if is_wave_deferral(&e) => {
-                tracing::debug!("cache: deferred arena creation deferred again: {e}")
-            }
-            Err(e) => tracing::warn!("cache: deferred arena creation failed: {e}"),
-        }
-    }
-
-    // **The counterpart to elevate** (`docs/vram_governor_design.md` §8.1).
-    // Runs here, on the same between-forward seam as the deferred arena
-    // creation above and past the device sync, so nothing is in flight: drop the
-    // hot copy of residences no wave has attended for `IDLE_DEMOTE_GRACE_EPOCHS`,
-    // and only where a warm copy already holds the same bytes. Everything it
-    // takes is excluded from the current working set twice over — by the epoch
-    // stamp and by `working_set_pins` — so a live residence cannot be taken
-    // here, and shedding a redundant copy sets no flag and leaves no state to
-    // reset: the next `elevate_to_hot` simply lifts it again.
-    //
-    // Without this the hot set only ever grew: nothing demoted a section once
-    // `elevate_to_hot` lifted it, so every shortfall was met by conceding
-    // expert-weight ground, which is one-way.
-    {
-        let shed = conversation
-            .read()
-            .demote_idle_hot(crate::substrate::IDLE_DEMOTE_GRACE_EPOCHS);
-        if shed > 0 {
-            tracing::debug!(
-                target: "candle_conversation::persistence::tier",
-                residences = shed,
-                "idle demote: dropped the hot copy of residences no wave has attended"
-            );
-        }
-    }
-
     // **Defer rather than race a compaction.** This marker is also the hold that
     // keeps a KV compaction from relocating the chunks whose addresses the migrate
     // below is about to capture; a pass in flight means those locations are moving
@@ -1270,15 +1011,6 @@ fn run_pass(
     // the bursts. `MAX_GROUP_RESIDENCES` per hold, and a refused pass — which sets
     // `COMPACTION_WAITING` — gets in before the next one.
     //
-    // **A refused group shrinks before it waits** (`GroupCap`). The snapshot
-    // takes the oldest residences first, so a group too big for the slots its
-    // destination classes keep free is refused at the head of the queue on
-    // every pass while everything behind it waits: measured on BlackWorld
-    // (2026-11-10), the same three groups of eight refused short of 8,349 to
-    // 12,685 R16 slots for over forty minutes, `moved_residences=0` on every
-    // pass, 45 GB of native KV standing on the card and the expert zone on its
-    // floor. The ingest's own R16 writes took each gap's new arenas before the
-    // group came back. Halved, the group fits what is free and moves.
     // How often one pass waits for a gap and runs a turned-away group again,
     // and how long it waits for each: a gap is milliseconds under load, so the
     // bound is for a scheduler that has stopped looping, not a slow one.
@@ -1290,7 +1022,9 @@ fn run_pass(
     let mut hot_to_warm_count: usize = 0;
     let mut install_ms = 0u64;
     'policies: for cc in policies {
-        let mut cap = GroupCap::new();
+        // A turn the gap still owes a quantize is left for it: copied now, its
+        // warm and cold copies would keep the native bytes the gap replaces.
+        let gap_owes = !single_latent && effective_turn_policy(compression_policy, cc).is_some();
         loop {
             let Some(mut group_guard) = try_migrate_flight() else {
                 deferred_groups += 1;
@@ -1307,27 +1041,21 @@ fn run_pass(
                             "persist: hot→warm layer-count mismatch for {idx:?} — skipping"
                         );
                     }
-                    whole
+                    whole && !(gap_owes && holds_native(hot))
                 })
                 .collect();
-            let more = read.len() > cap.get();
-            read.truncate(cap.get());
+            let more = read.len() > MAX_GROUP_RESIDENCES;
+            read.truncate(MAX_GROUP_RESIDENCES);
             let group: Vec<(ResidenceIndex, Vec<SealedSequence>)> =
                 read.iter().map(|(idx, hot)| (*idx, hot.to_vec())).collect();
-            // The hot copies the migrate reads, which its installs replace only
-            // while the residences still hold them.
-            let migrated: HashMap<ResidenceIndex, Arc<HotKv>> = read.into_iter().collect();
+            // The hot copies the copy reads, over which alone its installs land.
+            let copied: HashMap<ResidenceIndex, Arc<HotKv>> = read.into_iter().collect();
             // Registered while the flight still holds chunk locations, so no
             // compaction can start between the snapshot and the registration and
             // spend claims on chunks this group keeps alive. Dropped last, once
             // every handle the group took is gone.
             let mut held = HeldChunks::new();
             held.hold(group.iter().flat_map(|(_, hot)| hot.iter()));
-            let effective = if single_latent {
-                None
-            } else {
-                effective_turn_policy(compression_policy, cc)
-            };
             let mut installs = Vec::new();
             // The device's stream, leased for this group's GPU work alone and
             // taken before any lock the group takes: a wave segment waits for
@@ -1336,53 +1064,20 @@ fn run_pass(
                 unreachable!("substrate-persistence runs on a CUDA device")
             };
             let copy_stream = cuda.cuda_stream();
-            let wave_deferred = migrate_group_hot_to_warm(
+            let wave_deferred = copy_group_hot_to_warm(
                 backings,
                 device,
                 &copy_stream,
-                effective.as_ref(),
                 &group,
                 &mut group_guard,
-                &mut held,
                 pinned_scratch,
                 n_layers,
                 &mut installs,
-                &mut quantize_ms,
                 &mut copy_ms,
-                &mut select_ms,
-                &mut alloc_ms,
-                &mut convert_ms,
             );
             drop(copy_stream);
-            // The fence that makes the install and the release safe: the group's
-            // Q-format arenas are written and its captured addresses retired.
-            //
-            // Device-wide (not just primary-stream): the reproject on the scheduler
-            // thread reads these freshly-installed Q-arenas for the NEXT turn's
-            // context, and if any of the convert's V work retires on a stream the
-            // primary-stream sync doesn't cover, the reproject captures incomplete V
-            // (K, whose convert retires earlier, is fine) — the V-only multi-turn
-            // duplication corruption.
-            if let Err(e) = device.synchronize() {
-                tracing::warn!(
-                    "cache: device sync after a hot→warm group failed: {e:?} (last CUDA \
-                     kernel on this thread: {})",
-                    candle::last_cuda_kernel_launch()
-                );
-                // This group's GPU work is suspect — install none of it, and queue
-                // nothing more behind a device that is not answering. Its quantized
-                // copies go back through a `HotKv`, freed on the device's thread.
-                drop(HotKv::new(
-                    installs.into_iter().flat_map(|(_, hot, _)| hot).collect(),
-                ));
-                drop(group);
-                drop(migrated);
-                drop(held);
-                drop(group_guard);
-                break 'policies;
-            }
             let t_install = std::time::Instant::now();
-            let (bytes, count) = install_hot_to_warm(conversation, &migrated, installs);
+            let (bytes, count) = install_hot_to_warm(conversation, &copied, installs);
             install_ms += t_install.elapsed().as_millis() as u64;
             hot_to_warm_bytes = hot_to_warm_bytes.saturating_add(bytes);
             hot_to_warm_count += count;
@@ -1392,21 +1087,13 @@ fn run_pass(
             // first, the clones are never the last handle, so the native chunks a
             // pass may be stepping around are freed on the thread that compacts.
             drop(group);
-            drop(migrated);
+            drop(copied);
             drop(held);
             drop(group_guard);
             // A sized flush is answered the moment enough is warm — including
             // one sent while this pass was already running — and the rest of the
             // backlog moves on without a caller waiting on it.
             flush.at_group(hot_to_warm_bytes);
-            if count > 0 {
-                cap.moved();
-            }
-            // A group turned away for want of slots runs again at once, at half
-            // its size, while it has a size to give up.
-            if wave_deferred && count == 0 && cap.refused() {
-                continue;
-            }
             // **A group a forward turned away runs again at the next gap, in
             // this pass.** It needed an arena that could only be made between
             // forwards; the scheduler makes every owed arena in its next gap,
@@ -1437,7 +1124,7 @@ fn run_pass(
     }
     let migrate_ms = t_migrate.elapsed().as_millis() as u64;
     let t_sync_post = std::time::Instant::now();
-    // Every group fenced itself before installing; this sync runs on a fixed
+    // Every group's copy synchronised before installing; this sync runs on a fixed
     // cadence regardless of load (see the pass-timing log below, which fires
     // even with nothing to migrate), so it is the daemon's most reliable "the
     // device is still alive" heartbeat — closing any out-of-memory streak
@@ -1453,8 +1140,8 @@ fn run_pass(
     let sync_post_ms = t_sync_post.elapsed().as_millis() as u64;
     // Log the breakdown when the pass did real work OR was slow even with nothing
     // to install (isolates a dominant `device.synchronize()` cost). This is the
-    // number that tells us whether the drain is sync-bound, the serial 48-layer
-    // migrate, or install-lock-bound.
+    // number that tells us whether the drain is sync-bound, the batched copy,
+    // or install-lock-bound.
     let total_ms = t_pass.elapsed().as_millis() as u64;
     if hot_to_warm_count > 0 || sync_pre_ms + migrate_ms + sync_post_ms > 50 {
         tracing::debug!(
@@ -1464,27 +1151,12 @@ fn run_pass(
             n_layers,
             sync_pre_ms,
             migrate_ms,
-            quantize_ms,
-            select_ms,
-            alloc_ms,
-            convert_ms,
             copy_ms,
             sync_post_ms,
             install_ms,
             total_ms,
             "hot→warm pass timing"
         );
-    }
-    // The reserve this pass leaves standing, against the backlog it is sized
-    // from (`docs/kv_drain_under_pressure.md` §2b). Pools are shared across
-    // the model's layers, so the first backing's report is the whole model's.
-    // Written when the pass moved something or a class is still owed arenas,
-    // so an idle drain stays quiet.
-    if let Some(first) = backings.first() {
-        let report = first.owe_reserves();
-        if hot_to_warm_count > 0 || report.classes.iter().any(|c| c.owed_arenas > 0) {
-            log_reserve(&report, hot_to_warm_count, hot_to_warm_bytes, total_ms);
-        }
     }
     if hot_to_warm_count > 0 {
         relief_trace::note(
@@ -1502,7 +1174,6 @@ fn run_pass(
             hot_to_warm_count as u64,
             hot_to_warm_bytes / (1 << 20),
             migrate_ms,
-            quantize_ms,
             copy_ms,
             total_ms,
         ));
@@ -1912,7 +1583,47 @@ pub(crate) fn build_grid(
 mod tests {
     use super::*;
 
-    use candle_nn::kv_cache::{KV_ARENA_MID_WAVE, KV_DEVICE_OOM_MARKER, TIER_STANDS_OVER_FREE};
+    use candle::DType;
+    use candle_nn::kv_cache::{
+        ArenaLocation, ChunkGid, HeadGids, KvFormat, QuantFormat, SealedChunk, KV_ARENA_MID_WAVE,
+        KV_DEVICE_OOM_MARKER, N_PALETTE, TIER_STANDS_OVER_FREE,
+    };
+
+    /// A one-chunk layer of `tokens` tokens, every band in format `tag`.
+    fn layer(tag: u8, tokens: u16) -> SealedSequence {
+        SealedSequence {
+            chunks: vec![SealedChunk {
+                gids: HeadGids::uniform(ChunkGid::detached(0), 1),
+                offset: 0,
+                token_count: tokens,
+                k_pal: Arc::new(Vec::new()),
+                v_pal: Arc::new(Vec::new()),
+                k_scale: Arc::new(Vec::new()),
+                v_scale: Arc::new(Vec::new()),
+                k_fmt: Arc::new(vec![tag; N_PALETTE]),
+                v_fmt: Arc::new(vec![tag; N_PALETTE]),
+                byte_size: 0,
+                meta: None,
+                q_sign: None,
+            }],
+            token_count: tokens as usize,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }
+    }
+
+    /// **A turn the gap has yet to quantize is one whose hot copy holds a
+    /// native chunk with tokens** — on any layer. Quantized chunks and empty
+    /// native ones are not the gap's.
+    #[test]
+    fn a_hot_copy_holds_native_only_where_a_native_chunk_has_tokens() {
+        let f16 = KvFormat::Float(DType::F16).to_tag();
+        let q8 = KvFormat::Quantized(QuantFormat::Q8_0).to_tag();
+        let hot = |layers| HotKv::new(layers);
+        assert!(!holds_native(&hot(vec![layer(q8, 32), layer(q8, 16)])));
+        assert!(!holds_native(&hot(vec![layer(q8, 32), layer(f16, 0)])));
+        assert!(holds_native(&hot(vec![layer(q8, 32), layer(f16, 16)])));
+    }
 
     /// **A falling backlog wakes the scheduler; a rising or unchanged one does
     /// not.** The scheduler blocks while the backlog holds admission shut, and

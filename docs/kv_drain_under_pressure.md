@@ -1,10 +1,11 @@
 # KV drains under pressure: a quant reserve, and compaction that never blocks migration
 
-> **Superseded in part by `docs/kv_quantize_in_the_gap.md`.** That design
-> quantizes K/V on the scheduler thread in every gap and reduces persistence to
-> a copy. The hot→warm quantize, the backlog-sized reserve (§2a), the group cap
-> (§2c) and the quantize side of §3 are replaced by it. Until it is built, this
-> document describes the code.
+> **Superseded in part by `docs/kv_quantize_in_the_gap.md`.** K/V is quantized
+> on the scheduler thread in the gap, and persistence copies. The hot→warm
+> quantize, the group cap (§2c), the `kv_reserve: pass` line (§2b item 1) and
+> the quantize side of §3 are gone with it. The reserve (§2a) stays, sized by
+> the gap's own `create_deferred_arenas` and drawn on by the gap's lease; the
+> rest of this document describes the code.
 
 **What broke** (BlackWorld, 2026-11-08 02:11–02:16; every count is from its
 log). All 3,720 KV regions were live and the hot→warm migration barely ran: 93
@@ -247,28 +248,20 @@ refused layer owes its own demand together with every layer after it
 everything the group still needs. The layers before it give back what they
 claimed when the group drops, and the retry claims it again.
 
-**The group was as large as the backlog allowed.** So the group size is a cap
-the pass adjusts (`persistence/group_cap.rs`, `GroupCap`):
-- **Halved** by every refusal, and the smaller group is tried at once, before
-  any gap wait. One residence needs a few hundred to a few thousand slots of a
-  class, which the class almost always has free.
-- **Doubled back** towards `MAX_GROUP_RESIDENCES` by every group that moves.
-- **One residence refused** waits for the gap as before (`await_owed_arenas`,
-  `MAX_GAP_RETRIES`).
+**The group was as large as the backlog allowed.** The group cap that halved
+on each refusal answered this. It is gone with the persistence quantize: the
+gap quantizes a turn before its seal, and the pass's copy of a group of
+`MAX_GROUP_RESIDENCES` claims no destination slots
+(`docs/kv_quantize_in_the_gap.md` §5, §6).
 
 ## 2b. Logging for the next attempt
 
 Everything below goes to `candle_conversation::kv_reserve` at INFO, and at
 WARN on the event marked:
 
-1. **`kv_reserve: pass`**, once per persistence pass that moved something or
-   left a class owed (`persistence/reserve_log.rs`). It carries:
-   - `pending_slots` and `pending_mib`;
-   - `classes`, one field per class: `label:target/free+owed@factor`, with a
-     `!` when the class is held at its cap.
-
-   With that line the factor is a number in the log, not an assumption, and
-   the design can be checked against it.
+1. The `kv_reserve: pass` line is gone with the persistence quantize
+   (`docs/kv_quantize_in_the_gap.md` §6); the gap's `kv_gap` line carries its
+   leases' shortfalls.
 2. **Grow events** (`kv_reserve: grow <class> by N arena(s)`, from
    `owe_reserves`) fire at INFO when a class is owed arenas. Each names the
    class, the arenas owed, the target, the free slots, the factor, and the

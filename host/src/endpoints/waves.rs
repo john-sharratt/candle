@@ -71,7 +71,7 @@ fn telemetry_fuse() -> Value {
     json!({
         "series": {
             "waves": ["ws", "fwd", "wave_ms", "quanta_ms"],
-            "migrate": ["migrate", "quant", "copy", "total"],
+            "migrate": ["migrate", "copy", "total"],
             "mix": [],
         },
         "sum": ["host"],
@@ -223,7 +223,6 @@ struct Migrate {
     res: f64,
     mib: f64,
     migrate: f64,
-    quant: f64,
     copy: f64,
     total: f64,
 }
@@ -236,7 +235,6 @@ fn fold_migrates(at: u64, rows: &[&MigrateSample]) -> Migrate {
         res: sum(|s| s.residences),
         mib: sum(|s| s.mib),
         migrate: sum(|s| s.migrate_ms),
-        quant: sum(|s| s.quantize_ms),
         copy: sum(|s| s.copy_ms),
         total: sum(|s| s.total_ms),
     }
@@ -626,7 +624,7 @@ mod tests {
                 "fuse": {
                     "series": {
                         "waves": ["ws", "fwd", "wave_ms", "quanta_ms"],
-                        "migrate": ["migrate", "quant", "copy", "total"],
+                        "migrate": ["migrate", "copy", "total"],
                         "mix": [],
                     },
                     "sum": ["host"],
@@ -770,7 +768,7 @@ mod tests {
             )
             .unwrap()
         };
-        let migrate = |at| fold_migrates(at, &[&migrate_sample(1, 1, 1, 1, 1, 1)]);
+        let migrate = |at| fold_migrates(at, &[&migrate_sample(1, 1, 1, 1, 1)]);
         let series = WaveSeries {
             waves: vec![wave(5_000), wave(10_000), wave(15_000)],
             mix: vec![MixRow {
@@ -801,8 +799,8 @@ mod tests {
     /// A slot's migration passes add up, what they moved and how long they took.
     #[test]
     fn a_slots_migration_passes_add_up() {
-        let a = migrate_sample(3, 10, 100, 40, 50, 120);
-        let b = migrate_sample(2, 5, 200, 10, 150, 210);
+        let a = migrate_sample(3, 10, 100, 50, 120);
+        let b = migrate_sample(2, 5, 200, 150, 210);
         assert_eq!(
             fold_migrates(15_000, &[&a, &b]),
             Migrate {
@@ -810,7 +808,6 @@ mod tests {
                 res: 5.0,
                 mib: 15.0,
                 migrate: 300.0,
-                quant: 50.0,
                 copy: 200.0,
                 total: 330.0,
             }

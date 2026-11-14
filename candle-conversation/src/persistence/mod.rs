@@ -47,7 +47,6 @@ pub mod elevate;
 mod expiry_tests;
 pub mod flush;
 pub mod gauge;
-mod group_cap;
 pub mod header_index;
 mod held_groups;
 mod held_types;
@@ -83,7 +82,6 @@ pub mod replica;
 #[cfg(test)]
 mod replica_tests;
 pub mod replication_load;
-mod reserve_log;
 pub mod resume;
 pub mod retired;
 pub mod rewritten;

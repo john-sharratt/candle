@@ -1,8 +1,9 @@
-//! Quantize-on-evict — adaptive per-`(head, palette)` compression at the
-//! hot→warm tier boundary.
+//! Adaptive per-`(head, palette)` compression of sealed sequences.
 //!
-//! The substrate's persistence thread calls [`quantize_sealed_in_place`]
-//! when a `CompressionPolicy` is configured. The flow within this module is:
+//! A turn's K/V is quantized in the gap (`gap/`); this module quantizes a
+//! sealed sequence whole — a section under its section policy, through
+//! [`quantize_sealed_in_place`] — and is the reference seal the gap is held
+//! to, byte for byte. The flow within this module is:
 //!
 //! ```text
 //!   GPU Float / R16  ──select_palette4_formats_fused──▶  per-(h, p) format choice
@@ -13,11 +14,7 @@
 //! quantization format per `(chunk, head, palette)` from the policy's
 //! candidate list using the production K/V error thresholds. The
 //! conversion kernel writes the quantized bytes into GPU-quant arena
-//! slots. The returned `SealedSequence`s still live in VRAM — the
-//! persist thread does a separate format-preserving DtoH copy via
-//! `migrate_sealed_to_cpu_batch_async` to produce the warm-tier image,
-//! and then `install_warm_and_hot` atomically replaces hot with the new
-//! Q-format GPU chunks and installs warm.
+//! slots. The returned `SealedSequence`s live in VRAM.
 //!
 //! Source-side rules:
 //! - Eligible chunks must have all their (h, p) GIDs in GPU `Float` or
@@ -66,10 +63,8 @@ use super::head_gids::{ChunkBands, HeadGids, GIDS_PER_HEAD};
 use super::meta_pool::ChunkRecordSrc;
 #[cfg(feature = "cuda")]
 use super::sampled_selection::{PagedSelectionGpuInputs, SampleFormat};
-#[cfg(feature = "cuda")]
-use super::selection_batches::{
-    selection_batches, selection_bytes, slice_layers, SELECTION_BUDGET_BYTES,
-};
+#[cfg(all(test, feature = "cuda"))]
+use super::selection_batches::{selection_batches, selection_bytes, slice_layers};
 #[cfg(feature = "cuda")]
 use super::types::{SealedChunk, SealedSequence, CHUNK_SIZE};
 #[cfg(feature = "cuda")]
@@ -333,50 +328,19 @@ pub fn quantize_sealed_in_place_deferred(
     )
 }
 
-/// Cross-layer batched quantize: run the format-selection kernel **once** across
-/// every layer's chunks (via [`PagedSelectionGpuInputs::from_head_gids_multi`])
-/// instead of once per layer, then quantize each layer with its slice of the
-/// shared selection — deferring the convert into `descs_acc` exactly like
-/// [`quantize_sealed_in_place_deferred`]. This collapses the per-layer selection
-/// launch + 8 host readbacks (the WDDM-bound term that dominates the hot→warm
-/// drain) to a single launch + readback. `backings[i]` owns `per_layer_seqs[i]`;
-/// returns the GPU-quant sequences per layer, in order. Bit-identical to the
-/// per-layer path: the unified table's per-layer `arena_idx` offset is a pure
-/// relabelling of rows the kernel reads by pointer, and chunks never interact
-/// across the selection.
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub fn quantize_layers_deferred(
-    backings: &[&ChunkedKvBacking],
-    per_layer_seqs: &[Vec<&SealedSequence>],
-    policy: &CompressionPolicy,
-    device: &Device,
-    copy_stream: &Arc<CudaStream>,
-    pinned_scratch: &mut Option<PinnedBuf>,
-    descs_acc: &mut Vec<PalHeadDesc>,
-    // Timing breakdown of this pass's quantize phase, so the persist log can see
-    // whether the cross-layer selection or the dst-arena allocation dominates.
-    select_ms: &mut u64,
-    alloc_ms: &mut u64,
-) -> Result<Vec<Vec<SealedSequence>>> {
-    quantize_layers_deferred_within(
-        backings,
-        per_layer_seqs,
-        policy,
-        device,
-        copy_stream,
-        pinned_scratch,
-        descs_acc,
-        select_ms,
-        alloc_ms,
-        SELECTION_BUDGET_BYTES,
-    )
-}
-
-/// [`quantize_layers_deferred`], each selection run cut to carve at most
-/// `selection_budget` bytes — the persistence domain's room in production, and
-/// whatever a test wants to force many runs.
-#[cfg(feature = "cuda")]
+/// Cross-layer batched quantize of sealed sequences: run the format-selection
+/// kernel **once** across every layer's chunks (via
+/// [`PagedSelectionGpuInputs::from_head_gids_multi`]) instead of once per
+/// layer, then quantize each layer with its slice of the shared selection —
+/// deferring the convert into `descs_acc` exactly like
+/// [`quantize_sealed_in_place_deferred`]. `backings[i]` owns
+/// `per_layer_seqs[i]`; returns the GPU-quant sequences per layer, in order,
+/// each selection run cut to carve at most `selection_budget` bytes.
+/// Bit-identical to the per-layer path: the unified table's per-layer
+/// `arena_idx` offset is a pure relabelling of rows the kernel reads by
+/// pointer, and chunks never interact across the selection. The reference
+/// seal the gap quantize is held to, byte for byte, by the device tests.
+#[cfg(all(test, feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn quantize_layers_deferred_within(
     backings: &[&ChunkedKvBacking],

@@ -162,8 +162,8 @@ pub use chunked::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
-    quantize_sealed_in_place, quantize_sealed_in_place_deferred,
+    convert_deferred_descs, dequantize_sealed_in_place, quantize_sealed_in_place,
+    quantize_sealed_in_place_deferred,
 };
 pub use chunked::{
     fragmentation, gap_take, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation,

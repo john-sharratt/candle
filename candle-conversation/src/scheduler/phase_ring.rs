@@ -318,7 +318,6 @@ pub struct MigrateSample {
     pub residences: u64,
     pub mib: u64,
     pub migrate_ms: u64,
-    pub quantize_ms: u64,
     pub copy_ms: u64,
     pub total_ms: u64,
 }
@@ -386,7 +385,7 @@ pub fn push_idle_migrate(total_ms: u64) {
             .is_none_or(|m| m.at.elapsed() >= MIX_EVERY)
     });
     if quiet {
-        push_migrate(migrate_sample(0, 0, 0, 0, 0, total_ms));
+        push_migrate(migrate_sample(0, 0, 0, 0, total_ms));
     }
 }
 
@@ -783,7 +782,6 @@ pub fn migrate_sample(
     residences: u64,
     mib: u64,
     migrate_ms: u64,
-    quantize_ms: u64,
     copy_ms: u64,
     total_ms: u64,
 ) -> MigrateSample {
@@ -792,7 +790,6 @@ pub fn migrate_sample(
         residences,
         mib,
         migrate_ms,
-        quantize_ms,
         copy_ms,
         total_ms,
     }
@@ -953,7 +950,7 @@ mod tests {
         assert_eq!((s.slots, s.decodes, s.sections), (48, 8, 40));
         assert!(w.last().unwrap().age_s >= 0.0);
 
-        push_migrate(migrate_sample(308, 2314, 77540, 72352, 5151, 77782));
+        push_migrate(migrate_sample(308, 2314, 77540, 5151, 77782));
         let m = snapshot_migrates();
         let ms = &m.last().unwrap().sample;
         assert_eq!((ms.residences, ms.mib, ms.total_ms), (308, 2314, 77782));
@@ -979,7 +976,7 @@ mod tests {
     #[test]
     fn an_empty_pass_right_after_a_recorded_one_adds_no_row() {
         let _ring = ring_guard();
-        push_migrate(migrate_sample(1, 2, 3, 4, 5, 6));
+        push_migrate(migrate_sample(1, 2, 3, 4, 5));
         let before = snapshot_migrates().len();
         push_idle_migrate(7);
         assert_eq!(snapshot_migrates().len(), before);

@@ -615,16 +615,19 @@ scale whichever gap quantizes them.
   record supersedes (`kv_tier_migration.md` §5.5).
 - **Hot after warm.** The hot copy is already quantized and is left alone.
   Dropping it under pressure, or as an idle demote, is a free, not a copy.
-- **The persistence thread touches no arena topology.** Its pass opens with a
-  `device.synchronize()` that orders more than the migrate: the deferred arena
-  creation and the idle demote that follow it in the pass (`run_pass`) rely on
-  it too, and taking it away once raised `CUDA_ERROR_ILLEGAL_ADDRESS` from 0
-  to 199 in a run. Both leave the persistence thread. The gap already creates
-  the arenas a refusal owes (§3), and the idle demote runs in the gap after
-  compaction, between forwards, where every free is ordered behind the
-  forward that last read the block. With the copy on its own stream and
-  nothing else on the device, the persistence thread has nothing left that
-  the fence ordered.
+- **The persistence thread touches no arena topology.** The deferred arena
+  creation and the idle demote are the scheduler's: the gap creates the arenas
+  a refusal owes (§3), and the idle demote runs after the gap's quantize
+  (`Scheduler::demote_idle_hot`), between forwards, where every free is
+  ordered behind the forward that last read the block. The pass copies a turn
+  only once the gap has quantized it — a turn still holding native chunks
+  under a quantizing policy is left (`holds_native`) — so the copy writes
+  nothing on the device. Its opening `device.synchronize()` stays while the
+  copy runs on the device's stream: it retires the forwards' writes a lossless
+  turn's native copy reads, and it orders the maintenance sweep after the
+  copy, which raised `CUDA_ERROR_ILLEGAL_ADDRESS` from 0 to 199 in a run
+  without it. The copy moving to its own stream with event waits (above) is
+  what retires it.
 - **The backlog gauge measures the copy.** `pending_warm_bytes` is the
   quantized bytes installed hot and not yet copied warm, stamped by the
   persistence thread as today. `on_backlog_fall` still wakes the scheduler,
@@ -635,15 +638,24 @@ scale whichever gap quantizes them.
 
 ## 6. What is deleted
 
-- From `persistence/thread.rs`: the hot→warm quantize, convert and install
-  phases (`quantize_layers_deferred` and `convert_deferred_descs` calls,
-  `install_hot_to_warm`), the per-group `device.synchronize()`, the wave
-  deferral and gap retries (`wave_deferred`, `await_owed_arenas`,
-  `MAX_GAP_RETRIES`), and `GroupCap`.
-- The backlog-sized reserve: `pending`, `reserve_targets`' backlog terms, and
-  `owe_reserves`' growth with the backlog (`kv_drain_under_pressure.md` §2a,
-  §2c). What remains of the reserve is the gap lease (§3.2). The
-  `kv_reserve: pass` line and `persistence/reserve_log.rs` go with it (§3.7).
+- From `persistence/thread.rs`: the hot→warm quantize and convert phases
+  (the `quantize_layers_deferred` and `convert_deferred_descs` calls), the
+  install of a quantized hot copy (`Substrate::install_migrated`, replaced by
+  `install_copied`, which installs warm over the content it read), the fence
+  after the convert and the per-group `device.synchronize()`, the deferred
+  arena creation and the idle demote (both the scheduler's now), and
+  `GroupCap` (`persistence/group_cap.rs`), whose halving answered a quantize's
+  destination slots. The copy's own wave deferral and its retry at the next
+  gap (`await_owed_arenas`, `MAX_GAP_RETRIES`) stay: a warm copy can need an
+  arena a forward refuses to create. The pass's quantize timings go with it,
+  through the migrate panel (`MigrateSample::quantize_ms`, `waves.rs`'s
+  `quant`, `perf.js`).
+- The public `quantize_layers_deferred` wrapper. Its `_within` form stays, as
+  the reference seal the gap's device tests hold it to, byte for byte.
+- The persistence pass's `kv_reserve: pass` line and
+  `persistence/reserve_log.rs` (§3.7). The reserve itself stays: the gap's own
+  `create_deferred_arenas` sizes it (`owe_reserves`), and the gap's lease
+  draws on it (§3.2).
 - `MigrateFlight` as a quantize lock (§5).
 - The selection's host readback of palettes, scales and maps
   (`sampled_selection/gpu.rs`). The summary row carries them (§3.4).
@@ -866,12 +878,14 @@ Line numbers are as of commit `dc04b62ac`.
   `gap_settle` — and the function is deleted.
 
 **7. Persistence (§5).**
-- `candle-conversation/src/persistence/thread.rs`: `run_pass` (`:1036`) keeps
-  the copy and the append. Deleted: `await_owed_arenas` (`:694`),
-  `install_hot_to_warm` (`:710`), `migrate_group_hot_to_warm` (`:771`), the
-  syncs at `:1100`, `:1334` and `:1414`, `MAX_GAP_RETRIES` (`:1253`), and the
-  pass's deferred arena creation (`:1146`). The idle demote (`:1162`) moves to
-  the gap (§5). `BacklogGauge` stays, stamped with the copy backlog.
+- `candle-conversation/src/persistence/thread.rs`: `run_pass` keeps the copy
+  (`copy_group_hot_to_warm`, which replaced `migrate_group_hot_to_warm`) and
+  the append; a turn the gap still owes is left (`holds_native`). Deleted: the
+  quantize and convert, the fence after the convert and the per-group sync,
+  the pass's deferred arena creation and `GroupCap`. The idle demote is the
+  scheduler's (`scheduler/gap_residence.rs`). The copy keeps its retry at the
+  next gap (`await_owed_arenas`, `MAX_GAP_RETRIES`) and the pass its opening
+  and closing syncs (§5). `BacklogGauge` stays, stamped with the copy backlog.
 - `candle-nn/src/kv_cache/chunked/chunk_ops.rs:1297`,
   `migrate_sealed_to_cpu_batch_async`: the copy, on the thread's own stream,
   through its pinned staging into the warm arenas.

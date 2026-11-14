@@ -1934,7 +1934,7 @@ impl ConversationEngine {
     /// Wait for an evicted `timeline` to leave the device, then settle it.
     ///
     /// [`Self::evict_ingest_timeline`] only flags the timeline: the persistence
-    /// thread quantizes each turn and drops its device copy as the warm copy
+    /// thread copies each turn warm and drops its device copy as the warm copy
     /// lands, on its own schedule. A caller that wants its next request to start
     /// on the ground the last one gave back calls this after it — the Strata
     /// harness does, standing in for the idle time a daemon has between one
@@ -3134,8 +3134,8 @@ impl ConversationEngine {
     /// Like [`Self::commit_persistence`] but skipped when nothing is staged.
     /// Returns `Ok(true)` when an `fsync` actually happened. The daemon's
     /// periodic flush task uses this so an idle workspace doesn't issue
-    /// pointless syscalls — and so writes produced asynchronously by the
-    /// bg-quantizer's persist callback aren't left stranded between turns.
+    /// pointless syscalls — and so writes the persistence thread produced
+    /// asynchronously aren't left stranded between turns.
     pub fn commit_persistence_if_pending(&self) -> crate::Result<bool> {
         Ok(self.conversation.commit_persistence_if_pending()?)
     }

@@ -1990,76 +1990,44 @@ impl Substrate {
         }
     }
 
-    /// Install one hot→warm migrate's result: `hot`, the quantized GPU copy the
-    /// convert wrote, and `warm`, its CPU copy.
+    /// Install one hot→warm copy's result: `warm`, the CPU copy of the hot
+    /// copy `copied` the persistence thread read. The hot copy is already in
+    /// its stored formats — the gap quantized it — so it stays as it is.
     ///
-    /// A residence flagged `evict_when_cold` takes warm only and drops hot now,
-    /// so its VRAM returns at once; the warm→cold write then frees warm too
-    /// ([`Self::install_cold`]), leaving it cold-only. Every other residence
-    /// takes both ([`Self::install_warm_and_hot`]): the next projection injects
-    /// the quantized hot copy directly, so decode reads exactly the bytes the
-    /// convert wrote.
+    /// A residence flagged `evict_when_cold` drops hot now, so its VRAM
+    /// returns at once; the warm→cold write then frees warm too
+    /// ([`Self::install_cold`]), leaving it cold-only. **A flagged residence a
+    /// live working set names keeps its hot copy** for the wave reading it;
+    /// the flag stands, and [`Self::demote_idle_hot`] sheds the hot copy once
+    /// the residence leaves the working set.
     ///
-    /// **A flagged residence a live working set names takes both as well.** Its
-    /// hot copy has to stay for the wave reading it, and the copy that stays is
-    /// the quantized one, not the native form the forward wrote: keeping the
-    /// native one held a pinned turn at three times its stored size. The flag
-    /// stands, and [`Self::demote_idle_hot`] sheds the hot copy once the
-    /// residence leaves the working set.
-    ///
-    /// **Only over the copy it was made from.** `migrated` is the hot copy the
-    /// migrate read; when the residence no longer holds its content — killed, or
-    /// taken or replaced since — nothing is installed, and `false` says so: the
-    /// copies were made from state that has moved on. A KV compaction that
-    /// relocated the copy while the migrate read it has not moved the content on
-    /// ([`HotKv::lineage`]), so the install lands over the relocation.
-    ///
-    /// A refused `hot` goes back through a [`HotKv`], so its device chunks are
-    /// freed on the device's own thread like any other hot payload.
-    pub fn install_migrated(
+    /// **Only over the content it was made from.** When the residence no
+    /// longer holds `copied`'s content — killed, or taken or replaced since,
+    /// a gap's quantize among them — nothing is installed, and `false` says
+    /// so. A KV compaction that relocated the copy meanwhile has not moved the
+    /// content on ([`HotKv::lineage`]), so the install lands over it.
+    pub fn install_copied(
         &self,
         residence: ResidenceIndex,
-        migrated: &Arc<HotKv>,
-        hot: Vec<SealedSequence>,
+        copied: &Arc<HotKv>,
         warm: Vec<SealedSequence>,
     ) -> bool {
         let r = self.residences.get(residence);
-        if r.hot()
-            .is_none_or(|now| now.lineage() != migrated.lineage())
-        {
-            drop(HotKv::new(hot));
+        if r.hot().is_none_or(|now| now.lineage() != copied.lineage()) {
             return false;
         }
         if r.has_flag(EVICT_WHEN_COLD) && !r.is_pinned() {
-            drop(HotKv::new(hot));
             self.install_warm_and_evict_hot(residence, warm);
             return true;
-        }
-        if !self.residences.replace_hot(residence, migrated, hot) {
-            return false;
         }
         self.residences.install_warm(residence, warm)
     }
 
-    /// Atomic dual install: replace the residence's hot AND install
-    /// warm at the same time. Used by the persistence thread after a
-    /// quantize-in-place pass produces new GPU Q-format chunks (hot)
-    /// alongside a format-preserving copy of those chunks on CPU
-    /// (warm).
+    /// Install a residence's hot and warm copies together, hot first.
     ///
-    /// Replaces — not adds — `residence.hot`. The previous hot
-    /// SealedSequences (which the in-session reconcile fed in as
-    /// R16/F16 chunks captured at `record_turn`) drop their Arc refs
-    /// here; if no other holder remains (the slot was truncated
-    /// post-seal, so this is normal), the underlying arena chunks
-    /// return to the pool.
-    ///
-    /// The crucial property: when `apply_projection` runs for the
-    /// next turn, it pulls `residence.hot` and Arc-clones those
-    /// gids onto the slot. Because we installed the new GPU Q chunks
-    /// directly here, decode reads **the exact bytes the convert
-    /// kernel wrote** with no intervening `kv_migrate` scatter — the
-    /// same invariant the perf test relies on.
+    /// Replaces — not adds — `residence.hot`. The previous hot sequences drop
+    /// their Arc refs here; if no other holder remains, the underlying arena
+    /// chunks return to the pool, freed on the device's thread.
     pub fn install_warm_and_hot(
         &self,
         residence: ResidenceIndex,
@@ -11330,13 +11298,13 @@ mod tests {
         assert!(!sub.residences.hot_members().contains(&unpinned));
     }
 
-    /// **A migrate's quantized hot copy replaces the native one wherever hot
-    /// stays.** Unflagged, both tiers install; flagged and unpinned, hot goes
-    /// and warm stays; flagged but in a live working set, hot stays for the
-    /// reading wave — and it is the migrate's quantized copy that stays, with
-    /// the flag still set for the demote that sheds it later.
+    /// **A copy's warm install leaves the hot copy as it was wherever hot
+    /// stays.** Unflagged, both tiers stand; flagged and unpinned, hot goes and
+    /// warm stays; flagged but in a live working set, hot stays for the
+    /// reading wave, with the flag still set for the demote that sheds it
+    /// later.
     #[test]
-    fn a_migrate_keeps_its_quantized_copy_wherever_hot_stays() {
+    fn a_copy_keeps_the_hot_copy_wherever_hot_stays() {
         let (_, _, timeline, mut sub) = make_timeline();
         let fresh = |sub: &mut Substrate| {
             let idx = sub
@@ -11357,35 +11325,33 @@ mod tests {
         sub.residence(flagged).set_flag(EVICT_WHEN_COLD);
         sub.residence(flagged_pinned).set_flag(EVICT_WHEN_COLD);
         sub.set_working_set_pins(&[TurnKey::new(timeline, pinned_idx)], &[]);
-        // The migrate's quantized copy, told apart from the native one by its
-        // token count.
-        let quantized = || {
-            vec![SealedSequence {
-                token_count: 7,
-                ..minimal_sealed_layer()
-            }]
-        };
+        let mut read = Vec::new();
         for r in [plain, flagged, flagged_pinned] {
-            let from = sub.residence(r).hot().expect("hot before the migrate");
-            assert!(sub.install_migrated(r, &from, quantized(), vec![minimal_sealed_layer()]));
+            let from = sub.residence(r).hot().expect("hot before the copy");
+            assert!(sub.install_copied(r, &from, vec![minimal_sealed_layer()]));
+            read.push(from);
         }
-        let hot_tokens =
-            |sub: &Substrate, r: ResidenceIndex| sub.residence(r).hot().map(|h| h[0].token_count);
+        let same = |r: ResidenceIndex, from: &Arc<HotKv>| {
+            sub.residence(r)
+                .hot()
+                .is_some_and(|h| h.lineage() == from.lineage())
+        };
 
-        assert_eq!(hot_tokens(&sub, plain), Some(7));
+        assert!(
+            same(plain, &read[0]),
+            "unflagged: the hot copy stays as read"
+        );
         assert!(sub.residence(plain).has_warm());
 
-        assert_eq!(
-            hot_tokens(&sub, flagged),
-            None,
+        assert!(
+            !sub.residence(flagged).has_hot(),
             "flagged, unpinned: hot goes"
         );
         assert!(sub.residence(flagged).has_warm());
 
-        assert_eq!(
-            hot_tokens(&sub, flagged_pinned),
-            Some(7),
-            "flagged and pinned: the quantized copy stays, not the native one"
+        assert!(
+            same(flagged_pinned, &read[2]),
+            "flagged and pinned: the hot copy stays for the wave"
         );
         assert!(sub.residence(flagged_pinned).has_warm());
         assert!(
@@ -11394,23 +11360,18 @@ mod tests {
         );
     }
 
-    /// **A migrate's copies land only over the hot copy they were made from.**
-    /// A residence killed while it migrated, or whose hot copy was taken and
-    /// replaced, takes neither tier: the copies describe state that has moved
-    /// on.
+    /// **A copy lands only over the hot content it was made from.** A
+    /// residence killed while it copied, or whose hot copy was taken and
+    /// replaced — a gap's quantize among them — takes no warm copy: it
+    /// describes state that has moved on.
     #[test]
-    fn a_migrate_over_a_residence_that_moved_on_installs_nothing() {
+    fn a_copy_over_a_residence_that_moved_on_installs_nothing() {
         let (_, _, timeline, mut sub) = make_timeline();
         let (_, killed) = install_hot_and_warm(&mut sub, timeline, 10);
         sub.residences.take_warm(killed);
         let from_killed = sub.residence(killed).hot().unwrap();
         sub.residences.kill(killed);
-        assert!(!sub.install_migrated(
-            killed,
-            &from_killed,
-            vec![minimal_sealed_layer()],
-            vec![minimal_sealed_layer()]
-        ));
+        assert!(!sub.install_copied(killed, &from_killed, vec![minimal_sealed_layer()]));
         assert!(!sub.residence(killed).has_hot() && !sub.residence(killed).has_warm());
 
         let (_, replaced) = install_hot_and_warm(&mut sub, timeline, 10);
@@ -11419,12 +11380,7 @@ mod tests {
         sub.residences.take_hot(replaced);
         sub.residences
             .install_hot(replaced, vec![minimal_sealed_layer()]);
-        assert!(!sub.install_migrated(
-            replaced,
-            &stale,
-            vec![minimal_sealed_layer()],
-            vec![minimal_sealed_layer()]
-        ));
+        assert!(!sub.install_copied(replaced, &stale, vec![minimal_sealed_layer()]));
         assert!(
             !sub.residence(replaced).has_warm(),
             "no warm copy of the bytes the residence no longer holds"

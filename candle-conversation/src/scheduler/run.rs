@@ -1415,6 +1415,14 @@ impl Scheduler {
                 // A turn stored with native chunks — its seal gap short of
                 // ground — is quantized here, one a gap.
                 self.quantize_a_native_residence();
+                // **The counterpart to elevate** (`docs/vram_governor_design.md`
+                // §8.1), here between forwards, where every free is ordered
+                // behind the forward that last read the block: drop the hot
+                // copy of residences no wave has attended for
+                // `IDLE_DEMOTE_GRACE_EPOCHS`, and only where a warm copy holds
+                // the same bytes. Without it the hot set only grows, and every
+                // shortfall is met by conceding expert-weight ground.
+                self.demote_idle_hot();
                 self.kv_gap.flush_due(Instant::now());
             }
 

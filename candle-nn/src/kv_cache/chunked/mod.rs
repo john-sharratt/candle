@@ -114,6 +114,7 @@ pub(crate) mod reservation;
 mod reserve_target;
 pub mod sampled_selection;
 pub mod seal_gather;
+#[cfg(test)]
 mod selection_batches;
 mod sequence_ops;
 mod size_class;
@@ -175,8 +176,8 @@ pub use compact_plan::{
 };
 #[cfg(feature = "cuda")]
 pub use compress::{
-    convert_deferred_descs, dequantize_sealed_in_place, quantize_layers_deferred,
-    quantize_sealed_in_place, quantize_sealed_in_place_deferred,
+    convert_deferred_descs, dequantize_sealed_in_place, quantize_sealed_in_place,
+    quantize_sealed_in_place_deferred,
 };
 pub use compression_policy::{
     production_adaptive_candidates, CompressionPolicy, KvErrorThresholdFactors, LLAMA2_KV_FACTOR,

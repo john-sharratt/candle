@@ -291,9 +291,9 @@ export function mountPerf(page, { title }) {
         'The KV resident in VRAM by the format it is stored in, in tokens, stacked. The six formats that held the '
         + 'most keep their own band; the rest are <b>other</b>.', mixLegend, cArena),
       card('Migration passes',
-        'Hot→warm passes per 5-second slot: how long they took, and how much of that was compress-to-warm '
-        + 'rather than the copy. Passes with nothing to move are drawn at zero, so a quiet drain reads as quiet '
-        + 'rather than stopped.', cMig)),
+        'Hot→warm passes per 5-second slot: how long they took, and how much of that was the copy. The gap '
+        + 'quantizes before a turn is sealed, so a pass only copies. Passes with nothing to move are drawn at '
+        + 'zero, so a quiet drain reads as quiet rather than stopped.', cMig)),
     h('div', { class: 'grid g2' },
       card('Projection cost', 'Where projection time goes: drain, re-projection, scan, layout.', cProj),
       card('Active work', 'Resident conversations, and the decode / prefill widths sharing them.', cSlots)),
@@ -492,7 +492,6 @@ export function mountPerf(page, { title }) {
     series: [
       // A pass that moved nothing is drawn at zero: the drain ran and was idle.
       series(MG.map((m) => (m.res > 0 ? m.total / 1000 : 0)), 'var(--crit)', 'pass (s)'),
-      series(MG.map((m) => m.quant / 1000), 'var(--warn)', 'quantize (s)'),
       series(MG.map((m) => m.copy / 1000), 'var(--info)', 'copy (s)'),
     ],
     yFmt: (v) => v.toFixed(1) + 's',
@@ -503,7 +502,6 @@ export function mountPerf(page, { title }) {
       return [
         { t: `${fmtNum(m.res)} residences · ${fmtNum(Math.round(m.mib))} MiB` },
         { t: `pass ${(m.total / 1000).toFixed(2)} s`, c: 'var(--crit)' },
-        { t: `quantize ${(m.quant / 1000).toFixed(2)} s`, c: 'var(--warn)' },
         { t: `copy ${(m.copy / 1000).toFixed(2)} s`, c: 'var(--info)' },
       ];
     },
@@ -676,7 +674,7 @@ export function mountPerf(page, { title }) {
     if (m) {
       const s = m.total / 1000;
       cards.push(kpi('Last migration', s.toFixed(1), 's',
-        `${fmtNum(Math.round(m.mib))} MiB · ${((100 * m.quant) / Math.max(1, m.total)).toFixed(0)}% quantize`,
+        `${fmtNum(Math.round(m.mib))} MiB · ${((100 * m.copy) / Math.max(1, m.total)).toFixed(0)}% copy`,
         stateBy(s, LIMITS.migWarnS, LIMITS.migCritS)));
     }
     // The host reports memory in MiB, measured or absent (`null`).
@@ -708,9 +706,8 @@ export function mountPerf(page, { title }) {
     ];
     const m = lastMoved();
     if (m) {
-      const q = (100 * m.quant) / Math.max(1, m.total);
-      bits.push(`Last drain took ${(m.total / 1000).toFixed(1)}s, `, h('b', {}, q.toFixed(0) + '% of it quantizing'),
-        q > 60 ? ' — the bottleneck is compress-to-warm, not the copy. ' : '. ');
+      const c = (100 * m.copy) / Math.max(1, m.total);
+      bits.push(`Last drain took ${(m.total / 1000).toFixed(1)}s, `, h('b', {}, c.toFixed(0) + '% of it copying'), '. ');
     }
     const back = w.backlog;
     bits.push('Backlog ', h('b', {}, fmtNum(Math.round(back)) + ' tok'),
