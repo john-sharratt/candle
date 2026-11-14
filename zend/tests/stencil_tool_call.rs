@@ -1457,6 +1457,17 @@ fn walk_natural(
     walk_natural_held(tree, tok, target, strict, None)
 }
 
+/// The bytes of a `len`-byte token the decode loop commits once the session has
+/// `observed` it: a span that closed inside the token commits only its own
+/// part, and the successor writes the rest — the heal `StencilDriver` makes,
+/// whether the token was decoded free or under a held value's mask.
+fn committed(observed: Observe, len: usize) -> usize {
+    match observed {
+        Observe::SpanClosed { leftover } if leftover > 0 && leftover < len => len - leftover,
+        _ => len,
+    }
+}
+
 /// [`walk_natural`] with the turn's calls held to `held`, as a round's are
 /// (`zend::held_values`).
 fn walk_natural_held(
@@ -1537,11 +1548,11 @@ fn walk_natural_held(
                         before(b)
                     ));
                 }
-                session
+                let observed = session
                     .observe(*id, &bytes[b..b + p.len()])
                     .map_err(|e| format!("{e:?}"))?;
-                b += p.len();
-                written_to = b;
+                written_to = b + p.len();
+                b += committed(observed, p.len());
             }
             StencilAction::MaskedDecode(set) => {
                 let (id, len) = set
@@ -1561,10 +1572,10 @@ fn walk_natural_held(
                             String::from_utf8_lossy(&bytes[b..(b + 16).min(bytes.len())])
                         )
                     })?;
-                session
+                let observed = session
                     .observe(id, &bytes[b..b + len])
                     .map_err(|e| format!("{e:?}"))?;
-                b += len;
+                b += committed(observed, len);
             }
             StencilAction::FreeDecode { .. } => {
                 let (id, p) = token_at(b).ok_or_else(|| {
@@ -1583,12 +1594,7 @@ fn walk_natural_held(
                             before(b)
                         ))
                     }
-                    // The close fell inside this token: only the span's part is
-                    // committed, and the successor writes the rest.
-                    Observe::SpanClosed { leftover } if leftover > 0 && leftover < p.len() => {
-                        b += p.len() - leftover
-                    }
-                    _ => b += p.len(),
+                    observed => b += committed(observed, p.len()),
                 }
             }
             StencilAction::Exit => {
