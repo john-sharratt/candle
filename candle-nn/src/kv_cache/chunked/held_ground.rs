@@ -40,6 +40,8 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::{sys, CudaEvent, CudaStream};
 #[cfg(feature = "cuda")]
+use candle::cuda_backend::graph::relaxed_capture;
+#[cfg(feature = "cuda")]
 use candle::cuda_backend::{ask_holders_to_move, HeldGround};
 #[cfg(feature = "cuda")]
 use candle::{CudaDevice, Device};
@@ -248,27 +250,35 @@ impl Inner {
 
     /// Return every pending range whose fence has fired; with `wait`, the
     /// oldest one is waited for first, so at least one comes back.
+    ///
+    /// The fences are read with this thread's capture mode relaxed: a take
+    /// arrives inside a recording forward, and there the driver refuses a
+    /// fence query or wait outright and invalidates the forward's capture —
+    /// measured on BlackWorld (2026-11-14), the first take of a decode after a
+    /// give-back lost the wave, and every boot crash-looped on it.
     fn reclaim(&mut self, wait: bool) {
-        if wait {
-            if let Some((event, _, _)) = self.pending.first() {
-                // A failed wait leaves the range pending rather than reusing
-                // memory a launch may still read.
-                let _ = event.synchronize();
+        relaxed_capture(|| {
+            if wait {
+                if let Some((event, _, _)) = self.pending.first() {
+                    // A failed wait leaves the range pending rather than
+                    // reusing memory a launch may still read.
+                    let _ = event.synchronize();
+                }
             }
-        }
-        let mut i = 0;
-        while i < self.pending.len() {
-            // `cuEventQuery`: SUCCESS once every launch queued before the
-            // record has completed; anything else leaves the range pending.
-            let fired = unsafe { sys::cuEventQuery(self.pending[i].0.cu_event()) }
-                == sys::CUresult::CUDA_SUCCESS;
-            if fired {
-                let (_, ground, t) = self.pending.swap_remove(i);
-                self.extents_mut(ground).release(t.start, t.len);
-            } else {
-                i += 1;
+            let mut i = 0;
+            while i < self.pending.len() {
+                // `cuEventQuery`: SUCCESS once every launch queued before the
+                // record has completed; anything else leaves the range pending.
+                let fired = unsafe { sys::cuEventQuery(self.pending[i].0.cu_event()) }
+                    == sys::CUresult::CUDA_SUCCESS;
+                if fired {
+                    let (_, ground, t) = self.pending.swap_remove(i);
+                    self.extents_mut(ground).release(t.start, t.len);
+                } else {
+                    i += 1;
+                }
             }
-        }
+        })
     }
 
     /// `bytes` from the bootstrap block, else the lowest arena that holds them and

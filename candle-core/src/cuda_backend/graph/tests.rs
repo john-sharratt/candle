@@ -2148,3 +2148,74 @@ fn device_bytes_per_executable() -> Result<()> {
     }
     Ok(())
 }
+
+/// **What a fence wait does to a capture open on the waiting thread.** Held
+/// ground reads its fences — events recorded on the compute stream outside any
+/// capture — from inside a forward: a query on every take, a wait when the
+/// take finds no room otherwise. Each is tried here inside a `ThreadLocal`
+/// capture on a stream of the test's own, and the capture's status read after.
+#[test]
+fn a_fence_wait_inside_a_capture() -> Result<()> {
+    use cudarc::driver::sys;
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let stream = dev.cuda_context().new_stream().w()?;
+    let fence = dev.cuda_stream().record_event(None).w()?;
+    dev.cuda_stream().synchronize().w()?;
+    let status = |s: &CudaStream| -> Result<sys::CUstreamCaptureStatus> {
+        let mut st = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        // SAFETY: a live stream and a status to write.
+        unsafe { sys::cuStreamIsCapturing(s.cu_stream(), &mut st) }
+            .result()
+            .w()?;
+        Ok(st)
+    };
+    let mut outcome = Vec::new();
+    for relaxed in [false, true] {
+        for wait in [false, true] {
+            // SAFETY: a created stream this test owns, not capturing.
+            unsafe { super::capture::begin(&stream)? };
+            launch(&f, &stream, &x, &mut y, 1.0, 1.0)?;
+            let call = || {
+                // SAFETY: an event recorded above, outside any capture.
+                unsafe {
+                    if wait {
+                        sys::cuEventSynchronize(fence.cu_event())
+                    } else {
+                        sys::cuEventQuery(fence.cu_event())
+                    }
+                }
+            };
+            let called = if relaxed {
+                super::capture::relaxed(call)
+            } else {
+                call()
+            };
+            let after = status(&stream)?;
+            // SAFETY: the capture begun above, on this thread.
+            let ended = unsafe { super::capture::end(&stream) };
+            if let Ok(graph) = ended {
+                // SAFETY: a graph this test captured, destroyed once.
+                unsafe { cudarc::driver::result::graph::destroy(graph) }.w()?;
+            }
+            outcome.push((relaxed, wait, called, after));
+        }
+    }
+    use sys::CUresult::{CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED as REFUSED, CUDA_SUCCESS as FIRED};
+    use sys::CUstreamCaptureStatus::{
+        CU_STREAM_CAPTURE_STATUS_ACTIVE as ACTIVE, CU_STREAM_CAPTURE_STATUS_INVALIDATED as LOST,
+    };
+    assert_eq!(
+        outcome,
+        vec![
+            (false, false, REFUSED, LOST),
+            (false, true, REFUSED, LOST),
+            (true, false, FIRED, ACTIVE),
+            (true, true, FIRED, ACTIVE),
+        ]
+    );
+    Ok(())
+}

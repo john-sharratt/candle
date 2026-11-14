@@ -66,6 +66,30 @@ pub(crate) unsafe fn try_begin_on_stream(stream: &CudaStream) -> Result<bool> {
     begun.map(|()| true)
 }
 
+/// Run `f` with this thread's capture mode relaxed, restoring it after.
+///
+/// For a host call that reads a fence recorded outside any capture — a
+/// `cuEventQuery`, a `cuEventSynchronize` — made from a thread that may be
+/// recording one. Under the `ThreadLocal` mode every capture here is begun in,
+/// the driver refuses both (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) and
+/// invalidates the thread's open capture, though neither touches its stream;
+/// relaxed, both answer and the capture records on
+/// (`graph::tests::a_fence_wait_inside_a_capture`). The call must not issue
+/// work on a capturing stream: the mode decides what is refused, not what is
+/// recorded.
+pub fn relaxed<R>(f: impl FnOnce() -> R) -> R {
+    let mut mode = sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED;
+    // SAFETY: exchanges this thread's mode for `mode`, writing the old one back.
+    let swapped =
+        unsafe { sys::cuThreadExchangeStreamCaptureMode(&mut mode) } == sys::CUresult::CUDA_SUCCESS;
+    let out = f();
+    if swapped {
+        // SAFETY: as above, putting the thread's own mode back.
+        unsafe { sys::cuThreadExchangeStreamCaptureMode(&mut mode) };
+    }
+    out
+}
+
 /// End the capture [`begin`] started on `stream`, and count it out of the gate
 /// whether or not the driver hands back a graph.
 ///

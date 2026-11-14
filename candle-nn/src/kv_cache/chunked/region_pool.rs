@@ -4858,6 +4858,43 @@ mod tests {
         Ok(())
     }
 
+    /// **A take inside a recording forward keeps the forward's capture.** A
+    /// take reads the fences of the ranges given back before it, and the
+    /// driver refuses a fence read on a thread that is capturing and
+    /// invalidates the capture: on BlackWorld the first take of a decode after
+    /// a give-back lost the wave at every boot. Given back, then taken twice
+    /// inside a wave capture — once with room, once past the room so the take
+    /// waits out the oldest fence — the segment still records and ends.
+    #[test]
+    fn a_take_inside_a_capture_keeps_it() -> Result<()> {
+        let _serial = serial();
+        let Ok(Device::Cuda(dev)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let s = dev.cuda_stream();
+        let held = own_held_ground();
+        let site = Location::caller();
+        held.provision(&dev);
+        let room = held.stats().largest_free;
+        let given = held.take(room, site).expect("the ground's widest range");
+        held.give_back(given, &s);
+
+        let capture = dev.begin_wave_capture()?;
+        dev.record_launches()?;
+        let small = held.take(64, site);
+        let past = held.take(room, site);
+        assert!(
+            dev.recording_segment().is_some(),
+            "the segment still records after the takes"
+        );
+        capture.finish()?;
+        for ptr in [small, past].into_iter().flatten() {
+            held.give_back(ptr, &s);
+        }
+        s.synchronize().map_err(candle::Error::wrap)?;
+        Ok(())
+    }
+
     /// Once a window of quiet provisionings has passed, every idle arena has
     /// gone back to the span but the one keeping the region in hand: the
     /// headroom is arena ground, never the bootstrap's slack.

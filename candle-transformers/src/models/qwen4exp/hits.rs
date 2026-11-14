@@ -644,14 +644,20 @@ pub fn count_hits(
 
     // Words name the counters' addresses, so a table built for other
     // counters — a redeclaration — never matches.
-    let fresh = match table {
-        Some((cached, _)) => *cached != words,
-        None => true,
-    };
-    if fresh {
-        let t = held_empty((n_spans, HIT_SPAN_WORDS), DType::U32, device)?;
-        upload_into(&t, &words)?;
-        *table = Some((words, t));
+    // A table of the same width is refilled in place: the copy is ordered
+    // behind every launch that read the old words, so a wave that changes its
+    // spans takes no fresh ground and gives none back.
+    match table {
+        Some((cached, _)) if *cached == words => {}
+        Some((cached, t)) if cached.len() == words.len() => {
+            upload_into(t, &words)?;
+            *cached = words;
+        }
+        _ => {
+            let t = held_empty((n_spans, HIT_SPAN_WORDS), DType::U32, device)?;
+            upload_into(&t, &words)?;
+            *table = Some((words, t));
+        }
     }
     let Some((_, table)) = table.as_ref() else {
         candle::bail!("qsa hits: span table missing after upload");
