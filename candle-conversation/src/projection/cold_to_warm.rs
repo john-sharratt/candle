@@ -8,7 +8,7 @@
 //! read from the log and rebuilt in host RAM, one layer at a time, and
 //! installed as the residence's warm copy. Nothing touches the device.
 //!
-//! Best-effort by design: a turn already warm or hot, or retired, is skipped, a turn the
+//! Best-effort by design: a turn already warm or hot, or retired, is skipped; a turn the
 //! log cannot read is passed over with a warning, and once `room` bytes are
 //! spent the rest of the list is dropped. The caller asks again later.
 
