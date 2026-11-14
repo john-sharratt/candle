@@ -939,7 +939,10 @@ done before step 3.
    /v1/substrate/npcd/objects/import` with every member's exports, then `POST /v1/npcs/import`
    with the cast's; restart motherd through keep once so the characters
    spawn. These are admin HTTP calls to the member's own port, so they need
-   none of the OAuth tokens they restore. Read each import's answer: every
+   none of the OAuth tokens they restore — only an admin's identity, from a
+   peer the member believes (its gateway's address). Each route reads a body
+   of up to `IMPORT_BODY_LIMIT` (8 GiB): one member's zend export alone was
+   634 MB. Read each import's answer: every
    key written, none left as it was. A key left as it was means something was
    written between the start and the import (a sign-in, a thread) and is
    reported for a decision.

@@ -11,6 +11,17 @@ use crate::persistence::record::CustomObjectPayload;
 
 use super::union::Union;
 
+/// The largest import body a daemon's route accepts: every member's export of
+/// a whole store in one request. One member's zend export was 634 MB on
+/// BlackWorld (2026-11-14, 17,916 objects and 3,761 blobs) — past the HTTP
+/// layer's 2 MB default, which refused it — and a union carries one per member.
+pub const IMPORT_BODY_LIMIT: usize = 8 << 30;
+
+/// BlackWorld's zend export, in bytes: a body of two members' exports at that
+/// size fits the limit.
+const MEASURED_EXPORT: usize = 634_228_629;
+const _: () = assert!(2 * MEASURED_EXPORT < IMPORT_BODY_LIMIT);
+
 /// What an import did.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct ImportReport {

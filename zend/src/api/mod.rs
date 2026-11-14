@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::middleware;
+use candle_conversation::persistence::kept_objects::IMPORT_BODY_LIMIT;
 use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror};
 use host::guard::{delete, get, post, put, Api, Guarded, Routes};
 use mcp_server::http as mcp_http;
@@ -152,7 +153,7 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             "/v1/substrate/zend/objects/import",
             Role::Admin,
             Dispatch::Any,
-            post(kept_objects::import),
+            post(kept_objects::import).body_limit(IMPORT_BODY_LIMIT),
         )
         // A dialogue's approvals, settled by its person (`docs/zen_tool_reach.md`
         // §5): records in the substrate, so any member reads and runs one.
