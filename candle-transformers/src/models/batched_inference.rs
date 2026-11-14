@@ -76,6 +76,11 @@ use crate::models::speculative_choice::{
 use crate::models::verify_wave::{issue_verify_wave, upload_plan_rows, VerifyPlan};
 #[cfg(feature = "cuda")]
 use candle::wave_provenance::WaveTicket;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::GapCycle;
+
+#[cfg(feature = "cuda")]
+mod gap;
 
 /// One R16 chunk's unpacked contents: `(block_idx, k_flat, v_flat, q_flat)`.
 ///
@@ -671,6 +676,10 @@ pub struct BatchedInferenceSession {
     stencil_rows: usize,
     /// The draft walk's token buffer — see [`Self::walk_tokens`].
     walk_tokens: Option<Tensor>,
+    /// The gap quantize's state from one gap to the next, made at the first
+    /// gap of a session that quantizes — see `gap`.
+    #[cfg(feature = "cuda")]
+    gap: Option<GapCycle>,
 }
 
 /// Per-slot reprojection-glue descriptor staged on the session for one gap-fill
@@ -753,6 +762,8 @@ impl BatchedInferenceSession {
             accept_in_place: false,
             stencil_rows: 0,
             walk_tokens: None,
+            #[cfg(feature = "cuda")]
+            gap: None,
         })
     }
 
@@ -864,6 +875,8 @@ impl BatchedInferenceSession {
             accept_in_place: false,
             stencil_rows: 0,
             walk_tokens: None,
+            #[cfg(feature = "cuda")]
+            gap: None,
         }
     }
 
@@ -932,6 +945,37 @@ impl BatchedInferenceSession {
     /// Returns `None` for uniform / non-compression modes.
     pub fn compression_policy(&self) -> Option<CompressionPolicy> {
         self.config.compression_policy()
+    }
+
+    /// The policy the session's seals run under, or `None` when it does not
+    /// quantize (F16/BF16): its compression level's adaptive policy, or for a
+    /// fixed-format mode (Q8_0, Q4_0, …) a uniform override of that format on
+    /// both sides. The override's level only feeds candidate scaffolding the
+    /// override bypasses.
+    pub fn seal_policy(&self) -> Option<CompressionPolicy> {
+        if let Some(p) = self.compression_policy() {
+            return Some(p);
+        }
+        let k_fmt = self.config.k_format.as_quant()?;
+        let v_fmt = self.config.v_format.as_quant().unwrap_or(k_fmt);
+        Some(
+            CompressionPolicy::new_with_error_threshold_factors(5, 1.0, 1.0, 1.0, 1.0)
+                .with_override_k_quant(Some(k_fmt))
+                .with_override_v_quant(Some(v_fmt)),
+        )
+    }
+
+    /// Each layer's seal policy under `session`: the session's, or for a layer
+    /// capped below it ([`Self::cap_layer_seal_level`]) its cap's.
+    pub fn layer_seal_policies(&self, session: &CompressionPolicy) -> Vec<CompressionPolicy> {
+        (0..self.backings.len())
+            .map(|layer_idx| {
+                self.layer_seal_cap[layer_idx]
+                    .filter(|&cap| self.config.compression_level.is_some_and(|l| cap < l))
+                    .and_then(|cap| self.config.compression_policy_at(cap))
+                    .unwrap_or(*session)
+            })
+            .collect()
     }
 
     /// Get the device the session is on.
@@ -2073,31 +2117,7 @@ impl BatchedInferenceSession {
         // re-inject + fresh writer) — only the quantize step is skipped. This is
         // what keeps repeated prefills from leaving phantom empty chunks behind
         // for float modes (which the quantized path already collapses).
-        let policy: Option<CompressionPolicy> = match self.compression_policy() {
-            Some(p) => Some(p),
-            None => {
-                // Legacy uniform-quant modes (Q8_0, Q4_0, …) carry no
-                // compression_level but a fixed Quantized K/V format. Drive the
-                // quantizer with a forced uniform override so they still
-                // compress to that format. The level (5) only feeds the
-                // discarded candidate scaffolding — both overrides bypass
-                // per-block selection entirely.
-                match self.config.k_format.as_quant() {
-                    Some(k_fmt) => {
-                        let v_fmt = self.config.v_format.as_quant().unwrap_or(k_fmt);
-                        Some(
-                            CompressionPolicy::new_with_error_threshold_factors(
-                                5, 1.0, 1.0, 1.0, 1.0,
-                            )
-                            .with_override_k_quant(Some(k_fmt))
-                            .with_override_v_quant(Some(v_fmt)),
-                        )
-                    }
-                    // Uncompressed (F16/BF16): no quantization, but still seal.
-                    None => None,
-                }
-            }
-        };
+        let policy: Option<CompressionPolicy> = self.seal_policy();
         let copy_stream = match &self.device {
             Device::Cuda(d) => d.cuda_stream(),
             _ => return Ok(timing),
@@ -2195,14 +2215,7 @@ impl BatchedInferenceSession {
 
         if let Some(session_policy) = policy.as_ref() {
             // Resolve each layer's policy once, then bucket layers by it.
-            let layer_policies: Vec<CompressionPolicy> = (0..self.backings.len())
-                .map(|layer_idx| {
-                    self.layer_seal_cap[layer_idx]
-                        .filter(|&cap| self.config.compression_level.is_some_and(|l| cap < l))
-                        .and_then(|cap| self.config.compression_policy_at(cap))
-                        .unwrap_or(*session_policy)
-                })
-                .collect();
+            let layer_policies: Vec<CompressionPolicy> = self.layer_seal_policies(session_policy);
             let mut groups: Vec<(CompressionPolicy, Vec<usize>)> = Vec::new();
             for (layer_idx, lp) in layer_policies.iter().enumerate() {
                 match groups

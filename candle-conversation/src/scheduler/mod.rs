@@ -52,6 +52,7 @@ mod hit_density;
 mod idle_wait;
 mod injected_piece;
 mod interleave;
+mod kv_gap;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
 pub mod memory_report;
@@ -3526,6 +3527,8 @@ pub(crate) struct Scheduler {
     /// The pool shape the last KV compaction pass failed to improve, which holds
     /// the gate shut until that shape changes. See [`compaction_stall`].
     kv_compaction_stall: compaction_stall::CompactionStall,
+    /// What the gap quantize did this second, for the `kv_gap` line.
+    kv_gap: kv_gap::KvGapLine,
     /// Forwards this wave iteration has run, of either kind.
     ///
     /// The divisor for the loop's per-forward overhead: a wave's non-forward wall clock
@@ -4305,6 +4308,7 @@ impl Scheduler {
             norm_warm: NormWarm::default(),
             last_kv_compaction: None,
             kv_compaction_stall: compaction_stall::CompactionStall::default(),
+            kv_gap: kv_gap::KvGapLine::default(),
             wave_forwards: 0,
             wave_overhead_us: 0,
             wave_rate: None,

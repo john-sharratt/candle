@@ -769,9 +769,17 @@ Line numbers are as of commit `dc04b62ac`.
   (`scheduler/prefill.rs:1249`).
 - `candle-conversation/src/scheduler/decode.rs` (the rollback, around `:860`
   and `:1051`): the table is built after it.
-- `batched_inference.rs:2361`: the session's gap entry beside
-  `create_deferred_arenas`.
-- The `kv_gap` line, in a file of its own under `candle-conversation/src/scheduler/`.
+- `candle-nn/src/kv_cache/chunked/gap/cycle.rs`, `GapCycle`: the gap's state
+  from one gap to the next and its two calls, `catch_up` and `quantize`
+  (`gap_take` cuts each sequence's take to the gap's room).
+- `candle-transformers/src/models/batched_inference/gap.rs`: the session's
+  `gap_catch_up` and `gap_quantize` over every live sequence, each layer under
+  `layer_seal_policies` — the per-layer policies `quantize_and_seal_sequences`
+  resolves too, through the same `seal_policy` — and no gap for a session that
+  does not quantize, a head_dim the convert has no record for, or the
+  single-latent layout. A table holds `GAP_MAX_JOBS` (16,384) jobs.
+- The `kv_gap` line, `candle-conversation/src/scheduler/kv_gap.rs`: summed per
+  second and written while gaps run.
 - `batch_test/utils.rs:2056`, `:2195`, `batch_test/fidelity.rs:147` and
   `quantized_qwen38_moe.rs:1867`: every caller of `quantize_and_seal_sequences`
   moves to the gap call.

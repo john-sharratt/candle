@@ -6,7 +6,9 @@ use super::*;
 use crate::substrate::residence::{drain_reclaimed, own_device_frees};
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
 use candle::DeviceLocation;
-use candle_nn::kv_cache::{is_span_full, is_tier_refusal, set_kv_free_target, set_prompts_waiting};
+use candle_nn::kv_cache::{
+    is_span_full, is_tier_refusal, set_kv_free_target, set_prompts_waiting, GapKind,
+};
 use flume::RecvTimeoutError;
 use std::process::exit;
 use std::sync::atomic::AtomicU64;
@@ -1360,6 +1362,19 @@ impl Scheduler {
             // the reserves are made protected; compaction's empty sweep, run after,
             // cannot take back what was just made for a demand that has not filled it
             // (`docs/kv_drain_under_pressure.md` §2).
+            // **The gap quantize's catch-up comes first** (`docs/kv_quantize_in_the_gap.md`
+            // §3): the last gap's converted blocks go in place and its lease goes back
+            // to the pools, so the arena creation and compaction below see every slot
+            // the lease no longer needs.
+            let t_gap = Instant::now();
+            match self.session.gap_catch_up() {
+                Ok(c) => self.kv_gap.caught_up(&c),
+                Err(e) => tracing::warn!(
+                    target: "candle_conversation::scheduler::kv_gap",
+                    "gap catch-up failed: {e}"
+                ),
+            }
+            self.kv_gap.spent(t_gap.elapsed());
             match self.session.create_deferred_arenas() {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(
@@ -1375,6 +1390,29 @@ impl Scheduler {
                 // pass costs when it runs. The phase breakdown is filed inside.
                 let _g = super::profile::span("loop:compact_kv");
                 self.compact_kv_if_fragmented();
+            }
+            // **Then this gap's quantize**, over every complete block the wave's
+            // forwards left — after compaction, so its lease is allocated over the
+            // packed pools, the lowest-placed arenas first. A wave that ran prefill or
+            // ingest is a prefill gap: its K/V compresses differently from decode's,
+            // and the two keep their shares apart.
+            {
+                let _g = super::profile::span("loop:kv_gap");
+                let t_gap = Instant::now();
+                let kind = if self.prefill_width() > 0 || self.section_ingest_width() > 0 {
+                    GapKind::Prefill
+                } else {
+                    GapKind::Decode
+                };
+                match self.session.gap_quantize(kind) {
+                    Ok(q) => self.kv_gap.quantized(&q),
+                    Err(e) => tracing::warn!(
+                        target: "candle_conversation::scheduler::kv_gap",
+                        "gap quantize failed: {e}"
+                    ),
+                }
+                self.kv_gap.spent(t_gap.elapsed());
+                self.kv_gap.flush_due(Instant::now());
             }
 
             // Flush the wave summary + phase breakdown if its 2 s window
