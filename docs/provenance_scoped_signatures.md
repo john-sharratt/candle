@@ -208,16 +208,35 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
 - **Declared per layer.** A layer opts in with a `calibrate:` block — how many
   questions, the decode budget of each question's thinking (`think`), and the
   prompt that asks for them (`<<n>>`, `<<subject>>`, `<<file>>`, `<<repo>>`,
-  `<<path>>`). Nothing names a layer; `code_reading` and the three analyses of
-  a file (`dependency_analysis`, `code_review`, `security_review`, each asked
-  about what its own analysis answers) declare 24 questions and 64 thinking
-  tokens — one projection's worth: a turn's first
-  reprojection fires by the 64-token cadence, so the probe that decides what
-  is pulled in has seen at most that much of the model's thinking.
+  `<<path>>`). Nothing names a layer; `code_reading` declares 64 thinking
+  tokens — one projection's worth: a turn's first reprojection fires by the
+  64-token cadence, so the probe that decides what is pulled in has seen at
+  most that much of the model's thinking.
+- **As many questions as the unit has to be asked about.** The count is a
+  rule, not a number: one question per `per_tokens` of the unit's own sealed
+  tokens, held to `min..=max` (`calibrate/count.rs`); `code_reading` asks one
+  per 250 tokens, 8 to 64. A file defining forty things has forty names to
+  be asked about, and a ten-line module a few — one count for both left the
+  first with most of its names unasked and the second rephrasing itself.
+  The sealed tokens are what the ingest actually read, and the same on every
+  member, since a unit is calibrated only once it holds every turn. The
+  marker digests the rule, not the count, so a unit's count follows from the
+  rule and the content its key names. Over BlackWorld's 6,533 readings
+  (2026-11-15: median 2,815 tokens, p90 11,568) the rule asks 126k questions
+  against a flat 24's 157k — median 12, p90 47, the 409 largest at 64.
+  More exemplars give a unit more windows to win votes with in its
+  competition; the per-child background (`docs/provenance_score_normalization.md`)
+  is what takes a case's base rate out of its vote.
 - **Written by the unit.** Each unit is asked in a draft forked from its
   layer's base with the unit as its lineage — so it writes its questions with
   its whole content in front of it — without reasoning or tools. The draft is
   tombstoned once its answer is read; one question per line is kept.
+- **Diverse by how they are asked for.** Each question is an exemplar the
+  unit votes with, and a rephrasing takes a second window to vote the same
+  probes twice — so the prompt asks for each question to be about something
+  the others are not, a different name or a different thing about it, and
+  never a rewording. Variety is the writer's to get right, not a filter's to
+  enforce after the decode was paid for.
 - **Thought about as a live turn is.** A live probe is the trailing window of
   what the model decodes, and for most of a turn that is its own thinking,
   which no question exemplar resembles. Each question is asked again alone —

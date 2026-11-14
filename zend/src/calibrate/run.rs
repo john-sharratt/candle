@@ -69,8 +69,9 @@ pub const DRAFT_KEY: &str = "calibration_draft";
 pub const TAG: &str = "calibration";
 
 /// Decode budget for a draft's answer: room for the questions, which are
-/// asked for without reasoning.
-const DRAFT_MAX_TOKENS: usize = 2048;
+/// asked for without reasoning — up to [`super::spec::MAX_QUESTIONS`] of them,
+/// a developer's question naming what it asks about running to ~40 tokens.
+const DRAFT_MAX_TOKENS: usize = 4096;
 
 /// On a unit, the marker its calibration last failed under and how many times.
 const FAILED_KEY: &str = "calibration_failed";
@@ -451,13 +452,18 @@ fn calibrate_one(
     unit: &Unit,
 ) -> anyhow::Result<()> {
     let permit_wait_ms = draft_permit.as_ref().map_or(0, |(_, waited)| *waited);
+    let tokens = engine
+        .conversation()
+        .read()
+        .timeline_token_total(unit.timeline);
+    let wanted = spec.questions.for_tokens(tokens);
     let (asked, draft_ms) = {
         let _draft = draft_permit;
         let t_draft = Instant::now();
-        let asked = draft(engine, spec, base, unit)?;
+        let asked = draft(engine, spec, base, unit, wanted)?;
         (asked, t_draft.elapsed().as_millis() as u64)
     };
-    let found = questions(&asked, spec.questions);
+    let found = questions(&asked, wanted);
     if found.is_empty() {
         let opening: String = asked.chars().take(160).collect();
         anyhow::bail!("{NO_QUESTION} ({} chars: {opening:?})", asked.len());
@@ -479,6 +485,8 @@ fn calibrate_one(
         target: "zend::calibrate",
         layer = %spec.layer,
         subject = %unit.subject,
+        tokens,
+        wanted,
         questions = found.len(),
         permit_wait_ms,
         draft_ms,
@@ -593,13 +601,15 @@ fn thoughts(
     thought
 }
 
-/// The unit's answer to its layer's calibration prompt, asked in a draft
-/// whose lineage is the unit; the draft is tombstoned either way.
+/// The unit's answer to its layer's calibration prompt, asking for `wanted`
+/// questions, in a draft whose lineage is the unit; the draft is tombstoned
+/// either way.
 fn draft(
     engine: &ConversationEngine,
     spec: &CalibrateSpec,
     base: &Sequence,
     unit: &Unit,
+    wanted: usize,
 ) -> anyhow::Result<String> {
     on_a_draft(
         engine,
@@ -625,7 +635,7 @@ fn draft(
                 ..Default::default()
             };
             let handle = conv
-                .submit_turn_with_options(spec.prompt_for(&unit.subject), options)
+                .submit_turn_with_options(spec.prompt_for(&unit.subject, wanted), options)
                 .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
             let resp = handle
                 .wait_cancellable(crate::ingest_cancel::token())
@@ -678,6 +688,7 @@ pub(super) fn on_a_draft<T>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::count::QuestionCount;
     use super::*;
     use candle_conversation::projection::{Conversation, LayerId};
     use candle_conversation::substrate::TurnPartWrite;
@@ -705,7 +716,11 @@ mod tests {
         let group = GroupId::from_raw(1).unwrap();
         let spec = CalibrateSpec {
             layer: "code_reading".into(),
-            questions: 4,
+            questions: QuestionCount {
+                per_tokens: 250,
+                min: 4,
+                max: 4,
+            },
             think: 64,
             prompt: "ask".into(),
             guidance: None,

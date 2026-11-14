@@ -9928,6 +9928,7 @@ mod projection_schema_tests {
     /// per-axis split).
     #[test]
     fn embedded_schema_carries_the_working_set_config() {
+        use crate::calibrate::count::QuestionCount;
         use crate::calibrate::CalibrateSpec;
         use candle_conversation::projection::{ScanCases, SystemPromptItem};
         use candle_conversation::provenance::FusionMode;
@@ -9993,7 +9994,17 @@ mod projection_schema_tests {
         let calibrate = CalibrateSpec::of(layer("code_reading"))
             .unwrap()
             .expect("code_reading declares a calibration");
-        assert_eq!((calibrate.questions, calibrate.think), (24, 64));
+        assert_eq!(
+            (calibrate.questions, calibrate.think),
+            (
+                QuestionCount {
+                    per_tokens: 250,
+                    min: 8,
+                    max: 64
+                },
+                64
+            )
+        );
         assert!(calibrate.prompt.contains("<<path>>"));
 
         let ws = layer("dialogue")

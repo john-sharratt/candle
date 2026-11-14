@@ -6,7 +6,7 @@
 //! ```yaml
 //! - name: code_reading
 //!   calibrate:
-//!     questions: 24
+//!     questions: { per_tokens: 250, min: 8, max: 64 }
 //!     think: 64
 //!     prompt: |
 //!       Write <<n>> questions someone might ask whose answer needs `<<path>>` …
@@ -20,6 +20,8 @@ use candle_conversation::projection::{Draws, LayerSchema};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use super::count::QuestionCount;
+
 /// The most questions one unit may be asked for. Each is one turn of one
 /// prefill, and the calibration's K/V is held lossless until it seals.
 pub const MAX_QUESTIONS: usize = 64;
@@ -31,7 +33,7 @@ pub const MAX_THINK: usize = 256;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
-    questions: usize,
+    questions: QuestionCount,
     think: usize,
     prompt: String,
     /// What a unit a drawing group of the layer draws is asked instead.
@@ -44,8 +46,8 @@ struct Raw {
 pub struct CalibrateSpec {
     /// The layer's name.
     pub layer: String,
-    /// How many questions each unit is asked to write.
-    pub questions: usize,
+    /// How many questions each unit is asked to write, by its size.
+    pub questions: QuestionCount,
     /// The decode budget of each question's thinking ([`super::thinking`]).
     pub think: usize,
     /// What it is asked, with `<<n>>`, `<<subject>>`, and for a file subject
@@ -74,12 +76,8 @@ impl CalibrateSpec {
         };
         let raw: Raw = serde_yaml::from_value(value.clone())
             .map_err(|e| anyhow::anyhow!("layer '{}': its `calibrate:` block: {e}", layer.name))?;
-        if raw.questions == 0 || raw.questions > MAX_QUESTIONS {
-            anyhow::bail!(
-                "layer '{}': `calibrate.questions` must be 1..={MAX_QUESTIONS}, not {}",
-                layer.name,
-                raw.questions
-            );
+        if let Some(why) = raw.questions.invalid() {
+            anyhow::bail!("layer '{}': `calibrate.questions`: {why}", layer.name);
         }
         if raw.think == 0 || raw.think > MAX_THINK {
             anyhow::bail!(
@@ -129,20 +127,22 @@ impl CalibrateSpec {
         }
     }
 
-    /// The prompt for the unit whose subject is `subject` — a file's
-    /// workspace-relative path, its repository first, or a day.
-    pub fn prompt_for(&self, subject: &str) -> String {
-        fill(self.template_for(subject), self.questions, subject)
+    /// The prompt asking the unit whose subject is `subject` — a file's
+    /// workspace-relative path, its repository first, or a day — for
+    /// `questions` questions ([`QuestionCount::for_tokens`]).
+    pub fn prompt_for(&self, subject: &str, questions: usize) -> String {
+        fill(self.template_for(subject), questions, subject)
     }
 
     /// The calibration marker of the unit committed under `content_key`, whose
     /// subject is `subject`: the layer, a digest of what it is asked, and the
-    /// unit's own key — so a changed prompt, question count, thinking budget
-    /// or unit version calibrates again, and a changed guidance prompt only
-    /// the units asked it.
+    /// unit's own key — so a changed prompt, question-count rule, thinking
+    /// budget or unit version calibrates again, and a changed guidance prompt
+    /// only the units asked it. The unit's own count is not in it: it follows
+    /// from the rule and the content the key names.
     pub fn marker(&self, content_key: &str, subject: &str) -> String {
         let mut h = Sha256::new();
-        h.update(self.questions.to_le_bytes());
+        self.questions.digest_into(&mut h);
         h.update(self.think.to_le_bytes());
         h.update([0u8]);
         h.update(self.template_for(subject).as_bytes());
@@ -183,10 +183,16 @@ mod tests {
     use super::*;
     use candle_conversation::projection::{Builder, GroupId};
 
+    const RULE: QuestionCount = QuestionCount {
+        per_tokens: 250,
+        min: 3,
+        max: 12,
+    };
+
     fn spec() -> CalibrateSpec {
         CalibrateSpec {
             layer: "code_reading".into(),
-            questions: 3,
+            questions: RULE,
             think: 64,
             prompt: "<<n>> about `<<path>>` in <<repo>> (<<file>>, <<subject>>)".into(),
             guidance: None,
@@ -213,16 +219,16 @@ mod tests {
     fn a_drawn_unit_is_asked_the_guidance_prompt() {
         let s = with_guidance();
         assert_eq!(
-            s.prompt_for("candle/mcp/src/guides/deploy.md"),
+            s.prompt_for("candle/mcp/src/guides/deploy.md", 3),
             "3 a worker asks itself before `mcp/src/guides/deploy.md`"
         );
         assert_eq!(
-            s.prompt_for("journals/groups/zen/README.md"),
+            s.prompt_for("journals/groups/zen/README.md", 3),
             "3 about `groups/zen/README.md` in journals \
              (journals/groups/zen/README.md, journals/groups/zen/README.md)"
         );
         assert_eq!(
-            s.prompt_for("candle/docs/paper.md"),
+            s.prompt_for("candle/docs/paper.md", 3),
             "3 about `docs/paper.md` in candle (candle/docs/paper.md, candle/docs/paper.md)"
         );
     }
@@ -243,12 +249,12 @@ mod tests {
     #[test]
     fn a_prompt_names_its_count_and_subject() {
         assert_eq!(
-            spec().prompt_for("candle/docs/paper.md"),
-            "3 about `docs/paper.md` in candle (candle/docs/paper.md, candle/docs/paper.md)"
+            spec().prompt_for("candle/docs/paper.md", 12),
+            "12 about `docs/paper.md` in candle (candle/docs/paper.md, candle/docs/paper.md)"
         );
     }
 
-    /// The marker changes with the prompt, the count and the unit, and is
+    /// The marker changes with the prompt, the count rule and the unit, and is
     /// read back as the layer's; another layer's is not.
     #[test]
     fn a_marker_follows_what_is_asked_and_of_which_unit() {
@@ -259,7 +265,7 @@ mod tests {
         assert_eq!(s.marker("k1", at), m);
         assert_ne!(s.marker("k2", at), m);
         let mut more = s.clone();
-        more.questions = 4;
+        more.questions.per_tokens = 200;
         assert_ne!(more.marker("k1", at), m);
         let mut longer = s.clone();
         longer.think = 128;
@@ -312,34 +318,57 @@ layers:
 
     #[test]
     fn a_block_is_read_and_a_bad_one_refused() {
-        let block = |questions: usize, think: &str, prompt: &str| {
+        let block = |questions: &str, think: &str, prompt: &str| {
             layer(&format!(
                 "    calibrate:\n      questions: {questions}\n{think}      prompt: \"{prompt}\""
             ))
         };
-        let ok = block(24, "      think: 192\n", "ask <<n>>");
+        let rule = "{ per_tokens: 250, min: 8, max: 64 }";
+        let ok = block(rule, "      think: 192\n", "ask <<n>>");
         let s = CalibrateSpec::of(&ok).unwrap().expect("declared");
         assert_eq!(
             (s.layer.as_str(), s.questions, s.think),
-            ("code_reading", 24, 192)
+            (
+                "code_reading",
+                QuestionCount {
+                    per_tokens: 250,
+                    min: 8,
+                    max: 64
+                },
+                192
+            )
         );
         assert!(CalibrateSpec::of(&layer("")).unwrap().is_none());
-        assert!(CalibrateSpec::of(&block(0, "      think: 8\n", "x")).is_err());
-        assert!(CalibrateSpec::of(&block(4, "      think: 0\n", "x")).is_err());
-        assert!(CalibrateSpec::of(&block(4, "      think: 257\n", "x")).is_err());
+        let refused = |questions: &str| {
+            CalibrateSpec::of(&block(questions, "      think: 8\n", "x"))
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            refused("{ per_tokens: 250, min: 0, max: 64 }"),
+            "layer 'code_reading': `calibrate.questions`: `min` must be 1..=`max` (64), not 0"
+        );
         assert!(
-            CalibrateSpec::of(&block(4, "", "x")).is_err(),
+            refused("24").contains("its `calibrate:` block"),
+            "a bare count is no rule"
+        );
+        assert!(refused("{ per_tokens: 250, min: 8 }").contains("its `calibrate:` block"));
+        assert!(CalibrateSpec::of(&block(rule, "      think: 0\n", "x")).is_err());
+        assert!(CalibrateSpec::of(&block(rule, "      think: 257\n", "x")).is_err());
+        assert!(
+            CalibrateSpec::of(&block(rule, "", "x")).is_err(),
             "think is required"
         );
-        assert!(CalibrateSpec::of(&block(4, "      think: 8\n", " ")).is_err());
-        let extra = layer(
-            "    calibrate:\n      questions: 4\n      think: 8\n      prompt: \"x\"\n      tools: []",
-        );
+        assert!(CalibrateSpec::of(&block(rule, "      think: 8\n", " ")).is_err());
+        let extra = layer(&format!(
+            "    calibrate:\n      questions: {rule}\n      think: 8\n      prompt: \"x\"\n      \
+             tools: []"
+        ));
         assert!(CalibrateSpec::of(&extra).is_err());
-        let undrawn = layer(
-            "    calibrate:\n      questions: 4\n      think: 8\n      prompt: \"x\"\n      \
-             guidance_prompt: \"y\"",
-        );
+        let undrawn = layer(&format!(
+            "    calibrate:\n      questions: {rule}\n      think: 8\n      prompt: \"x\"\n      \
+             guidance_prompt: \"y\""
+        ));
         assert!(
             CalibrateSpec::of(&undrawn).is_err(),
             "a guidance prompt with nothing drawn"
@@ -370,7 +399,7 @@ layers:
     budget:
       priority: 40
     calibrate:
-      questions: 4
+      questions: { per_tokens: 250, min: 4, max: 4 }
       think: 8
       prompt: "x"
       guidance_prompt: "y"
