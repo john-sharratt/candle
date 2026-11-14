@@ -8,7 +8,7 @@ use super::admit;
 use super::admit_ground::{joins_a_full_forward, AdmitPass};
 use super::band::rank;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
-use super::creep_slice::{slice_target, time_bounded_layers};
+use super::creep_slice::{slice_target, time_bounded_layers, window_end};
 use super::first_sample::{
     contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
 };
@@ -5325,11 +5325,16 @@ impl Scheduler {
             .iter()
             .map(|t| t.dims().get(1).copied().unwrap_or(0))
             .sum();
+        // A model's draft head runs over every row of the step that completes
+        // the trunk, so its blocks are layers of the sweep: budgeted, cut at by
+        // `window_end`, and counted in what the step teaches the cost.
+        let head = self.model.sweep_head_layers();
+        let left = n - cursor.min(n) + head;
         let budget = if finish_sweep {
-            n - cursor.min(n)
+            left
         } else if head_rows > 0 {
             time_bounded_layers(
-                creep_layer_budget(n, ratio.ceil() as u32).min(n - cursor.min(n)),
+                creep_layer_budget(n, ratio.ceil() as u32).min(left),
                 creep_rows,
                 self.creep_layer_row_cost,
                 self.creep_layer_cost,
@@ -5350,17 +5355,18 @@ impl Scheduler {
             // 8,190-row ingest cohort starting a 2.6 s, 48-layer decode-less
             // step in the gap between two of its turns, and waited it out.
             time_bounded_layers(
-                creep_layer_budget(n, ratio.ceil() as u32).min(n - cursor.min(n)),
+                creep_layer_budget(n, ratio.ceil() as u32).min(left),
                 creep_rows,
                 self.creep_layer_row_cost,
                 self.creep_layer_cost,
                 Some(DECODE_LESS_SLICE),
             )
         };
-        let win_end = (cursor + budget).min(n);
+        let (win_end, head_run) = window_end(cursor.min(n), budget, n, head);
         // What the creep ran this step, for the next slice's cost estimate:
         // beside decode its excess over a decode-only step, alone its whole step.
-        let swept = win_end - cursor.min(win_end);
+        // The head's blocks count as layers the step ran.
+        let swept = win_end - cursor.min(win_end) + head_run;
         self.wave_step_creep_layer_rows = if !seq_ids.is_empty() {
             creep_rows * swept
         } else {

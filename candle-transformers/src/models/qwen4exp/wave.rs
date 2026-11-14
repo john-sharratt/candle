@@ -3247,6 +3247,12 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         flash_next_sweep::TOKEN_COST
     }
 
+    /// The NextN head, when loaded: it runs over every row of a sweep that
+    /// reaches the last trunk layer (`head_wave_pass`).
+    fn sweep_head_layers(&self) -> usize {
+        usize::from(self.model.mtp.is_some())
+    }
+
     /// Draft with the checkpoint's own NextN head, for the whole cohort in one
     /// batched walk ([`super::draft`]).
     fn speculative_draft(

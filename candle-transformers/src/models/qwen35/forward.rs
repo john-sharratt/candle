@@ -226,6 +226,12 @@ impl ManagedBatchedModel for HybridBatched {
         self.draft_token_cost_for()
     }
 
+    /// The NextN/MTP head, when loaded: it runs over every row of a sweep that
+    /// reaches the last trunk layer (`head_wave_pass`).
+    fn sweep_head_layers(&self) -> usize {
+        usize::from(self.has_drafter())
+    }
+
     /// Draft with the checkpoint's own NextN/MTP head ([`super::mtp`]), for the
     /// whole cohort in one batched pass.
     ///

@@ -51,6 +51,35 @@ pub(super) fn slice_target(
     }
 }
 
+/// Where a creep's window ends, and how many head blocks it runs: `budget`
+/// layers on from `cursor` in a sweep of `n` trunk layers whose last also runs
+/// `head` blocks past the trunk (`ManagedBatchedModel::sweep_head_layers`), each
+/// counted as one more layer of the sweep.
+///
+/// **A window that reaches the last trunk layer pays for the head.** The head
+/// runs over every row of the step that completes the trunk, so a slice priced
+/// on trunk layers alone overran by the head's whole pass over the creep's rows:
+/// on BlackWorld (2026-11-15) a 44 ms decode step spent 25 ms in Qwen3.8-Flash-
+/// Next's draft head, 234 experts routed beside a trunk carrying a few decode
+/// rows. So a budget that covers the last trunk layer but not its head stops one
+/// layer short, and the next step carries the last layer and the head together —
+/// unless the last layer is all that is left, which runs with its head whatever
+/// the budget, because a creep always advances.
+pub(super) fn window_end(cursor: usize, budget: usize, n: usize, head: usize) -> (usize, usize) {
+    let budget = budget.max(1);
+    let left = n.saturating_sub(cursor);
+    if left == 0 {
+        return (n, 0);
+    }
+    if budget >= left + head {
+        return (n, head);
+    }
+    if budget >= left {
+        return if left > 1 { (n - 1, 0) } else { (n, head) };
+    }
+    (cursor + budget, 0)
+}
+
 /// The newest step's weight in [`next_layer_row_cost`].
 const COST_WEIGHT: f64 = 0.25;
 
@@ -215,5 +244,35 @@ mod tests {
             Some(first)
         );
         assert_eq!(next_layer_row_cost(None, ms(70), ms(34), 0), None);
+    }
+
+    /// **A window that reaches the last trunk layer has budgeted the head.**
+    /// Flash-Next's 48 trunk layers and one head block: a budget that covers
+    /// the trunk and the head runs both; one that covers the trunk alone stops a
+    /// layer short, leaving the last layer and the head for the next step; and
+    /// a window short of the end is untouched.
+    #[test]
+    fn a_window_reaching_the_trunks_end_pays_for_the_head() {
+        assert_eq!(window_end(40, 9, 48, 1), (48, 1), "trunk and head fit");
+        assert_eq!(window_end(40, 8, 48, 1), (47, 0), "the head does not fit");
+        assert_eq!(window_end(40, 3, 48, 1), (43, 0), "short of the end");
+        assert_eq!(window_end(47, 2, 48, 1), (48, 1), "the last and the head");
+    }
+
+    /// **A creep always advances**: the last trunk layer alone, its budget one,
+    /// still runs with its head; a zero budget is one layer.
+    #[test]
+    fn the_last_layer_runs_with_its_head_whatever_the_budget() {
+        assert_eq!(window_end(47, 1, 48, 1), (48, 1));
+        assert_eq!(window_end(10, 0, 48, 1), (11, 0));
+        assert_eq!(window_end(48, 3, 48, 1), (48, 0), "nothing left to run");
+    }
+
+    /// Without a head the window is the trunk's alone.
+    #[test]
+    fn without_a_head_the_window_is_the_budget() {
+        assert_eq!(window_end(40, 8, 48, 0), (48, 0));
+        assert_eq!(window_end(40, 20, 48, 0), (48, 0));
+        assert_eq!(window_end(40, 3, 48, 0), (43, 0));
     }
 }

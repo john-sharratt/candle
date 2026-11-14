@@ -4631,6 +4631,20 @@ pub trait ManagedBatchedModel {
         0.0
     }
 
+    /// Blocks past the trunk that a sweep reaching its last layer also runs, over
+    /// every row it carries: a draft head with a KV layer of its own runs in the
+    /// same wave over the same rows, so its history stays as long as the sequence
+    /// it drafts for. Zero for a model without one.
+    ///
+    /// The creep slicer counts them as layers of the sweep (`creep_slice`): a
+    /// window that reaches the last trunk layer pays for them too, so the slice
+    /// that does must have budgeted them.
+    ///
+    /// Called once per wave, so it must be cheap and must not touch the device.
+    fn sweep_head_layers(&self) -> usize {
+        0
+    }
+
     /// Draft up to `max_len` speculative next-tokens for **every** sequence in the step's
     /// cohort, each following its own `committed` token, using the model's own drafter (e.g.
     /// an MTP / DSpark head). Proposals only — the caller verifies them and keeps the
