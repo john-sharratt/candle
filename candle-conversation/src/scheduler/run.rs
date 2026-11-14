@@ -1366,10 +1366,12 @@ impl Scheduler {
             // §3): the last gap's converted blocks go in place and its lease goes back
             // to the pools, so the arena creation and compaction below see every slot
             // the lease no longer needs.
-            // **Every span below is timed into its band** — the gap's own calls
-            // into `kv_gap`, the arena creation, compaction and idle demote into
-            // `housekeeping` — so the phase chart names them. Untimed, all of it
-            // fell into the window's remainder and drew as `blocked`.
+            // **Every span below is timed into its band and its census activity**
+            // — the gap's own calls into `quantize`, compaction into
+            // `compaction` / `compact`, the arena creation and idle demote into
+            // `housekeeping` / `compact` — so the phase chart and the census both
+            // name them. Untimed, all of it fell into the window's remainder and
+            // drew as `blocked`.
             let t_gap = Instant::now();
             match self.session.gap_catch_up() {
                 Ok(c) => self.kv_gap.caught_up(&c),
@@ -1380,7 +1382,9 @@ impl Scheduler {
             }
             let caught_up = t_gap.elapsed();
             self.kv_gap.spent(caught_up);
-            self.wave_stats.add_kv_gap(caught_up.as_micros() as u64);
+            self.wave_stats.add_quantize(caught_up.as_micros() as u64);
+            self.step_census
+                .spend(super::step_census::Activity::Quantize, caught_up);
             let t_upkeep = Instant::now();
             match self.session.create_deferred_arenas() {
                 Ok(0) => {}
@@ -1391,6 +1395,9 @@ impl Scheduler {
                 ),
                 Err(e) => tracing::warn!("deferred arena creation failed: {e}"),
             }
+            let arenas = t_upkeep.elapsed();
+            self.wave_stats.add_housekeeping(arenas.as_micros() as u64);
+            let t_compact = Instant::now();
             {
                 // The whole pass, including the gate that usually declines it — so the
                 // table shows what being *considered* every wave costs, not only what a
@@ -1398,8 +1405,10 @@ impl Scheduler {
                 let _g = super::profile::span("loop:compact_kv");
                 self.compact_kv_if_fragmented();
             }
-            self.wave_stats
-                .add_housekeeping(t_upkeep.elapsed().as_micros() as u64);
+            let compacted = t_compact.elapsed();
+            self.wave_stats.add_compaction(compacted.as_micros() as u64);
+            self.step_census
+                .spend(super::step_census::Activity::Compact, arenas + compacted);
             // **Then this gap's quantize**, over every complete block the wave's
             // forwards left — after compaction, so its lease is allocated over the
             // packed pools, the lowest-placed arenas first. A wave that ran prefill or
@@ -1424,8 +1433,10 @@ impl Scheduler {
                 // A turn stored with native chunks — its seal gap short of
                 // ground — is quantized here, one a gap.
                 self.quantize_a_native_residence();
-                self.wave_stats
-                    .add_kv_gap(t_gap.elapsed().as_micros() as u64);
+                let quantized = t_gap.elapsed();
+                self.wave_stats.add_quantize(quantized.as_micros() as u64);
+                self.step_census
+                    .spend(super::step_census::Activity::Quantize, quantized);
                 let t_demote = Instant::now();
                 // **The counterpart to elevate** (`docs/vram_governor_design.md`
                 // §8.1), here between forwards, where every free is ordered
@@ -1435,8 +1446,10 @@ impl Scheduler {
                 // the same bytes. Without it the hot set only grows, and every
                 // shortfall is met by conceding expert-weight ground.
                 self.demote_idle_hot();
-                self.wave_stats
-                    .add_housekeeping(t_demote.elapsed().as_micros() as u64);
+                let demoted = t_demote.elapsed();
+                self.wave_stats.add_housekeeping(demoted.as_micros() as u64);
+                self.step_census
+                    .spend(super::step_census::Activity::Compact, demoted);
                 self.kv_gap.flush_due(Instant::now());
             }
 
@@ -1444,7 +1457,12 @@ impl Scheduler {
             // elapsed — even when no forward ran this iteration, so stalls still
             // surface their phase split.
             if self.wave_stats.due() {
+                let t_flush = Instant::now();
                 self.flush_wave_telemetry();
+                let flushed = t_flush.elapsed();
+                self.wave_stats.add_telemetry(flushed.as_micros() as u64);
+                self.step_census
+                    .spend(super::step_census::Activity::Telemetry, flushed);
             }
             // Closes here, not at end of scope: the livelock guard below can sleep, and a
             // span that swallowed that sleep would report the wave's idle wait as

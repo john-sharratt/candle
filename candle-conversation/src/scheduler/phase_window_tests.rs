@@ -16,27 +16,51 @@ fn bands_of(window_ms: u32) -> Vec<(&'static str, u32)> {
 
 /// **The gap quantize is its own band, carved out of `blocked`.** A 1,237 ms
 /// window that timed 37 ms of gap work and 5 ms of housekeeping, and nothing
-/// else, draws 37 ms of `kv_gap`, 5 ms of `housekeeping` and 1,195 ms of
+/// else, draws 37 ms of `quantize`, 5 ms of `housekeeping` and 1,195 ms of
 /// `blocked` — the remainder nothing named.
 #[test]
 fn the_gap_quantize_is_its_own_band_and_out_of_blocked() {
     let mut w = WaveStats::new();
-    w.add_kv_gap(37_400);
+    w.add_quantize(37_400);
     w.add_housekeeping(5_000);
     w.push_phase_window(1_237);
     let mut bands = bands_of(1_237);
     bands.sort();
     assert_eq!(
         bands,
-        vec![("blocked", 1_195), ("housekeeping", 5), ("kv_gap", 37)]
+        vec![("blocked", 1_195), ("housekeeping", 5), ("quantize", 37)]
     );
 }
 
-/// A window with no gap work draws no `kv_gap` band at all.
+/// **Compaction and the telemetry flush are named apart from housekeeping.**
+/// A 1,241 ms window that timed 12 ms of compaction, 9 ms of the last window's
+/// flush and 5 ms of other housekeeping draws each as its own band, and only
+/// the 1,215 ms nothing timed as `blocked`.
 #[test]
-fn a_window_without_gap_work_draws_no_gap_band() {
+fn compaction_and_the_flush_are_named_apart_from_housekeeping() {
+    let mut w = WaveStats::new();
+    w.add_compaction(12_300);
+    w.add_telemetry(9_100);
+    w.add_housekeeping(5_000);
+    w.push_phase_window(1_241);
+    let mut bands = bands_of(1_241);
+    bands.sort();
+    assert_eq!(
+        bands,
+        vec![
+            ("blocked", 1_215),
+            ("compaction", 12),
+            ("housekeeping", 5),
+            ("telemetry", 9)
+        ]
+    );
+}
+
+/// A window with no gap work draws no `quantize` band at all.
+#[test]
+fn a_window_without_gap_work_draws_no_quantize_band() {
     let mut w = WaveStats::new();
     w.add_housekeeping(5_000);
     w.push_phase_window(1_239);
-    assert!(bands_of(1_239).iter().all(|(kind, _)| *kind != "kv_gap"));
+    assert!(bands_of(1_239).iter().all(|(kind, _)| *kind != "quantize"));
 }

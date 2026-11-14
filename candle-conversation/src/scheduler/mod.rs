@@ -2562,11 +2562,18 @@ struct WaveStats {
     /// Real scheduler work, none of it inside a quantum, and none of it timed
     /// before — so it landed in the unattributed remainder and drew as "blocked".
     housekeeping_us: u64,
-    /// KvGap phase this window: the gap quantize the loop runs between forwards
-    /// — the last gap's catch-up, this gap's launch, and the native residence
-    /// quantized a gap (`docs/kv_quantize_in_the_gap.md`). Outside every quantum,
-    /// so untimed it drew as "blocked". Microseconds, as [`Self::requests_us`].
-    kv_gap_us: u64,
+    /// Quantize phase this window: the K/V quantization the loop runs between
+    /// forwards — the last gap's catch-up, this gap's launch, and the native
+    /// residence quantized a gap (`docs/kv_quantize_in_the_gap.md`). Outside
+    /// every quantum, so untimed it drew as "blocked". Microseconds, as
+    /// [`Self::requests_us`].
+    quantize_us: u64,
+    /// Compaction phase this window: KV pool compaction between forwards,
+    /// drawn apart from the rest of the housekeeping. Microseconds.
+    compaction_us: u64,
+    /// Telemetry phase this window: the previous window's flush, which runs
+    /// after that window closed and so lands in this one. Microseconds.
+    telemetry_us: u64,
     /// Sync phase this window: deliberate GPU/persistence waits ([`WAIT_US`],
     /// swapped in at flush). Carved out of the compute phases + blocked so a
     /// device-sync / hot→warm flush stall is its own band, not hidden decode/prefill.
@@ -2630,7 +2637,9 @@ impl WaveStats {
             idle_ms: 0,
             requests_us: 0,
             housekeeping_us: 0,
-            kv_gap_us: 0,
+            quantize_us: 0,
+            compaction_us: 0,
+            telemetry_us: 0,
             wait_ms: 0,
             maint_ms: 0,
             drain_prefill_ms: 0,
@@ -2722,9 +2731,20 @@ impl WaveStats {
         self.housekeeping_us += us;
     }
 
-    /// Accumulate one gap-quantize span — see [`Self::kv_gap_us`].
-    fn add_kv_gap(&mut self, us: u64) {
-        self.kv_gap_us += us;
+    /// Accumulate one gap-quantize span — see [`Self::quantize_us`].
+    fn add_quantize(&mut self, us: u64) {
+        self.quantize_us += us;
+    }
+
+    /// Accumulate one compaction pass's span — see [`Self::compaction_us`].
+    fn add_compaction(&mut self, us: u64) {
+        self.compaction_us += us;
+    }
+
+    /// Charge the window just begun with the flush that closed the last one —
+    /// see [`Self::telemetry_us`].
+    fn add_telemetry(&mut self, us: u64) {
+        self.telemetry_us += us;
     }
 
     /// Accumulate one scope-ingest seal's sub-step timings (microseconds).
@@ -3115,7 +3135,9 @@ impl WaveStats {
         self.idle_ms = 0;
         self.requests_us = 0;
         self.housekeeping_us = 0;
-        self.kv_gap_us = 0;
+        self.quantize_us = 0;
+        self.compaction_us = 0;
+        self.telemetry_us = 0;
         self.wait_ms = 0;
         self.maint_ms = 0;
         self.drain_prefill_ms = 0;
@@ -3184,7 +3206,9 @@ impl WaveStats {
         let mut housekeeping_dur = carve_ms(self.housekeeping_us / 1000, &mut [&mut blocked_dur]);
         // The gap quantize runs between forwards, outside every quantum, so its
         // time is only ever in the remainder too.
-        let kv_gap_dur = carve_ms(self.kv_gap_us / 1000, &mut [&mut blocked_dur]);
+        let quantize_dur = carve_ms(self.quantize_us / 1000, &mut [&mut blocked_dur]);
+        let compaction_dur = carve_ms(self.compaction_us / 1000, &mut [&mut blocked_dur]);
+        let telemetry_dur = carve_ms(self.telemetry_us / 1000, &mut [&mut blocked_dur]);
 
         // Sealing runs in two places: the compression-turn seal inside
         // HOUSEKEEPING (`complete_compression_turn` → `perform_seal_and_write`,
@@ -3320,8 +3344,14 @@ impl WaveStats {
         if requests_dur > 0 {
             push(&mut phases, PhaseKind::Requests, requests_dur, 0, 0);
         }
-        if kv_gap_dur > 0 {
-            push(&mut phases, PhaseKind::KvGap, kv_gap_dur, 0, 0);
+        if quantize_dur > 0 {
+            push(&mut phases, PhaseKind::Quantize, quantize_dur, 0, 0);
+        }
+        if compaction_dur > 0 {
+            push(&mut phases, PhaseKind::Compaction, compaction_dur, 0, 0);
+        }
+        if telemetry_dur > 0 {
+            push(&mut phases, PhaseKind::Telemetry, telemetry_dur, 0, 0);
         }
         // Drained EVERY window, unconditionally — the sub-timers accumulate on
         // every wave, but the band they decompose is carved out of `blocked`,

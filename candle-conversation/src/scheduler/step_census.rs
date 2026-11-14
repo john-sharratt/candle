@@ -175,9 +175,17 @@ pub(super) enum Activity {
     Warm,
     /// Serving a co-resident model and settling the device on falling idle.
     Device,
+    /// K/V quantization between forwards: the gap's catch-up, its launch and
+    /// the native residence quantized a gap.
+    Quantize,
+    /// The deferred arenas a refused forward asked for, KV compaction, and the
+    /// idle hot→warm demote — the upkeep between forwards.
+    Compact,
+    /// Writing the wave summary and phase breakdown at a window's close.
+    Telemetry,
 }
 
-const ACTIVITIES: [Activity; 17] = [
+const ACTIVITIES: [Activity; 20] = [
     Activity::Drain,
     Activity::Promote,
     Activity::MidAdmit,
@@ -195,6 +203,9 @@ const ACTIVITIES: [Activity; 17] = [
     Activity::Requests,
     Activity::Warm,
     Activity::Device,
+    Activity::Quantize,
+    Activity::Compact,
+    Activity::Telemetry,
 ];
 
 impl Activity {
@@ -217,6 +228,9 @@ impl Activity {
             Activity::Requests => "requests",
             Activity::Warm => "warm",
             Activity::Device => "device",
+            Activity::Quantize => "quantize",
+            Activity::Compact => "compact",
+            Activity::Telemetry => "telemetry",
         }
     }
 
