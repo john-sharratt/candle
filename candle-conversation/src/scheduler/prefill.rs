@@ -2648,6 +2648,7 @@ impl Scheduler {
         if let Err(e) = self.model.claim_carried_state(work.sequence_id.0) {
             return Err(Box::new((work, ConversationError::Model(e))));
         }
+        self.seal_turn_under_its_conversation(work.sequence_id);
         self.begin_prefill(work);
         Ok(())
     }

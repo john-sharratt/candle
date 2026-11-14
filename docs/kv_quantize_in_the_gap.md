@@ -158,7 +158,13 @@ be quantized.
   block sealed under one policy shares them; they never vary block to block.
   Policies differ only where a layer seals at its own level (the MTP draft head,
   `layer_seal_cap`) or a conversation overrides its level or formats
-  (`effective_turn_policy`). The table is grouped by policy and the selection
+  (`effective_turn_policy`). Each sequence carries its seal (`GapSeal`): the
+  scheduler sets it from the conversation's `ConvCompression` when the slot is
+  made, when a view is carved from it and when a turn is admitted
+  (`scheduler/turn_seal.rs`), and each layer takes that policy through its
+  cap. A lossless conversation's sequence is left native and never handed to
+  the gap, and so is a section's: the section attends its own build first, and
+  its seal quantizes it under the section's policy. The table is grouped by policy and the selection
   kernel runs once per group, with the group's thresholds as its scalar launch
   arguments, exactly as the seal groups layers today. A gap normally holds one
   group, so it is one launch; a handful at most. The selection kernel's
@@ -380,13 +386,17 @@ the catch-up. A `ChunkPin` a launch or a generation snapshot took earlier drops
 its own when it is done. The convert that read the band has finished by then,
 so the slot is free for any stream to reuse and no fence is needed.
 
-**A clone made while its gap is outstanding stays native.** A seal or a
-reprojection that clones a block between its gap and its catch-up holds the
-native bands, and is not an owner the catch-up re-points. It reads correctly and
-is merely larger until it is dropped. A sequence is not sealed while it has
-blocks in an outstanding gap; the seal runs after that gap's catch-up, one step
-later. That leaves only a reprojection of a sealed residence's partial block,
-one block a residence at most.
+**The outstanding gap is caught up before its blocks move.** A row names its
+block by sequence and index. A turn's view finalized onto its parent, and a
+view a reprojection snapshots and rebuilds, take those blocks out of the
+sequence the row names, and its catch-up would discard the converted work as
+stale. So the scheduler waits the outstanding gap out and catches it up first:
+at the head of `cleanup_finished` when any turn finished, and before a
+reprojection's `snapshot_sequence_tail` (`scheduler/gap_wait.rs`). The wait is
+the gap's few milliseconds of device work, and only when one is outstanding at
+such a move. A clone made between a gap and its catch-up anywhere else holds
+the native bands and is not an owner the catch-up re-points: it reads
+correctly and is merely larger until it is dropped.
 
 **The bound.** Native K/V standing in VRAM is at most:
 - every live sequence's writer chunk;

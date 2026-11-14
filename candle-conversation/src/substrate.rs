@@ -1835,6 +1835,12 @@ impl Substrate {
         }
     }
 
+    /// `timeline`'s per-conversation compression override, the one each of
+    /// its turn residences is allocated with.
+    pub fn timeline_compression(&self, timeline: TimelineId) -> Option<ConvCompression> {
+        self.timeline_compression.get(&timeline).copied()
+    }
+
     /// Mark whether `timeline`'s turns should be summarised. Set `false` for
     /// append-only utility/reference layers (repo_map, code_reading) so their
     /// turns never enter the summariser's pending queue. Must run after the

@@ -44,7 +44,7 @@ mod summary;
 mod table;
 
 #[cfg(feature = "cuda")]
-pub use cycle::{CatchUpHost, GapCatchUp, GapCycle, GapQuantize, QuantizeHost};
+pub use cycle::{CatchUpHost, GapCatchUp, GapCycle, GapQuantize, GapSeq, QuantizeHost};
 #[cfg(feature = "cuda")]
 pub use demand::GapKind;
 #[cfg(feature = "cuda")]

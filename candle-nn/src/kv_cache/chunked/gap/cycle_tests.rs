@@ -10,22 +10,28 @@ use candle::DType;
 use super::super::compress::band_ptr;
 use super::super::compression_policy::CompressionPolicy;
 use super::super::head_gids::HeadGids;
-use super::cycle::GapCycle;
+use super::cycle::{GapCycle, GapSeq};
 use super::demand::GapKind;
 use super::install_tests::{assert_installed, live, live_bands, Live};
-use super::launch_tests::LAYERS;
+use super::launch_tests::{write_turn, LAYERS};
 use crate::kv_cache::arena_table::ArenaLocation;
-use crate::kv_cache::KvFormat;
+use crate::kv_cache::{KvFormat, QuantFormat};
+
+/// `slot` with every layer under `policy`.
+fn under(slot: usize, policy: &CompressionPolicy) -> Vec<GapSeq> {
+    vec![GapSeq {
+        seq: slot,
+        layer_policy: vec![*policy; LAYERS],
+    }]
+}
 
 /// Run gaps — catch-up, then quantize — until a quantize takes nothing and
 /// none is outstanding, synchronising between them. The gaps it took.
 fn run_until_quiet(cycle: &mut GapCycle, l: &Live, policy: &CompressionPolicy) -> usize {
-    let policies = vec![*policy; LAYERS];
+    let seqs = under(l.slot, policy);
     for gaps in 0..16 {
         cycle.catch_up(&l.layers).unwrap();
-        let q = cycle
-            .quantize(&l.layers, &[l.slot], &policies, GapKind::Prefill)
-            .unwrap();
+        let q = cycle.quantize(&l.layers, &seqs, GapKind::Prefill).unwrap();
         if q.jobs == 0 && !cycle.is_outstanding() {
             return gaps;
         }
@@ -47,6 +53,64 @@ fn a_cycle_quantizes_every_complete_block_as_today() {
         assert_installed(&l, blk);
     }
     assert_eq!(live_bands(&l, 0..3), l.want);
+}
+
+/// Two sequences in one gap, each under its own policy: the adaptive one comes
+/// out as today's seal makes it, the forced one in its forced K format, and a
+/// sequence the gap is not handed stays native.
+#[test]
+fn each_sequence_is_quantized_under_its_own_policy() {
+    let adaptive = CompressionPolicy::new(5);
+    let Some(l) = live(&adaptive) else {
+        return;
+    };
+    let forced = CompressionPolicy::new(5).with_override_k_quant(Some(QuantFormat::Q8_0));
+    let second_slot = |base: u32| -> usize {
+        let slots: Vec<usize> = l
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| write_turn(b, &l.device, (i as u32 + 1) * base))
+            .collect();
+        assert!(slots.iter().all(|&s| s == slots[0]));
+        slots[0]
+    };
+    let other = second_slot(1000);
+    let native = second_slot(3000);
+    let mut seqs = under(l.slot, &adaptive);
+    seqs.extend(under(other, &forced));
+    let mut cycle = GapCycle::new(&l.layers, 1024).unwrap();
+    for _ in 0..16 {
+        cycle.catch_up(&l.layers).unwrap();
+        let q = cycle.quantize(&l.layers, &seqs, GapKind::Prefill).unwrap();
+        if q.jobs == 0 && !cycle.is_outstanding() {
+            break;
+        }
+        cycle.wait().unwrap();
+    }
+    assert_eq!(live_bands(&l, 0..3), l.want);
+    let q8 = KvFormat::Quantized(QuantFormat::Q8_0);
+    for b in &l.layers {
+        let state = b.state.read().unwrap();
+        let seq = state.sequences[other].as_ref().unwrap();
+        for blk in 0..3 {
+            let c = &seq.chunks_slice()[blk];
+            assert!(!c.takes_writes(), "layer {} block {blk}", b.layer_idx);
+            assert!(
+                c.k_fmt.iter().all(|&t| KvFormat::from_tag(t) == Some(q8)),
+                "layer {} block {blk}: K forced to Q8_0",
+                b.layer_idx
+            );
+        }
+        let untouched = state.sequences[native].as_ref().unwrap();
+        for blk in 0..3 {
+            assert!(
+                untouched.chunks_slice()[blk].takes_writes(),
+                "layer {} block {blk}: the sequence left native stays native",
+                b.layer_idx
+            );
+        }
+    }
 }
 
 /// A table smaller than the blocks complete takes what fits and moves the
@@ -72,15 +136,11 @@ fn nothing_is_taken_while_a_gap_is_outstanding() {
     let Some(l) = live(&policy) else {
         return;
     };
-    let policies = vec![policy; LAYERS];
+    let seqs = under(l.slot, &policy);
     let mut cycle = GapCycle::new(&l.layers, LAYERS).unwrap();
-    let first = cycle
-        .quantize(&l.layers, &[l.slot], &policies, GapKind::Prefill)
-        .unwrap();
+    let first = cycle.quantize(&l.layers, &seqs, GapKind::Prefill).unwrap();
     assert_eq!(first.jobs, LAYERS);
-    let again = cycle
-        .quantize(&l.layers, &[l.slot], &policies, GapKind::Prefill)
-        .unwrap();
+    let again = cycle.quantize(&l.layers, &seqs, GapKind::Prefill).unwrap();
     assert!(again.outstanding && again.jobs == 0);
     let cursor = l.layers[0].gap_cursor_for_seq(l.slot).unwrap();
     assert_eq!(cursor, 1, "only the first gap's block was taken");
@@ -95,11 +155,9 @@ fn a_block_relocated_under_its_gap_is_quantized_afresh() {
     let Some(l) = live(&policy) else {
         return;
     };
-    let policies = vec![policy; LAYERS];
+    let seqs = under(l.slot, &policy);
     let mut cycle = GapCycle::new(&l.layers, 1024).unwrap();
-    cycle
-        .quantize(&l.layers, &[l.slot], &policies, GapKind::Prefill)
-        .unwrap();
+    cycle.quantize(&l.layers, &seqs, GapKind::Prefill).unwrap();
     // Relocate layer 0's block 1: fresh native slots, its bytes copied over on
     // the device's stream, as a compaction copies.
     let b = &l.layers[0];
@@ -162,9 +220,7 @@ fn a_block_relocated_under_its_gap_is_quantized_afresh() {
             "not installed from old bytes"
         );
     }
-    let next = cycle
-        .quantize(&l.layers, &[l.slot], &policies, GapKind::Prefill)
-        .unwrap();
+    let next = cycle.quantize(&l.layers, &seqs, GapKind::Prefill).unwrap();
     assert_eq!((next.jobs, next.retried), (1, 1));
     cycle.wait().unwrap();
     let last = cycle.catch_up(&l.layers).unwrap();

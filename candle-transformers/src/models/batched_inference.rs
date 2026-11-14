@@ -81,6 +81,9 @@ use candle_nn::kv_cache::GapCycle;
 #[cfg(feature = "cuda")]
 mod gap;
 
+mod gap_seal;
+pub use gap_seal::GapSeal;
+
 #[cfg(test)]
 mod prov_signs_tests;
 
@@ -511,6 +514,8 @@ struct SequenceState {
     /// unadapted conversation differ only in this field. A wave admits one
     /// value of it — see [`BatchedInferenceSession::wave_adapter`].
     adapter: Option<Arc<str>>,
+    /// What the gap quantizes this sequence's complete blocks under.
+    seal: GapSeal,
 }
 
 /// Assemble a [`GlueMeta`] from the wave's per-slot glue descriptors for a
@@ -1014,15 +1019,15 @@ impl BatchedInferenceSession {
         )
     }
 
-    /// Each layer's seal policy under `session`: the session's, or for a layer
-    /// capped below it ([`Self::cap_layer_seal_level`]) its cap's.
-    pub fn layer_seal_policies(&self, session: &CompressionPolicy) -> Vec<CompressionPolicy> {
+    /// Each layer's seal policy under `policy`: `policy`, or for a layer capped
+    /// below its level ([`Self::cap_layer_seal_level`]) its cap's.
+    pub fn layer_seal_policies(&self, policy: &CompressionPolicy) -> Vec<CompressionPolicy> {
         (0..self.backings.len())
             .map(|layer_idx| {
                 self.layer_seal_cap[layer_idx]
-                    .filter(|&cap| self.config.compression_level.is_some_and(|l| cap < l))
+                    .filter(|&cap| cap < policy.compression_level)
                     .and_then(|cap| self.config.compression_policy_at(cap))
-                    .unwrap_or(*session)
+                    .unwrap_or(*policy)
             })
             .collect()
     }
@@ -1103,9 +1108,33 @@ impl BatchedInferenceSession {
             // otherwise. The caller opts in with `set_sequence_adapter` before
             // the sequence's first wave.
             adapter: None,
+            // The session's policy until the caller names the sequence's own
+            // ([`Self::set_sequence_seal`]).
+            seal: GapSeal::Session,
         });
 
         Ok(idx)
+    }
+
+    /// Choose what the gap quantizes `seq_idx`'s complete blocks under: its
+    /// conversation's policy, or none — a lossless conversation's, or a
+    /// section's, whose own seal quantizes it once its build has attended.
+    pub fn set_sequence_seal(&mut self, seq_idx: usize, seal: GapSeal) -> Result<()> {
+        match self.sequences.get_mut(seq_idx).and_then(|s| s.as_mut()) {
+            Some(s) => {
+                s.seal = seal;
+                Ok(())
+            }
+            None => candle::bail!("set_sequence_seal: sequence {seq_idx} is not allocated"),
+        }
+    }
+
+    /// What the gap quantizes `seq_idx` under, `None` for a free slot.
+    pub fn sequence_seal(&self, seq_idx: usize) -> Option<GapSeal> {
+        self.sequences
+            .get(seq_idx)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.seal)
     }
 
     /// Choose the LoRA adapter this sequence decodes through, by name, or
@@ -2435,6 +2464,10 @@ impl BatchedInferenceSession {
             );
         }
         let view_idx = self.create_sequence()?;
+        // The view's turn is its parent's conversation's: it seals alike.
+        if let Some(seal) = self.sequence_seal(parent_idx) {
+            self.set_sequence_seal(view_idx, seal)?;
+        }
         // **All or nothing.** A view that fails part way holds the parent's
         // borrowed blocks on the layers it reached, with no writer opened on the
         // rest — a slot nobody will forward or free, pinning the parent's prefix

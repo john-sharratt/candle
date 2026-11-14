@@ -44,6 +44,7 @@ pub mod exported_state;
 mod first_sample;
 mod gallery_sweep;
 mod gang;
+mod gap_wait;
 mod graph_window;
 mod guest_room;
 mod held_turn;
@@ -96,6 +97,7 @@ mod sweep_forecast;
 mod test_substrate;
 mod turn_airtime;
 mod turn_group;
+mod turn_seal;
 pub mod turn_status;
 mod urgent_hold;
 mod wave_logits;
@@ -7648,6 +7650,7 @@ impl Scheduler {
         if let Some(target) = target {
             self.slot_targets.insert(slot_id, target);
         }
+        self.seal_under_conversation_of(slot_id, slot_id);
 
         tracing::trace!(
             kind = if target.is_some() {
@@ -8217,6 +8220,11 @@ impl Scheduler {
             .filter(|(_, s)| s.finished)
             .map(|(&id, _)| id)
             .collect();
+        // Their views are finalized onto their parents below: the outstanding
+        // gap's rows for their blocks go in place first.
+        if !finished_seq_ids.is_empty() {
+            self.catch_up_outstanding_gap();
+        }
 
         // Three phases, so the turns finishing together close together: every
         // turn's disposition, then one forward of all their closing tails, then
@@ -9006,6 +9014,9 @@ impl Scheduler {
         prefix_section_ids: &[SectionId],
         #[cfg_attr(not(feature = "context-dump"), allow(unused_variables))] tokens: &TokenBuffer,
     ) -> Result<usize, ConversationError> {
+        // A section's blocks stay native until its seal: its build attends
+        // them first.
+        self.seal_section_natively(sequence_id);
         // 1. Defensive truncate.
         self.session
             .truncate_sequence_to_blocks(sequence_id.0, 0)
@@ -11221,6 +11232,7 @@ impl Scheduler {
             .map_err(ConversationError::Model)?;
         let view_id = SequenceId(vs.view_idx);
         let borrowed = BlockCount(vs.borrowed_block_count);
+        self.seal_under_conversation_of(view_id, parent_id);
 
         // Seed sampling state for the view (clone parent's state so
         // the DRY window survives the carve).
@@ -12309,6 +12321,10 @@ impl Scheduler {
         // That dropped content is exactly the "the model has lost the
         // user message" symptom that derails generation past the
         // first reproject.
+        // The view is rebuilt from this snapshot and freed: the outstanding
+        // gap's rows for its blocks go in place first, so the snapshot carries
+        // them converted.
+        self.catch_up_outstanding_gap();
         let t_snapshot = Instant::now();
         let tail_per_layer = {
             let _g = profile::span("reproject:snapshot_tail");

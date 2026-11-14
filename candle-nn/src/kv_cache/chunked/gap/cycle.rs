@@ -47,6 +47,15 @@ struct Outstanding {
     kind: GapKind,
 }
 
+/// One live sequence a gap may take blocks of, and the policy each of its
+/// layers seals under — its conversation's, through the layer's cap. A
+/// sequence left native is not handed to the gap at all.
+#[derive(Debug, Clone)]
+pub struct GapSeq {
+    pub seq: usize,
+    pub layer_policy: Vec<CompressionPolicy>,
+}
+
 /// What one catch-up did.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct GapCatchUp {
@@ -211,14 +220,13 @@ impl GapCycle {
         })
     }
 
-    /// Quantize every complete block of `seqs` past its cursor, with the
-    /// retried blocks first (§3.1–§3.4). `layer_policy[l]` is the policy layer
-    /// `l` seals under. Nothing when a gap is outstanding.
+    /// Quantize every complete block of `seqs` past its cursor, each sequence
+    /// under its own layer policies, with the retried blocks first
+    /// (§3.1–§3.4). Nothing when a gap is outstanding.
     pub fn quantize(
         &mut self,
         backings: &[ChunkedKvBacking],
-        seqs: &[usize],
-        layer_policy: &[CompressionPolicy],
+        seqs: &[GapSeq],
         kind: GapKind,
     ) -> Result<GapQuantize> {
         if self.outstanding.is_some() {
@@ -227,10 +235,11 @@ impl GapCycle {
                 ..GapQuantize::default()
             });
         }
-        if layer_policy.len() != backings.len() {
+        if let Some(s) = seqs.iter().find(|s| s.layer_policy.len() != backings.len()) {
             candle::bail!(
-                "gap cycle: {} layer policies for {} layers",
-                layer_policy.len(),
+                "gap cycle: sequence {} has {} layer policies for {} layers",
+                s.seq,
+                s.layer_policy.len(),
                 backings.len()
             );
         }
@@ -258,12 +267,12 @@ impl GapCycle {
 
         // ── Then every sequence's complete blocks, cut to the gap's room ──
         let mut room_blocks = self.max_jobs.saturating_sub(jobs.len()) / n_layers.max(1);
-        let mut taken: Vec<(usize, Range<usize>)> = Vec::new();
-        for &s in seqs {
+        let mut taken: Vec<(&GapSeq, Range<usize>)> = Vec::new();
+        for s in seqs {
             if room_blocks == 0 {
                 break;
             }
-            let range = gap_take(backings, s, room_blocks);
+            let range = gap_take(backings, s.seq, room_blocks);
             room_blocks -= range.len();
             if !range.is_empty() {
                 taken.push((s, range));
@@ -278,16 +287,18 @@ impl GapCycle {
             for (s, range) in &taken {
                 let seq = state
                     .sequences
-                    .get(*s)
+                    .get(s.seq)
                     .and_then(Option::as_ref)
-                    .ok_or_else(|| candle::Error::Msg(format!("gap cycle: sequence {s} gone")))?;
+                    .ok_or_else(|| {
+                        candle::Error::Msg(format!("gap cycle: sequence {} gone", s.seq))
+                    })?;
                 for block in range.clone() {
                     let w = &seq.chunks_slice()[block];
                     fresh.push((
-                        layer_policy[layer],
+                        s.layer_policy[layer],
                         GapJob {
                             layer,
-                            seq: *s,
+                            seq: s.seq,
                             block,
                             bands: ChunkBands::from_window(w),
                             valid_range: (i32::from(w.offset) << 8) | w.usage as i32,

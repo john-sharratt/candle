@@ -3,9 +3,11 @@
 //! gap between forwards, its own arena creation and compaction next, then
 //! [`BatchedInferenceSession::gap_quantize`].
 //!
-//! Every layer seals under its own policy ([`BatchedInferenceSession::
-//! layer_seal_policies`]), as today's seal does, so the gap's groups and the
-//! seal's agree. A session that does not quantize — F16/BF16 — and a geometry
+//! Every sequence is quantized under its own seal ([`GapSeal`](super::GapSeal)) — its
+//! conversation's policy, or none for a lossless conversation and a section —
+//! and every layer under that policy through its cap ([`BatchedInferenceSession::
+//! layer_seal_policies`]), as the seal does, so the gap's groups and the seal's
+//! agree. A session that does not quantize — F16/BF16 — and a geometry
 //! the convert has no record for (a head_dim other than 128 or 256, or the
 //! single-latent layout, which has its own per-band compressor) take no gap.
 
@@ -13,7 +15,7 @@ use std::time::Instant;
 
 use candle::quantized::cuda::kvhead_supported_head_dim;
 use candle::{Device, Result};
-use candle_nn::kv_cache::{gap_jobs_within, GapCatchUp, GapCycle, GapKind, GapQuantize};
+use candle_nn::kv_cache::{gap_jobs_within, GapCatchUp, GapCycle, GapKind, GapQuantize, GapSeq};
 
 use super::BatchedInferenceSession;
 
@@ -74,18 +76,25 @@ impl BatchedInferenceSession {
         let Some(session_policy) = self.seal_policy() else {
             return Ok(GapQuantize::default());
         };
-        let policies = self.layer_seal_policies(&session_policy);
-        let seqs: Vec<usize> = self
+        // Each live sequence under its own seal, through every layer's cap; a
+        // sequence left native is not handed over.
+        let seqs: Vec<GapSeq> = self
             .sequences
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|_| i))
+            .filter_map(|(i, s)| {
+                let policy = s.as_ref()?.seal.policy(&session_policy)?;
+                Some(GapSeq {
+                    seq: i,
+                    layer_policy: self.layer_seal_policies(&policy),
+                })
+            })
             .collect();
         let t_setup = Instant::now();
         self.ensure_gap()?;
         let setup = t_setup.elapsed();
         let cycle = self.gap.as_mut().expect("made above");
-        let mut q = cycle.quantize(&self.backings, &seqs, &policies, kind)?;
+        let mut q = cycle.quantize(&self.backings, &seqs, kind)?;
         q.host.setup = setup;
         Ok(q)
     }
