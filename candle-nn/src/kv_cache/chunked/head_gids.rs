@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use super::gid_pool::ChunkGid;
 use super::size_class::payload_bytes_for_tag;
+use super::types::ChunkWindow;
 use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
 
 /// Stride per head in the flat GID slice: N_PALETTE * 2.
@@ -361,6 +362,19 @@ impl ChunkBands {
             gids: chunk.gids.clone(),
             k_fmt: chunk.k_fmt.clone(),
             v_fmt: chunk.v_fmt.clone(),
+        }
+    }
+
+    /// Borrow a live chunk's bands the same way: what a gap's job holds of the
+    /// native chunk it quantizes, and what keeps those bands alive until the
+    /// gap's catch-up.
+    // Reached from the gap's tests alone, as the gap modules are.
+    #[allow(dead_code)]
+    pub(crate) fn from_window(window: &ChunkWindow) -> Self {
+        Self {
+            gids: window.gids.clone(),
+            k_fmt: window.k_fmt.clone(),
+            v_fmt: window.v_fmt.clone(),
         }
     }
 

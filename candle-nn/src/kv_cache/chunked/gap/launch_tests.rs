@@ -33,12 +33,12 @@ use crate::kv_cache::{
     all_kv_formats, convert_deferred_descs, KvFormat, QuantFormat, SealedSequence,
 };
 
-const N_KV_HEAD: usize = 2;
-const HEAD_DIM: usize = 128;
-const ARENA_CAPACITY: usize = 256;
-const LAYERS: usize = 3;
+pub(super) const N_KV_HEAD: usize = 2;
+pub(super) const HEAD_DIM: usize = 128;
+pub(super) const ARENA_CAPACITY: usize = 256;
+pub(super) const LAYERS: usize = 3;
 /// Three full chunks a layer.
-const TOKENS: usize = 96;
+pub(super) const TOKENS: usize = 96;
 
 pub(super) fn cuda() -> Option<(Device, CudaDevice, GpuGuard)> {
     match Device::cuda_if_available(0) {
@@ -70,6 +70,13 @@ pub(super) fn backing(device: &Device, policy: &CompressionPolicy) -> ChunkedKvB
 /// The pattern varies by layer and has structure across channels, so the
 /// selection picks more than one format.
 fn seed(backing: &ChunkedKvBacking, device: &Device, base: u32) -> SealedSequence {
+    let slot = write_turn(backing, device, base);
+    backing.record_turn(slot).unwrap()
+}
+
+/// `TOKENS` of the same pattern written into a fresh live sequence, left live:
+/// its batch index.
+pub(super) fn write_turn(backing: &ChunkedKvBacking, device: &Device, base: u32) -> usize {
     let slot = backing.alloc_sequence().unwrap();
     backing.ensure_for_offset(slot, 0, TOKENS).unwrap();
     let total = N_KV_HEAD * TOKENS * HEAD_DIM;
@@ -89,22 +96,22 @@ fn seed(backing: &ChunkedKvBacking, device: &Device, base: u32) -> SealedSequenc
     let v = (&k * 0.5).unwrap();
     backing.write_contiguous(slot, 0, &k, &v).unwrap();
     backing.set_len(slot, TOKENS);
-    backing.record_turn(slot).unwrap()
+    slot
 }
 
 /// What one band came out as: record format code, outer scale bits, its
 /// head's packed palette map, and its converted payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Band {
-    fmt: u8,
-    scale: u32,
-    pal: Vec<u8>,
-    bytes: Vec<u8>,
+pub(super) struct Band {
+    pub fmt: u8,
+    pub scale: u32,
+    pub pal: Vec<u8>,
+    pub bytes: Vec<u8>,
 }
 
 /// Today's seal of every layer's chunks, band by band in table order: job
 /// (layer, chunk), head, palette, K before V.
-fn todays_seal(
+pub(super) fn todays_seal(
     device: &Device,
     backings: &[ChunkedKvBacking],
     srcs: &[SealedSequence],
@@ -191,10 +198,12 @@ fn todays_seal(
 fn jobs(srcs: &[SealedSequence]) -> Vec<GapJob> {
     let mut jobs = Vec::new();
     for (layer, s) in srcs.iter().enumerate() {
-        for c in &s.chunks {
+        for (block, c) in s.chunks.iter().enumerate() {
             let len = usize::from(c.token_count).clamp(1, 32) as i32;
             jobs.push(GapJob {
                 layer,
+                seq: 0,
+                block,
                 bands: ChunkBands::from_sealed(c),
                 valid_range: ((c.offset as i32) << 8) | len,
             });
@@ -227,7 +236,7 @@ pub(super) fn reachable(backing: &ChunkedKvBacking, policy: &CompressionPolicy) 
 
 /// A lease of `per_class(class)` slots for every class the policy reaches,
 /// allocated from `backing`'s pools as a gap's lease is.
-fn lease_for(
+pub(super) fn lease_for(
     backing: &ChunkedKvBacking,
     policy: &CompressionPolicy,
     per_class: impl Fn(usize) -> usize,
@@ -243,7 +252,7 @@ fn lease_for(
     lease
 }
 
-fn stack(lease: &Lease<ChunkGid>) -> StackImage {
+pub(super) fn stack(lease: &Lease<ChunkGid>) -> StackImage {
     lease.stack_image().unwrap()
 }
 
@@ -307,7 +316,7 @@ fn gap_bands(cuda: &CudaDevice, rows: &[HeadRow], elems: usize) -> Vec<Band> {
 }
 
 /// The quantized format a record format code names.
-fn arena_code_format(code: u8) -> KvFormat {
+pub(super) fn arena_code_format(code: u8) -> KvFormat {
     all_kv_formats()
         .find(|f| match f {
             KvFormat::Quantized(q) => {
@@ -318,7 +327,7 @@ fn arena_code_format(code: u8) -> KvFormat {
         .unwrap_or_else(|| panic!("no quantized format has record code {code}"))
 }
 
-fn setup(
+pub(super) fn setup(
     device: &Device,
     policy: &CompressionPolicy,
 ) -> (Vec<ChunkedKvBacking>, Vec<SealedSequence>) {
@@ -499,6 +508,11 @@ fn one_gap_is_outstanding_at_a_time() {
     assert!(gap.launch(&refs, &jobs, &groups, &image, 2).is_err());
     device.synchronize().unwrap();
     assert!(gap.poll());
+    // Complete but not yet read by a catch-up: still refused.
+    assert!(gap.launch(&refs, &jobs, &groups, &image, 2).is_err());
+    let finished = gap.finished().expect("complete and unread");
+    assert_eq!(finished.jobs(), jobs.len());
+    assert!(gap.finished().is_none(), "a summary is handed out once");
     gap.launch(&refs, &jobs, &groups, &image, 2).unwrap();
     device.synchronize().unwrap();
     assert!(gap.poll());
@@ -1134,6 +1148,7 @@ fn a_gap_after_the_seq_wrap_is_not_seen_complete_early() {
     f.device.synchronize().unwrap();
     assert!(gap.poll());
     assert!(gap.summary().complete(completion_word(after)));
+    assert!(gap.finished().is_some());
     gap.summary().arm();
     assert!(
         !gap.summary().complete(completion_word(after)),

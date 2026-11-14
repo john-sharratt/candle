@@ -291,6 +291,61 @@ impl MappedSummary {
     }
 }
 
+/// The summary of a gap that has completed, for its `jobs` jobs of
+/// `n_kv_head` heads: what the catch-up reads. Only [`GapDevice::finished`]
+/// makes one, once the completion word is in, and it borrows the device state
+/// so no gap can be launched over it while it is read.
+///
+/// [`GapDevice::finished`]: super::launch::GapDevice::finished
+#[cfg(feature = "cuda")]
+pub(crate) struct Finished<'s> {
+    summary: &'s MappedSummary,
+    jobs: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl<'s> Finished<'s> {
+    /// # Safety
+    ///
+    /// [`MappedSummary::complete`] has returned true for the gap of `jobs`
+    /// jobs whose summary `summary` is, and no later gap has been armed.
+    pub(crate) unsafe fn new(summary: &'s MappedSummary, jobs: usize) -> Self {
+        Self { summary, jobs }
+    }
+
+    /// The jobs the gap's table held.
+    pub(crate) fn jobs(&self) -> usize {
+        self.jobs
+    }
+
+    /// Whether the claim met a code its tables did not cover.
+    pub(crate) fn errored(&self) -> bool {
+        // SAFETY: the gap has completed (`new`).
+        unsafe { self.summary.errored() }
+    }
+
+    /// Whether job `job` was deferred.
+    pub(crate) fn deferred(&self, job: usize) -> Result<bool> {
+        if job >= self.jobs {
+            candle::bail!("gap summary: job {job} of a {}-job gap", self.jobs);
+        }
+        // SAFETY: the gap has completed, and `job` is inside its table.
+        Ok(unsafe { self.summary.deferred(job) })
+    }
+
+    /// Job `job`'s rows, one per KV head, in head order.
+    pub(crate) fn rows(&self, job: usize) -> Result<Vec<HeadRow>> {
+        if job >= self.jobs {
+            candle::bail!("gap summary: job {job} of a {}-job gap", self.jobs);
+        }
+        let n_kv_head = self.summary.layout.n_kv_head;
+        // SAFETY: the gap has completed, and every head is inside its table.
+        (job * n_kv_head..(job + 1) * n_kv_head)
+            .map(|h| unsafe { self.summary.head_row(h) })
+            .collect()
+    }
+}
+
 #[cfg(feature = "cuda")]
 impl Drop for MappedSummary {
     fn drop(&mut self) {

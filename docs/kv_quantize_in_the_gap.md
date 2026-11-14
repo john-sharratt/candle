@@ -312,6 +312,13 @@ build (§3.1's cut).
 
 When the completion word is set, the head of the next gap installs the
 outstanding gap's blocks. For each converted block the host:
+- finds the native chunk the gap converted: at the job's index, or — when a
+  front eviction or a splice moved it while the gap ran — wherever it moved to
+  in its sequence, found by identity. The search runs only for a job whose
+  index no longer holds its chunk. A chunk truncated or evicted away is gone,
+  and its row is discarded. Matching by index alone would leave a moved block
+  native for good: it already sits behind the sequence's cursor, so no later
+  gap takes it;
 - takes the claimed slots out of the lease as the block's bands, with the
   formats, scales and maps from the row;
 - claims a record slot and fills it with the existing device fill
@@ -441,10 +448,11 @@ of them is redesigned rather than excepted.
    - The gap's last launch writes the completion word after a system-scope
      fence; the host reads the word first and the rows only once it holds the
      gap's sequence number.
-   - Each row names the native gids it converted and its sequence's generation.
-     The catch-up installs a row only when the block at that index still holds
-     those gids under that generation. Otherwise the row is discarded and its
-     slots go back to their pools.
+   - Each job holds the native gids it converted. The catch-up installs a row
+     only into the chunk that still holds those gids — at the job's index, or
+     where a front eviction or a splice moved it. A chunk that is gone has its
+     row discarded and its slots go back to their pools; a deferred block that
+     moved is retried at its new index.
    - At most one gap is outstanding. A gap that finds one quantizes nothing, so
      no buffer, lease or row is ever shared by two gaps.
    - Arming a gap clears the summary's error and completion words. Completion
@@ -596,7 +604,8 @@ Unit tests, written with the code, asserting raw expected bytes:
   thousands of random interleavings of forwards, truncates, evictions, seals,
   gaps and catch-ups against a reference model, asserting after every step that
   each slot has exactly one owner, that no gid is freed twice or while pinned,
-  and that no block is both sealed and deferred. A failing interleaving is kept
+  that no block is both sealed and deferred, and that no complete native block
+  is left behind a cursor without being retried. A failing interleaving is kept
   as a fixed regression test;
 - on the device, a truncate and an eviction landing while a gap is outstanding:
   the stale rows are discarded, their slots return to their pools, and the
@@ -733,7 +742,18 @@ Line numbers are as of commit `dc04b62ac`.
 - New `candle-nn/src/kv_cache/chunked/gap/summary.rs`: the mapped buffer, its
   row layout and the completion word. Pattern:
   `candle-transformers/src/models/expert_lre/dispatch.rs:156`, `SummaryRing`.
-- New `candle-nn/src/kv_cache/chunked/gap/install.rs`: the catch-up.
+- New `candle-nn/src/kv_cache/chunked/gap/install.rs`: the catch-up over live
+  sequences — the summary read only once `GapDevice::finished` hands it out,
+  each block found by identity, its slots taken block by block, every record
+  built in one batch, each layer's chunks swapped in under one write of its
+  block table with their headers re-serialised in one upload per sequence and
+  the writer boundary moved past them, the rest of the lease returned, and the
+  deferred blocks handed back with their exact demand. `gap/assemble.rs`
+  rebuilds a block's slots in grid order and its chunk state from its rows, as
+  today's seal lays it out. `gap/install_tests.rs` holds the installed chunks
+  to today's seal band for band, and covers a truncate under the gap, the
+  natives' return, the lease's surplus and a deferred block installed by the
+  next gap. `gap/ownership_tests.rs` is the randomised model test of §7.
 - `candle-nn/src/kv_cache/chunked/backing.rs:1307`, `fill_records_on_device`,
   and `meta_pool.rs:146`, `serialize_kv_heads`: the record, unchanged.
 - `candle-nn/src/kv_cache/chunked/gpu_chunks.rs:692`, `update_chunk`, and

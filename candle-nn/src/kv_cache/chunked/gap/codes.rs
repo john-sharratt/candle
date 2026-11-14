@@ -13,6 +13,7 @@ use candle::Result;
 use candle::cuda_backend::kernels::simple::kv_gap_claim::N_CODES;
 
 use super::super::size_class::{all_kv_formats, class_for_format, SizeClass};
+use crate::kv_cache::arena_table::ArenaFormatTag;
 use crate::kv_cache::KvFormat;
 
 /// The class a code with no format at this geometry maps to.
@@ -26,6 +27,9 @@ pub(crate) struct CodeTables {
     pub class: [i8; N_CODES],
     pub fmt: [u8; N_CODES],
     fmt_class: [i8; 256],
+    /// Per record format byte, the band format tag a chunk carries for it
+    /// ([`ArenaFormatTag::as_u8`]); read only where `fmt_class` has a class.
+    fmt_tag: [u8; 256],
 }
 
 impl CodeTables {
@@ -38,6 +42,7 @@ impl CodeTables {
         let mut class = [NO_CLASS; N_CODES];
         let mut fmt = [0u8; N_CODES];
         let mut fmt_class = [NO_CLASS; 256];
+        let mut fmt_tag = [0u8; 256];
         for format in all_kv_formats() {
             let KvFormat::Quantized(q) = format else {
                 continue;
@@ -66,6 +71,7 @@ impl CodeTables {
                 candle::bail!("gap codes: record format {byte} maps to two classes");
             }
             *back = c;
+            fmt_tag[byte as usize] = ArenaFormatTag::from_kv_format(format).as_u8();
             class[code] = c;
             fmt[code] = byte;
         }
@@ -73,7 +79,14 @@ impl CodeTables {
             class,
             fmt,
             fmt_class,
+            fmt_tag,
         })
+    }
+
+    /// The band format tag of a record format byte, or `None` for a byte no
+    /// selectable format has.
+    pub(crate) fn tag_of_fmt(&self, fmt: u8) -> Option<u8> {
+        self.class_of_fmt(fmt).map(|_| self.fmt_tag[fmt as usize])
     }
 
     /// The size class a band whose record carries format byte `fmt` claimed
@@ -207,6 +220,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_record_format_byte_leads_back_to_its_formats_band_tag() {
+        let t = CodeTables::new(EPC).unwrap();
+        for q in [QuantFormat::Q8_0, QuantFormat::Q4_0, QuantFormat::R16] {
+            let byte = ggml_dtype_to_arena_fmt_code(q.to_ggml_dtype()).unwrap();
+            assert_eq!(
+                t.tag_of_fmt(byte),
+                Some(ArenaFormatTag::from_kv_format(KvFormat::Quantized(q)).as_u8()),
+                "{q:?}"
+            );
+        }
+        assert_eq!(t.tag_of_fmt(0xEE), None);
     }
 
     #[test]

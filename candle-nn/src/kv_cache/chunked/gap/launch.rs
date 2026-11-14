@@ -42,7 +42,7 @@ use super::super::head_gids::ChunkBands;
 use super::super::size_class::{elems_per_chunk, SizeClass, GID_STRIDE};
 use super::codes::CodeTables;
 use super::lease::StackImage;
-use super::summary::{completion_word, MappedSummary, SummaryLayout};
+use super::summary::{completion_word, Finished, MappedSummary, SummaryLayout};
 use crate::kv_cache::arena_table::N_PALETTE;
 use crate::kv_cache::{KvFormat, QuantFormat};
 
@@ -59,7 +59,13 @@ const BLOCK_ALIGN: usize = 256;
 pub(crate) struct GapJob {
     /// Index into the backings the gap is launched over.
     pub layer: usize,
-    /// The chunk's native bands: their gids and format tags.
+    /// The sequence's batch index in that layer's block table.
+    pub seq: usize,
+    /// The block's index in the sequence's chunk list.
+    pub block: usize,
+    /// The chunk's native bands: their gids and format tags. Held by the job
+    /// for the gap's life, it is what keeps those bands from going back to
+    /// their pool while the convert may still read them (§3.8 rule 4).
     pub bands: ChunkBands,
     /// The chunk's live token window, `(offset << 8) | len`.
     pub valid_range: i32,
@@ -114,6 +120,8 @@ pub(crate) struct GapDevice {
     convert: Grown,
     /// The completion word of the gap launched and not yet seen complete.
     outstanding: Option<u32>,
+    /// The job count of the gap launched and not yet read by a catch-up.
+    unread: Option<usize>,
 }
 
 impl GapDevice {
@@ -178,12 +186,27 @@ impl GapDevice {
             select: Grown(None),
             convert: Grown(None),
             outstanding: None,
+            unread: None,
         })
     }
 
     /// The summary the last gap writes.
     pub(crate) fn summary(&self) -> &MappedSummary {
         &self.summary
+    }
+
+    /// The last launched gap's summary, once — when its completion word is in
+    /// and no catch-up has read it yet. `None` while it runs, after it has been
+    /// read, and before any gap with a table has been launched. Borrowing the
+    /// device state keeps the next gap from being armed over it.
+    pub(crate) fn finished(&mut self) -> Option<Finished<'_>> {
+        if !self.poll() {
+            return None;
+        }
+        let jobs = self.unread.take()?;
+        // SAFETY: `poll` saw this gap's completion word, and no later gap has
+        // been armed: `launch` refuses while a summary is unread.
+        Some(unsafe { Finished::new(&self.summary, jobs) })
     }
 
     /// Whether the gap last launched has completed — a load of one mapped
@@ -213,6 +236,10 @@ impl GapDevice {
     ) -> Result<()> {
         if self.outstanding.is_some() {
             candle::bail!("gap {seq}: the previous gap has not completed");
+        }
+        if self.unread.is_some() {
+            // Arming would clear the summary a catch-up has yet to install.
+            candle::bail!("gap {seq}: the previous gap's summary has not been read");
         }
         let (n_kv_head, head_dim) = (self.n_kv_head, self.head_dim);
         let layout = self.summary.layout();
@@ -394,6 +421,7 @@ impl GapDevice {
             return Err(e);
         }
         self.outstanding = Some(completion_word(seq));
+        self.unread = Some(jobs.len());
         Ok(())
     }
 }
