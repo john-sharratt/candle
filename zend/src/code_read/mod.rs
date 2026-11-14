@@ -1461,6 +1461,21 @@ fn run_file_conversation(
 
         let results = tool_round::run(tool_ctx, steps);
         if let Some(missing) = read_not_found(&results) {
+            // What the round decoded, as written: whether its call was written
+            // under the reading's holds is read off its text.
+            let answer = resp.answer.text();
+            let call = answer
+                .find("<tool_call>")
+                .map_or(&answer[..], |at| &answer[at..]);
+            tracing::warn!(
+                target: "zend::code_read::ingest",
+                path,
+                round,
+                opened = round == 0 && opening.is_some(),
+                held = opening.is_some_and(|(_, held)| held.is_some()),
+                call = %call.chars().take(300).collect::<String>(),
+                "a reading named a file other than its own",
+            );
             anyhow::bail!("{READ_ELSEWHERE} {missing}: it read something other than `{path}`");
         }
         let response = format_tool_responses(&results);

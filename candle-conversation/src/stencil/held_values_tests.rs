@@ -452,3 +452,74 @@ fn a_name_spilled_into_its_value_still_names_the_call() {
     };
     assert_eq!(next.tokens(), [b'e' as TokenId]);
 }
+
+/// **A catalog of one tool still names its calls, and a function block's raw
+/// values are held.** A file's reading offers `file_read` alone, so no branch
+/// chooses the tool: the grammar writes the name, and the walk names the call
+/// where it does. Held there, each raw value can be only its file's: with
+/// `src` as a directory of the repository root, `candle-conversation/…` is
+/// still the one path the walk can write.
+#[test]
+fn a_lone_tools_raw_values_are_held() {
+    let v = TestVocab::new();
+    let spec = compile_tool_call_tree(&[read_tool()], &ToolCallEnvelope::qwen35()).unwrap();
+    let tree = Arc::new(compile(&spec, &v).unwrap());
+    let one = |field: &str, value: &str| FieldHold {
+        tools: vec!["file_read".into()],
+        field: field.into(),
+        on: Vec::new(),
+        table: HashMap::from([(Vec::new(), vec![value.to_string()])]),
+    };
+    let holds = ValueHolds {
+        fields: vec![
+            one("repo", "candle"),
+            one("path", "candle-conversation/src/cancel.rs"),
+        ],
+    };
+    let mut d = TriggerRegistry::new()
+        .with_trigger(TRIGGER, tree)
+        .holding_values(
+            TRIGGER,
+            Arc::new(HeldValues::build(&holds, &v, &mut HeldRules::default())),
+        )
+        .driver_for(TRIGGER)
+        .unwrap();
+    let mut text = String::new();
+    for _ in 0..400 {
+        let set = match d.step() {
+            StepMask::Prefill(run) => {
+                text.push_str(&String::from_utf8(v.decode(&run)).unwrap());
+                continue;
+            }
+            StepMask::Branch(set) => set,
+            StepMask::Free { .. } => panic!("a value decodes free after {text:?}"),
+            StepMask::Done => break,
+        };
+        let offered: Vec<u8> = set
+            .tokens()
+            .iter()
+            .filter_map(|&t| v.token_bytes(t).first().copied())
+            .collect();
+        // One way on inside a held value; at its close, the layout's newline,
+        // then the next tag.
+        let byte = match offered.as_slice() {
+            [only] => *only,
+            _ if offered.contains(&b'\n') && !text.ends_with('\n') => b'\n',
+            _ => b'<',
+        };
+        assert!(
+            offered.contains(&byte),
+            "{byte:?} after {text:?}: {offered:?}"
+        );
+        text.push(byte as char);
+        d.accept(byte as TokenId, &[byte]);
+    }
+    assert!(
+        text.contains("<parameter=repo>\ncandle</parameter>"),
+        "{text:?}"
+    );
+    assert!(
+        text.contains("<parameter=path>\ncandle-conversation/src/cancel.rs</parameter>"),
+        "{text:?}"
+    );
+}

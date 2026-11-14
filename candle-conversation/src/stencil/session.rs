@@ -340,6 +340,9 @@ impl StencilSession {
         if let Some(tok) = self.pushback.take() {
             return self.apply_pushback(tok);
         }
+        if let Cursor::At(node) = self.cursor {
+            self.arrive(node);
+        }
         match self.cursor {
             Cursor::At(node) => match self.tree.node(node) {
                 StencilNode::Static { tokens, next } => {
@@ -476,6 +479,7 @@ impl StencilSession {
             Cursor::At(n) => n,
             _ => unreachable!("pushback is only set with cursor At(next)"),
         };
+        self.arrive(node);
         // Snapshot under one immutable borrow, then mutate.
         enum Out {
             Static {
@@ -653,6 +657,20 @@ impl StencilSession {
     /// names, written with the values its schema fixes.
     fn name_call(&mut self, node: NodeId, arm: &[TokenId]) {
         let tool = self.tree.tool_named(node, arm).cloned();
+        self.begin_call(tool);
+    }
+
+    /// The walk reached `node`: a node where the grammar writes a lone tool's
+    /// name begins a call of that tool, as a name branch's arm does.
+    fn arrive(&mut self, node: NodeId) {
+        if let Some(tool) = self.tree.names_on_entry(node) {
+            let tool = Arc::clone(tool);
+            self.begin_call(Some(tool));
+        }
+    }
+
+    /// A call of `tool` begins, written with the values its schema fixes.
+    fn begin_call(&mut self, tool: Option<Arc<str>>) {
         if let Some(tool) = &tool {
             self.named.push(Arc::clone(tool));
         }

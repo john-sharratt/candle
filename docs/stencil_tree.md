@@ -791,6 +791,14 @@ call that was just refused for one.
   `candle-conversation/src/cancel.rs` wrote `src/cancel.rs` on every pass and
   was read again on every restart (pinned by
   `a_reading_writes_only_its_own_path_in_a_function_block`).
+- **A catalog of one tool names its calls where it writes the name.** Every
+  hold is looked up by the call's tool, and a name branch of one arm is folded
+  into the run around it (§4), so a grammar over a lone tool — a file's
+  reading offers `file_read` and nothing else — had no branch to name its calls
+  and held none of them, in either dialect. `compile` marks the node such a run
+  lowers to with the tool it names (`TreeMarks::names_on_entry`), and the walk
+  begins a call of that tool on reaching it, as a name branch's arm begins one
+  (pinned by `a_lone_tools_raw_values_are_held`).
 - **A value chosen by a branch is recorded too.** An enum's value is a choice,
   not a span — and every file tool's `repo` is an enum, the workspace's
   repositories written into it at startup — so nothing a span records says

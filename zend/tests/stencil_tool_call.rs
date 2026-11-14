@@ -2061,15 +2061,32 @@ fn a_reading_writes_only_its_own_path_in_a_function_block() {
     let im_end = tok.token_to_id(TURN_CLOSE).unwrap();
     let vocab = HfVocab::new(tok.clone(), &[im_end], 0);
     let block = ToolCallEnvelope::qwen35();
+    // A reading's grammar offers `file_read` alone, as its catalog does
+    // (`zend::code_read::reading_tools`): no branch names the tool.
+    let reading: Vec<ToolSpec> = catalog()
+        .into_iter()
+        .filter(|t| t.name == "file_read")
+        .collect();
+    for tools in [catalog(), reading] {
+        reading_holds_its_path(&tok, &vocab, &tools, &block);
+    }
+}
+
+/// [`a_reading_writes_only_its_own_path_in_a_function_block`] over `tools`.
+fn reading_holds_its_path(
+    tok: &tokenizers::Tokenizer,
+    vocab: &HfVocab,
+    tools: &[ToolSpec],
+    block: &ToolCallEnvelope,
+) {
     let calls = ToolCallEnvelope {
         open: block.open.strip_prefix(&block.marker).unwrap().to_string(),
         ..block.clone()
     };
-    let spec =
-        compile_tool_call_loop(&catalog(), &calls, MAX_TOOL_CALLS_PER_TURN, TURN_CLOSE).unwrap();
-    let tree = Arc::new(compile(&spec, &vocab).unwrap());
+    let spec = compile_tool_call_loop(tools, &calls, MAX_TOOL_CALLS_PER_TURN, TURN_CLOSE).unwrap();
+    let tree = Arc::new(compile(&spec, vocab).unwrap());
     let held = held_reading(
-        &vocab,
+        vocab,
         "candle",
         "candle-conversation/src/cancel.rs",
         &["1-120"],
@@ -2083,7 +2100,7 @@ fn a_reading_writes_only_its_own_path_in_a_function_block() {
     };
     walk_natural_held(
         Arc::clone(&tree),
-        &tok,
+        tok,
         &call("candle-conversation/src/cancel.rs"),
         false,
         Some(Arc::clone(&held)),
@@ -2091,10 +2108,14 @@ fn a_reading_writes_only_its_own_path_in_a_function_block() {
     .expect("the reading's own path writes through");
     let walked = walk_natural_held(
         Arc::clone(&tree),
-        &tok,
+        tok,
         &call("src/cancel.rs"),
         false,
         Some(Arc::clone(&held)),
     );
-    assert!(walked.is_err(), "the reading wrote `src/cancel.rs`");
+    assert!(
+        walked.is_err(),
+        "the reading wrote `src/cancel.rs` with {} tools",
+        tools.len()
+    );
 }
