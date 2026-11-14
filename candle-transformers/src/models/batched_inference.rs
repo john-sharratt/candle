@@ -5417,6 +5417,12 @@ pub trait ManagedBatchedModel {
         Ok(0)
     }
 
+    /// The pieces `seq`'s pool holds now — what a refresh may keep without
+    /// reading their pages again. Empty on a model that pools nothing.
+    fn pooled_keys(&self, _seq: usize) -> Vec<PieceKey> {
+        Vec::new()
+    }
+
     /// Let go of `seq`'s pooled pieces not in `keep`.
     fn retain_pooled(&self, _seq: usize, _keep: &[PieceKey]) -> Result<()> {
         Ok(())

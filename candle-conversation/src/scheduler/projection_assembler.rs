@@ -138,6 +138,10 @@ pub(super) struct SlotState {
     /// pages of its pooled conversations, whose unplaced rounds the
     /// declaration names for the shadow scan.
     pub(super) pool: PoolPages,
+    /// How many of each pooled conversation's turns [`Self::pool`] has walked.
+    /// A conversation's turns are append-only, so a refresh that keeps it walks
+    /// only the turns past this — the earlier ones' pages are held already.
+    pub(super) pool_walked: HashMap<TimelineId, u32>,
 }
 
 /// The most read-back parts a slot keeps between reprojections; past it the
@@ -422,8 +426,10 @@ impl SlotState {
             round_hits: self.round_hits.clone(),
             unread_hits: Vec::new(),
             // The model holds a pool's pages per sequence: the fork's holds
-            // none until its own first reprojection chooses one.
+            // none until its own first reprojection chooses one, and walks
+            // each conversation it pools whole.
             pool: PoolPages::new(),
+            pool_walked: HashMap::new(),
         }
     }
 

@@ -11959,9 +11959,12 @@ impl Scheduler {
             }
             None => HashMap::new(),
         };
+        let hits_us = t_observe.elapsed().as_micros() as u64;
+        let t_ws = Instant::now();
         policy
             .substrate
             .observe_working_set(schema, policy.target, &group_candidates, &density);
+        let ws_us = t_ws.elapsed().as_micros() as u64;
         // The pool behind the slot, chosen from the same scan: each candidate
         // conversation lifted by the most-read of its rounds (§7.2).
         let pool_lifts: HashMap<TimelineId, f32> = self
@@ -11976,9 +11979,26 @@ impl Scheduler {
                 by_piece
             })
             .unwrap_or_default();
-        self.refresh_pool(slot, &policy.substrate, &group_candidates, &pool_lifts);
+        let t_pool = Instant::now();
+        let pool = self.refresh_pool(slot, &policy.substrate, &group_candidates, &pool_lifts);
+        let pool_us = t_pool.elapsed().as_micros() as u64;
         observe_span.end();
         let observe_us = t_observe.elapsed().as_micros() as u64;
+        // `observe_us` by part, on every reprojection — one whose selection is
+        // unchanged reports no prepare split, and it is the one a decode waits
+        // on most often.
+        note("reproject observe split", || {
+            format!(
+                "view={} observe_us={observe_us} hits_us={hits_us} ws_us={ws_us} \
+                 pool_us={pool_us} pooled={} pool_reused={} pool_walked_turns={} \
+                 candidates={}",
+                view_id.0,
+                pool.pooled,
+                pool.reused,
+                pool.walked,
+                group_candidates.iter().map(|(_, c)| c.len()).sum::<usize>(),
+            )
+        });
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_belief_scan");

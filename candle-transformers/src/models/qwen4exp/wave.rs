@@ -3184,6 +3184,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Qwen4ExpBatched::retain_pooled(self, seq, keep)
     }
 
+    fn pooled_keys(&self, seq: usize) -> Vec<PieceKey> {
+        Qwen4ExpBatched::pooled_keys(self, seq)
+    }
+
     fn positional_lift_bytes(&self, page: &[u8], key: &PieceKey) -> Result<usize> {
         Qwen4ExpBatched::positional_lift_bytes(self, page, key)
     }
