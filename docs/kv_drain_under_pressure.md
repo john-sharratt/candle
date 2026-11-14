@@ -3,8 +3,11 @@
 > **Superseded in part by `docs/kv_quantize_in_the_gap.md`.** K/V is quantized
 > on the scheduler thread in the gap, and persistence copies. The hot→warm
 > quantize, the group cap (§2c), the `kv_reserve: pass` line (§2b item 1) and
-> the quantize side of §3 are gone with it. The reserve (§2a) stays, sized by
-> the gap's own `create_deferred_arenas` and drawn on by the gap's lease; the
+> the quantize side of §3 are gone with it, and so is §2a's backlog-sized
+> reserve: a reserve is one arena's worth of free slots per class, the guard
+> against a card full of native K/V, and the gap's lease buys the rest
+> between forwards (`kv_quantize_in_the_gap.md` §3.2). §2a's sizing, its
+> grow events (§2b item 2) and their logging describe the removed code; the
 > rest of this document describes the code.
 
 **What broke** (BlackWorld, 2026-11-08 02:11–02:16; every count is from its

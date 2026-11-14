@@ -29,7 +29,6 @@ use super::head_gids::HeadGids;
 #[cfg(feature = "cuda")]
 use super::region_pool;
 #[cfg(feature = "cuda")]
-use super::reserve_target::{reserve_targets, RESERVE_CAP_PERCENT};
 use super::size_class::{elems_per_chunk, SizeClass};
 use super::types::{ChunkWindow, DecodeLayout, CHUNK_SIZE};
 use super::write_placement::appended_tokens;
@@ -147,13 +146,13 @@ fn push_unique_key(keys: &mut Vec<super::arena::ArenaKey>, key: super::arena::Ar
 
 impl ChunkedKvBacking {
     /// Keep a **reserve** for the baseline formats and every quant candidate
-    /// the policy can produce (`docs/kv_drain_under_pressure.md` §2): one
+    /// the policy can produce (`docs/kv_quantize_in_the_gap.md` §3.2): one
     /// arena's worth of free slots per class, which the empty sweep never
-    /// releases, created here and replenished between forwards
-    /// ([`BackingInner::owe_reserves`]). A hot→warm migrate then always finds
-    /// its quantize destination without creating an arena — which it cannot
-    /// do while a wave is open, and which a full reservation gives it no
-    /// region for between waves.
+    /// releases, created here and restored between forwards
+    /// ([`BackingInner::create_deferred_arenas`]). It is the guard against a
+    /// card full of native K/V: the gap's first conversion finds a
+    /// destination, and every block it installs gives back more native ground
+    /// than it took. Past it the gap's lease buys what a table needs.
     pub(super) fn keep_reserves(
         &self,
         compression: Option<&super::CompressionPolicy>,
@@ -235,54 +234,6 @@ impl ChunkedKvBacking {
 
     pub(super) fn create_arena(&self, key: ArenaKey, index: usize) -> Result<Arena> {
         self.inner.create_arena(key, index)
-    }
-}
-
-/// One reserve class as [`BackingInner::owe_reserves`] last set it.
-#[cfg(feature = "cuda")]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ReserveClass {
-    pub key: ArenaKey,
-    /// Free slots the class holds.
-    pub target_slots: usize,
-    /// Free slots it held when the target was set.
-    pub free_slots: usize,
-    /// Arenas owed to it, for the gap to create.
-    pub owed_arenas: usize,
-    /// Its live slots over all live quant band slots.
-    pub factor: f64,
-    /// The backlog asked for more than its share of the cap.
-    pub capped: bool,
-}
-
-/// What [`BackingInner::owe_reserves`] set: the native backlog it sized from,
-/// the cap, and every reserve class (`docs/kv_drain_under_pressure.md` §2b).
-#[cfg(feature = "cuda")]
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ReserveReport {
-    /// Live native (R16/F16) slots, the migrate's backlog.
-    pub pending_slots: usize,
-    pub pending_bytes: usize,
-    /// Free bytes the reserve may hold across every class.
-    pub cap_bytes: usize,
-    /// The KV ground the cap is a share of.
-    pub kv_bytes: usize,
-    pub classes: Vec<ReserveClass>,
-}
-
-#[cfg(feature = "cuda")]
-impl ReserveReport {
-    /// Free bytes the reserve classes hold now.
-    pub fn free_bytes(&self) -> usize {
-        self.classes
-            .iter()
-            .map(|c| c.free_slots * c.key.slot_stride())
-            .sum()
-    }
-
-    /// Whether `key`'s reserve was at its cap.
-    pub fn capped(&self, key: ArenaKey) -> bool {
-        self.classes.iter().any(|c| c.key == key && c.capped)
     }
 }
 
@@ -465,10 +416,10 @@ impl BackingInner {
             if slots <= free {
                 continue;
             }
-            // A shortfall the reserve was sized to cover is a sizing or
-            // replenishing bug; one past its target is demand beyond the cap.
-            let target = self.pool.reserve_target(key);
-            let covered = target.is_some_and(|t| slots <= t);
+            // A shortfall the one-arena reserve would have covered is a
+            // restoring bug; one past it is demand the gap had to buy.
+            let reserve = self.pool.reserve_target(key);
+            let covered = reserve.is_some_and(|t| slots <= t);
             macro_rules! short {
                 ($level:ident) => {
                     tracing::$level!(
@@ -476,12 +427,12 @@ impl BackingInner {
                         class = %key.label(),
                         needed_slots = slots,
                         free_slots = free,
-                        target_slots = target.unwrap_or(0),
+                        reserve_slots = reserve.unwrap_or(0),
                         arenas_owed = more,
                         "kv_reserve: quantize deferred short of {} slots of {}{}",
                         slots - free,
                         key.label(),
-                        if covered { " — inside its reserve target" } else { "" },
+                        if covered { " — inside its reserve" } else { "" },
                     )
                 };
             }
@@ -493,129 +444,30 @@ impl BackingInner {
         }
     }
 
-    /// **Size every reserve to the native backlog and owe what each falls
-    /// short** (`docs/kv_drain_under_pressure.md` §2a). The live native
-    /// (R16/F16) slots are the hot→warm migrate's backlog; each quant class's
-    /// target is its share of it by the quant mix VRAM holds now
-    /// ([`reserve_targets`]), never below one arena and held to
-    /// [`RESERVE_CAP_PERCENT`] of the KV ground. A class whose free slots fall
-    /// below its target is owed the shortfall in whole arenas, which the gap
-    /// creates; a target that falls lets the empty sweep release down to it
-    /// (`ChunkGidPool::set_reserve_target`). The native classes keep their
-    /// one-arena floor — the migrate never writes them.
-    ///
-    /// Answers what it set, for the persistence pass's `kv_reserve` line.
+    /// The reserve classes whose free slots have fallen below their one-arena
+    /// reserve, each once: the arenas a gap makes to restore them
+    /// (`docs/kv_quantize_in_the_gap.md` §3.2). A reserve is the guard against
+    /// a card full of native K/V — the gap's first conversion has somewhere to
+    /// write — and sized by nothing else: the gap's lease buys whatever more a
+    /// table needs, between forwards, where creating an arena is legal. A
+    /// class already owed an arena by a refusal is not owed a second.
     #[cfg(feature = "cuda")]
-    pub(super) fn owe_reserves(&self) -> ReserveReport {
+    fn reserves_short(&self) -> Vec<ArenaKey> {
         let hot = self.hot_location();
-        let natives: Vec<ArenaKey> = [
-            KvFormat::Float(DType::F16),
-            KvFormat::Quantized(QuantFormat::R16),
-        ]
-        .into_iter()
-        .filter_map(|fmt| self.arena_key_for(fmt, hot).ok())
-        .fold(Vec::new(), |mut keys, key| {
-            push_unique_key(&mut keys, key);
-            keys
-        });
-        let pending_slots: usize = natives.iter().map(|&k| self.pool.live_slots(k)).sum();
-        let pending_bytes: usize = natives
-            .iter()
-            .map(|&k| self.pool.live_slots(k) * k.slot_stride())
-            .sum();
-        let classes: Vec<(ArenaKey, usize)> = self
-            .pool
+        let owed: Vec<ArenaKey> = self
+            .deferred_arenas
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_default();
+        self.pool
             .reserve_keys()
             .into_iter()
-            .filter(|k| k.location == hot && !natives.contains(k))
-            .map(|k| (k, self.pool.live_slots(k)))
-            .collect();
-        let kv_bytes = match self.device.location() {
-            candle::DeviceLocation::Cuda { gpu_id } => {
-                region_pool::region_stats(gpu_id).map_or(0, |s| s.total * region_pool::REGION_BYTES)
-            }
-            _ => 0,
-        };
-        let cap_bytes = kv_bytes / 100 * RESERVE_CAP_PERCENT;
-        let targets = reserve_targets(pending_slots, &classes, cap_bytes);
-
-        let Ok(mut owed_list) = self.deferred_arenas.lock() else {
-            return ReserveReport::default();
-        };
-        let mut report = ReserveReport {
-            pending_slots,
-            pending_bytes,
-            cap_bytes,
-            kv_bytes,
-            classes: Vec::with_capacity(targets.len() + natives.len()),
-        };
-        let mut owe = |key: ArenaKey, target: usize, factor: f64, capped: bool| {
-            let before = self.pool.reserve_target(key).unwrap_or(0);
-            self.pool.set_reserve_target(key, target);
-            let free = self.pool.free_slots(key);
-            let owed = owed_list.iter().filter(|k| **k == key).count();
-            let more = more_arenas_owed(target, free, key.chunks(), owed);
-            for _ in 0..more {
-                owed_list.push(key);
-            }
-            // INFO only when the class is owed arenas — the reserve actually
-            // growing. A target crossing an arena boundary moves with every
-            // seal and drain, many times a second, so it is DEBUG; the pass
-            // line carries every target.
-            let per = key.chunks().max(1);
-            let (was, now) = (before.div_ceil(per), target.div_ceil(per));
-            let reason = if capped {
-                "capped"
-            } else if now < was {
-                "drained"
-            } else {
-                "backlog"
-            };
-            if more > 0 {
-                tracing::info!(
-                    target: "candle_conversation::kv_reserve",
-                    class = %key.label(),
-                    arenas_owed = more,
-                    target_arenas = now,
-                    target_slots = target,
-                    free_slots = free,
-                    factor,
-                    reason,
-                    "kv_reserve: grow {} by {more} arena(s)",
-                    key.label(),
-                );
-            } else if was != now {
-                tracing::debug!(
-                    target: "candle_conversation::kv_reserve",
-                    class = %key.label(),
-                    target_arenas_before = was,
-                    target_arenas = now,
-                    target_slots = target,
-                    free_slots = free,
-                    factor,
-                    reason,
-                    "kv_reserve: target {} ({was} -> {now} arenas)",
-                    key.label(),
-                );
-            }
-            report.classes.push(ReserveClass {
-                key,
-                target_slots: target,
-                free_slots: free,
-                owed_arenas: owed + more,
-                factor,
-                capped,
-            });
-        };
-        for t in targets {
-            owe(t.key, t.slots, t.factor, t.capped);
-        }
-        for key in natives {
-            if self.pool.reserve_target(key).is_some() {
-                owe(key, key.chunks(), 0.0, false);
-            }
-        }
-        report
+            .filter(|&key| {
+                key.location == hot
+                    && !owed.contains(&key)
+                    && self.pool.free_slots(key) < key.chunks()
+            })
+            .collect()
     }
 
     /// Lift the protection of each arena made ahead of demand that the
@@ -656,48 +508,57 @@ impl BackingInner {
     /// demand stays recorded and the next gap gets it. Only a genuine allocation
     /// failure — the reservation truly full — propagates.
     ///
-    /// It first owes every reserve that has fallen short ([`Self::owe_reserves`])
-    /// and lifts the protection of the arenas it made earlier whose demand has
-    /// arrived ([`Self::settle_fresh`]), so one call keeps the reserve standing.
-    /// Each arena it makes is protected until its demand fills it.
+    /// It lifts the protection of the arenas it made earlier whose demand has
+    /// arrived ([`Self::settle_fresh`]), makes what refusals owe — each
+    /// protected until its demand fills it, so the sweep this same gap runs
+    /// does not take it first — and then restores every reserve fallen below
+    /// its one arena ([`Self::reserves_short`]). A reserve's arena is not
+    /// protected: the sweep already holds a reserve class at its arena.
     #[cfg(feature = "cuda")]
     pub(super) fn create_deferred_arenas(&self) -> Result<usize> {
         self.settle_fresh();
-        self.owe_reserves();
+        let reserves = self.reserves_short();
         let pending: Vec<ArenaKey> = match self.deferred_arenas.lock() {
             Ok(mut p) => std::mem::take(&mut *p),
             Err(_) => return Ok(0),
         };
-        if pending.is_empty() {
+        if pending.is_empty() && reserves.is_empty() {
             return Ok(0);
         }
         let mut made = 0usize;
-        let mut remaining = pending.into_iter();
-        while let Some(key) = remaining.next() {
+        // `true` for a refusal's demand, `false` for a reserve's.
+        let mut remaining = pending
+            .into_iter()
+            .map(|k| (k, true))
+            .chain(reserves.into_iter().map(|k| (k, false)));
+        while let Some((key, owed)) = remaining.next() {
             // Every exit that does not finish this key puts back the key **and
-            // everything after it** — the list was taken whole, so leaving with
-            // only the current one restored would silently drop the rest and
-            // the classes behind it would never be created. That holds for the
-            // benign "a wave started" refusal and for genuine errors alike: an
-            // error aborts this drain, not the demand, and the next gap must
-            // still see it.
-            let requeue = |first: ArenaKey, rest: &mut dyn Iterator<Item = ArenaKey>| {
-                self.note_deferred_arena(first);
-                for key in rest {
-                    self.note_deferred_arena(key);
-                }
-            };
+            // every refusal's demand after it** — the list was taken whole, so
+            // leaving with only the current one restored would silently drop
+            // the rest and the classes behind it would never be created. That
+            // holds for the benign "a wave started" refusal and for genuine
+            // errors alike: an error aborts this drain, not the demand, and the
+            // next gap must still see it. A reserve's is found short again at
+            // the next gap.
+            let requeue =
+                |first: (ArenaKey, bool), rest: &mut dyn Iterator<Item = (ArenaKey, bool)>| {
+                    for (key, owed) in std::iter::once(first).chain(rest) {
+                        if owed {
+                            self.note_deferred_arena(key);
+                        }
+                    }
+                };
             // One window per arena rather than one for the batch: a forward that
             // arrives mid-drain then takes the partition at the next arena
             // instead of waiting for the whole list.
             let window = match self.arena_window(key) {
                 Ok(w) => w,
                 Err(e) if Self::is_wave_deferral(&e) => {
-                    requeue(key, &mut remaining);
+                    requeue((key, owed), &mut remaining);
                     break;
                 }
                 Err(e) => {
-                    requeue(key, &mut remaining);
+                    requeue((key, owed), &mut remaining);
                     return Err(e);
                 }
             };
@@ -719,12 +580,16 @@ impl BackingInner {
                     // arena whose window never closes is counted as reclaimable
                     // and then refused by the sweep for the life of the process.
                     self.pool.finish_creation(key, idx);
-                    // Made for a demand that has not filled it yet: protected
-                    // until it does, or the sweep this same gap runs reclaims
-                    // it first and the pass that wanted it is refused again.
-                    self.pool.protect_arena(idx);
-                    if let Ok(mut fresh) = self.fresh_arenas.lock() {
-                        fresh.push((key, idx, 0));
+                    // A refusal's arena is made for a demand that has not
+                    // filled it yet: protected until it does, or the sweep this
+                    // same gap runs reclaims it first and the pass that wanted
+                    // it is refused again. A reserve's needs no protection —
+                    // the sweep holds a reserve class at its arena.
+                    if owed {
+                        self.pool.protect_arena(idx);
+                        if let Ok(mut fresh) = self.fresh_arenas.lock() {
+                            fresh.push((key, idx, 0));
+                        }
                     }
                     made += 1;
                 }
@@ -734,7 +599,7 @@ impl BackingInner {
                     // put the demand back so the next gap retries it.
                     self.pool.force_release_arena(idx);
                     drop(window);
-                    requeue(key, &mut remaining);
+                    requeue((key, owed), &mut remaining);
                     return Err(e);
                 }
             }
@@ -1193,15 +1058,6 @@ impl ChunkedKvBacking {
     #[cfg(feature = "cuda")]
     pub fn create_deferred_arenas(&self) -> Result<usize> {
         self.inner.create_deferred_arenas()
-    }
-
-    /// Size every reserve to the native backlog, owe what each falls short,
-    /// and answer what was set — see [`BackingInner::owe_reserves`]. The gap's
-    /// [`Self::create_deferred_arenas`] does the same first; the persistence
-    /// pass calls this for its `kv_reserve` line.
-    #[cfg(feature = "cuda")]
-    pub fn owe_reserves(&self) -> ReserveReport {
-        self.inner.owe_reserves()
     }
 
     /// Whether a refused pass is still owed an arena here — `false` once the

@@ -108,6 +108,57 @@ mod deferred_arena_tests {
         Ok(())
     }
 
+    /// **A reserve is one arena, restored in the gap and never grown.** A
+    /// reserve class whose free slots are all taken is owed one arena, which
+    /// the gap makes; however much more stands live, nothing more. The arena
+    /// is not protected: once its class is empty again the sweep takes the
+    /// spare back, and the class keeps one arena free.
+    #[test]
+    fn a_drained_reserve_gets_one_arena_back_and_no_more() -> Result<()> {
+        let _serial = gpu_serial();
+        let Ok(device @ Device::Cuda(_)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let backing = ChunkedKvBacking::new(2, 4, 32, DType::BF16, &device, 256)?;
+        let pool = &backing.inner.pool;
+        let key = pool
+            .reserve_keys()
+            .into_iter()
+            .find(|k| k.location == ArenaLocation::Gpu)
+            .expect("a device reserve class");
+        assert_eq!(
+            backing.create_deferred_arenas()?,
+            0,
+            "a full reserve owes nothing"
+        );
+
+        let mut held = Vec::new();
+        while pool.free_slots(key) > 0 {
+            held.push(backing.alloc_chunk_for_key(key)?);
+        }
+        assert_eq!(
+            backing.create_deferred_arenas()?,
+            1,
+            "a drained reserve is owed one arena"
+        );
+        assert_eq!(pool.free_slots(key), key.chunks());
+        assert_eq!(
+            backing.create_deferred_arenas()?,
+            0,
+            "and only one, however much stands live"
+        );
+        assert!(!backing.arenas_owed());
+
+        drop(held);
+        let spare = pool
+            .next_tombstone(key, None)
+            .expect("the reserve's arena is not protected");
+        pool.recycle_arena_index(spare);
+        assert_eq!(pool.next_tombstone(key, None), None, "one arena stays free");
+        assert_eq!(pool.free_slots(key), key.chunks());
+        Ok(())
+    }
+
     /// **A deferral must never be laundered into scarcity.**
     ///
     /// `alloc_chunk_run_for_key` answers a failed stamp by promoting to a wider

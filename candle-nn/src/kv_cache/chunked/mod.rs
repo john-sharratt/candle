@@ -111,7 +111,6 @@ pub(crate) mod reservation;
 /// Pure arithmetic, outside the `cuda` gate so it is tested anywhere; only the
 /// CUDA allocator sizes a reserve with it.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-mod reserve_target;
 pub mod sampled_selection;
 pub mod seal_gather;
 #[cfg(test)]
@@ -229,7 +228,6 @@ pub use super::arena_table::ArenaLocation;
 
 pub use alloc::class_promotion_count;
 #[cfg(feature = "cuda")]
-pub use alloc::{ReserveClass, ReserveReport};
 #[cfg(feature = "cuda")]
 pub use aside::aside;
 #[cfg(not(feature = "cuda"))]

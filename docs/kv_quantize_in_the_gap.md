@@ -273,7 +273,14 @@ chooses among them.**
   An over-estimate costs only slots allocated and returned within one gap; an
   under-estimate defers the blocks past it, whose exact demand the summary then
   reports, and the next gap places them. Nothing is held against a backlog:
-  this replaces §2a's backlog-sized reserve. The lease is KV ground below
+  this replaces §2a's backlog-sized reserve. What stays of the reserve is a
+  guard, one arena's worth of free slots for each class the policy reaches
+  (`keep_reserves`): on a card full of native K/V with nothing left to buy,
+  the gap's first conversion has somewhere to write, and every block it
+  installs gives back more native ground than it took. The gap's
+  `create_deferred_arenas` restores a reserve fallen below its arena
+  (`reserves_short`), unprotected, since the sweep already holds a reserve
+  class at its arena; nothing grows it past that. The lease is KV ground below
   `weight_floor` (invariant 7), from free slots in existing arenas first and
   then new arenas. **Firm demand** — retried blocks' exact demand, the measured
   shares, a cold gap's even split — may buy ground from the weight side when
@@ -653,9 +660,11 @@ scale whichever gap quantizes them.
 - The public `quantize_layers_deferred` wrapper. Its `_within` form stays, as
   the reference seal the gap's device tests hold it to, byte for byte.
 - The persistence pass's `kv_reserve: pass` line and
-  `persistence/reserve_log.rs` (§3.7). The reserve itself stays: the gap's own
-  `create_deferred_arenas` sizes it (`owe_reserves`), and the gap's lease
-  draws on it (§3.2).
+  `persistence/reserve_log.rs` (§3.7).
+- The backlog-sized reserve (`kv_drain_under_pressure.md` §2a): `owe_reserves`,
+  `reserve_target.rs` with its `RESERVE_CAP_PERCENT`, `ReserveReport` and
+  `ReserveClass`, the pool's per-class targets (`set_reserve_target`) and the
+  sweep's hysteresis band above them. A reserve is one arena (§3.2).
 - `MigrateFlight` as a quantize lock (§5).
 - The selection's host readback of palettes, scales and maps
   (`sampled_selection/gpu.rs`). The summary row carries them (§3.4).
@@ -787,9 +796,10 @@ Line numbers are as of commit `dc04b62ac`.
   allocates through `allocate_n_for`, which already takes the lowest-placed
   arena with a free slot (a find-first-set over the capacity bitmap); each
   slot's address is computed as it is allocated, so building the stack is a
-  copy. `set_reserve_target` (`:1465`) goes.
-- `candle-nn/src/kv_cache/chunked/alloc.rs:509`, `owe_reserves`, and
-  `reserve_target.rs:45`, `reserve_targets`: replaced by the lease's demand.
+  copy. `set_reserve_target` is gone: a reserve class keeps one arena.
+- `candle-nn/src/kv_cache/chunked/alloc.rs`, `owe_reserves`, and
+  `reserve_target.rs`, `reserve_targets`: replaced by the lease's demand, with
+  `reserves_short` restoring the one-arena guard.
 - `alloc.rs:664`, `create_deferred_arenas`, and the compaction: run with the
   gap's demand per class set aside as ground, and make the arenas a lease is
   short of, in the gap.
