@@ -15,12 +15,62 @@
 //! ([`at_site`]) and a backtrace, so a run names the next site to port instead
 //! of a number to account for. Off — the default — cudarc allocates as it always
 //! did, and [`at_site`] compiles to the closure it wraps.
+//!
+//! The watch is installed either way, because it also serves: inside a load's
+//! [`super::load_scratch::transient`] scope an allocation comes from the top of
+//! the span rather than from the driver, and goes back there when it drops.
+
+use std::sync::Arc;
+
+use cudarc::driver::sys::CUdeviceptr;
+use cudarc::driver::{install_alloc_watch, AllocWatch, CudaStream};
+
+use super::load_scratch;
 
 #[cfg(not(feature = "driver-alloc-panic"))]
 use std::panic::Location;
 
 #[cfg(feature = "driver-alloc-panic")]
-pub(crate) use watch::{at_site, install, report_load_survivors};
+pub(crate) use watch::{at_site, report_load_survivors};
+
+/// The process's allocation watch: the load scratch's server, and with the
+/// feature on the census and the refusal.
+struct Watch;
+
+impl AllocWatch for Watch {
+    fn serve(&self, stream: &Arc<CudaStream>, bytes: usize) -> Option<CUdeviceptr> {
+        load_scratch::serve(
+            stream.context().ordinal(),
+            stream.cu_stream() as usize,
+            bytes,
+        )
+    }
+
+    fn take_back(&self, ptr: CUdeviceptr) -> bool {
+        load_scratch::take_back(ptr)
+    }
+
+    #[cfg(feature = "driver-alloc-panic")]
+    fn alloc(&self, stream: &Arc<CudaStream>, bytes: usize) {
+        watch::alloc(stream, bytes)
+    }
+
+    #[cfg(feature = "driver-alloc-panic")]
+    fn allocated(&self, stream: &Arc<CudaStream>, ptr: CUdeviceptr, bytes: usize) {
+        watch::allocated(stream, ptr, bytes)
+    }
+
+    #[cfg(feature = "driver-alloc-panic")]
+    fn freed(&self, ptr: CUdeviceptr) {
+        watch::freed(ptr)
+    }
+}
+
+/// Install the watch for the process. Idempotent: every device is created
+/// through here, and the first install is the one that stands.
+pub(crate) fn install() {
+    install_alloc_watch(Arc::new(Watch));
+}
 
 /// Nothing is recorded with the feature off.
 #[cfg(not(feature = "driver-alloc-panic"))]
@@ -34,11 +84,6 @@ pub(crate) fn at_site<R>(_site: &'static Location<'static>, f: impl FnOnce() -> 
     f()
 }
 
-/// Nothing to install with the feature off.
-#[cfg(not(feature = "driver-alloc-panic"))]
-#[inline(always)]
-pub(crate) fn install() {}
-
 #[cfg(feature = "driver-alloc-panic")]
 mod watch {
     use std::backtrace::Backtrace;
@@ -49,7 +94,7 @@ mod watch {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use cudarc::driver::sys::CUdeviceptr;
-    use cudarc::driver::{install_alloc_watch, AllocWatch, CudaStream};
+    use cudarc::driver::CudaStream;
 
     use super::super::held::ground_for;
     use super::super::load_window::is_open;
@@ -147,57 +192,48 @@ mod watch {
         }
     }
 
-    /// Refuses every allocation cudarc is asked for outside a model load
-    /// ([`super::super::LoadWindow`]), and keeps the census of the ones a load
-    /// makes.
-    struct Refuse;
-
-    impl AllocWatch for Refuse {
-        fn allocated(&self, stream: &Arc<CudaStream>, ptr: CUdeviceptr, bytes: usize) {
-            let ordinal = stream.context().ordinal();
-            if is_open(ordinal) {
-                standing().lock().unwrap_or_else(|e| e.into_inner()).insert(
-                    ptr,
-                    Standing {
-                        ordinal,
-                        bytes,
-                        site: current_site(),
-                        trace: Backtrace::force_capture(),
-                    },
-                );
-            }
-        }
-
-        fn freed(&self, ptr: CUdeviceptr) {
-            standing()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&ptr);
-        }
-
-        fn alloc(&self, stream: &Arc<CudaStream>, bytes: usize) {
-            let ordinal = stream.context().ordinal();
-            if is_open(ordinal) {
-                return;
-            }
-            let site = current_site();
-            let when = if ground_for(ordinal).is_some() {
-                "with the span claimed"
-            } else {
-                "before the span exists"
-            };
-            panic!(
-                "driver allocation of {bytes} B on device {ordinal} {when}, outside a model \
-                 load, at {site}: every runtime device allocation belongs to an arena of the \
-                 span (docs/driver_model.md §4)\n{}",
-                Backtrace::force_capture()
+    /// A driver allocation landed: inside a model load
+    /// ([`super::super::LoadWindow`]) it joins the census.
+    pub(super) fn allocated(stream: &Arc<CudaStream>, ptr: CUdeviceptr, bytes: usize) {
+        let ordinal = stream.context().ordinal();
+        if is_open(ordinal) {
+            standing().lock().unwrap_or_else(|e| e.into_inner()).insert(
+                ptr,
+                Standing {
+                    ordinal,
+                    bytes,
+                    site: current_site(),
+                    trace: Backtrace::force_capture(),
+                },
             );
         }
     }
 
-    /// Install the watch for the process. Idempotent: every device is created
-    /// through here, and the first install is the one that stands.
-    pub(crate) fn install() {
-        install_alloc_watch(Arc::new(Refuse));
+    /// A driver allocation is freed: it leaves the census.
+    pub(super) fn freed(ptr: CUdeviceptr) {
+        standing()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ptr);
+    }
+
+    /// Refuse a driver allocation asked for outside every model load.
+    pub(super) fn alloc(stream: &Arc<CudaStream>, bytes: usize) {
+        let ordinal = stream.context().ordinal();
+        if is_open(ordinal) {
+            return;
+        }
+        let site = current_site();
+        let when = if ground_for(ordinal).is_some() {
+            "with the span claimed"
+        } else {
+            "before the span exists"
+        };
+        panic!(
+            "driver allocation of {bytes} B on device {ordinal} {when}, outside a model \
+             load, at {site}: every runtime device allocation belongs to an arena of the \
+             span (docs/driver_model.md §4)\n{}",
+            Backtrace::force_capture()
+        );
     }
 }

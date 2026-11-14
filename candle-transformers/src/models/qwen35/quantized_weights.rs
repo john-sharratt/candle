@@ -1019,6 +1019,26 @@ impl<R: Read + Seek> Loader<'_, R> {
         if let Some(m) = self.host_banded(name, want)? {
             return Ok(m);
         }
+        // A source read whole only to be repacked into a twin in the dense block is a
+        // transient of the load, served from its scratch at the span's top — under the
+        // rule `host_banded` takes a tensor by, since it is the same tensor this load
+        // could not band for want of a mapping.
+        let twin_in_dense = self.residency == WeightResidency::Span
+            && self
+                .overrides
+                .and_then(|o| o.effective_info(self.content, name))
+                .or_else(|| self.content.tensor_infos.get(name))
+                .is_some_and(|info| dense_span::bands_from_host(info, self.mode));
+        if twin_in_dense {
+            dense_span::transient(|| self.read_whole(name, want))
+        } else {
+            self.read_whole(name, want)
+        }
+    }
+
+    /// A projection read to the device whole and built there, its twin narrowed to `want`
+    /// where that shrinks it.
+    fn read_whole(&mut self, name: &str, want: Option<GgmlDType>) -> Result<QMatMul> {
         let qt = self.raw(name)?;
         match want {
             None => QMatMul::from_qtensor_in(qt, self.mode, self.residency),

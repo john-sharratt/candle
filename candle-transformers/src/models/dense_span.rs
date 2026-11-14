@@ -48,10 +48,10 @@ use crate::models::quantized_matmul::QMatMul;
 /// A model load in progress: open from [`open_for_load`] until the loader that
 /// holds it returns.
 ///
-/// It stands the device's [`LoadWindow`], so the load's own allocations — its
-/// sources, the repack's bands, the layer pack's build after [`close_load`] — go
-/// to the driver, and a driver allocation made outside every load is the
-/// `driver-alloc-panic` feature's to refuse. Held by the loader for its whole
+/// It stands the device's [`LoadWindow`], so the load's own allocations — the
+/// ones [`transient`] does not serve from the load's scratch, and the layer
+/// pack's build after [`close_load`] — go to the driver, and a driver allocation
+/// made outside every load is the `driver-alloc-panic` feature's to refuse. Held by the loader for its whole
 /// body (`let _load = …`), so everything that builds the model is inside it.
 #[must_use = "the load window closes when this drops: bind it for the loader's whole body"]
 pub struct Load {
@@ -86,7 +86,8 @@ pub fn open_for_load_sized(device: &Device, headroom: usize) -> Result<Load> {
                     target: "candle_transformers::dense_span",
                     headroom_mib = headroom >> 20,
                     "device reservation claimed before load; the largest source tensor and the \
-                     repack's bounded f32 band stay with the driver"
+                     repack's bounded f32 band are served from the load's scratch at the span's \
+                     top until close_load"
                 );
             } else {
                 tracing::info!(
@@ -241,6 +242,22 @@ pub fn place_host_in_dense(
         }
     }
     qtensor_from_ggml(dtype, bytes, dims.to_vec(), device)
+}
+
+/// Run `f` with its device allocations served from the load's scratch at the
+/// span's top (`load_scratch`), for a read whose result is a twin in the dense
+/// block: the source `f` reads whole, and the repack's bands, are gone when it
+/// returns. A twin the dense block declines would be left standing in the
+/// scratch, and `close_load` refuses it there. A no-op off CUDA.
+pub fn transient<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "cuda")]
+    {
+        candle::cuda_backend::load_scratch::transient(f)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        f()
+    }
 }
 
 /// Whether a load builds this tensor's KO twin from its bytes on the host, a

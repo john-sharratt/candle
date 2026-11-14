@@ -173,8 +173,24 @@ impl Qwen4ExpGpu {
         let f32_source = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             g.qtensor(name, device)?.dequantize(device)
         };
+        // A source read whole only to be repacked into a twin in the dense block
+        // is a transient of the load, served from its scratch at the span's top
+        // (`dense_span::transient`); one that stays as read is not.
+        let twins = |g: &GgufModel, names: &[&str]| -> bool {
+            names.iter().all(|n| {
+                g.info(n)
+                    .is_some_and(|info| dense_span::bands_from_host(info, int8mode))
+            })
+        };
         let qm = |g: &mut GgufModel, name: &str| -> Result<QMatMul> {
-            QMatMul::from_qtensor_with_mode(g.qtensor(name, device)?, int8mode)
+            let read = |g: &mut GgufModel| {
+                QMatMul::from_qtensor_with_mode(g.qtensor(name, device)?, int8mode)
+            };
+            if twins(g, &[name]) {
+                dense_span::transient(|| read(g))
+            } else {
+                read(g)
+            }
         };
         // Several projections that read one activation over one contraction,
         // row-concatenated into a single weight so the block issues one GEMM
@@ -188,13 +204,23 @@ impl Qwen4ExpGpu {
         // rows interleaved, and the append is refused by name. This engine has
         // no per-tensor narrowing schedule — every projection takes the mode's
         // twin — so unlike the qwen35 streaming loader it is free to stack.
+        // The parts and their concatenation are the repack's sources: transients
+        // when every part takes a twin, as the stacked weight then does.
         let stack = |g: &mut GgufModel, names: &[String]| -> Result<QMatMul> {
-            let parts = names
-                .iter()
-                .map(|n| g.qtensor(n, device))
-                .collect::<Result<Vec<_>>>()?;
-            let refs: Vec<&QTensor> = parts.iter().collect();
-            QMatMul::from_qtensor_with_mode(QTensor::concat_rows_cuda(&refs)?, int8mode)
+            let read = |g: &mut GgufModel| {
+                let parts = names
+                    .iter()
+                    .map(|n| g.qtensor(n, device))
+                    .collect::<Result<Vec<_>>>()?;
+                let refs: Vec<&QTensor> = parts.iter().collect();
+                QMatMul::from_qtensor_with_mode(QTensor::concat_rows_cuda(&refs)?, int8mode)
+            };
+            let parts: Vec<&str> = names.iter().map(String::as_str).collect();
+            if twins(g, &parts) {
+                dense_span::transient(|| read(g))
+            } else {
+                read(g)
+            }
         };
         // The inject rows are stacked under the down projection at load, which
         // is what makes the read gate and the write weights one GEMM instead of
