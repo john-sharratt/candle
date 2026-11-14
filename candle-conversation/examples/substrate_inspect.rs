@@ -34,6 +34,12 @@
 //!   export-kept --daemon <zend|npcd> --out <file>
 //!                         the kept custom objects as the daemon's export,
 //!                         read-only under no model (directory target)
+//!   export-cast --out <file>
+//!                         npcd's cast and its portraits, read-only under no
+//!                         model (directory target)
+//!   import --daemon <zend|npcd> [--kept <file>] [--cast <file>]
+//!                         WRITES: build a fresh store at the target from the
+//!                         two exports (target must not exist, daemon stopped)
 //! ```
 //!
 //! `<stream-id>` accepts decimal or `0x`-prefixed hex (as printed by
@@ -50,6 +56,8 @@
     clippy::unnecessary_map_or
 )]
 
+#[path = "substrate_inspect/cast.rs"]
+mod cast;
 #[path = "substrate_inspect/completeness.rs"]
 mod completeness;
 #[path = "substrate_inspect/faces.rs"]
@@ -699,6 +707,29 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// npcd's cast — every character's record and the portraits they name —
+    /// read-only, under no model, for a wipe-and-rebuild
+    /// (`docs/hit_driven_projection.md` §13.4). Directory target only.
+    ExportCast {
+        /// The file the export is written to.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// **Writes.** Build a fresh store at the target from an `export-kept`
+    /// and an `export-cast`: the kept objects, then the portraits and every
+    /// character verbatim. The target must not exist yet, and the daemon must
+    /// be stopped; it binds the store's model at its first open.
+    Import {
+        /// The daemon the kept export names: `zend` or `npcd`.
+        #[arg(long)]
+        daemon: String,
+        /// An `export-kept` to write.
+        #[arg(long)]
+        kept: Option<PathBuf>,
+        /// An `export-cast` to write.
+        #[arg(long)]
+        cast: Option<PathBuf>,
+    },
     /// Export a conversation's projection points + candidate/target galleries
     /// as an offline selection-replay fixture
     /// (`docs/provenance_adaptive_projection.md` §11): per dialogue turn the raw
@@ -1223,6 +1254,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let target = cli.log.clone().unwrap_or_else(default_log_path);
 
+    // An import builds the store it targets, so there is nothing yet to open.
+    if let Cmd::Import { daemon, kept, cast } = &cli.cmd {
+        return cast::import(&target, daemon, kept.as_deref(), cast.as_deref());
+    }
+
     // A directory is the segmented store: `summary` aggregates every segment;
     // the single-segment views open the active segment.
     let log_path = if target.is_dir() {
@@ -1251,6 +1287,9 @@ fn main() -> Result<()> {
         }
         if let Cmd::ExportKept { daemon, out } = &cli.cmd {
             return kept::export_kept(&target, daemon, out);
+        }
+        if let Cmd::ExportCast { out } = &cli.cmd {
+            return cast::export_cast(&target, out);
         }
         if let Cmd::Conversations { filter, limit } = &cli.cmd {
             return segment_conversations(&segs, filter, *limit);
@@ -1338,6 +1377,10 @@ fn main() -> Result<()> {
         Cmd::ExportKept { .. } => {
             anyhow::bail!("export-kept requires the segmented `substrate` DIRECTORY target")
         }
+        Cmd::ExportCast { .. } => {
+            anyhow::bail!("export-cast requires the segmented `substrate` DIRECTORY target")
+        }
+        Cmd::Import { .. } => unreachable!("an import is dispatched before the target opens"),
         Cmd::Couplings { .. } => {
             anyhow::bail!("couplings requires the segmented `substrate` DIRECTORY target")
         }

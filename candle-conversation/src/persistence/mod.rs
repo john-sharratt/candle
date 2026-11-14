@@ -32,6 +32,7 @@ mod adoption_tests;
 pub mod appended;
 pub mod applied_mix;
 pub mod blob;
+pub mod cast;
 pub mod chunk_plan;
 pub mod chunk_window_integrity;
 pub mod cold_load;
