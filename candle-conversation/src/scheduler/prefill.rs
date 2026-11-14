@@ -1666,6 +1666,20 @@ impl Scheduler {
                 },
             );
             let t = report.timings;
+            self.wave_stats.compaction_split.kv_stage(
+                [
+                    t.quiesce,
+                    t.plan,
+                    t.claim,
+                    t.copy,
+                    t.barrier,
+                    t.sweep,
+                    t.mint,
+                    t.invalidate,
+                    t.publish,
+                ],
+                report.moves,
+            );
             super::profile::record("compact:quiesce", t.quiesce);
             super::profile::record("compact:plan", t.plan);
             super::profile::record("compact:claim", t.claim);
