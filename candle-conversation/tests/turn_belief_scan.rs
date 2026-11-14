@@ -57,14 +57,19 @@ fn sig(fill: u64) -> WideQSig {
     }
 }
 
-/// Six signature fills a warm-up can learn from: `n` leading one bits for `n`
-/// of 64, 60, 52, 40, 24 and 4, so the gaps between neighbours (4, 8, 12, 16,
-/// 20 bits) all differ. With its own exchange left out every probe has ONE
-/// nearest other exchange, and turn 1 is the nearest for turns 0 and 2. Six
-/// probes teach thirty samples, past the eight a background needs, where three
-/// one-token turns taught too few for the warmed read to differ from the cold.
-fn graded_fills() -> [u64; 6] {
-    [64u32, 60, 52, 40, 24, 4].map(|n| !0u64 << (64 - n))
+/// Eleven signature fills a warm-up can learn from: `n` leading one bits for
+/// `n` of 64, 63, 61, 58, 54, 49, 43, 36, 28, 19 and 9, so the gaps between
+/// neighbours (1 to 10 bits) all differ. With its own exchange left out every
+/// probe has ONE nearest other exchange, and turn 1 is the nearest for turns 0
+/// and 2. Late fusion gives each probe's vote to that one exchange and a
+/// sample of no evidence teaches nothing, so each probe teaches one scoring
+/// sample: eleven are past the eight a background needs, where six fell short
+/// of it and the warmed read stayed the cold one.
+/// How many of a file's exchanges the ingest warm-up probes.
+const WARM_INGEST_PROBES: usize = 8;
+
+fn graded_fills() -> [u64; 11] {
+    [64u32, 63, 61, 58, 54, 49, 43, 36, 28, 19, 9].map(|n| !0u64 << (64 - n))
 }
 
 #[test]
@@ -463,7 +468,10 @@ fn the_ingest_warm_up_scores_each_probe_without_its_own_exchange() {
     };
     let reference = NormalizationCache::default();
     let scope = ScopeKey::turn_group(group.raw() as u64, timeline.raw());
-    for (k, window) in windows.iter().enumerate() {
+    // The warm-up self-probes a file's first `WARM_INGEST_PROBES` exchanges
+    // (`resolver.rs`'s `WARM_INGEST_PROBES_PER_TIMELINE`), each teaching every
+    // other exchange; the rest are taught, never probed.
+    for (k, window) in windows.iter().enumerate().take(WARM_INGEST_PROBES) {
         let answer = ChildKey::turn(k as u64);
         reference.observe(
             &scope,
@@ -1239,11 +1247,21 @@ fn record_warm_corpus(
     let group = builder.id_for_group("clusters").unwrap();
     let timeline = TimelineId::from_raw(31).expect("timeline id");
     conv.register_timeline(timeline, layer, group);
-    let exemplars: [(&str, u64, usize); 4] = [
+    // Five exemplars a member: each is scored without its own member, so it
+    // can teach only the other one, and ten probes teach the scope's pooled
+    // background past the eight scoring samples it needs; four taught four,
+    // and the warmed read stayed the cold one.
+    let exemplars: [(&str, u64, usize); 10] = [
         ("alpha", 0xAAAA_AAAA_AAAA_AAAA, 40),
         ("alpha", 0xABAB_ABAB_ABAB_ABAB, 17),
+        ("alpha", 0xAAAA_AAAA_0000_FFFF, 25),
+        ("alpha", 0xAAAB_AAAB_AAAB_AAAB, 12),
+        ("alpha", 0xEAEA_EAEA_EAEA_EAEA, 30),
         ("beta", 0x5555_5555_5555_5555, 33),
         ("beta", 0x1234_5678_9ABC_DEF0, 8),
+        ("beta", 0x5555_5555_FFFF_0000, 21),
+        ("beta", 0x5455_5455_5455_5455, 14),
+        ("beta", 0x1515_1515_1515_1515, 27),
     ];
     exemplars
         .iter()
@@ -1321,10 +1339,10 @@ fn the_collection_warm_up_scores_each_exemplar_without_its_own_member() {
         warm,
         CollectionWarm {
             members: 2,
-            probes: 4,
+            probes: 10,
             gpu_probes: 0,
         },
-        "two members have exemplars; all four were folded, on the CPU"
+        "two members have exemplars; all ten were folded, on the CPU"
     );
 
     let got = conv.score_belief_collections(sp, &probe, None, Observe::No, None);
@@ -1372,8 +1390,8 @@ fn the_gpu_collection_warm_up_learns_the_cpu_levels() {
         warm,
         CollectionWarm {
             members: 2,
-            probes: 4,
-            gpu_probes: 4,
+            probes: 10,
+            gpu_probes: 10,
         },
         "every exemplar is scored on the arena"
     );
