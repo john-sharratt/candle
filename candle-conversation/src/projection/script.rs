@@ -159,7 +159,9 @@ impl ProjectionScript {
     }
 
     /// Take `turns`, by `(timeline, index)`, out of every point: the control
-    /// that asks what a decode does without them.
+    /// that asks what a decode does without them. A placed unit is named by
+    /// its opening as the recording names it, not by the face that stands in
+    /// for it ([`ScriptedChoice::place_turns`]).
     pub fn without(mut self, turns: &HashSet<(u64, u32)>) -> Self {
         for point in &mut self.points {
             if let Some(choice) = &mut point.choice {

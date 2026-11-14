@@ -119,12 +119,14 @@ fn value_of(bytes: &[u8]) -> String {
     out
 }
 
-/// A raw value's content from the bytes its span took: up to its
-/// `</parameter>`, the one framing line break before it taken off, as every
+/// A raw value's content from the bytes its span took: up to the
+/// `</parameter>` that closed it — the last one, since a value may hold the
+/// text and only the marker a tag follows ends it, and nothing after the close
+/// holds another — the one framing line break before it taken off, as every
 /// reader of a block takes it (`element_close`).
 fn raw_value_of(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
-    let value = text.split(PARAM_CLOSE).next().unwrap_or_default();
+    let value = text.rfind(PARAM_CLOSE).map_or(&text[..], |at| &text[..at]);
     let value = value.strip_suffix('\n').unwrap_or(value);
     value.strip_suffix('\r').unwrap_or(value).to_string()
 }
@@ -197,6 +199,11 @@ mod tests {
         assert_eq!(raw_value_of(b"1-120\n</parameter>\n</function>"), "1-120");
         assert_eq!(raw_value_of(b"a \"b\"\r\n</parameter>"), "a \"b\"");
         assert_eq!(raw_value_of(b"src/a"), "src/a");
+        assert_eq!(
+            raw_value_of(b"x</parameter> y</parameter>\n</function>"),
+            "x</parameter> y",
+            "only the marker a tag follows ends a value"
+        );
         let mut call = CallSoFar::default();
         call.named(Some(Arc::from("file_read")), &[]);
         call.open(Arc::from("path"), ValueText::Raw);

@@ -7,6 +7,7 @@
 //! stencil's mask; prefilled static runs are emitted automatically.  This is the
 //! decode loop, minus the forward pass.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use candle_conversation::stencil::{
@@ -1988,7 +1989,7 @@ fn held_reading(vocab: &HfVocab, repo: &str, path: &str, lines: &[&str]) -> Arc<
         tools: vec!["file_read".to_string()],
         field: field.to_string(),
         on: Vec::new(),
-        table: std::collections::HashMap::from([(Vec::new(), values)]),
+        table: HashMap::from([(Vec::new(), values)]),
     };
     let holds = ValueHolds {
         fields: vec![
