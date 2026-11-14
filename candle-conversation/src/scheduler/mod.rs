@@ -60,6 +60,7 @@ pub(crate) mod kv_zero_check;
 pub mod memory_report;
 mod named_tool;
 mod norm_warm;
+mod page_cut;
 mod paused_creep;
 mod pending_ranges;
 pub mod phase_ring;
@@ -13471,12 +13472,12 @@ mod tests {
     /// unit's K/V anchor is taken. Everything a test can get wrong about that
     /// timing is visible here as a wrong page width.
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
-    struct ToyPages {
+    pub(super) struct ToyPages {
         /// Widths of the pages closed so far, oldest first.
-        closed: Vec<u32>,
+        pub(super) closed: Vec<u32>,
         /// Tokens forwarded since the last close — the live tail, which a unit
         /// beginning on this slot must not be allowed to extend.
-        tail: u32,
+        pub(super) tail: u32,
     }
 
     impl ToyPages {
@@ -13515,7 +13516,7 @@ mod tests {
     /// the scheduler holds the model by shared reference while a wave mutates
     /// the sequences in it.
     #[derive(Clone, Default)]
-    struct RecurrentProbe {
+    pub(super) struct RecurrentProbe {
         states: Arc<Mutex<HashMap<usize, ToyState>>>,
         /// The model's *other* recurrence, standing in for Flash-Next's QSA
         /// index: a token count, from which whole rows and a ragged open block
@@ -13563,13 +13564,13 @@ mod tests {
             self.index.lock().unwrap().get(&seq).copied()
         }
 
-        fn advance_index(&self, seq: usize, tokens: usize) {
+        pub(super) fn advance_index(&self, seq: usize, tokens: usize) {
             let mut idx = self.index.lock().unwrap();
             idx.entry(seq).or_default().tokens += tokens as u32;
             self.pages.lock().unwrap().entry(seq).or_default().tail += tokens as u32;
         }
 
-        fn get_pages(&self, seq: usize) -> ToyPages {
+        pub(super) fn get_pages(&self, seq: usize) -> ToyPages {
             self.pages
                 .lock()
                 .unwrap()
@@ -14089,7 +14090,8 @@ mod tests {
     /// [`make_test_scheduler`] over a [`DummyRecurrentModel`], returning the
     /// probe as well so a test can read the state the scheduler's boxed model
     /// is carrying.
-    fn make_test_scheduler_recurrent() -> (Scheduler, Sender<SchedulerRequest>, RecurrentProbe) {
+    pub(super) fn make_test_scheduler_recurrent(
+    ) -> (Scheduler, Sender<SchedulerRequest>, RecurrentProbe) {
         let (tx, rx) = flume::bounded(16);
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();

@@ -11,6 +11,7 @@ use super::first_sample::{
     contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
 };
 use super::gang;
+use super::page_cut::{break_advance, chunk_closes_page};
 use super::paused_creep::{drop_rows, PausedCreep};
 use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
 use super::section_pack;
@@ -4139,6 +4140,7 @@ impl Scheduler {
         }
         self.fit_cohort_to_ground(&mut members);
         self.cut_at_recurrent_spans(&mut members);
+        self.cut_at_page_breaks(&mut members);
         let used: usize = members
             .iter()
             .map(|m| match m {
@@ -4174,6 +4176,35 @@ impl Scheduler {
         let held = self.held_arena_bytes();
         self.sweep_forecast.held_formed(held);
         self.wave_prefill_members = members;
+    }
+
+    /// End each prefill's chunk just past the first page break it would cross
+    /// (`page_cut`), so the page closes there when the group's sweep commits it
+    /// (`complete_wave_group`). A chunk that runs an armed recurrent span is left
+    /// whole: the model honours the arm only on exactly that span. Members stay
+    /// in the one group, so the cut costs a member one more sweep per break and
+    /// no launch of its own.
+    fn cut_at_page_breaks(&self, members: &mut [WaveMember]) {
+        let breaks = self.prefill_breaks();
+        if breaks.is_empty() {
+            return;
+        }
+        for m in members.iter_mut() {
+            let WaveMember::Prefill { seq_id, advance } = m else {
+                continue;
+            };
+            let Some(p) = self
+                .active_prefills
+                .iter()
+                .find(|p| p.work.sequence_id.0 == *seq_id)
+            else {
+                continue;
+            };
+            if span_at(&p.work.recurrent_spans, p.offset).is_some() {
+                continue;
+            }
+            *advance = break_advance(&p.work.tokens[..], p.offset, *advance, breaks);
+        }
     }
 
     /// Cut each prefill's chunk so that every recurrent span of its turn runs as
@@ -4599,6 +4630,11 @@ impl Scheduler {
                         &chunk_tokens,
                     );
                     self.active_prefills[i].offset = end;
+                    // A chunk `cut_at_page_breaks` ended on a break closes its
+                    // page now, between this sweep's forward and the next.
+                    if chunk_closes_page(&chunk_tokens, end < total, self.prefill_breaks()) {
+                        self.close_page_at_break(seq_id, &chunk_tokens);
+                    }
                     if end < total {
                         // More to prefill: report progress and ride the next group.
                         let _ = self.active_prefills[i].work.event_tx.send(
@@ -7217,7 +7253,7 @@ mod wave_chunk_tests {
     use super::super::admit::rate::{DecodeModel, ExpertGeometry, RateModel};
     use super::super::admit::{fill, Ground, Kind, WaveRate};
     use super::super::admit_ground::AdmitPass;
-    use super::super::tests::make_test_scheduler;
+    use super::super::tests::{make_test_scheduler, make_test_scheduler_recurrent, ToyPages};
     use super::super::*;
 
     /// A dialogue prefill carrying `tokens` and nothing else.
@@ -7459,6 +7495,49 @@ mod wave_chunk_tests {
         let rows = inputs[0].to_vec2::<u32>().expect("u32 rows");
         assert_eq!(rows[0].len(), 200, "the tail chunk is what remains");
         assert_eq!(rows[0][0], 14_800, "the chunk starts at the offset");
+    }
+
+    /// **A creeping turn closes a page at the edge between its records.** The
+    /// npcd turn whose first page measured 109 against an edge of 91: a user
+    /// record of 91 tokens ending on its `<|im_end|>`, then the assistant's
+    /// 18-token opener. The group's first chunk ends at the edge, the page closes
+    /// when that sweep commits, and the opener rides the next chunk, so the user
+    /// record can be placed alone (`docs/hit_driven_projection.md` §8.1).
+    #[test]
+    fn a_creeping_turn_closes_a_page_at_its_user_records_edge() {
+        const IM_END: u32 = 900;
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        scheduler.page_break_tokens = vec![IM_END];
+        let seq = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let mut tokens = vec![1u32; 90];
+        tokens.push(IM_END);
+        tokens.extend([2u32; 18]);
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(seq, tokens));
+
+        scheduler.form_wave_group(false);
+        let (members, _, inputs, _) = scheduler.build_wave_group_inputs();
+        assert_eq!(inputs[0].dims(), &[1, 91], "the chunk ends at the edge");
+        // The sweep's forward pools the chunk's rows into the open page.
+        probe.advance_index(seq.0, 91);
+        scheduler.complete_wave_group(&members, &[]);
+        assert_eq!(
+            probe.get_pages(seq.0),
+            ToyPages {
+                closed: vec![91],
+                tail: 0
+            },
+            "the first page is the user record, 91 wide"
+        );
+
+        scheduler.form_wave_group(false);
+        let (_, _, inputs, _) = scheduler.build_wave_group_inputs();
+        assert_eq!(
+            inputs[0].dims(),
+            &[1, 18],
+            "the opener rides the next chunk"
+        );
     }
 
     /// **An opening on a filled slot creeps to its next boundary and waits

@@ -553,7 +553,12 @@ index page.
   without an index page is not a valid placement: the selection could not
   rank it, and it would be attended only through the query's tail. The
   substrate starts empty under the new key (§4), so every record is sealed
-  per half from its first write.
+  per half from its first write. The page between the halves closes after
+  the user record's `<|im_end|>` on every prefill path: a single-sequence
+  prefill splits its span at each break token, and a creeping wave group
+  ends a member's chunk just past the first break it would cross and closes
+  the page when that sweep commits (`scheduler/page_cut.rs`), all in one
+  batched forward.
 - **Ragged, not padded.** Each half ends on its own partial chunk and partial
   block, as every system-prompt section already does (§5). Seated halves take
   consecutive positions; the short tail is a short page in storage, never dead
