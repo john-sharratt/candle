@@ -11565,21 +11565,28 @@ impl Scheduler {
         // Where an elevate's time went: the keep-set publish every call pays, the
         // tier walk, and — only when something is not hot — the eviction and the
         // lift itself, with how much was lifted.
-        let split = |evict_us: u64, lift_us: u64| {
+        // A lift's report says where what it lifted came from: warm (host RAM)
+        // or cold (the log), and how many bytes of each.
+        let split = |evict_us: u64, lift_us: u64, from: (usize, usize, u64, u64)| {
             note("elevate split", || {
                 format!(
                     "whence={whence} pins_us={pins_us} tier_us={tier_us} evict_us={evict_us} \
-                     lift_us={lift_us} sections={} turns={} lifted_sections={} lifted_turns={}",
+                     lift_us={lift_us} sections={} turns={} lifted_sections={} lifted_turns={} \
+                     warm_to_hot={} cold_to_hot={} warm_mib={} cold_mib={}",
                     sections.len(),
                     turns.len(),
                     secs_lift.len(),
                     turns_lift.len(),
+                    from.0,
+                    from.1,
+                    from.2 >> 20,
+                    from.3 >> 20,
                 )
             });
         };
         // Everything already hot → nothing to evict or lift.
         if secs_lift.is_empty() && turns_lift.is_empty() {
-            split(0, 0);
+            split(0, 0, (0, 0, 0, 0));
             return;
         }
         let backings = self.session.backings().to_vec();
@@ -11618,7 +11625,15 @@ impl Scheduler {
             &turns_lift,
         );
         lift_span.end();
-        split(evict_us, t_lift.elapsed().as_micros() as u64);
+        let from = lifted.as_ref().map_or((0, 0, 0, 0), |r| {
+            (
+                r.warm_to_hot,
+                r.cold_to_hot,
+                r.bytes_warm_to_hot,
+                r.bytes_cold_to_hot,
+            )
+        });
+        split(evict_us, t_lift.elapsed().as_micros() as u64, from);
         match lifted {
             Ok(report) => {
                 if report.missing > 0 || report.failed > 0 {
