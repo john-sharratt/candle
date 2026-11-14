@@ -49,7 +49,9 @@ use super::held_extents::{Extents, Taken};
 #[cfg(feature = "cuda")]
 use super::held_ledger::{HeldLedger, HeldSite};
 #[cfg(feature = "cuda")]
-use super::region_pool::{regions_open, run_free_below, SpanClaims, SpanRegion};
+use super::region_pool::{
+    regions_open, run_free_below, span_region_refusal, SpanClaims, SpanRegion,
+};
 use super::types::TARGET_ARENA_BYTES;
 
 /// Holders listed beside a refusal: enough to name what filled the ground.
@@ -133,6 +135,9 @@ struct Inner {
     growth_at: usize,
     /// The most held at once since the process started.
     peak: usize,
+    /// Why the last provisioning was left short of its headroom, when it was:
+    /// what [`SpanHeldGround::report_shortfall`] last said.
+    last_shortfall: Option<&'static str>,
 }
 
 #[cfg(feature = "cuda")]
@@ -320,6 +325,7 @@ impl SpanHeldGround {
                 growth: [0; RECENT],
                 growth_at: 0,
                 peak: 0,
+                last_shortfall: None,
             }),
         })
     }
@@ -354,20 +360,52 @@ impl SpanHeldGround {
         self.lock().ledger.sites()
     }
 
-    /// Claim `bytes` worth of held arena — one region, or a run when `bytes` is
-    /// wider than a region — or `None` when the span will not give it now: a
-    /// model still loading, a forward owning the partition, no ground spare.
-    fn claim_arena(device: &CudaDevice, bytes: usize) -> Option<Vec<SpanRegion>> {
-        if !regions_open(&device.cuda_stream()) {
-            return None;
+    /// Say once, each time the reason changes, that provisioning was left
+    /// short of its headroom and `why` the span refused — or that it is no
+    /// longer short. A take inside a forward that finds no room goes to the
+    /// driver, so a shortfall that stands is what a refused take follows.
+    fn report_shortfall(&self, why: Option<&'static str>) {
+        let mut inner = self.lock();
+        if inner.last_shortfall == why {
+            return;
         }
-        let claims = SpanClaims::open(&Device::Cuda(device.clone()), "held ground").ok()?;
+        inner.last_shortfall = why;
+        let stats = stats_of(&inner);
+        drop(inner);
+        match why {
+            Some(why) => tracing::warn!(
+                target: "candle_nn::kv_cache::held_ground",
+                used = stats.used,
+                capacity = stats.capacity,
+                arenas = stats.arenas,
+                "held ground could not be provisioned to its headroom: {why}"
+            ),
+            None => tracing::info!(
+                target: "candle_nn::kv_cache::held_ground",
+                used = stats.used,
+                capacity = stats.capacity,
+                arenas = stats.arenas,
+                "held ground is provisioned to its headroom again"
+            ),
+        }
+    }
+
+    /// Claim `bytes` worth of held arena — one region, or a run when `bytes` is
+    /// wider than a region — or why the span will not give it now: a model
+    /// still loading, a forward owning the partition, no ground spare.
+    fn claim_arena(device: &CudaDevice, bytes: usize) -> Result<Vec<SpanRegion>, &'static str> {
+        if !regions_open(&device.cuda_stream()) {
+            return Err("a model is still loading into the dense block");
+        }
+        let claims = SpanClaims::open(&Device::Cuda(device.clone()), "held ground")
+            .map_err(|_| "a forward owns the partition: the claims window is closed")?;
         let k = bytes.div_ceil(REGION).max(1);
-        if k == 1 {
+        let claimed = if k == 1 {
             claims.claim().ok().flatten().map(|r| vec![r])
         } else {
             claims.claim_run(k).ok().flatten()
-        }
+        };
+        claimed.ok_or_else(|| span_region_refusal(&Device::Cuda(device.clone())))
     }
 
     /// **From a known point between forwards:** make sure one take of `bytes`
@@ -387,7 +425,7 @@ impl SpanHeldGround {
         if fits {
             return;
         }
-        if let Some(regions) = Self::claim_arena(device, bytes) {
+        if let Ok(regions) = Self::claim_arena(device, bytes) {
             self.lock().insert_arena(regions);
         }
     }
@@ -424,18 +462,23 @@ impl SpanHeldGround {
             (headroom.saturating_sub(inner.free()), widest)
         };
         if let Some(bytes) = widest {
-            if let Some(regions) = Self::claim_arena(device, bytes) {
+            if let Ok(regions) = Self::claim_arena(device, bytes) {
                 self.lock().insert_arena(regions);
             }
         }
         let mut need = short;
+        let mut refused = None;
         while need > 0 {
-            let Some(regions) = Self::claim_arena(device, REGION) else {
-                break;
-            };
-            self.lock().insert_arena(regions);
+            match Self::claim_arena(device, REGION) {
+                Ok(regions) => self.lock().insert_arena(regions),
+                Err(why) => {
+                    refused = Some(why);
+                    break;
+                }
+            }
             need = need.saturating_sub(REGION);
         }
+        self.report_shortfall(refused);
         // Released outside the lock: an arena's regions go back to the span
         // through the pool's lock.
         let released = {
