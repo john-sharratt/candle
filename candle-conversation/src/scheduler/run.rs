@@ -1412,6 +1412,9 @@ impl Scheduler {
                     ),
                 }
                 self.kv_gap.spent(t_gap.elapsed());
+                // A turn stored with native chunks — its seal gap short of
+                // ground — is quantized here, one a gap.
+                self.quantize_a_native_residence();
                 self.kv_gap.flush_due(Instant::now());
             }
 

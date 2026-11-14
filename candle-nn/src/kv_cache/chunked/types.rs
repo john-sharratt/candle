@@ -250,6 +250,21 @@ pub enum ProvSource {
 }
 
 impl SealedChunk {
+    /// Whether every band is still native — the formats the paged stores
+    /// write, R16 or float — so the chunk is one a gap quantizes. A chunk
+    /// whose formats were never recorded is not.
+    pub fn is_native(&self) -> bool {
+        !self.k_fmt.is_empty()
+            && self
+                .k_fmt
+                .iter()
+                .all(|&t| ArenaFormatTag::from_u8(t).takes_active_k_writes())
+            && self
+                .v_fmt
+                .iter()
+                .all(|&t| ArenaFormatTag::from_u8(t).takes_active_v_writes())
+    }
+
     /// The chunk's per-`(head, palette)` K and V format tags, in the
     /// `[h * N_PALETTE + p]` order [`ChunkPayload`] persists and the cold-load
     /// path decodes.

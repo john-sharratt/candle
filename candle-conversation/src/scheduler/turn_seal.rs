@@ -6,7 +6,7 @@
 //! the section's policy.
 
 use candle_nn::kv_cache::CompressionPolicy;
-use candle_transformers::models::batched_inference::GapSeal;
+pub(super) use candle_transformers::models::batched_inference::GapSeal;
 
 use super::*;
 use crate::persistence::thread::effective_turn_policy;

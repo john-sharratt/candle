@@ -2395,6 +2395,34 @@ impl Substrate {
             .collect()
     }
 
+    /// The oldest turn residence awaiting its warm copy whose hot copy still
+    /// holds native chunks — a turn whose seal gap the ground could not cover
+    /// — with its compression override, for the gap to quantize. A lossless
+    /// conversation's turns stay native and are never named.
+    pub fn native_pending_warm(
+        &self,
+    ) -> Option<(ResidenceIndex, Arc<HotKv>, Option<ConvCompression>)> {
+        self.pending_warm().find(|(_, hot, cc)| {
+            !cc.is_some_and(|c| c.lossless)
+                && hot
+                    .iter()
+                    .any(|s| s.chunks.iter().any(|c| c.token_count > 0 && c.is_native()))
+        })
+    }
+
+    /// Swap `quantized` in as `residence`'s hot copy — the gap's quantize of
+    /// `read` — only while the residence still holds `read`'s content. A
+    /// residence whose hot copy changed or went keeps what it has, and
+    /// `quantized` is dropped. Answers whether it was swapped in.
+    pub fn install_gap_quantized(
+        &self,
+        residence: ResidenceIndex,
+        read: &Arc<HotKv>,
+        quantized: Vec<SealedSequence>,
+    ) -> bool {
+        self.residences.replace_hot(residence, read, quantized)
+    }
+
     /// Every turn's hot residence awaiting a warm copy, with its hot bytes and
     /// its compression override — what the hot→warm phase works through.
     /// Sections go hot→cold and never take a warm copy.
@@ -9709,6 +9737,68 @@ mod tests {
         };
         assert_eq!(of(None), [plain.0]);
         assert_eq!(of(Some(lossless)), [exact.0]);
+    }
+
+    /// A one-chunk layer whose bands are all `tag`, with `tokens` tokens.
+    fn layer_tagged(tag: u8, tokens: u16) -> SealedSequence {
+        use candle_nn::kv_cache::{ArenaLocation, ChunkGid, HeadGids, SealedChunk, N_PALETTE};
+        SealedSequence {
+            chunks: vec![SealedChunk {
+                gids: HeadGids::uniform(ChunkGid::detached(0), 1),
+                offset: 0,
+                token_count: tokens,
+                k_pal: Arc::new(Vec::new()),
+                v_pal: Arc::new(Vec::new()),
+                k_scale: Arc::new(Vec::new()),
+                v_scale: Arc::new(Vec::new()),
+                k_fmt: Arc::new(vec![tag; N_PALETTE]),
+                v_fmt: Arc::new(vec![tag; N_PALETTE]),
+                byte_size: 0,
+                meta: None,
+                q_sign: None,
+            }],
+            token_count: tokens as usize,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }
+    }
+
+    /// **The gap is named the oldest pending turn still holding native
+    /// chunks** — never a quantized one, an empty one, a warm one, or a
+    /// lossless conversation's, whose turns stay native by design.
+    #[test]
+    fn a_native_pending_turn_is_named_for_the_gap_and_nothing_else_is() {
+        use candle::DType;
+        use candle_nn::kv_cache::{KvFormat, QuantFormat};
+        let f16 = KvFormat::Float(DType::F16).to_tag();
+        let q8 = KvFormat::Quantized(QuantFormat::Q8_0).to_tag();
+        let lossless = ConvCompression {
+            lossless: true,
+            level: None,
+            disable_k_override: false,
+            force_k: None,
+            force_v: None,
+        };
+        let sub = Substrate::new();
+        let quantized = sub.alloc_residence(StreamId(1), None);
+        let empty = sub.alloc_residence(StreamId(2), None);
+        let kept = sub.alloc_residence(StreamId(3), Some(lossless));
+        let warm = sub.alloc_residence(StreamId(4), None);
+        let native = sub.alloc_residence(StreamId(5), None);
+        sub.install_hot(quantized, vec![layer_tagged(q8, 32)]);
+        sub.install_hot(empty, vec![layer_tagged(f16, 0)]);
+        sub.install_hot(kept, vec![layer_tagged(f16, 32)]);
+        sub.install_hot(warm, vec![layer_tagged(f16, 32)]);
+        sub.install_warm(warm, vec![minimal_sealed_layer()]);
+        sub.install_hot(native, vec![layer_tagged(f16, 16)]);
+        let (idx, hot, cc) = sub.native_pending_warm().expect("the native turn");
+        assert_eq!((idx.0, cc), (native.0, None));
+
+        // Swapped in over the copy it read, it is native no longer.
+        assert!(sub.install_gap_quantized(idx, &hot, vec![layer_tagged(q8, 16)]));
+        assert!(sub.native_pending_warm().is_none());
+        // A second install over the same read finds the content changed.
+        assert!(!sub.install_gap_quantized(idx, &hot, vec![layer_tagged(q8, 16)]));
     }
 
     /// **A conversation's own tokens exclude the shared sections, and the corpus counts

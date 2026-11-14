@@ -599,7 +599,14 @@ scale whichever gap quantizes them.
   the range is in place; the deferred blocks of earlier gaps lead each of its
   tables, as they lead any gap's, and stay standing when it is done. Two gaps
   in a row that place nothing leave the rest native, and the seal stores it as
-  it stands. A section is not sealed this way: it attends its own build under
+  it stands, and a later gap finishes it: each housekeeping pass takes the
+  oldest pending-warm turn residence still holding native chunks
+  (`Substrate::native_pending_warm`; a lossless conversation's never), quantizes
+  them in one gap, waited for (`GapCycle::quantize_sealed`, its catch-up
+  building a quantized copy of the hot sequences instead of writing a block
+  table), and swaps the copy in over the hot copy it read, by lineage
+  (`install_gap_quantized`) — over a compaction's relocation of it too, and
+  over nothing else (`scheduler/gap_residence.rs`). A section is not sealed this way: it attends its own build under
   its section policy, and its seal keeps that path. A partial chunk's window
   is the job's own (`valid_range`), so a relocated partial is re-queued at its
   window rather than dropped (`requeue_at`).

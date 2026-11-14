@@ -150,13 +150,19 @@ pub(super) fn todays_seal(
     .expect("today's quantize");
     convert_deferred_descs(&backings[0], &descs, N_KV_HEAD, device).expect("today's convert");
     device.synchronize().unwrap();
+    let layers: Vec<&SealedSequence> = sealed.iter().map(|s| &s[0]).collect();
+    sealed_bands(backings, &layers)
+}
 
+/// The bands of quantized sealed sequences, one a layer of `backings`, in
+/// table order: chunk, head, palette, K before V.
+pub(super) fn sealed_bands(backings: &[ChunkedKvBacking], layers: &[&SealedSequence]) -> Vec<Band> {
     let elems = backings[0].elems_per_chunk();
     let ident = identity_pal_map(HEAD_DIM);
     let pal_bytes = HEAD_DIM / 4;
     let mut out = Vec::new();
-    for (layer, seqs) in sealed.iter().enumerate() {
-        for chunk in &seqs[0].chunks {
+    for (layer, seq) in layers.iter().enumerate() {
+        for chunk in &seq.chunks {
             for h in 0..N_KV_HEAD {
                 for p in 0..N_PALETTE {
                     for side in 0..2 {

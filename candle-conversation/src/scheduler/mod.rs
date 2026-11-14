@@ -44,6 +44,7 @@ pub mod exported_state;
 mod first_sample;
 mod gallery_sweep;
 mod gang;
+mod gap_residence;
 mod gap_wait;
 mod graph_window;
 mod guest_room;

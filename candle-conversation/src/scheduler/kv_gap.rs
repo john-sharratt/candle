@@ -2,14 +2,14 @@
 //! second in which a gap ran, summed over that second's gaps — blocks installed
 //! and deferred, rows discarded and blocks found moved, gaps that quantized
 //! nothing because one was outstanding, jobs launched and how many led as
-//! retries, the turns whose seal ran gaps of its own (counted in with the
-//! rest), the classes whose lease came up short and the first reason given,
+//! retries, the turns whose seal ran gaps of its own and the sealed residences
+//! whose native chunks a gap quantized (counted in with the rest), the classes whose lease came up short and the first reason given,
 //! the time the two calls took on the scheduler thread, and the caught-up
 //! gaps' time on the stream.
 
 use std::time::{Duration, Instant};
 
-use candle_nn::kv_cache::{GapCatchUp, GapQuantize, GapSealed};
+use candle_nn::kv_cache::{GapCatchUp, GapQuantize, GapSealed, GapSealedResidence};
 
 /// How often the line is written while gaps run.
 const WINDOW: Duration = Duration::from_secs(1);
@@ -26,6 +26,8 @@ pub(super) struct KvGapLine {
     outstanding: u64,
     /// Turns whose last blocks a seal's own gaps quantized.
     seals: u64,
+    /// Sealed residences whose native chunks a gap quantized.
+    residences: u64,
     jobs: u64,
     retried: u64,
     short_slots: u64,
@@ -86,6 +88,17 @@ impl KvGapLine {
         self.device_us += (s.device_ms * 1e3) as u64;
     }
 
+    /// Fold one sealed residence's gap in: a gap like any other, its
+    /// residences counted apart.
+    pub(super) fn residence(&mut self, r: &GapSealedResidence) {
+        self.residences += 1;
+        self.gaps += 1;
+        self.jobs += r.jobs as u64;
+        self.installed += r.installed as u64;
+        self.deferred += r.deferred as u64;
+        self.device_us += (r.device_ms * 1e3) as u64;
+    }
+
     /// Time the gap's two calls took on the scheduler thread.
     pub(super) fn spent(&mut self, d: Duration) {
         self.host_us += d.as_micros() as u64;
@@ -109,6 +122,7 @@ impl KvGapLine {
                 moved = self.moved,
                 outstanding = self.outstanding,
                 seals = self.seals,
+                residences = self.residences,
                 jobs = self.jobs,
                 retried = self.retried,
                 short_slots = self.short_slots,

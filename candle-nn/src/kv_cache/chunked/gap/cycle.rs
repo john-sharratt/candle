@@ -28,10 +28,11 @@ use super::super::compression_policy::CompressionPolicy;
 use super::super::gid_pool::ChunkGid;
 use super::super::head_gids::ChunkBands;
 use super::super::size_class::{class_for_format, SizeClass};
-use super::super::types::ChunkWindow;
+use super::super::types::{ChunkWindow, SealedSequence};
 use super::codes::CodeTables;
 use super::demand::{gap_demand, GapKind, PeakShares, PerClass};
 use super::install::{catch_up, requeue_at, window_of};
+use super::install_sealed::catch_up_sealed;
 use super::launch::{GapDevice, GapGroup, GapJob, MAX_GAP_JOBS};
 use super::lease::Lease;
 use super::lease_alloc::{lease_demand, LeaseRefusal};
@@ -81,6 +82,25 @@ impl GapSealed {
         self.device_ms += c.device_ms;
     }
 }
+
+/// What one sealed residence's gap did, and the residence's sequences after
+/// it.
+#[derive(Debug)]
+pub struct GapSealedResidence {
+    /// One a layer, every installed chunk quantized; a deferred one native.
+    pub seqs: Vec<SealedSequence>,
+    pub jobs: usize,
+    pub installed: usize,
+    pub deferred: usize,
+    /// The gap's time on the stream.
+    pub device_ms: f64,
+    /// The outstanding gap it waited out and caught up first.
+    pub caught: GapSealed,
+}
+
+/// The sequence index a sealed residence's jobs carry: they name a hot
+/// copy's chunks, not a live sequence's.
+const SEALED_SEQ: usize = usize::MAX;
 
 /// What one catch-up did.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -375,6 +395,102 @@ impl GapCycle {
                 return Ok(out);
             }
         }
+    }
+
+    /// Quantize the native chunks of a sealed residence's hot copy `hot` —
+    /// one sequence a layer, each layer under `layer_policy` — in one gap,
+    /// waited for: the turns whose seal gap the ground could not cover. Waits
+    /// out and catches up the outstanding gap first. Answers a copy of `hot`
+    /// with every installed chunk quantized, for the caller to swap in over
+    /// the copy it read, by lineage; `None` when `hot` has no native chunk.
+    /// The deferred blocks of earlier gaps stay standing for the gaps after.
+    pub fn quantize_sealed(
+        &mut self,
+        backings: &[ChunkedKvBacking],
+        layer_policy: &[CompressionPolicy],
+        hot: &[SealedSequence],
+    ) -> Result<Option<GapSealedResidence>> {
+        if layer_policy.len() != backings.len() || hot.len() != backings.len() {
+            candle::bail!(
+                "gap sealed quantize: {} layer policies and {} sequences for {} layers",
+                layer_policy.len(),
+                hot.len(),
+                backings.len()
+            );
+        }
+        let mut caught = GapSealed::default();
+        if self.outstanding.is_some() {
+            self.wait()?;
+            caught.add(&self.catch_up(backings)?);
+        }
+        let t_table = Instant::now();
+        let mut fresh: Vec<(CompressionPolicy, GapJob)> = Vec::new();
+        'layers: for (layer, seq) in hot.iter().enumerate() {
+            for (block, c) in seq.chunks.iter().enumerate() {
+                if fresh.len() == self.max_jobs {
+                    break 'layers;
+                }
+                if c.is_native() && c.token_count > 0 {
+                    fresh.push((
+                        layer_policy[layer],
+                        GapJob {
+                            layer,
+                            seq: SEALED_SEQ,
+                            block,
+                            bands: ChunkBands::from_sealed(c),
+                            valid_range: (i32::from(c.offset) << 8) | i32::from(c.token_count),
+                        },
+                    ));
+                }
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(None);
+        }
+        let no_retries = Retries {
+            jobs: Vec::new(),
+            demand: [0; SizeClass::COUNT],
+            unsized_jobs: 0,
+        };
+        let q = self.launch_table(backings, no_retries, fresh, GapKind::Decode, t_table)?;
+        self.wait()?;
+        self.device.order_compute_after()?;
+        let finished = self.device.finished().ok_or_else(|| {
+            candle::Error::Msg("gap sealed quantize: the gap did not complete".into())
+        })?;
+        let device_ms = finished.device_ms();
+        let Outstanding {
+            jobs,
+            groups,
+            mut lease,
+            kind,
+        } = self.outstanding.take().expect("launched above");
+        let refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
+        let gap_groups: Vec<GapGroup<'_>> = groups
+            .iter()
+            .map(|(p, r)| GapGroup {
+                policy: p,
+                jobs: r.clone(),
+            })
+            .collect();
+        let done = catch_up_sealed(
+            &finished,
+            &jobs,
+            &gap_groups,
+            &refs,
+            &mut lease,
+            &self.codes,
+            hot,
+        )?;
+        self.shares.record(kind, &done.claims);
+        Ok(Some(GapSealedResidence {
+            seqs: done.seqs,
+            jobs: q.jobs,
+            installed: done.installed,
+            deferred: done.deferred,
+            device_ms,
+            caught,
+        }))
     }
 
     /// The deferred blocks standing, each re-read at its index — the

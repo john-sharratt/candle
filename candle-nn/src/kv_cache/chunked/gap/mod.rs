@@ -23,6 +23,10 @@ mod cycle_tests;
 mod demand;
 #[cfg(feature = "cuda")]
 mod install;
+#[cfg(feature = "cuda")]
+mod install_sealed;
+#[cfg(all(test, feature = "cuda"))]
+mod install_sealed_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod install_tests;
 #[cfg(feature = "cuda")]
@@ -46,7 +50,10 @@ mod summary;
 mod table;
 
 #[cfg(feature = "cuda")]
-pub use cycle::{CatchUpHost, GapCatchUp, GapCycle, GapQuantize, GapSealed, GapSeq, QuantizeHost};
+pub use cycle::{
+    CatchUpHost, GapCatchUp, GapCycle, GapQuantize, GapSealed, GapSealedResidence, GapSeq,
+    QuantizeHost,
+};
 #[cfg(feature = "cuda")]
 pub use demand::GapKind;
 #[cfg(feature = "cuda")]

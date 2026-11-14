@@ -17,7 +17,8 @@ use std::time::Instant;
 use candle::quantized::cuda::kvhead_supported_head_dim;
 use candle::{Device, Result};
 use candle_nn::kv_cache::{
-    gap_jobs_within, GapCatchUp, GapCycle, GapKind, GapQuantize, GapSealed, GapSeq,
+    gap_jobs_within, CompressionPolicy, GapCatchUp, GapCycle, GapKind, GapQuantize, GapSealed,
+    GapSealedResidence, GapSeq, SealedSequence,
 };
 
 use super::BatchedInferenceSession;
@@ -125,6 +126,25 @@ impl BatchedInferenceSession {
         self.ensure_gap()?;
         let cycle = self.gap.as_mut().expect("made above");
         cycle.seal(&self.backings, &seq, blocks)
+    }
+
+    /// Quantize the native chunks of a sealed residence's hot copy `hot` —
+    /// one sequence a layer — under `policy` through every layer's cap, in
+    /// one gap, waited for (§5). Answers the quantized copy for the caller to
+    /// swap in by lineage; `None` when the session does not quantize or `hot`
+    /// has no native chunk.
+    pub fn gap_quantize_sealed(
+        &mut self,
+        policy: &CompressionPolicy,
+        hot: &[SealedSequence],
+    ) -> Result<Option<GapSealedResidence>> {
+        if !self.gaps_quantize() {
+            return Ok(None);
+        }
+        let layer_policy = self.layer_seal_policies(policy);
+        self.ensure_gap()?;
+        let cycle = self.gap.as_mut().expect("made above");
+        cycle.quantize_sealed(&self.backings, &layer_policy, hot)
     }
 
     /// Whether a gap is outstanding — launched and not yet caught up.
