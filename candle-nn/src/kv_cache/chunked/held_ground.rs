@@ -146,13 +146,23 @@ impl Inner {
         self.bootstrap.used() + self.arenas.iter().map(|a| a.extents.used()).sum::<usize>()
     }
 
-    /// Free ground a take can land in — not a vacating arena's.
-    fn free(&self) -> usize {
-        self.bootstrap.capacity() - self.bootstrap.used()
-            + self
-                .staying()
-                .map(|a| a.extents.capacity() - a.extents.used())
-                .sum::<usize>()
+    /// Free ground in the held arenas a take can land in — not a vacating
+    /// arena's, and not the bootstrap block's: what the headroom is kept in.
+    ///
+    /// **The bootstrap's slack is not headroom.** The block is sized from what
+    /// a model load takes ([`BOOTSTRAP_HELD_BYTES`]); what the load leaves of
+    /// it is whatever the load left, not ground anything was provisioned for.
+    /// Counted as headroom, a fresh process provisioned nothing — the slack
+    /// passed for a region in hand — and its first forwards ran on it: a
+    /// slot-state slab, the penalty counts and the hit counters' strides
+    /// together came to a megabyte past it, inside a captured forward, where a
+    /// take that finds no room goes to the driver and the capture is lost. A
+    /// take still lands in the bootstrap when it has room; provisioning keeps
+    /// its headroom where it can grow.
+    fn arena_free(&self) -> usize {
+        self.staying()
+            .map(|a| a.extents.capacity() - a.extents.used())
+            .sum::<usize>()
     }
 
     /// [`SpanHeldGround::provision`]'s claims, worked out as it works them out
@@ -163,7 +173,7 @@ impl Inner {
         let grew = self.peak_since.saturating_sub(self.used_at_provision) + self.refused_since;
         let mut growth = self.growth;
         growth[self.growth_at] = grew;
-        let short = headroom_for(&growth).saturating_sub(self.free());
+        let short = headroom_for(&growth).saturating_sub(self.arena_free());
         let widest = if self.widest_refused > self.largest_free() {
             self.widest_refused.div_ceil(REGION).max(1) * REGION
         } else {
@@ -459,7 +469,7 @@ impl SpanHeldGround {
             let headroom = headroom_for(&inner.growth);
             let widest = std::mem::take(&mut inner.widest_refused);
             let widest = (widest > inner.largest_free()).then_some(widest);
-            (headroom.saturating_sub(inner.free()), widest)
+            (headroom.saturating_sub(inner.arena_free()), widest)
         };
         if let Some(bytes) = widest {
             if let Ok(regions) = Self::claim_arena(device, bytes) {
@@ -496,7 +506,7 @@ impl SpanHeldGround {
                 let base = a.base;
                 let idle = a.extents.used() == 0 && !inner.holds(Ground::Arena(base));
                 let vacated = inner.vacating.contains(&base);
-                let spare = inner.free().saturating_sub(a.extents.capacity());
+                let spare = inner.arena_free().saturating_sub(a.extents.capacity());
                 if idle && (vacated || spare >= headroom + inner.vacating_bytes()) {
                     released.push(inner.arenas.remove(i));
                     inner.vacating.retain(|&b| b != base);
@@ -895,27 +905,37 @@ mod tests {
         assert_eq!(headroom_for(&g), 6 * REGION);
     }
 
-    /// **The next claim is the headroom short of free ground and the widest
-    /// refused take's arena, in whole regions.** On a ground of bootstrap only,
-    /// with no device: a quiet one claims nothing; a take of a region and a half
-    /// leaves a half free against two and a half of headroom, so two regions; a
-    /// refused take of three regions adds its own three-region arena and grows
-    /// the headroom by three more. The window's growth, rounded to regions, is
-    /// what each later window of a sweep may claim again.
+    /// **The next claim is the headroom short of free arena ground and the
+    /// widest refused take's arena, in whole regions.** On a ground of
+    /// bootstrap only, with no device: a quiet one still claims its region in
+    /// hand, the bootstrap's two free regions notwithstanding — they are the
+    /// load's slack, not headroom; a take of a region and a half, landed in the
+    /// bootstrap, grows the headroom to two and a half against no arena, so
+    /// three regions; a refused take of three regions grows it to five and a
+    /// half, so six, beside its own three-region arena. The window's growth,
+    /// rounded to regions, is what each later window of a sweep may claim
+    /// again.
     #[test]
     fn the_next_claim_is_what_provisioning_takes() {
         let held = SpanHeldGround::new(0x7f00_0000_0000, 2 * REGION);
         let site = Location::caller();
-        assert_eq!(held.next_claim(), HeldClaim::default(), "a quiet ground");
+        assert_eq!(
+            held.next_claim(),
+            HeldClaim {
+                growth: REGION,
+                ..HeldClaim::default()
+            },
+            "a quiet ground keeps a region in hand"
+        );
 
         held.take(REGION + REGION / 2, site)
             .expect("bootstrap room");
-        assert_eq!(held.next_claim().growth, 2 * REGION);
+        assert_eq!(held.next_claim().growth, 3 * REGION);
 
         assert_eq!(held.take(3 * REGION, site), None, "wider than any ground");
-        // Grew 4.5 regions → headroom 5.5, free 0.5: five regions short, and the
-        // refused take's own arena of three.
-        assert_eq!(held.next_claim().growth, (5 + 3) * REGION);
+        // Grew 4.5 regions → headroom 5.5 against no arena: six regions short,
+        // and the refused take's own arena of three.
+        assert_eq!(held.next_claim().growth, (6 + 3) * REGION);
         assert_eq!(held.next_claim().landing, 0, "no arena lives yet");
         assert_eq!(
             held.next_claim().per_window,

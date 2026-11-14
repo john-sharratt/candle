@@ -4820,7 +4820,7 @@ mod tests {
     /// A take wider than anything held is refused, once; the next provisioning
     /// claims an arena that holds it, so the same take is held ground; and once
     /// nothing holds the arena, a window of quiet provisionings returns it to the
-    /// span.
+    /// span, keeping only the region in hand.
     #[test]
     fn held_arenas_cover_a_refused_take_and_go_back_when_idle() -> Result<()> {
         let _serial = serial();
@@ -4854,8 +4854,17 @@ mod tests {
         for _ in 0..=super::super::held_ground::RECENT_WINDOW {
             held.provision(&dev);
         }
-        assert_eq!(held.stats().arenas, 0, "idle arenas went back to the span");
+        assert_idle(&held);
         Ok(())
+    }
+
+    /// Once a window of quiet provisionings has passed, every idle arena has
+    /// gone back to the span but the one keeping the region in hand: the
+    /// headroom is arena ground, never the bootstrap's slack.
+    fn assert_idle(held: &SpanHeldGround) {
+        let idle = held.stats();
+        assert_eq!(idle.arenas, 1, "only the region in hand stays: {idle:?}");
+        assert!(idle.arena_bytes >= REGION_BYTES, "{idle:?}");
     }
 
     /// **An idle held arena moves down onto ground freed beneath it.** Claimed
@@ -4900,7 +4909,7 @@ mod tests {
         for _ in 0..=super::super::held_ground::RECENT_WINDOW {
             held.provision(&dev);
         }
-        assert_eq!(held.stats().arenas, 0, "idle arenas went back to the span");
+        assert_idle(&held);
         Ok(())
     }
 
@@ -4965,7 +4974,7 @@ mod tests {
         for _ in 0..=super::super::held_ground::RECENT_WINDOW {
             held.provision(&dev);
         }
-        assert_eq!(held.stats().arenas, 0, "idle arenas went back to the span");
+        assert_idle(&held);
         Ok(())
     }
 
