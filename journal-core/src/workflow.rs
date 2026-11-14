@@ -124,6 +124,16 @@ fn millis(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Whether a draft may answer `journal_skip`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skip {
+    /// Once the journal holds a step to weigh the stretch against.
+    Allowed,
+    /// Never: the stretch is written whatever it holds. A coding session's
+    /// finished request is one — every request it was asked gets its entry.
+    Refused,
+}
+
 /// Run one draft over `span`, which the caller took with
 /// [`crate::journal::Journal::begin`]. Whichever way it ends, the state has been
 /// told.
@@ -133,9 +143,10 @@ pub async fn run<D: Desk, S: Holds>(
     span: &Span,
     world: &(dyn World + Sync),
     style: &Style,
+    skip: Skip,
 ) -> (Outcome, Timing) {
     let mut timing = Timing::default();
-    let outcome = draft(desk, state, span, world, style, &mut timing).await;
+    let outcome = draft(desk, state, span, world, style, skip, &mut timing).await;
     if matches!(outcome, Outcome::Abandoned(_)) {
         hold(state).journal_mut().abandon();
     }
@@ -148,13 +159,19 @@ async fn draft<D: Desk, S: Holds>(
     span: &Span,
     world: &(dyn World + Sync),
     style: &Style,
+    skip: Skip,
     timing: &mut Timing,
 ) -> Outcome {
     let (open, latest) = {
         let held = hold(state);
         let journal = held.journal();
         let open = journal.open().to_vec();
-        let latest = journal.latest_step().cloned();
+        // A draft that may not skip is shown no entry to weigh the stretch
+        // against, and offered no `journal_skip`.
+        let latest = journal
+            .latest_step()
+            .cloned()
+            .filter(|_| skip == Skip::Allowed);
         (open, latest)
     };
     let entries = world.entries();
@@ -405,7 +422,7 @@ mod tests {
 
     async fn drafted(desk: &mut Script, turns: Vec<SpanTurn>) -> (Outcome, Mutex<Journal>) {
         let (state, span) = started(turns);
-        let (outcome, _) = run(desk, &state, &span, &Fake::default(), &PLAIN).await;
+        let (outcome, _) = run(desk, &state, &span, &Fake::default(), &PLAIN, Skip::Allowed).await;
         (outcome, state)
     }
 
@@ -434,7 +451,15 @@ mod tests {
     async fn the_write_carries_the_stretch_and_a_spec_of_only_its_citable_turns() {
         let (state, span) = started(turns());
         let mut desk = Script::new(&[WRITE]);
-        run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        run(
+            &mut desk,
+            &state,
+            &span,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         let first = &desk.write_asked[0];
         assert_eq!(first, &ask::writing(&span, &PLAIN, None, false, None));
         assert!(first.contains("#1 ") && first.contains("#2 "), "{first}");
@@ -458,7 +483,7 @@ mod tests {
             facts: false,
             ..PLAIN
         };
-        run(&mut desk, &state, &span, &world, &no_facts).await;
+        run(&mut desk, &state, &span, &world, &no_facts, Skip::Allowed).await;
         assert!(
             desk.write_asked[0].ends_with(no_facts.per_question),
             "a writer offered per is told what it is for"
@@ -487,6 +512,7 @@ mod tests {
             &first,
             &Fake::default(),
             &PLAIN,
+            Skip::Allowed,
         )
         .await;
         let second = hold(&state)
@@ -505,7 +531,15 @@ mod tests {
     async fn a_journal_with_an_entry_offers_the_skip_beside_the_write() {
         let (state, span) = after_an_entry().await;
         let mut desk = Script::new(&[SKIP]);
-        run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        run(
+            &mut desk,
+            &state,
+            &span,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         assert_eq!(
             desk.specs[0],
             vec![
@@ -528,7 +562,15 @@ mod tests {
     async fn a_skip_covers_the_stretch_with_its_reason_in_one_answer() {
         let (state, span) = after_an_entry().await;
         let mut desk = Script::new(&[SKIP]);
-        let (outcome, _) = run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        let (outcome, _) = run(
+            &mut desk,
+            &state,
+            &span,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         let Outcome::Nothing { why } = outcome else {
             panic!("expected a skip, got {outcome:?}");
         };
@@ -552,7 +594,15 @@ mod tests {
     async fn each_stretch_is_filed_under_the_entry_it_went_into() {
         let (state, span) = started(turns());
         let mut desk = Script::new(&[WRITE]);
-        run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        run(
+            &mut desk,
+            &state,
+            &span,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         assert_eq!(desk.filed, [Some(Filed::of(1, &span))]);
 
         let second = hold(&state)
@@ -562,7 +612,15 @@ mod tests {
             )
             .unwrap();
         let mut desk = Script::new(&[SKIP]);
-        run(&mut desk, &state, &second, &Fake::default(), &PLAIN).await;
+        run(
+            &mut desk,
+            &state,
+            &second,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         assert_eq!(desk.filed, [Some(Filed::of(1, &second))]);
     }
 
@@ -578,7 +636,15 @@ mod tests {
         let (state, span) = after_an_entry().await;
         let mut desk = Script::new(&[SKIP]);
         desk.refuse_keeping = true;
-        let (outcome, _) = run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        let (outcome, _) = run(
+            &mut desk,
+            &state,
+            &span,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         assert!(
             matches!(outcome, Outcome::Abandoned(Abandon::Keeping(_))),
             "{outcome:?}"
@@ -598,11 +664,53 @@ mod tests {
             &span,
             &Fake::default(),
             &PLAIN,
+            Skip::Allowed,
         )
         .await;
         assert!(
             matches!(&outcome, Outcome::Nothing { why } if why == SKIPPED),
             "{outcome:?}"
+        );
+    }
+
+    /// **A draft that may not skip is asked to write, with no skip offered**:
+    /// a journal that holds an entry would offer one, and here the same
+    /// stretch's answer is a write, kept, and the question names no latest
+    /// entry to weigh it against.
+    #[tokio::test]
+    async fn a_draft_that_may_not_skip_is_offered_no_skip() {
+        let (state, span) = after_an_entry().await;
+        let farewell = r#"{"name": "journal_write", "arguments": {
+            "claims": [{"text": "I told Pax bye.", "cite": "4"}],
+            "summary": "Said bye to Pax."}}"#;
+        let mut desk = Script::new(&[SKIP, farewell]);
+        let (outcome, _) = run(
+            &mut desk,
+            &state,
+            &span,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Refused,
+        )
+        .await;
+        assert!(
+            matches!(outcome, Outcome::Wrote { rounds: 2, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            desk.specs[0],
+            vec![tools::write_spec(&[4], hold(&state).open(), FACTS).unwrap()],
+            "the write alone is offered"
+        );
+        assert!(
+            !desk.write_asked[0].contains("Or skip it with journal_skip."),
+            "{}",
+            desk.write_asked[0]
+        );
+        assert!(
+            desk.write_asked[1].contains("no call named `journal_skip`"),
+            "{}",
+            desk.write_asked[1]
         );
     }
 
@@ -627,7 +735,15 @@ mod tests {
         let scenery =
             r#"{"name": "journal_write", "arguments": {"claims": [{"text": "x", "cite": "9"}]}}"#;
         let mut desk = Script::new(&[scenery, SKIP]);
-        let (outcome, _) = run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        let (outcome, _) = run(
+            &mut desk,
+            &state,
+            &span,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         assert!(matches!(outcome, Outcome::Nothing { .. }), "{outcome:?}");
         assert_eq!(
             desk.specs[0], desk.specs[1],
@@ -710,7 +826,15 @@ mod tests {
         }
         let mut desk = Once(Script::new(&[WRITE_SCENERY, WRITE]));
         let (state, span) = started(turns());
-        let (outcome, _) = run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        let (outcome, _) = run(
+            &mut desk,
+            &state,
+            &span,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         assert!(
             matches!(outcome, Outcome::Abandoned(Abandon::Refused(_))),
             "{outcome:?}"
@@ -755,6 +879,7 @@ mod tests {
             &first,
             &Fake::default(),
             &PLAIN,
+            Skip::Allowed,
         )
         .await;
 
@@ -767,7 +892,15 @@ mod tests {
         let again = r#"{"name": "journal_write", "arguments": {
             "claims": [{"text": "I told Pax hello.", "cite": "4"}], "summary": "Greeted Pax."}}"#;
         let mut desk = Script::new(&[again]);
-        let (outcome, _) = run(&mut desk, &state, &second, &Fake::default(), &PLAIN).await;
+        let (outcome, _) = run(
+            &mut desk,
+            &state,
+            &second,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         let Outcome::Nothing { why } = outcome else {
             panic!("expected nothing new, got {outcome:?}");
         };
@@ -787,6 +920,7 @@ mod tests {
             &first,
             &Fake::default(),
             &PLAIN,
+            Skip::Allowed,
         )
         .await;
 
@@ -807,7 +941,15 @@ mod tests {
             .replace("I told Pax hello.", "I greeted Pax a second time.")
             .replace("new", "restates 1");
         let mut desk = Script::new(&[again.as_str()]);
-        let (outcome, _) = run(&mut desk, &state, &second, &Fake::default(), &PLAIN).await;
+        let (outcome, _) = run(
+            &mut desk,
+            &state,
+            &second,
+            &Fake::default(),
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         let Outcome::Wrote { entry, .. } = outcome else {
             panic!("expected an entry, got {outcome:?}");
         };
@@ -847,6 +989,7 @@ mod tests {
             &span,
             &Fake::default(),
             &PLAIN,
+            Skip::Allowed,
         )
         .await;
         assert!(matches!(outcome, Outcome::Wrote { .. }), "{outcome:?}");
@@ -864,7 +1007,15 @@ mod tests {
             "summary": "Checked the build."}}"#;
         let (state, span) = started(turns());
         let world = Fake::default().with("build", "status", "green");
-        let (outcome, _) = run(&mut Script::new(&[typed]), &state, &span, &world, &PLAIN).await;
+        let (outcome, _) = run(
+            &mut Script::new(&[typed]),
+            &state,
+            &span,
+            &world,
+            &PLAIN,
+            Skip::Allowed,
+        )
+        .await;
         let Outcome::Wrote { entry, notes, .. } = outcome else {
             panic!("expected an entry, got {outcome:?}");
         };

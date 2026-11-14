@@ -43,7 +43,7 @@
 //!
 //! What a character has written down is held the same way: one section per kept
 //! entry (the newest five) and one for the open items, submitted to its own
-//! conversation as `journal/<entry id>` and `journal/open`, and selected by
+//! conversation as `journal/<entry id>` and `journal/close`, and selected by
 //! [`carry_journal`] under `journal_intro`. The collection has no member of its
 //! own: a turn pins exactly the sections that have sealed, so `journal_none`
 //! shows while none has, and a new entry joins the prompt from the first turn
@@ -852,9 +852,9 @@ mod tests {
         );
         carry_journal(
             &mut sel,
-            &["journal/3".to_string(), "journal/open".to_string()],
+            &["journal/3".to_string(), "journal/close".to_string()],
         );
-        assert_eq!(sel.members(JOURNAL), ["journal/3", "journal/open"]);
+        assert_eq!(sel.members(JOURNAL), ["journal/3", "journal/close"]);
         carry_journal(&mut sel, &["journal/4".to_string()]);
         assert_eq!(
             sel.members(JOURNAL),

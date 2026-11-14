@@ -422,8 +422,9 @@ user turn is Claude's — the task, an answer, a nudge — so `Heard` renders
 `Claude said:` there (`style_for`, `zend/src/journal/style.rs`).
 
 **Every task ends with an entry.** The journal drafts on its own cadence —
-every 16 turns, or under selection pressure (`zend/src/journal/state.rs:23,
-101`) — so a long task may already have entries. When the task's turn ends,
+when each request finishes, and within a long one every 16 of its rounds or
+under selection pressure (`zend/src/journal/state.rs`, `docs/zend_journal.md`
+§6) — so a long task may already have entries. When the task's turn ends,
 `repo_task_start` asks for a draft (`POST …/journal/draft`) and polls
 `GET …/journal` until the journal covers the task's last turn. The task's
 result is every entry whose span overlaps the task's turns, the last of them
@@ -502,7 +503,7 @@ journal, outermost first, then its own, then the reader's line:
 P:candle                                  ← the project's standing rules (lineage/0)
 T:review-layers                           ← Claude's thread: decisions, what the user said, outcomes
 @zen/topics/candle                        ← the memory the thread is about (memory/0 …)
-… this conversation's own journal …       ← journal/<id>, journal/open
+… this conversation's own journal …       ← journal/<id>, journal/close
 This conversation is T:review-layers/verify-expiry.   ← the reader's line (lineage/reader)
 system_close
 ```

@@ -319,10 +319,10 @@ mod tests {
 
     #[test]
     fn a_section_whose_text_changed_is_submitted_again() {
-        let held = [standing("journal/open", "old", true)];
+        let held = [standing("journal/close", "old", true)];
         let p = plan(
             &held,
-            &[want("journal/open", "new")],
+            &[want("journal/close", "new")],
             Linking::Apart,
             &[],
             false,
@@ -356,12 +356,12 @@ mod tests {
         let one = names(&["journal/1"]);
         let held = [
             chained("journal/1", "a", NONE),
-            chained("journal/open", "x", &one),
+            chained("journal/close", "x", &one),
         ];
         let wanted = [
             want("journal/1", "a"),
             want("journal/2", "b"),
-            want("journal/open", "x"),
+            want("journal/close", "x"),
         ];
         let p = plan(&held, &wanted, Linking::Chain, &[], false);
         assert_eq!(p.submit, vec![1, 2], "the open items now follow entry 2");
@@ -377,9 +377,9 @@ mod tests {
         let held = [
             chained("journal/1", "a", NONE),
             chained("journal/2", "b", &one),
-            chained("journal/open", "x", &two),
+            chained("journal/close", "x", &two),
         ];
-        let wanted = [want("journal/2", "b"), want("journal/open", "x")];
+        let wanted = [want("journal/2", "b"), want("journal/close", "x")];
         let p = plan(&held, &wanted, Linking::Chain, &[], false);
         assert_eq!(p.submit, vec![0, 1]);
         assert_eq!(p.remove, vec!["journal/1".to_string()]);
@@ -398,12 +398,12 @@ mod tests {
                 alive: false,
                 ..chained("journal/2", "b", &one)
             },
-            chained("journal/open", "x", &two),
+            chained("journal/close", "x", &two),
         ];
         let wanted = [
             want("journal/1", "a"),
             want("journal/2", "b"),
-            want("journal/open", "x"),
+            want("journal/close", "x"),
         ];
         let p = plan(&held, &wanted, Linking::Chain, &[], false);
         assert_eq!(p.submit, vec![1, 2]);
@@ -413,9 +413,9 @@ mod tests {
     fn sections_kept_apart_never_reseal_for_one_another() {
         let held = [
             standing("journal/2", "b", true),
-            standing("journal/open", "x", true),
+            standing("journal/close", "x", true),
         ];
-        let wanted = [want("journal/2", "b"), want("journal/open", "x")];
+        let wanted = [want("journal/2", "b"), want("journal/close", "x")];
         let p = plan(&held, &wanted, Linking::Apart, &[], false);
         assert!(p.submit.is_empty());
     }

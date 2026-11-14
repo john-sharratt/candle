@@ -1269,7 +1269,8 @@ read every folder, and each person added is told so.
 
 ### 7.3 Zen workers
 
-A worker drafts its own journal every 16 turns with `journal-core`, tied to
+A worker drafts its own journal as each request finishes, and within a long
+one every 16 of its rounds (`docs/zend_journal.md` §6), with `journal-core`, tied to
 its conversation in zend's substrate; that journal stays the work record, read
 with `T:<thread>/<worker>`.
 

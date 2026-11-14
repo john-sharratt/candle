@@ -153,7 +153,9 @@ before `system_close`:
 `journal::carry::install` scopes the collection to the members a conversation
 names (`SelectionRule::Named`). It has no member of its own: the sections are
 the conversation's — one per entry the journal holds (`journal/<id>`), plus
-`journal/open` — submitted to its own timeline.
+`journal/close`, the closing section (`Still open:` and the line that says the
+journal ends there), which follows the entries and is none of them —
+submitted to its own timeline.
 
 - **The journal opens with what was read before the session began.** A
   dialogue descends from the priming chain and holds its working set's files
@@ -354,15 +356,20 @@ written closed, decoded greedily (`zend/src/journal/draft.rs`, which runs
    `journal_write`, whose `cite` enum holds the stretch's citable parts and
    whose `claims` hold at least one per two citable parts (at most six are
    insisted on: decoded greedily, a writer offered "another claim or close"
-   closed after one, the request, however the question asked), or,
-   once the journal holds an entry to weigh the stretch against,
-   `journal_skip` with a one-sentence `reason`. **A new entry is a step
-   change**: the user asking for something new, a new task begun, or a major
-   step done (a fix made, a cause found, a test passing or failing, a
-   decision). More reading, searching or more of the same step is skipped, and
-   **a skip files the stretch under the latest entry**: that entry's span runs
-   on over it (`Journal::nothing_to_write`), so its turns are found under the
-   step they belong to, and its line does not change, so nothing is resealed.
+   closed after one, the request, however the question asked), or, when the
+   draft may skip and the journal holds an entry to weigh the stretch against,
+   `journal_skip` with a one-sentence `reason`. **Whether it may skip is the
+   cadence's to say** (`journal_core::workflow::Skip`, §6): the draft of a
+   finished request may not — every request the user made gets its entry —
+   and a draft within a long request may only once that request has an entry
+   of its own. A draft that may not skip is shown no latest entry and offered
+   only the write. Within a request, **a new entry is a step change**: a new
+   task begun, or a major step done (a fix made, a cause found, a test passing
+   or failing, a decision). More reading, searching or more of the same step is
+   skipped, and **a skip files the stretch under the latest entry** — the
+   request's own: that entry's span runs on over it
+   (`Journal::nothing_to_write`), so its turns are found under the step they
+   belong to, and its line does not change, so nothing is resealed.
    The check runs as often as before — the cadence gives the record its
    resolution — and the gate decides what is a step. **zend asks once**
    (`Desk::rounds`, 1; npcd keeps the default four): a refused write is not
@@ -413,9 +420,9 @@ message, and its tool results are prefilled as large user sides. So a turn or
 two after any step, attention sees only that step's prose. In a tool loop the
 prose is little more than the calls themselves. The recurrent layers still
 hold the reasoning (§6.2 there), but as a gated fold that fades and cannot be
-addressed. The model keeps what it did and loses why. Entries come every 16
-turns (§6), so they are too coarse to carry a loop's working conclusions step
-by step.
+addressed. The model keeps what it did and loses why. Entries come once a
+request finishes, and within a long one every 16 of its rounds (§6), so they
+are too coarse to carry a loop's working conclusions step by step.
 
 A note is the model's own compression of its thinking, written while the
 thinking is still in front of it.
@@ -511,21 +518,38 @@ note call reads as `Note: <text>`.
 
 ## 6. Cadence
 
-zend counts sealed dialogue turns (each tool round seals one)
-(`zend/src/journal/state.rs`, `pressure.rs`). After each round's turn seals, a
-draft starts when either holds:
+zend counts in **requests** (`zend/src/journal/state.rs`, `pressure.rs`): a
+request is the user's turn and every tool round it takes (each round seals one
+turn), until a reply ends without a call. After each round's turn seals, a
+draft starts when one of these holds:
 
-- **`EVERY_TURNS` (16)** turns have sealed since the last draft was handed a
-  stretch.
-- **Selection pressure:** the round's projection left out a turn of this
-  conversation that no entry and no skip covers. The projection event a round
-  records already names every turn it selected, so the signal costs nothing. A
-  turn is looked at before the session loses sight of it.
+- **The request finished.** Its reply made no call, so the request is done: a
+  draft covers it, and may not skip (§5). Every request the user made is
+  therefore in the journal, in order — "what did I ask you?" is answered from
+  it. Measured on 2026-11-14 under the old cadence, a sixteen-turn draft
+  merged a tour and a paper critique into one line and recorded nothing of a
+  question between them, and the conversation's list of what it had been
+  asked was wrong.
+- **Within a long request, `EVERY_ROUNDS` (16)** of its turns have sealed since
+  the journal last looked: a progress entry for the stretch so far.
+- **Within a long request, selection pressure:** the round's projection left
+  out a turn of this conversation that no entry and no skip covers. The
+  projection event a round records already names every turn it selected, so
+  the signal costs nothing. A turn is looked at before the session loses sight
+  of it — a read-heavy request can pass the dialogue's window well before its
+  sixteenth round (a 200-line read is ~6,000 tokens).
 
-At most one draft runs per conversation (single flight). A draft's stretch is
-every part after `covered_to`. A skip or a kept entry moves `covered_to` to the
-end of the stretch. An abandoned draft leaves it where it was, so the next draft
-retries those turns.
+A request's entries are the ones whose spans fall within it: its progress
+entries and the one that closes it. A progress draft may skip only once its
+request has an entry, so a skip never files a request's turns under the entry
+of the request before it.
+
+At most one draft runs per conversation (single flight). A request that
+finishes while a draft runs is owed its entry (`SessionJournal::owe`), and that
+draft starts as soon as the running one ends, over what is still uncovered. A
+draft's stretch is every part after `covered_to`. A skip or a kept entry moves
+`covered_to` to the end of the stretch. An abandoned draft leaves it where it
+was, so the next draft retries those turns.
 
 There is no idle trigger. A quiet conversation's uncovered turns are still in
 the substrate, whole, and the next trigger after the session resumes covers
@@ -700,4 +724,5 @@ Settled with the user on 2026-10-23:
     which leave its window, but a copy living as long as the entry, ceased when
     it folds or the conversation is tombstoned or archived.
 
-The starting number `EVERY_TURNS` 16 is a guess to tune in live sessions.
+The number `EVERY_ROUNDS` 16 — how many of a long request's rounds pass
+between its progress entries — is a guess to tune in live sessions.

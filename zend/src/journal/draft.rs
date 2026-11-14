@@ -2,9 +2,11 @@
 //!
 //! The write, the skip, the check and the keep are `journal_core`'s
 //! ([`journal_core::workflow::run`]): one answer either writes the entry or —
-//! once the journal holds an entry to weigh the stretch against — skips it with
-//! a reason. Whichever way a draft ends, the journal is told and the draft is
-//! recorded, so the API shows every draft's outcome and timings.
+//! when the draft may skip and the journal holds an entry to weigh the stretch
+//! against — skips it with a reason. A finished request's draft may not
+//! ([`super::state::Due::skip`]). Whichever way a draft ends, the journal is told
+//! and the draft is recorded, so the API shows every draft's outcome and
+//! timings.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -13,7 +15,7 @@ use journal_core::journal::Holds;
 use journal_core::record::DraftRecord;
 use journal_core::span::Span;
 use journal_core::verify::World;
-use journal_core::workflow::{self, Desk};
+use journal_core::workflow::{self, Desk, Skip};
 
 use crate::journal::state::SessionJournal;
 
@@ -23,16 +25,17 @@ fn hold(state: &Mutex<SessionJournal>) -> MutexGuard<'_, SessionJournal> {
 
 /// Run one draft over `span`, which the caller took with
 /// [`SessionJournal::begin`], and return its record — which the journal holds
-/// too.
+/// too. `skip` says whether the draft may answer `journal_skip`.
 pub async fn draft<D: Desk>(
     desk: &mut D,
     state: &Mutex<SessionJournal>,
     span: &Span,
     world: &(dyn World + Sync),
+    skip: Skip,
 ) -> DraftRecord {
     let started = Instant::now();
     let style = hold(state).style();
-    let (outcome, timing) = workflow::run(desk, state, span, world, style).await;
+    let (outcome, timing) = workflow::run(desk, state, span, world, style, skip).await;
     let record = DraftRecord::of(span, started.elapsed(), &outcome).timed(timing);
     hold(state).journal_mut().record(record.clone());
     record
@@ -165,7 +168,7 @@ mod tests {
     async fn an_empty_journal_is_asked_for_the_entry_alone() {
         let (state, span) = begun(SessionJournal::new());
         let mut desk = answering(&[WRITTEN]);
-        let record = draft(&mut desk, &state, &span, &Silent).await;
+        let record = draft(&mut desk, &state, &span, &Silent, Skip::Allowed).await;
         assert_eq!(record.result, Ending::Wrote);
         assert_eq!(desk.offered, vec![vec![WRITE.to_string()]]);
         assert!(desk.asked[0].ends_with(WRITE_QUESTION), "{}", desk.asked[0]);
@@ -182,7 +185,7 @@ mod tests {
     async fn a_journal_with_an_entry_is_offered_the_skip_in_the_same_answer() {
         let (state, span) = begun(written());
         let mut desk = answering(&[WRITTEN]);
-        let record = draft(&mut desk, &state, &span, &Silent).await;
+        let record = draft(&mut desk, &state, &span, &Silent, Skip::Allowed).await;
         assert_eq!(record.result, Ending::Wrote);
         assert_eq!(record.entry, Some(2));
         assert_eq!(desk.asked.len(), 1, "one answer, no separate gate");
@@ -202,7 +205,7 @@ mod tests {
     async fn a_skip_covers_the_stretch_and_keeps_the_reason() {
         let (state, span) = begun(written());
         let mut desk = answering(&[SKIPPED]);
-        let record = draft(&mut desk, &state, &span, &Silent).await;
+        let record = draft(&mut desk, &state, &span, &Silent, Skip::Allowed).await;
         assert_eq!(record.result, Ending::Nothing);
         assert_eq!(record.detail.as_deref(), Some("Already written."));
         let j = state.lock().unwrap();
@@ -221,7 +224,7 @@ mod tests {
     async fn a_draft_that_cannot_be_asked_is_abandoned_and_covers_nothing() {
         let (state, span) = begun(written());
         let mut desk = Script::default();
-        let record = draft(&mut desk, &state, &span, &Silent).await;
+        let record = draft(&mut desk, &state, &span, &Silent, Skip::Allowed).await;
         assert_eq!(record.result, Ending::Abandoned);
         let j = state.lock().unwrap();
         assert_eq!(j.journal().covered_to(), 0, "nothing covered");
@@ -234,7 +237,7 @@ mod tests {
         let bad =
             r#"{"name": "journal_write", "arguments": {"claims": [{"text": "x", "cite": "9"}]}}"#;
         let mut desk = answering(&[bad; 4]);
-        let record = draft(&mut desk, &state, &span, &Silent).await;
+        let record = draft(&mut desk, &state, &span, &Silent, Skip::Allowed).await;
         assert_eq!(record.result, Ending::Abandoned);
         assert_eq!(desk.asked.len(), 4);
         let j = state.lock().unwrap();
