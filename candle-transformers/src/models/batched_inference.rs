@@ -50,8 +50,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     fragmentation, launch_scratch_reserve, plan_pool, region_stats, ArenaKey, ArenaLocation,
     ChunkedKvBacking, CompressionPolicy, Fragmentation, GpuArenaClassStats, GroundLost, HeadGids,
-    KvCache, KvFormat, ModelGeometry, PrefillKvStageLayout, PrefillLaunchBounds, QuantFormat,
-    SizeClass, WavePlan, WaveWidth, REGION_BYTES, WAVE_FFN_BYTES,
+    KvCache, KvFormat, ModelGeometry, PrefillKvStageLayout, PrefillLaunchBounds, ProvSource,
+    QuantFormat, SizeClass, WavePlan, WaveWidth, CHUNK_SIZE, REGION_BYTES, WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -80,6 +80,9 @@ use candle_nn::kv_cache::GapCycle;
 
 #[cfg(feature = "cuda")]
 mod gap;
+
+#[cfg(test)]
+mod prov_signs_tests;
 
 /// One R16 chunk's unpacked contents: `(block_idx, k_flat, v_flat, q_flat)`.
 ///
@@ -715,6 +718,47 @@ pub struct ProvSignPacked {
     /// `head_dim / n_palette` — bits packed per palette sub-band (`<= 64`, the
     /// width of a physical R16 band at `head_dim` 256).
     pub sub_head_dim: usize,
+}
+
+/// A scope's provenance sources, resolved by
+/// [`BatchedInferenceSession::resolve_provenance_sources`] and packed by
+/// [`BatchedInferenceSession::pack_provenance_signs`].
+pub struct ProvSources {
+    /// Per provenance-bearing layer, each block's source, in block order.
+    pub layers: Vec<Vec<ProvSource>>,
+    /// Absolute chunk indices resolved (identical across all layers).
+    pub blocks: Vec<usize>,
+}
+
+/// A scope's packed signs in [`ProvSignPacked`] order — layer-major, then
+/// block, each block `block_words` words — taking a [`ProvSource::Q`] block's
+/// warps from `read` (the sign-pack's output over every `Q` block's pointers,
+/// in the same order) and a [`ProvSource::Signed`] block's from its captured
+/// bits. `None` when `read` is not exactly the `Q` blocks' warps or a block
+/// is not `block_words` long.
+pub fn lay_out_prov_signs(
+    layers: &[Vec<ProvSource>],
+    read: &[u64],
+    block_words: usize,
+) -> Option<Vec<u64>> {
+    if block_words == 0 {
+        return None;
+    }
+    let blocks = layers.first().map_or(0, Vec::len);
+    let mut packed = Vec::with_capacity(layers.len() * blocks * block_words);
+    let mut from_kernel = read.chunks_exact(block_words);
+    if !from_kernel.remainder().is_empty() {
+        return None;
+    }
+    for source in layers.iter().flatten() {
+        let words: &[u64] = match source {
+            ProvSource::Q(ptrs) if ptrs.len() * CHUNK_SIZE == block_words => from_kernel.next()?,
+            ProvSource::Signed(signs) if signs.len() == block_words => signs,
+            _ => return None,
+        };
+        packed.extend_from_slice(words);
+    }
+    from_kernel.next().is_none().then_some(packed)
 }
 
 impl BatchedInferenceSession {
@@ -2884,32 +2928,64 @@ impl BatchedInferenceSession {
         block_range: Option<(usize, usize)>,
         n_layers: usize,
     ) -> candle::Result<Option<ProvSignPacked>> {
-        let Some((all_ptrs, block_indices)) =
-            self.resolve_provenance_q_ptrs(seq_idx, block_range, n_layers)?
-        else {
+        let Some(sources) = self.resolve_provenance_sources(seq_idx, block_range, n_layers)? else {
             return Ok(None);
         };
+        self.pack_provenance_signs(&sources)
+    }
+
+    /// Sign-pack a resolved scope: one kernel launch over every R16 block's Q
+    /// across all its layers, then each block's warps laid into the
+    /// warp-major [`ProvSignPacked`] order — the kernel's for a block read from
+    /// Q, the gap's captured bits for a block it converted. `None` when the
+    /// kernel declines (non-CUDA, unsupported width) or a captured block's
+    /// bits are not this geometry's size.
+    pub fn pack_provenance_signs(
+        &self,
+        sources: &ProvSources,
+    ) -> candle::Result<Option<ProvSignPacked>> {
         let sub_head_dim = self.prov_sub_head_dim();
-        let packed = self.run_prov_sign_pack(&all_ptrs, sub_head_dim)?;
-        if packed.is_empty() {
+        let n_kv_head = self.n_kv_head();
+        let n_palette = self.prov_n_palette();
+        let block_words = n_kv_head * n_palette * CHUNK_SIZE;
+        if sub_head_dim == 0 || block_words == 0 {
             return Ok(None);
         }
+        let all_ptrs: Vec<i64> = sources
+            .layers
+            .iter()
+            .flatten()
+            .filter_map(|s| match s {
+                ProvSource::Q(ptrs) => Some(ptrs.as_slice()),
+                ProvSource::Signed(_) => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        let read = if all_ptrs.is_empty() {
+            Vec::new()
+        } else {
+            self.run_prov_sign_pack(&all_ptrs, sub_head_dim)?
+        };
+        let Some(packed) = lay_out_prov_signs(&sources.layers, &read, block_words) else {
+            return Ok(None);
+        };
         Ok(Some(ProvSignPacked {
             packed,
-            block_indices,
-            n_layers: self.backings.len(),
-            n_kv_head: self.n_kv_head(),
+            block_indices: sources.blocks.clone(),
+            n_layers: sources.layers.len(),
+            n_kv_head,
             // Derived from the same rule as `sub_head_dim` above, and it has to
             // be: the two travel together in this struct, and a consumer that
             // reconstructs `head_dim = n_palette * sub_head_dim` from a derived
             // width beside a constant band count reads 128 for a 256-wide head.
-            n_palette: self.prov_n_palette(),
+            n_palette,
             sub_head_dim,
         }))
     }
 
     /// How many palette bands a head is **physically stored in** — the number
-    /// of Q pointers `provenance_q_ptrs` emits per head.
+    /// of Q pointers a [`ProvSource::Q`] carries per head.
     ///
     /// **This is a property of the arena, not a free choice.** The R16 chunk
     /// lays each head out in `N_PALETTE` bands of `head_dim / N_PALETTE` dims, the
@@ -2962,19 +3038,18 @@ impl BatchedInferenceSession {
         }
     }
 
-    /// Resolve the concatenated R16 Q-chunk pointers across ALL layers for a
-    /// sequence's blocks — the input to the sign-pack kernel — plus the block
-    /// index set (identical across layers). Split from the launch so a caller can
-    /// resolve many scopes while their slots are alive, then batch ONE kernel
-    /// launch over all of them (the arena chunks stay valid via the sealed K/V's
-    /// RAII refs). `None` (→ CPU path) when not CUDA, when any layer has no R16
-    /// blocks, when the layers' block sets disagree, or when `sub_head_dim > 32`.
-    pub fn resolve_provenance_q_ptrs(
+    /// Resolve where every provenance-bearing layer's blocks take their
+    /// `sign(Q)` from — R16 Q addresses or the gap's captured bits — plus the
+    /// block index set, identical across layers. Split from the launch so the
+    /// caller times the two apart. `None` (→ CPU path) when not CUDA, when any
+    /// layer has no block with Q or signs, when the layers' block sets
+    /// disagree, or when the geometry cannot be packed into one word.
+    pub fn resolve_provenance_sources(
         &self,
         seq_idx: usize,
         block_range: Option<(usize, usize)>,
         n_layers: usize,
-    ) -> candle::Result<Option<(Vec<i64>, Vec<usize>)>> {
+    ) -> candle::Result<Option<ProvSources>> {
         if self.backings.is_empty() || self.n_kv_head() == 0 || self.prov_sub_head_dim() == 0 {
             return Ok(None);
         }
@@ -2993,12 +3068,15 @@ impl BatchedInferenceSession {
         // Including it returned `None` on every turn: the turn sealed, the K/V
         // was written, and only the signature was silently absent, leaving
         // retrieval on recency with nothing saying so.
-        let mut all_ptrs: Vec<i64> = Vec::new();
+        let mut layers: Vec<Vec<ProvSource>> = Vec::new();
         let mut block_indices: Option<Vec<usize>> = None;
         let take = n_layers.min(self.backings.len());
         for backing in &self.backings[..take] {
-            let (ptrs, blocks) = backing.provenance_q_ptrs(seq_idx, block_range)?;
-            if ptrs.is_empty() {
+            let (blocks, sources): (Vec<usize>, Vec<ProvSource>) = backing
+                .provenance_sources(seq_idx, block_range)?
+                .into_iter()
+                .unzip();
+            if blocks.is_empty() {
                 return Ok(None);
             }
             match &block_indices {
@@ -3006,10 +3084,10 @@ impl BatchedInferenceSession {
                 Some(prev) if *prev != blocks => return Ok(None),
                 _ => {}
             }
-            all_ptrs.extend(ptrs);
+            layers.push(sources);
         }
         match block_indices {
-            Some(b) if !b.is_empty() => Ok(Some((all_ptrs, b))),
+            Some(blocks) if !blocks.is_empty() => Ok(Some(ProvSources { layers, blocks })),
             _ => Ok(None),
         }
     }
@@ -6553,6 +6631,7 @@ mod seal_alignment_tests {
             v_fmt: Arc::new(Vec::new()),
             byte_size: 0,
             meta: None,
+            q_sign: None,
         }
     }
 

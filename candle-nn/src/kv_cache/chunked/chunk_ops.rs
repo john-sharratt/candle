@@ -1646,6 +1646,8 @@ impl ChunkedKvBacking {
                 v_fmt: Arc::new(chunk.v_fmt.to_vec()),
                 byte_size: chunk.kv_bytes.len() as u64,
                 meta: None,
+                // Read back from the log: its signature was folded at its seal.
+                q_sign: None,
             })
             .collect();
         Ok(SealedSequence {

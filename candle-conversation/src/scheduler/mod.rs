@@ -11032,9 +11032,9 @@ impl Scheduler {
     /// aligned with the turn's `Tokens` record. Every token of each block is captured (no
     /// structural filter; filtering is a query-time concern). Each token's raw all-heads /
     /// all-layers `sign(Q)` is folded to the compact signature under this model's own
-    /// derived fold (three layer-groups, heads separate) before storing. Blocks whose R16
-    /// backing is gone (compressed) contribute nothing — capture a turn while its KV is
-    /// still R16 (e.g. `kv_lossless`, or at seal before the bg-quantizer runs).
+    /// derived fold (three layer-groups, heads separate) before storing. A block the gap
+    /// quantized contributes the `sign(Q)` bits the gap captured before its convert; a
+    /// block with neither R16 Q nor captured bits contributes nothing.
     fn gather_wide_sigs(&self, seq_id: SequenceId, range: (usize, usize)) -> Vec<WideQSig> {
         // **The STREAM layers, not every KV layer.** A signature is a statement
         // about the conversation's own history, and a draft head's K/V is not
@@ -11070,27 +11070,16 @@ impl Scheduler {
             let t_res = Instant::now();
             let resolved = self
                 .session
-                .resolve_provenance_q_ptrs(seq_id.0, Some(range), n_layers)
+                .resolve_provenance_sources(seq_id.0, Some(range), n_layers)
                 .ok()
                 .flatten();
             PROV_RESOLVE_US.fetch_add(t_res.elapsed().as_micros() as u64, Relaxed);
-            if let Some((all_ptrs, block_indices)) = resolved {
+            if let Some(sources) = resolved {
                 let t_run = Instant::now();
-                let packed = self
-                    .session
-                    .run_prov_sign_pack(&all_ptrs, sub)
-                    .unwrap_or_default();
+                let packed = self.session.pack_provenance_signs(&sources).ok().flatten();
                 PROV_KERNEL_US.fetch_add(t_run.elapsed().as_micros() as u64, Relaxed);
-                if !packed.is_empty() {
+                if let Some(ps) = packed {
                     let t_asm = Instant::now();
-                    let ps = ProvSignPacked {
-                        packed,
-                        block_indices,
-                        n_layers,
-                        n_kv_head,
-                        n_palette: candle_nn::kv_cache::N_PALETTE,
-                        sub_head_dim: sub,
-                    };
                     let sigs = assemble_folded_prov_sigs(&ps, &layout, head_dim, self.prov_fold);
                     PROV_ASSEMBLE_US.fetch_add(t_asm.elapsed().as_micros() as u64, Relaxed);
                     PROV_PATH_GPU.fetch_add(1, Relaxed);

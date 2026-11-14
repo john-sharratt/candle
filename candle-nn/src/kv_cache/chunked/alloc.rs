@@ -1174,6 +1174,8 @@ impl ChunkedKvBacking {
             // Fresh float writer chunk: transient, no resident record. The host
             // serializer builds per-forward scratch heads for it.
             meta: None,
+            // Its Q is in its bands.
+            q_sign: None,
         })
     }
 

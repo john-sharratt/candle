@@ -308,6 +308,18 @@ one, as today. On the RTX 3090 it runs at the device copy roofline: 88 µs for a
 Nothing else is written on the device. No record is filled and no block table is
 touched in the gap: both are the host's to change, at the catch-up.
 
+**Provenance signatures are captured before the convert.** A turn's provenance
+signature is `sign(Q)` per token, and Q lives inside the R16 K band, so a block
+converted mid-turn has no Q left for the seal to read. The gap's first launch is
+the provenance sign-pack (`prov_sign_pack`) over every job whose K bands are all
+R16, writing each job's `n_kv_head × N_PALETTE` warps of `CHUNK_SIZE` words into
+the summary (§3.4). The catch-up hands each converted chunk its bits
+(`ChunkWindow::q_sign`, a `QSign`), which travel with the chunk through
+snapshots, re-injection and forks as its record does. The seal's gather and the
+reprojection probe (`ChunkedKvBacking::provenance_sources`) take a block's bits
+from its R16 Q while it has one and from `q_sign` once it does not, so a block's
+signature is the same bits whichever side of the gap it is read on.
+
 ### 3.4 The summary
 
 The kernels write the gap's summary into one mapped pinned buffer, as the MoE
@@ -316,6 +328,7 @@ It holds:
 - one flag per block: converted or deferred;
 - for each head, its destination record exactly as the convert read it, and
   each of its eight bands' lease index;
+- for each job with R16 Q, its packed `sign(Q)` warps (§3.3);
 - a **completion word**, written by the gap's last launch (after the convert),
   holding the gap's sequence number.
 
@@ -810,7 +823,7 @@ Line numbers are as of commit `dc04b62ac`.
   does not quantize, a head_dim the convert has no record for, or the
   single-latent layout. The gap's state is made with the session, before any
   forward; a table holds the jobs whose scratch fits `GAP_SCRATCH_BYTES`
-  (64 MiB, `gap_jobs_within`): 3,866 at 4 KV heads of 128, 4,761 at 2 of 256.
+  (64 MiB, `gap_jobs_within`): 3,838 at 4 KV heads of 128, 4,739 at 2 of 256.
 - The `kv_gap` line, `candle-conversation/src/scheduler/kv_gap.rs`: summed per
   second and written while gaps run.
 - `batch_test/utils.rs`, `batch_test/fidelity.rs` and `quantized_qwen38_moe.rs`:

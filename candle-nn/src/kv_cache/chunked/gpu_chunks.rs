@@ -1593,6 +1593,7 @@ mod pin_tests {
             k_fmt: Arc::new(Vec::new()),
             v_fmt: Arc::new(Vec::new()),
             meta,
+            q_sign: None,
         }
     }
 

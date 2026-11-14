@@ -20,7 +20,7 @@ use super::band_codec::encode_band;
 use super::gid_pool::ChunkGid;
 use super::head_gids::HeadGids;
 use super::io::read_band_chunk;
-use super::types::{ChunkWindow, DetachedChunks, SealedChunk, SealedSequence};
+use super::types::{ChunkWindow, DetachedChunks, QSign, SealedChunk, SealedSequence};
 use super::{ChunkedKvBacking, SequenceState};
 use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
 use crate::kv_cache::{active_kv_formats, KvFormat};
@@ -514,6 +514,7 @@ impl ChunkedKvBacking {
             v_scale: Arc<Vec<f32>>,
             k_fmt: Arc<Vec<u8>>,
             v_fmt: Arc<Vec<u8>>,
+            q_sign: Option<QSign>,
         }
         let donors: Vec<DonorMeta> = chunk_ids
             .iter()
@@ -530,6 +531,7 @@ impl ChunkedKvBacking {
                                 v_scale: cw.v_scale.clone(),
                                 k_fmt: cw.k_fmt.clone(),
                                 v_fmt: cw.v_fmt.clone(),
+                                q_sign: cw.q_sign.clone(),
                             });
                             break 'search;
                         }
@@ -546,6 +548,7 @@ impl ChunkedKvBacking {
                     // represent for their fields.
                     k_fmt: self.inner.active_k_fmt.clone(),
                     v_fmt: self.inner.active_v_fmt.clone(),
+                    q_sign: None,
                 })
             })
             .collect();
@@ -568,6 +571,7 @@ impl ChunkedKvBacking {
                 k_fmt: donors[i].k_fmt.clone(),
                 v_fmt: donors[i].v_fmt.clone(),
                 meta: None,
+                q_sign: donors[i].q_sign.clone(),
             });
         }
         if n > 0 {
@@ -582,6 +586,7 @@ impl ChunkedKvBacking {
                 k_fmt: donors[n - 1].k_fmt.clone(),
                 v_fmt: donors[n - 1].v_fmt.clone(),
                 meta: None,
+                q_sign: donors[n - 1].q_sign.clone(),
             });
         }
 
@@ -765,6 +770,7 @@ impl ChunkedKvBacking {
             v_scale: Arc<Vec<f32>>,
             k_fmt: Arc<Vec<u8>>,
             v_fmt: Arc<Vec<u8>>,
+            q_sign: Option<QSign>,
         }
         let mut resolved_blocks: Vec<ResolvedBlock> = Vec::with_capacity(need_blocks);
         for block_ids in chunk_ids.iter() {
@@ -778,6 +784,7 @@ impl ChunkedKvBacking {
             let mut donor_v_scale: Option<Arc<Vec<f32>>> = None;
             let mut donor_k_fmt: Option<Arc<Vec<u8>>> = None;
             let mut donor_v_fmt: Option<Arc<Vec<u8>>> = None;
+            let mut donor_q_sign: Option<QSign> = None;
             for (idx, chunk_id) in block_ids.iter().enumerate() {
                 let raw = chunk_id.raw();
                 // Walk every live slot's chunks once to find the donor
@@ -795,6 +802,7 @@ impl ChunkedKvBacking {
                                 donor_v_scale = Some(cw.v_scale.clone());
                                 donor_k_fmt = Some(cw.k_fmt.clone());
                                 donor_v_fmt = Some(cw.v_fmt.clone());
+                                donor_q_sign = cw.q_sign.clone();
                             }
                             break 'search;
                         }
@@ -816,6 +824,7 @@ impl ChunkedKvBacking {
                 v_scale: donor_v_scale.unwrap_or_else(|| self.inner.identity_scale.clone()),
                 k_fmt: donor_k_fmt.unwrap_or_else(|| self.inner.active_k_fmt.clone()),
                 v_fmt: donor_v_fmt.unwrap_or_else(|| self.inner.active_v_fmt.clone()),
+                q_sign: donor_q_sign,
             });
         }
 
@@ -838,6 +847,7 @@ impl ChunkedKvBacking {
                 k_fmt: rb.k_fmt.clone(),
                 v_fmt: rb.v_fmt.clone(),
                 meta: None,
+                q_sign: rb.q_sign.clone(),
             });
         }
         if need_blocks > 0 {
@@ -854,6 +864,7 @@ impl ChunkedKvBacking {
                 k_fmt: rb.k_fmt.clone(),
                 v_fmt: rb.v_fmt.clone(),
                 meta: None,
+                q_sign: rb.q_sign.clone(),
             });
         }
 
@@ -968,6 +979,7 @@ impl ChunkedKvBacking {
                         // Fork shares the source chunk's GIDs (Arc bump), so its
                         // resident record's pointers stay valid — share it too.
                         meta: cw.meta.clone(),
+                        q_sign: cw.q_sign.clone(),
                     }
                 })
                 .collect();
@@ -1109,6 +1121,7 @@ impl ChunkedKvBacking {
                         // Fork shares the source chunk's GIDs (Arc bump), so its
                         // resident record's pointers stay valid — share it too.
                         meta: cw.meta.clone(),
+                        q_sign: cw.q_sign.clone(),
                     }
                 })
                 .collect();
@@ -1161,6 +1174,12 @@ impl ChunkedKvBacking {
                     cw.v_fmt.clone(),
                 )
             };
+            // A verbatim R16 copy carries Q with it; a source whose Q is already
+            // gone hands its captured bits on, which describe the same tokens.
+            let source_q_sign = state.sequences[source_batch]
+                .as_ref()
+                .and_then(|s| s.chunk_at(last_blk))
+                .and_then(|cw| cw.q_sign.clone());
 
             // Allocate new chunks using active_k_arena_key (R16 on GPU, Float on CPU)
             // so the active decode kernel can write directly into them.
@@ -1327,6 +1346,7 @@ impl ChunkedKvBacking {
                     // CoW partial: freshly-allocated GIDs (copied data) → no
                     // resident record; falls back to per-forward scratch heads.
                     meta: None,
+                    q_sign: source_q_sign,
                 });
         }
 
@@ -1613,18 +1633,7 @@ impl ChunkedKvBacking {
         // usage, read at decode like any slot's. Computing one here per block
         // was a prefix sum per block — O(n²) over the borrow, 75 M additions per
         // layer at a 12K-block prefix, for a value nothing read.
-        let borrowed_meta: Vec<(
-            HeadGids,
-            u32,
-            u16,
-            Arc<Vec<u8>>,
-            Arc<Vec<u8>>,
-            Arc<Vec<f32>>,
-            Arc<Vec<f32>>,
-            Arc<Vec<u8>>,
-            Arc<Vec<u8>>,
-            Option<super::meta_pool::MetaGid>,
-        )> = {
+        let borrowed_meta: Vec<ChunkWindow> = {
             let ps = state.sequences[parent_batch].as_ref().unwrap();
             let parent_len = ps.seq_len();
             parent_blocks
@@ -1646,29 +1655,16 @@ impl ChunkedKvBacking {
                             parent_blocks.len()
                         );
                     };
-                    // The view borrows the parent block's GIDs by Arc clone — same
-                    // physical placement — so the parent's resident record (if any)
-                    // is valid for the view too. Propagate the handle so the
-                    // reproject glue reads the resident record instead of rebuilding.
-                    Ok((
-                        cw.gids.clone(),
-                        cw.usage,
-                        cw.offset,
-                        cw.k_pal.clone(),
-                        cw.v_pal.clone(),
-                        cw.k_scale.clone(),
-                        cw.v_scale.clone(),
-                        cw.k_fmt.clone(),
-                        cw.v_fmt.clone(),
-                        cw.meta.clone(),
-                    ))
+                    // The view borrows the parent block's window whole: its GIDs by
+                    // Arc clone — same physical placement — so the parent's
+                    // resident record (if any) is valid for the view too, and the
+                    // reproject glue reads it instead of rebuilding; its formats,
+                    // scales and captured `sign(Q)` with them.
+                    Ok(cw.clone())
                 })
                 .collect::<candle::Result<Vec<_>>>()?
         };
-        let borrowed_token_count: usize = borrowed_meta
-            .iter()
-            .map(|(_, usage, ..)| *usage as usize)
-            .sum();
+        let borrowed_token_count: usize = borrowed_meta.iter().map(|cw| cw.usage as usize).sum();
 
         // All projected chunks are read-only. The view borrows EVERY parent
         // block (including a partial tail) via Arc clone — no COW. New tokens
@@ -1681,27 +1677,7 @@ impl ChunkedKvBacking {
 
         // Clone parent blocks (Arc shared, read-only) into the view in one
         // replacement — whatever the slot held goes back to the pool via RAII.
-        let chunks: Vec<ChunkWindow> = borrowed_meta
-            .into_iter()
-            .map(
-                |(gids, usage, offset, k_pal, v_pal, k_scale, v_scale, k_fmt, v_fmt, meta)| {
-                    ChunkWindow {
-                        gids,
-                        usage,
-                        offset,
-                        k_pal,
-                        v_pal,
-                        k_scale,
-                        v_scale,
-                        k_fmt,
-                        v_fmt,
-                        // Shares the parent's GIDs/placement, so the parent's
-                        // resident record applies — read it instead of rebuilding.
-                        meta,
-                    }
-                },
-            )
-            .collect();
+        let chunks = borrowed_meta;
         let view = state.sequences[view_batch].as_mut().unwrap();
         view.replace_chunks(chunks);
         // **The borrow is immutable the moment it lands**, not once a writer
@@ -1938,6 +1914,7 @@ impl ChunkedKvBacking {
                     // Snapshot shares the live chunk's GIDs, so its record (if
                     // resident) stays valid — propagate the handle.
                     meta: cw.meta.clone(),
+                    q_sign: cw.q_sign.clone(),
                 }
             })
             .collect();
@@ -2377,6 +2354,7 @@ fn sealed_windows(sealed: &SealedSequence) -> Vec<ChunkWindow> {
             k_fmt: Arc::clone(&sc.k_fmt),
             v_fmt: Arc::clone(&sc.v_fmt),
             meta: sc.meta.clone(),
+            q_sign: sc.q_sign.clone(),
         })
         .collect()
 }

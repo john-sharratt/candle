@@ -27,7 +27,7 @@ use super::super::gid_pool::ChunkGid;
 use super::super::head_gids::{ChunkBands, HeadGids};
 use super::super::meta_pool::{ChunkRecordSrc, MetaGid};
 use super::super::size_class::SizeClass;
-use super::super::types::{ChunkWindow, CHUNK_SIZE};
+use super::super::types::{ChunkWindow, QSign, CHUNK_SIZE};
 use super::assemble::{block_state, take_block, BlockState};
 use super::codes::CodeTables;
 use super::cycle::CatchUpHost;
@@ -73,6 +73,8 @@ struct Install {
     job: usize,
     gids: HeadGids,
     state: BlockState,
+    /// Its provenance `sign(Q)`, read from the R16 bands it replaces.
+    q_sign: Option<QSign>,
 }
 
 /// The group `job` was claimed under.
@@ -238,6 +240,7 @@ fn catch_up_inner(
             job: j,
             gids,
             state,
+            q_sign: finished.q_sign(j)?,
         });
     }
 
@@ -320,6 +323,8 @@ fn catch_up_inner(
                 );
                 if let Some(cw) = seq.chunk_at_mut(block) {
                     cw.meta = record;
+                    // The bands that held its Q are going; their signs stay.
+                    cw.q_sign = install.q_sign;
                 }
                 match touched.iter_mut().find(|(s, _)| *s == job.seq) {
                     Some((_, blocks)) => blocks.push(block),

@@ -221,6 +221,32 @@ pub struct SealedChunk {
     /// not-yet-promoted chunk); the host serializer builds per-forward scratch
     /// heads instead. See [`super::meta_pool`].
     pub meta: Option<MetaGid>,
+    /// The block's provenance `sign(Q)` bits, captured from its R16 bands by the
+    /// gap quantize before its convert replaced them ([`QSign`]). `None` while
+    /// the bands are R16 — Q is read from them — or when nothing captured it.
+    pub q_sign: Option<QSign>,
+}
+
+/// A block's packed provenance `sign(Q)` bits, one layer's worth: `n_kv_head ×
+/// N_PALETTE` warps of `CHUNK_SIZE` words, `[(head * N_PALETTE + palette) *
+/// CHUNK_SIZE + slot]`, each word bit `d` set iff Q dim `d` of that sub-band is
+/// non-negative — the sign-pack kernel's output for the block, as the
+/// provenance gather would have computed it from the R16 bands.
+///
+/// **Q lives inside the R16 K band**, so a block converted to a quantized
+/// format has no Q to read. The gap captures the bits first and the chunk
+/// carries them — through snapshots, re-injection and compaction — to the seal
+/// and the reprojection probe that read them.
+pub type QSign = Arc<Vec<u64>>;
+
+/// Where one block's provenance `sign(Q)` comes from, for one layer.
+#[derive(Clone, Debug)]
+pub enum ProvSource {
+    /// The block's K is R16 and GPU-backed: the Q band base addresses,
+    /// `[head][palette]`, for the sign-pack kernel to read.
+    Q(Vec<i64>),
+    /// The block was converted after the gap captured its signs.
+    Signed(QSign),
 }
 
 impl SealedChunk {
@@ -286,6 +312,7 @@ impl SealedChunk {
             v_fmt: Arc::new(Vec::new()),
             byte_size: 0,
             meta: None,
+            q_sign: None,
         }
     }
 }
@@ -421,6 +448,9 @@ pub(crate) struct ChunkWindow {
     /// freshly-allocated float writer chunk. Cloned with the window so every
     /// slot referencing the chunk shares one record. See [`super::meta_pool`].
     pub(crate) meta: Option<MetaGid>,
+    /// The block's provenance `sign(Q)` bits once its R16 bands are gone — see
+    /// [`QSign`]. Travels with the window as `meta` does.
+    pub(crate) q_sign: Option<QSign>,
 }
 
 impl ChunkWindow {
@@ -1781,6 +1811,7 @@ mod writer_region_tests {
             k_fmt: Arc::new(vec![tag.as_u8(); N_PALETTE]),
             v_fmt: Arc::new(vec![v.as_u8(); N_PALETTE]),
             meta: None,
+            q_sign: None,
         }
     }
 
@@ -1979,6 +2010,7 @@ mod sealed_tail_tests {
             v_fmt: Arc::new(vec![tag; N_PALETTE]),
             byte_size: 0,
             meta: None,
+            q_sign: None,
         }
     }
 
@@ -2046,6 +2078,7 @@ mod band_iteration_tests {
             k_fmt: Arc::new(vec![k_tag; N_PALETTE]),
             v_fmt: Arc::new(vec![v_tag; N_PALETTE]),
             meta: None,
+            q_sign: None,
         }
     }
 
@@ -2100,6 +2133,7 @@ mod band_iteration_tests {
             v_fmt: w.v_fmt.clone(),
             byte_size: 0,
             meta: None,
+            q_sign: None,
         };
         let from_window: Vec<ArenaFormatTag> = w.bands().map(|(_, t)| t).collect();
         let from_sealed: Vec<ArenaFormatTag> = sealed.bands().map(|(_, t)| t).collect();

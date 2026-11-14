@@ -20,7 +20,7 @@ use super::BatchedInferenceSession;
 /// The device scratch one gap's table runs in — its selection blocks, convert
 /// buffer and inputs, held for the session's life (§3.1). The table is cut to
 /// the jobs — blocks × layers — whose scratch fits ([`gap_jobs_within`]):
-/// 3,866 at 4 KV heads of 128, so an 8K-token prompt on a 48-layer model
+/// 3,838 at 4 KV heads of 128, so an 8K-token prompt on a 48-layer model
 /// (12,288 jobs) is quantized over four gaps; the rest of a table goes to the
 /// next gap.
 pub const GAP_SCRATCH_BYTES: usize = 64 << 20;

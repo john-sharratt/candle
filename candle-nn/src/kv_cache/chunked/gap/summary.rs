@@ -18,12 +18,17 @@ use std::ffi::c_void;
 use std::ptr::{null_mut, read_volatile, write_bytes, write_volatile};
 #[cfg(feature = "cuda")]
 use std::sync::atomic::{fence, Ordering};
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::sys;
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::kernels::simple::kv_gap_claim;
 
+#[cfg(feature = "cuda")]
+use super::super::types::QSign;
+use super::super::types::CHUNK_SIZE;
 use crate::kv_cache::arena_table::N_PALETTE as N_PAL;
 
 /// Bands per head: every palette, K and V.
@@ -79,9 +84,21 @@ impl SummaryLayout {
         (self.max_jobs * 4).next_multiple_of(8)
     }
 
+    /// Words of one job's provenance `sign(Q)` bits: a warp of `CHUNK_SIZE`
+    /// per head and palette, as the sign-pack kernel writes them.
+    pub(crate) fn sign_words(&self) -> usize {
+        self.n_kv_head * N_PAL * CHUNK_SIZE
+    }
+
+    /// The jobs' `sign(Q)` bits, eight-aligned after the rows: one job's worth
+    /// per job whose Q the gap read, packed in table order.
+    pub(crate) fn signs_off(&self) -> usize {
+        (self.heads_off() + self.max_jobs * self.n_kv_head * self.head_stride()).next_multiple_of(8)
+    }
+
     /// The error word the claim sets on a code its table does not cover.
     pub(crate) fn error_off(&self) -> usize {
-        self.heads_off() + self.max_jobs * self.n_kv_head * self.head_stride()
+        self.signs_off() + self.max_jobs * self.sign_words() * 8
     }
 
     /// The completion word, stored last.
@@ -272,6 +289,23 @@ impl MappedSummary {
         read_volatile(self.word(self.layout.flags_off() + job * 4)) != 0
     }
 
+    /// The `sign(Q)` bits the gap wrote at sign slot `slot` — the `slot`-th
+    /// job whose Q it read.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::errored`], and `slot` is one the gap's sign-pack wrote.
+    pub(crate) unsafe fn q_sign(&self, slot: usize) -> QSign {
+        let words = self.layout.sign_words();
+        let off = self.layout.signs_off() + slot * words * 8;
+        assert!(
+            off + words * 8 <= self.layout.error_off(),
+            "gap summary sign slot {slot} out of range"
+        );
+        let src = std::slice::from_raw_parts(self.host.add(off) as *const u64, words);
+        Arc::new(src.to_vec())
+    }
+
     /// Head `head`'s row (`head` counted across jobs, job-major).
     ///
     /// # Safety
@@ -302,6 +336,8 @@ pub(crate) struct Finished<'s> {
     summary: &'s MappedSummary,
     jobs: usize,
     device_ms: f64,
+    /// Each job's sign slot, `None` for a job whose Q the gap did not read.
+    sign_slots: &'s [Option<u32>],
 }
 
 #[cfg(feature = "cuda")]
@@ -310,13 +346,35 @@ impl<'s> Finished<'s> {
     ///
     /// [`MappedSummary::complete`] has returned true for the gap of `jobs`
     /// jobs whose summary `summary` is, and no later gap has been armed.
-    /// `device_ms` is that gap's time on the stream.
-    pub(crate) unsafe fn new(summary: &'s MappedSummary, jobs: usize, device_ms: f64) -> Self {
+    /// `device_ms` is that gap's time on the stream; `sign_slots` holds each
+    /// job's sign slot as the gap's sign-pack wrote them.
+    pub(crate) unsafe fn new(
+        summary: &'s MappedSummary,
+        jobs: usize,
+        device_ms: f64,
+        sign_slots: &'s [Option<u32>],
+    ) -> Self {
         Self {
             summary,
             jobs,
             device_ms,
+            sign_slots,
         }
+    }
+
+    /// Job `job`'s provenance `sign(Q)` bits, read from its R16 bands before
+    /// they were converted; `None` for a job whose bands held no Q.
+    pub(crate) fn q_sign(&self, job: usize) -> Result<Option<QSign>> {
+        if job >= self.jobs {
+            candle::bail!("gap summary: job {job} of a {}-job gap", self.jobs);
+        }
+        Ok(self
+            .sign_slots
+            .get(job)
+            .copied()
+            .flatten()
+            // SAFETY: the gap has completed, and the slot is one it wrote.
+            .map(|slot| unsafe { self.summary.q_sign(slot as usize) }))
     }
 
     /// The jobs the gap's table held.
@@ -375,7 +433,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_layout_puts_flags_rows_error_and_completion_in_order() {
+    fn the_layout_puts_flags_rows_signs_error_and_completion_in_order() {
         let l = SummaryLayout {
             max_jobs: 3,
             n_kv_head: 2,
@@ -386,9 +444,25 @@ mod tests {
         assert_eq!(l.flags_off(), 0);
         assert_eq!(l.heads_off(), 16);
         assert_eq!(l.head_off(5), 16 + 5 * 200);
-        assert_eq!(l.error_off(), 16 + 6 * 200);
-        assert_eq!(l.complete_off(), 16 + 6 * 200 + 4);
-        assert_eq!(l.bytes(), 16 + 6 * 200 + 8);
+        // A job's signs: 2 heads × 4 palettes × 32 tokens.
+        assert_eq!(l.sign_words(), 256);
+        assert_eq!(l.signs_off(), 16 + 6 * 200);
+        assert_eq!(l.error_off(), 16 + 6 * 200 + 3 * 256 * 8);
+        assert_eq!(l.complete_off(), 16 + 6 * 200 + 3 * 256 * 8 + 4);
+        assert_eq!(l.bytes(), 16 + 6 * 200 + 3 * 256 * 8 + 8);
+    }
+
+    #[test]
+    fn the_signs_start_eight_aligned_whatever_the_rows_end_on() {
+        for (jobs, heads, hd) in [(1, 1, 128), (3, 3, 128), (5, 2, 256), (7, 5, 128)] {
+            let l = SummaryLayout {
+                max_jobs: jobs,
+                n_kv_head: heads,
+                head_dim: hd,
+            };
+            assert_eq!(l.signs_off() % 8, 0, "{jobs} jobs × {heads} heads at {hd}");
+            assert!(l.signs_off() >= l.head_off(jobs * heads));
+        }
     }
 
     #[test]

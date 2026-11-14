@@ -25,7 +25,7 @@ use super::head_gids::ChunkBands;
 use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
 #[cfg(feature = "cuda")]
 use super::slot_upload_batch::SlotUploadBatch;
-use super::types::{ChunkWindow, DecodeGpuChunksSyncKind};
+use super::types::{ChunkWindow, DecodeGpuChunksSyncKind, ProvSource, QSign};
 use super::{
     Arena, ArenaKey, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta,
     CompressionPolicy, GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
@@ -1801,6 +1801,7 @@ impl ChunkedKvBacking {
                     // resident record handle so the prefill/glue serializer can
                     // emit its `kvheads_ptr` instead of rebuilding heads.
                     meta: cw.meta.clone(),
+                    q_sign: cw.q_sign.clone(),
                 }
             })
             .collect();
@@ -3393,35 +3394,36 @@ impl ChunkedKvBacking {
         Ok(result)
     }
 
-    /// Resolve the R16 K-chunk base pointers (Q is co-located in the K chunk at
-    /// +64 per dim-group) for a sequence's blocks — the addresses the provenance
-    /// sign-pack kernel reads Q from. Returns `(q_ptrs, block_indices)` where
-    /// `q_ptrs` is `[block][head][palette]` device i64 addresses (length
-    /// `block_indices.len() × n_kv_head × N_PALETTE`) and `block_indices` are the
-    /// absolute chunk indices kept — only fully-R16, GPU-backed blocks are
-    /// included, exactly as [`Self::gather_r16_kv_probe`] filters them, so all
-    /// layers of a scope resolve to the same block set. Empty on non-CUDA / no
-    /// R16 blocks.
-    pub fn provenance_q_ptrs(
+    /// Where each of a sequence's blocks' provenance `sign(Q)` comes from, in
+    /// block order: the R16 K-chunk base pointers the sign-pack kernel reads Q
+    /// from (Q is co-located in the K chunk at +64 per dim-group),
+    /// `[head][palette]` device addresses, for a block whose K is still R16 and
+    /// GPU-backed — the filter [`Self::gather_r16_kv_probe`] uses, so all layers
+    /// of a scope resolve alike — or the signs the gap captured for a block it
+    /// has since converted ([`ProvSource::Signed`]). A block with neither has
+    /// no Q to give and is left out. Empty on non-CUDA.
+    pub fn provenance_sources(
         &self,
         batch_idx: usize,
         block_range: Option<(usize, usize)>,
-    ) -> Result<(Vec<i64>, Vec<usize>)> {
+    ) -> Result<Vec<(usize, ProvSource)>> {
         use crate::kv_cache::arena_table::ArenaFormatTag;
 
         let Device::Cuda(_) = &self.inner.device else {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         };
 
-        // (absolute_block_idx, [(k_ai, k_ci)]) — Q side only (co-located with K).
-        let block_gids: Vec<(usize, Vec<(usize, usize, ArenaFormatTag)>)> = {
+        // (absolute_block_idx, [(k_ai, k_ci, tag)], captured signs) — Q side
+        // only (co-located with K).
+        type BlockQ = (usize, Vec<(usize, usize, ArenaFormatTag)>, Option<QSign>);
+        let block_gids: Vec<BlockQ> = {
             let state = self
                 .state
                 .read()
                 .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
             let slot = match state.sequences.get(batch_idx).and_then(|s| s.as_ref()) {
                 Some(s) => s,
-                None => return Ok((Vec::new(), Vec::new())),
+                None => return Ok(Vec::new()),
             };
             let chunks = slot.chunks_slice();
             let (lo, hi) = match block_range {
@@ -3429,7 +3431,7 @@ impl ChunkedKvBacking {
                 None => (0, chunks.len()),
             };
             if hi <= lo {
-                return Ok((Vec::new(), Vec::new()));
+                return Ok(Vec::new());
             }
             chunks[lo..hi]
                 .iter()
@@ -3441,48 +3443,52 @@ impl ChunkedKvBacking {
                         .step_by(2)
                         .map(|(g, tag)| (g.arena_idx(), g.chunk_idx(), tag))
                         .collect();
-                    (lo + i, gids)
+                    (lo + i, gids, cw.q_sign.clone())
                 })
                 .collect()
         };
         if block_gids.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
 
         // Resolve only the arenas this scope's gids actually reference (a couple),
         // not the whole arena table — the bulk of this path's per-scope cost.
         let needed: std::collections::HashSet<usize> = block_gids
             .iter()
-            .flat_map(|(_, gids)| gids.iter().map(|&(k_ai, ..)| k_ai))
+            .flat_map(|(_, gids, _)| gids.iter().map(|&(k_ai, ..)| k_ai))
             .collect();
         let arena_info = self.inner.resolve_arena_info_for(&needed)?;
-        let mut q_ptrs: Vec<i64> = Vec::new();
-        let mut block_indices: Vec<usize> = Vec::new();
-        for (block_idx, head_gids) in &block_gids {
-            // Keep a block only when every (h,p) K side is R16 and GPU-backed —
+        let mut out = Vec::with_capacity(block_gids.len());
+        for (block_idx, head_gids, q_sign) in block_gids {
+            // Q from the bands while every (h,p) K side is R16 and GPU-backed —
             // same filter as `gather_r16_kv_probe`, so layers stay aligned. The
             // R16-ness is the chunk answering; the residency is the arena.
-            let ok = head_gids.iter().all(|&(k_ai, _, k_tag)| {
+            let readable = head_gids.iter().all(|&(k_ai, _, k_tag)| {
                 k_tag == ArenaFormatTag::R16
                     && arena_info.get(k_ai).is_some_and(|a| a.base_ptr != 0)
             });
-            if !ok {
-                continue;
-            }
-            block_indices.push(*block_idx);
-            for &(k_ai, k_ci, _) in head_gids.iter() {
-                let k_arena = &arena_info[k_ai];
-                q_ptrs.push(k_arena.base_ptr as i64 + k_ci as i64 * k_arena.chunk_byte_stride);
+            if readable {
+                let ptrs = head_gids
+                    .iter()
+                    .map(|&(k_ai, k_ci, _)| {
+                        let k_arena = &arena_info[k_ai];
+                        k_arena.base_ptr as i64 + k_ci as i64 * k_arena.chunk_byte_stride
+                    })
+                    .collect();
+                out.push((block_idx, ProvSource::Q(ptrs)));
+            } else if let Some(signs) = q_sign {
+                // Converted after the gap captured its signs.
+                out.push((block_idx, ProvSource::Signed(signs)));
             }
         }
-        Ok((q_ptrs, block_indices))
+        Ok(out)
     }
 
     /// Launch the provenance sign-pack kernel over R16 Q-chunk pointers spanning
     /// ALL layers of a scope, returning the packed sign bits (`n_warps ×
     /// CHUNK_SIZE` u64, warp-major: `out[warp*CHUNK_SIZE + token]` has bit `d`
     /// set iff Q dim `d` of that sub-band is `>= 0`). `all_q_ptrs` is the
-    /// concatenation of every layer's [`Self::provenance_q_ptrs`] output; all
+    /// concatenation of every layer's [`ProvSource::Q`] pointers; all
     /// layers share this backing's device, so any backing can launch for the
     /// whole set. One HtoD (pointers) + one launch + one DtoH (packed bits) —
     /// replaces the per-layer f16 K/Q/V round-trips. CUDA only.

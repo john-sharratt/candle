@@ -106,6 +106,7 @@ mod tests {
             v_fmt: Arc::new(Vec::new()),
             byte_size: 0,
             meta: None,
+            q_sign: None,
         }
     }
 

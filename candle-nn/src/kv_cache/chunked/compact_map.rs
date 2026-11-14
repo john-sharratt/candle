@@ -1149,6 +1149,7 @@ mod tests {
             v_fmt: std::sync::Arc::new(Vec::new()),
             byte_size: 0,
             meta: None,
+            q_sign: None,
         }
     }
 }

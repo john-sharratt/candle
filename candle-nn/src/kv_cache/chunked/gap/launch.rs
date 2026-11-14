@@ -27,6 +27,7 @@ use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaStream, DevicePtr};
 use candle::cuda_backend::kernels::simple::kv_gap_claim::{
     claim_status_words, run_kv_gap_claim, run_kv_gap_complete, MAX_CLASS, MAX_KV_HEAD, NO_OVERRIDE,
 };
+use candle::cuda_backend::kernels::simple::prov_sign_pack;
 use candle::cuda_backend::staged::{segment, SEGMENT_ALIGN};
 use candle::cuda_backend::{CudaDevice, Held, WrapErr};
 use candle::quantized::cuda::{
@@ -148,14 +149,16 @@ impl GapScratch {
         let bands = heads * BANDS_PER_HEAD;
         let lease = SizeClass::COUNT * (bands * 8 + 3 * 4);
         let tables = heads * (PerHeadEntry::COLS + GIDS_PER_HEAD) * 8;
+        // The sign-pack's Q addresses: one a head and palette.
+        let q_ptrs = heads * N_PALETTE * 8;
         // Each group's candidates and windows: its sections, and a word a job.
         let words = SCRATCH_GROUPS * 3 * 4 * SECTION_PAD_WORDS + jobs * 4;
         let codes = 2 * 256;
-        let segments = (6 + 3 * SCRATCH_GROUPS) * SEGMENT_ALIGN;
+        let segments = (7 + 3 * SCRATCH_GROUPS) * SEGMENT_ALIGN;
         Self {
             select,
             convert,
-            inputs: lease + tables + words + codes + segments,
+            inputs: lease + tables + q_ptrs + words + codes + segments,
         }
     }
 
@@ -251,6 +254,9 @@ pub(crate) struct GapDevice {
     outstanding: Option<u32>,
     /// The job count of the gap launched and not yet read by a catch-up.
     unread: Option<usize>,
+    /// That gap's jobs' sign slots in the summary: where each job's
+    /// provenance `sign(Q)` bits were written, `None` for a job with no Q.
+    sign_slots: Vec<Option<u32>>,
     /// Events on the stream around that gap's work, from its first upload to
     /// its completion word: its device time, read once it has completed.
     timing: Option<(CudaEvent, CudaEvent)>,
@@ -331,6 +337,7 @@ impl GapDevice {
             host: HostImage::default(),
             outstanding: None,
             unread: None,
+            sign_slots: Vec::new(),
             timing: None,
         })
     }
@@ -365,8 +372,9 @@ impl GapDevice {
             .and_then(|(start, end)| start.elapsed_ms(&end).ok())
             .map_or(0.0, f64::from);
         // SAFETY: `poll` saw this gap's completion word, and no later gap has
-        // been armed: `launch` refuses while a summary is unread.
-        Some(unsafe { Finished::new(&self.summary, jobs, device_ms) })
+        // been armed: `launch` refuses while a summary is unread. The sign
+        // slots are the ones that gap's launch recorded.
+        Some(unsafe { Finished::new(&self.summary, jobs, device_ms, &self.sign_slots) })
     }
 
     /// Order the compute stream after everything the gap's stream has queued:
@@ -444,7 +452,16 @@ impl GapDevice {
             .collect::<Result<Vec<_>>>()?;
         let n_heads = jobs.len() * n_kv_head;
         let convert = Palette4ConvertLayout::new(head_dim, n_heads);
-        let (src_records, ranges) = source_records(jobs, backings, head_dim, n_kv_head)?;
+        let sources = source_records(jobs, backings, head_dim, n_kv_head)?;
+        let n_sign_warps = sources.q_ptrs.len();
+        let sub_head_dim = head_dim / N_PALETTE;
+        if n_sign_warps > 0 && sub_head_dim > prov_sign_pack::MAX_SUB_HEAD_DIM {
+            candle::bail!(
+                "gap {seq}: a {sub_head_dim}-dim band is wider than the sign-pack's \
+                 {}-bit word",
+                prov_sign_pack::MAX_SUB_HEAD_DIM
+            );
+        }
 
         // ── Device room ──
         let mut select_at = Vec::with_capacity(plans.len());
@@ -474,9 +491,14 @@ impl GapDevice {
         };
         let taken = vec![0u32; SizeClass::COUNT];
         let code_class: Vec<u8> = self.codes.class.iter().map(|&c| c as u8).collect();
+        let q_ptrs: &[i64] = if sources.q_ptrs.is_empty() {
+            &[0]
+        } else {
+            &sources.q_ptrs
+        };
         let mut segments: Vec<&[u8]> = vec![
-            &src_records,
-            segment(&ranges),
+            &sources.records,
+            segment(&sources.ranges),
             &code_class,
             &self.codes.fmt,
             segment(&lease_len),
@@ -489,6 +511,9 @@ impl GapDevice {
             segments.push(segment(&p.head_gids));
             segments.push(segment(&p.inputs.words));
         }
+        // Last: the sign-pack's Q addresses, after every group's inputs.
+        let q_ptrs_seg = segments.len() - INPUTS_FROM;
+        segments.push(segment(q_ptrs));
         let (offsets, image_len) = segment_offsets(&segments);
         // The inputs start at the third segment, on a segment boundary; the
         // device block is block-aligned, so every segment keeps its alignment.
@@ -546,6 +571,27 @@ impl GapDevice {
             let at = &at;
             let [class_at, fmt_at, lease_at, stack_at, off_at, taken_at] =
                 [at[0], at[1], at[2], at[3], at[4], at[5]];
+            // **The provenance signs first: Q is read before anything else of
+            // the gap's.** Q lives inside the R16 K band the convert reads and
+            // the catch-up then frees, so the gap is the last reader of it; the
+            // bits go to the summary for the catch-up to hand to the installed
+            // chunk. The bands stay native throughout the gap, so the order is
+            // not what keeps them readable — this is.
+            if n_sign_warps > 0 {
+                candle::set_kernel_breadcrumb("gap prov_sign_pack", file!(), line!());
+                // SAFETY: the Q addresses are in the staging inputs, uploaded
+                // above in stream order, one per warp; the summary's sign
+                // section holds a job's warps for every job of the table.
+                unsafe {
+                    prov_sign_pack::run_prov_sign_pack(
+                        at[q_ptrs_seg] as *const i64,
+                        summary.dev_at(layout.signs_off()) as *mut c_void,
+                        n_sign_warps as i32,
+                        sub_head_dim as i32,
+                        stream.cu_stream() as *mut c_void,
+                    );
+                }
+            }
             for (g, (p, group)) in plans.iter().zip(groups).enumerate() {
                 let block = select_base + select_at[g] as u64;
                 let sel = &p.inputs.layout;
@@ -640,6 +686,7 @@ impl GapDevice {
         self.timing = Some((started, ended));
         self.outstanding = Some(completion_word(seq));
         self.unread = Some(jobs.len());
+        self.sign_slots = sources.sign_slots;
         Ok(())
     }
 }
@@ -791,20 +838,39 @@ fn layer_backing<'b>(
     })
 }
 
+/// What the gap reads of its jobs' native bands, resolved in one pass.
+struct Sources {
+    /// Every head's source KvHead record, in table order.
+    records: Vec<u8>,
+    /// Every head's token window, in table order.
+    ranges: Vec<i32>,
+    /// The Q addresses of every job whose K bands are all R16 — one per head
+    /// and palette, job by job — for the provenance sign-pack.
+    q_ptrs: Vec<i64>,
+    /// Each job's place among those jobs, `None` for a job with no Q.
+    sign_slots: Vec<Option<u32>>,
+}
+
 /// Every head's source KvHead record — the job's native bands as they lie, at
-/// the identity map and unit scales — and its token window, in table order.
-/// One read of a layer's storage per run of its jobs, each arena looked up
-/// once per run, and every record written into one buffer sized up front.
+/// the identity map and unit scales — its token window, and where its Q lies
+/// when its K bands are R16 (Q is held in the R16 K band, so the band's own
+/// address is what the sign-pack reads). In table order. One read of a
+/// layer's storage per run of its jobs, each arena looked up once per run,
+/// and every record written into one buffer sized up front.
 fn source_records(
     jobs: &[GapJob],
     backings: &[&ChunkedKvBacking],
     head_dim: usize,
     n_kv_head: usize,
-) -> Result<(Vec<u8>, Vec<i32>)> {
+) -> Result<Sources> {
     let ident = identity_pal_map(head_dim);
     let record_bytes = Palette4ConvertLayout::new(head_dim, 1).record_bytes;
     let mut records = vec![0u8; jobs.len() * n_kv_head * record_bytes];
     let mut ranges = Vec::with_capacity(jobs.len() * n_kv_head);
+    let mut q_ptrs = Vec::new();
+    let mut sign_slots = Vec::with_capacity(jobs.len());
+    let mut signed = 0u32;
+    let r16 = KvFormat::Quantized(QuantFormat::R16).to_tag();
     let mut out = records.chunks_exact_mut(record_bytes);
     for run in layer_runs(jobs) {
         let layer = jobs[run.start].layer;
@@ -816,6 +882,12 @@ fn source_records(
             for job in &jobs[run] {
                 check_token_window(job.valid_range)
                     .map_err(|e| e.context(format!("gap: a job on layer {layer}")))?;
+                let has_q = (0..n_kv_head)
+                    .all(|h| (0..N_PALETTE).all(|p| job.bands.band_tags(h, p).0 == r16));
+                sign_slots.push(has_q.then(|| {
+                    signed += 1;
+                    signed - 1
+                }));
                 for h in 0..n_kv_head {
                     for p in 0..N_PALETTE {
                         let (kt, vt) = job.bands.band_tags(h, p);
@@ -828,6 +900,9 @@ fn source_records(
                         }
                     }
                     let src = head_source(&mut addrs, &job.bands, h)?;
+                    if has_q {
+                        q_ptrs.extend(src.k_ptrs.iter().map(|&a| a as i64));
+                    }
                     write_kvhead_bytes(
                         head_dim,
                         &src.k_ptrs,
@@ -846,7 +921,12 @@ fn source_records(
             Ok(())
         })??;
     }
-    Ok((records, ranges))
+    Ok(Sources {
+        records,
+        ranges,
+        q_ptrs,
+        sign_slots,
+    })
 }
 
 #[cfg(test)]
@@ -875,9 +955,9 @@ mod tests {
         let budget = 64 << 20;
         let n = gap_jobs_within(budget, 4, 128);
         // The production budget's cut at the geometries the fleet runs.
-        assert_eq!(n, 3866);
-        assert_eq!(gap_jobs_within(budget, 2, 256), 4761);
-        assert_eq!(gap_jobs_within(budget, 8, 128), 1933);
+        assert_eq!(n, 3838);
+        assert_eq!(gap_jobs_within(budget, 2, 256), 4739);
+        assert_eq!(gap_jobs_within(budget, 8, 128), 1919);
         assert!(GapScratch::for_jobs(n, 4, 128).total() <= budget);
         assert!(GapScratch::for_jobs(n + 1, 4, 128).total() > budget);
         // Wider heads take more a job, so fewer fit.

@@ -37,6 +37,8 @@ mod lease_alloc;
 mod lease_alloc_tests;
 #[cfg(test)]
 mod ownership_tests;
+#[cfg(all(test, feature = "cuda"))]
+mod sign_tests;
 #[cfg(any(feature = "cuda", test))]
 mod summary;
 mod table;

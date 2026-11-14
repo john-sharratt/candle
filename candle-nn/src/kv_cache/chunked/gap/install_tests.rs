@@ -77,7 +77,7 @@ pub(super) fn live(policy: &CompressionPolicy) -> Option<Live> {
 }
 
 /// The gap's jobs for `slot`: what `gap_take` hands over, layer-major.
-fn take_jobs(layers: &[ChunkedKvBacking], slot: usize) -> Vec<GapJob> {
+pub(super) fn take_jobs(layers: &[ChunkedKvBacking], slot: usize) -> Vec<GapJob> {
     let range = gap_take(layers, slot, usize::MAX);
     assert!(!range.is_empty(), "complete blocks to take");
     let mut jobs = Vec::new();

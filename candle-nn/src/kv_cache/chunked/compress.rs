@@ -1282,6 +1282,8 @@ fn quantize_sealed_in_place_impl(
                 v_fmt,
                 byte_size,
                 meta: None,
+                // The source's capture, if it had one: this convert reads no Q.
+                q_sign: src.q_sign.clone(),
             },
         );
         quant_keys.push((seq_idx, chunk_idx));
@@ -1713,6 +1715,8 @@ pub fn dequantize_sealed_in_place(
                 v_fmt: f16_fmt.clone(),
                 byte_size,
                 meta: None,
+                // F16 bands hold no Q either: the source's capture stands.
+                q_sign: src.q_sign.clone(),
             },
         );
         float_keys.push((seq_idx, chunk_idx));
