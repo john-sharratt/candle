@@ -10,6 +10,10 @@
 /// distributions against the float cache's, teacher-forced, 4K to 128K.
 #[cfg(test)]
 pub mod fidelity;
+/// The gap quantize, run by the gate after every forward as the scheduler runs
+/// it, and the config's line of what it did.
+#[cfg(feature = "cuda")]
+pub mod gap_tally;
 /// The gate's summary of what the wave chains did across a decode.
 #[cfg(feature = "cuda")]
 pub(crate) mod graph_report;

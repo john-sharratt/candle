@@ -21,6 +21,8 @@ use std::time::Duration;
 use tokenizers::Tokenizer;
 
 #[cfg(feature = "cuda")]
+use crate::models::batch_test::gap_tally::GapTally;
+#[cfg(feature = "cuda")]
 use crate::models::batch_test::graph_report::print_graph_line;
 use crate::models::batch_test::greedy::{aside_bytes, greedy_token, live_vocab, token_ids};
 use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
@@ -41,6 +43,8 @@ use crate::models::profile::{
 };
 use crate::models::speculative_choice::GreedyChooser;
 use candle::vram::process_ram::ProcessRam;
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::GapKind;
 use std::cmp::Reverse;
 use story_rewrite::fixtures;
 use story_rewrite::normalize::normalize_story;
@@ -1768,6 +1772,11 @@ impl TestParams {
         // still queued here, and would otherwise finish inside the prompt
         // timer and be reported as the prompt's prefill.
         self.device.synchronize()?;
+        // The gap quantize, run as the scheduler runs it: after the prefill
+        // here, and around the settle after every decode step. Its work lands
+        // inside the clocks, which is where a daemon pays it.
+        #[cfg(feature = "cuda")]
+        let mut gaps = GapTally::default();
         let prompt_start = std::time::Instant::now();
         let t_prompt_total = profile_now();
         let mut repeat_base_logits: Option<Vec<Tensor>> = None;
@@ -2016,6 +2025,11 @@ impl TestParams {
                 );
             }
         }
+        // The gap after the prefill: its complete blocks quantized on the
+        // device before the clock stops, put in place by the first decode
+        // step's gap — as the scheduler's next wave would.
+        #[cfg(feature = "cuda")]
+        gaps.quantize(&mut session, GapKind::Prefill)?;
         self.device.synchronize()?;
         pipeline_record("bench:bulk_total", t_prompt_total);
         let prompt_duration = prompt_start.elapsed();
@@ -2037,8 +2051,8 @@ impl TestParams {
         // the MoE / mHC spans (which run in both phases) are un-attributable.
         // Harvest the GPU spans before snapshotting: their elapsed times are read
         // from CUDA events, so an unharvested pair contributes nothing and the
-        // phase silently under-reports. This boundary already synchronises
-        // (quantize + seal follows), so the blocking drain costs nothing extra.
+        // phase silently under-reports. The prompt clock synchronised just
+        // above, so the blocking drain costs nothing extra.
         gpu_drain_blocking();
         let pipeline_bulk_profile = pipeline_snapshot_and_reset();
         // The expert counters split at the same boundary, for the same reason:
@@ -2046,24 +2060,6 @@ impl TestParams {
         // layer is counted here and none in the decode figures that follow.
         let prefill_expert_stats = expert_stats_with_ceiling(model);
         model.reset_expert_stats();
-
-        // Quantize + seal the prefilled history, mirroring the substrate
-        // scheduler's priming-projection boundary. `start_new_chunk = true` so
-        // decode writes land in a fresh chunk rather than appending to the now
-        // immutable quantized tail. Deliberately outside the timing windows.
-        #[cfg(feature = "cuda")]
-        {
-            let seal = session.quantize_and_seal_sequences(&sequence_indices, true)?;
-            self.device.synchronize()?;
-            eprintln!(
-                "{}",
-                seal.line(
-                    &format!("{:?} x{}", config.mode, sequence_indices.len()),
-                    "prefill",
-                    None,
-                )
-            );
-        }
 
         // Generate phase. Budget and early-stop live inside the driver's per
         // sequence emit sinks now, so there is nothing to track out here.
@@ -2107,6 +2103,8 @@ impl TestParams {
             self.speculative_max_draft
                 .resolve(model, sequence_indices.len()),
             self.tokens_for(config.mode),
+            #[cfg(feature = "cuda")]
+            &mut gaps,
         )?;
         self.device.synchronize()?;
         drop(detector);
@@ -2194,24 +2192,16 @@ impl TestParams {
             (generate_tokens as f64) / generate_duration.as_secs_f64()
         };
 
-        // Quantize + seal the decode tail before measuring so %Quantized and the
-        // compression ratio reflect the full sequence (the substrate quantizes
-        // at every turn boundary). Already-quantized prefill chunks pass through
-        // the quantizer's preserve bucket unchanged.
+        // Gaps until the cycle is quiet, before measuring, so %Quantized and the
+        // compression ratio cover every complete block the decode wrote; the
+        // writer chunk each sequence still appends to stays native, as it does
+        // between a daemon's waves. Outside the clocks.
         #[cfg(feature = "cuda")]
         {
-            let seal = session.quantize_and_seal_sequences(&sequence_indices, false)?;
-            self.device.synchronize()?;
-            // Everything this seal converted is what the decode wrote: the
-            // prefill's blocks were sealed at the boundary above.
-            let decode_mib_per_s = seal.native_mib() / generate_duration.as_secs_f64();
+            gaps.settle(&mut session, &self.device)?;
             eprintln!(
                 "{}",
-                seal.line(
-                    &format!("{:?} x{}", config.mode, sequence_indices.len()),
-                    "decode",
-                    Some(decode_mib_per_s),
-                )
+                gaps.line(&format!("{:?} x{}", config.mode, sequence_indices.len()))
             );
         }
 
@@ -2430,6 +2420,7 @@ impl TestParams {
     /// identical to the batched loop — a model with no drafter degrades to plain decode. Sessions
     /// drop out of the cohort as they hit EOS/budget. Returns a nominal step count for the perf
     /// table.
+    #[allow(clippy::too_many_arguments)]
     fn speculative_decode_phase<M>(
         &self,
         session: &mut BatchedInferenceSession,
@@ -2438,6 +2429,7 @@ impl TestParams {
         model: &M,
         max_draft: usize,
         max_tokens: usize,
+        #[cfg(feature = "cuda")] gaps: &mut GapTally,
     ) -> Result<usize>
     where
         M: ManagedBatchedModel + ?Sized,
@@ -2580,17 +2572,23 @@ impl TestParams {
                 }
             }
             emitted += idxs.iter().map(|&i| runs[i].output.len()).sum::<usize>() - before;
-            // Between forwards, as a scheduler does on every wave: pack what the
-            // last forward left and let the weight side take it. The first decode
-            // step is the one that hands the prefill scratch back, so its holes
-            // appear here. Inside the step's clock, which is where a daemon pays.
+            // Between forwards, as a scheduler does on every wave: the gap's
+            // catch-up, then pack what the last forward left and let the weight
+            // side take it, then the gap's quantize over what it completed —
+            // the scheduler's order. The first decode step is the one that hands
+            // the prefill scratch back, so its holes appear here. Inside the
+            // step's clock, which is where a daemon pays.
             #[cfg(feature = "cuda")]
-            if let Some(settled) = settler.settle(session, model)? {
-                if settled.frontier_after < settled.frontier_before
-                    || settled.weight_bytes_after > settled.weight_bytes_before
-                {
-                    println!("{}", settled.line());
+            {
+                gaps.catch_up(session)?;
+                if let Some(settled) = settler.settle(session, model)? {
+                    if settled.frontier_after < settled.frontier_before
+                        || settled.weight_bytes_after > settled.weight_bytes_before
+                    {
+                        println!("{}", settled.line());
+                    }
                 }
+                gaps.quantize(session, GapKind::Decode)?;
             }
             step_ms.push(t_step.elapsed().as_secs_f64() * 1e3);
         }
