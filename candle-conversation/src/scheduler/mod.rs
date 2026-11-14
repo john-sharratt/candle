@@ -33,6 +33,7 @@ mod answered;
 mod band;
 mod block_guard;
 mod census_stage;
+mod compaction_split;
 mod compaction_stall;
 mod creep_slice;
 mod decode;
@@ -2571,6 +2572,8 @@ struct WaveStats {
     /// Compaction phase this window: KV pool compaction between forwards,
     /// drawn apart from the rest of the housekeeping. Microseconds.
     compaction_us: u64,
+    /// What the compaction band was spent on, logged at the window's close.
+    compaction_split: compaction_split::CompactionSplit,
     /// Telemetry phase this window: the previous window's flush, which runs
     /// after that window closed and so lands in this one. Microseconds.
     telemetry_us: u64,
@@ -2639,6 +2642,7 @@ impl WaveStats {
             housekeeping_us: 0,
             quantize_us: 0,
             compaction_us: 0,
+            compaction_split: compaction_split::CompactionSplit::default(),
             telemetry_us: 0,
             wait_ms: 0,
             maint_ms: 0,
@@ -3137,6 +3141,7 @@ impl WaveStats {
         self.housekeeping_us = 0;
         self.quantize_us = 0;
         self.compaction_us = 0;
+        self.compaction_split = compaction_split::CompactionSplit::default();
         self.telemetry_us = 0;
         self.wait_ms = 0;
         self.maint_ms = 0;
@@ -3349,6 +3354,19 @@ impl WaveStats {
         }
         if compaction_dur > 0 {
             push(&mut phases, PhaseKind::Compaction, compaction_dur, 0, 0);
+            // Which pass the band went to: the chart draws one segment, and
+            // making it faster needs the part.
+            let s = &self.compaction_split;
+            tracing::info!(
+                target: "candle_conversation::scheduler::compaction",
+                total_ms = compaction_dur,
+                gate_ms = s.gate_us / 1000,
+                kv_ms = s.kv_us / 1000,
+                kv_passes = s.kv_passes,
+                tenants_ms = s.tenants_us / 1000,
+                tenant_passes = s.tenant_passes,
+                "compaction split"
+            );
         }
         if telemetry_dur > 0 {
             push(&mut phases, PhaseKind::Telemetry, telemetry_dur, 0, 0);

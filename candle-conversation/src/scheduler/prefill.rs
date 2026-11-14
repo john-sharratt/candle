@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use super::admission::{
     admit_quantum, budget_notches, evidence_admit_grow, evidence_ticks_for, per_block_kv_bytes,
     ThrottleReason,
@@ -1270,13 +1272,25 @@ impl Scheduler {
         {
             return 0;
         }
-        match self.frontier_pass() {
+        // Each part is charged to the window's compaction split, so the band
+        // says which pass it went to.
+        let t_gate = Instant::now();
+        let pass = self.frontier_pass();
+        self.wave_stats.compaction_split.gate(t_gate.elapsed());
+        match pass {
             None => 0,
             Some((shape, FrontierPass::SpanTenants)) => {
+                let t = Instant::now();
                 self.pack_span_tenants_judged(shape);
+                self.wave_stats.compaction_split.tenants(t.elapsed());
                 0
             }
-            Some((_, FrontierPass::Kv)) => self.pack_until_settled(PackGoal::Frontier),
+            Some((_, FrontierPass::Kv)) => {
+                let t = Instant::now();
+                let packed = self.pack_until_settled(PackGoal::Frontier);
+                self.wave_stats.compaction_split.kv(t.elapsed());
+                packed
+            }
         }
     }
 
