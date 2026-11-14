@@ -171,7 +171,8 @@ pub use chunked::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    gap_jobs_within, GapCatchUp, GapCycle, GapKind, GapQuantize, LeaseRefusal, QuantizeHost,
+    gap_jobs_within, CatchUpHost, GapCatchUp, GapCycle, GapKind, GapQuantize, LeaseRefusal,
+    QuantizeHost,
 };
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{

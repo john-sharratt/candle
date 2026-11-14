@@ -66,6 +66,19 @@ pub struct GapCatchUp {
     /// The caught-up gap's time on the stream, from its first upload to its
     /// completion word.
     pub device_ms: f64,
+    /// Where the call's host time went.
+    pub host: CatchUpHost,
+}
+
+/// The host time of one catch-up, by phase.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct CatchUpHost {
+    /// The summary's rows read, each job's chunk found, its slots taken.
+    pub read: Duration,
+    /// The installed blocks' records built and their arenas resolved.
+    pub records: Duration,
+    /// The block tables written and their headers uploaded.
+    pub install: Duration,
 }
 
 /// What one quantize did.
@@ -194,6 +207,7 @@ impl GapCycle {
             deferred: self.retry.len(),
             errored: done.errored,
             device_ms,
+            host: done.host,
         })
     }
 

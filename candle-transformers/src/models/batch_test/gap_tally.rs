@@ -18,7 +18,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use candle::{Device, Result};
-use candle_nn::kv_cache::{GapCatchUp, GapKind, GapQuantize, QuantizeHost};
+use candle_nn::kv_cache::{CatchUpHost, GapCatchUp, GapKind, GapQuantize, QuantizeHost};
 
 use crate::models::batched_inference::BatchedInferenceSession;
 
@@ -39,6 +39,8 @@ pub enum Window {
 pub struct WindowCost {
     /// Host time in catch-ups.
     pub catch_up: Duration,
+    /// The catch-ups' host time by phase.
+    pub caught: CatchUpHost,
     /// Host time in quantizes.
     pub quantize: Duration,
     /// The quantizes' host time by phase.
@@ -128,6 +130,9 @@ impl GapTally {
         let host = t.elapsed();
         if let Some(cost) = self.cost(self.window) {
             cost.catch_up += host;
+            cost.caught.read += c.host.read;
+            cost.caught.records += c.host.records;
+            cost.caught.install += c.host.install;
         }
         if c.caught_up {
             self.installed += c.installed;
@@ -215,10 +220,14 @@ impl GapTally {
         for (name, c) in [("prefill", self.prefill), ("decode", self.decode)] {
             let _ = write!(
                 s,
-                " | {name} host {:.1} ms (catch-up {:.1}, quantize {:.1} [setup {:.1}, \
-                 table {:.1}, lease {:.1}, launch {:.1}]), device {:.1} ms beside it",
+                " | {name} host {:.1} ms (catch-up {:.1} [read {:.1}, records {:.1}, \
+                 install {:.1}], quantize {:.1} [setup {:.1}, table {:.1}, lease {:.1}, \
+                 launch {:.1}]), device {:.1} ms beside it",
                 ms(c.host()),
                 ms(c.catch_up),
+                ms(c.caught.read),
+                ms(c.caught.records),
+                ms(c.caught.install),
                 ms(c.quantize),
                 ms(c.phases.setup),
                 ms(c.phases.table),

@@ -190,7 +190,8 @@ pub use format_census::FormatCensus;
 pub use gap::gap_take;
 #[cfg(feature = "cuda")]
 pub use gap::{
-    gap_jobs_within, GapCatchUp, GapCycle, GapKind, GapQuantize, LeaseRefusal, QuantizeHost,
+    gap_jobs_within, CatchUpHost, GapCatchUp, GapCycle, GapKind, GapQuantize, LeaseRefusal,
+    QuantizeHost,
 };
 pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
 pub use gpu_chunks::ChunkPin;

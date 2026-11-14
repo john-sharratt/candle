@@ -110,6 +110,7 @@ impl KvGapLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_nn::kv_cache::CatchUpHost;
 
     fn quantize(jobs: usize, retried: usize) -> GapQuantize {
         GapQuantize {
@@ -144,6 +145,7 @@ mod tests {
             moved: 1,
             errored: false,
             device_ms: 2.5,
+            host: CatchUpHost::default(),
         });
         assert_eq!((l.gaps, l.jobs, l.retried, l.outstanding), (2, 12, 2, 1));
         assert_eq!((l.installed, l.deferred, l.stale, l.moved), (7, 2, 1, 1));

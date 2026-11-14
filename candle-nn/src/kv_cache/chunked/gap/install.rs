@@ -18,6 +18,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use candle::Result;
 
@@ -29,6 +30,7 @@ use super::super::size_class::SizeClass;
 use super::super::types::{ChunkWindow, CHUNK_SIZE};
 use super::assemble::{block_state, take_block, BlockState};
 use super::codes::CodeTables;
+use super::cycle::CatchUpHost;
 use super::demand::{count_bands, PerClass};
 use super::launch::{GapGroup, GapJob};
 use super::lease::Lease;
@@ -62,6 +64,8 @@ pub(crate) struct CatchUp {
     /// Whether the claim met a code its tables did not cover. The jobs it met
     /// it in are among the deferred.
     pub errored: bool,
+    /// Where the host time went.
+    pub host: CatchUpHost,
 }
 
 /// One converted block on its way in.
@@ -172,6 +176,7 @@ fn catch_up_inner(
         );
     }
     let class_of_fmt = |f: u8| codes.class_of_fmt(f);
+    let t_read = Instant::now();
     let mut out = CatchUp {
         installed: 0,
         stale: 0,
@@ -181,6 +186,7 @@ fn catch_up_inner(
         requeue: Vec::new(),
         claims: [0; SizeClass::COUNT],
         errored: finished.errored(),
+        host: CatchUpHost::default(),
     };
     let mut installs: Vec<Install> = Vec::new();
     // Deferred jobs whose native chunk still stands, and where it stands now.
@@ -235,8 +241,10 @@ fn catch_up_inner(
         });
     }
 
+    out.host.read = t_read.elapsed();
     // Every installed block's record, in one batch.
     if let Some(first) = installs.first() {
+        let t_records = Instant::now();
         let backing = backings[jobs[first.job].layer];
         let needed: HashSet<usize> = installs
             .iter()
@@ -262,6 +270,8 @@ fn catch_up_inner(
         let mut header_arenas = needed;
         header_arenas.extend(records.iter().flatten().map(|r| r.gid().arena_idx()));
         let header_info = backing.resolve_arena_info_for(&header_arenas)?;
+        out.host.records = t_records.elapsed();
+        let t_install = Instant::now();
 
         // Per layer, one write of its block table.
         let mut by_layer: Vec<Vec<(Install, Option<MetaGid>)>> =
@@ -332,6 +342,7 @@ fn catch_up_inner(
                 seq.seal_unwritable_writer_region();
             }
         }
+        out.host.install = t_install.elapsed();
     }
 
     // The deferred blocks still standing lead the next table, at the index
