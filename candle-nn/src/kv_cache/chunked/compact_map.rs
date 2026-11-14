@@ -187,6 +187,22 @@ impl CompactionMap {
         }
         self.moved.get(&raw)
     }
+
+    /// Whether any of `gids` moved — [`Self::get`] over the slice, asked once per
+    /// run of equal ids. A chunk's gids repeat one id across its palettes (`K`
+    /// for every palette of a head, then `V`), and a run asks the same question
+    /// its first id already answered.
+    pub fn names_moved(&self, gids: &[ChunkGid]) -> bool {
+        let mut last: Option<i64> = None;
+        gids.iter().any(|g| {
+            let raw = g.raw();
+            if last == Some(raw) {
+                return false;
+            }
+            last = Some(raw);
+            self.get(g).is_some()
+        })
+    }
 }
 
 impl Default for CompactionMap {
@@ -521,12 +537,17 @@ impl<'m> Sweep<'m> {
     /// `SealedSequence` — while still sharing one memo, which is what makes an
     /// allocation held by both come back as one replacement.
     pub(super) fn rewrite_gids(&mut self, gids: &HeadGids) -> candle::Result<Option<HeadGids>> {
+        // **The presence scan before the memo.** The memo holds only allocations
+        // that name a moved gid, and an allocation never changes, so one whose
+        // gids moved nowhere cannot be in it. The sweep visits every resident
+        // chunk and nearly all of them name no moved gid: scanned first, they
+        // are rejected on presence bytes alone, without a hash probe of the memo.
+        if !self.map.names_moved(gids.as_slice()) {
+            return Ok(None);
+        }
         let id = gids.alloc_id();
         if let Some(done) = self.memo.get(&id) {
             return Ok(Some(done.clone()));
-        }
-        if !gids.as_slice().iter().any(|g| self.map.get(g).is_some()) {
-            return Ok(None);
         }
         let map = self.map;
         let next = gids.map_unique(|g| Ok(map.get(g).cloned().unwrap_or_else(|| g.clone())))?;
@@ -721,6 +742,21 @@ mod tests {
             "same arena, different chunk"
         );
         assert!(map.get(&ChunkGid::detached(raw(9, 3))).is_some());
+    }
+
+    /// **A run of equal ids is asked once, and a moved id after a run is still
+    /// found.** The palettes' repeats of an unmoved K then a moved V say yes;
+    /// repeats of unmoved ids, in touched and untouched arenas alike, say no.
+    #[test]
+    fn names_moved_answers_once_per_run_and_finds_a_moved_id_after_one() {
+        let mut map = CompactionMap::new();
+        map.insert(raw(9, 3), ChunkGid::detached(raw(0, 0)), 0x1000);
+        let g = |arena, chunk| ChunkGid::detached(raw(arena, chunk));
+        let k = g(9, 7);
+        let v = g(9, 3);
+        assert!(map.names_moved(&[k.clone(), k.clone(), k.clone(), v.clone(), v]));
+        assert!(!map.names_moved(&[k.clone(), k.clone(), k, g(4, 3), g(4, 3)]));
+        assert!(!map.names_moved(&[]));
     }
 
     /// A sentinel never moves and never hashes.
