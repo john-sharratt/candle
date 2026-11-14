@@ -2953,6 +2953,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         true
     }
 
+    fn short_span_rows(&self) -> Option<usize> {
+        Some(TIMELINE_ROWS)
+    }
+
     fn has_recurrent_state(&self, seq: usize) -> bool {
         self.has_recurrent(seq).unwrap_or(false)
     }

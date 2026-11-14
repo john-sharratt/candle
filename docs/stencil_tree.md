@@ -208,17 +208,28 @@ Entering: in the `Free` state, `observe` checks the decoded token against the
 **trigger registry** (§9). A hit begins a session at the tree root; the trigger
 token has already been emitted, so walking starts after it.
 
-`Prefill` writes the node's whole buffer in one forward, not a decode per token —
-this is the §1 speedup. That forward is the decode step's own wave
-(`scheduler/stencil_wave.rs`): the buffer, behind the sequence's pending token,
+`Prefill` writes the node's buffer in the decode step's own wave, not a decode
+per token — this is the §1 speedup. The buffers up to the next choice, behind
+the sequence's pending token, make one row (`scheduler/stencil_wave.rs`) that
 rides the wave's prefill slot as a full-sweep member beside the decode rows and
-verify blocks, scored at its last row, and the token after it is sampled from
-that row. A run costs no forward of its own, which on a card that streams its
-experts is a second round of expert loads saved per stenciled step. The part of
-a buffer one wave cannot carry — pieces before its last page break, or more than
-one forward's budget — is forwarded ahead of the wave. A wave refused for ground
-keeps the run for the next step; the run's tokens are already recorded, so it is
-written by the retry rather than failing the turn.
+verify blocks. A run costs no forward of its own, which on a card that streams
+its experts is a second round of expert loads saved per stenciled step. A wave
+refused for ground keeps the row for the next step; the run's tokens are already
+recorded, so it is written by the retry rather than failing the turn.
+
+**A wave writes a row a piece at a time.** A piece is at most the model's short
+span (`ManagedBatchedModel::short_span_rows`) and never runs past a page break
+with something after it; the break's page closes before the next piece. Only
+the piece that completes the row is scored, and the token after the run is
+sampled from it. The span is the recurrent stack's timeline (8 rows): a longer
+span writes a second copy of the sequence's whole recurrent state, its prefill
+scratch (144 MiB on Flash-Next), which a decode would take at any step with no
+admission of its own. Cut to the span, a stencil decode claims nothing a cohort
+or admission sets aside. Measured over a minimal call of every tool in the live
+catalog on the live tokenizer, 80% of rows are within it; the rest are the row
+after the tool's name, its last token and `", "arguments": {"`, at 9 or 10, and
+each costs one more step as two pieces (`zend/tests/stencil_tool_call.rs`,
+`the_rows_a_tool_call_plays_on_the_live_tokenizer`).
 
 ---
 

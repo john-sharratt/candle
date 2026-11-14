@@ -4898,6 +4898,19 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// The longest span this stack writes without claiming its sequence's
+    /// prefill scratch: the recurrent timeline's rows, on a stack that carries
+    /// recurrent state. A longer span writes a second copy of the whole state
+    /// ([`Self::prefill_scratch_bytes`]). `None` on a stack with none, where a
+    /// span of any length claims nothing beyond its K/V.
+    ///
+    /// What a stencil's static runs are cut to: a decode plays them as rows of
+    /// its step's wave, and a row within this claims nothing a cohort or
+    /// admission has to set aside (`docs/stencil_tree.md`).
+    fn short_span_rows(&self) -> Option<usize> {
+        None
+    }
+
     /// The selection index pages a prefill of `rows` rows from `offset` opens:
     /// zero for a model with no sparse selection. Its live tail grows a page at
     /// a time, so what a prefill claims is the pages past those its offset

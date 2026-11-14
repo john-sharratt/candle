@@ -1371,6 +1371,50 @@ fn cached_live_tokenizer() -> Option<std::path::PathBuf> {
         .find(|p| p.exists())
 }
 
+/// **How long the rows a tool call plays are, on the live tokenizer.** A row
+/// longer than the DeltaNet timeline (8 rows) is a long span and claims its
+/// sequence's prefill scratch; one within it writes the timeline instead.
+#[test]
+#[ignore = "requires the cached Qwen3.8 tokenizer.json; prints the row lengths"]
+fn the_rows_a_tool_call_plays_on_the_live_tokenizer() {
+    let path = cached_live_tokenizer().expect("Qwen3.8 tokenizer cached");
+    let tok = tokenizers::Tokenizer::from_file(&path).unwrap();
+    let im_end = tok.token_to_id(TURN_CLOSE).unwrap();
+    let vocab = HfVocab::new(tok.clone(), &[im_end], 0);
+    let tree = Arc::new(compile(&loop_spec(MAX_TOOL_CALLS_PER_TURN), &vocab).unwrap());
+    let mut all = Vec::new();
+    // A name the lenient walk's longest match cannot spell — an alias that is
+    // a prefix of a longer name's token — says nothing about row lengths.
+    let mut unwalked = Vec::new();
+    for spec in catalog() {
+        let mut rows = Vec::new();
+        match walk_natural_rows(
+            Arc::clone(&tree),
+            &tok,
+            &minimal_call(&spec),
+            false,
+            None,
+            &mut rows,
+        ) {
+            Ok(()) => {
+                println!("{:<28} rows {rows:?}", spec.name);
+                all.extend(rows);
+            }
+            Err(_) => unwalked.push(spec.name.clone()),
+        }
+    }
+    let mut hist = std::collections::BTreeMap::new();
+    for &r in &all {
+        *hist.entry(r).or_insert(0usize) += 1;
+    }
+    let long = all.iter().filter(|&&r| r > 8).count();
+    println!(
+        "row lengths {hist:?}; {long} of {} past the timeline",
+        all.len()
+    );
+    println!("not walked: {unwalked:?}");
+}
+
 /// What the constraints cost against the live vocabulary: each pattern's build
 /// time, its states, and the widest mask a step under it sends to the device.
 #[test]
@@ -1477,6 +1521,30 @@ fn walk_natural_held(
     strict: bool,
     held: Option<Arc<HeldValues>>,
 ) -> Result<(), String> {
+    walk_natural_rows(tree, tok, target, strict, held, &mut Vec::new())
+}
+
+/// [`walk_natural_held`], recording into `rows` each row the decode loop plays
+/// (`play_stencil_runs`): the pending token and every static run up to the next
+/// token the model chooses, a terminating EOS left out as the loop leaves it
+/// unforwarded.
+fn walk_natural_rows(
+    tree: Arc<StencilTree>,
+    tok: &tokenizers::Tokenizer,
+    target: &str,
+    strict: bool,
+    held: Option<Arc<HeldValues>>,
+    rows: &mut Vec<usize>,
+) -> Result<(), String> {
+    let eos = tok.token_to_id(TURN_CLOSE);
+    let mut run: Vec<u32> = Vec::new();
+    let close = |run: &mut Vec<u32>, rows: &mut Vec<usize>| {
+        if !run.is_empty() {
+            let forwarded = run.len() - usize::from(run.last().copied() == eos);
+            rows.push(1 + forwarded);
+            run.clear();
+        }
+    };
     // The first marker is the model's: decoding it is what fires the stencil,
     // so the walk starts after it and the natural encoding is of the rest.
     let body = target
@@ -1525,6 +1593,7 @@ fn walk_natural_held(
                     ));
                 }
                 b += text.len();
+                run.extend(toks);
             }
             // A masked decision fails only when the target's TEXT is unreachable:
             // no allowed token is a prefix of what comes next. Re-splitting the
@@ -1534,6 +1603,7 @@ fn walk_natural_held(
             // separator bug was different in kind: the allowed tokens spelled
             // other text, so the model had to choose something it did not mean.
             StencilAction::MaskedDecode(set) if strict && b >= arguments_at && b >= written_to => {
+                close(&mut run, rows);
                 let (id, p) = token_at(b).ok_or_else(|| {
                     format!(
                         "a masked decision starts INSIDE a natural token, after {:?} — the \
@@ -1555,6 +1625,7 @@ fn walk_natural_held(
                 b += committed(observed, p.len());
             }
             StencilAction::MaskedDecode(set) => {
+                close(&mut run, rows);
                 let (id, len) = set
                     .tokens()
                     .iter()
@@ -1578,6 +1649,7 @@ fn walk_natural_held(
                 b += committed(observed, len);
             }
             StencilAction::FreeDecode { .. } => {
+                close(&mut run, rows);
                 let (id, p) = token_at(b).ok_or_else(|| {
                     format!(
                         "a free decode starts INSIDE a natural token, after {:?} — \
@@ -1598,6 +1670,7 @@ fn walk_natural_held(
                 }
             }
             StencilAction::Exit => {
+                close(&mut run, rows);
                 return match b == bytes.len() {
                     true => Ok(()),
                     false => Err(format!(
