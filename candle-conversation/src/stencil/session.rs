@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use super::call_so_far::CallSoFar;
+use super::call_so_far::{CallSoFar, ValueText};
 use super::error::WalkError;
 use super::held_values::HeldValues;
 use super::mask::AllowedSet;
@@ -173,8 +173,21 @@ impl StencilSession {
             .held
             .as_ref()
             .zip(key)
-            .and_then(|(held, key)| held.rule_for(self.call.tool(), key, self.call.written()));
+            .and_then(|(held, key)| held.rule_for(self.call.tool(), key, self.call.written()))
+            .and_then(|rule| Self::held_form(rule, span));
         held.or_else(|| span.rule.clone())
+    }
+
+    /// The form of a held rule `span` walks: a quoted value's as it is, and a
+    /// raw value's — a function block's, closed by `</parameter>` and the tag
+    /// after it — closed the way the span's terminator closes
+    /// ([`ValueRule::closed_by`]). `None` when the set cannot be closed that
+    /// way, and the span keeps its own rule.
+    fn held_form(rule: Arc<ValueRule>, span: &FreeTextSpan) -> Option<Arc<ValueRule>> {
+        match span.term {
+            Terminator::Until { marker, tails } => rule.closed_by(marker, tails),
+            _ => Some(rule),
+        }
     }
 
     /// `offered`, the tokens branch `node` offers at `pos`, without a spill
@@ -218,7 +231,8 @@ impl StencilSession {
             .held
             .as_ref()
             .zip(self.tree.key_of(spill.next))
-            .and_then(|(held, key)| held.rule_for(tool, key, self.call.written()));
+            .and_then(|(held, key)| held.rule_for(tool, key, self.call.written()))
+            .and_then(|rule| Self::held_form(rule, span));
         let Some(rule) = held else {
             return true;
         };
@@ -231,7 +245,11 @@ impl StencilSession {
         self.active = self.rule_at(node, span);
         self.value = Self::value_start(span, self.active.as_ref());
         if let Some(key) = self.tree.key_of(node) {
-            self.call.open(Arc::clone(key));
+            let text = match span.term {
+                Terminator::Until { .. } => ValueText::Raw,
+                _ => ValueText::Json,
+            };
+            self.call.open(Arc::clone(key), text);
         }
     }
 
@@ -385,7 +403,8 @@ impl StencilSession {
     /// when the grammar wrote it.
     fn value_start(span: &FreeTextSpan, rule: Option<&Arc<ValueRule>>) -> Option<ValueState> {
         rule.map(|_| match span.term {
-            Terminator::JsonString => ValueState::Inside(0),
+            // Past the opening quote, or a raw value with none.
+            Terminator::JsonString | Terminator::Until { .. } => ValueState::Inside(0),
             _ => ValueState::Open,
         })
     }

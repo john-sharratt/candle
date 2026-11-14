@@ -65,9 +65,22 @@ impl ValueSet {
     /// The set of `values`, those a rule could never write left out; the
     /// order and repeats of `values` do not matter.
     pub fn of<S: AsRef<str>>(values: &[S]) -> ValueSet {
-        let kept = kept(values);
+        Self::built(&kept(values))
+    }
+
+    /// The set of exactly `values`, none left out: the strings that close a
+    /// raw value (`</parameter>` and the tags after it), which hold the
+    /// layout's own line breaks.
+    pub fn literal(values: &[&str]) -> ValueSet {
+        let mut kept = values.to_vec();
+        kept.sort_unstable();
+        kept.dedup();
+        Self::built(&kept)
+    }
+
+    fn built(kept: &[&str]) -> ValueSet {
         let mut nodes = vec![Node::default()];
-        for value in &kept {
+        for value in kept {
             let mut at = 0usize;
             for &byte in value.as_bytes() {
                 at = match nodes[at].children.binary_search_by_key(&byte, |c| c.0) {
@@ -131,6 +144,21 @@ impl ValueSet {
                     .children
                     .iter()
                     .any(|&(byte, child)| single[byte as usize] && done[child as usize]);
+        }
+        done
+    }
+
+    /// [`Self::finishable`] for a set whose every value ends the walk the
+    /// moment it is written, as the strings closing a raw value do: a node
+    /// finishes when a one-byte token leads on to a value's end, or to a node
+    /// that finishes.
+    pub fn finishable_on_arrival(&self, single: &[bool; 256]) -> Vec<bool> {
+        let mut done = vec![false; self.nodes.len()];
+        for at in (0..self.nodes.len()).rev() {
+            done[at] = self.nodes[at].children.iter().any(|&(byte, child)| {
+                single[byte as usize]
+                    && (self.nodes[child as usize].accepting || done[child as usize])
+            });
         }
         done
     }
@@ -208,5 +236,34 @@ mod tests {
             no_close.iter().all(|f| !*f),
             "nothing closes without a quote"
         );
+    }
+
+    /// **A literal set keeps every string**, line breaks included, which `of`
+    /// leaves out.
+    #[test]
+    fn a_literal_set_keeps_its_line_breaks() {
+        let closes = ValueSet::literal(&["</p>\n<p=", "</p>\r\n<p=", "</p>\n<p="]);
+        assert_eq!(closes.len(), 2);
+        assert!(closes.accepting(walk(&closes, "</p>\n<p=").unwrap()));
+        assert!(closes.accepting(walk(&closes, "</p>\r\n<p=").unwrap()));
+        assert_eq!(ValueSet::of(&["</p>\n<p="]).len(), 0);
+    }
+
+    /// **A string that ends the walk on arrival finishes its parent**, when a
+    /// one-byte token writes its last byte; an end only a missing byte reaches
+    /// finishes nothing before it.
+    #[test]
+    fn finishable_on_arrival_follows_the_single_byte_tokens() {
+        let closes = ValueSet::literal(&["ab", "c"]);
+        let mut single = [true; 256];
+        let all = closes.finishable_on_arrival(&single);
+        let a = walk(&closes, "a").unwrap() as usize;
+        assert!(all[0] && all[a]);
+        let ab = walk(&closes, "ab").unwrap() as usize;
+        assert!(!all[ab], "an end has nothing left to finish");
+        single[b'b' as usize] = false;
+        let no_b = closes.finishable_on_arrival(&single);
+        assert!(!no_b[a], "`a` can only end by `b`");
+        assert!(no_b[0], "`c` still ends from the root");
     }
 }

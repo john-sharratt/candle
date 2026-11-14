@@ -118,13 +118,21 @@ enum Machine {
     /// A held set's trie, each node's mask made the first time a walk stands
     /// on it.
     Set {
-        set: ValueSet,
-        /// Which nodes a walk can finish from ([`ValueSet::finishable`]).
+        set: Arc<ValueSet>,
+        /// What closes a value: its quote when `None`; else one of these
+        /// strings, written after a value of the set ([`ValueRule::closed_by`]).
+        /// Their trie's nodes follow the set's in the state numbering.
+        closes: Option<Arc<ValueSet>>,
+        /// Which states a walk can finish from: the set's nodes, then the
+        /// closing strings'.
         finishable: Vec<bool>,
         /// The vocabulary a mask is scanned over.
         tokens: Arc<Sorted>,
         /// The masks made so far, by node.
         masks: Mutex<HashMap<u32, AllowedSet>>,
+        /// This set's rule for each way a raw value is closed, made the first
+        /// time a span closed that way stands on it.
+        forms: Mutex<HashMap<Vec<String>, Arc<ValueRule>>>,
     },
 }
 
@@ -202,7 +210,7 @@ impl ValueRule {
             return Ok(rule);
         }
         let rule = Arc::new(ValueRule::over_set(
-            ValueSet::of(values),
+            Arc::new(ValueSet::of(values)),
             shared_sorted(vocab),
         )?);
         let mut held = rules.lock().unwrap_or_else(PoisonError::into_inner);
@@ -211,22 +219,40 @@ impl ValueRule {
         Ok(rule)
     }
 
-    fn over_set(set: ValueSet, tokens: Arc<Sorted>) -> Result<ValueRule, RuleError> {
+    fn over_set(set: Arc<ValueSet>, tokens: Arc<Sorted>) -> Result<ValueRule, RuleError> {
+        Self::over_closed(set, None, tokens)
+    }
+
+    /// A rule over `set`, its values closed by their quote when `closes` is
+    /// `None`, else by one of `closes` written after them.
+    fn over_closed(
+        set: Arc<ValueSet>,
+        closes: Option<Arc<ValueSet>>,
+        tokens: Arc<Sorted>,
+    ) -> Result<ValueRule, RuleError> {
         if set.is_empty() {
             return Err(RuleError::Empty);
         }
         let mut single = [false; 256];
-        let mut close = false;
         for (_, bytes) in tokens.iter() {
             if let [byte] = bytes.as_slice() {
                 single[*byte as usize] = true;
-                close |= *byte == b'"';
             }
         }
-        if !close {
-            return Err(RuleError::NoQuote);
-        }
-        let finishable = set.finishable(&single, close);
+        let finishable = match &closes {
+            None => {
+                if !single[b'"' as usize] {
+                    return Err(RuleError::NoQuote);
+                }
+                set.finishable(&single, true)
+            }
+            Some(closes) => {
+                let closing = closes.finishable_on_arrival(&single);
+                let mut finishable = set.finishable(&single, closing[0]);
+                finishable.extend(closing);
+                finishable
+            }
+        };
         if !finishable[0] {
             return Err(RuleError::Unfinishable);
         }
@@ -234,9 +260,11 @@ impl ValueRule {
             pattern: format!("one of {} values", set.len()),
             machine: Machine::Set {
                 set,
+                closes,
                 finishable: finishable.clone(),
                 tokens: Arc::clone(&tokens),
                 masks: Mutex::default(),
+                forms: Mutex::default(),
             },
             open_mask: AllowedSet::from_tokens(Vec::new()),
             spaced_mask: AllowedSet::from_tokens(Vec::new()),
@@ -340,6 +368,17 @@ impl ValueRule {
 
     /// Where one byte takes a walk from `state`.
     fn step(&self, state: ValueState, byte: u8) -> Step {
+        if let (
+            Machine::Set {
+                set,
+                closes: Some(closes),
+                ..
+            },
+            ValueState::Inside(s),
+        ) = (&self.machine, state)
+        {
+            return Self::raw_step(set, closes, s, byte);
+        }
         match state {
             ValueState::Open if byte == b' ' => Step::On(ValueState::Spaced),
             ValueState::Open | ValueState::Spaced => match byte {
@@ -355,6 +394,69 @@ impl ValueRule {
                 },
             },
         }
+    }
+
+    /// One byte of a raw value closed by one of `closes`: state `s` is a node
+    /// of `set` below its node count, and of `closes` past it. A value of the
+    /// set that has ended goes on into a closing string when the byte begins
+    /// one, so a value running on into a longer one through `<` is not
+    /// written: no path, anchor or range has one.
+    fn raw_step(set: &ValueSet, closes: &ValueSet, s: u32, byte: u8) -> Step {
+        let base = set.nodes() as u32;
+        let closing = |c: u32| match closes.step(c, byte) {
+            Some(next) if closes.accepting(next) => Step::Closes,
+            Some(next) => Step::On(ValueState::Inside(base + next)),
+            None => Step::Dead,
+        };
+        if s >= base {
+            return closing(s - base);
+        }
+        if set.accepting(s) {
+            let found = closing(0);
+            if found != Step::Dead {
+                return found;
+            }
+        }
+        match set.step(s, byte) {
+            Some(next) => Step::On(ValueState::Inside(next)),
+            None => Step::Dead,
+        }
+    }
+
+    /// This set's rule for a raw value, a function block's, which has no
+    /// quotes: closed by `marker` and then one of `tails`, or by `marker`
+    /// alone when there are none (`Terminator::Until`). Each value of the set
+    /// can be written, and after it only what closes it, so the span's
+    /// terminator fires on the byte the rule closes on. Made once per way of
+    /// closing and kept. `None` for a pattern's rule, which holds a quoted
+    /// value only, and when no value can be closed in this vocabulary.
+    pub fn closed_by(&self, marker: &str, tails: &[&str]) -> Option<Arc<ValueRule>> {
+        let Machine::Set {
+            set,
+            closes: None,
+            tokens,
+            forms,
+            ..
+        } = &self.machine
+        else {
+            return None;
+        };
+        let strings: Vec<String> = match tails {
+            [] => vec![marker.to_string()],
+            tails => tails.iter().map(|tail| format!("{marker}{tail}")).collect(),
+        };
+        let mut forms = forms.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(form) = forms.get(&strings) {
+            return Some(Arc::clone(form));
+        }
+        let literal: Vec<&str> = strings.iter().map(String::as_str).collect();
+        let closes = Arc::new(ValueSet::literal(&literal));
+        let form = Self::over_closed(Arc::clone(set), Some(closes), Arc::clone(tokens))
+            .map_err(|e| tracing::debug!("a held set has no raw form closed by {marker:?}: {e}"))
+            .ok()?;
+        let form = Arc::new(form);
+        forms.insert(strings, Arc::clone(&form));
+        Some(form)
     }
 
     /// Whether a value may end at automaton state `s`.
@@ -421,7 +523,9 @@ impl ValueRule {
     pub fn states(&self) -> usize {
         match &self.machine {
             Machine::Pattern { next, .. } => next.len(),
-            Machine::Set { set, .. } => set.nodes(),
+            Machine::Set { set, closes, .. } => {
+                set.nodes() + closes.as_ref().map_or(0, |c| c.nodes())
+            }
         }
     }
 
@@ -908,7 +1012,8 @@ mod tests {
             vec!["a/b", "ab", "c"],
             vec!["", "b"],
         ] {
-            let rule = ValueRule::over_set(ValueSet::of(&values), Arc::clone(&sorted)).unwrap();
+            let rule =
+                ValueRule::over_set(Arc::new(ValueSet::of(&values)), Arc::clone(&sorted)).unwrap();
             let mut starts = vec![ValueState::Open, ValueState::Spaced];
             starts.extend((0..rule.states() as u32).map(ValueState::Inside));
             for start in starts {
@@ -933,5 +1038,55 @@ mod tests {
         let start = rule.advance(ValueState::Open, b"\"").unwrap();
         assert!(rule.walk(start, b"ab").is_some());
         assert_eq!(rule.walk(start, b"abc"), None);
+    }
+
+    /// **A raw value is held to the set and then to what closes it**: a
+    /// function block's value has no quotes, so its held rule takes the
+    /// element's close — `</parameter>` and the tag after it — in the quote's
+    /// place, and closes on that tag's last byte, where the span's terminator
+    /// fires. `src/cancel.rs` is no value, even where `src` is one.
+    #[test]
+    fn a_raw_value_is_held_to_its_set_and_its_close() {
+        let vocab = TestVocab::new();
+        let quoted =
+            ValueRule::of_set(&["candle-conversation/src/cancel.rs", "src"], &vocab).unwrap();
+        let tails = ["\n<parameter=", "\n</function>"];
+        let rule = quoted.closed_by("</parameter>", &tails).unwrap();
+        assert!(
+            Arc::ptr_eq(&rule, &quoted.closed_by("</parameter>", &tails).unwrap()),
+            "one form per way of closing"
+        );
+        let start = ValueState::Inside(0);
+        assert_eq!(
+            rule.walk(
+                start,
+                b"candle-conversation/src/cancel.rs</parameter>\n<parameter="
+            ),
+            Some(None),
+            "the value, then its close"
+        );
+        assert_eq!(
+            rule.walk(start, b"src</parameter>\n</function>"),
+            Some(None)
+        );
+        assert_eq!(rule.walk(start, b"src/cancel.rs"), None);
+        assert_eq!(rule.walk(start, b"src</parameter>x"), None);
+        assert_eq!(rule.walk(start, b"src\""), None, "no quote closes it");
+        let src = rule.advance(start, b"src").unwrap();
+        let at_end = rule.mask(src);
+        assert!(at_end.contains(id(&vocab, "<")));
+        assert!(!at_end.contains(id(&vocab, "\"")) && !at_end.contains(id(&vocab, "/")));
+        let open = rule.advance(start, b"src</parameter>\n").unwrap();
+        let tag = rule.mask(open);
+        assert!(tag.contains(id(&vocab, "<")) && !tag.contains(id(&vocab, "\n")));
+        let alone = quoted.closed_by("</parameter>", &[]).unwrap();
+        assert_eq!(alone.walk(start, b"src</parameter>"), Some(None));
+        let (_, pattern) = rule_arc("[a-z]+");
+        assert!(pattern.closed_by("</parameter>", &tails).is_none());
+    }
+
+    fn rule_arc(pattern: &str) -> (TestVocab, Arc<ValueRule>) {
+        let (vocab, rule) = rule(pattern);
+        (vocab, Arc::new(rule))
     }
 }

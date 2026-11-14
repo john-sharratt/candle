@@ -2007,7 +2007,7 @@ impl<'a> ToolTreeBuilder<'a> {
         let limits = self.env.string_limits(p);
         let Some(follows) = follows.filter(|_| marker == PARAM_CLOSE) else {
             // A layout with no tag this rule knows: the marker alone ends it.
-            return self.spec.push(NodeSpec::FreeText {
+            let span = self.spec.push(NodeSpec::FreeText {
                 term: Terminator::Until { marker, tails: &[] },
                 eos_ends: false,
                 limits,
@@ -2015,6 +2015,7 @@ impl<'a> ToolTreeBuilder<'a> {
                 suppress_close: false,
                 next,
             });
+            return self.keyed(span, p);
         };
         let forks = (0..follows.tails().len())
             .map(|k| match follows.tag(k) {
@@ -2023,13 +2024,14 @@ impl<'a> ToolTreeBuilder<'a> {
             })
             .map(|fork| fork.expect("a tail is offered only for a tag `next` opens with"))
             .collect();
-        self.spec.push(NodeSpec::Element {
+        let span = self.spec.push(NodeSpec::Element {
             marker,
             tails: follows.tails(),
             limits,
             forks,
             next,
-        })
+        });
+        self.keyed(span, p)
     }
 
     /// What follows `node` once `written` — the start of its text — has been

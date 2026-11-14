@@ -776,6 +776,21 @@ call that was just refused for one.
   file the conversation never read), keeps the span's own rule. Each keyed
   span's value is recorded as the call writes it, so a later field can depend on
   it.
+- **A function block's raw value is held as a quoted one is.** Qwen3.5/3.8
+  write a call as elements (the edge-case table's raw-value row), each
+  value an `Element` span closed by `</parameter>` and the tag after it, with
+  no quotes. The front-end keys that span like any other
+  (`ToolTreeBuilder::element_value`), and the session walks the held set's
+  *raw form* there (`ValueRule::closed_by`): the set's trie, then — from a
+  node where a value ends — only the strings that close the span, the marker
+  followed by each tail its terminator closes on, so the rule closes on the
+  same byte the terminator fires on. The call records the value up to its
+  `</parameter>`, one framing line break taken off (`ValueText::Raw`). Until
+  2026-11-14 these spans were not keyed, so on the live checkpoint every hold
+  in this section held nothing: a reading of
+  `candle-conversation/src/cancel.rs` wrote `src/cancel.rs` on every pass and
+  was read again on every restart (pinned by
+  `a_reading_writes_only_its_own_path_in_a_function_block`).
 - **A value chosen by a branch is recorded too.** An enum's value is a choice,
   not a span — and every file tool's `repo` is an enum, the workspace's
   repositories written into it at startup — so nothing a span records says

@@ -10,10 +10,10 @@
 use std::sync::{Arc, OnceLock};
 
 use candle_conversation::stencil::{
-    compile, compile_tool_call_loop, compile_tool_call_tree, AllowedSet, FreeTextLimits, HeldRules,
-    HeldValues, HfVocab, NodeSpec, Observe, Param, ParamType, Pick, StencilAction, StencilNode,
-    StencilSession, StencilTree, Terminator, TestVocab, ToolCallEnvelope, ToolSpec, TreeSpec,
-    ValueHolds, ValueRule, Vocab, WalkError, MAX_TOOL_CALLS_PER_TURN,
+    compile, compile_tool_call_loop, compile_tool_call_tree, AllowedSet, FieldHold, FreeTextLimits,
+    HeldRules, HeldValues, HfVocab, NodeSpec, Observe, Param, ParamType, Pick, StencilAction,
+    StencilNode, StencilSession, StencilTree, Terminator, TestVocab, ToolCallEnvelope, ToolSpec,
+    TreeSpec, ValueHolds, ValueRule, Vocab, WalkError, MAX_TOOL_CALLS_PER_TURN,
 };
 use zend_vfs::{RepoSpec, Workspace};
 
@@ -1979,4 +1979,122 @@ fn the_natural_drive_rejects_both_live_failures() {
         err.contains("INSIDE a natural token"),
         "wrong reason: {err}"
     );
+}
+
+/// The holds a file's reading puts on `file_read` (`zend::code_read`'s
+/// `reading_holds`): its repository, its path inside it, and its ranges.
+fn held_reading(vocab: &HfVocab, repo: &str, path: &str, lines: &[&str]) -> Arc<HeldValues> {
+    let one = |field: &str, values: Vec<String>| FieldHold {
+        tools: vec!["file_read".to_string()],
+        field: field.to_string(),
+        on: Vec::new(),
+        table: std::collections::HashMap::from([(Vec::new(), values)]),
+    };
+    let holds = ValueHolds {
+        fields: vec![
+            one("repo", vec![repo.to_string()]),
+            one("path", vec![path.to_string()]),
+            one("lines", lines.iter().map(|l| l.to_string()).collect()),
+        ],
+    };
+    Arc::new(HeldValues::build(&holds, vocab, &mut HeldRules::default()))
+}
+
+/// **A reading's call names its own file, however its first directory
+/// reads.** `candle-conversation/src/cancel.rs` in `candle` was read as
+/// `src/cancel.rs` on every pass, its first directory taken for the
+/// repository prefix every read fence shows. Held, only the file's own path
+/// can be written.
+#[test]
+#[ignore = "requires the cached Qwen3.8 tokenizer.json"]
+fn a_reading_writes_only_its_own_path() {
+    let path = cached_live_tokenizer().expect("Qwen3.8 tokenizer cached");
+    let tok = tokenizers::Tokenizer::from_file(&path).unwrap();
+    let im_end = tok.token_to_id(TURN_CLOSE).unwrap();
+    let vocab = HfVocab::new(tok.clone(), &[im_end], 0);
+    let spec = compile_tool_call_loop(
+        &catalog(),
+        &production_envelope(),
+        MAX_TOOL_CALLS_PER_TURN,
+        TURN_CLOSE,
+    )
+    .unwrap();
+    let tree = Arc::new(compile(&spec, &vocab).unwrap());
+    let held = held_reading(
+        &vocab,
+        "candle",
+        "candle-conversation/src/cancel.rs",
+        &["1-120"],
+    );
+    let call = |path: &str| {
+        format!(
+            "{MARKER}\n{{\"name\": \"file_read\", \"arguments\": {{\"repo\": \"candle\", \
+             \"path\": \"{path}\", \"lines\": \"1-120\"}}}}\n</tool_call>{TURN_CLOSE}"
+        )
+    };
+    walk_natural_held(
+        Arc::clone(&tree),
+        &tok,
+        &call("candle-conversation/src/cancel.rs"),
+        false,
+        Some(Arc::clone(&held)),
+    )
+    .expect("the reading's own path writes through");
+    let walked = walk_natural_held(
+        Arc::clone(&tree),
+        &tok,
+        &call("src/cancel.rs"),
+        false,
+        Some(Arc::clone(&held)),
+    );
+    assert!(walked.is_err(), "the reading wrote `src/cancel.rs`");
+}
+
+/// [`a_reading_writes_only_its_own_path`] in the live checkpoint's own call
+/// dialect: Qwen3.8 writes a function block, each value an element closed by
+/// `</parameter>`, and the reading's holds must reach those values too.
+#[test]
+#[ignore = "requires the cached Qwen3.8 tokenizer.json"]
+fn a_reading_writes_only_its_own_path_in_a_function_block() {
+    let path = cached_live_tokenizer().expect("Qwen3.8 tokenizer cached");
+    let tok = tokenizers::Tokenizer::from_file(&path).unwrap();
+    let im_end = tok.token_to_id(TURN_CLOSE).unwrap();
+    let vocab = HfVocab::new(tok.clone(), &[im_end], 0);
+    let block = ToolCallEnvelope::qwen35();
+    let calls = ToolCallEnvelope {
+        open: block.open.strip_prefix(&block.marker).unwrap().to_string(),
+        ..block.clone()
+    };
+    let spec =
+        compile_tool_call_loop(&catalog(), &calls, MAX_TOOL_CALLS_PER_TURN, TURN_CLOSE).unwrap();
+    let tree = Arc::new(compile(&spec, &vocab).unwrap());
+    let held = held_reading(
+        &vocab,
+        "candle",
+        "candle-conversation/src/cancel.rs",
+        &["1-120"],
+    );
+    let call = |path: &str| {
+        let one = block.render(
+            "file_read",
+            &[("repo", "candle"), ("path", path), ("lines", "1-120")],
+        );
+        format!("{one}{TURN_CLOSE}")
+    };
+    walk_natural_held(
+        Arc::clone(&tree),
+        &tok,
+        &call("candle-conversation/src/cancel.rs"),
+        false,
+        Some(Arc::clone(&held)),
+    )
+    .expect("the reading's own path writes through");
+    let walked = walk_natural_held(
+        Arc::clone(&tree),
+        &tok,
+        &call("src/cancel.rs"),
+        false,
+        Some(Arc::clone(&held)),
+    );
+    assert!(walked.is_err(), "the reading wrote `src/cancel.rs`");
 }
