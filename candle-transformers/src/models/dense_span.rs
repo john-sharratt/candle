@@ -36,8 +36,14 @@
 
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::LoadWindow;
-use candle::quantized::{gguf_file, QTensor};
+use candle::quantized::ggml_file::qtensor_from_ggml;
+use candle::quantized::gguf_file::TensorInfo;
+#[cfg(feature = "cuda")]
+use candle::quantized::ko_quant::ko_tileable;
+use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
 use candle::{Device, Result, Tensor};
+
+use crate::models::quantized_matmul::QMatMul;
 
 /// A model load in progress: open from [`open_for_load`] until the loader that
 /// holds it returns.
@@ -178,6 +184,124 @@ pub fn place_in_dense(device: &Device, weight: QTensor) -> Result<QTensor> {
     }
 }
 
+/// A weight used as stored, copied from its bytes on the host straight into the
+/// dense block — the [`place_in_dense`] of a tensor that was never on the card.
+///
+/// Read through the driver and then copied, a stored weight stands on the card
+/// twice for a moment, and the load headroom has to hold the transient copy: on
+/// Flash-Next the token embedding, 644 MiB, the largest tensor the load reads.
+/// The headroom stays outside the span for the life of the process
+/// (`docs/driver_model.md` §4), so that moment cost the expert zone 644 MiB for
+/// good. From the host the weight costs its dense claim and nothing beside it.
+///
+/// `bytes` is the tensor as GGUF lays it out — whole blocks, row-major — and
+/// `dims` its candle shape. When the block declines — no reservation, a second
+/// model in the process — the weight is built where any loaded tensor is.
+pub fn place_host_in_dense(
+    device: &Device,
+    bytes: &[u8],
+    dims: &[usize],
+    dtype: GgmlDType,
+) -> Result<QTensor> {
+    let elems: usize = dims.iter().product();
+    let payload = elems / dtype.block_size() * dtype.type_size();
+    if bytes.len() != payload {
+        candle::bail!(
+            "dense placement: {} bytes for a {dims:?} {dtype:?} tensor of {payload}",
+            bytes.len()
+        );
+    }
+    #[cfg(feature = "cuda")]
+    {
+        use candle::cuda_backend::cudarc::driver::result::memcpy_htod_async;
+        use candle::cuda_backend::WrapErr;
+        use candle::quantized::cuda::{padded_storage_bytes, view_repacked};
+
+        if let Device::Cuda(cuda) = device {
+            let extent = padded_storage_bytes(elems, dtype);
+            let stream = cuda.cuda_stream();
+            match candle_nn::kv_cache::claim_dense(&stream, extent) {
+                Ok(at) => {
+                    // SAFETY: `at` names `extent` ≥ `payload` bytes of the dense
+                    // block, claimed for this weight alone; `bytes` is borrowed
+                    // until the synchronise below has seen the copy finish.
+                    unsafe { memcpy_htod_async(at, bytes, stream.cu_stream()) }.w()?;
+                    stream.synchronize().w()?;
+                    // SAFETY: the dense block is never released, so the view's
+                    // memory outlives every user of it.
+                    let storage = unsafe { view_repacked(cuda, at, payload, extent, dtype)? };
+                    return QTensor::new(storage, dims);
+                }
+                Err(e) => tracing::debug!(
+                    target: "candle_transformers::dense_span",
+                    extent,
+                    "dense block declined a stored weight ({e}); it is built on the driver's ground"
+                ),
+            }
+        }
+    }
+    qtensor_from_ggml(dtype, bytes, dims.to_vec(), device)
+}
+
+/// Whether a load builds this tensor's KO twin from its bytes on the host, a
+/// band at a time, so the tensor never stands on the card whole.
+///
+/// The conditions the banded route itself needs, asked before a byte is read
+/// so the load headroom can leave the tensor out: an int8 mode (at `Off` there
+/// is no twin to build), a 2-D shape the KO matmul tiles, and a source the
+/// banded repack reads. Off CUDA nothing repacks, so nothing bands.
+pub fn bands_from_host(info: &TensorInfo, mode: Int8Mode) -> bool {
+    #[cfg(feature = "cuda")]
+    if let [nrows, ncols] = info.shape.dims() {
+        return mode.is_int8()
+            && ko_tileable(*nrows, *ncols)
+            && candle::quantized::cuda::repackable_to_ko(info.ggml_dtype);
+    }
+    let _ = (info, mode);
+    false
+}
+
+/// A projection's KO twin, repacked from its bytes on the host a band at a time
+/// into the dense block (`cuda::repack_ko_from_host`).
+///
+/// The device holds a staging band, the f32 band and the twin, never the source
+/// — the route the qwen35 loader takes for every mapped projection, here for a
+/// load that reads its file by offset. `Ok(None)` when [`bands_from_host`]
+/// refuses the tensor: the caller reads it the ordinary way, and the load
+/// headroom has counted it.
+pub fn twin_from_host(
+    device: &Device,
+    bytes: &[u8],
+    info: &TensorInfo,
+    mode: Int8Mode,
+) -> Result<Option<QMatMul>> {
+    if !bands_from_host(info, mode) {
+        return Ok(None);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        use candle::quantized::cuda::repack_ko_from_host;
+        use candle::quantized::QStorage;
+
+        use crate::models::quantized_matmul::dense_destination_for;
+
+        let Device::Cuda(cuda) = device else {
+            return Ok(None);
+        };
+        let shape = info.shape.clone();
+        let ko = info.ggml_dtype.to_ko(mode)?;
+        let dst = dense_destination_for(device, &shape, ko);
+        let twin = repack_ko_from_host(cuda, bytes, &shape, info.ggml_dtype, ko, dst)?;
+        let qt = QTensor::new(QStorage::Cuda(twin), shape)?;
+        Ok(Some(QMatMul::from_qtensor_view(qt, mode)?))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (device, bytes);
+        Ok(None)
+    }
+}
+
 /// Move a plain tensor a model keeps for its whole life — a norm's gain, a
 /// gate, a scale — into the dense block.
 ///
@@ -313,10 +437,14 @@ pub fn freeze(device: &Device) -> Result<usize> {
 ///
 /// Two-dimensional tensors only. Expert banks are 3-D and are repacked per-expert by the expert
 /// cache; norms are 1-D and are never repacked. The max over 2-D covers both the weights that
-/// repack and the embedding, which does not repack but is read to the device at the same size.
+/// repack and a stored weight read to the device whole, which does not repack but stands there
+/// at the same size.
 ///
 /// Takes the tensors rather than the header so a load that substitutes some of them from
-/// another file bounds what it will actually read.
+/// another file bounds what it will actually read — and so a load leaves out the tensors it
+/// reads on the host ([`bands_from_host`], [`place_host_in_dense`]), which never stand on the
+/// card whole. That matters for good: the span never grows, so whatever this bound names stays
+/// outside it for the life of the process (`docs/driver_model.md` §4).
 pub fn peak_load_pool_bytes<'a>(
     infos: impl IntoIterator<Item = &'a gguf_file::TensorInfo>,
 ) -> usize {
@@ -337,4 +465,74 @@ pub fn peak_load_pool_bytes<'a>(
     // two by construction (it is the quantized form of the same rows), so one band's worth of
     // allowance on top covers both.
     largest_source + 2 * candle::quantized::cuda::REPACK_BAND_BYTES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(dtype: GgmlDType, dims: &[usize]) -> TensorInfo {
+        TensorInfo {
+            ggml_dtype: dtype,
+            shape: dims.into(),
+            offset: 0,
+        }
+    }
+
+    /// Off the card a stored weight is built from its bytes as any loaded one
+    /// is, and reads back exactly.
+    #[test]
+    fn a_stored_weight_is_built_from_its_host_bytes() -> Result<()> {
+        let bytes: Vec<u8> = [1.0f32, -2.5, 0.25]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let t = place_host_in_dense(&Device::Cpu, &bytes, &[3], GgmlDType::F32)?;
+        assert_eq!(
+            t.dequantize(&Device::Cpu)?.to_vec1::<f32>()?,
+            vec![1.0, -2.5, 0.25]
+        );
+        Ok(())
+    }
+
+    /// Bytes that are not the tensor's whole payload are refused, never read
+    /// short or past.
+    #[test]
+    fn a_short_payload_is_refused() {
+        let err = place_host_in_dense(&Device::Cpu, &[0u8; 11], &[3], GgmlDType::F32)
+            .expect_err("11 bytes are not three f32s");
+        assert!(err.to_string().contains("11 bytes"), "{err}");
+    }
+
+    /// Nothing bands without an int8 twin to build, or a 2-D shape the KO
+    /// matmul tiles.
+    #[test]
+    fn nothing_bands_without_a_twin_or_a_tile() {
+        let tiled = info(GgmlDType::Q8_0, &[64, 256]);
+        assert!(!bands_from_host(&tiled, Int8Mode::Off));
+        assert!(!bands_from_host(
+            &info(GgmlDType::Q8_0, &[16, 256]),
+            Int8Mode::Performance
+        ));
+        assert!(!bands_from_host(
+            &info(GgmlDType::Q8_0, &[64, 64]),
+            Int8Mode::Performance
+        ));
+        assert!(!bands_from_host(
+            &info(GgmlDType::F32, &[2048]),
+            Int8Mode::Precision
+        ));
+    }
+
+    /// A tiled 2-D source the banded repack reads bands under either int8 mode,
+    /// a float one included.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_tiled_source_bands_under_an_int8_mode() {
+        for dtype in [GgmlDType::Q8_0, GgmlDType::Q6_K, GgmlDType::BF16] {
+            let tiled = info(dtype, &[64, 256]);
+            assert!(bands_from_host(&tiled, Int8Mode::Performance), "{dtype:?}");
+            assert!(bands_from_host(&tiled, Int8Mode::Precision), "{dtype:?}");
+        }
+    }
 }

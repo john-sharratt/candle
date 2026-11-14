@@ -950,7 +950,23 @@ impl<'a, R: Read + Seek> Loader<'a, R> {
 }
 
 impl<R: Read + Seek> Loader<'_, R> {
+    /// A tensor read to the load's device, counted toward the model's footprint.
     fn raw(&mut self, name: &str) -> Result<QTensor> {
+        let device = self.device.clone();
+        let t = self.read_to(name, &device)?;
+        self.device_bytes += t.storage_size_in_bytes();
+        Ok(t)
+    }
+
+    /// A tensor read to the host, never touching the card: for a weight the
+    /// model keeps on the host, which read to the device would stand there whole
+    /// for nothing — and the load headroom, which the span never takes back,
+    /// would have to hold it (`dense_span::peak_load_pool_bytes`).
+    fn host(&mut self, name: &str) -> Result<QTensor> {
+        self.read_to(name, &Device::Cpu)
+    }
+
+    fn read_to(&mut self, name: &str, device: &Device) -> Result<QTensor> {
         // **Which tensor, and how big, at the moment it is read.**
         //
         // A load that runs out of VRAM reports `CUDA_ERROR_OUT_OF_MEMORY` and nothing else —
@@ -974,12 +990,10 @@ impl<R: Read + Seek> Loader<'_, R> {
                 "reading"
             );
         }
-        let t = match source {
-            Some((c, bytes)) => c.tensor(&mut std::io::Cursor::new(bytes), name, &self.device)?,
-            None => self.content.tensor(self.reader, name, &self.device)?,
-        };
-        self.device_bytes += t.storage_size_in_bytes();
-        Ok(t)
+        match source {
+            Some((c, bytes)) => c.tensor(&mut std::io::Cursor::new(bytes), name, device),
+            None => self.content.tensor(self.reader, name, device),
+        }
     }
 
     /// The twin this tensor should take: the scoped override if one is set, else the streaming
@@ -1047,8 +1061,7 @@ impl<R: Read + Seek> Loader<'_, R> {
     /// one band either way.
     #[cfg(feature = "cuda")]
     fn host_banded(&mut self, name: &str, narrow: Option<GgmlDType>) -> Result<Option<QMatMul>> {
-        use candle::quantized::cuda::{repack_ko_from_host, repackable_to_ko};
-        use candle::quantized::ko_quant::ko_tileable;
+        use candle::quantized::cuda::repack_ko_from_host;
         use candle::quantized::{QStorage, QTensor};
 
         // An overridden tensor is banded out of its own file's mapping, under the same rules.
@@ -1059,19 +1072,21 @@ impl<R: Read + Seek> Loader<'_, R> {
         let (Some(map), Device::Cuda(cuda)) = (map, &self.device) else {
             return Ok(None);
         };
-        if !self.mode.is_int8() || self.residency != WeightResidency::Span {
+        if self.residency != WeightResidency::Span {
             return Ok(None);
         }
         let Some(info) = content.tensor_infos.get(name) else {
             return Ok(None);
         };
+        // The int8 mode, the tiling and the source: the rule the load headroom
+        // leaves a banded head out by (`head_bands_from_host`).
+        if !dense_span::bands_from_host(info, self.mode) {
+            return Ok(None);
+        }
         let [nrows, ncols] = info.shape.dims() else {
             return Ok(None);
         };
         let (nrows, ncols) = (*nrows, *ncols);
-        if !ko_tileable(nrows, ncols) || !repackable_to_ko(info.ggml_dtype) {
-            return Ok(None);
-        }
         // The twin this weight would get anyway: the narrowing target when one is set and it
         // can actually shrink this source, else whatever the mode picks. Same rule as `proj`'s
         // own — a wider request leaves the tensor alone.
@@ -1602,6 +1617,51 @@ pub(crate) fn donor_gates(
     Ok(out)
 }
 
+/// The driver's ground this load needs — [`dense_span::peak_load_pool_bytes`]
+/// over every tensor it reads to the device whole, each as the load will read it
+/// (an override's own entry where one replaces the checkpoint's).
+///
+/// The span never grows, so this figure stays outside it for the life of the
+/// process (`docs/driver_model.md` §4): on a routed model every MiB here is a MiB
+/// of expert slots. Two tensors therefore stay out of it, each because the card
+/// never holds it whole:
+///
+/// - the token embedding, which lives on the host (`EmbeddingTable`), host-mapped
+///   or read there ([`Loader::host`]) — 515 MiB on the 35B, its largest tensor;
+/// - the output head, when its twin is repacked from the mapping a band at a time
+///   (`banded`: a mapping and a CUDA device, and [`dense_span::bands_from_host`]
+///   for the tensor) — 398 MiB on the 35B. With tied embeddings the head is the
+///   embedding read a second time, through the projection route, so it is left
+///   out under the same rule and counted otherwise.
+///
+/// Bounded with them the 35B's headroom was 611 MiB; without them it is its
+/// widest `attn_qkv` (17 MiB) and the repack's two bands, 113 MiB.
+fn load_headroom_bytes(
+    content: &gguf_file::Content,
+    overrides: Option<&TensorOverrides<'_>>,
+    banded: bool,
+    mode: Int8Mode,
+) -> usize {
+    const EMBEDDING: &str = "token_embd.weight";
+    let head = if content.tensor_infos.contains_key("output.weight") {
+        "output.weight"
+    } else {
+        EMBEDDING
+    };
+    dense_span::peak_load_pool_bytes(content.tensor_infos.iter().filter_map(|(name, info)| {
+        let name = name.as_str();
+        let info = overrides
+            .and_then(|o| o.effective_info(content, name))
+            .unwrap_or(info);
+        let on_host = if name == head {
+            banded && dense_span::bands_from_host(info, mode)
+        } else {
+            name == EMBEDDING
+        };
+        (!on_host).then_some(info)
+    }))
+}
+
 pub fn load_quantized_model<R, F, L>(
     content: &gguf_file::Content,
     reader: &mut R,
@@ -1662,10 +1722,8 @@ where
     // weights had already been taken from the pool and could not contain them.
     // Sized from what this load will read: an override from another file can be a wider
     // tensor than the entry it replaces, and the pool has to hold the largest source.
-    let headroom = match overrides {
-        Some(o) => dense_span::peak_load_pool_bytes(o.effective_infos(content)),
-        None => dense_span::peak_load_pool_bytes(content.tensor_infos.values()),
-    };
+    let banded = map.is_some() && device.is_cuda();
+    let headroom = load_headroom_bytes(content, overrides, banded, mode);
     // A plain `[rows, hidden]` residual, which the pool cushion covers: no runtime reserve.
     let _load = dense_span::open_for_load_sized(device, headroom)?;
 
@@ -1689,15 +1747,9 @@ where
     let embed = match host_embed {
         Some(h) => EmbeddingTable::HostMapped(h),
         None => {
-            // The quantized tensor lands on the device to be read and the F32
-            // copy on the host, so the device bytes it touched are transient and
-            // must come back off the count — charging them would inflate the
-            // dense footprint by the largest single tensor in the model (594 MiB
-            // on the 35B).
-            let embed_q = g.raw("token_embd.weight")?;
-            let embed_transient = embed_q.storage_size_in_bytes();
-            let table = embed_q.dequantize(&Device::Cpu)?;
-            g.device_bytes -= embed_transient.min(g.device_bytes);
+            // Read and widened on the host: the table never touches the card,
+            // so the load headroom leaves it out (`load_headroom_bytes`).
+            let table = g.host("token_embd.weight")?.dequantize(&Device::Cpu)?;
             EmbeddingTable::Host(table)
         }
     };
@@ -2103,6 +2155,92 @@ mod recurrent_precision_tests {
         assert!(
             got.iter().any(|n| n.ends_with("ssm_out.weight")),
             "the output projection must be repaired alongside the gates, got {got:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod headroom_tests {
+    use super::load_headroom_bytes;
+    use candle::quantized::cuda::REPACK_BAND_BYTES;
+    use candle::quantized::gguf_file::{Content, TensorInfo, VersionedMagic};
+    use candle::quantized::{GgmlDType, Int8Mode};
+    use candle::Shape;
+    use std::collections::HashMap;
+
+    /// Q8_0 tensors: `[64, 256]` is 512 blocks of 34 bytes, `[32, 128]` 128.
+    fn header(names: &[(&str, (usize, usize))]) -> Content {
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata: HashMap::new(),
+            tensor_infos: names
+                .iter()
+                .map(|&(name, dims)| {
+                    let info = TensorInfo {
+                        ggml_dtype: GgmlDType::Q8_0,
+                        shape: Shape::from(dims),
+                        offset: 0,
+                    };
+                    (name.to_string(), info)
+                })
+                .collect(),
+            tensor_data_offset: 0,
+        }
+    }
+
+    const BANDS: usize = 2 * REPACK_BAND_BYTES;
+
+    /// The embedding lives on the host and is never counted; a head read whole —
+    /// no mapping to band it from, or no int8 twin — is.
+    #[test]
+    fn the_embedding_is_never_counted_and_a_head_read_whole_is() {
+        let untied = header(&[
+            ("token_embd.weight", (64, 256)),
+            ("output.weight", (64, 256)),
+            ("blk.0.attn_qkv.weight", (32, 128)),
+        ]);
+        for mode in [Int8Mode::Off, Int8Mode::Precision] {
+            assert_eq!(
+                load_headroom_bytes(&untied, None, false, mode),
+                512 * 34 + BANDS
+            );
+        }
+        assert_eq!(
+            load_headroom_bytes(&untied, None, true, Int8Mode::Off),
+            512 * 34 + BANDS
+        );
+        // Tied: the head is the embedding read again through the projection route.
+        let tied = header(&[
+            ("token_embd.weight", (64, 256)),
+            ("blk.0.attn_qkv.weight", (32, 128)),
+        ]);
+        assert_eq!(
+            load_headroom_bytes(&tied, None, false, Int8Mode::Precision),
+            512 * 34 + BANDS
+        );
+    }
+
+    /// A head repacked from the mapping a band at a time is left out, tied or
+    /// not: what remains is the widest projection read whole.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_banded_head_is_left_out() {
+        let untied = header(&[
+            ("token_embd.weight", (64, 256)),
+            ("output.weight", (64, 256)),
+            ("blk.0.attn_qkv.weight", (32, 128)),
+        ]);
+        assert_eq!(
+            load_headroom_bytes(&untied, None, true, Int8Mode::Precision),
+            128 * 34 + BANDS
+        );
+        let tied = header(&[
+            ("token_embd.weight", (64, 256)),
+            ("blk.0.attn_qkv.weight", (32, 128)),
+        ]);
+        assert_eq!(
+            load_headroom_bytes(&tied, None, true, Int8Mode::Performance),
+            128 * 34 + BANDS
         );
     }
 }

@@ -79,6 +79,15 @@ memory management, so the same code runs under WDDM, TCC and Linux.
   of the process. It is the driver's ground: the load's scratch, the layer
   pack's build after `close_load`, and every allocation not yet carried by an
   arena of the span land there.
+- **So the headroom counts only what stands on the card whole.** Every MiB of
+  it is a MiB the expert zone never gets, so a tensor the load reads on the
+  host is left out of the bound: the token embedding (on the host for qwen35,
+  copied from the host straight into the dense block for Flash-Next —
+  `dense_span::place_host_in_dense`) and an output head whose twin is repacked
+  from the file a band at a time (`dense_span::bands_from_host`). Those two are
+  a model's largest 2-D tensors. Counted, they held Flash-Next's headroom at
+  1,384 MiB and the 35B's at 611; left out, the bound is the widest projection
+  read whole plus the two bands, 128 and 113 MiB.
 - **Everything else cudarc allocates is the driver's**, as upstream: a
   stream-ordered pool allocation where the card has memory pools (WDDM, Linux),
   a synchronous `cuMemAlloc` — and a stream synchronise plus `cuMemFree` on its
