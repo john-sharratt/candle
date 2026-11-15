@@ -118,10 +118,10 @@ mod tests {
             "prompt 'uses': `prompt` is empty"
         );
         let mut bad = raw("uses", "x");
-        bad.questions.min = 0;
+        bad.questions.min = 33;
         assert_eq!(
             Ask::of(bad).unwrap_err(),
-            "prompt 'uses': `questions`: `min` must be 1..=`max` (32), not 0"
+            "prompt 'uses': `questions`: `min` must be 0..=`max` (32), not 33"
         );
     }
 

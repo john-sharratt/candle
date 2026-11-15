@@ -212,13 +212,32 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   tokens — one projection's worth: a turn's first reprojection fires by the
   64-token cadence, so the probe that decides what is pulled in has seen at
   most that much of the model's thinking.
-- **Several prompts, each for one kind of question.** A layer declares a
-  list of prompts (`calibrate/ask.rs`), asked together in one turn of the
-  draft, each a part under its own `## name` heading
-  (`calibrate/sections.rs`): `code_reading` asks for what the file
-  **defines** ("where's `tier_fits` defined?"), how that is **used** ("what
-  calls it, what breaks if it changes?" — the transitive questions) and its
-  **purpose** (the architectural ones). One prompt asking for every kind wrote
+- **Asked by what was read.** A layer declares a list of **profiles**
+  (`calibrate/profile.rs`), each a set of prompts and the regexes over the
+  unit's subject — its repository, then its path — it is for; the first
+  profile whose regex matches is the unit's, and the last carries none and
+  takes every other. `code_reading` declares a `manifest` profile
+  (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, … — what it
+  declares, what depends on it), `tests` (what is tested where, and which
+  code a test covers), `kernels` (`.cu`/`.cuh` — what a kernel computes, what
+  launches it), `code` (definitions, uses, the log lines and errors it writes,
+  purpose), `config` (each setting and what reads it), `docs` (the
+  document's own concepts, rules and decisions — never where a symbol it
+  mentions is defined) and `default`. One set of prompts for every file asked
+  `ARCHITECTURE.md` 32 questions about symbols other files define, each a vote
+  against the file that defines it, and a small self-contained module for
+  callers it does not have (BlackWorld, 2026-11-15). A profile's regexes are
+  not in the marker: narrowing which files a profile takes does not
+  recalibrate the files it still takes, while a file that moves to another
+  profile is asked that profile's prompts and calibrated again.
+- **Several prompts, each for one kind of question.** A profile's prompts
+  (`calibrate/ask.rs`) are asked together in one turn of the draft, each a
+  part under its own `## name` heading (`calibrate/sections.rs`): the `code`
+  profile asks for what the file **defines** ("where's `tier_fits`
+  defined?" — about a third of them asking where), how that is **used**
+  ("what calls it, what breaks if it changes?" — the transitive questions),
+  the **messages** it writes and its **purpose** (the architectural ones).
+  One prompt asking for every kind wrote
   nearly all "what does X do / why" questions and almost none of the others;
   the same prompts asked in turn lost sight of the reading after the first,
   and about half the drafts kept only that one's questions (BlackWorld,
@@ -229,17 +248,21 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   guide is asked its guidance prompt alone.
 - **As many questions as the unit has to be asked about.** Each prompt's
   count is a rule, not a number: one question per `per_tokens` of the unit's
-  own sealed tokens, held to `min..=max` (`calibrate/count.rs`) — definitions
-  one per 300 (4–32), uses one per 400 (3–24), purpose one per 3,000 (2–8),
-  their maxima together the 64 one calibration holds. A file defining forty
+  own sealed tokens, held to `min..=max` (`calibrate/count.rs`) — for `code`,
+  definitions one per 300 (4–28), uses one per 400 (2–20), messages one per
+  1,500 (0–8), purpose one per 3,000 (2–6); each profile's maxima together
+  within the 64 one calibration holds. A `min` of 0 makes a part optional: it
+  is told to write fewer, or none, rather than pad, and writing few is not
+  reported as a short part. A file defining forty
   things has forty names to be asked about, and a ten-line module a few. The
   sealed tokens are what the ingest actually read, and the same on every
   member, since a unit is calibrated only once it holds every turn. The
-  marker digests the prompts, their rules and order, not the counts, so a
-  unit's counts follow from the rules and the content its key names. Over
-  BlackWorld's 6,533 readings (median 2,815 tokens, p90 11,568) the prompts
-  ask 173k questions — median 10 + 8 + 2, p90 32 + 24 + 4 — against a flat
-  24's 157k. More exemplars give a unit more windows to win votes with in
+  marker digests the unit's profile — its name, its prompts, their rules and
+  order — not the counts, so a unit's counts follow from the rules and the
+  content its key names, and a change to one profile calibrates only the
+  units it asks. Over BlackWorld's 6,533 readings (median 2,815 tokens, p90
+  11,568) one set of prompts at 300/400/3,000 asked 173k questions against a
+  flat 24's 157k. More exemplars give a unit more windows to win votes with in
   its competition; the per-child background
   (`docs/provenance_score_normalization.md`) is what takes a case's base
   rate out of its vote.

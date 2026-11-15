@@ -24,7 +24,9 @@ use super::spec::MAX_QUESTIONS;
 pub struct QuestionCount {
     /// One question for each this many of the unit's tokens.
     pub per_tokens: usize,
-    /// The fewest any unit is asked for.
+    /// The fewest any unit is asked for. Zero makes the part optional: a unit
+    /// small enough is asked for none rather than made to invent one — a file
+    /// with no log line is asked about none.
     pub min: usize,
     /// The most any unit is asked for, at most [`MAX_QUESTIONS`].
     pub max: usize,
@@ -36,9 +38,12 @@ impl QuestionCount {
         if self.per_tokens == 0 {
             return Some("`per_tokens` must be at least 1".into());
         }
-        if self.min == 0 || self.min > self.max {
+        if self.max == 0 {
+            return Some("`max` must be at least 1".into());
+        }
+        if self.min > self.max {
             return Some(format!(
-                "`min` must be 1..=`max` ({}), not {}",
+                "`min` must be 0..=`max` ({}), not {}",
                 self.max, self.min
             ));
         }
@@ -91,8 +96,9 @@ mod tests {
         assert_eq!(RULE.for_tokens(303_030), 64);
     }
 
-    /// A rule that divides by zero, asks for none, inverts its bounds or
-    /// passes the hard cap is refused, and says which.
+    /// A rule that divides by zero, can never ask for one, inverts its bounds
+    /// or passes the hard cap is refused, and says which; a minimum of zero is
+    /// an optional part.
     #[test]
     fn a_rule_out_of_bounds_is_refused() {
         assert_eq!(RULE.invalid(), None);
@@ -105,13 +111,14 @@ mod tests {
             with(0, 8, 64).invalid().as_deref(),
             Some("`per_tokens` must be at least 1")
         );
+        assert_eq!(with(250, 0, 64).invalid(), None, "an optional part");
         assert_eq!(
-            with(250, 0, 64).invalid().as_deref(),
-            Some("`min` must be 1..=`max` (64), not 0")
+            with(250, 0, 0).invalid().as_deref(),
+            Some("`max` must be at least 1")
         );
         assert_eq!(
             with(250, 65, 64).invalid().as_deref(),
-            Some("`min` must be 1..=`max` (64), not 65")
+            Some("`min` must be 0..=`max` (64), not 65")
         );
         assert_eq!(
             with(250, 8, MAX_QUESTIONS + 1).invalid().as_deref(),

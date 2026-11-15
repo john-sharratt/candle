@@ -27,6 +27,7 @@ pub mod count;
 pub mod mark;
 pub mod permits;
 pub mod plan;
+pub mod profile;
 pub mod questions;
 pub mod retire_replies;
 pub mod run;

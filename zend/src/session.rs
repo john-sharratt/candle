@@ -9990,8 +9990,10 @@ mod projection_schema_tests {
             ScanCases::Exchange
         );
         // Each file's reading is calibrated with the questions it answers,
-        // each opening the thinking it starts: what it defines, how that is
-        // used, and what the file is for, each on its own budget.
+        // each opening the thinking it starts, asked by what was read: a
+        // manifest what it declares, a test what it proves, a kernel what it
+        // computes, code what it defines and who uses it, a document what it
+        // states — each prompt on its own budget.
         let calibrate = CalibrateSpec::of(layer("code_reading"))
             .unwrap()
             .expect("code_reading declares a calibration");
@@ -10001,22 +10003,65 @@ mod projection_schema_tests {
             min,
             max,
         };
-        assert_eq!(
-            calibrate
-                .prompts
+        let asked = |subject: &str| {
+            let profile = calibrate.profile_for(subject);
+            let asks = calibrate
+                .asks_for(subject)
                 .iter()
-                .map(|a| (a.name.as_str(), a.questions))
-                .collect::<Vec<_>>(),
-            [
-                ("definitions", rule(300, 4, 32)),
-                ("uses", rule(400, 3, 24)),
-                ("purpose", rule(3000, 2, 8)),
-            ]
+                .map(|a| (a.name.clone(), a.questions))
+                .collect::<Vec<_>>();
+            (profile.name.clone(), asks)
+        };
+        let named = |profile: &str, asks: &[(&str, QuestionCount)]| {
+            (
+                profile.to_string(),
+                asks.iter()
+                    .map(|(n, q)| (n.to_string(), *q))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            asked("candle/zend/Cargo.toml"),
+            named(
+                "manifest",
+                &[
+                    ("dependencies", rule(120, 3, 16)),
+                    ("dependents", rule(400, 1, 8)),
+                    ("purpose", rule(4000, 1, 2)),
+                ]
+            )
         );
-        assert!(calibrate
-            .prompts
+        for test in [
+            "candle/zend/tests/aggregate_js.rs",
+            "candle/zend/src/mcp/latency_tests.rs",
+            "candle/tools/test_bench.py",
+            "candle/web/tests/perf.spec.ts",
+        ] {
+            assert_eq!(asked(test).0, "tests", "{test}");
+        }
+        assert_eq!(
+            asked("candle/candle-kernels/src/paged-decode/paged_decode.cu").0,
+            "kernels"
+        );
+        assert_eq!(
+            asked("candle/zend/src/calibrate/run.rs"),
+            named(
+                "code",
+                &[
+                    ("definitions", rule(300, 4, 28)),
+                    ("uses", rule(400, 2, 20)),
+                    ("messages", rule(1500, 0, 8)),
+                    ("purpose", rule(3000, 2, 6)),
+                ]
+            )
+        );
+        assert_eq!(asked("candle/zend/src/prompts/projection.yaml").0, "config");
+        assert_eq!(asked("candle/docs/unbounded_agents.md").0, "docs");
+        assert_eq!(asked("candle/LICENSE-MIT").0, "default");
+        assert!(calibrate.profiles.iter().all(|p| p
+            .asks
             .iter()
-            .all(|a| a.prompt.contains("<<path>>") && a.prompt.contains("<<n>>")));
+            .all(|a| a.prompt.contains("<<path>>") && a.prompt.contains("<<n>>"))));
         let guidance = calibrate.guidance.expect("the guidance group draws");
         assert_eq!(guidance.ask.questions, rule(250, 8, 64));
 

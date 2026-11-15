@@ -41,6 +41,7 @@ use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::{ConversationEngine, FinishOrder, Sequence, SequenceConfig, TurnOptions};
 
+use super::ask::Ask;
 use super::permits::{Permit, Permits};
 use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
@@ -645,11 +646,13 @@ fn draft(
                     .banned_tokens
                     .push(sampling.tool_call_open_token_id);
             }
-            let asks = spec.asks_for(&unit.subject);
-            let wanted: Vec<usize> = asks
+            // A part a unit is asked for none of is left out of the turn.
+            let (asks, wanted): (Vec<&Ask>, Vec<usize>) = spec
+                .asks_for(&unit.subject)
                 .iter()
-                .map(|a| a.questions.for_tokens(tokens))
-                .collect();
+                .map(|a| (a, a.questions.for_tokens(tokens)))
+                .filter(|&(_, n)| n > 0)
+                .unzip();
             let parts: Vec<(&str, String)> = asks
                 .iter()
                 .zip(&wanted)
@@ -678,14 +681,18 @@ fn draft(
             let mut kept: Vec<String> = Vec::new();
             match split(&answer, &names) {
                 Some(bodies) => {
-                    for ((body, &n), name) in bodies.iter().zip(&wanted).zip(&names) {
+                    for ((body, &n), ask) in bodies.iter().zip(&wanted).zip(&asks) {
                         let before = kept.len();
                         kept.extend(
                             questions(body, n)
                                 .into_iter()
                                 .filter(|q| seen.insert(q.to_lowercase())),
                         );
-                        short_of(unit, name, n, kept.len() - before, body);
+                        // An optional part is told to stop short rather than
+                        // pad, so writing few is its answer, not a failure.
+                        if ask.questions.min > 0 {
+                            short_of(unit, &ask.name, n, kept.len() - before, body);
+                        }
                     }
                 }
                 None => {
@@ -764,8 +771,9 @@ pub(super) fn on_a_draft<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::ask::Ask;
+    use super::super::ask::RawAsk;
     use super::super::count::QuestionCount;
+    use super::super::profile::{Profile, RawProfile};
     use super::*;
     use candle_conversation::projection::{Conversation, LayerId};
     use candle_conversation::substrate::TurnPartWrite;
@@ -794,15 +802,20 @@ mod tests {
         let spec = CalibrateSpec {
             layer: "code_reading".into(),
             think: 64,
-            prompts: vec![Ask {
-                name: "definitions".into(),
-                questions: QuestionCount {
-                    per_tokens: 250,
-                    min: 4,
-                    max: 4,
-                },
-                prompt: "ask".into(),
-            }],
+            profiles: vec![Profile::of(RawProfile {
+                name: "default".into(),
+                files: Vec::new(),
+                prompts: vec![RawAsk {
+                    name: "definitions".into(),
+                    questions: QuestionCount {
+                        per_tokens: 250,
+                        min: 4,
+                        max: 4,
+                    },
+                    prompt: "ask <<n>>".into(),
+                }],
+            })
+            .unwrap()],
             guidance: None,
         };
         let said = |tl: TimelineId, text: &str| {
