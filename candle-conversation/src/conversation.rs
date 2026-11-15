@@ -228,6 +228,7 @@ pub use ephemeral_turn::{AskScope, UnsealedAsker};
 mod prefix_state;
 mod prompt_dump;
 mod submitted_sections;
+mod turn_bans;
 
 use prefix_state::{checkpoint, shared, state_after};
 pub use prompt_dump::{PieceKind, PromptDump, PromptPiece};
@@ -2266,9 +2267,12 @@ impl TurnSubmitter {
         // after the sealed turn on every future projection.
         let post_decode_tokens = TokenBuffer::new();
 
-        let sampling = options
-            .sampling
-            .unwrap_or_else(|| self.config.sampling.clone());
+        let sampling = turn_bans::with_turn_bans(
+            options
+                .sampling
+                .unwrap_or_else(|| self.config.sampling.clone()),
+            &options.turn_banned_tokens,
+        );
         let max_tokens = options
             .max_tokens
             .unwrap_or(self.config.max_response_tokens);
