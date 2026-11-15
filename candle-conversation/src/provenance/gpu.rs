@@ -334,9 +334,13 @@ impl BatchedGpuGallery {
                     p_case as *const u32,
                     p_probe as *const u64,
                     p_seg_tok as *const i32,
+                    // Contiguous: every token in a segment's range is scanned,
+                    // so its range is also its count.
+                    p_seg_tok as *const i32,
                     p_seg_case as *const i32,
                     std::ptr::null(), // page_ptr — contiguous mode
-                    std::ptr::null(), // pos_map — contiguous mode
+                    std::ptr::null(), // entry_page — contiguous mode
+                    std::ptr::null(), // entry_slots — contiguous mode
                     n_probe_tokens as i32,
                     n_groups as i32,
                     n_segments as i32,

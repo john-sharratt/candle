@@ -85,20 +85,24 @@ extern "C" int bdp_take_pending_error() {
 //  * CONTIGUOUS (`page_ptr == nullptr`): one group-major buffer `gallery_words`;
 //    token `j`'s group-`g` words are at `g*n_tokens*gw + j*gw`.
 //  * PAGED (`page_ptr != nullptr`): the gallery lives in the resident arena as
-//    group-major pages of BDP_PAGE_TOKENS tokens each. `pos_map[j] = (page<<5)|in_pg`
-//    resolves scanned-token `j` to its resident page + offset; `page_ptr[page *
-//    n_groups + g]` is the absolute device address of launch-group `g`'s strip in
-//    that page (a descriptor per (page, group): a page holds only the groups its
-//    turn keeps). The coalesced load is identical — group-major pages keep a
-//    group's tokens contiguous, so only the base address per token differs.
+//    group-major pages of BDP_PAGE_TOKENS tokens each, scanned through page
+//    entries: slot `j` is slot `j & 31` of page `entry_page[j >> 5]`, scanned
+//    when bit `j & 31` of `entry_slots[j >> 5]` is set, voting for the entry's
+//    case `gallery_case[j >> 5]`; `page_ptr[page * n_groups + g]` is the absolute
+//    device address of launch-group `g`'s strip in that page (a descriptor per
+//    (page, group): a page holds only the groups its turn keeps). A segment's
+//    range is in slots; its vote's mean and spread are over the tokens it
+//    scans, `seg_tok_count`.
 extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
     const unsigned long long *__restrict__ gallery_words, // GROUP-major buffer, or null (paged)
-    const unsigned int *__restrict__ gallery_case,        // n_tokens (GLOBAL case id)
+    const unsigned int *__restrict__ gallery_case,        // GLOBAL case ids: per token (contiguous), per entry (paged)
     const unsigned long long *__restrict__ probe_words,   // token-major: n_probe_tokens * wpt
-    const int *__restrict__ seg_tok_start,                // n_segments+1 (token range per segment)
+    const int *__restrict__ seg_tok_start,                // n_segments+1 (token / slot range per segment)
+    const int *__restrict__ seg_tok_count,                // n_segments+1 (tokens each segment scans, prefix)
     const int *__restrict__ seg_case_start,               // n_segments+1 (case range per segment)
     const unsigned long long *__restrict__ page_ptr,      // paged: n_pages*n_groups (page, group) addresses, or null
-    const unsigned int *__restrict__ pos_map,             // paged: n_tokens (page<<5)|in_pg, or null
+    const unsigned int *__restrict__ entry_page,          // paged: the page each entry scans, or null
+    const unsigned int *__restrict__ entry_slots,         // paged: its page's slots it scans, a bit each, or null
     int n_probe_tokens,
     int n_groups,
     int n_segments,
@@ -201,11 +205,18 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
             }
             const unsigned long long *tok;
             if (paged) {
-                const unsigned int pm = pos_map[j];
-                tok = (const unsigned long long *)page_ptr[(size_t)(pm >> 5) * n_groups + g] +
-                      (size_t)(pm & (BDP_PAGE_TOKENS - 1)) * gw;
+                const int e = j >> 5;
+                const int sl = j & (BDP_PAGE_TOKENS - 1);
+                if (((entry_slots[e] >> sl) & 1u) == 0u) {
+                    ok[b] = false; // a slot its entry does not scan
+                    continue;
+                }
+                tok = (const unsigned long long *)page_ptr[(size_t)entry_page[e] * n_groups + g] +
+                      (size_t)sl * gw;
+                cc[b] = gallery_case[e] - (unsigned int)case0;
             } else {
                 tok = g_base + (size_t)j * gw;
+                cc[b] = gallery_case[j] - (unsigned int)case0;
             }
             if (gw == BDP_MAX_GW) {
                 const ulonglong4 *t4 = reinterpret_cast<const ulonglong4 *>(tok);
@@ -221,7 +232,6 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
                     }
                 }
             }
-            cc[b] = gallery_case[j] - (unsigned int)case0;
         }
         // Full unroll over the compile-time tile: keeps `lsum`/`lsumsq`
         // register-resident and issues BDP_TQ independent popcount chains (ILP).
@@ -284,7 +294,8 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
             out_vote[oi] = 0.0f;
         } else {
             out_case[oi] = case0 + top1c; // GLOBAL case id
-            out_vote[oi] = bdp_vote(top1, top2, s_sum[i], s_sumsq[i], tok1 - tok0);
+            out_vote[oi] = bdp_vote(top1, top2, s_sum[i], s_sumsq[i],
+                                    seg_tok_count[s + 1] - seg_tok_count[s]);
         }
     }
 }
@@ -298,9 +309,11 @@ extern "C" void run_batched_bdp_scan(
     const unsigned int *gallery_case,
     const unsigned long long *probe_words,
     const int *seg_tok_start,
+    const int *seg_tok_count,           // contiguous: seg_tok_start itself
     const int *seg_case_start,
     const unsigned long long *page_ptr, // paged: n_pages*n_groups (page, group) addresses, or null
-    const unsigned int *pos_map,        // paged: n_tokens (page<<5)|in_pg, or null
+    const unsigned int *entry_page,     // paged: the page each entry scans, or null
+    const unsigned int *entry_slots,    // paged: its page's slots it scans, a bit each, or null
     int n_probe_tokens,
     int n_groups,
     int n_segments,
@@ -321,7 +334,7 @@ extern "C" void run_batched_bdp_scan(
     cudaStream_t s = (cudaStream_t)stream;
     bdp_scan_kernel<<<blocks, threads, shmem, s>>>(
         gallery_words, gallery_case, probe_words,
-        seg_tok_start, seg_case_start, page_ptr, pos_map,
+        seg_tok_start, seg_tok_count, seg_case_start, page_ptr, entry_page, entry_slots,
         n_probe_tokens, n_groups, n_segments, max_seg_cases, gw, wpt,
         out_case, out_vote);
 }

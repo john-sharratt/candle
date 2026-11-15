@@ -26,6 +26,7 @@ mod dedup;
 pub(crate) mod eviction;
 mod groups;
 mod holder;
+mod index_entries;
 mod lease;
 mod page_io;
 mod pages;
@@ -60,12 +61,13 @@ use candle_nn::kv_cache::{
 use crate::persistence::streams::StreamId;
 
 use dedup::Dedup;
-use eviction::{index_cache_budget, index_cache_evictions, past_keep, Resident};
+use eviction::{idle_indexes, past_keep, Resident};
 use lease::IndexLease;
 
-/// Max distinct segment-set indices cached at once — a handful of belief groups
-/// per reprojection, so this comfortably covers a whole reproject's scans.
-const INDEX_CACHE_CAP: usize = 16;
+/// How long a cached scan index stays once no scan stores or reuses it — a
+/// reader that stopped scanning, not one between reprojections, which come
+/// every 64 decoded tokens (`docs/gallery_residency.md` §5).
+const INDEX_IDLE_MS: u64 = 60_000;
 
 /// How often a reused index records its turns' use. What reads it — the keep
 /// trade's `keep_within`, hours on every card measured — does not resolve five
@@ -226,15 +228,12 @@ pub struct GalleryArena {
     /// multi-GPU setups — e.g. mixed Ada/Blackwell — resolve each arena's
     /// backend ladder against its own device.
     tensor_caps: OnceLock<(bool, bool)>,
-    /// Device bytes the cached indices may hold together
-    /// ([`index_cache_budget`] of this arena's card).
-    index_cache_bytes: u64,
-    /// Per-scan indices (page_ptr / pos_map / case / seg prefixes) keyed by segment
+    /// Per-scan indices (page_ptr / page entries / seg prefixes) keyed by segment
     /// fingerprint, reused when the same segment set is rescanned and every turn
     /// it references still holds the run it was built against — skipping the
-    /// O(scanned-tokens) rebuild each reprojection. Keyed (not a single slot) so
-    /// the several belief groups scanned per reprojection don't evict each other;
-    /// bounded by [`INDEX_CACHE_CAP`].
+    /// rebuild each reprojection. Keyed (not a single slot) so the several
+    /// belief groups scanned per reprojection don't evict each other; an index
+    /// goes when it is stale or idle past [`INDEX_IDLE_MS`], never for room.
     ///
     /// Validated per turn, not by a device-wide generation: with ingest sealing
     /// turns concurrently, a global generation moved on every scan, and a
@@ -252,7 +251,8 @@ pub struct GalleryArena {
     /// dropped, moved or re-uploaded — ahead of the change. A new upload names
     /// no index's turn and does not count (`lease`).
     changes: AtomicU64,
-    /// When the arena began, what [`scan::PagedIndex::touched_ms`] counts from.
+    /// When the arena began, what [`scan::PagedIndex::touched_ms`] and
+    /// [`scan::PagedIndex::used`] count from.
     born: Instant,
     /// One page of zeros: what a scan's index points a (page, group) at when
     /// the page does not hold that group — only ever a group the window's own
@@ -281,10 +281,6 @@ impl GalleryArena {
             candle::bail!("gallery arena requires a CUDA device");
         }
         assert!(n_groups <= GroupSet::MAX, "{n_groups} fold groups");
-        let Device::Cuda(cuda) = device else {
-            candle::bail!("gallery arena requires a CUDA device");
-        };
-        let (_, total) = cuda.mem_get_info()?;
         Ok(Self {
             residency: Mutex::new(HashMap::new()),
             lru_clock: AtomicU64::new(0),
@@ -299,7 +295,6 @@ impl GalleryArena {
             zero_page: Mutex::new(None),
             dedup: Dedup::new(wpt),
             tensor_caps: OnceLock::new(),
-            index_cache_bytes: index_cache_budget(total as u64),
             device: device.clone(),
             wpt,
             n_groups,
@@ -859,10 +854,7 @@ impl GalleryArena {
             .find(|(fp, idx)| *fp == fingerprint && !idx.hold.retire_seen())
             .map(|(_, idx)| idx.clone())
             .ok_or(IndexMiss::Absent)?;
-        idx.used.store(
-            self.lru_clock.fetch_add(1, Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
+        idx.used.store(self.since_born_ms(), Ordering::Relaxed);
         if !idx.serves(weighed) {
             return Err(IndexMiss::Narrower {
                 covering: idx.covering(weighed),
@@ -946,32 +938,27 @@ impl GalleryArena {
         self.indexes.store(Arc::new(next));
     }
 
-    /// Cache `idx` under `fingerprint` for reuse, evicting the least recently
-    /// used entries until the cache is inside both [`INDEX_CACHE_CAP`] entries
-    /// and [`Self::index_cache_bytes`] of device arrays. An index larger than the
-    /// byte bound on its own is not cached: it would evict everything and still
-    /// not fit.
+    /// Cache `idx` under `fingerprint` for reuse, and drop the indices no scan
+    /// has used for [`INDEX_IDLE_MS`] ([`idle_indexes`]) — never one for room.
     fn store_index(&self, fingerprint: u64, idx: Arc<scan::PagedIndex>) {
-        let bytes = idx.device_bytes();
+        let now_ms = self.since_born_ms();
         let mut cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.remove(&fingerprint);
-        if bytes > self.index_cache_bytes {
-            self.publish_indexes(&cache);
-            return;
-        }
-        let entries: Vec<(u64, u64, u64)> = cache
+        let entries: Vec<(u64, u64)> = cache
             .iter()
-            .map(|(&fp, e)| (fp, e.used.load(Ordering::Relaxed), e.device_bytes()))
+            .map(|(&fp, e)| (fp, e.used.load(Ordering::Relaxed)))
             .collect();
-        for fp in index_cache_evictions(&entries, bytes, INDEX_CACHE_CAP, self.index_cache_bytes) {
+        for fp in idle_indexes(&entries, now_ms, INDEX_IDLE_MS) {
             cache.remove(&fp);
         }
-        idx.used.store(
-            self.lru_clock.fetch_add(1, Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
+        idx.used.store(now_ms, Ordering::Relaxed);
         cache.insert(fingerprint, idx);
         self.publish_indexes(&cache);
+    }
+
+    /// Milliseconds since the arena began — the clock an index's use is kept on.
+    fn since_born_ms(&self) -> u64 {
+        self.born.elapsed().as_millis() as u64
     }
 
     /// Pack the gallery's pages toward the low end of the span — the two-cursor

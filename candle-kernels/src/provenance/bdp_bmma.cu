@@ -65,11 +65,12 @@ using namespace nvcuda;
 #define BMMA_RANK_CAP 32
 
 extern "C" __global__ void __launch_bounds__(256) bdp_bmma_accum_kernel(
-    const unsigned int *__restrict__ gallery_case,   // n_tokens GLOBAL case ids
+    const unsigned int *__restrict__ gallery_case,   // one GLOBAL case id per entry
     const unsigned long long *__restrict__ probe_words, // token-major n_probe * wpt
     const unsigned long long *__restrict__ page_ptr, // (page, group) device addresses
-    const unsigned int *__restrict__ pos_map,        // n_tokens (page<<5)|in_pg
-    int n_tokens,
+    const unsigned int *__restrict__ entry_page,     // the page each entry scans
+    const unsigned int *__restrict__ entry_slots,    // its page's slots it scans, a bit each
+    int n_slots,                                     // entries * 32
     int n_probe_tokens,
     int n_groups,
     int n_cases,
@@ -81,7 +82,7 @@ extern "C" __global__ void __launch_bounds__(256) bdp_bmma_accum_kernel(
 #if BDP_BMMA_DEVICE_OK && defined(__CUDA_ARCH__)
     const int j0 = blockIdx.x * BMMA_TC;
     const int g = blockIdx.y;
-    if (j0 >= n_tokens) {
+    if (j0 >= n_slots) {
         return;
     }
 
@@ -113,20 +114,26 @@ extern "C" __global__ void __launch_bounds__(256) bdp_bmma_accum_kernel(
         const int k = idx & 7;
         const int j = j0 + t;
         unsigned long long w = 0ull;
-        if (j < n_tokens) {
-            const unsigned int pm = pos_map[j];
+        // Slot `j` is slot `j & 31` of entry `j >> 5`'s page, scanned when
+        // its bit is set; a slot not scanned stages zero words.
+        if (j < n_slots && ((entry_slots[j >> 5] >> (j & 31)) & 1u)) {
             const unsigned long long *tok =
                 // Group g's strip in this page — one address per (page, group).
-                (const unsigned long long *)page_ptr[(size_t)(pm >> 5) * n_groups + g] +
-                (size_t)(pm & (BMMA_PAGE_TOKENS - 1)) * BMMA_GW;
+                (const unsigned long long *)page_ptr[(size_t)entry_page[j >> 5] * n_groups + g] +
+                (size_t)(j & (BMMA_PAGE_TOKENS - 1)) * BMMA_GW;
             w = tok[k];
         }
         sh_b[k >> 1][t * 2 + (k & 1)] = w;
     }
-    // Stage per-token global case ids (sentinel for the padded tail).
+    // Stage each slot's global case id: its entry's when the slot is scanned,
+    // the sentinel otherwise (an unscanned slot, the padded tail). A gap in a
+    // case's run gives it a second rank here; ranks flush by case id, so the
+    // two merge in the global accumulators.
     for (int t = tid; t < BMMA_TC; t += blockDim.x) {
         const int j = j0 + t;
-        sh_case[t] = (j < n_tokens) ? gallery_case[j] : 0xFFFFFFFFu;
+        sh_case[t] = (j < n_slots && ((entry_slots[j >> 5] >> (j & 31)) & 1u))
+                         ? gallery_case[j >> 5]
+                         : 0xFFFFFFFFu;
     }
     __syncthreads();
 
@@ -322,8 +329,8 @@ extern "C" __global__ void __launch_bounds__(256) bdp_bmma_accum_kernel(
 #else
     // Stub on architectures without b1 BMMA — never launched (the launcher
     // reports unsupported at runtime).
-    (void)gallery_case; (void)probe_words; (void)page_ptr; (void)pos_map;
-    (void)n_tokens; (void)n_probe_tokens; (void)n_groups; (void)n_cases;
+    (void)gallery_case; (void)probe_words; (void)page_ptr; (void)entry_page; (void)entry_slots;
+    (void)n_slots; (void)n_probe_tokens; (void)n_groups; (void)n_cases;
     (void)wpt; (void)case_max; (void)case_sum; (void)case_sumsq;
 #endif
 }
@@ -334,7 +341,7 @@ extern "C" __global__ void bdp_bmma_finalize_kernel(
     const unsigned int *__restrict__ case_max,
     const unsigned long long *__restrict__ case_sum,
     const unsigned long long *__restrict__ case_sumsq,
-    const int *__restrict__ seg_tok_start,  // n_segments+1
+    const int *__restrict__ seg_tok_count,  // n_segments+1: tokens each segment scans, prefix
     const int *__restrict__ seg_case_start, // n_segments+1
     int n_probe_tokens,
     int n_groups,
@@ -355,7 +362,7 @@ extern "C" __global__ void bdp_bmma_finalize_kernel(
     const int g = rem % n_groups;
     const int q = rem / n_groups;
 
-    const int n_gal = seg_tok_start[s + 1] - seg_tok_start[s];
+    const int n_gal = seg_tok_count[s + 1] - seg_tok_count[s];
     const int c0 = seg_case_start[s];
     const int c1 = seg_case_start[s + 1];
     if (c1 <= c0 || n_gal <= 0) {
@@ -441,11 +448,12 @@ extern "C" int bdp_bmma_supported() {
 extern "C" int run_bmma_bdp_scan(
     const unsigned int *gallery_case,
     const unsigned long long *probe_words,
-    const int *seg_tok_start,
+    const int *seg_tok_count,
     const int *seg_case_start,
     const unsigned long long *page_ptr,
-    const unsigned int *pos_map,
-    int n_tokens,
+    const unsigned int *entry_page,
+    const unsigned int *entry_slots,
+    int n_slots,
     int n_probe_tokens,
     int n_groups,
     int n_segments,
@@ -457,10 +465,10 @@ extern "C" int run_bmma_bdp_scan(
     void *stream)
 {
     if (!bdp_bmma_supported() || gw != BMMA_GW || page_ptr == nullptr ||
-        pos_map == nullptr) {
+        entry_page == nullptr || entry_slots == nullptr) {
         return 1;
     }
-    if (n_tokens <= 0 || n_probe_tokens <= 0 || n_groups <= 0 ||
+    if (n_slots <= 0 || n_probe_tokens <= 0 || n_groups <= 0 ||
         n_segments <= 0 || n_cases <= 0) {
         return 1;
     }
@@ -514,9 +522,10 @@ extern "C" int run_bmma_bdp_scan(
         }
         if (err == cudaSuccess) {
             stage = BDP_BMMA_STAGE_ACCUM;
-            const dim3 grid((n_tokens + BMMA_TC - 1) / BMMA_TC, n_groups);
+            const dim3 grid((n_slots + BMMA_TC - 1) / BMMA_TC, n_groups);
             bdp_bmma_accum_kernel<<<grid, 256, 0, s>>>(
-                gallery_case, probe_words + (size_t)q0 * wpt, page_ptr, pos_map, n_tokens,
+                gallery_case, probe_words + (size_t)q0 * wpt, page_ptr, entry_page,
+                entry_slots, n_slots,
                 nq, n_groups, n_cases, wpt, d_max, d_sum, d_sq);
             err = cudaGetLastError();
         }
@@ -525,7 +534,7 @@ extern "C" int run_bmma_bdp_scan(
             const int total = nq * n_groups * n_segments;
             const int blocks = (total + 255) / 256;
             bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
-                d_max, d_sum, d_sq, seg_tok_start, seg_case_start, nq,
+                d_max, d_sum, d_sq, seg_tok_count, seg_case_start, nq,
                 n_groups, n_segments, n_cases, out_case + out_at, out_vote + out_at);
             err = cudaGetLastError();
         }

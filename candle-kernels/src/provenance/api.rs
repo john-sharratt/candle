@@ -15,16 +15,22 @@ extern "C" {
     ///
     /// - `gallery_words`: group-major `[group][token][gw]` sign words, tokens
     ///   sorted by segment, device ptr. Total tokens = `seg_tok_start[n_segments]`.
-    /// - `gallery_case`: `n_tokens` GLOBAL case ids, device ptr.
+    /// - `gallery_case`: GLOBAL case ids, device ptr — one per token
+    ///   (contiguous), one per page entry (paged).
     /// - `probe_words`: `n_probe_tokens * wpt` sign words (token-major), device ptr.
     /// - `seg_tok_start` / `seg_case_start`: `n_segments+1` prefix boundaries —
-    ///   segment `s` owns tokens `[seg_tok_start[s], seg_tok_start[s+1])` and cases
-    ///   `[seg_case_start[s], seg_case_start[s+1])`, device ptrs.
-    /// - `page_ptr` / `pos_map`: the PAGED gallery (resident arena). `page_ptr` is
-    ///   `n_pages * n_groups` absolute device addresses, `page_ptr[page * n_groups
-    ///   + g]` group `g`'s strip in that page; `pos_map[j] = (page<<5)|in_pg` maps
-    ///   scanned-token `j` to its resident page. Both null ⇒ the CONTIGUOUS layout
-    ///   in `gallery_words` (with `gallery_words` null in the paged case).
+    ///   segment `s` owns tokens (paged: slots) `[seg_tok_start[s],
+    ///   seg_tok_start[s+1])` and cases `[seg_case_start[s], seg_case_start[s+1])`,
+    ///   device ptrs.
+    /// - `seg_tok_count`: `n_segments+1` prefix of the tokens each segment
+    ///   actually scans — its vote's mean and spread are over them. Contiguous:
+    ///   `seg_tok_start` itself.
+    /// - `page_ptr` / `entry_page` / `entry_slots`: the PAGED gallery (resident
+    ///   arena). `page_ptr` is `n_pages * n_groups` absolute device addresses,
+    ///   `page_ptr[page * n_groups + g]` group `g`'s strip in that page. Slot `j`
+    ///   of the scan is slot `j & 31` of page `entry_page[j >> 5]`, scanned when
+    ///   bit `j & 31` of `entry_slots[j >> 5]` is set. All null ⇒ the CONTIGUOUS
+    ///   layout in `gallery_words` (with `gallery_words` null in the paged case).
     /// - `n_groups` / `gw` / `wpt`: folded-signature geometry (`wpt = n_groups*gw`).
     /// - `max_seg_cases`: the largest segment's case count (shared-mem stride).
     /// - `out_case` / `out_vote`: `n_probe_tokens * n_groups * n_segments` outputs
@@ -36,9 +42,11 @@ extern "C" {
         gallery_case: *const u32,
         probe_words: *const u64,
         seg_tok_start: *const i32,
+        seg_tok_count: *const i32,
         seg_case_start: *const i32,
         page_ptr: *const u64,
-        pos_map: *const u32,
+        entry_page: *const u32,
+        entry_slots: *const u32,
         n_probe_tokens: i32,
         n_groups: i32,
         n_segments: i32,
@@ -58,21 +66,24 @@ extern "C" {
     pub fn bdp_bmma_supported() -> i32;
 
     /// Launch the tensor-core (b1 BMMA) BDP scan on `stream` — the PAGED gallery
-    /// only (`page_ptr`/`pos_map` required, `gw == 8`). Emits the same
-    /// `(out_case, out_vote)` layout as [`run_batched_bdp_scan`]; the integer
-    /// per-case statistics are identical to the scalar kernel's, and the float
-    /// finalize is the shared `bdp_vote`. Requires each segment's gallery cases
-    /// to be non-decreasing over the scan order (the index builder sorts its
-    /// windows by case). Returns 0 on success, 1 when this device/geometry
-    /// cannot run the BMMA path, or a negative cudaError code.
+    /// only (`page_ptr`, `entry_page` and `entry_slots` required, `gw == 8`),
+    /// over `n_slots` slots (`entries × 32`). Emits the same `(out_case,
+    /// out_vote)` layout as [`run_batched_bdp_scan`]; the integer per-case
+    /// statistics are identical to the scalar kernel's, and the float finalize
+    /// is the shared `bdp_vote`, its `n` each segment's `seg_tok_count`.
+    /// Requires each segment's gallery cases to be non-decreasing over the scan
+    /// order (the index builder sorts its windows by case). Returns 0 on
+    /// success, 1 when this device/geometry cannot run the BMMA path, or a
+    /// negative cudaError code.
     pub fn run_bmma_bdp_scan(
         gallery_case: *const u32,
         probe_words: *const u64,
-        seg_tok_start: *const i32,
+        seg_tok_count: *const i32,
         seg_case_start: *const i32,
         page_ptr: *const u64,
-        pos_map: *const u32,
-        n_tokens: i32,
+        entry_page: *const u32,
+        entry_slots: *const u32,
+        n_slots: i32,
         n_probe_tokens: i32,
         n_groups: i32,
         n_segments: i32,
@@ -105,11 +116,12 @@ extern "C" {
     pub fn run_imma_bdp_scan(
         gallery_case: *const u32,
         probe_words: *const u64,
-        seg_tok_start: *const i32,
+        seg_tok_count: *const i32,
         seg_case_start: *const i32,
         page_ptr: *const u64,
-        pos_map: *const u32,
-        n_tokens: i32,
+        entry_page: *const u32,
+        entry_slots: *const u32,
+        n_slots: i32,
         n_probe_tokens: i32,
         n_groups: i32,
         n_segments: i32,

@@ -135,7 +135,61 @@ readers ask for — every one, or the first of each code within the turn — and
 a turn several read holds the union of their keeps, as it holds the union of
 their groups (`docs/gallery_dedup.md`).
 
-## 5. Seeing it
+## 5. The scan index addresses pages, not tokens
+
+A scan reads its gallery in place through an index — a descriptor table the
+kernels walk (AGENTS.md invariant 2b) — built once per segment set and cached
+while every turn it names keeps the pages it was built against. The index used
+to carry two arrays **per scanned token**: `pos_map[j] = (page << 5) | slot`
+and `case[j]`, 8 bytes a token. Calibrated, the `code_reading` scan covers 36
+million tokens across 173,833 turns, so its index was ~315 MB; past the cache's
+256 MiB it was never cached, and every reprojection rebuilt it — ~550 ms of a
+36M-step walk and an upload — for 3.9 s of projection in a 5 s slot (BlackWorld,
+2026-11-16).
+
+Every token of a page belongs to one turn, so its case is the page's; and the
+tokens a segment scans of a page are a subset of its 32 slots — all of them for
+a whole page, a run at a window's edge, a scattered few under a narrower keep.
+So the index carries one **entry** per (page, segment) instead:
+
+| Array | Per | Holds |
+|---|---|---|
+| `page_ptr[page × G + g]` | page × group | group `g`'s strip in the page (as before) |
+| `entry_page[e]` | entry | the page the entry scans |
+| `entry_slots[e]` | entry | the page's slots it scans, one bit each |
+| `entry_case[e]` | entry | the global case its votes go to |
+| `seg_slot[s]` | segment | its first slot (`entries × 32`), prefix |
+| `seg_tok[s]` | segment | its scanned tokens, prefix — the `n` its vote's mean and spread are over |
+| `seg_case[s]` | segment | its first case, prefix (as before) |
+
+A kernel's token space is `entries × 32` slots: slot `j` is slot `j & 31` of
+entry `j >> 5`, scanned when its bit is set. A slot not scanned stages zero
+words and the case sentinel, which the tensor kernels' dense-rank already skips
+(`RANK_INVALID`), and the scalar kernel skips. A gap in a case's run gives that
+case a second rank in the chunk, which is harmless: ranks flush to the global
+per-case accumulators by case id (`atomicMax` / `atomicAdd`), so they merge.
+The finalize reads `seg_tok`, the tokens actually scanned, not the slot range.
+
+- **Size**: 12 bytes an entry plus `page_ptr` — ~41 MB for the 36M-token
+  scan, against ~315 MB. An index is ~0.5% of the gallery pages it names.
+- **Build**: still a walk of the scanned tokens, to test each against its
+  segment's keep — but it now runs only when an index is first built or goes
+  stale, not on every reprojection.
+- **Cost**: the slots a partial page leaves unscanned are still staged — about
+  half a page per turn window, ~8% more slots than tokens at today's ~207
+  tokens a window. The kernel was never the scan's cost; the rebuild was.
+
+**The cache is bounded by the gallery, not by a byte budget.** An index is a
+fixed small fraction of the pages it names, and those pages are held under the
+gallery's own ceiling, so a byte cap only ever refuses an index the gallery can
+afford — which is how the cap made the scan rebuild. An index is evicted when
+it goes stale (a turn it names is evicted, moved or re-uploaded) or when no scan
+has used it for a minute (`INDEX_IDLE_MS`, `gallery_arena/mod.rs`) — never
+to make room. The cache
+then holds the indices of the readers that are scanning, however many there
+are, and a live reader's index is never rebuilt for want of space.
+
+## 6. Seeing it
 
 `/v1/memory` → `state.gallery.rows` sums resident turns by status (live,
 tombstoned, absent), holder (`shared`, `conversation`) and layer/group. After

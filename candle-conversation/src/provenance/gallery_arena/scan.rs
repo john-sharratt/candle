@@ -2,11 +2,12 @@
 //! and launch the paged BDP kernel.
 //!
 //! The gallery records stay resident (in the arena); a scan uploads only the
-//! addressing — `page_ptr` (device address per page), `pos_map` (page + offset
-//! per scanned token), `case`, the segment prefixes, and the probe — then runs
-//! the same kernel as the contiguous path in its paged mode. The host tally is
-//! shared with the contiguous path ([`needle_tally_segments`]). See
-//! `docs/archived/paged_gallery_arena.md` §7–8.
+//! addressing — `page_ptr` (device address per page and group), one entry per
+//! (page, segment) naming the page, the slots of it scanned and their case
+//! ([`IndexEntries`]), the segment prefixes, and the probe — then runs the same
+//! kernel as the contiguous path in its paged mode. The host tally is shared
+//! with the contiguous path ([`needle_tally_segments`]). See
+//! `docs/gallery_residency.md` §5.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -33,6 +34,7 @@ use crate::scheduler::profile;
 
 use super::super::gpu::{needle_tally_segments, BDP_TQ};
 use super::super::WideQSig;
+use super::index_entries::IndexEntries;
 use super::lease::ScanHold;
 use super::pages::PAGE_TOKENS;
 use super::probe_rows::ProbeRows;
@@ -80,16 +82,15 @@ fn every<'w>(segments: &[PagedSegment], weights: &'w [f32]) -> Vec<&'w [f32]> {
 }
 
 /// The index's arrays on the device — uploaded once, when the index is built,
-/// and read in place by every launch that reuses it.
-///
-/// They used to be uploaded per launch, from pageable host memory, even when the
-/// index itself was reused: `pos_map` and `case` are one `u32` per scanned
-/// token, so a 7.4M-token `code_reading` scan moved ~60 MB host-to-device on
-/// every launch — twice per reprojection (tail and question probes).
+/// and read in place by every launch that reuses it. Per page and group
+/// (`page_ptr`), per entry (`entry_*`, [`IndexEntries`]) and per segment —
+/// nothing per scanned token (`docs/gallery_residency.md` §5).
 struct DeviceIndex {
     page_ptr: Held<u64>,
-    pos_map: Held<u32>,
-    case: Held<u32>,
+    entry_page: Held<u32>,
+    entry_slots: Held<u32>,
+    entry_case: Held<u32>,
+    seg_slot: Held<i32>,
     seg_tok: Held<i32>,
     seg_case: Held<i32>,
 }
@@ -107,8 +108,10 @@ pub(super) struct PagedIndex {
     /// The groups each segment was built for — the groups its turns hold
     /// pages for. A reader weighing no more in any segment can reuse it.
     seg_groups: Vec<GroupSet>,
-    /// Scanned tokens (the length of `pos_map`).
+    /// Scanned tokens.
     pub(super) n_tokens: usize,
+    /// Slots the launch walks: entries × 32, scanned or not.
+    n_slots: usize,
     /// Host copy of the per-segment case prefixes, which the tally reads.
     seg_case: Vec<i32>,
     n_cases: usize,
@@ -127,7 +130,8 @@ pub(super) struct PagedIndex {
     /// When its turns' use was last recorded, milliseconds since the arena
     /// began.
     pub(super) touched_ms: AtomicU64,
-    /// When a scan last stored or reused it — the cache evicts the oldest first.
+    /// When a scan last stored or reused it, milliseconds since the arena
+    /// began — the cache drops it once idle (`INDEX_IDLE_MS`).
     pub(super) used: AtomicU64,
     /// Every probe token's row a launch over this index has produced, so the
     /// next launch scores only the tokens no earlier one did (see
@@ -155,16 +159,6 @@ impl PagedIndex {
             .enumerate()
             .map(|(s, w)| self.seg_groups.get(s).map_or(*w, |b| b.union(*w)))
             .collect()
-    }
-
-    /// Device bytes the index's arrays hold — what caching it costs the card,
-    /// outside the span and the arena's own ceiling.
-    pub(super) fn device_bytes(&self) -> u64 {
-        self.device.as_ref().map_or(0, |d| {
-            (d.page_ptr.len() * 8
-                + (d.pos_map.len() + d.case.len()) * 4
-                + (d.seg_tok.len() + d.seg_case.len()) * 4) as u64
-        })
     }
 }
 
@@ -224,7 +218,7 @@ fn launch_failure(rc: i32) -> (&'static str, i32) {
 /// whenever the turn's content changes
 /// ([`SigWindow::fingerprint`](super::super::SigWindow::fingerprint) folds in the
 /// stored buffer's address + a content sample), and `turn.len()` is hashed directly
-/// so a length change alone (which shifts `pos_map`) also invalidates. A 64-bit
+/// so a length change alone (which moves its entries) also invalidates. A 64-bit
 /// hash collision under an unchanged generation could serve a wrong index — a
 /// ~2⁻⁶⁴ event we accept, the standard content-address trade.
 fn fingerprint_segments(segments: &[PagedSegment]) -> u64 {
@@ -309,9 +303,7 @@ impl GalleryArena {
         let mut turn_base: HashMap<StreamId, (usize, Arc<KeepMask>)> = HashMap::new();
         let mut n_pages = 0usize;
         let mut page_ptr: Vec<u64> = Vec::new();
-        let mut pos_map: Vec<u32> = Vec::new();
-        let mut case: Vec<u32> = Vec::new();
-        let mut seg_tok = vec![0i32];
+        let mut entries = IndexEntries::new();
         let mut seg_case = vec![0i32];
         let mut case_off = 0usize;
         let mut max_seg_cases = 1usize;
@@ -407,24 +399,23 @@ impl GalleryArena {
                     debug_assert!(held.keeps(t), "a reader's kept token the pages lack");
                     let place = held.rank(t);
                     let page = base + place / PAGE_TOKENS;
-                    let in_pg = place % PAGE_TOKENS;
-                    pos_map.push(((page as u32) << 5) | (in_pg as u32));
-                    case.push((case_off + w.case) as u32);
+                    entries.push(page as u32, place % PAGE_TOKENS, (case_off + w.case) as u32);
                 }
             }
             case_off += seg.n_cases;
-            seg_tok.push(pos_map.len() as i32);
+            entries.end_segment();
             seg_case.push(case_off as i32);
             max_seg_cases = max_seg_cases.max(seg.n_cases);
         }
 
-        let n_tokens = pos_map.len();
+        let n_tokens = entries.tokens();
+        let n_slots = entries.slots_len();
         let walked = t_build.elapsed();
         let t_upload = Instant::now();
         let device = if n_tokens == 0 {
             None
         } else {
-            match self.upload_index(&page_ptr, &pos_map, &case, &seg_tok, &seg_case) {
+            match self.upload_index(&page_ptr, &entries, &seg_case) {
                 Ok(d) => Some(d),
                 Err(e) => {
                     for &s in &pinned_sids {
@@ -440,6 +431,8 @@ impl GalleryArena {
             turns = pinned_sids.len(),
             uploaded,
             tokens = n_tokens,
+            entries = entries.page.len(),
+            index_bytes = (page_ptr.len() * 8) as u64 + entries.bytes(),
             keeps_ms = keeps_time.as_millis() as u64,
             ensure_with_lock_wait_ms = ensure_time.as_millis() as u64,
             walk_ms = walked.saturating_sub(ensure_time).as_millis() as u64,
@@ -451,6 +444,7 @@ impl GalleryArena {
             groups: launch,
             seg_groups: seg_groups.to_vec(),
             n_tokens,
+            n_slots,
             seg_case,
             n_cases: case_off,
             n_segments: segments.len(),
@@ -470,9 +464,7 @@ impl GalleryArena {
     fn upload_index(
         &self,
         page_ptr: &[u64],
-        pos_map: &[u32],
-        case: &[u32],
-        seg_tok: &[i32],
+        entries: &IndexEntries,
         seg_case: &[i32],
     ) -> Result<DeviceIndex> {
         let Device::Cuda(dev) = &self.device else {
@@ -481,9 +473,11 @@ impl GalleryArena {
         // Held: the index is reused by every scan until the segments change.
         Ok(DeviceIndex {
             page_ptr: Held::from_host(dev, page_ptr)?,
-            pos_map: Held::from_host(dev, pos_map)?,
-            case: Held::from_host(dev, case)?,
-            seg_tok: Held::from_host(dev, seg_tok)?,
+            entry_page: Held::from_host(dev, &entries.page)?,
+            entry_slots: Held::from_host(dev, &entries.slots)?,
+            entry_case: Held::from_host(dev, &entries.case)?,
+            seg_slot: Held::from_host(dev, &entries.seg_slot)?,
+            seg_tok: Held::from_host(dev, &entries.seg_tok)?,
             seg_case: Held::from_host(dev, seg_case)?,
         })
     }
@@ -971,12 +965,14 @@ impl GalleryArena {
         // The outputs are written in full by the kernel (one block per tile ×
         // group × segment), so their room is neither zeroed nor uploaded.
         let launch = |at: &[u64], room: u64| -> candle::Result<()> {
-            let (p_case, _g1) = d_idx.case.device_ptr(&stream);
+            let (p_case, _g1) = d_idx.entry_case.device_ptr(&stream);
             let p_probe = at[0];
+            let (p_seg_slot, _g2) = d_idx.seg_slot.device_ptr(&stream);
             let (p_seg_tok, _g3) = d_idx.seg_tok.device_ptr(&stream);
             let (p_seg_case, _g4) = d_idx.seg_case.device_ptr(&stream);
             let (p_page_ptr, _g5) = d_idx.page_ptr.device_ptr(&stream);
-            let (p_pos_map, _g6) = d_idx.pos_map.device_ptr(&stream);
+            let (p_entry_page, _g6) = d_idx.entry_page.device_ptr(&stream);
+            let (p_entry_slots, _g7) = d_idx.entry_slots.device_ptr(&stream);
             let p_out_case = room;
             let p_out_vote = room + (n_out * std::mem::size_of::<i32>()) as u64;
             // The kernel's own device time, apart from whatever the shared
@@ -1001,8 +997,9 @@ impl GalleryArena {
                                 p_seg_tok as *const i32,
                                 p_seg_case as *const i32,
                                 p_page_ptr as *const u64,
-                                p_pos_map as *const u32,
-                                idx.n_tokens as i32,
+                                p_entry_page as *const u32,
+                                p_entry_slots as *const u32,
+                                idx.n_slots as i32,
                                 n_probe_tokens as i32,
                                 n_groups as i32,
                                 n_segments as i32,
@@ -1075,10 +1072,12 @@ impl GalleryArena {
                                 std::ptr::null(), // gallery_words — paged mode
                                 p_case as *const u32,
                                 p_probe as *const u64,
+                                p_seg_slot as *const i32,
                                 p_seg_tok as *const i32,
                                 p_seg_case as *const i32,
                                 p_page_ptr as *const u64,
-                                p_pos_map as *const u32,
+                                p_entry_page as *const u32,
+                                p_entry_slots as *const u32,
                                 n_probe_tokens as i32,
                                 n_groups as i32,
                                 n_segments as i32,
