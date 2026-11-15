@@ -319,7 +319,35 @@ impl Runtime {
     /// its conversations' (`docs/npc_conversations.md` §7.1, §8): a
     /// conversation's act takes no decision state and stamps none of the
     /// character's cooldowns.
+    ///
+    /// **A refused act is logged with the world's reason.** The character
+    /// reads the refusal; nothing else did, so a Maker that composed its piece
+    /// three times and never got it committed left no trace of why.
     pub async fn perform_said(
+        &self,
+        npc: u64,
+        act: &Act,
+        pinned: Option<&Where>,
+        said: Option<&Voiced>,
+        source: &ActSource,
+    ) -> Performed {
+        let performed = self.perform_routed(npc, act, pinned, said, source).await;
+        if !performed.recorded.landed {
+            tracing::info!(
+                target: "npcd::engine::refused",
+                npc,
+                act = act.tool,
+                source = ?source,
+                answer = %performed.recorded.answer,
+                "an act was refused"
+            );
+        }
+        performed
+    }
+
+    /// [`Self::perform_said`], unlogged: performed here when this member
+    /// writes the world, sent to its authority otherwise.
+    async fn perform_routed(
         &self,
         npc: u64,
         act: &Act,

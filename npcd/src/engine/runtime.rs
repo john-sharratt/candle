@@ -2386,9 +2386,18 @@ impl Runtime {
             // grammar that has forgotten about either. The real-time body pace
             // and the turn-based loop break are two different rate limits; their
             // union is what the grammar is built without.
+            //
+            // **And `reflect`, while no dream can follow it.** A reflection is
+            // what a dream grows from; with the character's next dream not due
+            // (`dreams::DREAM_EVERY_MS`), or one being written, it would be
+            // minutes of decode that lead nowhere, and the turn goes on with
+            // the work instead.
             cooling: {
                 let mut cooling = self.cooldowns.cooling(npc_id);
                 cooling.extend(self.loop_guards.cooling(npc_id));
+                if !self.dream_available(npc_id) {
+                    cooling.push(tools::REFLECT.name.to_string());
+                }
                 cooling.sort_unstable();
                 cooling.dedup();
                 cooling
@@ -2455,18 +2464,27 @@ impl Runtime {
             let Some(at) = w.actor(body).map(|a| a.at.clone()) else {
                 return;
             };
-            let mut here = w.map().instances_at(&at);
+            let here = w.map().instances_at(&at);
             // **A character that takes no orders works the order table from
             // wherever its attention is** (`docs/zen_moon_mind.md` §8.1): every
             // table in its world is in reach, not only one in its room.
-            if carrying.unordered {
+            //
+            // **And one carrying a mission can always give it up**: from
+            // anywhere, a table's `report_stuck` is in reach, with why. A Drone
+            // stuck where its step left it — Wick at the merge table, its brief
+            // naming a publish its steps never reached — had no way to fail the
+            // mission, so it stood there carrying it for hours and the one who
+            // posted it never heard. Reporting it done stays at the table.
+            let away_from_tables = carrying.unordered || (carrying.mission && !carrying.own);
+            let mut tables = Vec::new();
+            if away_from_tables {
                 for area in w.map().areas() {
                     for node in &area.nodes {
                         let there = Where::new(area.id.as_str(), node.id.as_str());
                         if there == at {
                             continue;
                         }
-                        here.extend(
+                        tables.extend(
                             w.map()
                                 .instances_at(&there)
                                 .into_iter()
@@ -2475,12 +2493,19 @@ impl Runtime {
                     }
                 }
             }
-            for inst in here {
+            let reach = here
+                .into_iter()
+                .map(|i| (i, true))
+                .chain(tables.into_iter().map(|i| (i, false)));
+            for (inst, standing_here) in reach {
                 let Some(url) = address_of(&inst) else {
                     continue;
                 };
                 for (verb, tool) in station::verbs_at(inst.part_id()) {
-                    if mission_acts::offered(tool.name, carrying) {
+                    let in_reach = standing_here
+                        || carrying.unordered
+                        || tool.name == mission_acts::REPORT_STUCK.name;
+                    if in_reach && mission_acts::offered(tool.name, carrying) {
                         invoke.push(Invokable::new(format!("{url}/{verb}"), tool.name));
                     }
                 }
@@ -4356,6 +4381,19 @@ impl Runtime {
             .unwrap()
             .as_ref()
             .is_some_and(|m| m.can_reflect())
+    }
+
+    /// Whether a reflection this character took now could go on to a dream:
+    /// its next dream is due and none is being written. What `reflect` is
+    /// offered on — see [`Self::within`].
+    fn dream_available(&self, npc_id: u64) -> bool {
+        let due = self
+            .minds
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|m| m.dream_due(npc_id, crate::api::now_ms()));
+        due && !self.dreaming.lock().unwrap().contains(&npc_id)
     }
 
     /// Take this character's one dream slot, if it is free. Held until the
@@ -8765,7 +8803,8 @@ mod tests {
             told.ends_with(
                 "/order_post` — a standing `job` by name when one fits what the families need: \
                  `ward-patrol`, `morning-briefing`; or a `brief` and its `steps` for what none of \
-                 them covers. A notice on a board is not work: nobody takes it up."
+                 them covers. A notice on a board is not work: nobody takes it up. Work still out \
+                 never stops you posting more: the table takes as many missions as you set."
             ),
             "{told}"
         );
@@ -9182,6 +9221,51 @@ mod tests {
         rt.set_table_open(false);
         assert_eq!(rt.at_table_summons(1), None, "the table closed");
         assert_eq!(rt.table_summons(2), None, "the table closed");
+    }
+
+    /// **A character carrying a mission can give it up from anywhere**: away
+    /// from the table, its `report_stuck` is in reach and nothing else of the
+    /// table's; carrying nothing, not even that.
+    #[tokio::test]
+    async fn a_mission_can_be_given_up_away_from_the_table() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let rt = vaulted();
+        embody(&rt, 2, "m2", "green-room");
+        assert!(!rt.at_command_table(2), "it stands away from the table");
+        let (hosted, body) = rt.body_of(2).unwrap();
+        let acts = |rt: &Runtime| -> Vec<String> {
+            rt.invokable_urls(&hosted, &body)
+                .into_iter()
+                .map(|i| i.act.to_string())
+                .collect()
+        };
+        assert!(
+            !acts(&rt)
+                .iter()
+                .any(|a| a == mission_acts::REPORT_STUCK.name),
+            "carrying nothing, there is nothing to give up"
+        );
+        hosted.with_sim(|s| {
+            s.missions.assign(
+                &body,
+                Mission::new(
+                    "Land the template.",
+                    vec![Todo::new("go to the watch room")],
+                    Origin::Lodged {
+                        by: "u_op".to_string(),
+                    },
+                ),
+            )
+        });
+        let offered = acts(&rt);
+        assert!(
+            offered.iter().any(|a| a == mission_acts::REPORT_STUCK.name),
+            "{offered:?}"
+        );
+        assert!(
+            !offered.iter().any(|a| a == mission_acts::REPORT_DONE.name),
+            "done is reported at the table: {offered:?}"
+        );
     }
 
     /// **The world gives an unordered character no orders.** At the open table

@@ -785,7 +785,7 @@ const SEND_IMAGE: Tool = Tool {
 /// name, nothing to satisfy, nothing to time out. The deadlock it was guarding
 /// against cannot form either: two characters pausing at each other both wake
 /// on their own clock rather than on each other's.
-const REFLECT: Tool = Tool {
+pub const REFLECT: Tool = Tool {
     name: "reflect",
     at: &[],
     category: "Attention",

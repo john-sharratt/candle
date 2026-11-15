@@ -291,10 +291,14 @@ pub fn results(hosted: &Hosted, body: &str) -> Outcome {
                     f.notes
                 ));
             }
+            if filed.iter().any(|f| f.outcome == Verdict::Fail) {
+                lines.push(SET_IT_AGAIN.to_string());
+            }
         }
     }
     if !out.is_empty() {
         lines.push("Still out:".to_string());
+        lines.push(NO_LIMIT.to_string());
         for (brief, with) in &out {
             let state = match with {
                 Some(b) => match hosted.sim(|s| s.missions.is_on_mission(b)) {
@@ -315,6 +319,24 @@ pub fn results(hosted: &Hosted, body: &str) -> Outcome {
     }
     Outcome::Did(lines.join("\n"))
 }
+
+/// What the poster is told under a report that could not be finished.
+///
+/// **A failure is the poster's to answer.** A Drone that gives a mission up
+/// says what stopped it; the work is still wanted, and the one who set it is
+/// the one who can set it right — a step changed, the brief corrected — so it
+/// is posted again rather than left failed.
+pub const SET_IT_AGAIN: &str = "What could not be finished is still yours to set: post it again, \
+                                with what stopped it put right — change the step that could not \
+                                be done, or correct the brief.";
+
+/// What the poster is told beside the work still out.
+///
+/// **The table has no limit.** Zen believed a table with three missions waiting
+/// to be taken was full and that it could post nothing more, and its round's
+/// "post work" step failed on that belief, routine after routine.
+pub const NO_LIMIT: &str = "Work still out never stops you posting more: the table takes as many \
+                            missions as you set.";
 
 #[cfg(test)]
 mod tests {
@@ -593,13 +615,17 @@ mod tests {
         assert!(h.sim(|s| s.missions.unread_for("zen")));
         assert_eq!(
             results(&h, "zen"),
-            Outcome::Did(
-                "Reported since you last read, newest first:\n- Wick done: Read the board. — the \
-                 board shows two jobs stalled\nStill out:\n- Watch Earth. — set for Jitter"
-                    .into()
-            )
+            Outcome::Did(format!(
+                "Reported since you last read, newest first:\n- Wick done: Read the board. — \
+                     the board shows two jobs stalled\nStill out:\n{NO_LIMIT}\n- Watch Earth. — \
+                     set for Jitter"
+            ))
         );
         assert!(!h.sim(|s| s.missions.unread_for("zen")), "read once");
+        let Outcome::Did(again) = results(&h, "zen") else {
+            panic!("a reading");
+        };
+        assert!(!again.contains(SET_IT_AGAIN), "nothing failed: {again}");
     }
 
     /// **A posted mission that ends unreported comes back to its poster** —
@@ -635,5 +661,8 @@ mod tests {
             ),
             "{read}"
         );
+        // **A failure is the poster's to set again**, with what stopped it put
+        // right; a reading with nothing failed says nothing of it.
+        assert!(read.contains(SET_IT_AGAIN), "{read}");
     }
 }

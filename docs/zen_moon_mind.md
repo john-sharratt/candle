@@ -141,14 +141,20 @@ own.
 The order table in the watch room holds the work, and Zen uses it through its effector — **from
 wherever its attention is**: a character that takes no orders is offered every order table in its
 world and reaches it from any room, while a Drone must be standing at the table to collect or
-report. A mission posted from elsewhere is still reported back at the table's own room.
+report a mission done. A mission posted from elsewhere is still reported back at the table's own
+room. **Giving one up is the exception:** a Drone carrying a mission reaches any table's
+`report_stuck` from wherever it is, with why, so a mission it cannot finish — a free-text step
+nothing signs off, a brief naming an act its steps never reach — is failed and comes back to Zen
+rather than being carried for hours. Reading that failure, Zen is told the work is still its to set,
+with what stopped it put right (`order_table::SET_IT_AGAIN`); and beside the work still out, that
+the table takes as many missions as it sets (`order_table::NO_LIMIT`).
 
 | Act | Who | Does |
 |---|---|---|
 | `order_post` | Zen | Puts a mission on the table: a brief and at least one step, or a standing job by name (`job`, its brief and steps its own), for any Drone or for one by name. |
 | `order_results` | Zen | Reads what came back since it last read: each report, newest first, what is still out, and — with the table empty — the standing jobs. Offered only while a report waits unread, so a reading is never asked for again unchanged. |
 | `collect_mission` | a Drone | Takes the next mission on the table — one set for it by name first, then the oldest open one. |
-| `report_done` / `report_stuck` | a Drone | Reports the mission at the table. |
+| `report_done` / `report_stuck` | a Drone | Reports the mission: done at the table, stuck from anywhere. |
 
 An order is a **mission**, not a line on the orders board: it has steps the engine signs off as
 they happen, a compass that tells the Drone what comes next, and a report. Its origin names its
