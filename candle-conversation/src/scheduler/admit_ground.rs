@@ -35,7 +35,10 @@
 //! reason [`admit::Ground::resident_weights`] gives: it moves under the fill's
 //! feet from places admission cannot see.
 
+use std::time::Instant;
+
 use super::admission::prefill_cost_bytes;
+use super::admission_split::AdmitPart;
 use super::admit::{Budget, Cost, Ground, Headroom, Kind};
 use super::band::rank;
 use super::interleave;
@@ -363,6 +366,26 @@ impl<'a> AdmitPass<'a> {
         seq: usize,
         claim: u64,
     ) -> (usize, u64, u64) {
+        // Charged to the window's admission split as `price`: the part of a
+        // fill that composes and prices the cohort for each offer.
+        let t = Instant::now();
+        let priced = self.priced_tier(room, turn, depth, seq, claim);
+        self.sched
+            .wave_stats
+            .admission_split
+            .part(AdmitPart::Price, t.elapsed());
+        priced
+    }
+
+    /// [`Self::offer_tier`]'s pricing.
+    fn priced_tier(
+        &mut self,
+        room: usize,
+        turn: usize,
+        depth: usize,
+        seq: usize,
+        claim: u64,
+    ) -> (usize, u64, u64) {
         let member = (turn, depth, seq);
         self.offered = Some(member);
         self.narrowed = false;
@@ -644,11 +667,20 @@ impl Ground for AdmitPass<'_> {
     }
 
     fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
-        match kind {
+        // Charged to the window's admission split as `admit`: beginning what
+        // the model said yes to — carving its view and store — and recomposing
+        // the cohort the next offer is priced against.
+        let t = Instant::now();
+        let admitted = match kind {
             Kind::Prefill => self.admit_prefill(prio, cost),
             Kind::Section => self.admit_section(prio, cost),
             Kind::Decode => false,
-        }
+        };
+        self.sched
+            .wave_stats
+            .admission_split
+            .part(AdmitPart::Admit, t.elapsed());
+        admitted
     }
 }
 

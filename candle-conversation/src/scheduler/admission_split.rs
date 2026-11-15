@@ -15,18 +15,27 @@ pub(super) enum AdmitPart {
     Relief,
     /// Arming the planner and pricing the ground (`AdmitPass::new`).
     Setup,
-    /// The rate model judging each offer (`admit::fill`).
+    /// The rate model judging each offer (`admit::fill`), whole — `price` and
+    /// `admit` below are parts of it.
     Fill,
+    /// Of `fill`: composing and pricing the cohort for each offer
+    /// (`AdmitPass::offer_tier`).
+    Price,
+    /// Of `fill`: beginning each admitted offer — its view and store carved —
+    /// and recomposing the cohort after it (`Ground::admit`).
+    Admit,
     /// Handing back what the pass did not offer (`AdmitPass::conclude`).
     Conclude,
     /// Lowering the frontier for a pass held on its floor over holes.
     Frontier,
 }
 
-const PARTS: [AdmitPart; 5] = [
+const PARTS: [AdmitPart; 7] = [
     AdmitPart::Relief,
     AdmitPart::Setup,
     AdmitPart::Fill,
+    AdmitPart::Price,
+    AdmitPart::Admit,
     AdmitPart::Conclude,
     AdmitPart::Frontier,
 ];
@@ -37,6 +46,8 @@ impl AdmitPart {
             AdmitPart::Relief => "relief",
             AdmitPart::Setup => "setup",
             AdmitPart::Fill => "fill",
+            AdmitPart::Price => "price",
+            AdmitPart::Admit => "admit",
             AdmitPart::Conclude => "conclude",
             AdmitPart::Frontier => "frontier",
         }
@@ -97,7 +108,7 @@ mod tests {
         assert_eq!(s.passes, 2);
         assert_eq!(
             s.parts_ms(),
-            "relief=12 setup=0 fill=7 conclude=0 frontier=40"
+            "relief=12 setup=0 fill=7 price=0 admit=0 conclude=0 frontier=40"
         );
     }
 }
