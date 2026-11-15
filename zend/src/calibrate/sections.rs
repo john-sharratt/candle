@@ -9,9 +9,25 @@
 //! is written with the reading in front of it, as the single prompt was, and
 //! the parts see each other, so each can ask nothing another asked.
 
+/// What follows the parts: whose file every question is about, then how the
+/// answer is laid out. `<<path>>` is the unit's own path.
+///
+/// **The unit's file alone.** A draft forks from the unit's reading, and the
+/// reading carries the files read before it in its lineage: asked about
+/// `yenbot/AGENTS.md`, a draft wrote ten of its fifteen questions about
+/// `battle-cities/AGENTS.md` — Bevy, `i64` world coordinates, the `sim` crate,
+/// none of them in the file (BlackWorld, 2026-11-15). Each such question is an
+/// exemplar voting for the wrong file. The calibration marker digests this
+/// text ([`super::spec::CalibrateSpec::marker`]), so a change to it calibrates
+/// every unit again.
+pub const CLOSING: &str = "Every question is about `<<path>>` alone, as you just read it. Other \
+     files may appear earlier in this conversation; ask nothing about them. Answer every part \
+     above, in this order, each under its own heading exactly as written (`## name`), with one \
+     question per line and nothing else.";
+
 /// The message asking every `(name, prompt)` part, each under a `## name`
-/// heading, then how the answer is to be laid out.
-pub fn compose(parts: &[(&str, String)]) -> String {
+/// heading, then [`CLOSING`] for the unit at `path`.
+pub fn compose(parts: &[(&str, String)], path: &str) -> String {
     let mut out = String::new();
     for (name, prompt) in parts {
         out.push_str("## ");
@@ -20,10 +36,7 @@ pub fn compose(parts: &[(&str, String)]) -> String {
         out.push_str(prompt.trim_end());
         out.push_str("\n\n");
     }
-    out.push_str(
-        "Answer every part above, in this order, each under its own heading exactly as \
-         written (`## name`), with one question per line and nothing else.",
-    );
+    out.push_str(&CLOSING.replace("<<path>>", path));
     out
 }
 
@@ -86,10 +99,12 @@ mod tests {
             ("uses", "Now write 3 more.".to_string()),
         ];
         assert_eq!(
-            compose(&parts),
+            compose(&parts, "src/a.rs"),
             "## definitions\nWrite 4 about `a.rs`.\n\n## uses\nNow write 3 more.\n\n\
-             Answer every part above, in this order, each under its own heading exactly as \
-             written (`## name`), with one question per line and nothing else."
+             Every question is about `src/a.rs` alone, as you just read it. Other files may \
+             appear earlier in this conversation; ask nothing about them. Answer every part \
+             above, in this order, each under its own heading exactly as written (`## name`), \
+             with one question per line and nothing else."
         );
     }
 

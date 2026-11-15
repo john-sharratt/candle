@@ -40,6 +40,7 @@ use sha2::{Digest, Sha256};
 use super::ask::{Ask, RawAsk};
 use super::count::QuestionCount;
 use super::profile::{Profile, RawProfile};
+use super::sections::CLOSING;
 
 /// The most questions one unit may be asked for, every prompt together. Each
 /// is one turn of one prefill, and the calibration's K/V is held lossless
@@ -201,13 +202,16 @@ impl CalibrateSpec {
     /// The calibration marker of the unit committed under `content_key`, whose
     /// subject is `subject`: the layer, a digest of what it is asked, and the
     /// unit's own key — so a changed prompt, its question-count rule, the
-    /// profile it is asked by, the thinking budget or the unit's version
-    /// calibrates again, and a change to one profile or the guidance prompt
+    /// profile it is asked by, the closing every draft is asked under
+    /// ([`CLOSING`]), the thinking budget or the unit's version calibrates
+    /// again, and a change to one profile or the guidance prompt
     /// only the units asked it. The unit's own counts are not in it: they
     /// follow from the rules and the content the key names.
     pub fn marker(&self, content_key: &str, subject: &str) -> String {
         let mut h = Sha256::new();
         h.update(self.think.to_le_bytes());
+        h.update(CLOSING.as_bytes());
+        h.update([0u8]);
         match self.guidance_for(subject) {
             Some(g) => {
                 h.update(b"guidance\0");

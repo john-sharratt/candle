@@ -999,7 +999,7 @@ layers:
             - name: concepts
               questions: { per_tokens: 300, min: 4, max: 28 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about the document you just read, `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a concept, rule, invariant, decision, procedure, measurement or term the document itself states or defines, and asks what it is, why it holds, what it was decided over, or how to carry it out. Ask about what the document says, not about code it mentions: never ask where a function or type it names is defined. Spread them across as many of its sections as it has, and ask about each only once. Some short, some longer.
+                Write <<n>> questions someone working in this workspace might ask about the document you just read, `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a concept, rule, invariant, decision, procedure, measurement or term the document itself states or defines, and asks what it is, why it holds, what it was decided over, or how to carry it out. Ask about what the document says, not about code it mentions: never ask where a function or type it names is defined. Ask about the subject itself, as a developer would — "why is weapon fire owned by the avatar that fires it?" — never "what does the document say about…". Spread them across as many of its sections as it has, and ask about each only once. Some short, some longer.
             - name: implements
               questions: { per_tokens: 800, min: 2, max: 16 }
               prompt: |

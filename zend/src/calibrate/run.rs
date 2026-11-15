@@ -680,6 +680,16 @@ fn thoughts(
     })
 }
 
+/// The path a unit's questions name it by: its file's path within its
+/// repository, as the prompts' `<<path>>` is, or the whole subject for a unit
+/// that is not a file.
+fn unit_path(subject: &str) -> &str {
+    match crate::repo_path::split(subject).1 {
+        "" => subject,
+        path => path,
+    }
+}
+
 /// What a unit's draft wrote: its questions from every prompt, in the order
 /// asked, how many the prompts asked for, and the last answer, which a draft
 /// that wrote no question is reported by.
@@ -745,7 +755,7 @@ fn draft(
                 ..Default::default()
             };
             let handle = conv
-                .submit_turn_with_options(compose(&parts), options)
+                .submit_turn_with_options(compose(&parts, unit_path(&unit.subject)), options)
                 .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
             let resp = handle
                 .wait_cancellable(crate::ingest_cancel::token())
@@ -906,6 +916,15 @@ mod tests {
         assert!(!units_own_failure(
             "decode: the turn made no progress for 60 s: it was not admitted, or was lost"
         ));
+    }
+
+    /// A file unit is named by its path within its repository; a unit that is
+    /// not a file, by its whole subject.
+    #[test]
+    fn a_unit_is_named_by_its_path_within_its_repository() {
+        assert_eq!(unit_path("yenbot/AGENTS.md"), "AGENTS.md");
+        assert_eq!(unit_path("candle/zend/src/lib.rs"), "zend/src/lib.rs");
+        assert_eq!(unit_path("journals"), "journals");
     }
 
     #[test]
