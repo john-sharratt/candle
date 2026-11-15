@@ -127,10 +127,37 @@ its verbs as catalogue specs, and `perform` — registered by an adapter:
 | **House devices** (`effector-bridge`, through the house's agent) | one per workable device the survey has found: `device-<mac>` | the device profile's actions — including webOS and Android TV, which gain their verbs here | built; today gated on a room and a linked part, which a terminal is not |
 | **Home network** | the house link | `survey`, `wake` | built as `survey_network`, `wake_device` |
 | **Cluster** (zend's MCP, as `service:zen`, the channel `zen_task` uses) | the gateway's logs; the cluster; each machine's services | read-only: list, search and read logs; cluster, member and service status | to build — zend has the tools, npcd has the channel |
+| **Machines** (each machine's own agent) | one per machine: BlackWorld and WhiteWorld first | the checks below | to build — the agent already takes the house's device work from npcd |
 | **Presence** | the home network | raises an event when a known handset joins or leaves | to build — the survey sees handsets; nothing watches for them |
 
-A cluster terminal is read-only. Deploying, restarting and rolling out stay
-with people.
+A cluster terminal and a machine terminal are read-only. Deploying,
+restarting and rolling out stay with people.
+
+### A machine's checks
+
+**Named checks, never a shell.** Zen reads logs, and logs carry text from
+outside; a command line on a machine would let what it reads decide what it
+runs. A check does one thing, takes validated arguments, changes nothing, and
+answers with a short report. A new check is a new entry in the agent's table.
+
+| Check | Reports |
+|---|---|
+| `health` | CPU, memory, free disk a volume, uptime, a pending reboot |
+| `gpu` | the card's memory, load and temperature, and what holds it |
+| `services` | each service keep supervises: its build, whether it runs, how its last trial ended |
+| `errors` | the daemons' recent errors and warnings, grouped and counted |
+| `logs {log, grep, since}` | a named log searched for a pattern over a window |
+| `logins` | recent sign-ins, failed attempts, remote sessions open |
+| `listeners` | ports open to the network and the process behind each |
+| `processes` | what runs now that did not at the last check; the heaviest by CPU and memory |
+| `security` | the firewall and antivirus state, the definitions' age, pending system updates |
+| `storage` | the substrate's and the journals' size, their growth since the last check, the newest backup's age |
+
+**A check says what changed.** The agent keeps each check's last answer and
+the report leads with the difference — a port that was not open, a process
+that was not running, a volume that lost ten gigabytes — so "out of the
+ordinary" is something the report states rather than something Zen has to
+infer from a page of numbers.
 
 A terminal raises an event by delivering `EventKind::Terminal { terminal,
 text }` to every unordered mind of its world, urgent when its adapter says so.
@@ -162,9 +189,10 @@ step of §8.
 3. **The terminal acts and the house-device adapter**, the television's verbs
    among them.
 4. **The cluster adapter**, read-only.
-5. **Terminal events, and presence** from the survey.
-6. **The mind's content** (`battle-mind`): Zen's round as observations, its
+5. **The machine adapter**: BlackWorld and WhiteWorld, the checks of §5.
+6. **Terminal events, and presence** from the survey.
+7. **The mind's content** (`battle-mind`): Zen's round as observations, its
    idle text, mission templates that grant the task acts, the `ops` and
    `network` templates rewritten to what a terminal can do or removed.
-7. **`docs/zen_moon_mind.md`** brought to the code: the world is `moon`, and
+8. **`docs/zen_moon_mind.md`** brought to the code: the world is `moon`, and
    the pieces it names that were never built are taken out.
