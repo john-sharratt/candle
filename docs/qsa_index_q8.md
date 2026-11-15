@@ -474,13 +474,50 @@ float kernel met. The small shapes are launches of a few microseconds. Done.
 (registers: 10 blocks of 128 threads an SM) — a launch-latency kernel with
 nothing to fill the card with.
 
+### Rounds 4–5 — fewer registers for more occupancy (both rejected)
+
+Occupancy is limited by registers, so two ways to need fewer were measured on
+the idle card. Ratio of Q8_0 to `F32` time, 16 pages:
+
+| | rows 1 | rows 8 | rows 64 | rows 512 | rows 2048 |
+|---|---|---|---|---|---|
+| **Adopted: `(4, 2)`, 256 threads × 2 blocks, 128 registers, 16 warps** | | | | | |
+| 128K | 0.47 | 0.65 | 0.60 | 0.47 | 0.44 |
+| 512K | 0.36 | 0.40 | 0.48 | 0.46 | 0.46 |
+| **Round 4: one candidate a thread, `(4, 1)`, 256 × 3 blocks, 80 registers, 24 warps** | | | | | |
+| 128K | 0.47 | 0.63 | 0.72 | 0.60 | 0.56 |
+| 512K | 0.40 | 0.47 | 0.59 | 0.57 | 0.58 |
+
+- **Round 4.** A thread holding one candidate needs 80 registers (32 B of
+  stack) and three blocks fit. It is **slower at every wide shape by about a
+  fifth**, and slower on the small arms too once they are capped at 80: each
+  query value read from shared memory now serves one candidate instead of two,
+  and that reuse is worth more than half again as many warps. The float
+  kernel's own note found the same.
+- **Round 5.** 192-thread blocks at three an SM would be 18 warps, but the
+  register allocation caps at 96 there and the wide arm spills **160 B**. Not
+  benchmarked.
+
+**Two candidates and four query rows of float accumulators cannot fit a third
+block**: 32 accumulators, 16 dequantized floats and 8 of query are 56 before a
+single address, and the float kernel itself spilled at 80. Full occupancy
+needs the key and the query *narrower in registers*, which is the integer
+path below — four codes to a register instead of one float.
+
 **What is left on the scorer is arithmetic**, and `ncu` agrees with the
 sweep: with spills gone it is compute-bound on the FMA pipe at a third of the
 card's warps. The next rounds, each needing an idle card to measure:
 
-1. **`dp4a` on the pass-through half** — a quarter of the instructions for
-   half the channels, no conversion, and fewer live registers in that loop;
-   it quantizes the query, so it carries its own selection gate.
+1. **The integer scorer** — the one change that buys instructions *and*
+   occupancy. The query tile quantized to int8 once a block; the pass-through
+   half scored by `dp4a` on the stored codes; the rotary half dequantized and
+   rotated as now, then **requantized to int8** against the block pair's
+   bound scale and scored by `dp4a` too. A thread then holds four codes to a
+   register: about 4 words of key and 2 of query a step where it holds 16 and
+   8 floats, which is what lets the `(4, 2)` arm under 80 registers and a
+   third block back, at a quarter of the multiply-adds. It quantizes the
+   query and rounds the rotated key a second time, so it carries its own
+   bound in the oracle and its own selection gate before it is adopted.
 2. **One 8-byte load for a key's four scales** in place of four 2-byte loads —
    the uncoalesced sectors above.
 3. **Row-major against blocked codes** (§3's open question).
