@@ -28,6 +28,16 @@ pub(super) enum AdmitPart {
     /// the carried state claimed, the turn sealed under its conversation and
     /// its prefill started (`Scheduler::begin_admitted`).
     Begin,
+    /// Of `begin`: carving a turn-group case its view.
+    BeginCarve,
+    /// Of `begin`: forking the view's recurrent state from its parent.
+    BeginFork,
+    /// Of `begin`: claiming the carried state the turn's sequence holds.
+    BeginClaim,
+    /// Of `begin`: sealing the turn under its conversation.
+    BeginSeal,
+    /// Of `begin`: starting its prefill.
+    BeginStart,
     /// Of `fill`: finding each offer and pricing it (`Ground::peek`) — `price`
     /// is part of it.
     Peek,
@@ -41,7 +51,7 @@ pub(super) enum AdmitPart {
     Frontier,
 }
 
-const PARTS: [AdmitPart; 11] = [
+const PARTS: [AdmitPart; 16] = [
     AdmitPart::Relief,
     AdmitPart::Setup,
     AdmitPart::Fill,
@@ -51,6 +61,11 @@ const PARTS: [AdmitPart; 11] = [
     AdmitPart::Judge,
     AdmitPart::Admit,
     AdmitPart::Begin,
+    AdmitPart::BeginCarve,
+    AdmitPart::BeginFork,
+    AdmitPart::BeginClaim,
+    AdmitPart::BeginSeal,
+    AdmitPart::BeginStart,
     AdmitPart::Conclude,
     AdmitPart::Frontier,
 ];
@@ -64,6 +79,11 @@ impl AdmitPart {
             AdmitPart::Price => "price",
             AdmitPart::Admit => "admit",
             AdmitPart::Begin => "begin",
+            AdmitPart::BeginCarve => "carve",
+            AdmitPart::BeginFork => "fork",
+            AdmitPart::BeginClaim => "claim",
+            AdmitPart::BeginSeal => "seal",
+            AdmitPart::BeginStart => "start",
             AdmitPart::Peek => "peek",
             AdmitPart::Residency => "residency",
             AdmitPart::Judge => "judge",
@@ -128,7 +148,7 @@ mod tests {
         assert_eq!(
             s.parts_ms(),
             "relief=12 setup=0 fill=7 peek=0 price=0 residency=0 judge=0 admit=0 begin=0 \
-             conclude=0 frontier=40"
+             carve=0 fork=0 claim=0 seal=0 start=0 conclude=0 frontier=40"
         );
     }
 }

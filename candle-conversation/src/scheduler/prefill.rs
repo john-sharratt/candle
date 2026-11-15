@@ -2683,11 +2683,18 @@ impl Scheduler {
         &mut self,
         mut work: PrefillWork,
     ) -> Result<(), Box<(PrefillWork, ConversationError)>> {
+        // Each step is charged to the window's admission split, so the
+        // allocation band says which part of a begin it went to.
+        let t = Instant::now();
         if let Some(case) = self.uncarved_case(&work) {
             if let Err(e) = self.carve_group_case(&mut work, case) {
                 return Err(Box::new((work, e)));
             }
         }
+        self.wave_stats
+            .admission_split
+            .part(AdmitPart::BeginCarve, t.elapsed());
+        let t = Instant::now();
         let view = work.sequence_id;
         if let Some(parent) = self
             .turn_views
@@ -2702,11 +2709,27 @@ impl Scheduler {
                 v.state_forked = true;
             }
         }
-        if let Err(e) = self.model.claim_carried_state(work.sequence_id.0) {
+        self.wave_stats
+            .admission_split
+            .part(AdmitPart::BeginFork, t.elapsed());
+        let t = Instant::now();
+        let claimed = self.model.claim_carried_state(work.sequence_id.0);
+        self.wave_stats
+            .admission_split
+            .part(AdmitPart::BeginClaim, t.elapsed());
+        if let Err(e) = claimed {
             return Err(Box::new((work, ConversationError::Model(e))));
         }
+        let t = Instant::now();
         self.seal_turn_under_its_conversation(work.sequence_id);
+        self.wave_stats
+            .admission_split
+            .part(AdmitPart::BeginSeal, t.elapsed());
+        let t = Instant::now();
         self.begin_prefill(work);
+        self.wave_stats
+            .admission_split
+            .part(AdmitPart::BeginStart, t.elapsed());
         Ok(())
     }
 
