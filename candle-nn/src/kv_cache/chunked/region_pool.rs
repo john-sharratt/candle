@@ -1618,7 +1618,22 @@ static RECYCLE_SYNC_NS: AtomicU64 = AtomicU64::new(0);
 static RECYCLE_FILL_NS: AtomicU64 = AtomicU64::new(0);
 static RECYCLE_SYNC_MAX_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Every nanosecond a recycled claim has spent in its device-wide quiesce,
+/// counted whatever reports it, so a caller can charge the wait inside its own
+/// span to the quiesce rather than to its own work ([`quiesce_wait_ns`]).
+static QUIESCE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The time recycled claims have waited in their device-wide quiesce, in all,
+/// since the process started. Read before and after a span of work, the
+/// difference is how much of it was the wait for the device to drain.
+pub fn quiesce_wait_ns() -> u64 {
+    QUIESCE_WAIT_NS.load(Ordering::Relaxed)
+}
+
 fn record_recycle(quiesced: bool, sync_ns: u64, fill_ns: u64) {
+    if quiesced {
+        QUIESCE_WAIT_NS.fetch_add(sync_ns, Ordering::Relaxed);
+    }
     if !super::alloc::arena_stats_enabled() {
         return;
     }

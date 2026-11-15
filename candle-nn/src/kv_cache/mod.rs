@@ -105,9 +105,10 @@ pub use chunked::{
 #[cfg(feature = "cuda")]
 pub use chunked::{
     empty_sweep_stats, forget_recent_tiers, held_ground_next_claim, held_ground_sites,
-    held_ground_stats, held_ground_top_rank, provision_held_ground, reclaim_empty_arenas,
-    region_ground, region_stats, settle_held_ground, span_partition, span_partition_now,
-    spare_tally, vram_bands, RegionGround, RegionStats, SpanPartition, VramBands, REGION_BYTES,
+    held_ground_stats, held_ground_top_rank, provision_held_ground, quiesce_wait_ns,
+    reclaim_empty_arenas, region_ground, region_stats, settle_held_ground, span_partition,
+    span_partition_now, spare_tally, vram_bands, RegionGround, RegionStats, SpanPartition,
+    VramBands, REGION_BYTES,
 };
 /// A guest's pipeline stage. Defined in both configurations — `f(x)` when there
 /// is no GPU backend, since no guest arena can exist without one — because the

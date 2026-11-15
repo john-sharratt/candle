@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::admission::{
     admit_quantum, budget_notches, evidence_admit_grow, evidence_ticks_for, per_block_kv_bytes,
@@ -28,7 +28,8 @@ use crate::substrate::residence::{drain_reclaimed, rewrite_reclaimed};
 use crate::substrate::EvictionReport;
 use crate::token_buffer::TokenBuffer;
 use candle_nn::kv_cache::{
-    end_wave_transient, is_device_oom, is_span_full, tier_refusal_shortfall, FreeRegionTarget,
+    end_wave_transient, is_device_oom, is_span_full, quiesce_wait_ns, tier_refusal_shortfall,
+    FreeRegionTarget,
 };
 use candle_transformers::models::batched_inference::PendingGlue;
 use candle_transformers::models::expert_lre::is_expert_stall;
@@ -2713,10 +2714,15 @@ impl Scheduler {
             .admission_split
             .part(AdmitPart::BeginFork, t.elapsed());
         let t = Instant::now();
+        let waited = quiesce_wait_ns();
         let claimed = self.model.claim_carried_state(work.sequence_id.0);
         self.wave_stats
             .admission_split
             .part(AdmitPart::BeginClaim, t.elapsed());
+        self.wave_stats.admission_split.part(
+            AdmitPart::BeginClaimQuiesce,
+            Duration::from_nanos(quiesce_wait_ns() - waited),
+        );
         if let Err(e) = claimed {
             return Err(Box::new((work, ConversationError::Model(e))));
         }

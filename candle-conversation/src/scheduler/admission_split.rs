@@ -34,6 +34,9 @@ pub(super) enum AdmitPart {
     BeginFork,
     /// Of `begin`: claiming the carried state the turn's sequence holds.
     BeginClaim,
+    /// Of `claim`: waiting for the device to drain before a recycled region
+    /// is handed to the state (`candle_nn::kv_cache::quiesce_wait_ns`).
+    BeginClaimQuiesce,
     /// Of `begin`: sealing the turn under its conversation.
     BeginSeal,
     /// Of `begin`: starting its prefill.
@@ -51,7 +54,7 @@ pub(super) enum AdmitPart {
     Frontier,
 }
 
-const PARTS: [AdmitPart; 16] = [
+const PARTS: [AdmitPart; 17] = [
     AdmitPart::Relief,
     AdmitPart::Setup,
     AdmitPart::Fill,
@@ -64,6 +67,7 @@ const PARTS: [AdmitPart; 16] = [
     AdmitPart::BeginCarve,
     AdmitPart::BeginFork,
     AdmitPart::BeginClaim,
+    AdmitPart::BeginClaimQuiesce,
     AdmitPart::BeginSeal,
     AdmitPart::BeginStart,
     AdmitPart::Conclude,
@@ -82,6 +86,7 @@ impl AdmitPart {
             AdmitPart::BeginCarve => "carve",
             AdmitPart::BeginFork => "fork",
             AdmitPart::BeginClaim => "claim",
+            AdmitPart::BeginClaimQuiesce => "quiesce",
             AdmitPart::BeginSeal => "seal",
             AdmitPart::BeginStart => "start",
             AdmitPart::Peek => "peek",
@@ -148,7 +153,7 @@ mod tests {
         assert_eq!(
             s.parts_ms(),
             "relief=12 setup=0 fill=7 peek=0 price=0 residency=0 judge=0 admit=0 begin=0 \
-             carve=0 fork=0 claim=0 seal=0 start=0 conclude=0 frontier=40"
+             carve=0 fork=0 claim=0 quiesce=0 seal=0 start=0 conclude=0 frontier=40"
         );
     }
 }
