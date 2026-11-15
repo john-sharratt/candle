@@ -42,8 +42,8 @@ use crate::jobs::{JobError, Jobs, MAX_WAIT};
 use crate::member::{capacity, node_in, APP};
 use crate::overlay::{Missing, MISSING};
 use crate::wire::{
-    AgentJobs, BridgeCall, Bridged, FetchJob, JobView, ListJob, LogChunk, PushJob, RunJob, Submit,
-    Switching,
+    bridge_here, AgentJobs, BridgeCall, Bridged, FetchJob, JobView, ListJob, LogChunk, PushJob,
+    RunJob, Submit, Switching,
 };
 
 /// How long each wait on a running job is held open.
@@ -297,8 +297,8 @@ impl Agents {
         call: &BridgeCall,
         to: Option<u64>,
     ) -> Result<(Bridged, Option<u64>), AgentError> {
-        if self.local().is_some() {
-            return Ok((bridge_in_process(call).await, None));
+        if let Some(jobs) = self.local() {
+            return Ok((bridge_here(call, jobs.checkouts().jobs_dir()).await, None));
         }
         let body = serde_json::to_vec(call).map_err(|e| AgentError::Transport(e.to_string()))?;
         let (at, bytes) = self
@@ -771,43 +771,6 @@ fn refused(e: JobError) -> AgentError {
         other => AgentError::Refused {
             status: 400,
             why: other.to_string(),
-        },
-    }
-}
-
-/// Run a bridge call on this process's own library — a daemon cut off from
-/// every cluster, whose house is reached through the agent in its own process.
-async fn bridge_in_process(call: &BridgeCall) -> Bridged {
-    let nets = effector_bridge::nets();
-    if let BridgeCall::Pair {
-        profile,
-        address,
-        code,
-    } = call
-    {
-        return crate::routes::pair(profile, address, code.clone(), &nets).await;
-    }
-    let worked = match call {
-        BridgeCall::Work {
-            profile,
-            name,
-            address,
-            action,
-            args,
-        } => effector_bridge::work(profile, name, address, action, args, &nets).await,
-        BridgeCall::Wake { name, mac } => effector_bridge::wake(name, mac, &nets),
-        BridgeCall::Pair { .. } => unreachable!("pairing is handled above"),
-    };
-    match worked {
-        Ok(line) => Bridged {
-            ok: true,
-            line,
-            creds: Default::default(),
-        },
-        Err(e) => Bridged {
-            ok: false,
-            line: e.to_string(),
-            creds: Default::default(),
         },
     }
 }

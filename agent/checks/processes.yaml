@@ -1,0 +1,5 @@
+name: processes
+says: The programs running on this machine — which are new since the last check — and the heaviest by processor time and by memory.
+program: powershell
+argv: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "{dir}/processes.ps1"]
+timeout_s: 40

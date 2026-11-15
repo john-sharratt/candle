@@ -1,0 +1,5 @@
+name: health
+says: The machine's processors, memory, free disk on each volume, how long it has been up, and whether a restart is pending.
+program: powershell
+argv: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "{dir}/health.ps1"]
+timeout_s: 40

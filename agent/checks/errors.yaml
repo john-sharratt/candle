@@ -1,0 +1,5 @@
+name: errors
+says: The errors and critical events this machine logged in the last day, grouped by what raised them and counted.
+program: powershell
+argv: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "{dir}/errors.ps1"]
+timeout_s: 60

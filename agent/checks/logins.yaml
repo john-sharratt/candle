@@ -1,0 +1,5 @@
+name: logins
+says: Who is signed in to this machine now, remote sessions open, and the sign-ins and failed attempts of the last day.
+program: powershell
+argv: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "{dir}/logins.ps1"]
+timeout_s: 60

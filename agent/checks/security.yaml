@@ -1,0 +1,5 @@
+name: security
+says: Whether this machine's firewall and antivirus are on, how old the antivirus definitions are, and when it last took an update.
+program: powershell
+argv: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "{dir}/security.ps1"]
+timeout_s: 60

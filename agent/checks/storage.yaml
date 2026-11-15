@@ -1,0 +1,5 @@
+name: storage
+says: How large each folder this machine is asked to watch is — the substrates, the journals, the backups — and how new the newest file in each is.
+program: powershell
+argv: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "{dir}/storage.ps1"]
+timeout_s: 110

@@ -409,6 +409,18 @@ pub enum BridgeCall {
         #[serde(default)]
         code: Option<String>,
     },
+    /// List the checks of the machine the agent runs on
+    /// (`docs/zen_everywhere.md` §5, [`crate::checks`]): each comes back in
+    /// [`Bridged::checks`] with what it reports and what its arguments may be.
+    Checks,
+    /// Run the machine's check `name` with `args`: a named, read-only look at
+    /// the machine, whose report — leading with what changed since it last ran
+    /// — is [`Bridged::line`].
+    Check {
+        name: String,
+        #[serde(default)]
+        args: std::collections::BTreeMap<String, String>,
+    },
 }
 
 /// What a [`BridgeCall`] came to: whether the device did it, and the line the
@@ -422,6 +434,72 @@ pub struct Bridged {
     /// device — empty for an ordinary `work`/`wake`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub creds: std::collections::BTreeMap<String, String>,
+    /// The machine's checks, for a [`BridgeCall::Checks`] — empty for every
+    /// other call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<crate::checks::CheckLine>,
+}
+
+impl Bridged {
+    /// A call that was done, with the line its caller reads.
+    pub fn did(line: impl Into<String>) -> Bridged {
+        Bridged {
+            ok: true,
+            line: line.into(),
+            creds: Default::default(),
+            checks: Vec::new(),
+        }
+    }
+
+    /// A call that was refused, with why.
+    pub fn refused(line: impl Into<String>) -> Bridged {
+        Bridged {
+            ok: false,
+            line: line.into(),
+            creds: Default::default(),
+            checks: Vec::new(),
+        }
+    }
+}
+
+/// Run `call` on this machine: the device bridges through
+/// [`effector_bridge`], a machine's checks through [`crate::checks`] from the
+/// agent's own folder `agent_dir`. Pairing holds a session between its two
+/// calls and is the routes' own ([`crate::routes::pair`]).
+pub async fn bridge_here(call: &BridgeCall, agent_dir: &std::path::Path) -> Bridged {
+    let nets = effector_bridge::nets();
+    let worked = match call {
+        BridgeCall::Pair {
+            profile,
+            address,
+            code,
+        } => return crate::routes::pair(profile, address, code.clone(), &nets).await,
+        BridgeCall::Checks => {
+            let checks = crate::checks::listed(agent_dir);
+            return Bridged {
+                checks,
+                ..Bridged::did("This machine's checks.")
+            };
+        }
+        BridgeCall::Check { name, args } => {
+            return match crate::checks::run(agent_dir, name, args).await {
+                Ok(report) => Bridged::did(report),
+                Err(why) => Bridged::refused(why),
+            }
+        }
+        BridgeCall::Work {
+            profile,
+            name,
+            address,
+            action,
+            args,
+        } => effector_bridge::work(profile, name, address, action, args, &nets).await,
+        BridgeCall::Wake { name, mac } => effector_bridge::wake(name, mac, &nets),
+    };
+    match worked {
+        Ok(line) => Bridged::did(line),
+        Err(e) => Bridged::refused(e.to_string()),
+    }
 }
 
 /// Why a [`PushLine`], [`Pushed`] or [`Fetched`] does not read as one.

@@ -1,0 +1,5 @@
+name: gpu
+says: The graphics card's memory, load and temperature, and the programs holding it.
+program: powershell
+argv: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "{dir}/gpu.ps1"]
+timeout_s: 30

@@ -9,6 +9,7 @@
 //! |---|---|
 //! | [`config`] | the agent's file: its checkouts, its job slots, its jobs folder |
 //! | [`checkouts`] | each checkout: its repository, sandbox and origin |
+//! | [`checks`] | the machine's named, read-only checks, each a file in its `checks/` folder |
 //! | [`stale_locks`] | the git locks a job cut short by a restart left in a checkout |
 //! | [`wire`] | the job API's bodies |
 //! | [`overlay`] | a run's overlay, its chains named by digest |
@@ -26,6 +27,7 @@
 
 pub mod chains;
 pub mod checkouts;
+pub mod checks;
 pub mod client;
 pub mod config;
 pub mod fetcher;

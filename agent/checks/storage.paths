@@ -1,0 +1,6 @@
+# The folders the `storage` check measures on this machine: one path to a
+# line. Lines beginning `#` are ignored. Name the substrates, the journals and
+# wherever backups are kept, for example:
+#
+#   D:\prog\candle\substrate
+#   D:\prog\backups

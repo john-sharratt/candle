@@ -1,0 +1,17 @@
+name: logs
+says: One of this machine's event logs, searched for a word or phrase over a stretch of time, newest first.
+args:
+  - name: log
+    says: Which log.
+    values: [System, Application, Security, Setup]
+  - name: grep
+    says: The word or phrase a line must hold. Left out, every event of the stretch.
+    free: 60
+    default: ""
+  - name: since
+    says: How far back to look.
+    values: [1h, 6h, 24h, 7d]
+    default: 24h
+program: powershell
+argv: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "{dir}/logs.ps1", "-Log", "{log}", "-Since", "{since}", "-Grep", "{grep}"]
+timeout_s: 90

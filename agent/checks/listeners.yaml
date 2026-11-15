@@ -1,0 +1,5 @@
+name: listeners
+says: Every port this machine is listening on, the address it listens at, and the program behind it.
+program: powershell
+argv: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "{dir}/listeners.ps1"]
+timeout_s: 40

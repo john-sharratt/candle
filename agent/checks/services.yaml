@@ -1,0 +1,5 @@
+name: services
+says: Each daemon this machine keeps running — keep, motherd, the gateway, the agent — whether it is up, and since when.
+program: powershell
+argv: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "{dir}/services.ps1"]
+timeout_s: 30

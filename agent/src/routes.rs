@@ -49,7 +49,7 @@ use cluster::log_read::LogAsk;
 
 use crate::jobs::{JobError, Jobs};
 use crate::overlay::Missing;
-use crate::wire::{BridgeCall, Bridged, Submit, Switching};
+use crate::wire::{bridge_here, BridgeCall, Bridged, Submit, Switching};
 
 /// Set on every request that arrived over the agent's socket.
 #[derive(Debug, Clone, Copy)]
@@ -233,39 +233,7 @@ async fn bridge(State(api): State<Api>, Json(call): Json<BridgeCall>) -> Respons
     if !api.jobs.enabled() {
         return failed(JobError::Disabled);
     }
-    let nets = effector_bridge::nets();
-    if let BridgeCall::Pair {
-        profile,
-        address,
-        code,
-    } = call
-    {
-        return Json(pair(&profile, &address, code, &nets).await).into_response();
-    }
-    let worked = match call {
-        BridgeCall::Work {
-            profile,
-            name,
-            address,
-            action,
-            args,
-        } => effector_bridge::work(&profile, &name, &address, &action, &args, &nets).await,
-        BridgeCall::Wake { name, mac } => effector_bridge::wake(&name, &mac, &nets),
-        BridgeCall::Pair { .. } => unreachable!("pairing is handled above"),
-    };
-    let bridged = match worked {
-        Ok(line) => Bridged {
-            ok: true,
-            line,
-            creds: Default::default(),
-        },
-        Err(e) => Bridged {
-            ok: false,
-            line: e.to_string(),
-            creds: Default::default(),
-        },
-    };
-    Json(bridged).into_response()
+    Json(bridge_here(&call, api.jobs.checkouts().jobs_dir()).await).into_response()
 }
 
 /// Android TV pairing sessions held open between the code appearing on the TV
@@ -286,17 +254,12 @@ pub(crate) async fn pair(
     code: Option<String>,
     nets: &[LocalNet],
 ) -> Bridged {
-    let refused = |line: String| Bridged {
-        ok: false,
-        line,
-        creds: Default::default(),
-    };
+    let refused = |line: String| Bridged::refused(line);
     let done: anyhow::Result<Bridged> = async {
         match (profile, code) {
             ("webos", _) => Ok(Bridged {
-                ok: true,
-                line: "Paired with the webOS TV.".into(),
                 creds: webos::pair(address, nets).await?,
+                ..Bridged::did("Paired with the webOS TV.")
             }),
             ("androidtv", None) => {
                 let session = androidtv::pair_start(address, nets, "effector-bridge").await?;
@@ -305,17 +268,14 @@ pub(crate) async fn pair(
                 // with no credentials yet — the second call earns those. A
                 // genuine failure to begin propagates through `?` and comes
                 // back `ok: false`, so the two are never confused downstream.
-                Ok(Bridged {
-                    ok: true,
-                    line: "The TV is showing a six-digit code. Pair again with that code.".into(),
-                    creds: Default::default(),
-                })
+                Ok(Bridged::did(
+                    "The TV is showing a six-digit code. Pair again with that code.",
+                ))
             }
             ("androidtv", Some(code)) => match pairings().lock().await.remove(address) {
                 Some(session) => Ok(Bridged {
-                    ok: true,
-                    line: "Paired with the Google TV.".into(),
                     creds: androidtv::creds_of(&session.finish(&code).await?),
+                    ..Bridged::did("Paired with the Google TV.")
                 }),
                 None => Ok(refused(
                     "No pairing is in progress for that TV — start one first.".into(),
