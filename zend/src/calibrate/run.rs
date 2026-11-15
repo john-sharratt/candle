@@ -747,15 +747,6 @@ fn draft(
                     .banned_tokens
                     .push(sampling.tool_call_open_token_id);
             }
-            // **No DRY.** It runs only inside a grammar's free-text values, so
-            // the draft's grammar ([`grammar`]) would switch it on for every
-            // part — and a part's questions rightly repeat its openers and its
-            // names line after line, which DRY prices as repetition and pushes
-            // off their spelling ("Keeper… The.Keeper… Kepper",
-            // `SamplingConfig::with_qwen_thinking_steering`). Drafts decode as
-            // they did before the grammar.
-            sampling.dry = None;
-            sampling.dry_repeat_penalty = None;
             // A part a unit is asked for none of is left out of the turn.
             let (asks, wanted): (Vec<&Ask>, Vec<usize>) = spec
                 .asks_for(&unit.subject)
