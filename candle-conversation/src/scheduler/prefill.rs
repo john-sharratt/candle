@@ -4,6 +4,7 @@ use super::admission::{
     admit_quantum, budget_notches, evidence_admit_grow, evidence_ticks_for, per_block_kv_bytes,
     ThrottleReason,
 };
+use super::admission_split::AdmitPart;
 use super::admit;
 use super::admit_ground::{joins_a_full_forward, AdmitPass};
 use super::band::rank;
@@ -2241,11 +2242,17 @@ impl Scheduler {
         // behind one High dialogue's 155k-token creep: relief ran 80 times and
         // relieved nothing, since the ground was that creep's own working set.
         // It still goes to the fill below, which prices it like any other offer.
-        if in_flight > 0
+        // Each part of the pass is charged to the window's admission split, so
+        // the allocation band says which part it went to.
+        let t_relief = Instant::now();
+        let held = in_flight > 0
             && self.vram_under_pressure()
             && self.relieve_vram_pressure("promote", VramPhase::Load, ReliefNeed::Paced)
-            && !self.a_queued_prompt_outranks_the_work_in_flight()
-        {
+            && !self.a_queued_prompt_outranks_the_work_in_flight();
+        self.wave_stats
+            .admission_split
+            .part(AdmitPart::Relief, t_relief.elapsed());
+        if held {
             // Pressure survived eviction — stop piling on this pass (the
             // `in_flight > 0` guard keeps ≥1 in flight). The budget halves
             // only on a genuine THROUGHPUT STALL, never on the mere presence
@@ -2357,10 +2364,21 @@ impl Scheduler {
             }
             return;
         };
+        let t_setup = Instant::now();
         let mut pass = AdmitPass::new(self);
+        let setup = t_setup.elapsed();
+        let t_fill = Instant::now();
         let filled = admit::fill(&mut pass, &mut rate);
+        let fill = t_fill.elapsed();
+        let t_conclude = Instant::now();
         let unoffered = pass.conclude();
+        let conclude = t_conclude.elapsed();
         self.wave_rate = Some(rate);
+        let split = &mut self.wave_stats.admission_split;
+        split.pass();
+        split.part(AdmitPart::Setup, setup);
+        split.part(AdmitPart::Fill, fill);
+        split.part(AdmitPart::Conclude, conclude);
         // **Keep one prefill in flight, whatever the model says.**
         //
         // The engine's deadlock-freedom rule, and the one guarantee no
@@ -2401,7 +2419,11 @@ impl Scheduler {
             if holes
                 >= super::compaction_stall::MIN_FREEABLE_ARENAS * candle_nn::kv_cache::REGION_BYTES
             {
+                let t_frontier = Instant::now();
                 self.lower_frontier_for(holes);
+                self.wave_stats
+                    .admission_split
+                    .part(AdmitPart::Frontier, t_frontier.elapsed());
             }
         }
         // The pass acted on the completions that opened it; the next one waits

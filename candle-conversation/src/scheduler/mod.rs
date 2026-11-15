@@ -16,6 +16,7 @@
 //! `/v1/phases`), `profile.rs` (feature-gated zero-cost span timer), and
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod admission;
+mod admission_split;
 /// Rate-based wave budgeting — **compiled and tested, not yet wired.**
 ///
 /// Admission: [`admit::fill`] is the path, and [`admit_ground::AdmitPass`] is
@@ -2574,6 +2575,8 @@ struct WaveStats {
     compaction_us: u64,
     /// What the compaction band was spent on, logged at the window's close.
     compaction_split: compaction_split::CompactionSplit,
+    /// What the allocation band was spent on, logged at the window's close.
+    admission_split: admission_split::AdmissionSplit,
     /// Telemetry phase this window: the previous window's flush, which runs
     /// after that window closed and so lands in this one. Microseconds.
     telemetry_us: u64,
@@ -2647,6 +2650,7 @@ impl WaveStats {
             quantize_us: 0,
             compaction_us: 0,
             compaction_split: compaction_split::CompactionSplit::default(),
+            admission_split: admission_split::AdmissionSplit::default(),
             telemetry_us: 0,
             mid_promote_us: 0,
             wait_ms: 0,
@@ -3152,6 +3156,7 @@ impl WaveStats {
         self.quantize_us = 0;
         self.compaction_us = 0;
         self.compaction_split = compaction_split::CompactionSplit::default();
+        self.admission_split = admission_split::AdmissionSplit::default();
         self.telemetry_us = 0;
         self.mid_promote_us = 0;
         self.wait_ms = 0;
@@ -3356,6 +3361,16 @@ impl WaveStats {
         }
         if alloc_dur > 0 {
             push(&mut phases, PhaseKind::Allocation, alloc_dur, 0, 0);
+            // Which part of admission the band went to: the chart draws one
+            // segment, and making it faster needs the part.
+            let s = &self.admission_split;
+            tracing::info!(
+                target: "candle_conversation::scheduler::admission",
+                total_ms = alloc_dur,
+                passes = s.passes,
+                parts = %s.parts_ms(),
+                "admission split"
+            );
         }
         if sync_dur > 0 {
             push(&mut phases, PhaseKind::Sync, sync_dur, 0, 0);
