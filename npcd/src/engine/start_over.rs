@@ -10,6 +10,9 @@
 //!
 //! Its beliefs, relationships, portrait and place in the world are kept: the
 //! character is the same one, with nothing behind it.
+//!
+//! The route answers `202` with who is being started over, and the work runs
+//! on a task of its own; what each character took is logged as it finishes.
 
 use std::sync::Arc;
 
@@ -18,6 +21,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::api::{err, owner_of, Authored};
 use crate::engine::no_engine;
@@ -127,11 +131,18 @@ pub async fn start_over(
             }
         }
     }
-    let mut started = Vec::with_capacity(ids.len());
-    for id in ids {
-        started.push(rt.start_over(id, body.journal, body.dreams).await);
-    }
-    Json(started).into_response()
+    // On a task of its own, and answered at once: a character mid-turn is
+    // waited for, which can outlast any request, and a request dropped part
+    // way would leave a character with its missions gone and its
+    // conversation still standing. What each one took is in the log.
+    let (rt, journal, dreams) = (Arc::clone(rt), body.journal, body.dreams);
+    let starting: Vec<String> = ids.iter().map(|id| npc_id_wire(*id)).collect();
+    tokio::spawn(async move {
+        for id in ids {
+            rt.start_over(id, journal, dreams).await;
+        }
+    });
+    (StatusCode::ACCEPTED, Json(json!({ "starting": starting }))).into_response()
 }
 
 #[cfg(test)]
