@@ -1665,11 +1665,17 @@ impl Runtime {
             // decided the lift was locked and spent a night asking the Drones
             // to override it.
             let attends = s.attends(&body);
+            // A mind that takes no orders goes nowhere: a place its mission
+            // names is named, with no way to it.
+            let bodiless = s.missions.is_unordered(&body);
             // The way to a place, in the grammar's verbs: a walk on this level
             // or through a door from it, the lift to any other — `move_to` does
             // not cross floors ([`way::way`]).
             let way_to = |to: &Where| -> Option<String> {
                 let room = w.node(to)?.name.clone();
+                if bodiless {
+                    return Some(room);
+                }
                 if attends {
                     return Some(format!("{room}: `focus` on it"));
                 }
@@ -2255,8 +2261,14 @@ impl Runtime {
         // The people among them are the `visitor:{handle}` bodies, and whether
         // a shout from here reaches one is perception's own rule
         // (`docs/npc_conversations.md` §12).
+        //
+        // **A mind that takes no orders has no body** (`docs/zen_everywhere.md`
+        // §4): it is in nobody's company, walks, rides and attends nowhere, and
+        // works no station where its seat is. What it is offered is the order
+        // table, its agenda and its messaging.
+        let bodiless = hosted.sim(|s| s.missions.is_unordered(&body));
         let (company, people, heard_by_person) = hosted.read(|w| {
-            let Some(mine) = w.actor(&body) else {
+            let Some(mine) = w.actor(&body).filter(|_| !bodiless) else {
                 return (Vec::new(), Vec::new(), false);
             };
             let here = mine.at.clone();
@@ -2282,7 +2294,7 @@ impl Runtime {
         // **A body that moves by attention neither walks nor rides**: it has the
         // world's rooms to `focus` on instead, and no destinations, no lift.
         let attends = hosted.sim(|s| s.attends(&body));
-        let (at_lift, lift_here, floors) = match attends {
+        let (at_lift, lift_here, floors) = match attends || bodiless {
             true => (false, false, Vec::new()),
             false => hosted.read(|w| w.lift_within(&body)),
         };
@@ -2301,16 +2313,23 @@ impl Runtime {
             invokable,
             // Never where it stands — see [`body::reachable`]. Walking to your
             // own room was refused, and refusal is not a lesson.
-            places: match attends {
+            places: match attends || bodiless {
                 true => Vec::new(),
                 false => body::reachable(&hosted, &body),
             },
-            rooms: body::rooms(&hosted, &body)
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect(),
+            rooms: match bodiless {
+                true => Vec::new(),
+                false => body::rooms(&hosted, &body)
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect(),
+            },
             parts: hosted.read(|w| {
-                let Some(node) = w.actor(&body).and_then(|a| w.node(&a.at)) else {
+                let Some(node) = w
+                    .actor(&body)
+                    .filter(|_| !bodiless)
+                    .and_then(|a| w.node(&a.at))
+                else {
                     return Vec::new();
                 };
                 w.map()
@@ -2402,10 +2421,16 @@ impl Runtime {
             let Some(at) = w.actor(body).map(|a| a.at.clone()) else {
                 return;
             };
-            let here = w.map().instances_at(&at);
             // **A character that takes no orders works the order table from
-            // wherever its attention is** (`docs/zen_moon_mind.md` §8.1): every
-            // table in its world is in reach, not only one in its room.
+            // its seat, and nothing else there** (`docs/zen_everywhere.md` §4):
+            // every table in its world is in reach, not only one in its room,
+            // and no other station where its seat is.
+            let here: Vec<_> = w
+                .map()
+                .instances_at(&at)
+                .into_iter()
+                .filter(|i| !carrying.unordered || COMMAND_DESK.contains(&i.part_id()))
+                .collect();
             //
             // **And one carrying a mission can always give it up**: from
             // anywhere, a table's `report_stuck` is in reach, with why. A Drone
@@ -9402,11 +9427,10 @@ mod tests {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         let attends = Kind {
-            unordered: true,
             attends: true,
             ..Kind::default()
         };
-        rt.embody_in_world(1, WORLD, attends, "Zen", None, 0)
+        rt.embody_in_world(1, WORLD, attends, "Warden", None, 0)
             .unwrap();
         embody(&rt, 2, "m2", "green-room");
         let within = rt.within(1);
@@ -9462,6 +9486,108 @@ mod tests {
             &act("focus", serde_json::json!({"on": "the command room"}))
         )
         .happened());
+    }
+
+    /// **A mind that takes no orders has no body** (`docs/zen_everywhere.md`
+    /// §4). Nothing of the room its seat is in is carried to it — no
+    /// situation, nothing that happens there — and it is in nobody's company,
+    /// with nowhere to walk, ride or turn its attention and no station to
+    /// work but the order table. It is still told what comes by other roads:
+    /// the outcome of a mission it posted. A body beside it perceives as ever.
+    #[tokio::test]
+    async fn a_mind_that_takes_no_orders_has_no_body() {
+        use crate::engine::enact::NO_BODY;
+        use crate::engine::mission_gen::world::Draw;
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        let zen = Kind {
+            unordered: true,
+            attends: true,
+            ..Kind::default()
+        };
+        rt.embody_in_world(1, WORLD, zen, "Zen", None, 0).unwrap();
+        // A Drone in the same room, at the table.
+        rt.scheduler.wake(2, 0, 0);
+        rt.embody_in_world(2, WORLD, Kind::default(), "Wick", None, 0)
+            .unwrap();
+        rt.set_table_open(false);
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let (_, seat) = rt.body_of(1).unwrap();
+        let (_, wick) = rt.body_of(2).unwrap();
+
+        // Nothing of the room reached it as it was seated, and nothing does
+        // when the room changes: Wick's arrival beside it, then a moment.
+        assert_eq!(rt.scheduler.inbox_depth(1), Some(0), "told where it is");
+        rt.moment(&hosted);
+        assert_eq!(rt.scheduler.inbox_depth(1), Some(0), "told what happened");
+        assert!(
+            waiting(&rt, 2)
+                .iter()
+                .any(|l| l.contains("the command room")),
+            "a body beside it is told where it stands"
+        );
+
+        // In nobody's company, and nowhere to go.
+        let within = rt.within(1);
+        assert!(within.company.is_empty() && within.people.is_empty());
+        assert!(within.places.is_empty() && within.rooms.is_empty());
+        assert!(within.floors.is_empty() && !within.at_lift && !within.away_from_home);
+        assert!(within.parts.is_empty(), "{:?}", within.parts);
+        // The order table is still its to post on, and nothing else is.
+        let acts: Vec<&str> = within.invokable.iter().map(|i| i.act).collect();
+        assert!(acts.contains(&"order_post"), "{acts:?}");
+        assert!(
+            acts.iter().all(|a| mission_acts::is_mine(a)),
+            "only the table's acts: {acts:?}"
+        );
+
+        let act = |tool: &'static str, v: serde_json::Value| Act {
+            tool,
+            args: v.as_object().unwrap().clone(),
+        };
+        for (tool, args) in [
+            ("focus", serde_json::json!({"on": "the green room"})),
+            (
+                "move_to",
+                serde_json::json!({"destination": "the green room"}),
+            ),
+            ("recall", serde_json::json!({})),
+            ("lift_call", serde_json::json!({})),
+        ] {
+            assert_eq!(
+                body::perform(&hosted, &seat, &act(tool, args)),
+                Outcome::Refused(NO_BODY.into()),
+                "{tool}"
+            );
+        }
+        assert_eq!(hosted.place_of(&seat), "vault-command/command-room");
+
+        // What comes by another road still reaches it: the outcome of a
+        // mission it posted.
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::None));
+        rt.set_table_open(true);
+        let posted = body::perform(
+            &hosted,
+            &seat,
+            &act(
+                "order_post",
+                serde_json::json!({"brief": "Read the board.", "steps": "go to the dispatch room"}),
+            ),
+        );
+        assert!(posted.happened(), "{posted:?}");
+        rt.moment(&hosted);
+        assert!(hosted.sim(|s| s.missions.is_on_mission(&wick)));
+        assert_eq!(rt.scheduler.inbox_depth(1), Some(0), "told of the post");
+        hosted.with_sim(|s| {
+            s.missions
+                .report(&wick, Verdict::Pass, "two jobs stalled", None)
+        });
+        rt.moment(&hosted);
+        let told = waiting(&rt, 1);
+        assert!(
+            told.len() == 1 && told[0].starts_with("Wick has reported it done: Read the board"),
+            "{told:?}"
+        );
     }
 
     /// **A personality's `idle:` is its idle wake**, for one that takes no

@@ -44,6 +44,7 @@ use crate::bridge;
 use crate::engine::act::Act;
 use crate::engine::agenda;
 use crate::engine::build;
+use crate::engine::enact::NO_BODY;
 use crate::engine::tools::CATALOG;
 use crate::house;
 use crate::world::Hosted;
@@ -532,6 +533,10 @@ fn who_is_here(hosted: &Hosted, body: &str) -> String {
 }
 
 fn move_to(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+    // A mind that takes no orders has no body to walk with.
+    if hosted.sim(|s| s.missions.is_unordered(body)) {
+        return Outcome::Refused(NO_BODY.into());
+    }
     // A body that moves by attention is not offered the act; this is it refused
     // when it is asked for anyway.
     if hosted.sim(|s| s.attends(body)) {

@@ -39,6 +39,12 @@ use crate::sim::tower::{on_map, Coord, Posture, DRILL_COST_PER_METRE, EDGE, SIEG
 use crate::sim::Sim;
 use crate::world::Hosted;
 
+/// What a mind that takes no orders is told when it asks to move
+/// (`docs/zen_everywhere.md` §4).
+pub const NO_BODY: &str = "You have no body to move and are nowhere to move from. What you need \
+                           to know reaches you, or you ask for it: post work on the order table, \
+                           or message whoever can tell you.";
+
 /// The acts this module performs.
 pub fn is_mine(tool: &str) -> bool {
     matches!(
@@ -84,6 +90,13 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
 pub fn perform_said(hosted: &Hosted, body: &str, act: &Act, said: Option<&Voiced>) -> Outcome {
     let a = &act.args;
     match act.tool {
+        // A mind that takes no orders has no body to move: none of these is
+        // offered it, and each is refused when asked for anyway.
+        "recall" | "focus" | "lift_call" | "lift_use"
+            if hosted.sim(|s| s.missions.is_unordered(body)) =>
+        {
+            Outcome::Refused(NO_BODY.into())
+        }
         "act" => act_on(hosted, body, a),
         "sleep" => sleep(hosted, body, a),
         "give" => give(hosted, body, a),

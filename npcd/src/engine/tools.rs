@@ -2388,6 +2388,19 @@ impl Within {
         // A world with no muster point is one nobody can be called back to, so
         // there is no journey home from anywhere in it.
         self.away_from_home = sim.homes().iter().any(|home| home != place);
+        // **A mind that takes no orders has no body** (`docs/zen_everywhere.md`
+        // §4): nothing of the place its seat is in is its to work — no
+        // machine, board, claim or journey — but the order table's own acts.
+        if carrying.unordered {
+            self.makeable.clear();
+            self.queues.clear();
+            self.tower_actions.clear();
+            self.claimable.clear();
+            self.readable.clear();
+            self.postable.clear();
+            self.station.retain(|t| mission_acts::is_mine(t));
+            self.away_from_home = false;
+        }
         // The phone. Empty without a handset in the pack, which is what takes
         // every messaging act out of the grammar for somebody who has not got
         // one — or has had it taken off them.

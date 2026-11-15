@@ -259,6 +259,18 @@ fn company_line(world: &World, body: &str) -> Option<String> {
     ))
 }
 
+/// Whether the world is carried to `body`'s mind at all.
+///
+/// **A mind that takes no orders has no body to perceive with**
+/// (`docs/zen_everywhere.md` §4): it keeps a seat in the world's record, and
+/// no situation is composed for it and nothing that stirs where the seat is
+/// reaches it. What it is told comes by other roads — a mission's outcome, a
+/// message, a person's conversation — and the rest it learns by looking. Its
+/// seat is swept like a body with no mind, so its cursor never falls behind.
+fn perceives(hosted: &Hosted, body: &str) -> bool {
+    !hosted.sim(|s| s.missions.is_unordered(body))
+}
+
 /// Hand one mind what its body has to be told, and say whether there was any.
 ///
 /// The delta is spent whether or not the mind exists in the scheduler: a
@@ -276,7 +288,7 @@ pub fn push_one(
     time: &WorldTimeOf,
 ) -> bool {
     let delta = hosted.delta(body);
-    if delta.is_empty() {
+    if delta.is_empty() || !perceives(hosted, body) {
         return false;
     }
     let events = hosted.read_both(|w, s| carried(w, s, &delta));
@@ -314,11 +326,12 @@ fn push_minds(
     reach: &Reach,
 ) -> usize {
     // The bodies perceived here, read before the world's lock: one with no mind,
-    // or whose character runs on another member, is swept without a percept
-    // being composed for it.
+    // whose character runs on another member, or whose mind has no body to
+    // perceive with ([`perceives`]) is swept without a percept being composed
+    // for it.
     let perceived: Minds = minds
         .iter()
-        .filter(|(_, &npc_id)| (reach.here)(npc_id))
+        .filter(|(body, &npc_id)| (reach.here)(npc_id) && perceives(hosted, body))
         .map(|(body, &npc_id)| (body.clone(), npc_id))
         .collect();
     let deltas = hosted.sweep_for(|body| perceived.contains_key(body));
