@@ -51,7 +51,9 @@ use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
 use candle::{
-    cuda_backend::cudarc::driver::result::memcpy_dtod_async, quantized::pinned_staging::PinnedBuf,
+    cuda_backend::cudarc::driver::result::{memcpy_dtod_async, memcpy_htod_async},
+    cuda_backend::cudarc::driver::CudaEvent,
+    quantized::pinned_staging::PinnedBuf,
     CudaDevice, DType, LeaseAnchor, Storage,
 };
 #[cfg(feature = "cuda")]
@@ -66,20 +68,60 @@ use std::sync::Mutex;
 /// shrinks while an engine runs, and has nothing to shrink from: a store's size is
 /// its model's geometry, identical for every sequence, so the buffer settles at one
 /// store's size on the first seal. An engine's shutdown frees it
-/// ([`release_seal_readback`]).
+/// ([`release_recurrent_host_buffers`]).
 #[cfg(feature = "cuda")]
 static READBACK: Mutex<Option<PinnedBuf>> = Mutex::new(None);
 
-/// Free the seal readback buffer ([`READBACK`]), unpinning its pages.
+/// The pinned host buffer every store's restore uploads from, kept between
+/// imports like [`READBACK`] and for the same reasons, with the event recorded
+/// after its last uploads: the buffer is written again only once they have read
+/// it.
+#[cfg(feature = "cuda")]
+static UPLOAD: Mutex<Option<PinnedUpload>> = Mutex::new(None);
+
+/// [`UPLOAD`]'s buffer and the point on the stream past which nothing reads it.
+#[cfg(feature = "cuda")]
+struct PinnedUpload {
+    buf: PinnedBuf,
+    /// Recorded after the last import's uploads were enqueued; `None` once
+    /// waited on.
+    done: Option<CudaEvent>,
+}
+
+#[cfg(feature = "cuda")]
+impl PinnedUpload {
+    /// Wait until the last import's uploads have read the buffer — by the
+    /// next import, almost always long since.
+    fn settle(&mut self) -> Result<()> {
+        if let Some(done) = self.done.take() {
+            done.synchronize()
+                .map_err(|e| Error::Msg(format!("recurrent store: upload settle: {e:?}")))?;
+        }
+        Ok(())
+    }
+}
+
+/// Free the pinned buffers a store's seal reads back into ([`READBACK`]) and
+/// its restore uploads from ([`UPLOAD`]), unpinning their pages.
 ///
-/// The buffer is process-wide, so it outlives the engine whose seals sized it:
-/// without this, a shut-down engine leaves one store's whole recurrent state —
-/// 19.3 MiB on the 0.8B, ~65 MB on the 35B-A3B — pinned for the life of the
-/// process. Called once the engine's scheduler, the only thread that seals, has
-/// joined; the next engine's first seal allocates it again.
-pub fn release_seal_readback() {
+/// The buffers are process-wide, so they outlive the engine whose seals and
+/// restores sized them: without this, a shut-down engine leaves one store's
+/// whole recurrent state — 19.3 MiB on the 0.8B, ~65 MB on the 35B-A3B —
+/// pinned twice for the life of the process. Called once the engine's
+/// scheduler, the only thread that seals or restores, has joined; the next
+/// engine's first seal and first restore allocate them again.
+pub fn release_recurrent_host_buffers() {
     #[cfg(feature = "cuda")]
-    release_readback_in(&READBACK);
+    {
+        release_readback_in(&READBACK);
+        let held = UPLOAD.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut up) = held {
+            // Uploads still reading it would read freed pages.
+            if let Err(e) = up.settle() {
+                tracing::warn!("{e}");
+            }
+        }
+    }
 }
 
 /// Empty `slot`, freeing its buffer outside the lock (the drop is a
@@ -1621,6 +1663,91 @@ impl RecurrentStateStore {
             .collect())
     }
 
+    /// [`Self::import`]'s copy on CUDA: every layer's bytes into one pinned host
+    /// buffer, then every upload enqueued from it, and no host wait.
+    ///
+    /// From pageable memory an upload cannot return before the driver's own
+    /// staging buffer has drained through the DMA, and that DMA is ordered on
+    /// the stream behind whatever forward is still running: a parked sequence's
+    /// claim waited out the forward in flight — ~130 ms of a 190 ms admission
+    /// begin on BlackWorld (2026-11-15). From pinned memory the copies are
+    /// queued and the call returns. The wire form is the device's own,
+    /// little-endian F32, so the bytes cross as they are, with no conversion.
+    /// The buffer is reused; the event recorded after the uploads is what the
+    /// next import waits on before writing it again.
+    #[cfg(feature = "cuda")]
+    fn import_cuda(&self, dev: &CudaDevice, layers: &[ExportedLayerState]) -> Result<()> {
+        let state_bytes = self.dims.state_elems() * 4;
+        let tail_bytes = self.dims.conv_state_elems() * 4;
+        let total = self.slots.len() * (state_bytes + tail_bytes);
+        let mut held = UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(up) = held.as_mut() {
+            up.settle()?;
+        }
+        if held.as_ref().is_none_or(|u| u.buf.len() < total) {
+            // Write-combined: the CPU only writes it, and the device reads it.
+            // Every upload from the buffer it replaces has read it — settled
+            // just above.
+            *held = Some(PinnedUpload {
+                buf: PinnedBuf::alloc_owned(total)?,
+                done: None,
+            });
+        }
+        let up = held.as_mut().expect("the upload buffer was just sized");
+        let buf = up.buf.as_mut_slice();
+        let mut at = 0usize;
+        for l in layers {
+            buf[at..at + state_bytes].copy_from_slice(&l.state);
+            at += state_bytes;
+            buf[at..at + tail_bytes].copy_from_slice(&l.conv_tail);
+            at += tail_bytes;
+        }
+        let stream = dev.cuda_stream();
+        let enqueued = (|| -> Result<()> {
+            let mut at = 0usize;
+            for slot in &self.slots {
+                for (tensor, bytes) in [
+                    (&slot.live.state.s, state_bytes),
+                    (&slot.live.state.conv_tail, tail_bytes),
+                ] {
+                    if tensor.elem_count() * 4 != bytes {
+                        candle::bail!(
+                            "recurrent store: layer {} holds {} bytes of state where its \
+                             geometry says {bytes}",
+                            slot.layer_index,
+                            tensor.elem_count() * 4,
+                        );
+                    }
+                    let dst = tensor_device_ptr(dev, tensor)?;
+                    // SAFETY: `dst` addresses `bytes` bytes of the slot's own
+                    // contiguous state tensor, and the source is `bytes` bytes of
+                    // pinned memory nothing writes until the event below has
+                    // passed. On the device's stream, behind the slot's clean.
+                    unsafe { memcpy_htod_async(dst, &buf[at..at + bytes], stream.cu_stream()) }
+                        .map_err(|e| {
+                            Error::Msg(format!("recurrent store: restore upload: {e:?}"))
+                        })?;
+                    at += bytes;
+                }
+            }
+            Ok(())
+        })();
+        // Recorded even when an enqueue failed part-way: the copies already
+        // queued still read the buffer.
+        match stream.record_event(None) {
+            Ok(done) => up.done = Some(done),
+            Err(e) => {
+                stream.synchronize().map_err(|e| {
+                    Error::Msg(format!("recurrent store: restore upload sync: {e:?}"))
+                })?;
+                return Err(Error::Msg(format!(
+                    "recurrent store: restore upload event: {e:?}"
+                )));
+            }
+        }
+        enqueued
+    }
+
     /// Whether a snapshot fits a store of this geometry — its schedule hash, and
     /// every layer's index and dims — without building one. What [`Self::import`]
     /// checks before it touches a tensor, available to a caller that holds the
@@ -1725,6 +1852,13 @@ impl RecurrentStateStore {
             }
         }
         self.break_step();
+        #[cfg(feature = "cuda")]
+        if let Some(Device::Cuda(dev)) = self.slots.first().map(|s| s.live.state.s.device()) {
+            let dev = dev.clone();
+            self.import_cuda(&dev, layers)?;
+            self.seeded = true;
+            return Ok(());
+        }
         for (slot, l) in self.slots.iter_mut().zip(layers) {
             let state_f: Vec<f32> = l
                 .state
@@ -2767,7 +2901,7 @@ mod tests {
     /// test that stages moves that total, and they run in parallel.
     #[cfg(feature = "cuda")]
     #[test]
-    fn releasing_the_seal_readback_unpins_it() -> Result<()> {
+    fn releasing_the_host_buffers_unpins_the_readback() -> Result<()> {
         let _gpu = gpu_serial();
         let held = || {
             READBACK
@@ -2777,15 +2911,50 @@ mod tests {
                 .map(|b| (matches!(b, PinnedBuf::Owned { .. }), b.len()))
         };
         let store = filled_store_on(&Device::new_cuda(0)?);
-        release_seal_readback();
+        release_recurrent_host_buffers();
         assert_eq!(held(), None);
         store.export()?;
         assert_eq!(held(), Some((true, 1_536)), "one owned, pinned buffer");
-        release_seal_readback();
+        release_recurrent_host_buffers();
         assert_eq!(held(), None, "the release dropped it");
         // The next seal allocates it afresh and reads the same bytes.
         assert_eq!(store.export()?, filled_store().export()?);
-        release_seal_readback();
+        release_recurrent_host_buffers();
+        Ok(())
+    }
+
+    /// **A restore on CUDA uploads from one pinned buffer** and lands the bytes
+    /// the snapshot holds: a store exported, imported into a fresh store and
+    /// exported again reads back the same bytes, and the buffer it went through
+    /// is one owned, pinned allocation of the store's size.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_cuda_restore_uploads_from_one_pinned_buffer() -> Result<()> {
+        let _gpu = gpu_serial();
+        let held = || {
+            UPLOAD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|u| (matches!(u.buf, PinnedBuf::Owned { .. }), u.buf.len()))
+        };
+        let dev = Device::new_cuda(0)?;
+        let source = filled_store_on(&dev);
+        let hash = source.schedule_hash();
+        let snapshot = source.export()?;
+        release_recurrent_host_buffers();
+        let mut restored = RecurrentStateStore::new(&kinds(), &dims(), &dev)?;
+        restored.import(hash, &snapshot)?;
+        assert_eq!(held(), Some((true, 1_536)), "one owned, pinned buffer");
+        assert_eq!(restored.export()?, snapshot);
+        assert_eq!(restored.export()?, filled_store().export()?);
+        // A second restore reuses the buffer once the first has read it.
+        let mut again = RecurrentStateStore::new(&kinds(), &dims(), &dev)?;
+        again.import(hash, &snapshot)?;
+        assert_eq!(held(), Some((true, 1_536)));
+        assert_eq!(again.export()?, snapshot);
+        release_recurrent_host_buffers();
+        assert_eq!(held(), None, "the release dropped it");
         Ok(())
     }
 

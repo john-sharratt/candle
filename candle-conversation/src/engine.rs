@@ -50,7 +50,7 @@ use candle::Device;
 use candle_nn::kv_cache::{ChunkedKvBacking, CompressionPolicy};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
-use candle_transformers::models::delta_net::release_seal_readback;
+use candle_transformers::models::delta_net::release_recurrent_host_buffers;
 use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -3259,7 +3259,7 @@ impl ConversationEngine {
         // for the recurrent stores' seal readback buffer: the scheduler was the
         // only thread that sealed.
         release_recycled_wc();
-        release_seal_readback();
+        release_recurrent_host_buffers();
         // Everything durable has landed, so the workspace is handed on: a
         // successor may open it while this engine is still held somewhere.
         self.conversation.release_writer()?;

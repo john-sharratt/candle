@@ -43,7 +43,7 @@ pub use quantized::{
 pub use span_arm::{ArmKind, SpanArms, SpanHook};
 pub use span_rows::{ReplyRows, SpanRows};
 pub use state_store::{
-    commit_stores, compact_stores, end_steps, fold_stores, release_seal_readback,
+    commit_stores, compact_stores, end_steps, fold_stores, release_recurrent_host_buffers,
     ExportedLayerState, RecurrentCompaction, RecurrentStateStore, StagedSnapshot,
 };
 pub use timeline::{fold_by_ops, TimelineLayout, TIMELINE_ROWS};
