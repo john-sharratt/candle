@@ -47,18 +47,20 @@ use super::append_grids::AppendGrids;
 use super::capture_rows::CaptureRows;
 use super::config::IndexerConfig;
 use super::hits::block_range;
+use super::index_keys::scale_plane_offset;
 /// Block keys per live-tail key page — see `index_keys`.
 pub use super::index_keys::PAGE_BLOCKS;
 use super::index_keys::{
-    alloc_buffers, row_addr, write_host, KeyPages, SnapshotBuffer, SnapshotBuffers,
+    alloc_buffers, key_addr, key_page_bytes, write_host, KeyPages, SnapshotBuffer, SnapshotBuffers,
     SNAPSHOT_BUFFERS,
 };
+use super::key_q8::Q8Keys;
 use super::qsa::IndexerWeights;
 use super::qsa_select::{
     entry_block, entry_cells, max_entries_for, max_gathered_for, max_keep, merge_ranges,
     selected_width, PinRow, Strata, MAX_PINS, MAX_RATIO,
 };
-use super::resident_page::ResidentPage;
+use super::resident_page::{ResidentPage, CODE_GROUP};
 use super::rows_matmul::rows_matmul_t;
 use super::spec::SpecCapture;
 use crate::models::decode_diag::{self, RawSelection};
@@ -590,9 +592,9 @@ impl IndexCache {
         let cells = self.n_open;
         let d = self.keys.head_dim();
         self.keys.ensure(self.n_blocks + 1)?;
-        let dst = row_addr(&self.keys.page_ptrs()?, self.n_blocks, d);
+        let (codes, scales) = key_addr(&self.keys.page_ptrs()?, self.n_blocks, d);
         let src = self.raw_ptr()?;
-        let jobs: Vec<i64> = vec![dst as i64, src as i64, cells as i64];
+        let jobs: Vec<i64> = vec![codes as i64, src as i64, cells as i64, scales as i64];
 
         let device = self.keys.device().clone();
         let candle::Device::Cuda(cuda) = &device else {
@@ -694,20 +696,28 @@ impl IndexCache {
     /// its own K/V and keep it there — internally consistent, wrong against the
     /// sequence, and silent.
     ///
-    /// `rows` and `open` are host rows, `[n, head_dim]` and `[n_open, head_dim]`
-    /// row-major, written straight into the cache's arena slots.
-    pub fn from_rows(rows: &[f32], open: &[f32], head_dim: usize, device: &Device) -> Result<Self> {
+    /// `rows` are the completed keys as they are stored and `open` the raw open
+    /// rows, `[n_open, head_dim]` row-major, both written straight into the
+    /// cache's arena slots.
+    pub fn from_rows(
+        rows: &Q8Keys,
+        open: &[f32],
+        head_dim: usize,
+        device: &Device,
+    ) -> Result<Self> {
         if head_dim == 0
-            || !rows.len().is_multiple_of(head_dim)
+            || (rows.dim != head_dim && !rows.is_empty())
             || !open.len().is_multiple_of(head_dim)
         {
             candle::bail!(
-                "index cache: {} row values and {} open values against head_dim {head_dim}",
-                rows.len(),
+                "index cache: {} rows of {}-wide keys and {} open values against head_dim \
+                 {head_dim}",
+                rows.n_rows(),
+                rows.dim,
                 open.len()
             );
         }
-        let n = rows.len() / head_dim;
+        let n = rows.n_rows();
         let n_open = open.len() / head_dim;
         if n_open > MAX_RATIO {
             candle::bail!(
@@ -897,13 +907,13 @@ impl IndexCache {
         self.page_rows[p] + whole
     }
 
-    /// The live prefix, `[n_blocks, head_dim]` row-major, read back to the host
-    /// out of the key pages.
+    /// The live prefix's keys as they are stored, read back to the host out of
+    /// the key pages.
     ///
     /// What a seal writes. The rows above `n_blocks` are dead until an append
     /// writes them, so handing out the whole capacity would persist uninitialised
     /// memory. The scorer never comes here — it reads the pages in place.
-    pub fn live_rows_host(&self) -> Result<Vec<f32>> {
+    pub fn live_rows_host(&self) -> Result<Q8Keys> {
         self.keys.host_rows(self.n_blocks)
     }
 
@@ -1504,6 +1514,7 @@ impl IndexCache {
             let delta = placed.base as i64 - (self.page_rows[i] * ratio) as i64;
             for chunk in placed.page.descriptors()? {
                 desc.push(chunk.ptr as i64);
+                desc.push(chunk.scales as i64);
                 desc.push(chunk.group_stride);
                 desc.push(chunk.row_stride);
                 desc.push(delta);
@@ -1522,15 +1533,17 @@ impl IndexCache {
         if with_tail {
             let span = self.page_row_span();
             // One entry per key page the live tail reaches, each row-major as the
-            // append writes it: group `c` of row `j` at `c + j·(d/4)` float4s. The
-            // tail's rows are consecutive global rows across its pages, so every
-            // page shares the tail's `delta`.
+            // append writes it: code group `c` of row `j` at `c·16 + j·d` bytes,
+            // the scales behind the page's codes. The tail's rows are consecutive
+            // global rows across its pages, so every page shares the tail's
+            // `delta`.
             let delta = self.tail_base as i64 - (span * ratio) as i64;
             let mut end = span;
             for (ptr, used) in self.keys.tail(self.n_blocks)? {
                 desc.push(ptr as i64);
-                desc.push(1);
-                desc.push((d / 4) as i64);
+                desc.push((ptr + scale_plane_offset(d) as u64) as i64);
+                desc.push(CODE_GROUP as i64);
+                desc.push(d as i64);
                 desc.push(delta);
                 end += used;
                 first.push(end as u32);
@@ -2458,10 +2471,12 @@ pub fn append_wave(
             // every later one is contiguous in the wave's projection.
             let n0 = if i == 0 { n_open.min(ratio) } else { 0 };
             let src1 = span.start + (i * ratio).saturating_sub(n_open);
-            jobs.push(row_addr(&pages, n_blocks + i, d) as i64);
+            let (codes, scales) = key_addr(&pages, n_blocks + i, d);
+            jobs.push(codes as i64);
             jobs.push(if n0 > 0 { raw as i64 } else { 0 });
             jobs.push(n0 as i64);
             jobs.push((k_base + src1 as u64 * row) as i64);
+            jobs.push(scales as i64);
         }
 
         if left > 0 {
@@ -2570,13 +2585,8 @@ pub fn compact_index_caches(
     let regions_before = arena_regions(device, SlotTenant::QsaIndex);
     let mut planned = 0usize;
     let mut moved = 0usize;
-    for rows in [PAGE_BLOCKS, MAX_RATIO] {
-        let moves = plan_slot_moves(
-            device,
-            SlotTenant::QsaIndex,
-            rows * head_dim * f32_bytes,
-            max_moves,
-        )?;
+    for bytes in [key_page_bytes(head_dim), MAX_RATIO * head_dim * f32_bytes] {
+        let moves = plan_slot_moves(device, SlotTenant::QsaIndex, bytes, max_moves)?;
         planned += moves.len();
         let mut by_source: HashMap<u64, ArenaSlot> =
             moves.into_iter().map(|m| (m.src, m.dst)).collect();
@@ -3031,6 +3041,7 @@ mod tests {
     use super::*;
     use crate::models::gpu_test_lock::gpu_serial;
     use crate::models::qwen35::attention::RopeTables;
+    use crate::models::qwen4exp::key_q8::{blocks, BLOCK};
     use crate::models::qwen4exp::qsa::{qsa_selection_mask, IndexState};
     use crate::models::qwen4exp::qsa_select::{
         entry_block, entry_cells, selection_entries, RowSelection,
@@ -3038,6 +3049,7 @@ mod tests {
     use crate::models::qwen4exp::select_bytes::{select_layer_bytes, CARVE_ALIGN};
     use crate::models::rope_schedule::plain_inv_freq;
     use candle_nn::kv_cache::{begin_wave, LayerPhase};
+    use half::f16;
 
     fn cuda() -> Option<Device> {
         match Device::cuda_if_available(0) {
@@ -3093,8 +3105,8 @@ mod tests {
             return Ok(());
         };
         let d = 128usize;
-        let build = |n: usize, seed: u64| -> Result<(IndexCache, Vec<f32>, Vec<f32>)> {
-            let keys = lcg(n * d, seed, 1.0);
+        let build = |n: usize, seed: u64| -> Result<(IndexCache, Q8Keys, Vec<f32>)> {
+            let keys = Q8Keys::quantize(&lcg(n * d, seed, 1.0), d);
             let open = lcg(3 * d, seed ^ 0x55, 1.0);
             let cache = IndexCache::from_rows(&keys, &open, d, &device)?;
             Ok((cache, keys, open))
@@ -3122,7 +3134,7 @@ mod tests {
         }
         for cache in [&p, &p_fork] {
             let (page, _) = cache.page_at(0).expect("the page survives the pass");
-            assert_eq!(page.host_rows()?, page_rows);
+            assert_eq!(page.host_rows()?, Q8Keys::quantize(&page_rows, d));
         }
         Ok(())
     }
@@ -3171,15 +3183,17 @@ mod tests {
         Ok(())
     }
 
-    /// A page of `host` rows (`[rows, d]` row-major) whose last row covers
-    /// `last` tokens, placed on `device` the way an injected record is.
+    /// A page of `host` rows (`[rows, d]` row-major), stored as the index
+    /// stores them, whose last row covers `last` tokens, placed on `device` the
+    /// way an injected record is.
     fn placed_page(
         host: &[f32],
         last: usize,
         d: usize,
         device: &Device,
     ) -> Result<Arc<ResidentPage>> {
-        let mut pages = ResidentPage::place_host(&[(host, last)], d, device)?;
+        let keys = Q8Keys::quantize(host, d);
+        let mut pages = ResidentPage::place_host(&[(&keys, last)], d, device)?;
         pages
             .pop()
             .ok_or_else(|| candle::Error::Msg("one page placed".into()))
@@ -3583,7 +3597,7 @@ mod tests {
     fn a_page_is_refused_after_live_rows_and_accepted_once_the_tail_is_reset() {
         let ratio = 4;
         let d = 4usize;
-        let rows = vec![0f32; 2 * d];
+        let rows = Q8Keys::quantize(&vec![0f32; 2 * d], d);
 
         let mut forwarded = IndexCache::from_rows(&rows, &[], d, &Device::Cpu).unwrap();
         assert_eq!(forwarded.live_blocks(), 2);
@@ -3610,7 +3624,7 @@ mod tests {
     #[test]
     fn a_snapshot_restores_the_open_rows_it_copied() {
         let d = 4usize;
-        let rows = vec![0f32; 2 * d];
+        let rows = Q8Keys::quantize(&vec![0f32; 2 * d], d);
         let open_v: Vec<f32> = (0..2 * d).map(|i| i as f32 + 0.5).collect();
         let mut cache = IndexCache::from_rows(&rows, &open_v, d, &Device::Cpu).unwrap();
         let snap = cache.snapshot().unwrap();
@@ -3640,7 +3654,7 @@ mod tests {
     #[test]
     fn snapshots_draw_on_a_fixed_set_of_rewind_buffers() {
         let d = 4usize;
-        let rows = vec![0f32; d];
+        let rows = Q8Keys::quantize(&vec![0f32; d], d);
         let bare = IndexCache::from_rows(&rows, &[], d, &Device::Cpu).unwrap();
         let free: Vec<_> = (0..2 * SNAPSHOT_BUFFERS)
             .map(|_| bare.snapshot().unwrap())
@@ -3681,7 +3695,8 @@ mod tests {
     fn the_prompt_end_travels_with_the_cache() -> Result<()> {
         let d = 2;
         // Four complete blocks and one open row at ratio 4: 17 positions.
-        let mut c = IndexCache::from_rows(&[0.0; 8], &[0.0; 2], d, &Device::Cpu)?;
+        let mut c =
+            IndexCache::from_rows(&Q8Keys::quantize(&[0.0; 8], d), &[0.0; 2], d, &Device::Cpu)?;
         assert_eq!((c.prompt_end(), c.prompt_blocks(4)), (0, 0));
         c.set_prompt_end(10);
         assert_eq!(c.prompt_blocks(4), 2);
@@ -3925,7 +3940,7 @@ mod tests {
     #[test]
     fn pins_travel_with_the_cache() -> Result<()> {
         // Fifteen complete blocks at ratio 4: 60 positions.
-        let mut c = IndexCache::from_rows(&[0.0; 30], &[], 2, &Device::Cpu)?;
+        let mut c = IndexCache::from_rows(&Q8Keys::quantize(&[0.0; 30], 2), &[], 2, &Device::Cpu)?;
         c.set_pins(&[40..60, 0..10, 8..20]);
         assert_eq!(c.pins(), &[0..20, 40..60]);
         // Uniform blocks of 4: [0, 20) is blocks 0..5; [40, 60) blocks 10..15.
@@ -4308,13 +4323,12 @@ mod tests {
         fn round_trip(&self, cache: &IndexCache) -> Result<IndexCache> {
             use crate::models::qwen4exp::paged_index::{decode_page, encode_page, SealedIndex};
             let sealed = SealedIndex {
-                rows: cache.live_rows_host()?,
-                dim: self.cfg.head_dim,
+                keys: cache.live_rows_host()?,
                 last_cells: self.ratio,
                 open: cache.open_rows_host()?,
             };
             let back = decode_page(&encode_page(&sealed)?)?;
-            IndexCache::from_rows(&back.rows, &back.open, self.cfg.head_dim, &self.device)
+            IndexCache::from_rows(&back.keys, &back.open, self.cfg.head_dim, &self.device)
         }
 
         /// Every row's selection, as the model would compute it.
@@ -4712,11 +4726,15 @@ mod tests {
             let rows = w.div_ceil(ratio);
             made.push((lcg(rows * d, 0xA0 + i as u64, 1.0), w - (rows - 1) * ratio));
         }
-        let host: Vec<(&[f32], usize)> = made.iter().map(|(r, l)| (r.as_slice(), *l)).collect();
-        let together = ResidentPage::place_host(&host, d, &device)?;
-        let alone = host
+        let stored: Vec<(Q8Keys, usize)> = made
             .iter()
-            .map(|&(r, l)| placed_page(r, l, d, &device))
+            .map(|(r, l)| (Q8Keys::quantize(r, d), *l))
+            .collect();
+        let host: Vec<(&Q8Keys, usize)> = stored.iter().map(|(k, l)| (k, *l)).collect();
+        let together = ResidentPage::place_host(&host, d, &device)?;
+        let alone = made
+            .iter()
+            .map(|(r, l)| placed_page(r, *l, d, &device))
             .collect::<Result<Vec<_>>>()?;
 
         let mut batched = IndexCache::new(d, &device)?;
@@ -4802,7 +4820,13 @@ mod tests {
         let mut origin = IndexCache::new(rig.cfg.head_dim, &device)?;
         origin.skip_to(made_at)?;
         rig.append(&mut origin, 0, tokens)?;
-        let page = placed_page(&origin.live_rows_host()?, ratio, rig.cfg.head_dim, &device)?;
+        let page = ResidentPage::place_host(
+            &[(&origin.live_rows_host()?, ratio)],
+            rig.cfg.head_dim,
+            &device,
+        )?
+        .pop()
+        .expect("one page placed");
 
         // Injected at a different offset.
         let mut injected = IndexCache::new(rig.cfg.head_dim, &device)?;
@@ -4989,7 +5013,7 @@ mod tests {
     fn an_oversized_open_block_is_refused() -> Result<()> {
         let Some(device) = cuda() else { return Ok(()) };
         let head_dim = 16usize;
-        let rows = vec![0f32; 4 * head_dim];
+        let rows = Q8Keys::quantize(&vec![0f32; 4 * head_dim], head_dim);
         let open = vec![0f32; (MAX_RATIO + 1) * head_dim];
         let err = IndexCache::from_rows(&rows, &open, head_dim, &device).unwrap_err();
         assert!(err.to_string().contains("open rows"), "{err}");
@@ -5011,16 +5035,14 @@ mod tests {
         cache.skip_to(1000)?;
         rig.append(&mut cache, 0, 7)?;
         rig.append(&mut cache, 7, 13)?;
-        let stored: Vec<Vec<f32>> = cache
-            .live_rows_host()?
-            .chunks_exact(d)
-            .map(<[f32]>::to_vec)
-            .collect();
-        assert_eq!(stored.len(), 20 / ratio);
+        let stored = cache.live_rows_host()?;
+        assert_eq!(stored.n_rows(), 20 / ratio);
+        let values = stored.dequantize();
+        let nb = blocks(d);
 
         let keys = rig.keys.to_vec2::<f32>()?;
         let k_norm = rig.w.k_norm.to_vec1::<f32>()?;
-        for (b, row) in stored.iter().enumerate() {
+        for b in 0..stored.n_rows() {
             let mean: Vec<f64> = (0..d)
                 .map(|c| {
                     (0..ratio)
@@ -5031,14 +5053,39 @@ mod tests {
                 .collect();
             let ms = mean.iter().map(|v| v * v).sum::<f64>() / d as f64;
             let scale = 1.0 / (ms + rig.eps).sqrt();
-            for c in 0..d {
-                let want = mean[c] * scale * k_norm[c] as f64;
+            let want: Vec<f32> = (0..d)
+                .map(|c| (mean[c] * scale * k_norm[c] as f64) as f32)
+                .collect();
+            // The kernel's key, stored as Q8_0, against the host's key stored by
+            // the host definition: the kernel runs under fast math and pools in
+            // registers, so a code may land the other side of a tie and a scale
+            // one step off — and no further.
+            let host = Q8Keys::quantize(&want, d);
+            let (codes, scales) = stored.rows(b, 1);
+            for (q, (&got, &exp)) in scales.iter().zip(&host.scales).enumerate() {
                 assert!(
-                    (row[c] as f64 - want).abs() <= 1e-5 * want.abs().max(1.0),
-                    "block {b} channel {c}: stored {} against the pooled normed key {want}",
-                    row[c]
+                    got.abs_diff(exp) <= 1,
+                    "block {b} scale {q}: stored {got:#06x} against the host's {exp:#06x}"
                 );
             }
+            for c in 0..d {
+                let (got, exp) = (codes[c] as i8, host.codes[c] as i8);
+                assert!(
+                    (got as i32 - exp as i32).abs() <= 1,
+                    "block {b} channel {c}: stored code {got} against the host's {exp}"
+                );
+                // And the value it holds is the key, to half a step.
+                let step = f16::from_bits(scales[c / BLOCK]).to_f32() as f64;
+                let held = values[b * d + c] as f64;
+                assert!(
+                    (held - want[c] as f64).abs()
+                        <= 0.5 * step + 2e-3 * want[c].abs() as f64 + 1e-5,
+                    "block {b} channel {c}: stored {held} against the pooled normed key {} at \
+                     step {step}",
+                    want[c]
+                );
+            }
+            assert_eq!(scales.len(), nb);
         }
         Ok(())
     }

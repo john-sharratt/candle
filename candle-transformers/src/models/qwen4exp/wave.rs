@@ -62,6 +62,7 @@ use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::indexer::{
     compact_index_caches, select_layer, selection_stride, IndexCache, IndexSnapshot, SplicePiece,
 };
+use super::key_q8::Q8Keys;
 use super::paged_index;
 use super::paged_index::SealedIndex;
 use super::ple::{PleSpan, PleState};
@@ -133,8 +134,7 @@ use crate::models::wave_token_ids::host_token_ids;
 /// gathered on the device first.
 fn seal_live(c: &IndexCache, last_cells: usize) -> Result<SealedIndex> {
     Ok(SealedIndex {
-        rows: c.live_rows_host()?,
-        dim: c.head_dim(),
+        keys: c.live_rows_host()?,
         last_cells,
         open: c.open_rows_host()?,
     })
@@ -1142,9 +1142,8 @@ impl Qwen4ExpBatched {
             };
             let mut fork = c.fork()?;
             let cells = fork.flush_open_block(w, cfg.rms_norm_eps)?;
-            let d = fork.head_dim();
             let rows = fork.live_rows_host()?;
-            let n = rows.len() / d;
+            let n = rows.n_rows();
             if first > n {
                 candle::bail!(
                     "qsa seal: seq {seq} asked for the rows from position {start_pos}, which \
@@ -1154,8 +1153,7 @@ impl Qwen4ExpBatched {
                 );
             }
             pages.push(SealedIndex {
-                rows: rows[first * d..].to_vec(),
-                dim: d,
+                keys: rows.from_row(first),
                 last_cells: cells.unwrap_or(ratio),
                 open: fork.open_rows_host()?,
             });
@@ -1283,8 +1281,7 @@ impl Qwen4ExpBatched {
                 // record is the page's rows as they stand. A page is already
                 // closed; only the live tail carries an open block.
                 layer_pages.push(SealedIndex {
-                    rows: p.host_rows()?,
-                    dim: c.head_dim(),
+                    keys: p.host_rows()?,
                     last_cells: p.last_cells(),
                     open: Vec::new(),
                 });
@@ -1351,9 +1348,9 @@ impl Qwen4ExpBatched {
                 sealed.len()
             );
         }
-        let host: Vec<(&[f32], usize)> = missing
+        let host: Vec<(&Q8Keys, usize)> = missing
             .iter()
-            .map(|&kv| (sealed[kv].rows.as_slice(), sealed[kv].last_cells))
+            .map(|&kv| (&sealed[kv].keys, sealed[kv].last_cells))
             .collect();
         let placed: Vec<(usize, Arc<ResidentPage>)> = missing
             .iter()
@@ -1395,13 +1392,11 @@ impl Qwen4ExpBatched {
         }
         let d = self.model.cfg.indexer.head_dim;
         let (_, sealed) = paged_index::decode_aux(blob)?;
-        let slot = candle_nn::kv_cache::slot_stride(
-            super::index_keys::PAGE_BLOCKS * d * DType::F32.size_in_bytes(),
-        );
+        let slot = candle_nn::kv_cache::slot_stride(super::index_keys::key_page_bytes(d));
         Ok(missing
             .iter()
             .filter_map(|&kv| sealed.get(kv))
-            .map(|s| (s.rows.len() / d.max(1)).div_ceil(super::index_keys::PAGE_BLOCKS) * slot)
+            .map(|s| s.n_rows().div_ceil(super::index_keys::PAGE_BLOCKS) * slot)
             .sum())
     }
 
@@ -2009,7 +2004,7 @@ impl Qwen4ExpBatched {
             let mut caches = Vec::with_capacity(layers.len());
             for s in &layers {
                 caches.push(IndexCache::from_rows(
-                    &s.rows,
+                    &s.keys,
                     &s.open,
                     cfg.indexer.head_dim,
                     &self.model.device,

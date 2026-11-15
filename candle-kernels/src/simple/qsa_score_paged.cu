@@ -14,15 +14,22 @@
 // boundary), plus the sequence's live tail — so the kernel takes a DESCRIPTOR
 // TABLE and reads each page in place (hot-path invariant 2b):
 //
-//     page p:  { keys, cstride, rstride, delta }            (i64 each)
+//     page p:  { codes, scales, cstride, rstride, delta }   (i64 each)
 //
-//   * `keys` addresses the page's `float4`s; channel group `c` of the page's
-//     row `j` is at `keys + c·cstride + j·rstride`. A placed page is
-//     channel-blocked (`cstride = rows`, `rstride = 1`), which makes a warp's
-//     read contiguous; the live tail is row-major (`cstride = 1`,
-//     `rstride = D/4`) because that is how the append writes it.
+//   * A key is Q8_0 (`../qsa_key_q8.cuh`): `D` int8 codes and `D/32` f16
+//     scales. `codes` addresses the page's codes in groups of 16; group `c` of
+//     the page's row `j` is at `codes + c·cstride + j·rstride`, strides in
+//     BYTES. A placed page is channel-blocked (`cstride = rows·16`,
+//     `rstride = 16`), which makes a warp's read of a group contiguous; a
+//     page the append wrote is row-major (`cstride = 16`, `rstride = D`).
+//   * `scales` addresses the page's scales, row-major in both layouts: block
+//     `b` of row `j` at `scales[j · D/32 + b]`.
 //   * `delta` places the page: global row `g` of page `p` sits at position
 //     `delta + g · ratio`. It is `base − page_first[p] · ratio`, signed.
+//
+// A key is dequantized in registers as it is read — sixteen codes a load, each
+// word of four made a `float4` by its block's scale — then rotated and scored
+// exactly as a float key would be. The queries are not quantized.
 //
 //     out[r, g] = Σ_h relu( q[r, h, :] · rope(key_g, pos(g)) )    for g <  cnt[r]
 //               = -1e30                                            for g >= cnt[r]
@@ -38,17 +45,16 @@
 //
 // ## Shape of the work
 //
-// One thread owns one candidate row and walks `D` with `float4` loads, holding
+// One thread owns one candidate row and walks `D` in Q8_0 blocks, holding
 // `TILE_R × H` accumulators. The key is read ONCE, rotated ONCE, and reused
 // across every query row in the block's tile: at the production geometry
-// (`D = 128`, `H = 4`, `TILE_R = 4`) a thread reads 512 B of key, rotates its
+// (`D = 128`, `H = 4`, `TILE_R = 4`) a thread reads 136 B of key, rotates its
 // 64 rotary channels, and does 2,048 FMAs against it.
 //
 // The rotary pairs are NeoX half-split within the rotary width: pair `i` is
-// channels `(i, i + pairs)`, which in `float4` groups is group `c = i/4` with
-// its partner `c + R`, `R = pairs/4`. So the channel walk is two loops — the
-// `R` rotary groups with their partners, then the pass-through groups `[2R, D/4)`
-// unchanged.
+// channels `(i, i + pairs)`, which in Q8_0 blocks is block `b = i/32` with its
+// partner `b + pairs/32`. So the channel walk is two loops — the rotary blocks
+// with their partners, then the pass-through blocks unchanged.
 //
 // Candidates on the x axis and query rows on the y: at decode the row count is
 // the number of sessions that selected this step — single digits — so tiling
@@ -58,6 +64,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include "../qsa_key_q8.cuh"
 #include "../rope/rope_table.cuh"
 
 #define QSA_PAGED_THREADS 256
@@ -70,8 +77,8 @@
 /// occupancy set by registers rather than by shared memory.
 #define QSA_PAGED_TILE_R 4
 
-/// i64 words per page descriptor: `{keys, cstride, rstride, delta}`.
-#define QSA_PAGED_PAGE_WORDS 4
+/// i64 words per page descriptor: `{codes, scales, cstride, rstride, delta}`.
+#define QSA_PAGED_PAGE_WORDS 5
 
 /// Masked-column score. Bit-identical to `indexer_score_reduce`'s padding.
 #define QSA_PAGED_MASK (-1e30f)
@@ -91,10 +98,11 @@ __device__ __forceinline__ int qsa_page_of(
     return lo;
 }
 
-/// Where candidate `g` lives: its first `float4`, its channel-group stride, and
-/// its position.
+/// Where candidate `g` lives: its first code group, the bytes between its
+/// groups, its scale row, and its position.
 struct QsaCand {
-    const float4* kb;
+    const signed char* kb;
+    const unsigned short* ks;
     long long cstride;
     int pos;
     int page;
@@ -103,21 +111,30 @@ struct QsaCand {
 __device__ __forceinline__ QsaCand qsa_resolve(
     const long long* __restrict__ pages,
     const unsigned int* __restrict__ page_first,
-    int P, int g, int ratio)
+    int P, int g, int ratio, int nb)
 {
     const int p = qsa_page_of(page_first, P, (unsigned int)g);
     const long long* pd = pages + (long long)p * QSA_PAGED_PAGE_WORDS;
-    const float4* base = reinterpret_cast<const float4*>((uintptr_t)__ldg(pd));
-    const long long cstride = __ldg(pd + 1);
-    const long long rstride = __ldg(pd + 2);
-    const long long delta = __ldg(pd + 3);
+    const signed char* base = reinterpret_cast<const signed char*>((uintptr_t)__ldg(pd));
+    const unsigned short* scales =
+        reinterpret_cast<const unsigned short*>((uintptr_t)__ldg(pd + 1));
+    const long long cstride = __ldg(pd + 2);
+    const long long rstride = __ldg(pd + 3);
+    const long long delta = __ldg(pd + 4);
     const int local = g - (int)__ldg(page_first + p);
     QsaCand out;
     out.kb = base + (long long)local * rstride;
+    out.ks = scales + (long long)local * nb;
     out.cstride = cstride;
     out.pos = (int)(delta + (long long)g * ratio);
     out.page = p;
     return out;
+}
+
+/// Word `s` of a sixteen-code group.
+__device__ __forceinline__ int qsa_group_word(const int4& v, int s)
+{
+    return s == 0 ? v.x : s == 1 ? v.y : s == 2 ? v.z : v.w;
 }
 
 /// `(sin, cos)` of `w + l`, from `(sin, cos)` of `w` and of `l`.
@@ -205,7 +222,8 @@ __global__ __launch_bounds__(QSA_PAGED_THREADS, QSA_PAGED_MIN_BLOCKS) void qsa_s
     for (int i = threadIdx.x; i < pairs * 32; i += QSA_PAGED_THREADS) step_s[i] = __ldg(steps + i);
     __syncthreads();
 
-    const int D4 = D >> 2;
+    const int NB = D >> 5;                            // Q8_0 blocks per key
+    const int RB = pairs >> 5;                        // rotary blocks per half
     const int R = pairs >> 2;                         // rotary float4 groups
     const int span = QSA_PAGED_THREADS * CPT;
     const int lane = threadIdx.x & 31;
@@ -224,7 +242,8 @@ __global__ __launch_bounds__(QSA_PAGED_THREADS, QSA_PAGED_MIN_BLOCKS) void qsa_s
         // end points at the last candidate's key instead of at null: the
         // epilogue drops its result, and a null test inside the channel loop
         // would put a branch between the loads and re-serialise them.
-        const float4* kb[CPT];
+        const signed char* kb[CPT];
+        const unsigned short* ks[CPT];
         long long cs[CPT];
         int pj[CPT];
         int gj[CPT];
@@ -236,8 +255,10 @@ __global__ __launch_bounds__(QSA_PAGED_THREADS, QSA_PAGED_MIN_BLOCKS) void qsa_s
         for (int j = 0; j < CPT; ++j) {
             const int g = g0 + j * QSA_PAGED_THREADS;
             gj[j] = g;
-            const QsaCand cd = qsa_resolve(pages, page_first, P, g < n_cand ? g : n_cand - 1, ratio);
+            const QsaCand cd =
+                qsa_resolve(pages, page_first, P, g < n_cand ? g : n_cand - 1, ratio, NB);
             kb[j] = cd.kb;
+            ks[j] = cd.ks;
             cs[j] = cd.cstride;
             pj[j] = cd.pos;
             // Lanes on one page are a run, and `W` is the position of the
@@ -275,53 +296,78 @@ __global__ __launch_bounds__(QSA_PAGED_THREADS, QSA_PAGED_MIN_BLOCKS) void qsa_s
                 #pragma unroll
                 for (int j = 0; j < CPT; ++j) acc[r][hh][j] = 0.f;
 
-        // ---- rotary groups: each with its partner, rotated on load ----------
-        for (int c = 0; c < R; ++c) {
-            float4 kl[CPT], kh[CPT];
+        // ---- rotary blocks: each with its partner, rotated on load ----------
+        //
+        // A block is two groups of sixteen codes and one scale. The group is
+        // loaded once and held as four words; each word becomes a `float4` by
+        // the block's scale, is rotated with its partner's, and scored.
+        for (int b = 0; b < RB; ++b) {
+            float sl[CPT], sh[CPT];
             #pragma unroll
             for (int j = 0; j < CPT; ++j) {
-                kl[j] = __ldg(kb[j] + (long long)c * cs[j]);
-                kh[j] = __ldg(kb[j] + (long long)(c + R) * cs[j]);
-                const int i0 = c << 2;
-                float2 sc[4];
-                if (run[j] >= 0) {
-                    const float2* wt =
-                        warp_s + ((warp * CPT + j) * QSA_RUNS + (run[j] >> 5)) * pairs + i0;
-                    const int l = run[j] & 31;
-                    #pragma unroll
-                    for (int e = 0; e < 4; ++e)
-                        sc[e] = qsa_compose(wt[e], step_s[(i0 + e) * 32 + l]);
-                } else {
-                    #pragma unroll
-                    for (int e = 0; e < 4; ++e)
-                        sc[e] = rope_f_lookup(tab, pairs, pj[j], i0 + e);
-                }
-                rope_f_rotate(kl[j].x, kh[j].x, sc[0]);
-                rope_f_rotate(kl[j].y, kh[j].y, sc[1]);
-                rope_f_rotate(kl[j].z, kh[j].z, sc[2]);
-                rope_f_rotate(kl[j].w, kh[j].w, sc[3]);
+                sl[j] = qsa_q8_scale(__ldg(ks[j] + b));
+                sh[j] = qsa_q8_scale(__ldg(ks[j] + b + RB));
             }
             #pragma unroll
-            for (int r = 0; r < TILE_R; ++r) {
-                if (r >= nr) break;
+            for (int gi = 0; gi < 2; ++gi) {
+                const int grp = 2 * b + gi;
+                int4 cl[CPT], ch[CPT];
                 #pragma unroll
-                for (int hh = 0; hh < H; ++hh) {
-                    const float4 ql =
-                        reinterpret_cast<const float4*>(sq + (r * H + hh) * D)[c];
-                    const float4 qh =
-                        reinterpret_cast<const float4*>(sq + (r * H + hh) * D)[c + R];
+                for (int j = 0; j < CPT; ++j) {
+                    cl[j] = __ldg(reinterpret_cast<const int4*>(kb[j] + (long long)grp * cs[j]));
+                    ch[j] = __ldg(reinterpret_cast<const int4*>(
+                        kb[j] + (long long)(grp + 2 * RB) * cs[j]));
+                }
+                #pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    const int c = (grp << 2) + s;     // float4 group of the key
+                    const int i0 = c << 2;
+                    float4 kl[CPT], kh[CPT];
                     #pragma unroll
                     for (int j = 0; j < CPT; ++j) {
-                        acc[r][hh][j] += ql.x * kl[j].x + ql.y * kl[j].y
-                                       + ql.z * kl[j].z + ql.w * kl[j].w
-                                       + qh.x * kh[j].x + qh.y * kh[j].y
-                                       + qh.z * kh[j].z + qh.w * kh[j].w;
+                        kl[j] = qsa_q8_word(qsa_group_word(cl[j], s), sl[j]);
+                        kh[j] = qsa_q8_word(qsa_group_word(ch[j], s), sh[j]);
+                        float2 sc[4];
+                        if (run[j] >= 0) {
+                            const float2* wt = warp_s
+                                + ((warp * CPT + j) * QSA_RUNS + (run[j] >> 5)) * pairs + i0;
+                            const int l = run[j] & 31;
+                            #pragma unroll
+                            for (int e = 0; e < 4; ++e)
+                                sc[e] = qsa_compose(wt[e], step_s[(i0 + e) * 32 + l]);
+                        } else {
+                            #pragma unroll
+                            for (int e = 0; e < 4; ++e)
+                                sc[e] = rope_f_lookup(tab, pairs, pj[j], i0 + e);
+                        }
+                        rope_f_rotate(kl[j].x, kh[j].x, sc[0]);
+                        rope_f_rotate(kl[j].y, kh[j].y, sc[1]);
+                        rope_f_rotate(kl[j].z, kh[j].z, sc[2]);
+                        rope_f_rotate(kl[j].w, kh[j].w, sc[3]);
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < TILE_R; ++r) {
+                        if (r >= nr) break;
+                        #pragma unroll
+                        for (int hh = 0; hh < H; ++hh) {
+                            const float4 ql =
+                                reinterpret_cast<const float4*>(sq + (r * H + hh) * D)[c];
+                            const float4 qh =
+                                reinterpret_cast<const float4*>(sq + (r * H + hh) * D)[c + R];
+                            #pragma unroll
+                            for (int j = 0; j < CPT; ++j) {
+                                acc[r][hh][j] += ql.x * kl[j].x + ql.y * kl[j].y
+                                               + ql.z * kl[j].z + ql.w * kl[j].w
+                                               + qh.x * kh[j].x + qh.y * kh[j].y
+                                               + qh.z * kh[j].z + qh.w * kh[j].w;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // ---- pass-through groups: read as stored ---------------------------
+        // ---- pass-through blocks: dequantized, not rotated -----------------
         //
         // **Summed into a temporary, deliberately.** This compiles to FMUL +
         // 3×FFMA + FADD, five instructions for four multiply-adds; accumulating
@@ -329,23 +375,39 @@ __global__ __launch_bounds__(QSA_PAGED_THREADS, QSA_PAGED_MIN_BLOCKS) void qsa_s
         // 0.101 at 128K and 64 rows). The temporary is independent of `acc`, so
         // the accumulator's critical path is one FADD per channel group rather
         // than four FMAs.
-        for (int c = 2 * R; c < D4; ++c) {
-            float4 kv[CPT];
+        for (int b = 2 * RB; b < NB; ++b) {
+            float sv[CPT];
             #pragma unroll
-            for (int j = 0; j < CPT; ++j) {
-                kv[j] = __ldg(kb[j] + (long long)c * cs[j]);
-            }
+            for (int j = 0; j < CPT; ++j) sv[j] = qsa_q8_scale(__ldg(ks[j] + b));
             #pragma unroll
-            for (int r = 0; r < TILE_R; ++r) {
-                if (r >= nr) break;
+            for (int gi = 0; gi < 2; ++gi) {
+                const int grp = 2 * b + gi;
+                int4 cv[CPT];
                 #pragma unroll
-                for (int hh = 0; hh < H; ++hh) {
-                    const float4 qv =
-                        reinterpret_cast<const float4*>(sq + (r * H + hh) * D)[c];
+                for (int j = 0; j < CPT; ++j) {
+                    cv[j] = __ldg(reinterpret_cast<const int4*>(kb[j] + (long long)grp * cs[j]));
+                }
+                #pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    const int c = (grp << 2) + s;
+                    float4 kv[CPT];
                     #pragma unroll
                     for (int j = 0; j < CPT; ++j) {
-                        acc[r][hh][j] += qv.x * kv[j].x + qv.y * kv[j].y
-                                       + qv.z * kv[j].z + qv.w * kv[j].w;
+                        kv[j] = qsa_q8_word(qsa_group_word(cv[j], s), sv[j]);
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < TILE_R; ++r) {
+                        if (r >= nr) break;
+                        #pragma unroll
+                        for (int hh = 0; hh < H; ++hh) {
+                            const float4 qv =
+                                reinterpret_cast<const float4*>(sq + (r * H + hh) * D)[c];
+                            #pragma unroll
+                            for (int j = 0; j < CPT; ++j) {
+                                acc[r][hh][j] += qv.x * kv[j].x + qv.y * kv[j].y
+                                               + qv.z * kv[j].z + qv.w * kv[j].w;
+                            }
+                        }
                     }
                 }
             }
@@ -370,8 +432,8 @@ __global__ __launch_bounds__(QSA_PAGED_THREADS, QSA_PAGED_MIN_BLOCKS) void qsa_s
     }
 }
 
-/// Generic arm: runtime `H`, and `D` or the rotary width not a multiple of the
-/// `float4` group. Scalar loads, one accumulator per row. Correctness for the
+/// Generic arm: runtime `H`, and `D` or the rotary width not a whole number of
+/// Q8_0 blocks. Scalar loads, one accumulator per row. Correctness for the
 /// oracle geometries the tests run (`head_dim` 16, odd head counts); the
 /// templated kernel above is what production takes.
 __global__ __launch_bounds__(QSA_PAGED_THREADS) void qsa_score_paged_generic_kernel(
@@ -386,10 +448,13 @@ __global__ __launch_bounds__(QSA_PAGED_THREADS) void qsa_score_paged_generic_ker
 {
     for (int g = blockIdx.x * QSA_PAGED_THREADS + threadIdx.x; g < n_cand;
          g += gridDim.x * QSA_PAGED_THREADS) {
-        const QsaCand cd = qsa_resolve(pages, page_first, P, g, ratio);
-        const float* kf = reinterpret_cast<const float*>(cd.kb);
-        // Channel `c` of this key, un-rotated: group `c/4` at `cstride` apart.
-        auto raw = [&](int c) { return kf[(long long)(c >> 2) * cd.cstride * 4 + (c & 3)]; };
+        const QsaCand cd = qsa_resolve(pages, page_first, P, g, ratio, qsa_q8_blocks(D));
+        // Channel `c` of this key, un-rotated: its code in group `c/16`, the
+        // groups `cstride` bytes apart, by its block's scale.
+        auto raw = [&](int c) {
+            return (float)cd.kb[(long long)(c >> 4) * cd.cstride + (c & 15)]
+                * qsa_q8_scale(cd.ks[c / QSA_Q8_BLOCK]);
+        };
         for (int r = 0; r < rows; ++r) {
             const unsigned int valid = __ldg(cnt + r);
             if ((unsigned int)g >= valid) {
@@ -517,9 +582,9 @@ extern "C" void run_qsa_score_paged(
     const int n_grid = qsa_paged_grid_cands(n_cand);
     const float2* tab2 = reinterpret_cast<const float2*>(tab);
     const float2* steps2 = reinterpret_cast<const float2*>(steps);
-    // The templated arms need whole `float4` groups on both sides of the
-    // rotary split; anything else takes the generic arm.
-    if ((D & 3) == 0 && (pairs & 3) == 0 && 2 * pairs <= D) {
+    // The templated arms need whole Q8_0 blocks on both sides of the rotary
+    // split; anything else takes the generic arm.
+    if ((D & 31) == 0 && (pairs & 31) == 0 && 2 * pairs <= D) {
         const float2* tab = tab2;
         switch (H) {
             QSA_PAGED_LAUNCH(1)

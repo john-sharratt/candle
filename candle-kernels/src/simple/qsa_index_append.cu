@@ -48,11 +48,12 @@
 // Table layout: array-of-structs, QSA_APPEND_JOB_WORDS i64 per job, read once
 // per block and broadcast to its threads.
 //
-//     [0] dst    float*        this block key's row in the sequence's cache
+//     [0] codes  int8*         this block key's code row in the sequence's cache
 //     [1] src0   const float*  first segment's base row (0 when the block does
 //                              not straddle)
 //     [2] n0     rows taken from segment 0; segment 1 supplies `ratio − n0`
 //     [3] src1   const float*  second segment's base row
+//     [4] scales uint16*       this block key's scale row
 //
 // ---- Shape ------------------------------------------------------------------
 //
@@ -85,13 +86,26 @@
 // `stored_rows_are_the_pooled_normed_unrotated_key` (`indexer.rs`) gates it
 // against host arithmetic.
 
+//
+// ---- The stored key ---------------------------------------------------------
+//
+// A key is stored as Q8_0 (`../qsa_key_q8.cuh`): quantized in registers the
+// moment it is normed, so no float key is ever written. With `d` a multiple of
+// 32 — the released geometry — each of the block's warps IS one Q8_0 block: its
+// largest magnitude is five shuffle rounds, lane 0 stores the scale and every
+// lane its code. Any other width takes each Q8_0 block's maximum through the
+// shared buffer the norm already holds.
+
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-#define QSA_APPEND_JOB_WORDS 4
+#include "../qsa_key_q8.cuh"
+
+/// i64 words per append job: `{codes, src0, n0, src1, scales}`.
+#define QSA_APPEND_JOB_WORDS 5
 #define QSA_APPEND_CARRY_WORDS 3
-/// i64 words per flush job: `{dst, src, count}`.
-#define QSA_FLUSH_JOB_WORDS 3
+/// i64 words per flush job: `{codes, src, count, scales}`.
+#define QSA_FLUSH_JOB_WORDS 4
 
 namespace qsa_index_append {
 
@@ -123,6 +137,34 @@ __device__ __forceinline__ float block_sum(float v, float* scratch) {
     return total;
 }
 
+// Store this thread's channel `y` of the block's key as Q8_0: its code into
+// `codes[c]`, and — from the first lane of each Q8_0 block — the block's scale
+// into `scales`. `scratch` is the block's `d` shared floats, free once the norm
+// has read its sum.
+__device__ __forceinline__ void store_key(
+    float y, signed char* codes, unsigned short* scales, float* scratch, int d)
+{
+    const int c = threadIdx.x;
+    float amax = fabsf(y);
+    if ((d & (QSA_Q8_BLOCK - 1)) == 0) {
+        // Every warp is full and is one Q8_0 block.
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+        }
+    } else {
+        scratch[c] = amax;
+        __syncthreads();
+        const int lo = c & ~(QSA_Q8_BLOCK - 1);
+        const int hi = min(d, lo + QSA_Q8_BLOCK);
+        amax = 0.0f;
+        for (int i = lo; i < hi; ++i) amax = fmaxf(amax, scratch[i]);
+    }
+    const QsaQ8Quant q = qsa_q8_quant(amax);
+    codes[c] = qsa_q8_code(y, q.id);
+    if ((c & (QSA_Q8_BLOCK - 1)) == 0) scales[c / QSA_Q8_BLOCK] = q.d;
+}
+
 // One completing block key per CUDA block.
 __global__ __launch_bounds__(MAX_D) void append_kernel(
     const long long* __restrict__ jobs,
@@ -137,10 +179,11 @@ __global__ __launch_bounds__(MAX_D) void append_kernel(
     const int c = threadIdx.x;
 
     const long long* job = jobs + (long long)j * QSA_APPEND_JOB_WORDS;
-    float* dst = (float*)(uintptr_t)job[0];
+    signed char* codes = (signed char*)(uintptr_t)job[0];
     const float* src0 = (const float*)(uintptr_t)job[1];
     const int n0 = (int)job[2];
     const float* src1 = (const float*)(uintptr_t)job[3];
+    unsigned short* scales = (unsigned short*)(uintptr_t)job[4];
 
     // ---- pool: the mean of the block's `ratio` raw rows -----------------
     float acc = 0.0f;
@@ -161,7 +204,7 @@ __global__ __launch_bounds__(MAX_D) void append_kernel(
     const float ss = block_sum(x * x, sv);
     // `mean_keepdim` then `+ eps` then `sqrt`, then a divide — the eager form.
     x = x / sqrtf(ss / (float)d + (float)eps);
-    dst[c] = x * k_norm[c];
+    store_key(x * k_norm[c], codes, scales, sv, d);
 }
 
 // ============================================================================
@@ -185,7 +228,7 @@ __global__ __launch_bounds__(MAX_D) void append_kernel(
 // table carries each page's `last_cells`, and the candidate prefix is derived
 // from the widths rather than assumed uniform).
 //
-// One job per flushed layer: `{dst, src, count}`.
+// One job per flushed layer: `{codes, src, count, scales}`.
 __global__ __launch_bounds__(MAX_D) void flush_kernel(
     const long long* __restrict__ jobs,
     const float* __restrict__ k_norm,
@@ -198,9 +241,10 @@ __global__ __launch_bounds__(MAX_D) void flush_kernel(
     const int c = threadIdx.x;
 
     const long long* job = jobs + (long long)j * QSA_FLUSH_JOB_WORDS;
-    float* dst = (float*)(uintptr_t)job[0];
+    signed char* codes = (signed char*)(uintptr_t)job[0];
     const float* src = (const float*)(uintptr_t)job[1];
     const int count = (int)job[2];
+    unsigned short* scales = (unsigned short*)(uintptr_t)job[3];
     if (count <= 0) return;
 
     // The mean over the rows that are ACTUALLY there — the one line that
@@ -212,7 +256,7 @@ __global__ __launch_bounds__(MAX_D) void flush_kernel(
     extern __shared__ float sv[];
     const float ss = block_sum(x * x, sv);
     x = x / sqrtf(ss / (float)d + (float)eps);
-    dst[c] = x * k_norm[c];
+    store_key(x * k_norm[c], codes, scales, sv, d);
 }
 
 // Carry the wave's trailing rows — the ones that do not complete a block — into

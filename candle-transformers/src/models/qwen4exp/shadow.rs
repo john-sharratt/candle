@@ -27,6 +27,7 @@ use candle_kernels::simple::qsa_shadow::{
 
 use super::index_keys::PAGE_BLOCKS;
 use super::indexer::u32_ptr;
+use super::key_q8::blocks;
 use super::resident_page::ResidentPage;
 use crate::models::held_tensor::held_empty;
 use crate::models::wave_buffers::upload_into;
@@ -108,13 +109,14 @@ impl ShadowRows {
         self.n_rows
     }
 
-    /// The rows' page descriptors as they stand — `{keys, cstride, rstride, 0}`
-    /// for every run of rows one chunk holds — and the exclusive prefix of rows
-    /// over them.
-    fn descriptors(&self) -> Result<(Vec<i64>, Vec<u32>)> {
+    /// The rows' page descriptors as they stand — `{codes, scales, cstride,
+    /// rstride, 0}` for every run of rows one chunk holds — and the exclusive
+    /// prefix of rows over them. `head_dim` is the keys' width.
+    fn descriptors(&self, head_dim: usize) -> Result<(Vec<i64>, Vec<u32>)> {
         let mut desc: Vec<i64> = Vec::new();
         let mut first: Vec<u32> = vec![0];
         let mut at = 0u32;
+        let scale_row = (blocks(head_dim) * 2) as u64;
         for s in &self.segments {
             for (c, chunk) in s.page.descriptors()?.iter().enumerate() {
                 let lo = c * PAGE_BLOCKS;
@@ -123,11 +125,12 @@ impl ShadowRows {
                 if a >= b {
                     continue;
                 }
-                // Row `a` of the page is row `a − lo` of the chunk: `row_stride`
-                // float4 groups per row.
-                let off = (a - lo) as u64 * chunk.row_stride as u64 * 16;
+                // Row `a` of the page is row `a − lo` of the chunk:
+                // `row_stride` bytes of codes and one scale row per row.
+                let skip = (a - lo) as u64;
                 let entry: [i64; SHADOW_PAGE_WORDS] = [
-                    (chunk.ptr + off) as i64,
+                    (chunk.ptr + skip * chunk.row_stride as u64) as i64,
+                    (chunk.scales + skip * scale_row) as i64,
                     chunk.group_stride,
                     chunk.row_stride,
                     0,
@@ -164,7 +167,7 @@ pub fn launch(jobs: &[ShadowJob<'_>], geom: &ShadowGeometry, device: &Device) ->
     }
     let tables: Vec<(Vec<i64>, Vec<u32>)> = jobs
         .iter()
-        .map(|j| j.rows.descriptors())
+        .map(|j| j.rows.descriptors(geom.head_dim))
         .collect::<Result<_>>()?;
     // The spans, then every job's descriptors, then every job's prefixes — the
     // descriptors on even words, so the i64s are aligned.
@@ -283,6 +286,7 @@ pub fn reference(
 mod tests {
     use super::*;
     use crate::models::gpu_test_lock::gpu_serial;
+    use crate::models::qwen4exp::key_q8::Q8Keys;
     use crate::models::rope_schedule::{plain_inv_freq, FactoredRope};
     use candle_kernels::simple::qsa_hits::KEEP_SLOTS;
     use candle_kernels::simple::qsa_topk::{CUT_WORDS, NO_CUT};
@@ -324,9 +328,13 @@ mod tests {
         };
         let d = geom.head_dim;
         let rope = FactoredRope::new(&plain_inv_freq(2 * geom.pairs, 1e4), &device)?;
-        let page_a: Vec<f32> = lcg(23 * d, 1);
-        let page_b: Vec<f32> = lcg(30 * d, 2);
-        let pages = ResidentPage::place_host(&[(&page_a, 4), (&page_b, 2)], d, &device)?;
+        // The scan reads the stored keys, so the definition scores what they
+        // dequantize to.
+        let keys_a = Q8Keys::quantize(&lcg(23 * d, 1), d);
+        let keys_b = Q8Keys::quantize(&lcg(30 * d, 2), d);
+        let pages = ResidentPage::place_host(&[(&keys_a, 4), (&keys_b, 2)], d, &device)?;
+        let page_a = keys_a.dequantize();
+        let page_b = keys_b.dequantize();
         let seg = |p: usize, rows: Range<usize>, counter: u32| ShadowSegment {
             page: Arc::clone(&pages[p]),
             rows,

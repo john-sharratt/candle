@@ -13,8 +13,8 @@
 //! ```
 //!
 //!   q           device f32[rows * H * D], contiguous, rotated, `[rows*H, D]`
-//!   pages       device i64[P * PAGE_WORDS] — `{keys, cstride, rstride, delta}`,
-//!               strides in `float4`s
+//!   pages       device i64[P * PAGE_WORDS] — `{codes, scales, cstride, rstride,
+//!               delta}`: Q8_0 keys, the code strides in bytes
 //!   page_first  device u32[P+1] — exclusive prefix sum of page row counts
 //!   cnt         device u32[rows] — valid candidate prefix per query row
 //!   tab         the factored RoPE table, f32[(2048 + 1024) · pairs · 2]
@@ -28,7 +28,7 @@
 use std::ffi::c_void;
 
 /// i64 words per page descriptor. Mirrors `QSA_PAGED_PAGE_WORDS`.
-pub const PAGE_WORDS: usize = 4;
+pub const PAGE_WORDS: usize = 5;
 
 extern "C" {
     #[allow(clippy::too_many_arguments)]

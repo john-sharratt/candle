@@ -31,12 +31,13 @@
 use candle::{Device, Result, Tensor};
 
 use super::indexer::IndexCache;
-#[cfg(feature = "cuda")]
-use super::place::{PlacePage, Placement, PLACE_TILE_R};
+use super::key_q8::{blocks, Q8Keys};
+use super::resident_page::ResidentPage;
 #[cfg(feature = "cuda")]
 use crate::models::operand_guard::expect_dense;
 #[cfg(feature = "cuda")]
 use crate::models::rope_schedule::FactoredRope;
+use std::sync::Arc;
 
 /// One page of a reconstructed index — a single turn's sealed rows.
 ///
@@ -46,7 +47,9 @@ use crate::models::rope_schedule::FactoredRope;
 /// and the scorer rotates each row at it as it reads the row.
 #[derive(Debug, Clone)]
 pub struct IndexPage {
-    /// `[rows, head_dim]` F32, the turn's pooled, normed block keys.
+    /// `[rows, head_dim]` F32, the turn's pooled, normed block keys — the
+    /// values a window is built from. The window stores them as the index
+    /// does, Q8_0, and both its kernel and its oracle score what that holds.
     pub keys: Tensor,
     /// Tokens the page's LAST row covers, in `1..=ratio`. Every earlier row
     /// covers `ratio`. This is the whole of the ragged case: a turn of `T`
@@ -92,19 +95,16 @@ pub struct PagedIndex {
     end: usize,
     ratio: usize,
     device: Device,
-    /// Device copies of the descriptor table, built once per window.
+    /// Device copies of the descriptor table, built once per window: one entry
+    /// per chunk of every page, and the exclusive prefix of rows over them.
     pages_tbl: Option<Tensor>,
     first_tbl: Option<Tensor>,
-    /// Every page written in the layout the scorer reads: `[head_dim/4, rows,
-    /// 4]` — channel-blocked, so a warp scoring `n` consecutive candidates reads
+    n_chunks: usize,
+    /// Every page resident as the index holds one: Q8_0, its codes written in
+    /// the layout the scorer reads, `[head_dim/16, rows, 16]` a chunk —
+    /// channel-blocked, so a warp scoring `n` consecutive candidates reads
     /// `n × 16` contiguous bytes per step.
-    ///
-    /// **The blocking is the difference between 4 memory transactions and 32.**
-    /// The record's layout is `[rows, head_dim]`, which is what a row means and
-    /// what [`IndexCache::from_rows`] consumes, and in it consecutive
-    /// candidates' keys are `head_dim × 4` bytes apart — so the warp's `float4`
-    /// load scatters across 32 cache lines and the L1 hit rate measured **2%**.
-    placed: Option<Placement>,
+    placed: Vec<Arc<ResidentPage>>,
 }
 
 impl PagedIndex {
@@ -178,7 +178,8 @@ impl PagedIndex {
             device: device.clone(),
             pages_tbl: None,
             first_tbl: None,
-            placed: None,
+            n_chunks: 0,
+            placed: Vec::new(),
         })
     }
 
@@ -186,7 +187,7 @@ impl PagedIndex {
     /// which is what a sequence that has not been reconstructed looks like.
     pub fn from_live(cache: &IndexCache, ratio: usize, device: &Device) -> Result<Self> {
         let (n, d) = (cache.live_blocks(), cache.head_dim());
-        let rows = Tensor::from_vec(cache.live_rows_host()?, (n, d), device)?;
+        let rows = Tensor::from_vec(cache.live_rows_host()?.dequantize(), (n, d), device)?;
         let last_cells = if n == 0 { 1 } else { ratio };
         Self::new(vec![(IndexPage::new(rows, last_cells), 0)], ratio, device)
     }
@@ -247,35 +248,57 @@ impl PagedIndex {
         if self.pages_tbl.is_some() {
             return Ok(());
         }
-        let jobs: Vec<PlacePage<'_>> = self
-            .pages
-            .iter()
-            .map(|p| PlacePage { keys: &p.keys })
-            .collect();
         // Table building runs outside a forward; no phase is open.
-        let placement = Placement::plan(&jobs, None)?;
-        placement.run(PLACE_TILE_R)?;
+        let stored = self.stored_keys()?;
+        let host: Vec<(&Q8Keys, usize)> = stored
+            .iter()
+            .zip(&self.pages)
+            .map(|(k, p)| (k, p.last_cells))
+            .collect();
+        let head_dim = stored.first().map_or(0, |k| k.dim);
+        self.placed = ResidentPage::place_host(&host, head_dim, &self.device)?;
         let mut desc: Vec<i64> = Vec::with_capacity(self.pages.len().max(1) * PAGE_WORDS);
-        for (i, t) in placement.staged().iter().enumerate() {
-            let rows = self.page_first[i + 1] - self.page_first[i];
-            desc.push(super::indexer::tensor_ptr(t)? as i64);
-            // Channel-blocked: group `c` of row `j` at `c·rows + j` float4s.
-            desc.push(rows as i64);
-            desc.push(1);
-            desc.push(self.bases[i] as i64 - self.page_first[i] as i64 * self.ratio as i64);
+        let mut first: Vec<u32> = vec![0];
+        let mut end = 0u32;
+        for (i, page) in self.placed.iter().enumerate() {
+            // A page's rows are consecutive global rows, so every chunk of it
+            // shares the page's rotation offset.
+            let delta = self.bases[i] as i64 - self.page_first[i] as i64 * self.ratio as i64;
+            for chunk in page.descriptors()? {
+                desc.extend([
+                    chunk.ptr as i64,
+                    chunk.scales as i64,
+                    chunk.group_stride,
+                    chunk.row_stride,
+                    delta,
+                ]);
+                end += chunk.rows as u32;
+                first.push(end);
+            }
         }
-        self.placed = Some(placement);
+        self.n_chunks = first.len() - 1;
         if desc.is_empty() {
-            desc.extend([0, 0, 0, 0]);
+            desc.extend([0i64; PAGE_WORDS]);
         }
         let n = desc.len();
         self.pages_tbl = Some(Tensor::from_vec(desc, (n,), &self.device)?);
-        self.first_tbl = Some(Tensor::from_vec(
-            self.page_first.clone(),
-            (self.page_first.len(),),
-            &self.device,
-        )?);
+        let n_first = first.len();
+        self.first_tbl = Some(Tensor::from_vec(first, (n_first,), &self.device)?);
         Ok(())
+    }
+
+    /// Every page's keys as the index stores them.
+    fn stored_keys(&self) -> Result<Vec<Q8Keys>> {
+        self.pages
+            .iter()
+            .map(|p| {
+                let (_, d) = p.keys.dims2()?;
+                Ok(Q8Keys::quantize(
+                    &p.keys.flatten_all()?.to_vec1::<f32>()?,
+                    d,
+                ))
+            })
+            .collect()
     }
 
     /// Score `q` against this window, writing `[rows, total_rows()]` into `out`.
@@ -339,7 +362,7 @@ impl PagedIndex {
                 n_heads as i32,
                 head_dim as i32,
                 self.total_rows() as i32,
-                self.pages.len() as i32,
+                self.n_chunks as i32,
                 rope.pairs() as i32,
                 self.ratio as i32,
                 out_stride as i64,
@@ -350,7 +373,8 @@ impl PagedIndex {
         Ok(cand)
     }
 
-    /// The CPU oracle: the same expression, evaluated eagerly in f64.
+    /// The CPU oracle: the same expression, evaluated eagerly in f64, over the
+    /// values the stored Q8_0 keys hold.
     ///
     /// Deliberately the naive form — each key rotated at its own position from
     /// the f64 sine and cosine of the exact angle, then one dot product at a
@@ -373,9 +397,11 @@ impl PagedIndex {
         // Every key rotated at its own position: row `j` of a page at
         // `base + j·ratio`.
         let mut keys: Vec<f64> = Vec::with_capacity(n * head_dim);
-        for (p, &base) in self.pages.iter().zip(&self.bases) {
+        // The values the stored keys hold, which is what the kernel scores.
+        let stored = self.stored_keys()?;
+        for ((p, &base), q8) in self.pages.iter().zip(&self.bases).zip(&stored) {
             let rows = p.rows()?;
-            let kv = p.keys.flatten_all()?.to_vec1::<f32>()?;
+            let kv = q8.dequantize();
             for j in 0..rows {
                 let pos = (base + j * self.ratio) as f64;
                 let row = &kv[j * head_dim..(j + 1) * head_dim];
@@ -479,10 +505,9 @@ pub fn tail_span_pages(page_widths: &[usize], tail_tokens: usize, tokens: usize)
 /// [`ResidentPage`](super::resident_page::ResidentPage), placed from these rows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SealedIndex {
-    /// `[rows, dim]` row-major F32 — the completed, pooled, normed, un-rotated
-    /// block keys.
-    pub rows: Vec<f32>,
-    pub dim: usize,
+    /// The completed, pooled, normed, un-rotated block keys, as the index
+    /// stores them: Q8_0, both planes row-major.
+    pub keys: Q8Keys,
     /// Tokens the last row covers, in `1..=ratio`.
     pub last_cells: usize,
     /// `[n_open, dim]` row-major F32 — the raw, un-pooled rows of the trailing
@@ -491,14 +516,19 @@ pub struct SealedIndex {
 }
 
 impl SealedIndex {
+    /// The keys' width.
+    pub fn dim(&self) -> usize {
+        self.keys.dim
+    }
+
     /// Completed rows.
     pub fn n_rows(&self) -> usize {
-        self.rows.len().checked_div(self.dim).unwrap_or(0)
+        self.keys.n_rows()
     }
 
     /// Carried open rows.
     pub fn n_open(&self) -> usize {
-        self.open.len().checked_div(self.dim).unwrap_or(0)
+        self.open.len().checked_div(self.keys.dim).unwrap_or(0)
     }
 
     /// Tokens the completed rows cover: full rows at `ratio`, plus the short last
@@ -513,11 +543,14 @@ impl SealedIndex {
 
 /// Wire version of the carried-state container.
 ///
-/// Version 3: each layer's completed rows are **un-rotated**, as the index
-/// stores them, beside its open block. A record of an earlier version held rows
-/// rotated relative to its page's start, which this build cannot read, so it is
-/// refused rather than scored in the wrong frame.
-const AUX_VERSION: u32 = 3;
+/// Version 4: each layer's completed rows are un-rotated **Q8_0** keys, as the
+/// index stores them, beside its `F32` open block. A version-3 record held the
+/// keys as `F32`; this build does not read it, and says what does
+/// ([`F32_INDEX_VERSION`]).
+pub const AUX_VERSION: u32 = 4;
+/// The version whose completed rows were `F32` — what
+/// `substrate_inspect migrate-index-q8` rewrites as [`AUX_VERSION`].
+pub const F32_INDEX_VERSION: u32 = 3;
 /// Everything this architecture carries that is not a DeltaNet layer stack,
 /// as one opaque blob for the turn record's auxiliary slot.
 ///
@@ -555,6 +588,12 @@ pub fn decode_aux(blob: &[u8]) -> Result<(Vec<u8>, Vec<SealedIndex>)> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
     let version = u32_at(0)?;
+    if version == F32_INDEX_VERSION {
+        candle::bail!(
+            "aux blob: version {version} was written before the index was Q8_0 — run \
+             `substrate_inspect migrate-index-q8` on this store"
+        );
+    }
     if version != AUX_VERSION {
         candle::bail!("aux blob: version {version} unknown (this build reads {AUX_VERSION})");
     }
@@ -579,49 +618,75 @@ pub fn decode_aux(blob: &[u8]) -> Result<(Vec<u8>, Vec<SealedIndex>)> {
     Ok((ple, pages))
 }
 
-/// A layer's completed rows and its open block, as raw little-endian F32.
+/// A layer's completed rows and its open block: `rows, dim, last_cells, n_open`
+/// as little-endian `u32`, then the codes `[rows, dim]`, the scales
+/// `[rows, blocks(dim)]` as little-endian `f16` bits, and the open block as
+/// little-endian `F32`.
 pub fn encode_page(s: &SealedIndex) -> Result<Vec<u8>> {
-    if s.dim == 0 && !(s.rows.is_empty() && s.open.is_empty()) {
+    let dim = s.keys.dim;
+    if dim == 0 && !(s.keys.is_empty() && s.open.is_empty()) {
         candle::bail!("index page: rows with no width");
     }
-    if s.dim > 0 && (!s.rows.len().is_multiple_of(s.dim) || !s.open.len().is_multiple_of(s.dim)) {
+    let nb = blocks(dim);
+    if dim > 0
+        && (!s.keys.codes.len().is_multiple_of(dim)
+            || s.keys.scales.len() != s.n_rows() * nb
+            || !s.open.len().is_multiple_of(dim))
+    {
         candle::bail!(
-            "index page: {} row values and {} open values against a {}-wide page",
-            s.rows.len(),
+            "index page: {} codes, {} scales and {} open values against a {dim}-wide page",
+            s.keys.codes.len(),
+            s.keys.scales.len(),
             s.open.len(),
-            s.dim
         );
     }
-    let mut out = Vec::with_capacity(16 + (s.rows.len() + s.open.len()) * 4);
+    let mut out =
+        Vec::with_capacity(16 + s.keys.codes.len() + s.keys.scales.len() * 2 + s.open.len() * 4);
     out.extend_from_slice(&(s.n_rows() as u32).to_le_bytes());
-    out.extend_from_slice(&(s.dim as u32).to_le_bytes());
+    out.extend_from_slice(&(dim as u32).to_le_bytes());
     out.extend_from_slice(&(s.last_cells as u32).to_le_bytes());
     out.extend_from_slice(&(s.n_open() as u32).to_le_bytes());
-    for v in s.rows.iter().chain(s.open.iter()) {
+    out.extend_from_slice(&s.keys.codes);
+    for v in &s.keys.scales {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in &s.open {
         out.extend_from_slice(&v.to_le_bytes());
     }
     Ok(out)
 }
 
-/// Read back what [`encode_page`] wrote.
-///
-/// The values are converted in one pass over 4-byte chunks. A page is thousands
-/// of rows, and the bounds-checked read per value this replaced was the larger
-/// part of every injection's host time.
-pub fn decode_page(blob: &[u8]) -> Result<SealedIndex> {
-    let u32_at = |o: usize| -> Result<u32> {
+/// The four header words of a layer's section: `(rows, dim, last_cells,
+/// n_open)`.
+fn page_header(blob: &[u8]) -> Result<(usize, usize, usize, usize)> {
+    let u32_at = |o: usize| -> Result<usize> {
         let b = blob
             .get(o..o + 4)
             .ok_or_else(|| candle::Error::Msg("index page: blob truncated".into()))?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
-    let rows = u32_at(0)? as usize;
-    let dim = u32_at(4)? as usize;
-    let last_cells = u32_at(8)? as usize;
-    let n_open = u32_at(12)? as usize;
-    let n = rows * dim;
-    let n_o = n_open * dim;
-    let want = 16 + (n + n_o) * 4;
+    Ok((u32_at(0)?, u32_at(4)?, u32_at(8)?, u32_at(12)?))
+}
+
+/// Little-endian `F32` values, converted in one pass over 4-byte chunks.
+fn floats(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// Read back what [`encode_page`] wrote.
+///
+/// The codes are taken as they stand and the rest converted in one pass. A
+/// page is thousands of rows, and a bounds-checked read per value was once the
+/// larger part of every injection's host time.
+pub fn decode_page(blob: &[u8]) -> Result<SealedIndex> {
+    let (rows, dim, last_cells, n_open) = page_header(blob)?;
+    let codes = rows * dim;
+    let scales = rows * blocks(dim) * 2;
+    let open = n_open * dim * 4;
+    let want = 16 + codes + scales + open;
     if blob.len() < want {
         candle::bail!(
             "index page: blob is {} bytes but [{rows}, {dim}] with {n_open} open rows needs \
@@ -629,18 +694,89 @@ pub fn decode_page(blob: &[u8]) -> Result<SealedIndex> {
             blob.len()
         );
     }
-    let floats = |bytes: &[u8]| -> Vec<f32> {
-        bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect()
-    };
+    let at = 16 + codes;
     Ok(SealedIndex {
-        rows: floats(&blob[16..16 + n * 4]),
-        dim,
+        keys: Q8Keys {
+            codes: blob[16..at].to_vec(),
+            scales: blob[at..at + scales]
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect(),
+            dim,
+        },
         last_cells,
-        open: floats(&blob[16 + n * 4..want]),
+        open: floats(&blob[at + scales..want]),
     })
+}
+
+/// A layer's section as [`F32_INDEX_VERSION`] wrote it — its completed rows
+/// `F32` — read and quantized: what a migration turns into [`encode_page`]'s
+/// bytes.
+fn decode_f32_page(blob: &[u8]) -> Result<SealedIndex> {
+    let (rows, dim, last_cells, n_open) = page_header(blob)?;
+    let n = rows * dim * 4;
+    let want = 16 + n + n_open * dim * 4;
+    if blob.len() < want {
+        candle::bail!(
+            "index page: an F32 blob is {} bytes but [{rows}, {dim}] with {n_open} open rows \
+             needs {want}",
+            blob.len()
+        );
+    }
+    Ok(SealedIndex {
+        keys: Q8Keys::quantize(&floats(&blob[16..16 + n]), dim),
+        last_cells,
+        open: floats(&blob[16 + n..want]),
+    })
+}
+
+/// What [`migrate_aux`] found a container to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuxMigration {
+    /// Already [`AUX_VERSION`]: nothing to do.
+    Current,
+    /// Written at [`F32_INDEX_VERSION`]; these are its bytes at
+    /// [`AUX_VERSION`], every completed key quantized.
+    Migrated(Vec<u8>),
+}
+
+/// Rewrite an aux container whose index keys are `F32` as one whose keys are
+/// Q8_0 — the PLE bytes, each layer's widths and its open block unchanged.
+///
+/// The one reader of [`F32_INDEX_VERSION`]: the daemon refuses that version
+/// ([`decode_aux`]), and `substrate_inspect migrate-index-q8` comes here.
+pub fn migrate_aux(blob: &[u8]) -> Result<AuxMigration> {
+    let u32_at = |o: usize| -> Result<u32> {
+        let b = blob
+            .get(o..o + 4)
+            .ok_or_else(|| candle::Error::Msg("aux blob: truncated".into()))?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    match u32_at(0)? {
+        AUX_VERSION => return Ok(AuxMigration::Current),
+        F32_INDEX_VERSION => {}
+        v => {
+            candle::bail!("aux blob: version {v} is neither {F32_INDEX_VERSION} nor {AUX_VERSION}")
+        }
+    }
+    let ple_len = u32_at(4)? as usize;
+    let ple_end = 8 + ple_len;
+    let ple = blob
+        .get(8..ple_end)
+        .ok_or_else(|| candle::Error::Msg("aux blob: PLE section truncated".into()))?;
+    let n_pages = u32_at(ple_end)? as usize;
+    let mut off = ple_end + 4;
+    let mut layers = Vec::with_capacity(n_pages.min(blob.len() / 4));
+    for i in 0..n_pages {
+        let len = u32_at(off)? as usize;
+        off += 4;
+        let section = blob
+            .get(off..off + len)
+            .ok_or_else(|| candle::Error::Msg(format!("aux blob: page {i} truncated")))?;
+        layers.push(decode_f32_page(section)?);
+        off += len;
+    }
+    Ok(AuxMigration::Migrated(encode_aux(ple, &layers)?))
 }
 
 #[cfg(test)]

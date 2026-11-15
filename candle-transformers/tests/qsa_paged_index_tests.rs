@@ -23,8 +23,10 @@
 #![cfg(feature = "cuda")]
 
 use candle::{DType, Device, Result, Tensor};
+use candle_transformers::models::qwen4exp::key_q8::{blocks, Q8Keys};
 use candle_transformers::models::qwen4exp::paged_index::{
-    decode_aux, decode_page, encode_aux, encode_page, IndexPage, PagedIndex, SealedIndex,
+    decode_aux, decode_page, encode_aux, encode_page, migrate_aux, AuxMigration, IndexPage,
+    PagedIndex, SealedIndex, F32_INDEX_VERSION,
 };
 use candle_transformers::models::rope_schedule::{plain_inv_freq, FactoredRope};
 
@@ -249,19 +251,40 @@ fn a_gap_between_pages_is_allowed_and_an_overlap_is_not() -> Result<()> {
 fn a_page_round_trips_through_its_record_bytes() -> Result<()> {
     let mut rng = Lcg(91);
     let rows = 11usize;
-    let vals = rng.vec(rows * HEAD_DIM);
+    let keys = Q8Keys::quantize(&rng.vec(rows * HEAD_DIM), HEAD_DIM);
     let open_vals = rng.vec(2 * HEAD_DIM);
     let sealed = SealedIndex {
-        rows: vals.clone(),
-        dim: HEAD_DIM,
+        keys: keys.clone(),
         last_cells: 3,
         open: open_vals.clone(),
     };
-    let back = decode_page(&encode_page(&sealed)?)?;
+    let blob = encode_page(&sealed)?;
+    // The layout itself: four header words, the codes, the scales, the open
+    // block.
+    let nb = blocks(HEAD_DIM);
+    assert_eq!(
+        blob.len(),
+        16 + rows * HEAD_DIM + rows * nb * 2 + 2 * HEAD_DIM * 4
+    );
+    let word = |i: usize| u32::from_le_bytes(blob[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+    assert_eq!((word(0), word(1), word(2), word(3)), (rows, HEAD_DIM, 3, 2));
+    assert_eq!(&blob[16..16 + rows * HEAD_DIM], keys.codes.as_slice());
+    let scales_at = 16 + rows * HEAD_DIM;
+    assert_eq!(
+        &blob[scales_at..scales_at + 2],
+        keys.scales[0].to_le_bytes().as_slice()
+    );
+    let open_at = scales_at + rows * nb * 2;
+    assert_eq!(
+        &blob[open_at..open_at + 4],
+        open_vals[0].to_le_bytes().as_slice()
+    );
+
+    let back = decode_page(&blob)?;
     assert_eq!(back.n_rows(), rows);
     assert_eq!(back.last_cells, 3);
     assert_eq!(
-        back.rows, vals,
+        back.keys, keys,
         "the page's keys did not survive the round trip"
     );
     assert_eq!(
@@ -283,8 +306,7 @@ fn an_open_block_of_every_width_round_trips() -> Result<()> {
     for n_open in 0..=RATIO {
         let open_vals = rng.vec(n_open * HEAD_DIM);
         let sealed = SealedIndex {
-            rows: rng.vec(5 * HEAD_DIM),
-            dim: HEAD_DIM,
+            keys: Q8Keys::quantize(&rng.vec(5 * HEAD_DIM), HEAD_DIM),
             last_cells: RATIO,
             open: open_vals.clone(),
         };
@@ -311,8 +333,7 @@ fn an_open_block_of_every_width_round_trips() -> Result<()> {
 fn a_truncated_page_blob_is_refused() -> Result<()> {
     let mut rng = Lcg(92);
     let sealed = SealedIndex {
-        rows: rng.vec(8 * HEAD_DIM),
-        dim: HEAD_DIM,
+        keys: Q8Keys::quantize(&rng.vec(8 * HEAD_DIM), HEAD_DIM),
         last_cells: RATIO,
         open: rng.vec(3 * HEAD_DIM),
     };
@@ -398,7 +419,7 @@ fn the_aux_container_round_trips_ple_and_every_page() -> Result<()> {
     let mut expect_open = Vec::new();
     for i in 0..layers {
         let rows = 3 + i;
-        let vals = rng.vec(rows * HEAD_DIM);
+        let vals = Q8Keys::quantize(&rng.vec(rows * HEAD_DIM), HEAD_DIM);
         expect.push(vals.clone());
         // A different open width per layer: the layers seal at one instant, but
         // they run at different ratios, so their remainders genuinely differ and
@@ -408,8 +429,7 @@ fn the_aux_container_round_trips_ple_and_every_page() -> Result<()> {
         let open_vals = rng.vec(n_open * HEAD_DIM);
         expect_open.push(open_vals.clone());
         sealed.push(SealedIndex {
-            rows: vals,
-            dim: HEAD_DIM,
+            keys: vals,
             last_cells: 1 + (i % RATIO),
             open: open_vals,
         });
@@ -422,7 +442,7 @@ fn the_aux_container_round_trips_ple_and_every_page() -> Result<()> {
         assert_eq!(s.n_rows(), 3 + i, "page {i} row count");
         assert_eq!(s.last_cells, 1 + (i % RATIO), "page {i} last_cells");
         assert_eq!(
-            s.rows, expect[i],
+            s.keys, expect[i],
             "page {i} keys did not survive the round trip"
         );
         assert_eq!(
@@ -439,8 +459,7 @@ fn the_aux_container_round_trips_ple_and_every_page() -> Result<()> {
 fn a_truncated_aux_container_is_refused() -> Result<()> {
     let mut rng = Lcg(556);
     let sealed = vec![SealedIndex {
-        rows: rng.vec(4 * HEAD_DIM),
-        dim: HEAD_DIM,
+        keys: Q8Keys::quantize(&rng.vec(4 * HEAD_DIM), HEAD_DIM),
         last_cells: RATIO,
         open: rng.vec(2 * HEAD_DIM),
     }];
@@ -451,6 +470,79 @@ fn a_truncated_aux_container_is_refused() -> Result<()> {
             "a container truncated at {cut} bytes decoded without error"
         );
     }
+    Ok(())
+}
+
+/// A container as version 3 wrote it: the PLE bytes, then each layer's rows and
+/// open block as `F32`.
+fn f32_aux(ple: &[u8], layers: &[(Vec<f32>, usize, Vec<f32>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&F32_INDEX_VERSION.to_le_bytes());
+    out.extend_from_slice(&(ple.len() as u32).to_le_bytes());
+    out.extend_from_slice(ple);
+    out.extend_from_slice(&(layers.len() as u32).to_le_bytes());
+    for (rows, last_cells, open) in layers {
+        let len = 16 + (rows.len() + open.len()) * 4;
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+        out.extend_from_slice(&((rows.len() / HEAD_DIM) as u32).to_le_bytes());
+        out.extend_from_slice(&(HEAD_DIM as u32).to_le_bytes());
+        out.extend_from_slice(&(*last_cells as u32).to_le_bytes());
+        out.extend_from_slice(&((open.len() / HEAD_DIM) as u32).to_le_bytes());
+        for v in rows.iter().chain(open) {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// **A build reads Q8_0 only.** A container whose keys are `F32` is refused by
+/// name, with the program that rewrites it.
+#[test]
+fn an_f32_container_is_refused_by_name() -> Result<()> {
+    let mut rng = Lcg(557);
+    let blob = f32_aux(&[9], &[(rng.vec(3 * HEAD_DIM), 2, Vec::new())]);
+    let err = decode_aux(&blob).unwrap_err().to_string();
+    assert!(err.contains("migrate-index-q8"), "{err}");
+    Ok(())
+}
+
+/// **The migration rewrites an `F32` container as exactly the Q8_0 one**: the
+/// PLE bytes, every layer's widths and its open block as they were, and its
+/// completed keys quantized by the host definition. A container already at the
+/// current version is left alone, and any other version is refused.
+#[test]
+fn migration_rewrites_an_f32_container_as_q8() -> Result<()> {
+    let mut rng = Lcg(558);
+    let ple: Vec<u8> = (0..11u8).collect();
+    let layers: Vec<(Vec<f32>, usize, Vec<f32>)> = (0..3)
+        .map(|i| (rng.vec((2 + i) * HEAD_DIM), 1 + i, rng.vec(i * HEAD_DIM)))
+        .collect();
+    let old = f32_aux(&ple, &layers);
+    let AuxMigration::Migrated(new) = migrate_aux(&old)? else {
+        panic!("an F32 container was not migrated");
+    };
+    let want: Vec<SealedIndex> = layers
+        .iter()
+        .map(|(rows, last_cells, open)| SealedIndex {
+            keys: Q8Keys::quantize(rows, HEAD_DIM),
+            last_cells: *last_cells,
+            open: open.clone(),
+        })
+        .collect();
+    assert_eq!(new, encode_aux(&ple, &want)?, "byte for byte");
+    let (ple_back, back) = decode_aux(&new)?;
+    assert_eq!(ple_back, ple);
+    assert_eq!(back, want);
+    assert!(
+        new.len() < old.len() / 2,
+        "the keys are a quarter the bytes"
+    );
+
+    assert_eq!(migrate_aux(&new)?, AuxMigration::Current);
+    let mut other = new.clone();
+    other[0] = 2;
+    assert!(migrate_aux(&other).is_err());
+    assert!(migrate_aux(&old[..old.len() - 1]).is_err(), "truncated");
     Ok(())
 }
 

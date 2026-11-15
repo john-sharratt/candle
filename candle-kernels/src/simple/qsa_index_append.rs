@@ -8,21 +8,23 @@
 //! layer per wave; see `simple/qsa_index_append.cu` for the measurement and the
 //! descriptor-table argument.
 //!
-//! Keys are stored **un-rotated**: the scorer rotates each one as it loads it.
+//! Keys are stored **un-rotated**, as Q8_0 (`qsa_key_q8.cuh`): a key's `d`
+//! int8 codes in its code row and its `⌈d/32⌉` f16 scales in its scale row.
+//! The scorer rotates each one as it loads it.
 //!
-//!   jobs      device i64[n_jobs * JOB_WORDS]  — {dst, src0, n0, src1}
+//!   jobs      device i64[n_jobs * JOB_WORDS]  — {codes, src0, n0, src1, scales}
 //!   k_norm    device f32[d]
 //!   carries   device i64[n_carry * CARRY_WORDS] — {dst, src, rows}
 
 use std::ffi::c_void;
 
 /// i64 words per job in the append table. Mirrors `QSA_APPEND_JOB_WORDS`.
-pub const JOB_WORDS: usize = 4;
+pub const JOB_WORDS: usize = 5;
 /// i64 words per entry in the carry table. Mirrors `QSA_APPEND_CARRY_WORDS`.
 pub const CARRY_WORDS: usize = 3;
-/// i64 words per flush job — `{dst, src, count}`. Mirrors
+/// i64 words per flush job — `{codes, src, count, scales}`. Mirrors
 /// `QSA_FLUSH_JOB_WORDS`.
-pub const FLUSH_WORDS: usize = 3;
+pub const FLUSH_WORDS: usize = 4;
 /// The widest channel count one block can own, from the kernel's `MAX_D`. The
 /// launch uses `d` threads, so this is also the block-size bound.
 pub const MAX_D: usize = 1024;

@@ -1,13 +1,14 @@
 //! Correctness gates + tuning harness for `qsa_page_place`.
 //!
-//! The kernel lays a QSA index page out in the scorer's channel-blocked
-//! `[head_dim/4, rows, 4]` layout. Pages are stored un-rotated and the scorer
-//! rotates each key as it loads it, so placing is a pure transpose — it replaces
-//! a `reshape → transpose → contiguous` chain with one batched launch.
+//! The kernel lays a QSA index page's Q8_0 codes out in the scorer's
+//! channel-blocked `[head_dim/16, rows, 16]` layout. Pages are stored un-rotated
+//! and the scorer rotates each key as it loads it, so placing is a pure
+//! transpose — it replaces a `reshape → transpose → contiguous` chain with one
+//! batched launch.
 //!
 //! # What is gated, and why in this file
 //!
-//! The kernel is pure bandwidth — `rows · head_dim` floats in, the same out —
+//! The kernel is pure bandwidth — `rows · head_dim` bytes in, the same out —
 //! so it is tuned, and a tuned kernel needs its correctness pinned against a
 //! reference that does not move while the tuning does. Both live here so one
 //! command answers both questions:
@@ -36,6 +37,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use candle::{Device, Result, Tensor};
+use candle_transformers::models::qwen4exp::key_q8::Q8Keys;
 use candle_transformers::models::qwen4exp::place::{
     place_pages, PlacePage, Placement, PLACE_TILE_R,
 };
@@ -74,33 +76,32 @@ fn seeded(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+/// A page's code plane, `[rows, HEAD_DIM]` — the keys' Q8_0 codes as a record
+/// holds them.
 fn page_keys(rows: usize, seed: u64, dev: &Device) -> Result<Tensor> {
-    Tensor::from_vec(seeded(rows * HEAD_DIM, seed), (rows, HEAD_DIM), dev)
+    let codes = Q8Keys::quantize(&seeded(rows * HEAD_DIM, seed), HEAD_DIM).codes;
+    Tensor::from_vec(codes, (rows, HEAD_DIM), dev)
 }
 
-/// The layout the kernel replaces: `[rows, d] → [d/4, rows, 4]`.
+/// The layout the kernel replaces: `[rows, d] → [d/16, rows, 16]`.
 fn reference_blocked(keys: &Tensor) -> Result<Tensor> {
     let (rows, dim) = keys.dims2()?;
-    keys.reshape((rows, dim / 4, 4))?
+    keys.reshape((rows, dim / 16, 16))?
         .transpose(0, 1)?
         .contiguous()
 }
 
-fn to_vec(t: &Tensor) -> Result<Vec<f32>> {
-    t.flatten_all()?.to_vec1::<f32>()
+fn to_vec(t: &Tensor) -> Result<Vec<u8>> {
+    t.flatten_all()?.to_vec1::<u8>()
 }
 
-/// Bit-for-bit: a transpose moves bytes and computes nothing.
+/// Byte for byte: a transpose moves bytes and computes nothing.
 fn assert_bits(got: &Tensor, want: &Tensor, what: &str) -> Result<()> {
     let g = to_vec(got)?;
     let w = to_vec(want)?;
     assert_eq!(g.len(), w.len(), "{what}: length");
     for (i, (a, b)) in g.iter().zip(&w).enumerate() {
-        assert_eq!(
-            a.to_bits(),
-            b.to_bits(),
-            "{what}: element {i} — kernel {a} against reference {b}",
-        );
+        assert_eq!(a, b, "{what}: byte {i} — kernel against reference");
     }
     Ok(())
 }
@@ -238,7 +239,7 @@ fn time_launch(plan: &Placement, tile: usize, dev: &Device) -> Result<f64> {
 }
 
 /// **The sweep.** Every case at every tile, reported as achieved bandwidth —
-/// the kernel reads `rows · head_dim` floats and writes the same, so GB/s
+/// the kernel reads `rows · head_dim` bytes and writes the same, so GB/s
 /// against the card's peak is the only figure that says whether it is done.
 #[test]
 #[ignore = "tuning harness; run with --ignored --nocapture"]
@@ -259,7 +260,7 @@ fn bench_qsa_page_place_tile_sweep() -> Result<()> {
         let pages: Vec<PlacePage<'_>> = keys.iter().map(|k| PlacePage { keys: k }).collect();
         let n_jobs = pages.len();
         // Read plus write, which is all this kernel does.
-        let bytes = 2.0 * (n_jobs * case.rows * HEAD_DIM * 4) as f64;
+        let bytes = 2.0 * (n_jobs * case.rows * HEAD_DIM) as f64;
         print!(
             "  {:>24} {:>7} {:>7} {:>9.1}",
             case.label,

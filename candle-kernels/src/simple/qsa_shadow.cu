@@ -48,6 +48,7 @@
 #include <math.h>
 #include <stdint.h>
 
+#include "../qsa_key_q8.cuh"
 #include "../qsa_select.cuh"
 #include "../qsa_survivors.cuh"
 #include "../rope/rope_table.cuh"
@@ -56,10 +57,10 @@
 // last rows of a prefill.
 #define QSA_KEEP_SLOTS 64
 
-// i64 words per page descriptor: `{keys, cstride, rstride, delta}`, the
-// paged scorer's (`qsa_score_paged.cu`). `delta` is unused: a shadow row's
-// position is its seat in its window.
-#define QSA_SHADOW_PAGE_WORDS 4
+// i64 words per page descriptor: `{codes, scales, cstride, rstride, delta}`,
+// the paged scorer's (`qsa_score_paged.cu`) — Q8_0 keys, the code strides in
+// bytes. `delta` is unused: a shadow row's position is its seat in its window.
+#define QSA_SHADOW_PAGE_WORDS 5
 
 // The most index heads a kept query has.
 #define QSA_SHADOW_MAX_HEADS 8
@@ -151,14 +152,22 @@ __global__ void __launch_bounds__(THREADS) qsa_shadow_kernel(
             if (g < hi) {
                 const int p = page_of(page_first, (int)s.n_pages, (uint32_t)g);
                 const long long* pd = pages + (size_t)p * QSA_SHADOW_PAGE_WORDS;
-                const float* kf = reinterpret_cast<const float*>((uintptr_t)__ldg(pd));
-                const long long cstride = __ldg(pd + 1);
-                const long long rstride = __ldg(pd + 2);
+                const signed char* codes =
+                    reinterpret_cast<const signed char*>((uintptr_t)__ldg(pd));
+                const unsigned short* scales =
+                    reinterpret_cast<const unsigned short*>((uintptr_t)__ldg(pd + 1));
+                const long long cstride = __ldg(pd + 2);
+                const long long rstride = __ldg(pd + 3);
                 const int local = g - (int)__ldg(page_first + p);
-                const float* kb = kf + (long long)local * rstride * 4;
-                // Channel `c` of this key, un-rotated: group `c/4` at `cstride`
-                // float4s apart.
-                auto raw = [&](int c) { return kb[(long long)(c >> 2) * cstride * 4 + (c & 3)]; };
+                const signed char* kb = codes + (long long)local * rstride;
+                const unsigned short* ks =
+                    scales + (long long)local * qsa_q8_blocks(head_dim);
+                // Channel `c` of this key, un-rotated: its code in group `c/16`,
+                // the groups `cstride` bytes apart, by its block's scale.
+                auto raw = [&](int c) {
+                    return (float)kb[(long long)(c >> 4) * cstride + (c & 15)]
+                        * qsa_q8_scale(ks[c / QSA_Q8_BLOCK]);
+                };
                 const int pos = (seat + (g - lo)) * ratio;
                 float acc[QSA_SHADOW_MAX_HEADS];
 #pragma unroll

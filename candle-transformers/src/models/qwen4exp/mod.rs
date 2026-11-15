@@ -49,6 +49,7 @@ pub mod hyper;
 mod index_keys;
 #[cfg(feature = "cuda")]
 pub mod indexer;
+pub mod key_q8;
 /// The KV threshold row by expert format.
 pub mod kv_row;
 pub mod loader;

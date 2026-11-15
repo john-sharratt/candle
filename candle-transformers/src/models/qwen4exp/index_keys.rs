@@ -24,10 +24,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use candle::{DType, Device, Result, Tensor};
+use candle::cuda_backend::cudarc::driver::DevicePtr;
+use candle::{DType, Device, Result, Storage, Tensor};
 use candle_nn::kv_cache::{claim_arena_slots, relocate_tensor, ArenaSlot, SlotTenant};
 
 use super::indexer::tensor_ptr;
+use super::key_q8::{blocks, key_bytes, Q8Keys};
 
 /// Block keys per live-tail page: 128 KiB at the released 128-wide indexer
 /// head, 128 pages to a region.
@@ -77,8 +79,90 @@ pub(super) fn alloc_buffers(
     }
 }
 
-/// The live tail's block keys: page `p` holds blocks `[p·PAGE_BLOCKS,
-/// (p+1)·PAGE_BLOCKS)`, row-major `[PAGE_BLOCKS, d]`.
+/// Bytes of one page of [`PAGE_BLOCKS`] `d`-wide Q8_0 keys: the code plane
+/// `[PAGE_BLOCKS, d]`, then the scale plane `[PAGE_BLOCKS, blocks(d)]`.
+pub fn key_page_bytes(d: usize) -> usize {
+    PAGE_BLOCKS * key_bytes(d)
+}
+
+/// Byte offset of a key page's scale plane.
+pub fn scale_plane_offset(d: usize) -> usize {
+    PAGE_BLOCKS * d
+}
+
+/// `n` uninitialised key pages for `d`-wide keys, each a flat `U8` view of
+/// [`key_page_bytes`]: on CUDA, anchored views of QSA-index arena slots claimed
+/// in one call; on any other device, ordinary tensors.
+///
+/// **Between forwards**, as [`alloc_buffers`].
+pub(super) fn alloc_key_pages(device: &Device, d: usize, n: usize) -> Result<Vec<Tensor>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes = key_page_bytes(d);
+    match device {
+        Device::Cuda(_) => claim_arena_slots(device, SlotTenant::QsaIndex, bytes, n)?
+            .into_iter()
+            .map(|slot| Arc::new(slot).tensor(0, DType::U8, (bytes,), device))
+            .collect(),
+        _ => (0..n)
+            .map(|_| Tensor::zeros((bytes,), DType::U8, device))
+            .collect(),
+    }
+}
+
+/// Device address of a `U8` buffer.
+pub(super) fn bytes_ptr(t: &Tensor) -> Result<u64> {
+    let Device::Cuda(dev) = t.device() else {
+        candle::bail!("qsa index pages live on CUDA");
+    };
+    let stream = dev.cuda_stream();
+    let (s, l) = t.storage_and_layout();
+    let slice = match &*s {
+        Storage::Cuda(c) => c.as_cuda_slice::<u8>()?,
+        _ => candle::bail!("qsa index pages must be CUDA u8"),
+    }
+    .slice(l.start_offset()..);
+    let (ptr, _guard) = slice.device_ptr(&stream);
+    Ok(ptr)
+}
+
+/// Copy host `bytes` into `dst` at byte `offset` — on CUDA one host-to-device
+/// copy into the slot `dst` views, on the stream every reader of the slot uses;
+/// on any other device a `slice_set`.
+pub(super) fn write_bytes(dst: &Tensor, offset: usize, bytes: &[u8]) -> Result<()> {
+    if offset + bytes.len() > dst.elem_count() {
+        candle::bail!(
+            "qsa index: {} bytes at +{offset} of a {}-byte page",
+            bytes.len(),
+            dst.elem_count()
+        );
+    }
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    match dst.device() {
+        Device::Cuda(cuda) => cuda.upload_raw(bytes_ptr(dst)? + offset as u64, bytes),
+        dev => dst.slice_set(&Tensor::from_slice(bytes, (bytes.len(),), dev)?, 0, offset),
+    }
+}
+
+/// `scales` as the bytes a page holds them in.
+pub(super) fn scale_bytes(scales: &[u16]) -> Vec<u8> {
+    scales.iter().flat_map(|s| s.to_le_bytes()).collect()
+}
+
+/// The scales a page's bytes hold.
+pub(super) fn scales_of(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect()
+}
+
+/// The live tail's block keys as Q8_0 (`key_q8`): page `p` holds blocks
+/// `[p·PAGE_BLOCKS, (p+1)·PAGE_BLOCKS)`, its codes row-major `[PAGE_BLOCKS, d]`
+/// and its scales row-major behind them.
 #[derive(Debug)]
 pub(super) struct KeyPages {
     pages: Vec<Tensor>,
@@ -113,16 +197,16 @@ impl KeyPages {
     pub(super) fn ensure(&mut self, blocks: usize) -> Result<()> {
         let want = blocks.div_ceil(PAGE_BLOCKS);
         if want > self.pages.len() {
-            let more = alloc_buffers(&self.device, PAGE_BLOCKS, self.d, want - self.pages.len())?;
+            let more = alloc_key_pages(&self.device, self.d, want - self.pages.len())?;
             self.pages.extend(more);
         }
         Ok(())
     }
 
     /// Every page's base address, in page order — what a caller resolving many
-    /// rows at once reads once, then indexes with [`row_addr`].
+    /// rows at once reads once, then indexes with [`key_addr`].
     pub(super) fn page_ptrs(&self) -> Result<Vec<u64>> {
-        self.pages.iter().map(tensor_ptr).collect()
+        self.pages.iter().map(bytes_ptr).collect()
     }
 
     /// The pages covering the first `n_blocks` keys, as `(base address, rows
@@ -132,50 +216,54 @@ impl KeyPages {
         (0..n_blocks.div_ceil(PAGE_BLOCKS))
             .map(|p| {
                 let used = (n_blocks - p * PAGE_BLOCKS).min(PAGE_BLOCKS);
-                Ok((tensor_ptr(&self.pages[p])?, used))
+                Ok((bytes_ptr(&self.pages[p])?, used))
             })
             .collect()
     }
 
-    /// The first `n_blocks` keys, `[n_blocks, d]` row-major, read back to the host
-    /// page by page — for a seal or a record, never for the scorer, which reads the
+    /// The first `n_blocks` keys as they are stored, read back to the host page
+    /// by page — for a seal or a record, never for the scorer, which reads the
     /// pages in place. Nothing is gathered on the device: a gather is a buffer from
     /// the CUDA pool, outside the span, for bytes that are only on their way off
-    /// the card.
-    pub(super) fn host_rows(&self, n_blocks: usize) -> Result<Vec<f32>> {
+    /// the card. Nothing is converted either: a record holds the stored bytes.
+    pub(super) fn host_rows(&self, n_blocks: usize) -> Result<Q8Keys> {
         self.check(n_blocks)?;
-        let mut out = Vec::with_capacity(n_blocks * self.d);
+        let nb = blocks(self.d);
+        let at = scale_plane_offset(self.d);
+        let mut out = Q8Keys::empty(self.d);
+        out.codes.reserve(n_blocks * self.d);
+        out.scales.reserve(n_blocks * nb);
         for p in 0..n_blocks.div_ceil(PAGE_BLOCKS) {
             let used = (n_blocks - p * PAGE_BLOCKS).min(PAGE_BLOCKS);
-            out.extend(
-                self.pages[p]
-                    .narrow(0, 0, used)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?,
-            );
+            let page = &self.pages[p];
+            out.codes
+                .extend(page.narrow(0, 0, used * self.d)?.to_vec1::<u8>()?);
+            out.scales.extend(scales_of(
+                &page.narrow(0, at, used * nb * 2)?.to_vec1::<u8>()?,
+            ));
         }
         Ok(out)
     }
 
-    /// Write `rows` (`[n, d]` row-major, host) as the first `n` keys, claiming
-    /// pages as needed — straight into the pages, with no device buffer between.
-    pub(super) fn write_host_rows(&mut self, rows: &[f32]) -> Result<()> {
-        if !rows.len().is_multiple_of(self.d) {
+    /// Write `keys` (host) as the first `n` keys, claiming pages as needed —
+    /// straight into the pages, with no device buffer between.
+    pub(super) fn write_host_rows(&mut self, keys: &Q8Keys) -> Result<()> {
+        if keys.dim != self.d && !keys.is_empty() {
             candle::bail!(
-                "qsa index pages: {} values is not a whole number of {}-wide rows",
-                rows.len(),
+                "qsa index pages: {}-wide keys into {}-wide pages",
+                keys.dim,
                 self.d
             );
         }
-        let n = rows.len() / self.d;
+        let n = keys.n_rows();
         self.ensure(n)?;
+        let at = scale_plane_offset(self.d);
         for p in 0..n.div_ceil(PAGE_BLOCKS) {
             let first = p * PAGE_BLOCKS;
             let used = (n - first).min(PAGE_BLOCKS);
-            write_host(
-                &self.pages[p],
-                &rows[first * self.d..(first + used) * self.d],
-            )?;
+            let (codes, scales) = keys.rows(first, used);
+            write_bytes(&self.pages[p], 0, codes)?;
+            write_bytes(&self.pages[p], at, &scale_bytes(scales))?;
         }
         Ok(())
     }
@@ -194,9 +282,13 @@ impl KeyPages {
         self.check(n_blocks)?;
         let mut child = Self::new(self.d, &self.device);
         child.ensure(n_blocks)?;
+        let nb = blocks(self.d);
+        let at = scale_plane_offset(self.d);
         for p in 0..n_blocks.div_ceil(PAGE_BLOCKS) {
             let used = (n_blocks - p * PAGE_BLOCKS).min(PAGE_BLOCKS);
-            child.pages[p].slice_set(&self.pages[p].narrow(0, 0, used)?, 0, 0)?;
+            let (src, dst) = (&self.pages[p], &child.pages[p]);
+            dst.slice_set(&src.narrow(0, 0, used * self.d)?, 0, 0)?;
+            dst.slice_set(&src.narrow(0, at, used * nb * 2)?, 0, at)?;
         }
         Ok(child)
     }
@@ -260,9 +352,15 @@ pub(super) fn write_host(dst: &Tensor, vals: &[f32]) -> Result<()> {
     }
 }
 
-/// Device address of block key `k`, from [`KeyPages::page_ptrs`].
-pub(super) fn row_addr(page_ptrs: &[u64], k: usize, d: usize) -> u64 {
-    page_ptrs[k / PAGE_BLOCKS] + ((k % PAGE_BLOCKS) * d * DType::F32.size_in_bytes()) as u64
+/// Device addresses of block key `k`'s code row and scale row, from
+/// [`KeyPages::page_ptrs`].
+pub(super) fn key_addr(page_ptrs: &[u64], k: usize, d: usize) -> (u64, u64) {
+    let page = page_ptrs[k / PAGE_BLOCKS];
+    let row = k % PAGE_BLOCKS;
+    (
+        page + (row * d) as u64,
+        page + (scale_plane_offset(d) + row * blocks(d) * 2) as u64,
+    )
 }
 
 /// The free rewind copies of one cache's open block. Shared with every
@@ -339,18 +437,43 @@ impl Drop for SnapshotBuffer {
 mod tests {
     use super::*;
 
-    fn rows(n: usize, d: usize) -> Vec<f32> {
-        (0..n * d).map(|i| i as f32).collect()
+    fn rows(n: usize, d: usize) -> Q8Keys {
+        let vals: Vec<f32> = (0..n * d).map(|i| (i % 251) as f32 - 125.0).collect();
+        Q8Keys::quantize(&vals, d)
+    }
+
+    /// A page is its codes then its scales, and a key's two rows are found in
+    /// the page that holds it.
+    #[test]
+    fn a_key_address_walks_pages_of_page_blocks() {
+        assert_eq!(key_page_bytes(128), 256 * 136);
+        assert_eq!(scale_plane_offset(128), 256 * 128);
+        let ptrs = [0x10_0000u64, 0x90_0000];
+        let scales = 256 * 128;
+        assert_eq!(key_addr(&ptrs, 0, 128), (0x10_0000, 0x10_0000 + scales));
+        assert_eq!(
+            key_addr(&ptrs, 1, 128),
+            (0x10_0000 + 128, 0x10_0000 + scales + 8)
+        );
+        assert_eq!(
+            key_addr(&ptrs, 255, 128),
+            (0x10_0000 + 255 * 128, 0x10_0000 + scales + 255 * 8)
+        );
+        assert_eq!(key_addr(&ptrs, 256, 128), (0x90_0000, 0x90_0000 + scales));
+        assert_eq!(
+            key_addr(&ptrs, 257, 128),
+            (0x90_0000 + 128, 0x90_0000 + scales + 8)
+        );
     }
 
     #[test]
-    fn a_row_address_walks_pages_of_page_blocks() {
-        let ptrs = [0x1000u64, 0x9000];
-        assert_eq!(row_addr(&ptrs, 0, 128), 0x1000);
-        assert_eq!(row_addr(&ptrs, 1, 128), 0x1000 + 512);
-        assert_eq!(row_addr(&ptrs, 255, 128), 0x1000 + 255 * 512);
-        assert_eq!(row_addr(&ptrs, 256, 128), 0x9000);
-        assert_eq!(row_addr(&ptrs, 257, 128), 0x9000 + 512);
+    fn scales_round_trip_through_page_bytes() {
+        let scales = [0x3c00u16, 0x0001, 0xffff];
+        assert_eq!(
+            scale_bytes(&scales),
+            vec![0x00, 0x3c, 0x01, 0x00, 0xff, 0xff]
+        );
+        assert_eq!(scales_of(&scale_bytes(&scales)), scales.to_vec());
     }
 
     #[test]
@@ -412,12 +535,17 @@ mod tests {
         let taken = keys.detach(n).unwrap();
         assert_eq!(taken.len(), 2, "the two pages the keys reach");
         assert_eq!(keys.capacity_blocks(), PAGE_BLOCKS, "the unused page stays");
-        let back: Vec<f32> = taken
+        let codes: Vec<u8> = taken
             .iter()
-            .flat_map(|t| t.flatten_all().unwrap().to_vec1::<f32>().unwrap())
+            .flat_map(|t| {
+                t.narrow(0, 0, PAGE_BLOCKS * 4)
+                    .unwrap()
+                    .to_vec1::<u8>()
+                    .unwrap()
+            })
             .take(n * 4)
             .collect();
-        assert_eq!(back, src, "the rows leave where they were written");
+        assert_eq!(codes, src.codes, "the rows leave where they were written");
     }
 
     #[test]

@@ -1,11 +1,13 @@
 // =============================================================================
-// QSA index page PLACEMENT: channel-block a page for the scorer
+// QSA index page PLACEMENT: channel-block a page's codes for the scorer
 // =============================================================================
 // An index page's rows are the pooled, normed, UN-rotated block keys of one
-// sealed unit, stored `[rows, d]` as a record holds them. The paged scorer reads
-// keys channel-blocked as `[d/4, rows, 4]`, which makes a warp's key read 512
-// contiguous bytes instead of 32 scattered ones — so a page is laid out that way
-// once, when it is placed, rather than once per score.
+// sealed unit, stored as Q8_0 (`../qsa_key_q8.cuh`): a plane of int8 codes
+// `[rows, d]` as a record holds them, and a plane of scales. The paged scorer
+// reads codes channel-blocked as `[d/16, rows, 16]`, which makes a warp's read
+// of one 16-code group 512 contiguous bytes — so a page's codes are laid out
+// that way once, when it is placed, rather than once per score. The scales are
+// read row-major in both layouts and are not this kernel's.
 //
 // Placing carries no rotation. The scorer rotates each key as it loads it, at
 // the key's own position (`qsa_score_paged.cu`), so a page's layout is the same
@@ -13,14 +15,14 @@
 //
 // ---- Shape of the work ------------------------------------------------------
 //
-// Pure bandwidth: `rows · d` floats in, the same out. One side of a transpose is
+// Pure bandwidth: `rows · d` bytes in, the same out. One side of a transpose is
 // always strided, so a block stages a `TILE_R × d` tile in shared memory —
-// coalesced `float4` reads in, coalesced `float4` writes out, and the strided
+// coalesced 16-byte reads in, coalesced 16-byte writes out, and the strided
 // axis paid in shared where it is cheap.
 //
 //   load    consecutive threads take consecutive channel groups of one row
 //   store   consecutive threads take consecutive ROWS of one channel group,
-//           which is exactly the `[d/4, rows, 4]` order the scorer reads
+//           which is exactly the `[d/16, rows, 16]` order the scorer reads
 //
 // ---- Batching ---------------------------------------------------------------
 //
@@ -31,8 +33,8 @@
 //
 // Table layout: array-of-structs, `QSA_PLACE_JOB_WORDS` i64 per job.
 //
-//     [0] src    const float*  the page's `[rows, d]` keys
-//     [1] dst    float*        the page's `[d/4, rows, 4]` placement
+//     [0] src    const int8*  the page's `[rows, d]` codes
+//     [1] dst    int8*        the page's `[d/16, rows, 16]` placement
 //     [2] rows
 
 #include <cuda_runtime.h>
@@ -43,11 +45,11 @@
 
 namespace qsa_page_place {
 
-/// Padding, in `float4`s, between shared-tile rows.
+/// Padding, in 16-byte groups, between shared-tile rows.
 ///
-/// The store phase walks a channel group down the tile — stride `D4 + PAD`
-/// `float4`s — so an unpadded tile would put every row of a group in the same
-/// bank quartet. One `float4` of padding shifts each row by four banks.
+/// The store phase walks a channel group down the tile — stride `DG + PAD`
+/// groups — so an unpadded tile would put every row of a group in the same
+/// bank quartet. One group of padding shifts each row by four banks.
 constexpr int PAD = 1;
 
 /// One `TILE_R × d` tile of one page.
@@ -55,16 +57,8 @@ constexpr int PAD = 1;
 /// `TILE_R` is a template parameter because it is the kernel's only real dial
 /// and it pulls two ways: it is the length of the store phase's contiguous run
 /// (coalescing) and it multiplies the shared footprint (occupancy). At the
-/// released geometry `d = 128`, so a tile is `TILE_R · 33` `float4` — 8.4 KB at
-/// 16, 16.9 KB at 32.
-///
-/// **Where it is measured, it is finished.** `ncu` on the two shapes that
-/// actually stream — 32 pages × 512 rows and one 32,768-row section — puts this
-/// at **87–88% of peak DRAM**, 95–97% warp occupancy, **40 registers a thread**,
-/// and shared bank conflicts under 1% of shared instructions. Every tile is
-/// within 1% there, because the tile cannot move a kernel the memory bus is
-/// holding. The dial only separates the shapes that fit L2; the sweep in
-/// `tests/qsa_page_place_bench.rs` carries those numbers and the choice.
+/// released geometry `d = 128`, so a tile is `TILE_R · 9` groups — 2.3 KB at
+/// 16.
 template <int TILE_R>
 __global__ __launch_bounds__(QSA_PLACE_THREADS) void place_kernel(
     const long long* __restrict__ jobs,
@@ -75,33 +69,33 @@ __global__ __launch_bounds__(QSA_PLACE_THREADS) void place_kernel(
     if (j >= n_jobs) return;
 
     const long long* job = jobs + (long long)j * QSA_PLACE_JOB_WORDS;
-    const float4* src = (const float4*)(uintptr_t)job[0];
-    float4* dst = (float4*)(uintptr_t)job[1];
+    const int4* src = (const int4*)(uintptr_t)job[0];
+    int4* dst = (int4*)(uintptr_t)job[1];
     const int rows = (int)job[2];
 
     const int r0 = blockIdx.x * TILE_R;
     if (r0 >= rows) return;                      // a narrower job's spare tiles
     const int nr = min(TILE_R, rows - r0);
 
-    const int D4 = d >> 2;
-    const int S = D4 + PAD;                      // shared row pitch, in float4
+    const int DG = d >> 4;                       // 16-code groups per key
+    const int S = DG + PAD;                      // shared row pitch, in groups
     const int tid = threadIdx.x;
 
-    extern __shared__ float4 sh[];
+    extern __shared__ int4 sh[];
 
     // ---- load: coalesced along the channel axis -------------------------
-    for (int i = tid; i < nr * D4; i += QSA_PLACE_THREADS) {
-        const int r = i / D4;
-        const int cg = i - r * D4;
-        sh[r * S + cg] = __ldg(src + (long long)(r0 + r) * D4 + cg);
+    for (int i = tid; i < nr * DG; i += QSA_PLACE_THREADS) {
+        const int r = i / DG;
+        const int cg = i - r * DG;
+        sh[r * S + cg] = __ldg(src + (long long)(r0 + r) * DG + cg);
     }
     __syncthreads();
 
     // ---- store: coalesced along the ROW axis, which is the scorer's -----
-    // `dst` is `[d/4, rows, 4]`, so channel group `cg` of row `r` sits at
-    // `cg · rows + r` float4s: consecutive threads take consecutive rows and the
+    // `dst` is `[d/16, rows, 16]`, so channel group `cg` of row `r` sits at
+    // `cg · rows + r` groups: consecutive threads take consecutive rows and the
     // warp writes one contiguous run.
-    for (int i = tid; i < D4 * nr; i += QSA_PLACE_THREADS) {
+    for (int i = tid; i < DG * nr; i += QSA_PLACE_THREADS) {
         const int cg = i / nr;
         const int r = i - cg * nr;
         dst[(long long)cg * rows + r0 + r] = sh[r * S + cg];
@@ -114,9 +108,9 @@ __global__ __launch_bounds__(QSA_PLACE_THREADS) void place_kernel(
 /// widest job; narrower jobs retire their spare blocks immediately.
 #define QSA_PLACE_LAUNCH(TR)                                                       \
     {                                                                              \
-        const int D4 = d >> 2;                                                     \
-        const size_t shmem = (size_t)(TR) * (D4 + qsa_page_place::PAD)             \
-                                 * sizeof(float4);                                 \
+        const int DG = d >> 4;                                                     \
+        const size_t shmem = (size_t)(TR) * (DG + qsa_page_place::PAD)             \
+                                 * sizeof(int4);                                   \
         dim3 grid((unsigned)((max_rows + (TR) - 1) / (TR)), (unsigned)n_jobs);     \
         qsa_page_place::place_kernel<TR>                                           \
             <<<grid, QSA_PLACE_THREADS, shmem, (cudaStream_t)stream>>>(            \
@@ -124,7 +118,8 @@ __global__ __launch_bounds__(QSA_PLACE_THREADS) void place_kernel(
         return;                                                                    \
     }
 
-/// Write every job's page in the scorer's channel-blocked layout.
+/// Write every job's codes in the scorer's channel-blocked layout. `d` is a
+/// multiple of 16.
 ///
 /// `tile_r` selects the row tile; `0` takes the tuned default. The explicit
 /// values exist for `tests/qsa_page_place_bench.rs`, which sweeps them — the
@@ -137,7 +132,7 @@ extern "C" void run_qsa_page_place(
     int32_t tile_r,
     void* stream
 ) {
-    if (n_jobs <= 0 || d <= 0 || max_rows <= 0) return;
+    if (n_jobs <= 0 || d <= 0 || (d & 15) != 0 || max_rows <= 0) return;
     switch (tile_r) {
         case 8:  QSA_PLACE_LAUNCH(8)
         case 16: QSA_PLACE_LAUNCH(16)

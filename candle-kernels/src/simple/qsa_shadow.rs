@@ -12,9 +12,9 @@
 
 use std::ffi::c_void;
 
-/// i64 words per page descriptor: `{keys, cstride, rstride, delta}`, the paged
-/// scorer's. `delta` is unused.
-pub const SHADOW_PAGE_WORDS: usize = 4;
+/// i64 words per page descriptor: `{codes, scales, cstride, rstride, delta}`,
+/// the paged scorer's. `delta` is unused.
+pub const SHADOW_PAGE_WORDS: usize = 5;
 
 /// The most index heads a kept query has (`QSA_SHADOW_MAX_HEADS`).
 pub const SHADOW_MAX_HEADS: usize = 8;

@@ -1,12 +1,12 @@
 //! FFI binding for QSA index page placement.
 //!
-//! Writes a page's un-rotated block keys in the scorer's channel-blocked
-//! layout. There is no rotation: the scorer rotates each key as it loads it.
-//! See `simple/qsa_page_place.cu`.
+//! Writes a page's Q8_0 codes in the scorer's channel-blocked layout. There is
+//! no rotation: the scorer rotates each key as it loads it. See
+//! `simple/qsa_page_place.cu`.
 //!
 //! ```text
-//!   src   device f32[rows, d]        the page's keys, as a record holds them
-//!   dst   device f32[d/4, rows, 4]   the page's placement
+//!   src   device i8[rows, d]          the page's codes, as a record holds them
+//!   dst   device i8[d/16, rows, 16]   the page's placement
 //! ```
 //!
 //! Batched over a descriptor table: one job per page.

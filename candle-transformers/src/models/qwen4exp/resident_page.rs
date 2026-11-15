@@ -29,20 +29,26 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, Weak};
 
-use candle::cuda_backend::cudarc::driver::result::memcpy_htod_async;
 use candle::{Device, Result, Tensor};
 use candle_kernels::simple::qsa_page_place::{run_qsa_page_place, PLACE_JOB_WORDS};
 use candle_nn::kv_cache::{relocate_tensor, ArenaSlot};
 
-use super::index_keys::{alloc_buffers, PAGE_BLOCKS};
-use super::indexer::tensor_ptr;
+use super::index_keys::{
+    alloc_key_pages, bytes_ptr, scale_bytes, scale_plane_offset, scales_of, write_bytes,
+    PAGE_BLOCKS,
+};
+use super::key_q8::{blocks, Q8Keys};
 use super::place::PLACE_TILE_R;
 use crate::models::piece_key::PieceKey;
 
-/// How a resident page's rows sit in each of its chunks.
+/// Codes in one group of the scorer's blocked layout — one 16-byte load.
+pub const CODE_GROUP: usize = 16;
+
+/// How a resident page's codes sit in each of its chunks. The scales are
+/// row-major behind the codes in both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkLayout {
-    /// `[d/4, rows, 4]` per chunk: channel-blocked, so a warp scoring
+    /// `[d/16, rows, 16]` per chunk: channel-blocked, so a warp scoring
     /// consecutive candidates reads one contiguous run. What a page made from a
     /// record is placed as.
     Blocked,
@@ -54,19 +60,22 @@ pub enum ChunkLayout {
 /// One chunk's entry in the scorer's descriptor table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkDesc {
+    /// The chunk's codes.
     pub ptr: u64,
+    /// The chunk's scales, `[rows, blocks(d)]` `f16` row-major.
+    pub scales: u64,
     pub rows: usize,
-    /// Float4 groups between channel group `c` and `c + 1` of one row.
+    /// Bytes between code group `c` and `c + 1` of one row.
     pub group_stride: i64,
-    /// Float4 groups between row `j` and `j + 1` of one channel group.
+    /// Bytes between row `j` and `j + 1` of one code group.
     pub row_stride: i64,
 }
 
 /// One sealed piece's rows for one attention layer, resident on the span.
 #[derive(Debug)]
 pub struct ResidentPage {
-    /// One `[PAGE_BLOCKS, d]` F32 view of a slot per chunk; chunk `c` holds rows
-    /// `[c·PAGE_BLOCKS, (c+1)·PAGE_BLOCKS)`. Behind a lock because a compaction
+    /// One key page (`index_keys::key_page_bytes`) per chunk; chunk `c` holds
+    /// rows `[c·PAGE_BLOCKS, (c+1)·PAGE_BLOCKS)`. Behind a lock because a compaction
     /// moves them between forwards while every holder keeps the same `Arc`.
     chunks: Mutex<Vec<Tensor>>,
     rows: usize,
@@ -82,28 +91,29 @@ fn chunk_rows(rows: usize, c: usize) -> usize {
 }
 
 impl ResidentPage {
-    /// Pages made from host rows — one `(rows, last_cells)` page per entry of
-    /// `pages`, each `[rows, d]` row-major F32 — placed in ONE launch.
+    /// Pages made from host keys — one `(keys, last_cells)` page per entry of
+    /// `pages`, each a record's Q8_0 rows — placed in ONE launch.
     ///
-    /// The rows are uploaded into staging slots of the same tenant and placed from
-    /// there into the page's own slots, and the job table rides the device's held
-    /// staging scratch, so nothing is taken from the CUDA pool; the staging goes
-    /// back when this returns, behind the launch on the same stream.
+    /// The codes are uploaded into staging slots of the same tenant and placed
+    /// from there into the page's own slots; the scales, row-major in both
+    /// layouts, are uploaded straight into the page. The job table rides the
+    /// device's held staging scratch, so nothing is taken from the CUDA pool; the
+    /// staging goes back when this returns, behind the launch on the same stream.
     ///
     /// **Between forwards.** A slot claim that needs a new arena takes the arena
     /// window.
     pub fn place_host(
-        pages: &[(&[f32], usize)],
+        pages: &[(&Q8Keys, usize)],
         d: usize,
         device: &Device,
     ) -> Result<Vec<Arc<Self>>> {
         let Device::Cuda(cuda) = device else {
             candle::bail!("qsa resident page: placed on a CUDA device");
         };
-        if !d.is_multiple_of(4) {
+        if !d.is_multiple_of(CODE_GROUP) {
             candle::bail!(
-                "qsa resident page: head_dim {d} is not a multiple of four — the scorer's \
-                 channel-blocked layout is built in float4 groups"
+                "qsa resident page: head_dim {d} is not a multiple of {CODE_GROUP} — the \
+                 scorer's channel-blocked layout is built in groups of {CODE_GROUP} codes"
             );
         }
         // Placement allocates and uploads: it runs eagerly for its whole extent,
@@ -115,28 +125,27 @@ impl ResidentPage {
         let mut jobs: Vec<i64> = Vec::new();
         let mut max_rows = 0usize;
         for &(host, last_cells) in pages {
-            if !host.len().is_multiple_of(d) {
+            if host.dim != d && !host.is_empty() {
                 candle::bail!(
-                    "qsa resident page: {} values is not a whole number of {d}-wide rows",
-                    host.len()
+                    "qsa resident page: {}-wide keys placed as a {d}-wide page",
+                    host.dim
                 );
             }
-            let rows = host.len() / d;
+            let rows = host.n_rows();
             let n = rows.div_ceil(PAGE_BLOCKS);
-            let chunks = alloc_buffers(device, PAGE_BLOCKS, d, n)?;
-            let stage = alloc_buffers(device, PAGE_BLOCKS, d, n)?;
+            let chunks = alloc_key_pages(device, d, n)?;
+            let stage = alloc_key_pages(device, d, n)?;
             for c in 0..n {
                 let first = c * PAGE_BLOCKS;
                 let used = chunk_rows(rows, c);
-                let src = &host[first * d..(first + used) * d];
-                // SAFETY: the staging slot holds `PAGE_BLOCKS · d` floats and `src`
-                // is at most that; the copy is ordered on the stream the placement
-                // below reads it from. From pageable memory the driver has staged
-                // the bytes before this returns, so `host` may go.
-                unsafe { memcpy_htod_async(tensor_ptr(&stage[c])?, src, stream.cu_stream()) }
-                    .map_err(|e| candle::Error::Msg(format!("qsa resident page upload: {e}")))?;
-                jobs.push(tensor_ptr(&stage[c])? as i64);
-                jobs.push(tensor_ptr(&chunks[c])? as i64);
+                let (codes, scales) = host.rows(first, used);
+                // Both uploads are ordered on the stream the placement below
+                // and every later reader use; the driver has staged the bytes
+                // before each returns, so `host` may go.
+                write_bytes(&stage[c], 0, codes)?;
+                write_bytes(&chunks[c], scale_plane_offset(d), &scale_bytes(scales))?;
+                jobs.push(bytes_ptr(&stage[c])? as i64);
+                jobs.push(bytes_ptr(&chunks[c])? as i64);
                 jobs.push(used as i64);
                 max_rows = max_rows.max(used);
             }
@@ -180,7 +189,7 @@ impl ResidentPage {
     }
 
     /// A page over a live tail's key pages, taken as they stand — `chunks` each a
-    /// `[PAGE_BLOCKS, d]` slot view holding rows row-major.
+    /// key page holding its codes row-major.
     pub fn from_key_pages(
         chunks: Vec<Tensor>,
         rows: usize,
@@ -232,11 +241,13 @@ impl ResidentPage {
             .map(|(c, t)| {
                 let rows = chunk_rows(self.rows, c);
                 let (group_stride, row_stride) = match self.layout {
-                    ChunkLayout::Blocked => (rows as i64, 1),
-                    ChunkLayout::RowMajor => (1, (self.d / 4) as i64),
+                    ChunkLayout::Blocked => ((rows * CODE_GROUP) as i64, CODE_GROUP as i64),
+                    ChunkLayout::RowMajor => (CODE_GROUP as i64, self.d as i64),
                 };
+                let ptr = bytes_ptr(t)?;
                 Ok(ChunkDesc {
-                    ptr: tensor_ptr(t)?,
+                    ptr,
+                    scales: ptr + scale_plane_offset(self.d) as u64,
                     rows,
                     group_stride,
                     row_stride,
@@ -245,30 +256,40 @@ impl ResidentPage {
             .collect()
     }
 
-    /// The page's rows, `[rows, d]` row-major, read back to the host — for a seal
-    /// that hands the page on as a record.
-    pub fn host_rows(&self) -> Result<Vec<f32>> {
+    /// The page's keys as they are stored, row-major, read back to the host —
+    /// for a seal that hands the page on as a record.
+    pub fn host_rows(&self) -> Result<Q8Keys> {
         let chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
         let d = self.d;
-        let mut out = vec![0f32; self.rows * d];
+        let nb = blocks(d);
+        let mut out = Q8Keys {
+            codes: vec![0u8; self.rows * d],
+            scales: Vec::with_capacity(self.rows * nb),
+            dim: d,
+        };
         for (c, t) in chunks.iter().enumerate() {
             let rows = chunk_rows(self.rows, c);
             let first = c * PAGE_BLOCKS;
-            let vals = t.flatten_all()?.narrow(0, 0, rows * d)?.to_vec1::<f32>()?;
-            let dst = &mut out[first * d..(first + rows) * d];
+            let vals = t.narrow(0, 0, rows * d)?.to_vec1::<u8>()?;
+            let dst = &mut out.codes[first * d..(first + rows) * d];
             match self.layout {
                 ChunkLayout::RowMajor => dst.copy_from_slice(&vals),
-                // `[d/4, rows, 4]`: group `g` of row `j` sits at `(g·rows + j)·4`.
+                // `[d/16, rows, 16]`: group `g` of row `j` sits at
+                // `(g·rows + j)·16`.
                 ChunkLayout::Blocked => {
-                    for g in 0..d / 4 {
+                    for g in 0..d / CODE_GROUP {
                         for j in 0..rows {
-                            let s = (g * rows + j) * 4;
-                            let o = j * d + g * 4;
-                            dst[o..o + 4].copy_from_slice(&vals[s..s + 4]);
+                            let s = (g * rows + j) * CODE_GROUP;
+                            let o = j * d + g * CODE_GROUP;
+                            dst[o..o + CODE_GROUP].copy_from_slice(&vals[s..s + CODE_GROUP]);
                         }
                     }
                 }
             }
+            out.scales.extend(scales_of(
+                &t.narrow(0, scale_plane_offset(d), rows * nb * 2)?
+                    .to_vec1::<u8>()?,
+            ));
         }
         Ok(out)
     }
@@ -358,19 +379,25 @@ mod tests {
         }
     }
 
-    fn ramp(n: usize, from: f32) -> Vec<f32> {
-        (0..n).map(|i| from + i as f32).collect()
+    /// `n` keys of width `d` whose codes are all distinct enough to tell a
+    /// misplaced group from a placed one.
+    fn keys(n: usize, d: usize, seed: usize) -> Q8Keys {
+        let vals: Vec<f32> = (0..n * d)
+            .map(|i| ((i * 7 + seed * 13) % 253) as f32 - 126.0)
+            .collect();
+        Q8Keys::quantize(&vals, d)
     }
 
-    /// Pages placed in one launch hold exactly the rows they were given, each
-    /// chunk in the channel-blocked layout — `[d/4, rows, 4]` over the chunk's
-    /// own row count — and describe themselves to the scorer by that layout.
+    /// Pages placed in one launch hold exactly the keys they were given, each
+    /// chunk's codes in the channel-blocked layout — `[d/16, rows, 16]` over the
+    /// chunk's own row count — with its scales row-major behind them, and
+    /// describe themselves to the scorer by that layout.
     #[test]
     fn placed_pages_hold_their_rows_channel_blocked() -> Result<()> {
         let Some(device) = cuda() else { return Ok(()) };
-        let d = 8usize;
-        let long = ramp((PAGE_BLOCKS + 3) * d, 0.0);
-        let short = ramp(2 * d, 10_000.0);
+        let d = 32usize;
+        let long = keys(PAGE_BLOCKS + 3, d, 0);
+        let short = keys(2, d, 5);
         let pages = ResidentPage::place_host(&[(&long, 3), (&short, 4)], d, &device)?;
         assert_eq!(pages.len(), 2);
 
@@ -379,49 +406,71 @@ mod tests {
         assert_eq!(pages[0].host_rows()?, long);
         assert_eq!(pages[1].host_rows()?, short);
 
-        // The short page's one chunk, raw: group 0 of rows 0 and 1, then group 1.
-        let raw = pages[1].chunks.lock().unwrap()[0]
-            .flatten_all()?
-            .narrow(0, 0, 2 * d)?
-            .to_vec1::<f32>()?;
-        assert_eq!(
-            raw,
-            vec![
-                10_000.0, 10_001.0, 10_002.0, 10_003.0, 10_008.0, 10_009.0, 10_010.0, 10_011.0,
-                10_004.0, 10_005.0, 10_006.0, 10_007.0, 10_012.0, 10_013.0, 10_014.0, 10_015.0,
-            ]
-        );
+        // The short page's one chunk, raw: group 0 of rows 0 and 1, then group 1
+        // of rows 0 and 1; then, at the scale plane, each row's one scale.
+        let chunk = pages[1].chunks.lock().unwrap()[0].clone();
+        let raw = chunk.narrow(0, 0, 2 * d)?.to_vec1::<u8>()?;
+        let c = &short.codes;
+        let want: Vec<u8> = [&c[0..16], &c[32..48], &c[16..32], &c[48..64]].concat();
+        assert_eq!(raw, want);
+        let scales = chunk.narrow(0, scale_plane_offset(d), 4)?.to_vec1::<u8>()?;
+        assert_eq!(scales, scale_bytes(&short.scales));
 
         let desc = pages[0].descriptors()?;
         let shape: Vec<_> = desc
             .iter()
-            .map(|c| (c.rows, c.group_stride, c.row_stride))
+            .map(|c| (c.rows, c.group_stride, c.row_stride, c.scales - c.ptr))
             .collect();
-        assert_eq!(shape, vec![(PAGE_BLOCKS, PAGE_BLOCKS as i64, 1), (3, 3, 1)]);
+        let plane = scale_plane_offset(d) as u64;
+        assert_eq!(
+            shape,
+            vec![
+                (PAGE_BLOCKS, (PAGE_BLOCKS * 16) as i64, 16, plane),
+                (3, 48, 16, plane)
+            ]
+        );
         Ok(())
     }
 
+    /// A key page holding `keys` row-major, as the append leaves one.
+    fn key_page(keys: &Q8Keys, device: &Device) -> Result<Tensor> {
+        let d = keys.dim;
+        let mut bytes = vec![0u8; super::super::index_keys::key_page_bytes(d)];
+        bytes[..keys.codes.len()].copy_from_slice(&keys.codes);
+        let at = scale_plane_offset(d);
+        let scales = scale_bytes(&keys.scales);
+        bytes[at..at + scales.len()].copy_from_slice(&scales);
+        let n = bytes.len();
+        Tensor::from_vec(bytes, (n,), device)
+    }
+
     /// A closed tail's key pages are taken as they stand: row-major, read at a
-    /// row stride of `d/4` float4 groups.
+    /// row stride of `d` bytes.
     #[test]
     fn key_pages_are_read_row_major_in_place() -> Result<()> {
         let Some(device) = cuda() else { return Ok(()) };
-        let d = 8usize;
+        let d = 16usize;
         let rows = PAGE_BLOCKS + 1;
-        let vals = ramp(2 * PAGE_BLOCKS * d, 0.0);
+        let all = keys(rows, d, 3);
+        let (codes, scales) = all.rows(0, PAGE_BLOCKS);
+        let first = Q8Keys {
+            codes: codes.to_vec(),
+            scales: scales.to_vec(),
+            dim: d,
+        };
         let chunks = vec![
-            Tensor::from_vec(vals[..PAGE_BLOCKS * d].to_vec(), (PAGE_BLOCKS, d), &device)?,
-            Tensor::from_vec(vals[PAGE_BLOCKS * d..].to_vec(), (PAGE_BLOCKS, d), &device)?,
+            key_page(&first, &device)?,
+            key_page(&all.from_row(PAGE_BLOCKS), &device)?,
         ];
         let page = ResidentPage::from_key_pages(chunks, rows, 2, d)?;
         assert_eq!(page.layout(), ChunkLayout::RowMajor);
-        assert_eq!(page.host_rows()?, vals[..rows * d].to_vec());
+        assert_eq!(page.host_rows()?, all);
         let shape: Vec<_> = page
             .descriptors()?
             .iter()
             .map(|c| (c.rows, c.group_stride, c.row_stride))
             .collect();
-        assert_eq!(shape, vec![(PAGE_BLOCKS, 1, 2), (1, 1, 2)]);
+        assert_eq!(shape, vec![(PAGE_BLOCKS, 16, 16), (1, 16, 16)]);
         Ok(())
     }
 

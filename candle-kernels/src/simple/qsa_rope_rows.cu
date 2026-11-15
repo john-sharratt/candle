@@ -11,11 +11,14 @@
 //     scored by cuBLAS instead — rotated into a scratch buffer that lives for
 //     one launch (`IndexCache::score_rows`), at `tail_base + j · ratio`.
 //
-// Rows come either from one dense `src` (`[n_rows, d]`), or — when `src_pages`
-// is non-null — from a PAGE TABLE: row `r` at `src_pages[r / rows_per_src_page]
-// + (r % rows_per_src_page) · d`. The live tail's keys are paged (one arena slot
-// per page), so reading them through the table is what spares the caller a
-// gather into one dense block (hot-path invariant 2b).
+// Rows come either from one dense float `src` (`[n_rows, d]`), or — when
+// `src_pages` is non-null — from a PAGE TABLE of Q8_0 key pages
+// (`../qsa_key_q8.cuh`): row `r` is row `r % rows_per_src_page` of page
+// `src_pages[r / rows_per_src_page]`, whose `rows_per_src_page · d` codes are
+// followed by its scales. The live tail's keys are paged (one arena slot per
+// page), so reading them through the table is what spares the caller a gather
+// into one dense block (hot-path invariant 2b), and they are dequantized as
+// they are read.
 //
 // Positions come either from a per-group array (`pos`, one entry per
 // `rows_per_pos` consecutive rows) or, when `pos` is null, from the affine
@@ -38,6 +41,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include "../qsa_key_q8.cuh"
 #include "../rope/rope_table.cuh"
 
 namespace qsa_rope_rows {
@@ -67,10 +71,24 @@ __global__ void rope_rows_kernel(
          i += (long long)gridDim.x * blockDim.x) {
         const int row = (int)(i / per_row);
         const int k = (int)(i - (long long)row * per_row);
-        const float* s = src_pages != nullptr
-            ? (const float*)(uintptr_t)__ldg(src_pages + row / rows_per_src_page)
-                  + (long long)(row % rows_per_src_page) * d
-            : src + (long long)row * d;
+        // A paged row is a Q8_0 key: its codes at `row · d` of its page, its
+        // scales at `row · nb` of the plane behind the page's codes.
+        const float* s = src + (long long)row * d;
+        const signed char* codes = nullptr;
+        const unsigned short* scales = nullptr;
+        if (src_pages != nullptr) {
+            const signed char* page = (const signed char*)(uintptr_t)__ldg(
+                src_pages + row / rows_per_src_page);
+            const int local = row % rows_per_src_page;
+            codes = page + (long long)local * d;
+            scales = (const unsigned short*)(page + (long long)rows_per_src_page * d)
+                + (long long)local * qsa_q8_blocks(d);
+        }
+        auto val = [&](int c) {
+            return codes != nullptr
+                ? (float)codes[c] * qsa_q8_scale(scales[c / QSA_Q8_BLOCK])
+                : s[c];
+        };
         float* o = dst + (long long)row * d;
         if (k < pairs) {
             const int group = row / rows_per_pos;
@@ -80,15 +98,15 @@ __global__ void rope_rows_kernel(
             const RopeView v = rope_view(
                 rungs, group_rung != nullptr ? __ldg(group_rung + group) : rung);
             const float scale = q_scale ? v.q_scale : 1.f;
-            float lo = s[k];
-            float hi = s[k + pairs];
+            float lo = val(k);
+            float hi = val(k + pairs);
             rope_f_rotate(lo, hi, rope_f_lookup(v.tab, pairs, p, k));
             o[k] = lo * scale;
             o[k + pairs] = hi * scale;
         } else {
             // Pass-through channel `c = k + pairs`, which is `>= 2·pairs`.
             const int c = k + pairs;
-            o[c] = s[c];
+            o[c] = val(c);
         }
     }
 }

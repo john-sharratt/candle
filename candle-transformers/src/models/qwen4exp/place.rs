@@ -1,8 +1,9 @@
 //! Placing a QSA index page — laying its rows out the way the scorer reads them.
 //!
 //! An index page's rows are one sealed unit's pooled, normed, **un-rotated**
-//! block keys, `[rows, head_dim]` as a record holds them. The paged scorer reads
-//! keys channel-blocked as `[head_dim/4, rows, 4]`, so a warp's key read is one
+//! block keys as Q8_0 (`key_q8`), their codes `[rows, head_dim]` as a record
+//! holds them. The paged scorer reads codes channel-blocked as
+//! `[head_dim/16, rows, 16]`, so a warp's read of a code group is one
 //! contiguous run; placing a page writes that layout once, rather than once per
 //! score.
 //!
@@ -13,7 +14,9 @@
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, Result, Tensor};
 
-use super::indexer::{i64_ptr, tensor_ptr};
+use super::index_keys::bytes_ptr;
+use super::indexer::i64_ptr;
+use super::resident_page::CODE_GROUP;
 use crate::models::wave_buffers::wave_from_vec_ticketed;
 
 /// Rows per block in [`Placement::run`].
@@ -21,8 +24,9 @@ use crate::models::wave_buffers::wave_from_vec_ticketed;
 /// The kernel's only real dial, and it pulls two ways: it is the length of the
 /// store phase's contiguous run and it multiplies the shared-memory footprint.
 ///
-/// **Measured** (`tests/qsa_page_place_bench.rs`, RTX PRO 5000 Blackwell, three
-/// runs, GB/s of read+write, with the rotation the pass carried at the time):
+/// **Measured** on `F32` keys in `float4` groups (`tests/qsa_page_place_bench.rs`,
+/// RTX PRO 5000 Blackwell, three runs, GB/s of read+write, with the rotation the
+/// pass carried at the time):
 ///
 /// | case | tile 8 | tile 16 | tile 32 | tile 64 |
 /// |---|---|---|---|---|
@@ -37,7 +41,7 @@ use crate::models::wave_buffers::wave_from_vec_ticketed;
 /// the shared memory of 32, which is what holds the occupancy.
 pub const PLACE_TILE_R: usize = 16;
 
-/// One page to place: `[rows, head_dim]` F32.
+/// One page to place: its codes, `[rows, head_dim]` U8.
 pub struct PlacePage<'a> {
     pub keys: &'a Tensor,
 }
@@ -86,10 +90,10 @@ impl Placement {
         }
         let device = pages[0].keys.device().clone();
         let (_, d) = pages[0].keys.dims2()?;
-        if d % 4 != 0 {
+        if d % CODE_GROUP != 0 {
             candle::bail!(
-                "index page placement: head_dim {d} is not a multiple of four — the scorer's \
-                 channel-blocked layout is built in `float4` groups"
+                "index page placement: head_dim {d} is not a multiple of {CODE_GROUP} — the \
+                 scorer's channel-blocked layout is built in groups of {CODE_GROUP} codes"
             );
         }
 
@@ -112,9 +116,8 @@ impl Placement {
         }
 
         // Fully overwritten by the kernel, so never zeroed (invariant 6).
-        let arena = Tensor::empty((total_rows * d,), DType::F32, &device)?;
-        let arena_base = tensor_ptr(&arena)?;
-        let elem = std::mem::size_of::<f32>() as u64;
+        let arena = Tensor::empty((total_rows * d,), DType::U8, &device)?;
+        let arena_base = bytes_ptr(&arena)?;
 
         let mut staged = Vec::with_capacity(pages.len());
         let mut jobs: Vec<i64> = Vec::with_capacity(pages.len() * PLACE_JOB_WORDS);
@@ -124,15 +127,15 @@ impl Placement {
             // than a second `tensor_ptr` per job: resolving a pointer walks the
             // storage and the layout, and at a thousand jobs that walk was
             // itself a measurable share of the plan.
-            jobs.push(tensor_ptr(p.keys)? as i64);
-            jobs.push((arena_base + (at * d) as u64 * elem) as i64);
+            jobs.push(bytes_ptr(p.keys)? as i64);
+            jobs.push((arena_base + (at * d) as u64) as i64);
             jobs.push(rows as i64);
             // A contiguous narrow reshaped is a view, so this costs no copy.
-            staged.push(
-                arena
-                    .narrow(0, at * d, rows * d)?
-                    .reshape((d / 4, rows, 4))?,
-            );
+            staged.push(arena.narrow(0, at * d, rows * d)?.reshape((
+                d / CODE_GROUP,
+                rows,
+                CODE_GROUP,
+            ))?);
             at += rows;
         }
         let n_jobs = pages.len();
@@ -178,7 +181,7 @@ impl Placement {
         Ok(())
     }
 
-    /// The placements, `[head_dim/4, rows, 4]` each, in the order the pages
+    /// The placements, `[head_dim/16, rows, 16]` each, in the order the pages
     /// were given.
     pub fn staged(&self) -> &[Tensor] {
         &self.staged
@@ -192,7 +195,7 @@ impl Placement {
 
 /// Plan and run — what a projection calls.
 ///
-/// Returns one `[head_dim/4, rows, 4]` F32 tensor per input page, in order.
+/// Returns one `[head_dim/16, rows, 16]` U8 tensor per input page, in order.
 #[cfg(feature = "cuda")]
 pub fn place_pages(pages: &[PlacePage<'_>], tile_r: usize) -> Result<Vec<Tensor>> {
     let placement = Placement::plan(pages, None)?;

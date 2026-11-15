@@ -8,6 +8,11 @@
 //! layout, strides, signed offset — is the test's to choose, and the oracle
 //! shares nothing with the kernel but the frequencies.
 //!
+//! The keys are Q8_0 (`docs/qsa_index_q8.md`): a page is built from stored
+//! keys, the kernel dequantizes each one in registers as it loads it, and the
+//! oracle scores the values those stored keys hold — so the bound below is the
+//! arithmetic's alone and a quantization change can never hide inside it.
+//!
 //! # The bound is derived, not tuned
 //!
 //! Each cell is `Σ_h relu(q_h · rot(k))`. A rotated key element carries the
@@ -38,6 +43,7 @@ use candle_transformers::models::qwen4exp::config::IndexerConfig;
 use candle_transformers::models::qwen4exp::indexer::{
     append_wave, AppendSpan, IndexCache, TailRoute, PAGE_BLOCKS as KEY_PAGE_BLOCKS,
 };
+use candle_transformers::models::qwen4exp::key_q8::{key_bytes, Q8Keys};
 use candle_transformers::models::qwen4exp::qsa::IndexerWeights;
 use candle_transformers::models::qwen4exp::qsa_select::Strata;
 use candle_transformers::models::qwen4exp::resident_page::ResidentPage;
@@ -119,10 +125,26 @@ fn dev_ptr_i64(t: &Tensor) -> Result<u64> {
     Ok(p)
 }
 
-/// How a page's keys sit in device memory.
+fn dev_ptr_u8(t: &Tensor) -> Result<u64> {
+    let Device::Cuda(dev) = t.device() else {
+        candle::bail!("harness tensors live on CUDA")
+    };
+    let stream = dev.cuda_stream();
+    let (s, l) = t.storage_and_layout();
+    let slice = match &*s {
+        candle::Storage::Cuda(c) => c.as_cuda_slice::<u8>()?,
+        _ => candle::bail!("expected CUDA u8"),
+    }
+    .slice(l.start_offset()..);
+    let (p, _g) = slice.device_ptr(&stream);
+    Ok(p)
+}
+
+/// How a page's codes sit in device memory. Its scales follow them, row-major,
+/// in both.
 #[derive(Clone, Copy, Debug)]
 enum Layout {
-    /// `[d/4, rows, 4]` — a placed page.
+    /// `[d/16, rows, 16]` — a placed page.
     Blocked,
     /// `[cap, d]`, rows beyond `rows` poisoned — the live tail, whose buffer
     /// is larger than what it holds.
@@ -136,18 +158,31 @@ struct Page {
     base: usize,
     rows: usize,
     last_cells: usize,
-    /// `[rows, d]`, un-rotated.
+    /// The keys as the index stores them.
+    q8: Q8Keys,
+    /// `[rows, d]`, un-rotated: the values `q8` holds, which is what the
+    /// kernel scores and so what the oracle does.
     keys: Vec<f32>,
     layout: Layout,
 }
 
 impl Page {
     fn new(base: usize, rows: usize, last_cells: usize, seed: u64, d: usize) -> Self {
+        Self::stored(
+            base,
+            last_cells,
+            Q8Keys::quantize(&seeded(rows * d, seed), d),
+        )
+    }
+
+    /// A page over keys already stored.
+    fn stored(base: usize, last_cells: usize, q8: Q8Keys) -> Self {
         Self {
             base,
-            rows,
+            rows: q8.n_rows(),
             last_cells,
-            keys: seeded(rows * d, seed),
+            keys: q8.dequantize(),
+            q8,
             layout: Layout::Blocked,
         }
     }
@@ -209,29 +244,35 @@ fn upload(pages: &[Page], d: usize, dev: &Device) -> Result<Uploaded> {
     let mut desc: Vec<i64> = Vec::with_capacity(pages.len() * PAGE_WORDS);
     let mut first: Vec<u32> = vec![0];
     let mut acc = 0usize;
-    let d4 = d / 4;
+    let groups = d / 16;
     for p in pages {
-        let (host, cstride, rstride) = match p.layout {
+        // The codes in the page's layout, then its scales row-major. Strides
+        // are bytes.
+        let (mut host, cstride, rstride) = match p.layout {
             Layout::Blocked => {
-                let mut v = vec![0f32; p.rows * d];
+                assert_eq!(d % 16, 0, "a blocked page is whole groups of 16 codes");
+                let mut v = vec![0u8; p.rows * d];
                 for j in 0..p.rows {
-                    for c in 0..d4 {
-                        for e in 0..4 {
-                            v[(c * p.rows + j) * 4 + e] = p.keys[j * d + c * 4 + e];
-                        }
+                    for c in 0..groups {
+                        let at = (c * p.rows + j) * 16;
+                        v[at..at + 16].copy_from_slice(&p.q8.codes[j * d + c * 16..][..16]);
                     }
                 }
-                (v, p.rows as i64, 1i64)
+                (v, (p.rows * 16) as i64, 16i64)
             }
             Layout::RowMajor { cap } => {
-                let mut v = vec![f32::NAN; cap * d];
-                v[..p.rows * d].copy_from_slice(&p.keys);
-                (v, 1i64, d4 as i64)
+                let mut v = vec![0x7fu8; cap * d];
+                v[..p.rows * d].copy_from_slice(&p.q8.codes);
+                (v, 16i64, d as i64)
             }
         };
+        let scales_at = host.len();
+        host.extend(p.q8.scales.iter().flat_map(|s| s.to_le_bytes()));
         let n = host.len();
         let buf = Tensor::from_vec(host, n, dev)?;
-        desc.push(dev_ptr_f32(&buf)? as i64);
+        let codes = dev_ptr_u8(&buf)?;
+        desc.push(codes as i64);
+        desc.push((codes + scales_at as u64) as i64);
         desc.push(cstride);
         desc.push(rstride);
         desc.push(p.base as i64 - (acc * RATIO) as i64);
@@ -676,10 +717,7 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
     // pages, so both routes read the tail across page boundaries.
     let pages = contiguous_pages(0, &[40, 23], &[RATIO, 2], 0xB1, D);
     let mut cache = IndexCache::new(D, &dev)?;
-    let host: Vec<(&[f32], usize)> = pages
-        .iter()
-        .map(|p| (p.keys.as_slice(), p.last_cells))
-        .collect();
+    let host: Vec<(&Q8Keys, usize)> = pages.iter().map(|p| (&p.q8, p.last_cells)).collect();
     for (p, page) in pages.iter().zip(ResidentPage::place_host(&host, D, &dev)?) {
         cache.push_page(page, p.base, RATIO)?;
     }
@@ -694,15 +732,9 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
 
     // The oracle's view: the pages, then the tail's stored rows where they sit.
     let tail_rows = cache.live_rows_host()?;
-    let n_tail = tail_rows.len() / D;
+    let n_tail = tail_rows.n_rows();
     let mut all = pages.clone();
-    all.push(Page {
-        base: cache.page_token_span(),
-        rows: n_tail,
-        last_cells: RATIO,
-        keys: tail_rows,
-        layout: Layout::Blocked,
-    });
+    all.push(Page::stored(cache.page_token_span(), RATIO, tail_rows));
 
     assert_eq!(n_tail, 2 * KEY_PAGE_BLOCKS + 75);
     let end = cache.page_token_span() + n_tail * RATIO;
@@ -834,7 +866,7 @@ fn bench_rot_scorer() -> Result<()> {
                 })?;
                 println!(
                     "{tokens:>9} {n_pages:>7} {t:>6} {:>9.1} {rot:>11.4} {rot90:>11.4} {norot:>11.4} {:>8.3} {:>10.2}",
-                    (n * D * 4) as f64 / 1e6,
+                    (n * key_bytes(D)) as f64 / 1e6,
                     rot / norot,
                     (t * n) as f64 / (rot * 1e6),
                 );
