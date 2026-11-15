@@ -381,14 +381,71 @@ the ratio is Q8_0 over `F32`.
   int-to-float conversions and 128 scale multiplies ahead of the same FMAs.
   Eight rows past 512K is 7–13% slower.
 
-**The decode and wide gates below are not met by the baseline reader.** It was
-deployed on WhiteWorld regardless, on the absolute numbers: the worst cell is
-+0.18 ms a launch against decode steps that waited about a second on expert
-misses the freed span is there to remove. Rounds 1–3 are what close it, and
-they need attribution this machine could not give: `ncu` refused with
-`ERR_NVGPUCTRPERM` (GPU performance counters are not enabled for this account),
-so registers, spills and occupancy are unread. Run them on BlackWorld, or
-enable the counters here.
+**The decode and wide gates below were not met by the baseline reader**, and
+it was deployed on WhiteWorld untuned — the step this section exists for was
+skipped. Rounds 1–2 are the tuning it should have had first.
+
+### Attribution — the wide arms spilled (`ptxas -v`, sm_86)
+
+`ncu` is refused on WhiteWorld (`ERR_NVGPUCTRPERM`: GPU performance counters
+are not enabled for this account), so the attribution is the compiler's own:
+each kernel compiled alone with the archive's flags and `-Xptxas -v`, and its
+SASS from `cuobjdump -sass`.
+
+| Arm `(TILE_R, H, CPT)` | `F32` stack | Q8_0 stack, 80 registers | Q8_0 stack, 128 registers |
+|---|---|---|---|
+| (4, 4, 2) — 64 rows and up | 48 B | **240 B** | 8 B |
+| (2, 4, 2) | 8 B | **144 B** | 0 |
+| (2, 4, 1) | 0 | 8 B | 0 |
+| (1, 4, 1) — one decoding row | 0 | 8 B | 0 (104 registers) |
+
+A Q8_0 key costs registers a float key did not: the sixteen codes of a load
+held while four words of them are dequantized, each block's scale, the scale
+row's address. Under `__launch_bounds__(256, 3)` — 80 registers — the wide
+arms spilled five times what the float kernel did, and the spilled shapes are
+exactly the slow ones.
+
+### Round 1 — two blocks per SM (128 registers, no spills)
+
+`QSA_PAGED_MIN_BLOCKS` 3 → 2. Ratio of Q8_0 to `F32` time, same sweep, same
+idle card, reproduced on a second run:
+
+| tokens | rows 1 | rows 8 | rows 64 | rows 512 | rows 2048 |
+|---|---|---|---|---|---|
+| 8K | 0.86 | 0.87 | 0.78 | 0.65 | 0.68 |
+| 32K | 0.83 | 0.73 | 0.75 | 0.63 | 0.67 |
+| 128K | 0.47 | 0.65 | 0.60 | 0.47 | 0.44 |
+| 512K | 0.36 | 0.40 | 0.48 | 0.46 | 0.46 |
+| 1M | 0.33 | 0.40 | 0.48 | 0.45 | 0.46 |
+
+(16 pages; 256 pages is 0.35–0.90.) **Faster than the float scorer in every
+cell, 1.1–3×.** Occupancy falls from 24 warps an SM to 16 and it does not
+matter: the spills cost far more than the third block's warps were worth.
+**Adopted.** Both speed gates now hold.
+
+### Round 2 — four codes a load, to fit 80 registers (rejected)
+
+Loading one word of four codes per step instead of holding a group of sixteen
+left **192 B** of stack at 80 registers, against 240: the held codes were not
+the pressure, the scales and their addresses are. It gives up the 16-byte
+vector load for nothing. **Reverted.**
+
+### The kernels as they stand (`ptxas -v` and SASS, sm_86)
+
+| Kernel | Registers | Stack | Notes |
+|---|---|---|---|
+| scorer (4, 4, 2) | 128 | 8 B | 12 × `LDG.E.128` code loads, 6 × `LDG.E.U16` scales, no scalar byte loads; 4 `LDL` / 3 `STL`; 2,816 `FFMA` |
+| scorer (1, 4, 1) | 104 | 0 | |
+| `append_kernel` / `flush_kernel` | 47 | 0 | one block of `d` threads a key: four full warps at `d = 128`, every shuffle under a full mask |
+| `carry_kernel` | 20 | 0 | |
+| `place_kernel<16>` | 40 | 0 | |
+| `rope_rows_kernel` | 30 | 0 | |
+| `qsa_shadow_kernel` | 64 | 48 B | its eight-head accumulator array |
+
+**Still to do**, in order: the counter-based readings (`ncu` — achieved
+occupancy, warp execution efficiency, stall reasons, DRAM and L1) on
+BlackWorld; `dp4a` on the pass-through half; row-major against blocked codes;
+the append and placement sweeps against their `F32` forms; tensor cores.
 
 **Gates for adoption:**
 

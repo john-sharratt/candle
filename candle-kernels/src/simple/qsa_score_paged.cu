@@ -69,8 +69,8 @@
 
 #define QSA_PAGED_THREADS 256
 
-/// Blocks per SM the templated kernel is compiled to fit: 80 registers.
-#define QSA_PAGED_MIN_BLOCKS 3
+/// Blocks per SM the templated kernel is compiled to fit: 128 registers.
+#define QSA_PAGED_MIN_BLOCKS 2
 
 /// Rows of the query tile one block holds in shared memory. Four keeps the
 /// tile at `4 × H × D` floats — 8 KB at the production geometry — which leaves
@@ -183,10 +183,16 @@ __device__ __forceinline__ float2 qsa_compose(float2 w, float2 l)
 /// and no candidate reads the table from L2. A warp spanning more runs than
 /// that reads each lane's rotation from the table.
 ///
-/// **Three blocks per SM.** Left to itself the compiler spends 123 registers on
-/// the `(4, 4, 2)` arm, which holds two blocks — 16 warps — while shared memory
-/// has room for three; with the SM issuing every 1.8 cycles for want of an
-/// eligible warp, the third block's warps are worth more than the registers.
+/// **Two blocks per SM, and no spills.** A Q8_0 key costs registers a float key
+/// did not — the sixteen codes of a load held while four words of them are
+/// dequantized, each block's scale, the scale row's address — and the
+/// `(4, 4, 2)` arm needs more than the 80 a third block leaves. Capped there it
+/// spilled 240 bytes of stack a thread (`ptxas -v`; a float key's arm spilled
+/// 48) and ran 6–63% SLOWER than the float scorer from 64 query rows up. At two
+/// blocks it has 128 registers, spills 8 bytes, and runs at 0.33–0.87× the
+/// float scorer's time in every shape of the sweep: the spills cost far more
+/// than the third block's warps were worth
+/// (`docs/qsa_index_q8.md` §9, rounds 0–2).
 template <int TILE_R, int H, int CPT>
 __global__ __launch_bounds__(QSA_PAGED_THREADS, QSA_PAGED_MIN_BLOCKS) void qsa_score_paged_kernel(
     const float* __restrict__ q,                     // [rows*H, D], rotated
