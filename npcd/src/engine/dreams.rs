@@ -75,6 +75,36 @@ pub const META_OF: &str = "dream.of";
 /// Conversation metadata: the assumption the dream suspends — the axis §8's
 /// search runs over, and what the next reflection is steered away from.
 pub const META_ASSUMPTION: &str = "dream.assumption";
+/// Conversation metadata: when the dream was kept, in Unix milliseconds — what
+/// [`last_dreamt_ms`] reads to space the next one ([`DREAM_EVERY_MS`]).
+pub const META_AT: &str = "dream.at";
+
+/// The least time between one of a character's dreams and its next: one a
+/// twelve-hour period.
+///
+/// **A dream is not every reflection's.** Each reflection went on to a dream
+/// whenever none was being written, so a character dreamt every few minutes —
+/// three to four minutes of decode each, on a card the whole cast shares — and
+/// its missions waited behind them. A reflection still answers every time; the
+/// dream after it waits its period.
+pub const DREAM_EVERY_MS: u64 = 12 * 60 * 60 * 1000;
+
+/// Whether a character whose last dream was kept at `last_ms` may dream again
+/// at `now_ms`: one that has never dreamt may.
+pub fn due(last_ms: Option<u64>, now_ms: u64) -> bool {
+    last_ms.is_none_or(|at| now_ms >= at.saturating_add(DREAM_EVERY_MS))
+}
+
+/// When `npc_id` last kept a dream, in Unix milliseconds: the newest
+/// [`META_AT`] among its kept dreams. `None` when none carries one.
+pub fn last_dreamt_ms(engine: &ConversationEngine, npc_id: u64) -> Option<u64> {
+    engine
+        .find_conversations_by_metadata(META_OF, &npc_id.to_string())
+        .into_iter()
+        .filter_map(|tl| engine.conversation_metadata_value(tl, META_AT))
+        .filter_map(|at| at.parse::<u64>().ok())
+        .max()
+}
 
 /// How much the dream conversation may write. A brief asks for about two
 /// hundred words; this is room for that and for the dream running longer than
@@ -469,9 +499,14 @@ pub async fn keep(
         if let Err(e) = engine.set_conversation_conv_id(timeline, &name) {
             tracing::warn!("{name}: could not be named in the log — {e:?}");
         }
+        let at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
         for (key, value) in [
             (META_OF, npc_id.to_string()),
             (META_ASSUMPTION, assumption.trim().to_string()),
+            (META_AT, at.to_string()),
         ] {
             if let Err(e) = engine.set_conversation_metadata(timeline, key, &value) {
                 tracing::warn!("{name}: metadata {key} not set — {e:?}");
@@ -629,6 +664,18 @@ pub fn forget(engine: &Arc<ConversationEngine>, npc_id: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **One dream a twelve-hour period**: due for a character that never
+    /// dreamt, not again until twelve hours after the last, and due from then.
+    #[test]
+    fn a_dream_is_due_once_a_twelve_hour_period() {
+        assert!(due(None, 0));
+        let last = 1_000_000;
+        assert!(!due(Some(last), last));
+        assert!(!due(Some(last), last + DREAM_EVERY_MS - 1));
+        assert!(due(Some(last), last + DREAM_EVERY_MS));
+        assert_eq!(DREAM_EVERY_MS, 43_200_000);
+    }
 
     const SCHEMA: &str = r#"
 system_prompt:

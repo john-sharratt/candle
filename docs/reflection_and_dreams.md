@@ -292,6 +292,10 @@ This line is a plan block in Part VIII's sense — *"a standing high-salience bl
 
 ## 7. The dream layer
 
+### One dream a twelve-hour period
+
+**A dream follows a reflection at most once every twelve hours** (`dreams::DREAM_EVERY_MS`). A kept dream carries `dream.at`, when it was kept, in Unix milliseconds; a reflection goes on to a dream only when the character's newest kept dream is twelve hours old or it has none (`dreams::due`, `Minds::dream_due`), and otherwise stops at its answer, saying so in the log. The stamp is on the dream, so a restart does not reset the period. A reflection still answers every time: what is spaced is the dream after it. Each reflection used to go on to a dream whenever none was being written, so a character dreamt every few minutes — three to four minutes of decode each, on the card the whole cast shares — and its missions waited behind them.
+
 ### One dream, one conversation
 
 **Built** (`npcd/src/engine/dreams.rs`), as two conversations rather than one. The dream is decoded in a brand-new transient conversation seeded by the brief, under the schema's `dreaming` stance and no acts shown; it is tombstoned after, like a reflection.

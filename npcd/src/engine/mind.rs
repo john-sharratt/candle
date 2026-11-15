@@ -1405,6 +1405,12 @@ impl Minds {
         dreams::count(&self.engine, npc_id)
     }
 
+    /// Whether this character's next dream is due: twelve hours since its last
+    /// kept one ([`dreams::DREAM_EVERY_MS`]), or it has never dreamt.
+    pub fn dream_due(&self, npc_id: u64, now_ms: u64) -> bool {
+        dreams::due(dreams::last_dreamt_ms(&self.engine, npc_id), now_ms)
+    }
+
     /// Whether this daemon can reflect at all: a mind that authors the
     /// questions, and a schema to ask them under.
     pub fn can_reflect(&self) -> bool {

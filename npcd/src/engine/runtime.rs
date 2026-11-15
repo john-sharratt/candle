@@ -4443,6 +4443,14 @@ impl Runtime {
         };
         let mut answer_tx = Some(answer_tx);
         let mut slot: Option<DreamSlot<'_>> = None;
+        // A dream follows a reflection once a twelve-hour period at most
+        // (`dreams::DREAM_EVERY_MS`); the reflection answers every time.
+        let dream_due = self
+            .minds
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|m| m.dream_due(npc_id, crate::api::now_ms()));
         let result = self
             .reflect_with(
                 npc_id,
@@ -4463,7 +4471,10 @@ impl Runtime {
                             started.elapsed()
                         );
                     }
-                    slot = self.claim_dream(npc_id);
+                    slot = match dream_due {
+                        true => self.claim_dream(npc_id),
+                        false => None,
+                    };
                     slot.is_some()
                 },
             )
@@ -4496,10 +4507,16 @@ impl Runtime {
                 .unwrap_or_default()
         );
         if slot.is_none() {
-            tracing::info!(
-                "npc {npc_id}: a dream is already being written, so this reflection stopped at \
-                 its answer"
-            );
+            match dream_due {
+                true => tracing::info!(
+                    "npc {npc_id}: a dream is already being written, so this reflection stopped \
+                     at its answer"
+                ),
+                false => tracing::info!(
+                    "npc {npc_id}: dreamt within the last twelve hours, so this reflection \
+                     stopped at its answer"
+                ),
+            }
             return;
         }
         match r.dream() {
