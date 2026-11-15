@@ -46,6 +46,7 @@ use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
 use super::retire_replies::retire_reply_records;
 use super::seal::seal_calibration;
+use super::sections::{compose, split};
 use super::spec::CalibrateSpec;
 use super::thinking::{exemplar, thinking_of};
 use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
@@ -611,14 +612,16 @@ struct Drafted {
     last_answer: String,
 }
 
-/// The unit's answers to its layer's calibration prompts, asked in turn in one
-/// draft whose lineage is the unit, each for as many questions as its rule
-/// gives a unit of `tokens`; the draft is tombstoned either way.
+/// The unit's answer to its layer's calibration prompts, asked together in
+/// one turn of a draft whose lineage is the unit — each a part under its own
+/// heading ([`super::sections`]), each for as many questions as its rule gives
+/// a unit of `tokens`; the draft is tombstoned either way.
 ///
-/// **One draft, every prompt in turn.** Each later prompt is asked with the
-/// unit's reading and the earlier answers in front of it, so it can be told to
-/// ask nothing already asked; a question one prompt repeats of another's word
-/// for word is kept once.
+/// **Every part in one turn, with the reading in front of it.** The parts see
+/// each other, so a later one can be told to ask nothing an earlier one asked;
+/// a question two parts repeat word for word is kept once. An answer that
+/// carries no headings is read as one list, against the parts' counts
+/// together.
 fn draft(
     engine: &ConversationEngine,
     spec: &CalibrateSpec,
@@ -642,59 +645,83 @@ fn draft(
                     .banned_tokens
                     .push(sampling.tool_call_open_token_id);
             }
-            let mut out = Drafted {
-                questions: Vec::new(),
-                wanted: 0,
-                last_answer: String::new(),
+            let asks = spec.asks_for(&unit.subject);
+            let wanted: Vec<usize> = asks
+                .iter()
+                .map(|a| a.questions.for_tokens(tokens))
+                .collect();
+            let parts: Vec<(&str, String)> = asks
+                .iter()
+                .zip(&wanted)
+                .map(|(a, &n)| (a.name.as_str(), a.prompt_for(&unit.subject, n)))
+                .collect();
+            let options = TurnOptions {
+                max_tokens: Some(DRAFT_MAX_TOKENS),
+                sampling: Some(sampling),
+                selection: draft_selection(),
+                tags: vec![TAG.to_string()],
+                ..Default::default()
             };
+            let handle = conv
+                .submit_turn_with_options(compose(&parts), options)
+                .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
+            let resp = handle
+                .wait_cancellable(crate::ingest_cancel::token())
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+            let answer = answer_of(&resp.answer, 0, &resp.stats.finish);
+            conv.finish_turn(handle, &resp)
+                .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+            let answer = answer?;
+            let total: usize = wanted.iter().sum();
+            let names: Vec<&str> = asks.iter().map(|a| a.name.as_str()).collect();
             let mut seen: HashSet<String> = HashSet::new();
-            for ask in spec.asks_for(&unit.subject) {
-                let wanted = ask.questions.for_tokens(tokens);
-                let options = TurnOptions {
-                    max_tokens: Some(DRAFT_MAX_TOKENS),
-                    sampling: Some(sampling.clone()),
-                    selection: draft_selection(),
-                    tags: vec![TAG.to_string()],
-                    ..Default::default()
-                };
-                let handle = conv
-                    .submit_turn_with_options(ask.prompt_for(&unit.subject, wanted), options)
-                    .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
-                let resp = handle
-                    .wait_cancellable(crate::ingest_cancel::token())
-                    .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-                let answer = answer_of(&resp.answer, 0, &resp.stats.finish);
-                conv.finish_turn(handle, &resp)
-                    .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
-                let answer = answer?;
-                let before = out.questions.len();
-                out.questions.extend(
-                    questions(&answer, wanted)
-                        .into_iter()
-                        .filter(|q| seen.insert(q.to_lowercase())),
-                );
-                let got = out.questions.len() - before;
-                // **A prompt that writes far short of its count is said so, with
-                // what it wrote.** The draft is gone once read, and a unit whose
-                // later prompts kept nothing reads like one with a small budget.
-                if got * 2 < wanted {
-                    let opening: String = answer.chars().take(240).collect();
-                    tracing::warn!(
-                        target: "zend::calibrate",
-                        subject = %unit.subject,
-                        prompt = %ask.name,
-                        wanted,
-                        got,
-                        chars = answer.len(),
-                        "a calibration prompt wrote under half its questions: {opening:?}",
-                    );
+            let mut kept: Vec<String> = Vec::new();
+            match split(&answer, &names) {
+                Some(bodies) => {
+                    for ((body, &n), name) in bodies.iter().zip(&wanted).zip(&names) {
+                        let before = kept.len();
+                        kept.extend(
+                            questions(body, n)
+                                .into_iter()
+                                .filter(|q| seen.insert(q.to_lowercase())),
+                        );
+                        short_of(unit, name, n, kept.len() - before, body);
+                    }
                 }
-                out.wanted += wanted;
-                out.last_answer = answer;
+                None => {
+                    kept = questions(&answer, total)
+                        .into_iter()
+                        .filter(|q| seen.insert(q.to_lowercase()))
+                        .collect();
+                    short_of(unit, "all", total, kept.len(), &answer);
+                }
             }
-            Ok(out)
+            Ok(Drafted {
+                questions: kept,
+                wanted: total,
+                last_answer: answer,
+            })
         },
     )
+}
+
+/// **A part that writes far short of its count is said so, with what it
+/// wrote.** The draft is gone once read, and a unit one of whose parts kept
+/// nothing reads like one with a small budget.
+fn short_of(unit: &Unit, part: &str, wanted: usize, got: usize, wrote: &str) {
+    if got * 2 >= wanted {
+        return;
+    }
+    let opening: String = wrote.chars().take(240).collect();
+    tracing::warn!(
+        target: "zend::calibrate",
+        subject = %unit.subject,
+        part,
+        wanted,
+        got,
+        chars = wrote.len(),
+        "a calibration part wrote under half its questions: {opening:?}",
+    );
 }
 
 /// Run `f` on a draft: a fork of `base` whose lineage is the unit at `unit` —

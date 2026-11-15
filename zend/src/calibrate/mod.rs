@@ -31,6 +31,7 @@ pub mod questions;
 pub mod retire_replies;
 pub mod run;
 pub mod seal;
+pub mod sections;
 pub mod spec;
 pub mod thinking;
 

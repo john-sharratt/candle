@@ -213,16 +213,20 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   64-token cadence, so the probe that decides what is pulled in has seen at
   most that much of the model's thinking.
 - **Several prompts, each for one kind of question.** A layer declares a
-  list of prompts (`calibrate/ask.rs`), asked in turn in one draft:
-  `code_reading` asks for what the file **defines** ("where's `tier_fits`
-  defined?"), how that is **used** ("what calls it, what breaks if it
-  changes?" — the transitive questions) and its **purpose** (the
-  architectural ones). One prompt asking for every kind wrote nearly all
-  "what does X do / why" questions and almost none of the others
-  (BlackWorld, 2026-11-15). Each later prompt sees the reading and the
-  earlier answers, and is told to ask nothing already asked; a question one
-  prompt repeats of another's word for word is kept once. A drawn guide is
-  asked its guidance prompt alone.
+  list of prompts (`calibrate/ask.rs`), asked together in one turn of the
+  draft, each a part under its own `## name` heading
+  (`calibrate/sections.rs`): `code_reading` asks for what the file
+  **defines** ("where's `tier_fits` defined?"), how that is **used** ("what
+  calls it, what breaks if it changes?" — the transitive questions) and its
+  **purpose** (the architectural ones). One prompt asking for every kind wrote
+  nearly all "what does X do / why" questions and almost none of the others;
+  the same prompts asked in turn lost sight of the reading after the first,
+  and about half the drafts kept only that one's questions (BlackWorld,
+  2026-11-15). In one turn every part is written with the reading in front of
+  it and sees the others, so it is told to ask nothing already asked; the
+  answer is split back by its headings, each part read against its own
+  count, and a question two parts repeat word for word is kept once. A drawn
+  guide is asked its guidance prompt alone.
 - **As many questions as the unit has to be asked about.** Each prompt's
   count is a rule, not a number: one question per `per_tokens` of the unit's
   own sealed tokens, held to `min..=max` (`calibrate/count.rs`) — definitions
