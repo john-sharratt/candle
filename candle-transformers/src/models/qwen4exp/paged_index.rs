@@ -31,7 +31,7 @@
 use candle::{Device, Result, Tensor};
 
 use super::indexer::IndexCache;
-use super::key_q8::{blocks, Q8Keys};
+use super::key_q8::{blocks, Fidelity, Q8Keys};
 use super::resident_page::ResidentPage;
 #[cfg(feature = "cuda")]
 use crate::models::operand_guard::expect_dense;
@@ -711,33 +711,38 @@ pub fn decode_page(blob: &[u8]) -> Result<SealedIndex> {
 
 /// A layer's section as [`F32_INDEX_VERSION`] wrote it — its completed rows
 /// `F32` — read and quantized: what a migration turns into [`encode_page`]'s
-/// bytes.
-fn decode_f32_page(blob: &[u8]) -> Result<SealedIndex> {
+/// bytes. How closely the quantized keys hold the `F32` ones is added to
+/// `fidelity`.
+fn decode_f32_page(blob: &[u8], fidelity: &mut Fidelity) -> Result<SealedIndex> {
     let (rows, dim, last_cells, n_open) = page_header(blob)?;
     let n = rows * dim * 4;
     let want = 16 + n + n_open * dim * 4;
-    if blob.len() < want {
+    if blob.len() != want {
         candle::bail!(
             "index page: an F32 blob is {} bytes but [{rows}, {dim}] with {n_open} open rows \
-             needs {want}",
+             is {want}",
             blob.len()
         );
     }
+    let rows = floats(&blob[16..16 + n]);
+    let keys = Q8Keys::quantize(&rows, dim);
+    fidelity.add(&rows, &keys);
     Ok(SealedIndex {
-        keys: Q8Keys::quantize(&floats(&blob[16..16 + n]), dim),
+        keys,
         last_cells,
         open: floats(&blob[16 + n..want]),
     })
 }
 
 /// What [`migrate_aux`] found a container to be.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AuxMigration {
     /// Already [`AUX_VERSION`]: nothing to do.
     Current,
-    /// Written at [`F32_INDEX_VERSION`]; these are its bytes at
-    /// [`AUX_VERSION`], every completed key quantized.
-    Migrated(Vec<u8>),
+    /// Written at [`F32_INDEX_VERSION`]; `bytes` are the container at
+    /// [`AUX_VERSION`], every completed key quantized, and `fidelity` how
+    /// closely those keys hold the `F32` ones.
+    Migrated { bytes: Vec<u8>, fidelity: Fidelity },
 }
 
 /// Rewrite an aux container whose index keys are `F32` as one whose keys are
@@ -745,6 +750,11 @@ pub enum AuxMigration {
 ///
 /// The one reader of [`F32_INDEX_VERSION`]: the daemon refuses that version
 /// ([`decode_aux`]), and `substrate_inspect migrate-index-q8` comes here.
+///
+/// **Strict about the container's own shape**, at either version: the sections
+/// must account for every byte. A migration is handed payloads it has to tell
+/// apart by structure — a section's page is one container, a turn's is a framed
+/// list of them — and bytes that merely begin with a version word are not one.
 pub fn migrate_aux(blob: &[u8]) -> Result<AuxMigration> {
     let u32_at = |o: usize| -> Result<u32> {
         let b = blob
@@ -752,12 +762,11 @@ pub fn migrate_aux(blob: &[u8]) -> Result<AuxMigration> {
             .ok_or_else(|| candle::Error::Msg("aux blob: truncated".into()))?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
-    match u32_at(0)? {
-        AUX_VERSION => return Ok(AuxMigration::Current),
-        F32_INDEX_VERSION => {}
-        v => {
-            candle::bail!("aux blob: version {v} is neither {F32_INDEX_VERSION} nor {AUX_VERSION}")
-        }
+    let version = u32_at(0)?;
+    if version != AUX_VERSION && version != F32_INDEX_VERSION {
+        candle::bail!(
+            "aux blob: version {version} is neither {F32_INDEX_VERSION} nor {AUX_VERSION}"
+        );
     }
     let ple_len = u32_at(4)? as usize;
     let ple_end = 8 + ple_len;
@@ -766,17 +775,42 @@ pub fn migrate_aux(blob: &[u8]) -> Result<AuxMigration> {
         .ok_or_else(|| candle::Error::Msg("aux blob: PLE section truncated".into()))?;
     let n_pages = u32_at(ple_end)? as usize;
     let mut off = ple_end + 4;
-    let mut layers = Vec::with_capacity(n_pages.min(blob.len() / 4));
+    let mut sections = Vec::with_capacity(n_pages.min(blob.len() / 4));
     for i in 0..n_pages {
         let len = u32_at(off)? as usize;
         off += 4;
-        let section = blob
-            .get(off..off + len)
-            .ok_or_else(|| candle::Error::Msg(format!("aux blob: page {i} truncated")))?;
-        layers.push(decode_f32_page(section)?);
+        sections.push(
+            blob.get(off..off + len)
+                .ok_or_else(|| candle::Error::Msg(format!("aux blob: page {i} truncated")))?,
+        );
         off += len;
     }
-    Ok(AuxMigration::Migrated(encode_aux(ple, &layers)?))
+    if off != blob.len() {
+        candle::bail!(
+            "aux blob: {n_pages} page(s) account for {off} of {} bytes",
+            blob.len()
+        );
+    }
+    if version == AUX_VERSION {
+        for (i, s) in sections.iter().enumerate() {
+            let page = decode_page(s)?;
+            let want =
+                16 + page.keys.codes.len() + page.keys.scales.len() * 2 + page.open.len() * 4;
+            if s.len() != want {
+                candle::bail!("aux blob: page {i} is {} bytes but holds {want}", s.len());
+            }
+        }
+        return Ok(AuxMigration::Current);
+    }
+    let mut fidelity = Fidelity::default();
+    let layers = sections
+        .iter()
+        .map(|s| decode_f32_page(s, &mut fidelity))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(AuxMigration::Migrated {
+        bytes: encode_aux(ple, &layers)?,
+        fidelity,
+    })
 }
 
 #[cfg(test)]

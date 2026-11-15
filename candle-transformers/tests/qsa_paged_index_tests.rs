@@ -518,9 +518,17 @@ fn migration_rewrites_an_f32_container_as_q8() -> Result<()> {
         .map(|i| (rng.vec((2 + i) * HEAD_DIM), 1 + i, rng.vec(i * HEAD_DIM)))
         .collect();
     let old = f32_aux(&ple, &layers);
-    let AuxMigration::Migrated(new) = migrate_aux(&old)? else {
+    let AuxMigration::Migrated {
+        bytes: new,
+        fidelity,
+    } = migrate_aux(&old)?
+    else {
         panic!("an F32 container was not migrated");
     };
+    // Every completed key of every layer is tallied, and held closely.
+    assert_eq!(fidelity.keys, 2 + 3 + 4);
+    assert!(fidelity.snr_db() > 35.0, "{fidelity:?}");
+    assert!(fidelity.cos_min > 0.999, "{fidelity:?}");
     let want: Vec<SealedIndex> = layers
         .iter()
         .map(|(rows, last_cells, open)| SealedIndex {

@@ -127,6 +127,84 @@ impl Q8Keys {
     }
 }
 
+/// How closely stored keys hold the keys they were made from, accumulated over
+/// any number of them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fidelity {
+    pub keys: u64,
+    /// `Σ ‖k − k̂‖²` over every key.
+    pub err_sq: f64,
+    /// `Σ ‖k‖²` over every key.
+    pub norm_sq: f64,
+    /// `Σ cos(k, k̂)` over every key with a direction.
+    pub cos_sum: f64,
+    /// The least `cos(k, k̂)` of any key with a direction.
+    pub cos_min: f64,
+}
+
+impl Default for Fidelity {
+    fn default() -> Self {
+        Self {
+            keys: 0,
+            err_sq: 0.0,
+            norm_sq: 0.0,
+            cos_sum: 0.0,
+            cos_min: 1.0,
+        }
+    }
+}
+
+impl Fidelity {
+    /// Add the keys `rows` (`[n, dim]`) against what `stored` holds of them.
+    pub fn add(&mut self, rows: &[f32], stored: &Q8Keys) {
+        let dim = stored.dim.max(1);
+        let held = stored.dequantize();
+        for (k, h) in rows.chunks_exact(dim).zip(held.chunks_exact(dim)) {
+            let (mut err, mut kk, mut hh, mut kh) = (0f64, 0f64, 0f64, 0f64);
+            for (&a, &b) in k.iter().zip(h) {
+                let (a, b) = (a as f64, b as f64);
+                err += (a - b) * (a - b);
+                kk += a * a;
+                hh += b * b;
+                kh += a * b;
+            }
+            self.err_sq += err;
+            self.norm_sq += kk;
+            // A key with no direction — all zero, before or after — has no
+            // cosine and counts as held exactly when both are.
+            let cos = if kk > 0.0 && hh > 0.0 {
+                kh / (kk.sqrt() * hh.sqrt())
+            } else if kk == hh {
+                1.0
+            } else {
+                0.0
+            };
+            self.cos_sum += cos;
+            self.cos_min = self.cos_min.min(cos);
+            self.keys += 1;
+        }
+    }
+
+    /// Fold another tally in.
+    pub fn merge(&mut self, other: &Fidelity) {
+        self.keys += other.keys;
+        self.err_sq += other.err_sq;
+        self.norm_sq += other.norm_sq;
+        self.cos_sum += other.cos_sum;
+        self.cos_min = self.cos_min.min(other.cos_min);
+    }
+
+    /// Signal to quantization noise, in dB.
+    pub fn snr_db(&self) -> f64 {
+        10.0 * (self.norm_sq / self.err_sq.max(f64::MIN_POSITIVE)).log10()
+    }
+
+    /// The mean `cos(k, k̂)`.
+    pub fn cos_mean(&self) -> f64 {
+        self.cos_sum / (self.keys.max(1) as f64)
+    }
+}
+
 /// Quantize one key, appending its codes and its scales.
 pub fn quantize_key(key: &[f32], codes: &mut Vec<u8>, scales: &mut Vec<u16>) {
     for block in key.chunks(BLOCK) {
@@ -248,6 +326,38 @@ mod tests {
                 "channel {i}: {x} against {y} at step {d}"
             );
         }
+    }
+
+    /// The fidelity tally is the keys' own arithmetic: an exactly held key
+    /// adds no error and a cosine of one, a perturbed one what it lost, and a
+    /// merge is the sum.
+    #[test]
+    fn fidelity_tallies_error_and_cosine() {
+        // Codes land exactly: ±127 and 0 at a scale of 1.
+        let exact = [127.0f32, -127.0, 0.0, 64.0];
+        let mut f = Fidelity::default();
+        f.add(&exact, &Q8Keys::quantize(&exact, 4));
+        assert_eq!((f.keys, f.err_sq), (1, 0.0));
+        assert!((f.cos_min - 1.0).abs() < 1e-12 && (f.cos_mean() - 1.0).abs() < 1e-12);
+
+        // 0.4 rounds to 0 beside 127: the error is 0.4², the norm 127² + 0.4².
+        let rough = [127.0f32, 0.4, 0.0, 0.0];
+        let mut g = Fidelity::default();
+        g.add(&rough, &Q8Keys::quantize(&rough, 4));
+        assert!((g.err_sq - 0.16).abs() < 1e-6, "{g:?}");
+        assert!((g.norm_sq - (127.0f64 * 127.0 + 0.16)).abs() < 1e-3);
+        assert!(g.cos_min < 1.0 && g.cos_min > 0.999_99);
+        assert!((g.snr_db() - 10.0 * (g.norm_sq / g.err_sq).log10()).abs() < 1e-12);
+
+        f.merge(&g);
+        assert_eq!(f.keys, 2);
+        assert_eq!(f.cos_min, g.cos_min);
+        assert!((f.err_sq - g.err_sq).abs() < 1e-12);
+
+        // A zero key is held exactly and has no direction to lose.
+        let mut z = Fidelity::default();
+        z.add(&[0.0; 4], &Q8Keys::quantize(&[0.0; 4], 4));
+        assert_eq!((z.keys, z.cos_min), (1, 1.0));
     }
 
     /// Rows narrow and borrow by row, both planes together.

@@ -62,6 +62,8 @@ mod cast;
 mod completeness;
 #[path = "substrate_inspect/faces.rs"]
 mod faces;
+#[path = "substrate_inspect/index_q8.rs"]
+mod index_q8;
 #[path = "substrate_inspect/kept.rs"]
 mod kept;
 #[path = "substrate_inspect/liveness.rs"]
@@ -695,6 +697,16 @@ enum Cmd {
     /// recurrent snapshot per face. The daemon must be stopped. Directory
     /// target only.
     RetireFaces,
+    /// **Writes** (unless `--dry-run`). Rewrite every QSA index this store
+    /// holds as `F32` keys as Q8_0 ones — turn and section index pages, and the
+    /// index a snapshot or branch checkpoint carries (`docs/qsa_index_q8.md`
+    /// §8). A build reads the Q8_0 form only. The daemon must be stopped.
+    /// Directory target only.
+    MigrateIndexQ8 {
+        /// Count what would be rewritten and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// The store's kept custom objects as `daemon`'s export, the lines `GET
     /// /v1/substrate/<daemon>/objects/export` answers — read-only, under no
     /// model, so a store its new model key refuses still exports
@@ -1285,6 +1297,12 @@ fn main() -> Result<()> {
                 .context("the substrate directory has no parent workspace")?;
             return faces::retire_faces(workspace);
         }
+        if let Cmd::MigrateIndexQ8 { dry_run } = &cli.cmd {
+            let workspace = target
+                .parent()
+                .context("the substrate directory has no parent workspace")?;
+            return index_q8::migrate_index_q8(workspace, *dry_run);
+        }
         if let Cmd::ExportKept { daemon, out } = &cli.cmd {
             return kept::export_kept(&target, daemon, out);
         }
@@ -1373,6 +1391,9 @@ fn main() -> Result<()> {
         }
         Cmd::RetireFaces => {
             anyhow::bail!("retire-faces requires the segmented `substrate` DIRECTORY target")
+        }
+        Cmd::MigrateIndexQ8 { .. } => {
+            anyhow::bail!("migrate-index-q8 requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::ExportKept { .. } => {
             anyhow::bail!("export-kept requires the segmented `substrate` DIRECTORY target")

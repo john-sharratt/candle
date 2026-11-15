@@ -52,6 +52,7 @@ pub mod header_index;
 mod held_groups;
 mod held_types;
 pub mod identity;
+pub mod index_q8_migration;
 pub mod inherit;
 pub mod integrity;
 pub mod joined;
@@ -3141,6 +3142,15 @@ impl SubstratePersistence {
     /// can apply to a detached identity (`read_event`'s fix-up).
     pub fn no_rebases(&self) -> bool {
         self.rebases.is_empty()
+    }
+
+    /// Every live recurrent tail — a conversation's snapshot or a prompt
+    /// branch's checkpoint — by its stream id, with where its record is.
+    pub fn recurrent_tails(&self) -> Vec<(StreamId, RecordLoc)> {
+        self.snapshot_locs
+            .iter()
+            .map(|(stream, loc)| (StreamId(*stream), *loc))
+            .collect()
     }
 
     /// Read one record's payload back by location — the snapshot-restore

@@ -260,30 +260,50 @@ this costs nothing.
 
 ## 8. Migration
 
-A one-time program, `substrate_inspect migrate-index-q8 --log <dir>`, run on a
-stopped substrate:
+A one-time program, `substrate_inspect migrate-index-q8 --log <substrate dir>`,
+run on a stopped substrate (`persistence/index_q8_migration.rs`):
 
-1. `--dry-run` counts every record holding a version-3 container, by kind, and
-   their bytes.
+1. `--dry-run` opens the store read-only — safe beside a running daemon — and
+   counts every record holding a version-3 container, by kind, with their
+   bytes as they stand and as Q8_0, and **how closely the Q8_0 keys hold the
+   `F32` ones**: signal to noise over every key, and the mean and least cosine.
 2. The run decodes each, quantizes its completed rows with `quantize_key`
-   (§3), re-encodes at version 4 and re-emits
-   the record as compaction re-emits one it relocates; the superseded records
-   are dead weight a later compaction reclaims. A `TurnIndexPage` is unframed,
-   each page migrated, and reframed with its token widths unchanged.
-3. It ends by counting the version-3 containers left, which must be zero.
+   (§3), re-encodes at version 4 and appends the record again. A
+   `TurnIndexPage` holds either one container (a prompt section's page) or a
+   framed list of them (a turn's pages); the two are told apart by structure,
+   each read strict about accounting for every byte, and a payload that reads
+   as both or as neither is reported and left. A framed list is rewritten page
+   by page with its token widths unchanged.
+3. It commits, opens the store again and counts: none of this node's own
+   version-3 records may still be what a reload reads.
 
-**To settle before it is written, by reading
-`substrate/replicated_state.rs` and `persistence/maintenance.rs`:**
-`TurnIndexPage` is last-writer-wins per turn stream and is replicated. The
-migration must re-emit under the record's **existing stamp**, so a migrated
-member neither wins over nor loses to a peer's copy of the same turn, and a
-cluster must not have one member writing version 4 while another still reads
-version 3. WhiteWorld's npcd substrate is its own; BlackWorld's zend is the one
-this bears on, and its migration is timed with BlackWorld's session (which has
-asked for that) around its calibration sweep.
+**Under a new stamp, and only what this node wrote.** Of two records with one
+identity a reload keeps the one it meets first (`stamps::take` is strict), so a
+rewrite under the old stamp would be dropped. The rewritten record is a later
+write by this node — in the page's own generation, so a section's page is still
+the section's — and supersedes the one it replaces, whose bytes maintenance
+reclaims. A page belongs to the member that wrote its stream (`StreamKey` is
+the stream and its writer), so a record this node stamps cannot supersede
+another member's page: those are counted as **foreign** and left, and arrive
+rewritten from the member that wrote them once it has run this. Until then a
+build reads those turns' K/V with no index. A snapshot's tail is keyed by its
+stream alone and is rewritten whoever wrote it.
 
-Run first against a copy of each store, with the count and a resumed
-conversation checked.
+So on a replicated store **every member is stopped, migrated and started on
+the new build together**: a member on the old build cannot read a version-4
+page a migrated peer sends it, and a page whose writer has left the cluster
+stays `F32` and unindexed.
+
+**WhiteWorld's npcd store, dry run 2026-11-15** (28 GB, the daemon running):
+
+| Records | Q8_0 | `F32` | `F32` MiB | as Q8_0 MiB | foreign | unreadable |
+|---|---|---|---|---|---|---|
+| turn and section index pages | 0 | 2,917 | 3,487.6 | 928.3 | 0 | 0 |
+| snapshots and checkpoints | 1,689 | 28 | 3,164.6 | 3,155.5 | 0 | 0 |
+
+7,162,818 keys held at **45.2 dB**, cosine to the `F32` key mean **0.999985**,
+least **0.999956**. The snapshots are mostly recurrent state; their index is
+the 9 MiB that shrinks.
 
 ## 9. The micro-harness, and the tuning method
 
@@ -355,8 +375,7 @@ beside the ones it extends (`qsa_score_rot_harness.rs`,
    test moves to the planes.
 3. **The micro-harness and its rounds** (§9).
 4. **The selection gate** against `F32` on recorded contexts.
-5. **The migration program**, after the replication question of §8 is
-   answered, with its dry run, against copies of real stores.
+5. **The migration program** (§8), with its dry run.
 6. **Main, then WhiteWorld and BlackWorld** migrated with their daemons stopped.
 7. **The tensor-core scorer**, adopted only if it beats what stands at the
    decode shape.
@@ -383,5 +402,6 @@ conversion in each direction that the finished design does not have.
 - `dp4a` quantizes the query, so it is a gated round after a float baseline
   rather than part of the first reader.
 - One aux version covers every persisted form; no separate page version word.
-- The migration's interaction with a replicated, last-writer-wins record.
+- The migration rewrites under a new stamp and only this node's own pages —
+  an equal stamp loses on reload, and a page is its writer's.
 - On-disk lands with the card, not after it.
