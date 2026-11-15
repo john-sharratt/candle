@@ -34,6 +34,10 @@ pub(super) struct CompactionSplit {
     pub kv_moves: u64,
     pub tenants_us: u64,
     pub tenant_passes: u32,
+    /// Regions the frontier fell by across the KV passes — what they bought.
+    pub kv_frontier_drop: u64,
+    /// Regions the frontier fell by across the span tenants' passes.
+    pub tenants_frontier_drop: u64,
 }
 
 impl CompactionSplit {
@@ -60,6 +64,16 @@ impl CompactionSplit {
     pub fn tenants(&mut self, took: Duration) {
         self.tenants_us += took.as_micros() as u64;
         self.tenant_passes += 1;
+    }
+
+    /// How far a KV pass lowered the frontier, from `before` to `after` regions.
+    pub fn kv_lowered(&mut self, before: usize, after: usize) {
+        self.kv_frontier_drop += before.saturating_sub(after) as u64;
+    }
+
+    /// How far a span tenants' pass lowered the frontier.
+    pub fn tenants_lowered(&mut self, before: usize, after: usize) {
+        self.tenants_frontier_drop += before.saturating_sub(after) as u64;
     }
 
     /// The KV stages as `name=ms` pairs, for the log.
@@ -96,8 +110,22 @@ mod tests {
                 kv_moves: 0,
                 tenants_us: 4_000,
                 tenant_passes: 2,
+                kv_frontier_drop: 0,
+                tenants_frontier_drop: 0,
             }
         );
+    }
+
+    /// The frontier's fall is summed per kind of pass, and a pass that raised
+    /// it — ground claimed while it ran — counts as no fall.
+    #[test]
+    fn the_frontiers_fall_is_summed_per_kind_of_pass() {
+        let mut s = CompactionSplit::default();
+        s.kv_lowered(455, 450);
+        s.kv_lowered(450, 452);
+        s.tenants_lowered(450, 447);
+        s.tenants_lowered(447, 447);
+        assert_eq!((s.kv_frontier_drop, s.tenants_frontier_drop), (5, 3));
     }
 
     /// A KV pass's stages sum stage by stage, and read back as `name=ms`.

@@ -1369,6 +1369,9 @@ impl Scheduler {
             .session
             .kv_region_stats()
             .map_or(shape.frontier, |s| s.live_watermark);
+        self.wave_stats
+            .compaction_split
+            .tenants_lowered(shape.frontier, after);
         self.kv_compaction_stall.record(
             FrontierPass::SpanTenants,
             shape,
@@ -1666,6 +1669,9 @@ impl Scheduler {
                 },
             );
             let t = report.timings;
+            self.wave_stats
+                .compaction_split
+                .kv_lowered(report.frontier_before, report.frontier_after);
             self.wave_stats.compaction_split.kv_stage(
                 [
                     t.quiesce,
