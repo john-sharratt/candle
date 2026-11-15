@@ -442,10 +442,53 @@ vector load for nothing. **Reverted.**
 | `rope_rows_kernel` | 30 | 0 | |
 | `qsa_shadow_kernel` | 64 | 48 B | its eight-head accumulator array |
 
-**Still to do**, in order: the counter-based readings (`ncu` — achieved
-occupancy, warp execution efficiency, stall reasons, DRAM and L1) on
-BlackWorld; `dp4a` on the pass-through half; row-major against blocked codes;
-the append and placement sweeps against their `F32` forms; tensor cores.
+### Round 3 — `ncu` on the tuned kernels (WhiteWorld, elevated, 2026-11-15)
+
+`ncu --set full`, one launch each, from an elevated shell — the counters are
+admin-only here and the first attempt, unelevated, was refused. The daemon was
+running beside it, so durations are indicative and the ratios are what to read.
+
+**Scorer `(4, 4, 2)`**, 128K tokens, 64 rows, 256 pages (`bench_rot_scorer_profile_one`):
+
+| Target | Reading |
+|---|---|
+| **Full warps** | **32.0** active threads a warp, 31.6 not predicated off |
+| **Occupancy** | theoretical 33.3%, achieved 33.7%; limited by registers (128 → 2 blocks; shared memory would hold 3, warps 6) |
+| **Compute** | SM throughput 63%, issue slots busy 69.5%, 2.78 instructions a cycle; FMA the busiest pipe at 48.5% — compute-bound, as the note says |
+| **Memory** | memory throughput 45% of peak, DRAM 9%, L2 hit 91.6%, L1 hit 18.9%; 10% excessive sectors from uncoalesced global loads (26.6 of 32 bytes a sector used) |
+| **Spills** | flagged by `ncu` as its largest estimate (44%), and wrong: the seven `LDL`/`STL` of the function sit in the per-pass setup and the epilogue, none between the first and last `FFMA` (SASS) |
+| **Shared** | 13.8% of shared-store wavefronts conflict (1.7-way) — the tile, step and warp-rotation fills, once a pass |
+| **FP32** | 29.4 M fused against 17.1 M non-fused instructions: the dequantize multiplies, the rotation, and the pass-through's deliberate `FMUL + 3 FFMA + FADD` |
+
+A further cut of held state — strides as `int`, the candidate index recomputed
+— left registers and stack where they were, and was not kept.
+
+**Placement `place_kernel<16>`** (`bench_qsa_page_place_every_shape`): 40
+registers, **theoretical occupancy 100%**, 32 active threads a warp; on the two
+shapes that stream — 32 pages × 512 rows and one 32,768-row section — DRAM is
+at **83% and 88% of peak** with 90% and 88% achieved occupancy, the bar the
+float kernel met. The small shapes are launches of a few microseconds. Done.
+
+**Append `append_kernel`** at decode width (two keys a launch): 47 registers,
+31.2 active threads a warp, 7 µs a launch, theoretical occupancy 83%
+(registers: 10 blocks of 128 threads an SM) — a launch-latency kernel with
+nothing to fill the card with.
+
+**What is left on the scorer is arithmetic**, and `ncu` agrees with the
+sweep: with spills gone it is compute-bound on the FMA pipe at a third of the
+card's warps. The next rounds, each needing an idle card to measure:
+
+1. **`dp4a` on the pass-through half** — a quarter of the instructions for
+   half the channels, no conversion, and fewer live registers in that loop;
+   it quantizes the query, so it carries its own selection gate.
+2. **One 8-byte load for a key's four scales** in place of four 2-byte loads —
+   the uncoalesced sectors above.
+3. **Row-major against blocked codes** (§3's open question).
+4. **The append and placement sweeps against their `F32` forms**, then tensor
+   cores.
+
+The sweep and the two-block choice are sm_86 measurements; BlackWorld runs its
+own before it migrates.
 
 **Gates for adoption:**
 
