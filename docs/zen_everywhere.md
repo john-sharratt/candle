@@ -138,7 +138,17 @@ restarting and rolling out stay with people.
 **Named checks, never a shell.** Zen reads logs, and logs carry text from
 outside; a command line on a machine would let what it reads decide what it
 runs. A check does one thing, takes validated arguments, changes nothing, and
-answers with a short report. A new check is a new entry in the agent's table.
+answers with a short report.
+
+**The list is the machine's own, and it is open.** A check is a declaration
+the agent loads from its `checks/` folder, a file each: its name, the line
+Zen reads in the terminal's verbs, its arguments with the values each may
+take, and what it runs — one of the agent's built-in probes, or a program
+with a fixed argument list into which only validated arguments are placed.
+Adding a check is adding a file on that machine; the agent reads the folder
+when a terminal is listed, so there is nothing to rebuild. Who can write to
+the machine can add a check. Zen chooses from the list and cannot add to it.
+The checks below ship as the first files.
 
 | Check | Reports |
 |---|---|
