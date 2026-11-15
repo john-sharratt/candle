@@ -219,6 +219,10 @@ pub struct Missions {
     /// account — the mind's, read afresh like the routines.
     #[serde(skip)]
     authorizers: Vec<Authorizer>,
+    /// Whether the world's order-giver may author new templates — the mind's,
+    /// read afresh like the routines.
+    #[serde(skip)]
+    authoring: bool,
     /// What the world's round has done — see [`super::round`].
     #[serde(default)]
     round: RoundState,
@@ -1068,6 +1072,17 @@ impl Missions {
         self.authorizers = authorizers;
     }
 
+    /// Set whether the world's order-giver may author new templates.
+    pub fn set_authoring(&mut self, authoring: bool) {
+        self.authoring = authoring;
+    }
+
+    /// Whether the world's order-giver may author new templates
+    /// (`mission_write`).
+    pub fn authoring(&self) -> bool {
+        self.authoring
+    }
+
     /// Who may approve a critical step here (`docs/mission_templates.md` §6).
     pub fn authorizers(&self) -> &[Authorizer] {
         &self.authorizers
@@ -1081,6 +1096,7 @@ impl Missions {
         self.routines = std::mem::take(&mut from.routines);
         self.draw = from.draw;
         self.authorizers = std::mem::take(&mut from.authorizers);
+        self.authoring = from.authoring;
         self.round_items = std::mem::take(&mut from.round_items);
     }
 

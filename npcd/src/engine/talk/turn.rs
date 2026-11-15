@@ -332,6 +332,22 @@ impl Runtime {
                 seen.party_name
             ));
         }
+        // A turn the character began itself, with nothing arrived and no yes
+        // to ask for: it tells what it set out to, and decides nothing. What
+        // the party said before was answered when it was said, and the head
+        // says so — read in the history with nothing saying it was closed, an
+        // old question was answered again ahead of every new thing told.
+        let telling = (lines.is_empty() && state.pending_critical.is_none())
+            .then(|| inputs.purposes.join("; "))
+            .filter(|t| !t.trim().is_empty());
+        let head = match telling {
+            Some(_) => format!(
+                "{head} {} has said nothing since, and nothing they said before waits on an \
+                 answer: you are the one speaking now, to tell them one thing.",
+                seen.party_name
+            ),
+            None => head,
+        };
         let spoken = minds
             .talk_turn(
                 &mut talk,
@@ -345,6 +361,7 @@ impl Runtime {
                     catchup: &caught,
                     gap: &gap,
                     band,
+                    telling: telling.as_deref(),
                 },
             )
             .await?;

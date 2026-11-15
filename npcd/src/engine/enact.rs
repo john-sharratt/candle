@@ -30,6 +30,7 @@ use crate::engine::body::{destinations, refusal, rooms, Outcome};
 use crate::engine::survey;
 use crate::engine::tools::{CHANNEL_WAY, PRIVATE, SELF};
 use crate::engine::whereabouts;
+use crate::engine::whole;
 use crate::sim::field::{Resource, Stance};
 use crate::sim::item::{Item, Kind as ItemKind};
 use crate::sim::ledger::OrderRefused;
@@ -758,6 +759,15 @@ fn lift_use(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
 }
 
 fn scan(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+    // **A mind with no body looks at the whole of itself, never at a room.**
+    // Naming nothing surveys what stands where a body is; given the room its
+    // seat is kept in, Zen read the ward's stations as "the terminals here"
+    // and reported the cluster missing without ever asking for its terminals.
+    if text(args, "at").is_none() {
+        if let Some(whole) = hosted.read_both(|w, s| whole::view(w, s, body)) {
+            return Outcome::Did(whole);
+        }
+    }
     if let Some(at) = text(args, "at") {
         // **A name has to be turned into a place before anything can be asked
         // about it.**

@@ -29,6 +29,7 @@
 //! (`crate::authority::terminals`).
 
 pub mod acts;
+pub mod watch;
 
 use std::collections::BTreeMap;
 
@@ -527,10 +528,196 @@ pub fn check_args(args: &Map<String, Value>) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// How many lines of a log one reading of it brings back.
+const LOG_LINES: u32 = 60;
+
+/// The call on zend one act of the cluster's terminal makes: the tool, and
+/// its arguments from the act's. `Err` says what the act did not give.
+///
+/// **One act, one tool, named.** The cluster's terminal reaches what the
+/// house's own tools reach — how it stands, its logs, and the jobs run on its
+/// build machines, started and seen through — and nothing that decides for
+/// the cluster (a rollout, a restart, a deploy) or that writes code: those are
+/// a person's, and a Drone's task.
+pub fn cluster_call(
+    tool: &str,
+    args: &Map<String, Value>,
+) -> Result<(&'static str, Value), String> {
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let need = |key: &str, what: &str| text(key).ok_or_else(|| format!("Say {what}."));
+    Ok(match tool {
+        "cluster_status" => ("cluster_status", json!({})),
+        "cluster_services" => ("service_status", json!({})),
+        "cluster_audit" => ("cluster_audit", json!({})),
+        "cluster_jobs" => ("job_list", json!({})),
+        "cluster_logs" => {
+            let mut call = json!({
+                "grep": need("grep", "what to search the logs for")?,
+                "source": "cluster",
+                "limit": LOG_LINES,
+            });
+            for key in ["level", "since"] {
+                if let Some(v) = text(key) {
+                    call[key] = json!(v);
+                }
+            }
+            ("log_grep", call)
+        }
+        "cluster_log" => (
+            "log_read",
+            json!({"source": need("source", "which log to read")?, "limit": LOG_LINES}),
+        ),
+        "cluster_member" => (
+            "member_status",
+            json!({"node": need("node", "which member, by its node id")?}),
+        ),
+        "cluster_memory" => (
+            "member_memory",
+            json!({"node": need("node", "which member, by its node id")?}),
+        ),
+        "cluster_job" => (
+            "job_status",
+            json!({"jobs": [need("job", "which job, by its handle")?], "wait_s": 0}),
+        ),
+        "cluster_job_read" => {
+            let page = match text("page") {
+                None => 1,
+                Some(p) => p
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| format!("{p} is not a page: pages are numbered from 1."))?,
+            };
+            (
+                "job_read",
+                json!({"job": need("job", "which job, by its handle")?, "page": page, "wait_s": 0}),
+            )
+        }
+        "cluster_job_stop" => (
+            "job_cancel",
+            json!({"job": need("job", "which job, by its handle")?}),
+        ),
+        "cluster_job_start" => {
+            let given = need("args", "the program's arguments")?;
+            // One program and its arguments, never a line for a shell: what a
+            // shell would join, pipe or redirect is refused here, where the
+            // refusal can say so.
+            if let Some(bad) = given
+                .split_whitespace()
+                .find(|w| matches!(*w, "&&" | "||" | "|" | ";" | ">" | ">>" | "<"))
+            {
+                return Err(format!(
+                    "`{bad}` is a shell's: a job runs one program with its arguments, and \
+                     nothing joins two."
+                ));
+            }
+            let words: Vec<&str> = given.split_whitespace().collect();
+            (
+                "repo_job_start",
+                json!({
+                    "repo": need("repo", "which repository")?,
+                    "branch": "main",
+                    "program": need("program", "which program to run")?,
+                    "args": words,
+                }),
+            )
+        }
+        other => return Err(format!("The cluster has no `{other}`.")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bridge::finding::DEVICE;
+
+    /// **Each act of the cluster's terminal is one named tool of zend's**,
+    /// with its arguments as raw JSON; nothing a shell would join is passed,
+    /// and what an act did not give is said.
+    #[test]
+    fn each_cluster_act_is_one_named_call() {
+        let args = |v: Value| v.as_object().unwrap().clone();
+        let call = |tool: &str, v: Value| cluster_call(tool, &args(v));
+        assert_eq!(
+            call("cluster_status", json!({})),
+            Ok(("cluster_status", json!({})))
+        );
+        assert_eq!(
+            call("cluster_services", json!({})),
+            Ok(("service_status", json!({})))
+        );
+        assert_eq!(
+            call("cluster_logs", json!({"grep": "panicked", "level": "WARN"})),
+            Ok((
+                "log_grep",
+                json!({"grep": "panicked", "source": "cluster", "limit": 60, "level": "WARN"})
+            ))
+        );
+        assert_eq!(
+            call("cluster_member", json!({"node": " 09dd3987369d9cd8 "})),
+            Ok(("member_status", json!({"node": "09dd3987369d9cd8"})))
+        );
+        assert_eq!(
+            call(
+                "cluster_job",
+                json!({"job": "build:76c3a0f4d39bd9db:Be-t_qMsg8U"})
+            ),
+            Ok((
+                "job_status",
+                json!({"jobs": ["build:76c3a0f4d39bd9db:Be-t_qMsg8U"], "wait_s": 0})
+            ))
+        );
+        assert_eq!(
+            call(
+                "cluster_job_read",
+                json!({"job": "cluster:76c3a0f4d39bd9db:4"})
+            ),
+            Ok((
+                "job_read",
+                json!({"job": "cluster:76c3a0f4d39bd9db:4", "page": 1, "wait_s": 0})
+            ))
+        );
+        assert_eq!(
+            call(
+                "cluster_job_start",
+                json!({"repo": "candle", "program": "cargo", "args": "test -p web  --lib"})
+            ),
+            Ok((
+                "repo_job_start",
+                json!({
+                    "repo": "candle",
+                    "branch": "main",
+                    "program": "cargo",
+                    "args": ["test", "-p", "web", "--lib"],
+                })
+            ))
+        );
+        assert!(call(
+            "cluster_job_start",
+            json!({"repo": "candle", "program": "cargo", "args": "test && rm -rf ."})
+        )
+        .unwrap_err()
+        .contains("`&&` is a shell's"));
+        assert_eq!(
+            call("cluster_member", json!({})),
+            Err("Say which member, by its node id.".to_string())
+        );
+        assert!(call("cluster_job_read", json!({"job": "x", "page": "0"})).is_err());
+        // Every act the terminal offers has a call, and nothing else does.
+        for act in acts::CLUSTER_ACTS {
+            let got = call(act, json!({}));
+            assert!(
+                !matches!(&got, Err(e) if e.contains("has no")),
+                "`{act}` is offered and has no call"
+            );
+        }
+        assert!(call("service_deploy", json!({})).is_err());
+    }
 
     fn finding(hardware: &str, name: &str, profile: &str) -> Finding {
         Finding {

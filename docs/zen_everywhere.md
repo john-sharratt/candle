@@ -98,12 +98,37 @@ All of it arrives through the one inbox the messaging system already fills.
 What lies outside the moon — the house, the machines — Zen learns by connecting
 and looking.
 
-**Zen's own work is the watch.** Its round stops sending it to rooms to read
-panels. A round item is an observation: connect to a terminal, read what it
-shows, and act on what is out of the ordinary — itself when it is a switch to
-throw, by posting a mission when it is long. A person's request
-(`mission_add`, from their conversation) is an item on the same agenda: turn
-the television on is connect, act, disconnect, and back to the watch.
+**The watch is the engine's, and Zen is told what changed.** Looking needs no
+mind; deciding what a change means does. Every quarter of an hour the world's
+authority reads the cluster's standing and runs each machine's `health` check
+(`Runtime::tend_watch`, `engine/terminal/watch.rs`), and raises the terminal —
+which wakes Zen with the change in hand — only when the standing differs from
+the last reading, or the check's report leads with a change. What moves on
+every reading and means nothing by moving (how long ago a member started, what
+it has yet to send) is taken out before the comparison. Zen's round is what
+only a mind can do: reading what a Drone brought back. A person's request
+(`mission_add`, from their conversation) is an item on its agenda: turn the
+television on is connect, act, disconnect.
+
+**The terminals are stated, never looked for.** The view of the whole names
+each terminal that can be reached (`sim::terminals::reachable`, noted every
+five minutes and whenever they are listed), and `scan` naming nothing answers
+a mind with no body with that view rather than a room's stations — given the
+ward's stations, Zen reported the cluster missing without once asking for its
+terminals.
+
+**Telling is not answering, and characters message.** A conversation's turn
+that its character began — it has something to tell, and the party has said
+nothing new — is the words alone, with no decision (`TalkTurn::telling`): put
+through the decision, it answered the party's last question again ahead of
+every new thing told. And only a person's line opens a turn of a conversation;
+a line from another character is told to the mind as something that happened
+(`environment::deliver_messages`), because two conversations answering each
+other never end.
+
+**What may be posted is the world's to state.** A world's missions file says
+whether its order-giver may author templates (`authoring`, off unless said);
+the moon's does not, and its one job is `coding-task`.
 
 **Drones get the long work**: a large coding task, anything that needs long
 reasoning or many turns overseen. Those missions grant the task acts.
@@ -140,7 +165,7 @@ The terminals, each by the name `terminal_connect` takes
 | **`the lights`** — one, over every WiZ bulb the house network has shown | `effector-bridge`'s WiZ profile, through an in-network agent | `wiz_status`, `wiz_on`, `wiz_off`, `wiz_dim`, `wiz_white`, `wiz_colour` — on one bulb by its name, or on every one at once as `all the lights`, asked together and answered in one report |
 | **a device, by the name it goes by** — each Sonos player, AV receiver, Cast device and television; never a bulb | its profile, through an agent | that kind's acts. A television: `tv_status`, `tv_on`, `tv_off`, `tv_volume`, `tv_louder`, `tv_quieter`, `tv_mute`, `tv_unmute`, `tv_play`, `tv_pause`, `tv_stop`, `tv_launch`, `tv_youtube`, `tv_input`, `tv_button`, `tv_show` — an LG all of them, a Google television the ones its remote has a button for. One not yet paired offers `pair_device` / `pair_code` and nothing else |
 | **`the house network`** | this member's own survey of it; an agent for the wake | `survey_network`, `wake_device`, `device_rename {device, called}`, `presence_watch {device, who}`, `presence_forget {device}` |
-| **`the cluster`** — on a member of one | zend's `/v1/mcp` as `service:zen`, the channel `zen_task` uses | read-only: `cluster_status`, `cluster_services` (zend's `service_status`), `cluster_logs {grep, level, since}` (zend's `log_grep`) |
+| **`the cluster`** — on a member of one | zend's `/v1/mcp` as `service:zen`, the channel `zen_task` uses; each act one named tool (`terminal::cluster_call`) | how it stands: `cluster_status`, `cluster_services` (`service_status`), `cluster_member {node}` (`member_status`), `cluster_memory {node}` (`member_memory`), `cluster_audit`; its logs: `cluster_logs {grep, level, since}` (`log_grep`), `cluster_log {source}` (`log_read`); its jobs, started and seen through: `cluster_jobs` (`job_list`), `cluster_job {job}` (`job_status`), `cluster_job_read {job, page}` (`job_read`), `cluster_job_stop {job}` (`job_cancel`), `cluster_job_start {repo, program, args}` (`repo_job_start` on `main`, one program, never a shell line). Nothing that decides for the cluster — a rollout, a restart, a deploy — and nothing that writes code, which is a Drone's task |
 | **a machine, by its host name** — each machine an agent runs on: BlackWorld and WhiteWorld | that machine's own agent | `machine_check {check, args}` — the checks below |
 
 **A device belongs to the house, not to a room.** The devices a room's parts

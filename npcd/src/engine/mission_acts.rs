@@ -289,6 +289,9 @@ pub struct Carrying {
     /// That mission's document is given whole in its brief, to be written as
     /// given with `file_write` — see [`crate::engine::mission::Mission::writes_given`].
     pub given: bool,
+    /// The world lets its order-giver author new templates — see
+    /// [`crate::sim::missions::Missions::authoring`].
+    pub authoring: bool,
 }
 
 /// What `body` is carrying in `s`.
@@ -306,6 +309,7 @@ pub fn carrying(s: &Sim, body: &str) -> Carrying {
         unread: s.missions.unread_for(body),
         own: mission.is_some_and(|m| matches!(m.origin, Origin::Round { .. } | Origin::Own)),
         given: mission.is_some_and(|m| m.writes_given()),
+        authoring: s.missions.authoring(),
     }
 }
 
@@ -345,8 +349,10 @@ pub fn offered(tool: &str, c: Carrying) -> bool {
         // once: the reading is offered only while something new waits in it.
         t if t == ORDER_POST.name => c.unordered,
         t if t == ORDER_RESULTS.name => c.unordered && c.unread,
-        // Authoring a template is the order-giver's, like posting work.
-        t if t == MISSION_WRITE.name => c.unordered,
+        // Authoring a template is the order-giver's, in a world that lets it:
+        // what may be posted is the world's to state. Asked in its prompt not
+        // to, Zen wrote new templates for work no Drone could do.
+        t if t == MISSION_WRITE.name => c.unordered && c.authoring,
         // **A mission of one's own is not reported.** Offered the report, Zen
         // filed its round's `watch-earth` done with "post work on the order
         // table" never done — the step that is the Drones' work — and the
@@ -389,7 +395,35 @@ mod tests {
             unread: false,
             own: false,
             given: false,
+            authoring: false,
         }
+    }
+
+    /// **A template is authored only by an order-giver, and only in a world
+    /// that lets it**: what may be posted is the world's to state.
+    #[test]
+    fn a_template_is_authored_only_where_the_world_lets_it() {
+        let giver = Carrying {
+            unordered: true,
+            ..carrying(false, false, false)
+        };
+        assert!(!offered("mission_write", giver), "the world did not say so");
+        assert!(offered("order_post", giver), "posting is still its own");
+        let authoring = Carrying {
+            authoring: true,
+            ..giver
+        };
+        assert!(offered("mission_write", authoring));
+        assert!(
+            !offered(
+                "mission_write",
+                Carrying {
+                    unordered: false,
+                    ..authoring
+                }
+            ),
+            "never one that takes orders"
+        );
     }
 
     #[test]

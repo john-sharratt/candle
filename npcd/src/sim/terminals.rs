@@ -79,6 +79,15 @@ pub struct Terminals {
     /// The terminal each mind is connected to, by its body: at most one.
     #[serde(default)]
     connected: BTreeMap<String, String>,
+    /// The terminals a mind with no body can reach, by name, as last noted —
+    /// what its view of the world states. Not kept: it is what answers now.
+    #[serde(skip)]
+    reachable: Vec<String>,
+    /// The cluster's standing as the watch last read it
+    /// (`engine::terminal::watch`) — `None` before its first reading here,
+    /// which is told to nobody: there is nothing for it to differ from.
+    #[serde(skip)]
+    cluster: Option<Vec<String>>,
 }
 
 impl Terminals {
@@ -260,6 +269,22 @@ impl Terminals {
     /// What `body` is connected to.
     pub fn connected(&self, body: &str) -> Option<&str> {
         self.connected.get(body).map(String::as_str)
+    }
+
+    /// The terminals that can be reached now, by name, as last noted.
+    pub fn reachable(&self) -> &[String] {
+        &self.reachable
+    }
+
+    /// Note the terminals that can be reached now.
+    pub fn set_reachable(&mut self, names: Vec<String>) {
+        self.reachable = names;
+    }
+
+    /// Take in the watch's reading of the cluster's standing, and answer the
+    /// one before it — `None` for the first reading here.
+    pub fn read_cluster(&mut self, standing: Vec<String>) -> Option<Vec<String>> {
+        self.cluster.replace(standing)
     }
 }
 

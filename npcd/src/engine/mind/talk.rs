@@ -6,6 +6,8 @@
 //! thread's catalog and writes nothing; the words are then the real turn,
 //! sealed on the conversation with no grammar, no reasoning and no call, under
 //! the response templates of where they go. Nothing is prefilled in either.
+//! A turn the character began itself, with nothing arrived, is the words
+//! alone: what it set out to tell is the decision ([`TalkTurn::telling`]).
 //!
 //! **Resumed only under the frame it was written under** (§4.1): the frame is
 //! the projection's under the `talking` stance, and a change to it opens the
@@ -81,6 +83,10 @@ pub struct TalkTurn<'a> {
     /// The gap as the summary question names it.
     pub gap: &'a str,
     pub band: DecodePriority,
+    /// What the character itself set out to tell the party, when that is all
+    /// this turn is: nothing arrived, so nothing is decided — the turn says
+    /// it. `None` for a turn something arrived on.
+    pub telling: Option<&'a str>,
 }
 
 /// What a turn decided, and the words it said.
@@ -244,12 +250,30 @@ impl Minds {
         // to somebody else is asked again with what it sent struck, and goes on
         // to what is said to the party. Each round strikes at least one
         // hand-off, so it ends once they are all spent.
+        //
+        // **Telling is not answering.** A turn the character's own mind began
+        // — it has something to tell the party, and the party has said nothing
+        // new — has nothing to decide: put through the decision, it found the
+        // party's last question in the history and answered it again, every
+        // time, ahead of what it had come to say. Its intent is the decision.
         let mut acts: Vec<Act> = Vec::new();
         let mut refused: Vec<String> = Vec::new();
         let mut openings: Vec<String> = Vec::new();
         let mut left = within.clone();
         let mut asked = user.clone();
-        loop {
+        if let Some(intent) = turn.telling {
+            acts.push(Act {
+                tool: "reply",
+                args: [
+                    ("to".to_string(), turn.party.into()),
+                    ("intent".to_string(), intent.into()),
+                ]
+                .into_iter()
+                .collect(),
+            });
+            openings.push(format!("told, not decided: {intent}"));
+        }
+        while turn.telling.is_none() {
             let mut shown = selection.clone();
             tools::show_within(&mut shown, Catalog::THREAD.mode, &left);
             let grammar = self.grammar_for(Deliberation::None, Catalog::THREAD, &left);

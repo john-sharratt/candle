@@ -520,18 +520,40 @@ fn deliver_messages(
             told += 1;
         }
         for (thread, lines) in talk {
-            tracing::info!(
-                npc = npc_id,
-                thread = %thread,
-                lines = lines.len(),
-                "lines land for the character's conversation"
-            );
-            let kind = EventKind::Talk { thread, lines };
+            // **Characters message; only people are conversed with.** A line
+            // from a person opens a turn of the conversation with them, which
+            // answers. A line from another character is something that
+            // happened, told to the mind, which answers it or does not: two
+            // conversations answering each other never end — Zen and a Drone
+            // traded the same two lines every forty minutes for a day, four
+            // decodes a round.
+            let from_a_character = lines.iter().all(|l| minds.contains_key(&l.from));
+            let (kind, salience) = match from_a_character {
+                true => (
+                    EventKind::Description {
+                        text: lines
+                            .iter()
+                            .map(|l| format!("{}, on your phone: {}", l.name, l.text.trim()))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    },
+                    Salience::NORMAL,
+                ),
+                false => {
+                    tracing::info!(
+                        npc = npc_id,
+                        thread = %thread,
+                        lines = lines.len(),
+                        "lines land for the character's conversation"
+                    );
+                    (EventKind::Talk { thread, lines }, Salience::URGENT)
+                }
+            };
             match (reach.here)(npc_id) {
                 true => {
-                    sched.deliver(npc_id, at_ms, Salience::URGENT, kind);
+                    sched.deliver(npc_id, at_ms, salience, kind);
                 }
-                false => (reach.elsewhere)(npc_id, at_ms, Salience::URGENT, kind),
+                false => (reach.elsewhere)(npc_id, at_ms, salience, kind),
             }
             told += 1;
         }
@@ -1078,10 +1100,10 @@ mod tests {
         assert_eq!(push(&h, &b, &s, &|_| 0, &Reach::everyone()), 1);
     }
 
-    /// **A direct line is handed to the character's conversation as the line
-    /// itself, through the reach when it runs elsewhere** — a `Talk`, never a
-    /// notice for the mind. Its own member's copy of the world shows it the
-    /// room; only this world holds its threads.
+    /// **A person's direct line is handed to the character's conversation as
+    /// the line itself, through the reach when it runs elsewhere** — a `Talk`,
+    /// never a notice for the mind. Its own member's copy of the world shows
+    /// it the room; only this world holds its threads.
     #[test]
     fn a_direct_line_goes_to_the_conversation_through_the_reach() {
         let (h, b, s) = crew(2);
@@ -1091,9 +1113,9 @@ mod tests {
             issue_handset(sim, "m2", "Maker-02");
             let id = sim
                 .threads
-                .reach(&Who::new("m1", "Maker-01"), &Who::new("m2", "Maker-02"));
+                .reach(&Who::new("u_john", "John"), &Who::new("m2", "Maker-02"));
             sim.threads
-                .send_on(&id, "m1", Said::words("Come up when you can."))
+                .send_on(&id, "u_john", Said::words("Come up when you can."))
                 .unwrap();
         });
         h.with(|w| w.say("m1", "for the room").unwrap());
@@ -1114,18 +1136,58 @@ mod tests {
         let EventKind::Talk { thread, lines } = kind else {
             panic!("a direct line is a Talk: {kind:?}");
         };
-        assert_eq!(thread, "dm:m1:m2");
+        assert!(thread.starts_with("dm:"), "{thread}");
         assert_eq!(
             lines
                 .iter()
                 .map(|l| (l.seq, l.from.as_str(), l.name.as_str(), l.text.as_str()))
                 .collect::<Vec<_>>(),
-            [(1, "m1", "Maker-01", "Come up when you can.")]
+            [(1, "u_john", "John", "Come up when you can.")]
         );
         assert_eq!(
             h.sim(|sim| sim.unread_on_phone_for("m2")),
             Vec::<String>::new(),
             "a direct line is never the mind's to read"
+        );
+    }
+
+    /// **Characters message; only people are conversed with.** A direct line
+    /// from another character is told to the mind as something that happened
+    /// — the words, by whom — and opens no turn of a conversation: two
+    /// conversations answering each other never end.
+    #[test]
+    fn a_characters_direct_line_is_told_to_the_mind() {
+        let (h, b, s) = crew(2);
+        run(&s, 0);
+        h.with_sim(|sim| {
+            issue_handset(sim, "m1", "Maker-01");
+            issue_handset(sim, "m2", "Maker-02");
+            let id = sim
+                .threads
+                .reach(&Who::new("m1", "Maker-01"), &Who::new("m2", "Maker-02"));
+            sim.threads
+                .send_on(&id, "m1", Said::words("Come up when you can."))
+                .unwrap();
+        });
+        let elsewhere = Mutex::new(Vec::new());
+        let tell = |npc: u64, _: u64, salience: Salience, kind: EventKind| {
+            elsewhere.lock().unwrap().push((npc, salience, kind));
+        };
+        let reach = Reach {
+            here: &|npc| npc != 102,
+            elsewhere: &tell,
+        };
+        advance_for(&h, &b, &s, &|_| 0, &reach);
+        let told = elsewhere.into_inner().unwrap();
+        assert_eq!(
+            told,
+            [(
+                102,
+                Salience::NORMAL,
+                EventKind::Description {
+                    text: "Maker-01, on your phone: Come up when you can.".into()
+                }
+            )]
         );
     }
 

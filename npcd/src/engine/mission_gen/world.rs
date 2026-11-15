@@ -203,6 +203,12 @@ pub struct WorldMissions {
     /// held, never approved.
     #[serde(default)]
     pub authorizers: Vec<Authorizer>,
+    /// Whether the world's order-giver may author new templates
+    /// (`mission_write`). A world that does not say so has the templates its
+    /// mind was given and no others: what may be posted there is the world's
+    /// to state, and a character asked not to write more wrote them anyway.
+    #[serde(default)]
+    pub authoring: bool,
 }
 
 /// The world-level config a `missions/<world>/world.yaml` carries.
@@ -213,6 +219,8 @@ struct WorldConfig {
     draw: Draw,
     #[serde(default)]
     authorizers: Vec<Authorizer>,
+    #[serde(default)]
+    authoring: bool,
 }
 
 /// Whether an argument's value is a stand-in for one — empty, or a word that
@@ -308,6 +316,7 @@ impl WorldMissions {
         let mut routines: Vec<Routine> = Vec::new();
         let mut draw = Draw::default();
         let mut authorizers: Vec<Authorizer> = Vec::new();
+        let mut authoring = false;
         let mut found = false;
 
         let file = path(world);
@@ -317,6 +326,7 @@ impl WorldMissions {
                 routines.extend(m.routines);
                 draw = m.draw;
                 authorizers.extend(m.authorizers);
+                authoring = m.authoring;
                 found = true;
             }
             None if mind.is_file(&file) => return Err(format!("{file} is not UTF-8")),
@@ -339,6 +349,7 @@ impl WorldMissions {
                     serde_yaml::from_str(&text).map_err(|e| format!("{rel}: {e}"))?;
                 draw = c.draw;
                 authorizers.extend(c.authorizers);
+                authoring |= c.authoring;
             } else {
                 routines.push(Routine::parse(&rel, &text)?);
             }
@@ -353,6 +364,7 @@ impl WorldMissions {
             routines,
             draw,
             authorizers,
+            authoring,
         }))
     }
 }

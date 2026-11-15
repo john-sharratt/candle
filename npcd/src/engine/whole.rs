@@ -50,8 +50,19 @@ pub fn view(world: &World, sim: &Sim, body: &str) -> Option<String> {
         who.sort();
         s.push_str(&format!("\n- {room}, {level}: {}", who.join("; ")));
     }
-    if let Some(terminal) = sim.terminals.connected(body) {
-        s.push_str(&format!("\nYou are connected to {terminal}."));
+    // What lies outside it is reached through its terminals, and which there
+    // are is stated rather than asked for: a mind that had to list them
+    // looked around its own rooms instead and reported there were none.
+    let terminals = sim.terminals.reachable();
+    if !terminals.is_empty() {
+        s.push_str(&format!(
+            "\nOutside you, reached one at a time with `terminal_connect`: {}.",
+            terminals.join(", ")
+        ));
+    }
+    match sim.terminals.connected(body) {
+        Some(terminal) => s.push_str(&format!("\nYou are connected to {terminal}.")),
+        None => s.push_str("\nYou are connected to none of them."),
     }
     Some(s)
 }

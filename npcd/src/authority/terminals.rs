@@ -21,7 +21,7 @@ use agent::client::Agents;
 use agent::wire::BridgeCall;
 use effector_bridge::work::profile_act;
 use futures::future::join_all;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use tokio::time::{interval, MissedTickBehavior};
 
 use super::zen_task::call_zend;
@@ -31,13 +31,22 @@ use crate::engine::act::Act;
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::runtime::{Recorded, Runtime, LANDED, REFUSED};
 use crate::engine::terminal::{
-    self, check_args, tv_action, welcome, Kind, Machine, Terminal, ALL_LIGHTS, NETWORK,
+    self, check_args, tv_action, watch, welcome, Kind, Machine, Terminal, ALL_LIGHTS, CLUSTER,
+    NETWORK,
 };
 use crate::sim::terminals::Device;
 use crate::world::Hosted;
 
 /// How often the house network is surveyed for the handsets that are watched.
 pub const WATCH_EVERY: Duration = Duration::from_secs(300);
+
+/// How many presence surveys pass between two readings of the cluster and the
+/// machines: every third, so a quarter of an hour.
+const WATCH_EVERY_TICKS: u32 = 3;
+
+/// The machine check the watch runs: the one a machine's own list calls its
+/// health.
+const WATCH_CHECK: &str = "health";
 
 /// The session zend keeps a mind's cluster reads under.
 const WATCH_THREAD: &str = "zen-watch";
@@ -433,24 +442,12 @@ impl Runtime {
                     false => (false, format!("There is no device called {device}.")),
                 }
             }
-            // ── the cluster: read, never change ───────────────────────────
-            (Kind::Cluster, "cluster_status") => {
-                self.ask_cluster("cluster_status", json!({})).await
-            }
-            (Kind::Cluster, "cluster_services") => {
-                self.ask_cluster("service_status", json!({})).await
-            }
-            (Kind::Cluster, "cluster_logs") => {
-                let Some(grep) = text(&act.args, "grep") else {
-                    return (false, "Say what to search the logs for.".into());
-                };
-                let mut call = json!({"grep": grep, "source": "cluster", "limit": 60});
-                for key in ["level", "since"] {
-                    if let Some(v) = text(&act.args, key) {
-                        call[key] = json!(v);
-                    }
+            // ── the cluster: how it stands, its logs, its jobs ────────────
+            (Kind::Cluster, tool) if terminal::acts::CLUSTER_ACTS.contains(&tool) => {
+                match terminal::cluster_call(tool, &act.args) {
+                    Ok((zend, call)) => self.ask_cluster(zend, call).await,
+                    Err(why) => (false, why),
                 }
-                self.ask_cluster("log_grep", call).await
             }
             // ── a machine: its checks ─────────────────────────────────────
             (Kind::Machine(m), "machine_check") => {
@@ -524,7 +521,8 @@ impl Runtime {
         }
     }
 
-    /// One read-only tool of zend's, called as Zen's service.
+    /// One tool of zend's, called as Zen's service — one of those
+    /// [`terminal::cluster_call`] names.
     async fn ask_cluster(&self, tool: &str, args: Value) -> (bool, String) {
         let Some(member) = self.standing.member().cloned() else {
             return (
@@ -652,6 +650,86 @@ impl Runtime {
         tracing::info!(world = hosted.id(), terminal, "a terminal raised: {text}");
     }
 
+    /// Note, in every world this member writes, the terminals a mind with no
+    /// body can reach now — what its view of the world states
+    /// (`engine::whole`), so it never has to ask what there is. The machines
+    /// are asked after first: an agent that joined since is a terminal.
+    pub async fn note_terminals(&self) {
+        self.refresh_machines().await;
+        let machines = self.machines();
+        let on_cluster = self.standing.member().is_some();
+        for hosted in self
+            .hosted
+            .ids()
+            .into_iter()
+            .filter(|id| self.standing.writes(id))
+            .filter_map(|id| self.hosted.get(&id))
+        {
+            let names: Vec<String> = hosted.sim(|s| {
+                terminal::listed(s, &machines, on_cluster)
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect()
+            });
+            if hosted.sim(|s| s.terminals.reachable() != names.as_slice()) {
+                hosted.with_sim(|s| s.terminals.set_reachable(names));
+            }
+        }
+    }
+
+    /// Keep the watch for every world this member writes that holds a mind
+    /// with no body (`engine::terminal::watch`): read the cluster's standing
+    /// and run each machine's `health` check, once for them all, and raise
+    /// the terminal in each world only for what changed. A reading that
+    /// could not be taken raises nothing: the next one will say.
+    pub async fn tend_watch(&self) {
+        let watched: Vec<Arc<Hosted>> = self
+            .hosted
+            .ids()
+            .into_iter()
+            .filter(|id| self.standing.writes(id))
+            .filter_map(|id| self.hosted.get(&id))
+            .filter(|h| {
+                self.bodies
+                    .in_world(h.id())
+                    .iter()
+                    .any(|(_, body)| h.sim(|s| s.missions.is_unordered(body)))
+            })
+            .collect();
+        if watched.is_empty() {
+            return;
+        }
+        if self.standing.member().is_some() {
+            if let (true, status) = self
+                .ask_cluster("cluster_status", Value::Object(Map::new()))
+                .await
+            {
+                let now = watch::standing(&status);
+                for hosted in &watched {
+                    let before = hosted.with_sim(|s| s.terminals.read_cluster(now.clone()));
+                    if let Some(news) = before.and_then(|b| watch::cluster_news(&b, &now)) {
+                        self.raise_terminal(hosted, CLUSTER, &news, false);
+                    }
+                }
+            }
+        }
+        let agents = self.agents();
+        for machine in self.machines().into_iter().filter(|m| m.ready) {
+            let call = BridgeCall::Check {
+                name: WATCH_CHECK.to_string(),
+                args: BTreeMap::new(),
+            };
+            let (true, report) = bridged(agents.as_ref(), call, Some(machine.node)).await else {
+                continue;
+            };
+            if let Some(news) = watch::machine_news(&report) {
+                for hosted in &watched {
+                    self.raise_terminal(hosted, &machine.host, news, false);
+                }
+            }
+        }
+    }
+
     /// Survey the house network for every world this member writes that
     /// watches a handset, and raise what changed: who came home, who went
     /// out. One survey serves them all — it is one house.
@@ -691,17 +769,26 @@ impl Runtime {
 pub async fn run(rt: Arc<Runtime>) {
     let mut tick = interval(WATCH_EVERY);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut ticks: u32 = 0;
     loop {
         tick.tick().await;
         if rt.stopping() {
             return;
         }
+        rt.note_terminals().await;
+        // The machines and the cluster change by the hour, not the minute.
+        if ticks.is_multiple_of(WATCH_EVERY_TICKS) {
+            rt.tend_watch().await;
+        }
+        ticks = ticks.wrapping_add(1);
         rt.tend_presence().await;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::bridge::finding::Finding;
 

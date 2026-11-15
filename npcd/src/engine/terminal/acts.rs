@@ -384,6 +384,156 @@ pub const CLUSTER_LOGS: Tool = Tool {
     }],
 };
 
+pub const CLUSTER_MEMBER: Tool = one!(
+    "cluster_member",
+    "Cluster",
+    "Read one member's own status, whole, as it reports itself: its state and build, each app it \
+     hosts, whether it is really joined, what it has not yet sent, and its upgrade.",
+    "node",
+    "string",
+    "The member, by its node id: the sixteen hex digits `cluster_status` lists it under.",
+    "The cluster's summary says a member is ready, and you doubt it is joined.",
+    r#"{"node":"09dd3987369d9cd8"}"#,
+    "The summary is one line a member; what a member says of itself is the whole of it."
+);
+
+pub const CLUSTER_MEMORY: Tool = one!(
+    "cluster_memory",
+    "Cluster",
+    "Read one member's memory as it reports it: the machine's RAM, what holds its card, and how \
+     full each part is.",
+    "node",
+    "string",
+    "The member, by its node id: the sixteen hex digits `cluster_status` lists it under.",
+    "A member has slowed, and you want to know whether its card is full.",
+    r#"{"node":"09dd3987369d9cd8"}"#,
+    "Slow is a symptom; what is holding the card is the cause."
+);
+
+pub const CLUSTER_AUDIT: Tool = bare!(
+    "cluster_audit",
+    "Cluster",
+    "Read what was done to the cluster in the last day, newest first: each command a member ran \
+     and who sent it, with members joining, leaving and being refused.",
+    "A member is on a build you did not expect, and you want to know who put it there.",
+    "Before deciding something is wrong, see what was done on purpose."
+);
+
+pub const CLUSTER_LOG: Tool = one!(
+    "cluster_log",
+    "Cluster",
+    "Read the newest lines of one log, oldest first — the cluster's own, or a site's — when you \
+     want what it is saying now and have no word to search for.",
+    "source",
+    "string",
+    "The log to read: `cluster` for the machines' daemons, or a site's name.",
+    "A deploy has just gone out and you want the cluster's last lines as they are.",
+    r#"{"source":"cluster"}"#,
+    "With nothing to search for, the newest lines are where to start."
+);
+
+pub const CLUSTER_JOBS: Tool = bare!(
+    "cluster_jobs",
+    "Cluster",
+    "List the jobs running on the cluster now — builds, test runs, deploys, tasks, maintenance — \
+     each with its handle, where it runs and how long it has run.",
+    "A machine is busy and you want to know with what.",
+    "A machine working hard is usually working on something somebody started."
+);
+
+pub const CLUSTER_JOB: Tool = one!(
+    "cluster_job",
+    "Cluster",
+    "Read where one job is, and once it has ended how it went: a build's or test run's results \
+     and first failures, a deploy's trial, a task's answer.",
+    "job",
+    "string",
+    "The job, by its handle, as `cluster_jobs` or the call that started it gave it.",
+    "You started a test run a while ago and want to know how it ended.",
+    r#"{"job":"build:76c3a0f4d39bd9db:Be-t_qMsg8U"}"#,
+    "A job you started is yours to see through to how it ended."
+);
+
+pub const CLUSTER_JOB_READ: Tool = Tool {
+    name: "cluster_job_read",
+    at: &[],
+    category: "Cluster",
+    plane: Plane::World,
+    availability: Availability::Granted,
+    description: "Read one page of a job's output — two hundred lines: a build's log, a deploy's \
+                  build and trial, a task's entries and answer.",
+    params: &[
+        Param {
+            name: "job",
+            ty: "string",
+            required: true,
+            description: "The job, by its handle.",
+        },
+        Param {
+            name: "page",
+            ty: "string",
+            required: false,
+            description: "The page to read, from 1. Left out, the first.",
+        },
+    ],
+    examples: &[Example {
+        situation: "A test run failed and its status names page 3 as where the failure is.",
+        call: r#"{"job":"build:76c3a0f4d39bd9db:Be-t_qMsg8U","page":"3"}"#,
+        because: "What failed is in the output, on the page the status named.",
+    }],
+};
+
+pub const CLUSTER_JOB_STOP: Tool = one!(
+    "cluster_job_stop",
+    "Cluster",
+    "Stop one job you started: a build or test run is killed where it is, and nothing it built \
+     is kept.",
+    "job",
+    "string",
+    "The job, by its handle.",
+    "A test run you started is the wrong one, and it is holding a machine.",
+    r#"{"job":"build:76c3a0f4d39bd9db:Be-t_qMsg8U"}"#,
+    "A job that answers nothing useful is a machine kept from one that would."
+);
+
+pub const CLUSTER_JOB_START: Tool = Tool {
+    name: "cluster_job_start",
+    at: &[],
+    category: "Cluster",
+    plane: Plane::World,
+    availability: Availability::Granted,
+    description: "Start a build, a test run or a check of the code on a build machine, as it \
+                  stands on the repository's main branch. It answers at once with the job's \
+                  handle; `cluster_job` says how it went. One program a job, never a shell line. \
+                  Writing or changing code is not this: that is a Drone's `coding-task`.",
+    params: &[
+        Param {
+            name: "repo",
+            ty: "string",
+            required: true,
+            description: "The repository, by its name, such as candle.",
+        },
+        Param {
+            name: "program",
+            ty: "string",
+            required: true,
+            description: "The program alone, such as cargo.",
+        },
+        Param {
+            name: "args",
+            ty: "string",
+            required: true,
+            description: "Its arguments, a space between each, exactly as they are to be \
+                          passed.",
+        },
+    ],
+    examples: &[Example {
+        situation: "John asked whether the web crate's tests still pass on main.",
+        call: r#"{"repo":"candle","program":"cargo","args":"test -p web"}"#,
+        because: "Whether the tests pass is found by running them, on a machine kept for it.",
+    }],
+};
+
 // ── a machine ──────────────────────────────────────────────────────────────
 
 pub const MACHINE_CHECK: Tool = Tool {
@@ -455,7 +605,20 @@ pub const TV_ACTS: &[&str] = &[
 pub const NETWORK_ACTS: &[&str] = &["device_rename", "presence_watch", "presence_forget"];
 
 /// What the cluster's terminal offers.
-pub const CLUSTER_ACTS: &[&str] = &["cluster_status", "cluster_services", "cluster_logs"];
+pub const CLUSTER_ACTS: &[&str] = &[
+    "cluster_status",
+    "cluster_services",
+    "cluster_logs",
+    "cluster_member",
+    "cluster_memory",
+    "cluster_audit",
+    "cluster_log",
+    "cluster_jobs",
+    "cluster_job",
+    "cluster_job_read",
+    "cluster_job_stop",
+    "cluster_job_start",
+];
 
 /// What a machine's terminal offers.
 pub const MACHINE_ACTS: &[&str] = &["machine_check"];
@@ -487,6 +650,15 @@ pub const TERMINAL_ACTS: &[Tool] = &[
     CLUSTER_STATUS,
     CLUSTER_SERVICES,
     CLUSTER_LOGS,
+    CLUSTER_MEMBER,
+    CLUSTER_MEMORY,
+    CLUSTER_AUDIT,
+    CLUSTER_LOG,
+    CLUSTER_JOBS,
+    CLUSTER_JOB,
+    CLUSTER_JOB_READ,
+    CLUSTER_JOB_STOP,
+    CLUSTER_JOB_START,
     MACHINE_CHECK,
 ];
 

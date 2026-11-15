@@ -860,6 +860,7 @@ pub fn spawn(rt: Arc<Runtime>) {
                             s.missions.set_workflows(vec![written]);
                             s.missions.set_routines(own.routines, own.draw);
                             s.missions.set_authorizers(own.authorizers);
+                            s.missions.set_authoring(own.authoring);
                         });
                         if authority {
                             settle_failed(&hosted);
@@ -874,6 +875,7 @@ pub fn spawn(rt: Arc<Runtime>) {
                         hosted.with_sim(|s| {
                             s.missions.set_routines(Vec::new(), Draw::Routines);
                             s.missions.set_authorizers(Vec::new());
+                            s.missions.set_authoring(false);
                         });
                     }
                     Err(e) => {
