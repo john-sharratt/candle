@@ -250,10 +250,33 @@ step of §8.
 
 ## 8. Order of work
 
-Steps 1–6 are built. Step 1 runs on WhiteWorld; steps 2–6 are released
-together with step 7, since a Zen with no body and its old round of rooms to
-walk has nothing it can do. The machine checks need each machine's agent on
-a build that has them.
+Steps 1–7 are built and released together, since a Zen with no body and its
+old round of rooms to walk has nothing it can do. The machine checks need each
+machine's agent on a build that has them.
+
+Four things the first days on WhiteWorld showed, and what answers each:
+
+- **A conversation reads its own group only.** A group that is not a turn's
+  own is gathered across every conversation in it, and under a sequence rule
+  each turn found is held as the reader's founding history; the mind and the
+  talks are two groups, so a character answering somebody read every other
+  character's working turns, the Makers' drafts among them. Both groups are
+  scoped with no scope ever named (`Minds::close_conversations`).
+- **An act offered in one place only is always described**
+  (`tools::shown_wherever_offered`): the lift's, a granted act, a house
+  device's, a routed one. Ten acts are described a turn, and a Drone at the
+  lift was not shown `lift_use`.
+- **A carrier that never tries the way is believed in the end**
+  (`Mission::refuse_stuck_on_the_way`): every third turn-away in a row with
+  nothing tried counts as one, so a mission cannot be stood beside for hours.
+- **A step of the round is `connect to <terminal> …`**, signed off when an act
+  of that terminal lands (`Mission::worked_terminal`). Connecting alone signs
+  nothing off.
+
+`POST /v1/pulse/start-over` starts named characters over — missions called
+off, conversations retired, and by name the journal emptied and the dreams
+retired — while the daemon runs and without touching another world's cast
+(`engine/start_over.rs`).
 
 1. **Drones at rest**: the engine-held rest state, assignment at the post, no
    summons, hands as §3 — with the runtime's scripted tests. The load change.
@@ -264,8 +287,10 @@ a build that has them.
 4. **The cluster adapter**, read-only.
 5. **The machine adapter**: BlackWorld and WhiteWorld, the checks of §5.
 6. **Terminal events, and presence** from the survey.
-7. **The mind's content** (`battle-mind`): Zen's round as observations, its
-   idle text, mission templates that grant the task acts, the `ops` and
-   `network` templates rewritten to what a terminal can do or removed.
+7. **The mind's content** (`battle-mind`): Zen's round as observations
+   (`rounds/moon.yaml`: the reports, the cluster, the house network, each
+   machine), its idle text and anchor, the one job it posts for a Drone
+   (`coding-task`, which grants the task acts), and the `ops` and `network`
+   templates removed — what they named is Zen's own to do through a terminal.
 8. **`docs/zen_moon_mind.md`** brought to the code: the world is `moon`, and
    the pieces it names that were never built are taken out.

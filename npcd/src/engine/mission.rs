@@ -256,6 +256,10 @@ pub struct Mission {
     /// believing the next one ([`Self::refuse_stuck_on_the_way`]).
     #[serde(default)]
     pub refused_since: bool,
+    /// How many `report_stuck` in a row the desk has turned away with the way
+    /// open and nothing tried — see [`Self::refuse_stuck_on_the_way`].
+    #[serde(default)]
+    pub stuck_untried: u32,
     /// A digest of the mission's document as it stood when the desk last
     /// turned a `report_stuck` away over its faults — what tells a rewrite from
     /// none ([`Self::refuse_stuck_over_faults`]).
@@ -301,6 +305,7 @@ impl Mission {
             observed: Vec::new(),
             stuck_refused: 0,
             refused_since: false,
+            stuck_untried: 0,
             faulted_draft: None,
             gate_refusal: None,
             work: None,
@@ -548,9 +553,22 @@ impl Mission {
     /// other levels" — having walked between the lift and the table and never
     /// once called `lift_use`; two turn-aways and the third report was
     /// believed. Told the way and not trying it is not being blocked by it.
+    ///
+    /// **But a carrier that will not try it is not going to.** A Drone stood
+    /// between the lift and the table for two hours, turned away every time
+    /// and never trying, and held its place on the card for all of it. Every
+    /// [`UNTRIED_TURN_AWAYS`] in a row with nothing tried count as one, so the
+    /// report is believed in the end and the mission fails.
     pub fn refuse_stuck_on_the_way(&mut self) -> u32 {
         if std::mem::take(&mut self.refused_since) {
             self.stuck_refused += 1;
+            self.stuck_untried = 0;
+        } else {
+            self.stuck_untried += 1;
+            if self.stuck_untried == UNTRIED_TURN_AWAYS {
+                self.stuck_refused += 1;
+                self.stuck_untried = 0;
+            }
         }
         self.stuck_refused
     }
@@ -748,6 +766,28 @@ impl Mission {
     /// signed off.
     pub fn read_messages(&mut self) -> bool {
         self.tick_opening(READING_MESSAGES)
+    }
+
+    /// Sign off every open step that connects to the terminal called
+    /// `terminal`, because the carrier worked it: `connect to the cluster and
+    /// read its status` is done once an act of the cluster's landed. Connecting
+    /// alone signs nothing off — the step is the look, not the door. Returns
+    /// whether anything was signed off.
+    pub fn worked_terminal(&mut self, terminal: &str) -> bool {
+        let name = plain(terminal);
+        let mut ticked = false;
+        for step in self
+            .todo
+            .iter_mut()
+            .filter(|t| !t.done && !t.reports && !t.critical)
+        {
+            if connecting_to(&step.text).is_some_and(|to| names(&to, &name)) {
+                step.done = true;
+                step.outcome = Some(StepOutcome::Achieved);
+                ticked = true;
+            }
+        }
+        ticked
     }
 
     /// Sign off every open step that opens with `opening`.
@@ -1226,6 +1266,11 @@ fn bounded_refusal(refusal: &str) -> String {
     }
 }
 
+/// How many `report_stuck` in a row, turned away with the way open and nothing
+/// tried, count as one real turn-away — see
+/// [`Mission::refuse_stuck_on_the_way`].
+pub const UNTRIED_TURN_AWAYS: u32 = 3;
+
 /// The most of a refusal the compass carries, in characters: a gate's refusal
 /// names five faults of a kind and counts the rest, well inside it.
 pub const COMPASS_REFUSAL_CHARS: usize = 4_000;
@@ -1403,6 +1448,17 @@ pub fn engine_sees(step: &str) -> bool {
         || writing_doc(step).is_some()
         || time_step(step).is_some()
         || is_task_step(step)
+        || connecting_to(step).is_some()
+}
+
+/// The terminal a step connects to, as a [`plain`] name with the rest of the
+/// step after it: "connect to the cluster and read its status" → "cluster and
+/// read its status", matched against a terminal's name by [`names`]. `None`
+/// for any other step. The step of a mind with no body: what it looks at, it
+/// looks at through a terminal ([`Mission::worked_terminal`]).
+fn connecting_to(step: &str) -> Option<String> {
+    let step = step.trim().to_lowercase();
+    step.strip_prefix("connect to ").map(plain)
 }
 
 /// The step that sends a carrier to a time machine to work in `year`.
@@ -1905,7 +1961,7 @@ pub mod bank {
 #[cfg(test)]
 mod tests {
     use super::bank::{random, Duty, Facts, ROUTINES};
-    use super::{Mission, Origin, Outcome, StepOutcome, Todo, Work};
+    use super::{Mission, Origin, Outcome, StepOutcome, Todo, Work, UNTRIED_TURN_AWAYS};
 
     fn makers() -> Vec<String> {
         vec!["Wren".to_string(), "Pax".to_string(), "Soren".to_string()]
@@ -1962,6 +2018,32 @@ mod tests {
         m.refused_an_act();
         assert_eq!(m.refuse_stuck_on_the_way(), 1);
         assert_eq!(m.refuse_stuck_on_the_way(), 1, "one refusal counts once");
+
+        // A step that connects to a terminal is done when that terminal is
+        // worked, by its name with or without its article, and by no other.
+        let mut m = Mission::new(
+            "keep watch",
+            vec![
+                Todo::new("connect to the cluster and read its status"),
+                Todo::new("connect to WhiteWorld and run its health check"),
+            ],
+            Origin::Own,
+        );
+        assert!(super::engine_sees(
+            "connect to the cluster and read its status"
+        ));
+        assert!(!m.worked_terminal("the lights"));
+        assert!(m.worked_terminal("the cluster"));
+        assert!(!m.worked_terminal("the cluster"), "signed off already");
+        assert!(m.worked_terminal("whiteworld"));
+        assert!(m.all_todos_done());
+
+        // Never trying counts in the end: one for every run of turn-aways.
+        let mut m = a_mission();
+        let counted: Vec<u32> = (0..UNTRIED_TURN_AWAYS * 2)
+            .map(|_| m.refuse_stuck_on_the_way())
+            .collect();
+        assert_eq!(counted, [0, 0, 1, 1, 1, 2]);
     }
 
     /// **Arriving signs the journey off; arriving somewhere else does not.** The

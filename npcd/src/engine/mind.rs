@@ -697,7 +697,28 @@ impl Minds {
             projected.prompt.len()
         );
         self.warm_dreams(&projected);
+        self.close_conversations(&projected);
         self.projection.store(Some(Arc::new(projected)));
+    }
+
+    /// Close the groups the cast's conversations are written to: a conversation
+    /// reads its own group as its own lineage, and nothing of anybody else's.
+    ///
+    /// **A group that is not a turn's own is gathered across every
+    /// conversation in it**, and under a sequence rule every turn found that
+    /// way is held as the reader's founding history. The mind and the talks
+    /// are two groups, so a character answering somebody read every other
+    /// character's working turns as its own past — Zen told a person it had
+    /// "just finished reviewing" a piece a Maker in another world had been
+    /// handed half an hour before — and a character at work read everybody's
+    /// private conversations the same way. Scoped, with no conversation ever
+    /// named in a scope, each group offers nothing to a turn that is not its
+    /// own; what happened in between reaches a talk from the journal.
+    fn close_conversations(&self, projected: &Projected) {
+        self.engine.mark_group_scoped(projected.group);
+        if let Some((_, talk)) = projected.talk {
+            self.engine.mark_group_scoped(talk);
+        }
     }
 
     /// The installed schema, as an `Arc` a caller may hold across an await.
@@ -2105,7 +2126,9 @@ impl Minds {
     /// — the cast is meant to still be there when it starts again. Retiring here
     /// would make [`Minds::open_conversation`]'s rejoin unreachable, since the
     /// lookup it runs on excludes tombstoned timelines by design.
-    pub async fn retire_npc(&self, npc_id: u64) {
+    ///
+    /// Returns how many conversations with a party it retired.
+    pub async fn retire_npc(&self, npc_id: u64) -> usize {
         // Taken out of the map first, then locked: a character mid-decode is
         // awaited rather than tombstoned underneath.
         let gone = self.release(npc_id);
@@ -2113,7 +2136,7 @@ impl Minds {
             retire(&self.engine, &*l.conversation.lock().await);
         }
         // Its conversations too, of every party and generation (§4.1).
-        self.retire_talks(npc_id);
+        self.retire_talks(npc_id)
     }
 
     /// Make `live` the character's conversation, with the handle it is asked

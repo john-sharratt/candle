@@ -4443,6 +4443,8 @@ mod tests {
                 // character, so admin.
                 ("/v1/pulse/guardian", "admin"),
                 ("/v1/pulse/missions/cancel", "admin"),
+                // Starting named characters over: admin, and never undone.
+                ("/v1/pulse/start-over", "admin"),
                 ("/v1/pulse/missions/generate", "admin"),
                 // The pool's read and its clearing are registered apart for
                 // their dispatch: any member reads it, every member clears the

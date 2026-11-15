@@ -59,6 +59,14 @@ pub const CALLED_OFF: &str = "It was called off before it was done.";
 /// was set for, is gone from the world.
 pub const GONE: &str = "Whoever it was for is gone, and it was never done.";
 
+/// What a posted mission's poster is told of one dropped because its carrier
+/// was started over ([`Missions::start_over`]).
+pub const STARTED_OVER: &str = "Its carrier was started over, and it was dropped.";
+
+/// The most missions one [`Missions::start_over`] calls off from a body's
+/// hands: a bound on a loop that ends when there is nothing left to cancel.
+const START_OVER_MOST: usize = 64;
+
 /// What the world offers a routine, owned: [`Sim::mission_material`]'s answer,
 /// which a caller borrows as [`Facts`] while it draws.
 ///
@@ -687,6 +695,14 @@ impl Missions {
         self.active
             .get_mut(body)
             .is_some_and(Mission::read_messages)
+    }
+
+    /// Sign off the steps of the body's open mission that connect to the
+    /// terminal it has just worked — see [`Mission::worked_terminal`].
+    pub fn worked_terminal(&mut self, body: &str, terminal: &str) -> bool {
+        self.active
+            .get_mut(body)
+            .is_some_and(|m| m.worked_terminal(terminal))
     }
 
     /// The body's open mission, if it is on one.
@@ -1712,6 +1728,31 @@ impl Missions {
             }
             None => false,
         }
+    }
+
+    /// A body starts over: what it carries is called off, every mission
+    /// waiting for it, whoever lodged it, is dropped — each poster told — and
+    /// the work it posted that nobody has taken up yet is taken off the table.
+    /// Returns how many missions went. The body stays in the world, taking
+    /// orders or giving them as it did.
+    pub fn start_over(&mut self, body: &str) -> usize {
+        let mut gone = 0;
+        while gone < START_OVER_MOST && self.cancel_for(body, STARTED_OVER) {
+            gone += 1;
+        }
+        for m in self.lodged.remove(body).unwrap_or_default() {
+            self.called_off(body, &m, STARTED_OVER);
+            gone += 1;
+        }
+        let posted =
+            |m: &Mission| matches!(&m.origin, Origin::Ordered { poster, .. } if poster == body);
+        let waiting = self.pool.len() + self.lodged.values().map(Vec::len).sum::<usize>();
+        self.pool.retain(|m| !posted(m));
+        for queue in self.lodged.values_mut() {
+            queue.retain(|m| !posted(m));
+        }
+        self.lodged.retain(|_, queue| !queue.is_empty());
+        gone + waiting - self.pool.len() - self.lodged.values().map(Vec::len).sum::<usize>()
     }
 
     /// A body is gone from the world: what it carried is called off, what was

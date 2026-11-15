@@ -112,6 +112,7 @@ pub mod schema;
 pub mod simulate;
 pub mod slash;
 pub mod sleep;
+pub mod start_over;
 pub mod station;
 pub mod stir;
 pub mod substrate_views;
@@ -556,6 +557,15 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Role::Admin,
             each(),
             post(mission_api::cancel_all),
+        )
+        // Start named characters over: their missions called off and their
+        // conversations retired. Admin — it reaches characters the caller does
+        // not own, and cannot be undone.
+        .route(
+            "/v1/pulse/start-over",
+            Role::Admin,
+            each(),
+            post(start_over::start_over),
         )
         // The table's generator: write one mission now, and read or clear what
         // it has put on the table and what it has found. Admin — the work it

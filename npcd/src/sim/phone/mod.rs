@@ -115,6 +115,23 @@ impl Threads {
         }
     }
 
+    /// `who` starts over on every thread it is on: it stays a member, and
+    /// nothing said before now is its to read or to be told of. Returns how
+    /// many threads that was.
+    pub fn start_over(&mut self, who: &str) -> usize {
+        let mut on = 0;
+        for t in self.threads.values_mut() {
+            let last = t.last_seq();
+            if let Some(m) = t.member_mut(who) {
+                m.joined = last;
+                m.read = last;
+                m.delivered = last;
+                on += 1;
+            }
+        }
+        on
+    }
+
     /// The name `id` is shown by on any thread it is on.
     pub fn name_of(&self, id: &str) -> Option<&str> {
         self.threads

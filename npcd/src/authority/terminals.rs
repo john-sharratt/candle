@@ -193,7 +193,13 @@ impl Runtime {
                      `terminal_connect` takes you to one."
                         .into(),
                 ),
-                Some(terminal) => self.work(&hosted, &terminal, act).await,
+                Some(terminal) => {
+                    let (landed, answer) = self.work(&hosted, &terminal, act).await;
+                    if landed {
+                        hosted.with_sim(|s| s.missions.worked_terminal(&body, &terminal.name));
+                    }
+                    (landed, answer)
+                }
             },
         };
         if landed {

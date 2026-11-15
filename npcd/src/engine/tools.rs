@@ -1262,8 +1262,28 @@ pub fn entry(t: &Tool) -> String {
 }
 
 /// How many of the acts a room offers one turn's prompt describes, ranked by
-/// provenance. Routed acts are not counted: they are shown whenever offered.
+/// provenance. An act [`shown_wherever_offered`] is not counted.
 pub const SHOWN_ACTS: usize = 10;
+
+/// Whether `t` is described on every turn that offers it, however it ranks.
+///
+/// **An act offered in one place only is the point of standing there.** A
+/// routed act is one: its address in the mask is useless to a character never
+/// told what the verb means. So is the lift's — a Drone sent to another level
+/// reached the shaft twenty times, was told each time to ride with `lift_use`,
+/// and walked away again because the ten acts its prompt described that turn
+/// did not include it: "that tool does not exist in my available toolset". And
+/// so is an act that is granted — a mission's own, a terminal's verbs while it
+/// is connected — and a house device's, which are offered only for as long as
+/// they are what the character is there to do.
+pub fn shown_wherever_offered(t: &Tool) -> bool {
+    routed(t.name)
+        || BRIDGE_ACTS.iter().any(|b| b.name == t.name)
+        || matches!(
+            t.availability,
+            Availability::Granted | Availability::AtLift | Availability::AtLanding
+        )
+}
 
 /// Install `tools` into the schema's [`COLLECTION`], one member each, and make
 /// it chosen by both the room and provenance — so nothing shows until a turn
@@ -1276,9 +1296,8 @@ pub const SHOWN_ACTS: usize = 10;
 /// ones the grammar allows), and provenance scoring then ranks those by how
 /// well each fits what the character is meant to be doing — so a collection
 /// scored alone can no longer show an act the room refuses, and a room can no
-/// longer bury the relevant act under every other one it allows. A routed act
-/// is mandatory: it is shown whenever its table is in reach, because the
-/// address in the mask is useless to a character never told what the verb means.
+/// longer bury the relevant act under every other one it allows. An act
+/// offered in one place only is mandatory — see [`shown_wherever_offered`].
 ///
 /// Forced to [`SelectionRule::Offered`] whatever the schema declared, because
 /// the selector is this module's to name: a collection authored
@@ -1311,10 +1330,10 @@ pub fn install<'a>(
         let id = builder
             .add_section_to_collection(cid, member_of(t), entry(t), 100.0)
             .map_err(|e| anyhow::anyhow!("installing `{}` into `{COLLECTION}`: {e}", t.name))?;
-        if routed(t.name) {
+        if shown_wherever_offered(t) {
             builder
                 .set_collection_member_mandatory(cid, id)
-                .map_err(|e| anyhow::anyhow!("routed act `{}` mandatory: {e}", t.name))?;
+                .map_err(|e| anyhow::anyhow!("act `{}` mandatory: {e}", t.name))?;
         }
         n += 1;
         installed(n, t);
@@ -4701,8 +4720,22 @@ mod tests {
             })
             .into_iter()
             .collect();
-        let routed_count = all.iter().filter(|t| routed(t.name)).count();
-        assert_eq!(mandatory, [routed_count], "the routed acts, and only they");
+        let always = all.iter().filter(|t| shown_wherever_offered(t)).count();
+        assert_eq!(mandatory, [always], "the acts offered in one place only");
+    }
+
+    /// The lift's acts, a granted act and a routed one are described wherever
+    /// they are offered; an act offered everywhere competes for its place.
+    #[test]
+    fn an_act_offered_in_one_place_is_always_shown() {
+        for name in ["lift_use", "lift_call", "terminal_connect", "report_done"] {
+            let t = by_name(name).unwrap_or_else(|| panic!("no `{name}`"));
+            assert!(shown_wherever_offered(t), "`{name}` could be left out");
+        }
+        for name in ["move_to", "scan", "message"] {
+            let t = by_name(name).unwrap_or_else(|| panic!("no `{name}`"));
+            assert!(!shown_wherever_offered(t), "`{name}` is always shown");
+        }
     }
 
     /// A turn that forces one answer pins exactly that definition, whatever the
