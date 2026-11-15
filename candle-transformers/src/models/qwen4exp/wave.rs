@@ -59,6 +59,7 @@ use super::hits::{
     ShadowScan,
 };
 use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
+use super::index_keys::key_page_growth_bytes;
 use super::indexer::{
     compact_index_caches, select_layer, selection_stride, IndexCache, IndexSnapshot, SplicePiece,
 };
@@ -2993,24 +2994,16 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         }
     }
 
-    /// Per selecting layer, the live tail's pages a prefill of `rows` rows from
-    /// `offset` opens — a block key per `compress_ratio` rows,
-    /// [`super::index_keys::PAGE_BLOCKS`] keys to a page — each at its slot's
-    /// share of the region. Unpriced, the index grew two regions under a cohort
-    /// fitted with 84 MiB to spare beside other unpriced claims, and its window
-    /// was refused eight regions short (WhiteWorld, f3bf5e313, 2026-10-19).
+    /// Per selecting layer, the live tail's Q8_0 key pages a prefill of `rows`
+    /// rows from `offset` opens ([`key_page_growth_bytes`]). Unpriced, the index
+    /// grew two regions under a cohort fitted with 84 MiB to spare beside other
+    /// unpriced claims, and its window was refused eight regions short
+    /// (WhiteWorld, f3bf5e313, 2026-10-19).
     fn index_growth_bytes(&self, offset: usize, rows: usize) -> usize {
         let d = self.model.cfg.indexer.head_dim;
-        let page = candle_nn::kv_cache::slot_share_bytes(
-            super::index_keys::PAGE_BLOCKS * d * DType::F32.size_in_bytes(),
-        );
         self.attention_ratios()
             .into_iter()
-            .map(|ratio| {
-                let ratio = ratio.max(1);
-                let pages = |at: usize| (at / ratio).div_ceil(super::index_keys::PAGE_BLOCKS);
-                pages(offset + rows).saturating_sub(pages(offset)) * page
-            })
+            .map(|ratio| key_page_growth_bytes(d, ratio, offset, rows))
             .sum()
     }
 

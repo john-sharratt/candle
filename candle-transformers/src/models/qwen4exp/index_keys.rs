@@ -26,7 +26,9 @@ use std::sync::{Arc, Mutex};
 
 use candle::cuda_backend::cudarc::driver::DevicePtr;
 use candle::{DType, Device, Result, Storage, Tensor};
-use candle_nn::kv_cache::{claim_arena_slots, relocate_tensor, ArenaSlot, SlotTenant};
+use candle_nn::kv_cache::{
+    claim_arena_slots, relocate_tensor, slot_share_bytes, ArenaSlot, SlotTenant,
+};
 
 use super::indexer::tensor_ptr;
 use super::key_q8::{blocks, key_bytes, Q8Keys};
@@ -83,6 +85,22 @@ pub(super) fn alloc_buffers(
 /// `[PAGE_BLOCKS, d]`, then the scale plane `[PAGE_BLOCKS, blocks(d)]`.
 pub fn key_page_bytes(d: usize) -> usize {
     PAGE_BLOCKS * key_bytes(d)
+}
+
+/// The span bytes one selecting layer's live tail grows by when a sequence at
+/// `offset` takes `rows` more rows: a block key per `ratio` rows,
+/// [`PAGE_BLOCKS`] keys to a page, each page newly opened at its slot's share of
+/// the region ([`key_page_bytes`], `slot_share_bytes`).
+///
+/// What admission prices a prefill's index by. Sized from the page as it is
+/// stored, so a page of Q8_0 keys is priced at its 34,880 bytes at the
+/// 128-wide head, not the 131,072 its F32 keys took: priced at the float page
+/// after the keys became Q8_0, admission charged every turn ~3.8 times the
+/// index ground it claims.
+pub fn key_page_growth_bytes(d: usize, ratio: usize, offset: usize, rows: usize) -> usize {
+    let ratio = ratio.max(1);
+    let pages = |at: usize| (at / ratio).div_ceil(PAGE_BLOCKS);
+    pages(offset + rows).saturating_sub(pages(offset)) * slot_share_bytes(key_page_bytes(d))
 }
 
 /// Byte offset of a key page's scale plane.
@@ -440,6 +458,25 @@ mod tests {
     fn rows(n: usize, d: usize) -> Q8Keys {
         let vals: Vec<f32> = (0..n * d).map(|i| (i % 251) as f32 - 125.0).collect();
         Q8Keys::quantize(&vals, d)
+    }
+
+    /// **A prefill is priced by the Q8_0 pages it opens**, each at its slot's
+    /// share of a 16 MiB region: 481 pages of 34,816 bytes to a region, so
+    /// 34,880 bytes a page at the 128-wide head. A block key per `ratio` rows,
+    /// 256 keys to a page; rows inside an open page open none.
+    #[test]
+    fn a_prefill_is_priced_by_the_q8_pages_it_opens() {
+        assert_eq!(key_page_growth_bytes(128, 4, 0, 4), 34_880);
+        assert_eq!(key_page_growth_bytes(128, 4, 0, 1_024), 34_880);
+        assert_eq!(key_page_growth_bytes(128, 4, 0, 1_028), 69_760);
+        assert_eq!(key_page_growth_bytes(128, 4, 1_024, 4), 34_880);
+        assert_eq!(key_page_growth_bytes(128, 4, 4, 1_000), 0);
+        assert_eq!(key_page_growth_bytes(128, 128, 0, 131_072), 4 * 34_880);
+        assert_eq!(
+            key_page_growth_bytes(128, 0, 0, 256),
+            34_880,
+            "a ratio of 0 is 1"
+        );
     }
 
     /// A page is its codes then its scales, and a key's two rows are found in
