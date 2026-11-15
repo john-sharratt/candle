@@ -493,6 +493,8 @@ __global__ __launch_bounds__(QSA_PAGED_THREADS) void qsa_score_paged_generic_ker
     }
 }
 
+#include "qsa_score_mma.cuh"
+
 /// Candidates a block covers: every thread carries `CPT` of them.
 #define QSA_PAGED_SPAN(TR, CP) (QSA_PAGED_THREADS * (CP))
 
@@ -588,6 +590,22 @@ extern "C" void run_qsa_score_paged(
     const int n_grid = qsa_paged_grid_cands(n_cand);
     const float2* tab2 = reinterpret_cast<const float2*>(tab);
     const float2* steps2 = reinterpret_cast<const float2*>(steps);
+    // A wide span over a deep index scores on the INT8 tensor cores
+    // (`qsa_score_mma.cuh`), at the released geometry. That arm stages keys a
+    // warp at a time and so runs few of them at once: under
+    // `QSA_MMA_MIN_ROWS` rows or `QSA_MMA_MIN_CELLS` cells — a decoding
+    // sequence, a shallow index — the launch is latency-bound and a thread per
+    // candidate is faster (`docs/qsa_index_q8.md` §9, round 7).
+    if (D == QSA_MMA_D && (pairs & 31) == 0 && pairs <= QSA_MMA_MAX_PAIRS
+        && rows >= QSA_MMA_MIN_ROWS && (long long)rows * n_grid >= QSA_MMA_MIN_CELLS) {
+        switch (H) {
+            QSA_MMA_LAUNCH(1)
+            QSA_MMA_LAUNCH(2)
+            QSA_MMA_LAUNCH(4)
+            QSA_MMA_LAUNCH(8)
+            default: break;
+        }
+    }
     // The templated arms need whole Q8_0 blocks on both sides of the rotary
     // split; anything else takes the generic arm.
     if ((D & 31) == 0 && (pairs & 31) == 0 && 2 * pairs <= D) {

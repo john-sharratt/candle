@@ -383,6 +383,37 @@ fn rotate_f64(key: &[f32], pos: usize, inv_freq: &[f32]) -> Vec<f64> {
     out
 }
 
+/// What one head's dot product can lose to the tensor-core arm's int8
+/// operands, for a query `q` and a rotated key `k` of the released width.
+///
+/// That arm rounds the query to int8 against each 32-channel block's maximum
+/// (`s_q = max|q| / 127`) and, in the rotary width, rounds the rotated key a
+/// second time against its own (`s_k`). With `Q = q/s_q + e_q`,
+/// `K = k/s_k + e_k` and `|e| ≤ ½`, a block's integer dot differs from the
+/// true one by at most `½·s_k·Σ|q| + ½·s_q·Σ|k| + 32·¼·s_q·s_k`; a
+/// pass-through block's key is its stored codes exactly, which leaves the
+/// middle term alone. The kernel takes its maxima in f32 under fast math, so
+/// the half is given two percent of slack. Other widths take the float arm
+/// and lose nothing here.
+fn int8_bound(q: &[f32], k: &[f64], pairs: usize) -> f64 {
+    if q.len() != 128 {
+        return 0.0;
+    }
+    let mut bound = 0f64;
+    for b in 0..4 {
+        let (qb, kb) = (&q[b * 32..(b + 1) * 32], &k[b * 32..(b + 1) * 32]);
+        let q_sum: f64 = qb.iter().map(|x| x.abs() as f64).sum();
+        let k_sum: f64 = kb.iter().map(|x| x.abs()).sum();
+        let s_q = qb.iter().fold(0f64, |m, x| m.max(x.abs() as f64)) / 127.0;
+        bound += 0.51 * s_q * k_sum;
+        if b * 32 < 2 * pairs {
+            let s_k = kb.iter().fold(0f64, |m, x| m.max(x.abs())) / 127.0;
+            bound += 0.51 * s_k * q_sum + 8.2 * s_q * s_k;
+        }
+    }
+    bound
+}
+
 /// The oracle and its per-cell bound: `(scores, bounds)`, `[t, n]` each.
 fn oracle(
     pages: &[Page],
@@ -412,6 +443,7 @@ fn oracle(
         for (g, k) in keys.iter().enumerate().take(valid) {
             let mut sum = 0f64;
             let mut mag = 0f64;
+            let mut quant = 0f64;
             for hh in 0..h {
                 let qb = (r * h + hh) * d;
                 let mut dot = 0f64;
@@ -420,9 +452,10 @@ fn oracle(
                     mag += (q[qb + c] as f64 * k[c]).abs();
                 }
                 sum += dot.max(0.0);
+                quant += int8_bound(&q[qb..qb + d], k, inv_freq.len());
             }
             s[r * n + g] = sum;
-            b[r * n + g] = (d as f64 + 16.0) * u * mag + 1e-12;
+            b[r * n + g] = (d as f64 + 16.0) * u * mag + 1e-12 + quant;
         }
     }
     (s, b)
@@ -590,6 +623,63 @@ fn every_tile_arm() -> Result<()> {
             ROPE_DIM,
             &format!("h {h}"),
         )?;
+    }
+    Ok(())
+}
+
+/// The rows of `scores` (`[t, n]`) as each one's `k` best columns among its
+/// first `valid` — the selection the scores exist for.
+fn top_k(scores: impl Fn(usize) -> f64, valid: usize, k: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..valid).collect();
+    order.sort_by(|&a, &b| scores(b).total_cmp(&scores(a)).then(a.cmp(&b)));
+    order.truncate(k);
+    order.sort_unstable();
+    order
+}
+
+/// **The tensor-core arm**: a span wide and deep enough that the launcher
+/// takes it — sixteen rows and four million cells — against the f64 oracle
+/// within the int8 bound, at every compiled head count, over ragged pages with
+/// a row-major tail. And the selection it exists for: each row's 512 best
+/// candidates by the kernel are the oracle's, to within one in a hundred.
+#[test]
+fn the_tensor_core_arm_matches_the_oracle_and_selects_the_same() -> Result<()> {
+    let _g = gpu_serial();
+    let dev = Device::new_cuda(0)?;
+    let (table, inv) = rope(THETA, ROPE_DIM, &dev)?;
+    // 70,000 candidates in ragged pages, the last row-major in a buffer larger
+    // than it holds.
+    let mut pages = contiguous_pages(0, &[40_000, 7, 29_000], &[3, 1, RATIO], 0xD0, D);
+    let mut tail = Page::new(pages[2].base + pages[2].tokens(), 993, 2, 0xD9, D);
+    tail.layout = Layout::RowMajor { cap: 1024 };
+    pages.push(tail);
+    let n: usize = pages.iter().map(|p| p.rows).sum();
+    let end = pages[3].base + pages[3].tokens();
+    for &(h, t) in &[(4usize, 64usize), (1, 70), (2, 64), (8, 61)] {
+        assert!(t >= 16 && t * n.next_power_of_two() >= 1 << 22);
+        // The deepest rows see everything; a few see a prefix.
+        let qpos: Vec<usize> = (0..t).map(|i| end - 1 - (i * 4099) % (end / 2)).collect();
+        let q = seeded(t * h * D, 0xDA ^ (h * 131 + t) as u64);
+        let got = score(&pages, &q, &qpos, &table, 0, h, D)?;
+        let (want, bound) = oracle(&pages, &q, &qpos, &inv, h, D);
+        assert_matches(&got, &want, &bound, &format!("tensor cores, h {h}, t {t}"));
+
+        let (mut same, mut all) = (0usize, 0usize);
+        for (r, &pos) in qpos.iter().enumerate() {
+            let valid = candidates(&pages, pos) as usize;
+            let k = 512.min(valid);
+            let kernel = top_k(|g| got[r * n + g] as f64, valid, k);
+            let truth = top_k(|g| want[r * n + g], valid, k);
+            same += kernel
+                .iter()
+                .filter(|g| truth.binary_search(g).is_ok())
+                .count();
+            all += k;
+        }
+        assert!(
+            same * 100 >= all * 99,
+            "h {h}: the kernel's top 512 share {same} of {all} with the oracle's"
+        );
     }
     Ok(())
 }
@@ -944,6 +1034,48 @@ fn bench_tail_routes() -> Result<()> {
         }
     }
     println!();
+    Ok(())
+}
+
+/// One launch of the decode shape — one query row over a deep index — for
+/// `ncu`.
+#[test]
+#[ignore = "profiling target; run under ncu"]
+fn bench_rot_scorer_profile_decode() -> Result<()> {
+    let _g = gpu_serial();
+    let dev = Device::new_cuda(0)?;
+    let (table, _) = rope(THETA, ROPE_DIM, &dev)?;
+    let tokens = 1_048_576usize;
+    let n_pages = 256usize;
+    let t = 1usize;
+    let rows_each = (tokens / n_pages).div_ceil(RATIO);
+    let pages = contiguous_pages(
+        0,
+        &vec![rows_each; n_pages],
+        &vec![RATIO; n_pages],
+        0x1234,
+        D,
+    );
+    let up = upload(&pages, D, &dev)?;
+    let n = up.n_rows;
+    let qpos = n * RATIO - 1;
+    let cnt = Tensor::from_vec(vec![candidates(&pages, qpos)], t, &dev)?;
+    let q = Tensor::from_vec(seeded(t * H * D, 7), (t * H, D), &dev)?;
+    let out = Tensor::zeros((t, n), DType::F32, &dev)?;
+    launch(
+        &up,
+        &q,
+        &cnt,
+        &table,
+        0,
+        &out,
+        t,
+        H,
+        D,
+        table.pairs(),
+        n_pages,
+    )?;
+    dev.synchronize()?;
     Ok(())
 }
 
