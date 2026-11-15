@@ -267,13 +267,15 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   its competition; the per-child background
   (`docs/provenance_score_normalization.md`) is what takes a case's base
   rate out of its vote.
-- **A draft that stops short is asked again.** A unit that keeps under half
-  of what its required parts asked for — an optional part's shortfall is
-  never held against it — fails as its own failure and is calibrated again by
-  a later pass, up to the same three tries as a draft that wrote none; on its
-  last, what it wrote is sealed. Sealed as they stood, 11 of 283 units
-  counted as calibrated on BlackWorld (2026-11-15) with as few as 1 question
-  of 41.
+- **A draft that stops short is asked again.** A draft that stops early
+  leaves its later parts empty, so a unit one of whose required parts kept no
+  question fails as its own failure and is calibrated again by a later pass,
+  up to the same three tries as a draft that wrote none; on its last, what it
+  wrote is sealed. An optional part may rightly write none, and a part may
+  write fewer than its count: a small file with few names is told to write
+  fewer rather than ask about a name twice. Sealed as they stood, 11 of 283
+  units counted as calibrated on BlackWorld (2026-11-15) with as few as 1
+  question of 41.
 - **Written by the unit.** Each unit is asked in a draft forked from its
   layer's base with the unit as its lineage — so it writes its questions with
   its whole content in front of it — without reasoning or tools. The draft is

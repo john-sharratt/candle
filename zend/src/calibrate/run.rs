@@ -91,19 +91,25 @@ const MAX_FAILURES: u32 = 3;
 const NO_QUESTION: &str = "the draft wrote no question";
 
 /// How a calibration whose draft stopped short says so.
-const SHORT_DRAFT: &str = "the draft wrote under half its questions";
+const SHORT_DRAFT: &str = "the draft left a part with no question";
 
-/// Whether a draft that kept `kept` questions, against the `required` its
-/// non-optional parts asked for, stopped short: under half.
+/// The required parts of a draft that kept no question — `(name, min, kept)`
+/// for each part asked — in the order asked.
 ///
-/// A draft that stops early still writes something, and sealed as it stood it
-/// counted as calibrated: `zend/src/held_values.rs` was asked for 41 and kept
-/// 1, `npc-map/src/lift.rs` 56 and kept 16 — its later parts empty — and the
-/// sweep never came back to either (BlackWorld, 2026-11-15, 11 units in 283).
-/// An optional part's questions count toward `kept` but not `required`: it is
-/// told to write fewer rather than pad.
-fn falls_short(kept: usize, required: usize) -> bool {
-    kept * 2 < required
+/// **A draft that stops early leaves its later parts empty.** Sealed as it
+/// stood it counted as calibrated: `zend/src/held_values.rs` kept 1 question
+/// and `npc-map/src/lift.rs` 16, their `uses` and `purpose` parts empty, and
+/// the sweep never came back to either (BlackWorld, 2026-11-15, 11 units in
+/// 283). Judged instead by how many it kept against its count, a file with
+/// fewer names than its budget — told to write fewer rather than ask about a
+/// name twice — would be sent back for doing as it was told. An optional part
+/// (`min` 0) may rightly write none.
+fn empty_parts<'a>(parts: &[(&'a str, usize, usize)]) -> Vec<&'a str> {
+    parts
+        .iter()
+        .filter(|&&(_, min, kept)| min > 0 && kept == 0)
+        .map(|&(name, _, _)| name)
+        .collect()
 }
 
 /// Whether `error` is the unit's own failure — its draft wrote nothing, or
@@ -527,12 +533,8 @@ fn calibrate_one(
     // try what it wrote is sealed, which is more than leaving it with none.
     let last_try =
         failures_of(unit.prior_failures.as_deref(), &unit.marker).saturating_add(1) >= MAX_FAILURES;
-    if falls_short(found.len(), drafted.required) && !last_try {
-        anyhow::bail!(
-            "{SHORT_DRAFT} ({} of {} required)",
-            found.len(),
-            drafted.required
-        );
+    if !drafted.empty.is_empty() && !last_try {
+        anyhow::bail!("{SHORT_DRAFT} ({})", drafted.empty.join(", "));
     }
     let t_think = Instant::now();
     let thought = thoughts(engine, frame, spec, &found)?;
@@ -705,9 +707,10 @@ fn unit_path(subject: &str) -> &str {
 struct Drafted {
     questions: Vec<String>,
     wanted: usize,
-    /// Of `wanted`, what the parts that are not optional asked for — what a
-    /// draft that stopped short is judged against ([`falls_short`]).
-    required: usize,
+    /// The required parts that kept no question ([`empty_parts`]); for an
+    /// answer with no headings, `all` when it kept under the parts' minimums
+    /// together.
+    empty: Vec<String>,
     last_answer: String,
 }
 
@@ -777,17 +780,12 @@ fn draft(
                 .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
             let answer = answer?;
             let total: usize = wanted.iter().sum();
-            let required: usize = asks
-                .iter()
-                .zip(&wanted)
-                .filter(|(a, _)| a.questions.min > 0)
-                .map(|(_, &n)| n)
-                .sum();
             let names: Vec<&str> = asks.iter().map(|a| a.name.as_str()).collect();
             let mut seen: HashSet<String> = HashSet::new();
             let mut kept: Vec<String> = Vec::new();
-            match split(&answer, &names) {
+            let empty: Vec<String> = match split(&answer, &names) {
                 Some(bodies) => {
+                    let mut parts: Vec<(&str, usize, usize)> = Vec::with_capacity(asks.len());
                     for ((body, &n), ask) in bodies.iter().zip(&wanted).zip(&asks) {
                         let before = kept.len();
                         kept.extend(
@@ -795,12 +793,18 @@ fn draft(
                                 .into_iter()
                                 .filter(|q| seen.insert(q.to_lowercase())),
                         );
+                        let got = kept.len() - before;
                         // An optional part is told to stop short rather than
                         // pad, so writing few is its answer, not a failure.
                         if ask.questions.min > 0 {
-                            short_of(unit, &ask.name, n, kept.len() - before, body);
+                            short_of(unit, &ask.name, n, got, body);
                         }
+                        parts.push((ask.name.as_str(), ask.questions.min, got));
                     }
+                    empty_parts(&parts)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
                 }
                 None => {
                     kept = questions(&answer, total)
@@ -808,12 +812,18 @@ fn draft(
                         .filter(|q| seen.insert(q.to_lowercase()))
                         .collect();
                     short_of(unit, "all", total, kept.len(), &answer);
+                    let least: usize = asks.iter().map(|a| a.questions.min).sum();
+                    if kept.len() < least {
+                        vec!["all".to_string()]
+                    } else {
+                        Vec::new()
+                    }
                 }
-            }
+            };
             Ok(Drafted {
                 questions: kept,
                 wanted: total,
-                required,
+                empty,
                 last_answer: answer,
             })
         },
@@ -898,21 +908,24 @@ mod tests {
         assert_eq!(failures_of(Some("garbled"), "m:1"), 0);
     }
 
-    /// **Every keyed unit is found; only a whole, finished one is ready.** A
-    /// unit with a turn still to arrive, and one cut off mid-thought, are
-    /// found but not ready; a calibration and an unkeyed conversation of the
-    /// group are not units.
-    /// **A draft that kept under half of what its required parts asked for
-    /// stopped short** — `held_values.rs` keeping 1 of 41, `lift.rs` 16 of 53;
-    /// half or more is a draft that wrote what it could, and a unit asked for
-    /// nothing required cannot fall short.
+    /// **A draft that left a required part empty stopped short** — `lift.rs`
+    /// with 16 definitions and no uses or purpose; a part that wrote fewer than
+    /// asked, and an optional part that wrote none, did not.
     #[test]
-    fn a_draft_under_half_its_required_questions_falls_short() {
-        assert!(falls_short(1, 41));
-        assert!(falls_short(16, 53));
-        assert!(!falls_short(20, 40));
-        assert!(!falls_short(27, 53));
-        assert!(!falls_short(0, 0));
+    fn a_required_part_with_no_question_is_a_draft_stopped_short() {
+        assert_eq!(
+            empty_parts(&[
+                ("definitions", 4, 16),
+                ("uses", 2, 0),
+                ("messages", 0, 0),
+                ("purpose", 2, 0)
+            ]),
+            ["uses", "purpose"]
+        );
+        assert!(
+            empty_parts(&[("definitions", 4, 6), ("uses", 2, 3), ("messages", 0, 0)]).is_empty()
+        );
+        assert!(empty_parts(&[]).is_empty());
     }
 
     /// **Only the unit's own failures count against it**: a draft that wrote
@@ -923,7 +936,7 @@ mod tests {
             "the draft wrote no question (12 chars: \"I'll read it\")"
         ));
         assert!(units_own_failure(
-            "the draft wrote under half its questions (1 of 41 required)"
+            "the draft left a part with no question (uses, purpose)"
         ));
         assert!(!units_own_failure(
             "decode: the turn made no progress for 60 s: it was not admitted, or was lost"
@@ -939,6 +952,10 @@ mod tests {
         assert_eq!(unit_path("journals"), "journals");
     }
 
+    /// **Every keyed unit is found; only a whole, finished one is ready.** A
+    /// unit with a turn still to arrive, and one cut off mid-thought, are
+    /// found but not ready; a calibration and an unkeyed conversation of the
+    /// group are not units.
     #[test]
     fn a_unit_is_ready_only_whole_and_finished() {
         let conv = Conversation::ephemeral();

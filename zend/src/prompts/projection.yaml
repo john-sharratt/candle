@@ -947,11 +947,14 @@ layers:
           prompts:
             # "where is `tier_fits` defined?" — about a third of the names,
             # asked only that. Asked as a third of the questions, it came back
-            # as a "where" twin of every "what is" (BlackWorld, 2026-11-15).
+            # as a "where" twin of every "what is"; and a budget by tokens
+            # asks a small file with few names for more than it has, so it
+            # writes fewer rather than ask a name again — `think_gate.rs`
+            # asked about `ThinkGate` five times (BlackWorld, 2026-11-15).
             - name: definitions
               questions: { per_tokens: 300, min: 4, max: 28 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. Each one names, exactly as written there, a function, type, trait, constant, field or setting it defines, and asks one thing about it: what it is, what it does or returns, what its arguments or fields mean, or where it is defined. For about a third of the names, the one thing asked is where it is defined. Spread them across as many different names as the file has, and ask about each name only once — never a second question about a name already asked about. Ask as different developers would: some short, like "where's `tier_fits` defined?", some longer. Never ask about module visibility, test names or formatting.
+                Write up to <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. If the file defines fewer names than that, write fewer rather than ask about a name again. Each one names, exactly as written there, a function, type, trait, constant, field or setting it defines, and asks one thing about it: what it is, what it does or returns, what its arguments or fields mean, or where it is defined. For about a third of the names, the one thing asked is where it is defined. Spread them across as many different names as the file has, and ask about each name only once — never a second question about a name already asked about. Ask as different developers would: some short, like "where's `tier_fits` defined?", some longer. Never ask about module visibility, test names or formatting.
             # "what calls `tier_fits`?", "what breaks if it changes?" — the
             # transitive questions.
             - name: uses
