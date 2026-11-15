@@ -86,6 +86,12 @@ impl Runtime {
                     return;
                 };
                 for key in rt.talks.due(now_ms()) {
+                    // A held character — suspended, or a drone at rest —
+                    // answers nobody: its lines wait with the conversation and
+                    // are answered once it is let go.
+                    if rt.scheduler.is_held(key.0) {
+                        continue;
+                    }
                     let turn = tokio::spawn(Arc::clone(&rt).talk_turn(key.clone()));
                     // Recorded once spawned; a turn that ended first leaves
                     // only a finished handle, which cancels nothing.

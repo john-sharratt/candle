@@ -1,17 +1,16 @@
-//! The acts a mission is lived through: take one up at the command desk, and
-//! report how it went back at the desk.
+//! The acts a mission is lived through: report how it went at the command
+//! desk, and — for a character that gives orders — post work there and read
+//! what came back.
 //!
 //! # One place: the command table
 //!
-//! A mission is taken up and answered for at the command table (`order-table`),
-//! and carried out in the world between. All three acts are `AtPart` on that
-//! part, so they are in a character's grammar only while it stands at the table —
-//! it is called there when the table opens (see `Runtime::TO_THE_TABLE` and the
-//! tannoy the command-table API sends), takes one up, goes and does it, and
-//! comes back to report and take the next. Keeping the acts to the table is also
-//! what keeps a character *out working* free of them: its grammar while it
-//! travels and reads and talks is the ordinary one, unchanged by carrying a
-//! mission.
+//! A mission is given to its carrier by the table (`Runtime::assign_work`:
+//! nobody comes for one), carried out in the world, and answered for at the
+//! command table (`order-table`). The acts are `AtPart` on that part, so they
+//! are in a character's grammar only while it stands at the table. Keeping
+//! them to the table is also what keeps a character *out working* free of
+//! them: its grammar while it travels and reads and talks is the ordinary
+//! one, unchanged by carrying a mission.
 //!
 //! The rich shape of a mission (the ask, the steps, the answer, the pass/fail
 //! report) lives in [`crate::engine::mission`]; whose it is lives in
@@ -23,8 +22,8 @@ use super::tools::{Availability, Example, Param, Plane, Tool};
 use crate::engine::mission::Origin;
 use crate::sim::Sim;
 
-/// The command desk, by the part id the map gives it. A mission is taken up and
-/// reported here and nowhere else.
+/// The command desk, by the part id the map gives it. A mission is reported
+/// here and nowhere else.
 pub const COMMAND_DESK: &[&str] = &["order-table"];
 
 /// An act taken at the command desk that names nothing — it acts on the desk and
@@ -74,16 +73,6 @@ macro_rules! desk_on {
     };
 }
 
-pub const COLLECT_MISSION: Tool = desk!(
-    "collect_mission",
-    "Take up a mission from the table — the one set for you, or, if none is, the next thing worth \
-     doing. It becomes what you are working on until you come back and report it.",
-    "You are at the command table with nothing you have been asked to do, and it is where work is \
-     handed out.",
-    "A mission taken is a mission somebody can hold you to; standing at the table without one is \
-     standing idle where the work is."
-);
-
 /// **What was found is called `found`.** Named `account`, the field read —
 /// inside an `invoke` body, where only its name is in front of the writer — as
 /// whose account it was, and Makers filed their own names there turn after
@@ -92,7 +81,7 @@ pub const REPORT_DONE: Tool = desk_on!(
     "report_done",
     "Back at the command table, report the mission you were carrying as done, and say what you \
      found or concluded. This closes it and files your answer, which is how anyone else learns \
-     what came of it — and it frees you to take up the next.",
+     what came of it — and it frees you for the next.",
     "found",
     "What you found, made, or concluded — the answer the mission was for.",
     "You have carried out your mission and come back to the table to say what came of it.",
@@ -104,7 +93,7 @@ pub const REPORT_STUCK: Tool = desk_on!(
     "report_stuck",
     "Back at the command table, report that the mission cannot be finished, and say why. This \
      closes it as not done — an honest account of what stopped you, not a thing to be ashamed of \
-     — and frees you to take up another.",
+     — and frees you for another.",
     "why",
     "What stopped you — what you tried, and where it would not go.",
     "You have carried a mission as far as it will go, and come back to the table to say it will \
@@ -138,8 +127,9 @@ pub const ORDER_POST: Tool = Tool {
     availability: Availability::AtPart,
     description: "Put a mission on the table for one of those who take your orders to carry \
                   out: what is to be done and the steps to it — or one of the standing jobs, \
-                  whole — and, if it is for one in particular, who. Whoever waits at the table \
-                  is told at once; you are told when it is reported, and read the report here.",
+                  whole — and, if it is for one in particular, who. It is handed to them at \
+                  once, or to the first of them free; you are told when it is reported, and \
+                  read the report here.",
     params: &[
         Param {
             name: "job",
@@ -167,8 +157,8 @@ pub const ORDER_POST: Tool = Tool {
             name: "for",
             ty: "string",
             required: false,
-            description: "Who is to carry it, by name. Left out, the first to come for work \
-                          takes it.",
+            description: "Who is to carry it, by name. Left out, it goes to whoever has been \
+                          free longest.",
         },
         Param {
             name: "args",
@@ -262,9 +252,8 @@ pub const MISSION_WRITE: Tool = Tool {
 };
 
 /// Every mission act, for the catalog. All at the command table: a mission is
-/// taken up and answered for there, and carried out in the world between.
+/// answered for there, and carried out in the world.
 pub const MISSION_ACTS: &[Tool] = &[
-    COLLECT_MISSION,
     REPORT_DONE,
     REPORT_STUCK,
     REPORT_REJECTED,
@@ -342,22 +331,15 @@ const NOT_FOR_OPERATIONS: [&str; 9] = [
 
 /// Whether the table offers `tool` to a body carrying `c`.
 ///
-/// **What cannot be done is not offered.** The table listed `collect_mission`
-/// beside `report_done` to a character back with its work done; it took the
-/// first, was refused, read the refusal as being sent to collect first, and
-/// stood at the table going round. One carrying a mission has only the reports;
-/// one carrying none has only the collect; only a review can be rejected.
-/// `orders_report_done` is for a body holding an order — a character with a
+/// **What cannot be done is not offered.** One carrying a mission has the
+/// reports; one carrying none has nothing to report; only a review can be
+/// rejected. `orders_report_done` is for a body holding an order — a character with a
 /// mission and no order filed its mission against an order it never held. A
 /// Maker on an operation is not offered the bench's working-set verbs (see
 /// [`NOT_FOR_OPERATIONS`]), and an unordered character is offered no work at
 /// all.
 pub fn offered(tool: &str, c: Carrying) -> bool {
     match tool {
-        // One that takes no orders collects nothing: its round is put on its
-        // agenda by the engine as each item comes due (`docs/zen_moon_mind.md`
-        // §17.3).
-        t if t == COLLECT_MISSION.name => !c.mission && !c.unordered,
         // The table is the poster's to give work from and read back at, and only
         // a character that takes no orders gives them. What came back is read
         // once: the reading is offered only while something new waits in it.
@@ -412,15 +394,13 @@ mod tests {
 
     #[test]
     fn the_table_offers_only_what_the_body_can_do_there() {
-        // Carrying nothing: take one up, nothing to report.
+        // Carrying nothing: nothing to report.
         let idle = carrying(false, false, false);
-        assert!(offered("collect_mission", idle));
         assert!(!offered("report_done", idle));
         assert!(!offered("report_stuck", idle));
         assert!(!offered("report_rejected", idle));
-        // Carrying one: report it, take nothing new.
+        // Carrying one: report it.
         let busy = carrying(true, false, false);
-        assert!(!offered("collect_mission", busy));
         assert!(offered("report_done", busy));
         assert!(offered("report_stuck", busy));
         assert!(!offered("report_rejected", busy), "only a review rejects");
@@ -467,7 +447,7 @@ mod tests {
             unordered: true,
             ..idle
         };
-        assert!(!offered("collect_mission", unordered));
+        assert!(!offered("report_done", unordered));
         assert!(offered("present", unordered));
         // And it is the one the table's orders are for; nobody else posts. What
         // came back is offered only while something new waits in it.

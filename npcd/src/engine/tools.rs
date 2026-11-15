@@ -914,7 +914,7 @@ const INVOKE: Tool = Tool {
             ty: "string",
             required: true,
             description: "The address to act at, exactly as it appears on your device — e.g. \
-                          \"http://local/command/order-table~0/collect_mission\".",
+                          \"http://local/command/order-table~0/report_done\".",
         },
         // **The body is a JSON object, typed by the address.** The grammar
         // replaces this parameter with the fields the chosen address takes — see
@@ -931,11 +931,11 @@ const INVOKE: Tool = Tool {
         },
     ],
     examples: &[Example {
-        situation: "You are at the command table with nothing you have been asked to do, and \
-                    want the next thing worth doing.",
-        call: r#"{"url":"http://local/command/order-table~0/collect_mission","body":{}}"#,
-        because: "Taking up a mission names nothing, so the body is an empty object. The world \
-                  answers with what has been asked of you.",
+        situation: "You are back at the command table with the reading your mission sent you \
+                    for.",
+        call: r#"{"url":"http://local/command/order-table~0/report_done","body":{"found":"I read the breaker panel: the main breaker is tripped and the others are closed"}}"#,
+        because: "The address is the table's own, and the body carries the one field it asked \
+                  for. The world answers that the mission is closed.",
     }],
 };
 
@@ -4751,7 +4751,7 @@ mod tests {
     }
 
     /// **A migrated act leaves the grammar even where its station stands.**
-    /// `collect_mission` is `routed` to the effector device, so a body standing
+    /// `report_done` is `routed` to the effector device, so a body standing
     /// at the command table — `within.station` naming it — is still not offered
     /// it as a compiled call. It reaches missions through `invoke` on the
     /// command table now, which is the whole of the Step 6 cut.
@@ -4760,22 +4760,18 @@ mod tests {
         let mut at_table = Within::nowhere();
         // What `sim.station_tools` would report at the command table: the acts its
         // parts carry, by name — including the migrated mission acts.
-        at_table.station = vec![
-            "collect_mission".to_string(),
-            "report_done".to_string(),
-            "report_stuck".to_string(),
-        ];
+        at_table.station = vec!["report_done".to_string(), "report_stuck".to_string()];
         // `invoke` is offered only when there is an address to name, so give it
         // the one the device would list for the command table.
         at_table.invokable = vec![Invokable::new(
-            "http://local/command/order-table~0/collect_mission",
-            "collect_mission",
+            "http://local/command/order-table~0/report_done",
+            "report_done",
         )];
         let offered: Vec<String> = specs_within(Mode::Physical, &at_table)
             .iter()
             .map(|s| s.name.clone())
             .collect();
-        for migrated in ["collect_mission", "report_done", "report_stuck"] {
+        for migrated in ["report_done", "report_stuck"] {
             assert!(
                 !offered.iter().any(|n| n == migrated),
                 "`{migrated}` is routed to the device and must not be in the grammar: {offered:?}"
@@ -4811,7 +4807,7 @@ mod tests {
         let here = shown(&at_table);
         assert!(here.contains(&member("report_done")), "{here:?}");
         assert!(here.contains(&member("report_stuck")), "{here:?}");
-        assert!(!here.contains(&member("collect_mission")), "{here:?}");
+        assert!(!here.contains(&member("order_post")), "{here:?}");
         let away = shown(&Within::nowhere());
         assert!(!away.contains(&member("report_done")), "{away:?}");
     }

@@ -642,17 +642,6 @@ struct CharacterTask {
     attempt: Arc<Mutex<AttemptSlot>>,
 }
 
-/// Where a character's command table is, as the standing task words it.
-struct TableWay {
-    /// The room the table stands in.
-    room: String,
-    /// The level that room is on.
-    level: String,
-    /// Whether that room is on the character's own level, so a walk is all it
-    /// takes. When it is not, the lift is the way.
-    on_foot: bool,
-}
-
 /// The supervisor's current attempt, or the tombstone that tells a supervisor
 /// racing [`CharacterTask::stop`] to put its fresh attempt down: the stop may
 /// land between the attempt's spawn and its registration here, and without
@@ -749,11 +738,11 @@ pub const YOUR_OWN_TIME: &str = "Nobody gives you orders, and nothing is waiting
 /// has just filled (`docs/zen_moon_mind.md` §17.3), followed by the mission it
 /// was given.
 ///
-/// **The round is put on the agenda, never fetched.** Woken with an address to
-/// `invoke` the table's `collect_mission` at, Zen had to reach the table before
-/// its routine could begin, and a turn spent answering its channel instead left
-/// the round waiting on an act nobody took. The engine takes the item up the
-/// moment it is due, so Zen wakes already working on it.
+/// **The round is put on the agenda, never fetched.** Woken to fetch it at the
+/// table, Zen had to reach the table before its routine could begin, and a
+/// turn spent answering its channel instead left the round waiting on an act
+/// nobody took. The engine takes the item up the moment it is due, so Zen
+/// wakes already working on it.
 pub const ROUND_TAKEN: &str = "Nothing was on your agenda, so your round has given you its next \
                                item, and it is what you are working on now.";
 
@@ -797,70 +786,22 @@ fn written_up_to_floor(s: &Sim, body: &str, mission: &Mission, doc: &DocStep) ->
     (words >= work.min_words).then_some(words)
 }
 
-/// What a character with no mission is set on **while the command table is
-/// open**: go to it and take one up.
+/// What a character is told as the table gives it a mission
+/// ([`Runtime::assign_work`]), followed by the mission as it reads it.
 ///
-/// The standing task while the table is open, so an idle character reads it and
-/// makes its way there rather than settling into the room it is in. It names the
-/// command table's device verb (`invoke` its `collect_mission`): the mission acts
-/// have migrated to the effector device (`tools::routed`), so taking one up is a
-/// device call on the table's address, not a compiled act. Naming the concrete
-/// verb still lands where a bare wish does not — the lesson [`IN_COMPANY`]
-/// records — it is only the *surface* that moved. The loud call that reaches a
-/// character mid-conversation is the tannoy the table's opening sends; this is
-/// what keeps drawing one that has drifted, and what a character reads on its way.
-///
-/// `{room}` and `{level}` are where the table stands. Fixed as "the command room,
-/// on the command level", the moon's Drones were sent to a room their world does
-/// not have — its table is in the watch room — and never found the work.
-pub const TO_THE_TABLE: &str =
-    "The command table is open and there is work waiting for you. Leave off \
-     whatever you are doing or saying and go to it now. The table is in {room}, \
-     on {level}: if you are on another floor, go to the lift, ride it to {level} \
-     with `lift_use` — it calls the car and waits for it — and then `move_to` \
-     {room}; you cannot walk between floors. This comes before talk — answer no message and \
-     nobody here, go. Once you are \
-     there, the table is on your effector device: `scan` to see what it offers, \
-     then take up a mission by `invoke` on its `collect_mission`. Carry it out, \
-     and when it is done come back and report it at the table the same way, then \
-     take up the next.";
+/// **A mission is given, never fetched** (`docs/zen_everywhere.md` §3). Called
+/// to the table to take one up, Makers stood at it with work waiting, scanned
+/// it, reflected, rode the lift and came back — forty minutes without one
+/// collected — and a Drone with nothing to carry was woken every thirty
+/// seconds to be told to go and wait. The table hands the work over where the
+/// character is, and a character with none is at rest.
+pub const MISSION_GIVEN: &str = "The command table has given you a mission, and it is what you \
+                                 are working on now. Carry it out, and when it is done go to \
+                                 the table and report it there.";
 
-/// [`TO_THE_TABLE`] for a character whose table is **on its own level**: no lift,
-/// no floors, just a room to walk to. `{room}` is the room the table stands in.
-pub const TO_THE_TABLE_ON_FOOT: &str =
-    "The command table is open and there is work waiting for you. Leave off \
-     whatever you are doing or saying and go to it now. The table is in {room}: \
-     `move_to` it. This comes before talk — answer no message and nobody here, go. Once you \
-     are there, the table is on your effector device: `scan` to see what it \
-     offers, then take up a mission by `invoke` on its `collect_mission`. Carry \
-     it out, and when it is done come back and report it at the table the same \
-     way, then take up the next.";
-
-/// The summons for a character with nothing to do in a world that hands out no
-/// routines (`draw: none`), while nothing is posted: go and **wait** at the
-/// table, where work will be posted and you will be told
-/// (`docs/zen_moon_mind.md` §8.3).
-pub const TO_WAIT: &str = "You have no work yet. Go to the order table in {room} and wait there \
-                           — {how} — and you will be told the moment work is posted.";
-
-/// The summons for a character that is **already at the table** with no mission.
-///
-/// [`TO_THE_TABLE`] tells a character to travel; read by one that has arrived it
-/// is a step out of date — "make your way to the command room" while standing in
-/// it is the confusion that had a character reach the table and then wander off
-/// again. This is the same standing task from where the work is actually taken:
-/// stop, and take one up now.
-pub const AT_THE_TABLE: &str =
-    "You are at the command table, where the work is handed out, and you are \
-     carrying nothing. Do not walk away and do not stand here talking. The table \
-     is on your effector device: `scan` to see what it offers, then take up a \
-     mission now by `invoke` on its `collect_mission`. Once it is yours, carry it \
-     out, and when it is done come back and `invoke` the table's `report_done` — \
-     or `report_stuck` if it will not finish — then take up the next.";
-
-/// The summons for a character **at the command table with its mission's work
-/// done** — everything but the report signed off. See
-/// [`Runtime::at_table_summons`].
+/// What a character **at the command table with its mission's work done** —
+/// everything but the report signed off — is told. See
+/// [`Runtime::at_table_report`].
 pub const REPORT_AT_THE_TABLE: &str =
     "You are at the command table and every step of your mission is done but the \
      report. Report it now, here: `invoke` the table's `report_done` with exactly \
@@ -893,16 +834,13 @@ pub const VERDICT_AT_THE_TABLE: &str =
 /// does not stand in a room for minutes with nothing to go on.
 const IDLE_AFTER_MS: u64 = 90_000;
 
-/// How often the command table's **active** summons is restated to a character
-/// that has no mission while the table is open.
+/// How often a character that takes no orders is asked whether its round has
+/// an item due for its empty agenda ([`Runtime::round_due`]).
 ///
 /// Shorter than [`IDLE_AFTER_MS`] and on a clock of its own (see
-/// `Scheduler::summons_due`), because this one has to reach a character *in*
-/// conversation rather than wait for it to fall quiet — the table is open and
-/// calling, and a busy Maker that never comes is the whole failure this fixes.
-/// Not so short that the same call lands every tick: repeated verbatim into the
-/// window it stops being read as work and becomes a pattern the character
-/// remarks on instead of obeying.
+/// `Scheduler::summons_due`), because the round has to reach a character *in*
+/// conversation rather than wait for it to fall quiet: one talking on its
+/// channels never goes quiet enough for the idle wake.
 const SUMMONS_AFTER_MS: u64 = 30_000;
 
 /// How long a character due a turn waits for the engine and its persona when
@@ -1333,21 +1271,21 @@ impl Runtime {
         // [`Persona::mission`]), so there is no standing task to restate: saying
         // its wording again on a clock is what reads as a loop.
         //
-        // With no mission but the command table open, the standing task is to go
-        // and take one up — so an idle character makes its way there rather than
-        // settling where it stands. See [`TO_THE_TABLE`].
+        // **With no mission while the table gives work, there is no task to
+        // restate**: the table hands a free character its next mission where it
+        // stands ([`Self::assign_work`]), and one with nothing to be handed is
+        // at rest ([`Self::follow_rest`]) — not told to go anywhere, and not
+        // woken to be told that nothing is asked of it.
         //
         // **An unordered character is given no task** — the world gives it no
         // orders — but it is still woken: with nothing else arriving, this is
         // what rouses a character gone quiet. It is told its own idle thought
         // when its personality has one, and otherwise only that its time is its
         // own. See [`YOUR_OWN_TIME`].
-        let (on_mission, table_open, unordered, waits, round) = hosted.sim(|s| {
+        let (on_mission, unordered, round) = hosted.sim(|s| {
             (
                 s.missions.is_on_mission(&body),
-                s.table_open,
                 s.missions.is_unordered(&body),
-                !s.missions.draws() && !s.missions.has_work_for(&body),
                 s.missions.has_round(),
             )
         });
@@ -1365,28 +1303,8 @@ impl Runtime {
         if unordered {
             return Some(idle.unwrap_or_else(|| YOUR_OWN_TIME.to_string()));
         }
-        if let Some(way) = self.command_table_way(npc_id).filter(|_| table_open) {
-            // **With nothing on the table, the work is to wait for it** in a
-            // world that hands nothing out by draw: one at the table is left
-            // quiet until a post wakes it, and one away is sent there to wait.
-            if waits {
-                return match self.at_command_table(npc_id) {
-                    true => None,
-                    false => Some(Self::to_wait_at(&way)),
-                };
-            }
-            // Location-aware, the same split the active summons makes (see
-            // [`Self::table_summons`] / [`Self::at_table_summons`]): a character
-            // that has arrived reads [`AT_THE_TABLE`] — take one up here — and one
-            // still on its way reads [`TO_THE_TABLE`] — make your way there. This
-            // passive path fires on the idle gate ([`IDLE_AFTER_MS`]), so without
-            // the distinction a free character that falls quiet standing at the
-            // table is told to travel to the room it is already in, the exact
-            // arrived-then-told-to-travel confusion the summons split removed.
-            return Some(match self.at_command_table(npc_id) {
-                true => AT_THE_TABLE.to_string(),
-                false => Self::to_the_table(&way),
-            });
+        if self.table_gives_to(&hosted, &body) {
+            return None;
         }
         // Who is here — which decides *which* standing task this is, and, when
         // there is company, is itself the most useful thing in it. Reading the
@@ -1418,98 +1336,164 @@ impl Runtime {
         })
     }
 
-    /// The command table's **active** summons, for a character that has no
-    /// mission while the table is open — `None` otherwise.
+    /// The round's next due item, put on the empty agenda of a character that
+    /// takes no orders and said as its wake — `None` for any other character,
+    /// one with something on its agenda, or a round with nothing due
+    /// (`docs/zen_moon_mind.md` §17.3).
     ///
-    /// [`Self::nudge_for`] already returns [`TO_THE_TABLE`] in this state, but it
-    /// is delivered only on the quiet-stretch gate (see the tick loop): a
-    /// character in conversation never goes quiet, so the passive nudge never
-    /// reaches it and it talks past the one-time tannoy. This is what the tick
-    /// loop appends to *every* tick's perception instead — the table stays open
-    /// calling, so a busy character is told every turn to break off and take up
-    /// work, and stops being told the moment it holds a mission.
-    pub fn table_summons(&self, npc_id: u64) -> Option<String> {
-        // Only for a character still on its way. One already at the table is
-        // called every tick by [`Self::at_table_summons`] instead — this gate is
-        // the slow one that must not repeat over a long journey, and a character
-        // that has arrived is out of its scope.
+    /// Asked on a clock of its own ([`SUMMONS_AFTER_MS`]) so it reaches a
+    /// character deep in conversation: one talking on its channels never falls
+    /// quiet enough for the idle wake [`Self::nudge_for`] rides.
+    pub fn round_due(&self, npc_id: u64) -> Option<String> {
         let (hosted, body) = self.body_of(npc_id)?;
-        let (on_mission, table_open, unordered, waits, round) = hosted.sim(|s| {
-            (
-                s.missions.is_on_mission(&body),
-                s.table_open,
-                s.missions.is_unordered(&body),
-                !s.missions.draws() && !s.missions.has_work_for(&body),
-                s.missions.has_round(),
-            )
+        let due = hosted.sim(|s| {
+            s.missions.is_unordered(&body)
+                && !s.missions.is_on_mission(&body)
+                && s.missions.has_round()
         });
-        // **An unordered character is given its round here**, with an empty
-        // agenda and an item due (`docs/zen_moon_mind.md` §17.3), on the same
-        // clock that reaches a character deep in conversation — one talking on
-        // its channels never falls quiet enough for the idle wake.
-        if unordered {
-            return match !on_mission && round {
-                true => take_up_round(&hosted, &body),
-                false => None,
-            };
+        match due {
+            true => take_up_round(&hosted, &body),
+            false => None,
         }
-        if on_mission || !table_open || self.at_command_table(npc_id) {
-            return None;
-        }
-        // With nothing posted in a world that draws nothing, it is called to
-        // wait there, not to take something up.
-        self.command_table_way(npc_id).map(|way| match waits {
-            true => Self::to_wait_at(&way),
-            false => Self::to_the_table(&way),
-        })
     }
 
-    /// The summons for a character **standing at the command table** with no
-    /// mission while the table is open — `None` otherwise.
+    /// Whether the table gives `body` its work in `hosted`: the table is open
+    /// and the body takes orders, in a world that draws nothing — where a
+    /// free body is at rest until work is posted — or one whose table the body
+    /// can reach to report at. Such a body is handed its missions
+    /// ([`Self::assign_work`]) and has no standing task without one.
+    fn table_gives_to(&self, hosted: &Hosted, body: &str) -> bool {
+        if body.starts_with("visitor:") {
+            return false;
+        }
+        let (open, ordered, draws) = hosted.sim(|s| {
+            (
+                s.table_open,
+                !s.missions.is_unordered(body),
+                s.missions.draws(),
+            )
+        });
+        open && ordered && (!draws || Self::reaches_table(hosted, body))
+    }
+
+    /// Whether `body` is a drone at rest in `hosted`
+    /// (`docs/zen_everywhere.md` §3): the table gives it its work, it carries
+    /// nothing, and nothing waits on the table that it may take.
+    fn at_rest(&self, hosted: &Hosted, body: &str) -> bool {
+        // The mission state first: it is a map lookup, and asked of every body
+        // every moment.
+        hosted.sim(|s| s.missions.at_rest(body)) && self.table_gives_to(hosted, body)
+    }
+
+    /// Hold at rest exactly the characters running here whose bodies in
+    /// `hosted` are drones at rest, and wake the others.
     ///
-    /// The tick loop appends this to *every* tick's perception (not the gated
-    /// deliver [`Self::table_summons`] rides), because a character is at the
-    /// table for only a turn or two before it drifts off again: the slow gate
-    /// misses that window, so a Maker reached the table, was told nothing new,
-    /// and wandered back out without taking anything up. The window is short by
-    /// nature — the moment it takes a mission this returns `None` — so repeating
-    /// it here does not pile up the way a summons repeated over a long journey
-    /// does.
+    /// **A drone with no mission does nothing and holds nothing on the card.**
+    /// Put at rest it is held as a suspended character is
+    /// ([`Scheduler::rest`]) and its conversation is let go
+    /// ([`Minds::let_go`]): no engine slot, no resident K/V, no recurrent
+    /// store, no index. Only a mission wakes it — the moment it carries one
+    /// this lets it go, and the turn it then takes rejoins its conversation
+    /// from the log and reads what reached it meanwhile, bounded per source.
+    pub(crate) fn follow_rest(&self, hosted: &Hosted) {
+        let minds = self.minds.read().unwrap().clone();
+        for (npc, body) in self.bodies.in_world(hosted.id()) {
+            if !self.standing.runs(npc) {
+                continue;
+            }
+            let rest = self.at_rest(hosted, &body);
+            if !self.scheduler.rest(npc, rest) {
+                continue;
+            }
+            match rest {
+                true => {
+                    let freed = minds.as_ref().is_some_and(|m| m.let_go(npc));
+                    tracing::info!(
+                        npc,
+                        freed,
+                        "drone at rest: it carries no mission, and takes no turn until it is \
+                         given one"
+                    );
+                }
+                false => tracing::info!(npc, "drone woken: it carries a mission"),
+            }
+        }
+    }
+
+    /// Give every free hand in `hosted` the table's next mission for it, the
+    /// one longest at rest first, and tell each what it was given.
     ///
-    /// **And a character standing there with its mission's work done is told to
-    /// report it.** The report is filed nowhere but the table, and a character
-    /// that came back with everything done read only its brief — so it reached
-    /// for `collect_mission`, was refused, and walked back out to begin again.
-    /// Same window, same reasoning: it stops the moment the report is filed.
-    pub fn at_table_summons(&self, npc_id: u64) -> Option<String> {
+    /// **Missions are assigned, not collected** (`docs/zen_everywhere.md` §3).
+    /// The world's authority runs this every moment, so work is handed over
+    /// the moment it is posted, and a character that reports is handed the
+    /// next thing waiting before it can come to rest. A hand is a body that
+    /// takes orders whose character is not suspended; work for a suspended
+    /// one waits for it.
+    pub(crate) fn assign_work(&self, hosted: &Hosted) {
+        let world = hosted.id();
+        let suspended = self.suspended_bodies(world);
+        if hosted.sim(|s| s.missions.suspended() != &suspended) {
+            hosted.with_sim(|s| s.missions.set_suspended(suspended));
+        }
+        // Longest at rest first; a character not at rest — it has only just
+        // put a mission down — comes after every one that is.
+        let mut free: Vec<(u64, u64, String)> = self
+            .bodies
+            .in_world(world)
+            .into_iter()
+            .filter(|(_, body)| {
+                // The mission state first, as in [`Self::at_rest`]: whether a
+                // table is in reach is a search of the map.
+                hosted.sim(|s| {
+                    s.missions.is_hand(body)
+                        && !s.missions.is_on_mission(body)
+                        && (s.missions.draws() || s.missions.has_work_for(body))
+                }) && self.table_gives_to(hosted, body)
+            })
+            .map(|(npc, body)| {
+                (
+                    self.scheduler.resting_since(npc).unwrap_or(u64::MAX),
+                    npc,
+                    body,
+                )
+            })
+            .collect();
+        free.sort_unstable();
+        for (_, npc, body) in free {
+            let Some(brief) = work::take_up(hosted, &body) else {
+                continue;
+            };
+            // Woken before it is told, so the brief is read in the turn the
+            // mission wakes it into rather than counted among what waited.
+            if self.standing.runs(npc) && self.scheduler.rest(npc, false) {
+                tracing::info!(npc, "drone woken: it carries a mission");
+            }
+            self.tell(
+                npc,
+                self.world_ms(npc),
+                Salience::URGENT,
+                EventKind::Nudge {
+                    text: format!("{MISSION_GIVEN}\n{brief}"),
+                },
+            );
+        }
+    }
+
+    /// What a character **standing at the command table** with its mission's
+    /// work done is told: report it, here, now — `None` otherwise.
+    ///
+    /// The tick loop appends this to *every* tick's perception, because a
+    /// character is at the table for only a turn or two before it drifts off
+    /// again, and the report is filed nowhere but the table: one that came
+    /// back with everything done and read only its brief walked back out to
+    /// begin again. The window is short by nature — it stops the moment the
+    /// report is filed.
+    pub fn at_table_report(&self, npc_id: u64) -> Option<String> {
         let (hosted, body) = self.body_of(npc_id)?;
         // An unordered character standing at the table is only standing there.
         if !self.at_command_table(npc_id) || hosted.sim(|s| s.missions.is_unordered(&body)) {
             return None;
         }
-        // **The table hands its work to whoever stands at it free.** Told every
-        // tick to take one up, Makers stood at the open table with operations
-        // waiting, scanned it, reflected, rode the lift and came back — forty
-        // minutes without one collected, thirty-five reviews waiting. A Maker
-        // free at the open table is given the next operation's mission it may
-        // take, and reads its brief.
-        if hosted.sim(|s| {
-            s.table_open && !s.missions.is_on_mission(&body) && s.missions.has_pooled_for(&body)
-        }) {
-            if let Some(brief) = work::take_up(&hosted, &body) {
-                return Some(format!(
-                    "The table hands you the next piece of work, and you take it up.\n{brief}"
-                ));
-            }
-        }
-        // The exact address, for a mission set for this character by name: the
-        // general call to take one up was read past, turn after turn, by a
-        // character that walked in and out of the table room on other business.
-        let collect = self
-            .invokable_urls(&hosted, &body)
-            .into_iter()
-            .find(|i| i.act == mission_acts::COLLECT_MISSION.name)
-            .map(|i| i.url);
         // **"Report it now" only when the report will be taken.** A Maker told
         // every tick that all but the report was done, and refused at every
         // report by the quality gate, went round until it said it wanted to
@@ -1526,18 +1510,7 @@ impl Runtime {
             }
         }
         hosted.sim(|s| match s.missions.active(&body) {
-            None if s.missions.has_lodged(&body) => Some(match &collect {
-                Some(url) => format!(
-                    "A mission has been set for you by name, and it is waiting at this table. \
-                     Take it up now: `invoke` {url}."
-                ),
-                None => AT_THE_TABLE.to_string(),
-            }),
-            // **Waiting for work is waiting quietly.** In a world that draws
-            // nothing, a character at the table with nothing posted is told
-            // nothing: a post wakes it (`Runtime::moment`).
-            None if !s.missions.draws() => None,
-            None => s.table_open.then(|| AT_THE_TABLE.to_string()),
+            None => None,
             // A mission carried on its ask alone has no steps to have done, so
             // it is not told they are.
             Some(m)
@@ -1770,7 +1743,7 @@ impl Runtime {
                 // nowhere and paced the level it was on for twenty minutes.
                 let tables: Vec<&Where> = reach
                     .iter()
-                    .filter(|at| s.part_offers(&place(at), mission_acts::COLLECT_MISSION.name))
+                    .filter(|at| s.part_offers(&place(at), mission_acts::REPORT_DONE.name))
                     .collect();
                 let table = tables
                     .iter()
@@ -2060,8 +2033,8 @@ impl Runtime {
             .is_none_or(|(hosted, body)| !hosted.sim(|s| s.missions.is_unordered(&body)))
     }
 
-    /// Whether this character stands where a mission is taken up — i.e. the order
-    /// table's `collect_mission` is among the acts the room offers it.
+    /// Whether this character stands where a mission is reported — i.e. the
+    /// order table's `report_done` is among the acts the room offers it.
     fn at_command_table(&self, npc_id: u64) -> bool {
         let Some((hosted, body)) = self.body_of(npc_id) else {
             return false;
@@ -2070,78 +2043,32 @@ impl Runtime {
         hosted.sim(|s| {
             s.station_tools(&place)
                 .iter()
-                .any(|t| t == mission_acts::COLLECT_MISSION.name)
+                .any(|t| t == mission_acts::REPORT_DONE.name)
         })
     }
 
-    /// The command table this character can get to from where it stands, and
-    /// whether it is on its own level: the room it is in, or any room the map's
-    /// doors, portals and lifts lead on to, that offers `collect_mission`. A
-    /// table on the character's own level is preferred to one on another.
+    /// Whether `body` can get to a command table from where it stands: the
+    /// room it is in, or any room the map's doors, portals and lifts lead on
+    /// to, offers `report_done`.
     ///
-    /// `None` for a world with no order table, or a building cut off from the one
-    /// that has it, so the table's standing task is not set for a character that
-    /// has no way to obey it.
-    fn command_table_way(&self, npc_id: u64) -> Option<TableWay> {
-        let (hosted, body) = self.body_of(npc_id)?;
-        hosted.with_both(|w, s| {
-            let here = w.actor(&body).map(|a| a.at.clone())?;
-            let offers = |at: &Where| {
-                s.part_offers(
-                    &format!("{}/{}", at.area, at.node),
-                    mission_acts::COLLECT_MISSION.name,
-                )
-            };
-            let mut candidates = vec![here.clone()];
-            candidates.extend(route::reachable_from(w.map(), &here));
-            let offering: Vec<Where> = candidates.into_iter().filter(|at| offers(at)).collect();
-            let table = offering
-                .iter()
-                .find(|at| at.area == here.area)
-                .or_else(|| offering.first())?;
-            Some(TableWay {
-                room: w.node(table).map(|n| n.name.clone())?,
-                level: w.map().get(&table.area).map(|a| a.name.clone())?,
-                on_foot: table.area == here.area,
+    /// `false` for a world with no order table, or a building cut off from the
+    /// one that has it, so no mission is given to a body with nowhere to
+    /// report it.
+    fn reaches_table(hosted: &Hosted, body: &str) -> bool {
+        hosted
+            .with_both(|w, s| {
+                let here = w.actor(body).map(|a| a.at.clone())?;
+                let offers = |at: &Where| {
+                    s.part_offers(
+                        &format!("{}/{}", at.area, at.node),
+                        mission_acts::REPORT_DONE.name,
+                    )
+                };
+                Some(offers(&here) || route::reachable_from(w.map(), &here).iter().any(offers))
             })
-        })
+            .unwrap_or(false)
     }
 
-    /// The traveling summons, worded for the way this character has to go:
-    /// walk to a named room when the table is on its own level, ride the lift to
-    /// the command level when it is not.
-    fn to_the_table(way: &TableWay) -> String {
-        match way.on_foot {
-            true => TO_THE_TABLE_ON_FOOT.replace("{room}", &way.room),
-            false => TO_THE_TABLE
-                .replace("{room}", &way.room)
-                .replace("{level}", &way.level),
-        }
-    }
-
-    /// [`Self::to_the_table`] for a table with nothing on it yet, in a world
-    /// that hands nothing out by draw: go and wait there — see [`TO_WAIT`].
-    fn to_wait_at(way: &TableWay) -> String {
-        let how = match way.on_foot {
-            true => format!("`move_to` {}", way.room),
-            false => format!(
-                "ride the lift with `lift_use` to its level, then `move_to` {}",
-                way.room
-            ),
-        };
-        TO_WAIT.replace("{room}", &way.room).replace("{how}", &how)
-    }
-
-    /// Open or shut the command table on every world this daemon runs.
-    ///
-    /// The state the standing task ([`TO_THE_TABLE`]) and `collect_mission` read.
-    /// Opening it does not itself call anyone — [`Self::call_to_table`] sends the
-    /// tannoy and the chat-channel line that do.
-    ///
-    /// The flag is world state: each world's authority writes it with the rest
-    /// of the world's records on its next beat, so a reboot, and every member
-    /// following the world, finds it as it was left. A world this daemon only
-    /// follows is its authority's to open or shut.
     /// The agent client a device-bridge job is submitted through, when this
     /// member can reach one (`docs/zen_moon_mind.md` §15). `None` on a daemon
     /// that reaches no agent — a bridge act is then refused, not run here.
@@ -2155,6 +2082,17 @@ impl Runtime {
         let _ = self.agents.set(agents);
     }
 
+    /// Open or shut the command table on every world this daemon runs.
+    ///
+    /// The state [`Self::assign_work`] and [`Self::follow_rest`] read: an open
+    /// table gives work, a shut one gives none and puts nobody at rest.
+    /// Opening it does not itself announce anything —
+    /// [`Self::say_to_all_channels`] and the tannoy do.
+    ///
+    /// The flag is world state: each world's authority writes it with the rest
+    /// of the world's records on its next beat, so a reboot, and every member
+    /// following the world, finds it as it was left. A world this daemon only
+    /// follows is its authority's to open or shut.
     pub fn set_table_open(&self, open: bool) {
         for id in self.hosted.ids() {
             if !self.standing.writes(&id) {
@@ -2714,6 +2652,9 @@ impl Runtime {
         // What the order table owes: a post wakes whoever waits for it, a report
         // tells its poster. The world's authority tells, once.
         if self.standing.writes(hosted.id()) {
+            // Work is handed out before the notices, so a report and the next
+            // mission reach their readers in one moment.
+            self.assign_work(hosted);
             for notice in hosted.with_sim(|s| s.missions.take_notices()) {
                 self.give_notice(hosted, notice);
             }
@@ -2726,6 +2667,9 @@ impl Runtime {
                 self.changed(hosted, Change::World { line });
             }
         }
+        // After the table has given its work out: a drone handed a mission
+        // this moment is awake, and one left with none comes to rest.
+        self.follow_rest(hosted);
         self.keep_visitors_with_their_hosts(hosted);
         self.show_out_the_expired();
         moment
@@ -2734,11 +2678,8 @@ impl Runtime {
     /// Deliver one of the order table's notices
     /// (`docs/zen_moon_mind.md` §8.2–§8.3).
     ///
-    /// - **A post** wakes the one it is for, wherever it is — or, with none
-    ///   named, everybody who takes orders waiting at a table with nothing in
-    ///   hand. It only wakes them: the table hands the work to the first of
-    ///   them to take a turn there ([`Self::at_table_summons`]), so telling them
-    ///   all to collect it was telling all but one to be refused.
+    /// - **A post** tells nobody here: the table hands it to its carrier
+    ///   ([`Self::assign_work`]), which is told then, with the mission.
     /// - **A report** tells its poster who reported what, that the report waits
     ///   at the table, and — with nothing left on the table — that it is empty.
     fn give_notice(&self, hosted: &Hosted, notice: Notice) {
@@ -2752,33 +2693,7 @@ impl Runtime {
             )
         };
         match notice {
-            Notice::Posted {
-                to: Some(body),
-                brief,
-            } => {
-                if let Some(npc_id) = self.bodies.mind_of(world, &body) {
-                    tell(
-                        npc_id,
-                        format!(
-                            "Work has been posted on the order table for you by name: {brief} \
-                             Go to the table and take it up with `collect_mission`."
-                        ),
-                    );
-                }
-            }
-            Notice::Posted { to: None, brief } => {
-                for (npc_id, body) in self.bodies.in_world(world) {
-                    let free = hosted.sim(|s| {
-                        !s.missions.is_unordered(&body) && !s.missions.is_on_mission(&body)
-                    });
-                    if free && self.at_command_table(npc_id) {
-                        tell(
-                            npc_id,
-                            format!("Work has been posted on the order table: {brief}"),
-                        );
-                    }
-                }
-            }
+            Notice::Posted { .. } => {}
             Notice::Reported(filed) => {
                 // A standing mission's report is for every body here that
                 // gives orders; a posted one's for its poster.
@@ -2871,28 +2786,32 @@ impl Runtime {
     /// was last restated (without the second the gate latches open, because the
     /// task is not news).
     ///
-    /// **The table's active summons rides its own, shorter clock**
-    /// ([`SUMMONS_AFTER_MS`], since last restated alone) and is URGENT, so it
-    /// reaches a free character deep in conversation that the quiet gate never
-    /// would — but not every turn, or the character fixates on the repetition
-    /// instead of going.
+    /// **The round rides its own, shorter clock** ([`SUMMONS_AFTER_MS`], since
+    /// last restated alone) and is URGENT, so its next due item reaches a
+    /// character that takes no orders deep in conversation, which the quiet
+    /// gate never would ([`Self::round_due`]).
+    ///
+    /// **A character at rest is told nothing**: it has no standing task, and
+    /// nothing said here would be read before a mission wakes it.
     ///
     /// **A character with a mission is told its next step.** Its brief is in
     /// its prompt, so the brief is not restated; but a Maker gone quiet at its
     /// desk had nothing at all to bring it back, and the next step — what to do
     /// now — is what it needs.
     fn standing_task(&self, npc_id: u64) {
+        if self.scheduler.is_held(npc_id) {
+            return;
+        }
         let world_ms = self.world_ms(npc_id);
         // Asked twice a second for everybody, so the clock first: neither gate
-        // opens before the shorter one has, and reading the way to the table is
-        // a route search.
+        // opens before the shorter one has.
         if !self
             .scheduler
             .summons_due(npc_id, world_ms, SUMMONS_AFTER_MS)
         {
             return;
         }
-        let summons = self.table_summons(npc_id);
+        let summons = self.round_due(npc_id);
         let (gate_after, salience, text) = match &summons {
             Some(t) => (SUMMONS_AFTER_MS, Salience::URGENT, Some(t.clone())),
             None => (
@@ -4114,8 +4033,10 @@ impl Runtime {
         sampled_axes: &[String],
         on_reflection: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> anyhow::Result<reflect::Reflection> {
-        if self.scheduler.is_suspended(npc_id) {
-            anyhow::bail!("npc {npc_id} is suspended, and reflects on nothing until it is resumed");
+        if self.scheduler.is_held(npc_id) {
+            anyhow::bail!(
+                "npc {npc_id} is suspended or at rest, and reflects on nothing until it is let go"
+            );
         }
         let who = self
             .persona_of_async(npc_id)
@@ -4173,8 +4094,8 @@ impl Runtime {
     /// Dream a brief and keep the dream. Logged, never returned: nobody is
     /// waiting on it, and a dream that did not land costs a dream.
     async fn dream_now(&self, npc_id: u64, brief: &str, assumption: &str) {
-        if self.scheduler.is_suspended(npc_id) {
-            tracing::info!("npc {npc_id}: suspended, so this brief is not dreamt");
+        if self.scheduler.is_held(npc_id) {
+            tracing::info!("npc {npc_id}: suspended or at rest, so this brief is not dreamt");
             return;
         }
         let started = Instant::now();
@@ -4211,8 +4132,10 @@ impl Runtime {
         brief: &str,
         assumption: &str,
     ) -> anyhow::Result<crate::engine::dreams::Kept> {
-        if self.scheduler.is_suspended(npc_id) {
-            anyhow::bail!("npc {npc_id} is suspended, and dreams nothing until it is resumed");
+        if self.scheduler.is_held(npc_id) {
+            anyhow::bail!(
+                "npc {npc_id} is suspended or at rest, and dreams nothing until it is let go"
+            );
         }
         let minds = self
             .minds
@@ -4242,9 +4165,9 @@ impl Runtime {
     /// Start a draft of the stretch waiting in `npc_id`'s journal, as a task of
     /// its own. `false` when there is no stretch to draft: another draft is
     /// running, the stretch was taken since the guardian looked, or the
-    /// character is suspended.
+    /// character is suspended or at rest.
     pub fn draft_journal(self: &Arc<Self>, npc_id: u64) -> bool {
-        if self.scheduler.is_suspended(npc_id) {
+        if self.scheduler.is_held(npc_id) {
             return false;
         }
         let Some(due) = self.scheduler.journal_begin(npc_id) else {
@@ -4620,8 +4543,10 @@ impl Runtime {
         question: &str,
         choices: &[String],
     ) -> anyhow::Result<Answer> {
-        if self.scheduler.is_suspended(npc_id) {
-            anyhow::bail!("npc {npc_id} is suspended, and answers nothing until it is resumed");
+        if self.scheduler.is_held(npc_id) {
+            anyhow::bail!(
+                "npc {npc_id} is suspended or at rest, and answers nothing until it is let go"
+            );
         }
         let minds = self
             .minds
@@ -6830,13 +6755,12 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // far, told once — not the summons below, which is made afresh
             // every tick and would otherwise be read twice.
             let told_once = start.events.len();
-            // **A character standing at the table is told to take one up, every
-            // tick it stands there.** Appended to the tick in hand rather than
-            // `deliver`ed (whose `due_at = 0` would tight-loop): the window is a
-            // turn or two before it drifts off, so the slow gated summons misses
-            // it, and a Maker that reached the table and was told nothing new
-            // wandered back out. It stops the instant it holds a mission
-            // (`at_table_summons` returns `None`).
+            // **A character standing at the table with its work done is told to
+            // report it, every tick it stands there.** Appended to the tick in
+            // hand rather than `deliver`ed (whose `due_at = 0` would
+            // tight-loop): the window is a turn or two before it drifts off.
+            // It stops the instant the report is filed (`at_table_report`
+            // returns `None`).
             if let Some(text) = opening.summons {
                 start.events.push(Event::new(
                     rt.scheduler.next_seq(),
@@ -7539,14 +7463,6 @@ mod tests {
 
     fn at(node: &str) -> npc_map::world::Where {
         npc_map::world::Where::new("vault-casting", node)
-    }
-
-    /// [`TO_THE_TABLE`] as the vault words it: its table is in the command
-    /// room, on the command level.
-    fn vault_table_call() -> String {
-        TO_THE_TABLE
-            .replace("{room}", "the command room")
-            .replace("{level}", "the command level")
     }
 
     /// **Composing is refused honestly, never faked.** With no piece of work to
@@ -8539,19 +8455,19 @@ mod tests {
 
     /// **A fresh world opens the command table by default.** A world that hands
     /// out no missions leaves its whole cast with nothing asked of it; so an
-    /// untouched world comes up open, and an idle character with no mission is
-    /// pointed at the table rather than left to drift. (Shutting it is durable
-    /// and an operator's to do — see [`Self::host`].)
+    /// untouched world comes up open, and a character with no mission is given
+    /// one by the table rather than left to drift. (Shutting it is durable and
+    /// an operator's to do — see [`Self::host`].)
     #[tokio::test]
     async fn a_fresh_world_opens_the_command_table_by_default() {
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
         // Nobody has touched the table; its default is open, so a free character
-        // out in the wing is called to make its way to it.
-        assert_eq!(
-            rt.nudge_for(1).as_deref(),
-            Some(vault_table_call().as_str())
-        );
+        // out in the wing has no standing task, and the table gives it work.
+        assert_eq!(rt.nudge_for(1), None);
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        rt.assign_work(&hosted);
+        assert!(hosted.sim(|s| s.missions.is_on_mission("m1")));
     }
 
     /// **Company changes the standing task.** Told to go somewhere new every
@@ -8833,11 +8749,7 @@ mod tests {
         rt.scheduler.wake(1, 0, 0);
         rt.embody(1, WORLD, "m1", 0).expect("bound");
         hosted.with_sim(|s| s.missions.set_unordered("m1", true));
-        assert_eq!(
-            rt.table_summons(1),
-            None,
-            "a world with no round calls nobody"
-        );
+        assert_eq!(rt.round_due(1), None, "a world with no round calls nobody");
 
         let items = round::parse(
             "rounds/creators-vault.yaml",
@@ -8846,7 +8758,7 @@ mod tests {
         )
         .unwrap();
         hosted.with_sim(|s| s.missions.set_round(items));
-        let woken = rt.table_summons(1).expect("the due item wakes it");
+        let woken = rt.round_due(1).expect("the due item wakes it");
         assert!(
             woken.starts_with(ROUND_TAKEN) && woken.contains("Set the work."),
             "woken already working on the item: {woken}"
@@ -8858,11 +8770,7 @@ mod tests {
             }),
             "the item is on its agenda"
         );
-        assert_eq!(
-            rt.table_summons(1),
-            None,
-            "an agenda in hand is worked first"
-        );
+        assert_eq!(rt.round_due(1), None, "an agenda in hand is worked first");
     }
 
     /// **A piece is written at a desk that composes.** At a chronicle terminal,
@@ -9112,14 +9020,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── the command table summons ───────────────────────────────────────────
+    // ── the command table: work given, and drones at rest ───────────────────
 
     /// **Standing at the command table is recognised by what the room offers,
-    /// not by a coordinate.** `collect_mission` is stationed at the order table,
+    /// not by a coordinate.** `report_done` is stationed at the order table,
     /// so "am I at the table" is exactly "is that act among the ones this room
     /// hands me" — which is true in the command room and nowhere else.
     #[tokio::test]
-    async fn a_character_is_at_the_table_only_where_a_mission_can_be_collected() {
+    async fn a_character_is_at_the_table_only_where_a_mission_can_be_reported() {
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         // Arrives at the command room, where the order table stands.
@@ -9138,90 +9046,167 @@ mod tests {
         );
     }
 
-    /// **The traveling summons calls a character with no mission toward an open
-    /// table — and falls silent the moment there is nothing to travel for.** It
-    /// speaks only for a free character (no mission), only while the table is
-    /// open, and only while the character is still on its way; a character that
-    /// has arrived is the at-table summons's to call.
+    /// What reached character `npc` and waits unread, as it would read it.
+    fn waiting(rt: &Runtime, npc: u64) -> Vec<String> {
+        rt.scheduler
+            .tick(npc, 0, 0, |_, _| Vec::new())
+            .map(|rec| rec.perceived)
+            .unwrap_or_default()
+    }
+
+    /// **An open table gives a free character its work where it stands, and a
+    /// shut one gives none.** In a world that draws routines, a character away
+    /// from the table with no mission is handed one — told with its brief,
+    /// never called to fetch it — and one already carrying is handed nothing
+    /// more.
     #[tokio::test]
-    async fn the_traveling_summons_calls_only_a_free_character_toward_an_open_table() {
-        use crate::engine::mission::{Mission, Origin, Todo};
+    async fn the_open_table_gives_a_free_character_its_work_where_it_stands() {
         let rt = vaulted();
         // Out in the wing, away from the table.
         embody(&rt, 1, "m1", "green-room");
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let carrying = || hosted.sim(|s| s.missions.active("m1").map(|m| m.standing_text()));
 
-        // Shut table: nothing to be summoned to. (The default is open, so this
-        // shuts it first to exercise the closed→open transition.)
+        // Shut table: nothing is given. (The default is open, so this shuts it
+        // first to exercise the closed→open transition.)
         rt.set_table_open(false);
-        assert_eq!(rt.table_summons(1), None, "the table is not open");
+        waiting(&rt, 1);
+        rt.assign_work(&hosted);
+        assert_eq!(carrying(), None, "the table is not open");
+        assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
 
-        // Opened: now it is called to the command room.
+        // Opened: it is given a routine, and told so with the brief.
         rt.set_table_open(true);
-        assert_eq!(
-            rt.table_summons(1).as_deref(),
-            Some(vault_table_call().as_str())
+        assert_eq!(rt.nudge_for(1), None, "the table gives it its work");
+        rt.assign_work(&hosted);
+        let brief = carrying().expect("given a mission");
+        assert_eq!(waiting(&rt, 1), [format!("{MISSION_GIVEN}\n{brief}")]);
+        assert!(
+            !rt.scheduler.is_resting(1),
+            "a world that draws rests nobody"
         );
 
-        // Once it is carrying a mission, the call stops — the mission's own text
-        // is the standing task now.
-        let mission = Mission::new(
-            "Take stock of the redoubt.",
-            vec![Todo::new("walk the wall")],
-            Origin::Lodged {
-                by: "u_op".to_string(),
-            },
-        );
-        rt.hosted
-            .get(WORLD)
-            .unwrap()
-            .with_sim(|s| s.missions.assign("m1", mission));
-        assert_eq!(
-            rt.table_summons(1),
-            None,
-            "a character with a mission is not summoned to take another"
-        );
+        // Carrying one, it is given nothing more.
+        rt.assign_work(&hosted);
+        assert_eq!(carrying(), Some(brief));
+        assert!(waiting(&rt, 1).is_empty(), "told once");
     }
 
-    /// **The two summons are complementary: the traveling one for a character on
-    /// its way, the at-table one for a character standing at the table.** A free
-    /// character standing at an open table hears "you are here, take one up now";
-    /// one still travelling hears "make your way here" — never both, never
-    /// neither.
+    /// **A drone with no mission is at rest, and only a mission wakes it**
+    /// (`docs/zen_everywhere.md` §3). In a world that draws nothing, a drone
+    /// with nothing posted for it is held: no standing task, no turn, and what
+    /// is said to it waits. Work posted for nobody by name goes to the drone
+    /// longest at rest, which wakes carrying it and reads its brief first;
+    /// reported, with nothing more waiting, it comes to rest again.
     #[tokio::test]
-    async fn the_at_table_summons_speaks_at_the_table_and_the_traveling_one_on_the_way() {
+    async fn a_drone_with_no_mission_rests_until_the_table_gives_it_one() {
+        use crate::engine::event::{EventKind, Salience};
+        use crate::engine::mission::{Mission, Origin, Outcome as Verdict, Todo};
+        use crate::engine::mission_gen::world::Draw;
         let rt = vaulted();
-        rt.scheduler.wake(1, 0, 0);
-        // At the command room — the table itself.
-        rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
-            .unwrap();
-        rt.set_table_open(true);
-        assert_eq!(
-            rt.at_table_summons(1).as_deref(),
-            Some(AT_THE_TABLE),
-            "a free character at the open table is told to take one up here"
-        );
-        assert_eq!(
-            rt.table_summons(1),
-            None,
-            "one that has arrived is out of the traveling summons's scope"
-        );
-
-        // A second character still in the wing hears the mirror of that.
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::None));
+        embody(&rt, 1, "m1", "green-room");
         embody(&rt, 2, "m2", "green-room");
-        assert_eq!(
-            rt.at_table_summons(2),
-            None,
-            "a character not at the table is not told it is standing there"
+        waiting(&rt, 1);
+        waiting(&rt, 2);
+
+        // The first comes to rest a moment before the second.
+        rt.follow_rest(&hosted);
+        assert!(rt.scheduler.is_resting(1) && rt.scheduler.is_resting(2));
+        rt.scheduler.rest(2, false);
+        std::thread::sleep(Duration::from_millis(5));
+        rt.follow_rest(&hosted);
+        assert!(rt.scheduler.resting_since(1) < rt.scheduler.resting_since(2));
+
+        // At rest it has no standing task and takes no turn, whatever arrives.
+        assert_eq!(rt.nudge_for(1), None);
+        rt.standing_tasks(&hosted);
+        rt.scheduler.deliver(
+            1,
+            0,
+            Salience::URGENT,
+            EventKind::Description {
+                text: "A door slams.".into(),
+            },
         );
-        assert_eq!(
-            rt.table_summons(2).as_deref(),
-            Some(vault_table_call().as_str())
+        assert!(
+            rt.scheduler.begin_tick(1).is_none(),
+            "a drone at rest thought"
+        );
+        assert!(rt.scheduler.due_now(u64::MAX - 1).is_empty());
+
+        // Work for whoever is free goes to the one longest at rest.
+        let board = || {
+            Mission::new(
+                "Read the board.",
+                vec![Todo::new("go to the dispatch room")],
+                Origin::Lodged { by: "op".into() },
+            )
+        };
+        hosted.with_sim(|s| s.missions.post(board(), None));
+        rt.assign_work(&hosted);
+        rt.follow_rest(&hosted);
+        assert!(hosted.sim(|s| s.missions.is_on_mission("m1")));
+        assert!(!hosted.sim(|s| s.missions.is_on_mission("m2")));
+        assert!(!rt.scheduler.is_resting(1), "the mission woke it");
+        assert!(rt.scheduler.is_resting(2), "nothing for the other");
+        let read = waiting(&rt, 1);
+        assert_eq!(read[0], "A door slams.", "what waited is read");
+        assert!(
+            read[1].starts_with(MISSION_GIVEN) && read[1].contains("Read the board."),
+            "{read:?}"
         );
 
-        // Shut the table and both go quiet.
+        // Reported with nothing more waiting, it rests again.
+        hosted.with_sim(|s| {
+            s.missions
+                .report("m1", Verdict::Pass, "two jobs stalled", None)
+        });
+        rt.assign_work(&hosted);
+        rt.follow_rest(&hosted);
+        assert!(rt.scheduler.is_resting(1));
+
+        // Work set for one by name is that one's, however long another rested.
+        hosted.with_sim(|s| s.missions.post(board(), Some("m2")));
+        rt.assign_work(&hosted);
+        rt.follow_rest(&hosted);
+        assert!(hosted.sim(|s| s.missions.is_on_mission("m2")));
+        assert!(!rt.scheduler.is_resting(2) && rt.scheduler.is_resting(1));
+
+        // A shut table rests nobody: with no table to be given work by, a
+        // character with no mission has the ordinary standing task.
         rt.set_table_open(false);
-        assert_eq!(rt.at_table_summons(1), None, "the table closed");
-        assert_eq!(rt.table_summons(2), None, "the table closed");
+        rt.follow_rest(&hosted);
+        assert!(!rt.scheduler.is_resting(1));
+        assert!(rt.nudge_for(1).is_some());
+    }
+
+    /// **Work for a suspended drone waits for it.** It is no hand: a mission
+    /// for whoever is free passes it by, and one set for it by name stays on
+    /// the table until it is resumed.
+    #[tokio::test]
+    async fn work_is_not_given_to_a_suspended_drone() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        use crate::engine::mission_gen::world::Draw;
+        let rt = vaulted();
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::None));
+        embody(&rt, 1, "m1", "green-room");
+        rt.scheduler.suspend(1, true);
+        let watch = Mission::new(
+            "Watch Earth.",
+            vec![Todo::new("go to the observatory")],
+            Origin::Lodged { by: "op".into() },
+        );
+        hosted.with_sim(|s| s.missions.post(watch, Some("m1")));
+        rt.assign_work(&hosted);
+        assert!(!hosted.sim(|s| s.missions.is_on_mission("m1")));
+        assert!(hosted.sim(|s| !s.missions.is_hand("m1")));
+
+        rt.scheduler.suspend(1, false);
+        rt.assign_work(&hosted);
+        assert!(hosted.sim(|s| s.missions.is_on_mission("m1")));
     }
 
     /// **A character carrying a mission can give it up from anywhere**: away
@@ -9270,10 +9255,10 @@ mod tests {
     }
 
     /// **The world gives an unordered character no orders.** At the open table
-    /// or on its way to it, it is not summoned; idle, it is woken only with
-    /// [`YOUR_OWN_TIME`]; and the table offers it no `collect_mission`, while a
-    /// character beside it is called as ever. Embodied unordered while it
-    /// carries a mission, it is stood down from it.
+    /// it is given no work and is never at rest; idle, it is woken only with
+    /// [`YOUR_OWN_TIME`]; and the table offers it no report, while a character
+    /// beside it is given work as ever. Embodied unordered while it carries a
+    /// mission, it is stood down from it.
     #[tokio::test]
     async fn an_unordered_character_is_given_no_orders() {
         use crate::engine::mission::{Mission, Origin, Todo};
@@ -9287,30 +9272,31 @@ mod tests {
             .unwrap();
         rt.set_table_open(true);
         assert!(rt.at_command_table(1), "it is standing at the table");
-        assert_eq!(rt.at_table_summons(1), None);
-        assert_eq!(rt.table_summons(1), None);
+        assert_eq!(rt.at_table_report(1), None);
+        let (hosted, body) = rt.body_of(1).unwrap();
+        rt.assign_work(&hosted);
+        rt.follow_rest(&hosted);
+        assert!(!hosted.sim(|s| s.missions.is_on_mission(&body)));
+        assert!(!rt.scheduler.is_resting(1));
         assert_eq!(
             rt.nudge_for(1).as_deref(),
             Some(YOUR_OWN_TIME),
             "woken, and set nothing"
         );
         assert!(!rt.takes_orders(1));
-        let (hosted, body) = rt.body_of(1).unwrap();
         let acts: Vec<String> = rt
             .invokable_urls(&hosted, &body)
             .into_iter()
             .map(|i| i.act.to_string())
             .collect();
         assert!(
-            !acts.iter().any(|a| a == mission_acts::COLLECT_MISSION.name),
+            !acts.iter().any(|a| a == mission_acts::REPORT_DONE.name),
             "{acts:?}"
         );
 
         embody(&rt, 2, "m2", "green-room");
-        assert_eq!(
-            rt.table_summons(2).as_deref(),
-            Some(vault_table_call().as_str())
-        );
+        rt.assign_work(&hosted);
+        assert!(hosted.sim(|s| s.missions.is_on_mission("m2")));
         assert!(rt.takes_orders(2));
 
         hosted.with_sim(|s| {
@@ -9336,53 +9322,12 @@ mod tests {
         );
     }
 
-    /// **In a world that draws nothing, a character with no work waits at the
-    /// table quietly**: at the table it is told nothing, away it is sent there to
-    /// wait — not to take something up — and work posted for it calls it again.
+    /// **A post is handed to its carrier, and a report tells its poster**: one
+    /// for whoever is free goes to one free hand and nobody else is told; one
+    /// by name goes to its own; the poster hears of neither until the report.
     #[tokio::test]
-    async fn with_nothing_posted_a_character_waits_at_the_table() {
-        use crate::engine::mission::{Mission, Origin};
+    async fn a_post_is_handed_to_its_carrier_and_a_report_tells_its_poster() {
         use crate::engine::mission_gen::world::Draw;
-        let rt = vaulted();
-        rt.scheduler.wake(1, 0, 0);
-        rt.embody_in_world(1, WORLD, Kind::default(), "Wick", None, 0)
-            .unwrap();
-        embody(&rt, 2, "m2", "green-room");
-        let hosted = rt.hosted.get(WORLD).unwrap();
-        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::None));
-        rt.set_table_open(true);
-        assert!(rt.at_command_table(1));
-        assert_eq!(rt.at_table_summons(1), None, "waiting quietly");
-        assert_eq!(rt.nudge_for(1), None);
-        let wait = rt.table_summons(2).expect("sent to wait");
-        assert!(
-            wait.starts_with("You have no work yet. Go to the order table in the command room"),
-            "{wait}"
-        );
-        assert_eq!(rt.nudge_for(2).as_deref(), Some(wait.as_str()));
-        let (_, body) = rt.body_of(2).unwrap();
-        hosted.with_sim(|s| {
-            s.missions.post(
-                Mission::new(
-                    "Read the board.",
-                    Vec::new(),
-                    Origin::Lodged { by: "op".into() },
-                ),
-                Some(&body),
-            )
-        });
-        assert_eq!(
-            rt.table_summons(2).as_deref(),
-            Some(vault_table_call().as_str())
-        );
-    }
-
-    /// **The table's notices reach whom they are for**: a post for whoever
-    /// comes wakes those waiting at the table and nobody away from it or on
-    /// work; one by name wakes only its own; a report tells its poster.
-    #[tokio::test]
-    async fn a_post_wakes_whoever_waits_and_a_report_tells_its_poster() {
-        use crate::engine::mission::bank::Facts;
         use crate::engine::order_table;
         let rt = vaulted();
         for id in [1, 3] {
@@ -9397,10 +9342,12 @@ mod tests {
         };
         rt.embody_in_world(3, WORLD, zen, "Zen", None, 0).unwrap();
         let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::None));
         let (_, wick) = rt.body_of(1).unwrap();
         let (_, poster) = rt.body_of(3).unwrap();
         let depth = |id| rt.scheduler.inbox_depth(id).unwrap();
         let notify = || {
+            rt.assign_work(&hosted);
             for n in hosted.with_sim(|s| s.missions.take_notices()) {
                 rt.give_notice(&hosted, n);
             }
@@ -9418,8 +9365,10 @@ mod tests {
         notify();
         assert_eq!(
             (depth(1), depth(2), depth(3)),
-            (before.0 + 1, before.1, before.2)
+            (before.0 + 1, before.1, before.2),
+            "handed to the first hand, and nobody else told"
         );
+        assert!(hosted.sim(|s| s.missions.is_on_mission(&wick)));
 
         assert!(order_table::post(
             &hosted,
@@ -9435,7 +9384,6 @@ mod tests {
         assert_eq!((depth(1), depth(2)), (before.0 + 1, before.1 + 1));
 
         hosted.with_sim(|s| {
-            s.missions.collect(&wick, &Facts::default()).unwrap();
             s.missions.report(
                 &wick,
                 Verdict::Pass,
@@ -9614,12 +9562,13 @@ mod tests {
         );
     }
 
-    /// **A Maker free at the open table is handed the operation waiting there**
-    /// — and never the review of a draft it wrote; that one it is only told to
-    /// take up something else for, and the table's routine stays its to choose.
+    /// **A free Maker is handed the operation waiting on the open table** — and
+    /// never the review of a draft it wrote: with only that waiting, in a world
+    /// that draws nothing, it is at rest.
     #[tokio::test]
-    async fn the_open_table_hands_its_work_to_whoever_stands_at_it_free() {
+    async fn the_open_table_hands_a_free_maker_the_operation_waiting() {
         use crate::engine::mission::{Origin, Outcome as Verdict, Todo, Work};
+        use crate::engine::mission_gen::world::Draw;
         use crate::sim::operations::tests::workflows;
         use std::collections::BTreeMap;
         let rt = vaulted();
@@ -9652,6 +9601,7 @@ mod tests {
             })
         };
         let id = hosted.with_sim(|s| {
+            s.missions.set_routines(Vec::new(), Draw::None);
             s.missions.set_workflows(workflows());
             let id = s
                 .missions
@@ -9677,10 +9627,12 @@ mod tests {
             );
             id
         });
-        let handed = rt.at_table_summons(1).unwrap();
+        waiting(&rt, 1);
+        rt.assign_work(&hosted);
+        let handed = waiting(&rt, 1);
         assert!(
-            handed.starts_with("The table hands you the next piece of work, and you take it up."),
-            "{handed}"
+            handed.len() == 1 && handed[0].starts_with(MISSION_GIVEN),
+            "{handed:?}"
         );
         assert_eq!(
             hosted.sim(|s| s
@@ -9699,8 +9651,11 @@ mod tests {
             let review = step("Review it.", vec!["report_rejected".into()], "report it");
             s.missions.offer_step(id, review);
         });
-        assert_eq!(rt.at_table_summons(1).as_deref(), Some(AT_THE_TABLE));
+        rt.assign_work(&hosted);
+        rt.follow_rest(&hosted);
         assert!(!hosted.sim(|s| s.missions.is_on_mission(&body)));
+        assert!(rt.scheduler.is_resting(1), "nothing it may take");
+        assert_eq!(rt.at_table_report(1), None);
 
         // A reviewer whose reading is done is asked for its verdict, not for
         // what it found.
@@ -9724,10 +9679,7 @@ mod tests {
             tools: vec!["report_rejected".into()],
         });
         hosted.with_sim(|s| s.missions.assign(&body, review));
-        assert_eq!(
-            rt.at_table_summons(1).as_deref(),
-            Some(VERDICT_AT_THE_TABLE)
-        );
+        assert_eq!(rt.at_table_report(1).as_deref(), Some(VERDICT_AT_THE_TABLE));
     }
 
     /// **A character back at the table with its mission's work done is told to
@@ -9768,12 +9720,12 @@ mod tests {
         assert!(arrived.contains(": that was the last step"), "{arrived}");
         assert!(hosted.sim(|s| s.missions.active("m1").unwrap().todo[1].done));
         assert_eq!(rt.mark_arrival(1), None, "signed off once");
-        assert_eq!(rt.at_table_summons(1), None, "not at the table");
+        assert_eq!(rt.at_table_report(1), None, "not at the table");
 
         // At the table with the journey still to make: not called to report.
         embody_at(&rt, 2, "m2", Where::new("vault-command", "command-room"));
         hosted.with_sim(|s| s.missions.assign("m2", read_the_valve()));
-        assert_eq!(rt.at_table_summons(2), None, "the work is not done");
+        assert_eq!(rt.at_table_report(2), None, "the work is not done");
 
         // At the table with the work done: report it now.
         hosted.with_sim(|s| {
@@ -9782,39 +9734,11 @@ mod tests {
             s.missions
                 .read_off("m2", &["the coolant valve".to_string()]);
         });
-        assert_eq!(rt.at_table_summons(2).as_deref(), Some(REPORT_AT_THE_TABLE));
+        assert_eq!(rt.at_table_report(2).as_deref(), Some(REPORT_AT_THE_TABLE));
 
-        // Reported, it is free and called to take the next.
+        // Reported, there is nothing to report, and nothing said at the table.
         hosted.with_sim(|s| s.missions.report("m2", Verdict::Pass, "ok", None));
-        assert_eq!(rt.at_table_summons(2).as_deref(), Some(AT_THE_TABLE));
-    }
-
-    /// **The passive standing task is location-aware too.** [`Runtime::nudge_for`]
-    /// fires on the idle gate ([`IDLE_AFTER_MS`]), not just the active summons, so
-    /// a free character that falls quiet standing at the open table must read
-    /// [`AT_THE_TABLE`] — take one up here — rather than the traveling
-    /// [`TO_THE_TABLE`] it is already at the destination of.
-    #[tokio::test]
-    async fn the_passive_standing_task_is_location_aware_at_the_table() {
-        let rt = vaulted();
-        rt.scheduler.wake(1, 0, 0);
-        // At the command room — the table.
-        rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
-            .unwrap();
-        rt.set_table_open(true);
-        assert_eq!(
-            rt.nudge_for(1).as_deref(),
-            Some(AT_THE_TABLE),
-            "a free character standing at the open table is told to take one up here"
-        );
-
-        // One still in the wing reads the traveling text.
-        embody(&rt, 2, "m2", "green-room");
-        assert_eq!(
-            rt.nudge_for(2).as_deref(),
-            Some(vault_table_call().as_str()),
-            "a character on its way is told to make its way to the table"
-        );
+        assert_eq!(rt.at_table_report(2), None);
     }
 
     /// A body standing at `at`, bound to character `npc_id`.
@@ -9828,75 +9752,34 @@ mod tests {
         rt.embody(npc_id, WORLD, body, 0).expect("bound");
     }
 
-    /// **A character is only summoned to a table it can get to.** The waste is
-    /// open ground with no door, stair or lift to any building, so a character
-    /// out there has no way to a command table. Told every turn to go to one, it
-    /// could only loop on the summons and never took up a mission. All three
-    /// standing-task paths stay silent for it, and speak again for a character
-    /// in the vault.
+    /// **A character is only given work it has a table to report at.** The
+    /// waste is open ground with no door, stair or lift to any building, so a
+    /// character out there has no way to a command table: a world that draws
+    /// gives it no routine, and it keeps the ordinary standing task. One in
+    /// the vault, however far from the table, can ride to it and is given work
+    /// — as is one in the Redoubt, which has a table of its own in the muster
+    /// hall.
     #[tokio::test]
-    async fn no_summons_reaches_a_character_with_no_way_to_the_table() {
+    async fn no_work_is_given_to_a_character_with_no_way_to_a_table() {
         let rt = vaulted();
         embody_at(&rt, 1, "m1", Where::new("the-waste", "ruins"));
+        embody(&rt, 2, "m2", "green-room");
+        embody_at(&rt, 3, "m3", Where::new("tower-redoubt", "gatehouse"));
         rt.set_table_open(true);
+        let hosted = rt.hosted.get(WORLD).unwrap();
 
-        assert_eq!(rt.table_summons(1), None, "no route to the table");
-        assert_eq!(rt.at_table_summons(1), None, "not standing at a table");
+        rt.assign_work(&hosted);
+        rt.follow_rest(&hosted);
+        assert!(!hosted.sim(|s| s.missions.is_on_mission("m1")));
+        assert!(!rt.scheduler.is_resting(1), "not the table's to rest");
+        assert_eq!(rt.at_table_report(1), None, "not standing at a table");
         assert_eq!(
             rt.nudge_for(1).as_deref(),
             Some(NO_MISSION),
-            "the idle nudge does not send a character where it cannot go"
+            "it keeps the ordinary standing task"
         );
-
-        // A character in the vault, however far from the table, can ride to it.
-        embody(&rt, 2, "m2", "green-room");
-        assert_eq!(
-            rt.table_summons(2).as_deref(),
-            Some(vault_table_call().as_str())
-        );
-        assert_eq!(
-            rt.nudge_for(2).as_deref(),
-            Some(vault_table_call().as_str())
-        );
-    }
-
-    /// **The Redoubt has a command table of its own, in the muster hall where
-    /// orders are given.** A character living there is not sent up a lift it does
-    /// not have: from the gatehouse it is told to `move_to` the muster hall, and
-    /// once there it is told to take a mission up where it stands.
-    #[tokio::test]
-    async fn the_redoubt_has_its_own_table_and_its_summons_walks_there() {
-        let rt = vaulted();
-        rt.set_table_open(true);
-
-        embody_at(&rt, 1, "m1", Where::new("tower-redoubt", "gatehouse"));
-        let on_foot = rt.table_summons(1).expect("a table to walk to");
-        assert!(
-            on_foot.contains("The table is in the muster hall"),
-            "{on_foot}"
-        );
-        assert!(
-            !on_foot.contains("lift"),
-            "no lift in the Redoubt: {on_foot}"
-        );
-        assert_eq!(rt.at_table_summons(1), None, "not yet at the table");
-
-        embody_at(&rt, 2, "m2", Where::new("tower-redoubt", "muster-hall"));
-        assert_eq!(rt.at_table_summons(2).as_deref(), Some(AT_THE_TABLE));
-        assert_eq!(rt.table_summons(2), None, "arrived");
-    }
-
-    /// A table on the character's own level is a walk, even in the vault: from
-    /// the lift landing of the command level it is one `move_to`, not a ride.
-    #[tokio::test]
-    async fn a_table_on_the_characters_own_level_is_walked_to() {
-        let rt = vaulted();
-        rt.set_table_open(true);
-        let landing = Where::new("vault-command", "core");
-        embody_at(&rt, 1, "m1", landing);
-        let said = rt.table_summons(1).expect("a table to walk to");
-        assert!(said.contains("The table is in the command room"), "{said}");
-        assert!(!said.contains("lift"), "{said}");
+        assert!(hosted.sim(|s| s.missions.is_on_mission("m2")));
+        assert!(hosted.sim(|s| s.missions.is_on_mission("m3")));
     }
 
     /// **The standing task is for the quiet turns, and the situation is not

@@ -29,7 +29,7 @@ and a standing task restates an idle drone's summons every 90 s
 | Zen is `moves: attention` — no `move_to`, no lift, a `focus` teleport | `sim/mod.rs:139`, `enact.rs:676` | Half-way to no body already. |
 | A conversation can be unloaded and rejoined from the log | `Minds::let_go` (`mind.rs:2097`) | Used by suspension; an idle drone uses the same path. |
 | A held character: parked, `begin_tick` refuses, inbox fills and is cut on resume, reflect/dream/journal refuse | `Scheduler::suspend`, `follow_suspended`, `held::PER_SOURCE` | Exactly what idle is. |
-| Free drones at an open table are handed pooled work | `Runtime::at_table_summons` → `work::take_up` | Assignment without `collect_mission` exists. |
+| The table hands a free drone its work | `Runtime::assign_work` → `work::take_up` | Built (§8 step 1): no act of a drone's takes work. |
 | The round goes only to unordered bodies | `take_up_round`, `rounds/<world>.yaml` | Zen's own idle work is already Zen's alone. |
 | A conversation with a person puts an item on Zen's agenda | `mission_add` on the thread, `agenda/acts.rs` | A request becomes work for Zen today. |
 | Real devices, worked through an agent on the home network | `effector-bridge`, `npcd/src/bridge/` | Sonos, eISCP receivers, Cast, LG webOS, Android TV, WiZ bulbs, wake-on-LAN; found by `survey_network`. |
@@ -125,10 +125,18 @@ its verbs as catalogue specs, and `perform` — registered by an adapter:
 | Adapter | Terminals | Verbs | State |
 |---|---|---|---|
 | **House devices** (`effector-bridge`, through the house's agent) | one per workable device the survey has found: `device-<mac>` | the device profile's actions — including webOS and Android TV, which gain their verbs here | built; today gated on a room and a linked part, which a terminal is not |
+| **House lights** (the WiZ profile of `effector-bridge`) | **one** terminal, `lights`, over every bulb the survey has found — eight WiZ E27 today | list the bulbs and their state; on, off, brightness, colour and white temperature, a built-in scene — for one bulb by name, several, or all of them in one act | the bulb profile is built; the one terminal over all of them is to build. A bulb is not also a `device-<mac>` terminal |
 | **Home network** | the house link | `survey`, `wake` | built as `survey_network`, `wake_device` |
 | **Cluster** (zend's MCP, as `service:zen`, the channel `zen_task` uses) | the gateway's logs; the cluster; each machine's services | read-only: list, search and read logs; cluster, member and service status | to build — zend has the tools, npcd has the channel |
 | **Machines** (each machine's own agent) | one per machine: BlackWorld and WhiteWorld first | the checks below | to build — the agent already takes the house's device work from npcd |
 | **Presence** | the home network | raises an event when a known handset joins or leaves | to build — the survey sees handsets; nothing watches for them |
+
+**The lights are one terminal because they are worked together.** Turning
+the house off at night is one act over all eight, not eight connections. A
+mode is a verb of this terminal that keeps running after Zen disconnects —
+the adapter drives the bulbs, not a turn of Zen's — and has a verb to stop
+it; the patterns driven from an audio input, for a set played live, are
+modes added here.
 
 A cluster terminal and a machine terminal are read-only. Deploying,
 restarting and rolling out stay with people.
@@ -196,8 +204,8 @@ step of §8.
    summons, hands as §3 — with the runtime's scripted tests. The load change.
 2. **Zen without perception or a place**: no situation, no stirrings, no
    movement acts; outcomes and drone messages as its events.
-3. **The terminal acts and the house-device adapter**, the television's verbs
-   among them.
+3. **The terminal acts, the house-device adapter** — the television's verbs
+   among them — **and the `lights` terminal** with its basic verbs.
 4. **The cluster adapter**, read-only.
 5. **The machine adapter**: BlackWorld and WhiteWorld, the checks of §5.
 6. **Terminal events, and presence** from the survey.

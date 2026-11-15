@@ -4,10 +4,13 @@
 //!
 //! The acts are [`ORDER_POST`](crate::engine::mission_acts::ORDER_POST) and
 //! [`ORDER_RESULTS`](crate::engine::mission_acts::ORDER_RESULTS), offered at the
-//! table only to a character that takes no orders; the work they post is carried
-//! by the others through `collect_mission` and `report_done`, as any mission is.
+//! table only to a character that takes no orders; the work they post is given
+//! to the others by the table (`Runtime::assign_work`) and reported with
+//! `report_done`, as any mission is.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 
@@ -57,7 +60,7 @@ fn takes_orders(hosted: &Hosted, body: &str) -> bool {
 }
 
 /// `order_post`: put a mission on the table, for somebody by name or for
-/// whoever comes for work first — its own brief and steps, or one of the
+/// whoever has been free longest — its own brief and steps, or one of the
 /// world's standing jobs whole.
 ///
 /// **A mission has a step to do.** Posted with none, its only step was the
@@ -185,7 +188,7 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     );
     let for_whom = match &to {
         Some((_, named)) => format!("for {named}"),
-        None => "for whoever comes for work first".to_string(),
+        None => "for whoever is free first".to_string(),
     };
     let id = to.as_ref().map(|(id, _)| id.as_str());
     // Posting work is a step of the poster's round, seen done as it lands.
@@ -223,13 +226,24 @@ fn table_full(hosted: &Hosted, body: &str, brief: &str) -> Option<String> {
             })
         })
         .count();
-    let hands = order_takers(hosted).len();
+    let hands = hands(hosted);
     (waiting >= hands.max(1)).then(|| {
         format!(
             "The table already holds {waiting} missions nobody has taken, and there are {hands} \
              to take them: wait for a report before you set more."
         )
     })
+}
+
+/// How many hands the table has to give work to: the characters who take
+/// orders here and are not suspended, carrying or not, at rest or not — a
+/// drone at rest is a hand that work wakes.
+fn hands(hosted: &Hosted) -> usize {
+    let bodies: Vec<String> = hosted.read(|w| w.actors().map(|a| a.id.clone()).collect());
+    bodies
+        .iter()
+        .filter(|id| !id.starts_with("visitor:") && hosted.sim(|s| s.missions.is_hand(id)))
+        .count()
 }
 
 /// The names of the characters who take orders here.
@@ -377,11 +391,11 @@ mod tests {
         v.as_object().unwrap().clone()
     }
 
-    /// **A mission posted for whoever comes is on the table for the first to
-    /// collect**, with its steps and the report back to the table it was
+    /// **A mission posted for nobody by name is on the table for the first
+    /// hand free**, with its steps and the report back to the table it was
     /// posted at, and names its poster.
     #[test]
-    fn a_post_for_whoever_comes_is_collected_by_the_first() {
+    fn a_post_for_nobody_by_name_goes_to_the_first_free() {
         let h = vault();
         let posted = post(
             &h,
@@ -394,7 +408,7 @@ mod tests {
         assert_eq!(
             posted,
             Outcome::Did(
-                "Posted on the table, for whoever comes for work first: Read the breaker panel. \
+                "Posted on the table, for whoever is free first: Read the breaker panel. \
                  You will be told when it is reported."
                     .into()
             )
@@ -492,6 +506,30 @@ mod tests {
             s.missions.collect("wick", &Facts::default()).unwrap();
         });
         assert!(post(&h, "zen", &ward).happened());
+    }
+
+    /// **A suspended drone is not a hand**: with one of two suspended the
+    /// table holds one mission nobody has taken, not two.
+    #[test]
+    fn a_suspended_drone_is_not_a_hand() {
+        let h = vault();
+        h.with_sim(|s| {
+            s.missions
+                .set_suspended(BTreeSet::from(["jitter".to_string()]))
+        });
+        let board = args(json!({"brief": "Read the board.", "steps": "go to the dispatch room"}));
+        assert!(post(&h, "zen", &board).happened());
+        let earth = args(json!({"brief": "Watch Earth.", "steps": "go to the observatory"}));
+        assert_eq!(
+            post(&h, "zen", &earth),
+            Outcome::Refused(
+                "The table already holds 1 missions nobody has taken, and there are 1 to take \
+                 them: wait for a report before you set more."
+                    .into()
+            )
+        );
+        h.with_sim(|s| s.missions.set_suspended(BTreeSet::new()));
+        assert!(post(&h, "zen", &earth).happened());
     }
 
     /// **A full table answers the step to post work**: refused, the poster's

@@ -34,7 +34,6 @@ pub fn notable(tool: &str) -> bool {
         "make",
         "claim",
         "release",
-        "collect_mission",
         "report_done",
         "report_stuck",
         "file_write",

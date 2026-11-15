@@ -600,8 +600,8 @@ impl Minds {
         let mut at_table = tools::Within::nowhere();
         at_table.station = vec!["order-table".to_string()];
         at_table.invokable = vec![Invokable::new(
-            "http://local/command/order-table~0/collect_mission",
-            "collect_mission",
+            "http://local/command/order-table~0/report_done",
+            "report_done",
         )];
         for level in LEVELS {
             if let Err(e) = compile_act_loop(&engine, &base_config, level, Catalog::ROOM, &at_table)

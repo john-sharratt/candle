@@ -118,15 +118,6 @@ fn subject(args: &Map<String, Value>) -> Option<String> {
 fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     let a = &act.args;
     match act.tool {
-        // **The world gives an unordered character no orders** — see
-        // [`crate::sim::missions::Missions::set_unordered`] — and the table
-        // gives it nothing either: its round is put on its agenda as each item
-        // comes due (`docs/zen_moon_mind.md` §17.3).
-        "collect_mission" if hosted.sim(|s| s.missions.is_unordered(body)) => Outcome::Refused(
-            "The table has nothing to give you: your round comes to your agenda by itself as \
-             each item falls due."
-                .into(),
-        ),
         // The table's orders are given by a character that takes none; the
         // table does not offer them to anybody else, and refuses them if asked.
         "order_post" | "order_results" | "mission_write"
@@ -139,46 +130,6 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         "order_post" => order_table::post(hosted, body, a),
         "order_results" => order_table::results(hosted, body),
         "mission_write" => write_template::write(hosted, body, a),
-        "collect_mission" => {
-            // **One mission at a time.** `collect_mission` is offered whenever a
-            // body stands at the desk, including when it has come back to report
-            // — so without this a character could draw a fresh mission over an
-            // open one, discarding the answer it built and never filing it to
-            // `done`. Report it first; then the desk has something new to give.
-            if let Some((carried, next)) = hosted.sim(|s| {
-                s.missions.active(body).map(|m| {
-                    (
-                        m.standing_text(),
-                        m.next_step().filter(|t| !t.reports).map(|t| t.text.clone()),
-                    )
-                })
-            }) {
-                // **Say the one thing to do, not the whole brief again.** A
-                // character that came back to the table mid-mission and was handed
-                // its brief whole went back out to the first step it had already
-                // done; one with everything done needs telling that the report is
-                // what is left, here, now.
-                let what_now = match next {
-                    Some(step) => format!(
-                        "It is not finished: the next thing to do on it is to {}. Go and do \
-                         that, then come back and `invoke` this table's `report_done` with what \
-                         you found — or `report_stuck` if it cannot be done.",
-                        step.trim().trim_end_matches('.')
-                    ),
-                    None => "Every step of it is done, and you are at the table: report it now — \
-                             `invoke` this table's `report_done` with exactly what you found."
-                        .to_string(),
-                };
-                return Outcome::Refused(format!(
-                    "You are already carrying a mission, and the table gives out one at a time. \
-                     {what_now}\n{carried}"
-                ));
-            }
-            match take_up(hosted, body) {
-                Some(brief) => Outcome::Did(format!("You take it up.\n{brief}")),
-                None => Outcome::Refused(NOTHING_POSTED.to_string()),
-            }
-        }
         "report_done" => {
             let Some(account) = text(a, "found") else {
                 return Outcome::Refused(
@@ -465,11 +416,19 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     }
 }
 
-/// Take up the next mission for `body` at the table — lodged for it, waiting
-/// in the pool, or a routine from the bank — and answer with its brief as the
-/// character reads it. `None` when there is nothing to take: a world that draws
-/// nothing, with nothing posted.
+/// Give `body` the table's next mission for it — lodged for it, waiting in
+/// the pool, or a routine from the bank — and answer with its brief as the
+/// character reads it. `None` when there is nothing to give: a world that
+/// draws nothing, with nothing posted.
+///
+/// **A mission is given, never fetched** (`docs/zen_everywhere.md` §3): the
+/// table's authority calls this for a body free to carry
+/// (`Runtime::assign_work`), and no act of a character's reaches it. A body
+/// already carrying one is given nothing — one at a time.
 pub fn take_up(hosted: &Hosted, body: &str) -> Option<String> {
+    if hosted.sim(|s| s.missions.is_on_mission(body) || s.missions.is_unordered(body)) {
+        return None;
+    }
     // The character's own name, so a routine that would send it to visit
     // "the makers here" is not built around visiting itself.
     let me = hosted
@@ -492,7 +451,7 @@ pub fn take_up(hosted: &Hosted, body: &str) -> Option<String> {
         let material = s.mission_material(&me, &room_name, &reach);
         s.missions.collect(body, &material.facts()).cloned()
     })?;
-    tracing::info!(npc = body, prompt = %mission.mission_text(), "mission taken up at the command table");
+    tracing::info!(npc = body, prompt = %mission.mission_text(), "mission given by the command table");
     // What an operation's document says in its store as its step is taken up
     // — what a step that must change it is held against (`changed`).
     let found = mission
@@ -504,10 +463,6 @@ pub fn take_up(hosted: &Hosted, body: &str) -> Option<String> {
     }
     Some(mission.standing_text())
 }
-
-/// What a character collecting at a table with nothing on it is told.
-pub const NOTHING_POSTED: &str = "Nothing has been posted on the table yet. Wait here: you will \
-                                  be told the moment work arrives.";
 
 /// Whether the next step of the body's mission still to do is the writing of
 /// its own document — the step the gate puts back when the document does not
@@ -1110,7 +1065,7 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     if matches!(act.tool, MERGE_STATUS | MERGE_PUBLISH | MERGE_SYNC) {
         return archive::perform(hosted, body, act.tool);
     }
-    // The mission acts before the subject is looked for: `collect_mission`
+    // The mission acts before the subject is looked for: `order_results`
     // names nothing, and the reports carry their subject under `found` / `why`,
     // which the shared [`subject`] list does not scan.
     if crate::engine::mission_acts::is_mine(act.tool) {
@@ -4604,7 +4559,7 @@ mod tests {
     #[test]
     fn a_scan_keeps_the_reading_it_signs_off() {
         let h = vault();
-        assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
+        assert!(take_up(&h, "m1").is_some());
         let (device, mode, at) = h.sim(|s| {
             let m = s.missions.active("m1").unwrap();
             let d = s
@@ -4843,36 +4798,31 @@ mod tests {
         );
     }
 
-    /// A mission taken up at the desk, worked with its progress recorded, and
+    /// A mission given by the table, worked with its progress recorded, and
     /// reported — the whole loop through `perform`. `perform` does not gate on
     /// availability (the grammar does), so this drives the acts directly.
     #[test]
-    fn a_mission_is_collected_worked_and_reported() {
+    fn a_mission_is_given_worked_and_reported() {
         let h = vault();
-        // Nothing to report before collecting.
+        // Nothing to report before one is given.
         assert!(matches!(
             perform(&h, "m1", &act("report_done", json!({"found":"nothing"}))),
             Outcome::Refused(_)
         ));
 
-        // Collecting draws a mission (a bank routine here — the vault has no
-        // records indexed) and makes it the body's open one.
-        assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
+        // The table gives a mission (a bank routine here — the vault has no
+        // records indexed) and it is the body's open one.
+        assert!(take_up(&h, "m1").is_some());
         assert!(h.sim(|s| s.missions.is_on_mission("m1")));
 
-        // A second collect while already carrying one is refused — one at a
-        // time, so a mission in progress is never discarded by drawing another.
-        // The refusal says what the open mission is, so the character is not
-        // left to guess what it is already carrying.
+        // One at a time: a body carrying a mission is given nothing more, so
+        // one in progress is never discarded by drawing another.
         let brief = h.sim(|s| s.missions.active("m1").unwrap().mission_text());
-        match perform(&h, "m1", &act("collect_mission", json!({}))) {
-            Outcome::Refused(why) => {
-                assert!(why.contains("already carrying a mission"), "{why}");
-                assert!(why.contains(&brief), "{why}");
-                assert!(why.contains("report_done"), "{why}");
-            }
-            other => panic!("a second collect must be refused, got {other:?}"),
-        }
+        assert_eq!(take_up(&h, "m1"), None);
+        assert_eq!(
+            h.sim(|s| s.missions.active("m1").unwrap().mission_text()),
+            brief
+        );
 
         // The bank's first routine goes to a room and reads a machine there, and
         // a journey not made cannot be reported done: the desk says what is left
@@ -4982,7 +4932,7 @@ mod tests {
     #[test]
     fn stuck_is_refused_while_the_next_step_is_within_reach() {
         let h = vault();
-        assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
+        assert!(take_up(&h, "m1").is_some());
         for _ in 0..4 {
             match crate::engine::body::perform(
                 &h,
@@ -5005,7 +4955,7 @@ mod tests {
     #[test]
     fn stuck_is_believed_after_the_way_was_tried_and_refused_twice() {
         let h = vault();
-        assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
+        assert!(take_up(&h, "m1").is_some());
         let body = crate::engine::body::perform;
         let tried = || {
             let out = body(

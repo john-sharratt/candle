@@ -29,10 +29,10 @@ pub fn namespace_of(part_id: &str) -> &str {
         "map-table" | "gallery-rail" => "map",
         // The record surface: intake, catalogue, and the benches that mend it.
         "accession-desk" | "catalogue" | "appraisal-bench" | "mending-bench" => "record",
-        // The command table: where a character takes up a mission and reports it.
+        // The command table: where a character reports its mission.
         // Its own routable namespace, **distinct from the plan-bridge `/orders`**
         // (the projected agency store, which is excluded from station routing) —
-        // so the mission acts (`collect_mission`/`report_done`/`report_stuck`)
+        // so the mission acts (`report_done`/`report_stuck`/`order_post`)
         // reach the device as `http://local/command/<id>/<verb>` (effector design
         // Step 6; the mission half of the command migration).
         "order-table" => "command",

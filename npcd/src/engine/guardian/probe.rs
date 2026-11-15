@@ -90,7 +90,7 @@ impl Probe for RuntimeProbe {
             .census()
             .into_iter()
             .map(|c| c.npc_id)
-            .filter(|id| !scheduler.is_suspended(*id))
+            .filter(|id| !scheduler.is_held(*id))
             .collect()
     }
 

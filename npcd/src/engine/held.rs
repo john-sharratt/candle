@@ -1,11 +1,11 @@
 //! What a held character reads once it is let go: everything that reached it
-//! while it was suspended, bounded per source.
+//! while it was suspended or at rest, bounded per source.
 //!
-//! A suspended character takes no turn, and nothing that reaches it is dropped
+//! A held character takes no turn, and nothing that reaches it is dropped
 //! — so a character held for a day under a busy channel comes back to
 //! thousands of arrivals, and the first turn after it resumes would read every
 //! one. [`bound`] keeps the newest [`PER_SOURCE`] from each source and puts one
-//! counted line where the rest were: "While you were suspended, 214 more
+//! counted line where the rest were: "While you were away, 214 more
 //! messages on #general." A source is what an arrival came from — one thread, one speaker,
 //! one thing watched, the world around it — so a burst on one channel does not
 //! crowd out the one line somebody said to it directly.
@@ -117,7 +117,7 @@ fn source(kind: &EventKind) -> Source {
 /// The line that stands for `n` arrivals of `src` left out.
 fn left_out(src: &Source, n: usize) -> String {
     let noun = if n == 1 { &src.one } else { &src.many };
-    format!("While you were suspended, {n} more {noun}.")
+    format!("While you were away, {n} more {noun}.")
 }
 
 /// `queue`, bounded per source: the newest `keep` of each in their places,
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(
             prose(&out),
             vec![
-                "While you were suspended, 4 more messages on #general.".to_string(),
+                "While you were away, 4 more messages on #general.".to_string(),
                 "Your phone shows a message from Kit on #general (5 unread messages in all). \
                  `read` #general to see what was said, and answer it there with `reply`, not \
                  to Kit alone."
@@ -284,7 +284,7 @@ mod tests {
         let out = bound(q, 2, || 9);
         assert_eq!(
             out[0].prose(),
-            "While you were suspended, 1 more thing Wren said."
+            "While you were away, 1 more thing Wren said."
         );
         assert_eq!(out.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![9, 2, 3]);
     }

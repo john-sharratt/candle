@@ -1268,6 +1268,9 @@ async fn the_standing_instruction_is_restated_and_never_accumulates() {
     rt.scheduler.wake(1, 0, 0);
     rt.embody_in_world(1, WORLD, Kind::default(), "Maker-01", None, 0)
         .unwrap();
+    // An open table gives a free character its work and no standing task;
+    // shut, the standing task is the one this is about.
+    rt.set_table_open(false);
 
     for round in 0..5 {
         let nudge = rt.nudge_for(1).unwrap();

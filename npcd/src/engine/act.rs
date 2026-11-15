@@ -1160,7 +1160,7 @@ mod tests {
         // The grammar writes the body as an object, which is carried as one.
         let typed = parse(
             "<tool_call>\n{\"name\": \"invoke\", \"arguments\": \
-             {\"url\": \"http://local/command/order-table~0/collect_mission\", \"body\": {}}}\n\
+             {\"url\": \"http://local/command/order-table~0/order_results\", \"body\": {}}}\n\
              </tool_call>",
         );
         assert_eq!(typed.rejected, Vec::new(), "{:?}", typed.rejected);

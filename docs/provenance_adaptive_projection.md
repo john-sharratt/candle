@@ -155,7 +155,7 @@ relevant of them. A member the selector does not name is never shown however it 
 still overrides; and when every offered member scores zero (cold provenance) the whole
 offer shows rather than the first `k`. npcd installs its `tools` collection this way: the
 room offers the acts the turn's grammar allows, provenance ranks them, and the routed acts
-(`collect_mission`, `report_done`, `report_stuck`) are mandatory.
+(`report_done`, `report_stuck`) are mandatory.
 
 Nothing expresses: normalization applicability, adaptive budgets, locality, anchors,
 momentum, probe composition, or fusion mode. All seven get YAML surface in §10.

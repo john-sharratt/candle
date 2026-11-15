@@ -145,7 +145,7 @@ mod tests {
 
     const TOWER: &str = "http://local/tower/bridge-console~0/command_tower";
     const FAB: &str = "http://local/fab/fabricator~0/produce";
-    const MISSION: &str = "http://local/command/order-table~0/collect_mission";
+    const MISSION: &str = "http://local/command/order-table~0/order_results";
 
     fn tower() -> Invokable {
         Invokable::new(TOWER, "command_tower")
@@ -159,7 +159,7 @@ mod tests {
     }
 
     fn mission() -> Invokable {
-        Invokable::new(MISSION, "collect_mission")
+        Invokable::new(MISSION, "order_results")
     }
 
     /// A room the tower and the fabricators can both be worked from.

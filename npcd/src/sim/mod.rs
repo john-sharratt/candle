@@ -66,7 +66,7 @@ use std::iter;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::mission::bank::Duty;
-use crate::engine::mission_acts::COLLECT_MISSION;
+use crate::engine::mission_acts::REPORT_DONE;
 use bench::Benches;
 use device::Devices;
 use field::{Field, Resource};
@@ -703,7 +703,7 @@ impl Sim {
         let on_own_level = |place: &str| own_level.is_some() && level(place) == own_level;
         let tables: Vec<&String> = reach
             .iter()
-            .filter(|place| self.part_offers(place, COLLECT_MISSION.name))
+            .filter(|place| self.part_offers(place, REPORT_DONE.name))
             .collect();
         let table_place = tables
             .iter()
@@ -893,10 +893,7 @@ mod tests {
     #[test]
     fn taking_a_world_in_keeps_what_the_map_offers_here() {
         let mut s = Sim::new();
-        s.set_part_tools(
-            "moon-command/watch-room",
-            vec!["collect_mission".to_string()],
-        );
+        s.set_part_tools("moon-command/watch-room", vec!["report_done".to_string()]);
         s.set_home("moon-command/watch-room".to_string());
         s.postings.stand_up("moon-command/watch-room", "the table");
         s.postings
@@ -930,7 +927,7 @@ mod tests {
             "all clear",
         );
         s.take_in(written);
-        assert!(s.part_offers("moon-command/watch-room", "collect_mission"));
+        assert!(s.part_offers("moon-command/watch-room", "report_done"));
         assert_eq!(s.homes(), ["moon-command/watch-room"]);
         assert!(!s.table_open, "the world's own state is the record's");
         assert_eq!(s.postable_at("moon-command/watch-room"), ["the table"]);
@@ -1008,7 +1005,7 @@ mod tests {
     #[test]
     fn mission_material_names_the_machines_to_read_and_the_table_room() {
         let mut s = Sim::new();
-        s.set_part_tools("hall/muster", vec![COLLECT_MISSION.name.to_string()]);
+        s.set_part_tools("hall/muster", vec![REPORT_DONE.name.to_string()]);
         for (id, name, at) in [
             ("valve", "the coolant valve", "hall/foundry"),
             ("clock", "the wall clock", "hall/muster"),
@@ -1056,7 +1053,7 @@ mod tests {
     fn mission_material_is_the_table_and_machines_the_body_can_reach() {
         let mut s = Sim::new();
         for table in ["tower-redoubt/muster-hall", "vault-command/command-room"] {
-            s.set_part_tools(table, vec![COLLECT_MISSION.name.to_string()]);
+            s.set_part_tools(table, vec![REPORT_DONE.name.to_string()]);
         }
         for (id, name, at) in [
             ("gate", "the gate winch", "tower-redoubt/gatehouse"),

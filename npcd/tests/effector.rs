@@ -361,16 +361,19 @@ async fn the_lift_schema_floor_enum_is_the_worlds_own_floor_names() {
 /// **A body standing at a station is offered the station's verbs, each with the
 /// body its act takes (§11).** Read off the real vault: the address the grammar
 /// will let the character name is the address the route serves, and the body the
-/// grammar pairs with it is the act's own parameters — `{}` at the command table,
-/// whose `collect_mission` names nothing.
+/// grammar pairs with it is the act's own parameters — at the command table, the
+/// one `found` field `report_done` takes, for a body carrying a mission.
 #[tokio::test]
-async fn a_body_at_the_command_table_is_offered_its_mission_verb_with_an_empty_body() {
+async fn a_body_at_the_command_table_is_offered_its_mission_verb_with_its_body() {
     use npcd::engine::tools::{specs_within, Mode};
+    use npcd::engine::work::take_up;
 
     let (rt, _tokens) = daemon();
     place_where(&rt, 15, Where::new("vault-command", "command-room"));
+    let (hosted, body) = rt.body_of(15).expect("bound");
+    take_up(&hosted, &body).expect("the table gives it a mission");
     let table = instance_id("vault-command", "command-room", "order-table");
-    let url = format!("http://local/command/{table}/collect_mission");
+    let url = format!("http://local/command/{table}/report_done");
 
     let within = rt.within(15);
     assert!(
@@ -403,11 +406,14 @@ async fn a_body_at_the_command_table_is_offered_its_mission_verb_with_an_empty_b
         .expect("the address brings its body");
     assert_eq!(shape.len(), 1);
     assert_eq!(shape[0].name, "body");
-    assert_eq!(
-        shape[0].properties.as_ref().map(Vec::len),
-        Some(0),
-        "collect_mission takes no fields"
-    );
+    let fields: Vec<&str> = shape[0]
+        .properties
+        .as_ref()
+        .expect("an object body")
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(fields, ["found"], "report_done takes what was found");
 }
 
 /// **Every address a body is offered is one the router answers.** A body is stood

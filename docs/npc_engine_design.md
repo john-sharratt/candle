@@ -241,15 +241,24 @@ and is the KV prefix. Both are superseding turns in their own bands (Part V), wh
 them in the most recent position — where the present belongs — without disturbing the prefix
 above them.
 
-**The command table's summons is for bodies that can walk to it.** While the table is open,
-a character with no mission is told every turn to go to it (or, standing at it, to take a
-mission up). The summons is set only when a room offering `collect_mission` is the body's own
-room or lies on a route from it across the map's doors, portals and lifts
-(`Runtime::command_table_way`, which names the room and whether the way is on foot). A table in
-the body's own area is preferred. The vault's command room and the Redoubt's muster hall each
-hold an `order-table`, so a Redoubt character is sent to its own muster hall, on foot, and is
-never told to ride a lift to the vault's level. A body with no table in reach (the waste) gets no
-summons and reads the ordinary standing task for its company instead.
+**The command table gives its work out; nobody comes for it** (`docs/zen_everywhere.md` §3).
+While the table is open, the world's authority hands every free body that takes orders its next
+mission where it stands, each moment (`Runtime::assign_work` → `work::take_up`): what is lodged
+for it by name, then the oldest waiting it may take, then — in a world that draws — a routine.
+The one longest at rest is handed work first, and the character is told with the brief
+(`MISSION_GIVEN`). In a world that draws routines, work is given only to a body with a table to
+report at: a room offering `report_done` is its own room or lies on a route from it across the
+map's doors, portals and lifts (`Runtime::reaches_table`). A body with no table in reach (the
+waste) is given nothing and reads the ordinary standing task for its company instead.
+
+**A drone with no mission is at rest.** In a world that draws nothing (`draw: none`), a body
+that takes orders, carries nothing and has nothing on the table it may take is held by the
+engine as a suspended character is (`Runtime::follow_rest`, `Scheduler::rest`): never due,
+refused a turn, no standing task, and its conversation let go (`Minds::let_go`), so it holds no
+slot, K/V, recurrent store or index on the card. What reaches it waits in its inbox, bounded
+per source when it wakes (`held::bound`). Only a mission wakes it. A suspended character is not
+a hand: work for it waits until it is resumed, and the table's limit counts the hands that are
+not suspended.
 
 **A mission's steps are signed off by what the engine sees, not by what the character says.**
 Where a body stands, which machines stand there in what state, and who it spoke to are facts
@@ -273,9 +282,9 @@ and the way to whatever it names — a room, the room a machine stands in, the r
 right now — or, when only the report is left, the way back to the table. A way on another level is
 the lift ride (`lift_call`, `lift_use` naming the level, then `move_to`), worded from the landing
 when the body is standing at the lift so it is told again there. The table offers only what the
-body can do at it: `collect_mission` to one carrying nothing, `report_done` / `report_stuck` to
-one carrying a mission, `orders_report_done` to one holding a standing order; a body with a
-mission lodged for it by name is told so at the table with the address to `invoke`.
+body can do at it: `report_done` / `report_stuck` to one carrying a mission,
+`orders_report_done` to one holding a standing order, and nothing of a mission's to one
+carrying none.
 The mission compass says the exact act for a step that sets the year — `time_travel` naming it
 at a time machine, or the way to one (`mission::time_compass`); told only "set your time to 2837
 at a time machine", Makers wandered between levels for an hour and told each other the lift was
@@ -292,7 +301,7 @@ readings, meetings, words — is kept on the mission as `observed`, beside the c
 the line that tells it to report, so the report is about this mission. `GET /v1/npc/:nid/mission`
 returns the mission in hand, the last one `finished`, and how many are `lodged` and waiting.
 
-Random routines are drawn from what the body can reach: the table it would be summoned to (its
+Random routines are drawn from what the body can reach: the table it reports at (its
 own level's first), and machines on its own level before any it would have to ride to.
 
 ### The idle turn is authored, not generated

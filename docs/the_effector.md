@@ -1645,7 +1645,6 @@ like any other (§9), not a second projected-store surface.
 | Route | Method | Condition | Body schema | Store | From |
 |---|---|---|---|---|---|
 | `GET .../command/command-room-1` (read) | GET | always | — | World (generic station read) | `station.rs::state` |
-| `POST .../command/command-room-1/collect_mission` | POST | at the table, no open mission | — | Sim `missions` | `MISSION_ACTS`/`mission_acts.rs`, dispatched in `work.rs::mission` |
 | `POST .../command/command-room-1/report_done` | POST | holding an order | `what` free req | Sim `ledger` | `ORDERS_REPORT_DONE` station.rs:830, `work.rs::perform` |
 | `POST .../orders/muster-1/set` | POST | always | `what` free req; `for` free opt | projected (agency) | `ORDERS_SET` station.rs:804 (audit §3.2/§6.2) |
 | `POST .../orders/muster-1/hand_to` | POST | always | `what` free req; `to` free req | projected (agency) | `ORDERS_HAND_TO` station.rs:818 (audit §6.2) |

@@ -156,7 +156,7 @@ ending "post work on the order table" is not held on that step for its hour and 
 |---|---|---|
 | `order_post` | Zen | Puts a mission on the table: a brief and at least one step, or a standing job by name (`job`, its brief and steps its own), for any Drone or for one by name. |
 | `order_results` | Zen | Reads what came back since it last read: each report, newest first, what is still out, and — with the table empty — the standing jobs. Offered only while a report waits unread, so a reading is never asked for again unchanged. |
-| `collect_mission` | a Drone | Takes the next mission on the table — one set for it by name first, then the oldest open one. |
+| — | the table | Hands each free Drone its next mission — one set for it by name first, then the oldest open one — to the Drone longest at rest first. No act of a Drone's takes work (`docs/zen_everywhere.md` §3). |
 | `report_done` / `report_stuck` | a Drone | Reports the mission: done at the table, stuck from anywhere. |
 
 An order is a **mission**, not a line on the orders board: it has steps the engine signs off as
@@ -178,10 +178,10 @@ name mirrored rooms and their terminals — "go to the Sharratt house and read t
 
 ### 8.3 The Drones wait for work
 
-A Drone with no mission **goes to the order table and waits there, idle** — no routines, no
-nudges, nothing drawn from a bank. **A mission posted wakes it**: every Drone waiting at the
-table is told the moment work arrives, and the table hands it to the first of them to take a
-turn there; a mission set for one by name wakes only that one.
+A Drone with no mission **is at rest where it stands** (`docs/zen_everywhere.md` §3) — no
+routines, no nudges, nothing drawn from a bank, no turn taken, and its conversation off the
+card. **A mission posted wakes it**: the table hands the work to the Drone longest at rest, or
+to the one it is set for by name, and that Drone wakes carrying it; the others stay at rest.
 
 `missions/life.yaml`'s routines stop being handed out by draw; they are Zen's **maintenance
 catalogue** — the standing jobs it may post by name when the table is empty. A standing job a
@@ -439,8 +439,8 @@ how Zen does a thing; a post is how it has a Drone do one.
 
 With nothing on its agenda, **the engine puts the next due item of its round on it**, and Zen is
 woken already working on it (`ROUND_TAKEN`, then the mission). Zen needs no table for this and
-takes no act to get it: `collect_mission` is a Drone's, and the table refuses it to a character
-that takes no orders. The round decides which item; Zen does not choose. With nothing due, Zen
+takes no act to get it: the table gives its work to Drones, and nothing to a character that
+takes no orders. The round decides which item; Zen does not choose. With nothing due, Zen
 rests (§17.4).
 
 #### The file

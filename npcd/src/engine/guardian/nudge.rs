@@ -205,11 +205,7 @@ mod tests {
         v.stations = vec![Station {
             name: "table".into(),
             address: "http://local/command/order-table~0".into(),
-            verbs: vec![
-                "collect_mission".into(),
-                "report_done".into(),
-                "report_stuck".into(),
-            ],
+            verbs: vec!["report_done".into(), "report_stuck".into()],
         }];
         let t = text(Rung::Nudge, Concern::Looping, &v).unwrap();
         assert!(

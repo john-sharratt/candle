@@ -246,7 +246,6 @@ pub fn perform_said(hosted: &Hosted, body: &str, act: &Act, said: Option<&Voiced
 /// The acts that report on a mission at its desk: a refusal of one is about the
 /// report, never the way.
 const DESK_REPORTS: &[&str] = &[
-    "collect_mission",
     "report_done",
     "report_stuck",
     "report_rejected",

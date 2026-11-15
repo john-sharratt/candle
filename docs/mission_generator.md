@@ -160,9 +160,9 @@ report is gated, a life event loses a heading it opened on, a story gains its ti
 run-on paragraph is broken at sentence ends. Reviewers refused at every report for a heading
 line went round until they despaired; nobody is asked to judge what needs no judgement.
 
-**The table hands its work out.** A Maker free at the open table is given the next mission it
-may take (`Runtime::at_table_summons`) rather than told to collect one — told every tick,
-Makers stood at the table scanning and reflecting with thirty-five reviews waiting. A reviewer
+**The table hands its work out.** A free Maker is given the next mission it may take, wherever
+it stands (`Runtime::assign_work`), rather than called to the table to collect one — told
+every tick, Makers stood at the table scanning and reflecting with thirty-five reviews waiting. A reviewer
 whose reading is done is asked for its verdict, not for "what you found": a review has nothing
 to find.
 
@@ -483,11 +483,10 @@ sent down to the hatchery to read a cradle and report back to a table.
 A personality says so with `takes_orders: false`. **The world gives a character of it no
 orders** (`sim::missions::Missions::set_unordered`):
 
-- **No summons, no standing task.** The table never calls it, on its way or standing at the
-  table, and it is given no idle nudge either — what it does with its time is its own
-  (`Runtime::table_summons`, `at_table_summons`, `nudge_for`).
-- **No work at the table.** `collect_mission` is not offered to it, and refused if asked for;
-  the table hands it nothing from the pool.
+- **No standing task, and never at rest.** The table sets it nothing and does not hold it —
+  what it does with its time is its own (`Runtime::nudge_for`, `follow_rest`).
+- **No work at the table.** The table hands it nothing, lodged or from the pool
+  (`Runtime::assign_work`, `work::take_up`).
 - **Nothing lodged.** `POST /v1/npc/:nid/mission` (and the MCP `bot_mission_give` behind it)
   answers `409 takes_no_orders`; talk to it instead. The world's authority refuses a lodge for it
   too.

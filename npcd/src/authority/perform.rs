@@ -110,7 +110,7 @@ impl Runtime {
             WorldOp::Begin { npc } => {
                 let arrival = self.mark_arrival(npc);
                 let compass = self.compass_news(npc);
-                let summons = self.at_table_summons(npc);
+                let summons = self.at_table_report(npc);
                 OpReply::Began {
                     arrival,
                     compass,

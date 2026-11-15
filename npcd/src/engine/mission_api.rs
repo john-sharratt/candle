@@ -410,10 +410,10 @@ pub async fn pair(
 
 /// `POST /v1/pulse/command-table` — open or shut the command table.
 ///
-/// Opening it calls every character to the table — over the chat channel and
-/// the tannoy — and sets the standing task, so a character with no mission
-/// breaks off, makes its way there, and takes one up (with `collect_mission`),
-/// carries it out, reports, and comes back for the next until the table shuts.
+/// Opening it announces the table — over the chat channel and the tannoy —
+/// and lets it give work: a character with no mission is handed one where it
+/// stands (`Runtime::assign_work`), carries it out, reports at the table, and
+/// is handed the next until the table shuts.
 /// Shutting it stands the cast down: missions in hand are finished, no new ones
 /// given. Admin, like `broadcast`: it reaches the whole cast.
 pub async fn command_table(

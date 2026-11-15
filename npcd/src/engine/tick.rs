@@ -394,13 +394,12 @@ impl Inbox {
 
     /// Like [`Self::nudge_due`] but on the "since the task was last restated"
     /// clock ALONE — it ignores the quiet-since-news clock, so it fires while a
-    /// character is deep in conversation. This is what the command table's
-    /// **active** summons rides: a busy character never goes quiet, so the
-    /// full gate never reaches it, but repeating the call every tick collapses
-    /// the character onto the repetition (it fixates on "the loop" rather than
-    /// acting on the call). Restating it on its own interval is the middle
-    /// ground — often enough to break a conversation, rarely enough to stay
-    /// evidence rather than noise.
+    /// character is deep in conversation. This is what a summons that must
+    /// break into a conversation rides — the round's next due item: a busy
+    /// character never goes quiet, so the full gate never reaches it, but
+    /// repeating a call every tick collapses the character onto the
+    /// repetition. Its own interval is the middle ground — often enough to
+    /// break a conversation, rarely enough to stay evidence rather than noise.
     pub fn summons_due(&self, world_ms: u64, after_ms: u64) -> bool {
         world_ms.saturating_sub(self.last_nudge_ms) >= after_ms
     }
@@ -598,6 +597,10 @@ pub struct Scheduler {
     /// of it: it holds for a character this member is not lent, and it has to be
     /// standing already on the moment a lease brings one here and wakes it.
     suspended: Mutex<HashSet<u64>>,
+    /// The characters at rest — held as a suspended one is, by the engine
+    /// rather than by their owner — each with the scheduler's clock when its
+    /// rest began. See [`Self::rest`].
+    resting: Mutex<HashMap<u64, u64>>,
     /// Where a character's conversation lines and purposes go instead of its
     /// inbox: its conversations answer them, never its mind
     /// (`docs/npc_conversations.md` §9). Set once by the runtime.
@@ -623,6 +626,7 @@ impl Scheduler {
             recent_cap: recent_cap.max(1),
             born: Instant::now(),
             suspended: Mutex::new(HashSet::new()),
+            resting: Mutex::new(HashMap::new()),
             talk: OnceLock::new(),
         }
     }
@@ -651,10 +655,54 @@ impl Scheduler {
                 set.remove(&npc_id)
             }
         };
-        if changed && !suspended {
+        if changed && !suspended && !self.is_held(npc_id) {
             self.resume(npc_id);
         }
         changed
+    }
+
+    /// Put one character at rest, or wake it. Returns whether that changed
+    /// anything.
+    ///
+    /// **A character at rest is held exactly as a suspended one is**: never
+    /// due, refused a turn, and everything delivered meanwhile kept in its
+    /// inbox, bounded per source when it wakes. What differs is who holds it —
+    /// the engine, for a character with no work to carry, where a suspension
+    /// is its owner's — so the two are kept apart, and a character both
+    /// suspended and at rest stays held until neither holds.
+    pub fn rest(&self, npc_id: u64, resting: bool) -> bool {
+        let changed = {
+            let mut set = self.resting.lock().unwrap();
+            match resting {
+                true if set.contains_key(&npc_id) => false,
+                true => {
+                    set.insert(npc_id, self.now_ms());
+                    true
+                }
+                false => set.remove(&npc_id).is_some(),
+            }
+        };
+        if changed && !resting && !self.is_held(npc_id) {
+            self.resume(npc_id);
+        }
+        changed
+    }
+
+    /// Whether this character is at rest.
+    pub fn is_resting(&self, npc_id: u64) -> bool {
+        self.resting.lock().unwrap().contains_key(&npc_id)
+    }
+
+    /// When this character's rest began, on the scheduler's clock — `None`
+    /// for one that is not at rest.
+    pub fn resting_since(&self, npc_id: u64) -> Option<u64> {
+        self.resting.lock().unwrap().get(&npc_id).copied()
+    }
+
+    /// Whether this character is held — suspended or at rest — and so takes no
+    /// turn.
+    pub fn is_held(&self, npc_id: u64) -> bool {
+        self.is_suspended(npc_id) || self.is_resting(npc_id)
     }
 
     /// Hold exactly `suspended` suspended — the cast's suspended characters,
@@ -678,7 +726,7 @@ impl Scheduler {
             changed
         };
         for (id, now_suspended) in &changed {
-            if !now_suspended {
+            if !now_suspended && !self.is_held(*id) {
                 self.resume(*id);
             }
         }
@@ -913,13 +961,13 @@ impl Scheduler {
 
     /// The next event sequence number, for a caller that builds an [`Event`] to
     /// place directly into a tick already in hand rather than [`Self::deliver`]
-    /// it — the at-the-table summons rides every tick this way, and `deliver`'s
+    /// it — the call to report at the table rides every tick this way, and `deliver`'s
     /// `due_at = 0` would make that a tight re-tick loop.
     pub fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, AtomicOrdering::Relaxed)
     }
 
-    /// Whether the command table's active summons is due for this character —
+    /// Whether a summons that breaks into conversation is due for this character —
     /// on the "since last restated" clock alone (see [`Inbox::summons_due`]),
     /// so it reaches one that is deep in conversation.
     pub fn summons_due(&self, npc_id: u64, world_ms: u64, after_ms: u64) -> bool {
@@ -1020,11 +1068,7 @@ impl Scheduler {
                 let Some(inbox) = inboxes.get(&npc_id) else {
                     return false;
                 };
-                (
-                    inbox.due_at,
-                    Arc::clone(&inbox.waker),
-                    self.is_suspended(npc_id),
-                )
+                (inbox.due_at, Arc::clone(&inbox.waker), self.is_held(npc_id))
             };
             // Registered before the deadline check could race a notify: a
             // permit stored between the read above and this await completes
@@ -1057,9 +1101,11 @@ impl Scheduler {
     pub fn due_now(&self, now_ms: u64) -> Vec<u64> {
         let inboxes = self.inboxes.lock().unwrap();
         let suspended = self.suspended.lock().unwrap();
+        let resting = self.resting.lock().unwrap();
+        let held = |id: &u64| suspended.contains(id) || resting.contains_key(id);
         let mut due: Vec<(u64, u64)> = inboxes
             .values()
-            .filter(|i| i.due_at <= now_ms && !suspended.contains(&i.npc_id))
+            .filter(|i| i.due_at <= now_ms && !held(&i.npc_id))
             .map(|i| (i.due_at, i.npc_id))
             .collect();
         due.sort_unstable();
@@ -1072,9 +1118,10 @@ impl Scheduler {
     fn is_due(&self, npc_id: u64, now_ms: u64) -> bool {
         let inboxes = self.inboxes.lock().unwrap();
         let suspended = self.suspended.lock().unwrap();
-        inboxes
-            .get(&npc_id)
-            .is_some_and(|i| i.due_at <= now_ms && !suspended.contains(&npc_id))
+        let resting = self.resting.lock().unwrap();
+        inboxes.get(&npc_id).is_some_and(|i| {
+            i.due_at <= now_ms && !suspended.contains(&npc_id) && !resting.contains_key(&npc_id)
+        })
     }
 
     /// Run one character's tick.
@@ -1110,7 +1157,7 @@ impl Scheduler {
     /// after its task left [`Self::wait_due`] takes no turn, and its inbox
     /// stays whole for the turn it takes once resumed.
     pub fn begin_tick(&self, npc_id: u64) -> Option<TickStart> {
-        if self.is_suspended(npc_id) {
+        if self.is_held(npc_id) {
             return None;
         }
         // The drain takes the lock and gives it straight back.
@@ -1653,6 +1700,36 @@ mod tests {
         );
     }
 
+    /// **A character at rest is held as a suspended one is**, and is let go
+    /// only when neither holds it: woken from rest while suspended it stays
+    /// held, and the turn after both are lifted reads what reached it.
+    #[test]
+    fn a_character_at_rest_is_held_until_it_is_woken() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        assert!(s.rest(1, true));
+        assert!(!s.rest(1, true), "put at rest twice changes nothing");
+        assert!(s.is_resting(1) && s.is_held(1));
+        assert!(s.resting_since(1).is_some());
+
+        s.deliver(1, 0, Salience::URGENT, say("an alarm"));
+        assert!(s.due_now(1_000).is_empty());
+        assert!(s.begin_tick(1).is_none(), "a character at rest took a turn");
+        assert_eq!(s.inbox_depth(1), Some(1), "the refused turn drained it");
+
+        // Suspended meanwhile, waking from rest does not let it go.
+        s.suspend(1, true);
+        assert!(s.rest(1, false));
+        assert!(!s.is_resting(1) && s.is_held(1));
+        assert!(s.due_now(1_000).is_empty());
+        assert_eq!(s.resting_since(1), None);
+
+        s.suspend(1, false);
+        assert_eq!(s.due_now(1_000), vec![1]);
+        let rec = s.tick(1, 1_000, 0, |_, _| vec![]).expect("ticked");
+        assert_eq!(rec.perceived, vec!["an alarm".to_string()]);
+    }
+
     /// **The turn after a long suspension reads the newest of each source and
     /// a count of the rest**, never the whole backlog: 25 things happen around
     /// a suspended character, and it resumes to the newest 20, behind one line
@@ -1670,7 +1747,7 @@ mod tests {
         s.suspend(1, false);
         let rec = s.tick(1, 1_000, 0, |_, _| vec![]).expect("ticked");
         let mut want =
-            vec!["While you were suspended, 5 more things that happened around you.".to_string()];
+            vec!["While you were away, 5 more things that happened around you.".to_string()];
         want.extend((5..25).map(|i| format!("line {i}")));
         assert_eq!(rec.perceived, want);
     }

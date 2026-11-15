@@ -453,12 +453,12 @@ mod tests {
     }
 
     /// **A world this file does not describe still offers what its parts do.**
-    /// Seeded with its machines alone, the moon offered no `collect_mission` at
-    /// its order table, and its Drones were never called to take work.
+    /// Seeded with its machines alone, the moon offered none of the order
+    /// table's acts, and its Drones had nowhere to report.
     #[test]
     fn an_undescribed_world_offers_the_acts_of_its_parts() {
         let s = for_world("an-undescribed-world", Some(&maps()));
-        assert!(s.part_offers("vault-command/command-room", "collect_mission"));
+        assert!(s.part_offers("vault-command/command-room", "report_done"));
         assert!(s.part_offers("vault-command/command-room", "order_post"));
         assert!(
             !s.has_home(),

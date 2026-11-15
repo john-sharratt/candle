@@ -227,6 +227,11 @@ pub struct Missions {
     /// one priority, oldest first.
     #[serde(default)]
     agenda_count: u64,
+    /// The bodies whose characters are suspended — hands the table cannot
+    /// give work to. The cast's, told by the world's authority as it gives
+    /// work out ([`Self::set_suspended`]), never saved.
+    #[serde(skip)]
+    suspended: BTreeSet<String>,
 }
 
 impl Missions {
@@ -243,8 +248,8 @@ impl Missions {
     }
 
     /// Mark the body unordered, or not: **the world gives an unordered
-    /// character no orders.** The table never calls it, never hands it work and
-    /// never offers it `collect_mission`, nothing is lodged for it, and its
+    /// character no orders.** The table never hands it work, nothing is
+    /// lodged for it, and its
     /// idle wake sets it nothing — what it does with its time is its own. Made
     /// unordered, it is stood down from whatever it carries, and told so, and
     /// what was lodged for it is dropped. `docs/mission_generator.md`, "A
@@ -265,6 +270,36 @@ impl Missions {
     /// [`Self::set_unordered`].
     pub fn is_unordered(&self, body: &str) -> bool {
         self.unordered.contains(body)
+    }
+
+    /// Hold exactly `suspended` as the bodies whose characters are suspended.
+    /// Returns whether that changed anything.
+    pub fn set_suspended(&mut self, suspended: BTreeSet<String>) -> bool {
+        let changed = self.suspended != suspended;
+        self.suspended = suspended;
+        changed
+    }
+
+    /// The bodies whose characters are suspended, as last told.
+    pub fn suspended(&self) -> &BTreeSet<String> {
+        &self.suspended
+    }
+
+    /// Whether `body` is a hand the table can give work to: it takes orders
+    /// and its character is not suspended. One at rest is a hand — work wakes
+    /// it (`docs/zen_everywhere.md` §3).
+    pub fn is_hand(&self, body: &str) -> bool {
+        !self.is_unordered(body) && !self.suspended.contains(body)
+    }
+
+    /// Whether `body` is a drone at rest in a world whose table is open: it
+    /// takes orders, carries nothing, the world draws it no routine, and
+    /// nothing on the table is its to take.
+    pub fn at_rest(&self, body: &str) -> bool {
+        !self.is_unordered(body)
+            && !self.is_on_mission(body)
+            && !self.draws()
+            && !self.has_work_for(body)
     }
 
     /// Set the world's round (`docs/zen_moon_mind.md` §17) — empty for a
