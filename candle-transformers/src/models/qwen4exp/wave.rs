@@ -1535,7 +1535,9 @@ impl Qwen4ExpBatched {
     /// and the first wave keeps it. A store a fork already copied is left alone,
     /// and a snapshot held for the sequence becomes its store here.
     pub fn claim_carried_state(&self, seq: usize) -> Result<()> {
+        let t = Instant::now();
         self.refuse_parked(seq)?;
+        ClaimPart::Parked.charge(t.elapsed());
         let t = Instant::now();
         self.install_staged(seq)?;
         ClaimPart::Install.charge(t.elapsed());
@@ -1897,7 +1899,10 @@ impl Qwen4ExpBatched {
             return Ok(());
         };
         let cfg = &self.model.cfg;
-        match snap.build(&cfg.layer_kinds, &cfg.delta_net, &self.model.device) {
+        let t = Instant::now();
+        let built = snap.build(&cfg.layer_kinds, &cfg.delta_net, &self.model.device);
+        ClaimPart::Build.charge(t.elapsed());
+        match built {
             Ok(store) => {
                 self.recurrent
                     .write()

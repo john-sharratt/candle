@@ -37,9 +37,14 @@ pub(super) enum AdmitPart {
     /// Of `claim`: waiting for the device to drain before a recycled region
     /// is handed to the state (`candle_nn::kv_cache::quiesce_wait_ns`).
     BeginClaimQuiesce,
+    /// Of `claim`: the check that a parked sequence has a snapshot staged.
+    BeginClaimParked,
     /// Of `claim`: building the recurrent store from a snapshot held for the
     /// sequence (`claim_split::ClaimPart::Install`).
     BeginClaimInstall,
+    /// Of `install`: the store built from the snapshot, without the locks
+    /// around it.
+    BeginClaimBuild,
     /// Of `claim`: a fresh recurrent store, its slots claimed and zeroed.
     BeginClaimRecurrent,
     /// Of `claim`: the PLE history and its spare.
@@ -63,7 +68,7 @@ pub(super) enum AdmitPart {
     Frontier,
 }
 
-const PARTS: [AdmitPart; 21] = [
+const PARTS: [AdmitPart; 23] = [
     AdmitPart::Relief,
     AdmitPart::Setup,
     AdmitPart::Fill,
@@ -77,7 +82,9 @@ const PARTS: [AdmitPart; 21] = [
     AdmitPart::BeginFork,
     AdmitPart::BeginClaim,
     AdmitPart::BeginClaimQuiesce,
+    AdmitPart::BeginClaimParked,
     AdmitPart::BeginClaimInstall,
+    AdmitPart::BeginClaimBuild,
     AdmitPart::BeginClaimRecurrent,
     AdmitPart::BeginClaimPle,
     AdmitPart::BeginClaimSeeds,
@@ -100,7 +107,9 @@ impl AdmitPart {
             AdmitPart::BeginFork => "fork",
             AdmitPart::BeginClaim => "claim",
             AdmitPart::BeginClaimQuiesce => "quiesce",
+            AdmitPart::BeginClaimParked => "parked",
             AdmitPart::BeginClaimInstall => "install",
+            AdmitPart::BeginClaimBuild => "build",
             AdmitPart::BeginClaimRecurrent => "recurrent",
             AdmitPart::BeginClaimPle => "ple",
             AdmitPart::BeginClaimSeeds => "seeds",
@@ -170,7 +179,7 @@ mod tests {
         assert_eq!(
             s.parts_ms(),
             "relief=12 setup=0 fill=7 peek=0 price=0 residency=0 judge=0 admit=0 begin=0 \
-             carve=0 fork=0 claim=0 quiesce=0 install=0 \
+             carve=0 fork=0 claim=0 quiesce=0 parked=0 install=0 build=0 \
              recurrent=0 ple=0 seeds=0 seal=0 start=0 conclude=0 frontier=40"
         );
     }

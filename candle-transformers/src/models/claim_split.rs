@@ -14,6 +14,11 @@ use std::time::Duration;
 /// The parts of a carried-state claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimPart {
+    /// The check that a parked sequence has a snapshot staged for it.
+    Parked,
+    /// Of `install`: building the store from the snapshot, without the locks
+    /// around it.
+    Build,
     /// Building the recurrent store from a snapshot held for the sequence.
     Install,
     /// A fresh recurrent store: its state-arena slots claimed and zeroed.
@@ -25,8 +30,10 @@ pub enum ClaimPart {
 }
 
 /// Every part, in the order the totals read.
-pub const CLAIM_PARTS: [ClaimPart; 4] = [
+pub const CLAIM_PARTS: [ClaimPart; 6] = [
+    ClaimPart::Parked,
     ClaimPart::Install,
+    ClaimPart::Build,
     ClaimPart::Recurrent,
     ClaimPart::Ple,
     ClaimPart::Seeds,
@@ -37,15 +44,19 @@ static PART_NS: [AtomicU64; CLAIM_PARTS.len()] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 
 impl ClaimPart {
     fn index(self) -> usize {
         match self {
-            ClaimPart::Install => 0,
-            ClaimPart::Recurrent => 1,
-            ClaimPart::Ple => 2,
-            ClaimPart::Seeds => 3,
+            ClaimPart::Parked => 0,
+            ClaimPart::Install => 1,
+            ClaimPart::Build => 2,
+            ClaimPart::Recurrent => 3,
+            ClaimPart::Ple => 4,
+            ClaimPart::Seeds => 5,
         }
     }
 
@@ -85,7 +96,7 @@ mod tests {
         let took = ClaimSplit::since(before);
         // Other tests may charge parts concurrently; this one's charge is at
         // least what it filed, under its own index.
-        assert!(took[2] >= Duration::from_micros(1500), "{took:?}");
-        assert_eq!(CLAIM_PARTS.map(ClaimPart::index), [0, 1, 2, 3]);
+        assert!(took[4] >= Duration::from_micros(1500), "{took:?}");
+        assert_eq!(CLAIM_PARTS.map(ClaimPart::index), [0, 1, 2, 3, 4, 5]);
     }
 }

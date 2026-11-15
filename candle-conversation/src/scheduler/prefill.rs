@@ -2721,9 +2721,11 @@ impl Scheduler {
         self.wave_stats
             .admission_split
             .part(AdmitPart::BeginClaim, t.elapsed());
-        let [install, recurrent, ple, seeds] = ClaimSplit::since(split);
+        let [parked, install, build, recurrent, ple, seeds] = ClaimSplit::since(split);
         for (part, took) in [
+            (AdmitPart::BeginClaimParked, parked),
             (AdmitPart::BeginClaimInstall, install),
+            (AdmitPart::BeginClaimBuild, build),
             (AdmitPart::BeginClaimRecurrent, recurrent),
             (AdmitPart::BeginClaimPle, ple),
             (AdmitPart::BeginClaimSeeds, seeds),
