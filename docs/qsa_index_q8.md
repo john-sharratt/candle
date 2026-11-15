@@ -87,26 +87,25 @@ x̂[c] = q[c] · f32(d)
 - **The open block stays `F32`**: at most `ratio − 1` raw rows and its rewind
   copies, pooled into a key only when the block completes.
 
-### One definition, bit-identical on both sides
+### One definition, two implementations, not bit-identical
 
-The `simple` archive compiles `--use_fast_math` (approximate divide, implicit
-FMA contraction, flush-to-zero), and `build_utils.rs` records what that does to
-a quantizer at a .5 boundary: one-code flips. The append is on the hot path and
-stays in that group, so the quantizer is written in **explicit IEEE
-operations** — `__fmul_rn`, `__fdiv_rn`, `__float2int_rn`, `__float2half_rn` —
-as the latent kernels do for the divisions their mirror must match. It lives
-once, as a `__device__` inline in `candle-kernels/src/qsa_key_q8.cuh`
-(quantize a block from registers; dequantize a channel, a `float4`, a block),
-and once in Rust, `qwen4exp/key_q8.rs` (`quantize_key`, `dequantize_key`), which
-is the test oracle and the migration's quantizer.
+The quantizer lives once as a `__device__` inline in
+`candle-kernels/src/qsa_key_q8.cuh` (quantize a block from registers;
+dequantize a channel, a `float4`, a block), and once in Rust,
+`qwen4exp/key_q8.rs` (`quantize_key`, `dequantize_key`), which is the test
+oracle and the migration's quantizer.
 
-The fused pool-and-norm is *not* bit-exact to host arithmetic and never was
-(`qsa_index_append.cu`, Numerics), so "the append's bytes equal the reference's"
-is not a test that can be written against the append. The bit-identity gate is
-a test entry over the same inline — `run_qsa_key_q8_rows`, `F32` rows in, the
-two planes out — compared byte for byte with `quantize_key`; the append is
-gated as it is today, against host arithmetic, with the tolerance widened by
-half a code.
+**The kernel compiles with the rest of the `simple` archive, under
+`--use_fast_math`, and is not required to match the Rust bytes.** A key is
+quantized once — by the append or by the migration — and from then on only its
+stored codes and stored scale are read; no mirror reproduces the kernel, which
+is what the KV codecs' bit-exact contract exists for. A code that lands the
+other side of a .5 tie, or a scale one ULP off, is a key still within half a
+step of the value, read back by the scale that was stored.
+
+So the tests are: `quantize_key` against raw bytes (it is deterministic); the
+kernel against it with every code within ±1, the scale within one `f16` step,
+and the dequantized key within half a step of the `F32` key the host computes.
 
 ### Layout on the card
 
@@ -267,7 +266,7 @@ stopped substrate:
 1. `--dry-run` counts every record holding a version-3 container, by kind, and
    their bytes.
 2. The run decodes each, quantizes its completed rows with `quantize_key`
-   (§3 — bit-identical to the kernel's), re-encodes at version 4 and re-emits
+   (§3), re-encodes at version 4 and re-emits
    the record as compaction re-emits one it relocates; the superseded records
    are dead weight a later compaction reclaims. A `TurnIndexPage` is unframed,
    each page migrated, and reframed with its token widths unchanged.
@@ -294,8 +293,8 @@ this touches gets a harness before it is tuned, in `candle-transformers/tests/`,
 beside the ones it extends (`qsa_score_rot_harness.rs`,
 `qsa_page_place_bench.rs`, `qsa_index_bench.rs`):
 
-- **Correctness first, in the same file.** The quantizer inline bit-identical to
-  `quantize_key`; a placed page its planes transposed, byte for byte; every
+- **Correctness first, in the same file.** The quantizer inline within one code
+  of `quantize_key` (§3); a placed page its planes transposed, byte for byte; every
   scorer arm against the f64 oracle over the dequantized keys within the §5
   bound; the shadow scan and the GEMM tail against the same oracle.
 - **A sweep that says which shape is slow:** depth {8K, 32K, 128K, 512K} ×
@@ -347,8 +346,8 @@ beside the ones it extends (`qsa_score_rot_harness.rs`,
 ## 10. Order of work
 
 1. **The quantizer:** `key_q8.rs` with `#[test]`s on raw bytes (rounding at
-   ties, ±127, the zero block, a short last block, the four-block key), the
-   `qsa_key_q8.cuh` inline and its bit-identity test entry.
+   ties, ±127, the zero block, a short last block, the four-block key) and the
+   `qsa_key_q8.cuh` inline.
 2. **Q8_0 on the card, in one change** — the format cannot be half in: key
    pages and resident pages as byte slots; append and flush; placement; the
    baseline scorer, the shadow scan and the GEMM tail; `SealedIndex` and the
@@ -374,9 +373,9 @@ conversion in each direction that the finished design does not have.
 - Three card-side readers and writers the first draft missed: the shadow scan,
   the GEMM-tail rotation, and the host readback.
 - Row-major pages are permanent (`close_tail_into_page`), not only the tail.
-- The rounding rule would not have been bit-identical under `--use_fast_math`;
-  it is now the repository's Q8_0 in explicit IEEE operations, with a canonical
-  zero.
+- The rounding rule is the repository's Q8_0 with a canonical zero; the kernel
+  runs under fast math and is gated within one code of the Rust reference,
+  since nothing reproduces its bytes.
 - Widths that are not a multiple of 32, which the tests run.
 - Scales row-major in both layouts; the descriptor at five words, not six; one
   slot a chunk.
