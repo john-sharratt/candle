@@ -8803,8 +8803,9 @@ mod tests {
             told.ends_with(
                 "/order_post` — a standing `job` by name when one fits what the families need: \
                  `ward-patrol`, `morning-briefing`; or a `brief` and its `steps` for what none of \
-                 them covers. A notice on a board is not work: nobody takes it up. Work still out \
-                 never stops you posting more: the table takes as many missions as you set."
+                 them covers. A notice on a board is not work: nobody takes it up. The table holds \
+                 as many missions nobody has taken as there are hands to take them; past that, a \
+                 new one waits for a report."
             ),
             "{told}"
         );

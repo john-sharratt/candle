@@ -274,8 +274,12 @@ impl Benches {
         if let Some(c) = self.open.get(body).and_then(|w| w.files.get(&key)) {
             return match &c.now {
                 Some(t) => Ok(t.clone()),
+                // **A removal says how it is undone.** A Maker that took its
+                // own draft out edited it again and again, told only that it
+                // was gone; writing it whole puts it back.
                 None => Err(format!(
-                    "You have taken {key} out. It goes when you commit."
+                    "You have taken {key} out. It goes when you commit — to keep it, write it \
+                     whole again with `compose`."
                 )),
             };
         }

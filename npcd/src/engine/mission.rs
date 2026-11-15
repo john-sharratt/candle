@@ -25,7 +25,7 @@ use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::mission_gen::world::Routine;
-use crate::engine::order_table::NO_LIMIT;
+use crate::engine::order_table::TABLE_LIMIT;
 use crate::engine::zen_task::{is_task_step, Task};
 use crate::sim::agenda::Agendum;
 
@@ -1072,7 +1072,7 @@ pub fn post_work_line(routines: &[Routine], at: Option<&str>) -> String {
     };
     format!(
         "Work is posted with {act}{what}. A notice on a board is not work: nobody takes it up. \
-         {NO_LIMIT}"
+         {TABLE_LIMIT}"
     )
 }
 
@@ -2093,28 +2093,31 @@ mod tests {
             "Work is posted with `invoke` `http://local/command/order-table~0/order_post` — a \
              standing `job` by name when one fits what the families need: `ward-patrol`, \
              `morning-briefing`; or a `brief` and its `steps` for what none of them covers. A \
-             notice on a board is not work: nobody takes it up. Work still out never stops you \
-             posting more: the table takes as many missions as you set."
+             notice on a board is not work: nobody takes it up. The table holds as many missions \
+             nobody has taken as there are hands to take them; past that, a new one waits for a \
+             report."
         );
         assert_eq!(
             post_work_line(&jobs, None),
             "Work is posted with `order_post` at the order table — a standing `job` by name when \
              one fits what the families need: `ward-patrol`, `morning-briefing`; or a `brief` and \
              its `steps` for what none of them covers. A notice on a board is not work: nobody \
-             takes it up. Work still out never stops you posting more: the table takes as many \
-             missions as you set."
+             takes it up. The table holds as many missions nobody has taken as there are hands \
+             to take them; past that, a new one waits for a report."
         );
         assert_eq!(
             post_work_line(&[], Some(at)),
             "Work is posted with `invoke` `http://local/command/order-table~0/order_post`, with a \
-             `brief` and its `steps`. A notice on a board is not work: nobody takes it up. Work \
-             still out never stops you posting more: the table takes as many missions as you set."
+             `brief` and its `steps`. A notice on a board is not work: nobody takes it up. The \
+             table holds as many missions nobody has taken as there are hands to take them; past \
+             that, a new one waits for a report."
         );
         assert_eq!(
             post_work_line(&[], None),
             "Work is posted with `order_post` at the order table, with a `brief` and its `steps`. \
-             A notice on a board is not work: nobody takes it up. Work still out never stops you \
-             posting more: the table takes as many missions as you set."
+             A notice on a board is not work: nobody takes it up. The table holds as many \
+             missions nobody has taken as there are hands to take them; past that, a new one \
+             waits for a report."
         );
     }
 

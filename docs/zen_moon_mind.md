@@ -146,8 +146,11 @@ room. **Giving one up is the exception:** a Drone carrying a mission reaches any
 `report_stuck` from wherever it is, with why, so a mission it cannot finish — a free-text step
 nothing signs off, a brief naming an act its steps never reach — is failed and comes back to Zen
 rather than being carried for hours. Reading that failure, Zen is told the work is still its to set,
-with what stopped it put right (`order_table::SET_IT_AGAIN`); and beside the work still out, that
-the table takes as many missions as it sets (`order_table::NO_LIMIT`).
+with what stopped it put right (`order_table::SET_IT_AGAIN`); and beside the work still out, the
+table's limit — as many untaken missions as there are hands to take them, past that a new one
+waits for a report (`order_table::TABLE_LIMIT`). A post the full table refuses answers the
+poster's step to post work (`order_table::STEP_ANSWERED`): the work is already out, so a round item
+ending "post work on the order table" is not held on that step for its hour and failed.
 
 | Act | Who | Does |
 |---|---|---|

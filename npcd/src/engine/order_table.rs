@@ -129,7 +129,15 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     };
     let brief = filled.brief.clone();
     if let Some(refusal) = table_full(hosted, body, &brief) {
-        return Outcome::Refused(refusal);
+        // **A full table answers a step to post work.** The work it would set
+        // is already out, waiting on the hands to take it; a round item ending
+        // "post work on the order table" was otherwise held on that step for
+        // its hour and failed, routine after routine.
+        let answered = hosted.with_sim(|s| s.missions.posted_work(body));
+        return Outcome::Refused(match answered {
+            true => format!("{refusal} {STEP_ANSWERED}"),
+            false => refusal,
+        });
     }
     // Reported at the table's own room, not the poster's: a poster that takes no
     // orders posts from wherever its attention is (`docs/zen_moon_mind.md`
@@ -298,7 +306,7 @@ pub fn results(hosted: &Hosted, body: &str) -> Outcome {
     }
     if !out.is_empty() {
         lines.push("Still out:".to_string());
-        lines.push(NO_LIMIT.to_string());
+        lines.push(TABLE_LIMIT.to_string());
         for (brief, with) in &out {
             let state = match with {
                 Some(b) => match hosted.sim(|s| s.missions.is_on_mission(b)) {
@@ -330,13 +338,15 @@ pub const SET_IT_AGAIN: &str = "What could not be finished is still yours to set
                                 with what stopped it put right — change the step that could not \
                                 be done, or correct the brief.";
 
-/// What the poster is told beside the work still out.
-///
-/// **The table has no limit.** Zen believed a table with three missions waiting
-/// to be taken was full and that it could post nothing more, and its round's
-/// "post work" step failed on that belief, routine after routine.
-pub const NO_LIMIT: &str = "Work still out never stops you posting more: the table takes as many \
-                            missions as you set.";
+/// What the poster is told beside the work still out, and where it is told
+/// how to post: the table's limit ([`table_full`]), said before it is met.
+pub const TABLE_LIMIT: &str = "The table holds as many missions nobody has taken as there are \
+                               hands to take them; past that, a new one waits for a report.";
+
+/// What a poster refused by a full table is told when the refusal answered its
+/// step to post work.
+pub const STEP_ANSWERED: &str = "Your step to post work is answered: the table's work is already \
+                                 out.";
 
 #[cfg(test)]
 mod tests {
@@ -484,6 +494,40 @@ mod tests {
         assert!(post(&h, "zen", &ward).happened());
     }
 
+    /// **A full table answers the step to post work**: refused, the poster's
+    /// round step is signed off and it is told so, rather than held on the
+    /// step for its hour.
+    #[test]
+    fn a_full_table_answers_the_step_to_post_work() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let h = vault();
+        for brief in ["Read the board.", "Watch Earth."] {
+            let a = args(json!({"brief": brief, "steps": "go to the dispatch room"}));
+            assert!(post(&h, "zen", &a).happened());
+        }
+        h.with_sim(|s| {
+            s.missions.assign(
+                "zen",
+                Mission::new(
+                    "Watch Earth and set what it needs.",
+                    vec![Todo::new("post work on the order table")],
+                    Origin::Round {
+                        id: "watch-earth".into(),
+                    },
+                ),
+            )
+        });
+        let ward = args(json!({"brief": "Walk the ward.", "steps": "go to the ward room"}));
+        let Outcome::Refused(why) = post(&h, "zen", &ward) else {
+            panic!("the table is full");
+        };
+        assert!(why.ends_with(STEP_ANSWERED), "{why}");
+        assert!(h.sim(|s| s
+            .missions
+            .active("zen")
+            .is_some_and(Mission::all_todos_done)));
+    }
+
     fn ward_shift() -> Routine {
         Routine {
             id: "ward-shift".into(),
@@ -617,7 +661,7 @@ mod tests {
             results(&h, "zen"),
             Outcome::Did(format!(
                 "Reported since you last read, newest first:\n- Wick done: Read the board. — \
-                     the board shows two jobs stalled\nStill out:\n{NO_LIMIT}\n- Watch Earth. — \
+                     the board shows two jobs stalled\nStill out:\n{TABLE_LIMIT}\n- Watch Earth. — \
                      set for Jitter"
             ))
         );

@@ -707,6 +707,25 @@ fn gate_refusal(
 /// **Exactly the path, capitals and all.** The disk does not tell `X.Md` from
 /// `X.md`, but the mind does: a life document written as `….Md` is never read
 /// as an episode, and two were, before the comparison stopped ignoring case.
+/// Why `body` may not take `path` out: it is the document its mission writes.
+///
+/// **A mission's own piece is mended, never taken out.** Odile, sent to mend a
+/// draft, deleted it; every edit after that was refused ("You have taken it
+/// out"), the working-set verbs that could undo it are not an operation's, and
+/// the review could neither be finished nor reported. `None` for any other
+/// document, or a body whose mission writes none.
+fn the_mission_piece(s: &Sim, body: &str, path: &str) -> Option<String> {
+    let work = s.missions.active(body)?.work.as_ref()?;
+    let norm = |p: &str| p.trim().trim_start_matches('/').to_string();
+    (norm(path) == norm(&work.writes)).then(|| {
+        format!(
+            "{} is the piece your mission is for: mend it in place — `file_edit` a passage, or \
+             write it whole again — rather than take it out.",
+            work.writes
+        )
+    })
+}
+
 fn outside_the_mission(s: &Sim, body: &str, path: &str) -> Option<String> {
     let work = s.missions.active(body)?.work.as_ref()?;
     let norm = |p: &str| p.trim().trim_start_matches('/').to_string();
@@ -2314,6 +2333,9 @@ fn bench(
         "file_delete" => {
             let shelf = hosted.shelf_of(body);
             hosted.with_sim(|s| {
+                if let Some(why) = the_mission_piece(s, body, what) {
+                    return Outcome::Refused(why);
+                }
                 if let Some(i) = s.record.by_name(what) {
                     if i.state == State::Filed {
                         return Outcome::Refused(format!(
@@ -2590,6 +2612,45 @@ mod tests {
             h.sim(|s| s.bench.diff("m1")),
             ["layers/eras/third.md (changed)"]
         );
+    }
+
+    /// **A mission's own piece is never taken out by the one carrying it**: it
+    /// is mended in place, and the refusal says so.
+    #[test]
+    fn a_missions_own_piece_cannot_be_deleted() {
+        use crate::engine::mission::{Mission, Origin, Todo, Work};
+        let (h, _root) = vault_with_documents("keep-piece");
+        let path = "layers/stories/the-water-schedule.md";
+        h.with_sim(|s| {
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Mend the story of the water schedule.",
+                    vec![Todo::new(format!("change {path} and commit it"))],
+                    Origin::Generated {
+                        generator: "untold".into(),
+                        target: "era:layers/eras/third.md".into(),
+                        operation: OP,
+                        step: "review".into(),
+                    },
+                )
+                .with_work(Work {
+                    writes: path.into(),
+                    reads: vec![],
+                    min_words: 0,
+                    edit_optional: false,
+                    anew: false,
+                    checks: Vec::new(),
+                    tools: Vec::new(),
+                }),
+            )
+        });
+        match perform(&h, "m1", &act("file_delete", json!({ "path": path }))) {
+            Outcome::Refused(why) => {
+                assert!(why.contains("is the piece your mission is for"), "{why}")
+            }
+            other => panic!("the mission's own piece was taken out: {other:?}"),
+        }
     }
 
     /// **A mission that writes the record is reported done only once its

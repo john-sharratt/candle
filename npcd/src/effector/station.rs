@@ -56,7 +56,7 @@ use crate::effector::router::Local;
 use crate::effector::token::Scope;
 use crate::engine::act::Act;
 use crate::engine::body;
-use crate::engine::mission_acts::COMMAND_DESK;
+use crate::engine::mission_acts::{self, COMMAND_DESK};
 use crate::engine::tools::{self, Tool};
 use crate::world::Hosted;
 
@@ -95,7 +95,7 @@ async fn state(
     pinned: Option<Extension<PinnedStandpoint>>,
     Path(id): Path<String>,
 ) -> Response {
-    let Some((hosted, _body, part)) = resolve(&local, &caller, pinned_at(pinned), &id) else {
+    let Some((hosted, _body, part)) = resolve(&local, &caller, pinned_at(pinned), &id, None) else {
         return not_here(&id);
     };
     let ns = namespace_of(&part.part_id);
@@ -143,7 +143,8 @@ async fn schema(
     pinned: Option<Extension<PinnedStandpoint>>,
     Path(id): Path<String>,
 ) -> Response {
-    let Some((_hosted, _body, part)) = resolve(&local, &caller, pinned_at(pinned), &id) else {
+    let Some((_hosted, _body, part)) = resolve(&local, &caller, pinned_at(pinned), &id, None)
+    else {
         return not_here(&id);
     };
     let ns = namespace_of(&part.part_id);
@@ -182,7 +183,8 @@ async fn invoke(
     Path((id, verb)): Path<(String, String)>,
     payload: Option<Json<Value>>,
 ) -> Response {
-    let Some((hosted, body, part)) = resolve(&local, &caller, pinned_at(pinned), &id) else {
+    let Some((hosted, body, part)) = resolve(&local, &caller, pinned_at(pinned), &id, Some(&verb))
+    else {
         return not_here(&id);
     };
     let ns = namespace_of(&part.part_id);
@@ -251,6 +253,7 @@ fn resolve(
     caller: &DeviceCaller,
     pinned: Option<Where>,
     id: &str,
+    verb: Option<&str>,
 ) -> Option<(Arc<Hosted>, String, Station)> {
     let (hosted, body) = local.body_of(caller)?;
     let (station, place, live_standpoint) = hosted.read(|w| {
@@ -281,9 +284,19 @@ fn resolve(
     // As-npc is proximity-gated (§8.3): the thing must be where the body stands.
     // A direct-scope caller addresses any id regardless of standpoint, and so
     // does a character that takes no orders at the order table, which it works
-    // from wherever its attention is (`docs/zen_moon_mind.md` §8.1).
-    let anywhere = COMMAND_DESK.contains(&station.part_id.as_str())
-        && hosted.sim(|s| s.missions.is_unordered(&body));
+    // from wherever its attention is (`docs/zen_moon_mind.md` §8.1) — and so
+    // does one carrying a mission, for the table's `report_stuck` alone: a
+    // mission is given up from wherever it stuck, as the grammar offers it
+    // (`Runtime::invokable_urls`).
+    let at_the_table = COMMAND_DESK.contains(&station.part_id.as_str());
+    let anywhere = at_the_table
+        && hosted.sim(|s| {
+            let carrying = mission_acts::carrying(s, &body);
+            carrying.unordered
+                || (verb == Some(mission_acts::REPORT_STUCK.name)
+                    && carrying.mission
+                    && !carrying.own)
+        });
     if caller.scope != Scope::Direct && !anywhere && standpoint.as_ref() != Some(&place) {
         return None;
     }
@@ -567,6 +580,52 @@ mod tests {
             ],
             "reported at the table's room, not the poster's"
         );
+    }
+
+    /// **A mission is given up from wherever it stuck.** Far from the table, a
+    /// body carrying a mission reaches its `report_stuck` — and no other verb
+    /// of it — and one carrying nothing reaches neither.
+    #[tokio::test]
+    async fn a_mission_is_given_up_from_wherever_it_stuck() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        use npc_map::load::MapSet;
+        let table = MapSet::load_dir(ROOMS)
+            .expect("the vault loads")
+            .instances_at(&Where::new("vault-command", "command-room"))
+            .into_iter()
+            .find(|i| i.part_id() == "order-table")
+            .expect("the command room holds the order table")
+            .id();
+        let (rt, tokens) = daemon(54);
+        let stuck = format!("/command/{table}/report_stuck");
+        let done = format!("/command/{table}/report_done");
+        let why = json!({"why": "the merge table will not take it"});
+
+        let (status, body) = send(&rt, &tokens, 54, "POST", &stuck, Some(why.clone())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "nothing carried: {body}");
+
+        let world = rt.hosted.get(WORLD).expect("hosted");
+        world.with_sim(|s| {
+            s.missions.assign(
+                &Runtime::body_id(54),
+                Mission::new(
+                    "Land the template.",
+                    vec![Todo::new("go to the watch room")],
+                    Origin::Lodged {
+                        by: "u_op".to_string(),
+                    },
+                ),
+            )
+        });
+        let (status, body) =
+            send(&rt, &tokens, 54, "POST", &done, Some(json!({"found": "x"}))).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "done is reported at the table: {body}"
+        );
+        let (status, body) = send(&rt, &tokens, 54, "POST", &stuck, Some(why)).await;
+        assert_ne!(status, StatusCode::NOT_FOUND, "in reach from afar: {body}");
     }
 
     /// **A station answers only under its own namespace prefix.** A chronicle
