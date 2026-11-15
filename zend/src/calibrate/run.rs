@@ -667,11 +667,28 @@ fn draft(
                 conv.finish_turn(handle, &resp)
                     .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
                 let answer = answer?;
+                let before = out.questions.len();
                 out.questions.extend(
                     questions(&answer, wanted)
                         .into_iter()
                         .filter(|q| seen.insert(q.to_lowercase())),
                 );
+                let got = out.questions.len() - before;
+                // **A prompt that writes far short of its count is said so, with
+                // what it wrote.** The draft is gone once read, and a unit whose
+                // later prompts kept nothing reads like one with a small budget.
+                if got * 2 < wanted {
+                    let opening: String = answer.chars().take(240).collect();
+                    tracing::warn!(
+                        target: "zend::calibrate",
+                        subject = %unit.subject,
+                        prompt = %ask.name,
+                        wanted,
+                        got,
+                        chars = answer.len(),
+                        "a calibration prompt wrote under half its questions: {opening:?}",
+                    );
+                }
                 out.wanted += wanted;
                 out.last_answer = answer;
             }
