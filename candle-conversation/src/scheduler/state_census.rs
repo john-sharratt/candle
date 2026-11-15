@@ -127,6 +127,10 @@ pub struct SlotRow {
     pub layer: String,
     pub group: String,
     pub slots: usize,
+    /// Whose each of those slots is, sorted: the timeline's `conv_id`, else
+    /// its label, else its raw id — so a slot nobody expected can be traced
+    /// to the conversation that holds it.
+    pub holders: Vec<String>,
 }
 
 /// Recurrent state, by the stores that hold it.
@@ -179,14 +183,18 @@ pub fn tally(
     rows
 }
 
-/// `rows` of slots, most first, ties by name.
-fn slot_rows(counts: HashMap<(String, String), usize>) -> Vec<SlotRow> {
-    let mut rows: Vec<SlotRow> = counts
+/// `rows` of slots, most first, ties by name; each row's holders sorted.
+fn slot_rows(held: HashMap<(String, String), Vec<String>>) -> Vec<SlotRow> {
+    let mut rows: Vec<SlotRow> = held
         .into_iter()
-        .map(|((layer, group), slots)| SlotRow {
-            layer,
-            group,
-            slots,
+        .map(|((layer, group), mut holders)| {
+            holders.sort();
+            SlotRow {
+                layer,
+                group,
+                slots: holders.len(),
+                holders,
+            }
         })
         .collect();
     rows.sort_by(|a, b| {
@@ -336,33 +344,37 @@ impl Scheduler {
         names: &[(SubstrateRef, GroupNames)],
     ) -> RecurrentBreakdown {
         let (live_stores, parked_stores) = self.model.recurrent_census();
-        let mut counts: HashMap<(String, String), usize> = HashMap::new();
+        let mut held: HashMap<(String, String), Vec<String>> = HashMap::new();
         for (slot, target) in &self.slot_targets {
-            let named = self
-                .slot_conversations
-                .get(slot)
+            let conv = self.slot_conversations.get(slot);
+            let named = conv
                 .and_then(|conv| names.iter().find(|(r, _)| r.is(conv)))
                 .and_then(|(_, n)| n.get(&target.group))
                 .cloned()
                 .unwrap_or_default();
-            *counts.entry(named).or_default() += 1;
+            let holder = conv
+                .and_then(|c| {
+                    c.conv_id_of(target.timeline)
+                        .or_else(|| c.label_of(target.timeline))
+                })
+                .unwrap_or_else(|| format!("timeline {}", target.timeline.raw()));
+            held.entry(named).or_default().push(holder);
         }
         let unbound = self
             .slot_conversations
             .keys()
             .filter(|s| !self.slot_targets.contains_key(s))
-            .count();
-        if unbound > 0 {
-            *counts
-                .entry(("(none)".to_string(), "(no projection target)".to_string()))
-                .or_default() += unbound;
-        }
+            .map(|s| format!("sequence {s:?}"));
+        held.entry(("(none)".to_string(), "(no projection target)".to_string()))
+            .or_default()
+            .extend(unbound);
+        held.retain(|_, holders| !holders.is_empty());
         RecurrentBreakdown {
             held_bytes,
             store_bytes: self.model.recurrent_store_bytes() as u64,
             live_stores,
             parked_stores,
-            slots: slot_rows(counts),
+            slots: slot_rows(held),
         }
     }
 }
@@ -475,18 +487,28 @@ mod tests {
         );
     }
 
-    /// Slots are listed most first, a tie broken by name.
+    /// Slots are listed most first, a tie broken by name, and each row names
+    /// its holders in order.
     #[test]
     fn slots_are_listed_most_first() {
-        let mut counts = HashMap::new();
-        counts.insert(("code_reading".to_string(), "files".to_string()), 3);
-        counts.insert(("code_review".to_string(), "code_reviews".to_string()), 16);
-        counts.insert(("dialogue".to_string(), "main".to_string()), 3);
-        let rows = slot_rows(counts);
+        let held_by =
+            |n: usize| -> Vec<String> { (0..n).rev().map(|i| format!("c{i:02}")).collect() };
+        let mut held = HashMap::new();
+        held.insert(
+            ("code_reading".to_string(), "files".to_string()),
+            held_by(3),
+        );
+        held.insert(
+            ("code_review".to_string(), "code_reviews".to_string()),
+            held_by(16),
+        );
+        held.insert(("dialogue".to_string(), "main".to_string()), held_by(3));
+        let rows = slot_rows(held);
         let order: Vec<(&str, usize)> = rows.iter().map(|r| (r.layer.as_str(), r.slots)).collect();
         assert_eq!(
             order,
             [("code_review", 16), ("code_reading", 3), ("dialogue", 3)]
         );
+        assert_eq!(rows[1].holders, ["c00", "c01", "c02"]);
     }
 }

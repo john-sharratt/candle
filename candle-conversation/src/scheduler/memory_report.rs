@@ -1021,6 +1021,7 @@ mod tests {
                         layer: "code_reading".into(),
                         group: "files".into(),
                         slots: 16,
+                        holders: (0..16).map(|i| format!("conv-{i:02}")).collect(),
                     }],
                 },
             },
