@@ -220,8 +220,9 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, … — what it
   declares, what depends on it), `tests` (what is tested where, and which
   code a test covers), `kernels` (`.cu`/`.cuh` — what a kernel computes, what
-  launches it), `code` (definitions, uses, the log lines and errors it writes,
-  purpose), `config` (each setting and what reads it), `docs` (the
+  launches it), `scripts` (`.sh`, `.ps1`, … — the commands it runs, the flags
+  it takes and passes, what it prints), `code` (definitions, uses, the log
+  lines and errors it writes, purpose), `config` (each setting and what reads it), `docs` (the
   document's own concepts, rules and decisions — never where a symbol it
   mentions is defined) and `default`. One set of prompts for every file asked
   `ARCHITECTURE.md` 32 questions about symbols other files define, each a vote
@@ -266,6 +267,13 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   its competition; the per-child background
   (`docs/provenance_score_normalization.md`) is what takes a case's base
   rate out of its vote.
+- **A draft that stops short is asked again.** A unit that keeps under half
+  of what its required parts asked for — an optional part's shortfall is
+  never held against it — fails as its own failure and is calibrated again by
+  a later pass, up to the same three tries as a draft that wrote none; on its
+  last, what it wrote is sealed. Sealed as they stood, 11 of 283 units
+  counted as calibrated on BlackWorld (2026-11-15) with as few as 1 question
+  of 41.
 - **Written by the unit.** Each unit is asked in a draft forked from its
   layer's base with the unit as its lineage — so it writes its questions with
   its whole content in front of it — without reasoning or tools. The draft is

@@ -90,6 +90,29 @@ const MAX_FAILURES: u32 = 3;
 /// How a calibration that failed for want of a question says so.
 const NO_QUESTION: &str = "the draft wrote no question";
 
+/// How a calibration whose draft stopped short says so.
+const SHORT_DRAFT: &str = "the draft wrote under half its questions";
+
+/// Whether a draft that kept `kept` questions, against the `required` its
+/// non-optional parts asked for, stopped short: under half.
+///
+/// A draft that stops early still writes something, and sealed as it stood it
+/// counted as calibrated: `zend/src/held_values.rs` was asked for 41 and kept
+/// 1, `npc-map/src/lift.rs` 56 and kept 16 — its later parts empty — and the
+/// sweep never came back to either (BlackWorld, 2026-11-15, 11 units in 283).
+/// An optional part's questions count toward `kept` but not `required`: it is
+/// told to write fewer rather than pad.
+fn falls_short(kept: usize, required: usize) -> bool {
+    kept * 2 < required
+}
+
+/// Whether `error` is the unit's own failure — its draft wrote nothing, or
+/// stopped short — which counts against it, rather than a decode lost to a
+/// full card, which says nothing about the unit.
+fn units_own_failure(error: &str) -> bool {
+    error.starts_with(NO_QUESTION) || error.starts_with(SHORT_DRAFT)
+}
+
 /// How many times `marker` has failed, as [`FAILED_KEY`] holds it in `recorded`.
 fn failures_of(recorded: Option<&str>, marker: &str) -> u32 {
     recorded
@@ -301,7 +324,7 @@ pub fn calibrate_layer(
                         // Only the unit's own failure counts against it: a
                         // decode lost to a full card says nothing about the
                         // unit, and is simply tried again.
-                        if format!("{e:#}").starts_with(NO_QUESTION) {
+                        if units_own_failure(&format!("{e:#}")) {
                             let tries = failures_of(unit.prior_failures.as_deref(), &unit.marker)
                                 .saturating_add(1);
                             if let Err(err) = engine.set_conversation_metadata(
@@ -491,6 +514,17 @@ fn calibrate_one(
         let opening: String = last.chars().take(160).collect();
         anyhow::bail!("{NO_QUESTION} ({} chars: {opening:?})", last.len());
     }
+    // **A short draft is tried again, but not forever**: on the unit's last
+    // try what it wrote is sealed, which is more than leaving it with none.
+    let last_try =
+        failures_of(unit.prior_failures.as_deref(), &unit.marker).saturating_add(1) >= MAX_FAILURES;
+    if falls_short(found.len(), drafted.required) && !last_try {
+        anyhow::bail!(
+            "{SHORT_DRAFT} ({} of {} required)",
+            found.len(),
+            drafted.required
+        );
+    }
     let t_think = Instant::now();
     let thought = thoughts(engine, frame, spec, &found)?;
     let think_ms = t_think.elapsed().as_millis() as u64;
@@ -652,6 +686,9 @@ fn thoughts(
 struct Drafted {
     questions: Vec<String>,
     wanted: usize,
+    /// Of `wanted`, what the parts that are not optional asked for — what a
+    /// draft that stopped short is judged against ([`falls_short`]).
+    required: usize,
     last_answer: String,
 }
 
@@ -718,6 +755,12 @@ fn draft(
                 .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
             let answer = answer?;
             let total: usize = wanted.iter().sum();
+            let required: usize = asks
+                .iter()
+                .zip(&wanted)
+                .filter(|(a, _)| a.questions.min > 0)
+                .map(|(_, &n)| n)
+                .sum();
             let names: Vec<&str> = asks.iter().map(|a| a.name.as_str()).collect();
             let mut seen: HashSet<String> = HashSet::new();
             let mut kept: Vec<String> = Vec::new();
@@ -748,6 +791,7 @@ fn draft(
             Ok(Drafted {
                 questions: kept,
                 wanted: total,
+                required,
                 last_answer: answer,
             })
         },
@@ -836,6 +880,34 @@ mod tests {
     /// unit with a turn still to arrive, and one cut off mid-thought, are
     /// found but not ready; a calibration and an unkeyed conversation of the
     /// group are not units.
+    /// **A draft that kept under half of what its required parts asked for
+    /// stopped short** — `held_values.rs` keeping 1 of 41, `lift.rs` 16 of 53;
+    /// half or more is a draft that wrote what it could, and a unit asked for
+    /// nothing required cannot fall short.
+    #[test]
+    fn a_draft_under_half_its_required_questions_falls_short() {
+        assert!(falls_short(1, 41));
+        assert!(falls_short(16, 53));
+        assert!(!falls_short(20, 40));
+        assert!(!falls_short(27, 53));
+        assert!(!falls_short(0, 0));
+    }
+
+    /// **Only the unit's own failures count against it**: a draft that wrote
+    /// nothing or stopped short, not a decode lost to a full card.
+    #[test]
+    fn only_the_units_own_failures_count_against_it() {
+        assert!(units_own_failure(
+            "the draft wrote no question (12 chars: \"I'll read it\")"
+        ));
+        assert!(units_own_failure(
+            "the draft wrote under half its questions (1 of 41 required)"
+        ));
+        assert!(!units_own_failure(
+            "decode: the turn made no progress for 60 s: it was not admitted, or was lost"
+        ));
+    }
+
     #[test]
     fn a_unit_is_ready_only_whole_and_finished() {
         let conv = Conversation::ephemeral();

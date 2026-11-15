@@ -893,11 +893,11 @@ layers:
             - name: verifies
               questions: { per_tokens: 300, min: 4, max: 32 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about the tests you just read in `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a function, type, behaviour or case the tests exercise, and asks where it is tested, what a test checks about it, what input or state it is tested with, or what a failing test there means. Spread them across as many different things under test as the file has, and ask about each only once. Some short, like "where is `tier_fits` tested?", some longer.
+                Write <<n>> questions someone working in this workspace might ask about the tests you just read in `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a function, type, behaviour or case the tests exercise, and asks where it is tested, what a test checks about it, what input or state it is tested with, or what a failing test there means. Name a test by its name, never by a line number. Spread them across as many different things under test as the file has, and ask about each only once. Some short, like "where is `tier_fits` tested?", some longer.
             - name: covers
               questions: { per_tokens: 500, min: 2, max: 16 }
               prompt: |
-                Now write <<n>> more questions, about which code the tests in `<<path>>` cover and depend on: which module or function each test calls, what fixture or helper it builds on, and which test has to change when that code changes. Ask nothing you asked above.
+                Now write <<n>> more questions, about which code the tests in `<<path>>` cover and depend on: which module or function each test calls, what fixture or helper it builds on, and which test has to change when that code changes. Name a test by its name, never by a line number. Ask nothing you asked above.
             - name: purpose
               questions: { per_tokens: 4000, min: 1, max: 4 }
               prompt: |
@@ -920,17 +920,38 @@ layers:
               questions: { per_tokens: 3000, min: 2, max: 6 }
               prompt: |
                 Last, write <<n>> questions about `<<path>>` as a whole: what part of the model it runs, why it is built the way it is, and when someone would need to read or change it. Ask nothing you asked above.
+        # A script: the commands it runs, the flags it takes and passes, what
+        # it prints. Asked as code, a script's flags were asked twice each —
+        # what `--port` does, then what it affects (BlackWorld, 2026-11-15).
+        - name: scripts
+          files:
+            - '\.(sh|bash|zsh|ps1|psm1|bat|cmd)$'
+          prompts:
+            - name: commands
+              questions: { per_tokens: 200, min: 3, max: 24 }
+              prompt: |
+                Write <<n>> questions someone working in this workspace might ask about the script you just read, `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a command it runs, a flag or argument it takes or passes, or a variable, function or file it uses, and asks what it does, what it is set to, or why the script needs it. Spread them across as many different commands, flags and variables as the script has, and ask about each only once.
+            - name: outputs
+              questions: { per_tokens: 600, min: 0, max: 12 }
+              prompt: |
+                Now write up to <<n>> questions someone reading the output of `<<path>>` would ask: each quotes, exactly as written there, a message it prints, a check it makes or a file it writes, and asks what causes it or what it means. If the script has fewer, write fewer; if it has none, write none. Ask nothing you asked above.
+            - name: purpose
+              questions: { per_tokens: 4000, min: 1, max: 3 }
+              prompt: |
+                Last, write <<n>> questions about `<<path>>` as a whole: what it is for, and when someone would run it or need to change it. Ask nothing you asked above.
         # Source code: what it defines, how that is connected, what it
         # reports, what it is for.
         - name: code
           files:
-            - '\.(rs|py|pyi|ts|tsx|js|jsx|mjs|cjs|go|c|cc|cpp|cxx|h|hh|hpp|java|kt|cs|swift|rb|php|lua|sh|bash|ps1|sql|zig)$'
+            - '\.(rs|py|pyi|ts|tsx|js|jsx|mjs|cjs|go|c|cc|cpp|cxx|h|hh|hpp|java|kt|cs|swift|rb|php|lua|sql|zig)$'
           prompts:
-            # "where is `tier_fits` defined?" — about a third of them.
+            # "where is `tier_fits` defined?" — about a third of the names,
+            # asked only that. Asked as a third of the questions, it came back
+            # as a "where" twin of every "what is" (BlackWorld, 2026-11-15).
             - name: definitions
               questions: { per_tokens: 300, min: 4, max: 28 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. Each one names, exactly as written there, a function, type, trait, constant, field or setting it defines, and asks what it is, what it does or returns, what its arguments or fields mean, or where it is defined — about a third of them asking where. Spread them across as many different names as the file has, and ask about each name only once. Ask as different developers would: some short, like "where's `tier_fits` defined?", some longer. Never ask about module visibility, test names or formatting.
+                Write <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. Each one names, exactly as written there, a function, type, trait, constant, field or setting it defines, and asks one thing about it: what it is, what it does or returns, what its arguments or fields mean, or where it is defined. For about a third of the names, the one thing asked is where it is defined. Spread them across as many different names as the file has, and ask about each name only once — never a second question about a name already asked about. Ask as different developers would: some short, like "where's `tier_fits` defined?", some longer. Never ask about module visibility, test names or formatting.
             # "what calls `tier_fits`?", "what breaks if it changes?" — the
             # transitive questions.
             - name: uses
@@ -966,7 +987,11 @@ layers:
               prompt: |
                 Last, write <<n>> questions about `<<path>>` as a whole: what it configures, and when someone would need to change it. Ask nothing you asked above.
         # Prose: its own concepts, rules and decisions — never the symbols it
-        # mentions that other files define.
+        # mentions that other files define, and never a counterfactual. Asked
+        # "what has to change if that rule changes", `AGENTS.md` wrote 13
+        # hypotheticals naming paths it never mentions — "which file in
+        # `candle-core/src/vram/` would need modification" (BlackWorld,
+        # 2026-11-15).
         - name: docs
           files:
             - '\.(md|markdown|mdx|txt|rst|adoc)$'
@@ -978,11 +1003,11 @@ layers:
             - name: implements
               questions: { per_tokens: 800, min: 2, max: 16 }
               prompt: |
-                Now write up to <<n>> more questions, about where what `<<path>>` describes is carried out: which part of the system follows a rule or decision it states, what has to change if that rule changes, and what goes wrong when it is broken. Ask nothing you asked above.
+                Now write up to <<n>> more questions, about where what `<<path>>` describes is carried out: which part of the system follows a rule or decision it states, what has to change if that rule changes, and what goes wrong when it is broken. Ask only about parts of the system the document itself names — a file, module, function or component written there — and only as things stand: never "if this were changed, which file would…", and never a path or mechanism the document does not mention. Write fewer rather than invent one. Ask nothing you asked above.
             - name: architecture
               questions: { per_tokens: 1500, min: 2, max: 16 }
               prompt: |
-                Last, write <<n>> questions about the design `<<path>>` sets out as a whole: why it is built this way, what it trades away, how its parts fit together, and when someone would need to read it. Ask nothing you asked above.
+                Last, write <<n>> questions about the design `<<path>>` sets out as a whole: why it is built this way, what it trades away, how its parts fit together, and when someone would need to read it. Ask only about what the document itself sets out, never a mechanism it does not describe. Ask nothing you asked above.
         # Everything else.
         - name: default
           prompts:

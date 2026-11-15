@@ -10057,6 +10057,8 @@ mod projection_schema_tests {
         );
         assert_eq!(asked("candle/zend/src/prompts/projection.yaml").0, "config");
         assert_eq!(asked("candle/docs/unbounded_agents.md").0, "docs");
+        assert_eq!(asked("candle/tools/quality_harness.sh").0, "scripts");
+        assert_eq!(asked("candle/keep/install.ps1").0, "scripts");
         assert_eq!(asked("candle/LICENSE-MIT").0, "default");
         assert!(calibrate.profiles.iter().all(|p| p
             .asks

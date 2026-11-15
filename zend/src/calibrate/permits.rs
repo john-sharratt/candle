@@ -127,9 +127,12 @@ mod tests {
                             submitted += 1;
                         }
                         std::thread::yield_now();
-                        if held.pop().is_some() {
+                        // Counted out before the place goes back, so the
+                        // count never trails a place another thread holds.
+                        if let Some(place) = held.pop() {
                             now.fetch_sub(1, Ordering::SeqCst);
                             done.fetch_add(1, Ordering::SeqCst);
+                            drop(place);
                         }
                     }
                 });
