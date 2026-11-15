@@ -1391,12 +1391,7 @@ impl RegionPool {
     /// `next` because the free list is lowest-first: live arenas stay
     /// left-packed, which is the property that makes the boundary movable at all.
     fn live_watermark(&self) -> usize {
-        let free: std::collections::HashSet<usize> =
-            self.free.iter().map(|Reverse(i)| *i).collect();
-        (0..self.next)
-            .rev()
-            .find(|i| !free.contains(i))
-            .map_or(0, |i| i + 1)
+        watermark_of(self.next, self.free.iter().map(|Reverse(i)| *i))
     }
 
     /// Move the weight side's left edge and re-derive the region count.
@@ -3327,6 +3322,52 @@ pub fn lowest_free_region(ordinal: usize) -> Option<usize> {
         .and_then(|pool| pool.free.peek().map(|Reverse(i)| *i))
 }
 
+/// One past the highest region of `0..next` not in `free` — the arena
+/// frontier — or `0` when every one is free.
+///
+/// **The free regions at the top, walked down, and no set built.** The
+/// frontier is found from the free indices sorted high to low: each one
+/// that is the region just under the frontier so far moves it down, and the
+/// first that is not ends the walk. It used to collect every free index into
+/// a `HashSet` and probe it from `next` down, on every reading — and admission
+/// read it several times per offer, under the pool's lock.
+fn watermark_of(next: usize, free: impl Iterator<Item = usize>) -> usize {
+    let mut top: Vec<usize> = free.filter(|&i| i < next).collect();
+    top.sort_unstable_by(|a, b| b.cmp(a));
+    let mut watermark = next;
+    for i in top {
+        if i + 1 != watermark {
+            break;
+        }
+        watermark = i;
+    }
+    watermark
+}
+
+/// What admission reads of a device's KV side, and nothing else: the regions
+/// there are, those live, the arena frontier, and the weight side's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionGround {
+    pub total: usize,
+    pub live: usize,
+    pub live_watermark: usize,
+    pub weight_bytes: usize,
+}
+
+/// [`region_stats`]'s four figures admission reads per offer, without the free
+/// list's census, the span's layout or the reservation's queries the rest of
+/// it computes — a lock and a walk of the free regions at the frontier.
+/// `None` without a reservation.
+pub fn region_ground(ordinal: usize) -> Option<RegionGround> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&ordinal).map(|pool| RegionGround {
+        total: pool.total,
+        live: pool.live,
+        live_watermark: pool.live_watermark(),
+        weight_bytes: (pool.span_end() - pool.weight_floor) as usize,
+    })
+}
+
 pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
     let map = pools().lock().unwrap_or_else(|e| e.into_inner());
     map.get(&ordinal).map(|pool| RegionStats {
@@ -3629,6 +3670,28 @@ mod partition_tests {
         );
         assert_eq!((p.kv, p.transient, p.regions_free), (4 * R, 2 * R, 0));
         assert_eq!(p.sum(), span);
+    }
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::watermark_of;
+
+    /// **The frontier is one past the highest region not free.** Free regions
+    /// at the top bring it down one by one; a hole below a live region does
+    /// not; every region free is a frontier of zero.
+    #[test]
+    fn the_frontier_is_one_past_the_highest_region_not_free() {
+        assert_eq!(watermark_of(10, [9, 8, 3].into_iter()), 8);
+        assert_eq!(watermark_of(10, [3, 1].into_iter()), 10, "holes only");
+        assert_eq!(watermark_of(10, [7, 9].into_iter()), 9, "8 is live");
+        assert_eq!(watermark_of(4, [0, 1, 2, 3].into_iter()), 0, "all free");
+        assert_eq!(watermark_of(0, [].into_iter()), 0);
+        assert_eq!(
+            watermark_of(5, [12, 4, 6].into_iter()),
+            4,
+            "free indices past `next` are not in the walk"
+        );
     }
 }
 

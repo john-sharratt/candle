@@ -35,11 +35,11 @@
 //! reason [`admit::Ground::resident_weights`] gives: it moves under the fill's
 //! feet from places admission cannot see.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::admission::prefill_cost_bytes;
 use super::admission_split::AdmitPart;
-use super::admit::{Budget, Cost, Ground, Headroom, Kind};
+use super::admit::{Budget, Cost, FillPart, Ground, Headroom, Kind};
 use super::band::rank;
 use super::interleave;
 use super::{Scheduler, SequenceId, WaveMember};
@@ -664,6 +664,15 @@ impl Ground for AdmitPass<'_> {
             .iter()
             .map(|p| p.work.submitted_at);
         queued.chain(pending).map(weight).sum::<f64>().max(1.0)
+    }
+
+    fn charge(&mut self, part: FillPart, took: Duration) {
+        let part = match part {
+            FillPart::Peek => AdmitPart::Peek,
+            FillPart::Residency => AdmitPart::Residency,
+            FillPart::Judge => AdmitPart::Judge,
+        };
+        self.sched.wave_stats.admission_split.part(part, took);
     }
 
     fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {

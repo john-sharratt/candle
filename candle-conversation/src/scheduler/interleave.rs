@@ -12,7 +12,9 @@
 
 use std::sync::atomic::AtomicU64;
 
-use candle_nn::kv_cache::{region_stats, RegionStats, MIN_ELASTIC_RESERVE, REGION_BYTES};
+use candle_nn::kv_cache::{
+    region_ground, region_stats, RegionGround, RegionStats, MIN_ELASTIC_RESERVE, REGION_BYTES,
+};
 
 /// The device ordinal every figure here is read from.
 ///
@@ -24,6 +26,13 @@ use candle_nn::kv_cache::{region_stats, RegionStats, MIN_ELASTIC_RESERVE, REGION
 /// defence at all, silently.
 fn stats() -> Option<RegionStats> {
     region_stats(RESERVATION_DEVICE)
+}
+
+/// The four figures admission reads per offer ([`region_ground`]) — what
+/// [`effective_weight_zone_bytes`] and [`stranded_hole_bytes`] are made of,
+/// read without the rest of [`stats`]'s census under the pool's lock.
+fn ground() -> Option<RegionGround> {
+    region_ground(RESERVATION_DEVICE)
 }
 
 /// The reservation's device. Zero because the engine builds one reservation on
@@ -81,7 +90,7 @@ pub(super) fn weight_zone_bytes() -> Option<u64> {
 /// 7.37 GB window tier found 7.06 GB above the frontier. Holes are credited to
 /// the claims that will land in them instead — see [`stranded_hole_bytes`].
 pub(super) fn effective_weight_zone_bytes(standing_tier: usize) -> Option<u64> {
-    let r = stats()?;
+    let r = ground()?;
     Some(achievable_weight_bytes(
         r.total,
         r.live_watermark.max(r.live),
@@ -95,7 +104,7 @@ pub(super) fn effective_weight_zone_bytes(standing_tier: usize) -> Option<u64> {
 /// before any of them moves the frontier, and so the part of a claim that
 /// dislodges no weight.
 pub(super) fn stranded_hole_bytes() -> u64 {
-    stats().map_or(0, |r| {
+    ground().map_or(0, |r| {
         (r.live_watermark.saturating_sub(r.live) * REGION_BYTES) as u64
     })
 }

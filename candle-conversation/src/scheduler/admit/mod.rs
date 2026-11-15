@@ -89,6 +89,8 @@ pub(crate) use gate::Headroom;
 pub(crate) use order::{Kind, Order};
 pub(crate) use rate::{Admission, WaveRate};
 
+use std::time::{Duration, Instant};
+
 use crate::projection::DecodePriority;
 
 /// The wave's opening terms, read once per fill from the settled device.
@@ -213,6 +215,24 @@ pub(crate) trait Ground {
     fn close_rows(&mut self) -> bool {
         false
     }
+
+    /// File `took` of this fill as `part`, for the window's admission split. A
+    /// ground that keeps no split ignores it.
+    fn charge(&mut self, part: FillPart, took: Duration) {
+        let _ = (part, took);
+    }
+}
+
+/// The parts of a fill [`Ground::charge`] is told of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillPart {
+    /// Finding the band's next offer and pricing it ([`Ground::peek`]).
+    Peek,
+    /// Reading the residency an offer is judged against
+    /// ([`Ground::resident_weights`]).
+    Residency,
+    /// The rate model's verdict on an offer, and its refusal's log line.
+    Judge,
 }
 
 /// What one fill pass took.
@@ -379,7 +399,13 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
         // The band, FIFO, until it runs dry or the wave stops paying. A refusal
         // ends this band and not the pass: a later band's work is a different
         // size and may still be worth carrying.
-        while let Some(cost) = ground.peek(kind, prio) {
+        loop {
+            let t_peek = Instant::now();
+            let offered = ground.peek(kind, prio);
+            ground.charge(FillPart::Peek, t_peek.elapsed());
+            let Some(cost) = offered else {
+                break;
+            };
             let total = cost.total();
             // The truth as of this offer, and what this offer would leave of
             // it — its region claim **and its tier**, which the weight side
@@ -387,8 +413,11 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
             // per forward but published per wave, and the growth term is
             // bounded by it, so a wave that widens holds that ground against
             // the weight side for as long as it stays that wide.
+            let t_residency = Instant::now();
             let before = ground.resident_weights();
+            ground.charge(FillPart::Residency, t_residency.elapsed());
             let after = before.saturating_sub(cost.dislodged_bytes());
+            let t_judge = Instant::now();
             let allowed = match kind {
                 // A decode when none is running is the one case with its own
                 // rule — it keeps the expert cache warm. It is also the only
@@ -519,6 +548,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                             | rate::Refusal::Worse { .. }),
                         ) if cost.rows > 0 && ground.close_rows() => {
                             log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
+                            ground.charge(FillPart::Judge, t_judge.elapsed());
                             continue;
                         }
                         rate::Admit::Refused(r) => {
@@ -603,6 +633,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                             r @ (rate::Refusal::Saturated { .. } | rate::Refusal::Worse { .. }),
                         ) if kind == Kind::Prefill && !cost.ahead && ground.close_rows() => {
                             log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
+                            ground.charge(FillPart::Judge, t_judge.elapsed());
                             continue;
                         }
                         rate::Admit::Refused(r) => {
@@ -621,6 +652,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                     }
                 }
             };
+            ground.charge(FillPart::Judge, t_judge.elapsed());
             if !allowed {
                 break;
             }
