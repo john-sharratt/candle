@@ -2577,6 +2577,10 @@ struct WaveStats {
     /// Telemetry phase this window: the previous window's flush, which runs
     /// after that window closed and so lands in this one. Microseconds.
     telemetry_us: u64,
+    /// The admission pass run mid-quantum, inside the decode quantum: a
+    /// sub-slice of decode's time, carved out of it into the allocation band.
+    /// Microseconds.
+    mid_promote_us: u64,
     /// Sync phase this window: deliberate GPU/persistence waits ([`WAIT_US`],
     /// swapped in at flush). Carved out of the compute phases + blocked so a
     /// device-sync / hot→warm flush stall is its own band, not hidden decode/prefill.
@@ -2644,6 +2648,7 @@ impl WaveStats {
             compaction_us: 0,
             compaction_split: compaction_split::CompactionSplit::default(),
             telemetry_us: 0,
+            mid_promote_us: 0,
             wait_ms: 0,
             maint_ms: 0,
             drain_prefill_ms: 0,
@@ -2749,6 +2754,11 @@ impl WaveStats {
     /// see [`Self::telemetry_us`].
     fn add_telemetry(&mut self, us: u64) {
         self.telemetry_us += us;
+    }
+
+    /// Accumulate one mid-quantum admission pass — see [`Self::mid_promote_us`].
+    fn add_mid_promote(&mut self, us: u64) {
+        self.mid_promote_us += us;
     }
 
     /// Accumulate one scope-ingest seal's sub-step timings (microseconds).
@@ -3143,6 +3153,7 @@ impl WaveStats {
         self.compaction_us = 0;
         self.compaction_split = compaction_split::CompactionSplit::default();
         self.telemetry_us = 0;
+        self.mid_promote_us = 0;
         self.wait_ms = 0;
         self.maint_ms = 0;
         self.drain_prefill_ms = 0;
@@ -3200,7 +3211,10 @@ impl WaveStats {
             .saturating_sub(cobatched_prefill + cobatched_section);
         let mut prefill_dur = self.prefill_ms + cobatched_prefill + drain_prefill;
         let mut section_dur = self.section_ms + cobatched_section;
-        let alloc_dur = self.promote_ms;
+        // The loop's own admission pass, plus the one run inside the decode
+        // quantum — carved out of decode, where its wall clock already is.
+        let alloc_dur =
+            self.promote_ms + carve_ms(self.mid_promote_us / 1000, &mut [&mut decode_dur]);
         let accounted =
             self.drain_ms + self.promote_ms + self.decode_ms + self.prefill_ms + self.section_ms;
         let mut blocked_dur = (window_ms as u64).saturating_sub(accounted);

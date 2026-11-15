@@ -2,7 +2,7 @@
 //! named, and only what nothing timed is left as `blocked`.
 
 use super::phase_ring::snapshot;
-use super::WaveStats;
+use super::{WavePhase, WaveStats};
 
 /// The window's bands as `(kind, dur_ms)`, found by a `window_ms` no other
 /// test pushes — the ring is process-global.
@@ -53,6 +53,25 @@ fn compaction_and_the_flush_are_named_apart_from_housekeeping() {
             ("housekeeping", 5),
             ("telemetry", 9)
         ]
+    );
+}
+
+/// **The admission pass inside the decode quantum is carved out of decode,
+/// never drawn beside it.** A 1,243 ms window with 100 ms of decode, 30 ms of
+/// which was a mid-quantum admission pass, draws 70 ms of decode, 30 ms of
+/// allocation and 1,143 ms of `blocked` — the decode quantum's 100 ms counted
+/// once.
+#[test]
+fn the_mid_quantum_admission_is_carved_out_of_decode() {
+    let mut w = WaveStats::new();
+    w.add_phase(WavePhase::Decode, 100);
+    w.add_mid_promote(30_000);
+    w.push_phase_window(1_243);
+    let mut bands = bands_of(1_243);
+    bands.sort();
+    assert_eq!(
+        bands,
+        vec![("allocation", 30), ("blocked", 1_143), ("decode", 70)]
     );
 }
 

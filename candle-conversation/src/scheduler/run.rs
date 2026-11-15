@@ -581,8 +581,10 @@ impl Scheduler {
             let t_promote = Instant::now();
             let _g = profile::span("mid:promote");
             self.promote_new_prefills();
+            // Inside the decode quantum, so it is carved out of decode into the
+            // allocation band, never added beside it.
             self.wave_stats
-                .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
+                .add_mid_promote(t_promote.elapsed().as_micros() as u64);
         }
         // Bound KV production to the hot→warm drain rate across the slice, not just
         // once per quantum. Self-gated on an active ingest so a plain dialogue decode
