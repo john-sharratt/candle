@@ -1296,6 +1296,7 @@ fn reach_out(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome 
 mod tests {
     use super::*;
     use crate::engine::act::Act;
+    use crate::engine::talk::hand_off::HAND_OFF_ACTS;
     use crate::engine::zen_task;
     use crate::sim::upkeep::{CONTACT_EVERY, RESERVE};
     use npc_map::world::Where;
@@ -1473,6 +1474,11 @@ mod tests {
             // A mission's task acts call zend, also on the async path
             // (`Runtime::zen_task_act`).
             if zen_task::is_mine(name) {
+                continue;
+            }
+            // A conversation's hand-off is performed as the world's `message`
+            // (`talk::hand_off::as_performed`), which is dispatched here.
+            if HAND_OFF_ACTS.iter().any(|t| t.name == name) {
                 continue;
             }
             assert!(

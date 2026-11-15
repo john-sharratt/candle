@@ -1164,7 +1164,9 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     | Availability::AtLift
                     | Availability::AtLanding
                     // A grant is the carried mission's, not the channel's.
-                    | Availability::Granted => true,
+                    | Availability::Granted
+                    // A conversation's own act is the thread's, whatever its channel.
+                    | Availability::OnThread => true,
                     Availability::PhysicalOnly => **m == Mode::Physical,
                     Availability::MessagingOnly => m.remote(),
                     Availability::Pictorial => m.carries_pictures(),
@@ -1238,6 +1240,7 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     Availability::Granted => {
                         json!("a mission that grants it, in that mission's room in a mirrored place")
                     }
+                    Availability::OnThread => json!("a conversation's decision"),
                 },
                 // Every station, named, however many there are. The `needs`
                 // line above summarises for the table; this is what the detail

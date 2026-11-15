@@ -10,6 +10,7 @@
 //! | [`critical`] | a critical step: a request, then a yes |
 //! | [`decide`] | where a decision's words go, and the decision restated |
 //! | [`guard`] | the conversation's own guards |
+//! | [`hand_off`] | a message to somebody other than the party, which does not end the decision |
 //! | [`key`] | who a conversation is with, and its timeline |
 //! | [`orders`] | its mission acts, checked and applied where they land |
 //! | [`runner`] | every conversation held here, and whose turn is due |
@@ -25,6 +26,7 @@ pub mod clock;
 pub mod critical;
 pub mod decide;
 pub mod guard;
+pub mod hand_off;
 pub mod key;
 pub mod orders;
 pub mod runner;

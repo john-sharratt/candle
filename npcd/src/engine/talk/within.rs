@@ -4,7 +4,8 @@
 //!
 //! The party is the conversation's whole company: `reply`, `sign_off`,
 //! `promise` and `remind` bind them and nobody else, and a hand-off through
-//! `message` or `reach_out` goes to anybody on the phone **but** them. Its
+//! `message_someone_else` or `reach_out` goes to anybody on the phone **but**
+//! them (`hand_off`). Its
 //! cooling is its own — a person is never made to wait on the character's
 //! cooldowns, and the character's are never stamped by a conversation (§8).
 
@@ -18,7 +19,7 @@ pub const ACTS: &[&str] = &[
     "reflect",
     "promise",
     "remind",
-    "message",
+    "message_someone_else",
     "reach_out",
     "mission_add",
     "mission_edit",
@@ -38,7 +39,7 @@ pub const MISSION_ACTS: &[&str] = &[
 /// The acts that keep a conversation talking, struck once an NPC↔NPC
 /// activation has run its turns (§8): what is left is the journal or a
 /// goodbye.
-pub const TALKING_ACTS: &[&str] = &["reply", "message"];
+pub const TALKING_ACTS: &[&str] = &["reply", "message_someone_else"];
 
 /// The conversation a turn belongs to, as the turn's catalog needs it.
 #[derive(Clone, Debug)]
@@ -174,11 +175,29 @@ mod tests {
                 "sign_off",
                 "reflect",
                 "promise",
-                "message",
+                "message_someone_else",
                 "reach_out"
             ]
             .map(String::from)
         );
+    }
+
+    /// **The conversation's message is for somebody else, and only the
+    /// conversation is offered it**: the main loop keeps `message`.
+    #[test]
+    fn only_a_conversation_is_offered_a_message_to_someone_else() {
+        let party = mira();
+        let thread_specs = specs_within(
+            Catalog::THREAD.mode,
+            &zen().on_thread(&thread(&party, "Mira")),
+        );
+        assert!(thread_specs
+            .iter()
+            .any(|s| s.name == "message_someone_else"));
+        assert!(!thread_specs.iter().any(|s| s.name == "message"));
+        let main_specs = specs_within(Catalog::THREAD.mode, &zen());
+        assert!(!main_specs.iter().any(|s| s.name == "message_someone_else"));
+        assert!(main_specs.iter().any(|s| s.name == "message"));
     }
 
     #[test]
@@ -209,7 +228,7 @@ mod tests {
                 "sign_off",
                 "reflect",
                 "promise",
-                "message",
+                "message_someone_else",
                 "reach_out",
                 "mission_add",
                 "mission_edit",
@@ -242,7 +261,7 @@ mod tests {
                 "sign_off",
                 "reflect",
                 "promise",
-                "message",
+                "message_someone_else",
                 "reach_out",
                 "mission_add",
                 "mission_edit",
@@ -313,7 +332,7 @@ mod tests {
                 "reflect",
                 "promise",
                 "remind",
-                "message",
+                "message_someone_else",
                 "reach_out"
             ]
             .map(String::from)

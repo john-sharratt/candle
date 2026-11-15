@@ -27,9 +27,9 @@ use crate::engine::identity::{self, Deliberation};
 use crate::engine::prompt::{Persona, Stance, STANCE_SELECTOR};
 use crate::engine::reflect::plain_prose;
 use crate::engine::talk::catchup::{self, CatchUp};
-use crate::engine::talk::decide;
 use crate::engine::talk::key::{self, Party};
 use crate::engine::talk::templates::Destination;
+use crate::engine::talk::{decide, hand_off};
 use crate::engine::tools::{self, Catalog, Within};
 
 /// The most a line to the party decodes: one Discord message.
@@ -238,20 +238,42 @@ impl Minds {
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        // The decision, on a fork that writes nothing.
-        let grammar = self.grammar_for(Deliberation::None, Catalog::THREAD, within);
-        let options = TurnOptions {
-            assistant_prefill: self.opening(Deliberation::None, grammar.is_some()),
-            turn_grammar: grammar.map(TurnGrammar::of),
-            sampling: Some(self.sampling_for(Deliberation::None)),
-            selection: selection.clone(),
-            ..Default::default()
-        };
-        let decided = asker
-            .ask(&user, turn.band, AskScope::Whole, options)
-            .await?;
-        let parsed = act::parse(&decided.text, &act_specs(Catalog::THREAD, within));
-        let to = decide::destination(&parsed.acts);
+        // The decision, on a fork that writes nothing, with the thread's acts
+        // shown. **A hand-off does not end it**: one that only sent something
+        // to somebody else is asked again with what it sent struck, and goes on
+        // to what is said to the party. Each round strikes at least one
+        // hand-off, so it ends once they are all spent.
+        let mut acts: Vec<Act> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        let mut openings: Vec<String> = Vec::new();
+        let mut left = within.clone();
+        let mut asked = user.clone();
+        loop {
+            let mut shown = selection.clone();
+            tools::show_within(&mut shown, Catalog::THREAD.mode, &left);
+            let grammar = self.grammar_for(Deliberation::None, Catalog::THREAD, &left);
+            let options = TurnOptions {
+                assistant_prefill: self.opening(Deliberation::None, grammar.is_some()),
+                turn_grammar: grammar.map(TurnGrammar::of),
+                sampling: Some(self.sampling_for(Deliberation::None)),
+                selection: shown,
+                ..Default::default()
+            };
+            let decided = asker
+                .ask(&asked, turn.band, AskScope::Whole, options)
+                .await?;
+            let parsed = act::parse(&decided.text, &act_specs(Catalog::THREAD, &left));
+            openings.push(decided.text.chars().take(DECISION_SHOWN).collect());
+            refused.extend(parsed.rejected.iter().map(|r| r.line()));
+            let handed = decide::handed_off_only(&parsed.acts);
+            acts.extend(parsed.acts);
+            let Some(spent) = handed else {
+                break;
+            };
+            left = hand_off::struck(&left, &spent);
+            asked = format!("{user}\n\n{}", decide::after_hand_off(turn.party, &acts));
+        }
+        let to = decide::destination(&acts);
 
         // The words: the real turn, sealed, shown no act to call.
         let mut sel = selection;
@@ -270,7 +292,7 @@ impl Minds {
             selection: sel,
             ..Default::default()
         };
-        let said = format!("{user}\n\n{}", decide::restated(turn.party, &parsed.acts));
+        let said = format!("{user}\n\n{}", decide::restated(turn.party, &acts));
         let response = talk
             .sequence
             .send_turn_with_options_async(&said, options)
@@ -289,18 +311,17 @@ impl Minds {
                 tokio::time::sleep,
             )
             .await;
-        // What it decided, by name, what the parse refused, and the decision's
+        // What it decided, by name, what the parse refused, and each round's
         // own opening: a conversation that keeps going to its journal when it
         // was asked a question shows here whether it chose to or could not.
-        let named: Vec<&str> = parsed.acts.iter().map(|a| a.tool).collect();
-        let refused: Vec<String> = parsed.rejected.iter().map(|r| r.line()).collect();
-        let opening: String = decided.text.chars().take(DECISION_SHOWN).collect();
+        let named: Vec<&str> = acts.iter().map(|a| a.tool).collect();
         tracing::info!(
             npc_id,
             to = ?to,
             acts = ?named,
             rejected = ?refused,
-            decided = %opening,
+            rounds = openings.len(),
+            decided = %openings.join(" | "),
             ms = started.elapsed().as_millis() as u64,
             "a conversation's turn"
         );
@@ -308,8 +329,8 @@ impl Minds {
             anyhow::bail!("the conversation's words came back empty");
         }
         Ok(Spoken {
-            acts: parsed.acts,
-            rejected: parsed.rejected.iter().map(|r| r.line()).collect(),
+            acts,
+            rejected: refused,
             to,
             words,
         })

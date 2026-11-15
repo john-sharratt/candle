@@ -7,7 +7,51 @@
 //! decides; a list with none of them goes to the journal.
 
 use crate::engine::act::Act;
+use crate::engine::talk::hand_off::HAND_OFFS;
 use crate::engine::talk::templates::Destination;
+
+/// The hand-offs `acts` made when they say nothing to the party: none of
+/// `reply`, `sign_off` or `reflect`, and at least one act to somebody else
+/// (`hand_off`). `None` when the decision answered, or handed nothing off.
+///
+/// **A hand-off does not end the decision.** Asked again with these struck,
+/// the turn goes on to what is said to the party.
+pub fn handed_off_only(acts: &[Act]) -> Option<Vec<&'static str>> {
+    let answers = acts
+        .iter()
+        .any(|a| matches!(a.tool, "reply" | "sign_off" | "reflect"));
+    let handed: Vec<&'static str> = acts
+        .iter()
+        .map(|a| a.tool)
+        .filter(|t| HAND_OFFS.contains(t))
+        .collect();
+    (!answers && !handed.is_empty()).then_some(handed)
+}
+
+/// What the decision is told when it is asked again after handing off: what it
+/// already sent, and that the party still waits on it.
+pub fn after_hand_off(party: &str, sent: &[Act]) -> String {
+    let what: Vec<String> = sent
+        .iter()
+        .filter(|a| HAND_OFFS.contains(&a.tool))
+        .map(|a| {
+            let arg = |k: &str| {
+                a.args
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .trim_end_matches('.')
+                    .to_string()
+            };
+            format!("to {}: {}", arg("to"), arg("intent"))
+        })
+        .collect();
+    format!(
+        "You have sent {}. {party} is still waiting on you: decide what you say to them.",
+        what.join("; ")
+    )
+}
 
 /// Where a decision's words go.
 pub fn destination(acts: &[Act]) -> Destination {
@@ -103,6 +147,32 @@ mod tests {
         assert_eq!(destination(slice::from_ref(&promise)), Destination::Journal);
         assert_eq!(destination(&[]), Destination::Journal);
         assert_eq!(destination(&[promise, reply]), Destination::Reply);
+    }
+
+    /// **Handing off without an answer asks again**; an answer beside a
+    /// hand-off, or no hand-off at all, does not.
+    #[test]
+    fn a_hand_off_alone_leaves_the_answer_to_decide() {
+        let sent = act(
+            "message_someone_else",
+            json!({"via": "private", "to": "Wick", "intent": "check the ring."}),
+        );
+        let reply = act("reply", json!({"to": "Mira", "intent": "it is done"}));
+        let promise = act(
+            "promise",
+            json!({"to": "Mira", "what": "the report", "by": "Friday"}),
+        );
+        assert_eq!(
+            handed_off_only(slice::from_ref(&sent)),
+            Some(vec!["message_someone_else"])
+        );
+        assert_eq!(handed_off_only(&[sent.clone(), reply]), None);
+        assert_eq!(handed_off_only(slice::from_ref(&promise)), None);
+        assert_eq!(
+            after_hand_off("Mira", &[sent, promise]),
+            "You have sent to Wick: check the ring. Mira is still waiting on you: decide what \
+             you say to them."
+        );
     }
 
     #[test]

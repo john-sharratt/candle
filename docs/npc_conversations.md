@@ -540,7 +540,7 @@ The decision is the mind's act turn, run on an ephemeral fork with
 | `promise` | a ledger promise to the party | `to` = the party; `what`, `by` |
 | `remind` | remind the party of their promise | NPC↔NPC only, because a person never `promise`s. `which` ∈ what the party owes. |
 | `mission_*` | change the mission (§7.1) | offered only when the party is the owner or an authorizer, outside the thrash cooldown |
-| `message` / `reach_out` | hand off: a purpose to another conversation (§10) | `to` ∈ the NPC's threads and contacts **other than the party** |
+| `message_someone_else` / `reach_out` | hand off: a purpose to another conversation (§10) — not the answer | `to` ∈ the NPC's threads, channels and contacts **other than the party**. `message_someone_else` is the conversation's own act (`Availability::OnThread`, `talk/hand_off.rs`), performed as the world's `message`; the main loop keeps `message` and is never offered it. |
 
 - **Calls per turn.** `compile_action_loop` with `max_calls` = `TALK_ACTS` = 2
   (`candle-conversation/src/stencil/tool_call.rs:1207`): a promise or a
@@ -550,6 +550,13 @@ The decision is the mind's act turn, run on an ephemeral fork with
   the shipped mind's 116 moods and an agenda to change one act is about 300
   paths. Three acts admit 2.6 × 10⁷ decodes, twelve times `MAX_TURN_PATHS`;
   two admit under 10⁵ (`tools::tests::a_full_thread_stays_inside_the_path_budget`).
+- **A hand-off does not end the decision.** A decision whose acts include a
+  hand-off and none of `reply`, `sign_off` or `reflect` is asked again on a
+  fresh fork, with what it handed off struck from the offered acts and told
+  what it sent and that the party still waits (`decide::handed_off_only`,
+  `decide::after_hand_off`). Each round strikes at least one hand-off, so the
+  rounds end once they are spent. The acts of every round are performed, so
+  the character messages somebody else and then answers the party.
 - **The destination.** The loop cannot make one call terminal
   (`tool_call.rs:1262-1294`), so the destination is read after parsing: the
   **last** of `reply`, `sign_off` or `reflect` in the list decides. A list with

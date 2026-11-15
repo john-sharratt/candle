@@ -2080,9 +2080,13 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
         if tools::routed(t.name) {
             continue;
         }
+        // A conversation's own act is offered in a conversation's decision,
+        // never in a room (`talk::hand_off`).
+        let on_a_thread = matches!(t.availability, tools::Availability::OnThread);
         let reachable = seen.iter().any(|s| s == t.name)
             || messaging.contains(&t.name)
-            || lent_by_missions.contains(&t.name);
+            || lent_by_missions.contains(&t.name)
+            || on_a_thread;
         assert!(
             reachable,
             "`{}` is in the catalog and no room in either shipped world offers it",

@@ -28,6 +28,7 @@ use crate::engine::talk::catchup::{self, CatchUp};
 use crate::engine::talk::clock::{self, Ended, Input};
 use crate::engine::talk::critical;
 use crate::engine::talk::guard::{self, Words};
+use crate::engine::talk::hand_off;
 use crate::engine::talk::key::Party;
 use crate::engine::talk::runner::{Inputs, Key};
 use crate::engine::talk::state::TalkState;
@@ -374,7 +375,7 @@ impl Runtime {
             .filter(|a| !matches!(a.tool, "reply" | "sign_off" | "reflect"))
         {
             let done = self
-                .perform_said(npc, act, None, None, &source)
+                .perform_said(npc, &hand_off::as_performed(act), None, None, &source)
                 .await
                 .recorded;
             if !done.landed {

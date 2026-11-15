@@ -54,6 +54,7 @@ use crate::bridge::BRIDGE_ACTS;
 use crate::engine::agenda::{self, ordered, AGENDA_ACTS};
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::invoke_body::{self, Invokable};
+use crate::engine::talk::hand_off::HAND_OFF_ACTS;
 use crate::engine::zen_task::TASK_ACTS;
 use crate::engine::{acts, bench, mission, mission_acts, station};
 use crate::house::HOUSE_ACTS;
@@ -192,6 +193,10 @@ pub enum Availability {
     /// the acts by which the world builds itself (`docs/zen_moon_mind.md` §14).
     /// See [`Within::grants`].
     Granted,
+    /// Only in a conversation's decision (`docs/npc_conversations.md` §6.2) —
+    /// a turn whose `Within` carries the thread's allow-list
+    /// ([`Within::allow`]) — never in the main loop.
+    OnThread,
 }
 
 /// One parameter, as the model sees it.
@@ -994,6 +999,7 @@ pub static CATALOG: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(||
         .chain(HOUSE_ACTS)
         .chain(BUILD_ACTS)
         .chain(TASK_ACTS)
+        .chain(HAND_OFF_ACTS)
         .copied()
         .collect()
 });
@@ -1126,6 +1132,8 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             Availability::AtLift | Availability::AtLanding => false,
             // A grant is the carried mission's, in its room — the situation's.
             Availability::Granted => false,
+            // A conversation's own act is never the main loop's.
+            Availability::OnThread => false,
         })
         .collect()
 }
@@ -1935,6 +1943,9 @@ const LIVE: &[(&str, &str, Choices)] = &[
     // How it goes, and from that, to which conversation: `to` is brought by
     // the way chosen ([`BRINGS`], [`BROUGHT_CHOICES`]).
     ("message", "via", Choices::Ways),
+    // A conversation's message to somebody else, bound as a `message` is:
+    // its people and channels never include the party (`talk::within`).
+    ("message_someone_else", "via", Choices::Ways),
     // Not `Threads`: an answer goes on the conversation that is waiting for
     // it, never on one the asker merely shares a name with. See
     // [`Choices::Awaiting`].
@@ -2468,6 +2479,7 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             Availability::AtLift => within.at_lift && !within.lift_here,
             Availability::AtLanding => within.at_lift,
             Availability::Granted => within.grants.iter().any(|g| g == t.name),
+            Availability::OnThread => within.allow.is_some(),
         })
         .filter(|t| performable(t, within))
         .map(|t| ToolSpec {
@@ -2638,6 +2650,11 @@ const BRINGS: &[(&str, &str, &[Needs])] = &[
         "via",
         &[(PRIVATE, &["to"]), (CHANNEL_WAY, &["to"])],
     ),
+    (
+        "message_someone_else",
+        "via",
+        &[(PRIVATE, &["to"]), (CHANNEL_WAY, &["to"])],
+    ),
 ];
 
 /// A `message` sent to somebody alone — the value of its `via`.
@@ -2654,6 +2671,8 @@ pub const CHANNEL_WAY: &str = "channel";
 const BROUGHT_CHOICES: &[(&str, &str, &str, Choices)] = &[
     ("message", PRIVATE, "to", Choices::Private),
     ("message", CHANNEL_WAY, "to", Choices::Channels),
+    ("message_someone_else", PRIVATE, "to", Choices::Private),
+    ("message_someone_else", CHANNEL_WAY, "to", Choices::Channels),
 ];
 
 /// Every field some value of `tool`'s choices brings. See [`BRINGS`].
@@ -4512,6 +4531,7 @@ mod tests {
             .chain(HOUSE_ACTS)
             .chain(BUILD_ACTS)
             .chain(TASK_ACTS)
+            .chain(HAND_OFF_ACTS)
             .map(|t| t.name)
             .collect();
         let n = declared.len();
