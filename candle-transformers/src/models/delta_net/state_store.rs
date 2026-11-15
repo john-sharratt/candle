@@ -72,26 +72,38 @@ use std::sync::Mutex;
 #[cfg(feature = "cuda")]
 static READBACK: Mutex<Option<PinnedBuf>> = Mutex::new(None);
 
-/// The pinned host buffer every store's restore uploads from, kept between
-/// imports like [`READBACK`] and for the same reasons, with the event recorded
-/// after its last uploads: the buffer is written again only once they have read
-/// it.
+/// The pinned host buffers stores' restores upload from, kept between imports
+/// like [`READBACK`] and for the same reasons, each with the event recorded
+/// after its last uploads.
+///
+/// **A pool, because an import never waits.** A restore's uploads are queued
+/// behind the forward still running, so a buffer one restore has just filled is
+/// not read until that forward ends, and an admission pass restores several
+/// sequences back to back: one buffer made every restore after a pass's first
+/// wait out the forward — 213 ms of a 260 ms admission begin on BlackWorld
+/// (2026-11-15). An import takes a buffer whose uploads have completed, asked
+/// without blocking, and allocates one only when none has, so the pool settles
+/// at the number of restores one forward's admissions make.
 #[cfg(feature = "cuda")]
-static UPLOAD: Mutex<Option<PinnedUpload>> = Mutex::new(None);
+static UPLOAD: Mutex<Vec<PinnedUpload>> = Mutex::new(Vec::new());
 
-/// [`UPLOAD`]'s buffer and the point on the stream past which nothing reads it.
+/// One of [`UPLOAD`]'s buffers and the point on the stream past which nothing
+/// reads it.
 #[cfg(feature = "cuda")]
 struct PinnedUpload {
     buf: PinnedBuf,
-    /// Recorded after the last import's uploads were enqueued; `None` once
-    /// waited on.
+    /// Recorded after the last import's uploads from it were enqueued.
     done: Option<CudaEvent>,
 }
 
 #[cfg(feature = "cuda")]
 impl PinnedUpload {
-    /// Wait until the last import's uploads have read the buffer — by the
-    /// next import, almost always long since.
+    /// Whether nothing reads the buffer any more, asked without waiting.
+    fn is_free(&self) -> bool {
+        self.done.as_ref().is_none_or(CudaEvent::is_complete)
+    }
+
+    /// Wait until the last import's uploads have read the buffer.
     fn settle(&mut self) -> Result<()> {
         if let Some(done) = self.done.take() {
             done.synchronize()
@@ -114,8 +126,8 @@ pub fn release_recurrent_host_buffers() {
     #[cfg(feature = "cuda")]
     {
         release_readback_in(&READBACK);
-        let held = UPLOAD.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(mut up) = held {
+        let held = std::mem::take(&mut *UPLOAD.lock().unwrap_or_else(|e| e.into_inner()));
+        for mut up in held {
             // Uploads still reading it would read freed pages.
             if let Err(e) = up.settle() {
                 tracing::warn!("{e}");
@@ -1673,27 +1685,27 @@ impl RecurrentStateStore {
     /// begin on BlackWorld (2026-11-15). From pinned memory the copies are
     /// queued and the call returns. The wire form is the device's own,
     /// little-endian F32, so the bytes cross as they are, with no conversion.
-    /// The buffer is reused; the event recorded after the uploads is what the
-    /// next import waits on before writing it again.
+    /// The buffer comes from [`UPLOAD`]'s pool, one whose last uploads have
+    /// completed, and goes back with the event recorded after these.
     #[cfg(feature = "cuda")]
     fn import_cuda(&self, dev: &CudaDevice, layers: &[ExportedLayerState]) -> Result<()> {
         let state_bytes = self.dims.state_elems() * 4;
         let tail_bytes = self.dims.conv_state_elems() * 4;
         let total = self.slots.len() * (state_bytes + tail_bytes);
-        let mut held = UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(up) = held.as_mut() {
-            up.settle()?;
-        }
-        if held.as_ref().is_none_or(|u| u.buf.len() < total) {
+        let taken = {
+            let mut pool = UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+            pool.iter()
+                .position(|u| u.buf.len() >= total && u.is_free())
+                .map(|i| pool.swap_remove(i))
+        };
+        let mut up = match taken {
+            Some(up) => up,
             // Write-combined: the CPU only writes it, and the device reads it.
-            // Every upload from the buffer it replaces has read it — settled
-            // just above.
-            *held = Some(PinnedUpload {
+            None => PinnedUpload {
                 buf: PinnedBuf::alloc_owned(total)?,
                 done: None,
-            });
-        }
-        let up = held.as_mut().expect("the upload buffer was just sized");
+            },
+        };
         let buf = up.buf.as_mut_slice();
         let mut at = 0usize;
         for l in layers {
@@ -1734,17 +1746,20 @@ impl RecurrentStateStore {
         })();
         // Recorded even when an enqueue failed part-way: the copies already
         // queued still read the buffer.
-        match stream.record_event(None) {
-            Ok(done) => up.done = Some(done),
-            Err(e) => {
-                stream.synchronize().map_err(|e| {
-                    Error::Msg(format!("recurrent store: restore upload sync: {e:?}"))
-                })?;
-                return Err(Error::Msg(format!(
-                    "recurrent store: restore upload event: {e:?}"
-                )));
+        let recorded = match stream.record_event(None) {
+            Ok(done) => {
+                up.done = Some(done);
+                Ok(())
             }
-        }
+            Err(e) => stream
+                .synchronize()
+                .map_err(|e| Error::Msg(format!("recurrent store: restore upload sync: {e:?}")))
+                .and(Err(Error::Msg(format!(
+                    "recurrent store: restore upload event: {e:?}"
+                )))),
+        };
+        UPLOAD.lock().unwrap_or_else(|e| e.into_inner()).push(up);
+        recorded?;
         enqueued
     }
 
@@ -2923,38 +2938,62 @@ mod tests {
         Ok(())
     }
 
-    /// **A restore on CUDA uploads from one pinned buffer** and lands the bytes
-    /// the snapshot holds: a store exported, imported into a fresh store and
-    /// exported again reads back the same bytes, and the buffer it went through
-    /// is one owned, pinned allocation of the store's size.
+    /// **A restore on CUDA uploads from a pooled pinned buffer** and lands the
+    /// bytes the snapshot holds: a store exported, imported into a fresh store
+    /// and exported again reads back the same bytes, through an owned, pinned
+    /// buffer of the store's size. A restore whose predecessor's uploads have
+    /// completed takes that buffer again; one whose predecessor's are still
+    /// queued takes another rather than wait.
     #[cfg(feature = "cuda")]
     #[test]
-    fn a_cuda_restore_uploads_from_one_pinned_buffer() -> Result<()> {
+    fn a_cuda_restore_uploads_from_a_pooled_pinned_buffer() -> Result<()> {
         let _gpu = gpu_serial();
         let held = || {
             UPLOAD
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
+                .iter()
                 .map(|u| (matches!(u.buf, PinnedBuf::Owned { .. }), u.buf.len()))
+                .collect::<Vec<_>>()
         };
         let dev = Device::new_cuda(0)?;
+        let Device::Cuda(cuda) = &dev else {
+            unreachable!("a CUDA device")
+        };
         let source = filled_store_on(&dev);
         let hash = source.schedule_hash();
         let snapshot = source.export()?;
         release_recurrent_host_buffers();
         let mut restored = RecurrentStateStore::new(&kinds(), &dims(), &dev)?;
         restored.import(hash, &snapshot)?;
-        assert_eq!(held(), Some((true, 1_536)), "one owned, pinned buffer");
+        assert_eq!(held(), [(true, 1_536)], "one owned, pinned buffer");
         assert_eq!(restored.export()?, snapshot);
         assert_eq!(restored.export()?, filled_store().export()?);
-        // A second restore reuses the buffer once the first has read it.
+        // The export synchronised the stream, so the first restore's uploads
+        // have completed and the second takes its buffer.
         let mut again = RecurrentStateStore::new(&kinds(), &dims(), &dev)?;
         again.import(hash, &snapshot)?;
-        assert_eq!(held(), Some((true, 1_536)));
+        assert_eq!(
+            held(),
+            [(true, 1_536)],
+            "the completed buffer is taken again"
+        );
+        // Two restores back to back with nothing waited between them may each
+        // take a buffer; none is waited on, and both land.
+        let mut third = RecurrentStateStore::new(&kinds(), &dims(), &dev)?;
+        third.import(hash, &snapshot)?;
+        let pooled = held();
+        assert!(
+            (1..=2).contains(&pooled.len()) && pooled.iter().all(|&b| b == (true, 1_536)),
+            "{pooled:?}"
+        );
+        cuda.cuda_stream()
+            .synchronize()
+            .map_err(|e| Error::Msg(format!("{e:?}")))?;
         assert_eq!(again.export()?, snapshot);
+        assert_eq!(third.export()?, snapshot);
         release_recurrent_host_buffers();
-        assert_eq!(held(), None, "the release dropped it");
+        assert!(held().is_empty(), "the release dropped them");
         Ok(())
     }
 
