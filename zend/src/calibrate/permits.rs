@@ -19,7 +19,7 @@ pub struct Permit<'a> {
 }
 
 impl Permits {
-    pub fn new(n: usize) -> Self {
+    pub const fn new(n: usize) -> Self {
         Permits {
             free: Mutex::new(n),
             freed: Condvar::new(),
@@ -34,6 +34,25 @@ impl Permits {
         }
         *free -= 1;
         Permit { of: self }
+    }
+
+    /// One more place for a holder that already holds `held`: waited for when
+    /// it holds none, taken only if one is free when it holds some.
+    ///
+    /// A holder that waited while it held places would keep them from the
+    /// holders it waits on, and holders that each keep some and want more
+    /// deadlock with the gate full. Taking without waiting, a holder with
+    /// places goes on to finish the work they cover, which hands them back.
+    pub fn next_place(&self, held: usize) -> Option<Permit<'_>> {
+        if held == 0 {
+            return Some(self.acquire());
+        }
+        let mut free = self.free.lock().unwrap();
+        if *free == 0 {
+            return None;
+        }
+        *free -= 1;
+        Some(Permit { of: self })
     }
 
     /// Permits not held now.
@@ -66,6 +85,60 @@ mod tests {
         assert_eq!(p.available(), 1);
         drop(b);
         assert_eq!(p.available(), 2);
+    }
+
+    /// **A holder with places never waits for another**, and one with none
+    /// does: the gate full, a holder holding some is told there is none.
+    #[test]
+    fn a_holder_with_places_is_never_made_to_wait() {
+        let p = Permits::new(2);
+        let first = p.next_place(0).expect("an empty holder waits and gets one");
+        let second = p.next_place(1).expect("one is free");
+        assert!(p.next_place(2).is_none(), "the gate is full");
+        drop(first);
+        assert!(p.next_place(1).is_some());
+        drop(second);
+    }
+
+    /// **Units sharing the gate never hold more than it allows, and all
+    /// finish**: each tops its window up without waiting while it holds
+    /// places, waits only when it holds none, and gives a place back as each
+    /// of its turns ends.
+    #[test]
+    fn units_sharing_the_gate_stay_within_it_and_all_finish() {
+        let p = Permits::new(4);
+        let (now, most, done) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        std::thread::scope(|s| {
+            for _ in 0..9 {
+                s.spawn(|| {
+                    let (mut submitted, mut held) = (0, Vec::new());
+                    while submitted < 30 || !held.is_empty() {
+                        while submitted < 30 {
+                            let Some(place) = p.next_place(held.len()) else {
+                                break;
+                            };
+                            let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                            most.fetch_max(n, Ordering::SeqCst);
+                            held.push(place);
+                            submitted += 1;
+                        }
+                        std::thread::yield_now();
+                        if held.pop().is_some() {
+                            now.fetch_sub(1, Ordering::SeqCst);
+                            done.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(done.load(Ordering::SeqCst), 9 * 30);
+        let most = most.load(Ordering::SeqCst);
+        assert!((1..=4).contains(&most), "{most} held at once");
+        assert_eq!(p.available(), 4);
     }
 
     /// **Never more than `n` hold at once**, however many threads ask.

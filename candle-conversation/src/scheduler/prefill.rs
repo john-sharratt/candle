@@ -19,6 +19,7 @@ use super::paused_creep::{drop_rows, PausedCreep};
 use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
 use super::section_pack;
 use super::wave_logits::WaveLogits;
+use super::MAX_PREFILL_WIDTH;
 use super::*;
 use crate::projection::DecodePriority;
 use crate::recorded_reply::replayed_step;
@@ -2193,7 +2194,7 @@ impl Scheduler {
     /// ([`admit::rate`]) without crossing the residency the engine defends
     /// ([`admit::gate`]).
     ///
-    /// [`Scheduler::MAX_PREFILL_WIDTH`] is a backstop above this, not the
+    /// [`MAX_PREFILL_WIDTH`] is a backstop above this, not the
     /// control. The keep-one-alive rule below is what guarantees progress: a
     /// pass that admits nothing with nothing in flight takes the queue head
     /// regardless, so an oversized lone turn still runs and is bounded by the
@@ -2208,7 +2209,7 @@ impl Scheduler {
         // `in_flight` counts only work that can advance — prefills and section
         // ingests alike, see `running_members`.
         let in_flight = self.running_members();
-        if in_flight >= Self::MAX_PREFILL_WIDTH {
+        if in_flight >= MAX_PREFILL_WIDTH {
             return;
         }
         // **A guest waiting for room closes admission**, the queue head's forced
@@ -2356,7 +2357,7 @@ impl Scheduler {
             }
             // Sections have no rate question either, and nothing to wait on: the
             // width backstop is their only bound here, as it is a prefill's.
-            while self.running_members() < Self::MAX_PREFILL_WIDTH {
+            while self.running_members() < MAX_PREFILL_WIDTH {
                 let Some(s) = self.pop_highest_band_section() else {
                     break;
                 };
@@ -3612,7 +3613,7 @@ impl Scheduler {
     }
 
     /// Admitted work that can still advance a row: running prefills and section
-    /// ingests together — what [`Self::MAX_PREFILL_WIDTH`] bounds and what the
+    /// ingests together — what [`MAX_PREFILL_WIDTH`] bounds and what the
     /// keep-one-alive rule asks about, since both are prefill rows in one wave.
     pub(super) fn running_members(&self) -> usize {
         self.running_prefills() + self.section_ingest_width()

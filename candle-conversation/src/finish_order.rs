@@ -49,6 +49,16 @@ impl FinishOrder {
         }
     }
 
+    /// Add `handle` to the batch as its turn number `index`, for a caller that
+    /// submits its turns as places free rather than all at once. A turn just
+    /// submitted has had no chance to move, so the batch's stall clock starts
+    /// again from it: a batch that waited for a place before submitting is not
+    /// given up for the wait.
+    pub fn push(&mut self, index: usize, handle: TurnHandle) {
+        self.live.push((index, handle));
+        self.moved = Instant::now();
+    }
+
     /// Turns not yet finished.
     pub fn pending(&self) -> usize {
         self.live.len()
@@ -128,6 +138,29 @@ mod tests {
             .expect("not cancelled")
             .expect("a turn left");
         (index, result.map(|r| r.text).map_err(|e| e.to_string()))
+    }
+
+    /// **A turn pushed later joins the batch under its own number** and settles
+    /// in the order it finishes, and pushing starts the stall clock again: a
+    /// batch that sat empty past the limit is not given up for it.
+    #[test]
+    fn a_pushed_turn_joins_the_batch_and_restarts_the_clock() {
+        let mut order = FinishOrder::stalling_after(Vec::new(), Duration::from_millis(200));
+        assert_eq!(order.pending(), 0);
+        std::thread::sleep(Duration::from_millis(250));
+        let (tx7, rx7) = flume::unbounded();
+        let (tx3, rx3) = flume::unbounded();
+        order.push(7, TurnHandle::new(rx7));
+        order.push(3, TurnHandle::new(rx3));
+        assert_eq!(order.pending(), 2);
+        tx3.send(TurnEvent::Done(turn_response("three"))).unwrap();
+        assert_eq!(next_index(&mut order), (3, Ok("three".to_string())));
+        tx7.send(TurnEvent::Done(turn_response("seven"))).unwrap();
+        assert_eq!(next_index(&mut order), (7, Ok("seven".to_string())));
+        assert!(order
+            .next_cancellable(&CancelToken::new())
+            .expect("not cancelled")
+            .is_none());
     }
 
     /// **Turns settle in the order they finish, not the order they were

@@ -17,6 +17,19 @@
 //! `kv_zero_check.rs` (feature `kv-zero-check`, audits live K/V slots).
 mod admission;
 mod admission_split;
+
+/// Static backstop on the ragged prefill forward's width — how many in-flight
+/// prefills may coalesce into one `forward_batched`, regardless of what the
+/// byte budget would allow.
+///
+/// The admission budget's setpoint (`Scheduler::admit_budget`) is the real
+/// throttle; this is the dumb ceiling beneath it. It exists so an error in the
+/// cost model (`admission::per_block_kv_bytes` and friends) costs throughput
+/// rather than the daemon: a cost underestimate can only ever admit this many
+/// sequences before it is capped, whatever it believes they are worth. It is
+/// also what a caller that queues many turns at once sizes its window by, so
+/// it never queues more than the scheduler can run.
+pub const MAX_PREFILL_WIDTH: usize = 24;
 /// Rate-based wave budgeting — **compiled and tested, not yet wired.**
 ///
 /// Admission: [`admit::fill`] is the path, and [`admit_ground::AdmitPass`] is
@@ -4461,7 +4474,7 @@ impl Scheduler {
             compression_jobs: HashMap::new(),
             pending_compression_seals: HashMap::new(),
             next_compression_job_id: 0,
-            admit_budget: Self::MAX_PREFILL_WIDTH as u64 * admission::admit_quantum(),
+            admit_budget: MAX_PREFILL_WIDTH as u64 * admission::admit_quantum(),
             host_ram_probe: None,
             admit_grow_streak: 0,
             admit_ok_tokens_seen: 0,
@@ -7206,18 +7219,7 @@ impl Scheduler {
         let _ = response_tx.send(Ok(idx));
     }
 
-    /// Static backstop on the ragged prefill forward's width — how many in-flight
-    /// prefills may coalesce into one `forward_batched`, regardless of what the
-    /// byte budget would allow.
-    ///
-    /// The [`Self::admit_budget`] setpoint is the real throttle; this is the dumb
-    /// ceiling beneath it. It exists so an error in the cost model
-    /// ([`admission::per_block_kv_bytes`] and friends) costs throughput rather
-    /// than the daemon: a cost underestimate can only ever admit this many
-    /// sequences before it is capped, whatever it believes they are worth.
-    pub(super) const MAX_PREFILL_WIDTH: usize = 24;
-
-    /// The decode counterpart of [`Self::MAX_PREFILL_WIDTH`], and a backstop of
+    /// The decode counterpart of [`MAX_PREFILL_WIDTH`], and a backstop of
     /// exactly the same kind: the rate model is the real throttle, and this is
     /// the dumb ceiling beneath it so an error in the cost model costs
     /// throughput rather than the daemon.
@@ -7267,12 +7269,12 @@ impl Scheduler {
         self.cut_admit_budget(reason);
     }
 
-    /// The setpoint's static upper bound — [`Self::MAX_PREFILL_WIDTH`] quanta.
+    /// The setpoint's static upper bound — [`MAX_PREFILL_WIDTH`] quanta.
     /// A pure constant, so the reopen paths can cheaply ask "is there anything to
     /// reopen?" before paying for the live ceiling, which costs a device query
     /// (`QueryVideoMemoryInfo`) and a walk of the registered relievers.
     fn max_admit_budget() -> u64 {
-        Self::MAX_PREFILL_WIDTH as u64 * admission::admit_quantum()
+        MAX_PREFILL_WIDTH as u64 * admission::admit_quantum()
     }
 
     /// Additive-increase the admission budget by one quantum, toward the live
@@ -17536,14 +17538,11 @@ mod tests {
     #[test]
     fn sections_are_bounded_by_the_width_backstop() {
         let mut sched = admission_scheduler();
-        for _ in 0..Scheduler::MAX_PREFILL_WIDTH + 3 {
+        for _ in 0..MAX_PREFILL_WIDTH + 3 {
             ingest_section(&mut sched, 64);
         }
         sched.promote_new_prefills();
-        assert_eq!(
-            sched.active_section_ingests.len(),
-            Scheduler::MAX_PREFILL_WIDTH
-        );
+        assert_eq!(sched.active_section_ingests.len(), MAX_PREFILL_WIDTH);
         assert_eq!(sched.section_queue.len(), 3);
     }
 

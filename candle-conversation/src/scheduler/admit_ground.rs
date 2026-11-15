@@ -42,6 +42,7 @@ use super::admission_split::AdmitPart;
 use super::admit::{Budget, Cost, FillPart, Ground, Headroom, Kind};
 use super::band::rank;
 use super::interleave;
+use super::MAX_PREFILL_WIDTH;
 use super::{Scheduler, SequenceId, WaveMember};
 use crate::projection::DecodePriority;
 use candle_nn::kv_cache::CHUNK_SIZE;
@@ -233,7 +234,7 @@ pub(super) struct Unoffered {
     /// takes every row the pass budget allows, and a turn joining it would
     /// advance by nothing.
     pub rows: bool,
-    /// The [`Scheduler::MAX_PREFILL_WIDTH`] backstop was reached.
+    /// The [`MAX_PREFILL_WIDTH`] backstop was reached.
     pub width: bool,
 }
 
@@ -604,7 +605,7 @@ impl Ground for AdmitPass<'_> {
         // moves no row (`Scheduler::running_members`).
         // A prompt of a band the running members yield to is not held behind
         // them: they are why the width is spent (`Ground::outranks_active`).
-        if self.sched.running_members() >= Scheduler::MAX_PREFILL_WIDTH
+        if self.sched.running_members() >= MAX_PREFILL_WIDTH
             && !(kind == Kind::Prefill && self.sched.lower_band_active(prio))
         {
             self.unoffered.width |= !self.sched.prefill_queue.is_empty()

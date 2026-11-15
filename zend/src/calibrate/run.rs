@@ -39,7 +39,9 @@ use candle_conversation::projection::{
 };
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
-use candle_conversation::{ConversationEngine, FinishOrder, Sequence, SequenceConfig, TurnOptions};
+use candle_conversation::{
+    ConversationEngine, FinishOrder, Sequence, SequenceConfig, TurnOptions, MAX_PREFILL_WIDTH,
+};
 
 use super::ask::Ask;
 use super::permits::{Permit, Permits};
@@ -102,6 +104,11 @@ fn failures_of(recorded: Option<&str>, marker: &str) -> u32 {
 /// question, so three times as many units are in flight, and one thinking
 /// does not hold a draft's place. The scheduler's waves pace the decode.
 const CALIBRATE_PARALLELISM: usize = 3 * LAYER_PARALLELISM;
+
+/// The places every unit's questions share while they think: as many as the
+/// scheduler runs prefills at once ([`MAX_PREFILL_WIDTH`]), so no more
+/// thinking turns stand queued than it can take ([`thoughts`]).
+static THINKING: Permits = Permits::new(MAX_PREFILL_WIDTH);
 
 /// What one layer's pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -506,71 +513,91 @@ fn thinking_selection() -> SelectionState {
     SelectionState::new()
 }
 
-/// Each of `questions`' thinking, in order: every question asked at once, each
-/// alone in a transient conversation under the frame's system prompt, decoded
-/// to the spec's `think` budget. Each conversation is tombstoned either way.
-/// A question the model did not think about fails the unit, which is
-/// calibrated again by a later pass.
+/// Each of `questions`' thinking, in order: each question asked alone in a
+/// transient conversation under the frame's system prompt, decoded to the
+/// spec's `think` budget. Each conversation is tombstoned either way. A
+/// question the model did not think about fails the unit, which is calibrated
+/// again by a later pass.
+///
+/// **No more in the queue than the scheduler runs.** Every unit's questions
+/// share one gate ([`THINKING`]), as wide as the scheduler's prefill: a unit
+/// submits a question only while it holds a place, and gives the place back
+/// as the question's turn ends, when it submits its next. Asked every question
+/// at once, a dozen units stood ~550 turns in the queue against 24 run at a
+/// time on BlackWorld (2026-11-15), and a unit none of whose turns moved for a
+/// minute gave its whole calibration up ([`FinishOrder`]) — two units in
+/// three, each redone from its draft by a later pass. A unit holding no place
+/// waits for one; a unit holding some takes more only when one is free
+/// ([`Permits::next_place`]), so it never waits on places it keeps from
+/// another.
 ///
 /// **A question gives up its conversation the moment its turn ends**, read in
-/// the order the turns finish ([`FinishOrder`]). A transient conversation's
-/// recurrent store is never parked — it writes no record to park into — so a
-/// question waited on in submit order held its store until every question
-/// before it was done: on BlackWorld (2026-10-29) a hundred finished questions
-/// at a time, ~15 GiB of state beside a dozen running ones.
+/// the order the turns finish. A transient conversation's recurrent store is
+/// never parked — it writes no record to park into — so a question waited on
+/// in submit order held its store until every question before it was done: on
+/// BlackWorld (2026-10-29) a hundred finished questions at a time, ~15 GiB of
+/// state beside a dozen running ones.
 fn thoughts(
     engine: &ConversationEngine,
     frame: &Frame<'_>,
     spec: &CalibrateSpec,
     questions: &[String],
 ) -> anyhow::Result<Vec<String>> {
-    let mut asked: Vec<Option<Sequence>> = Vec::with_capacity(questions.len());
-    let mut timelines: Vec<TimelineId> = Vec::with_capacity(questions.len());
-    let opened: anyhow::Result<()> = questions.iter().try_for_each(|_| {
-        let e = engine;
-        // **Background, as the ingest is.** A sweep thinks dozens of
-        // questions at once; at `Normal` they rode every forward beside a live
-        // turn, where `Low` rows step aside for an `Urgent` decode
-        // (`scheduler::band`, `urgent_hold`).
-        let conv = e
-            .new_reserved_conversation(
-                frame.system_prompt,
-                Reserved::Calibration,
-                DecodePriority::Low,
-                frame.config.clone(),
-            )
-            .map_err(|err| anyhow::anyhow!("thinking conversation: {err}"))?;
-        let timeline = conv.timeline_id();
-        asked.push(Some(conv));
-        timelines.push(timeline);
-        e.conversation().mark_timeline_transient(timeline);
-        e.set_timeline_summarize(timeline, false);
-        e.set_conversation_metadata(timeline, DRAFT_KEY, &spec.layer)
-            .map_err(|err| anyhow::anyhow!("naming the thinking conversation: {err}"))
-    });
-    let thought = opened.and_then(|()| {
-        let mut handles = Vec::with_capacity(questions.len());
-        for (conv, q) in asked.iter_mut().zip(questions) {
-            let options = TurnOptions {
-                max_tokens: Some(spec.think),
-                selection: thinking_selection(),
-                triggers: Arc::clone(&frame.thinking),
-                tags: vec![TAG.to_string()],
-                ..Default::default()
+    let n = questions.len();
+    let mut asked: Vec<Option<Sequence>> = Vec::with_capacity(n);
+    let mut timelines: Vec<TimelineId> = Vec::with_capacity(n);
+    let mut places: Vec<Option<Permit<'static>>> = Vec::with_capacity(n);
+    let mut out: Vec<Option<String>> = vec![None; n];
+    let mut finished = FinishOrder::new(Vec::new());
+    let thought = (|| -> anyhow::Result<()> {
+        loop {
+            while asked.len() < n {
+                let Some(place) = THINKING.next_place(finished.pending()) else {
+                    break;
+                };
+                let i = asked.len();
+                // **Background, as the ingest is.** A sweep thinks dozens of
+                // questions at once; at `Normal` they rode every forward beside
+                // a live turn, where `Low` rows step aside for an `Urgent`
+                // decode (`scheduler::band`, `urgent_hold`).
+                let conv = engine
+                    .new_reserved_conversation(
+                        frame.system_prompt,
+                        Reserved::Calibration,
+                        DecodePriority::Low,
+                        frame.config.clone(),
+                    )
+                    .map_err(|err| anyhow::anyhow!("thinking conversation: {err}"))?;
+                let timeline = conv.timeline_id();
+                asked.push(Some(conv));
+                timelines.push(timeline);
+                places.push(Some(place));
+                engine.conversation().mark_timeline_transient(timeline);
+                engine.set_timeline_summarize(timeline, false);
+                engine
+                    .set_conversation_metadata(timeline, DRAFT_KEY, &spec.layer)
+                    .map_err(|err| anyhow::anyhow!("naming the thinking conversation: {err}"))?;
+                let options = TurnOptions {
+                    max_tokens: Some(spec.think),
+                    selection: thinking_selection(),
+                    triggers: Arc::clone(&frame.thinking),
+                    tags: vec![TAG.to_string()],
+                    ..Default::default()
+                };
+                let handle = asked[i]
+                    .as_mut()
+                    .expect("the question's conversation was just opened")
+                    .submit_turn_with_options(questions[i].clone(), options)
+                    .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
+                finished.push(i, handle);
+            }
+            let Some((i, handle, resp)) = finished
+                .next_cancellable(crate::ingest_cancel::token())
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))?
+            else {
+                return Ok(());
             };
-            let handle = conv
-                .as_mut()
-                .expect("every question's conversation is open")
-                .submit_turn_with_options(q.clone(), options)
-                .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
-            handles.push(handle);
-        }
-        let mut finished = FinishOrder::new(handles);
-        let mut out: Vec<Option<String>> = vec![None; questions.len()];
-        while let Some((i, handle, resp)) = finished
-            .next_cancellable(crate::ingest_cancel::token())
-            .map_err(|e| anyhow::anyhow!("decode: {e}"))?
-        {
+            places[i] = None;
             let q = &questions[i];
             let mut conv = asked[i].take().expect("a turn finishes once");
             let thought = resp
@@ -590,18 +617,20 @@ fn thoughts(
             drop(conv);
             out[i] = Some(thought?);
         }
-        Ok(out
-            .into_iter()
-            .map(|t| t.expect("every turn finished"))
-            .collect())
-    });
-    let e = engine;
+    })();
+    // The places go back before the unfinished conversations are retired.
+    drop(places);
+    drop(finished);
     for (conv, timeline) in asked.iter().zip(&timelines) {
         if conv.is_some() {
-            let _ = e.tombstone_timeline(*timeline);
+            let _ = engine.tombstone_timeline(*timeline);
         }
     }
-    thought
+    thought.map(|()| {
+        out.into_iter()
+            .map(|t| t.expect("every turn finished"))
+            .collect()
+    })
 }
 
 /// What a unit's draft wrote: its questions from every prompt, in the order

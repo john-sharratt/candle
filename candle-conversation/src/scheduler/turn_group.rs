@@ -35,7 +35,7 @@
 //! priced like any other first admission: its store, its K/V, its rows in the
 //! tier.
 //!
-//! The group queues its cases in order, at most [`Scheduler::MAX_PREFILL_WIDTH`]
+//! The group queues its cases in order, at most [`MAX_PREFILL_WIDTH`]
 //! at a time — a bookkeeping bound, not the throttle — and each seal makes room
 //! for the next. Carving the views as the group queues them would claim them
 //! against no judgement of the card — up to 24 a group, sixteen groups in
@@ -48,6 +48,7 @@
 //! seal next is never admitted behind one after it, so carving late cannot
 //! stall the seal order.
 
+use super::MAX_PREFILL_WIDTH;
 use super::*;
 
 /// One case of one turn group — what a case's [`SealAction::GroupCase`]
@@ -244,7 +245,7 @@ impl Scheduler {
         let group = self.next_turn_group;
         self.next_turn_group += 1;
         let (case_tx, case_rx) = flume::unbounded();
-        let ledger = CaseLedger::new(cases.len(), Self::MAX_PREFILL_WIDTH);
+        let ledger = CaseLedger::new(cases.len(), MAX_PREFILL_WIDTH);
         tracing::debug!(
             target: "candle_conversation::scheduler",
             group,
