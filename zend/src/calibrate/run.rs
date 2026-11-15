@@ -415,7 +415,8 @@ fn units_of(substrate: &Substrate, group: GroupId, spec: &CalibrateSpec) -> Vec<
             // A file's reading is keyed by its own content key; a unit built
             // on one records the reading's under `FILE_KEY`.
             let reading = meta.get(FILE_KEY).unwrap_or(key);
-            let marker = spec.marker(key, subject);
+            let link = meta.contains_key(Substrate::FORKED_FROM_KEY);
+            let marker = spec.marker(key, subject, link);
             let prior_failures = meta.get(FAILED_KEY).cloned();
             Some(Unit {
                 timeline: tl,
@@ -427,6 +428,7 @@ fn units_of(substrate: &Substrate, group: GroupId, spec: &CalibrateSpec) -> Vec<
                     && failures_of(prior_failures.as_deref(), &marker) < MAX_FAILURES,
                 marker,
                 prior_failures,
+                link,
             })
         })
         .collect();
@@ -474,13 +476,20 @@ pub fn calibrate_committed(
         config: &ctx.config,
         thinking: ctx.triggers_for(ThinkMode::Balanced, ToolMode::None),
     };
+    let link = ctx
+        .engine
+        .conversation()
+        .read()
+        .custom_of(timeline)
+        .is_some_and(|meta| meta.contains_key(Substrate::FORKED_FROM_KEY));
     let unit = Unit {
         timeline,
         subject: subject.to_string(),
         key: key.to_string(),
-        marker: spec.marker(key, subject),
+        marker: spec.marker(key, subject, link),
         ready: true,
         prior_failures: None,
+        link,
     };
     calibrate_one(ctx.engine, spec, base, &frame, None, &unit)
 }
@@ -755,7 +764,10 @@ fn draft(
                 ..Default::default()
             };
             let handle = conv
-                .submit_turn_with_options(compose(&parts, unit_path(&unit.subject)), options)
+                .submit_turn_with_options(
+                    compose(&parts, unit.link.then(|| unit_path(&unit.subject))),
+                    options,
+                )
                 .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
             let resp = handle
                 .wait_cancellable(crate::ingest_cancel::token())
@@ -1007,10 +1019,11 @@ mod tests {
         let unit = |timeline: TimelineId, subject: &str, key: String, ready: bool| Unit {
             timeline,
             subject: subject.into(),
-            marker: spec.marker(&key, subject),
+            marker: spec.marker(&key, subject, false),
             key,
             ready,
             prior_failures: None,
+            link: false,
         };
         assert_eq!(
             units,

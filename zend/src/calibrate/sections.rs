@@ -9,25 +9,31 @@
 //! is written with the reading in front of it, as the single prompt was, and
 //! the parts see each other, so each can ask nothing another asked.
 
-/// What follows the parts: whose file every question is about, then how the
-/// answer is laid out. `<<path>>` is the unit's own path.
+/// How the answer is to be laid out, after the parts.
+const LAYOUT: &str = "Answer every part above, in this order, each under its own heading \
+     exactly as written (`## name`), with one question per line and nothing else.";
+
+/// What a priming-chain link's draft is told before the layout: its questions
+/// are about its own file. `<<path>>` is the unit's own path.
 ///
-/// **The unit's file alone.** A draft forks from the unit's reading, and the
-/// reading carries the files read before it in its lineage: asked about
-/// `yenbot/AGENTS.md`, a draft wrote ten of its fifteen questions about
-/// `battle-cities/AGENTS.md` — Bevy, `i64` world coordinates, the `sim` crate,
-/// none of them in the file (BlackWorld, 2026-11-15). Each such question is an
-/// exemplar voting for the wrong file. The calibration marker digests this
-/// text ([`super::spec::CalibrateSpec::marker`]), so a change to it calibrates
-/// every unit again.
-pub const CLOSING: &str = "Every question is about `<<path>>` alone, as you just read it. Other \
-     files may appear earlier in this conversation; ask nothing about them. Answer every part \
-     above, in this order, each under its own heading exactly as written (`## name`), with one \
-     question per line and nothing else.";
+/// **Only a chain link sees other files.** A link — a repository's README,
+/// ARCHITECTURE, AGENTS or CLAUDE — is read behind every link before it
+/// (`branch_ingest::prime`), and its draft, forked from its reading, sees them
+/// all: asked about `yenbot/AGENTS.md`, a draft wrote ten of its fifteen
+/// questions about `battle-cities/AGENTS.md` — Bevy, `i64` world coordinates,
+/// the `sim` crate, none of them in the file (BlackWorld, 2026-11-15). Every
+/// other unit is sealed behind the system prompt alone and is asked without
+/// it. The chain cannot be taken out of the link's draft: the link's K/V was
+/// computed behind it. A link's calibration marker digests this text
+/// ([`super::spec::CalibrateSpec::marker`]), so a change to it calibrates the
+/// links again and no other unit.
+pub const OWN_FILE: &str = "Every question is about `<<path>>` alone, as you just read it. \
+     Other files appear earlier in this conversation; ask nothing about them.";
 
 /// The message asking every `(name, prompt)` part, each under a `## name`
-/// heading, then [`CLOSING`] for the unit at `path`.
-pub fn compose(parts: &[(&str, String)], path: &str) -> String {
+/// heading, then — for a priming-chain link, the unit at `link` — [`OWN_FILE`],
+/// then the layout.
+pub fn compose(parts: &[(&str, String)], link: Option<&str>) -> String {
     let mut out = String::new();
     for (name, prompt) in parts {
         out.push_str("## ");
@@ -36,7 +42,11 @@ pub fn compose(parts: &[(&str, String)], path: &str) -> String {
         out.push_str(prompt.trim_end());
         out.push_str("\n\n");
     }
-    out.push_str(&CLOSING.replace("<<path>>", path));
+    if let Some(path) = link {
+        out.push_str(&OWN_FILE.replace("<<path>>", path));
+        out.push(' ');
+    }
+    out.push_str(LAYOUT);
     out
 }
 
@@ -99,9 +109,16 @@ mod tests {
             ("uses", "Now write 3 more.".to_string()),
         ];
         assert_eq!(
-            compose(&parts, "src/a.rs"),
+            compose(&parts, None),
             "## definitions\nWrite 4 about `a.rs`.\n\n## uses\nNow write 3 more.\n\n\
-             Every question is about `src/a.rs` alone, as you just read it. Other files may \
+             Answer every part above, in this order, each under its own heading exactly as \
+             written (`## name`), with one question per line and nothing else."
+        );
+        // A priming-chain link is told its questions are about its own file.
+        assert_eq!(
+            compose(&parts[..1], Some("AGENTS.md")),
+            "## definitions\nWrite 4 about `a.rs`.\n\n\
+             Every question is about `AGENTS.md` alone, as you just read it. Other files \
              appear earlier in this conversation; ask nothing about them. Answer every part \
              above, in this order, each under its own heading exactly as written (`## name`), \
              with one question per line and nothing else."

@@ -40,7 +40,7 @@ use sha2::{Digest, Sha256};
 use super::ask::{Ask, RawAsk};
 use super::count::QuestionCount;
 use super::profile::{Profile, RawProfile};
-use super::sections::CLOSING;
+use super::sections::OWN_FILE;
 
 /// The most questions one unit may be asked for, every prompt together. Each
 /// is one turn of one prefill, and the calibration's K/V is held lossless
@@ -202,16 +202,18 @@ impl CalibrateSpec {
     /// The calibration marker of the unit committed under `content_key`, whose
     /// subject is `subject`: the layer, a digest of what it is asked, and the
     /// unit's own key — so a changed prompt, its question-count rule, the
-    /// profile it is asked by, the closing every draft is asked under
-    /// ([`CLOSING`]), the thinking budget or the unit's version calibrates
-    /// again, and a change to one profile or the guidance prompt
+    /// profile it is asked by, for a priming-chain link (`link`) what it is told
+    /// about other files ([`OWN_FILE`]), the thinking budget or the unit's
+    /// version calibrates again, and a change to one profile or the guidance prompt
     /// only the units asked it. The unit's own counts are not in it: they
     /// follow from the rules and the content the key names.
-    pub fn marker(&self, content_key: &str, subject: &str) -> String {
+    pub fn marker(&self, content_key: &str, subject: &str, link: bool) -> String {
         let mut h = Sha256::new();
         h.update(self.think.to_le_bytes());
-        h.update(CLOSING.as_bytes());
-        h.update([0u8]);
+        if link {
+            h.update(OWN_FILE.as_bytes());
+            h.update([0u8]);
+        }
         match self.guidance_for(subject) {
             Some(g) => {
                 h.update(b"guidance\0");
@@ -364,13 +366,22 @@ layers:
         let mut reworded = s.clone();
         reworded.profiles[0].asks[0].prompt.push('!');
         let (manifest, code) = ("candle/zend/Cargo.toml", "candle/zend/src/lib.rs");
-        assert_ne!(reworded.marker("k", manifest), s.marker("k", manifest));
-        assert_eq!(reworded.marker("k", code), s.marker("k", code));
+        assert_ne!(
+            reworded.marker("k", manifest, false),
+            s.marker("k", manifest, false)
+        );
+        assert_eq!(
+            reworded.marker("k", code, false),
+            s.marker("k", code, false)
+        );
         let mut guided = s.clone();
         guided.guidance.as_mut().unwrap().ask.prompt.push('!');
         let guide = "candle/mcp/src/guides/deploy.md";
-        assert_ne!(guided.marker("g", guide), s.marker("g", guide));
-        assert_eq!(guided.marker("k", code), s.marker("k", code));
+        assert_ne!(
+            guided.marker("g", guide, false),
+            s.marker("g", guide, false)
+        );
+        assert_eq!(guided.marker("k", code, false), s.marker("k", code, false));
     }
 
     /// The marker changes with the profile's prompts, their rules and order,
@@ -379,19 +390,24 @@ layers:
     fn a_marker_follows_what_is_asked_and_of_which_unit() {
         let s = spec();
         let at = "candle/a.rs";
-        let m = s.marker("k1", at);
+        let m = s.marker("k1", at, false);
         assert!(m.starts_with("code_reading|") && m.ends_with("|k1"), "{m}");
-        assert_eq!(s.marker("k1", at), m);
-        assert_ne!(s.marker("k2", at), m);
+        assert_eq!(s.marker("k1", at, false), m);
+        assert_ne!(s.marker("k2", at, false), m);
         let mut more = s.clone();
         more.profiles[1].asks[1].questions.per_tokens = 200;
-        assert_ne!(more.marker("k1", at), m);
+        assert_ne!(more.marker("k1", at, false), m);
         let mut longer = s.clone();
         longer.think = 128;
-        assert_ne!(longer.marker("k1", at), m);
+        assert_ne!(longer.marker("k1", at, false), m);
         let mut swapped = s.clone();
         swapped.profiles[1].asks.swap(0, 1);
-        assert_ne!(swapped.marker("k1", at), m, "the order is what is asked");
+        assert_ne!(
+            swapped.marker("k1", at, false),
+            m,
+            "the order is what is asked"
+        );
+        assert_ne!(s.marker("k1", at, true), m, "a chain link is asked more");
         assert_eq!(CalibrateSpec::unit_of(&m), Some("k1"));
         assert_eq!(
             CalibrateSpec::unit_of("code_reading|ab|key:a|b"),

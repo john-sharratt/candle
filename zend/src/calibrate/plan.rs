@@ -37,6 +37,9 @@ pub struct Unit {
     pub ready: bool,
     /// What its calibration's failures have recorded, if any.
     pub prior_failures: Option<String>,
+    /// Read behind a parent — a priming-chain link — so its draft sees the
+    /// links before it ([`super::sections::OWN_FILE`]).
+    pub link: bool,
 }
 
 /// A calibration found carrying one of the layer's markers.
@@ -128,6 +131,7 @@ mod tests {
             marker: marker.into(),
             ready: true,
             prior_failures: None,
+            link: false,
         }
     }
 
