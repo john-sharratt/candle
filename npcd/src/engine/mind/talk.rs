@@ -315,10 +315,12 @@ impl Minds {
         // own opening: a conversation that keeps going to its journal when it
         // was asked a question shows here whether it chose to or could not.
         let named: Vec<&str> = acts.iter().map(|a| a.tool).collect();
+        let handed = hand_off::described(&acts);
         tracing::info!(
             npc_id,
             to = ?to,
             acts = ?named,
+            handed_off = ?handed,
             rejected = ?refused,
             rounds = openings.len(),
             decided = %openings.join(" | "),

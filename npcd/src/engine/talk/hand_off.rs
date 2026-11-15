@@ -61,6 +61,28 @@ pub fn struck(within: &Within, names: &[&str]) -> Within {
     left
 }
 
+/// Each hand-off among `acts`, as the log names it: `via → to: intent`.
+///
+/// **What was handed off is said where it can be read.** A private hand-off
+/// becomes a purpose the other conversation says later, in its own words; until
+/// then the turn's own line is the only record of who it went to and what it
+/// meant.
+pub fn described(acts: &[Act]) -> Vec<String> {
+    acts.iter()
+        .filter(|a| HAND_OFFS.contains(&a.tool))
+        .map(|a| {
+            let arg = |k: &str| a.args.get(k).and_then(|v| v.as_str()).unwrap_or("-");
+            format!(
+                "{} {} → {}: {}",
+                a.tool,
+                arg("via"),
+                arg("to"),
+                arg("intent")
+            )
+        })
+        .collect()
+}
+
 /// `act` as the world performs it: a message to somebody else is a `message`.
 pub fn as_performed(act: &Act) -> Act {
     match act.tool == MESSAGE_SOMEONE_ELSE.name {
@@ -95,6 +117,32 @@ mod tests {
             args: json!({"to": "Mira"}).as_object().unwrap().clone(),
         };
         assert_eq!(as_performed(&reply).tool, "reply");
+    }
+
+    /// **A hand-off is named with who it went to and what it meant**, and
+    /// nothing else is named.
+    #[test]
+    fn a_hand_off_is_described_for_the_log() {
+        let acts = [
+            Act {
+                tool: "message_someone_else",
+                args: json!({"via": "private", "to": "Jitter", "intent": "check the heat"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+            Act {
+                tool: "reply",
+                args: json!({"to": "Mira", "intent": "done"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+        ];
+        assert_eq!(
+            described(&acts),
+            ["message_someone_else private → Jitter: check the heat"]
+        );
     }
 
     /// **What was handed off is struck, and nothing else.**
