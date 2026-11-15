@@ -24,6 +24,10 @@ pub(super) enum AdmitPart {
     /// Of `fill`: beginning each admitted offer — its view and store carved —
     /// and recomposing the cohort after it (`Ground::admit`).
     Admit,
+    /// Of `admit`: the begin alone — the case carved, the view's state forked,
+    /// the carried state claimed, the turn sealed under its conversation and
+    /// its prefill started (`Scheduler::begin_admitted`).
+    Begin,
     /// Of `fill`: finding each offer and pricing it (`Ground::peek`) — `price`
     /// is part of it.
     Peek,
@@ -37,7 +41,7 @@ pub(super) enum AdmitPart {
     Frontier,
 }
 
-const PARTS: [AdmitPart; 10] = [
+const PARTS: [AdmitPart; 11] = [
     AdmitPart::Relief,
     AdmitPart::Setup,
     AdmitPart::Fill,
@@ -46,6 +50,7 @@ const PARTS: [AdmitPart; 10] = [
     AdmitPart::Residency,
     AdmitPart::Judge,
     AdmitPart::Admit,
+    AdmitPart::Begin,
     AdmitPart::Conclude,
     AdmitPart::Frontier,
 ];
@@ -58,6 +63,7 @@ impl AdmitPart {
             AdmitPart::Fill => "fill",
             AdmitPart::Price => "price",
             AdmitPart::Admit => "admit",
+            AdmitPart::Begin => "begin",
             AdmitPart::Peek => "peek",
             AdmitPart::Residency => "residency",
             AdmitPart::Judge => "judge",
@@ -121,8 +127,8 @@ mod tests {
         assert_eq!(s.passes, 2);
         assert_eq!(
             s.parts_ms(),
-            "relief=12 setup=0 fill=7 peek=0 price=0 residency=0 judge=0 admit=0 conclude=0 \
-             frontier=40"
+            "relief=12 setup=0 fill=7 peek=0 price=0 residency=0 judge=0 admit=0 begin=0 \
+             conclude=0 frontier=40"
         );
     }
 }

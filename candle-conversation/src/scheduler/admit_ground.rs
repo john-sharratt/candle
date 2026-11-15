@@ -965,19 +965,24 @@ impl AdmitPass<'_> {
         }
         let before = residency_now(self.standing_tier);
         let stranded = interleave::stranded_hole_bytes();
-        let begun = match self.sched.materialise_submit(pending) {
-            Some(work) => match self.sched.begin_admitted(work) {
-                Ok(()) => true,
-                Err(refused) => {
-                    let (work, why) = *refused;
-                    tracing::debug!(
-                        target: "candle_conversation::scheduler::throttle",
-                        "admitted submission could not begin — it waits as carved work: {why}",
-                    );
-                    self.sched.prefill_queue.push_front(work);
-                    false
-                }
-            },
+        let t_begin = Instant::now();
+        let materialised = self.sched.materialise_submit(pending);
+        let started = materialised.map(|work| self.sched.begin_admitted(work));
+        self.sched
+            .wave_stats
+            .admission_split
+            .part(AdmitPart::Begin, t_begin.elapsed());
+        let begun = match started {
+            Some(Ok(())) => true,
+            Some(Err(refused)) => {
+                let (work, why) = *refused;
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::throttle",
+                    "admitted submission could not begin — it waits as carved work: {why}",
+                );
+                self.sched.prefill_queue.push_front(work);
+                false
+            }
             // Its caller has the error, or it went to a turn group whose cases
             // are offered on their own.
             None => true,
@@ -1010,7 +1015,13 @@ impl AdmitPass<'_> {
         // the ground is genuinely gone, and the case waits for the next pass.
         let before = residency_now(self.standing_tier);
         let stranded = interleave::stranded_hole_bytes();
-        if let Err(refused) = self.sched.begin_admitted(work) {
+        let t_begin = Instant::now();
+        let begun = self.sched.begin_admitted(work);
+        self.sched
+            .wave_stats
+            .admission_split
+            .part(AdmitPart::Begin, t_begin.elapsed());
+        if let Err(refused) = begun {
             let (work, why) = *refused;
             tracing::debug!(
                 target: "candle_conversation::scheduler::throttle",
