@@ -305,6 +305,15 @@ stays `F32` and unindexed.
 least **0.999956**. The snapshots are mostly recurrent state; their index is
 the 9 MiB that shrinks.
 
+**Migrated the same day**, daemon stopped, the store copied first: 2,977
+records rewritten in 40 s, the store read back with no `F32` record, and build
+5082 (`eaf12e984`) proven by keep with npcd ready in 47 s and no index refusal.
+
+**BlackWorld's zend store, dry run 2026-11-15:** 113,718 pages, 81,947 MiB →
+21,828 MiB; 28 snapshots; 0 foreign, 0 unreadable; 167,675,482 keys at 45.0 dB,
+cosine mean 0.999984, least 0.999955. Not yet migrated — BlackWorld deploys no
+motherd from main until it is.
+
 ## 9. The micro-harness, and the tuning method
 
 The repository's kernel method (`docs/progressive_yarn.md` §7.6): **attribute
@@ -347,6 +356,39 @@ beside the ones it extends (`qsa_score_rot_harness.rs`,
 4. The append at decode width and at a prefill chunk.
 5. Placement, if round 2 keeps it.
 6. Tensor cores (§5).
+
+### Round 0 — the baseline reader against `F32` (WhiteWorld, 2026-11-15)
+
+RTX 3090, daemon stopped, card idle; `bench_rot_scorer`, median of 50, the
+`F32` kernel built from `82e877016` in its own worktree. Milliseconds a launch;
+the ratio is Q8_0 over `F32`.
+
+| tokens | rows 1 | rows 8 | rows 64 | rows 512 | rows 2048 |
+|---|---|---|---|---|---|
+| 8K | 0.014 / 0.015 (0.92) | 0.014 / 0.016 (0.87) | 0.035 / 0.047 (0.74) | 0.221 / 0.159 (1.39) | 0.711 / 0.504 (1.41) |
+| 32K | 0.017 / 0.017 (1.01) | 0.033 / 0.034 (0.97) | 0.133 / 0.094 (1.41) | 0.800 / 0.512 (1.56) | 3.04 / 2.07 (1.47) |
+| 128K | 0.016 / 0.029 (**0.57**) | 0.044 / 0.066 (0.67) | 0.465 / 0.286 (**1.63**) | 3.40 / 2.95 (1.15) | 13.9 / 12.5 (1.11) |
+| 512K | 0.036 / 0.091 (**0.39**) | 0.269 / 0.240 (1.12) | 1.78 / 1.63 (1.09) | 14.5 / 13.0 (1.12) | 56.7 / 52.5 (1.08) |
+| 1M | 0.059 / 0.169 (**0.35**) | 0.476 / 0.445 (1.07) | 3.51 / 3.21 (1.10) | 28.6 / 26.8 (1.07) | 115 / 107 (1.08) |
+
+(16 pages; 256 pages reads the same within a few percent.)
+
+- **One query row** — a decoding sequence — is as fast or faster at every
+  depth, up to 2.9×: that shape is bound by the key bytes it reads, and reads a
+  quarter of them.
+- **From 64 rows the reader is slower, 6–63%**, worst where the keys fit L2
+  (32K–128K) and the kernel is bound by arithmetic: every key now costs 128
+  int-to-float conversions and 128 scale multiplies ahead of the same FMAs.
+  Eight rows past 512K is 7–13% slower.
+
+**The decode and wide gates below are not met by the baseline reader.** It was
+deployed on WhiteWorld regardless, on the absolute numbers: the worst cell is
++0.18 ms a launch against decode steps that waited about a second on expert
+misses the freed span is there to remove. Rounds 1–3 are what close it, and
+they need attribution this machine could not give: `ncu` refused with
+`ERR_NVGPUCTRPERM` (GPU performance counters are not enabled for this account),
+so registers, spills and occupancy are unread. Run them on BlackWorld, or
+enable the counters here.
 
 **Gates for adoption:**
 
