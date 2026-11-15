@@ -856,7 +856,11 @@ layers:
       # live question and the §9.12 battery ask; asked in turn, later prompts
       # lost sight of the reading. Each part sees the others and is told to ask
       # nothing already asked. A profile's maxima together stay within the 64
-      # one calibration holds.
+      # one calibration holds. Each first prompt says the file was just read
+      # and is above: asked instead for questions "that `<<path>>` answers", a
+      # document's draft set out to read it again — "I need to first read the
+      # document", a `file_read` written out — and wrote none, one docs unit in
+      # nine (BlackWorld, 2026-11-15).
       profiles:
         # A crate's or package's manifest: what it pulls in, what turns on
         # what — "which crates use `cudarc`?", "what does `tensor-assert`
@@ -868,7 +872,7 @@ layers:
             - name: dependencies
               questions: { per_tokens: 120, min: 3, max: 16 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask that `<<path>>` answers. Each one names, exactly as written there, a dependency, feature, target, script or setting it declares, and asks which package depends on it, what version or source it comes from, what a feature turns on, or what building or running a target needs. Ask about each name only once. Some short, like "which crate pulls in `cudarc`?", some longer.
+                Write <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a dependency, feature, target, script or setting it declares, and asks which package depends on it, what version or source it comes from, what a feature turns on, or what building or running a target needs. Ask about each name only once. Some short, like "which crate pulls in `cudarc`?", some longer.
             - name: dependents
               questions: { per_tokens: 400, min: 1, max: 8 }
               prompt: |
@@ -889,7 +893,7 @@ layers:
             - name: verifies
               questions: { per_tokens: 300, min: 4, max: 32 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask that the tests in `<<path>>` answer. Each one names, exactly as written there, a function, type, behaviour or case the tests exercise, and asks where it is tested, what a test checks about it, what input or state it is tested with, or what a failing test there means. Spread them across as many different things under test as the file has, and ask about each only once. Some short, like "where is `tier_fits` tested?", some longer.
+                Write <<n>> questions someone working in this workspace might ask about the tests you just read in `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a function, type, behaviour or case the tests exercise, and asks where it is tested, what a test checks about it, what input or state it is tested with, or what a failing test there means. Spread them across as many different things under test as the file has, and ask about each only once. Some short, like "where is `tier_fits` tested?", some longer.
             - name: covers
               questions: { per_tokens: 500, min: 2, max: 16 }
               prompt: |
@@ -952,7 +956,7 @@ layers:
             - name: settings
               questions: { per_tokens: 200, min: 4, max: 32 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask that `<<path>>` answers. Each one names, exactly as written there, a setting, key, section or value it declares, and asks what it is set to, what it controls, what its allowed values or units are, or where it is set. Spread them across as many different settings as the file has, and ask about each only once. Some short, like "where's `window` set for `code_reading`?", some longer.
+                Write <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a setting, key, section or value it declares, and asks what it is set to, what it controls, what its allowed values or units are, or where it is set. Spread them across as many different settings as the file has, and ask about each only once. Some short, like "where's `window` set for `code_reading`?", some longer.
             - name: readers
               questions: { per_tokens: 400, min: 2, max: 20 }
               prompt: |
@@ -970,7 +974,7 @@ layers:
             - name: concepts
               questions: { per_tokens: 300, min: 4, max: 28 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask that `<<path>>` answers. Each one names, exactly as written there, a concept, rule, invariant, decision, procedure, measurement or term the document itself states or defines, and asks what it is, why it holds, what it was decided over, or how to carry it out. Ask about what the document says, not about code it mentions: never ask where a function or type it names is defined. Spread them across as many of its sections as it has, and ask about each only once. Some short, some longer.
+                Write <<n>> questions someone working in this workspace might ask about the document you just read, `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a concept, rule, invariant, decision, procedure, measurement or term the document itself states or defines, and asks what it is, why it holds, what it was decided over, or how to carry it out. Ask about what the document says, not about code it mentions: never ask where a function or type it names is defined. Spread them across as many of its sections as it has, and ask about each only once. Some short, some longer.
             - name: implements
               questions: { per_tokens: 800, min: 2, max: 16 }
               prompt: |
