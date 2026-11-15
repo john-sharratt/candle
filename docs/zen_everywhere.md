@@ -73,22 +73,30 @@ the world is unchanged.
 
 ## 4. Zen
 
-**Zen has no body.** It keeps a seat in the world's record — the key its
-agenda and its posts hang from — at its home, which nothing else enters and it
-never leaves. It has no movement act (`focus`, `recall` go with `move_to`), is
-in no one's company, and is not perceived.
+**Zen has no body: it is the moon.** It keeps a seat in the world's record —
+the key its agenda and its posts hang from — at its home, which nothing else
+enters and it never leaves. It has no movement act (`focus`, `recall` go with
+`move_to`), is in no one's company, and is not perceived. Its prompt carries
+the moon's levels and rooms as its own insides (`prompt::being`, the member
+`identity::whole_key` names), not as a building it works in: told that, it
+answered a person from "the command level by the order table".
 
-**Zen does not perceive the vault.** No situation is pushed to it and no
-stirring reaches it. It is told only:
+**Zen sees the whole of the moon at once**, and no room of it: one situation
+(`engine/whole.rs`) listing every room with somebody in it, who is there, and
+what each is doing — carrying which mission and its next step, or at rest —
+replaced when it changes and carried at idle salience, so it is read when Zen
+next thinks and is no reason to think. Nothing that stirs in a room reaches
+it. What *happens* is told as it happens:
 
-- **what a terminal raises** — an event from the real world (§5);
+- **a drone takes up work, or comes to rest** (`Runtime::tell_whole`);
 - **a mission's outcome** — done, failed with its reason, a drone stuck;
+- **what a terminal raises** — an event from the real world (§5);
 - **a drone's message**;
 - and a person, who speaks to it in a conversation of their own.
 
 All of it arrives through the one inbox the messaging system already fills.
-Anything Zen should notice unprompted is one of these or goes unseen; it learns
-the rest by connecting and looking.
+What lies outside the moon — the house, the machines — Zen learns by connecting
+and looking.
 
 **Zen's own work is the watch.** Its round stops sending it to rooms to read
 panels. A round item is an observation: connect to a terminal, read what it

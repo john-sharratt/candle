@@ -402,6 +402,13 @@ pub fn building_key(world: &str, part: &str) -> String {
     format!("{world}/{part}")
 }
 
+/// The name a part of a world is installed and selected under for a mind
+/// that *is* it rather than stands in it — [`building_key`]'s member, read as
+/// the mind's own insides (`prompt::being`).
+pub fn whole_key(building: &str) -> String {
+    format!("{building}/as-itself")
+}
+
 fn pick<'a>(
     collection: &str,
     mut installed: impl Iterator<Item = &'a String>,

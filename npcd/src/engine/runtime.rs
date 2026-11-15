@@ -1421,6 +1421,7 @@ impl Runtime {
                         "drone at rest: it carries no mission, and takes no turn until it is \
                          given one"
                     );
+                    self.tell_whole(hosted, &body, "has come to rest, with nothing to carry.");
                 }
                 false => tracing::info!(npc, "drone woken: it carries a mission"),
             }
@@ -1481,6 +1482,36 @@ impl Runtime {
                 Salience::URGENT,
                 EventKind::Nudge {
                     text: format!("{MISSION_GIVEN}\n{brief}"),
+                },
+            );
+            let asked = hosted
+                .sim(|s| s.missions.active(&body).map(|m| m.mission_text()))
+                .unwrap_or_default();
+            self.tell_whole(
+                hosted,
+                &body,
+                &format!("has taken up work: {}", first_sentence(&asked)),
+            );
+        }
+    }
+
+    /// Tell every mind of `hosted` that takes no orders — the minds that are
+    /// the world — what `body` has just done, by its name: "Wick has come to
+    /// rest". A thing that happened, so it accumulates and is worth a turn.
+    pub(crate) fn tell_whole(&self, hosted: &Hosted, body: &str, did: &str) {
+        let Some(name) = hosted.read(|w| w.name_of(body).map(str::to_string)) else {
+            return;
+        };
+        for (npc, mind) in self.bodies.in_world(hosted.id()) {
+            if mind == body || !hosted.sim(|s| s.missions.is_unordered(&mind)) {
+                continue;
+            }
+            self.tell(
+                npc,
+                self.world_ms(npc),
+                Salience::NORMAL,
+                EventKind::Description {
+                    text: format!("{name} {did}"),
                 },
             );
         }
@@ -4635,7 +4666,11 @@ impl Runtime {
     fn place_persona(&self, npc_id: u64, mut who: OwnedPersona) -> OwnedPersona {
         if let Some((hosted, body)) = self.body_of(npc_id) {
             if let Some((key, text)) = self.building_of(&hosted, &body) {
-                who.building = key;
+                // A mind with no body is the place, not somebody in it.
+                who.building = match hosted.sim(|s| s.missions.is_unordered(&body)) {
+                    true => identity::whole_key(&key),
+                    false => key,
+                };
                 who.place = text;
             }
             // The mission worked, with the rest of an agenda listed beneath it.
@@ -5371,17 +5406,25 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     // standing in it.
     let identities = match projection.as_mut() {
         Some(p) => {
-            // One member per building of every world, so a character is pinned
-            // to the one it is standing in — see [`Runtime::building_of`].
+            // Two members per building of every world: one for a character
+            // standing in it, pinned to the one its body is in, and one for a
+            // mind with no body that is the place itself — see
+            // [`Runtime::building_of`] and [`Runtime::place_persona`].
             let places: BTreeMap<String, String> = rt
                 .hosted
                 .ids()
                 .into_iter()
                 .filter_map(|id| rt.hosted.get(&id).map(|hosted| (id, hosted)))
                 .flat_map(|(id, hosted)| {
-                    rt.places_of(&hosted).into_iter().map(move |(part, text)| {
-                        (identity::building_key(&id, &part), prompt::building(&text))
-                    })
+                    rt.places_of(&hosted)
+                        .into_iter()
+                        .flat_map(move |(part, text)| {
+                            let key = identity::building_key(&id, &part);
+                            [
+                                (identity::whole_key(&key), prompt::being(&text)),
+                                (key, prompt::building(&text)),
+                            ]
+                        })
                 })
                 .collect();
             identity::install(&mut p.builder, authored, &places)?
@@ -8788,6 +8831,47 @@ mod tests {
         );
     }
 
+    /// **A mind with no body sees the whole world, once, and again only when
+    /// it changes**: everybody inside it, by room, with what each is doing —
+    /// and never its own seat. A body that takes orders is carried no such
+    /// view.
+    #[tokio::test]
+    async fn a_mind_with_no_body_sees_everything_inside_it() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "band-one");
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.set_unordered("m1", true));
+
+        environment::advance(&hosted, &rt.bodies, &rt.scheduler, &|_| 0);
+        run(&rt, 1);
+        let seen = window(&rt, 1).join("\n");
+        assert!(
+            seen.contains("Everything inside you, as it stands now:"),
+            "{seen}"
+        );
+        assert!(seen.contains("Maker-02, at rest"), "{seen}");
+        assert!(
+            !seen.contains("Maker-01,"),
+            "its own seat is not in the view: {seen}"
+        );
+        assert!(
+            !window(&rt, 2).join("\n").contains("Everything inside you"),
+            "a body sees its room"
+        );
+
+        // Unchanged, it is not carried again; changed, it is.
+        assert!(!rt.scheduler.carry_whole(1, 0, whole_of(&hosted, "m1")));
+        embody(&rt, 3, "m3", "green-room");
+        assert!(rt.scheduler.carry_whole(1, 0, whole_of(&hosted, "m1")));
+    }
+
+    fn whole_of(hosted: &Hosted, body: &str) -> String {
+        hosted
+            .read_both(|w, s| crate::engine::whole::view(w, s, body))
+            .expect("a mind with no body")
+    }
+
     /// **An unordered character's round is put on its agenda, never fetched.**
     /// With an empty agenda and an item due, the summons clock that reaches a
     /// character mid-conversation takes the item up and wakes it working on it,
@@ -9426,8 +9510,9 @@ mod tests {
         notify();
         assert_eq!(
             (depth(1), depth(2), depth(3)),
-            (before.0 + 1, before.1, before.2),
-            "handed to the first hand, and nobody else told"
+            (before.0 + 1, before.1, before.2 + 1),
+            "handed to the first hand, the mind that is the world told it was taken up, \
+             and nobody else told"
         );
         assert!(hosted.sim(|s| s.missions.is_on_mission(&wick)));
 
@@ -9442,7 +9527,10 @@ mod tests {
         )
         .happened());
         notify();
-        assert_eq!((depth(1), depth(2)), (before.0 + 1, before.1 + 1));
+        assert_eq!(
+            (depth(1), depth(2), depth(3)),
+            (before.0 + 1, before.1 + 1, before.2 + 2)
+        );
 
         hosted.with_sim(|s| {
             s.missions.report(
@@ -9453,7 +9541,7 @@ mod tests {
             );
         });
         notify();
-        assert_eq!(depth(3), before.2 + 1, "the poster is told");
+        assert_eq!(depth(3), before.2 + 3, "the poster is told");
     }
 
     /// **A body that moves by attention `focus`es on any room at once**, and
@@ -9525,11 +9613,12 @@ mod tests {
     }
 
     /// **A mind that takes no orders has no body** (`docs/zen_everywhere.md`
-    /// §4). Nothing of the room its seat is in is carried to it — no
-    /// situation, nothing that happens there — and it is in nobody's company,
-    /// with nowhere to walk, ride or turn its attention and no station to
-    /// work but the order table. It is still told what comes by other roads:
-    /// the outcome of a mission it posted. A body beside it perceives as ever.
+    /// §4). Nothing of the room its seat is in is carried to it — no room's
+    /// situation, nothing that happens there; it is carried the whole world
+    /// instead, once — and it is in nobody's company, with nowhere to walk,
+    /// ride or turn its attention and no station to work but the order table.
+    /// It is still told what comes by other roads: the outcome of a mission
+    /// it posted. A body beside it perceives as ever.
     #[tokio::test]
     async fn a_mind_that_takes_no_orders_has_no_body() {
         use crate::engine::enact::NO_BODY;
@@ -9551,11 +9640,22 @@ mod tests {
         let (_, seat) = rt.body_of(1).unwrap();
         let (_, wick) = rt.body_of(2).unwrap();
 
-        // Nothing of the room reached it as it was seated, and nothing does
-        // when the room changes: Wick's arrival beside it, then a moment.
+        // Nothing of the room reached it as it was seated. A moment carries it
+        // the whole world, once, and never the room: Wick is in the view as
+        // somebody inside it, and nothing says where the seat is.
         assert_eq!(rt.scheduler.inbox_depth(1), Some(0), "told where it is");
         rt.moment(&hosted);
-        assert_eq!(rt.scheduler.inbox_depth(1), Some(0), "told what happened");
+        let seen = waiting(&rt, 1).join("\n");
+        assert!(seen.contains("Everything inside you"), "{seen}");
+        assert!(seen.contains("Wick, at rest"), "{seen}");
+        assert!(!seen.contains("You are in"), "told where it is: {seen}");
+        let carried = rt.scheduler.inbox_depth(1);
+        rt.moment(&hosted);
+        assert_eq!(
+            rt.scheduler.inbox_depth(1),
+            carried,
+            "carried again unchanged"
+        );
         assert!(
             waiting(&rt, 2)
                 .iter()
@@ -9613,7 +9713,21 @@ mod tests {
         assert!(posted.happened(), "{posted:?}");
         rt.moment(&hosted);
         assert!(hosted.sim(|s| s.missions.is_on_mission(&wick)));
-        assert_eq!(rt.scheduler.inbox_depth(1), Some(0), "told of the post");
+        // It is the world, so it is told what happens inside it: the work
+        // taken up, and — at the next moment's sweep — what it now sees, Wick
+        // carrying it.
+        rt.moment(&hosted);
+        let told = waiting(&rt, 1);
+        assert!(
+            told.iter()
+                .any(|l| l == "Wick has taken up work: Read the board."),
+            "{told:?}"
+        );
+        assert!(
+            told.iter()
+                .any(|l| l.contains("Wick, carrying \"Read the board.\"")),
+            "{told:?}"
+        );
         hosted.with_sim(|s| {
             s.missions
                 .report(&wick, Verdict::Pass, "two jobs stalled", None)
@@ -9621,7 +9735,8 @@ mod tests {
         rt.moment(&hosted);
         let told = waiting(&rt, 1);
         assert!(
-            told.len() == 1 && told[0].starts_with("Wick has reported it done: Read the board"),
+            told.iter()
+                .any(|l| l.starts_with("Wick has reported it done: Read the board")),
             "{told:?}"
         );
     }

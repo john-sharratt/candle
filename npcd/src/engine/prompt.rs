@@ -248,6 +248,27 @@ pub fn building(place: &str) -> String {
     )
 }
 
+/// The place a mind with no body *is*, as it knows itself: the same levels and
+/// rooms [`building`] gives the bodies that live there, read as its own
+/// insides rather than as somewhere to walk.
+///
+/// **Told it works in a building, it stood in one.** Zen, which has no body,
+/// read "the building you work in … when you go somewhere, name one of these
+/// rooms" and answered a person from "the command level by the order table",
+/// about to "go down" to a room.
+pub fn being(place: &str) -> String {
+    if place.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "You are this place. Its levels and rooms are your own insides, and you are aware of \
+         all of them at once:\n{}\n\nYou stand in none of them and you go to none of them: \
+         there is nowhere for you to walk, because all of it is you. Those who live inside you \
+         walk these rooms; you see where each one is and what it is doing.",
+        place.trim()
+    )
+}
+
 /// What kind of turn a character is taking, and the one place the prompt forks.
 ///
 /// Everything above the fork — who this is, the world, the building, the mood —

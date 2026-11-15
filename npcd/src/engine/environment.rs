@@ -49,6 +49,7 @@ use crate::engine::reach;
 use crate::engine::tick::Scheduler;
 use crate::engine::tools;
 use crate::engine::whereabouts;
+use crate::engine::whole;
 use crate::sim::phone;
 use crate::sim::unread::Due;
 use crate::world::binding::Bindings;
@@ -263,10 +264,11 @@ fn company_line(world: &World, body: &str) -> Option<String> {
 ///
 /// **A mind that takes no orders has no body to perceive with**
 /// (`docs/zen_everywhere.md` §4): it keeps a seat in the world's record, and
-/// no situation is composed for it and nothing that stirs where the seat is
-/// reaches it. What it is told comes by other roads — a mission's outcome, a
-/// message, a person's conversation — and the rest it learns by looking. Its
-/// seat is swept like a body with no mind, so its cursor never falls behind.
+/// nothing that stirs where the seat is reaches it, nor any room's situation.
+/// It is the world, and sees the whole of it instead ([`whole::view`]); what
+/// happens reaches it by other roads — work taken up, a hand come to rest, a
+/// mission's outcome, a message, a person's conversation. Its seat is swept
+/// like a body with no mind, so its cursor never falls behind.
 fn perceives(hosted: &Hosted, body: &str) -> bool {
     !hosted.sim(|s| s.missions.is_unordered(body))
 }
@@ -325,6 +327,17 @@ fn push_minds(
     time: &WorldTimeOf,
     reach: &Reach,
 ) -> usize {
+    // A mind with no body sees the whole world rather than a room of it: one
+    // situation, carried when it has changed since it was last carried.
+    let mut told = 0;
+    for (body, &npc_id) in minds.iter().filter(|(_, &npc_id)| (reach.here)(npc_id)) {
+        let Some(seen) = hosted.read_both(|w, s| whole::view(w, s, body)) else {
+            continue;
+        };
+        if sched.carry_whole(npc_id, time(npc_id), seen) {
+            told += 1;
+        }
+    }
     // The bodies perceived here, read before the world's lock: one with no mind,
     // whose character runs on another member, or whose mind has no body to
     // perceive with ([`perceives`]) is swept without a percept being composed
@@ -335,10 +348,6 @@ fn push_minds(
         .map(|(body, &npc_id)| (body.clone(), npc_id))
         .collect();
     let deltas = hosted.sweep_for(|body| perceived.contains_key(body));
-    if deltas.is_empty() {
-        return 0;
-    }
-    let mut told = 0;
     for delta in &deltas {
         let Some(&npc_id) = perceived.get(&delta.who) else {
             continue;

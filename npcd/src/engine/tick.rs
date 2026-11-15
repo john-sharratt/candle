@@ -38,6 +38,7 @@
 //! lands rather than at the next poll.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -602,6 +603,9 @@ pub struct Scheduler {
     /// rather than by their owner — each with the scheduler's clock when its
     /// rest began. See [`Self::rest`].
     resting: Mutex<HashMap<u64, u64>>,
+    /// A digest of the whole-world view last carried to each mind that is its
+    /// world. See [`Self::carry_whole`].
+    whole: Mutex<HashMap<u64, u64>>,
     /// Where a character's conversation lines and purposes go instead of its
     /// inbox: its conversations answer them, never its mind
     /// (`docs/npc_conversations.md` §9). Set once by the runtime.
@@ -628,6 +632,7 @@ impl Scheduler {
             born: Instant::now(),
             suspended: Mutex::new(HashSet::new()),
             resting: Mutex::new(HashMap::new()),
+            whole: Mutex::new(HashMap::new()),
             talk: OnceLock::new(),
         }
     }
@@ -687,6 +692,30 @@ impl Scheduler {
             self.resume(npc_id);
         }
         changed
+    }
+
+    /// Deliver `seen` — what a mind that is its world sees of the whole of it
+    /// — as its situation, when it differs from what it was last carried.
+    /// Returns whether it was delivered.
+    ///
+    /// The view is composed every moment and is the same for hours; a
+    /// situation carried again unchanged is a turn's worth of prompt rewritten
+    /// for nothing. At idle salience: a view is there to be read when the mind
+    /// next thinks, and is no reason to think.
+    pub fn carry_whole(&self, npc_id: u64, at_ms: u64, seen: String) -> bool {
+        let mut h = DefaultHasher::new();
+        seen.hash(&mut h);
+        let digest = h.finish();
+        if self.whole.lock().unwrap().insert(npc_id, digest) == Some(digest) {
+            return false;
+        }
+        self.deliver(
+            npc_id,
+            at_ms,
+            Salience::IDLE,
+            EventKind::Situation { text: seen },
+        );
+        true
     }
 
     /// Whether this character is at rest.
