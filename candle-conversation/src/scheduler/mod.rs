@@ -30,6 +30,16 @@ mod admission_split;
 /// also what a caller that queues many turns at once sizes its window by, so
 /// it never queues more than the scheduler can run.
 pub const MAX_PREFILL_WIDTH: usize = 24;
+
+/// The decode counterpart of [`MAX_PREFILL_WIDTH`], and a backstop of exactly
+/// the same kind: the rate model is the real throttle, and this is the dumb
+/// ceiling beneath it so an error in the cost model costs throughput rather
+/// than the daemon.
+///
+/// Sixty-four, which is the width the aggregate benchmark runs at — the engine
+/// is known to carry that many sessions, so a cap below it would refuse work
+/// the hardware has already been shown to do.
+pub const MAX_DECODE_WIDTH: usize = 64;
 /// Rate-based wave budgeting — **compiled and tested, not yet wired.**
 ///
 /// Admission: [`admit::fill`] is the path, and [`admit_ground::AdmitPass`] is
@@ -7218,16 +7228,6 @@ impl Scheduler {
         );
         let _ = response_tx.send(Ok(idx));
     }
-
-    /// The decode counterpart of [`MAX_PREFILL_WIDTH`], and a backstop of
-    /// exactly the same kind: the rate model is the real throttle, and this is
-    /// the dumb ceiling beneath it so an error in the cost model costs
-    /// throughput rather than the daemon.
-    ///
-    /// Sixty-four, which is the width the aggregate benchmark runs at — the
-    /// engine is known to carry that many sessions, so a cap below it would
-    /// refuse work the hardware has already been shown to do.
-    pub(super) const MAX_DECODE_WIDTH: usize = 64;
 
     /// Multiplicative-decrease the admission budget: halve it toward one quantum.
     /// Called from every throttle signal — VRAM pressure surviving an eviction

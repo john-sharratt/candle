@@ -40,7 +40,8 @@ use candle_conversation::projection::{
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::{
-    ConversationEngine, FinishOrder, Sequence, SequenceConfig, TurnOptions, MAX_PREFILL_WIDTH,
+    ConversationEngine, FinishOrder, Sequence, SequenceConfig, TurnOptions, MAX_DECODE_WIDTH,
+    MAX_PREFILL_WIDTH,
 };
 
 use super::ask::Ask;
@@ -105,10 +106,22 @@ fn failures_of(recorded: Option<&str>, marker: &str) -> u32 {
 /// does not hold a draft's place. The scheduler's waves pace the decode.
 const CALIBRATE_PARALLELISM: usize = 3 * LAYER_PARALLELISM;
 
-/// The places every unit's questions share while they think: as many as the
-/// scheduler runs prefills at once ([`MAX_PREFILL_WIDTH`]), so no more
-/// thinking turns stand queued than it can take ([`thoughts`]).
-static THINKING: Permits = Permits::new(MAX_PREFILL_WIDTH);
+/// The places every unit's questions share while they think ([`thoughts`]):
+/// enough to keep the card full, and few enough that no thinking turn stands
+/// queued for admission long enough to be given up.
+///
+/// **Past both of the scheduler's widths, because a thinking turn spends most
+/// of its life decoding.** Its prefill is the shared system prompt and one
+/// question; its decode is the thinking budget. Gated at the prefill width
+/// alone (24), the places were held by turns decoding while the prefill sat
+/// half empty — 11.8 prefill and 13.3 decode rows in flight on BlackWorld
+/// (2026-11-15), and a unit's thinking took up to 337 s. At 128, the
+/// scheduler's prefill and decode ([`MAX_PREFILL_WIDTH`] + [`MAX_DECODE_WIDTH`]
+/// = 88) are both kept full with a short queue behind them, far below the
+/// ~550 that, asked all at once, stood long enough to trip the stall limit.
+const THINKING_WIDTH: usize = 128;
+const _: () = assert!(THINKING_WIDTH >= MAX_PREFILL_WIDTH + MAX_DECODE_WIDTH);
+static THINKING: Permits = Permits::new(THINKING_WIDTH);
 
 /// What one layer's pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -520,7 +533,7 @@ fn thinking_selection() -> SelectionState {
 /// again by a later pass.
 ///
 /// **No more in the queue than the scheduler runs.** Every unit's questions
-/// share one gate ([`THINKING`]), as wide as the scheduler's prefill: a unit
+/// share one gate ([`THINKING`]), as wide as the scheduler runs turns: a unit
 /// submits a question only while it holds a place, and gives the place back
 /// as the question's turn ends, when it submits its next. Asked every question
 /// at once, a dozen units stood ~550 turns in the queue against 24 run at a

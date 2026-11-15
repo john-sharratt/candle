@@ -42,8 +42,8 @@ use super::admission_split::AdmitPart;
 use super::admit::{Budget, Cost, FillPart, Ground, Headroom, Kind};
 use super::band::rank;
 use super::interleave;
-use super::MAX_PREFILL_WIDTH;
 use super::{Scheduler, SequenceId, WaveMember};
+use super::{MAX_DECODE_WIDTH, MAX_PREFILL_WIDTH};
 use crate::projection::DecodePriority;
 use candle_nn::kv_cache::CHUNK_SIZE;
 
@@ -1373,7 +1373,7 @@ impl Scheduler {
             prefill_floor: room.prefill_floor().saturating_add(room.forward_reserve),
             decode_floor: room.floor().saturating_add(room.forward_reserve),
             max_rows: chunk_rows,
-            max_decodes: Self::MAX_DECODE_WIDTH,
+            max_decodes: MAX_DECODE_WIDTH,
         }
     }
 
