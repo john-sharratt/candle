@@ -40,7 +40,8 @@ pub const JOURNAL_TOKENS: usize = 480;
 
 /// How a turn's words are decoded, as part of the frame a conversation is
 /// resumed under: with no act shown to them ([`tools::show_none`]), and no
-/// brace to open a call with (`words`).
+/// brace to open a call with (`words`) — a ban the sampler holds the turn to,
+/// since a turn's own banned tokens reach it (`turn_bans`).
 ///
 /// **A conversation's history teaches its next words.** Words decoded while the
 /// thread's acts were still listed came out as the decision written as text —
@@ -48,7 +49,7 @@ pub const JOURNAL_TOKENS: usize = 480;
 /// how this character answers. Naming the shape in the frame means a
 /// conversation sealed under another shape is not resumed: its next turn opens
 /// a new generation and retires the old ones (§4.1).
-const WORDS_SHAPE: &str = "words: no acts shown, no brace";
+const WORDS_SHAPE: &str = "words: no acts shown, no brace, banned at the sampler";
 
 /// How much of a turn's decision its log line shows, in characters.
 const DECISION_SHOWN: usize = 600;
