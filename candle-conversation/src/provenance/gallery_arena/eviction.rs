@@ -121,11 +121,47 @@ pub fn index_cache_evictions(
     out
 }
 
+/// The share of a card's memory the cached scan indices may hold together:
+/// one forty-eighth.
+const INDEX_CACHE_SHARE: u64 = 48;
+
+/// The least the cached scan indices may hold, whatever the card.
+const INDEX_CACHE_FLOOR: u64 = 256 << 20;
+
+/// Device bytes the cached scan indices may hold together on a card of
+/// `total` bytes: a forty-eighth of it, never under [`INDEX_CACHE_FLOOR`].
+///
+/// An index's arrays live in the driver pool — outside the span and the
+/// gallery's own ceiling — at about 8 bytes per scanned token, so the budget is
+/// memory nothing else accounts for and is kept a small share of the card.
+///
+/// **Sized by the card, because an index past the budget is never cached.** It
+/// was a fixed 256 MiB. Calibrated, the `code_reading` gallery's scan covers 36
+/// million tokens across 173,833 turns — an index of ~288 MB — so it was rebuilt
+/// on every reprojection, ~550 ms of walk and upload each, and projection took
+/// 3.9 s of a 5 s slot (BlackWorld, 2026-11-16). A forty-eighth holds it five
+/// times over on the 72 GB card, once on the 16 GB one.
+pub fn index_cache_budget(total: u64) -> u64 {
+    (total / INDEX_CACHE_SHARE).max(INDEX_CACHE_FLOOR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
+
+    /// **A forty-eighth of the card, never under 256 MiB** — on each
+    /// development card's reported total.
+    #[test]
+    fn the_index_cache_holds_a_share_of_the_card() {
+        let gib = 1024 * MIB;
+        assert_eq!(index_cache_budget(72 * gib), 1_536 * MIB);
+        assert_eq!(index_cache_budget(24 * gib), 512 * MIB);
+        assert_eq!(index_cache_budget(16 * gib), 341 * MIB + 341 * 1024 + 341);
+        assert_eq!(index_cache_budget(8 * gib), 256 * MIB, "the floor");
+        assert_eq!(index_cache_budget(0), 256 * MIB);
+    }
 
     /// Within both bounds nothing goes.
     #[test]

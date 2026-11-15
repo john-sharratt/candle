@@ -60,20 +60,12 @@ use candle_nn::kv_cache::{
 use crate::persistence::streams::StreamId;
 
 use dedup::Dedup;
-use eviction::{index_cache_evictions, past_keep, Resident};
+use eviction::{index_cache_budget, index_cache_evictions, past_keep, Resident};
 use lease::IndexLease;
 
 /// Max distinct segment-set indices cached at once — a handful of belief groups
 /// per reprojection, so this comfortably covers a whole reproject's scans.
 const INDEX_CACHE_CAP: usize = 16;
-
-/// Device bytes the cached indices may hold together. An index's arrays live in
-/// the driver pool — outside the span and the gallery's own ceiling — at about
-/// 8 bytes per scanned token, so the 7.4M-token `code_reading` scan alone holds
-/// ~60 MB; sixteen entries left unbounded could hold a gigabyte nothing else
-/// accounts for. This covers a working set of a couple of conversations' large
-/// groups plus the small ones.
-const INDEX_CACHE_BYTES: u64 = 256 << 20;
 
 /// How often a reused index records its turns' use. What reads it — the keep
 /// trade's `keep_within`, hours on every card measured — does not resolve five
@@ -234,6 +226,9 @@ pub struct GalleryArena {
     /// multi-GPU setups — e.g. mixed Ada/Blackwell — resolve each arena's
     /// backend ladder against its own device.
     tensor_caps: OnceLock<(bool, bool)>,
+    /// Device bytes the cached indices may hold together
+    /// ([`index_cache_budget`] of this arena's card).
+    index_cache_bytes: u64,
     /// Per-scan indices (page_ptr / pos_map / case / seg prefixes) keyed by segment
     /// fingerprint, reused when the same segment set is rescanned and every turn
     /// it references still holds the run it was built against — skipping the
@@ -286,6 +281,10 @@ impl GalleryArena {
             candle::bail!("gallery arena requires a CUDA device");
         }
         assert!(n_groups <= GroupSet::MAX, "{n_groups} fold groups");
+        let Device::Cuda(cuda) = device else {
+            candle::bail!("gallery arena requires a CUDA device");
+        };
+        let (_, total) = cuda.mem_get_info()?;
         Ok(Self {
             residency: Mutex::new(HashMap::new()),
             lru_clock: AtomicU64::new(0),
@@ -300,6 +299,7 @@ impl GalleryArena {
             zero_page: Mutex::new(None),
             dedup: Dedup::new(wpt),
             tensor_caps: OnceLock::new(),
+            index_cache_bytes: index_cache_budget(total as u64),
             device: device.clone(),
             wpt,
             n_groups,
@@ -948,14 +948,14 @@ impl GalleryArena {
 
     /// Cache `idx` under `fingerprint` for reuse, evicting the least recently
     /// used entries until the cache is inside both [`INDEX_CACHE_CAP`] entries
-    /// and [`INDEX_CACHE_BYTES`] of device arrays. An index larger than the
+    /// and [`Self::index_cache_bytes`] of device arrays. An index larger than the
     /// byte bound on its own is not cached: it would evict everything and still
     /// not fit.
     fn store_index(&self, fingerprint: u64, idx: Arc<scan::PagedIndex>) {
         let bytes = idx.device_bytes();
         let mut cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.remove(&fingerprint);
-        if bytes > INDEX_CACHE_BYTES {
+        if bytes > self.index_cache_bytes {
             self.publish_indexes(&cache);
             return;
         }
@@ -963,7 +963,7 @@ impl GalleryArena {
             .iter()
             .map(|(&fp, e)| (fp, e.used.load(Ordering::Relaxed), e.device_bytes()))
             .collect();
-        for fp in index_cache_evictions(&entries, bytes, INDEX_CACHE_CAP, INDEX_CACHE_BYTES) {
+        for fp in index_cache_evictions(&entries, bytes, INDEX_CACHE_CAP, self.index_cache_bytes) {
             cache.remove(&fp);
         }
         idx.used.store(
