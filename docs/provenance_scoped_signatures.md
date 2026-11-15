@@ -205,38 +205,50 @@ measured the gap: its exemplars were ~95% think block and call, and when plain
 questions joined them as exemplars Top-1 rose 74.5% → 87.9%
 (`docs/tool_selection_provenance_results.md` §26.3). A unit is given the same.
 
-- **Declared per layer.** A layer opts in with a `calibrate:` block — how many
-  questions, the decode budget of each question's thinking (`think`), and the
-  prompt that asks for them (`<<n>>`, `<<subject>>`, `<<file>>`, `<<repo>>`,
-  `<<path>>`). Nothing names a layer; `code_reading` declares 64 thinking
+- **Declared per layer.** A layer opts in with a `calibrate:` block — the
+  decode budget of each question's thinking (`think`), and the prompts that
+  ask for questions, each with its own count (`<<n>>`, `<<subject>>`,
+  `<<file>>`, `<<repo>>`, `<<path>>`). Nothing names a layer; `code_reading` declares 64 thinking
   tokens — one projection's worth: a turn's first reprojection fires by the
   64-token cadence, so the probe that decides what is pulled in has seen at
   most that much of the model's thinking.
-- **As many questions as the unit has to be asked about.** The count is a
-  rule, not a number: one question per `per_tokens` of the unit's own sealed
-  tokens, held to `min..=max` (`calibrate/count.rs`); `code_reading` asks one
-  per 250 tokens, 8 to 64. A file defining forty things has forty names to
-  be asked about, and a ten-line module a few — one count for both left the
-  first with most of its names unasked and the second rephrasing itself.
-  The sealed tokens are what the ingest actually read, and the same on every
+- **Several prompts, each for one kind of question.** A layer declares a
+  list of prompts (`calibrate/ask.rs`), asked in turn in one draft:
+  `code_reading` asks for what the file **defines** ("where's `tier_fits`
+  defined?"), how that is **used** ("what calls it, what breaks if it
+  changes?" — the transitive questions) and its **purpose** (the
+  architectural ones). One prompt asking for every kind wrote nearly all
+  "what does X do / why" questions and almost none of the others
+  (BlackWorld, 2026-11-15). Each later prompt sees the reading and the
+  earlier answers, and is told to ask nothing already asked; a question one
+  prompt repeats of another's word for word is kept once. A drawn guide is
+  asked its guidance prompt alone.
+- **As many questions as the unit has to be asked about.** Each prompt's
+  count is a rule, not a number: one question per `per_tokens` of the unit's
+  own sealed tokens, held to `min..=max` (`calibrate/count.rs`) — definitions
+  one per 300 (4–32), uses one per 400 (3–24), purpose one per 3,000 (2–8),
+  their maxima together the 64 one calibration holds. A file defining forty
+  things has forty names to be asked about, and a ten-line module a few. The
+  sealed tokens are what the ingest actually read, and the same on every
   member, since a unit is calibrated only once it holds every turn. The
-  marker digests the rule, not the count, so a unit's count follows from the
-  rule and the content its key names. Over BlackWorld's 6,533 readings
-  (2026-11-15: median 2,815 tokens, p90 11,568) the rule asks 126k questions
-  against a flat 24's 157k — median 12, p90 47, the 409 largest at 64.
-  More exemplars give a unit more windows to win votes with in its
-  competition; the per-child background (`docs/provenance_score_normalization.md`)
-  is what takes a case's base rate out of its vote.
+  marker digests the prompts, their rules and order, not the counts, so a
+  unit's counts follow from the rules and the content its key names. Over
+  BlackWorld's 6,533 readings (median 2,815 tokens, p90 11,568) the prompts
+  ask 173k questions — median 10 + 8 + 2, p90 32 + 24 + 4 — against a flat
+  24's 157k. More exemplars give a unit more windows to win votes with in
+  its competition; the per-child background
+  (`docs/provenance_score_normalization.md`) is what takes a case's base
+  rate out of its vote.
 - **Written by the unit.** Each unit is asked in a draft forked from its
   layer's base with the unit as its lineage — so it writes its questions with
   its whole content in front of it — without reasoning or tools. The draft is
   tombstoned once its answer is read; one question per line is kept.
 - **Diverse by how they are asked for.** Each question is an exemplar the
   unit votes with, and a rephrasing takes a second window to vote the same
-  probes twice — so the prompt asks for each question to be about something
-  the others are not, a different name or a different thing about it, and
-  never a rewording. Variety is the writer's to get right, not a filter's to
-  enforce after the decode was paid for.
+  probes twice — so each prompt asks for its questions spread across as many
+  different names as the file has, and each later one for nothing already
+  asked. Variety is the writer's to get right, not a filter's to enforce
+  after the decode was paid for.
 - **Thought about as a live turn is.** A live probe is the trailing window of
   what the model decodes, and for most of a turn that is its own thinking,
   which no question exemplar resembles. Each question is asked again alone —

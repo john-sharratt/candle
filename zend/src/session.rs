@@ -9990,22 +9990,35 @@ mod projection_schema_tests {
             ScanCases::Exchange
         );
         // Each file's reading is calibrated with the questions it answers,
-        // each opening the thinking it starts.
+        // each opening the thinking it starts: what it defines, how that is
+        // used, and what the file is for, each on its own budget.
         let calibrate = CalibrateSpec::of(layer("code_reading"))
             .unwrap()
             .expect("code_reading declares a calibration");
+        assert_eq!(calibrate.think, 64);
+        let rule = |per_tokens, min, max| QuestionCount {
+            per_tokens,
+            min,
+            max,
+        };
         assert_eq!(
-            (calibrate.questions, calibrate.think),
-            (
-                QuestionCount {
-                    per_tokens: 250,
-                    min: 8,
-                    max: 64
-                },
-                64
-            )
+            calibrate
+                .prompts
+                .iter()
+                .map(|a| (a.name.as_str(), a.questions))
+                .collect::<Vec<_>>(),
+            [
+                ("definitions", rule(300, 4, 32)),
+                ("uses", rule(400, 3, 24)),
+                ("purpose", rule(3000, 2, 8)),
+            ]
         );
-        assert!(calibrate.prompt.contains("<<path>>"));
+        assert!(calibrate
+            .prompts
+            .iter()
+            .all(|a| a.prompt.contains("<<path>>") && a.prompt.contains("<<n>>")));
+        let guidance = calibrate.guidance.expect("the guidance group draws");
+        assert_eq!(guidance.ask.questions, rule(250, 8, 64));
 
         let ws = layer("dialogue")
             .working_set

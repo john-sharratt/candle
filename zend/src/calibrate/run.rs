@@ -27,7 +27,7 @@
 //! the unit is scored, and is then archived — the commit — and distilled
 //! provenance-only: its K/V is dropped and its signatures stay.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -456,17 +456,18 @@ fn calibrate_one(
         .conversation()
         .read()
         .timeline_token_total(unit.timeline);
-    let wanted = spec.questions.for_tokens(tokens);
-    let (asked, draft_ms) = {
+    let (drafted, draft_ms) = {
         let _draft = draft_permit;
         let t_draft = Instant::now();
-        let asked = draft(engine, spec, base, unit, wanted)?;
-        (asked, t_draft.elapsed().as_millis() as u64)
+        let drafted = draft(engine, spec, base, unit, tokens)?;
+        (drafted, t_draft.elapsed().as_millis() as u64)
     };
-    let found = questions(&asked, wanted);
+    let wanted = drafted.wanted;
+    let found = drafted.questions;
     if found.is_empty() {
-        let opening: String = asked.chars().take(160).collect();
-        anyhow::bail!("{NO_QUESTION} ({} chars: {opening:?})", asked.len());
+        let last = &drafted.last_answer;
+        let opening: String = last.chars().take(160).collect();
+        anyhow::bail!("{NO_QUESTION} ({} chars: {opening:?})", last.len());
     }
     let t_think = Instant::now();
     let thought = thoughts(engine, frame, spec, &found)?;
@@ -601,16 +602,30 @@ fn thoughts(
     thought
 }
 
-/// The unit's answer to its layer's calibration prompt, asking for `wanted`
-/// questions, in a draft whose lineage is the unit; the draft is tombstoned
-/// either way.
+/// What a unit's draft wrote: its questions from every prompt, in the order
+/// asked, how many the prompts asked for, and the last answer, which a draft
+/// that wrote no question is reported by.
+struct Drafted {
+    questions: Vec<String>,
+    wanted: usize,
+    last_answer: String,
+}
+
+/// The unit's answers to its layer's calibration prompts, asked in turn in one
+/// draft whose lineage is the unit, each for as many questions as its rule
+/// gives a unit of `tokens`; the draft is tombstoned either way.
+///
+/// **One draft, every prompt in turn.** Each later prompt is asked with the
+/// unit's reading and the earlier answers in front of it, so it can be told to
+/// ask nothing already asked; a question one prompt repeats of another's word
+/// for word is kept once.
 fn draft(
     engine: &ConversationEngine,
     spec: &CalibrateSpec,
     base: &Sequence,
     unit: &Unit,
-    wanted: usize,
-) -> anyhow::Result<String> {
+    tokens: usize,
+) -> anyhow::Result<Drafted> {
     on_a_draft(
         engine,
         &spec.layer,
@@ -627,23 +642,40 @@ fn draft(
                     .banned_tokens
                     .push(sampling.tool_call_open_token_id);
             }
-            let options = TurnOptions {
-                max_tokens: Some(DRAFT_MAX_TOKENS),
-                sampling: Some(sampling),
-                selection: draft_selection(),
-                tags: vec![TAG.to_string()],
-                ..Default::default()
+            let mut out = Drafted {
+                questions: Vec::new(),
+                wanted: 0,
+                last_answer: String::new(),
             };
-            let handle = conv
-                .submit_turn_with_options(spec.prompt_for(&unit.subject, wanted), options)
-                .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
-            let resp = handle
-                .wait_cancellable(crate::ingest_cancel::token())
-                .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-            let answer = answer_of(&resp.answer, 0, &resp.stats.finish);
-            conv.finish_turn(handle, &resp)
-                .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
-            answer
+            let mut seen: HashSet<String> = HashSet::new();
+            for ask in spec.asks_for(&unit.subject) {
+                let wanted = ask.questions.for_tokens(tokens);
+                let options = TurnOptions {
+                    max_tokens: Some(DRAFT_MAX_TOKENS),
+                    sampling: Some(sampling.clone()),
+                    selection: draft_selection(),
+                    tags: vec![TAG.to_string()],
+                    ..Default::default()
+                };
+                let handle = conv
+                    .submit_turn_with_options(ask.prompt_for(&unit.subject, wanted), options)
+                    .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
+                let resp = handle
+                    .wait_cancellable(crate::ingest_cancel::token())
+                    .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+                let answer = answer_of(&resp.answer, 0, &resp.stats.finish);
+                conv.finish_turn(handle, &resp)
+                    .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+                let answer = answer?;
+                out.questions.extend(
+                    questions(&answer, wanted)
+                        .into_iter()
+                        .filter(|q| seen.insert(q.to_lowercase())),
+                );
+                out.wanted += wanted;
+                out.last_answer = answer;
+            }
+            Ok(out)
         },
     )
 }
@@ -688,6 +720,7 @@ pub(super) fn on_a_draft<T>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::ask::Ask;
     use super::super::count::QuestionCount;
     use super::*;
     use candle_conversation::projection::{Conversation, LayerId};
@@ -716,13 +749,16 @@ mod tests {
         let group = GroupId::from_raw(1).unwrap();
         let spec = CalibrateSpec {
             layer: "code_reading".into(),
-            questions: QuestionCount {
-                per_tokens: 250,
-                min: 4,
-                max: 4,
-            },
             think: 64,
-            prompt: "ask".into(),
+            prompts: vec![Ask {
+                name: "definitions".into(),
+                questions: QuestionCount {
+                    per_tokens: 250,
+                    min: 4,
+                    max: 4,
+                },
+                prompt: "ask".into(),
+            }],
             guidance: None,
         };
         let said = |tl: TimelineId, text: &str| {
