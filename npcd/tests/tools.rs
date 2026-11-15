@@ -2070,6 +2070,13 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
     // A task act is lent by the mission that drives the task, wherever it is
     // carried, never by a room (`engine::zen_task::task_grants`).
     let lent_by_missions: Vec<&str> = TASK_ACTS.iter().map(|t| t.name).collect();
+    // A terminal's act is reached through a connection, by a mind with no
+    // body, never from a room: which connection offers which is
+    // `engine::terminal`'s to prove (`grants_of`, `Within::at_terminals`).
+    let through_a_terminal: Vec<&str> = npcd::engine::terminal::TERMINAL_ACTS
+        .iter()
+        .map(|t| t.name)
+        .collect();
 
     for t in tools::CATALOG.iter() {
         // A migrated act is reached through the effector device, not a room's
@@ -2086,6 +2093,7 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
         let reachable = seen.iter().any(|s| s == t.name)
             || messaging.contains(&t.name)
             || lent_by_missions.contains(&t.name)
+            || through_a_terminal.contains(&t.name)
             || on_a_thread;
         assert!(
             reachable,

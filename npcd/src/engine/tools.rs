@@ -55,6 +55,7 @@ use crate::engine::agenda::{self, ordered, AGENDA_ACTS};
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::invoke_body::{self, Invokable};
 use crate::engine::talk::hand_off::HAND_OFF_ACTS;
+use crate::engine::terminal::TERMINAL_ACTS;
 use crate::engine::zen_task::TASK_ACTS;
 use crate::engine::{acts, bench, mission, mission_acts, station};
 use crate::house::HOUSE_ACTS;
@@ -996,6 +997,7 @@ pub static CATALOG: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(||
         .chain(mission_acts::MISSION_ACTS)
         .chain(AGENDA_ACTS)
         .chain(BRIDGE_ACTS)
+        .chain(TERMINAL_ACTS)
         .chain(HOUSE_ACTS)
         .chain(BUILD_ACTS)
         .chain(TASK_ACTS)
@@ -1582,6 +1584,17 @@ pub enum Choices {
     /// A Google TV here not yet paired — what `pair_code` finishes. A webOS TV
     /// is absent, since it earns its key in one call and takes no code.
     Pairing,
+    /// A terminal a mind with no body can connect to — what `terminal_connect`
+    /// takes (`docs/zen_everywhere.md` §5). Empty for every body, which takes
+    /// the act away.
+    Terminals,
+    /// A check of the machine a mind is connected to — what `machine_check`
+    /// runs. Empty unless it is connected to a machine.
+    Checks,
+    /// A device on the house network, by the name it goes by — what the house
+    /// network's terminal names and watches. Empty unless a mind is connected
+    /// to it.
+    Devices,
     /// The house's modes (`docs/house_modes.md`) — what `house_mode` sets.
     /// Offered only to a character that takes no orders, standing in the room
     /// the house's devices stand in; empty anywhere else, which takes the act
@@ -2018,6 +2031,13 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("wiz_white", "device", Choices::Lights),
     ("pair_device", "device", Choices::Pairable),
     ("pair_code", "device", Choices::Pairing),
+    // A mind with no body's terminals (`engine::terminal`): the terminal it
+    // may connect to, and what the one it is connected to names.
+    ("terminal_connect", "terminal", Choices::Terminals),
+    ("machine_check", "check", Choices::Checks),
+    ("device_rename", "device", Choices::Devices),
+    ("presence_watch", "device", Choices::Devices),
+    ("presence_forget", "device", Choices::Devices),
     ("house_mode", "mode", Choices::HouseModes),
     ("wake_device", "device", Choices::Onboarded),
     ("onboard_part", "from", Choices::Findings),
@@ -2111,6 +2131,15 @@ pub struct Within {
     /// The Google TVs here not yet paired, by name — [`Choices::Pairing`]. What
     /// `pair_code` finishes; a webOS TV never appears, since it takes no code.
     pub pairing: Vec<String>,
+    /// The terminals a mind with no body may connect to, by name, never the
+    /// one it is connected to — [`Choices::Terminals`]. Empty for a body.
+    pub terminals: Vec<String>,
+    /// The checks of the machine a mind is connected to, by name —
+    /// [`Choices::Checks`].
+    pub checks: Vec<String>,
+    /// The devices on the house network, by the names they go by, for a mind
+    /// connected to it — [`Choices::Devices`].
+    pub devices: Vec<String>,
     /// The house's modes, where this character may set them —
     /// [`Choices::HouseModes`].
     pub house_modes: Vec<String>,
@@ -2799,6 +2828,9 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Lights => within.lights.clone(),
         Choices::Pairable => within.pairable.clone(),
         Choices::Pairing => within.pairing.clone(),
+        Choices::Terminals => within.terminals.clone(),
+        Choices::Checks => within.checks.clone(),
+        Choices::Devices => within.devices.clone(),
         Choices::HouseModes => within.house_modes.clone(),
         Choices::Findings => within.findings.clone(),
         Choices::Unlinked => within.unlinked.clone(),
@@ -4541,6 +4573,7 @@ mod tests {
             .chain(mission_acts::MISSION_ACTS)
             .chain(AGENDA_ACTS)
             .chain(BRIDGE_ACTS)
+            .chain(TERMINAL_ACTS)
             .chain(HOUSE_ACTS)
             .chain(BUILD_ACTS)
             .chain(TASK_ACTS)

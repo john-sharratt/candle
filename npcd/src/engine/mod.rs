@@ -117,6 +117,7 @@ pub mod stir;
 pub mod substrate_views;
 pub mod survey;
 pub mod talk;
+pub mod terminal;
 pub mod tick;
 pub mod tools;
 pub mod watch;

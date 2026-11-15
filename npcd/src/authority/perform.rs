@@ -33,7 +33,7 @@ use crate::engine::experience::line::first_sentence;
 use crate::engine::loopguard::NUDGE;
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::{Recorded, Runtime, REFUSED};
-use crate::engine::{body, build, tools, zen_task};
+use crate::engine::{body, build, terminal, tools, zen_task};
 use crate::house;
 
 /// An act made, for the feed and the character, and whether it moved the
@@ -478,6 +478,9 @@ impl Runtime {
             let mode = act.args.get("mode").and_then(|v| v.as_str()).unwrap_or("");
             let line = format!("{name} set the house to {} mode.", mode.trim());
             self.changed(&hosted, Change::World { line });
+        } else if terminal::is_mine(act.tool) || hosted.sim(|s| s.missions.is_unordered(&body)) {
+            // What a mind with no body does through a terminal happened in no
+            // room: nobody standing where its seat is saw it.
         } else if body::is_device(act.tool) || bridge::is_mine(act.tool) || build::is_mine(act.tool)
         {
             let place = hosted.standpoint_of(&body);
@@ -535,13 +538,20 @@ impl Runtime {
         let bodily = !(body::is_device(act.tool)
             || body::composes(act.tool)
             || bridge::is_mine(act.tool)
+            || terminal::is_mine(act.tool)
             || house::is_mine(act.tool)
             || build::is_mine(act.tool)
             || zen_task::is_mine(act.tool));
+        // A mind with no body works real things through its terminal: its
+        // own acts, and the house's device acts on what it is connected to.
+        let through_a_terminal =
+            terminal::is_mine(act.tool) || (bridge::is_mine(act.tool) && self.is_bodiless(npc));
         let recorded = if body::is_device(act.tool) {
             self.enact_device(npc, act, pinned).await
         } else if body::composes(act.tool) {
             self.compose(npc, act).await
+        } else if through_a_terminal {
+            self.terminal_act(npc, act).await
         } else if bridge::is_mine(act.tool) {
             self.bridge_act(npc, act).await
         } else if house::is_mine(act.tool) {

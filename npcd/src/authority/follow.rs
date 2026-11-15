@@ -12,6 +12,7 @@ use super::driver;
 use super::pulse::{self, EVENTS};
 use super::report;
 use super::role::Role;
+use super::terminals;
 use super::told::{self, TOLD};
 use super::zen_task;
 use crate::engine::runtime::Runtime;
@@ -51,6 +52,9 @@ impl Runtime {
             }
         });
         handle.spawn(zen_task::run(Arc::clone(self), Arc::clone(&member)));
+        // The house network's watch on handsets (`docs/zen_everywhere.md` §5):
+        // who came home and who went out, raised through its terminal.
+        handle.spawn(terminals::run(Arc::clone(self)));
         handle.spawn(driver::run(Arc::clone(self), member));
     }
 

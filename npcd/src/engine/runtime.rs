@@ -127,6 +127,7 @@ use crate::engine::talk::key::VISITOR;
 use crate::engine::talk::runner::Talks;
 use crate::engine::talk::templates;
 use crate::engine::talk::voice::Post;
+use crate::engine::terminal::Machine;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
 use crate::engine::watcher::{is_ingestible, Ledger, Reconcile};
@@ -459,6 +460,11 @@ pub struct Runtime {
     /// effector verb and the operator route can submit a `BridgeCall`. Set once
     /// the member's agents are known; absent on a daemon that reaches none.
     agents: OnceLock<Agents>,
+    /// The machines the house's agents run on, as last heard of
+    /// (`docs/zen_everywhere.md` §5): what a mind with no body lists and
+    /// connects to as terminals. Refreshed by `terminal_list` and
+    /// `terminal_connect`, read by [`Self::within`].
+    machines: RwLock<Vec<Machine>>,
     /// Asked for a relaunch: the mind's schema moved.
     relaunch: OnceLock<Arc<Stopping>>,
     /// What reads the authored state again when a mind pending at start
@@ -987,6 +993,7 @@ impl Runtime {
             days: Days::new(),
             mind_repos: OnceLock::new(),
             agents: OnceLock::new(),
+            machines: RwLock::new(Vec::new()),
             relaunch: OnceLock::new(),
             mind_arrived: RwLock::new(None),
             // Read from disk: a document already in the substrate must not be
@@ -2383,7 +2390,36 @@ impl Runtime {
         // takes the acts that need it out of the grammar, which is how a world
         // without hostiles ends up without `engage`.
         let place = hosted.place_of(&body);
-        hosted.sim(|sim| base.clone().from_sim(sim, &body, &place))
+        let within = hosted.sim(|sim| base.clone().from_sim(sim, &body, &place));
+        if !bodiless {
+            return within;
+        }
+        // A mind with no body reaches real things through its terminals: the
+        // three terminal acts, and — connected — the one terminal's verbs
+        // (`docs/zen_everywhere.md` §5).
+        let machines = self.machines();
+        let on_cluster = self.standing.member().is_some();
+        hosted.sim(|sim| within.at_terminals(sim, &machines, on_cluster, &body))
+    }
+
+    /// The machines the house's agents run on, as last heard of — what a
+    /// machine's terminal is listed and connected to from.
+    pub fn machines(&self) -> Vec<Machine> {
+        self.machines.read().unwrap().clone()
+    }
+
+    /// Keep `machines` as the machines last heard of, each with the checks it
+    /// had listed when it was last connected to.
+    pub(crate) fn set_machines(&self, mut machines: Vec<Machine>) {
+        let mut kept = self.machines.write().unwrap();
+        for m in &mut machines {
+            if let Some(was) = kept.iter().find(|k| k.node == m.node) {
+                if m.checks.is_empty() {
+                    m.checks = was.checks.clone();
+                }
+            }
+        }
+        *kept = machines;
     }
 
     /// Fix who this character can address, as of now — taken just before the
@@ -9588,6 +9624,167 @@ mod tests {
             told.len() == 1 && told[0].starts_with("Wick has reported it done: Read the board"),
             "{told:?}"
         );
+    }
+
+    /// **A mind with no body reaches real things through one terminal at a
+    /// time** (`docs/zen_everywhere.md` §5). It lists what there is, connects,
+    /// and has that terminal's verbs alone in its grammar; a verb of another
+    /// terminal is refused, a body is refused all of it, and what a terminal
+    /// raises is told to the mind and to nobody with a body.
+    #[tokio::test]
+    async fn a_mind_with_no_body_works_through_one_terminal_at_a_time() {
+        use crate::bridge::finding::{Finding, DEVICE, SONOS, WIZ};
+        use crate::engine::terminal::{ALL_LIGHTS, LIGHTS, NETWORK};
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        let zen = Kind {
+            unordered: true,
+            attends: true,
+            ..Kind::default()
+        };
+        rt.embody_in_world(1, WORLD, zen, "Zen", None, 0).unwrap();
+        embody(&rt, 2, "m2", "green-room");
+        rt.set_table_open(false);
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let found = |hardware: &str, name: &str, profile: &str| Finding {
+            address: "192.168.1.20".into(),
+            hardware: hardware.into(),
+            names: vec![name.into()],
+            profile: profile.into(),
+            ..Finding::default()
+        };
+        hosted.with_sim(|s| {
+            s.terminals.surveyed(vec![
+                found("a8:bb:50:00:00:01", "wiz_d8a011", WIZ),
+                found("a8:bb:50:00:00:02", "hall light", WIZ),
+                found("f0:f6:c1:a0:79:b4", "SonosZP", SONOS),
+                found("3c:22:fb:00:00:09", "Pixel-8", DEVICE),
+            ])
+        });
+        let act = |tool: &'static str, v: serde_json::Value| Act {
+            tool,
+            args: v.as_object().unwrap().clone(),
+        };
+        let none = serde_json::json!({});
+
+        // Disconnected: the terminal acts, and no terminal's verbs.
+        let free = rt.within(1);
+        assert_eq!(free.terminals, [LIGHTS, NETWORK, "SonosZP"]);
+        assert!(free.grants.iter().any(|g| g == "terminal_connect"));
+        assert!(free.lights.is_empty() && free.sonos.is_empty());
+        let listed = rt
+            .terminal_act(1, &act("terminal_list", none.clone()))
+            .await;
+        assert!(listed.landed, "{}", listed.answer);
+        assert!(
+            listed
+                .answer
+                .contains("- the lights: every light in the house, 2 of them, 2 answering"),
+            "{}",
+            listed.answer
+        );
+        let early = rt
+            .terminal_act(
+                1,
+                &act(
+                    "device_rename",
+                    serde_json::json!({"device": "x", "called": "y"}),
+                ),
+            )
+            .await;
+        assert!(!early.landed && early.answer.starts_with("You are connected to nothing"));
+
+        // Connected to the lights: the light acts, on one bulb or all.
+        let lit = rt
+            .terminal_act(
+                1,
+                &act("terminal_connect", serde_json::json!({"terminal": LIGHTS})),
+            )
+            .await;
+        assert!(
+            lit.landed && lit.answer.starts_with("You are connected to the lights."),
+            "{}",
+            lit.answer
+        );
+        let within = rt.within(1);
+        assert_eq!(within.lights, [ALL_LIGHTS, "hall light", "wiz_d8a011"]);
+        assert!(within.sonos.is_empty(), "another terminal's device");
+        assert!(!within.terminals.iter().any(|t| t == LIGHTS));
+        // Another terminal's verb is not this one's.
+        let stray = rt
+            .terminal_act(
+                1,
+                &act("sonos_play", serde_json::json!({"device": "SonosZP"})),
+            )
+            .await;
+        assert!(!stray.landed && stray.answer.contains("has no `sonos_play`"));
+        // With no agent in reach a light is refused, never silently skipped.
+        let dark = rt
+            .terminal_act(
+                1,
+                &act("wiz_off", serde_json::json!({"device": ALL_LIGHTS})),
+            )
+            .await;
+        assert!(!dark.landed && dark.answer.starts_with("0 of 2 lights took it."));
+
+        // Connecting elsewhere lets the last go: the network names devices.
+        let net = rt
+            .terminal_act(
+                1,
+                &act("terminal_connect", serde_json::json!({"terminal": NETWORK})),
+            )
+            .await;
+        assert!(net.landed, "{}", net.answer);
+        assert!(rt.within(1).lights.is_empty());
+        let named = rt
+            .terminal_act(
+                1,
+                &act(
+                    "device_rename",
+                    serde_json::json!({"device": "wiz_d8a011", "called": "kitchen light"}),
+                ),
+            )
+            .await;
+        assert_eq!(
+            named.answer,
+            "wiz_d8a011 is called kitchen light from now on."
+        );
+        let watched = rt
+            .terminal_act(
+                1,
+                &act(
+                    "presence_watch",
+                    serde_json::json!({"device": "Pixel-8", "who": "Kate"}),
+                ),
+            )
+            .await;
+        assert!(watched.landed, "{}", watched.answer);
+        assert!(hosted.sim(|s| s.terminals.watches()));
+
+        // What a terminal raises reaches the mind, and nobody with a body.
+        waiting(&rt, 1);
+        waiting(&rt, 2);
+        rt.raise_terminal(&hosted, NETWORK, "Kate is home.", true);
+        assert_eq!(
+            waiting(&rt, 1),
+            ["Raised by the house network, a terminal of yours: Kate is home."]
+        );
+        assert!(waiting(&rt, 2).is_empty());
+
+        // Let go, it is connected to nothing; and a body has no terminals.
+        let gone = rt
+            .terminal_act(1, &act("terminal_disconnect", none.clone()))
+            .await;
+        assert_eq!(gone.answer, "You let go of the house network.");
+        assert!(
+            !rt.terminal_act(1, &act("terminal_disconnect", none.clone()))
+                .await
+                .landed
+        );
+        assert!(rt.within(2).terminals.is_empty());
+        assert!(!rt.within(2).grants.iter().any(|g| g == "terminal_list"));
+        let body = rt.terminal_act(2, &act("terminal_list", none)).await;
+        assert!(!body.landed && body.answer.starts_with("Terminals are not yours"));
     }
 
     /// **A personality's `idle:` is its idle wake**, for one that takes no

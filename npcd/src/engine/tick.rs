@@ -338,6 +338,7 @@ impl Inbox {
             EventKind::Speech { .. }
                 | EventKind::Description { .. }
                 | EventKind::Announcement { .. }
+                | EventKind::Terminal { .. }
                 | EventKind::Entity { .. }
                 | EventKind::Operator { .. }
                 | EventKind::MindControl { .. }

@@ -27,7 +27,7 @@ use finding::{ANDROIDTV, CAST, RECEIVER, SONOS, WIZ};
 /// TV's two-phase pairing, so `pair_code` finishes on that same agent (the TLS
 /// session lives only there). Reserved keys begin with `_`; [`with_link`] never
 /// hands one to a device.
-const PAIRING_AGENT: &str = "_pairing_agent";
+pub(crate) const PAIRING_AGENT: &str = "_pairing_agent";
 
 pub use acts::{is_mine, BRIDGE_ACTS};
 

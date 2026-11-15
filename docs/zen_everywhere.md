@@ -114,29 +114,41 @@ Three acts, offered to an unordered mind alone:
 | `terminal_disconnect` | Lets it go. |
 
 Disconnected, Zen's acts are these three, its table and agenda acts, and its
-messaging. Connected, it also has **that terminal's verbs** — offered through
-the live set the catalogue already filters by, so an unconnected terminal's
-verbs are not in the grammar at all. The frame's state says what Zen is
-connected to.
+messaging. Connected, it also has **that terminal's verbs**: every terminal
+act is `Availability::Granted`, and a mind's grants are the three above plus
+what the terminal it is connected to offers (`engine::terminal::grants_of`),
+so an unconnected terminal's verbs are not in the grammar at all. The
+house's own device acts (`sonos_…`, `receiver_…`, `cast_…`, `wiz_…`,
+`pair_…`) are bound to the devices of their kind, and a connection is what
+puts a device in that set (`Within::at_terminals`). Connecting answers with
+what the terminal is and what can be done there
+(`engine::terminal::welcome`).
 
-A terminal is an implementation of one trait — its id, its line for the list,
-its verbs as catalogue specs, and `perform` — registered by an adapter:
+The terminals, each by the name `terminal_connect` takes
+(`engine::terminal`, enacted in `authority::terminals`):
 
-| Adapter | Terminals | Verbs | State |
-|---|---|---|---|
-| **House devices** (`effector-bridge`, through the house's agent) | one per workable device the survey has found: `device-<mac>` | the device profile's actions — including webOS and Android TV, which gain their verbs here | built; today gated on a room and a linked part, which a terminal is not |
-| **House lights** (the WiZ profile of `effector-bridge`) | **one** terminal, `lights`, over every bulb the survey has found — eight WiZ E27 today | list the bulbs and their state; on, off, brightness, colour and white temperature, a built-in scene — for one bulb by name, several, or all of them in one act | the bulb profile is built; the one terminal over all of them is to build. A bulb is not also a `device-<mac>` terminal |
-| **Home network** | the house link | `survey`, `wake` | built as `survey_network`, `wake_device` |
-| **Cluster** (zend's MCP, as `service:zen`, the channel `zen_task` uses) | the gateway's logs; the cluster; each machine's services | read-only: list, search and read logs; cluster, member and service status | to build — zend has the tools, npcd has the channel |
-| **Machines** (each machine's own agent) | one per machine: BlackWorld and WhiteWorld first | the checks below | to build — the agent already takes the house's device work from npcd |
-| **Presence** | the home network | raises an event when a known handset joins or leaves | to build — the survey sees handsets; nothing watches for them |
+| Terminal | Behind it | Verbs |
+|---|---|---|
+| **`the lights`** — one, over every WiZ bulb the house network has shown | `effector-bridge`'s WiZ profile, through an in-network agent | `wiz_status`, `wiz_on`, `wiz_off`, `wiz_dim`, `wiz_white`, `wiz_colour` — on one bulb by its name, or on every one at once as `all the lights`, asked together and answered in one report |
+| **a device, by the name it goes by** — each Sonos player, AV receiver, Cast device and television; never a bulb | its profile, through an agent | that kind's acts. A television: `tv_status`, `tv_on`, `tv_off`, `tv_volume`, `tv_louder`, `tv_quieter`, `tv_mute`, `tv_unmute`, `tv_play`, `tv_pause`, `tv_stop`, `tv_launch`, `tv_youtube`, `tv_input`, `tv_button`, `tv_show` — an LG all of them, a Google television the ones its remote has a button for. One not yet paired offers `pair_device` / `pair_code` and nothing else |
+| **`the house network`** | this member's own survey of it; an agent for the wake | `survey_network`, `wake_device`, `device_rename {device, called}`, `presence_watch {device, who}`, `presence_forget {device}` |
+| **`the cluster`** — on a member of one | zend's `/v1/mcp` as `service:zen`, the channel `zen_task` uses | read-only: `cluster_status`, `cluster_services` (zend's `service_status`), `cluster_logs {grep, level, since}` (zend's `log_grep`) |
+| **a machine, by its host name** — each machine an agent runs on: BlackWorld and WhiteWorld | that machine's own agent | `machine_check {check, args}` — the checks below |
+
+**A device belongs to the house, not to a room.** The devices a room's parts
+stand for are that room's and are worked from it by a body, as before. A
+terminal's devices are kept by hardware address in the world's state
+(`sim::terminals`): the name each goes by, what a pairing earned for it, and
+whether the last surveys saw it. A device that changes address is the same
+device; one that calls itself by a code is given a name a person would use
+with `device_rename`.
 
 **The lights are one terminal because they are worked together.** Turning
 the house off at night is one act over all eight, not eight connections. A
 mode is a verb of this terminal that keeps running after Zen disconnects —
 the adapter drives the bulbs, not a turn of Zen's — and has a verb to stop
 it; the patterns driven from an audio input, for a set played live, are
-modes added here.
+modes to be added here.
 
 A cluster terminal and a machine terminal are read-only. Deploying,
 restarting and rolling out stay with people.
@@ -148,37 +160,75 @@ outside; a command line on a machine would let what it reads decide what it
 runs. A check does one thing, takes validated arguments, changes nothing, and
 answers with a short report.
 
-**The list is the machine's own, and it is open.** A check is a declaration
-the agent loads from its `checks/` folder, a file each: its name, the line
-Zen reads in the terminal's verbs, its arguments with the values each may
-take, and what it runs — one of the agent's built-in probes, or a program
-with a fixed argument list into which only validated arguments are placed.
-Adding a check is adding a file on that machine; the agent reads the folder
-when a terminal is listed, so there is nothing to rebuild. Who can write to
-the machine can add a check. Zen chooses from the list and cannot add to it.
-The checks below ship as the first files.
+**The list is the machine's own, and it is open** (`agent::checks`). A check
+is one `*.yaml` file in the `checks/` folder under the agent's own:
+
+```yaml
+name: logs
+says: One of this machine's event logs, searched for a word or phrase.
+args:
+  - name: log
+    values: [System, Application, Security, Setup]   # one of these
+  - name: grep
+    free: 60          # or up to 60 plain characters
+    default: ""       # an argument with no default must be given
+program: powershell
+argv: ["-NoProfile", "-File", "{dir}/logs.ps1", "-Log", "{log}", "-Grep", "{grep}"]
+timeout_s: 90
+```
+
+An argument is one of its listed values, or a short run of letters, digits,
+spaces and `_ . : -`. It takes the place of one **whole** entry of `argv`
+(`{name}`); it is never spliced into a string that a shell or an interpreter
+parses, and `{dir}/…` names a file in the folder. A declaration that names a
+field the agent does not know, an argument with nothing it may be, or an
+`argv` naming an argument it does not take is not offered, and the agent says
+why in its log.
+
+The folder is read afresh on every call, so adding a check is adding a file
+on that machine — nothing is rebuilt and nothing is restarted. Who can write
+to the machine can add a check; Zen chooses from the list and cannot add to
+it. The checks below are written into the folder when it does not exist yet,
+each a declaration and the PowerShell script it runs, and are the machine's
+to change after that.
 
 | Check | Reports |
 |---|---|
-| `health` | CPU, memory, free disk a volume, uptime, a pending reboot |
-| `gpu` | the card's memory, load and temperature, and what holds it |
-| `services` | each service keep supervises: its build, whether it runs, how its last trial ended |
-| `errors` | the daemons' recent errors and warnings, grouped and counted |
-| `logs {log, grep, since}` | a named log searched for a pattern over a window |
-| `logins` | recent sign-ins, failed attempts, remote sessions open |
-| `listeners` | ports open to the network and the process behind each |
-| `processes` | what runs now that did not at the last check; the heaviest by CPU and memory |
-| `security` | the firewall and antivirus state, the definitions' age, pending system updates |
-| `storage` | the substrate's and the journals' size, their growth since the last check, the newest backup's age |
+| `health` | processors, memory, free disk on each volume, uptime, a pending restart |
+| `gpu` | the card's memory, load and temperature, and the programs holding it |
+| `services` | keep, motherd, the gateway, the agent: whether each is up and since when |
+| `errors` | the last day's errors and critical events, by what raised them, counted |
+| `logs {log, grep, since}` | one event log searched for a word over a stretch of time |
+| `logins` | who is signed in, remote sessions, the last day's sign-ins and failed attempts |
+| `listeners` | every listening port, whether it is open to the network, and the program behind it |
+| `processes` | every program running and where from; the heaviest by memory and processor time |
+| `security` | firewall and antivirus on or off, threats detected, the definitions' age, the last update |
+| `storage` | the size of each folder named in `storage.paths`, and its newest file |
+
+`storage.paths` ships empty: each machine names its substrates, journals and
+backups there, one path to a line.
 
 **A check says what changed.** The agent keeps each check's last answer and
-the report leads with the difference — a port that was not open, a process
-that was not running, a volume that lost ten gigabytes — so "out of the
-ordinary" is something the report states rather than something Zen has to
-infer from a page of numbers.
+the report leads with the lines that came and went since — a port that was
+not open, a program that was not running, a firewall that is off — so "out
+of the ordinary" is something the report states rather than something Zen
+has to infer from a page of numbers. What moves every time (a load figure,
+the busiest programs) follows a line of `---` in the check's output: it is
+reported and not compared.
+
+### What a terminal raises
 
 A terminal raises an event by delivering `EventKind::Terminal { terminal,
-text }` to every unordered mind of its world, urgent when its adapter says so.
+text }` to every unordered mind of its world (`Runtime::raise_terminal`),
+urgent when its adapter says so. It names the terminal as `terminal_list`
+does, so what Zen is told is also what to connect to.
+
+**Presence is the first source.** `presence_watch` marks a handset on the
+house network as one person's. Every five minutes this member surveys the
+network for the worlds it writes that watch any (`authority::terminals::run`),
+and raises that the person is home the moment their handset is seen, and
+that they have gone out once two surveys running have missed it — one miss
+is a phone asleep.
 
 ## 6. What changes for a person
 
@@ -199,6 +249,11 @@ lines (sequences a forward, forward time, hit rate), before and after each
 step of §8.
 
 ## 8. Order of work
+
+Steps 1–6 are built. Step 1 runs on WhiteWorld; steps 2–6 are released
+together with step 7, since a Zen with no body and its old round of rooms to
+walk has nothing it can do. The machine checks need each machine's agent on
+a build that has them.
 
 1. **Drones at rest**: the engine-held rest state, assignment at the post, no
    summons, hands as §3 — with the runtime's scripted tests. The load change.

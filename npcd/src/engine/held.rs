@@ -94,6 +94,11 @@ fn source(kind: &EventKind) -> Source {
             "word sent across the world".into(),
             "words sent across the world".into(),
         ),
+        EventKind::Terminal { terminal, .. } => named(
+            format!("terminal:{terminal}"),
+            format!("thing {terminal} raised"),
+            format!("things {terminal} raised"),
+        ),
         EventKind::Operator { .. } => named(
             "operator".into(),
             "line from the operator".into(),

@@ -80,7 +80,7 @@ pub fn zen_headers() -> Vec<(HeaderName, HeaderValue)> {
 
 /// `tool` with `args` called on zend as Zen, on behalf of `thread`: the
 /// answer's text, or why there is none.
-async fn call_zend(
+pub(crate) async fn call_zend(
     member: &AppMember,
     tool: &str,
     args: &Value,

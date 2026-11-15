@@ -39,7 +39,8 @@
 
 use crate::clock::{WorldTime, DAY_MS};
 use crate::engine::event::{
-    elsewhere_line, message_line, mind_control_line, unread_line, Addressed, Event, EventKind,
+    elsewhere_line, message_line, mind_control_line, terminal_line, unread_line, Addressed, Event,
+    EventKind,
 };
 
 /// How many people are named in `STATE` before the rest become "several others".
@@ -87,6 +88,9 @@ fn event_line(e: &Event) -> Option<String> {
             let t = text.trim();
             (!t.is_empty()).then(|| format!("word reaches everyone across the world: {t}"))
         }
+        // Raised by a real thing through its terminal, already written as the
+        // character is told it: passed through.
+        EventKind::Terminal { terminal, text } => Some(terminal_line(terminal, text)),
         // Authored, addressed to the focal character already — pass through.
         EventKind::Nudge { text } | EventKind::Operator { text } => {
             let t = text.trim();

@@ -45,6 +45,7 @@ use crate::engine::act::Act;
 use crate::engine::agenda;
 use crate::engine::build;
 use crate::engine::enact::NO_BODY;
+use crate::engine::terminal;
 use crate::engine::tools::CATALOG;
 use crate::house;
 use crate::world::Hosted;
@@ -214,7 +215,8 @@ pub fn is_device(tool: &str) -> bool {
 }
 
 /// Whether this act reaches the real house — a bridge act ([`bridge`]), the
-/// house's mode ([`house`]), or one that builds the world ([`build`]).
+/// house's mode ([`house`]), one that builds the world ([`build`]), or one of
+/// a terminal's ([`terminal`]).
 ///
 /// It is **not** [`is_of_the_body`]: a survey waits on the house network, a
 /// mode on the devices and the decks, and a build is kept through the map
@@ -222,7 +224,7 @@ pub fn is_device(tool: &str) -> bool {
 /// `Runtime::build_act`), where [`perform`] is synchronous and has nothing to
 /// run for them.
 pub fn is_of_the_house(tool: &str) -> bool {
-    bridge::is_mine(tool) || house::is_mine(tool) || build::is_mine(tool)
+    bridge::is_mine(tool) || house::is_mine(tool) || build::is_mine(tool) || terminal::is_mine(tool)
 }
 
 /// Perform one act against the world a body stands in.

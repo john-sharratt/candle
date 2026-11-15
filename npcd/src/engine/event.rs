@@ -229,6 +229,12 @@ pub enum EventKind {
     /// feed. Delivered by broadcast at a salience that reaches even a waiting
     /// character — see `pulse::announce`.
     Announcement { text: String },
+    /// Something a terminal raised: an event from a real thing, by way of the
+    /// adapter behind it (`docs/zen_everywhere.md` §5) — a handset joining the
+    /// house network, a machine's check finding something. `terminal` is the
+    /// name the terminal goes by in `terminal_list`, so what is told is also
+    /// what to connect to. Delivered only to a mind that takes no orders.
+    Terminal { terminal: String, text: String },
     /// Someone said something to, or near, the character.
     Speech {
         speaker: String,
@@ -418,6 +424,12 @@ pub fn elsewhere_line(party: &str, lines: &[String]) -> String {
     s
 }
 
+/// How an [`EventKind::Terminal`] event reads: which terminal raised it, and
+/// what it says.
+pub fn terminal_line(terminal: &str, text: &str) -> String {
+    format!("Raised by {terminal}, a terminal of yours: {}", text.trim())
+}
+
 pub fn mind_control_line(text: &str) -> String {
     format!("A thought you can't shake: {}", text.trim())
 }
@@ -428,6 +440,7 @@ impl EventKind {
         match self {
             EventKind::Description { .. } => "description",
             EventKind::Announcement { .. } => "announcement",
+            EventKind::Terminal { .. } => "terminal",
             EventKind::Speech { .. } => "speech",
             EventKind::Message { .. } => "message",
             EventKind::Talk { .. } => "talk",
@@ -539,6 +552,7 @@ impl Event {
             EventKind::Announcement { text } => {
                 format!("Word goes out across the world: {}", text.trim())
             }
+            EventKind::Terminal { terminal, text } => terminal_line(terminal, text),
             EventKind::Speech { speaker, text, to } => {
                 let t = third_person(text.trim());
                 // Three readings of one utterance, and the difference between

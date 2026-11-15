@@ -56,6 +56,7 @@ pub mod record;
 pub mod round;
 pub mod seed;
 pub mod shelf;
+pub mod terminals;
 pub mod tower;
 pub mod unread;
 pub mod upkeep;
@@ -153,6 +154,10 @@ pub struct Sim {
     /// What the mirrored home is set up for, and its table — see [`house`].
     #[serde(default)]
     pub house: house::House,
+    /// The house's devices as a mind with no body reaches them, and what each
+    /// such mind is connected to — see [`terminals`].
+    #[serde(default)]
+    pub terminals: terminals::Terminals,
 }
 
 impl Sim {

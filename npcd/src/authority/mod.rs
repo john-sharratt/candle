@@ -43,6 +43,7 @@ pub mod pulse;
 pub mod report;
 pub mod role;
 pub mod routes;
+pub mod terminals;
 pub mod told;
 pub mod world_lease;
 pub mod worlds;
