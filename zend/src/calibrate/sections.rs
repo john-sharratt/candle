@@ -9,6 +9,10 @@
 //! is written with the reading in front of it, as the single prompt was, and
 //! the parts see each other, so each can ask nothing another asked.
 
+use candle_conversation::stencil::{
+    BuildError, FreeTextLimits, StencilTreeBuilder, Terminator, TreeSpec,
+};
+
 /// How the answer is to be laid out, after the parts.
 const LAYOUT: &str = "Answer every part above, in this order, each under its own heading \
      exactly as written (`## name`), with one question per line and nothing else.";
@@ -48,6 +52,60 @@ pub fn compose(parts: &[(&str, String)], link: Option<&str>) -> String {
     }
     out.push_str(LAYOUT);
     out
+}
+
+/// Decode tokens a part may run to per question it asks for, before the
+/// grammar moves it on: a developer's question runs to ~40 tokens.
+const TOKENS_PER_QUESTION: u32 = 80;
+
+/// The grammar a draft's answer is decoded under: each `(name, questions)`
+/// part's heading written by the grammar, in order, and the model's own text
+/// under it until it starts the next heading.
+///
+/// **Every part is reached.** Asked in free text, a draft that wrote nothing
+/// under an optional part ended its answer there: the `code` profile's
+/// `messages` comes before `purpose`, and 110 code units in a day left
+/// `purpose` empty, one in five (BlackWorld, 2026-11-15). Under the grammar the
+/// answer cannot end before the last part — a part's text ends only where the
+/// model starts a heading (`\n##`) or at its budget, and the grammar then
+/// writes the next part's heading itself — and no heading is missing,
+/// misspelled or out of order. The questions are the model's own; only the
+/// headings are fixed. The grammar is not what the unit is asked, so the
+/// calibration marker does not digest it ([`super::spec::CalibrateSpec::marker`]).
+pub fn grammar(parts: &[(&str, usize)]) -> Result<TreeSpec, BuildError> {
+    let mut b = StencilTreeBuilder::new("calibration_draft").root("h0");
+    for (i, &(name, questions)) in parts.iter().enumerate() {
+        let heading = if i == 0 {
+            format!("## {name}\n")
+        } else {
+            // `\n##` was the model's, closing the part before.
+            format!(" {name}\n")
+        };
+        b = b.static_node(format!("h{i}"), heading, format!("b{i}"));
+        let budget = (questions as u32).max(1) * TOKENS_PER_QUESTION;
+        let last = i + 1 == parts.len();
+        b = if last {
+            b.free_text(
+                format!("b{i}"),
+                Terminator::Never,
+                true,
+                FreeTextLimits::think_flow(budget),
+                "end",
+            )
+        } else {
+            b.free_text(
+                format!("b{i}"),
+                Terminator::Until {
+                    marker: "\n##",
+                    tails: &[],
+                },
+                false,
+                FreeTextLimits::think_flow(budget),
+                format!("h{}", i + 1),
+            )
+        };
+    }
+    b.end("end").build()
 }
 
 /// `answer` split into the text under each of `names`' headings, in `names`'
@@ -99,6 +157,54 @@ fn heading(line: &str, names: &[&str]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_conversation::stencil::{compile, simulate, Oracle, TestVocab, Vocab};
+    use std::sync::Arc;
+
+    /// Decode `script` under the grammar for `parts` on a byte vocabulary:
+    /// the text that entered the answer.
+    fn decode(parts: &[(&str, usize)], script: &str) -> String {
+        let vocab = TestVocab::new();
+        let tree = Arc::new(compile(&grammar(parts).unwrap(), &vocab).unwrap());
+        let mut tokens: Vec<u32> = script.bytes().map(u32::from).collect();
+        tokens.push(256);
+        let run = simulate(tree, &vocab, Oracle::Scripted(tokens), 10_000).unwrap();
+        String::from_utf8_lossy(&vocab.decode(&run.tokens)).into_owned()
+    }
+
+    /// **The grammar writes every heading, in order, and the model writes the
+    /// questions**: a part ends where the model starts a heading, and the next
+    /// part's heading is the grammar's.
+    #[test]
+    fn the_grammar_writes_each_heading_and_the_model_each_part() {
+        let answer = decode(
+            &[("definitions", 2), ("uses", 1), ("purpose", 1)],
+            "What is `a`?\nWhere is `b` defined?\n##What calls `a`?\n##What is the file for?\n",
+        );
+        assert_eq!(
+            answer,
+            "## definitions\nWhat is `a`?\nWhere is `b` defined?\n## uses\nWhat calls `a`?\n## \
+             purpose\nWhat is the file for?\n"
+        );
+        assert_eq!(
+            split(&answer, &["definitions", "uses", "purpose"]),
+            Some(vec![
+                "What is `a`?\nWhere is `b` defined?\n",
+                "What calls `a`?\n",
+                "What is the file for?\n"
+            ])
+        );
+    }
+
+    /// **An empty part does not end the answer**: the model cannot end its turn
+    /// before the last part, so a part it leaves empty is followed by the next.
+    #[test]
+    fn an_empty_part_is_followed_by_the_next() {
+        let answer = decode(
+            &[("messages", 1), ("purpose", 1)],
+            "\n##What is the file for?\n",
+        );
+        assert_eq!(answer, "## messages\n\n## purpose\nWhat is the file for?\n");
+    }
 
     const NAMES: [&str; 3] = ["definitions", "uses", "purpose"];
 

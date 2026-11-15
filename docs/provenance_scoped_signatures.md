@@ -267,6 +267,14 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   its competition; the per-child background
   (`docs/provenance_score_normalization.md`) is what takes a case's base
   rate out of its vote.
+- **Decoded under a grammar of its headings.** A draft's answer is decoded
+  under a stencil (`calibrate/sections.rs`, `grammar`): each part's `## name`
+  heading is written by the grammar, in order, and the model's text under it
+  runs until it starts the next heading or reaches its budget — the answer
+  cannot end before the last part. Decoded freely, a code file with no log
+  line wrote nothing under the optional `messages` and ended its answer, so
+  one code unit in five left `purpose` empty (BlackWorld, 2026-11-15). The
+  grammar is not what a unit is asked, so the marker does not digest it.
 - **A draft that stops short is asked again.** A draft that stops early
   leaves its later parts empty, so a unit one of whose required parts kept no
   question fails as its own failure and is calibrated again by a later pass,

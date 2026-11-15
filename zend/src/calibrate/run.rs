@@ -37,7 +37,7 @@ use candle_conversation::projection::{
     DecodePriority, GroupId, OptionalState, Reserved, SelectionState, TimelineId,
     NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
-use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
+use candle_conversation::stencil::{ThinkMode, TriggerRegistry, TurnGrammar};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::{
     ConversationEngine, FinishOrder, Sequence, SequenceConfig, TurnOptions, MAX_DECODE_WIDTH,
@@ -50,7 +50,7 @@ use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
 use super::retire_replies::retire_reply_records;
 use super::seal::seal_calibration;
-use super::sections::{compose, split};
+use super::sections::{compose, grammar, split};
 use super::spec::CalibrateSpec;
 use super::thinking::{exemplar, thinking_of};
 use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
@@ -759,9 +759,22 @@ fn draft(
                 .zip(&wanted)
                 .map(|(a, &n)| (a.name.as_str(), a.prompt_for(&unit.subject, n)))
                 .collect();
+            // Every part's heading is the grammar's, so no part is skipped and
+            // the answer cannot end before the last ([`grammar`]).
+            let headings: Vec<(&str, usize)> = asks
+                .iter()
+                .zip(&wanted)
+                .map(|(a, &n)| (a.name.as_str(), n))
+                .collect();
+            let spec =
+                grammar(&headings).map_err(|e| anyhow::anyhow!("the draft's grammar: {e}"))?;
+            let tree = engine
+                .compile_stencil(&spec)
+                .map_err(|e| anyhow::anyhow!("compiling the draft's grammar: {e}"))?;
             let options = TurnOptions {
                 max_tokens: Some(DRAFT_MAX_TOKENS),
                 sampling: Some(sampling),
+                turn_grammar: Some(TurnGrammar::of(Arc::new(tree))),
                 selection: draft_selection(),
                 tags: vec![TAG.to_string()],
                 ..Default::default()
