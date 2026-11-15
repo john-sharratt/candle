@@ -931,15 +931,14 @@ layers:
               questions: { per_tokens: 200, min: 3, max: 24 }
               prompt: |
                 Write <<n>> questions someone working in this workspace might ask about the script you just read, `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a command it runs, a flag or argument it takes or passes, or a variable, function or file it uses, and asks what it does, what it is set to, or why the script needs it. Spread them across as many different commands, flags and variables as the script has, and ask about each only once.
-            - name: purpose
-              questions: { per_tokens: 4000, min: 1, max: 3 }
-              prompt: |
-                Now write <<n>> questions about `<<path>>` as a whole: what it is for, and when someone would run it or need to change it. Ask nothing you asked above.
-            # Optional, so last: see the `code` profile's `messages`.
             - name: outputs
               questions: { per_tokens: 600, min: 0, max: 12 }
               prompt: |
-                Last, write up to <<n>> questions someone reading the output of `<<path>>` would ask: each quotes, exactly as written there, a message it prints, a check it makes or a file it writes, and asks what causes it or what it means. If the script has fewer, write fewer; if it has none, write none. Ask nothing you asked above.
+                Now write up to <<n>> questions someone reading the output of `<<path>>` would ask: each quotes, exactly as written there, a message it prints, a check it makes or a file it writes, and asks what causes it or what it means. If the script has fewer, write fewer; if it has none, write none. Ask nothing you asked above.
+            - name: purpose
+              questions: { per_tokens: 4000, min: 1, max: 3 }
+              prompt: |
+                Last, write <<n>> questions about `<<path>>` as a whole: what it is for, and when someone would run it or need to change it. Ask nothing you asked above.
         # Source code: what it defines, how that is connected, what it
         # reports, what it is for.
         - name: code
@@ -962,19 +961,16 @@ layers:
               questions: { per_tokens: 400, min: 2, max: 20 }
               prompt: |
                 Now write up to <<n>> more questions, about how what `<<path>>` defines is used and connected. Each one names, exactly as written there, a function, type, constant, field or setting it defines or uses, and asks what calls or reads it, what it calls or depends on, what depends on it, what breaks or has to change if it changes, or where a change to it has to be made. Ask only about connections the file shows; write fewer rather than invent one. Ask nothing you asked above.
-            - name: purpose
-              questions: { per_tokens: 3000, min: 2, max: 6 }
-              prompt: |
-                Now write <<n>> questions about `<<path>>` as a whole: what it is for, why it is built the way it is, and when someone would need to read or change it. Ask nothing you asked above.
             # "where is 'admission split' logged?" — asked only as far as the
-            # file has them. **Optional, so last.** Asked before `purpose`, a
-            # file with no message wrote none and the answer ended there: 110
-            # code units in a day left `purpose` empty, one in five
-            # (BlackWorld, 2026-11-15).
+            # file has them.
             - name: messages
               questions: { per_tokens: 1500, min: 0, max: 8 }
               prompt: |
-                Last, write up to <<n>> questions someone reading a log, an error or a command's output would ask that `<<path>>` answers: each quotes a log line, error message, panic, metric or command-line option it writes or reads, exactly as written there, and asks where it comes from, what it means or what causes it. If the file has fewer, write fewer; if it has none, write none. Ask nothing you asked above.
+                Now write up to <<n>> questions someone reading a log, an error or a command's output would ask that `<<path>>` answers: each quotes a log line, error message, panic, metric or command-line option it writes or reads, exactly as written there, and asks where it comes from, what it means or what causes it. If the file has fewer, write fewer; if it has none, write none. Ask nothing you asked above.
+            - name: purpose
+              questions: { per_tokens: 3000, min: 2, max: 6 }
+              prompt: |
+                Last, write <<n>> questions about `<<path>>` as a whole: what it is for, why it is built the way it is, and when someone would need to read or change it. Ask nothing you asked above.
         # Configuration: what each setting is and what reads it — "where is
         # `window` set for `code_reading`?", "what reads `think`?".
         - name: config

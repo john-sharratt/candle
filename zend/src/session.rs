@@ -10050,8 +10050,8 @@ mod projection_schema_tests {
                 &[
                     ("definitions", rule(300, 4, 28)),
                     ("uses", rule(400, 2, 20)),
-                    ("purpose", rule(3000, 2, 6)),
                     ("messages", rule(1500, 0, 8)),
+                    ("purpose", rule(3000, 2, 6)),
                 ]
             )
         );
