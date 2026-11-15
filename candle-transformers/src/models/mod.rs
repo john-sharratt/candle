@@ -38,6 +38,7 @@ pub mod blip_text;
 pub mod causal_mask_cache;
 pub mod chatglm;
 pub mod chinese_clip;
+pub mod claim_split;
 pub mod clip;
 pub mod codegeex4_9b;
 pub mod colpali;

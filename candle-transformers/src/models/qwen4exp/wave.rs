@@ -31,6 +31,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs, MOE_PREDICT_VOTES_MAX_TOKENS};
 use candle::{DType, Device, LiveTensor, Result, Tensor};
@@ -44,6 +45,7 @@ use candle_nn::kv_cache::{
 };
 
 use super::kv_row::kv_factors_for;
+use crate::models::claim_split::ClaimPart;
 
 #[cfg(feature = "tensor-assert")]
 use super::attn_capture::attention_checkpoint;
@@ -1534,11 +1536,14 @@ impl Qwen4ExpBatched {
     /// and a snapshot held for the sequence becomes its store here.
     pub fn claim_carried_state(&self, seq: usize) -> Result<()> {
         self.refuse_parked(seq)?;
+        let t = Instant::now();
         self.install_staged(seq)?;
+        ClaimPart::Install.charge(t.elapsed());
         let cfg = &self.model.cfg;
         let hc_dim = cfg.hc.count * cfg.hidden_size;
         let dev = &self.model.device;
         let mut created = false;
+        let t = Instant::now();
         {
             let mut rec = self
                 .recurrent
@@ -1553,6 +1558,8 @@ impl Qwen4ExpBatched {
                 created = true;
             }
         }
+        ClaimPart::Recurrent.charge(t.elapsed());
+        let t = Instant::now();
         {
             let mut ple = self
                 .ple
@@ -1563,6 +1570,8 @@ impl Qwen4ExpBatched {
             }
             ple.get_mut(&seq).expect("inserted above").ensure_spare()?;
         }
+        ClaimPart::Ple.charge(t.elapsed());
+        let t = Instant::now();
         if self.model.mtp.is_some() {
             let dims = (1, cfg.hc.count, cfg.hidden_size);
             let mut seeds = self
@@ -1581,6 +1590,7 @@ impl Qwen4ExpBatched {
                 e.insert(state_buffer(dev, dims, false)?);
             }
         }
+        ClaimPart::Seeds.charge(t.elapsed());
         if created {
             self.pristine
                 .write()

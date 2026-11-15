@@ -32,6 +32,7 @@ use candle_nn::kv_cache::{
     FreeRegionTarget,
 };
 use candle_transformers::models::batched_inference::PendingGlue;
+use candle_transformers::models::claim_split::ClaimSplit;
 use candle_transformers::models::expert_lre::is_expert_stall;
 use candle_transformers::models::residual_rows::{compact_creeps, CreepResidual};
 use candle_transformers::models::wave_driver::{StepCreep, StepRows, StepSpec};
@@ -2715,10 +2716,20 @@ impl Scheduler {
             .part(AdmitPart::BeginFork, t.elapsed());
         let t = Instant::now();
         let waited = quiesce_wait_ns();
+        let split = ClaimSplit::now();
         let claimed = self.model.claim_carried_state(work.sequence_id.0);
         self.wave_stats
             .admission_split
             .part(AdmitPart::BeginClaim, t.elapsed());
+        let [install, recurrent, ple, seeds] = ClaimSplit::since(split);
+        for (part, took) in [
+            (AdmitPart::BeginClaimInstall, install),
+            (AdmitPart::BeginClaimRecurrent, recurrent),
+            (AdmitPart::BeginClaimPle, ple),
+            (AdmitPart::BeginClaimSeeds, seeds),
+        ] {
+            self.wave_stats.admission_split.part(part, took);
+        }
         self.wave_stats.admission_split.part(
             AdmitPart::BeginClaimQuiesce,
             Duration::from_nanos(quiesce_wait_ns() - waited),
