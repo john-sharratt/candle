@@ -3486,6 +3486,10 @@ impl Substrate {
     /// under: a file's `v{N}:{path}@{blob}`, a folder's listing hash.
     pub const CONTENT_KEY: &'static str = "content_key";
 
+    /// Metadata key holding a file conversation's workspace-relative path —
+    /// what a scan that reads files by their kind (their extension) reads.
+    pub const PATH_KEY: &'static str = "path";
+
     /// The prefix of a `forked_from` that names its parent by **content key**
     /// rather than timeline id — `unit:<key>`, resolved where the lineage is
     /// read to the conversation holding that key ([`Self::unit_holding`]).

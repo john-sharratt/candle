@@ -128,7 +128,34 @@ power 1.
 | `scopes` (code reading) | 8 | 0.5 | `[1,1,1]` | ×1.0 on `[1,1,1]`, one vote per token | yes | yes |
 | tools collection | 1 | 1.0 | unchanged | unchanged | no | no |
 
-## 5. Reproduction
+## 5. The port and what it costs
+
+**What changed.** The scan carries a vote law per segment (`provenance::VoteLaw`: `top_k`,
+`power`).
+- **Kernels.** Each BDP backend (scalar, b1 BMMA, INT8 IMMA) emits `max_k` rows per (token,
+  group, segment). A single-vote segment runs the leader/runner-up loop unchanged. A top-k
+  segment keeps its best k+1 in registers, one compare per case that does not place, and
+  every vote goes through the shared `bdp_vote`.
+- **Host.** The tally reads every vote of a row and raises each kept, weighed vote by the
+  segment's power.
+- **Configuration.** A group sets the law with `vote_top_k` / `vote_power`, reads its files
+  against their kind with `normalize: kind_z`, and leaves its target's lineage out with
+  `exclude_lineage`. The calibration competition keeps one vote a token at the group's power.
+  Every default is the previous behaviour.
+
+**Cost.** Measured on the RTX PRO 5000 (IMMA), best of five fresh probes
+(`bench_wide_turn_group_scan`):
+
+| Shape | Probe tokens | One vote | Top-8 |
+|---|---:|---:|---:|
+| 9 segments × 116 cases (a turn group), 8.0 M tokens | 66 / 256 / 1,024 | 14.3 / 29.5 / 102.2 ms | — |
+| 1 segment × 6,678 cases (code reading), 3.4 M tokens | 66 / 256 / 1,024 | 7.2 / 18.3 / 60.4 ms | 8.2 / 20.1 / 64.8 ms |
+
+Top-8 adds 1.0–4.4 ms (7–14%) to the code-reading scan. Single-vote launches, which is every
+other group, run the same work and read back the same bytes as before. The added time is the
+finalize: one thread per (token, group, segment) walks every case in series under either law.
+
+## 6. Reproduction
 
 ```bash
 # Code reading (BlackWorld's zend as the daemon)

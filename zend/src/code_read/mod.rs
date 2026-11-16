@@ -47,6 +47,7 @@ use candle_conversation::projection::{
 use candle_conversation::stencil::{
     HeldRules, HeldValues, OpeningCall, ToolSpec, TriggerRegistry, TurnGrammar,
 };
+use candle_conversation::substrate::Substrate;
 use candle_conversation::{
     is_ground_refusal_message, is_stall_message, ConversationEngine, Sequence, TurnOptions,
     TurnText,
@@ -80,7 +81,7 @@ use crate::types::ToolMode;
 use crate::workspace::UPLOADS_REPO;
 
 /// Metadata key holding a file conversation's workspace-relative path.
-pub(crate) const PATH_KEY: &str = "path";
+pub(crate) const PATH_KEY: &str = Substrate::PATH_KEY;
 
 /// One file to read: its workspace-relative path, its blob, its language, and
 /// the commit its bytes are read from — `None` for an upload, which is read

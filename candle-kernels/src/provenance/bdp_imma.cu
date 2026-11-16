@@ -461,8 +461,8 @@ extern "C" __global__ void __launch_bounds__(256) bdp_imma_accum_kernel(
 extern "C" __global__ void bdp_bmma_finalize_kernel(
     const unsigned int *case_max, const unsigned long long *case_sum,
     const unsigned long long *case_sumsq, const int *seg_tok_start,
-    const int *seg_case_start, int n_probe_tokens, int n_groups, int n_segments,
-    int n_cases, int *out_case, float *out_vote);
+    const int *seg_case_start, const int *seg_top_k, int n_probe_tokens, int n_groups,
+    int n_segments, int n_cases, int max_k, int *out_case, float *out_vote);
 
 // Whether this backend can run on the current device: the hardware must have
 // INT8 MMA (sm_80+) AND the embedded fatbin must hold a loadable kernel image
@@ -513,6 +513,7 @@ extern "C" int run_imma_bdp_scan(
     const unsigned long long *page_ptr,
     const unsigned int *entry_page,
     const unsigned int *entry_slots,
+    const int *seg_top_k,
     int n_slots,
     int n_probe_tokens,
     int n_groups,
@@ -520,12 +521,14 @@ extern "C" int run_imma_bdp_scan(
     int n_cases,
     int gw,
     int wpt,
+    int max_k,
     int *out_case,
     float *out_vote,
     void *stream)
 {
     if (!bdp_imma_supported() || gw != IMMA_GW || page_ptr == nullptr ||
-        entry_page == nullptr || entry_slots == nullptr) {
+        entry_page == nullptr || entry_slots == nullptr || max_k <= 0 ||
+        max_k > BDP_MAX_TOP_K) {
         return 1;
     }
     if (n_slots <= 0 || n_probe_tokens <= 0 || n_groups <= 0 ||
@@ -566,7 +569,7 @@ extern "C" int run_imma_bdp_scan(
     for (int q0 = 0; err == cudaSuccess && q0 < n_probe_tokens; q0 += chunk) {
         const int nq = (n_probe_tokens - q0) < chunk ? (n_probe_tokens - q0) : chunk;
         const size_t ncq = (size_t)nq * n_groups * n_cases;
-        const size_t out_at = (size_t)q0 * n_groups * n_segments;
+        const size_t out_at = (size_t)q0 * n_groups * n_segments * max_k;
         stage = IMMA_STAGE_MEMSET;
         err = cudaMemsetAsync(d_max, 0, ncq * sizeof(unsigned int), s);
         if (err == cudaSuccess) {
@@ -589,8 +592,8 @@ extern "C" int run_imma_bdp_scan(
             const int total = nq * n_groups * n_segments;
             const int blocks = (total + 255) / 256;
             bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
-                d_max, d_sum, d_sq, seg_tok_count, seg_case_start, nq,
-                n_groups, n_segments, n_cases, out_case + out_at, out_vote + out_at);
+                d_max, d_sum, d_sq, seg_tok_count, seg_case_start, seg_top_k, nq,
+                n_groups, n_segments, n_cases, max_k, out_case + out_at, out_vote + out_at);
             err = cudaGetLastError();
         }
     }

@@ -335,20 +335,22 @@ extern "C" __global__ void __launch_bounds__(256) bdp_bmma_accum_kernel(
 #endif
 }
 
-// One thread per (query, group, segment): leader/runner-up over the segment's
-// case range -> the same (out_case, z*margin) pairs as the scalar kernel.
+// One thread per (query, group, segment): the segment's best cases -> the same
+// (out_case, z*margin) rows as the scalar kernel, `max_k` per thread.
 extern "C" __global__ void bdp_bmma_finalize_kernel(
     const unsigned int *__restrict__ case_max,
     const unsigned long long *__restrict__ case_sum,
     const unsigned long long *__restrict__ case_sumsq,
     const int *__restrict__ seg_tok_count,  // n_segments+1: tokens each segment scans, prefix
     const int *__restrict__ seg_case_start, // n_segments+1
+    const int *__restrict__ seg_top_k,      // n_segments: cases a token votes for, or null (1 each)
     int n_probe_tokens,
     int n_groups,
     int n_segments,
     int n_cases,
-    int *__restrict__ out_case,   // n_probe * n_groups * n_segments
-    float *__restrict__ out_vote) // n_probe * n_groups * n_segments
+    int max_k,                    // votes per output row
+    int *__restrict__ out_case,   // n_probe * n_groups * n_segments * max_k
+    float *__restrict__ out_vote) // n_probe * n_groups * n_segments * max_k
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = n_probe_tokens * n_groups * n_segments;
@@ -356,47 +358,67 @@ extern "C" __global__ void bdp_bmma_finalize_kernel(
         return;
     }
     // idx decomposes exactly as the output layout (q * n_groups + g) *
-    // n_segments + s, so idx IS the output index.
+    // n_segments + s, so idx IS the output row; its votes start at idx * max_k.
     const int s = idx % n_segments;
     const int rem = idx / n_segments;
     const int g = rem % n_groups;
     const int q = rem / n_groups;
+    const int oi = idx * max_k;
 
     const int n_gal = seg_tok_count[s + 1] - seg_tok_count[s];
     const int c0 = seg_case_start[s];
     const int c1 = seg_case_start[s + 1];
     if (c1 <= c0 || n_gal <= 0) {
-        out_case[idx] = -1;
-        out_vote[idx] = 0.0f;
+        for (int r = 0; r < max_k; r++) {
+            out_case[oi + r] = -1;
+            out_vote[oi + r] = 0.0f;
+        }
         return;
     }
 
-    // Leader/runner-up over the segment's cases, ascending with strict
-    // comparisons — identical tie behaviour to the scalar kernel's top-2 loop.
-    unsigned int top1 = 0u, top2 = 0u;
-    int top1c = -1;
     unsigned long long sum = 0ull;
     unsigned long long sumsq = 0ull;
     const size_t base = ((size_t)q * n_groups + g) * n_cases;
+    const int k = seg_top_k ? seg_top_k[s] : 1;
+    if (k == 1) {
+        // Leader/runner-up over the segment's cases, ascending with strict
+        // comparisons — identical tie behaviour to the scalar kernel's top-2 loop.
+        unsigned int top1 = 0u, top2 = 0u;
+        int top1c = -1;
+        for (int c = c0; c < c1; c++) {
+            const unsigned int m = case_max[base + c];
+            sum += case_sum[base + c];
+            sumsq += case_sumsq[base + c];
+            if (m > top1) {
+                top2 = top1;
+                top1 = m;
+                top1c = c;
+            } else if (m > top2) {
+                top2 = m;
+            }
+        }
+        if (top1c < 0) {
+            out_case[oi] = -1;
+            out_vote[oi] = 0.0f;
+        } else {
+            out_case[oi] = top1c; // already a GLOBAL case id
+            out_vote[oi] = bdp_vote(top1, top2, sum, sumsq, n_gal);
+        }
+        for (int r = 1; r < max_k; r++) {
+            out_case[oi + r] = -1;
+            out_vote[oi + r] = 0.0f;
+        }
+        return;
+    }
+    // A top-k segment: the best k+1 in registers, over the same ascending pass.
+    BdpRanks ranks;
+    bdp_ranks_init(ranks);
     for (int c = c0; c < c1; c++) {
-        const unsigned int m = case_max[base + c];
         sum += case_sum[base + c];
         sumsq += case_sumsq[base + c];
-        if (m > top1) {
-            top2 = top1;
-            top1 = m;
-            top1c = c;
-        } else if (m > top2) {
-            top2 = m;
-        }
+        bdp_ranks_offer(ranks, k, case_max[base + c], c - c0);
     }
-    if (top1c < 0) {
-        out_case[idx] = -1;
-        out_vote[idx] = 0.0f;
-    } else {
-        out_case[idx] = top1c; // already a GLOBAL case id
-        out_vote[idx] = bdp_vote(top1, top2, sum, sumsq, n_gal);
-    }
+    bdp_ranks_emit(ranks, k, max_k, c0, sum, sumsq, n_gal, out_case + oi, out_vote + oi);
 }
 
 // Whether this backend can run on the current device: the hardware must have
@@ -453,6 +475,7 @@ extern "C" int run_bmma_bdp_scan(
     const unsigned long long *page_ptr,
     const unsigned int *entry_page,
     const unsigned int *entry_slots,
+    const int *seg_top_k,
     int n_slots,
     int n_probe_tokens,
     int n_groups,
@@ -460,12 +483,14 @@ extern "C" int run_bmma_bdp_scan(
     int n_cases,
     int gw,
     int wpt,
+    int max_k,
     int *out_case,
     float *out_vote,
     void *stream)
 {
     if (!bdp_bmma_supported() || gw != BMMA_GW || page_ptr == nullptr ||
-        entry_page == nullptr || entry_slots == nullptr) {
+        entry_page == nullptr || entry_slots == nullptr || max_k <= 0 ||
+        max_k > BDP_MAX_TOP_K) {
         return 1;
     }
     if (n_slots <= 0 || n_probe_tokens <= 0 || n_groups <= 0 ||
@@ -511,7 +536,7 @@ extern "C" int run_bmma_bdp_scan(
     for (int q0 = 0; err == cudaSuccess && q0 < n_probe_tokens; q0 += chunk) {
         const int nq = (n_probe_tokens - q0) < chunk ? (n_probe_tokens - q0) : chunk;
         const size_t ncq = (size_t)nq * n_groups * n_cases;
-        const size_t out_at = (size_t)q0 * n_groups * n_segments;
+        const size_t out_at = (size_t)q0 * n_groups * n_segments * max_k;
         stage = BDP_BMMA_STAGE_MEMSET;
         err = cudaMemsetAsync(d_max, 0, ncq * sizeof(unsigned int), s);
         if (err == cudaSuccess) {
@@ -534,8 +559,8 @@ extern "C" int run_bmma_bdp_scan(
             const int total = nq * n_groups * n_segments;
             const int blocks = (total + 255) / 256;
             bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
-                d_max, d_sum, d_sq, seg_tok_count, seg_case_start, nq,
-                n_groups, n_segments, n_cases, out_case + out_at, out_vote + out_at);
+                d_max, d_sum, d_sq, seg_tok_count, seg_case_start, seg_top_k, nq,
+                n_groups, n_segments, n_cases, max_k, out_case + out_at, out_vote + out_at);
             err = cudaGetLastError();
         }
     }

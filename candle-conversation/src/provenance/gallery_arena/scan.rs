@@ -33,6 +33,7 @@ use crate::persistence::streams::StreamId;
 use crate::scheduler::profile;
 
 use super::super::gpu::{needle_tally_segments, BDP_TQ};
+use super::super::vote_law::VoteLaw;
 use super::super::WideQSig;
 use super::index_entries::IndexEntries;
 use super::lease::ScanHold;
@@ -67,13 +68,15 @@ pub struct PagedWindow<'a> {
 /// One segment (file): its windows, its exchange (case) count, who the turns it
 /// reads are held for (`docs/gallery_residency.md` §2), the fold groups its
 /// scan weighs (§4) — the groups its turns must hold, and the launch scans —
-/// and which of its turns' tokens the card holds (`docs/gallery_dedup.md`).
+/// and which of its turns' tokens the card holds (`docs/gallery_dedup.md`),
+/// and how a probe token's agreements become votes in it ([`VoteLaw`]).
 pub struct PagedSegment<'a> {
     pub windows: Vec<PagedWindow<'a>>,
     pub n_cases: usize,
     pub holder: Holder,
     pub groups: GroupSet,
     pub keep: Keep,
+    pub law: VoteLaw,
 }
 
 /// `weights` for every one of `segments`.
@@ -93,6 +96,8 @@ struct DeviceIndex {
     seg_slot: Held<i32>,
     seg_tok: Held<i32>,
     seg_case: Held<i32>,
+    /// Cases a probe token votes for, per segment.
+    seg_top_k: Held<i32>,
 }
 
 /// The assembled per-scan index, built from the resident arena. `page_ptr`
@@ -117,6 +122,11 @@ pub(super) struct PagedIndex {
     n_cases: usize,
     n_segments: usize,
     max_seg_cases: usize,
+    /// Each segment's vote law; its `top_k` is what the kernel ranks to, its
+    /// power what the tally raises by.
+    seg_law: Vec<VoteLaw>,
+    /// Votes per kernel output row: the largest `top_k` of any segment.
+    max_k: usize,
     /// Turns referenced by this scan; pinned for the scan that builds the
     /// index, leased as a set by every scan that reuses it.
     pub(super) pinned_sids: Vec<StreamId>,
@@ -146,7 +156,8 @@ impl PagedIndex {
         self.device.as_ref().map_or(0, |d| {
             (d.page_ptr.len() * 8
                 + (d.entry_page.len() + d.entry_slots.len() + d.entry_case.len()) * 4
-                + (d.seg_slot.len() + d.seg_tok.len() + d.seg_case.len()) * 4) as u64
+                + (d.seg_slot.len() + d.seg_tok.len() + d.seg_case.len() + d.seg_top_k.len()) * 4)
+                as u64
         })
     }
 
@@ -207,7 +218,7 @@ fn launch_failure(rc: i32) -> (&'static str, i32) {
 }
 
 /// Fingerprint the segment structure the built index depends on — file order,
-/// each file's case count, holder and keep, and every window's `(sid,
+/// each file's case count, holder, keep and `top_k`, and every window's `(sid,
 /// fingerprint, turn length, start, end, case)`. Cheap (per-window, not
 /// per-token). The holder is in it so an index built for one reader never
 /// stands in for another's, whose build would widen what its turns are held
@@ -238,6 +249,8 @@ fn fingerprint_segments(segments: &[PagedSegment]) -> u64 {
         seg.n_cases.hash(&mut h);
         seg.holder.hash(&mut h);
         seg.keep.hash(&mut h);
+        // The kernel's rows rank to it; the power is the tally's alone.
+        seg.law.top_k.hash(&mut h);
         seg.windows.len().hash(&mut h);
         for w in &seg.windows {
             w.sid.0.hash(&mut h);
@@ -420,12 +433,24 @@ impl GalleryArena {
 
         let n_tokens = entries.tokens();
         let n_slots = entries.slots_len();
+        let seg_law: Vec<VoteLaw> = segments.iter().map(|s| s.law).collect();
+        if let Some(bad) = seg_law.iter().find(|l| !l.is_valid()) {
+            for &s in &pinned_sids {
+                self.unpin(s);
+            }
+            return Err(candle::Error::Msg(format!(
+                "paged scan: a segment's vote law {bad:?} is outside 1..={} votes",
+                VoteLaw::MAX_TOP_K
+            )));
+        }
+        let seg_top_k: Vec<i32> = seg_law.iter().map(|l| l.top_k as i32).collect();
+        let max_k = seg_law.iter().map(|l| l.top_k).max().unwrap_or(1);
         let walked = t_build.elapsed();
         let t_upload = Instant::now();
         let device = if n_tokens == 0 {
             None
         } else {
-            match self.upload_index(&page_ptr, &entries, &seg_case) {
+            match self.upload_index(&page_ptr, &entries, &seg_case, &seg_top_k) {
                 Ok(d) => Some(d),
                 Err(e) => {
                     for &s in &pinned_sids {
@@ -459,13 +484,15 @@ impl GalleryArena {
             n_cases: case_off,
             n_segments: segments.len(),
             max_seg_cases,
+            seg_law,
+            max_k,
             members: pinned_sids.iter().copied().collect(),
             pinned_sids,
             run_ids,
             hold: ScanHold::default(),
             touched_ms: AtomicU64::new(0),
             used: AtomicU64::new(0),
-            rows: Mutex::new(ProbeRows::new(launch.len() * segments.len())),
+            rows: Mutex::new(ProbeRows::new(launch.len() * segments.len() * max_k)),
         })
     }
 
@@ -476,6 +503,7 @@ impl GalleryArena {
         page_ptr: &[u64],
         entries: &IndexEntries,
         seg_case: &[i32],
+        seg_top_k: &[i32],
     ) -> Result<DeviceIndex> {
         let Device::Cuda(dev) = &self.device else {
             return Err(candle::Error::Msg("paged scan requires CUDA".into()));
@@ -489,6 +517,7 @@ impl GalleryArena {
             seg_slot: Held::from_host(dev, &entries.seg_slot)?,
             seg_tok: Held::from_host(dev, &entries.seg_tok)?,
             seg_case: Held::from_host(dev, seg_case)?,
+            seg_top_k: Held::from_host(dev, seg_top_k)?,
         })
     }
 
@@ -750,7 +779,9 @@ impl GalleryArena {
             raw.n_groups,
             idx.n_segments,
             idx.n_cases,
+            idx.max_k,
             segment_weights,
+            &idx.seg_law,
         );
         let LaunchTiming {
             upload_us,
@@ -812,7 +843,7 @@ impl GalleryArena {
         let n_segments = idx.n_segments;
         let none = || {
             (
-                TokenVotes::none(probes.len(), n_groups, n_segments),
+                TokenVotes::none(probes.len(), n_groups, n_segments, idx.max_k),
                 Launched::default(),
             )
         };
@@ -882,7 +913,9 @@ impl GalleryArena {
         // Rows for every fold group, as every reader of raw votes indexes them:
         // a group a segment does not weigh voted for nothing in it, though the
         // index may scan it for another segment or an earlier reader.
-        let (out_case, out_vote) = widen_rows(&out_case, &out_vote, idx.groups, weighed, n_groups);
+        let (out_case, out_vote) = widen_rows(
+            &out_case, &out_vote, idx.groups, weighed, n_groups, idx.max_k,
+        );
 
         Ok((
             TokenVotes {
@@ -891,6 +924,7 @@ impl GalleryArena {
                 per_probe: per_req_tokens,
                 n_groups,
                 n_segments,
+                k: idx.max_k,
             },
             Launched {
                 timing,
@@ -966,7 +1000,8 @@ impl GalleryArena {
             );
         }
 
-        let n_out = n_probe_tokens * n_groups * n_segments;
+        let max_k = idx.max_k;
+        let n_out = n_probe_tokens * n_groups * n_segments * max_k;
         let upload_us = t_upload.elapsed().as_micros() as u64;
         let t_kernel = Instant::now();
         let mut out_case = vec![0i32; n_out];
@@ -983,6 +1018,7 @@ impl GalleryArena {
             let (p_page_ptr, _g5) = d_idx.page_ptr.device_ptr(&stream);
             let (p_entry_page, _g6) = d_idx.entry_page.device_ptr(&stream);
             let (p_entry_slots, _g7) = d_idx.entry_slots.device_ptr(&stream);
+            let (p_seg_top_k, _g8) = d_idx.seg_top_k.device_ptr(&stream);
             let p_out_case = room;
             let p_out_vote = room + (n_out * std::mem::size_of::<i32>()) as u64;
             // The kernel's own device time, apart from whatever the shared
@@ -1009,6 +1045,7 @@ impl GalleryArena {
                                 p_page_ptr as *const u64,
                                 p_entry_page as *const u32,
                                 p_entry_slots as *const u32,
+                                p_seg_top_k as *const i32,
                                 idx.n_slots as i32,
                                 n_probe_tokens as i32,
                                 n_groups as i32,
@@ -1016,6 +1053,7 @@ impl GalleryArena {
                                 n_cases as i32,
                                 gw as i32,
                                 wpt as i32,
+                                max_k as i32,
                                 p_out_case as *mut i32,
                                 p_out_vote as *mut f32,
                                 stream.cu_stream() as *mut c_void,
@@ -1088,12 +1126,14 @@ impl GalleryArena {
                                 p_page_ptr as *const u64,
                                 p_entry_page as *const u32,
                                 p_entry_slots as *const u32,
+                                p_seg_top_k as *const i32,
                                 n_probe_tokens as i32,
                                 n_groups as i32,
                                 n_segments as i32,
                                 idx.max_seg_cases as i32,
                                 gw as i32,
                                 wpt as i32,
+                                max_k as i32,
                                 p_out_case as *mut i32,
                                 p_out_vote as *mut f32,
                                 stream.cu_stream() as *mut c_void,
@@ -1167,6 +1207,7 @@ mod tests {
     use crate::persistence::content_hash::turn_stream_id;
     use crate::projection::TimelineId;
     use crate::provenance::gpu::{BatchedGpuGallery, SegmentInput};
+    use crate::provenance::score_slots_law;
 
     /// The launchers' `-(stage * 1000 + cudaError)` codes, decoded exactly —
     /// and a bare `-cudaError`, which names no stage.
@@ -1227,6 +1268,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1241,6 +1283,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             },
         ];
         let tail = vec![
@@ -1306,6 +1349,7 @@ mod tests {
                     holder: Holder::Shared,
                     groups: GroupSet::all(3),
                     keep: Keep::All,
+                    law: VoteLaw::SINGLE,
                 },
                 PagedSegment {
                     windows: vec![
@@ -1330,6 +1374,7 @@ mod tests {
                     holder: Holder::Shared,
                     groups: GroupSet::all(3),
                     keep: Keep::All,
+                    law: VoteLaw::SINGLE,
                 },
             ]
         };
@@ -1402,6 +1447,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             },
             PagedSegment {
                 windows: vec![window(3, &c, 0)],
@@ -1409,6 +1455,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             },
         ];
         let p0 = vec![sig(0x1001), sig(0x3000 + 30), sig(0xBEEF)];
@@ -1426,7 +1473,9 @@ mod tests {
             raw.n_groups,
             raw.n_segments,
             3,
+            raw.k,
             &[&weights, &weights],
+            &[VoteLaw::SINGLE, VoteLaw::SINGLE],
         );
         let weighted = arena.scan_weighted(&segs, &probes, &weights).unwrap();
         let bits = |v: &[Vec<f32>]| {
@@ -1486,6 +1535,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             },
             PagedSegment {
                 // Two sub-windows of ONE multi-page turn → different cases (a seam).
@@ -1511,6 +1561,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1525,6 +1576,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             },
         ];
 
@@ -1642,6 +1694,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             },
             PagedSegment {
                 windows: vec![PagedWindow {
@@ -1656,6 +1709,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             },
         ];
         let probe = vec![sig(0xA00 + 5), sig(0xC00 + 2), sig(0x999)];
@@ -1717,6 +1771,7 @@ mod tests {
             holder: Holder::Shared,
             groups: GroupSet::all(3),
             keep: Keep::All,
+            law: VoteLaw::SINGLE,
         }];
         let seg_b = vec![PagedSegment {
             windows: vec![PagedWindow {
@@ -1731,6 +1786,7 @@ mod tests {
             holder: Holder::Shared,
             groups: GroupSet::all(3),
             keep: Keep::All,
+            law: VoteLaw::SINGLE,
         }];
         let probe = vec![sig(0xA00 + 3), sig(0xB00 + 3)];
 
@@ -1783,6 +1839,7 @@ mod tests {
             holder: Holder::Shared,
             groups: GroupSet::all(3),
             keep: Keep::All,
+            law: VoteLaw::SINGLE,
         }];
         let probe = vec![sig(0xA00 + 3)];
         let fp = fingerprint_segments(&seg_a);
@@ -1870,6 +1927,7 @@ mod tests {
             holder: Holder::Shared,
             groups: GroupSet::all(3),
             keep,
+            law: VoteLaw::SINGLE,
         };
         let whole = |a: &'static [WideQSig], b: &'static [WideQSig]| {
             [(81u64, a, 0usize), (82, b, 1)]
@@ -1999,6 +2057,7 @@ mod tests {
                 holder,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             }]
         };
         let holder_now = || arena.resident_runs()[0].holder;
@@ -2054,6 +2113,7 @@ mod tests {
                     holder: Holder::Shared,
                     groups: content,
                     keep: Keep::All,
+                    law: VoteLaw::SINGLE,
                 },
                 PagedSegment {
                     windows: vec![w(93, &c, 0)],
@@ -2061,6 +2121,7 @@ mod tests {
                     holder: Holder::Shared,
                     groups: calibration,
                     keep: Keep::All,
+                    law: VoteLaw::SINGLE,
                 },
             ]
         };
@@ -2176,6 +2237,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups,
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             }]
         };
         let narrow_w: &[f32] = &[0.0, 1.0, 1.0];
@@ -2257,6 +2319,7 @@ mod tests {
             holder: Holder::Shared,
             groups: GroupSet::all(3),
             keep: Keep::All,
+            law: VoteLaw::SINGLE,
         }];
         let probe = vec![sig(0xB00 + 5)];
         let fp = fingerprint_segments(&seg);
@@ -2316,6 +2379,7 @@ mod tests {
             holder: Holder::Shared,
             groups: GroupSet::all(3),
             keep: Keep::All,
+            law: VoteLaw::SINGLE,
         }];
         let probe = vec![sig(1 << 32), sig((3u64 << 32) + 5), sig(0xFEED)];
 
@@ -2453,6 +2517,7 @@ mod tests {
                 holder: Holder::Shared,
                 groups: GroupSet::all(3),
                 keep: Keep::All,
+                law: VoteLaw::SINGLE,
             });
         }
 
@@ -2508,6 +2573,132 @@ mod tests {
         }
     }
 
+    /// **Every backend scores a segment's vote law as the host scorer does.**
+    /// Three segments in one launch: twelve cases at top-8, power 0.5 (the
+    /// code-reading law); five at one vote (a tool catalog's law, in a launch
+    /// whose rows are eight wide); two at top-3 (fewer cases than votes). Each
+    /// segment's scores match `score_slots_law` over its own windows to
+    /// fast-math tolerance, the backends match the scalar kernel bit for bit,
+    /// and the one-vote segment scores bit for bit as it does in a launch of
+    /// its own. Then the same windows at one vote everywhere: the index built
+    /// for the top-k law is not reused for rows of a different width.
+    #[test]
+    fn every_backend_scores_a_segments_vote_law_as_the_host_does() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let (has_bmma, has_imma) = arena.tensor_caps();
+        let mut rng = 0x5EED_70B8_u64;
+        let laws = [
+            (
+                12usize,
+                VoteLaw {
+                    top_k: 8,
+                    power: 0.5,
+                },
+            ),
+            (5, VoteLaw::SINGLE),
+            (
+                2,
+                VoteLaw {
+                    top_k: 3,
+                    power: 1.0,
+                },
+            ),
+        ];
+        // Each segment: one turn of 5..40 tokens a case.
+        let turns: Vec<Vec<Vec<WideQSig>>> = laws
+            .iter()
+            .map(|&(n_cases, _)| {
+                (0..n_cases)
+                    .map(|c| (0..5 + 7 * c % 36).map(|_| rand_sig(&mut rng)).collect())
+                    .collect()
+            })
+            .collect();
+        let segment = |s: usize, law: VoteLaw| PagedSegment {
+            windows: turns[s]
+                .iter()
+                .enumerate()
+                .map(|(c, t)| PagedWindow {
+                    sid: turn_stream_id(900 + s as u64, c as u32),
+                    fingerprint: (s * 1000 + c) as u64,
+                    turn: t.into(),
+                    start: 0,
+                    end: t.len(),
+                    case: c,
+                })
+                .collect(),
+            n_cases: laws[s].0,
+            holder: Holder::Shared,
+            groups: GroupSet::all(3),
+            keep: Keep::All,
+            law,
+        };
+        let segs: Vec<PagedSegment> = (0..laws.len()).map(|s| segment(s, laws[s].1)).collect();
+        let probe: Vec<WideQSig> = (0..70).map(|_| rand_sig(&mut rng)).collect();
+        let weights = [0.5f32, 1.0, 2.0];
+
+        let scalar = arena
+            .scan_weighted_scalar(&segs, &[probe.as_slice()], &weights)
+            .unwrap();
+        let mut at = 0usize;
+        for (s, &(n_cases, law)) in laws.iter().enumerate() {
+            let windows: Vec<&[WideQSig]> = turns[s].iter().map(Vec::as_slice).collect();
+            let slots: Vec<usize> = (0..n_cases).collect();
+            let host = score_slots_law(&probe, &windows, &slots, n_cases, &weights, law);
+            let card = &scalar[0][at..at + n_cases];
+            assert!(host.iter().any(|&v| v > 0.0), "segment {s} scores");
+            for (c, (h, g)) in host.iter().zip(card).enumerate() {
+                assert!(
+                    (h - g).abs() <= 1e-3 * h.abs().max(1.0),
+                    "segment {s} case {c}: host {h} vs card {g}"
+                );
+            }
+            at += n_cases;
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        if has_bmma {
+            let bmma = arena
+                .scan_weighted_bmma(&segs, &[probe.as_slice()], &weights)
+                .unwrap();
+            assert_eq!(bits(&bmma[0]), bits(&scalar[0]), "BMMA vs scalar");
+        }
+        if has_imma {
+            let imma = arena
+                .scan_weighted_imma(&segs, &[probe.as_slice()], &weights)
+                .unwrap();
+            assert_eq!(bits(&imma[0]), bits(&scalar[0]), "IMMA vs scalar");
+        }
+        // The one-vote segment alone: rows one wide.
+        let alone = arena
+            .scan_weighted_scalar(
+                &[segment(1, VoteLaw::SINGLE)],
+                &[probe.as_slice()],
+                &weights,
+            )
+            .unwrap();
+        assert_eq!(bits(&alone[0]), bits(&scalar[0][12..17]));
+        // One vote everywhere over the same windows: a different index.
+        let single: Vec<PagedSegment> = (0..laws.len())
+            .map(|s| segment(s, VoteLaw::SINGLE))
+            .collect();
+        let once = arena
+            .scan_weighted_scalar(&single, &[probe.as_slice()], &weights)
+            .unwrap();
+        let windows: Vec<&[WideQSig]> = turns[0].iter().map(Vec::as_slice).collect();
+        let slots: Vec<usize> = (0..12).collect();
+        let host = score_slots_law(&probe, &windows, &slots, 12, &weights, VoteLaw::SINGLE);
+        for (h, g) in host.iter().zip(&once[0][..12]) {
+            assert!(
+                (h - g).abs() <= 1e-3 * h.abs().max(1.0),
+                "one vote: {h} vs {g}"
+            );
+        }
+    }
+
     /// **The live reprojection's widest scan, timed per backend.** The shape a
     /// turn group took in zend on `.5` (2026-10-17): 8.08 M index tokens over 9
     /// segments and 1,041 cases, scored for 66 fresh probe tokens — 16–23 ms a
@@ -2528,37 +2719,25 @@ mod tests {
         let turns: Vec<Vec<WideQSig>> = (0..2_048)
             .map(|_| (0..TURN_TOKENS).map(|_| rand_sig(&mut rng)).collect())
             .collect();
-        const SEGMENTS: usize = 9;
-        const CASES_PER_SEGMENT: usize = 116;
-        const WINDOWS_PER_CASE: usize = 15;
-        let mut next = 0usize;
-        let segs: Vec<PagedSegment> = (0..SEGMENTS)
-            .map(|_| {
-                let mut windows = Vec::new();
-                for case in 0..CASES_PER_SEGMENT {
-                    for _ in 0..WINDOWS_PER_CASE {
-                        let ti = next % turns.len();
-                        next += 1;
-                        windows.push(PagedWindow {
-                            sid: turn_stream_id(7_000, ti as u32),
-                            fingerprint: ti as u64,
-                            turn: (&turns[ti]).into(),
-                            start: 0,
-                            end: TURN_TOKENS,
-                            case,
-                        });
-                    }
-                }
-                PagedSegment {
-                    windows,
-                    n_cases: CASES_PER_SEGMENT,
-                    holder: Holder::Shared,
-                    groups: GroupSet::all(3),
-                    keep: Keep::All,
-                }
-            })
-            .collect();
-        let tokens = SEGMENTS * CASES_PER_SEGMENT * WINDOWS_PER_CASE * TURN_TOKENS;
+        let top_8 = VoteLaw {
+            top_k: 8,
+            power: 0.5,
+        };
+        // (shape, segments, cases a segment, windows a case, law): the turn
+        // group's 9 × 116, at one vote; and the code-reading group's one
+        // competition of 6,678 files, a window each, at one vote and at the
+        // scoring lab's top-8.
+        let shapes = [
+            (
+                "9 x 116, one vote",
+                9usize,
+                116usize,
+                15usize,
+                VoteLaw::SINGLE,
+            ),
+            ("1 x 6678, one vote", 1, 6_678, 1, VoteLaw::SINGLE),
+            ("1 x 6678, top-8", 1, 6_678, 1, top_8),
+        ];
         let (has_bmma, has_imma) = arena.tensor_caps();
         let mut backends: Vec<&str> = Vec::new();
         if has_bmma {
@@ -2568,26 +2747,58 @@ mod tests {
             backends.push("imma");
         }
         backends.push("auto");
-        let scan = |name: &str, probe: &[WideQSig]| match name {
-            "bmma" => arena.scan_weighted_bmma(&segs, &[probe], &[]),
-            "imma" => arena.scan_weighted_imma(&segs, &[probe], &[]),
-            _ => arena.scan_weighted(&segs, &[probe], &[]),
-        };
-        println!("gallery: {tokens} index tokens, {SEGMENTS} segments");
-        for probe_tokens in [66usize, 256, 1_024] {
-            for name in &backends {
-                // The first scan builds the index and uploads the pages.
-                let warm: Vec<WideQSig> = (0..probe_tokens).map(|_| rand_sig(&mut rng)).collect();
-                scan(name, &warm).unwrap();
-                let mut best = f64::MAX;
-                for _ in 0..5 {
-                    let probe: Vec<WideQSig> =
+        for (shape, n_segments, n_cases, per_case, law) in shapes {
+            let mut next = 0usize;
+            let segs: Vec<PagedSegment> = (0..n_segments)
+                .map(|_| {
+                    let mut windows = Vec::new();
+                    for case in 0..n_cases {
+                        for _ in 0..per_case {
+                            let ti = next % turns.len();
+                            next += 1;
+                            windows.push(PagedWindow {
+                                sid: turn_stream_id(7_000, ti as u32),
+                                fingerprint: ti as u64,
+                                turn: (&turns[ti]).into(),
+                                start: 0,
+                                end: TURN_TOKENS,
+                                case,
+                            });
+                        }
+                    }
+                    PagedSegment {
+                        windows,
+                        n_cases,
+                        holder: Holder::Shared,
+                        groups: GroupSet::all(3),
+                        keep: Keep::All,
+                        law,
+                    }
+                })
+                .collect();
+            let tokens = n_segments * n_cases * per_case * TURN_TOKENS;
+            let scan = |name: &str, probe: &[WideQSig]| match name {
+                "bmma" => arena.scan_weighted_bmma(&segs, &[probe], &[]),
+                "imma" => arena.scan_weighted_imma(&segs, &[probe], &[]),
+                _ => arena.scan_weighted(&segs, &[probe], &[]),
+            };
+            println!("{shape}: {tokens} index tokens");
+            for probe_tokens in [66usize, 256, 1_024] {
+                for name in &backends {
+                    // The first scan builds the index and uploads the pages.
+                    let warm: Vec<WideQSig> =
                         (0..probe_tokens).map(|_| rand_sig(&mut rng)).collect();
-                    let t = Instant::now();
-                    scan(name, &probe).unwrap();
-                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                    scan(name, &warm).unwrap();
+                    let mut best = f64::MAX;
+                    for _ in 0..5 {
+                        let probe: Vec<WideQSig> =
+                            (0..probe_tokens).map(|_| rand_sig(&mut rng)).collect();
+                        let t = Instant::now();
+                        scan(name, &probe).unwrap();
+                        best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    println!("  {name:>5} probe {probe_tokens:>5}: {best:8.2} ms");
                 }
-                println!("  {name:>5} probe {probe_tokens:>5}: {best:8.2} ms");
             }
         }
     }
@@ -2638,6 +2849,7 @@ mod tests {
                     holder: Holder::Shared,
                     groups: GroupSet::all(3),
                     keep: Keep::All,
+                    law: VoteLaw::SINGLE,
                 }
             })
             .collect();

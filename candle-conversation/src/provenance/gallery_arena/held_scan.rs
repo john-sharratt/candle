@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use super::super::{SigWindow, WideQSig};
+use super::super::{SigWindow, VoteLaw, WideQSig};
 use super::scan_split::{self, ArenaScanSplit};
 use super::{
     GalleryArena, GroupSet, Holder, Keep, PagedSegment, PagedWindow, TokenVotes, TurnSigs,
@@ -57,6 +57,7 @@ pub struct HeldSegment {
     holder: Holder,
     groups: GroupSet,
     keep: Keep,
+    law: VoteLaw,
 }
 
 impl HeldSegment {
@@ -78,6 +79,7 @@ impl HeldSegment {
             holder: segment.holder,
             groups: segment.groups,
             keep: segment.keep,
+            law: segment.law,
         }
     }
 
@@ -100,6 +102,7 @@ impl HeldSegment {
             holder: self.holder,
             groups: self.groups,
             keep: self.keep,
+            law: self.law,
         }
     }
 }
@@ -258,12 +261,23 @@ mod tests {
             holder: Holder::Shared,
             groups: GroupSet::all(3),
             keep: Keep::All,
+            law: VoteLaw {
+                top_k: 8,
+                power: 0.5,
+            },
         };
         let held = HeldSegment::of(&segment);
         drop(decoded);
         let back = held.view();
         assert_eq!(back.n_cases, 5);
         assert_eq!(back.holder, Holder::Shared);
+        assert_eq!(
+            back.law,
+            VoteLaw {
+                top_k: 8,
+                power: 0.5
+            }
+        );
         assert_eq!(back.groups, GroupSet::all(3));
         assert_eq!(back.keep, Keep::All);
         let fields: Vec<(u64, u64, usize, usize, usize)> = back

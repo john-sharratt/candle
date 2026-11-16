@@ -23,6 +23,7 @@ use rayon::prelude::*;
 
 use super::packed::PackedGallery;
 use super::scan::{heads_per_group, FOLD_GROUPS, NEEDLE_KEEP_FRAC};
+use super::vote_law::VoteLaw;
 use super::WideQSig;
 
 /// Query-token tile width — MUST mirror `BDP_TQ` in `bdp_scan.cu`. The kernel's
@@ -341,12 +342,14 @@ impl BatchedGpuGallery {
                     std::ptr::null(), // page_ptr — contiguous mode
                     std::ptr::null(), // entry_page — contiguous mode
                     std::ptr::null(), // entry_slots — contiguous mode
+                    std::ptr::null(), // seg_top_k — one vote a token
                     n_probe_tokens as i32,
                     n_groups as i32,
                     n_segments as i32,
                     self.max_seg_cases as i32,
                     self.gw as i32,
                     wpt as i32,
+                    1,
                     p_out_case as *mut i32,
                     p_out_vote as *mut f32,
                     stream.cu_stream() as *mut c_void,
@@ -374,7 +377,9 @@ impl BatchedGpuGallery {
             n_groups,
             n_segments,
             n_cases,
+            1,
             &vec![group_weights; n_segments],
+            &vec![VoteLaw::SINGLE; n_segments],
         ))
     }
 }
@@ -397,6 +402,11 @@ impl BatchedGpuGallery {
 /// `segment_weights[s]` weighs segment `s`'s fold groups — in its gate and its
 /// tally alike — so competitions that carry their identity in different groups
 /// are each weighed by their own.
+///
+/// Each output row holds `k` votes, best first, ended early by a negative case;
+/// every one counts toward its token's magnitude, and each kept vote, weighed,
+/// is raised by `laws[s]` before it is summed — at [`VoteLaw::SINGLE`] the
+/// arithmetic of one weighed vote a row.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn needle_tally_segments(
     out_case: &[i32],
@@ -406,13 +416,16 @@ pub(crate) fn needle_tally_segments(
     n_groups: usize,
     n_segments: usize,
     n_cases: usize,
+    k: usize,
     segment_weights: &[&[f32]],
+    laws: &[VoteLaw],
 ) -> Vec<Vec<f32>> {
     assert_eq!(
         segment_weights.len(),
         n_segments,
         "one fold-group weighting per segment"
     );
+    assert_eq!(laws.len(), n_segments, "one vote law per segment");
     let mut results = Vec::with_capacity(per_req_tokens.len());
     let mut tok_base = 0usize;
     for &cnt in per_req_tokens {
@@ -431,6 +444,7 @@ pub(crate) fn needle_tally_segments(
                     return (case0, local);
                 }
                 let group_weights = segment_weights[s];
+                let law = laws[s];
                 let wof = |g: usize| group_weights.get(g).copied().unwrap_or(1.0);
                 // Pass 1: per-query magnitude (sum of weighted votes over groups).
                 let mut mags = vec![0f32; cnt];
@@ -438,8 +452,11 @@ pub(crate) fn needle_tally_segments(
                     let gqt = base + qt;
                     let mut acc = 0f32;
                     for g in 0..n_groups {
-                        let idx = (gqt * n_groups + g) * n_segments + s;
-                        if out_case[idx] >= 0 {
+                        let row = ((gqt * n_groups + g) * n_segments + s) * k;
+                        for idx in row..row + k {
+                            if out_case[idx] < 0 {
+                                break;
+                            }
                             acc += out_vote[idx] * wof(g);
                         }
                     }
@@ -457,10 +474,13 @@ pub(crate) fn needle_tally_segments(
                     }
                     let gqt = base + qt;
                     for g in 0..n_groups {
-                        let idx = (gqt * n_groups + g) * n_segments + s;
-                        let c = out_case[idx];
-                        if c >= 0 {
-                            local[c as usize - case0] += out_vote[idx] * wof(g);
+                        let row = ((gqt * n_groups + g) * n_segments + s) * k;
+                        for idx in row..row + k {
+                            let c = out_case[idx];
+                            if c < 0 {
+                                break;
+                            }
+                            local[c as usize - case0] += law.raise(out_vote[idx] * wof(g));
                         }
                     }
                 }
@@ -513,14 +533,57 @@ mod tests {
         // each; `(token × groups + group) × segments + segment`.
         let out_vote = [1.0f32, 1.0, 4.0, 4.0, 3.0, 3.0, 1.0, 1.0];
         let out_case = [0i32, 1, 0, 1, 0, 1, 0, 1];
+        let single = [VoteLaw::SINGLE; 2];
         let tally = |w: &[&[f32]]| {
-            needle_tally_segments(&out_case, &out_vote, &[2], &[0, 1, 2], 2, 2, 2, w)
+            needle_tally_segments(
+                &out_case,
+                &out_vote,
+                &[2],
+                &[0, 1, 2],
+                2,
+                2,
+                2,
+                1,
+                w,
+                &single,
+            )
         };
         // Alike: both segments keep token 0 (magnitude 5 against 4).
         assert_eq!(tally(&[&[1.0, 1.0], &[1.0, 1.0]]), vec![vec![5.0, 5.0]]);
         // Apart: segment 0 weighs group 0 alone and keeps token 1 (3 > 1);
         // segment 1 weighs group 1 alone and keeps token 0 (4 > 1).
         assert_eq!(tally(&[&[1.0, 0.0], &[0.0, 1.0]]), vec![vec![3.0, 4.0]]);
+    }
+
+    /// **A row of k votes tallies every vote, raised by its segment's law.**
+    /// One group, one segment of three cases, two votes a row. Token 0 votes
+    /// 9 for case 0 and 4 for case 2 (magnitude 13); token 1 votes 1 for case
+    /// 1 and nothing more (magnitude 1). The gate keeps token 0 alone; at
+    /// power 0.5 its votes sum as 3 and 2.
+    #[test]
+    fn a_row_of_k_votes_tallies_each_vote_raised() {
+        let out_case = [0i32, 2, 1, -1];
+        let out_vote = [9.0f32, 4.0, 1.0, 0.0];
+        let tally = |law: VoteLaw| {
+            needle_tally_segments(
+                &out_case,
+                &out_vote,
+                &[2],
+                &[0, 3],
+                1,
+                1,
+                3,
+                2,
+                &[&[]],
+                &[law],
+            )
+        };
+        assert_eq!(tally(VoteLaw::SINGLE), vec![vec![9.0, 0.0, 4.0]]);
+        let root = VoteLaw {
+            top_k: 2,
+            power: 0.5,
+        };
+        assert_eq!(tally(root), vec![vec![3.0, 0.0, 2.0]]);
     }
 
     /// The batched GPU scan must be **bit-identical** to running the CPU

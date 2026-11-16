@@ -4,6 +4,7 @@
 use candle::engine_events::note;
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::iter::repeat_n;
 use std::ops::Range;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -17,7 +18,7 @@ mod maintenance_op;
 pub use maintenance_op::MaintenanceOp;
 use maintenance_op::Pass;
 
-use super::adaptive::ScanCases;
+use super::adaptive::{ScanCases, ScanNorm};
 use super::belief_files::{assemble_file_scans, cut_excluded, scan_file_scans, FileScan};
 use super::belief_scan_split::GROUP_SCAN_SPLIT;
 use super::held_index_pages::HeldIndexPages;
@@ -38,7 +39,7 @@ use super::working_set_pick::{Standing, WorkingSetMembers};
 use crate::cancel::CancelToken;
 use crate::error::ConversationError;
 use crate::index_pages::StoredPages;
-use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
+use crate::normalization::{kind_z_band, path_kind, ChildKey, NormalizationCache, ScopeKey};
 use crate::persistence::chunk_window_integrity::{first_divergent_chunk, WindowDivergence};
 use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
@@ -1294,6 +1295,7 @@ impl Conversation {
                         holder: Holder::Shared,
                         groups: GroupSet::weighed(&coll.policy.layer_weights, arena.n_groups()),
                         keep: coll.policy.scan.gallery_keep,
+                        law: coll.policy.scan.law,
                     };
                     // Every probe token's vote in each fold group, as the needle
                     // gate meets them: which member each token's best match
@@ -2157,6 +2159,7 @@ impl Conversation {
             holder: Holder::Shared,
             groups: GroupSet::weighed(weights, arena.n_groups()),
             keep: taught.policy.scan.gallery_keep,
+            law: taught.policy.scan.law,
         }];
         let mut raw = Vec::with_capacity(queries.len());
         for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
@@ -2640,6 +2643,29 @@ impl Conversation {
             let t_assemble = Instant::now();
             let (mut files, turns_walked) = assemble_file_scans(&sub, timelines);
             cut_excluded(&mut files, &sub.chunk_exclusion(group.id));
+            // Each file's kind, its path's extension, when the group reads its
+            // files against their own kind — one metadata lookup a file.
+            let kinds: Option<Vec<String>> =
+                (group.policy.scan.normalize == ScanNorm::KindZ).then(|| {
+                    files
+                        .iter()
+                        .map(|f| {
+                            sub.custom_of(f.timeline)
+                                .and_then(|m| m.get(Substrate::PATH_KEY))
+                                .map_or(String::new(), |p| path_kind(p).to_string())
+                        })
+                        .collect()
+                });
+            // The target's lineage, when the group leaves it out: the priming
+            // chain the target opens on already.
+            let lineage: HashSet<TimelineId> = if group.policy.scan.exclude_lineage {
+                sub.inherited_chain(target.timeline)
+                    .into_iter()
+                    .filter(|&tl| tl != target.timeline)
+                    .collect()
+            } else {
+                HashSet::new()
+            };
             // End of Phase A — release the substrate before the scan. Every
             // `FileScan` owns its data (`arcs_kept` holds `Arc`s), so nothing
             // below borrows the guard.
@@ -2734,14 +2760,30 @@ impl Conversation {
             };
             let pool_raw = pool_pairs(&fresh_per_file);
             let band = |out: Vec<(ChildKey, f32)>| out.into_iter().map(|(_, s)| s);
-            let mut pool_normed =
-                band(self.normalization.normalize(&pool_scope, &pool_raw, t_tail));
-            let mut pool_normed_q = fresh_q_per_file.as_ref().map(|per_file| {
-                band(
-                    self.normalization
-                        .normalize(&pool_scope, &pool_pairs(per_file), t_q),
-                )
-            });
+            // Under `kind_z` every file is pooled (`cases: file`), its one
+            // score standing for each of its exchanges.
+            let by_kind = |per_file: &[Vec<f32>], kinds: &[String]| -> Vec<f32> {
+                let raw: Vec<f32> = per_file
+                    .iter()
+                    .map(|s| s.first().copied().unwrap_or(0.0))
+                    .collect();
+                files
+                    .iter()
+                    .zip(kind_z_band(&raw, kinds))
+                    .flat_map(|(f, b)| repeat_n(b, f.n_slots))
+                    .collect()
+            };
+            let pool_band = |per_file: &[Vec<f32>], pairs: &[(ChildKey, f32)], t: usize| {
+                match &kinds {
+                    Some(kinds) => by_kind(per_file, kinds),
+                    None => band(self.normalization.normalize(&pool_scope, pairs, t)).collect(),
+                }
+                .into_iter()
+            };
+            let mut pool_normed = pool_band(&fresh_per_file, &pool_raw, t_tail);
+            let mut pool_normed_q = fresh_q_per_file
+                .as_ref()
+                .map(|per_file| pool_band(per_file, &pool_pairs(per_file), t_q));
             for (fi, (f, fresh)) in files.iter().zip(&fresh_per_file).enumerate() {
                 let timeline = f.timeline;
                 let (normed, normed_q): (Vec<f32>, Option<Vec<f32>>) = if in_pool(f) {
@@ -2790,6 +2832,12 @@ impl Conversation {
                         t.max(q)
                     })
                     .collect();
+                // A link of the target's lineage competed in the scan and is not
+                // offered: the target opens on it already.
+                if lineage.contains(&timeline) {
+                    group_raw.extend_from_slice(&mass_base_per_file[fi]);
+                    continue;
+                }
                 // Concept C: a hit drags its timeline neighbors into contention
                 // (exchange granularity, max-not-sum, radius grows with score).
                 let boosted_flags: Vec<bool> = match &group.locality {
@@ -2816,8 +2864,9 @@ impl Conversation {
                 }
                 group_raw.extend_from_slice(&mass_base_per_file[fi]);
             }
+            // A kind-read pool keeps no background: there is nothing to teach.
             if let (false, true, Some(source)) = (
-                pool_raw.is_empty(),
+                pool_raw.is_empty() || kinds.is_some(),
                 observe.teaches(&group.policy.tags),
                 observe.source(),
             ) {
@@ -6976,6 +7025,75 @@ layers:
         );
         assert!(keeps("gallery_keep: 0").is_err());
         assert!(keeps("gallery_keep: some").is_err());
+    }
+
+    /// **A group's vote law, normalization and lineage parse from its
+    /// policy**, default to today's single vote against each file's background,
+    /// and a law the scan cannot run is refused with its reason.
+    #[test]
+    fn a_vote_law_and_kind_normalization_parse_from_the_policy() {
+        use crate::projection::ScanNorm;
+        use crate::provenance::VoteLaw;
+
+        let yaml = |policy: &str| {
+            format!(
+                r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
+layers:
+  - name: files
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: scopes
+        selection: {{ kind: top_k, k: 2 }}
+        policy: {{ {policy} }}
+"#
+            )
+        };
+        let scan = |policy: &str| {
+            Builder::from_yaml(&yaml(policy)).map(|b| b.schema().layers[0].groups[0].policy.scan)
+        };
+        let lab = scan(
+            "cases: file, vote_top_k: 8, vote_power: 0.5, normalize: kind_z, \
+             exclude_lineage: true",
+        )
+        .unwrap();
+        assert_eq!(
+            lab.law,
+            VoteLaw {
+                top_k: 8,
+                power: 0.5
+            }
+        );
+        assert_eq!(lab.normalize, ScanNorm::KindZ);
+        assert!(lab.exclude_lineage);
+        let plain = scan("cases: file").unwrap();
+        assert_eq!(plain.law, VoteLaw::SINGLE);
+        assert_eq!(plain.normalize, ScanNorm::Background);
+        assert!(!plain.exclude_lineage);
+
+        let reason = |policy: &str| scan(policy).err().unwrap().to_string();
+        assert!(reason("vote_top_k: 9").contains("vote_top_k must be in 1..=8"));
+        assert!(reason("vote_top_k: 0").contains("vote_top_k must be in 1..=8"));
+        assert!(reason("vote_power: 0").contains("vote_power a positive number"));
+        assert!(reason("vote_top_k: 2, fusion: { mode: content_gated }")
+            .contains("needs fusion: additive"));
+        assert!(reason("normalize: kind_z").contains("needs cases: file"));
+        assert!(reason("normalize: kind").contains("unknown normalize"));
     }
 
     /// **A calibration's questions vote for the file they calibrate.** Two

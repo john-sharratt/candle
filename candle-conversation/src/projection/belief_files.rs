@@ -27,7 +27,7 @@ use crate::provenance::chunk_exclusion::{uncut, ChunkExclusion};
 use crate::provenance::gallery_arena::{BeliefArena, GroupSet, Holder, PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
-    score_slots_grouped, score_slots_weighted, FusionMode, SigWindow, WideQSig,
+    score_slots_grouped, score_slots_law, FusionMode, SigWindow, VoteLaw, WideQSig,
 };
 use crate::substrate::calibration_record::CalRecord;
 use crate::substrate::Substrate;
@@ -525,35 +525,38 @@ pub(crate) fn scan_file_scans(
     // order, as the arena lays them. The windows are decoded on the host path's
     // first use and shared by every probe of this call.
     let decoded: OnceCell<Vec<Vec<Vec<WideQSig>>>> = OnceCell::new();
+    let law = group.policy.scan.law;
+    let cal_law = group.policy.scan.calibration_law();
     let scan_files_cpu = |p: &[WideQSig]| -> Vec<(Vec<f32>, Vec<f32>)> {
         let decoded = decoded.get_or_init(|| decode_files(files));
         let mut fused_all: Vec<f32> = Vec::new();
         let mut base_all: Vec<f32> = Vec::new();
-        let mut score = |wref: &[&[WideQSig]], wslot: &[usize], n_cases: usize, w: &[f32]| {
-            let (fused, base) = match group.policy.scan.fusion {
-                FusionMode::Additive => {
-                    let v = score_slots_weighted(p, wref, wslot, n_cases, w);
-                    (v.clone(), v)
-                }
-                mode => {
-                    let grouped = score_slots_grouped(p, wref, wslot, n_cases, w);
-                    if grouped.is_empty() {
-                        (vec![0.0; n_cases], vec![0.0; n_cases])
-                    } else {
-                        (mode.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
+        let mut score =
+            |wref: &[&[WideQSig]], wslot: &[usize], n_cases: usize, w: &[f32], law: VoteLaw| {
+                let (fused, base) = match group.policy.scan.fusion {
+                    FusionMode::Additive => {
+                        let v = score_slots_law(p, wref, wslot, n_cases, w, law);
+                        (v.clone(), v)
                     }
-                }
+                    mode => {
+                        let grouped = score_slots_grouped(p, wref, wslot, n_cases, w);
+                        if grouped.is_empty() {
+                            (vec![0.0; n_cases], vec![0.0; n_cases])
+                        } else {
+                            (mode.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
+                        }
+                    }
+                };
+                fused_all.extend(resized(fused, n_cases));
+                base_all.extend(resized(base, n_cases));
             };
-            fused_all.extend(resized(fused, n_cases));
-            base_all.extend(resized(base, n_cases));
-        };
         for comp in &comps {
             let (wref, wslot, n_cases) = competition_windows(files, decoded, comp, cases);
-            score(&wref, &wslot, n_cases, weights);
+            score(&wref, &wslot, n_cases, weights, law);
         }
         if !cal.is_empty() {
             let (wref, wslot) = calibration_windows(files, decoded, &cal);
-            score(&wref, &wslot, cal.len(), cal_weights);
+            score(&wref, &wslot, cal.len(), cal_weights, cal_law);
         }
         let split = |votes: &[f32]| with_calibration(files, &comps, &cal, votes, cases, cal_weight);
         split(&fused_all)
@@ -594,6 +597,7 @@ pub(crate) fn scan_file_scans(
                     // resident (`docs/gallery_residency.md` §4).
                     groups: GroupSet::weighed(weights, arena.n_groups()),
                     keep: group.policy.scan.gallery_keep,
+                    law,
                 }
             })
             .collect();
@@ -617,6 +621,7 @@ pub(crate) fn scan_file_scans(
                 holder,
                 groups: GroupSet::weighed(cal_weights, arena.n_groups()),
                 keep: group.policy.scan.calibration_gallery_keep,
+                law: cal_law,
             });
         }
         let segments_us = t_segments.elapsed().as_micros() as u64;
@@ -720,7 +725,7 @@ mod tests {
 
     use super::*;
     use crate::projection::Builder;
-    use crate::provenance::encode_wide_sigs;
+    use crate::provenance::{encode_wide_sigs, score_slots_weighted};
 
     /// A deterministic pseudo-random folded signature: 3 groups × 4 heads ×
     /// 2 words.

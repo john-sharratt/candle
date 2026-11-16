@@ -36,6 +36,7 @@ pub mod raw_store;
 pub mod scan;
 pub mod selection;
 pub mod sig_window;
+pub mod vote_law;
 pub mod wide_sig;
 pub mod window_score;
 
@@ -43,18 +44,20 @@ pub use belief::{ToolBelief, DEFAULT_LEAK_BETA};
 pub use fusion::FusionMode;
 pub use gallery_arena::GalleryArena;
 pub use gather::{
-    belief_step, score_slots, score_slots_fused, score_slots_grouped, score_slots_weighted,
-    SlotBelief,
+    belief_step, score_slots, score_slots_fused, score_slots_grouped, score_slots_law,
+    score_slots_weighted, SlotBelief,
 };
 pub use gpu::{score_batched_gpu, BatchedGpuGallery, SegmentInput};
 pub use packed::{score_packed, PackedGallery};
 pub use raw_store::extract_q_vector_r16;
 pub use scan::{
     heads_per_group, score_provenance_late_fusion, score_provenance_late_fusion_fused,
-    score_provenance_late_fusion_grouped, score_provenance_late_fusion_weighted, FOLD_GROUPS,
+    score_provenance_late_fusion_grouped, score_provenance_late_fusion_law,
+    score_provenance_late_fusion_weighted, FOLD_GROUPS,
 };
 pub use selection::{GroupBudget, SectionPolicy, SectionSelector};
 pub use sig_window::SigWindow;
+pub use vote_law::VoteLaw;
 pub use wide_sig::{
     active_fold, decode_wide_sigs, decode_wide_sigs_for_scoring, encode_wide_sigs,
     encode_wide_sigs_with, fold_fits, fold_provenance, fold_provenance_checked,

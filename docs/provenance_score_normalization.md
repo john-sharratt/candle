@@ -230,6 +230,30 @@ locked on its own draft at 13,365), documents with no evidence at exactly 0, and
 no document winning across unrelated activities. Pinned by
 `turn_belief_scan::one_exchange_documents_compete_as_one_pool`.
 
+### 3.3b A file-scored group read against its own kind (`normalize: kind_z`)
+
+A file-scored group (`cases: file`) may instead read each file against the
+scoring files of its **own kind** (its path's extension) on the same probe, with
+no background at all (`normalization::kind_z_band`). A file's score becomes a
+z-score among its kind's positive scores, and the z-score goes onto the band
+through the normal tail: `1000 × −ln P(Z ≥ z) / ln 100`. So 1000 is still a
+1-in-100 score, a file at its kind's mean reads about 150, and a score of no
+evidence reads 0. A pool read this way learns nothing at seal.
+
+This exists for the code-reading group, where documents compete with source
+files. A document scores on nearly every natural-language question, so it is
+loud on every probe, and against its own background it still outranked code on
+questions about code. Read against its kind, a document competes only with
+documents:
+- the dependency battery's MRR was 0.532 with the kind z, against 0.522 for a
+  hand-set ×0.25 on documents;
+- the kind's mean taken on the background instead scored 0.326, because the
+  background must be the same kind of question as the probe.
+
+See `docs/results/provenance_scoring_lab_2026-11-16.md`. The tool catalog keeps
+§3.1: every tool is one kind, and its backgrounds are what keep the gate's false
+hits low.
+
 ### 3.4 Subdividing a scope by phase — tried, measured, REMOVED
 
 > **Status: not in the engine.** The phase lens was built, A/B'd, and found to be

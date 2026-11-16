@@ -16,7 +16,11 @@
 
 use super::fusion::FusionMode;
 use super::selection::{GroupBudget, SectionPolicy, SectionSelector};
-use super::{score_provenance_late_fusion_fused, score_provenance_late_fusion_grouped, WideQSig};
+use super::vote_law::VoteLaw;
+use super::{
+    score_provenance_late_fusion_fused, score_provenance_late_fusion_grouped,
+    score_provenance_late_fusion_law, WideQSig,
+};
 
 /// One slot's belief after a step: its confidence and whether it is selected.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,6 +66,32 @@ pub fn score_slots_weighted(
         group_weights,
         FusionMode::Additive,
     )
+}
+
+/// [`score_slots_weighted`] under a [`VoteLaw`] — additive fusion, each token
+/// voting for its best `law.top_k` slots, kept votes raised to `law.power`.
+pub fn score_slots_law(
+    query: &[WideQSig],
+    gallery_windows: &[&[WideQSig]],
+    gallery_slot: &[usize],
+    n_slots: usize,
+    group_weights: &[f32],
+    law: VoteLaw,
+) -> Vec<f32> {
+    let total: usize = gallery_windows.iter().map(|w| w.len()).sum();
+    let mut gtoks: Vec<&WideQSig> = Vec::with_capacity(total);
+    let mut gcase: Vec<u32> = Vec::with_capacity(total);
+    for (wi, w) in gallery_windows.iter().enumerate() {
+        let slot = gallery_slot.get(wi).copied().unwrap_or(usize::MAX);
+        if slot >= n_slots {
+            continue;
+        }
+        for t in w.iter() {
+            gtoks.push(t);
+            gcase.push(slot as u32);
+        }
+    }
+    score_provenance_late_fusion_law(query, &gtoks, &gcase, n_slots, group_weights, law)
 }
 
 /// Per-fold-group slot scores (Concept G): `out[g][slot]` — each group's

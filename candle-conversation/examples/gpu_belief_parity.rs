@@ -27,7 +27,7 @@ use candle_conversation::persistence::streams::StreamDecl;
 use candle_conversation::persistence::SubstratePersistence;
 use candle_conversation::provenance::gallery_arena::{Holder, Keep, PagedSegment, PagedWindow};
 use candle_conversation::provenance::{
-    decode_wide_sigs, score_slots_weighted, GalleryArena, WideQSig,
+    decode_wide_sigs, score_slots_weighted, GalleryArena, VoteLaw, WideQSig,
 };
 use candle_conversation::substrate::Substrate;
 
@@ -159,6 +159,7 @@ fn main() {
             holder: Holder::Shared,
             groups: arena.all_groups(),
             keep: Keep::All,
+            law: VoteLaw::SINGLE,
         })
         .collect::<Vec<_>>();
 
@@ -253,6 +254,7 @@ fn main() {
             holder: Holder::Shared,
             groups: arena.all_groups(),
             keep: Keep::All,
+            law: VoteLaw::SINGLE,
         };
         // A wide probe (past the group scans' 256 budget) mirrors the live
         // collection probe: concatenate windows up to 320 sigs.

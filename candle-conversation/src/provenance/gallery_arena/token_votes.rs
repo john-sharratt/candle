@@ -1,4 +1,4 @@
-//! A paged scan's raw output: every probe token's vote in every fold group and
+//! A paged scan's raw output: every probe token's votes in every fold group and
 //! segment, before the needle gate and the tally
 //! ([`GalleryArena::scan_votes`](super::GalleryArena::scan_votes)).
 //!
@@ -11,35 +11,42 @@
 //! not weigh voted for nothing in it, which is what weighing it zero tallies —
 //! whether the launch scanned that group for another segment, or for an
 //! earlier reader of the same index, or not at all.
+//!
+//! Each row holds `k` votes, the most any segment of the launch casts a token
+//! ([`VoteLaw::top_k`](super::super::VoteLaw)), best first; a segment casting
+//! fewer leaves the rest of its rows empty.
 
 use super::groups::GroupSet;
 
 /// Every probe token's `(case, vote)` per fold group and segment, token-major:
-/// row `(token · n_groups + group) · n_segments + segment`, the probes' tokens
-/// laid end to end in probe order.
+/// row `(token · n_groups + group) · n_segments + segment`, `k` votes a row,
+/// the probes' tokens laid end to end in probe order.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TokenVotes {
-    /// The winning case, global over the scan's segments; negative where the
-    /// token voted for nothing.
+    /// The voted cases, global over the scan's segments, best first; negative
+    /// past the row's last vote.
     pub case: Vec<i32>,
-    /// The `z × margin` vote the winner took.
+    /// The `z × margin` vote each case took.
     pub vote: Vec<f32>,
     /// Tokens each probe contributed (a token narrower than the gallery's fold
     /// is not scanned).
     pub per_probe: Vec<usize>,
     pub n_groups: usize,
     pub n_segments: usize,
+    /// Votes a row.
+    pub k: usize,
 }
 
 impl TokenVotes {
     /// No probe token scored: `per_probe` tokens each, all of them empty.
-    pub fn none(n_probes: usize, n_groups: usize, n_segments: usize) -> Self {
+    pub fn none(n_probes: usize, n_groups: usize, n_segments: usize, k: usize) -> Self {
         TokenVotes {
             case: Vec::new(),
             vote: Vec::new(),
             per_probe: vec![0; n_probes],
             n_groups,
             n_segments,
+            k,
         }
     }
 
@@ -48,12 +55,27 @@ impl TokenVotes {
         self.per_probe[..p].iter().sum()
     }
 
-    /// Token `t` (end-to-end)'s winning case and vote in `group` and
+    /// Token `t` (end-to-end)'s leading case and vote in `group` and
     /// `segment`, or `None` where it voted for nothing.
     pub fn at(&self, t: usize, group: usize, segment: usize) -> Option<(usize, f32)> {
-        let i = (t * self.n_groups + group) * self.n_segments + segment;
-        let c = *self.case.get(i)?;
-        (c >= 0).then(|| (c as usize, self.vote[i]))
+        self.votes_at(t, group, segment).next()
+    }
+
+    /// Token `t`'s votes in `group` and `segment`, best first.
+    pub fn votes_at(
+        &self,
+        t: usize,
+        group: usize,
+        segment: usize,
+    ) -> impl Iterator<Item = (usize, f32)> + '_ {
+        let row = ((t * self.n_groups + group) * self.n_segments + segment) * self.k;
+        let end = (row + self.k).min(self.case.len());
+        let start = row.min(end);
+        self.case[start..end]
+            .iter()
+            .zip(&self.vote[start..end])
+            .take_while(|(c, _)| **c >= 0)
+            .map(|(&c, &v)| (c as usize, v))
     }
 }
 
@@ -61,16 +83,17 @@ impl TokenVotes {
 /// `n_groups` for segments weighing `weighed` (one set per segment, each
 /// within `launch`): a weighed group's row where it stands, every other group
 /// voting for nothing in that segment (case `-1`, vote `0`). Rows are
-/// token-major, then group, then segment, on both sides.
+/// token-major, then group, then segment, `k` votes each, on both sides.
 pub(super) fn widen_rows(
     case: &[i32],
     vote: &[f32],
     launch: GroupSet,
     weighed: &[GroupSet],
     n_groups: usize,
+    k: usize,
 ) -> (Vec<i32>, Vec<f32>) {
     let n_segments = weighed.len();
-    let per_token = launch.len() * n_segments;
+    let per_token = launch.len() * n_segments * k;
     if per_token == 0 {
         return (Vec::new(), Vec::new());
     }
@@ -79,7 +102,7 @@ pub(super) fn widen_rows(
         return (case.to_vec(), vote.to_vec());
     }
     let n_tokens = case.len() / per_token;
-    let mut out_case = vec![-1i32; n_tokens * n_groups * n_segments];
+    let mut out_case = vec![-1i32; n_tokens * n_groups * n_segments * k];
     let mut out_vote = vec![0f32; out_case.len()];
     for t in 0..n_tokens {
         for (place, g) in launch.iter().enumerate() {
@@ -87,8 +110,9 @@ pub(super) fn widen_rows(
             let to = (t * n_groups + g) * n_segments;
             for (s, w) in weighed.iter().enumerate() {
                 if w.contains(g) {
-                    out_case[to + s] = case[from + s];
-                    out_vote[to + s] = vote[from + s];
+                    let (f, o) = ((from + s) * k, (to + s) * k);
+                    out_case[o..o + k].copy_from_slice(&case[f..f + k]);
+                    out_vote[o..o + k].copy_from_slice(&vote[f..f + k]);
                 }
             }
         }
@@ -108,7 +132,7 @@ mod tests {
         // token 0: g1 [s0 s1], g2 [s0 s1]; token 1 likewise.
         let case = [10, 11, 20, 21, 12, 13, 22, 23];
         let vote = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let (c, v) = widen_rows(&case, &vote, launch, &[launch, launch], 3);
+        let (c, v) = widen_rows(&case, &vote, launch, &[launch, launch], 3, 1);
         assert_eq!(c, [-1, -1, 10, 11, 20, 21, -1, -1, 12, 13, 22, 23]);
         assert_eq!(
             v,
@@ -116,9 +140,19 @@ mod tests {
         );
         let full = GroupSet::all(3);
         assert_eq!(
-            widen_rows(&c, &v, full, &[full, full], 3),
+            widen_rows(&c, &v, full, &[full, full], 3, 1),
             (c.clone(), v.clone())
         );
+    }
+
+    /// **Rows of two votes widen as one**: one token, a launch over group 1 of
+    /// two, one segment — its two votes land in group 1's row whole.
+    #[test]
+    fn a_row_of_k_votes_widens_whole() {
+        let launch = GroupSet::default().with(1);
+        let (c, v) = widen_rows(&[7, 9], &[3.0, 1.0], launch, &[launch], 2, 2);
+        assert_eq!(c, [-1, -1, 7, 9]);
+        assert_eq!(v, [0.0, 0.0, 3.0, 1.0]);
     }
 
     /// **A group a segment does not weigh votes for nothing in it**, though the
@@ -131,7 +165,7 @@ mod tests {
         let only_2 = GroupSet::default().with(2);
         let case = [10, 11, 20, 21, 12, 13, 22, 23];
         let vote = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let (c, v) = widen_rows(&case, &vote, launch, &[launch, only_2], 3);
+        let (c, v) = widen_rows(&case, &vote, launch, &[launch, only_2], 3, 1);
         assert_eq!(c, [-1, -1, 10, -1, 20, 21, -1, -1, 12, -1, 22, 23]);
         assert_eq!(
             v,
@@ -142,7 +176,7 @@ mod tests {
         let wide_case = [1, 2, 3];
         let wide_vote = [1.0, 2.0, 3.0];
         assert_eq!(
-            widen_rows(&wide_case, &wide_vote, full, &[only_2], 3),
+            widen_rows(&wide_case, &wide_vote, full, &[only_2], 3, 1),
             (vec![-1, -1, 3], vec![0.0, 0.0, 3.0])
         );
     }
@@ -158,6 +192,7 @@ mod tests {
             per_probe: vec![1, 2],
             n_groups: 2,
             n_segments: 2,
+            k: 1,
         };
         assert_eq!(v.at(0, 0, 1), Some((2, 2.0)));
         assert_eq!(v.at(0, 1, 0), None);
@@ -165,6 +200,26 @@ mod tests {
         assert_eq!(v.at(2, 1, 1), Some((2, 12.0)));
         assert_eq!(v.first_token(1), 1);
         assert_eq!(v.at(3, 0, 0), None, "past the end");
-        assert_eq!(TokenVotes::none(2, 3, 1).per_probe, vec![0, 0]);
+        assert_eq!(TokenVotes::none(2, 3, 1, 1).per_probe, vec![0, 0]);
+    }
+
+    /// **A row's votes read best first and stop at its first empty one**: one
+    /// token, one group, two segments, three votes a row.
+    #[test]
+    fn a_rows_votes_read_until_the_first_empty_one() {
+        let v = TokenVotes {
+            case: vec![4, 1, -1, 6, -1, -1],
+            vote: vec![9.0, 2.0, 0.0, 5.0, 0.0, 0.0],
+            per_probe: vec![1],
+            n_groups: 1,
+            n_segments: 2,
+            k: 3,
+        };
+        assert_eq!(
+            v.votes_at(0, 0, 0).collect::<Vec<_>>(),
+            [(4, 9.0), (1, 2.0)]
+        );
+        assert_eq!(v.votes_at(0, 0, 1).collect::<Vec<_>>(), [(6, 5.0)]);
+        assert_eq!(v.at(0, 0, 0), Some((4, 9.0)));
     }
 }

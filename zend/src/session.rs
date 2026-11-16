@@ -8988,8 +8988,8 @@ mod projection_schema_tests {
     fn embedded_schema_carries_the_working_set_config() {
         use crate::calibrate::count::QuestionCount;
         use crate::calibrate::CalibrateSpec;
-        use candle_conversation::projection::{ScanCases, SystemPromptItem};
-        use candle_conversation::provenance::FusionMode;
+        use candle_conversation::projection::{ScanCases, ScanNorm, SystemPromptItem};
+        use candle_conversation::provenance::{FusionMode, VoteLaw};
         let builder = build_projection_builder(Path::new("demo-project"));
         let schema = builder.schema();
 
@@ -9035,14 +9035,32 @@ mod projection_schema_tests {
             (30.0, "path")
         );
 
-        // A whole file is one case of one competition, content weighed on fold
-        // groups 1-2 and the calibration competition on the top group alone,
-        // at a quarter of the content's weight.
+        // A whole file is one case of one competition, scored under the
+        // scoring lab's formula: every fold group alike in both competitions,
+        // the calibration weighed alike with the content, each token voting
+        // for its best 8 files at power 0.5 (the calibration keeping one vote
+        // a token), a file read against its own kind, the lineage not offered.
         let g = &layer("code_reading").groups[0];
         assert_eq!(g.policy.scan.cases, ScanCases::File);
-        assert_eq!(g.policy.layer_weights, vec![0.0, 1.0, 1.0]);
-        assert_eq!(g.policy.calibration_layer_weights, vec![0.0, 0.0, 1.0]);
-        assert_eq!(g.policy.scan.calibration_weight, 0.25);
+        assert_eq!(g.policy.layer_weights, vec![1.0, 1.0, 1.0]);
+        assert_eq!(g.policy.calibration_layer_weights, vec![1.0, 1.0, 1.0]);
+        assert_eq!(g.policy.scan.calibration_weight, 1.0);
+        assert_eq!(
+            g.policy.scan.law,
+            VoteLaw {
+                top_k: 8,
+                power: 0.5
+            }
+        );
+        assert_eq!(
+            g.policy.scan.calibration_law(),
+            VoteLaw {
+                top_k: 1,
+                power: 0.5
+            }
+        );
+        assert_eq!(g.policy.scan.normalize, ScanNorm::KindZ);
+        assert!(g.policy.scan.exclude_lineage);
         assert_eq!(
             layer("repo_map").groups[0].policy.scan.cases,
             ScanCases::Exchange
@@ -9164,6 +9182,12 @@ mod projection_schema_tests {
             tools.policy.scan.fusion,
             FusionMode::Additive,
             "tools MUST stay additive (results doc §25.8: gating collapses Top-1 97.3% → 32.9%)"
+        );
+        assert_eq!(
+            tools.policy.scan.law,
+            VoteLaw::SINGLE,
+            "tools keep one vote a token: top-8 costs Top-1 80% -> 64% \
+             (docs/results/provenance_scoring_lab_2026-11-16.md)"
         );
         // Strict normalized-band gate (reverted from the too-permissive min 112).
         assert_eq!(tools.policy.config.min_score, 800.0);

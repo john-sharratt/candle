@@ -31,11 +31,16 @@ extern "C" {
     ///   of the scan is slot `j & 31` of page `entry_page[j >> 5]`, scanned when
     ///   bit `j & 31` of `entry_slots[j >> 5]` is set. All null ⇒ the CONTIGUOUS
     ///   layout in `gallery_words` (with `gallery_words` null in the paged case).
+    /// - `seg_top_k`: `n_segments` (device) — how many cases a probe token votes
+    ///   for in each segment, `1..=BDP_MAX_TOP_K`; null ⇒ 1 for every segment.
+    ///   At 1 a token votes `z × margin` for its leading case; at `k` for each
+    ///   of its best `k`, case `r` by `z_r × (a_r − a_k)`.
     /// - `n_groups` / `gw` / `wpt`: folded-signature geometry (`wpt = n_groups*gw`).
     /// - `max_seg_cases`: the largest segment's case count (shared-mem stride).
-    /// - `out_case` / `out_vote`: `n_probe_tokens * n_groups * n_segments` outputs
-    ///   (device) — the per-(query token, group, segment) leading GLOBAL case
-    ///   (`-1` if none) and its `z*margin`.
+    /// - `max_k`: votes per output row, at least every segment's `seg_top_k`.
+    /// - `out_case` / `out_vote`: `n_probe_tokens * n_groups * n_segments *
+    ///   max_k` outputs (device) — per (query token, group, segment) row, its
+    ///   voted GLOBAL cases best first (`-1` past the last) and their votes.
     /// - `stream`: the CUDA stream handle so the kernel orders with the copies.
     pub fn run_batched_bdp_scan(
         gallery_words: *const u64,
@@ -47,12 +52,14 @@ extern "C" {
         page_ptr: *const u64,
         entry_page: *const u32,
         entry_slots: *const u32,
+        seg_top_k: *const i32,
         n_probe_tokens: i32,
         n_groups: i32,
         n_segments: i32,
         max_seg_cases: i32,
         gw: i32,
         wpt: i32,
+        max_k: i32,
         out_case: *mut i32,
         out_vote: *mut f32,
         stream: *mut c_void,
@@ -83,6 +90,7 @@ extern "C" {
         page_ptr: *const u64,
         entry_page: *const u32,
         entry_slots: *const u32,
+        seg_top_k: *const i32,
         n_slots: i32,
         n_probe_tokens: i32,
         n_groups: i32,
@@ -90,6 +98,7 @@ extern "C" {
         n_cases: i32,
         gw: i32,
         wpt: i32,
+        max_k: i32,
         out_case: *mut i32,
         out_vote: *mut f32,
         stream: *mut c_void,
@@ -121,6 +130,7 @@ extern "C" {
         page_ptr: *const u64,
         entry_page: *const u32,
         entry_slots: *const u32,
+        seg_top_k: *const i32,
         n_slots: i32,
         n_probe_tokens: i32,
         n_groups: i32,
@@ -128,6 +138,7 @@ extern "C" {
         n_cases: i32,
         gw: i32,
         wpt: i32,
+        max_k: i32,
         out_case: *mut i32,
         out_vote: *mut f32,
         stream: *mut c_void,

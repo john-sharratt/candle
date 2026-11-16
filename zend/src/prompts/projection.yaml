@@ -1119,17 +1119,25 @@ layers:
           cases: file
           # Each file's calibration questions and their thinking compete among
           # themselves, not in the files' pool, where they took nearly every
-          # vote of a question probe; the file adds a quarter of its
-          # calibration vote. Content carries a file's identity in fold groups
-          # 1-2 (group 0 alone ranks nothing), the calibration in the top
-          # group alone. Over live-turn probes (a held-out question and its
-          # thinking, 999 files), R@1 / R@10 / MRR 0.197 / 0.561 / 0.323 at
-          # [1,1,1] + 0.5 x [1,1,1] -> 0.310 / 0.554 / 0.397; through the
-          # working set's momentum over three turns on a file, R@1 0.213 ->
-          # 0.392 (docs/results/provenance_gates_2026-10-26.md).
-          layer_weights: [0.0, 1.0, 1.0]
-          calibration_layer_weights: [0.0, 0.0, 1.0]
-          calibration_weight: 0.25
+          # vote of a question probe. The scoring lab's formula over the
+          # dependency battery (docs/results/provenance_scoring_lab_2026-11-16.md):
+          # a question's probe gives a vote to only a few dozen of the
+          # workspace's files, so each token votes for its best 8 files and
+          # every kept vote is square-rooted; the calibration keeps one vote a
+          # token (spreading it diluted a clean match, 0.53 -> 0.40), weighed
+          # alike with the content, every fold group alike in both; a file
+          # reads as a z-score among the scoring files of its own extension, so
+          # documents compete with code with no weight set by hand; and the
+          # priming chain the dialogue opens on is not offered. On the same
+          # decoded probes, MRR 0.235 under the previous formula -> 0.663.
+          # Tools keep one vote a token: there top-8 drops Top-1 80% -> 64%.
+          layer_weights: [1.0, 1.0, 1.0]
+          calibration_layer_weights: [1.0, 1.0, 1.0]
+          calibration_weight: 1.0
+          vote_top_k: 8
+          vote_power: 0.5
+          normalize: kind_z
+          exclude_lineage: true
       - id: guidance
         persisted_id: 13
         # The workers' guides and the journals, placed apart from the code

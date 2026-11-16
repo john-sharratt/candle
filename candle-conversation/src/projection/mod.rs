@@ -261,7 +261,7 @@ mod working_set_tests;
 pub use crate::substrate::{ContentResolver, Substrate, SubstrateRead};
 pub use adaptive::{
     attention_mass, AnchorConfig, AnchorMember, BudgetAdaptive, LocalityConfig,
-    MemberBudgetAdaptive, ScanCases, ScanPolicy,
+    MemberBudgetAdaptive, ScanCases, ScanNorm, ScanPolicy,
 };
 pub use builder::Builder;
 pub use chunk_exclusion::ExclusionReport;

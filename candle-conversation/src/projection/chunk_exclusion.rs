@@ -242,7 +242,7 @@ fn in_batches(
     sigs: &[Vec<WideQSig>],
     scan: impl Fn(Vec<Vec<WideQSig>>) -> candle::Result<GroupVotes>,
 ) -> candle::Result<TokenVotes> {
-    let mut out = TokenVotes::none(0, FOLD_GROUPS, 1);
+    let mut out = TokenVotes::none(0, FOLD_GROUPS, 1, 1);
     for batch in sigs.chunks(PROBES_PER_SCAN) {
         let votes = in_file_order(files, &scan(batch.to_vec())?);
         out.case.extend(votes.case);
@@ -250,6 +250,7 @@ fn in_batches(
         out.per_probe.extend(votes.per_probe);
         out.n_groups = votes.n_groups;
         out.n_segments = votes.n_segments;
+        out.k = votes.k;
     }
     Ok(out)
 }
@@ -445,6 +446,7 @@ mod tests {
             per_probe: vec![1, 1],
             n_groups: FOLD_GROUPS,
             n_segments: 1,
+            k: 1,
         };
         let m = chunk_mass(
             &files,
@@ -478,6 +480,7 @@ mod tests {
                     per_probe: vec![1; batch.len()],
                     n_groups: FOLD_GROUPS,
                     n_segments: 1,
+                    k: 1,
                 },
             })
         })
@@ -546,6 +549,7 @@ mod tests {
                     per_probe: probes.iter().map(Vec::len).collect(),
                     n_groups: FOLD_GROUPS,
                     n_segments: 1,
+                    k: 1,
                 },
             })
         };

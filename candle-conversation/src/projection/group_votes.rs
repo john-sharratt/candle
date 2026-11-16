@@ -16,7 +16,7 @@ use crate::provenance::chunk_exclusion::uncut;
 use crate::provenance::gallery_arena::{
     GroupSet, Holder, Keep, PagedSegment, PagedWindow, TokenVotes,
 };
-use crate::provenance::{GalleryArena, WideQSig};
+use crate::provenance::{GalleryArena, VoteLaw, WideQSig};
 
 /// The votes: each case's file, and every probe token's vote per fold group
 /// (`TokenVotes::case` indexes `files`).
@@ -60,13 +60,15 @@ fn group_segment<'a>(
             }
         }
     }
-    // Every active file of the group: a read across conversations.
+    // Every active file of the group: a read across conversations, one vote a
+    // token — the caller weighs and folds the leading votes itself.
     PagedSegment {
         windows,
         n_cases: files.len(),
         holder: Holder::Shared,
         groups,
         keep,
+        law: VoteLaw::SINGLE,
     }
 }
 

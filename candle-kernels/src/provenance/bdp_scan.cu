@@ -103,14 +103,16 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
     const unsigned long long *__restrict__ page_ptr,      // paged: n_pages*n_groups (page, group) addresses, or null
     const unsigned int *__restrict__ entry_page,          // paged: the page each entry scans, or null
     const unsigned int *__restrict__ entry_slots,         // paged: its page's slots it scans, a bit each, or null
+    const int *__restrict__ seg_top_k,                    // n_segments: cases a token votes for, or null (1 each)
     int n_probe_tokens,
     int n_groups,
     int n_segments,
     int max_seg_cases, // shared-mem case stride (>= every segment's case count)
     int gw,            // words per layer-group (<= BDP_MAX_GW)
     int wpt,           // words per token (n_groups * gw)
-    int *__restrict__ out_case,   // n_probe_tokens * n_groups * n_segments
-    float *__restrict__ out_vote) // n_probe_tokens * n_groups * n_segments
+    int max_k,         // votes per output row (>= every segment's top_k)
+    int *__restrict__ out_case,   // n_probe_tokens * n_groups * n_segments * max_k
+    float *__restrict__ out_vote) // n_probe_tokens * n_groups * n_segments * max_k
 {
     const int tile = blockIdx.x / n_groups;
     const int g = blockIdx.x % n_groups;
@@ -132,14 +134,16 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
     const int case0 = seg_case_start[s];
     const int seg_nc = seg_case_start[s + 1] - case0;
 
-    // Output index for this (tile, group, segment): query token i is at
-    // ((q0+i)*n_groups + g)*n_segments + s.
+    // Output row for this (tile, group, segment): query token i's `max_k`
+    // votes start at (((q0+i)*n_groups + g)*n_segments + s) * max_k.
     // Empty segment ⇒ no vote.
     if (seg_nc <= 0 || tok1 <= tok0) {
         for (int i = tid; i < tq; i += nthreads) {
-            const int oi = ((q0 + i) * n_groups + g) * n_segments + s;
-            out_case[oi] = -1;
-            out_vote[oi] = 0.0f;
+            const int oi = (((q0 + i) * n_groups + g) * n_segments + s) * max_k;
+            for (int r = 0; r < max_k; r++) {
+                out_case[oi + r] = -1;
+                out_vote[oi + r] = 0.0f;
+            }
         }
         return;
     }
@@ -272,30 +276,47 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
     }
     __syncthreads();
 
-    // One thread per query token in the tile: leader/runner-up (WITHIN the
-    // segment) → z*margin vote, z's mean/std over the segment's tokens.
+    // One thread per query token in the tile: its best cases (WITHIN the
+    // segment) → z*margin votes, z's mean/std over the segment's tokens. A
+    // single-vote segment keeps the leader/runner-up loop; a top-k segment
+    // keeps its best k+1 in registers.
+    const int k = seg_top_k ? seg_top_k[s] : 1;
+    const int n_gal = seg_tok_count[s + 1] - seg_tok_count[s];
     for (int i = tid; i < tq; i += nthreads) {
         const unsigned int *cmax = s_case_max + (size_t)i * max_seg_cases;
-        unsigned int top1 = 0u, top2 = 0u;
-        int top1c = -1;
-        for (int c = 0; c < seg_nc; c++) {
-            const unsigned int m = cmax[c];
-            if (m > top1) {
-                top2 = top1;
-                top1 = m;
-                top1c = c;
-            } else if (m > top2) {
-                top2 = m;
+        const int oi = (((q0 + i) * n_groups + g) * n_segments + s) * max_k;
+        if (k == 1) {
+            unsigned int top1 = 0u, top2 = 0u;
+            int top1c = -1;
+            for (int c = 0; c < seg_nc; c++) {
+                const unsigned int m = cmax[c];
+                if (m > top1) {
+                    top2 = top1;
+                    top1 = m;
+                    top1c = c;
+                } else if (m > top2) {
+                    top2 = m;
+                }
             }
-        }
-        const int oi = ((q0 + i) * n_groups + g) * n_segments + s;
-        if (top1c < 0) {
-            out_case[oi] = -1;
-            out_vote[oi] = 0.0f;
+            if (top1c < 0) {
+                out_case[oi] = -1;
+                out_vote[oi] = 0.0f;
+            } else {
+                out_case[oi] = case0 + top1c; // GLOBAL case id
+                out_vote[oi] = bdp_vote(top1, top2, s_sum[i], s_sumsq[i], n_gal);
+            }
+            for (int r = 1; r < max_k; r++) {
+                out_case[oi + r] = -1;
+                out_vote[oi + r] = 0.0f;
+            }
         } else {
-            out_case[oi] = case0 + top1c; // GLOBAL case id
-            out_vote[oi] = bdp_vote(top1, top2, s_sum[i], s_sumsq[i],
-                                    seg_tok_count[s + 1] - seg_tok_count[s]);
+            BdpRanks ranks;
+            bdp_ranks_init(ranks);
+            for (int c = 0; c < seg_nc; c++) {
+                bdp_ranks_offer(ranks, k, cmax[c], c);
+            }
+            bdp_ranks_emit(ranks, k, max_k, case0, s_sum[i], s_sumsq[i], n_gal,
+                           out_case + oi, out_vote + oi);
         }
     }
 }
@@ -314,17 +335,20 @@ extern "C" void run_batched_bdp_scan(
     const unsigned long long *page_ptr, // paged: n_pages*n_groups (page, group) addresses, or null
     const unsigned int *entry_page,     // paged: the page each entry scans, or null
     const unsigned int *entry_slots,    // paged: its page's slots it scans, a bit each, or null
+    const int *seg_top_k,               // n_segments: cases a token votes for, or null (1 each)
     int n_probe_tokens,
     int n_groups,
     int n_segments,
     int max_seg_cases,
     int gw,
     int wpt,
+    int max_k,
     int *out_case,
     float *out_vote,
     void *stream)
 {
-    if (n_probe_tokens <= 0 || n_groups <= 0 || n_segments <= 0 || max_seg_cases <= 0) {
+    if (n_probe_tokens <= 0 || n_groups <= 0 || n_segments <= 0 || max_seg_cases <= 0 ||
+        max_k <= 0 || max_k > BDP_MAX_TOP_K) {
         return;
     }
     const int n_tiles = (n_probe_tokens + BDP_TQ - 1) / BDP_TQ;
@@ -335,6 +359,6 @@ extern "C" void run_batched_bdp_scan(
     bdp_scan_kernel<<<blocks, threads, shmem, s>>>(
         gallery_words, gallery_case, probe_words,
         seg_tok_start, seg_tok_count, seg_case_start, page_ptr, entry_page, entry_slots,
-        n_probe_tokens, n_groups, n_segments, max_seg_cases, gw, wpt,
+        seg_top_k, n_probe_tokens, n_groups, n_segments, max_seg_cases, gw, wpt, max_k,
         out_case, out_vote);
 }

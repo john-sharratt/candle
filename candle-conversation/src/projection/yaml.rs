@@ -68,11 +68,11 @@ use candle_transformers::models::dialect::{Dialect, DialectTemplate};
 use serde::Deserialize;
 
 use crate::provenance::gallery_arena::Keep;
-use crate::provenance::FusionMode;
+use crate::provenance::{FusionMode, VoteLaw};
 
 use super::adaptive::{
     AnchorConfig, AnchorMember, BudgetAdaptive, LocalityConfig, MemberBudgetAdaptive, ScanCases,
-    ScanPolicy,
+    ScanNorm, ScanPolicy,
 };
 use super::error::ConstructionError;
 use super::hits::HitsConfig;
@@ -255,6 +255,22 @@ struct YamlPolicy {
     /// `gallery_keep` for the calibration competition's questions.
     #[serde(default)]
     calibration_gallery_keep: Option<YamlKeep>,
+    /// Cases a probe token votes for in the group's own competitions,
+    /// `1..=8`. Omitted ⇒ inherit.
+    #[serde(default)]
+    vote_top_k: Option<usize>,
+    /// The power each kept vote is raised to before it is summed. Omitted ⇒
+    /// inherit.
+    #[serde(default)]
+    vote_power: Option<f32>,
+    /// How a file-scored group's scores meet the band: `background` |
+    /// `kind_z`. Omitted ⇒ inherit.
+    #[serde(default)]
+    normalize: Option<String>,
+    /// Leave the target's lineage out of the group's candidates. Omitted ⇒
+    /// inherit.
+    #[serde(default)]
+    exclude_lineage: Option<bool>,
 }
 
 /// `all`, or a count of tokens to keep per code.
@@ -1215,6 +1231,27 @@ fn parse_policy(
     if let Some(k) = &yp.calibration_gallery_keep {
         scan.calibration_gallery_keep = parse_keep(name, "calibration_gallery_keep", k)?;
     }
+    if let Some(k) = yp.vote_top_k {
+        scan.law.top_k = k;
+    }
+    if let Some(p) = yp.vote_power {
+        scan.law.power = p;
+    }
+    if let Some(n) = &yp.normalize {
+        scan.normalize = match n.as_str() {
+            "background" => ScanNorm::Background,
+            "kind_z" => ScanNorm::KindZ,
+            other => {
+                return Err(ConstructionError::InvalidPolicy {
+                    name: name.to_string(),
+                    reason: format!("unknown normalize {other:?} (background | kind_z)"),
+                })
+            }
+        };
+    }
+    if let Some(x) = yp.exclude_lineage {
+        scan.exclude_lineage = x;
+    }
     validate_scan(name, &scan)?;
     if calibration_layer_weights
         .iter()
@@ -1247,6 +1284,21 @@ fn validate_scan(name: &str, s: &ScanPolicy) -> Result<(), ConstructionError> {
     }
     if s.calibration_weight.is_nan() || s.calibration_weight < 0.0 {
         return Err(bad("calibration_weight must be >= 0"));
+    }
+    if !s.law.is_valid() {
+        return Err(bad(&format!(
+            "vote_top_k must be in 1..={} and vote_power a positive number",
+            VoteLaw::MAX_TOP_K
+        )));
+    }
+    // The non-additive modes score each fold group by its own one-vote scan.
+    if s.law.top_k > 1 && s.fusion != FusionMode::Additive {
+        return Err(bad("vote_top_k above 1 needs fusion: additive"));
+    }
+    // A file's kind is read once per file, and an exchange-scored file is
+    // several cases.
+    if s.normalize == ScanNorm::KindZ && s.cases != ScanCases::File {
+        return Err(bad("normalize: kind_z needs cases: file"));
     }
     Ok(())
 }

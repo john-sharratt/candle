@@ -24,12 +24,14 @@
 
 mod background;
 mod cache;
+mod kind_z;
 mod scope;
 
 #[cfg(test)]
 mod tests;
 
 pub use cache::NormalizationCache;
+pub use kind_z::{band_of_z, kind_z_band, path_kind};
 
 /// Identity of a **score-competition** budget scope (a turn group, a section
 /// collection, or a sub-window). NOT a layer — the layer is token distribution,

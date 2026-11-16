@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::provenance::gallery_arena::Keep;
-use crate::provenance::FusionMode;
+use crate::provenance::{FusionMode, VoteLaw};
 
 /// Scan-side policy knobs (per selection-policy node): Concept G's fusion
 /// mode, Concept F's question pinning, and Concept B's mass constants.
@@ -50,6 +50,31 @@ pub struct ScanPolicy {
     pub gallery_keep: Keep,
     /// [`Self::gallery_keep`] for the calibration competition's questions.
     pub calibration_gallery_keep: Keep,
+    /// How a probe token's agreements become votes in the group's own
+    /// competitions: one `z × margin` vote, or its best `k` cases' votes
+    /// raised to a power. The calibration competition keeps one vote a token
+    /// at [`Self::law`]'s power — its token matches one file's question
+    /// cleanly, and spreading the vote dilutes it
+    /// (`docs/results/provenance_scoring_lab_2026-11-16.md`).
+    pub law: VoteLaw,
+    /// How a file-scored group's pooled scores meet the band.
+    pub normalize: ScanNorm,
+    /// Leave the target's own lineage — the priming chain's documents, which
+    /// every conversation opens on already — out of the group's candidates.
+    /// They still compete in the scan; they are not offered.
+    pub exclude_lineage: bool,
+}
+
+/// How a file-scored group's pooled scores meet the band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanNorm {
+    /// Each file against its own learned background
+    /// (`docs/provenance_score_normalization.md`).
+    #[default]
+    Background,
+    /// Each file as a z-score among the scoring files of its own kind (its
+    /// extension) on the same probe (`normalization::kind_z_band`).
+    KindZ,
 }
 
 /// What a turn group's scan scores as one case
@@ -81,6 +106,20 @@ impl Default for ScanPolicy {
             calibration_weight: 1.0,
             gallery_keep: Keep::All,
             calibration_gallery_keep: Keep::All,
+            law: VoteLaw::SINGLE,
+            normalize: ScanNorm::Background,
+            exclude_lineage: false,
+        }
+    }
+}
+
+impl ScanPolicy {
+    /// The calibration competition's law: one vote a token, at the group's
+    /// power.
+    pub fn calibration_law(&self) -> VoteLaw {
+        VoteLaw {
+            top_k: 1,
+            power: self.law.power,
         }
     }
 }

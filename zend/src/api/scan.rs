@@ -298,6 +298,7 @@ mod tests {
                 per_probe: vec![1, 2],
                 n_groups: 2,
                 n_segments: 1,
+                k: 1,
             },
         };
         assert_eq!(

@@ -31,6 +31,7 @@ use rayon::prelude::*;
 
 use super::fusion::FusionMode;
 use super::popcount::group_agreement;
+use super::vote_law::{law_votes, VoteLaw};
 use super::WideQSig;
 
 /// Layer groups in a folded signature — **structural, not tuned**.
@@ -104,6 +105,30 @@ pub fn score_provenance_late_fusion_weighted(
     n_cases: usize,
     group_weights: &[f32],
 ) -> Vec<f32> {
+    score_provenance_late_fusion_law(
+        query,
+        gallery,
+        gallery_case,
+        n_cases,
+        group_weights,
+        VoteLaw::SINGLE,
+    )
+}
+
+/// [`score_provenance_late_fusion_weighted`] under a [`VoteLaw`]: each query
+/// token votes, per group, for its best `law.top_k` cases ([`law_votes`]),
+/// and the kept votes are raised to `law.power` before they are summed. The
+/// host twin of the paged scan's per-segment law, so a host without the
+/// arena scores as the card does. [`VoteLaw::SINGLE`] is the shipped scorer,
+/// bit for bit.
+pub fn score_provenance_late_fusion_law(
+    query: &[WideQSig],
+    gallery: &[&WideQSig],
+    gallery_case: &[u32],
+    n_cases: usize,
+    group_weights: &[f32],
+    law: VoteLaw,
+) -> Vec<f32> {
     let shape: Option<&WideQSig> = query.first().or_else(|| gallery.first().copied());
     let Some(shape) = shape else {
         return vec![0.0; n_cases];
@@ -146,6 +171,17 @@ pub fn score_provenance_late_fusion_weighted(
                     sum += ag as u64;
                     sumsq += (ag as u64) * (ag as u64);
                 }
+                let w = group_weights.get(g).copied().unwrap_or(1.0);
+                if law.top_k > 1 {
+                    let mean = sum as f32 / n_gal;
+                    let var = (sumsq as f32 / n_gal - mean * mean).max(1e-6);
+                    out.extend(
+                        law_votes(&case_max, mean, var.sqrt(), law.top_k)
+                            .into_iter()
+                            .map(|(c, v)| (c, v * w)),
+                    );
+                    continue;
+                }
                 // Leader and runner-up case agreements → margin.
                 let (mut top1, mut top1c, mut top2) = (0u32, usize::MAX, 0u32);
                 for (c, &m) in case_max.iter().enumerate() {
@@ -162,7 +198,6 @@ pub fn score_provenance_late_fusion_weighted(
                     let var = (sumsq as f32 / n_gal - mean * mean).max(1e-6);
                     let z = ((top1 as f32 - mean) / var.sqrt()).max(0.0);
                     let margin = top1.saturating_sub(top2) as f32;
-                    let w = group_weights.get(g).copied().unwrap_or(1.0);
                     out.push((top1c, z * margin * w));
                 }
             }
@@ -170,7 +205,7 @@ pub fn score_provenance_late_fusion_weighted(
         })
         .collect();
 
-    needle_gate_tally(&per_query, n_cases)
+    needle_gate_tally_raised(&per_query, n_cases, law)
 }
 
 /// Per-fold-group scoring for non-additive fusion (Concept G): one pass over
@@ -325,6 +360,16 @@ pub fn score_provenance_late_fusion_fused(
 /// summed into the per-case result — the sparse discriminative *needle*, dropping
 /// the diffuse *haystack*, position-independently (§82).
 pub(super) fn needle_gate_tally(per_query: &[Vec<(usize, f32)>], n_cases: usize) -> Vec<f32> {
+    needle_gate_tally_raised(per_query, n_cases, VoteLaw::SINGLE)
+}
+
+/// [`needle_gate_tally`] with each kept vote raised by `law` before it is
+/// summed; the gate reads the votes as cast.
+fn needle_gate_tally_raised(
+    per_query: &[Vec<(usize, f32)>],
+    n_cases: usize,
+    law: VoteLaw,
+) -> Vec<f32> {
     if per_query.is_empty() {
         return vec![0.0; n_cases];
     }
@@ -341,7 +386,7 @@ pub(super) fn needle_gate_tally(per_query: &[Vec<(usize, f32)>], n_cases: usize)
     for (contribs, &mag) in per_query.iter().zip(&mags) {
         if mag >= thresh {
             for &(case, v) in contribs {
-                votes[case] += v;
+                votes[case] += law.raise(v);
             }
         }
     }
