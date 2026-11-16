@@ -14,11 +14,18 @@
 //! next generation and retires the older ones.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use candle_conversation::projection::{DecodePriority, SelectionState};
-use candle_conversation::stencil::TurnGrammar;
-use candle_conversation::{AskScope, Carried, Linking, Sequence, TurnOptions, Want};
+use candle_conversation::stencil::{StencilTree, TurnGrammar};
+use candle_conversation::{AskScope, Carried, Linking, Sequence, TurnOptions, UnsealedAsker, Want};
+use journal_core::section::JournalPrompt;
+use journal_core::span::Span;
+use journal_core::transcript::Filed;
+use journal_core::verify::World;
+use journal_core::workflow::{self, Desk, Outcome, Skip, Timing};
+use serde_json::Value;
 
 use super::{
     act_specs, frame_fingerprint, journal_sweep, journal_wants, Minds, CONTEXT_WINDOW_TURNS,
@@ -26,9 +33,11 @@ use super::{
 };
 use crate::engine::act::{self, Act};
 use crate::engine::identity::{self, Deliberation};
+use crate::engine::journal::desk::{tool_specs, WRITE_TOKENS};
 use crate::engine::prompt::{Persona, Stance, STANCE_SELECTOR};
 use crate::engine::reflect::plain_prose;
 use crate::engine::talk::catchup::{self, CatchUp};
+use crate::engine::talk::journal::{TalkJournal, TALK};
 use crate::engine::talk::key::{self, Party};
 use crate::engine::talk::templates::Destination;
 use crate::engine::talk::{decide, hand_off};
@@ -59,6 +68,74 @@ const DECISION_SHOWN: usize = 600;
 /// How long a park waits for the turn's state to be durable before it lets
 /// the slot go regardless.
 const DURABLE_WAIT: Duration = Duration::from_secs(30);
+
+/// What a conversation's claims are checked against: nothing. What somebody
+/// said is not a thing the world reads back.
+struct NoFacts;
+
+impl World for NoFacts {
+    fn read(&self, _: &str, _: &str) -> Option<String> {
+        None
+    }
+}
+
+/// The desk a conversation's journal is drafted at: the conversation itself,
+/// asked on an ephemeral fork under [`AskScope::Conversation`] — its own
+/// turns and what it carries, nothing gathered from beside it.
+struct TalkDesk<'a> {
+    minds: &'a Minds,
+    asker: UnsealedAsker,
+    tree: Option<Arc<StencilTree>>,
+    /// The journal's record once something was kept: the caller writes it to
+    /// the conversation's metadata.
+    record: Option<String>,
+}
+
+impl Desk for TalkDesk<'_> {
+    async fn write(&mut self, specs: &[Value], question: &str) -> anyhow::Result<String> {
+        let tree = match &self.tree {
+            Some(tree) => Arc::clone(tree),
+            None => {
+                let tree = self.minds.answer_tree(&tool_specs(specs)?)?;
+                self.tree = Some(Arc::clone(&tree));
+                tree
+            }
+        };
+        let options = TurnOptions {
+            assistant_prefill: self.minds.opening(Deliberation::None, true),
+            turn_grammar: Some(TurnGrammar::of(tree)),
+            sampling: Some(self.minds.sampling_for(Deliberation::None)),
+            max_tokens: Some(WRITE_TOKENS),
+            selection: self.asker.selection(),
+            ..Default::default()
+        };
+        // Below every turn a person waits on, above the layers that only
+        // maintain themselves — where every journal draft runs.
+        let response = self
+            .asker
+            .ask(
+                question,
+                DecodePriority::Normal,
+                AskScope::Conversation,
+                options,
+            )
+            .await?;
+        Ok(response.text)
+    }
+
+    /// A conversation keeps no text behind its entries: its turns are its
+    /// own timeline's, and the record is written by whoever asked for the
+    /// draft, with the conversation's other state.
+    async fn keep(
+        &mut self,
+        prompt: &JournalPrompt,
+        _filed: Option<&Filed>,
+        _ceased: &[u64],
+    ) -> anyhow::Result<()> {
+        self.record = Some(prompt.record().to_string());
+        Ok(())
+    }
+}
 
 /// One conversation, open for a turn.
 pub struct Talk {
@@ -435,6 +512,33 @@ impl Minds {
             catchup_sealed.iter().map(String::as_str),
         );
         selection
+    }
+
+    /// Draft one entry of the conversation's own journal over `span`, which
+    /// the caller took with `Journal::begin` — the workflow a character's
+    /// journal and a zend dialogue's are written by, asked of this
+    /// conversation on a fork of itself that writes nothing back
+    /// (`engine::talk::journal`). Skipped when the stretch adds nothing to
+    /// what the journal holds.
+    ///
+    /// Whichever way it ends, `state` has been told how. The record to keep
+    /// is the caller's to write: `Some` when an entry was kept or a stretch
+    /// settled.
+    pub async fn talk_journal(
+        &self,
+        talk: &Talk,
+        state: &Mutex<TalkJournal>,
+        span: &Span,
+    ) -> (Outcome, Timing, Option<String>) {
+        let mut desk = TalkDesk {
+            minds: self,
+            asker: talk.sequence.unsealed_asker(),
+            tree: None,
+            record: None,
+        };
+        let (outcome, timing) =
+            workflow::run(&mut desk, state, span, &NoFacts, &TALK, Skip::Allowed).await;
+        (outcome, timing, desk.record)
     }
 
     /// Let the conversation go: once the turn's state is durable, so a resume

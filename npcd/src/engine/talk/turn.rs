@@ -6,10 +6,13 @@
 //! world goes through the ordinary act path as [`ActSource::Talk`], so the
 //! authority writes it — and stamps none of the character's own cooldowns.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use candle_conversation::projection::DecodePriority;
+use journal_core::journal::Holds;
+use journal_core::workflow::Outcome;
 use journals::actor::Actor;
 use journals::experience::ExperienceKind;
 use journals::path::JournalPath;
@@ -21,7 +24,7 @@ use crate::authority::ops::{ActSource, OpReply, Voiced, WorldOp};
 use crate::engine::act::Act;
 use crate::engine::event::{EventKind, Salience, TalkLine};
 use crate::engine::experience::line;
-use crate::engine::mind::TalkTurn;
+use crate::engine::mind::{Minds, Talk, TalkTurn};
 use crate::engine::runtime::Runtime;
 use crate::engine::talk::authority;
 use crate::engine::talk::catchup::{self, CatchUp};
@@ -29,6 +32,7 @@ use crate::engine::talk::clock::{self, Ended, Input};
 use crate::engine::talk::critical;
 use crate::engine::talk::guard::{self, Words};
 use crate::engine::talk::hand_off;
+use crate::engine::talk::journal::{self, TalkJournal};
 use crate::engine::talk::key::Party;
 use crate::engine::talk::runner::{Inputs, Key};
 use crate::engine::talk::state::TalkState;
@@ -506,6 +510,29 @@ impl Runtime {
         state.last_turn = Stamp::now();
         state.seen = caught.seen;
         minds.set_talk_meta(&talk, &state.to_meta())?;
+        // **The conversation writes its own journal, and a kept entry is news
+        // to the mind** (§5.5): what was asked and answered, what the
+        // character means to do about it and what it left open, drafted once
+        // the words have gone — so the party never waits on it — and told so
+        // that it wakes the mind. Zen told a person "I am going to connect to
+        // the terminal now", and nothing ever reached the mind that could.
+        if matches!(ended, Ended::Spoke) {
+            if let Some(entry) = self
+                .journal_turn(
+                    &minds,
+                    &talk,
+                    npc,
+                    &lines,
+                    &seen.me,
+                    &spoken.words,
+                    world_ms,
+                )
+                .await
+            {
+                elsewhere.push(entry);
+                settled = true;
+            }
+        }
         if settled {
             // **A promise or a mission change is told so it wakes the mind**
             // (§5.4, D10): it is how a conversation changes what the character
@@ -536,6 +563,58 @@ impl Runtime {
         }
         minds.park_talk(talk).await;
         Ok(ended)
+    }
+
+    /// Draft the conversation's journal over the turn just taken — what
+    /// `lines` said and what `reply` answered — and keep its record with the
+    /// conversation. The entry as it reads in full when one was kept; `None`
+    /// when nobody spoke, the stretch added nothing, or the draft did not
+    /// finish, which costs an entry and nothing else.
+    #[allow(clippy::too_many_arguments)]
+    async fn journal_turn(
+        &self,
+        minds: &Minds,
+        talk: &Talk,
+        npc: u64,
+        lines: &[&TalkLine],
+        me: &str,
+        reply: &str,
+        world_ms: u64,
+    ) -> Option<String> {
+        let turns = journal::stretch(lines, me, reply, world_ms);
+        let newest = turns.last()?.id;
+        let mut held = TalkJournal::restore(&minds.talk_meta(talk));
+        let span = held.journal_mut().begin(turns, newest)?;
+        let state = Mutex::new(held);
+        let (outcome, _, record) = minds.talk_journal(talk, &state, &span).await;
+        if let Some(record) = record {
+            let kept = BTreeMap::from([(journal::META_JOURNAL.to_string(), record)]);
+            if let Err(e) = minds.set_talk_meta(talk, &kept) {
+                tracing::warn!(npc, "a conversation's journal was not recorded: {e:#}");
+            }
+        }
+        match outcome {
+            Outcome::Wrote { entry, .. } => {
+                tracing::info!(
+                    npc,
+                    entry = entry.id,
+                    "a conversation's journal entry was kept — {}",
+                    entry.summary
+                );
+                Some(entry.detail(&journal::TALK))
+            }
+            Outcome::Nothing { why } => {
+                tracing::info!(npc, "nothing worth a conversation's journal entry — {why}");
+                None
+            }
+            Outcome::Abandoned(why) => {
+                tracing::warn!(
+                    npc,
+                    "a conversation's journal entry was not written — {why:?}"
+                );
+                None
+            }
+        }
     }
 
     /// The catch-up for a turn at `now`: the character's journal, the world's,

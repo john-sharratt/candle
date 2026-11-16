@@ -429,6 +429,37 @@ promise, or a mission change — tells it as `Concluded` instead, which does**
 mind does it. Told quietly, it waited for whatever woke the mind next, and for
 a character standing in a quiet room that was nothing.
 
+### 5.5 A conversation's own journal
+
+A conversation with a person keeps a journal of its own, as a zend dialogue
+does (`docs/zend_journal.md`), written by the same workflow
+(`journal_core::workflow::run`) — `npcd/src/engine/talk/journal.rs`,
+`Minds::talk_journal`.
+
+- **When.** After a turn a person spoke on, once the reply has gone: the party
+  never waits on it. A turn the character began itself is not journaled — it
+  is the mind's own doing, and the mind already knows it.
+- **The stretch.** Each line the person said, citable as *heard*, then what
+  the character replied, citable as its own act (`journal::stretch`). The
+  numbers a claim cites are the thread's seqs, so they mean the same thing
+  after a restart.
+- **The draft.** Asked of the conversation on an ephemeral fork of itself
+  under `AskScope::Conversation`, at `Normal` priority, writing nothing back.
+  One answer writes an entry — a one-sentence summary, claims that cite, what
+  the character means to do next, what it left open — or, once the journal
+  holds an entry to weigh the stretch against, skips it.
+- **No facts.** What somebody said is nothing the world can read back, so the
+  conversation's style offers no fact slot (`journal::TALK`), as zend's does
+  not.
+- **Where it is kept.** The record is in the conversation's own metadata
+  (`talk.journal`), beside the rest of its state: it follows the conversation
+  and is nobody else's.
+- **A kept entry is told to the mind, and wakes it.** It goes as `Concluded`,
+  with the entry in full. That is how what was said on the phone becomes
+  something the character does: "John asked whether the cluster is up; I said
+  I would look" reaches the mind with what it now means to do and what is
+  open. A skipped stretch tells nothing more than §5.4's quiet `Elsewhere`.
+
 ---
 
 ## 6. A turn

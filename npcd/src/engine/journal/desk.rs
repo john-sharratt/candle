@@ -66,7 +66,7 @@ impl<'a> EngineDesk<'a> {
 }
 
 /// The core's `{name, params}` forms, as the engine reads them.
-fn tool_specs(specs: &[Value]) -> anyhow::Result<Vec<ToolSpec>> {
+pub(crate) fn tool_specs(specs: &[Value]) -> anyhow::Result<Vec<ToolSpec>> {
     specs
         .iter()
         .map(|spec| Ok(serde_json::from_value(spec.clone())?))

@@ -27,6 +27,7 @@ pub mod critical;
 pub mod decide;
 pub mod guard;
 pub mod hand_off;
+pub mod journal;
 pub mod key;
 pub mod orders;
 pub mod runner;
