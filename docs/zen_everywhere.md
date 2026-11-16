@@ -112,10 +112,17 @@ television on is connect, act, disconnect.
 
 **The terminals are stated, never looked for.** The view of the whole names
 each terminal that can be reached (`sim::terminals::reachable`, noted every
-five minutes and whenever they are listed), and `scan` naming nothing answers
-a mind with no body with that view rather than a room's stations — given the
-ward's stations, Zen reported the cluster missing without once asking for its
-terminals.
+five minutes and whenever they are listed). The acts a body finds its way
+about the world with — `scan`, `focus` (`tools::WAYFINDING`) — are never
+offered to a mind with no body: it is shown every room as it changes, and
+offered `scan` it scanned its own rooms when asked what was on the house
+network.
+
+**The house's devices become terminals without being asked for.** The house
+network is surveyed for every world that holds a mind with no body
+(`Runtime::tend_presence`), as it is for one that watches a handset, so a
+light, a speaker or a television is among the mind's terminals once the
+network shows it, rather than once the mind thinks to survey.
 
 **Telling is not answering, and characters message.** A conversation's turn
 that its character began — it has something to tell, and the party has said

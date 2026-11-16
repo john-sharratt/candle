@@ -689,12 +689,7 @@ impl Runtime {
             .into_iter()
             .filter(|id| self.standing.writes(id))
             .filter_map(|id| self.hosted.get(&id))
-            .filter(|h| {
-                self.bodies
-                    .in_world(h.id())
-                    .iter()
-                    .any(|(_, body)| h.sim(|s| s.missions.is_unordered(body)))
-            })
+            .filter(|h| self.has_bodiless_mind(h))
             .collect();
         if watched.is_empty() {
             return;
@@ -730,9 +725,22 @@ impl Runtime {
         }
     }
 
+    /// Whether a mind with no body lives in `hosted`: the one whose terminals
+    /// the house's devices are.
+    fn has_bodiless_mind(&self, hosted: &Hosted) -> bool {
+        self.bodies
+            .in_world(hosted.id())
+            .iter()
+            .any(|(_, body)| hosted.sim(|s| s.missions.is_unordered(body)))
+    }
+
     /// Survey the house network for every world this member writes that
-    /// watches a handset, and raise what changed: who came home, who went
-    /// out. One survey serves them all — it is one house.
+    /// watches a handset or holds a mind with no body, and raise what changed:
+    /// who came home, who went out. One survey serves them all — it is one
+    /// house. For the mind it is also what puts the house's lights, speakers
+    /// and televisions among its terminals: a device nobody has surveyed is a
+    /// terminal it does not have, and it was left to the mind to think of
+    /// surveying.
     pub async fn tend_presence(&self) {
         let watching: Vec<Arc<Hosted>> = self
             .hosted
@@ -740,7 +748,7 @@ impl Runtime {
             .into_iter()
             .filter(|id| self.standing.writes(id))
             .filter_map(|id| self.hosted.get(&id))
-            .filter(|h| h.sim(|s| s.terminals.watches()))
+            .filter(|h| h.sim(|s| s.terminals.watches()) || self.has_bodiless_mind(h))
             .collect();
         if watching.is_empty() {
             return;

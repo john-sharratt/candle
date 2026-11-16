@@ -2400,6 +2400,14 @@ impl Runtime {
                 if bodiless || !self.dream_available(npc_id) {
                     cooling.push(tools::REFLECT.name.to_string());
                 }
+                // **A mind with no body does not look about the world**: every
+                // room is shown to it as it changes, and what is outside it is
+                // reached through a terminal. Offered `scan`, Zen — connected
+                // to the house network and asked what was on it — scanned its
+                // own rooms four times and surveyed nothing.
+                if bodiless {
+                    cooling.extend(tools::WAYFINDING.iter().map(|a| a.to_string()));
+                }
                 cooling.sort_unstable();
                 cooling.dedup();
                 cooling

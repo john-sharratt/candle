@@ -1218,6 +1218,12 @@ pub fn narrates(tool: &str) -> bool {
     )
 }
 
+/// The acts by which a body finds its way about the world it stands in:
+/// looking into another room, turning its attention to one. A mind with no
+/// body is never offered them — it sees every room already, and has nowhere
+/// to turn.
+pub const WAYFINDING: &[&str] = &["scan", "focus"];
+
 /// The system-prompt collection every tool is installed into — see [`install`].
 pub const COLLECTION: &str = "tools";
 
@@ -3390,6 +3396,15 @@ mod tests {
                     p.name
                 );
             }
+        }
+    }
+
+    /// Every wayfinding act is a real act: a name that matched none would
+    /// withhold nothing from a mind with no body, and say nothing about it.
+    #[test]
+    fn every_wayfinding_act_is_in_the_catalog() {
+        for name in WAYFINDING {
+            assert!(by_name(name).is_some(), "`{name}` is no act");
         }
     }
 
