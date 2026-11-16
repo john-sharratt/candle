@@ -12,7 +12,7 @@
 
 use std::cell::OnceCell;
 use std::mem::take;
-use std::ops::Range;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,25 +30,21 @@ use crate::provenance::{
     score_slots_grouped, score_slots_law, FusionMode, SigWindow, VoteLaw, WideQSig,
 };
 use crate::substrate::calibration_record::CalRecord;
-use crate::substrate::Substrate;
+use crate::substrate::{FileGallery, Substrate};
 use crate::summary_tree::exchange::{exchanges, over_normals};
 
-/// One file's candidates: its turns grouped into exchanges, and the gallery
-/// windows that score them.
+/// One file's candidates: its gallery — its turns grouped into exchanges and the
+/// windows that score them, shared with the substrate that holds it
+/// ([`Substrate::file_gallery`]) — read through `Deref`, and this scan's own
+/// cut of the windows and its calibration.
 #[derive(Clone)]
 pub(crate) struct FileScan {
     pub timeline: TimelineId,
-    /// Every non-summary turn, in order — the subsequence couplings project onto.
-    pub arc_turn: Vec<TurnIndex>,
-    /// Each exchange's span of `arc_turn`.
-    pub ex_ranges: Vec<Range<usize>>,
-    pub n_slots: usize,
-    /// The stored signature windows referenced by `windows`, not decoded.
-    pub arcs_kept: Vec<SigWindow>,
-    /// Stream id of each kept arc's turn — the arena residency key.
-    pub arc_sids: Vec<StreamId>,
+    /// The file's gallery as its turns build it.
+    pub gallery: Arc<FileGallery>,
     /// `(arc index into arcs_kept, window start, window end, exchange slot)`:
-    /// the file's own windows.
+    /// the file's own windows, as the group's chunk exclusion leaves them
+    /// ([`cut_excluded`]).
     pub windows: Vec<(usize, usize, usize, usize)>,
     /// `(arc index into arcs_kept, window start, window end)`: each question
     /// its calibrations hold ([`Substrate::CALIBRATES_KEY`]), a window apiece.
@@ -59,6 +55,14 @@ pub(crate) struct FileScan {
     /// past [`Self::arcs_kept`], so [`Self::cal_windows`] indexes one arc list
     /// with [`Self::windows`] ([`Self::arc`], [`Self::sid`]).
     pub cal: Option<Arc<CalRecord>>,
+}
+
+impl Deref for FileScan {
+    type Target = FileGallery;
+
+    fn deref(&self) -> &FileGallery {
+        &self.gallery
+    }
 }
 
 impl FileScan {
@@ -112,12 +116,19 @@ impl FileScan {
 }
 
 /// Assemble every file in `timelines` from `sub`. Returns the files that hold
-/// at least one window, and how many turns were walked to find them.
+/// at least one window, and how many turns were walked to build the galleries
+/// no earlier scan had left on their timelines.
+///
+/// A file's gallery is read from its timeline entry when one is held there for
+/// this version ([`Substrate::file_gallery`]) and built — and left there for
+/// every later scan — when not. Only the calibration, which has its own memo,
+/// and the copy of the windows a group's exclusion cuts are this scan's own.
 pub(crate) fn assemble_file_scans(
     sub: &Substrate,
     timelines: Vec<TimelineId>,
 ) -> (Vec<FileScan>, usize) {
     let mut turns_walked = 0usize;
+    let mut built_galleries = 0u64;
     let mut files: Vec<FileScan> = Vec::new();
     // Where the assembly's time goes, summed over its files into the scan's
     // split: a scan that grew is named by the phase that grew.
@@ -128,13 +139,72 @@ pub(crate) fn assemble_file_scans(
     let records = sub.calibration_snapshot();
     let mut fresh = Vec::new();
     for timeline in timelines {
+        let Some(gallery) = sub.file_gallery(timeline, |s| {
+            built_galleries += 1;
+            build_file_gallery(s, timeline, &mut turns_walked, &mut walk, &mut exchange)
+        }) else {
+            continue;
+        };
+        if gallery.windows.is_empty() {
+            continue;
+        }
+        let t_cal = Instant::now();
+        // Each calibration's questions, a window apiece, for the calibration
+        // competition.
+        let cal = sub.calibration_record(timeline, &records, &mut fresh);
+        let own = gallery.arcs_kept.len();
+        let cal_windows: Vec<(usize, usize, usize)> = cal.as_ref().map_or(Vec::new(), |r| {
+            r.sigs
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (own + i, 0, w.len()))
+                .collect()
+        });
+        cal_kept += cal_windows.len() as u64;
+        cal_time += t_cal.elapsed();
+        files.push(FileScan {
+            timeline,
+            windows: gallery.windows.clone(),
+            gallery,
+            cal_windows,
+            cal,
+        });
+    }
+    let kept = files.len() as u64;
+    let built = fresh.len() as u64;
+    sub.publish_calibration_records(fresh);
+    add_to_split(|s| {
+        s.files += kept;
+        s.galleries_built += built_galleries;
+        s.walk_us += walk.as_micros() as u64;
+        s.exchange_us += exchange.as_micros() as u64;
+        s.cal_built += built;
+        s.cal_windows += cal_kept;
+        s.cal_us += cal_time.as_micros() as u64;
+    });
+    (files, turns_walked)
+}
+
+/// `timeline`'s gallery as `sub` holds it: every non-summary turn, grouped
+/// into exchanges, and the windows of the ones with a stored signature. Adds
+/// the turns it walked to `turns_walked` and its time to `walk` and
+/// `exchange`. A file with no window builds an empty gallery, which the
+/// assembly skips.
+fn build_file_gallery(
+    sub: &Substrate,
+    timeline: TimelineId,
+    turns_walked: &mut usize,
+    walk: &mut Duration,
+    exchange: &mut Duration,
+) -> FileGallery {
+    {
         let t_walk = Instant::now();
         // Enumerate the group's turns exactly as selection does — the whole
         // resolved timeline, `0..turn_count`, fetched by stream id — instead
         // of scanning `all_streams()` per group (which is O(all timelines'
         // streams) on the reproject hot path).
         let count = sub.turn_count(timeline);
-        turns_walked += count as usize;
+        *turns_walked += count as usize;
         // Per candidate turn: its full sig plus the self-referencing sub-window
         // seams recorded on it. A turn with no seams scores as one whole-turn
         // window; a turn with N seams scores as N+1 focused windows that all
@@ -183,9 +253,9 @@ pub(crate) fn assemble_file_scans(
                 }
             }
         }
-        walk += t_walk.elapsed();
+        *walk += t_walk.elapsed();
         if arc_turn.is_empty() {
-            continue;
+            return FileGallery::default();
         }
         let t_exchange = Instant::now();
         // Group the kept turns into EXCHANGES before scoring. A code-read scope
@@ -235,49 +305,16 @@ pub(crate) fn assemble_file_scans(
                 }
             }
         }
-        if windows.is_empty() {
-            exchange += t_exchange.elapsed();
-            continue;
-        }
-        exchange += t_exchange.elapsed();
-        let t_cal = Instant::now();
-        // Each calibration's questions, a window apiece, for the calibration
-        // competition.
-        let cal = sub.calibration_record(timeline, &records, &mut fresh);
-        let own = arcs_kept.len();
-        let cal_windows: Vec<(usize, usize, usize)> = cal.as_ref().map_or(Vec::new(), |r| {
-            r.sigs
-                .iter()
-                .enumerate()
-                .map(|(i, w)| (own + i, 0, w.len()))
-                .collect()
-        });
-        cal_kept += cal_windows.len() as u64;
-        cal_time += t_cal.elapsed();
-        files.push(FileScan {
-            timeline,
+        *exchange += t_exchange.elapsed();
+        FileGallery {
             arc_turn,
             ex_ranges,
             n_slots,
             arcs_kept,
             arc_sids,
             windows,
-            cal_windows,
-            cal,
-        });
+        }
     }
-    let kept = files.len() as u64;
-    let built = fresh.len() as u64;
-    sub.publish_calibration_records(fresh);
-    add_to_split(|s| {
-        s.files += kept;
-        s.walk_us += walk.as_micros() as u64;
-        s.exchange_us += exchange.as_micros() as u64;
-        s.cal_built += built;
-        s.cal_windows += cal_kept;
-        s.cal_us += cal_time.as_micros() as u64;
-    });
-    (files, turns_walked)
 }
 
 /// `files` with every range `exclusion` names cut from their windows, own and
@@ -754,17 +791,22 @@ mod tests {
             })
             .collect();
         let tl = TimelineId::for_test(timeline);
+        let windows: Vec<(usize, usize, usize, usize)> =
+            (0..exchanges).map(|e| (e, 0, tokens, e)).collect();
         FileScan {
             timeline: tl,
-            arc_turn: (0..exchanges as u32).map(TurnIndex).collect(),
-            ex_ranges: (0..exchanges).map(|e| e..e + 1).collect(),
-            n_slots: exchanges,
-            arc_sids: (0..exchanges as u32)
-                .map(|i| turn_stream_id(tl.raw(), i))
-                .collect(),
-            windows: (0..exchanges).map(|e| (e, 0, tokens, e)).collect(),
+            gallery: Arc::new(FileGallery {
+                arc_turn: (0..exchanges as u32).map(TurnIndex).collect(),
+                ex_ranges: (0..exchanges).map(|e| e..e + 1).collect(),
+                n_slots: exchanges,
+                arc_sids: (0..exchanges as u32)
+                    .map(|i| turn_stream_id(tl.raw(), i))
+                    .collect(),
+                windows: windows.clone(),
+                arcs_kept: arcs,
+            }),
+            windows,
             cal_windows: Vec::new(),
-            arcs_kept: arcs,
             cal: None,
         }
     }
@@ -815,10 +857,15 @@ layers:
     ) -> FileScan {
         let mut f = file(timeline, seed, exchanges, tokens);
         for (i, q) in questions.iter().enumerate() {
-            f.arcs_kept
+            let gallery = Arc::make_mut(&mut f.gallery);
+            gallery
+                .arcs_kept
                 .push(SigWindow::new(Arc::from(encode_wide_sigs(q))).expect("a stored window"));
-            f.arc_sids.push(turn_stream_id(9_000 + timeline, i as u32));
-            f.cal_windows.push((f.arcs_kept.len() - 1, 0, q.len()));
+            gallery
+                .arc_sids
+                .push(turn_stream_id(9_000 + timeline, i as u32));
+            let k = gallery.arcs_kept.len() - 1;
+            f.cal_windows.push((k, 0, q.len()));
         }
         f
     }

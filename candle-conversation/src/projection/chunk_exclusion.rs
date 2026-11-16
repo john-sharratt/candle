@@ -402,6 +402,7 @@ mod tests {
     use super::*;
     use crate::projection::ids::TurnIndex;
     use crate::provenance::encode_wide_sigs;
+    use crate::substrate::FileGallery;
 
     /// A signature whose 24 words are all `fill`.
     fn sig(fill: u64) -> WideQSig {
@@ -414,14 +415,18 @@ mod tests {
     /// A file of one turn of `tokens`.
     fn file(raw: u64, tokens: &[WideQSig]) -> FileScan {
         let window = SigWindow::new(Arc::from(encode_wide_sigs(tokens))).expect("a stored window");
+        let windows = vec![(0, 0, tokens.len(), 0)];
         FileScan {
             timeline: TimelineId::for_test(raw),
-            arc_turn: vec![TurnIndex(0)],
-            ex_ranges: vec![0..1],
-            n_slots: 1,
-            arcs_kept: vec![window],
-            arc_sids: vec![turn_stream_id(raw, 0)],
-            windows: vec![(0, 0, tokens.len(), 0)],
+            gallery: Arc::new(FileGallery {
+                arc_turn: vec![TurnIndex(0)],
+                ex_ranges: vec![0..1],
+                n_slots: 1,
+                arcs_kept: vec![window],
+                arc_sids: vec![turn_stream_id(raw, 0)],
+                windows: windows.clone(),
+            }),
+            windows,
             cal_windows: Vec::new(),
             cal: None,
         }

@@ -14,7 +14,8 @@
 //! the hot path, so the member reloads (§6.6): [`Substrate::take_reload_due`]
 //! says when.
 
-use super::pcoll::{arc_mut, ord_arc_mut};
+use super::file_gallery::entry_mut;
+use super::pcoll::ord_arc_mut;
 use super::{
     turn_stream_id, ResidenceIndex, StoredSequence, Substrate, TimelineId, TokenBuffer, TurnIndex,
     TurnLayout,
@@ -47,7 +48,7 @@ impl Substrate {
             0,
             0,
         );
-        arc_mut(&mut self.timelines, &timeline)
+        entry_mut(&mut self.timelines, &timeline)
             .expect("restore_turn registered the timeline")
             .gaps
             .insert(index);
@@ -209,7 +210,7 @@ impl Substrate {
     /// residence become the turn's.
     fn fill_gap(&mut self, timeline: TimelineId, index: TurnIndex, turn: RestoredTurn) {
         let tl =
-            arc_mut(&mut self.timelines, &timeline).expect("a gap is in a registered timeline");
+            entry_mut(&mut self.timelines, &timeline).expect("a gap is in a registered timeline");
         tl.gaps.remove(&index);
         let entry = ord_arc_mut(&mut tl.turns, &index).expect("a gap holds a placeholder entry");
         entry.block_range = (turn.block_start, turn.block_end);

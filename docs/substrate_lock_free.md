@@ -318,6 +318,25 @@ marked never-coming in write order, so it holds back no peer (§9.3).
 The decoded events digest is a `OnceLock` on the stream's runtime entry, reset
 when the events blob is written or pruned; nothing locks around the decode.
 
+A timeline's **file gallery** — its turns grouped into exchanges and the
+signature windows that score them, what a belief scan reads for every file of a
+group — is an `ArcSwapOption` on its `TimelineEntry` (`substrate/file_gallery.rs`).
+The rule for a memo held in the version:
+
+- **Readers fill it, edits never do.** The first reader that finds it empty
+  builds it from the version it holds and stores it; an edit only clears it, so
+  no gallery work runs inside the compare-and-swap loop.
+- **Every edit of what it is built from clears it, on the edit's own copy.** All
+  edits of a timeline entry go through `entry_mut`, which clears the copy the
+  edit makes; a turn's declaration, signature or events, written on its stream,
+  clear the owning timeline's entry the same way. An older version still holding
+  the shared entry keeps its own memo and is never emptied under a reader.
+- **A change that names no timeline moves a memo epoch** every memo records — a
+  stream a log rewrite dropped, a reset — so each is rebuilt when next read.
+
+Measured on BlackWorld (2026-11-17): rebuilding every file's gallery was ~110 ms
+of each reprojection's ~220 ms belief scan over 7,449 files.
+
 ## 7. Caches beside the version
 
 The `Conversation` handle's side state is lock-free:

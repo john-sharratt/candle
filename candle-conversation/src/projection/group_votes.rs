@@ -118,6 +118,7 @@ mod tests {
     use crate::persistence::content_hash::turn_stream_id;
     use crate::projection::ids::TurnIndex;
     use crate::provenance::{encode_wide_sigs, SigWindow};
+    use crate::substrate::FileGallery;
 
     fn window(fill: u64) -> SigWindow {
         let sig = WideQSig {
@@ -139,14 +140,18 @@ mod tests {
             arc_sids.push(turn_stream_id(cal, 0));
             cal_windows.push((1, 0, 1));
         }
+        let windows = vec![(0, 0, 1, 0)];
         FileScan {
             timeline: tl,
-            arc_turn: vec![TurnIndex(0)],
-            ex_ranges: vec![0..1],
-            n_slots: 1,
-            arcs_kept,
-            arc_sids,
-            windows: vec![(0, 0, 1, 0)],
+            gallery: Arc::new(FileGallery {
+                arc_turn: vec![TurnIndex(0)],
+                ex_ranges: vec![0..1],
+                n_slots: 1,
+                arcs_kept,
+                arc_sids,
+                windows: windows.clone(),
+            }),
+            windows,
             cal_windows,
             cal: None,
         }

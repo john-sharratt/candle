@@ -1700,8 +1700,9 @@ impl Conversation {
             format!(
                 "probe_windows={} collections_us={coll_us} groups_us={} groups_scanned={} \
                  group_windows={} group_turns={} select_us={} assemble_us={} score_us={} \
-                 normalize_us={} files={} walk_us={} exchange_us={} cal_built={} \
-                 cal_windows={} cal_us={} segments_us={} arena_scans={} arena_launches={} \
+                 normalize_us={} files={} galleries_built={} walk_us={} exchange_us={} \
+                 cal_built={} cal_windows={} cal_us={} segments_us={} arena_scans={} \
+                 arena_launches={} \
                  arena_segments={} arena_fresh_tokens={} arena_index_us={} \
                  arena_fingerprint_us={} arena_windows={} arena_pinned={} arena_upload_us={} \
                  arena_kernel_us={} arena_readback_us={} arena_rows_us={} arena_tally_us={}",
@@ -1715,6 +1716,7 @@ impl Conversation {
                 groups.score_us,
                 groups.normalize_us,
                 groups.files,
+                groups.galleries_built,
                 groups.walk_us,
                 groups.exchange_us,
                 groups.cal_built,
@@ -7253,6 +7255,111 @@ layers:
         let after = record();
         assert!(!Arc::ptr_eq(&before, &after), "a rewrite drops the record");
         assert_ne!(before.sigs[0].fingerprint(), after.sigs[0].fingerprint());
+    }
+
+    /// **A file's gallery is built once and kept on its timeline until
+    /// something it reads changes, and only its own change rebuilds it.** Two
+    /// files of one signed turn: a second assembly builds neither; a signature
+    /// rewritten on one rebuilds that one, holding the new window; a turn
+    /// added to the other rebuilds that one, holding both turns.
+    #[test]
+    fn a_files_gallery_is_kept_until_what_it_reads_changes() {
+        use super::super::belief_files::assemble_file_scans;
+        use super::super::belief_scan_split::GROUP_SCAN_SPLIT;
+        use crate::provenance::{encode_wide_sigs, WideQSig};
+
+        const YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
+layers:
+  - name: files
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: scopes
+        selection: { kind: top_k, k: 2 }
+        policy: { cases: file }
+"#;
+        let sig = |fill: u64| WideQSig {
+            n_heads: 12,
+            words: vec![fill; 24],
+        };
+        let builder = Builder::from_yaml(YAML).unwrap();
+        let files_layer = builder.id_for_layer("files").unwrap();
+        let scopes = builder.id_for_group("scopes").unwrap();
+        let conv = Conversation::ephemeral();
+        let write = |tl: TimelineId, sigs: Vec<WideQSig>| {
+            let idx = conv
+                .record_turn(
+                    tl,
+                    Role::User,
+                    TurnPartWrite {
+                        token_count: sigs.len(),
+                        ..Default::default()
+                    },
+                    |seqs| Ok(seqs.to_vec()),
+                )
+                .expect("record_turn");
+            conv.persist_wide_q_sigs(turn_stream_id(tl.raw(), idx.0), &encode_wide_sigs(&sigs))
+                .expect("persist sigs");
+        };
+        let (x, y) = (
+            TimelineId::from_raw(61).unwrap(),
+            TimelineId::from_raw(62).unwrap(),
+        );
+        conv.register_timeline(x, files_layer, scopes);
+        conv.register_timeline(y, files_layer, scopes);
+        write(x, vec![sig(1), sig(2)]);
+        write(y, vec![sig(3), sig(4), sig(5)]);
+        // Each assembly: the files, and how many galleries it built.
+        let assemble = || {
+            GROUP_SCAN_SPLIT.take();
+            let files = assemble_file_scans(&conv.inner.read(), vec![x, y]).0;
+            (files, GROUP_SCAN_SPLIT.take().galleries_built)
+        };
+
+        let (first, built) = assemble();
+        assert_eq!(built, 2);
+        assert_eq!(first[0].windows, vec![(0, 0, 2, 0)]);
+        assert_eq!(first[1].windows, vec![(0, 0, 3, 0)]);
+        let (again, built) = assemble();
+        assert_eq!(built, 0, "nothing changed");
+        assert!(Arc::ptr_eq(&first[0].gallery, &again[0].gallery));
+        assert!(Arc::ptr_eq(&first[1].gallery, &again[1].gallery));
+
+        conv.persist_wide_q_sigs(
+            turn_stream_id(x.raw(), 0),
+            &encode_wide_sigs(&[sig(7), sig(8), sig(9), sig(10)]),
+        )
+        .expect("persist sigs");
+        let (resigned, built) = assemble();
+        assert_eq!(built, 1, "x alone");
+        assert_eq!(resigned[0].windows, vec![(0, 0, 4, 0)]);
+        assert_ne!(
+            resigned[0].arcs_kept[0].fingerprint(),
+            first[0].arcs_kept[0].fingerprint()
+        );
+        assert!(Arc::ptr_eq(&first[1].gallery, &resigned[1].gallery));
+
+        write(y, vec![sig(11)]);
+        let (grown, built) = assemble();
+        assert_eq!(built, 1, "y alone");
+        assert_eq!(grown[1].n_slots, 2);
+        assert_eq!(grown[1].windows, vec![(0, 0, 3, 0), (1, 0, 1, 1)]);
+        assert!(Arc::ptr_eq(&resigned[0].gallery, &grown[0].gallery));
     }
 
     /// **The preload takes only what every conversation reads.** A shared

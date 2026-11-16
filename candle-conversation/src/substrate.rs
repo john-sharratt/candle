@@ -48,6 +48,7 @@ mod deleted_set;
 mod dominance;
 mod ended_sections;
 mod faces;
+mod file_gallery;
 pub mod gauge;
 mod label_records;
 mod lock;
@@ -112,6 +113,8 @@ use crate::ConversationError;
 use calibration_record::{standing, CalRecord, CalRecords, CalSnapshot};
 use deleted_set::DeletedSet;
 use ended_sections::EndedSections;
+pub use file_gallery::FileGallery;
+use file_gallery::{entry_mut, GalleryMemo};
 use label_records::label_records;
 pub use lock::{SubstrateLock, SubstrateReadGuard};
 use pcoll::{arc_mut, ord_arc_mut, PMap, POrdMap, POrdSet, PSet, PVec};
@@ -329,6 +332,11 @@ pub struct Substrate {
     /// once per change instead of on every reprojection (see
     /// [`Self::gallery_epoch`]).
     gallery_epoch: u64,
+
+    /// The epoch every file gallery held on a timeline entry was built under
+    /// (`file_gallery`): moved by a change some gallery reads that names no
+    /// timeline, so each is built again when next read.
+    gallery_memo_epoch: u64,
 
     /// Bumped whenever a turn or a timeline is tombstoned — written here or
     /// replayed from the log, a replicated record included. The scheduler's
@@ -1541,6 +1549,9 @@ pub struct TimelineEntry {
     pub last_selection: Option<Arc<SelectionDiagnostics>>,
     /// The record behind each of this timeline's replicated values.
     pub ids: TimelineIds,
+    /// This timeline's belief gallery, built by the first reader that wants it
+    /// and cleared by every edit of the entry ([`file_gallery`]).
+    pub gallery: GalleryMemo,
 }
 
 /// Tree-bookkeeping metadata stored alongside every substrate turn.
@@ -1780,6 +1791,7 @@ impl TimelineEntry {
             needs_reconcile: false,
             last_selection: None,
             ids: TimelineIds::default(),
+            gallery: GalleryMemo::default(),
         }
     }
 
@@ -1855,7 +1867,7 @@ impl Substrate {
     /// turns never enter the summariser's pending queue. Must run after the
     /// timeline is registered and before its first turn seals.
     pub fn set_timeline_summarize(&mut self, timeline: TimelineId, summarize: bool) {
-        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
+        if let Some(tl) = entry_mut(&mut self.timelines, &timeline) {
             tl.summarize = summarize;
         }
     }
@@ -3396,7 +3408,7 @@ impl Substrate {
     /// Mutable variant of [`Self::turn`]: this version's own copy of the
     /// timeline and the turn, so older versions keep theirs.
     fn turn_mut(&mut self, timeline: TimelineId, index: TurnIndex) -> Option<&mut TurnEntryData> {
-        arc_mut(&mut self.timelines, &timeline).and_then(|t| ord_arc_mut(&mut t.turns, &index))
+        entry_mut(&mut self.timelines, &timeline).and_then(|t| ord_arc_mut(&mut t.turns, &index))
     }
 
     /// Every conversation registered in `group` — none for a drawing group,
@@ -3999,7 +4011,7 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
         };
-        let Some(tl) = arc_mut(&mut self.timelines, &timeline) else {
+        let Some(tl) = entry_mut(&mut self.timelines, &timeline) else {
             self.pending.hold(
                 payload.timeline_id,
                 PendingChild::Coupling(payload.from_turn),
@@ -4077,7 +4089,7 @@ impl Substrate {
     /// same key; clears the old mapping if the timeline already had a
     /// different debug_id.
     fn index_debug_id(&mut self, timeline: TimelineId, id: String) {
-        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
+        if let Some(tl) = entry_mut(&mut self.timelines, &timeline) {
             if let Some(old) = tl.debug_id.take() {
                 if old != id {
                     self.timeline_by_debug_id.remove(&old);
@@ -4122,7 +4134,7 @@ impl Substrate {
         meta: TreeNodeMeta,
         id: RecordIdentity,
     ) {
-        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
+        if let Some(tl) = entry_mut(&mut self.timelines, &timeline) {
             if take_keyed(&mut tl.ids.tree_meta, idx, id) {
                 tl.tree_meta.insert(idx, meta);
             }
@@ -4228,7 +4240,7 @@ impl Substrate {
 
     /// Set/clear the reconcile hint.
     pub fn set_needs_reconcile(&mut self, timeline: TimelineId, v: bool) {
-        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
+        if let Some(tl) = entry_mut(&mut self.timelines, &timeline) {
             tl.needs_reconcile = v;
         }
     }
@@ -4238,7 +4250,7 @@ impl Substrate {
     /// superseded AVL code) so the ternary canonical nodes can be rebuilt, and
     /// arm the reconcile hint when the forest isn't already whole.
     pub fn mark_for_reconcile(&mut self, timeline: TimelineId) {
-        let Some(tl) = arc_mut(&mut self.timelines, &timeline) else {
+        let Some(tl) = entry_mut(&mut self.timelines, &timeline) else {
             return;
         };
         let noncanonical: Vec<TurnIndex> = tl
@@ -4266,7 +4278,8 @@ impl Substrate {
     /// FIFO pop: next pending turn for the summariser to absorb, or
     /// `None` if the queue is empty.
     pub fn pop_pending_summary(&mut self, timeline: TimelineId) -> Option<TurnIndex> {
-        arc_mut(&mut self.timelines, &timeline).and_then(|tl| tl.pending_summary_queue.pop_front())
+        entry_mut(&mut self.timelines, &timeline)
+            .and_then(|tl| tl.pending_summary_queue.pop_front())
     }
 
     /// Push a turn onto the pending-summary queue.  Used during
@@ -4284,7 +4297,7 @@ impl Substrate {
         // One map lookup: the entry carries its layer, so the per-timeline
         // flag and the append-only-layer refusal read off the same borrow
         // (`append_only_layers` is a disjoint field).
-        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
+        if let Some(tl) = entry_mut(&mut self.timelines, &timeline) {
             if !tl.summarize || self.append_only_layers.contains(&tl.layer) {
                 return;
             }
@@ -4305,7 +4318,7 @@ impl Substrate {
     /// last-write-wins across re-projections within a turn.  Pure
     /// test-harness instrumentation — production daemons can ignore.
     pub fn set_last_selection(&mut self, timeline: TimelineId, diag: SelectionDiagnostics) {
-        if let Some(tl) = arc_mut(&mut self.timelines, &timeline) {
+        if let Some(tl) = entry_mut(&mut self.timelines, &timeline) {
             tl.last_selection = Some(Arc::new(diag));
         }
     }
@@ -4722,6 +4735,9 @@ impl Substrate {
             {
                 self.reload_due = true;
             }
+            // Which stream sits at each of the timeline's positions may have
+            // moved: its gallery reads them by position.
+            self.gallery_changed(timeline);
         }
         if section {
             if id.is_none() {
@@ -5009,6 +5025,8 @@ impl Substrate {
         // version's own copy of the runtime, so older versions keep theirs.
         entry.events_digest = OnceLock::new();
         self.gallery_epoch += 1;
+        // The turn's seams are read out of its events.
+        self.stream_gallery_changed(key);
     }
 
     /// Record `stream_id`'s wide-Q signature window, record `id` — the greatest
@@ -5025,6 +5043,7 @@ impl Substrate {
         let replaced = entry.wide_q_sigs.replace(payload.into()).is_some();
         self.sig_rewrites += u64::from(replaced);
         self.gallery_epoch += 1;
+        self.stream_gallery_changed(key);
     }
 
     /// Record the QSA index page of a turn or a prompt section, record `id` —
@@ -5089,7 +5108,7 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
             return;
         };
-        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
+        let Some(entry) = entry_mut(&mut self.timelines, &timeline) else {
             self.pending
                 .hold(timeline_raw, PendingChild::Label(meta.clone()), id);
             return;
@@ -5205,7 +5224,7 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
             return;
         };
-        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
+        let Some(entry) = entry_mut(&mut self.timelines, &timeline) else {
             self.pending
                 .hold(timeline_raw, PendingChild::State(state), id);
             return;
@@ -5217,7 +5236,7 @@ impl Substrate {
 
     /// Install `state` as `timeline`'s whole conversation state.
     fn replace_conv_state(&mut self, timeline: TimelineId, state: ConvState) {
-        if let Some(entry) = arc_mut(&mut self.timelines, &timeline) {
+        if let Some(entry) = entry_mut(&mut self.timelines, &timeline) {
             entry.archived = state.archived;
             entry.branches = state.branches.into_iter().collect();
             entry.active = state.active;
@@ -5265,7 +5284,7 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
         };
-        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
+        let Some(entry) = entry_mut(&mut self.timelines, &timeline) else {
             self.pending.hold(
                 payload.timeline_id,
                 PendingChild::DebugId(payload.debug_id.clone()),
@@ -5417,6 +5436,7 @@ impl Substrate {
                     });
                     self.gallery_epoch += 1;
                     self.tombstone_epoch += 1;
+                    self.gallery_changed(timeline);
                 }
             }
             None => self.mark_timeline_dead(timeline),
@@ -6585,7 +6605,7 @@ impl Substrate {
         // range, but holds no sealed KV — the residence stays cold
         // (`hot = None`) until an elevate / restore_turn install
         // puts bytes in.
-        let tl = arc_mut(&mut self.timelines, &timeline).unwrap();
+        let tl = entry_mut(&mut self.timelines, &timeline).unwrap();
         tl.turns.insert(
             idx,
             Arc::new(TurnEntryData {
@@ -6681,7 +6701,7 @@ impl Substrate {
         let block_end = write.block_end;
         let token_count = write.token_count;
         {
-            let tl = arc_mut(&mut self.timelines, &timeline).unwrap();
+            let tl = entry_mut(&mut self.timelines, &timeline).unwrap();
             tl.turns.insert(
                 idx,
                 Arc::new(TurnEntryData {
@@ -6738,7 +6758,7 @@ impl Substrate {
         let compression = self.timeline_compression.get(&timeline).copied();
         let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
         {
-            let tl = arc_mut(&mut self.timelines, &timeline).unwrap();
+            let tl = entry_mut(&mut self.timelines, &timeline).unwrap();
             tl.turns.insert(
                 idx,
                 Arc::new(TurnEntryData {
@@ -7400,7 +7420,7 @@ impl Substrate {
     /// follows the rejoin will. Until then its provisional generation outranks
     /// everything this member mints.
     pub fn settle_custom_field(&mut self, timeline: TimelineId, key: &str, gen: u64) {
-        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
+        let Some(entry) = entry_mut(&mut self.timelines, &timeline) else {
             return;
         };
         if let Some(held) = entry.ids.custom.get(key).copied() {
@@ -7674,7 +7694,7 @@ impl Substrate {
     /// the daemon uses this to skip the persistence write when the
     /// caller is just re-asserting the current state.
     pub fn set_archived(&mut self, timeline: TimelineId, archived: bool) -> bool {
-        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
+        let Some(entry) = entry_mut(&mut self.timelines, &timeline) else {
             return false;
         };
         if entry.archived == archived {
@@ -7707,7 +7727,7 @@ impl Substrate {
     /// it outranks every conversation used before it. Returns `false` for an
     /// unregistered timeline, which has no state to write.
     pub fn touch_conversation(&mut self, timeline: TimelineId) -> bool {
-        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
+        let Some(entry) = entry_mut(&mut self.timelines, &timeline) else {
             return false;
         };
         self.conv_active_counter += 1;
@@ -7719,7 +7739,7 @@ impl Substrate {
     /// isn't registered. Returns `true` when the branch actually changed, so
     /// the caller can skip the persistence write when nothing did.
     pub fn set_branch(&mut self, timeline: TimelineId, repo: &str, branch: &str) -> bool {
-        let Some(entry) = arc_mut(&mut self.timelines, &timeline) else {
+        let Some(entry) = entry_mut(&mut self.timelines, &timeline) else {
             return false;
         };
         if entry.branches.get(repo).map(String::as_str) == Some(branch) {
@@ -7734,7 +7754,7 @@ impl Substrate {
     /// [`Self::set_branch`], is carried by `ConvState` record `id` — minted
     /// for the change, so it outranks every state the timeline held.
     pub fn stamp_conv_state(&mut self, timeline: TimelineId, id: RecordIdentity) {
-        if let Some(entry) = arc_mut(&mut self.timelines, &timeline) {
+        if let Some(entry) = entry_mut(&mut self.timelines, &timeline) {
             take(&mut entry.ids.state, id);
         }
     }
@@ -7838,6 +7858,7 @@ impl Substrate {
         self.section_token_total = 0;
         self.gallery_epoch += 1;
         self.sig_rewrites += 1;
+        self.galleries_changed();
     }
 
     /// The stored projection-event record payload for a turn, if any.

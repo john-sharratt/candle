@@ -46,6 +46,9 @@ pub(crate) struct GroupScanSplit {
     pub cal_us: u64,
     /// Of `score_us`: laying the windows out as the arena's segments.
     pub segments_us: u64,
+    /// Files whose gallery the assembly built, rather than found held on
+    /// their timeline (`Substrate::file_gallery`).
+    pub galleries_built: u64,
 }
 
 thread_local! {
@@ -66,6 +69,7 @@ thread_local! {
             cal_windows: 0,
             cal_us: 0,
             segments_us: 0,
+            galleries_built: 0,
         }) };
 }
 
