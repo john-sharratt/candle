@@ -5418,10 +5418,11 @@ impl ProbeCtx {
     /// "what would this query retrieve" probe. Warms the query under the full
     /// system prompt, scores its wide-Q read-only (`observe = false`), and returns
     /// the resulting [`ProjectionEvent`] (selected turns + sections with belief
-    /// scores) plus the query token count. Persists NOTHING to the substrate.
-    pub fn probe(&self, text: &str) -> crate::Result<(ProjectionEvent, usize)> {
+    /// scores) plus the probe it scored — the query's wide-Q, one signature a
+    /// token, which a harness scores again offline under formulas of its own.
+    /// Persists NOTHING to the substrate.
+    pub fn probe(&self, text: &str) -> crate::Result<(ProjectionEvent, Vec<WideQSig>)> {
         let probe = self.probe_wide_q(text)?;
-        let query_tokens = probe.len();
         // The typed probe IS the question, so a separate Q-window would be
         // identical to the tail scan — `None` scans it once.
         let (scores, _) = self.substrate.score_beliefs(
@@ -5452,7 +5453,7 @@ impl ProbeCtx {
             0,
             0.0,
         );
-        Ok((ev, query_tokens))
+        Ok((ev, probe))
     }
 
     /// Capture the WARM folded wide-Q signature of `text` as if it were a new turn

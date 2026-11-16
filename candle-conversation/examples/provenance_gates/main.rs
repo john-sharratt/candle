@@ -40,6 +40,11 @@
 //! - **Dedup** (`dedup`): the content gallery reduced by a learned codebook —
 //!   near duplicates within a file, codes common across files — sized, and
 //!   judged on calibration questions.
+//! - **Lab** (`lab`): the dependency battery's questions, probed once as a
+//!   chat's opening probes them, ranked against the files that answer them
+//!   under a formula read from a YAML file — re-ranked on every save with
+//!   `--watch`, so the scoring formula is iterated without restarting the
+//!   daemon (`lab`, `lab_formula`, `lab.yaml`).
 //!
 //! The sweep, gate 4, the questions gate, the normalization probe and the
 //! chunk factor scan on a running daemon's gallery
@@ -81,6 +86,8 @@
 //!     <workspace dir> scan-loop [passes] --daemon <url> --node <hex>
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> dedup [sample files] [questions per file] --daemon <url> --node <hex>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> lab <battery.yaml> <formula.yaml> [--watch] --daemon <url> --node <hex>
 
 mod anomaly;
 mod attribution;
@@ -94,6 +101,9 @@ mod corpus;
 mod dedup_gate;
 mod density;
 mod judge;
+mod lab;
+mod lab_formula;
+mod lab_probes;
 mod layers_gate;
 mod momentum_gate;
 mod norm_probe;
@@ -300,11 +310,25 @@ fn main() -> anyhow::Result<()> {
             let per_file = args.get(3).map(|a| a.parse()).transpose()?.unwrap_or(3);
             dedup_gate::run(&files, sample, per_file, daemon()?)?;
         }
+        "lab" => {
+            let rest: Vec<&String> = args[2..].iter().filter(|a| *a != "--watch").collect();
+            let watch = args[2..].iter().any(|a| a == "--watch");
+            let (Some(battery), Some(formula)) = (rest.first(), rest.get(1)) else {
+                anyhow::bail!("lab needs <battery.yaml> <formula.yaml> [--watch]");
+            };
+            lab::run(
+                &files,
+                &PathBuf::from(battery),
+                &PathBuf::from(formula),
+                watch,
+                daemon()?,
+            )?;
+        }
         other => {
             anyhow::bail!(
                 "unknown command `{other}`: files, retrieval, sweep, paper, questions, \
                  normalization, chunk-factor, density, question-cut, competitions, thinking, \
-                 calibration-cut, momentum, layers, scan-loop or dedup"
+                 calibration-cut, momentum, layers, scan-loop, dedup or lab"
             )
         }
     }

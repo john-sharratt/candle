@@ -36,7 +36,7 @@ const GROUP: &str = "scopes";
 const CACHE_DIR: &str = "target/provenance-scan-cache";
 
 /// The admin identity a member's routes accept from the gateway.
-const ADMIN_HEADERS: [(&str, &str); 3] = [
+pub const ADMIN_HEADERS: [(&str, &str); 3] = [
     ("x-tokera-user", "forged-admin"),
     ("x-tokera-provider", "google"),
     ("x-tokera-email", "johnathan.sharratt@gmail.com"),

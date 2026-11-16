@@ -1,0 +1,20 @@
+# The scoring lab's formula (`lab_formula.rs`). Save this file while
+# `provenance_gates … lab … --watch` runs and every battery question is
+# re-ranked at once. Each value below is production's: this file as written
+# scores as today's belief scan does.
+
+budget_files: 10            # recall is "an answer file in the top this many"
+
+groups: [1.0, 1.0, 1.0]     # content competition's fold-group weights
+keep: 0.25                  # needle gate: top fraction of probe tokens kept
+vote_power: 1.0             # each kept vote raised to this before summing
+length_power: 0.0           # score / signed_tokens^p — 0.5 is a sqrt correction
+
+calibration: 0.5            # calibration competition's weight; 0 leaves it out
+calibration_groups: [1.0, 1.0, 1.0]
+
+hub: none                   # none | subtract | divide — against each file's mean on the other questions
+
+types: []                   # per-path multipliers, first match wins, e.g.
+#  - { files: '\.(md|txt|rst)$', weight: 0.5 }
+#  - { files: '(^|/)tests?/', weight: 0.7 }

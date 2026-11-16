@@ -27,6 +27,8 @@ use tokio::sync::Mutex as ConvLock;
 use tokio::sync::{watch, Notify, OwnedMutexGuard};
 use tokio::task::JoinHandle as TaskHandle;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use candle::{vram, Device};
 use candle_conversation::models::{Dialect, Model, StrataTokens};
 use candle_conversation::persistence::record::DistillMode;
@@ -38,7 +40,7 @@ use candle_conversation::projection::{
     SectionLoads, SelectionRule, SystemItem, SystemPromptItem, TimelineId, TurnIndex,
 };
 use candle_conversation::provenance::gallery_arena::GroupSet;
-use candle_conversation::provenance::FOLD_GROUPS;
+use candle_conversation::provenance::{encode_wide_sigs, FOLD_GROUPS};
 use candle_conversation::stencil::{
     compile_action_loop, OpeningCall, ThinkMode, ToolCallEnvelope, ToolSpec, TriggerRegistry,
     MAX_TOOL_CALLS_PER_TURN,
@@ -6860,6 +6862,7 @@ impl ZendSession {
             return Some(ProjectView {
                 query_tokens: 0,
                 tiles: Vec::new(),
+                probe: String::new(),
             });
         }
 
@@ -6869,16 +6872,18 @@ impl ZendSession {
         // under a brief `base_conv` lock, then run the GPU-bound probe UNLOCKED so
         // the fork source isn't held across a full turn round-trip.
         let ctx = { state.base_conv.probe_ctx() };
-        let (event, query_tokens) = match ctx.probe(text) {
+        let (event, probe) = match ctx.probe(text) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("substrate_project probe failed: {e:#}");
                 return Some(ProjectView {
                     query_tokens: 0,
                     tiles: Vec::new(),
+                    probe: String::new(),
                 });
             }
         };
+        let query_tokens = probe.len();
 
         // Resolve tile labels + bodies from the substrate (read lock only).
         let conv = { state.engine.conversation() };
@@ -6999,6 +7004,7 @@ impl ZendSession {
         Some(ProjectView {
             query_tokens,
             tiles,
+            probe: STANDARD.encode(encode_wide_sigs(&probe)),
         })
     }
 

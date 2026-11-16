@@ -257,6 +257,12 @@ pub struct ProjectView {
     pub query_tokens: usize,
     /// Selected turns + scored section members, sorted by belief score descending.
     pub tiles: Vec<ProjectTile>,
+    /// The probe the query was scored by — its wide-Q, one signature a token,
+    /// as `encode_wide_sigs` writes it, base64 — so a harness can score the
+    /// same question again offline under formulas of its own
+    /// (`candle-conversation/examples/provenance_gates/lab`). Empty when nothing
+    /// was probed.
+    pub probe: String,
 }
 
 /// One retrieved item — a conversation turn/summary or a scored system-prompt
