@@ -350,7 +350,7 @@ impl Runtime {
                  answer: you are the one speaking now, to tell them one thing.",
                 seen.party_name
             ),
-            None => head,
+            None => format!("{head} {ANSWERING}"),
         };
         let spoken = minds
             .talk_turn(
@@ -732,6 +732,18 @@ fn to_party(tool: &'static str, party: &str) -> Act {
     args.insert("intent".into(), "".into());
     Act { tool, args }
 }
+
+/// What a turn that answers somebody is told about what it can do.
+///
+/// **A conversation only talks; the doing is the same character's, elsewhere.**
+/// Its decision is offered the thread's acts and nothing of the world, and a
+/// model that reads no `terminal_list` among them says so: asked to list its
+/// terminals, Zen answered that it had no such tool "in this session" and
+/// could not see the house — while its mind held every one of them.
+const ANSWERING: &str = "On the phone you only talk. Whatever they ask you to do, find out or \
+                         check is done by you once you have answered, away from the phone, where \
+                         everything you can work is to hand — so never say you cannot or have no \
+                         way to: say what you will do, and it becomes yours to do.";
 
 /// What the mind reads once the words it asked for have been said: the words,
 /// that saying them again adds nothing, and that what they promised is still
