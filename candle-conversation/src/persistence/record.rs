@@ -1858,17 +1858,26 @@ impl From<ExportedLayerState> for SnapshotLayer {
 impl From<SnapshotLayer> for ExportedLayerState {
     /// The record's rows handed to the model as they are: a restore moves the
     /// decoded rows into the snapshot it stages rather than copying them.
-    fn from(l: SnapshotLayer) -> Self {
+    fn from(mut l: SnapshotLayer) -> Self {
         Self {
             layer_index: l.layer_index,
             n_v_heads: l.n_v_heads,
             d_v: l.d_v,
             d_k: l.d_k,
-            state: l.state,
+            state: std::mem::take(&mut l.state),
             conv_channels: l.conv_channels,
             conv_tail_cols: l.conv_tail_cols,
-            conv_tail: l.conv_tail,
+            conv_tail: std::mem::take(&mut l.conv_tail),
         }
+    }
+}
+
+impl Drop for SnapshotLayer {
+    /// A layer's rows go back to the host pool its decode or its seal's export
+    /// took them from, so the next one fills them rather than allocating.
+    fn drop(&mut self) {
+        host_rows::give(std::mem::take(&mut self.state));
+        host_rows::give(std::mem::take(&mut self.conv_tail));
     }
 }
 

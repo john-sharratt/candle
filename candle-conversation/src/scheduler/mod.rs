@@ -14973,16 +14973,7 @@ mod tests {
         let restored: Vec<ExportedLayerState> = back
             .layers
             .into_iter()
-            .map(|l| ExportedLayerState {
-                layer_index: l.layer_index,
-                n_v_heads: l.n_v_heads,
-                d_v: l.d_v,
-                d_k: l.d_k,
-                state: l.state,
-                conv_channels: l.conv_channels,
-                conv_tail_cols: l.conv_tail_cols,
-                conv_tail: l.conv_tail,
-            })
+            .map(ExportedLayerState::from)
             .collect();
         assert!(sched
             .model

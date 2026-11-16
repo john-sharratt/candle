@@ -1681,9 +1681,11 @@ impl RecurrentStateStore {
             .slots
             .iter()
             .map(|_| {
-                let state = buf[at..at + state_bytes].to_vec();
+                // Into kept rows: every seal exports the same row sizes, and the
+                // rows of the snapshots dropped since are in the pool.
+                let state = host_rows::row_from(&buf[at..at + state_bytes]);
                 at += state_bytes;
-                let tail = buf[at..at + tail_bytes].to_vec();
+                let tail = host_rows::row_from(&buf[at..at + tail_bytes]);
                 at += tail_bytes;
                 (state, tail)
             })

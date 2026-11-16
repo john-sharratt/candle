@@ -14,7 +14,20 @@
 //! returned row is freed as before. It is host memory, never pinned and never
 //! on the card.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+use candle::engine_events::note;
+
+/// What the pool has done since the process started: rows filled from it and
+/// rows allocated past it, rows kept and rows freed past its bound, each with
+/// its bytes — what says whether the bound fits the traffic.
+static REUSED: AtomicU64 = AtomicU64::new(0);
+static FRESH: AtomicU64 = AtomicU64::new(0);
+static FRESH_BYTES: AtomicU64 = AtomicU64::new(0);
+static KEPT: AtomicU64 = AtomicU64::new(0);
+static FREED: AtomicU64 = AtomicU64::new(0);
+static FREED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// The most row bytes the pool keeps: two of Qwen4Exp's snapshots — what a
 /// restore and the snapshot it replaces hold at once.
@@ -53,7 +66,17 @@ pub fn row_from(bytes: &[u8]) -> Vec<u8> {
             row
         })
     };
-    let mut row = kept.unwrap_or_else(|| Vec::with_capacity(bytes.len()));
+    let mut row = match kept {
+        Some(row) => {
+            REUSED.fetch_add(1, Ordering::Relaxed);
+            row
+        }
+        None => {
+            FRESH.fetch_add(1, Ordering::Relaxed);
+            FRESH_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            Vec::with_capacity(bytes.len())
+        }
+    };
     row.clear();
     row.extend_from_slice(bytes);
     row
@@ -68,11 +91,34 @@ pub fn give(row: Vec<u8>) {
     let mut p = pool();
     if p.bytes + row.capacity() > POOL_BYTES {
         drop(p);
+        FREED.fetch_add(1, Ordering::Relaxed);
+        FREED_BYTES.fetch_add(row.capacity() as u64, Ordering::Relaxed);
         drop(row);
+        report();
         return;
     }
     p.bytes += row.capacity();
     p.rows.push(row);
+    drop(p);
+    KEPT.fetch_add(1, Ordering::Relaxed);
+    report();
+}
+
+/// The pool's counters as an engine event (`GET /v1/events`).
+fn report() {
+    note("recurrent host rows", || {
+        let mib = |b: u64| b >> 20;
+        format!(
+            "reused={} fresh={} fresh_mib={} kept={} freed={} freed_mib={} pooled_mib={}",
+            REUSED.load(Ordering::Relaxed),
+            FRESH.load(Ordering::Relaxed),
+            mib(FRESH_BYTES.load(Ordering::Relaxed)),
+            KEPT.load(Ordering::Relaxed),
+            FREED.load(Ordering::Relaxed),
+            mib(FREED_BYTES.load(Ordering::Relaxed)),
+            mib(pooled_bytes() as u64),
+        )
+    });
 }
 
 /// Row bytes the pool keeps now.
