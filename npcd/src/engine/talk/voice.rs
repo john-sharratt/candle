@@ -21,6 +21,17 @@ use crate::engine::tools::CHANNEL_WAY;
 /// The most a post decodes: one Discord message.
 pub const POST_TOKENS: usize = 320;
 
+/// The band a post's words decode at: the band a character's own turns do
+/// (the mind's `decode_priority: high`).
+///
+/// **A post is part of the act that made it, and the character's next turn
+/// waits on that act.** One band lower, the words queued behind every turn of
+/// every character on the card while their own character — whose turns would
+/// have outranked them — waited on the words: thirteen tokens to the channel
+/// took twenty-six minutes, and Zen, having told a person it was doing what
+/// they asked, did nothing for nineteen of them.
+pub const POST_BAND: DecodePriority = DecodePriority::High;
+
 /// Where `act` puts words on a group, and what it means to say there: the
 /// thread as the character named it, and the intent. `None` for an act that
 /// puts no words on a group.
@@ -111,7 +122,7 @@ impl Runtime {
                     prompt: &prompt,
                     to: Destination::Channel,
                     max_tokens: POST_TOKENS,
-                    band: DecodePriority::Normal,
+                    band: POST_BAND,
                 },
             )
             .await?;
@@ -140,6 +151,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A post's words are not outranked by the turns that wait on them.
+    #[test]
+    fn a_post_decodes_at_the_band_of_a_characters_turns() {
+        assert_eq!(POST_BAND, DecodePriority::High);
+    }
 
     fn act(tool: &'static str, args: serde_json::Value) -> Act {
         Act {
