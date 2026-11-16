@@ -23,20 +23,23 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
+use candle_conversation::persistence::content_hash::ContentHasher;
 use candle_conversation::projection::TimelineId;
-use candle_conversation::provenance::WideQSig;
+use candle_conversation::provenance::window_score::{group_ranked, Ranked};
+use candle_conversation::provenance::{encode_wide_sigs, WideQSig, FOLD_GROUPS};
 use candle_conversation::substrate::Substrate;
 use serde::Deserialize;
 
-use crate::corpus::File;
+use crate::corpus::{File, Gallery};
 use crate::lab_formula::{Formula, FormulaSpec, Sample, TokenVote, Votes};
 use crate::lab_probes::{probed, Probed};
 use crate::ranking::order;
+use crate::ranking::token_files;
 use crate::remote_gallery::{Daemon, Questions, RemoteGallery};
 
 /// How often the formula file is looked at in `--watch`.
@@ -45,6 +48,17 @@ const POLL: Duration = Duration::from_millis(400);
 /// Background probes: one calibration question from every this-many-th
 /// calibrated file.
 const BACKGROUND_STRIDE: usize = 60;
+
+/// Files a CPU ranking keeps per token and group: enough for `topk` up to
+/// one less, each vote measured over the next.
+const RANK_KEPT: usize = 9;
+
+/// Where the CPU rankings are kept, from the repository root.
+const RANK_CACHE_DIR: &str = "target/provenance-topk-cache";
+
+/// The longest one question's CPU ranking may take before the lab stops
+/// ranking for the rest of the run: an experiment, not a wait.
+const RANK_BUDGET: Duration = Duration::from_secs(60);
 
 /// A battery question, as the lab reads it.
 #[derive(Deserialize)]
@@ -71,10 +85,12 @@ enum FormulaFile {
     One(FormulaSpec),
 }
 
-/// One probe's votes in both competitions, as the daemon scanned them.
+/// One probe's votes in both competitions, as the daemon scanned them, and
+/// its content competition ranked on the CPU when the lab was asked to.
 struct Scanned {
     content: Vec<TokenVote>,
     calibration: Vec<TokenVote>,
+    ranked: Option<Vec<[Ranked; FOLD_GROUPS]>>,
 }
 
 impl Scanned {
@@ -82,6 +98,7 @@ impl Scanned {
         Votes {
             content: &self.content,
             calibration: &self.calibration,
+            ranked: self.ranked.as_deref(),
         }
     }
 }
@@ -166,17 +183,86 @@ fn scan(
     Ok(Scanned {
         content,
         calibration,
+        ranked: None,
     })
 }
 
-pub fn run(
-    files: &[File],
-    chain: HashSet<usize>,
-    battery: &Path,
-    formula_path: &Path,
-    watch: bool,
-    daemon: &Daemon,
-) -> anyhow::Result<()> {
+/// A ranked token as the cache keeps it: per group, `(mean, std, top)`.
+type KeptRanking = Vec<Vec<(f32, f32, Vec<(usize, u32)>)>>;
+
+/// `probe`'s content competition ranked on the CPU — each token's best
+/// [`RANK_KEPT`] files per group — from the cache when it holds it.
+fn ranked(
+    probe: &[WideQSig],
+    gallery: &Gallery,
+    token_file: &[usize],
+    n_files: usize,
+) -> anyhow::Result<Vec<[Ranked; FOLD_GROUPS]>> {
+    let mut h = ContentHasher::new();
+    h.update(&encode_wide_sigs(probe));
+    h.update(&(gallery.flat.len() as u64).to_le_bytes());
+    let key = h.finish();
+    let kept = PathBuf::from(RANK_CACHE_DIR).join(format!("{:016x}{:016x}.json", key.hi, key.lo));
+    if let Ok(text) = fs::read_to_string(&kept) {
+        let rows: KeptRanking = serde_json::from_str(&text).context("reading a kept ranking")?;
+        return Ok(rows
+            .into_iter()
+            .map(|groups| {
+                let mut it = groups
+                    .into_iter()
+                    .map(|(mean, std, top)| Ranked { mean, std, top });
+                std::array::from_fn(|_| {
+                    it.next().unwrap_or(Ranked {
+                        mean: 0.0,
+                        std: 1.0,
+                        top: Vec::new(),
+                    })
+                })
+            })
+            .collect());
+    }
+    let out = group_ranked(probe, &gallery.flat, token_file, n_files, RANK_KEPT);
+    let rows: KeptRanking = out
+        .iter()
+        .map(|groups| {
+            groups
+                .iter()
+                .map(|r| (r.mean, r.std, r.top.clone()))
+                .collect()
+        })
+        .collect();
+    fs::create_dir_all(RANK_CACHE_DIR).context("making the ranking cache")?;
+    fs::write(&kept, serde_json::to_string(&rows)?).context("keeping the ranking")?;
+    Ok(out)
+}
+
+/// What the lab is run on.
+pub struct LabRun<'a> {
+    pub files: &'a [File],
+    pub gallery: &'a Gallery,
+    pub chain: HashSet<usize>,
+    pub battery: &'a Path,
+    pub formula: &'a Path,
+    /// Re-score every time the formula file is saved.
+    pub watch: bool,
+    /// Rank each question's content competition on the CPU, for `topk`.
+    pub topk: bool,
+    pub daemon: &'a Daemon,
+}
+
+pub fn run(run: LabRun) -> anyhow::Result<()> {
+    let LabRun {
+        files,
+        gallery,
+        chain,
+        battery,
+        formula: formula_path,
+        watch,
+        topk,
+        daemon,
+    } = run;
+    let token_file = token_files(gallery, None);
+    let mut rank_budget_spent = false;
     let battery: Battery = serde_yaml::from_str(
         &fs::read_to_string(battery).with_context(|| format!("reading {}", battery.display()))?,
     )
@@ -192,7 +278,21 @@ pub fn run(
     for q in &battery.questions {
         let Probed { probe, placed } =
             probed(daemon, &q.question).with_context(|| format!("probing {}", q.id))?;
-        let scanned = scan(&gpu, &probe, None)?;
+        let mut scanned = scan(&gpu, &probe, None)?;
+        if topk && !rank_budget_spent {
+            let t_rank = Instant::now();
+            scanned.ranked = Some(ranked(&probe, gallery, &token_file, files.len())?);
+            let took = t_rank.elapsed();
+            if took > RANK_BUDGET {
+                rank_budget_spent = true;
+                println!(
+                    "  {}: the CPU ranking took {:.0}s, past the {}s budget — no more are ranked",
+                    q.id,
+                    took.as_secs_f64(),
+                    RANK_BUDGET.as_secs()
+                );
+            }
+        }
         let mut answers = Vec::new();
         let mut missing = Vec::new();
         for a in &q.files {

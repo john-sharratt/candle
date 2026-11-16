@@ -87,7 +87,7 @@
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> dedup [sample files] [questions per file] --daemon <url> --node <hex>
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
-//!     <workspace dir> lab <battery.yaml> <formula.yaml> [--watch] --daemon <url> --node <hex>
+//!     <workspace dir> lab <battery.yaml> <formula.yaml> [--watch] [--topk] --daemon <url> --node <hex>
 
 mod anomaly;
 mod attribution;
@@ -311,19 +311,22 @@ fn main() -> anyhow::Result<()> {
             dedup_gate::run(&files, sample, per_file, daemon()?)?;
         }
         "lab" => {
-            let rest: Vec<&String> = args[2..].iter().filter(|a| *a != "--watch").collect();
-            let watch = args[2..].iter().any(|a| a == "--watch");
+            let flag = |f: &str| args[2..].iter().any(|a| a == f);
+            let rest: Vec<&String> = args[2..].iter().filter(|a| !a.starts_with("--")).collect();
             let (Some(battery), Some(formula)) = (rest.first(), rest.get(1)) else {
-                anyhow::bail!("lab needs <battery.yaml> <formula.yaml> [--watch]");
+                anyhow::bail!("lab needs <battery.yaml> <formula.yaml> [--watch] [--topk]");
             };
-            lab::run(
-                &files,
-                lab::chain_files(&sub, &files),
-                &PathBuf::from(battery),
-                &PathBuf::from(formula),
-                watch,
-                daemon()?,
-            )?;
+            let (battery, formula) = (PathBuf::from(battery), PathBuf::from(formula));
+            lab::run(lab::LabRun {
+                files: &files,
+                gallery: &gallery,
+                chain: lab::chain_files(&sub, &files),
+                battery: &battery,
+                formula: &formula,
+                watch: flag("--watch"),
+                topk: flag("--topk"),
+                daemon: daemon()?,
+            })?;
         }
         other => {
             anyhow::bail!(

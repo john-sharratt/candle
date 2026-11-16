@@ -348,6 +348,122 @@ pub fn group_votes(
         .collect()
 }
 
+/// One probe token's ranking in one fold group: the agreement distribution
+/// over every gallery token, and the files whose best tokens agree most, best
+/// first — what [`group_votes`] reduces to one vote. With the first two files,
+/// `z × (top[0] − top[1])` over `mean` and `std` is that vote.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ranked {
+    pub mean: f32,
+    pub std: f32,
+    /// `(file, its best token's agreement)`, best first, ties by file id.
+    pub top: Vec<(usize, u32)>,
+}
+
+/// [`group_votes`]' scan, keeping each usable probe token's best `k` files per
+/// fold group rather than its best two — for an experiment that lets a token
+/// vote for more than one file. Same slices and tiles, so the same cost.
+pub fn group_ranked(
+    probe: &[WideQSig],
+    gallery: &FlatSigs,
+    token_file: &[usize],
+    n_files: usize,
+    k: usize,
+) -> Vec<[Ranked; FOLD_GROUPS]> {
+    let n_tokens = gallery.len();
+    let wph = gallery.wpt / gallery.n_heads.max(1) as usize;
+    let hpg = heads_per_group(gallery.n_heads as usize);
+    if wph == 0 || hpg == 0 || n_tokens == 0 || n_tokens != token_file.len() || k == 0 {
+        return Vec::new();
+    }
+    let gw = hpg * wph;
+    let need = FOLD_GROUPS * gw;
+    let wpt = gallery.wpt;
+    let n = n_tokens as f32;
+    let usable: Vec<&WideQSig> = probe.iter().filter(|q| q.words.len() >= need).collect();
+    let nq = usable.len();
+    // Best first, ties by file id, at most `k`.
+    let keep = |mut v: Vec<(u32, usize)>| {
+        v.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        v.truncate(k);
+        v
+    };
+    type Acc = (u64, u64, Vec<(u32, usize)>);
+    let merged: Vec<Acc> = slices(token_file)
+        .into_par_iter()
+        .map(|range| {
+            let mut out: Vec<Acc> = vec![(0, 0, Vec::new()); nq * FOLD_GROUPS];
+            let files = token_file[range.clone()]
+                .iter()
+                .copied()
+                .filter(|&f| f < n_files);
+            let (lo, hi) = files.fold((usize::MAX, 0), |(lo, hi), f| (lo.min(f), hi.max(f)));
+            let width = if lo == usize::MAX { 0 } else { hi - lo + 1 };
+            for (t0, tile) in usable.chunks(PROBE_TILE).enumerate() {
+                let q0 = t0 * PROBE_TILE;
+                let mut best = vec![(0u32, u32::MAX); tile.len() * width * FOLD_GROUPS];
+                let mut sums = vec![SliceBest::NONE; tile.len() * FOLD_GROUPS];
+                TilePass {
+                    rows: &gallery.words[range.start * wpt..range.end * wpt],
+                    wpt,
+                    gw,
+                    start: range.start,
+                    token_file,
+                    n_files,
+                    lo,
+                    width,
+                    tile,
+                    sums: &mut sums,
+                    best: &mut best,
+                }
+                .run();
+                for qi in 0..tile.len() {
+                    for g in 0..FOLD_GROUPS {
+                        let o = &mut out[(q0 + qi) * FOLD_GROUPS + g];
+                        let s = sums[qi * FOLD_GROUPS + g];
+                        o.0 += s.sum;
+                        o.1 += s.sumsq;
+                        let found = (0..width).filter_map(|lf| {
+                            let (m, t) = best[(qi * width + lf) * FOLD_GROUPS + g];
+                            (t != u32::MAX).then_some((m, lo + lf))
+                        });
+                        o.2 = keep(o.2.drain(..).chain(found).collect());
+                    }
+                }
+            }
+            out
+        })
+        .reduce(
+            || vec![(0, 0, Vec::new()); nq * FOLD_GROUPS],
+            |a, b| {
+                a.into_iter()
+                    .zip(b)
+                    .map(|(x, y)| {
+                        (
+                            x.0 + y.0,
+                            x.1 + y.1,
+                            keep(x.2.into_iter().chain(y.2).collect()),
+                        )
+                    })
+                    .collect()
+            },
+        );
+    (0..nq)
+        .map(|qi| {
+            std::array::from_fn(|g| {
+                let (sum, sumsq, top) = &merged[qi * FOLD_GROUPS + g];
+                let mean = *sum as f32 / n;
+                let var = (*sumsq as f32 / n - mean * mean).max(1e-6);
+                Ranked {
+                    mean,
+                    std: var.sqrt(),
+                    top: top.iter().map(|&(m, f)| (f, m)).collect(),
+                }
+            })
+        })
+        .collect()
+}
+
 /// [`group_votes`] weighed by `group_weights` (empty: uniform) and gated: the
 /// probe tokens whose summed vote is in the top `keep` fraction keep their
 /// votes, the rest are dropped — late fusion's needle gate at
@@ -631,6 +747,38 @@ mod tests {
             );
         }
         assert!(slices(&token_file).len() >= 3);
+    }
+
+    /// **A ranking's first two files are the vote.** Over a sliced gallery,
+    /// every probe token's best file in each group is the file `group_votes`
+    /// gives the vote to, and `z × (top[0] − top[1])` is its weight; the
+    /// ranking is best first and holds at most `k` files.
+    #[test]
+    fn a_rankings_first_two_files_are_the_vote() {
+        let n = SLICE_TOKENS * 2 + 311;
+        let tokens: Vec<WideQSig> = (0..n as u64).map(|s| sig(s % 4093)).collect();
+        let token_file: Vec<usize> = (0..n).map(|t| (t * 5 / SLICE_TOKENS).min(12)).collect();
+        let probe: Vec<WideQSig> = (0..20u64).map(|s| sig(s * 131 % 4093)).collect();
+        let flat = FlatSigs::new(&tokens).unwrap();
+        let votes = group_votes(&probe, &flat, &token_file, 13);
+        let ranked = group_ranked(&probe, &flat, &token_file, 13, 4);
+        assert_eq!(votes.len(), ranked.len());
+        for (v, r) in votes.iter().zip(&ranked) {
+            for g in 0..FOLD_GROUPS {
+                let r = &r[g];
+                assert!(r.top.len() <= 4);
+                assert!(r.top.windows(2).all(|w| w[0].1 >= w[1].1));
+                let vote = v[g].expect("every token votes in this gallery");
+                assert_eq!(r.top[0].0, vote.file);
+                let z = ((r.top[0].1 as f32 - r.mean) / r.std).max(0.0);
+                let w = z * r.top[0].1.saturating_sub(r.top[1].1) as f32;
+                assert!(
+                    (w - vote.weight).abs() <= 1e-3 * (1.0 + w.abs()),
+                    "{w} vs {}",
+                    vote.weight
+                );
+            }
+        }
     }
 
     /// Laid flat only when every token is one width.

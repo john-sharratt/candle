@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use regex::Regex;
 use serde::Deserialize;
 
-use candle_conversation::provenance::window_score::{gate, Vote};
+use candle_conversation::provenance::window_score::{gate, Ranked, Vote};
 use candle_conversation::provenance::FOLD_GROUPS;
 
 /// One probe token's vote in each fold group, as the daemon's scan returns it.
@@ -34,6 +34,11 @@ pub struct FormulaSpec {
     pub budget_files: usize,
     /// How the fold groups' votes combine.
     pub fusion: Fusion,
+    /// Files each probe token votes for in each group of the content
+    /// competition: its best `topk`, file `r` by `z_r × (a_r − a_{topk+1})`
+    /// — 1 is production's single `z × margin` vote. Above 1 the content is
+    /// scored from the lab's CPU ranking ([`Votes::ranked`]), additively.
+    pub topk: usize,
     /// The content competition's fold-group weights.
     pub groups: [f32; 3],
     /// The needle gate: the top fraction of probe tokens by summed vote kept.
@@ -68,6 +73,7 @@ impl Default for FormulaSpec {
         Self {
             budget_files: 10,
             fusion: Fusion::Additive,
+            topk: 1,
             groups: [1.0, 1.0, 1.0],
             keep: 0.25,
             vote_power: 1.0,
@@ -149,6 +155,9 @@ pub struct Sample {
 pub struct Votes<'a> {
     pub content: &'a [TokenVote],
     pub calibration: &'a [TokenVote],
+    /// The content competition ranked on the CPU — each probe token's best
+    /// files per group — when the lab computed it; what `topk` above 1 reads.
+    pub ranked: Option<&'a [[Ranked; FOLD_GROUPS]]>,
 }
 
 impl Formula {
@@ -198,7 +207,10 @@ impl Formula {
     pub fn raw(&self, votes: &Votes, paths: &[&str], tokens: &[usize]) -> Vec<f32> {
         let s = &self.spec;
         let n = paths.len();
-        let mut out = self.fused(votes.content, &s.groups, n);
+        let mut out = match (s.topk, votes.ranked) {
+            (k, Some(ranked)) if k > 1 => self.top_k_summed(ranked, &s.groups, k, n),
+            _ => self.fused(votes.content, &s.groups, n),
+        };
         if s.calibration != 0.0 {
             let cal = self.fused(votes.calibration, &s.calibration_groups, n);
             for (o, c) in out.iter_mut().zip(cal) {
@@ -316,6 +328,64 @@ impl Formula {
         }
     }
 
+    /// Each probe token's votes for its best `k` files per group, weighed by
+    /// `groups`: file `r` by `z_r × (a_r − a_{k+1})`, `z_r` its agreement's
+    /// standing over the token's distribution. The tokens whose summed votes
+    /// are in the top `keep` fraction keep them, each raised to its power and
+    /// summed per file — production's gate over a token's every vote.
+    fn top_k_summed(
+        &self,
+        ranked: &[[Ranked; FOLD_GROUPS]],
+        groups: &[f32; 3],
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        let per_token: Vec<Vec<(usize, f32)>> = ranked
+            .iter()
+            .map(|groups_of| {
+                let mut out = Vec::new();
+                for (g, r) in groups_of.iter().enumerate() {
+                    let w = groups[g];
+                    if w == 0.0 || r.top.is_empty() {
+                        continue;
+                    }
+                    let floor = r.top.get(k).map_or(0, |t| t.1);
+                    for &(file, a) in r.top.iter().take(k) {
+                        let z = ((a as f32 - r.mean) / r.std.max(1e-3)).max(0.0);
+                        let v = w * z * a.saturating_sub(floor) as f32;
+                        if v > 0.0 {
+                            out.push((file, v));
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        let mags: Vec<f32> = per_token
+            .iter()
+            .map(|v| v.iter().map(|x| x.1).sum())
+            .collect();
+        let mut out = vec![0.0f32; n];
+        if mags.is_empty() {
+            return out;
+        }
+        let n_keep = ((self.spec.keep * mags.len() as f32).ceil() as usize).clamp(1, mags.len());
+        let mut sorted = mags.clone();
+        sorted.sort_unstable_by(|a, b| b.total_cmp(a));
+        let thresh = sorted[n_keep - 1];
+        for (votes, m) in per_token.iter().zip(&mags) {
+            if *m < thresh {
+                continue;
+            }
+            for &(file, v) in votes {
+                if file < n {
+                    out[file] += v.powf(self.spec.vote_power);
+                }
+            }
+        }
+        out
+    }
+
     /// Votes weighed by `groups`, gated at the formula's keep, each raised to
     /// its power, summed per file.
     fn summed(&self, votes: &[TokenVote], groups: &[f32; 3], n: usize) -> Vec<f32> {
@@ -391,10 +461,61 @@ mod tests {
             &Votes {
                 content,
                 calibration: &[],
+                ranked: None,
             },
             &PATHS,
             tokens,
         )
+    }
+
+    /// One token ranked in group 0 only: files 1, 0, 2 at agreements 90, 80,
+    /// 70, over a distribution of mean 50 and spread 10.
+    fn ranked_one() -> Vec<[Ranked; FOLD_GROUPS]> {
+        let empty = Ranked {
+            mean: 0.0,
+            std: 1.0,
+            top: Vec::new(),
+        };
+        vec![[
+            Ranked {
+                mean: 50.0,
+                std: 10.0,
+                top: vec![(1, 90), (0, 80), (2, 70)],
+            },
+            empty.clone(),
+            empty,
+        ]]
+    }
+
+    /// **Top-k voting gives each of a token's best files a vote** over the
+    /// `(k+1)`-th: at k = 2, file 1 by z 4 × (90 − 70) and file 0 by
+    /// z 3 × (80 − 70); file 2, the floor, by nothing. At k = 1 the CPU
+    /// ranking is not read — the daemon's single vote stands.
+    #[test]
+    fn top_k_gives_each_best_file_a_vote_over_the_next() {
+        let ranked = ranked_one();
+        let f = Formula::parse("topk: 2\ncalibration: 0").unwrap();
+        let got = f.raw(
+            &Votes {
+                content: &[],
+                calibration: &[],
+                ranked: Some(&ranked),
+            },
+            &PATHS,
+            &[1, 1, 1],
+        );
+        assert_eq!(got, vec![30.0, 80.0, 0.0]);
+        let one = Formula::parse("calibration: 0").unwrap();
+        let got = one.raw(
+            &Votes {
+                content: &votes(),
+                calibration: &[],
+                ranked: Some(&ranked),
+            },
+            &PATHS,
+            &[1, 1, 1],
+        );
+        assert_eq!(got, vec![8.0, 0.0, 0.0], "k = 1 reads the daemon's votes");
     }
 
     /// **An empty formula is production's**: every group weighed 1, the top
@@ -410,6 +531,7 @@ mod tests {
             &Votes {
                 content: &votes(),
                 calibration: &calibration,
+                ranked: None,
             },
             &PATHS,
             &[10, 10, 10],
