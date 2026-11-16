@@ -516,6 +516,24 @@ impl Runtime {
         // the words have gone — so the party never waits on it — and told so
         // that it wakes the mind. Zen told a person "I am going to connect to
         // the terminal now", and nothing ever reached the mind that could.
+        // **What the mind had said for it wakes the mind once it is said**:
+        // the telling was the mind's own act, and its landing is that act's
+        // outcome. Before the journal, and whether or not an entry is kept: a
+        // telling hears nothing, so its stretch often adds none, and Zen —
+        // having told a person "I will now survey the devices" — was woken by
+        // nothing and surveyed nothing.
+        let told = telling.is_some() && matches!(ended, Ended::Spoke);
+        if told {
+            self.scheduler.deliver(
+                npc,
+                world_ms,
+                Salience::NORMAL,
+                EventKind::Concluded {
+                    party: seen.party_name.clone(),
+                    applied: said_for_the_mind(&spoken.words),
+                },
+            );
+        }
         if matches!(ended, Ended::Spoke) {
             if let Some(entry) = self
                 .journal_turn(
@@ -531,7 +549,9 @@ impl Runtime {
                 .await
             {
                 elsewhere.push(entry);
-                settled = true;
+                // A telling has already woken the mind; its entry is read on
+                // the turn that wake starts.
+                settled = settled || !told;
             }
         }
         if settled {
@@ -713,6 +733,19 @@ fn to_party(tool: &'static str, party: &str) -> Act {
     Act { tool, args }
 }
 
+/// What the mind reads once the words it asked for have been said: the words,
+/// that saying them again adds nothing, and that what they promised is still
+/// to be done — woken by its own telling, a mind with nothing new told the
+/// person the same thing again a minute later.
+fn said_for_the_mind(words: &str) -> String {
+    format!(
+        "You have now said it: \"{}\" It is said; saying it again tells them nothing. Whatever \
+         you said you would do is still yours to do — do it, and speak to them again only when \
+         there is something new to tell.",
+        words.trim()
+    )
+}
+
 /// The band a conversation with `party` decodes at.
 ///
 /// **A person on the other end is waiting on the turn right now** — the
@@ -729,7 +762,18 @@ fn talk_band(party: &Party) -> DecodePriority {
 
 #[cfg(test)]
 mod tests {
-    use super::{talk_band, DecodePriority, Party};
+    use super::{said_for_the_mind, talk_band, DecodePriority, Party};
+
+    /// The mind is told what was said, and that the doing is still its own.
+    #[test]
+    fn a_telling_comes_back_as_said_and_still_to_be_done() {
+        assert_eq!(
+            said_for_the_mind(" Connected to the house network. Scanning now.\n"),
+            "You have now said it: \"Connected to the house network. Scanning now.\" It is said; \
+             saying it again tells them nothing. Whatever you said you would do is still yours \
+             to do — do it, and speak to them again only when there is something new to tell."
+        );
+    }
 
     /// A person is answered at `Urgent`; another character in the background.
     #[test]

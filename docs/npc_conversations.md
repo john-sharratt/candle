@@ -463,6 +463,14 @@ does (`docs/zend_journal.md`), written by the same workflow
   something the character does: "John asked whether the cluster is up; I said
   I would look" reaches the mind with what it now means to do and what is
   open. A skipped stretch tells nothing more than §5.4's quiet `Elsewhere`.
+- **A telling wakes the mind as soon as it is said.** When the turn spoke for
+  the mind (the main loop's `message` to this party) rather than answered
+  anybody, the mind is told `Concluded` before the journal is drafted: the
+  words, that saying them again tells the party nothing, and that what it said
+  it would do is still its to do. A telling hears nothing, so its stretch often
+  keeps no entry, and without this a mind that said "I will survey the devices
+  now" was woken by nothing and never did. An entry that is kept for a telling
+  follows quietly, read on the turn that wake starts.
 
 ---
 
