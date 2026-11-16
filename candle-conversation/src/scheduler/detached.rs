@@ -116,7 +116,6 @@ impl SchedulerRequest {
             | Self::IngestSection { sequence_id, .. }
             | Self::SeedRecurrentFromLineage { sequence_id, .. }
             | Self::MemoryCatchUp { sequence_id, .. }
-            | Self::PrimingProjection { sequence_id, .. }
             | Self::ExtractRawKvq { sequence_id, .. }
             | Self::ProbeWideSigs { sequence_id, .. }
             | Self::ReadRecurrentMemory { sequence_id, .. } => vec![*sequence_id],
@@ -125,7 +124,8 @@ impl SchedulerRequest {
             Self::InstallRecurrentState { sequence_ids, .. } => sequence_ids.clone(),
             Self::NewEphemeralSequence { .. }
             | Self::ResumeSequence { .. }
-            | Self::ScoreSealedTurn { .. }
+            | Self::ArenaScan { .. }
+            | Self::ArenaGroups { .. }
             | Self::BranchCheckpointPass { .. }
             | Self::RestoreSection { .. }
             | Self::RetireSections { .. }
@@ -164,8 +164,9 @@ impl SchedulerRequest {
             | Self::WarmIngestSlice { conversation, .. }
             | Self::ScanGroupVotes { conversation, .. }
             | Self::DemoteTimelinesHot { conversation, .. } => Some(conversation),
-            Self::ScoreSealedTurn { substrate, .. } => Some(substrate),
             Self::ForkEphemeralSequence { .. }
+            | Self::ArenaScan { .. }
+            | Self::ArenaGroups { .. }
             | Self::SubmitTurn { .. }
             | Self::FreeSequence { .. }
             | Self::ResetSequence { .. }
@@ -175,7 +176,6 @@ impl SchedulerRequest {
             | Self::SeedRecurrentFromLineage { .. }
             | Self::MemoryCatchUp { .. }
             | Self::BranchCheckpointPass { .. }
-            | Self::PrimingProjection { .. }
             | Self::ExtractRawKvq { .. }
             | Self::ProbeWideSigs { .. }
             | Self::SubmitSummaryProbe { .. }

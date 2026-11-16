@@ -99,9 +99,12 @@ impl UnsealedAsker {
                     AskScope::Conversation => Arc::new(state.projection.focused()),
                 }
             };
+            // The fork borrows the live slot's K/V, so there is no empty slot
+            // for a frame to seed.
             let inputs = ProjectionInputs {
                 projection,
                 selection: options.selection.clone(),
+                frame: None,
             };
             let message = TurnText::from(question);
             self.submitter

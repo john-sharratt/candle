@@ -1229,6 +1229,20 @@ layers:
       beta: 0.2                  # per-file momentum leak: m ← (1 − β)·m + fresh
       min_momentum: 100          # below this a file is no provenance candidate
       max_file_tokens: 48000     # one file above this is never seeded or locked
+      # The most of `budget_tokens` each type of document may hold — locks
+      # count toward it but are never refused by it; a file of no type (code,
+      # tests, kernels, scripts) is unbounded, and provenance orders the rest
+      # (docs/zend_working_set.md §4.10). Patterns match a unit's subject,
+      # `<repo>/<path>`; the first type that matches is the unit's.
+      type_shares:
+        - name: docs
+          files: ['\.(md|markdown|mdx|txt|rst|adoc)$']
+          max_share: 0.35
+        - name: config
+          files:
+            - '\.(ya?ml|toml|json|jsonc|ini|cfg|conf|env|properties)$'
+            - '(^|/)(Cargo\.toml|package\.json|pyproject\.toml|go\.mod)$'
+          max_share: 0.15
       # What a dialogue starts out attending to: each enters provenance at the
       # momentum of one full-strength hit (1000) when the conversation opens and
       # fades like any other file it stops attending to. Within `--max-depth 3`.

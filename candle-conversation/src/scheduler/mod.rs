@@ -67,6 +67,7 @@ mod ephemeral_fork;
 mod expert_counters;
 pub mod exported_state;
 mod first_sample;
+mod frame;
 mod gallery_sweep;
 mod gang;
 mod gap_residence;
@@ -107,11 +108,11 @@ mod rates_store;
 mod recurrent_park;
 mod relief_pacing;
 pub mod relief_trace;
+mod remote_arena;
 mod reproject_abandon;
 mod request_laps;
 mod run;
 mod sample;
-mod seal_scan;
 mod section_pack;
 mod section_pages;
 mod segment_rearm;
@@ -139,6 +140,7 @@ use band::recorded_band;
 use census_stage::Stage;
 use detached::Detached;
 use expert_counters::ExpertCounters;
+use frame::framed_segments;
 use graph_window::graph_window;
 use held_turn::HeldTurn;
 use phase_split::cobatched_step_shares;
@@ -186,7 +188,7 @@ use crate::projection::{
     CollectionWarm, DecodePriority, GalleryPreload, GroupId, GroupVotes, LayerId, Schema,
     SelectionRule, SubstrateRef, LINEAGE_BASE,
 };
-use crate::provenance::gallery_arena::{GroupSet, Keep};
+use crate::provenance::gallery_arena::{BeliefArena, GroupSet, HeldScan, Keep, ScanReply};
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
@@ -197,7 +199,7 @@ use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StepMask, TriggerRegistry, TurnGrammar, TOOL_CALL_TREE_LABEL,
 };
-use crate::substrate::{HotKv, ProjectionScores, ResidenceIndex, TurnPartWrite};
+use crate::substrate::{HotKv, ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::scope::Scope;
 use crate::summary_tree::{
     leaf_skeleton, structural_rollup, ProbeError, SelectionDiagnostics, SummariserTrigger, TurnKind,
@@ -229,7 +231,7 @@ use candle_transformers::models::sealed_injection::reconcile_sealed_prefix;
 use self::exported_state::{ExportedState, SharedState};
 use self::norm_warm::NormWarm;
 use self::projection_identity::{section_content_stamp, segments_identity, turn_start_identity};
-pub(crate) use self::seal_scan::SealedProbe;
+pub(crate) use self::remote_arena::RemoteArena;
 pub use self::settle::SettleReport;
 use self::turn_group::{GroupCaseId, TurnGroup};
 use candle::engine_events::note;
@@ -440,9 +442,9 @@ pub(crate) enum SchedulerRequest {
         /// already holds content, and append the prefill onto the
         /// cumulative slot instead.  The `seal_action` is unaffected, so
         /// the turn still seals into the substrate.  The system prompt is
-        /// seeded by PrimingProjection at conversation creation (so the
-        /// slot is already non-empty and this stays true from turn 1);
-        /// see the handler for the gated-section trade-off.  Used by
+        /// laid down by the first turn from its frame
+        /// ([`ProjectionInputs::frame`]), so the slot is non-empty from
+        /// turn 2; see the handler for the gated-section trade-off.  Used by
         /// append-only utility ingests (e.g. `code_reading`) where
         /// re-projecting the whole trunk every turn is both unnecessary
         /// and O(n²) — see `zend::code_read`.
@@ -494,20 +496,23 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<(), ConversationError>>,
     },
 
-    /// Score a just-sealed turn's beliefs — the once-per-turn seal scan that
-    /// teaches the normalization backgrounds — on the scheduler's gallery arena.
+    /// Run one belief-scan launch on the gallery arena, for a scan running on
+    /// another thread ([`RemoteArena`]).
     ///
-    /// It comes here rather than scanning on the caller's thread because the
-    /// arena has exactly one scan thread (see [`seal_scan`]). The CPU per-file
-    /// scan the caller would otherwise run cost ~1 s over a 7M-token layer,
-    /// paid after every turn before its tool calls could dispatch.
-    ScoreSealedTurn {
-        substrate: Conversation,
-        projection: Arc<Builder>,
-        target: ProjectionTarget,
-        sealed: SealedProbe,
-        response_tx: Sender<ProjectionScores>,
+    /// The arena has exactly one scan thread — a re-seal frees a turn's pages
+    /// on the grounds that nobody else can be holding a scan pin on them — so a
+    /// scan elsewhere sends its launches here and does the rest of its work,
+    /// the substrate reads and the normalization, on its own thread. A seal
+    /// scan held the wave thread ~575 ms a turn, all but ~50 ms of it host
+    /// work (BlackWorld, 2026-11-16).
+    ArenaScan {
+        scan: HeldScan,
+        response_tx: Sender<ScanReply>,
     },
+
+    /// The gallery arena's fold-group count, `None` when there is no arena —
+    /// what a [`RemoteArena`] lays its segments out by.
+    ArenaGroups { response_tx: Sender<Option<usize>> },
 
     /// Ingest a substrate section: fresh slot in, sealed section out.
     ///
@@ -697,27 +702,6 @@ pub(crate) enum SchedulerRequest {
     RetireSections {
         conversation: Conversation,
         sections: Vec<SectionId>,
-    },
-
-    /// Pre-warm a freshly-allocated slot by injecting the static system-prompt
-    /// sections before the user submits the first turn.
-    ///
-    /// The scheduler calls [`Scheduler::apply_projection`] with the supplied
-    /// section IDs and no history turns.  After this returns the slot's offset
-    /// is non-zero, so the first [`Self::SubmitTurn`]'s `apply_projection`
-    /// call sees `slot_already_populated = true` and skips the injection
-    /// entirely — eliminating the injection latency from the first turn's
-    /// critical path.
-    ///
-    /// Safe to call only once, immediately after slot creation and after all
-    /// section ingestion in the `new_with_schema` flow has completed.
-    PrimingProjection {
-        sequence_id: SequenceId,
-        /// Sections to inject, in the exact order `apply_projection` would
-        /// use at first-turn time (declaration order from the schema loop,
-        /// including collection members).
-        section_ids: Vec<SectionId>,
-        response_tx: Sender<Result<(), ConversationError>>,
     },
 
     /// Quantize + offload the collection-member sections sealed so far, freeing
@@ -976,7 +960,8 @@ impl SchedulerRequest {
             Self::FreeSequence { .. } => "req:free_sequence",
             Self::ResetSequence { .. } => "req:reset_sequence",
             Self::SetSequenceAdapter { .. } => "req:set_sequence_adapter",
-            Self::ScoreSealedTurn { .. } => "req:score_sealed_turn",
+            Self::ArenaScan { .. } => "req:arena_scan",
+            Self::ArenaGroups { .. } => "req:arena_groups",
             Self::IngestSection { .. } => "req:ingest_section",
             Self::InstallRecurrentState { .. } => "req:install_recurrent_state",
             Self::SeedRecurrentFromLineage { .. } => "req:seed_recurrent_from_lineage",
@@ -984,7 +969,6 @@ impl SchedulerRequest {
             Self::BranchCheckpointPass { .. } => "req:branch_checkpoint_pass",
             Self::RestoreSection { .. } => "req:restore_section",
             Self::RetireSections { .. } => "req:retire_sections",
-            Self::PrimingProjection { .. } => "req:priming_projection",
             Self::OffloadCollectionMembers { .. } => "req:offload_collection_members",
             Self::ExtractRawKvq { .. } => "req:extract_raw_kvq",
             Self::ProbeWideSigs { .. } => "req:probe_wide_sigs",
@@ -1495,6 +1479,13 @@ pub(crate) struct ProjectionInputs {
     pub projection: Arc<Builder>,
     /// Section-tree selection for this turn's projection (the composer dials).
     pub selection: SelectionState,
+    /// The sections an append-only conversation's first turn lays onto an
+    /// empty slot instead of projecting: the schema's fixed sections, each tree
+    /// at its default branch. Its later turns skip projection
+    /// (`disable_reprojection`), so this is the prompt its sealed K/V is
+    /// computed under for the conversation's whole life, and no turn's
+    /// selection can alter it. `None` on every other submit.
+    pub frame: Option<Arc<Vec<SectionId>>>,
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -4898,18 +4889,23 @@ impl Scheduler {
                 // cumulative slot. The seal is unaffected — turns still land
                 // in the substrate.
                 //
-                // The system prompt is laid down at conversation creation by
-                // PrimingProjection (see `Conversation::new_*`), so the slot
-                // already has blocks before turn 1 and `skip_projection` is
-                // true from the first turn — `apply_projection` never runs for
-                // these ingests. That's intentional: priming injects the
-                // `fixed_prefix` (system) sections. The trade-off is that
-                // collection-member / `depends_on`-gated sections (which only
-                // materialize via per-turn `apply_projection`) are NOT added;
-                // utility-layer system prompts (code_reading, repo_map) use
-                // only fixed sections, so this is exact for them.
-                let skip_projection = disable_reprojection
-                    && self.session.sequence_block_count(parent_id.0).unwrap_or(0) > 0;
+                // The system prompt is laid down by the conversation's first
+                // turn: a submit that carries a frame (`ProjectionInputs::frame`)
+                // and finds the slot empty injects exactly the frame's sections
+                // instead of projecting, as part of its own admission and
+                // prefill. From then on the slot holds blocks and
+                // `skip_projection` holds. The trade-off is that collection-
+                // member / `depends_on`-gated sections (which only materialize
+                // via a projection) are NOT added; utility-layer system prompts
+                // (code_reading, repo_map) use only fixed sections, so this is
+                // exact for them.
+                let slot_holds_blocks =
+                    self.session.sequence_block_count(parent_id.0).unwrap_or(0) > 0;
+                let skip_projection = disable_reprojection && slot_holds_blocks;
+                let frame = projection_inputs
+                    .as_ref()
+                    .and_then(|i| i.frame.as_ref())
+                    .filter(|_| disable_reprojection && !slot_holds_blocks);
                 // Mark this as an append-only ingest timeline so the gentle-early
                 // ladder can demote its sealed, warm-backed KV to RAM at ~50%
                 // capacity — it is never re-attended until query time. See
@@ -4944,214 +4940,217 @@ impl Scheduler {
                 // below (carried belief stepped through the submit projection);
                 // default when projection is skipped.
                 let mut turn_belief = PriorBelief::default();
-                let (projected_sections, projected_segments) = if let (Some(inputs), Some(target)) = (
-                    projection_inputs.as_ref().filter(|_| !skip_projection),
-                    slot_target,
-                ) {
-                    let conversation = match self.slot_conversations.get(&parent_id) {
-                        Some(c) => c.clone(),
-                        None => {
-                            let _ = event_tx.send(TurnEvent::Error(ConversationError::Channel(
-                                format!(
+                let (projected_sections, projected_segments) =
+                    if let (Some(frame), Some(_)) = (frame, slot_target) {
+                        framed_segments(frame)
+                    } else if let (Some(inputs), Some(target)) = (
+                        projection_inputs.as_ref().filter(|_| !skip_projection),
+                        slot_target,
+                    ) {
+                        let conversation = match self.slot_conversations.get(&parent_id) {
+                            Some(c) => c.clone(),
+                            None => {
+                                let _ = event_tx.send(TurnEvent::Error(
+                                    ConversationError::Channel(format!(
                                     "submit_turn: no conversation registered for slot {parent_id}"
-                                ),
-                            )));
-                            return true;
+                                )),
+                                ));
+                                return true;
+                            }
+                        };
+                        // Target-aware read: the projection sees only
+                        // `target.timeline` within `target.group`,
+                        // masking sibling timelines.
+                        let view = conversation.read_for(target);
+                        // Prefill mode: section scoring uses the calibrated
+                        // prefill profile (Max / semantic depth, no threshold)
+                        // against the prefill-Q section corpus.  The sink
+                        // captures score-density diagnostics for the test
+                        // harness (§10.8.4) on a substrate-side side-channel.
+                        // Last-write-wins per timeline; the recall test reads
+                        // it via `Conversation::last_selection_diagnostics`
+                        // after `send_turn` returns.  Sink is never invoked
+                        // when the rule-based path runs (no tree on the
+                        // target timeline).
+                        // Submit-time projection seeds from the conversation's belief
+                        // as of its last completed turn (`carried_beliefs`) — empty
+                        // only for a genuinely fresh conversation. The belief then
+                        // evolves through this turn's reprojections and is harvested
+                        // back at seal, so provenance selection is continuous across
+                        // turn boundaries instead of resetting to catalog order.
+                        //
+                        // Decayed at the boundary so it seeds as a SOFT PRIOR, not a
+                        // hard pin: the incoming query has no decode-Q evidence yet
+                        // (its prefill-Q hits the call↔definition domain gap), so a
+                        // full-strength prior would let the previous turn's tool own
+                        // the whole opening window and the model could commit to a
+                        // wrong framing before the correct tool is selected. Halving
+                        // lets the fresh decode-Q overtake a stale tool within a few
+                        // tokens; a real continuation re-accumulates just as fast.
+                        let mut carried_belief = self
+                            .carried_beliefs
+                            .get(&parent_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        carried_belief.decay_scores(CARRIED_BELIEF_TURN_DECAY);
+                        // Choosing the context: the provenance scan and the section-tree walk
+                        // that decide which turns this reply attends over. Pure selection —
+                        // no K/V has moved yet.
+                        let _g_project = profile::span("drain:project");
+                        let projection = inputs.projection.project_with_mode_and_sink(
+                            target,
+                            &view,
+                            ProjectionMode::Prefill,
+                            &inputs.selection,
+                            &carried_belief,
+                            // Opening projection: decode position 0. The early-decode
+                            // window excludes position 0 (its prior is the previous
+                            // turn's decayed belief), so submit selects on the steady
+                            // band; the grace window engages once decode starts.
+                            Some(0),
+                            &mut |diag| {
+                                diag_to_write = Some((target.timeline, diag));
+                            },
+                        );
+                        // Emit the OPENING projection as a timeline event: a POINT at
+                        // token 0 (nothing decoded yet) carrying the initial composition
+                        // this turn decodes against. A projection governs everything
+                        // forward until the next reprojection supersedes it, so even a
+                        // short / no-think turn that never reprojects still gets this one
+                        // clickable record. `start_token`/`seconds` stay 0 — the turn's
+                        // opening point.
+                        {
+                            let mut opening = crate::projection::from_projection_with_origins(
+                                &projection.segments,
+                                &projection.selection_origins,
+                                inputs.projection.schema(),
+                                &view,
+                                &projection.selection_scores,
+                                view.total_token_count(target.timeline) as u32,
+                                0,
+                                0.0,
+                            );
+                            // The turn's decode state seeds its belief from what this
+                            // opening projection actually selected (the carried belief
+                            // stepped against this turn's selection), so the first
+                            // mid-decode reprojection continues the evolution.
+                            turn_belief = PriorBelief::from_selection(&opening.selection);
+                            opening.materialized = projection_assembler::materialize_conversation(
+                                &projection.segments,
+                                &projection.selection_origins,
+                                &view,
+                                inputs.projection.schema(),
+                                |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
+                            );
+                            let _ = event_tx.send(TurnEvent::Projection(opening));
                         }
-                    };
-                    // Target-aware read: the projection sees only
-                    // `target.timeline` within `target.group`,
-                    // masking sibling timelines.
-                    let view = conversation.read_for(target);
-                    // Prefill mode: section scoring uses the calibrated
-                    // prefill profile (Max / semantic depth, no threshold)
-                    // against the prefill-Q section corpus.  The sink
-                    // captures score-density diagnostics for the test
-                    // harness (§10.8.4) on a substrate-side side-channel.
-                    // Last-write-wins per timeline; the recall test reads
-                    // it via `Conversation::last_selection_diagnostics`
-                    // after `send_turn` returns.  Sink is never invoked
-                    // when the rule-based path runs (no tree on the
-                    // target timeline).
-                    // Submit-time projection seeds from the conversation's belief
-                    // as of its last completed turn (`carried_beliefs`) — empty
-                    // only for a genuinely fresh conversation. The belief then
-                    // evolves through this turn's reprojections and is harvested
-                    // back at seal, so provenance selection is continuous across
-                    // turn boundaries instead of resetting to catalog order.
-                    //
-                    // Decayed at the boundary so it seeds as a SOFT PRIOR, not a
-                    // hard pin: the incoming query has no decode-Q evidence yet
-                    // (its prefill-Q hits the call↔definition domain gap), so a
-                    // full-strength prior would let the previous turn's tool own
-                    // the whole opening window and the model could commit to a
-                    // wrong framing before the correct tool is selected. Halving
-                    // lets the fresh decode-Q overtake a stale tool within a few
-                    // tokens; a real continuation re-accumulates just as fast.
-                    let mut carried_belief = self
-                        .carried_beliefs
-                        .get(&parent_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    carried_belief.decay_scores(CARRIED_BELIEF_TURN_DECAY);
-                    // Choosing the context: the provenance scan and the section-tree walk
-                    // that decide which turns this reply attends over. Pure selection —
-                    // no K/V has moved yet.
-                    let _g_project = profile::span("drain:project");
-                    let projection = inputs.projection.project_with_mode_and_sink(
-                        target,
-                        &view,
-                        ProjectionMode::Prefill,
-                        &inputs.selection,
-                        &carried_belief,
-                        // Opening projection: decode position 0. The early-decode
-                        // window excludes position 0 (its prior is the previous
-                        // turn's decayed belief), so submit selects on the steady
-                        // band; the grace window engages once decode starts.
-                        Some(0),
-                        &mut |diag| {
-                            diag_to_write = Some((target.timeline, diag));
-                        },
-                    );
-                    // Emit the OPENING projection as a timeline event: a POINT at
-                    // token 0 (nothing decoded yet) carrying the initial composition
-                    // this turn decodes against. A projection governs everything
-                    // forward until the next reprojection supersedes it, so even a
-                    // short / no-think turn that never reprojects still gets this one
-                    // clickable record. `start_token`/`seconds` stay 0 — the turn's
-                    // opening point.
-                    {
-                        let mut opening = crate::projection::from_projection_with_origins(
-                            &projection.segments,
-                            &projection.selection_origins,
-                            inputs.projection.schema(),
-                            &view,
-                            &projection.selection_scores,
-                            view.total_token_count(target.timeline) as u32,
-                            0,
-                            0.0,
-                        );
-                        // The turn's decode state seeds its belief from what this
-                        // opening projection actually selected (the carried belief
-                        // stepped against this turn's selection), so the first
-                        // mid-decode reprojection continues the evolution.
-                        turn_belief = PriorBelief::from_selection(&opening.selection);
-                        opening.materialized = projection_assembler::materialize_conversation(
-                            &projection.segments,
-                            &projection.selection_origins,
-                            &view,
-                            inputs.projection.schema(),
-                            |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
-                        );
-                        let _ = event_tx.send(TurnEvent::Projection(opening));
-                    }
-                    // The schema's projection is the single source
-                    // of truth for system-side sections — emit
-                    // exactly what the projection picked, in
-                    // declaration order.  The legacy
-                    // "always prepend `system_section_id`" path
-                    // (a monolithic ChatML-wrapped duplicate of
-                    // the schema fragments) has been removed; the
-                    // schema items now compose the full system
-                    // prompt on their own.
-                    // Single walk of `projection.segments` builds three
-                    // outputs:
-                    //   - `projected_sections` / `turn_keys_for_elevate`
-                    //     feed `elevate_to_hot` (per-id form expected
-                    //     by the persistence API).
-                    //   - `segments` carries the same items in
-                    //     declaration order for `apply_projection`.
-                    // Each turn already carries its resolved timeline
-                    // (stamped at projection), so no group→timeline
-                    // resolution happens here.
-                    let mut sections: Vec<SectionId> = Vec::new();
-                    let mut segments: Vec<ProjectionSegment> = Vec::new();
-                    for seg in &projection.segments {
-                        match seg {
-                            ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
-                                // Any-tier filter — cold-marker
-                                // sections (post-reload, before
-                                // elevate) must survive this filter
-                                // so the `elevate_to_hot` call below
-                                // can lift them.  Filtering on
-                                // `section_sealed_of` (hot-only)
-                                // would silently drop every
-                                // not-yet-elevated section the
-                                // projection selected.
-                                if view.section_tier_state(rs.id).is_some() {
-                                    sections.push(rs.id);
+                        // The schema's projection is the single source
+                        // of truth for system-side sections — emit
+                        // exactly what the projection picked, in
+                        // declaration order.  The legacy
+                        // "always prepend `system_section_id`" path
+                        // (a monolithic ChatML-wrapped duplicate of
+                        // the schema fragments) has been removed; the
+                        // schema items now compose the full system
+                        // prompt on their own.
+                        // Single walk of `projection.segments` builds three
+                        // outputs:
+                        //   - `projected_sections` / `turn_keys_for_elevate`
+                        //     feed `elevate_to_hot` (per-id form expected
+                        //     by the persistence API).
+                        //   - `segments` carries the same items in
+                        //     declaration order for `apply_projection`.
+                        // Each turn already carries its resolved timeline
+                        // (stamped at projection), so no group→timeline
+                        // resolution happens here.
+                        let mut sections: Vec<SectionId> = Vec::new();
+                        let mut segments: Vec<ProjectionSegment> = Vec::new();
+                        for seg in &projection.segments {
+                            match seg {
+                                ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
+                                    // Any-tier filter — cold-marker
+                                    // sections (post-reload, before
+                                    // elevate) must survive this filter
+                                    // so the `elevate_to_hot` call below
+                                    // can lift them.  Filtering on
+                                    // `section_sealed_of` (hot-only)
+                                    // would silently drop every
+                                    // not-yet-elevated section the
+                                    // projection selected.
+                                    if view.section_tier_state(rs.id).is_some() {
+                                        sections.push(rs.id);
+                                        segments.push(seg.clone());
+                                    }
+                                }
+                                ProjectionSegment::Sealed(SealedKind::Turn(rt, _))
+                                | ProjectionSegment::Sealed(SealedKind::TurnHalf(rt, _)) => {
+                                    // The turn carries its conversation (stamped at
+                                    // projection); read it directly — no group→timeline
+                                    // re-derivation.  `elevate_to_hot` below brings
+                                    // cold-marker turns into hot before apply runs; a
+                                    // timeline-less (mock/untracked) turn is skipped, a
+                                    // record elevates the turn it belongs to.
+                                    let Some(timeline) = rt.timeline else {
+                                        continue;
+                                    };
+                                    turn_keys_for_elevate.push(TurnKey::new(timeline, rt.index()));
+                                    segments.push(seg.clone());
+                                }
+                                ProjectionSegment::Generated { .. }
+                                | ProjectionSegment::NewUserMessage { .. } => {
+                                    // Live-prefill runs and new-user-message
+                                    // captures don't need an elevate side-list
+                                    // entry — their K/V is produced on the
+                                    // slot, not loaded from the substrate.
                                     segments.push(seg.clone());
                                 }
                             }
-                            ProjectionSegment::Sealed(SealedKind::Turn(rt, _))
-                            | ProjectionSegment::Sealed(SealedKind::TurnHalf(rt, _)) => {
-                                // The turn carries its conversation (stamped at
-                                // projection); read it directly — no group→timeline
-                                // re-derivation.  `elevate_to_hot` below brings
-                                // cold-marker turns into hot before apply runs; a
-                                // timeline-less (mock/untracked) turn is skipped, a
-                                // record elevates the turn it belongs to.
-                                let Some(timeline) = rt.timeline else {
-                                    continue;
-                                };
-                                turn_keys_for_elevate.push(TurnKey::new(timeline, rt.index()));
-                                segments.push(seg.clone());
-                            }
-                            ProjectionSegment::Generated { .. }
-                            | ProjectionSegment::NewUserMessage { .. } => {
-                                // Live-prefill runs and new-user-message
-                                // captures don't need an elevate side-list
-                                // entry — their K/V is produced on the
-                                // slot, not loaded from the substrate.
-                                segments.push(seg.clone());
-                            }
                         }
-                    }
 
-                    // **No trailing `Generated(UserStart)`.**
-                    //
-                    // The live turn's opener is now the head of its own prefill
-                    // (`Sequence::submit_prefill_unit`), so it arrives as
-                    // ordinary tail prefill rather than as a glue island the
-                    // engine has to gap-fill. The distinction is the whole
-                    // difference for this lineage: appending at the writer tail
-                    // is prefill, which any model can do; filling a hole in the
-                    // middle of a sequence is gap-fill, which a recurrence
-                    // cannot do even in principle.
-                    //
-                    // It is invisible in the token stream — the same ids in the
-                    // same order — and visible only in whether a gap chunk was
-                    // reserved, which is what `T5a.1` asserts on.
-                    // Build the composition for a staged prefill's per-segment
-                    // projection events now, while the view guard is live. The
-                    // calibration projection is pinned (`SelectionRule::Named`), so
-                    // one composition serves every segment — the wave overrides its
-                    // point `start_token` per emission.
-                    if !projection_offsets.is_empty() {
-                        let total = view.total_token_count(target.timeline) as u32;
-                        staged_composition = Some(crate::projection::from_projection(
-                            &projection.segments,
-                            inputs.projection.schema(),
-                            &view,
-                            &projection.selection_scores,
-                            total,
-                            0,
-                            0.0,
-                        ));
-                    }
-                    // **No live `/no_think` run either.**
-                    //
-                    // The soft-switch is baked into the head of the turn that
-                    // carries it, decided once at submit from the dial that was
-                    // live then. That is *stronger* than re-deciding it every
-                    // projection, not weaker: the leak this used to guard
-                    // against — a past suppressed turn putting a stale switch on
-                    // a later thinking-on turn — cannot happen when each turn's
-                    // grid holds its own.
-                    (sections, segments)
-                } else {
-                    (Vec::new(), Vec::new())
-                };
+                        // **No trailing `Generated(UserStart)`.**
+                        //
+                        // The live turn's opener is now the head of its own prefill
+                        // (`Sequence::submit_prefill_unit`), so it arrives as
+                        // ordinary tail prefill rather than as a glue island the
+                        // engine has to gap-fill. The distinction is the whole
+                        // difference for this lineage: appending at the writer tail
+                        // is prefill, which any model can do; filling a hole in the
+                        // middle of a sequence is gap-fill, which a recurrence
+                        // cannot do even in principle.
+                        //
+                        // It is invisible in the token stream — the same ids in the
+                        // same order — and visible only in whether a gap chunk was
+                        // reserved, which is what `T5a.1` asserts on.
+                        // Build the composition for a staged prefill's per-segment
+                        // projection events now, while the view guard is live. The
+                        // calibration projection is pinned (`SelectionRule::Named`), so
+                        // one composition serves every segment — the wave overrides its
+                        // point `start_token` per emission.
+                        if !projection_offsets.is_empty() {
+                            let total = view.total_token_count(target.timeline) as u32;
+                            staged_composition = Some(crate::projection::from_projection(
+                                &projection.segments,
+                                inputs.projection.schema(),
+                                &view,
+                                &projection.selection_scores,
+                                total,
+                                0,
+                                0.0,
+                            ));
+                        }
+                        // **No live `/no_think` run either.**
+                        //
+                        // The soft-switch is baked into the head of the turn that
+                        // carries it, decided once at submit from the dial that was
+                        // live then. That is *stronger* than re-deciding it every
+                        // projection, not weaker: the leak this used to guard
+                        // against — a past suppressed turn putting a stale switch on
+                        // a later thinking-on turn — cannot happen when each turn's
+                        // grid holds its own.
+                        (sections, segments)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
 
                 // **What the projection will put on the device is priced here, and
                 // put there only when admission takes the turn** (`submit_admit`).
@@ -5359,15 +5358,17 @@ impl Scheduler {
                 true
             }
 
-            SchedulerRequest::ScoreSealedTurn {
-                substrate,
-                projection,
-                target,
-                sealed,
-                response_tx,
-            } => {
-                let scores = self.score_sealed_turn(&substrate, &projection, target, &sealed);
-                let _ = response_tx.send(scores);
+            SchedulerRequest::ArenaScan { scan, response_tx } => {
+                let reply = match self.gallery_arena.as_deref() {
+                    Some(arena) => scan.run(arena),
+                    None => scan.no_arena(),
+                };
+                let _ = response_tx.send(reply);
+                true
+            }
+
+            SchedulerRequest::ArenaGroups { response_tx } => {
+                let _ = response_tx.send(self.gallery_arena.as_deref().map(GalleryArena::n_groups));
                 true
             }
 
@@ -5446,112 +5447,6 @@ impl Scheduler {
                     self.pending_section_quantize
                         .retain(|p| p.section_id != id || !p.substrate.is(&conversation));
                 }
-                true
-            }
-
-            SchedulerRequest::PrimingProjection {
-                sequence_id,
-                section_ids,
-                response_tx,
-            } => {
-                let result = if section_ids.is_empty() {
-                    Ok(())
-                } else {
-                    // Elevate priming sections cold→hot before
-                    // `apply_projection`.  Cold-marker sections
-                    // restored from the redo log have `hot = None`
-                    // until elevate lifts them; without this call
-                    // `inject_sealed_section` would warn-and-skip
-                    // and the primed slot would be missing every
-                    // persisted section from the schema's prelude.
-                    // Load-phase VRAM gate: elevation scatters sealed KV into
-                    // fresh GPU arenas BEFORE the projection attends over it — a
-                    // "load KV into VRAM before attention" phase. The freed-float
-                    // free-list is the destination of that load, so relieve first
-                    // (compress/evict make real headroom) rather than allocating
-                    // straight into space the load will consume. Without this the
-                    // elevation had no scheduler pressure gate at all — only the
-                    // per-arena `vram_has_room` check, which OOMs per-arena instead
-                    // of shedding ahead of the load.
-                    if self.vram_under_pressure_for(prefill::VramPhase::Load) {
-                        self.relieve_vram_pressure(
-                            "elevate",
-                            prefill::VramPhase::Load,
-                            prefill::ReliefNeed::Now,
-                        );
-                    }
-                    if let Some(conversation) = self.slot_conversations.get(&sequence_id).cloned() {
-                        let backings = self.session.backings().to_vec();
-                        let device = self.session.device().clone();
-                        let main_stream = match &device {
-                            Device::Cuda(d) => d.cuda_stream(),
-                            _ => panic!("scheduler: requires a CUDA device"),
-                        };
-                        let no_turns: Vec<TurnKey> = Vec::new();
-                        if let Err(e) = elevate_to_hot(
-                            &conversation,
-                            &backings,
-                            &device,
-                            &main_stream,
-                            &mut self.elevate_pinned_scratch,
-                            &mut self.cold_load_stager,
-                            &section_ids,
-                            &no_turns,
-                        ) {
-                            tracing::warn!(
-                                "priming elevate failed for slot {sequence_id}: {e} — \
-                                 apply_projection will warn-and-skip cold sections"
-                            );
-                        }
-                    }
-                    let segments: Vec<ProjectionSegment> = section_ids
-                        .iter()
-                        .map(|&id| {
-                            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id)))
-                        })
-                        .collect();
-                    let r = self.apply_projection(sequence_id, BlockCount(0), &segments);
-                    // End-of-build boundary: every section the schema
-                    // ingested earlier in `new_with_projection` is now
-                    // installed in `substrate.section.hot` (native) and
-                    // has been injected into this slot's block table.
-                    // The slot's `Arc<ChunkGid>` refs keep the native
-                    // chunks alive even after we swap the residence's
-                    // hot to its quantized form, so swap is safe here.
-                    // Any conversation forked from this point on will
-                    // re-project sections fresh from `section.hot` and
-                    // see the quantized form.
-                    if r.is_ok() && !self.pending_section_quantize.is_empty() {
-                        if let Some(turn_policy) = self.session.compression_policy() {
-                            if let Some(conversation) =
-                                self.slot_conversations.get(&sequence_id).cloned()
-                            {
-                                let boundary_policy = Self::section_compression_policy_boundary();
-                                let member_policy =
-                                    Self::section_compression_policy_member(&turn_policy);
-                                if let Err(e) = self.quantize_pending_sections(
-                                    &conversation,
-                                    &boundary_policy,
-                                    &member_policy,
-                                ) {
-                                    tracing::warn!(
-                                        "post-priming section quantize drain failed: {e:?}"
-                                    );
-                                }
-                            } else {
-                                // The pending sections stay queued under their
-                                // own substrate and drain at its next seal.
-                                tracing::warn!(
-                                    "post-priming drain: no conversation handle for slot {sequence_id}"
-                                );
-                            }
-                        } else {
-                            self.pending_section_quantize.clear();
-                        }
-                    }
-                    r
-                };
-                let _ = response_tx.send(result);
                 true
             }
 
@@ -10105,8 +10000,8 @@ impl Scheduler {
                 // the queue was ingested earlier in this conversation
                 // build with its native (prefill-output) K/V installed in
                 // `substrate.section.hot`, and every reader up to this
-                // point — priming projection's top-k selection, this
-                // turn's prefill kernel attending back over the injected
+                // point — this turn's projection's top-k selection, its
+                // prefill kernel attending back over the injected
                 // sections — has consumed that native form.  This
                 // turn-seal boundary is the first moment where no
                 // in-flight operation depends on those native bytes any
@@ -10126,8 +10021,7 @@ impl Scheduler {
                         // recorded above and do not depend on section
                         // requantization — a quantize failure (e.g. a model
                         // whose head_dim the palette4 path doesn't support)
-                        // must not abort the turn seal. Same handling as the
-                        // post-priming drain site.
+                        // must not abort the turn seal.
                         if let Err(e) = self.quantize_pending_sections(
                             &conversation,
                             &boundary_policy,
@@ -10481,9 +10375,9 @@ impl Scheduler {
                     }
                 });
                 // Queue the section for quantization at the next safe
-                // boundary (end of `PrimingProjection` for sections
-                // ingested during a base-conv build, or `SealAction::
-                // Turn` for sections ingested mid-conversation).  Until
+                // boundary — the next `SealAction::Turn` on this substrate,
+                // whether the section was ingested during a conversation's
+                // build or mid-conversation.  Until
                 // the drain runs, `mark_section_pending_quantize` keeps
                 // the persistence thread from writing the interim
                 // native bytes to disk — otherwise the cold tier would
@@ -10492,7 +10386,7 @@ impl Scheduler {
                 // inconsistent state.
                 //
                 // Sections **must** be left in their native form for the
-                // in-flight build: priming projection reads
+                // in-flight build: the first turn's projection reads
                 // `substrate.section.hot` to pick top-k tools, the user
                 // prefill kernel attends back over those injected K/V
                 // to compute the prompt's own hidden states.  If we
@@ -12013,7 +11907,7 @@ impl Scheduler {
         // resident gallery arena, per-file z) — one launch for the whole group,
         // numerically equivalent to the CPU per-file scan up to fast-math ULP /
         // same ranking (see `examples/gpu_belief_parity.rs`). Seal-time learning
-        // runs the same launch here (`SchedulerRequest::ScoreSealedTurn`), so the
+        // runs the same launches here (`SchedulerRequest::ArenaScan`), so the
         // levels are learned from the scores they later normalize.
         let (mut projection_scores, group_candidates) = policy.substrate.score_beliefs(
             schema,
@@ -12023,7 +11917,7 @@ impl Scheduler {
             // A live reprojection only READS the levels; the turn teaches them
             // once, at seal, where its tags are known.
             Observe::No,
-            self.gallery_arena.as_deref(),
+            self.gallery_arena.as_deref().map(|a| a as &dyn BeliefArena),
         );
         scan_span.end();
         let score_us = t_score.elapsed().as_micros() as u64;

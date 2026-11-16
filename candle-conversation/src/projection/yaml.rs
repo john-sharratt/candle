@@ -90,7 +90,7 @@ use super::schema::{
 };
 use super::swap_cap::DEFAULT_MAX_SWAPS;
 use crate::summary_tree::scope::Scope;
-use crate::working_set::WorkingSetConfig;
+use crate::working_set::{TypeShareSpec, TypeShares, WorkingSetConfig};
 
 /// Sequential SectionId allocator. Ids are globally unique across the whole
 /// schema even though names are per-layer scoped.
@@ -972,6 +972,20 @@ struct YamlWorkingSet {
     /// What the slot keeps back for what arrives between two projections:
     /// one cadence of decoded tokens or one prefill chunk.
     reserve_tokens: usize,
+    /// The most of `budget_tokens` each type of document may hold; none when
+    /// absent.
+    #[serde(default)]
+    type_shares: Vec<YamlTypeShare>,
+}
+
+/// One `working_set.type_shares` entry.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlTypeShare {
+    name: String,
+    /// Regexes over a unit's subject; the first type one matches is its type.
+    files: Vec<String>,
+    max_share: f32,
 }
 
 // ── Conversion ────────────────────────────────────────────────────────────────
@@ -1068,6 +1082,12 @@ fn parse_working_set(
             invalid("max_admits must be >= 1: a cap of 0 admits no conversation, ever")
         })?,
     };
+    let specs: Vec<TypeShareSpec> = yw
+        .type_shares
+        .iter()
+        .map(|t| (t.name.clone(), t.files.clone(), t.max_share))
+        .collect();
+    let type_shares = TypeShares::new(&specs).map_err(|e| invalid(&format!("type_shares: {e}")))?;
     Ok(Some(WorkingSetConfig {
         budget_tokens: yw.budget_tokens,
         folder_tokens: yw.folder_tokens,
@@ -1080,6 +1100,7 @@ fn parse_working_set(
         release_on: yw.release_on.clone(),
         max_admits,
         reserve_tokens: yw.reserve_tokens,
+        type_shares,
     }))
 }
 

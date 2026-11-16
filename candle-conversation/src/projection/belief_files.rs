@@ -24,10 +24,10 @@ use super::schema::GroupSchema;
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::streams::StreamId;
 use crate::provenance::chunk_exclusion::{uncut, ChunkExclusion};
-use crate::provenance::gallery_arena::{GroupSet, Holder, PagedSegment, PagedWindow};
+use crate::provenance::gallery_arena::{BeliefArena, GroupSet, Holder, PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
-    score_slots_grouped, score_slots_weighted, FusionMode, GalleryArena, SigWindow, WideQSig,
+    score_slots_grouped, score_slots_weighted, FusionMode, SigWindow, WideQSig,
 };
 use crate::substrate::calibration_record::CalRecord;
 use crate::substrate::Substrate;
@@ -511,7 +511,7 @@ pub(crate) fn scan_file_scans(
     files: &[FileScan],
     group: &GroupSchema,
     probes: &[&[WideQSig]],
-    arena: Option<&GalleryArena>,
+    arena: Option<&dyn BeliefArena>,
     holder: Holder,
 ) -> Vec<Vec<(Vec<f32>, Vec<f32>)>> {
     let weights = &group.policy.layer_weights;

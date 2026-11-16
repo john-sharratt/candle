@@ -9,7 +9,11 @@
 //! turns that carry the collection's tags.
 //!
 //! A turn's tags are its gather tags: a working-set mark puts no turn in a
-//! scope (`working_set::marks`), so a turn carrying only marks is not here.
+//! scope (`working_set::marks`). A turn with no gather tag is dialogue, and the
+//! untagged collections — the journal, a conversation's own memory — draw from
+//! exactly those, so they are kept as a set of their own: a walk of every turn
+//! to find them spent ~440 ms of a ~575 ms seal scan on BlackWorld's substrate
+//! (2026-11-16), where ingest turns outnumber dialogue many times over.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -23,15 +27,19 @@ use crate::working_set::marks::gather_tags;
 pub struct TagIndex {
     by_tag: PMap<String, POrdSet<StreamKey>>,
     tags_of: PMap<StreamKey, Arc<Vec<String>>>,
+    /// The turns with no gather tag.
+    dialogue: POrdSet<StreamKey>,
 }
 
 impl TagIndex {
     /// `key` is declared a turn with `tags`, replacing whatever it was declared
-    /// with before. A turn with no gather tag leaves the index.
+    /// with before: under each of its gather tags, or among the dialogue when
+    /// it has none.
     pub fn set(&mut self, key: StreamKey, tags: &[String]) {
         self.remove(key);
         let gather: Vec<String> = gather_tags(tags).cloned().collect();
         if gather.is_empty() {
+            self.dialogue.insert(key);
             return;
         }
         for tag in &gather {
@@ -42,6 +50,9 @@ impl TagIndex {
 
     /// `key` is no longer declared a turn.
     pub fn remove(&mut self, key: StreamKey) {
+        if self.dialogue.remove(&key).is_some() {
+            return;
+        }
         let Some(tags) = self.tags_of.remove(&key) else {
             return;
         };
@@ -70,6 +81,11 @@ impl TagIndex {
                 all.into_iter().collect()
             }
         }
+    }
+
+    /// Every turn with no gather tag, in key order.
+    pub fn dialogue(&self) -> impl Iterator<Item = StreamKey> + '_ {
+        self.dialogue.iter().copied()
     }
 }
 
@@ -126,10 +142,35 @@ mod tests {
         idx.set(key(1), &tags(&["working_set:release"]));
         assert_eq!(idx.with_any(&tags(&["code"])), Vec::<StreamKey>::new());
         assert!(idx.by_tag.is_empty() && idx.tags_of.is_empty());
+        assert_eq!(idx.dialogue().collect::<Vec<_>>(), vec![key(1)]);
 
         idx.set(key(2), &tags(&["tool"]));
         idx.remove(key(2));
         idx.remove(key(9));
         assert_eq!(idx.with_any(&tags(&["tool"])), Vec::<StreamKey>::new());
+    }
+
+    /// **A turn with no gather tag is dialogue, and only such a turn**, in key
+    /// order; tagging it moves it out, untagging it moves it back, and removing
+    /// it takes it from wherever it was.
+    #[test]
+    fn a_turn_with_no_gather_tag_is_dialogue() {
+        let mut idx = TagIndex::default();
+        idx.set(key(7), &[]);
+        idx.set(key(3), &tags(&["working_set:lock:4"]));
+        idx.set(key(5), &tags(&["tool"]));
+        assert_eq!(idx.dialogue().collect::<Vec<_>>(), vec![key(3), key(7)]);
+
+        idx.set(key(7), &tags(&["code"]));
+        assert_eq!(idx.dialogue().collect::<Vec<_>>(), vec![key(3)]);
+        assert_eq!(idx.with_any(&tags(&["code"])), vec![key(7)]);
+
+        idx.set(key(5), &[]);
+        assert_eq!(idx.dialogue().collect::<Vec<_>>(), vec![key(3), key(5)]);
+        assert_eq!(idx.with_any(&tags(&["tool"])), Vec::<StreamKey>::new());
+
+        idx.remove(key(3));
+        idx.remove(key(5));
+        assert_eq!(idx.dialogue().count(), 0);
     }
 }

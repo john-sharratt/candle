@@ -11,17 +11,17 @@
 //! Loads Qwen3-30B-A3B against a fresh empty workspace, installs the
 //! production tool catalog, and verifies that:
 //!
-//!  1. After `base_conv` build returns, every section's hot bytes in
-//!     `substrate.section.hot` are in the quantized byte-size range
-//!     (i.e. the scheduler's `PrimingProjection`-end drain ran and
-//!     swapped each residence's native bytes for their quantized form),
-//!     and
-//!
-//!  2. A subsequent user turn produces a coherent response — not the
+//!  1. The first user turn — projected over the sections in their
+//!     native form — produces a coherent response, not the
 //!     `"\" {\" \"; 00 //1 \"1\"…"` gibberish that earlier
 //!     asynchronous quantize paths produced when `substrate.section.hot`
-//!     was mutated while priming projection / prefill kernels were
-//!     still reading it.
+//!     was mutated while the projection / prefill kernels were still
+//!     reading it, and
+//!
+//!  2. After that turn seals, every section's hot bytes in
+//!     `substrate.section.hot` are in the quantized byte-size range
+//!     (i.e. the scheduler's turn-seal drain ran and swapped each
+//!     residence's native bytes for their quantized form).
 //!
 //! See `candle-conversation/src/scheduler/mod.rs::quantize_pending_sections`
 //! for the production code path this test guards.
@@ -131,13 +131,12 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
     (engine, base_conv)
 }
 
-/// End-to-end check: the scheduler's `SealAction::Section →
-/// PrimingProjection drain` path leaves every section in its quantized
-/// form by the time `base_conv` build returns, *and* a subsequent
-/// user turn against those quantized sections produces a coherent
-/// response.
+/// End-to-end check: the first user turn after the build produces a
+/// coherent response, *and* the scheduler's `SealAction::Section →
+/// turn-seal drain` path leaves every section in its quantized form
+/// once that turn has sealed.
 ///
-/// Earlier asynchronous attempts (persistence-thread Phase 2.5,
+/// Earlier asynchronous attempts (persistence-thread drain,
 /// inline-at-section-seal) corrupted the prompt's K/V across 48 layers
 /// of attention and produced JSON-fragment gibberish; this test guards
 /// against regressing back to that path.
@@ -149,6 +148,33 @@ fn section_quantize_end_to_end() {
     eprintln!("fresh workspace = {}", workspace.display());
 
     let (engine, base_conv) = load_engine_and_base(&workspace);
+
+    // Coherence check.  The exact wording shifts with the policy
+    // (small K-side noise can nudge the model's tool selection), so
+    // we don't pin a substring.  We reject the failure mode the
+    // broken paths exhibited: short outputs full of unbalanced quotes,
+    // `//` markers, and `\\\\` runs.
+    let timeline_id = base_conv.timeline_id();
+    let mut conv = base_conv.fork_resuming(timeline_id).expect("fork");
+    let response = conv
+        .send_turn("What's the current date and time?")
+        .expect("send_turn");
+    let text = response.text.clone();
+    conv.close().expect("close");
+    eprintln!("response: {:?}", text);
+    assert!(
+        text.len() >= 20,
+        "response too short to be coherent: {:?}",
+        text
+    );
+    let gibberish_score =
+        text.matches("//").count() + text.matches("\\\\").count() + text.matches("\"\"").count();
+    assert!(
+        gibberish_score < 3,
+        "response shows the broken-quantize-path failure pattern (gibberish_score={}): {:?}",
+        gibberish_score,
+        text
+    );
 
     // Native F16 chunks for Qwen3-30B-A3B (4 KV heads × head_dim 128 ×
     // CHUNK_SIZE 32 × 2 bytes × {K, V}) land at ~98 KiB.  Boundary
@@ -176,45 +202,18 @@ fn section_quantize_end_to_end() {
         }
     }
     eprintln!(
-        "post-build sections: total={}, quantized={}, native={}",
+        "post-turn sections: total={}, quantized={}, native={}",
         section_ids.len(),
         quantized_count,
         native_count
     );
     assert_eq!(
         native_count, 0,
-        "every section must be quantized post-build, but {native_count} are still native",
+        "every section must be quantized once the first turn seals, but {native_count} are \
+         still native",
     );
     assert!(
         quantized_count > 0,
         "expected at least one quantized section",
-    );
-    drop(view);
-
-    // Coherence check.  The exact wording shifts with the policy
-    // (small K-side noise can nudge the model's tool selection), so
-    // we don't pin a substring.  We reject the failure mode the
-    // broken paths exhibited: short outputs full of unbalanced quotes,
-    // `//` markers, and `\\\\` runs.
-    let timeline_id = base_conv.timeline_id();
-    let mut conv = base_conv.fork_resuming(timeline_id).expect("fork");
-    let response = conv
-        .send_turn("What's the current date and time?")
-        .expect("send_turn");
-    let text = response.text.clone();
-    conv.close().expect("close");
-    eprintln!("response: {:?}", text);
-    assert!(
-        text.len() >= 20,
-        "response too short to be coherent: {:?}",
-        text
-    );
-    let gibberish_score =
-        text.matches("//").count() + text.matches("\\\\").count() + text.matches("\"\"").count();
-    assert!(
-        gibberish_score < 3,
-        "response shows the broken-quantize-path failure pattern (gibberish_score={}): {:?}",
-        gibberish_score,
-        text
     );
 }

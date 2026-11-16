@@ -197,3 +197,36 @@ memory (BlackWorld, 2026-11-16).
 tombstoned, absent), holder (`shared`, `conversation`) and layer/group. After
 a sweep, tombstoned and absent rows hold only pinned turns, and conversation
 rows only the loaded conversations' turns.
+
+## 7. One scan thread, and scans from elsewhere
+
+The arena has exactly one scan thread, the scheduler's wave thread. A re-seal
+frees a turn's old pages on the grounds that no other scan can hold a pin on
+them, uploads and page moves are ordered on the device's stream, and a cached
+index's arrays are read by the next scan that reuses it — none of which holds
+with a second thread scanning on a stream of its own.
+
+A belief scan, though, is mostly host work: each collection's gallery and each
+turn group's files are assembled from the substrate, and what the launches
+return is normalized and folded into the backgrounds. The seal scan — every
+sealed turn's, the once-per-turn learning point — held the wave thread ~575 ms
+a turn on BlackWorld (2026-11-16), all but ~50 ms of it that host work. So a
+scan that runs elsewhere reaches the arena through `BeliefArena`, the four
+calls a belief scan makes: the arena implements it in place, and
+`scheduler::RemoteArena` implements it by sending each launch to the wave
+thread as an owned `HeldScan` (`SchedulerRequest::ArenaScan`) and waiting for
+its answer. A held launch is the segments' turns as shared signature blobs — a
+reference count each, not a copy — so the wave thread runs exactly the launch
+the scan built. The launch's share of the arena split (index, kernel,
+readback) comes back with its answer and is counted on the scanning thread, so
+the wave thread's own scans are not credited with it.
+
+The seal scan runs this way on the sealing conversation's thread
+(`Sequence::last_turn_belief_scores`). A live reprojection scans on the wave
+thread itself, with the arena in place.
+
+The untagged collections — the journal, a conversation's memory — draw from
+dialogue turns, which the substrate indexes as it indexes the tagged turns
+(`substrate::tag_index`), so their gallery walks only those: walking every turn
+to find them was ~440 ms of each assembly, paid by the seal scan and by the
+first reprojection after every seal.

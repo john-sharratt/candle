@@ -3,6 +3,7 @@
 use std::num::NonZeroUsize;
 
 use super::state::Limits;
+use super::type_shares::TypeShares;
 
 /// The fresh score of a full-strength hit — the top of the normalized band a
 /// reprojection scores a file on.
@@ -52,6 +53,10 @@ pub struct WorkingSetConfig {
     /// slot itself is the engine's trained window
     /// (`docs/hit_driven_projection.md` §4).
     pub reserve_tokens: usize,
+    /// The most of `budget_tokens` each type of document may hold
+    /// (`docs/zend_working_set.md` §4.10); a unit of no declared type is
+    /// unbounded.
+    pub type_shares: TypeShares,
 }
 
 /// The window a working set fills, and why it left the trained one.
@@ -144,6 +149,7 @@ mod tests {
             release_on: vec!["write".into(), "file_edit".into()],
             max_admits: NonZeroUsize::new(2).unwrap(),
             reserve_tokens: 16_384,
+            type_shares: TypeShares::default(),
         }
     }
 

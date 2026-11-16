@@ -63,7 +63,7 @@ use crate::persistence::{
 };
 use crate::projection::adaptive::attention_mass;
 use crate::provenance::gallery_arena::{
-    scan_split, GroupSet, Holder, Keep, PagedSegment, PagedWindow,
+    scan_split, BeliefArena, GroupSet, Holder, Keep, PagedSegment, PagedWindow,
 };
 use crate::provenance::heads_per_group;
 use crate::provenance::{
@@ -957,11 +957,11 @@ impl Conversation {
         let mut windows: Vec<SigWindow> = Vec::new();
         let mut slots: Vec<usize> = Vec::new();
         let mut sids: Vec<StreamId> = Vec::new();
-        // A tagged collection admits only turns carrying its tags, which the
-        // substrate indexes by tag; an untagged one admits dialogue, which is
-        // every other turn, so it walks them all.
+        // A tagged collection admits only turns carrying its tags, and an
+        // untagged one only dialogue — the turns carrying none — and the
+        // substrate indexes both, so neither walks the turns it would refuse.
         let streams: Box<dyn Iterator<Item = TurnStream<'_>>> = if tags.is_empty() {
-            Box::new(sub.all_turn_streams())
+            Box::new(sub.dialogue_turn_streams())
         } else {
             Box::new(sub.tagged_turn_streams(tags))
         };
@@ -1183,7 +1183,7 @@ impl Conversation {
         probe: &[WideQSig],
         probe_q: Option<&[WideQSig]>,
         observe: Observe<'_>,
-        arena: Option<&GalleryArena>,
+        arena: Option<&dyn BeliefArena>,
     ) -> ProjectionScores {
         let mut scores = ProjectionScores::new();
         if probe.is_empty() {
@@ -1631,7 +1631,7 @@ impl Conversation {
         probe: &[WideQSig],
         probe_q: Option<&[WideQSig]>,
         observe: Observe<'_>,
-        arena: Option<&GalleryArena>,
+        arena: Option<&dyn BeliefArena>,
     ) -> (ProjectionScores, Vec<(GroupId, Vec<(TurnKey, f32)>)>) {
         let mut scores = ProjectionScores::new();
         let mut candidates: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
@@ -1774,11 +1774,8 @@ impl Conversation {
         }
         let mut probes: Vec<(u64, u32, Vec<WideQSig>)> = {
             let sub = self.inner.read();
-            sub.all_turn_streams()
+            sub.dialogue_turn_streams()
                 .filter_map(|turn| {
-                    if !is_dialogue(&turn.decl.tags) {
-                        return None;
-                    }
                     let sig = turn
                         .runtime
                         .wide_q_sigs
@@ -1830,6 +1827,7 @@ impl Conversation {
             tags: &[],
             source: warm.source,
         };
+        let arena = arena.map(|a| a as &dyn BeliefArena);
         let _ =
             self.score_belief_collections(&schema.system_prompt, &warm.probe, None, observe, arena);
         let mut throwaway = ProjectionScores::new();
@@ -2457,7 +2455,13 @@ impl Conversation {
                 None => files.clone(),
             };
             let probe_refs: Vec<&[WideQSig]> = at.iter().map(|&p| probes[p].2).collect();
-            let out = scan_file_scans(&without, group, &probe_refs, arena, holder);
+            let out = scan_file_scans(
+                &without,
+                group,
+                &probe_refs,
+                arena.map(|a| a as &dyn BeliefArena),
+                holder,
+            );
             for (&p, per_file) in at.iter().zip(out) {
                 scanned[p] = per_file;
             }
@@ -2508,7 +2512,7 @@ impl Conversation {
         probe_q: Option<&[WideQSig]>,
         scores: &mut ProjectionScores,
         observe: Observe<'_>,
-        arena: Option<&GalleryArena>,
+        arena: Option<&dyn BeliefArena>,
     ) -> Vec<(GroupId, Vec<(TurnKey, f32)>)> {
         let mut per_group: Vec<(GroupId, Vec<(TurnKey, f32)>)> = Vec::new();
         if probe.is_empty() {

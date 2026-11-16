@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
+use super::type_shares::TypeCap;
 use crate::projection::{HitMomentum, HitsConfig, TimelineId, WorkingSetShare};
 
 /// How much stronger a newcomer must be than the provenance it dislodges.
@@ -53,6 +54,10 @@ pub struct Candidate {
     /// The share of the budget it draws on; `None` when it belongs to no
     /// working-set group.
     pub share: Option<WorkingSetShare>,
+    /// The type of document it is and that type's cap
+    /// ([`super::TypeShares::classify`]); `None` for one of no declared type,
+    /// which is unbounded.
+    pub kind: Option<TypeCap>,
 }
 
 /// One member of the sequence.
@@ -61,6 +66,7 @@ struct Member {
     timeline: TimelineId,
     tokens: usize,
     share: WorkingSetShare,
+    kind: Option<TypeCap>,
     locked: bool,
 }
 
@@ -237,7 +243,9 @@ impl WorkingSet {
     /// this order exists for, and its content is in context wherever it sits.
     /// A newcomer enters just before the insertion point, on top of the
     /// voluntary members: it dislodges nothing. A lock that would take the
-    /// locks past `lock_tokens` is refused and the call runs for real.
+    /// locks past `lock_tokens` is refused and the call runs for real. A lock
+    /// is never refused for its type's share — the model asked for it — but
+    /// it counts toward that share, so provenance of its type makes room.
     pub fn lock(
         &mut self,
         timeline: TimelineId,
@@ -262,6 +270,7 @@ impl WorkingSet {
                 timeline,
                 tokens,
                 share,
+                kind: candidate.kind,
                 locked: true,
             },
         );
@@ -271,7 +280,13 @@ impl WorkingSet {
     /// Put back a lock the conversation's history says was served, whatever it
     /// costs now: the model was told it has this content, and a restart must
     /// not quietly take it away.
-    pub fn restore_lock(&mut self, timeline: TimelineId, tokens: usize, share: WorkingSetShare) {
+    pub fn restore_lock(
+        &mut self,
+        timeline: TimelineId,
+        tokens: usize,
+        share: WorkingSetShare,
+        kind: Option<TypeCap>,
+    ) {
         if let Some(at) = self.position(timeline) {
             self.members[at].locked = true;
             return;
@@ -282,6 +297,7 @@ impl WorkingSet {
                 timeline,
                 tokens,
                 share,
+                kind,
                 locked: true,
             },
         );
@@ -313,11 +329,14 @@ impl WorkingSet {
             }
             let entry = self.momentum.entry(timeline).or_insert(0.0);
             *entry = entry.max(momentum);
-            if self.room_for(tokens, share, limits, &|_| false).is_none() {
+            if self
+                .room_for(tokens, share, candidate.kind, limits, &|_| false)
+                .is_none()
+            {
                 refused.push(timeline);
                 continue;
             }
-            self.admit(timeline, tokens, share);
+            self.admit(timeline, tokens, share, candidate.kind);
         }
         refused
     }
@@ -412,15 +431,16 @@ impl WorkingSet {
             .map(|(i, _)| i)
             .collect();
         self.evict(&leaving);
-        if let Some(over) = self.room_for(0, WorkingSetShare::Remainder, limits, &|_| true) {
-            self.evict(&over);
+        for share in [
+            WorkingSetShare::Remainder,
+            WorkingSetShare::Folders,
+            WorkingSetShare::Guidance,
+        ] {
+            if let Some(over) = self.room_for(0, share, None, limits, &|_| true) {
+                self.evict(&over);
+            }
         }
-        if let Some(over) = self.room_for(0, WorkingSetShare::Folders, limits, &|_| true) {
-            self.evict(&over);
-        }
-        if let Some(over) = self.room_for(0, WorkingSetShare::Guidance, limits, &|_| true) {
-            self.evict(&over);
-        }
+        self.trim_types(limits);
 
         let mut newcomers: Vec<(TimelineId, f32)> = self
             .momentum
@@ -439,6 +459,7 @@ impl WorkingSet {
             let Some(Candidate {
                 tokens: Some(tokens),
                 share: Some(share),
+                kind,
             }) = candidate(timeline)
             else {
                 continue;
@@ -447,9 +468,9 @@ impl WorkingSet {
                 continue;
             }
             let beaten = |weaker: f32| weaker * DISLODGE_MARGIN < strength;
-            if let Some(victims) = self.room_for(tokens, share, limits, &beaten) {
+            if let Some(victims) = self.room_for(tokens, share, kind, limits, &beaten) {
                 self.evict(&victims);
-                self.admit(timeline, tokens, share);
+                self.admit(timeline, tokens, share, kind);
                 admitted += 1;
             }
         }
@@ -465,35 +486,97 @@ impl WorkingSet {
 
     /// Enter `timeline` as provenance at the insertion point, which moves past
     /// it.
-    fn admit(&mut self, timeline: TimelineId, tokens: usize, share: WorkingSetShare) {
+    fn admit(
+        &mut self,
+        timeline: TimelineId,
+        tokens: usize,
+        share: WorkingSetShare,
+        kind: Option<TypeCap>,
+    ) {
         self.members.insert(
             self.insert_at,
             Member {
                 timeline,
                 tokens,
                 share,
+                kind,
                 locked: false,
             },
         );
         self.insert_at += 1;
     }
 
+    /// Tokens the budget's members of type `id` hold — the locks among them
+    /// too, which are never dislodged for it but take their share of it.
+    /// Guidance is a pool apart and holds no type's share.
+    fn type_tokens(&self, id: u8) -> usize {
+        self.members
+            .iter()
+            .filter(|m| m.share != WorkingSetShare::Guidance && m.kind.is_some_and(|k| k.id == id))
+            .map(|m| m.tokens)
+            .sum()
+    }
+
+    /// Bring every type back under its share: while one holds more than its
+    /// cap, its weakest voluntary member leaves — a lock of its type joined it,
+    /// or a lock was released into it. One whose locks alone pass the cap keeps
+    /// them and loses every voluntary member.
+    fn trim_types(&mut self, limits: Limits) {
+        let mut kinds: Vec<TypeCap> = self
+            .members
+            .iter()
+            .filter(|m| m.share != WorkingSetShare::Guidance)
+            .filter_map(|m| m.kind)
+            .collect();
+        kinds.sort_by_key(|k| k.id);
+        kinds.dedup_by_key(|k| k.id);
+        for kind in kinds {
+            let cap = kind.tokens(limits.budget_tokens);
+            while self.type_tokens(kind.id) > cap {
+                let weakest = self
+                    .members
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| {
+                        !m.locked
+                            && m.share != WorkingSetShare::Guidance
+                            && m.kind.is_some_and(|k| k.id == kind.id)
+                    })
+                    .map(|(i, m)| (i, self.score_of(m.timeline).unwrap_or(0.0)))
+                    .min_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)));
+                match weakest {
+                    Some((i, _)) => self.evict(&[i]),
+                    None => break,
+                }
+            }
+        }
+    }
+
     /// The voluntary members that must leave for `tokens` more voluntary
-    /// tokens of `share` to fit, weakest first among those `may_dislodge`
-    /// allows (judged on their strength, [`Self::score_of`]) — or `None` when no such set makes it
-    /// fit. On a momentum tie the one nearest the insertion point goes first:
-    /// it moves the fewest members on its left. Locks count against nothing
-    /// here; they sit on top. Guidance is a pool apart: it is bounded by
-    /// `guidance_tokens` alone and dislodges only guidance, and nothing else
-    /// dislodges it.
+    /// tokens of `share`, of type `kind`, to fit, weakest first among those
+    /// `may_dislodge` allows (judged on their strength, [`Self::score_of`]) —
+    /// or `None` when no such set makes it fit. On a momentum tie the one
+    /// nearest the insertion point goes first: it moves the fewest members on
+    /// its left. Locks count against nothing here but their type's share; they
+    /// sit on top. Guidance is a pool apart: it is bounded by `guidance_tokens`
+    /// alone and dislodges only guidance, and nothing else dislodges it. A
+    /// typed newcomer its type has no room for dislodges only its own type,
+    /// as a folder past `folder_tokens` dislodges only folders — so a burst of
+    /// strong documents cannot take the room the code would have.
     fn room_for(
         &self,
         tokens: usize,
         share: WorkingSetShare,
+        kind: Option<TypeCap>,
         limits: Limits,
         may_dislodge: &dyn Fn(f32) -> bool,
     ) -> Option<Vec<usize>> {
         let guidance = share == WorkingSetShare::Guidance;
+        let kind = kind.filter(|_| !guidance);
+        let of_kind = |m: &Member| kind.is_some_and(|k| m.kind.is_some_and(|mk| mk.id == k.id));
+        let mut typed: usize = kind.map_or(0, |k| self.type_tokens(k.id));
+        let type_bound =
+            |typed: usize| kind.is_some_and(|k| typed + tokens > k.tokens(limits.budget_tokens));
         let in_pool = |m: &Member| !m.locked && (m.share == WorkingSetShare::Guidance) == guidance;
         let mut total: usize = self
             .members
@@ -527,17 +610,22 @@ impl WorkingSet {
         loop {
             let over_total = total + tokens > ceiling;
             let over_folders = folder_bound(folders);
-            if !over_total && !over_folders {
+            let over_type = type_bound(typed);
+            if !over_total && !over_folders && !over_type {
                 return Some(victims);
             }
             let next = pool.iter().position(|&(i, _)| {
-                !over_folders || self.members[i].share == WorkingSetShare::Folders
+                let m = &self.members[i];
+                (!over_folders || m.share == WorkingSetShare::Folders) && (!over_type || of_kind(m))
             })?;
             let (i, _) = pool.remove(next);
             let m = &self.members[i];
             total -= m.tokens;
             if m.share == WorkingSetShare::Folders {
                 folders -= m.tokens;
+            }
+            if of_kind(m) {
+                typed -= m.tokens;
             }
             victims.push(i);
         }
@@ -579,8 +667,14 @@ mod tests {
         }
     }
 
+    /// Documents may hold a fifth of the budget.
+    const DOCS: TypeCap = TypeCap {
+        id: 0,
+        per_mille: 200,
+    };
+
     /// A 100-token file, except 9 (no total) and 8 (2,000 tokens); 50–59 are
-    /// 100-token folders, 60–69 100-token guides.
+    /// 100-token folders, 60–69 100-token guides, 70–79 100-token documents.
     fn info(timeline: TimelineId) -> Option<Candidate> {
         let raw = timeline.raw();
         Some(Candidate {
@@ -594,6 +688,7 @@ mod tests {
                 60..70 => GUIDES,
                 _ => FILES,
             }),
+            kind: (70..80).contains(&raw).then_some(DOCS),
         })
     }
 
@@ -823,6 +918,7 @@ mod tests {
         let nowhere = Candidate {
             tokens: Some(100),
             share: None,
+            kind: None,
         };
         assert_eq!(ws.lock(tl(7), nowhere, limits(10_000)), Err(Refusal::Gone));
         assert!(ws.members().is_empty());
@@ -1031,14 +1127,118 @@ mod tests {
     #[test]
     fn a_restored_lock_ignores_the_budget() {
         let mut ws = WorkingSet::default();
-        ws.restore_lock(tl(8), 2_000, FILES);
-        ws.restore_lock(tl(1), 100, FILES);
+        ws.restore_lock(tl(8), 2_000, FILES, None);
+        ws.restore_lock(tl(1), 100, FILES, None);
         assert_eq!(
             order(&ws),
             vec![1, 8],
             "restored in order, each before the last"
         );
         assert_eq!(ws.tokens(), 2_100);
+    }
+
+    /// **Documents enter up to their share, then the code does**: three strong
+    /// documents and two weaker files against a 1,000-token budget whose
+    /// documents may hold 200. Two documents fill the share; the third, no
+    /// stronger than either, waits; both files enter on the room it left.
+    #[test]
+    fn documents_enter_up_to_their_share_then_code() {
+        let mut ws = WorkingSet::default();
+        observe(
+            &mut ws,
+            &[
+                (70, 900.0),
+                (71, 900.0),
+                (72, 900.0),
+                (1, 300.0),
+                (2, 300.0),
+            ],
+            1_000,
+        );
+        assert_eq!(order(&ws), vec![70, 71, 1, 2]);
+        assert_eq!(
+            ws.momentum_of(tl(72)),
+            Some(900.0),
+            "72 waits as a candidate"
+        );
+        assert_eq!(ws.type_tokens(DOCS.id), 200);
+    }
+
+    /// **A typed newcomer dislodges only its own type**: a far stronger
+    /// document takes the weakest document's place, never the weaker file's.
+    #[test]
+    fn a_strong_document_dislodges_a_document_never_code() {
+        let mut ws = WorkingSet::default();
+        observe(&mut ws, &[(70, 300.0), (71, 400.0), (1, 150.0)], 1_000);
+        assert_eq!(order(&ws), vec![71, 70, 1]);
+        observe(&mut ws, &[(72, 5_000.0)], 1_000);
+        assert_eq!(
+            order(&ws),
+            vec![71, 1, 72],
+            "70, the weakest document, left"
+        );
+    }
+
+    /// **A locked document counts toward the share but is never refused**:
+    /// three locks pass the share, a strong document newcomer then finds no
+    /// room — only locks hold it — and a file still enters.
+    #[test]
+    fn locked_documents_count_toward_the_share_and_are_never_refused() {
+        let mut ws = WorkingSet::default();
+        for raw in [70, 71, 72] {
+            ws.lock(tl(raw), cand(raw), limits(1_000)).unwrap();
+        }
+        assert_eq!(ws.type_tokens(DOCS.id), 300);
+        observe(&mut ws, &[(73, 5_000.0), (1, 200.0)], 1_000);
+        assert_eq!(order(&ws), vec![1, 72, 71, 70]);
+    }
+
+    /// **Released documents are trimmed back to their share**: three locked
+    /// documents released into provenance leave two after the next
+    /// reprojection, and the file beside them stays.
+    #[test]
+    fn released_documents_are_trimmed_back_to_their_share() {
+        let mut ws = WorkingSet::default();
+        observe(&mut ws, &[(1, 900.0)], 1_000);
+        for raw in [70, 71, 72] {
+            ws.lock(tl(raw), cand(raw), limits(1_000)).unwrap();
+        }
+        ws.release(5_000.0);
+        observe(&mut ws, &[], 1_000);
+        let members = order(&ws);
+        assert!(members.contains(&1), "{members:?}");
+        assert_eq!(ws.type_tokens(DOCS.id), 200, "{members:?}");
+        assert_eq!(members.len(), 3, "{members:?}");
+    }
+
+    /// **Seeds keep to the share too**: of three document seeds two enter,
+    /// and the code seed after them.
+    #[test]
+    fn document_seeds_keep_to_the_share() {
+        let mut ws = WorkingSet::default();
+        let seeds: Vec<(TimelineId, Candidate)> =
+            [70, 71, 72, 1].iter().map(|&r| (tl(r), cand(r))).collect();
+        let refused = ws.seed(&seeds, limits(1_000), 1_000.0);
+        assert_eq!(order(&ws), vec![70, 71, 1]);
+        assert_eq!(refused, vec![tl(72)]);
+    }
+
+    /// **A document guide holds no share of the budget**: guidance is its own
+    /// pool, so a typed guide neither counts toward nor is refused by it.
+    #[test]
+    fn a_typed_guide_is_outside_the_share() {
+        let guide_doc = Candidate {
+            tokens: Some(100),
+            share: Some(GUIDES),
+            kind: Some(DOCS),
+        };
+        let mut ws = WorkingSet::default();
+        let seeds: Vec<(TimelineId, Candidate)> =
+            [70, 71].iter().map(|&r| (tl(r), cand(r))).collect();
+        ws.seed(&seeds, limits(1_000), 1_000.0);
+        let refused = ws.seed(&[(tl(60), guide_doc)], limits(1_000), 1_000.0);
+        assert!(refused.is_empty());
+        assert_eq!(ws.type_tokens(DOCS.id), 200, "the guide is not counted");
     }
 
     #[test]

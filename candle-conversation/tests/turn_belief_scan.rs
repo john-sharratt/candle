@@ -12,6 +12,7 @@ use candle_conversation::projection::TurnIndex;
 use candle_conversation::projection::{
     Builder, CollectionWarm, Conversation, GalleryPreload, Observe, ProjectionTarget, TimelineId,
 };
+use candle_conversation::provenance::gallery_arena::BeliefArena;
 use candle_conversation::provenance::{
     encode_wide_sigs, score_slots_weighted, GalleryArena, WideQSig,
 };
@@ -1018,7 +1019,7 @@ fn score_belief_groups_gpu_matches_cpu_and_caches() {
     // The paged gallery arena (folded geometry: wpt 24, 3 groups).
     let arena = candle_conversation::provenance::GalleryArena::new(&device, 24, 3).unwrap();
 
-    let all_scores = |arena: Option<&candle_conversation::provenance::GalleryArena>| {
+    let all_scores = |arena: Option<&dyn BeliefArena>| {
         let mut scores = ProjectionScores::new();
         conv.score_belief_groups(
             &builder.schema().layers[0],

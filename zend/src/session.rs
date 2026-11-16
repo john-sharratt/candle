@@ -182,9 +182,15 @@ pub mod diag;
 mod memory_writer;
 mod replay;
 pub mod restore;
+mod titles;
+
 pub use ask::{AskOutcome, AskSpec};
 pub use replay::{
     RecordedTurn, ReplayOutcome, ReplayReport, ReplaySampling, ReplaySpec, TurnComparison,
+};
+use titles::{
+    clean_title, head_tail_truncate, retitle_prompt, Finished, PendingRetitles, FIRST_HEAD_TOKENS,
+    FIRST_TAIL_TOKENS, TITLER_SYSTEM_PROMPT,
 };
 
 pub const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
@@ -208,6 +214,10 @@ enum TitleJob {
         timeline: TimelineId,
         message: String,
     },
+    /// Title `timeline` again from its latest finished exchange, which waits
+    /// in [`InferenceState::retitles`] — taken when this job starts, so a turn
+    /// that finished since the job was queued is the one it reads.
+    Retitle { timeline: TimelineId },
     /// Stop draining and exit (sent during shutdown to wake an idle worker).
     Shutdown,
 }
@@ -848,6 +858,9 @@ struct InferenceState {
     /// concurrently with main decode, never serialised against the request
     /// path — and drains cleanly on shutdown.
     titler_tx: mpsc::Sender<TitleJob>,
+    /// The re-titles queued and not yet started, one per conversation — see
+    /// [`titles`].
+    retitles: PendingRetitles,
     /// Handle to the titler task, awaited during [`ZendSession::shutdown`]
     /// so any in-flight title turn unwinds before the process exits.
     titler_worker: Mutex<Option<TaskHandle<()>>>,
@@ -979,22 +992,6 @@ struct InferenceState {
     journals: Journals,
 }
 
-// The titler uses this plain system prompt (not the projection schema), so the
-// dialogue `no_think` *section* never applies. Suppression is the `<think>`
-// trigger bound to `ThinkMode::Off` in `generate_one_title`, which is structural
-// and cannot be ignored — see there for why the soft switch is not enough.
-//
-// No `/no_think` here. It read as a system-side switch and was never one: the
-// marker only does anything on a dialect that declares it
-// (`Dialect::thinking_suppression`), this family declares the empty string, and
-// on the families that do declare it, it is honoured from the *user* turn rather
-// than the system prompt. It was prose to every model that ever saw it.
-const TITLER_SYSTEM_PROMPT: &str = "You write short conversation titles. \
-Given the user's first message, reply with a 3-6 word title that captures its topic. \
-No quotes, no period, no preamble — just the title.";
-
-const TITLER_HEAD_TOKENS: usize = 50;
-const TITLER_TAIL_TOKENS: usize = 50;
 // Room for the title plus the empty `<think></think>` Qwen3 still decodes under
 // /no_think (no longer prefilled for free) — the block is stripped afterwards.
 const TITLER_MAX_TOKENS: usize = 24;
@@ -2052,6 +2049,18 @@ impl InferenceState {
                 engine.set_working_set_share(group.id, share);
             }
         }
+        // The types of document the dialogue's working set caps at a share of
+        // its budget, read from the path a `code_reading` unit is of
+        // (`docs/zend_working_set.md` §4.10). One dialogue layer declares the
+        // working set.
+        if let Some(ws) = proj_builder_refresh
+            .schema()
+            .layers
+            .iter()
+            .find_map(|l| l.working_set.as_ref())
+        {
+            engine.set_working_set_types(ws.type_shares.clone(), PATH_KEY);
+        }
         // Each group that draws files out of another's conversations by path
         // (`docs/guidance_layer.md` §1): scoped like the group it draws from,
         // with the files it draws in its scope rather than that group's.
@@ -2197,6 +2206,7 @@ impl InferenceState {
             ingest_bases,
             chain_end: Mutex::new(None),
             titler_tx,
+            retitles: PendingRetitles::default(),
             titler_worker: Mutex::new(None),
             memory_writer: Mutex::new(None),
             memory_stop: CancelToken::new(),
@@ -4354,6 +4364,9 @@ fn run_inference_stream(
             }
 
             if is_final {
+                // The request turn has ended: title the conversation again from
+                // this exchange, in the background (`titles`).
+                request_retitle(&state, timeline, &original_user_message, &resp.text);
                 break;
             }
 
@@ -5926,6 +5939,30 @@ async fn passthrough_turn(
     true
 }
 
+/// Queue a re-title of `timeline` from the request turn that just finished:
+/// `request` asked, `answer` is the reply that ended it. Coalesced — a
+/// conversation already waiting for one has it read this exchange instead —
+/// and non-blocking: a full queue or a shutdown drops it, and the title stays
+/// as it was. A turn resumed from a sealed call has no request text of its
+/// own; its answer alone carries the topic.
+fn request_retitle(state: &InferenceState, timeline: TimelineId, request: &str, answer: &str) {
+    if answer.trim().is_empty() || state.shutting_down.load(Ordering::Relaxed) {
+        return;
+    }
+    let exchange = Finished {
+        request: request.to_string(),
+        answer: answer.to_string(),
+    };
+    if !state.retitles.offer(timeline, exchange) {
+        return;
+    }
+    if let Err(e) = state.titler_tx.try_send(TitleJob::Retitle { timeline }) {
+        // Nothing will take it: let the next finished turn queue afresh.
+        state.retitles.take(timeline);
+        tracing::debug!("titler queue full or closed — skipping re-title: {e}");
+    }
+}
+
 /// The titler task. Owns the titler [`Sequence`] exclusively and drains title
 /// jobs one at a time off `rx`. Each title-gen overlaps the main decode (the
 /// scheduler batches both sequences), but the task never blocks the request
@@ -5945,7 +5982,26 @@ async fn titler_task(
         match job {
             TitleJob::Shutdown => break,
             TitleJob::Title { timeline, message } => {
-                generate_one_title(&state, &mut titler, timeline, &message).await;
+                let prompt = head_tail_truncate(
+                    &message,
+                    &state.tokenizer,
+                    FIRST_HEAD_TOKENS,
+                    FIRST_TAIL_TOKENS,
+                );
+                generate_one_title(&state, &mut titler, timeline, &prompt).await;
+            }
+            TitleJob::Retitle { timeline } => {
+                // Read the title as it stands when the re-title starts — the
+                // first title, queued ahead of it, has been written by now.
+                let Some(exchange) = state.retitles.take(timeline) else {
+                    continue;
+                };
+                let current = state.engine.conversation_label_of(timeline);
+                let cut = |text: &str, head: usize, tail: usize| {
+                    head_tail_truncate(text, &state.tokenizer, head, tail)
+                };
+                let prompt = retitle_prompt(current.as_deref(), &exchange, &cut);
+                generate_one_title(&state, &mut titler, timeline, &prompt).await;
             }
         }
     }
@@ -5956,25 +6012,21 @@ async fn titler_task(
     }
 }
 
-/// Run the titler conversation against `user_message` and write the result as
-/// the main conversation's sidebar label. Errors are logged and dropped — the
-/// worst case is a missing sidebar label, never a failed response. Any turn
-/// that doesn't reach `Done` (scheduler error, or shutdown mid-decode) is
-/// aborted rather than left in flight, so the next title-gen can `reset`.
+/// Run the titler conversation against `prompt` — a first message, or a
+/// re-title's current title and latest exchange ([`titles`]), already bounded
+/// — and write the result as the main conversation's sidebar label. Errors are
+/// logged and dropped — the worst case is a stale sidebar label, never a failed
+/// response. Any turn that doesn't reach `Done` (scheduler error, or shutdown
+/// mid-decode) is aborted rather than left in flight, so the next title-gen
+/// can `reset`.
 async fn generate_one_title(
     state: &Arc<InferenceState>,
     titler: &mut Sequence,
     timeline: TimelineId,
-    user_message: &str,
+    prompt: &str,
 ) {
     use candle_conversation::TurnOptions;
 
-    let truncated = head_tail_truncate(
-        user_message,
-        &state.tokenizer,
-        TITLER_HEAD_TOKENS,
-        TITLER_TAIL_TOKENS,
-    );
     // **The titler must never reason, and the soft switch cannot stop it.**
     //
     // `NO_THINK_SELECTOR` below emits the scheduler's `no_think_current` glue,
@@ -6042,7 +6094,7 @@ async fn generate_one_title(
         triggers,
         ..Default::default()
     };
-    let handle = match titler.submit_turn_with_options(&truncated, opts) {
+    let handle = match titler.submit_turn_with_options(prompt, opts) {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!("titler submit failed: {e}");
@@ -6072,6 +6124,11 @@ async fn generate_one_title(
     }
     // Don't touch the engine once shutdown has begun — it's being torn down.
     if state.shutting_down.load(Ordering::Relaxed) {
+        return;
+    }
+    // A re-title that kept the title writes nothing: the label record would
+    // replicate a value every member already holds.
+    if state.engine.conversation_label_of(timeline).as_deref() == Some(title.as_str()) {
         return;
     }
 
@@ -8686,52 +8743,6 @@ pub fn timeline_for(conv_id: &str) -> projection::TimelineId {
     projection::TimelineId::from_raw(h.lo.max(1)).expect("timeline id is non-zero")
 }
 
-/// Cap the titler's prefill at `head + tail` tokens. For short messages
-/// (≤ head+tail) the text is returned verbatim; for long ones the head and
-/// tail token windows are decoded back to text and joined with `" … "`.
-/// This bounds title-generation latency regardless of how much the user
-/// pasted into their first message.
-fn head_tail_truncate(
-    text: &str,
-    tokenizer: &tokenizers::Tokenizer,
-    head: usize,
-    tail: usize,
-) -> String {
-    let Ok(encoded) = tokenizer.encode(text, false) else {
-        return text.to_string();
-    };
-    let ids = encoded.get_ids();
-    if ids.len() <= head + tail {
-        return text.to_string();
-    }
-    let head_text = tokenizer.decode(&ids[..head], false).unwrap_or_default();
-    let tail_text = tokenizer
-        .decode(&ids[ids.len() - tail..], false)
-        .unwrap_or_default();
-    format!("{head_text} … {tail_text}")
-}
-
-/// Clean a model-generated title: strip wrapping quotes, trailing
-/// punctuation, and any leading "Title:" prefix the model might add.
-fn clean_title(raw: &str) -> String {
-    // The titler runs under `/no_think`, but Qwen3 still emits an empty
-    // `<think></think>` (and may reason despite it) — strip any think block so it
-    // never lands in the sidebar label.
-    let stripped = candle_conversation::think_strip::strip_think_blocks(raw);
-    let s = stripped.trim();
-    let s = s.strip_prefix("Title:").unwrap_or(s).trim();
-    let s = s
-        .strip_prefix('"')
-        .and_then(|r| r.strip_suffix('"'))
-        .unwrap_or(s);
-    let s = s
-        .strip_prefix('\'')
-        .and_then(|r| r.strip_suffix('\''))
-        .unwrap_or(s);
-    let s = s.trim_end_matches(['.', '!', '?']);
-    s.trim().to_string()
-}
-
 /// What a committed ingested unit is keyed by, workspace-relative: a file's
 /// reading by its path, a folder's by its folder, a layer's unit by its
 /// subject — the file or folder it analyses. `None` for a conversation that is
@@ -9420,37 +9431,5 @@ mod unit_key_tests {
         );
         let partial = meta(&[("layer", "code_review"), ("subject", "candle/x.rs")]);
         assert_eq!(committed_unit_key(&partial), None);
-    }
-}
-
-#[cfg(test)]
-mod title_tests {
-    use super::clean_title;
-
-    #[test]
-    fn strips_empty_no_think_block() {
-        // Qwen3 under /no_think still emits an empty think block before the label.
-        assert_eq!(
-            clean_title("<think>\n\n</think>\n\nUnbounded Context Engine"),
-            "Unbounded Context Engine"
-        );
-    }
-
-    #[test]
-    fn strips_reasoned_think_block() {
-        assert_eq!(
-            clean_title("<think>The user is asking about X, so a good title is…</think>\nProjection Bar Rendering"),
-            "Projection Bar Rendering"
-        );
-    }
-
-    #[test]
-    fn keeps_existing_cleanup() {
-        // Think-strip composes with the prefix/quote/punctuation trimming.
-        assert_eq!(
-            clean_title("<think></think>Title: \"KV Cache Tiering.\""),
-            "KV Cache Tiering"
-        );
-        assert_eq!(clean_title("Plain Title"), "Plain Title");
     }
 }

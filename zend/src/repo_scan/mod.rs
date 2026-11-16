@@ -1396,15 +1396,15 @@ fn process_one_dir(
 /// layers so all three read from one place.
 ///
 /// **This text does not become K/V, and that is the point.** A conversation's
-/// prompt K/V is the schema's own content-addressed sections, injected by the
-/// priming projection at creation (`Sequence::new_with_projection` →
-/// `PrimingProjection`) — the same stored sections a chat conversation injects.
-/// An append-only ingest never re-projects (`skip_projection`), so that primed
-/// prefix is its prompt for the conversation's whole life and no runtime
-/// selection can alter it. What this string is for is the in-memory tree's
-/// per-turn formatting; it walks the schema at the SAME default branch priming
-/// uses, so the text mirrors the K/V rather than describing a prompt that never
-/// existed. Changing what an ingest is framed by means changing the schema's
+/// prompt K/V is the schema's own content-addressed sections, laid onto its
+/// empty slot by its first turn from its frame (`ProjectionInputs::frame`, the
+/// birth prefix `Sequence::new_with_projection` builds) — the same stored
+/// sections a chat conversation injects. An append-only ingest never
+/// re-projects (`skip_projection`), so that frame is its prompt for the
+/// conversation's whole life and no runtime selection can alter it. What this
+/// string is for is the in-memory tree's per-turn formatting; it walks the
+/// schema at the SAME default branch the frame uses, so the text mirrors the
+/// K/V rather than describing a prompt that never existed. Changing what an ingest is framed by means changing the schema's
 /// defaults.
 pub(crate) fn shared_system_prompt(
     builder: &projection::Builder,

@@ -702,6 +702,55 @@ holds, so a face that failed part-way is never pointed at. Tombstoning a unit
 tombstones its face (`Conversation::tombstone_timeline`). A face that is gone
 or not yet sealed reads as absent, and the unit's own opening stands.
 
+### 4.10 Type shares — no kind of document takes the whole budget
+
+**Why.** The leak-free dependency battery (24 questions of the form "where is
+`tier_fits` defined and who calls it?", BlackWorld, 2026-11-16) found the
+answers drawn from the same few documents nearly every time — `README.md`,
+`AGENTS.md`, `ARCHITECTURE.md`, `docs/*.md`, the MCP guides — and almost never
+from the code file that answers the question. A hub document matches nearly any
+question about the code it describes, so on momentum documents filled the
+voluntary budget and the code that ranked below them never entered.
+
+**What.** The dialogue's `working_set:` names types of document and the most of
+`budget_tokens` each may hold:
+
+```yaml
+      type_shares:
+        - name: docs
+          files: ['\.(md|markdown|mdx|txt|rst|adoc)$']
+          max_share: 0.35
+        - name: config
+          files:
+            - '\.(ya?ml|toml|json|jsonc|ini|cfg|conf|env|properties)$'
+            - '(^|/)(Cargo\.toml|package\.json|pyproject\.toml|go\.mod)$'
+          max_share: 0.15
+```
+
+A unit's type is the first type a pattern of which matches its subject — the
+`path` a `code_reading` unit records, `<repo>/<path>`. A unit matching none —
+code, tests, kernels, scripts, and every folder — is unbounded. Shares are in
+`(0, 1]`, names unique, every pattern must compile; a declaration that breaks
+any of those is refused at load (`working_set::TypeShares::new`).
+
+**How it applies.** A share is a cap, not a reservation: it is checked where
+`folder_tokens` is, at admission (`WorkingSet::room_for`). A typed newcomer
+whose type would pass its share dislodges only weaker voluntary members of its
+own type — by the same `DISLODGE_MARGIN` — so a burst of strong documents can
+take each other's places but never the room the code would have. When it beats
+none of them it waits on its momentum, and the next-best candidate by score is
+considered. Seeds keep to the shares too. Locks count toward their type's share
+— the model's own reads are in context whatever they are — but are never
+refused by it; after a lock of a type is taken or released into provenance, the
+next reprojection trims that type's weakest voluntary members back under the
+share (`WorkingSet::trim_types`). Guidance is its own pool and holds no type's
+share. Provenance orders everything inside the caps exactly as before.
+
+The substrate types each candidate (`Substrate::working_set_candidate`) from the
+classifier zend installs at setup beside the groups' shares
+(`ConversationEngine::set_working_set_types`), and every member carries its type
+and cap, so a restored lock is typed as an admitted one is.
+
 ## 5. Constraints and cost
 
 - **Context length.** Flash-Next is trained to 262,144 positions, and the

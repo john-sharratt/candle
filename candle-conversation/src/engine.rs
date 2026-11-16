@@ -43,7 +43,7 @@ use crate::substrate::{ConvCompression, Substrate};
 use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 use crate::turn_text::literal_tokenizer;
-use crate::working_set::{Limits, Refusal, WorkingSet};
+use crate::working_set::{Limits, Refusal, TypeShares, WorkingSet};
 
 use candle::quantized::pinned_staging::release_recycled_wc;
 use candle::Device;
@@ -1499,6 +1499,16 @@ impl ConversationEngine {
             .update(|s| s.set_working_set_share(group, share));
     }
 
+    /// Cap each of `types` at its share of a dialogue's working-set budget,
+    /// a conversation's type read from the subject its metadata holds under
+    /// `subject_key` (`docs/zend_working_set.md` §4.10). In-memory, so it is
+    /// set at every setup.
+    pub fn set_working_set_types(&self, types: TypeShares, subject_key: &str) {
+        // The edit may run more than once, so each run takes its own copy.
+        self.conversation
+            .update(|s| s.set_working_set_types(types.clone(), subject_key));
+    }
+
     /// Record that `drawing` places units of `from`'s conversations — what a
     /// group's `draws:` declares (`docs/guidance_layer.md` §1). Idempotent;
     /// in-memory, so it is set at every setup.
@@ -2807,12 +2817,6 @@ impl ConversationEngine {
             self.core.model_core,
             self.conversation.clone(),
             section_progress,
-            // **Primed on both paths, resume included.** Priming injects the
-            // schema's prelude *sections* and explicitly no turns, and the
-            // per-turn `apply_projection` at submit materialises the real
-            // projection regardless — so a resumed slot is warmed by this and
-            // its history still arrives the ordinary way.
-            true,
         )
         .inspect_err(|_| free_slot())?;
         // A group of one — the same install path the batch create takes.
@@ -2965,10 +2969,6 @@ impl ConversationEngine {
                     self.core.model_core,
                     self.conversation.clone(),
                     None,
-                    // Pipelined batch: skip the per-sequence priming round-trip
-                    // that would otherwise serialise the burst — `apply_projection`
-                    // at first submit materialises the projection instead.
-                    false,
                 )?;
                 pending.extend(p);
                 Ok(conv)

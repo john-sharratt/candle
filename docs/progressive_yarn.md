@@ -262,12 +262,14 @@ It is fragile by construction:
   cannot be read under another rung;
 - a wrong frame anywhere shows up only as a wrong selection above 2,051 tokens.
 
-**The aux-blob index is live.** A new conversation runs the priming projection
-and then installs its prompt-branch checkpoint. `restore_aux_state` replaces the
-primed index with the checkpoint's, and the first turn then skips
-`apply_projection` (`conversation.rs:1041-1073`). The checkpoint's rows were
-prefilled from position 0 on the same prompt, so they sit where the primed K/V
-sits. §7 keeps this path; it simply stops rotating it.
+**The aux-blob index is live.** A new conversation installs its prompt-branch
+checkpoint onto its empty slot before its first turn: `restore_aux_state` puts
+the checkpoint's index rows and recurrent state in place. The first turn's
+projection then cuts the empty slot to nothing, which drops the index rows
+(`reset_positional_state`) and keeps the recurrent state, and lays the prompt's
+sections down with their stored index pages. Those pages were prefilled from
+position 0 on the same prompt chain, so they sit where the checkpoint's rows
+sat. §7 keeps this path; it simply stops rotating it.
 
 §7 removes the stored rotation entirely.
 

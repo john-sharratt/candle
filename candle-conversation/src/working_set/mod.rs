@@ -10,6 +10,8 @@
 mod config;
 pub mod marks;
 mod state;
+mod type_shares;
 
 pub use config::WorkingSetConfig;
 pub use state::{Candidate, Limits, Refusal, WorkingSet};
+pub use type_shares::{TypeCap, TypeShareSpec, TypeShares};

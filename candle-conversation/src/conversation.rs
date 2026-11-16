@@ -25,12 +25,13 @@ use crate::projection::{
     DecodePriority, Observe, ProjectionEvent, ProjectionMode, ProjectionPoint, ProjectionTarget,
     SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
+use crate::provenance::gallery_arena::BeliefArena;
 use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::reply_wait::replied;
 use crate::scheduler::projection_assembler::materialize_conversation;
 use crate::scheduler::{
     note_branch_checkpoint_computed, note_branch_checkpoint_installed, ProjectionInputs,
-    ReprojectionPolicy, SchedulerRequest, SealedProbe, TurnContent,
+    RemoteArena, ReprojectionPolicy, SchedulerRequest, TurnContent,
 };
 use crate::sealed_turn::{SealedPages, SealedTurn};
 use crate::sequence_handle::{BlockCount, SequenceId};
@@ -478,15 +479,22 @@ pub struct Sequence {
     /// `projection.project()`.  Different cognitive activities (dialogue,
     /// bug analysis, dream log, …) point at different targets.
     pub(crate) target: ProjectionTarget,
-    /// The birth-time primed section list and the branch windows inside it —
-    /// retained because `prompt_branch` needs both to rebuild a checkpoint
-    /// when the FIRST turn's dials select a different branch than the
-    /// create-time default.
+    /// The birth-time section list — the schema's fixed sections, each tree at
+    /// its default branch — and the branch windows inside it, retained because
+    /// `prompt_branch` needs both to rebuild a checkpoint when the FIRST turn's
+    /// dials select a different branch than the create-time default.
     ///
     /// One window per [`SectionTree`] the schema declares, in item order: a
     /// schema may declare several (zend's does), each contributing its own
-    /// run of ids to the primed list.
-    primed_prefix: Arc<Vec<SectionId>>,
+    /// run of ids to the birth list.
+    birth_prefix: Arc<Vec<SectionId>>,
+    /// The frame an append-only conversation's first turn lays onto an empty
+    /// slot: [`Self::birth_prefix`], sent with the first submit and gone after
+    /// it ([`ProjectionInputs::frame`]). `None` for a conversation that
+    /// re-projects every turn, and once the first turn has been submitted. A
+    /// fork carries its parent's, so a unit forked from an ingest base that
+    /// never ran a turn is framed exactly as the base would have been.
+    frame: Option<Arc<Vec<SectionId>>>,
     branch_spans: Vec<(usize, usize)>,
     /// True when this conversation was **born with a prompt checkpoint** — as
     /// opposed to a fork, whose state is the parent's or the timeline's and
@@ -805,16 +813,6 @@ impl Sequence {
         model_core: ModelCoreProperties,
         substrate: Conversation,
         section_progress: Option<&dyn Fn(u64, u64)>,
-        // When `false`, skip the [`SchedulerRequest::PrimingProjection`] slot
-        // pre-warm (a synchronous scheduler round-trip). Priming is a
-        // first-turn latency optimization — it pre-injects the empty-collection
-        // layout so the first `submit_turn` skips `apply_projection`. Callers
-        // that create MANY sequences in a pipelined burst (calibration) pass
-        // `false`: the per-sequence round-trip would serialise the burst back
-        // to one-create-per-wave-latency, defeating the batching, and the
-        // per-turn `apply_projection` at submit materialises the projection
-        // just the same (it must anyway, to select the pinned tool).
-        prime_slot: bool,
     ) -> crate::Result<(Self, Option<PendingBranchState>)> {
         // Persistence is now a property of the workspace `Conversation`
         // (the substrate handle), wired in by the engine via
@@ -858,7 +856,8 @@ impl Sequence {
             submitted: SubmittedSections::default(),
             substrate,
             target,
-            primed_prefix: Arc::new(Vec::new()),
+            birth_prefix: Arc::new(Vec::new()),
+            frame: None,
             branch_spans: Vec::new(),
             state_is_prompt_only: false,
             installed_branch: None,
@@ -907,8 +906,8 @@ impl Sequence {
         // and they contribute nothing to the prefix here.
         let mut linear_prefix: Vec<SectionId> = Vec::new();
         // Mirrors `linear_prefix` but excludes Collection members and
-        // `depends_on`-gated sections — feeds the priming projection
-        // so the first-turn slot mirrors the empty-collection layout.
+        // `depends_on`-gated sections — the birth prefix: the empty-collection
+        // layout an append-only conversation's first turn is framed by.
         let mut fixed_prefix: Vec<SectionId> = Vec::new();
         // Where each section tree's emitted ids land inside `fixed_prefix`, as
         // `(start, len)` — the windows the branch-checkpoint pass rewrites per
@@ -1019,12 +1018,11 @@ impl Sequence {
                     linear_prefix.push(s.id);
                     // Sections with `depends_on` are conditional — they
                     // only emit when the named collection materialises —
-                    // so they must NOT contribute to the priming
-                    // projection's `fixed_prefix`. Nor does a section with
-                    // no content: ingest seals nothing for it and the
-                    // projection emits nothing for it, so priming must not
-                    // name it either, or the two lists disagree about what
-                    // the slot holds.
+                    // so they must NOT contribute to the birth prefix
+                    // `fixed_prefix`. Nor does a section with no content:
+                    // ingest seals nothing for it and the projection emits
+                    // nothing for it, so the frame must not name it either,
+                    // or the two lists disagree about what the slot holds.
                     if s.depends_on.is_none() && !s.content.is_empty() {
                         fixed_prefix.push(s.id);
                     }
@@ -1063,8 +1061,8 @@ impl Sequence {
                     // Extend the live linear_prefix with every
                     // collection member so subsequent sections see
                     // them at projection time, but do NOT add them
-                    // to fixed_prefix — the priming projection must
-                    // be coherent for the empty-collection case.
+                    // to fixed_prefix — the birth prefix must be
+                    // coherent for the empty-collection case.
                     //
                     // This is also why these members cannot be offloaded as the
                     // section tree's embedded collections are: those never enter
@@ -1160,8 +1158,8 @@ impl Sequence {
                             }
                         }
                     }
-                    // Sections declared after the tree (and the priming
-                    // projection) attend to the default branch — the fan-out is
+                    // Sections declared after the tree (and the birth
+                    // prefix) attend to the default branch — the fan-out is
                     // bounded to the tree itself.
                     //
                     // Remember where this tree's branch ids sit in
@@ -1202,7 +1200,12 @@ impl Sequence {
         // know, so the checkpoint installed below is the DEFAULT branch's. If
         // that first turn selects a different branch, `submit_turn_with_options`
         // rebuilds from exactly these inputs.
-        conv.primed_prefix = Arc::new(fixed_prefix.clone());
+        conv.birth_prefix = Arc::new(fixed_prefix);
+        conv.frame = conv
+            .submitter
+            .config
+            .disable_reprojection
+            .then(|| Arc::clone(&conv.birth_prefix));
         conv.branch_spans = branch_spans;
         // Only a checkpoint that exists is installed: a failed pass returns the
         // prefix without a payload, and a first turn on that branch should try again.
@@ -1210,38 +1213,16 @@ impl Sequence {
             .as_ref()
             .and_then(|(prefix, payload)| payload.as_ref().map(|_| *prefix));
 
-        // Pre-warm the slot: inject all system-prompt sections now so the
-        // first `submit_turn` sees an already-populated slot and skips
-        // `apply_projection` entirely, removing that injection from the
-        // first-turn critical path.
+        // The slot is left empty: the first `submit_turn`'s `apply_projection`
+        // lays the system prompt down as part of that turn's prefill, in the
+        // scheduler's ordinary waves, rather than in a request of its own that
+        // would hold the wave thread for every other conversation.
         //
-        // Priming uses `fixed_prefix` — the collections-as-empty
-        // projection — so the slot's starting state mirrors what
-        // `emit_system_prompt_items` would produce when no collection
-        // members are selected and no `depends_on`-gated sections fire.
-        // Any per-turn projection that selects ≥ 1 collection member
-        // will materialise those (and the gated sections) via
-        // `apply_projection` at submit_turn time.
-        if prime_slot && !fixed_prefix.is_empty() {
-            let (tx, rx) = flume::bounded(1);
-            conv.scheduler_tx
-                .send(crate::scheduler::SchedulerRequest::PrimingProjection {
-                    sequence_id: conv.id,
-                    section_ids: fixed_prefix,
-                    response_tx: tx,
-                })
-                .map_err(|_| ConversationError::SchedulerGone)?;
-            replied(&rx).map_err(|_| ConversationError::SchedulerGone)??;
-        }
-
-        // The prompt's K/V is on the slot; give the recurrent layers the state
-        // that goes with it. Order matters and is the reason this is not folded
-        // into `create_sequence` alongside the timeline-snapshot restore — see
-        // `restore_branch_checkpoint`.
-        // NOT installed here: the install is a scheduler round-trip that is
-        // almost all queue wait, and that wait is per-request, not per-slot. The
+        // The recurrent layers' state that goes with the prompt is NOT
+        // installed here: the install is a scheduler round-trip that is almost
+        // all queue wait, and that wait is per-request, not per-slot. The
         // caller installs — one group per batch of conversations — via
-        // `install_branch_states`.
+        // `install_branch_states`, before the first turn is submitted.
         let pending = branch_checkpoint.map(|(prefix, payload)| PendingBranchState {
             sequence_id: conv.id,
             prefix,
@@ -1271,11 +1252,11 @@ impl Sequence {
     /// The ordered sections this conversation's system prompt is built from,
     /// and the content prefix that identifies them.
     ///
-    /// `primed` is the birth-time projection — the collections-as-empty section
-    /// list the slot is primed with — and `branch_spans` are the windows inside
-    /// it that the section trees filled, one per tree in item order. Each
-    /// window is **re-derived** from its tree and this conversation's own
-    /// selection rather than taken as-is, because the walk that built `primed`
+    /// `birth` is the birth-time projection — the collections-as-empty section
+    /// list — and `branch_spans` are the windows inside it that the section
+    /// trees filled, one per tree in item order. Each window is
+    /// **re-derived** from its tree and this conversation's own selection
+    /// rather than taken as-is, because the walk that built `birth`
     /// had only the authored defaults to go on: `SectionTree::branch_prefix_ids`
     /// is what turns a selection into the branch's sealed sections, so a
     /// conversation opened on a non-default assignment names the branch it will
@@ -1291,12 +1272,12 @@ impl Sequence {
     /// counted them would change whenever the catalog did.
     fn prompt_branch(
         &self,
-        primed: &[SectionId],
+        birth: &[SectionId],
         branch_spans: &[(usize, usize)],
     ) -> (ContentHash, Vec<u32>) {
         let schema = self.projection.schema();
         let trees: Vec<&SectionTree> = schema.system_prompt.section_trees().collect();
-        let mut ids: Vec<SectionId> = Vec::with_capacity(primed.len());
+        let mut ids: Vec<SectionId> = Vec::with_capacity(birth.len());
         // Walk the windows in order, copying the untouched runs between them
         // and re-deriving each tree's own run. `cursor` is where the last
         // window ended, so an out-of-order or out-of-range span is caught
@@ -1305,22 +1286,22 @@ impl Sequence {
         let mut spliced = trees.len() == branch_spans.len();
         if spliced {
             for (tree, &(start, len)) in trees.iter().zip(branch_spans) {
-                if start < cursor || start + len > primed.len() {
+                if start < cursor || start + len > birth.len() {
                     spliced = false;
                     break;
                 }
-                ids.extend_from_slice(&primed[cursor..start]);
+                ids.extend_from_slice(&birth[cursor..start]);
                 let selection = tree.selection(|id| self.selection.get(id));
                 ids.extend(tree.branch_prefix_ids(&selection));
                 cursor = start + len;
             }
         }
         if spliced {
-            ids.extend_from_slice(&primed[cursor..]);
+            ids.extend_from_slice(&birth[cursor..]);
         } else {
-            // No trees, or spans that no longer index `primed`: the primed list
+            // No trees, or spans that no longer index `birth`: the birth list
             // is the prompt.
-            ids = primed.to_vec();
+            ids = birth.to_vec();
         }
 
         let view = self.substrate.read();
@@ -1368,10 +1349,10 @@ impl Sequence {
     /// conversation is an outage.
     fn build_branch_checkpoint(
         &self,
-        primed: &[SectionId],
+        birth: &[SectionId],
         branch_spans: &[(usize, usize)],
     ) -> crate::Result<Option<(ContentHash, Option<Arc<BranchCheckpointPayload>>)>> {
-        let (prefix, tokens) = self.prompt_branch(primed, branch_spans);
+        let (prefix, tokens) = self.prompt_branch(birth, branch_spans);
         if tokens.is_empty() {
             return Ok(None);
         }
@@ -1402,12 +1383,10 @@ impl Sequence {
 
     /// Install this conversation's branch checkpoint onto its slot (P6.4).
     ///
-    /// Runs **after** priming, which is the difference from the conversation
-    /// resume path: that one installs inside `create_sequence`, before any
-    /// wave, because a timeline snapshot depends on nothing else. A branch
-    /// checkpoint describes the state after the prompt, so the prompt's K/V has
-    /// to be on the slot first — otherwise the pair is installed in the wrong
-    /// order and nothing says so.
+    /// A branch checkpoint describes the recurrent state after the prompt. It
+    /// is installed before the first turn, whose projection lays the prompt's
+    /// K/V onto the slot: placing K/V restores K/V and nothing else, so the
+    /// installed state survives it and the first prefill reads both together.
     ///
     /// A miss is a degradation, not a failure: the conversation starts with its
     /// prompt in K/V and zero in the recurrent layers, exactly as it did before
@@ -2068,7 +2047,7 @@ impl Sequence {
         //
         // **A changed selection is not a changed branch.** Dials that select no
         // section tree — the thinking switch, a response-length dial on a prompt
-        // without that tree — leave the prompt exactly as it was primed, so the
+        // without that tree — leave the prompt exactly as it was born, so the
         // branch they name is the one already installed, and the swap would read
         // the ~63 MiB checkpoint back off the log (the memo holds one branch, and
         // every conversation with its own prompt is its own branch), decode it,
@@ -2077,11 +2056,11 @@ impl Sequence {
         // the batch's prefill window. Naming the branch is a walk of the sections
         // already in the substrate; only a branch that differs is rebuilt.
         if selection_changed && self.state_is_prompt_only && timeline_is_empty {
-            let primed = Arc::clone(&self.primed_prefix);
+            let birth = Arc::clone(&self.birth_prefix);
             let spans = self.branch_spans.clone();
-            let (selected, _) = self.prompt_branch(&primed, &spans);
+            let (selected, _) = self.prompt_branch(&birth, &spans);
             if needs_branch_swap(self.installed_branch, selected) {
-                if let Some((prefix, fresh)) = self.build_branch_checkpoint(&primed, &spans)? {
+                if let Some((prefix, fresh)) = self.build_branch_checkpoint(&birth, &spans)? {
                     self.restore_branch_checkpoint(prefix, fresh)?;
                     self.installed_branch = Some(prefix);
                 }
@@ -2091,9 +2070,10 @@ impl Sequence {
         // state past the prompt — the swap window closes.
         self.state_is_prompt_only = false;
 
+        let inputs = self.projection_inputs();
         let (handle, user_tokens) = self.submit_turn_on(
             self.id,
-            self.projection_inputs(),
+            inputs,
             &user_message,
             user_text.clone(),
             options,
@@ -2477,9 +2457,10 @@ impl Sequence {
             }
         }
 
+        let inputs = self.projection_inputs();
         let handle = self.submit_prefill_unit(
             self.id,
-            Some(self.projection_inputs()),
+            Some(inputs),
             formatted,
             prefill_tokens,
             user_text,
@@ -2641,10 +2622,11 @@ impl Sequence {
         }
 
         let (event_tx, event_rx) = flume::unbounded();
+        let inputs = self.projection_inputs();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 sequence_id: self.id,
-                projection_inputs: Some(self.projection_inputs()),
+                projection_inputs: Some(inputs),
                 prefill_text: String::new(),
                 // Each case prefills its own tokens, on its own view.
                 prefill_tokens: TokenBuffer::new(),
@@ -2911,10 +2893,11 @@ impl Sequence {
     /// target itself is pinned on the slot (via the scheduler's
     /// `slot_targets` map at `NewSequence` time) and read from there
     /// at handler entry.
-    fn projection_inputs(&self) -> ProjectionInputs {
+    fn projection_inputs(&mut self) -> ProjectionInputs {
         ProjectionInputs {
             projection: Arc::clone(&self.projection),
             selection: self.selection.clone(),
+            frame: self.frame.take(),
         }
     }
 
@@ -3070,9 +3053,10 @@ impl Sequence {
         // projection, prefills the full exchange, appends
         // `post_decode_tokens`, and emits Done without entering
         // decode.
+        let inputs = self.projection_inputs();
         let handle = self.submit_prefill_unit(
             self.id,
-            Some(self.projection_inputs()),
+            Some(inputs),
             formatted,
             prefill_tokens,
             user_text,
@@ -3398,9 +3382,9 @@ impl Sequence {
         // deliberately left alone. The turns it seals are later borrowed into
         // dialogue projections, and borrowed K/V carries the framing it was computed
         // under, and on the append-only ingest path that framing is NOT this
-        // selection's to set: the prefix is the one priming injected at creation
-        // (the schema's sections at each tree's default branch) and
-        // `skip_projection` means no turn ever rebuilds it. The ingest's prompt is
+        // selection's to set: the prefix is the conversation's frame, laid on its
+        // empty slot by its first turn (the schema's sections at each tree's
+        // default branch), and `skip_projection` means no turn ever rebuilds it. The ingest's prompt is
         // therefore the same shared prompt KV a chat conversation uses, and the
         // schema's defaults are where its content is decided.
         //
@@ -3447,7 +3431,7 @@ impl Sequence {
         // **Three layers, and only the last one is structural.** `NO_THINK_SELECTOR`
         // adds the `/no_think` glue below, baked into this turn's own prefill — which
         // the model may simply ignore, because it is text. (Nothing in the prompt
-        // helps: an append-only ingest is framed by the primed shared prompt at its
+        // helps: an append-only ingest is framed by the shared birth prompt at its
         // default branch, whose thinking dial is the dialogue's.)
         // `apply_think_mode` then programs the sampler's segment-close
         // budget, which for `Off` at a short summary budget collapses to a forced
@@ -4047,33 +4031,28 @@ impl Sequence {
         // The seal scan is the once-per-turn learning point for the
         // score-normalization backgrounds — and it teaches only the scopes this
         // turn is inside, so a dialogue turn cannot rewrite a tag-scoped
-        // collection's lens. The scheduler runs it on its gallery arena, the
-        // only thread that may scan there.
-        let (tx, rx) = flume::bounded(1);
-        let sent = self.scheduler_tx.send(SchedulerRequest::ScoreSealedTurn {
-            substrate: self.substrate.clone(),
-            projection: Arc::clone(&self.projection),
-            target: self.target,
-            sealed: SealedProbe {
-                probe,
-                probe_q,
-                tags,
-                source,
-                observe,
+        // collection's lens. It runs here, on this conversation's thread: the
+        // galleries, the turn groups' files and the normalization are substrate
+        // work any thread may do, and only the launches go to the scheduler's
+        // wave thread, the one thread that may scan the gallery arena
+        // (`RemoteArena`). With no arena it scores on the host.
+        let arena = RemoteArena::connect(&self.scheduler_tx);
+        let (scores, _) = self.substrate.score_beliefs(
+            self.projection.schema(),
+            self.target,
+            &probe,
+            (!probe_q.is_empty()).then_some(probe_q.as_slice()),
+            if observe {
+                Observe::Yes {
+                    tags: &tags,
+                    source,
+                }
+            } else {
+                Observe::No
             },
-            response_tx: tx,
-        });
-        match sent.ok().and_then(|()| rx.recv().ok()) {
-            Some(scores) => scores,
-            None => {
-                tracing::warn!(
-                    timeline = timeline.raw(),
-                    "seal belief scan: the scheduler is gone; the turn's projection \
-                     event carries no belief scores"
-                );
-                empty
-            }
-        }
+            arena.as_ref().map(|a| a as &dyn BeliefArena),
+        );
+        scores
     }
 
     /// Recompute the materialized projection for this conversation and pair it
@@ -4631,7 +4610,11 @@ impl Sequence {
             // history aggregation continues to work.
             substrate: self.substrate.clone(),
             target: fork_target,
-            primed_prefix: Arc::clone(&self.primed_prefix),
+            birth_prefix: Arc::clone(&self.birth_prefix),
+            // A fork of a slot that holds K/V borrows it and never reads this;
+            // one of an empty slot (an ingest base that never ran a turn) is
+            // framed as its parent would have been.
+            frame: self.frame.clone(),
             branch_spans: self.branch_spans.clone(),
             // A fork's state is real — the parent's live state or the
             // timeline's snapshot, never exactly the prompt checkpoint — so
@@ -4667,7 +4650,7 @@ impl Sequence {
                 turn_count,
             ) {
                 let (prefix, _tokens) =
-                    fork_conv.prompt_branch(&fork_conv.primed_prefix, &fork_conv.branch_spans);
+                    fork_conv.prompt_branch(&fork_conv.birth_prefix, &fork_conv.branch_spans);
                 if let Err(e) = fork_conv.restore_branch_checkpoint(prefix, None) {
                     tracing::warn!(
                         "fork onto a fresh timeline: branch checkpoint install failed ({e}) — \
@@ -5515,9 +5498,11 @@ impl ProbeCtx {
                 // `ephemeral_slots` branch that forces `SealAction::None`.
                 seal_group: None,
                 sequence_id: slot,
+                // Re-projects (`disable_reprojection: false`): no frame.
                 projection_inputs: Some(ProjectionInputs {
                     projection: Arc::clone(&self.projection),
                     selection: self.selection.clone(),
+                    frame: None,
                 }),
                 prefill_tokens: TokenBuffer::from(query_tokens),
                 prefill_text: String::new(),

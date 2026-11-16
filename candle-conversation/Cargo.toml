@@ -72,6 +72,7 @@ tokenizers = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 half = { workspace = true }
+regex = "1"
 regex-automata = "0.4"
 
 [target.'cfg(windows)'.dependencies]

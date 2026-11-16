@@ -105,8 +105,7 @@ GEMM, so a large prefill never starves decode of its working set and decode neve
 `SchedulerRequest` is the full caller-facing surface: `NewSequence` / `ResumeSequence` / `FreeSequence` for slot
 lifecycle, `SubmitTurn` (the full turn lifecycle — project, prefill, decode to EOS/max-tokens, seal) with an
 optional `ReprojectionPolicy` for continuous mid-decode reprojection, `IngestSection` / `RestoreSection` for
-one-shot system-prompt section prefill, and diagnostic/maintenance variants (`PrimingProjection`,
-`ProbeWideSigs`, `ReconstructSubstrate`, `Shutdown`, …). Prefill **admission** is governed by an AIMD controller
+one-shot system-prompt section prefill, and diagnostic/maintenance variants (`ProbeWideSigs`, `ReconstructSubstrate`, `Shutdown`, …). Prefill **admission** is governed by an AIMD controller
 (`shrink_admit_window` / `grow_admit_window`) with an evidence-based escape hatch (`evidence_admit_grow`) that
 reopens the admission window after enough consecutive OOM-free ticks even under a card whose steady-state VRAM
 reading always looks "pressured". Per-wave phase timings (`Decode` / `Prefill` / `Section` / `Projection` /

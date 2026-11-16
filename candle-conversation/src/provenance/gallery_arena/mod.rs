@@ -22,9 +22,11 @@
 //! turns when it unloads, and a tombstoned turn's at once. See
 //! `docs/gallery_residency.md`.
 
+mod belief_arena;
 mod dedup;
 pub(crate) mod eviction;
 mod groups;
+mod held_scan;
 mod holder;
 mod index_entries;
 mod lease;
@@ -36,8 +38,10 @@ pub mod scan_split;
 mod token_votes;
 mod turn_sigs;
 
+pub use belief_arena::BeliefArena;
 pub use dedup::{Codebook, Keep, KeepMask};
 pub use groups::GroupSet;
+pub use held_scan::{HeldScan, ScanAnswer, ScanReply};
 pub use holder::{Holder, HolderKind};
 pub use pages::{page_words, pages_for, transpose_to_pages, PAGE_TOKENS};
 pub use scan::{PagedSegment, PagedWindow};

@@ -107,7 +107,7 @@ use crate::summary_tree::{
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnRecord, TurnSegment};
-use crate::working_set::{Candidate, Limits, Refusal, WorkingSet};
+use crate::working_set::{Candidate, Limits, Refusal, TypeShares, WorkingSet};
 use crate::ConversationError;
 use calibration_record::{standing, CalRecord, CalRecords, CalSnapshot};
 use deleted_set::DeletedSet;
@@ -278,6 +278,12 @@ pub struct Substrate {
     /// member. In-memory only, set once at engine setup.
     working_set_shares: PMap<GroupId, WorkingSetShare>,
 
+    /// The types of document a working set caps, and the metadata key of a
+    /// conversation's subject they are matched against
+    /// (`docs/zend_working_set.md` §4.10). In-memory only, set once at engine
+    /// setup; until then every candidate is of no type.
+    working_set_types: Option<Arc<(TypeShares, String)>>,
+
     /// Each drawing group and the group whose conversations it draws from —
     /// the schema's `draws: { from }` (`docs/guidance_layer.md` §1). A drawing
     /// group holds no conversation of its own: its candidates are its source's,
@@ -301,16 +307,19 @@ pub struct Substrate {
     /// from record headers.
     streams: StreamIndex,
 
-    /// The streams of `streams` whose declaration is a turn in a gather scope —
-    /// one carrying a tag that is not a working-set mark — by tag, kept in step
-    /// with every declaration installed and every stream removed.
+    /// The streams of `streams` whose declaration is a turn: those in a gather
+    /// scope — carrying a tag that is not a working-set mark — by tag, and the
+    /// dialogue — carrying none — as a set, kept in step with every declaration
+    /// installed and every stream removed.
     ///
     /// A tagged collection's gallery is drawn from the turns carrying its tags
     /// alone: the tool catalog's few thousand beside a substrate of every turn
     /// and chunk stream ingest has written. Walking all of `streams` to find
     /// them was ~115 ms, and walking every gather scope's turns, ~75 ms, both
     /// paid on the first reprojection after every seal anywhere in the
-    /// workspace. See [`TagIndex`].
+    /// workspace. An untagged collection's is drawn from the dialogue alone,
+    /// and walking every turn to find it was ~440 ms of each seal scan. See
+    /// [`TagIndex`].
     tagged_turns: TagIndex,
 
     /// Bumped whenever anything a collection's belief gallery is assembled from
@@ -3648,6 +3657,13 @@ impl Substrate {
         self.working_set_shares.insert(group, share);
     }
 
+    /// Cap each of `types` at its share of a working set's budget, a
+    /// conversation's type read from the subject its metadata names under
+    /// `subject_key`.
+    pub fn set_working_set_types(&mut self, types: TypeShares, subject_key: &str) {
+        self.working_set_types = Some(Arc::new((types, subject_key.to_string())));
+    }
+
     /// Record that `drawing` places units of `from`'s conversations: its
     /// candidates are `from`'s, as `drawing`'s own retrieval scope names them.
     /// Both are scoped, and the embedder gives each target scopes that do not
@@ -3694,9 +3710,14 @@ impl Substrate {
         if group.is_some_and(|g| !self.scope_offers(g, target, timeline)) {
             return None;
         }
+        let kind = self.working_set_types.as_ref().and_then(|types| {
+            let (types, key) = &**types;
+            types.classify(self.custom_of(timeline)?.get(key)?)
+        });
         Some(Candidate {
             tokens: self.timeline_token_totals.get(&timeline).copied(),
             share: group.and_then(|g| self.working_set_shares.get(&g).copied()),
+            kind,
         })
     }
 
@@ -3719,14 +3740,16 @@ impl Substrate {
     /// conversation it names can no longer deliver anything.
     pub fn working_set_restore_lock(&mut self, target: TimelineId, timeline: TimelineId) -> bool {
         let Some(Candidate {
-            share: Some(share), ..
+            share: Some(share),
+            kind,
+            ..
         }) = self.working_set_candidate(target, timeline)
         else {
             return false;
         };
         let tokens = self.timeline_token_total(timeline);
         self.working_set_mut(target)
-            .restore_lock(timeline, tokens, share);
+            .restore_lock(timeline, tokens, share, kind);
         true
     }
 
@@ -4667,9 +4690,9 @@ impl Substrate {
             }
         }
         let key = StreamKey::of(stream_id, &id);
-        let turn_tags: Vec<String> = match &decl {
-            StreamDecl::Turn(t) => t.tags.clone(),
-            _ => Vec::new(),
+        let turn_tags: Option<Vec<String>> = match &decl {
+            StreamDecl::Turn(t) => Some(t.tags.clone()),
+            _ => None,
         };
         let section = matches!(decl, StreamDecl::PromptSection(_));
         let generation = SectionGeneration {
@@ -4704,7 +4727,12 @@ impl Substrate {
                     .prune(key, |held| held.epoch >= generation.oseq);
             }
         }
-        self.tagged_turns.set(key, &turn_tags);
+        // Only a turn is in a gather scope or among the dialogue; a stream
+        // redeclared as anything else leaves both.
+        match &turn_tags {
+            Some(tags) => self.tagged_turns.set(key, tags),
+            None => self.tagged_turns.remove(key),
+        }
         self.gallery_epoch += 1;
     }
 
@@ -4743,6 +4771,15 @@ impl Substrate {
         self.tagged_turns
             .with_any(tags)
             .into_iter()
+            .filter_map(|key| self.streams.turn(key))
+    }
+
+    /// Every stream declared as a turn with no gather tag, in stream-key order
+    /// — the members an untagged collection draws its gallery from. See the
+    /// `tagged_turns` field.
+    pub fn dialogue_turn_streams(&self) -> impl Iterator<Item = TurnStream<'_>> + '_ {
+        self.tagged_turns
+            .dialogue()
             .filter_map(|key| self.streams.turn(key))
     }
 
@@ -9070,6 +9107,30 @@ mod tests {
     }
 
     /// **A calibration names what it calibrates, and is never a member.**
+    /// **A candidate's type is read from the subject its metadata names**: a
+    /// document is typed, a source file and a conversation with no subject are
+    /// not, and with no types installed nothing is.
+    #[test]
+    fn a_candidate_is_typed_by_its_subject() {
+        let (mut sub, target, reads) = working_set_fixture(3, 10);
+        let kind = |sub: &Substrate, tl| sub.working_set_candidate(target, tl).and_then(|c| c.kind);
+        for (tl, path) in [
+            (reads[0], "candle/docs/x.md"),
+            (reads[1], "candle/zend/src/a.rs"),
+        ] {
+            let kv = BTreeMap::from([("path".to_string(), path.to_string())]);
+            sub.merge_custom(tl, &kv, RecordIdentity::NONE);
+        }
+        assert_eq!(kind(&sub, reads[0]), None, "no types installed yet");
+        let types =
+            TypeShares::new(&[("docs".to_string(), vec![r"\.md$".to_string()], 0.35)]).unwrap();
+        sub.set_working_set_types(types, "path");
+        let docs = kind(&sub, reads[0]).expect("a document");
+        assert_eq!((docs.id, docs.per_mille), (0, 350));
+        assert_eq!(kind(&sub, reads[1]), None, "source is unbounded");
+        assert_eq!(kind(&sub, reads[2]), None, "no subject, no type");
+    }
+
     /// The lookup keys each live calibration by its conversation — archived
     /// ones included, tombstoned ones not — and a calibration is refused as a
     /// lock however whole it is.
