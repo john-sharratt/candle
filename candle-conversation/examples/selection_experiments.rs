@@ -1384,6 +1384,7 @@ fn r4c(f: &Fixture, level: &[f32], floor_base: f32, floor_cap: f32) {
 //   backgrounds:  self-match warm (production ingest warm)  vs  dialogue-traffic
 
 use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
+use candle_conversation::provenance::window_score::{group_ranked, FlatSigs};
 use candle_conversation::provenance::{score_slots_fused, FusionMode};
 
 fn r5(f: &Fixture) {
@@ -1523,6 +1524,57 @@ const TOOL_GATE: f32 = 800.0;
 
 fn r6(f: &Fixture) {
     println!("\n═══ R6: tool catalog LOO through warm-up + normalization ═══");
+    let r = tool_chain(f, &|probe, slots| rank_weighted(probe, slots, &[]));
+    r.print();
+}
+
+/// What the tool catalog's leave-one-out chain measured under one scorer.
+struct ToolChain {
+    tools: usize,
+    probes: usize,
+    top1: usize,
+    top5: usize,
+    /// Summed reciprocal rank of the asked tool, normalized and fused.
+    rr: f32,
+    raw_top1: usize,
+    raw_top5: usize,
+    raw_rr: f32,
+    false_gate: usize,
+}
+
+impl ToolChain {
+    fn print(&self) {
+        let pct = |n: usize| 100.0 * n as f32 / self.probes.max(1) as f32;
+        let mean = |x: f32| x / self.probes.max(1) as f32;
+        println!(
+            "  {} LOO probes over {} tools: normalized Top-1 {:.1}%  Top-5 {:.1}%  MRR {:.3}  \
+             (raw question Top-1 {:.1}%  Top-5 {:.1}%  MRR {:.3})  other tools ≥ {TOOL_GATE:.0}: \
+             {:.2} a probe",
+            self.probes,
+            self.tools,
+            pct(self.top1),
+            pct(self.top5),
+            mean(self.rr),
+            pct(self.raw_top1),
+            pct(self.raw_top5),
+            mean(self.raw_rr),
+            self.false_gate as f32 / self.probes.max(1) as f32,
+        );
+    }
+}
+
+/// A probe's raw score per tool slot.
+type ToolScorer<'s> = dyn Fn(&[WideQSig], &[Slot]) -> Vec<f32> + 's;
+
+/// The 1-based rank of `idx` in `scores`, ties counted in its favour.
+fn place_of(scores: &[f32], idx: usize) -> usize {
+    scores.iter().filter(|&&s| s > scores[idx]).count() + 1
+}
+
+/// R6's chain — warm-up, leave-one-out question and tail probes, each
+/// normalized at its own length and max-fused — with every raw score from
+/// `score`.
+fn tool_chain(f: &Fixture, score: &ToolScorer) -> ToolChain {
     let mut by_tool: BTreeMap<String, Vec<&TurnRef>> = BTreeMap::new();
     for t in &f.targets["tool"] {
         let Some(tool) = t.tags.iter().find(|g| *g != "tool") else {
@@ -1564,13 +1616,23 @@ fn r6(f: &Fixture) {
         let gallery = slots_without(None, Some(tool));
         for t in turns {
             let probe = f.sig(t.timeline, t.index);
-            let raw = rank_weighted(probe, &gallery, &[]);
+            let raw = score(probe, &gallery);
             let own = ChildKey::named(tool.clone());
             cache.observe(&scope, source, &pairs_of(&raw), Some(&own), probe.len());
             source += 1;
         }
     }
-    let (mut top1, mut top5, mut probes, mut false_gate, mut raw_top1) = (0, 0, 0, 0, 0);
+    let mut out = ToolChain {
+        tools: by_tool.len(),
+        probes: 0,
+        top1: 0,
+        top5: 0,
+        rr: 0.0,
+        raw_top1: 0,
+        raw_top5: 0,
+        raw_rr: 0.0,
+        false_gate: 0,
+    };
     for (tool, turns) in &by_tool {
         if turns.len() < 2 {
             continue;
@@ -1582,7 +1644,7 @@ fn r6(f: &Fixture) {
             let q = &all[..HEAD_PROBE_TOKENS.min(all.len())];
             let tail = &all[all.len().saturating_sub(MAX_PROBE_TOKENS)..];
             let read = |p: &[WideQSig]| -> (Vec<f32>, Vec<f32>) {
-                let raw = rank_weighted(p, &gallery, &[]);
+                let raw = score(p, &gallery);
                 let normed = cache
                     .normalize(&scope, &pairs_of(&raw), p.len())
                     .into_iter()
@@ -1593,29 +1655,119 @@ fn r6(f: &Fixture) {
             let (raw_q, nq) = read(q);
             let (_, nt) = read(tail);
             let fused: Vec<f32> = nq.iter().zip(&nt).map(|(a, b)| a.max(*b)).collect();
-            let rank = fused.iter().filter(|&&s| s > fused[idx]).count() + 1;
-            top1 += usize::from(rank == 1);
-            top5 += usize::from(rank <= 5);
-            let raw_rank = raw_q.iter().filter(|&&s| s > raw_q[idx]).count() + 1;
-            raw_top1 += usize::from(raw_rank == 1);
-            false_gate += fused
+            let rank = place_of(&fused, idx);
+            out.top1 += usize::from(rank == 1);
+            out.top5 += usize::from(rank <= 5);
+            out.rr += 1.0 / rank as f32;
+            let raw_rank = place_of(&raw_q, idx);
+            out.raw_top1 += usize::from(raw_rank == 1);
+            out.raw_top5 += usize::from(raw_rank <= 5);
+            out.raw_rr += 1.0 / raw_rank as f32;
+            out.false_gate += fused
                 .iter()
                 .enumerate()
                 .filter(|(i, &s)| *i != idx && s >= TOOL_GATE)
                 .count();
-            probes += 1;
+            out.probes += 1;
         }
     }
-    let pct = |n: usize| 100.0 * n as f32 / probes.max(1) as f32;
-    println!(
-        "  {probes} LOO probes over {} tools: normalized Top-1 {:.1}%  Top-5 {:.1}%  \
-         (raw question Top-1 {:.1}%)  other tools ≥ {TOOL_GATE:.0}: {:.2} a probe",
-        by_tool.len(),
-        pct(top1),
-        pct(top5),
-        pct(raw_top1),
-        false_gate as f32 / probes.max(1) as f32,
-    );
+    out
+}
+
+// ═══ Round 7 — the tool catalog under the code-reading lab's formula ═════════
+//
+// The scoring lab (`provenance_gates … lab`) lifted code retrieval on the
+// dependency battery with each probe token voting for its best 8 cases,
+// `z_r × (a_r − a_9)`, and kept votes raised to 0.5 before they are summed. R7
+// runs R6's chain with each raw score from that law instead, so the two
+// formulas meet the tools on the same probes, warm-up and normalization.
+
+/// One raw-score law: votes per token, the power kept votes are raised to,
+/// and the needle gate's kept fraction.
+#[derive(Clone, Copy)]
+struct VoteLaw {
+    top_k: usize,
+    power: f32,
+    keep: f32,
+}
+
+/// `probe`'s score per slot under `law`: each probe token's best `top_k` slots
+/// per fold group, slot `r` by `z_r × (a_r − a_{top_k})` (`z` over the token's
+/// agreements with every gallery token), the tokens whose summed vote is in
+/// the top `keep` fraction keeping theirs, each raised to `power`.
+fn rank_law(probe: &[WideQSig], slots: &[Slot], law: VoteLaw) -> Vec<f32> {
+    let mut tokens: Vec<WideQSig> = Vec::new();
+    let mut token_slot: Vec<usize> = Vec::new();
+    for (i, s) in slots.iter().enumerate() {
+        for w in &s.windows {
+            tokens.extend(w.iter().cloned());
+            token_slot.extend(std::iter::repeat_n(i, w.len()));
+        }
+    }
+    let mut out = vec![0.0f32; slots.len()];
+    let Some(flat) = FlatSigs::new(&tokens) else {
+        return out;
+    };
+    let ranked = group_ranked(probe, &flat, &token_slot, slots.len(), law.top_k + 1);
+    let per_token: Vec<Vec<(usize, f32)>> = ranked
+        .iter()
+        .map(|groups| {
+            let mut votes = Vec::new();
+            for r in groups {
+                let floor = r.top.get(law.top_k).map_or(0, |t| t.1);
+                let std = r.std.max(1e-3);
+                for &(slot, a, _) in r.top.iter().take(law.top_k) {
+                    let z = ((a as f32 - r.mean) / std).max(0.0);
+                    let v = z * a.saturating_sub(floor) as f32;
+                    if v > 0.0 {
+                        votes.push((slot, v));
+                    }
+                }
+            }
+            votes
+        })
+        .collect();
+    let mags: Vec<f32> = per_token
+        .iter()
+        .map(|v| v.iter().map(|x| x.1).sum())
+        .collect();
+    if mags.is_empty() {
+        return out;
+    }
+    let n_keep = ((law.keep * mags.len() as f32).ceil() as usize).clamp(1, mags.len());
+    let mut sorted = mags.clone();
+    sorted.sort_unstable_by(|a, b| b.total_cmp(a));
+    let thresh = sorted[n_keep - 1];
+    for (votes, m) in per_token.iter().zip(&mags) {
+        if *m < thresh {
+            continue;
+        }
+        for &(slot, v) in votes {
+            out[slot] += v.powf(law.power);
+        }
+    }
+    out
+}
+
+fn r7(f: &Fixture) {
+    println!("\n═══ R7: tool catalog LOO under the code-reading lab's vote law ═══");
+    let laws = [
+        ("top-1, power 1 (production)", 1, 1.0),
+        ("top-1, power 0.5", 1, 0.5),
+        ("top-8, power 1", 8, 1.0),
+        ("top-8, power 0.5 (lab)", 8, 0.5),
+        ("top-4, power 0.5", 4, 0.5),
+        ("top-2, power 0.5", 2, 0.5),
+    ];
+    for (name, top_k, power) in laws {
+        let law = VoteLaw {
+            top_k,
+            power,
+            keep: 0.25,
+        };
+        println!("  {name}:");
+        tool_chain(f, &|probe, slots| rank_law(probe, slots, law)).print();
+    }
 }
 
 fn main() {
@@ -1668,5 +1820,8 @@ fn main() {
     }
     if run("6") {
         r6(&f);
+    }
+    if run("7") {
+        r7(&f);
     }
 }
