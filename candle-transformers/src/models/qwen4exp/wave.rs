@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use candle::engine_events::note;
 use candle::quantized::cuda::{to_dynamic, DynamicActs, MOE_PREDICT_VOTES_MAX_TOKENS};
 use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
@@ -1647,28 +1648,46 @@ impl Qwen4ExpBatched {
                 .remove(&child);
             return Ok(());
         }
-        let store = {
+        let t_lock = Instant::now();
+        // One write: take the child's store and put it under the parent. The
+        // parent's displaced store leaves the lock with it and is dropped
+        // outside — its per-layer buffers go back to the region pool, and none
+        // of that may hold the map every wave reads.
+        let displaced = {
             let mut map = self
                 .recurrent
                 .write()
                 .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
-            match map.remove(&child) {
+            let lock_us = t_lock.elapsed().as_micros() as u64;
+            let store = match map.remove(&child) {
                 Some(s) => s,
                 // The view never ran a wave; the parent keeps what it had.
                 None => return Ok(()),
-            }
+            };
+            (map.insert(parent, store), lock_us)
         };
-        self.recurrent
-            .write()
-            .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
-            .insert(parent, store);
+        let (displaced, lock_us) = displaced;
+        let t_drop = Instant::now();
+        let displaced_store = displaced.is_some();
+        drop(displaced);
+        let drop_us = t_drop.elapsed().as_micros() as u64;
         self.unpark(parent);
         // The parent's state is the view's continuation now, so a snapshot it
         // was still holding describes a point it has moved past.
-        self.staged
+        let t_staged = Instant::now();
+        let stale = self
+            .staged
             .write()
             .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
             .remove(&parent);
+        drop(stale);
+        let staged_us = t_staged.elapsed().as_micros() as u64;
+        note("recurrent move split", || {
+            format!(
+                "child={child} parent={parent} lock_us={lock_us} drop_us={drop_us} \
+                 displaced={displaced_store} staged_us={staged_us}"
+            )
+        });
         {
             let mut map = self
                 .ple
