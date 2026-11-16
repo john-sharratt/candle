@@ -22,6 +22,7 @@
 //! | [`model`] | the one model every tenant runs |
 //! | [`expert_split`] | the CPU expert split's settings, applied before the engine loads |
 //! | [`build_info`] | `--build-info`, and what every binary does first |
+//! | [`calibration`] | the load phase that writes each tool's exemplars, run by every tenant that offers tools |
 //! | [`logs`], [`telemetry`], [`loading`] | what the process says about itself |
 //! | [`memory_census`] | what the process holds, read once a minute, judged for growth |
 //! | [`process`], [`ctrl_c`], [`self_heal`] | process-wide concerns (the log file is `web::log_file`, which the gateway writes too) |
@@ -29,6 +30,7 @@
 pub mod access;
 pub mod boot;
 pub mod build_info;
+pub mod calibration;
 pub mod cli;
 pub mod cluster;
 pub mod commands;

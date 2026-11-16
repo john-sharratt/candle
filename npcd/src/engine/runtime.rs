@@ -85,6 +85,7 @@ use crate::engine::authoring;
 use crate::engine::authorize::{self, critical_compass};
 use crate::engine::bearings;
 use crate::engine::body::{self, Outcome};
+use crate::engine::calibrate;
 use crate::engine::channels::{self, ChannelSection};
 use crate::engine::compose;
 use crate::engine::driver::{self, Metronome};
@@ -153,6 +154,7 @@ use agent::jobs::Jobs;
 use agent::pusher::AgentPush;
 use candle_conversation::EngineSource;
 use cluster::member::{ClusterView, Link};
+use host::calibration;
 use host::cluster::store::ConversationStore;
 use host::cluster::view::{
     admitted, catchup_detail, catchup_progress, connecting_detail, model_id,
@@ -5396,6 +5398,36 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             "tools: {installed} installed into the prompt, each shown on the turns that can \
              take it"
         );
+    }
+
+    // ── what the acts are ranked by ────────────────────────────────────────
+    //
+    // A turn shows the acts its room offers that provenance ranks highest, and
+    // an act is ranked by the turns that carry its tag. Those are written here,
+    // from each act's authored examples and questions, by the phase zend runs
+    // over its tool files. On its own hidden layer, so it reads nothing of the
+    // mind and nothing of the mind reads it but the `tools` collection.
+    p.set_step(LoadStep::Calibrating);
+    if projection.is_some() {
+        let acts: Vec<&Tool> = tools::CATALOG
+            .iter()
+            .chain(ORDERED_ACTS)
+            .chain(reflect::ASKED)
+            .collect();
+        let defs = calibrate::defs(&acts, &conv_config.dialect);
+        let report = calibration::run(
+            &calibration::Phase {
+                engine: &engine,
+                config: &conv_config,
+                frame: &calibrate::frame(&conv_config.dialect),
+                progress: &|done, total| p.set_progress(done, total),
+                stopped: &|| rt.stopping(),
+            },
+            &defs,
+        )?;
+        if report.stopped {
+            anyhow::bail!("the process stopped while calibrating the acts");
+        }
     }
 
     // ── the prompt a character thinks under ────────────────────────────────

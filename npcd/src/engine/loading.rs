@@ -54,6 +54,11 @@ pub enum LoadStep {
     /// which is the worst kind of wrong: nothing fails, and retrieval is quietly
     /// worse than it should be.
     Tools,
+    /// Write each act's exemplars — its authored examples and the ways it is
+    /// asked for — so provenance has something to rank the acts by. Each is
+    /// written once and found again on every later start. See
+    /// `engine::calibrate`.
+    Calibrating,
     /// Diff the mind directory against what the substrate holds and ingest the
     /// difference — the step that puts a world's documents where a character can
     /// reach them.
@@ -72,6 +77,7 @@ impl LoadStep {
         LoadStep::Connecting,
         LoadStep::CatchUp,
         LoadStep::Tools,
+        LoadStep::Calibrating,
         LoadStep::Layers,
         LoadStep::Waking,
     ];
@@ -84,6 +90,7 @@ impl LoadStep {
             LoadStep::Connecting => "connecting",
             LoadStep::CatchUp => "catchup",
             LoadStep::Tools => "tools",
+            LoadStep::Calibrating => "calibrating",
             LoadStep::Layers => "layers",
             LoadStep::Waking => "waking",
         }
@@ -98,6 +105,7 @@ impl LoadStep {
             LoadStep::CatchUp => "Catching up",
             LoadStep::Layers => "Ingesting mind layers",
             LoadStep::Tools => "Installing tools",
+            LoadStep::Calibrating => "Calibrating acts",
             LoadStep::Waking => "Waking the cast",
         }
     }
@@ -113,6 +121,7 @@ impl LoadStep {
             LoadStep::CatchUp => "records",
             LoadStep::Layers => "files",
             LoadStep::Tools => "tools",
+            LoadStep::Calibrating => "examples",
             LoadStep::Waking => "characters",
         }
     }
@@ -372,7 +381,8 @@ mod tests {
                 LoadStep::Substrate,
                 LoadStep::Connecting,
                 LoadStep::CatchUp,
-                LoadStep::Tools
+                LoadStep::Tools,
+                LoadStep::Calibrating
             ]
         );
     }
@@ -395,6 +405,8 @@ mod tests {
         // And both sit after the substrate they write into, and before the cast
         // that reads them.
         assert!(pos(LoadStep::Substrate) < pos(LoadStep::Tools));
+        // An act's exemplars are written against its installed entry.
+        assert!(pos(LoadStep::Tools) < pos(LoadStep::Calibrating));
         assert!(pos(LoadStep::Layers) < pos(LoadStep::Waking));
         // The cluster is joined once the substrate — and the node it carries —
         // is open, and before anything is written that the group would share.
@@ -451,7 +463,7 @@ mod tests {
         }
         assert_eq!(
             LoadStep::ALL.len(),
-            7,
+            8,
             "a step was added without a decision"
         );
     }

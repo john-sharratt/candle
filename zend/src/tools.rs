@@ -31,13 +31,11 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use candle_conversation::models::Dialect;
-use candle_conversation::projection::{
-    Builder as ProjectionBuilder, DecodePriority, GroupId, LayerId, Reserved, SectionId,
-    SelectionRule,
-};
+use candle_conversation::projection::{Builder as ProjectionBuilder, SectionId};
 use candle_conversation::stencil::{function_blocks_to_json, ToolSpec};
 use candle_conversation::think_strip::strip_think_blocks_keep_layout;
 use candle_conversation::TurnText;
+use host::calibration::Frame;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -147,91 +145,29 @@ pub fn install_tool_catalog(
     Ok(out)
 }
 
-/// The selector id the calibration projection's `tools` collection reads
-/// ([`SelectionRule::Named`]) to pin exactly one tool. The "Calibrating sections"
-/// driver sets it per run via [`candle_conversation::TurnOptions::selection`].
-pub const CALIB_TOOL_SELECTOR: &str = "tool";
-
-/// Section-id partition for the calibration projection: high in the u32 space,
-/// just below the per-kind reserved singleton band (`u32::MAX - 0..3`) and far
-/// above the user schema's low 1..n ids and the tool ids allocated above them.
-/// 4096 ids is ample headroom for the frame, its summary framing, the whole tool
-/// catalog (one section each), and the outro.
-const CALIB_SECTION_BASE: u32 = u32::MAX - 4096;
-
-/// Build the hidden **calibration projection** used by the "Calibrating sections"
-/// load phase.
+/// The system prompt a calibration case's one tool is shown inside
+/// ([`host::calibration`]): the coding assistant's instruction to call, and the
+/// Hermes `<tools>…</tools>` envelope the live prompt wraps its tools in.
 ///
-/// A single `Reserved::Calibration` layer whose system prompt frames a `tools`
-/// collection holding the **whole** catalog — one name-keyed section per tool —
-/// governed by [`SelectionRule::Named`] on the [`CALIB_TOOL_SELECTOR`] selector.
-/// A calibration run pins one tool by setting that selector to the tool's name
-/// (via `TurnOptions::selection`), so the projection emits exactly that tool,
-/// wrapped in the proven Hermes `<tools>…</tools>` envelope. The model then sees
-/// a single available tool and free-decodes the full think→call trajectory (and
-/// its reprojection wide-Q windows) — the same conditions under which the
-/// `datetime` case calibrated cleanly, now reproduced for every tool.
-///
-/// The reserved layer keeps these conversations off every user projection (their
-/// turns never enter dialogue retrieval), and the `tools` collection's distinct,
-/// name-keyed member sections mean no two tools ever collide on one slot — the
-/// failure mode of the earlier single-reserved-section approach.
-///
-/// The system-prompt envelope markers live in the section *content* (the
-/// assembler does not wrap system sections): the frame opens with
-/// `dialect.system_start` and the outro closes with `dialect.system_end`.
-pub fn build_calibration_projection(
-    dialect: &Dialect,
-) -> anyhow::Result<(ProjectionBuilder, LayerId, GroupId)> {
-    let layer = LayerId::reserved(Reserved::Calibration);
-    let group = GroupId::reserved(Reserved::Calibration);
-
-    // Frame: system-open marker + framing prose + the opening `<tools>` marker.
-    // The collection's one selected tool line emits next; the outro closes it.
-    let frame = format!(
-        "{sys_start}You are a coding assistant. Use the available tool to satisfy the \
-         user's request.\n\n# Tools\n\nYou may call the tool below. Return the call as a \
-         JSON object with its name and arguments inside <tool_call></tool_call> XML tags.\n\n\
-         <tools>\n",
-        sys_start = dialect.system_start,
-    );
-    // Background to any dialogue that is up while it runs: `Low`, the band
-    // that steps aside for a live turn (`scheduler::band`), as the ingest and
-    // the units' calibration are.
-    let mut builder = ProjectionBuilder::for_reserved_corpus(
-        &frame,
-        Reserved::Calibration,
-        CALIB_SECTION_BASE,
-        DecodePriority::Low,
-    );
-
-    let collection = builder
-        .add_collection(
-            "tools",
-            SelectionRule::Named {
-                selector: CALIB_TOOL_SELECTOR.to_string(),
-            },
-            0.0,
-        )
-        .map_err(|e| anyhow::anyhow!("calibration add_collection: {e}"))?;
-    for def in crate::tool_def::all() {
-        builder
-            .add_section_to_collection(collection, def.name.clone(), def.json_line(), 100.0)
-            .map_err(|e| anyhow::anyhow!("calibration add tool {}: {e}", def.name))?;
+/// `open` is the system-open marker, the framing prose and the opening
+/// `<tools>` marker; the pinned tool's line emits next; `close` closes the
+/// block, gives the call instruction, and emits the system-close marker so the
+/// whole system message is well-formed.
+pub fn calibration_frame(dialect: &Dialect) -> Frame {
+    Frame {
+        open: format!(
+            "{sys_start}You are a coding assistant. Use the available tool to satisfy the \
+             user's request.\n\n# Tools\n\nYou may call the tool below. Return the call as a \
+             JSON object with its name and arguments inside <tool_call></tool_call> XML tags.\n\n\
+             <tools>\n",
+            sys_start = dialect.system_start,
+        ),
+        close: format!(
+            "</tools>\n\nFor a tool call, return:\n<tool_call>\n\
+             {{\"name\": <tool-name>, \"arguments\": <args-json-object>}}\n</tool_call>{sys_end}",
+            sys_end = dialect.system_end,
+        ),
     }
-
-    // Outro: close the `<tools>` block, give the call instruction, and emit the
-    // system-close marker so the whole system message is well-formed.
-    let outro = format!(
-        "</tools>\n\nFor a tool call, return:\n<tool_call>\n\
-         {{\"name\": <tool-name>, \"arguments\": <args-json-object>}}\n</tool_call>{sys_end}",
-        sys_end = dialect.system_end,
-    );
-    builder
-        .add_section("tools_outro", outro, 50.0)
-        .map_err(|e| anyhow::anyhow!("calibration add outro: {e}"))?;
-
-    Ok((builder, layer, group))
 }
 
 // ── Tool-call extraction ─────────────────────────────────────────────────────

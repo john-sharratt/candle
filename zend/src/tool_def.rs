@@ -20,6 +20,9 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use host::calibration::Calibrated;
+#[cfg(doc)]
+use host::calibration::PROJECTION_MARKER;
 use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use serde_json::Value;
@@ -32,12 +35,6 @@ use crate::types::ToolMode;
 /// The tool definitions, embedded at compile time. The `tools` collection in
 /// `prompts/projection.yaml` is filled from here.
 static TOOLS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src/prompts/tools");
-
-/// The marker embedded in a calibration example's trajectory at each projection
-/// (wide-Q capture) point. Not a real token — the prefill path strips it and
-/// records each occurrence's token offset so a projection fires there,
-/// reproducing the decode's per-segment projection sequence.
-pub const PROJECTION_MARKER: &str = "<|projection|>";
 
 /// One tool definition parsed from a `tools/*.yaml` file.
 #[derive(Debug, Clone, Deserialize)]
@@ -95,9 +92,9 @@ pub struct ToolDef {
     /// ChatML selection-calibration trajectories (prompt + `<|im_end|>
     /// <|im_start|>assistant` + think→call with [`PROJECTION_MARKER`]s), or a bare
     /// prompt for a tool whose trajectories are not recorded yet. A trajectory
-    /// is prefilled on its own ([`Self::trajectories`]); a bare prompt has no
-    /// answer to prefill, so it is calibrated as the question it is
-    /// ([`Self::calibration_questions`]).
+    /// is prefilled on its own ([`Calibrated::trajectories`]); a bare prompt
+    /// has no answer to prefill, so it is calibrated as the question it is
+    /// ([`Calibrated::calibration_questions`]).
     #[serde(default)]
     pub examples: Vec<String>,
     /// Extra ways a user might ASK for this tool — one plain question each, no
@@ -131,60 +128,27 @@ impl ToolDef {
         });
         serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string())
     }
+}
 
-    /// Content marker for one calibration case: this tool paired with one of its
-    /// trajectories — an `examples` entry or a rendered `questions` one. Covers
-    /// **everything that shapes the exemplar**: the projected [`Self::json_line`]
-    /// (name, description, parameters — exactly the text the model reads when
-    /// choosing a tool) and the trajectory itself.
-    ///
-    /// The calibration phase keys its resume cache on this, so editing a
-    /// description, a parameter's description, an example, or a question changes
-    /// the marker and that case re-runs against the current text. Hashing the
-    /// trajectory alone would leave a reworded tool answering the belief scan
-    /// with signatures captured against wording that no longer exists.
-    pub fn calibration_marker(&self, example: &str) -> String {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(self.json_line().as_bytes());
-        h.update([0u8]);
-        h.update(example.as_bytes());
-        format!("{}|{:x}", self.name, h.finalize())
+/// What the calibration phase reads of a definition: its name, the
+/// [`ToolDef::json_line`] the model reads when choosing it (name, description,
+/// parameters — so rewording any of them regenerates its cases), and the
+/// authored examples and questions.
+impl Calibrated for ToolDef {
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    /// The `examples` entries that carry a recorded answer: those with an
-    /// assistant half after `assistant_start`. Each is one calibration case.
-    pub fn trajectories<'a>(
-        &'a self,
-        assistant_start: &'a str,
-    ) -> impl Iterator<Item = &'a str> + 'a {
-        self.examples
-            .iter()
-            .map(String::as_str)
-            .filter(move |e| e.contains(assistant_start))
+    fn line(&self) -> String {
+        self.json_line()
     }
 
-    /// The questions calibrated as this tool's one stuffed group: the authored
-    /// [`Self::questions`], then every bare-prompt `examples` entry as the
-    /// plain question it is, its trailing `user_end` dropped.
-    ///
-    /// A bare prompt has no trajectory, and routing happens on the question, so
-    /// this is the exemplar it can give. Decoding it live instead put a
-    /// single-row decode of up to 2,048 tokens on the boot path per prompt, and
-    /// a prompt the model reasonably answers without
-    /// a call ("what failed at the end of the build log?" with no job to read)
-    /// never sealed, so it was decoded again on every boot.
-    pub fn calibration_questions(&self, assistant_start: &str, user_end: &str) -> Vec<String> {
-        let end = user_end.trim();
-        let bare = self
-            .examples
-            .iter()
-            .filter(|e| !e.contains(assistant_start))
-            .map(|e| {
-                let p = e.trim();
-                p.strip_suffix(end).unwrap_or(p).trim_end().to_string()
-            });
-        self.questions.iter().cloned().chain(bare).collect()
+    fn examples(&self) -> &[String] {
+        &self.examples
+    }
+
+    fn questions(&self) -> &[String] {
+        &self.questions
     }
 }
 

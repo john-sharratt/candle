@@ -65,7 +65,9 @@ pub const TERMINAL_LIST: Tool = bare!(
     "Terminals",
     "List every terminal you can reach now — each a real thing with a way in: the house's \
      lights, a television, the house network, the cluster, a machine — with what it is and \
-     whether it answers.",
+     whether it answers. Use for: finding out what you can reach, and the exact name to give \
+     `terminal_connect`. Triggered by: \"what can you reach\", \"which terminals do you have\", \
+     wanting to look at something outside you without knowing its terminal's name.",
     "You want to look in on the house and do not know what is there to look through.",
     "You are nowhere, so nothing is in front of you until you connect to it; the list is where \
      looking starts."
@@ -74,8 +76,14 @@ pub const TERMINAL_LIST: Tool = bare!(
 pub const TERMINAL_CONNECT: Tool = one!(
     "terminal_connect",
     "Terminals",
-    "Connect to a terminal. You hold one connection: connecting to another lets the last go. \
-     Connected, what the terminal can do is yours to do, and it tells you what that is.",
+    "Connect to a terminal — the only way you reach anything outside you. You hold one \
+     connection: connecting to another lets the last go. Connected, what the terminal can do is \
+     yours to do, and it tells you what that is. Use for: any question or errand about the \
+     cluster, a machine, the lights, a television or the house network — connect first, then \
+     act with what the terminal gives you; until you are connected you know nothing of it and \
+     can only say so. Triggered by: \"check the cluster\", \"are the machines up\", \"is the \
+     television on\", \"turn the lights off\", or having told somebody you would look at a \
+     thing you are not connected to.",
     "terminal",
     "string",
     "The terminal to connect to, by its name as `terminal_list` gave it.",
@@ -335,7 +343,10 @@ pub const CLUSTER_STATUS: Tool = bare!(
     "cluster_status",
     "Cluster",
     "Read how the cluster stands: every member, the build each runs, whether it is ready, and \
-     anything in fault.",
+     anything in fault. Use for: the first look at the cluster, and any question of whether \
+     the machines are up, serving, or on the same build. Triggered by: \"is everything up\", \
+     \"are the machines serving\", \"what build is each member on\", \"did the rollout reach \
+     every member\".",
     "You are on your watch and have not looked at the cluster since morning.",
     "A member that has fallen out says nothing; it is seen only by looking."
 );
@@ -344,7 +355,9 @@ pub const CLUSTER_SERVICES: Tool = bare!(
     "cluster_services",
     "Cluster",
     "Read what each machine's keep runs: every service's installed build, whether it runs, and \
-     how its last trial ended.",
+     how its last trial ended. Use for: whether a deploy took on each machine, and what is \
+     installed as against what the cluster reports. Triggered by: \"did the deploy take\", \
+     \"is a trial running\", \"what is installed on that machine\".",
     "A deploy went out this afternoon and you want to know it took everywhere.",
     "What a machine runs is in its keep, not in what was meant to be deployed."
 );
@@ -356,7 +369,10 @@ pub const CLUSTER_LOGS: Tool = Tool {
     plane: Plane::World,
     availability: Availability::Granted,
     description: "Search the cluster's logs — every member's, gathered at the gateway — for \
-                  what they say about a symptom, oldest first.",
+                  what they say about a symptom, oldest first. Use for: why something happened, \
+                  once you have a word for it. Triggered by: \"why did it restart\", \"what do \
+                  the logs say about\", \"find the error\"; with no word to search for, \
+                  `cluster_log` reads the newest lines.",
     params: &[
         Param {
             name: "grep",
@@ -545,7 +561,10 @@ pub const MACHINE_CHECK: Tool = Tool {
     description: "Run one of the checks of the machine you are connected to. A check looks and \
                   changes nothing, and its report begins with what is different from the last \
                   time it ran. The machine's own list says what each one reports and what \
-                  arguments it takes.",
+                  arguments it takes. Use for: how one machine is doing — its health, its \
+                  disks, what listens on it, what runs on it, what its logs say. Triggered by: \
+                  \"is that machine healthy\", \"what is using the disk\", \"has anything \
+                  changed on it\".",
     params: &[
         Param {
             name: "check",

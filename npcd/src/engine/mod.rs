@@ -60,6 +60,7 @@ pub mod bench;
 pub mod bodies;
 pub mod body;
 pub mod build;
+pub mod calibrate;
 pub mod channels;
 pub mod check;
 pub mod chronology;

@@ -2387,7 +2387,7 @@ impl Sequence {
     /// 0`, so the scheduler prefills then seals — `perform_seal_and_write`
     /// captures the whole turn's wide-Q from KV exactly as for a decoded turn.
     ///
-    /// `selection` pins the tool (via `CALIB_TOOL_SELECTOR`) so the projection
+    /// `selection` pins the tool (via the calibration projection's tool selector) so the projection
     /// marks exactly that catalog member selected; `tags` scope the belief
     /// gallery. Returns the streaming handle — drain it to `Done` and seal it
     /// with [`finish_turn`](Self::finish_turn) exactly like a decoded turn.

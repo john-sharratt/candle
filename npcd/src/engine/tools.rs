@@ -40,9 +40,11 @@
 //!
 //! Each tool also carries `examples` — a concrete situation, the call a
 //! well-calibrated character makes in it, and why that call rather than a
-//! neighbouring one. They are what an act is written against, not what the
-//! model reads; a tool with none has not been thought through, so an
-//! example-less tool is a build failure here rather than a quiet regression.
+//! neighbouring one. The model never reads them in its prompt: they are
+//! prefilled at load as the turns provenance ranks the acts by
+//! ([`crate::engine::calibrate`]), so an act with none has nothing to be
+//! chosen by, and an example-less tool is a build failure here rather than a
+//! quiet regression.
 
 use candle_conversation::projection::{
     Builder, SelectionRule, SelectionState, FORCE_TOOL_SELECTOR, FORCE_TOOL_SEPARATOR,

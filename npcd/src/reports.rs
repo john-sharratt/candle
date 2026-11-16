@@ -106,9 +106,9 @@ impl Reports for NpcdReports {
             Err((
                 409,
                 json!({
-                    "error": "calibrated_by_examples",
-                    "detail": "an npcd act is calibrated by the examples authored for it in the \
-                               catalog; there is no pass to run",
+                    "error": "calibrated_at_load",
+                    "detail": "an npcd act is calibrated at load, from the examples and questions \
+                               authored for it in the catalog; there is no pass to run",
                 }),
             ))
         })
@@ -257,7 +257,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (code, body) = reports(dir.path()).calibrate().await.unwrap_err();
         assert_eq!(code, 409);
-        assert_eq!(body["error"], "calibrated_by_examples");
+        assert_eq!(body["error"], "calibrated_at_load");
     }
 
     /// A signed-out caller has no account and npcd says nothing; a signed-in
