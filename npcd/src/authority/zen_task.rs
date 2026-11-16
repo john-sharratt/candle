@@ -97,7 +97,21 @@ pub(crate) async fn call_zend(
     )
     .await
     .map_err(|e| format!("Zen could not be reached: {e:#}"))?;
-    answer_of(&reply.body)
+    answered(reply.status, &reply.body)
+}
+
+/// A reply's answer: [`answer_of`] its body when zend took the call, and when
+/// the gateway or zend refused it, the status it was refused with — a refusal
+/// often carries no body, and "nothing readable" would hide why.
+fn answered(status: u16, body: &[u8]) -> Result<String, String> {
+    if (200..300).contains(&status) {
+        return answer_of(body);
+    }
+    let said = String::from_utf8_lossy(body);
+    Err(match said.trim() {
+        "" => format!("the call was refused with status {status}"),
+        said => format!("the call was refused with status {status}: {said}"),
+    })
 }
 
 fn recorded(act: &Act, landed: bool, answer: String) -> Recorded {
@@ -364,6 +378,27 @@ mod tests {
     const ROOMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps");
     const WORLD: &str = "creators-vault";
     const HANDLE: &str = "task:mission-1-0/fix-door";
+
+    /// A refused call says the status it was refused with, body or none; a
+    /// call zend took is read for its answer.
+    #[test]
+    fn a_refused_call_says_its_status() {
+        assert_eq!(
+            answered(403, b""),
+            Err("the call was refused with status 403".to_string())
+        );
+        assert_eq!(
+            answered(503, b"no member is ready\n"),
+            Err("the call was refused with status 503: no member is ready".to_string())
+        );
+        assert_eq!(
+            answered(
+                200,
+                br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"two members"}]}}"#
+            ),
+            Ok("two members".to_string())
+        );
+    }
 
     /// **Eight tasks are asked after four at a time**: each call taking 30 s,
     /// half land at 30 s and half at 60 s, and never more than four are in
