@@ -85,6 +85,8 @@ impl World for NoFacts {
 struct TalkDesk<'a> {
     minds: &'a Minds,
     asker: UnsealedAsker,
+    /// The band the draft is asked at: the conversation's own.
+    band: DecodePriority,
     tree: Option<Arc<StencilTree>>,
     /// The journal's record once something was kept: the caller writes it to
     /// the conversation's metadata.
@@ -109,16 +111,14 @@ impl Desk for TalkDesk<'_> {
             selection: self.asker.selection(),
             ..Default::default()
         };
-        // Below every turn a person waits on, above the layers that only
-        // maintain themselves — where every journal draft runs.
+        // At the conversation's own band. A journal draft elsewhere runs
+        // below every turn a person waits on; this one is what carries the
+        // person's request to the mind, and the conversation is held until it
+        // is written — asked at `Normal`, it waited ten minutes behind the
+        // character's own reflection with the request still undelivered.
         let response = self
             .asker
-            .ask(
-                question,
-                DecodePriority::Normal,
-                AskScope::Conversation,
-                options,
-            )
+            .ask(question, self.band, AskScope::Conversation, options)
             .await?;
         Ok(response.text)
     }
@@ -529,10 +529,12 @@ impl Minds {
         talk: &Talk,
         state: &Mutex<TalkJournal>,
         span: &Span,
+        band: DecodePriority,
     ) -> (Outcome, Timing, Option<String>) {
         let mut desk = TalkDesk {
             minds: self,
             asker: talk.sequence.unsealed_asker(),
+            band,
             tree: None,
             record: None,
         };

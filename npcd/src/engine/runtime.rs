@@ -2387,10 +2387,15 @@ impl Runtime {
             // (`dreams::DREAM_EVERY_MS`), or one being written, it would be
             // minutes of decode that lead nowhere, and the turn goes on with
             // the work instead.
+            //
+            // **A mind with no body neither reflects nor dreams.** It keeps
+            // the watch: with nothing to do it rests, and time spent turning
+            // the quiet over — "terrified that the silence means they have
+            // stopped breathing" — was time a person's request waited behind.
             cooling: {
                 let mut cooling = self.cooldowns.cooling(npc_id);
                 cooling.extend(self.loop_guards.cooling(npc_id));
-                if !self.dream_available(npc_id) {
+                if bodiless || !self.dream_available(npc_id) {
                     cooling.push(tools::REFLECT.name.to_string());
                 }
                 cooling.sort_unstable();

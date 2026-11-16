@@ -444,7 +444,11 @@ does (`docs/zend_journal.md`), written by the same workflow
   numbers a claim cites are the thread's seqs, so they mean the same thing
   after a restart.
 - **The draft.** Asked of the conversation on an ephemeral fork of itself
-  under `AskScope::Conversation`, at `Normal` priority, writing nothing back.
+  under `AskScope::Conversation`, writing nothing back, at the conversation's
+  own band: it is what carries the person's request to the mind, and the
+  conversation is held until it is written. Asked at `Normal`, where other
+  journal drafts run, it waited ten minutes behind the character's own
+  reflection.
   One answer writes an entry — a one-sentence summary, claims that cite, what
   the character means to do next, what it left open — or, once the journal
   holds an entry to weigh the stretch against, skips it.

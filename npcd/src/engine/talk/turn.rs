@@ -526,6 +526,7 @@ impl Runtime {
                     &seen.me,
                     &spoken.words,
                     world_ms,
+                    band,
                 )
                 .await
             {
@@ -580,13 +581,14 @@ impl Runtime {
         me: &str,
         reply: &str,
         world_ms: u64,
+        band: DecodePriority,
     ) -> Option<String> {
         let turns = journal::stretch(lines, me, reply, world_ms);
         let newest = turns.last()?.id;
         let mut held = TalkJournal::restore(&minds.talk_meta(talk));
         let span = held.journal_mut().begin(turns, newest)?;
         let state = Mutex::new(held);
-        let (outcome, _, record) = minds.talk_journal(talk, &state, &span).await;
+        let (outcome, _, record) = minds.talk_journal(talk, &state, &span, band).await;
         if let Some(record) = record {
             let kept = BTreeMap::from([(journal::META_JOURNAL.to_string(), record)]);
             if let Err(e) = minds.set_talk_meta(talk, &kept) {
