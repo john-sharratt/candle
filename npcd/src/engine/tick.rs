@@ -220,11 +220,32 @@ pub struct Inbox {
     /// context, identical decode; the character repeated one act until something
     /// outside it changed.
     last_nudge_ms: u64,
+    /// What a person asked of this character that it has not yet told them
+    /// the outcome of — see [`Scheduler::ask`].
+    asked: Option<Asked>,
     /// What the character's own task sleeps on — see [`Scheduler::wait_due`].
     /// A delivery, a cut-short pause, and a retirement each notify it; the
     /// permit is stored if the task is mid-think, so a wake sent while the
     /// character is busy is read the moment it returns to its wait.
     waker: Arc<Notify>,
+}
+
+/// How long a request stands with nothing told of it before it is dropped.
+pub const ASKED_FOR_MS: u64 = 20 * 60 * 1000;
+
+/// A request a person made of a character on the phone, standing until the
+/// character has worked at it and told them what came of it.
+#[derive(Debug, Clone)]
+struct Asked {
+    /// Who asked, by the name the character calls them.
+    party: String,
+    /// What they asked, as the conversation's journal entry wrote it.
+    request: String,
+    /// World time (ms) it was asked.
+    at_ms: u64,
+    /// Whether an act of the character's has come back with something since:
+    /// only then is telling them an answer and not a promise of one.
+    worked: bool,
 }
 
 impl Inbox {
@@ -258,8 +279,26 @@ impl Inbox {
             replayed: 0,
             last_news_ms: 0,
             last_nudge_ms: 0,
+            asked: None,
             waker: Arc::new(Notify::new()),
         }
+    }
+
+    /// What a person asked of this character and has not been told the
+    /// outcome of, while it still stands at `world_ms`: who, and what was
+    /// asked. One left standing past [`ASKED_FOR_MS`] is dropped — a request
+    /// nothing came of does not hold a character for ever.
+    pub fn asked(&mut self, world_ms: u64) -> Option<(String, String)> {
+        let standing = self
+            .asked
+            .as_ref()
+            .is_some_and(|a| world_ms.saturating_sub(a.at_ms) < ASKED_FOR_MS);
+        if !standing {
+            self.asked = None;
+        }
+        self.asked
+            .as_ref()
+            .map(|a| (a.party.clone(), a.request.clone()))
     }
 
     /// Stop for a while and then come back to it.
@@ -998,6 +1037,66 @@ impl Scheduler {
             .unwrap()
             .get(&npc_id)
             .is_none_or(Inbox::acted_since_news)
+    }
+
+    /// Hold `request`, which `party` made of this character on the phone,
+    /// until the character has worked at it and told them what came of it.
+    ///
+    /// **A request has to outlast the turn it arrived on.** It reaches the
+    /// mind once, as what a conversation settled; the next thing to wake the
+    /// mind — a Drone taking up work, a message on a channel — begins a turn
+    /// that says nothing of it, and a mind that reads only what is in front
+    /// of it connected to a terminal and then rested. Held here, it is
+    /// restated at the head of every turn ([`Self::asked`]) and stopping is
+    /// refused while it stands.
+    pub fn ask(&self, npc_id: u64, party: &str, request: &str, world_ms: u64) {
+        if let Some(i) = self.inboxes.lock().unwrap().get_mut(&npc_id) {
+            i.asked = Some(Asked {
+                party: party.to_string(),
+                request: request.trim().to_string(),
+                at_ms: world_ms,
+                worked: false,
+            });
+        }
+    }
+
+    /// What is still asked of this character at `world_ms`: who asked, and
+    /// what. See [`Inbox::asked`].
+    pub fn asked(&self, npc_id: u64, world_ms: u64) -> Option<(String, String)> {
+        self.inboxes
+            .lock()
+            .unwrap()
+            .get_mut(&npc_id)
+            .and_then(|i| i.asked(world_ms))
+    }
+
+    /// Note that an act of this character's came back with something: from
+    /// here, telling whoever asked is an answer.
+    pub fn worked(&self, npc_id: u64) {
+        if let Some(asked) = self
+            .inboxes
+            .lock()
+            .unwrap()
+            .get_mut(&npc_id)
+            .and_then(|i| i.asked.as_mut())
+        {
+            asked.worked = true;
+        }
+    }
+
+    /// Note that this character has told `party` something. What `party`
+    /// asked stands no longer once the character has worked at it; told
+    /// before any act of its own came back, it was promised an answer and is
+    /// still owed one.
+    pub fn told(&self, npc_id: u64, party: &str) {
+        if let Some(i) = self.inboxes.lock().unwrap().get_mut(&npc_id) {
+            if i.asked
+                .as_ref()
+                .is_some_and(|a| a.worked && a.party == party)
+            {
+                i.asked = None;
+            }
+        }
     }
 
     /// Whether this character is due the standing task. See [`Inbox::nudge_due`].
@@ -2681,6 +2780,37 @@ mod tests {
 
         s.deliver(1, T0 + 4_000, Salience::NORMAL, say("is it up?"));
         assert!(!s.acted_since_news(1), "asked again");
+    }
+
+    /// **What a person asked stands until the character has worked at it and
+    /// told them.** Telling them before any act came back leaves it standing;
+    /// telling somebody else leaves it standing; and one nothing came of is
+    /// dropped after [`ASKED_FOR_MS`].
+    #[test]
+    fn a_request_stands_until_it_is_worked_at_and_told() {
+        const T0: u64 = 1_000_000;
+        let s = sched();
+        s.wake(1, 0, T0);
+        assert_eq!(s.asked(1, T0), None);
+        s.ask(1, "John", " Asked whether the television is on. ", T0);
+        let standing = Some((
+            "John".to_string(),
+            "Asked whether the television is on.".to_string(),
+        ));
+        assert_eq!(s.asked(1, T0 + 1_000), standing);
+
+        s.told(1, "John");
+        assert_eq!(s.asked(1, T0 + 2_000), standing, "a promise, not an answer");
+        s.worked(1);
+        s.told(1, "Jitter");
+        assert_eq!(s.asked(1, T0 + 3_000), standing, "told to somebody else");
+        s.told(1, "John");
+        assert_eq!(s.asked(1, T0 + 4_000), None);
+
+        s.ask(1, "John", "Asked for the lights off.", T0);
+        assert!(s.asked(1, T0 + ASKED_FOR_MS - 1).is_some());
+        assert_eq!(s.asked(1, T0 + ASKED_FOR_MS), None, "nothing came of it");
+        assert_eq!(s.asked(1, T0 + 1), None, "and it does not come back");
     }
 
     /// **The active summons reaches a character deep in conversation, where the

@@ -756,6 +756,18 @@ pub const YOUR_OWN_TIME: &str = "Nobody gives you orders, and nothing is waiting
 pub const ROUND_TAKEN: &str = "Nothing was on your agenda, so your round has given you its next \
                                item, and it is what you are working on now.";
 
+/// What a character reads at the head of a turn while `request`, which
+/// `party` made of it on the phone, is still to be done and told.
+pub fn still_asked(party: &str, request: &str) -> String {
+    format!(
+        "Still yours to do, and nothing comes before it: what {party} asked of you on the \
+         phone.\n{}\nDo it yourself, now, with the act that answers it, then tell {party} what \
+         came of it — what you read, or that you could not. Telling them you are about to is \
+         not an answer.",
+        request.trim()
+    )
+}
+
 /// Put the round's next due item on `body`'s empty agenda and say what it was
 /// given ([`ROUND_TAKEN`] and the mission) — `None` when its agenda is not
 /// empty or nothing on the round is due.
@@ -3206,6 +3218,10 @@ impl Runtime {
     fn arm_followup(&self, npc_id: u64, act: &Act, landed: bool, moved: bool) {
         let through_a_terminal = answers_through_a_terminal(act.tool)
             || (is_of_the_bridge(act.tool) && self.is_bodiless(npc_id));
+        // A reading taken is what makes telling whoever asked an answer.
+        if through_a_terminal && landed {
+            self.scheduler.worked(npc_id);
+        }
         if moved || through_a_terminal || body::continues(act, landed) {
             self.scheduler.think_again(npc_id);
         }
@@ -6927,6 +6943,25 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                     world_ms,
                     Salience::URGENT,
                     EventKind::Nudge { text },
+                ));
+            }
+            // **What a person asked and has not been told the outcome of is
+            // restated on every turn it is not itself the news of**: a turn
+            // begun on a Drone taking up work reads nothing of the request
+            // otherwise, and the request is dropped for whatever is in front
+            // of the mind. Appended to the tick in hand, as the summons is.
+            let fresh = start
+                .events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::Concluded { .. }));
+            if let Some((party, request)) = rt.scheduler.asked(id, world_ms).filter(|_| !fresh) {
+                start.events.push(Event::new(
+                    rt.scheduler.next_seq(),
+                    world_ms,
+                    Salience::URGENT,
+                    EventKind::Nudge {
+                        text: still_asked(&party, &request),
+                    },
                 ));
             }
             let mut awaiting_reflection: Option<(oneshot::Receiver<String>, Owed)> = None;

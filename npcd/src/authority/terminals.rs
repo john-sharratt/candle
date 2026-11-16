@@ -29,7 +29,7 @@ use crate::bridge::finding::{ANDROIDTV, WEBOS};
 use crate::bridge::{discover, PAIRING_AGENT};
 use crate::engine::act::Act;
 use crate::engine::event::{EventKind, Salience};
-use crate::engine::runtime::{Recorded, Runtime, LANDED, REFUSED};
+use crate::engine::runtime::{still_asked, Recorded, Runtime, LANDED, REFUSED};
 use crate::engine::terminal::{
     self, check_args, tv_action, watch, welcome, Kind, Machine, Terminal, ALL_LIGHTS, CLUSTER,
     NETWORK,
@@ -212,9 +212,14 @@ impl Runtime {
             // Stopping is refused once, while what last reached the mind is
             // still unanswered by any act of its own: taken in the turn a
             // request arrives, it would put the request down unread.
-            "rest" => match self.scheduler.acted_since_news(npc) {
-                true => (true, RESTED.into()),
-                false => (false, REST_REFUSED.into()),
+            // And refused outright while what a person asked on the phone is
+            // still to be done and told.
+            "rest" => match self.scheduler.asked(npc, self.world_ms(npc)) {
+                Some((party, request)) => (false, still_asked(&party, &request)),
+                None => match self.scheduler.acted_since_news(npc) {
+                    true => (true, RESTED.into()),
+                    false => (false, REST_REFUSED.into()),
+                },
             },
             _ => match self.connection(&hosted, &body) {
                 None => (

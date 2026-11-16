@@ -32,7 +32,7 @@ use crate::engine::talk::clock::{self, Ended, Input};
 use crate::engine::talk::critical;
 use crate::engine::talk::guard::{self, Words};
 use crate::engine::talk::hand_off;
-use crate::engine::talk::journal::{self, TalkJournal};
+use crate::engine::talk::journal::{self, TalkJournal, TALK};
 use crate::engine::talk::key::Party;
 use crate::engine::talk::runner::{Inputs, Key};
 use crate::engine::talk::state::TalkState;
@@ -537,6 +537,11 @@ impl Runtime {
                     applied: said_for_the_mind(&spoken.words),
                 },
             );
+            // The mind has told this person something: what they asked of it
+            // stands no longer, once it has worked at it.
+            if party.is_person() {
+                self.scheduler.told(npc, &seen.party_name);
+            }
         }
         if matches!(ended, Ended::Spoke) {
             if let Some(entry) = self
@@ -552,6 +557,13 @@ impl Runtime {
                 )
                 .await
             {
+                // **What a person asked, and the character means to do, is
+                // held until it is done and told** (`Scheduler::ask`): the
+                // entry reaches the mind once, and the next thing to wake it
+                // says nothing of it.
+                if party.is_person() && !told && entry.contains(TALK.meaning_to) {
+                    self.scheduler.ask(npc, &seen.party_name, &entry, world_ms);
+                }
                 elsewhere = vec![entry];
                 // A telling has already woken the mind; its entry is read on
                 // the turn that wake starts.

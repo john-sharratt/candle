@@ -285,6 +285,19 @@ and raises that the person is home the moment their handset is seen, and
 that they have gone out once two surveys running have missed it — one miss
 is a phone asleep.
 
+**A request stands until it is done and told.** When a person's phone
+conversation keeps a journal entry that says the character means to do
+something (its `Meaning to:` part), the scheduler holds it
+(`Scheduler::ask`). While it stands it is restated at the head of every turn
+that is not itself the entry's (`runtime::still_asked`) — a turn begun on a
+Drone taking up work would otherwise read nothing of it — and `rest` is
+refused with the same words. It stands no longer once an act through a
+terminal has come back (`Scheduler::worked`) and the mind has then told that
+person something (`Scheduler::told`); told before any act came back, they
+were promised an answer and are still owed one. One nothing comes of is
+dropped after twenty minutes (`tick::ASKED_FOR_MS`). It is held in memory:
+a restart forgets it, and the entry in the journal is what remains.
+
 ### 5.1 What a mind that works terminals reads
 
 The engine's prompt is one schema for every character, and what differs by
