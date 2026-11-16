@@ -9,8 +9,11 @@
 //! - **Towards `group:keep`**: an Admin's requests to a machine's keep, each
 //!   sent to the keep of the machine it names ([`keeps`](super::keeps)).
 //! - **Towards `group:bus`**: the member itself on this gateway's bus
-//!   (`docs/mcp_file_tools.md` §5.2), on any topic. Any other group is
-//!   refused.
+//!   (`docs/mcp_file_tools.md` §5.2), on any topic.
+//! - **Towards `group:<app>` of another clustered app**: a request for that
+//!   app's routes, served as on the member's own stream but routed on that
+//!   app's site — how npcd, on a machine that hosts no zend, calls zend's
+//!   `/v1/mcp` as Zen. Any other group is refused.
 
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -41,6 +44,17 @@ pub fn serve(gateway: &Arc<Gateway>, ip: IpAddr, stream: MemberStream) {
             serve_group(gateway, ip, stream, Group::Keeps);
         } else if group == BUS_GROUP {
             serve_router(gateway, ip, stream, member_router(gateway.clone()), None);
+        } else if gateway.hub.clustered(group) {
+            // Another app's routes, asked of this gateway as that app's own
+            // members ask them: served by the gateway's router on that app's
+            // site, the identity the member states believed as on its own
+            // stream. A machine that hosts npcd alone reaches zend this way.
+            let Some(router) = gateway.router() else {
+                stream.conn.reset();
+                return;
+            };
+            let origin = origin_for(group, stream.node);
+            serve_router(gateway, ip, stream, router, Some(origin));
         } else {
             tracing::debug!(group, "a member opened a stream to a group that takes none");
             stream.conn.reset();
@@ -51,11 +65,18 @@ pub fn serve(gateway: &Arc<Gateway>, ip: IpAddr, stream: MemberStream) {
         stream.conn.reset();
         return;
     };
-    let origin = MemberOrigin {
-        app: stream.app.clone(),
-        node: stream.node,
-    };
+    let origin = origin_for(&stream.app, stream.node);
     serve_router(gateway, ip, stream, router, Some(origin));
+}
+
+/// The origin a request from member `node` carries when it is routed as
+/// `app`'s: its own app's on the stream towards it, another clustered app's
+/// on a stream towards that app's group.
+fn origin_for(app: &str, node: u64) -> MemberOrigin {
+    MemberOrigin {
+        app: app.to_string(),
+        node,
+    }
 }
 
 /// Each request on `stream` served by `router`, marked `origin` when it is
@@ -126,4 +147,20 @@ fn serve_group(gateway: &Arc<Gateway>, ip: IpAddr, stream: MemberStream, group: 
             tracing::debug!(error = %e, "member group stream ended");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{origin_for, MemberOrigin};
+
+    #[test]
+    fn a_request_is_routed_as_the_app_its_stream_was_opened_towards() {
+        assert_eq!(
+            origin_for("zend", 0x09dd),
+            MemberOrigin {
+                app: "zend".to_string(),
+                node: 0x09dd,
+            }
+        );
+    }
 }

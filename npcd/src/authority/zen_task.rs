@@ -1,8 +1,8 @@
 //! The task acts and their tending, where the world runs
 //! (`docs/mission_templates.md` §7): a drone's `task_start`, `task_reply` and
 //! `task_nudge` become `repo_task_start`, `repo_task_reply` and
-//! `repo_task_nudge` on zend's `/v1/mcp`, sent up this member's cluster socket
-//! as Zen — the identity `service:zen` (`docs/mcp_file_tools.md` §4), which the
+//! `repo_task_nudge` on zend's `/v1/mcp`, sent through a gateway to zend's
+//! group as Zen — the identity `service:zen` (`docs/mcp_file_tools.md` §4), which the
 //! member states and the gateway believes from a member's socket, as zend's own
 //! calls to npcd are made. Every [`POLL_EVERY`], each carried mission's task is
 //! asked how it stands (`job_status`, `wait_s: 0`), off the decode path; what
@@ -19,7 +19,7 @@ use std::time::Duration;
 use axum::http::{header, HeaderName, HeaderValue, Method};
 use cluster::member::AppMember;
 use futures::stream::{self, StreamExt};
-use host::cluster::up::send_up;
+use host::cluster::up::send_to_group;
 use mcp_server::http::VERSION_HEADER;
 use mcp_server::protocol::MODERN;
 use serde_json::Value;
@@ -36,6 +36,9 @@ use crate::engine::zen_task::request::{
 use crate::engine::zen_task::{task_grants, Task};
 use crate::sim::phone::{Kind as ThreadKind, Said, Who};
 use crate::sim::Sim;
+
+/// The app whose members serve zend's `/v1/mcp`: the group a call is sent to.
+pub const ZEND_APP: &str = "zend";
 
 /// The service a drone's task is Zen's as: `service:zen`.
 pub const ZEN_SERVICE: &str = "zen";
@@ -87,8 +90,11 @@ pub(crate) async fn call_zend(
     thread: &str,
 ) -> Result<String, String> {
     let body = rpc(tool, args, thread).to_string().into_bytes();
-    let reply = send_up(
+    // Towards zend's group, not up this member's own stream: a gateway routes
+    // that one on npcd's site, where `/v1/mcp` is nobody's.
+    let reply = send_to_group(
         member,
+        ZEND_APP,
         Method::POST,
         ZEND_MCP,
         &zen_headers(),

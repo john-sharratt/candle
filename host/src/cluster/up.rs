@@ -59,7 +59,7 @@ pub async fn send_up(
 
 /// [`send_up`] towards `group:<app>` rather than this member's own app: the
 /// gateway sends it to the member of `app` it names — an agent, a machine's
-/// keep.
+/// keep — or, for another clustered app, routes it as that app's own request.
 pub async fn send_to_group(
     member: &AppMember,
     app: &str,
