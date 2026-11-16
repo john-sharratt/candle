@@ -231,7 +231,7 @@ mod prompt_dump;
 mod submitted_sections;
 mod turn_bans;
 
-use prefix_state::{checkpoint, shared, state_after};
+use prefix_state::{checkpoint, shared_held, state_after};
 pub use prompt_dump::{PieceKind, PromptDump, PromptPiece};
 use submitted_sections::SubmittedSections;
 pub use submitted_sections::{SectionRef, SectionState};
@@ -695,10 +695,11 @@ pub(crate) fn install_branch_states(
         })
         .collect();
 
-    for (_, payload, sequence_ids) in groups {
+    for (prefix, payload, sequence_ids) in groups {
         // The scheduler installs from a shared slice, so the layers are
-        // materialised once for the whole group rather than per slot.
-        let state = shared(&payload);
+        // materialised once for the branch — held for every later group on it —
+        // rather than per slot or per install.
+        let state = shared_held(prefix, &payload);
         let layers = Arc::clone(&state.layers);
         let n_layers = layers.len();
         let n_slots = sequence_ids.len();

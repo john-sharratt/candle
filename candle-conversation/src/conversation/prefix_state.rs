@@ -153,6 +153,21 @@ fn held(prefix: ContentHash) -> Option<SharedState> {
         .map(|(_, s)| s.clone())
 }
 
+/// The state the checkpoint for `prefix` describes, shared with every slot
+/// given the same prompt branch: the held one, or one materialised from
+/// `payload` and held. Materialised per install, every conversation opened on a
+/// branch copied the whole state (~112 MiB on Qwen4Exp) and freed it again
+/// when its slot's snapshot was dropped — ~5 ms on the scheduler thread, ~400
+/// times in one calibration burst (BlackWorld, 2026-11-16).
+pub(crate) fn shared_held(prefix: ContentHash, payload: &BranchCheckpointPayload) -> SharedState {
+    if let Some(state) = held(prefix) {
+        return state;
+    }
+    let state = shared(payload);
+    hold(prefix, state.clone());
+    state
+}
+
 /// The state after the sealed `sections`, in order — `Ok(None)` before any
 /// token, where the state is zero, and for a model with no recurrent state.
 pub(crate) fn state_after(
@@ -186,5 +201,49 @@ pub(crate) fn continue_state(
     if tokens.is_empty() {
         return Ok(start);
     }
-    Ok(run_state(scheduler_tx, start, tokens)?.map(|s| SharedState::from(&s)))
+    Ok(run_state(scheduler_tx, start, tokens)?.map(SharedState::from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::content_hash::hash_bytes;
+
+    fn payload(prefix: ContentHash, fill: u8) -> BranchCheckpointPayload {
+        BranchCheckpointPayload {
+            prefix_hash: prefix,
+            schedule_hash: 7,
+            layers: vec![SnapshotLayer {
+                layer_index: 0,
+                n_v_heads: 1,
+                d_v: 1,
+                d_k: 1,
+                state: vec![fill; 4],
+                conv_channels: 1,
+                conv_tail_cols: 1,
+                conv_tail: vec![fill; 4],
+            }],
+            aux: Vec::new(),
+        }
+    }
+
+    /// **Every install on one prompt branch shares one copy of its state**:
+    /// the second asks for the rows the first materialised, not a copy of the
+    /// payload; another branch gets its own.
+    #[test]
+    fn one_branchs_installs_share_its_rows() {
+        let a = hash_bytes(b"prompt branch a, for one_branchs_installs_share_its_rows");
+        let b = hash_bytes(b"prompt branch b, for one_branchs_installs_share_its_rows");
+        let first = shared_held(a, &payload(a, 1));
+        let second = shared_held(a, &payload(a, 9));
+        assert!(Arc::ptr_eq(&first.layers, &second.layers));
+        assert_eq!(
+            second.layers[0].state,
+            vec![1u8; 4],
+            "the held rows, not the new payload's"
+        );
+        let other = shared_held(b, &payload(b, 3));
+        assert!(!Arc::ptr_eq(&first.layers, &other.layers));
+        assert_eq!(other.layers[0].state, vec![3u8; 4]);
+    }
 }

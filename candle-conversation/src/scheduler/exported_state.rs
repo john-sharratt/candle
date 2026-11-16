@@ -59,3 +59,15 @@ impl From<&ExportedState> for SharedState {
         }
     }
 }
+
+impl From<ExportedState> for SharedState {
+    /// The rows handed over as they are: a state computed for one fan-out is
+    /// moved into its shared form rather than copied.
+    fn from(s: ExportedState) -> Self {
+        Self {
+            schedule_hash: s.schedule_hash,
+            layers: s.layers.into(),
+            aux: s.aux.into(),
+        }
+    }
+}
