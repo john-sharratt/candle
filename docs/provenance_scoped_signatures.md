@@ -377,28 +377,21 @@ loses (`docs/results/provenance_gates_2026-10-26.md`).
   neutral, MRR 0.251 → 0.250 (`provenance_gates calibration-cut`); over 999
   files calibrated with thinking it is neutral too, k 3–5 within +0.004 MRR
   (`provenance_gates thinking`).
-- **Where.** Learned after each ingest pass
-  (`GroupScanner::learn_chunk_exclusion`, the attribution on the calling
-  thread holding no lock), held in memory per group
-  (`Substrate::chunk_exclusion`), and cut from the group's own windows where
-  the live scan assembles them (`belief_files::cut_excluded`), calibration
-  windows and its own alike. The questions are scanned 16 at a time, each
-  batch one background job the scheduler runs between waves: all of them in
-  one job held the engine ~40 s at a time and froze every live conversation
-  for minutes. A standing exclusion is kept, nothing scanned, until the
-  questions it was learned from move by a tenth; a restart, which holds none,
-  learns it once its first pass ends, whether or not that pass succeeded. It
-  is not learned ahead of the pass because its few hundred jobs, run between
-  live conversations' waves, take many minutes, and a pass waiting on them
-  reads nothing. The price is that first pass: the units its derived layers
-  write are projected without the cut. Learned from 2 questions a file
-  (`EXCLUSION_QUESTIONS_PER_FILE`); the cut at that sample has not been
-  measured against the 6-a-file one below.
-- **Learned incrementally.** `docs/incremental_chunk_exclusion.md` replaces the
-  from-scratch learn above: a 4,000-question random sample, each sample token's
-  scan statistics kept as an exact mergeable summary, every appended signature
-  folded in once, and the state, cursor and cut replicated in the substrate — so
-  no restart relearns it and no job assembles the whole group.
+- **Where.** Learned incrementally (`docs/incremental_chunk_exclusion.md`):
+  4,000 calibration questions sampled by hash, each sample token's scan
+  statistics kept as an exact mergeable summary, and every gallery stream
+  folded in once, when it appears, after each ingest pass — on one member at a
+  time, under the group's exclusion lease, its launches small jobs on the wave
+  thread. The questions' records and the group's cut and cursor are keyed
+  objects the substrate replicates; every member installs the cut as it applies
+  the group record (`Substrate::chunk_exclusion`), and it is cut from the
+  group's own windows where the live scan assembles them
+  (`belief_files::cut_excluded`), calibration windows and its own alike. A
+  restart resumes from the records and scans nothing it had folded. The learn
+  it replaces scanned 2 questions a file against the whole group in 16-question
+  jobs, ~1,670 of them after every restart: 17 m 44 s of wave-thread time on
+  BlackWorld (2026-11-16). The cut at a 4,000 sample has not been measured
+  against either; each fold logs the votes its weakest cut chunk won.
 - **Measured.** Held-out questions, content alone: MRR 0.172 → 0.186; stacked
   on the calibration competition at 15 questions a file: 0.220 → 0.228, R@10
   0.364 → 0.379.

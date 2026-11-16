@@ -1,10 +1,11 @@
-//! The calibration competition's cut as production learns it, judged.
+//! The calibration competition's cut, judged.
 //!
-//! Production learns the cut from each file's first `LEARN` calibration
+//! The cut is learned here from each file's first `LEARN` calibration
 //! questions, asked of every other calibration question with the asking ones
-//! held out (`Conversation::learn_chunk_exclusion`), over every calibrated
-//! file — old calibrations of questions alone beside new ones of questions
-//! and their thinking. Here question 0 of each file is never learned from nor
+//! held out, over every calibrated file — old calibrations of questions alone
+//! beside new ones of questions and their thinking. (Production learns from a
+//! 4,000-question sample of all of them, `docs/incremental_chunk_exclusion.md`.)
+//! Here question 0 of each file is never learned from nor
 //! scanned in the gallery: it is the probe, asked of the content plus the
 //! calibration competition (questions `1..`), with the competition cut at
 //! several thresholds.
@@ -18,8 +19,7 @@ use crate::judge::{header, Judge};
 use crate::remote_gallery::{Daemon, Questions, RemoteGallery};
 use crate::sweep::summed;
 
-/// Questions per file the cut is learned from, after question 0: production's
-/// `EXCLUSION_QUESTIONS_PER_FILE`.
+/// Questions per file the cut is learned from, after question 0.
 const LEARN: usize = 2;
 
 /// The calibration competition's weight, production's.

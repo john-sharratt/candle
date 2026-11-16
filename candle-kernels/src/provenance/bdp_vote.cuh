@@ -27,6 +27,51 @@ __device__ __forceinline__ float bdp_vote(unsigned int top1, unsigned int top2,
     return z * margin;
 }
 
+// One probe token's statistics in one segment, as the statistics mode writes
+// them: what its vote is made of, for a caller that merges segments and
+// galleries itself (`docs/incremental_chunk_exclusion.md` §4.5). 32 bytes,
+// mirrored by the Rust `BdpStats`.
+struct BdpStats {
+    unsigned int a1;         // the leading case's best agreement
+    int c1;                  // its GLOBAL case id; -1 when no case scored
+    unsigned int a2;         // the runner-up case's best agreement
+    int c2;                  // its GLOBAL case id; -1 when under two scored
+    unsigned long long sum;  // agreement sum over the segment's scanned tokens
+    unsigned long long sumsq; // agreement sum of squares over them
+};
+
+// A segment's leader and runner-up over its per-case best agreements `cmax[c]`,
+// `c` in `[0, n_cases)` ascending, strictly greater displacing — the order the
+// single-vote loop ranks by — written with the segment's sums. Cases are
+// reported as `case_base + c`.
+__device__ __forceinline__ void bdp_stats_emit(const unsigned int *cmax, int n_cases, int case_base,
+                                               unsigned long long sum,
+                                               unsigned long long sumsq,
+                                               BdpStats *__restrict__ out) {
+    unsigned int top1 = 0u, top2 = 0u;
+    int c1 = -1, c2 = -1;
+    for (int c = 0; c < n_cases; c++) {
+        const unsigned int m = cmax[c];
+        if (m > top1) {
+            top2 = top1;
+            c2 = c1;
+            top1 = m;
+            c1 = c;
+        } else if (m > top2) {
+            top2 = m;
+            c2 = c;
+        }
+    }
+    BdpStats st;
+    st.a1 = top1;
+    st.c1 = c1 < 0 ? -1 : case_base + c1;
+    st.a2 = top2;
+    st.c2 = c2 < 0 ? -1 : case_base + c2;
+    st.sum = sum;
+    st.sumsq = sumsq;
+    *out = st;
+}
+
 // The most cases one probe token votes for in a segment. Mirrors the Rust
 // `VoteLaw::MAX_TOP_K`.
 #define BDP_MAX_TOP_K 8

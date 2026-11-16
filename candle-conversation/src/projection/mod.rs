@@ -264,7 +264,7 @@ pub use adaptive::{
     MemberBudgetAdaptive, ScanCases, ScanNorm, ScanPolicy,
 };
 pub use builder::Builder;
-pub use chunk_exclusion::ExclusionReport;
+pub use chunk_exclusion::{CompetitionCut, ExclusionLearner, FoldCounts, FoldReport};
 pub use cold_to_warm::Warmed;
 pub use error::ConstructionError;
 pub use event::{

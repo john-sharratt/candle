@@ -889,7 +889,7 @@ layers:
             files[0].arc_sids[1],
             files[0].arc_sids[3],
         );
-        let x = ChunkExclusion::of_chunks([(t0, 1, 64), (t1, 0, 64), (t1, 1, 64), (c0, 1, 40)]);
+        let x = ChunkExclusion::of_ranges([(t0, 32, 64), (t1, 0, 32), (t1, 32, 64), (c0, 32, 40)]);
         cut_excluded(&mut files, &x);
         assert_eq!(files[0].windows, vec![(0, 0, 32, 0), (2, 0, 64, 2)]);
         assert_eq!(files[0].cal_windows, vec![(3, 0, 32), (4, 0, 40)]);

@@ -942,11 +942,14 @@ impl Scheduler {
                 set_prompts_waiting(gpu_id, self.pending_prefill_tokens() > 0);
             }
 
-            // 2a. One turn of the normalization warm-up replay (see `norm_warm`).
+            // 2a. One background scan (see `norm_warm`): a warm-up's replayed
+            // turn or ingest slice, or a group-vote scan — its own band.
             let t_warm = Instant::now();
             self.step_norm_warm();
             self.step_census
                 .spend(super::step_census::Activity::Warm, t_warm.elapsed());
+            self.wave_stats
+                .add_warm(t_warm.elapsed().as_micros() as u64);
 
             // 2b. A turn whose prefill stands still is told what it waits
             // behind, so its caller can show it rather than look hung

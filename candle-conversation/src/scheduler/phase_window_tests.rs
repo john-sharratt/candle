@@ -56,6 +56,19 @@ fn compaction_and_the_flush_are_named_apart_from_housekeeping() {
     );
 }
 
+/// **The background scan is its own band, carved out of `blocked`.** A
+/// 1,247 ms window that timed 900 ms of background scanning and nothing else
+/// draws 900 ms of `warm` and only the 347 ms nothing timed as `blocked`.
+#[test]
+fn the_background_scan_is_its_own_band_and_out_of_blocked() {
+    let mut w = WaveStats::new();
+    w.add_warm(900_400);
+    w.push_phase_window(1_247);
+    let mut bands = bands_of(1_247);
+    bands.sort();
+    assert_eq!(bands, vec![("blocked", 347), ("warm", 900)]);
+}
+
 /// **The admission pass inside the decode quantum is carved out of decode,
 /// never drawn beside it.** A 1,243 ms window with 100 ms of decode, 30 ms of
 /// which was a mid-quantum admission pass, draws 70 ms of decode, 30 ms of

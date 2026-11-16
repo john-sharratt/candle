@@ -9,10 +9,10 @@ use std::ops::Range;
 use flume::Sender;
 
 use crate::persistence::streams::StreamId;
-use crate::projection::{Conversation, ExclusionReport, GroupId, GroupVotes};
+use crate::projection::{Conversation, ExclusionLearner, FoldReport, GroupId, GroupVotes};
 use crate::provenance::gallery_arena::{GroupSet, Keep};
 use crate::provenance::WideQSig;
-use crate::scheduler::SchedulerRequest;
+use crate::scheduler::{RemoteArena, SchedulerRequest};
 
 /// A handle that scans without holding the engine: the conversation it reads
 /// and the scheduler that owns the arena. Taken from
@@ -32,42 +32,25 @@ pub enum ScanRefused {
 }
 
 impl GroupScanner {
-    /// Learn `group`'s anomalous-chunk exclusion from up to `per_file` of each
-    /// file's calibration questions, scanned here against its content alone,
-    /// and set it for every live scan — see
-    /// [`Conversation::learn_chunk_exclusion`]. Blocks for the scan; the
-    /// attribution runs on the calling thread, holding no lock.
+    /// Fold what changed in the learner's group into its anomalous-chunk
+    /// exclusion, and write its records and cut — see
+    /// [`ExclusionLearner::fold`]. Its launches run on the scheduler's wave
+    /// thread, each a small job of its own (`RemoteArena`); the assembly, the
+    /// merging and the cut run on the calling thread, holding no lock.
     ///
     /// Each competition is scanned in the fold groups its live scans weigh, of
     /// the tokens they keep — `content` for the files' own turns,
-    /// `calibration` for their calibrations — so the learn reads what those
+    /// `calibration` for their calibrations — so the learner reads what those
     /// scans read, and never widens a turn they keep narrow
     /// (`docs/gallery_residency.md` §4, `docs/gallery_dedup.md` §3).
-    pub fn learn_chunk_exclusion(
+    pub fn fold_chunk_exclusion(
         &self,
-        group: GroupId,
-        per_file: usize,
+        learner: &mut ExclusionLearner,
         content: (GroupSet, Keep),
         calibration: (GroupSet, Keep),
-    ) -> candle::Result<ExclusionReport> {
-        self.conversation
-            .learn_chunk_exclusion(group, per_file, |calibrations, masked, probes| {
-                let (groups, keep) = if calibrations { calibration } else { content };
-                match self.scan(
-                    group,
-                    calibrations,
-                    masked,
-                    HashMap::new(),
-                    probes,
-                    Some(groups),
-                    keep,
-                ) {
-                    Ok(votes) => votes,
-                    Err(refused) => Err(candle::Error::Msg(format!(
-                        "the chunk-exclusion scan was refused: {refused:?}"
-                    ))),
-                }
-            })
+    ) -> Result<candle::Result<FoldReport>, ScanRefused> {
+        let arena = RemoteArena::connect(&self.scheduler_tx).ok_or(ScanRefused::NoArena)?;
+        Ok(learner.fold(&self.conversation, &arena, content, calibration))
     }
 
     /// `probes`' raw votes against every active file of `group` — see

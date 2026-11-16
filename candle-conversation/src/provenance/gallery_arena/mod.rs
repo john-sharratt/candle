@@ -35,6 +35,7 @@ mod pages;
 mod probe_rows;
 mod scan;
 pub mod scan_split;
+mod token_stats;
 mod token_votes;
 mod turn_sigs;
 
@@ -45,6 +46,7 @@ pub use held_scan::{HeldScan, ScanAnswer, ScanReply};
 pub use holder::{Holder, HolderKind};
 pub use pages::{page_words, pages_for, transpose_to_pages, PAGE_TOKENS};
 pub use scan::{PagedSegment, PagedWindow};
+pub use token_stats::TokenStats;
 pub use token_votes::TokenVotes;
 pub use turn_sigs::TurnSigs;
 

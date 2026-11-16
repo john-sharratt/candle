@@ -37,14 +37,16 @@ const tokPerSec = (w) => (w.ws > 0 ? w.tok / (w.ws / 1000) : 0);
  * large-batch prefill reads at a glance rather than by hunting a legend.
  * `quantize` is the K/V quantization the loop runs between forwards,
  * `compaction` the KV pool compaction beside it, `telemetry` the window's own
- * flush; `blocked` is only what no band names. */
+ * flush, `warm` the background scan run one a pass (the normalization
+ * warm-ups, the group-vote scans); `blocked` is only what no band names. */
 const PHASES = ['decode', 'prefill', 'projection', 'sealing', 'eviction', 'allocation',
-  'requests', 'housekeeping', 'compaction', 'quantize', 'telemetry', 'blocked', 'sync', 'idle'];
+  'requests', 'housekeeping', 'compaction', 'quantize', 'telemetry', 'warm', 'blocked', 'sync',
+  'idle'];
 const PH = {
   decode: 'var(--ok)', prefill: 'var(--info)',
   projection: '#c084fc', sealing: 'var(--warn)', eviction: 'var(--crit)',
   allocation: '#94a3b8', requests: '#2dd4bf', housekeeping: '#a3e635',
-  compaction: '#facc15', quantize: '#fb923c', telemetry: '#818cf8',
+  compaction: '#facc15', quantize: '#fb923c', telemetry: '#818cf8', warm: '#38bdf8',
   blocked: '#ec4899', sync: '#e11d48', idle: 'var(--line-2)',
 };
 

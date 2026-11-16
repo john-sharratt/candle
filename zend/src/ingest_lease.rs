@@ -78,6 +78,8 @@ const WORKER_PREFIX: &[u8] = b"worker/";
 
 const FACE_PREFIX: &[u8] = b"face/";
 
+const EXCLUSION_PREFIX: &[u8] = b"exclusion/";
+
 /// The lease key for a content key.
 pub fn lease_key(content_key: &str) -> Vec<u8> {
     prefixed(PREFIX, content_key)
@@ -98,6 +100,11 @@ pub fn face_key(content_key: &str) -> Vec<u8> {
     prefixed(FACE_PREFIX, content_key)
 }
 
+/// The lease key for a group's chunk-exclusion learner, by the group's name.
+pub fn exclusion_key(group: &str) -> Vec<u8> {
+    prefixed(EXCLUSION_PREFIX, group)
+}
+
 fn prefixed(prefix: &[u8], name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(prefix.len() + name.len());
     key.extend_from_slice(prefix);
@@ -106,11 +113,17 @@ fn prefixed(prefix: &[u8], name: &str) -> Vec<u8> {
 }
 
 /// Whether `key` is one of this module's: a reading's, a calibration's, a
-/// worker's or a face's.
+/// worker's, a face's or an exclusion learner's.
 fn is_unit_lease(key: &[u8]) -> bool {
-    [PREFIX, CALIBRATE_PREFIX, WORKER_PREFIX, FACE_PREFIX]
-        .iter()
-        .any(|prefix| key.starts_with(prefix))
+    [
+        PREFIX,
+        CALIBRATE_PREFIX,
+        WORKER_PREFIX,
+        FACE_PREFIX,
+        EXCLUSION_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| key.starts_with(prefix))
 }
 
 /// What this member should do with a unit it found unread.
@@ -248,6 +261,27 @@ pub fn share_calibration(marker: &str) -> Share {
 /// from the same replicated substrate, as with calibration.
 pub fn share_face(content_key: &str) -> Share {
     share_key(face_key(content_key))
+}
+
+/// Lease the chunk-exclusion learner of the group named `group`
+/// (`docs/incremental_chunk_exclusion.md` §4.6). [`Share::Mine`] when this
+/// member should fold it — one member in the cluster at a time, every other
+/// installing the cut its records replicate.
+///
+/// **Left alone when this member cannot propose**, as a worker's turns are: a
+/// unit read twice costs a reading, but two learners folding one group write
+/// one group's records from two states, and the greatest stamp would keep a
+/// mix of both. A member outside any cluster folds it itself; a reserved
+/// machine leaves it.
+pub fn share_exclusion(group: &str) -> Share {
+    if reservation().holds() {
+        return Share::Theirs;
+    }
+    let seat = SEAT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match seat {
+        Some(seat) => claim_worker(seat, exclusion_key(group)),
+        None => Share::Mine(Guard::local()),
+    }
 }
 
 /// Lease the turns of the worker conversation `conv_id`. [`Share::Mine`] when
@@ -591,6 +625,18 @@ mod tests {
         assert!(is_unit_lease(&calibration_key("x@1")));
         assert!(is_unit_lease(&lease_key("x@1")));
         assert!(!is_unit_lease(b"upgrade/zend"));
+    }
+
+    /// **A group's exclusion learner is leased by the group's name**, apart
+    /// from every unit's.
+    #[test]
+    fn exclusion_key_names_the_group() {
+        assert_eq!(
+            exclusion_key("code_reading"),
+            b"exclusion/code_reading".to_vec()
+        );
+        assert_ne!(exclusion_key("x"), calibration_key("x"));
+        assert!(is_unit_lease(&exclusion_key("code_reading")));
     }
 
     #[test]

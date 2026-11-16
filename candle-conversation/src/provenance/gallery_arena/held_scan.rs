@@ -12,7 +12,8 @@ use std::time::Instant;
 use super::super::{SigWindow, VoteLaw, WideQSig};
 use super::scan_split::{self, ArenaScanSplit};
 use super::{
-    GalleryArena, GroupSet, Holder, Keep, PagedSegment, PagedWindow, TokenVotes, TurnSigs,
+    GalleryArena, GroupSet, Holder, Keep, PagedSegment, PagedWindow, TokenStats, TokenVotes,
+    TurnSigs,
 };
 use crate::persistence::streams::StreamId;
 
@@ -114,6 +115,7 @@ enum Launch {
     Weighted(Vec<f32>),
     SegmentWeighted(Vec<Vec<f32>>),
     Votes,
+    Stats,
 }
 
 /// One launch of [`super::BeliefArena`], held. See the module documentation.
@@ -134,6 +136,7 @@ pub struct HeldScan {
 pub enum ScanAnswer {
     Scores(Result<Vec<Vec<f32>>, String>),
     Votes(Result<TokenVotes, String>),
+    Stats(Result<TokenStats, String>),
 }
 
 /// A [`HeldScan`]'s answer, and where the arena's time went running it — the
@@ -181,6 +184,11 @@ impl HeldScan {
         Self::held(segments, probes, Launch::Votes)
     }
 
+    /// [`GalleryArena::scan_stats`], held.
+    pub fn stats(segments: &[PagedSegment], probes: &[&[WideQSig]]) -> Self {
+        Self::held(segments, probes, Launch::Stats)
+    }
+
     /// The segments, as the scan that sent them built them.
     pub fn segments(&self) -> Vec<PagedSegment<'_>> {
         self.segments.iter().map(HeldSegment::view).collect()
@@ -213,6 +221,7 @@ impl HeldScan {
                 )
             }
             Launch::Votes => ScanAnswer::Votes(arena.scan_votes(&segments, &probes).map_err(text)),
+            Launch::Stats => ScanAnswer::Stats(arena.scan_stats(&segments, &probes).map_err(text)),
         });
         ScanReply {
             answer,
@@ -238,6 +247,7 @@ impl HeldScan {
         ScanReply {
             answer: match self.launch {
                 Launch::Votes => ScanAnswer::Votes(Err(gone)),
+                Launch::Stats => ScanAnswer::Stats(Err(gone)),
                 _ => ScanAnswer::Scores(Err(gone)),
             },
             split: ArenaScanSplit::default(),

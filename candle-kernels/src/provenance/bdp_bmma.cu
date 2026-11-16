@@ -335,6 +335,43 @@ extern "C" __global__ void __launch_bounds__(256) bdp_bmma_accum_kernel(
 #endif
 }
 
+// The statistics mode's finalize: one thread per (query, group, segment), the
+// segment's leader and runner-up with their cases, and its agreement sums —
+// what `bdp_bmma_finalize_kernel` makes its vote of, written raw. Its own
+// kernel, so the vote finalize's code and registers are untouched by it.
+extern "C" __global__ void bdp_stats_finalize_kernel(
+    const unsigned int *__restrict__ case_max,
+    const unsigned long long *__restrict__ case_sum,
+    const unsigned long long *__restrict__ case_sumsq,
+    const int *__restrict__ seg_case_start, // n_segments+1
+    int n_probe_tokens,
+    int n_groups,
+    int n_segments,
+    int n_cases,
+    BdpStats *__restrict__ out_stats) // n_probe * n_groups * n_segments
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_probe_tokens * n_groups * n_segments;
+    if (idx >= total) {
+        return;
+    }
+    const int s = idx % n_segments;
+    const int rem = idx / n_segments;
+    const int g = rem % n_groups;
+    const int q = rem / n_groups;
+    const int c0 = seg_case_start[s];
+    const int c1 = seg_case_start[s + 1];
+    const size_t base = ((size_t)q * n_groups + g) * n_cases;
+    unsigned long long sum = 0ull;
+    unsigned long long sumsq = 0ull;
+    for (int c = c0; c < c1; c++) {
+        sum += case_sum[base + c];
+        sumsq += case_sumsq[base + c];
+    }
+    const int nc = c1 > c0 ? c1 - c0 : 0;
+    bdp_stats_emit(case_max + base + c0, nc, c0, sum, sumsq, out_stats + idx);
+}
+
 // One thread per (query, group, segment): the segment's best cases -> the same
 // (out_case, z*margin) rows as the scalar kernel, `max_k` per thread.
 extern "C" __global__ void bdp_bmma_finalize_kernel(
@@ -486,6 +523,7 @@ extern "C" int run_bmma_bdp_scan(
     int max_k,
     int *out_case,
     float *out_vote,
+    BdpStats *out_stats, // statistics mode, or null for votes
     void *stream)
 {
     if (!bdp_bmma_supported() || gw != BMMA_GW || page_ptr == nullptr ||
@@ -537,6 +575,7 @@ extern "C" int run_bmma_bdp_scan(
         const int nq = (n_probe_tokens - q0) < chunk ? (n_probe_tokens - q0) : chunk;
         const size_t ncq = (size_t)nq * n_groups * n_cases;
         const size_t out_at = (size_t)q0 * n_groups * n_segments * max_k;
+        const size_t stats_at = (size_t)q0 * n_groups * n_segments;
         stage = BDP_BMMA_STAGE_MEMSET;
         err = cudaMemsetAsync(d_max, 0, ncq * sizeof(unsigned int), s);
         if (err == cudaSuccess) {
@@ -558,9 +597,15 @@ extern "C" int run_bmma_bdp_scan(
             stage = BDP_BMMA_STAGE_FINALIZE;
             const int total = nq * n_groups * n_segments;
             const int blocks = (total + 255) / 256;
-            bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
-                d_max, d_sum, d_sq, seg_tok_count, seg_case_start, seg_top_k, nq,
-                n_groups, n_segments, n_cases, max_k, out_case + out_at, out_vote + out_at);
+            if (out_stats != nullptr) {
+                bdp_stats_finalize_kernel<<<blocks, 256, 0, s>>>(
+                    d_max, d_sum, d_sq, seg_case_start, nq, n_groups, n_segments, n_cases,
+                    out_stats + stats_at);
+            } else {
+                bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
+                    d_max, d_sum, d_sq, seg_tok_count, seg_case_start, seg_top_k, nq,
+                    n_groups, n_segments, n_cases, max_k, out_case + out_at, out_vote + out_at);
+            }
             err = cudaGetLastError();
         }
     }

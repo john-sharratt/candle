@@ -352,6 +352,7 @@ impl BatchedGpuGallery {
                     1,
                     p_out_case as *mut i32,
                     p_out_vote as *mut f32,
+                    std::ptr::null_mut(), // votes, not statistics
                     stream.cu_stream() as *mut c_void,
                 );
             }

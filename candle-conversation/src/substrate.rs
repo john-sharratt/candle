@@ -97,6 +97,7 @@ use crate::projection::{
     ProjectionEvent, ProjectionTarget, SectionId, SystemItem, TimelineAllocator, TimelineId,
     TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
 };
+use crate::provenance::chunk_exclusion::records::{from_json, group_of_key, CutRecord};
 use crate::provenance::chunk_exclusion::ChunkExclusion;
 use crate::provenance::SigWindow;
 use crate::scheduler::profile;
@@ -524,9 +525,9 @@ pub struct Substrate {
 
     /// Per belief group, the gallery chunks cut from its live scans — those
     /// that win votes on every file's questions
-    /// (`crate::provenance::chunk_exclusion`). Transient: learned from the
-    /// group's calibration questions once an ingest pass
-    /// ([`Self::set_chunk_exclusion`]), never redo-logged.
+    /// (`crate::provenance::chunk_exclusion`). Installed from the group's
+    /// replicated cut record as it is applied ([`Self::apply_custom_object`]),
+    /// on replay and replication alike.
     chunk_exclusion: PMap<GroupId, Arc<ChunkExclusion>>,
 }
 
@@ -1870,11 +1871,6 @@ impl Substrate {
         if let Some(tl) = entry_mut(&mut self.timelines, &timeline) {
             tl.summarize = summarize;
         }
-    }
-
-    /// Replace the chunks cut from `group`'s live belief scans.
-    pub fn set_chunk_exclusion(&mut self, group: GroupId, exclusion: ChunkExclusion) {
-        self.chunk_exclusion.insert(group, Arc::new(exclusion));
     }
 
     /// The chunks cut from `group`'s live belief scans; none until learned.
@@ -4484,6 +4480,18 @@ impl Substrate {
             .and_then(SigWindow::new)
     }
 
+    /// The hybrid-logical-clock reading of the record that holds
+    /// `stream_id`'s signature — the same on every member — or `None` when it
+    /// holds none (`docs/replicated_substrate.md` §6.2). What an incremental
+    /// exclusion's cursor is kept in (`docs/incremental_chunk_exclusion.md`
+    /// §4.2).
+    pub fn wide_sig_hlc(&self, stream_id: StreamId) -> Option<u64> {
+        self.streams
+            .get(stream_id)
+            .filter(|e| e.wide_q_sigs.is_some())
+            .map(|e| e.ids.wide_q_sigs.hlc)
+    }
+
     /// A turn's self-referencing sub-window seam offsets (the `start_token`s of
     /// its `self_reference` projection events), **sorted and deduped** — decoded
     /// from the events JSON blob once per session and memoized, so the belief
@@ -5306,9 +5314,28 @@ impl Substrate {
             if !self.custom_object_keys.contains_key(&obj.key) {
                 self.custom_object_keys.insert(obj.key.clone(), key);
             }
+            self.install_chunk_exclusion(&obj);
             self.custom_objects.insert(key, Arc::new(obj));
             self.custom_objects_version += 1;
         }
+    }
+
+    /// When `obj` is a group's exclusion record, install its cut for the
+    /// group's live scans — on every member, as it applies the record
+    /// (`docs/incremental_chunk_exclusion.md` §4.7). A tombstone, or a record
+    /// this build cannot read, leaves the group with no cut.
+    fn install_chunk_exclusion(&mut self, obj: &CustomObjectPayload) {
+        let Some(group) = group_of_key(&obj.key).and_then(GroupId::from_raw) else {
+            return;
+        };
+        let cut = (!obj.ceased)
+            .then(|| from_json(&obj.blob))
+            .flatten()
+            .and_then(|b| CutRecord::decode(&b))
+            .map_or_else(ChunkExclusion::default, |r| {
+                ChunkExclusion::of_ranges(r.cut)
+            });
+        self.chunk_exclusion.insert(group, Arc::new(cut));
     }
 
     /// The record behind the custom object keyed `key_hash`.

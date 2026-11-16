@@ -10,6 +10,22 @@
 
 use core::ffi::c_void;
 
+/// One probe token's statistics in one segment, as the scan's statistics mode
+/// writes them — the C `BdpStats` of `bdp_vote.cuh`, field for field: the
+/// leading and runner-up cases' best agreements and their GLOBAL case ids
+/// (`-1` when fewer cases scored), and the agreement sum and sum of squares
+/// over the segment's scanned tokens.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BdpStats {
+    pub a1: u32,
+    pub c1: i32,
+    pub a2: u32,
+    pub c2: i32,
+    pub sum: u64,
+    pub sumsq: u64,
+}
+
 extern "C" {
     /// Launch the segmented batched BDP scan on `stream`.
     ///
@@ -41,6 +57,9 @@ extern "C" {
     /// - `out_case` / `out_vote`: `n_probe_tokens * n_groups * n_segments *
     ///   max_k` outputs (device) — per (query token, group, segment) row, its
     ///   voted GLOBAL cases best first (`-1` past the last) and their votes.
+    /// - `out_stats`: null for votes; otherwise the **statistics mode** — one
+    ///   [`BdpStats`] per (query token, group, segment) row (device), in the
+    ///   rows' order, and `out_case` / `out_vote` are not written.
     /// - `stream`: the CUDA stream handle so the kernel orders with the copies.
     pub fn run_batched_bdp_scan(
         gallery_words: *const u64,
@@ -62,6 +81,7 @@ extern "C" {
         max_k: i32,
         out_case: *mut i32,
         out_vote: *mut f32,
+        out_stats: *mut BdpStats,
         stream: *mut c_void,
     );
 
@@ -101,6 +121,7 @@ extern "C" {
         max_k: i32,
         out_case: *mut i32,
         out_vote: *mut f32,
+        out_stats: *mut BdpStats,
         stream: *mut c_void,
     ) -> i32;
 
@@ -141,6 +162,7 @@ extern "C" {
         max_k: i32,
         out_case: *mut i32,
         out_vote: *mut f32,
+        out_stats: *mut BdpStats,
         stream: *mut c_void,
     ) -> i32;
 }

@@ -112,7 +112,8 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
     int wpt,           // words per token (n_groups * gw)
     int max_k,         // votes per output row (>= every segment's top_k)
     int *__restrict__ out_case,   // n_probe_tokens * n_groups * n_segments * max_k
-    float *__restrict__ out_vote) // n_probe_tokens * n_groups * n_segments * max_k
+    float *__restrict__ out_vote, // n_probe_tokens * n_groups * n_segments * max_k
+    BdpStats *__restrict__ out_stats) // statistics mode: one row per (token, group, segment); null for votes
 {
     const int tile = blockIdx.x / n_groups;
     const int g = blockIdx.x % n_groups;
@@ -139,6 +140,11 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
     // Empty segment ⇒ no vote.
     if (seg_nc <= 0 || tok1 <= tok0) {
         for (int i = tid; i < tq; i += nthreads) {
+            if (out_stats != nullptr) {
+                bdp_stats_emit(nullptr, 0, case0, 0ull, 0ull,
+                               out_stats + (((q0 + i) * n_groups + g) * n_segments + s));
+                continue;
+            }
             const int oi = (((q0 + i) * n_groups + g) * n_segments + s) * max_k;
             for (int r = 0; r < max_k; r++) {
                 out_case[oi + r] = -1;
@@ -284,6 +290,11 @@ extern "C" __global__ void __launch_bounds__(128, 6) bdp_scan_kernel(
     const int n_gal = seg_tok_count[s + 1] - seg_tok_count[s];
     for (int i = tid; i < tq; i += nthreads) {
         const unsigned int *cmax = s_case_max + (size_t)i * max_seg_cases;
+        if (out_stats != nullptr) {
+            bdp_stats_emit(cmax, seg_nc, case0, s_sum[i], s_sumsq[i],
+                           out_stats + (((q0 + i) * n_groups + g) * n_segments + s));
+            continue;
+        }
         const int oi = (((q0 + i) * n_groups + g) * n_segments + s) * max_k;
         if (k == 1) {
             unsigned int top1 = 0u, top2 = 0u;
@@ -345,6 +356,7 @@ extern "C" void run_batched_bdp_scan(
     int max_k,
     int *out_case,
     float *out_vote,
+    BdpStats *out_stats, // statistics mode, or null for votes
     void *stream)
 {
     if (n_probe_tokens <= 0 || n_groups <= 0 || n_segments <= 0 || max_seg_cases <= 0 ||
@@ -360,5 +372,5 @@ extern "C" void run_batched_bdp_scan(
         gallery_words, gallery_case, probe_words,
         seg_tok_start, seg_tok_count, seg_case_start, page_ptr, entry_page, entry_slots,
         seg_top_k, n_probe_tokens, n_groups, n_segments, max_seg_cases, gw, wpt, max_k,
-        out_case, out_vote);
+        out_case, out_vote, out_stats);
 }

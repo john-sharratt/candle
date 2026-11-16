@@ -10,7 +10,7 @@
 use candle::Result;
 
 use super::super::WideQSig;
-use super::{GalleryArena, PagedSegment, TokenVotes};
+use super::{GalleryArena, PagedSegment, TokenStats, TokenVotes};
 
 /// The gallery as a belief scan reads it. See the module documentation.
 pub trait BeliefArena {
@@ -35,6 +35,9 @@ pub trait BeliefArena {
 
     /// [`GalleryArena::scan_votes`].
     fn scan_votes(&self, segments: &[PagedSegment], probes: &[&[WideQSig]]) -> Result<TokenVotes>;
+
+    /// [`GalleryArena::scan_stats`].
+    fn scan_stats(&self, segments: &[PagedSegment], probes: &[&[WideQSig]]) -> Result<TokenStats>;
 }
 
 impl BeliefArena for GalleryArena {
@@ -62,5 +65,9 @@ impl BeliefArena for GalleryArena {
 
     fn scan_votes(&self, segments: &[PagedSegment], probes: &[&[WideQSig]]) -> Result<TokenVotes> {
         GalleryArena::scan_votes(self, segments, probes)
+    }
+
+    fn scan_stats(&self, segments: &[PagedSegment], probes: &[&[WideQSig]]) -> Result<TokenStats> {
+        GalleryArena::scan_stats(self, segments, probes)
     }
 }

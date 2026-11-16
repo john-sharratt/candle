@@ -160,6 +160,13 @@ pub enum PhaseKind {
     /// the VRAM bands, the arena mix, the summary line. Measured after the window
     /// it closes, so it is charged to the next one.
     Telemetry,
+    /// The background scans the loop runs one a pass between waves
+    /// (`step_norm_warm`): the normalization warm-ups' replayed turns and
+    /// ingest slices, and the group-vote scans an offline harness asks for.
+    /// Scheduler-thread work outside every quantum, so without its own band
+    /// it read as [`PhaseKind::Blocked`] — on BlackWorld (2026-11-16) up to 51
+    /// s of a minute after a restart.
+    Warm,
 }
 
 impl PhaseKind {
@@ -179,6 +186,7 @@ impl PhaseKind {
             PhaseKind::Quantize => "quantize",
             PhaseKind::Compaction => "compaction",
             PhaseKind::Telemetry => "telemetry",
+            PhaseKind::Warm => "warm",
         }
     }
 }
@@ -927,6 +935,7 @@ mod tests {
         assert_eq!(PhaseKind::Housekeeping.as_str(), "housekeeping");
         assert_eq!(PhaseKind::Quantize.as_str(), "quantize");
         assert_eq!(PhaseKind::Compaction.as_str(), "compaction");
+        assert_eq!(PhaseKind::Warm.as_str(), "warm");
         assert_eq!(PhaseKind::Telemetry.as_str(), "telemetry");
     }
 

@@ -9,8 +9,16 @@
 //! is what lifts recall. Which chunks go is learned from the files'
 //! calibration questions, never from the gallery alone: a gallery statistic
 //! (verbatim shared runs) lost at every threshold measured.
+//!
+//! It is learned incrementally (`docs/incremental_chunk_exclusion.md`): a
+//! sample of the questions ([`sample`]), each sample token's statistics kept
+//! as an exact mergeable summary ([`stats`]), in keyed records the substrate
+//! replicates ([`records`]).
 
 pub mod anomaly;
+pub mod records;
+pub mod sample;
+pub mod stats;
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -20,47 +28,31 @@ use crate::persistence::streams::StreamId;
 /// The 32-token chunk exclusion is learned and cut at, as signature tokens.
 pub const CHUNK: usize = 32;
 
-/// The token ranges cut from each turn's gallery windows, and how many
-/// calibration questions they were learned from. Held in memory; empty until
-/// the first is learned, and learned again once the questions to learn from
-/// have moved by a tenth.
+/// The token ranges cut from each turn's gallery windows. Installed from the
+/// group's replicated cut record ([`records::CutRecord`]); empty until one is
+/// written.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChunkExclusion {
     by_stream: HashMap<StreamId, Vec<Range<usize>>>,
-    questions: usize,
 }
 
 impl ChunkExclusion {
-    /// This exclusion, as learned from `questions` calibration questions.
-    pub fn learned_from(self, questions: usize) -> Self {
-        ChunkExclusion { questions, ..self }
-    }
-
-    /// Whether this exclusion still stands for a sample of `questions`: it
-    /// was learned from some, and the sample has moved by less than a tenth.
-    pub fn stands_for(&self, questions: usize) -> bool {
-        self.questions > 0 && questions.abs_diff(self.questions) * 10 < self.questions
-    }
-
-    /// An exclusion of `chunks`, each `(turn, chunk index, turn length)`.
-    pub fn of_chunks(chunks: impl IntoIterator<Item = (StreamId, usize, usize)>) -> Self {
+    /// An exclusion of the `(turn, start, end)` token ranges a cut record
+    /// holds.
+    pub fn of_ranges(ranges: impl IntoIterator<Item = (StreamId, u32, u32)>) -> Self {
         let mut by_stream: HashMap<StreamId, Vec<Range<usize>>> = HashMap::new();
-        for (sid, c, len) in chunks {
-            let start = c * CHUNK;
-            if start < len {
+        for (sid, start, end) in ranges {
+            if start < end {
                 by_stream
                     .entry(sid)
                     .or_default()
-                    .push(start..((c + 1) * CHUNK).min(len));
+                    .push(start as usize..end as usize);
             }
         }
         for ranges in by_stream.values_mut() {
             ranges.sort_by_key(|r| r.start);
         }
-        ChunkExclusion {
-            by_stream,
-            questions: 0,
-        }
+        ChunkExclusion { by_stream }
     }
 
     /// The ranges cut from turn `sid`, ascending.
@@ -104,30 +96,16 @@ pub fn uncut(start: usize, end: usize, cut: &[Range<usize>]) -> Vec<(usize, usiz
 mod tests {
     use super::*;
 
-    /// A chunk is its 32 tokens, the last one cut short by its turn's end; a
-    /// chunk past the end is nothing.
+    /// **A cut record's ranges are the exclusion**, sorted per turn; an empty
+    /// range is nothing, and a turn with none cuts nothing.
     #[test]
-    fn a_chunk_is_its_tokens_cut_at_the_turns_end() {
+    fn a_cut_records_ranges_are_the_exclusion() {
         let (a, b) = (StreamId(1), StreamId(2));
-        let x = ChunkExclusion::of_chunks([(a, 2, 100), (a, 0, 100), (b, 1, 40), (b, 5, 40)]);
+        let x = ChunkExclusion::of_ranges([(a, 64, 96), (b, 32, 40), (a, 0, 32), (b, 5, 5)]);
         assert_eq!(x.of(a), &[0..32, 64..96]);
         assert_eq!(x.of(b), &[32..40]);
         assert_eq!(x.of(StreamId(3)), &[] as &[Range<usize>]);
         assert_eq!(x.chunks(), 3);
-    }
-
-    /// **An exclusion stands until its questions move by a tenth**, either
-    /// way; one learned from none never stands.
-    #[test]
-    fn an_exclusion_stands_until_its_questions_move_by_a_tenth() {
-        let x = ChunkExclusion::default().learned_from(1000);
-        assert!(x.stands_for(1000));
-        assert!(x.stands_for(1099));
-        assert!(!x.stands_for(1100));
-        assert!(x.stands_for(901));
-        assert!(!x.stands_for(900));
-        assert!(!ChunkExclusion::default().stands_for(0));
-        assert!(!ChunkExclusion::default().stands_for(10));
     }
 
     /// **A cut leaves what lies outside it, in order**: overlapping and

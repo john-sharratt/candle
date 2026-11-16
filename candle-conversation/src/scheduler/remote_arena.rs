@@ -11,7 +11,7 @@ use flume::Sender;
 
 use super::SchedulerRequest;
 use crate::provenance::gallery_arena::{
-    scan_split, BeliefArena, HeldScan, PagedSegment, ScanAnswer, ScanReply, TokenVotes,
+    scan_split, BeliefArena, HeldScan, PagedSegment, ScanAnswer, ScanReply, TokenStats, TokenVotes,
 };
 use crate::provenance::WideQSig;
 
@@ -52,8 +52,8 @@ impl RemoteArena {
     fn scores(&self, scan: HeldScan) -> candle::Result<Vec<Vec<f32>>> {
         match self.ask(scan)? {
             ScanAnswer::Scores(r) => r.map_err(candle::Error::Msg),
-            ScanAnswer::Votes(_) => Err(candle::Error::Msg(
-                "arena scan: a scores launch answered with votes".into(),
+            _ => Err(candle::Error::Msg(
+                "arena scan: a scores launch answered with something else".into(),
             )),
         }
     }
@@ -93,8 +93,21 @@ impl BeliefArena for RemoteArena {
     ) -> candle::Result<TokenVotes> {
         match self.ask(HeldScan::votes(segments, probes))? {
             ScanAnswer::Votes(r) => r.map_err(candle::Error::Msg),
-            ScanAnswer::Scores(_) => Err(candle::Error::Msg(
-                "arena scan: a votes launch answered with scores".into(),
+            _ => Err(candle::Error::Msg(
+                "arena scan: a votes launch answered with something else".into(),
+            )),
+        }
+    }
+
+    fn scan_stats(
+        &self,
+        segments: &[PagedSegment],
+        probes: &[&[WideQSig]],
+    ) -> candle::Result<TokenStats> {
+        match self.ask(HeldScan::stats(segments, probes))? {
+            ScanAnswer::Stats(r) => r.map_err(candle::Error::Msg),
+            _ => Err(candle::Error::Msg(
+                "arena scan: a statistics launch answered with something else".into(),
             )),
         }
     }

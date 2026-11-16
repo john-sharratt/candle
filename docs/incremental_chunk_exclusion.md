@@ -4,9 +4,10 @@ The anomalous-chunk exclusion (`docs/provenance_scoped_signatures.md` §2.6) is
 learned **incrementally**: a fixed random sample of 4,000 calibration questions,
 each sample token's scan statistics kept as an exact, mergeable summary, and
 every signature appended to the group folded in once — against the sample, never
-against the whole gallery again. The state, its cursor and the cut it yields are
-replicated in the substrate, so a restart, a deploy or a change of member resumes
-where the last fold stopped instead of learning from nothing.
+against the whole gallery again. Each sample question's statistics are its own
+keyed record, and the group's cut and cursor one more, all replicated in the
+substrate, so a restart, a deploy or a change of member resumes where the last
+fold stopped instead of learning from nothing.
 
 It replaces the from-scratch learn (`Conversation::learn_chunk_exclusion`,
 `GroupScanner::learn_chunk_exclusion`, `InferenceState::learn_chunk_exclusions`).
@@ -67,27 +68,36 @@ merge((a1,c1,a2,c2,s,q,n), (b1,d1,b2,d2,s',q',n')) =
      agreements combined by max, s+s', q+q', n+n')
 ```
 
-Ties rank by the lower case — the order the full kernel's ascending case loop
-gives (`bdp_ranks_offer` displaces only on a strictly greater agreement), with
-cases numbered by ascending `TimelineId`. A winning token ties by the lower
-`(stream, position)`. With those orders fixed, folding a gallery stream by stream
-yields **bit-identical** statistics to scanning it whole, and the vote, gate, mass
-and cut computed from them are identical too.
+A case outside both parts' top two is beaten in its own part by two distinct
+cases at least as good, so it cannot be in the merged top two: the merge is exact.
+Ties rank by the lower case — the order the kernel's ascending case loop gives
+(`bdp_ranks_offer` displaces only on a strictly greater agreement). With that order
+fixed, folding a gallery stream by stream yields **bit-identical** statistics to
+scanning it whole, and the vote, gate, mass and cut computed from them are
+identical too.
+
+The statistics split by what they describe:
+
+| Part | Describes | Changes |
+|---|---|---|
+| `a1, c1, a2, c2` | the question against its best two files | when a new file beats one of them — rare once built |
+| `s, q, n` | the question against the whole gallery (z's mean and spread) | on every appended stream |
 
 The vote, gate and mass are recomputed from the statistics each time the cut is
-taken: they move whenever `n`, `s`, `q` move, which is every fold, but that is a
-host pass over the sample's entries, not a scan.
+taken, on the host.
 
 ## 4. The design
 
 ### 4.1 The sample
 
 - **4,000 questions, chosen by hash.** The sample is the 4,000 live calibration
-  questions of the group whose `hash(stream id)` is smallest (bottom-k sampling).
+  questions of the group, at the galleries' signature width, whose `hash(stream
+  id)` is smallest (bottom-k sampling; a question at another width has no token
+  to scan, so it never takes a place).
   It is uniform, needs no random state, and every member computes the same one
   from the same substrate.
-- **It changes by one question at a time.** A new question enters exactly when
-  its hash is below the 4,000th smallest, and the 4,000th then leaves; a sample
+- **It changes one question at a time.** A new question enters exactly when its
+  hash is below the 4,000th smallest, and the 4,000th then leaves; a sample
   question that is tombstoned or archived leaves and the next-smallest hash
   enters. With 161,502 calibration questions in `code_reading` today, about 2.5% of
   new questions enter.
@@ -95,55 +105,58 @@ host pass over the sample's entries, not a scan.
   are its entries; each remembers the question's owner file, whose wins are never
   credited.
 
-### 4.2 The state
+### 4.2 The records
 
-Per group, per competition:
+Every piece of state is keyed by what it describes, so a question that leaves is
+one tombstone:
 
-| Part | Content | Size (4,000 questions, ~75 tokens each) |
+| Key | Holds | Written |
 |---|---|---|
-| Entries | per sample token per fold group: `a1, c1, a2, c2, s, q` and the winning token `(stream, position)` | ~1.8 M entries × 36 B ≈ 65 MB for both competitions |
-| `n` | gallery tokens scanned — one count per competition, the same for every entry | 8 B |
-| Folded set | every gallery stream folded: its stream id, case, the identity `(origin, oseq)` of its signature record, and its `SigWindow` (a shared reference to the substrate's own blob — no copy) | ~200 k streams × 40 B |
-| Cursor | the per-origin `oseq` set of the signature records folded — an `AppliedSet` (`persistence/replica/`) | small |
+| `chunk_exclusion/<group>/q/<question stream>` | the question's entries in both competitions: per token per fold group `a1, c1, a2, c2`, the winning token `(stream, position)`, and `s, q` with the gallery count `n` they were taken at | when any entry's `c1`/`c2`/`a1`/`a2` changes, or when the gallery count has moved since the record was written by between 5% and 10% — the share fixed per question by its hash, so the sample's records come due a few at a time; tombstoned when the question leaves the sample, or when a learner loading it finds its question gone |
+| `chunk_exclusion/<group>` | the cut — both competitions' chunks `(stream, range)` — the **cursor** and the gallery counts | after a fold that changes any of them |
 
-**The cursor is the redo log's own position.** A record's local `(segment,
-offset)` moves with every maintenance pass and other members' records arrive in
-any order (`docs/replicated_substrate.md` §1.3, §6.9), so neither is a cursor. Its
-identity `(origin, oseq)` survives both; the substrate already holds it beside each
-turn's signature (`streams.entry(key).ids.wide_q_sigs`). A stream is *folded* when
-its signature's identity is in the cursor.
+A question's record is ~75 tokens × 3 fold groups × 2 competitions × 36 B ≈ 16 KB;
+the group record a few tens of KB. Cases (`c1`, `c2`) are timeline ids, the same on
+every member.
+
+**The cursor is the highest signature stamp folded.** Every signature record
+carries a hybrid-logical-clock reading `hlc` (`docs/replicated_substrate.md` §6.2),
+the same on every member. A fold takes every group stream and question whose
+signature `hlc` is above the cursor, and every tombstone above it, folds them, and
+raises the cursor to the highest it folded. A record that arrives by replication
+after the cursor has passed its stamp is not folded, and a takeover whose cursor
+trails the records it loads folds a stream twice; both are a few streams out of
+tens of thousands, and the statistic they touch is over the whole gallery, so the
+design takes that loss for one number of state.
 
 ### 4.3 Folding
 
-The learner compares the group against the folded set:
+The learning member holds, besides the records, the `SigWindow` of every stream
+it folded (a shared reference to the substrate's own blob — no copy):
 
-| Change | What is scanned | Merge |
+| Change since the cursor | What is scanned | Merge |
 |---|---|---|
-| **Stream appended** (a new turn, or a new file) | its tokens against the sample | merge its statistics into every entry; a new `c1` takes its winning token from the stream itself (`best_token` over its tokens) |
+| **Stream appended** (a new turn, or a new file) | its tokens against the sample | merge its statistics into every entry; an entry whose `c1` it now holds has its winning token found within it |
 | **Stream removed** (turn tombstoned, file archived or tombstoned) | its held `SigWindow` against the sample | subtract `s`, `q`, `n` exactly; every entry whose `c1` or `c2` was its case is **rescanned** against the whole gallery, one batched launch for all of them |
-| **Stream rewritten** (new signature identity) | old window, then new | removal, then append |
-| **Question enters the sample** | its tokens against the whole gallery | new entries |
-| **Question leaves the sample** | — | its entries dropped |
+| **Stream rewritten** (a new signature) | old window, then new | removal, then append |
+| **Question enters the sample** | its tokens against the whole gallery | new entries, its record written |
+| **Question leaves the sample** | — | its entries dropped, its record tombstoned |
 
 In the calibration competition the gallery is every calibration question not in
 the sample, so a question entering the sample also leaves that gallery (removal
 above), and one leaving enters it (append).
 
-**Finding the change is a pointer compare.** Each active timeline's `FileGallery`
-is held on its entry and replaced whenever anything it reads changes
-(`substrate/file_gallery.rs`); the learner keeps the `Arc` it folded and visits only
-the files whose `Arc` differs — ~7,500 compares, well under a millisecond — and
-reads the calibration records the same way (`calibration_snapshot`). The cursor is
-what a fold resumes from after a restart or a change of member, where no `Arc` was
-kept: every stream whose signature identity is outside it is appended.
+**A rescan reads the whole gallery, so it is batched.** An entry a removal
+leaves waiting is kept out of the cut, and once waiting entries pass 2% of the
+sample's entries (`RESCAN_SHARE`) one pass rescans all of them — each waiting
+token against every folded stream, its leaders found again from nothing, its sums
+(which are exact) kept.
 
-**A removal after a restart.** A stream removed while no member held the state
-has no window left to scan, so its `s`, `q`, `n` cannot be subtracted exactly.
-They are taken as its token count times the entry's current mean (and the mean of
-squares), and the entries whose winner it was are rescanned exactly as above. The
-state counts the tokens removed this way; when they pass 1% of `n`, the moments are
-recomputed exactly by one moments-only pass over the gallery (§4.6's first build,
-without the winners).
+A stream removed while no member held its window — a removal a takeover finds —
+cannot be subtracted: there is no window left to scan, so its `s`, `q` stay
+counted, a few streams out of tens of thousands. Every fold leaves each entry
+whose leader or runner-up names a file no longer in its gallery waiting on a
+rescan, so no entry votes for a file that is gone.
 
 ### 4.4 The cut
 
@@ -155,44 +168,72 @@ keeps only chunks far above one typical vote: the strongest outliers, which is
 where the measured gain is (`K` = 5 beat 4, `anomaly.rs`). Each cut chunk's vote
 count is logged with the cut, so the margin at this sample size is on record.
 
+A winning token is found only when the cut needs it: an entry keeps its winner
+until its `c1` or `a1` changes, and the cut resolves the entries left without one
+by searching `c1`'s tokens on the host — a file at a time, each file's signatures
+decoded once, files in parallel.
+
 ### 4.5 The kernel
 
-A **statistics mode** of the paged BDP scan: for each probe token and fold group
-it writes `(a1, c1, a2, c2, s, q, n)` instead of the vote — the values the
-finalize already holds when it calls `bdp_vote` (`bdp_ranks_emit` →
-`bdp_stats_emit`), on every backend (scalar, BMMA, IMMA). The winning token's
-position is found on the host within the one winning stream.
+A **statistics mode** of the paged BDP scan: for each probe token, fold group and
+segment it writes `(a1, c1, a2, c2, s, q)` (`BdpStats`) instead of the vote — the
+values the finalize already holds when it calls `bdp_vote` — on every backend.
+The scalar kernel writes them in its own finalize; the tensor backends (BMMA,
+IMMA) share a finalize kernel of their own for it, `bdp_stats_finalize_kernel`,
+so the vote finalize's code and registers are untouched. Every vote-mode kernel
+compiles to the registers and spills it did before, on sm_86, sm_89 and sm_120.
+The arena runs it as `GalleryArena::scan_stats`, through the live scans' index
+cache: a slice is scanned once per chunk of the sample's tokens, so its index is
+built for the first chunk and reused, its turns checked current, by the rest;
+once the learner moves on, it idles out of the cache like any other.
 
 ### 4.6 Scheduling
 
 - **One learner per group in the cluster.** It runs under the lease
   `exclusion/<group>` (`zend/src/ingest_lease.rs`, renewed while it works, 120 s
-  TTL), after each ingest pass and each calibration pass. A member that finds the
-  lease held installs the replicated cut (§4.7) and scans nothing.
-- **Jobs are bounded by work, not by count.** A job is a slice of the delta — the
-  streams of up to a token-pair budget against the sample — sent as one
-  `SchedulerRequest` and laid out as one segment of **that slice only**: no job
-  assembles the whole group. The budget is set so a job's kernel is ≤ 10 ms.
-- **The wave thread's time is named.** The `warm` step's time gets its own band in
-  the phase window, so it is never drawn as `blocked`, and each job notes an engine
-  event with its split (slice streams, tokens, setup, kernel, readback).
-- **The first build** — no replicated state for the group yet — is the whole gallery
-  folded as appends, in the same bounded jobs.
+  TTL), after each ingest pass. A member that finds the lease held installs the
+  replicated cut (§4.7), scans nothing and lets go of any learner state it held.
+  A member in a cluster that cannot propose leaves the learner alone, as it does
+  a worker's turns: two learners folding one group would write its records from
+  two states.
+- **Jobs are small in both directions.** A job is up to 8,192 probe tokens of the
+  sample (`PROBE_CHUNK`) against a slice of up to 262,144 gallery tokens
+  (`SLICE_TOKENS`), laid out as segments of at most 1,024 files
+  (`SEGMENT_FILES`, under the scalar kernel's 1,536-case bound) of **that slice
+  only**: no job assembles the whole group. The probe chunk keeps a job's upload
+  (~1.5 MB) and output (~0.8 MB a segment) inside the scratch the live scans
+  already hold (`with_synced_upload` grows by doubling and never shrinks), and the
+  slice bounds a job's kernel at ~2 × 10⁹ token pairs, ~10 ms. A slice's index
+  is built once and reused by its later probe chunks (§4.5).
+- **A job is a request on the wave thread.** The learner runs on zend's own
+  thread and sends each job there as a held launch (`HeldScan::stats` over
+  `SchedulerRequest::ArenaScan`), which the loop serves with its other requests
+  and draws in the `requests` band; the merging and the cut stay on the learner's
+  thread. The other background scans the loop runs one a pass — the normalization
+  warm-ups, the offline harness's group-vote scans — get their own band, `warm`,
+  so they are never drawn as `blocked`.
+- **The first build** — no records for the group yet — is the whole gallery folded
+  as appends, in the same jobs.
 
 ### 4.7 Replication
 
-- **The cut and where it stands** — a keyed custom object `exclusion/<group>`:
-  the cut chunks (stream, range) of both competitions, the cursor, the sample's
-  hash bound, and the checkpoint's blob hash. A few tens of KB. Every member
-  installs its cut on apply (`Substrate::set_chunk_exclusion`); the greatest stamp
-  holds, as for any keyed value.
-- **The state** — a content-addressed blob (`persistence/blob/`), written as a
-  checkpoint when the learner has folded 10% of the gallery's tokens since the last
-  one, every 30 minutes while it changes, and when it hands back the lease. A
-  superseded checkpoint's blob is retired by its tombstone.
-- **Taking over.** A member that takes the lease reads the newest checkpoint and
-  folds the delta outside its cursor (§4.3). With no checkpoint it runs the first
-  build.
+- Every member installs the group record's cut as it applies the record — written
+  here, replayed at load or replicated (`Substrate::apply_custom_object`); the
+  greatest stamp holds, as for any keyed value, and a tombstone leaves no cut.
+- A member that takes the lease reads the question records and the cursor, and
+  folds what is above the cursor (§4.3). With no records it runs the first build.
+  A learner whose cursor is behind the group record's — another member folded
+  since — drops its state and reads the records again.
+- The group record is written before the question records: a fold that dies
+  between them leaves a cursor whose missing question records are questions
+  entering the sample on reload, scanned whole.
+- The learner's own `s, q` are exact; a record's are as of its `n`, at most 10%
+  of the gallery behind. A takeover starts from the records' moments, which only
+  touches the vote's normalisation, by that bound; best and runner-up are always
+  exact.
+- On load, the calibration gallery taken as folded holds no question that has a
+  record or is in today's sample; today's sample's others enter it and are
+  scanned whole.
 
 ## 5. Cost
 
@@ -202,13 +243,13 @@ measures it:
 
 | Work | Token pairs | GPU time |
 |---|---|---|
-| A new 2,000-token file against the sample (~300 k probe tokens) | 6 × 10⁸ | ~2.4 ms |
+| A new 2,000-token file against the sample (~300 k probe tokens) | 6 × 10⁸ | ~2.4 ms, in 37 probe chunks |
 | A question entering the sample (~75 tokens × ~53 M gallery tokens) | 4 × 10⁹ | ~16 ms |
 | First build, both competitions | ~1.6 × 10¹³ | ~64 s, in ≤ 10 ms jobs |
 | The from-scratch learn it replaces (13,373 questions) | ~5 × 10¹³ | ~3.5 min of kernel, stretched to ~18 min by per-job setup |
 
-Steady state is O(appended tokens × sample), constant per appended token. A restart
-costs nothing; a takeover costs the delta since the last checkpoint.
+Steady state is O(appended tokens × sample), constant per appended token, and
+writes only the question records an append changed. A restart costs nothing.
 
 ## 6. What is removed
 
@@ -223,20 +264,27 @@ the offline harness (`zend/src/api/scan.rs`).
 All `#[test]`s, asserting raw values:
 
 - **Merge** — the statistics of a gallery equal the merge of its parts' in every
-  order, ties included (`a1`/`a2` equal, cases ordered by id).
-- **Fold equals scan** — a fixture group folded stream by stream, in shuffled
-  orders, gives entries, masses and cut identical to one scan of the whole gallery.
-- **Removal** — a fold then a removal equals never having folded the stream; a
-  removed winner's entries are rescanned and match a whole scan.
-- **Sample** — bottom-k by hash: the same sample from any order of questions; one
-  question in and the 4,000th out; a tombstoned sample question replaced by the
-  next.
-- **Cursor** — a state restored from a checkpoint and folded to the present equals
-  one folded continuously.
-- **Statistics mode** — each backend's `(a1, c1, a2, c2, s, q, n)` matches the
-  scalar reference on a fixture, and the vote computed from them matches the vote
-  mode's.
-- **Cut** — today's rule on fixture masses gives today's cut.
+  order, ties included (`stats.rs`).
+- **Fold equals scan** — a gallery folded a third, two thirds, then all of its
+  files gives entries and counts identical to folding it at once.
+- **Removal** — a fold then a removal equals never having folded the stream, sums
+  and leaders; a file that vanished while no member held the state has the
+  entries it led rescanned to the leaders a fold without it finds.
+- **Sample** — bottom-k by a fixed SplitMix64 mix: the same sample from any order;
+  one question in and the largest out (`sample.rs`).
+- **Records** — each record is its bytes, and reads back as itself
+  (`records.rs`); a restarted learner reads them, scans nothing and writes
+  nothing; a group record installs its cut on apply and its tombstone clears it.
+- **Cursor** — the cursor rises to the highest stamp folded; a fold with nothing
+  new launches nothing; a turn appended after a restart is the one stream folded.
+- **Statistics mode** — each backend's rows equal the definitions on a fixture of
+  empty cases, descending case order and a dropped out-of-range case, and the
+  backends' rows are identical (`gallery_arena/scan.rs`).
+- **Cut** — a hub token planted in one chunk and asked by every question is the
+  content cut.
+
+The learner's tests fold against `HostArena`, which answers statistics launches
+from their definitions on the host.
 
 ## 8. Code map
 
@@ -244,10 +292,14 @@ All `#[test]`s, asserting raw values:
 |---|---|
 | Entry statistics and merge | `provenance/chunk_exclusion/stats.rs` |
 | Sample (bottom-k by hash) | `provenance/chunk_exclusion/sample.rs` |
-| State, folded set, cursor | `projection/chunk_exclusion/state.rs` |
-| Folding and change detection | `projection/chunk_exclusion/fold.rs` |
+| Question and group records, and their keys | `provenance/chunk_exclusion/records.rs` |
+| The cut installed on apply | `substrate.rs` (`install_chunk_exclusion`) |
+| A group's galleries and questions | `projection/chunk_exclusion/gallery.rs` |
+| Bounded jobs and their merge | `projection/chunk_exclusion/scan_jobs.rs` |
+| Learner state and folding | `projection/chunk_exclusion/fold.rs` |
 | Cut from state | `projection/chunk_exclusion/cut.rs` |
-| Checkpoint and keyed object | `projection/chunk_exclusion/replicated.rs` |
-| Statistics-mode kernel | `candle-kernels/src/provenance/bdp_vote.cuh` (`bdp_stats_emit`), the three backends, `gallery_arena/scan.rs` |
-| Scheduler job and its event | `scheduler/norm_warm.rs`, `scheduler/mod.rs` |
+| The learner, its load and its writes | `projection/chunk_exclusion/learner.rs` |
+| Statistics-mode kernel | `candle-kernels/src/provenance/bdp_vote.cuh`, `bdp_scan.cu`, `bdp_bmma.cu`, `bdp_imma.cu`, `gallery_arena/scan.rs` |
+| A job sent to the wave thread | `gallery_arena/held_scan.rs`, `scheduler/remote_arena.rs`, `group_scanner.rs` |
+| The `warm` band | `scheduler/phase_ring.rs`, `scheduler/mod.rs`, `web/content/common/lib/perf.js` |
 | Learner and lease | `zend/src/session.rs`, `zend/src/ingest_lease.rs` |

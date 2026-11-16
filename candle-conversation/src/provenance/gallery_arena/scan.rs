@@ -24,7 +24,7 @@ use candle::cuda_backend::Held;
 use candle::{CudaDevice, Device, Result};
 use candle_kernels::provenance::{
     bdp_bmma_supported, bdp_imma_supported, bdp_take_pending_error, run_batched_bdp_scan,
-    run_bmma_bdp_scan, run_imma_bdp_scan,
+    run_bmma_bdp_scan, run_imma_bdp_scan, BdpStats,
 };
 use core::ffi::c_void;
 
@@ -40,7 +40,9 @@ use super::pages::PAGE_TOKENS;
 use super::probe_rows::ProbeRows;
 use super::scan_split::{self, LaunchTiming};
 use super::token_votes::widen_rows;
-use super::{GalleryArena, GroupSet, Holder, IndexMiss, Keep, KeepMask, TokenVotes, TurnSigs};
+use super::{
+    GalleryArena, GroupSet, Holder, IndexMiss, Keep, KeepMask, TokenStats, TokenVotes, TurnSigs,
+};
 
 /// What producing a scan's rows cost: the launch's timing, the probe tokens it
 /// scored (the rest were read from [`ProbeRows`]), and the row cache's own
@@ -118,6 +120,9 @@ pub(super) struct PagedIndex {
     n_slots: usize,
     /// Host copy of the per-segment case prefixes, which the tally reads.
     seg_case: Vec<i32>,
+    /// Host copy of the per-segment prefix of the tokens each scans — a
+    /// segment's `n` in the statistics mode.
+    seg_tok: Vec<i32>,
     n_cases: usize,
     n_segments: usize,
     max_seg_cases: usize,
@@ -480,6 +485,7 @@ impl GalleryArena {
             n_tokens,
             n_slots,
             seg_case,
+            seg_tok: entries.seg_tok.clone(),
             n_cases: case_off,
             n_segments: segments.len(),
             max_seg_cases,
@@ -631,6 +637,97 @@ impl GalleryArena {
         self.with_index(segments, |idx, weighed| {
             self.token_votes(idx, weighed, probes, None)
                 .map(|(votes, _)| votes)
+        })
+    }
+
+    /// Every probe token's statistics in every segment, in each fold group the
+    /// segments weigh — the statistics mode (`docs/incremental_chunk_exclusion.md`
+    /// §4.5): what its vote is made of, for a caller merging scans of parts of
+    /// a gallery itself.
+    ///
+    /// **The index is the one the live scans' cache holds for the segments.** A
+    /// learner scans each slice of a gallery once per chunk of its probes, so
+    /// the slice's index is built for the first chunk and reused, its turns
+    /// checked current, by every later one; once the learner moves on it
+    /// idles out of the cache like any other.
+    pub fn scan_stats(
+        &self,
+        segments: &[PagedSegment],
+        probes: &[&[WideQSig]],
+    ) -> Result<TokenStats> {
+        self.scan_stats_on(segments, probes, None)
+    }
+
+    /// [`Self::scan_stats`] on `force`'s backend, or the auto ladder's.
+    fn scan_stats_on(
+        &self,
+        segments: &[PagedSegment],
+        probes: &[&[WideQSig]],
+        force: Option<PagedBackend>,
+    ) -> Result<TokenStats> {
+        let dev = match self.device() {
+            Device::Cuda(d) => d,
+            _ => return Err(candle::Error::Msg("paged scan requires CUDA".into())),
+        };
+        self.with_index(segments, |idx, _| self.stats_of(dev, idx, probes, force))
+    }
+
+    /// The statistics launch over `idx` for `probes`, each probe token narrowed
+    /// to the groups the index scans.
+    fn stats_of(
+        &self,
+        dev: &CudaDevice,
+        idx: &PagedIndex,
+        probes: &[&[WideQSig]],
+        force: Option<PagedBackend>,
+    ) -> Result<TokenStats> {
+        let wpt = self.wpt();
+        let gw = self.gw();
+        let mut probe_words: Vec<u64> = Vec::new();
+        let mut per_probe: Vec<usize> = Vec::with_capacity(probes.len());
+        for probe in probes {
+            let mut n = 0usize;
+            for tok in *probe {
+                if tok.words.len() >= wpt {
+                    for g in idx.groups.iter() {
+                        probe_words.extend_from_slice(&tok.words[g * gw..(g + 1) * gw]);
+                    }
+                    n += 1;
+                }
+            }
+            per_probe.push(n);
+        }
+        let n_tokens: usize = per_probe.iter().sum();
+        let Some(d_idx) = idx.device.as_ref() else {
+            return Ok(TokenStats::none(per_probe));
+        };
+        if n_tokens == 0 || idx.n_segments == 0 || idx.n_cases == 0 || idx.groups.is_empty() {
+            return Ok(TokenStats::none(per_probe));
+        }
+        let (out, timing) =
+            self.launch_kernel(dev, d_idx, idx, &probe_words, n_tokens, force, true)?;
+        let LaunchOut::Stats(rows) = out else {
+            return Err(candle::Error::Msg(
+                "paged scan: a statistics launch wrote votes".into(),
+            ));
+        };
+        scan_split::add(|s| {
+            s.launches += 1;
+            s.fresh_tokens += n_tokens as u64;
+            s.upload_us += timing.upload_us;
+            s.kernel_us += timing.kernel_us;
+            s.kernel_gpu_us += timing.kernel_gpu_us;
+            s.readback_us += timing.readback_us;
+        });
+        Ok(TokenStats {
+            rows,
+            per_probe,
+            groups: idx.groups.iter().collect(),
+            seg_tokens: idx
+                .seg_tok
+                .windows(2)
+                .map(|w| (w[1] - w[0]) as u64)
+                .collect(),
         })
     }
 
@@ -908,8 +1005,13 @@ impl GalleryArena {
                 .map(|&t| &probe_words[t * wpt..(t + 1) * wpt])
                 .collect();
             let words: Vec<u64> = tokens.concat();
-            let (case, vote, timing) =
-                self.launch_kernel(dev, d_idx, idx, &words, tokens.len(), force)?;
+            let (out, timing) =
+                self.launch_kernel(dev, d_idx, idx, &words, tokens.len(), force, false)?;
+            let LaunchOut::Votes { case, vote } = out else {
+                return Err(candle::Error::Msg(
+                    "paged scan: a votes launch wrote statistics".into(),
+                ));
+            };
             let t_insert = Instant::now();
             rows.insert(&tokens, &case, &vote);
             profile::record("arena:rows_insert", t_insert.elapsed());
@@ -949,9 +1051,10 @@ impl GalleryArena {
 
     /// One kernel launch over `n_probe_tokens` probe tokens (`probe_words`,
     /// `wpt` words each) against `idx`, on the fastest backend the device and
-    /// geometry admit. Returns the raw output — one row per probe token — and
-    /// where the launch's time went.
-    #[allow(clippy::type_complexity)]
+    /// geometry admit. Returns the raw output — one row per probe token, its
+    /// votes, or with `stats` the statistics they are made of — and where the
+    /// launch's time went.
+    #[allow(clippy::too_many_arguments)]
     fn launch_kernel(
         &self,
         dev: &CudaDevice,
@@ -960,7 +1063,8 @@ impl GalleryArena {
         probe_words: &[u64],
         n_probe_tokens: usize,
         force: Option<PagedBackend>,
-    ) -> Result<(Vec<i32>, Vec<f32>, LaunchTiming)> {
+        stats: bool,
+    ) -> Result<(LaunchOut, LaunchTiming)> {
         // The launch's own geometry: its groups, as the index addresses them
         // and the probe was narrowed to.
         let n_groups = idx.groups.len();
@@ -1014,11 +1118,15 @@ impl GalleryArena {
         }
 
         let max_k = idx.max_k;
-        let n_out = n_probe_tokens * n_groups * n_segments * max_k;
+        // Votes: `max_k` a row. Statistics: one a row, and no votes.
+        let n_rows = n_probe_tokens * n_groups * n_segments;
+        let n_out = if stats { 0 } else { n_rows * max_k };
+        let n_stats = if stats { n_rows } else { 0 };
         let upload_us = t_upload.elapsed().as_micros() as u64;
         let t_kernel = Instant::now();
         let mut out_case = vec![0i32; n_out];
         let mut out_vote = vec![0f32; n_out];
+        let mut out_stats = vec![BdpStats::default(); n_stats];
         let mut readback_us = 0u64;
         let mut kernel_gpu_us = 0u64;
         // The outputs are written in full by the kernel (one block per tile ×
@@ -1035,6 +1143,16 @@ impl GalleryArena {
             let (p_seg_top_k, _g8) = d_idx.seg_top_k.device_ptr(&stream);
             let p_out_case = room;
             let p_out_vote = room + (n_out * std::mem::size_of::<i32>()) as u64;
+            let p_out_stats: *mut BdpStats = if stats {
+                room as *mut BdpStats
+            } else {
+                std::ptr::null_mut()
+            };
+            let (p_votes_case, p_votes_vote) = if stats {
+                (std::ptr::null_mut(), std::ptr::null_mut())
+            } else {
+                (p_out_case as *mut i32, p_out_vote as *mut f32)
+            };
             // The kernel's own device time, apart from whatever the shared
             // stream had queued ahead of it — the wall-clock sync below counts
             // both. Timing events: `None` flags would make them untimed.
@@ -1067,8 +1185,9 @@ impl GalleryArena {
                                 gw as i32,
                                 wpt as i32,
                                 max_k as i32,
-                                p_out_case as *mut i32,
-                                p_out_vote as *mut f32,
+                                p_votes_case,
+                                p_votes_vote,
+                                p_out_stats,
                                 stream.cu_stream() as *mut c_void,
                             )
                         };
@@ -1147,8 +1266,9 @@ impl GalleryArena {
                                 gw as i32,
                                 wpt as i32,
                                 max_k as i32,
-                                p_out_case as *mut i32,
-                                p_out_vote as *mut f32,
+                                p_votes_case,
+                                p_votes_vote,
+                                p_out_stats,
                                 stream.cu_stream() as *mut c_void,
                             );
                         }
@@ -1180,10 +1300,18 @@ impl GalleryArena {
             // SAFETY: both ranges are this launch's outputs inside the scratch,
             // held until the closure returns; the copies are waited for below.
             unsafe {
-                memcpy_dtoh_async(&mut out_case, p_out_case, stream.cu_stream())
-                    .map_err(|e| candle::Error::Msg(format!("paged scan: DtoH out_case: {e}")))?;
-                memcpy_dtoh_async(&mut out_vote, p_out_vote, stream.cu_stream())
-                    .map_err(|e| candle::Error::Msg(format!("paged scan: DtoH out_vote: {e}")))?;
+                if stats {
+                    memcpy_dtoh_async(&mut out_stats, room, stream.cu_stream()).map_err(|e| {
+                        candle::Error::Msg(format!("paged scan: DtoH out_stats: {e}"))
+                    })?;
+                } else {
+                    memcpy_dtoh_async(&mut out_case, p_out_case, stream.cu_stream()).map_err(
+                        |e| candle::Error::Msg(format!("paged scan: DtoH out_case: {e}")),
+                    )?;
+                    memcpy_dtoh_async(&mut out_vote, p_out_vote, stream.cu_stream()).map_err(
+                        |e| candle::Error::Msg(format!("paged scan: DtoH out_vote: {e}")),
+                    )?;
+                }
             }
             stream
                 .synchronize()
@@ -1194,13 +1322,21 @@ impl GalleryArena {
         dev.with_synced_upload(
             &stream,
             &[segment(probe_words)],
-            n_out * (std::mem::size_of::<i32>() + std::mem::size_of::<f32>()),
+            n_out * (std::mem::size_of::<i32>() + std::mem::size_of::<f32>())
+                + n_stats * std::mem::size_of::<BdpStats>(),
             launch,
         )?;
         let kernel_us = (t_kernel.elapsed().as_micros() as u64).saturating_sub(readback_us);
+        let out = if stats {
+            LaunchOut::Stats(out_stats)
+        } else {
+            LaunchOut::Votes {
+                case: out_case,
+                vote: out_vote,
+            }
+        };
         Ok((
-            out_case,
-            out_vote,
+            out,
             LaunchTiming {
                 upload_us,
                 kernel_us,
@@ -1209,6 +1345,13 @@ impl GalleryArena {
             },
         ))
     }
+}
+
+/// What one launch wrote back: its votes, or in the statistics mode the
+/// statistics they are made of — one [`BdpStats`] a row.
+enum LaunchOut {
+    Votes { case: Vec<i32>, vote: Vec<f32> },
+    Stats(Vec<BdpStats>),
 }
 
 #[cfg(test)]
@@ -2582,6 +2725,156 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The statistics a probe token `q` has in fold group `g` against
+    /// `segment`'s windows, from the definitions: each case's best agreement,
+    /// the leading and runner-up cases (ascending, strictly greater
+    /// displacing), and the agreement sum and sum of squares over every token
+    /// scanned. A window whose case is out of range is not scanned.
+    fn host_stats(q: &WideQSig, g: usize, segment: &PagedSegment, case_base: i32) -> BdpStats {
+        let gw = 8;
+        let words = g * gw..(g + 1) * gw;
+        let mut best = vec![0u32; segment.n_cases];
+        let (mut sum, mut sumsq) = (0u64, 0u64);
+        for w in &segment.windows {
+            if w.case >= segment.n_cases {
+                continue;
+            }
+            let toks = w.turn.with_decoded(<[WideQSig]>::to_vec);
+            for t in &toks[w.start..w.end.min(toks.len())] {
+                let a: u32 = q.words[words.clone()]
+                    .iter()
+                    .zip(&t.words[words.clone()])
+                    .map(|(x, y)| (!(x ^ y)).count_ones())
+                    .sum();
+                best[w.case] = best[w.case].max(a);
+                sum += u64::from(a);
+                sumsq += u64::from(a) * u64::from(a);
+            }
+        }
+        let (mut a1, mut a2, mut c1, mut c2) = (0u32, 0u32, -1i32, -1i32);
+        for (c, &m) in best.iter().enumerate() {
+            if m > a1 {
+                (a2, c2) = (a1, c1);
+                (a1, c1) = (m, c as i32);
+            } else if m > a2 {
+                (a2, c2) = (m, c as i32);
+            }
+        }
+        BdpStats {
+            a1,
+            c1: if c1 < 0 { -1 } else { case_base + c1 },
+            a2,
+            c2: if c2 < 0 { -1 } else { case_base + c2 },
+            sum,
+            sumsq,
+        }
+    }
+
+    /// **The statistics mode writes, on every backend, what the definitions
+    /// give.** Five segments — empty cases, cases supplied in descending
+    /// order, an out-of-range case that is not scanned — against probes of 1,
+    /// 9 and 70 tokens: every (token, group, segment) row equals the host's
+    /// statistics, its cases global; the segments' `n` are the tokens each
+    /// scanned; and the auto ladder, the scalar kernel and each tensor backend
+    /// the card has write identical rows.
+    #[test]
+    fn the_statistics_mode_is_the_host_reference_on_every_backend() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let (has_bmma, has_imma) = arena.tensor_caps();
+        let mut rng = 0x0005_7A75_u64;
+        let lens = [1usize, 7, 32, 33, 65, 100];
+        let turns: Vec<Vec<WideQSig>> = (0..18)
+            .map(|i| {
+                (0..lens[i % lens.len()])
+                    .map(|_| rand_sig(&mut rng))
+                    .collect()
+            })
+            .collect();
+        let segs: Vec<PagedSegment> = (0..5usize)
+            .map(|s| {
+                let n_cases = 2 + s;
+                let mut windows: Vec<PagedWindow> = (0..3usize)
+                    .map(|w| {
+                        let ti = (s * 3 + w) % turns.len();
+                        PagedWindow {
+                            sid: turn_stream_id(700 + s as u64, ti as u32),
+                            fingerprint: (s * 100 + ti) as u64,
+                            turn: (&turns[ti]).into(),
+                            start: 0,
+                            end: turns[ti].len(),
+                            // Descending, with gaps: case 0 of a wide segment
+                            // stays empty.
+                            case: (n_cases - 1).saturating_sub(w * 2 % n_cases),
+                        }
+                    })
+                    .collect();
+                windows.push(PagedWindow {
+                    sid: turn_stream_id(700 + s as u64, 99),
+                    fingerprint: 99,
+                    turn: (&turns[0]).into(),
+                    start: 0,
+                    end: 1,
+                    case: n_cases + 1,
+                });
+                PagedSegment {
+                    windows,
+                    n_cases,
+                    holder: Holder::Shared,
+                    groups: GroupSet::all(3),
+                    keep: Keep::All,
+                    law: VoteLaw::SINGLE,
+                }
+            })
+            .collect();
+        let probes: Vec<Vec<WideQSig>> = [1usize, 9, 70]
+            .iter()
+            .map(|&n| (0..n).map(|_| rand_sig(&mut rng)).collect())
+            .collect();
+        let probe_refs: Vec<&[WideQSig]> = probes.iter().map(Vec::as_slice).collect();
+
+        let auto = arena.scan_stats(&segs, &probe_refs).unwrap();
+        assert_eq!(auto.per_probe, vec![1, 9, 70]);
+        assert_eq!(auto.groups, vec![0, 1, 2]);
+        let scanned: Vec<u64> = segs
+            .iter()
+            .map(|s| {
+                s.windows
+                    .iter()
+                    .filter(|w| w.case < s.n_cases)
+                    .map(|w| (w.end - w.start) as u64)
+                    .sum()
+            })
+            .collect();
+        assert_eq!(auto.seg_tokens, scanned);
+        let all: Vec<&WideQSig> = probes.iter().flatten().collect();
+        for (t, q) in all.iter().enumerate() {
+            for g in 0..3 {
+                let mut base = 0i32;
+                for (s, seg) in segs.iter().enumerate() {
+                    assert_eq!(
+                        auto.row(t, g, s),
+                        Some(&host_stats(q, g, seg, base)),
+                        "token {t} group {g} segment {s}"
+                    );
+                    base += seg.n_cases as i32;
+                }
+            }
+        }
+        let on = |b| arena.scan_stats_on(&segs, &probe_refs, Some(b)).unwrap();
+        assert_eq!(on(PagedBackend::Scalar), auto, "scalar vs auto");
+        if has_bmma {
+            assert_eq!(on(PagedBackend::Bmma), auto, "BMMA vs auto");
+        }
+        if has_imma {
+            assert_eq!(on(PagedBackend::Imma), auto, "IMMA vs auto");
         }
     }
 

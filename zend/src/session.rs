@@ -36,8 +36,8 @@ use candle_conversation::persistence::{
     content_hash, OpenProgressHook, OpenStage, SharedSubstrate, SUBSTRATE_DIR,
 };
 use candle_conversation::projection::{
-    self, Builder, Conversation, DecodePriority, GroupId, LayerId, Reserved, SectionId,
-    SectionLoads, SelectionRule, SystemItem, SystemPromptItem, TimelineId, TurnIndex,
+    self, Builder, Conversation, DecodePriority, ExclusionLearner, GroupId, LayerId, Reserved,
+    SectionId, SectionLoads, SelectionRule, SystemItem, SystemPromptItem, TimelineId, TurnIndex,
 };
 use candle_conversation::provenance::gallery_arena::GroupSet;
 use candle_conversation::provenance::{encode_wide_sigs, FOLD_GROUPS};
@@ -653,13 +653,6 @@ fn turn_sampling(
     sampling
 }
 
-/// Calibration questions per file a layer's chunk exclusion is learned from:
-/// a background of ~3,300 questions over the workspace's ~1,650 files, ~410
-/// scans of 16 questions run between waves. The outliers it cuts sit orders
-/// of magnitude above the rest, so a sample finds them; the cut it learns at
-/// this sample has not been measured against the six-a-file one.
-const EXCLUSION_QUESTIONS_PER_FILE: usize = 2;
-
 /// A [`round_triggers`] held: its mode's level, its dial, the tools out.
 type HeldKey = (u8, String, Vec<&'static str>);
 
@@ -903,10 +896,13 @@ struct InferenceState {
     /// that can move a branch wakes it, since a push moves the tracking refs
     /// itself and no origin probe will see a difference afterwards.
     ingest_wake: OnceLock<Arc<Notify>>,
-    /// Raised while the branch layers' chunk exclusions are being learned on
-    /// their own thread ([`InferenceState::learn_chunk_exclusions_behind`]),
-    /// so a pass ending while one learns does not start a second.
+    /// Raised while the branch layers' chunk exclusions are being folded on
+    /// their own thread ([`InferenceState::fold_chunk_exclusions_behind`]),
+    /// so a pass ending while one folds does not start a second.
     learning_exclusions: AtomicBool,
+    /// Each branch layer's exclusion learner, its state kept between passes
+    /// (`docs/incremental_chunk_exclusion.md`).
+    exclusion_learners: Mutex<HashMap<GroupId, ExclusionLearner>>,
     /// The dialogue layer's working set (`docs/zend_working_set.md`), its
     /// `release_on` names checked against the tool registry at load. `None`
     /// when the schema declares none: nothing is seeded, locked or released,
@@ -2222,6 +2218,7 @@ impl InferenceState {
             retrieval_scope,
             ingest_wake: OnceLock::new(),
             learning_exclusions: AtomicBool::new(false),
+            exclusion_learners: Mutex::new(HashMap::new()),
             working_set,
             read_coverage: Coverage::default(),
             refresh_builder: proj_builder_refresh,
@@ -2478,17 +2475,15 @@ impl InferenceState {
         }
     }
 
-    /// Learn the chunk exclusions ([`Self::learn_chunk_exclusions`]) on a
+    /// Fold the chunk exclusions ([`Self::fold_chunk_exclusions`]) on a
     /// thread of their own, so the next pass starts without waiting for them —
-    /// and not again while a learn is running: the pass after it learns from
-    /// what was written meanwhile.
+    /// and not again while a fold is running: the pass after it folds what was
+    /// written meanwhile.
     ///
-    /// **Not at the end of the pass.** Learned there, every pass ended with
-    /// the scans: on BlackWorld (2026-10-28) a pass that read its units at
-    /// 23:53:43 learned until 23:57:01, and the layers read nothing, the GPU
-    /// idle, for those 3 m 18 s. The scans are background jobs the scheduler
-    /// runs between the next pass's waves.
-    pub(crate) fn learn_chunk_exclusions_behind(self: &Arc<Self>) {
+    /// **Not at the end of the pass.** A pass ending with the scans reads
+    /// nothing while they run; on its own thread a fold's launches are small
+    /// jobs the scheduler runs between waves.
+    pub(crate) fn fold_chunk_exclusions_behind(self: &Arc<Self>) {
         if self.branch_layers.is_empty() || self.learning_exclusions.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -2496,35 +2491,25 @@ impl InferenceState {
         let spawned = std::thread::Builder::new()
             .name("zend-exclusions".into())
             .spawn(move || {
-                state.learn_chunk_exclusions();
+                state.fold_chunk_exclusions();
                 state.learning_exclusions.store(false, Ordering::SeqCst);
             });
         if let Err(e) = spawned {
             self.learning_exclusions.store(false, Ordering::SeqCst);
             tracing::warn!(
                 target: "zend::calibrate",
-                "the chunk exclusions were not learned (no thread): {e}"
+                "the chunk exclusions were not folded (no thread): {e}"
             );
         }
     }
 
-    /// Learn the chunk exclusion of every branch layer that declares a
-    /// `calibrate:` block: the calibrations written are the background its
-    /// generic chunks are told apart by. A standing exclusion is kept until its
-    /// questions move by a tenth.
-    ///
-    /// **After the pass, never ahead of it.** The learn is a few hundred scans,
-    /// each one background job the scheduler runs between waves; under live
-    /// conversations that is many minutes, and a pass waiting on it reads
-    /// nothing meanwhile — on BlackWorld (2026-10-26) restarts a quarter of an
-    /// hour apart left the ingest reading no file for hours. The price is the
-    /// first pass after a restart, which has no exclusion: the units its
-    /// derived layers write are projected without the cut. On the
-    /// calibration competition the cut measured neutral (MRR 0.251 → 0.250);
-    /// on content alone it bought MRR 0.172 → 0.186
-    /// (`docs/provenance_scoped_signatures.md` §2.6). Run behind the passes
-    /// ([`Self::learn_chunk_exclusions_behind`]).
-    fn learn_chunk_exclusions(&self) {
+    /// Fold what changed into the chunk exclusion of every branch layer that
+    /// declares a `calibrate:` block, under the layer's exclusion lease: one
+    /// member in the cluster folds a group, and every member installs the cut
+    /// its records replicate (`docs/incremental_chunk_exclusion.md`). The
+    /// learner keeps its state between passes, so a fold scans only what was
+    /// appended since the last; after a restart it resumes from the records.
+    fn fold_chunk_exclusions(&self) {
         for (il, _) in &self.branch_layers {
             if crate::ingest_cancel::cancelled() {
                 return;
@@ -2534,6 +2519,19 @@ impl InferenceState {
             }
             let Some(group) = self.refresh_builder.id_for_group(&il.group) else {
                 continue;
+            };
+            let _lease = match ingest_lease::share_exclusion(&il.group) {
+                ingest_lease::Share::Mine(lease) => lease,
+                ingest_lease::Share::Theirs => {
+                    // Another member folds it: what this one held would only
+                    // pin signatures the substrate has let go, and goes stale
+                    // the moment the other folds.
+                    self.exclusion_learners
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&group);
+                    continue;
+                }
             };
             // Each competition in the fold groups its live scans weigh.
             let Some(policy) = self
@@ -2556,29 +2554,51 @@ impl InferenceState {
                 policy.scan.calibration_gallery_keep,
             );
             let scanner = self.engine.group_scanner();
-            match scanner.learn_chunk_exclusion(
-                group,
-                EXCLUSION_QUESTIONS_PER_FILE,
-                content,
-                calibration,
-            ) {
-                Ok(r) => tracing::info!(
+            let t_fold = Instant::now();
+            let mut learners = self
+                .exclusion_learners
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let learner = learners
+                .entry(group)
+                .or_insert_with(|| ExclusionLearner::new(group));
+            match scanner.fold_chunk_exclusion(learner, content, calibration) {
+                Ok(Ok(r)) => tracing::info!(
                     target: "zend::calibrate",
                     layer = %il.name,
-                    files = r.files,
-                    calibrated = r.calibrated,
-                    questions = r.probes,
-                    chunks = r.chunks,
-                    cut = r.cut,
-                    calibration_chunks = r.calibration_chunks,
-                    calibration_cut = r.calibration_cut,
-                    kept = r.kept,
-                    "the layer's anomalous-chunk exclusion",
+                    loaded = r.loaded,
+                    sample = r.sample,
+                    appended = r.counts.appended,
+                    removed = r.counts.removed,
+                    entered = r.counts.entered,
+                    left = r.counts.left,
+                    rescanned = r.counts.rescanned,
+                    dirty = r.dirty.0,
+                    entries = r.dirty.1,
+                    content_tokens = r.n[0],
+                    calibration_tokens = r.n[1],
+                    chunks = r.content.chunks,
+                    votes = r.content.votes,
+                    cut = r.content.cut.len(),
+                    weakest_cut_votes = ?r.content.weakest_cut_votes,
+                    calibration_chunks = r.calibration.chunks,
+                    calibration_votes = r.calibration.votes,
+                    calibration_cut = r.calibration.cut.len(),
+                    calibration_weakest_cut_votes = ?r.calibration.weakest_cut_votes,
+                    written = r.written,
+                    tombstoned = r.tombstoned,
+                    elapsed_ms = t_fold.elapsed().as_millis() as u64,
+                    "the layer's anomalous-chunk exclusion folded",
                 ),
-                Err(e) => tracing::warn!(
+                Ok(Err(e)) => tracing::warn!(
                     target: "zend::calibrate",
                     layer = %il.name,
-                    "learning the layer's chunk exclusion failed (its scans cut nothing): {e:#}",
+                    "folding the layer's chunk exclusion failed; the next fold resumes from its records: {e:#}",
+                ),
+                Err(refused) => tracing::warn!(
+                    target: "zend::calibrate",
+                    layer = %il.name,
+                    "the chunk-exclusion fold was refused: {refused:?}",
                 ),
             }
         }
@@ -8080,11 +8100,11 @@ impl ZendSession {
                                     }
                                     Err(e) => tracing::warn!("ingest pass failed: {e:#}"),
                                 }
-                                // Learned whether or not the pass succeeded: a
+                                // Folded whether or not the pass succeeded: a
                                 // failed pass is read again only on the next
-                                // branch move or layer clock, and the scans until
-                                // then would run without an exclusion.
-                                pass_state.learn_chunk_exclusions_behind();
+                                // branch move or layer clock, and what it did
+                                // write is folded now rather than then.
+                                pass_state.fold_chunk_exclusions_behind();
                             });
                             let warm_state = Arc::clone(&state);
                             let after_first_pass: Arc<dyn Fn() + Send + Sync> =

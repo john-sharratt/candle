@@ -2589,6 +2589,9 @@ struct WaveStats {
     /// Compaction phase this window: KV pool compaction between forwards,
     /// drawn apart from the rest of the housekeeping. Microseconds.
     compaction_us: u64,
+    /// Warm phase this window: the background scan the loop runs a pass
+    /// (`step_norm_warm`), outside every quantum. Microseconds.
+    warm_us: u64,
     /// What the compaction band was spent on, logged at the window's close.
     compaction_split: compaction_split::CompactionSplit,
     /// What the allocation band was spent on, logged at the window's close.
@@ -2665,6 +2668,7 @@ impl WaveStats {
             housekeeping_us: 0,
             quantize_us: 0,
             compaction_us: 0,
+            warm_us: 0,
             compaction_split: compaction_split::CompactionSplit::default(),
             admission_split: admission_split::AdmissionSplit::default(),
             telemetry_us: 0,
@@ -2768,6 +2772,11 @@ impl WaveStats {
     /// Accumulate one compaction pass's span — see [`Self::compaction_us`].
     fn add_compaction(&mut self, us: u64) {
         self.compaction_us += us;
+    }
+
+    /// Accumulate one background scan's span — see [`Self::warm_us`].
+    fn add_warm(&mut self, us: u64) {
+        self.warm_us += us;
     }
 
     /// Charge the window just begun with the flush that closed the last one —
@@ -3171,6 +3180,7 @@ impl WaveStats {
         self.housekeeping_us = 0;
         self.quantize_us = 0;
         self.compaction_us = 0;
+        self.warm_us = 0;
         self.compaction_split = compaction_split::CompactionSplit::default();
         self.admission_split = admission_split::AdmissionSplit::default();
         self.telemetry_us = 0;
@@ -3249,6 +3259,9 @@ impl WaveStats {
         let quantize_dur = carve_ms(self.quantize_us / 1000, &mut [&mut blocked_dur]);
         let compaction_dur = carve_ms(self.compaction_us / 1000, &mut [&mut blocked_dur]);
         let telemetry_dur = carve_ms(self.telemetry_us / 1000, &mut [&mut blocked_dur]);
+        // The background scan runs between quanta, so its time is only ever in
+        // the remainder.
+        let warm_dur = carve_ms(self.warm_us / 1000, &mut [&mut blocked_dur]);
 
         // Sealing runs in two places: the compression-turn seal inside
         // HOUSEKEEPING (`complete_compression_turn` → `perform_seal_and_write`,
@@ -3396,6 +3409,9 @@ impl WaveStats {
         }
         if quantize_dur > 0 {
             push(&mut phases, PhaseKind::Quantize, quantize_dur, 0, 0);
+        }
+        if warm_dur > 0 {
+            push(&mut phases, PhaseKind::Warm, warm_dur, 0, 0);
         }
         if compaction_dur > 0 {
             push(&mut phases, PhaseKind::Compaction, compaction_dur, 0, 0);
