@@ -1093,6 +1093,21 @@ async fn identities(authored: &Arc<Authored>) -> Identities {
             .iter()
             .map(|w| (w.id.clone(), field(&w.body, "setting")))
             .collect(),
+        // A personality's own voice and way of working, read in the schema's
+        // generic ones' place.
+        voices: personalities
+            .iter()
+            .map(|p| (p.id.clone(), field(&p.body, "voice")))
+            .collect(),
+        actings: personalities
+            .iter()
+            .map(|p| (p.id.clone(), field(&p.body, "acting")))
+            .collect(),
+        unordered: personalities
+            .iter()
+            .filter(|p| p.body.get("takes_orders").and_then(Value::as_bool) == Some(false))
+            .map(|p| p.id.clone())
+            .collect(),
     }
 }
 

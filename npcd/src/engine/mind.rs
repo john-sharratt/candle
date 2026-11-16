@@ -1833,6 +1833,7 @@ impl Minds {
                 s.apply(
                     &self.engine,
                     live.sequence.timeline_id(),
+                    persona.personality,
                     &within.parts,
                     within.year,
                 )
@@ -2063,13 +2064,16 @@ impl Minds {
             .load()
             .as_ref()
             .map(|p| {
-                p.identities.selection_for(
+                let mut sel = p.identities.selection_for(
                     npc_id,
                     persona.personality,
                     persona.world_id,
                     persona.building,
                     identity::Deliberation::default(),
-                )
+                );
+                p.identities
+                    .act_as(&mut sel, persona.personality, persona.mission.is_some());
+                sel
             })
             .unwrap_or_else(|| identity::deliberation(identity::Deliberation::default()));
         if persona.mission.is_some() {

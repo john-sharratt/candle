@@ -103,6 +103,19 @@ pub const JOURNAL: &str = "journal";
 /// while it is on one.
 pub const CHANNELS: &str = "channels";
 
+/// How a character speaks and what it is here as: the schema's `voice/generic`
+/// for a personality that writes none, its own `voice:` for one that does.
+pub const VOICE: &str = "voice";
+
+/// How a character works and what it may say it knows, on a turn that acts:
+/// the schema's `acting/generic`, or a personality's own `acting:`.
+pub const ACTING: &str = "acting";
+
+/// What a character reads with no mission in its hands. Selected only for one
+/// the world gives orders to: a personality with `takes_orders: false` has
+/// nothing asked of it by default, and reads nothing where a mission would be.
+pub const UNASSIGNED: &str = "unassigned";
+
 /// The member every collection carries for the case nothing else resolves.
 pub const GENERIC: &str = "generic";
 
@@ -286,6 +299,13 @@ pub struct Authored {
     pub characters: Vec<(u64, String)>,
     /// `(world id, setting)`.
     pub settings: Vec<(String, String)>,
+    /// `(personality id, voice)` — a personality's own `voice:`, read in the
+    /// schema's generic one's place.
+    pub voices: Vec<(String, String)>,
+    /// `(personality id, acting)` — a personality's own `acting:`, likewise.
+    pub actings: Vec<(String, String)>,
+    /// The personalities the world gives no orders (`takes_orders: false`).
+    pub unordered: Vec<String>,
 }
 
 /// What was installed, so a turn can be pinned to the right members.
@@ -299,6 +319,15 @@ pub struct Installed {
     /// Whether the schema declares the [`CHANNELS`] collection: what a turn's
     /// channel sections are submitted to.
     pub channels: bool,
+    /// The personalities with a [`VOICE`] member of their own.
+    pub voices: Vec<String>,
+    /// The personalities with an [`ACTING`] member of their own.
+    pub actings: Vec<String>,
+    /// The personalities the world gives no orders.
+    pub unordered: Vec<String>,
+    /// Which of [`VOICE`], [`ACTING`] and [`UNASSIGNED`] the schema declares:
+    /// an undeclared one is pinned by nothing.
+    pub frames: Vec<&'static str>,
 }
 
 impl Installed {
@@ -327,7 +356,29 @@ impl Installed {
         sel.select(WHO, self.who(npc_id));
         sel.select(SETTING, pick(SETTING, self.settings.iter(), world));
         sel.select(BUILDING, pick(BUILDING, self.buildings.iter(), building));
+        self.voice(&mut sel, personality);
         sel
+    }
+
+    /// Pin the voice `personality` speaks in: its own, or the generic one.
+    fn voice(&self, sel: &mut SelectionState, personality: &str) {
+        if self.frames.contains(&VOICE) {
+            sel.select(VOICE, pick(VOICE, self.voices.iter(), personality));
+        }
+    }
+
+    /// Pin what a turn that acts reads beyond who the character is: how its
+    /// personality works ([`ACTING`]), and — with no mission in its hands,
+    /// for a personality the world gives orders to — what having nothing asked
+    /// of it means ([`UNASSIGNED`]). A reflection and a dream call neither.
+    pub fn act_as(&self, sel: &mut SelectionState, personality: &str, on_mission: bool) {
+        if self.frames.contains(&ACTING) {
+            sel.select(ACTING, pick(ACTING, self.actings.iter(), personality));
+        }
+        let ordered = !self.unordered.iter().any(|p| p == personality);
+        if self.frames.contains(&UNASSIGNED) && ordered && !on_mission {
+            sel.select(UNASSIGNED, member(UNASSIGNED, GENERIC));
+        }
     }
 
     /// The selection one character's dream projects under.
@@ -351,6 +402,7 @@ impl Installed {
         sel.select(ANCHOR, member(ANCHOR, &dreaming(inner)));
         sel.select(WHO, self.who(npc_id));
         sel.select(SETTING, pick(SETTING, self.settings.iter(), world));
+        self.voice(&mut sel, personality);
         sel
     }
 
@@ -505,10 +557,54 @@ pub fn install(
             .map_err(|e| anyhow::anyhow!("scoping `{CHANNELS}` to its members: {e}"))?;
     }
 
+    // Optional too, and each holds its generic member as the schema wrote it:
+    // a schema with none of them says the same thing to every personality in
+    // sections of its own.
+    let mut frames = Vec::new();
+    for collection in [VOICE, ACTING, UNASSIGNED] {
+        if builder.id_for_system_collection(collection).is_none() {
+            continue;
+        }
+        builder
+            .set_collection_selection(
+                collection,
+                SelectionRule::Named {
+                    selector: collection.to_string(),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("scoping `{collection}` to one member: {e}"))?;
+        if builder
+            .id_for_system_section(&member(collection, GENERIC))
+            .is_none()
+        {
+            anyhow::bail!(
+                "the schema declares `{collection}` without a `{collection}/{GENERIC}` member — \
+                 a personality that writes none of its own would read nothing there"
+            );
+        }
+        frames.push(collection);
+    }
+
     let mut out = Installed {
         channels: builder.id_for_system_collection(CHANNELS).is_some(),
+        unordered: authored.unordered.clone(),
         ..Installed::default()
     };
+    if frames.contains(&VOICE) {
+        for (id, voice) in &authored.voices {
+            if add(builder, VOICE, id, voice)? {
+                out.voices.push(id.clone());
+            }
+        }
+    }
+    if frames.contains(&ACTING) {
+        for (id, acting) in &authored.actings {
+            if add(builder, ACTING, id, acting)? {
+                out.actings.push(id.clone());
+            }
+        }
+    }
+    out.frames = frames;
 
     add(builder, ANCHOR, GENERIC, GENERIC_ANCHOR)?;
     for (id, anchor) in &authored.anchors {
@@ -583,6 +679,7 @@ fn add(builder: &mut Builder, collection: &str, id: &str, content: &str) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_conversation::models::Dialect;
 
     fn installed() -> Installed {
         Installed {
@@ -591,12 +688,110 @@ mod tests {
             characters: vec![7],
             settings: vec!["battle-cities".into()],
             buildings: vec![VAULT.into(), REDOUBT.into()],
-            channels: false,
+            ..Installed::default()
         }
+    }
+
+    /// **A personality that writes its own voice and acting reads them; one
+    /// that writes none reads the schema's.** And having nothing asked of it
+    /// is told only to a personality the world gives orders to, with no
+    /// mission in its hands — a mind that takes no orders reads a mission
+    /// section when it carries one and nothing there otherwise.
+    #[test]
+    fn a_personality_reads_its_own_frame_or_the_generic_one() {
+        let mut b = Builder::from_yaml(
+            "system_prompt:\n  items:\n    - kind: section\n      id: frame\n      content: hi\n    \
+             - kind: collection\n      name: identity_anchor\n      selection: { kind: \
+             always_visible }\n      sections: []\n    - kind: collection\n      name: identity\n      \
+             selection: { kind: always_visible }\n      sections: []\n    - kind: collection\n      \
+             name: world\n      selection: { kind: always_visible }\n      sections: []\n    - kind: \
+             collection\n      name: place\n      selection: { kind: always_visible }\n      \
+             sections: []\n    - kind: collection\n      name: voice\n      selection: { kind: \
+             always_visible }\n      sections:\n        - id: voice/generic\n          content: \
+             You have a body.\n    - kind: collection\n      name: acting\n      selection: { \
+             kind: always_visible }\n      sections:\n        - id: acting/generic\n          \
+             content: Talk to people.\n    - kind: collection\n      name: unassigned\n      \
+             selection: { kind: always_visible }\n      sections:\n        - id: \
+             unassigned/generic\n          content: Find somebody.\nlayers: []\n",
+        )
+        .unwrap();
+        let authored = Authored {
+            voices: vec![("zen".into(), "You have no body.".into())],
+            actings: vec![("zen".into(), "Work through terminals.".into())],
+            unordered: vec!["zen".into()],
+            ..Authored::default()
+        };
+        let i = install(&mut b, &authored, &BTreeMap::new()).unwrap();
+        assert_eq!(i.frames, [VOICE, ACTING, UNASSIGNED]);
+
+        let mut zen = i.selection_for(1, "zen", "moon", "moon/x", Deliberation::None);
+        assert_eq!(zen.get(VOICE), Some("voice/zen"));
+        assert_eq!(zen.get(ACTING), None, "a reflection pins no acting frame");
+        i.act_as(&mut zen, "zen", false);
+        assert_eq!(zen.get(ACTING), Some("acting/zen"));
+        assert_eq!(
+            zen.get(UNASSIGNED),
+            None,
+            "nothing is asked of it by default"
+        );
+
+        let mut drone = i.selection_for(2, "drone", "moon", "moon/x", Deliberation::None);
+        assert_eq!(drone.get(VOICE), Some("voice/generic"));
+        i.act_as(&mut drone, "drone", false);
+        assert_eq!(drone.get(ACTING), Some("acting/generic"));
+        assert_eq!(drone.get(UNASSIGNED), Some("unassigned/generic"));
+        let mut working = i.selection_for(2, "drone", "moon", "moon/x", Deliberation::None);
+        i.act_as(&mut working, "drone", true);
+        assert_eq!(
+            working.get(UNASSIGNED),
+            None,
+            "its mission is what it reads"
+        );
+
+        let dream = i.dreaming_selection_for(1, "zen", "moon");
+        assert_eq!(dream.get(VOICE), Some("voice/zen"));
+        assert_eq!(dream.get(ACTING), None);
+    }
+
+    /// **A frame collection with no generic member is refused**: a personality
+    /// that writes none of its own would read nothing there.
+    #[test]
+    fn a_frame_collection_needs_its_generic_member() {
+        let mut b = schema(&[ANCHOR, WHO, SETTING, BUILDING, VOICE]);
+        let e = install(&mut b, &Authored::default(), &BTreeMap::new()).unwrap_err();
+        assert!(e.to_string().contains("voice/generic"), "{e}");
     }
 
     const VAULT: &str = "battle-cities/creators-vault";
     const REDOUBT: &str = "battle-cities/tower-redoubt";
+
+    /// **The live mind's schema carries the three frame collections, each with
+    /// its generic member**, and takes a personality's own voice and acting
+    /// beside them — read from the mind checked out beside this repository.
+    #[test]
+    #[ignore = "reads the live mind checked out beside this repository"]
+    fn the_live_minds_schema_installs_its_frames() {
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../mind/projection.yaml"
+        ))
+        .expect("the mind is checked out beside candle");
+        let mut b = Builder::from_yaml_with_vars_and_dialect(&yaml, &[], Some(&Dialect::chat_ml()))
+            .expect("the mind's schema parses");
+        let authored = Authored {
+            voices: vec![("zen-moon".into(), "You have no body.".into())],
+            actings: vec![("zen-moon".into(), "Work through terminals.".into())],
+            unordered: vec!["zen-moon".into()],
+            ..Authored::default()
+        };
+        let i = install(&mut b, &authored, &BTreeMap::new()).unwrap();
+        assert_eq!(i.frames, [VOICE, ACTING, UNASSIGNED]);
+        assert_eq!((i.voices.len(), i.actings.len()), (1, 1));
+        for name in ["voice/generic", "acting/generic", "unassigned/generic"] {
+            assert!(b.id_for_system_section(name).is_some(), "{name}");
+        }
+        assert!(b.id_for_layer("guides").is_some(), "the guides layer");
+    }
 
     /// **A character does not deliberate; it acts.**
     ///

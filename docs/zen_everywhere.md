@@ -285,6 +285,36 @@ and raises that the person is home the moment their handset is seen, and
 that they have gone out once two surveys running have missed it — one miss
 is a phone asleep.
 
+### 5.1 What a mind that works terminals reads
+
+The engine's prompt is one schema for every character, and what differs by
+kind of character is selected, never forked. Four things are per
+personality, each general to the engine and assigned in the mind:
+
+| What | Where it is written | How it reaches a turn |
+|---|---|---|
+| **Voice** — what the character is here as | `voice:` in `personalities/<id>.yaml`; `voice/generic` in the schema for one that writes none | the `voice` collection, pinned on every turn (`identity::Installed::selection_for`) |
+| **Acting** — how its work goes and what it may say it knows | `acting:` in the personality; `acting/generic` in the schema | the `acting` collection, pinned on a turn that acts or talks (`Installed::act_as`); a reflection and a dream read neither |
+| **Nothing asked of it** | `unassigned/generic` in the schema | pinned for a character with no mission whose personality takes orders; one with `takes_orders: false` reads a mission section when it carries a mission and nothing in its place otherwise |
+| **What it draws on** | `personalities:` in `bearings.yaml` | a personality's own draws stand in the room's bearing wherever it is (`bearings::Bearings::of`) |
+
+`zen-moon` writes its own voice and acting: it is told that it helps the
+people it looks after, that its acts run for real, that a reading is taken
+and never remembered, that a request ends when whoever asked has been told,
+and that `rest` is how it stops. It draws its own world's canon and the
+**guides**.
+
+**Guides** are the `guides` layer: `layers/guides/*.md` in the mind, one
+short document per piece of real work — the cluster's health, jobs and logs,
+a machine check, the house network, the house's devices, carrying a request
+through. The layer is shared and scoped, so a guide is offered only to a
+personality whose draws name it, and a turn is handed the two its opening
+scores highest.
+
+**The journal is pinned.** `journal_intro` and the `journal` collection are
+`pin: true` under the schema's `pin_tokens`, as zend's are: what a character
+wrote down is attended whole at every depth of its conversation.
+
 ## 6. What changes for a person
 
 Nothing in how they speak to Zen: the conversation is its own thread at urgent

@@ -82,6 +82,9 @@ struct File {
     bearings: Vec<Rule>,
     #[serde(default)]
     elsewhere: Draws,
+    /// What a personality draws on wherever it is, by its id.
+    #[serde(default)]
+    personalities: BTreeMap<String, Draws>,
     /// The layers that answer to a character's year, and how.
     #[serde(default)]
     timed: BTreeMap<String, Timed>,
@@ -92,6 +95,10 @@ struct File {
 pub struct Bearings {
     rules: Vec<Rule>,
     elsewhere: Draws,
+    /// A personality's own draws, which stand in the room's place: a mind
+    /// that is in no room, or a cast whose work is not what the rooms are
+    /// for, draws on what its personality names and nothing else.
+    personalities: Vec<(String, Draws)>,
     timed: BTreeMap<String, Timed>,
 }
 
@@ -114,7 +121,8 @@ impl Bearings {
             .bearings
             .iter()
             .map(|r| &r.draws)
-            .chain(std::iter::once(&file.elsewhere));
+            .chain(std::iter::once(&file.elsewhere))
+            .chain(file.personalities.values());
         for d in draws.flat_map(|d| d.values()) {
             if let Draw::Every(word) = d {
                 anyhow::ensure!(
@@ -126,13 +134,25 @@ impl Bearings {
         Ok(Self {
             rules: file.bearings,
             elsewhere: file.elsewhere,
+            personalities: file.personalities.into_iter().collect(),
             timed: file.timed,
         })
     }
 
-    /// The bearing of a room holding `parts`: its index (the count of rules
-    /// for `elsewhere`), its name, and what it draws.
-    pub fn of(&self, parts: &[String]) -> (usize, &str, &Draws) {
+    /// The bearing of a character of `personality` in a room holding `parts`:
+    /// its index, its name, and what it draws. A personality with draws of its
+    /// own has those wherever it is (indexed after `elsewhere`, named by the
+    /// personality); any other has the first rule whose part is here, or
+    /// `elsewhere` (the count of rules).
+    pub fn of(&self, personality: &str, parts: &[String]) -> (usize, &str, &Draws) {
+        if let Some(at) = self
+            .personalities
+            .iter()
+            .position(|(id, _)| id == personality)
+        {
+            let (id, draws) = &self.personalities[at];
+            return (self.rules.len() + 1 + at, id.as_str(), draws);
+        }
         self.rules
             .iter()
             .enumerate()
@@ -246,11 +266,17 @@ impl Scopes {
         self.shelves.iter().map(|s| s.group)
     }
 
-    /// The bearing of a room holding `parts`, and the documents each shared
-    /// group offers there to a character working in `year` (`None`: the
-    /// present) — an empty set for a layer the bearing does not draw on.
-    pub fn at(&self, parts: &[String], year: Option<u32>) -> (&str, Arc<Vec<Offered>>) {
-        let (index, name, draws) = self.bearings.of(parts);
+    /// The bearing of a character of `personality` in a room holding `parts`,
+    /// and the documents each shared group offers it there, working in `year`
+    /// (`None`: the present) — an empty set for a layer the bearing does not
+    /// draw on.
+    pub fn at(
+        &self,
+        personality: &str,
+        parts: &[String],
+        year: Option<u32>,
+    ) -> (&str, Arc<Vec<Offered>>) {
+        let (index, name, draws) = self.bearings.of(personality, parts);
         let mut built = self.built.lock().unwrap();
         let scopes = built.entry((index, year)).or_insert_with(|| {
             Arc::new(
@@ -276,16 +302,18 @@ impl Scopes {
         (name, Arc::clone(scopes))
     }
 
-    /// Scope `timeline`'s turns to the bearing of a room holding `parts`, for
-    /// a character working in `year`. Answers the bearing's name.
+    /// Scope `timeline`'s turns to the bearing of a character of
+    /// `personality` in a room holding `parts`, working in `year`. Answers the
+    /// bearing's name.
     pub fn apply(
         &self,
         engine: &ConversationEngine,
         timeline: TimelineId,
+        personality: &str,
         parts: &[String],
         year: Option<u32>,
     ) -> String {
-        let (name, scopes) = self.at(parts, year);
+        let (name, scopes) = self.at(personality, parts, year);
         for (group, allowed) in scopes.iter() {
             engine.set_retrieval_scope(timeline, *group, Arc::clone(allowed));
         }
@@ -309,6 +337,10 @@ bearings:
       world: [locations, cities]
 elsewhere:
   world: [locations, cities]
+personalities:
+  zen-moon:
+    guides: all
+    world: [moon]
 timed:
   eras: era
   stories: dated
@@ -328,7 +360,17 @@ timed:
 
     /// What `s` offers a character at `p` working in `year`, by group.
     fn offered(s: &Scopes, p: &[&str], year: Option<u32>) -> Vec<(GroupId, Vec<u64>)> {
-        let (_, scopes) = s.at(&parts(p), year);
+        offered_to(s, "maker", p, year)
+    }
+
+    /// What `s` offers a character of `personality` at `p` working in `year`.
+    fn offered_to(
+        s: &Scopes,
+        personality: &str,
+        p: &[&str],
+        year: Option<u32>,
+    ) -> Vec<(GroupId, Vec<u64>)> {
+        let (_, scopes) = s.at(personality, &parts(p), year);
         scopes
             .iter()
             .map(|(g, a)| {
@@ -352,16 +394,55 @@ timed:
     #[test]
     fn the_bearing_is_the_first_whose_part_is_here() {
         let b = Bearings::parse(YAML).unwrap();
-        let (i, name, draws) = b.of(&parts(&["seat", "story-desk"]));
+        let (i, name, draws) = b.of("maker", &parts(&["seat", "story-desk"]));
         assert_eq!((i, name), (0, "story-desk"));
         assert_eq!(draws.get("eras"), Some(&Draw::Every("all".into())));
-        assert_eq!(b.of(&parts(&["map-table"])).1, "map-table");
-        let (i, name, draws) = b.of(&parts(&[]));
+        assert_eq!(b.of("maker", &parts(&["map-table"])).1, "map-table");
+        let (i, name, draws) = b.of("maker", &parts(&[]));
         assert_eq!((i, name), (2, ELSEWHERE));
         assert_eq!(
             draws.get("eras"),
             None,
             "nothing of the chronicle in a corridor"
+        );
+    }
+
+    /// **A personality with draws of its own has them wherever it is**: at a
+    /// story desk or in no room at all it is offered its guides and its own
+    /// world's canon, and nothing the room's bearing would have drawn.
+    #[test]
+    fn a_personalitys_own_draws_stand_in_the_rooms_place() {
+        let b = Bearings::parse(YAML).unwrap();
+        let (i, name, draws) = b.of("zen-moon", &parts(&["story-desk"]));
+        assert_eq!((i, name), (3, "zen-moon"));
+        assert_eq!(draws.get("eras"), None);
+
+        let world = GroupId::from_raw(1).unwrap();
+        let guides = GroupId::from_raw(2).unwrap();
+        let shelves = vec![
+            Shelf {
+                layer: "world".into(),
+                group: world,
+                docs: vec![
+                    doc(1, "world/cities", None),
+                    doc(2, "world/moon/the-warren", None),
+                ],
+            },
+            Shelf {
+                layer: "guides".into(),
+                group: guides,
+                docs: vec![doc(3, "guides/cluster-health", None)],
+            },
+        ];
+        let s = Scopes::new(b, shelves);
+        assert_eq!(
+            offered_to(&s, "zen-moon", &[], None),
+            [(world, vec![2]), (guides, vec![3])]
+        );
+        assert_eq!(
+            offered_to(&s, "maker", &[], None),
+            [(world, vec![1]), (guides, vec![])],
+            "a guide is offered to nobody it is not drawn for"
         );
     }
 
