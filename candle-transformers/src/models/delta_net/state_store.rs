@@ -153,6 +153,7 @@ use candle_nn::kv_cache::{
 
 #[cfg(feature = "cuda")]
 use super::cuda::{delta_net_fold, fold_runs_fused, FoldEntry};
+use super::host_rows;
 use super::mix::{DeltaNetState, SpanWrite};
 use super::timeline::{fold_by_ops, TimelineLayout, TIMELINE_ROWS};
 use super::types::{DeltaNetDims, LayerKind};
@@ -192,6 +193,20 @@ impl StagedSnapshot {
         let mut store = RecurrentStateStore::new(layer_kinds, dims, device)?;
         store.import(self.schedule_hash, &self.layers)?;
         Ok(store)
+    }
+}
+
+impl Drop for StagedSnapshot {
+    /// The last holder of the rows returns them to [`host_rows`], for the next
+    /// decode to fill, instead of freeing them where the snapshot is dropped —
+    /// inside a reprojection's swap or a store's build, on the scheduler thread.
+    fn drop(&mut self) {
+        if let Some(layers) = Arc::get_mut(&mut self.layers) {
+            for l in layers.iter_mut() {
+                host_rows::give(std::mem::take(&mut l.state));
+                host_rows::give(std::mem::take(&mut l.conv_tail));
+            }
+        }
     }
 }
 
@@ -2104,6 +2119,42 @@ mod tests {
             layers: staged.layers.clone(),
         };
         assert!(foreign.build(&kinds(), &dims(), &Device::Cpu).is_err());
+    }
+
+    /// **The last holder of a snapshot's rows returns them to the host pool**;
+    /// a holder that shares them returns nothing, and the rows a decode then
+    /// fills are the returned ones.
+    #[test]
+    fn a_dropped_snapshot_returns_its_rows_to_the_pool() {
+        let _g = host_rows::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        host_rows::clear();
+        let source = filled_store();
+        let layers: Arc<[ExportedLayerState]> = source.export().unwrap().into();
+        let bytes: usize = layers
+            .iter()
+            .map(|l| l.state.capacity() + l.conv_tail.capacity())
+            .sum();
+        let first_state = layers[0].state.as_ptr();
+        let staged = StagedSnapshot {
+            schedule_hash: source.schedule_hash(),
+            layers: Arc::clone(&layers),
+        };
+        let shared = StagedSnapshot {
+            schedule_hash: source.schedule_hash(),
+            layers,
+        };
+        drop(staged);
+        assert_eq!(host_rows::pooled_bytes(), 0, "the rows are still shared");
+        let want = shared.layers[0].state.clone();
+        drop(shared);
+        assert_eq!(host_rows::pooled_bytes(), bytes);
+        let refilled = (0..64)
+            .map(|_| host_rows::row_from(&want))
+            .find(|r| r.as_ptr() == first_state);
+        assert!(refilled.is_some(), "a decode fills a returned row");
+        host_rows::clear();
     }
 
     /// **A short span leaves the state as it entered; a fold lands it.** The span

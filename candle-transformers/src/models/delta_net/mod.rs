@@ -16,6 +16,7 @@
 pub mod bench;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod host_rows;
 pub mod kv_layout;
 pub mod mix;
 /// The quantized driver projects through `models::stacked_proj`, whose ragged

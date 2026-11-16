@@ -246,6 +246,9 @@ impl Scheduler {
         // would no-op anyway, but the substrate read-lock
         // snapshot is cheap to avoid.
         let mut projected_segments = projected_segments;
+        // Whether a selected conversation was withdrawn from this assembly: the
+        // slot then holds less than the selection names.
+        let mut withdrew = false;
         if let Some(conversation) = self.slot_conversations.get(&parent_id).cloned() {
             // Free VRAM held by yesterday's working set (warm-backed hot
             // residences NOT in the incoming projection), then batch
@@ -262,7 +265,7 @@ impl Scheduler {
                 "submit",
             );
             // Every other conversation whole, or not this time.
-            Self::keep_conversations_whole(
+            withdrew = Self::keep_conversations_whole(
                 &conversation,
                 slot_target.map(|t| t.timeline),
                 &mut projected_segments,
@@ -275,15 +278,33 @@ impl Scheduler {
         // onto it below. `apply_projection(_, BlockCount(0), _)` would
         // reset it to empty, so it must be skipped here (not just fed
         // empty segments, which is the RULER/summarisation reset path).
+        //
+        // `built` is the identity of what this assembly put on the parent,
+        // when it put exactly its segment list there — so the turn's first
+        // reprojection that selects the same keeps the parent instead of
+        // rebuilding it (`turn_start_identity`).
+        let mut built: Option<u64> = None;
         if !skip_projection {
             // Injecting the projected context into the parent slot: the K/V
             // scatter and the block-table writes for every selected segment. The
             // heaviest single step in the handler, and the one that scales with
             // how much context the projection chose.
             let _g = profile::span("drain:apply_projection");
-            if let Err(e) = self.apply_projection(parent_id, BlockCount(0), &projected_segments) {
-                let _ = work.event_tx.send(TurnEvent::Error(e));
-                return None;
+            match self.apply_projection(parent_id, BlockCount(0), &projected_segments) {
+                Ok(complete) => {
+                    if complete && !withdrew {
+                        built = self.slot_conversations.get(&parent_id).map(|c| {
+                            let read = c.read();
+                            submit_identity(&projected_segments, |id| {
+                                section_content_stamp(&read.section_tokens_of(id))
+                            })
+                        });
+                    }
+                }
+                Err(e) => {
+                    let _ = work.event_tx.send(TurnEvent::Error(e));
+                    return None;
+                }
             }
         }
 
@@ -403,7 +424,7 @@ impl Scheduler {
                 original_borrowed: borrowed,
                 turn_start_parent_blocks,
                 question_tokens: work.user_content_end as usize,
-                applied_identity: turn_start_identity(parent_block_count),
+                applied_identity: turn_start_identity(parent_block_count, built),
                 state_forked: false,
                 holds_parent_state: false,
             },

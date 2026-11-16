@@ -734,6 +734,16 @@ reset lands on top of the restore and silently zeroes it — the exact failure
 this document exists to remove. An explicit `seeded` flag on the store, cleared
 by the first wave, closes it without depending on the ordering. See §9 Q2.
 
+**The host rows are held once and recycled.** A snapshot is one F32 row per
+recurrent layer — ~112 MiB across Qwen4Exp's 36 DeltaNet layers. The decoder
+fills its rows from a bounded host pool (`delta_net::host_rows`, 256 MiB at
+most, never pinned, never on the card), the restore *moves* the decoded rows
+into the `StagedSnapshot` it stages rather than copying them, and the snapshot's
+last holder hands the rows back to the pool when it drops. Copying the rows and
+freeing the copies cost a restore the whole state twice; the last free landed in
+the next reprojection's state move, ~4 ms of a calibration exemplar's ~5 ms move
+(BlackWorld, 2026-11-16).
+
 ### 4.4 Fork: a VRAM-to-VRAM copy
 
 Two cases, and the fast one is the common one.

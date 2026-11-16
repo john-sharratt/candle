@@ -230,7 +230,9 @@ use candle_transformers::models::sealed_injection::reconcile_sealed_prefix;
 
 use self::exported_state::{ExportedState, SharedState};
 use self::norm_warm::NormWarm;
-use self::projection_identity::{section_content_stamp, segments_identity, turn_start_identity};
+use self::projection_identity::{
+    section_content_stamp, segments_identity, submit_identity, turn_start_identity,
+};
 pub(crate) use self::remote_arena::RemoteArena;
 pub use self::settle::SettleReport;
 use self::turn_group::{GroupCaseId, TurnGroup};
@@ -7874,20 +7876,15 @@ impl Scheduler {
             return false;
         }
 
+        // The decoded rows move into the staged snapshot: copied, a restore
+        // would hold the whole state twice and free one of them here.
+        let (turn_index, schedule_hash) = (payload.turn_index, payload.schedule_hash);
         let layers: Vec<ExportedLayerState> = payload
             .layers
-            .iter()
-            .map(|l| ExportedLayerState {
-                layer_index: l.layer_index,
-                n_v_heads: l.n_v_heads,
-                d_v: l.d_v,
-                d_k: l.d_k,
-                state: l.state.clone(),
-                conv_channels: l.conv_channels,
-                conv_tail_cols: l.conv_tail_cols,
-                conv_tail: l.conv_tail.clone(),
-            })
+            .into_iter()
+            .map(ExportedLayerState::from)
             .collect();
+        let n_layers = layers.len();
 
         // **Staged, not built.** The store is claimed where its slot is next
         // used — the view's fork at admission, or a wave on the slot — so a
@@ -7896,14 +7893,12 @@ impl Scheduler {
         // the state at once.
         match self
             .model
-            .stage_recurrent(slot_id.0, payload.schedule_hash, Arc::from(layers))
+            .stage_recurrent(slot_id.0, schedule_hash, Arc::from(layers))
         {
             Ok(true) => {
                 tracing::debug!(
-                    "restored recurrent state for timeline {timeline} at turn {} \
-                     ({} layers)",
-                    payload.turn_index,
-                    payload.layers.len(),
+                    "restored recurrent state for timeline {timeline} at turn \
+                     {turn_index} ({n_layers} layers)",
                 );
             }
             Ok(false) => {
@@ -8059,12 +8054,15 @@ impl Scheduler {
     /// the bytes the record references.  Arc-clone keeps the
     /// chunk's memory alive across freed slots; substrate metadata
     /// is atomic; projection sees a consistent snapshot.
+    ///
+    /// Answers whether the slot now holds exactly `segments`
+    /// ([`projection_assembler::apply_segments`]).
     pub(crate) fn apply_projection(
         &mut self,
         parent_id: SequenceId,
         system_block_count: BlockCount,
         segments: &[ProjectionSegment],
-    ) -> Result<(), ConversationError> {
+    ) -> Result<bool, ConversationError> {
         let _ = system_block_count;
 
         let conversation = self

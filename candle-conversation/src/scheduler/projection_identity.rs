@@ -132,17 +132,32 @@ pub(super) fn segments_identity(
 }
 
 /// The identity a turn's view starts with, given the block count of the parent
-/// it borrows.
+/// it borrows and the identity of the assembly that just built that parent, when
+/// it built exactly its segment list ([`submit_identity`]).
 ///
-/// A view otherwise learns its parent's identity only from a rebuild, so a turn's
-/// first reprojection always rebuilds — and that rebuild tears the whole active
-/// turn off the parent and puts it back, ~290 ms for a 128K prompt, even when it
-/// selects exactly what the parent already holds. An **empty** parent is exactly
-/// the assembly of an empty segment list, so the view can start with that
-/// identity and a reprojection that selects nothing keeps it. A parent holding
-/// anything starts with none: only the assembly that built it knows what it is.
-pub(super) fn turn_start_identity(parent_block_count: usize) -> Option<u64> {
-    (parent_block_count == 0).then(|| segments_identity(&[], |_| (0, 0)))
+/// A turn's first reprojection otherwise always rebuilds — tearing the whole
+/// active turn off the parent and putting it back, ~290 ms for a 128K prompt and
+/// ~8 ms for a calibration exemplar, every one of them, even when it selects
+/// exactly what the parent already holds. The submit's assembly knows what it
+/// built; an **empty** parent is exactly the assembly of an empty segment list,
+/// so a view over one starts with that identity whatever assembled it.
+pub(super) fn turn_start_identity(parent_block_count: usize, built: Option<u64>) -> Option<u64> {
+    built.or_else(|| (parent_block_count == 0).then(|| segments_identity(&[], |_| (0, 0))))
+}
+
+/// The identity of a submit's segment list as a reprojection of the same turn
+/// computes it: the turn's own user message is left out, since a reprojection
+/// carries it in the view's tail rather than among the segments it assembles.
+pub(super) fn submit_identity(
+    segments: &[ProjectionSegment],
+    section_stamp: impl Fn(SectionId) -> (u64, usize),
+) -> u64 {
+    let assembled: Vec<ProjectionSegment> = segments
+        .iter()
+        .filter(|s| !matches!(s, ProjectionSegment::NewUserMessage { .. }))
+        .cloned()
+        .collect();
+    segments_identity(&assembled, section_stamp)
 }
 
 #[cfg(test)]
@@ -255,17 +270,47 @@ mod tests {
 
     /// An empty parent is the empty list's assembly, so a turn opened on one
     /// starts with that identity and a reprojection that selects nothing keeps
-    /// it; a parent holding anything starts with none.
+    /// it; a parent holding anything starts with the identity of the assembly
+    /// that built it exactly, or none.
     #[test]
-    fn only_an_empty_parent_starts_a_turn_with_an_identity() {
+    fn a_turn_starts_with_the_identity_its_parent_was_built_from() {
         use super::turn_start_identity;
-        assert_eq!(turn_start_identity(0), Some(segments_identity(&[], stamp)));
-        assert_eq!(turn_start_identity(1), None);
-        assert_eq!(turn_start_identity(4002), None);
+        let empty = Some(segments_identity(&[], stamp));
+        assert_eq!(turn_start_identity(0, None), empty);
+        assert_eq!(turn_start_identity(1, None), None);
+        assert_eq!(turn_start_identity(4002, None), None);
         assert_ne!(
-            turn_start_identity(0),
+            turn_start_identity(0, None),
             Some(segments_identity(&[section(3)], stamp)),
             "a projection that selects something still rebuilds"
+        );
+        let built = segments_identity(&prefix(), stamp);
+        assert_eq!(turn_start_identity(4002, Some(built)), Some(built));
+    }
+
+    /// **A submit's list names what a reprojection of the same turn assembles**:
+    /// the turn's own user message, which a reprojection carries in the view's
+    /// tail, is left out, and everything else counts as it does there.
+    #[test]
+    fn a_submits_identity_is_the_reprojections() {
+        use super::submit_identity;
+        let mut submitted = prefix();
+        submitted.push(ProjectionSegment::NewUserMessage {
+            tokens: Arc::new(vec![11, 12, 13]),
+        });
+        assert_eq!(
+            submit_identity(&submitted, stamp),
+            segments_identity(&prefix(), stamp)
+        );
+        let mut other = prefix();
+        other.pop();
+        other.push(ProjectionSegment::NewUserMessage {
+            tokens: Arc::new(vec![11, 12, 13]),
+        });
+        assert_ne!(
+            submit_identity(&other, stamp),
+            segments_identity(&prefix(), stamp),
+            "a different prefix still differs"
         );
     }
 

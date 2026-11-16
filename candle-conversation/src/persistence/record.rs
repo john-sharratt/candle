@@ -49,6 +49,8 @@
 
 use std::collections::BTreeMap;
 
+use candle_transformers::models::delta_net::{host_rows, ExportedLayerState};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{from_value, Value};
 use sha2::{Digest, Sha256};
@@ -1834,12 +1836,29 @@ pub struct SnapshotLayer {
     pub conv_tail: Vec<u8>,
 }
 
-impl From<candle_transformers::models::delta_net::ExportedLayerState> for SnapshotLayer {
+impl From<ExportedLayerState> for SnapshotLayer {
     /// The model's export rows are field-for-field this record's layer rows —
     /// `candle-conversation` depends on `candle-transformers` and not the
     /// reverse, so the model hands back its own type and the record shape is
     /// built here.
-    fn from(l: candle_transformers::models::delta_net::ExportedLayerState) -> Self {
+    fn from(l: ExportedLayerState) -> Self {
+        Self {
+            layer_index: l.layer_index,
+            n_v_heads: l.n_v_heads,
+            d_v: l.d_v,
+            d_k: l.d_k,
+            state: l.state,
+            conv_channels: l.conv_channels,
+            conv_tail_cols: l.conv_tail_cols,
+            conv_tail: l.conv_tail,
+        }
+    }
+}
+
+impl From<SnapshotLayer> for ExportedLayerState {
+    /// The record's rows handed to the model as they are: a restore moves the
+    /// decoded rows into the snapshot it stages rather than copying them.
+    fn from(l: SnapshotLayer) -> Self {
         Self {
             layer_index: l.layer_index,
             n_v_heads: l.n_v_heads,
@@ -2123,7 +2142,9 @@ fn decode_snapshot_layer(r: &mut ByteReader<'_>) -> Result<SnapshotLayer> {
     let n_v_heads = r.get_u32()?;
     let d_v = r.get_u32()?;
     let d_k = r.get_u32()?;
-    let state = r.get_blob()?.to_vec();
+    // Into a kept row: a restore's rows are the size every snapshot of the model
+    // has, and the last snapshot dropped left its rows in the pool.
+    let state = host_rows::row_from(r.get_blob()?);
     let expect = n_v_heads as usize * d_v as usize * d_k as usize * 4;
     if state.len() != expect {
         return Err(PersistenceError::Corrupt(format!(
@@ -2133,7 +2154,7 @@ fn decode_snapshot_layer(r: &mut ByteReader<'_>) -> Result<SnapshotLayer> {
     }
     let conv_channels = r.get_u32()?;
     let conv_tail_cols = r.get_u32()?;
-    let conv_tail = r.get_blob()?.to_vec();
+    let conv_tail = host_rows::row_from(r.get_blob()?);
     let expect_tail = conv_channels as usize * conv_tail_cols as usize * 4;
     if conv_tail.len() != expect_tail {
         return Err(PersistenceError::Corrupt(format!(

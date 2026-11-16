@@ -1651,8 +1651,9 @@ impl Qwen4ExpBatched {
         let t_lock = Instant::now();
         // One write: take the child's store and put it under the parent. The
         // parent's displaced store leaves the lock with it and is dropped
-        // outside — its per-layer buffers go back to the region pool, and none
-        // of that may hold the map every wave reads.
+        // outside, its slots going back to their arenas without holding the map
+        // every wave reads. The parent's stale staged snapshot, removed below,
+        // returns its host rows to `host_rows` when it is the last holder.
         let displaced = {
             let mut map = self
                 .recurrent

@@ -126,13 +126,14 @@ fn pages_pushed(probe: &RecurrentProbe, slot: SequenceId) -> usize {
 fn each_record_goes_in_with_the_pages_inside_it() {
     let (mut scheduler, probe, conversation, timeline, index) = sealed_turn(&[EDGE, 6, 4]);
     let slot = create_scratch_slot(&mut scheduler, &conversation);
-    scheduler
+    let complete = scheduler
         .apply_projection(
             slot,
             BlockCount(0),
             &[record(timeline, index, TurnRecord::User)],
         )
         .expect("the user record places");
+    assert!(complete, "every piece placed, its gap-fill run here");
     assert_eq!(scheduler.session.sequence_offset(slot.0), Some(EDGE));
     assert_eq!(pages_pushed(&probe, slot), 1);
 

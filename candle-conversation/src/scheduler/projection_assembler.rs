@@ -993,13 +993,19 @@ pub(super) struct PlannedIsland {
 /// Post-condition: the slot's per-layer K/V is `[sealed prefix | glue]` plus the
 /// re-attached writer tail and the prefilled in-flight user message. Equivalent
 /// to `apply_segments_build` + `fire_gap_fill_batch` (one slot) + `_finish`.
+///
+/// Answers whether the slot now holds exactly `new_segments`: the walk placed
+/// every sealed piece and the gap-fill ran here. A fill deferred to the drain's
+/// batch has not run yet — and a later assembly of the same slot in the drain
+/// drops it — so a deferred apply answers `false`.
 pub(super) fn apply_segments(
     state: &mut SlotState,
     mut ctx: ApplyContext<'_>,
     new_segments: &[ProjectionSegment],
     defer: Option<&mut Vec<GapFillPlan>>,
-) -> Result<(), ConversationError> {
+) -> Result<bool, ConversationError> {
     let plan = apply_segments_build(state, &mut ctx, new_segments)?;
+    let complete = plan.complete;
     // When the caller is batching drain gap-fills AND this projection has no
     // deferred user message (ingest / compression — the content prefills through a
     // separate unit), queue the fire and finish now (restore-tail only). The glue
@@ -1010,7 +1016,8 @@ pub(super) fn apply_segments(
     if let Some(sink) = defer {
         if plan.deferred_user.is_none() {
             sink.push(fire_only(&plan));
-            return apply_segments_finish(state, &mut ctx, plan, false);
+            apply_segments_finish(state, &mut ctx, plan, false)?;
+            return Ok(false);
         }
     }
     let t_glue = Instant::now();
@@ -1021,7 +1028,8 @@ pub(super) fn apply_segments(
         return Err(e);
     }
     super::drain_add_us(&super::DRAIN_GLUE_US, t_glue.elapsed().as_micros() as u64);
-    apply_segments_finish(state, &mut ctx, plan, true)
+    apply_segments_finish(state, &mut ctx, plan, true)?;
+    Ok(complete)
 }
 
 /// A fire-only clone of a [`GapFillPlan`] (glue scatter inputs; no deferred user /

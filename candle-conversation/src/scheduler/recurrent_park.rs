@@ -176,22 +176,15 @@ impl Scheduler {
             (Some((timeline, turn)), Some(conversation)) => {
                 match conversation.read_recurrent_snapshot(timeline) {
                     Ok(Some(payload)) if payload.turn_index == turn => {
+                        // Moved, not copied — see `restore_recurrent_state`.
+                        let schedule_hash = payload.schedule_hash;
                         let layers: Vec<ExportedLayerState> = payload
                             .layers
-                            .iter()
-                            .map(|l| ExportedLayerState {
-                                layer_index: l.layer_index,
-                                n_v_heads: l.n_v_heads,
-                                d_v: l.d_v,
-                                d_k: l.d_k,
-                                state: l.state.clone(),
-                                conv_channels: l.conv_channels,
-                                conv_tail_cols: l.conv_tail_cols,
-                                conv_tail: l.conv_tail.clone(),
-                            })
+                            .into_iter()
+                            .map(ExportedLayerState::from)
                             .collect();
                         self.model
-                            .stage_recurrent(slot.0, payload.schedule_hash, Arc::from(layers))
+                            .stage_recurrent(slot.0, schedule_hash, Arc::from(layers))
                             .map_err(ConversationError::Model)
                             .map(|_| ())
                     }
