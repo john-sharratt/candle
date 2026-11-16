@@ -771,7 +771,9 @@ pub const SCAN: Tool = Tool {
     availability: Availability::Always,
     description: "Look through your instruments. Name a place you are not in to see who is there \
                   and what moves. Name nothing to see what in your own room you can work, with \
-                  its state and the address to `invoke` for each.",
+                  its state and the address to `invoke` for each. It shows rooms and who is in \
+                  them, nothing else: it never reaches a terminal, the house network, the \
+                  cluster or a machine — connected to one of those, use the acts it gave you.",
     // **`at` is optional because naming nothing is a real act: the survey.**
     //
     // The grammar offers a place from the live set of places there are, or no

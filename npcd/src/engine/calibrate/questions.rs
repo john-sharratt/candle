@@ -58,6 +58,21 @@ pub const ASKED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "survey_network",
+        &[
+            "what devices are on the house network right now",
+            "scan the house network",
+            "survey the network and tell me what answers",
+            "are there any lights, speakers or a television on the network",
+            "what is connected to the wifi at the moment",
+            "has anything new joined the network",
+            "you are connected to the house network and said you would see what is on it",
+            "which devices in the house can you work",
+            "find every device in the house",
+            "is my phone on the network",
+        ],
+    ),
+    (
         "terminal_disconnect",
         &[
             "you have read what you came for and have nothing more to do here",

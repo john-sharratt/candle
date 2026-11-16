@@ -11,10 +11,14 @@ pub const SURVEY_NETWORK: Tool = Tool {
     category: "House",
     plane: Plane::World,
     availability: Availability::Embodied,
-    description:
-        "Survey the house network from the house link here: every device on it, what each \
-                  says it is, and whether the world can work it. What it finds stays with this \
-                  room, to put each device in it as what it is.",
+    description: "Survey the house network from the house link here, or from the house network's \
+                  terminal while you are connected to it: every device on it, what each says it \
+                  is, and whether the world can work it. What it finds stays with this room, to \
+                  put each device in it as what it is. Use for: finding out what is on the \
+                  house's network now — lights, speakers, televisions, handsets, machines. \
+                  Triggered by: \"what devices are on the network\", \"scan the house network\", \
+                  \"is there a television or a speaker in the house\". This is the one act that \
+                  looks at the network; `scan` looks only at rooms.",
     params: &[Param {
         name: "at",
         ty: "string",
