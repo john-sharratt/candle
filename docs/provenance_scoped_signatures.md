@@ -394,6 +394,11 @@ loses (`docs/results/provenance_gates_2026-10-26.md`).
   write are projected without the cut. Learned from 2 questions a file
   (`EXCLUSION_QUESTIONS_PER_FILE`); the cut at that sample has not been
   measured against the 6-a-file one below.
+- **Learned incrementally.** `docs/incremental_chunk_exclusion.md` replaces the
+  from-scratch learn above: a 4,000-question random sample, each sample token's
+  scan statistics kept as an exact mergeable summary, every appended signature
+  folded in once, and the state, cursor and cut replicated in the substrate — so
+  no restart relearns it and no job assembles the whole group.
 - **Measured.** Held-out questions, content alone: MRR 0.172 → 0.186; stacked
   on the calibration competition at 15 questions a file: 0.220 → 0.228, R@10
   0.364 → 0.379.
