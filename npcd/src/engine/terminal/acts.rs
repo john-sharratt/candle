@@ -102,6 +102,21 @@ pub const TERMINAL_DISCONNECT: Tool = bare!(
      done there."
 );
 
+pub const REST: Tool = bare!(
+    "rest",
+    "Terminals",
+    "Stop, and be woken by whatever reaches you next: a message, a terminal telling you \
+     something changed, a Drone's work come back. You name nothing to wait for and no time; the \
+     next thing that happens is what wakes you. Use for: the moment after you have done what \
+     was asked and told whoever asked what came of it, and any moment with nothing new to act \
+     on — a reading that says what the last one said is nothing new. Never to put off \
+     something asked of you: do it, say what came of it, then rest. Triggered by: nothing left \
+     to do, having just reported, a reading that has not changed.",
+    "You read the cluster, told John what it said, and nothing else has reached you.",
+    "Reading again what has not changed is not watching: what changes is told to you, and it \
+     wakes you."
+);
+
 // ── a television ───────────────────────────────────────────────────────────
 
 pub const TV_STATUS: Tool = bare!(
@@ -597,8 +612,9 @@ pub const MACHINE_CHECK: Tool = Tool {
     ],
 };
 
-/// The three acts a mind with no body always has.
-pub const REACH_ACTS: &[&str] = &["terminal_list", "terminal_connect"];
+/// The acts a mind with no body always has: finding its terminals,
+/// connecting to one, and stopping until something reaches it.
+pub const REACH_ACTS: &[&str] = &["terminal_list", "terminal_connect", "rest"];
 
 /// What a paired television offers.
 pub const TV_ACTS: &[&str] = &[
@@ -647,6 +663,7 @@ pub const TERMINAL_ACTS: &[Tool] = &[
     TERMINAL_LIST,
     TERMINAL_CONNECT,
     TERMINAL_DISCONNECT,
+    REST,
     TV_STATUS,
     TV_ON,
     TV_OFF,
@@ -687,6 +704,17 @@ pub fn is_mine(tool: &str) -> bool {
     TERMINAL_ACTS.iter().any(|t| t.name == tool)
 }
 
+/// The terminal acts that leave nothing to act on: letting a terminal go, and
+/// stopping.
+const ENDINGS: &[&str] = &["terminal_disconnect", "rest"];
+
+/// Whether what `tool` came back with is the point of making it — a reading,
+/// a list, whether a thing took the call — so the mind that made it is owed a
+/// turn to use it.
+pub fn answers(tool: &str) -> bool {
+    is_mine(tool) && !ENDINGS.contains(&tool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,6 +745,23 @@ mod tests {
                 tool.name
             );
             assert_eq!(tool.availability, Availability::Granted, "{}", tool.name);
+        }
+    }
+
+    /// **A reading is owed a turn to use it; an ending is not.** Every
+    /// terminal act answers but the two that leave nothing to act on.
+    #[test]
+    fn every_terminal_act_answers_but_the_endings() {
+        for tool in [
+            "terminal_list",
+            "terminal_connect",
+            "cluster_status",
+            "tv_on",
+        ] {
+            assert!(answers(tool), "{tool}");
+        }
+        for tool in ["rest", "terminal_disconnect", "tell", "survey_network"] {
+            assert!(!answers(tool), "{tool}");
         }
     }
 }

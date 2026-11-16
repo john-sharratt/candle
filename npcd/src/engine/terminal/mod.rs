@@ -808,7 +808,7 @@ mod tests {
         let mut s = house();
         let at = |s: &Sim| Within::default().at_terminals(s, &machines(), true, "zen");
         let free = at(&s);
-        assert_eq!(free.grants, ["terminal_list", "terminal_connect"]);
+        assert_eq!(free.grants, ["terminal_list", "terminal_connect", "rest"]);
         assert_eq!(free.links, [NETWORK], "the survey is offered unconnected");
         assert_eq!(free.terminals.len(), 6);
         assert!(free.lights.is_empty() && free.sonos.is_empty() && free.checks.is_empty());
@@ -818,7 +818,12 @@ mod tests {
         assert_eq!(lit.lights, [ALL_LIGHTS, "hall light", "kitchen light"]);
         assert_eq!(
             lit.grants,
-            ["terminal_list", "terminal_connect", "terminal_disconnect"]
+            [
+                "terminal_list",
+                "terminal_connect",
+                "rest",
+                "terminal_disconnect"
+            ]
         );
         assert!(!lit.terminals.iter().any(|t| t == LIGHTS));
         assert!(lit.sonos.is_empty(), "another terminal's device");
@@ -843,7 +848,7 @@ mod tests {
 
         // A terminal that is gone is no connection: its verbs go with it.
         s.terminals.connect("zen", "the toaster");
-        assert_eq!(at(&s).grants, ["terminal_list", "terminal_connect"]);
+        assert_eq!(at(&s).grants, ["terminal_list", "terminal_connect", "rest"]);
     }
 
     /// **A television is paired before it is worked**: unpaired it offers the

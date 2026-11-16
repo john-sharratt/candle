@@ -86,6 +86,21 @@ pub const ASKED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "rest",
+        &[
+            "you have told John what the cluster said and nothing else has reached you",
+            "the reading came back the same as the last one",
+            "there is nothing left to do until something changes",
+            "you answered the message and nobody is waiting on you",
+            "the Drones are at rest and no terminal has told you of a change",
+            "you have done what was asked and said so",
+            "nothing calls for you this moment",
+            "you have just reported and have nothing new to act on",
+            "stand down until something happens",
+            "that is all for now, thank you",
+        ],
+    ),
+    (
         "cluster_status",
         &[
             "are all the machines up and serving right now",

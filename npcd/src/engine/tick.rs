@@ -396,6 +396,14 @@ impl Inbox {
         world_ms.saturating_sub(self.last_news_ms.max(self.last_act_ms))
     }
 
+    /// Whether this character has acted since news last reached it — what a
+    /// mind with no body is asked before it may `rest`. An act of any kind
+    /// counts, a refused one too: the question is whether it turned to what
+    /// arrived, not whether it did it well.
+    pub fn acted_since_news(&self) -> bool {
+        self.last_act_ms >= self.last_news_ms
+    }
+
     /// Whether the standing task is due: `after_ms` without news, **and**
     /// `after_ms` since it was last restated.
     ///
@@ -979,6 +987,17 @@ impl Scheduler {
             *act = to;
         }
         found
+    }
+
+    /// Whether this character has acted since news last reached it; true of
+    /// one with no inbox, which nothing has reached. See
+    /// [`Inbox::acted_since_news`].
+    pub fn acted_since_news(&self, npc_id: u64) -> bool {
+        self.inboxes
+            .lock()
+            .unwrap()
+            .get(&npc_id)
+            .is_none_or(Inbox::acted_since_news)
     }
 
     /// Whether this character is due the standing task. See [`Inbox::nudge_due`].
@@ -2627,6 +2646,41 @@ mod tests {
 
         // Done and gone quiet: the standing task comes round again.
         assert!(s.nudge_due(1, surveyed + AFTER, AFTER));
+    }
+
+    /// **A mind may rest once it has turned to what last reached it.** With
+    /// nothing arrived it has; a request arriving makes it not so until a turn
+    /// of its own has acted; and news landing after that act is unanswered
+    /// again.
+    #[test]
+    fn a_character_has_acted_since_news_only_after_a_turn_that_acted() {
+        const T0: u64 = 1_000_000;
+        let s = sched();
+        assert!(s.acted_since_news(9), "nothing has reached a stranger");
+        s.wake(1, 0, T0);
+        assert!(s.acted_since_news(1), "nothing has reached it yet");
+
+        s.deliver(
+            1,
+            T0 + 1_000,
+            Salience::NORMAL,
+            EventKind::Concluded {
+                party: "John".into(),
+                applied: "Asked how the cluster is.".into(),
+            },
+        );
+        assert!(!s.acted_since_news(1), "asked, and nothing done about it");
+        s.tick(1, 0, T0 + 2_000, |_, _| Vec::new());
+        assert!(
+            !s.acted_since_news(1),
+            "a turn that did nothing answers nothing"
+        );
+        s.think_again(1);
+        s.tick(1, 0, T0 + 3_000, |_, _| vec!["cluster_status".into()]);
+        assert!(s.acted_since_news(1));
+
+        s.deliver(1, T0 + 4_000, Salience::NORMAL, say("is it up?"));
+        assert!(!s.acted_since_news(1), "asked again");
     }
 
     /// **The active summons reaches a character deep in conversation, where the

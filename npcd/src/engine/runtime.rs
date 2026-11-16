@@ -75,6 +75,7 @@ use tower::ServiceExt;
 use crate::authority::ops::{ActSource, Voiced, WorldOp};
 use crate::authority::told::Told;
 use crate::authority::{Role, Standing};
+use crate::bridge::is_mine as is_of_the_bridge;
 use crate::effector::auth::PinnedStandpoint;
 use crate::effector::router::address_of;
 use crate::effector::station;
@@ -128,6 +129,7 @@ use crate::engine::talk::key::VISITOR;
 use crate::engine::talk::runner::Talks;
 use crate::engine::talk::templates;
 use crate::engine::talk::voice::Post;
+use crate::engine::terminal::acts::answers as answers_through_a_terminal;
 use crate::engine::terminal::Machine;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
@@ -3194,8 +3196,17 @@ impl Runtime {
     /// A word that signed a step off, a time machine set, a mission taken up
     /// or handed in: each is answered with what comes next, and that is the
     /// world answering, not the character talking.
+    ///
+    /// **So does what a mind with no body did through a terminal.** What the
+    /// cluster reads, what a television is doing, whether a light took the
+    /// call: each is in the act's answer and nowhere else, and whoever asked
+    /// is waiting to be told. Left to the next thing that happened to wake
+    /// it, Zen read the cluster and told John what it said minutes later,
+    /// when a Drone posted on the channel.
     fn arm_followup(&self, npc_id: u64, act: &Act, landed: bool, moved: bool) {
-        if moved || body::continues(act, landed) {
+        let through_a_terminal = answers_through_a_terminal(act.tool)
+            || (is_of_the_bridge(act.tool) && self.is_bodiless(npc_id));
+        if moved || through_a_terminal || body::continues(act, landed) {
             self.scheduler.think_again(npc_id);
         }
     }
@@ -6944,6 +6955,15 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                         if !t.perception.is_empty() {
                             narrated = Some(t.perception.clone());
                         }
+                        // What woke it, beside the acts it then makes: a turn
+                        // that reads nothing was brought back by its own last
+                        // act, and one that reads something by the world.
+                        tracing::info!(
+                            target: "npcd::engine::turn",
+                            npc = id,
+                            read = %t.perception,
+                            "a mind's turn began on this"
+                        );
                         // Reported, never swallowed: a character failing
                         // to act and one choosing not to look identical
                         // from outside and need completely different
@@ -6997,6 +7017,9 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                         // keeps `body::NO_REFLECTION` until the
                         // reflection answers.
                         let mut reflecting: Option<(Owed, [String; 3])> = None;
+                        // What each act came back with, in call order: what
+                        // the loop guard judges an act that names nothing by.
+                        let mut came_back: Vec<String> = Vec::new();
                         for a in &t.parsed.acts {
                             // Made in the world the character stands in,
                             // wherever that world runs — see
@@ -7084,6 +7107,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                                     [arg("situation"), arg("inner_thoughts"), arg("feeling")],
                                 ));
                             }
+                            came_back.push(answer.clone());
                             answers.push(answer);
                             // A pause that landed stops the character
                             // here. Armed after the act rather than
@@ -7109,12 +7133,16 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                         //
                         // A device call goes in under the verb at its
                         // address: under `invoke`, a loop at one device
-                        // struck every device in reach.
+                        // struck every device in reach. An act that names
+                        // nothing goes in as what it came back with: reading
+                        // the cluster's jobs twice is a loop only when the
+                        // second reading says what the first did.
                         let taken: Vec<Took> = t
                             .parsed
                             .acts
                             .iter()
-                            .map(|a| match body::is_device(a.tool) {
+                            .zip(&came_back)
+                            .map(|(a, back)| match body::is_device(a.tool) {
                                 true => {
                                     let path = device_path(
                                         a.args.get("url").and_then(|v| v.as_str()).unwrap_or(""),
@@ -7135,7 +7163,12 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                                         }
                                     }
                                 }
-                                false => Took::new(a.tool, salient(a)),
+                                false => match salient(a) {
+                                    meant if meant.trim().is_empty() => {
+                                        Took::call(a.tool, back.as_str())
+                                    }
+                                    meant => Took::new(a.tool, meant),
+                                },
                             })
                             .collect();
                         // A fight is the one place the guard lets `act`

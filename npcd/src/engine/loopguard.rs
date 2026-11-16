@@ -47,6 +47,13 @@
 //! ([`Took::call`]): a body names things, and two that name different ones are
 //! different calls however many words they share.
 //!
+//! An act that names nothing — `cluster_jobs`, `terminal_list` — has no words
+//! to compare, and is kept as what it came back with, judged as a call is: it
+//! is a repeat only when it comes back the same. Compared on its empty
+//! arguments it never repeated at all, and Zen read "No running jobs." from
+//! the cluster every forty seconds; struck for being taken twice, a reading
+//! that had changed would be lost.
+//!
 //! **What happens.** The looping act — for speech, every way of speaking — is
 //! struck from the grammar, and nothing else is: struck, not refused, because
 //! what a character cannot say it cannot get stuck saying (the same rule as
@@ -91,8 +98,10 @@ const GUARD_EXEMPT: &[&str] = &["act"];
 /// is going round on — and calling the car again, naming the same level, is
 /// waiting for it, not saying the same thing twice. `compose` carries no words
 /// to compare — every sitting writes the piece afresh — and the engine refuses
-/// a sitting over a piece already written itself (`Runtime::compose`).
-const NEVER_STRUCK: &[&str] = &["move_to", "lift_use", "lift_call", "compose"];
+/// a sitting over a piece already written itself (`Runtime::compose`). `rest`
+/// is how a mind with no body stops: taken again it comes back the same, and
+/// stopping twice is not a loop.
+const NEVER_STRUCK: &[&str] = &["move_to", "lift_use", "lift_call", "compose", "rest"];
 
 /// The acts that put words into a document. A repeat is the same text again —
 /// see [`same_text`].
@@ -473,6 +482,30 @@ mod tests {
 
     fn struck(g: &LoopGuards, npc: u64, tool: &str) -> bool {
         g.cooling(npc).contains(&tool.to_string())
+    }
+
+    /// **An act that names nothing loops when it comes back the same**, kept
+    /// as what it came back with: the same reading taken again is struck, a
+    /// reading that changed is not, and `rest` is never struck.
+    #[test]
+    fn an_act_that_names_nothing_repeats_when_it_comes_back_the_same() {
+        let g = LoopGuards::new();
+        let read = |back: &str| g.record(1, &[Took::call("cluster_jobs", back)], false);
+        assert!(!read("No running jobs."));
+        assert!(read("No running jobs."), "the same reading again");
+        assert!(struck(&g, 1, "cluster_jobs"));
+        assert!(!struck(&g, 1, "cluster_status"), "only the act that looped");
+
+        let g = LoopGuards::new();
+        let read = |back: &str| g.record(1, &[Took::call("cluster_jobs", back)], false);
+        assert!(!read("No running jobs."));
+        assert!(!read("1 job: build on BlackWorld, 40 s."), "it changed");
+        assert!(!struck(&g, 1, "cluster_jobs"));
+
+        let g = LoopGuards::new();
+        let rest = || g.record(1, &[Took::call("rest", "You rested.")], false);
+        assert!(!rest() && !rest() && !rest());
+        assert!(!struck(&g, 1, "rest"));
     }
 
     /// The salient text is the content argument, whichever one carries it.

@@ -54,6 +54,16 @@ const WATCH_THREAD: &str = "zen-watch";
 /// The most of an answer from the cluster a mind is handed.
 const ANSWER_CHARS: usize = 6_000;
 
+/// What a mind reads, the next time something wakes it, of the `rest` it took.
+pub const RESTED: &str = "You rested until this reached you.";
+
+/// What a mind is told of a `rest` taken before it has done anything about
+/// what last reached it.
+pub const REST_REFUSED: &str = "Something has reached you since you last did anything: a \
+                                message, a request, a change a terminal told you of. Do what it \
+                                asks and tell whoever asked what came of it. If it asks nothing \
+                                of you, rest.";
+
 fn recorded(act: &Act, landed: bool, answer: String) -> Recorded {
     let first = answer.lines().next().unwrap_or_default().to_string();
     Recorded {
@@ -163,6 +173,8 @@ impl Runtime {
     }
 
     /// An act made through a terminal for `npc`: one of the terminal acts, or
+    /// `rest` — which lands as [`RESTED`] and, earning no turn to read an
+    /// answer in, leaves the mind unscheduled until something reaches it — or
     /// one of the house's device acts on what it is connected to.
     pub(crate) async fn terminal_act(&self, npc: u64, act: &Act) -> Recorded {
         if self.scheduler.is_suspended(npc) {
@@ -197,6 +209,13 @@ impl Runtime {
             },
             // The house network is surveyed from wherever the mind is.
             "survey_network" => self.survey_house(&hosted).await,
+            // Stopping is refused once, while what last reached the mind is
+            // still unanswered by any act of its own: taken in the turn a
+            // request arrives, it would put the request down unread.
+            "rest" => match self.scheduler.acted_since_news(npc) {
+                true => (true, RESTED.into()),
+                false => (false, REST_REFUSED.into()),
+            },
             _ => match self.connection(&hosted, &body) {
                 None => (
                     false,

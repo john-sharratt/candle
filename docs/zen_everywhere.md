@@ -145,16 +145,31 @@ reasoning or many turns overseen. Those missions grant the task acts.
 **A terminal is a real thing with an adapter behind it.** It is not a part of
 the moon's map; the stations drones work at are those, and stay.
 
-Three acts, offered to an unordered mind alone:
+Four acts, offered to an unordered mind alone:
 
 | Act | Does |
 |---|---|
 | `terminal_list` | Every terminal Zen can reach now: its name, what it is, whether it answers. |
 | `terminal_connect {terminal}` | Connects. Zen holds **one** connection; connecting elsewhere replaces it. |
 | `terminal_disconnect` | Lets it go. |
+| `rest` | Stops, until whatever reaches Zen next wakes it. |
 
-Disconnected, Zen's acts are these three, its table and agenda acts, and its
-messaging. Connected, it also has **that terminal's verbs**: every terminal
+**What a terminal answers is read at once, and `rest` is how Zen stops.**
+Every terminal act but `terminal_disconnect` and `rest` earns the turn after
+it (`engine::terminal::acts::answers`, `Runtime::arm_followup`): a reading is
+in the act's answer and nowhere else, and whoever asked is waiting to be
+told. So a mind that has nothing to do with an answer needs an act that ends
+the run, and `rest` is it: it names no condition and no time, earns no turn,
+and leaves Zen unscheduled exactly as a message sent does — a message, a
+terminal raising a change or a Drone's report wakes it. It is refused once
+while what last reached Zen has had no act of Zen's since
+(`Scheduler::acted_since_news`), so it cannot be taken in the turn a request
+arrives. A reading taken again that comes back the same is a loop, and the
+loop guard strikes it (`engine::loopguard`, an act that names nothing is kept
+as what it came back with); `rest` is never struck.
+
+Disconnected, Zen's acts are the first two and `rest`, its table and agenda
+acts, and its messaging. Connected, it also has **that terminal's verbs**: every terminal
 act is `Availability::Granted`, and a mind's grants are the three above plus
 what the terminal it is connected to offers (`engine::terminal::grants_of`),
 so an unconnected terminal's verbs are not in the grammar at all. The
