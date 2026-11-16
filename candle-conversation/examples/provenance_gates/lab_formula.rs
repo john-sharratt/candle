@@ -40,6 +40,13 @@ pub struct FormulaSpec {
     /// — 1 is production's single `z × margin` vote. Above 1 the content is
     /// scored from the lab's CPU ranking ([`Votes::ranked`]), additively.
     pub topk: usize,
+    /// Under `topk` above 1: how a token's vote is split among its best
+    /// files.
+    pub vote_law: VoteLaw,
+    /// Under `topk` above 1: how much each probe token counts.
+    pub token_weight: TokenWeight,
+    /// Under `topk` above 1: how a file's kept votes combine.
+    pub aggregate: Aggregate,
     /// The content competition's fold-group weights.
     pub groups: [f32; 3],
     /// The needle gate: the top fraction of probe tokens by summed vote kept.
@@ -73,6 +80,53 @@ pub struct FormulaSpec {
     pub type_norm: TypeNorm,
 }
 
+/// How a token's vote is split among its best files, `a_r` the agreement of
+/// the file at rank `r`, over the token's distribution of mean `μ` and
+/// spread `σ`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoteLaw {
+    /// `z_r × (a_r − a_{k+1})` — production's `z × margin` at k = 1.
+    ZMargin,
+    /// `z_r` alone.
+    ZOnly,
+    /// `1 / (r + 1)`: by rank, whatever the agreements.
+    ReciprocalRank,
+    /// `exp((a_r − a_0) / σ)`: a near-tie shares the vote, a clear winner
+    /// keeps it.
+    Softmax,
+    /// One a file.
+    Count,
+}
+
+/// How much a probe token counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenWeight {
+    /// Every token alike.
+    None,
+    /// By how far its best match stands above its distribution,
+    /// `(a_0 − μ) / σ` — a token every file matches alike counts little.
+    TopZ,
+    /// By how far its best match stands above its k-th, `(a_0 − a_k) / σ`
+    /// — a token that cannot tell its best files apart counts little.
+    Spread,
+}
+
+/// How a file's kept votes combine into its score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Aggregate {
+    /// The sum of its votes, each raised to `vote_power`.
+    Sum,
+    /// The sum of `ln(1 + v)`: concave, so many votes outweigh one loud one.
+    LogSum,
+    /// How many distinct probe tokens voted for it.
+    Tokens,
+    /// That count times its largest vote.
+    TokensTimesBest,
+}
+
 /// How a file is read against files of its own kind (its extension).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +148,9 @@ impl Default for FormulaSpec {
             budget_files: 10,
             fusion: Fusion::Additive,
             topk: 1,
+            vote_law: VoteLaw::ZMargin,
+            token_weight: TokenWeight::None,
+            aggregate: Aggregate::Sum,
             groups: [1.0, 1.0, 1.0],
             keep: 0.25,
             vote_power: 1.0,
@@ -239,6 +296,9 @@ impl Formula {
             _ => self.fused(votes.content, &s.groups, n),
         };
         if s.calibration != 0.0 {
+            // The calibration keeps its single vote: its token matches one
+            // file's question cleanly, and spreading that vote over the next
+            // files dilutes it (MRR 0.53 → 0.40 on the battery).
             let cal = self.fused(votes.calibration, &s.calibration_groups, n);
             for (o, c) in out.iter_mut().zip(cal) {
                 *o += s.calibration * c;
@@ -432,10 +492,10 @@ impl Formula {
     }
 
     /// Each probe token's votes for its best `k` files per group, weighed by
-    /// `groups`: file `r` by `z_r × (a_r − a_{k+1})`, `z_r` its agreement's
-    /// standing over the token's distribution. The tokens whose summed votes
-    /// are in the top `keep` fraction keep them, each raised to its power and
-    /// summed per file — production's gate over a token's every vote.
+    /// `groups`, under the formula's [`VoteLaw`] and [`TokenWeight`]. The
+    /// tokens whose summed votes are in the top `keep` fraction keep them —
+    /// production's gate over a token's every vote — and each file's kept
+    /// votes are combined by the formula's [`Aggregate`].
     fn top_k_summed(
         &self,
         ranked: &[[Ranked; FOLD_GROUPS]],
@@ -452,12 +512,11 @@ impl Formula {
                     if w == 0.0 || r.top.is_empty() {
                         continue;
                     }
-                    let floor = r.top.get(k).map_or(0, |t| t.1);
-                    for &(file, a) in r.top.iter().take(k) {
-                        let z = ((a as f32 - r.mean) / r.std.max(1e-3)).max(0.0);
-                        let v = w * z * a.saturating_sub(floor) as f32;
+                    let token = self.token_weight(r, k);
+                    for (rank, v) in self.law_votes(r, k) {
+                        let v = w * token * v;
                         if v > 0.0 {
-                            out.push((file, v));
+                            out.push((r.top[rank].0, v));
                         }
                     }
                 }
@@ -476,17 +535,82 @@ impl Formula {
         let mut sorted = mags.clone();
         sorted.sort_unstable_by(|a, b| b.total_cmp(a));
         let thresh = sorted[n_keep - 1];
+        // Per file: the sum of its raised votes, the sum of `ln(1 + v)`, its
+        // largest vote, and how many distinct kept tokens voted for it.
+        let mut sum = vec![0.0f32; n];
+        let mut logs = vec![0.0f32; n];
+        let mut best = vec![0.0f32; n];
+        let mut tokens = vec![0u32; n];
         for (votes, m) in per_token.iter().zip(&mags) {
             if *m < thresh {
                 continue;
             }
+            let mut seen: Vec<usize> = Vec::new();
             for &(file, v) in votes {
-                if file < n {
-                    out[file] += v.powf(self.spec.vote_power);
+                if file >= n {
+                    continue;
+                }
+                sum[file] += v.powf(self.spec.vote_power);
+                logs[file] += v.ln_1p();
+                best[file] = best[file].max(v);
+                if !seen.contains(&file) {
+                    seen.push(file);
+                    tokens[file] += 1;
                 }
             }
         }
+        for f in 0..n {
+            out[f] = match self.spec.aggregate {
+                Aggregate::Sum => sum[f],
+                Aggregate::LogSum => logs[f],
+                // Ties between equal counts broken by the votes' sum, which
+                // no count can reach: it is below one.
+                Aggregate::Tokens => {
+                    tokens[f] as f32 + sum[f] / (1.0 + sum.iter().copied().fold(0.0, f32::max))
+                }
+                Aggregate::TokensTimesBest => tokens[f] as f32 * best[f],
+            };
+        }
         out
+    }
+
+    /// Each of `r`'s best `k` files' vote under the formula's [`VoteLaw`], by
+    /// its rank in `r.top`.
+    fn law_votes(&self, r: &Ranked, k: usize) -> Vec<(usize, f32)> {
+        let floor = r.top.get(k).map_or(0, |t| t.1);
+        let std = r.std.max(1e-3);
+        let top = r.top[0].1 as f32;
+        r.top
+            .iter()
+            .take(k)
+            .enumerate()
+            .map(|(rank, &(_, a))| {
+                let z = ((a as f32 - r.mean) / std).max(0.0);
+                let v = match self.spec.vote_law {
+                    VoteLaw::ZMargin => z * a.saturating_sub(floor) as f32,
+                    VoteLaw::ZOnly => z,
+                    VoteLaw::ReciprocalRank => 1.0 / (rank + 1) as f32,
+                    VoteLaw::Softmax => ((a as f32 - top) / std).exp(),
+                    VoteLaw::Count => 1.0,
+                };
+                (rank, v)
+            })
+            .collect()
+    }
+
+    /// How much a token's ranking `r` counts, under the formula's
+    /// [`TokenWeight`].
+    fn token_weight(&self, r: &Ranked, k: usize) -> f32 {
+        let std = r.std.max(1e-3);
+        let top = r.top[0].1 as f32;
+        match self.spec.token_weight {
+            TokenWeight::None => 1.0,
+            TokenWeight::TopZ => ((top - r.mean) / std).max(0.0),
+            TokenWeight::Spread => {
+                let floor = r.top.get(k).map_or(0, |t| t.1) as f32;
+                ((top - floor) / std).max(0.0)
+            }
+        }
     }
 
     /// Votes weighed by `groups`, gated at the formula's keep, each raised to
@@ -719,6 +843,48 @@ mod tests {
         // Inside the background: the tail alone. 9 samples ≥ 20 of 9 reads
         // −ln(10/10) = 0.
         assert_eq!(surprise(20.0, &loud), 0.0);
+    }
+
+    /// **Each vote law, token weight and aggregate does what it says**, on
+    /// one token ranking files 1, 0, 2 at 90, 80, 70 over mean 50, spread 10.
+    #[test]
+    fn each_vote_law_token_weight_and_aggregate_does_what_it_says() {
+        let ranked = ranked_one();
+        let score = |yaml: &str| {
+            Formula::parse(&format!("topk: 2\ncalibration: 0\n{yaml}"))
+                .unwrap()
+                .raw(
+                    &Votes {
+                        content: &[],
+                        calibration: &[],
+                        ranked: Some(&ranked),
+                    },
+                    &PATHS,
+                    &[1, 1, 1],
+                )
+        };
+        assert_eq!(score("vote_law: reciprocal_rank"), vec![0.5, 1.0, 0.0]);
+        assert_eq!(score("vote_law: count"), vec![1.0, 1.0, 0.0]);
+        assert_eq!(score("vote_law: z_only"), vec![3.0, 4.0, 0.0]);
+        let soft = score("vote_law: softmax");
+        assert!((soft[0] - (-1.0f32).exp()).abs() < 1e-6 && soft[1] == 1.0);
+        // A token standing 4 spreads above its mean counts 4; its best two
+        // files are 2 spreads apart from the third.
+        assert_eq!(
+            score("vote_law: count\ntoken_weight: top_z"),
+            vec![4.0, 4.0, 0.0]
+        );
+        assert_eq!(
+            score("vote_law: count\ntoken_weight: spread"),
+            vec![2.0, 2.0, 0.0]
+        );
+        // One token: each file it voted for counts one token, ties broken by
+        // the votes' sum below one.
+        let tokens = score("aggregate: tokens");
+        assert!(tokens[1] > tokens[0] && tokens[0] > 1.0 && tokens[1] < 2.0);
+        assert_eq!(score("aggregate: tokens_times_best"), vec![30.0, 80.0, 0.0]);
+        let logs = score("aggregate: log_sum");
+        assert!((logs[1] - 81f32.ln()).abs() < 1e-5);
     }
 
     /// **A kind is a path's extension**; a path with none is the empty kind.

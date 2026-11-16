@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Context;
 use candle_conversation::persistence::content_hash::ContentHasher;
 use candle_conversation::projection::TimelineId;
-use candle_conversation::provenance::window_score::{group_ranked, Ranked};
+use candle_conversation::provenance::window_score::{group_ranked, FlatSigs, Ranked};
 use candle_conversation::provenance::{encode_wide_sigs, WideQSig, FOLD_GROUPS};
 use candle_conversation::substrate::Substrate;
 use serde::Deserialize;
@@ -190,17 +190,18 @@ fn scan(
 /// A ranked token as the cache keeps it: per group, `(mean, std, top)`.
 type KeptRanking = Vec<Vec<(f32, f32, Vec<(usize, u32)>)>>;
 
-/// `probe`'s content competition ranked on the CPU — each token's best
-/// [`RANK_KEPT`] files per group — from the cache when it holds it.
+/// `probe` ranked on the CPU against the content gallery `flat` — each
+/// token's best [`RANK_KEPT`] files per group — from the cache when it holds
+/// it.
 fn ranked(
     probe: &[WideQSig],
-    gallery: &Gallery,
+    flat: &FlatSigs,
     token_file: &[usize],
     n_files: usize,
 ) -> anyhow::Result<Vec<[Ranked; FOLD_GROUPS]>> {
     let mut h = ContentHasher::new();
     h.update(&encode_wide_sigs(probe));
-    h.update(&(gallery.flat.len() as u64).to_le_bytes());
+    h.update(&(flat.len() as u64).to_le_bytes());
     let key = h.finish();
     let kept = PathBuf::from(RANK_CACHE_DIR).join(format!("{:016x}{:016x}.json", key.hi, key.lo));
     if let Ok(text) = fs::read_to_string(&kept) {
@@ -221,7 +222,7 @@ fn ranked(
             })
             .collect());
     }
-    let out = group_ranked(probe, &gallery.flat, token_file, n_files, RANK_KEPT);
+    let out = group_ranked(probe, flat, token_file, n_files, RANK_KEPT);
     let rows: KeptRanking = out
         .iter()
         .map(|groups| {
@@ -281,7 +282,7 @@ pub fn run(run: LabRun) -> anyhow::Result<()> {
         let mut scanned = scan(&gpu, &probe, None)?;
         if topk && !rank_budget_spent {
             let t_rank = Instant::now();
-            scanned.ranked = Some(ranked(&probe, gallery, &token_file, files.len())?);
+            scanned.ranked = Some(ranked(&probe, &gallery.flat, &token_file, files.len())?);
             let took = t_rank.elapsed();
             if took > RANK_BUDGET {
                 rank_budget_spent = true;
