@@ -62,6 +62,8 @@ pub struct FormulaSpec {
     pub calibration: f32,
     /// The calibration competition's fold-group weights.
     pub calibration_groups: [f32; 3],
+    /// How the content and calibration scores combine.
+    pub blend: Blend,
     /// Correct each file by what it scores on questions that are not about
     /// it.
     pub hub: Hub,
@@ -157,6 +159,7 @@ impl Default for FormulaSpec {
             length_power: 0.0,
             calibration: 0.5,
             calibration_groups: [1.0, 1.0, 1.0],
+            blend: Blend::Sum,
             hub: Hub::None,
             hub_from: HubFrom::Background,
             exclude_chain: false,
@@ -165,6 +168,97 @@ impl Default for FormulaSpec {
             type_norm: TypeNorm::None,
         }
     }
+}
+
+/// How the content and calibration competitions' scores combine, the
+/// calibration weighed by [`FormulaSpec::calibration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Blend {
+    /// Raw scores summed.
+    Sum,
+    /// Each competition as a z-score among the files it scores, then summed:
+    /// neither wins by being on a louder scale.
+    ZSum,
+    /// Reciprocal-rank fusion, `1 / (60 + rank)` in each competition that
+    /// scores the file: only order counts.
+    Rrf,
+    /// The larger of the two z-scores: a file either competition is sure of
+    /// ranks high.
+    ZMax,
+}
+
+/// `content` and `calibration` scores combined as `blend` says, the
+/// calibration weighed by `weight`. A file neither competition scores stays
+/// at 0.
+fn blended(content: &[f32], calibration: &[f32], weight: f32, blend: Blend) -> Vec<f32> {
+    match blend {
+        Blend::Sum => content
+            .iter()
+            .zip(calibration)
+            .map(|(c, k)| c + weight * k)
+            .collect(),
+        Blend::ZSum | Blend::ZMax => {
+            let (zc, zk) = (scoring_z(content), scoring_z(calibration));
+            zc.iter()
+                .zip(&zk)
+                .map(|(&c, &k)| {
+                    let k = k.map(|k| weight * k);
+                    let v = match (c, k, blend) {
+                        (None, None, _) => return 0.0,
+                        (Some(c), Some(k), Blend::ZMax) => c.max(k),
+                        (c, k, _) => c.unwrap_or(0.0) + k.unwrap_or(0.0),
+                    };
+                    (v + Z_FLOOR).max(f32::MIN_POSITIVE)
+                })
+                .collect()
+        }
+        Blend::Rrf => {
+            let (rc, rk) = (ranks(content), ranks(calibration));
+            rc.iter()
+                .zip(&rk)
+                .map(|(c, k)| {
+                    c.map_or(0.0, |r| 1.0 / (RRF_K + r as f32))
+                        + weight * k.map_or(0.0, |r| 1.0 / (RRF_K + r as f32))
+                })
+                .collect()
+        }
+    }
+}
+
+/// Reciprocal-rank fusion's damping: the conventional 60.
+const RRF_K: f32 = 60.0;
+
+/// Added to a blended z-score so a scored file stays above the unscored
+/// files' 0: a z-score below the mean is still a vote.
+const Z_FLOOR: f32 = 10.0;
+
+/// Each positive score's z-score among the positive scores; `None` for a
+/// file the competition gave nothing.
+fn scoring_z(scores: &[f32]) -> Vec<Option<f32>> {
+    let pos: Vec<f32> = scores.iter().copied().filter(|&v| v > 0.0).collect();
+    if pos.is_empty() {
+        return vec![None; scores.len()];
+    }
+    let mean = pos.iter().sum::<f32>() / pos.len() as f32;
+    let var = pos.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / pos.len() as f32;
+    let std = var.sqrt().max(f32::EPSILON);
+    scores
+        .iter()
+        .map(|&v| (v > 0.0).then(|| (v - mean) / std))
+        .collect()
+}
+
+/// Each positive score's rank among the positive scores, best 0, ties by
+/// file; `None` for a file the competition gave nothing.
+fn ranks(scores: &[f32]) -> Vec<Option<usize>> {
+    let mut order: Vec<usize> = (0..scores.len()).filter(|&f| scores[f] > 0.0).collect();
+    order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+    let mut out = vec![None; scores.len()];
+    for (r, f) in order.into_iter().enumerate() {
+        out[f] = Some(r);
+    }
+    out
 }
 
 /// A path's kind: its extension, or the empty kind for a path with none.
@@ -300,9 +394,7 @@ impl Formula {
             // file's question cleanly, and spreading that vote over the next
             // files dilutes it (MRR 0.53 → 0.40 on the battery).
             let cal = self.fused(votes.calibration, &s.calibration_groups, n);
-            for (o, c) in out.iter_mut().zip(cal) {
-                *o += s.calibration * c;
-            }
+            out = blended(&out, &cal, s.calibration, s.blend);
         }
         for (f, o) in out.iter_mut().enumerate() {
             if s.length_power != 0.0 {
@@ -682,6 +774,32 @@ mod tests {
     }
 
     const PATHS: [&str; 3] = ["candle/README.md", "candle/a.rs", "candle/b.rs"];
+
+    /// **The two competitions blend by sum, by z-score, by rank or by the
+    /// surer of the two**, and a file neither scores stays at 0.
+    #[test]
+    fn content_and_calibration_blend_by_scale_free_laws() {
+        let content = [4.0, 2.0, 0.0, 0.0];
+        let calibration = [0.0, 1.0, 3.0, 0.0];
+        assert_eq!(
+            blended(&content, &calibration, 0.5, Blend::Sum),
+            vec![4.0, 2.5, 1.5, 0.0]
+        );
+        // Content z: ±1 over {4, 2}; calibration z: ∓1 over {1, 3}.
+        assert_eq!(
+            blended(&content, &calibration, 1.0, Blend::ZSum),
+            vec![11.0, 8.0, 11.0, 0.0]
+        );
+        assert_eq!(
+            blended(&content, &calibration, 1.0, Blend::ZMax),
+            vec![11.0, 9.0, 11.0, 0.0]
+        );
+        let rrf = blended(&content, &calibration, 1.0, Blend::Rrf);
+        assert_eq!(
+            rrf,
+            vec![1.0 / 60.0, 1.0 / 61.0 + 1.0 / 61.0, 1.0 / 60.0, 0.0]
+        );
+    }
 
     fn raw(f: &Formula, content: &[TokenVote], tokens: &[usize]) -> Vec<f32> {
         f.raw(
