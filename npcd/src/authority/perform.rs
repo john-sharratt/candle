@@ -323,6 +323,11 @@ impl Runtime {
     /// **A refused act is logged with the world's reason.** The character
     /// reads the refusal; nothing else did, so a Maker that composed its piece
     /// three times and never got it committed left no trace of why.
+    ///
+    /// **An act the world took is logged too**, with the feed's line for it
+    /// and what the character was told came of it. A mind that takes a turn
+    /// every half minute and says nothing to anybody is otherwise a mind
+    /// whose turns cannot be told apart from no turns at all.
     pub async fn perform_said(
         &self,
         npc: u64,
@@ -332,15 +337,24 @@ impl Runtime {
         source: &ActSource,
     ) -> Performed {
         let performed = self.perform_routed(npc, act, pinned, said, source).await;
-        if !performed.recorded.landed {
-            tracing::info!(
+        match performed.recorded.landed {
+            true => tracing::info!(
+                target: "npcd::engine::acted",
+                npc,
+                act = act.tool,
+                source = ?source,
+                feed = %performed.recorded.feed,
+                answer = %performed.recorded.answer,
+                "an act was made"
+            ),
+            false => tracing::info!(
                 target: "npcd::engine::refused",
                 npc,
                 act = act.tool,
                 source = ?source,
                 answer = %performed.recorded.answer,
                 "an act was refused"
-            );
+            ),
         }
         performed
     }
