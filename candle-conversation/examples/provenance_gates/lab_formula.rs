@@ -35,6 +35,9 @@ pub struct FormulaSpec {
     /// How many files the lab treats as placed — recall is "an answer file in
     /// the top this many".
     pub budget_files: usize,
+    /// Which of the probe's tokens are scored: the question, the decoded
+    /// answer, or both.
+    pub part: Part,
     /// How the fold groups' votes combine.
     pub fusion: Fusion,
     /// Files each probe token votes for in each group of the content
@@ -161,6 +164,7 @@ impl Default for FormulaSpec {
     fn default() -> Self {
         Self {
             budget_files: 10,
+            part: Part::Whole,
             fusion: Fusion::Additive,
             topk: 1,
             vote_law: VoteLaw::ZMargin,
@@ -353,6 +357,34 @@ pub struct Votes<'a> {
     /// The content competition ranked on the CPU — each probe token's best
     /// files per group — when the lab computed it; what `topk` above 1 reads.
     pub ranked: Option<&'a [[Ranked; FOLD_GROUPS]]>,
+    /// Probe tokens that are the prefilled question, the rest being the
+    /// decoded answer; `None` for a probe with no answer (a background
+    /// probe), which every [`Part`] reads whole.
+    pub question: Option<usize>,
+}
+
+/// Which of a probe's tokens a formula scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Part {
+    /// The prefilled question: what a turn's opening projection reads.
+    Question,
+    /// The decoded answer alone.
+    Thinking,
+    /// Both: what a turn reprojects on once it has thought.
+    Whole,
+}
+
+impl Part {
+    /// The token range of a probe of `len` tokens, `question` of them the
+    /// question's, this part covers.
+    fn range(self, question: Option<usize>, len: usize) -> std::ops::Range<usize> {
+        match (self, question) {
+            (_, None) | (Part::Whole, _) => 0..len,
+            (Part::Question, Some(q)) => 0..q.min(len),
+            (Part::Thinking, Some(q)) => q.min(len)..len,
+        }
+    }
 }
 
 impl Formula {
@@ -402,15 +434,19 @@ impl Formula {
     pub fn raw(&self, votes: &Votes, paths: &[&str], tokens: &[usize]) -> Vec<f32> {
         let s = &self.spec;
         let n = paths.len();
-        let mut out = match (s.topk, votes.ranked) {
+        let part = |len: usize| s.part.range(votes.question, len);
+        let content = &votes.content[part(votes.content.len())];
+        let calibration = &votes.calibration[part(votes.calibration.len())];
+        let ranked = votes.ranked.map(|r| &r[part(r.len())]);
+        let mut out = match (s.topk, ranked) {
             (k, Some(ranked)) if k > 1 => self.top_k_summed(ranked, &s.groups, k, n),
-            _ => self.fused(votes.content, &s.groups, n),
+            _ => self.fused(content, &s.groups, n),
         };
         if s.calibration != 0.0 {
             // The calibration keeps its single vote: its token matches one
             // file's question cleanly, and spreading that vote over the next
             // files dilutes it (MRR 0.53 → 0.40 on the battery).
-            let cal = self.fused(votes.calibration, &s.calibration_groups, n);
+            let cal = self.fused(calibration, &s.calibration_groups, n);
             out = blended(&out, &cal, s.calibration, s.blend);
         }
         for (f, o) in out.iter_mut().enumerate() {
@@ -838,6 +874,7 @@ mod tests {
                 content,
                 calibration: &[],
                 ranked: None,
+                question: None,
             },
             &PATHS,
             tokens,
@@ -861,6 +898,17 @@ mod tests {
             empty.clone(),
             empty,
         ]]
+    }
+
+    /// **A part is the question's tokens, the answer's, or both**, and a
+    /// probe with no answer is read whole by every part.
+    #[test]
+    fn a_part_cuts_the_probe_at_its_question() {
+        assert_eq!(Part::Question.range(Some(3), 10), 0..3);
+        assert_eq!(Part::Thinking.range(Some(3), 10), 3..10);
+        assert_eq!(Part::Whole.range(Some(3), 10), 0..10);
+        assert_eq!(Part::Thinking.range(None, 10), 0..10);
+        assert_eq!(Part::Thinking.range(Some(12), 10), 10..10);
     }
 
     /// **A vote in a token run is multiplied by its bonus, and a run too
@@ -889,6 +937,7 @@ mod tests {
                     content: &[],
                     calibration: &[],
                     ranked: Some(&ranked),
+                    question: None,
                 },
                 &PATHS,
                 &[1, 1, 1],
@@ -919,6 +968,7 @@ mod tests {
                 content: &[],
                 calibration: &[],
                 ranked: Some(&ranked),
+                question: None,
             },
             &PATHS,
             &[1, 1, 1],
@@ -930,6 +980,7 @@ mod tests {
                 content: &votes(),
                 calibration: &[],
                 ranked: Some(&ranked),
+                question: None,
             },
             &PATHS,
             &[1, 1, 1],
@@ -951,6 +1002,7 @@ mod tests {
                 content: &votes(),
                 calibration: &calibration,
                 ranked: None,
+                question: None,
             },
             &PATHS,
             &[10, 10, 10],
@@ -1050,6 +1102,7 @@ mod tests {
                         content: &[],
                         calibration: &[],
                         ranked: Some(&ranked),
+                        question: None,
                     },
                     &PATHS,
                     &[1, 1, 1],

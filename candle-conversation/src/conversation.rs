@@ -4159,6 +4159,7 @@ impl Sequence {
             target: self.target,
             tokenizer: Arc::clone(&self.tokenizer),
             selection: self.selection.clone(),
+            dialect: self.config.dialect.clone(),
         }
     }
 
@@ -5410,19 +5411,33 @@ pub struct ProbeCtx {
     target: ProjectionTarget,
     tokenizer: Arc<tokenizers::Tokenizer>,
     selection: SelectionState,
+    dialect: Dialect,
+}
+
+/// What [`ProbeCtx::probe`] scored: the projection it selects, and the turn's
+/// wide-Q — the prefilled turn's `question` signatures first, then one for
+/// each token the model decoded after it.
+pub struct Probed {
+    pub event: ProjectionEvent,
+    pub sigs: Vec<WideQSig>,
+    /// Signatures of the prefilled turn — its opener, the question and the
+    /// assistant header — ahead of the decoded ones.
+    pub question: usize,
 }
 
 impl ProbeCtx {
     /// Project a typed `text` against the current substrate as if it were a new
     /// turn under this conversation's system prompt — the interactive
     /// "what would this query retrieve" probe. Warms the query under the full
-    /// system prompt, scores its wide-Q read-only (`observe = false`), and returns
-    /// the resulting [`ProjectionEvent`] (selected turns + sections with belief
-    /// scores) plus the probe it scored — the query's wide-Q, one signature a
-    /// token, which a harness scores again offline under formulas of its own.
-    /// Persists NOTHING to the substrate.
-    pub fn probe(&self, text: &str) -> crate::Result<(ProjectionEvent, Vec<WideQSig>)> {
-        let probe = self.probe_wide_q(text)?;
+    /// system prompt as a thinking turn, decodes `decode` tokens of the model's
+    /// answer (at least one, so the completion path gathers the wide-Q), scores
+    /// the whole turn's wide-Q read-only (`observe = false`), and returns the
+    /// resulting [`ProjectionEvent`] (selected turns + sections with belief
+    /// scores) plus the probe it scored, one signature a token, which a harness
+    /// scores again offline under formulas of its own. Persists NOTHING to the
+    /// substrate.
+    pub fn probe(&self, text: &str, decode: usize) -> crate::Result<Probed> {
+        let (probe, question) = self.probe_wide_q(text, decode.max(1))?;
         // The typed probe IS the question, so a separate Q-window would be
         // identical to the tail scan — `None` scans it once.
         let (scores, _) = self.substrate.score_beliefs(
@@ -5453,23 +5468,27 @@ impl ProbeCtx {
             0,
             0.0,
         );
-        Ok((ev, probe))
+        Ok(Probed {
+            event: ev,
+            sigs: probe,
+            question,
+        })
     }
 
     /// Capture the WARM folded wide-Q signature of `text` as if it were a new turn
     /// under the system prompt, WITHOUT writing anything to the substrate. An
     /// ephemeral projection slot materializes the full system prompt (warming the
-    /// query's Q exactly like a real turn) and decodes one throwaway token so the
-    /// completion path finalizes the KV and gathers the query wide-Q; the slot
-    /// resolves to `SealAction::None`, so no turn is sealed and no belief learned.
-    fn probe_wide_q(&self, text: &str) -> crate::Result<Vec<WideQSig>> {
-        let query_tokens = match self.tokenizer.encode(text, false) {
-            Ok(enc) => enc.get_ids().to_vec(),
-            Err(_) => return Ok(Vec::new()),
-        };
+    /// query's Q exactly like a real turn), prefills the turn ([`Self::turn_tokens`])
+    /// and decodes `decode` tokens of its answer, so the completion path finalizes
+    /// the KV and gathers the turn's wide-Q; the slot resolves to
+    /// `SealAction::None`, so no turn is sealed and no belief learned. Returns the
+    /// signatures and how many of them are the prefilled turn's.
+    fn probe_wide_q(&self, text: &str, decode: usize) -> crate::Result<(Vec<WideQSig>, usize)> {
+        let query_tokens = probe_turn_tokens(&self.tokenizer, &self.dialect, text)?;
         if query_tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
+        let question = query_tokens.len();
 
         // Ephemeral slot bound to this conversation's target: it projects (warm)
         // but never seals.
@@ -5516,13 +5535,13 @@ impl ProbeCtx {
                 projection_offsets: Vec::new(),
                 prefill_assistant_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),
-                max_decode_tokens: 1,
+                max_decode_tokens: decode,
                 sampling: SamplingConfig::argmax(),
                 event_tx,
                 reprojection: None,
                 disable_reprojection: false,
                 triggers: Arc::new(TriggerRegistry::new()),
-                // A one-token wide-Q probe constrains nothing.
+                // A probe's answer is free thinking: nothing constrains it.
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
@@ -5585,7 +5604,7 @@ impl ProbeCtx {
         // where the model commits to the call), not the query's prefill-Q, which
         // sits near the noise floor (the call↔definition domain gap). Dropping the
         // decoded tail collapsed scores ~10× (600 → 60).
-        Ok(sigs)
+        Ok((sigs, question))
     }
 }
 
@@ -6145,6 +6164,67 @@ mod window_sealed_tokens_tests {
 /// prose again, and the content span claims tokens the grid does not hold.
 fn assistant_lead(closed_think: &str, assistant_prefill: &str) -> String {
     format!("{closed_think}{assistant_prefill}")
+}
+
+/// The thinking turn `text` opens, as a dialogue turn prefills it:
+/// `user_start`, the question, `user_end`, `assistant_start` and the
+/// dialect's thinking-on lead — what [`ProbeCtx::probe`] prefills. Empty
+/// when `text` encodes to nothing.
+fn probe_turn_tokens(
+    tokenizer: &tokenizers::Tokenizer,
+    dialect: &Dialect,
+    text: &str,
+) -> crate::Result<Vec<u32>> {
+    let encode = |s: &str| {
+        tokenizer
+            .encode(s, false)
+            .map(|enc| enc.get_ids().to_vec())
+            .map_err(|e| ConversationError::Tokenizer(e.to_string()))
+    };
+    let body = encode(text)?;
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lead = assistant_lead(dialect.thinking_suppression(false).1, "");
+    let mut tokens = encode(dialect.user_start)?;
+    tokens.extend(body);
+    tokens.extend(encode(&format!(
+        "{}{}{lead}",
+        dialect.user_end, dialect.assistant_start
+    ))?);
+    Ok(tokens)
+}
+
+#[cfg(test)]
+mod probe_turn_tests {
+    use super::probe_turn_tokens;
+    use candle_transformers::models::dialect::Dialect;
+    use tokenizers::Tokenizer;
+
+    /// One id a character: `h i ␠ [ / I N S T ]` are 1–10.
+    const CHARS: &str = r#"{
+      "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+      "normalizer": null,
+      "pre_tokenizer": {"type": "Split", "pattern": {"Regex": "."}, "behavior": "Isolated", "invert": false},
+      "post_processor": null, "decoder": null,
+      "model": {"type": "WordLevel",
+        "vocab": {"[UNK]": 0, "h": 1, "i": 2, " ": 3, "[": 4, "/": 5, "I": 6, "N": 7, "S": 8, "T": 9, "]": 10},
+        "unk_token": "[UNK]"}
+    }"#;
+
+    /// **A probe prefills the question as a thinking turn**: the user
+    /// opener (empty on Llama 2), the question, `user_end` and the assistant
+    /// header — `hi [/INST] ` — and nothing for a question that is empty.
+    #[test]
+    fn a_probe_prefills_its_question_as_a_thinking_turn() {
+        let t: Tokenizer = CHARS.parse().unwrap();
+        let d = Dialect::llama2();
+        assert_eq!(
+            probe_turn_tokens(&t, &d, "hi").unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 3]
+        );
+        assert!(probe_turn_tokens(&t, &d, "").unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]

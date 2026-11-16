@@ -140,8 +140,8 @@ pub use config::{
     REPROJECT_TRIGGER_TEXTS,
 };
 pub use conversation::{
-    AskScope, Carried, ChainRound, GlueMarkers, Linking, PieceKind, PromptDump, PromptPiece,
-    SectionRef, SectionState, Sequence, UnsealedAsker, Want,
+    AskScope, Carried, ChainRound, GlueMarkers, Linking, PieceKind, Probed, PromptDump,
+    PromptPiece, SectionRef, SectionState, Sequence, UnsealedAsker, Want,
 };
 pub use engine::{
     ConversationEngine, EngineAttacher, SubstrateReloadStatus, SubstrateReloader, ThinkSteering,

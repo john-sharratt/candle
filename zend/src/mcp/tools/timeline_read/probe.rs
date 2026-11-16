@@ -80,7 +80,8 @@ pub fn render(text: &str, v: &Value) -> String {
 pub async fn read(call: &OpsCall, text: &str) -> Result<String, String> {
     let session = Arc::clone(&call.session);
     let query = text.to_string();
-    let view = tokio::task::spawn_blocking(move || session.substrate_project(&query))
+    // The opening probe: the question as a turn opens on it, one token decoded.
+    let view = tokio::task::spawn_blocking(move || session.substrate_project(&query, 1))
         .await
         .map_err(|e| format!("the probe did not finish: {e}"))?
         .ok_or("the model is still loading; try again shortly")?;

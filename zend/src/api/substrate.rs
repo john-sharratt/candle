@@ -94,7 +94,7 @@ pub async fn project(
     Json(req): Json<ProjectReq>,
 ) -> Result<Json<ProjectView>, StatusCode> {
     // The probe is a real GPU prefill + belief scan, as well as a substrate read.
-    off_runtime(move || session.substrate_project(&req.text))
+    off_runtime(move || session.substrate_project(&req.text, req.decode))
         .await?
         .map(Json)
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)
@@ -248,6 +248,15 @@ pub struct SelectedNodeView {
 #[derive(Deserialize)]
 pub struct ProjectReq {
     pub text: String,
+    /// Tokens of the model's answer to decode after the question, the probe
+    /// taking their wide-Q too — what a live turn reprojects on once it has
+    /// thought. One, the least the capture needs, when absent.
+    #[serde(default = "one")]
+    pub decode: usize,
+}
+
+fn one() -> usize {
+    1
 }
 
 /// `POST /v1/substrate/zend/project` body — what the query would retrieve, as tiles.
@@ -263,6 +272,9 @@ pub struct ProjectView {
     /// (`candle-conversation/examples/provenance_gates/lab`). Empty when nothing
     /// was probed.
     pub probe: String,
+    /// Signatures of `probe` that are the prefilled turn — its opener, the
+    /// question and the assistant header; the rest are the decoded answer's.
+    pub question: usize,
 }
 
 /// One retrieved item — a conversation turn/summary or a scored system-prompt

@@ -87,7 +87,8 @@
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> dedup [sample files] [questions per file] --daemon <url> --node <hex>
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
-//!     <workspace dir> lab <battery.yaml> <formula.yaml> [--watch] [--topk] --daemon <url> --node <hex>
+//!     <workspace dir> lab <battery.yaml> <formula.yaml> [--watch] [--topk] [--decode <tokens>] \
+//!     --daemon <url> --node <hex>
 
 mod anomaly;
 mod attribution;
@@ -315,9 +316,18 @@ fn main() -> anyhow::Result<()> {
             let flag = |f: &str| args[2..].iter().any(|a| a == f);
             let rest: Vec<&String> = args[2..].iter().filter(|a| !a.starts_with("--")).collect();
             let (Some(battery), Some(formula)) = (rest.first(), rest.get(1)) else {
-                anyhow::bail!("lab needs <battery.yaml> <formula.yaml> [--watch] [--topk]");
+                anyhow::bail!(
+                    "lab needs <battery.yaml> <formula.yaml> [--watch] [--topk] [--decode <tokens>]"
+                );
             };
             let (battery, formula) = (PathBuf::from(battery), PathBuf::from(formula));
+            let decode = args
+                .iter()
+                .position(|a| a == "--decode")
+                .and_then(|i| args.get(i + 1))
+                .map(|n| n.parse())
+                .transpose()?
+                .unwrap_or(1);
             lab::run(lab::LabRun {
                 files: &files,
                 gallery: &gallery,
@@ -326,6 +336,7 @@ fn main() -> anyhow::Result<()> {
                 formula: &formula,
                 watch: flag("--watch"),
                 topk: flag("--topk"),
+                decode,
                 daemon: daemon()?,
             })?;
         }

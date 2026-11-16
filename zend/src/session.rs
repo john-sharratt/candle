@@ -57,8 +57,8 @@ use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
     CancelToken, Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers,
-    GroupScanner, Linking, PromptDump, SamplingConfig, SelectionState, Sequence, ThinkSteering,
-    TokenDecoder, TurnEvent, UnsealedAsker, Want,
+    GroupScanner, Linking, Probed, PromptDump, SamplingConfig, SelectionState, Sequence,
+    ThinkSteering, TokenDecoder, TurnEvent, UnsealedAsker, Want,
 };
 use host::calibration;
 use host::download::ensure_model_pack;
@@ -6856,13 +6856,14 @@ impl ZendSession {
     /// Prefills `text` under the base conversation's system prompt (no seal, no
     /// belief mutation), then resolves the selected turns + scored section members
     /// into score-sorted tiles. `None` until the model is loaded.
-    pub fn substrate_project(&self, text: &str) -> Option<ProjectView> {
+    pub fn substrate_project(&self, text: &str, decode: usize) -> Option<ProjectView> {
         let state = self.inference.load_full()?;
         if text.trim().is_empty() {
             return Some(ProjectView {
                 query_tokens: 0,
                 tiles: Vec::new(),
                 probe: String::new(),
+                question: 0,
             });
         }
 
@@ -6872,7 +6873,11 @@ impl ZendSession {
         // under a brief `base_conv` lock, then run the GPU-bound probe UNLOCKED so
         // the fork source isn't held across a full turn round-trip.
         let ctx = { state.base_conv.probe_ctx() };
-        let (event, probe) = match ctx.probe(text) {
+        let Probed {
+            event,
+            sigs: probe,
+            question,
+        } = match ctx.probe(text, decode) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("substrate_project probe failed: {e:#}");
@@ -6880,6 +6885,7 @@ impl ZendSession {
                     query_tokens: 0,
                     tiles: Vec::new(),
                     probe: String::new(),
+                    question: 0,
                 });
             }
         };
@@ -7005,6 +7011,7 @@ impl ZendSession {
             query_tokens,
             tiles,
             probe: STANDARD.encode(encode_wide_sigs(&probe)),
+            question,
         })
     }
 

@@ -4,8 +4,9 @@
 //! the daemon or rebuilding this harness.
 //!
 //! Each question is asked once of a running daemon: `/project` for its probe
-//! (the question's wide-Q, as a chat's opening captures it) and production's
-//! own pick ([`crate::lab_probes`]), and `/scan` for the raw per-token,
+//! (the question's wide-Q as a thinking turn prefills it, then `--decode`
+//! tokens of the model's answer — a formula's `part` picks which it scores)
+//! and production's own pick ([`crate::lab_probes`]), and `/scan` for the raw per-token,
 //! per-fold-group votes of the content and the calibration competitions on
 //! the daemon's GPU gallery ([`crate::remote_gallery`]). A fixed sample of
 //! other files' calibration questions is scanned the same way, as the
@@ -61,6 +62,10 @@ const RANK_CACHE_DIR: &str = "target/provenance-topk-cache-at";
 /// ranking for the rest of the run: an experiment, not a wait.
 const RANK_BUDGET: Duration = Duration::from_secs(60);
 
+/// Decoded-answer tokens the CPU ranks per question, by the daemon's vote
+/// ([`ranked_tokens`]).
+const THINKING_RANKED: usize = 64;
+
 /// A battery question, as the lab reads it.
 #[derive(Deserialize)]
 struct BatteryQuestion {
@@ -92,6 +97,9 @@ struct Scanned {
     content: Vec<TokenVote>,
     calibration: Vec<TokenVote>,
     ranked: Option<Vec<[Ranked; FOLD_GROUPS]>>,
+    /// Probe tokens that are the question, ahead of the decoded answer's;
+    /// `None` for a probe that is a question alone.
+    question: Option<usize>,
 }
 
 impl Scanned {
@@ -100,6 +108,7 @@ impl Scanned {
             content: &self.content,
             calibration: &self.calibration,
             ranked: self.ranked.as_deref(),
+            question: self.question,
         }
     }
 }
@@ -185,6 +194,7 @@ fn scan(
         content,
         calibration,
         ranked: None,
+        question: None,
     })
 }
 
@@ -238,6 +248,50 @@ fn ranked(
     Ok(out)
 }
 
+/// The probe tokens the CPU ranks: every one of the question's, and the
+/// [`THINKING_RANKED`] of the answer's whose daemon votes (`content`, summed
+/// over the groups) are largest — the needle gate keeps a quarter of a probe's
+/// tokens by vote, so the rest could not be kept anyway. Ascending.
+fn ranked_tokens(content: &[TokenVote], question: usize) -> Vec<usize> {
+    let mass = |t: usize| -> f32 { content[t].iter().flatten().map(|v| v.weight).sum() };
+    let mut answer: Vec<usize> = (question.min(content.len())..content.len()).collect();
+    answer.sort_by(|&a, &b| mass(b).total_cmp(&mass(a)).then(a.cmp(&b)));
+    answer.truncate(THINKING_RANKED);
+    let mut out: Vec<usize> = (0..question.min(content.len())).chain(answer).collect();
+    out.sort_unstable();
+    out
+}
+
+/// `probe` ranked on the CPU at the tokens `only` names, every other token
+/// left with an empty ranking — no vote.
+fn ranked_at(
+    probe: &[WideQSig],
+    only: &[usize],
+    flat: &FlatSigs,
+    token_file: &[usize],
+    n_files: usize,
+) -> anyhow::Result<Vec<[Ranked; FOLD_GROUPS]>> {
+    let picked: Vec<WideQSig> = only.iter().map(|&t| probe[t].clone()).collect();
+    let got = ranked(&picked, flat, token_file, n_files)?;
+    anyhow::ensure!(
+        got.len() == picked.len(),
+        "{} of {} probe tokens ranked — a token narrower than the gallery's fold",
+        got.len(),
+        picked.len()
+    );
+    let empty = Ranked {
+        mean: 0.0,
+        std: 1.0,
+        top: Vec::new(),
+    };
+    let mut out: Vec<[Ranked; FOLD_GROUPS]> =
+        vec![std::array::from_fn(|_| empty.clone()); probe.len()];
+    for (&t, r) in only.iter().zip(got) {
+        out[t] = r;
+    }
+    Ok(out)
+}
+
 /// What the lab is run on.
 pub struct LabRun<'a> {
     pub files: &'a [File],
@@ -249,6 +303,8 @@ pub struct LabRun<'a> {
     pub watch: bool,
     /// Rank each question's content competition on the CPU, for `topk`.
     pub topk: bool,
+    /// Tokens of the model's answer each question's probe decodes after it.
+    pub decode: usize,
     pub daemon: &'a Daemon,
 }
 
@@ -261,6 +317,7 @@ pub fn run(run: LabRun) -> anyhow::Result<()> {
         formula: formula_path,
         watch,
         topk,
+        decode,
         daemon,
     } = run;
     let token_file = token_files(gallery, None);
@@ -278,13 +335,39 @@ pub fn run(run: LabRun) -> anyhow::Result<()> {
     let t = Instant::now();
     let mut asked: Vec<Asked> = Vec::with_capacity(battery.questions.len());
     for q in &battery.questions {
-        let Probed { probe, placed } =
-            probed(daemon, &q.question).with_context(|| format!("probing {}", q.id))?;
+        let Probed {
+            probe,
+            question,
+            placed,
+        } = probed(daemon, &q.question, decode).with_context(|| format!("probing {}", q.id))?;
         let mut scanned = scan(&gpu, &probe, None)?;
+        anyhow::ensure!(
+            scanned.content.len() == probe.len(),
+            "{}: {} of {} probe tokens scanned",
+            q.id,
+            scanned.content.len(),
+            probe.len()
+        );
+        scanned.question = Some(question);
         if topk && !rank_budget_spent {
             let t_rank = Instant::now();
-            scanned.ranked = Some(ranked(&probe, &gallery.flat, &token_file, files.len())?);
+            let only = ranked_tokens(&scanned.content, question);
+            scanned.ranked = Some(ranked_at(
+                &probe,
+                &only,
+                &gallery.flat,
+                &token_file,
+                files.len(),
+            )?);
             let took = t_rank.elapsed();
+            println!(
+                "  {}: {} question + {} answer tokens, {} ranked in {:.1}s",
+                q.id,
+                question,
+                probe.len() - question,
+                only.len(),
+                took.as_secs_f64()
+            );
             if took > RANK_BUDGET {
                 rank_budget_spent = true;
                 println!(
@@ -540,6 +623,38 @@ mod tests {
             turns: Vec::new(),
             questions: Vec::new(),
         }
+    }
+
+    /// **Every question token is ranked, and the answer's loudest**: with
+    /// two question tokens and more answer tokens than the cap, the answer
+    /// tokens ranked are the [`THINKING_RANKED`] with the largest daemon
+    /// votes, in order.
+    #[test]
+    fn the_ranking_takes_the_question_and_the_loudest_answer_tokens() {
+        use candle_conversation::provenance::window_score::Vote;
+        let n = 2 + THINKING_RANKED + 3;
+        let content: Vec<TokenVote> = (0..n)
+            .map(|t| {
+                // The answer's quietest three are tokens 2, 3 and 4.
+                let w = if (2..5).contains(&t) {
+                    0.5
+                } else {
+                    10.0 + t as f32
+                };
+                [
+                    Some(Vote {
+                        token: t,
+                        file: 0,
+                        weight: w,
+                    }),
+                    None,
+                    None,
+                ]
+            })
+            .collect();
+        let got = ranked_tokens(&content, 2);
+        let want: Vec<usize> = (0..2).chain(5..n).collect();
+        assert_eq!(got, want);
     }
 
     /// **An answer path finds its file under its repository's prefix**, and
