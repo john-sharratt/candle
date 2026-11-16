@@ -11,8 +11,8 @@ pub const SURVEY_NETWORK: Tool = Tool {
     category: "House",
     plane: Plane::World,
     availability: Availability::Embodied,
-    description: "Survey the house network from the house link here, or from the house network's \
-                  terminal while you are connected to it: every device on it, what each says it \
+    description: "Survey the house network from the house link here — or, for a mind with no body, \
+                  from wherever it is, connected to anything or to nothing: every device on it, what each says it \
                   is, and whether the world can work it. What it finds stays with this room, to \
                   put each device in it as what it is. Use for: finding out what is on the \
                   house's network now — lights, speakers, televisions, handsets, machines. \

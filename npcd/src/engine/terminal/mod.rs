@@ -291,6 +291,12 @@ impl Within {
         for name in acts::REACH_ACTS {
             grant(&mut self, name);
         }
+        // **The survey is offered whatever the mind is connected to**: the
+        // house network always stands, and finding what is on it is where
+        // every device's terminal comes from. Offered only on that terminal,
+        // it was two acts away from a mind asked "what is on the network" —
+        // and the mind never took the first.
+        self.links = vec![NETWORK.to_string()];
         let Some(terminal) = now else {
             return self;
         };
@@ -305,7 +311,6 @@ impl Within {
                     .collect();
             }
             Kind::Network => {
-                self.links = vec![NETWORK.to_string()];
                 let devices = sim.terminals.devices();
                 self.devices = devices.iter().map(|d| d.name.clone()).collect();
                 self.onboarded = devices
@@ -794,15 +799,17 @@ mod tests {
         );
     }
 
-    /// **A mind with no connection has the three terminal acts and nothing of
-    /// any terminal's**; connected, it has that terminal's verbs alone, and
-    /// the terminal it is on is not offered to connect to again.
+    /// **A mind with no connection has the three terminal acts, the house
+    /// network to survey, and nothing else of any terminal's**; connected, it
+    /// has that terminal's verbs alone, and the terminal it is on is not
+    /// offered to connect to again.
     #[test]
     fn a_connection_brings_one_terminals_verbs_and_no_others() {
         let mut s = house();
         let at = |s: &Sim| Within::default().at_terminals(s, &machines(), true, "zen");
         let free = at(&s);
         assert_eq!(free.grants, ["terminal_list", "terminal_connect"]);
+        assert_eq!(free.links, [NETWORK], "the survey is offered unconnected");
         assert_eq!(free.terminals.len(), 6);
         assert!(free.lights.is_empty() && free.sonos.is_empty() && free.checks.is_empty());
 
@@ -826,6 +833,7 @@ mod tests {
         assert_eq!(checking.checks, ["listeners"]);
         assert!(checking.grants.iter().any(|g| g == "machine_check"));
         assert!(!checking.grants.iter().any(|g| g == "cluster_logs"));
+        assert_eq!(checking.links, [NETWORK], "and on another terminal");
 
         s.terminals.connect("zen", NETWORK);
         let net = at(&s);

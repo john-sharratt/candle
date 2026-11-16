@@ -195,6 +195,8 @@ impl Runtime {
                 Some(was) => (true, format!("You let go of {was}.")),
                 None => (false, "You are connected to nothing.".into()),
             },
+            // The house network is surveyed from wherever the mind is.
+            "survey_network" => self.survey_house(&hosted).await,
             _ => match self.connection(&hosted, &body) {
                 None => (
                     false,
@@ -286,6 +288,39 @@ impl Runtime {
         (true, hosted.sim(|s| welcome(&terminal, s)))
     }
 
+    /// Survey the house network for a mind with no body: every device on it
+    /// now, each kept as a terminal of `hosted`'s world.
+    async fn survey_house(&self, hosted: &Hosted) -> (bool, String) {
+        let found = match discover::survey().await {
+            Err(e) => return (false, format!("The survey could not be made: {e}")),
+            Ok(found) => found,
+        };
+        let lines: Vec<String> = found.iter().map(|f| f.line()).collect();
+        let n = found.len();
+        let changes = hosted.with_sim(|s| s.terminals.surveyed(found));
+        tracing::info!(
+            world = hosted.id(),
+            devices = n,
+            "house network surveyed by a mind with no body"
+        );
+        for change in changes {
+            self.raise_terminal(hosted, NETWORK, &change.line(), true);
+        }
+        match n {
+            0 => (
+                true,
+                "The survey found nothing on the house network.".into(),
+            ),
+            _ => (
+                true,
+                format!(
+                    "The survey found {n} devices on the house network:\n{}",
+                    lines.join("\n")
+                ),
+            ),
+        }
+    }
+
     /// One act on the terminal a mind is connected to.
     async fn work(&self, hosted: &Hosted, terminal: &Terminal, act: &Act) -> (bool, String) {
         let agents = self.agents();
@@ -354,35 +389,6 @@ impl Runtime {
                 }
             }
             // ── the house network ─────────────────────────────────────────
-            (Kind::Network, "survey_network") => match discover::survey().await {
-                Err(e) => (false, format!("The survey could not be made: {e}")),
-                Ok(found) => {
-                    let lines: Vec<String> = found.iter().map(|f| f.line()).collect();
-                    let n = found.len();
-                    let changes = hosted.with_sim(|s| s.terminals.surveyed(found));
-                    tracing::info!(
-                        world = hosted.id(),
-                        devices = n,
-                        "house network surveyed through its terminal"
-                    );
-                    for change in changes {
-                        self.raise_terminal(hosted, NETWORK, &change.line(), true);
-                    }
-                    match n {
-                        0 => (
-                            true,
-                            "The survey found nothing on the house network.".into(),
-                        ),
-                        _ => (
-                            true,
-                            format!(
-                                "The survey found {n} devices on the house network:\n{}",
-                                lines.join("\n")
-                            ),
-                        ),
-                    }
-                }
-            },
             (Kind::Network, "wake_device") => {
                 let Some(name) = text(&act.args, "device") else {
                     return (false, "Say which device to wake.".into());

@@ -459,7 +459,9 @@ does (`docs/zend_journal.md`), written by the same workflow
   (`talk.journal`), beside the rest of its state: it follows the conversation
   and is nobody else's.
 - **A kept entry is told to the mind, and wakes it.** It goes as `Concluded`,
-  with the entry in full. That is how what was said on the phone becomes
+  with the entry in full and nothing beside it — the entry already says what
+  was asked, what was answered and what is meant to be done, so the line said
+  and the acts taken are not repeated next to it. That is how what was said on the phone becomes
   something the character does: "John asked whether the cluster is up; I said
   I would look" reaches the mind with what it now means to do and what is
   open. A skipped stretch tells nothing more than §5.4's quiet `Elsewhere`.

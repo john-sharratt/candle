@@ -522,6 +522,10 @@ impl Runtime {
         // telling hears nothing, so its stretch often adds none, and Zen —
         // having told a person "I will now survey the devices" — was woken by
         // nothing and surveyed nothing.
+        // **A kept entry is what the mind is told, and nothing beside it**: it
+        // says what was asked, what was answered and what is meant to be done
+        // about it, so the line said and the acts taken would be the same
+        // thing twice.
         let told = telling.is_some() && matches!(ended, Ended::Spoke);
         if told {
             self.scheduler.deliver(
@@ -548,7 +552,7 @@ impl Runtime {
                 )
                 .await
             {
-                elsewhere.push(entry);
+                elsewhere = vec![entry];
                 // A telling has already woken the mind; its entry is read on
                 // the turn that wake starts.
                 settled = settled || !told;
