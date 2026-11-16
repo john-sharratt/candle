@@ -138,6 +138,7 @@ pub(crate) fn assemble_file_scans(
     // pass had to build goes back in one swap.
     let records = sub.calibration_snapshot();
     let mut fresh = Vec::new();
+    let t_files = Instant::now();
     for timeline in timelines {
         let Some(gallery) = sub.file_gallery(timeline, |s| {
             built_galleries += 1;
@@ -170,6 +171,7 @@ pub(crate) fn assemble_file_scans(
             cal,
         });
     }
+    let files_us = t_files.elapsed().as_micros() as u64;
     let kept = files.len() as u64;
     let built = fresh.len() as u64;
     sub.publish_calibration_records(fresh);
@@ -181,6 +183,7 @@ pub(crate) fn assemble_file_scans(
         s.cal_built += built;
         s.cal_windows += cal_kept;
         s.cal_us += cal_time.as_micros() as u64;
+        s.files_us += files_us;
     });
     (files, turns_walked)
 }

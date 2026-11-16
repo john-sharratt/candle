@@ -7,6 +7,7 @@
 //! held launch back as the very segments it was built from.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::super::{SigWindow, VoteLaw, WideQSig};
 use super::scan_split::{self, ArenaScanSplit};
@@ -121,6 +122,10 @@ pub struct HeldScan {
     segments: Vec<HeldSegment>,
     probes: Vec<Vec<WideQSig>>,
     launch: Launch,
+    /// When the launch was held, ready to send.
+    sent: Instant,
+    /// What holding it cost the sending thread.
+    hold_us: u64,
 }
 
 /// What a [`HeldScan`] answers, its error as text: a launch's error crosses a
@@ -141,10 +146,15 @@ pub struct ScanReply {
 
 impl HeldScan {
     fn held(segments: &[PagedSegment], probes: &[&[WideQSig]], launch: Launch) -> Self {
+        let t_hold = Instant::now();
+        let segments = segments.iter().map(HeldSegment::of).collect();
+        let probes = probes.iter().map(|p| p.to_vec()).collect();
         Self {
-            segments: segments.iter().map(HeldSegment::of).collect(),
-            probes: probes.iter().map(|p| p.to_vec()).collect(),
+            segments,
+            probes,
             launch,
+            sent: Instant::now(),
+            hold_us: t_hold.elapsed().as_micros() as u64,
         }
     }
 
@@ -184,8 +194,11 @@ impl HeldScan {
     /// Run the launch on `arena` — on its scan thread — counting its time
     /// apart from that thread's own scans.
     pub fn run(&self, arena: &GalleryArena) -> ScanReply {
+        let queue_us = self.sent.elapsed().as_micros() as u64;
+        let t_view = Instant::now();
         let segments = self.segments();
         let probes = self.probes();
+        let view_us = t_view.elapsed().as_micros() as u64;
         let text = |e: candle::Error| e.to_string();
         let (answer, split) = scan_split::apart(|| match &self.launch {
             Launch::Weighted(w) => {
@@ -201,7 +214,21 @@ impl HeldScan {
             }
             Launch::Votes => ScanAnswer::Votes(arena.scan_votes(&segments, &probes).map_err(text)),
         });
-        ScanReply { answer, split }
+        ScanReply {
+            answer,
+            split: self.counted(split, queue_us, view_us),
+        }
+    }
+
+    /// `split` with this launch counted as held: what holding it cost the
+    /// sender, its `queue_us` waiting for the scan thread and its `view_us`
+    /// laid back out there.
+    fn counted(&self, mut split: ArenaScanSplit, queue_us: u64, view_us: u64) -> ArenaScanSplit {
+        split.held += 1;
+        split.hold_us += self.hold_us;
+        split.queue_us += queue_us;
+        split.view_us += view_us;
+        split
     }
 
     /// The answer when there is no arena to run on: the scheduler that said it
@@ -315,5 +342,32 @@ mod tests {
             Launch::Weighted(w) => assert_eq!(w, &vec![0.25]),
             other => panic!("a weighted launch, got {other:?}"),
         }
+    }
+
+    /// **A held launch's reply counts it as held**, with what holding it cost
+    /// the sender, its wait for the scan thread and its layout there, on top
+    /// of the arena's own split.
+    #[test]
+    fn a_held_launchs_reply_counts_its_hold_wait_and_layout() {
+        let tail = vec![sig(1)];
+        let mut held = HeldScan::weighted(&[], &[&tail], &[1.0]);
+        held.hold_us = 40;
+        let arena = ArenaScanSplit {
+            scans: 1,
+            kernel_us: 9,
+            ..ArenaScanSplit::default()
+        };
+        assert_eq!(
+            held.counted(arena, 700, 30),
+            ArenaScanSplit {
+                scans: 1,
+                kernel_us: 9,
+                held: 1,
+                hold_us: 40,
+                queue_us: 700,
+                view_us: 30,
+                ..ArenaScanSplit::default()
+            }
+        );
     }
 }

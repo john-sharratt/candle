@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async;
-#[cfg(feature = "profile")]
 use candle::cuda_backend::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
 use candle::cuda_backend::staged::segment;
@@ -691,11 +690,22 @@ impl GalleryArena {
                     "scan index rebuilt: {}",
                     miss.reason()
                 );
+                let t_build = Instant::now();
+                scan_split::add(|s| match miss {
+                    IndexMiss::Absent => s.index_absent += 1,
+                    IndexMiss::Stale => s.index_stale += 1,
+                    IndexMiss::Narrower { .. } => s.index_narrower += 1,
+                });
                 let build_for = match miss {
                     IndexMiss::Narrower { covering } => covering,
                     IndexMiss::Absent | IndexMiss::Stale => weighed.clone(),
                 };
                 let built = Arc::new(self.build_index(segments, &build_for)?);
+                let build_us = t_build.elapsed().as_micros() as u64;
+                scan_split::add(|s| {
+                    s.index_built += 1;
+                    s.index_build_us += build_us;
+                });
                 // What a scan waits for when its working set is not all
                 // resident: the uploads of the turns it finds evicted and the
                 // index over them, per byte of the set — the stall a turn's
@@ -786,10 +796,12 @@ impl GalleryArena {
         let LaunchTiming {
             upload_us,
             kernel_us,
+            kernel_gpu_us,
             readback_us,
         } = launched.timing;
         profile::record("arena:launch_upload", Duration::from_micros(upload_us));
         profile::record("arena:launch_kernel", Duration::from_micros(kernel_us));
+        profile::record("arena:kernel_gpu", Duration::from_micros(kernel_gpu_us));
         profile::record("arena:launch_readback", Duration::from_micros(readback_us));
         profile::record("arena:launch_tally", t_tally.elapsed());
         let tally_us = t_tally.elapsed().as_micros() as u64;
@@ -797,6 +809,7 @@ impl GalleryArena {
             s.launches += u64::from(launched.fresh > 0);
             s.fresh_tokens += launched.fresh as u64;
             s.upload_us += upload_us;
+            s.kernel_gpu_us += kernel_gpu_us;
             s.kernel_us += kernel_us;
             s.readback_us += readback_us;
             s.rows_us += launched.rows_us;
@@ -1007,6 +1020,7 @@ impl GalleryArena {
         let mut out_case = vec![0i32; n_out];
         let mut out_vote = vec![0f32; n_out];
         let mut readback_us = 0u64;
+        let mut kernel_gpu_us = 0u64;
         // The outputs are written in full by the kernel (one block per tile ×
         // group × segment), so their room is neither zeroed nor uploaded.
         let launch = |at: &[u64], room: u64| -> candle::Result<()> {
@@ -1023,8 +1037,7 @@ impl GalleryArena {
             let p_out_vote = room + (n_out * std::mem::size_of::<i32>()) as u64;
             // The kernel's own device time, apart from whatever the shared
             // stream had queued ahead of it — the wall-clock sync below counts
-            // both.
-            #[cfg(feature = "profile")]
+            // both. Timing events: `None` flags would make them untimed.
             let ev_start = stream.record_event(Some(CU_EVENT_DEFAULT)).ok();
             let mut launched = false;
             for &backend in &candidates {
@@ -1151,17 +1164,15 @@ impl GalleryArena {
                 ));
             }
             profile::record("arena:launch_enqueue", t_kernel.elapsed());
-            #[cfg(feature = "profile")]
             let ev_stop = stream.record_event(Some(CU_EVENT_DEFAULT)).ok();
             let t_sync = Instant::now();
             stream
                 .synchronize()
                 .map_err(|e| candle::Error::Msg(format!("paged scan: synchronize: {e}")))?;
             profile::record("arena:launch_sync", t_sync.elapsed());
-            #[cfg(feature = "profile")]
             if let (Some(start), Some(stop)) = (&ev_start, &ev_stop) {
                 if let Ok(ms) = start.elapsed_ms(stop) {
-                    profile::record("arena:kernel_gpu", Duration::from_secs_f32(ms / 1000.0));
+                    kernel_gpu_us = (f64::from(ms) * 1000.0) as u64;
                 }
             }
 
@@ -1193,6 +1204,7 @@ impl GalleryArena {
             LaunchTiming {
                 upload_us,
                 kernel_us,
+                kernel_gpu_us,
                 readback_us,
             },
         ))

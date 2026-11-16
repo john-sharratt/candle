@@ -49,6 +49,22 @@ pub(crate) struct GroupScanSplit {
     /// Files whose gallery the assembly built, rather than found held on
     /// their timeline (`Substrate::file_gallery`).
     pub galleries_built: u64,
+    /// Of `select_us`: the group's timelines in the target's scope.
+    pub scope_us: u64,
+    /// Of `select_us`: keeping the timelines that carry a tagged group's tags.
+    pub tags_us: u64,
+    /// Of `assemble_us`: the per-file loop — each held gallery read back (or
+    /// built), its windows taken and its calibrations attached.
+    pub files_us: u64,
+    /// Of `assemble_us`: cutting the group's excluded chunks out.
+    pub exclude_us: u64,
+    /// Of `assemble_us`: each file's kind, for a group normalized by kind.
+    pub kinds_us: u64,
+    /// Of `assemble_us`: the target's lineage, for a group that leaves it out.
+    pub lineage_us: u64,
+    /// Of `assemble_us`: letting go of the substrate version the assembly
+    /// read — a version no one else holds is freed here.
+    pub release_us: u64,
 }
 
 thread_local! {
@@ -70,6 +86,13 @@ thread_local! {
             cal_us: 0,
             segments_us: 0,
             galleries_built: 0,
+            scope_us: 0,
+            tags_us: 0,
+            files_us: 0,
+            exclude_us: 0,
+            kinds_us: 0,
+            lineage_us: 0,
+            release_us: 0,
         }) };
 }
 

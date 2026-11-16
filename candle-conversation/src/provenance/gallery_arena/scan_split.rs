@@ -23,6 +23,17 @@ pub struct ArenaScanSplit {
     pub index_us: u64,
     /// Of `index_us`: fingerprinting the segment set, over every window.
     pub fingerprint_us: u64,
+    /// Scans that built their index rather than reused a cached one.
+    pub index_built: u64,
+    /// Of `index_us`: the builds.
+    pub index_build_us: u64,
+    /// Builds because no index was cached for the segment set.
+    pub index_absent: u64,
+    /// Builds because a turn the cached index held was evicted, moved or
+    /// re-uploaded.
+    pub index_stale: u64,
+    /// Builds because the cached index scanned fewer fold groups.
+    pub index_narrower: u64,
     /// Windows fingerprinted, over all scans.
     pub windows: u64,
     /// Turns the index pinned resident, over all scans.
@@ -32,12 +43,27 @@ pub struct ArenaScanSplit {
     /// Enqueue to the kernel's completion on the stream — the scan shares the
     /// compute stream, so work queued ahead of it is counted here too.
     pub kernel_us: u64,
+    /// Of `kernel_us`: the kernel's own device time, between events recorded
+    /// on the stream either side of it — what `kernel_us` holds beyond this
+    /// is work queued ahead of the launch and the host's enqueue.
+    pub kernel_gpu_us: u64,
     /// The outputs back to the host.
     pub readback_us: u64,
     /// Row cache plan, insert and assembly.
     pub rows_us: u64,
     /// The host's needle tally.
     pub tally_us: u64,
+    /// Launches sent to the arena's scan thread from another
+    /// ([`super::HeldScan`]).
+    pub held: u64,
+    /// Of the held launches: copying the segments into owned form on the
+    /// sending thread.
+    pub hold_us: u64,
+    /// Of the held launches: waiting for the scan thread to take them up.
+    pub queue_us: u64,
+    /// Of the held launches: laying the owned segments back out on the scan
+    /// thread before the launch.
+    pub view_us: u64,
 }
 
 thread_local! {
@@ -48,13 +74,23 @@ thread_local! {
         fresh_tokens: 0,
         index_us: 0,
         fingerprint_us: 0,
+        index_built: 0,
+        index_build_us: 0,
+        index_absent: 0,
+        index_stale: 0,
+        index_narrower: 0,
         windows: 0,
         pinned: 0,
         upload_us: 0,
         kernel_us: 0,
+        kernel_gpu_us: 0,
         readback_us: 0,
         rows_us: 0,
         tally_us: 0,
+        held: 0,
+        hold_us: 0,
+        queue_us: 0,
+        view_us: 0,
     }) };
 }
 
@@ -65,6 +101,8 @@ pub(crate) struct LaunchTiming {
     pub upload_us: u64,
     /// The kernel, to its completion.
     pub kernel_us: u64,
+    /// Of `kernel_us`: the kernel's own device time.
+    pub kernel_gpu_us: u64,
     /// The outputs back to the host.
     pub readback_us: u64,
 }
@@ -93,13 +131,23 @@ pub(crate) fn merge(other: ArenaScanSplit) {
         s.fresh_tokens += other.fresh_tokens;
         s.index_us += other.index_us;
         s.fingerprint_us += other.fingerprint_us;
+        s.index_built += other.index_built;
+        s.index_build_us += other.index_build_us;
+        s.index_absent += other.index_absent;
+        s.index_stale += other.index_stale;
+        s.index_narrower += other.index_narrower;
         s.windows += other.windows;
         s.pinned += other.pinned;
         s.upload_us += other.upload_us;
         s.kernel_us += other.kernel_us;
+        s.kernel_gpu_us += other.kernel_gpu_us;
         s.readback_us += other.readback_us;
         s.rows_us += other.rows_us;
         s.tally_us += other.tally_us;
+        s.held += other.held;
+        s.hold_us += other.hold_us;
+        s.queue_us += other.queue_us;
+        s.view_us += other.view_us;
     });
 }
 
@@ -161,13 +209,23 @@ mod tests {
             fresh_tokens: 4,
             index_us: 5,
             fingerprint_us: 6,
-            windows: 7,
-            pinned: 8,
-            upload_us: 9,
-            kernel_us: 10,
-            readback_us: 11,
-            rows_us: 12,
-            tally_us: 13,
+            index_built: 7,
+            index_build_us: 8,
+            index_absent: 9,
+            index_stale: 10,
+            index_narrower: 11,
+            windows: 12,
+            pinned: 13,
+            upload_us: 14,
+            kernel_us: 15,
+            kernel_gpu_us: 16,
+            readback_us: 17,
+            rows_us: 18,
+            tally_us: 19,
+            held: 20,
+            hold_us: 21,
+            queue_us: 22,
+            view_us: 23,
         };
         merge(every);
         merge(every);
@@ -181,13 +239,23 @@ mod tests {
                 fresh_tokens: 8,
                 index_us: 10,
                 fingerprint_us: 12,
-                windows: 14,
-                pinned: 16,
-                upload_us: 18,
-                kernel_us: 20,
-                readback_us: 22,
-                rows_us: 24,
-                tally_us: 26,
+                index_built: 14,
+                index_build_us: 16,
+                index_absent: 18,
+                index_stale: 20,
+                index_narrower: 22,
+                windows: 24,
+                pinned: 26,
+                upload_us: 28,
+                kernel_us: 30,
+                kernel_gpu_us: 32,
+                readback_us: 34,
+                rows_us: 36,
+                tally_us: 38,
+                held: 40,
+                hold_us: 42,
+                queue_us: 44,
+                view_us: 46,
             }
         );
     }

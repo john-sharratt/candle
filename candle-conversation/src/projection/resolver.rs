@@ -1640,6 +1640,8 @@ impl Conversation {
         if probe.is_empty() {
             return (scores, candidates);
         }
+        // The once-per-turn seal scan observes; a live reprojection only reads.
+        let seal = u8::from(observe.source().is_some());
         // Collections (the tool catalog) live in the shared system prompt.
         scan_split::take();
         let t_coll = Instant::now();
@@ -1705,7 +1707,12 @@ impl Conversation {
                  arena_launches={} \
                  arena_segments={} arena_fresh_tokens={} arena_index_us={} \
                  arena_fingerprint_us={} arena_windows={} arena_pinned={} arena_upload_us={} \
-                 arena_kernel_us={} arena_readback_us={} arena_rows_us={} arena_tally_us={}",
+                 arena_kernel_us={} arena_readback_us={} arena_rows_us={} arena_tally_us={} \
+                 seal={seal} scope_us={} tags_us={} files_us={} exclude_us={} kinds_us={} \
+                 lineage_us={} release_us={} arena_kernel_gpu_us={} arena_index_built={} \
+                 arena_index_build_us={} arena_index_absent={} arena_index_stale={} \
+                 arena_index_narrower={} arena_held={} arena_hold_us={} arena_queue_us={} \
+                 arena_view_us={}",
                 probe.len(),
                 t_groups.elapsed().as_micros(),
                 groups.scanned,
@@ -1736,6 +1743,23 @@ impl Conversation {
                 arena.readback_us,
                 arena.rows_us,
                 arena.tally_us,
+                groups.scope_us,
+                groups.tags_us,
+                groups.files_us,
+                groups.exclude_us,
+                groups.kinds_us,
+                groups.lineage_us,
+                groups.release_us,
+                arena.kernel_gpu_us,
+                arena.index_built,
+                arena.index_build_us,
+                arena.index_absent,
+                arena.index_stale,
+                arena.index_narrower,
+                arena.held,
+                arena.hold_us,
+                arena.queue_us,
+                arena.view_us,
             )
         });
         (scores, candidates)
@@ -2605,6 +2629,7 @@ impl Conversation {
             } else {
                 Holder::Shared
             };
+            let t_scope = Instant::now();
             let mut timelines: Vec<TimelineId> = if masked {
                 vec![target.timeline]
             } else if sub.is_append_only_layer(target.layer) {
@@ -2619,6 +2644,8 @@ impl Conversation {
                 sub.scoped_timelines_for_group(group.id, target.timeline)
                     .collect()
             };
+            let scope_us = t_scope.elapsed().as_micros() as u64;
+            let t_tags = Instant::now();
             // A tagged group reads only the conversations carrying its tags — the
             // same scope projection applies to its candidates, applied here so an
             // out-of-scope conversation is neither scanned nor allowed to teach
@@ -2635,6 +2662,7 @@ impl Conversation {
                     })
                 });
             }
+            let tags_us = t_tags.elapsed().as_micros() as u64;
             // ── Phase A: assemble every file's exchanges + gallery windows ───────
             // All files in the group are built first so the whole group can be scored
             // in ONE batched GPU launch (per-file z), or file-by-file on the CPU
@@ -2644,7 +2672,10 @@ impl Conversation {
             let n_timelines = timelines.len();
             let t_assemble = Instant::now();
             let (mut files, turns_walked) = assemble_file_scans(&sub, timelines);
+            let t_exclude = Instant::now();
             cut_excluded(&mut files, &sub.chunk_exclusion(group.id));
+            let exclude_us = t_exclude.elapsed().as_micros() as u64;
+            let t_kinds = Instant::now();
             // Each file's kind, its path's extension, when the group reads its
             // files against their own kind — one metadata lookup a file.
             let kinds: Option<Vec<String>> =
@@ -2658,6 +2689,8 @@ impl Conversation {
                         })
                         .collect()
                 });
+            let kinds_us = t_kinds.elapsed().as_micros() as u64;
+            let t_lineage = Instant::now();
             // The target's lineage, when the group leaves it out: the priming
             // chain the target opens on already.
             let lineage: HashSet<TimelineId> = if group.policy.scan.exclude_lineage {
@@ -2668,10 +2701,13 @@ impl Conversation {
             } else {
                 HashSet::new()
             };
+            let lineage_us = t_lineage.elapsed().as_micros() as u64;
+            let t_release = Instant::now();
             // End of Phase A — release the substrate before the scan. Every
             // `FileScan` owns its data (`arcs_kept` holds `Arc`s), so nothing
             // below borrows the guard.
             drop(sub);
+            let release_us = t_release.elapsed().as_micros() as u64;
             let assemble_us = t_assemble.elapsed().as_micros() as u64;
             let n_windows: usize = files.iter().map(|f| f.windows.len()).sum();
             if files.is_empty() {
@@ -2934,6 +2970,12 @@ impl Conversation {
                 s.assemble_us += assemble_us;
                 s.score_us += score_us;
                 s.normalize_us += normalize_us;
+                s.scope_us += scope_us;
+                s.tags_us += tags_us;
+                s.exclude_us += exclude_us;
+                s.kinds_us += kinds_us;
+                s.lineage_us += lineage_us;
+                s.release_us += release_us;
                 s
             });
             per_group.push((group.id, cands));
