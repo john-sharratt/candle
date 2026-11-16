@@ -53,8 +53,9 @@ const BACKGROUND_STRIDE: usize = 60;
 /// one less, each vote measured over the next.
 const RANK_KEPT: usize = 9;
 
-/// Where the CPU rankings are kept, from the repository root.
-const RANK_CACHE_DIR: &str = "target/provenance-topk-cache";
+/// Where the CPU rankings are kept, from the repository root: each file with
+/// the gallery token that agreed, which token runs read.
+const RANK_CACHE_DIR: &str = "target/provenance-topk-cache-at";
 
 /// The longest one question's CPU ranking may take before the lab stops
 /// ranking for the rest of the run: an experiment, not a wait.
@@ -188,7 +189,7 @@ fn scan(
 }
 
 /// A ranked token as the cache keeps it: per group, `(mean, std, top)`.
-type KeptRanking = Vec<Vec<(f32, f32, Vec<(usize, u32)>)>>;
+type KeptRanking = Vec<Vec<(f32, f32, Vec<(usize, u32, u32)>)>>;
 
 /// `probe` ranked on the CPU against the content gallery `flat` — each
 /// token's best [`RANK_KEPT`] files per group — from the cache when it holds

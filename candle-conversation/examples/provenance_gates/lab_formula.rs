@@ -14,6 +14,8 @@ use serde::Deserialize;
 use candle_conversation::provenance::window_score::{gate, Ranked, Vote};
 use candle_conversation::provenance::FOLD_GROUPS;
 
+use crate::lab_runs::{run_lengths, RunOrder};
+
 /// One probe token's vote in each fold group, as the daemon's scan returns it.
 pub type TokenVote = [Option<Vote>; FOLD_GROUPS];
 
@@ -49,6 +51,17 @@ pub struct FormulaSpec {
     pub aggregate: Aggregate,
     /// The content competition's fold-group weights.
     pub groups: [f32; 3],
+    /// Under `topk` above 1, per fold group: a vote in a token run of length
+    /// `L` ([`crate::lab_runs`]) is multiplied by `1 + run_bonus × (L − 1)`.
+    pub run_bonus: [f32; 3],
+    /// Under `topk` above 1, per fold group: a vote in a run shorter than
+    /// this is dropped — 1 keeps every vote.
+    pub run_min: [usize; 3],
+    /// How far apart, in gallery tokens, two neighbouring probe tokens'
+    /// matches in one file may lie and still link.
+    pub run_slack: u32,
+    /// Which way a run's matches may step through the file.
+    pub run_order: RunOrder,
     /// The needle gate: the top fraction of probe tokens by summed vote kept.
     pub keep: f32,
     /// Each kept vote raised to this power before it is summed: below 1
@@ -154,6 +167,10 @@ impl Default for FormulaSpec {
             token_weight: TokenWeight::None,
             aggregate: Aggregate::Sum,
             groups: [1.0, 1.0, 1.0],
+            run_bonus: [0.0; 3],
+            run_min: [1; 3],
+            run_slack: 1,
+            run_order: RunOrder::Forward,
             keep: 0.25,
             vote_power: 1.0,
             length_power: 0.0,
@@ -595,9 +612,15 @@ impl Formula {
         k: usize,
         n: usize,
     ) -> Vec<f32> {
+        let s = &self.spec;
+        let runs: [Option<Vec<Vec<usize>>>; FOLD_GROUPS] = std::array::from_fn(|g| {
+            (s.run_bonus[g] != 0.0 || s.run_min[g] > 1)
+                .then(|| run_lengths(ranked, g, k, s.run_slack, s.run_order))
+        });
         let per_token: Vec<Vec<(usize, f32)>> = ranked
             .iter()
-            .map(|groups_of| {
+            .enumerate()
+            .map(|(ti, groups_of)| {
                 let mut out = Vec::new();
                 for (g, r) in groups_of.iter().enumerate() {
                     let w = groups[g];
@@ -606,7 +629,15 @@ impl Formula {
                     }
                     let token = self.token_weight(r, k);
                     for (rank, v) in self.law_votes(r, k) {
-                        let v = w * token * v;
+                        let run = runs[g].as_ref().map_or(1.0, |lens| {
+                            let len = lens[ti][rank];
+                            if len < s.run_min[g] {
+                                0.0
+                            } else {
+                                1.0 + s.run_bonus[g] * (len - 1) as f32
+                            }
+                        });
+                        let v = w * token * v * run;
                         if v > 0.0 {
                             out.push((r.top[rank].0, v));
                         }
@@ -676,7 +707,7 @@ impl Formula {
             .iter()
             .take(k)
             .enumerate()
-            .map(|(rank, &(_, a))| {
+            .map(|(rank, &(_, a, _))| {
                 let z = ((a as f32 - r.mean) / std).max(0.0);
                 let v = match self.spec.vote_law {
                     VoteLaw::ZMargin => z * a.saturating_sub(floor) as f32,
@@ -825,11 +856,54 @@ mod tests {
             Ranked {
                 mean: 50.0,
                 std: 10.0,
-                top: vec![(1, 90), (0, 80), (2, 70)],
+                top: vec![(1, 90, 0), (0, 80, 0), (2, 70, 0)],
             },
             empty.clone(),
             empty,
         ]]
+    }
+
+    /// **A vote in a token run is multiplied by its bonus, and a run too
+    /// short is dropped.** Two tokens each rank file 1 (gallery tokens 10,
+    /// 11: one run of two) and file 0 (tokens 30, 70: two runs of one), at
+    /// z 4 × (90 − 70) = 80 and z 3 × (80 − 70) = 30, over the floor file 2.
+    #[test]
+    fn token_runs_boost_or_gate_a_vote() {
+        let token = |a1: u32, a0: u32| Ranked {
+            mean: 50.0,
+            std: 10.0,
+            top: vec![(1, 90, a1), (0, 80, a0), (2, 70, 0)],
+        };
+        let empty = Ranked {
+            mean: 0.0,
+            std: 1.0,
+            top: Vec::new(),
+        };
+        let ranked = vec![
+            [token(10, 30), empty.clone(), empty.clone()],
+            [token(11, 70), empty.clone(), empty],
+        ];
+        let score = |spec: &str| {
+            Formula::parse(spec).unwrap().raw(
+                &Votes {
+                    content: &[],
+                    calibration: &[],
+                    ranked: Some(&ranked),
+                },
+                &PATHS,
+                &[1, 1, 1],
+            )
+        };
+        let base = "topk: 2\ncalibration: 0\nkeep: 1.0\n";
+        assert_eq!(score(base), vec![60.0, 160.0, 0.0]);
+        assert_eq!(
+            score(&format!("{base}run_bonus: [1.0, 0, 0]")),
+            vec![60.0, 320.0, 0.0]
+        );
+        assert_eq!(
+            score(&format!("{base}run_min: [2, 1, 1]")),
+            vec![0.0, 160.0, 0.0]
+        );
     }
 
     /// **Top-k voting gives each of a token's best files a vote** over the

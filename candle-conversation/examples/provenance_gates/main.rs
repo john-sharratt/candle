@@ -104,6 +104,7 @@ mod judge;
 mod lab;
 mod lab_formula;
 mod lab_probes;
+mod lab_runs;
 mod layers_gate;
 mod momentum_gate;
 mod norm_probe;

@@ -356,8 +356,9 @@ pub fn group_votes(
 pub struct Ranked {
     pub mean: f32,
     pub std: f32,
-    /// `(file, its best token's agreement)`, best first, ties by file id.
-    pub top: Vec<(usize, u32)>,
+    /// `(file, its best token's agreement, that gallery token)`, best first,
+    /// ties by file id.
+    pub top: Vec<(usize, u32, u32)>,
 }
 
 /// [`group_votes`]' scan, keeping each usable probe token's best `k` files per
@@ -383,12 +384,12 @@ pub fn group_ranked(
     let usable: Vec<&WideQSig> = probe.iter().filter(|q| q.words.len() >= need).collect();
     let nq = usable.len();
     // Best first, ties by file id, at most `k`.
-    let keep = |mut v: Vec<(u32, usize)>| {
+    let keep = |mut v: Vec<(u32, usize, u32)>| {
         v.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         v.truncate(k);
         v
     };
-    type Acc = (u64, u64, Vec<(u32, usize)>);
+    type Acc = (u64, u64, Vec<(u32, usize, u32)>);
     let merged: Vec<Acc> = slices(token_file)
         .into_par_iter()
         .map(|range| {
@@ -425,7 +426,7 @@ pub fn group_ranked(
                         o.1 += s.sumsq;
                         let found = (0..width).filter_map(|lf| {
                             let (m, t) = best[(qi * width + lf) * FOLD_GROUPS + g];
-                            (t != u32::MAX).then_some((m, lo + lf))
+                            (t != u32::MAX).then_some((m, lo + lf, t))
                         });
                         o.2 = keep(o.2.drain(..).chain(found).collect());
                     }
@@ -457,7 +458,7 @@ pub fn group_ranked(
                 Ranked {
                     mean,
                     std: var.sqrt(),
-                    top: top.iter().map(|&(m, f)| (f, m)).collect(),
+                    top: top.iter().map(|&(m, f, t)| (f, m, t)).collect(),
                 }
             })
         })
@@ -770,6 +771,10 @@ mod tests {
                 assert!(r.top.windows(2).all(|w| w[0].1 >= w[1].1));
                 let vote = v[g].expect("every token votes in this gallery");
                 assert_eq!(r.top[0].0, vote.file);
+                assert_eq!(r.top[0].2 as usize, vote.token, "the vote's own token");
+                for &(f, _, t) in &r.top {
+                    assert_eq!(token_file[t as usize], f, "each file's token is its own");
+                }
                 let z = ((r.top[0].1 as f32 - r.mean) / r.std).max(0.0);
                 let w = z * r.top[0].1.saturating_sub(r.top[1].1) as f32;
                 assert!(
