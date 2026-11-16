@@ -7,32 +7,44 @@
 //! (the question's wide-Q, as a chat's opening captures it) and production's
 //! own pick ([`crate::lab_probes`]), and `/scan` for the raw per-token,
 //! per-fold-group votes of the content and the calibration competitions on
-//! the daemon's GPU gallery ([`crate::remote_gallery`]). Both are cached on
-//! disk. Everything after that — gating, weighing, correcting, ranking — is
-//! the formula's ([`crate::lab_formula`]), on the host, in milliseconds.
+//! the daemon's GPU gallery ([`crate::remote_gallery`]). A fixed sample of
+//! other files' calibration questions is scanned the same way, as the
+//! background a file is read against when it scores on a question that is
+//! not about it. All of it is cached on disk. Everything after that — fusing,
+//! gating, correcting, ranking — is the formula's ([`crate::lab_formula`]),
+//! on the host, in milliseconds.
+//!
+//! The formula file holds one formula, or `variants:` — named formulas each
+//! scored to one summary line, for a sweep.
 //!
 //! Judged against each question's `files` in the battery: where the files
 //! that answer it rank, whether one is in the top `budget_files`, and what
 //! production placed for the same probe.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
+use candle_conversation::projection::TimelineId;
+use candle_conversation::provenance::WideQSig;
+use candle_conversation::substrate::Substrate;
 use serde::Deserialize;
 
 use crate::corpus::File;
-use crate::lab_formula::Formula;
+use crate::lab_formula::{Formula, FormulaSpec, Sample, TokenVote, Votes};
 use crate::lab_probes::{probed, Probed};
 use crate::ranking::order;
 use crate::remote_gallery::{Daemon, Questions, RemoteGallery};
-use crate::sweep::TokenVotes;
 
 /// How often the formula file is looked at in `--watch`.
 const POLL: Duration = Duration::from_millis(400);
+
+/// Background probes: one calibration question from every this-many-th
+/// calibrated file.
+const BACKGROUND_STRIDE: usize = 60;
 
 /// A battery question, as the lab reads it.
 #[derive(Deserialize)]
@@ -49,18 +61,52 @@ struct Battery {
     questions: Vec<BatteryQuestion>,
 }
 
+/// A formula file: one formula, or named variants.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FormulaFile {
+    Variants {
+        variants: BTreeMap<String, FormulaSpec>,
+    },
+    One(FormulaSpec),
+}
+
+/// One probe's votes in both competitions, as the daemon scanned them.
+struct Scanned {
+    content: Vec<TokenVote>,
+    calibration: Vec<TokenVote>,
+}
+
+impl Scanned {
+    fn votes(&self) -> Votes<'_> {
+        Votes {
+            content: &self.content,
+            calibration: &self.calibration,
+        }
+    }
+}
+
 /// One question, probed and scanned: what every formula scores.
-pub struct Asked {
-    pub id: String,
-    pub category: String,
+struct Asked {
+    id: String,
+    category: String,
     /// The files that answer it, by index; empty when no file does.
-    pub answers: Vec<usize>,
+    answers: Vec<usize>,
     /// Answer paths no loaded file holds.
-    pub missing: Vec<String>,
-    pub content: TokenVotes,
-    pub calibration: TokenVotes,
+    missing: Vec<String>,
+    scanned: Scanned,
     /// Production's pick, by file index, best first.
-    pub placed: Vec<usize>,
+    placed: Vec<usize>,
+}
+
+/// Everything a formula is scored against.
+struct Bench<'a> {
+    asked: Vec<Asked>,
+    /// Other files' calibration questions, each with the file it is about.
+    background: Vec<(usize, Scanned)>,
+    paths: Vec<&'a str>,
+    tokens: Vec<usize>,
+    chain: HashSet<usize>,
 }
 
 /// The files of `files` whose path is `answer` within its repository: the
@@ -80,8 +126,52 @@ pub fn answer_files(files: &[File], answer: &str) -> Vec<usize> {
         .collect()
 }
 
+/// The files of `files` that are links of the priming chain: every ancestor
+/// any file inherits. Every conversation opens on them already.
+pub fn chain_files(sub: &Substrate, files: &[File]) -> HashSet<usize> {
+    let mut ancestors: HashSet<u64> = HashSet::new();
+    for f in files {
+        if let Some(tl) = TimelineId::from_raw(f.timeline) {
+            ancestors.extend(
+                sub.inherited_chain(tl)
+                    .into_iter()
+                    .filter(|a| *a != tl)
+                    .map(|a| a.raw()),
+            );
+        }
+    }
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| ancestors.contains(&f.timeline))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// `probe`'s votes in both competitions on the daemon's gallery, its own
+/// calibration question `own` — `(file, question)` — left out.
+fn scan(
+    gpu: &RemoteGallery,
+    probe: &[WideQSig],
+    own: Option<(usize, usize)>,
+) -> anyhow::Result<Scanned> {
+    let content = gpu
+        .votes(&[probe], &|_, _| false, Questions::Without, &|_, _| false)?
+        .remove(0);
+    let calibration = gpu
+        .votes(&[probe], &|_, _| true, Questions::With, &|f, q| {
+            Some((f, q)) == own
+        })?
+        .remove(0);
+    Ok(Scanned {
+        content,
+        calibration,
+    })
+}
+
 pub fn run(
     files: &[File],
+    chain: HashSet<usize>,
     battery: &Path,
     formula_path: &Path,
     watch: bool,
@@ -102,22 +192,7 @@ pub fn run(
     for q in &battery.questions {
         let Probed { probe, placed } =
             probed(daemon, &q.question).with_context(|| format!("probing {}", q.id))?;
-        let content = gpu
-            .votes(
-                &[probe.as_slice()],
-                &|_, _| false,
-                Questions::Without,
-                &|_, _| false,
-            )?
-            .remove(0);
-        let calibration = gpu
-            .votes(
-                &[probe.as_slice()],
-                &|_, _| true,
-                Questions::With,
-                &|_, _| false,
-            )?
-            .remove(0);
+        let scanned = scan(&gpu, &probe, None)?;
         let mut answers = Vec::new();
         let mut missing = Vec::new();
         for a in &q.files {
@@ -131,41 +206,54 @@ pub fn run(
             category: q.category.clone(),
             answers,
             missing,
-            content,
-            calibration,
+            scanned,
             placed: placed
                 .iter()
                 .filter_map(|tl| by_timeline.get(tl).copied())
                 .collect(),
         });
     }
+    let calibrated: Vec<usize> = (0..files.len())
+        .filter(|&f| !files[f].questions.is_empty())
+        .collect();
+    let mut background = Vec::new();
+    for &f in calibrated.iter().step_by(BACKGROUND_STRIDE) {
+        let q = &files[f].questions[0];
+        background.push((f, scan(&gpu, q.body_sigs(), Some((f, 0)))?));
+    }
     println!(
-        "lab: {} questions probed and scanned in {:.1}s — formula {}",
+        "lab: {} questions and {} background probes scanned in {:.1}s, {} chain files — formula {}",
         asked.len(),
+        background.len(),
         t.elapsed().as_secs_f64(),
+        chain.len(),
         formula_path.display()
     );
     for a in asked.iter().filter(|a| !a.missing.is_empty()) {
         println!("  {}: no loaded file is {:?}", a.id, a.missing);
     }
+    let bench = Bench {
+        asked,
+        background,
+        paths: files
+            .iter()
+            .map(|f| f.path.as_deref().unwrap_or(""))
+            .collect(),
+        tokens: files
+            .iter()
+            .map(|f| f.turns.iter().map(|t| t.sigs.len()).sum())
+            .collect(),
+        chain,
+    };
 
-    let paths: Vec<&str> = files
-        .iter()
-        .map(|f| f.path.as_deref().unwrap_or(""))
-        .collect();
-    let tokens: Vec<usize> = files
-        .iter()
-        .map(|f| f.turns.iter().map(|t| t.sigs.len()).sum())
-        .collect();
     let mut seen: Option<SystemTime> = None;
     loop {
         let stamp = fs::metadata(formula_path).and_then(|m| m.modified()).ok();
         if seen.is_none() || stamp != seen {
             seen = stamp.or(Some(SystemTime::UNIX_EPOCH));
             let text = fs::read_to_string(formula_path).unwrap_or_default();
-            match Formula::parse(&text) {
-                Ok(formula) => report(&formula, &asked, &paths, &tokens),
-                Err(e) => println!("\nformula refused: {e:#}"),
+            if let Err(e) = score_file(&bench, &text) {
+                println!("\nformula refused: {e:#}");
             }
         }
         if !watch {
@@ -175,28 +263,79 @@ pub fn run(
     }
 }
 
-/// Every question scored under `formula`, ranked and judged.
-fn report(formula: &Formula, asked: &[Asked], paths: &[&str], tokens: &[usize]) {
-    let t = Instant::now();
-    let raw: Vec<Vec<f32>> = asked
+/// Score the formula file `text` holds: one formula in detail, or each named
+/// variant to a summary line.
+fn score_file(bench: &Bench, text: &str) -> anyhow::Result<()> {
+    let file: FormulaFile = if text.trim().is_empty() {
+        FormulaFile::One(FormulaSpec::default())
+    } else {
+        serde_yaml::from_str(text)?
+    };
+    match file {
+        FormulaFile::One(spec) => {
+            let formula = Formula::new(spec)?;
+            let t = Instant::now();
+            let judged = judge(bench, &formula, true);
+            println!("\n── formula scored in {} ms ──", t.elapsed().as_millis());
+            println!("{}", summary(&judged, formula.spec.budget_files));
+        }
+        FormulaFile::Variants { variants } => {
+            println!("\n── {} variants ──", variants.len());
+            for (name, spec) in variants {
+                let formula = Formula::new(spec).with_context(|| format!("variant {name}"))?;
+                let judged = judge(bench, &formula, false);
+                println!("{name:<28} {}", summary(&judged, formula.spec.budget_files));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One question's judgement: the best answer file's rank, the answer files in
+/// the budget, the answer files, production's answer files placed, and the
+/// documents in the budget.
+struct Judged {
+    best: usize,
+    covered: usize,
+    answers: usize,
+    prod: usize,
+    docs: usize,
+}
+
+/// Every question scored under `formula` and judged; with `detail`, a line
+/// each.
+fn judge(bench: &Bench, formula: &Formula, detail: bool) -> Vec<Judged> {
+    let raw: Vec<Vec<f32>> = bench
+        .asked
         .iter()
-        .map(|a| formula.raw(&a.content, &a.calibration, paths, tokens))
+        .map(|a| formula.raw(&a.scanned.votes(), &bench.paths, &bench.tokens))
         .collect();
-    let scored = formula.corrected(&raw);
+    let background: Vec<Sample> = bench
+        .background
+        .iter()
+        .map(|(f, s)| Sample {
+            about: Some(*f),
+            scores: formula.raw(&s.votes(), &bench.paths, &bench.tokens),
+        })
+        .collect();
+    let scored = formula.corrected(&raw, &background);
     let budget = formula.spec.budget_files;
     let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-
-    println!("\n── formula scored in {} ms ──", t.elapsed().as_millis());
-    println!(
-        "{:<4} {:<13} {:>6} {:>7} {:>6}   top files (answers marked *)",
-        "id", "category", "best", "in top", "prod"
-    );
+    if detail {
+        println!(
+            "{:<4} {:<13} {:>6} {:>7} {:>6} {:>6} {:>9}  top files (answers marked *)",
+            "id", "category", "best", "in top", "prod", "scored", "answer"
+        );
+    }
     let mut judged = Vec::new();
-    for (a, s) in asked.iter().zip(&scored) {
+    for (a, s) in bench.asked.iter().zip(&scored) {
         if a.answers.is_empty() {
             continue;
         }
-        let ranked = order(s);
+        let ranked: Vec<usize> = order(s)
+            .into_iter()
+            .filter(|&f| formula.ranks(f, bench.paths[f], &bench.chain))
+            .collect();
         let rank_of = |f: usize| {
             ranked
                 .iter()
@@ -211,41 +350,61 @@ fn report(formula: &Formula, asked: &[Asked], paths: &[&str], tokens: &[usize]) 
             .unwrap_or(usize::MAX);
         let covered = a.answers.iter().filter(|&&f| rank_of(f) <= budget).count();
         let prod = a.answers.iter().filter(|f| a.placed.contains(f)).count();
-        let top: Vec<String> = ranked
-            .iter()
-            .take(5)
-            .map(|&f| {
-                let mark = if a.answers.contains(&f) { "*" } else { "" };
-                format!("{mark}{}", short(paths[f]))
-            })
-            .collect();
-        println!(
-            "{:<4} {:<13} {:>6} {:>4}/{:<2} {:>3}/{:<2}  {}",
-            a.id,
-            a.category,
-            best,
-            covered,
-            a.answers.len(),
-            prod,
-            a.answers.len(),
-            top.join(", ")
-        );
         let docs = ranked
             .iter()
             .take(budget)
-            .filter(|&&f| is_document(paths[f]))
+            .filter(|&&f| is_document(bench.paths[f]))
             .count();
-        judged.push((best, covered, a.answers.len(), prod, docs));
+        if detail {
+            let top: Vec<String> = ranked
+                .iter()
+                .take(5)
+                .map(|&f| {
+                    let mark = if a.answers.contains(&f) { "*" } else { "" };
+                    format!("{mark}{}", short(bench.paths[f]))
+                })
+                .collect();
+            let scoring = ranked.iter().filter(|&&f| s[f] > 0.0).count();
+            let best_score = a.answers.iter().map(|&f| s[f]).fold(0.0f32, f32::max);
+            println!(
+                "{:<4} {:<13} {:>6} {:>4}/{:<2} {:>3}/{:<2} {:>6} {:>9.1}  {}",
+                a.id,
+                a.category,
+                best,
+                covered,
+                a.answers.len(),
+                prod,
+                a.answers.len(),
+                scoring,
+                best_score,
+                top.join(", ")
+            );
+        }
+        judged.push(Judged {
+            best,
+            covered,
+            answers: a.answers.len(),
+            prod,
+            docs,
+        });
     }
+    judged
+}
+
+/// The summary line for `judged` at `budget`.
+fn summary(judged: &[Judged], budget: usize) -> String {
     let n = judged.len().max(1) as f32;
-    let hit = |k: usize| judged.iter().filter(|j| j.0 <= k).count() as f32 / n;
-    let mrr = judged.iter().map(|j| 1.0 / j.0 as f32).sum::<f32>() / n;
-    let coverage = judged.iter().map(|j| j.1 as f32 / j.2 as f32).sum::<f32>() / n;
-    let prod_hit = judged.iter().filter(|j| j.3 > 0).count() as f32 / n;
-    let docs = judged.iter().map(|j| j.4 as f32).sum::<f32>() / (n * budget as f32);
-    println!(
-        "\n{} questions: hit@1 {:.2}  hit@5 {:.2}  hit@{budget} {:.2}  MRR {:.3}  answer files in top \
-         {budget} {:.2}  documents in top {budget} {:.2}  | production placed an answer {:.2}",
+    let hit = |k: usize| judged.iter().filter(|j| j.best <= k).count() as f32 / n;
+    let mrr = judged.iter().map(|j| 1.0 / j.best as f32).sum::<f32>() / n;
+    let coverage = judged
+        .iter()
+        .map(|j| j.covered as f32 / j.answers as f32)
+        .sum::<f32>()
+        / n;
+    let prod = judged.iter().filter(|j| j.prod > 0).count() as f32 / n;
+    let docs = judged.iter().map(|j| j.docs as f32).sum::<f32>() / (n * budget as f32);
+    format!(
+        "n {}  hit@1 {:.2}  hit@5 {:.2}  hit@{budget} {:.2}  MRR {:.3}  cover {:.2}  docs {:.2}  | prod {:.2}",
         judged.len(),
         hit(1),
         hit(5),
@@ -253,8 +412,8 @@ fn report(formula: &Formula, asked: &[Asked], paths: &[&str], tokens: &[usize]) 
         mrr,
         coverage,
         docs,
-        prod_hit
-    );
+        prod
+    )
 }
 
 /// Whether `path` is prose rather than code — what the type shares call docs.
@@ -301,5 +460,20 @@ mod tests {
         assert!(is_document("candle/docs/notes.txt"));
         assert!(!is_document("candle/zend/src/lib.rs"));
         assert!(!is_document("candle/zend/src/prompts/projection.yaml"));
+    }
+
+    /// **A formula file is one formula or named variants.**
+    #[test]
+    fn a_formula_file_is_one_formula_or_named_variants() {
+        let one: FormulaFile = serde_yaml::from_str("keep: 0.5").unwrap();
+        assert!(matches!(one, FormulaFile::One(s) if s.keep == 0.5));
+        let many: FormulaFile =
+            serde_yaml::from_str("variants:\n  a: { keep: 0.5 }\n  b: { hub: divide }\n").unwrap();
+        match many {
+            FormulaFile::Variants { variants } => {
+                assert_eq!(variants.keys().cloned().collect::<Vec<_>>(), ["a", "b"]);
+            }
+            FormulaFile::One(_) => panic!("variants read as one formula"),
+        }
     }
 }

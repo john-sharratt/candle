@@ -318,6 +318,7 @@ fn main() -> anyhow::Result<()> {
             };
             lab::run(
                 &files,
+                lab::chain_files(&sub, &files),
                 &PathBuf::from(battery),
                 &PathBuf::from(formula),
                 watch,
