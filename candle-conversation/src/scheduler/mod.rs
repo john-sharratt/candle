@@ -12504,10 +12504,12 @@ impl Scheduler {
                 .move_recurrent(view_id.0, parent_id.0)
                 .map_err(ConversationError::Model)
         );
+        let move_us = t_free.elapsed().as_micros() as u64;
         // The parent has the turn's state now. Until here the old view stayed
         // registered, so a failure above could hand back a state it held
         // (`abandon_reprojection`).
         self.turn_views.remove(&view_id);
+        let t_free_view = Instant::now();
         or_abandon!(
             self,
             view_id,
@@ -12518,6 +12520,8 @@ impl Scheduler {
                 .free_sequence(view_id.0)
                 .map_err(ConversationError::Model)
         );
+        let free_view_us = t_free_view.elapsed().as_micros() as u64;
+        let t_release = Instant::now();
         or_abandon!(
             self,
             view_id,
@@ -12528,6 +12532,8 @@ impl Scheduler {
                 .release_sequence(view_id.0)
                 .map_err(ConversationError::Model)
         );
+        let release_us = t_release.elapsed().as_micros() as u64;
+        let t_truncate = Instant::now();
 
         // Cut the parent back to the pieces its last assembly placed — the
         // active turn it also holds past them was captured above from the
@@ -12544,6 +12550,7 @@ impl Scheduler {
                 .truncate_sequence_to_blocks(parent_id.0, view_state.turn_start_parent_blocks)
                 .map_err(ConversationError::Model)
         );
+        let truncate_us = t_truncate.elapsed().as_micros() as u64;
         // Reset the slot_tokens diagnostic log so it stays in sync with
         // the post-rebuild slot contents.  apply_projection re-populates
         // it with the new prefix's tokens; the active turn tokens get
@@ -12610,7 +12617,9 @@ impl Scheduler {
             format!(
                 "view={} warm_us={warm_us} score_us={score_us} observe_us={observe_us} \
                  identity_us={identity_us} snapshot_us={snapshot_us} seal_us={seal_us} \
-                 free_us={free_us} build_us={} probe_tokens={}",
+                 free_us={free_us} (move_us={move_us} free_view_us={free_view_us} \
+                 release_us={release_us} truncate_us={truncate_us}) build_us={} \
+                 probe_tokens={}",
                 view_id.0,
                 t_build.elapsed().as_micros(),
                 probe.len(),
