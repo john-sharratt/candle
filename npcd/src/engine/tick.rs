@@ -192,6 +192,9 @@ pub struct Inbox {
     /// `None` until the first one, which is a different fact from "a long time
     /// ago" and is shown as such.
     last_act_at: Option<Duration>,
+    /// World time (ms) of the last tick that produced acts — the other half
+    /// of what [`Inbox::quiet_for`] measures quiet from.
+    last_act_ms: u64,
     /// Set when the tick that is still running has already decided when the
     /// next one is — by pausing, or by asking the world something it must come
     /// back to read.
@@ -249,6 +252,7 @@ impl Inbox {
             ticks: 0,
             events_seen: 0,
             last_act_at: None,
+            last_act_ms: 0,
             scheduled: false,
             owed: false,
             replayed: 0,
@@ -333,10 +337,17 @@ impl Inbox {
     /// every moment, and that situation is a fact about the room rather than an
     /// event asking for a response. Speech and things that happened nearby are
     /// news; where you are, time passing, and the standing task itself are not.
+    ///
+    /// **What a conversation settled is news.** It is what a person asked for
+    /// on the phone, told to the mind that does it. Left out, it moved no
+    /// clock: Zen's mind was handed "survey the house network and report" and,
+    /// in the same turn and again ninety seconds on, its idle thought —
+    /// "Nothing calls for you this moment… rest" — and it rested.
     fn is_news(kind: &EventKind) -> bool {
         matches!(
             kind,
             EventKind::Speech { .. }
+                | EventKind::Concluded { .. }
                 | EventKind::Description { .. }
                 | EventKind::Announcement { .. }
                 | EventKind::Terminal { .. }
@@ -377,7 +388,12 @@ impl Inbox {
         if self.queue.iter().any(|e| Self::is_news(&e.kind)) {
             return 0;
         }
-        world_ms.saturating_sub(self.last_news_ms)
+        // **A character that has just acted has something going on.** What an
+        // act came back with rides on the conversation, not in the queue, so a
+        // character working through a request one act at a time received no
+        // news at all while it worked — and was told mid-task that nothing
+        // called for it.
+        world_ms.saturating_sub(self.last_news_ms.max(self.last_act_ms))
     }
 
     /// Whether the standing task is due: `after_ms` without news, **and**
@@ -1314,6 +1330,7 @@ impl Scheduler {
         // keep counting through those or it answers a different question.
         if !acts.is_empty() {
             inbox.last_act_at = Some(self.born.elapsed());
+            inbox.last_act_ms = inbox.last_act_ms.max(world_ms);
         }
 
         inbox.ticks += 1;
@@ -2561,6 +2578,55 @@ mod tests {
             !s.nudge_due(1, T0 + AFTER + 10_000, AFTER),
             "ten seconds after being spoken to"
         );
+    }
+
+    /// **A character doing what it was asked on the phone is not told that
+    /// nothing calls for it.** What the conversation settled is news, and each
+    /// act it takes afterwards keeps it out of the quiet the standing task
+    /// waits for; once it has stopped for a full cadence, the task is due.
+    #[test]
+    fn a_settled_conversation_and_the_acts_after_it_hold_the_standing_task_off() {
+        const AFTER: u64 = 90_000;
+        const T0: u64 = 1_000_000;
+        let s = sched();
+        s.wake(1, 0, T0);
+        s.deliver(
+            1,
+            T0,
+            Salience::IDLE,
+            EventKind::Nudge {
+                text: "nothing calls for you".into(),
+            },
+        );
+        s.tick(1, 0, T0, |_, _| Vec::new());
+
+        // Long quiet, then the phone: asked to survey the house network.
+        let asked = T0 + 10 * AFTER;
+        assert!(s.nudge_due(1, asked, AFTER));
+        s.deliver(
+            1,
+            asked,
+            Salience::NORMAL,
+            EventKind::Concluded {
+                party: "John".into(),
+                applied: "Meaning to: survey the house network and report.".into(),
+            },
+        );
+        assert!(!s.nudge_due(1, asked, AFTER), "unread, it is news");
+        s.tick(1, 0, asked, |_, _| vec!["terminal_connect".into()]);
+        assert!(!s.nudge_due(1, asked + 60_000, AFTER));
+
+        // A slow turn later it acts again, past a cadence from the request.
+        let surveyed = asked + 80_000;
+        s.think_again(1);
+        s.tick(1, 0, surveyed, |_, _| vec!["survey_network".into()]);
+        assert!(
+            !s.nudge_due(1, asked + AFTER + 5_000, AFTER),
+            "mid-task, a cadence after the request"
+        );
+
+        // Done and gone quiet: the standing task comes round again.
+        assert!(s.nudge_due(1, surveyed + AFTER, AFTER));
     }
 
     /// **The active summons reaches a character deep in conversation, where the
