@@ -5,7 +5,8 @@
 //! no harness rebuilt. Every field has production's value as its default, so
 //! an empty file scores as today's belief scan does.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::iter::once;
 
 use regex::Regex;
 use serde::Deserialize;
@@ -66,6 +67,25 @@ pub struct FormulaSpec {
     pub exclude: Vec<String>,
     /// Per-path multipliers, first match wins; a path matching none is ×1.
     pub types: Vec<TypeWeight>,
+    /// Compare each file first against files of its own kind — its
+    /// extension — so a kind that scores on everything starts no higher than
+    /// one that scores on little, with no weight set by hand.
+    pub type_norm: TypeNorm,
+}
+
+/// How a file is read against files of its own kind (its extension).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeNorm {
+    /// Not at all.
+    None,
+    /// Divided by the mean of its kind's scoring files on this question.
+    QuestionMean,
+    /// As a z-score among its kind's scoring files on this question.
+    QuestionZ,
+    /// Divided by its kind's mean score on the background probes — how loud
+    /// that kind is on questions that are not about it.
+    BackgroundMean,
 }
 
 impl Default for FormulaSpec {
@@ -85,8 +105,15 @@ impl Default for FormulaSpec {
             exclude_chain: false,
             exclude: Vec::new(),
             types: Vec::new(),
+            type_norm: TypeNorm::None,
         }
     }
+}
+
+/// A path's kind: its extension, or the empty kind for a path with none.
+pub fn kind_of(path: &str) -> &str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.rsplit_once('.').map_or("", |(_, ext)| ext)
 }
 
 /// How the fold groups' votes combine into a file's score.
@@ -275,6 +302,82 @@ impl Formula {
                                 surprise(x, against)
                             }
                             Hub::None => x,
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `scored` read against each file's kind as [`FormulaSpec::type_norm`]
+    /// says: per question, over the kind's scoring files there; or over the
+    /// kind's scores on the `background` probes. A kind with nothing to be
+    /// read against leaves its files as they are; a score of no evidence
+    /// stays zero.
+    pub fn kind_normalized(
+        &self,
+        scored: &[Vec<f32>],
+        background: &[Sample],
+        paths: &[&str],
+    ) -> Vec<Vec<f32>> {
+        let kinds: Vec<&str> = paths.iter().map(|p| kind_of(p)).collect();
+        let stats = |rows: &mut dyn Iterator<Item = &Vec<f32>>| {
+            let mut by_kind: HashMap<&str, (f32, f32, usize)> = HashMap::new();
+            for row in rows {
+                for (f, &x) in row.iter().enumerate() {
+                    if x > 0.0 {
+                        let e = by_kind.entry(kinds[f]).or_default();
+                        e.0 += x;
+                        e.1 += x * x;
+                        e.2 += 1;
+                    }
+                }
+            }
+            by_kind
+        };
+        let background_stats = match self.spec.type_norm {
+            TypeNorm::BackgroundMean => stats(&mut background.iter().map(|s| &s.scores)),
+            _ => HashMap::new(),
+        };
+        scored
+            .iter()
+            .map(|row| {
+                let per_question = match self.spec.type_norm {
+                    TypeNorm::QuestionMean | TypeNorm::QuestionZ => stats(&mut once(row)),
+                    _ => HashMap::new(),
+                };
+                row.iter()
+                    .enumerate()
+                    .map(|(f, &x)| {
+                        if x <= 0.0 {
+                            // Below every scoring file, whatever its z.
+                            return if self.spec.type_norm == TypeNorm::QuestionZ {
+                                f32::MIN
+                            } else {
+                                x
+                            };
+                        }
+                        let k = kinds[f];
+                        match self.spec.type_norm {
+                            TypeNorm::None => x,
+                            TypeNorm::QuestionMean => match per_question.get(k) {
+                                Some(&(sum, _, n)) => x / (sum / n as f32),
+                                None => x,
+                            },
+                            // A kind's lone scoring file is its kind's
+                            // average: z 0.
+                            TypeNorm::QuestionZ => match per_question.get(k) {
+                                Some(&(sum, sq, n)) if n > 1 => {
+                                    let mean = sum / n as f32;
+                                    let var = (sq / n as f32 - mean * mean).max(0.0);
+                                    (x - mean) / var.sqrt().max(f32::EPSILON)
+                                }
+                                _ => 0.0,
+                            },
+                            TypeNorm::BackgroundMean => match background_stats.get(k) {
+                                Some(&(sum, _, n)) => x / (sum / n as f32),
+                                None => x,
+                            },
                         }
                     })
                     .collect()
@@ -616,6 +719,51 @@ mod tests {
         // Inside the background: the tail alone. 9 samples ≥ 20 of 9 reads
         // −ln(10/10) = 0.
         assert_eq!(surprise(20.0, &loud), 0.0);
+    }
+
+    /// **A kind is a path's extension**; a path with none is the empty kind.
+    #[test]
+    fn a_kind_is_the_extension() {
+        assert_eq!(kind_of("candle/docs/x.md"), "md");
+        assert_eq!(kind_of("candle/zend/src/lib.rs"), "rs");
+        assert_eq!(kind_of("candle/Makefile"), "");
+        assert_eq!(kind_of("candle/.github/x"), "");
+    }
+
+    /// **Read against its kind, a loud kind starts no higher**: documents
+    /// scoring 10 and 20 and code 2 and 4 on one question — divided by their
+    /// kind's mean, each pair reads 2/3 and 4/3; as z-scores −1 and 1; a file
+    /// of no evidence stays 0, or falls below all under z.
+    #[test]
+    fn a_kind_is_read_against_itself() {
+        let paths = ["a.md", "b.md", "c.rs", "d.rs", "e.rs"];
+        let scored = vec![vec![10.0, 20.0, 2.0, 4.0, 0.0]];
+        let mean = Formula::parse("type_norm: question_mean").unwrap();
+        let got = mean.kind_normalized(&scored, &[], &paths);
+        let want = [2.0 / 3.0, 4.0 / 3.0, 2.0 / 3.0, 4.0 / 3.0, 0.0];
+        for (g, w) in got[0].iter().zip(want) {
+            assert!((g - w).abs() < 1e-6, "{got:?}");
+        }
+        let z = Formula::parse("type_norm: question_z").unwrap();
+        assert_eq!(
+            z.kind_normalized(&scored, &[], &paths)[0],
+            vec![-1.0, 1.0, -1.0, 1.0, f32::MIN]
+        );
+        // Against the background: documents average 30 there, code 3.
+        let background = vec![Sample {
+            about: None,
+            scores: vec![30.0, 30.0, 3.0, 3.0, 3.0],
+        }];
+        let bg = Formula::parse("type_norm: background_mean").unwrap();
+        let got = bg.kind_normalized(&scored, &background, &paths);
+        assert_eq!(got[0][1], 20.0 / 30.0);
+        assert_eq!(got[0][3], 4.0 / 3.0);
+        assert_eq!(
+            Formula::parse("")
+                .unwrap()
+                .kind_normalized(&scored, &[], &paths),
+            scored
+        );
     }
 
     /// **A chain link or an excluded path takes no part in the ranking.**

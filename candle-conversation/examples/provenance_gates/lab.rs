@@ -418,7 +418,11 @@ fn judge(bench: &Bench, formula: &Formula, detail: bool) -> Vec<Judged> {
             scores: formula.raw(&s.votes(), &bench.paths, &bench.tokens),
         })
         .collect();
-    let scored = formula.corrected(&raw, &background);
+    let scored = formula.kind_normalized(
+        &formula.corrected(&raw, &background),
+        &background,
+        &bench.paths,
+    );
     let budget = formula.spec.budget_files;
     let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
     if detail {
