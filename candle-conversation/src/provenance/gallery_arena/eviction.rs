@@ -92,24 +92,61 @@ pub fn keep_within(upload_us_per_byte: f64, weight_us_per_byte_sec: f64) -> Opti
     Duration::try_from_secs_f64(upload_us_per_byte / weight_us_per_byte_sec).ok()
 }
 
-/// Which cached scan indices have gone idle: those no scan has stored or reused
-/// for more than `idle_ms`. `entries` are `(fingerprint, last use)`, both
-/// times in milliseconds on one clock; the returned fingerprints are the ones
-/// to remove.
+/// Which cached scan indices go before one of `incoming` bytes joins them:
+/// every one no scan has stored or reused for more than `idle_ms`, then, while
+/// the rest and the newcomer are over `cap_bytes`, the least recently used.
+/// `entries` are `(fingerprint, last use, device bytes)`, use in milliseconds
+/// on one clock; the returned fingerprints are the ones to remove.
 ///
-/// **Idleness, never room, decides** (`docs/gallery_residency.md` §5). An index
-/// is about half a percent of the gallery pages it names, and those pages are
-/// held under the gallery's own ceiling, so the cache needs no bound of its
-/// own: a byte budget only ever refused an index the gallery could afford, and
-/// the calibrated `code_reading` index, past the 256 MiB it was given, was
-/// rebuilt on every reprojection (BlackWorld, 2026-11-16). A live reader's
-/// index is never evicted for another's.
-pub fn idle_indexes(entries: &[(u64, u64)], now_ms: u64, idle_ms: u64) -> Vec<u64> {
-    entries
-        .iter()
-        .filter(|&&(_, used)| now_ms.saturating_sub(used) > idle_ms)
-        .map(|&(fp, _)| fp)
-        .collect()
+/// **Idleness first, room only as a backstop** (`docs/gallery_residency.md`
+/// §5). An index addresses pages, a few bytes each, so the cap holds dozens of
+/// even the largest scan's; it exists because the count of distinct indices is
+/// bounded by how fast readers make new segment sets, not by the gallery — a
+/// gate leaving each probe's own turn out built 110 in two minutes, kept
+/// them past the scans that used them, and ran the card out of memory
+/// (BlackWorld, 2026-11-16). Nothing here is exempt: an index is only a cache
+/// of work the next scan can redo, and the pages it names stay resident.
+pub fn index_cache_evictions(
+    entries: &[(u64, u64, u64)],
+    incoming: u64,
+    now_ms: u64,
+    idle_ms: u64,
+    cap_bytes: u64,
+) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut live: Vec<&(u64, u64, u64)> = Vec::new();
+    for e in entries {
+        if now_ms.saturating_sub(e.1) > idle_ms {
+            out.push(e.0);
+        } else {
+            live.push(e);
+        }
+    }
+    live.sort_by_key(|&&(_, used, _)| used);
+    let mut held: u64 = live.iter().map(|&&(_, _, b)| b).sum();
+    for &&(fp, _, bytes) in &live {
+        if held + incoming <= cap_bytes {
+            break;
+        }
+        out.push(fp);
+        held -= bytes;
+    }
+    out
+}
+
+/// The share of a card's memory the cached scan indices may hold together:
+/// one forty-eighth.
+const INDEX_CACHE_SHARE: u64 = 48;
+
+/// The least the cached scan indices may hold, whatever the card.
+const INDEX_CACHE_FLOOR: u64 = 256 << 20;
+
+/// Device bytes the cached scan indices may hold together on a card of
+/// `total` bytes: a forty-eighth of it, never under [`INDEX_CACHE_FLOOR`] —
+/// memory in the driver pool, outside the span, that nothing else accounts
+/// for. ~1.5 GB on the 72 GB card, dozens of the largest scan's index.
+pub fn index_cache_budget(total: u64) -> u64 {
+    (total / INDEX_CACHE_SHARE).max(INDEX_CACHE_FLOOR)
 }
 
 #[cfg(test)]
@@ -118,15 +155,51 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
-    /// **Only an index idle past the limit goes**, however many there are and
-    /// however large: one used within it stays, and one used exactly at it
-    /// does too.
+    /// **An idle index goes, however small**: one used within the limit
+    /// stays, one used exactly at it too, and a cache under its cap loses
+    /// nothing else.
     #[test]
-    fn only_an_idle_index_goes() {
-        let entries = [(1, 100_000), (2, 39_999), (3, 40_000), (4, 0)];
-        assert_eq!(idle_indexes(&entries, 100_000, 60_000), vec![2, 4]);
-        assert!(idle_indexes(&entries, 60_000, 60_000).is_empty());
-        assert!(idle_indexes(&[], 1, 0).is_empty());
+    fn an_idle_index_goes_and_nothing_else_under_the_cap() {
+        let entries = [
+            (1, 100_000, MIB),
+            (2, 39_999, MIB),
+            (3, 40_000, MIB),
+            (4, 0, MIB),
+        ];
+        assert_eq!(
+            index_cache_evictions(&entries, MIB, 100_000, 60_000, 256 * MIB),
+            vec![2, 4]
+        );
+        assert!(index_cache_evictions(&entries, MIB, 60_000, 60_000, 256 * MIB).is_empty());
+        assert!(index_cache_evictions(&[], MIB, 1, 0, 256 * MIB).is_empty());
+    }
+
+    /// **Over the cap, the least recently used live ones go**, after the idle
+    /// ones and only until the newcomer fits.
+    #[test]
+    fn over_the_cap_the_oldest_live_go_until_the_newcomer_fits() {
+        let entries = [
+            (1, 90, 100 * MIB),
+            (2, 30, 100 * MIB),
+            (3, 60, 50 * MIB),
+            (4, 0, 70 * MIB),
+        ];
+        // At 100 with an 80 limit: 4 is idle. 250 held + 60 incoming against
+        // 256: drop the oldest live (2, used 30) and stop — 150 + 60 fits.
+        assert_eq!(
+            index_cache_evictions(&entries, 60 * MIB, 100, 80, 256 * MIB),
+            vec![4, 2]
+        );
+    }
+
+    /// **A forty-eighth of the card, never under 256 MiB** — on each
+    /// development card's reported total.
+    #[test]
+    fn the_index_cache_holds_a_share_of_the_card() {
+        let gib = 1024 * MIB;
+        assert_eq!(index_cache_budget(72 * gib), 1_536 * MIB);
+        assert_eq!(index_cache_budget(24 * gib), 512 * MIB);
+        assert_eq!(index_cache_budget(8 * gib), 256 * MIB, "the floor");
     }
 
     fn turn(lru: u64, idle_s: u64, interval_s: Option<u64>, pinned: bool) -> Resident {

@@ -179,15 +179,17 @@ The finalize reads `seg_tok`, the tokens actually scanned, not the slot range.
   half a page per turn window, ~8% more slots than tokens at today's ~207
   tokens a window. The kernel was never the scan's cost; the rebuild was.
 
-**The cache is bounded by the gallery, not by a byte budget.** An index is a
-fixed small fraction of the pages it names, and those pages are held under the
-gallery's own ceiling, so a byte cap only ever refuses an index the gallery can
-afford — which is how the cap made the scan rebuild. An index is evicted when
-it goes stale (a turn it names is evicted, moved or re-uploaded) or when no scan
-has used it for a minute (`INDEX_IDLE_MS`, `gallery_arena/mod.rs`) — never
-to make room. The cache
-then holds the indices of the readers that are scanning, however many there
-are, and a live reader's index is never rebuilt for want of space.
+**The cache evicts by idleness first, by size only as a backstop.** An index
+goes when it is stale (a turn it names is evicted, moved or re-uploaded) or when
+no scan has used it for a minute (`INDEX_IDLE_MS`, `gallery_arena/mod.rs`). Past
+a forty-eighth of the card (~1.5 GB on the 72 GB card) the least recently used
+go too. With indices a few bytes a page, that holds dozens of even the largest
+scan's, so a live reader's index is evicted only when that many segment sets
+are in use at once. The backstop is needed because the count of distinct
+indices is bounded by how fast readers make new segment sets, not by the
+gallery: a gate that left each probe's own turn out built 110 indices in two
+minutes, kept them past the scans that used them, and ran the card out of
+memory (BlackWorld, 2026-11-16).
 
 ## 6. Seeing it
 

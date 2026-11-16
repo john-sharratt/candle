@@ -140,6 +140,16 @@ pub(super) struct PagedIndex {
 }
 
 impl PagedIndex {
+    /// Device bytes the index's arrays hold — what caching it costs the card,
+    /// outside the span and the arena's own ceiling.
+    pub(super) fn device_bytes(&self) -> u64 {
+        self.device.as_ref().map_or(0, |d| {
+            (d.page_ptr.len() * 8
+                + (d.entry_page.len() + d.entry_slots.len() + d.entry_case.len()) * 4
+                + (d.seg_slot.len() + d.seg_tok.len() + d.seg_case.len()) * 4) as u64
+        })
+    }
+
     /// Whether this index scans every group each segment of a reader weighing
     /// `weighed` (one set per segment) weighs.
     pub(super) fn serves(&self, weighed: &[GroupSet]) -> bool {

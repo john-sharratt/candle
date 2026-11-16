@@ -61,7 +61,7 @@ use candle_nn::kv_cache::{
 use crate::persistence::streams::StreamId;
 
 use dedup::Dedup;
-use eviction::{idle_indexes, past_keep, Resident};
+use eviction::{index_cache_budget, index_cache_evictions, past_keep, Resident};
 use lease::IndexLease;
 
 /// How long a cached scan index stays once no scan stores or reuses it — a
@@ -228,12 +228,17 @@ pub struct GalleryArena {
     /// multi-GPU setups — e.g. mixed Ada/Blackwell — resolve each arena's
     /// backend ladder against its own device.
     tensor_caps: OnceLock<(bool, bool)>,
+    /// Device bytes the cached indices may hold together
+    /// ([`index_cache_budget`] of this arena's card).
+    index_cache_bytes: u64,
     /// Per-scan indices (page_ptr / page entries / seg prefixes) keyed by segment
     /// fingerprint, reused when the same segment set is rescanned and every turn
     /// it references still holds the run it was built against — skipping the
     /// rebuild each reprojection. Keyed (not a single slot) so the several
     /// belief groups scanned per reprojection don't evict each other; an index
-    /// goes when it is stale or idle past [`INDEX_IDLE_MS`], never for room.
+    /// goes when it is stale or idle past [`INDEX_IDLE_MS`], and, as a
+    /// backstop, the least recently used when the cache is past
+    /// [`Self::index_cache_bytes`].
     ///
     /// Validated per turn, not by a device-wide generation: with ingest sealing
     /// turns concurrently, a global generation moved on every scan, and a
@@ -281,6 +286,10 @@ impl GalleryArena {
             candle::bail!("gallery arena requires a CUDA device");
         }
         assert!(n_groups <= GroupSet::MAX, "{n_groups} fold groups");
+        let Device::Cuda(cuda) = device else {
+            candle::bail!("gallery arena requires a CUDA device");
+        };
+        let (_, total) = cuda.mem_get_info()?;
         Ok(Self {
             residency: Mutex::new(HashMap::new()),
             lru_clock: AtomicU64::new(0),
@@ -295,6 +304,7 @@ impl GalleryArena {
             zero_page: Mutex::new(None),
             dedup: Dedup::new(wpt),
             tensor_caps: OnceLock::new(),
+            index_cache_bytes: index_cache_budget(total as u64),
             device: device.clone(),
             wpt,
             n_groups,
@@ -938,17 +948,30 @@ impl GalleryArena {
         self.indexes.store(Arc::new(next));
     }
 
-    /// Cache `idx` under `fingerprint` for reuse, and drop the indices no scan
-    /// has used for [`INDEX_IDLE_MS`] ([`idle_indexes`]) — never one for room.
+    /// Cache `idx` under `fingerprint` for reuse, dropping the indices no scan
+    /// has used for [`INDEX_IDLE_MS`] and, past [`Self::index_cache_bytes`],
+    /// the least recently used ([`index_cache_evictions`]). An index larger
+    /// than the cap on its own is not cached.
     fn store_index(&self, fingerprint: u64, idx: Arc<scan::PagedIndex>) {
         let now_ms = self.since_born_ms();
+        let bytes = idx.device_bytes();
         let mut cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.remove(&fingerprint);
-        let entries: Vec<(u64, u64)> = cache
+        if bytes > self.index_cache_bytes {
+            self.publish_indexes(&cache);
+            return;
+        }
+        let entries: Vec<(u64, u64, u64)> = cache
             .iter()
-            .map(|(&fp, e)| (fp, e.used.load(Ordering::Relaxed)))
+            .map(|(&fp, e)| (fp, e.used.load(Ordering::Relaxed), e.device_bytes()))
             .collect();
-        for fp in idle_indexes(&entries, now_ms, INDEX_IDLE_MS) {
+        for fp in index_cache_evictions(
+            &entries,
+            bytes,
+            now_ms,
+            INDEX_IDLE_MS,
+            self.index_cache_bytes,
+        ) {
             cache.remove(&fp);
         }
         idx.used.store(now_ms, Ordering::Relaxed);
