@@ -26,7 +26,9 @@
 use std::time::Instant;
 
 use candle::{Device, Result};
-use candle_nn::kv_cache::{lift_warm_to_gpu, ChunkedKvBacking, WarmLiftRing};
+use candle_nn::kv_cache::{
+    lift_warm_to_gpu, ChunkedKvBacking, LiftSplit, WarmLiftRing, WarmLifted,
+};
 
 use super::cold_load::ColdLoadStager;
 use crate::projection::{Conversation, SectionId, TurnKey};
@@ -291,6 +293,7 @@ pub fn elevate_to_hot(
     // ── Phase 3: warm → hot (PCIe-bound, batched per layer) ────────────
     //
     let t_warm_hot = Instant::now();
+    let mut warm_split = LiftSplit::default();
     let warm_items: Vec<WarmToHotEntry> = plan
         .warm_to_hot
         .into_iter()
@@ -322,8 +325,9 @@ pub fn elevate_to_hot(
             .map(|_| Vec::with_capacity(n_layers))
             .collect();
         match lifted {
-            Ok(by_layer) => {
-                for layer_hot in by_layer {
+            Ok(WarmLifted { layers, split }) => {
+                warm_split = split;
+                for layer_hot in layers {
                     for (i, h) in layer_hot.into_iter().enumerate() {
                         hot_per_item[i].push(h);
                     }
@@ -397,6 +401,13 @@ pub fn elevate_to_hot(
             warm_items = report.warm_to_hot,
             warm_bytes = report.bytes_warm_to_hot,
             warm_hot_ms,
+            warm_plan_us = warm_split.plan_us,
+            warm_fill_us = warm_split.fill_us,
+            warm_wait_us = warm_split.wait_us,
+            warm_launch_us = warm_split.launch_us,
+            warm_finish_us = warm_split.finish_us,
+            warm_batches = warm_split.batches,
+            warm_entries = warm_split.entries,
             install_ms = t_install.elapsed().as_millis() as u64,
             "elevate_to_hot phases"
         );

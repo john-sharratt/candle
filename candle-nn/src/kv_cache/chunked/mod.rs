@@ -213,7 +213,7 @@ pub use types::{
     DetachedChunks, LiveChunkRef, ProvSource, QSign, SealedChunk, SealedSequence, WriterTail,
 };
 #[cfg(feature = "cuda")]
-pub use warm_lift::{lift_warm_to_gpu, WarmLiftRing};
+pub use warm_lift::{lift_warm_to_gpu, LiftSplit, WarmLiftRing, WarmLifted};
 pub use weight_zone::{
     RetractPlan, WeightZone, WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
 };

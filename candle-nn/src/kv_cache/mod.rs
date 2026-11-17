@@ -123,7 +123,7 @@ pub use chunked::{
 /// The warm lift — RAM → VRAM for an elevate, batched and sync-free
 /// (`docs/warm_lift.md`).
 #[cfg(feature = "cuda")]
-pub use chunked::{lift_warm_to_gpu, WarmLiftRing};
+pub use chunked::{lift_warm_to_gpu, LiftSplit, WarmLiftRing, WarmLifted};
 /// Claimed regions coalesced into contiguous runs — see `chunked::region_runs`.
 pub use chunked::{runs_from, RegionRun};
 /// Fixed-stride slot arenas, one set per span tenant — see `chunked::tenant_arena`.

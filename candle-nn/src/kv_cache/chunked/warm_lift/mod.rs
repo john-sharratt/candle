@@ -18,26 +18,42 @@ mod copiers;
 mod layer;
 mod plan;
 mod ring;
+mod split;
 
 pub use ring::WarmLiftRing;
+pub use split::LiftSplit;
+
+use std::time::Instant;
 
 use candle::cuda_backend::kernels::simple::warm_lift::{run_warm_lift_scatter, WarmLiftEntry};
 use candle::{Device, Result};
+
+/// Blocks of the scatter resident per SM — `SCATTER_BLOCKS_PER_SM` in
+/// `candle-kernels/src/simple/scatter_copy.cuh`, which the kernel's launch
+/// bounds hold its registers to: six blocks of 256 threads, 48 warps, fill an
+/// SM of 1,536 threads.
+const SCATTER_BLOCKS_PER_SM: usize = 6;
 
 use self::copiers::fill_slot;
 use self::plan::{batches, LiftBand};
 use crate::kv_cache::chunked::types::SealedSequence;
 use crate::kv_cache::chunked::ChunkedKvBacking;
 
+/// A lift's result: per layer, the items' sequences at their new GPU
+/// placement, in the order given, and where the host's time went.
+pub struct WarmLifted {
+    pub layers: Vec<Vec<SealedSequence>>,
+    pub split: LiftSplit,
+}
+
 /// Lift `layers[l]` — every item's warm sequence at layer `l` — into VRAM
-/// through `backings[l]`. Returns, per layer, the items' sequences at their
-/// new GPU placement, in the order given.
+/// through `backings[l]`.
 pub fn lift_warm_to_gpu(
     backings: &[ChunkedKvBacking],
     ring: &mut WarmLiftRing,
     device: &Device,
     layers: &[Vec<&SealedSequence>],
-) -> Result<Vec<Vec<SealedSequence>>> {
+) -> Result<WarmLifted> {
     let Device::Cuda(cuda) = device else {
         candle::bail!("warm lift: requires a CUDA device");
     };
@@ -48,6 +64,17 @@ pub fn lift_warm_to_gpu(
             backings.len()
         );
     }
+    // **The lift meets the device eagerly.** On a thread recording a wave,
+    // launches are captured into the wave's segment rather than issued, and a
+    // query of an event invalidates the capture. A lift's launches read ring
+    // slots the host refills as soon as their events say the scatter ran, and
+    // `acquire` asks exactly that — so the lift suspends the capture until it
+    // has issued everything: the recorded segment goes first, and the lift's
+    // launches follow it, in order, on the one stream. Nothing waits for the
+    // device here; only the recording is set aside.
+    let _paused = cuda.pause_capture()?;
+    let mut split = LiftSplit::default();
+    let t = Instant::now();
     let lifts = layers
         .iter()
         .enumerate()
@@ -55,9 +82,19 @@ pub fn lift_warm_to_gpu(
         .collect::<Result<Vec<_>>>()?;
     let bands: Vec<LiftBand> = lifts.iter().flat_map(|l| l.bands.iter().copied()).collect();
     let stream = cuda.cuda_stream();
-    for batch in batches(&bands, ring.slot_bytes(), ring.max_entries())? {
-        let mut slot = ring.acquire(cuda)?;
+    // A few blocks per SM: a warp a run, and enough of them resident to keep
+    // the reads' round trips covered (`scatter_copy.cuh`).
+    let blocks = (cuda.multiprocessor_count()? * SCATTER_BLOCKS_PER_SM) as i32;
+    let cut = batches(&bands, ring.slot_bytes(), ring.max_entries())?;
+    split.plan_us = micros(t);
+    for batch in cut {
+        let t = Instant::now();
+        let mut slot = ring.acquire()?;
+        split.wait_us += micros(t);
+        let t = Instant::now();
         fill_slot(backings, &bands, &batch, slot.payload)?;
+        split.fill_us += micros(t);
+        let t = Instant::now();
         let entries: Vec<WarmLiftEntry> = bands[batch.bands.clone()]
             .iter()
             .zip(&batch.offsets)
@@ -89,17 +126,29 @@ pub fn lift_warm_to_gpu(
                 slot.payload.as_ptr(),
                 table,
                 entries.len() as i32,
+                blocks,
                 stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
         slot.scattered(&stream)?;
+        split.launch_us += micros(t);
+        split.batches += 1;
+        split.entries += entries.len() as u64;
+        split.bytes += entries.iter().map(|e| e.bytes).sum::<u64>();
     }
-    layers
+    let t = Instant::now();
+    let layers = layers
         .iter()
         .zip(&lifts)
         .enumerate()
         .map(|(l, (seqs, lift))| backings[l].finish_warm_lift(seqs, lift))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    split.finish_us = micros(t);
+    Ok(WarmLifted { layers, split })
+}
+
+fn micros(since: Instant) -> u64 {
+    since.elapsed().as_micros() as u64
 }
 
 /// One layer's lift through a ring of its own — what a test of one backing
@@ -117,5 +166,5 @@ pub(crate) fn lift_one(
         device,
         &[sequences.to_vec()],
     )?;
-    Ok(lifted.remove(0))
+    Ok(lifted.layers.remove(0))
 }

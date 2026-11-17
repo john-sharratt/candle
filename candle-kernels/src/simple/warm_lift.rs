@@ -1,7 +1,7 @@
 // FFI binding for the warm lift's scatter kernel (docs/warm_lift.md).
 //
-// `run_warm_lift_scatter` copies every band one pinned ring slot holds into its
-// destination arena slot. `slot` and `table` are the ring slot's mapped pinned
+// `run_warm_lift_scatter` copies every run one pinned ring slot holds into its
+// destination arena slots, a warp a run (`scatter_copy.cuh`). `slot` and `table` are the ring slot's mapped pinned
 // memory, at their host addresses: the kernel reads the payloads and the
 // descriptor table straight from host memory, so nothing is uploaded.
 //
@@ -22,10 +22,13 @@ pub struct WarmLiftEntry {
 }
 
 extern "C" {
+    /// `blocks` of 256 threads at most, a warp a run: the caller sizes it to
+    /// fill the device (a few blocks per SM); the launcher trims it to the runs.
     pub fn run_warm_lift_scatter(
         slot: *const u8,
         table: *const WarmLiftEntry,
         n_entries: i32,
+        blocks: i32,
         stream: *mut c_void,
     );
 }

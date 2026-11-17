@@ -14,7 +14,7 @@ use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaStream};
 use candle::cuda_backend::kernels::simple::warm_lift::WarmLiftEntry;
 use candle::cuda_backend::WrapErr;
 use candle::quantized::pinned_staging::PinnedBuf;
-use candle::{CudaDevice, Result};
+use candle::Result;
 
 /// The smallest piece a kernel pulling pinned memory moves at the link's rate:
 /// an 819,200 B projection at ≈ 11.9 GB/s (`docs/moe_live_dispatch_design.md`
@@ -91,16 +91,16 @@ impl WarmLiftRing {
     /// region and its table region, both writable. The wait is the ring's
     /// only one, and a slot no scatter has read since it was last filled has
     /// nothing to wait for.
-    pub(crate) fn acquire(&mut self, device: &CudaDevice) -> Result<SlotFill<'_>> {
+    ///
+    /// Queries and waits on an event, which invalidate a wave capture: the
+    /// caller holds the capture paused (`lift_warm_to_gpu` does, for the whole
+    /// lift).
+    pub(crate) fn acquire(&mut self) -> Result<SlotFill<'_>> {
         let k = self.next;
         self.next = (self.next + 1) % SLOTS;
         let slot = &mut self.slots[k];
         if let Some(event) = slot.read.as_ref() {
             if !event.is_complete() {
-                // An event wait is host protocol, refused on a thread recording
-                // a wave; a lift never runs inside one, and the pause makes that
-                // a no-op rather than an assumption.
-                let _paused = device.pause_capture()?;
                 event.synchronize().w()?;
             }
         }
