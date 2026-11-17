@@ -2,15 +2,19 @@
 //! kernel drains the other (`docs/warm_lift.md` §3.2).
 //!
 //! Each slot is mapped, write-combined pinned memory — the CPU only writes it,
-//! the kernel only reads it, at its host address — holding a slot's payloads
-//! and, behind them, its descriptor table. Allocated once and never grown:
+//! the kernel only reads it — holding a slot's payloads and, behind them, its
+//! descriptor table. The kernel is handed the slot's **device** address, from
+//! `cuMemHostGetDevicePointer`, never its host address: under TCC the two
+//! coincide, under WDDM they do not, and a host address read on the device is
+//! `CUDA_ERROR_ILLEGAL_ADDRESS` (WhiteWorld, every first lift, 17 November
+//! 2026). Allocated once and never grown:
 //! pinned host memory is the expert weights' tier, and what the lift takes of it
 //! is this fixed number.
 //!
 //! A slot carries the event recorded after the scatter that read it. Refilling
 //! a slot waits on that event, and that is the only wait the lift has.
 
-use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaStream};
+use candle::cuda_backend::cudarc::driver::{sys, CudaEvent, CudaStream};
 use candle::cuda_backend::kernels::simple::warm_lift::WarmLiftEntry;
 use candle::cuda_backend::WrapErr;
 use candle::quantized::pinned_staging::PinnedBuf;
@@ -35,11 +39,23 @@ const BYTES_PER_ENTRY_BOUND: usize = 256;
 /// The two slots.
 const SLOTS: usize = 2;
 
-/// One slot: its memory, and the event recorded after the last scatter that
-/// read it.
+/// One slot: its memory, the device address the kernel reads it at, and the
+/// event recorded after the last scatter that read it.
 struct RingSlot {
     buf: PinnedBuf,
+    dev: u64,
     read: Option<CudaEvent>,
+}
+
+/// The device address of mapped pinned memory `buf`.
+fn device_address(buf: &PinnedBuf) -> Result<u64> {
+    let mut dev: sys::CUdeviceptr = 0;
+    // SAFETY: `buf` is a live `cuMemHostAlloc` allocation made with
+    // `CU_MEMHOSTALLOC_DEVICEMAP` (`PinnedBuf::alloc_owned_mapped`).
+    unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, buf.as_slice().as_ptr() as *mut _, 0) }
+        .result()
+        .map_err(|e| candle::Error::Msg(format!("warm lift ring: no device address: {e:?}")))?;
+    Ok(dev)
 }
 
 /// See the module documentation.
@@ -63,8 +79,11 @@ impl WarmLiftRing {
         let table_bytes = max_entries * std::mem::size_of::<WarmLiftEntry>();
         let slots = (0..SLOTS)
             .map(|_| {
+                let buf = PinnedBuf::alloc_owned_mapped(slot_bytes + table_bytes)?;
+                let dev = device_address(&buf)?;
                 Ok(RingSlot {
-                    buf: PinnedBuf::alloc_owned_mapped(slot_bytes + table_bytes)?,
+                    buf,
+                    dev,
                     read: None,
                 })
             })
@@ -102,9 +121,12 @@ impl WarmLiftRing {
         }
         let slot_bytes = self.slot_bytes;
         let max_entries = self.max_entries;
+        let dev = slot.dev;
         let (payload, table) = slot.buf.as_mut_slice().split_at_mut(slot_bytes);
         Ok(SlotFill {
             payload,
+            dev_payload: dev,
+            dev_table: dev + slot_bytes as u64,
             table: &mut table[..max_entries * std::mem::size_of::<WarmLiftEntry>()],
             read: &mut slot.read,
         })
@@ -115,12 +137,16 @@ impl WarmLiftRing {
 /// [`Self::scattered`] on the stream that ran it.
 pub(crate) struct SlotFill<'a> {
     pub payload: &'a mut [u8],
+    /// The payload's device address — what the scatter reads.
+    pub dev_payload: u64,
+    dev_table: u64,
     table: &'a mut [u8],
     read: &'a mut Option<CudaEvent>,
 }
 
 impl SlotFill<'_> {
-    /// Write `entries` as the slot's descriptor table; the table's address.
+    /// Write `entries` as the slot's descriptor table; the table's device
+    /// address, which is what the scatter is handed.
     pub(crate) fn write_table(
         &mut self,
         entries: &[WarmLiftEntry],
@@ -137,7 +163,7 @@ impl SlotFill<'_> {
         // fit the table region checked above.
         let raw = unsafe { std::slice::from_raw_parts(entries.as_ptr() as *const u8, bytes) };
         self.table[..bytes].copy_from_slice(raw);
-        Ok(self.table.as_ptr() as *const WarmLiftEntry)
+        Ok(self.dev_table as *const WarmLiftEntry)
     }
 
     /// The scatter reading this slot is on `stream`: record the event a

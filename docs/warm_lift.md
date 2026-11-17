@@ -103,7 +103,12 @@ Two slots, each `SLOT_BYTES` of payload plus room for its descriptor table, allo
 once with the scheduler's other persistent host buffers and held for the process.
 Write-combined pinned memory (`PinnedBuf`, `CU_MEMHOSTALLOC_WRITECOMBINED`): the CPU
 only writes it and the GPU only reads it, which is the pattern write-combining is fast
-for. Mapped, so the kernel reads it at its host address.
+for. Mapped, so the kernel reads it in place — at the **device** address
+`cuMemHostGetDevicePointer` gives, as every other mapped buffer here is read (the expert
+dispatch, the CPU pool's rings, the table ring). Under TCC that address is the host's;
+under WDDM it is not, and the first build handed the kernel the host address: every
+first lift on WhiteWorld (WDDM) read an unmapped address and poisoned the context,
+while BlackWorld (TCC) ran it clean.
 
 **`SLOT_BYTES` = 8 MiB.** A kernel pulling pinned memory reaches the link's rate with
 pieces of ~0.8 MB (`docs/moe_live_dispatch_design.md` §0.10.1: an 819,200 B projection

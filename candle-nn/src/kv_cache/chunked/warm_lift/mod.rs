@@ -112,14 +112,14 @@ pub fn lift_warm_to_gpu(
                 e.bytes as usize,
             );
         }
-        // SAFETY: `slot.payload` and `table` are the slot's mapped pinned
-        // memory, held by the ring and not refilled until the event recorded
-        // below has completed; every destination is a slot claimed for this
-        // lift and resolved from its arena's base above.
+        // SAFETY: `slot.dev_payload` and `table` are the device addresses of the
+        // slot's mapped pinned memory, held by the ring and not refilled until
+        // the event recorded below has completed; every destination is a slot
+        // claimed for this lift and resolved from its arena's base above.
         unsafe {
             candle::set_kernel_breadcrumb("run_warm_lift_scatter", file!(), line!());
             run_warm_lift_scatter(
-                slot.payload.as_ptr(),
+                slot.dev_payload as *const u8,
                 table,
                 entries.len() as i32,
                 blocks,

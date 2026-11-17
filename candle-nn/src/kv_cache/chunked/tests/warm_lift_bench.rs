@@ -153,7 +153,7 @@ fn bench_warm_lift_scatter_alone() {
             })
             .collect();
         let table = slot.write_table(&entries).unwrap();
-        let payload = slot.payload.as_ptr();
+        let payload = slot.dev_payload as *const u8;
         let cu = stream.cu_stream() as *mut std::ffi::c_void;
         // SAFETY: the slot and its table are mapped pinned memory held by
         // `ring`; every destination lies inside `dst`.
