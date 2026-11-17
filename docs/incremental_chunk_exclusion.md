@@ -112,12 +112,21 @@ one tombstone:
 
 | Key | Holds | Written |
 |---|---|---|
-| `chunk_exclusion/<group>/q/<question stream>` | the question's entries in both competitions: per token per fold group `a1, c1, a2, c2`, the winning token `(stream, position)`, and `s, q` with the gallery count `n` they were taken at | when any entry's `c1`/`c2`/`a1`/`a2` changes, or when the gallery count has moved since the record was written by between 5% and 10% — the share fixed per question by its hash, so the sample's records come due a few at a time; tombstoned when the question leaves the sample, or when a learner loading it finds its question gone |
+| `chunk_exclusion/<group>/q/<question stream>` | the question's entries in both competitions — per token per fold group `a1, c1, a2, c2, s, q` and the winning token `(stream, position)` — and the **cursor it was written at** | when the question enters the sample, and in rotation: each fold rewrites the 200 records written longest ago (`ROTATE`, a twentieth of the sample); tombstoned when the question leaves the sample, or when a learner loading it finds its question gone |
 | `chunk_exclusion/<group>` | the cut — both competitions' chunks `(stream, range)` — the **cursor** and the gallery counts | after a fold that changes any of them |
 
-A question's record is ~75 tokens × 3 fold groups × 2 competitions × 36 B ≈ 16 KB;
+A question's record is ~75 tokens × 3 fold groups × 2 competitions × 49 B ≈ 22 KB;
 the group record a few tens of KB. Cases (`c1`, `c2`) are timeline ids, the same on
 every member.
+
+**A record is written in rotation, not when it moves.** Almost every append
+moves some entry of almost every question — a pass of 994 streams moved 3,992 of
+4,000 (BlackWorld, 2026-11-17) — so writing on change rewrote the sample every
+fold, ~116 MB replicated. A record instead carries its own cursor, the learner
+holds every entry exactly, and the sample turns over every 20 folds, ~4 MB a
+fold. A reload groups the questions by their records' cursors — about 20 — and
+catches each group up on the streams above its own cursor alone (`catch_up`),
+which is exact for every stream appended since.
 
 **The cursor is the highest signature stamp folded.** Every signature record
 carries a hybrid-logical-clock reading `hlc` (`docs/replicated_substrate.md` §6.2),
@@ -205,13 +214,15 @@ once the learner moves on, it idles out of the cache like any other.
   already hold (`with_synced_upload` grows by doubling and never shrinks), and the
   slice bounds a job's kernel at ~2 × 10⁹ token pairs, ~10 ms. A slice's index
   is built once and reused by its later probe chunks (§4.5).
-- **A job is a request on the wave thread.** The learner runs on zend's own
-  thread and sends each job there as a held launch (`HeldScan::stats` over
-  `SchedulerRequest::ArenaScan`), which the loop serves with its other requests
-  and draws in the `requests` band; the merging and the cut stay on the learner's
-  thread. The other background scans the loop runs one a pass — the normalization
-  warm-ups, the offline harness's group-vote scans — get their own band, `warm`,
-  so they are never drawn as `blocked`.
+- **A job is background work on the wave thread, one a pass.** The learner runs
+  on zend's own thread and sends each job there as a background held launch
+  (`HeldScan::stats` over `SchedulerRequest::ArenaScan` with `background`), which
+  the loop queues with its other background scans — the normalization warm-ups,
+  the offline harness's group-vote scans — and serves one a pass
+  (`step_norm_warm`), between waves, in the `warm` band. The merging and the cut
+  stay on the learner's thread. Served as requests the moment they arrived, a
+  learner's run of jobs went back to back between two waves: 19 questions
+  entering the sample held decode at ~60 t/s for ~10 s (BlackWorld, 2026-11-17).
 - **The first build** — no records for the group yet — is the whole gallery folded
   as appends, in the same jobs.
 
@@ -227,10 +238,9 @@ once the learner moves on, it idles out of the cache like any other.
 - The group record is written before the question records: a fold that dies
   between them leaves a cursor whose missing question records are questions
   entering the sample on reload, scanned whole.
-- The learner's own `s, q` are exact; a record's are as of its `n`, at most 10%
-  of the gallery behind. A takeover starts from the records' moments, which only
-  touches the vote's normalisation, by that bound; best and runner-up are always
-  exact.
+- A record's entries are exact as of its cursor, and a takeover catches each
+  question up on what is above it: what stays approximate is only what a removal
+  while no member held the state left in the sums (§4.3).
 - On load, the calibration gallery taken as folded holds no question that has a
   record or is in today's sample; today's sample's others enter it and are
   scanned whole.
@@ -272,9 +282,14 @@ All `#[test]`s, asserting raw values:
   entries it led rescanned to the leaders a fold without it finds.
 - **Sample** — bottom-k by a fixed SplitMix64 mix: the same sample from any order;
   one question in and the largest out (`sample.rs`).
-- **Records** — each record is its bytes, and reads back as itself
-  (`records.rs`); a restarted learner reads them, scans nothing and writes
-  nothing; a group record installs its cut on apply and its tombstone clears it.
+- **Records** — each record is its bytes, and reads back as itself; an older
+  layout is not read (`records.rs`); a restarted learner reads them, scans
+  nothing and writes nothing; a fold writes the new questions and the 200 oldest
+  records; a question reloaded behind the cursor catches up to exactly the
+  entries a continuous fold holds; a group record installs its cut on apply and
+  its tombstone clears it; an orphaned record is tombstoned.
+- **Background** — a background launch is queued, not run, as it arrives, and
+  answered one a step; a background handle sends background launches.
 - **Cursor** — the cursor rises to the highest stamp folded; a fold with nothing
   new launches nothing; a turn appended after a restart is the one stream folded.
 - **Statistics mode** — each backend's rows equal the definitions on a fixture of
@@ -300,6 +315,6 @@ from their definitions on the host.
 | Cut from state | `projection/chunk_exclusion/cut.rs` |
 | The learner, its load and its writes | `projection/chunk_exclusion/learner.rs` |
 | Statistics-mode kernel | `candle-kernels/src/provenance/bdp_vote.cuh`, `bdp_scan.cu`, `bdp_bmma.cu`, `bdp_imma.cu`, `gallery_arena/scan.rs` |
-| A job sent to the wave thread | `gallery_arena/held_scan.rs`, `scheduler/remote_arena.rs`, `group_scanner.rs` |
+| A job sent to the wave thread, one a pass | `gallery_arena/held_scan.rs`, `scheduler/remote_arena.rs` (`connect_background`), `scheduler/norm_warm.rs`, `group_scanner.rs` |
 | The `warm` band | `scheduler/phase_ring.rs`, `scheduler/mod.rs`, `web/content/common/lib/perf.js` |
 | Learner and lease | `zend/src/session.rs`, `zend/src/ingest_lease.rs` |

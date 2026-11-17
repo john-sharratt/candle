@@ -19,12 +19,27 @@ use crate::provenance::WideQSig;
 pub(crate) struct RemoteArena {
     tx: Sender<SchedulerRequest>,
     n_groups: usize,
+    /// Its launches wait with the loop's background scans, one a pass,
+    /// rather than run as they arrive.
+    background: bool,
 }
 
 impl RemoteArena {
-    /// The scheduler's arena, reached over `tx`; `None` when it has none or is
-    /// gone — a scan then scores on the host, as one with no arena does.
+    /// The scheduler's arena, reached over `tx`, each launch run as it
+    /// arrives; `None` when it has none or is gone — a scan then scores on
+    /// the host, as one with no arena does.
     pub(crate) fn connect(tx: &Sender<SchedulerRequest>) -> Option<Self> {
+        Self::connect_as(tx, false)
+    }
+
+    /// [`Self::connect`] for background work: each launch waits with the
+    /// loop's background scans and runs one a pass, so a run of them is
+    /// never served back to back between two waves.
+    pub(crate) fn connect_background(tx: &Sender<SchedulerRequest>) -> Option<Self> {
+        Self::connect_as(tx, true)
+    }
+
+    fn connect_as(tx: &Sender<SchedulerRequest>, background: bool) -> Option<Self> {
         let (response_tx, response_rx) = flume::bounded(1);
         tx.send(SchedulerRequest::ArenaGroups { response_tx })
             .ok()?;
@@ -32,6 +47,7 @@ impl RemoteArena {
         Some(Self {
             tx: tx.clone(),
             n_groups,
+            background,
         })
     }
 
@@ -40,7 +56,11 @@ impl RemoteArena {
     fn ask(&self, scan: HeldScan) -> candle::Result<ScanAnswer> {
         let (response_tx, response_rx) = flume::bounded(1);
         self.tx
-            .send(SchedulerRequest::ArenaScan { scan, response_tx })
+            .send(SchedulerRequest::ArenaScan {
+                scan,
+                response_tx,
+                background: self.background,
+            })
             .map_err(|_| candle::Error::Msg("arena scan: the scheduler is gone".into()))?;
         let ScanReply { answer, split } = response_rx
             .recv()
@@ -142,12 +162,19 @@ mod tests {
                     SchedulerRequest::ArenaGroups { response_tx } => {
                         let _ = response_tx.send(groups);
                     }
-                    SchedulerRequest::ArenaScan { scan, response_tx } => {
+                    SchedulerRequest::ArenaScan {
+                        scan,
+                        response_tx,
+                        background,
+                    } => {
                         let _ = response_tx.send(ScanReply {
                             answer: ScanAnswer::Scores(answer(&scan.probes())),
                             split: ArenaScanSplit {
                                 scans: 1,
                                 kernel_us,
+                                // The flag the launch arrived with, where the
+                                // test can read it back.
+                                held: u64::from(background),
                                 ..ArenaScanSplit::default()
                             },
                         });
@@ -182,6 +209,24 @@ mod tests {
         assert_eq!(got, vec![vec![1.0, 9.0]]);
         let split = scan_split::take();
         assert_eq!((split.scans, split.kernel_us), (2, 80));
+        assert_eq!(split.held, 0, "a seal scan's launches run as they arrive");
+    }
+
+    /// **A background handle's launches are sent as background**, for the
+    /// loop to run one a pass; an ordinary handle's are not.
+    #[test]
+    fn a_background_handle_sends_background_launches() {
+        let tx = wave(Some(3), 0, |probes| Ok(vec![Vec::new(); probes.len()]));
+        scan_split::take();
+        let background = RemoteArena::connect_background(&tx).unwrap();
+        background.scan_weighted(&[], &[&[sig(1)]], &[1.0]).unwrap();
+        background.scan_weighted(&[], &[&[sig(2)]], &[1.0]).unwrap();
+        assert_eq!(scan_split::take().held, 2);
+        RemoteArena::connect(&tx)
+            .unwrap()
+            .scan_weighted(&[], &[&[sig(3)]], &[1.0])
+            .unwrap();
+        assert_eq!(scan_split::take().held, 0);
     }
 
     /// **A launch's failure is the caller's error**, in the launch's words.

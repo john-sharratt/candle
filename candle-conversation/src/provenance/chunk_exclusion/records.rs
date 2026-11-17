@@ -16,8 +16,12 @@ use crate::persistence::streams::StreamId;
 /// Every key the exclusion keeps begins with this.
 pub const PREFIX: &str = "chunk_exclusion/";
 
-/// Layout version both records open with.
-const VERSION: u8 = 1;
+/// Layout version a question record opens with: 2 carries the record's own
+/// cursor.
+const QUESTION_VERSION: u8 = 2;
+
+/// Layout version the group record opens with.
+const GROUP_VERSION: u8 = 1;
 
 /// The group record's key.
 pub fn group_key(group: u32) -> String {
@@ -62,25 +66,25 @@ pub struct Entry {
 /// stream (u64), win position (u32).
 const ENTRY_BYTES: usize = 2 + 2 + 1 + 8 * 5 + 4;
 
-/// A sample question's record: its owner file, the gallery count each
-/// competition's sums were taken at, and its entries per competition, token
-/// major, fold group minor.
+/// A sample question's record: its owner file, the **cursor** — the highest
+/// signature stamp its entries had folded when it was written, which a reload
+/// folds the question on from — and its entries per competition, token major,
+/// fold group minor.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QuestionRecord {
     pub owner: FileId,
-    pub n: [u64; 2],
+    pub cursor: u64,
     pub entries: [Vec<Entry>; 2],
 }
 
 impl QuestionRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(
-            1 + 8 * 3 + 8 + ENTRY_BYTES * (self.entries[0].len() + self.entries[1].len()),
+            1 + 8 * 2 + 8 + ENTRY_BYTES * (self.entries[0].len() + self.entries[1].len()),
         );
-        b.push(VERSION);
+        b.push(QUESTION_VERSION);
         b.extend_from_slice(&self.owner.to_le_bytes());
-        b.extend_from_slice(&self.n[0].to_le_bytes());
-        b.extend_from_slice(&self.n[1].to_le_bytes());
+        b.extend_from_slice(&self.cursor.to_le_bytes());
         for comp in &self.entries {
             b.extend_from_slice(&(comp.len() as u32).to_le_bytes());
             for e in comp {
@@ -102,11 +106,11 @@ impl QuestionRecord {
 
     pub fn decode(b: &[u8]) -> Option<Self> {
         let mut r = Reader(b);
-        if r.u8()? != VERSION {
+        if r.u8()? != QUESTION_VERSION {
             return None;
         }
         let owner = r.u64()?;
-        let n = [r.u64()?, r.u64()?];
+        let cursor = r.u64()?;
         let mut entries: [Vec<Entry>; 2] = [Vec::new(), Vec::new()];
         for comp in &mut entries {
             let count = r.u32()? as usize;
@@ -135,8 +139,11 @@ impl QuestionRecord {
                 });
             }
         }
-        r.0.is_empty()
-            .then_some(QuestionRecord { owner, n, entries })
+        r.0.is_empty().then_some(QuestionRecord {
+            owner,
+            cursor,
+            entries,
+        })
     }
 }
 
@@ -152,7 +159,7 @@ pub struct CutRecord {
 impl CutRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(1 + 8 * 3 + 4 + 16 * self.cut.len());
-        b.push(VERSION);
+        b.push(GROUP_VERSION);
         b.extend_from_slice(&self.cursor.to_le_bytes());
         b.extend_from_slice(&self.n[0].to_le_bytes());
         b.extend_from_slice(&self.n[1].to_le_bytes());
@@ -167,7 +174,7 @@ impl CutRecord {
 
     pub fn decode(b: &[u8]) -> Option<Self> {
         let mut r = Reader(b);
-        if r.u8()? != VERSION {
+        if r.u8()? != GROUP_VERSION {
             return None;
         }
         let cursor = r.u64()?;
@@ -238,7 +245,7 @@ mod tests {
     fn a_question_record_is_these_bytes() {
         let rec = QuestionRecord {
             owner: 0x0102,
-            n: [3, 4],
+            cursor: 0x0304,
             entries: [
                 vec![Entry {
                     stats: EntryStats {
@@ -256,10 +263,9 @@ mod tests {
             ],
         };
         let bytes = rec.encode();
-        let mut want = vec![1u8];
+        let mut want = vec![2u8];
         want.extend_from_slice(&[0x02, 0x01, 0, 0, 0, 0, 0, 0]);
-        want.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
-        want.extend_from_slice(&[4, 0, 0, 0, 0, 0, 0, 0]);
+        want.extend_from_slice(&[0x04, 0x03, 0, 0, 0, 0, 0, 0]);
         want.extend_from_slice(&[1, 0, 0, 0]);
         want.extend_from_slice(&[0x05, 0x01, 0x00, 0x01, 0b11]);
         want.extend_from_slice(&[9, 0, 0, 0, 0, 0, 0, 0]);
@@ -272,6 +278,9 @@ mod tests {
         assert_eq!(bytes, want);
         assert_eq!(QuestionRecord::decode(&bytes), Some(rec));
         assert_eq!(QuestionRecord::decode(&bytes[..bytes.len() - 1]), None);
+        let mut v1 = bytes.clone();
+        v1[0] = 1;
+        assert_eq!(QuestionRecord::decode(&v1), None, "a v1 record is not read");
     }
 
     /// **A group record is these bytes**, and reads back as itself through its

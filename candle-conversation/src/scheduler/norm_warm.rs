@@ -22,7 +22,12 @@
 //!
 //! A raw group scan ([`Conversation::scan_group_votes`]) — an offline caller
 //! scoring its own probes against the resident gallery — waits in the same
-//! loop under the same rule, after the replay and before ingest slices.
+//! loop under the same rule, after the replay and before ingest slices; so do
+//! the chunk-exclusion learner's launches, held and sent from its own thread
+//! (`docs/incremental_chunk_exclusion.md` §4.6), after the raw scans. Served
+//! with the requests the moment they arrived, a learner's run of launches went
+//! back to back between two waves: 19 questions entering the sample held
+//! decode at ~60 t/s for ~10 s on BlackWorld (2026-11-17).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -37,7 +42,7 @@ use crate::projection::{
     Builder, Conversation, GroupId, GroupVotes, LayerId, ProjectionTarget, Schema, TimelineId,
     WarmProbe,
 };
-use crate::provenance::gallery_arena::{GroupSet, Keep};
+use crate::provenance::gallery_arena::{GroupSet, HeldScan, Keep, ScanReply};
 use crate::provenance::WideQSig;
 
 /// One replayed turn waiting to be scored, with what scoring it needs.
@@ -77,6 +82,14 @@ pub(super) struct ScanVotesJob {
     pub(super) response_tx: Sender<Option<candle::Result<GroupVotes>>>,
 }
 
+/// One background launch sent from another thread — a chunk-exclusion
+/// learner's job (`docs/incremental_chunk_exclusion.md` §4.6) — and where its
+/// answer goes.
+pub(super) struct HeldJob {
+    pub(super) scan: HeldScan,
+    pub(super) response_tx: Sender<ScanReply>,
+}
+
 /// The replay's backlog, and what the current one has done so far.
 #[derive(Default)]
 pub(super) struct NormWarm {
@@ -84,6 +97,9 @@ pub(super) struct NormWarm {
     /// Raw group scans, served after the replay's turns and before ingest
     /// slices.
     scans: VecDeque<ScanVotesJob>,
+    /// Background launches, served after the raw group scans and before
+    /// ingest slices.
+    held: VecDeque<HeldJob>,
     /// Ingest warm-up slices, served after the replay's turns.
     ingest: VecDeque<IngestSliceJob>,
     /// When the replay now draining was queued.
@@ -98,7 +114,11 @@ impl Scheduler {
     /// zero while anything is.
     pub(super) fn norm_warm_wait(&self) -> Option<Duration> {
         let warm = &self.norm_warm;
-        if warm.backlog.is_empty() && warm.scans.is_empty() && warm.ingest.is_empty() {
+        if warm.backlog.is_empty()
+            && warm.scans.is_empty()
+            && warm.held.is_empty()
+            && warm.ingest.is_empty()
+        {
             return None;
         }
         Some(Duration::ZERO)
@@ -138,6 +158,12 @@ impl Scheduler {
         self.norm_warm.scans.push_back(job);
     }
 
+    /// Queue one background launch; [`Self::step_norm_warm`] runs it on a
+    /// later loop iteration, so a run of them never stands between two waves.
+    pub(super) fn queue_held_scan(&mut self, job: HeldJob) {
+        self.norm_warm.held.push_back(job);
+    }
+
     /// Drop every queued job for `conversation`'s substrate — it has detached,
     /// and nothing on this thread may refer to it afterwards. A dropped
     /// slice's reply channel closes, which its warmer reads as the engine
@@ -156,9 +182,21 @@ impl Scheduler {
     }
 
     /// Score one queued replay turn — or, with none left, one raw group scan,
-    /// then one ingest slice. Returns whether one was scored.
+    /// then one background launch, then one ingest slice. Returns whether one
+    /// was scored.
     pub(super) fn step_norm_warm(&mut self) -> bool {
         let Some(job) = self.norm_warm.backlog.pop_front() else {
+            if self.norm_warm.scans.is_empty() {
+                if let Some(held) = self.norm_warm.held.pop_front() {
+                    let reply = match self.gallery_arena.as_deref() {
+                        Some(arena) => held.scan.run(arena),
+                        None => held.scan.no_arena(),
+                    };
+                    // A caller that has gone away has nothing left to wait for.
+                    let _ = held.response_tx.send(reply);
+                    return true;
+                }
+            }
             if let Some(scan) = self.norm_warm.scans.pop_front() {
                 let votes = self.gallery_arena.as_deref().map(|arena| {
                     scan.conversation.scan_group_votes(
@@ -310,6 +348,40 @@ mod tests {
             "no arena on this scheduler"
         );
         assert!(!sched.step_norm_warm(), "the scan was the whole backlog");
+        assert_eq!(sched.norm_warm_wait(), None);
+    }
+
+    /// **A background launch is queued, not run, as it arrives, and answered
+    /// one a step.** Two arrive by request; neither is answered until a step
+    /// runs, and each step answers one — here that the scheduler has no arena.
+    #[test]
+    fn background_launches_are_answered_one_a_step() {
+        use super::super::SchedulerRequest;
+        use crate::provenance::gallery_arena::{HeldScan, ScanAnswer};
+
+        let (mut sched, _tx) = make_test_scheduler();
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            let (response_tx, response_rx) = flume::bounded(1);
+            assert!(sched.handle_request(SchedulerRequest::ArenaScan {
+                scan: HeldScan::stats(&[], &[]),
+                response_tx,
+                background: true,
+            }));
+            replies.push(response_rx);
+        }
+        assert!(replies.iter().all(|r| r.try_recv().is_err()), "both wait");
+        assert_eq!(sched.norm_warm_wait(), Some(Duration::ZERO));
+
+        assert!(sched.step_norm_warm());
+        assert!(matches!(
+            replies[0].try_recv().unwrap().answer,
+            ScanAnswer::Stats(Err(_))
+        ));
+        assert!(replies[1].try_recv().is_err(), "the second waits a step");
+        assert!(sched.step_norm_warm());
+        assert!(replies[1].try_recv().is_ok());
+        assert!(!sched.step_norm_warm());
         assert_eq!(sched.norm_warm_wait(), None);
     }
 

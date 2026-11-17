@@ -49,7 +49,8 @@ impl GroupScanner {
         content: (GroupSet, Keep),
         calibration: (GroupSet, Keep),
     ) -> Result<candle::Result<FoldReport>, ScanRefused> {
-        let arena = RemoteArena::connect(&self.scheduler_tx).ok_or(ScanRefused::NoArena)?;
+        let arena =
+            RemoteArena::connect_background(&self.scheduler_tx).ok_or(ScanRefused::NoArena)?;
         Ok(learner.fold(&self.conversation, &arena, content, calibration))
     }
 

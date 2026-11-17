@@ -19,18 +19,19 @@ use crate::provenance::chunk_exclusion::records::{
     from_json, group_key, question_key, question_of_key, questions_prefix, to_json, CutRecord,
     QuestionRecord,
 };
-use crate::provenance::chunk_exclusion::sample::sample_hash;
+use crate::provenance::chunk_exclusion::sample::SAMPLE;
 use crate::provenance::gallery_arena::{BeliefArena, GroupSet, Keep};
 use crate::provenance::FOLD_GROUPS;
 
 /// Question records written in one commit.
 const RECORDS_PER_COMMIT: usize = 256;
 
-/// A question's record is written again once its competition's gallery count
-/// has moved by at least this share since it was written — between it and
-/// twice it, fixed per question ([`drifted`]). A record's sums are read only
-/// by a member taking over, and normalise its votes from there.
-const DRIFT: f64 = 0.05;
+/// Question records a fold rewrites besides the questions that entered: the
+/// ones written longest ago, so the whole sample turns over every 20 folds
+/// and a reload has at most ~20 cursors to catch questions up from. Writing
+/// every record whose entries moved rewrote 3,992 of 4,000 (~116 MB,
+/// replicated) after a pass of 994 streams (BlackWorld, 2026-11-17).
+const ROTATE: usize = SAMPLE / 20;
 
 /// What one fold did, and the cut it left.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -186,8 +187,8 @@ fn load(conv: &Conversation, group: GroupId, view: &GalleryView) -> LearnerState
                 owner: rec.owner,
                 tokens,
                 entries: rec.entries,
-                written_n: rec.n,
-                changed: false,
+                written: Some(rec.cursor),
+                behind: (rec.cursor < cut.cursor).then_some(rec.cursor),
             },
         );
     }
@@ -215,23 +216,27 @@ fn load(conv: &Conversation, group: GroupId, view: &GalleryView) -> LearnerState
     }
 }
 
-/// Whether question `sid`'s record has drifted far enough to write again: its
-/// gallery count has moved by between [`DRIFT`] and twice it, the share fixed
-/// per question by its hash so the sample's records come due a few at a time
-/// rather than all on one fold.
-fn drifted(sid: StreamId, written: u64, now: u64) -> bool {
-    if now == 0 {
-        return false;
-    }
-    let spread = 1.0 + (sample_hash(sid) % 1_000) as f64 / 1_000.0;
-    (now as f64 - written as f64).abs() >= DRIFT * spread * now as f64
+/// The questions whose records a fold at `cursor` writes: every question with
+/// no record yet, and the [`ROTATE`] whose records are oldest — written below
+/// `cursor`, the lowest cursor first, ties by stream.
+fn due(sample: &BTreeMap<StreamId, SampleQuestion>, cursor: u64) -> Vec<StreamId> {
+    let mut stale: Vec<(u64, StreamId)> = sample
+        .iter()
+        .filter_map(|(sid, q)| q.written.filter(|&w| w < cursor).map(|w| (w, *sid)))
+        .collect();
+    stale.sort_by_key(|&(w, sid)| (w, sid.0));
+    sample
+        .iter()
+        .filter(|(_, q)| q.written.is_none())
+        .map(|(sid, _)| *sid)
+        .chain(stale.into_iter().take(ROTATE).map(|(_, sid)| sid))
+        .collect()
 }
 
 /// Write what the fold moved: the group's cut, cursor and counts when they
-/// changed, then every sample question whose entries changed or whose sums
-/// have drifted ([`drifted`]), and a tombstone for every question that left
-/// and every orphaned record load found. Returns the records written and
-/// tombstoned.
+/// changed, then the questions that come due ([`due`]) at the state's cursor,
+/// and a tombstone for every question that left and every orphaned record
+/// load found. Returns the records written and tombstoned.
 ///
 /// **The group record goes first.** A fold that dies between the writes leaves
 /// a cursor with some question records behind it; a reload takes each missing
@@ -267,23 +272,20 @@ fn write(
             .map_err(|e| candle::Error::Msg(format!("exclusion cut record: {e}")))?;
         state.written_cut = Some(cut);
     }
+    let cursor = state.cursor;
     let mut objs: Vec<CustomObjectPayload> = Vec::new();
-    for (sid, q) in state.sample.iter_mut() {
-        let moved = (0..2).any(|c| drifted(*sid, q.written_n[c], n[c]));
-        if !q.changed && !moved {
-            continue;
-        }
+    for sid in due(&state.sample, cursor) {
+        let q = state.sample.get_mut(&sid).expect("a sample question");
         let rec = QuestionRecord {
             owner: q.owner,
-            n,
+            cursor,
             entries: q.entries.clone(),
         };
         objs.push(CustomObjectPayload::new(
-            question_key(group.raw(), *sid),
+            question_key(group.raw(), sid),
             to_json(&rec.encode()),
         ));
-        q.written_n = n;
-        q.changed = false;
+        q.written = Some(cursor);
     }
     let written = objs.len();
     let gone: Vec<StreamId> = left.iter().chain(&state.orphans).copied().collect();
@@ -304,20 +306,32 @@ fn write(
 mod tests {
     use super::*;
 
-    /// **A record comes due between 5% and 10% of drift, fixed per
-    /// question**: under 5% never, at 10% always, and between them as its
-    /// hash places it — so not every question at once.
-    #[test]
-    fn a_record_comes_due_between_five_and_ten_percent() {
-        for sid in (0..200).map(StreamId) {
-            assert!(!drifted(sid, 1_000, 1_049));
-            assert!(drifted(sid, 1_000, 1_112));
-            assert!(!drifted(sid, 1_000, 0), "an empty gallery is never due");
+    fn question(written: Option<u64>) -> SampleQuestion {
+        SampleQuestion {
+            owner: 1,
+            tokens: Vec::new(),
+            entries: [Vec::new(), Vec::new()],
+            written,
+            behind: None,
         }
-        let due_at_7: usize = (0..200)
-            .map(StreamId)
-            .filter(|&s| drifted(s, 1_000, 1_076))
-            .count();
-        assert!(due_at_7 > 0 && due_at_7 < 200, "{due_at_7} of 200 due at 7%");
+    }
+
+    /// **A fold writes the questions with no record, and the [`ROTATE`]
+    /// written longest ago** — none already written at its cursor.
+    #[test]
+    fn a_fold_writes_new_questions_and_the_oldest_records() {
+        let mut sample: BTreeMap<StreamId, SampleQuestion> = BTreeMap::new();
+        for i in 0..(ROTATE as u64 + 50) {
+            // Cursors 10, 11, … — the first ROTATE are the oldest.
+            sample.insert(StreamId(1_000 + i), question(Some(10 + i)));
+        }
+        sample.insert(StreamId(7), question(None));
+        sample.insert(StreamId(8), question(Some(900)));
+        let due = due(&sample, 900);
+        assert_eq!(due.len(), 1 + ROTATE);
+        assert_eq!(due[0], StreamId(7), "the new question first");
+        assert_eq!(due[1], StreamId(1_000));
+        assert_eq!(due[ROTATE], StreamId(1_000 + ROTATE as u64 - 1));
+        assert!(!due.contains(&StreamId(8)), "already at the cursor");
     }
 }

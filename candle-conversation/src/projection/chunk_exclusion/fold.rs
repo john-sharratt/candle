@@ -34,10 +34,13 @@ pub(crate) struct SampleQuestion {
     pub tokens: Vec<WideQSig>,
     /// Per competition, token major, fold group minor.
     pub entries: [Vec<Entry>; 2],
-    /// Each competition's gallery count when its record was last written.
-    pub written_n: [u64; 2],
-    /// Its record is behind what it holds.
-    pub changed: bool,
+    /// The cursor its record was last written at; `None` when it has none
+    /// yet — a question that entered the sample this fold.
+    pub written: Option<u64>,
+    /// The cursor its entries have folded to, when behind the state's: a
+    /// question loaded from a record written before the group's cursor, whose
+    /// streams above it the next fold catches it up on.
+    pub behind: Option<u64>,
 }
 
 /// See the module documentation.
@@ -66,6 +69,8 @@ pub struct FoldCounts {
     pub entered: usize,
     pub left: usize,
     pub rescanned: usize,
+    /// Questions loaded behind the cursor, caught up on what is above theirs.
+    pub caught_up: usize,
 }
 
 /// A question's full-width tokens, at the galleries' `width`.
@@ -113,6 +118,7 @@ impl LearnerState {
             self.sample.remove(sid);
         }
         counts.left = left.len();
+        counts.caught_up = self.catch_up(arena, shapes)?;
 
         // The galleries as they stand: the calibration one without the sample.
         let current = |comp: Competition| -> HashMap<StreamId, &GalleryStream> {
@@ -175,8 +181,8 @@ impl LearnerState {
                                 owner: q.owner,
                                 tokens,
                                 entries: [blank.clone(), blank],
-                                written_n: [0, 0],
-                                changed: true,
+                                written: None,
+                                behind: None,
                             },
                         )
                     })
@@ -268,9 +274,8 @@ impl LearnerState {
                 for (g, stats) in groups.into_iter().enumerate() {
                     let e = &mut q.entries[ci][t * FOLD_GROUPS + g];
                     e.stats.subtract_sums(&stats);
-                    if files.iter().any(|&f| e.stats.leads(f)) && !e.dirty {
+                    if files.iter().any(|&f| e.stats.leads(f)) {
                         e.dirty = true;
-                        q.changed = true;
                     }
                 }
             }
@@ -292,23 +297,72 @@ impl LearnerState {
         }
         let got = scan(arena, streams, &probes, shape)?;
         self.n[ci] += got.n;
-        for (sid, per_token) in sids.iter().zip(got.stats) {
+        self.merge_into(ci, &sids, got.stats);
+        Ok(())
+    }
+
+    /// Merge scanned statistics into the entries of questions `sids`, in
+    /// competition `ci`; an entry whose leader moved loses its winning token.
+    fn merge_into(
+        &mut self,
+        ci: usize,
+        sids: &[StreamId],
+        stats: Vec<Vec<[EntryStats; FOLD_GROUPS]>>,
+    ) {
+        for (sid, per_token) in sids.iter().zip(stats) {
             let q = self.sample.get_mut(sid).expect("a sample question");
             for (t, groups) in per_token.into_iter().enumerate() {
-                for (g, stats) in groups.into_iter().enumerate() {
+                for (g, s) in groups.into_iter().enumerate() {
                     let e = &mut q.entries[ci][t * FOLD_GROUPS + g];
-                    let before = (e.stats.a1, e.stats.c1, e.stats.a2, e.stats.c2);
-                    e.stats.merge(&stats);
-                    if (e.stats.a1, e.stats.c1) != (before.0, before.1) {
+                    let before = (e.stats.a1, e.stats.c1);
+                    e.stats.merge(&s);
+                    if (e.stats.a1, e.stats.c1) != before {
                         e.win = None;
-                    }
-                    if (e.stats.a1, e.stats.c1, e.stats.a2, e.stats.c2) != before {
-                        q.changed = true;
                     }
                 }
             }
         }
-        Ok(())
+    }
+
+    /// Catch every question loaded behind the state's cursor up on the
+    /// streams folded above its own: questions are grouped by the cursor their
+    /// record was written at, and each group scans only what is above it. The
+    /// gallery counts already hold those streams. How many questions caught up.
+    fn catch_up(&mut self, arena: &dyn BeliefArena, shapes: [ScanShape; 2]) -> Result<usize> {
+        let mut by_cursor: BTreeMap<u64, Vec<StreamId>> = BTreeMap::new();
+        for (sid, q) in &self.sample {
+            if let Some(c) = q.behind {
+                by_cursor.entry(c).or_default().push(*sid);
+            }
+        }
+        let mut caught = 0usize;
+        for (cursor, sids) in by_cursor {
+            for comp in Competition::BOTH {
+                let ci = comp.index();
+                let above: Vec<GalleryStream> = self.folded[ci]
+                    .values()
+                    .filter(|s| s.hlc > cursor)
+                    .cloned()
+                    .collect();
+                if above.is_empty() {
+                    continue;
+                }
+                let refs: Vec<&GalleryStream> = above.iter().collect();
+                let probes: Vec<&[WideQSig]> = sids
+                    .iter()
+                    .map(|s| self.sample[s].tokens.as_slice())
+                    .collect();
+                let got = scan(arena, &refs, &probes, shapes[ci])?;
+                self.merge_into(ci, &sids, got.stats);
+            }
+            for sid in &sids {
+                if let Some(q) = self.sample.get_mut(sid) {
+                    q.behind = None;
+                }
+            }
+            caught += sids.len();
+        }
+        Ok(caught)
     }
 
     /// Leave every entry whose leader or runner-up names a file no longer in
@@ -322,9 +376,8 @@ impl LearnerState {
             for q in self.sample.values_mut() {
                 for e in &mut q.entries[ci] {
                     let gone = |f: FileId| f != 0 && !present.contains(&f);
-                    if !e.dirty && (gone(e.stats.c1) || gone(e.stats.c2)) {
+                    if gone(e.stats.c1) || gone(e.stats.c2) {
                         e.dirty = true;
-                        q.changed = true;
                     }
                 }
             }
@@ -392,7 +445,6 @@ impl LearnerState {
                             e.stats.merge_leaders(&stats);
                             e.dirty = false;
                             e.win = None;
-                            q.changed = true;
                         }
                     }
                 }

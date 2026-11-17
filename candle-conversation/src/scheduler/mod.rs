@@ -507,9 +507,14 @@ pub(crate) enum SchedulerRequest {
     /// the substrate reads and the normalization, on its own thread. A seal
     /// scan held the wave thread ~575 ms a turn, all but ~50 ms of it host
     /// work (BlackWorld, 2026-11-16).
+    ///
+    /// A `background` launch — a chunk-exclusion learner's — is not run as it
+    /// arrives but queued with the loop's other background scans, one a pass
+    /// (`norm_warm`), so a run of them never stands between two waves.
     ArenaScan {
         scan: HeldScan,
         response_tx: Sender<ScanReply>,
+        background: bool,
     },
 
     /// The gallery arena's fold-group count, `None` when there is no arena —
@@ -5390,7 +5395,15 @@ impl Scheduler {
                 true
             }
 
-            SchedulerRequest::ArenaScan { scan, response_tx } => {
+            SchedulerRequest::ArenaScan {
+                scan,
+                response_tx,
+                background,
+            } => {
+                if background {
+                    self.queue_held_scan(norm_warm::HeldJob { scan, response_tx });
+                    return true;
+                }
                 let reply = match self.gallery_arena.as_deref() {
                     Some(arena) => scan.run(arena),
                     None => scan.no_arena(),

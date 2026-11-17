@@ -105,6 +105,44 @@ fn entries(s: &LearnerState) -> HashMap<StreamId, [Vec<Entry>; 2]> {
         .collect()
 }
 
+/// **A question reloaded behind the cursor catches up exactly.** Files
+/// stamped after the first fold are folded by a learner that holds the sample
+/// throughout; another state reloads one question from its record as the
+/// first fold left it, the rest current, and catches it up on the streams above
+/// its own cursor alone — ending with the same entries.
+#[test]
+fn a_question_reloaded_behind_catches_up_exactly() {
+    let mut view = gallery(0xCA7C);
+    // Files 103.. arrive after the first fold: their stamps are above the
+    // questions'.
+    for s in &mut view.content {
+        if s.file >= 103 {
+            s.hlc += 1_000;
+        }
+    }
+    let early = with_content(&view, |s| s.file < 103);
+    let arena = HostArena::default();
+    let mut held = LearnerState::default();
+    held.fold(&early, &arena, shapes()).unwrap();
+    let first_cursor = held.cursor;
+    let behind_q = *held.sample.keys().next().unwrap();
+    let record = held.sample[&behind_q].entries.clone();
+    held.fold(&view, &arena, shapes()).unwrap();
+
+    let mut reloaded = held.clone();
+    let q = reloaded.sample.get_mut(&behind_q).unwrap();
+    q.entries = record;
+    q.behind = Some(first_cursor);
+    let (counts, _) = reloaded.fold(&view, &arena, shapes()).unwrap();
+    assert_eq!(counts.caught_up, 1);
+    assert_eq!(counts.appended, 0, "nothing new in the gallery");
+    assert_eq!(
+        reloaded.sample[&behind_q].entries,
+        held.sample[&behind_q].entries
+    );
+    assert_eq!(reloaded.sample[&behind_q].behind, None);
+}
+
 /// **Folding a gallery a part at a time is folding it whole.** One state
 /// folds the whole gallery at once; another folds a third of the files, then
 /// two thirds, then all: their entries and gallery counts are identical.

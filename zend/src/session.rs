@@ -2573,6 +2573,7 @@ impl InferenceState {
                     entered = r.counts.entered,
                     left = r.counts.left,
                     rescanned = r.counts.rescanned,
+                    caught_up = r.counts.caught_up,
                     dirty = r.dirty.0,
                     entries = r.dirty.1,
                     content_tokens = r.n[0],
