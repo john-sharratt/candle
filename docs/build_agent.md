@@ -3,14 +3,14 @@
 A build is the slow part of every deploy, and today almost anything that
 restarts a process on its machine kills it. This design makes the planned
 path work: a deploy, a certified install, a restart through keep. A planned
-restart of a process that runs builds waits for the build that is running,
-holds back the runs queued behind it, and hands them to the process that
-comes up next. Builds run one at a time on each machine, and trials of other
-services run alongside them.
+restart of a process that runs builds waits for the deploy build that is
+running, sets other runs aside to run again afterwards, and hands the queue
+to the process that comes up next. Builds run one at a time on each machine,
+and trials of other services run alongside them.
 
-**Out of scope: crashes.** A crash, a reboot, or a trial that is rolled back
-fails the build that was running, and loses the runs queued behind it. Its
-caller is told the run ended. Nothing here tries to survive that.
+**Out of scope: crashes.** A crash, a reboot, a forced restart, or keep
+dying while it holds a queue (§5) fails the build that was running and loses
+the runs queued behind it. Nothing here tries to survive that.
 
 `docs/jobs.md` §2 and §6 describe the path as it is built today. Each
 changes as the step that touches it lands.
@@ -35,9 +35,9 @@ Each machine's builds run in one agent: the one in motherd on BlackWorld and
 WhiteWorld, `tokera-agent` on AlienWorld. `Jobs` gets one **build slot** and a
 queue in front of it. A run takes the slot after its fetch and its store are
 ready, before its checkout is set aside, and gives it back once its command has
-ended and its output is staged. Runs go through in the order they came. A
-running build is never preempted. Pushes, fetches and listings never take the
-slot.
+ended, its output is staged and, for a deploy, keep has been asked for the
+trial (§6). Runs go through in the order they came. Pushes, fetches and
+listings never take the slot.
 
 - Tests take the slot too. They compile as much as builds do, and the timed
   test gate needs a quiet machine (`cargo test-server` on BlackWorld).
@@ -55,20 +55,24 @@ slot.
 `Jobs::hold()` is what every planned restart of the agent's process asks for
 first:
 
-1. The queue stops: no run starts from it, and runs that arrive join it.
-2. The hold waits for the running run, if there is one, to end and stage its
-   output: at most `build_hold` (the agent file; 60 minutes on BlackWorld).
-   A run still going then is killed with the process.
-3. It parks the queue on the gateway (§4).
-4. It answers: the process may now be stopped.
+1. **The queue stops.** No run starts from it, and runs that arrive join it.
+2. **The running run is dealt with by what it is.**
+   - A deploy build is waited for until it has staged and asked keep for its
+     trial, at most `build_hold` (the agent file; 60 minutes). A deploy still
+     going then is killed with the process.
+   - Any other run, a test or a build that is no deploy, is stopped at once and
+     put back at the head of the queue, under its own id. It runs again from
+     its start on the next process. Its log says where it was cut and where it
+     started again. So a restart waits at most for one deploy build, never for a
+     long test.
+3. **The queue is parked on keep** (§5).
+4. **It answers**: the process may now be stopped.
 
 A hold the process asked for itself, for an install, stands until the process
-exits, or until the install fails and lets it go. A hold keep asked for through
-the route lifts by itself if keep has not stopped the process within five
-minutes of its answer. Either way, a hold that lifts takes its parked runs back
-and starts the queue again. A second hold
-asked while one stands joins it, so a restart that the process asked for itself
-and keep's restart of it do not wait for each other.
+exits, or until the install fails and lets it go. A hold keep asked for lifts
+by itself if keep has not stopped the process within five minutes of its
+answer. A hold that lifts takes its parked runs back from keep and starts the
+queue again. A second hold asked while one stands joins it.
 
 Who asks:
 
@@ -76,11 +80,8 @@ Who asks:
 |---|---|---|
 | a certified install | the installing process, `install_tick` | **before it takes its upgrade leases**: they last `LEASE_TTL` (`READY_WITHIN` + 5 min) and are never renewed, so a wait after taking them could let a second member install while the first is still to go down. The rollout's step reads `waiting for builds` |
 | a standalone agent's install | the agent | before it closes its sockets, in place of `JOBS_WAIT` |
-| keep's `/restart`, `/stop`, `/accept`, or a trial, by hand or from the cluster | keep, through `POST /v1/agent/hold` on the service's status address (`ServiceCfg::status`) | after its guards pass and before it stops the service |
+| keep's `/restart`, `/stop`, `/accept`, or a trial, by hand or from the cluster | keep, through `POST /v1/agent/hold` on the service's `agent:` address (§4) | after its guards pass and before it stops the service |
 
-- **keep asks every service with a status address.** One with no agent answers
-  404, and keep goes on at once. A Battle Cities, gateway or connector trial
-  never waits for a build, so it runs while a candle build compiles.
 - **A forced request asks for no hold.** A person forcing a restart wants it
   now. The cluster's install always sends `FORCE_HEADER`, and has already held
   in `install_tick`.
@@ -88,57 +89,78 @@ Who asks:
   `build_hold`. keep's cluster trial route already answers before it switches
   (`keep/src/remote.rs` `trial`), so the hold happens on the trial's own
   thread, and the board shows the trial as running from the request.
+- A Battle Cities, gateway or connector trial asks no hold (§4), so it runs
+  while a candle build compiles.
 
-## 4. Parking the queue
+## 4. keep's `agent:` address
 
-A process about to stop gives its queue to the gateway, so the runs in it
-start on the process that comes up next. When the hold has drained, the agent
-sends each gateway it is joined to one message: its queued runs, each with its
+keep asks for a hold only of a service whose entry in its file names the
+address of the agent in it: `agent: "192.168.1.2:8081"` on BlackWorld's
+`motherd` (its plain entrance, `motherd/motherd.yaml` `host:`/`port:`), and the
+standalone agent's on AlienWorld. The route answers only a caller on the
+machine itself, as keep's own port takes only loopback. It is a field of its
+own. `status:`, which arms keep's last-member guard
+(`keep/src/guard.rs`), is left as it is on every service, so nothing that guard
+refuses or allows changes.
+
+## 5. The queue waits on keep
+
+The process about to stop gives its queue to its machine's keep, which
+restarts it and outlives it. When the hold has drained, the agent posts keep's
+local port `POST /park {node, runs}`: its queued runs in order, each with its
 id and request, and its recent ended runs (the last `KEPT`), so a handle from
-before the restart is still answered after it.
+before the restart is answered after it.
 
-- The gateway holds them for that agent's node until a new process of that
-  agent connects. It then hands them over, and the agent queues the runs
-  again in their order, under their own ids, and lists the ended ones as
-  ended. In between, `job_status` on a parked run answers "parked: its agent
-  is restarting".
+- keep holds them in memory by node. The agent's next process, once its
+  queue starts (§6), asks `POST /unpark {node}`. keep answers them and lets
+  them go. The agent queues the runs again in their order, under their ids,
+  and lists the ended ones as ended. A hold that lifts without a restart takes
+  them back the same way.
+- keep refuses `/exit` while it holds parked runs, unless forced.
+- While the agent is down, `job_status` on one of its runs answers that its
+  agent is restarting and to ask again, where it now says the run is not
+  found.
 - A run whose overlay carries chains is parked without them. The new process
-  then lacks them and refuses it as `JobError::Missing`, which is what a run
-  naming an unknown chain is refused with today. Its caller, a worker's call
-  that ended with the old process, has gone, so such a run ends there.
-- A hold that lifts without a restart (§3) takes its parked runs back from the
-  gateway, the same way.
-- A gateway that restarts while it holds a park loses it. That is the
-  everything-restarts-at-once case, out of scope.
+  lacks them and refuses it as `JobError::Missing`, as a run naming an unknown
+  chain is refused today. Its caller, a worker's call, ended with the old
+  process, so such a run ends there.
 
-## 5. The agent hands the build to keep
+## 6. A new process starts its queue once it is serving
+
+A process's agent starts no run until the process has printed the line keep
+proves a trial on, `INFO serving` (`cluster::upgrade::switch::PROOF`). keep
+proves the trial on that line, so a build never starts in a process that keep
+could still roll back. Until then the agent takes runs into its queue, and
+takes its parked runs back from keep when the line is printed.
+
+## 7. The agent hands the build to keep
 
 A `RunJob` that is a deploy says so: `deploy: Option<String>` names the
 service. When such a run has exited 0 and staged its binary, the agent itself
 asks its machine's keep for the trial before it gives back the slot. keep's
-local port (`127.0.0.1:8092`) gets `POST /trial {service, artifact, deploy}`,
-which is what the cluster route `/v1/keep/trial` takes (`keep/src/remote.rs`).
-The trial goes on keep's board under the deploy's id, `<node>:<id>` (`board.rs`),
-which the agent writes from its node and the run's id, as `service_deploy` does
-today. The run records what came of it (`JobView::tried`: asked, or refused
-with keep's reason), so `job_status` on a refused trial says why.
+local port gets `POST /trial {service, artifact, deploy}`, which is what the
+cluster route `/v1/keep/trial` takes (`keep/src/remote.rs`). The trial goes on
+keep's board under the deploy's id, `<node>:<id>` (`board.rs`), which the agent
+writes from its node and the run's id, as `service_deploy` does today. The run
+records what came of it (`JobView::tried`: asked, or refused with keep's
+reason), so `job_status` on a refused trial says why.
 
-- The build is handed off before the slot is free, so a hold that waits for the
-  run waits for the handoff too. Cause 3 is gone. keep's `/trial` answers as
-  soon as the trial is on its board, before it switches, so a trial that then
-  asks this same process for a hold does not wait on the run that asked for it.
+- The build is handed off before the slot is free, so a hold that waits for a
+  deploy waits for its handoff too. Cause 3 is gone. keep's `/trial` answers
+  once the trial is on its board, before it switches, so a trial that then asks
+  this same process for a hold does not wait on the run that asked for it.
 - `deploy.rs` `drive` and its `tokio::spawn` are removed. `service_deploy`
   submits the build with `deploy` set and answers as it does now.
-- **A motherd deploy.** The trial keep then starts asks motherd for a hold. If
-  a queued run took the slot in the moment between the handoff and keep's hold,
-  the trial waits for that run: a delay, never a kill. From then on the deploy
-  is followed on keep's board (`service::resolve`, `service::trial_in`), as it
-  is today.
+- **A motherd deploy.** The trial keep starts asks motherd for a hold. A queued
+  run that took the slot in the moment between the handoff and that hold is not
+  a deploy, so it is set aside (§3) and the trial goes on. From then on the
+  deploy is followed on keep's board (`service::resolve`, `service::trial_in`),
+  as it is today.
 - The daemon's deploy keeps `connector_job` ahead of it on the same agent. With
   the queue in the order runs came, the connector is staged before the daemon's
   trial starts, as today.
 
-## 6. Unchanged
+## 8. Unchanged
 
 - **When a pushed commit counts as tried** (`web/src/hooks/pushes.rs` `Told`,
   `on_push::due`) is left as it is. It was wrong only for a build that a restart
@@ -148,16 +170,34 @@ with keep's reason), so `job_status` on a refused trial says why.
   of another branch there briefly serves that branch's site. That is its own
   change, with the site-only deploy rule, not this one.
 
-## 7. Landing it
+## 9. Landing it
 
-Everything is in candle. It takes effect once deployed: keep on each machine
-(`/exit` onto the new `keep.exe`), a motherd deploy, and the gateway. The motherd
-deploy that brings it is the last planned restart that can kill a build: the old
-process has no hold to ask for.
+Everything is in candle. The tests sit beside the code:
 
-| Step | Crates | Tests beside the code |
+| Step | Crates | Tests |
 |---|---|---|
 | §2 slot | `agent` | two runs on two checkouts never run at once; runs start in the order they came; `slots_free` follows the slot and the queue |
-| §3 hold | `agent`, `cluster`, `keep` | a hold stops the queue and answers once the running run has staged; a run still going at `build_hold` does not stop the answer; a hold lifts by itself and the queue starts again; a second hold joins the first; `install_tick` holds before it takes a lease; keep asks for a hold before it stops a service, goes on at a 404, and asks none when forced |
-| §4 park | `agent`, `cluster` | a hold parks the queue and the recent ended runs; a new process of the agent gets them back in order under their ids; a lifted hold takes them back; a parked run's status says so |
-| §5 handoff | `agent`, `keep`, `zend` | keep's local `/trial` lands on the board under the deploy's id; a deploy run asks keep before it frees the slot; a refusal is recorded on the run |
+| §3 hold | `agent`, `cluster`, `keep` | a hold stops the queue and answers once a running deploy has handed off; a running test is stopped and put back at the head of the queue under its id; a deploy still going at `build_hold` does not stop the answer; a hold lifts by itself and the queue starts again; a second hold joins the first; `install_tick` holds before it takes a lease; keep asks for a hold before it stops a service with an `agent:` address, asks none of one without, and none when forced |
+| §5 park | `agent`, `keep` | a hold parks the queue and the recent ended runs on keep; the next process takes them back in order under their ids; a lifted hold takes them back; keep refuses `/exit` while it holds a park |
+| §6 serving | `agent`, `host` | no run starts before the process prints `PROOF`; parked runs are taken back once it has |
+| §7 handoff | `agent`, `keep`, `zend` | keep's local `/trial` lands on the board under the deploy's id; a deploy run asks keep before it frees the slot; a refusal is recorded on the run |
+
+**Rolling it out**, in this order:
+
+1. **keep on each machine first**: `/exit` onto the new `keep.exe`. keep's
+   services keep running and the new keep adopts them. Its file gains `agent:`
+   on the services that run builds:
+   - BlackWorld: `keep/keep.yaml`, `motherd`, in the repository;
+   - WhiteWorld: `C:\prog\keep-local.yaml`, `motherd`, edited on the machine;
+   - AlienWorld: `C:\Users\johna\prog\keep-local.yaml`, the agent, edited there
+     by the session on that machine.
+2. **The agent files** gain `build_hold` and lose `slots`: `motherd/agent.yaml`
+   (BlackWorld), `C:\prog\agent-local.yaml` (WhiteWorld),
+   `motherd/agent.laptop.yaml` (AlienWorld).
+3. **motherd on BlackWorld, while its agent is idle.** The process that brings
+   this is the last one with no hold, so it kills whatever is running when it
+   goes. Check `job_list` on BlackWorld's agent first, and deploy when it shows
+   nothing running. The other members take it through certification, and their
+   installs hold from then on.
+4. **The standalone agent on AlienWorld** takes the new build when the floor
+   rises, as it does today, and holds from then on.
