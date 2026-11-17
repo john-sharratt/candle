@@ -335,8 +335,9 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     tokio::spawn(drive(call.clone(), agents, h, host.clone(), service));
     Answer::ok(format!(
         "Started {job}: {service} to {host}, building origin/main with `cargo build --release -p \
-         {service}` — {}. When it has built, keep on {host} tries it: proven once it serves, or \
+         {}` — {}. When it has built, keep on {host} tries it: proven once it serves, or \
          rolled back.\n{}",
+        package_of(service),
         phase(&view.phase, node),
         next_steps(&job)
     ))
