@@ -91,8 +91,8 @@ fn admitted_once(hub: &Hub) -> (u64, Arc<AtomicBool>) {
 
 /// **A forwarder is given the members that serve, each at the address its
 /// socket came from**: one that is not ready yet is not among them.
-#[test]
-fn the_members_that_serve_are_listed_with_their_addresses() {
+#[tokio::test]
+async fn the_members_that_serve_are_listed_with_their_addresses() {
     let hub = Hub::new(GroupKey::from_bytes([3; 32]), "g");
     admitted_once(&hub);
     assert_eq!(hub.serving("zend"), Vec::new());

@@ -751,6 +751,7 @@ mod tests {
             "/oauth/authorize",
             &query(&good()),
             RESOURCE,
+            None,
             ESTATE,
             100,
         )
