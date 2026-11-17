@@ -110,6 +110,7 @@ mod relief_pacing;
 pub mod relief_trace;
 mod remote_arena;
 mod reproject_abandon;
+mod reproject_census;
 mod request_laps;
 mod run;
 mod sample;
@@ -151,6 +152,7 @@ use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
 use self::pool::pool_tokens_for;
 use self::relief_pacing::ReliefPacing;
+use self::reproject_census::{Outcome as ReprojectOutcome, Part as ReprojectPart, ReprojectCensus};
 use self::request_laps::RequestLaps;
 use self::wave_timing::WaveTiming;
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
@@ -4186,6 +4188,8 @@ pub(crate) struct Scheduler {
     wave_step_creep_layers: usize,
     /// When the section gate's relief may run next (`relief_pacing`).
     section_relief_pacing: ReliefPacing,
+    /// Every live reprojection's parts, summed and written once a minute.
+    reproject_census: ReprojectCensus,
     /// The query×key pairs the creep attended through those layers this step.
     wave_step_creep_layer_pairs: f64,
     /// Consecutive failures of the decode-less wave step and the wait owed
@@ -4561,6 +4565,7 @@ impl Scheduler {
             wave_step_creep_layer_rows: 0,
             wave_step_creep_layers: 0,
             section_relief_pacing: ReliefPacing::default(),
+            reproject_census: ReprojectCensus::new(Instant::now()),
             wave_step_creep_layer_pairs: 0.0,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),
@@ -11934,6 +11939,8 @@ impl Scheduler {
         };
         probe_span.end();
         let probe_ms = t_probe.elapsed().as_millis() as u64;
+        self.reproject_census
+            .add_since(ReprojectPart::Probe, t_probe);
         record_phase(t_probe, "reproject_probe_extract");
         REPROJ_SCAN_US.fetch_add(
             t_probe.elapsed().as_micros() as u64,
@@ -12086,6 +12093,15 @@ impl Scheduler {
         let pool_us = t_pool.elapsed().as_micros() as u64;
         observe_span.end();
         let observe_us = t_observe.elapsed().as_micros() as u64;
+        for (part, us) in [
+            (ReprojectPart::Warm, warm_us),
+            (ReprojectPart::Score, score_us),
+            (ReprojectPart::Hits, hits_us),
+            (ReprojectPart::WorkingSet, ws_us),
+            (ReprojectPart::Pool, pool_us),
+        ] {
+            self.reproject_census.add(part, us);
+        }
         // `observe_us` by part, on every reprojection — one whose selection is
         // unchanged reports no prepare split, and it is the one a decode waits
         // on most often.
@@ -12127,6 +12143,7 @@ impl Scheduler {
         // without lowering the threshold (which would admit noise mid-turn); the
         // strong carried signals survive, and RelLeak decays the challenger back
         // out over the turn if its fresh score doesn't hold up.
+        let t_challenger = Instant::now();
         if is_turn_boundary {
             // Collections (tool catalog) live in the shared system prompt:
             // challenge on section fresh scores.
@@ -12192,6 +12209,8 @@ impl Scheduler {
                 );
             }
         }
+        self.reproject_census
+            .add_since(ReprojectPart::Challenger, t_challenger);
 
         // 5. Re-project against the freshly-scored substrate.
         //
@@ -12304,6 +12323,8 @@ impl Scheduler {
         };
         project_span.end();
         let project_ms = t_project.elapsed().as_millis() as u64;
+        self.reproject_census
+            .add_since(ReprojectPart::Project, t_project);
         record_phase(t_project, "reproject_project");
         REPROJ_LAYOUT_US.fetch_add(
             t_project.elapsed().as_micros() as u64,
@@ -12329,8 +12350,11 @@ impl Scheduler {
             })
         };
         let identity_us = t_identity.elapsed().as_micros() as u64;
+        self.reproject_census
+            .add(ReprojectPart::Identity, identity_us);
         if view_state.applied_identity == Some(identity) {
             self.keep_unchanged_projection(view_id, composition);
+            self.end_reprojection(ReprojectOutcome::Kept, t_repro);
             tracing::debug!(
                 target: "candle_conversation::scheduler::reproject",
                 view = view_id.0,
@@ -12349,12 +12373,16 @@ impl Scheduler {
         // slow are the only thing at stake. Below the decode floor admission
         // defends, the turn keeps decoding on the view it has, and a later
         // trigger asks again. Nothing has moved yet, so not starting is free.
+        let t_lift = Instant::now();
         let lift = self.projection_lift(
             &policy.substrate,
             &projected_sections,
             &turn_keys_for_elevate,
         );
-        if !self.decode_floor_holds_after(lift) {
+        let floor_holds = self.decode_floor_holds_after(lift);
+        self.reproject_census.add_since(ReprojectPart::Lift, t_lift);
+        if !floor_holds {
+            self.end_reprojection(ReprojectOutcome::Declined, t_repro);
             tracing::debug!(
                 target: "candle_conversation::scheduler::reproject",
                 view = view_id.0,
@@ -12452,7 +12480,9 @@ impl Scheduler {
         // The view is rebuilt from this snapshot and freed: the outstanding
         // gap's rows for its blocks go in place first, so the snapshot carries
         // them converted.
+        let t_gap = Instant::now();
         self.catch_up_outstanding_gap();
+        self.reproject_census.add_since(ReprojectPart::Gap, t_gap);
         let t_snapshot = Instant::now();
         let tail_per_layer = {
             let _g = profile::span("reproject:snapshot_tail");
@@ -12616,6 +12646,16 @@ impl Scheduler {
         }
         free_span.end();
         let free_us = t_free.elapsed().as_micros() as u64;
+        for (part, us) in [
+            (ReprojectPart::Snapshot, snapshot_us),
+            (ReprojectPart::Seal, seal_us),
+            (ReprojectPart::Move, move_us),
+            (ReprojectPart::FreeView, free_view_us),
+            (ReprojectPart::Release, release_us),
+            (ReprojectPart::Truncate, truncate_us),
+        ] {
+            self.reproject_census.add(part, us);
+        }
         // The pure swap work (tail snapshot + free + truncate) ends here —
         // captured disjoint from elevate/glue/complete so `swap_ms` reflects
         // only the chunk-pool rebalance, not the whole reproject.
@@ -12639,8 +12679,11 @@ impl Scheduler {
         );
         elevate_span.end();
         let elevate_ms = t_elevate.elapsed().as_millis() as u64;
+        self.reproject_census
+            .add_since(ReprojectPart::Elevate, t_elevate);
         // Every other conversation whole, or not this time — and a rebuild that
         // withdrew one does not hold the selection its identity names.
+        let t_whole = Instant::now();
         let mut projected_segments = projected_segments;
         let identity = (!Self::keep_conversations_whole(
             &policy.substrate,
@@ -12649,6 +12692,8 @@ impl Scheduler {
             "reproject",
         ))
         .then_some(identity);
+        self.reproject_census
+            .add_since(ReprojectPart::Whole, t_whole);
 
         // Time the per-slot apply work (segment build now + finish later),
         // EXCLUDING the shared gap-fill wave — that wait is reported as `glue_ms`.
@@ -12665,6 +12710,8 @@ impl Scheduler {
             self.apply_projection_build(parent_id, &projected_segments)
         );
         let build_ms = t_build.elapsed().as_millis() as u64;
+        self.reproject_census
+            .add_since(ReprojectPart::Build, t_build);
         // The prepare half step by step, where the reproject line has one field
         // per phase: which part of `scan_ms` / `swap_ms` / `apply_ms` the time is.
         note("reproject prepare split", || {
@@ -12701,6 +12748,22 @@ impl Scheduler {
             question_tokens: old_view_state.map(|v| v.question_tokens).unwrap_or(0),
             identity,
         }))
+    }
+
+    /// Count a reprojection that ended as `outcome`, started at `started`, and
+    /// write the census once its minute is up.
+    fn end_reprojection(&mut self, outcome: ReprojectOutcome, started: Instant) {
+        let now = Instant::now();
+        self.reproject_census.ended(
+            outcome,
+            now.saturating_duration_since(started).as_micros() as u64,
+        );
+        if let Some(census) = self.reproject_census.due(now) {
+            tracing::info!(
+                target: "candle_conversation::scheduler::reproject",
+                "reprojection census {census}"
+            );
+        }
     }
 
     /// Complete phase of reprojection — runs after the batched gap-fill forward
@@ -12808,6 +12871,10 @@ impl Scheduler {
         );
         self.begin_unit(parent_id, "reprojected turn");
         finish_span.end();
+        self.reproject_census
+            .add(ReprojectPart::Glue, glue_ms * 1000);
+        self.reproject_census
+            .add_since(ReprojectPart::Finish, t_finish);
         // apply_ms = this slot's segment build + finish, NOT the shared gap-fill
         // wave (reported separately as glue_ms), so it no longer absorbs the
         // cross-slot wave wait.
@@ -12931,6 +12998,8 @@ impl Scheduler {
 
         inject_span.end();
         let inject_ms = t_inject.elapsed().as_millis() as u64;
+        self.reproject_census
+            .add_since(ReprojectPart::Inject, t_inject);
 
         // Carve a fresh view from the rebuilt parent, borrowing every chunk, and
         // re-bind the turn to it. The active turn's content starts where the new
@@ -12975,6 +13044,7 @@ impl Scheduler {
         }
         view_span.end();
         let view_ms = t_view.elapsed().as_millis() as u64;
+        self.reproject_census.add_since(ReprojectPart::View, t_view);
         // The new view's slot may have been recycled from the freed old view's.
         self.slot_tokens.remove(&new_view_id);
         self.turn_views.insert(
@@ -13002,6 +13072,7 @@ impl Scheduler {
         // but separated by the shared glue wave — can be read against a real
         // total instead of summed by eye.
         let total_ms = t_repro.elapsed().as_millis() as u64;
+        self.end_reprojection(ReprojectOutcome::Rebuilt, t_repro);
 
         // Per-reproject timing breakdown — an event, not a log line: a
         // continuous-reproject run reprojects several times a second.
