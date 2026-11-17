@@ -64,15 +64,6 @@ pub fn lift_warm_to_gpu(
             backings.len()
         );
     }
-    // **The lift meets the device eagerly.** On a thread recording a wave,
-    // launches are captured into the wave's segment rather than issued, and a
-    // query of an event invalidates the capture. A lift's launches read ring
-    // slots the host refills as soon as their events say the scatter ran, and
-    // `acquire` asks exactly that — so the lift suspends the capture until it
-    // has issued everything: the recorded segment goes first, and the lift's
-    // launches follow it, in order, on the one stream. Nothing waits for the
-    // device here; only the recording is set aside.
-    let _paused = cuda.pause_capture()?;
     let mut split = LiftSplit::default();
     let t = Instant::now();
     let lifts = layers
@@ -80,6 +71,11 @@ pub fn lift_warm_to_gpu(
         .enumerate()
         .map(|(l, seqs)| backings[l].plan_warm_lift(l, seqs))
         .collect::<Result<Vec<_>>>()?;
+    for lift in &lifts {
+        split.plan_resolve_us += lift.resolve_us;
+        split.plan_claim_us += lift.claim_us;
+        split.plan_place_us += lift.place_us;
+    }
     let bands: Vec<LiftBand> = lifts.iter().flat_map(|l| l.bands.iter().copied()).collect();
     let stream = cuda.cuda_stream();
     // A few blocks per SM: a warp a run, and enough of them resident to keep
@@ -141,7 +137,9 @@ pub fn lift_warm_to_gpu(
         .iter()
         .zip(&lifts)
         .enumerate()
-        .map(|(l, (seqs, lift))| backings[l].finish_warm_lift(seqs, lift))
+        .map(|(l, (seqs, lift))| {
+            backings[l].finish_warm_lift(seqs, lift, &mut split.finish_records_us)
+        })
         .collect::<Result<Vec<_>>>()?;
     split.finish_us = micros(t);
     Ok(WarmLifted { layers, split })

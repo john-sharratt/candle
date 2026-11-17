@@ -91,10 +91,6 @@ impl WarmLiftRing {
     /// region and its table region, both writable. The wait is the ring's
     /// only one, and a slot no scatter has read since it was last filled has
     /// nothing to wait for.
-    ///
-    /// Queries and waits on an event, which invalidate a wave capture: the
-    /// caller holds the capture paused (`lift_warm_to_gpu` does, for the whole
-    /// lift).
     pub(crate) fn acquire(&mut self) -> Result<SlotFill<'_>> {
         let k = self.next;
         self.next = (self.next + 1) % SLOTS;

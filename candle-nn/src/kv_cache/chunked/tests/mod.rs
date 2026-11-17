@@ -33,4 +33,5 @@ mod selection_table_tests;
 mod sequence_ops_tests;
 mod stream_gate;
 mod types_tests;
+mod warm_lift_bench;
 mod warm_lift_tests;

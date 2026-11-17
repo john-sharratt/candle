@@ -296,6 +296,27 @@ impl HeadGids {
         Ok(HeadGids(Arc::new(out)))
     }
 
+    /// Map every slot's GID through `f`, which is called once per slot and must
+    /// answer the same raw id for the same input raw id — a lookup in a table
+    /// the caller already built — so slots that shared a GID share one after.
+    /// [`Self::map_unique`] keeps its own cache for an `f` that mints; this
+    /// keeps none. Detached / sentinel GIDs (raw < 0) pass through without
+    /// calling `f`.
+    pub fn map_each<F>(&self, mut f: F) -> candle::Result<HeadGids>
+    where
+        F: FnMut(&ChunkGid) -> candle::Result<ChunkGid>,
+    {
+        let out = self
+            .0
+            .iter()
+            .map(|gid| match gid.raw() {
+                raw if raw < 0 => Ok(ChunkGid::detached(raw)),
+                _ => f(gid),
+            })
+            .collect::<candle::Result<Vec<_>>>()?;
+        Ok(HeadGids(Arc::new(out)))
+    }
+
     /// Whether all slots point to the same `(arena_idx, chunk_idx)`.
     #[inline]
     pub fn is_uniform(&self) -> bool {
@@ -463,6 +484,29 @@ mod tests {
         );
         assert!(unique_out.contains(&1010));
         assert!(unique_out.contains(&1020));
+    }
+
+    /// `map_each` maps every slot, passes sentinels through without calling
+    /// `f`, and a table lookup keeps the sharing structure: slots that shared
+    /// an id share its mapping.
+    #[test]
+    fn map_each_maps_every_slot_and_passes_sentinels() {
+        let gids = HeadGids::from_vec(vec![
+            ChunkGid::detached(1),
+            ChunkGid::detached(-1),
+            ChunkGid::detached(2),
+            ChunkGid::detached(1),
+        ]);
+        let mut calls = 0usize;
+        let result = gids
+            .map_each(|gid| {
+                calls += 1;
+                Ok(ChunkGid::detached(gid.raw() + 100))
+            })
+            .unwrap();
+        assert_eq!(calls, 3);
+        let out: Vec<i64> = result.iter().map(|g| g.raw()).collect();
+        assert_eq!(out, vec![101, -1, 102, 101]);
     }
 
     // ── arena_byte_size regression tests ─────────────────────────────────

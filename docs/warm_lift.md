@@ -78,14 +78,24 @@ the other into the destination arena slots.
 One pass over all layers and items, under each backing's storage read lock once:
 
 - every unique source band gid with its byte length (from its tag, as now), its
-  arena and slot;
+  arena and slot — one table of sources and one gid → position index, the arena key
+  read once per arena, not once per band;
 - the destination slots, allocated in one `state.write()` per backing — palette-band
-  runs contiguous, as `migrate_sealed_to_gpu_batch_async` does today;
+  runs contiguous — in two batched claims: every run through
+  `alloc_chunk_runs_for_keys`, then the rest through one `alloc_chunks_for_key_bulk`
+  per key;
 - the plan cut into **slot batches** of at most `SLOT_BYTES` payload each, in source
   order, a band never split across two batches.
 
 Each batch's descriptor table is `{src offset in the slot, dst device address, bytes}`
 per band — the shape of `MigrationPlan`'s records, and of the expert path's item table.
+
+A lift carries ~10^5 bands at a working set's size, so the plan's per-band cost is the
+lift's cost: three hash maps a band, a vector and a hash set a palette run, and a claim
+a run took the bench's 192 MiB lift 35 ms to plan, against 13 ms to copy (§7). The
+rebuild after is the same shape: every lifted chunk's records in **one**
+`build_meta_records` call for the layer, and each gid mapped through the plan's index
+(`HeadGids::map_each`), not through a cache built per chunk.
 
 ### 3.2 The ring
 
@@ -114,31 +124,63 @@ A slot batch is split into four contiguous runs of bands of about equal bytes, o
 thread; each copies its bands from their arena slots into its own byte range of the
 slot (`Arena::copy_slot_bytes`), under one storage read of each layer it crosses.
 Spawning four threads costs tens of microseconds against a slot's ~0.5 ms of copying.
-Four streams of pageable reads outrun a ×16 link; one does not on PCIe 5.0, and on
-the 3090 and the 4090 Laptop (~12 GB/s links) the link is the limit with room to spare.
+
+Measured on BlackWorld (`bench_host_copy_into_the_ring_by_threads`, pageable source
+scattered over 512 MiB into the write-combined slot, a thread spawned per slot):
+
+| Band | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| 1 KiB | 10.8 GB/s | 15.6 | **18.6** | 15.9 |
+| 4 KiB | 12.8 | 17.9 | **20.3** | 16.8 |
+| 16 KiB | 16.5 | 21.3 | **22.6** | 15.9 |
+
+Four threads beat one by 1.4–1.7× and eight lose, so four it is. Writing the
+write-combined slot costs nothing over writing pageable memory (within 5 % at every
+point). On PCIe 5.0 this copy, not the link, is the lift's limit; on the 3090 and the
+4090 Laptop (~12 GB/s links) the link is.
 
 The scatter launch for a slot returns at once, so the copiers fill the next slot while
 the GPU drains the last.
 
 ### 3.4 The scatter kernel
 
-`warm_lift_scatter` (`candle-kernels/src/simple/`, beside `kv_migrate.cu`), one launch
-per filled slot on the device's stream:
+`warm_lift_scatter` (`candle-kernels/src/simple/warm_lift.cu`), one launch per filled
+slot on the device's stream. It and `kv_migrate_copy` are one copy,
+`candle-kernels/src/simple/scatter_copy.cuh`:
 
-- `W` = 8 blocks of 128 threads (`docs/moe_live_dispatch_design.md` §0.10: 4–8 blocks
-  saturate the link; more only hold SM slots while waves run);
-- blocks take bands from the slot's descriptor table — read from the slot itself, so
-  **nothing is uploaded**;
-- each thread keeps four 16-byte loads in flight (`ld.global.cg.v4.u32`), then stores
-  them — the copy loop of `moe_live_ahead_piece` (`candle-kernels/src/quantized/kernel.cuh`),
-  reused, not reinvented. A plain one-load loop over the same memory measured 2.2 GB/s;
+- **a warp owns a band**, taken grid-stride from the slot's descriptor table — read
+  from the slot itself, so **nothing is uploaded**. Lanes 0–2 read the row's three
+  words and the warp shares them by shuffle. A band is ~1–4 KB, so a block a band
+  (the first build: 8 blocks of 128 threads) left most of each block idle and paid a
+  round trip a band — 0.55 GB/s in production;
+- each lane keeps four 16-byte loads in flight, then stores them — the copy loop of
+  `moe_live_ahead_piece` (`candle-kernels/src/quantized/kernel.cuh`). A warp moves
+  2 KB a round trip, about one band;
+- 256 threads a block, `__launch_bounds__(256, 6)`: six blocks fill an SM of 1,536
+  threads (sm_86, sm_89, sm_120), 48 warps of round trips in flight. 32-bit unit
+  indices hold both kernels to 40 registers with no spills on sm_86 and sm_89;
+  `kv_migrate_copy` spills 12 B on sm_120, which 32-bit strides did not remove. The
+  grid is the SM count × 6, trimmed to the bands there are;
 - loads are `ld.global.cv`, not `.cg`: the host rewrites a slot in place every time it
   reuses it, and `.cg` may be served from an L2 line an earlier batch's read of the
-  same address left behind — the reason the expert path's CPU result ring reads `.cv`;
-- a band whose destination or length is not 16 B-aligned is copied bytewise; every
-  band starts 16 B-aligned in the slot because the host lays them out that way.
+  same address left behind — the reason the expert path's CPU result ring reads `.cv`.
+  `kv_migrate_copy` reads device memory once and loads `.cg`;
+- a band whose source, destination or length is not 16 B-aligned is copied bytewise;
+  every band starts 16 B-aligned in the slot because the host lays them out that way.
 
 The destination is written directly: no device staging buffer, no second copy.
+
+Measured on BlackWorld (`bench_warm_lift_scatter_alone`, an 8 MiB slot to scattered
+destinations), against the copy engine moving the same slot in one transfer at
+56.9 GB/s:
+
+| Band | 1 KiB | 2,176 B | 4 KiB | 16 KiB | 64 KiB | 256 KiB |
+|---|---|---|---|---|---|---|
+| GB/s | 35.5 | 39.6 | 43.4 | 43.8 | 47.7 | 48.9 |
+
+`kv_migrate_copy` device → device (`bench_kv_migrate_copy_alone`) moves ~650 GB/s at
+every band size from 1 KiB to 64 KiB, which is the card's DRAM bandwidth (each byte
+read and written).
 
 ### 3.5 Ordering, with no host sync
 
@@ -189,6 +231,9 @@ copiers and the scatter is unchanged.
 | The host copiers | `candle-nn/src/kv_cache/chunked/warm_lift/copiers.rs` |
 | The lift (plan → fill → scatter → rebuild) | `candle-nn/src/kv_cache/chunked/warm_lift/mod.rs`, `lift_warm_to_gpu` |
 | The scatter kernel | `candle-kernels/src/simple/warm_lift.cu`, FFI in `candle-kernels/src/simple/warm_lift.rs` |
+| The copy both scatter kernels share | `candle-kernels/src/simple/scatter_copy.cuh` |
+| Where a lift's host time goes | `candle-nn/src/kv_cache/chunked/warm_lift/split.rs`, `LiftSplit`, logged on the `elevate_to_hot phases` line |
+| The micro harness | `candle-nn/src/kv_cache/chunked/tests/warm_lift_bench.rs` |
 | The ring's memory | `PinnedBuf::alloc_owned_mapped` (`candle-core/src/quantized/pinned_staging.rs`) |
 | The caller | `elevate_to_hot`'s warm leg, one call in place of the layer loop; the scheduler holds the ring (`Scheduler::warm_lift_ring`), allocated at the first lift |
 | Removed | `migrate_sealed_to_gpu_batch_async`, and `elevate_to_hot`'s `copy_stream` and `pinned_scratch` |
@@ -211,6 +256,11 @@ In `candle-nn/src/kv_cache/chunked/tests/warm_lift_tests.rs` unless named:
 - **The plan** (CPU, `warm_lift/plan.rs`): batches packed 16-byte aligned, cut at the
   slot and at the table's room, never split a band, every band placed once.
 - Order 1 of §3.5 is the stream's FIFO, which needs no test of its own.
+- **The micro harness** (`tests/warm_lift_bench.rs`, `#[ignore]`d, run alone with
+  `--ignored --nocapture --test-threads=1`): the host copy by thread count, each scatter
+  kernel alone over every band size, and a whole lift shaped like production's —
+  twelve layers, two KV heads, items of 256 tokens — timed to the device landing it,
+  with its `LiftSplit`.
 
 ## 7. What it should reach
 
@@ -220,8 +270,23 @@ In `candle-nn/src/kv_cache/chunked/tests/warm_lift_tests.rs` unless named:
 - **Waits:** none for a lift of at most 16 MiB; at most one GPU drain to the first
   scatter for a larger one.
 - **This conversation's warm lifts:** ~1.7 s → well under 0.2 s.
-- **Measured by** the `elevate_to_hot phases` line (`warm_hot_ms`, `warm_bytes`) and the
+- **Measured by** the `elevate_to_hot phases` line (`warm_hot_ms`, `warm_bytes`, and the
+  lift's split: `warm_plan_us` with its `resolve`/`claim`/`place` parts, `warm_fill_us`,
+  `warm_wait_us`, `warm_launch_us`, `warm_finish_us` with its `records` part) and the
   reprojection census's `elevate_ms`, before and after, on BlackWorld and the 3090 box.
+
+**Measured** on BlackWorld (`bench_whole_lift`, 64 items, 98,304 bands, 192 MiB, to the
+device landing it):
+
+| | plan | fill | launch | finish | whole lift |
+|---|---|---|---|---|---|
+| block-a-band kernel, per-band maps | — | — | — | — | 0.55 GB/s in production |
+| warp-a-band kernel, per-band maps | 35.2 ms | 13.2 | 0.5 | 17.6 | 67.5 ms, 2.98 GB/s |
+| plan and rebuild batched (§3.1) | 10.6 ms | 12.6 | 0.5 | 8.0 | **32.7 ms, 6.16 GB/s** |
+
+The copy is now the largest part, at the four-thread rate of §3.3; the plan's claims
+(4.2 ms) and the rebuild's gid mapping (~5.5 ms, a refcount per gid) are what remains
+of the bookkeeping.
 
 ## 8. Not this design
 

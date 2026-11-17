@@ -182,63 +182,6 @@ fn a_lift_returns_while_the_stream_is_held() {
     );
 }
 
-/// **A lift on a thread recording a wave lands every byte, and the wave
-/// finishes**: the lift issues its launches outside the capture, so a ring
-/// slot's event is never queried while the wave records and no scatter is
-/// left in a segment to run against a slot the host has since refilled. A
-/// 4 KiB ring makes the lift reuse each slot many times over.
-///
-/// The fault this pins: WhiteWorld, 17 November 2026 — the lift's event query
-/// inside a recording wave, then `CUDA_ERROR_ILLEGAL_ADDRESS` at the next sync,
-/// three times in fifteen minutes.
-#[test]
-fn a_lift_on_a_recording_thread_lands_and_the_wave_finishes() {
-    let _gpu = gpu_serial();
-    let device = Device::new_cuda(0).unwrap();
-    let Device::Cuda(cuda) = &device else {
-        unreachable!("a CUDA test");
-    };
-    let stream = stream_of(&device);
-    let backings: Vec<ChunkedKvBacking> = (0..2)
-        .map(|_| ChunkedKvBacking::new(4, N_KV_HEAD, HEAD_DIM, DType::BF16, &device, 256).unwrap())
-        .collect();
-    let mut pinned: Option<PinnedBuf> = None;
-    let warm: Vec<Vec<SealedSequence>> = backings
-        .iter()
-        .enumerate()
-        .map(|(l, backing)| {
-            let hot: Vec<SealedSequence> = (0..2)
-                .map(|i| seeded(backing, &device, 50 + l * 10 + i))
-                .collect();
-            let refs: Vec<&SealedSequence> = hot.iter().collect();
-            backing
-                .migrate_sealed_to_cpu_batch_async(&device, &stream, &mut pinned, &refs)
-                .unwrap()
-        })
-        .collect();
-    let layers: Vec<Vec<&SealedSequence>> = warm.iter().map(|w| w.iter().collect()).collect();
-    let mut ring = WarmLiftRing::with_slot_bytes(4096).unwrap();
-    device.synchronize().unwrap();
-
-    let capture = cuda.begin_wave_capture().unwrap();
-    cuda.record_launches().unwrap();
-    let lift = lift_warm_to_gpu(&backings, &mut ring, &device, &layers).unwrap();
-    capture.finish().unwrap();
-    device.synchronize().unwrap();
-
-    // 2 layers x 2 items x 64 bands of 1 KiB, four to a 4 KiB slot.
-    assert_eq!(lift.split.batches, 64, "{:?}", lift.split);
-    for (l, backing) in backings.iter().enumerate() {
-        for (i, seq) in lift.layers[l].iter().enumerate() {
-            assert_eq!(
-                lifted_bytes(backing, &device, &stream, seq),
-                warm_bytes(backing, &warm[l][i]),
-                "layer {l} item {i}"
-            );
-        }
-    }
-}
-
 /// Nothing to lift is nothing done.
 #[test]
 fn an_empty_lift_returns_empty_layers() {

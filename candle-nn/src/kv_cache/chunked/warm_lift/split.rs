@@ -11,10 +11,17 @@
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LiftSplit {
     pub plan_us: u64,
+    /// Of `plan_us`: reading the source bands' arenas and lengths, claiming
+    /// their destination slots, and resolving the slots' device addresses.
+    pub plan_resolve_us: u64,
+    pub plan_claim_us: u64,
+    pub plan_place_us: u64,
     pub fill_us: u64,
     pub wait_us: u64,
     pub launch_us: u64,
     pub finish_us: u64,
+    /// Of `finish_us`: building the lifted chunks' resident records.
+    pub finish_records_us: u64,
     /// Ring slots filled.
     pub batches: u64,
     /// Descriptor entries launched.
@@ -34,14 +41,20 @@ impl LiftSplit {
 mod tests {
     use super::*;
 
+    /// The total is the phases, not their parts: a part is already inside its
+    /// phase.
     #[test]
     fn the_total_is_every_phase() {
         let s = LiftSplit {
             plan_us: 1,
+            plan_resolve_us: 7,
+            plan_claim_us: 7,
+            plan_place_us: 7,
             fill_us: 20,
             wait_us: 300,
             launch_us: 4_000,
             finish_us: 50_000,
+            finish_records_us: 7,
             batches: 2,
             entries: 9,
             bytes: 1 << 20,
