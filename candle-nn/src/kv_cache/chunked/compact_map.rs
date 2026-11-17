@@ -74,6 +74,7 @@ use super::head_gids::HeadGids;
 #[cfg(feature = "cuda")]
 use super::meta_pool::MetaGid;
 use super::types::{SealedChunk, SealedSequence};
+use crate::kv_cache::ArenaLocation;
 
 /// Where every relocated chunk went, published once per pass.
 ///
@@ -620,9 +621,20 @@ pub fn rewrite_sealed(
     // every resident turn, ~120 ms a pass on a long-lived substrate. Nothing is cloned
     // until the first chunk that actually changes, and only its sequence and the ones
     // after it are rebuilt.
+    //
+    // **A host sequence is not walked.** A pass relocates GPU arenas only, and every
+    // chunk of a sequence resolves to an arena at its `location`, so a warm copy names
+    // nothing a pass can have moved — and the warm tier is most of what a long-lived
+    // substrate holds, so it was most of every sweep. Skipping it is sound for the
+    // same reason an unreached holder is: a holder the sweep does not rewrite keeps
+    // its own ground alive and reads it correctly.
     let mut out: Option<Vec<SealedSequence>> = None;
     for (i, seq) in seqs.iter().enumerate() {
-        let chunks = rewrite_chunks(&seq.chunks, sweep)?;
+        let chunks = if seq.location == ArenaLocation::Gpu {
+            rewrite_chunks(&seq.chunks, sweep)?
+        } else {
+            None
+        };
         match (chunks, out.as_mut()) {
             (Some(chunks), Some(out)) => out.push(with_chunks(seq, chunks)),
             (Some(chunks), None) => {
@@ -724,7 +736,6 @@ mod tests {
     use super::*;
     use crate::kv_cache::chunked::meta_pool::MetaGid;
     use crate::kv_cache::chunked::types::GID_STRIDE;
-    use crate::kv_cache::ArenaLocation;
 
     fn raw(arena: usize, chunk: usize) -> i64 {
         (arena * GID_STRIDE + chunk) as i64
@@ -912,6 +923,39 @@ mod tests {
         let mut sweep = Sweep::new(&map);
         assert!(rewrite_sealed(&[seq], &mut sweep).unwrap().is_none());
         assert_eq!(sweep.allocations_rewritten(), 0);
+    }
+
+    /// **A host sequence is not walked, and a GPU one beside it still is.** The two
+    /// name the same raw id, so the only thing telling them apart is `location`: the
+    /// warm copy is carried through as it is, the hot one is rewritten.
+    #[test]
+    fn a_host_sequence_is_carried_through_unwalked() {
+        let seq = |location| SealedSequence {
+            chunks: vec![chunk_with(HeadGids::uniform(
+                ChunkGid::detached(raw(5, 2)),
+                1,
+            ))],
+            token_count: 32,
+            chunk_size: 32,
+            location,
+        };
+        let mut map = CompactionMap::new();
+        map.insert(raw(5, 2), ChunkGid::detached(raw(0, 1)), 0x4000);
+        let mut sweep = Sweep::new(&map);
+        assert!(rewrite_sealed(&[seq(ArenaLocation::Cpu)], &mut sweep)
+            .unwrap()
+            .is_none());
+        assert_eq!(sweep.allocations_rewritten(), 0, "nothing walked");
+
+        let out = rewrite_sealed(
+            &[seq(ArenaLocation::Cpu), seq(ArenaLocation::Gpu)],
+            &mut sweep,
+        )
+        .unwrap()
+        .expect("the hot copy moved");
+        assert_eq!(out[0].chunks[0].gids.as_slice()[0].raw(), raw(5, 2));
+        assert_eq!(out[0].location, ArenaLocation::Cpu);
+        assert_eq!(out[1].chunks[0].gids.as_slice()[0].raw(), raw(0, 1));
     }
 
     /// **Copy on write keeps every untouched chunk and sequence, in order.** The sweep

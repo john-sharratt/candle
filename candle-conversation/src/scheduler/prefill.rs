@@ -205,6 +205,12 @@ pub(crate) enum VramPhase {
 /// reload churn the old watermark ladder was built to damp.
 const RELIEF_OVERSHOOT_REGIONS: usize = 8;
 
+/// [`Scheduler::frontier_holder`]'s answer when a KV arena stands on the top region.
+pub(super) const KV_POOLS: &str = "the KV pools";
+
+/// [`Scheduler::frontier_holder`]'s answer when held ground stands on it.
+pub(super) const HELD_GROUND: &str = "held ground";
+
 /// How long prefill throughput must be COMPLETELY silent (no forward
 /// completing) under surviving VRAM pressure before the promote path halves
 /// the admission window. Longer than any healthy forward (the widest
@@ -417,27 +423,14 @@ impl Scheduler {
         let (frontier, holes) = self.session.kv_region_stats().map_or((0, 0), |s| {
             (s.live_watermark, s.live_watermark.saturating_sub(s.live))
         });
-        let top = frontier.checked_sub(1);
+        let holder = self.frontier_holder(frontier);
         let ordinal = match self.session.device().location() {
             candle::DeviceLocation::Cuda { gpu_id } => Some(gpu_id),
             _ => None,
         };
-        let held_top = ordinal.and_then(candle_nn::kv_cache::held_ground_top_rank);
-        let holder = if top.is_none() {
-            "nothing"
-        } else if self.session.kv_top_rank() == top {
-            "the KV pools"
-        } else if held_top == top {
-            "held ground"
-        } else {
-            candle_nn::kv_cache::SlotTenant::ALL
-                .iter()
-                .find(|&&t| candle_nn::kv_cache::arena_top_rank(self.session.device(), t) == top)
-                .map_or("unaccounted", |t| t.label())
-        };
         // Held ground is raw ranges, not slots a pass can move: what holds it is
         // the call sites, the largest three.
-        let held_sites = if holder == "held ground" {
+        let held_sites = if holder == HELD_GROUND {
             ordinal
                 .and_then(candle_nn::kv_cache::held_ground_sites)
                 .unwrap_or_default()
@@ -460,6 +453,32 @@ impl Scheduler {
             "lowered the arena frontier for a refused tier"
         );
         gained
+    }
+
+    /// Who stands on the region just below `frontier` — the one whose ground holds
+    /// the frontier where it is: the KV pools, held ground, or a span tenant by its
+    /// label. `"unaccounted"` names ground none of them reports, which is a tenant
+    /// missing from this list.
+    pub(super) fn frontier_holder(&self, frontier: usize) -> &'static str {
+        let Some(top) = frontier.checked_sub(1) else {
+            return "nothing";
+        };
+        if self.session.kv_top_rank() == Some(top) {
+            return KV_POOLS;
+        }
+        let held_top = match self.session.device().location() {
+            candle::DeviceLocation::Cuda { gpu_id } => {
+                candle_nn::kv_cache::held_ground_top_rank(gpu_id)
+            }
+            _ => None,
+        };
+        if held_top == Some(top) {
+            return HELD_GROUND;
+        }
+        candle_nn::kv_cache::SlotTenant::ALL
+            .iter()
+            .find(|&&t| candle_nn::kv_cache::arena_top_rank(self.session.device(), t) == Some(top))
+            .map_or("unaccounted", |t| t.label())
     }
 
     /// The span ground held ground's arenas stand on now — zero off CUDA or

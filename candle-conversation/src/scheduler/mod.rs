@@ -237,6 +237,7 @@ use self::projection_identity::{
 };
 pub(crate) use self::remote_arena::RemoteArena;
 pub use self::settle::SettleReport;
+use self::settle::SettledGround;
 use self::turn_group::{GroupCaseId, TurnGroup};
 use candle::engine_events::note;
 use flume::{Receiver, Sender, TryRecvError};
@@ -3682,6 +3683,10 @@ pub(crate) struct Scheduler {
     /// so the weight side grows back into what the finished work left behind
     /// while there is nothing in flight to pace against.
     pub(super) settle_owed: bool,
+    /// The partition the last settle left — what the idle branch compares the
+    /// ground with to tell whether something freed since owes another
+    /// (`settle::resettle_owed`). `None` before the first settle.
+    pub(super) settled_ground: Option<SettledGround>,
     /// Callers waiting on that settle ([`SchedulerRequest::Settle`]), each sent
     /// its report when the idle branch runs it.
     pub(super) settle_waiters: Vec<Sender<SettleReport>>,
@@ -4471,6 +4476,7 @@ impl Scheduler {
             // See the field: the first pass has nothing to wait for.
             settled_since_admit: true,
             settle_owed: false,
+            settled_ground: None,
             settle_waiters: Vec::new(),
             norm_warm: NormWarm::default(),
             last_kv_compaction: None,

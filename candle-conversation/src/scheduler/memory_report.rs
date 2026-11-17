@@ -372,6 +372,10 @@ pub struct KvSection {
     /// it appears as regions the class rows cannot account for, which reads exactly
     /// like a second tenant holding ground. Measured — 734 phantom regions.
     pub frontier_regions: usize,
+    /// Who stands on the region just below [`Self::frontier_regions`] — the KV pools,
+    /// held ground, or a span tenant by its label — in the same breath. What a
+    /// frontier that stays up with the pools packed is waiting on.
+    pub frontier_holder: &'static str,
     /// Regions held by any tenant at that same moment — arenas and span tenants.
     pub live_regions: usize,
     /// Of [`Self::live_regions`], the ones a span tenant holds: a sequence's
@@ -662,6 +666,7 @@ impl Scheduler {
             classes,
             arenas,
             frontier_regions: ground.watermark,
+            frontier_holder: self.frontier_holder(ground.watermark),
             live_regions: ground.live_arenas,
             span_regions: ground.span_regions,
             record_regions: ground.record_regions,
@@ -937,6 +942,7 @@ mod tests {
                 // nothing stranded and nothing sparse — the shape a consumer dividing
                 // `packed_arenas` by the frontier should read as fully efficient.
                 frontier_regions: 1,
+                frontier_holder: "the KV pools",
                 live_regions: 1,
                 span_regions: 0,
                 record_regions: 0,

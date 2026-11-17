@@ -8,12 +8,21 @@
 //! the weight side can only grow back over a frontier that packing has lowered.
 //! [`Scheduler::settle_device`] runs the three to completion, in that order.
 //!
-//! It runs when the scheduler falls idle after doing work — and only then. A
-//! request for it ([`super::SchedulerRequest::Settle`]), which is how a caller
-//! that has just evicted a timeline learns the card is ready for the next
-//! request, is answered by that same idle settle: none of the three is budgeted,
-//! so run from the request drain beside live decodes it would hold every one of
-//! them for as long as the passes took.
+//! It runs when the scheduler falls idle after doing work, and again while idle
+//! whenever ground has been freed since the last settle left the partition
+//! ([`resettle_owed`]). A request for it ([`super::SchedulerRequest::Settle`]),
+//! which is how a caller that has just evicted a timeline learns the card is
+//! ready for the next request, is answered by that same idle settle: none of the
+//! three is budgeted, so run from the request drain beside live decodes it would
+//! hold every one of them for as long as the passes took.
+//!
+//! **Ground keeps freeing after the work has gone.** Idle conversations are
+//! released, durable recurrent stores parked and idle hot copies demoted minutes
+//! after the last forward, each on its own clock. A settle run only on falling
+//! idle packed against the ground as it stood then and never saw what those freed:
+//! on BlackWorld (5177, 2026-11-17) the frontier fell from 1,687 regions to 861
+//! when the sessions released, with 141 live, and stood there with ~24 GB fewer
+//! experts resident than the span could hold until the next request arrived.
 
 use candle::Device;
 use candle_nn::kv_cache::{end_wave_transient, forget_recent_tiers, settle_held_ground};
@@ -56,6 +65,28 @@ const MAX_NEGOTIATIONS: usize = 64;
 /// policy's own one-negotiation guard (`GrowthPolicy::spare`), so a single flat
 /// reading is that guard and not yet the end of what is spare.
 const FLAT_NEGOTIATIONS: usize = 2;
+
+/// The partition's shape a settle is judged against: regions live, and the
+/// frontier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SettledGround {
+    pub live: usize,
+    pub frontier: usize,
+}
+
+/// Whether an idle scheduler owes another settle: ground has changed since the
+/// last one left the partition at `settled`, and the frontier now stands above
+/// what is live — holes a pack could close, or a frontier a tenant gave up.
+///
+/// **Only on a change.** A settle that could not lower the frontier leaves it
+/// above `live` (a tenant standing on the top region that no pass can move), and
+/// asking again over the same ground repeats every pass for nothing; the gate
+/// behind each pass already refuses that, but the passes still census to find out.
+/// A shape no settle has seen yet (`None`) is owed one whenever the frontier is
+/// above what is live.
+pub(super) fn resettle_owed(settled: Option<SettledGround>, now: SettledGround) -> bool {
+    now.frontier > now.live && settled != Some(now)
+}
 
 /// Offer the weight side ground until it stops taking it. `negotiate` runs one
 /// negotiation and answers the zone's extent after it; `start` is the extent
@@ -133,10 +164,15 @@ impl Scheduler {
             arenas_released,
             negotiations,
         };
+        self.settled_ground = Some(SettledGround {
+            live: report.live_regions,
+            frontier: report.frontier,
+        });
         tracing::info!(
             target: "candle_conversation::scheduler::vram_relief",
             live_regions = report.live_regions,
             frontier = report.frontier,
+            holder = self.frontier_holder(report.frontier),
             weight_mib = report.weight_bytes >> 20,
             grown_mib = report.weight_bytes.saturating_sub(start) >> 20,
             arenas_released = report.arenas_released,
@@ -165,6 +201,37 @@ mod tests {
         // against the end.
         let mut zone = [100usize, 150, 175, 187, 187, 187, 190].into_iter();
         assert_eq!(grow_until_flat(|| zone.next().unwrap(), 100), 6);
+    }
+
+    fn ground(live: usize, frontier: usize) -> SettledGround {
+        SettledGround { live, frontier }
+    }
+
+    /// **Ground freed since the last settle is owed one; the same ground is not.**
+    /// BlackWorld's shape: settled at 260 live under a frontier of 1,687 that a
+    /// tenant held, then the sessions released and left 141 live under 861.
+    #[test]
+    fn a_settle_is_owed_when_the_ground_changed_and_holes_stand() {
+        let settled = Some(ground(260, 1687));
+        assert!(
+            resettle_owed(settled, ground(141, 861)),
+            "the release freed ground"
+        );
+        assert!(
+            !resettle_owed(settled, ground(260, 1687)),
+            "the ground the last settle could not lower is not asked again"
+        );
+        assert!(
+            resettle_owed(None, ground(141, 861)),
+            "nothing settled yet, and holes stand"
+        );
+    }
+
+    /// A packed partition owes nothing, changed or not.
+    #[test]
+    fn a_packed_partition_owes_no_settle() {
+        assert!(!resettle_owed(Some(ground(260, 300)), ground(141, 141)));
+        assert!(!resettle_owed(None, ground(0, 0)));
     }
 
     /// A policy that never stops granting is bounded.

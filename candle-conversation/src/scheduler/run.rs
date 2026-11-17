@@ -1,6 +1,7 @@
 use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, ThrottleReason};
 use super::creep_slice::next_layer_row_cost;
 use super::prefill::{VramPhase, LOAD_TARGET};
+use super::settle::{resettle_owed, SettledGround};
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
 use crate::substrate::residence::{drain_reclaimed, own_device_frees};
@@ -982,6 +983,21 @@ impl Scheduler {
                 // the forwards beside it; with none left, what the finished work
                 // freed is handed back whole before the loop parks — otherwise it
                 // waits, owed, inside the next request's first forwards.
+                //
+                // **And again whenever ground has freed since.** Conversations
+                // release, stores park and hot copies demote on their own clocks
+                // after the last forward; what they free stands above the frontier
+                // a settle on falling idle already packed (`settle::resettle_owed`).
+                // Read every wake of the idle wait — a request or a rates period.
+                if let Some(stats) = self.session.kv_region_stats() {
+                    let now = SettledGround {
+                        live: stats.live,
+                        frontier: stats.live_watermark,
+                    };
+                    if resettle_owed(self.settled_ground, now) {
+                        self.settle_owed = true;
+                    }
+                }
                 if std::mem::take(&mut self.settle_owed) {
                     let t_settle = Instant::now();
                     let report = self.settle_device();
