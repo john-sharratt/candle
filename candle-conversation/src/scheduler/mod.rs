@@ -17205,6 +17205,7 @@ mod tests {
     mod positional_ledger;
     mod refused_decode_tier;
     mod reproject_abandoned;
+    mod section_page_refused;
     mod speculation_exits;
     mod speculation_in_a_grammar;
     mod splice_rebuild;

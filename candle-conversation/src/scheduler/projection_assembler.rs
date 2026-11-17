@@ -2345,15 +2345,44 @@ fn inject_sealed_section(
     // The rows that go with those chunks. Borrowing the K/V is what makes this
     // path cheap; the index cannot be borrowed the same way, because its keys
     // come from hidden states this slot never computed.
-    if let Some(page) = page {
-        match place_page(ctx, walker, page.bytes(), &page.whole_key()) {
-            Ok(()) => walker.pages_pushed += 1,
-            Err(e) => tracing::warn!(
-                "apply_projection: section {} index page refused: {e}",
-                sid.raw()
-            ),
-        }
-    } else if ctx.model.carries_positional_state() {
+    //
+    // **A refused page is a missing page.** The K/V went in above whatever the
+    // page does, so a page the model will not read leaves the slot holding tokens
+    // no index accounts for — and a view forked from it inherits them. On
+    // WhiteWorld (2026-11-17) a 108-token section whose page was written before
+    // the index was Q8_0 was refused on every projection that borrowed it, placed
+    // nothing in its place, and every turn its views ran failed its select 108
+    // tokens short. So it goes in as a gap like a section with no page, and its
+    // generation is ended: the next request prefills it fresh, and that writes a
+    // page the model reads.
+    let had_page = page.is_some();
+    let refused = match page {
+        Some(page) => match place_page(ctx, walker, page.bytes(), &page.whole_key()) {
+            Ok(()) => {
+                walker.pages_pushed += 1;
+                false
+            }
+            Err(e) => {
+                let retired = stream.is_some_and(|s| {
+                    ctx.conversation.read().is_section_tombstoned(s)
+                        || ctx
+                            .conversation
+                            .retire_section_generation(s, "its index page cannot be read")
+                            .is_ok()
+                });
+                tracing::warn!(
+                    slot = parent_id.0,
+                    retired,
+                    "apply_projection: section {} index page refused ({e}) — placed as a gap; \
+                     its generation ended so the next request prefills it fresh",
+                    sid.raw()
+                );
+                true
+            }
+        },
+        None => false,
+    };
+    if (refused || !had_page) && ctx.model.carries_positional_state() {
         // The section's K/V goes in either way, so the index has to be told how
         // far the slot advanced — a page pushed after this one is placed at a
         // position, and that position is measured from here. The span itself
@@ -2367,8 +2396,9 @@ fn inject_sealed_section(
                  placed short of where their K/V is",
                 sid.raw()
             );
-        } else if !injected.was_cut() {
-            // A cut section's missing page was reported with the cut.
+        } else if !injected.was_cut() && !refused {
+            // A cut section's missing page was reported with the cut, and a refused
+            // one with its refusal.
             tracing::warn!(
                 "apply_projection: section {} has no index page — its {tokens} token(s) are \
                  unindexed",
