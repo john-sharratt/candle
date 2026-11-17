@@ -14,7 +14,7 @@ state: keep/state
 # mcp's: from this machine the public name hairpins out through the router and
 # never reaches the gateway beside it, so the LAN name comes first.
 cluster:
-  url: "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
+  url: "https://gateway.tokera.local https://gateway.tokera.com"
   name: tokera.com
   group_key: web/secrets/group.key
   host: blackworld
@@ -61,7 +61,7 @@ services:
       - "--state"
       - "D:/battle-cities/state"
       - "--cluster-url"
-      - "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
+      - "https://gateway.tokera.local https://gateway.tokera.com"
       - "--cluster-name"
       - "tokera.com"
       - "--group-key"

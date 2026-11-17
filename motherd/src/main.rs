@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(c.host.tls_port, Some(8444));
         assert_eq!(
             c.host.clusters,
-            ["https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"]
+            ["https://gateway.tokera.local https://gateway.tokera.com"]
         );
         assert_eq!(c.host.cluster_name.as_deref(), Some("tokera.com"));
         assert!(c.host.group_key.is_some() && c.host.agent.is_some());

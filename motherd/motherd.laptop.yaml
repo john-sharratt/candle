@@ -17,7 +17,7 @@ host:
   # One cluster reached by two paths, best first: blackworld on the LAN
   # (gateway.tokera.local → .4 and .5 through this machine's hosts file),
   # then the internet.
-  clusters: ["https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"]
+  clusters: ["https://gateway.tokera.local https://gateway.tokera.com"]
   cluster_name: tokera.com
   group_key: web/secrets/group.key
 

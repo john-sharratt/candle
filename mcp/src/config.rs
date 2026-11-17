@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(
             c.cluster,
             ClusterJoin {
-                urls: "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443".into(),
+                urls: "https://gateway.tokera.local https://gateway.tokera.com".into(),
                 name: "tokera.com".into(),
                 group_key: "web/secrets/group.key".into(),
                 host: "blackworld".into(),

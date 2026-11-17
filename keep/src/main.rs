@@ -958,7 +958,7 @@ mod tests {
         let cluster = cfg.cluster.expect("keep.yaml names its gateway");
         assert_eq!(
             cluster.url,
-            "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
+            "https://gateway.tokera.local https://gateway.tokera.com"
         );
         Target::parse(&cluster.url, Some(&cluster.name)).expect("the URLs dial");
         assert_eq!(cluster.name, "tokera.com");

@@ -20,7 +20,7 @@ gateway: "http://127.0.0.1"
 # The cluster it joins as the app `mcp`: the gateway sends `/mcp` to its
 # members in turn, over the socket each dialled.
 cluster:
-  urls: "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
+  urls: "https://gateway.tokera.local https://gateway.tokera.com"
   name: tokera.com
   group_key: web/secrets/group.key
   host: blackworld

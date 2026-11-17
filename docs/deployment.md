@@ -35,7 +35,7 @@ repository is readable by the model.
                       │  HTTP :80 to the public IP
                       ▼
                 router ── DMZ ──► 192.168.0.5:80   web  (the gateway, by Host header;
-                                     │                   cluster `tokera.com` on :9443)
+                                     │                   cluster `tokera.com` on :443)
                      ┌───────────────┴────────────────┐
                      ▼                                ▼
           192.168.0.5:8081  motherd            192.168.0.6:8081  (stopped)
@@ -98,8 +98,8 @@ as its working directory. cf-ddns is the exception — see below.
 
 | Service | Machine | Listens | Build | Stop by default in `/down` |
 |---|---|---|---|---|
-| web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:9443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml` — `rdp-tunnel-server` holds 443 and 8443) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
-| motherd | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the zend route's upstream in dumb mode; outbound to the gateway's cluster on `:9443` | `cargo build --release -p motherd` | yes |
+| web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml`); UDP 4300 and 4123, the game's datagrams it forwards (`docs/battlecities_app.md` §5) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
+| motherd | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the zend route's upstream in dumb mode; outbound to the gateway's cluster on `:443` | `cargo build --release -p motherd` | yes |
 | keep | .5 | — (watches web on `:80` and motherd on `:8081`) | `cargo build --release -p keep` | **never** |
 | yenbot | .5 | `127.0.0.1:8096` (from `D:\yenbot\live\yenbot.yaml`) — loopback only; the gateway's `yenbot` site forwards yenbot.com.au to it | `cargo build --release` in `D:\prog\yenbot` (its own repository, `docs/yenbot_app_host.md` §5.5); released with `service_deploy {host: BlackWorld, service: yenbot}` | yes |
 | npcd | .6 | `0.0.0.0:8081` (`--host 0.0.0.0 --port 8081`) | `cargo build --release -p npcd` | yes |
@@ -167,7 +167,7 @@ Notes on the arguments:
 under its name, in the same shape as that daemon's own flags:
 
 - **`host:`** — `192.168.0.5`, ports `8081` and `8444` (zend's, unchanged), and the
-  cluster: `clusters: ["https://gateway.tokera.com:9443"]`, verified as `cluster_name:
+  cluster: `clusters: ["https://gateway.tokera.local https://gateway.tokera.com"]`, verified as `cluster_name:
   tokera.com`, with `group_key: web/secrets/group.key` and `agent: motherd/agent.yaml`.
 - **`zend:`** — `working_dir: ..`, so the workspace is `D:\prog` and the substrate
   `D:\prog\substrate`, the one zend ran on before (adopted as the group's first member,
@@ -201,11 +201,13 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
   `target\release\web.exe --new-group-key web/secrets/group.key` (it refuses to
   overwrite one). The gateway and every member on every machine hold the same file;
   it is a secret, gitignored with the rest of `web/secrets`, and never printed.
-- **Members join over the TLS entrance**, `https://gateway.tokera.com:9443`, checked
+- **Members join over the TLS entrance**, `https://gateway.tokera.com` on 443, checked
   against the gateway's `tokera.com` certificate (`cluster_name: tokera.com`).
   `gateway.tokera.com` is a DNS-only record (not proxied) for the public IP, with
-  9443 tcp + udp forwarded to `.5`; `tokera.com` itself is behind Cloudflare's proxy,
-  which does not carry :9443.
+  443 tcp + udp forwarded to `.5`; `tokera.com` itself is behind Cloudflare's proxy,
+  which does not carry a cluster socket. The entrance was on 9443 while a
+  remote-desktop tunnel held 443 (until 17 November 2026); the firewall forwards 9443
+  to the entrance's 443 until every member runs a configuration that names no port.
 - **The zend and npcd routes** carry `cluster: zend` and `cluster: npcd` and keep their
   `upstream:`. The gateway serves a name from the app's ready members while it has any,
   and from the upstream while it has none.

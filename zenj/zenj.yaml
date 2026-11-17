@@ -9,7 +9,7 @@
 bind: "127.0.0.1:8097"
 trusted_gateways: ["127.0.0.1"]
 cluster:
-  urls: "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
+  urls: "https://gateway.tokera.local https://gateway.tokera.com"
   name: tokera.com
   group_key: web/secrets/group.key
   host: blackworld
