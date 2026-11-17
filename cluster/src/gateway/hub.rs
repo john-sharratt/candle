@@ -105,9 +105,10 @@ pub const MEMBERS_EVERY: Duration = Duration::from_secs(5);
 /// How many refused handshakes the status page lists.
 pub const REFUSALS_KEPT: usize = 100;
 
-/// The apps a member may join (§3.1). `keep`, `mcp` and `zenj` are
-/// [`SERVICES`]: listed on the status page, and not replication groups.
-pub const APPS: [&str; 6] = ["zend", "npcd", AGENT_APP, KEEP, MCP, ZENJ];
+/// The apps a member may join (§3.1). `keep`, `mcp`, `zenj` and
+/// `battlecities` are [`SERVICES`]: listed on the status page, and not
+/// replication groups.
+pub const APPS: [&str; 7] = ["zend", "npcd", AGENT_APP, KEEP, MCP, ZENJ, BATTLECITIES];
 
 /// The agents' app (§11).
 const AGENT_APP: &str = "agent";
@@ -123,10 +124,16 @@ pub const MCP: &str = "mcp";
 /// machine the decks are cabled to.
 pub const ZENJ: &str = "zenj";
 
+/// The Battle Cities game server's app (`docs/battlecities_app.md`): the
+/// members the `battlecities` site's requests and the game's datagrams go
+/// to. It is built from its own repository, so its build count is that
+/// repository's and is compared with nothing here.
+pub const BATTLECITIES: &str = "battlecities";
+
 /// The apps keep runs on each machine and releases there itself: each member
 /// is admitted on whatever build it runs, holds no substrate and no model,
 /// and is never certified or rolled out. Their members serve as they join.
-pub const SERVICES: [&str; 3] = [KEEP, MCP, ZENJ];
+pub const SERVICES: [&str; 4] = [KEEP, MCP, ZENJ, BATTLECITIES];
 
 /// Whether `app` is one of the [`SERVICES`].
 pub fn is_service(app: &str) -> bool {

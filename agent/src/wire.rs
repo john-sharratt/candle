@@ -311,6 +311,11 @@ pub struct JobLine {
     pub kind: JobKind,
     /// The branch a run's store is on; `None` for a push or a fetch.
     pub branch: Option<String>,
+    /// The commit that branch held once the run had fetched origin: what it is
+    /// a run of. Absent for a push or a fetch, for a run that has not fetched
+    /// yet, and from an agent that records none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
     /// Its command line: a run's program and arguments, or the git command a
     /// push or a fetch makes.
     pub command: Vec<String>,
@@ -775,6 +780,7 @@ mod tests {
                 repo: "candle".into(),
                 kind: JobKind::Run,
                 branch: Some("zen/x".into()),
+                base: None,
                 command: vec!["cargo".into(), "test".into()],
                 status: JobStatus::Running,
                 lines: 2,
@@ -802,6 +808,14 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<AgentJobs>(wire).unwrap(), jobs);
+        // A run that has fetched origin names the commit it is of.
+        let of = JobLine {
+            base: Some(A.into()),
+            ..jobs.jobs[0].clone()
+        };
+        let wire = serde_json::to_value(&of).unwrap();
+        assert_eq!(wire["base"], json!(A));
+        assert_eq!(serde_json::from_value::<JobLine>(wire).unwrap(), of);
     }
 
     /// **A view from an agent that names no phase reads as ended**, so a

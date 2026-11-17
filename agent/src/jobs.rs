@@ -137,6 +137,9 @@ enum Kind {
 /// What a job runs and when, as [`Jobs::list`] shows it.
 struct Line {
     branch: Option<String>,
+    /// The commit a run's branch held once origin was fetched for it: what the
+    /// run is of. `None` for a push or a fetch, and for a run not yet there.
+    base: Option<String>,
     command: Vec<String>,
     started_ms: u64,
     ended_ms: Option<u64>,
@@ -454,6 +457,7 @@ impl Jobs {
                 },
                 line: Line {
                     branch: None,
+                    base: None,
                     command,
                     started_ms,
                     ended_ms: Some(now_ms()),
@@ -535,6 +539,7 @@ impl Jobs {
             })?;
         let line = Line {
             branch: Some(run.branch.clone()),
+            base: None,
             command: [run.program.clone()]
                 .into_iter()
                 .chain(run.args.iter().cloned())
@@ -590,7 +595,7 @@ impl Jobs {
             self.setting_up.until_ended(&run.repo).await;
             self.set_prep(id, Prep::Fetching);
         }
-        let handle = match self.start(run, overlay, branch).await {
+        let handle = match self.start(id, run, overlay, branch).await {
             Ok(started) => {
                 self.set_prep(id, Prep::Started(started.id));
                 started.handle
@@ -609,10 +614,12 @@ impl Jobs {
         self.finished(id, outcome, staged);
     }
 
-    /// Fetch origin for `run` and start it in its checkout's sandbox, with
-    /// `overlay` laid down.
+    /// Fetch origin for run `id` and start it in its checkout's sandbox, with
+    /// `overlay` laid down. The commit its branch holds once origin is
+    /// fetched is recorded on the job: what it is a run of.
     async fn start(
         self: &Arc<Self>,
+        id: &str,
         run: RunJob,
         overlay: Snapshot,
         branch: BranchName,
@@ -620,6 +627,9 @@ impl Jobs {
         self.fetch(&run.repo).await?;
         self.sweep(&run.repo).await;
         let c = self.checkout(&run.repo)?;
+        if let Ok(base) = c.repo().resolve(&Rev::Branch(branch.clone())) {
+            self.set_base(id, base.to_string());
+        }
         let store = VfsStore::on_branch(Arc::clone(&c.source), Rev::Branch(branch.clone()));
         store
             .restore(overlay)
@@ -638,6 +648,13 @@ impl Jobs {
                 },
             )
             .map_err(|e| JobError::Bad(format!("the job's log: {e}")))
+    }
+
+    /// Run `id` is of commit `base`.
+    fn set_base(&self, id: &str, base: String) {
+        if let Some(entry) = self.table().0.get_mut(id) {
+            entry.line.base = Some(base);
+        }
     }
 
     /// Run `id` has got to `prep`.
@@ -777,6 +794,7 @@ impl Jobs {
                 kind: Kind::Push { status, pushed },
                 line: Line {
                     branch: None,
+                    base: None,
                     command,
                     started_ms,
                     ended_ms: Some(now_ms()),
@@ -1075,6 +1093,7 @@ impl Jobs {
             repo: view.repo,
             kind,
             branch: e.line.branch.clone(),
+            base: e.line.base.clone(),
             command: e.line.command.clone(),
             status: view.status,
             lines: view.lines,

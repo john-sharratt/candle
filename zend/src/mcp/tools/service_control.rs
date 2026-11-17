@@ -19,7 +19,8 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Restart, stop or start a service — motherd (the daemon that runs the models), web \
-            (the gateway), mcp (this connector's own server) or yenbot (Yen Bots) — on one machine, \
+            (the gateway), mcp (this connector's own server), yenbot (Yen Bots) or battlecities (the \
+            Battle Cities game server) — on one machine, \
             through keep, the \
             supervisor that runs them. A restart runs the \
             installed binary again, with no trial; a start lifts a stop. A stop holds the service down until \
@@ -109,7 +110,7 @@ mod tests {
     fn the_schema_offers_the_services_keep_runs() {
         assert_eq!(
             definition()["inputSchema"]["properties"]["service"]["enum"],
-            json!(["motherd", "web", "mcp", "yenbot"])
+            json!(["motherd", "web", "mcp", "yenbot", "battlecities"])
         );
     }
 }

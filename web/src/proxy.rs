@@ -68,7 +68,7 @@ pub const HOP_BY_HOP: [header::HeaderName; 7] = [
 /// this gateway itself resolved.
 ///
 /// [`Builder::trust`]: crate::server::Builder::trust
-pub const IDENTITY_HEADERS: [&str; 7] = [
+pub const IDENTITY_HEADERS: [&str; 10] = [
     "x-tokera-user",
     // The issuer half of the account key. In this list because it decides
     // *which* account a subject resolves to: a client able to set it could pick
@@ -79,6 +79,16 @@ pub const IDENTITY_HEADERS: [&str; 7] = [
     "x-tokera-name",
     "x-tokera-picture",
     "x-tokera-assertion",
+    // What a bearer token was granted, as the game's API reads it
+    // (`docs/battlecities_app.md` §6): a caller that set it would be naming
+    // its own rights.
+    "x-tokera-scope",
+    // The marks of a request that is this gateway's or a supervisor's own, not
+    // one passed on for a caller (`docs/battlecities_app.md` §5, §7): the
+    // game believes a flow's announcement and a request to stop only with
+    // one, so a client that sent either would be speaking as the gateway.
+    "x-tokera-forwarder",
+    "x-tokera-keep",
     // The member a request came from, when another member sent it: what a
     // member's internal routes believe (§9.3). Set only from a stream the
     // member itself opened, so a client claiming it is claiming to be one.

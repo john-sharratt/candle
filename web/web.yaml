@@ -279,9 +279,14 @@ sites:
       - {prefix: /sitemap.xml, exact: true, upstream: local}
 
   # ── battlecities.net — the game's own site ──────────────────────────────
-  # A handful of static files: a title image, a download link, and the icon set
-  # the game already shipped. No daemon, no API, no generated pages — so it is
-  # `roots` and nothing else, and a bare `/` finds `index.html` on its own.
+  # Served by the game itself (docs/battlecities_app.md): every path goes to
+  # a member of the app `battlecities` — the game server, which holds the
+  # site's pages, its API and its socket — and to the server on this machine's
+  # loopback while none is joined. Sign-in stays the gateway's, and the game
+  # believes who a caller is from the headers this gateway sets.
+  #
+  # `roots` stays for the icon set the Tokera home page copies its Battle
+  # Cities mark from; no request reaches it while the route below claims `/`.
   #
   # It was a `hosts:` entry on the tokera site until now, which meant it served
   # tokera's pages and tokera's brand mark. Two products cannot share one site
@@ -290,12 +295,15 @@ sites:
   # battlecities.net wore the Tokera triskelion. Its own entry gives it the Zen
   # back. `roles.rs` asserts the split so it cannot quietly close again.
   #
-  # The download link points at `battle-cities.exe`, which is not here. That is
-  # the game's build output rather than repository content, so the link 404s
-  # until a release is dropped alongside these files.
+  # The download link is the game's own `/battle-cities.exe`: the client built
+  # beside the server it is served by.
   - name: battlecities
     hosts: ["battlecities.net", "battlecities.localhost"]
     roots: ["content/battlecities"]
+    api:
+      - prefix: /
+        upstream: "http://127.0.0.1:4080"
+        cluster: battlecities
 
   # `www.` for the game, sent to the name without it — same reasoning as
   # `tokera-alt` below, and the same reason it is its own entry: a redirect site

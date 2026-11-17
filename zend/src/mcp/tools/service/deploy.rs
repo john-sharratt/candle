@@ -9,15 +9,17 @@ use std::time::Duration;
 
 use agent::client::Agents;
 use agent::overlay::Overlay;
-use agent::wire::{RunJob, Staged};
+use agent::wire::{ListJob, RunJob, Staged};
 use axum::http::Method;
 use cluster::machines::MachineTable;
 use host::machines::machines;
 use serde_json::{json, Value};
 use zend_vfs::JobStatus;
 
+use super::pending::{self, Ask};
 use super::{
-    guard, keep, keep_build, repo_of, service_of, trial_body, KEEP_STATE, KEEP_TRIAL, SERVICES,
+    guard, keep, keep_build, package_of, repo_of, service_of, trial_body, KEEP_STATE, KEEP_TRIAL,
+    SERVICES,
 };
 use crate::mcp::ops;
 use crate::mcp::ops_tools::OpsCall;
@@ -40,6 +42,12 @@ const CONNECTOR: &str = "mcp";
 /// The longest one wait on the build is held.
 const STEP: Duration = Duration::from_secs(25);
 
+/// Origin's ref a deploy builds.
+const MAIN_REF: &str = "refs/heads/main";
+
+/// How many of an agent's newest jobs are read for a deploy under way.
+const JOBS_READ: usize = 64;
+
 pub fn definition() -> Value {
     json!({
         "name": NAME,
@@ -56,7 +64,8 @@ pub fn definition() -> Value {
             runs. Only \
             origin/main is built: merge and push first. `motherd` is the daemon — models, Zen, npcd; \
             trying it stops every app on that machine for the trial. `web` is the gateway; `mcp` is the \
-            connector; `yenbot` is Yen Bots, built from its own repository. One machine per call; \
+            connector; `yenbot` is Yen Bots and `battlecities` the Battle Cities game server, each \
+            built from its own repository. One machine per call; \
             leave out `host` and it goes to the machine the cluster builds on first (BlackWorld), \
             which is where a motherd deploy belongs: the new motherd joins the cluster as a \
             candidate and the other members take it once it is certified, so they never build it \
@@ -69,7 +78,7 @@ pub fn definition() -> Value {
             "type": "object",
             "properties": {
                 "host": {"type": "string", "minLength": 1, "maxLength": 32, "description": "The machine to deploy to, by name, as `cluster_status` and `service_status` name it: `BlackWorld`, `WhiteWorld`. Left out: the machine the cluster builds on first (`host/machines.yaml`'s `builds`)."},
-                "service": {"type": "string", "enum": SERVICES, "description": "`motherd` (the daemon), `web` (the gateway), `mcp` (the connector) or `yenbot` (Yen Bots)."}
+                "service": {"type": "string", "enum": SERVICES, "description": "`motherd` (the daemon), `web` (the gateway), `mcp` (the connector), `yenbot` (Yen Bots) or `battlecities` (the Battle Cities game server)."}
             },
             "required": ["service"],
             "additionalProperties": false
@@ -80,8 +89,9 @@ pub fn definition() -> Value {
 /// The job that builds `service` from origin/main and stages it. The daemon is
 /// built with the connector, which is released with it: one build, so the
 /// connector [`connector_job`] stages is the daemon's build.
-pub fn build_job(service: &str) -> RunJob {
-    let mut args: Vec<String> = ["build", "--release", "-p", service]
+pub fn build_job(service: &'static str) -> RunJob {
+    let package = package_of(service);
+    let mut args: Vec<String> = ["build", "--release", "-p", package]
         .map(str::to_string)
         .to_vec();
     if service == DAEMON {
@@ -94,7 +104,7 @@ pub fn build_job(service: &str) -> RunJob {
         program: "cargo".to_string(),
         args,
         timeout_secs: BUILD_TIMEOUT_S,
-        stage: Some(format!("target/release/{service}.exe")),
+        stage: Some(format!("target/release/{package}.exe")),
     }
 }
 
@@ -127,6 +137,36 @@ pub fn next_steps(job: &JobHandle) -> String {
         "Next: `job_status {{jobs: [\"{job}\"], wait_s: 240}}` waits for it and says where it is; \
          `job_read {{job: \"{job}\", page: 1}}` reads its output — the build's log, then the \
          trial's; `job_cancel {{job: \"{job}\"}}` stops it."
+    )
+}
+
+/// The commit origin's `main` holds for `repo`, read through an agent that
+/// holds the repository; `None` when origin could not be listed, and the
+/// deploy then starts as one always did.
+async fn origin_tip(agents: &Agents, repo: &str) -> Option<String> {
+    let listing = ListJob {
+        repo: repo.to_string(),
+    };
+    match agents.list(listing).await {
+        Ok(refs) => refs
+            .refs
+            .iter()
+            .find(|(name, _)| name.as_str() == MAIN_REF)
+            .map(|(_, commit)| commit.to_string()),
+        Err(e) => {
+            tracing::warn!(repo, "deploy: origin could not be listed: {e}");
+            None
+        }
+    }
+}
+
+/// What a caller asking for a deploy already under way is told.
+pub fn already(job: &JobHandle, service: &str, host: &str, tip: &str) -> String {
+    let short = tip.get(..9).unwrap_or(tip);
+    format!(
+        "{job} is already deploying {service} to {host} at origin/main's commit {short}: nothing \
+         new was started.\n{}",
+        next_steps(job)
     )
 }
 
@@ -226,13 +266,49 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
         .map_or(host, |a| a.host.clone());
     // The trial is keep's, found again by the deploy it records: a keep that
     // cannot record it is updated before anything is built for it.
-    match keep(call, Method::GET, KEEP_STATE, &host, None).await {
+    let state = match keep(call, Method::GET, KEEP_STATE, &host, None).await {
         Ok(state) => {
             if let Err(why) = keep_build(&host, &state) {
                 return Answer::error(why);
             }
+            state
         }
         Err(e) => return Answer::error(format!("{e}: nothing is built for a keep not reached")),
+    };
+    // One deploy of a commit: asked again for what is already under way here,
+    // the answer is that deploy; a build of an older commit gives way.
+    if let Some(tip) = origin_tip(&agents, repo_of(service)).await {
+        let at = agents.at(node);
+        let jobs = match agents.jobs_of(at, JOBS_READ).await {
+            Ok(listed) => listed.jobs,
+            Err(e) => {
+                tracing::warn!(
+                    host,
+                    service,
+                    "deploy: the agent's jobs could not be read: {e}"
+                );
+                Vec::new()
+            }
+        };
+        let trying = pending::trying(&state, service);
+        match pending::decide(&jobs, service, trying.as_deref(), &tip) {
+            Ask::Watch(id) => {
+                let job = JobHandle::Deploy(Handle::new(node, &id));
+                return Answer::ok(already(&job, service, &host, &tip));
+            }
+            Ask::Replace(id) => {
+                let older = Handle::new(node, &id);
+                match agents.cancel(at, &id).await {
+                    Ok(_) => {
+                        tracing::info!(deploy = %older, host, service, tip, "deploy: replaced by a newer commit")
+                    }
+                    Err(e) => {
+                        tracing::warn!(deploy = %older, host, service, "deploy: the older build could not be cancelled: {e}")
+                    }
+                }
+            }
+            Ask::Start => {}
+        }
     }
     if service == DAEMON {
         if let Err(e) = agents
@@ -302,6 +378,29 @@ mod tests {
         assert_eq!(job.stage.as_deref(), Some("target/release/yenbot.exe"));
     }
 
+    /// **The game server is built from its own repository**, as the package
+    /// its workspace names, and staged under that name: the file keep's
+    /// `battlecities` service is installed from.
+    #[test]
+    fn the_game_server_is_built_from_its_own_repository() {
+        let job = build_job("battlecities");
+        assert_eq!(
+            (job.repo.as_str(), job.branch.as_str()),
+            ("battle-cities", "main")
+        );
+        assert_eq!(
+            job.args,
+            ["build", "--release", "-p", "battle-cities-server"]
+        );
+        assert_eq!(
+            job.stage.as_deref(),
+            Some("target/release/battle-cities-server.exe")
+        );
+        let mut command = vec![job.program.clone()];
+        command.extend(job.args);
+        assert_eq!(built_service(&command), Some("battlecities"));
+    }
+
     /// **The daemon is built with its connector**, and the job ahead of it
     /// stages the connector from that same build without reading as a deploy.
     #[test]
@@ -342,6 +441,26 @@ mod tests {
         );
     }
 
+    /// **Asked again for a deploy under way, the answer names it** and how to
+    /// watch it, and says nothing was started.
+    #[test]
+    fn a_deploy_already_under_way_is_named_to_whoever_asks_again() {
+        let job = JobHandle::Deploy(Handle::new(0xab, "Xe"));
+        let said = already(
+            &job,
+            "battlecities",
+            "BlackWorld",
+            "a744abc8d1f0c4b7e9a3552f6c1d8e0b9a7f6e5d",
+        );
+        assert!(said.starts_with(
+            "deploy:00000000000000ab:Xe is already deploying battlecities to BlackWorld at \
+             origin/main's commit a744abc8d: nothing new was started.\n"
+        ));
+        assert!(
+            said.contains(r#"`job_status {jobs: ["deploy:00000000000000ab:Xe"], wait_s: 240}`"#)
+        );
+    }
+
     #[test]
     fn the_next_steps_name_the_deploy_and_its_machine() {
         let next = next_steps(&JobHandle::Deploy(Handle::new(0xab, "Xe")));
@@ -358,7 +477,7 @@ mod tests {
         let d = definition();
         assert_eq!(
             d["inputSchema"]["properties"]["service"]["enum"],
-            json!(["motherd", "web", "mcp", "yenbot"])
+            json!(["motherd", "web", "mcp", "yenbot", "battlecities"])
         );
         assert_eq!(d["inputSchema"]["required"], json!(["service"]));
         assert!(d["inputSchema"]["properties"]["host"].is_object());

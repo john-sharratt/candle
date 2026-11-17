@@ -8,6 +8,7 @@
 //! | [`deploy`] | `service_deploy` |
 //! | [`status`] | `service_status` |
 //! | [`guard`] | what a worker's deploy may not take down |
+//! | [`pending`] | one deploy of a service on a machine for one commit |
 //!
 //! **A deploy is named by its build job.** Its state is read from the agent
 //! that builds it and from the keep that tries it, which records the handle on
@@ -29,18 +30,39 @@ use crate::mcp::ops_tools::OpsCall;
 
 pub mod deploy;
 pub mod guard;
+pub mod pending;
 pub mod status;
 
-/// The services keep runs, each built from the package of its name.
-pub const SERVICES: [&str; 4] = ["motherd", "web", "mcp", "yenbot"];
+/// The services keep runs.
+pub const SERVICES: [&str; 5] = ["motherd", "web", "mcp", "yenbot", BATTLECITIES];
+
+/// The Battle Cities game server (`docs/battlecities_app.md`).
+pub const BATTLECITIES: &str = "battlecities";
 
 /// The workspace repository each service is built from: the cluster's from
-/// candle, Yen Bots from its own (`docs/yenbot_app_host.md` §5.5).
+/// candle, Yen Bots from its own (`docs/yenbot_app_host.md` §5.5), the game
+/// from its own (`docs/battlecities_app.md` §3).
 pub fn repo_of(service: &str) -> &'static str {
     match service {
         "yenbot" => "yenbot",
+        BATTLECITIES => "battle-cities",
         _ => "candle",
     }
+}
+
+/// The package `cargo build --release -p` builds for each service, which is
+/// also its binary's name: the service's own name, but for the game, whose
+/// workspace names its server `battle-cities-server`.
+pub fn package_of(service: &'static str) -> &'static str {
+    match service {
+        BATTLECITIES => "battle-cities-server",
+        named => named,
+    }
+}
+
+/// The service package `package` builds.
+fn service_built_by(package: &str) -> Option<&'static str> {
+    SERVICES.iter().copied().find(|s| package_of(s) == package)
 }
 
 /// keep's routes.
@@ -68,20 +90,21 @@ pub fn service_of(text: &str) -> Result<&'static str, String> {
         .ok_or_else(|| {
             format!(
                 "`{text}` is not a service keep runs: `motherd` (the daemon), `web` (the gateway), \
-                 `mcp` (the connector) or `yenbot` (Yen Bots)"
+                 `mcp` (the connector), `yenbot` (Yen Bots) or `battlecities` (the Battle Cities \
+                 game server)"
             )
         })
 }
 
-/// The service a deploy's build job builds: the package after `-p` in
-/// `cargo build --release -p <service>`.
+/// The service a deploy's build job builds: the one whose package follows
+/// `-p` in `cargo build --release -p <package>`.
 pub fn built_service(command: &[String]) -> Option<&'static str> {
     let at = command.iter().position(|w| w == "-p")?;
     let built = command.get(at + 1)?;
     let is_build = command.first().is_some_and(|p| p == "cargo")
         && command.iter().any(|w| w == "build")
         && command.iter().any(|w| w == "--release");
-    is_build.then(|| service_of(built).ok()).flatten()
+    is_build.then(|| service_built_by(built)).flatten()
 }
 
 /// Ask machine `host`'s keep `method path` with `body` for `call`.
@@ -370,6 +393,19 @@ mod tests {
         );
         assert_eq!(repo_of("yenbot"), "yenbot");
         assert_eq!(repo_of("web"), "candle");
+        // The game's package is not named for its service, and a deploy of it
+        // is still read back as the service.
+        assert_eq!(repo_of("battlecities"), "battle-cities");
+        assert_eq!(package_of("battlecities"), "battle-cities-server");
+        assert_eq!(package_of("web"), "web");
+        assert_eq!(
+            built_service(&words("cargo build --release -p battle-cities-server")),
+            Some("battlecities")
+        );
+        assert_eq!(
+            built_service(&words("cargo build --release -p battlecities")),
+            None
+        );
         assert!(service_of("zend")
             .unwrap_err()
             .contains("not a service keep runs"));

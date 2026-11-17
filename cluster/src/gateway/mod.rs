@@ -46,8 +46,8 @@ pub use claims::Claims;
 pub use coord_log::changes;
 pub use drain::DRAIN_WAIT;
 pub use hub::{
-    is_service, rolls_out, Hub, MemberStream, APPS, CAPACITY_SILENCE, CATCHUP_CAP, KEEP, LAG_CAP,
-    MCP, MEMBERS_EVERY, REFUSALS_KEPT, SERVICES, ZENJ,
+    is_service, rolls_out, Hub, MemberStream, APPS, BATTLECITIES, CAPACITY_SILENCE, CATCHUP_CAP,
+    KEEP, LAG_CAP, MCP, MEMBERS_EVERY, REFUSALS_KEPT, SERVICES, ZENJ,
 };
 pub use load::{Load, Picked};
 pub use log::{CoordLog, Entry};

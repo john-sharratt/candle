@@ -38,3 +38,28 @@ services:
     stable: keep/stable/mcp.exe
     args: ["--config", "mcp/mcp.yaml"]
     cwd: D:/prog/candle
+  # The Battle Cities game server (docs/battlecities_app.md §3), built from its
+  # own repository by the agent's checkout of it and run from that checkout,
+  # whose build writes the `server_assets` it reads. Its world is kept outside
+  # the checkout, seeded once from the checkout's `data` submodule, so a
+  # deploy's fetch never touches a world being played. It joins the cluster as
+  # the app `battlecities`, and serves HTTP 4080 and UDP 4300 and 4123 on this
+  # machine for the gateway beside it.
+  - name: battlecities
+    stable: keep/stable/battle-cities-server.exe
+    args:
+      - "--data"
+      - "D:/battle-cities/data"
+      - "--seed-from"
+      - "data"
+      - "--state"
+      - "D:/battle-cities/state"
+      - "--cluster-url"
+      - "https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"
+      - "--cluster-name"
+      - "tokera.com"
+      - "--group-key"
+      - "D:/prog/candle/web/secrets/group.key"
+      - "--host"
+      - "blackworld"
+    cwd: D:/agent/battle-cities

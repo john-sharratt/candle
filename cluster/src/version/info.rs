@@ -27,11 +27,14 @@ pub const WEB: &str = "web";
 pub const MCP: &str = "mcp";
 /// The DJ (`docs/zenj.md`): a service on the machine the decks are cabled to.
 pub const ZENJ: &str = "zenj";
+/// The Battle Cities game server (`docs/battlecities_app.md`): built from its
+/// own repository, which stamps its own count and hash.
+pub const BATTLECITIES: &str = "battlecities";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildInfo {
     /// Which binary: [`ZEND`], [`NPCD`], [`MOTHERD`], [`AGENT`], [`WEB`],
-    /// [`MCP`] or [`ZENJ`].
+    /// [`MCP`], [`ZENJ`] or [`BATTLECITIES`].
     pub kind: String,
     pub count: u32,
     pub hash: String,
