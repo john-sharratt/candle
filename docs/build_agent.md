@@ -61,8 +61,9 @@ first. It answers at once with a handle, and the handle says when the hold has
 1. **The queue stops.** No run starts from it.
 2. **The running run is dealt with by what it is.**
    - A deploy build is waited for until it has staged and asked keep for its
-     trial, at most `build_hold` (the agent file; 60 minutes). A deploy still
-     going then is killed with the process.
+     trial, at most `build_hold` (the agent file; 20 minutes, to be set from a
+     measured motherd release build on BlackWorld, §10). A deploy still going
+     then is killed with the process.
    - Any other run, a test or a build that is no deploy, is stopped at once and
      put back at the head of the queue, under its own id. It runs again from
      its start on the next process, and its log says where it was cut and where
@@ -70,6 +71,23 @@ first. It answers at once with a handle, and the handle says when the hold has
      long test.
 3. **The queue is parked on keep** (§6).
 4. **Drained**: the process may now be stopped.
+
+**A process that is unwell is not waited for.** When the hold is asked, and
+again each time it checks the running deploy, it reads the process's own
+readiness, what its `/v1/status` reports: every tenant `ready`, and no device
+failing (`host::cluster` `member_state`). A process that is not ready drains at
+once: the deploy is killed with it, like any other run. A restart of a sick
+motherd, the restart that is usually urgent, goes ahead without waiting; only a
+healthy process makes a restart wait, and while it waits it keeps serving.
+
+**A wait says what it is for and how long it should take.** While a hold waits
+on a deploy, it reports the run, its service and its estimated time left: the
+time the same command took the last time it succeeded on this agent, less what
+it has run so far (the ended runs the agent keeps, which a park carries across
+a restart, §6). Every place that waits shows that line: `install_tick`'s step
+(`waiting for builds: battlecities deploy, about 1 min left`), keep's state for
+the request it holds, and the stopping path's job step. A command with no
+earlier success says `time left unknown`.
 
 Holds join: a second hold asked while one stands shares it, so the paths below
 that meet in one restart never wait for each other. A hold is let go by the
@@ -202,7 +220,7 @@ Everything is in candle. The tests sit beside the code:
 | Step | Crates | Tests |
 |---|---|---|
 | §2 slot | `agent` | two runs on two checkouts never run at once; runs start in the order they came; `slots_free` follows the slot, the queue and a hold |
-| §3 hold | `agent` | a hold stops the queue and drains once a running deploy has handed off; a running test is stopped and put back at the head of the queue under its id; a deploy still going at `build_hold` does not stop the drain; a second hold shares the first; a hold let go takes its park back and starts the queue |
+| §3 hold | `agent`, `host` | a hold stops the queue and drains once a running deploy has handed off; a running test is stopped and put back at the head of the queue under its id; a deploy still going at `build_hold` does not stop the drain; a process that is not ready drains at once, and one that falls ill while a hold waits drains then; the wait reports the run and its time left from the command's last success, or unknown; a second hold shares the first; a hold let go takes its park back and starts the queue |
 | §4 who asks | `cluster`, `host`, `keep` | `install_tick` asks and returns without waiting, takes the leases only on a tick that finds the hold drained, and lets it go when it cannot take them or loses its target; the stopping path holds before it drains the tenants and joins an install's hold; keep's supervisor asks immediately before `stop` in each of its four paths, asks none of a service without an `agent:` address and none when forced; keep's remote routes answer before the hold drains |
 | §6 park | `agent`, `keep` | a drained hold parks the queue and the recent ended runs on keep; a run arriving after the park is appended to it and listed as waiting; the next process takes the park back in order under its ids and ignores an id it holds; keep refuses `/exit` while it holds a park |
 | §7 handoff | `agent`, `keep`, `zend` | keep's local `/trial` puts the trial on the board and answers before it switches; a deploy run asks keep before it frees the slot; a refusal is recorded on the run |
@@ -219,7 +237,10 @@ Everything is in candle. The tests sit beside the code:
      by the session on that machine.
 2. **The agent files** gain `build_hold` and lose `slots`: `motherd/agent.yaml`
    (BlackWorld), `C:\prog\agent-local.yaml` (WhiteWorld),
-   `motherd/agent.laptop.yaml` (AlienWorld).
+   `motherd/agent.laptop.yaml` (AlienWorld). `build_hold` is set from a measured
+   `cargo build --release -p motherd -p mcp` on BlackWorld's agent, from a warm
+   cache: the longest normal deploy build plus a margin, 20 minutes unless the
+   measurement says otherwise.
 3. **motherd on BlackWorld, while its agent is idle.** The process that brings
    this is the last one with no hold, so it kills whatever is running when it
    goes. Check `job_list` on BlackWorld's agent first, and deploy when it shows
