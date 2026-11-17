@@ -963,19 +963,24 @@ mod tests {
         Target::parse(&cluster.url, Some(&cluster.name)).expect("the URLs dial");
         assert_eq!(cluster.name, "tokera.com");
         assert_eq!(cluster.host, "blackworld");
-        assert_eq!(cfg.services.len(), 3);
-        assert_eq!(
-            cfg.services[0].stable,
-            PathBuf::from(STABLE_DIR).join("web.exe")
-        );
-        assert_eq!(
-            cfg.services[1].stable,
-            PathBuf::from(STABLE_DIR).join("motherd.exe")
-        );
-        assert_eq!(
-            cfg.services[2].stable,
-            PathBuf::from(STABLE_DIR).join("mcp.exe")
-        );
+        assert_eq!(cfg.services.len(), 4);
+        for (at, exe) in [
+            "web.exe",
+            "motherd.exe",
+            "mcp.exe",
+            "battle-cities-server.exe",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(cfg.services[at].stable, PathBuf::from(STABLE_DIR).join(exe));
+        }
+        assert_eq!(cfg.services[3].name, "battlecities");
+        assert!(cfg.services[3].args.windows(2).any(|w| w
+            == [
+                "--cluster-url",
+                "https://gateway.tokera.local https://gateway.tokera.com"
+            ]));
         assert_eq!(cfg.guards, ["127.0.0.1:8097"]);
         assert_eq!(cfg.services[0].args, ["--config", "web/web.yaml"]);
         assert_eq!(cfg.services[1].args, ["--config", "motherd/motherd.yaml"]);

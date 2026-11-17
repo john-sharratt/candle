@@ -23,7 +23,15 @@ host:
 
 zend:
   working_dir: ..
-  max_depth: 3
+  max_depth: 5
+  ignore:
+    - candle/docs/results/dependency_battery_*
+    - candle/zend/examples/dependency_battery/*
+    - candle/docs/provenance_expectations/*
+    - candle/candle-examples/examples/*/*
+    - candle/npc-map/maps/*/*
+    - battle-cities/docs/lore/*/*
+    - battle-cities/assets/*/*
 
 npcd:
   mind_repo: battle-mind
