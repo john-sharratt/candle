@@ -28,7 +28,6 @@ use super::gid_pool::ChunkGid;
 use super::head_gids::HeadGids;
 #[cfg(feature = "cuda")]
 use super::region_pool;
-#[cfg(feature = "cuda")]
 use super::size_class::{elems_per_chunk, SizeClass};
 use super::types::{ChunkWindow, DecodeLayout, CHUNK_SIZE};
 use super::write_placement::appended_tokens;

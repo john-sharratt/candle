@@ -32,6 +32,7 @@ mod tests {
             k_fmt: std::sync::Arc::new(Vec::new()),
             v_fmt: std::sync::Arc::new(Vec::new()),
             meta: None,
+            q_sign: None,
         }
     }
 
