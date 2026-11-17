@@ -17,8 +17,10 @@
 > compaction, and warm-backed eviction (`evict_hot_to_free`) are all **built and
 > live**. **Two deliberate divergences remain from the target shape:** (1) the
 > warm tier lives in **pageable CPU arenas**, not the pinned host-buffer pool of
-> §10 — `warm_pool.rs` was never created, so warm↔hot DtoH/HtoD runs at ~½ PCIe
-> bandwidth; (2) the hot→warm copy runs on the **primary CUDA stream**, not the
+> §10 — and it stays there: pinned host memory is the expert weights' tier. The
+> warm → hot direction is redesigned around that in `docs/warm_lift.md` (a bounded
+> pinned ring the host copies into, drained by one scatter kernel, no host syncs);
+> `warm_pool.rs` will not be built; (2) the hot→warm copy runs on the **primary CUDA stream**, not the
 > dedicated overlap copy stream of §11 (a correctness-motivated choice to avoid
 > shared-state races — see `persistence/thread.rs`). Both are the remaining
 > performance work; the tier is functional without them.
