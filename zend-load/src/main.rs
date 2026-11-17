@@ -7,9 +7,16 @@
 //! conversation the run made is deleted at the end.
 //!
 //! ```text
-//! zend-load --levels light,medium,heavy --tasks decode,read
-//! zend-load --gateway http://192.168.0.6:8081 --patterns heavy-read,blend,shift
+//! zend-load --gateway http://192.168.0.6:8081 --user google:<id> --email <email> \
+//!     --levels light,medium,heavy --tasks decode,read
+//! zend-load --gateway http://192.168.0.6:8081 --user google:<id> --email <email> \
+//!     --patterns heavy-read,blend,shift
 //! ```
+//!
+//! Every request speaks as `--user`/`--email`, on the headers a gateway
+//! forwards a signed-in person on. A member honours them only from a trusted
+//! gateway's address, so a run is sent from a gateway machine to a member's
+//! own listener.
 //!
 //! `--patterns` runs named, fixed mixes ([`pattern`]) in place of the ladder,
 //! each part's row printed and then the pattern's as a whole. `--gateway` may
@@ -36,7 +43,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Result};
 use clap::Parser;
 
-use client::Target;
+use client::{Caller, Target};
 use ingest::{watch, Watched};
 use ladder::rung;
 use pattern::{pattern, run_pattern};
@@ -53,6 +60,17 @@ struct Args {
     /// The site the gateway routes zend by.
     #[arg(long, default_value = "code.tokera.com")]
     host: String,
+    /// The account subject the run speaks as (`<provider>:<id>`), sent as a
+    /// gateway would forward it — so honoured only when the run is sent from a
+    /// trusted gateway's address to a member's own listener.
+    #[arg(long)]
+    user: String,
+    /// The provider that signed the caller in.
+    #[arg(long, default_value = "google")]
+    provider: String,
+    /// The caller's email, which the estate's role table is keyed by.
+    #[arg(long)]
+    email: String,
     /// Rungs to run, in order: light, medium, heavy.
     #[arg(long, value_delimiter = ',', default_value = "light,medium,heavy")]
     levels: Vec<String>,
@@ -120,6 +138,11 @@ async fn main() -> Result<()> {
             .build()?,
         chat_url: format!("{base}/v1/chat/completions"),
         host: args.host.clone(),
+        caller: Caller {
+            user: args.user.clone(),
+            provider: args.provider.clone(),
+            email: args.email.clone(),
+        },
     });
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let limit = Duration::from_secs(args.turn_limit_s);

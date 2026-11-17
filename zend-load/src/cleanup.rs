@@ -3,6 +3,7 @@
 //! conversation goes by its id; a passthrough one is found by the run's mark
 //! in its opening, which its label shows.
 
+use reqwest::Method;
 use serde_json::Value;
 
 use crate::client::Target;
@@ -21,9 +22,7 @@ pub async fn delete_run(
     let (mut gone, mut kept) = (0, 0);
     for id in ids {
         let res = target
-            .http
-            .delete(format!("{base}/v1/conversations/{id}"))
-            .header("host", &target.host)
+            .request(Method::DELETE, &format!("{base}/v1/conversations/{id}"))
             .send()
             .await;
         match res {
@@ -37,9 +36,7 @@ pub async fn delete_run(
 /// The passthrough conversations whose label carries `mark`.
 async fn marked(target: &Target, base: &str, mark: &str) -> Vec<String> {
     let listing = target
-        .http
-        .get(format!("{base}/v1/conversations"))
-        .header("host", &target.host)
+        .request(Method::GET, &format!("{base}/v1/conversations"))
         .send()
         .await;
     let Ok(listing) = listing else {

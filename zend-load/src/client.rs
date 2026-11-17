@@ -5,20 +5,55 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, Method, RequestBuilder};
 use serde_json::Value;
 use tokio::time::Instant;
 
 use crate::sample::Sample;
 use crate::sse::{Item, Parser};
 
-/// Where requests go.
+/// Where requests go, and as whom.
 pub struct Target {
     pub http: Client,
     /// The gateway's chat endpoint.
     pub chat_url: String,
     /// The site the gateway routes by.
     pub host: String,
+    /// The person the run speaks as.
+    pub caller: Caller,
+}
+
+/// A signed-in person, as a gateway forwards them to the member behind it.
+///
+/// A member reads who a caller is only from these headers, and clears them on
+/// every request whose peer is not a trusted gateway. So a run carries them
+/// when it is sent from a gateway's own address straight to a member's
+/// listener; through the gateway itself they are cleared and replaced by
+/// whoever the gateway has signed in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    /// The account's subject, as `<provider>:<id>`.
+    pub user: String,
+    /// The identity provider that signed it in.
+    pub provider: String,
+    pub email: String,
+}
+
+/// The forwarded-identity headers a member reads (`web::auth::forwarded`).
+const USER: &str = "x-tokera-user";
+const PROVIDER: &str = "x-tokera-provider";
+const EMAIL: &str = "x-tokera-email";
+
+impl Target {
+    /// A request to `url`, addressed to the site and carrying the caller.
+    pub fn request(&self, method: Method, url: &str) -> RequestBuilder {
+        self.http
+            .request(method, url)
+            .header("host", &self.host)
+            .header(USER, &self.caller.user)
+            .header(PROVIDER, &self.caller.provider)
+            .header(EMAIL, &self.caller.email)
+    }
 }
 
 /// The header naming the member that served a request.
@@ -40,9 +75,7 @@ pub async fn turn(
     let res = tokio::time::timeout_at(
         deadline,
         target
-            .http
-            .post(&target.chat_url)
-            .header("host", &target.host)
+            .request(Method::POST, &target.chat_url)
             .json(body)
             .send(),
     )
@@ -125,6 +158,36 @@ mod tests {
     use super::*;
     use crate::sample::Outcome;
 
+    fn caller() -> Caller {
+        Caller {
+            user: "google:someone@example.com".to_string(),
+            provider: "google".to_string(),
+            email: "someone@example.com".to_string(),
+        }
+    }
+
+    /// **Every request carries the site and the caller**, as the gateway's
+    /// forwarded headers, byte for byte.
+    #[test]
+    fn a_request_carries_the_site_and_the_caller() {
+        let target = Target {
+            http: Client::new(),
+            chat_url: "http://127.0.0.1:1/v1/chat/completions".to_string(),
+            host: "code.example.com".to_string(),
+            caller: caller(),
+        };
+        let req = target
+            .request(Method::DELETE, "http://127.0.0.1:1/v1/conversations/c")
+            .build()
+            .unwrap();
+        let h = req.headers();
+        assert_eq!(req.method(), Method::DELETE);
+        assert_eq!(h["host"], "code.example.com");
+        assert_eq!(h["x-tokera-user"], "google:someone@example.com");
+        assert_eq!(h["x-tokera-provider"], "google");
+        assert_eq!(h["x-tokera-email"], "someone@example.com");
+    }
+
     /// **A request held without headers is cut at the turn's limit.** The
     /// server accepts and never answers; the turn ends as a cut, not a client
     /// that waits for ever.
@@ -138,6 +201,7 @@ mod tests {
             http: Client::new(),
             chat_url: format!("http://{addr}/v1/chat/completions"),
             host: "zend.localhost".to_string(),
+            caller: caller(),
         };
         let limit = Duration::from_millis(300);
         let (sample, content) = turn(&target, "held", &json!({}), limit).await;

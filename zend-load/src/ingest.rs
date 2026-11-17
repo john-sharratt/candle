@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use reqwest::Method;
 use serde_json::Value;
 use tokio::time::{sleep, Instant};
 
@@ -57,9 +58,7 @@ impl Watched {
 /// Read `base`'s status as `target` addresses it.
 async fn status(target: &Target, base: &str) -> Option<Value> {
     let res = target
-        .http
-        .get(format!("{base}/v1/status"))
-        .header("host", &target.host)
+        .request(Method::GET, &format!("{base}/v1/status"))
         .send()
         .await
         .ok()?;
