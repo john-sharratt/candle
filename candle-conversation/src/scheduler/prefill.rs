@@ -3603,20 +3603,6 @@ impl Scheduler {
             || self.prefill_queue.iter().any(|w| urgent(w.sequence_id))
     }
 
-    /// Whether a section a person is waiting on is being sealed, or queued to
-    /// be: the frame of a conversation opened for them, or what one of theirs
-    /// had submitted to it. Their turn cannot be submitted until it has.
-    pub(super) fn an_urgent_section_ingests(&self) -> bool {
-        self.active_section_ingests
-            .iter()
-            .filter(|s| s.error.is_none() && s.offset < s.tokens.len())
-            .any(|s| s.band == DecodePriority::Urgent)
-            || self
-                .section_queue
-                .iter()
-                .any(|s| s.band == DecodePriority::Urgent)
-    }
-
     /// In-flight prefills that can advance: not errored. What admission's
     /// progress gates count.
     pub(super) fn running_prefills(&self) -> usize {

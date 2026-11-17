@@ -193,41 +193,6 @@ fn an_urgent_prompt_holds_low_rows_like_an_urgent_decode() {
     assert_eq!(scheduler.active_decodes[&low].generated_tokens.len(), 1);
 }
 
-/// **While a person's prompt prefills, the cast sits out too.** A `High` row
-/// beside a queued `Urgent` prompt rides no step — the step is the prompt's —
-/// and loses nothing: it decodes on once the prompt has gone.
-#[test]
-fn an_urgent_prompt_prefilling_holds_every_lower_band() {
-    let (mut scheduler, carried) = recording_scheduler();
-    let (high, _h) = decoding(&mut scheduler, DecodePriority::High, 100);
-    let (normal, _n) = decoding(&mut scheduler, DecodePriority::Normal, 300);
-    let prompt = SequenceId(scheduler.session.create_sequence().unwrap());
-    scheduler.slot_bands.insert(prompt, DecodePriority::Urgent);
-    scheduler.prefill_queue.push_back(test_prefill_work(prompt));
-
-    for _ in 0..LOW_RIDES_EVERY {
-        scheduler.batch_decode_step();
-    }
-    assert!(
-        carried
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|rows| !rows.contains(&high.0) && !rows.contains(&normal.0)),
-        "neither rode while the prompt waited"
-    );
-    assert_eq!(scheduler.active_decodes[&high].generated_tokens.len(), 1);
-
-    scheduler.prefill_queue.clear();
-    scheduler.batch_decode_step();
-    let carried = carried.lock().unwrap().clone();
-    let last = carried.last().expect("a forward");
-    assert!(
-        last.contains(&high.0) && last.contains(&normal.0),
-        "the prompt gone, both ride: {last:?}"
-    );
-}
-
 /// **A hold never empties a step that nothing else can use.** While the creep
 /// is held back, holding the only rows would finish a step with nothing in it
 /// and spend the hold's count on it.

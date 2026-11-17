@@ -621,9 +621,8 @@ impl Scheduler {
         // ── Every band's decode rides the step ──────────────────────────────
         // Decode is width-bound — the step's expert loads amortize across its
         // rows — so an ingest row beside a dialogue's costs the dialogue little
-        // and is the ingest's whole progress. Bands share the step; beside an
-        // `Urgent` decode only `Low` sits out, three steps in four, and beside
-        // an `Urgent` prompt still prefilling every lower band does (below,
+        // and is the ingest's whole progress. Bands share the step; only `Low`
+        // beside an `Urgent` decode sits out, three steps in four (below,
         // `urgent_hold`). The highest band leads, so the adapter rule below
         // keeps the dialogue's. `decode_priority_or_high` treats an
         // unresolvable slot as `High`. Tenants are equal: the band alone ranks.
@@ -670,17 +669,13 @@ impl Scheduler {
         // `LOW_RIDES_EVERY` (`urgent_hold`): a step bound by its rows' contexts
         // is the dialogue's latency, row for row. A held row is not dropped —
         // it waits, as an adapter's does, and its static run stays pending.
-        // **And while that person's prompt or section is still prefilling, every
-        // band below sits out**: a step that carries a decode row is that row's
-        // whole forward, and the prompt gets one slice of it.
-        let prefilling = self.an_urgent_prompt_prefills() || self.an_urgent_section_ingests();
         let urgent = seq_ids
             .iter()
             .copied()
             .chain(stencil.rows.iter().map(|r| r.seq))
             .any(|id| self.decode_priority_or_high(id) == DecodePriority::Urgent)
-            || prefilling;
-        self.urgent_hold.advance(urgent, prefilling);
+            || self.an_urgent_prompt_prefills();
+        self.urgent_hold.advance(urgent);
         // **A hold needs something to give the step to.** With the creep held
         // back by a debt and no row riding, holding them would leave a step
         // with nothing in it: done at once, its count spent, and the debt no
