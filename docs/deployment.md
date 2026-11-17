@@ -288,9 +288,16 @@ S4U as `johna`, restart count 999 — whose action is a PowerShell supervisor lo
 `D:\prog\cf-ddns\target\release\cf-ddns.exe` and restarts it 10 s after any exit. Log:
 `C:\Users\johna\AppData\Local\cf-ddns\cf-ddns.log` (rotated at 5 MB).
 
-It manages the records named on its startup log line — as of 2026-09-13:
-`tokera.com, www.tokera.com, remote.tokera.com`, every 30 s. The other names
-(`code.`, `bot.`, `battlecities.net`) are not in that list.
+It manages the A records named on its startup log line — as of 2026-11-17:
+`tokera.com, www.tokera.com, remote.tokera.com`, every 30 s. It looks each name up
+among the zone's A records and changes only the address, never the proxied flag. The
+other names (`code.`, `bot.`, `battlecities.net`) are not in that list.
+
+`gateway.tokera.com`, the name every member dials over the internet, is not an A
+record and is not in the list: it is a DNS-only CNAME to `tokera.com`, so it answers
+the apex's address and follows it whenever cf-ddns moves the apex. Named in the list
+it fails every cycle with "no A record found in this zone". `connect.battlecities.net`
+is a CNAME to it.
 
 Healthy means: task state `Running` **and** a `cf-ddns` process exists. The process's
 `ExecutablePath` reads empty from an interactive session (it runs in another logon
@@ -367,14 +374,15 @@ Expected results, as measured 2026-09-13:
 | gateway config | `target\release\web.exe --config web/web.yaml --check` | exit 0 |
 | gateway routing | `curl -H "Host: <name>" http://127.0.0.1/` for `tokera.com`, `code.tokera.com`, `bot.tokera.com` | `200` / `30x` / `401`; `503` = that upstream is down |
 | from the internet | `curl https://<name>/` for `tokera.com`, `www.tokera.com`, `battlecities.net`, `code.tokera.com`, `bot.tokera.com` | not `5xx`, not `000` |
-| DNS vs public IP | `curl https://api.ipify.org` vs `Resolve-DnsName remote.tokera.com -Server 1.1.1.1 -DnsOnly` | equal |
+| DNS vs public IP | `curl https://api.ipify.org` vs `Resolve-DnsName gateway.tokera.com -Server 1.1.1.1 -DnsOnly -Type A` | equal |
 | cf-ddns | task `Running` + a `cf-ddns` process; no error lines at the end of its log | yes |
 
 Reading a failure:
 
 - **Proxied names cannot be compared to the public IP** — they resolve to Cloudflare's
-  addresses (`104.21.*`, `172.67.*`). `remote.tokera.com` is DNS-only (grey cloud) and
-  resolves to the origin, so it is the one record that shows whether the IP is right.
+  addresses (`104.21.*`, `172.67.*`). `gateway.tokera.com` is DNS-only (grey cloud), a
+  CNAME to the apex, and resolves to the origin, so it is the name that shows whether the
+  IP is right — and the one the members' internet path depends on.
 - **Cloudflare `521` / `522` / `523`** with the gateway healthy locally means Cloudflare
   cannot reach port 80 on the public IP: a stale A record (check DNS vs public IP, then
   cf-ddns), the router's DMZ no longer pointing at `192.168.0.5` (e.g. DHCP handed this box
