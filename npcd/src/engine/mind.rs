@@ -64,7 +64,8 @@ use papaya::HashMap as LockFreeMap;
 use tokio::sync::Mutex as ConversationLock;
 
 use candle_conversation::projection::{
-    Builder, Conversation, GroupId, LayerId, SelectedTurn, SelectionState, TimelineId,
+    Builder, Conversation, DecodePriority, GroupId, LayerId, SelectedTurn, SelectionState,
+    TimelineId,
 };
 use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, StencilTree, ThinkMode, ThinkSteerEnvelope,
@@ -736,6 +737,18 @@ impl Minds {
     /// map, so holding it holds nothing else.
     fn resident_of(&self, npc_id: u64) -> Option<Arc<Resident>> {
         self.live.pin().get(&npc_id)?.load_full()
+    }
+
+    /// Decode this character's next turns at `band`, or with `None` at its
+    /// conversation's own. A character carrying out what a person asked of it
+    /// is waited on as the phone turn that took the request was, and its turn
+    /// queued with the rest of the cast left that person waiting minutes for
+    /// a reading that takes seconds. Nothing to set for a character with no
+    /// conversation open: its first turn opens one.
+    pub async fn set_band(&self, npc_id: u64, band: Option<DecodePriority>) {
+        if let Some(resident) = self.resident_of(npc_id) {
+            resident.conversation.lock().await.sequence.set_band(band);
+        }
     }
 
     /// Take this character's conversation out of the map, emptying the entry's

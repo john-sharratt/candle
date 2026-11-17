@@ -590,14 +590,11 @@ impl Sequence {
             .ok_or_else(|| ConversationError::Other("owned section ids are exhausted".into()))?;
         self.substrate.register_owned_section(owner, name, section);
 
-        // A layer the schema does not list cannot be decoded at: the protective
-        // `High`, as the scheduler reads an unresolved slot.
-        let band = base
-            .schema()
-            .layers
-            .iter()
-            .find(|l| l.id == self.target.layer)
-            .map_or(DecodePriority::High, |l| l.decode_priority);
+        // At the conversation's own band, as its frame is: a person's
+        // conversation records `Urgent`, and its mission, journal and catch-up
+        // sealed at its layer's `High` stood behind every character's turn
+        // before the turn a person waits on could start.
+        let band = self.band();
         let settled = Settled::new();
         let job = SealJob {
             scheduler_tx: self.scheduler_tx.clone(),

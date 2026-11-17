@@ -38,7 +38,7 @@ use candle_conversation::guest::resolve_seed;
 use candle_conversation::models::ModelBuilder;
 use candle_conversation::persistence::SharedSubstrate;
 use candle_conversation::projection::{
-    Builder, GroupId, LayerId, ProjectionEvent, SelectionState, TimelineId,
+    Builder, DecodePriority, GroupId, LayerId, ProjectionEvent, SelectionState, TimelineId,
 };
 use candle_conversation::{
     ConversationEngine, LoadPhase, Sequence, SequenceConfig, TurnEvent, TurnHandle, TurnResponse,
@@ -6954,7 +6954,14 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 .events
                 .iter()
                 .any(|e| matches!(e.kind, EventKind::Concluded { .. }));
-            if let Some((party, request)) = rt.scheduler.asked(id, world_ms).filter(|_| !fresh) {
+            let asked = rt.scheduler.asked(id, world_ms);
+            // **And the turn that carries it out is waited on**: it decodes
+            // at `Urgent`, ahead of the cast, for as long as the request
+            // stands, and at the conversation's own band once it is told.
+            minds
+                .set_band(id, asked.as_ref().map(|_| DecodePriority::Urgent))
+                .await;
+            if let Some((party, request)) = asked.filter(|_| !fresh) {
                 start.events.push(Event::new(
                     rt.scheduler.next_seq(),
                     world_ms,

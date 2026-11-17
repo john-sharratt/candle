@@ -706,6 +706,19 @@ pub(crate) enum SchedulerRequest {
         sections: Vec<SectionId>,
     },
 
+    /// Set the band a slot decodes at in place of its target layer's, from
+    /// its next admission on; `None` returns it to the band its conversation
+    /// records for itself, or with none recorded to its layer's.
+    ///
+    /// A conversation's band is otherwise fixed when its slot is made. A
+    /// character carrying out what a person is waiting on is the same
+    /// conversation as the one that idles: what changes is who waits on its
+    /// next turn. Fire-and-forget.
+    SetBand {
+        sequence_id: SequenceId,
+        band: Option<DecodePriority>,
+    },
+
     /// Quantize + offload the collection-member sections sealed so far, freeing
     /// their VRAM mid-build.  Sent by the section-ingest loop after each batch
     /// of prefix-transparent members (e.g. one `no_think` branch of the tool
@@ -971,6 +984,7 @@ impl SchedulerRequest {
             Self::BranchCheckpointPass { .. } => "req:branch_checkpoint_pass",
             Self::RestoreSection { .. } => "req:restore_section",
             Self::RetireSections { .. } => "req:retire_sections",
+            Self::SetBand { .. } => "req:set_band",
             Self::OffloadCollectionMembers { .. } => "req:offload_collection_members",
             Self::ExtractRawKvq { .. } => "req:extract_raw_kvq",
             Self::ProbeWideSigs { .. } => "req:probe_wide_sigs",
@@ -5443,6 +5457,19 @@ impl Scheduler {
                     tokens,
                 );
                 let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::SetBand { sequence_id, band } => {
+                let recorded = || {
+                    let conversation = self.slot_conversations.get(&sequence_id)?;
+                    let target = self.slot_targets.get(&sequence_id)?;
+                    recorded_band(conversation, target.timeline)
+                };
+                match band.or_else(recorded) {
+                    Some(band) => self.slot_bands.insert(sequence_id, band),
+                    None => self.slot_bands.remove(&sequence_id),
+                };
                 true
             }
 
@@ -18108,6 +18135,50 @@ mod tests {
             scheduler.handle_request(SchedulerRequest::FreeSequence { sequence_id: child });
             assert!(!scheduler.slot_bands.contains_key(&child));
         }
+    }
+
+    /// **A slot's band can be raised while it lives, and given back.** Set, it
+    /// decodes at that band; cleared, at the one its conversation records —
+    /// or, recording none, at no band of its own.
+    #[test]
+    fn a_slots_band_is_set_and_given_back() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = Conversation::new();
+        let recorded = ProjectionTarget {
+            timeline: TimelineId::from_raw(51).unwrap(),
+            layer: LayerId::from_raw(1).unwrap(),
+            group: GroupId::from_raw(1).unwrap(),
+        };
+        conversation
+            .set_conversation_metadata(recorded.timeline, DecodePriority::METADATA_KEY, "normal")
+            .unwrap();
+        conversation.register_timeline(recorded.timeline, recorded.layer, recorded.group);
+        let plain = ProjectionTarget {
+            timeline: TimelineId::from_raw(52).unwrap(),
+            ..recorded
+        };
+        let a = scheduler
+            .create_sequence(conversation.clone(), Some(recorded))
+            .expect("slot");
+        let b = scheduler
+            .create_sequence(conversation, Some(plain))
+            .expect("slot");
+        for slot in [a, b] {
+            scheduler.handle_request(SchedulerRequest::SetBand {
+                sequence_id: slot,
+                band: Some(DecodePriority::Urgent),
+            });
+            assert_eq!(
+                scheduler.slot_bands.get(&slot),
+                Some(&DecodePriority::Urgent)
+            );
+            scheduler.handle_request(SchedulerRequest::SetBand {
+                sequence_id: slot,
+                band: None,
+            });
+        }
+        assert_eq!(scheduler.slot_bands.get(&a), Some(&DecodePriority::Normal));
+        assert!(!scheduler.slot_bands.contains_key(&b));
     }
 
     /// **A conversation that records its own band decodes at it**, in place of

@@ -713,10 +713,24 @@ and a `talking` stance branch:
   on the phone with {party}…"). Talk-only text lives here, never in shared
   sections, so an edit to it changes only the talk frame (§4.1).
 
-**Bands.** A person's conversation decodes at **High**, and an NPC↔NPC one at
-**Low**, through the timeline's `decode_band` (`scheduler/band.rs:14-40`), at
-most 64 decodes a wave (`candle-conversation/src/scheduler/mod.rs:7011`). The
-catch-up section seals at the layer's band (`submitted_sections.rs:593-600`).
+**Bands.** A person's conversation decodes at **Urgent**, and an NPC↔NPC one
+at **Low**, through the timeline's `decode_band` (`scheduler/band.rs`), at
+most 64 decodes a wave.
+
+**What a turn waits on runs at the turn's band.** A conversation's frame —
+its system prompt, sealed as it opens — and every section submitted to it
+(mission, journal, catch-up) seal at the conversation's own band
+(`Sequence::band`: the `decode_band` it records, else its layer's). The frame
+was sealed at `Low` whatever the conversation was for, and the submitted
+sections at the layer's band, so work asked at `Urgent` stood behind the
+cast before its turn could be submitted: an image prompt's content check
+took eighty-five seconds to ask four one-token questions, past the sixty its
+caller waits.
+
+**A mind carrying out a person's request is waited on too.** While a request
+stands (`Scheduler::asked`), the character's own turns decode at `Urgent`
+(`Minds::set_band`, `SchedulerRequest::SetBand`), and at the conversation's
+own band again once the person has been told.
 
 ---
 

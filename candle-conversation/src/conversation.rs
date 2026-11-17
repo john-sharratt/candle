@@ -1783,6 +1783,7 @@ impl Sequence {
         } else {
             None
         };
+        let band = self.band();
         let mut slot_ids: Vec<SequenceId> = Vec::with_capacity(to_ingest.len());
         for _ in 0..to_ingest.len() {
             match self.alloc_scratch_slot() {
@@ -1821,7 +1822,9 @@ impl Sequence {
                     debug_name: item.debug_name,
                     in_collection,
                     start: start.clone(),
-                    band: DecodePriority::Low,
+                    // At the conversation's own band: whoever waits on its
+                    // first turn waits on its frame sealing first.
+                    band,
                     response_tx: tx,
                 })
                 .is_err()
@@ -4840,6 +4843,41 @@ impl Sequence {
             .map_err(|_| crate::error::ConversationError::SchedulerGone)?;
         rx.recv()
             .map_err(|_| crate::error::ConversationError::SchedulerGone)?
+    }
+
+    /// The band this conversation's own work runs at: the one it records for
+    /// itself under [`DecodePriority::METADATA_KEY`], or with none recorded
+    /// its target layer's. A layer the schema does not list cannot be decoded
+    /// at: the protective `High`, as the scheduler reads an unresolved slot.
+    ///
+    /// **What a turn waits on runs at the turn's band.** A conversation's
+    /// frame and the sections submitted to it are sealed before its turn can
+    /// be; sealed at `Low` whatever the conversation was for, an image
+    /// prompt's content check — four one-token answers asked at `Urgent` —
+    /// spent eighty-five seconds behind eight characters before its first
+    /// question was submitted, and the caller had given up at sixty.
+    pub fn band(&self) -> DecodePriority {
+        self.substrate
+            .conversation_metadata_value(self.target.timeline, DecodePriority::METADATA_KEY)
+            .and_then(|name| DecodePriority::parse(&name))
+            .unwrap_or_else(|| {
+                self.projection
+                    .schema()
+                    .layers
+                    .iter()
+                    .find(|l| l.id == self.target.layer)
+                    .map_or(DecodePriority::High, |l| l.decode_priority)
+            })
+    }
+
+    /// Decode this conversation's turns at `band` from the next one on, in
+    /// place of the band it was opened at; `None` returns it to that band.
+    /// See [`SchedulerRequest::SetBand`].
+    pub fn set_band(&self, band: Option<DecodePriority>) {
+        let _ = self.scheduler_tx.send(SchedulerRequest::SetBand {
+            sequence_id: self.id,
+            band,
+        });
     }
 
     /// Close this conversation, releasing the sequence slot.

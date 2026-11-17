@@ -113,6 +113,7 @@ impl SchedulerRequest {
             | Self::FreeSequence { sequence_id }
             | Self::ResetSequence { sequence_id, .. }
             | Self::SetSequenceAdapter { sequence_id, .. }
+            | Self::SetBand { sequence_id, .. }
             | Self::IngestSection { sequence_id, .. }
             | Self::SeedRecurrentFromLineage { sequence_id, .. }
             | Self::MemoryCatchUp { sequence_id, .. }
@@ -171,6 +172,7 @@ impl SchedulerRequest {
             | Self::FreeSequence { .. }
             | Self::ResetSequence { .. }
             | Self::SetSequenceAdapter { .. }
+            | Self::SetBand { .. }
             | Self::IngestSection { .. }
             | Self::InstallRecurrentState { .. }
             | Self::SeedRecurrentFromLineage { .. }
