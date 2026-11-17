@@ -16,6 +16,7 @@
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use super::metadata::{API_PATH, SCOPE};
 use crate::auth::session::{self, Identity, Key};
 
 /// How long a consent page may wait for an answer.
@@ -40,9 +41,27 @@ pub struct Grant {
     pub email: String,
     #[serde(default)]
     pub name: String,
+    /// The scopes granted, for a token to a site's `/api`
+    /// (`docs/battlecities_app.md` §6). A token for `/mcp` names none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
 }
 
 impl Grant {
+    /// Whether this grant is for a site's `/api`, not for `/mcp`.
+    pub fn is_api(&self) -> bool {
+        self.resource.ends_with(API_PATH)
+    }
+
+    /// The `scope` a token on this grant is answered with: its scopes,
+    /// space-separated, or `/mcp`'s one.
+    pub fn scope(&self) -> String {
+        match self.is_api() {
+            true => self.scopes.join(" "),
+            false => SCOPE.to_string(),
+        }
+    }
+
     /// Whether `identity` is the person this grant is for: a person is their
     /// provider and subject.
     pub fn is_for(&self, identity: &Identity) -> bool {
@@ -126,6 +145,16 @@ pub mod testing {
             sub: "boss".into(),
             email: "boss@example.com".into(),
             name: "Boss".into(),
+            scopes: Vec::new(),
+        }
+    }
+
+    /// A grant to the game's API, for `read` and `play`.
+    pub fn api_grant() -> Grant {
+        Grant {
+            resource: "https://battlecities.net/api".into(),
+            scopes: vec!["read".into(), "play".into()],
+            ..grant()
         }
     }
 
@@ -161,6 +190,24 @@ mod tests {
         assert_eq!(open::<Grant>(&other, Kind::McpAccess, &t, 1), None);
         let cookie = session::sign(&key(), &grant().identity(100));
         assert_eq!(open::<Grant>(&key(), Kind::McpAccess, &cookie, 1), None);
+    }
+
+    /// **A token for `/mcp` is the bytes it always was**: it names no scopes,
+    /// and one sealed before scopes existed still opens. A token for a
+    /// site's `/api` carries the scopes granted.
+    #[test]
+    fn a_grant_carries_scopes_only_for_an_api() {
+        let mcp = serde_json::to_string(&grant()).unwrap();
+        assert!(!mcp.contains("scopes"), "{mcp}");
+        assert_eq!(serde_json::from_str::<Grant>(&mcp).unwrap(), grant());
+        assert!(!grant().is_api());
+        assert_eq!(grant().scope(), "zend");
+
+        let api = testing::api_grant();
+        let sealed = serde_json::to_string(&api).unwrap();
+        assert!(sealed.ends_with(r#""scopes":["read","play"]}"#), "{sealed}");
+        assert!(api.is_api());
+        assert_eq!(api.scope(), "read play");
     }
 
     #[test]

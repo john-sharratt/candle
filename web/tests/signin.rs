@@ -671,6 +671,7 @@ fn mcp_token(sub: &str, email: &str) -> String {
         sub: sub.into(),
         email: email.into(),
         name: String::new(),
+        scopes: Vec::new(),
     };
     seal(&key, Kind::McpAccess, now_secs() + 600, &grant)
 }

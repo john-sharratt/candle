@@ -43,11 +43,17 @@ services:
   # whose build writes the `server_assets` it reads. Its world is kept outside
   # the checkout, seeded once from the checkout's `data` submodule, so a
   # deploy's fetch never touches a world being played. It joins the cluster as
-  # the app `battlecities`, and serves HTTP 4080 and UDP 4300 and 4123 on this
-  # machine for the gateway beside it.
+  # the app `battlecities`, and serves HTTP 4080 on this machine. Its
+  # datagrams come through the gateway beside it, which listens on the game's
+  # own UDP ports (4300, 4123) and forwards to the ports named here
+  # (`cluster.udp_forward` in web/web.yaml).
   - name: battlecities
     stable: keep/stable/battle-cities-server.exe
     args:
+      - "--game-port"
+      - "14300"
+      - "--time-port"
+      - "14123"
       - "--data"
       - "D:/battle-cities/data"
       - "--seed-from"

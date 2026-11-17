@@ -21,8 +21,24 @@ pub const RESOURCE_DOC_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
 pub const SERVER_DOC_PATH: &str = "/.well-known/oauth-authorization-server";
 pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
 pub const TOKEN_PATH: &str = "/oauth/token";
-/// The one scope a token carries.
+/// The one scope a token for `/mcp` carries.
 pub const SCOPE: &str = "zend";
+/// The path a site's API is served under: the resource a token with that
+/// site's scopes is for (`docs/battlecities_app.md` §6).
+pub const API_PATH: &str = "/api";
+/// Where the protected-resource document is served, for a site's `/api`.
+pub const API_RESOURCE_DOC_PATH: &str = "/.well-known/oauth-protected-resource/api";
+
+/// The protected-resource document for `resource`, a site's `/api`, issued by
+/// `issuer` with the scopes the site names.
+pub fn protected_api(resource: &str, issuer: &str, scopes: &[String]) -> Value {
+    json!({
+        "resource": resource,
+        "authorization_servers": [issuer],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": scopes,
+    })
+}
 
 /// The protected-resource document for `resource`, issued by `issuer`.
 pub fn protected_resource(resource: &str, issuer: &str) -> Value {
@@ -65,6 +81,16 @@ mod tests {
         assert_eq!(
             authorization_server("https://code.tokera.com").to_string(),
             r#"{"issuer":"https://code.tokera.com","authorization_endpoint":"https://code.tokera.com/oauth/authorize","token_endpoint":"https://code.tokera.com/oauth/token","response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"],"client_id_metadata_document_supported":true,"scopes_supported":["zend"],"authorization_response_iss_parameter_supported":true}"#
+        );
+        let scopes = ["read".to_string(), "play".to_string()];
+        assert_eq!(
+            protected_api(
+                "https://battlecities.net/api",
+                "https://battlecities.net",
+                &scopes
+            )
+            .to_string(),
+            r#"{"resource":"https://battlecities.net/api","authorization_servers":["https://battlecities.net"],"bearer_methods_supported":["header"],"scopes_supported":["read","play"]}"#
         );
     }
 }

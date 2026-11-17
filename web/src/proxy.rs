@@ -68,7 +68,7 @@ pub const HOP_BY_HOP: [header::HeaderName; 7] = [
 /// this gateway itself resolved.
 ///
 /// [`Builder::trust`]: crate::server::Builder::trust
-pub const IDENTITY_HEADERS: [&str; 10] = [
+pub const IDENTITY_HEADERS: [&str; 9] = [
     "x-tokera-user",
     // The issuer half of the account key. In this list because it decides
     // *which* account a subject resolves to: a client able to set it could pick
@@ -83,17 +83,28 @@ pub const IDENTITY_HEADERS: [&str; 10] = [
     // (`docs/battlecities_app.md` §6): a caller that set it would be naming
     // its own rights.
     "x-tokera-scope",
-    // The marks of a request that is this gateway's or a supervisor's own, not
-    // one passed on for a caller (`docs/battlecities_app.md` §5, §7): the
-    // game believes a flow's announcement and a request to stop only with
-    // one, so a client that sent either would be speaking as the gateway.
+    // The mark of a request that is this gateway's own, not one passed on for
+    // a caller (`docs/battlecities_app.md` §4.4, §5): a member believes a
+    // push's word and a flow's announcement only with it, so a client that
+    // sent it would be speaking as the gateway.
     "x-tokera-forwarder",
-    "x-tokera-keep",
     // The member a request came from, when another member sent it: what a
     // member's internal routes believe (§9.3). Set only from a stream the
     // member itself opened, so a client claiming it is claiming to be one.
     FROM_MEMBER,
 ];
+
+/// The header a bearer token's scopes are stated upstream on, space-separated
+/// (`docs/battlecities_app.md` §6).
+pub const SCOPE_HEADER: &str = "x-tokera-scope";
+
+/// The scopes of the bearer token a request's identity came from,
+/// space-separated: put on the request by the server when it reads a token
+/// for the site's API (`Auth::api_grant`), and stated upstream on
+/// [`SCOPE_HEADER`]. A request whose identity is a browser's session carries
+/// none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope(pub String);
 
 /// What a visitor is told when a daemon behind the gateway is not answering.
 ///
@@ -239,6 +250,14 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
     }
     if let Some(id) = f.identity {
         name_caller(&mut headers, id);
+        // What the caller's bearer token may do, when the identity came from
+        // one for this site's API. Always said for such a token, even when it
+        // holds no scope the site still names: upstream reads a caller with no
+        // such header as a browser's session, which may do everything.
+        if let Some(Scope(granted)) = parts.extensions.get::<Scope>() {
+            let said = HeaderValue::from_str(granted).unwrap_or(HeaderValue::from_static(""));
+            headers.insert(header::HeaderName::from_static(SCOPE_HEADER), said);
+        }
         // Not to a member: no daemon reads it, and it is a replayable session
         // token (§5.1).
         if let (To::Url { .. }, Some(v)) = (

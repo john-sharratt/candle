@@ -7,6 +7,10 @@
 //! a push only when the event is `push` and it moved a branch to a commit —
 //! not a tag, and not a branch's deletion.
 
+use std::io::ErrorKind;
+use std::path::Path;
+
+use anyhow::{bail, Context};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -24,6 +28,31 @@ pub struct Pushed {
     pub repo: String,
     pub branch: String,
     pub commit: String,
+}
+
+/// The webhook's secret, from the file `cluster.deploy_on_push` names: its
+/// bytes without the line end an editor leaves. A file that is not there is
+/// no secret, and no delivery is believed; one that is there and empty is a
+/// mistake, and stops the start.
+pub fn secret(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut read = match std::fs::read(path) {
+        Ok(read) => read,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            tracing::warn!(
+                "hook: {} is not there, so no webhook delivery is believed",
+                path.display()
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    while read.last().is_some_and(u8::is_ascii_whitespace) {
+        read.pop();
+    }
+    if read.is_empty() {
+        bail!("{} holds no secret", path.display());
+    }
+    Ok(Some(read))
 }
 
 /// The bytes `hex` spells; `None` when it is not hex of whole bytes.
@@ -114,6 +143,20 @@ mod tests {
         ] {
             assert!(!signed(secret, body, bad), "{bad}");
         }
+    }
+
+    /// The secret is the file's bytes without its line end; a missing file
+    /// is no secret, and an empty one is refused.
+    #[test]
+    fn the_secret_is_read_from_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("github-hook.key");
+        assert_eq!(secret(&file).unwrap(), None);
+        std::fs::write(&file, b"s3cret with spaces\r\n").unwrap();
+        assert_eq!(secret(&file).unwrap(), Some(b"s3cret with spaces".to_vec()));
+        std::fs::write(&file, b"\n").unwrap();
+        let empty = secret(&file).unwrap_err();
+        assert!(format!("{empty:#}").contains("holds no secret"));
     }
 
     fn delivery(moved: &str, after: &str, deleted: bool) -> Vec<u8> {

@@ -50,7 +50,7 @@ pub use gateways::Gateways;
 pub use role::{Person, Principal, Role, Roles};
 pub use session::Identity;
 
-use crate::config::{Auth as AuthConfig, CookieDomain};
+use crate::config::{Auth as AuthConfig, CookieDomain, Site};
 use session::Key;
 
 /// How long a browser has to complete the round trip to the provider.
@@ -67,6 +67,17 @@ pub struct Auth {
     /// The gateway's roles, so `/auth/me` can say what the caller may do — a
     /// page offers an admin's links only to an admin.
     roles: Roles,
+    /// The sites whose `/api` takes a bearer token with scopes
+    /// (`sites[].api_scopes`, [`mcp`]).
+    api_sites: Vec<ApiSite>,
+}
+
+/// A site whose `/api` takes a bearer token: its hosts, as the site names
+/// them, and the scopes a token may be granted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiSite {
+    pub hosts: Vec<String>,
+    pub scopes: Vec<String>,
 }
 
 impl Auth {
@@ -115,7 +126,22 @@ impl Auth {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()?,
             roles,
+            api_sites: Vec::new(),
         })
+    }
+
+    /// With the `/api` of each of `sites` that names scopes for one taking
+    /// bearer tokens ([`mcp`]).
+    pub fn with_api_sites(mut self, sites: &[Site]) -> Self {
+        self.api_sites = sites
+            .iter()
+            .filter(|site| !site.api_scopes.is_empty())
+            .map(|site| ApiSite {
+                hosts: site.hosts.clone(),
+                scopes: site.api_scopes.clone(),
+            })
+            .collect();
+        self
     }
 
     /// The identity this request carries, if any. Silent on a bad or expired
@@ -440,6 +466,7 @@ mod tests {
     use axum::http::HeaderValue;
     use serde_json::Value;
 
+    use super::mcp::grants::{self, Grant, Kind};
     use super::*;
 
     /// An `Auth` over secrets in `dir`, with `roles`.
@@ -476,6 +503,63 @@ mod tests {
         );
         let res = me(State(auth), headers).await;
         serde_json::from_slice(&to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap()
+    }
+
+    /// **A bearer token for a site's API is read on that site's `/api`
+    /// alone**, and says the scopes it holds that the site still names. It is
+    /// nobody on another path, on another site, or as a `/mcp` token; and a
+    /// `/mcp` token is nobody on an API.
+    #[test]
+    fn an_api_token_is_read_on_its_sites_api_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut auth = auth(dir.path(), "people:\n  - { email: a@x.com, role: admin }\n");
+        auth.api_sites = vec![ApiSite {
+            hosts: vec!["battlecities.net".into()],
+            scopes: vec!["read".into(), "play".into()],
+        }];
+        let grant = |resource: &str, scopes: &[&str]| Grant {
+            client_id: "https://client.example/doc".into(),
+            redirect_uri: "https://client.example/cb".into(),
+            resource: resource.into(),
+            provider: "google".into(),
+            sub: "p1".into(),
+            email: "p@x.com".into(),
+            name: String::new(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        };
+        let asking = |host: &str, grant: &Grant| {
+            let exp = session::now_secs() + 600;
+            let token = grants::seal(&auth.key, Kind::McpAccess, exp, grant);
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            headers
+        };
+        // `admin` was granted and the site no longer names it: not held.
+        let game = grant("https://battlecities.net/api", &["play", "admin", "read"]);
+        let on_game = asking("battlecities.net", &game);
+        let (who, scope) = auth.api_grant(&on_game, "/api/v1/me").unwrap();
+        assert_eq!((who.sub.as_str(), scope.as_str()), ("p1", "play read"));
+        assert!(auth.api_grant(&on_game, "/api").is_some());
+        assert!(auth.api_grant(&on_game, "/apiary").is_none());
+        assert!(auth.api_grant(&on_game, "/").is_none());
+        assert!(auth.mcp_identity(&on_game, "/mcp").is_none());
+        assert!(auth.mcp_delegated(&on_game).is_none());
+        // On a site that names no scopes, the token is nobody.
+        let elsewhere = asking("tokera.com", &game);
+        assert!(auth.api_grant(&elsewhere, "/api/v1/me").is_none());
+        // A `/mcp` token is nobody on the game's API.
+        let mcp = grant("https://battlecities.net/mcp", &[]);
+        let with_mcp = asking("battlecities.net", &mcp);
+        assert!(auth.api_grant(&with_mcp, "/api/v1/me").is_none());
+        // The site's document names the resource and its scopes.
+        let api = auth.api(&on_game).unwrap();
+        assert_eq!(api.resource, "https://battlecities.net/api");
+        assert_eq!(api.scopes, ["read", "play"]);
+        assert!(auth.api(&elsewhere).is_none());
     }
 
     /// **`/auth/me` names the caller's role**, so a page offers an admin's

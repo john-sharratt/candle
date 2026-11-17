@@ -67,6 +67,7 @@ async fn dial_in(
     let ip = peer.map_or(IpAddr::from([0, 0, 0, 0]), |ConnectInfo(a)| a.ip());
     upgrade(req, MAX_MESSAGE, move |tx, rx| async move {
         gateway.tick_upgrades();
+        gateway.watch_pushes();
         let hub = gateway.hub.clone();
         hub.serve(app, ip, tx, rx, |s| streams::serve(&gateway, ip, s))
             .await;

@@ -17,7 +17,6 @@ use serde_json::json;
 
 use super::authorize::may_connect;
 use super::grants::{self, Code, Grant, Kind, ACCESS_TTL_SECS, REFRESH_TTL_SECS};
-use super::metadata::SCOPE;
 use crate::auth::oidc::pkce_challenge;
 use crate::auth::session::Key;
 use crate::auth::Roles;
@@ -28,6 +27,8 @@ pub struct Issued {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: u64,
+    /// What the pair may do, as the answer's `scope` says it.
+    pub scope: String,
 }
 
 /// Why an exchange was refused, as RFC 6749 §5.2 names it.
@@ -50,6 +51,7 @@ pub fn issue(key: &Key, grant: &Grant, now: u64) -> Issued {
         access_token: grants::seal(key, Kind::McpAccess, now + ACCESS_TTL_SECS, grant),
         refresh_token: grants::seal(key, Kind::McpRefresh, now + REFRESH_TTL_SECS, grant),
         expires_in: ACCESS_TTL_SECS,
+        scope: grant.scope(),
     }
 }
 
@@ -150,7 +152,8 @@ fn exchange_unlogged(
             ));
         }
     }
-    if !may_connect(roles, &grant.identity(now)) {
+    // A site's API is anyone's who signed in; `/mcp` is the role table's.
+    if !grant.is_api() && !may_connect(roles, &grant.identity(now)) {
         return Err(refused(
             "invalid_grant",
             "this account is no longer on the list of people who may use Zen",
@@ -173,7 +176,7 @@ pub fn answer(result: Result<Issued, Refused>) -> Response {
                 "token_type": "Bearer",
                 "expires_in": issued.expires_in,
                 "refresh_token": issued.refresh_token,
-                "scope": SCOPE,
+                "scope": issued.scope,
             })),
         )
             .into_response(),
@@ -267,6 +270,28 @@ mod tests {
             100 + CODE_TTL_SECS,
         );
         assert_eq!(late.unwrap_err().error, "invalid_grant");
+    }
+
+    /// **A token for a site's API is anyone's who signed in, and says its
+    /// scopes**: with nobody on the role table the code still buys a pair,
+    /// whose answer names the scopes granted; `/mcp`'s names its one.
+    #[test]
+    fn an_apis_code_buys_a_pair_for_anyone_and_names_its_scopes() {
+        use crate::auth::mcp::grants::testing::api_grant;
+        let c = Code {
+            grant: api_grant(),
+            challenge: pkce_challenge(VERIFIER),
+        };
+        let sealed = grants::seal(&key(), Kind::McpCode, 100 + CODE_TTL_SECS, &c);
+        let nobody_listed = Roles::default();
+        let issued = exchange(&key(), &nobody_listed, &by_code(&sealed, VERIFIER), 101).unwrap();
+        assert_eq!(issued.scope, "read play");
+        let access: Grant =
+            grants::open(&key(), Kind::McpAccess, &issued.access_token, 102).unwrap();
+        assert_eq!(access, api_grant());
+
+        let mcp = exchange(&key(), &listed(), &by_code(&code(100), VERIFIER), 101).unwrap();
+        assert_eq!(mcp.scope, "zend");
     }
 
     #[test]

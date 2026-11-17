@@ -57,6 +57,7 @@ pub mod proxy;
 pub mod server;
 pub mod site;
 pub mod tls;
+pub mod udp_forward;
 pub mod upstream_tls;
 
 pub use config::{Backoff, Config, Route, Site, Tls, Upstream};
