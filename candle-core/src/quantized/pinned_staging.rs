@@ -341,6 +341,14 @@ impl PinnedBuf {
         Self::alloc_owned_with_flags(len, 0x01)
     }
 
+    /// Write-combined pinned memory a kernel reads at its host address —
+    /// `CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_WRITECOMBINED` (0x06). For a
+    /// buffer the CPU only writes and a kernel only reads, pulled over PCIe by
+    /// the kernel itself rather than copied by the copy engine.
+    pub fn alloc_owned_mapped(len: usize) -> Result<Self> {
+        Self::alloc_owned_with_flags(len, 0x06)
+    }
+
     /// Staging allocation that never aborts the process under memory pressure:
     /// try pinned host memory first, and on failure fall back to a **fallible**
     /// plain host `Vec` via `try_reserve_exact` (NOT `vec![]`, which calls

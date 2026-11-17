@@ -13,16 +13,15 @@
 //! always right: the whole defect was the device disagreeing with it.
 #![cfg(feature = "cuda")]
 
-use std::ffi::c_void;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use candle::cuda_backend::cudarc::driver::result::memcpy_dtod_async;
-use candle::cuda_backend::cudarc::driver::result::stream::launch_host_function;
-use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use candle::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr};
 use candle::{DType, Device, Tensor};
 
+use super::stream_gate::StreamGate;
 use crate::kv_cache::arena_table::N_PALETTE;
 use crate::kv_cache::chunked::gpu_test_lock::gpu_serial;
 use crate::kv_cache::{ChunkedKvBacking, DecodeGpuChunkSyncStats, KvCache, KvFormat};
@@ -103,65 +102,6 @@ fn slice_lens(bytes: &[u8]) -> Vec<u16> {
         .chunks_exact(SLICE_BYTES)
         .map(|s| u16::from_le_bytes([s[2], s[3]]))
         .collect()
-}
-
-/// A gate across a stream: a host function the stream runs when it reaches it,
-/// which blocks until the test opens the gate — so everything enqueued after it
-/// waits, deterministically and with no GPU work. It opens by itself after
-/// [`StreamGate::TIMEOUT`], so a host that waits on work queued behind a closed
-/// gate is held that long and then fails the test, rather than hanging it.
-struct StreamGate {
-    open: Arc<(Mutex<bool>, Condvar)>,
-}
-
-impl StreamGate {
-    const TIMEOUT: Duration = Duration::from_secs(2);
-
-    fn close_on(stream: &CudaStream) -> Self {
-        let open = Arc::new((Mutex::new(false), Condvar::new()));
-        let arg = Arc::into_raw(Arc::clone(&open)) as *mut c_void;
-        // SAFETY: `wait_at_gate` takes back, exactly once, the reference leaked
-        // here, when the stream runs it.
-        unsafe { launch_host_function(stream.cu_stream(), wait_at_gate, arg) }.unwrap();
-        Self { open }
-    }
-
-    fn open(&self) {
-        let (opened, wake) = &*self.open;
-        *opened.lock().unwrap() = true;
-        wake.notify_all();
-    }
-
-    /// Open the gate from another thread after `delay` — for a test whose own
-    /// thread is about to wait on work behind it.
-    fn open_after(&self, delay: Duration) -> JoinHandle<()> {
-        let gate = Self {
-            open: Arc::clone(&self.open),
-        };
-        thread::spawn(move || {
-            thread::sleep(delay);
-            gate.open();
-        })
-    }
-}
-
-impl Drop for StreamGate {
-    fn drop(&mut self) {
-        self.open();
-    }
-}
-
-/// The host function behind a [`StreamGate`]. It must not call CUDA, and does
-/// not: it only waits.
-unsafe extern "C" fn wait_at_gate(arg: *mut c_void) {
-    // SAFETY: `arg` is the `Arc` leaked by `StreamGate::close_on`, taken back
-    // once.
-    let open = unsafe { Arc::from_raw(arg as *const (Mutex<bool>, Condvar)) };
-    let (opened, wake) = &*open;
-    let guard = opened
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _ = wake.wait_timeout_while(guard, StreamGate::TIMEOUT, |opened| !*opened);
 }
 
 /// A block that fits the writer chunk: the reused buffer's writer length must

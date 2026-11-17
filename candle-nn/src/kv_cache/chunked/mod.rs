@@ -138,6 +138,8 @@ mod vram_bands;
 // Instrumentation for the bump arenas' high-water marks: its only caller is
 // `bump_arena`, so it shares that module's gating.
 #[cfg(feature = "cuda")]
+mod warm_lift;
+#[cfg(feature = "cuda")]
 mod wave_census;
 pub mod wave_plan;
 #[cfg(feature = "cuda")]
@@ -210,6 +212,8 @@ pub use types::{ChunkMeta, CHUNK_SIZE};
 pub use types::{
     DetachedChunks, LiveChunkRef, ProvSource, QSign, SealedChunk, SealedSequence, WriterTail,
 };
+#[cfg(feature = "cuda")]
+pub use warm_lift::{lift_warm_to_gpu, WarmLiftRing};
 pub use weight_zone::{
     RetractPlan, WeightZone, WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
 };

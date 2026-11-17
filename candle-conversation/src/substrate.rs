@@ -670,7 +670,7 @@ pub type AlreadyHotEntry = PromotionItemKind;
 /// One item that needs warm → hot promotion. The warm
 /// `Vec<SealedSequence>` is the residence's own, shared at snapshot time —
 /// one refcount, never a per-chunk copy — so the caller can hand it to
-/// [`candle_nn::kv_cache::ChunkedKvBacking::migrate_sealed_to_gpu_batch_async`]
+/// the warm lift ([`candle_nn::kv_cache::lift_warm_to_gpu`])
 /// without holding the substrate read lock, and a plan built only to price a
 /// lift costs nothing per chunk.
 #[derive(Debug)]
@@ -756,7 +756,7 @@ pub struct ColdRecall {
 /// A fast promotion from warm (RAM-cached) state into hot.
 ///
 /// The elevation orchestrator produces one of these per turn already
-/// resident in the warm tier: `migrate_sealed_to_gpu_batch_async`
+/// resident in the warm tier: the warm lift (`lift_warm_to_gpu`)
 /// scatters the warm payload into fresh VRAM arena chunks. Only hot
 /// is installed — the warm copy stays in place, so the residence stays
 /// dual-tier.

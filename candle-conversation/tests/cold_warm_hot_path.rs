@@ -43,7 +43,7 @@ use candle_conversation::projection::{
 use candle_conversation::substrate::residence::{drain_reclaimed, own_device_frees};
 use candle_conversation::substrate::TierState;
 use candle_conversation::turn::Role;
-use candle_nn::kv_cache::{ChunkedKvBacking, KvFormat, QuantFormat, SealedSequence};
+use candle_nn::kv_cache::{ChunkedKvBacking, KvFormat, QuantFormat, SealedSequence, WarmLiftRing};
 use half::bf16;
 
 mod common;
@@ -485,18 +485,16 @@ fn full_cold_warm_hot_round_trip() {
 
         // ── Phase 4: warm → hot ─────────────────────────────────────────
         //
-        // elevate_to_hot routes each turn through the WarmLift leg:
-        // batched per-layer migrate_sealed_to_gpu_batch_async on the
-        // device's main stream. Single substrate write lock to install.
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
+        // elevate_to_hot routes each turn through the WarmLift leg: one warm
+        // lift for every layer, through the pinned ring on the device's main
+        // stream. Single substrate write lock to install.
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         let report = elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &turn_keys,
@@ -567,15 +565,13 @@ fn full_cold_warm_hot_round_trip() {
     // recover_turn_chunks pulls the grid out of the redo log and load_to_hot
     // scatters it into fresh VRAM arenas. The recall lands hot only — the
     // cold record stays the turn's host copy, so no warm copy is made.
-    let main_stream = cuda_stream(&device);
-    let mut pinned: Option<PinnedBuf> = None;
     let mut stager = ColdLoadStager::new();
+    let mut ring = WarmLiftRing::new().unwrap();
     let report = elevate_to_hot(
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &turn_keys,
@@ -698,15 +694,13 @@ fn cold_to_warm_on_request_round_trip() {
         "a warm turn is skipped"
     );
 
-    let main_stream = cuda_stream(&device);
-    let mut pinned: Option<PinnedBuf> = None;
     let mut stager = ColdLoadStager::new();
+    let mut ring = WarmLiftRing::new().unwrap();
     let report = elevate_to_hot(
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &turn_keys,
@@ -1050,15 +1044,13 @@ fn quant_blend_warm_round_trip() {
         let purged = evict_from_hot(&conv, &[], &[]);
         assert_eq!(purged.count, formats.len(), "all hot residences evicted");
 
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         let report = elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &turn_keys,
@@ -1128,15 +1120,13 @@ fn single_format_cold_round_trip(label: &str, target_format: Option<KvFormat>) {
     conv.reconstruct_from_log(N_LAYERS, None).unwrap();
 
     let key = TurnKey::new(timeline, TurnIndex(0));
-    let main_stream = cuda_stream(&device);
-    let mut pinned: Option<PinnedBuf> = None;
     let mut stager = ColdLoadStager::new();
+    let mut ring = WarmLiftRing::new().unwrap();
     let report = elevate_to_hot(
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &[key],
@@ -1261,15 +1251,13 @@ fn cold_marker_turn_passes_existence_check() {
     // Now run the elevate path the SubmitTurn handler runs after the
     // filter — proves the cold-marker turn actually does land hot
     // when the filter lets it through.
-    let main_stream = cuda_stream(&device);
-    let mut pinned: Option<PinnedBuf> = None;
     let mut stager = ColdLoadStager::new();
+    let mut ring = WarmLiftRing::new().unwrap();
     let report = elevate_to_hot(
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &[key],
@@ -1389,15 +1377,13 @@ fn cold_load_q8_single_chunk_diagnostic() {
     }
 
     let key = TurnKey::new(timeline, TurnIndex(0));
-    let main_stream = cuda_stream(&device);
-    let mut pinned: Option<PinnedBuf> = None;
     let mut stager = ColdLoadStager::new();
+    let mut ring = WarmLiftRing::new().unwrap();
     let report = elevate_to_hot(
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &[key],
@@ -1519,15 +1505,13 @@ fn quant_blend_cold_round_trip() {
     let restored = conv.reconstruct_from_log(N_LAYERS, None).unwrap();
     assert_eq!(restored, formats.len(), "all mixed-format turns recovered");
 
-    let main_stream = cuda_stream(&device);
-    let mut pinned: Option<PinnedBuf> = None;
     let mut stager = ColdLoadStager::new();
+    let mut ring = WarmLiftRing::new().unwrap();
     let report = elevate_to_hot(
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &turn_keys,
@@ -1613,9 +1597,8 @@ fn elevate_edge_cases() {
     let purged = evict_from_hot(&conv, &[], &[]);
     assert_eq!(purged.count, 3, "explicit purge drops all 3 hot residences");
 
-    let main_stream = cuda_stream(&device);
-    let mut pinned: Option<PinnedBuf> = None;
     let mut stager = ColdLoadStager::new();
+    let mut ring = WarmLiftRing::new().unwrap();
 
     // ── Case 1: missing key + valid keys mixed ───────────────────────────
     let bogus = TurnKey::new(TimelineId::from_raw(999).unwrap(), TurnIndex(42));
@@ -1624,8 +1607,7 @@ fn elevate_edge_cases() {
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &mixed_keys,
@@ -1651,8 +1633,7 @@ fn elevate_edge_cases() {
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &[keys[0], keys[1]],
@@ -1688,8 +1669,7 @@ fn elevate_edge_cases() {
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &[keys[2]],
@@ -1778,15 +1758,13 @@ fn multi_chunk_turn_round_trip() {
         let purged = evict_from_hot(&conv, &[], &[]);
         assert_eq!(purged.count, 1, "explicit purge drops post-persist hot");
 
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         let report = elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -1810,15 +1788,13 @@ fn multi_chunk_turn_round_trip() {
     let st = turn_state(&conv, key);
     assert!(!st.hot && !st.warm && st.cold);
 
-    let main_stream = cuda_stream(&device);
-    let mut pinned: Option<PinnedBuf> = None;
     let mut stager = ColdLoadStager::new();
+    let mut ring = WarmLiftRing::new().unwrap();
     let report = elevate_to_hot(
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &[key],
@@ -2183,15 +2159,13 @@ fn quantize_on_evict_cold_reload_round_trip() {
     );
 
     // Cold-load + elevate.
-    let main_stream = cuda_stream(&device);
-    let mut pinned: Option<PinnedBuf> = None;
     let mut stager = ColdLoadStager::new();
+    let mut ring = WarmLiftRing::new().unwrap();
     let report = elevate_to_hot(
         &conv,
         &backings,
         &device,
-        &main_stream,
-        &mut pinned,
+        &mut ring,
         &mut stager,
         &[],
         &[key],
@@ -2786,12 +2760,12 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -2810,8 +2784,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -2836,15 +2809,13 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(n_layers, None).unwrap();
 
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         let report = elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -2872,15 +2843,13 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(n_layers, None).unwrap();
 
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -2904,14 +2873,14 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         // The first elevate lands the recall hot only; the warm copy is made
         // from hot as the persistence thread makes one.
         elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -2929,8 +2898,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -3034,12 +3002,12 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -3057,8 +3025,7 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -3077,15 +3044,13 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(n_layers, None).unwrap();
 
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -3104,12 +3069,12 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -3125,8 +3090,7 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],
@@ -3145,15 +3109,13 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(n_layers, None).unwrap();
 
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
+        let mut ring = WarmLiftRing::new().unwrap();
         elevate_to_hot(
             &conv,
             &backings,
             &device,
-            &main_stream,
-            &mut pinned,
+            &mut ring,
             &mut stager,
             &[],
             &[key],

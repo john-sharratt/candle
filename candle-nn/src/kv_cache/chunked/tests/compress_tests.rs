@@ -21,6 +21,7 @@ use half::f16;
 use crate::kv_cache::arena_table::ArenaLocation;
 use crate::kv_cache::chunked::compress::quantize_layers_deferred_within;
 use crate::kv_cache::chunked::selection_batches::selection_bytes;
+use crate::kv_cache::chunked::warm_lift::lift_one;
 use crate::kv_cache::chunked::{ChunkedKvBacking, CompressionPolicy};
 use crate::kv_cache::{
     convert_deferred_descs, payload_bytes_for_tag, quantize_sealed_in_place,
@@ -572,10 +573,7 @@ fn migrate_layers_batched_matches_per_layer_bytes() {
     // Warm CPU seq → elevate back to GPU → read: canonical bytes for comparison.
     let warm_to_bytes =
         |backing: &ChunkedKvBacking, warm: &SealedSequence| -> Vec<(Vec<u8>, Vec<u8>)> {
-            let mut pin: Option<PinnedBuf> = None;
-            let round = backing
-                .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pin, &[warm])
-                .expect("elevate warm → gpu");
+            let round = lift_one(backing, &device, &[warm]).expect("elevate warm → gpu");
             device.synchronize().unwrap();
             read_bytes(backing, &round[0])
         };
@@ -660,10 +658,7 @@ fn migrate_layers_split_below_a_layer_matches_per_layer_bytes() {
         };
     let warm_to_bytes =
         |backing: &ChunkedKvBacking, warm: &SealedSequence| -> Vec<(Vec<u8>, Vec<u8>)> {
-            let mut pin: Option<PinnedBuf> = None;
-            let round = backing
-                .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pin, &[warm])
-                .expect("elevate warm → gpu");
+            let round = lift_one(backing, &device, &[warm]).expect("elevate warm → gpu");
             device.synchronize().unwrap();
             read_bytes(backing, &round[0])
         };
@@ -882,7 +877,7 @@ fn quantize_to_cpu_requantizes_filled_partials() {
 ///    Q* (partials quantize like full chunks) — both still on GPU. A
 ///    separate `migrate_sealed_to_cpu` evicts the sealed turn to the
 ///    warm (CPU) tier, formats preserved.
-/// 3. **Cold-elevate**: `migrate_sealed_to_gpu_batch_async` brings the
+/// 3. **Cold-elevate**: the warm lift (`lift_warm_to_gpu`) brings the
 ///    warm SealedSequence back to GPU with the same per-chunk formats
 ///    (Q* full + Q* partial) — the round-trip validates quantized
 ///    partials through the warm tier.
@@ -940,9 +935,7 @@ fn cold_load_partial_extend_then_requantize() {
     assert_eq!(warm_cpu[0].location, ArenaLocation::Cpu);
 
     // ── Phase 3: simulate cold-elevate back to GPU ─────────────────
-    let elevated = backing
-        .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&warm_cpu[0]])
-        .expect("turn 1 elevate");
+    let elevated = lift_one(&backing, &device, &[&warm_cpu[0]]).expect("turn 1 elevate");
     let elevated_seq = &elevated[0];
     assert_eq!(elevated_seq.chunks.len(), 2);
 

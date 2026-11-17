@@ -93,16 +93,13 @@ fn band_keys(
 /// carved. 512 MiB costs 32 regions of KV, which on a 16 GiB card is real, and
 /// the measured GPU staging peak on a decode/ingest workload is **29,696 B**.
 ///
-/// **All three staging sites now batch against it**, so it is a batch size
-/// rather than a ceiling and the span bounds one group instead of a whole pass:
-/// `migrate_sealed_layers_to_cpu_batch` groups by layer, and
-/// `migrate_sealed_to_gpu_batch_async` (warm→hot elevate) and the hot→warm
-/// gather group by band through [`staging_groups`]. Each group opens its own
+/// **Both staging sites batch against it**, so it is a batch size rather than a
+/// ceiling and the span bounds one group instead of a whole pass:
+/// `migrate_sealed_layers_to_cpu_batch` groups by layer, and the hot→warm gather
+/// groups by band through [`staging_groups`]. Each group opens its own
 /// generation, so the cursor rewinds between them and peak transient use is one
-/// group. That is what makes lowering it safe — before, two of the three did a
-/// single `bump.alloc(total_bytes)`, and `persistence/elevate.rs` issues the
-/// elevate **once per layer across every warm item**, so a deep elevate simply
-/// exhausted the span and failed the forward.
+/// group. The warm→hot elevate stages nothing on the device: its scatter reads
+/// the pinned ring in place (`docs/warm_lift.md`).
 ///
 /// 64 MiB is sized from the floor the batching can shrink to — a single ~30 MB
 /// layer, so two layers plus headroom — not from the 29,696 B observed peak,
@@ -2008,351 +2005,6 @@ impl ChunkedKvBacking {
         arena.write_slot_from_bytes(chunk_idx, bytes)
     }
 
-    /// **Fully-batched** RAM→VRAM migration — the symmetric inverse of
-    /// [`Self::migrate_sealed_to_cpu_batch_async`]. Uses the same
-    /// dedicated copy stream, the same pinned host scratch, and the
-    /// same [`super::migrate::kv_migrate_on`] scatter kernel.
-    ///
-    /// ```text
-    ///   CPU arena chunks ──read_chunk_into_pinned────▶ pinned host scratch
-    ///                                                      ┃
-    ///                                                      ▼
-    ///                                          memcpy_htod (copy stream)
-    ///                                                      ┃
-    ///                                                      ▼
-    ///                                          device staging buffer
-    ///                                                      ┃
-    ///                                          kv_migrate_on scatter
-    ///                                                      ┃
-    ///                                                      ▼
-    ///                                          fresh GPU arena chunks
-    /// ```
-    ///
-    /// Same locking discipline: one `state.write()` for dest GID
-    /// allocation, one `storage.read()` for source byte extraction
-    /// (CPU arenas → pinned scratch). The CPU-side extraction is a
-    /// dtype-dispatched `Tensor::to_vec` + memcpy — symmetric to the
-    /// downward path's `Tensor::from_slice` + `slice_set`.
-    ///
-    /// Float arenas (BF16/F16/F32) only on this fast path.
-    #[cfg(feature = "cuda")]
-    pub fn migrate_sealed_to_gpu_batch_async(
-        &self,
-        device: &Device,
-        copy_stream: &Arc<CudaStream>,
-        pinned_scratch: &mut Option<PinnedBuf>,
-        sequences: &[&SealedSequence],
-    ) -> candle::Result<Vec<SealedSequence>> {
-        use super::migrate::{kv_migrate_on, MigrationPlan};
-
-        if sequences.is_empty() {
-            return Ok(Vec::new());
-        }
-        let cuda_dev = match device {
-            candle::Device::Cuda(d) => d,
-            _ => {
-                return Err(candle::Error::Msg(
-                    "migrate_sealed_to_gpu_batch_async requires a CUDA device".into(),
-                ))
-            }
-        };
-        let _ = cuda_dev;
-
-        // ── Resolve sources + dedup ─────────────────────────────────────
-        // Source arenas live on CPU; we record each unique source GID's
-        // byte size by reading the arena's per-chunk shape × element size.
-        let arena_chunks = GID_STRIDE;
-        let mut unique_raws: Vec<i64> = Vec::new();
-        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        let mut src_keys: std::collections::HashMap<i64, ArenaKey> =
-            std::collections::HashMap::new();
-        let mut gid_byte_range: std::collections::HashMap<i64, (usize, usize)> =
-            std::collections::HashMap::new();
-        let mut total_bytes: usize = 0;
-
-        let elems = self.inner.elems_per_chunk();
-        self.inner.storage.read(|s| -> candle::Result<()> {
-            for seq in sequences {
-                for chunk in &seq.chunks {
-                    for (gid, tag) in chunk.bands() {
-                        let raw = gid.raw();
-                        if !seen.insert(raw) {
-                            continue;
-                        }
-                        let arena_idx = (raw as usize) / arena_chunks;
-                        let key = s.arena_key(arena_idx).ok_or_else(|| {
-                            candle::Error::Msg(format!(
-                                "migrate_sealed_to_gpu_batch_async: arena {arena_idx} not found"
-                            ))
-                        })?;
-                        if key.location != ArenaLocation::Cpu {
-                            return Err(candle::Error::Msg(
-                                "migrate_sealed_to_gpu_batch_async: source arena is not \
-                                 CPU-resident"
-                                    .into(),
-                            ));
-                        }
-                        // How many bytes this band occupies comes from its own
-                        // tag; the warm arena is a class-strided byte slab and
-                        // has no format to ask.
-                        let len = payload_bytes_for_tag(tag, elems).ok_or_else(|| {
-                            candle::Error::Msg(format!(
-                                "migrate_sealed_to_gpu_batch_async: band tag {tag:?} names no \
-                                 storage format, so its byte length is unknown"
-                            ))
-                        })?;
-                        src_keys.insert(raw, key);
-                        gid_byte_range.insert(raw, (total_bytes, len));
-                        total_bytes += len;
-                        unique_raws.push(raw);
-                    }
-                }
-            }
-            Ok(())
-        })??;
-
-        if total_bytes == 0 {
-            return sequences.iter().map(|seq| Ok((*seq).clone())).collect();
-        }
-
-        // ── Ensure pinned scratch capacity ──────────────────────────────
-        let need_grow = pinned_scratch
-            .as_ref()
-            .map(|b| b.len() < total_bytes)
-            .unwrap_or(true);
-        if need_grow {
-            *pinned_scratch = Some(match PinnedBuf::alloc_owned(total_bytes) {
-                Ok(b) => b,
-                Err(_) => PinnedBuf::Host {
-                    data: vec![0u8; total_bytes],
-                },
-            });
-        }
-
-        // ── Phase 1: read CPU arena bytes into pinned scratch ──────────
-        // One storage.read() across all chunks. Per-chunk we do
-        // dtype-dispatched Tensor::to_vec + memcpy — symmetric to the
-        // downward path's per-chunk Tensor::from_slice + slice_set.
-        let scratch = pinned_scratch
-            .as_mut()
-            .expect("pinned scratch allocated above");
-        self.inner.storage.read(|s| -> candle::Result<()> {
-            let dst_all = scratch.as_mut_slice();
-            for &raw in &unique_raws {
-                let arena_idx = (raw as usize) / arena_chunks;
-                let chunk_idx = (raw as usize) % arena_chunks;
-                let (off, len) = gid_byte_range[&raw];
-                let arena = s.arenas().get(&arena_idx).ok_or_else(|| {
-                    candle::Error::Msg(format!(
-                        "migrate_sealed_to_gpu_batch_async: arena {arena_idx} missing"
-                    ))
-                })?;
-                read_chunk_into_pinned_bytes(arena, chunk_idx, &mut dst_all[off..off + len])?;
-            }
-            Ok(())
-        })??;
-
-        // ── Phase 3: allocate dest GPU GIDs (one state.write) ──────────
-        // Palette-band runs first: for every (chunk, head, side) whose
-        // N_PALETTE band gids are distinct and share one format, allocate the
-        // dest slots as one CONTIGUOUS run for select/QREL walk locality
-        // (correctness is per-band via `resolve_band_source`, not the run
-        // layout). Leftovers (shared or mixed-format band groups) fall back to
-        // singleton allocation.
-        let mut new_gids: std::collections::HashMap<i64, ChunkGid> =
-            std::collections::HashMap::new();
-        {
-            let _state = self
-                .state
-                .write()
-                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-            let n_kv_head = self.inner.n_kv_head;
-            for seq in sequences {
-                for chunk in &seq.chunks {
-                    for h in 0..n_kv_head {
-                        for side_v in [false, true] {
-                            let raws: Vec<i64> = (0..crate::kv_cache::arena_table::N_PALETTE)
-                                .map(|p| {
-                                    if side_v {
-                                        chunk.gids.v_gid_pal(h, p).raw()
-                                    } else {
-                                        chunk.gids.k_gid_pal(h, p).raw()
-                                    }
-                                })
-                                .collect();
-                            let distinct: std::collections::HashSet<i64> =
-                                raws.iter().copied().collect();
-                            if distinct.len() != raws.len()
-                                || raws.iter().any(|r| *r < 0 || new_gids.contains_key(r))
-                            {
-                                continue;
-                            }
-                            let Some(first_key) = src_keys.get(&raws[0]) else {
-                                continue;
-                            };
-                            if raws[1..]
-                                .iter()
-                                .any(|r| src_keys.get(r).map(|k| k.class) != Some(first_key.class))
-                            {
-                                continue;
-                            }
-                            let gpu_key = first_key.at(ArenaLocation::Gpu);
-                            let run = self.alloc_chunk_run_for_key(gpu_key, raws.len())?;
-                            for (raw, gid) in raws.into_iter().zip(run) {
-                                new_gids.insert(raw, gid);
-                            }
-                        }
-                    }
-                }
-            }
-            for &raw in &unique_raws {
-                if new_gids.contains_key(&raw) {
-                    continue;
-                }
-                let src_key = &src_keys[&raw];
-                let gpu_key = src_key.at(ArenaLocation::Gpu);
-                new_gids.insert(raw, self.alloc_chunk_for_key(gpu_key)?);
-            }
-        }
-
-        // Stream-ordered allocation fence: the dest arenas above come from the
-        // device's ASYNC pool, whose allocations become valid in primary-stream
-        // order — but every access below runs on the COPY stream. With no
-        // recorded dependency, the copy stream can reach the new arena bytes
-        // before the primary stream reaches the allocation point (routine under
-        // bulk load, where waves queue the primary stream seconds deep) —
-        // CUDA_ERROR_ILLEGAL_ADDRESS on the scatter/convert. Drain the device
-        // once so the allocations are valid on every stream before any
-        // copy-stream use.
-        device.synchronize()?;
-
-        // ── Phases 4/5: stage → scatter, in batches the domain can hold ─
-        //
-        // **Batched against `MIGRATION_STAGING_CAP_BYTES`, which is the
-        // persistence domain's whole span.** This used to be one
-        // `bump.alloc(total_bytes)` — and `persistence/elevate.rs` issues this
-        // call once per layer across *every* warm item, so `total_bytes` is
-        // bounded by nothing here. A deep elevate therefore exhausted the
-        // transient span and failed the forward, and the cap could never be
-        // lowered because for this site it was a hard ceiling rather than a
-        // batch size. Now it bisects like `migrate_sealed_layers_to_cpu_batch`
-        // always did, so the span bounds a *batch* and peak transient use is one
-        // group rather than the sum.
-        //
-        // One generation per group: dropping it fences the copy stream and
-        // rewinds the cursor, so the next group reuses the same bytes. That
-        // fence is what makes reuse safe — the scatter reading a group's staging
-        // has completed before the next group overwrites it.
-        //
-        // Offsets are contiguous in `unique_raws` order (`total_bytes += len` as
-        // each was pushed), so a group is one contiguous slice of the pinned
-        // scratch and `off - group_start` re-bases it onto the group's staging.
-        let gpu_arena_info = self.resolve_arena_info()?;
-        let bump = bump_arena::persistence_domain(copy_stream)?;
-        let lens: Vec<usize> = unique_raws.iter().map(|r| gid_byte_range[r].1).collect();
-        for (i, j, group_bytes) in staging_groups(&lens, MIGRATION_STAGING_CAP_BYTES) {
-            let group_start = gid_byte_range[&unique_raws[i]].0;
-            // Allocated through the guard, so `staging` borrows it: the group's
-            // range cannot outlive the generation whose drop fences the copy
-            // stream and rewinds the cursor under it.
-            let group_gen = bump.generation(NOT_A_WAVE, NOT_A_WAVE)?;
-            let staging = group_gen.alloc(group_bytes, 256)?;
-            let staging_base = staging.ptr as i64;
-            let src_bytes = &scratch.as_slice()[group_start..group_start + group_bytes];
-            // SAFETY: the range is `staging.len` of the domain's span, held by
-            // the generation guard for this scope; `src_bytes` is the pinned
-            // host scratch, alive across the copy; both sides are on
-            // `copy_stream`.
-            unsafe {
-                candle::cuda_backend::cudarc::driver::result::memcpy_htod_async(
-                    staging_base as u64,
-                    src_bytes,
-                    copy_stream.cu_stream(),
-                )
-            }
-            .map_err(|e| candle::Error::Msg(format!("warm->hot staging upload: {e}")))?;
-
-            let mut plan = MigrationPlan::new();
-            for &raw in &unique_raws[i..j] {
-                let new_gid = new_gids[&raw].clone();
-                let dst_arena_idx = new_gid.arena_idx();
-                let dst_chunk_idx = new_gid.chunk_idx();
-                let info = gpu_arena_info.get(dst_arena_idx).ok_or_else(|| {
-                    candle::Error::Msg(format!(
-                        "migrate_sealed_to_gpu_batch_async: dest arena {dst_arena_idx} out of range"
-                    ))
-                })?;
-                if info.base_ptr == 0 {
-                    return Err(candle::Error::Msg(
-                        "migrate_sealed_to_gpu_batch_async: dest arena not GPU-resident".into(),
-                    ));
-                }
-                let dst_ptr = info.base_ptr as i64 + dst_chunk_idx as i64 * info.chunk_byte_stride;
-                let (off, len) = gid_byte_range[&raw];
-                plan.push(
-                    staging_base + (off - group_start) as i64,
-                    dst_ptr,
-                    len as i64,
-                );
-            }
-            kv_migrate_on(device, &plan, Some(copy_stream))?;
-        }
-
-        // ── Phase 6: rebuild SealedSequences with mapped GIDs ──────────
-        // Warm→hot elevate rebuilds each chunk's resident KV-head record at its
-        // new GPU placement, batched per sequence (one coalesced upload), so a
-        // subsequent reproject glue forward reads it instead of rebuilding heads.
-        sequences
-            .iter()
-            .map(|seq| -> candle::Result<SealedSequence> {
-                let mapped: Vec<HeadGids> = seq
-                    .chunks
-                    .iter()
-                    .map(|chunk| {
-                        chunk
-                            .gids
-                            .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))
-                    })
-                    .collect::<candle::Result<_>>()?;
-                // Gids are remapped to the new GPU placement; every other field
-                // — formats included — travels with the chunk unchanged, since
-                // an elevate copies bytes verbatim into a same-format slot.
-                let refs: Vec<ChunkRecordSrc<'_>> = seq
-                    .chunks
-                    .iter()
-                    .zip(&mapped)
-                    .map(|(chunk, m)| ChunkRecordSrc {
-                        gids: m,
-                        k_pal: chunk.k_pal.as_slice(),
-                        v_pal: chunk.v_pal.as_slice(),
-                        k_scale: chunk.k_scale.as_slice(),
-                        v_scale: chunk.v_scale.as_slice(),
-                        k_fmt: chunk.k_fmt.as_slice(),
-                        v_fmt: chunk.v_fmt.as_slice(),
-                    })
-                    .collect();
-                let metas = self.build_meta_records(&refs, &gpu_arena_info)?;
-                let new_chunks: Vec<SealedChunk> = seq
-                    .chunks
-                    .iter()
-                    .zip(mapped)
-                    .zip(metas)
-                    .map(|((chunk, m), meta)| SealedChunk {
-                        gids: m,
-                        meta,
-                        ..chunk.clone()
-                    })
-                    .collect();
-                Ok(SealedSequence {
-                    chunks: new_chunks,
-                    token_count: seq.token_count,
-                    chunk_size: seq.chunk_size,
-                    location: ArenaLocation::Gpu,
-                })
-            })
-            .collect()
-    }
-
     /// Migrate one sealed sequence from the warm tier back to the hot tier.
     ///
     /// Symmetric inverse of [`migrate_sealed_to_cpu`].  Sharing structure is
@@ -2385,7 +2037,7 @@ impl ChunkedKvBacking {
                 Ok(SealedChunk {
                     gids: new_gids,
                     // Single-sequence elevate keeps meta=None by design — the
-                    // batched elevate (`migrate_sealed_to_gpu_batch_async`) is the
+                    // batched elevate (`warm_lift::lift_warm_to_gpu`) is the
                     // one that rebuilds the resident record. This rarely-used path
                     // uses per-forward scratch heads at the new placement.
                     meta: None,
@@ -3013,11 +2665,12 @@ mod tests {
 
     // ── Batched-async migrate tests (GPU-only) ──────────────────────────────
     //
-    // These exercise `migrate_sealed_to_cpu_batch_async` and
-    // `migrate_sealed_to_gpu_batch_async` — the production hot↔warm path
-    // used by the substrate persistence thread. They require a CUDA
-    // device and a working `kv_migrate_on` kernel; on a CPU-only build
-    // each test silently returns early.
+    // These exercise `migrate_sealed_to_cpu_batch_async` and the warm lift
+    // (`warm_lift::lift_warm_to_gpu`) — the production hot↔warm path. They
+    // require a CUDA device; on a CPU-only build each test silently returns
+    // early.
+    #[cfg(feature = "cuda")]
+    use crate::kv_cache::chunked::warm_lift::lift_one;
     //
     // Byte-identity is checked end-to-end: a known pattern is seeded on
     // GPU, migrated to RAM, then back to VRAM, and the round-tripped
@@ -3224,8 +2877,8 @@ mod tests {
         assert_eq!(unique.len(), all_gids.len(), "GIDs must be globally unique");
     }
 
-    /// `migrate_sealed_to_gpu_batch_async` on a CPU sequence must produce
-    /// a GPU-located sealed with the same per-chunk metadata.
+    /// The warm lift of a CPU sequence must produce a GPU-located sealed with
+    /// the same per-chunk metadata.
     #[cfg(feature = "cuda")]
     #[test]
     fn batched_async_to_gpu_preserves_structure() {
@@ -3253,9 +2906,7 @@ mod tests {
         let cpu = backing
             .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_orig])
             .unwrap();
-        let gpu_back = backing
-            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&cpu[0]])
-            .expect("batched async to_gpu must succeed");
+        let gpu_back = lift_one(&backing, &device, &[&cpu[0]]).expect("the warm lift must succeed");
 
         assert_eq!(gpu_back.len(), 1);
         let r = &gpu_back[0];
@@ -3272,9 +2923,8 @@ mod tests {
     /// path: a known pattern seeded on GPU, migrated to RAM via
     /// `migrate_sealed_to_cpu_batch_async` (kv_migrate_on gather + DtoH
     /// on the copy stream + pinned scratch → Tensor::from_slice +
-    /// slice_set), then back to VRAM via
-    /// `migrate_sealed_to_gpu_batch_async` (Tensor::to_vec + HtoD on
-    /// the copy stream + kv_migrate_on scatter). After the round-trip,
+    /// slice_set), then back to VRAM via the warm lift (host copy into
+    /// the pinned ring + the ring scatter). After the round-trip,
     /// the CPU bytes of the final form must be byte-identical to the
     /// CPU bytes of the first migration.
     #[cfg(feature = "cuda")]
@@ -3312,9 +2962,7 @@ mod tests {
         );
 
         // CPU → GPU (the production warm→hot path).
-        let gpu_back = backing
-            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&cpu_first[0]])
-            .unwrap();
+        let gpu_back = lift_one(&backing, &device, &[&cpu_first[0]]).unwrap();
 
         // GPU → CPU again so we can read bytes to compare.
         let cpu_second = backing
@@ -3384,9 +3032,7 @@ mod tests {
         let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
         assert!(!first_bytes.is_empty());
 
-        let gpu_back = backing
-            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&cpu_first[0]])
-            .unwrap();
+        let gpu_back = lift_one(&backing, &device, &[&cpu_first[0]]).unwrap();
         let cpu_second = backing
             .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_back[0]])
             .unwrap();
@@ -3482,9 +3128,7 @@ mod tests {
         assert_eq!(&first[..band_bytes], &pattern[..band_bytes], "K band 0");
 
         // warm -> hot -> warm again.
-        let back = backing
-            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&warm[0]])
-            .unwrap();
+        let back = lift_one(&backing, &device, &[&warm[0]]).unwrap();
         let warm2 = backing
             .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&back[0]])
             .unwrap();
@@ -3521,9 +3165,7 @@ mod tests {
         assert!(out.is_empty());
         assert!(pinned.is_none(), "no scratch allocation on empty input");
 
-        let out_gpu = backing
-            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[])
-            .unwrap();
+        let out_gpu = lift_one(&backing, &device, &[]).unwrap();
         assert!(out_gpu.is_empty());
     }
 }

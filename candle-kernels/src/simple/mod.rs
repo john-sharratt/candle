@@ -67,6 +67,10 @@ pub mod prov_sign_pack;
 // KV tier-migration scatter/gather (kv_pack / kv_unpack primitive)
 pub mod kv_migrate;
 
+// The warm lift's scatter: one pinned ring slot, read in place, into its
+// destination arena slots (docs/warm_lift.md)
+pub mod warm_lift;
+
 // Fletcher-32 KV-chunk golden checksum: GPU-side integrity hash, one launch for
 // a whole plan of quantized chunks, leaving the KV data on the device
 pub mod fletcher32;

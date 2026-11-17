@@ -217,7 +217,7 @@ use first_sample::PrefillEnd;
 use candle::cuda_backend::graph::CaptureStats;
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, Tensor};
-use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
+use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence, WarmLiftRing};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked, SequenceStats,
@@ -1261,6 +1261,15 @@ fn timed_wait<T>(f: impl FnOnce() -> T) -> T {
         std::sync::atomic::Ordering::Relaxed,
     );
     r
+}
+
+/// The warm lift's ring, allocating it on the first lift: pinned memory is the
+/// weights', and a scheduler that never lifts — a CPU test's — takes none.
+fn warm_lift_ring(ring: &mut Option<WarmLiftRing>) -> candle::Result<&mut WarmLiftRing> {
+    if ring.is_none() {
+        *ring = Some(WarmLiftRing::new()?);
+    }
+    Ok(ring.as_mut().expect("allocated above"))
 }
 
 #[inline]
@@ -3922,18 +3931,16 @@ pub(crate) struct Scheduler {
     /// effectively dead code on engines without quantize).
     pending_section_quantize: Vec<PendingSectionQuantize>,
 
-    /// Re-used pinned host scratch for the cold→hot leg inside
-    /// `elevate_to_hot`. Grows on demand across submits; stays
-    /// allocated for the scheduler's lifetime.
-    ///
-    /// The elevate path itself runs on the device's **main inference
-    /// stream** (`dev.cuda_stream()`) — the scheduler thread is
-    /// single-owner and is blocking on the result before
-    /// `apply_projection` runs prefill/decode, so a dedicated stream
-    /// would only add a stream-sync without buying any overlap.
-    /// Scattering on the main stream lets the subsequent prefill
-    /// kernels see the writes for free (same-stream serialisation).
-    elevate_pinned_scratch: Option<PinnedBuf>,
+    /// Re-used pinned host scratch for the section quantize's staging.
+    /// Grows on demand; stays allocated for the scheduler's lifetime.
+    quantize_pinned_scratch: Option<PinnedBuf>,
+
+    /// The warm lift's pinned ring (`docs/warm_lift.md`): fixed, allocated at
+    /// the first lift and held for the scheduler's lifetime. The lift runs on
+    /// the device's **main inference stream** (`dev.cuda_stream()`), so the
+    /// prefill and decode kernels after it see the lifted bytes by stream
+    /// order, with no fence.
+    warm_lift_ring: Option<WarmLiftRing>,
 
     /// Pre-tokenised role markers for the engine's dialect. Built once at
     /// engine construction and passed into the scheduler.
@@ -4505,10 +4512,11 @@ impl Scheduler {
             attached_substrates: Vec::new(),
             summariser_trigger,
             pending_section_quantize: Vec::new(),
-            elevate_pinned_scratch: preallocate_pinned_scratch(
+            quantize_pinned_scratch: preallocate_pinned_scratch(
                 PINNED_PREALLOC_BYTES,
-                "scheduler::elevate_pinned_scratch",
+                "scheduler::quantize_pinned_scratch",
             ),
+            warm_lift_ring: None,
             boundary_markers,
             prov_fold,
             prov_capture_layers,
@@ -9104,21 +9112,19 @@ impl Scheduler {
                 {
                     let backings = self.session.backings().to_vec();
                     let device = self.session.device().clone();
-                    let main_stream = match &device {
-                        Device::Cuda(d) => d.cuda_stream(),
-                        _ => panic!("scheduler: requires a CUDA device"),
-                    };
                     let no_turns: Vec<TurnKey> = Vec::new();
-                    if let Err(e) = elevate_to_hot(
-                        &conversation,
-                        &backings,
-                        &device,
-                        &main_stream,
-                        &mut self.elevate_pinned_scratch,
-                        &mut self.cold_load_stager,
-                        prefix_section_ids,
-                        &no_turns,
-                    ) {
+                    let lifted = warm_lift_ring(&mut self.warm_lift_ring).and_then(|ring| {
+                        elevate_to_hot(
+                            &conversation,
+                            &backings,
+                            &device,
+                            ring,
+                            &mut self.cold_load_stager,
+                            prefix_section_ids,
+                            &no_turns,
+                        )
+                    });
+                    if let Err(e) = lifted {
                         tracing::warn!(
                             "prepare_section_ingest: prefix elevate failed: {e} — \
                              some prefix sections may still be cold"
@@ -9623,7 +9629,7 @@ impl Scheduler {
                     group_policy,
                     &device,
                     &copy_stream,
-                    &mut self.elevate_pinned_scratch,
+                    &mut self.quantize_pinned_scratch,
                 )
                 .map_err(ConversationError::Model)?;
                 for (slot_idx, qi) in out.into_iter().enumerate() {
@@ -11675,13 +11681,6 @@ impl Scheduler {
         }
         let backings = self.session.backings().to_vec();
         let device = self.session.device().clone();
-        // Scheduler is single-owner and blocks here before re-applying, so the
-        // main inference stream is the right place for the scatter — no extra
-        // sync, and subsequent prefill kernels serialise behind it for free.
-        let main_stream = match &device {
-            Device::Cuda(d) => d.cuda_stream(),
-            _ => panic!("scheduler: requires a CUDA device"),
-        };
         // Keep-list = FULL working set (protect the already-hot units too).
         let t_evict = Instant::now();
         let evict_span = profile::span("elevate:evict_to_fit");
@@ -11698,16 +11697,17 @@ impl Scheduler {
         // Lift only the non-hot subset; already-hot units are left untouched.
         let t_lift = Instant::now();
         let lift_span = profile::span("elevate:lift");
-        let lifted = elevate_to_hot(
-            conversation,
-            &backings,
-            &device,
-            &main_stream,
-            &mut self.elevate_pinned_scratch,
-            &mut self.cold_load_stager,
-            &secs_lift,
-            &turns_lift,
-        );
+        let lifted = warm_lift_ring(&mut self.warm_lift_ring).and_then(|ring| {
+            elevate_to_hot(
+                conversation,
+                &backings,
+                &device,
+                ring,
+                &mut self.cold_load_stager,
+                &secs_lift,
+                &turns_lift,
+            )
+        });
         lift_span.end();
         let from = lifted.as_ref().map_or((0, 0, 0, 0), |r| {
             (

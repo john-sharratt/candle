@@ -108,21 +108,22 @@ median under 10 MB — fills both slots at once and never waits for the ring.
 
 ### 3.3 The host copy
 
-`HOST_COPIERS` = 4 threads, owned by the lifter and parked between lifts — not the
-global rayon pool, whose queue the belief scan's warm-ups share. A slot batch is split
-into four contiguous byte ranges, one a thread; each copies its bands from their arena
-slots into the slot (`Arena::copy_slot_bytes`, as `read_chunk_into_pinned_bytes` does
-now) and writes its share of the descriptor table. Four streams of pageable reads
-outrun a ×16 link; one does not on PCIe 5.0, and on the 3090 and the 4090 Laptop
-(~12 GB/s links) the link is the limit with room to spare.
+`HOST_COPIERS` = 4 threads, scoped to the slot and joined before its scatter is
+launched — not the global rayon pool, whose queue the belief scan's warm-ups share.
+A slot batch is split into four contiguous runs of bands of about equal bytes, one a
+thread; each copies its bands from their arena slots into its own byte range of the
+slot (`Arena::copy_slot_bytes`), under one storage read of each layer it crosses.
+Spawning four threads costs tens of microseconds against a slot's ~0.5 ms of copying.
+Four streams of pageable reads outrun a ×16 link; one does not on PCIe 5.0, and on
+the 3090 and the 4090 Laptop (~12 GB/s links) the link is the limit with room to spare.
 
-The copy runs on the lifter's threads while the scheduler thread builds the next batch
-and enqueues the previous one — the scheduler never copies bytes itself.
+The scatter launch for a slot returns at once, so the copiers fill the next slot while
+the GPU drains the last.
 
 ### 3.4 The scatter kernel
 
 `warm_lift_scatter` (`candle-kernels/src/simple/`, beside `kv_migrate.cu`), one launch
-per filled slot on the backing's copy stream:
+per filled slot on the device's stream:
 
 - `W` = 8 blocks of 128 threads (`docs/moe_live_dispatch_design.md` §0.10: 4–8 blocks
   saturate the link; more only hold SM slots while waves run);
@@ -131,29 +132,31 @@ per filled slot on the backing's copy stream:
 - each thread keeps four 16-byte loads in flight (`ld.global.cg.v4.u32`), then stores
   them — the copy loop of `moe_live_ahead_piece` (`candle-kernels/src/quantized/kernel.cuh`),
   reused, not reinvented. A plain one-load loop over the same memory measured 2.2 GB/s;
-- a tail shorter than 16 B is copied bytewise; every band starts 16 B-aligned in the
-  slot because the host lays them out that way.
+- loads are `ld.global.cv`, not `.cg`: the host rewrites a slot in place every time it
+  reuses it, and `.cg` may be served from an L2 line an earlier batch's read of the
+  same address left behind — the reason the expert path's CPU result ring reads `.cv`;
+- a band whose destination or length is not 16 B-aligned is copied bytewise; every
+  band starts 16 B-aligned in the slot because the host lays them out that way.
 
 The destination is written directly: no device staging buffer, no second copy.
 
 ### 3.5 Ordering, with no host sync
 
-Three orders matter and each is an event, never a wait on the host:
+Every caller of `elevate_to_hot` passes the device's own stream, so the lift runs
+there and two of the three orders it needs are the stream's own FIFO:
 
 1. **A destination slot is written only after every queued read of its previous
-   tenant.** A freed KV slot is reissued, and waves already queued on the primary
-   stream may still read what it held. The primary stream records `alloc_done` after
-   the allocations; the copy stream waits on it (`cuStreamWaitEvent`) before the first
-   scatter. This is what today's `device.synchronize()` buys, without blocking the host.
-2. **A forward reads a lifted chunk only after it is written.** The copy stream records
-   `lift_done` after the last scatter; the primary stream waits on it before the next
-   wave is enqueued. The lift returns as soon as the work is enqueued.
+   tenant.** A freed KV slot is reissued, and waves already queued on the stream may
+   still read what it held. The scatter is enqueued behind them. The per-layer
+   `device.synchronize()` the old path paid for this bought nothing on one stream.
+2. **A forward reads a lifted chunk only after it is written.** Every later launch on
+   the stream runs after the scatter. The lift returns as soon as the work is enqueued.
 3. **A ring slot is refilled only after its scatter has read it.** Each slot carries the
-   event recorded after its launch; a copier about to refill a slot waits on that
-   event. This is the only host wait in the design. It never happens for a lift of at
-   most two slots, and otherwise it waits for the GPU to reach the scatter, which
-   order 1 may place behind queued waves — once for the lift, where today pays it ~192
-   times.
+   event recorded after its launch; refilling the slot waits on that event
+   (`WarmLiftRing::acquire`). This is the only host wait in the design. It never
+   happens for a lift of at most two slots, and otherwise it waits for the GPU to reach
+   the scatter, which order 1 may place behind queued waves — once for the lift, where
+   the old path paid ~192 waits.
 
 The metadata records stay as they are: `build_meta_records` fills them on the device
 from a descriptor table, asynchronously (`candle-nn/src/kv_cache/chunked/backing.rs`).
@@ -180,32 +183,34 @@ copiers and the scatter is unchanged.
 
 | Piece | Where |
 |---|---|
-| The plan across layers | `candle-nn/src/kv_cache/chunked/warm_lift/plan.rs` |
+| A layer's sources resolved, destinations claimed, sequences rebuilt | `candle-nn/src/kv_cache/chunked/warm_lift/layer.rs` |
+| The bands cut into slot batches | `candle-nn/src/kv_cache/chunked/warm_lift/plan.rs` |
 | The ring and its events | `candle-nn/src/kv_cache/chunked/warm_lift/ring.rs` |
 | The host copiers | `candle-nn/src/kv_cache/chunked/warm_lift/copiers.rs` |
-| The lift (plan → fill → scatter → events) | `candle-nn/src/kv_cache/chunked/warm_lift/mod.rs` |
-| The scatter kernel | `candle-kernels/src/simple/warm_lift.cu`, FFI in `candle-kernels/src/lib.rs` |
-| The caller | `elevate_to_hot`'s warm leg, one call in place of the layer loop |
-| Removed | `migrate_sealed_to_gpu_batch_async` and its `pinned_scratch` |
+| The lift (plan → fill → scatter → rebuild) | `candle-nn/src/kv_cache/chunked/warm_lift/mod.rs`, `lift_warm_to_gpu` |
+| The scatter kernel | `candle-kernels/src/simple/warm_lift.cu`, FFI in `candle-kernels/src/simple/warm_lift.rs` |
+| The ring's memory | `PinnedBuf::alloc_owned_mapped` (`candle-core/src/quantized/pinned_staging.rs`) |
+| The caller | `elevate_to_hot`'s warm leg, one call in place of the layer loop; the scheduler holds the ring (`Scheduler::warm_lift_ring`), allocated at the first lift |
+| Removed | `migrate_sealed_to_gpu_batch_async`, and `elevate_to_hot`'s `copy_stream` and `pinned_scratch` |
 
 `migrate_sealed_to_cpu_batch_async` — hot → warm, on the persistence thread — is not
 changed here.
 
 ## 6. Tests
 
-- **Byte for byte against today's path** (GPU): lift the same multi-layer, multi-item
-  warm set through both, read every destination slot and every metadata record back,
-  assert equal bytes. The old path stays in the test module as the reference until
-  this passes, and is deleted with it.
-- **A lift larger than the ring** (several slot batches, a band at a batch edge), and
-  one of exactly one slot: every byte lands.
-- **No host sync**: a test that closes a stream gate on the primary stream
-  (`StreamGate`, `candle-nn/src/kv_cache/chunked/tests/decode_slot_resync_tests.rs`)
-  and asserts a two-slot lift returns while the gate is shut.
-- **Ordering**: a destination slot freed by a queued read is not written before that
-  read retires — the same gate, with the read behind it.
-- **The plan** (CPU): batches never exceed `SLOT_BYTES`, never split a band, cover
-  every source once; the descriptor table's raw bytes for a fixed input.
+In `candle-nn/src/kv_cache/chunked/tests/warm_lift_tests.rs` unless named:
+
+- **Byte for byte against the source** (GPU): three layers × two items lifted through
+  a ring of 4 KiB slots — hundreds of batches, every slot refilled many times — and
+  every lifted sequence's stored bytes equal its original's.
+- **The round trips** in `chunk_ops.rs` and `tests/compress_tests.rs` (hot → warm →
+  hot → warm, BF16, F16, quantized, a band narrower than its slot) run through the
+  lift and compare raw bytes.
+- **No host sync**: with the device's stream held shut by a `StreamGate`
+  (`tests/stream_gate.rs`), a lift returns long before the gate would open.
+- **The plan** (CPU, `warm_lift/plan.rs`): batches packed 16-byte aligned, cut at the
+  slot and at the table's room, never split a band, every band placed once.
+- Order 1 of §3.5 is the stream's FIFO, which needs no test of its own.
 
 ## 7. What it should reach
 

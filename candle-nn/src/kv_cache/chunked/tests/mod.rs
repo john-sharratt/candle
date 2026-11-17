@@ -31,4 +31,6 @@ mod q0_v_codebook_side_tests;
 mod q5_selection_tests;
 mod selection_table_tests;
 mod sequence_ops_tests;
+mod stream_gate;
 mod types_tests;
+mod warm_lift_tests;

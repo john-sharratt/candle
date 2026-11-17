@@ -10,9 +10,10 @@
 //! ```text
 //!   classify (substrate.read) ──┬─▶ already_hot   (skip)
 //!                               │
-//!                               ├─▶ warm_to_hot   ──▶ migrate_sealed_to_gpu_batch_async
-//!                               │                      (one kv_migrate_on scatter per layer
-//!                               │                       on the dedicated copy stream)
+//!                               ├─▶ warm_to_hot   ──▶ lift_warm_to_gpu
+//!                               │                      (every layer and item through the
+//!                               │                       pinned ring, one scatter a slot,
+//!                               │                       no host sync — docs/warm_lift.md)
 //!                               │
 //!                               ├─▶ cold_to_hot   ──▶ recover_turn_chunks + load_to_hot
 //!                               │                      (NVMe → pinned scratch → VRAM)
@@ -22,13 +23,10 @@
 //!   install_promoted_hot (substrate.write) ──▶ residence.hot = Some(...)
 //! ```
 
-use std::sync::Arc;
 use std::time::Instant;
 
-use candle::cuda_backend::cudarc::driver::CudaStream;
-use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, Result};
-use candle_nn::kv_cache::ChunkedKvBacking;
+use candle_nn::kv_cache::{lift_warm_to_gpu, ChunkedKvBacking, WarmLiftRing};
 
 use super::cold_load::ColdLoadStager;
 use crate::projection::{Conversation, SectionId, TurnKey};
@@ -95,15 +93,14 @@ impl ElevationReport {
 /// `elevate_to_hot` for retries.
 ///
 /// Single substrate read at the start (classification) + at most one
-/// substrate write at the end (bulk install). Between them, all GPU
-/// work runs on `copy_stream` with the pinned host scratch caller
-/// provided.
+/// substrate write at the end (bulk install). Between them, the warm leg
+/// goes through `warm_ring` and the cold leg through `cold_stager`, both on
+/// the device's stream.
 pub fn elevate_to_hot(
     conversation: &Conversation,
     backings: &[ChunkedKvBacking],
     device: &Device,
-    copy_stream: &Arc<CudaStream>,
-    pinned_scratch: &mut Option<PinnedBuf>,
+    warm_ring: &mut WarmLiftRing,
     cold_stager: &mut ColdLoadStager,
     sections: &[SectionId],
     turns: &[TurnKey],
@@ -293,10 +290,6 @@ pub fn elevate_to_hot(
 
     // ── Phase 3: warm → hot (PCIe-bound, batched per layer) ────────────
     //
-    // Build the per-layer input vectors once across all warm items,
-    // then issue one `migrate_sealed_to_gpu_batch_async` per layer.
-    // The async path internally batches the gather + HtoD + scatter
-    // on the dedicated copy stream.
     let t_warm_hot = Instant::now();
     let warm_items: Vec<WarmToHotEntry> = plan
         .warm_to_hot
@@ -317,33 +310,26 @@ pub fn elevate_to_hot(
         .collect();
 
     if !warm_items.is_empty() {
-        // Per-item collector of (layer-indexed) hot results.
+        // One lift for every layer and item (`docs/warm_lift.md`): the bands go
+        // through the pinned ring and one scatter a slot, enqueued on the
+        // device's stream. Per item, its sequences by layer.
+        let layers: Vec<Vec<&candle_nn::kv_cache::SealedSequence>> = (0..n_layers)
+            .map(|layer| warm_items.iter().map(|w| &w.warm[layer]).collect())
+            .collect();
+        let lifted = lift_warm_to_gpu(backings, warm_ring, device, &layers);
+        let layer_ok = lifted.is_ok();
         let mut hot_per_item: Vec<Vec<candle_nn::kv_cache::SealedSequence>> = (0..warm_items.len())
             .map(|_| Vec::with_capacity(n_layers))
             .collect();
-        let mut layer_ok = true;
-        for (layer, backing) in backings.iter().enumerate().take(n_layers) {
-            let inputs: Vec<&candle_nn::kv_cache::SealedSequence> =
-                warm_items.iter().map(|w| &w.warm[layer]).collect();
-            match backing.migrate_sealed_to_gpu_batch_async(
-                device,
-                copy_stream,
-                pinned_scratch,
-                &inputs,
-            ) {
-                Ok(layer_hot) => {
+        match lifted {
+            Ok(by_layer) => {
+                for layer_hot in by_layer {
                     for (i, h) in layer_hot.into_iter().enumerate() {
                         hot_per_item[i].push(h);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "elevate_to_hot: warm→hot layer {layer} batched migrate failed: {e}"
-                    );
-                    layer_ok = false;
-                    break;
-                }
             }
+            Err(e) => tracing::warn!("elevate_to_hot: the warm lift failed: {e}"),
         }
         if layer_ok {
             for (i, w) in warm_items.into_iter().enumerate() {
@@ -479,6 +465,11 @@ pub fn evict_from_hot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use candle::cuda_backend::cudarc::driver::CudaStream;
+    use candle::quantized::pinned_staging::PinnedBuf;
+
     use crate::projection::{GroupId, LayerId, TimelineAllocator, TimelineId, TurnIndex};
     use crate::substrate::TurnPartWrite;
     use crate::turn::Role;
@@ -580,6 +571,7 @@ mod tests {
     struct CudaResources {
         copy_stream: Arc<CudaStream>,
         pinned: Option<PinnedBuf>,
+        ring: WarmLiftRing,
         stager: ColdLoadStager,
     }
 
@@ -603,6 +595,7 @@ mod tests {
             // can come back.
             copy_stream: (*cuda_dev.cuda_stream()).clone(),
             pinned: None,
+            ring: WarmLiftRing::new().unwrap(),
             stager: ColdLoadStager::new(),
         }
     }
@@ -624,8 +617,7 @@ mod tests {
             &conv,
             &backings,
             &device,
-            &r.copy_stream,
-            &mut r.pinned,
+            &mut r.ring,
             &mut r.stager,
             &[],
             &[key],
@@ -657,8 +649,7 @@ mod tests {
             &conv,
             &backings,
             &device,
-            &r.copy_stream,
-            &mut r.pinned,
+            &mut r.ring,
             &mut r.stager,
             &[],
             &[bogus],
@@ -711,8 +702,7 @@ mod tests {
             &conv,
             &backings,
             &device,
-            &r.copy_stream,
-            &mut r.pinned,
+            &mut r.ring,
             &mut r.stager,
             &[],
             &[key],
@@ -781,8 +771,7 @@ mod tests {
             &conv,
             &backings,
             &device,
-            &r.copy_stream,
-            &mut r.pinned,
+            &mut r.ring,
             &mut r.stager,
             &[],
             &[TurnKey::new(timeline, idx_a)],
@@ -834,8 +823,7 @@ mod tests {
             &conv,
             &backings,
             &device,
-            &r.copy_stream,
-            &mut r.pinned,
+            &mut r.ring,
             &mut r.stager,
             &[],
             &[
@@ -866,8 +854,7 @@ mod tests {
             &conv,
             &backings,
             &device,
-            &r.copy_stream,
-            &mut r.pinned,
+            &mut r.ring,
             &mut r.stager,
             &[],
             &[],
