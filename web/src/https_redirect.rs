@@ -100,7 +100,7 @@ impl Plan {
     }
 }
 
-fn said<'a>(headers: &'a HeaderMap, name: impl header::AsHeaderName) -> Option<&'a str> {
+fn said(headers: &HeaderMap, name: impl header::AsHeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
