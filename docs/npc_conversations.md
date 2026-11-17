@@ -727,6 +727,16 @@ cast before its turn could be submitted: an image prompt's content check
 took eighty-five seconds to ask four one-token questions, past the sixty its
 caller waits.
 
+**While a person's prompt prefills, every band below sits out.** From the
+moment an `Urgent` prompt or section is queued until it has prefilled, no
+decode row of a lower band rides a step (`scheduler/urgent_hold.rs`): the
+steps are the prompt's alone and take a decode-less creep's slice. Sharing
+each step with one character's decode gave four seventy-token prompts one
+layer of forty-eight a step, and thirty seconds to a first token. Once the
+turn decodes, the hold is the shared one — `Low` rows three steps in four.
+The content check's four questions are asked once as the engine comes up
+(`tenant::warm_content_check`), so their frames are sealed before a draw.
+
 **A mind carrying out a person's request is waited on too.** While a request
 stands (`Scheduler::asked`), the character's own turns decode at `Urgent`
 (`Minds::set_band`, `SchedulerRequest::SetBand`), and at the conversation's

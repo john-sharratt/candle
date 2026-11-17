@@ -12,7 +12,7 @@ use std::env::current_dir;
 use std::net::SocketAddr;
 use std::path::{absolute, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::extract::{ConnectInfo, Request};
@@ -42,6 +42,7 @@ use crate::api::{self, Authored};
 use crate::authority;
 use crate::authorize::{self, Signer};
 use crate::collections::Libraries;
+use crate::compliance;
 use crate::discord::bots;
 use crate::discord::client::{self as discord_client, Client as DiscordClient};
 use crate::discord::limit::{self, InvalidRequests};
@@ -579,6 +580,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     install_sinks(&runtime, &authored, feelings);
     reload_on_move(&runtime, &authored);
     retire_kept_pictures(&authored);
+    warm_content_check(&authored);
     // The characters' Discord bots, on the authority of each one's world
     // (`docs/npcd_discord.md` §3.3).
     bots::start(&authored);
@@ -832,6 +834,50 @@ fn retire_kept_pictures(authored: &Arc<Authored>) {
                 Ok(Err(e)) => tracing::warn!("images: kept pictures could not be retired: {e}"),
                 Err(e) => tracing::error!("images: retiring kept pictures panicked: {e}"),
             }
+        }
+    });
+}
+
+/// How often the engine is looked at while it loads, before the content check
+/// is asked its first question.
+const WARM_CHECK_EVERY: Duration = Duration::from_secs(5);
+
+/// What the content check is asked once at load: a picture of nothing anybody
+/// could object to.
+const WARM_CHECK_PROMPT: &str = "A red apple on a wooden table.";
+
+/// Ask the content check one prompt as soon as the engine is up, so its four
+/// questions' frames are sealed before anybody waits on a draw
+/// (`crate::compliance`). A frame is kept once sealed; left to the first draw,
+/// sealing them was thirty-seven seconds of that draw's wait. Holds the state
+/// weakly, so the task ends with it.
+fn warm_content_check(authored: &Arc<Authored>) {
+    let authored = Arc::downgrade(authored);
+    tokio::spawn(async move {
+        let mut every = interval(WARM_CHECK_EVERY);
+        loop {
+            every.tick().await;
+            let Some(authored) = authored.upgrade() else {
+                return;
+            };
+            let Some(rt) = authored.runtime.as_ref() else {
+                return;
+            };
+            if rt.stopping() {
+                return;
+            }
+            if rt.minds.read().unwrap().is_none() {
+                continue;
+            }
+            let started = Instant::now();
+            match compliance::check(&authored, WARM_CHECK_PROMPT).await {
+                Ok(()) => tracing::info!(
+                    ms = started.elapsed().as_millis() as u64,
+                    "content check: its questions' frames are sealed"
+                ),
+                Err(e) => tracing::warn!("content check: the first question did not answer: {e}"),
+            }
+            return;
         }
     });
 }
