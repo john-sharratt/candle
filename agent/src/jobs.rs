@@ -615,8 +615,16 @@ impl Jobs {
     }
 
     /// Fetch origin for run `id` and start it in its checkout's sandbox, with
-    /// `overlay` laid down. The commit its branch holds once origin is
-    /// fetched is recorded on the job: what it is a run of.
+    /// `overlay` laid down. The commit the run's store is on is recorded on
+    /// the job: what it is a run of.
+    ///
+    /// **The store's own base, not the branch resolved apart from it.** A
+    /// fetch moves origin's copy of a branch (`refs/remotes/origin/<b>`) and
+    /// never the local one, and a store reads origin's copy first
+    /// (`GitSource::base_at`); `rev-parse` of the branch names the local
+    /// one. Recorded that way, a run on `main` after a push would name the
+    /// commit before it, and a deploy of the pushed commit would cancel the
+    /// very build that was making it.
     async fn start(
         self: &Arc<Self>,
         id: &str,
@@ -627,13 +635,15 @@ impl Jobs {
         self.fetch(&run.repo).await?;
         self.sweep(&run.repo).await;
         let c = self.checkout(&run.repo)?;
-        if let Ok(base) = c.repo().resolve(&Rev::Branch(branch.clone())) {
-            self.set_base(id, base.to_string());
-        }
         let store = VfsStore::on_branch(Arc::clone(&c.source), Rev::Branch(branch.clone()));
         store
             .restore(overlay)
             .map_err(|e| JobError::Bad(format!("the overlay: {e}")))?;
+        if let Ok(Some(base)) = store.base() {
+            if let Some(commit) = base.commit() {
+                self.set_base(id, commit.to_string());
+            }
+        }
         let command = SandboxCommand::new(run.program)
             .args(run.args)
             .timeout(Duration::from_secs(run.timeout_secs))

@@ -226,6 +226,34 @@ async fn a_run_on_an_agent_comes_back_as_deltas() {
     assert_eq!(jobs.slots(), (2, 0));
 }
 
+/// **A run on `main` after a push is of the pushed commit**
+/// (`docs/battlecities_app.md` §4.3, §8). Origin's `main` moves past the
+/// agent's checkout, whose own `main` the run's fetch never moves; the run's
+/// line names the commit its store read — the pushed one — so a deploy of that
+/// commit finds this build making it rather than cancelling it.
+#[tokio::test]
+async fn a_run_after_a_push_is_of_the_pushed_commit() {
+    let r = repos();
+    std::fs::write(r.member.join("in.txt"), b"pushed\n").unwrap();
+    git(&r.member, &["commit", "-q", "-am", "second"]);
+    git(&r.member, &["push", "-q", "origin", "main"]);
+    let pushed = git(&r.member, &["rev-parse", "HEAD"]).trim().to_string();
+    let agents_own = git(&r.agent, &["rev-parse", "main"]).trim().to_string();
+    assert_ne!(pushed, agents_own, "the agent's checkout is behind");
+
+    let jobs = jobs_over(&r, false);
+    let store = VfsStore::on_branch(GitSource::open(&r.member).unwrap(), Rev::Branch(main()));
+    let started = jobs.submit(Submit::Run(run_job(&store))).await.unwrap();
+    let view = ended(&jobs, started).await;
+    assert_eq!(view.status, JobStatus::Exited { code: Some(0) }, "{view:?}");
+    let listed = jobs.list(10).jobs;
+    let line = listed
+        .iter()
+        .find(|l| l.id == view.id)
+        .expect("the run is listed");
+    assert_eq!(line.base.as_deref(), Some(pushed.as_str()));
+}
+
 /// One `.agent/setup.yaml` command running `script` in the test's shell.
 fn setup_command(script: &str) -> String {
     let (program, flag) = if cfg!(windows) {

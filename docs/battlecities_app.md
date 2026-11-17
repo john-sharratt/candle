@@ -72,7 +72,7 @@ A webhook can be lost. Every 60 seconds the push driver (§4.4) lists origin thr
 | A trial of the service, of an older commit | The trial is left to end; a new build starts and its trial follows |
 | Nothing | A new build starts |
 
-The agent records, on each run, the commit its branch held once it had fetched origin (`JobLine::base`, set in `Jobs::start`). That is what a build is "of". An agent that records none names no commit, and a deploy beside such a build starts as it always did.
+The agent records, on each run, the commit the run's store is on once it has fetched origin and laid the overlay down (`JobLine::base`, from `VfsStore::base` in `Jobs::start`). That is what a build is "of". It is the store's own base, not the branch resolved apart from it: a fetch moves origin's copy of a branch and never the local one, a store reads origin's copy first, and `rev-parse` of the branch names the local one — recorded that way, a run on `main` after a push named the commit before it (`agent/tests/agents.rs`, `a_run_after_a_push_is_of_the_pushed_commit`). An agent that records none names no commit, and a deploy beside such a build starts as it always did.
 
 This holds for every service and every way of asking: a second `service_deploy` of a commit being deployed answers with the first, whoever started it.
 
@@ -113,12 +113,12 @@ keep stops a service by ending its process. The game saves what changed every fe
 - The webhook's signature and body (§4.1): `web/src/hooks/github.rs` and its tests. The signature test is GitHub's own published example.
 - The supervisor's entry and the site's route (`keep/keep.yaml`, `web/web.yaml`), and the three headers added to the list the gateway removes (`web/src/proxy.rs`).
 
-**To check when it is first built:**
+**Checked when it was first built** (BlackWorld, 17 November 2026; the agent, cluster, zend and web suites pass, and clippy and fmt are clean):
 
-- `Jobs::start` resolves the run's branch with `Repo::resolve(&Rev::Branch(..))` after the fetch. It must be the commit the run's store is on; if the store reads the remote's tracking ref and this reads the local branch, the recorded commit is stale and §4.3 would replace builds it should watch. A run on `main` after a push is the test.
-- The agent runs a build in the checkout itself (`D:/agent/battle-cities`), so `server_assets/` is there for the service's working folder. If a build runs in a copy, the service's `cwd` is that copy's path.
-- `service_deploy`'s and `service_control`'s descriptions changed (one more service), which the tool calibration reads.
-- `web/src/roles.rs` asserts things of the `battlecities` site; it now has a route.
+- The commit a run records was stale: `Jobs::start` resolved the branch with `Repo::resolve(&Rev::Branch(..))`, which names the local branch, while the fetch moves only origin's copy and the store reads that first. It now records the store's own base (§4.3), and a run on `main` after a push is the test that holds it.
+- The agent builds in the checkout itself (`motherd/agent.yaml` names `D:/agent/battle-cities`), and `server_assets/` and `target/` are ignored there, so the service's working folder is that checkout.
+- `service_deploy`'s and `service_control`'s descriptions name one more service. The tool calibration reads them, so the next calibration pass after the deploy recalibrates those two tools.
+- `web/src/roles.rs`'s assertions of the `battlecities` site hold with its route.
 
 **Designed above, not written:** the route that receives the webhook and publishes it (§4.1), the watch and the push driver (§4.2, §4.4), the forwarder (§5), the sign-in domain and the second OAuth resource (§6), and keep's stop request (§7). Each reaches into machinery that should be written where it can be compiled and run: the driver needs an operator's identity for its requests to keep, the forwarder the registry's view of each member's address, the OAuth resource the token store. The game's half of each is built and tested: the flow table and `POST /api/v1/flows`, `POST /api/v1/stop`, the scopes read from `X-Tokera-Scope`, the proof line, the build answer.
 

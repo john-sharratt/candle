@@ -28,7 +28,7 @@ pub struct Pushed {
 
 /// The bytes `hex` spells; `None` when it is not hex of whole bytes.
 fn unhex(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 || !hex.is_ascii() {
+    if !hex.len().is_multiple_of(2) || !hex.is_ascii() {
         return None;
     }
     (0..hex.len())
