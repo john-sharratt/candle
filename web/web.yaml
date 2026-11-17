@@ -42,6 +42,14 @@ server:
   # and the TLS entrance sees the client's.
   trusted_backends: ["127.0.0.1", "192.168.1.3"]
 
+  # A visitor who arrives on the plain entrance is sent to the same address
+  # over HTTPS (web/src/https_redirect.rs), on the names this gateway holds a
+  # certificate for. Not the CA's challenge, which is asked for over plain
+  # HTTP; not a request from this machine or a trusted backend; and not one a
+  # proxy in front says is already on HTTPS. It does nothing on a machine with
+  # no TLS entrance.
+  redirect_http: true
+
   # ── the TLS entrance ──────────────────────────────────────────────────────
   # HTTP/3 over QUIC on udp, with HTTP/2 and HTTP/1.1 over tcp for a client
   # that cannot reach udp — both on one port. A browser's first request always

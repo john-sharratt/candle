@@ -50,6 +50,7 @@ pub mod errors;
 pub mod health;
 pub mod hooks;
 pub mod html;
+pub mod https_redirect;
 pub mod log_file;
 pub mod markdown;
 pub mod mock;

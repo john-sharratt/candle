@@ -51,6 +51,7 @@ use crate::content::{self, Roots};
 use crate::errors::{self, Problem};
 use crate::health::Health;
 use crate::hooks;
+use crate::https_redirect::{self, Plan};
 use crate::proxy::{self, To};
 use crate::site;
 use crate::tls::{Entrance, Resolver, SecureEntrance};
@@ -273,6 +274,7 @@ impl Builder {
         };
         let cluster = self.cluster.clone();
         let wrap = self.wrap;
+        let to_https = Plan::of(&self.cfg).map(Arc::new);
         let app = App {
             cfg: Arc::new(self.cfg),
             clients,
@@ -309,6 +311,12 @@ impl Builder {
                     }
                 },
             )),
+            None => router,
+        };
+        // A visitor on the plain entrance is sent to the TLS one before
+        // anything is served, the CA's challenge apart (`https_redirect`).
+        let router = match to_https {
+            Some(plan) => router.layer(middleware::from_fn_with_state(plan, https_redirect::layer)),
             None => router,
         };
         let router = match wrap {

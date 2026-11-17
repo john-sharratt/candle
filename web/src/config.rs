@@ -357,6 +357,12 @@ pub struct Server {
     /// else.
     #[serde(default)]
     pub trusted_backends: Vec<IpAddr>,
+    /// Send a visitor who arrives on the plain entrance to the TLS one
+    /// ([`crate::https_redirect`]). It takes effect only where this process
+    /// has a TLS entrance, and never for the CA's challenge, which is asked
+    /// for over plain HTTP.
+    #[serde(default)]
+    pub redirect_http: bool,
 }
 
 /// Where the TLS entrance listens, and where its certificates come from.
@@ -446,6 +452,7 @@ impl Default for Server {
             tls: None,
             tls_file: None,
             trusted_backends: Vec::new(),
+            redirect_http: false,
         }
     }
 }
