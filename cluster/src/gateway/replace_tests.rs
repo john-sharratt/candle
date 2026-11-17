@@ -73,6 +73,7 @@ fn admitted_once(hub: &Hub) -> (u64, Arc<AtomicBool>) {
         Socket {
             session: first.session,
             handle: handle(),
+            addr: IpAddr::from([10, 0, 0, 1]),
             replaced: Arc::clone(&flag),
             connected_ms: 0,
             clock_offset_ms: 0,
@@ -86,6 +87,25 @@ fn admitted_once(hub: &Hub) -> (u64, Arc<AtomicBool>) {
     );
     s.registry.join(member(1, first.session));
     (first.session, flag)
+}
+
+/// **A forwarder is given the members that serve, each at the address its
+/// socket came from**: one that is not ready yet is not among them.
+#[test]
+fn the_members_that_serve_are_listed_with_their_addresses() {
+    let hub = Hub::new(GroupKey::from_bytes([3; 32]), "g");
+    admitted_once(&hub);
+    assert_eq!(hub.serving("zend"), Vec::new());
+    {
+        let mut s = hub.state();
+        let ready = Capacity {
+            state: MemberState::Ready,
+            ..Capacity::default()
+        };
+        assert!(s.registry.capacity("zend", 1, ready));
+    }
+    assert_eq!(hub.serving("zend"), vec![(1, IpAddr::from([10, 0, 0, 1]))]);
+    assert_eq!(hub.serving("npcd"), Vec::new());
 }
 
 fn ready() -> Frame {

@@ -8,8 +8,16 @@
 //! cookie is ([`Auth::mcp_identity`]): the gateway states it on `X-Tokera-*`
 //! to the member serving `/mcp`, which never sees a token's meaning.
 //!
+//! A site that names scopes for its `/api` (`sites[].api_scopes`) has a
+//! second resource, `https://<host>/api` (`docs/battlecities_app.md` §6): a
+//! token for it is anyone's who signs in, carries the scopes its person
+//! allowed, and is read on that site's `/api` paths alone
+//! ([`Auth::api_grant`]), where the gateway states those scopes upstream as
+//! `X-Tokera-Scope`.
+//!
 //! ```text
 //! GET  /.well-known/oauth-protected-resource/mcp
+//! GET  /.well-known/oauth-protected-resource/api
 //! GET  /.well-known/oauth-authorization-server
 //! GET  /oauth/authorize    → sign-in, then the consent page
 //! POST /oauth/authorize    → the answer: a code, or access_denied
@@ -20,13 +28,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Form, Query, State};
-use axum::http::{header, HeaderMap, Uri};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 
 use super::session::{self, Identity};
 use super::{estate, Auth};
+use crate::config::{host_name, hosts_match};
 
 pub mod authorize;
 pub mod client;
@@ -35,6 +44,7 @@ pub mod metadata;
 pub mod page;
 pub mod token;
 
+use authorize::Api;
 use grants::{Grant, Kind};
 
 /// This gateway's public origin, as the client reached it: the scheme the
@@ -63,7 +73,54 @@ pub fn bearer(headers: &HeaderMap) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
+/// Whether `path` is under a site's `/api`.
+fn under_api(path: &str) -> bool {
+    path.strip_prefix(metadata::API_PATH)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 impl Auth {
+    /// The `/api` of the site `headers` name by their `Host`, when the site
+    /// names scopes for one (`sites[].api_scopes`): its resource on this
+    /// origin, and those scopes.
+    pub fn api(&self, headers: &HeaderMap) -> Option<Api> {
+        let host = headers.get(header::HOST)?.to_str().ok()?;
+        let name = host_name(host);
+        let site = self
+            .api_sites
+            .iter()
+            .find(|site| hosts_match(&site.hosts, &name))?;
+        Some(Api {
+            resource: format!("{}{}", origin(self, headers), metadata::API_PATH),
+            scopes: site.scopes.clone(),
+        })
+    }
+
+    /// Who a request under a site's `/api` is by its bearer token, and what
+    /// the token may do: the person an access token for that site's `/api`
+    /// was granted by, and its scopes, space-separated, less any the site
+    /// no longer names (`docs/battlecities_app.md` §6). No other path reads
+    /// such a token, and no site that names no scopes.
+    pub fn api_grant(&self, headers: &HeaderMap, path: &str) -> Option<(Identity, String)> {
+        if !under_api(path) {
+            return None;
+        }
+        let api = self.api(headers)?;
+        let token = bearer(headers)?;
+        let grant: Grant = grants::open(&self.key, Kind::McpAccess, token, session::now_secs())?;
+        if grant.resource != api.resource {
+            return None;
+        }
+        let held: Vec<&str> = grant
+            .scopes
+            .iter()
+            .map(String::as_str)
+            .filter(|scope| api.scopes.iter().any(|s| s == scope))
+            .collect();
+        let identity = grant.identity(session::now_secs() + grants::ACCESS_TTL_SECS);
+        Some((identity, held.join(" ")))
+    }
+
     /// Who a request to `path` is by its bearer token: only `/mcp` reads one,
     /// and only an access token granted for this origin's `/mcp`.
     pub fn mcp_identity(&self, headers: &HeaderMap, path: &str) -> Option<Identity> {
@@ -94,6 +151,7 @@ impl Auth {
     pub fn mcp_router(self: Arc<Self>) -> Router {
         Router::new()
             .route(metadata::RESOURCE_DOC_PATH, get(resource_doc))
+            .route(metadata::API_RESOURCE_DOC_PATH, get(api_resource_doc))
             .route(metadata::SERVER_DOC_PATH, get(server_doc))
             .route(
                 metadata::AUTHORIZE_PATH,
@@ -110,6 +168,20 @@ async fn resource_doc(State(auth): State<Arc<Auth>>, headers: HeaderMap) -> Resp
         &origin(&auth, &headers),
     ))
     .into_response()
+}
+
+/// The protected-resource document of this site's `/api`; `404` on a site
+/// that names no scopes for one.
+async fn api_resource_doc(State(auth): State<Arc<Auth>>, headers: HeaderMap) -> Response {
+    match auth.api(&headers) {
+        Some(api) => Json(metadata::protected_api(
+            &api.resource,
+            &origin(&auth, &headers),
+            &api.scopes,
+        ))
+        .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn server_doc(State(auth): State<Arc<Auth>>, headers: HeaderMap) -> Response {
@@ -132,6 +204,7 @@ async fn authorize_ask(
         path_and_query,
         &query,
         &resource(&auth, &headers),
+        auth.api(&headers).as_ref(),
         &estate(&auth, &headers).0.cookie_domain,
         session::now_secs(),
     )

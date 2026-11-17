@@ -66,6 +66,59 @@ pub struct Request {
     pub challenge: String,
     pub state: Option<String>,
     pub resource: String,
+    /// The scopes asked for, of a site's `/api`; none for `/mcp`.
+    pub scopes: Vec<String>,
+}
+
+/// A site's `/api` as a token may be asked for it: the resource, and the
+/// scopes the site names (`docs/battlecities_app.md` §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Api {
+    pub resource: String,
+    pub scopes: Vec<String>,
+}
+
+impl Api {
+    /// Whether `query` asks for this API.
+    pub fn asked_by(&self, query: &HashMap<String, String>) -> bool {
+        query.get("resource") == Some(&self.resource)
+    }
+
+    /// The scopes `query` asks for, each one this API names: a request for
+    /// none, or for one it does not name, is refused.
+    pub fn scopes_asked(&self, query: &HashMap<String, String>) -> Result<Vec<String>, String> {
+        let offered = || self.scopes.join(", ");
+        let mut asked: Vec<String> = Vec::new();
+        for scope in query
+            .get("scope")
+            .map_or("", String::as_str)
+            .split_whitespace()
+        {
+            if !self.scopes.iter().any(|s| s == scope) {
+                return Err(format!(
+                    "`{scope}` is not a scope of `{}`: {}",
+                    self.resource,
+                    offered()
+                ));
+            }
+            if !asked.iter().any(|s| s == scope) {
+                asked.push(scope.to_string());
+            }
+        }
+        if asked.is_empty() {
+            return Err(format!("`scope` is missing: one or more of {}", offered()));
+        }
+        Ok(asked)
+    }
+
+    /// Check `query` as a request for this API, in the estate `estate`.
+    pub fn parse(&self, query: &HashMap<String, String>, estate: &str) -> Result<Request, String> {
+        let scopes = self.scopes_asked(query)?;
+        Ok(Request {
+            scopes,
+            ..parse(query, &self.resource, estate)?
+        })
+    }
 }
 
 /// Whether `asked` is the `/mcp` of a site in the estate `estate` (a cookie
@@ -123,6 +176,7 @@ pub fn parse(
         challenge: challenge.to_string(),
         state: get("state").map(str::to_string),
         resource: resource.to_string(),
+        scopes: Vec::new(),
     })
 }
 
@@ -192,6 +246,47 @@ pub fn consent_card(consent: &Consent, sealed: &str) -> String {
     )
 }
 
+/// The consent card for a site's `/api`: who asks, for which site, the scopes
+/// it asks for by name, as whom, and where it will be sent.
+pub fn api_card(consent: &Consent, sealed: &str) -> String {
+    let to = host_of(&consent.grant.redirect_uri);
+    let site = host_of(&consent.grant.resource);
+    let who = if consent.grant.email.is_empty() {
+        consent.grant.name.clone()
+    } else {
+        consent.grant.email.clone()
+    };
+    let scopes: String = consent
+        .grant
+        .scopes
+        .iter()
+        .map(|s| format!("<li><code>{}</code></li>\n", escape(s)))
+        .collect();
+    format!(
+        r#"<div class="body">
+<p class="whisper">Another program asks to act for you.</p>
+<h1><span class="client">{name}</span> wants to use your account on {site}</h1>
+<p class="lede">It will act as you there, within what it asks for:</p>
+<div class="who"><span class="dot" aria-hidden="true"></span><span>Signed in as <b>{who}</b></span></div>
+<ul class="can">
+{scopes}</ul>
+<p class="to">You will be sent back to <code>{to}</code>.</p>
+<form method="post" action="/oauth/authorize" class="actions">
+<input type="hidden" name="consent" value="{sealed}">
+<button type="submit" name="decision" value="deny" class="deny">Deny</button>
+<button type="submit" name="decision" value="allow" class="allow">Allow</button>
+</form>
+</div>
+<div class="foot">Only allow a client you started yourself. Access lasts {days} days, and each use renews it.</div>"#,
+        name = escape(&consent.client_name),
+        site = escape(&site),
+        who = escape(&who),
+        to = escape(&to),
+        sealed = escape(sealed),
+        days = REFRESH_TTL_SECS / 86_400,
+    )
+}
+
 /// A refusal, in the same look: what went wrong, and that the sign-in starts
 /// again from the client.
 fn page(status: StatusCode, message: &str) -> Response {
@@ -216,8 +311,12 @@ fn see_other(location: &str) -> Response {
 }
 
 /// Steps 1–3: the request checked, then the sign-in, or the consent page for
-/// `identity`. `resource` is this origin's `/mcp`, and `estate` the cookie
-/// domain it signs in on.
+/// `identity`. `resource` is this origin's `/mcp`, `api` its `/api` when the
+/// site names scopes for one, and `estate` the cookie domain it signs in on.
+///
+/// A request for the site's `/api` is anyone's who signs in: the site's own
+/// accounts decide what a person may do there, so the role table, which says
+/// who may use Zen, is not asked.
 #[allow(clippy::too_many_arguments)]
 pub async fn ask(
     key: &Key,
@@ -226,10 +325,16 @@ pub async fn ask(
     path_and_query: &str,
     query: &HashMap<String, String>,
     resource: &str,
+    api: Option<&Api>,
     estate: &str,
     now: u64,
 ) -> Response {
-    let req = match parse(query, resource, estate) {
+    let for_api = api.filter(|api| api.asked_by(query));
+    let parsed = match for_api {
+        Some(api) => api.parse(query, estate),
+        None => parse(query, resource, estate),
+    };
+    let req = match parsed {
         Ok(req) => req,
         Err(why) => return page(StatusCode::BAD_REQUEST, &why),
     };
@@ -238,8 +343,9 @@ pub async fn ask(
     let Some(identity) = identity else {
         return see_other(&format!("/auth/login?next={}", urlencode(path_and_query)));
     };
-    // And named in the role table: a guest fetches nothing either.
-    if !may_connect(roles, &identity) {
+    // And, for `/mcp`, named in the role table: a guest fetches nothing
+    // either.
+    if for_api.is_none() && !may_connect(roles, &identity) {
         tracing::info!(
             target: "web::auth::mcp",
             email = %identity.email,
@@ -295,17 +401,25 @@ pub async fn ask(
             sub: identity.sub,
             email: identity.email,
             name: identity.name,
+            scopes: req.scopes,
         },
         challenge: req.challenge,
         state: req.state,
         client_name: doc.display_name(),
     };
     let sealed = grants::seal(key, Kind::McpConsent, now + CONSENT_TTL_SECS, &consent);
-    respond(
-        StatusCode::OK,
-        "Allow access to zend",
-        &consent_card(&consent, &sealed),
-    )
+    match consent.grant.is_api() {
+        true => respond(
+            StatusCode::OK,
+            "Allow access to your account",
+            &api_card(&consent, &sealed),
+        ),
+        false => respond(
+            StatusCode::OK,
+            "Allow access to zend",
+            &consent_card(&consent, &sealed),
+        ),
+    }
 }
 
 /// Step 4: the answer `identity` gave.
@@ -335,7 +449,7 @@ pub fn decide(
             "this consent was shown to someone else",
         );
     }
-    if !may_connect(roles, &identity) {
+    if !consent.grant.is_api() && !may_connect(roles, &identity) {
         tracing::info!(
             target: "web::auth::mcp",
             email = %identity.email,
@@ -470,6 +584,108 @@ mod tests {
         other.retain(|(k, _)| *k != "resource");
         other.push(("resource", "https://evil.example/mcp"));
         assert!(parse(&query(&other), RESOURCE, ESTATE).is_err());
+    }
+
+    fn game() -> Api {
+        Api {
+            resource: "https://battlecities.net/api".into(),
+            scopes: ["read", "chat", "play", "manage", "account", "admin"]
+                .map(str::to_string)
+                .to_vec(),
+        }
+    }
+
+    fn asking_the_game(scope: Option<&str>) -> HashMap<String, String> {
+        let mut q = asking_for("https://battlecities.net/api");
+        if let Some(scope) = scope {
+            q.insert("scope".into(), scope.into());
+        }
+        q
+    }
+
+    /// **A site's `/api` is asked for by its resource, with scopes it names**:
+    /// each asked once, in the order asked; none, or one the site does not
+    /// name, is refused, and `/mcp`'s request is not the API's.
+    #[test]
+    fn an_api_is_asked_for_with_scopes_it_names() {
+        let api = game();
+        assert!(api.asked_by(&asking_the_game(None)));
+        assert!(!api.asked_by(&asking_for(RESOURCE)));
+        assert!(!api.asked_by(&asking_for("https://battlecities.net/api/v1")));
+
+        let estate = ".battlecities.net";
+        let req = api
+            .parse(&asking_the_game(Some("play read  play")), estate)
+            .unwrap();
+        assert_eq!(req.resource, "https://battlecities.net/api");
+        assert_eq!(req.scopes, ["play", "read"]);
+        assert_eq!(req.state.as_deref(), Some("xyz"));
+
+        let none = api.parse(&asking_the_game(None), estate).unwrap_err();
+        assert_eq!(
+            none,
+            "`scope` is missing: one or more of read, chat, play, manage, account, admin"
+        );
+        let other = api
+            .parse(&asking_the_game(Some("read zend")), estate)
+            .unwrap_err();
+        assert!(other.starts_with("`zend` is not a scope of"), "{other}");
+        // A request for `/mcp` names no scopes, whatever it says.
+        let mcp = parse(&query(&good()), RESOURCE, ESTATE).unwrap();
+        assert!(mcp.scopes.is_empty());
+    }
+
+    /// **Anyone who signs in may grant a client their account on a site's
+    /// API**; `/mcp` stays the role table's. With nobody on the table, the
+    /// API's consent is answered with a code and `/mcp`'s is refused.
+    #[test]
+    fn an_apis_consent_is_anyones_and_mcps_is_the_role_tables() {
+        use crate::auth::mcp::grants::testing::api_grant;
+        let nobody_listed = Roles::default();
+        let answer = |grant: Grant| {
+            let consent = Consent {
+                grant: grant.clone(),
+                challenge: "abc".into(),
+                state: None,
+                client_name: "A client".into(),
+            };
+            let sealed = grants::seal(&key(), Kind::McpConsent, 600, &consent);
+            let form = query(&[("consent", sealed.as_str()), ("decision", "allow")]);
+            decide(
+                &key(),
+                &nobody_listed,
+                Some(grant.identity(900)),
+                &form,
+                "https://battlecities.net",
+                100,
+            )
+        };
+        let api = answer(api_grant());
+        assert_eq!(api.status(), StatusCode::SEE_OTHER);
+        let to = api.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(to.contains("code="), "{to}");
+        assert_eq!(answer(grant()).status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The API's consent names the site, the client and each scope asked.
+    #[test]
+    fn an_apis_consent_names_the_site_and_the_scopes() {
+        use crate::auth::mcp::grants::testing::api_grant;
+        let consent = Consent {
+            grant: api_grant(),
+            challenge: "abc".into(),
+            state: None,
+            client_name: "A <client>".into(),
+        };
+        let card = api_card(&consent, "sealed");
+        assert!(
+            card.contains("A &lt;client&gt;</span> wants to use your account on battlecities.net")
+        );
+        assert!(card.contains("<li><code>read</code></li>\n<li><code>play</code></li>"));
+        assert!(!card.contains("Zen"));
     }
 
     #[test]

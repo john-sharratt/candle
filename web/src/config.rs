@@ -113,6 +113,40 @@ pub struct ServiceTopics {
     pub publish: Vec<String>,
 }
 
+/// `cluster.deploy_on_push`: the repositories whose `main` is deployed as it
+/// moves, told by GitHub's webhook and by a watch of origin
+/// (`docs/battlecities_app.md` §4).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeployOnPush {
+    /// The repositories, by the name the workspace knows them: `battle-cities`.
+    pub repos: Vec<String>,
+    /// The file that holds the webhook's secret, resolved against this
+    /// config. Absent, or naming a file that is not there, no delivery is
+    /// believed and the watch alone tells of a push.
+    #[serde(default)]
+    pub github_hook_key_file: Option<PathBuf>,
+}
+
+/// One entry of `cluster.udp_forward`: the ports whose datagrams go to the
+/// members of `app`.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UdpForward {
+    pub app: String,
+    pub ports: Vec<UdpPort>,
+}
+
+/// One forwarded port: where the gateway listens, and the port each member
+/// listens on. They differ where a member runs on the gateway's own machine,
+/// which cannot bind one port twice.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UdpPort {
+    pub listen: u16,
+    pub member: u16,
+}
+
 /// The `cluster:` block.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -135,6 +169,14 @@ pub struct Cluster {
     /// (`docs/mcp_file_tools.md` §4), each on the routes and topics it names.
     #[serde(default)]
     pub service_keys: Vec<ServiceKeyConfig>,
+    /// The pushes that are deployed at once (`docs/battlecities_app.md` §4):
+    /// the repositories, and the secret GitHub signs its webhook with.
+    #[serde(default)]
+    pub deploy_on_push: Option<DeployOnPush>,
+    /// The UDP ports forwarded to an app's members (`docs/battlecities_app.md`
+    /// §5).
+    #[serde(default)]
+    pub udp_forward: Vec<UdpForward>,
     /// This gateway's name in the coordination log; default its bind address.
     #[serde(default)]
     pub name: Option<String>,
@@ -501,6 +543,13 @@ pub struct Site {
     /// tools read through `/gateway/logs/<site>/…`.
     #[serde(default)]
     pub logs: bool,
+    /// The scopes a bearer token for this site's `/api` may be granted
+    /// (`docs/battlecities_app.md` §6). With any named, the gateway's
+    /// authorization server issues tokens for `https://<host>/api` to
+    /// whoever signs in, and states a token's scopes upstream as
+    /// `X-Tokera-Scope`. Empty, the site's API takes no token.
+    #[serde(default)]
+    pub api_scopes: Vec<String>,
     #[serde(skip)]
     pub roots_abs: Vec<PathBuf>,
     #[serde(skip)]
@@ -571,19 +620,38 @@ impl Upstream {
     }
 }
 
+/// A `Host` header's name as sites are matched by it: without its port or an
+/// IPv6 literal's brackets, lowercased.
+pub fn host_name(raw: &str) -> String {
+    let h = raw.trim();
+    let h = h
+        .rsplit_once(':')
+        .filter(|(head, _)| !head.contains(':') || head.starts_with('['))
+        .map(|(head, _)| head)
+        .unwrap_or(h);
+    h.trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase()
+}
+
+/// Whether `host` — a [`host_name`] — is one of `hosts`, a site's patterns: a
+/// leading `*.` matches subdomains but not the bare apex.
+pub fn hosts_match(hosts: &[String], host: &str) -> bool {
+    hosts.iter().any(|pattern| {
+        let p = pattern.to_ascii_lowercase();
+        match p.strip_prefix("*.") {
+            Some(suffix) => {
+                host.len() > suffix.len() + 1
+                    && host.ends_with(suffix)
+                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+            }
+            None => host == p,
+        }
+    })
+}
+
 impl Site {
     pub fn matches_host(&self, host: &str) -> bool {
-        self.hosts.iter().any(|pattern| {
-            let p = pattern.to_ascii_lowercase();
-            match p.strip_prefix("*.") {
-                Some(suffix) => {
-                    host.len() > suffix.len() + 1
-                        && host.ends_with(suffix)
-                        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-                }
-                None => host == p,
-            }
-        })
+        hosts_match(&self.hosts, host)
     }
 
     /// Longest matching prefix wins, so `/v1/stream` can go somewhere other
@@ -780,6 +848,29 @@ impl Config {
                     key.key_file = base.join(&key.key_file);
                 }
             }
+            if let Some(pushes) = &mut cluster.deploy_on_push {
+                if let Some(p) = &mut pushes.github_hook_key_file {
+                    if p.is_relative() {
+                        *p = base.join(&*p);
+                    }
+                }
+            }
+            for forward in &cluster.udp_forward {
+                if !APPS.contains(&forward.app.as_str()) {
+                    bail!(
+                        "`cluster.udp_forward` names `{}`, which is no app — one of {}",
+                        forward.app,
+                        APPS.join(", ")
+                    );
+                }
+                let unnamed = |p: &UdpPort| p.listen == 0 || p.member == 0;
+                if forward.ports.is_empty() || forward.ports.iter().any(unnamed) {
+                    bail!(
+                        "`cluster.udp_forward` for `{}` names no port, or port 0",
+                        forward.app
+                    );
+                }
+            }
             let mut names: Vec<&str> = cluster
                 .service_keys
                 .iter()
@@ -843,6 +934,19 @@ impl Config {
                         abs.display()
                     )
                 })?);
+            }
+            // A scope is a word a token endpoint lists and a header carries,
+            // space-separated: letters, digits, `_` and `-`.
+            let word = |s: &String| {
+                !s.is_empty()
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            };
+            if let Some(bad) = site.api_scopes.iter().find(|s| !word(s)) {
+                bail!(
+                    "site `{}`: `api_scopes` names `{bad}`, which is not a word",
+                    site.name
+                );
             }
             for r in &site.api {
                 if !r.prefix.starts_with('/') {
@@ -940,15 +1044,7 @@ impl Config {
 
     pub fn site_for(&self, host: Option<&str>) -> &Site {
         if let Some(raw) = host {
-            let h = raw.trim();
-            let h = h
-                .rsplit_once(':')
-                .filter(|(head, _)| !head.contains(':') || head.starts_with('['))
-                .map(|(head, _)| head)
-                .unwrap_or(h);
-            let h = h
-                .trim_matches(|c| c == '[' || c == ']')
-                .to_ascii_lowercase();
+            let h = host_name(raw);
             if let Some(s) = self.sites.iter().find(|s| s.matches_host(&h)) {
                 return s;
             }
@@ -1135,6 +1231,68 @@ sites:
             format!("{twice:#}").contains("names `yenbot` twice"),
             "{twice:#}"
         );
+        // Pushes deployed at once and forwarded ports: none unless named; the
+        // webhook's secret resolves like every key file, and a forward names
+        // an app and its ports.
+        assert_eq!(cluster.deploy_on_push, None);
+        assert!(cluster.udp_forward.is_empty());
+        let game = Config::from_yaml(
+            &ok.replace(
+                "{group_key_file:",
+                "{deploy_on_push: {repos: [battle-cities], github_hook_key_file: \
+                 \"secrets/github-hook.key\"}, udp_forward: [{app: battlecities, ports: \
+                 [{listen: 4300, member: 14300}, {listen: 4123, member: 14123}]}], \
+                 group_key_file:",
+            ),
+            Path::new("/srv/web"),
+        )
+        .unwrap()
+        .cluster
+        .unwrap();
+        assert_eq!(
+            game.deploy_on_push,
+            Some(DeployOnPush {
+                repos: vec!["battle-cities".into()],
+                github_hook_key_file: Some(Path::new("/srv/web").join("secrets/github-hook.key")),
+            })
+        );
+        assert_eq!(
+            game.udp_forward,
+            vec![UdpForward {
+                app: "battlecities".into(),
+                ports: vec![
+                    UdpPort {
+                        listen: 4300,
+                        member: 14300,
+                    },
+                    UdpPort {
+                        listen: 4123,
+                        member: 14123,
+                    },
+                ],
+            }]
+        );
+        for (bad, why) in [
+            (
+                "[{app: chess, ports: [{listen: 4300, member: 4300}]}]",
+                "which is no app",
+            ),
+            ("[{app: battlecities, ports: []}]", "names no port"),
+            (
+                "[{app: battlecities, ports: [{listen: 4300, member: 0}]}]",
+                "names no port",
+            ),
+        ] {
+            let refused = Config::from_yaml(
+                &ok.replace(
+                    "{group_key_file:",
+                    &format!("{{udp_forward: {bad}, group_key_file:"),
+                ),
+                Path::new("/srv/web"),
+            )
+            .unwrap_err();
+            assert!(format!("{refused:#}").contains(why), "{refused:#}");
+        }
         let tuned = Config::from_yaml(
             &ok.replace(
                 "{group_key_file:",

@@ -177,6 +177,10 @@ pub struct MemberStream {
 pub(super) struct Socket {
     pub session: u64,
     pub handle: SessionHandle,
+    /// The address the socket came from: where the member's machine is
+    /// reached by what is not carried over the socket itself — the game's
+    /// datagrams (`docs/battlecities_app.md` §5).
+    pub addr: IpAddr,
     /// Set, under the state's guard, once a newer session of the node is
     /// admitted: its session's loop reads it to drop what it still reports
     /// of its node's state ([`Report`]).
@@ -785,14 +789,16 @@ impl Hub {
             }
         };
         let guard = decided.expect("an ADMIT was decided");
-        self.run(app, hello, guard, tx, rx, streams).await;
+        self.run(app, ip, hello, guard, tx, rx, streams).await;
     }
 
-    /// The admitted session's life. `guard` holds its admission until its
-    /// pending is taken.
+    /// The admitted session's life, on a socket that came from `ip`. `guard`
+    /// holds its admission until its pending is taken.
+    #[allow(clippy::too_many_arguments)]
     async fn run<T, R, F>(
         self: &Arc<Self>,
         app: &str,
+        ip: IpAddr,
         hello: Hello,
         mut guard: PendingGuard,
         tx: T,
@@ -852,6 +858,7 @@ impl Hub {
                 Socket {
                     session: admitted.session,
                     handle: handle.clone(),
+                    addr: ip,
                     replaced: Arc::clone(&replaced_flag),
                     connected_ms,
                     clock_offset_ms: hello.now_ms as i64 - connected_ms as i64,
@@ -1998,6 +2005,25 @@ impl Hub {
             .iter()
             .find(|m| m.ready())
             .map(|m| m.node)
+    }
+
+    /// The members of `app` a request may go to now, in node order, each with
+    /// the address its socket came from: what a forwarder of datagrams
+    /// spreads its flows over (`docs/battlecities_app.md` §5).
+    pub fn serving(&self, app: &str) -> Vec<(u64, IpAddr)> {
+        let s = self.state();
+        let mut serving: Vec<(u64, IpAddr)> = s
+            .registry
+            .members(app)
+            .iter()
+            .filter(|m| m.routable() && !m.silent)
+            .filter_map(|m| {
+                let socket = s.sockets.get(&(app.to_string(), m.node))?;
+                Some((m.node, socket.addr))
+            })
+            .collect();
+        serving.sort_unstable_by_key(|(node, _)| *node);
+        serving
     }
 
     /// `app`'s floor, model lock and member count, for an aggregated

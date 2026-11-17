@@ -249,6 +249,24 @@ cluster:
       topics:
         subscribe: ["dj/rekordbox"]
         publish: ["dj/rekordbox/result/*"]
+  # Battle Cities (docs/battlecities_app.md §4): a push to the game's `main`
+  # is deployed at once. GitHub's webhook says so — `POST
+  # /gateway/hooks/github`, signed with the secret in this file, which holds
+  # the same text the webhook was given in GitHub — and origin is looked at
+  # once a minute for a push no delivery told of. Without the file no delivery
+  # is believed, and the watch alone deploys.
+  deploy_on_push:
+    repos: [battle-cities]
+    github_hook_key_file: "secrets/github-hook.key"
+  # The game's datagrams (docs/battlecities_app.md §5): clients send to the
+  # game's own ports here, and each client's flow is carried to one member.
+  # The member on this machine listens on other ports, since one port is
+  # bound once.
+  udp_forward:
+    - app: battlecities
+      ports:
+        - {listen: 4300, member: 14300}
+        - {listen: 4123, member: 14123}
 
 sites:
   # ── tokera.com ──────────────────────────────────────────────────────────
@@ -300,6 +318,10 @@ sites:
   - name: battlecities
     hosts: ["battlecities.net", "battlecities.localhost"]
     roots: ["content/battlecities"]
+    # The game's API takes bearer tokens (docs/battlecities_app.md §6): anyone
+    # who signs in may grant a client any of these on their own account, and
+    # the gateway tells the game which a token holds.
+    api_scopes: [read, chat, play, manage, account, admin]
     api:
       - prefix: /
         upstream: "http://127.0.0.1:4080"

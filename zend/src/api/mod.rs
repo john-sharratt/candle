@@ -34,6 +34,7 @@ pub mod chat;
 mod chat_frames;
 mod compressed;
 pub mod conversations;
+pub mod deploys;
 pub mod diag;
 pub mod files;
 pub mod jobs;
@@ -441,6 +442,15 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Dispatch::Any,
             post(worker_continue::post).body_limit(worker_continue::BODY_LIMIT),
         )
+        // A gateway's word that a repository's `main` moved
+        // (`docs/battlecities_app.md` §4.4). Open at the gateway, because the
+        // gateway itself asks; the handler believes only a gateway's mark.
+        .route(
+            "/v1/deploys/pushed",
+            Role::Unauthenticated,
+            Dispatch::Any,
+            post(deploys::post).body_limit(deploys::BODY_LIMIT),
+        )
 }
 
 #[cfg(test)]
@@ -507,6 +517,9 @@ mod tests {
                 // Open at the gateway; its handler believes a member's stamp
                 // alone (`worker_continue`).
                 ("/v1/mcp/worker/continue", "unauthenticated"),
+                // Open at the gateway; its handler believes a gateway's mark
+                // alone (`deploys`).
+                ("/v1/deploys/pushed", "unauthenticated"),
             ]
         );
     }

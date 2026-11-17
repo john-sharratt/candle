@@ -9,6 +9,7 @@
 //! | [`status`] | `service_status` |
 //! | [`guard`] | what a worker's deploy may not take down |
 //! | [`pending`] | one deploy of a service on a machine for one commit |
+//! | [`on_push`] | the services deployed when their repository's `main` moves |
 //!
 //! **A deploy is named by its build job.** Its state is read from the agent
 //! that builds it and from the keep that tries it, which records the handle on
@@ -30,6 +31,7 @@ use crate::mcp::ops_tools::OpsCall;
 
 pub mod deploy;
 pub mod guard;
+pub mod on_push;
 pub mod pending;
 pub mod status;
 

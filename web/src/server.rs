@@ -50,9 +50,11 @@ use crate::config::{Config, Site, Upstream};
 use crate::content::{self, Roots};
 use crate::errors::{self, Problem};
 use crate::health::Health;
+use crate::hooks;
 use crate::proxy::{self, To};
 use crate::site;
 use crate::tls::{Entrance, Resolver, SecureEntrance};
+use crate::udp_forward;
 use crate::upstream_tls::Clients;
 
 #[derive(Clone)]
@@ -148,7 +150,8 @@ impl Builder {
     /// poor way to find out.
     pub fn with_auth(mut self) -> anyhow::Result<Self> {
         if let Some(cfg) = self.cfg.auth.clone() {
-            self.auth = Some(Arc::new(Auth::new(cfg, self.cfg.roles.clone())?));
+            let auth = Auth::new(cfg, self.cfg.roles.clone())?.with_api_sites(&self.cfg.sites);
+            self.auth = Some(Arc::new(auth));
         }
         Ok(self)
     }
@@ -264,6 +267,7 @@ impl Builder {
                     gw.clone(),
                     self.cfg.server.trusted_backends.clone(),
                 ))
+                .merge(hooks::http::router(gw.clone()))
                 .merge(site_logs::router(&self.cfg)),
             None => Router::new(),
         };
@@ -331,9 +335,21 @@ impl Builder {
             .map(|c| c.peers.clone())
             .unwrap_or_default();
         let cluster = self.cluster.clone();
+        let forwards = self
+            .cfg
+            .cluster
+            .as_ref()
+            .map(|c| c.udp_forward.clone())
+            .unwrap_or_default();
+        let forward_on = self.cfg.server.bind.ip();
         // The plain entrance first: it answers the CA's HTTP-01 challenges, so
         // it is listening before the manager can ask for a certificate.
         let bound = self.bind().await?;
+        // The forwarded UDP ports, bound before anything is served like the
+        // entrances: a port that is taken stops the start.
+        if let Some(gw) = &cluster {
+            udp_forward::start(gw, &forwards, forward_on).await?;
+        }
         // Bound before anything is served, so a store that does not load or a
         // port that is taken stops the start rather than leaving the plain
         // entrance up without it. The stored certificates are installed first,
@@ -663,6 +679,24 @@ async fn handle(
     if gateway.is_some_and(|gw| gw.presents_key(req.headers())) {
         req.headers_mut().remove(header::AUTHORIZATION);
     }
+    // **A bearer token for this site's API** (`Auth::api_grant`,
+    // `docs/battlecities_app.md` §6): the person it was granted by, with the
+    // scopes it was granted, on the site's `/api` paths alone. Read only when
+    // nothing else names the caller — a browser's session has every right of
+    // its account and states no scope. The token is this gateway's to read:
+    // upstream is told who and what, never handed the token.
+    let granted = match (&identity, app.auth.as_ref()) {
+        (None, Some(a)) => a.api_grant(req.headers(), &path),
+        _ => None,
+    };
+    let identity = match granted {
+        Some((person, scope)) => {
+            req.extensions_mut().insert(proxy::Scope(scope));
+            req.headers_mut().remove(header::AUTHORIZATION);
+            Some(person)
+        }
+        None => identity,
+    };
     let assertion = app
         .auth
         .as_ref()

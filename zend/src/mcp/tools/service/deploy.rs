@@ -143,7 +143,7 @@ pub fn next_steps(job: &JobHandle) -> String {
 /// The commit origin's `main` holds for `repo`, read through an agent that
 /// holds the repository; `None` when origin could not be listed, and the
 /// deploy then starts as one always did.
-async fn origin_tip(agents: &Agents, repo: &str) -> Option<String> {
+pub async fn origin_tip(agents: &Agents, repo: &str) -> Option<String> {
     let listing = ListJob {
         repo: repo.to_string(),
     };

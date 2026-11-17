@@ -67,6 +67,8 @@ use crate::auth::forwarded::identify;
 use crate::auth::{Auth, Identity};
 use crate::bus::Bus;
 use crate::config::{Cluster as ClusterConfig, Config};
+use crate::hooks::github::secret;
+use crate::hooks::pushes::{tell_and_log, Told, WATCH_EVERY};
 use axum::http::HeaderMap;
 use bearer_key::BearerKey;
 use ops_key::OpsKey;
@@ -138,6 +140,16 @@ pub struct Gateway {
     pub service_keys: Vec<ServiceKey>,
     /// The pub/sub bus its members and services use (`crate::bus`).
     pub bus: Bus,
+    /// The secret GitHub signs its webhook with, when
+    /// `cluster.deploy_on_push` names a file that holds one (`crate::hooks`).
+    pub github_hook_secret: Option<Vec<u8>>,
+    /// The repositories whose pushes to `main` are deployed at once
+    /// (`cluster.deploy_on_push`).
+    pub deploy_on_push: Vec<String>,
+    /// The commit each of them was last told to a member at.
+    pub told: Told,
+    /// Set once the watch for their pushes runs.
+    watching: OnceLock<()>,
     /// The ACME shared with the peers, once the TLS entrance's certificates
     /// are loaded.
     acme: OnceLock<Arc<AcmePeers>>,
@@ -197,6 +209,11 @@ impl Gateway {
             .map(|o| OpsKey::load(&o.file, &o.admin))
             .transpose()?;
         let service_keys = service_key::load_present(&cluster.service_keys)?;
+        let pushes = cluster.deploy_on_push.as_ref();
+        let github_hook_secret = match pushes.and_then(|p| p.github_hook_key_file.as_deref()) {
+            Some(file) => secret(file)?,
+            None => None,
+        };
         Ok(Arc::new(Gateway {
             hub,
             node: voter,
@@ -205,6 +222,10 @@ impl Gateway {
             ops_key,
             service_keys,
             bus: Bus::new(),
+            github_hook_secret,
+            deploy_on_push: pushes.map(|p| p.repos.clone()).unwrap_or_default(),
+            told: Told::default(),
+            watching: OnceLock::new(),
             acme: OnceLock::new(),
             sites: groups(cfg).into_iter().map(|g| g.site).collect(),
             router: OnceLock::new(),
@@ -246,6 +267,53 @@ impl Gateway {
         });
     }
 
+    /// Look at origin once a minute from now on for a push no webhook told
+    /// of (`crate::hooks::pushes`): started by the first member socket, on
+    /// the runtime that serves it, when `cluster.deploy_on_push` names a
+    /// repository.
+    pub fn watch_pushes(self: &Arc<Self>) {
+        if self.deploy_on_push.is_empty() || self.watching.set(()).is_err() {
+            return;
+        }
+        let gateway = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = interval(WATCH_EVERY);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                for repo in &gateway.deploy_on_push {
+                    tell_and_log(&gateway, repo, None).await;
+                }
+            }
+        });
+    }
+
+    /// A gateway around `hub` that believes webhook deliveries signed with
+    /// `secret` and deploys the pushes of `repos`, for tests.
+    pub fn with_hub_and_pushes(
+        hub: Arc<Hub>,
+        secret: Option<Vec<u8>>,
+        repos: Vec<String>,
+    ) -> Arc<Gateway> {
+        Arc::new(Gateway {
+            hub,
+            node: 0,
+            peering: None,
+            status_key: None,
+            ops_key: None,
+            service_keys: Vec::new(),
+            bus: Bus::new(),
+            github_hook_secret: secret,
+            deploy_on_push: repos,
+            told: Told::default(),
+            watching: OnceLock::new(),
+            acme: OnceLock::new(),
+            sites: Vec::new(),
+            router: OnceLock::new(),
+            ticking: OnceLock::new(),
+        })
+    }
+
     /// A gateway around `hub`, for tests that build the hub themselves.
     pub fn with_hub(hub: Arc<Hub>) -> Arc<Gateway> {
         Gateway::with_hub_and_keys(hub, None, None)
@@ -275,6 +343,10 @@ impl Gateway {
             ops_key,
             service_keys,
             bus: Bus::new(),
+            github_hook_secret: None,
+            deploy_on_push: Vec::new(),
+            told: Told::default(),
+            watching: OnceLock::new(),
             acme: OnceLock::new(),
             sites: Vec::new(),
             router: OnceLock::new(),
