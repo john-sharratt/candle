@@ -44,18 +44,30 @@ builds the commit again.
 
 ## 3. The runner
 
-Every run gets a **runner**: the agent's own binary started as `tokera-agent
-run`, detached from the agent. On Windows it is outside the agent's job object
-(`CREATE_BREAKAWAY_FROM_JOB`) and in no console of its own, the way keep's
-services outlive keep. The runner is the sandbox job, steps 1–9 of
-`zend_vfs::sandbox`. It moves out of the agent's process whole:
+Every run gets a **runner**: `tokera-runner`, a small binary of the `agent`
+crate, started detached (`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
+CREATE_NO_WINDOW`, as keep starts its services, `keep/src/trial.rs`). A build
+dies today because the agent holds the job object its command runs in, and
+closing the agent closes the job (`zend-vfs/src/kill_tree.rs`, `Tree::drop`).
+The runner holds that job instead.
+
+A runner never runs from a file a switch replaces. The agent in motherd has
+no binary of its own: its executable is `keep/stable/motherd.exe`, which keep
+overwrites on every switch, and a running image cannot be overwritten on
+Windows. So each agent, as it starts, copies the `tokera-runner` of its own
+build into `jobs_dir/runners/<count>-<hash>/` and starts runners from there.
+A copy no runner is using is removed once its build is two behind.
+
+The runner is the sandbox job, steps 1–9 of `zend_vfs::sandbox`. It moves out
+of the agent's process whole:
 
 1. It reads its `RunJob` from stdin, overlay chains included, and keeps it in
    memory. Its id is the run's id.
 2. It takes the checkout's lock, then the machine's build slot (§4). Both are
    named OS mutexes, which the OS releases if the runner dies. This replaces
-   the sandbox's in-process lock, because two agent processes may now look
-   at one checkout.
+   the sandbox's in-process lock (a `tokio::sync::Mutex`,
+   `zend-vfs/src/sandbox/mod.rs`), because a runner and a restarted agent
+   are now different processes looking at one checkout.
 3. It sets aside, materializes, runs, captures and puts back, as the sandbox
    does today. The command runs in a job object the runner holds, so
    cancelling a run is one kill of the runner's job, and a runner that
@@ -65,16 +77,35 @@ services outlive keep. The runner is the sandbox job, steps 1–9 of
    what it built (`Jobs::stage`).
 5. It keeps its outcome (exit code, changed files as deltas, what it staged)
    and serves it on a named pipe, `\\.\pipe\tokera-run-<id>`, until an agent
-   collects it and says it has been delivered (§6). It exits then, or after a
-   day uncollected.
+   tells it the outcome has been delivered (§6). It exits then, or after a
+   day undelivered.
 
 The pipe answers: what the run is (its `RunJob` without the chains, its phase
 and times), the log's path, the outcome once there, `cancel`, and `delivered`.
+The pipe's DACL admits the agent's own account alone, and an agent believes a
+pipe only when its server process is a `tokera-runner` from its runners folder
+(`GetNamedPipeServerProcessId`).
 
-**An agent adopts its runners when it starts.** It lists the pipes named
-`tokera-run-*`, asks each one what it is, and puts it in its job table under
-the run's own id, so every handle from before the restart still names it. No
-file records which runners exist: the runner itself is the record.
+**An agent adopts its runners when it starts, before anything else touches a
+checkout.** In this order:
+
+1. It lists the pipes named `tokera-run-*`, asks each one what it is, and
+   puts it in its job table under the run's own id, so every handle from
+   before the restart still names it. No file records which runners exist:
+   the runner itself is the record.
+2. It joins the gateway and reports (§5), then takes back the runs it was
+   handed and had not started. A run whose id it adopted in step 1 is not
+   queued again, so a run that started just before a restart never runs twice.
+3. Only then does it run its start-up work on the checkouts no adopted runner
+   holds: each checkout's declared setup (`Jobs::set_up`), the stale git lock
+   sweep (`stale_locks`, which already spares a lock whose git still runs) and
+   the disk sweep (`sweep`, which counts adopted runs as holding their
+   checkout's `target`).
+
+Every read of a run in `Jobs` goes through the checkout's in-process job
+server today (`view`, `tail`, `log`, `holding` call `server.query_job`). They
+read the runner instead, through its pipe and its log file, for a run the
+agent started and for one it adopted alike: one path, not two.
 
 `JOBS_WAIT` goes: an installing agent leaves its runners running and adopts
 them on the new build. Causes 1, 2 and 4 are gone for every run that has
@@ -108,21 +139,28 @@ loading its world, runs while the next candle build compiles.
 
 ## 5. The gateway's table, rebuilt both ways
 
-The gateway already queues a run that finds no free agent
-(`cluster/src/gateway/agents.rs`). It now also keeps a table of every run it
-handed out, by `(node, id)`: its request without the chains, its phase, and
-how it ended once it has. It serves the cluster's reads of runs
-(`job_status`, `job_list`, `pending::decide`, §7) without asking the agent,
-and the agent's own answers stay what a log read goes to.
+A run that finds no free slot queues on an agent, never in the gateway
+(`cluster/src/gateway/agents.rs`): the agent holds its queue. The gateway now
+keeps a table of every run it handed out, by `(node, id)`: its request without
+the chains, its machine, its base commit, its phase, and how it ended once it
+has. It serves the cluster's reads of runs (`job_status`, `job_list`,
+`pending::decide`, §7) without asking the agent. A log read still goes to the
+agent.
 
-- **On every connect, an agent reports its runs**: the ones queued in it,
-  the runners it adopted, and the ones that ended since its last report. The
-  gateway's entries for that node are replaced by the report.
+- **On every connect, and on every change after, an agent reports its runs**:
+  the ones queued in it, the runners it holds, and the ones that ended.
+- **A report merges into the table; it never replaces it.** A run the report
+  names takes the report's state. A run in the table that the report leaves
+  out is left as it is: an unstarted one is a run the agent lost, and it is
+  handed back (below). An ended one stays as the record of how it ended (§7),
+  however many agent restarts later. Ended runs are kept by age (30 days) and
+  by count (the newest 1,024 a machine), not by the agent's `KEPT`.
 - **A restarted gateway** has an empty table and fills it as the agents
-  reconnect and report.
-- **A restarted agent** asks the gateway, once connected, for the runs it was
-  handed and has not started. They go back into its queue. Its runners it has
-  found itself (§3).
+  reconnect and report. What it loses is the ended runs the agents no longer
+  hold.
+- **A restarted agent** takes back, once its report is merged, the runs the
+  table holds for its node as queued and that it neither queued nor adopted
+  (§3, step 2).
 
 Each side is the copy the other rebuilds from. Only a restart of both
 together, while a run was queued and not started, loses that run.
@@ -136,17 +174,32 @@ That agent:
 1. collects the outcome from the runner;
 2. for a deploy, asks its own machine's keep for the trial (below);
 3. reports the end to the gateway;
-4. tells the runner `delivered` once the caller has it. A caller that has
-   gone tells it nothing, and the runner holds its outcome until the day is
-   up.
+4. tells the runner `delivered` once the outcome is kept where the caller
+   reads it. Until then the runner holds it, so an agent that restarts
+   between any two of these steps does them again from the runner. Each step
+   is safe to do twice. An outcome no caller ever takes is held until the
+   day is up.
 
-What "the caller has it" means depends on who asked:
+Where the outcome is kept, and so when `delivered` is said, depends on who
+asked:
 
-| Caller | How it is told |
-|---|---|
-| a deploy | the trial keep starts is the next step. The agent asks for it, so no zend member has to be alive (cause 3). `delivered` follows the trial being accepted |
-| `repo_job_start`, `job_status` | the handle is unchanged across every restart. `job_status` answers from the gateway's table and the agent; a caller waiting when the agent restarted is answered once the adopting agent reports the end |
-| `run_command` inside a turn of Zen's | the run's id is derived from the call, `hash(conversation, turn, call)`. A turn resumed after a motherd restart (`zend::tools::Dispatch::Resumed`) asks the agent for the run by that id, instead of refusing the call as not replayable. A run still going is waited on. A run that ended while motherd was down has its outcome handed back and its deltas recorded in the conversation's store, and the turn carries on as if nothing had happened. `run_command`'s replay rule changes to that |
+| Caller | Kept where | `delivered` once |
+|---|---|---|
+| a deploy | keep's board, under the deploy's handle. The agent asks for the trial, so no zend member has to be alive (cause 3) | keep's board names the handle, as running or ended |
+| `repo_job_start`, `job_status` | the gateway's table. The handle is unchanged across every restart; a caller waiting when the agent restarted is answered once the adopting agent reports the end | the gateway has merged the end |
+| `run_command` inside a turn of Zen's | the turn's own record of the call's result in the substrate | zend has written the result. A turn resumed after a motherd restart (`zend::tools::Dispatch::Resumed`) asks the agent for the run by its id (below) instead of refusing the call: a run still going is waited on; a run that ended while motherd was down has its outcome handed over and its deltas recorded in the conversation's store, and the turn carries on. An id no agent holds was never started, and the call runs |
+
+**A `run_command`'s run id is derived from the call**, so a resumed turn can
+name it without any record: `hash(conversation, turn, call index)`, written in
+the shape every job id has (11 characters, the last one of 16,
+`tool_constraints.yaml`). `zend_tools::Replay` gains `Reattach` beside `Safe`
+and `Unsafe` for a tool whose call, resumed, is joined to what it already
+started.
+
+**keep answers a trial asked twice with the trial it has.** `/trial` with a
+deploy handle that its board already names, running or ended, answers that
+trial and starts nothing. A second ask after an agent restart is then
+harmless, where today it would try the artifact again.
 
 **The deploy handoff.** A `RunJob` that is a deploy says so: `deploy:
 Option<String>` names the service. keep's local port (`127.0.0.1:8092`) gets
@@ -177,9 +230,11 @@ read from the gateway's table (§5) and keep's board:
 | a commit whose build failed, or whose trial was rolled back | no |
 | anything else, including a commit whose run was lost (§2) | yes |
 
-The webhook and the once-a-minute watch send the same body, `{repo}`. A
-gateway restart forgets failed commits until the agents report again, so it
-cannot retry a failed build blindly. Cause 5 is gone.
+The webhook and the once-a-minute watch send the same body, `{repo}`. An
+agent's restart no longer forgets a failed build, because the table keeps it
+(§5). A gateway restart does forget it, so a commit whose build failed before
+the gateway restarted is built once more. A rolled-back trial is still on
+keep's board. Cause 5 is gone.
 
 ## 8. Related: the game runs from the agent's build checkout
 
@@ -200,10 +255,14 @@ request.
 
 ## 9. To settle while building it
 
-- **The runner's executable.** An agent's install replaces its own binary
-  (`cluster::upgrade`). A runner must run from a file the install does not
-  touch, a copy under the build it came from, and the pipe's messages must stay
-  readable by the next build's agent, as saved records do.
+- **The pipe across builds.** A runner started by one build is adopted by the
+  next build's agent, so the pipe's messages must stay readable by old and new
+  binaries, as saved records do. The `tokera-runner` copy (§3) must be part of
+  every build that carries an agent, `motherd` included
+  (`docs/replicated_substrate.md` §3.9).
+- **Global names.** A `Global\` mutex needs `SeCreateGlobalPrivilege` outside
+  session 0. keep runs its services from a scheduled task. Confirm the session
+  they run in before choosing `Global\` or `Local\`.
 - **Deltas held in a runner.** A run's captured deltas stay in its runner's
   memory until delivered. A run that rewrites a large tree holds that much for
   up to a day. The bound is the store's own limit on what a run may change.
@@ -222,9 +281,9 @@ it does not.
 
 | Step | Crates | Tests beside the code |
 |---|---|---|
-| §3 runner | `agent`, `zend-vfs` | a run started by one `Jobs` and adopted by a second one after the first is dropped ends with the same outcome; cancelling an adopted run kills its command and puts the checkout back; a runner exits once delivered |
+| §3 runner | `agent`, `zend-vfs` | a run started by one `Jobs` and adopted by a second one after the first is dropped ends with the same outcome; cancelling an adopted run kills its command and puts the checkout back; a runner exits once delivered; a run both adopted and handed back by the gateway runs once; start-up setup and sweeps leave an adopted run's checkout alone |
 | §4 build slot | `agent` | two runs on two checkouts never hold the slot at once; a deploy waiting goes ahead of an earlier test; `slots_free` follows the slot |
-| §5 table | `cluster`, `agent` | an agent's report replaces its node's entries; a restarted gateway's table is refilled by reports; a restarted agent gets back its unstarted runs |
-| §6 finishing | `agent`, `keep`, `zend` | keep's local `/trial` lands on the board under the handle; an adopted deploy hands off once; a resumed `run_command` with a derived id receives an outcome that ended while it was down |
+| §5 table | `cluster`, `agent` | a report merges, and an ended run it leaves out stays; a restarted gateway's table is refilled by reports; a restarted agent gets back its unstarted runs |
+| §6 finishing | `agent`, `keep`, `zend`, `zend-tools` | keep's local `/trial` lands on the board under the handle, and asked again with the handle starts nothing; an adopted deploy hands off once; a resumed `run_command` with a derived id receives an outcome that ended while it was down, and one never started runs |
 | §7 due | `zend`, `web` | a failed build, a rolled-back trial and an installed commit are not due; a lost one is |
 | §8 live tree | `zend`, `keep`, configs | a proven trial moves the live tree; a site-only push builds nothing |
