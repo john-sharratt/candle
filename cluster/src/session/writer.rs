@@ -145,7 +145,7 @@ mod tests {
     /// Windows, over a second for these.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn catchup_frames_go_as_fast_as_the_reader_takes_them() {
-        const FRAMES: usize = 64;
+        const FRAMES: usize = (64 << 20) / CATCHUP_LOW_WATER;
         let (a, mut b) = pair(2 * CATCHUP_LOW_WATER + 64);
         let (commands, rx) = unbounded_channel();
         let gauges = Arc::new(Gauges::default());
@@ -166,7 +166,7 @@ mod tests {
         let took = started.elapsed();
         assert!(
             took < Duration::from_millis(400),
-            "{FRAMES} MiB of catch-up took {took:?}"
+            "64 MiB of catch-up in {FRAMES} frames took {took:?}"
         );
         drop(commands);
         writer.await.unwrap();

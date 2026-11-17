@@ -125,7 +125,10 @@ mod room_tests {
         assert_eq!(room_for(ROOM_UNIT + 1), 2);
         assert_eq!(room_for(59 * 1024), 59);
         assert_eq!(room_for(ARRIVALS_CAP * 4), ROOM_PERMITS as u32);
-        assert_eq!(ROOM_PERMITS, 131_072, "twice a 64 MiB fetch window, in KiB");
+        assert_eq!(
+            ROOM_PERMITS, 1_048_576,
+            "twice a 512 MiB fetch window, in KiB"
+        );
     }
 
     /// **Replication is busy while a catch-up runs or a quarter of the budget

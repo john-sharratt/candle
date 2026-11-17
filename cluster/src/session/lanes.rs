@@ -27,8 +27,9 @@ use crate::frame::{Event, Frame};
 /// The socket's unsent bytes under which catch-up frames may go (§7.4). A
 /// live event queued behind catch-up waits for at most this much to drain —
 /// with small records, tens of thousands of frames — so it is kept to what
-/// keeps a link busy, not more.
-pub const CATCHUP_LOW_WATER: usize = 1 << 20;
+/// keeps a link busy, not more: 8 MiB is some seven milliseconds of a 10 Gbit
+/// link, where 1 MiB handed the socket a megabyte a wake-up.
+pub const CATCHUP_LOW_WATER: usize = 8 << 20;
 
 /// An event waiting to go, as its fragments, and who to tell the session
 /// frame number its last fragment went out as.

@@ -31,9 +31,12 @@ use crate::frame::{Fetch, Headers};
 /// answerer's reads, the gateway hop and the spare-capacity gate — about
 /// 170 ms on `.5`, so 8 MiB moved ~46 MB/s, under half the LAN, and a member
 /// whose peer's npcd wrote faster than that could never close its gap (34 and
-/// 40 GB backlogs each way, 2026-10-17). Half the gateway's catch-up cap, so a
-/// window in flight never fills the lane on its own.
-pub const FETCH_WINDOW: u64 = 64 << 20;
+/// 40 GB backlogs each way, 2026-10-17). 64 MiB filled a 1 Gbit link and no
+/// more: on the machines' 10 Gbit cards WhiteWorld's 465 GB zend catch-up
+/// (2026-11-17) ran at ~100 MB/s, the receiving disk 93% idle. Half the
+/// gateway's catch-up cap, so a window in flight never fills the lane on its
+/// own.
+pub const FETCH_WINDOW: u64 = 512 << 20;
 
 /// The most bytes one `FETCH` asks for: a sixteenth of the window.
 ///
