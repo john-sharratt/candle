@@ -1,13 +1,16 @@
-# Builds that outlive a restart
+# Builds that are never cut short by a planned restart
 
 A build is the slow part of every deploy, and today almost anything that
-restarts a process on its machine kills it. This document is the design that
-keeps every run (a build, a test) going through a restart of the agent, of
-motherd or of the gateway. It finishes what each run was for and tells its
-caller, after a delay if the caller was the process that restarted. It runs
-one build at a time on each machine, with trials and deploys running
-alongside. It writes no state file: the state is held by processes that do not
-restart together, and each one rebuilds from the others.
+restarts a process on its machine kills it. This document is the design
+that stops a planned restart from ever killing a build. A planned restart
+waits for the build that is running, holds back the ones queued behind it,
+and lets them start once the new process is up. It also runs one build at a
+time on each machine, hands a finished build to keep without depending on any
+zend member, and counts a commit as tried only once it came to something.
+
+A crash or a reboot still kills the build that is running. Nothing resumes it.
+Its run ends `Interrupted`, and the next push watch builds the commit again
+(§7).
 
 `docs/jobs.md` §2 and §6 and `docs/battlecities_app.md` §4.2–§4.4 describe
 the path as it is built today. Each one changes as the step that touches it
@@ -22,219 +25,177 @@ again until someone started it by hand. The causes, as the code stands:
 
 | # | Cause | Where |
 |---|---|---|
-| 1 | **A run is a child of the agent, and the agent runs inside motherd.** A motherd trial, restart or rollout ends the process. Its commands are spawned `kill_on_drop` inside a Windows job object, so they end with it. | `host/src/cluster/mod.rs` `start_agent`; `zend-vfs/src/sandbox/process.rs`, `kill_tree.rs` |
-| 2 | **Agents follow the floor.** Once a motherd build is certified, the gateway closes every agent below it, and each agent installs the new build. An agent waits `JOBS_WAIT` (60 s) for its jobs, then kills them. A standalone agent loses its builds the same way. | `cluster/src/gateway/hub.rs` `set_floor`; `agent/src/install.rs` `jobs_ended` |
+| 1 | **A run dies with the agent, and the agent runs inside motherd.** The agent holds the job object each command runs in, and closing the agent closes the job, which kills the command. Every motherd trial, restart and rollout closes the agent. | `host/src/cluster/mod.rs` `start_agent`; `zend-vfs/src/kill_tree.rs` `Tree::drop` |
+| 2 | **No planned restart looks for running builds.** keep switches, restarts and stops a service without asking whether it is building. A certified install drains the process, releases its substrate and closes its sockets, then asks keep to switch (`cluster/src/upgrade/handoff.rs`), with no step that waits for builds. A standalone agent's install waits `JOBS_WAIT` (60 s), then kills them. | `keep/src/main.rs`, `keep/src/remote.rs`; `agent/src/install.rs` `jobs_ended` |
 | 3 | **The handoff to keep lives in one zend member's memory.** A task in the member that took `service_deploy` waits for the build, then asks keep for the trial. If that member restarts first, the build ends and no trial is ever asked for. | `zend/src/mcp/tools/service/deploy.rs` `drive` |
-| 4 | **The agent's job table is in memory.** After a restart nothing is queued or re-run, and a handle from before the restart is not found. | `agent/src/jobs.rs` `Jobs::table` |
+| 4 | **The agent's queue and job table are in memory.** After a restart a queued run is gone, and a handle from before the restart is not found. | `agent/src/jobs.rs` `Jobs::table` |
 | 5 | **A started deploy counts as tried.** The gateway records the commit as soon as the member answers that it started a deploy. The once-a-minute watch then sends that commit as `attempted`, and the member does nothing. A killed build is never retried. The record is also in the gateway's memory, so a gateway restart retries even a commit that really failed. | `web/src/hooks/pushes.rs` `Told`, `tell`; `zend/src/mcp/tools/service/on_push.rs` `due` |
-| 6 | **Nothing limits a machine to one build at a time.** The only lock is per checkout, so a candle build and a battle-cities build run side by side. The agent file's `slots: 4` is reported to the gateway but not enforced as a build limit. | `zend-vfs/src/sandbox/mod.rs`; `agent/src/jobs.rs` `slots` |
+| 6 | **Nothing limits a machine to one build at a time.** The only lock is per checkout (a `tokio::sync::Mutex`, `zend-vfs/src/sandbox/mod.rs`), so a candle build and a battle-cities build run side by side. The agent file's `slots: 4` is reported to the gateway but not enforced as a build limit. | `agent/src/jobs.rs` `slots` |
 
-## 2. Who holds what
+## 2. The build gate
 
-| What | Held by | Survives a restart of | Rebuilt from |
-|---|---|---|---|
-| A run that has started: its request, its checkout, its command, its outcome until collected | **its runner** (§3), a process of its own | the agent, motherd, the gateway | — |
-| A run accepted but not started yet | **the gateway** | the agent, motherd | the agent's copy (§5) |
-| The cluster's view of every run: where it is, how it ended | **the gateway** | the agent, motherd | the agents' reports on reconnect (§5) |
-| A trial, and how it ended | **keep** (its board) | the agent, motherd, the gateway | — |
+Each machine has one **build gate**: two named mutexes, a turnstile and a
+slot. The OS releases a mutex its holder dies holding (it is abandoned, and
+the next waiter gets it), so no crash leaves the gate shut. No file records
+it. On Windows they are `tokera-build-turnstile` and `tokera-build-slot` in
+the namespace keep's services share (§9).
 
-A machine that reboots, or a gateway and an agent restarting together while a
-run was still queued, loses what was in flight. The next push watch (§7)
-builds the commit again.
+- **A run passes the gate to start.** It takes the turnstile, then the slot,
+  then lets the turnstile go at once. It holds the slot until its command has
+  ended and its output is staged.
+- **A restart shuts the gate.** It takes the turnstile and keeps it. A run
+  can then no longer get through, so every run accepted from that moment
+  waits in the queue. The restart then waits for the slot, which it gets once
+  the run holding it ends. It holds both until it is done.
 
-## 3. The runner
+The turnstile is what lets a restart get in ahead of the queue: without it, a
+restart waiting for the slot would compete with every queued run and could
+wait for ever.
 
-Every run gets a **runner**: `tokera-runner`, a small binary of the `agent`
-crate, started detached (`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
-CREATE_NO_WINDOW`, as keep starts its services, `keep/src/trial.rs`). A build
-dies today because the agent holds the job object its command runs in, and
-closing the agent closes the job (`zend-vfs/src/kill_tree.rs`, `Tree::drop`).
-The runner holds that job instead.
+A Windows mutex belongs to the thread that took it, and the agent runs its
+jobs on tokio's pool. So a gate is held by a thread of its own, which takes
+and gives back the mutexes when asked (`agent::gate`).
 
-A runner never runs from a file a switch replaces. The agent in motherd has
-no binary of its own: its executable is `keep/stable/motherd.exe`, which keep
-overwrites on every switch, and a running image cannot be overwritten on
-Windows. So each agent, as it starts, copies the `tokera-runner` of its own
-build into `jobs_dir/runners/<count>-<hash>/` and starts runners from there.
-A copy no runner is using is removed once its build is two behind.
+## 3. One build at a time on each machine
 
-The runner is the sandbox job, steps 1–9 of `zend_vfs::sandbox`. It moves out
-of the agent's process whole:
+Every run takes the slot (§2) after its fetch and its store are ready, and
+before its checkout is set aside. Pushes, fetches and listings never take it.
+Tests compile as much as builds do, and the timed test gate needs a quiet
+machine (`cargo test-server` on BlackWorld), so every run takes the slot.
 
-1. It reads its `RunJob` from stdin, overlay chains included, and keeps it in
-   memory. Its id is the run's id.
-2. It takes the checkout's lock, then the machine's build slot (§4). Both are
-   named OS mutexes, which the OS releases if the runner dies. This replaces
-   the sandbox's in-process lock (a `tokio::sync::Mutex`,
-   `zend-vfs/src/sandbox/mod.rs`), because a runner and a restarted agent
-   are now different processes looking at one checkout.
-3. It sets aside, materializes, runs, captures and puts back, as the sandbox
-   does today. The command runs in a job object the runner holds, so
-   cancelling a run is one kill of the runner's job, and a runner that
-   crashes takes its command with it. A crash part way is recovered by the
-   set-aside journal that already exists (`zend_vfs::checkout::preserve`).
-4. It writes its output to the run's log, as the sandbox does now, and stages
-   what it built (`Jobs::stage`).
-5. It keeps its outcome (exit code, changed files as deltas, what it staged)
-   and serves it on a named pipe, `\\.\pipe\tokera-run-<id>`, until an agent
-   tells it the outcome has been delivered (§6). It exits then, or after a
-   day undelivered.
-
-The pipe answers: what the run is (its `RunJob` without the chains, its phase
-and times), the log's path, the outcome once there, `cancel`, and `delivered`.
-The pipe's DACL admits the agent's own account alone, and an agent believes a
-pipe only when its server process is a `tokera-runner` from its runners folder
-(`GetNamedPipeServerProcessId`).
-
-**An agent adopts its runners when it starts, before anything else touches a
-checkout.** In this order:
-
-1. It lists the pipes named `tokera-run-*`, asks each one what it is, and
-   puts it in its job table under the run's own id, so every handle from
-   before the restart still names it. No file records which runners exist:
-   the runner itself is the record.
-2. It joins the gateway and reports (§5), then takes back the runs it was
-   handed and had not started. A run whose id it adopted in step 1 is not
-   queued again, so a run that started just before a restart never runs twice.
-3. Only then does it run its start-up work on the checkouts no adopted runner
-   holds: each checkout's declared setup (`Jobs::set_up`), the stale git lock
-   sweep (`stale_locks`, which already spares a lock whose git still runs) and
-   the disk sweep (`sweep`, which counts adopted runs as holding their
-   checkout's `target`).
-
-Every read of a run in `Jobs` goes through the checkout's in-process job
-server today (`view`, `tail`, `log`, `holding` call `server.query_job`). They
-read the runner instead, through its pipe and its log file, for a run the
-agent started and for one it adopted alike: one path, not two.
-
-`JOBS_WAIT` goes: an installing agent leaves its runners running and adopts
-them on the new build. Causes 1, 2 and 4 are gone for every run that has
-started.
-
-## 4. One build at a time on each machine
-
-The build slot is a named mutex for the whole machine,
-`Global\tokera-build-slot`. A runner takes it after its checkout lock and
-before it sets the checkout aside, and lets go once it has staged its output.
-Pushes, fetches and listings never take it. Tests compile as much as builds
-do, and the timed test gate needs a quiet machine (`cargo test-server` on
-BlackWorld), so every run takes it.
-
-An agent starts a runner only when the slot is free. A run accepted while the
-slot is taken waits in the agent's queue as `Phase::Waiting {behind}`, naming
-the run that holds the slot. Deploys (§6) go first, then other runs in the
-order they came. A running build is never preempted.
-
-- The agent reports `slots_free` as 1 when nothing holds the slot or waits for
-  it, and 0 otherwise. The gateway already sends a run that names no machine
-  to an agent with a free slot (`cluster/src/gateway/agents.rs`), so a
-  worker's test goes to another machine while BlackWorld builds. A deploy
-  names its machine and waits its turn.
+- A run waiting for the slot is `Phase::Waiting {behind}`, naming the run that
+  holds it. A run held back by a shut gate is `Phase::Held {by}`, naming the
+  restart.
+- The agent decides the order the waiting runs go through the gate: deploys
+  (§5) first, then other runs in the order they came. A running build is
+  never preempted.
+- The agent reports `slots_free` as 1 when the slot is free and nothing waits,
+  and 0 otherwise. The gateway already sends a run that names no machine to
+  an agent with a free slot (`cluster/src/gateway/agents.rs`), so a worker's
+  test goes to another machine while BlackWorld builds. A deploy names its
+  machine and waits its turn.
 - `slots:` leaves the agent file.
 
-**Trials run alongside.** A trial is keep's process. Once a deploy's runner
-has staged its build and the agent has asked keep for the trial (§6), the slot
-is free for the next build. A Battle Cities trial, which spends minutes
-loading its world, runs while the next candle build compiles.
+## 4. Who shuts the gate
 
-## 5. The gateway's table, rebuilt both ways
+Every planned restart of a process that runs builds shuts the gate first. It
+shuts it before it does anything that stops the process serving, so a member
+is never drained while it waits for a build.
 
-A run that finds no free slot queues on an agent, never in the gateway
-(`cluster/src/gateway/agents.rs`): the agent holds its queue. The gateway now
-keeps a table of every run it handed out, by `(node, id)`: its request without
-the chains, its machine, its base commit, its phase, and how it ended once it
-has. It serves the cluster's reads of runs (`job_status`, `job_list`,
-`pending::decide`, §7) without asking the agent. A log read still goes to the
-agent.
-
-- **On every connect, and on every change after, an agent reports its runs**:
-  the ones queued in it, the runners it holds, and the ones that ended.
-- **A report merges into the table; it never replaces it.** A run the report
-  names takes the report's state. A run in the table that the report leaves
-  out is left as it is: an unstarted one is a run the agent lost, and it is
-  handed back (below). An ended one stays as the record of how it ended (§7),
-  however many agent restarts later. Ended runs are kept by age (30 days) and
-  by count (the newest 1,024 a machine), not by the agent's `KEPT`.
-- **A restarted gateway** has an empty table and fills it as the agents
-  reconnect and report. What it loses is the ended runs the agents no longer
-  hold.
-- **A restarted agent** takes back, once its report is merged, the runs the
-  table holds for its node as queued and that it neither queued nor adopted
-  (§3, step 2).
-
-Each side is the copy the other rebuilds from. Only a restart of both
-together, while a run was queued and not started, loses that run.
-
-## 6. Finishing the run, and telling its caller
-
-When a runner's command ends, its run is finished by whichever agent holds it
-then: the one that started it, or the one that adopted it after a restart.
-That agent:
-
-1. collects the outcome from the runner;
-2. for a deploy, asks its own machine's keep for the trial (below);
-3. reports the end to the gateway;
-4. tells the runner `delivered` once the outcome is kept where the caller
-   reads it. Until then the runner holds it, so an agent that restarts
-   between any two of these steps does them again from the runner. Each step
-   is safe to do twice. An outcome no caller ever takes is held until the
-   day is up.
-
-Where the outcome is kept, and so when `delivered` is said, depends on who
-asked:
-
-| Caller | Kept where | `delivered` once |
+| Restart | Who shuts the gate | When it opens |
 |---|---|---|
-| a deploy | keep's board, under the deploy's handle. The agent asks for the trial, so no zend member has to be alive (cause 3) | keep's board names the handle, as running or ended |
-| `repo_job_start`, `job_status` | the gateway's table. The handle is unchanged across every restart; a caller waiting when the agent restarted is answered once the adopting agent reports the end | the gateway has merged the end |
-| `run_command` inside a turn of Zen's | the turn's own record of the call's result in the substrate | zend has written the result. A turn resumed after a motherd restart (`zend::tools::Dispatch::Resumed`) asks the agent for the run by its id (below) instead of refusing the call: a run still going is waited on; a run that ended while motherd was down has its outcome handed over and its deltas recorded in the conversation's store, and the turn carries on. An id no agent holds was never started, and the call runs |
+| keep's switch or trial of a service that runs builds (`motherd` on BlackWorld and WhiteWorld, `agent` on AlienWorld) | keep, before it stops the old process | the trial is proven or rolled back, or the switch has started the new process |
+| keep's `/restart`, `/stop` of such a service | keep, before it stops it | the service is started again, or for `/stop` when it is started |
+| a certified install (`cluster::upgrade`) | the installing process, before it drains | the process exits; the OS releases the gate it held |
+| a standalone agent's install | the agent, before it closes its sockets | the process exits |
 
-**A `run_command`'s run id is derived from the call**, so a resumed turn can
-name it without any record: `hash(conversation, turn, call index)`, written in
-the shape every job id has (11 characters, the last one of 16,
-`tool_constraints.yaml`). `zend_tools::Replay` gains `Reattach` beside `Safe`
-and `Unsafe` for a tool whose call, resumed, is joined to what it already
-started.
+- keep's file marks the services that run builds: `builds: true` on the
+  service in `keep/keep.yaml` and its siblings. A trial or restart of any
+  other service never waits. A Battle Cities trial, which spends minutes
+  loading its world, runs while a candle build compiles.
+- **An install hands its held gate to keep.** It posts the switch with
+  `x-tokera-gate-held: 1`, saying it holds the gate and will let go by
+  exiting. keep, which would otherwise wait for a gate that the process it
+  is about to stop holds, takes the gate as the old process exits, and holds
+  it until the new process has started, so no run starts in the gap.
+- `JOBS_WAIT` goes. A standalone agent's install is the table's last row.
+- **A gate is shut for as long as a build has left to run, and no longer.**
+  Whoever shuts it waits for the slot at most the running run's remaining
+  timeout. A run that has not ended by then is killed by its own timeout
+  anyway. A person who wants the restart now sends `x-tokera-skip-gate: 1`,
+  which kills the running build. The cluster's install sends `FORCE_HEADER`,
+  which skips keep's refusals (`keep/src/guard.rs`) but not the gate.
 
-**keep answers a trial asked twice with the trial it has.** `/trial` with a
-deploy handle that its board already names, running or ended, answers that
-trial and starts nothing. A second ask after an agent restart is then
-harmless, where today it would try the artifact again.
+**A build cannot hold up the restart that would deploy it.** A deploy's run
+gives the slot back once its output is staged, before it asks keep for the
+trial (§5). The trial then shuts the gate behind it, and the runs queued
+after it wait for the trial.
 
-**The deploy handoff.** A `RunJob` that is a deploy says so: `deploy:
-Option<String>` names the service. keep's local port (`127.0.0.1:8092`) gets
-`POST /trial {service, artifact, deploy}`, which is what the cluster route
-`/v1/keep/trial` takes (`keep/src/remote.rs`). The trial goes on keep's board
-under the deploy's handle `deploy:<node>:<id>`, which the agent writes from
-its node and the run's id, exactly as `service_deploy` answered. keep's check
-that the artifact was built from a commit on `origin/main` still applies. The
-run records what came of the handoff (`JobView::tried`: asked, or refused with
-keep's reason), so `job_status` on a refused trial says why. `deploy.rs`
-`drive` and its `tokio::spawn` are removed. For a motherd deploy,
-`connector_job` runs ahead of the daemon's build on the same agent, and the
-slot's order keeps the connector staged before the daemon's trial starts.
+**While a trial of motherd runs, no build starts on that machine.** The new
+process's agent is part of what is being tried. A build started in it would
+die if the trial were rolled back, which is exactly the restart this design
+exists to keep builds out of. Trials of every other service run alongside
+builds.
 
-A build that finishes while motherd is restarting waits in its runner until
-the new motherd's agent adopts it. It then reaches keep, minutes late and
-otherwise as if nothing had happened.
+## 5. The agent hands the build to keep
+
+A `RunJob` that is a deploy says so: `deploy: Option<String>` names the
+service. When such a run exits 0, the agent stages the binary, gives back the
+slot, reports the end to the gateway (§6), and asks its own machine's keep for
+the trial.
+
+- keep's local port (`127.0.0.1:8092`) gets `POST /trial {service, artifact,
+  deploy}`, which is what the cluster route `/v1/keep/trial` takes
+  (`keep/src/remote.rs`). The trial goes on keep's board under the deploy's
+  handle `deploy:<node>:<id>`, which the agent writes from its node and the
+  run's id, exactly as `service_deploy` answered. keep's check that the
+  artifact was built from a commit on `origin/main` still applies.
+- **A trial asked twice is answered with the trial keep has.** `/trial` with a
+  deploy handle its board already names, running or ended, starts nothing.
+- The run records what came of the handoff (`JobView::tried`: asked, or
+  refused with keep's reason), so `job_status` on a refused trial says why.
+- `deploy.rs` `drive` and its `tokio::spawn` are removed. `service_deploy`
+  submits the build with `deploy` set and answers as it does now. A zend
+  restart no longer touches a deploy. Cause 3 is gone.
+- For a motherd deploy, `connector_job` runs ahead of the daemon's build on
+  the same agent, and the gate's order keeps the connector staged before the
+  daemon's trial starts.
+
+A motherd trial restarts the agent that built it. The run's end is already
+in the gateway's table, and from then on the deploy is followed on keep's
+board (`service::resolve`, `service::trial_in`), as it is today.
+
+## 6. The gateway's table
+
+A run that finds no free slot queues on its agent, never in the gateway
+(`cluster/src/gateway/agents.rs`): the agent holds the queue. The gateway
+keeps a table of every run it handed out, by `(node, id)`: its request
+without the overlay's chains, its machine, its base commit, its phase, and
+how it ended once it has. It serves the cluster's reads of runs
+(`job_status`, `job_list`, `pending::decide`, §7) without asking the agent. A
+log read still goes to the agent.
+
+- **An agent reports its runs on every connect and on every change**: the
+  ones queued in it, the one running, and the ones that ended.
+- **A report merges into the table; it never replaces it.** A run the report
+  names takes the report's state. A run in the table that a report leaves out
+  is left as it is, unless the report is the first from a new process of that
+  agent:
+  - a run the table holds as queued is handed back to the agent and queued
+    again, under its own id. The agent's queue was lost with the old process;
+  - a run the table holds as running ends `Interrupted`, "the agent
+    restarted". A planned restart never leaves one (§4). A crash does.
+- Ended runs stay as the record of how they ended (§7), however many agent
+  restarts later: kept by age (30 days) and by count (the newest 1,024 a
+  machine), not by the agent's `KEPT`.
+- A restarted gateway has an empty table. It fills it as the agents
+  reconnect and report, and loses only the ended runs the agents no longer
+  hold.
+
+A run queued when its agent restarts starts on the new process, under the
+same handle, and a caller waiting on it with `job_status` is answered as if
+nothing happened. Only a restart of both the agent and the gateway, while a
+run was queued, loses that run. A run handed back but overlaid with chains
+the new process lacks is refused as `JobError::Missing` is today, and its
+caller sends them again.
 
 ## 7. Tried means it came to something
 
 The gateway's `Told` and the `attempted` field go. Whether a commit is due is
-read from the gateway's table (§5) and keep's board:
+read from the gateway's table (§6) and keep's board:
 
 | Origin's `main` is | due? |
 |---|---|
 | the commit the installed binary was built from (keep's state) | no |
 | a commit a deploy is under way for: a run in the table, or a trial on keep's board | no: that deploy is watched (`pending::decide`) |
 | a commit whose build failed, or whose trial was rolled back | no |
-| anything else, including a commit whose run was lost (§2) | yes |
+| anything else, including a commit whose run ended `Interrupted` or was lost | yes |
 
-The webhook and the once-a-minute watch send the same body, `{repo}`. An
-agent's restart no longer forgets a failed build, because the table keeps it
-(§5). A gateway restart does forget it, so a commit whose build failed before
-the gateway restarted is built once more. A rolled-back trial is still on
-keep's board. Cause 5 is gone.
+The webhook and the once-a-minute watch send the same body, `{repo}`. A build
+killed by a crash is built again by the next watch. A gateway restart forgets
+a failed build, so a commit whose build failed before the gateway restarted is
+built once more. A rolled-back trial is still on keep's board. Cause 5 is
+gone.
 
 ## 8. Related: the game runs from the agent's build checkout
 
@@ -255,35 +216,27 @@ request.
 
 ## 9. To settle while building it
 
-- **The pipe across builds.** A runner started by one build is adopted by the
-  next build's agent, so the pipe's messages must stay readable by old and new
-  binaries, as saved records do. The `tokera-runner` copy (§3) must be part of
-  every build that carries an agent, `motherd` included
-  (`docs/replicated_substrate.md` §3.9).
-- **Global names.** A `Global\` mutex needs `SeCreateGlobalPrivilege` outside
-  session 0. keep runs its services from a scheduled task. Confirm the session
-  they run in before choosing `Global\` or `Local\`.
-- **Deltas held in a runner.** A run's captured deltas stay in its runner's
-  memory until delivered. A run that rewrites a large tree holds that much for
-  up to a day. The bound is the store's own limit on what a run may change.
+- **The mutexes' namespace.** A `Global\` name needs `SeCreateGlobalPrivilege`
+  outside session 0, and a `Local\` name is per session. keep and the services
+  it starts must name the same objects. Confirm the session keep's scheduled
+  task runs them in, and choose the prefix from that.
 - **Other platforms.** The agent also builds for Linux
-  (`cluster/src/upgrade/runtime/fetch.rs`). There the pipe is a Unix socket in
-  the runtime directory and the mutexes are `flock`s, released the same way
-  when the process dies.
+  (`cluster/src/upgrade/runtime/fetch.rs`). There the gate is two `flock`s,
+  which the kernel releases when the holder dies.
 
 ## 10. Landing it
 
 Everything is in candle. It takes effect once deployed: keep on each machine
-(`/exit` onto the new `keep.exe`), a motherd deploy (the agent and the
-runners), and the gateway (the table, `Told` removed). The first motherd
-deploy of it still kills the builds the old agent is running. Every one after
-it does not.
+(`/exit` onto the new `keep.exe`), a motherd deploy, and the gateway. The
+motherd deploy that brings it is the last planned restart that can kill a
+build: the old process has no gate to shut.
 
 | Step | Crates | Tests beside the code |
 |---|---|---|
-| §3 runner | `agent`, `zend-vfs` | a run started by one `Jobs` and adopted by a second one after the first is dropped ends with the same outcome; cancelling an adopted run kills its command and puts the checkout back; a runner exits once delivered; a run both adopted and handed back by the gateway runs once; start-up setup and sweeps leave an adopted run's checkout alone |
-| §4 build slot | `agent` | two runs on two checkouts never hold the slot at once; a deploy waiting goes ahead of an earlier test; `slots_free` follows the slot |
-| §5 table | `cluster`, `agent` | a report merges, and an ended run it leaves out stays; a restarted gateway's table is refilled by reports; a restarted agent gets back its unstarted runs |
-| §6 finishing | `agent`, `keep`, `zend`, `zend-tools` | keep's local `/trial` lands on the board under the handle, and asked again with the handle starts nothing; an adopted deploy hands off once; a resumed `run_command` with a derived id receives an outcome that ended while it was down, and one never started runs |
-| §7 due | `zend`, `web` | a failed build, a rolled-back trial and an installed commit are not due; a lost one is |
+| §2 gate | `agent` | a run cannot pass a shut gate; a gate whose holder thread is gone is free again; a restart shutting the gate gets the slot ahead of runs queued after it |
+| §3 one build | `agent` | two runs on two checkouts never hold the slot at once; a deploy waiting goes ahead of an earlier test; `slots_free` follows the slot |
+| §4 restarts | `keep`, `cluster`, `agent` | keep's restart of a `builds: true` service waits for a running run and starts none until the service is back; one of another service does not wait; an install shuts the gate before it drains; `x-tokera-gate-held` makes keep take the gate as the old process exits; `x-tokera-skip-gate` does not wait; `FORCE_HEADER` alone still waits |
+| §5 handoff | `agent`, `keep`, `zend` | keep's local `/trial` lands on the board under the handle, and asked again with the handle starts nothing; a deploy run gives back the slot before it asks keep; a refusal is recorded on the run |
+| §6 table | `cluster`, `agent` | a report merges, and an ended run it leaves out stays; a new process's first report gets back its queued runs and ends its running one `Interrupted`; a restarted gateway's table is refilled |
+| §7 due | `zend`, `web` | a failed build, a rolled-back trial and an installed commit are not due; an interrupted or lost one is |
 | §8 live tree | `zend`, `keep`, configs | a proven trial moves the live tree; a site-only push builds nothing |
