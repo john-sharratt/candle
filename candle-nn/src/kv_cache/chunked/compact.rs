@@ -279,7 +279,7 @@ pub struct CompactionTally {
     pub wave_in_flight: u64,
     /// Refused because a hot→warm migrate was acting on captured chunk addresses.
     pub migrate_in_flight: u64,
-    /// Refused because every pool was already gapless — the expected refusal.
+    /// Refused because no pool had an arena a pack could empty — the expected refusal.
     pub already_packed: u64,
     /// Refused because a step of the pass failed: claims, copy, barrier, or either
     /// side of the rewrite. Any non-zero reading is a defect, and the `tracing`
@@ -373,9 +373,9 @@ pub enum CompactionRefused {
     MigrateInFlight,
     /// Not a CUDA device, or no reservation yet.
     NoDevice,
-    /// Every pool is already gapless from its lowest arena — the planner had nothing
-    /// to propose. The only *expected* refusal, and the only one that is not a
-    /// defect.
+    /// No pool has an arena a pack could empty — the planner had nothing to propose,
+    /// since a move that empties no arena releases nothing (`compact_plan::pack_moves`).
+    /// The only *expected* refusal, and the only one that is not a defect.
     ///
     /// **Separated from the failures below because one label for all of them cost a
     /// whole diagnostic cycle.** A tally reading `nothing_to_do=38` over 41 attempts

@@ -6,10 +6,14 @@
 //! One size class's arenas, laid end to end in physical address order, are one
 //! flat sequence of equal-sized slots. A pass walks that sequence from the left,
 //! and every time it finds a gap it fills it with the **last** live chunk on the
-//! right. When the two cursors meet, the live chunks occupy a gapless prefix and
-//! every slot above them is free — so the class is packed to the lowest physical
-//! address it can reach, and `release_empty_arenas` can hand back every arena
-//! that has fallen out of the prefix.
+//! right. When the two cursors meet, every arena above the one they met in is
+//! empty — so the class holds the fewest, lowest regions it can, and
+//! `release_empty_arenas` can hand back every arena above the meeting point.
+//!
+//! The arena the cursors meet in stays live whatever is moved out of it, so a
+//! finished walk moves nothing out of it ([`pack_moves`]): its gaps cost no
+//! region, and filling them is copy work that buys nothing. Perfect is measured
+//! in regions, which is what the frontier is made of, not in slots.
 //!
 //! That is the property the partition actually needs. `live_watermark()` — the
 //! floor the wave transient tier must stand above, and so what bounds how far
@@ -29,11 +33,11 @@
 //! # Minimality
 //!
 //! The two-cursor walk moves each relocated chunk **once**, and it relocates a
-//! chunk only if that chunk sits above the final packed frontier. Both are
-//! forced: any pass that reaches a gapless prefix must vacate every occupied slot
-//! above the frontier, and no such chunk needs a second move because its
-//! destination is free before it is written. So the move count this produces is
-//! the minimum for a perfect pack — which is worth stating because the first
+//! chunk only if that chunk sits in an arena the pack empties. Both are forced:
+//! any pass that releases those arenas must vacate every chunk in them, and no
+//! such chunk needs a second move because its destination is free before it is
+//! written. So the move count this produces is the minimum for a perfect pack —
+//! which is worth stating because the first
 //! attempt at address-ordered relocation on a prior branch moved 387,759 bands
 //! against a live population that needed roughly 884 moved, by ranking
 //! destinations on free space instead of address.
@@ -223,9 +227,11 @@ pub struct SlotRun<'a> {
 /// stopped it first.
 ///
 /// Every move copies the highest occupied slot into the lowest free one, and names
-/// both by `(SlotRun::id, slot)`. See [`plan_pool`] for why this is the minimum move
-/// count for a perfect pack, and why a clipped walk is still sound — the pool that
-/// applies a prefix of these moves is strictly better packed than before it.
+/// both by `(SlotRun::id, slot)`. See the module documentation for why this is the
+/// minimum move count for a perfect pack, and why a clipped walk is still sound — the
+/// pool that applies a prefix of these moves is strictly better packed than before it.
+/// A walk that finishes drops the moves out of the arena it finished in, which stays
+/// live regardless ([`drop_moves_out_of_a_surviving_arena`]).
 ///
 /// **O(moves + arenas), not O(slots).** Both cursors walk the ascending `occupied`
 /// lists themselves: the right one steps down through occupied slots and never looks
@@ -327,7 +333,43 @@ pub fn pack_moves(order: &[SlotRun<'_>], max_moves: usize) -> (Vec<ChunkMove>, b
         ls += 1;
     }
 
+    if !clipped {
+        drop_moves_out_of_a_surviving_arena(order, &mut moves);
+    }
     (moves, clipped)
+}
+
+/// **A move that empties no arena saves nothing, so a finished walk does not make it.**
+///
+/// What a pack buys is regions: an arena hands its region back when its last chunk
+/// goes, and the frontier is the highest region still live. A walk that ends because
+/// its cursors met stops inside one arena, the lowest the right cursor reached, and
+/// that arena is still live afterwards — it keeps the chunks below the meeting point,
+/// or receives moves of its own. Every move *out of* it fills a lower gap and frees
+/// nothing: the same arenas empty, the same regions are released and the frontier
+/// falls to the same place without them. Measured on BlackWorld, passes moved
+/// 50,000–230,000 chunks to release a handful of 16 MiB regions, and at the 320 B
+/// rung a surviving arena alone holds up to 52,428 slots.
+///
+/// Only the last source arena can survive: every arena above it was walked from its
+/// top occupied slot to its bottom, and the left cursor, which places every
+/// destination, never passes the right one. Its moves are the plan's suffix, so what
+/// remains is still a prefix-safe plan. A clipped walk keeps them — it stopped on its
+/// budget, not on the pack, and the next pass carries the drain on from there.
+fn drop_moves_out_of_a_surviving_arena(order: &[SlotRun<'_>], moves: &mut Vec<ChunkMove>) {
+    let Some(last) = moves.last() else {
+        return;
+    };
+    let src = last.from.0;
+    let out = moves.iter().rev().take_while(|m| m.from.0 == src).count();
+    let population = order
+        .iter()
+        .find(|a| a.id == src)
+        .map_or(0, |a| a.occupied.len());
+    let receives = moves.iter().any(|m| m.to.0 == src);
+    if out < population || receives {
+        moves.truncate(moves.len() - out);
+    }
 }
 
 /// The whole of what fragmentation denies the weight side, in regions.
@@ -533,12 +575,15 @@ mod tests {
         }
     }
 
-    /// The defining property: after applying every move, the class's live chunks
-    /// occupy a gapless prefix of the rank-ordered slot sequence.
+    /// The defining property, in regions: after applying every move of a finished
+    /// plan, the live arenas are the shortest rank prefix whose slots hold the
+    /// population — every arena above it empty, every region a pack can release
+    /// released — and no move came out of an arena that is still live, since such
+    /// a move releases nothing.
     ///
     /// Asserted by simulation rather than by eyeballing the move list, because the
     /// property is about the end state and a plan that merely *looks* ordered can
-    /// still leave a hole.
+    /// still leave an arena live.
     fn assert_packed(arenas: &[ArenaSlots], plan: &CompactPlan) {
         let mut order: Vec<ArenaSlots> = arenas.to_vec();
         order.sort_unstable_by_key(|a| a.rank);
@@ -572,21 +617,34 @@ mod tests {
             "compaction must neither create nor destroy a chunk",
         );
 
-        // Walk the flat sequence: every occupied slot must precede every free one.
-        let mut seen_gap = false;
-        for a in &order {
-            for s in 0..a.capacity as u32 {
-                let occ = a.occupied.binary_search(&s).is_ok();
-                if occ && seen_gap && !plan.clipped {
-                    panic!(
-                        "arena {} (rank {}) slot {s} is live above a gap — not packed",
-                        a.arena_idx, a.rank,
-                    );
-                }
-                if !occ {
-                    seen_gap = true;
-                }
-            }
+        if plan.clipped {
+            return;
+        }
+        // The shortest rank prefix whose capacity holds every live chunk.
+        let mut held = 0usize;
+        let prefix = order
+            .iter()
+            .take_while(|a| {
+                let more = held < live_total;
+                held += a.capacity;
+                more
+            })
+            .count();
+        for (at, a) in order.iter().enumerate() {
+            assert!(
+                at < prefix || a.occupied.is_empty(),
+                "arena {} (rank {}) is live above the packed prefix of {prefix} arenas",
+                a.arena_idx,
+                a.rank,
+            );
+        }
+        for m in &plan.moves {
+            let src = order.iter().find(|a| a.arena_idx == m.from.0).unwrap();
+            assert!(
+                src.occupied.is_empty(),
+                "move {m:?} came out of arena {}, which is still live — it saved nothing",
+                m.from.0,
+            );
         }
     }
 
@@ -638,20 +696,75 @@ mod tests {
         assert_eq!(plan_pool(&arenas, gpu(), 0), None);
     }
 
-    /// A single arena still compacts internally: a gap at slot 0 under a live
-    /// chunk at slot 3 is exactly the case that pins a watermark inside one arena.
+    /// **A gap inside the arena that stays live is left.** One arena holding a
+    /// chunk at slot 3 over a free slot 0 keeps its region whatever is moved
+    /// inside it, so filling the gap is a copy that releases nothing.
     #[test]
-    fn one_arena_still_fills_its_own_gaps() {
+    fn an_arena_that_stays_live_does_not_fill_its_own_gaps() {
         let arenas = vec![arena(7, 0, 4, &[1, 3])];
-        let plan = plan_pool(&arenas, gpu(), 0).expect("slot 0 is a gap below slot 3");
+        assert_eq!(plan_pool(&arenas, gpu(), 0), None);
+    }
+
+    /// **The arena the cursors meet in is never a source**, and the arenas above it
+    /// still empty. Three 8-slot arenas holding 3, 6 and 2 chunks: eleven chunks
+    /// need two arenas, so the top one empties into the lowest gaps of the bottom
+    /// one, and the middle one — where the walk ends — keeps all six, gaps and all.
+    /// A full walk would have moved four more chunks out of it, releasing nothing.
+    #[test]
+    fn the_meeting_arena_keeps_its_chunks() {
+        let arenas = vec![
+            arena(0, 0, 8, &[0, 3, 5]),
+            arena(1, 1, 8, &[0, 2, 4, 5, 6, 7]),
+            arena(2, 2, 8, &[1, 6]),
+        ];
+        let plan = plan_pool(&arenas, gpu(), 0).expect("the top arena can be emptied");
         assert_packed(&arenas, &plan);
         assert_eq!(
             plan.moves,
-            vec![ChunkMove {
-                from: (7, 3),
-                to: (7, 0)
-            }],
+            vec![
+                ChunkMove {
+                    from: (2, 6),
+                    to: (0, 1)
+                },
+                ChunkMove {
+                    from: (2, 1),
+                    to: (0, 2)
+                },
+            ],
         );
+    }
+
+    /// **The same arenas empty with the drop as without it**, so the frontier falls
+    /// exactly as far: whatever the occupancy of three small arenas, the arenas
+    /// left live by the plan are the ones a gapless pack would leave live.
+    #[test]
+    fn dropping_the_meeting_arenas_moves_releases_the_same_arenas() {
+        const CAP: u32 = 3;
+        for mask in 0u32..(1 << (CAP * 3)) {
+            let slots = |a: u32| -> Vec<u32> {
+                (0..CAP)
+                    .filter(|s| mask & (1 << (s + a * CAP)) != 0)
+                    .collect()
+            };
+            let arenas: Vec<ArenaSlots> = (0..3)
+                .map(|a| arena(a as usize, a as usize, CAP as usize, &slots(a)))
+                .collect();
+            let live: usize = arenas.iter().map(|a| a.occupied.len()).sum();
+            // A gapless pack leaves live exactly the first ceil(live / CAP) arenas.
+            let packed = live.div_ceil(CAP as usize);
+            let mut after: Vec<usize> = arenas.iter().map(|a| a.occupied.len()).collect();
+            if let Some(plan) = plan_pool(&arenas, gpu(), 0) {
+                for m in &plan.moves {
+                    after[m.from.0] -= 1;
+                    after[m.to.0] += 1;
+                }
+            }
+            let live_arenas: Vec<usize> = (0..3).filter(|&a| after[a] > 0).collect();
+            assert!(
+                live_arenas.iter().all(|&a| a < packed),
+                "mask {mask:#b}: arenas {live_arenas:?} live, a pack keeps only the first {packed}",
+            );
+        }
     }
 
     /// Every relocated chunk moves exactly once, and only chunks above the final
@@ -1165,15 +1278,11 @@ mod tests {
                 arena(1, 1, CAP as usize, &a1),
             ];
             let Some(plan) = plan_pool(&arenas, gpu(), 0) else {
-                // Refused ⇒ must already be a gapless prefix.
-                let flat: Vec<bool> = (0..CAP)
-                    .map(|s| a0.contains(&s))
-                    .chain((0..CAP).map(|s| a1.contains(&s)))
-                    .collect();
-                let live = flat.iter().filter(|b| **b).count();
+                // Refused ⇒ no arena can be emptied: the upper one is empty, or the
+                // population needs both.
                 assert!(
-                    flat[..live].iter().all(|b| *b),
-                    "mask {mask:#b} was refused but is not packed: {flat:?}",
+                    a1.is_empty() || a0.len() + a1.len() > CAP as usize,
+                    "mask {mask:#b} was refused but arena 1 could be emptied: {a0:?} {a1:?}",
                 );
                 continue;
             };
