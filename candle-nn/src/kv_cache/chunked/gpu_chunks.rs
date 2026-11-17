@@ -959,6 +959,17 @@ impl GpuChunksGuard<'_> {
         // arenas it addresses stay alive until it drops.
         self.inner.pins = Arc::new(Vec::new());
     }
+
+    /// [`Self::clear`], handing back this serialisation's pins instead of
+    /// dropping them here. A freed view's pins are its parent's whole prefix —
+    /// thousands of refcount decrements per layer — and the caller drops them
+    /// beside the chunks, across threads, rather than one layer at a time under
+    /// that layer's state lock.
+    pub(crate) fn clear_detached(&mut self) -> Arc<Vec<ChunkPin>> {
+        let pins = std::mem::replace(&mut self.inner.pins, Arc::new(Vec::new()));
+        self.clear();
+        pins
+    }
 }
 
 /// Serialised `len` of entry `i`: the offset-derived `write_len` for the writer,

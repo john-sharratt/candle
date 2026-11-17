@@ -2125,6 +2125,41 @@ mod tests {
             let again = backing.free_sequence_detached(view).unwrap();
             assert!(again.is_empty(), "a free slot hands back nothing");
         }
+
+        /// **A slot's content extent is the last block holding a token, plus
+        /// one, beside its block count** — the answer `block_usage` gives,
+        /// without its `max_blocks`-wide vector.
+        #[test]
+        fn test_content_extent_ends_at_the_last_block_holding_a_token() {
+            const CHUNK_SIZE: usize = 32;
+            let (n_kv_head, head_dim) = (4usize, 32usize);
+            let backing =
+                ChunkedKvBacking::new(4, n_kv_head, head_dim, DType::BF16, &Device::Cpu, 256)
+                    .unwrap();
+            assert_eq!(backing.content_extent(0).unwrap(), None, "no slot");
+            let seq = backing.alloc_sequence().unwrap();
+            assert_eq!(backing.content_extent(seq).unwrap(), Some((0, 0)));
+            backing.ensure_for_offset(seq, 0, CHUNK_SIZE).unwrap();
+            let k = Tensor::zeros(
+                (1, n_kv_head, CHUNK_SIZE, head_dim),
+                DType::BF16,
+                &Device::Cpu,
+            )
+            .unwrap();
+            backing.write_contiguous(seq, 0, &k, &k).unwrap();
+            backing.set_len(seq, CHUNK_SIZE);
+            // The next write's chunk, pushed and still empty.
+            backing.ensure_for_offset(seq, CHUNK_SIZE, 1).unwrap();
+            let blocks = backing.sequence_block_count(seq).unwrap();
+            let usage = backing.block_usage(seq);
+            let by_usage = usage[..blocks]
+                .iter()
+                .rposition(|&u| u != 0)
+                .map_or(0, |i| i + 1);
+            assert_eq!(blocks, 2);
+            assert_eq!(backing.content_extent(seq).unwrap(), Some((2, by_usage)));
+            assert_eq!(by_usage, 1, "the empty writer is past the content");
+        }
     }
 
     // ==================== CPU↔GPU sealed-sequence primitives =================

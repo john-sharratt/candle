@@ -2655,11 +2655,7 @@ impl Conversation {
             if !group.policy.tags.is_empty() && group.id != target.group {
                 let tags = &group.policy.tags;
                 timelines.retain(|&tl| {
-                    (0..sub.turn_count(tl)).any(|i| {
-                        sub.turn_tags(tl, TurnIndex(i))
-                            .iter()
-                            .any(|t| tags.contains(t))
-                    })
+                    (0..sub.turn_count(tl)).any(|i| sub.turn_has_any_tag(tl, TurnIndex(i), tags))
                 });
             }
             let tags_us = t_tags.elapsed().as_micros() as u64;

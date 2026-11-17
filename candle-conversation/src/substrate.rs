@@ -668,26 +668,27 @@ pub enum PromotionItemKind {
 pub type AlreadyHotEntry = PromotionItemKind;
 
 /// One item that needs warm → hot promotion. The warm
-/// `Vec<SealedSequence>` is cloned out of the substrate at snapshot
-/// time so the caller can hand it to
+/// `Vec<SealedSequence>` is the residence's own, shared at snapshot time —
+/// one refcount, never a per-chunk copy — so the caller can hand it to
 /// [`candle_nn::kv_cache::ChunkedKvBacking::migrate_sealed_to_gpu_batch_async`]
-/// without holding the substrate read lock.
+/// without holding the substrate read lock, and a plan built only to price a
+/// lift costs nothing per chunk.
 #[derive(Debug)]
 pub struct WarmToHotEntry {
     pub kind: PromotionItemKind,
     pub residence: ResidenceIndex,
-    pub warm: Vec<SealedSequence>,
+    pub warm: Arc<Vec<SealedSequence>>,
 }
 
 /// One item that needs cold (disk) → hot promotion. The cold
-/// `Vec<StoredSequence>` is cloned for the same reason as
+/// `Vec<StoredSequence>` is shared for the same reason as
 /// [`WarmToHotEntry::warm`]; the [`StreamId`] is the redo-log handle
 /// the caller passes to `recover_turn_chunks` / `load_to_hot`.
 #[derive(Debug, Clone)]
 pub struct ColdToHotEntry {
     pub kind: PromotionItemKind,
     pub residence: ResidenceIndex,
-    pub cold: Vec<StoredSequence>,
+    pub cold: Arc<Vec<StoredSequence>>,
     pub stream_id: StreamId,
 }
 
@@ -2672,11 +2673,10 @@ impl Substrate {
     /// Classify a batch of items (sections + turns) by what work
     /// `elevate_to_hot` will need to do to put each one in VRAM.
     ///
-    /// One read-lock walk over the substrate; clones the warm
-    /// `Vec<SealedSequence>` and cold `Vec<StoredSequence>` so the
-    /// caller can drop the lock before running the slow CUDA work.
-    /// The inner `Arc<ChunkGid>`s in warm SealedSequences are cloned
-    /// cheaply (refcount bumps); cold StoredSequences are plain data.
+    /// One read-lock walk over the substrate; shares each residence's warm
+    /// `Vec<SealedSequence>` and cold `Vec<StoredSequence>` — one refcount
+    /// each — so the caller can drop the lock before running the slow CUDA
+    /// work.
     pub fn snapshot_promotion_state(
         &self,
         sections: &[SectionId],
@@ -2725,7 +2725,7 @@ impl Substrate {
             plan.warm_to_hot.push(WarmToHotEntry {
                 kind,
                 residence,
-                warm: (*warm).clone(),
+                warm,
             });
             return;
         }
@@ -2733,7 +2733,7 @@ impl Substrate {
             plan.cold_to_hot.push(ColdToHotEntry {
                 kind,
                 residence,
-                cold: (*cold).clone(),
+                cold,
                 stream_id: slot.stream_id,
             });
             return;
@@ -3712,10 +3712,24 @@ impl Substrate {
     /// stood in both the working set and the chain), or the scope of its group
     /// no longer offers it to `target`.
     fn working_set_candidate(&self, target: TimelineId, timeline: TimelineId) -> Option<Candidate> {
+        let chain: HashSet<TimelineId> = self.inherited_chain(target).into_iter().collect();
+        self.working_set_candidate_beside(target, &chain, timeline)
+    }
+
+    /// [`Self::working_set_candidate`], with `target`'s inherited chain
+    /// walked once by the caller: one observe judges every scored
+    /// conversation against the same chain, and walking it per candidate cost
+    /// a `Vec`, a `HashSet` and the parent walk each time.
+    fn working_set_candidate_beside(
+        &self,
+        target: TimelineId,
+        chain: &HashSet<TimelineId>,
+        timeline: TimelineId,
+    ) -> Option<Candidate> {
         if !self.deliverable(target, timeline) {
             return None;
         }
-        if self.inherited_chain(target).contains(&timeline) {
+        if chain.contains(&timeline) {
             return None;
         }
         let group = self.placing_group(target, timeline);
@@ -3845,8 +3859,9 @@ impl Substrate {
             .map(Arc::unwrap_or_clone)
             .unwrap_or_default();
         ws.observe_hits(hit_density, hits);
+        let chain: HashSet<TimelineId> = self.inherited_chain(target).into_iter().collect();
         ws.observe(fresh, beta, min_momentum, limits, max_admits, &|timeline| {
-            self.working_set_candidate(target, timeline)
+            self.working_set_candidate_beside(target, &chain, timeline)
         });
         self.working_sets.insert(target, Arc::new(ws));
     }
@@ -7944,6 +7959,24 @@ impl Substrate {
         match &stream.decl {
             Some(StreamDecl::Turn(decl)) => decl.tags.clone(),
             _ => Vec::new(),
+        }
+    }
+
+    /// Whether the turn carries any of `tags` — [`Self::turn_tags`] read in
+    /// place, for a scan that asks it of every turn of every conversation in
+    /// a group and wants no copy of each turn's tags to do it.
+    pub fn turn_has_any_tag(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        tags: &[String],
+    ) -> bool {
+        let Some(stream) = self.streams.get(turn_stream_id(timeline.raw(), index.0)) else {
+            return false;
+        };
+        match &stream.decl {
+            Some(StreamDecl::Turn(decl)) => decl.tags.iter().any(|t| tags.contains(t)),
+            _ => false,
         }
     }
 
@@ -12664,6 +12697,58 @@ mod tests {
         assert!(sub.couplings_of(timeline).is_empty());
     }
 
+    /// **Asking a turn for any of some tags reads its declared tags in place**:
+    /// the answer `turn_tags` gives, for a tagged turn, an untagged one and a
+    /// turn that is not there.
+    #[test]
+    fn a_turns_tags_are_matched_in_place() {
+        let mut sub = Substrate::new();
+        let decl = |tl: u64, tags: &[&str]| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id: tl,
+                turn_index: 0,
+                turn_id_day: 0,
+                turn_id_seq: 1,
+                role: 1,
+                block_start: 0,
+                block_end: 1,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+            })
+        };
+        sub.apply_stream_decl(
+            turn_stream_id(7, 0),
+            decl(7, &["tool", "code"]),
+            RecordIdentity::NONE,
+        );
+        sub.apply_stream_decl(turn_stream_id(8, 0), decl(8, &[]), RecordIdentity::NONE);
+        let wanted = |names: &[&str]| names.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        let first = TurnIndex(0);
+        for (tl, tags) in [
+            (7u64, wanted(&["code"])),
+            (7, wanted(&["guide"])),
+            (7, wanted(&[])),
+            (8, wanted(&["tool"])),
+            (9, wanted(&["tool"])),
+        ] {
+            let timeline = TimelineId::from_raw(tl).unwrap();
+            let by_copy = sub
+                .turn_tags(timeline, first)
+                .iter()
+                .any(|t| tags.contains(t));
+            assert_eq!(
+                sub.turn_has_any_tag(timeline, first, &tags),
+                by_copy,
+                "{tl} {tags:?}"
+            );
+        }
+        assert!(sub.turn_has_any_tag(TimelineId::from_raw(7).unwrap(), first, &wanted(&["code"])));
+    }
+
     /// `tombstoned_stream_bytes` sums the on-disk record bytes of every
     /// tombstoned timeline's turn streams — the dead weight the
     /// header-keyed accounting can't attribute.
@@ -14040,6 +14125,23 @@ mod tests {
         assert_eq!(plan.already_hot.len(), 0);
         assert_eq!(plan.warm_to_hot.len(), 0);
         assert_eq!(plan.cold_to_hot.len(), 0);
+    }
+
+    /// **A plan shares a warm turn's sequences with its residence**: the very
+    /// vector the residence holds, one refcount, not a per-chunk copy — a lift
+    /// priced three times over a reprojection copies nothing.
+    #[test]
+    fn a_promotion_plan_shares_the_residences_warm_sequences() {
+        let (_layer, _group, timeline, mut sub) = make_timeline();
+        sub.append_with_blocks(timeline, 10, 0, 1);
+        let residence = sub.turn(timeline, TurnIndex(0)).unwrap().content.residence;
+        sub.install_warm(residence, vec![minimal_sealed_layer()]);
+
+        let plan = sub.snapshot_promotion_state(&[], &[TurnKey::new(timeline, TurnIndex(0))]);
+        assert_eq!(plan.warm_to_hot.len(), 1);
+        let held = sub.residence(residence).warm().unwrap();
+        assert!(Arc::ptr_eq(&plan.warm_to_hot[0].warm, &held));
+        assert_eq!(plan.warm_to_hot[0].warm.len(), 1);
     }
 
     /// Counterpart to the regression test: a TurnKey naming an

@@ -253,12 +253,15 @@ impl KeyPages {
         out.scales.reserve(n_blocks * nb);
         for p in 0..n_blocks.div_ceil(PAGE_BLOCKS) {
             let used = (n_blocks - p * PAGE_BLOCKS).min(PAGE_BLOCKS);
-            let page = &self.pages[p];
-            out.codes
-                .extend(page.narrow(0, 0, used * self.d)?.to_vec1::<u8>()?);
-            out.scales.extend(scales_of(
-                &page.narrow(0, at, used * nb * 2)?.to_vec1::<u8>()?,
-            ));
+            // One readback per page, codes through the end of the used scales:
+            // each `to_vec1` waits for the device, and both planes are this
+            // one tensor.
+            let scale_bytes = used * nb * 2;
+            let whole = self.pages[p]
+                .narrow(0, 0, at + scale_bytes)?
+                .to_vec1::<u8>()?;
+            out.codes.extend_from_slice(&whole[..used * self.d]);
+            out.scales.extend(scales_of(&whole[at..at + scale_bytes]));
         }
         Ok(out)
     }

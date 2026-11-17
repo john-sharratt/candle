@@ -1919,18 +1919,9 @@ impl BatchedInferenceSession {
     pub fn sequence_content_block_count(&self, seq_idx: usize) -> Result<Option<usize>> {
         let mut fewest: Option<usize> = None;
         for backing in &self.backings {
-            let Some(blocks) = backing.sequence_block_count(seq_idx) else {
+            let Some((_, held)) = backing.content_extent(seq_idx)? else {
                 continue;
             };
-            let usage = backing.block_usage(seq_idx);
-            let Some(usage) = usage.get(..blocks) else {
-                candle::bail!(
-                    "sequence_content_block_count: seq {seq_idx} reports {blocks} block(s) but \
-                     its backing's block_usage is only {} wide",
-                    usage.len()
-                );
-            };
-            let held = usage.iter().rposition(|&u| u != 0).map_or(0, |i| i + 1);
             fewest = Some(fewest.map_or(held, |f| f.min(held)));
         }
         Ok(fewest)
@@ -1949,22 +1940,13 @@ impl BatchedInferenceSession {
     /// append at the same block index by construction.
     pub fn trim_empty_tail_chunks(&mut self, seq_idx: usize) -> Result<()> {
         for backing in &self.backings {
-            let Some(blocks) = backing.sequence_block_count(seq_idx) else {
+            // A slot holding more blocks than the backing's `max_blocks` is a
+            // real invariant violation — the sequence has outgrown the arena's
+            // own capacity — and `content_extent` refuses it rather than
+            // silently keeping everything.
+            let Some((blocks, keep)) = backing.content_extent(seq_idx)? else {
                 continue;
             };
-            // `block_usage` is always exactly `max_blocks` wide, so a slot
-            // reporting more blocks than that is a real invariant violation
-            // — the sequence has outgrown the arena's own capacity — not a
-            // shape we can silently absorb by keeping everything.
-            let usage = backing.block_usage(seq_idx);
-            let Some(usage) = usage.get(..blocks) else {
-                candle::bail!(
-                    "trim_empty_tail_chunks: seq {seq_idx} reports {blocks} block(s) but its \
-                     backing's block_usage is only {} wide",
-                    usage.len()
-                );
-            };
-            let keep = usage.iter().rposition(|&u| u != 0).map_or(0, |i| i + 1);
             if keep < blocks {
                 backing.truncate_sequence_to_blocks(seq_idx, keep)?;
             }

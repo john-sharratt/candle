@@ -180,12 +180,12 @@ impl ChunkedKvBacking {
             .write()
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
         let Some(mut slot) = state.sequences[batch_idx].take() else {
-            return Ok(DetachedChunks(Vec::new()));
+            return Ok(DetachedChunks::none());
         };
-        let chunks = slot.take_chunks();
+        let (chunks, pins) = slot.take_chunks();
         drop(slot);
         drop(state);
-        Ok(DetachedChunks(chunks))
+        Ok(DetachedChunks { chunks, pins })
     }
 
     pub fn set_len(&self, batch_idx: usize, len: usize) {
@@ -621,6 +621,36 @@ impl ChunkedKvBacking {
             }
         }
         result
+    }
+
+    /// A slot's block count and its content extent — the last block holding a
+    /// token, plus one — read under one lock with nothing allocated: what
+    /// [`Self::block_usage`] answers when all a caller wants is where the
+    /// content ends. `None` when the slot is not allocated; an error when the
+    /// slot holds more blocks than the backing's `max_blocks`, which is the
+    /// sequence outgrowing the arena's capacity.
+    pub fn content_extent(&self, batch_idx: usize) -> Result<Option<(usize, usize)>> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let Some(slot) = state.sequences.get(batch_idx).and_then(|s| s.as_ref()) else {
+            return Ok(None);
+        };
+        let chunks = slot.chunks_slice();
+        if chunks.len() > state.max_blocks {
+            candle::bail!(
+                "content_extent: seq {batch_idx} holds {} block(s), past the backing's \
+                 {} max_blocks",
+                chunks.len(),
+                state.max_blocks
+            );
+        }
+        let held = chunks
+            .iter()
+            .rposition(|c| c.usage != 0)
+            .map_or(0, |i| i + 1);
+        Ok(Some((chunks.len(), held)))
     }
 
     /// Count the chunks currently held by a sequence slot.

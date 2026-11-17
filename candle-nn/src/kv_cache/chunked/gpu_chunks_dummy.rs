@@ -118,6 +118,11 @@ impl GpuChunksGuard<'_> {
 
     pub(crate) fn clear(&mut self) {}
 
+    /// The stub holds no pins, so it hands back none.
+    pub(crate) fn clear_detached(&mut self) -> Arc<Vec<ChunkPin>> {
+        Arc::new(Vec::new())
+    }
+
     pub(crate) fn rebuild_decode(
         &mut self,
         _chunks: &[ChunkWindow],

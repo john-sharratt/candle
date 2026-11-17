@@ -20,6 +20,7 @@ mod chunk_ops_tests;
 mod claim_cost_tests;
 mod compress_tests;
 mod decode_slot_resync_tests;
+mod detached_free_pins_tests;
 pub mod dump_reader;
 mod frontier_rank_tests;
 mod gather_r16_tests;

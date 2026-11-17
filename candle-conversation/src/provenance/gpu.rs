@@ -465,9 +465,11 @@ pub(crate) fn needle_tally_segments(
                 }
                 // Needle gate: keep the top NEEDLE_KEEP_FRAC query tokens by magnitude.
                 let keep_n = ((NEEDLE_KEEP_FRAC * cnt as f32).ceil() as usize).clamp(1, cnt);
-                let mut sorted = mags.clone();
-                sorted.sort_unstable_by(|a, b| b.total_cmp(a));
-                let thresh = sorted[keep_n - 1];
+                // The `keep_n`-th largest magnitude: a selection, not a sort —
+                // the same value under `total_cmp`'s total order, in O(cnt).
+                let mut ranked = mags.clone();
+                let (_, &mut thresh, _) =
+                    ranked.select_nth_unstable_by(keep_n - 1, |a, b| b.total_cmp(a));
                 // Pass 2: tally the kept tokens' votes into this segment's cases.
                 for (qt, &mag) in mags.iter().enumerate() {
                     if mag < thresh {

@@ -1284,18 +1284,9 @@ impl GalleryArena {
                 ));
             }
             profile::record("arena:launch_enqueue", t_kernel.elapsed());
+            // The kernel's time is the events', so nothing waits for it alone:
+            // the copies follow it in stream order and one wait covers both.
             let ev_stop = stream.record_event(Some(CU_EVENT_DEFAULT)).ok();
-            let t_sync = Instant::now();
-            stream
-                .synchronize()
-                .map_err(|e| candle::Error::Msg(format!("paged scan: synchronize: {e}")))?;
-            profile::record("arena:launch_sync", t_sync.elapsed());
-            if let (Some(start), Some(stop)) = (&ev_start, &ev_stop) {
-                if let Ok(ms) = start.elapsed_ms(stop) {
-                    kernel_gpu_us = (f64::from(ms) * 1000.0) as u64;
-                }
-            }
-
             let t_readback = Instant::now();
             // SAFETY: both ranges are this launch's outputs inside the scratch,
             // held until the closure returns; the copies are waited for below.
@@ -1316,7 +1307,14 @@ impl GalleryArena {
             stream
                 .synchronize()
                 .map_err(|e| candle::Error::Msg(format!("paged scan: readback: {e}")))?;
-            readback_us = t_readback.elapsed().as_micros() as u64;
+            if let (Some(start), Some(stop)) = (&ev_start, &ev_stop) {
+                if let Ok(ms) = start.elapsed_ms(stop) {
+                    kernel_gpu_us = (f64::from(ms) * 1000.0) as u64;
+                }
+            }
+            // The wait covered the kernel's tail as well as the copies; the
+            // readback is what is left once the kernel's own time is taken off.
+            readback_us = (t_readback.elapsed().as_micros() as u64).saturating_sub(kernel_gpu_us);
             Ok(())
         };
         dev.with_synced_upload(

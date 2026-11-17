@@ -270,10 +270,16 @@ impl ResidentPage {
         for (c, t) in chunks.iter().enumerate() {
             let rows = chunk_rows(self.rows, c);
             let first = c * PAGE_BLOCKS;
-            let vals = t.narrow(0, 0, rows * d)?.to_vec1::<u8>()?;
+            // One readback per chunk, codes through the end of the rows' scales:
+            // each `to_vec1` waits for the device, and the two planes sit in the
+            // one tensor.
+            let scales_at = scale_plane_offset(d);
+            let scale_bytes = rows * nb * 2;
+            let whole = t.narrow(0, 0, scales_at + scale_bytes)?.to_vec1::<u8>()?;
+            let vals = &whole[..rows * d];
             let dst = &mut out.codes[first * d..(first + rows) * d];
             match self.layout {
-                ChunkLayout::RowMajor => dst.copy_from_slice(&vals),
+                ChunkLayout::RowMajor => dst.copy_from_slice(vals),
                 // `[d/16, rows, 16]`: group `g` of row `j` sits at
                 // `(g·rows + j)·16`.
                 ChunkLayout::Blocked => {
@@ -286,10 +292,8 @@ impl ResidentPage {
                     }
                 }
             }
-            out.scales.extend(scales_of(
-                &t.narrow(0, scale_plane_offset(d), rows * nb * 2)?
-                    .to_vec1::<u8>()?,
-            ));
+            out.scales
+                .extend(scales_of(&whole[scales_at..scales_at + scale_bytes]));
         }
         Ok(out)
     }

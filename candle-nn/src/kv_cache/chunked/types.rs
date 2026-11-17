@@ -610,19 +610,32 @@ pub(crate) fn front_evict_count(
 /// A freed sequence's block table, detached from its slot
 /// ([`ChunkedKvBacking::free_sequence_detached`](super::ChunkedKvBacking::free_sequence_detached)).
 ///
-/// Dropping it releases the chunks, on whichever thread drops it. Nothing in it
-/// touches the device.
-pub struct DetachedChunks(pub(crate) Vec<ChunkWindow>);
+/// Dropping it releases the chunks and the slot-state serialisation's pins on
+/// them, on whichever thread drops it. Nothing in it touches the device.
+pub struct DetachedChunks {
+    pub(crate) chunks: Vec<ChunkWindow>,
+    /// Held only to be dropped with the chunks, on the dropping thread.
+    #[allow(dead_code)]
+    pub(crate) pins: Arc<Vec<ChunkPin>>,
+}
 
 impl DetachedChunks {
+    /// Nothing detached.
+    pub(crate) fn none() -> Self {
+        Self {
+            chunks: Vec::new(),
+            pins: Arc::new(Vec::new()),
+        }
+    }
+
     /// Chunks held.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.chunks.len()
     }
 
     /// Whether it holds no chunk.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.chunks.is_empty()
     }
 }
 
@@ -1335,13 +1348,13 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
-    /// Move every chunk out and clear the GPU buffer, handing the chunks to
-    /// the caller to drop.
-    pub(crate) fn take_chunks(&mut self) -> Vec<ChunkWindow> {
+    /// Move every chunk out and clear the GPU buffer, handing the chunks and
+    /// the serialisation's pins on them to the caller to drop.
+    pub(crate) fn take_chunks(&mut self) -> (Vec<ChunkWindow>, Arc<Vec<ChunkPin>>) {
         let chunks = std::mem::take(&mut self.chunks);
         self.gap_cursor = 0;
-        self.gpu_chunks.as_mut().clear();
-        chunks
+        let pins = self.gpu_chunks.as_mut().clear_detached();
+        (chunks, pins)
     }
 
     /// Drain the first `n` chunks (RAII-drops their GIDs) and clear the GPU buffer.
