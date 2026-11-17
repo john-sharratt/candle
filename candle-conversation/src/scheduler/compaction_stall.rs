@@ -124,11 +124,20 @@ pub(super) struct CompactionStall {
 impl CompactionStall {
     /// Whether `pass` over `now` would repeat one that already made no progress:
     /// the same pass stalled last, and nothing has been freed since — no new hole
-    /// below the frontier and no arena gone sparser — whatever the frontier and the
-    /// live count did in between.
+    /// below the frontier, no arena gone sparser, and the frontier no lower than it
+    /// stalled at. A frontier that rose holds it: growth opens nothing to pack.
+    ///
+    /// **A frontier that fell is new ground, whatever the hole count did.** Its top
+    /// region is a different one, usually a different tenant's — the one the
+    /// stalled pass could not move let go of it. On BlackWorld (5179, 2026-11-17)
+    /// the span tenants' pass stalled under held ground at 1,294 regions over 702
+    /// holes; held ground released, the frontier fell to 771 with the provenance
+    /// gallery on top over 192 holes, and the gate held the gallery's pass because
+    /// 192 is fewer than 702 — the frontier stood there with nothing asked to move it.
     pub fn holds(&self, pass: FrontierPass, now: PoolShape) -> bool {
         self.stalled_at.is_some_and(|(stalled, s)| {
             stalled == pass
+                && now.frontier >= s.frontier
                 && now.holes() <= s.holes()
                 && now.sparse <= s.sparse
                 && now.tenant_sparse <= s.tenant_sparse
@@ -428,6 +437,50 @@ mod tests {
                 "{freed:?} has something new to pack"
             );
         }
+    }
+
+    /// **A frontier that fell below the stall reopens it, with fewer holes than
+    /// before.** BlackWorld's shape: the span tenants' pass stalled under held ground
+    /// at 1,294 over 702 holes, then held ground let go and the gallery stood on top
+    /// at 771 over 192. The fall is new ground; the same fall with the frontier back
+    /// at the stall is not.
+    #[test]
+    fn a_fallen_frontier_reopens_the_gate() {
+        let tenants = FrontierPass::SpanTenants;
+        let stalled = PoolShape {
+            live: 592,
+            frontier: 1_294,
+            sparse: 0,
+            tenant_sparse: 0,
+        };
+        let mut stall = CompactionStall::default();
+        stall.record(
+            tenants,
+            stalled,
+            PassOutcome {
+                reclaimed_regions: 0,
+                frontier_before: 1_294,
+                frontier_after: 1_294,
+                clipped: false,
+            },
+        );
+        let fallen = PoolShape {
+            live: 579,
+            frontier: 771,
+            ..stalled
+        };
+        assert!(fallen.holes() < stalled.holes());
+        assert!(!stall.holds(tenants, fallen), "a new top region to move");
+        assert!(
+            stall.holds(
+                tenants,
+                PoolShape {
+                    live: 600,
+                    ..stalled
+                }
+            ),
+            "the same frontier with less air is still held"
+        );
     }
 
     #[test]
