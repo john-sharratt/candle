@@ -23,10 +23,13 @@ use candle_transformers::models::piece_key::PieceKey;
 use crate::projection::{TimelineId, TurnIndex};
 
 /// How many refreshes a piece that left the pool keeps its pages.
-pub(super) const LINGER_REFRESHES: u32 = 8;
+pub(super) const LINGER_REFRESHES: u32 = 12;
 
-/// How many pieces linger at most.
-pub(super) const MAX_LINGERING: usize = 48;
+/// How many pieces linger at most. At 48 the linger stood full at every
+/// refresh on BlackWorld (2026-11-18), 5–40 pieces leaving each time, so it
+/// reached back only three or four refreshes and few comebacks found their
+/// pages; the pool itself holds about 150.
+pub(super) const MAX_LINGERING: usize = 128;
 
 /// A pooled conversation's pages per turn, as the pool holds them.
 pub(super) type Layout = HashMap<TurnIndex, Vec<(usize, PieceKey)>>;

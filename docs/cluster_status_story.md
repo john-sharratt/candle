@@ -1,7 +1,33 @@
 # A failed install: what the member does, and what the status says
 
-**Status: designed, not built.** Settled with the user on 2026-11-19. This
-document is authoritative over:
+**Status: partly built** (2026-11-19).
+
+**Built:**
+
+- the attempts record and the bounded retry of §2.1–§2.2
+  (`cluster/src/upgrade/runtime/attempts.rs`), replacing `refused.json`;
+- the retries reported apart from the refusals in `COORD`, so the gateway's
+  close over a refused floor build (`gateway::upgrades::left_behind`) applies
+  only once the tries are spent;
+- the status of §3–§4 (`zend/src/mcp/tools/cluster_status.rs`):
+  - `behind` for a below-floor member installing nothing;
+  - each retry with its kind and when it is due;
+  - the rollout line's counts;
+  - a machine's keep trial as a timed event, and its connected members said
+    as such.
+
+**Not built:**
+
+- §2.3, serving the old build between attempts. It needs the restored member
+  to say so at admission, which is a handshake change.
+- §2.5, the connector following its daemon out of rotation, and the
+  `serving` signal for the daemon's loops.
+
+The kind of a keep rollback is read as `slow`, because keep's local port
+serves no state a restored process could read. A watchdog's failure record
+names `died` and `cancelled`.
+
+This document is authoritative over:
 
 - what a member does after an install of a new build fails and keep restores
   the old one;

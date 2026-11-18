@@ -16,10 +16,11 @@
 //! | the builds an install waits for | [`builds`] |
 //! | the machine's connector following the release | [`connector`] |
 //! | what it serves | [`served`] |
-//! | the builds it never tries again | [`refused`] |
+//! | the installs that failed here, and when each is tried again | [`attempts`] |
 //! | what `COORD` reports | [`view`] |
 
 mod announce;
+pub mod attempts;
 pub mod builds;
 mod candidate;
 pub mod commands;
@@ -30,28 +31,40 @@ mod facts_read;
 mod failed_install;
 mod fetch;
 mod install;
-pub mod refused;
 pub mod served;
 mod setup;
 mod view;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tokio::time::{interval, MissedTickBehavior};
 
 use super::artifacts::Probe;
 use super::decisions::build_name;
 use super::parts::Parts;
-use super::watchdog::{Failure, FAILED};
+use super::watchdog::{Failure, FAILED, PLAN};
+use crate::clock::now_ms;
 use crate::coord::{KeptLine, VerdictLine};
 use crate::frame::{BuildArtifacts, Frame};
 use crate::member::AppMember;
+use attempts::{kind_of, Attempt, Attempts};
 use builds::{BuildHold, HoldTicket};
 use facts_read::FactsRead;
 use failed_install::failed_install;
+
+/// When the install plan in `upgrade_dir` was written, ms since the epoch: the
+/// install a restored process's failure belongs to.
+fn plan_ms(upgrade_dir: &Path) -> Option<u64> {
+    let modified = fs::metadata(upgrade_dir.join(PLAN))
+        .and_then(|m| m.modified())
+        .ok()?;
+    let since = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(since.as_millis() as u64)
+}
 
 pub use decide::{prefetch, target, Facts, Lease, Target};
 pub use install::{InstallJob, Installer, HANDBACK_TTL, LEASE_TTL};
@@ -90,6 +103,8 @@ struct State {
     step: String,
     stranded: Option<String>,
     failure: Option<Failure>,
+    /// The installs that failed here, and when each build is tried again.
+    attempts: Attempts,
     announce_due: bool,
     last_announce: Option<Instant>,
     /// An install was handed to the installer: the process is stopping.
@@ -142,30 +157,38 @@ impl Upgrader {
         probe: Arc<dyn Probe + Send + Sync>,
     ) -> Arc<Upgrader> {
         let dir = setup.upgrade_dir.clone();
-        let mut refused = refused::read(&dir);
-        if let Some(build) = &failed_install(&setup, &dir) {
-            match refused::refuse(&dir, build) {
-                Ok(r) => refused = r,
-                Err(e) => tracing::error!("the failed build {build} was not recorded: {e}"),
-            }
-            tracing::warn!(
-                build,
-                "restored after a failed install: it is not tried again"
-            );
-        }
-        let own = build_name(&setup.info.build());
-        if refused.contains(&own) {
-            match refused::forgive(&dir, &own) {
-                Ok(r) => refused = r,
-                Err(e) => tracing::error!("the running build {own} was not forgiven: {e}"),
-            }
-        }
-        let failure = fs::read(dir.join(FAILED))
+        let failure: Option<Failure> = fs::read(dir.join(FAILED))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
+        let mut attempts = Attempts::read(&dir);
+        if let Some(build) = &failed_install(&setup, &dir) {
+            let of_build = failure.as_ref().filter(|f| &f.build == build);
+            let attempt = Attempt {
+                ended_ms: now_ms(),
+                kind: kind_of(of_build.map(|f| f.reason.as_str())),
+                last_line: of_build.and_then(|f| f.last_lines.last().cloned()),
+                plan_ms: plan_ms(&dir),
+            };
+            if attempts.record(build, attempt) {
+                if let Err(e) = attempts.write(&dir) {
+                    tracing::error!("the failed install of {build} was not recorded: {e}");
+                }
+                tracing::warn!(
+                    build,
+                    next = ?attempts.next_try(build),
+                    "restored after a failed install: it is tried again when due"
+                );
+            }
+        }
+        let own = build_name(&setup.info.build());
+        if attempts.forgive(&own) {
+            if let Err(e) = attempts.write(&dir) {
+                tracing::error!("the running build {own} was not forgiven: {e}");
+            }
+        }
         let facts = Facts {
             own: Some(setup.info.clone()),
-            refused,
+            refused: attempts.refused_at(now_ms()),
             ..Facts::default()
         };
         Arc::new(Upgrader {
@@ -178,6 +201,7 @@ impl Upgrader {
             s: Mutex::new(State {
                 facts,
                 failure,
+                attempts,
                 announce_due: true,
                 ..State::default()
             }),
@@ -292,6 +316,11 @@ impl Upgrader {
             self.scan().await;
         }
         let fresh = self.refresh_facts(store_wait).await;
+        // A failed build's retry comes due with time, not with any fact.
+        {
+            let mut s = self.state();
+            s.facts.refused = s.attempts.refused_at(now_ms());
+        }
         if fresh {
             self.own_verdicts().await;
         }

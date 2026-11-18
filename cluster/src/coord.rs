@@ -75,12 +75,30 @@ pub struct UpgradeView {
     pub failure: Option<Failure>,
     /// The builds it never tries again: `count-hash`.
     pub refused: Vec<String>,
+    /// The builds whose install failed here and will be tried again, each
+    /// with when (`upgrade::runtime::attempts`). A member that reports none —
+    /// one of a build before the field — is read as having none.
+    #[serde(default)]
+    pub retrying: Vec<RetryLine>,
     /// The latest verdict on each build the app has settled.
     pub verdicts: Vec<VerdictLine>,
     /// The app's latest forced rollout.
     pub rollout: Option<RolloutLine>,
     /// Whether the app's automatic rollout is paused.
     pub paused: bool,
+}
+
+/// A build whose install failed here, to be tried again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryLine {
+    /// `count-hash`.
+    pub build: String,
+    /// Failed attempts counted so far.
+    pub attempts: u32,
+    /// How the newest ended: `slow`, `died` or `cancelled`.
+    pub kind: String,
+    /// When the next attempt may start, ms since the epoch.
+    pub at_ms: u64,
 }
 
 /// One artifact a member can serve.

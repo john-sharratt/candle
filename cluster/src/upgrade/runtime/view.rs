@@ -61,7 +61,11 @@ impl Upgrader {
             step: s.step.clone(),
             stranded: s.stranded.clone(),
             failure: s.failure.clone(),
-            refused: s.facts.refused.iter().cloned().collect(),
+            // Only a build refused for good: one waiting for its retry is
+            // reported apart, and the gateway closes a member over the first
+            // alone (`attempts`).
+            refused: s.attempts.refused_for_good(),
+            retrying: s.attempts.retrying(),
             verdicts: s.verdicts.get(app).cloned().unwrap_or_default(),
             rollout: s.facts.rollouts.get(app).map(|(n, r)| RolloutLine {
                 n: *n,

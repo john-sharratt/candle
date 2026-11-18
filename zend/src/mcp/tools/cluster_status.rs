@@ -204,12 +204,42 @@ fn floor_count(status: &Value, app: &str) -> Option<u64> {
         .as_u64()
 }
 
+/// Whether member `m` — a row of the gateway's status — is installing a
+/// build now: its report names the install step or a fetch under way.
+fn installing(m: &Value) -> bool {
+    m.pointer("/coord/upgrade").is_some_and(|up| {
+        up.get("step")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.starts_with("upgrading"))
+            || up.get("fetching").is_some_and(|f| !f.is_null())
+    })
+}
+
+/// Member `m`'s state as the gateway's view says it: `upgrading` only while
+/// an install is under way; a member admitted below the floor and installing
+/// nothing is `behind` (`docs/cluster_status_story.md` §3).
+fn state_word(m: &Value) -> &str {
+    match str_of(m, "state") {
+        "upgrading" if !installing(m) => "behind",
+        s => s,
+    }
+}
+
+/// When an attempt is due: `now` or how far ahead.
+fn due(at_ms: u64, now: u64) -> String {
+    if at_ms <= now {
+        "now".into()
+    } else {
+        format!("in {}", ago(now, at_ms).trim_end_matches(" ago"))
+    }
+}
+
 /// Where member `m` — a row of the gateway's status — stands in an upgrade,
 /// from its own report (`COORD`'s upgrade view): what it is doing, how far a
-/// fetch has got, or why it is stuck. A member below its app's `floor` with
-/// nothing under way says so: that is a member left behind. `None` for a
-/// member with nothing to say.
-pub fn upgrade_line(m: &Value, floor: Option<u64>) -> Option<String> {
+/// fetch has got, why it is stuck, and each failed install it will try again
+/// and when. A member below its app's `floor` with nothing under way says so.
+/// `None` for a member with nothing to say.
+pub fn upgrade_line(m: &Value, floor: Option<u64>, now: u64) -> Option<String> {
     let below = floor.is_some_and(|f| {
         m.pointer("/build/count")
             .and_then(Value::as_u64)
@@ -259,6 +289,21 @@ pub fn upgrade_line(m: &Value, floor: Option<u64>) -> Option<String> {
                 str_of(f, "reason")
             ));
         }
+        for r in up
+            .get("retrying")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let at = r.get("at_ms").and_then(Value::as_u64).unwrap_or(0);
+            said.push(format!(
+                "its install of {} failed {}× ({}); tried again {}",
+                str_of(r, "build"),
+                r.get("attempts").and_then(Value::as_u64).unwrap_or(0),
+                str_of(r, "kind"),
+                due(at, now)
+            ));
+        }
         if up.get("paused").and_then(Value::as_bool) == Some(true) {
             said.push("the app's rollout is paused".into());
         }
@@ -272,8 +317,8 @@ pub fn upgrade_line(m: &Value, floor: Option<u64>) -> Option<String> {
     }
     if said.is_empty() && below {
         return Some(
-            "below the floor, with no upgrade under way: it is left behind — read its \
-             log for why (`log_grep`, or a worker's `cluster_logs`)"
+            "below the floor, with no install under way and none failed: read its log for \
+             why (`log_grep`, or a worker's `cluster_logs`)"
                 .into(),
         );
     }
@@ -285,6 +330,42 @@ pub fn upgrade_line(m: &Value, floor: Option<u64>) -> Option<String> {
         if below { "below the floor: " } else { "" },
         said.join("; ")
     ))
+}
+
+/// The members of `app` below its floor, counted by what they are doing:
+/// installing, serving an older build, or behind.
+fn below_count(status: &Value, app: &str) -> String {
+    let Some(floor) = floor_count(status, app) else {
+        return "no floor".into();
+    };
+    let below: Vec<&Value> = status
+        .get("members")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| str_of(m, "app") == app)
+        .filter(|m| {
+            m.pointer("/build/count")
+                .and_then(Value::as_u64)
+                .is_some_and(|c| c < floor)
+        })
+        .collect();
+    if below.is_empty() {
+        return "no member below it".into();
+    }
+    let n_installing = below.iter().filter(|m| installing(m)).count();
+    let behind = below
+        .iter()
+        .filter(|m| !installing(m) && str_of(m, "state") == "upgrading")
+        .count();
+    let serving = below.len() - n_installing - behind;
+    format!(
+        "{} below it: {n_installing} installing, {serving} serving an older build, {behind} behind",
+        match below.len() {
+            1 => "1 member".to_string(),
+            n => format!("{n} members"),
+        }
+    )
 }
 
 /// One fault row of the gateway's status, as a line.
@@ -365,7 +446,7 @@ pub fn render_gateway(status: &Value) -> String {
             str_of(m, "host"),
             str_of(m, "node"),
             build_of(m, "build").as_deref().unwrap_or("?"),
-            str_of(m, "state"),
+            state_word(m),
         ));
         let flags: Vec<&str> = ["syncing", "lagging", "silent"]
             .into_iter()
@@ -374,7 +455,7 @@ pub fn render_gateway(status: &Value) -> String {
         if !flags.is_empty() {
             out.push_str(&format!(" ({})", flags.join(", ")));
         }
-        if let Some(line) = upgrade_line(m, floor_count(status, str_of(m, "app"))) {
+        if let Some(line) = upgrade_line(m, floor_count(status, str_of(m, "app")), now) {
             out.push_str(&format!(" — {line}"));
         }
     }
@@ -395,8 +476,9 @@ pub fn render_gateway(status: &Value) -> String {
         }
         if let Some(at) = u.get("rollout_since_ms").and_then(Value::as_u64) {
             out.push_str(&format!(
-                "\nupgrade {app}: floor raised {}, members below it upgrading",
-                ago(at, now)
+                "\nupgrade {app}: floor raised {}; {}",
+                ago(at, now),
+                below_count(status, app)
             ));
         }
         if let Some(at) = u.get("deadline_ms").and_then(Value::as_u64) {
@@ -417,10 +499,14 @@ pub fn render_gateway(status: &Value) -> String {
     out
 }
 
-/// A machine no member answered for, as its keep `state` says it stands: a
-/// trial in progress is a member coming up, a running motherd that does not
-/// answer is loading or stuck, and a stopped one is down.
-pub fn absent_line(host: &str, state: &Value, now: u64) -> String {
+/// A machine no member's `/v1/status` reached, as its keep `state` and the
+/// gateway's rows for it (`connected`: each `app state` the gateway lists on
+/// that host) say it stands: what happened to it — keep's last trial, when it
+/// ended and how — then what it is now (`docs/cluster_status_story.md` §4).
+/// A member connected to the gateway is reported as such, never as loading or
+/// stuck: below the floor it is routed nothing, which is why its status did
+/// not answer.
+pub fn absent_line(host: &str, state: &Value, now: u64, connected: &[String]) -> String {
     let motherd = state
         .get("services")
         .and_then(Value::as_array)
@@ -432,24 +518,57 @@ pub fn absent_line(host: &str, state: &Value, now: u64) -> String {
         return format!("- {host}: not answering, and its keep runs no motherd");
     };
     let build = build_of(m, "build").unwrap_or_else(|| "?".into());
-    if let Some(t) = m.pointer("/trials/running").filter(|t| !t.is_null()) {
-        return format!(
-            "- {host}: not answering — {} (installed {build})",
-            trying(t, now)
+    let mut lines = vec![format!("- {host} — motherd {build}")];
+    if let Some(last) = m.pointer("/trials/last").filter(|t| !t.is_null()) {
+        let when = ago(
+            last.get("ended_ms").and_then(Value::as_u64).unwrap_or(0),
+            now,
         );
+        let how = if last.get("proven").and_then(Value::as_bool) == Some(true) {
+            "proven".to_string()
+        } else {
+            let detail = str_of(last, "detail").replace('\n', " / ");
+            format!("rolled back — {detail}")
+        };
+        lines.push(format!("  {when}: keep's last trial of motherd: {how}"));
     }
-    match m.get("running").and_then(Value::as_u64) {
-        Some(pid) => format!(
-            "- {host}: not answering — keep runs motherd {build} as pid {pid}, so it is \
-             loading or stuck: read its lines with `log_grep` (a worker's `cluster_logs`)"
-        ),
-        None => format!("- {host}: not answering — keep has motherd {build} stopped"),
-    }
+    let now_line = if let Some(t) = m.pointer("/trials/running").filter(|t| !t.is_null()) {
+        format!("  now: {}", trying(t, now))
+    } else if !connected.is_empty() {
+        format!(
+            "  now: its members are connected to the gateway ({}) and routed nothing, so \
+             their /v1/status does not answer",
+            connected.join(", ")
+        )
+    } else {
+        match m.get("running").and_then(Value::as_u64) {
+            Some(pid) => format!(
+                "  now: keep runs it as pid {pid}, and no member of it is connected to the \
+                 gateway: read its lines on the machine"
+            ),
+            None => "  now: keep has it stopped".to_string(),
+        }
+    };
+    lines.push(now_line);
+    lines.join("\n")
+}
+
+/// The gateway's rows on `host`, each as `app state`.
+fn connected_on(gateway: Option<&Value>, host: &str) -> Vec<String> {
+    gateway
+        .and_then(|g| g.get("members"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| str_of(m, "host").eq_ignore_ascii_case(host))
+        .filter(|m| matches!(str_of(m, "app"), "zend" | "npcd"))
+        .map(|m| format!("{} {}", str_of(m, "app"), state_word(m)))
+        .collect()
 }
 
 /// The machines with an agent but no member in `envelope`, as their keeps
-/// say they stand.
-async fn absent(call: &OpsCall, envelope: &Value) -> Vec<String> {
+/// and the gateway's rows say they stand.
+async fn absent(call: &OpsCall, envelope: &Value, gateway: Option<&Value>) -> Vec<String> {
     let Some(agents) = call.session.agents() else {
         return Vec::new();
     };
@@ -475,7 +594,7 @@ async fn absent(call: &OpsCall, envelope: &Value) -> Vec<String> {
     for host in hosts {
         lines.push(
             match keep(call, Method::GET, KEEP_STATE, &host, None).await {
-                Ok(state) => absent_line(&host, &state, now),
+                Ok(state) => absent_line(&host, &state, now, &connected_on(gateway, &host)),
                 Err(e) => format!("- {host}: not answering, and its keep could not be read: {e}"),
             },
         );
@@ -508,7 +627,8 @@ pub async fn run(call: &OpsCall, _args: &Value) -> Answer {
     };
     let mut out = render_members(&envelope, now_ms());
     if call.admin() {
-        let gone = absent(call, &envelope).await;
+        let view = gateway.as_ref().and_then(|g| g.as_ref().ok());
+        let gone = absent(call, &envelope, view).await;
         if !gone.is_empty() {
             out.push_str("\nMachines with no member answering:\n");
             out.push_str(&gone.join("\n"));
@@ -629,7 +749,7 @@ mod tests {
                    "size": 3 * gib, "resumes": 1}, "stranded": null, "failure": null, "paused": false}),
         );
         assert_eq!(
-            upgrade_line(&fetching, Some(4381)).unwrap(),
+            upgrade_line(&fetching, Some(4381), NOW).unwrap(),
             "below the floor: upgrading; fetching 4381-7b4f4e062: 1.5 GB of 3.0 GB, resumed 1×"
         );
         let stuck = member(
@@ -639,18 +759,18 @@ mod tests {
                                "last_lines": ["loading", "panicked at x.rs:1"]}, "paused": true}),
         );
         assert_eq!(
-            upgrade_line(&stuck, Some(4381)).unwrap(),
+            upgrade_line(&stuck, Some(4381), NOW).unwrap(),
             "below the floor: stranded; stranded: no member offers 4381 for windows; its install of \
              4376-12a48b0 failed and was restored: no serving line (last line: panicked at x.rs:1); \
              the app's rollout is paused"
         );
         let idle = json!({"step": "", "fetching": null, "stranded": null, "failure": null, "paused": false});
-        assert!(upgrade_line(&member(4350, idle.clone()), Some(4381))
+        assert!(upgrade_line(&member(4350, idle.clone()), Some(4381), NOW)
             .unwrap()
-            .starts_with("below the floor, with no upgrade under way"));
-        assert_eq!(upgrade_line(&member(4381, idle), Some(4381)), None);
+            .starts_with("below the floor, with no install under way and none failed"));
+        assert_eq!(upgrade_line(&member(4381, idle), Some(4381), NOW), None);
         let no_report = json!({"build": {"count": 1, "hash": "h", "local": ""}, "coord": null});
-        assert_eq!(upgrade_line(&no_report, None), None);
+        assert_eq!(upgrade_line(&no_report, None, NOW), None);
     }
 
     /// **A fault says why and since when; a member near its disk floor says
@@ -700,7 +820,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("\nupgrade zend: floor raised 2 min ago, members below it upgrading"),
+            text.contains(
+                "\nupgrade zend: floor raised 2 min ago; 1 member below it: 0 installing, 1 \
+                 serving an older build, 0 behind"
+            ),
             "{text}"
         );
         assert!(
@@ -753,41 +876,120 @@ mod tests {
         );
     }
 
-    /// **A machine with no member answering says why, from its keep**: a
-    /// member coming up under a trial, a motherd running but not answering,
-    /// or one stopped.
+    /// **A machine whose status did not answer says what happened to it, then
+    /// what it is now** (`docs/cluster_status_story.md` §4): keep's last trial
+    /// and how it ended; a trial in progress; members connected below the
+    /// floor, which are routed nothing — never "loading or stuck"; a motherd
+    /// running with no member connected; one stopped.
     #[test]
-    fn a_machine_with_no_member_says_what_its_keep_runs() {
+    fn a_machine_with_no_member_says_what_happened_and_what_it_is() {
         let build = json!({"count": 4419, "hash": "6ecd6158", "local": ""});
-        let state = |running: Value, trial: Value| {
+        let state = |running: Value, trial: Value, last: Value| {
             json!({"services": [{"name": "motherd", "running": running, "build": build,
-                                 "trials": {"running": trial, "last": null}}]})
+                                 "trials": {"running": trial, "last": last}}]})
         };
+        let rolled_back = json!({"ended_ms": NOW - 23_400_000, "proven": false,
+                                 "detail": "rolled back\nno proof line within the limit"});
+        assert_eq!(
+            absent_line(
+                "WhiteWorld",
+                &state(json!(22508), Value::Null, rolled_back.clone()),
+                NOW,
+                &["zend behind".into(), "npcd behind".into()]
+            ),
+            "- WhiteWorld — motherd 4419-6ecd6158\n  \
+             6.5 h ago: keep's last trial of motherd: rolled back — rolled back / no proof line \
+             within the limit\n  \
+             now: its members are connected to the gateway (zend behind, npcd behind) and routed \
+             nothing, so their /v1/status does not answer"
+        );
         assert_eq!(
             absent_line(
                 "WhiteWorld",
                 &state(
                     json!(464),
-                    json!({"artifact": "stage/motherd.exe", "started_ms": NOW - 51_000})
+                    json!({"artifact": "stage/motherd.exe", "started_ms": NOW - 51_000}),
+                    Value::Null
                 ),
-                NOW
+                NOW,
+                &[]
             ),
-            "- WhiteWorld: not answering — keep is trying it: 51 s in, of a 10-minute window to \
-             print that it serves — the window restarts while it is catching up on replication \
-             (installed 4419-6ecd6158)"
+            "- WhiteWorld — motherd 4419-6ecd6158\n  \
+             now: keep is trying it: 51 s in, of a 10-minute window to print that it serves — \
+             the window restarts while it is catching up on replication"
         );
         assert_eq!(
-            absent_line("WhiteWorld", &state(json!(464), Value::Null), NOW),
-            "- WhiteWorld: not answering — keep runs motherd 4419-6ecd6158 as pid 464, so it is \
-             loading or stuck: read its lines with `log_grep` (a worker's `cluster_logs`)"
+            absent_line(
+                "WhiteWorld",
+                &state(json!(464), Value::Null, rolled_back),
+                NOW,
+                &[]
+            ),
+            "- WhiteWorld — motherd 4419-6ecd6158\n  \
+             6.5 h ago: keep's last trial of motherd: rolled back — rolled back / no proof line \
+             within the limit\n  \
+             now: keep runs it as pid 464, and no member of it is connected to the gateway: read \
+             its lines on the machine"
         );
         assert_eq!(
-            absent_line("WhiteWorld", &state(Value::Null, Value::Null), NOW),
-            "- WhiteWorld: not answering — keep has motherd 4419-6ecd6158 stopped"
+            absent_line(
+                "WhiteWorld",
+                &state(Value::Null, Value::Null, Value::Null),
+                NOW,
+                &[]
+            ),
+            "- WhiteWorld — motherd 4419-6ecd6158\n  now: keep has it stopped"
         );
         assert_eq!(
-            absent_line("AlienWorld", &json!({"services": []}), NOW),
+            absent_line("AlienWorld", &json!({"services": []}), NOW, &[]),
             "- AlienWorld: not answering, and its keep runs no motherd"
+        );
+    }
+
+    /// **`upgrading` only while an install is under way**: a member admitted
+    /// below the floor and installing nothing reads `behind`, and the rollout
+    /// line counts each kind; a failed install to be tried again says when.
+    #[test]
+    fn a_member_installing_nothing_is_behind_and_the_rollout_counts_it() {
+        let b = |count: u64| json!({"count": count, "hash": "h", "local": ""});
+        let up = |step: &str, retrying: Value| {
+            json!({"mode": "joined", "upgrade": {"step": step, "fetching": null,
+                   "stranded": null, "failure": null, "paused": false, "retrying": retrying}})
+        };
+        let status = json!({
+            "gateway": "bw", "build": b(1), "draining": false, "now_ms": NOW,
+            "apps": [{"app": "zend", "service": false, "mode": "clustered", "ready": 1, "members": 3,
+                      "floor": b(11), "pending_floor": null}],
+            "members": [
+                {"app": "zend", "host": "ww", "node": "01", "build": b(10), "state": "upgrading",
+                 "coord": up("", json!([{"build": "11-h", "attempts": 1, "kind": "slow",
+                                         "at_ms": NOW + 600_000}]))},
+                {"app": "zend", "host": "aw", "node": "02", "build": b(10), "state": "upgrading",
+                 "coord": up("upgrading", json!([]))},
+                {"app": "zend", "host": "bw", "node": "03", "build": b(11), "state": "ready",
+                 "coord": up("", json!([]))}
+            ],
+            "upgrades": [{"app": "zend", "candidate": null, "rollout_since_ms": NOW - 120_000}],
+            "faults": []
+        });
+        let text = render_gateway(&status);
+        assert!(
+            text.contains(
+                "\n  zend ww 01 build 10-h: behind — below the floor: its install of 11-h failed \
+                 1× (slow); tried again in 10 min"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n  zend aw 02 build 10-h: upgrading — below the floor: upgrading"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\nupgrade zend: floor raised 2 min ago; 2 members below it: 1 installing, 0 \
+                 serving an older build, 1 behind"
+            ),
+            "{text}"
         );
     }
 
