@@ -370,8 +370,14 @@ At each boundary:
      its own strength before the token budget is spent by strength across
      kinds. A run of large readings cannot crowd the other kinds out.
    - **Type shares bind here.** Documents hold at most 35% and configuration
-     15% of the pooled readings' tokens (`docs/zend_working_set.md` §4.10):
-     a measure on what provenance proposes, not on what the indexer picks.
+     15% of the pool's token budget (`docs/zend_working_set.md` §4.10): a
+     measure on what provenance proposes, not on what the indexer picks. The
+     budget, not the pooled readings' running total, so a type's room does
+     not move as the pool fills.
+   - **The working set is the pool** (`working_set::WorkingSet::observe`):
+     its membership is chosen again at every observation by these rules,
+     and the scheduler pools the slot's placed pieces and then the working
+     set's members in their order (`scheduler::pool::pool_order`).
    - **Admission is not throttled.** Every piece that ranks in at a boundary
      enters the pool at that boundary. Its index pages come from memory when
      resident, from the redo log when cold; the reads run in the
@@ -466,8 +472,9 @@ At each boundary:
    rows while its piece stays pooled.
 6. **Seating: stable.** Slot rounds are seated at compact positions: the
    system prompt in its declared order, then the lineage, then each placed
-   piece in the pool's insertion order (step 1) with its rounds in its own
-   order, then the dialogue's rounds as the projection orders them. A piece
+   piece in the pool's insertion order (step 1) within its kind's group —
+   the groups in the schema's layer order — with its rounds in its own order,
+   then the dialogue's rounds as the projection orders them. A piece
    entering is seated where its insertion order puts it, a piece leaving
    closes its gap, and nothing else moves, so a rebuild keeps the slot's
    prefix up to the first change (`scheduler/piece_identity.rs`).
@@ -591,18 +598,16 @@ not cost 306K, only the pages the question reads, up to `max_file`.
   (`opening_prompt`, the reading's tool grammar), and its round limit is the
   file's page count, not `MAX_FILE_READ_ROUNDS`, so a file of any length reads
   to its end in rounds of one page.
-- **Scored per turn.** Each page turn has its own hit counter and base. Its
-  base is provenance's normalized score for that turn (§7.1), lifted by its
-  hits. A page enters the fill at its piece's score, lifted by up to as much
-  again by how its own score stands among the piece's pages
-  (`dialogue_fill::piece_round_score`). So the piece's level decides how it
-  ranks against other pieces, and its pages' own scores decide which of them
-  the slot holds. A piece with no scored page enters at its own score, and
-  ties go to the oldest page.
-- **A reading longer than `max_file` is a member.** The working set charges it
-  `max_file_tokens`, the most of it the slot places, not its whole size
-  (`docs/zend_working_set.md` §4.4). It is pooled whole like any piece, and
-  the slot holds its floor and best pages under the `max_file` cap.
+- **Scored per turn, on the band.** Each page turn has its own hit counter
+  and base. Its base is provenance's normalized score for that turn (§7.1),
+  lifted by its hits, and a page with no base that the indexer reads is
+  credited `lineage_base · gain · h`. A page enters the fill at that score
+  alone; its piece's strength ranks the piece for the pool and never enters
+  the fill. A floor pair enters at the better of its two turns, and ties go
+  to the oldest page.
+- **No reading is too long to pool.** It is pooled whole like any piece, and
+  the slot holds its floor and best pages under the readings' cap, which one
+  reading may take whole.
 - **The fill did not run on the daemon until 2026-11-18.** Every placed turn
   of 30 dialogue prompts was whole, with the working-set groups past their
   64K budget each time. `SubstrateRead` answered the trait's default
@@ -877,7 +882,12 @@ show it.
       another stays deleted. A key whose winner is a tombstone is not written
       at all: the new substrate never held it.
 
-**The pool-first revision (2026-11-18), to build:**
+**The pool-first revision (2026-11-18), built 2026-11-19:** items 18–26
+below. The pool's sizes live in `working_set::PoolSize`, set on the substrate
+by the scheduler from the card; the shares in `working_set.shares`
+(`working_set::FillShares`); the allowance in `projection::fill::Allowance`,
+the slot's held turns recorded at each scanned boundary
+(`Substrate::working_set_boundary`).
 
 18. **The pool is the fill's candidate set (§7.2 step 1).** The fill draws
     working-set rounds from every pooled piece, not only from working-set

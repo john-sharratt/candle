@@ -735,10 +735,10 @@ layers:
     # Loading-screen unit for this layer's startup ingest ("N / M folders").
     ingest_unit: folders
     # In tool rounds, and outside the dialogue's flexbox: what a dialogue sees
-    # of this layer is its working set (docs/zend_working_set.md) — pinned
-    # folders and the ones it keeps attending to, sized by the dialogue
-    # layer's `working_set.folder_tokens`. A round that leans on a folder it
-    # listed must still have it.
+    # of this layer is its working set (docs/zend_working_set.md) — the folders
+    # it keeps attending to, pooled by strength and placed under the folders'
+    # share of the slot (`working_set.shares`). A round that leans on a folder
+    # it listed must still have it.
     window: 6000
     score_threshold: 0.0
     # Dial overrides for the shared system prompt when this layer is the
@@ -787,10 +787,9 @@ layers:
     groups:
       - id: structure
         persisted_id: 1
-        # Whole folder units from the dialogue's working set: its pinned
-        # folders (seeds, then `file_list` locks), then provenance folders by
-        # momentum, up to the working set's `folder_tokens`. A folder is only
-        # ever a provenance candidate once its momentum clears
+        # Folder units from the dialogue's pool: seeds and provenance folders by
+        # strength, at least the card's count of them. A folder is only
+        # ever a pool candidate once its momentum clears
         # `working_set.min_momentum`, so a cold probe (every folder scoring 0)
         # selects nothing but what is pinned.
         selection: { kind: working_set, share: folders }
@@ -1097,11 +1096,10 @@ layers:
     groups:
       - id: scopes
         persisted_id: 2
-        # Whole files from the dialogue's working set: its pinned files (seeds,
-        # then `file_read` locks), then provenance files by momentum, up to
-        # what `working_set.budget_tokens` leaves after the folders. Each file
-        # is one conversation, taken whole — never a slice of one.
-        selection: { kind: working_set, share: remainder }
+        # File readings from the dialogue's pool: seeds and provenance files by
+        # strength, whole, within the card's pool. The slot fill places their
+        # turns under the readings' share of the room (`working_set.shares`).
+        selection: { kind: working_set, share: readings }
         # The scan's settings stay: they decide the fresh per-file scores the
         # working set's momentum is built from.
         policy:
@@ -1140,26 +1138,41 @@ layers:
           exclude_lineage: true
       - id: guidance
         persisted_id: 13
-        # The workers' guides and the journals, placed apart from the code
+        # The workers' guides, placed apart from the code
         # (docs/guidance_layer.md): the same `code_reading` units, drawn out of
         # `scopes` by path, so a unit is placed through one group or the other.
-        # They compete among themselves for the working set's
-        # `guidance_tokens`: a guide never dislodges a file, and no burst of
-        # files crowds out a guide. A folder's hub files are not drawn: they
+        # Each of guides and journal notes is a kind of its own: the pool holds
+        # the card's count of each by its own strength, so no burst of files
+        # crowds them out, and in the slot each has its own share of the room
+        # (`working_set.shares`). A folder's hub files are not drawn: they
         # match every question and answer none, so they stay with `scopes`.
         draws:
           from: scopes
-          paths: [candle/mcp/src/guides/, journals/]
-          except: [README.md, group.yaml, journal.yaml, person.yaml]
-        # A journal entry fades with its age, so the note that superseded an
-        # older one outranks it (docs/guidance_layer.md §4); a guide carries
-        # no date stamp and does not fade.
-        selection:
-          kind: working_set
-          share: guidance
-          recency: { half_life_days: 30, dated_by: path }
+          paths: [candle/mcp/src/guides/]
+          except: [README.md]
+        selection: { kind: working_set, share: guides }
         # Scanned as `scopes` is, each guide one case; its own competition is
         # what keeps a guide from being ranked against every `.rs` file.
+        policy:
+          fusion: { mode: additive }
+          question_pin: true
+          cases: file
+          layer_weights: [0.0, 1.0, 1.0]
+          calibration_layer_weights: [0.0, 0.0, 1.0]
+          calibration_weight: 0.25
+      - id: journals
+        persisted_id: 14
+        # The journals' notes, drawn out of `scopes` as the guides are.
+        draws:
+          from: scopes
+          paths: [journals/]
+          except: [README.md, group.yaml, journal.yaml, person.yaml]
+        # A journal entry fades with its age, so the note that superseded an
+        # older one outranks it (docs/guidance_layer.md §4).
+        selection:
+          kind: working_set
+          share: journals
+          recency: { half_life_days: 30, dated_by: path }
         policy:
           fusion: { mode: additive }
           question_pin: true
@@ -1218,25 +1231,25 @@ layers:
       # The slot is the engine's trained window, so a dialogue runs the
       # trained RoPE at every depth (docs/hit_driven_projection.md §4). One
       # fill places everything in it after the system prompt: floors, then
-      # rounds by score. The shares below and this layer's window are caps on
-      # that fill, never reservations, so they may sum past the slot.
+      # rounds by score.
       # What arrives between two projections: one 64-token cadence, or one
       # prefill chunk of an opening (a tool result is prefilled in chunks of
       # this many, with a projection between them).
       reserve_tokens: 16384
-      # What the set holds — seeds and provenance.
-      budget_tokens: 64000
-      folder_tokens: 10000       # repo_map's share of it
-      # The guidance group's pool, beside `budget_tokens`: four to five guides
-      # and journal notes at a time (docs/guidance_layer.md §1).
-      guidance_tokens: 16000
-      beta: 0.2                  # per-file momentum leak: m ← (1 − β)·m + fresh
-      min_momentum: 100          # below this a file is no provenance candidate
-      # The most of one reading the slot places: a longer one is a member
-      # charged this much, and the fill keeps its first and last turns and its
-      # best-scored pages between (docs/zend_working_set.md §4.4).
-      max_file_tokens: 48000
-      # The most of `budget_tokens` each type of document may hold; a file of
+      # Each kind's share of the room — the slot less the reserve, the system
+      # prompt and what the turn has appended — as the fill's caps. They sum
+      # to the room, so no kind crowds another out; a kind with little to place
+      # leaves its room to the next round by score. There is no per-piece cap
+      # (docs/hit_driven_projection.md §7.2 step 4).
+      shares: { readings: 0.225, folders: 0.02, guides: 0.05, journals: 0.105, dialogue: 0.6 }
+      # The working set is the slot's pool: whole conversations holding their
+      # index pages only, chosen by strength kind by kind. Its size is the
+      # card's — 2M tokens and 6 of each kind on the 72 GB card, 1M and 4 on
+      # the 24 GB card, 512K and 4 on the 16 GB card — never this file's
+      # (docs/hit_driven_projection.md §7.2 step 1).
+      beta: 0.2                  # per-piece momentum leak: m ← (1 − β)·m + fresh
+      min_momentum: 100          # below this a piece is no pool candidate
+      # The most of the pool's tokens each type of document may hold; a file of
       # no type (code, tests, kernels, scripts) is unbounded, and provenance
       # orders the rest
       # (docs/zend_working_set.md §4.10). Patterns match a unit's subject,

@@ -150,7 +150,6 @@ use section_pages::SectionPages;
 
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
-use self::pool::pool_tokens_for;
 use self::relief_pacing::ReliefPacing;
 use self::reproject_census::{Outcome as ReprojectOutcome, Part as ReprojectPart, ReprojectCensus};
 use self::request_laps::RequestLaps;
@@ -170,6 +169,7 @@ use crate::persistence::cold_load::{
 };
 use crate::persistence::content_hash::{section_stream_id, turn_stream_id, ContentChain};
 use crate::provenance::boundaries::{BoundaryRule, BoundaryState, Step};
+use crate::working_set::PoolSize;
 // Only the K/V-digest request carries these, and it is a test-helper probe.
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::persistence::content_hash::{ContentHash, ContentHasher};
@@ -3623,9 +3623,9 @@ pub(crate) struct Scheduler {
     /// The cut falls **after** the token, so a marker stays in the page it
     /// closes rather than heading the next one.
     page_break_tokens: Vec<u32>,
-    /// Tokens a dialogue's pool holds behind its slot
-    /// (`docs/hit_driven_projection.md` §7.2), by the card's size.
-    pool_tokens: usize,
+    /// How large a dialogue's pool is behind its slot
+    /// (`docs/hit_driven_projection.md` §7.2 step 1), by the card's size.
+    pool_size: PoolSize,
     /// EOS token ID (stops generation).
     eos_tokens: TokenBuffer,
     /// Device the model lives on.
@@ -4435,7 +4435,7 @@ impl Scheduler {
             ?page_break_tokens,
             "index page breaks resolved by name (<think>, </think>, turn closer)"
         );
-        let pool_tokens = pool_tokens_for(
+        let pool_size = PoolSize::for_card(
             model
                 .device()
                 .mem_get_info()
@@ -4452,7 +4452,7 @@ impl Scheduler {
             tokenizer,
             think_close,
             page_break_tokens,
-            pool_tokens,
+            pool_size,
             eos_tokens,
             device,
             active_decodes: HashMap::new(),
@@ -12010,8 +12010,11 @@ impl Scheduler {
                         })
                     })
                     .unwrap_or(LINEAGE_BASE);
-                // Credit for unscored reads goes to the conversation and its
-                // lineage alone: their turns are ranked on the lineage's scale.
+                // Credit for unscored reads goes to the conversation, its
+                // lineage and the pooled pieces: every round of the fill is
+                // ranked on the one band (§7.1), so a pooled turn the shadow
+                // scan keeps reading is brought in though provenance did not
+                // score it.
                 let chain: HashSet<TimelineId> = policy
                     .substrate
                     .read()
@@ -12032,33 +12035,41 @@ impl Scheduler {
                 };
                 lifted = turn_lifts.len();
                 top_lift = turn_lifts.values().copied().fold(0.0, f32::max);
-                projection_scores.lift_turns(turn_lifts, base, |k| chain.contains(&k.timeline));
+                let pool = &state.pool;
+                projection_scores.lift_turns(turn_lifts, base, |k| {
+                    chain.contains(&k.timeline) || pool.contains_key(&k.timeline)
+                });
                 hit_density::hit_density(&parts)
             }
             None => HashMap::new(),
         };
         let hits_us = t_observe.elapsed().as_micros() as u64;
         let t_ws = Instant::now();
+        // The working set is the pool: it chooses its pieces within this
+        // card's size (`docs/hit_driven_projection.md` §7.2 step 1).
+        if policy.substrate.read().pool_size() != self.pool_size {
+            let size = self.pool_size;
+            policy.substrate.update(|s| s.set_pool_size(size));
+        }
+        // The boundary: what the slot holds now, for the fill to keep seated
+        // and to count entries against (§7.2 step 5).
+        let placed_turns = self
+            .slot_projection_state
+            .get(&slot)
+            .map(|s| s.placed_turns())
+            .unwrap_or_default();
+        let target = policy.target.timeline;
+        policy
+            .substrate
+            .update(|s| s.working_set_boundary(target, &placed_turns));
         policy
             .substrate
             .observe_working_set(schema, policy.target, &group_candidates, &density);
         let ws_us = t_ws.elapsed().as_micros() as u64;
-        // The pool behind the slot, chosen from the same scan: each candidate
-        // conversation lifted by the most-read of its rounds (§7.2).
-        let pool_lifts: HashMap<TimelineId, f32> = self
-            .slot_projection_state
-            .get(&slot)
-            .map(|s| {
-                let mut by_piece: HashMap<TimelineId, f32> = HashMap::new();
-                for (key, lift) in s.round_hits.lifts(&schema.hits) {
-                    let at = by_piece.entry(key.timeline).or_insert(lift);
-                    *at = at.max(lift);
-                }
-                by_piece
-            })
-            .unwrap_or_default();
+        // The pool behind the slot: the pieces it places and the working
+        // set's members (§7.2 step 1).
         let t_pool = Instant::now();
-        let pool = self.refresh_pool(slot, &policy.substrate, &group_candidates, &pool_lifts);
+        let pool = self.refresh_pool(slot, &policy.substrate, policy.target.timeline);
         let pool_us = t_pool.elapsed().as_micros() as u64;
         observe_span.end();
         let observe_us = t_observe.elapsed().as_micros() as u64;
@@ -12077,12 +12088,17 @@ impl Scheduler {
         note("reproject observe split", || {
             format!(
                 "view={} observe_us={observe_us} hits_us={hits_us} ws_us={ws_us} \
-                 pool_us={pool_us} pooled={} pool_reused={} pool_walked_turns={} \
+                 pool_us={pool_us} pooled={} pool_admitted={} pool_dropped={} \
+                 pool_read_us={} pool_read_bytes={} pool_reused={} pool_walked_turns={} \
                  candidates={} hit_parts={} queries={} shadow_queries={} \
                  loaded_rounds={} loaded_hit={} loaded_hits={} pooled_rounds={} \
                  pooled_hit={} pooled_hits={} turns_lifted={lifted} top_lift={top_lift:.3}",
                 view_id.0,
                 pool.pooled,
+                pool.admitted,
+                pool.dropped,
+                pool.read_us,
+                pool.read_bytes,
                 pool.reused,
                 pool.walked,
                 group_candidates.iter().map(|(_, c)| c.len()).sum::<usize>(),

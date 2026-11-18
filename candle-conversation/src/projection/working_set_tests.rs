@@ -40,18 +40,16 @@ layers:
     summary: *summary
     groups:
       - id: scopes
-        selection: { kind: working_set, share: remainder }
+        selection: { kind: working_set, share: readings }
 
   - name: dialogue
     window: 500
     summary: *summary
     working_set:
-      budget_tokens: 1000
-      folder_tokens: 300
       beta: 0.2
       min_momentum: 100
-      max_file_tokens: 800
       reserve_tokens: 500
+      shares: { readings: 0.225, folders: 0.02, guides: 0.05, journals: 0.105, dialogue: 0.6 }
     budget:
       priority: 100
     groups:

@@ -1449,18 +1449,31 @@ pub enum SelectionRule {
     WorkingSet { share: WorkingSetShare },
 }
 
-/// Which part of the target's working-set budget a
-/// [`SelectionRule::WorkingSet`] group fills.
+/// Which kind of piece a [`SelectionRule::WorkingSet`] group holds: the kind
+/// whose share of the room caps its rounds in the slot fill
+/// (`docs/hit_driven_projection.md` §7.2 step 4, `working_set.shares`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkingSetShare {
-    /// Up to the working set's `folder_tokens`, shared by every folder group.
+    /// File readings. Members hold what `budget_tokens` leaves once the folder
+    /// groups have selected.
+    Readings,
+    /// Folder summaries. Members hold up to `folder_tokens`, shared by every
+    /// folder group.
     Folders,
-    /// What `budget_tokens` leaves once the folder groups have selected.
-    Remainder,
-    /// Up to the working set's `guidance_tokens`, a pool of its own beside
-    /// `budget_tokens`: a guide never dislodges a file, and no burst of files
-    /// crowds out a guide (`docs/guidance_layer.md` §1).
-    Guidance,
+    /// The workers' guides.
+    Guides,
+    /// Journal notes.
+    Journals,
+}
+
+impl WorkingSetShare {
+    /// Whether this share's members draw on the working set's guidance pool,
+    /// `guidance_tokens`, a pool of its own beside `budget_tokens`: a guide or
+    /// note never dislodges a file, and no burst of files crowds one out
+    /// (`docs/guidance_layer.md` §1).
+    pub fn is_guidance(self) -> bool {
+        matches!(self, Self::Guides | Self::Journals)
+    }
 }
 
 /// A fallback section injected when a **collection's** normal selection

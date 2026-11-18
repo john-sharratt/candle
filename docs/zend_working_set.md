@@ -5,7 +5,10 @@
 (`fast_path_window`, deleted); it does not sit beside it.
 
 **Revised by `docs/hit_driven_projection.md` §7.2 and §12 items 18–26
-(2026-11-18), which supersede this document where they differ:**
+(2026-11-18, built 2026-11-19), which supersede this document where they
+differ. Of §4.2's block, `budget_tokens`, `folder_tokens`, `guidance_tokens`,
+`max_file_tokens` and `max_admits` are gone: the pool's size is the card's
+(`working_set::PoolSize`), and the slot's caps are `shares:`.**
 - The working set's momentum, seeds and withheld set rank the **pool**, the
   fill's candidate set of whole conversations holding index pages only.
   Whole-file membership charged against `budget_tokens`, `max_admits`, the

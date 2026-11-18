@@ -3,12 +3,13 @@
 //! order.
 //!
 //! Nothing is chosen here. Which conversations are members, and where each
-//! sits, is decided when they enter and leave the working set — admission
-//! enforces the budget, and the order is insertion order — so a projection
-//! emits exactly what the set holds and two projections of an unchanged set
-//! emit the same thing.
+//! sits, is decided when the pool is chosen — by strength within the card's
+//! size, in insertion order — so a projection emits exactly what the set
+//! holds and two projections of an unchanged set emit the same thing.
 
-use super::ids::TimelineId;
+use std::collections::HashSet;
+
+use super::ids::{TimelineId, TurnKey};
 use crate::summary_tree::SelectionOrigin;
 
 /// The projection target's working-set members in one group, in the working
@@ -16,6 +17,17 @@ use crate::summary_tree::SelectionOrigin;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkingSetMembers {
     pub members: Vec<(TimelineId, f32)>,
+}
+
+/// What the slot fill knows of the boundary it fills at
+/// (`docs/hit_driven_projection.md` §7.2 step 5).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SlotBoundary {
+    /// The turns the slot holds from the boundary before.
+    pub held: HashSet<TurnKey>,
+    /// Whether this is the first boundary after a new user message, which
+    /// chooses its rounds whole, with no allowance.
+    pub opening: bool,
 }
 
 /// One conversation a working-set group emits.

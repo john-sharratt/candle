@@ -16,17 +16,25 @@ them**.
 
 ## 1. What it is
 
-A `guidance` group on the `code_reading` layer, declared in the schema with a
-filter over the units it draws:
+Two drawing groups on the `code_reading` layer — `guidance` for the guides,
+`journals` for the journal notes — each declared in the schema with a filter
+over the units it draws:
 
 ```yaml
 - id: guidance
   persisted_id: 13
   draws:
     from: scopes
-    paths: [candle/mcp/src/guides/, journals/]
+    paths: [candle/mcp/src/guides/]
+    except: [README.md]
+  selection: { kind: working_set, share: guides }
+- id: journals
+  persisted_id: 14
+  draws:
+    from: scopes
+    paths: [journals/]
     except: [README.md, group.yaml, journal.yaml, person.yaml]
-  selection: { kind: working_set, share: guidance }
+  selection: { kind: working_set, share: journals, recency: { half_life_days: 30, dated_by: path } }
 ```
 
 - **It draws, it does not own.** A unit belongs to `scopes` as it always has.
@@ -44,15 +52,13 @@ filter over the units it draws:
   (`Substrate::placing_group`) and the members a group emits
   (`working_set_members`) all follow that split, so a unit is placed through one
   group, never both.
-- **Its own pool.** `WorkingSetShare::Guidance` is bounded by the working set's
-  `guidance_tokens` (16K, four to five guides and journal notes at a time), a
-  pool beside `budget_tokens` (64K) rather than inside it. On a selecting
-  engine both are caps on the one slot fill of the trained window
-  (`docs/hit_driven_projection.md` §4, §7.2): guidance enters by score like
-  every other unit, up to its cap, and room it leaves goes to the next unit.
-  Guidance dislodges only guidance, and nothing else dislodges it: a guide never
-  dislodges a code file, and no burst of code crowds out the guide the worker
-  needs. Without `guidance_tokens` no guide enters.
+- **Kinds of their own.** Guides (`WorkingSetShare::Guides`) and journal notes
+  (`WorkingSetShare::Journals`) are each a kind of the pool, which holds the
+  card's count of each by its own strength whatever the code ranks
+  (`docs/hit_driven_projection.md` §7.2 step 1), so no burst of code crowds out
+  the guide the worker needs. In the slot each has its own share of the room —
+  guides 5%, journals 10.5% (`working_set.shares`) — and enters by score like
+  every other round, up to its cap; room it leaves goes to the next round.
 - **The same scope.** A unit is offered only when the conversation's base holds
   its version (`retrieval_scope`), as for every `code_reading` unit. Its own
   scan competition (`cases: file`, per group) keeps a guide from being ranked
@@ -144,13 +150,14 @@ room on units the worker will read regardless. "Relevant" is the signal of
 placement working. It is a proxy: a matching scan says the reasoning was on the
 unit's subject while it was placed, not that the reply used it.
 
-The self-improvement mission reads these lines to retune `guidance_tokens` and
-the group's band, and to judge the mined calibration: "missed" should fall as
+The self-improvement mission reads these lines to retune the guides' and
+journals' shares and the groups' bands, and to judge the mined calibration: "missed" should fall as
 exemplars accumulate, and "relevant" should rise against "read anyway".
 
 ## 4. Journals
 
-Journals reach the same group by the same filter, with two differences:
+Journals reach a group of their own, `journals`, by the same kind of filter,
+with two differences:
 
 - **They change continuously.** A journal file's new version is a new
   `code_reading` unit, read when the branch ingest sees it, and its use
@@ -165,7 +172,7 @@ Journals reach the same group by the same filter, with two differences:
   ```yaml
   selection:
     kind: working_set
-    share: guidance
+    share: journals
     recency: { half_life_days: 30, dated_by: path }
   ```
 
@@ -182,7 +189,7 @@ Journals reach the same group by the same filter, with two differences:
 
 1. **Built.** The drawing group: `draws:` on a group, its candidates taken from
    its source, the drawn units leaving the owning group's candidates; the
-   `guidance` share and `guidance_tokens`. Tests against the substrate, the
+   `guides` and `journals` kinds. Tests against the substrate, the
    retrieval scope and the working set.
 2. **Built.** Use calibration: a read in a tool round becomes an exemplar of its
    unit, kept per unit up to `MAX_EXEMPLARS`. Tests for the read's file, the

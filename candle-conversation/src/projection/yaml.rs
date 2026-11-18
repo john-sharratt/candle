@@ -90,7 +90,7 @@ use super::schema::{
 };
 use super::swap_cap::DEFAULT_MAX_SWAPS;
 use crate::summary_tree::scope::Scope;
-use crate::working_set::{TypeShareSpec, TypeShares, WorkingSetConfig};
+use crate::working_set::{FillShares, TypeShareSpec, TypeShares, WorkingSetConfig};
 
 /// Sequential SectionId allocator. Ids are globally unique across the whole
 /// schema even though names are per-layer scoped.
@@ -968,27 +968,30 @@ fn parse_recency(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct YamlWorkingSet {
-    budget_tokens: usize,
-    folder_tokens: usize,
     beta: f32,
     min_momentum: f32,
-    max_file_tokens: usize,
-    /// The guidance groups' pool; none when the schema declares no such group.
-    #[serde(default)]
-    guidance_tokens: usize,
     #[serde(default)]
     seeds: Vec<String>,
-    /// Provenance members one reprojection admits; [`DEFAULT_MAX_SWAPS`] when
-    /// absent.
-    #[serde(default)]
-    max_admits: Option<usize>,
     /// What the slot keeps back for what arrives between two projections:
     /// one cadence of decoded tokens or one prefill chunk.
     reserve_tokens: usize,
-    /// The most of `budget_tokens` each type of document may hold; none when
-    /// absent.
+    /// The most of the pool's tokens each type of document may hold; none
+    /// when absent.
     #[serde(default)]
     type_shares: Vec<YamlTypeShare>,
+    /// Each kind's share of the slot's room, the fill's caps.
+    shares: YamlFillShares,
+}
+
+/// A `working_set.shares` block — see [`FillShares`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YamlFillShares {
+    readings: f64,
+    folders: f64,
+    guides: f64,
+    journals: f64,
+    dialogue: f64,
 }
 
 /// One `working_set.type_shares` entry.
@@ -1059,8 +1062,10 @@ fn parse_draws(
 }
 
 /// Resolve a layer's `working_set:` block, refusing values the arithmetic
-/// cannot use: a leak outside `(0, 1]`, a folder share larger than the whole,
-/// a negative floor, a zero file cap.
+/// cannot use: a leak outside `(0, 1]`, a negative floor, shares that do not
+/// make the room. The slot is the engine's trained window, which the schema
+/// does not know: the reserve is measured against it at each fill, which runs
+/// on the rung above when it passes it (`WorkingSetConfig::slot_window`).
 fn parse_working_set(
     layer: &str,
     yw: Option<&YamlWorkingSet>,
@@ -1075,43 +1080,25 @@ fn parse_working_set(
     if !(yw.beta > 0.0 && yw.beta <= 1.0) {
         return Err(invalid("beta must be in (0, 1]"));
     }
-    if yw.folder_tokens > yw.budget_tokens {
-        return Err(invalid("folder_tokens must not exceed budget_tokens"));
-    }
     if yw.min_momentum < 0.0 {
         return Err(invalid("min_momentum must be >= 0"));
     }
-    if yw.max_file_tokens == 0 {
-        return Err(invalid("max_file_tokens must be > 0"));
-    }
-    // The slot is the engine's trained window, which the schema does not know:
-    // the shares and the window are caps on one fill of it
-    // (`docs/hit_driven_projection.md` §7.2), so they may sum past it; the
-    // reserve is measured against it at each fill, which runs on the rung above
-    // when it passes it (`WorkingSetConfig::slot_window`).
-    let max_admits = match yw.max_admits {
-        None => DEFAULT_MAX_SWAPS,
-        Some(n) => NonZeroUsize::new(n).ok_or_else(|| {
-            invalid("max_admits must be >= 1: a cap of 0 admits no conversation, ever")
-        })?,
-    };
     let specs: Vec<TypeShareSpec> = yw
         .type_shares
         .iter()
         .map(|t| (t.name.clone(), t.files.clone(), t.max_share))
         .collect();
     let type_shares = TypeShares::new(&specs).map_err(|e| invalid(&format!("type_shares: {e}")))?;
+    let s = &yw.shares;
+    let fill_shares = FillShares::new(s.readings, s.folders, s.guides, s.journals, s.dialogue)
+        .map_err(|e| invalid(&e))?;
     Ok(Some(WorkingSetConfig {
-        budget_tokens: yw.budget_tokens,
-        folder_tokens: yw.folder_tokens,
-        guidance_tokens: yw.guidance_tokens,
         beta: yw.beta,
         min_momentum: yw.min_momentum,
-        max_file_tokens: yw.max_file_tokens,
         seeds: yw.seeds.clone(),
-        max_admits,
         reserve_tokens: yw.reserve_tokens,
         type_shares,
+        fill_shares,
     }))
 }
 
@@ -2856,13 +2843,14 @@ fn parse_selection(name: &str, ys: &YamlSelection) -> Result<SelectionRule, Cons
         }
         "working_set" => {
             let share = match ys.share.as_deref() {
+                Some("readings") => WorkingSetShare::Readings,
                 Some("folders") => WorkingSetShare::Folders,
-                Some("remainder") => WorkingSetShare::Remainder,
-                Some("guidance") => WorkingSetShare::Guidance,
+                Some("guides") => WorkingSetShare::Guides,
+                Some("journals") => WorkingSetShare::Journals,
                 other => {
                     let reason = format!(
-                        "a working_set selection needs share: folders | remainder | guidance, \
-                         got {other:?}"
+                        "a working_set selection needs share: readings | folders | guides | \
+                         journals, got {other:?}"
                     );
                     return Err(ConstructionError::InvalidPolicy {
                         name: name.to_string(),

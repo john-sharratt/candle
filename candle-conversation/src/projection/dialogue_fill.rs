@@ -6,9 +6,10 @@
 //!
 //! - **the lineage**, each exchange whole, scored from its base (§8.4);
 //! - **the working set**: each piece's first and last turn — its request and
-//!   its answer — as its floor, and its tool turns — a reading's pages — at the piece's score, ranked
-//!   among themselves by each turn's own score, so a reading its cap will not
-//!   take whole keeps its best pages (§8.2, [`piece_round_score`]);
+//!   its answer — as its floor, scored by the better of the two, and its tool
+//!   turns — a reading's pages — each at its own turn's score (§7.1, §8.2): every
+//!   unit competes on the one band, and a piece's strength, which ranks it for
+//!   the pool, never enters the fill;
 //! - **the dialogue** (§8.3): its newest exchange as the current one — its
 //!   first turn, its newest tool turn and its last kept, its older tool turns
 //!   shed first — its first exchange's floor, and its `recent` exchanges before
@@ -23,16 +24,15 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::projection::fill::{fill, Caps, FillInput, FloorExchange, Kind, Unit};
+use crate::projection::fill::{fill, Allowance, Caps, FillInput, FloorExchange, Kind, Unit};
 use crate::projection::rounds;
 use crate::projection::TurnKey;
 
-/// One working-set piece: its kind for the caps, its score, and its
-/// exchanges, each its turns in order.
+/// One working-set piece: its kind for the caps and its exchanges, each its
+/// turns in order.
 #[derive(Debug, Clone)]
 pub struct WorkingPiece {
     pub kind: Kind,
-    pub score: f32,
     pub exchanges: Vec<Vec<TurnKey>>,
 }
 
@@ -60,6 +60,11 @@ pub struct DialogueSlot {
     pub own: Vec<Vec<TurnKey>>,
     /// Every other group's selected exchanges.
     pub context: Vec<ContextExchange>,
+    /// The turns the slot holds now, from the boundary before.
+    pub held: HashSet<TurnKey>,
+    /// What may enter per working-set kind at this boundary; `None` on the
+    /// first boundary after a new user message ([`fill`]).
+    pub allowance: Option<Allowance>,
 }
 
 /// What the fill placed, part by part, each in the order the slot seats it.
@@ -122,22 +127,6 @@ fn floor_rounds(n: usize) -> Vec<usize> {
     }
 }
 
-/// The score one tool turn of a working-set piece enters the fill
-/// at: the piece's own `piece` score, lifted by up to as much again by how the
-/// turn stands among the piece's turns — `round`, its score (the scan's
-/// evidence for that page, lifted by the hits on it), against `best`, the
-/// highest of the piece's turns. The piece's level decides how it ranks
-/// against the other pieces; the turns' own scores decide which pages a
-/// reading longer than `max_file_tokens` keeps (`docs/hit_driven_projection.md`
-/// §8.2). A piece with no scored turn enters at `piece` throughout.
-fn piece_round_score(piece: f32, round: f32, best: f32) -> f32 {
-    if best > 0.0 {
-        piece * (1.0 + round.max(0.0) / best)
-    } else {
-        piece
-    }
-}
-
 /// Plan `slot` (module docs). `score` is a turn's score; `tokens` a turn's.
 pub fn plan(
     slot: &DialogueSlot,
@@ -177,16 +166,10 @@ pub fn plan(
         input.scored.push(u);
     }
 
-    // The working set.
+    // The working set: every unit at its own turns' scores, on the band.
     for (p, wp) in slot.working.iter().enumerate() {
         let pid = piece();
         let mut floor: Vec<Unit> = Vec::new();
-        let best = wp
-            .exchanges
-            .iter()
-            .map(|ex| best_of(ex, &(0..ex.len()).collect::<Vec<_>>()))
-            .fold(0.0, f32::max);
-        let ranked = |s: f32| piece_round_score(wp.score, s, best);
         for (e, ex) in wp.exchanges.iter().enumerate() {
             let n = ex.len();
             if n == 0 {
@@ -200,7 +183,7 @@ pub fn plan(
                 pid,
                 wp.kind,
                 sum(ex, &fr),
-                ranked(best_of(ex, &fr)),
+                best_of(ex, &fr),
             );
             floor.push(pair);
             if n <= 2 {
@@ -208,8 +191,7 @@ pub fn plan(
                 input.scored.push(pair);
             }
             for (r, &turn) in ex.iter().enumerate().take(n.saturating_sub(1)).skip(1) {
-                let s = ranked(score(turn));
-                let u = units.add(part, vec![r], pid, wp.kind, tokens(turn), s);
+                let u = units.add(part, vec![r], pid, wp.kind, tokens(turn), score(turn));
                 input.scored.push(u);
             }
         }
@@ -293,6 +275,27 @@ pub fn plan(
     // Floors run newest first.
     input.recent.reverse();
 
+    // A unit is held when the slot holds every turn of it.
+    let exchange_of = |part: Part| -> &[TurnKey] {
+        match part {
+            Part::Lineage(i) => &slot.lineage[i].0,
+            Part::Working(p, e) => &slot.working[p].exchanges[e],
+            Part::Own(e) => &slot.own[e],
+            Part::Context(i) => &slot.context[i].exchange,
+        }
+    };
+    input.held = units
+        .of
+        .iter()
+        .enumerate()
+        .filter(|(_, (part, rounds))| {
+            let ex = exchange_of(*part);
+            !rounds.is_empty() && rounds.iter().all(|&r| slot.held.contains(&ex[r]))
+        })
+        .map(|(id, _)| id)
+        .collect();
+    input.allowance = slot.allowance.clone();
+
     let filled = fill(&input, &slot.caps);
     let mut kept: HashMap<Part, HashSet<usize>> = HashMap::new();
     for id in &filled.placed {
@@ -362,11 +365,11 @@ mod tests {
 
     fn caps() -> Caps {
         Caps {
-            budget: 10_000,
-            folder: 10_000,
-            guidance: 10_000,
-            max_file: 10_000,
-            window: 10_000,
+            readings: 10_000,
+            folders: 10_000,
+            guides: 10_000,
+            journals: 10_000,
+            dialogue: 10_000,
             layers: vec![30],
         }
     }
@@ -376,12 +379,16 @@ mod tests {
         20
     }
 
-    fn reading(score: f32) -> WorkingPiece {
+    /// A reading of four turns on timeline `tl`.
+    fn reading_of(tl: u64) -> WorkingPiece {
         WorkingPiece {
             kind: Kind::Reading,
-            score,
-            exchanges: vec![vec![k(5, 0), k(5, 1), k(5, 2), k(5, 3)]],
+            exchanges: vec![vec![k(tl, 0), k(tl, 1), k(tl, 2), k(tl, 3)]],
         }
+    }
+
+    fn reading() -> WorkingPiece {
+        reading_of(5)
     }
 
     fn slot(room: usize, caps: Caps, working: Vec<WorkingPiece>) -> DialogueSlot {
@@ -393,6 +400,8 @@ mod tests {
             working,
             own: vec![],
             context: vec![],
+            held: HashSet::new(),
+            allowance: None,
         }
     }
 
@@ -404,9 +413,11 @@ mod tests {
             caps: caps(),
             recent: 16,
             lineage: vec![(vec![k(9, 0)], 1_000.0)],
-            working: vec![reading(500.0)],
+            working: vec![reading()],
             own: vec![vec![k(1, 0)], vec![k(1, 1), k(1, 2)]],
             context: vec![],
+            held: HashSet::new(),
+            allowance: None,
         };
         let p = plan(&slot, |_| 1.0, twenty);
         assert_eq!(p.lineage, vec![k(9, 0)]);
@@ -419,35 +430,43 @@ mod tests {
     /// tool turn that ties go to, the oldest, each whole.
     #[test]
     fn a_reading_is_carved_to_whole_turns() {
-        let p = plan(&slot(60, caps(), vec![reading(500.0)]), |_| 0.0, twenty);
+        let p = plan(&slot(60, caps(), vec![reading()]), |_| 0.0, twenty);
         assert_eq!(p.working, vec![vec![k(5, 0), k(5, 1), k(5, 3)]]);
     }
 
     /// **A reading past its cap keeps the page its own score names, not its
-    /// first**: room for everything, but `max_file` of 60 holds the floor and
-    /// one tool turn. Turn 5:2 is the one the scan scored, so it is kept over
-    /// 5:1, which ties would have kept.
+    /// first**: room for everything, but a readings cap of 60 holds the floor
+    /// and one tool turn. Turn 5:2 is the one the scan scored, so it is kept
+    /// over 5:1, which ties would have kept.
     #[test]
     fn a_capped_reading_keeps_its_best_scored_turn() {
         let capped = Caps {
-            max_file: 60,
+            readings: 60,
             ..caps()
         };
-        let s = slot(10_000, capped, vec![reading(500.0)]);
+        let s = slot(10_000, capped, vec![reading()]);
         let p = plan(&s, |t| if t == k(5, 2) { 900.0 } else { 0.0 }, twenty);
         assert_eq!(p.working, vec![vec![k(5, 0), k(5, 2), k(5, 3)]]);
     }
 
-    /// A turn's score keeps its piece's level and ranks it among the piece's
-    /// turns: the best turn is lifted to twice the piece, an unscored one stays
-    /// at it, and a piece with nothing scored is its own score throughout.
+    /// **Rounds compete on the band, whichever piece they come from.** With
+    /// room under the readings cap for one round and its floor, the round
+    /// scored 800 enters and brings its reading; the other reading's round,
+    /// scored 300, does not — nothing of a piece's own strength reorders them.
     #[test]
-    fn a_pieces_rounds_rank_within_its_level() {
-        assert_eq!(piece_round_score(500.0, 900.0, 900.0), 1_000.0);
-        assert_eq!(piece_round_score(500.0, 450.0, 900.0), 750.0);
-        assert_eq!(piece_round_score(500.0, 0.0, 900.0), 500.0);
-        assert_eq!(piece_round_score(500.0, -3.0, 900.0), 500.0);
-        assert_eq!(piece_round_score(500.0, 0.0, 0.0), 500.0);
+    fn a_working_round_ranks_by_its_own_score() {
+        let capped = Caps {
+            readings: 60,
+            ..caps()
+        };
+        let s = slot(10_000, capped, vec![reading_of(5), reading_of(6)]);
+        let scores = |t: TurnKey| match (t.timeline.raw(), t.index.0) {
+            (5, 1) => 300.0,
+            (6, 1) => 800.0,
+            _ => 0.0,
+        };
+        let p = plan(&s, scores, twenty);
+        assert_eq!(p.working, vec![vec![], vec![k(6, 0), k(6, 1), k(6, 3)]]);
     }
 
     /// An older exchange the room has no place for leaves whole; the current
@@ -472,6 +491,28 @@ mod tests {
         };
         let p = plan(&slot, |_| 0.0, twenty);
         assert_eq!(p.own, vec![k(1, 0), k(1, 2), k(1, 3), k(1, 4)]);
+    }
+
+    /// **A reading the slot holds keeps its pages at a boundary with an
+    /// allowance**: the slot holds 5:1 (and the floor); a stronger page 5:2
+    /// may enter only while the readings' allowance has room — none here — so
+    /// the held page stays and the new one waits.
+    #[test]
+    fn a_held_page_stays_while_the_allowance_is_spent() {
+        let capped = Caps {
+            readings: 60,
+            ..caps()
+        };
+        let scores = |t: TurnKey| if t == k(5, 2) { 900.0 } else { 10.0 };
+        let mut s = slot(10_000, capped, vec![reading()]);
+        s.held = HashSet::from([k(5, 0), k(5, 1), k(5, 3)]);
+        s.allowance = Some(Allowance::from([(Kind::Reading, 0)]));
+        let p = plan(&s, scores, twenty);
+        assert_eq!(p.working, vec![vec![k(5, 0), k(5, 1), k(5, 3)]]);
+        // The first boundary after a question chooses whole, by score.
+        s.allowance = None;
+        let p = plan(&s, scores, twenty);
+        assert_eq!(p.working, vec![vec![k(5, 0), k(5, 2), k(5, 3)]]);
     }
 
     /// Another layer's exchanges enter whole by score under that layer's

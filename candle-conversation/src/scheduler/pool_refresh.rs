@@ -1,30 +1,30 @@
 //! The pool a reprojection leaves behind a dialogue's slot
-//! (`docs/hit_driven_projection.md` §7.2).
+//! (`docs/hit_driven_projection.md` §7.2 step 1).
 //!
-//! At each reprojection the pool is chosen again ([`super::pool::choose_pool`]):
-//! the conversations the slot places are its floor, and provenance's other
-//! candidates follow by score, lifted by the hits their rounds ran up. Each
-//! pooled conversation's turns hold their index pages at the sampled layers on
-//! the model — placed once per card, shared with every slot and pool that holds
-//! the same piece — and a conversation the pool drops lets go of them.
+//! At each reprojection the pool is taken again ([`super::pool::pool_order`]):
+//! the conversations the slot places, then the dialogue's working set — the
+//! pieces it chose by strength within the card's size. Each pooled
+//! conversation's turns hold their index pages at the sampled layers on the
+//! model — placed once per card, shared with every slot and pool that holds the
+//! same piece — and a conversation the pool drops lets go of them. No K/V moves
+//! for a pooled piece: its rounds' K/V comes up only when the fill places one.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use candle_transformers::models::piece_key::PieceKey;
 
 use crate::index_pages;
-use crate::projection::{Conversation, GroupId, TimelineId, TurnIndex, TurnKey};
+use crate::projection::{Conversation, TimelineId, TurnIndex, WorkingSetShare};
 use crate::sequence_handle::SequenceId;
 
-use super::pool::{choose_pool, PoolCandidate};
+use super::pool::pool_order;
 use super::pooled_rounds::PoolPages;
+use super::profile;
 use super::Scheduler;
 
-/// Conversations a reprojection admits to the pool that it was not holding,
-/// at most. Admitting reads each turn's index pages, from the log for one
-/// whose bytes are not in memory, so the admissions of one boundary are
-/// bounded and the rest come at the next.
-const POOL_ADMITS_PER_BOUNDARY: usize = 2;
+/// How many of each kind's strongest pieces the per-kind line names.
+const NAMED_PER_KIND: usize = 8;
 
 /// What one refresh did, for the reprojection's observe split.
 #[derive(Debug, Default, Clone, Copy)]
@@ -34,8 +34,16 @@ pub(super) struct PoolRefresh {
     /// Of them, kept from the last refresh without reading their held turns
     /// again.
     pub reused: usize,
+    /// Conversations it admitted that the last refresh did not hold.
+    pub admitted: usize,
+    /// Conversations the last refresh held that it let go.
+    pub dropped: usize,
     /// Turns whose index pages it read.
     pub walked: usize,
+    /// Bytes of index pages it read.
+    pub read_bytes: usize,
+    /// Microseconds the reads took — the `pool:index_read` span.
+    pub read_us: u64,
 }
 
 /// The turns of a pooled conversation a refresh reads: from `walked`, the
@@ -50,16 +58,27 @@ pub(super) fn walk_from(walked: Option<u32>, turns: u32, layout_held: bool) -> u
     }
 }
 
+/// A kind's name in the per-kind line.
+fn kind_name(share: WorkingSetShare) -> &'static str {
+    match share {
+        WorkingSetShare::Readings => "readings",
+        WorkingSetShare::Folders => "folders",
+        WorkingSetShare::Guides => "guides",
+        WorkingSetShare::Journals => "journals",
+    }
+}
+
 impl Scheduler {
-    /// Choose `slot`'s pool from `candidates` — what the belief scan scored
-    /// this reprojection, per group — and hold its pieces' sampled-layer
-    /// index pages on the model.
+    /// Take `slot`'s pool again — the pieces it places, then `target`'s
+    /// working set — and hold its pieces' sampled-layer index pages on the
+    /// model.
     ///
-    /// A conversation the pool already holds keeps the pages it holds: only
-    /// the turns it gained since the last refresh are read and held. Reading
-    /// every turn's pages again at every reprojection — from the log, for a
-    /// page not in memory — was most of a reprojection's time on a long
-    /// conversation, and the decode waited on it.
+    /// **Admission is not throttled**: every piece the working set chose is
+    /// pooled at this boundary. A conversation the pool already holds keeps
+    /// the pages it holds: only the turns it gained since the last refresh
+    /// are read. A new one's pages come from memory when resident and from the
+    /// log when cold, in the `pool:index_read` span, whose count, bytes and
+    /// time the refresh reports.
     ///
     /// The pool only advises: a page that cannot be read or held leaves its
     /// conversation out of this pool, and nothing about the slot changes.
@@ -67,47 +86,24 @@ impl Scheduler {
         &mut self,
         slot: SequenceId,
         conversation: &Conversation,
-        candidates: &[(GroupId, Vec<(TurnKey, f32)>)],
-        lifts: &HashMap<TimelineId, f32>,
+        target: TimelineId,
     ) -> PoolRefresh {
         let placed: Vec<TimelineId> = self
             .slot_projection_state
             .get(&slot)
             .map(|s| s.placed_timelines())
             .unwrap_or_default();
-        let (floors, scored, turns_of) = {
+        let (pool, turns_of) = {
             let read = conversation.read();
-            let tokens = |tl: TimelineId| -> usize {
-                (0..read.turn_count(tl))
-                    .map(|i| read.turn_token_count_of(tl, TurnIndex(i)))
-                    .sum()
-            };
-            let floors: Vec<(TimelineId, usize)> =
-                placed.iter().map(|&tl| (tl, tokens(tl))).collect();
-            let mut best: HashMap<TimelineId, f32> = HashMap::new();
-            for (_, turns) in candidates {
-                for (key, score) in turns {
-                    let at = best.entry(key.timeline).or_insert(*score);
-                    *at = at.max(*score);
-                }
-            }
-            let scored: Vec<PoolCandidate> = best
-                .into_iter()
-                .map(|(piece, score)| PoolCandidate {
-                    piece,
-                    tokens: tokens(piece),
-                    score: score * lifts.get(&piece).copied().unwrap_or(1.0),
-                })
-                .collect();
-            let turns_of: HashMap<TimelineId, u32> = floors
-                .iter()
-                .map(|(tl, _)| *tl)
-                .chain(scored.iter().map(|c| c.piece))
-                .map(|tl| (tl, read.turn_count(tl)))
-                .collect();
-            (floors, scored, turns_of)
+            let members = read
+                .working_set(target)
+                .map(|ws| ws.members())
+                .unwrap_or_default();
+            let pool = pool_order(&placed, &members);
+            let turns_of: HashMap<TimelineId, u32> =
+                pool.iter().map(|&tl| (tl, read.turn_count(tl))).collect();
+            (pool, turns_of)
         };
-        let pool = choose_pool(&floors, &scored, self.pool_tokens);
         let (mut prior, mut prior_walked) = self
             .slot_projection_state
             .get_mut(&slot)
@@ -118,6 +114,7 @@ impl Scheduler {
                 )
             })
             .unwrap_or_default();
+        let held_before: HashSet<TimelineId> = prior.keys().copied().collect();
         // What the model holds for the slot: a held conversation is reused only
         // where every page its layout names is still there.
         let model_held: HashSet<PieceKey> = self.model.pooled_keys(slot.0).into_iter().collect();
@@ -125,12 +122,9 @@ impl Scheduler {
         let mut kept: PoolPages = HashMap::new();
         let mut kept_walked: HashMap<TimelineId, u32> = HashMap::new();
         let mut stats = PoolRefresh::default();
-        let mut admitted = 0usize;
+        let reading = profile::span("pool:index_read");
+        let t_read = Instant::now();
         for tl in pool {
-            let fresh = !prior.contains_key(&tl);
-            if fresh && admitted == POOL_ADMITS_PER_BOUNDARY {
-                continue;
-            }
             let turns = turns_of.get(&tl).copied().unwrap_or(0);
             let prior_layout = prior.remove(&tl).unwrap_or_default();
             let layout_held = prior_layout
@@ -159,6 +153,7 @@ impl Scheduler {
                         break;
                     }
                 };
+                stats.read_bytes += pages.bytes().len();
                 let Ok(framed) = index_pages::decode(pages.bytes()) else {
                     whole = false;
                     break;
@@ -185,25 +180,20 @@ impl Scheduler {
                 keep.extend(keys);
                 kept.insert(tl, layout);
                 kept_walked.insert(tl, turns);
-                admitted += fresh as usize;
             }
         }
+        stats.read_us = t_read.elapsed().as_micros() as u64;
+        reading.end();
         stats.pooled = kept.len();
+        stats.admitted = kept.keys().filter(|tl| !held_before.contains(tl)).count();
+        stats.dropped = held_before
+            .iter()
+            .filter(|tl| !kept.contains_key(tl))
+            .count();
         if let Err(e) = self.model.retain_pooled(slot.0, &keep) {
             tracing::warn!(slot = slot.0, error = %e, "pool: dropped pieces not released");
         }
-        // Each pooled conversation's K/V to the warm tier, so a round the fill
-        // later chooses loads at PCIe speed rather than from the log. Turns
-        // already warm or hot cost a lookup; what the warm share has no room
-        // for stays cold.
-        let warm: Vec<TurnKey> = kept
-            .keys()
-            .flat_map(|&tl| {
-                (0..turns_of.get(&tl).copied().unwrap_or(0))
-                    .map(move |i| TurnKey::new(tl, TurnIndex(i)))
-            })
-            .collect();
-        self.persist_triggers.warm_turns(warm);
+        self.log_pool_by_kind(conversation, target, &kept, &held_before, &placed, &stats);
         // The pool's pages go with the slot's projection state, which the
         // assembly declares the pooled rounds from, and leave with it. A slot
         // with no state yet has placed nothing to hold a pool beside.
@@ -212,6 +202,94 @@ impl Scheduler {
             state.pool_walked = kept_walked;
         }
         stats
+    }
+
+    /// One info line per kind of the pool (`docs/hit_driven_projection.md` §12
+    /// item 26): its pieces and tokens, those admitted and dropped at this
+    /// boundary, how many of them the indexer reads against how many the slot
+    /// places, and its strongest pieces by rank, each with its page count —
+    /// so a pool that favours large pieces shows it.
+    fn log_pool_by_kind(
+        &self,
+        conversation: &Conversation,
+        target: TimelineId,
+        kept: &PoolPages,
+        held_before: &HashSet<TimelineId>,
+        placed: &[TimelineId],
+        stats: &PoolRefresh,
+    ) {
+        let read = conversation.read();
+        let Some(ws) = read.working_set(target) else {
+            return;
+        };
+        let placed: HashSet<TimelineId> = placed.iter().copied().collect();
+        tracing::info!(
+            target: "candle_conversation::scheduler::pool",
+            pooled = stats.pooled,
+            admitted = stats.admitted,
+            dropped = stats.dropped,
+            index_read_turns = stats.walked,
+            index_read_bytes = stats.read_bytes,
+            index_read_us = stats.read_us,
+            "pool:index_read"
+        );
+        for kind in [
+            WorkingSetShare::Readings,
+            WorkingSetShare::Folders,
+            WorkingSetShare::Guides,
+            WorkingSetShare::Journals,
+        ] {
+            let mut pieces: Vec<(TimelineId, usize, f32)> = ws
+                .pooled()
+                .into_iter()
+                .filter(|(tl, _, share)| *share == kind && kept.contains_key(tl))
+                .map(|(tl, tokens, _)| (tl, tokens, ws.score_of(tl).unwrap_or(0.0)))
+                .collect();
+            if pieces.is_empty() {
+                continue;
+            }
+            pieces.sort_by(|a, b| b.2.total_cmp(&a.2));
+            let tokens: usize = pieces.iter().map(|(_, t, _)| t).sum();
+            let admitted = pieces
+                .iter()
+                .filter(|(tl, _, _)| !held_before.contains(tl))
+                .count();
+            let hit = pieces
+                .iter()
+                .filter(|(tl, _, _)| ws.hits_of(*tl) > 0.0)
+                .count();
+            let on_slot = pieces
+                .iter()
+                .filter(|(tl, _, _)| placed.contains(tl))
+                .count();
+            let named: Vec<String> = pieces
+                .iter()
+                .take(NAMED_PER_KIND)
+                .enumerate()
+                .map(|(rank, (tl, tokens, strength))| {
+                    let name = read
+                        .custom_of(*tl)
+                        .and_then(|m| m.get("path").cloned())
+                        .unwrap_or_else(|| tl.raw().to_string());
+                    let pages: usize = kept.get(tl).map_or(0, |l| l.values().map(Vec::len).sum());
+                    format!(
+                        "#{} {name} pages={pages} tokens={tokens} strength={strength:.0}",
+                        rank + 1
+                    )
+                })
+                .collect();
+            tracing::info!(
+                target: "candle_conversation::scheduler::pool",
+                kind = kind_name(kind),
+                pieces = pieces.len(),
+                tokens,
+                admitted,
+                hit,
+                placed = on_slot,
+                "pool by kind: {}",
+                named.join(" · ")
+            );
+        }
     }
 }
 

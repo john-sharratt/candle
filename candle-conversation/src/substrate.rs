@@ -70,7 +70,6 @@ use std::sync::OnceLock;
 use ahash::{AHashMap, AHashSet};
 use candle_nn::kv_cache::{rewrite_sealed, FormatCensus, QuantFormat, SealedSequence, Sweep};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::conversation::window_sealed_tokens;
@@ -94,8 +93,8 @@ use crate::persistence::walker::WalkEntry;
 use crate::projection::scan_stats::GroupScan;
 use crate::projection::{
     decode_events, CorruptTurnPolicy, GroupId, HitsConfig, LayerId, OwnedSection, OwnedSections,
-    ProjectionEvent, ProjectionTarget, SectionId, SystemItem, TimelineAllocator, TimelineId,
-    TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
+    ProjectionEvent, ProjectionTarget, SectionId, SlotBoundary, SystemItem, TimelineAllocator,
+    TimelineId, TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
 };
 use crate::provenance::chunk_exclusion::records::{from_json, group_of_key, CutRecord};
 use crate::provenance::chunk_exclusion::ChunkExclusion;
@@ -109,7 +108,7 @@ use crate::summary_tree::{
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnSegment};
-use crate::working_set::{Candidate, Limits, TypeShares, WorkingSet};
+use crate::working_set::{Candidate, PoolSize, TypeShares, WorkingSet};
 use crate::ConversationError;
 use calibration_record::{standing, CalRecord, CalRecords, CalSnapshot};
 use deleted_set::DeletedSet;
@@ -287,6 +286,11 @@ pub struct Substrate {
     /// (`docs/zend_working_set.md` §4.10). In-memory only, set once at engine
     /// setup; until then every candidate is of no type.
     working_set_types: Option<Arc<(TypeShares, String)>>,
+
+    /// How large each dialogue's pool is on the card this substrate serves
+    /// (`docs/hit_driven_projection.md` §7.2 step 1). Set by the scheduler from
+    /// the card; the smallest card's until then.
+    pool_size: PoolSize,
 
     /// Each drawing group and the group whose conversations it draws from —
     /// the schema's `draws: { from }` (`docs/guidance_layer.md` §1). A drawing
@@ -1378,11 +1382,19 @@ pub trait ContentResolver {
         0.0
     }
 
-    /// The projection target's working set as it bears on `group` — its pinned
-    /// and provenance conversations that belong to that group
+    /// The projection target's working set as it bears on `group` — its
+    /// pooled conversations that belong to that group
     /// (`docs/zend_working_set.md` §4.4). `None` when the target carries no
     /// working set, which is every ingest conversation. Default `None`.
     fn working_set_members(&self, _group: GroupId) -> Option<WorkingSetMembers> {
+        None
+    }
+
+    /// What the target's slot holds from the boundary before, and whether
+    /// this is the first boundary after a new user message
+    /// (`docs/hit_driven_projection.md` §7.2 step 5). `None` for a target
+    /// with no working set, whose fill is chosen whole. Default `None`.
+    fn working_set_boundary(&self) -> Option<SlotBoundary> {
         None
     }
 
@@ -3740,42 +3752,27 @@ impl Substrate {
         })
     }
 
-    /// What a seed or a provenance candidate costs a working set on this
-    /// substrate's engine. An engine with a trained window carves the slot by
-    /// whole turns (`docs/hit_driven_projection.md` §7.2, §8.1), placing at
-    /// most `max_file_tokens` of one reading, so a longer reading is charged
-    /// that much ([`Candidate::carved_to`]); an engine that emits members whole
-    /// is charged their whole size, and the working set refuses one past the
-    /// cap.
-    fn provenance_charge(&self, candidate: Candidate, limits: Limits) -> Candidate {
-        match self.trained_window {
-            Some(_) => candidate.carved_to(limits.max_file_tokens),
-            None => candidate,
-        }
-    }
-
-    /// Seed `target`'s provenance with `candidates` at `momentum`
-    /// ([`WorkingSet::seed`]). Returns the candidates that did not enter.
+    /// Seed `target`'s pool with `candidates` at `momentum`
+    /// ([`WorkingSet::seed`]), under this card's pool size. Returns the
+    /// candidates that did not enter.
     pub fn working_set_seed(
         &mut self,
         target: TimelineId,
         candidates: &[TimelineId],
-        limits: Limits,
         momentum: f32,
     ) -> Vec<TimelineId> {
         let mut refused = Vec::new();
         let mut admissible = Vec::new();
         for &timeline in candidates {
             match self.working_set_candidate(target, timeline) {
-                Some(candidate) => {
-                    admissible.push((timeline, self.provenance_charge(candidate, limits)))
-                }
+                Some(candidate) => admissible.push((timeline, candidate)),
                 None => refused.push(timeline),
             }
         }
+        let pool = self.pool_size;
         refused.extend(
             self.working_set_mut(target)
-                .seed(&admissible, limits, momentum),
+                .seed(&admissible, pool, momentum),
         );
         refused
     }
@@ -3788,6 +3785,14 @@ impl Substrate {
         }
     }
 
+    /// A boundary of `target`'s slot, which holds `placed` now
+    /// ([`WorkingSet::boundary`]). Nothing for a target with no working set.
+    pub fn working_set_boundary(&mut self, target: TimelineId, placed: &[TurnKey]) {
+        if let Some(ws) = arc_mut(&mut self.working_sets, &target) {
+            ws.boundary(placed.iter().copied());
+        }
+    }
+
     /// Let `target`'s withheld conversations enter again
     /// ([`WorkingSet::clear_withheld`]).
     pub fn working_set_clear_withheld(&mut self, target: TimelineId) {
@@ -3796,11 +3801,11 @@ impl Substrate {
         }
     }
 
-    /// Fold one reprojection's per-file fresh scores into `target`'s working
-    /// set ([`WorkingSet::observe`]), after the stride's hit densities
-    /// ([`WorkingSet::observe_hits`]) — so what the indexer read since the
-    /// last reprojection lifts every judgment this one makes.
-    #[allow(clippy::too_many_arguments)]
+    /// Fold one reprojection's per-piece fresh scores into `target`'s pool
+    /// ([`WorkingSet::observe`]) under this card's pool size, after the
+    /// stride's hit densities ([`WorkingSet::observe_hits`]) — so what the
+    /// indexer read since the last reprojection lifts every judgment this one
+    /// makes.
     pub fn working_set_observe(
         &mut self,
         target: TimelineId,
@@ -3809,8 +3814,6 @@ impl Substrate {
         hits: &HitsConfig,
         beta: f32,
         min_momentum: f32,
-        limits: Limits,
-        max_admits: NonZeroUsize,
     ) {
         let mut ws = self
             .working_sets
@@ -3819,9 +3822,8 @@ impl Substrate {
             .unwrap_or_default();
         ws.observe_hits(hit_density, hits);
         let chain: HashSet<TimelineId> = self.inherited_chain(target).into_iter().collect();
-        ws.observe(fresh, beta, min_momentum, limits, max_admits, &|timeline| {
+        ws.observe(fresh, beta, min_momentum, self.pool_size, &|timeline| {
             self.working_set_candidate_beside(target, &chain, timeline)
-                .map(|c| self.provenance_charge(c, limits))
         });
         self.working_sets.insert(target, Arc::new(ws));
     }
@@ -3998,6 +4000,16 @@ impl Substrate {
     /// Record the trained window of the engine this substrate serves.
     pub fn set_trained_window(&mut self, window: Option<usize>) {
         self.trained_window = window;
+    }
+
+    /// How large each dialogue's pool is on this substrate's card.
+    pub fn pool_size(&self) -> PoolSize {
+        self.pool_size
+    }
+
+    /// Record the pool size of the card this substrate serves.
+    pub fn set_pool_size(&mut self, size: PoolSize) {
+        self.pool_size = size;
     }
 
     pub fn couplings_of(&self, timeline: TimelineId) -> Couplings {
@@ -8901,13 +8913,13 @@ mod tests {
         let (mut sub, target, reads) = working_set_fixture(2, 100);
         let files = GroupId::for_test(1);
         let guides = GroupId::for_test(3);
-        sub.set_working_set_share(guides, WorkingSetShare::Guidance);
+        sub.set_working_set_share(guides, WorkingSetShare::Guides);
         sub.set_group_draws(guides, files);
         sub.mark_group_scoped(guides);
         sub.set_retrieval_scope(target, guides, Arc::new(HashSet::from([reads[1]])));
         let share = |tl| sub.working_set_candidate(target, tl).and_then(|c| c.share);
-        assert_eq!(share(reads[0]), Some(WorkingSetShare::Remainder));
-        assert_eq!(share(reads[1]), Some(WorkingSetShare::Guidance));
+        assert_eq!(share(reads[0]), Some(WorkingSetShare::Readings));
+        assert_eq!(share(reads[1]), Some(WorkingSetShare::Guides));
     }
 
     // ── working sets ────────────────────────────────────────────────────────
@@ -8923,7 +8935,7 @@ mod tests {
         let group = GroupId::for_test(1);
         let alloc = TimelineAllocator::new();
         let mut sub = Substrate::new();
-        sub.set_working_set_share(group, WorkingSetShare::Remainder);
+        sub.set_working_set_share(group, WorkingSetShare::Readings);
         let target = alloc.next();
         sub.register_timeline(target, layer, group);
         let mut reads = Vec::new();
@@ -8936,59 +8948,42 @@ mod tests {
         (sub, target, reads)
     }
 
-    fn ws_limits(budget_tokens: usize) -> Limits {
-        Limits {
-            budget_tokens,
-            folder_tokens: budget_tokens,
-            guidance_tokens: budget_tokens,
-            max_file_tokens: 100_000,
-        }
+    /// Observe `fresh` into `target`'s working set at the defaults.
+    fn ws_observe(sub: &mut Substrate, target: TimelineId, fresh: &HashMap<TimelineId, f32>) {
+        sub.working_set_observe(
+            target,
+            fresh,
+            &HashMap::new(),
+            &HitsConfig::default(),
+            0.2,
+            100.0,
+        );
     }
 
-    /// **A reading past `max_file_tokens` is a member where the fill carves.**
-    /// With no trained window the engine emits members whole, so a 300-token
-    /// reading against a 200-token cap is refused as a seed and on momentum.
-    /// With one, it is seeded and admitted, charged the 200 it can place.
+    /// **The pool is the card's size, and a piece is pooled whole**: two
+    /// 300-token readings fit a pool of 600, and only one fits a pool of 500;
+    /// no per-piece cap refuses either.
     #[test]
-    fn a_reading_past_the_cap_is_charged_the_cap_where_the_fill_carves() {
-        let capped = Limits {
-            max_file_tokens: 200,
-            ..ws_limits(1000)
-        };
-        let observe = |sub: &mut Substrate, target, read| {
-            sub.working_set_observe(
-                target,
-                &HashMap::from([(read, 5000.0)]),
-                &HashMap::new(),
-                &HitsConfig::default(),
-                0.2,
-                100.0,
-                capped,
-                NonZeroUsize::new(4).unwrap(),
-            )
-        };
+    fn the_pool_holds_whole_pieces_within_the_cards_size() {
         let members = |sub: &Substrate, target| -> Vec<TimelineId> {
             sub.working_set(target)
                 .map(|ws| ws.members())
                 .unwrap_or_default()
         };
-
-        let (mut whole, target, reads) = working_set_fixture(2, 300);
-        assert_eq!(
-            whole.working_set_seed(target, &[reads[0]], capped, 1000.0),
-            vec![reads[0]]
-        );
-        observe(&mut whole, target, reads[1]);
-        assert!(members(&whole, target).is_empty());
-
-        let (mut carved, target, reads) = working_set_fixture(2, 300);
-        carved.set_trained_window(Some(262_144));
-        assert!(carved
-            .working_set_seed(target, &[reads[0]], capped, 1000.0)
-            .is_empty());
-        observe(&mut carved, target, reads[1]);
-        assert_eq!(members(&carved, target), vec![reads[0], reads[1]]);
-        assert_eq!(carved.working_set(target).unwrap().tokens(), 400);
+        for (tokens, pooled) in [(600, 2), (500, 1)] {
+            let (mut sub, target, reads) = working_set_fixture(2, 300);
+            sub.set_pool_size(PoolSize {
+                tokens,
+                per_kind: 0,
+            });
+            ws_observe(
+                &mut sub,
+                target,
+                &HashMap::from([(reads[0], 5000.0), (reads[1], 4000.0)]),
+            );
+            assert_eq!(members(&sub, target).len(), pooled, "a pool of {tokens}");
+            assert_eq!(members(&sub, target)[0], reads[0], "the strongest first");
+        }
     }
 
     /// A link of the dialogue's own inherited chain is projected as its opening
@@ -9000,20 +8995,11 @@ mod tests {
         set_parent(&mut sub, target, reads[0]);
         assert!(sub.working_set_candidate(target, reads[0]).is_none());
         assert_eq!(
-            sub.working_set_seed(target, &[reads[0], reads[1]], ws_limits(1000), 1000.0),
+            sub.working_set_seed(target, &[reads[0], reads[1]], 1000.0),
             vec![reads[0]],
         );
         let fresh = HashMap::from([(reads[0], 5000.0), (reads[1], 5000.0)]);
-        sub.working_set_observe(
-            target,
-            &fresh,
-            &HashMap::new(),
-            &HitsConfig::default(),
-            0.2,
-            100.0,
-            ws_limits(1000),
-            NonZeroUsize::new(4).unwrap(),
-        );
+        ws_observe(&mut sub, target, &fresh);
         let members = sub.working_set(target).unwrap().members();
         assert_eq!(members, vec![reads[1]]);
     }
@@ -9031,7 +9017,7 @@ mod tests {
             "no group's share"
         );
         assert_eq!(
-            sub.working_set_seed(target, &[elsewhere], ws_limits(1000), 1000.0),
+            sub.working_set_seed(target, &[elsewhere], 1000.0),
             vec![elsewhere]
         );
     }
@@ -9049,7 +9035,7 @@ mod tests {
             assert!(sub.working_set_candidate(target, tl).is_none(), "{tl:?}");
         }
         assert_eq!(
-            sub.working_set_seed(target, &[reads[0], empty], ws_limits(1000), 1000.0),
+            sub.working_set_seed(target, &[reads[0], empty], 1000.0),
             vec![reads[0], empty],
         );
         assert!(sub.working_set(target).unwrap().provenance().is_empty());
@@ -9087,7 +9073,7 @@ mod tests {
         assert_eq!(sub.turn_count(partial), 2);
         assert!(sub.working_set_candidate(target, partial).is_none());
         assert_eq!(
-            sub.working_set_seed(target, &[partial], ws_limits(1000), 1000.0),
+            sub.working_set_seed(target, &[partial], 1000.0),
             vec![partial],
         );
 
@@ -9186,17 +9172,8 @@ mod tests {
     #[test]
     fn a_tombstone_leaves_every_working_set() {
         let (mut sub, target, reads) = working_set_fixture(3, 10);
-        sub.working_set_seed(target, &[reads[0], reads[1]], ws_limits(1000), 1000.0);
-        sub.working_set_observe(
-            target,
-            &HashMap::from([(reads[2], 500.0)]),
-            &HashMap::new(),
-            &HitsConfig::default(),
-            0.2,
-            100.0,
-            ws_limits(1000),
-            NonZeroUsize::MAX,
-        );
+        sub.working_set_seed(target, &[reads[0], reads[1]], 1000.0);
+        ws_observe(&mut sub, target, &HashMap::from([(reads[2], 500.0)]));
         assert_eq!(sub.working_set(target).unwrap().members().len(), 3);
         for r in &reads {
             sub.tombstone_timeline(*r);
@@ -9210,7 +9187,7 @@ mod tests {
     #[test]
     fn clearing_drops_the_set_for_a_rebuild() {
         let (mut sub, target, reads) = working_set_fixture(2, 10);
-        sub.working_set_seed(target, &reads, ws_limits(1000), 1000.0);
+        sub.working_set_seed(target, &reads, 1000.0);
         sub.working_set_clear(target);
         assert!(sub.working_set(target).is_none());
     }

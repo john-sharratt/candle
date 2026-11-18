@@ -43,7 +43,7 @@ use crate::substrate::{ConvCompression, Substrate};
 use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 use crate::turn_text::literal_tokenizer;
-use crate::working_set::{Limits, TypeShares, WorkingSet};
+use crate::working_set::{TypeShares, WorkingSet};
 
 use candle::quantized::pinned_staging::release_recycled_wc;
 use candle::Device;
@@ -1355,18 +1355,16 @@ impl ConversationEngine {
         self.conversation.read().holds_whole(timeline)
     }
 
-    /// Seed `target`'s provenance with `candidates` at `momentum`, in list
-    /// order while the budget has room. Returns the candidates that did not
-    /// enter.
+    /// Seed `target`'s pool with `candidates` at `momentum`, in list order
+    /// while the pool has room. Returns the candidates that did not enter.
     pub fn working_set_seed(
         &self,
         target: TimelineId,
         candidates: &[TimelineId],
-        limits: Limits,
         momentum: f32,
     ) -> Vec<TimelineId> {
         self.conversation
-            .update(|s| s.working_set_seed(target, candidates, limits, momentum))
+            .update(|s| s.working_set_seed(target, candidates, momentum))
     }
 
     /// Keep `reads` out of `target`'s working set until

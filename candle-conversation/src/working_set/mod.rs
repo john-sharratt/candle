@@ -8,10 +8,14 @@
 //! ingest conversation.
 
 mod config;
+mod fill_shares;
 pub mod marks;
+mod pool_size;
 mod state;
 mod type_shares;
 
 pub use config::WorkingSetConfig;
-pub use state::{Candidate, Limits, WorkingSet};
+pub use fill_shares::{FillShares, ShareCaps};
+pub use pool_size::PoolSize;
+pub use state::{Candidate, WorkingSet};
 pub use type_shares::{TypeCap, TypeShareSpec, TypeShares};

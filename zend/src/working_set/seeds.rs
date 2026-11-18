@@ -100,12 +100,9 @@ impl Seeding<'_> {
             }
         }
         let candidates: Vec<TimelineId> = resolved.iter().map(|(tl, _)| *tl).collect();
-        let refused = self.engine.working_set_seed(
-            target,
-            &candidates,
-            config.limits(),
-            config.seed_momentum(),
-        );
+        let refused = self
+            .engine
+            .working_set_seed(target, &candidates, config.seed_momentum());
         if !refused.is_empty() {
             let names: Vec<&str> = resolved
                 .iter()

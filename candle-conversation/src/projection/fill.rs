@@ -14,24 +14,37 @@
 //!    — a reading's request and answer, an older exchange's pair — with it, and
 //!    only if all of them fit.
 //!
-//! The working set's shares, the dialogue's window and each other layer's
-//! window are **caps**: they bound
-//! how much of a kind the scored tier takes and never reserve room, and floors
-//! count toward their kind's cap without ever being skipped for it.
+//! Each kind's **cap** is its share of the room (`working_set.shares`), and the
+//! shares sum to the room; each other layer's window caps that layer's
+//! exchanges. A cap bounds how much of a kind the scored tier takes and never
+//! reserves room, and floors count toward their kind's cap without ever being
+//! skipped for it. There is no per-piece cap: one reading the indexer reads
+//! above everything else may take the whole of its kind's.
+//!
+//! **A third of a working-set kind's cap may enter per boundary** (§7.2 step
+//! 5). With an [`Allowance`], the working-set rounds the slot already holds
+//! keep their seats first, and a round that is not held enters only while its
+//! kind's allowance has room — rounded up to whole turns, a new piece's floor
+//! counted with it. A held round leaves only as an entry needs its room,
+//! lowest score first; a piece whose last tool round leaves goes whole, floor
+//! and all. With none — the first boundary after a new user message — the
+//! working set is chosen whole, by score.
 
 use std::collections::{HashMap, HashSet};
 
 /// What a placed unit is, for the caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
-    /// A round of a file's reading — under `budget` and its piece's `max_file`.
+    /// A round of a file's reading — under `readings`.
     Reading,
-    /// A round of a folder summary — under `budget` and `folder`.
+    /// A round of a folder summary — under `folders`.
     Folder,
-    /// A round of a guide or a journal note — under `budget` and `guidance`.
-    Guidance,
+    /// A round of a guide — under `guides`.
+    Guide,
+    /// A round of a journal note — under `journals`.
+    Journal,
     /// A round of the dialogue or of its inherited lineage, or an exchange of
-    /// another group on the dialogue's layer — under `window`.
+    /// another group on the dialogue's layer — under `dialogue`.
     Dialogue,
     /// An exchange of a group on another layer of the projection — under that
     /// layer's `window`, `Caps::layers[i]`.
@@ -57,17 +70,54 @@ pub struct FloorExchange {
     pub rounds: Vec<Unit>,
 }
 
-/// How much of each kind the scored tier may take.
+/// How much of each kind the scored tier may take, in tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caps {
-    pub budget: usize,
-    pub folder: usize,
-    pub guidance: usize,
-    pub max_file: usize,
-    pub window: usize,
+    pub readings: usize,
+    pub folders: usize,
+    pub guides: usize,
+    pub journals: usize,
+    pub dialogue: usize,
     /// Each other layer's `window`, indexed by [`Kind::Layer`]. A layer with
     /// no entry takes nothing.
     pub layers: Vec<usize>,
+}
+
+impl Kind {
+    /// Whether this is a working-set kind — what the allowance bounds.
+    fn is_working(self) -> bool {
+        matches!(
+            self,
+            Kind::Reading | Kind::Folder | Kind::Guide | Kind::Journal
+        )
+    }
+}
+
+/// How many tokens of each working-set kind may enter the slot at this
+/// boundary: a third of its cap.
+pub type Allowance = HashMap<Kind, usize>;
+
+impl Caps {
+    /// A third of each working-set kind's cap, rounded up — what may enter
+    /// at one boundary (§7.2 step 5).
+    pub fn allowance(&self) -> Allowance {
+        [Kind::Reading, Kind::Folder, Kind::Guide, Kind::Journal]
+            .into_iter()
+            .map(|k| (k, self.of(k).div_ceil(3)))
+            .collect()
+    }
+
+    /// The cap `kind` counts toward.
+    fn of(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Reading => self.readings,
+            Kind::Folder => self.folders,
+            Kind::Guide => self.guides,
+            Kind::Journal => self.journals,
+            Kind::Dialogue => self.dialogue,
+            Kind::Layer(i) => self.layers.get(i).copied().unwrap_or(0),
+        }
+    }
 }
 
 /// Everything one fill decides over.
@@ -86,6 +136,11 @@ pub struct FillInput {
     pub scored: Vec<Unit>,
     /// Each piece's floor, placed with its first scored unit.
     pub piece_floors: HashMap<usize, Vec<Unit>>,
+    /// The units whose rounds the slot already holds.
+    pub held: HashSet<usize>,
+    /// What may enter per working-set kind at this boundary; `None` on the
+    /// first boundary after a new user message, which chooses whole.
+    pub allowance: Option<Allowance>,
 }
 
 /// What the fill placed: the units by id, and how far past the room the
@@ -97,50 +152,29 @@ pub struct Fill {
 }
 
 /// Tokens placed per cap, as the fill goes.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Used {
     total: usize,
     by_kind: HashMap<Kind, usize>,
-    by_piece: HashMap<usize, usize>,
 }
 
 impl Used {
     fn add(&mut self, u: &Unit) {
         self.total += u.tokens;
         *self.by_kind.entry(u.kind).or_default() += u.tokens;
-        *self.by_piece.entry(u.piece).or_default() += u.tokens;
     }
 
     fn kind(&self, k: Kind) -> usize {
         self.by_kind.get(&k).copied().unwrap_or(0)
     }
 
-    /// Whether `units` fit under every cap they count toward.
+    /// Whether `units` fit under the cap of every kind they add to.
     fn under_caps(&self, units: &[Unit], caps: &Caps) -> bool {
         let mut add: HashMap<Kind, usize> = HashMap::new();
-        let mut by_piece: HashMap<usize, usize> = HashMap::new();
         for u in units {
             *add.entry(u.kind).or_default() += u.tokens;
-            if u.kind == Kind::Reading {
-                *by_piece.entry(u.piece).or_default() += u.tokens;
-            }
         }
-        let after = |k: Kind| self.kind(k) + add.get(&k).copied().unwrap_or(0);
-        let working = after(Kind::Reading) + after(Kind::Folder) + after(Kind::Guidance);
-        let working_added = add.get(&Kind::Reading).copied().unwrap_or(0)
-            + add.get(&Kind::Folder).copied().unwrap_or(0)
-            + add.get(&Kind::Guidance).copied().unwrap_or(0);
-        (working_added == 0 || working <= caps.budget)
-            && (!add.contains_key(&Kind::Folder) || after(Kind::Folder) <= caps.folder)
-            && (!add.contains_key(&Kind::Guidance) || after(Kind::Guidance) <= caps.guidance)
-            && (!add.contains_key(&Kind::Dialogue) || after(Kind::Dialogue) <= caps.window)
-            && add.keys().all(|k| match *k {
-                Kind::Layer(i) => after(*k) <= caps.layers.get(i).copied().unwrap_or(0),
-                _ => true,
-            })
-            && by_piece
-                .iter()
-                .all(|(p, t)| self.by_piece.get(p).copied().unwrap_or(0) + t <= caps.max_file)
+        add.iter().all(|(&k, &t)| self.kind(k) + t <= caps.of(k))
     }
 }
 
@@ -205,30 +239,165 @@ pub fn fill(input: &FillInput, caps: &Caps) -> Fill {
     // A unit is placed once, whether it came in by its own score or with a
     // round of its piece; a piece's floor is brought by whichever of its
     // units enters first.
-    let mut in_slot: HashSet<usize> = placed.iter().copied().collect();
-    for u in order {
-        if in_slot.contains(&u.id) {
-            continue;
+    let in_slot: HashSet<usize> = placed.iter().copied().collect();
+    let mut slot = Slot {
+        used,
+        placed,
+        in_slot,
+    };
+    match &input.allowance {
+        None => {
+            for u in order {
+                slot.try_place(u, input, caps);
+            }
         }
+        Some(allowance) => {
+            let mut left = allowance.clone();
+            // 2a. The working-set rounds the slot holds keep their seats.
+            for u in order
+                .iter()
+                .filter(|u| u.kind.is_working() && input.held.contains(&u.id))
+            {
+                slot.try_place(u, input, caps);
+            }
+            // 2b. The rest, an entry only while its kind's allowance has room,
+            // displacing held rounds of its kind it outscores when it needs
+            // their room.
+            for u in &order {
+                if slot.in_slot.contains(&u.id) {
+                    continue;
+                }
+                let with = slot.with_floor(u, input);
+                let entering: usize = with
+                    .iter()
+                    .filter(|w| w.kind.is_working() && !input.held.contains(&w.id))
+                    .map(|w| w.tokens)
+                    .sum();
+                if entering > 0 && left.get(&u.kind).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+                let placed = slot.fits(&with, input, caps)
+                    || (u.kind.is_working() && slot.displace_for(u, &with, input, caps));
+                if placed {
+                    slot.place_all(&with);
+                    if let Some(l) = left.get_mut(&u.kind) {
+                        *l = l.saturating_sub(entering);
+                    }
+                }
+            }
+        }
+    }
+    Fill {
+        placed: slot.placed,
+        over_room,
+    }
+}
+
+/// The scored tier's slot as it fills.
+struct Slot {
+    used: Used,
+    placed: Vec<usize>,
+    in_slot: HashSet<usize>,
+}
+
+impl Slot {
+    /// `u` with the units of its piece's floor not yet in the slot.
+    fn with_floor(&self, u: &Unit, input: &FillInput) -> Vec<Unit> {
         let mut with: Vec<Unit> = Vec::new();
         if let Some(f) = input.piece_floors.get(&u.piece) {
             with.extend(
                 f.iter()
-                    .filter(|f| f.id != u.id && !in_slot.contains(&f.id))
+                    .filter(|f| f.id != u.id && !self.in_slot.contains(&f.id))
                     .copied(),
             );
         }
         with.push(*u);
+        with
+    }
+
+    /// Whether `with` fits the room and every cap it adds to.
+    fn fits(&self, with: &[Unit], input: &FillInput, caps: &Caps) -> bool {
         let cost: usize = with.iter().map(|w| w.tokens).sum();
-        if used.total + cost > input.room || !used.under_caps(&with, caps) {
-            continue;
-        }
-        for w in &with {
-            in_slot.insert(w.id);
-            place(w, &mut used, &mut placed);
+        self.used.total + cost <= input.room && self.used.under_caps(with, caps)
+    }
+
+    fn place_all(&mut self, with: &[Unit]) {
+        for w in with {
+            self.in_slot.insert(w.id);
+            self.used.add(w);
+            self.placed.push(w.id);
         }
     }
-    Fill { placed, over_room }
+
+    /// Place `u` with its floor when they fit; `false` when they do not.
+    fn try_place(&mut self, u: &Unit, input: &FillInput, caps: &Caps) -> bool {
+        if self.in_slot.contains(&u.id) {
+            return true;
+        }
+        let with = self.with_floor(u, input);
+        if !self.fits(&with, input, caps) {
+            return false;
+        }
+        self.place_all(&with);
+        true
+    }
+
+    fn remove(&mut self, u: &Unit) {
+        if self.in_slot.remove(&u.id) {
+            self.used.total -= u.tokens;
+            *self.used.by_kind.entry(u.kind).or_default() -= u.tokens;
+            self.placed.retain(|id| *id != u.id);
+        }
+    }
+
+    /// Make room for `with`, which `u` brings, by taking out held rounds of
+    /// `u`'s kind scored below it, lowest first — a piece whose last tool
+    /// round goes leaving whole, its floor with it. Commits and answers `true`
+    /// when `with` then fits; changes nothing and answers `false` otherwise.
+    fn displace_for(&mut self, u: &Unit, with: &[Unit], input: &FillInput, caps: &Caps) -> bool {
+        let mut victims: Vec<&Unit> = input
+            .scored
+            .iter()
+            .filter(|v| {
+                v.kind == u.kind
+                    && v.piece != u.piece
+                    && v.score < u.score
+                    && input.held.contains(&v.id)
+                    && self.in_slot.contains(&v.id)
+            })
+            .collect();
+        victims.sort_by(|a, b| a.score.total_cmp(&b.score).then(b.id.cmp(&a.id)));
+        let mut trial = Slot {
+            used: self.used.clone(),
+            placed: self.placed.clone(),
+            in_slot: self.in_slot.clone(),
+        };
+        for v in victims {
+            if trial.fits(with, input, caps) {
+                break;
+            }
+            trial.remove(v);
+            let floor: Vec<Unit> = input
+                .piece_floors
+                .get(&v.piece)
+                .cloned()
+                .unwrap_or_default();
+            let floor_ids: HashSet<usize> = floor.iter().map(|f| f.id).collect();
+            let rounds_left = input.scored.iter().any(|r| {
+                r.piece == v.piece && !floor_ids.contains(&r.id) && trial.in_slot.contains(&r.id)
+            });
+            if !rounds_left {
+                for f in &floor {
+                    trial.remove(f);
+                }
+            }
+        }
+        if !trial.fits(with, input, caps) {
+            return false;
+        }
+        *self = trial;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -247,13 +416,127 @@ mod tests {
 
     fn caps() -> Caps {
         Caps {
-            budget: 1_000,
-            folder: 200,
-            guidance: 300,
-            max_file: 500,
-            window: 1_000,
+            readings: 1_000,
+            folders: 200,
+            guides: 300,
+            journals: 300,
+            dialogue: 1_000,
             layers: vec![100],
         }
+    }
+
+    /// A third of each working-set kind's cap, rounded up.
+    #[test]
+    fn the_allowance_is_a_third_of_each_working_cap() {
+        let a = caps().allowance();
+        assert_eq!(a[&Kind::Reading], 334);
+        assert_eq!(a[&Kind::Folder], 67);
+        assert_eq!(a[&Kind::Guide], 100);
+        assert_eq!(a[&Kind::Journal], 100);
+        assert!(!a.contains_key(&Kind::Dialogue));
+    }
+
+    fn readings(scored: Vec<Unit>, held: &[usize], allowance: Option<Allowance>) -> FillInput {
+        FillInput {
+            room: 10_000,
+            scored,
+            held: held.iter().copied().collect(),
+            allowance,
+            ..Default::default()
+        }
+    }
+
+    /// **Held rounds keep their seats, and entries stop at the allowance**:
+    /// with 100 tokens a boundary, the held round scored 0.1 stays though four
+    /// stronger rounds wait, and only the first of them enters.
+    #[test]
+    fn held_rounds_stay_and_entries_stop_at_the_allowance() {
+        let r = |id, score| u(id, id, Kind::Reading, 100, score);
+        let scored = vec![r(1, 0.1), r(2, 0.9), r(3, 0.8), r(4, 0.7)];
+        let allowance = Allowance::from([(Kind::Reading, 100)]);
+        let f = fill(&readings(scored.clone(), &[1], Some(allowance)), &caps());
+        assert_eq!(sorted(f.placed), vec![1, 2]);
+        // On the first boundary after a question, everything by score.
+        let f = fill(&readings(scored, &[1], None), &caps());
+        assert_eq!(sorted(f.placed), vec![1, 2, 3, 4]);
+    }
+
+    /// **An entry is rounded up to whole turns**: 50 tokens of allowance
+    /// still lets one 100-token round in, and nothing after it.
+    #[test]
+    fn an_entry_rounds_up_to_a_whole_turn() {
+        let r = |id, score| u(id, id, Kind::Reading, 100, score);
+        let allowance = Allowance::from([(Kind::Reading, 50)]);
+        let f = fill(
+            &readings(vec![r(1, 0.9), r(2, 0.8)], &[], Some(allowance)),
+            &caps(),
+        );
+        assert_eq!(f.placed, vec![1]);
+    }
+
+    /// **A held round leaves only as an entry needs its room, lowest first,
+    /// and a piece whose last tool round leaves goes whole**: the readings
+    /// cap of 250 is full of piece 7's floor (50) and its two held rounds
+    /// (100 each). An entry scored 0.9 needs 100: the held round scored 0.2
+    /// goes; piece 7 keeps its other round and its floor. A second entry at
+    /// 0.8 takes the last round, and the floor goes with it.
+    #[test]
+    fn an_entry_displaces_the_weakest_held_round() {
+        let capped = Caps {
+            readings: 250,
+            ..caps()
+        };
+        let floor = u(70, 7, Kind::Reading, 50, 0.0);
+        let mut floors = HashMap::new();
+        floors.insert(7, vec![floor]);
+        let input = |scored: Vec<Unit>| FillInput {
+            room: 10_000,
+            scored,
+            piece_floors: floors.clone(),
+            held: HashSet::from([70, 71, 72]),
+            allowance: Some(Allowance::from([(Kind::Reading, 1_000)])),
+            ..Default::default()
+        };
+        let held = [
+            u(71, 7, Kind::Reading, 100, 0.2),
+            u(72, 7, Kind::Reading, 100, 0.5),
+        ];
+        let one = input(vec![held[0], held[1], u(1, 1, Kind::Reading, 100, 0.9)]);
+        assert_eq!(sorted(fill(&one, &capped).placed), vec![1, 70, 72]);
+        let two = input(vec![
+            held[0],
+            held[1],
+            u(1, 1, Kind::Reading, 100, 0.9),
+            u(2, 2, Kind::Reading, 100, 0.8),
+        ]);
+        assert_eq!(sorted(fill(&two, &capped).placed), vec![1, 2]);
+    }
+
+    /// Guides and journal notes each fill their own cap: a full guides cap
+    /// leaves the journals' untouched.
+    #[test]
+    fn guides_and_journals_are_capped_apart() {
+        let input = FillInput {
+            room: 10_000,
+            scored: vec![
+                u(1, 1, Kind::Guide, 300, 0.9),
+                u(2, 2, Kind::Guide, 10, 0.8),
+                u(3, 3, Kind::Journal, 300, 0.7),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(sorted(fill(&input, &caps()).placed), vec![1, 3]);
+    }
+
+    /// No cap per piece: one reading's rounds may take the whole readings cap.
+    #[test]
+    fn one_reading_may_take_the_whole_readings_cap() {
+        let input = FillInput {
+            room: 10_000,
+            scored: (0..10).map(|i| u(i, 7, Kind::Reading, 100, 0.9)).collect(),
+            ..Default::default()
+        };
+        assert_eq!(fill(&input, &caps()).placed.len(), 10);
     }
 
     fn sorted(mut v: Vec<usize>) -> Vec<usize> {

@@ -16,9 +16,10 @@ pub fn fmt_selection(rule: &SelectionRule) -> String {
             lineage_base,
         } => format!("recent {recent} + top {historical_top_k}, lineage from {lineage_base}"),
         SelectionRule::WorkingSet { share } => match share {
+            WorkingSetShare::Readings => "working set (readings)".to_string(),
             WorkingSetShare::Folders => "working set (folders)".to_string(),
-            WorkingSetShare::Remainder => "working set (files)".to_string(),
-            WorkingSetShare::Guidance => "working set (guidance)".to_string(),
+            WorkingSetShare::Guides => "working set (guides)".to_string(),
+            WorkingSetShare::Journals => "working set (journals)".to_string(),
         },
     }
 }
@@ -62,9 +63,15 @@ mod tests {
         );
         assert_eq!(
             fmt_selection(&SelectionRule::WorkingSet {
-                share: WorkingSetShare::Remainder
+                share: WorkingSetShare::Readings
             }),
-            "working set (files)"
+            "working set (readings)"
+        );
+        assert_eq!(
+            fmt_selection(&SelectionRule::WorkingSet {
+                share: WorkingSetShare::Journals
+            }),
+            "working set (journals)"
         );
     }
 }

@@ -284,10 +284,10 @@ layers:
 {block}
     groups:
       - id: scopes
-        selection: {{ kind: working_set, share: remainder }}
+        selection: {{ kind: working_set, share: readings }}
       - id: guidance
         draws: {{ from: scopes, paths: [candle/mcp/src/guides/], except: [README.md] }}
-        selection: {{ kind: working_set, share: guidance }}
+        selection: {{ kind: working_set, share: guides }}
 "#
         );
         Builder::from_yaml(&yaml).unwrap().schema().layers[0].clone()

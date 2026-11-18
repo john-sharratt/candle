@@ -35,7 +35,7 @@ use super::schema::{
 };
 use super::warm_pool;
 use super::working_set_observe::{working_set_config, working_set_fresh};
-use super::working_set_pick::WorkingSetMembers;
+use super::working_set_pick::{SlotBoundary, WorkingSetMembers};
 use crate::cancel::CancelToken;
 use crate::error::ConversationError;
 use crate::index_pages::StoredPages;
@@ -1598,8 +1598,6 @@ impl Conversation {
                 &schema.hits,
                 cfg.beta,
                 cfg.min_momentum,
-                cfg.limits(),
-                cfg.max_admits,
             )
         });
     }
@@ -6047,6 +6045,17 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             .map(|tl| (tl, ws.momentum_of(tl).unwrap_or(0.0)))
             .collect();
         Some(WorkingSetMembers { members })
+    }
+
+    /// What the target's slot holds and whether a new question opened this
+    /// boundary, as its working set recorded them at the scan
+    /// (`WorkingSet::boundary`).
+    fn working_set_boundary(&self) -> Option<SlotBoundary> {
+        let ws = self.read.working_set(self.target.timeline)?;
+        Some(SlotBoundary {
+            held: ws.held().clone(),
+            opening: ws.opening(),
+        })
     }
 
     fn timeline_turns(&self, timeline: TimelineId) -> Vec<TurnKey> {

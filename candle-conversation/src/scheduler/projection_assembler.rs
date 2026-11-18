@@ -212,6 +212,17 @@ impl SlotState {
         out
     }
 
+    /// Every turn the last assembly placed, in slot order.
+    pub(super) fn placed_turns(&self) -> Vec<TurnKey> {
+        self.placed_pieces
+            .iter()
+            .filter_map(|p| match p.range {
+                Some(PieceRange::Turn(tl, idx)) => Some(TurnKey::new(tl, idx)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The placed pieces by position, each named by the turn or section it is.
     pub(super) fn placed_spans(&self) -> Vec<PieceSpan> {
         self.placed_pieces

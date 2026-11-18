@@ -2279,8 +2279,9 @@ pub fn run_with_sink<R: ContentResolver>(
         for gs in group_states.iter().filter(|gs| gs.working_set.is_some()) {
             let kind = match gs.working_set {
                 Some(WorkingSetShare::Folders) => Kind::Folder,
-                Some(WorkingSetShare::Guidance) => Kind::Guidance,
-                _ => Kind::Reading,
+                Some(WorkingSetShare::Guides) => Kind::Guide,
+                Some(WorkingSetShare::Journals) => Kind::Journal,
+                Some(WorkingSetShare::Readings) | None => Kind::Reading,
             };
             let mut order: Vec<TimelineId> = Vec::new();
             for (k, _) in &gs.selected {
@@ -2289,17 +2290,14 @@ pub fn run_with_sink<R: ContentResolver>(
                 }
             }
             for tl in order {
-                let keys: Vec<(TurnKey, f32)> = gs
+                let ks: Vec<TurnKey> = gs
                     .selected
                     .iter()
                     .filter(|(k, _)| k.timeline == tl)
-                    .copied()
+                    .map(|(k, _)| *k)
                     .collect();
-                let score = keys.iter().map(|(_, s)| *s).fold(0.0, f32::max);
-                let ks: Vec<TurnKey> = keys.iter().map(|(k, _)| *k).collect();
                 working.push(WorkingPiece {
                     kind,
-                    score,
                     exchanges: exchanges_of(&ks),
                 });
                 working_groups.push(gs.schema.id);
@@ -2328,26 +2326,63 @@ pub fn run_with_sink<R: ContentResolver>(
                 context_of.push(gs.schema.id);
             }
         }
+        // Each kind's cap is its share of this projection's room
+        // (`docs/hit_driven_projection.md` §7.2 step 4).
+        let shares = ws.fill_shares.caps(room);
+        let caps = Caps {
+            readings: shares.readings,
+            folders: shares.folders,
+            guides: shares.guides,
+            journals: shares.journals,
+            dialogue: shares.dialogue,
+            layers: visible_layers.iter().map(|l| l.window).collect(),
+        };
+        // What the slot holds from the boundary before, and whether this is
+        // the first boundary after a new user message — which chooses whole,
+        // with no allowance (§7.2 step 5).
+        let boundary = resolver.working_set_boundary().unwrap_or_default();
+        let allowance = (!boundary.opening).then(|| caps.allowance());
         let slot = DialogueSlot {
             room,
-            caps: Caps {
-                budget: ws.budget_tokens,
-                folder: ws.folder_tokens,
-                guidance: ws.guidance_tokens,
-                max_file: ws.max_file_tokens,
-                window: layer.window,
-                layers: visible_layers.iter().map(|l| l.window).collect(),
-            },
+            caps,
             recent,
             lineage,
             working,
             own: exchanges_of(&own_keys),
             context,
+            held: boundary.held,
+            allowance,
         };
         let plan = dialogue_fill::plan(
             &slot,
             |k| resolver.turn_score(k),
             |k| resolver.turn_token_count(k),
+        );
+        // Each cap's use (`docs/hit_driven_projection.md` §12 item 26).
+        let tokens_of = |keys: &[TurnKey]| -> usize {
+            keys.iter().map(|k| resolver.turn_token_count(*k)).sum()
+        };
+        let mut used: HashMap<Kind, usize> = HashMap::new();
+        for (piece, placed) in slot.working.iter().zip(&plan.working) {
+            *used.entry(piece.kind).or_default() += tokens_of(placed);
+        }
+        let used_of = |k: Kind| used.get(&k).copied().unwrap_or(0);
+        tracing::info!(
+            target: "candle_conversation::projection::fill",
+            room,
+            readings = format!("{}/{}", used_of(Kind::Reading), slot.caps.readings),
+            folders = format!("{}/{}", used_of(Kind::Folder), slot.caps.folders),
+            guides = format!("{}/{}", used_of(Kind::Guide), slot.caps.guides),
+            journals = format!("{}/{}", used_of(Kind::Journal), slot.caps.journals),
+            dialogue = format!(
+                "{}/{}",
+                tokens_of(&plan.lineage) + tokens_of(&plan.own),
+                slot.caps.dialogue
+            ),
+            pieces_offered = slot.working.len(),
+            pieces_placed = plan.working.iter().filter(|p| !p.is_empty()).count(),
+            over_room = plan.over_room,
+            "fill: each cap's use"
         );
         let mut push = |gid: GroupId, key: TurnKey| final_selected.push((gid, key));
         for p in plan.lineage.into_iter().chain(plan.own) {

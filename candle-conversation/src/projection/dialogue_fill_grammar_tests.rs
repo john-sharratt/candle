@@ -4,10 +4,10 @@
 //! exchanges — at random turn sizes, scores, caps and room, each exchange the
 //! plan places holds its first and its last turn, and between them only some
 //! of its own turns, in order. Every turn is placed whole, so the roles
-//! alternate `U A U A …` by construction. The caps bind: no reading passes
-//! `max_file`, and the working set never passes `budget`.
+//! alternate `U A U A …` by construction. The caps bind: no working-set kind
+//! passes its share of the room.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -37,11 +37,10 @@ fn random_case(rng: &mut StdRng) -> Case {
     let lineage = (0..rng.random_range(0..=3))
         .map(|_| (ex(rng, 4), rng.random_range(0.0..1000.0)))
         .collect();
-    let kinds = [Kind::Reading, Kind::Folder, Kind::Guidance];
+    let kinds = [Kind::Reading, Kind::Folder, Kind::Guide, Kind::Journal];
     let working = (0..rng.random_range(0..=4))
         .map(|_| WorkingPiece {
             kind: kinds[rng.random_range(0..kinds.len())],
-            score: rng.random_range(0.0..1000.0),
             exchanges: (0..rng.random_range(1..=3)).map(|_| ex(rng, 6)).collect(),
         })
         .collect();
@@ -57,22 +56,36 @@ fn random_case(rng: &mut StdRng) -> Case {
             score: rng.random_range(0.0..1.0),
         })
         .collect();
-    let slot = DialogueSlot {
+    let caps = Caps {
+        readings: rng.random_range(0..=400),
+        folders: rng.random_range(0..=400),
+        guides: rng.random_range(0..=400),
+        journals: rng.random_range(0..=400),
+        dialogue: rng.random_range(0..=400),
+        layers: vec![rng.random_range(0..=400)],
+    };
+    // Half the cases are a boundary with an allowance, the slot holding some
+    // of the turns already.
+    let allowance = rng.random_bool(0.5).then(|| caps.allowance());
+    let mut slot = DialogueSlot {
         room: rng.random_range(0..=600),
-        caps: Caps {
-            budget: rng.random_range(0..=400),
-            folder: rng.random_range(0..=400),
-            guidance: rng.random_range(0..=400),
-            max_file: rng.random_range(0..=400),
-            window: rng.random_range(0..=400),
-            layers: vec![rng.random_range(0..=400)],
-        },
+        caps,
         recent: rng.random_range(0..=3),
         lineage,
         working,
         own,
         context,
+        held: HashSet::new(),
+        allowance,
     };
+    let held: HashSet<TurnKey> = slot
+        .working
+        .iter()
+        .flat_map(|w| w.exchanges.iter().flatten())
+        .copied()
+        .filter(|_| rng.random_bool(0.4))
+        .collect();
+    slot.held = held;
     let mut tokens = HashMap::new();
     let mut scores = HashMap::new();
     let every_exchange: Vec<&Vec<TurnKey>> = slot
@@ -165,29 +178,27 @@ fn every_carving_of_a_random_slot_keeps_whole_turns_and_its_caps() {
                 "case {case_no} context {i}"
             );
         }
-        // A reading stays under `max_file`, and the pieces together under
-        // `budget`.
-        let mut working = 0usize;
+        // Each working-set kind stays under its cap. (Only the dialogue's own
+        // floors may pass theirs; the working set has none of its own.)
+        let mut by_kind: HashMap<Kind, usize> = HashMap::new();
         for (p, wp) in slot.working.iter().enumerate() {
-            let mut piece = 0usize;
             for (e, ex) in wp.exchanges.iter().enumerate() {
                 let placed = check(ex, &format!("working {p}/{e}"));
-                piece += tokens_of(&placed);
-            }
-            working += piece;
-            if wp.kind == Kind::Reading {
-                assert!(
-                    piece <= slot.caps.max_file,
-                    "case {case_no}: reading {p} placed {piece} past max_file {}",
-                    slot.caps.max_file
-                );
+                *by_kind.entry(wp.kind).or_default() += tokens_of(&placed);
             }
         }
-        assert!(
-            working <= slot.caps.budget,
-            "case {case_no}: {working} past budget {}",
-            slot.caps.budget
-        );
+        for (kind, cap) in [
+            (Kind::Reading, slot.caps.readings),
+            (Kind::Folder, slot.caps.folders),
+            (Kind::Guide, slot.caps.guides),
+            (Kind::Journal, slot.caps.journals),
+        ] {
+            let used = by_kind.get(&kind).copied().unwrap_or(0);
+            assert!(
+                used <= cap,
+                "case {case_no}: {kind:?} placed {used} past its cap {cap}"
+            );
+        }
         // The current exchange keeps its first turn, its newest tool turn and
         // its last; the dialogue's first exchange keeps its floor unless it is
         // one of the recent exchanges, which give way.

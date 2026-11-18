@@ -9208,7 +9208,7 @@ mod projection_schema_tests {
         };
         for (name, share) in [
             ("repo_map", WorkingSetShare::Folders),
-            ("code_reading", WorkingSetShare::Remainder),
+            ("code_reading", WorkingSetShare::Readings),
         ] {
             let l = layer(name);
             let g = &l.groups[0];
@@ -9223,19 +9223,41 @@ mod projection_schema_tests {
             assert!(l.budget.adaptive.is_none(), "{name}");
         }
 
-        // The guides and journals are drawn out of the files with their hub
-        // files left behind, and a journal entry fades over a 30-day half-life.
-        let guidance = layer("code_reading")
-            .groups
-            .iter()
-            .find(|g| g.name == "guidance")
-            .expect("code_reading declares the guidance group");
-        let draws = guidance.draws.as_ref().expect("guidance draws");
+        // The guides and the journals are drawn out of the files, each as its
+        // own kind, with their hub files left behind; a journal entry fades
+        // over a 30-day half-life and a guide does not.
+        let group = |name: &str| {
+            layer("code_reading")
+                .groups
+                .iter()
+                .find(|g| g.name == name)
+                .unwrap_or_else(|| panic!("code_reading declares the {name} group"))
+        };
+        let guides = group("guidance");
+        assert_eq!(
+            guides.selection,
+            SelectionRule::WorkingSet {
+                share: WorkingSetShare::Guides
+            }
+        );
+        let draws = guides.draws.as_ref().expect("guides draw");
+        assert_eq!(draws.paths, ["candle/mcp/src/guides/"]);
+        assert_eq!(draws.except, ["README.md"]);
+        assert!(guides.recency.is_none(), "a guide does not fade");
+        let journals = group("journals");
+        assert_eq!(
+            journals.selection,
+            SelectionRule::WorkingSet {
+                share: WorkingSetShare::Journals
+            }
+        );
+        let draws = journals.draws.as_ref().expect("journals draw");
+        assert_eq!(draws.paths, ["journals/"]);
         assert_eq!(
             draws.except,
             ["README.md", "group.yaml", "journal.yaml", "person.yaml"]
         );
-        let recency = guidance.recency.as_ref().expect("journals age");
+        let recency = journals.recency.as_ref().expect("journals age");
         assert_eq!(
             (recency.half_life_days, recency.dated_by.as_str()),
             (30.0, "path")
@@ -9353,21 +9375,24 @@ mod projection_schema_tests {
             .working_set
             .as_ref()
             .expect("the dialogue declares a working set");
-        assert_eq!(ws.budget_tokens, 64_000);
-        assert_eq!(ws.folder_tokens, 10_000);
-        assert_eq!(ws.guidance_tokens, 16_000);
         assert_eq!(ws.beta, 0.2);
         assert_eq!(ws.min_momentum, 100.0);
-        assert_eq!(ws.max_file_tokens, 48_000);
-        // The reserve fits Flash-Next's trained window, and the
-        // dialogue's window and the working set's budget are caps on one fill
-        // of it that together reach about the room a system prompt leaves
-        // (244K of 246K), so a thin working set leaves its room to the
-        // dialogue (`docs/hit_driven_projection.md` §4, §7.2).
+        // The reserve fits Flash-Next's trained window, and the slot's room
+        // is shared out by kind as the fill's caps, the shares making the
+        // whole room (`docs/hit_driven_projection.md` §4, §7.2 step 4).
         assert_eq!(ws.reserve_tokens, 16_384);
         assert_eq!(ws.slot_window(262_144).window, 262_144);
-        assert_eq!(layer("dialogue").window, 180_000);
-        assert_eq!(layer("dialogue").window + ws.budget_tokens, 244_000);
+        let caps = ws.fill_shares.caps(233_000);
+        assert_eq!(
+            (
+                caps.readings,
+                caps.folders,
+                caps.guides,
+                caps.journals,
+                caps.dialogue
+            ),
+            (52_425, 4_660, 11_650, 24_465, 139_800)
+        );
         // The persona and the journal are pinned, within 1,024 positions.
         assert!(!schema.system_prompt.pins.is_empty());
         assert_eq!(schema.system_prompt.pins.tokens, 1024);
