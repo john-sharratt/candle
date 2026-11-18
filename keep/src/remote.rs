@@ -21,8 +21,9 @@ use std::convert::Infallible;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::Duration;
 
 use cluster::dispatch::{Dispatch, Route as Declared, RouteTable};
 use cluster::log_read::{self, LogAsk, LogRead};
@@ -141,17 +142,44 @@ fn route(method: &Method, path: &str, body: &[u8], slots: &[Slot]) -> Response<F
                     )
                 }
             };
-            let done = service_request(action, name, slots, false);
-            reply(
-                status_of(&done),
-                json!({"service": name, "answer": done.body.trim()}),
-            )
+            match service_within(action, name, slots, SERVICE_ANSWER) {
+                Some(done) => reply(
+                    status_of(&done),
+                    json!({"service": name, "answer": done.body.trim()}),
+                ),
+                None => reply(
+                    StatusCode::ACCEPTED,
+                    json!({
+                        "service": name,
+                        "answer": "accepted: it waits for the deploy build running there to \
+                                   hand off, then goes ahead; read the state for how it ended",
+                        "read": STATE,
+                    }),
+                ),
+            }
         }
         _ => refuse(
             StatusCode::NOT_FOUND,
             format!("keep has no {method} {path}"),
         ),
     }
+}
+
+/// The longest a cluster request to restart, stop or start a service is held
+/// for its answer: a stop waits for the builds the service runs
+/// (`docs/build_agent.md` §4), which can take longer than a gateway holds a
+/// request, so past this the request is answered accepted and goes on.
+const SERVICE_ANSWER: Duration = Duration::from_secs(25);
+
+/// `action` on `name`, on a thread of its own: its answer if it came within
+/// `within`, `None` while it still runs.
+fn service_within(action: Action, name: &str, slots: &[Slot], within: Duration) -> Option<Answer> {
+    let (tx, rx) = mpsc::channel();
+    let (name, slots) = (name.to_string(), slots.to_vec());
+    thread::spawn(move || {
+        let _ = tx.send(service_request(action, &name, &slots, false));
+    });
+    rx.recv_timeout(within).ok()
 }
 
 /// Every service as it stands.
@@ -301,6 +329,29 @@ pub fn mainline(artifact: &Path, probe: &dyn Probe) -> Result<(), String> {
 
 /// Start a trial as a job; its end is read from [`state`].
 fn trial(body: &[u8], slots: &[Slot], probe: &dyn Probe) -> Response<Full<Bytes>> {
+    let (status, body) = trial_job(body, slots, probe);
+    reply(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        body,
+    )
+}
+
+/// [`trial`]'s status and body, for the cluster route and for keep's local
+/// `/trial`, which a deploy's build agent on this machine asks
+/// (`docs/build_agent.md` §7). It answers once the trial is on the board, and
+/// the trial runs on a thread of its own, so a trial that holds the builds of
+/// the process that asked never waits on that process's answer.
+pub fn trial_job(body: &[u8], slots: &[Slot], probe: &dyn Probe) -> (u16, Value) {
+    let (status, body) = trial_answer(body, slots, probe);
+    (status.as_u16(), body)
+}
+
+fn refusal(status: StatusCode, detail: impl Into<String>) -> (StatusCode, Value) {
+    (status, json!({"error": "refused", "detail": detail.into()}))
+}
+
+fn trial_answer(body: &[u8], slots: &[Slot], probe: &dyn Probe) -> (StatusCode, Value) {
+    let refuse = refusal;
     let ask: TrialAsk = match serde_json::from_slice(body) {
         Ok(a) => a,
         Err(e) => {
@@ -348,9 +399,9 @@ fn trial(body: &[u8], slots: &[Slot], probe: &dyn Probe) -> Response<Full<Bytes>
         Err(refused) => return refuse(status_of(&refused), refused.body.trim().to_string()),
     };
     thread::spawn(move || {
-        switch(path, &tried, Hand::Trial);
+        switch(path, &tried, Hand::Trial, false);
     });
-    reply(
+    (
         StatusCode::ACCEPTED,
         json!({"service": slot.name, "artifact": artifact, "read": STATE}),
     )

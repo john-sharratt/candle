@@ -1,11 +1,12 @@
 //! The agent's file (§11.1): the checkouts it holds, laid out as
 //! `docs/zend_workspace_execution.md` §7.1 describes — one folder per
-//! repository, each with an `origin` — how many jobs it runs at once, and
-//! where their logs go.
+//! repository, each with an `origin` — how long a restart waits for a deploy
+//! build, and where the jobs' logs go. An agent runs one build at a time
+//! (`docs/build_agent.md` §2).
 //!
 //! ```yaml
 //! jobs_dir: D:/agent/jobs
-//! slots: 4
+//! build_hold_mins: 20       # optional; the default
 //! stage_dir: D:/prog/candle/keep/stage
 //! checkouts:
 //!   - name: candle
@@ -16,6 +17,11 @@
 //!   low_free_percent: 10
 //!   worth_gb: 10            # a prune or a clean must bring back at least this
 //! ```
+//!
+//! `build_hold_mins` is the longest a planned restart waits for the deploy
+//! build that is running (`docs/build_agent.md` §3): longer than a normal
+//! deploy build, short enough that one that hangs does not hold the restart
+//! for long.
 //!
 //! `sweep` is when a run, as it takes its checkout, first takes back what the
 //! checkouts' build outputs hold ([`crate::sweep`]): prune, then clean.
@@ -30,8 +36,17 @@
 //! refused.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
+
+/// How long a restart waits for a running deploy build, when the file names
+/// no `build_hold_mins`.
+pub const BUILD_HOLD_MINS: u64 = 20;
+
+fn build_hold_mins() -> u64 {
+    BUILD_HOLD_MINS
+}
 
 /// One repository the agent holds.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -76,10 +91,10 @@ impl Default for SweepConfig {
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub jobs_dir: PathBuf,
-    /// Jobs run at once, one per checkout at most; half the cores when
-    /// absent.
-    #[serde(default)]
-    pub slots: Option<u32>,
+    /// The longest a planned restart waits for a running deploy build, in
+    /// minutes.
+    #[serde(default = "build_hold_mins")]
+    pub build_hold_mins: u64,
     /// Where a run stages the file it built, for this machine's keep.
     #[serde(default)]
     pub stage_dir: Option<PathBuf>,
@@ -123,9 +138,9 @@ impl AgentConfig {
         Self::parse(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
     }
 
-    /// Jobs run at once: as configured, or half of `cores`, at least one.
-    pub fn slots(&self, cores: u16) -> u32 {
-        self.slots.unwrap_or_else(|| u32::from(cores / 2)).max(1)
+    /// The longest a planned restart waits for a running deploy build.
+    pub fn build_hold(&self) -> Duration {
+        Duration::from_secs(self.build_hold_mins * 60)
     }
 }
 
@@ -134,16 +149,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_file_names_its_checkouts_and_slots() {
+    fn the_file_names_its_checkouts_and_its_build_hold() {
         let cfg = AgentConfig::parse(
-            "jobs_dir: /a/jobs\nslots: 3\nstage_dir: /a/stage\ncheckouts:\n  - name: candle\n    dir: /a/candle\n    push: true\n  - name: site\n    dir: /a/site\n",
+            "jobs_dir: /a/jobs\nbuild_hold_mins: 30\nstage_dir: /a/stage\ncheckouts:\n  - name: candle\n    dir: /a/candle\n    push: true\n  - name: site\n    dir: /a/site\n",
         )
         .unwrap();
         assert_eq!(
             cfg,
             AgentConfig {
                 jobs_dir: "/a/jobs".into(),
-                slots: Some(3),
+                build_hold_mins: 30,
                 stage_dir: Some("/a/stage".into()),
                 checkouts: vec![
                     CheckoutConfig {
@@ -162,7 +177,7 @@ mod tests {
                 sweep: SweepConfig::default(),
             }
         );
-        assert_eq!(cfg.slots(16), 3);
+        assert_eq!(cfg.build_hold(), Duration::from_secs(30 * 60));
     }
 
     /// **The sweep's bars default, and each can be set alone.**
@@ -182,10 +197,13 @@ mod tests {
         assert!(AgentConfig::parse("jobs_dir: j\ncheckouts: []\nsweep: {often: 1}\n").is_err());
     }
 
+    /// **The build hold defaults to 20 minutes, `slots` is no setting any
+    /// more, and checkout names are unique.**
     #[test]
-    fn slots_default_to_half_the_cores_and_names_are_unique() {
+    fn the_build_hold_defaults_and_names_are_unique() {
         let cfg = AgentConfig::parse("jobs_dir: j\ncheckouts: []\n").unwrap();
-        assert_eq!((cfg.slots(16), cfg.slots(1)), (8, 1));
+        assert_eq!(cfg.build_hold(), Duration::from_secs(BUILD_HOLD_MINS * 60));
+        assert!(AgentConfig::parse("jobs_dir: j\nslots: 4\ncheckouts: []\n").is_err());
         assert!(AgentConfig::parse(
             "jobs_dir: j\ncheckouts:\n  - {name: a, dir: x}\n  - {name: a, dir: y}\n"
         )
@@ -240,6 +258,9 @@ mod tests {
             .checkouts
             .iter()
             .all(|c| c.dir.starts_with("C:/Users/johna/prog/agent")));
-        assert_eq!(laptop.slots(22), 2);
+        // Both take the default: a file naming `build_hold_mins` would stop a
+        // build from before it, which refuses keys it does not know.
+        assert_eq!(blackworld.build_hold_mins, BUILD_HOLD_MINS);
+        assert_eq!(laptop.build_hold_mins, BUILD_HOLD_MINS);
     }
 }

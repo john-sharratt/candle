@@ -1,20 +1,14 @@
 //! An agent's install (`docs/replicated_substrate.md` §3.9): asked by the
-//! process's upgrades, it stops the agent the way Ctrl-C does — its sockets
-//! close, so no gateway sends it another job — waits, at most
-//! [`JOBS_WAIT`], for the jobs it is running to end, and asks `keep` to start
-//! the staged build.
+//! process's upgrades once they have held the agent's builds and the hold has
+//! drained (`docs/build_agent.md` §4), it stops the agent the way Ctrl-C does
+//! — its sockets close, so no gateway sends it another job — and asks `keep`
+//! to start the staged build. Nothing is running by then: a deploy's build
+//! has handed off, any other run was set aside, and the queue waits on keep.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use cluster::upgrade::runtime::{InstallJob, Installer};
 use tokio::sync::Notify;
-use tokio::time::{sleep, Instant};
-
-use crate::jobs::Jobs;
-
-/// The longest an install waits for the jobs in flight.
-pub const JOBS_WAIT: Duration = Duration::from_secs(60);
 
 /// The agent's side of an install.
 #[derive(Default)]
@@ -49,19 +43,6 @@ impl Installer for AgentInstaller {
         *held = Some(job);
         self.asked.notify_waiters();
         Ok(())
-    }
-}
-
-/// Wait, at most [`JOBS_WAIT`], for `jobs` to have nothing running; how many
-/// were still running when it stopped waiting.
-pub async fn jobs_ended(jobs: &Jobs) -> u32 {
-    let deadline = Instant::now() + JOBS_WAIT;
-    loop {
-        let (_, running) = jobs.slots();
-        if running == 0 || Instant::now() >= deadline {
-            return running;
-        }
-        sleep(Duration::from_millis(200)).await;
     }
 }
 

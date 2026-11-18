@@ -6,8 +6,10 @@
 #
 # The names are what the jobs ask for: zend's workspace repositories as
 # `workspace.yaml` names them, and the mind as motherd.yaml's `mind_repo:`.
+# One build at a time (docs/build_agent.md §2). A planned restart of this
+# motherd waits for the deploy build that is running, at most the agent's
+# `build_hold_mins` (20 by default; §3).
 jobs_dir: D:/agent/jobs
-slots: 4
 # Where a build job stages what it built for this machine's keep to try
 # (docs/claude_zend_gateway.md §8.4).
 stage_dir: D:/prog/candle/keep/stage

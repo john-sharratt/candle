@@ -17,12 +17,18 @@
 //! The last [`KEPT`] jobs are kept; asking after an older one is not found.
 //! Each is kept with its command line and its times, which is what an admin
 //! watching the agent reads ([`Jobs::list`], [`Jobs::tail`]).
+//!
+//! **One run at a time** (`docs/build_agent.md` §2): a run takes the machine's
+//! build slot ([`queue`]) once its store is ready, and gives it back once it
+//! has ended, staged what it built and, for a deploy, asked keep for the
+//! trial ([`handoff`]). A planned restart holds the queue first ([`hold`]),
+//! and the queue waits on keep while the process restarts ([`park`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,9 +51,14 @@ use crate::sweep::{sweep, Bars, Target};
 use crate::switch::Switch;
 use crate::wire::{
     decode_bundle, AgentJobs, FetchJob, Fetched, JobKind, JobLine, JobView, ListJob, Listed,
-    LogChunk, Phase, PushJob, Pushed, RunJob, Staged, Submit,
+    LogChunk, Phase, PushJob, Pushed, RunJob, Staged, Submit, Tried,
 };
+use queue::Queue;
 
+mod handoff;
+pub mod hold;
+mod park;
+pub mod queue;
 mod start_setup;
 
 /// Jobs kept after they end.
@@ -106,6 +117,8 @@ enum Prep {
     SettingUp,
     /// Fetching origin and building its store: it has no sandbox job yet.
     Fetching,
+    /// Its store is ready, and it waits in the queue for the build slot.
+    Queued,
     /// Its sandbox job, which says where it stands from here.
     Started(JobId),
     /// It ended before its command started — the fetch or the store failed,
@@ -124,6 +137,14 @@ enum Kind {
         stage: Option<String>,
         /// What staging came to, once it ended.
         staged: Option<Staged>,
+        /// What it was sent, kept so a hold can set it aside and run it again,
+        /// and park it for the next process ([`hold`], [`park`]).
+        request: RunJob,
+        /// Its overlay as resolved here.
+        overlay: Snapshot,
+        gate: Gate,
+        /// A deploy's handoff to keep, once made ([`handoff`]).
+        tried: Option<Tried>,
     },
     Push {
         status: JobStatus,
@@ -131,6 +152,11 @@ enum Kind {
     },
     Fetch {
         status: JobStatus,
+    },
+    /// A run that ended in this agent's previous process, taken back from its
+    /// park ([`park`]): read as it was, with no log.
+    Recalled {
+        view: JobView,
     },
 }
 
@@ -142,6 +168,9 @@ struct Line {
     base: Option<String>,
     command: Vec<String>,
     started_ms: u64,
+    /// When a run took the build slot: what its build took is counted from
+    /// here, not from its time in the queue.
+    slot_ms: Option<u64>,
     ended_ms: Option<u64>,
 }
 
@@ -154,7 +183,18 @@ struct Entry {
 
 pub struct Jobs {
     checkouts: Checkouts,
-    slots: u32,
+    /// The machine's build slot and the queue for it.
+    queue: Queue,
+    /// The longest a hold waits for a running deploy build.
+    build_hold: Duration,
+    /// This agent's node, once joined: what its park and its deploys' ids are
+    /// written under.
+    node: Mutex<Option<u64>>,
+    /// Whether the process it runs in is well; a hold does not wait for a
+    /// build in one that is not.
+    health: Mutex<Option<Health>>,
+    /// Its queue waits on keep for the next process ([`park`]).
+    parked: AtomicBool,
     /// What its commands run at: below normal on a host that also runs a
     /// model member (§11.5).
     priority: Priority,
@@ -171,6 +211,9 @@ pub struct Jobs {
     /// which a member's run on them waits for ([`Jobs::set_up`]).
     setting_up: SettingUp,
 }
+
+/// Whether the process an agent runs in is well enough to be waited for.
+pub type Health = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Whether a run waits for its checkout's setup: a member's does; a setup
 /// command, which is that setup, does not.
@@ -268,13 +311,18 @@ impl std::fmt::Debug for Jobs {
 }
 
 impl Jobs {
-    /// The jobs of `checkouts`, `slots` at a time, their commands run at
-    /// `priority`; switched on or off as its jobs folder keeps it.
-    pub fn new(checkouts: Checkouts, slots: u32, priority: Priority) -> Arc<Jobs> {
+    /// The jobs of `checkouts`, one build at a time, their commands run at
+    /// `priority`, a restart waiting at most `build_hold` for a deploy build;
+    /// switched on or off as its jobs folder keeps it.
+    pub fn new(checkouts: Checkouts, priority: Priority, build_hold: Duration) -> Arc<Jobs> {
         let switch = Switch::open(checkouts.jobs_dir());
         Arc::new(Jobs {
             checkouts,
-            slots,
+            queue: Queue::default(),
+            build_hold,
+            node: Mutex::new(None),
+            health: Mutex::new(None),
+            parked: AtomicBool::new(false),
             priority,
             switch,
             running: AtomicU32::new(0),
@@ -307,9 +355,44 @@ impl Jobs {
         self.priority
     }
 
-    /// Job slots: all of them, and those running.
+    /// The build slot, one, and the runs accepted that have not ended.
     pub fn slots(&self) -> (u32, u32) {
-        (self.slots, self.running.load(Ordering::Relaxed))
+        (1, self.running.load(Ordering::Relaxed))
+    }
+
+    /// Whether a run sent here would start at once: the slot is free, nothing
+    /// waits for it, no hold stands and the queue is open.
+    pub fn slot_free(&self) -> bool {
+        self.queue.free()
+    }
+
+    /// This agent joined as `node`: its park and its deploys are named by it.
+    pub fn set_node(&self, node: u64) {
+        *self.node.lock().unwrap_or_else(|e| e.into_inner()) = Some(node);
+    }
+
+    fn node(&self) -> Option<u64> {
+        *self.node.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How the process this agent runs in says whether it is well.
+    pub fn set_health(&self, health: Health) {
+        *self.health.lock().unwrap_or_else(|e| e.into_inner()) = Some(health);
+    }
+
+    fn healthy(&self) -> bool {
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        health.is_none_or(|well| well())
+    }
+
+    /// Start no run until [`Self::open`]: for a process that proves itself
+    /// before it builds anything (`docs/build_agent.md` §8).
+    pub fn wait_for_serving(&self) {
+        self.queue.close();
     }
 
     fn table(&self) -> MutexGuard<'_, Table> {
@@ -373,6 +456,7 @@ impl Jobs {
             fetched: None,
             listed: Some(Listed::of(&listed)),
             staged: None,
+            tried: None,
             phase: Phase::Ended,
             command: Vec::new(),
             started_ms: 0,
@@ -438,6 +522,7 @@ impl Jobs {
                     fetched: Some(Fetched::of(&f)),
                     listed: None,
                     staged: None,
+                    tried: None,
                     phase: Phase::Ended,
                     command,
                     started_ms,
@@ -460,6 +545,7 @@ impl Jobs {
                     base: None,
                     command,
                     started_ms,
+                    slot_ms: None,
                     ended_ms: Some(now_ms()),
                 },
                 ended,
@@ -520,6 +606,17 @@ impl Jobs {
     /// [`JobError::Missing`], before anything is kept. A member's run first
     /// waits for its checkout's setup to end (`gate`).
     async fn run(self: &Arc<Self>, run: RunJob, gate: Gate) -> Result<JobView, JobError> {
+        self.run_as(run, gate, JobId::random().to_string()).await
+    }
+
+    /// [`Self::run`] under `id`: a fresh one, or the id a parked run had in
+    /// the previous process, so the handle its caller holds still names it.
+    async fn run_as(
+        self: &Arc<Self>,
+        run: RunJob,
+        gate: Gate,
+        id: String,
+    ) -> Result<JobView, JobError> {
         self.checkout(&run.repo)?;
         let branch = BranchName::parse(&run.branch).map_err(|e| JobError::Bad(e.to_string()))?;
         let stage = match &run.stage {
@@ -545,43 +642,67 @@ impl Jobs {
                 .chain(run.args.iter().cloned())
                 .collect(),
             started_ms: now_ms(),
+            slot_ms: None,
             ended_ms: None,
         };
-        let id = JobId::random().to_string();
         let (ended, _) = watch::channel(false);
         self.running.fetch_add(1, Ordering::Relaxed);
-        let jobs = Arc::clone(self);
-        let job = id.clone();
         let repo = run.repo.clone();
         {
             // Held while the job is kept: its task records how far it got
             // only once it is in the table.
             let mut t = self.table();
-            let task =
-                tokio::spawn(async move { jobs.carry(&job, run, overlay, branch, gate).await });
+            let task = self.spawn_carry(&id, run.clone(), overlay.clone(), branch, gate);
             keep_in(
                 &mut t,
                 id.clone(),
                 Entry {
                     repo,
                     kind: Kind::Run {
-                        task: task.abort_handle(),
+                        task,
                         prep: Prep::Fetching,
                         outcome: None,
                         stage,
                         staged: None,
+                        request: run,
+                        overlay,
+                        gate,
+                        tried: None,
                     },
                     line,
                     ended,
                 },
             );
         }
+        // A run that arrives once the queue is parked joins the park: the
+        // process may stop before it starts.
+        if gate == Gate::AfterSetup && self.parked.load(Ordering::Relaxed) {
+            let jobs = Arc::clone(self);
+            tokio::spawn(async move { jobs.park().await });
+        }
         self.view(&id)
     }
 
+    /// Run `id`'s task, from its fetch to its end ([`Self::carry`]).
+    fn spawn_carry(
+        self: &Arc<Self>,
+        id: &str,
+        run: RunJob,
+        overlay: Snapshot,
+        branch: BranchName,
+        gate: Gate,
+    ) -> AbortHandle {
+        let jobs = Arc::clone(self);
+        let job = id.to_string();
+        tokio::spawn(async move { jobs.carry(&job, run, overlay, branch, gate).await })
+            .abort_handle()
+    }
+
     /// Run job `id` from its fetch to its end: wait for its checkout's setup
-    /// (`gate`), fetch origin, start its sandbox job, wait for it, and stage
-    /// what it built.
+    /// (`gate`), fetch origin and build its store, wait in the queue for the
+    /// build slot, start its sandbox job, wait for it, stage what it built
+    /// and, for a deploy, ask keep for the trial. The slot is given back once
+    /// all of that is done.
     async fn carry(
         self: Arc<Self>,
         id: &str,
@@ -595,7 +716,19 @@ impl Jobs {
             self.setting_up.until_ended(&run.repo).await;
             self.set_prep(id, Prep::Fetching);
         }
-        let handle = match self.start(id, run, overlay, branch).await {
+        let repo = run.repo.clone();
+        let deploy = run.deploy.clone();
+        let started = match self.prepare(id, run, overlay, branch).await {
+            Ok(request) => {
+                self.set_prep(id, Prep::Queued);
+                self.queue.join(id, false);
+                self.queue.take(id, deploy.is_some()).await;
+                self.set_slot(id);
+                self.launch(&repo, request)
+            }
+            Err(e) => Err(e),
+        };
+        let handle = match started {
             Ok(started) => {
                 self.set_prep(id, Prep::Started(started.id));
                 started.handle
@@ -605,18 +738,33 @@ impl Jobs {
                 let staged = self
                     .asked_to_stage(id)
                     .then(|| Staged::Not("the run did not start, so nothing was staged".into()));
-                self.finished(id, None, staged);
+                self.finished(id, None, staged, None);
                 return;
             }
         };
         let outcome = handle.finish().await.ok();
         let staged = Arc::clone(&self).staging(id, outcome.as_ref()).await;
-        self.finished(id, outcome, staged);
+        let tried = match (&deploy, &staged) {
+            (Some(service), Some(Staged::At(artifact))) => {
+                Some(self.hand_off(id, service, artifact).await)
+            }
+            _ => None,
+        };
+        self.finished(id, outcome, staged, tried);
     }
 
-    /// Fetch origin for run `id` and start it in its checkout's sandbox, with
-    /// `overlay` laid down. The commit the run's store is on is recorded on
-    /// the job: what it is a run of.
+    /// Start the sandbox job `request` on `repo`'s checkout.
+    fn launch(&self, repo: &str, request: JobRequest) -> Result<StartedJob, JobError> {
+        self.checkout(repo)?
+            .server
+            .start_job(DiskWriteGrant::issue(), request)
+            .map_err(|e| JobError::Bad(format!("the job's log: {e}")))
+    }
+
+    /// Fetch origin for run `id` and build its store, with `overlay` laid
+    /// down: the sandbox job it starts once it holds the build slot. The
+    /// commit the run's store is on is recorded on the job: what it is a run
+    /// of.
     ///
     /// **The store's own base, not the branch resolved apart from it.** A
     /// fetch moves origin's copy of a branch (`refs/remotes/origin/<b>`) and
@@ -625,13 +773,13 @@ impl Jobs {
     /// one. Recorded that way, a run on `main` after a push would name the
     /// commit before it, and a deploy of the pushed commit would cancel the
     /// very build that was making it.
-    async fn start(
+    async fn prepare(
         self: &Arc<Self>,
         id: &str,
         run: RunJob,
         overlay: Snapshot,
         branch: BranchName,
-    ) -> Result<StartedJob, JobError> {
+    ) -> Result<JobRequest, JobError> {
         self.fetch(&run.repo).await?;
         self.sweep(&run.repo).await;
         let c = self.checkout(&run.repo)?;
@@ -648,22 +796,24 @@ impl Jobs {
             .args(run.args)
             .timeout(Duration::from_secs(run.timeout_secs))
             .priority(self.priority);
-        c.server
-            .start_job(
-                DiskWriteGrant::issue(),
-                JobRequest {
-                    branch,
-                    files: Arc::new(store),
-                    command,
-                },
-            )
-            .map_err(|e| JobError::Bad(format!("the job's log: {e}")))
+        Ok(JobRequest {
+            branch,
+            files: Arc::new(store),
+            command,
+        })
     }
 
     /// Run `id` is of commit `base`.
     fn set_base(&self, id: &str, base: String) {
         if let Some(entry) = self.table().0.get_mut(id) {
             entry.line.base = Some(base);
+        }
+    }
+
+    /// Run `id` took the build slot now.
+    fn set_slot(&self, id: &str) {
+        if let Some(entry) = self.table().0.get_mut(id) {
+            entry.line.slot_ms = Some(now_ms());
         }
     }
 
@@ -726,9 +876,18 @@ impl Jobs {
         Some(copied.unwrap_or_else(|e| Staged::Not(format!("staging stopped: {e}"))))
     }
 
-    /// Run `id` ended — by itself, or cancelled — having staged `staged`. Its
-    /// slot is given back once, whichever comes first.
-    fn finished(&self, id: &str, outcome: Option<RunOutcome>, staged: Option<Staged>) {
+    /// Run `id` ended — by itself, or cancelled — having staged `staged` and,
+    /// for a deploy, asked keep for the trial as `tried`. It leaves the queue
+    /// and gives the build slot back, and its count is given back once,
+    /// whichever comes first.
+    fn finished(
+        &self,
+        id: &str,
+        outcome: Option<RunOutcome>,
+        staged: Option<Staged>,
+        tried: Option<Tried>,
+    ) {
+        self.queue.leave(id);
         let mut t = self.table();
         let Some(e) = t.0.get_mut(id) else {
             self.running.fetch_sub(1, Ordering::Relaxed);
@@ -740,11 +899,13 @@ impl Jobs {
         if let Kind::Run {
             outcome: o,
             staged: s,
+            tried: h,
             ..
         } = &mut e.kind
         {
             *o = outcome;
             *s = staged;
+            *h = tried;
         }
         e.line.ended_ms = Some(now_ms());
         // Stored whether or not anyone waits on it: `send` drops a value no
@@ -807,6 +968,7 @@ impl Jobs {
                     base: None,
                     command,
                     started_ms,
+                    slot_ms: None,
                     ended_ms: Some(now_ms()),
                 },
                 ended,
@@ -817,7 +979,11 @@ impl Jobs {
 
     /// Where job `id` stands.
     pub fn view(&self, id: &str) -> Result<JobView, JobError> {
-        let t = self.table();
+        self.view_in(&self.table(), id)
+    }
+
+    /// [`Self::view`] read from the table `t`, already held.
+    fn view_in(&self, t: &Table, id: &str) -> Result<JobView, JobError> {
         let e =
             t.0.get(id)
                 .ok_or_else(|| JobError::NotFound(id.to_string()))?;
@@ -835,6 +1001,7 @@ impl Jobs {
                 fetched: None,
                 listed: None,
                 staged: None,
+                tried: None,
                 phase: Phase::Ended,
                 command,
                 started_ms,
@@ -851,22 +1018,33 @@ impl Jobs {
                 fetched: None,
                 listed: None,
                 staged: None,
+                tried: None,
                 phase: Phase::Ended,
                 command,
                 started_ms,
                 ended_ms,
             },
+            Kind::Recalled { view } => view.clone(),
             Kind::Run {
                 prep,
                 outcome,
                 staged,
+                tried,
                 ..
             } => {
                 let ended = *e.ended.borrow();
                 let (status, lines, bytes, phase) = match prep {
-                    Prep::SettingUp | Prep::Fetching if ended => {
+                    Prep::SettingUp | Prep::Fetching | Prep::Queued if ended => {
                         (JobStatus::Cancelled, 0, 0, Phase::Ended)
                     }
+                    Prep::Queued => (
+                        JobStatus::Queued,
+                        0,
+                        0,
+                        Phase::Waiting {
+                            behind: self.slot_behind(),
+                        },
+                    ),
                     Prep::SettingUp => (
                         JobStatus::Queued,
                         0,
@@ -886,7 +1064,7 @@ impl Jobs {
                         let phase = match &info.status {
                             _ if ended => Phase::Ended,
                             JobStatus::Queued => Phase::Waiting {
-                                behind: self.holding(&t, &e.repo),
+                                behind: self.holding(t, &e.repo),
                             },
                             JobStatus::Running => Phase::Running,
                             _ => Phase::Staging,
@@ -912,6 +1090,7 @@ impl Jobs {
                     fetched: None,
                     listed: None,
                     staged: staged.clone(),
+                    tried: tried.clone(),
                     phase,
                     command,
                     started_ms,
@@ -919,6 +1098,17 @@ impl Jobs {
                 }
             }
         })
+    }
+
+    /// What a run waiting in the queue waits behind: the run holding the slot,
+    /// or the restart holding the queue.
+    fn slot_behind(&self) -> Vec<String> {
+        match self.queue.running() {
+            Some(holder) => vec![holder.id],
+            None if self.queue.held() => vec!["a restart".to_string()],
+            None if !self.queue.is_open() => vec!["the process to be serving".to_string()],
+            None => Vec::new(),
+        }
     }
 
     /// Sweep the checkouts' build outputs if their disk is low ([`sweep`]), as a
@@ -1044,7 +1234,7 @@ impl Jobs {
                     // or done: its own task records how it ended, and what it
                     // staged.
                     let ended = match prep {
-                        Prep::SettingUp | Prep::Fetching => false,
+                        Prep::SettingUp | Prep::Fetching | Prep::Queued => false,
                         Prep::Stopped(_) => true,
                         Prep::Started(j) => self
                             .checkout(&repo)
@@ -1056,24 +1246,24 @@ impl Jobs {
                         None
                     } else {
                         task.abort();
-                        if matches!(prep, Prep::SettingUp | Prep::Fetching) {
+                        if matches!(prep, Prep::SettingUp | Prep::Fetching | Prep::Queued) {
                             *prep = Prep::Stopped(JobStatus::Cancelled);
                         }
                         Some(stage.is_some())
                     }
                 }
-                Kind::Push { .. } | Kind::Fetch { .. } => None,
+                Kind::Push { .. } | Kind::Fetch { .. } | Kind::Recalled { .. } => None,
             }
         };
         if let Some(asked) = aborted {
             let staged =
                 asked.then(|| Staged::Not("the run was cancelled, so nothing was staged".into()));
-            self.finished(id, None, staged);
+            self.finished(id, None, staged, None);
         }
         self.view(id)
     }
 
-    /// Whether it takes jobs, its slots, and up to `limit` of the jobs it
+    /// Whether it takes jobs, its slot, and up to `limit` of the jobs it
     /// keeps, newest first.
     pub fn list(&self, limit: usize) -> AgentJobs {
         let ids: Vec<String> = self.table().1.iter().rev().take(limit).cloned().collect();
@@ -1088,13 +1278,17 @@ impl Jobs {
 
     /// Job `id` as [`Self::list`] shows it.
     fn line(&self, id: &str) -> Result<JobLine, JobError> {
-        let view = self.view(id)?;
-        let t = self.table();
+        self.line_in(&self.table(), id)
+    }
+
+    /// [`Self::line`] read from the table `t`, already held.
+    fn line_in(&self, t: &Table, id: &str) -> Result<JobLine, JobError> {
+        let view = self.view_in(t, id)?;
         let e =
             t.0.get(id)
                 .ok_or_else(|| JobError::NotFound(id.to_string()))?;
         let kind = match &e.kind {
-            Kind::Run { .. } => JobKind::Run,
+            Kind::Run { .. } | Kind::Recalled { .. } => JobKind::Run,
             Kind::Push { .. } => JobKind::Push,
             Kind::Fetch { .. } => JobKind::Fetch,
         };
@@ -1109,6 +1303,7 @@ impl Jobs {
             lines: view.lines,
             bytes: view.bytes,
             started_ms: e.line.started_ms,
+            slot_ms: e.line.slot_ms,
             ended_ms: e.line.ended_ms,
             changed: view.outcome.map_or(0, |o| o.changed.len()),
             phase: view.phase,
@@ -1188,6 +1383,7 @@ mod tests {
             args: vec!["build".into()],
             timeout_secs: 60,
             stage: None,
+            deploy: None,
         });
         let list = Submit::List(ListJob {
             repo: "candle".into(),

@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use agent::checkouts::Checkouts;
 use agent::config::AgentConfig;
-use agent::install::{jobs_ended, AgentInstaller};
+use agent::install::AgentInstaller;
+use agent::jobs::hold::Builds;
 use agent::jobs::Jobs;
 use agent::member::{announce_when_admitted, join, node_in, Joining};
 use clap::Parser;
 use cluster::handshake::GroupKey;
 use cluster::launch::LaunchSpec;
-use cluster::machine::measure;
 use cluster::upgrade::artifacts::RunProbe;
 use cluster::upgrade::handoff::hand_off;
 use cluster::upgrade::kept::KEEP_DEFAULT;
@@ -95,16 +95,22 @@ async fn main() -> anyhow::Result<()> {
         .map(|u| Target::parse(u, args.cluster_name.as_deref()))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let checkouts = Checkouts::open(&cfg, &policy())?;
-    let slots = cfg.slots(measure().cores);
-    let jobs = Jobs::new(checkouts, slots, Priority::Normal);
+    let jobs = Jobs::new(checkouts, Priority::Normal, cfg.build_hold());
+    // No build starts until this build has shown it works: one started in a
+    // process keep could still roll back would die with it
+    // (`docs/build_agent.md` §8).
+    jobs.wait_for_serving();
+    // An install holds the builds before it takes its leases (§4).
+    upgrader.set_builds(Arc::new(Builds(Arc::clone(&jobs))));
     // Each checkout's declared setup, before any job on it (§11.4).
     jobs.set_up();
     let node = node_in(&cfg.jobs_dir)?;
+    jobs.set_node(node);
     let host = args
         .host
         .or_else(machine_name)
         .unwrap_or_else(|| format!("agent-{node:016x}"));
-    tracing::info!(node = %format!("{node:016x}"), slots, "joining as an agent");
+    tracing::info!(node = %format!("{node:016x}"), "joining as an agent");
     let member = join(
         Joining {
             targets,
@@ -116,7 +122,16 @@ async fn main() -> anyhow::Result<()> {
         &upgrader,
     )?;
     let joined = Arc::clone(&member);
-    announce_when_admitted(move || joined.admitted(), || eprintln!("{PROOF}"));
+    let serving = Arc::clone(&jobs);
+    announce_when_admitted(
+        move || joined.admitted(),
+        move || {
+            eprintln!("{PROOF}");
+            // Proven: the queue opens, taking back what the previous process
+            // parked on keep first.
+            tokio::spawn(async move { serving.open().await });
+        },
+    );
     tokio::select! {
         stopped = tokio::signal::ctrl_c() => {
             stopped?;
@@ -125,10 +140,6 @@ async fn main() -> anyhow::Result<()> {
         }
         job = installer.asked() => {
             member.shutdown("the agent is installing a new build");
-            let left = jobs_ended(&jobs).await;
-            if left > 0 {
-                tracing::warn!(left, "jobs still running: they end with this process");
-            }
             match hand_off(&launch, &setup, &job, None) {
                 Ok(()) => {
                     tracing::warn!("keep is starting the staged build — exiting");

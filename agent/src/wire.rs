@@ -197,6 +197,47 @@ pub struct RunJob {
     /// the run exits 0, for this machine's keep to try.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
+    /// The service this run is a deploy of: once it has staged its binary,
+    /// the agent asks its machine's keep for the trial itself, under the
+    /// deploy's id (`docs/build_agent.md` §7). A planned restart waits for a
+    /// deploy's build, and sets any other run aside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<String>,
+}
+
+/// What came of a deploy's handoff to keep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tried {
+    /// keep took the trial: it is on keep's board under the deploy's id.
+    Asked,
+    /// keep refused it, and why.
+    Refused(String),
+}
+
+/// A queue parked on keep while its process restarts
+/// (`docs/build_agent.md` §6): `POST /park` on keep's local port carries it,
+/// and the agent's next process takes it back with `POST /unpark {node}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Park {
+    /// The agent's node, as 16 hex digits.
+    pub node: String,
+    /// The runs waiting, in their order, each under its id.
+    pub runs: Vec<ParkedRun>,
+    /// The runs that ended, so a handle from before the restart is answered.
+    pub ended: Vec<ParkedEnded>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParkedRun {
+    pub id: String,
+    pub run: RunJob,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParkedEnded {
+    pub line: JobLine,
+    pub view: JobView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +290,9 @@ pub struct JobView {
     /// file's path on the agent's machine, or why nothing was staged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged: Option<Staged>,
+    /// A deploy's handoff to keep, once it has been made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tried: Option<Tried>,
     /// Where it has got to (see [`Phase`]).
     #[serde(default)]
     pub phase: Phase,
@@ -270,8 +314,8 @@ pub struct JobView {
 pub enum Phase {
     /// Fetching origin, so the base it runs on is held here.
     Fetching,
-    /// Waiting for its checkout, which the runs `behind` hold — jobs on one
-    /// checkout run one at a time.
+    /// Waiting for the build slot or its checkout, which the runs `behind`
+    /// hold — or a restart holding the queue — as one build runs at a time.
     Waiting { behind: Vec<String> },
     /// Its command is running.
     Running,
@@ -326,6 +370,10 @@ pub struct JobLine {
     pub bytes: u64,
     /// When it started and ended, in Unix milliseconds.
     pub started_ms: u64,
+    /// When a run took the build slot: what its build took is counted from
+    /// here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_ms: Option<u64>,
     pub ended_ms: Option<u64>,
     /// The files a run changed, once it has ended.
     pub changed: usize,
@@ -604,6 +652,7 @@ mod tests {
             args: vec!["test".into()],
             timeout_secs: 600,
             stage: None,
+            deploy: None,
         });
         assert_eq!(
             serde_json::to_value(&run).unwrap(),
@@ -621,9 +670,11 @@ mod tests {
             args: vec!["build".into()],
             timeout_secs: 600,
             stage: Some("target/release/motherd.exe".into()),
+            deploy: Some("motherd".into()),
         });
         let wire = serde_json::to_value(&staging).unwrap();
         assert_eq!(wire["stage"], "target/release/motherd.exe");
+        assert_eq!(wire["deploy"], "motherd");
         assert_eq!(serde_json::from_value::<Submit>(wire).unwrap(), staging);
         let push = Submit::Push(PushJob {
             repo: "candle".into(),
@@ -683,6 +734,7 @@ mod tests {
             fetched: None,
             listed: None,
             staged: None,
+            tried: None,
             phase: Phase::Ended,
             command: vec!["cargo".into(), "check".into()],
             started_ms: 5,
@@ -706,6 +758,25 @@ mod tests {
         let wire = serde_json::to_value(&staged).unwrap();
         assert_eq!(wire["staged"], json!({"at": "D:/keep/stage/motherd.exe"}));
         assert_eq!(serde_json::from_value::<JobView>(wire).unwrap(), staged);
+        // A deploy says what came of its handoff to keep.
+        let refused = JobView {
+            tried: Some(Tried::Refused("a trial of x is already running".into())),
+            ..staged.clone()
+        };
+        let wire = serde_json::to_value(&refused).unwrap();
+        assert_eq!(
+            wire["tried"],
+            json!({"refused": "a trial of x is already running"})
+        );
+        assert_eq!(serde_json::from_value::<JobView>(wire).unwrap(), refused);
+        let asked = JobView {
+            tried: Some(Tried::Asked),
+            ..staged
+        };
+        assert_eq!(
+            serde_json::to_value(&asked).unwrap()["tried"],
+            json!("asked")
+        );
     }
 
     /// A fetch asks for a branch past what the member holds; its answer
@@ -786,6 +857,7 @@ mod tests {
                 lines: 2,
                 bytes: 17,
                 started_ms: 1_700_000_000_000,
+                slot_ms: None,
                 ended_ms: None,
                 changed: 0,
                 phase: Phase::Waiting {

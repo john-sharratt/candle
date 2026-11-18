@@ -30,10 +30,15 @@ services:
     stable: keep/stable/web.exe
     args: ["--config", "web/web.yaml"]
     cwd: D:/prog/candle
+  # motherd runs this machine's build agent: before keep stops it for a trial,
+  # an accept, a restart or a stop, it asks motherd's plain entrance to hold
+  # the builds and waits for the deploy build running there to hand off
+  # (docs/build_agent.md §4, §5). A forced request does not wait.
   - name: motherd
     stable: keep/stable/motherd.exe
     args: ["--config", "motherd/motherd.yaml"]
     cwd: D:/prog/candle
+    agent: 192.168.1.2:8081
   - name: mcp
     stable: keep/stable/mcp.exe
     args: ["--config", "mcp/mcp.yaml"]

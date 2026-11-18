@@ -13,12 +13,14 @@
 //! | a candidate's verdicts and its `certify` proposal | [`candidate`] |
 //! | the upgrade commands: verdicts, pauses and rollouts by hand, rollback | [`commands`] |
 //! | taking the lease, the install, `ok`, and handing the lease back | [`install`] |
+//! | the builds an install waits for | [`builds`] |
 //! | the machine's connector following the release | [`connector`] |
 //! | what it serves | [`served`] |
 //! | the builds it never tries again | [`refused`] |
 //! | what `COORD` reports | [`view`] |
 
 mod announce;
+pub mod builds;
 mod candidate;
 pub mod commands;
 pub mod connector;
@@ -47,6 +49,7 @@ use super::watchdog::{Failure, FAILED};
 use crate::coord::{KeptLine, VerdictLine};
 use crate::frame::{BuildArtifacts, Frame};
 use crate::member::AppMember;
+use builds::{BuildHold, HoldTicket};
 use facts_read::FactsRead;
 use failed_install::failed_install;
 
@@ -109,6 +112,9 @@ struct State {
     blocked: Option<String>,
     /// The machine's connector was looked at once this process was ready.
     connector_followed: bool,
+    /// The hold an install has on this process's builds, from the tick that
+    /// found its target until the process stops or the install is given up.
+    hold: Option<Arc<dyn HoldTicket>>,
 }
 
 /// See the module documentation.
@@ -118,6 +124,8 @@ pub struct Upgrader {
     installer: Arc<dyn Installer>,
     probe: Arc<dyn Probe + Send + Sync>,
     apps: Mutex<Vec<Arc<AppMember>>>,
+    /// The build agent in this process, which an install holds first.
+    builds: Mutex<Option<Arc<dyn BuildHold>>>,
     s: Mutex<State>,
 }
 
@@ -166,6 +174,7 @@ impl Upgrader {
             installer,
             probe,
             apps: Mutex::new(Vec::new()),
+            builds: Mutex::new(None),
             s: Mutex::new(State {
                 facts,
                 failure,
@@ -192,6 +201,16 @@ impl Upgrader {
         s.facts
             .nodes
             .insert(member.app().to_string(), format!("{:016x}", member.node()));
+    }
+
+    /// This process runs builds through `builds`: an install holds them
+    /// before it takes its leases (`docs/build_agent.md` §4).
+    pub fn set_builds(&self, builds: Arc<dyn BuildHold>) {
+        *lock(&self.builds) = Some(builds);
+    }
+
+    fn builds(&self) -> Option<Arc<dyn BuildHold>> {
+        lock(&self.builds).clone()
     }
 
     fn apps(&self) -> Vec<Arc<AppMember>> {

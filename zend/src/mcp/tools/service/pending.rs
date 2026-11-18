@@ -103,6 +103,7 @@ mod tests {
             lines: 0,
             bytes: 0,
             started_ms: 0,
+            slot_ms: None,
             ended_ms: None,
             changed: 0,
             phase,

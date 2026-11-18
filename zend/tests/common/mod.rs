@@ -34,7 +34,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::checkouts::Checkouts;
-use agent::config::{AgentConfig, CheckoutConfig, SweepConfig};
+use agent::config::{AgentConfig, CheckoutConfig, SweepConfig, BUILD_HOLD_MINS};
 use agent::jobs::Jobs;
 use candle::Device;
 use candle_conversation::models::Model;
@@ -410,7 +410,7 @@ pub fn agent(ws: &Path) -> Arc<Jobs> {
     }
     let cfg = AgentConfig {
         jobs_dir: root.join("jobs"),
-        slots: Some(1),
+        build_hold_mins: BUILD_HOLD_MINS,
         stage_dir: None,
         checkouts: vec![CheckoutConfig {
             name: PROJECT_REPO.into(),
@@ -421,7 +421,7 @@ pub fn agent(ws: &Path) -> Arc<Jobs> {
         sweep: SweepConfig::default(),
     };
     let checkouts = Checkouts::open(&cfg, &policy()).expect("open the agent's checkout");
-    Jobs::new(checkouts, 1, Priority::Normal)
+    Jobs::new(checkouts, Priority::Normal, cfg.build_hold())
 }
 
 /// Run `git` in `dir` with a fixed identity, panicking on failure.

@@ -7,11 +7,12 @@
 //! tenant takes its engine from, the HTTP server, and the exit.
 
 use std::collections::HashMap;
+use std::mem::forget;
 use std::mem::replace;
 use std::path::{Component, Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use candle_conversation::engine_slot::CoreRequests;
 use candle_conversation::profile::set_gpu_span_period;
@@ -30,6 +31,7 @@ use tokio::sync::oneshot;
 use web::Roots;
 
 use crate::access::{roles, LocalSignin};
+use crate::agent_hold::with_hold;
 use crate::boot::{router as boot_router, Boot, BootLine};
 use crate::cli::HostArgs;
 use crate::cluster::in_flight::IN_FLIGHT_WAIT;
@@ -57,6 +59,7 @@ use crate::telemetry::Telemetry;
 use crate::tenant::{Reports, Stop, Tenant, TenantContext, TenantUi};
 use crate::ui::{build_id, COMMON};
 use agent::config::AgentConfig;
+use agent::jobs::Jobs;
 #[cfg(feature = "memory-census")]
 use heap_census::{set_thread, Scope};
 
@@ -312,7 +315,11 @@ pub fn run_seated(cfg: HostConfig, seats: Vec<Seat>) -> ! {
 /// **Until then, each catch-up that receives more prints a syncing line**
 /// (`syncing`), which restarts `keep`'s limit: a member that is behind is
 /// waited out while its sync keeps arriving, and rolled back once it stalls.
-fn announce_when_ready(reports: Vec<Arc<dyn Reports>>) {
+///
+/// **The build agent's queue opens with the proof**: keep keeps the build on
+/// that line, so a build never starts in a process it could still roll back
+/// (`docs/build_agent.md` §8).
+fn announce_when_ready(reports: Vec<Arc<dyn Reports>>, agent: Option<Arc<Jobs>>) {
     tokio::spawn(async move {
         let mut synced = vec![0u64; reports.len()];
         loop {
@@ -328,6 +335,9 @@ fn announce_when_ready(reports: Vec<Arc<dyn Reports>>) {
             }
             if ready {
                 eprintln!("{PROOF}");
+                if let Some(agent) = &agent {
+                    agent.open().await;
+                }
                 // Loaded: the census judges growth from here, not across the
                 // load.
                 #[cfg(feature = "memory-census")]
@@ -569,14 +579,20 @@ async fn serve_tenants(
     // The boot server has released the ports. The real server is about to
     // accept, and a tenant's `start` returns while its model is still loading.
     // The line `keep` waits for is printed once every tenant reports ready.
-    announce_when_ready(proving);
+    announce_when_ready(proving, agent.clone());
+    // keep asks this process to hold its builds before it stops it
+    // (`docs/build_agent.md` §5).
+    let router = match &agent {
+        Some(jobs) => with_hold(all.router, Arc::clone(jobs), listen.bind),
+        None => all.router,
+    };
     let served = serve(
         &listen,
         &uis,
-        all.router,
+        router,
         local_signin,
         cluster.clone(),
-        leave(Arc::clone(&stopping), cluster.clone()),
+        leave(Arc::clone(&stopping), cluster.clone(), agent.clone()),
     )
     .await;
     if let Some(c) = &cluster {
@@ -603,12 +619,28 @@ async fn serve_tenants(
 /// Resolves once the process should stop serving: a Ctrl-C, or a `shutdown`
 /// or `restart` command (§12.4). A member first drains and sends what it
 /// wrote; the server then finishes the requests in flight.
-async fn leave(stopping: Arc<Stopping>, cluster: Option<Arc<Cluster>>) {
-    tokio::select! {
+///
+/// **A stop the process was asked for holds its builds first**: a `shutdown`
+/// or `restart` command, npcd's relaunch, or an install, before anything stops
+/// serving (`docs/build_agent.md` §4). An install already holds them from
+/// `install_tick`, and this hold joins it. A Ctrl-C is a person at the console
+/// and waits for nothing.
+async fn leave(stopping: Arc<Stopping>, cluster: Option<Arc<Cluster>>, agent: Option<Arc<Jobs>>) {
+    let asked = tokio::select! {
         _ = stop_signal() => {
             stopping.ask(Ending::Exit);
+            false
         }
-        _ = stopping.asked() => {}
+        _ = stopping.asked() => true,
+    };
+    if let (true, Some(jobs)) = (asked, &agent) {
+        let held = jobs.hold();
+        while !held.drained() {
+            stopping.set_step("Waiting for builds", held.waiting_for());
+            let _ = tokio::time::timeout(Duration::from_secs(1), held.until_drained()).await;
+        }
+        // Held until the process exits: the queue waits on keep for the next.
+        forget(held);
     }
     abort_on_ctrl_c();
     if let Some(c) = &cluster {

@@ -2,7 +2,9 @@
 //!
 //! **The install.** Once a target is decided ([`target`]), its artifact is
 //! verified or kept here, and the build can open this member's substrate
-//! ([`check`]), the member takes the install's leases — `upgrade/<app>` for each
+//! ([`check`]), and the build agent in the process, if it runs one, has held and
+//! drained its builds ([`super::builds`]), the member takes the install's
+//! leases — `upgrade/<app>` for each
 //! app it serves, or one of a forced rollout's `upgrade/<app>/<i>` — and hands
 //! the install to its [`Installer`]: the process drains, flushes, releases its
 //! substrate, closes its sockets, stages the new executable and asks `keep`
@@ -26,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::builds::builds_drained;
 use super::decide::{holding_back, target, Lease};
 use super::fetch::connector_of;
 use super::served::HeldAs;
@@ -295,6 +298,8 @@ impl Upgrader {
         };
         let Some(t) = chosen else {
             let mut s = self.state();
+            // No install to make: a hold an earlier tick took is let go.
+            s.hold = None;
             if s.stranded.is_none() {
                 let step = holding_back(&s.facts).unwrap_or_default();
                 if step != s.step {
@@ -324,7 +329,20 @@ impl Upgrader {
             let mut s = self.state();
             s.stranded = Some(reason);
             s.step = "stranded".into();
+            s.hold = None;
             return;
+        }
+        // The builds before the leases (`docs/build_agent.md` §4): a lease is
+        // never renewed, so its time must not be spent waiting for a build.
+        // The hold then stands through any wait for the leases, and until the
+        // process stops.
+        let builds = self.builds();
+        {
+            let mut s = self.state();
+            if let Err(step) = builds_drained(&mut s.hold, builds.as_ref()) {
+                s.step = step;
+                return;
+            }
         }
         let leases: Vec<String> = match &t.lease {
             Lease::None => Vec::new(),
@@ -415,6 +433,7 @@ impl Upgrader {
             let mut s = self.state();
             s.installing = false;
             s.step = "waiting".into();
+            s.hold = None;
         }
     }
 }

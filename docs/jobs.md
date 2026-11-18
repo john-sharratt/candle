@@ -60,8 +60,14 @@ A start never waits on work that can take seconds.
 - **The gateway never holds a job back** (`cluster/src/gateway/agents.rs`). A
   busy lineage holder spills to the best free agent at once; with none free the
   job queues on its holder or the best agent.
-- **`service_deploy` answers once its build is accepted.** A driver in the
-  member that took the call waits for the build and asks keep for the trial.
+- **`service_deploy` answers once its build is accepted.** The build says
+  it is a deploy of the service, and the agent that runs it asks its own
+  machine's keep for the trial once it has staged the binary
+  (`docs/build_agent.md` §7).
+
+An agent runs one build or test at a time, and a planned restart of the
+process it runs in waits for a deploy's build and sets any other run aside to
+run again after it (`docs/build_agent.md`).
 
 A build's **phase** (`agent::wire::Phase`): `fetching`, `waiting {behind}` (the
 checkout is held by the runs behind), `running`, `staging`, `ended`.
@@ -142,8 +148,10 @@ maintenance jobs at `GET /v1/cluster/command/jobs`.
    and a build queued ahead of it on the same agent stages that connector, so
    the trial's daemon follows it and offers it to the members that install
    the release (`docs/replicated_substrate.md` §3.9).
-4. The driver waits for the build and, once it is staged, posts the trial to
-   that machine's keep with the deploy's handle.
+4. Once the build has staged its binary, the agent that ran it posts the
+   trial to its own machine's keep (`POST /trial` on keep's local port) under
+   the deploy's id, before it gives the build slot back, and records what keep
+   answered on the job (`tried`).
 5. keep runs the trial: proven on `INFO serving` within ten minutes, the window
    restarting at each sync line, or rolled back.
 

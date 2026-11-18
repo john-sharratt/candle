@@ -153,6 +153,7 @@ impl Executor for AgentExecutor {
             args: request.command.args.clone(),
             timeout_secs: request.command.timeout.as_secs(),
             stage: None,
+            deploy: None,
         };
         let ran = self.wait_for(lineage, job).map_err(failed)?;
         let id = JobId::parse(&ran.view.id).ok_or_else(|| {
@@ -364,7 +365,7 @@ mod tests {
         }
         let cfg = AgentConfig {
             jobs_dir: root.path().join("agent-jobs"),
-            slots: Some(1),
+            build_hold_mins: 20,
             stage_dir: None,
             checkouts: vec![CheckoutConfig {
                 name: "app".into(),
@@ -376,8 +377,8 @@ mod tests {
         };
         let jobs = Jobs::new(
             Checkouts::open(&cfg, &CommandPolicy::allowing([shell()])).unwrap(),
-            1,
             Priority::Below,
+            cfg.build_hold(),
         );
         let executor = Arc::new(AgentExecutor::new(
             Agents::new(cut_off(), Some(jobs)),

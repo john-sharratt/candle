@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent::checkouts::Checkouts;
-use agent::config::{AgentConfig, CheckoutConfig, SweepConfig};
+use agent::config::{AgentConfig, CheckoutConfig, SweepConfig, BUILD_HOLD_MINS};
 use agent::jobs::Jobs;
 use anyhow::{bail, Context};
 use candle_conversation::persistence::SUBSTRATE_DIR;
@@ -146,7 +146,7 @@ fn agent_for(workspace: &Path, checkouts: &Path, out: &Path) -> anyhow::Result<A
         .join("battery_agent_jobs");
     let cfg = AgentConfig {
         jobs_dir,
-        slots: Some(1),
+        build_hold_mins: BUILD_HOLD_MINS,
         stage_dir: None,
         checkouts: Workspace::manifest(workspace)?
             .into_iter()
@@ -160,7 +160,7 @@ fn agent_for(workspace: &Path, checkouts: &Path, out: &Path) -> anyhow::Result<A
         sweep: SweepConfig::default(),
     };
     let checkouts = Checkouts::open(&cfg, &policy()).context("opening the agent's checkout")?;
-    Ok(Jobs::new(checkouts, 1, Priority::Normal))
+    Ok(Jobs::new(checkouts, Priority::Normal, cfg.build_hold()))
 }
 
 /// Every identifier-like word in the repository's source and documents.

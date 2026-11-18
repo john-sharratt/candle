@@ -60,6 +60,7 @@ use std::time::{Duration, Instant};
 
 use agent::checkouts::Checkouts;
 use agent::config::AgentConfig;
+use agent::jobs::hold::Builds;
 use agent::jobs::Jobs;
 use agent::member::{node_in, Agent, APP as AGENT_APP};
 use axum::Router;
@@ -268,7 +269,7 @@ impl Cluster {
                 last = std::time::Instant::now();
             }
         });
-        Ok(Arc::new(Cluster {
+        let cluster = Arc::new(Cluster {
             targets,
             agent,
             upgrader,
@@ -299,7 +300,28 @@ impl Cluster {
                 })
                 .collect(),
             settings,
-        }))
+        });
+        if let Some(jobs) = &cluster.agent {
+            // A hold does not wait for a build in a process that is not well,
+            // and an install holds the builds before it takes its leases
+            // (`docs/build_agent.md` §3, §4).
+            let weak = Arc::downgrade(&cluster);
+            jobs.set_health(Arc::new(move || weak.upgrade().is_some_and(|c| c.well())));
+            cluster
+                .upgrader
+                .set_builds(Arc::new(Builds(Arc::clone(jobs))));
+        }
+        Ok(cluster)
+    }
+
+    /// Whether this process is well enough for a restart to wait on its
+    /// builds: every app it serves ready, and no device failing.
+    fn well(&self) -> bool {
+        !device_failing()
+            && self
+                .links
+                .values()
+                .all(|link| link.ready.load(Ordering::Relaxed))
     }
 
     fn sockets(&self) -> &Runtime {
@@ -480,7 +502,9 @@ impl Cluster {
 pub fn standalone_agent(cfg: &AgentConfig) -> anyhow::Result<Arc<Jobs>> {
     let checkouts = Checkouts::open(cfg, &policy())?;
     tracing::info!("an agent in process, with no cluster");
-    let jobs = Jobs::new(checkouts, cfg.slots(measure().cores), Priority::Below);
+    let jobs = Jobs::new(checkouts, Priority::Below, cfg.build_hold());
+    // No build until the process is serving (`docs/build_agent.md` §8).
+    jobs.wait_for_serving();
     // Each checkout's declared setup, before any job on it (§11.4).
     jobs.set_up();
     Ok(jobs)
@@ -502,8 +526,12 @@ fn start_agent(
     runtime: &Handle,
 ) -> anyhow::Result<Arc<Jobs>> {
     let checkouts = Checkouts::open(cfg, &policy())?;
-    let jobs = Jobs::new(checkouts, cfg.slots(measure().cores), Priority::Below);
+    let jobs = Jobs::new(checkouts, Priority::Below, cfg.build_hold());
+    // No build until the process is serving: one started in a process keep
+    // could still roll back would die with it (`docs/build_agent.md` §8).
+    jobs.wait_for_serving();
     let node = node_in(&cfg.jobs_dir)?;
+    jobs.set_node(node);
     let _on = runtime.enter();
     // Each checkout's declared setup, before any job on it (§11.4).
     jobs.set_up();

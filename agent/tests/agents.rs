@@ -145,7 +145,7 @@ fn repos_with(files: &[(&str, &str)]) -> Repos {
 fn jobs_over(r: &Repos, push: bool) -> Arc<Jobs> {
     let cfg = AgentConfig {
         jobs_dir: r.jobs.clone(),
-        slots: Some(2),
+        build_hold_mins: 20,
         stage_dir: Some(r.jobs.join("stage")),
         checkouts: vec![CheckoutConfig {
             name: "r".into(),
@@ -157,7 +157,7 @@ fn jobs_over(r: &Repos, push: bool) -> Arc<Jobs> {
     };
     let shell = copy("a", "b").0;
     let checkouts = Checkouts::open(&cfg, &CommandPolicy::allowing([shell.as_str()])).unwrap();
-    Jobs::new(checkouts, 2, Priority::Normal)
+    Jobs::new(checkouts, Priority::Normal, cfg.build_hold())
 }
 
 fn main() -> BranchName {
@@ -181,6 +181,7 @@ fn run_job(store: &VfsStore) -> RunJob {
         args,
         timeout_secs: 60,
         stage: None,
+        deploy: None,
     }
 }
 
@@ -223,7 +224,7 @@ async fn a_run_on_an_agent_comes_back_as_deltas() {
     assert!(!r.agent.join("out.txt").exists());
     assert!(jobs.log(&view.id).unwrap().unwrap().is_file());
     assert_eq!(view.phase, Phase::Ended);
-    assert_eq!(jobs.slots(), (2, 0));
+    assert_eq!(jobs.slots(), (1, 0));
 }
 
 /// **A run on `main` after a push is of the pushed commit**
@@ -470,7 +471,107 @@ async fn a_run_answers_at_once_and_says_where_it_is() {
     );
     let done = ended(&jobs, first).await;
     assert_eq!(done.status, JobStatus::Exited { code: Some(0) }, "{done:?}");
-    assert_eq!(jobs.slots(), (2, 0));
+    assert_eq!(jobs.slots(), (1, 0));
+}
+
+/// **A hold sets aside a run that is no deploy**
+/// (`docs/build_agent.md` §3): the hold drains without waiting for it, the
+/// run waits behind the restart under its own id, and once the hold ends it
+/// runs again from its start and ends as it would have.
+#[tokio::test]
+async fn a_hold_sets_aside_a_run_that_is_no_deploy() {
+    let r = repos();
+    let jobs = jobs_over(&r, false);
+    let store = changed_store(&r);
+    let (program, args) = pause(3);
+    let test = RunJob {
+        program,
+        args,
+        ..run_job(&store)
+    };
+    let first = jobs.submit(Submit::Run(test)).await.unwrap();
+    view_once(&jobs, &first.id, |v| v.phase == Phase::Running).await;
+    let hold = jobs.hold();
+    tokio::time::timeout(Duration::from_secs(2), hold.until_drained())
+        .await
+        .expect("a hold does not wait for a run that is no deploy");
+    let set_aside = view_once(&jobs, &first.id, |v| v.phase != Phase::Running).await;
+    assert_eq!(
+        (set_aside.status, set_aside.phase),
+        (
+            JobStatus::Queued,
+            Phase::Waiting {
+                behind: vec!["a restart".into()]
+            }
+        )
+    );
+    assert!(!jobs.slot_free());
+    drop(hold);
+    let done = ended(&jobs, first).await;
+    assert_eq!(done.status, JobStatus::Exited { code: Some(0) }, "{done:?}");
+    assert_eq!(jobs.slots(), (1, 0));
+}
+
+/// **A hold waits for a deploy's build**, and drains once it has ended; in a
+/// process that is not well, it does not wait.
+#[tokio::test]
+async fn a_hold_waits_for_a_deploy_unless_the_process_is_unwell() {
+    let r = repos();
+    let jobs = jobs_over(&r, false);
+    let store = changed_store(&r);
+    let (program, args) = pause(3);
+    let deploy = RunJob {
+        program,
+        args,
+        deploy: Some("battlecities".into()),
+        ..run_job(&store)
+    };
+    let first = jobs.submit(Submit::Run(deploy.clone())).await.unwrap();
+    view_once(&jobs, &first.id, |v| v.phase == Phase::Running).await;
+    let hold = jobs.hold();
+    sleep(Duration::from_millis(1200)).await;
+    assert!(!hold.drained(), "the deploy is still building");
+    assert!(
+        hold.waiting_for().starts_with("battlecities deploy, "),
+        "{}",
+        hold.waiting_for()
+    );
+    let done = ended(&jobs, first).await;
+    assert_eq!(done.status, JobStatus::Exited { code: Some(0) }, "{done:?}");
+    tokio::time::timeout(WITHIN, hold.until_drained())
+        .await
+        .expect("drained once the deploy ended");
+    drop(hold);
+
+    let unwell = jobs_over(&r, false);
+    unwell.set_health(Arc::new(|| false));
+    let second = unwell.submit(Submit::Run(deploy)).await.unwrap();
+    view_once(&unwell, &second.id, |v| v.phase == Phase::Running).await;
+    let hold = unwell.hold();
+    tokio::time::timeout(Duration::from_secs(2), hold.until_drained())
+        .await
+        .expect("an unwell process is not waited for");
+}
+
+/// **A queue waiting for its process to serve starts nothing**, and runs
+/// what it took once it opens.
+#[tokio::test]
+async fn a_queue_starts_once_the_process_is_serving() {
+    let r = repos();
+    let jobs = jobs_over(&r, false);
+    jobs.wait_for_serving();
+    let store = changed_store(&r);
+    let first = jobs.submit(Submit::Run(run_job(&store))).await.unwrap();
+    let waiting = view_once(&jobs, &first.id, |v| v.phase != Phase::Fetching).await;
+    assert_eq!(
+        waiting.phase,
+        Phase::Waiting {
+            behind: vec!["the process to be serving".into()]
+        }
+    );
+    jobs.open().await;
+    let done = ended(&jobs, first).await;
+    assert_eq!(done.status, JobStatus::Exited { code: Some(0) }, "{done:?}");
 }
 
 /// **A run whose fetch fails is a failed job, not a refused submit**: it was
@@ -503,7 +604,7 @@ async fn a_run_whose_fetch_fails_ends_failed() {
         ))
     );
     assert_eq!(jobs.log(&view.id).unwrap(), None);
-    assert_eq!(jobs.slots(), (2, 0));
+    assert_eq!(jobs.slots(), (1, 0));
 }
 
 /// **A run that asks to stage what it built leaves it in the stage folder**:
@@ -811,7 +912,7 @@ async fn an_agent_is_watched_and_switched_through_the_gateway() {
     assert_eq!(at, At::Agent(0xa1));
     let listing = agents.jobs_of(at, 10).await.unwrap();
     assert!(listing.enabled);
-    assert_eq!((listing.slots, listing.running), (2, 0));
+    assert_eq!((listing.slots, listing.running), (1, 0));
     let line = &listing.jobs[0];
     assert_eq!(line.id, ran.view.id);
     assert_eq!(line.kind, JobKind::Run);

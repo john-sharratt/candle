@@ -346,6 +346,7 @@ mod tests {
             fetched: None,
             listed: None,
             staged,
+            tried: None,
             phase: Phase::Ended,
             command: ["cargo", "build", "--release", "-p", "web"]
                 .map(str::to_string)

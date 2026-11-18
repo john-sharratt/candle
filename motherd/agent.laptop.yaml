@@ -9,7 +9,6 @@
 # for `battle-mind` or `journals` finds the same repository here. See
 # agent.yaml for what each setting means.
 jobs_dir: C:/Users/johna/prog/agent/jobs
-slots: 2
 # Where a run stages the file it built, for this machine's keep.
 stage_dir: C:/Users/johna/prog/candle/keep/stage
 checkouts:

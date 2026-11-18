@@ -57,7 +57,9 @@ use std::time::{Duration, Instant};
 use board::BOARD;
 use cluster::reserve::watch::{read_once, watch};
 use cluster::reserve::{machine as reservation, Reservation};
+use cluster::upgrade::artifacts::RunProbe;
 use cluster::upgrade::switch::SWITCH_ADDR;
+use hyper::StatusCode;
 use place::{accept, previous_of, restore, same_file};
 use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -65,8 +67,10 @@ use trial::{spawn_detached, switch_to, Ended, Running};
 
 mod board;
 mod guard;
+mod hold;
 #[cfg(windows)]
 mod owner_access;
+mod park;
 mod place;
 mod presence;
 mod remote;
@@ -75,6 +79,9 @@ mod trial;
 /// How long a trial may run before it is stopped and the stable file is
 /// started. Not a config value.
 const TRIAL: Duration = Duration::from_secs(10 * 60);
+
+/// The largest body a local request may carry: a parked queue's runs.
+const BODY_MAX: usize = 16 << 20;
 
 #[derive(Debug, Deserialize)]
 struct ServiceCfg {
@@ -87,6 +94,11 @@ struct ServiceCfg {
     /// guard (`guard`). Absent for a service with no quorum.
     #[serde(default)]
     status: Option<String>,
+    /// The `host:port` of the build agent the service runs, which keep asks
+    /// to hold its builds before it stops the service (`hold`,
+    /// `docs/build_agent.md` §5). Absent for a service that runs none.
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +123,8 @@ struct Service {
     cwd: PathBuf,
     /// Where a trial's stderr is written, and read for the proof line.
     trial_log: PathBuf,
+    /// See [`ServiceCfg::agent`].
+    agent: Option<String>,
 }
 
 struct Slot {
@@ -138,25 +152,29 @@ impl Slot {
     }
 }
 
-/// What a service's supervisor is asked to do.
+/// What a service's supervisor is asked to do. A request that stops the
+/// service carries whether it was forced: one that was not first holds the
+/// builds the service runs (`hold`).
 enum Req {
     /// Run `path` as a trial on the stable path (`POST /`, the path as body).
     Switch {
         path: PathBuf,
+        forced: bool,
         reply: Sender<Answer>,
     },
     /// Install `path` on the stable path and start it, with no trial
     /// (`POST /accept`, the path as body).
     Accept {
         path: PathBuf,
+        forced: bool,
         reply: Sender<Answer>,
     },
     /// Stop the service and start its stable file again
     /// (`POST /restart/<name>`): no trial, the binary is the one already kept.
-    Restart { reply: Sender<Answer> },
+    Restart { forced: bool, reply: Sender<Answer> },
     /// Stop the service and hold it down (`POST /stop/<name>`): it is not
     /// started again until a start, restart or switch asks for it.
-    Stop { reply: Sender<Answer> },
+    Stop { forced: bool, reply: Sender<Answer> },
     /// Lift a hold and start the stable file (`POST /start/<name>`).
     Start { reply: Sender<Answer> },
 }
@@ -267,6 +285,7 @@ fn prepare(state: &Path, cfg: ServiceCfg) -> anyhow::Result<Service> {
         stable,
         args: cfg.args.into_iter().map(std::ffi::OsString::from).collect(),
         cwd,
+        agent: cfg.agent,
     })
 }
 
@@ -291,21 +310,29 @@ fn supervise(svc: Service, rx: Receiver<Req>) {
     let mut held = false;
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(Req::Switch { path, reply }) => {
+            Ok(Req::Switch {
+                path,
+                forced,
+                reply,
+            }) => {
                 held = false;
-                live = apply(&svc, live, &path, reply);
+                live = apply(&svc, live, &path, forced, reply);
             }
-            Ok(Req::Accept { path, reply }) => {
+            Ok(Req::Accept {
+                path,
+                forced,
+                reply,
+            }) => {
                 held = false;
-                live = accept_build(&svc, live, &path, reply);
+                live = accept_build(&svc, live, &path, forced, reply);
             }
-            Ok(Req::Restart { reply }) => {
+            Ok(Req::Restart { forced, reply }) => {
                 held = false;
-                live = restart(&svc, live, reply);
+                live = restart(&svc, live, forced, reply);
             }
-            Ok(Req::Stop { reply }) => {
+            Ok(Req::Stop { forced, reply }) => {
                 held = true;
-                live = hold(&svc, live, reply);
+                live = hold(&svc, live, forced, reply);
             }
             Ok(Req::Start { reply }) => {
                 held = false;
@@ -321,7 +348,8 @@ fn supervise(svc: Service, rx: Receiver<Req>) {
 }
 
 /// Stop the service and leave it stopped.
-fn hold(svc: &Service, live: Option<Live>, reply: Sender<Answer>) -> Option<Live> {
+fn hold(svc: &Service, live: Option<Live>, forced: bool, reply: Sender<Answer>) -> Option<Live> {
+    hold::before_stop(&svc.name, svc.agent.as_deref(), forced);
     if let Some(mut live) = live {
         stop(&mut live);
     }
@@ -383,7 +411,8 @@ fn roll_back_interrupted_trial(svc: &Service) {
 
 /// Stop the service and start its stable file again. Answers once the new
 /// process has started; it is not a trial, so nothing waits on its proof line.
-fn restart(svc: &Service, live: Option<Live>, reply: Sender<Answer>) -> Option<Live> {
+fn restart(svc: &Service, live: Option<Live>, forced: bool, reply: Sender<Answer>) -> Option<Live> {
+    hold::before_stop(&svc.name, svc.agent.as_deref(), forced);
     if let Some(mut live) = live {
         stop(&mut live);
     }
@@ -411,8 +440,10 @@ fn accept_build(
     svc: &Service,
     live: Option<Live>,
     path: &Path,
+    forced: bool,
     reply: Sender<Answer>,
 ) -> Option<Live> {
+    hold::before_stop(&svc.name, svc.agent.as_deref(), forced);
     if let Some(mut live) = live {
         stop(&mut live);
     }
@@ -445,7 +476,16 @@ fn accept_build(
     started
 }
 
-fn apply(svc: &Service, live: Option<Live>, path: &Path, reply: Sender<Answer>) -> Option<Live> {
+fn apply(
+    svc: &Service,
+    live: Option<Live>,
+    path: &Path,
+    forced: bool,
+    reply: Sender<Answer>,
+) -> Option<Live> {
+    // A cluster install's handoff is forced: the installing process held its
+    // builds before it took its leases, and lets go by exiting.
+    hold::before_stop(&svc.name, svc.agent.as_deref(), forced);
     if let Some(mut live) = live {
         stop(&mut live);
     }
@@ -614,6 +654,31 @@ fn handle(mut stream: TcpStream, slots: &[Slot]) {
             Route::Switch => dispatch(body.trim(), slots, Hand::Trial, forced),
             Route::Accept => dispatch(body.trim(), slots, Hand::Accept, forced),
             Route::Service(action, name) => service_request(action, name, slots, forced),
+            Route::Trial => {
+                let (status, body) = remote::trial_job(body.as_bytes(), slots, &RunProbe);
+                json_answer(status, body.to_string())
+            }
+            Route::Park => match park::park(&body) {
+                Ok(node) => {
+                    eprintln!("keep: the queue of agent {node} is parked here");
+                    json_answer(200, "{}".into())
+                }
+                Err(e) => json_answer(400, e),
+            },
+            Route::Unpark => match park::unpark(&body) {
+                Ok(park) => json_answer(200, park),
+                Err(e) => json_answer(400, e),
+            },
+            Route::Exit if !forced && !park::held().is_empty() => Answer {
+                status: 409,
+                reason: "Conflict",
+                body: format!(
+                    "refused: keep holds the parked queues of agents {} until their processes \
+                     take them back; send `{}: 1` to exit anyway\n",
+                    park::held().join(", "),
+                    guard::FORCE_HEADER
+                ),
+            },
             Route::Exit => {
                 let _ = write_answer(
                     &mut stream,
@@ -632,7 +697,8 @@ fn handle(mut stream: TcpStream, slots: &[Slot]) {
                 status: 404,
                 reason: "Not Found",
                 body: "POST / or /accept with an executable's path, \
-                       POST /restart|stop|start/<service>, or POST /exit\n"
+                       POST /restart|stop|start/<service>, POST /trial, /park or /unpark \
+                       with JSON, or POST /exit\n"
                     .into(),
             },
         },
@@ -656,6 +722,13 @@ enum Route<'a> {
     Service(Action, &'a str),
     /// `/exit`: keep itself exits, for its supervisor to start it again.
     Exit,
+    /// `/trial`: a trial as a job, `{service, artifact, deploy}` — what a
+    /// deploy's build agent on this machine asks (`docs/build_agent.md` §7).
+    Trial,
+    /// `/park`: keep an agent's queue while its process restarts.
+    Park,
+    /// `/unpark`: answer an agent's parked queue, and let it go.
+    Unpark,
     Unknown,
 }
 
@@ -676,6 +749,12 @@ fn route(target: &str) -> Route<'_> {
     }
     if target == "/exit" {
         return Route::Exit;
+    }
+    match target {
+        "/trial" => return Route::Trial,
+        "/park" => return Route::Park,
+        "/unpark" => return Route::Unpark,
+        _ => {}
     }
     for (prefix, action) in [
         ("/restart/", Action::Restart),
@@ -722,8 +801,8 @@ fn service_request(action: Action, name: &str, slots: &[Slot], forced: bool) -> 
     }
     let (tx, rx) = mpsc::channel();
     let req = match action {
-        Action::Restart => Req::Restart { reply: tx },
-        Action::Stop => Req::Stop { reply: tx },
+        Action::Restart => Req::Restart { forced, reply: tx },
+        Action::Stop => Req::Stop { forced, reply: tx },
         Action::Start => Req::Start { reply: tx },
     };
     if slot.tx.send(req).is_err() {
@@ -760,7 +839,7 @@ fn dispatch(body: &str, slots: &[Slot], hand: Hand, forced: bool) -> Answer {
             return refused;
         }
     }
-    switch(path, slot, hand)
+    switch(path, slot, hand, forced)
 }
 
 /// The executable `body` names and the service it is for, or why it is
@@ -827,11 +906,19 @@ fn trial_running(why: String) -> Answer {
 
 /// Hand `path` to `slot`'s supervisor and wait for its answer; a trial's end
 /// goes on the board.
-fn switch(path: PathBuf, slot: &Slot, hand: Hand) -> Answer {
+fn switch(path: PathBuf, slot: &Slot, hand: Hand, forced: bool) -> Answer {
     let (tx, rx) = mpsc::channel();
     let req = match hand {
-        Hand::Trial => Req::Switch { path, reply: tx },
-        Hand::Accept => Req::Accept { path, reply: tx },
+        Hand::Trial => Req::Switch {
+            path,
+            forced,
+            reply: tx,
+        },
+        Hand::Accept => Req::Accept {
+            path,
+            forced,
+            reply: tx,
+        },
     };
     let answer = if slot.tx.send(req).is_err() {
         Answer {
@@ -908,10 +995,11 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
     let len = named("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
-    if len > 4096 {
+    // A path is short; a parked queue carries its runs' requests.
+    if len > BODY_MAX {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "the path is too long",
+            "the body is too long",
         ));
     }
     let mut body = buf[header_end + 4..].to_vec();
@@ -924,12 +1012,25 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
     }
     body.truncate(len);
     let body = String::from_utf8(body)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the path is not utf-8"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the body is not utf-8"))?;
     Ok(Request {
         target,
         body,
         forced,
     })
+}
+
+/// An answer of `status` whose body is JSON, as keep's local JSON routes give.
+fn json_answer(status: u16, body: String) -> Answer {
+    let reason = StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+        .unwrap_or("Unknown");
+    Answer {
+        status,
+        reason,
+        body,
+    }
 }
 
 fn write_answer(stream: &mut TcpStream, answer: &Answer) -> io::Result<()> {
@@ -985,6 +1086,28 @@ mod tests {
         assert_eq!(cfg.services[0].args, ["--config", "web/web.yaml"]);
         assert_eq!(cfg.services[1].args, ["--config", "motherd/motherd.yaml"]);
         assert_eq!(cfg.services[2].args, ["--config", "mcp/mcp.yaml"]);
+        // motherd runs the build agent, whose builds keep holds before it
+        // stops it; nothing else does.
+        let agents: Vec<Option<&str>> = cfg.services.iter().map(|s| s.agent.as_deref()).collect();
+        assert_eq!(agents, [None, Some("192.168.1.2:8081"), None, None]);
+    }
+
+    /// **The local JSON routes are their own**, apart from a switch's path.
+    #[test]
+    fn the_local_json_routes_are_named() {
+        assert_eq!(route("/trial"), Route::Trial);
+        assert_eq!(route("/park"), Route::Park);
+        assert_eq!(route("/unpark"), Route::Unpark);
+        assert_eq!(route("/park/x"), Route::Unknown);
+    }
+
+    #[test]
+    fn a_json_answer_carries_its_reason() {
+        let a = json_answer(202, "{}".into());
+        assert_eq!(
+            (a.status, a.reason, a.body.as_str()),
+            (202, "Accepted", "{}")
+        );
     }
 
     /// A trial asked for during another is 423, never the 409 of a rollback:

@@ -14,7 +14,8 @@
 //! | [`wire`] | the job API's bodies |
 //! | [`overlay`] | a run's overlay, its chains named by digest |
 //! | [`chains`] | the chains an agent has been sent, by digest |
-//! | [`jobs`] | running jobs, pushes and fetches, and what each came to |
+//! | [`jobs`] | running jobs, pushes and fetches, and what each came to; one build at a time, held for a restart |
+//! | [`keep`] | calls to this machine's keep: a deploy's trial, the queue's park |
 //! | [`setup`] | the commands a repository declares for its checkout's start |
 //! | [`setting_up`] | which checkouts are still setting up, holding their runs |
 //! | [`switch`] | whether the agent takes jobs: an admin's, kept across restarts |
@@ -33,6 +34,7 @@ pub mod config;
 pub mod fetcher;
 pub mod install;
 pub mod jobs;
+pub mod keep;
 pub mod member;
 pub mod overlay;
 pub mod pusher;

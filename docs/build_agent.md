@@ -61,14 +61,14 @@ first. It answers at once with a handle, and the handle says when the hold has
 1. **The queue stops.** No run starts from it.
 2. **The running run is dealt with by what it is.**
    - A deploy build is waited for until it has staged and asked keep for its
-     trial, at most `build_hold` (the agent file; 20 minutes, to be set from a
-     measured motherd release build on BlackWorld, §10). A deploy still going
-     then is killed with the process.
+     trial, at most `build_hold_mins` (the agent file; 20 minutes, to be set
+     from a measured motherd release build on BlackWorld, §10). A deploy still
+     going then is killed with the process.
    - Any other run, a test or a build that is no deploy, is stopped at once and
      put back at the head of the queue, under its own id. It runs again from
-     its start on the next process, and its log says where it was cut and where
-     it started again. A restart waits at most for one deploy build, never for a
-     long test.
+     its start on the next process, with a new log. One whose command has
+     already ended and is only staging is waited out. A restart waits at most
+     for one deploy build, never for a long test.
 3. **The queue is parked on keep** (§6).
 4. **Drained**: the process may now be stopped.
 
@@ -101,10 +101,10 @@ stops the process serving:
 
 | Restart | Where it holds |
 |---|---|
-| a certified install | `install_tick`, once it has found its target and that it is not stranded, and before it takes its leases. The tick **does not wait**: it asks for the hold, says `waiting for builds` as its step, and returns, so the upgrader's other ticks (announcing, certifying, fetching) carry on. A later tick that finds the hold drained takes the leases. A tick that cannot take them, or finds the target gone or stranded, lets the hold go and tries again from the start. The leases (`LEASE_TTL`, never renewed) are therefore only ever taken with nothing left to wait for |
+| a certified install | `install_tick` (`cluster::upgrade::runtime::builds`), once it has found its target and that it is not stranded, and before it takes its leases. The tick **does not wait**: it asks for the hold, says `waiting for builds: …` as its step, and returns, so the upgrader's other ticks (announcing, certifying, fetching) carry on. A later tick that finds the hold drained goes on to the leases, and the hold stands through any wait for them, so the queue is held and a run set aside once, not on every tick. A tick that finds the target gone or stranded, or an install that does not start, lets the hold go. The leases (`LEASE_TTL`, never renewed) are therefore only ever taken with nothing left to wait for |
 | a standalone agent's install | the same `install_tick`: the agent runs the cluster's upgrader. `JOBS_WAIT` goes |
-| the cluster's `restart` and `shutdown`, and npcd's relaunch | the host's stopping path (`host/src/commands/exec.rs`, `Stopping`), which holds and waits for it to drain before it drains the tenants. An install that already holds is joined, not waited on twice |
-| keep's `/restart`, `/stop`, `/accept`, a trial by hand, a trial from the cluster | keep's supervisor thread, in `restart`, `hold`, `accept_build` and `apply` (`keep/src/main.rs`), immediately before each calls `stop`, through `POST /v1/agent/hold` on the service's `agent:` address (§5) |
+| the cluster's `restart` and `shutdown`, and npcd's relaunch | the host's stopping path (`host/src/run.rs` `leave`), which holds and waits for it to drain before it drains the tenants, showing `Waiting for builds` as its step. An install that already holds is joined, not waited on twice. A Ctrl-C at the console waits for nothing |
+| keep's `/restart`, `/stop`, `/accept`, a trial by hand, a trial from the cluster | keep's supervisor thread, in `restart`, `hold`, `accept_build` and `apply` (`keep/src/main.rs`, `keep/src/hold.rs`), immediately before each calls `stop`, through `POST /v1/agent/hold` on the service's `agent:` address (§5) |
 
 - **keep holds on the supervisor thread, at the moment it stops the process.**
   A request waiting behind another on that thread, a `/restart` behind a
@@ -113,9 +113,10 @@ stops the process serving:
 - **A forced request asks for no hold.** The force is carried on the request
   to the supervisor. A person forcing a restart wants it now. The cluster's
   install always sends `FORCE_HEADER`, and has already held in `install_tick`.
-- **keep's answers do not wait for a hold.** Its cluster service route and its
-  trial route answer once the request is queued on the supervisor, and the
-  request's end is read from keep's state, as a trial's is today
+- **keep's cluster answers do not wait out a hold.** Its trial route answers
+  once the trial is on the board, as it does today. Its service route answers
+  with the request's end when that comes within 25 s, and otherwise `202`,
+  accepted, the request going on and its end read from keep's state
   (`keep/src/remote.rs`). The gateway's request timeout is never reached.
 - A Battle Cities, gateway or connector restart asks no hold (§5), so it runs
   while a candle build compiles.
@@ -123,17 +124,21 @@ stops the process serving:
 ## 5. keep's `agent:` address
 
 keep asks for a hold only of a service whose entry in its file names the
-address of the agent in it: `agent: "192.168.1.2:8081"` on BlackWorld's
-`motherd` (its plain entrance, `motherd/motherd.yaml` `host:`/`port:`), and the
-standalone agent's on AlienWorld. It is a field of its own. `status:`, which
+address of the agent in it: `agent: 192.168.1.2:8081` on BlackWorld's
+`motherd` (its plain entrance, `motherd/motherd.yaml` `host:`/`port:`), and
+`192.168.1.3:8081` on WhiteWorld's. It is a field of its own. `status:`, which
 arms keep's last-member guard and a service's own refusal (`keep/src/guard.rs`),
 is left as it is on every service, so nothing those refuse or allow changes.
+AlienWorld's standalone agent serves no HTTP port, so keep asks it for nothing:
+its builds are held by its own installs, through `install_tick`, and a restart
+of it by hand stops its build.
 
-`/v1/agent/hold` is a route on the process's own port, beside its status, not
-on the cluster socket the agent's job routes are served over
-(`agent/src/member.rs`). It answers only a caller on the machine itself, as
-keep's own port takes only loopback. It answers once the hold has drained, and
-the hold it opens is let go by keep if keep then does not stop the process.
+`/v1/agent/hold` is a route on the process's own port (`host/src/agent_hold.rs`),
+not on the cluster socket the agent's job routes are served over
+(`agent/src/member.rs`). It answers only a caller on the machine itself —
+loopback, or the address the process listens on — as keep's own port takes
+only loopback. It answers once the hold has drained, and the hold it opens lifts
+by itself five minutes later if the process is still running.
 
 ## 6. The queue waits on keep
 
@@ -232,12 +237,17 @@ Everything is in candle. The tests sit beside the code:
    services keep running and the new keep adopts them. Its file gains `agent:`
    on the services that run builds:
    - BlackWorld: `keep/keep.yaml`, `motherd`, in the repository;
-   - WhiteWorld: `C:\prog\keep-local.yaml`, `motherd`, edited on the machine;
-   - AlienWorld: `C:\Users\johna\prog\keep-local.yaml`, the agent, edited there
-     by the session on that machine.
-2. **The agent files** gain `build_hold` and lose `slots`: `motherd/agent.yaml`
-   (BlackWorld), `C:\prog\agent-local.yaml` (WhiteWorld),
-   `motherd/agent.laptop.yaml` (AlienWorld). `build_hold` is set from a measured
+   - WhiteWorld: `C:\prog\keep-local.yaml`, `motherd` (`192.168.1.3:8081`),
+     edited on the machine.
+2. **The agent files** lose `slots` **before** the new build starts on each
+   machine: an agent file is read with unknown keys refused, so a `slots:` left
+   in one stops the new build's start, and one that names `build_hold_mins`
+   stops the old build's. Each leaves `build_hold_mins` out, taking the default,
+   until the old build is gone everywhere. `motherd/agent.yaml` (BlackWorld) and
+   `motherd/agent.laptop.yaml` (AlienWorld) are in the repository;
+   `C:\prog\agent-local.yaml` (WhiteWorld) is edited on the machine, and
+   AlienWorld's checkout pulls its file. The default, `BUILD_HOLD_MINS`, is set
+   from a measured
    `cargo build --release -p motherd -p mcp` on BlackWorld's agent, from a warm
    cache: the longest normal deploy build plus a margin, 20 minutes unless the
    measurement says otherwise.

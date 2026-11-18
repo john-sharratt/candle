@@ -169,6 +169,7 @@ pub async fn list(call: &OpsCall, running: bool, limit: usize) -> Result<Vec<Row
                 fetched: None,
                 listed: None,
                 staged: None,
+                tried: None,
                 phase: j.phase.clone(),
                 command: j.command.clone(),
                 started_ms: j.started_ms,

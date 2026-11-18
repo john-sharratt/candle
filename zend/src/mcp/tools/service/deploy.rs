@@ -1,26 +1,21 @@
 //! `service_deploy {host, service}`: build a service from origin/main on one
 //! machine's agent and try it there through keep (`docs/jobs.md` §6). It
 //! answers once the build job is accepted, with the deploy's handle,
-//! `deploy:<node>:<id>`;
-//! a driver task in this member waits for the build and asks keep for the
-//! trial, tagged with the handle, and keep runs the trial from there.
-
-use std::time::Duration;
+//! `deploy:<node>:<id>`. The build says it is a deploy of the service, and the
+//! agent that runs it asks its own machine's keep for the trial once it has
+//! staged the binary, under the deploy's id (`docs/build_agent.md` §7): no
+//! task in this member has to live for the trial to be asked for.
 
 use agent::client::Agents;
 use agent::overlay::Overlay;
-use agent::wire::{ListJob, RunJob, Staged};
+use agent::wire::{ListJob, RunJob};
 use axum::http::Method;
 use cluster::machines::MachineTable;
 use host::machines::machines;
 use serde_json::{json, Value};
-use zend_vfs::JobStatus;
 
 use super::pending::{self, Ask};
-use super::{
-    guard, keep, keep_build, package_of, repo_of, service_of, trial_body, KEEP_STATE, KEEP_TRIAL,
-    SERVICES,
-};
+use super::{guard, keep, keep_build, package_of, repo_of, service_of, KEEP_STATE, SERVICES};
 use crate::mcp::ops;
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::tools::job::JobHandle;
@@ -38,9 +33,6 @@ const BUILD_TIMEOUT_S: u64 = 3_600;
 /// The daemon, and the connector released with it.
 const DAEMON: &str = "motherd";
 const CONNECTOR: &str = "mcp";
-
-/// The longest one wait on the build is held.
-const STEP: Duration = Duration::from_secs(25);
 
 /// Origin's ref a deploy builds.
 const MAIN_REF: &str = "refs/heads/main";
@@ -105,6 +97,7 @@ pub fn build_job(service: &'static str) -> RunJob {
         args,
         timeout_secs: BUILD_TIMEOUT_S,
         stage: Some(format!("target/release/{package}.exe")),
+        deploy: Some(service.to_string()),
     }
 }
 
@@ -127,6 +120,8 @@ pub fn connector_job() -> RunJob {
         .map(str::to_string)
         .to_vec(),
         stage: Some(format!("target/release/{CONNECTOR}.exe")),
+        // Staged for the daemon's trial to follow; no trial of its own.
+        deploy: None,
         ..build_job(CONNECTOR)
     }
 }
@@ -168,42 +163,6 @@ pub fn already(job: &JobHandle, service: &str, host: &str, tip: &str) -> String 
          new was started.\n{}",
         next_steps(job)
     )
-}
-
-/// Wait for deploy `h`'s build and, once it has staged its binary, ask keep on
-/// `host` for the trial. What this member does for a deploy ends there: the
-/// trial is keep's, and its end is on keep's board.
-async fn drive(call: OpsCall, agents: Agents, h: Handle, host: String, service: &'static str) {
-    let at = h.at(&agents);
-    let view = loop {
-        match agents.wait(at, &h.id, STEP).await {
-            Ok(v) if v.status.is_finished() => break v,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(deploy = %h, host, service, "deploy: the build could not be read: {e}");
-                return;
-            }
-        }
-    };
-    let artifact = match (&view.status, &view.staged) {
-        (JobStatus::Exited { code: Some(0) }, Some(Staged::At(path))) => path.clone(),
-        _ => {
-            tracing::info!(deploy = %h, host, service, status = ?view.status, "deploy: the build did not stage");
-            return;
-        }
-    };
-    tracing::info!(deploy = %h, host, service, artifact, "deploy: trial");
-    if let Err(e) = keep(
-        &call,
-        Method::POST,
-        KEEP_TRIAL,
-        &host,
-        Some(&trial_body(service, &artifact, &h)),
-    )
-    .await
-    {
-        tracing::warn!(deploy = %h, host, service, "deploy: keep refused the trial: {e}");
-    }
 }
 
 /// The machine a deploy that names none goes to: of the machines with an
@@ -332,7 +291,6 @@ pub async fn run(call: &OpsCall, args: &Value) -> Answer {
     let h = Handle::new(node, &view.id);
     tracing::info!(deploy = %h, host, service, "deploy: building");
     let job = JobHandle::Deploy(h.clone());
-    tokio::spawn(drive(call.clone(), agents, h, host.clone(), service));
     Answer::ok(format!(
         "Started {job}: {service} to {host}, building origin/main with `cargo build --release -p \
          {}` — {}. When it has built, keep on {host} tries it: proven once it serves, or \
@@ -365,6 +323,8 @@ mod tests {
         assert_eq!(job.args, ["build", "--release", "-p", "web"]);
         assert_eq!(job.stage.as_deref(), Some("target/release/web.exe"));
         assert_eq!(job.overlay, Overlay::default());
+        // The agent asks keep for the trial itself once the binary is staged.
+        assert_eq!(job.deploy.as_deref(), Some("web"));
         let mut command = vec![job.program.clone()];
         command.extend(job.args);
         assert_eq!(built_service(&command), Some("web"));
@@ -425,6 +385,11 @@ mod tests {
             ]
         );
         assert_eq!(connector.stage.as_deref(), Some("target/release/mcp.exe"));
+        assert_eq!(daemon.deploy.as_deref(), Some("motherd"));
+        assert_eq!(
+            connector.deploy, None,
+            "the connector has no trial of its own"
+        );
         assert_eq!(
             (connector.repo.as_str(), connector.branch.as_str()),
             ("candle", "main")

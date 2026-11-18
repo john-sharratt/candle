@@ -1,7 +1,7 @@
 //! An agent joined to its clusters (§11.1): one socket per `--cluster` to
 //! `/v1/cluster/agent`, with the same handshake and group key as any member,
 //! no model and no substrate. Its `HELLO` advertises its checkouts; its
-//! `CAPACITY`, every second, its job slots, the host's cores, load and free
+//! `CAPACITY`, every second, whether its build slot is free, the host's cores, load and free
 //! memory, and the allow-listed toolchains on its `PATH` (§11.2) — and its
 //! state, `disabled` while an admin has switched it off (§11.7). The streams
 //! its gateways open are served the job API.
@@ -65,10 +65,12 @@ pub fn capacity(jobs: &Jobs, found: &[String]) -> Capacity {
 
 /// [`capacity`] on `reservation`. A reserved machine is still `ready` — its
 /// pushes, fetches and the house's bridge calls go on — with no slot free, so
-/// a gateway places builds and tests on another agent.
+/// a gateway places builds and tests on another agent. So is one whose build
+/// slot is taken, queued for or held for a restart (`docs/build_agent.md`
+/// §2).
 fn capacity_on(jobs: &Jobs, found: &[String], reservation: &Reservation) -> Capacity {
     let machine = measure();
-    let (slots, running) = jobs.slots();
+    let (_, running) = jobs.slots();
     Capacity {
         state: if jobs.enabled() {
             MemberState::Ready
@@ -77,10 +79,7 @@ fn capacity_on(jobs: &Jobs, found: &[String], reservation: &Reservation) -> Capa
         },
         power: u32::from(machine.cores),
         idle: running == 0,
-        slots_free: match reservation.holds() {
-            true => 0,
-            false => slots.saturating_sub(running),
-        },
+        slots_free: u32::from(!reservation.holds() && jobs.slot_free()),
         cores: machine.cores,
         load_milli: machine.load_milli,
         os: machine.os,
@@ -259,24 +258,52 @@ mod tests {
     use crate::checkouts::Checkouts;
     use crate::config::{AgentConfig, SweepConfig};
 
+    fn config(dir: &tempfile::TempDir) -> AgentConfig {
+        AgentConfig {
+            jobs_dir: dir.path().join("jobs"),
+            build_hold_mins: 20,
+            stage_dir: None,
+            checkouts: Vec::new(),
+            sweep: SweepConfig::default(),
+        }
+    }
+
+    fn jobs_of(cfg: &AgentConfig, priority: Priority) -> Arc<Jobs> {
+        Jobs::new(
+            Checkouts::open(cfg, &CommandPolicy::allowing(["cargo"])).unwrap(),
+            priority,
+            cfg.build_hold(),
+        )
+    }
+
     /// **An agent whose jobs run below normal priority says so**, and a
     /// dedicated one does not.
     #[test]
     fn capacity_says_whether_the_agent_is_low_priority() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = AgentConfig {
-            jobs_dir: dir.path().join("jobs"),
-            slots: Some(2),
-            stage_dir: None,
-            checkouts: Vec::new(),
-            sweep: SweepConfig::default(),
-        };
-        let open = || Checkouts::open(&cfg, &CommandPolicy::allowing(["cargo"])).unwrap();
-        let beside = Jobs::new(open(), 2, Priority::Below);
-        let dedicated = Jobs::new(open(), 2, Priority::Normal);
+        let cfg = config(&dir);
+        let beside = jobs_of(&cfg, Priority::Below);
+        let dedicated = jobs_of(&cfg, Priority::Normal);
         assert!(capacity(&beside, &[]).low_priority);
         assert!(!capacity(&dedicated, &[]).low_priority);
-        assert_eq!(capacity(&dedicated, &[]).slots_free, 2);
+        assert_eq!(capacity(&dedicated, &[]).slots_free, 1);
+    }
+
+    /// **A held queue, or one not open yet, offers no slot**, so a gateway
+    /// sends a run that names no machine to another agent.
+    #[tokio::test]
+    async fn a_held_or_closed_queue_offers_no_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = jobs_of(&config(&dir), Priority::Normal);
+        let hold = jobs.hold();
+        assert_eq!(capacity(&jobs, &[]).slots_free, 0);
+        hold.until_drained().await;
+        drop(hold);
+        assert_eq!(capacity(&jobs, &[]).slots_free, 1);
+        jobs.wait_for_serving();
+        assert_eq!(capacity(&jobs, &[]).slots_free, 0);
+        jobs.open().await;
+        assert_eq!(capacity(&jobs, &[]).slots_free, 1);
     }
 
     /// **An agent switched off reports itself `disabled`**, so no gateway
@@ -284,18 +311,7 @@ mod tests {
     #[test]
     fn capacity_reports_an_agent_switched_off() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = AgentConfig {
-            jobs_dir: dir.path().join("jobs"),
-            slots: Some(1),
-            stage_dir: None,
-            checkouts: Vec::new(),
-            sweep: SweepConfig::default(),
-        };
-        let jobs = Jobs::new(
-            Checkouts::open(&cfg, &CommandPolicy::allowing(["cargo"])).unwrap(),
-            1,
-            Priority::Normal,
-        );
+        let jobs = jobs_of(&config(&dir), Priority::Normal);
         assert_eq!(capacity(&jobs, &[]).state, MemberState::Ready);
         jobs.set_enabled(false).unwrap();
         assert_eq!(capacity(&jobs, &[]).state, MemberState::Disabled);
@@ -308,24 +324,13 @@ mod tests {
     #[test]
     fn a_reserved_machine_offers_no_slot_and_stays_ready() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = AgentConfig {
-            jobs_dir: dir.path().join("jobs"),
-            slots: Some(2),
-            stage_dir: None,
-            checkouts: Vec::new(),
-            sweep: SweepConfig::default(),
-        };
-        let jobs = Jobs::new(
-            Checkouts::open(&cfg, &CommandPolicy::allowing(["cargo"])).unwrap(),
-            2,
-            Priority::Below,
-        );
+        let jobs = jobs_of(&config(&dir), Priority::Below);
         let reserved = Reservation::new();
         reserved.observe(Some("rekordbox is open".into()), Instant::now());
         let cap = capacity_on(&jobs, &[], &reserved);
         assert_eq!(cap.state, MemberState::Ready);
         assert_eq!(cap.slots_free, 0);
-        assert_eq!(capacity_on(&jobs, &[], &Reservation::new()).slots_free, 2);
+        assert_eq!(capacity_on(&jobs, &[], &Reservation::new()).slots_free, 1);
     }
 
     /// **The proof is printed once, and only once admitted.**

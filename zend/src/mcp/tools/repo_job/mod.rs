@@ -283,6 +283,7 @@ mod tests {
             fetched: None,
             listed: None,
             staged: None,
+            tried: None,
             phase,
             command: vec!["cargo".into(), "test".into(), "-p".into(), "web".into()],
             started_ms: 1_000,

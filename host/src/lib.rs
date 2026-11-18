@@ -28,6 +28,7 @@
 //! | [`process`], [`ctrl_c`], [`self_heal`] | process-wide concerns (the log file is `web::log_file`, which the gateway writes too) |
 
 pub mod access;
+pub mod agent_hold;
 pub mod boot;
 pub mod build_info;
 pub mod calibration;

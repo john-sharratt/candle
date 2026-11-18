@@ -117,6 +117,7 @@ impl Jobs {
             program: command.program,
             args: command.args,
             stage: None,
+            deploy: None,
         };
         let started = Instant::now();
         let view = match self.run(run, Gate::IsSetup).await {

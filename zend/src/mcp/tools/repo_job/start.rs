@@ -132,6 +132,9 @@ pub fn job_of(args: &Value) -> Result<RunJob, String> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        // A build or test run, never a deploy: only `service_deploy` asks for
+        // a trial.
+        deploy: None,
     })
 }
 
