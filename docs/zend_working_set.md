@@ -4,6 +4,22 @@
 §10 step 5. Replaces the fast path's least-recently-used budget
 (`fast_path_window`, deleted); it does not sit beside it.
 
+**Revised by `docs/hit_driven_projection.md` §7.2 and §12 items 18–26
+(2026-11-18), which supersede this document where they differ:**
+- The working set's momentum, seeds and withheld set rank the **pool**, the
+  fill's candidate set of whole conversations holding index pages only.
+  Whole-file membership charged against `budget_tokens`, `max_admits`, the
+  dislodge margin and the `max_file_tokens` refusal (§4.3, §4.4) go.
+- The slot fill places whole turns under caps that are shares of the room:
+  readings 22.5%, folders 2%, guides 5%, journals 10.5%, the dialogue 60%.
+  `budget_tokens`, `folder_tokens`, `guidance_tokens` and `max_file_tokens`
+  (§4.2) become those shares.
+- Type shares (§4.10) bind on the pool.
+- **Locks are removed.** zend already runs every `file_read` for real (§4.5),
+  so the lock tier, its marks and restart (§4.5's former screen, §4.6, §4.8),
+  `lock_tokens` and `release_on` go with the code that serves them.
+This document is rewritten with that change.
+
 ## 1. The idea
 
 Every dialogue carries a **working set**: a voluntary token budget (64K) of

@@ -45,14 +45,14 @@ The findings this answers are in
 
 | Part | What it is |
 |---|---|
-| **Rotation** | Every sequence on rung 1, the trained RoPE. The slot stays inside the trained window unless the user's locks alone pass it. |
+| **Rotation** | Every sequence on rung 1, the trained RoPE. The slot stays inside the trained window unless one exchange's floors alone pass it. |
 | **Pinned ranges** | Declared ranges of the system prompt that every attention query attends, outside the selection budget, in their declared place. |
-| **Pool** | Whole conversations as candidates — the dialogue, its inherited lineage, and every reading provenance proposes — up to `pool_tokens` (1M / 512K / 256K by card). Index rows on the device at the sampled layers; K/V warm, cold where warm runs short. |
-| **Rounds** | The carving unit: a request and its answer, or a call and its result. Every slot of rounds reads as a conversation that could have happened. |
+| **Pool** | Whole conversations as candidates — the dialogue, its inherited lineage, and every reading provenance proposes — up to 2M / 1M / 512K tokens by card, at least 6 / 4 / 4 of each kind. Index rows only, at the sampled layers; no K/V moves until the fill places a round. |
+| **Rounds** | The carving unit: one whole turn. Every slot of rounds opens each exchange on its request and closes it on its answer. |
 | **Slot** | The pool's best rounds, K/V loaded, at most the trained window (262,144 positions) less one append's reserve, seated at compact positions and selected as one window. |
 | **Hits** | Per round, how often the indexer selected its blocks (loaded) or would have (unloaded, the shadow scan), on a sample of the selecting layers, over every prefilled and decoded query. |
 | **Openings** | A turn's opening is prefilled once, in chunks of at most `reserve_tokens` with a boundary between them; its hits move the slot at the next boundary. |
-| **Projection** | At each projection boundary, hits move each round's score, the pool is re-chosen by conversation, and the slot by round: locks, pins, floors, then score. |
+| **Projection** | At each projection boundary, hits move each round's score, the pool is re-chosen by conversation, and the slot by round: pins, floors, then score, each kind under its share of the room. |
 | **Journals** | What leaves the pool is carried by journal notes. |
 | **Kept objects** | What the substrate holds that no model computed — accounts, threads, tokens, world state, journal text — is exported as text before the model changes and imported after (§13.4). |
 
@@ -118,9 +118,8 @@ with.
   slot is in §7.2.
 - **The higher rungs stay for callers that drive a sequence past `L0`
   themselves** (the YaRN gates, a plain-prompt conversation), and for one case
-  in zend's dialogue: locks the user asked for that alone pass the slot (§7.2).
-  Locks are placed whole, and a slot they carry past `L0` moves to the rung its
-  reach needs.
+  in zend's dialogue: one exchange whose floors alone pass the slot (§7.2),
+  which moves the slot to the rung its reach needs.
 - **Re-seating is free.** Keys and index rows are stored un-rotated
   (`progressive_yarn.md` I1) and rotated as they load, so seating a piece at a
   new compact position rewrites nothing.
@@ -184,8 +183,8 @@ at every selecting layer, whatever its score.
   caps (§7.2). The system prompt is measured as it is emitted and the fill
   (§7.2) places everything else in what it leaves, so the system prompt needs
   no margin and a slot never leaves the trained window on its own content.
-  Only locks, or floors that alone pass the slot, carry it out (§7.2), and the
-  assembler warns when a placement does.
+  Only floors that alone pass the slot carry it out (§7.2), and the assembler
+  warns when a placement does.
 - **Cost.** Every pinned cell is read by every query at every selecting layer:
   at `pin_tokens`, half the checkpoint's own read. Forcing the 8K recent span
   cost +93% decode and confused reasoning after a tool call
@@ -211,7 +210,7 @@ selection runs at all of them.
 
 ### 6.2 The real selection
 
-The slot is one window. Unless locks alone carry it further (§7.2), it never
+The slot is one window. Unless floors alone carry it further (§7.2), it never
 exceeds `L0`, the length the indexer was trained to rank, so the strata over a dialogue's slot are `Strata::WHOLE`: one
 ranking over every candidate, the checkpoint's selection exactly, plus the
 pinned ranges forced and the query's tail. Nothing without K/V is ever named
@@ -324,44 +323,66 @@ a leak of 0.2 it carries about the last five strides.
 
 ### 7.1 Score
 
-Each round, and each piece, carries a base score and a hit momentum.
+Each round — one whole turn (§8.1) — and each piece carries a base score and a
+hit momentum. Pieces and rounds are scored apart: a piece's score decides
+whether it is pooled, a round's decides whether the slot holds it.
 
-- **Base** is what the projection gives it today, on the one band a
-  reprojection scores on, `0 ..= 1,000`, where 1,000 is one full-strength hit
-  (`LINEAGE_BASE`): provenance's normalized score for a retrieved piece and
-  each of its rounds, the seed momentum for a seeded one (normalized to the
-  same band), the turn's own belief score for a round of the dialogue, as the
-  history is scored today, and `lineage_base` for a link of the inherited
-  lineage (§8.4). There is no distance base: the dialogue's recent exchanges
-  hold their seats as floors (§8.5), and older rounds compete on evidence like
-  everything else. Ties break oldest first.
+- **Base** is on the one band a reprojection scores on, `0 ..= 1,000`, where
+  1,000 is one full-strength hit (`LINEAGE_BASE`): provenance's normalized
+  score for each turn of a retrieved piece, the turn's own belief score for a
+  round of the dialogue, as the history is scored today, and `lineage_base`
+  for a link of the inherited lineage (§8.4). There is no distance base: the
+  dialogue's recent exchanges hold their seats as floors (§8.5), and older
+  rounds compete on evidence like everything else. Ties break oldest first.
 - **Hit momentum** `h` follows the stride's density `d`:
-  `h ← (1 − β) · h + d`, with `β` the working set's leak (0.2).
-- **Score** is `base · (1 + gain · h)`. A piece the indexer keeps reading holds
-  its score against a falling base; one it never reads falls with it.
+  `h ← (1 − β) · h + d`, with `β` the leak (0.2).
+- **A round's score** is `base · (1 + gain · h)`, and a round with no base
+  that the indexer reads is given what its reads alone are worth over the
+  `lineage_base` floor, `lineage_base · gain · h` (`ProjectionScores::lift_turns`).
+  That credit is every round's — a pooled piece's as well as the dialogue's
+  own and the lineage's — so the shadow scan's hits can bring in a turn
+  provenance did not score, not only reorder the ones it did.
+- **A piece's strength** is its momentum lifted by its own hit momentum,
+  `m · (1 + gain · h)` (`docs/zend_working_set.md` §4.3), where
+  `m ← (1 − β)·m + fresh` and `fresh` is its best turn's provenance score this
+  reprojection. Strength ranks pieces for the pool and never enters the fill:
+  every unit of the fill, whatever kind, competes on the band.
 
 `hits.gain` (default 1) and `hits.beta` (default 0.2) are schema fields beside
-`hits.layers`. The lift applies twice over: to a working-set member's strength
-— its momentum times `1 + gain · h`, wherever the working set admits, keeps or
-dislodges (`WorkingSet::score_of`) — and to each placed turn's score in the
-reprojection that follows (`ProjectionScores::lift_turns`), so a turn the
-model keeps reading outranks the history it would otherwise age out with.
+`hits.layers`.
 
 ### 7.2 Choosing the pool and the slot
 
 At each boundary:
 
-1. **Pool, by piece.** The pieces holding a floor (§8.5), then pieces by
-   score — provenance's base lifted by the piece's hit momentum — until the
-   pool holds `pool_tokens`. A piece enters or leaves the pool whole: every
-   round of a file's reading is a candidate for the slot, or none is.
-   `pool_tokens` is per card, by the card's size and nothing else:
-   1,000,000 on the 72 GB card, 512,000 on the 24 GB card, 256,000 on the
-   16 GB card (`scheduler::pool::pool_tokens_for`). No configuration
-   overrides it, in `projection.yaml` or the machine config. The slot is the
-   same on all three. The pool is per sequence: each dialogue chooses its own.
-   On the 16 GB card it is barely larger than the slot and the shadow scan has
-   little to find; that is accepted.
+1. **Pool, by piece: the candidate set.** The pool is the only set the slot
+   fill draws working-set rounds from. Its pieces are the ones holding a
+   floor (§8.5), then pieces by strength (§7.1) — seeds at the seed
+   momentum, a file the turn's loop just read withheld
+   (`docs/zend_working_set.md` §4.5) — kind by kind. A piece enters or leaves
+   the pool whole, with its index pages only: no K/V moves for a pooled
+   piece until the fill places one of its rounds.
+   - **Size, per card: the larger of a token budget and a count per kind.**
+     2,000,000 tokens on the 72 GB card, 1,000,000 on the 24 GB card, 512,000
+     on the 16 GB card (`scheduler::pool::pool_tokens_for`), and at least 6
+     pieces of each kind on the 72 GB card and 4 on the others — readings,
+     folder summaries, guides and journal notes each filled to its count by
+     its own strength before the token budget is spent by strength across
+     kinds. A run of large readings cannot crowd the other kinds out.
+   - **Type shares bind here.** Documents hold at most 35% and configuration
+     15% of the pooled readings' tokens (`docs/zend_working_set.md` §4.10):
+     a measure on what provenance proposes, not on what the indexer picks.
+   - **Admission is not throttled.** Every piece that ranks in at a boundary
+     enters the pool at that boundary. Its index pages come from memory when
+     resident, from the redo log when cold; the reads run in the
+     reprojection's `pool:index_read` span, and their count, bytes and time
+     are logged (§12 item 26).
+   - **The pool keeps an insertion order.** A piece keeps its place in it
+     from when it entered until it leaves, and the slot seats placed pieces
+     in that order (step 6), never by strength.
+   No configuration overrides the pool's size, in `projection.yaml` or the
+   machine config. The slot is the same on all three cards. The pool is per
+   sequence: each dialogue chooses its own.
 2. **Shared index pages.** A piece's sampled-layer index pages are placed on
    the device once per card, whichever sequences pool it, and refcounted: a
    sequence pooling a piece takes a reference, one dropping it gives the
@@ -377,30 +398,24 @@ At each boundary:
    redo log), so a piece's rows come from wherever its K/V is: a cold piece's
    rows are read from the log on admission and it is scored from the boundary
    after they land.
-3. **Pooled K/V.** A piece entering the pool has its K/V brought to the warm
-   tier, so a round chosen for the slot loads at PCIe speed. The warm tier is
-   the substrate's, one copy of a sealed record however many sequences pool
-   it, so warm K/V is shared per piece as the index pages are, and bounded by
-   the warm tier's own capacity, not by `pool_tokens`. Where the warm tier has
-   no room for all of it, the pool takes what fits and leaves the rest cold; a
-   cold round chosen for the slot loads from the redo log, one boundary later,
-   and holds no room while it is in flight: the slot is filled without it, and
-   it is placed at the next boundary if it still ranks. A round placed in the
-   slot is hot.
+3. **K/V only for what the fill places.** A pooled piece's K/V stays where
+   it is — hot, warm or cold — until the fill places one of its rounds. A
+   round placed from the warm tier loads at PCIe speed; a cold one loads from
+   the redo log, one boundary later, and holds no room while it is in
+   flight: the slot is filled without it, and it is placed at the next
+   boundary if it still ranks. A round placed in the slot is hot.
 4. **Slot, by round.** One fill replaces the budget passes of the working set
    and `select_conversation`, and `slot_room` with them. Its room is
    `L0 − reserve_tokens`, less the system prompt as emitted (pinned ranges
    included) and what the turn has already appended. Rounds in this order:
-   1. **Locks**, whole. A read the user asked for is placed entire, whatever
-      it costs. If the locks alone pass the slot they are placed anyway, and
-      the slot runs past `L0` on the rung its reach needs (§4).
-   2. **Floors** (§8.5), in their own order: the current exchange (its
-      request, its newest tool round and the reply as it grows), the
-      dialogue's first request, then the recent exchanges newest first.
-   3. **Everything else by score**, highest first, whichever piece it comes
-      from, each round admitted only while its kind is under its cap. A
-      round of a piece not yet placed brings the piece's request and answer
-      with it (its floor, §8.1), and is admitted only if all three fit.
+   1. **Floors** (§8.5), in their own order: the current exchange (its first
+      turn, its newest tool turn and the reply as it grows), the dialogue's
+      first exchange's floor, then the recent exchanges newest first.
+   2. **Everything else by score**, highest first, whichever piece it comes
+      from, each round admitted only while its kind is under its cap and its
+      kind's entry allowance (step 5) has room. A round of a piece not yet
+      placed brings the piece's floor — its first and last turn — with it,
+      and is admitted only if all of them fit.
 
    Every other group of the projection, on the dialogue's layer or any
    other, is part of the last tier: each exchange it selects is a unit, whole,
@@ -409,54 +424,53 @@ At each boundary:
    nothing is flexed; the flexbox sizes the layers only for a model that does
    not select.
 
-   **A working set that cannot fit `L0` fills `2·L0`.** When `lock_tokens`
-   and `reserve_tokens` together pass the trained window, or the reserve
-   alone leaves nothing of it, the slot's window is the rung above, YaRN ×2,
-   and the assembler warns once; the fill runs as before against that room.
-
-   Each tier takes its room from the tiers below it, so as locks grow,
-   provenance's rounds and the lower-scored history of the dialogue shrink
-   with them, never the locks themselves.
-
    **When the floors pass the room, they give way from the bottom.** A recent
-   exchange that does not fit sheds its tool rounds, oldest first, and leaves
+   exchange that does not fit sheds its tool turns, oldest first, and leaves
    whole once it has none left; the recent exchanges go oldest first. If the
-   current exchange alone still passes the room, its own older tool rounds go,
-   oldest first; its request, its newest tool round and the reply stay. Only
-   when those and the first request alone pass the room (`L0 −
-   reserve_tokens − system prompt − appended`) does the slot run past `L0`,
-   as locks carry it, and the assembler warns. A
-   reply therefore stays on rung 1 unless one exchange's request, newest
-   result and reply alone outgrow the trained window.
+   current exchange alone still passes the room, its own older tool turns go,
+   oldest first; its first turn, its newest tool turn and the reply stay.
+   Only when those and the first exchange's floor alone pass the room does
+   the slot run past `L0`, on the rung its reach needs (§4), and the
+   assembler warns. A reply therefore stays on rung 1 unless one exchange's
+   request, newest result and reply alone outgrow the trained window.
 
-   **The working set's shares are caps.** They bound how much of each kind the
-   slot holds from the last tier, and never reserve room:
+   **The caps are shares of the room, and they sum to it.** Each kind's cap
+   is its share of the room this projection has, so no kind can crowd
+   another out and the slot never passes the trained window, whatever the
+   system prompt's tools section or the reply's length:
 
-   | Cap | Bounds |
-   |---|---|
-   | `budget` (64,000) | every working-set round in the slot together: readings, folder summaries, guides |
-   | `folder` (10,000) | folder-summary rounds |
-   | `guidance` (16,000) | guide and journal-note rounds |
-   | `max_file` (48,000) | one reading's rounds, its request and answer included |
-   | `window` (180,000) | the dialogue's own rounds and the inherited lineage, its floors included |
+   | Cap | Share of the room | At a 233K room |
+   |---|---:|---:|
+   | `readings` | 22.5% | ≈ 52K |
+   | `folders` | 2% | ≈ 5K |
+   | `guides` | 5% | ≈ 12K |
+   | `journals` | 10.5% | ≈ 24K |
+   | `window` — the dialogue's own rounds and the inherited lineage, its floors included | 60% | ≈ 140K |
 
-   A round whose kind is at its cap is skipped and the fill goes on to the
-   next by score, so a capped kind leaves its room to the others. Floors count
-   toward their kind's cap but are never skipped for it. Locks are bounded by
-   `lock_tokens` alone. The pool has no caps but `pool_tokens`. The caps may
-   sum past the room, and do: `budget` and `window` together are about 244K,
-   so a slot whose working set is thin is filled by the dialogue, and one
-   whose dialogue is short by the working set. The caps keep either from
-   taking the whole slot; they never leave it underfilled while either kind
-   has rounds to give. `window` is raised from 96,000 to 180,000 for that,
-   in the dialogue layer of `projection.yaml`.
-5. **Rounds in and out.** A round entering the slot has its K/V and its
-   remaining layers' index rows brought to the device; one leaving keeps its
-   sampled rows and its warm K/V while its piece stays pooled.
-6. **Seating.** Slot rounds are seated at compact positions: the system
-   prompt in its declared order, then the lineage, then each placed piece's
-   rounds in the piece's own order, then the dialogue's rounds as the
-   projection orders them today.
+   The room is `262,144 − 16,384` (the reserve) less the system prompt, about
+   12K with the tools section at its widest, less the turn's own appended
+   tokens. A round whose kind is at its cap is skipped and the fill goes on to
+   the next by score. Floors count toward their kind's cap but are never
+   skipped for it. There is no per-piece cap: a reading the indexer reads
+   above everything else may take the whole of `readings`.
+5. **Rounds in and out: a third of a budget per boundary.** At most a third
+   of each working-set kind's cap — counted in the placed rounds' K/V tokens,
+   rounded up to whole turns, a new piece's floor included — may enter the
+   slot at one boundary, so no budget is flushed at once and what the
+   momentum carries comes in over a few boundaries. The first boundary after
+   a new user message has no allowance: the question changes what is read,
+   and it chooses its rounds whole. Rounds leave only as entries need their
+   room, lowest score first; a piece whose last tool turn leaves goes whole,
+   floor and all. A round entering the slot has its K/V and its remaining
+   layers' index rows brought to the device; one leaving keeps its sampled
+   rows while its piece stays pooled.
+6. **Seating: stable.** Slot rounds are seated at compact positions: the
+   system prompt in its declared order, then the lineage, then each placed
+   piece in the pool's insertion order (step 1) with its rounds in its own
+   order, then the dialogue's rounds as the projection orders them. A piece
+   entering is seated where its insertion order puts it, a piece leaving
+   closes its gap, and nothing else moves, so a rebuild keeps the slot's
+   prefix up to the first change (`scheduler/piece_identity.rs`).
 
 ### 7.3 Membership and positions
 
@@ -505,10 +519,11 @@ prefill of every tool result is a cost with nothing left to buy.
 
 ### 7.5 What provenance does now
 
-Provenance proposes pieces for the pool and gives them their base score. It no
-longer decides what is attended: with only index rows to pay for, it can
-propose four times what the slot holds, and the indexer's hits decide which of
-that is loaded.
+Provenance proposes pieces for the pool and gives their turns their base
+score. It no longer decides what is attended: with only index rows to pay for,
+it can propose many times what the slot holds, and the indexer's hits — the
+real selection's on placed rounds, the shadow scan's on pooled ones — decide
+which of that is loaded. Only what the fill places moves its K/V.
 
 ## 8. The conversation
 
@@ -638,18 +653,16 @@ everything else.
 
 Always in the pool and the slot, whatever their score, in the order of §7.2:
 
-- reads the user asked for, which the working set locks, placed whole. Locks
-  come first; when they pass the slot the slot runs past `L0` (§4), and
-  everything below them gives up its room. `lock_tokens` still bounds what
-  can be locked: a lock past it is refused and the read runs for real
-  (`Refusal::Full`), its result in the dialogue's own rounds.
 - the system prompt, its pinned ranges with it (§5);
-- the current exchange: its request, its newest tool round and the reply as
-  it grows, and its older tool rounds until §7.2 sheds them;
-- the dialogue's first user turn;
+- the current exchange: its first turn, its newest tool turn and the reply as
+  it grows, and its older tool turns until §7.2 sheds them;
+- the dialogue's first exchange's floor;
 - the dialogue's most recent exchanges (`recent`, 16), whole, newest first;
-- each placed piece's request and answer (§8.1), which come with the piece's
-  first placed round rather than on their own.
+- each placed piece's first and last turn (§8.1), which come with the piece's
+  first placed tool turn rather than on their own.
+
+There are no locks. Every `file_read` runs for real and its result is a round
+of the dialogue (`docs/zend_working_set.md` §4.5).
 
 Everything else is scored round by round. When provenance scores are low the
 dialogue fills the slot; when they are high the oldest unread rounds give way.
@@ -668,7 +681,7 @@ had said it is read back as something it said
 | Piece | File |
 |---|---|
 | `rope: min_yarn_factor` removed with its schema field, error and identity argument; the substrate moved aside under the new key, its kept objects exported and imported | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{schema,error,builder}.rs`, `candle-conversation/src/models/{builder.rs,identity/rope_key.rs}` |
-| `hits:` block; `pin: true` on system-prompt items and `pin_tokens`; `reserve_tokens`, `lock_tokens`; `lineage_base` on the conversation rule; the `working_set` shares and `window` (180,000) as caps on the slot fill; `slot_tokens` removed, the slot read from the engine's `L0` | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{yaml,schema}.rs` |
+| `hits:` block; `pin: true` on system-prompt items and `pin_tokens`; `reserve_tokens`; `lineage_base` on the conversation rule; each kind's share of the room as the fill's caps; `slot_tokens` and `lock_tokens` removed, the slot read from the engine's `L0` | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{yaml,schema}.rs` |
 | Pinned ranges in place of the prompt span; forced in every row; one window over the slot | `candle-transformers/src/models/qwen4exp/{indexer,qsa_select,wave}.rs`, `candle-kernels/src/simple/qsa_topk.cu` |
 | Sampled layers from percentiles | `candle-transformers/src/models/selection_strata.rs` beside `StrataTokens` |
 | Index rows resident without K/V; the stride's kept queries and cuts; the shadow scan and its windows | `candle-transformers/src/models/qwen4exp/{resident_page,indexer,hits,shadow}.rs`, `candle-kernels/src/simple/{qsa_topk,qsa_hits,qsa_shadow}.cu` |
@@ -677,27 +690,31 @@ had said it is read back as something it said
 | Text export and import of every kept custom object and the blobs it names | `zend/src/api/kept_objects.rs` and `npcd/src/api.rs`, over `candle-conversation/src/persistence/kept_objects/` |
 | Scores, the pool, the slot, floors, the lineage, exchanges and tool rounds as units | `candle-conversation/src/projection/{fill,dialogue_fill,rounds,project}.rs`, `candle-conversation/src/scheduler/projection_assembler.rs` |
 | `ManagedBatchedModel` hooks for pinned ranges, hit rounds and summaries, and the trained window (no-ops for a model that does not select) | `candle-transformers/src/models/batched_inference.rs` |
-| `pool_tokens` per card size; pooled K/V warmed, cold where warm runs short | `candle-conversation/src/scheduler/{pool,pool_refresh,pooled_rounds}.rs`, `candle-conversation/src/persistence/warm_asks.rs`, `candle-conversation/src/projection/cold_to_warm.rs` |
-| Rounds carved by the grammar; slot order locks, pins, floors, score | `candle-conversation/src/projection/{rounds,fill,dialogue_fill}.rs`, `candle-conversation/src/scheduler/projection_assembler.rs` |
+| The pool as the candidate set: per-card size and minimum count per kind, type shares, unthrottled admission, insertion order, index pages only | `candle-conversation/src/scheduler/{pool,pool_refresh,pooled_rounds}.rs`, `candle-conversation/src/working_set/` |
+| Rounds carved by the grammar; slot order pins, floors, score; the third-per-boundary entry allowance | `candle-conversation/src/projection/{rounds,fill,dialogue_fill}.rs`, `candle-conversation/src/scheduler/projection_assembler.rs` |
 | Every turn placed whole, with all its index pages | `candle-conversation/src/projection/rounds.rs`, `candle-conversation/src/scheduler/projection_assembler.rs` |
 | One `file_read` per reply in code-reading ingest, the round limit the file's page count | `zend/src/code_read/mod.rs` |
 | Shared sampled-layer index pages per card | `candle-transformers/src/models/qwen4exp/{resident_page,wave}.rs`, the span's region pool |
 
 ## 10. Cost
 
-- **Index memory.** One pooled key is 128 F32 per four tokens per layer. The
-  unloaded pool on three sampled layers is at most about 290 MB at a 1M pool
-  (about 750K unloaded), about 100 MB at 512K and about 4 MB at 256K, where
-  the pool is barely larger than the slot. Pages are shared per card, so
-  dialogues pooling the same readings pay for them once; the slot's twelve
-  layers are about 400 MB a sequence, as today at that size.
-- **Warm K/V.** A pooled piece's K/V is held in the warm tier. Where the warm
-  tier is short, cold rounds cost a redo-log read and arrive a boundary late.
+- **Index memory.** One pooled key is 128 F32 per four tokens per layer, about
+  384 bytes a token over the three sampled layers. The unloaded pool is at
+  most about 680 MB at a 2M pool (about 1.77M unloaded), about 300 MB at 1M
+  and about 110 MB at 512K. A per-kind minimum count past the token budget
+  adds what those pieces hold. Pages are shared per card, so dialogues
+  pooling the same readings pay for them once; the slot's twelve layers are
+  about 400 MB a sequence.
+- **Pool admission.** A pooled piece's index pages are read from memory when
+  resident and from the redo log when cold, at the boundary it ranks in.
+  The reads are the `pool:index_read` span; their count, bytes and time are
+  logged per boundary.
+- **No K/V for the pool.** Only a placed round moves K/V: from warm at PCIe
+  speed, from cold a boundary late.
 - **Shadow scan.** One launch per sampled layer on the first wave after a
-  boundary: up to 64 queries per layer
-  against the unloaded keys, about 290 MB a sequence at a 1M pool. A stride
-  reads those keys once for all its queries, against once per token if it ran
-  in the forward.
+  boundary: up to 64 queries per layer against the unloaded keys, about
+  680 MB a sequence at a 2M pool. A stride reads those keys once for all its
+  queries, against once per token if it ran in the forward.
 - **Ingest.** One read per reply makes a reading take one reply per page:
   more, shorter turns than batched reads.
 - **K/V.** At most the trained window, against about 428K of budget today.
@@ -717,8 +734,13 @@ had said it is read back as something it said
 
 ## 12. Built
 
-Everything this document describes is built. Each item names the section it
-answers to and where it lives.
+Items 1–17 are built; each names the section it answers to and where it
+lives. Items 18–26 are the pool-first revision (2026-11-18) of §7.1, §7.2,
+§7.5 and §8.5, and are what is left to build. A built item is not the same as
+a live one: the fill of item 12 was built and tested on the CPU and did not run
+on the daemon until 2026-11-18 (§8.2). An item is live when the daemon's own
+prompt dumps (`/v1/conversations/<id>/prompt-tokens`) and projection points
+show it.
 
 1. **Rotation (§4).** The minimum factor is gone from the schema, the engine
    asks, the model builder, the rung selection (`RungSelect` has no floor) and
@@ -765,24 +787,18 @@ answers to and where it lives.
     dialogue's pool is its floors, then provenance's candidates lifted by
     their rounds' hits, up to the card's `pool_tokens`; each pooled
     conversation's pages are held at the sampled layers
-    (`scheduler/pool_refresh.rs`). At each reprojection a pooled
-    conversation's K/V is asked into the warm tier, and a cold-only turn is
-    rebuilt in host RAM from its log image within the substrate's share of
-    the warm budget (`PersistenceTrigger::warm_turns`,
-    `ChunkedKvBacking::warm_from_cold`). The hit map covers loaded rounds,
-    then pooled ones (`PooledRound`).
+    (`scheduler/pool_refresh.rs`). The hit map covers loaded rounds, then
+    pooled ones (`PooledRound`). Item 21 removes the pool's warm asks.
 12. **The slot fill (§7.2).** `projection/fill.rs`: one fill after the
-    system prompt — locks, floors that give way from the bottom, then units
-    by score under the caps (budget, folders, guidance, `max_file_tokens`,
-    the target's window, each other layer's window), each round bringing its
-    piece's floor, every unit placed once. A dialogue's lineage, working set
-    and exchanges are one fill, carved back into whole turns in seating order
-    (`dialogue_fill.rs`). It runs on the daemon since 2026-11-18 (§8.2). On a selecting engine
-    every group of the projection enters the fill, so nothing is flexed.
+    system prompt — floors that give way from the bottom, then units by score
+    under the caps, each round bringing its piece's floor, every unit placed
+    once. A dialogue's lineage, working set and exchanges are one fill,
+    carved back into whole turns in seating order (`dialogue_fill.rs`). It
+    runs on the daemon since 2026-11-18 (§8.2). On a selecting engine every
+    group of the projection enters the fill, so nothing is flexed.
     `slot_tokens` and `slot_room` are gone: the slot is the engine's `L0`
-    less `reserve_tokens`, and a working set whose `lock_tokens` and
-    `reserve_tokens` pass it fills `2·L0` (YaRN ×2) with one warning
-    (`SlotWindow`). The dialogue's window is 180,000.
+    less `reserve_tokens`. Items 18–26 change its candidates, scores, caps,
+    entries and seating.
 13. **The lineage (§8.4)** is scored from `lineage_base`, ancestors ranked so
     a tight window gives up the oldest first and whole.
 14. **Hits across views.** A view carved from a slot counts into the slot's
@@ -861,6 +877,48 @@ answers to and where it lives.
       another stays deleted. A key whose winner is a tombstone is not written
       at all: the new substrate never held it.
 
+**The pool-first revision (2026-11-18), to build:**
+
+18. **The pool is the fill's candidate set (§7.2 step 1).** The fill draws
+    working-set rounds from every pooled piece, not only from working-set
+    members. Momentum, seeds and the withheld set move onto pool membership
+    (`docs/zend_working_set.md` §4.3, §4.5); whole-file membership charged
+    against a budget, the two admits per reprojection, the dislodge margin
+    and the `max_file_tokens` refusal go.
+19. **Pool size and kinds (§7.2 step 1).** 2M / 1M / 512K tokens by card, and
+    at least 6 / 4 / 4 pieces of each kind; type shares on the pooled
+    readings.
+20. **Unthrottled pool admission (§7.2 step 1).** `POOL_ADMITS_PER_BOUNDARY`
+    goes; every piece that ranks in is admitted at its boundary, its index
+    pages read in the `pool:index_read` sub-span of the reprojection's pool
+    part.
+21. **No K/V for the pool (§7.2 step 3).** `refresh_pool`'s `warm_turns` ask
+    goes; a placed round moves its K/V, from warm or a boundary late from
+    cold.
+22. **Rounds on the band (§7.1).** A working-set round's score is its own
+    turn's provenance score lifted by its hit momentum; a pooled round with
+    no base is credited `lineage_base · gain · h`. Piece strength never
+    enters the fill (`dialogue_fill::piece_round_score` goes).
+23. **Caps as shares of the room (§7.2 step 4).** Readings 22.5%, folders
+    2%, guides 5%, journals 10.5%, the dialogue's window 60%; no per-piece
+    cap; guides and journals are kinds of their own.
+24. **A third per boundary (§7.2 step 5).** Each working-set kind admits at
+    most a third of its cap per boundary, floors included, rounded up to
+    whole turns; no allowance on the first boundary after a new user
+    message; rounds leave only as entries need room, a piece with no tool
+    turn left leaving whole.
+25. **Stable seating (§7.2 step 6).** Placed pieces are seated in the pool's
+    insertion order.
+26. **Locks removed (§8.5).** `WorkingSet::lock`, `restore_lock`, `release`,
+    `release_one`, the lock marks, the engine's lock methods, `lock_tokens`,
+    the fill's lock tier and `Refusal`'s lock variants go. Per reprojection
+    and per kind, one info line logs: pooled pieces and tokens, admitted and
+    dropped; each pooled piece's page count beside its rank (the pool's size
+    bias, `docs/results/dependency_battery_gap_analysis_2026-11-18.md`); hit
+    pieces against placed ones and the top hit pieces by name; rounds
+    entering and leaving against the allowance; each cap's use; and the
+    `pool:index_read` count, bytes and time.
+
 ## 13. Handover
 
 ### 13.1 Rules
@@ -880,10 +938,13 @@ Every item of §12 is unit-tested beside its code. Beyond them:
 - **Grammar.** A property test over random pieces and slot sizes: every
   carving reads `U (A U)* A`, never two of one role adjacent, and every placed
   piece holds its request and answer.
-- **Fill.** Locks past the slot are placed and the slot leaves rung 1; a kind
-  at its cap is skipped and its room goes to the next; floors count toward
-  caps and are never skipped; floors past the room give way in the order of
-  §7.2; a thin working set leaves its room to the dialogue.
+- **Fill.** The caps sum to the room and each is its share of it; a kind at
+  its cap is skipped and its room goes to the next; floors count toward caps
+  and are never skipped; floors past the room give way in the order of §7.2;
+  a kind admits at most a third of its cap per boundary, none limited on the
+  first boundary after a user message; a piece's rounds are seated in the
+  pool's insertion order whatever their scores; a pooled round with no base
+  and hits enters on its credit.
 - **Density.** A loaded and an unloaded round hit by every query they could
   have been hit by score the same density, whatever the stride's prefill and
   shadow row counts.
