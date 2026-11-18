@@ -68,6 +68,7 @@ use crate::scheduler::piece_identity::{
     alignment_identities, chained_identities, piece_label, PieceReads,
 };
 use crate::scheduler::piece_splice::{plan_splice, HeldPiece, PieceKind, SplicePlan, WantedPiece};
+use crate::scheduler::pool_linger::PoolLinger;
 use crate::scheduler::pooled_rounds::{pooled_rounds, PoolPages};
 use crate::scheduler::profile;
 use crate::scheduler::projection_identity::section_content_stamp;
@@ -141,6 +142,9 @@ pub(super) struct SlotState {
     /// A conversation's turns are append-only, so a refresh that keeps it walks
     /// only the turns past this — the earlier ones' pages are held already.
     pub(super) pool_walked: HashMap<TimelineId, u32>,
+    /// Pieces that left the pool, keeping their pages for a few refreshes
+    /// (`super::pool_linger`).
+    pub(super) pool_linger: PoolLinger,
 }
 
 /// The most read-back parts a slot keeps between reprojections; past it the
@@ -415,6 +419,7 @@ impl SlotState {
             // each conversation it pools whole.
             pool: PoolPages::new(),
             pool_walked: HashMap::new(),
+            pool_linger: PoolLinger::default(),
         }
     }
 

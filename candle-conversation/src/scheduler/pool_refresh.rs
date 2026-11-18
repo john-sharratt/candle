@@ -45,6 +45,10 @@ pub(super) struct PoolRefresh {
     pub read_bytes: usize,
     /// Microseconds the reads took — the `pool:index_read` span.
     pub read_us: u64,
+    /// Of `admitted`, pieces taken up from lingering, their pages still held.
+    pub revived: usize,
+    /// Pieces lingering after it (`pool_linger`).
+    pub lingering: usize,
 }
 
 /// The turns of a pooled conversation a refresh reads: from `walked`, the
@@ -105,16 +109,18 @@ impl Scheduler {
                 pool.iter().map(|&tl| (tl, read.turn_count(tl))).collect();
             (pool, turns_of)
         };
-        let (mut prior, mut prior_walked) = self
+        let (mut prior, mut prior_walked, mut linger) = self
             .slot_projection_state
             .get_mut(&slot)
             .map(|s| {
                 (
                     std::mem::take(&mut s.pool),
                     std::mem::take(&mut s.pool_walked),
+                    std::mem::take(&mut s.pool_linger),
                 )
             })
             .unwrap_or_default();
+        linger.age();
         let held_before: HashSet<TimelineId> = prior.keys().copied().collect();
         // What the model holds for the slot: a held conversation is reused only
         // where every page its layout names is still there.
@@ -127,12 +133,22 @@ impl Scheduler {
         let t_read = Instant::now();
         for tl in pool {
             let turns = turns_of.get(&tl).copied().unwrap_or(0);
-            let prior_layout = prior.remove(&tl).unwrap_or_default();
+            // Held last refresh, or lingering since it left (`pool_linger`).
+            let (prior_layout, walked) = match prior.remove(&tl) {
+                Some(layout) => (layout, prior_walked.remove(&tl)),
+                None => match linger.take(tl) {
+                    Some((layout, walked)) => {
+                        stats.revived += 1;
+                        (layout, Some(walked))
+                    }
+                    None => Default::default(),
+                },
+            };
             let layout_held = prior_layout
                 .values()
                 .flatten()
                 .all(|(_, key)| model_held.contains(key));
-            let from = walk_from(prior_walked.remove(&tl), turns, layout_held);
+            let from = walk_from(walked, turns, layout_held);
             let mut keys = Vec::new();
             let mut layout: HashMap<TurnIndex, Vec<(usize, PieceKey)>> = HashMap::new();
             if from > 0 {
@@ -199,6 +215,14 @@ impl Scheduler {
             .iter()
             .filter(|tl| !kept.contains_key(tl))
             .count();
+        // What left the pool lingers with its pages (`pool_linger`); the model
+        // keeps them beside the pool's own.
+        for (tl, layout) in prior {
+            let walked = prior_walked.get(&tl).copied().unwrap_or(0);
+            linger.linger(tl, layout, walked);
+        }
+        stats.lingering = linger.len();
+        keep.extend(linger.keys());
         if let Err(e) = self.model.retain_pooled(slot.0, &keep) {
             tracing::warn!(slot = slot.0, error = %e, "pool: dropped pieces not released");
         }
@@ -209,6 +233,7 @@ impl Scheduler {
         if let Some(state) = self.slot_projection_state.get_mut(&slot) {
             state.pool = kept;
             state.pool_walked = kept_walked;
+            state.pool_linger = linger;
         }
         stats
     }
@@ -240,6 +265,8 @@ impl Scheduler {
             index_read_turns = stats.walked,
             index_read_bytes = stats.read_bytes,
             index_read_us = stats.read_us,
+            revived = stats.revived,
+            lingering = stats.lingering,
             ring_pages = self.pool_read_ring.len(),
             ring_mib = self.pool_read_ring.bytes() >> 20,
             "pool:index_read"
