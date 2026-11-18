@@ -37,11 +37,19 @@ The last row is the remainder. The log line is cut before those fields, so
 step 0 reads them.
 
 **What that costs the decode.** The scheduler spent **16.2 s of the minute,
-27%,** reprojecting. The wave lines over the same seconds show 35–40 decode
-forwards per 2.0–2.2 s at 31–34 ms each: about 1.2 s of forward time in 2.1 s.
-So the stream decoded at **~17 tokens/s where its forward allows ~31**.
-Reprojection accounts for about two thirds of the gap. The rest is step 0's
-question.
+27%,** reprojecting.
+
+> **Corrected 2026-11-18.** An earlier version of this section read the wave
+> heartbeat as the decode rate and gave ~17 tokens/s against a forward bound of
+> ~31. Neither number is a decode rate. The rate is committed tokens
+> (`/v1/telemetry` `decode_tps`), and a turn's own rate is its tokens over the
+> time its forwards ran (`turn complete … tps=`, `DecodeState::decode_busy_us`).
+> On build `5228` at 22:17 UTC, one chat alone, the forwards ran at
+> **111–115 tokens/s**. A tool round took 6–9 s from submit to completion:
+> 1.7–2.3 s of prefill, 1.1–1.8 s of forwards, and 3–5 s between them. The
+> census for that minute has 29 rebuilds at 467 ms each, about one per 32
+> tokens decoded, which is more than those 32 tokens' forwards (~290 ms). The
+> gap is the time between forwards. Reprojection is most of it.
 
 **Before the chat, the same build:** reprojections that kept their selection
 took about **1 ms each** (`kept=19 kept_ms=18.6`, `kept=15 kept_ms=13.1`). The
@@ -223,7 +231,9 @@ On the fixed replay of §1, one stream on BlackWorld:
 - reprojection under **5% of the minute** (from 27%);
 - a rebuild under **60 ms** on average (from 338 ms), with `score` under 20 ms
   and `pool` under 10 ms;
-- decode within **10% of its forward bound** (from ~17 of ~31 tokens/s);
+- a tool round's time between forwards no more than its forwards' own (from
+  3–5 s against 1.1–1.8 s), so the committed rate is within reach of the
+  forward's ~110 tokens/s;
 - the battery of `docs/results/dependency_battery_2026-11-19.md` not below its
   51.0%, because the selection has not changed.
 
