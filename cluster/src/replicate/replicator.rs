@@ -38,7 +38,7 @@ use super::watch::GapWatch;
 use crate::consensus::votes::VoteStore;
 use crate::consensus::{Config, LeaseRow, Millis, Paxos, WallMillis};
 use crate::coord::{AppCoord, CommandLine};
-use crate::delivery::Outbox;
+use crate::delivery::{Outbox, SocketId};
 use crate::fragment::Whole;
 use crate::frame::{Catchup, Done, Frame, Headers, Lost, Members, Pulse};
 use crate::member::AppMember;
@@ -213,6 +213,12 @@ pub(super) struct State {
     /// them onto its own socket before the round robin does.
     pub fresh: BTreeMap<u64, Instant>,
     pub sockets: Vec<Option<SessionHandle>>,
+    /// Per cluster, the outbox's id for its current session: a new one at
+    /// every admission, so a dead session's late writes are told apart from
+    /// the live one's (`delivery::outbox`).
+    pub socket_ids: Vec<SocketId>,
+    /// The next session's outbox id.
+    pub next_socket: SocketId,
     /// Per socket: its admission catch-up has finished.
     pub ready: Vec<bool>,
     /// An admission catch-up has finished since the process started: the
@@ -529,6 +535,8 @@ impl Replicator {
                 receipts: ReceiptWatch::default(),
                 fresh: BTreeMap::new(),
                 sockets: vec![None; clusters],
+                socket_ids: vec![0; clusters],
+                next_socket: 0,
                 ready: vec![false; clusters],
                 served: false,
                 admission_quiet: vec![0; clusters],
@@ -650,6 +658,10 @@ impl Replicator {
         let first = {
             let mut s = self.state();
             s.sockets[c] = Some(handle);
+            let id = s.next_socket;
+            s.next_socket += 1;
+            s.socket_ids[c] = id;
+            s.outbox.opened(id);
             s.ready[c] = false;
             s.admission_quiet[c] = 0;
             s.ack_dirty = true;
@@ -684,7 +696,8 @@ impl Replicator {
         s.sockets[c] = None;
         s.ready[c] = false;
         s.members[c] = None;
-        s.outbox.dropped(c as u32);
+        let id = s.socket_ids[c];
+        s.outbox.dropped(id);
         let gone: Vec<u64> = s
             .catchups
             .iter()
@@ -733,7 +746,10 @@ impl Replicator {
     pub fn frame(self: &Arc<Self>, c: usize, frame: Frame) {
         match frame {
             Frame::Receipt(r) => {
-                self.state().outbox.receipt(c as u32, r.through);
+                let mut s = self.state();
+                let id = s.socket_ids[c];
+                s.outbox.receipt(id, r.through);
+                drop(s);
                 self.receipts.notify_waiters();
             }
             Frame::Members(m) => {

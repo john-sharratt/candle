@@ -90,13 +90,16 @@ impl Replicator {
                         sockets[s.rr].clone()
                     }
                 };
-                s.outbox.queue(oseq, c as u32);
+                // The session's own id: a write that completes after it
+                // dropped names it, and leaves the event owed.
+                let id = s.socket_ids[c];
+                s.outbox.queue(oseq, id);
                 // Not fresh: owed again after a socket dropped or the process
                 // restarted.
                 if s.fresh.remove(&oseq).is_none() {
                     s.stats.resent += 1;
                 }
-                picks.push((oseq, c, handle));
+                picks.push((oseq, id, handle));
             }
             picks
         };
@@ -109,14 +112,14 @@ impl Replicator {
         let Ok(read) = tokio::task::spawn_blocking(move || {
             picks
                 .into_iter()
-                .map(|(oseq, c, h)| (oseq, c, h, store.read(node, oseq)))
+                .map(|(oseq, id, h)| (oseq, id, h, store.read(node, oseq)))
                 .collect::<Vec<_>>()
         })
         .await
         else {
             return 0;
         };
-        for (oseq, c, handle, bytes) in read {
+        for (oseq, id, handle, bytes) in read {
             let Some(bytes) = bytes else {
                 // Maintenance dropped it as superseded: what superseded it is
                 // sent instead, and a catch-up records this one as gone.
@@ -130,12 +133,12 @@ impl Replicator {
                         let written = written.await;
                         let mut s = me.state();
                         match written {
-                            Ok(frame) => s.outbox.sent(oseq, c as u32, frame),
-                            Err(_) => s.outbox.unqueue(oseq),
+                            Ok(frame) => s.outbox.sent(oseq, id, frame),
+                            Err(_) => s.outbox.unqueue(oseq, id),
                         }
                     });
                 }
-                Err(_) => self.state().outbox.unqueue(oseq),
+                Err(_) => self.state().outbox.unqueue(oseq, id),
             }
         }
         taken
@@ -163,7 +166,11 @@ impl Replicator {
             let receipted = self.receipts.notified();
             let mut receipted = pin!(receipted);
             receipted.as_mut().enable();
-            if !self.state().outbox.owed_elsewhere(through, c as u32) {
+            let owed = {
+                let s = self.state();
+                s.outbox.owed_elsewhere(through, s.socket_ids[c])
+            };
+            if !owed {
                 return;
             }
             if timeout_at(deadline, receipted).await.is_err() {

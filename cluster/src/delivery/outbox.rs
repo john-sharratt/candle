@@ -5,10 +5,21 @@
 //! is sent.
 //!
 //! Received events are forgotten, so the outbox holds only what is still owed.
+//!
+//! **A socket is one session.** Frame numbers are a session's own, counted
+//! from its start, so a socket id names one session and is never reused: a
+//! cluster that reconnects opens a new id. A write that completes after its
+//! session ended — the writer's future resolving once the socket has dropped
+//! and its events were made owed again — names a socket that is no longer
+//! open, and its event stays owed. Recorded in flight under the dead session's
+//! frame number, no later receipt on the cluster's new session would cover it:
+//! on BlackWorld (2026-11-18) 964 events stood in flight that way for five
+//! hours, the oldest never moving.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// One of the member's sockets, by the caller's own numbering.
+/// One of the member's sessions, by the caller's own numbering: a new id for
+/// every session, never reused.
 pub type SocketId = u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +44,8 @@ pub struct Outbox {
     in_flight: BTreeMap<u64, (SocketId, u64)>,
     /// Per socket, its in-flight events by the frame that completed them.
     by_frame: HashMap<SocketId, BTreeMap<u64, Vec<u64>>>,
+    /// The sockets open now: an event is in flight only on one of them.
+    open: BTreeSet<SocketId>,
     /// The highest `oseq` the outbox has been told of.
     written: u64,
 }
@@ -74,6 +87,11 @@ impl Outbox {
         self.unsent.iter().copied()
     }
 
+    /// Session `socket` began: events may be queued and in flight on it.
+    pub fn opened(&mut self, socket: SocketId) {
+        self.open.insert(socket);
+    }
+
     /// `oseq` was handed to `socket`'s writer.
     pub fn queue(&mut self, oseq: u64, socket: SocketId) {
         if self.unsent.remove(&oseq) {
@@ -81,9 +99,11 @@ impl Outbox {
         }
     }
 
-    /// `oseq`, queued, never went out: the session ended first.
-    pub fn unqueue(&mut self, oseq: u64) {
-        if self.queued.remove(&oseq).is_some() {
+    /// `oseq`, queued on `socket`, never went out: the session ended first.
+    /// One queued since on another socket is that socket's, and stays.
+    pub fn unqueue(&mut self, oseq: u64, socket: SocketId) {
+        if self.queued.get(&oseq) == Some(&socket) {
+            self.queued.remove(&oseq);
             self.unsent.insert(oseq);
         }
     }
@@ -95,8 +115,14 @@ impl Outbox {
         self.queued.remove(&oseq);
     }
 
-    /// `oseq` went out on `socket`, its last fragment as frame `frame`.
+    /// `oseq` went out on `socket`, its last fragment as frame `frame`. A
+    /// socket no longer open is a session that ended: no receipt will come for
+    /// its frame, so the event stays owed (module docs).
     pub fn sent(&mut self, oseq: u64, socket: SocketId, frame: u64) {
+        if !self.open.contains(&socket) {
+            self.unqueue(oseq, socket);
+            return;
+        }
         self.unsent.remove(&oseq);
         self.queued.remove(&oseq);
         if let Some((s, f)) = self.in_flight.insert(oseq, (socket, frame)) {
@@ -123,8 +149,10 @@ impl Outbox {
         }
     }
 
-    /// `socket` dropped: everything queued or in flight on it is owed again.
+    /// `socket` dropped: everything queued or in flight on it is owed again,
+    /// and a write it completes later leaves its event owed.
     pub fn dropped(&mut self, socket: SocketId) {
+        self.open.remove(&socket);
         for (_, oseqs) in self.by_frame.remove(&socket).unwrap_or_default() {
             for oseq in oseqs {
                 self.in_flight.remove(&oseq);
@@ -210,6 +238,8 @@ mod tests {
     #[test]
     fn a_dropped_socket_returns_only_its_unreceipted_events() {
         let mut o = Outbox::new();
+        o.opened(0);
+        o.opened(1);
         for oseq in 1..=6 {
             o.written(oseq);
         }
@@ -271,6 +301,8 @@ mod tests {
     #[test]
     fn a_queued_event_is_neither_unsent_nor_lost() {
         let mut o = Outbox::new();
+        o.opened(0);
+        o.opened(1);
         for oseq in 1..=3 {
             o.written(oseq);
         }
@@ -285,7 +317,9 @@ mod tests {
         assert!(!o.owed_elsewhere(1, 0));
         o.dropped(1);
         assert_eq!(o.unsent().collect::<Vec<_>>(), vec![2]);
-        o.unqueue(1);
+        o.unqueue(1, 1);
+        assert_eq!(o.state(1), EventState::Queued { socket: 0 }, "not 1's");
+        o.unqueue(1, 0);
         assert_eq!(o.unsent().collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(o.counts(), (2, 1));
     }
@@ -295,6 +329,7 @@ mod tests {
     #[test]
     fn a_restart_leaves_events_written_since_alone() {
         let mut o = Outbox::new();
+        o.opened(0);
         o.written(9);
         o.written(12);
         o.sent(12, 0, 1);
@@ -314,6 +349,8 @@ mod tests {
     #[test]
     fn the_oldest_event_in_flight_is_named() {
         let mut o = Outbox::new();
+        o.opened(0);
+        o.opened(1);
         assert_eq!(o.oldest_in_flight(), None);
         for oseq in 1..=4 {
             o.written(oseq);
@@ -336,9 +373,12 @@ mod tests {
     #[test]
     fn a_resend_moves_the_event_to_its_new_socket() {
         let mut o = Outbox::new();
+        o.opened(0);
+        o.opened(1);
         o.written(1);
         o.sent(1, 0, 3);
         o.dropped(0);
+        o.queue(1, 1);
         o.sent(1, 1, 2);
         o.receipt(0, 100);
         assert_eq!(
@@ -350,5 +390,45 @@ mod tests {
         );
         o.receipt(1, 2);
         assert_eq!(o.state(1), EventState::Received);
+    }
+
+    /// **A write that completes after its session dropped leaves its event
+    /// owed**, not in flight under the dead session's frame number. The
+    /// cluster's new session counts its frames from the start, so its receipts
+    /// never reach that number: 964 events stood in flight for five hours on
+    /// BlackWorld (2026-11-18). The event goes out again on the new session and
+    /// is received there.
+    #[test]
+    fn a_write_completing_on_a_dropped_session_stays_owed() {
+        let mut o = Outbox::new();
+        o.opened(0);
+        o.written(1);
+        o.written(2);
+        o.queue(1, 0);
+        o.queue(2, 0);
+        o.dropped(0);
+        assert_eq!(o.unsent().collect::<Vec<_>>(), vec![1, 2]);
+        // The cluster reconnects as a new session.
+        o.opened(1);
+        o.queue(2, 1);
+        // Session 0's writer reports both written, late, at a frame far past
+        // anything session 1 has sent.
+        o.sent(1, 0, 5_000_000);
+        o.sent(2, 0, 5_000_001);
+        assert_eq!(o.state(1), EventState::Unsent, "owed again, not in flight");
+        assert_eq!(
+            o.state(2),
+            EventState::Queued { socket: 1 },
+            "1's, untouched"
+        );
+        assert_eq!(o.counts(), (1, 1));
+        o.queue(1, 1);
+        o.sent(1, 1, 3);
+        o.sent(2, 1, 4);
+        o.receipt(1, 4);
+        assert_eq!(o.state(1), EventState::Received);
+        assert_eq!(o.state(2), EventState::Received);
+        assert_eq!(o.counts(), (0, 0));
+        assert_eq!(o.oldest_in_flight(), None);
     }
 }

@@ -338,7 +338,7 @@ impl Replicator {
                 unsent,
                 stalled_s = secs,
                 oldest_oseq = oldest.map(|(o, _)| o),
-                cluster = oldest.map(|(_, c)| c),
+                session = oldest.map(|(_, s)| s),
                 "own events in flight have had no receipt: the gateway is not taking them in"
             ),
             Seen::Resumed { in_flight, secs } => tracing::info!(
