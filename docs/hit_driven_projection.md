@@ -591,14 +591,12 @@ not cost 48K, only the pages the question reads.
   ranks against other pieces, and its pages' own scores decide which of them
   the slot holds. A piece with no scored page enters at its own score, and
   ties go to the oldest page.
-- **The fill did not run on the daemon until 2026-11-18.** Every placed turn
-  of 30 dialogue prompts was whole, never a single record, with the
-  working-set groups past their 64K budget each time. The cause was
-  `SubstrateRead` answering the trait's default `trained_window` of `None` to
-  `TargetedRead`, so every dialogue projected as if its engine did not select
-  (`docs/zend_working_set.md` §4.4). `trained_window` and `record_tokens` now
-  have no default. Until the fill is seen carving on the daemon, a reading
-  longer than `max_file` is not a member.
+- **Open: the fill does not carve in production.** Measured 2026-11-18 on
+  BlackWorld, every placed turn of 30 dialogue prompts was whole, never a
+  single record, with the working-set groups past their 64K budget each time
+  (`docs/zend_working_set.md` §4.4). So the caps of step 4 bind in tests and
+  not on the daemon. Until they do, a reading longer than `max_file` cannot be
+  a member.
 - **The reading's own projection is not carved.** While a reading is being
   ingested its conversation is its own target and selected whole
   (`target_is_ingest_self`), as it is today.

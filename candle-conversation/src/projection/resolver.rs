@@ -6176,36 +6176,6 @@ mod tests {
         );
     }
 
-    /// **A dialogue's projection sees the engine's trained window.** The
-    /// targeted read every dialogue projects through answered `None` while
-    /// the substrate held the window, so no slot was ever filled
-    /// (`ContentResolver::trained_window`). Every reader reports what the
-    /// substrate holds, before and after it is set.
-    #[test]
-    fn every_read_reports_the_substrates_trained_window() {
-        use crate::projection::project::ProjectionTarget;
-        use crate::substrate::ContentResolver;
-
-        let conv = Conversation::ephemeral();
-        let target = ProjectionTarget {
-            layer: LayerId::from_raw(1).expect("layer id"),
-            group: GroupId::from_raw(1).expect("group id"),
-            timeline: TimelineId::from_raw(41).expect("timeline id"),
-        };
-        let windows = |conv: &Conversation| {
-            let read = conv.read();
-            (
-                ContentResolver::trained_window(&*read),
-                ContentResolver::trained_window(&read),
-                ContentResolver::trained_window(&conv.read_for(target)),
-            )
-        };
-        assert_eq!(windows(&conv), (None, None, None));
-        conv.update(|s| s.set_trained_window(Some(262_144)));
-        let set = Some(262_144);
-        assert_eq!(windows(&conv), (set, set, set));
-    }
-
     /// A conversation that never forked is unaffected — the masking that keeps
     /// one chat out of another's projection is exactly as it was.
     #[test]

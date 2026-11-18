@@ -9,9 +9,8 @@ use super::project::{
     OptionalState, ProjectionMode, ProjectionTarget, SelectionState, TOOL_ROUND_SELECTOR,
 };
 use super::working_set_pick::{Standing, WorkingSetMembers, PINNED_SCORE};
-use crate::substrate::{whole_turn_records, ContentResolver};
+use crate::substrate::ContentResolver;
 use crate::summary_tree::SelectionOrigin;
-use crate::turn_layout::TurnRecord;
 
 /// A folder layer, a file layer and a dialogue that carries a 1,000-token
 /// working set, 300 of it for folders.
@@ -132,14 +131,6 @@ impl ContentResolver for WsResolver {
 
     fn turn_score(&self, _turn: TurnKey) -> f32 {
         0.0
-    }
-
-    fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
-        whole_turn_records(self.turn_token_count(turn), record)
-    }
-
-    fn trained_window(&self) -> Option<usize> {
-        None
     }
 
     fn target_is_ingest_self(&self) -> bool {
