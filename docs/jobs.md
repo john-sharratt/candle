@@ -164,6 +164,84 @@ its output is the marker and the trial's log. Only a handle neither the agent
 nor keep's board knows is refused, and the refusal says that nothing of it was
 tried.
 
+### 6.1 A job across its agent's restart
+
+**Status: designed, not built** (2026-11-19).
+
+**What went wrong.** On 2026-11-19, `job_status` on the deploy of 8088a2457 to
+BlackWorld (`deploy:76c3a0f4d39bd9db:MGignEd3tEg`) answered *"the agent refused
+the job (503): upstream_unavailable — a job lives in its agent's process, and
+one lost to a restart is gone: start it again"*. keep was trying the deploy at
+the time, and the trial was proven: BlackWorld runs `5211-8088a2457`. The
+deploy was fine. Only its answer said it was lost, so the caller stopped
+following it and watched `/v1/status` instead. `z9uJAYtBvRw` answered the same
+way on 2026-11-18.
+
+The deploys that were really lost on 2026-11-17 and 2026-11-18 were a different
+fault:
+
+- `VkCZX5VwhGs` answered "nothing of it was tried".
+- `AJWsJ4oXPH8` (`web`) and `hOwLc1aOqPg` (`battlecities`) answered "built, but
+  no trial was started".
+
+Each was a run queued behind a motherd deploy, killed when that deploy's trial
+restarted the agent. They predate 7361debde, which made a planned restart hold
+for a deploy's handoff and park the queue on keep (`docs/build_agent.md`).
+
+**Why it said lost.** One status makes two calls to the agent: the job's view
+(`service::resolve`) and its log (`job::source::deploy::build_log` →
+`build::read`). `resolve` answers a failed view from keep's board. The log read
+turns any failure into `repo_job::lost`, the terminal answer. When the trial's
+restart lands between the two calls, a deploy keep holds is reported gone. The
+same rule makes a 503 final everywhere `lost` is used, `build::standing`
+included. A 503 means the agent's process cannot be reached, which is what a
+restart looks like for a few seconds. Only a 404 means the agent is up and does
+not hold the job. `docs/build_agent.md` §6 already says that while the agent is
+down, `job_status` answers that it is restarting and to ask again. No job tool
+says it.
+
+**The rules:**
+
+1. **An agent that cannot be reached is restarting, not finished.** A 503, a
+   refused connection or a timeout from the agent is `Unreachable`, kept apart
+   from `NotHeld` (404). `Unreachable` is never `lost`.
+   - A build answers `— its agent on <machine> is restarting; asking again`.
+   - In `job_status` that standing is **not ended**: the wait goes on and asks
+     again each round until `wait_s` runs out.
+   - `job_read` and `job_grep` answer the same line and the call that asks
+     again.
+2. **A deploy is answered from keep whenever the agent does not answer.**
+   - Every agent call on a deploy's path falls back to keep's board, as
+     `resolve`'s view does today: the log read, the log grep and the cancel's
+     build stop.
+   - A log read that fails after `resolve` succeeded reads the deploy as having
+     no build (`Deploy::build = None`). Its output is then the marker and the
+     trial's log, as `BUILD_GONE` says.
+   - A deploy is refused as untraced only when the agent answers `NotHeld` and
+     keep's board names no trial of it.
+   - While the agent is `Unreachable` and keep's board names no trial yet, the
+     deploy is `building`, not untraced. The trial is asked for before the
+     agent's process may stop (`docs/build_agent.md` §7), so it is on the board
+     the moment the process can go.
+3. **A run the agent parked is not lost.** After a restart the agent takes its
+   park back from keep (`docs/build_agent.md` §6, §8). A `NotHeld` before the
+   new process has started its queue is answered as `Unreachable`, and the
+   agent says which: its status reports whether its queue has started.
+
+**Tests** (`zend/src/mcp/tools/job/source/`, against a scripted agent and a
+scripted keep):
+
+- A deploy whose view succeeds and whose log read answers 503 reads as
+  `Trying` from keep's board, with `BUILD_GONE`.
+- A deploy whose agent answers 503 and whose board names no trial reads as
+  `building` and is not ended.
+- A deploy with a 404 and no trial is untraced. With a 404 and a trial it is
+  answered from the board.
+- A build whose agent answers 503 is restarting and not ended. `job_status`
+  over it waits on and ends when the agent answers again.
+- A 404 from an agent whose queue has not started is restarting. After it has
+  started, the same 404 is `lost`.
+
 `job_cancel` on a deploy cancels the build while it runs, or asks keep to stop
 the trial, which rolls it back and records the end as cancelled.
 
