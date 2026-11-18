@@ -242,7 +242,11 @@ Everything is in candle. The tests sit beside the code:
 2. **The agent files** lose `slots` **before** the new build starts on each
    machine: an agent file is read with unknown keys refused, so a `slots:` left
    in one stops the new build's start, and one that names `build_hold_mins`
-   stops the old build's. Each leaves `build_hold_mins` out, taking the default,
+   stops the old build's. The file read is the one in the checkout keep runs
+   the service from (`D:\prog\candle` on BlackWorld), which a deploy does not
+   update: that checkout is pulled first. On 2026-11-18 the first deploy of this
+   was rolled back in 2.2 s for a `slots:` still in it. Each leaves
+   `build_hold_mins` out, taking the default,
    until the old build is gone everywhere. `motherd/agent.yaml` (BlackWorld) and
    `motherd/agent.laptop.yaml` (AlienWorld) are in the repository;
    `C:\prog\agent-local.yaml` (WhiteWorld) is edited on the machine, and
