@@ -33,7 +33,7 @@ pub struct WorkingSetConfig {
     pub beta: f32,
     /// Momentum below which a file leaves the map and is no provenance candidate.
     pub min_momentum: f32,
-    /// The most of one reading a slot places ([`Limits::max_file_tokens`]).
+    /// One conversation above this many tokens is never a member.
     pub max_file_tokens: usize,
     /// Workspace paths a dialogue starts out attending to: `repo/dir/` for a
     /// folder (trailing `/`), `repo/path/file` for a file. Each enters

@@ -591,11 +591,12 @@ not cost 48K, only the pages the question reads.
   ranks against other pieces, and its pages' own scores decide which of them
   the slot holds. A piece with no scored page enters at its own score, and
   ties go to the oldest page.
-- **A reading longer than `max_file` is a member.** The working set charges it
-  `max_file_tokens`, the most of it the slot places, not its whole size
-  (`docs/zend_working_set.md` §4.4). It is pooled whole like any piece, and
-  the slot holds its request, its answer and its best pages under the
-  `max_file` cap.
+- **Open: the fill does not carve in production.** Measured 2026-11-18 on
+  BlackWorld, every placed turn of 30 dialogue prompts was whole, never a
+  single record, with the working-set groups past their 64K budget each time
+  (`docs/zend_working_set.md` §4.4). So the caps of step 4 bind in tests and
+  not on the daemon. Until they do, a reading longer than `max_file` cannot be
+  a member.
 - **The reading's own projection is not carved.** While a reading is being
   ingested its conversation is its own target and selected whole
   (`target_is_ingest_self`), as it is today.

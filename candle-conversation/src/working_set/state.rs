@@ -26,10 +26,8 @@ pub struct Limits {
     pub guidance_tokens: usize,
     /// Tokens the locks may hold together, on top of `budget_tokens`.
     pub lock_tokens: usize,
-    /// Tokens of one member a slot places. Where members are emitted whole, a
-    /// longer one is never seeded or admitted; where the fill carves the slot,
-    /// a longer reading is admitted at this cost ([`Candidate::carved_to`]).
-    /// A lock past it is refused everywhere: a lock is placed whole.
+    /// Tokens one member may hold: a member is placed whole, so a longer one
+    /// is never seeded, admitted or locked.
     pub max_file_tokens: usize,
 }
 
@@ -61,20 +59,6 @@ pub struct Candidate {
     /// ([`super::TypeShares::classify`]); `None` for one of no declared type,
     /// which is unbounded.
     pub kind: Option<TypeCap>,
-}
-
-impl Candidate {
-    /// What this candidate costs a slot the fill carves
-    /// (`docs/hit_driven_projection.md` §7.2, §8.2): the fill places at most
-    /// `max_file_tokens` of one reading — its request, its answer and its
-    /// best-scored pages — so a longer reading is charged that much and
-    /// competes for the budget at the size it can take up.
-    pub fn carved_to(self, max_file_tokens: usize) -> Self {
-        Self {
-            tokens: self.tokens.map(|t| t.min(max_file_tokens)),
-            ..self
-        }
-    }
 }
 
 /// One member of the sequence.
@@ -724,34 +708,6 @@ mod tests {
 
     fn read(raws: &[u64]) -> HashMap<TimelineId, f32> {
         raws.iter().map(|&r| (tl(r), 1.0)).collect()
-    }
-
-    /// **A carved reading costs what the slot can place of it**: the 2,000-token
-    /// file is refused whole and admitted carved, at the 1,000-token cap, beside
-    /// a 100-token file in a budget of 1,100; a smaller one keeps its own size.
-    #[test]
-    fn a_carved_reading_is_charged_the_cap() {
-        let mut whole = WorkingSet::default();
-        let refused = whole.seed(&[(tl(8), cand(8))], limits(1_100), 1000.0);
-        assert_eq!(refused, vec![tl(8)], "2,000 whole is past the cap");
-
-        let carved = |raw| cand(raw).carved_to(1_000);
-        assert_eq!(carved(8).tokens, Some(1_000));
-        assert_eq!(carved(1).tokens, Some(100));
-        assert_eq!(
-            cand(9).carved_to(1_000).tokens,
-            None,
-            "no total stays unknown"
-        );
-        let mut ws = WorkingSet::default();
-        let refused = ws.seed(
-            &[(tl(8), carved(8)), (tl(1), carved(1))],
-            limits(1_100),
-            1000.0,
-        );
-        assert!(refused.is_empty(), "{refused:?}");
-        assert_eq!(order(&ws), vec![8, 1]);
-        assert_eq!(ws.tokens(), 1_100);
     }
 
     /// **A file the indexer keeps reading outlasts its fading score**: two

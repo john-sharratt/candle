@@ -3747,19 +3747,6 @@ impl Substrate {
         })
     }
 
-    /// What a seed or a provenance candidate costs a working set on this
-    /// substrate's engine. An engine with a trained window carves the slot
-    /// (`docs/hit_driven_projection.md` §7.2), placing at most
-    /// `max_file_tokens` of one reading, so a longer reading is charged that
-    /// much ([`Candidate::carved_to`]); an engine that emits members whole is
-    /// charged their whole size, and the working set refuses one past the cap.
-    fn provenance_charge(&self, candidate: Candidate, limits: Limits) -> Candidate {
-        match self.trained_window {
-            Some(_) => candidate.carved_to(limits.max_file_tokens),
-            None => candidate,
-        }
-    }
-
     /// Lock `timeline` into `target`'s working set, priced at its recorded
     /// token total. A refusal means the call must run for real.
     pub fn working_set_lock(
@@ -3805,9 +3792,7 @@ impl Substrate {
         let mut admissible = Vec::new();
         for &timeline in candidates {
             match self.working_set_candidate(target, timeline) {
-                Some(candidate) => {
-                    admissible.push((timeline, self.provenance_charge(candidate, limits)))
-                }
+                Some(candidate) => admissible.push((timeline, candidate)),
                 None => refused.push(timeline),
             }
         }
@@ -3877,7 +3862,6 @@ impl Substrate {
         let chain: HashSet<TimelineId> = self.inherited_chain(target).into_iter().collect();
         ws.observe(fresh, beta, min_momentum, limits, max_admits, &|timeline| {
             self.working_set_candidate_beside(target, &chain, timeline)
-                .map(|c| self.provenance_charge(c, limits))
         });
         self.working_sets.insert(target, Arc::new(ws));
     }
@@ -9081,13 +9065,12 @@ mod tests {
         );
     }
 
-    /// **A reading past `max_file_tokens` is a member where the fill carves.**
-    /// With no trained window the engine emits members whole, so a 300-token
-    /// reading against a 200-token cap is refused as a seed and on momentum. With
-    /// one, it is seeded and admitted, charged the 200 it can place; a lock of it
-    /// is refused on either engine, because a lock is placed whole.
+    /// **A reading past `max_file_tokens` is never a member**, on an engine
+    /// with a trained window or without one: a member is placed whole, so a
+    /// 300-token reading against a 200-token cap is refused as a seed, on
+    /// momentum and as a lock alike.
     #[test]
-    fn a_reading_past_the_cap_is_charged_the_cap_where_the_fill_carves() {
+    fn a_reading_past_the_cap_is_never_a_member() {
         let capped = Limits {
             max_file_tokens: 200,
             ..ws_limits(1000)
@@ -9110,26 +9093,22 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        let (mut whole, target, reads) = working_set_fixture(2, 300);
-        assert_eq!(
-            whole.working_set_seed(target, &[reads[0]], capped, 1000.0),
-            vec![reads[0]]
-        );
-        observe(&mut whole, target, reads[1]);
-        assert!(members(&whole, target).is_empty());
-
-        let (mut carved, target, reads) = working_set_fixture(3, 300);
-        carved.set_trained_window(Some(262_144));
-        assert!(carved
-            .working_set_seed(target, &[reads[0]], capped, 1000.0)
-            .is_empty());
-        observe(&mut carved, target, reads[1]);
-        assert_eq!(members(&carved, target), vec![reads[0], reads[1]]);
-        assert_eq!(carved.working_set(target).unwrap().tokens(), 400);
-        assert_eq!(
-            carved.working_set_lock(target, reads[2], capped),
-            Err(Refusal::TooLarge)
-        );
+        for trained in [None, Some(262_144)] {
+            let (mut sub, target, reads) = working_set_fixture(3, 300);
+            sub.set_trained_window(trained);
+            assert_eq!(
+                sub.working_set_seed(target, &[reads[0]], capped, 1000.0),
+                vec![reads[0]],
+                "{trained:?}"
+            );
+            observe(&mut sub, target, reads[1]);
+            assert!(members(&sub, target).is_empty(), "{trained:?}");
+            assert_eq!(
+                sub.working_set_lock(target, reads[2], capped),
+                Err(Refusal::TooLarge),
+                "{trained:?}"
+            );
+        }
     }
 
     /// A link of the dialogue's own inherited chain is projected as its opening
