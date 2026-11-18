@@ -19,7 +19,7 @@ use crate::entry::{Entry, Item};
 use crate::fold::Fold;
 use crate::period::Period;
 use crate::record::DraftRecord;
-use crate::section::{entry_section, JournalPrompt, Kept};
+use crate::section::{entry_section, JournalPrompt, Kept, Step};
 use crate::span::{Span, SpanTurn};
 use crate::style::Style;
 
@@ -315,7 +315,13 @@ impl Journal {
 
     /// The journal as a conversation should hold it now.
     pub fn prompt(&self, style: &Style) -> JournalPrompt {
-        JournalPrompt::of(&self.snapshot(), style)
+        self.prompt_with_steps(&[], style)
+    }
+
+    /// [`Self::prompt`] with the steps of the request in progress
+    /// ([`JournalPrompt::with_steps`]).
+    pub fn prompt_with_steps(&self, steps: &[Step], style: &Style) -> JournalPrompt {
+        JournalPrompt::with_steps(&self.snapshot(), steps, style)
             .without(self.removed.iter().map(|id| entry_section(*id)).collect())
     }
 

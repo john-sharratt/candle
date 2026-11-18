@@ -174,7 +174,15 @@ pub const CODING: Style = Style {
     // something else. The cited turns are what a claim rests on.
     facts: false,
     open_heading: "Still open:",
-    nothing_open: "Still open: nothing.",
+    // Said only when something is: the end line below says where the journal
+    // ends (`docs/request_steps.md` §2.2).
+    nothing_open: None,
+    history_heading: Some("Journal history:"),
+    current_heading: Some(
+        "Current request — the notes you have made in the request you are working on, \
+         in order:",
+    ),
+    step: "Step",
     end: "That is the whole of your journal. Anything else you know of this conversation comes \
 from its turns or from what was retrieved for it, not from your journal.",
     clock,
@@ -317,6 +325,8 @@ mod tests {
         assert_eq!(style_for("c-123").heard, "User said:");
     }
 
+    /// **"Still open" is said only when something is**; the end line is said
+    /// either way (`docs/request_steps.md` §2.2).
     #[test]
     fn the_journal_ends_with_what_is_still_open_and_where_it_stops() {
         let open = [Item {
@@ -329,10 +339,7 @@ mod tests {
             render_open(&open, &CODING),
             format!("Still open:\n#4 Rerun the gate\n\n{end}")
         );
-        assert_eq!(
-            render_open(&[], &CODING),
-            format!("Still open: nothing.\n\n{end}")
-        );
+        assert_eq!(render_open(&[], &CODING), end);
     }
 
     #[test]

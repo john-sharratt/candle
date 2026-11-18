@@ -56,9 +56,19 @@ pub struct Style {
     pub facts: bool,
     /// First line of the section the open items are carried in.
     pub open_heading: &'static str,
-    /// That section when nothing is open — said, not left out, so a reader
-    /// asked what is open does not fill the silence in.
-    pub nothing_open: &'static str,
+    /// That section when nothing is open, or `None` to leave it out. A
+    /// character says it, so a reader asked what is open does not fill the
+    /// silence in; a coding journal leaves it out, and its end line says
+    /// where the journal ends (`docs/request_steps.md` §2.2).
+    pub nothing_open: Option<&'static str>,
+    /// The line above a journal's entries, or `None` for no heading: a coding
+    /// journal reads as its history, then the request in progress.
+    pub history_heading: Option<&'static str>,
+    /// The line above the steps of the request in progress, or `None` for a
+    /// journal that carries no steps.
+    pub current_heading: Option<&'static str>,
+    /// What a step's line opens with: `"Step"` makes `Step 3 — …`.
+    pub step: &'static str,
     /// The journal's last line: where it ends, so what the reader remembers
     /// from elsewhere is not taken for something it wrote down.
     pub end: &'static str,
@@ -151,7 +161,10 @@ pub(crate) mod testing {
         rests_on: " (per",
         facts: true,
         open_heading: "Open:",
-        nothing_open: "Open: nothing.",
+        nothing_open: Some("Open: nothing."),
+        history_heading: None,
+        current_heading: None,
+        step: "Step",
         end: "End.",
         clock,
         stretch,

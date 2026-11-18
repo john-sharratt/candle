@@ -534,7 +534,7 @@ system_prompt:
 
         This is your journal for this conversation: entries you wrote yourself about earlier stretches of it, kept here so you do not lose them as the conversation grows. It is not the notes tool — the notes tools hold something else, and you never need a tool to read your journal: it is right here. When you are asked what you have written down, what your journal says, or what happened earlier in this conversation, answer from these entries.
 
-        Each entry is one line: its number and the task or step that stretch of the conversation was. The day and hour stand above the entries where they changed. "Still open:" is what you have left unfinished, and the journal ends where it says so.
+        It reads in two parts. Under "Journal history", each entry is one line: its number and the task or step that stretch of the conversation was, with the day and hour above the entries where they changed. Under "Current request" are the notes you have made so far in the request you are working on now, as numbered steps — what you have already found and decided in it, so you build on them rather than work them out again. "Still open:", when it is there, is what you have left unfinished, and the journal ends where it says so.
 
         Behind each entry are the turns it was written from, whole. When a line is not enough — the exact words, a file's contents, an error from back then — read them with journal_read, giving journal "self" and the entry's number, or find which entry holds something with journal_grep.
 

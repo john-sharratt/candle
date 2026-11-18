@@ -4058,13 +4058,19 @@ impl Substrate {
     /// is a new user message — a finished request's reasoning is not carried
     /// into the next one (`docs/thinking_span_projection.md` §6.3).
     pub fn reasoning_turns(&self, timeline: TimelineId) -> Vec<TurnIndex> {
+        let request = self.request_turns(timeline);
+        request[request.len().saturating_sub(REASONING_ROUNDS)..].to_vec()
+    }
+
+    /// The `Normal` turns of the request `timeline`'s next turn continues, in
+    /// order: the request's own turn first, then each of its rounds. Empty
+    /// when the next turn opens a request of its own. What the request's steps
+    /// are read again from after a restart (`docs/request_steps.md` §2.5).
+    pub fn request_turns(&self, timeline: TimelineId) -> Vec<TurnIndex> {
         let normals = self.normals_of(timeline);
         let couplings = over_normals(&self.couplings_of(timeline), &normals);
         let request = continued_exchange(&couplings, normals.len());
-        let from = request
-            .start
-            .max(request.end.saturating_sub(REASONING_ROUNDS));
-        normals[from..request.end].to_vec()
+        normals[request].to_vec()
     }
 
     /// `timeline`'s `Normal` turns in order: every turn but its summary nodes.

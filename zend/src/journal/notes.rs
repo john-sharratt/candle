@@ -45,9 +45,51 @@ pub fn marked(text: &str) -> String {
         .into_owned()
 }
 
+/// The notes `text` writes to the conversation's own journal, in order: each
+/// `journal_note` call's `text` whose `journal` is left out or `"self"`. A note
+/// to a memory journal is a memory write, not a step of the request
+/// (`docs/request_steps.md` §2.1).
+pub fn own_notes(text: &str) -> Vec<String> {
+    call_blocks()
+        .find_iter(text)
+        .flat_map(|block| extract_tool_calls(block.as_str()))
+        .filter(|call| call.name == JOURNAL_NOTE_TOOL)
+        .filter(|call| {
+            call.arguments
+                .get("journal")
+                .and_then(|j| j.as_str())
+                .is_none_or(|j| j == "self")
+        })
+        .filter_map(|call| {
+            call.arguments
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(|t| t.trim().to_string())
+        })
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A reply's own notes are its steps, in order**: in both call
+    /// syntaxes, `journal` left out or `"self"`. A note to a memory journal,
+    /// another call and an empty note are none of them.
+    #[test]
+    fn a_replys_own_notes_are_read_in_order() {
+        let text = "<tool_call>\n{\"name\": \"journal_note\", \"arguments\": {\"text\": \" First \
+                    finding. \"}}\n</tool_call>\n<tool_call>\n{\"name\": \"journal_note\", \
+                    \"arguments\": {\"text\": \"To memory.\", \"journal\": \"~/notes\"}}\n\
+                    </tool_call>\n<tool_call>\n<function=journal_note>\n<parameter=text>\nSecond \
+                    finding.\n</parameter>\n<parameter=journal>\nself\n</parameter>\n</function>\n\
+                    </tool_call>\n<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \
+                    \"a.rs\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"journal_note\", \
+                    \"arguments\": {\"text\": \"  \"}}\n</tool_call>";
+        assert_eq!(own_notes(text), ["First finding.", "Second finding."]);
+        assert!(own_notes("no calls at all").is_empty());
+    }
 
     /// **A note call reads as the note**, in both call syntaxes the models
     /// write, and every other call stays as written.

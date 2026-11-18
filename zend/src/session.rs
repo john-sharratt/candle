@@ -122,7 +122,7 @@ use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_cancel;
 use crate::ingest_lease;
 use crate::journal::desk::{Asking, Compile, Record, ZendDesk, FOLD_TOKENS, WRITE_TOKENS};
-use crate::journal::notes::JOURNAL_NOTE_TOOL;
+use crate::journal::notes::{own_notes, JOURNAL_NOTE_TOOL};
 use crate::journal::opening::OPENING_SEAL_WAIT;
 use crate::journal::record::{kept_in, metadata_of, KEY as JOURNAL_KEY};
 use crate::journal::registry::{Journals, Open};
@@ -4429,6 +4429,20 @@ fn run_inference_stream(
                     // Each round seals one turn, so the request opened at the
                     // turn `iteration` rounds back — a resumed round's too.
                     let rounds = u32::try_from(iteration).unwrap_or(u32::MAX);
+                    // The reply's notes are the request's next steps, carried
+                    // from the next round's head; a final reply clears them
+                    // for the entry that replaces them (`journal::steps`).
+                    state
+                        .journals
+                        .of(&conv_id, || journal_record(&state, timeline))
+                        .lock()
+                        .unwrap()
+                        .steps_mut()
+                        .sealed(
+                            newest.saturating_sub(rounds),
+                            own_notes(&resp.text),
+                            is_final,
+                        );
                     let cadence = Cadence::Due {
                         newest,
                         selected: selected_turns.as_deref(),
@@ -4865,6 +4879,15 @@ async fn carry_journal(
         .journals
         .of(conv_id, || journal_record(state, timeline));
     let opened = open_journal(state, timeline, &journal);
+    // A journal this process has not seen a round of yet — after a restart, a
+    // takeover or a resume — reads the request's steps from its turns, once.
+    if !journal.lock().unwrap().steps().known() {
+        let request = state
+            .engine
+            .request_replies(timeline)
+            .map(|(from, replies)| (from.0, replies.iter().map(|r| own_notes(r)).collect()));
+        journal.lock().unwrap().steps_mut().rebuild(request);
+    }
     let (prompt, sections) = journal_sections(state, conv_id, &journal);
     let wants: Vec<Want<'_>> = sections.iter().map(section_want).collect();
     let lineage_sweep = lineage::sweep_names();
@@ -4927,7 +4950,8 @@ fn journal_sections(
 ) -> (JournalPrompt, Vec<Section>) {
     let prompt = {
         let held = journal.lock().unwrap();
-        held.journal().prompt(held.style())
+        held.journal()
+            .prompt_with_steps(&held.steps().steps(), held.style())
     };
     // A conversation owned through `/mcp` carries its ancestors' journals
     // ahead of its own, and the reader's line after it (`mcp::lineage`).

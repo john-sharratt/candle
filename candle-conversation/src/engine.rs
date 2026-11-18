@@ -1430,6 +1430,22 @@ impl ConversationEngine {
             .collect()
     }
 
+    /// The request `timeline`'s next turn continues: its first turn and each of
+    /// its turns' assistant text, in order. `None` when the next turn opens a
+    /// request of its own.
+    pub fn request_replies(&self, timeline: TimelineId) -> Option<(TurnIndex, Vec<String>)> {
+        let view = self.conversation.read();
+        let turns = view.request_turns(timeline);
+        let first = *turns.first()?;
+        Some((
+            first,
+            turns
+                .into_iter()
+                .map(|idx| view.assistant_text_of(timeline, idx))
+                .collect(),
+        ))
+    }
+
     /// `timeline`'s recorded token total, when one was recorded.
     pub fn timeline_token_total(&self, timeline: TimelineId) -> usize {
         self.conversation.read().timeline_token_total(timeline)

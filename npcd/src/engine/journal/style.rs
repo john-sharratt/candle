@@ -139,7 +139,11 @@ pub const NPC: Style = Style {
     // what a tower is doing — which the world reads, so a fact is checked.
     facts: true,
     open_heading: "What you have left open:",
-    nothing_open: "What you have left open: nothing.",
+    nothing_open: Some("What you have left open: nothing."),
+    // A character's journal is one list, and it keeps no request steps.
+    history_heading: None,
+    current_heading: None,
+    step: "Step",
     end: "That is the whole of your journal.",
     clock,
     stretch,

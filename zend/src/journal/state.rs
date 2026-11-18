@@ -31,6 +31,7 @@ use journal_core::style::Style;
 use journal_core::workflow::Skip;
 
 use crate::journal::origin::{reply_part, turn_of, user_part};
+use crate::journal::steps::RequestSteps;
 use crate::journal::style::CODING;
 
 /// Sealed turns of one request since the journal last looked after which a
@@ -72,6 +73,8 @@ pub struct SessionJournal {
     /// A request finished while a draft ran: its entry starts when that draft
     /// ends.
     owed: bool,
+    /// The steps of the request in progress (`super::steps`).
+    steps: RequestSteps,
 }
 
 impl Default for SessionJournal {
@@ -98,7 +101,17 @@ impl SessionJournal {
             fold_failed_at: None,
             style: &CODING,
             owed: false,
+            steps: RequestSteps::default(),
         }
+    }
+
+    /// The steps of the request in progress.
+    pub fn steps(&self) -> &RequestSteps {
+        &self.steps
+    }
+
+    pub fn steps_mut(&mut self) -> &mut RequestSteps {
+        &mut self.steps
     }
 
     /// Rebuild from the record the conversation's metadata held. Part numbers

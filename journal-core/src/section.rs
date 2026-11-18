@@ -31,24 +31,59 @@ pub const CLOSE_SECTION: &str = "journal/close";
 /// Conversation metadata: the kept entries and open items, as JSON.
 pub const META_KEPT: &str = "journal.kept";
 
+/// The heading above a journal's entries, when its style has one.
+pub const HISTORY_SECTION: &str = "journal/history";
+
+/// The heading above the steps of the request in progress.
+pub const CURRENT_SECTION: &str = "journal/current";
+
+/// The most of a step's note its line carries; a longer one is cut with `…`.
+pub const STEP_CHARS: usize = 400;
+
 /// The section entry `id` is submitted under.
 pub fn entry_section(id: u64) -> String {
     format!("{JOURNAL}/{id}")
 }
 
-/// The journal's last section: the open items — or that nothing is open — and
-/// the line that says the journal ends there.
+/// The section step `n` of the request in progress is submitted under.
+pub fn step_section(n: u32) -> String {
+    format!("{JOURNAL}/step/{n}")
+}
+
+/// One step of the request in progress: a note the writer made in it, by its
+/// number within the request (`docs/request_steps.md` §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub n: u32,
+    pub text: String,
+}
+
+/// Step `step`'s line: its number and its note, clipped to [`STEP_CHARS`].
+pub fn render_step(step: &Step, style: &Style) -> String {
+    let text = step.text.trim();
+    let clipped = match text.char_indices().nth(STEP_CHARS) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_string(),
+    };
+    format!("{} {} — {clipped}", style.step, step.n)
+}
+
+/// The journal's last section: the open items — or, in a style that says so,
+/// that nothing is open — and the line that says the journal ends there.
 pub fn render_open(items: &[Item], style: &Style) -> String {
     let open = if items.is_empty() {
-        style.nothing_open.to_string()
+        style.nothing_open.map(str::to_string)
     } else {
         let lines: Vec<String> = items
             .iter()
             .map(|i| format!("#{} {}", i.id, i.text.trim()))
             .collect();
-        format!("{}\n{}", style.open_heading, lines.join("\n"))
+        Some(format!("{}\n{}", style.open_heading, lines.join("\n")))
     };
-    format!("{open}\n\n{}", style.end)
+    match open {
+        Some(open) => format!("{open}\n\n{}", style.end),
+        None => style.end.to_string(),
+    }
 }
 
 /// What a journal keeps across a restart.
@@ -97,16 +132,41 @@ impl JournalPrompt {
     /// The sections for `kept`, whose entries are the newest ones, rendered in
     /// `style`, each dated against the one above it.
     pub fn of(kept: &Kept, style: &Style) -> Self {
-        let mut sections: Vec<Section> = kept
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| Section {
-                name: entry_section(e.id),
-                text: e.render(i.checked_sub(1).map(|b| &kept.entries[b]), style),
-            })
-            .collect();
-        if !(kept.entries.is_empty() && kept.open.is_empty()) {
+        Self::with_steps(kept, &[], style)
+    }
+
+    /// [`Self::of`] with the steps of the request in progress: under the
+    /// style's current heading, after the entries and before the closing
+    /// section (`docs/request_steps.md` §2.2). A style with no current
+    /// heading carries no steps. Steps with no entry still close the journal,
+    /// so it says where it ends.
+    pub fn with_steps(kept: &Kept, steps: &[Step], style: &Style) -> Self {
+        let steps = match style.current_heading {
+            Some(_) => steps,
+            None => &[],
+        };
+        let mut sections: Vec<Section> = Vec::new();
+        if let (Some(heading), false) = (style.history_heading, kept.entries.is_empty()) {
+            sections.push(Section {
+                name: HISTORY_SECTION.to_string(),
+                text: heading.to_string(),
+            });
+        }
+        sections.extend(kept.entries.iter().enumerate().map(|(i, e)| Section {
+            name: entry_section(e.id),
+            text: e.render(i.checked_sub(1).map(|b| &kept.entries[b]), style),
+        }));
+        if let (Some(heading), false) = (style.current_heading, steps.is_empty()) {
+            sections.push(Section {
+                name: CURRENT_SECTION.to_string(),
+                text: heading.to_string(),
+            });
+            sections.extend(steps.iter().map(|s| Section {
+                name: step_section(s.n),
+                text: render_step(s, style),
+            }));
+        }
+        if !(kept.entries.is_empty() && kept.open.is_empty() && steps.is_empty()) {
             sections.push(Section {
                 name: CLOSE_SECTION.to_string(),
                 text: render_open(&kept.open, style),
@@ -208,6 +268,95 @@ mod tests {
         let names: Vec<&str> = p.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["journal/1", "journal/close"]);
         assert_eq!(p.sections[1].text, "Open: nothing.\n\nEnd.");
+    }
+
+    /// A coding journal's style: headed history and steps, and nothing said
+    /// when nothing is open.
+    const HEADED: Style = Style {
+        nothing_open: None,
+        history_heading: Some("History:"),
+        current_heading: Some("Now:"),
+        ..PLAIN
+    };
+
+    fn step(n: u32, text: &str) -> Step {
+        Step {
+            n,
+            text: text.into(),
+        }
+    }
+
+    /// **The journal reads as its history, then the request in progress, then
+    /// what is open**: the history heading, each entry, the current heading,
+    /// each step, the closing section — in that order and that text.
+    #[test]
+    fn a_headed_journal_reads_history_then_the_request_then_its_close() {
+        let k = kept(&[3], vec![item(2, "who holds it?")]);
+        let p = JournalPrompt::with_steps(
+            &k,
+            &[
+                step(1, "The flag is read in three places."),
+                step(2, " Only one gates. "),
+            ],
+            &HEADED,
+        );
+        let names: Vec<&str> = p.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "journal/history",
+                "journal/3",
+                "journal/current",
+                "journal/step/1",
+                "journal/step/2",
+                "journal/close"
+            ]
+        );
+        let texts: Vec<&str> = p.sections.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts[0], "History:");
+        assert_eq!(texts[2], "Now:");
+        assert_eq!(texts[3], "Step 1 — The flag is read in three places.");
+        assert_eq!(texts[4], "Step 2 — Only one gates.");
+        assert_eq!(texts[5], "Open:\n#2 who holds it?\n\nEnd.");
+    }
+
+    /// **"Open" shows only when something is open**: with nothing open the
+    /// closing section is the end line alone. No steps, no current heading.
+    #[test]
+    fn nothing_open_leaves_the_end_line_alone_in_a_coding_journal() {
+        let p = JournalPrompt::with_steps(&kept(&[1], vec![]), &[], &HEADED);
+        let names: Vec<&str> = p.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["journal/history", "journal/1", "journal/close"]);
+        assert_eq!(p.sections[2].text, "End.");
+    }
+
+    /// Steps with no entry yet: no history heading, and the journal still
+    /// closes so it says where it ends. A style with no current heading
+    /// carries none of them.
+    #[test]
+    fn steps_alone_still_close_the_journal_and_need_a_heading() {
+        let k = kept(&[], vec![]);
+        let p = JournalPrompt::with_steps(&k, &[step(1, "x")], &HEADED);
+        let names: Vec<&str> = p.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["journal/current", "journal/step/1", "journal/close"]
+        );
+        assert!(JournalPrompt::with_steps(&k, &[step(1, "x")], &PLAIN).is_empty());
+    }
+
+    /// A step past [`STEP_CHARS`] is cut at that many characters, whole
+    /// characters, with `…`; one within it is kept whole.
+    #[test]
+    fn a_long_step_is_clipped_with_an_ellipsis() {
+        let long = "é".repeat(STEP_CHARS + 5);
+        let line = render_step(&step(7, &long), &HEADED);
+        assert_eq!(line, format!("Step 7 — {}…", "é".repeat(STEP_CHARS)));
+        let fits = "a".repeat(STEP_CHARS);
+        assert_eq!(
+            render_step(&step(1, &fits), &HEADED),
+            format!("Step 1 — {fits}")
+        );
     }
 
     #[test]

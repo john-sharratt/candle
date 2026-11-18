@@ -39,6 +39,7 @@ pub mod record;
 pub mod registry;
 pub mod shelf;
 pub mod state;
+pub mod steps;
 pub mod style;
 pub mod text;
 pub mod world;
