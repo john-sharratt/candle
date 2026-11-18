@@ -50,6 +50,9 @@ pub(super) struct PoolRefresh {
     pub fetch_us: u64,
     /// Of `read_us`, placing the sampled layers' pages on the device.
     pub place_us: u64,
+    /// Of `walked`, the turns whose pages came off the log: held by nothing,
+    /// the ring included.
+    pub cold: usize,
     /// Of `admitted`, pieces taken up from lingering, their pages still held.
     pub revived: usize,
     /// Pieces lingering after it (`pool_linger`).
@@ -179,14 +182,14 @@ impl Scheduler {
                     }
                 };
                 stats.read_bytes += pages.bytes().len();
-                // Held past this refresh, so a piece that leaves the pool and
-                // comes back reads it from memory (`pool_read_ring`). Only a
-                // page just read off the log, whose one owner is this read: one
-                // found held — by the ring, a slot or the substrate — is held
-                // already.
+                // A page whose one owner is this read came off the log.
                 if Arc::strong_count(&pages) == 1 {
-                    self.pool_read_ring.keep(&pages);
+                    stats.cold += 1;
                 }
+                // Held past this refresh as the ring's newest, so a piece that
+                // leaves the pool and comes back reads it from memory
+                // (`pool_read_ring`).
+                self.pool_read_ring.keep(&pages);
                 let Ok(framed) = index_pages::decode(pages.bytes()) else {
                     whole = false;
                     break;
@@ -274,6 +277,7 @@ impl Scheduler {
             admitted = stats.admitted,
             dropped = stats.dropped,
             index_read_turns = stats.walked,
+            index_read_cold = stats.cold,
             index_read_bytes = stats.read_bytes,
             index_read_us = stats.read_us,
             fetch_us = stats.fetch_us,

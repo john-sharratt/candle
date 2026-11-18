@@ -10,8 +10,11 @@
 //!
 //! A page read is found again without the log while any holder keeps its
 //! `Arc` ([`crate::projection`]'s held index pages). The ring keeps the pages
-//! the pool read last, newest last, up to a byte budget, so a piece that comes
-//! back within that reach is read from memory.
+//! the pool used last, least recently used first out, up to a byte budget, so
+//! a piece that comes back within that reach is read from memory. **Used, not
+//! read:** a page the pool finds in memory moves to the newest end, so the
+//! pieces it keeps coming back to stay, where a ring ordered by when a page was
+//! read off the log let them go first.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -38,11 +41,18 @@ impl PoolReadRing {
         }
     }
 
-    /// Keep `page`, letting the oldest go past the budget. A page larger
-    /// than the whole budget is not kept.
+    /// `page` was used: keep it as the newest, moving it there if the ring
+    /// holds it, and let the least recently used go past the budget. A page
+    /// larger than the whole budget is not kept.
     pub fn keep(&mut self, page: &Arc<StoredPages>) {
         let size = page.bytes().len();
         if size > self.cap {
+            return;
+        }
+        if let Some(at) = self.pages.iter().position(|p| Arc::ptr_eq(p, page)) {
+            if let Some(held) = self.pages.remove(at) {
+                self.pages.push_back(held);
+            }
             return;
         }
         self.pages.push_back(Arc::clone(page));
@@ -87,6 +97,24 @@ mod tests {
         assert_eq!((ring.len(), ring.bytes()), (2, 80), "the oldest went");
         assert_eq!(Arc::strong_count(&a), 1, "a is held only here");
         assert_eq!(Arc::strong_count(&b), 2);
+        assert_eq!(Arc::strong_count(&c), 2);
+    }
+
+    /// **A page used again moves to the newest end**, so the next to go is
+    /// the one least recently used, not the one read off the log first; using
+    /// it again does not hold it twice.
+    #[test]
+    fn a_page_used_again_is_the_last_to_go() {
+        let mut ring = PoolReadRing::new(100);
+        let (a, b, c) = (page(40), page(40), page(40));
+        ring.keep(&a);
+        ring.keep(&b);
+        ring.keep(&a);
+        assert_eq!((ring.len(), ring.bytes()), (2, 80));
+        assert_eq!(Arc::strong_count(&a), 2, "held once");
+        ring.keep(&c);
+        assert_eq!(Arc::strong_count(&b), 1, "b went: a was used after it");
+        assert_eq!(Arc::strong_count(&a), 2);
         assert_eq!(Arc::strong_count(&c), 2);
     }
 
