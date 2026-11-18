@@ -173,6 +173,14 @@ fn close_under_exchange(
 /// the configuration is fixed for the process, so it is said once.
 static SLOT_EXPANDED_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Whether a dialogue with a working set has been projected without a fill —
+/// its members placed whole, no cap binding — once for the process.
+static UNFILLED_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the fill has priced a turn holding tokens at nothing — a turn whose
+/// records have no edge, which no cap can bind — once for the process.
+static UNPRICED_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Emit a selected candidate: the exchange's turns in ascending order, right
 /// where the representative sat. Selection ranks representatives; this is the
 /// one place they expand back into the turns the projection carries.
@@ -2104,6 +2112,13 @@ pub fn run_with_sink<R: ContentResolver>(
     // Working-set groups emit what Step 4b picked, verbatim and untrimmed —
     // unless the dialogue is filled, which places them below.
     if fill_target.is_none() {
+        if declares_working_set && !UNFILLED_REPORTED.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                layer = ?target.layer,
+                "a dialogue with a working set is projected without a fill: the engine reports \
+                 no trained window, so its members are placed whole"
+            );
+        }
         for gs in group_states.iter().filter(|gs| !flexed(gs)) {
             for (key, _) in &gs.selected {
                 push_exchange(&mut final_selected, gs.schema.id, &gs.members, *key);
@@ -2353,7 +2368,22 @@ pub fn run_with_sink<R: ContentResolver>(
         let plan = dialogue_fill::plan(
             &slot,
             |k| resolver.turn_score(k),
-            |k, r| resolver.record_tokens(k, r),
+            |k, r| {
+                let tokens = resolver.record_tokens(k, r);
+                if r == TurnRecord::Assistant && tokens == 0 {
+                    let whole = resolver.turn_token_count(k);
+                    if whole > 0 && !UNPRICED_WARNED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            timeline = k.timeline.raw(),
+                            turn = k.index.0,
+                            whole,
+                            "the fill prices a turn holding tokens at nothing: its records \
+                             have no edge, so no cap binds on it and it is placed whole"
+                        );
+                    }
+                }
+                tokens
+            },
         );
         let mut push = |gid: GroupId, (key, record): (TurnKey, Option<TurnRecord>)| {
             final_selected.push((gid, key));
