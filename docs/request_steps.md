@@ -1,9 +1,21 @@
 # A request's steps, and the request turn that anchors them
 
-**Status: designed, not built.** Settled with the user on 2026-11-19. This
-document is authoritative over the steps section of a dialogue's journal and
-over the projection's rule that a request's own turn is never windowed out. When
-it is built, `docs/zend_journal.md` §4 and §5.2 take its summary.
+**Status: built** (2026-11-19). Settled with the user the same day:
+
+- `journal-core/src/section.rs`: `Step`, `JournalPrompt::with_steps`, and the
+  headings;
+- `zend/src/journal/steps.rs`: `RequestSteps`;
+- `zend/src/journal/notes.rs`: `own_notes`;
+- the round's seal and `carry_journal` in `zend/src/session.rs`.
+
+This document is authoritative over the steps section of a dialogue's journal
+and over the projection's rule that a request's own turn is never windowed out.
+`docs/zend_journal.md` §4 and §5.2 defer to it.
+
+§3's request-turn rule holds by the two rules it names. The end-to-end
+projection test it calls for is not yet written: it needs a projection fixture
+with 64 tool rounds of real turn sizes, which the projection tests do not
+build today.
 
 ## 1. Why
 
