@@ -8,6 +8,7 @@ use super::admission_split::AdmitPart;
 use super::admit;
 use super::admit_ground::{joins_a_full_forward, AdmitPass};
 use super::band::rank;
+use super::compaction_split::TenantPart;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
 use super::creep_slice::{slice_target, time_bounded_layers, window_end};
 use super::first_sample::{
@@ -1388,10 +1389,14 @@ impl Scheduler {
     /// beneath it, so a tenant that cannot move is not asked again every wave.
     pub(super) fn pack_span_tenants_judged(&mut self, shape: PoolShape) {
         self.compact_span_tenants();
+        let t_judge = Instant::now();
         let after = self
             .session
             .kv_region_stats()
             .map_or(shape.frontier, |s| s.live_watermark);
+        self.wave_stats
+            .compaction_split
+            .tenant_part(TenantPart::Judge, t_judge.elapsed());
         self.wave_stats
             .compaction_split
             .tenants_lowered(shape.frontier, after);
@@ -1449,10 +1454,14 @@ impl Scheduler {
         // copy and repoints the one store that holds it, so it needs no holder sweep
         // and no quiesce; a failure part-way leaves every store consistent (each move
         // is whole) and is reported loudly rather than retried silently.
+        let t_recurrent = Instant::now();
         let recurrent = {
             let _g = super::profile::span("compact:recurrent");
             self.model.compact_recurrent(MAX_STATE_MOVES)
         };
+        self.wave_stats
+            .compaction_split
+            .tenant_part(TenantPart::Recurrent, t_recurrent.elapsed());
         match recurrent {
             // Each compaction pass is routine housekeeping between forwards —
             // every few seconds under pressure — so its report is debug; a
@@ -1483,6 +1492,7 @@ impl Scheduler {
         // ground under it and leave its blocks holding the frontier. Its blocks
         // move like any tenant's: the one in flight and a paused one, which are
         // every creep arena there is, between forwards (`docs/wave_step.md` §3).
+        let t_creep = Instant::now();
         let creeps = {
             let _g = super::profile::span("compact:creep");
             let held = self.wave_prefill_residual.iter_mut().chain(
@@ -1492,6 +1502,9 @@ impl Scheduler {
             );
             compact_creeps(held, MAX_CREEP_MOVES)
         };
+        self.wave_stats
+            .compaction_split
+            .tenant_part(TenantPart::Creep, t_creep.elapsed());
         match creeps {
             Ok(r) if r.planned > 0 => {
                 tracing::debug!(
@@ -1522,10 +1535,14 @@ impl Scheduler {
         // Pages a scan is reading are skipped, so this cannot move ground out from
         // under an in-flight launch.
         if let Some(arena) = self.gallery_arena.as_ref() {
+            let t_gallery = Instant::now();
             let gallery = {
                 let _g = super::profile::span("compact:gallery");
                 arena.compact(MAX_GALLERY_MOVES)
             };
+            self.wave_stats
+                .compaction_split
+                .tenant_part(TenantPart::Gallery, t_gallery.elapsed());
             match gallery {
                 Ok(r) if r.planned > 0 => {
                     tracing::debug!(

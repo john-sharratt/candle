@@ -2536,9 +2536,47 @@ mod tests {
         }];
         let probe = vec![sig(1 << 32), sig((3u64 << 32) + 5), sig(0xFEED)];
 
+        // A quiet turn, uploaded first so it sits at the foot of the first
+        // arena, below every hole the pass fills: no move touches it.
+        let quiet_turn: Vec<WideQSig> = (0..32u64).map(|k| sig((99u64 << 32) + k)).collect();
+        let quiet_sid = turn_stream_id(39, 0);
+        let quiet = vec![PagedSegment {
+            windows: vec![PagedWindow {
+                sid: quiet_sid,
+                fingerprint: 99,
+                turn: (&quiet_turn).into(),
+                start: 0,
+                end: quiet_turn.len(),
+                case: 0,
+            }],
+            n_cases: 1,
+            holder: Holder::Shared,
+            groups: GroupSet::all(3),
+            keep: Keep::All,
+            law: VoteLaw::SINGLE,
+        }];
+        arena
+            .scan_weighted(&quiet, &[probe.as_slice()], &[])
+            .unwrap();
+
         let before = arena
             .scan_weighted(&segments, &[probe.as_slice()], &[])
             .unwrap();
+        // Scanned again, the quiet index is checked against the uploads since
+        // it was built, and trusted from then on.
+        arena
+            .scan_weighted(&quiet, &[probe.as_slice()], &[])
+            .unwrap();
+        let stale_of = |sid| {
+            arena
+                .indexes
+                .load()
+                .iter()
+                .filter(|(_, idx)| idx.members.contains(&sid))
+                .map(|(_, idx)| idx.hold.stale())
+                .collect::<Vec<bool>>()
+        };
+        assert_eq!(stale_of(quiet_sid), vec![false], "checked once rescanned");
 
         // Scatter: drop the first arena's first turns, leaving more holes under
         // live pages than the second arena holds, then pack. `scan_weighted`
@@ -2547,6 +2585,17 @@ mod tests {
         arena.drop_turns(&dropped);
         let report = arena.compact(0).unwrap();
         assert!(report.moved > 0, "nothing moved, so nothing is proven");
+
+        // **The pass named only the turns it moved.** The quiet turn's index is
+        // still trusted, so its next scan does not walk its turns; the moved
+        // turns' index is marked, so its next scan does.
+        assert_eq!(stale_of(quiet_sid), vec![false], "an untouched index");
+        assert!(
+            stale_of(turn_stream_id(40 + turns.len() as u64 - 1, 0))
+                .iter()
+                .all(|&s| s),
+            "the moved turns' index is marked"
+        );
 
         // The dropped turns rebuild on demand; the survivors are read at their new
         // addresses. Either way every score must reproduce exactly.

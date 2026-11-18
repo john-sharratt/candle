@@ -1070,6 +1070,17 @@ impl GalleryArena {
             by_src.extend(moves.into_iter().map(|m| (m.src, m.dst)));
         }
         let planned = by_src.len();
+        // **A pass with no moves changes nothing**, and says so to no index: a
+        // change noted, or a turn asked whether it is leased, marks the indexes
+        // naming it stale, and the next scan of each walks its turns again.
+        if planned == 0 {
+            return Ok(GalleryCompaction {
+                planned,
+                moved: 0,
+                regions_before,
+                regions_after: regions_before,
+            });
+        }
         let mut moved = 0usize;
         let outcome = {
             let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
@@ -1082,7 +1093,14 @@ impl GalleryArena {
             let mut outcome = Ok(());
             self.note_change();
             for (sid, rt) in res.iter_mut() {
-                if rt.pinned != 0 || self.leased(sid) {
+                // Only a turn the plan moves is asked whether it is leased —
+                // which marks the indexes naming it stale — so a pass leaves
+                // every index of turns it does not touch trusted.
+                if by_src.is_empty() {
+                    break;
+                }
+                let touched = rt.run.slots.iter().any(|s| by_src.contains_key(&s.ptr()));
+                if !touched || rt.pinned != 0 || self.leased(sid) {
                     continue;
                 }
                 let mut moved_here = 0usize;
@@ -1708,7 +1726,9 @@ mod tests {
     }
 
     /// A gallery with nothing to pack plans nothing and bumps nothing — the pass
-    /// has to be free to run every relief episode.
+    /// has to be free to run every relief episode. **Nor does it tell any index a
+    /// change happened**: the change count stands, so a cached index's next scan
+    /// trusts it without walking its turns.
     #[test]
     fn compaction_of_a_packed_gallery_is_a_no_op() {
         let device = match Device::new_cuda(0) {
@@ -1722,8 +1742,10 @@ mod tests {
             arena.shared(sid(t), &rows, t + 1).unwrap();
         }
         let gen_before = arena.residency_gen();
+        let changes_before = arena.changes.load(Ordering::SeqCst);
         let report = arena.compact(0).unwrap();
         assert_eq!((report.planned, report.moved), (0, 0));
         assert_eq!(arena.residency_gen(), gen_before);
+        assert_eq!(arena.changes.load(Ordering::SeqCst), changes_before);
     }
 }

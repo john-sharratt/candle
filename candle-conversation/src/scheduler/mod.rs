@@ -3450,6 +3450,7 @@ impl WaveStats {
                 kv_frontier_drop = s.kv_frontier_drop,
                 tenants_ms = s.tenants_us / 1000,
                 tenant_passes = s.tenant_passes,
+                tenant_parts = %s.tenant_parts_ms(),
                 tenants_frontier_drop = s.tenants_frontier_drop,
                 "compaction split"
             );
