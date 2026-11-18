@@ -152,7 +152,7 @@ use section_pages::SectionPages;
 
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
-use self::pool_read_ring::{PoolReadRing, POOL_READ_RING_BYTES};
+use self::pool_read_ring::PoolReadRing;
 use self::relief_pacing::ReliefPacing;
 use self::reproject_census::{Outcome as ReprojectOutcome, Part as ReprojectPart, ReprojectCensus};
 use self::request_laps::RequestLaps;
@@ -4574,7 +4574,7 @@ impl Scheduler {
             wave_step_creep_layers: 0,
             section_relief_pacing: ReliefPacing::default(),
             reproject_census: ReprojectCensus::new(Instant::now()),
-            pool_read_ring: PoolReadRing::new(POOL_READ_RING_BYTES),
+            pool_read_ring: PoolReadRing::for_pool(pool_size),
             wave_step_creep_layer_pairs: 0.0,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),

@@ -20,9 +20,17 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::index_pages::StoredPages;
+use crate::working_set::PoolSize;
 
-/// The host bytes the ring keeps at most.
-pub(super) const POOL_READ_RING_BYTES: usize = 768 << 20;
+/// Host bytes the ring keeps for each token of the card's pool.
+///
+/// A turn's index pages run about 900 bytes a token (each selecting layer's
+/// Q8_0 keys, in every width the turn was framed at). A 768 MiB ring held
+/// ~780 pages on BlackWorld (2026-11-18), about 40% of its 2M-token pool, and
+/// nearly every refresh's reads still came off the log. Two KiB a token holds
+/// the pool and the pieces at its edge: 4 GB of the 72 GB card's 189 GB host,
+/// 2 GB on the 24 GB card, 1 GB on the 16 GB one.
+const RING_BYTES_PER_POOL_TOKEN: usize = 2 << 10;
 
 /// See the module documentation.
 #[derive(Debug)]
@@ -33,6 +41,11 @@ pub(super) struct PoolReadRing {
 }
 
 impl PoolReadRing {
+    /// The ring for a card whose pool is `pool`.
+    pub fn for_pool(pool: PoolSize) -> Self {
+        Self::new(pool.tokens * RING_BYTES_PER_POOL_TOKEN)
+    }
+
     pub fn new(cap: usize) -> Self {
         Self {
             pages: VecDeque::new(),
@@ -116,6 +129,15 @@ mod tests {
         assert_eq!(Arc::strong_count(&b), 1, "b went: a was used after it");
         assert_eq!(Arc::strong_count(&a), 2);
         assert_eq!(Arc::strong_count(&c), 2);
+    }
+
+    /// Each card's ring holds two KiB a token of its pool.
+    #[test]
+    fn a_cards_ring_holds_its_pool() {
+        let ring = |gib: u64| PoolReadRing::for_pool(PoolSize::for_card(gib << 30)).cap;
+        assert_eq!(ring(72), 4_096_000_000);
+        assert_eq!(ring(24), 2_048_000_000);
+        assert_eq!(ring(16), 1_048_576_000);
     }
 
     /// A page larger than the whole budget is not kept, and keeps nothing out.
