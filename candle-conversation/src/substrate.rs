@@ -108,7 +108,7 @@ use crate::summary_tree::{
     TurnKind, MERGE_FANOUT,
 };
 use crate::token_buffer::TokenBuffer;
-use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnRecord, TurnSegment};
+use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnSegment};
 use crate::working_set::{Candidate, Limits, Refusal, TypeShares, WorkingSet};
 use crate::ConversationError;
 use calibration_record::{standing, CalRecord, CalRecords, CalSnapshot};
@@ -1179,23 +1179,18 @@ pub trait ContentResolver {
     /// Token count for a turn.  Stable across projection calls.
     fn turn_token_count(&self, turn: TurnKey) -> usize;
 
-    /// Tokens one record of a turn holds (`docs/hit_driven_projection.md`
-    /// §8.1). Default: the whole turn is its assistant record — a resolver
-    /// that keeps no record edges has turns that are not carved.
-    fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
-        match record {
-            TurnRecord::User => 0,
-            TurnRecord::Assistant => self.turn_token_count(turn),
-        }
-    }
-
     /// The trained window of the engine the projection is for — the slot a
     /// dialogue's fill holds (`docs/hit_driven_projection.md` §4). `None` for
     /// an engine whose attention selects nothing, which is filled by its
     /// layers' windows instead.
-    fn trained_window(&self) -> Option<usize> {
-        None
-    }
+    ///
+    /// **No default.** `SubstrateRead` once took the trait's `None` while the
+    /// substrate it reads held the engine's window, so `TargetedRead`, which
+    /// every dialogue projection runs through, never filled a slot. Members
+    /// were placed whole and no cap bound: measured 2026-11-18 on BlackWorld,
+    /// every placed turn of 30 prompts was whole, with the working set ~75K
+    /// against a 64K budget. Each resolver says which it is.
+    fn trained_window(&self) -> Option<usize>;
 
     /// Relevance score for a turn — the wide-Q belief score the scheduler
     /// recorded for this projection. Zero when unscored.
@@ -3747,6 +3742,20 @@ impl Substrate {
         })
     }
 
+    /// What a seed or a provenance candidate costs a working set on this
+    /// substrate's engine. An engine with a trained window carves the slot by
+    /// whole turns (`docs/hit_driven_projection.md` §7.2, §8.1), placing at
+    /// most `max_file_tokens` of one reading, so a longer reading is charged
+    /// that much ([`Candidate::carved_to`]); an engine that emits members whole
+    /// is charged their whole size, and the working set refuses one past the
+    /// cap.
+    fn provenance_charge(&self, candidate: Candidate, limits: Limits) -> Candidate {
+        match self.trained_window {
+            Some(_) => candidate.carved_to(limits.max_file_tokens),
+            None => candidate,
+        }
+    }
+
     /// Lock `timeline` into `target`'s working set, priced at its recorded
     /// token total. A refusal means the call must run for real.
     pub fn working_set_lock(
@@ -3792,7 +3801,9 @@ impl Substrate {
         let mut admissible = Vec::new();
         for &timeline in candidates {
             match self.working_set_candidate(target, timeline) {
-                Some(candidate) => admissible.push((timeline, candidate)),
+                Some(candidate) => {
+                    admissible.push((timeline, self.provenance_charge(candidate, limits)))
+                }
                 None => refused.push(timeline),
             }
         }
@@ -3862,6 +3873,7 @@ impl Substrate {
         let chain: HashSet<TimelineId> = self.inherited_chain(target).into_iter().collect();
         ws.observe(fresh, beta, min_momentum, limits, max_admits, &|timeline| {
             self.working_set_candidate_beside(target, &chain, timeline)
+                .map(|c| self.provenance_charge(c, limits))
         });
         self.working_sets.insert(target, Arc::new(ws));
     }
@@ -7155,111 +7167,6 @@ impl Substrate {
         Ok(Some((Arc::new(windowed), Some(Arc::new(filtered)))))
     }
 
-    /// One record of a turn — its user record or its assistant record — as
-    /// sealed K/V and the index pages that cover exactly it
-    /// (`docs/hit_driven_projection.md` §8.1). The slot places a tool round as
-    /// one turn's assistant record and the next turn's user record, so each is
-    /// placed alone, with rows of its own.
-    ///
-    /// The K/V is zero-copy windows of the turn's chunks, as
-    /// [`Self::turn_sealed_without_thinking`] takes them; an assistant record
-    /// whose reasoning is not kept (`keep_reasoning` false) has its
-    /// `<think>…</think>` span windowed out of both the K/V and the pages.
-    ///
-    /// `Ok(None)` when the turn is not held here. The pages are `None` when the
-    /// turn sealed none — a model that carries no index — and an `Err` when the
-    /// record's edges, or its reasoning's, do not fall on page boundaries:
-    /// rows for the wrong span are worse than none, and the seal cuts a page at
-    /// each edge so this does not happen.
-    pub fn turn_record_sealed(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-        record: TurnRecord,
-        keep_reasoning: bool,
-        pages: Option<Arc<StoredPages>>,
-    ) -> Result<Option<(Arc<Vec<SealedSequence>>, Option<Arc<StoredPages>>)>, ConversationError>
-    {
-        let (Some(full), Some(turn)) = (
-            self.turn_sealed_of(timeline, index),
-            self.turn(timeline, index),
-        ) else {
-            return Ok(None);
-        };
-        let layout = &turn.content.layout;
-        let total = full.first().map_or(0, |s| s.token_count);
-        let Some(span) = layout.record_span(record, total as u32) else {
-            return Err(ConversationError::Channel(format!(
-                "turn {}#{} has no edge between its records — its message's closer is not in \
-                 its grid — so neither record can be placed alone",
-                timeline.raw(),
-                index.0,
-            )));
-        };
-        // The reasoning comes out of an assistant record that does not keep it,
-        // where it falls inside the record.
-        let reasoning = match (record, keep_reasoning) {
-            (TurnRecord::Assistant, false) => layout
-                .segments
-                .iter()
-                .find_map(|s| match s {
-                    TurnSegment::Thinking { kv, .. } => *kv,
-                    _ => None,
-                })
-                .map(|k| k.range())
-                .filter(|r| !r.is_empty() && r.start >= span.start && r.end <= span.end),
-            _ => None,
-        };
-        let refuse = |what: &str, stored: &StoredPages| {
-            let bounds = index_pages::boundaries(stored.bytes())
-                .map(|b| format!("{b:?}"))
-                .unwrap_or_else(|| "absent".to_string());
-            ConversationError::Channel(format!(
-                "turn {}#{}: the {record:?} record's {what} does not fall on its index page \
-                 boundaries {bounds} — the K/V can be windowed but the rows cannot",
-                timeline.raw(),
-                index.0,
-            ))
-        };
-        let pages = match pages.as_deref() {
-            None => None,
-            Some(stored) => {
-                let mine = stored
-                    .within_span(span.clone())
-                    .ok_or_else(|| refuse(&format!("span {span:?}"), stored))?;
-                let mine = match &reasoning {
-                    None => mine,
-                    Some(r) => mine
-                        .without_span(r.start - span.start..r.end - span.start)
-                        .ok_or_else(|| refuse(&format!("reasoning {r:?}"), stored))?,
-                };
-                Some(Arc::new(mine))
-            }
-        };
-        let ranges = match &reasoning {
-            None => vec![span.clone()],
-            Some(r) => vec![span.start..r.start, r.end..span.end],
-        };
-        let mut kv: Option<Vec<SealedSequence>> = None;
-        for r in ranges {
-            let part = window_sealed_tokens(&full, r.start, r.end);
-            kv = Some(match kv {
-                None => part,
-                Some(acc) => acc
-                    .into_iter()
-                    .zip(part)
-                    .map(|(h, t)| SealedSequence {
-                        token_count: h.token_count + t.token_count,
-                        chunks: h.chunks.into_iter().chain(t.chunks).collect(),
-                        chunk_size: h.chunk_size,
-                        location: h.location,
-                    })
-                    .collect(),
-            });
-        }
-        Ok(Some((Arc::new(kv.unwrap_or_default()), pages)))
-    }
-
     /// Token ids of the turn's *assistant-response body* `[asst_start, total)`,
     /// which the compression path prefills as text.
     pub fn turn_assistant_token_ids(
@@ -7285,24 +7192,6 @@ impl Substrate {
         let start = (layout.user_content_start() as usize).min(total);
         let end = (layout.user_content_end() as usize).min(total).max(start);
         Some(toks[start..end].to_vec())
-    }
-
-    /// Tokens `record` of a turn holds: its span of the turn's grid, or 0 when
-    /// the turn is not held here or has no record edge.
-    pub fn turn_record_tokens(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-        record: TurnRecord,
-    ) -> usize {
-        let Some(turn) = self.turn(timeline, index) else {
-            return 0;
-        };
-        let total = turn.content.token_count as u32;
-        turn.content
-            .layout
-            .record_span(record, total)
-            .map_or(0, |r| r.len())
     }
 
     /// Turn token count — pinned bytes the seal recorded.
@@ -8324,6 +8213,10 @@ impl Substrate {
 /// sibling conversations of the same shape) MUST project through [`TargetedRead`]
 /// — this bare impl is for structural / test callers only.
 impl ContentResolver for Substrate {
+    fn trained_window(&self) -> Option<usize> {
+        Substrate::trained_window(self)
+    }
+
     fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
         self.active_timelines_for_group(group)
             .flat_map(|tl| {
@@ -8458,6 +8351,10 @@ impl<'a> std::ops::Deref for ScoredSubstrate<'a> {
 /// sibling-timeline masking** — a target-masked projection routes through
 /// [`TargetedRead`]; this pairing is for structural / test callers.
 impl<'a> ContentResolver for ScoredSubstrate<'a> {
+    fn trained_window(&self) -> Option<usize> {
+        self.substrate.trained_window()
+    }
+
     fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
         self.substrate
             .active_timelines_for_group(group)
@@ -8598,6 +8495,10 @@ impl<'a> std::ops::Deref for SubstrateRead<'a> {
 /// **no** sibling-timeline masking (it has no target). Wrap in [`TargetedRead`]
 /// for a target-masked projection; this bare guard is for structural / test reads.
 impl<'a> ContentResolver for SubstrateRead<'a> {
+    fn trained_window(&self) -> Option<usize> {
+        self.guard.trained_window()
+    }
+
     fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
         self.guard
             .active_timelines_for_group(group)
@@ -9065,12 +8966,13 @@ mod tests {
         );
     }
 
-    /// **A reading past `max_file_tokens` is never a member**, on an engine
-    /// with a trained window or without one: a member is placed whole, so a
-    /// 300-token reading against a 200-token cap is refused as a seed, on
-    /// momentum and as a lock alike.
+    /// **A reading past `max_file_tokens` is a member where the fill carves.**
+    /// With no trained window the engine emits members whole, so a 300-token
+    /// reading against a 200-token cap is refused as a seed and on momentum.
+    /// With one, it is seeded and admitted, charged the 200 it can place. A
+    /// lock of it is refused on either engine, because a lock is placed whole.
     #[test]
-    fn a_reading_past_the_cap_is_never_a_member() {
+    fn a_reading_past_the_cap_is_charged_the_cap_where_the_fill_carves() {
         let capped = Limits {
             max_file_tokens: 200,
             ..ws_limits(1000)
@@ -9093,22 +8995,30 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        for trained in [None, Some(262_144)] {
-            let (mut sub, target, reads) = working_set_fixture(3, 300);
-            sub.set_trained_window(trained);
-            assert_eq!(
-                sub.working_set_seed(target, &[reads[0]], capped, 1000.0),
-                vec![reads[0]],
-                "{trained:?}"
-            );
-            observe(&mut sub, target, reads[1]);
-            assert!(members(&sub, target).is_empty(), "{trained:?}");
-            assert_eq!(
-                sub.working_set_lock(target, reads[2], capped),
-                Err(Refusal::TooLarge),
-                "{trained:?}"
-            );
-        }
+        let (mut whole, target, reads) = working_set_fixture(3, 300);
+        assert_eq!(
+            whole.working_set_seed(target, &[reads[0]], capped, 1000.0),
+            vec![reads[0]]
+        );
+        observe(&mut whole, target, reads[1]);
+        assert!(members(&whole, target).is_empty());
+        assert_eq!(
+            whole.working_set_lock(target, reads[2], capped),
+            Err(Refusal::TooLarge)
+        );
+
+        let (mut carved, target, reads) = working_set_fixture(3, 300);
+        carved.set_trained_window(Some(262_144));
+        assert!(carved
+            .working_set_seed(target, &[reads[0]], capped, 1000.0)
+            .is_empty());
+        observe(&mut carved, target, reads[1]);
+        assert_eq!(members(&carved, target), vec![reads[0], reads[1]]);
+        assert_eq!(carved.working_set(target).unwrap().tokens(), 400);
+        assert_eq!(
+            carved.working_set_lock(target, reads[2], capped),
+            Err(Refusal::TooLarge)
+        );
     }
 
     /// A link of the dialogue's own inherited chain is projected as its opening

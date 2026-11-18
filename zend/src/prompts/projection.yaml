@@ -1236,7 +1236,11 @@ layers:
       guidance_tokens: 16000
       beta: 0.2                  # per-file momentum leak: m ← (1 − β)·m + fresh
       min_momentum: 100          # below this a file is no provenance candidate
-      max_file_tokens: 48000     # one file above this is never seeded or locked
+      # The most of one reading the slot places: a longer one is a member
+      # charged this much, and the fill keeps its first and last turns and its
+      # best-scored pages between (docs/zend_working_set.md §4.4). A lock past
+      # it is refused.
+      max_file_tokens: 48000
       # The most of `budget_tokens` each type of document may hold — locks
       # count toward it but are never refused by it; a file of no type (code,
       # tests, kernels, scripts) is unbounded, and provenance orders the rest

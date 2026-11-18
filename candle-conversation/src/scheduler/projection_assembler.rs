@@ -76,7 +76,6 @@ use crate::sequence_handle::SequenceId;
 use crate::substrate::Substrate;
 use crate::summary_tree::SelectionOrigin;
 use crate::summary_tree::TurnKind;
-use crate::turn_layout::TurnRecord;
 
 /// Per-slot state owned by the projection assembler.
 ///
@@ -149,62 +148,37 @@ pub(super) struct SlotState {
 const UNREAD_HIT_PARTS: usize = 8;
 
 /// Every placed round as a hit piece (`docs/hit_driven_projection.md` §6.4,
-/// §8.1): its key and the positions it took, in slot order. A round is one or
-/// two records — a whole turn placed holds its two, split at its record edge,
-/// and a record placed alone holds one — so the records are found first, then
-/// grouped into the rounds of the exchanges they belong to. `placed[j]`
-/// records `pieces[j]`; pieces past the records, turns with no conversation to
-/// name them by, and a round whose records do not sit together are not
-/// declared.
+/// §8.1): its key and the positions it took, in slot order. A round is one
+/// whole turn, so each placed turn is grouped into the round of the exchange it
+/// belongs to. `placed[j]` records `pieces[j]`; pieces that are not turns and
+/// turns with no conversation to name them by are not declared.
 pub(super) fn hit_rounds_of(
     pieces: &[AssembledPiece],
     placed: &[PlacedPiece],
     conv: &Substrate,
 ) -> (Vec<RoundKey>, Vec<Range<usize>>) {
-    let mut records: HashMap<TimelineId, Vec<(TurnIndex, TurnRecord, Range<usize>)>> =
-        HashMap::new();
+    let mut turns_of: HashMap<TimelineId, Vec<(TurnIndex, Range<usize>)>> = HashMap::new();
     for (piece, p) in pieces.iter().zip(placed) {
         if p.tokens == 0 {
             continue;
         }
-        let span = (p.pos_after - p.tokens) as usize..p.pos_after as usize;
-        match piece {
-            AssembledPiece::Turn {
-                index,
-                timeline: Some(timeline),
-                ..
-            } => {
-                let Some(edge) = conv
-                    .turn_layout(*timeline, *index)
-                    .and_then(|l| l.user_record_end())
-                    .map(|e| span.start + e as usize)
-                    .filter(|e| *e <= span.end)
-                else {
-                    continue;
-                };
-                let at = records.entry(*timeline).or_default();
-                at.push((*index, TurnRecord::User, span.start..edge));
-                at.push((*index, TurnRecord::Assistant, edge..span.end));
-            }
-            AssembledPiece::TurnHalf {
-                index,
-                timeline: Some(timeline),
-                record,
-                ..
-            } => records
-                .entry(*timeline)
-                .or_default()
-                .push((*index, *record, span)),
-            _ => {}
+        if let AssembledPiece::Turn {
+            index,
+            timeline: Some(timeline),
+            ..
+        } = piece
+        {
+            let span = (p.pos_after - p.tokens) as usize..p.pos_after as usize;
+            turns_of.entry(*timeline).or_default().push((*index, span));
         }
     }
     let mut declared: Vec<(RoundKey, Range<usize>)> = Vec::new();
-    for (timeline, placed) in records {
+    for (timeline, placed) in turns_of {
         for turns in conv.exchanges_of(timeline) {
             let Some(&head) = turns.first() else {
                 continue;
             };
-            if !placed.iter().any(|(t, _, _)| turns.contains(t)) {
+            if !placed.iter().any(|(t, _)| turns.contains(t)) {
                 continue;
             }
             for (index, span) in rounds::round_spans(&turns, &placed) {
@@ -528,7 +502,7 @@ pub(super) fn working_set_from_segments(segments: &[ProjectionSegment]) -> SlotW
         if let ProjectionSegment::Sealed(kind) = seg {
             match kind {
                 SealedKind::Section(rs) => ws.sections.push(rs.id),
-                SealedKind::Turn(rt, _) | SealedKind::TurnHalf(rt, _) => {
+                SealedKind::Turn(rt, _) => {
                     if let Some(key) = rt.key() {
                         ws.turns.push(key);
                     }
@@ -662,15 +636,6 @@ pub(crate) enum AssembledPiece {
     },
     /// The in-flight user message, deferred to prefill after the gap-fill.
     DeferredUser(Arc<Vec<u32>>),
-    /// One record of a sealed turn, placed alone with the index pages that
-    /// cover it (`docs/hit_driven_projection.md` §8.1). Its grid carries its
-    /// own boundary markers, so no glue is wrapped around it.
-    TurnHalf {
-        group: GroupId,
-        index: TurnIndex,
-        timeline: Option<TimelineId>,
-        record: TurnRecord,
-    },
 }
 
 /// Lay out a projection's segments into the ordered [`AssembledPiece`]s the
@@ -784,17 +749,6 @@ fn assemble_inner(
                     }
                 }
             }
-            ProjectionSegment::Sealed(SealedKind::TurnHalf(rt, record)) => {
-                // A record's grid holds its own markers, so it is placed with
-                // no glue around it.
-                flush(&mut run, &mut pieces);
-                pieces.push(AssembledPiece::TurnHalf {
-                    group: rt.group(),
-                    index: rt.index(),
-                    timeline: rt.timeline,
-                    record: *record,
-                });
-            }
             ProjectionSegment::NewUserMessage { tokens } => {
                 flush(&mut run, &mut pieces);
                 pieces.push(AssembledPiece::DeferredUser(tokens.clone()));
@@ -814,9 +768,8 @@ fn assemble_inner(
 /// never drift from what the projection really does.
 ///
 /// The system prompt is excluded (it is covered by
-/// [`ProjectionSelection::system`]); the live, still-decoding user message and
-/// the compression turn-halves are excluded too (the panel renders the live turn
-/// from its own `um`/`dm`). Glue islands are decoded to text via `decode`; each
+/// [`ProjectionSelection::system`]); the live, still-decoding user message is
+/// excluded too (the panel renders the live turn from its own `um`/`dm`). Glue islands are decoded to text via `decode`; each
 /// turn is classified (layer / group / role / token count / forest kind / why)
 /// via `resolver` + `origins`.
 pub(crate) fn materialize_conversation(
@@ -826,15 +779,14 @@ pub(crate) fn materialize_conversation(
     schema: &Schema,
     mut decode: impl FnMut(&[u32]) -> String,
 ) -> Vec<MaterializedPiece> {
-    // Conversation region = from the first sealed turn / turn-half / deferred
-    // user onward; everything before is the system prompt.
+    // Conversation region = from the first sealed turn / deferred user onward;
+    // everything before is the system prompt.
     let start = segments
         .iter()
         .position(|s| {
             matches!(
                 s,
                 ProjectionSegment::Sealed(SealedKind::Turn(..))
-                    | ProjectionSegment::Sealed(SealedKind::TurnHalf(..))
                     | ProjectionSegment::NewUserMessage { .. }
             )
         })
@@ -883,11 +835,9 @@ pub(crate) fn materialize_conversation(
             }
             // The live user message is a separate prefill unit (not part of
             // `project()`'s segments), so it never reaches this spine — the panel
-            // renders the in-flight turn from `um`/`dm`. The compression turn-half
-            // and any stray section are not part of the displayed dialogue spine.
-            AssembledPiece::DeferredUser(_)
-            | AssembledPiece::TurnHalf { .. }
-            | AssembledPiece::Section(_) => None,
+            // renders the in-flight turn from `um`/`dm`. A stray section is not
+            // part of the displayed dialogue spine.
+            AssembledPiece::DeferredUser(_) | AssembledPiece::Section(_) => None,
         })
         .collect()
 }
@@ -1071,17 +1021,6 @@ fn hash_piece_identity(
             h.write_u8(3);
             h.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
             h.write_u64(index.0 as u64);
-        }
-        Some(AssembledPiece::TurnHalf {
-            timeline,
-            index,
-            record,
-            ..
-        }) => {
-            h.write_u8(4);
-            h.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
-            h.write_u64(index.0 as u64);
-            h.write_u8(*record as u8);
         }
         Some(AssembledPiece::Section(id)) => {
             h.write_u8(2);
@@ -1324,18 +1263,6 @@ fn walk_sealed_piece(
             c.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
             c.write_u32(index.0);
             c.write_u8(*role as u8);
-        }
-        AssembledPiece::TurnHalf {
-            group,
-            index,
-            timeline,
-            record,
-        } => {
-            inject_sealed_turn_half(ctx, walker, *timeline, *group, *index, *record)?;
-            c.write_u8(4);
-            c.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
-            c.write_u32(index.0);
-            c.write_u8(*record as u8);
         }
         AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) => {
             return Err(ConversationError::Channel(format!(
@@ -1620,7 +1547,7 @@ pub(super) fn apply_segments_build(
         let mut contrib = 0u64;
         let kind = match &pieces[i] {
             AssembledPiece::Section(_) => 0,
-            AssembledPiece::Turn { .. } | AssembledPiece::TurnHalf { .. } => 1,
+            AssembledPiece::Turn { .. } => 1,
             AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) => 2,
         };
         match &pieces[i] {
@@ -1659,19 +1586,6 @@ pub(super) fn apply_segments_build(
                         let conv = ctx.conversation.read();
                         conv.turn_sealed_of(*tl, *index).is_some()
                             && conv.turn_token_count_of(*tl, *index) >= fwd as usize
-                    }
-                    (
-                        _,
-                        Some(AssembledPiece::TurnHalf {
-                            timeline: Some(tl),
-                            index,
-                            record,
-                            ..
-                        }),
-                    ) => {
-                        let conv = ctx.conversation.read();
-                        conv.turn_sealed_of(*tl, *index).is_some()
-                            && conv.turn_record_tokens(*tl, *index, *record) >= fwd as usize
                     }
                     _ => false,
                 };
@@ -1770,9 +1684,7 @@ pub(super) fn apply_segments_build(
                 c.write_u32(fwd);
                 contrib = c.finish();
             }
-            AssembledPiece::Section(_)
-            | AssembledPiece::Turn { .. }
-            | AssembledPiece::TurnHalf { .. } => {
+            AssembledPiece::Section(_) | AssembledPiece::Turn { .. } => {
                 contrib = walk_sealed_piece(ctx, &mut walker, &pieces[i])?;
             }
             AssembledPiece::DeferredUser(tokens) => {
@@ -1962,22 +1874,7 @@ pub(super) fn apply_segments_build(
         let conv = ctx.conversation.read();
         let (mut keys, ranges) = hit_rounds_of(&pieces, &state.placed_pieces, &conv);
         let placed: HashSet<RoundKey> = keys.iter().copied().collect();
-        let (pooled_keys, pooled) = pooled_rounds(
-            &state.pool,
-            &placed,
-            |tl| conv.exchanges_of(tl),
-            |tl, turn, record| {
-                let total = conv.turn_token_count_of(tl, turn);
-                let edge = conv
-                    .turn_layout(tl, turn)
-                    .and_then(|l| l.user_record_end())
-                    .map_or(0, |e| (e as usize).min(total));
-                match record {
-                    TurnRecord::User => 0..edge,
-                    TurnRecord::Assistant => edge..total,
-                }
-            },
-        );
+        let (pooled_keys, pooled) = pooled_rounds(&state.pool, &placed, |tl| conv.exchanges_of(tl));
         keys.extend(pooled_keys);
         (keys, ranges, pooled)
     };
@@ -2158,16 +2055,14 @@ const TURN_BRIDGE_FWD_AHEAD: u32 = 16;
 
 /// Forward bridge window for the glue island that immediately precedes `next` in
 /// the assembled piece stream. Open it (`TURN_BRIDGE_FWD_AHEAD`) only when the
-/// glue leads INTO a conversation turn/summary — a `Turn`/`TurnHalf` piece, which
-/// is injected in-place downstream in the same slot and so is already resident in
+/// glue leads INTO a conversation turn/summary — a `Turn` piece, which is
+/// injected in-place downstream in the same slot and so is already resident in
 /// `[0, kv_len)` for the glue forward to attend. Section boundaries and the glue
 /// before the deferred (still un-prefilled) user message have no resident turn
 /// ahead, so they stay backward-only (`0`).
 fn glue_bridge_window(next: Option<&AssembledPiece>) -> u32 {
     match next {
-        Some(AssembledPiece::Turn { .. } | AssembledPiece::TurnHalf { .. }) => {
-            TURN_BRIDGE_FWD_AHEAD
-        }
+        Some(AssembledPiece::Turn { .. }) => TURN_BRIDGE_FWD_AHEAD,
         _ => 0,
     }
 }
@@ -2820,96 +2715,6 @@ fn push_turn_pages(
             );
         }
     }
-}
-
-/// Place one record of a sealed turn — its user record or its assistant
-/// record — with the index pages that cover exactly it
-/// (`docs/hit_driven_projection.md` §8.1).
-///
-/// **A record with no page is refused** on a model that carries an index: the
-/// selection could not rank it, and it would be attended only through the
-/// query's tail. Every record is sealed with its own pages — the seal closes a
-/// page at the edge between a turn's two records — so a refusal here is a seal
-/// that did not cut where it says it does. An assistant record keeps its
-/// reasoning only when its turn is the one the slot continues, by the rule
-/// [`inject_sealed_turn`] places whole turns by.
-fn inject_sealed_turn_half(
-    ctx: &mut ApplyContext<'_>,
-    walker: &mut SegmentWalker,
-    timeline: Option<TimelineId>,
-    group: GroupId,
-    index: TurnIndex,
-    record: TurnRecord,
-) -> Result<(), ConversationError> {
-    let parent_id = ctx.parent_id;
-
-    // Carried from projection — see `inject_sealed_turn`.
-    let Some(timeline) = timeline else {
-        walker.skipped_turns += 1;
-        tracing::warn!(
-            target: "candle_conversation::scheduler::reproject",
-            slot = parent_id.0,
-            group = group.raw(),
-            index = index.0,
-            ?record,
-            "apply_projection: record carries no timeline; dropping it"
-        );
-        return Ok(());
-    };
-    // Before the substrate lock: a page left in the log is read through the
-    // persistence path, which takes its own.
-    let stored = ctx.conversation.turn_index_page(timeline, index)?;
-    let resolved = {
-        let conv = ctx.conversation.read();
-        let newest = conv.turn_indices(timeline).max();
-        let keep = keeps_reasoning(ctx.slot_target.map(|t| t.timeline), timeline, newest, index);
-        conv.turn_record_sealed(timeline, index, record, keep, stored)?
-    };
-    let Some((sealed, page)) = resolved else {
-        walker.skipped_turns += 1;
-        tracing::warn!(
-            target: "candle_conversation::scheduler::reproject",
-            slot = parent_id.0,
-            timeline = timeline.raw(),
-            index = index.0,
-            ?record,
-            "apply_projection: selected record's turn has no hot sealed K/V; dropping it"
-        );
-        return Ok(());
-    };
-    if page.is_none() && ctx.model.carries_positional_state() {
-        return Err(ConversationError::Channel(format!(
-            "apply_projection: the {record:?} record of turn {}#{} has no index page — a \
-             record placed without one could not be ranked by the selection",
-            timeline.raw(),
-            index.0
-        )));
-    }
-    if sealed.first().is_none_or(|s| s.token_count == 0) {
-        return Ok(());
-    }
-    let what = InjectedPiece::TurnHalf(timeline, index, record);
-    let Some(injected) = place_sealed(ctx, walker, &sealed, &what)? else {
-        walker.skipped_turns += 1;
-        return Ok(());
-    };
-    if injected.was_cut() {
-        report_cut(
-            &what,
-            parent_id,
-            &sealed,
-            &injected,
-            "a conversation's turn is its history and is not rebuilt; its index pages \
-             are left out and the span goes in unindexed",
-        );
-    }
-    let t_pages = Instant::now();
-    push_turn_pages(ctx, walker, timeline, index, page, &injected);
-    walker.turn_pages_us += t_pages.elapsed().as_micros() as u64;
-    walker.sealed_turns += 1;
-    walker.sealed_tokens += injected.tokens;
-    walker.record_sealed(injected.tokens);
-    Ok(())
 }
 
 /// Inject a piece's already-sealed per-layer K/V onto `parent_id`'s slot.
@@ -3776,6 +3581,9 @@ mod tests {
         fn turn_token_count(&self, _turn: TurnKey) -> usize {
             10
         }
+        fn trained_window(&self) -> Option<usize> {
+            None
+        }
         fn turn_score(&self, _turn: TurnKey) -> f32 {
             0.0
         }
@@ -4312,15 +4120,8 @@ layers:
             role: crate::Role::Assistant,
             timeline: Some(TimelineId::for_test(2)),
         };
-        let turn_half = AssembledPiece::TurnHalf {
-            group: GroupId::for_test(2),
-            index: TurnIndex(3),
-            timeline: Some(TimelineId::for_test(2)),
-            record: TurnRecord::User,
-        };
         // Leads into a resident turn/summary → bridge window opens.
         assert_eq!(glue_bridge_window(Some(&turn)), TURN_BRIDGE_FWD_AHEAD);
-        assert_eq!(glue_bridge_window(Some(&turn_half)), TURN_BRIDGE_FWD_AHEAD);
         // No resident turn ahead → backward-only.
         assert_eq!(
             glue_bridge_window(Some(&AssembledPiece::Section(SectionId::new(7)))),

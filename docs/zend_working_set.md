@@ -231,7 +231,7 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
       guidance_tokens: 16000     # the guidance pool, beside budget_tokens
       beta: 0.2                  # per-file momentum leak (§4.3)
       min_momentum: 100          # below this a file is not a provenance candidate
-      max_file_tokens: 48000     # one file above this is never seeded or locked
+      max_file_tokens: 48000     # the most of one reading the slot places (§4.4)
       seeds:
         - candle/zend/
         - candle/zend/src/
@@ -357,20 +357,26 @@ A `working_set` selection rule, declared on `repo_map/structure` and
 the group's working-set members, whole, in the working set's order (§4.3) —
 nothing is chosen at projection time.
 
-**Open: a reading longer than `max_file_tokens` is never a member.** The
-fill (`docs/hit_driven_projection.md` §7.2) is meant to place at most
-`max_file_tokens` of one reading, its request, answer and best-scored pages,
-so a longer reading could be admitted at the cap's cost. Today it cannot.
-Measured 2026-11-18 on BlackWorld: across 30 dialogue prompts, every one of
-2,187 placed turns was a whole turn and never a single record, although the
-working-set groups held about 75K tokens against the 64K budget each time.
-The fill's caps do not bind in production. The budget holds only because
-admission refuses whole sizes. Admitting a reading past the cap at the cap's
-cost was tried (cec2653ed) and placed a 60K-token reading whole, so it was
-withdrawn. Until the fill carves, the five battery answer files past the cap
-can never be placed: `scheduler/mod.rs` (306K tokens), `quantized/cuda.rs`,
-`conversation.rs`, `region_pool.rs` and `projection_assembler.rs`
-(`docs/results/battery_gap_analysis_2026-11-18.md`).
+**A reading longer than `max_file_tokens` is carved, not refused.** On an
+engine whose fill carves the slot (`docs/hit_driven_projection.md` §7.2),
+the fill places at most `max_file_tokens` of one reading: its first and last
+turns and the page turns that score highest, each whole (§8.1 there). So a
+reading longer than the cap is admitted as a seed or as provenance, and
+charged the cap against the budget, not its whole size
+(`Candidate::carved_to`, applied by `Substrate::provenance_charge`). On an
+engine that emits members whole, it is never a member. A lock past the cap
+is refused on either engine, because a lock is placed whole.
+
+Measured 2026-11-18, the §9.12 battery's answers sit in five files past the
+cap: `scheduler/mod.rs` (306K tokens), `quantized/cuda.rs`,
+`conversation.rs`, `region_pool.rs` and `projection_assembler.rs`. Refused
+whole, they could never be placed, and two questions had no other answer
+file (`docs/results/battery_gap_analysis_2026-11-18.md`). The same day
+showed the fill had never run on the daemon: `SubstrateRead`'s
+`ContentResolver` took the trait's default `trained_window` of `None`, so
+every dialogue projected as if its engine did not select. Across 30 prompts,
+all 2,187 placed turns were whole, and the working-set groups held about 75K
+against the 64K budget each time.
 
 The rule reads the dialogue's `WorkingSet` through the resolver
 (`ContentResolver::working_set_members`, filtered to the group); a target whose
@@ -584,7 +590,8 @@ blob the dialogue's branch holds, a folder through `folder_unit`. A miss
 seeding momentum and enters provenance in list order while the budget has room,
 dislodging nothing (§4.3) — so the seeds are the leftmost members, beside the
 system prompt and the priming chain. One that does not fit, has no recorded
-size, or is past `max_file_tokens` is left out with a warning naming it; one
+size, or, where members are emitted whole, is past `max_file_tokens` (§4.4) is
+left out with a warning naming it; one
 that missed only for room stays a candidate and can enter later on its
 momentum.
 
@@ -886,7 +893,7 @@ measurement watches these numbers.
 | D4 | Which calls release | File writes (the written file's lock alone), git writes, `run_command`, `code_run`, `code_session_exec` (every lock) — registry-checked names. Plus the promising reply leaving the projection; never a user message. |
 | D5 | Where the working set sits | Its own layers' groups, which already emit ahead of the dialogue. |
 | D6 | Tool rounds | `in_tool_rounds: true`; ingestion unchanged. |
-| D7 | Provenance unit | Whole files and folders. A reading past `max_file_tokens` is never a member until the fill carves (§4.4, open). |
+| D7 | Provenance unit | Whole files and folders are what enters and leaves. Where the fill carves the slot, a reading past `max_file_tokens` is a member charged the cap, and the fill keeps its floor and best-scored page turns (§4.4). |
 | D8 | Seed list | §4.2 draft, to be edited. |
 | D9 | Fade rate | Per-file momentum at β 0.2, leaking by its own value. |
 | D10 | Default budget | 64K voluntary, locks on top up to 48K, guidance 16K, caps on one fill of the trained window less the 16K reserve, beside the dialogue's 180K window (`docs/hit_driven_projection.md` §4, §7.2). Strength is momentum lifted by the model's own hits (§4.3, `hit_driven_projection.md` §7.1). |

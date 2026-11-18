@@ -451,9 +451,6 @@ pub(super) fn projected_depth(
             ProjectionSegment::Sealed(SealedKind::Turn(rt, _)) => rt
                 .timeline
                 .map_or(0, |tl| read.turn_token_count_of(tl, rt.index())),
-            ProjectionSegment::Sealed(SealedKind::TurnHalf(rt, record)) => rt
-                .timeline
-                .map_or(0, |tl| read.turn_record_tokens(tl, rt.index(), *record)),
             ProjectionSegment::Generated { tokens, .. }
             | ProjectionSegment::NewUserMessage { tokens } => tokens.len(),
         })

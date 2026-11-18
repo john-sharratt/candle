@@ -83,7 +83,7 @@ use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
 use crate::tenant_rank::TenantRank;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
-use crate::turn_layout::{TurnLayout, TurnRecord, TurnSegment};
+use crate::turn_layout::{TurnLayout, TurnSegment};
 use crate::working_set::marks::is_dialogue;
 use candle_nn::kv_cache::{SealedSequence, Sweep};
 
@@ -5925,11 +5925,6 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         self.read.turn_token_count_of(turn.timeline, turn.index)
     }
 
-    fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
-        self.read
-            .turn_record_tokens(turn.timeline, turn.index, record)
-    }
-
     fn trained_window(&self) -> Option<usize> {
         self.read.trained_window()
     }
@@ -6174,6 +6169,36 @@ mod tests {
             ],
             "oldest ancestor first, the target's own turns last",
         );
+    }
+
+    /// **A dialogue's projection sees the engine's trained window.** The
+    /// targeted read every dialogue projects through answered `None` while
+    /// the substrate held the window, so no slot was ever filled
+    /// (`ContentResolver::trained_window`). Every reader reports what the
+    /// substrate holds, before and after it is set.
+    #[test]
+    fn every_read_reports_the_substrates_trained_window() {
+        use crate::projection::project::ProjectionTarget;
+        use crate::substrate::ContentResolver;
+
+        let conv = Conversation::ephemeral();
+        let target = ProjectionTarget {
+            layer: LayerId::from_raw(1).expect("layer id"),
+            group: GroupId::from_raw(1).expect("group id"),
+            timeline: TimelineId::from_raw(41).expect("timeline id"),
+        };
+        let windows = |conv: &Conversation| {
+            let read = conv.read();
+            (
+                ContentResolver::trained_window(&*read),
+                ContentResolver::trained_window(&read),
+                ContentResolver::trained_window(&conv.read_for(target)),
+            )
+        };
+        assert_eq!(windows(&conv), (None, None, None));
+        conv.update(|s| s.set_trained_window(Some(262_144)));
+        let set = Some(262_144);
+        assert_eq!(windows(&conv), (set, set, set));
     }
 
     /// A conversation that never forked is unaffected — the masking that keeps

@@ -1,11 +1,14 @@
-//! **A turn's records are placed alone, each with its own pages**
+//! **A turn is placed whole, whatever its pages inside**
 //! (`docs/hit_driven_projection.md` §8.1).
 //!
-//! A tool round is one turn's assistant record and the next turn's user
-//! record, so the slot places records rather than whole turns. Each record's
-//! K/V is a window of its turn's chunks and its rows are the pages inside that
-//! window; a record whose edge falls inside a page has no rows of its own and
-//! is refused. These run the real assembler on the CPU double.
+//! A turn's pages start and end with the turn, but the page edge between its
+//! two records is only where the seal cut one: a turn sealed before the cut
+//! landed on the record edge has a page straddling it. The slot places whole
+//! turns only, so such a turn goes in at its full width with every page it
+//! holds. Measured 2026-11-18: a reading's turn with pages `[0, 4858, 4907,
+//! 4908]` against a record edge of 4850 could not be placed a record at a time,
+//! and every reprojection of the dialogue that carved it failed. These run the
+//! real assembler on the CPU double.
 
 use super::positional_ledger::toy_page;
 use super::*;
@@ -16,7 +19,7 @@ use crate::projection::{
 };
 use crate::substrate::TurnPartWrite;
 use crate::token_buffer::TokenBuffer;
-use crate::turn_layout::{TurnLayout, TurnRecord};
+use crate::turn_layout::TurnLayout;
 
 const GROUP: u32 = 9;
 
@@ -100,8 +103,8 @@ fn sealed_turn(
     (scheduler, probe, conversation, timeline, index)
 }
 
-fn record(timeline: TimelineId, index: TurnIndex, which: TurnRecord) -> ProjectionSegment {
-    ProjectionSegment::Sealed(SealedKind::TurnHalf(
+fn turn(timeline: TimelineId, index: TurnIndex) -> ProjectionSegment {
+    ProjectionSegment::Sealed(SealedKind::Turn(
         ResolvedTurn {
             id: TurnId {
                 layer_id: LayerId::for_test(1),
@@ -110,7 +113,7 @@ fn record(timeline: TimelineId, index: TurnIndex, which: TurnRecord) -> Projecti
             },
             timeline: Some(timeline),
         },
-        which,
+        Role::Assistant,
     ))
 }
 
@@ -120,49 +123,30 @@ fn pages_pushed(probe: &RecurrentProbe, slot: SequenceId) -> usize {
     })
 }
 
-/// Each record goes in at its own width with only the pages inside it: the
-/// user record's one page, then the assistant record's two.
+/// A turn whose pages meet at its record edge goes in whole with every page.
 #[test]
-fn each_record_goes_in_with_the_pages_inside_it() {
+fn a_turn_goes_in_whole_with_every_page() {
     let (mut scheduler, probe, conversation, timeline, index) = sealed_turn(&[EDGE, 6, 4]);
     let slot = create_scratch_slot(&mut scheduler, &conversation);
     let complete = scheduler
-        .apply_projection(
-            slot,
-            BlockCount(0),
-            &[record(timeline, index, TurnRecord::User)],
-        )
-        .expect("the user record places");
+        .apply_projection(slot, BlockCount(0), &[turn(timeline, index)])
+        .expect("the turn places");
     assert!(complete, "every piece placed, its gap-fill run here");
-    assert_eq!(scheduler.session.sequence_offset(slot.0), Some(EDGE));
-    assert_eq!(pages_pushed(&probe, slot), 1);
-
-    let other = create_scratch_slot(&mut scheduler, &conversation);
-    scheduler
-        .apply_projection(
-            other,
-            BlockCount(0),
-            &[record(timeline, index, TurnRecord::Assistant)],
-        )
-        .expect("the assistant record places");
-    assert_eq!(
-        scheduler.session.sequence_offset(other.0),
-        Some(TOTAL - EDGE)
-    );
-    assert_eq!(pages_pushed(&probe, other), 2);
+    assert_eq!(scheduler.session.sequence_offset(slot.0), Some(TOTAL));
+    assert_eq!(pages_pushed(&probe, slot), 3);
 }
 
-/// Pages that straddle the edge between the records describe neither, so a
-/// record placed from them is refused rather than given rows for the wrong
-/// span.
+/// **A turn whose page straddles its record edge still goes in whole**: its
+/// pages `[0, 5, 18]` miss the edge at 8, and the turn places at its full
+/// width with both pages.
 #[test]
-fn a_record_whose_edge_falls_inside_a_page_is_refused() {
-    let (mut scheduler, _probe, conversation, timeline, index) = sealed_turn(&[5, 13]);
+fn a_turn_whose_page_straddles_its_record_edge_goes_in_whole() {
+    let (mut scheduler, probe, conversation, timeline, index) = sealed_turn(&[5, 13]);
     let slot = create_scratch_slot(&mut scheduler, &conversation);
-    let placed = scheduler.apply_projection(
-        slot,
-        BlockCount(0),
-        &[record(timeline, index, TurnRecord::User)],
-    );
-    assert!(placed.is_err(), "the user record has no pages of its own");
+    let complete = scheduler
+        .apply_projection(slot, BlockCount(0), &[turn(timeline, index)])
+        .expect("the turn places whole");
+    assert!(complete);
+    assert_eq!(scheduler.session.sequence_offset(slot.0), Some(TOTAL));
+    assert_eq!(pages_pushed(&probe, slot), 2);
 }

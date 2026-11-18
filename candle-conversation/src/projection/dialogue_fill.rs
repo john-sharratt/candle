@@ -1,34 +1,32 @@
 //! A dialogue's slot as one fill (`docs/hit_driven_projection.md` §7.2, §8).
 //!
 //! The pieces a dialogue's slot draws on — its inherited lineage, its working
-//! set and its own exchanges — become the units of [`fill`]:
+//! set and its own exchanges — become the units of [`fill`], every one of them
+//! whole turns ([`rounds`]):
 //!
 //! - **the lineage**, each exchange whole, scored from its base (§8.4);
-//! - **the working set**: a locked piece's every round as locks; any other
-//!   piece's request and answer as its floor, and its tool rounds — a reading's
-//!   pages — at the piece's score, ranked among themselves by each round's own
-//!   score, so a reading its cap will not take whole keeps its best pages
-//!   (§8.2, [`piece_round_score`]);
+//! - **the working set**: a locked piece's every turn as locks; any other
+//!   piece's first and last turn — its request and its answer — as its floor,
+//!   and its tool turns — a reading's pages — at the piece's score, ranked
+//!   among themselves by each turn's own score, so a reading its cap will not
+//!   take whole keeps its best pages (§8.2, [`piece_round_score`]);
 //! - **the dialogue** (§8.3): its newest exchange as the current one — its
-//!   request, newest tool round and reply kept, its older tool rounds shed
-//!   first — its first exchange's request and answer, and its `recent`
-//!   exchanges before the current one, whole, as floors; every older exchange
-//!   as its pair, scored, and its tool rounds, each scored and entering only
-//!   with the pair.
+//!   first turn, its newest tool turn and its last kept, its older tool turns
+//!   shed first — its first exchange's floor, and its `recent` exchanges before
+//!   the current one, whole, as floors; every older exchange as its floor,
+//!   scored, and its tool turns, each scored and entering only with the floor.
 //!
 //! - **every other group** of the projection: each selected exchange whole, at
 //!   its selection score, under its layer's window.
 //!
 //! What the fill places comes back as each exchange's carving
-//! ([`rounds::carve`]): whole turns where both records are kept, one record
-//! where only one is, in the order the slot seats them.
+//! ([`rounds::carve`]): its kept turns, whole, in the order the slot seats them.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::projection::fill::{fill, Caps, FillInput, FloorExchange, Kind, Unit};
-use crate::projection::rounds::{self, records_of, round_count, Placement};
-use crate::projection::{TurnIndex, TurnKey};
-use crate::turn_layout::TurnRecord;
+use crate::projection::rounds;
+use crate::projection::TurnKey;
 
 /// One working-set piece: its kind for the caps, whether it is locked, its
 /// score, and its exchanges, each its turns in order.
@@ -66,18 +64,15 @@ pub struct DialogueSlot {
     pub context: Vec<ContextExchange>,
 }
 
-/// A turn placed whole (`None`) or one of its records alone.
-pub type Placed = (TurnKey, Option<TurnRecord>);
-
 /// What the fill placed, part by part, each in the order the slot seats it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DialoguePlan {
-    pub lineage: Vec<Placed>,
+    pub lineage: Vec<TurnKey>,
     /// One list per working piece, in [`DialogueSlot::working`]'s order.
-    pub working: Vec<Vec<Placed>>,
-    pub own: Vec<Placed>,
+    pub working: Vec<Vec<TurnKey>>,
+    pub own: Vec<TurnKey>,
     /// One list per context exchange, in [`DialogueSlot::context`]'s order.
-    pub context: Vec<Vec<Placed>>,
+    pub context: Vec<Vec<TurnKey>>,
     /// How far locks and floors carried the slot past its room.
     pub over_room: usize,
 }
@@ -119,14 +114,24 @@ impl Units {
     }
 }
 
-/// The score one round of an unlocked working-set piece enters the fill at:
-/// the piece's own `piece` score, lifted by up to as much again by how the
-/// round stands among the piece's rounds — `round`, its turns' score (the
-/// scan's evidence for that page, lifted by the hits on it), against `best`,
-/// the highest of the piece's rounds. The piece's level decides how it ranks
-/// against the other pieces; the rounds' own scores decide which pages a
+/// An exchange's floor: its first turn and its last, or the one turn of a
+/// plain question and answer.
+fn floor_rounds(n: usize) -> Vec<usize> {
+    match n {
+        0 => Vec::new(),
+        1 => vec![0],
+        n => vec![0, n - 1],
+    }
+}
+
+/// The score one tool turn of an unlocked working-set piece enters the fill
+/// at: the piece's own `piece` score, lifted by up to as much again by how the
+/// turn stands among the piece's turns — `round`, its score (the scan's
+/// evidence for that page, lifted by the hits on it), against `best`, the
+/// highest of the piece's turns. The piece's level decides how it ranks
+/// against the other pieces; the turns' own scores decide which pages a
 /// reading longer than `max_file_tokens` keeps (`docs/hit_driven_projection.md`
-/// §8.2). A piece with no scored round enters at `piece` throughout.
+/// §8.2). A piece with no scored turn enters at `piece` throughout.
 fn piece_round_score(piece: f32, round: f32, best: f32) -> f32 {
     if best > 0.0 {
         piece * (1.0 + round.max(0.0) / best)
@@ -135,30 +140,16 @@ fn piece_round_score(piece: f32, round: f32, best: f32) -> f32 {
     }
 }
 
-/// Plan `slot` (module docs). `score` is a turn's score; `tokens` a record's.
+/// Plan `slot` (module docs). `score` is a turn's score; `tokens` a turn's.
 pub fn plan(
     slot: &DialogueSlot,
     score: impl Fn(TurnKey) -> f32,
-    tokens: impl Fn(TurnKey, TurnRecord) -> usize,
+    tokens: impl Fn(TurnKey) -> usize,
 ) -> DialoguePlan {
-    let indices = |ex: &[TurnKey]| -> Vec<TurnIndex> { ex.iter().map(|k| k.index).collect() };
-    let round_tokens = |ex: &[TurnKey], r: usize| -> usize {
-        let idx = indices(ex);
-        records_of(&idx, r)
-            .into_iter()
-            .map(|(t, rec)| {
-                let key = ex.iter().find(|k| k.index == t).copied().unwrap_or(ex[0]);
-                tokens(key, rec)
-            })
-            .sum()
-    };
-    let round_score = |ex: &[TurnKey], r: usize| -> f32 {
-        let idx = indices(ex);
-        records_of(&idx, r)
-            .into_iter()
-            .filter_map(|(t, _)| ex.iter().find(|k| k.index == t))
-            .map(|k| score(*k))
-            .fold(0.0, f32::max)
+    let sum =
+        |ex: &[TurnKey], rounds: &[usize]| -> usize { rounds.iter().map(|&r| tokens(ex[r])).sum() };
+    let best_of = |ex: &[TurnKey], rounds: &[usize]| -> f32 {
+        rounds.iter().map(|&r| score(ex[r])).fold(0.0, f32::max)
     };
     let mut units = Units::default();
     let mut input = FillInput {
@@ -174,16 +165,16 @@ pub fn plan(
 
     // The lineage: each exchange whole, at its score.
     for (i, (ex, s)) in slot.lineage.iter().enumerate() {
-        let all: Vec<usize> = (0..round_count(ex.len())).collect();
-        let t = all.iter().map(|&r| round_tokens(ex, r)).sum();
+        let all: Vec<usize> = (0..ex.len()).collect();
+        let t = sum(ex, &all);
         let u = units.add(Part::Lineage(i), all, piece(), Kind::Dialogue, t, *s);
         input.scored.push(u);
     }
 
     // Every other group's exchanges: each whole, at its selection score.
     for (i, cx) in slot.context.iter().enumerate() {
-        let all: Vec<usize> = (0..round_count(cx.exchange.len())).collect();
-        let t = all.iter().map(|&r| round_tokens(&cx.exchange, r)).sum();
+        let all: Vec<usize> = (0..cx.exchange.len()).collect();
+        let t = sum(&cx.exchange, &all);
         let u = units.add(Part::Context(i), all, piece(), cx.kind, t, cx.score);
         input.scored.push(u);
     }
@@ -195,33 +186,39 @@ pub fn plan(
         let best = wp
             .exchanges
             .iter()
-            .flat_map(|ex| (0..round_count(ex.len())).map(|r| round_score(ex, r)))
+            .map(|ex| best_of(ex, &(0..ex.len()).collect::<Vec<_>>()))
             .fold(0.0, f32::max);
         let ranked = |s: f32| piece_round_score(wp.score, s, best);
         for (e, ex) in wp.exchanges.iter().enumerate() {
-            let n = round_count(ex.len());
+            let n = ex.len();
             if n == 0 {
                 continue;
             }
             let part = Part::Working(p, e);
             if wp.locked {
-                for r in 0..n {
-                    let u = units.add(part, vec![r], pid, wp.kind, round_tokens(ex, r), wp.score);
+                for (r, &turn) in ex.iter().enumerate() {
+                    let u = units.add(part, vec![r], pid, wp.kind, tokens(turn), wp.score);
                     input.locks.push(u);
                 }
                 continue;
             }
-            let pair_tokens = round_tokens(ex, 0) + round_tokens(ex, n - 1);
-            let pair_score = ranked(round_score(ex, 0).max(round_score(ex, n - 1)));
-            let pair = units.add(part, vec![0, n - 1], pid, wp.kind, pair_tokens, pair_score);
+            let fr = floor_rounds(n);
+            let pair = units.add(
+                part,
+                fr.clone(),
+                pid,
+                wp.kind,
+                sum(ex, &fr),
+                ranked(best_of(ex, &fr)),
+            );
             floor.push(pair);
-            if n == 2 {
-                // A plain question and answer: the pair is all there is.
+            if n <= 2 {
+                // A floor of every turn there is: nothing else to rank.
                 input.scored.push(pair);
             }
-            for r in 1..n - 1 {
-                let s = ranked(round_score(ex, r));
-                let u = units.add(part, vec![r], pid, wp.kind, round_tokens(ex, r), s);
+            for (r, &turn) in ex.iter().enumerate().take(n.saturating_sub(1)).skip(1) {
+                let s = ranked(score(turn));
+                let u = units.add(part, vec![r], pid, wp.kind, tokens(turn), s);
                 input.scored.push(u);
             }
         }
@@ -235,7 +232,7 @@ pub fn plan(
     let current = n_ex.checked_sub(1);
     let recent_from = current.map_or(0, |c| c.saturating_sub(slot.recent));
     for (e, ex) in slot.own.iter().enumerate() {
-        let n = round_count(ex.len());
+        let n = ex.len();
         if n == 0 {
             continue;
         }
@@ -247,19 +244,21 @@ pub fn plan(
                 vec![r],
                 pid,
                 Kind::Dialogue,
-                round_tokens(ex, r),
-                round_score(ex, r),
+                tokens(ex[r]),
+                score(ex[r]),
             )
         };
-        let tools: Vec<usize> = (1..n - 1).collect();
+        let tools: Vec<usize> = (1..n.saturating_sub(1)).collect();
         if Some(e) == current {
-            // Its request, its newest tool round and its reply are kept; the
-            // older tool rounds go first.
-            let mut kept = vec![one(&mut units, 0)];
+            // Its first turn, its newest tool turn and its last are kept; the
+            // older tool turns go first.
+            let mut kept: Vec<Unit> = floor_rounds(n)
+                .into_iter()
+                .map(|r| one(&mut units, r))
+                .collect();
             if let Some(&newest) = tools.last() {
                 kept.push(one(&mut units, newest));
             }
-            kept.push(one(&mut units, n - 1));
             let older = tools[..tools.len().saturating_sub(1)]
                 .iter()
                 .map(|&r| one(&mut units, r))
@@ -270,18 +269,17 @@ pub fn plan(
             };
             continue;
         }
-        let pair_tokens = round_tokens(ex, 0) + round_tokens(ex, n - 1);
-        let pair_score = round_score(ex, 0).max(round_score(ex, n - 1));
+        let fr = floor_rounds(n);
         let pair = units.add(
             part,
-            vec![0, n - 1],
+            fr.clone(),
             pid,
             Kind::Dialogue,
-            pair_tokens,
-            pair_score,
+            sum(ex, &fr),
+            best_of(ex, &fr),
         );
         if e >= recent_from {
-            // A recent exchange holds every round it has.
+            // A recent exchange holds every turn it has.
             let rounds = tools.iter().map(|&r| one(&mut units, r)).collect();
             input.recent.push(FloorExchange {
                 kept: vec![pair],
@@ -290,7 +288,7 @@ pub fn plan(
             continue;
         }
         if e == 0 {
-            // The dialogue's first request, with its answer.
+            // The dialogue's first exchange's floor.
             input.first_request = Some(pair);
         } else {
             input.scored.push(pair);
@@ -312,24 +310,19 @@ pub fn plan(
             .or_default()
             .extend(rounds.iter().copied());
     }
-    let carve_of = |ex: &[TurnKey], part: Part| -> Vec<Placed> {
+    let carve_of = |ex: &[TurnKey], part: Part| -> Vec<TurnKey> {
         let Some(k) = kept.get(&part) else {
             return Vec::new();
         };
-        let n = round_count(ex.len());
-        // A carving keeps a request and an answer; an exchange whose pair
-        // did not enter is not placed at all.
-        if !k.contains(&0) || !k.contains(&(n - 1)) {
+        // A carving keeps its floor; an exchange whose floor did not enter is
+        // not placed at all.
+        if !floor_rounds(ex.len()).iter().all(|r| k.contains(r)) {
             return Vec::new();
         }
-        rounds::carve(&indices(ex), |r| k.contains(&r))
+        let indices: Vec<_> = ex.iter().map(|t| t.index).collect();
+        rounds::carve(&indices, |r| k.contains(&r))
             .into_iter()
-            .filter_map(|p| match p {
-                Placement::Turn(t) => ex.iter().find(|k| k.index == t).map(|k| (*k, None)),
-                Placement::Record(t, rec) => {
-                    ex.iter().find(|k| k.index == t).map(|k| (*k, Some(rec)))
-                }
-            })
+            .filter_map(|t| ex.iter().find(|key| key.index == t).copied())
             .collect()
     };
     DialoguePlan {
@@ -370,7 +363,7 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::TimelineId;
+    use crate::projection::{TimelineId, TurnIndex};
 
     fn k(tl: u64, i: u32) -> TurnKey {
         TurnKey::new(TimelineId::from_raw(tl).unwrap(), TurnIndex(i))
@@ -387,9 +380,30 @@ mod tests {
         }
     }
 
-    /// Every record is 10 tokens: a round of two records is 20.
-    fn ten(_: TurnKey, _: TurnRecord) -> usize {
-        10
+    /// Every turn is 20 tokens.
+    fn twenty(_: TurnKey) -> usize {
+        20
+    }
+
+    fn reading(score: f32) -> WorkingPiece {
+        WorkingPiece {
+            kind: Kind::Reading,
+            locked: false,
+            score,
+            exchanges: vec![vec![k(5, 0), k(5, 1), k(5, 2), k(5, 3)]],
+        }
+    }
+
+    fn slot(room: usize, caps: Caps, working: Vec<WorkingPiece>) -> DialogueSlot {
+        DialogueSlot {
+            room,
+            caps,
+            recent: 0,
+            lineage: vec![],
+            working,
+            own: vec![],
+            context: vec![],
+        }
     }
 
     /// With room for everything, every exchange goes in whole, turn by turn.
@@ -400,103 +414,43 @@ mod tests {
             caps: caps(),
             recent: 16,
             lineage: vec![(vec![k(9, 0)], 1_000.0)],
-            working: vec![WorkingPiece {
-                kind: Kind::Reading,
-                locked: false,
-                score: 500.0,
-                exchanges: vec![vec![k(5, 0), k(5, 1), k(5, 2)]],
-            }],
+            working: vec![reading(500.0)],
             own: vec![vec![k(1, 0)], vec![k(1, 1), k(1, 2)]],
             context: vec![],
         };
-        let p = plan(&slot, |_| 1.0, ten);
-        assert_eq!(p.lineage, vec![(k(9, 0), None)]);
-        assert_eq!(
-            p.working,
-            vec![vec![(k(5, 0), None), (k(5, 1), None), (k(5, 2), None)]]
-        );
-        assert_eq!(
-            p.own,
-            vec![(k(1, 0), None), (k(1, 1), None), (k(1, 2), None)]
-        );
+        let p = plan(&slot, |_| 1.0, twenty);
+        assert_eq!(p.lineage, vec![k(9, 0)]);
+        assert_eq!(p.working, vec![vec![k(5, 0), k(5, 1), k(5, 2), k(5, 3)]]);
+        assert_eq!(p.own, vec![k(1, 0), k(1, 1), k(1, 2)]);
         assert_eq!(p.over_room, 0);
     }
 
-    /// A reading too large for its room keeps its request and answer and the
-    /// pages that score highest; the pages it drops split their turns into
-    /// the records the kept rounds hold.
+    /// A reading too large for its room keeps its first and last turns and the
+    /// tool turn that ties go to, the oldest, each whole.
     #[test]
-    fn a_reading_is_carved_to_its_best_pages() {
-        // A reading of four turns: request, three page rounds, answer — five
-        // rounds; with 20-token rounds and 10-token request and answer, room
-        // for the pair and one page.
-        let reading = vec![k(5, 0), k(5, 1), k(5, 2), k(5, 3)];
-        let slot = DialogueSlot {
-            room: 40,
-            caps: caps(),
-            recent: 0,
-            lineage: vec![],
-            working: vec![WorkingPiece {
-                kind: Kind::Reading,
-                locked: false,
-                score: 500.0,
-                exchanges: vec![reading.clone()],
-            }],
-            own: vec![],
-            context: vec![],
-        };
-        let p = plan(&slot, |_| 0.0, ten);
-        // Ties break oldest first, so page round 1 is the one kept: the
-        // request (5:0 user) and round 1 (5:0 assistant, 5:1 user) — 5:0
-        // whole — then 5:1's call is dropped with round 2, 5:2 entirely, and
-        // the answer, 5:3's assistant record.
-        assert_eq!(
-            p.working,
-            vec![vec![
-                (k(5, 0), None),
-                (k(5, 1), Some(TurnRecord::User)),
-                (k(5, 3), Some(TurnRecord::Assistant)),
-            ]]
-        );
+    fn a_reading_is_carved_to_whole_turns() {
+        let p = plan(&slot(60, caps(), vec![reading(500.0)]), |_| 0.0, twenty);
+        assert_eq!(p.working, vec![vec![k(5, 0), k(5, 1), k(5, 3)]]);
     }
 
     /// **A reading past its cap keeps the page its own score names, not its
-    /// first**: room for everything, but `max_file` of 40 holds the pair and one
-    /// 20-token page. Turn 5:3 is the one the scan scored, so page round 3 (5:2's
-    /// call, 5:3's result) is kept over round 1, which ties would have kept.
+    /// first**: room for everything, but `max_file` of 60 holds the floor and
+    /// one tool turn. Turn 5:2 is the one the scan scored, so it is kept over
+    /// 5:1, which ties would have kept.
     #[test]
-    fn a_capped_reading_keeps_its_best_scored_page() {
-        let slot = DialogueSlot {
-            room: 10_000,
-            caps: Caps {
-                max_file: 40,
-                ..caps()
-            },
-            recent: 0,
-            lineage: vec![],
-            working: vec![WorkingPiece {
-                kind: Kind::Reading,
-                locked: false,
-                score: 500.0,
-                exchanges: vec![vec![k(5, 0), k(5, 1), k(5, 2), k(5, 3)]],
-            }],
-            own: vec![],
-            context: vec![],
+    fn a_capped_reading_keeps_its_best_scored_turn() {
+        let capped = Caps {
+            max_file: 60,
+            ..caps()
         };
-        let p = plan(&slot, |t| if t == k(5, 3) { 900.0 } else { 0.0 }, ten);
-        assert_eq!(
-            p.working,
-            vec![vec![
-                (k(5, 0), Some(TurnRecord::User)),
-                (k(5, 2), Some(TurnRecord::Assistant)),
-                (k(5, 3), None),
-            ]]
-        );
+        let s = slot(10_000, capped, vec![reading(500.0)]);
+        let p = plan(&s, |t| if t == k(5, 2) { 900.0 } else { 0.0 }, twenty);
+        assert_eq!(p.working, vec![vec![k(5, 0), k(5, 2), k(5, 3)]]);
     }
 
-    /// A round's score keeps its piece's level and ranks it among the piece's
-    /// rounds: the best round is lifted to twice the piece, an unscored one
-    /// stays at it, and a piece with nothing scored is its own score throughout.
+    /// A turn's score keeps its piece's level and ranks it among the piece's
+    /// turns: the best turn is lifted to twice the piece, an unscored one stays
+    /// at it, and a piece with nothing scored is its own score throughout.
     #[test]
     fn a_pieces_rounds_rank_within_its_level() {
         assert_eq!(piece_round_score(500.0, 900.0, 900.0), 1_000.0);
@@ -507,41 +461,40 @@ mod tests {
     }
 
     /// An older exchange the room has no place for leaves whole; the current
-    /// exchange and the first request stay.
+    /// exchange and the first exchange's floor stay.
     #[test]
     fn an_older_exchange_leaves_whole() {
         let slot = DialogueSlot {
-            room: 40,
-            caps: caps(),
-            recent: 0,
-            lineage: vec![],
-            working: vec![],
             own: vec![vec![k(1, 0)], vec![k(1, 1)], vec![k(1, 2)]],
-            context: vec![],
+            ..slot(40, caps(), vec![])
         };
-        let p = plan(&slot, |_| 0.0, ten);
-        assert_eq!(p.own, vec![(k(1, 0), None), (k(1, 2), None)]);
+        let p = plan(&slot, |_| 0.0, twenty);
+        assert_eq!(p.own, vec![k(1, 0), k(1, 2)]);
+    }
+
+    /// The current exchange past the room sheds its older tool turns, oldest
+    /// first, and keeps its first turn, its newest tool turn and its last.
+    #[test]
+    fn the_current_exchange_sheds_its_oldest_tool_turns() {
+        let slot = DialogueSlot {
+            own: vec![vec![k(1, 0), k(1, 1), k(1, 2), k(1, 3), k(1, 4)]],
+            ..slot(80, caps(), vec![])
+        };
+        let p = plan(&slot, |_| 0.0, twenty);
+        assert_eq!(p.own, vec![k(1, 0), k(1, 2), k(1, 3), k(1, 4)]);
     }
 
     /// A locked piece goes in whole even past the room.
     #[test]
     fn a_locked_piece_goes_in_whole() {
-        let slot = DialogueSlot {
-            room: 10,
-            caps: caps(),
-            recent: 0,
-            lineage: vec![],
-            working: vec![WorkingPiece {
-                kind: Kind::Reading,
-                locked: true,
-                score: 0.0,
-                exchanges: vec![vec![k(5, 0), k(5, 1)]],
-            }],
-            own: vec![],
-            context: vec![],
+        let locked = WorkingPiece {
+            kind: Kind::Reading,
+            locked: true,
+            score: 0.0,
+            exchanges: vec![vec![k(5, 0), k(5, 1)]],
         };
-        let p = plan(&slot, |_| 0.0, ten);
-        assert_eq!(p.working, vec![vec![(k(5, 0), None), (k(5, 1), None)]]);
+        let p = plan(&slot(10, caps(), vec![locked]), |_| 0.0, twenty);
+        assert_eq!(p.working, vec![vec![k(5, 0), k(5, 1)]]);
         assert_eq!(p.over_room, 30);
     }
 
@@ -556,15 +509,10 @@ mod tests {
             score: s,
         };
         let slot = DialogueSlot {
-            room: 10_000,
-            caps: caps(),
-            recent: 0,
-            lineage: vec![],
-            working: vec![],
-            own: vec![],
             context: vec![cx(7, 0.5), cx(8, 0.9)],
+            ..slot(10_000, caps(), vec![])
         };
-        let p = plan(&slot, |_| 0.0, ten);
-        assert_eq!(p.context, vec![vec![], vec![(k(8, 0), None)]]);
+        let p = plan(&slot, |_| 0.0, twenty);
+        assert_eq!(p.context, vec![vec![], vec![k(8, 0)]]);
     }
 }

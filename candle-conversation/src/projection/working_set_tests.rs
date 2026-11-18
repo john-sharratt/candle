@@ -133,6 +133,10 @@ impl ContentResolver for WsResolver {
         0.0
     }
 
+    fn trained_window(&self) -> Option<usize> {
+        None
+    }
+
     fn target_is_ingest_self(&self) -> bool {
         self.ingest_self
     }

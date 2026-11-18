@@ -1984,19 +1984,6 @@ impl DecodeState {
 ///
 /// `held` is the slot's token length, for the log only: it says whether the
 /// closed width accounts for everything standing on the slot or only part of it.
-/// Whether `pages` — `(token width, bytes)` in order — have a boundary at
-/// `edge`: the start, the end, or between two pages.
-fn pages_meet_at<B>(pages: &[(usize, B)], edge: usize) -> bool {
-    let mut at = 0usize;
-    if edge == 0 {
-        return true;
-    }
-    pages.iter().any(|(w, _)| {
-        at += *w;
-        at == edge
-    })
-}
-
 pub(super) fn close_unit_boundary(
     model: &(dyn ManagedBatchedModel + Send),
     slot: SequenceId,
@@ -5138,14 +5125,12 @@ impl Scheduler {
                                         segments.push(seg.clone());
                                     }
                                 }
-                                ProjectionSegment::Sealed(SealedKind::Turn(rt, _))
-                                | ProjectionSegment::Sealed(SealedKind::TurnHalf(rt, _)) => {
+                                ProjectionSegment::Sealed(SealedKind::Turn(rt, _)) => {
                                     // The turn carries its conversation (stamped at
                                     // projection); read it directly — no group→timeline
                                     // re-derivation.  `elevate_to_hot` below brings
                                     // cold-marker turns into hot before apply runs; a
-                                    // timeline-less (mock/untracked) turn is skipped, a
-                                    // record elevates the turn it belongs to.
+                                    // timeline-less (mock/untracked) turn is skipped.
                                     let Some(timeline) = rt.timeline else {
                                         continue;
                                     };
@@ -9946,11 +9931,6 @@ impl Scheduler {
                 _ => None,
             })
         });
-        // Where the turn's user record ends and its assistant record begins —
-        // each is placed alone, so a page must close there.
-        let record_edge = turn_content
-            .as_ref()
-            .and_then(|c| c.layout.user_record_end());
         // The turn's own token count, from the buffer whose contract is that it
         // "must match the K/V chunk grid 1-1". It is the tie-breaker when the
         // chunk sum and the index walk disagree: equal to the chunk sum means
@@ -10211,23 +10191,6 @@ impl Scheduler {
                         // The substrate holds the bytes until the write lands and
                         // the log after it; a slot that places the turn holds them
                         // again for as long as it does (`HeldIndexPages`).
-                        // Each record is placed alone with the pages inside it
-                        // (`docs/hit_driven_projection.md` §8.1), so the pages
-                        // must meet at the edge between the two. The prefill
-                        // closes a page after the message's `<|im_end|>`, which
-                        // is that edge; a turn whose pages straddle it seals as
-                        // usual and its records are refused at placement.
-                        if let Some(edge) = record_edge {
-                            if !pages_meet_at(&pages, edge as usize) {
-                                tracing::warn!(
-                                    turn = idx.0,
-                                    edge,
-                                    widths = ?pages.iter().map(|(w, _)| *w).collect::<Vec<_>>(),
-                                    "turn index pages do not meet at the edge between its user \
-                                     and assistant records — neither record can be placed alone"
-                                );
-                            }
-                        }
                         if covered == turn_token_count {
                             conversation.enqueue_index_page(
                                 turn_stream_id(target.timeline.raw(), idx.0),
@@ -12262,8 +12225,7 @@ impl Scheduler {
                             segments.push(seg.clone());
                         }
                     }
-                    ProjectionSegment::Sealed(SealedKind::Turn(rt, _))
-                    | ProjectionSegment::Sealed(SealedKind::TurnHalf(rt, _)) => {
+                    ProjectionSegment::Sealed(SealedKind::Turn(rt, _)) => {
                         // The turn carries its conversation (stamped at projection),
                         // so read it directly — no group→timeline re-derivation,
                         // which is what once resolved the first-registered timeline
@@ -13118,18 +13080,6 @@ mod tests {
     use candle_nn::kv_cache::KV_DEVICE_OOM_MARKER;
     use candle_transformers::models::speculative_choice::GreedyChooser;
     use std::sync::Mutex;
-
-    /// Pages meet at an edge when one ends there, or the edge is the start.
-    #[test]
-    fn pages_meet_only_where_one_ends() {
-        let pages = [(3usize, ()), (5, ()), (4, ())];
-        for edge in [0, 3, 8, 12] {
-            assert!(pages_meet_at(&pages, edge), "edge {edge}");
-        }
-        for edge in [1, 4, 7, 9, 13] {
-            assert!(!pages_meet_at(&pages, edge), "edge {edge}");
-        }
-    }
 
     /// A signature run with the reasoning span cut out of it.
     ///
@@ -17209,8 +17159,8 @@ mod tests {
     mod speculation_exits;
     mod speculation_in_a_grammar;
     mod splice_rebuild;
-    mod turn_records;
     mod urgent_hold_steps;
+    mod whole_turns;
 
     // —— admission (`admit_ground::AdmitPass`) ———————————————————————————————
 

@@ -592,9 +592,6 @@ pub fn from_projection_with_origins(
                 label: "current message".to_string(),
                 tokens: tokens.len() as u32,
             }),
-            // A record placed alone is part of its turn's display, not one of its
-            // own.
-            ProjectionSegment::Sealed(SealedKind::TurnHalf(..)) => None,
             // Structural framing — not materialized content.
             ProjectionSegment::Generated { .. } => None,
         })
@@ -684,8 +681,6 @@ fn build_selection(
                     qualified: false,
                 });
             }
-            // A record placed alone is not a displayed dialogue turn of its own.
-            ProjectionSegment::Sealed(SealedKind::TurnHalf(..)) => {}
             ProjectionSegment::Generated { tokens, identity } => {
                 emitted_glue.insert(identity.name.as_str(), tokens.len() as u32);
             }
@@ -1190,6 +1185,9 @@ layers:
         }
         fn turn_score(&self, _turn: TurnKey) -> f32 {
             0.0
+        }
+        fn trained_window(&self) -> Option<usize> {
+            None
         }
         fn section_token_count(&self, section: SectionId) -> usize {
             *self.section_tokens.get(&section.raw()).unwrap_or(&0)

@@ -77,7 +77,7 @@ async fn a_repository_loads_whole_through_an_agent_in_process() {
     std::fs::create_dir_all(&agent_dir).unwrap();
     git(&agent_dir, &["clone", "-q", origin.to_str().unwrap(), "r"]);
     let yaml = format!(
-        "jobs_dir: '{}'\nslots: 1\ncheckouts:\n  - name: r\n    dir: '{}'\n",
+        "jobs_dir: '{}'\ncheckouts:\n  - name: r\n    dir: '{}'\n",
         agent_dir.join("jobs").display(),
         agent_dir.join("r").display(),
     );
@@ -85,7 +85,7 @@ async fn a_repository_loads_whole_through_an_agent_in_process() {
     std::fs::write(&cfg_file, yaml).unwrap();
     let cfg = AgentConfig::load(&cfg_file).unwrap();
     let checkouts = Checkouts::open(&cfg, &CommandPolicy::allowing(Vec::<String>::new())).unwrap();
-    let jobs: Arc<Jobs> = Jobs::new(checkouts, 1, Priority::Below);
+    let jobs: Arc<Jobs> = Jobs::new(checkouts, Priority::Below, cfg.build_hold());
 
     let sub = tmp.path().join("substrate");
     std::fs::create_dir(&sub).unwrap();

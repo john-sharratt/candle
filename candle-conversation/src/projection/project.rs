@@ -117,7 +117,6 @@ use super::working_set_pick;
 use super::working_set_pick::Standing;
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{NodeId, SelectionDiagnostics, SelectionOrigin};
-use crate::turn_layout::TurnRecord;
 
 /// Collapse `keys` into exchange candidates: one `(representative, score)` per
 /// exchange, in first-appearance order, recording each representative's full
@@ -176,10 +175,6 @@ static SLOT_EXPANDED_WARNED: AtomicBool = AtomicBool::new(false);
 /// Whether a dialogue with a working set has been projected without a fill —
 /// its members placed whole, no cap binding — once for the process.
 static UNFILLED_REPORTED: AtomicBool = AtomicBool::new(false);
-
-/// Whether the fill has priced a turn holding tokens at nothing — a turn whose
-/// records have no edge, which no cap can bind — once for the process.
-static UNPRICED_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Emit a selected candidate: the exchange's turns in ascending order, right
 /// where the representative sat. Selection ranks representatives; this is the
@@ -393,12 +388,6 @@ pub enum ProjectionSegment {
 pub enum SealedKind {
     Section(ResolvedSection),
     Turn(ResolvedTurn, crate::Role),
-    /// One record of a turn — its user record or its assistant record — placed
-    /// alone, as zero-copy windows over the turn's chunks with the index pages
-    /// that cover it (`docs/hit_driven_projection.md` §8.1). A tool round is
-    /// one turn's assistant record and the next turn's user record; a
-    /// [`SealedKind::Turn`] places both of one turn's together.
-    TurnHalf(ResolvedTurn, crate::turn_layout::TurnRecord),
 }
 
 /// Diagnostic identity for a [`ProjectionSegment::Generated`] run.
@@ -2224,8 +2213,6 @@ pub fn run_with_sink<R: ContentResolver>(
     }
 
     // ── Step 11b: The dialogue's fill ────────────────────────────────────────
-    // Turns placed as one record alone, by the carving the fill chose.
-    let mut record_of: HashMap<TurnKey, TurnRecord> = HashMap::new();
     if let Some(((layer, ws), trained)) = fill_target {
         let slot_window = ws.slot_window(trained);
         if let Some(why) = &slot_window.expanded {
@@ -2368,29 +2355,9 @@ pub fn run_with_sink<R: ContentResolver>(
         let plan = dialogue_fill::plan(
             &slot,
             |k| resolver.turn_score(k),
-            |k, r| {
-                let tokens = resolver.record_tokens(k, r);
-                if r == TurnRecord::Assistant && tokens == 0 {
-                    let whole = resolver.turn_token_count(k);
-                    if whole > 0 && !UNPRICED_WARNED.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(
-                            timeline = k.timeline.raw(),
-                            turn = k.index.0,
-                            whole,
-                            "the fill prices a turn holding tokens at nothing: its records \
-                             have no edge, so no cap binds on it and it is placed whole"
-                        );
-                    }
-                }
-                tokens
-            },
+            |k| resolver.turn_token_count(k),
         );
-        let mut push = |gid: GroupId, (key, record): (TurnKey, Option<TurnRecord>)| {
-            final_selected.push((gid, key));
-            if let Some(r) = record {
-                record_of.insert(key, r);
-            }
-        };
+        let mut push = |gid: GroupId, key: TurnKey| final_selected.push((gid, key));
         for p in plan.lineage.into_iter().chain(plan.own) {
             push(target.group, p);
         }
@@ -2543,16 +2510,11 @@ pub fn run_with_sink<R: ContentResolver>(
     // injects `user_start` before / `assistant_end` after every
     // `Sealed::Turn` from its own pre-tokenised `BoundaryMarkers`
     // (held on the scheduler, threaded through `ApplyContext`).
-    // A turn the fill carved to one record goes in as that record alone.
-    segments.extend(turns.into_iter().map(|t| {
-        let carved = t
-            .timeline
-            .and_then(|tl| record_of.get(&TurnKey::new(tl, t.index())));
-        match carved {
-            Some(r) => ProjectionSegment::Sealed(SealedKind::TurnHalf(t, *r)),
-            None => ProjectionSegment::Sealed(SealedKind::Turn(t, crate::Role::Assistant)),
-        }
-    }));
+    segments.extend(
+        turns
+            .into_iter()
+            .map(|t| ProjectionSegment::Sealed(SealedKind::Turn(t, crate::Role::Assistant))),
+    );
     Projection {
         segments,
         selections: resolved_selections,

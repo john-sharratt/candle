@@ -55,8 +55,7 @@ impl Scheduler {
 /// The turn a segment injects, when it injects one of a known conversation.
 fn turn_of(seg: &ProjectionSegment) -> Option<(TimelineId, TurnIndex)> {
     match seg {
-        ProjectionSegment::Sealed(SealedKind::Turn(rt, _))
-        | ProjectionSegment::Sealed(SealedKind::TurnHalf(rt, _)) => {
+        ProjectionSegment::Sealed(SealedKind::Turn(rt, _)) => {
             rt.timeline.map(|tl| (tl, rt.index()))
         }
         _ => None,

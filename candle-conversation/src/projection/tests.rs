@@ -206,6 +206,10 @@ impl MockResolver {
 }
 
 impl ContentResolver for MockResolver {
+    fn trained_window(&self) -> Option<usize> {
+        None
+    }
+
     fn target_is_ingest_self(&self) -> bool {
         self.ingest_self
     }

@@ -27,8 +27,6 @@ pub enum PieceKind {
     Section,
     /// A sealed conversation turn, boundary markers included.
     Turn,
-    /// The user half of a turn, injected alone by a compression pass.
-    TurnHalf,
     /// Structural template tokens prefilled live (role markers, envelopes).
     Glue,
     /// The user message of the turn being submitted.
@@ -104,9 +102,6 @@ pub(crate) fn lay_out(
             }
             ProjectionSegment::Sealed(SealedKind::Turn(turn, role)) => {
                 turn_piece(PieceKind::Turn, turn, Some(role_str(*role)), scores, source)
-            }
-            ProjectionSegment::Sealed(SealedKind::TurnHalf(turn, _)) => {
-                turn_piece(PieceKind::TurnHalf, turn, None, scores, source)
             }
             ProjectionSegment::Generated { tokens, identity } => piece_of(
                 PieceKind::Glue,

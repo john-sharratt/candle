@@ -62,10 +62,7 @@ The findings this answers are in
   a folder summary, a guide or journal note, one link of the inherited lineage,
   or the dialogue itself.
 - **Round**: one unit the slot places or removes whole, carved from a piece by
-  the round grammar (§8.1): its opening request, one tool call with its result,
-  or its closing answer.
-- **Half**: one of a turn's two records, the user record or the assistant
-  record (`code_read::couple_turn`), sealed on its own (§8.1).
+  the round grammar (§8.1): one whole turn of it.
 - **Cell, block, chunk**: a cell is one position. A block is `ratio` cells
   (four on Flash-Next), one row of the index and the unit the selection ranks
   (`qsa_select.rs`); the checkpoint's budget is 2,051 cells, about 512 blocks.
@@ -532,48 +529,44 @@ U request · (A call · U result)* · A answer
 - each **tool round**: the assistant's call and the result returned for it;
 - the **answer**: the assistant's closing reply.
 
-These are the rounds the slot places. The request and the answer are the
-piece's floor: when any round of a piece is placed, its request and answer
-are placed with it. A carving keeps the grammar by construction. Dropping any
-tool round leaves a request, rounds that each answer the turn before them, and
-a closing answer to the request.
+The turn store keeps a turn as a user record and an assistant record
+(`code_read::couple_turn`): turn `n` is the result of call `n − 1` and the
+reply that makes call `n`. **The rounds the slot places are whole turns**
+(`projection/rounds.rs`): round 0 is the first turn (the request and the
+first call), the last round is the last turn (the last result and the
+answer), and the rounds between are the tool turns. The first and last turn
+are the piece's floor: when any round of a piece is placed, its floor is
+placed with it. Every turn is placed whole, so every carving reads `U A U A …`
+from the request to the answer.
 
-Tool rounds cross turns. The turn store keeps a turn as a user record and an
-assistant record (`code_read::couple_turn`): turn `n` is the result of call
-`n − 1` and the reply that makes call `n`. A round's call is one turn's
-assistant record and its result is the next turn's user record, so a round is
-two whole records from two adjacent turns, never a record split at the call.
-Those records are the **halves**: each is sealed on its own, with its own
-index page.
-
-- **Sealed per half.** Every turn is sealed as its two records, each with
-  K/V and index rows of its own. A half placed alone
-  (`inject_sealed_turn_half`) carries its index page, so the indexer scores it
-  and the hit map counts it as a block range of its round. A half placed
-  without an index page is not a valid placement: the selection could not
-  rank it, and it would be attended only through the query's tail. The
-  substrate starts empty under the new key (§4), so every record is sealed
-  per half from its first write. The page between the halves closes after
-  the user record's `<|im_end|>` on every prefill path: a single-sequence
-  prefill splits its span at each break token, and a creeping wave group
-  ends a member's chunk just past the first break it would cross and closes
-  the page when that sweep commits (`scheduler/page_cut.rs`), all in one
-  batched forward.
-- **Ragged, not padded.** Each half ends on its own partial chunk and partial
-  block, as every system-prompt section already does (§5). Seated halves take
-  consecutive positions; the short tail is a short page in storage, never dead
-  positions in the slot.
-- **Seated by the call that produced it.** A round's call and result keep
-  their order and sit between the request and the answer. Rounds keep the
-  order they were read in, so the pages they hold read in file order.
+- **Whole turns, never records.** A turn's index pages always start and end
+  with the turn, so a whole turn is always placeable with every row it has.
+  The page edge between a turn's two records is only where the seal cut one.
+  Turns sealed before the creeping wave group cut there (bc47bed15,
+  2026-11-15) have a page straddling the edge. Measured 2026-11-18, a
+  reading's turn with pages `[0, 4858, 4907, 4908]` against an edge of 4850
+  could not be placed a record at a time, and every reprojection of a
+  dialogue that carved it failed. So records are never placed alone, and
+  nothing reads the record edge.
+- **A dropped tool turn parts a call from its result.** In a run of kept
+  turns, each call is followed by its own result. At a gap, a kept turn's call
+  is followed by the next kept turn's result, for another page. The result's
+  fence names its own file and lines. The battery measures what the gap
+  costs.
+- **Ragged, not padded.** Each turn ends on its own partial chunk and partial
+  block, as every system-prompt section already does (§5). Seated turns take
+  consecutive positions; the short tail is a short page in storage, never
+  dead positions in the slot.
+- **Seated in their own order.** Kept turns keep the order they were read in,
+  so the pages they hold read in file order.
 
 ### 8.2 A file's reading is carved
 
 A code reading (`zend/src/code_read/`) is one piece. Its request asks for the
 file, its tool rounds each read one range of it, and its answer summarises it.
-The pool holds the whole reading; the slot holds its request and answer and
-the pages the indexer asks for. Placing a 48K-token file in a dialogue does
-not cost 48K, only the pages the question reads.
+The pool holds the whole reading; the slot holds its first and last turns and
+the pages the indexer asks for. Placing a 306K-token file in a dialogue does
+not cost 306K, only the pages the question reads, up to `max_file`.
 
 - **One read per reply.** The reading asks for one `file_read` per reply, one
   range of at most `PAGE_LINES` (200) lines each, so each tool round is one page
@@ -583,44 +576,47 @@ not cost 48K, only the pages the question reads.
   (`opening_prompt`, the reading's tool grammar), and its round limit is the
   file's page count, not `MAX_FILE_READ_ROUNDS`, so a file of any length reads
   to its end in rounds of one page.
-- **Scored per round.** Each page has its own hit counter and base. Its base
-  is provenance's normalized score for that round (§7.1), lifted by its hits.
-  A page enters the fill at its piece's score, lifted by up to as much again
-  by how its own score stands among the piece's pages
+- **Scored per turn.** Each page turn has its own hit counter and base. Its
+  base is provenance's normalized score for that turn (§7.1), lifted by its
+  hits. A page enters the fill at its piece's score, lifted by up to as much
+  again by how its own score stands among the piece's pages
   (`dialogue_fill::piece_round_score`). So the piece's level decides how it
   ranks against other pieces, and its pages' own scores decide which of them
   the slot holds. A piece with no scored page enters at its own score, and
   ties go to the oldest page.
-- **Open: the fill does not carve in production.** Measured 2026-11-18 on
-  BlackWorld, every placed turn of 30 dialogue prompts was whole, never a
-  single record, with the working-set groups past their 64K budget each time
-  (`docs/zend_working_set.md` §4.4). So the caps of step 4 bind in tests and
-  not on the daemon. Until they do, a reading longer than `max_file` cannot be
-  a member.
+- **A reading longer than `max_file` is a member.** The working set charges it
+  `max_file_tokens`, the most of it the slot places, not its whole size
+  (`docs/zend_working_set.md` §4.4). It is pooled whole like any piece, and
+  the slot holds its floor and best pages under the `max_file` cap.
+- **The fill did not run on the daemon until 2026-11-18.** Every placed turn
+  of 30 dialogue prompts was whole, with the working-set groups past their
+  64K budget each time. `SubstrateRead` answered the trait's default
+  `trained_window` of `None` to `TargetedRead`, so every dialogue projected
+  as if its engine did not select. `trained_window` now has no default.
 - **The reading's own projection is not carved.** While a reading is being
   ingested its conversation is its own target and selected whole
   (`target_is_ingest_self`), as it is today.
 
 ### 8.3 The dialogue
 
-The dialogue is carved by the same grammar, and each exchange is a piece of it
-for the floor rule: the user's turn, its tool rounds and the assistant's
-answer to it, never the user's turn without its answer.
+The dialogue is carved by the same grammar, in whole turns, and each exchange
+is a piece of it for the floor rule: its first turn and its last, never the
+user's turn without its answer.
 
 - **Recent exchanges are floors, whole.** The current exchange and the
-  `recent` (16) before it hold every round they have, tool rounds included,
-  and give way only as §7.2 says when the floors pass the room: tool rounds
-  oldest first, then the exchange whole.
-- **Older exchanges compete by score.** An older exchange's request and
-  answer are one round of the fill, the **pair**, scored from their turns'
-  base and lifted by their hits; a plain question and answer is that pair
-  alone. Each of its tool rounds is a round of its own, scored the same way,
-  and is admitted only with the pair: a tool round that ranks before its pair
+  `recent` (16) before it hold every turn they have, and give way only as
+  §7.2 says when the floors pass the room: tool turns oldest first, then the
+  exchange whole. The current exchange keeps its first turn, its newest tool
+  turn and its last.
+- **Older exchanges compete by score.** An older exchange's first and last
+  turns are one unit of the fill, the **pair**, scored from their turns' base
+  and lifted by their hits; a plain question and answer is one turn, its own
+  pair. Each of its tool turns is a unit of its own, scored the same way, and
+  is admitted only with the pair: a tool turn that ranks before its pair
   brings the pair with it and enters only if both fit. So the history is
-  score-ordered, and what remains of any exchange still reads as a complete
-  exchange. A reading's request and answer are not a pair of this kind: they
-  carry nothing without a page, so they come only with its first placed
-  round (§8.1).
+  score-ordered, and what remains of any exchange opens on its request and
+  closes on its answer. A reading's floor comes only with its first placed
+  tool turn (§8.1).
 
 ### 8.4 The inherited lineage
 
@@ -683,7 +679,7 @@ had said it is read back as something it said
 | `ManagedBatchedModel` hooks for pinned ranges, hit rounds and summaries, and the trained window (no-ops for a model that does not select) | `candle-transformers/src/models/batched_inference.rs` |
 | `pool_tokens` per card size; pooled K/V warmed, cold where warm runs short | `candle-conversation/src/scheduler/{pool,pool_refresh,pooled_rounds}.rs`, `candle-conversation/src/persistence/warm_asks.rs`, `candle-conversation/src/projection/cold_to_warm.rs` |
 | Rounds carved by the grammar; slot order locks, pins, floors, score | `candle-conversation/src/projection/{rounds,fill,dialogue_fill}.rs`, `candle-conversation/src/scheduler/projection_assembler.rs` |
-| Every turn record placed alone, each with its index pages | `candle-conversation/src/{turn_layout,index_pages,substrate}.rs`, `candle-conversation/src/scheduler/projection_assembler.rs` |
+| Every turn placed whole, with all its index pages | `candle-conversation/src/projection/rounds.rs`, `candle-conversation/src/scheduler/projection_assembler.rs` |
 | One `file_read` per reply in code-reading ingest, the round limit the file's page count | `zend/src/code_read/mod.rs` |
 | Shared sampled-layer index pages per card | `candle-transformers/src/models/qwen4exp/{resident_page,wave}.rs`, the span's region pool |
 
@@ -703,8 +699,7 @@ had said it is read back as something it said
   reads those keys once for all its queries, against once per token if it ran
   in the forward.
 - **Ingest.** One read per reply makes a reading take one reply per page:
-  more, shorter turns than batched reads, and every turn record sealed in two
-  halves.
+  more, shorter turns than batched reads.
 - **K/V.** At most the trained window, against about 428K of budget today.
 - **Decode.** One window instead of two halves the cells a query reads at a
   full slot. The pinned ranges add their cells to every query's read.
@@ -747,18 +742,16 @@ answers to and where it lives.
    hits), and a reprojection reads the summary without waiting on the
    device, as MoE routing's summary is read (AGENTS invariant 3). Queries are
    counted on the device.
-6. **Per-record sealing (§8.1).** A turn's user and assistant records are
-   placed alone, each with the index pages inside it, and a record with none
-   is refused at placement; the seal warns when its pages miss the edge
-   between the records (`turn_layout.rs`, `index_pages.rs`).
+6. **Whole-turn placement (§8.1).** Every turn is placed whole with all its
+   pages, whatever its inner page cuts (`scheduler/tests/whole_turns.rs`).
 7. **One read per reply (§8.2).** Code-reading ingest bounds a reply to one
    `file_read` call; the reading's grammar is a loop of one call, its round
    limit the file's page count (`zend/src/code_read/mod.rs`).
 8. **Rounds (§8.1, §8.3).** `projection/rounds.rs` carves every placed piece
-   and the dialogue into rounds by the grammar; hits are declared and counted
-   per round of each exchange, and a round's momentum lifts the turns it
-   covers. A round is named by its piece and index, so its counter and
-   momentum follow it across projections.
+   and the dialogue into whole-turn rounds; hits are declared and counted per
+   round of each exchange, and a round's momentum lifts its turn. A round is
+   named by its piece and index, so its counter and momentum follow it across
+   projections.
 9. **Score (§7.1).** Hit momentum per working-set member and per round,
    folded at every reprojection, lifting working-set strength and turn
    scores. Density reads each round against the denominator it was counted
@@ -783,8 +776,8 @@ answers to and where it lives.
     by score under the caps (budget, folders, guidance, `max_file_tokens`,
     the target's window, each other layer's window), each round bringing its
     piece's floor, every unit placed once. A dialogue's lineage, working set
-    and exchanges are one fill, carved back into whole turns and single
-    records in seating order (`dialogue_fill.rs`). On a selecting engine
+    and exchanges are one fill, carved back into whole turns in seating order
+    (`dialogue_fill.rs`). It runs on the daemon since 2026-11-18 (§8.2). On a selecting engine
     every group of the projection enters the fill, so nothing is flexed.
     `slot_tokens` and `slot_room` are gone: the slot is the engine's `L0`
     less `reserve_tokens`, and a working set whose `lock_tokens` and

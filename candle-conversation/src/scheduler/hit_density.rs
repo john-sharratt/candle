@@ -13,7 +13,7 @@ use std::hash::Hash;
 
 use candle_transformers::models::hit_layers::PieceHits;
 
-use crate::projection::rounds::{records_of, RoundKey};
+use crate::projection::rounds::RoundKey;
 use crate::projection::{TimelineId, TurnIndex, TurnKey};
 
 /// One part of a stride's read: the keys the pieces were declared under, and
@@ -77,9 +77,9 @@ pub(super) fn round_density(parts: &[HitPart]) -> HashMap<RoundKey, f32> {
     density_by(parts, |k| *k)
 }
 
-/// Each turn's lift from its rounds' `lifts`: a turn is two records, each in
-/// one round, and is lifted by the more read of the two. `exchange` names the
-/// turns of the exchange a round's head opens.
+/// Each turn's lift from its round's `lifts`: a round is one whole turn, so
+/// round `index` of an exchange lifts that exchange's `index`-th turn.
+/// `exchange` names the turns of the exchange a round's head opens.
 pub(super) fn turn_lifts(
     lifts: impl IntoIterator<Item = (RoundKey, f32)>,
     mut exchange: impl FnMut(TimelineId, TurnIndex) -> Option<Vec<TurnIndex>>,
@@ -89,7 +89,7 @@ pub(super) fn turn_lifts(
         let Some(turns) = exchange(key.timeline, key.head) else {
             continue;
         };
-        for (turn, _) in records_of(&turns, key.index as usize) {
+        if let Some(&turn) = turns.get(key.index as usize) {
             let at = out.entry(TurnKey::new(key.timeline, turn)).or_insert(lift);
             *at = at.max(lift);
         }
@@ -218,10 +218,11 @@ mod tests {
         assert_eq!((c[&tl(7)], c[&tl(9)]), (1.0, 1.0));
     }
 
-    /// A turn takes the larger lift of the two rounds its records are in: in
-    /// an exchange of turns 4, 5, round 1 (4's call, 5's result) lifts both.
+    /// A round lifts its own turn: in an exchange of turns 4, 5, round 0 lifts
+    /// turn 4 and round 1 lifts turn 5; a round past the exchange, or of no
+    /// known exchange, lifts nothing.
     #[test]
-    fn a_turn_takes_the_larger_lift_of_its_rounds() {
+    fn a_round_lifts_its_own_turn() {
         let exchange = |_: TimelineId, head: TurnIndex| {
             (head == TurnIndex(4)).then(|| vec![TurnIndex(4), TurnIndex(5)])
         };
@@ -229,13 +230,14 @@ mod tests {
             [
                 (key(7, 4, 0), 1.5),
                 (key(7, 4, 1), 2.0),
+                (key(7, 4, 2), 9.0),
                 (key(7, 9, 0), 3.0),
             ],
             exchange,
         );
-        assert_eq!(lifts[&TurnKey::new(tl(7), TurnIndex(4))], 2.0);
+        assert_eq!(lifts[&TurnKey::new(tl(7), TurnIndex(4))], 1.5);
         assert_eq!(lifts[&TurnKey::new(tl(7), TurnIndex(5))], 2.0);
-        assert_eq!(lifts.len(), 2, "a round of no known exchange lifts nothing");
+        assert_eq!(lifts.len(), 2);
     }
 
     /// The summary counts each part's queries, and splits the declared rounds
