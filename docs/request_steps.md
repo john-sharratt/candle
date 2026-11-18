@@ -59,32 +59,47 @@ a new one, which has no steps yet.
 ### 2.2 Where they render
 
 The steps are part of the journal collection in `zend/src/prompts/projection.yaml`.
-They come after the conversation's own entries and before `journal/close`, so
-the journal reads as the record so far, then the work in progress, then what is
-still open:
+The journal reads in two parts under their own headings: **Journal history**,
+the entries, then **Current request**, the steps. Both come before
+`journal/close`, so the journal reads as the record so far, then the work in
+progress, then what is still open:
 
 ```
+Journal history:
+Entry 6 — Reviewed the onboarding flow and listed its three demo-mode leaks.
 Entry 7 — Began making demo mode anonymous across the employee lifecycle.
-Steps of the current request, as noted so far:
+
+Current request:
 Step 1 — The demo flag is read in three places; only session.rs gates on it.
 Step 2 — EmployeeCard renders the real name before the demo check runs.
 …
+
 Still open: …
 ```
 
-- One section per step, `journal/step/<n>`, chained after the entries like
+- **`journal/history`** is the fixed heading line before the first entry. It
+  is part of the chain, so adding it reseals each conversation's journal once.
+  After that it is sealed with the entries and costs nothing per round. A
+  journal with no entry pins no section (`docs/zend_journal.md` §4), and its
+  heading goes with them.
+- **`journal/current`** is the fixed heading line before the first step. It is
+  submitted with the first step of a request and removed with the last, so a
+  journal with no request in progress shows no Current request heading.
+- One section per step, `journal/step/<n>`, chained after the heading like
   every journal section (`Sequence::submit_section`'s `after`). A new step
-  seals its own line and the closing section, nothing before it. The heading
-  is `journal/steps`: a fixed line sealed when the first step arrives, with the
-  steps after it.
+  seals its own line and the closing section, nothing before it.
+- The calendar's date lines (`docs/zend_journal.md` §4) stay inside Journal
+  history, above the entries they date. Steps carry no dates: they are all of
+  the one request in progress.
 - `n` is the step's number within its request, counted from 1. Numbers stay
   fixed as steps age out (§2.4), so "Step 3" means the same step on every round.
 - **The text, verbatim, clipped to 400 characters** with `…`. These are the same
   bounds a draft's parts are shown at (`docs/zend_journal.md` §3.1). The note
   grammar sets no length bound, and one runaway note must not take the room.
-- The journal intro gains one sentence naming the steps as the notes the model
-  has written so far in the request it is working on. It says nothing about
-  where the notes came from beyond that.
+- The journal intro names the two parts: Journal history holds the entries
+  for earlier work, one line each, and Current request holds the notes the
+  model has written so far in the request it is working on. It says nothing
+  about where the notes came from beyond that.
 
 ### 2.3 When they change
 
@@ -96,7 +111,8 @@ current request, exactly as it reconciles entries (`Carried`):
   newest tool turn, which the fill keeps (§3), so the note is in view either
   way. By the round after that, the section has sealed and is pinned.
 - **A request that finishes** loses its steps at the next round's reconcile.
-  Every `journal/step/*` section is removed, and the closing section reseals.
+  Every `journal/step/*` section and the `journal/current` heading are removed,
+  and the closing section reseals.
   The request's closing entry, drafted as soon as it finishes (§6 there; may
   not skip), is the high-level line that replaces them.
 - **A progress entry within the request** (every 16 rounds, or selection
@@ -193,6 +209,9 @@ Made in writing this, to be confirmed or reversed before it is built:
 
 - **Placement** after the entries, before `journal/close` (§2.2). The steps
   read as the newest part of the record, and "Still open" stays last.
+- **Two headed parts**, Journal history and Current request (§2.2), asked for
+  by the user on 2026-11-19, so the model reads earlier work and the request it
+  is in as two things.
 - **One section per step**, so a new step seals one line (§2.2). The
   alternative, one section for all steps, reseals every step on every note.
 - **Clipping at 400 characters** (§2.2).
@@ -209,8 +228,8 @@ Made in writing this, to be confirmed or reversed before it is built:
 |---|---|
 | `zend/src/journal/steps.rs` | `Steps`: a request's first turn and its steps; grow from a sealed reply, reset on a new request, rebuild from the request's turns, the newest 64 |
 | `zend/src/journal/notes.rs` | reading a reply's note calls with their `journal`, so a memory-journal note is told apart |
-| `journal-core/src/section.rs` | the `journal/steps` heading and `journal/step/<n>` names; a step's rendered line |
-| `zend/src/journal/carry.rs` | the steps in the wanted sections, between the entries and `journal/close` |
+| `journal-core/src/section.rs` | the `journal/history` and `journal/current` headings and `journal/step/<n>` names; a step's rendered line |
+| `zend/src/journal/carry.rs` | the wanted sections in order: history heading, entries, current heading, steps, `journal/close` |
 | `zend/src/journal/state.rs` | `SessionJournal` holds the `Steps` |
 | `zend/src/prompts/projection.yaml` | the intro's sentence on steps |
 | `candle-conversation/src/projection/` tests | the end-to-end request-turn test (§3) |
@@ -221,9 +240,10 @@ Made in writing this, to be confirmed or reversed before it is built:
   journal's do not; a new request resets them; the 65th step drops the first
   and keeps the numbers; a note longer than 400 characters is clipped with `…`;
   a rebuild from a request's turns equals the steps grown round by round.
-- **Sections** (raw expected text): the heading and step lines render exactly;
-  the wanted sections order is entries, steps, close; a finished request wants
-  no step section.
+- **Sections** (raw expected text): both headings and the step lines render
+  exactly; the wanted sections run history heading, entries, current heading,
+  steps, close; a journal with no entry wants no history heading; a finished
+  request wants neither the current heading nor a step.
 - **Carry:** a new step seals one section and the close; a finished request
   removes every step section; a progress entry leaves the steps standing.
 - **Handover:** a conversation taken up mid-request (`resume_conversation`)
