@@ -359,6 +359,7 @@ pub(super) fn fresh(
         checked: false,
         // `begin` names the member it begins on.
         runner: None,
+        handed_ms: None,
         by_task: false,
     }
 }
@@ -514,18 +515,20 @@ fn revive(
     worker.state = State::Running;
     worker.error = None;
     worker.ended_ms = None;
-    worker.resumes += 1;
+    // A member that left handed it on (`docs/turn_handover.md` §5): that is
+    // explained, and does not count toward the bound on unexplained losses.
+    let why = match worker.handed_ms.take() {
+        Some(_) => "handed on by a member that left".to_string(),
+        None => {
+            worker.resumes += 1;
+            format!("cut off, try {}", worker.resumes)
+        }
+    };
     worker.beat_ms = now;
     worker.turn_ms = now;
     worker.entries_after = newest_entry(session.journal(&worker.conv_id).as_ref());
     worker.entries = Vec::new();
-    note(
-        records,
-        owner,
-        worker,
-        "Resumed:",
-        format!("cut off, try {}", worker.resumes),
-    )?;
+    note(records, owner, worker, "Resumed:", why)?;
     Ok(told)
 }
 
@@ -1058,6 +1061,19 @@ async fn taken_within(records: &dyn Records, owner: &str, worker: &Worker, to: u
     }
 }
 
+/// Say on `worker`'s record that this member stopped it as it left: no runner,
+/// handed now, so another member resumes it at once (`docs/turn_handover.md`
+/// §5). Its state stays running — nothing ended it.
+fn hand_left(records: &dyn Records, owner: &str, worker: &Worker) {
+    if let Some(mut w) = threads::worker(records, owner, &worker.thread, &worker.name) {
+        w.runner = None;
+        w.handed_ms = Some(now_ms());
+        if let Err(e) = threads::put_worker(records, owner, &w) {
+            tracing::warn!(conv_id = %w.conv_id, "mcp: the worker could not be marked handed: {e}");
+        }
+    }
+}
+
 /// Say on `worker`'s record that it still runs, now.
 fn beat_now(records: &dyn Records, owner: &str, worker: &Worker) {
     if let Some(mut w) = threads::worker(records, owner, &worker.thread, &worker.name) {
@@ -1153,6 +1169,10 @@ enum Turned {
         call_turn: u32,
         iteration: usize,
     },
+    /// The member left its clusters under the turn ([`StreamItem::Left`]): the
+    /// turn stopped where it stood, its round's entries kept, for another
+    /// member to resume (`docs/turn_handover.md` §4).
+    Left,
 }
 
 impl Ended {
@@ -1216,8 +1236,26 @@ async fn run(
             && first.is_none()
             && worker.runner.is_some()
             && worker.runner == worker_hop::own_node();
+        // Counted as running through the turn and, when the member leaves
+        // under it, the record written after: the leave waits for both.
+        let running = session.turn_running();
         let ended = match turn(&session, &worker, next, movable, &live).await {
-            Turned::Ended(ended) => ended,
+            Turned::Ended(ended) => {
+                drop(running);
+                ended
+            }
+            Turned::Left => {
+                beating.abort();
+                let _ = beating.await;
+                drop(lease.take());
+                hand_left(&records, &owner, &worker);
+                tracing::info!(
+                    conv_id = %worker.conv_id,
+                    "mcp: the member leaves — the worker is handed on for another member to resume",
+                );
+                drop(running);
+                return;
+            }
             Turned::Handed {
                 to,
                 call_turn,
@@ -1709,6 +1747,7 @@ async fn turn(
     let mut failed: Option<String> = None;
     let mut closed: Option<&'static str> = None;
     let mut handed: Option<(u64, u32, usize)> = None;
+    let mut left = false;
     while let Some(item) = stream.next().await {
         if let Ok(item) = &item {
             live.observe(item);
@@ -1725,11 +1764,15 @@ async fn turn(
                 call_turn,
                 iteration,
             }) => handed = Some((to, call_turn, iteration)),
+            Ok(StreamItem::Left) => left = true,
             Ok(_) => {}
             Err(e) => {
                 failed.get_or_insert(format!("{e:#}"));
             }
         }
+    }
+    if left {
+        return Turned::Left;
     }
     let last = if text.is_empty() { ended } else { text };
     turned(last, failed, closed, handed)
@@ -1737,7 +1780,8 @@ async fn turn(
 
 /// What a turn that streamed `text` came to: a failure first, since nothing
 /// it said can be trusted; then a move, since its round is not over; then a
-/// close; else a reply.
+/// close; else a reply. A turn the member left under is [`Turned::Left`]
+/// whatever else it streamed, read before this.
 fn turned(
     text: String,
     failed: Option<String>,
@@ -1985,6 +2029,7 @@ mod tests {
             audit: None,
             checked: false,
             runner: None,
+            handed_ms: None,
             by_task: false,
         }
     }

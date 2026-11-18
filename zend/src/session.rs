@@ -134,6 +134,7 @@ use crate::journal::world::{Citable, JournalsAbove};
 use crate::journal::{carry, draft, origin, pressure};
 use crate::layers::expiry::now_ms;
 use crate::layers::keys::SUBJECT_KEY;
+use crate::leaving::{Leaving, Running, LEAVE_TURNS_WAIT};
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::mcp::chats::sweep as chat_sweep;
@@ -141,6 +142,7 @@ use crate::mcp::diaries::placement as diary_placement;
 use crate::mcp::memory::readers::MemoryReaders;
 use crate::mcp::memory::Memory;
 use crate::mcp::ownership::owner_of;
+use crate::mcp::resuming::RESUME_SWEEP;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
 use crate::mcp::zen_tasks::{level_of, withhold_by_level};
@@ -158,6 +160,7 @@ use crate::repo_path::shown as shown_unit;
 use crate::repo_scan::{utility_config, DIR_KEY};
 use crate::resident::Resident;
 use crate::resume;
+use crate::resume::Unfinished;
 use crate::retrieval_scope::{Readers, RetrievalScope};
 use crate::round_timing::{self, RoundTiming};
 use crate::self_check::{self, Report as SelfCheckReport};
@@ -320,7 +323,15 @@ pub enum StreamItem {
         /// moves.
         iteration: usize,
     },
+    /// The member is leaving its clusters: the turn stopped where it stood,
+    /// nothing of its round sealed, its entries kept and its conversation
+    /// marked for the member that takes it (`docs/turn_handover.md` §4). Sent
+    /// once, last.
+    Left,
 }
+
+/// What a client streaming a turn is told when the member leaves under it.
+pub const LEFT_STATUS: &str = "this member is restarting: the reply continues on another member";
 
 /// A sealed call turn whose round a turn finishes (`TurnStart::resume`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -981,6 +992,11 @@ struct InferenceState {
     /// Moved by every conversation delete, so a reply running on the deleted
     /// conversation ends mid-round rather than at its next one.
     deletions: Deletions,
+    /// Raised when the member leaves its clusters: every live turn stops where
+    /// it stands for another member to resume (`docs/turn_handover.md` §4).
+    leaving: Leaving,
+    /// The conversations this member is resuming now (`crate::resume`).
+    resuming: resume::Resuming,
     /// Whether the schema declares a journal (`journal::carry::install`). A
     /// workspace schema without one journals nothing.
     journaling: bool,
@@ -2239,6 +2255,8 @@ impl InferenceState {
             think_steering,
             passthrough: PassthroughCache::new(),
             deletions: Deletions::default(),
+            leaving: Leaving::default(),
+            resuming: resume::Resuming::default(),
             journaling,
             journals: Journals::default(),
             memory,
@@ -3215,6 +3233,17 @@ fn run_inference_stream(
     // drops `rx`; the next send fails, the task returns, and dropping the
     // in-flight `TurnHandle` stops the decode at its next step.
     tokio::spawn(async move {
+        // Counted until the task ends, so a leave waits for what the turn
+        // writes on its way out (`crate::leaving`).
+        let _running = state.leaving.running();
+        // A member leaving starts no turn: one begun now would be cut at
+        // once, and the gateway places the next ask on another member.
+        if state.leaving.is_leaving() {
+            let _ = tx
+                .send(Ok(StreamItem::Error(LEFT_STATUS.to_string())))
+                .await;
+            return;
+        }
         let msg_preview: String = user_message.chars().take(60).collect();
         tracing::info!(
             conv_id = %conv_id,
@@ -3657,9 +3686,21 @@ fn run_inference_stream(
             current_message = text;
             start_iteration = resumed_at + 1;
         }
+        // A fresh request's message is durable before its first round is
+        // submitted, so a round cut off before it seals is asked again on the
+        // member that resumes it (`crate::resume`, `docs/turn_handover.md` §3).
+        // A resumed round's input is its call turn's, named by its own entry.
+        let pending_message = start_iteration == 0 && !original_user_message.is_empty();
+        if pending_message {
+            resume::mark_message(&state.engine, timeline, &original_user_message);
+        }
         // Set when the turn stops at a round boundary to move to a faster
         // member: that member finishes the round, so its entry stays.
         let mut handed = false;
+        // Set when the member leaves under the turn: the member that takes the
+        // conversation resumes it, so its entries stay (`crate::leaving`).
+        let mut left = false;
+        let mut leaving = state.leaving.watch();
 
         // The reflection-marker suppression ceiling is per-dial: derive the think
         // mode once, materialise the turn's sampling config (the conversation
@@ -3738,6 +3779,14 @@ fn run_inference_stream(
                     iteration,
                     "conversation deleted while its reply ran — ending the turn",
                 );
+                break;
+            }
+            // The member is leaving: no further round starts here. The round
+            // whose tools just ran is named by its resume entry, unanswered,
+            // so the member that takes the conversation runs them again and
+            // goes on from there.
+            if *leaving.borrow() {
+                left = true;
                 break;
             }
             tracing::debug!(conv_id = %conv_id, iteration, "submitting turn");
@@ -3908,6 +3957,15 @@ fn run_inference_stream(
                                 .is_timeline_tombstoned(timeline)
                             {
                                 deleted = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        // The member leaves mid-round: the round stops where it
+                        // stands, nothing of it sealed (`crate::leaving`).
+                        Ok(()) = leaving.changed() => {
+                            if *leaving.borrow() {
+                                left = true;
                                 break;
                             }
                             continue;
@@ -4120,6 +4178,12 @@ fn run_inference_stream(
                 state.engine.clear_retrieval_scope(timeline);
                 break;
             }
+            // Dropping the round's handle, which the break does, withdraws it
+            // from the engine: its reply is never sealed.
+            if left {
+                state.engine.clear_retrieval_scope(timeline);
+                break;
+            }
 
             if listener_gone {
                 tracing::info!(
@@ -4308,6 +4372,13 @@ fn run_inference_stream(
                 if let Some(call_idx) = resp.seal.as_ref().and_then(|s| s.turn_index) {
                     resume::mark_call_turn(&state.engine, timeline, call_idx);
                 }
+            }
+            // The request's first round sealed: its message is in the substrate
+            // now, so the pending message goes in the same commit — handed to
+            // the resume entry above when the round called tools, and to
+            // nothing when it was the final response.
+            if pending_message && iteration == start_iteration {
+                resume::clear_message(&state.engine, timeline);
             }
 
             // Group-commit the substrate redo log: the just-sealed turn is
@@ -4574,6 +4645,27 @@ fn run_inference_stream(
         // when the member finishing the round clears it. A crash before this
         // reaches disk is covered by the scan's own check: an entry whose turn
         // arrived is tombstoned rather than acted on.
+        //
+        // A turn the member left under keeps its entries — the call turn's,
+        // the pending message — for the member that takes the conversation,
+        // and the conversation is marked handed so that member resumes it now
+        // (`docs/turn_handover.md` §4). Committed here: the leave waits for
+        // this task, and the drain after it sends what is committed.
+        if left {
+            // A worker's own record says it was handed on (`mcp::workers`).
+            if conv_names(&conv_id).is_none() {
+                resume::mark_handed(&state.engine, timeline, workers::now_ms());
+            }
+            if let Err(e) = state.engine.conversation().commit_persistence() {
+                tracing::warn!(conv_id = %conv_id, "persistence commit error: {e}");
+            }
+            tracing::info!(
+                conv_id = %conv_id,
+                "the member leaves: the turn stopped where it stood, for another member to resume",
+            );
+            let _ = tx.send(Ok(StreamItem::Left)).await;
+            return;
+        }
         if !handed {
             resume::clear_call_turn(&state.engine, timeline);
         }
@@ -5547,204 +5639,257 @@ async fn wait_whole(state: &InferenceState, timeline: TimelineId) -> bool {
     }
 }
 
-/// Finish the tool rounds the previous run stopped in the middle of.
+/// The conversations a resume may touch, of those `wanted` names.
+/// Passthrough conversations are the client's own turns and are not
+/// resumable here; the titler's timeline is not a conversation; an archived
+/// one has been distilled and must not take another turn. A deleted one is
+/// already absent — `known_conversations` excludes tombstoned timelines. An
+/// ingest layer carries no `conv_id` at all and is never listed here.
+fn resumable_conversations(
+    state: &InferenceState,
+    wanted: impl Fn(TimelineId) -> bool,
+) -> Vec<(TimelineId, String)> {
+    let titler = state.titler_timeline;
+    state
+        .engine
+        .known_conversations()
+        .into_iter()
+        .filter(|(tl, conv_id, _, archived, _)| {
+            *tl != titler
+                && !*archived
+                && !conv_id.starts_with(passthrough::CONV_ID_PREFIX)
+                && wanted(*tl)
+        })
+        .map(|(tl, conv_id, _, _, _)| (tl, conv_id))
+        .collect()
+}
+
+/// Finish the requests the previous run left unfinished: a tool round it
+/// stopped in the middle of, or a first round whose message never sealed
+/// (`crate::resume`).
 ///
-/// Spawned once, just after `ready`. Only a conversation carrying a resume
-/// entry is touched, so one that ended normally is passed over — and so is one
-/// whose turn died before its call turn sealed, which is not resumed at all:
-/// nothing ran, and whoever asked can ask again. In practice the set here is
-/// whatever the daemon had tools out for when it stopped, usually nothing.
+/// Spawned once, just after `ready`. Only a conversation carrying an entry is
+/// touched, so one that ended normally is passed over. In practice the set
+/// here is whatever the daemon had in flight when it stopped, usually nothing.
 ///
 /// Resumed one at a time, deliberately: each is a full decode, and starting
 /// every one of them at once would hand the scheduler a boot-time burst that
 /// competes with the first real request.
 fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>) {
     tokio::spawn(async move {
-        // Passthrough conversations are the client's own turns and are not
-        // resumable here; the titler's timeline is not a conversation; an
-        // archived one has been distilled and must not take another turn. A
-        // deleted one is already absent — `known_conversations` excludes
-        // tombstoned timelines. An ingest layer carries no `conv_id` at all and
-        // is never listed here to begin with.
-        let candidates: Vec<(TimelineId, String)> = {
-            let engine = &state.engine;
-            let titler = state.titler_timeline;
-            engine
-                .known_conversations()
-                .into_iter()
-                .filter(|(tl, conv_id, _, archived, _)| {
-                    *tl != titler && !*archived && !conv_id.starts_with(passthrough::CONV_ID_PREFIX)
-                })
-                .map(|(tl, conv_id, _, _, _)| (tl, conv_id))
-                .collect()
-        };
-
         let mut resumed = 0usize;
-        for (timeline, conv_id) in candidates {
-            let unfinished = {
-                let engine = &state.engine;
-                match resume::marked_call_turn(engine, timeline) {
-                    // The round's response turn never arrived — finish it.
-                    Some(call_turn) if !resume::round_answered(engine, timeline, call_turn) => {
-                        Some(call_turn)
-                    }
-                    // The turn after it is in the substrate, so the round
-                    // completed and the entry outlived it. Retract it.
-                    Some(call_turn) => {
-                        tracing::info!(
-                            conv_id = %conv_id,
-                            call_turn,
-                            "resume: the round completed before the daemon stopped — entry retired",
-                        );
-                        resume::clear_call_turn(engine, timeline);
-                        None
-                    }
-                    // No entry, so nothing was mid-round here. A turn killed
-                    // before its call turn sealed is not resumed: nothing ran,
-                    // and whoever asked can ask again.
-                    None => None,
-                }
-            };
-            let Some(call_turn) = unfinished else {
-                continue;
-            };
-            // A worker still beating is run by a live member, which finishes
-            // the round itself: a round handed on keeps its entry until the
-            // member it moved to clears it (`worker_hop`), and running it here
-            // too would run its tools twice.
-            if worker_runs_elsewhere(&session, &conv_id) {
-                tracing::info!(
-                    conv_id = %conv_id,
-                    call_turn,
-                    "resume: its worker runs on another member, which finishes the round",
-                );
-                continue;
+        for (timeline, conv_id) in resumable_conversations(&state, |_| true) {
+            if resume_conversation(&session, &state, timeline, &conv_id).await {
+                resumed += 1;
             }
-            // A worker this member ran is carried on as itself, with its beat
-            // and its settling, not finished with nothing listening: that left
-            // its record saying nobody ran it, and another member's sweep
-            // started it again over the same round.
-            if let Some((owner, thread, name)) = conv_names(&conv_id) {
-                match workers::carry_on(&session, owner, thread, name, call_turn).await {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!(
-                        conv_id = %conv_id,
-                        "resume: the worker could not be carried on: {e}"
-                    ),
-                }
-            }
+        }
+        if resumed > 0 {
+            tracing::info!(resumed, "resume: finished the turns the last run left open");
+        }
+    });
+}
 
-            // The conversation is this member's to write only while it holds
-            // its claim: another live member holding it is running this very
-            // round — the entry it reads here is that member's, replicated —
-            // and finishes it itself (`turn_claims::take`).
-            let claim = match turn_claims::take(&conv_id).await {
-                Ok(claim) => claim,
-                Err(NotTaken::Held(holder)) => {
-                    tracing::info!(
-                        conv_id = %conv_id,
-                        call_turn,
-                        holder = format_args!("{holder:016x}"),
-                        "resume: another member holds the conversation and runs its round",
-                    );
+/// Resume, every [`RESUME_SWEEP`], each conversation a leaving member handed
+/// on (`docs/turn_handover.md` §5), each in its own task so one long reply
+/// holds up no other. A member that is itself leaving stops sweeping.
+fn resume_handed_turns(session: Arc<ZendSession>, state: Arc<InferenceState>) {
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(RESUME_SWEEP);
+        loop {
+            every.tick().await;
+            if state.leaving.is_leaving() {
+                return;
+            }
+            let handed: HashSet<TimelineId> = resume::handed(&state.engine).into_iter().collect();
+            if handed.is_empty() {
+                continue;
+            }
+            for (timeline, conv_id) in resumable_conversations(&state, |tl| handed.contains(&tl)) {
+                if session.live_turn(&conv_id).is_some() {
                     continue;
                 }
-                // Not held complete here: the member that let it go finished
-                // the round or left it for one that holds it.
-                Err(NotTaken::Incomplete) => {
-                    tracing::warn!(
-                        conv_id = %conv_id,
-                        call_turn,
-                        "resume: this member does not hold the conversation complete; its round \
-                         is left to one that does",
-                    );
-                    continue;
-                }
-            };
-            // **Only a conversation held whole is resumed.** Another member's
-            // turns arrive as gaps until their content is fetched, and the
-            // projection skips an empty turn — so a round resumed now would run
-            // over a history missing turns, answering as if they had never
-            // been said. On 2026-11-09 a member resumed 425bad8d moments after
-            // its restart, its copy still holding the other member's newest
-            // turns as gaps, and its rounds reasoned from a conversation that
-            // stopped short of them. Catch-up fills the gaps; this waits for it.
-            if !wait_whole(&state, timeline).await {
-                tracing::warn!(
-                    conv_id = %conv_id,
-                    call_turn,
-                    "resume: this member does not hold the conversation whole; its round is \
-                     left to one that does",
-                );
-                turn_claims::release(claim, &conv_id).await;
-                continue;
+                let (session, state) = (Arc::clone(&session), Arc::clone(&state));
+                tokio::spawn(async move {
+                    resume_conversation(&session, &state, timeline, &conv_id).await;
+                });
             }
-            // Read again under the claim: a member that held it until a moment
-            // ago may have finished the round in between.
-            let still_open = resume::marked_call_turn(&state.engine, timeline) == Some(call_turn)
-                && !resume::round_answered(&state.engine, timeline, call_turn);
-            if !still_open {
-                tracing::info!(
-                    conv_id = %conv_id,
-                    call_turn,
-                    "resume: the round was finished while this member waited for its claim",
-                );
-                turn_claims::release(claim, &conv_id).await;
-                continue;
-            }
+        }
+    });
+}
 
-            let (selection, tools_mode) = resume_dials(session.conversation_dials(&conv_id));
-            // The turn carries no question of its own: its message is the tool
-            // output, built inside the loop from the call turn's own request.
-            let user_message = String::new();
-            // Its calls may have run before the restart: a call that cannot
-            // run twice is answered instead of run again.
-            let start = TurnStart {
-                // The round it stopped at is not recorded: the cap counts
-                // afresh from the round it finishes.
+/// Resume what `conv_id`'s request left unfinished — a tool round, or its
+/// first round's message — on this member, under the conversation's claim.
+/// `true` when a turn ran. A conversation with nothing unfinished has its
+/// stale entries retracted: a call turn answered, a handed mark.
+async fn resume_conversation(
+    session: &Arc<ZendSession>,
+    state: &Arc<InferenceState>,
+    timeline: TimelineId,
+    conv_id: &str,
+) -> bool {
+    let Some(_busy) = state.resuming.begin(timeline) else {
+        return false;
+    };
+    let engine = &state.engine;
+    let Some(unfinished) = resume::unfinished(engine, timeline) else {
+        // The round's response turn is in the substrate, so the round
+        // completed and the entry outlived it. Retract it.
+        if let Some(call_turn) = resume::marked_call_turn(engine, timeline) {
+            tracing::info!(
+                conv_id = %conv_id,
+                call_turn,
+                "resume: the round completed before the daemon stopped — entry retired",
+            );
+            resume::clear_call_turn(engine, timeline);
+        }
+        if resume::is_handed(engine, timeline) {
+            resume::clear_handed(engine, timeline);
+        }
+        return false;
+    };
+    if let Some((owner, thread, name)) = conv_names(conv_id) {
+        let Unfinished::Round(call_turn) = unfinished else {
+            // A worker's first round is its prompt, on its record: the
+            // worker sweep starts it again (`mcp::resuming`).
+            return false;
+        };
+        // A worker still beating is run by a live member, which finishes the
+        // round itself: a round handed on keeps its entry until the member it
+        // moved to clears it (`worker_hop`), and running it here too would run
+        // its tools twice.
+        if worker_runs_elsewhere(session, conv_id) {
+            tracing::info!(
+                conv_id = %conv_id,
+                call_turn,
+                "resume: its worker runs on another member, which finishes the round",
+            );
+            return false;
+        }
+        // A worker this member ran is carried on as itself, with its beat and
+        // its settling, not finished with nothing listening: that left its
+        // record saying nobody ran it, and another member's sweep started it
+        // again over the same round.
+        match workers::carry_on(session, owner, thread, name, call_turn).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                conv_id = %conv_id,
+                "resume: the worker could not be carried on: {e}"
+            ),
+        }
+    }
+
+    // The conversation is this member's to write only while it holds its
+    // claim: another live member holding it is running this very request —
+    // the entry read here is that member's, replicated — and finishes it
+    // itself (`turn_claims::take`).
+    let claim = match turn_claims::take(conv_id).await {
+        Ok(claim) => claim,
+        Err(NotTaken::Held(holder)) => {
+            tracing::info!(
+                conv_id = %conv_id,
+                ?unfinished,
+                holder = format_args!("{holder:016x}"),
+                "resume: another member holds the conversation and runs its request",
+            );
+            return false;
+        }
+        // Not held complete here: the member that let it go finished the
+        // request or left it for one that holds it.
+        Err(NotTaken::Incomplete) => {
+            tracing::warn!(
+                conv_id = %conv_id,
+                ?unfinished,
+                "resume: this member does not hold the conversation complete; its request is \
+                 left to one that does",
+            );
+            return false;
+        }
+    };
+    // **Only a conversation held whole is resumed.** Another member's turns
+    // arrive as gaps until their content is fetched, and the projection skips
+    // an empty turn — so a round resumed now would run over a history missing
+    // turns, answering as if they had never been said. On 2026-11-09 a member
+    // resumed 425bad8d moments after its restart, its copy still holding the
+    // other member's newest turns as gaps, and its rounds reasoned from a
+    // conversation that stopped short of them. Catch-up fills the gaps; this
+    // waits for it.
+    if !wait_whole(state, timeline).await {
+        tracing::warn!(
+            conv_id = %conv_id,
+            ?unfinished,
+            "resume: this member does not hold the conversation whole; its request is left \
+             to one that does",
+        );
+        turn_claims::release(claim, conv_id).await;
+        return false;
+    }
+    // Read again under the claim: a member that held it until a moment ago
+    // may have finished the request in between.
+    if resume::unfinished(engine, timeline).as_ref() != Some(&unfinished) {
+        tracing::info!(
+            conv_id = %conv_id,
+            ?unfinished,
+            "resume: the request moved on while this member waited for its claim",
+        );
+        turn_claims::release(claim, conv_id).await;
+        return false;
+    }
+    // Taken: a turn cut off again marks it handed again on its way out.
+    if resume::is_handed(engine, timeline) {
+        resume::clear_handed(engine, timeline);
+    }
+
+    let (selection, tools_mode) = resume_dials(session.conversation_dials(conv_id));
+    let (user_message, asked, start) = match unfinished {
+        // The turn carries no question of its own: its message is the tool
+        // output, built inside the loop from the call turn's own request. Its
+        // calls may have run before it stopped: a call that cannot run twice
+        // is answered instead of run again. The round it stopped at is not
+        // recorded: the cap counts afresh from the round it finishes.
+        Unfinished::Round(call_turn) => (
+            String::new(),
+            None,
+            TurnStart {
                 resume: Some(Resume {
                     call_turn,
                     dispatch: Dispatch::Resumed,
                     iteration: 0,
                 }),
                 may_hand: false,
-            };
+            },
+        ),
+        // The first round never sealed: its message is asked again.
+        Unfinished::Message(text) => (text.clone(), Some(text), TurnStart::default()),
+    };
+    tracing::info!(conv_id = %conv_id, resumes_round = asked.is_none(), "resume: resuming the request");
 
-            // Run as a chat turn runs, with no request behind it: the claim
-            // is held until the turn's last record is written, so the gateway
-            // sends the page here, and the reply is recorded live, so a page
-            // open across the restart — or reloaded — follows the rest of it
-            // instead of finding each round only once it has sealed. Its
-            // question and the rounds before the restart are already in the
-            // history, which it therefore keeps.
-            let history_before = dialogue_history(&state, &conv_id).len();
-            let live = session.live_turns.begin(&conv_id, None, history_before);
-            let mut turn = run_inference_stream(
-                Arc::clone(&state),
-                conv_id.clone(),
-                user_message,
-                None,
-                None,
-                None,
-                None,
-                false,
-                tools_mode,
-                None,
-                selection,
-                start,
-            );
-            relay_live(&mut turn, None, &live, &conv_id).await;
-            session.live_turns.end(&conv_id, &live);
-            drop(turn);
-            turn_claims::release(claim, &conv_id).await;
-            resumed += 1;
-        }
-
-        if resumed > 0 {
-            tracing::info!(resumed, "resume: finished the turns the last run left open");
-        }
-    });
+    // Run as a chat turn runs, with no request behind it: the claim is held
+    // until the turn's last record is written, so the gateway sends the page
+    // here, and the reply is recorded live, so a page open across the stop —
+    // or reloaded — follows the rest of it instead of finding each round only
+    // once it has sealed.
+    let history_before = dialogue_history(state, conv_id).len();
+    let live = session.live_turns.begin(conv_id, asked, history_before);
+    let mut turn = run_inference_stream(
+        Arc::clone(state),
+        conv_id.to_string(),
+        user_message,
+        None,
+        None,
+        None,
+        None,
+        false,
+        tools_mode,
+        None,
+        selection,
+        start,
+    );
+    relay_live(&mut turn, None, &live, conv_id).await;
+    session.live_turns.end(conv_id, &live);
+    drop(turn);
+    turn_claims::release(claim, conv_id).await;
+    true
 }
 
 /// One OpenAI-passthrough call, holding its conversation's lock for the whole
@@ -7482,6 +7627,43 @@ impl ZendSession {
         self.live_turns.get(conv_id)
     }
 
+    /// Hand every live turn on as the member leaves its clusters
+    /// (`docs/turn_handover.md` §4): no turn starts from now, each running
+    /// turn stops where it stands and marks its conversation for the member
+    /// that takes it, and this waits — at most [`LEAVE_TURNS_WAIT`] — until
+    /// they have. A turn still running past that is cut at the shutdown and
+    /// resumed by this member when it starts again.
+    pub async fn leave(&self) {
+        let Some(state) = self.inference.load_full() else {
+            return;
+        };
+        let running = state.leaving.count();
+        let left = state.leaving.leave(LEAVE_TURNS_WAIT).await;
+        if left > 0 {
+            tracing::warn!(
+                running,
+                left,
+                "leaving: turns still running after {} s are cut at the shutdown",
+                LEAVE_TURNS_WAIT.as_secs()
+            );
+        } else {
+            tracing::info!(running, "leaving: every live turn stopped and handed on");
+        }
+    }
+
+    /// Whether the member is leaving its clusters.
+    pub fn is_leaving(&self) -> bool {
+        self.inference
+            .load_full()
+            .is_some_and(|s| s.leaving.is_leaving())
+    }
+
+    /// Count a turn's settling as running until the guard drops, so a leave
+    /// waits for what it writes (`crate::leaving`). `None` before the load.
+    pub fn turn_running(&self) -> Option<Running> {
+        self.inference.load_full().map(|s| s.leaving.running())
+    }
+
     /// The composer dials this conversation last ran under, for the GUI to set
     /// its dials from when the conversation is opened. `None` when the model
     /// isn't loaded, or when no turn has recorded dials — a conversation that
@@ -8201,6 +8383,11 @@ impl ZendSession {
                         // which is written by the daemon beside this one.
                         if !read_only_substrate {
                             resume_unfinished_turns(
+                                Arc::clone(&session_for_loader),
+                                Arc::clone(&state),
+                            );
+                            // And what another member handed on as it left.
+                            resume_handed_turns(
                                 Arc::clone(&session_for_loader),
                                 Arc::clone(&state),
                             );

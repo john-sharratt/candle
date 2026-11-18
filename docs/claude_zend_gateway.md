@@ -885,8 +885,12 @@ back on is kept in the running member's memory. The ratio keeps two cards of
 one class from trading a worker back and forth, and a member never hands a
 worker to a slower one.
 
-**Moving off a card needs nothing new.** A member that goes away loses the
-workers it ran (`BEAT_LOST_MS`), and the next call lands on another.
+**A member that leaves hands its workers on** (`docs/turn_handover.md`). An
+install, a `restart` or a drain stops each worker's turn where it stands, names
+no runner on its record and marks it handed, before the claims go; another
+member resumes it within `RESUME_SWEEP`, its unfinished round first. A member
+that dies without leaving loses the workers it ran (`BEAT_LOST_MS`), and they
+are resumed after `RESUME_AFTER_MS`.
 
 **A round handed on is not run again at boot.** Its resume entry stays until
 the member finishing it clears it. A member that restarts skips any worker

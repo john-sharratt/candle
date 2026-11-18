@@ -656,6 +656,9 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     Ok(Running {
         routes,
         reports: Arc::new(NpcdReports::new(authored, data)),
+        // Its characters are handed back at their turn boundaries by the drain
+        // itself (`docs/replicated_substrate.md` §9.3): nothing runs past it.
+        leave: Box::new(|| Box::pin(async {})),
         stop: Box::new(move || Box::pin(stop(stopping, guardian))),
     })
 }

@@ -1,9 +1,11 @@
 //! A member leaving its clusters before the process stops
-//! (`docs/replicated_substrate.md` §12.4): every app drains — its claims and
-//! leases handed back, the gateways routing it nothing new — and the process
-//! waits, at most [`LEAVE_WAIT`], for what each app's tenant has written to be
-//! on disk and sent. The HTTP server then finishes the requests in flight, the
-//! sockets close with `1001`, and the tenants run their own shutdown.
+//! (`docs/replicated_substrate.md` §12.4): every tenant hands its live work on
+//! ([`hand_over`], `docs/turn_handover.md`), then every app drains — its claims
+//! and leases handed back, the gateways routing it nothing new — and the
+//! process waits, at most [`LEAVE_WAIT`], for what each app's tenant has
+//! written to be on disk and sent. The HTTP server then finishes the requests
+//! in flight, the sockets close with `1001`, and the tenants run their own
+//! shutdown.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +16,18 @@ use tokio::time::{sleep, Instant};
 
 use super::Cluster;
 use crate::stopping::Stopping;
+use crate::tenant::Leave;
+
+/// Run every tenant's [`Leave`], in rank order, before the claims go: a
+/// tenant's live work is stopped and marked while this member still owns it,
+/// so the records saying so are flushed and sent by the drain after.
+pub async fn hand_over(leaves: Vec<(&'static str, Leave)>, stopping: &Stopping) {
+    for (name, leave) in leaves {
+        stopping.set_step("Handing over", format!("{name}: stopping its live work"));
+        leave().await;
+        tracing::info!(tenant = name, "handed its live work over");
+    }
+}
 
 /// The longest a member waits for its own events to leave before it closes.
 pub const LEAVE_WAIT: Duration = Duration::from_secs(60);
@@ -76,5 +90,30 @@ pub async fn drain_and_send(cluster: &Cluster, stopping: &Stopping) -> usize {
             format!("{left} own events still to reach the group"),
         );
         sleep(LOOK).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// Every tenant's leave runs, each to its end, in rank order.
+    #[tokio::test]
+    async fn every_tenant_hands_its_work_over_in_rank_order() {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let leave = |name: &'static str| -> Leave {
+            let ran = Arc::clone(&ran);
+            Box::new(move || {
+                Box::pin(async move {
+                    sleep(Duration::from_millis(10)).await;
+                    ran.lock().unwrap().push(name);
+                })
+            })
+        };
+        let leaves = vec![("zend", leave("zend")), ("npcd", leave("npcd"))];
+        hand_over(leaves, &Stopping::new()).await;
+        assert_eq!(*ran.lock().unwrap(), ["zend", "npcd"]);
     }
 }

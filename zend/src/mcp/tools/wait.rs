@@ -226,6 +226,7 @@ mod tests {
             audit: None,
             checked: false,
             runner: None,
+            handed_ms: None,
         }
     }
 

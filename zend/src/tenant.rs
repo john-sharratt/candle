@@ -122,6 +122,7 @@ impl Tenant for ZendTenant {
                 crate::ingest_cancel::token().request();
             });
             let stopping = Arc::clone(&session);
+            let leaving = Arc::clone(&session);
             // The routes wait for the memory to open (`api::routes`): on the
             // blocking pool, not the runtime.
             let routed = Arc::clone(&session);
@@ -130,6 +131,7 @@ impl Tenant for ZendTenant {
             Ok(Running {
                 routes,
                 reports: Arc::new(ZendReports::new(session)),
+                leave: Box::new(move || Box::pin(async move { leaving.leave().await })),
                 stop: Box::new(move || {
                     Box::pin(async move {
                         stopping.shutdown().await;

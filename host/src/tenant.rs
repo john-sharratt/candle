@@ -85,12 +85,20 @@ pub struct TenantContext {
 /// process is told to stop, and when a later start fails — then exits.
 pub type Stop = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
 
+/// How a started tenant hands its work on when a member leaves its clusters:
+/// called once, before the member hands back its claims, so what it stops is
+/// written and sent while the member still owns it
+/// (`docs/turn_handover.md` §4). Resolves once the work is stopped and marked.
+pub type Leave = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
+
 /// A started tenant.
 pub struct Running {
     /// Its own routes — none the host serves.
     pub routes: Routes,
     /// What the shared endpoints report about it.
     pub reports: Arc<dyn Reports>,
+    /// Hand its work on as the member leaves — see [`Leave`].
+    pub leave: Leave,
     /// Drain it — see [`Stop`].
     pub stop: Stop,
 }

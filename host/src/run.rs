@@ -35,7 +35,7 @@ use crate::agent_hold::with_hold;
 use crate::boot::{router as boot_router, Boot, BootLine};
 use crate::cli::HostArgs;
 use crate::cluster::in_flight::IN_FLIGHT_WAIT;
-use crate::cluster::leave::drain_and_send;
+use crate::cluster::leave::{drain_and_send, hand_over};
 use crate::cluster::readiness::watch_readiness;
 use crate::cluster::reserve::step_aside;
 use crate::cluster::upgrade::{setup as upgrade_setup, HostInstaller};
@@ -56,7 +56,7 @@ use crate::starting::StartLine;
 use crate::stopping::{Ending, Stopping};
 use crate::syncing::next_syncing_line;
 use crate::telemetry::Telemetry;
-use crate::tenant::{Reports, Stop, Tenant, TenantContext, TenantUi};
+use crate::tenant::{Leave, Reports, Stop, Tenant, TenantContext, TenantUi};
 use crate::ui::{build_id, COMMON};
 use agent::config::AgentConfig;
 use agent::jobs::Jobs;
@@ -489,6 +489,7 @@ async fn serve_tenants(
     let mut reports = Vec::new();
     let mut tenant_routes = Vec::new();
     let mut stops: Vec<(&'static str, Stop)> = Vec::new();
+    let mut leaves: Vec<(&'static str, Leave)> = Vec::new();
     for ((rank, tenant), starting) in tenants.into_iter().zip(start_lines) {
         let name = tenant.name();
         let ctx = TenantContext {
@@ -508,6 +509,7 @@ async fn serve_tenants(
                 boot.started(name, Arc::clone(&started.reports));
                 reports.push((name, started.reports));
                 tenant_routes.push((name, started.routes));
+                leaves.push((name, started.leave));
                 stops.push((name, started.stop));
             }
             // The tenants already started are stopped, not left mid-load
@@ -592,7 +594,12 @@ async fn serve_tenants(
         router,
         local_signin,
         cluster.clone(),
-        leave(Arc::clone(&stopping), cluster.clone(), agent.clone()),
+        leave(
+            Arc::clone(&stopping),
+            cluster.clone(),
+            agent.clone(),
+            leaves,
+        ),
     )
     .await;
     if let Some(c) = &cluster {
@@ -625,7 +632,16 @@ async fn serve_tenants(
 /// serving (`docs/build_agent.md` §4). An install already holds them from
 /// `install_tick`, and this hold joins it. A Ctrl-C is a person at the console
 /// and waits for nothing.
-async fn leave(stopping: Arc<Stopping>, cluster: Option<Arc<Cluster>>, agent: Option<Arc<Jobs>>) {
+///
+/// **A member hands its tenants' live work on before it drains**
+/// (`docs/turn_handover.md` §4): a turn still running once the claims go would
+/// be cut where it stands, with nothing saying another member may take it.
+async fn leave(
+    stopping: Arc<Stopping>,
+    cluster: Option<Arc<Cluster>>,
+    agent: Option<Arc<Jobs>>,
+    leaves: Vec<(&'static str, Leave)>,
+) {
     let asked = tokio::select! {
         _ = stop_signal() => {
             stopping.ask(Ending::Exit);
@@ -644,6 +660,7 @@ async fn leave(stopping: Arc<Stopping>, cluster: Option<Arc<Cluster>>, agent: Op
     }
     abort_on_ctrl_c();
     if let Some(c) = &cluster {
+        hand_over(leaves, &stopping).await;
         drain_and_send(c, &stopping).await;
     }
     stopping.set_step("Stopping", "finishing the requests in flight");

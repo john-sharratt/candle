@@ -25,7 +25,7 @@ use crate::mcp::ownership;
 use crate::openai_tools::{self, wire_function};
 use crate::passthrough::PASSTHROUGH_MODEL;
 use crate::reasoning_split;
-use crate::session::{StreamItem, ZendSession};
+use crate::session::{StreamItem, ZendSession, LEFT_STATUS};
 use crate::types::{
     AssistantMessage, ChatCompletion, ChatCompletionRequest, CompletionChoice, RequestTools,
     ResponseToolCall, Role, ToolMode, Usage,
@@ -410,6 +410,12 @@ fn stream_sse(
             // Only a worker's turn hands itself on, and a worker reads its
             // turn in process.
             Ok(StreamItem::Handed { .. }) => Vec::new(),
+            // The member left under the turn: the page is told, and follows
+            // the conversation, whose reply resumes on another member.
+            Ok(StreamItem::Left) => {
+                let data = serde_json::json!({ "text": LEFT_STATUS }).to_string();
+                vec![Ok(Event::default().event("status").data(data))]
+            }
         })
         .flat_map(futures::stream::iter);
 
@@ -468,6 +474,11 @@ async fn collect_completion(
             Ok(StreamItem::Think { .. }) => {} // reasoning progress; display-only
             Ok(StreamItem::Closing(_)) => {} // the closing turn's text says it
             Ok(StreamItem::Handed { .. }) => {} // only a worker's turn, read in process
+            // A collected reply cannot follow the resumed one: it is told where
+            // the answer went.
+            Ok(StreamItem::Left) => {
+                failed.get_or_insert(LEFT_STATUS.to_string());
+            }
             Ok(StreamItem::Error(message)) => {
                 failed.get_or_insert(message);
             }

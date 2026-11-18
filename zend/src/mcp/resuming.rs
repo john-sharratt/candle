@@ -7,6 +7,11 @@
 //! everything it needed and written nothing yet (2026-10-31). So every member
 //! watches for lost tasks and one of them, by lease, continues each in its own
 //! conversation.
+//!
+//! **A task handed on is started again at once.** A member that leaves its
+//! clusters stops its tasks' turns and says so on each record — no runner,
+//! `handed_ms` (`docs/turn_handover.md` §5) — so the wait that tells a lost task
+//! from a lagging copy is not needed for it.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -22,8 +27,9 @@ use super::workers;
 use crate::ingest_lease::{self, Share};
 use crate::session::ZendSession;
 
-/// How often lost tasks are looked for.
-const EVERY: Duration = Duration::from_secs(60);
+/// How often lost and handed tasks are looked for: a task handed on waits
+/// at most this long for another member to take it.
+pub const RESUME_SWEEP: Duration = Duration::from_secs(10);
 
 /// Restarts a task is carried through. Past this something other than a
 /// restart is ending it, and it stays lost for a person to read.
@@ -36,11 +42,21 @@ pub const MAX_RESUMES: u32 = 3;
 /// [`super::threads::BEAT_LOST_MS`], and a restart's load is within it.
 pub const RESUME_AFTER_MS: u64 = 10 * 60 * 1000;
 
-/// Whether `w`, as observed at `now`, should be started again. One silent for
-/// as long as the archive sweep waits has been given up on.
+/// Whether `w`, as observed at `now`, should be started again: handed on by a
+/// member that left, at once; lost, once silent past [`RESUME_AFTER_MS`]. One
+/// silent for as long as the archive sweep waits has been given up on.
 pub fn due(w: &Worker, now: u64) -> bool {
+    if handed(w) {
+        return true;
+    }
     let silent = now.saturating_sub(w.beat_ms);
     lost(w) && w.resumes < MAX_RESUMES && (RESUME_AFTER_MS..LOST_ARCHIVE_MS).contains(&silent)
+}
+
+/// Whether `w` was handed on by a member that left: marked so, run by no
+/// member, and not ended.
+pub fn handed(w: &Worker) -> bool {
+    w.handed_ms.is_some() && w.runner.is_none() && w.ended_ms.is_none()
 }
 
 /// Whether the thread `thread` may have its lost tasks started again: any
@@ -52,8 +68,12 @@ pub fn chat_open(records: &dyn Records, owner: &str, thread: &str) -> bool {
     }
 }
 
-/// Start again, on one member, every lost task. How many this one took.
+/// Start again, on one member, every lost or handed task. How many this one
+/// took. A member that is leaving takes none: it is handing its own on.
 fn pass(session: &Arc<ZendSession>, now: u64) -> usize {
+    if session.is_leaving() {
+        return 0;
+    }
     let Some(records) = session.shared_substrate() else {
         return 0;
     };
@@ -88,9 +108,10 @@ fn pass(session: &Arc<ZendSession>, now: u64) -> usize {
     resumed
 }
 
-/// Look for lost tasks every [`EVERY`] for as long as the session lives.
+/// Look for lost and handed tasks every [`RESUME_SWEEP`] for as long as the
+/// session lives.
 async fn resuming(session: Weak<ZendSession>) {
-    let mut every = tokio::time::interval(EVERY);
+    let mut every = tokio::time::interval(RESUME_SWEEP);
     loop {
         every.tick().await;
         let Some(session) = session.upgrade() else {
@@ -154,6 +175,22 @@ mod tests {
         let late = 1_000 + LOST_ARCHIVE_MS;
         assert!(!due(&worker("a", 0).observed(late), late), "given up on");
         assert_eq!(worker("a", 0).observed(1_000).state, State::Running);
+    }
+
+    /// **A task handed on by a member that left is due at once**, however
+    /// fresh its beat and however often it was resumed before; once a member
+    /// runs it again, or it ended, it is not.
+    #[test]
+    fn a_handed_task_is_due_at_once() {
+        let mut w = worker("a", MAX_RESUMES);
+        w.handed_ms = Some(1_000);
+        assert!(due(&w.clone().observed(1_000), 1_000));
+        let mut taken = w.clone();
+        taken.runner = Some(7);
+        assert!(!due(&taken.observed(1_000), 1_000), "a member runs it");
+        let mut ended = w;
+        ended.ended_ms = Some(1_500);
+        assert!(!due(&ended.observed(2_000), 2_000), "it ended");
     }
 
     /// **A chat being disposed of is not started again**, nor one no longer

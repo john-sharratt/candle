@@ -231,6 +231,11 @@ pub struct Worker {
     /// the worker on.
     #[serde(default)]
     pub runner: Option<u64>,
+    /// When the member running it left its clusters and stopped its turn,
+    /// naming no runner after it: another member resumes it at once
+    /// (`docs/turn_handover.md` §5). Cleared when it is resumed.
+    #[serde(default)]
+    pub handed_ms: Option<u64>,
     /// Whether another task started it with `repo_task_start`. Tasks nest one
     /// level: a task Claude or a person started may start tasks, and a task a
     /// task started may not (`docs/zen_tool_reach.md` §6.3).
@@ -706,6 +711,7 @@ mod tests {
             audit: None,
             checked: false,
             runner: None,
+            handed_ms: None,
         };
         assert_eq!(
             w.clone().observed(1_000 + BEAT_LOST_MS).state,
