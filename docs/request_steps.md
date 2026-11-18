@@ -91,6 +91,15 @@ Still open: …
 - The calendar's date lines (`docs/zend_journal.md` §4) stay inside Journal
   history, above the entries they date. Steps carry no dates: they are all of
   the one request in progress.
+- **"Still open" shows only when something is open.** The closing section
+  lists the journal's open items under `Still open:` when it holds one or
+  more, and leaves the heading out when it holds none. `Still open: nothing.`
+  is no longer written. The closing section's last line, which says the
+  journal ends there and that anything else known of the conversation comes
+  from its turns, stays in every journal that pins a section. That line is
+  what keeps silence, or the rest of the context, from being read as something
+  written down (`docs/zend_journal.md` §4). It is one line, and it does not
+  need an empty list to say it.
 - `n` is the step's number within its request, counted from 1. Numbers stay
   fixed as steps age out (§2.4), so "Step 3" means the same step on every round.
 - **The text, verbatim, clipped to 400 characters** with `…`. These are the same
@@ -212,6 +221,9 @@ Made in writing this, to be confirmed or reversed before it is built:
 - **Two headed parts**, Journal history and Current request (§2.2), asked for
   by the user on 2026-11-19, so the model reads earlier work and the request it
   is in as two things.
+- **"Still open" only when something is open** (§2.2), asked for by the user
+  on 2026-11-19. The journal's end line stays. Hiding that line too would undo
+  the guard the placeholder lesson put there.
 - **One section per step**, so a new step seals one line (§2.2). The
   alternative, one section for all steps, reseals every step on every note.
 - **Clipping at 400 characters** (§2.2).
@@ -228,7 +240,7 @@ Made in writing this, to be confirmed or reversed before it is built:
 |---|---|
 | `zend/src/journal/steps.rs` | `Steps`: a request's first turn and its steps; grow from a sealed reply, reset on a new request, rebuild from the request's turns, the newest 64 |
 | `zend/src/journal/notes.rs` | reading a reply's note calls with their `journal`, so a memory-journal note is told apart |
-| `journal-core/src/section.rs` | the `journal/history` and `journal/current` headings and `journal/step/<n>` names; a step's rendered line |
+| `journal-core/src/section.rs` | the `journal/history` and `journal/current` headings and `journal/step/<n>` names; a step's rendered line; the closing section without `Still open:` when nothing is open |
 | `zend/src/journal/carry.rs` | the wanted sections in order: history heading, entries, current heading, steps, `journal/close` |
 | `zend/src/journal/state.rs` | `SessionJournal` holds the `Steps` |
 | `zend/src/prompts/projection.yaml` | the intro's sentence on steps |
@@ -243,7 +255,9 @@ Made in writing this, to be confirmed or reversed before it is built:
 - **Sections** (raw expected text): both headings and the step lines render
   exactly; the wanted sections run history heading, entries, current heading,
   steps, close; a journal with no entry wants no history heading; a finished
-  request wants neither the current heading nor a step.
+  request wants neither the current heading nor a step; a closing section with
+  no open item renders the journal's end line alone, with no `Still open:`, and
+  one with an open item renders the list and then that line.
 - **Carry:** a new step seals one section and the close; a finished request
   removes every step section; a progress entry leaves the steps standing.
 - **Handover:** a conversation taken up mid-request (`resume_conversation`)
