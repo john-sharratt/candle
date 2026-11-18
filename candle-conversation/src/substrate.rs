@@ -338,6 +338,14 @@ pub struct Substrate {
     /// [`Self::gallery_epoch`]).
     gallery_epoch: u64,
 
+    /// Bumped whenever what a belief turn group offers changes beyond its
+    /// streams: a group marked scoped, a target's scope set or cleared, a
+    /// group's chunk exclusion replaced, a conversation archived or restored.
+    /// With [`Self::gallery_epoch`] and [`Self::custom_objects_version`] it
+    /// stamps an assembled group scan, which is reused while all three stand
+    /// (`projection::group_assembly`).
+    retrieval_version: u64,
+
     /// The epoch every file gallery held on a timeline entry was built under
     /// (`file_gallery`): moved by a change some gallery reads that names no
     /// timeline, so each is built again when next read.
@@ -3686,7 +3694,9 @@ impl Substrate {
     /// Both are scoped, and the embedder gives each target scopes that do not
     /// overlap, so a unit is placed through one group or the other. Idempotent.
     pub fn set_group_draws(&mut self, drawing: GroupId, from: GroupId) {
-        self.drawing_groups.insert(drawing, from);
+        if self.drawing_groups.insert(drawing, from) != Some(from) {
+            self.retrieval_version += 1;
+        }
     }
 
     /// The group whose registered conversations `group`'s candidates are: its
@@ -3839,7 +3849,9 @@ impl Substrate {
     /// Offer `group`'s conversations to a projection only as its target's
     /// scope names them. Idempotent.
     pub fn mark_group_scoped(&mut self, group: GroupId) {
-        self.scoped_groups.insert(group);
+        if self.scoped_groups.insert(group).is_none() {
+            self.retrieval_version += 1;
+        }
     }
 
     /// Whether `group` offers only what a target's scope names.
@@ -3859,11 +3871,20 @@ impl Substrate {
             .entry(target)
             .or_default()
             .insert(group, allowed);
+        self.retrieval_version += 1;
     }
 
     /// Forget every scope `target` was given — it is going away.
     pub fn clear_retrieval_scope(&mut self, target: TimelineId) {
         self.retrieval_scopes.remove(&target);
+        self.retrieval_version += 1;
+    }
+
+    /// The retrieval version: unchanged while no group's scoping, no target's
+    /// scope, no chunk exclusion and no archived flag has changed. See the
+    /// field.
+    pub fn retrieval_version(&self) -> u64 {
+        self.retrieval_version
     }
 
     /// [`Self::active_timelines_for_group`] as `target` may see it: all of
@@ -5130,6 +5151,9 @@ impl Substrate {
         }
         for (k, v) in &meta.custom {
             if take_keyed(&mut entry.ids.custom, k.clone(), id) {
+                // A file's path names its kind and a calibration names its
+                // unit: what an assembled group scan was built from.
+                self.retrieval_version += 1;
                 let before = entry.custom.insert(k.clone(), v.clone());
                 if k == Self::CALIBRATES_KEY {
                     Self::index_calibration(
@@ -5334,6 +5358,7 @@ impl Substrate {
                 ChunkExclusion::of_ranges(r.cut)
             });
         self.chunk_exclusion.insert(group, Arc::new(cut));
+        self.retrieval_version += 1;
     }
 
     /// The record behind the custom object keyed `key_hash`.
@@ -5689,6 +5714,7 @@ impl Substrate {
         self.splice_source_timelines.remove(&timeline);
         // A tombstoned conversation is never a projection's target again.
         self.retrieval_scopes.remove(&timeline);
+        self.retrieval_version += 1;
         // Nor carries anything, nor is carried: a pinned item whose turns are
         // gone would keep emitting a promise nothing can deliver.
         self.working_sets.remove(&timeline);
@@ -7604,10 +7630,11 @@ impl Substrate {
         }
         entry.archived = archived;
         // An archived conversation takes no more turns: no scope of its is
-        // read again.
+        // read again. Either way the groups it is in offer a different set.
         if archived {
             self.retrieval_scopes.remove(&timeline);
         }
+        self.retrieval_version += 1;
         true
     }
 

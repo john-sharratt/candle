@@ -10,6 +10,7 @@
 //! for a pooled piece: its rounds' K/V comes up only when the fill places one.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use candle_transformers::models::piece_key::PieceKey;
@@ -154,6 +155,14 @@ impl Scheduler {
                     }
                 };
                 stats.read_bytes += pages.bytes().len();
+                // Held past this refresh, so a piece that leaves the pool and
+                // comes back reads it from memory (`pool_read_ring`). Only a
+                // page just read off the log, whose one owner is this read: one
+                // found held — by the ring, a slot or the substrate — is held
+                // already.
+                if Arc::strong_count(&pages) == 1 {
+                    self.pool_read_ring.keep(&pages);
+                }
                 let Ok(framed) = index_pages::decode(pages.bytes()) else {
                     whole = false;
                     break;
@@ -231,6 +240,8 @@ impl Scheduler {
             index_read_turns = stats.walked,
             index_read_bytes = stats.read_bytes,
             index_read_us = stats.read_us,
+            ring_pages = self.pool_read_ring.len(),
+            ring_mib = self.pool_read_ring.bytes() >> 20,
             "pool:index_read"
         );
         for kind in [

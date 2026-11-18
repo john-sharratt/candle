@@ -97,6 +97,7 @@ mod piece_identity;
 mod piece_splice;
 mod pinned_report;
 pub mod pool;
+mod pool_read_ring;
 mod pool_refresh;
 mod pooled_rounds;
 mod prefill;
@@ -150,6 +151,7 @@ use section_pages::SectionPages;
 
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
+use self::pool_read_ring::{PoolReadRing, POOL_READ_RING_BYTES};
 use self::relief_pacing::ReliefPacing;
 use self::reproject_census::{Outcome as ReprojectOutcome, Part as ReprojectPart, ReprojectCensus};
 use self::request_laps::RequestLaps;
@@ -4189,6 +4191,9 @@ pub(crate) struct Scheduler {
     section_relief_pacing: ReliefPacing,
     /// Every live reprojection's parts, summed and written once a minute.
     reproject_census: ReprojectCensus,
+    /// The index pages the pool read last, so a piece that comes back reads
+    /// them from memory (`pool_read_ring`).
+    pool_read_ring: PoolReadRing,
     /// The query×key pairs the creep attended through those layers this step.
     wave_step_creep_layer_pairs: f64,
     /// Consecutive failures of the decode-less wave step and the wait owed
@@ -4567,6 +4572,7 @@ impl Scheduler {
             wave_step_creep_layers: 0,
             section_relief_pacing: ReliefPacing::default(),
             reproject_census: ReprojectCensus::new(Instant::now()),
+            pool_read_ring: PoolReadRing::new(POOL_READ_RING_BYTES),
             wave_step_creep_layer_pairs: 0.0,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),

@@ -597,9 +597,12 @@ impl GalleryArena {
         let mut holder = holder;
         let mut groups = groups;
         let mut keep = keep;
-        if res.contains_key(&sid) {
+        // A re-seal changes a turn an index may name: asked, so each such index
+        // is marked stale, in every build.
+        let leased = res.contains_key(&sid) && {
             self.note_change();
-        }
+            self.leased(&sid)
+        };
         if let Some(old) = res.remove(&sid) {
             holder = old.holder.widen(holder);
             groups = old.groups.union(groups);
@@ -611,7 +614,7 @@ impl GalleryArena {
             // scan's pages are about to be recycled — the arena would need a
             // multi-version turn to stay safe under concurrent re-seal + scan.
             debug_assert!(
-                old.pinned == 0 && !self.leased(&sid),
+                old.pinned == 0 && !leased,
                 "re-seal of a turn pinned by an active scan — pages would be freed \
                  under an in-flight kernel"
             );
@@ -822,12 +825,19 @@ impl GalleryArena {
     }
 
     /// Whether a scan holds `sid` through a leased index. Asked after
-    /// [`Self::note_change`], of the turn about to go.
+    /// [`Self::note_change`], of the turn about to go, under the residency
+    /// lock. Every index naming `sid` is marked stale first, before its lease
+    /// is read (`lease`): a later scan of it checks its turns, and one that
+    /// names none of the changed turns is trusted without the walk.
     fn leased(&self, sid: &StreamId) -> bool {
-        self.indexes
-            .load()
-            .iter()
-            .any(|(_, idx)| idx.hold.leased() && idx.members.contains(sid))
+        let mut leased = false;
+        for (_, idx) in self.indexes.load().iter() {
+            if idx.members.contains(sid) {
+                idx.hold.mark_stale();
+                leased |= idx.hold.leased();
+            }
+        }
+        leased
     }
 
     /// The residency mutation count — churn, reported per scan (see
@@ -878,7 +888,13 @@ impl GalleryArena {
         }
         let lease = IndexLease::take(idx.clone()).ok_or(IndexMiss::Absent)?;
         if !idx.hold.current(&self.changes) {
-            self.check_index(fingerprint, &idx)?;
+            if idx.hold.stale() {
+                self.check_index(fingerprint, &idx)?;
+            } else {
+                // The count moved for turns this index does not name
+                // (`lease`): it is current without the walk.
+                idx.hold.trusted(self.changes.load(Ordering::SeqCst));
+            }
         }
         self.touch_index(&idx);
         Ok(lease)
@@ -901,6 +917,11 @@ impl GalleryArena {
             .iter()
             .zip(&idx.run_ids)
             .all(|(sid, run)| res.get(sid).is_some_and(|rt| rt.run_id == *run));
+        // Cleared under the lock every change takes, so no change's mark is
+        // lost between the check and the clearing.
+        if current {
+            idx.hold.checked(changes);
+        }
         drop(res);
         if !current {
             let mut cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -910,7 +931,6 @@ impl GalleryArena {
             self.publish_indexes(&cache);
             return Err(IndexMiss::Stale);
         }
-        idx.hold.checked(changes);
         Ok(())
     }
 

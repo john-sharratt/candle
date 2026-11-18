@@ -208,6 +208,7 @@ pub mod dialogue_fill;
 mod error;
 pub(crate) mod event;
 pub mod fill;
+mod group_assembly;
 mod group_votes;
 mod held_index_pages;
 mod hits;

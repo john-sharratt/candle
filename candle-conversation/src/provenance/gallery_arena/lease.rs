@@ -21,6 +21,15 @@
 //! An index leaving the cache is the same handshake on [`ScanHold::retired`]: a
 //! scan adds its lease and then reads the flag; the cache sets the flag and,
 //! on a later publish, stops listing the index only if it reads no lease.
+//!
+//! **Only an index a change names is checked.** The change count moves with
+//! any change to any resident turn, and another conversation's evictions move
+//! it all the time, so a count alone sent nearly every scan through the full
+//! check: 194,167 turns under the residency lock, 56 ms a scan, on BlackWorld
+//! (2026-11-18). A change therefore also marks [`ScanHold::stale`] every index
+//! naming the turn, before it reads that index's lease. A scan whose index is
+//! unmarked has had no turn of it changed since its last check, and trusts it
+//! without walking the turns; a marked one is checked as before.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
@@ -36,15 +45,18 @@ pub(super) struct ScanHold {
     verified: AtomicU64,
     /// It has left the cache: a scan leases nothing.
     retired: AtomicBool,
+    /// A change may have touched one of its turns since the last check.
+    stale: AtomicBool,
 }
 
 impl Default for ScanHold {
-    /// Unchecked: the first reuse checks the turns.
+    /// Unchecked and marked: the first reuse checks the turns.
     fn default() -> Self {
         Self {
             leases: AtomicU32::new(0),
             verified: AtomicU64::new(u64::MAX),
             retired: AtomicBool::new(false),
+            stale: AtomicBool::new(true),
         }
     }
 }
@@ -77,8 +89,29 @@ impl ScanHold {
         self.verified.load(SeqCst) == changes.load(SeqCst)
     }
 
-    /// The turns were checked, under the residency lock, at count `changes`.
+    /// The turns were checked, under the residency lock, at count `changes`,
+    /// and found current: the mark is cleared. Changes take the same lock, so
+    /// none lands between the check and the clearing.
     pub fn checked(&self, changes: u64) {
+        self.stale.store(false, SeqCst);
+        self.verified.store(changes, SeqCst);
+    }
+
+    /// A change is about to touch one of the index's turns. Marked before the
+    /// change reads [`Self::leased`] (module docs).
+    pub fn mark_stale(&self) {
+        self.stale.store(true, SeqCst);
+    }
+
+    /// Whether a change may have touched one of its turns since the last
+    /// check. Read after the lease was added.
+    pub fn stale(&self) -> bool {
+        self.stale.load(SeqCst)
+    }
+
+    /// The change count moved but no change named this index: it is current
+    /// at `changes` without walking its turns.
+    pub fn trusted(&self, changes: u64) {
         self.verified.store(changes, SeqCst);
     }
 
@@ -193,6 +226,58 @@ mod tests {
                 "the change freed a turn a scan believed untouched"
             );
         }
+    }
+
+    /// **A change to an index's turn and a scan trusting it can never miss each
+    /// other.** A change marks the index and then reads its lease; a scan
+    /// enters its lease and then reads the mark. The outcome that would read a
+    /// moved page — the change sees no lease AND the scan sees no mark — never
+    /// happens.
+    #[test]
+    fn a_marked_change_and_a_trusting_scan_always_see_each_other() {
+        for _ in 0..20_000 {
+            let hold = Arc::new(ScanHold::default());
+            hold.checked(0);
+            let start = Arc::new(Barrier::new(2));
+            let scan = {
+                let (hold, start) = (hold.clone(), start.clone());
+                thread::spawn(move || {
+                    start.wait();
+                    assert!(hold.enter());
+                    hold.stale()
+                })
+            };
+            let change = {
+                let (hold, start) = (hold.clone(), start.clone());
+                thread::spawn(move || {
+                    start.wait();
+                    hold.mark_stale();
+                    hold.leased()
+                })
+            };
+            let scan_saw_the_mark = scan.join().unwrap();
+            let change_saw_a_lease = change.join().unwrap();
+            assert!(
+                scan_saw_the_mark || change_saw_a_lease,
+                "a scan trusted an index whose turn was changed under it"
+            );
+        }
+    }
+
+    /// A new hold is marked, a check clears the mark, and a change sets it
+    /// again; trusting moves the count without clearing a mark.
+    #[test]
+    fn the_mark_follows_checks_and_changes() {
+        let hold = ScanHold::default();
+        assert!(hold.stale(), "a new index is checked once");
+        hold.checked(4);
+        assert!(!hold.stale());
+        hold.mark_stale();
+        assert!(hold.stale());
+        hold.trusted(5);
+        assert!(hold.stale(), "trusting clears nothing");
+        let changes = AtomicU64::new(5);
+        assert!(hold.current(&changes));
     }
 
     /// The same for an index leaving the cache: it stops being listed only if

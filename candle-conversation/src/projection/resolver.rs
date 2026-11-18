@@ -21,6 +21,7 @@ use maintenance_op::Pass;
 use super::adaptive::{ScanCases, ScanNorm};
 use super::belief_files::{assemble_file_scans, cut_excluded, scan_file_scans, FileScan};
 use super::belief_scan_split::GROUP_SCAN_SPLIT;
+use super::group_assembly::{held, keep, Assemblies, AssemblyKey, AssemblyStamp, GroupAssembly};
 use super::held_index_pages::HeldIndexPages;
 use super::ids::{
     process_timeline_allocator, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId,
@@ -474,6 +475,9 @@ pub struct Conversation {
     /// epoch, it reruns only when a stream, blob or tombstone actually changed —
     /// about once per sealed turn.
     gallery_cache: Arc<papaya::HashMap<GalleryKey, Arc<(u64, BeliefGallery)>>>,
+    /// Each belief turn group's assembled scan, per target, reused while the
+    /// substrate it was gathered from stands (`group_assembly`).
+    group_assemblies: Arc<Assemblies>,
     /// The index pages a live slot holds, found again by their record rather
     /// than read off the log at every reprojection — see [`HeldIndexPages`].
     held_index_pages: Arc<HeldIndexPages>,
@@ -655,6 +659,7 @@ impl Conversation {
             normalization_warm: Arc::new(AtomicBool::new(false)),
             branch_checkpoint: Arc::new(ArcSwapOption::empty()),
             gallery_cache: Arc::new(papaya::HashMap::new()),
+            group_assemblies: Arc::new(Assemblies::new()),
             held_index_pages: Arc::default(),
             section_loads: Arc::default(),
         }
@@ -1710,7 +1715,7 @@ impl Conversation {
                  lineage_us={} release_us={} arena_kernel_gpu_us={} arena_index_built={} \
                  arena_index_build_us={} arena_index_absent={} arena_index_stale={} \
                  arena_index_narrower={} arena_held={} arena_hold_us={} arena_queue_us={} \
-                 arena_view_us={}",
+                 arena_view_us={} assemblies_reused={}",
                 probe.len(),
                 t_groups.elapsed().as_micros(),
                 groups.scanned,
@@ -1758,6 +1763,7 @@ impl Conversation {
                 arena.hold_us,
                 arena.queue_us,
                 arena.view_us,
+                groups.assemblies_reused,
             )
         });
         (scores, candidates)
@@ -2627,63 +2633,110 @@ impl Conversation {
             } else {
                 Holder::Shared
             };
-            let t_scope = Instant::now();
-            let mut timelines: Vec<TimelineId> = if masked {
-                vec![target.timeline]
-            } else if sub.is_append_only_layer(target.layer) {
-                // A compounded group never offers the target's own lineage:
-                // it is the target's opening already (`compounding_lineage`).
-                let lineage: HashSet<TimelineId> =
-                    sub.inherited_chain(target.timeline).into_iter().collect();
-                sub.scoped_timelines_for_group(group.id, target.timeline)
-                    .filter(|tl| !lineage.contains(tl))
-                    .collect()
-            } else {
-                sub.scoped_timelines_for_group(group.id, target.timeline)
-                    .collect()
+            // The group's files as this target reads them: kept from an earlier
+            // scan while nothing they were gathered from has moved
+            // (`group_assembly`), gathered afresh otherwise.
+            let by_kind = group.policy.scan.normalize == ScanNorm::KindZ;
+            let key = AssemblyKey {
+                group: group.id,
+                target: target.timeline,
+                masked,
             };
-            let scope_us = t_scope.elapsed().as_micros() as u64;
-            let t_tags = Instant::now();
-            // A tagged group reads only the conversations carrying its tags — the
-            // same scope projection applies to its candidates, applied here so an
-            // out-of-scope conversation is neither scanned nor allowed to teach
-            // the group's backgrounds. See `Builder::set_group_tags`. Never the
-            // target's own group, which is its own timeline already — the same
-            // exemption projection makes.
-            if !group.policy.tags.is_empty() && group.id != target.group {
-                let tags = &group.policy.tags;
-                timelines.retain(|&tl| {
-                    (0..sub.turn_count(tl)).any(|i| sub.turn_has_any_tag(tl, TurnIndex(i), tags))
-                });
-            }
-            let tags_us = t_tags.elapsed().as_micros() as u64;
-            // ── Phase A: assemble every file's exchanges + gallery windows ───────
-            // All files in the group are built first so the whole group can be scored
-            // in ONE batched GPU launch (per-file z), or file-by-file on the CPU
-            // fallback — the two paths are numerically equivalent up to fast-math ULP
-            // (same ranking; see `examples/gpu_belief_parity.rs`).
+            let stamp = AssemblyStamp::of(&sub);
+            let (mut scope_us, mut tags_us, mut exclude_us, mut kinds_us) = (0, 0, 0, 0);
             let select_us = t_select.elapsed().as_micros() as u64;
-            let n_timelines = timelines.len();
             let t_assemble = Instant::now();
-            let (mut files, turns_walked) = assemble_file_scans(&sub, timelines);
-            let t_exclude = Instant::now();
-            cut_excluded(&mut files, &sub.chunk_exclusion(group.id));
-            let exclude_us = t_exclude.elapsed().as_micros() as u64;
-            let t_kinds = Instant::now();
-            // Each file's kind, its path's extension, when the group reads its
-            // files against their own kind — one metadata lookup a file.
-            let kinds: Option<Vec<String>> =
-                (group.policy.scan.normalize == ScanNorm::KindZ).then(|| {
-                    files
-                        .iter()
-                        .map(|f| {
-                            sub.custom_of(f.timeline)
-                                .and_then(|m| m.get(Substrate::PATH_KEY))
-                                .map_or(String::new(), |p| path_kind(p).to_string())
-                        })
-                        .collect()
-                });
-            let kinds_us = t_kinds.elapsed().as_micros() as u64;
+            let assembly = match held(
+                &self.group_assemblies,
+                key,
+                stamp,
+                &group.policy.tags,
+                by_kind,
+            ) {
+                Some(kept) => {
+                    GROUP_SCAN_SPLIT.set({
+                        let mut s = GROUP_SCAN_SPLIT.get();
+                        s.assemblies_reused += 1;
+                        s
+                    });
+                    kept
+                }
+                None => {
+                    let t_scope = Instant::now();
+                    let mut timelines: Vec<TimelineId> = if masked {
+                        vec![target.timeline]
+                    } else if sub.is_append_only_layer(target.layer) {
+                        // A compounded group never offers the target's own
+                        // lineage: it is the target's opening already
+                        // (`compounding_lineage`).
+                        let lineage: HashSet<TimelineId> =
+                            sub.inherited_chain(target.timeline).into_iter().collect();
+                        sub.scoped_timelines_for_group(group.id, target.timeline)
+                            .filter(|tl| !lineage.contains(tl))
+                            .collect()
+                    } else {
+                        sub.scoped_timelines_for_group(group.id, target.timeline)
+                            .collect()
+                    };
+                    scope_us = t_scope.elapsed().as_micros() as u64;
+                    let t_tags = Instant::now();
+                    // A tagged group reads only the conversations carrying its
+                    // tags — the same scope projection applies to its
+                    // candidates, applied here so an out-of-scope conversation
+                    // is neither scanned nor allowed to teach the group's
+                    // backgrounds. See `Builder::set_group_tags`. Never the
+                    // target's own group, which is its own timeline already —
+                    // the same exemption projection makes.
+                    if !group.policy.tags.is_empty() && group.id != target.group {
+                        let tags = &group.policy.tags;
+                        timelines.retain(|&tl| {
+                            (0..sub.turn_count(tl))
+                                .any(|i| sub.turn_has_any_tag(tl, TurnIndex(i), tags))
+                        });
+                    }
+                    tags_us = t_tags.elapsed().as_micros() as u64;
+                    // ── Phase A: assemble every file's exchanges + gallery
+                    // windows. All files in the group are built first so the
+                    // whole group can be scored in ONE batched GPU launch
+                    // (per-file z), or file-by-file on the CPU fallback — the two
+                    // paths are numerically equivalent up to fast-math ULP (same
+                    // ranking; see `examples/gpu_belief_parity.rs`).
+                    let n_timelines = timelines.len();
+                    let (mut files, turns_walked) = assemble_file_scans(&sub, timelines);
+                    let t_exclude = Instant::now();
+                    cut_excluded(&mut files, &sub.chunk_exclusion(group.id));
+                    exclude_us = t_exclude.elapsed().as_micros() as u64;
+                    let t_kinds = Instant::now();
+                    // Each file's kind, its path's extension, when the group
+                    // reads its files against their own kind — one metadata
+                    // lookup a file.
+                    let kinds: Option<Vec<String>> = by_kind.then(|| {
+                        files
+                            .iter()
+                            .map(|f| {
+                                sub.custom_of(f.timeline)
+                                    .and_then(|m| m.get(Substrate::PATH_KEY))
+                                    .map_or(String::new(), |p| path_kind(p).to_string())
+                            })
+                            .collect()
+                    });
+                    kinds_us = t_kinds.elapsed().as_micros() as u64;
+                    let built = Arc::new(GroupAssembly {
+                        stamp,
+                        tags: group.policy.tags.clone(),
+                        kinds,
+                        files,
+                        n_timelines,
+                        turns_walked,
+                    });
+                    keep(&self.group_assemblies, key, Arc::clone(&built));
+                    built
+                }
+            };
+            let n_timelines = assembly.n_timelines;
+            let turns_walked = assembly.turns_walked;
+            let files = &assembly.files;
+            let kinds = &assembly.kinds;
             let t_lineage = Instant::now();
             // The target's lineage, when the group leaves it out: the priming
             // chain the target opens on already.
@@ -2715,7 +2768,7 @@ impl Conversation {
             // schema YAML). Per probe, per file: `(fused, mass_base)`, the tail and
             // question windows riding one launch. ──
             let scan_files =
-                |probes: &[&[WideQSig]]| scan_file_scans(&files, group, probes, arena, holder);
+                |probes: &[&[WideQSig]]| scan_file_scans(files, group, probes, arena, holder);
             // Concept F: the pinned question window scans as a second probe,
             // max-fused with the tail per exchange AFTER normalization.
             let question = match probe_q {

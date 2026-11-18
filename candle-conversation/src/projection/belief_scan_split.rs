@@ -65,6 +65,9 @@ pub(crate) struct GroupScanSplit {
     /// Of `assemble_us`: letting go of the substrate version the assembly
     /// read — a version no one else holds is freed here.
     pub release_us: u64,
+    /// Groups whose files were kept from an earlier scan rather than gathered
+    /// (`group_assembly`).
+    pub assemblies_reused: u64,
 }
 
 thread_local! {
@@ -93,6 +96,7 @@ thread_local! {
             kinds_us: 0,
             lineage_us: 0,
             release_us: 0,
+            assemblies_reused: 0,
         }) };
 }
 

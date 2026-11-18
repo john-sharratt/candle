@@ -867,6 +867,84 @@ fn score_belief_groups_scores_every_conversation_in_a_multi_file_group() {
     assert!(cluster_cands.iter().any(|(k, _)| k.timeline == file_b));
 }
 
+/// **A group's assembled files are kept between scans and gathered afresh once
+/// the substrate moves.** A second scan with nothing changed scores every turn
+/// exactly as the first did. A file registered between scans is scored by the
+/// next one: the kept assembly is stamped with the gallery epoch, which the new
+/// file's turns move.
+#[test]
+fn a_kept_group_assembly_scores_alike_and_a_new_file_is_seen() {
+    use candle_conversation::projection::{TimelineId, TurnIndex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+    let builder = Builder::from_yaml(TWO_LAYER_YAML).unwrap();
+    let mem_layer = builder.id_for_layer("mem").unwrap();
+    let clusters = builder.id_for_group("clusters").unwrap();
+    let dialogue_layer = builder.id_for_layer("dialogue").unwrap();
+    let convo = builder.id_for_group("convo").unwrap();
+    let fills = [
+        0xAAAA_AAAA_AAAA_AAAAu64,
+        0x5555_5555_5555_5555u64,
+        0xFFFF_FFFF_FFFF_FFFFu64,
+    ];
+    let write_file = |tl: TimelineId| {
+        conv.register_timeline(tl, mem_layer, clusters);
+        for fill in fills {
+            let idx = conv
+                .record_turn(
+                    tl,
+                    Role::User,
+                    TurnPartWrite {
+                        token_count: 4,
+                        tags: vec!["repo_map".to_string()],
+                        ..Default::default()
+                    },
+                    |seqs| Ok(seqs.to_vec()),
+                )
+                .expect("record_turn");
+            conv.persist_wide_q_sigs(
+                turn_stream_id(tl.raw(), idx.0),
+                &encode_wide_sigs(&[sig(fill)]),
+            )
+            .expect("persist sigs");
+        }
+    };
+    let file_a = TimelineId::from_raw(211).unwrap();
+    write_file(file_a);
+    let dlg_tl = TimelineId::from_raw(298).unwrap();
+    conv.register_timeline(dlg_tl, dialogue_layer, convo);
+    let target = ProjectionTarget {
+        layer: dialogue_layer,
+        group: convo,
+        timeline: dlg_tl,
+    };
+    let probe = vec![sig(fills[1])];
+    let scan = || conv.score_beliefs(builder.schema(), target, &probe, None, Observe::No, None);
+    let (first, _) = scan();
+    let (second, _) = scan();
+    for i in 0..3 {
+        assert_eq!(
+            first.turn(file_a, TurnIndex(i)).to_bits(),
+            second.turn(file_a, TurnIndex(i)).to_bits(),
+            "turn {i} scored alike from the kept assembly",
+        );
+    }
+    let file_b = TimelineId::from_raw(212).unwrap();
+    write_file(file_b);
+    let (third, cands) = scan();
+    assert!(
+        third.turn(file_b, TurnIndex(1)) > 0.0,
+        "the file written between scans is scored",
+    );
+    let cluster_cands = cands
+        .iter()
+        .find(|(g, _)| *g == clusters)
+        .map(|(_, c)| c)
+        .expect("clusters group reported candidates");
+    assert_eq!(cluster_cands.len(), 6, "both files' three turns");
+}
+
 /// **Documents of one exchange compete with each other.** A group of
 /// one-turn conversations — a world's entries, one era each — is one score
 /// competition: the document a probe is drawn from wins, and a document it is
