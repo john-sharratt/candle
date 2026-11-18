@@ -243,11 +243,12 @@ fn address_of(rel: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn a_documents_path_address_and_life_are_read_from_its_mind_path() {
-        let mind = PathBuf::from("D:/prog/mind");
+        // Absolute on every platform: `D:/prog/mind` is a relative path on Unix.
+        let root = std::env::temp_dir();
+        let mind = root.join("mind");
         assert_eq!(
             rel(
                 &mind,
@@ -256,7 +257,7 @@ mod tests {
             .as_deref(),
             Some("layers/stories/the-ledger.md")
         );
-        assert_eq!(rel(&mind, Path::new("C:/elsewhere/x.md")), None);
+        assert_eq!(rel(&mind, &root.join("elsewhere").join("x.md")), None);
         assert_eq!(rel(Path::new(""), &std::env::temp_dir().join("x.md")), None);
         assert_eq!(
             rel(Path::new(""), Path::new("layers/x.md")).as_deref(),

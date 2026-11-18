@@ -49,6 +49,16 @@ fn mentions(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
 
+/// Git's `fatal: repository '<url>' does not exist` — how a local origin that
+/// is not there is reported by the releases that do not say it "does not
+/// appear to be a git repository" (2.43 among them). Matched as the whole
+/// sentence: a bare "does not exist" is also how a missing path is told.
+fn repository_missing(lower: &str) -> bool {
+    lower
+        .lines()
+        .any(|l| l.starts_with("fatal: repository '") && l.trim_end().ends_with("' does not exist"))
+}
+
 /// The ref named in git's `cannot lock ref '<name>': <reason>`, and the reason.
 fn locked_ref(stderr: &str) -> Option<(RefName, String)> {
     let start = stderr.find("cannot lock ref '")? + "cannot lock ref '".len();
@@ -98,7 +108,7 @@ pub(crate) fn classify(
                 detail: stderr.trim().to_string(),
             };
         }
-        if mentions(&lower, UNREACHABLE) {
+        if mentions(&lower, UNREACHABLE) || repository_missing(&lower) {
             return GitError::RemoteUnreachable {
                 remote: remote.clone(),
                 detail: stderr.trim().to_string(),
@@ -162,6 +172,9 @@ mod tests {
             "ssh: Could not resolve hostname github.invalid: Name or service not known\nfatal: Could not read from remote repository.\n",
             "ssh: connect to host github.com port 22: Connection refused\n",
             "fatal: unable to access 'https://github.invalid/x.git/': Could not resolve host: github.invalid\n",
+            // A local origin that is not there, as 2.45 and 2.43 each say it.
+            "fatal: '/tmp/no-such-origin' does not appear to be a git repository\nfatal: Could not read from remote repository.\n",
+            "fatal: repository '/tmp/no-such-origin' does not exist\n",
         ] {
             assert!(
                 matches!(run(&origin(), stderr), GitError::RemoteUnreachable { .. }),
@@ -174,6 +187,16 @@ mod tests {
     #[test]
     fn remote_wording_without_a_remote_is_unclassified() {
         let e = run(&Context::default(), "Permission denied (publickey).\n");
+        assert!(matches!(e, GitError::Unclassified { .. }), "{e}");
+    }
+
+    /// A path that does not exist is not a missing repository.
+    #[test]
+    fn a_missing_path_is_not_an_unreachable_remote() {
+        let e = run(
+            &origin(),
+            "fatal: path 'x.txt' does not exist in 'origin/main'\n",
+        );
         assert!(matches!(e, GitError::Unclassified { .. }), "{e}");
     }
 

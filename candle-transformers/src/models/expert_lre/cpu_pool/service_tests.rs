@@ -6,7 +6,7 @@
 
 use std::ptr;
 use std::sync::atomic::{fence, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -87,6 +87,13 @@ fn write_work(work: &Mapped, row: i32, seq: u32, experts: &[(u32, u32, u32, [u64
     }
 }
 
+/// One fixture's pool at a time. Each pins its service thread to the first
+/// pool core and its workers to the rest, as the one service in production
+/// does; two at once contend for the same cores. Where pinning is a preference
+/// (Windows CPU sets) they share them; where it is binding (Linux affinity) a
+/// service thread spinning beside another on its one core misses its answer.
+static ONE_POOL: Mutex<()> = Mutex::new(());
+
 /// Four experts in pinned slot images, and the service over a production-
 /// shaped pool.
 struct Fixture {
@@ -98,10 +105,16 @@ struct Fixture {
     seed: u64,
     /// The last rung layer's input map: ring row → input row.
     inputs: Vec<usize>,
+    /// Held for the fixture's life. Last, so it is dropped after the service
+    /// it guards has stopped (fields drop in order).
+    _one_pool: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     fn new() -> candle::Result<Self> {
+        // A test that failed while holding it leaves it poisoned; the pool it
+        // guarded is gone with that test's fixture.
+        let one_pool = ONE_POOL.lock().unwrap_or_else(|e| e.into_inner());
         let dt = GgmlDType::Q3_KO;
         let mut seed = 0x5e7_71ce;
         let images: Vec<(Vec<u8>, (usize, usize, usize))> = (0..4)
@@ -161,6 +174,7 @@ impl Fixture {
             service,
             seed,
             inputs: Vec::new(),
+            _one_pool: one_pool,
         })
     }
 

@@ -15,12 +15,19 @@
 //! cores the process kept busy (its CPU time over wall time), which is what
 //! the package's clock pays for.
 
-#[cfg(test)]
+#[cfg(all(test, any(windows, target_os = "linux")))]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    use libc::{getrusage, rusage, timeval, RUSAGE_SELF};
+    #[cfg(windows)]
+    use windows_sys::Win32::Foundation::FILETIME;
+    #[cfg(windows)]
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
     use crate::models::expert_lre::cpu_pool::backoff::{
         Backoff, COOL_DOWN, INTER_LAYER_SPINS, INTRA_LAYER_SPINS, LOW_POWER_CYCLES,
@@ -47,9 +54,19 @@ mod tests {
     }
 
     /// The process's CPU time so far, user and kernel.
+    #[cfg(target_os = "linux")]
     fn cpu_time() -> Duration {
-        use windows_sys::Win32::Foundation::FILETIME;
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        // SAFETY: an all-zero `rusage` is a valid out-param for `getrusage`.
+        let mut usage: rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: the calling process's usage, written into a live `rusage`.
+        unsafe { getrusage(RUSAGE_SELF, &mut usage) };
+        let tv = |t: timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1_000);
+        tv(usage.ru_utime) + tv(usage.ru_stime)
+    }
+
+    /// The process's CPU time so far, user and kernel.
+    #[cfg(windows)]
+    fn cpu_time() -> Duration {
         let zero = FILETIME {
             dwLowDateTime: 0,
             dwHighDateTime: 0,

@@ -200,7 +200,21 @@ impl HostArgs {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
     use clap::Parser;
+
+    /// A group key file in `dir`, readable by its owner alone, as the cluster
+    /// requires of a key on Unix.
+    fn group_key_in(dir: &Path) -> PathBuf {
+        let key = dir.join("group.key");
+        std::fs::write(&key, "ab".repeat(32)).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        key
+    }
 
     #[derive(Parser)]
     struct Cli {
@@ -282,8 +296,7 @@ mod tests {
     #[test]
     fn cluster_flags_parse_and_need_their_key() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let key = tmp.path().join("group.key");
-        std::fs::write(&key, "ab".repeat(32)).unwrap();
+        let key = group_key_in(tmp.path());
         let key_arg = key.to_string_lossy().to_string();
         let flags = Cli::try_parse_from([
             "x",
@@ -338,8 +351,7 @@ mod tests {
     #[test]
     fn a_cluster_of_several_urls_is_one_gateway() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let key = tmp.path().join("group.key");
-        std::fs::write(&key, "ab".repeat(32)).unwrap();
+        let key = group_key_in(tmp.path());
         let yaml: HostArgs = serde_yaml::from_str(&format!(
             "clusters: [\"https://gateway.tokera.local:9443 https://gateway.tokera.com:9443\"]\n\
              cluster_name: tokera.com\ngroup_key: '{}'\n",

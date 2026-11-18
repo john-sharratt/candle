@@ -624,6 +624,8 @@ mod tests {
     // platform constant is exactly what is being asserted.
     #![allow(clippy::assertions_on_constants)]
 
+    use std::hint::black_box;
+
     use super::*;
 
     /// On Windows the probe must return live, sane counters; elsewhere `None`.
@@ -851,7 +853,9 @@ mod tests {
             assert!(cfg!(not(any(windows, target_os = "linux"))));
             return;
         };
-        let held = vec![1u8; 64 << 20];
+        // Through `black_box`: an allocation nothing reads may be elided in a
+        // release build, and then nothing was touched at all.
+        let held = black_box(vec![1u8; 64 << 20]);
         let after = process_private_resident().unwrap();
         assert!(
             after >= before + (48 << 20),

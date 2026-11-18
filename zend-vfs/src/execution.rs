@@ -58,13 +58,11 @@ impl Repo {
         // git's "did not match any file(s) known to git".
         let commit = self.resolve(&Rev::Branch(branch.clone()))?;
         let _write = self.write_lock();
+        // No `--end-of-options`: git before 2.44 reads the `--` after it as a
+        // second ref ("only one reference expected, 2 given"). The branch cannot
+        // be read as a flag: a `BranchName` refuses a leading `-`.
         self.git("checkout")
-            .args([
-                "--quiet",
-                "--force",
-                "--no-recurse-submodules",
-                "--end-of-options",
-            ])
+            .args(["--quiet", "--force", "--no-recurse-submodules"])
             .arg(branch.as_str())
             // Nothing after the branch is a path.
             .arg("--")
@@ -132,8 +130,10 @@ impl Repo {
     pub fn restore_paths(&self, commit: &Oid, paths: &[&RepoPath]) -> Result<(), GitError> {
         let _write = self.write_lock();
         for batch in batches(paths) {
+            // No `--end-of-options`, as in `force_checkout_branch`; a commit
+            // id is hex and cannot be read as a flag.
             self.git("checkout")
-                .args(["--quiet", "--force", "--end-of-options"])
+                .args(["--quiet", "--force"])
                 .arg(commit.as_str())
                 .arg("--")
                 .args(batch.iter().map(|p| p.as_str()))
