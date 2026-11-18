@@ -77,9 +77,6 @@ pub enum SelectionOrigin {
     /// first exchange), injected because a sibling exchange was selected — it
     /// travels WITH the hit, carrying the file's imports/module doc.
     Anchor,
-    /// A working-set lock: a conversation the fast path served in place of a
-    /// tool read, pinned for the rest of the task.
-    WorkingSetLock,
     /// A working-set provenance pick: a conversation the dialogue keeps
     /// attending to, ranked by its momentum.
     WorkingSetMomentum,

@@ -1,12 +1,11 @@
 //! **Every carving the slot fill makes keeps whole turns and its floor**
 //! (`docs/hit_driven_projection.md` §8.1, §13.2): over random pieces — a
-//! lineage, working-set pieces locked and not, the dialogue's own exchanges and
-//! other groups' exchanges — at random turn sizes, scores, caps and room, each
-//! exchange the plan places holds its first and its last turn, and between
-//! them only some of its own turns, in order. Every turn is placed whole, so
-//! the roles alternate `U A U A …` by construction. The caps bind: no unlocked
-//! reading passes `max_file`, and the unlocked working set never passes
-//! `budget`.
+//! lineage, working-set pieces, the dialogue's own exchanges and other groups'
+//! exchanges — at random turn sizes, scores, caps and room, each exchange the
+//! plan places holds its first and its last turn, and between them only some
+//! of its own turns, in order. Every turn is placed whole, so the roles
+//! alternate `U A U A …` by construction. The caps bind: no reading passes
+//! `max_file`, and the working set never passes `budget`.
 
 use std::collections::HashMap;
 
@@ -42,7 +41,6 @@ fn random_case(rng: &mut StdRng) -> Case {
     let working = (0..rng.random_range(0..=4))
         .map(|_| WorkingPiece {
             kind: kinds[rng.random_range(0..kinds.len())],
-            locked: rng.random_bool(0.2),
             score: rng.random_range(0.0..1000.0),
             exchanges: (0..rng.random_range(1..=3)).map(|_| ex(rng, 6)).collect(),
         })
@@ -167,32 +165,27 @@ fn every_carving_of_a_random_slot_keeps_whole_turns_and_its_caps() {
                 "case {case_no} context {i}"
             );
         }
-        // A locked piece goes in whole; an unlocked reading stays under
-        // `max_file`, and the unlocked pieces together under `budget`.
-        let mut unlocked = 0usize;
+        // A reading stays under `max_file`, and the pieces together under
+        // `budget`.
+        let mut working = 0usize;
         for (p, wp) in slot.working.iter().enumerate() {
             let mut piece = 0usize;
             for (e, ex) in wp.exchanges.iter().enumerate() {
                 let placed = check(ex, &format!("working {p}/{e}"));
-                if wp.locked {
-                    assert_eq!(placed.len(), ex.len(), "case {case_no} locked {p}/{e}");
-                }
                 piece += tokens_of(&placed);
             }
-            if !wp.locked {
-                unlocked += piece;
-                if wp.kind == Kind::Reading {
-                    assert!(
-                        piece <= slot.caps.max_file,
-                        "case {case_no}: reading {p} placed {piece} past max_file {}",
-                        slot.caps.max_file
-                    );
-                }
+            working += piece;
+            if wp.kind == Kind::Reading {
+                assert!(
+                    piece <= slot.caps.max_file,
+                    "case {case_no}: reading {p} placed {piece} past max_file {}",
+                    slot.caps.max_file
+                );
             }
         }
         assert!(
-            unlocked <= slot.caps.budget,
-            "case {case_no}: {unlocked} unlocked past budget {}",
+            working <= slot.caps.budget,
+            "case {case_no}: {working} past budget {}",
             slot.caps.budget
         );
         // The current exchange keeps its first turn, its newest tool turn and
@@ -221,8 +214,7 @@ fn every_carving_of_a_random_slot_keeps_whole_turns_and_its_caps() {
             }
         }
 
-        // What is placed fits the room, but for what locks and floors carried
-        // past it.
+        // What is placed fits the room, but for what floors carried past it.
         let total = tokens_of(&all_placed(&plan));
         assert!(
             total <= slot.room + plan.over_room,

@@ -305,4 +305,4 @@ pub use schema::{
     LINEAGE_BASE,
 };
 pub use script::{recorded_dials, ProjectionScript};
-pub use working_set_pick::{Standing, WorkingSetMembers};
+pub use working_set_pick::WorkingSetMembers;

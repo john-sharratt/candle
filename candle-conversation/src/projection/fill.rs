@@ -1,16 +1,15 @@
 //! The slot fill (`docs/hit_driven_projection.md` §7.2 step 4, §8.5).
 //!
 //! One fill places everything a dialogue's slot holds after its system prompt,
-//! in three tiers, each taking its room from the tiers below it:
+//! in two tiers, the first taking its room from the second:
 //!
-//! 1. **Locks**, whole: the reads the user asked for, whatever they cost.
-//! 2. **Floors**, in their own order: the current exchange, the dialogue's
+//! 1. **Floors**, in their own order: the current exchange, the dialogue's
 //!    first request, then the recent exchanges newest first. When they pass
 //!    the room they give way from the bottom — a recent exchange sheds its tool
 //!    rounds oldest first and then leaves whole, oldest exchange first; then the
 //!    current exchange's older tool rounds go. What is left past the room
-//!    carries the slot past the trained window, as locks do.
-//! 3. **Everything else by score**, highest first, ties oldest first: each
+//!    carries the slot past the trained window.
+//! 2. **Everything else by score**, highest first, ties oldest first: each
 //!    round admitted while its kind is under its cap, bringing its piece's floor
 //!    — a reading's request and answer, an older exchange's pair — with it, and
 //!    only if all of them fit.
@@ -77,7 +76,6 @@ pub struct FillInput {
     /// The room: the trained window less the reserve, the system prompt as
     /// emitted and what the turn has already appended.
     pub room: usize,
-    pub locks: Vec<Unit>,
     /// The current exchange: `kept` is its request, its newest tool round and
     /// the reply; `rounds` its older tool rounds.
     pub current: FloorExchange,
@@ -91,7 +89,7 @@ pub struct FillInput {
 }
 
 /// What the fill placed: the units by id, and how far past the room the
-/// locks and the floors that could not give way carried it.
+/// floors that could not give way carried it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Fill {
     pub placed: Vec<usize>,
@@ -155,12 +153,7 @@ pub fn fill(input: &FillInput, caps: &Caps) -> Fill {
         placed.push(u.id);
     }
 
-    // 1. Locks, whole, whatever they cost.
-    for u in &input.locks {
-        place(u, &mut used, &mut placed);
-    }
-
-    // 2. Floors, giving way from the bottom when they pass the room.
+    // 1. Floors, giving way from the bottom when they pass the room.
     let mut recent: Vec<FloorExchange> = input.recent.clone();
     let mut current_rounds: Vec<Unit> = input.current.rounds.clone();
     let floor_tokens = |recent: &[FloorExchange], current_rounds: &[Unit]| -> usize {
@@ -206,7 +199,7 @@ pub fn fill(input: &FillInput, caps: &Caps) -> Fill {
     }
     let over_room = used.total.saturating_sub(input.room);
 
-    // 3. Everything else by score, highest first, ties oldest first.
+    // 2. Everything else by score, highest first, ties oldest first.
     let mut order: Vec<&Unit> = input.scored.iter().collect();
     order.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
     // A unit is placed once, whether it came in by its own score or with a
@@ -266,21 +259,6 @@ mod tests {
     fn sorted(mut v: Vec<usize>) -> Vec<usize> {
         v.sort_unstable();
         v
-    }
-
-    /// Locks past the room are placed anyway and carry the slot past it;
-    /// nothing scored gets in behind them.
-    #[test]
-    fn locks_past_the_slot_are_placed() {
-        let input = FillInput {
-            room: 100,
-            locks: vec![u(1, 1, Kind::Reading, 150, 0.0)],
-            scored: vec![u(2, 2, Kind::Dialogue, 10, 9.0)],
-            ..Default::default()
-        };
-        let f = fill(&input, &caps());
-        assert_eq!(f.placed, vec![1]);
-        assert_eq!(f.over_room, 50);
     }
 
     /// A kind at its cap is skipped and its room goes to the next by score.

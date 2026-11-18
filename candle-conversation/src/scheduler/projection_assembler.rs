@@ -2343,21 +2343,6 @@ fn keeps_reasoning(
     slot_timeline == Some(turn_timeline) && newest_of_turn_timeline == Some(index)
 }
 
-/// Whether `timeline` is pinned in the working set of the slot being assembled
-/// — content the model was told it has, so a turn of it that cannot be injected
-/// must fail the projection rather than drop out of it.
-fn is_promised(
-    substrate: &Substrate,
-    slot_target: Option<ProjectionTarget>,
-    timeline: TimelineId,
-) -> bool {
-    slot_target.is_some_and(|t| {
-        substrate
-            .working_set(t.timeline)
-            .is_some_and(|ws| ws.is_pinned(timeline))
-    })
-}
-
 fn inject_sealed_turn(
     ctx: &mut ApplyContext<'_>,
     walker: &mut SegmentWalker,
@@ -2509,22 +2494,7 @@ fn inject_sealed_turn(
                 None => (None, None, None),
             };
             let tok_count = conv.turn_token_count_of(timeline, index);
-            // **A pinned turn is a promise, not a candidate.** The model was
-            // told this content is in its context ("already read"), so leaving
-            // it out would have it answer from nothing. Refuse the projection
-            // loudly instead; a provenance turn carries no promise and is
-            // dropped as before.
-            let pinned = is_promised(&conv, ctx.slot_target, timeline);
             drop(conv);
-            if pinned {
-                return Err(ConversationError::Other(format!(
-                    "apply_projection: working-set turn {}:{} is pinned but has no hot \
-                     sealed K/V (tier hot={tier_hot:?} warm={tier_warm:?} cold={tier_cold:?}) \
-                     — the working set does not fit this card",
-                    timeline.raw(),
-                    index.0,
-                )));
-            }
             tracing::warn!(
                 target: "candle_conversation::scheduler::reproject",
                 slot = parent_id.0,
@@ -3557,12 +3527,7 @@ fn log_placed_tokens(ctx: &mut ApplyContext<'_>, walker: &mut SegmentWalker, tok
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::{
-        GroupId, HitsConfig, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId,
-        WorkingSetShare,
-    };
-    use crate::working_set::Limits;
-    use std::num::NonZeroUsize;
+    use crate::projection::{GroupId, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId};
 
     fn tl(raw: u64) -> TimelineId {
         TimelineId::from_raw(raw).expect("timeline id")
@@ -3695,49 +3660,6 @@ layers:
             !keeps_reasoning(Some(slot), ancestor, Some(TurnIndex(1)), TurnIndex(1)),
             "the newest turn of a FOREIGN timeline is not the slot's live turn",
         );
-    }
-
-    /// A turn the slot's working set pins is a promise — it may not drop out
-    /// of the projection — while a provenance pick carries none, and nor does
-    /// a projection with no slot identity.
-    #[test]
-    fn only_a_pinned_working_set_turn_is_a_promise() {
-        let layer = LayerId::for_test(1);
-        let group = GroupId::for_test(1);
-        let (dialogue, file, other) = (tl(7), tl(8), tl(9));
-        let mut sub = Substrate::new();
-        sub.set_working_set_share(group, WorkingSetShare::Remainder);
-        for t in [dialogue, file, other] {
-            sub.register_timeline(t, layer, group);
-        }
-        sub.append_with_blocks(file, 10, 0, 1);
-        sub.append_with_blocks(other, 10, 0, 1);
-        assert!(sub.working_set_restore_lock(dialogue, file));
-        let limits = Limits {
-            budget_tokens: 1_000,
-            folder_tokens: 1_000,
-            guidance_tokens: 1_000,
-            lock_tokens: 1_000,
-            max_file_tokens: 1_000,
-        };
-        sub.working_set_observe(
-            dialogue,
-            &HashMap::from([(other, 500.0)]),
-            &HashMap::new(),
-            &HitsConfig::default(),
-            0.2,
-            100.0,
-            limits,
-            NonZeroUsize::MAX,
-        );
-        let target = ProjectionTarget {
-            layer,
-            group,
-            timeline: dialogue,
-        };
-        assert!(is_promised(&sub, Some(target), file));
-        assert!(!is_promised(&sub, Some(target), other));
-        assert!(!is_promised(&sub, None, file));
     }
 
     /// With no slot identity there is no turn being continued, so nothing keeps

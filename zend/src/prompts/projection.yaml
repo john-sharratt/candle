@@ -1217,20 +1217,16 @@ layers:
     working_set:
       # The slot is the engine's trained window, so a dialogue runs the
       # trained RoPE at every depth (docs/hit_driven_projection.md §4). One
-      # fill places everything in it after the system prompt: locks, floors,
-      # then rounds by score. The shares below and this layer's window are
-      # caps on that fill, never reservations, so they may sum past the slot.
+      # fill places everything in it after the system prompt: floors, then
+      # rounds by score. The shares below and this layer's window are caps on
+      # that fill, never reservations, so they may sum past the slot.
       # What arrives between two projections: one 64-token cadence, or one
       # prefill chunk of an opening (a tool result is prefilled in chunks of
       # this many, with a projection between them).
       reserve_tokens: 16384
-      # What the set holds voluntarily — seeds and provenance. The model's own
-      # reads sit on top under `lock_tokens`.
+      # What the set holds — seeds and provenance.
       budget_tokens: 64000
-      # The locks sit on top: a read the model makes adds to what it carries
-      # and never displaces the provenance around it, up to this ceiling.
-      lock_tokens: 48000
-      folder_tokens: 10000       # repo_map's share: pinned + provenance folders
+      folder_tokens: 10000       # repo_map's share of it
       # The guidance group's pool, beside `budget_tokens`: four to five guides
       # and journal notes at a time (docs/guidance_layer.md §1).
       guidance_tokens: 16000
@@ -1238,12 +1234,11 @@ layers:
       min_momentum: 100          # below this a file is no provenance candidate
       # The most of one reading the slot places: a longer one is a member
       # charged this much, and the fill keeps its first and last turns and its
-      # best-scored pages between (docs/zend_working_set.md §4.4). A lock past
-      # it is refused.
+      # best-scored pages between (docs/zend_working_set.md §4.4).
       max_file_tokens: 48000
-      # The most of `budget_tokens` each type of document may hold — locks
-      # count toward it but are never refused by it; a file of no type (code,
-      # tests, kernels, scripts) is unbounded, and provenance orders the rest
+      # The most of `budget_tokens` each type of document may hold; a file of
+      # no type (code, tests, kernels, scripts) is unbounded, and provenance
+      # orders the rest
       # (docs/zend_working_set.md §4.10). Patterns match a unit's subject,
       # `<repo>/<path>`; the first type that matches is the unit's.
       type_shares:
@@ -1278,12 +1273,6 @@ layers:
         - candle/zend/src/main.rs
         - candle/zend-tools/src/lib.rs
         - candle/candle-conversation/src/lib.rs
-      # Every call that may change what a later read returns. Checked against
-      # the tool registry at load; `file_write` is an alias of `write`, and
-      # `code_run` / `code_session_exec` write the conversation's files too.
-      release_on: [write, file_edit, file_delete, file_move, journal_move,
-                   git_commit, git_merge, git_ref, git_switch, git_reset,
-                   run_command, code_run, code_session_exec]
     budget:
       priority: 100
       min_percent: 50    # dialogue keeps at least half its own window

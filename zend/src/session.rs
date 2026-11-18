@@ -903,10 +903,8 @@ struct InferenceState {
     /// Each branch layer's exclusion learner, its state kept between passes
     /// (`docs/incremental_chunk_exclusion.md`).
     exclusion_learners: Mutex<HashMap<GroupId, ExclusionLearner>>,
-    /// The dialogue layer's working set (`docs/zend_working_set.md`), its
-    /// `release_on` names checked against the tool registry at load. `None`
-    /// when the schema declares none: nothing is seeded, locked or released,
-    /// and every tool call runs for real.
+    /// The dialogue layer's working set (`docs/zend_working_set.md`). `None`
+    /// when the schema declares none: nothing is seeded.
     working_set: Option<WorkingSetConfig>,
     /// Whether each `code_reading` chain read its whole file — asked before a
     /// file is served or seeded, answered once per chain.
@@ -1147,7 +1145,7 @@ impl InferenceState {
             .ok_or_else(|| {
                 anyhow::anyhow!("projection schema missing 'primary_conversation' group")
             })?;
-        let working_set = dialogue_config(proj_builder.schema(), dialogue_layer)?;
+        let working_set = dialogue_config(proj_builder.schema(), dialogue_layer);
         // (layer, group) are passed through to
         // `new_conversation_with_projection`, which mints a fresh
         // `TimelineId` internally.
@@ -4655,12 +4653,12 @@ fn placed_guidance(state: &InferenceState, timeline: TimelineId) -> Vec<(String,
     };
     ws.members()
         .into_iter()
-        .filter(|(member, _)| {
+        .filter(|member| {
             substrate
                 .placing_group(timeline, *member)
                 .is_some_and(|g| state.retrieval_scope.is_drawing(g))
         })
-        .filter_map(|(member, _)| {
+        .filter_map(|member| {
             let path = substrate.custom_of(member)?.get(PATH_KEY).cloned()?;
             Some((path, ws.fresh_of(member)))
         })
@@ -9169,13 +9167,12 @@ mod projection_schema_tests {
             .as_ref()
             .expect("the dialogue declares a working set");
         assert_eq!(ws.budget_tokens, 64_000);
-        assert_eq!(ws.lock_tokens, 48_000);
         assert_eq!(ws.folder_tokens, 10_000);
         assert_eq!(ws.guidance_tokens, 16_000);
         assert_eq!(ws.beta, 0.2);
         assert_eq!(ws.min_momentum, 100.0);
         assert_eq!(ws.max_file_tokens, 48_000);
-        // The reserve and the locks fit Flash-Next's trained window, and the
+        // The reserve fits Flash-Next's trained window, and the
         // dialogue's window and the working set's budget are caps on one fill
         // of it that together reach about the room a system prompt leaves
         // (244K of 246K), so a thin working set leaves its room to the

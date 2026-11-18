@@ -5,9 +5,8 @@
 //! whole turns ([`rounds`]):
 //!
 //! - **the lineage**, each exchange whole, scored from its base (§8.4);
-//! - **the working set**: a locked piece's every turn as locks; any other
-//!   piece's first and last turn — its request and its answer — as its floor,
-//!   and its tool turns — a reading's pages — at the piece's score, ranked
+//! - **the working set**: each piece's first and last turn — its request and
+//!   its answer — as its floor, and its tool turns — a reading's pages — at the piece's score, ranked
 //!   among themselves by each turn's own score, so a reading its cap will not
 //!   take whole keeps its best pages (§8.2, [`piece_round_score`]);
 //! - **the dialogue** (§8.3): its newest exchange as the current one — its
@@ -28,12 +27,11 @@ use crate::projection::fill::{fill, Caps, FillInput, FloorExchange, Kind, Unit};
 use crate::projection::rounds;
 use crate::projection::TurnKey;
 
-/// One working-set piece: its kind for the caps, whether it is locked, its
-/// score, and its exchanges, each its turns in order.
+/// One working-set piece: its kind for the caps, its score, and its
+/// exchanges, each its turns in order.
 #[derive(Debug, Clone)]
 pub struct WorkingPiece {
     pub kind: Kind,
-    pub locked: bool,
     pub score: f32,
     pub exchanges: Vec<Vec<TurnKey>>,
 }
@@ -73,7 +71,7 @@ pub struct DialoguePlan {
     pub own: Vec<TurnKey>,
     /// One list per context exchange, in [`DialogueSlot::context`]'s order.
     pub context: Vec<Vec<TurnKey>>,
-    /// How far locks and floors carried the slot past its room.
+    /// How far the floors carried the slot past its room.
     pub over_room: usize,
 }
 
@@ -124,7 +122,7 @@ fn floor_rounds(n: usize) -> Vec<usize> {
     }
 }
 
-/// The score one tool turn of an unlocked working-set piece enters the fill
+/// The score one tool turn of a working-set piece enters the fill
 /// at: the piece's own `piece` score, lifted by up to as much again by how the
 /// turn stands among the piece's turns — `round`, its score (the scan's
 /// evidence for that page, lifted by the hits on it), against `best`, the
@@ -195,13 +193,6 @@ pub fn plan(
                 continue;
             }
             let part = Part::Working(p, e);
-            if wp.locked {
-                for (r, &turn) in ex.iter().enumerate() {
-                    let u = units.add(part, vec![r], pid, wp.kind, tokens(turn), wp.score);
-                    input.locks.push(u);
-                }
-                continue;
-            }
             let fr = floor_rounds(n);
             let pair = units.add(
                 part,
@@ -388,7 +379,6 @@ mod tests {
     fn reading(score: f32) -> WorkingPiece {
         WorkingPiece {
             kind: Kind::Reading,
-            locked: false,
             score,
             exchanges: vec![vec![k(5, 0), k(5, 1), k(5, 2), k(5, 3)]],
         }
@@ -482,20 +472,6 @@ mod tests {
         };
         let p = plan(&slot, |_| 0.0, twenty);
         assert_eq!(p.own, vec![k(1, 0), k(1, 2), k(1, 3), k(1, 4)]);
-    }
-
-    /// A locked piece goes in whole even past the room.
-    #[test]
-    fn a_locked_piece_goes_in_whole() {
-        let locked = WorkingPiece {
-            kind: Kind::Reading,
-            locked: true,
-            score: 0.0,
-            exchanges: vec![vec![k(5, 0), k(5, 1)]],
-        };
-        let p = plan(&slot(10, caps(), vec![locked]), |_| 0.0, twenty);
-        assert_eq!(p.working, vec![vec![k(5, 0), k(5, 1)]]);
-        assert_eq!(p.over_room, 30);
     }
 
     /// Another layer's exchanges enter whole by score under that layer's

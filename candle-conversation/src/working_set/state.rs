@@ -15,38 +15,18 @@ const DISLODGE_MARGIN: f32 = 1.5;
 /// The size limits an admission is checked against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// Tokens the voluntary members — seeds and provenance — may hold
-    /// together. Locks are not counted: they sit on top.
+    /// Tokens the members — seeds and provenance — may hold together.
     pub budget_tokens: usize,
-    /// Tokens the voluntary folder members may hold between them; the files
-    /// take what is left of `budget_tokens`.
+    /// Tokens the folder members may hold between them; the files take what
+    /// is left of `budget_tokens`.
     pub folder_tokens: usize,
-    /// Tokens the voluntary guidance members may hold between them — a pool
-    /// of their own, outside `budget_tokens`.
+    /// Tokens the guidance members may hold between them — a pool of their
+    /// own, outside `budget_tokens`.
     pub guidance_tokens: usize,
-    /// Tokens the locks may hold together, on top of `budget_tokens`.
-    pub lock_tokens: usize,
     /// Tokens of one member a slot places. Where members are emitted whole, a
     /// longer one is never seeded or admitted; where the fill carves the slot,
     /// a longer reading is admitted at this cost ([`Candidate::carved_to`]).
-    /// A lock past it is refused everywhere: a lock is placed whole.
     pub max_file_tokens: usize,
-}
-
-/// Why a lock was refused. Every refusal sends the call to a real read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
-    /// The conversation cannot deliver its content: it is tombstoned, archived,
-    /// holds no sealed turn, is the dialogue itself, or belongs to no
-    /// working-set group.
-    Gone,
-    /// The conversation has no recorded token total, so what it would cost is
-    /// unknown.
-    NoCost,
-    /// The conversation alone is past `max_file_tokens`.
-    TooLarge,
-    /// The locks already held leave no room for it under `lock_tokens`.
-    Full,
 }
 
 /// What admitting a conversation needs to know about it.
@@ -84,46 +64,31 @@ struct Member {
     tokens: usize,
     share: WorkingSetShare,
     kind: Option<TypeCap>,
-    locked: bool,
 }
 
 /// What a dialogue carries ahead of its own turns: one sequence, in the order
-/// its members entered, and one insertion point.
+/// its members entered.
 ///
-/// **Position is insertion order, never age or rank.** Everything enters at
-/// the insertion point: a lock just before it, so the oldest lock stays
-/// nearest the dialogue; provenance just after the provenance already there,
-/// so the newest provenance sits beside the locks. A member keeps its place
-/// until it leaves, and when it leaves the gap closes at once.
+/// **Position is insertion order, never age or rank.** Every member enters
+/// after the ones already there, keeps its place until it leaves, and when it
+/// leaves the gap closes at once.
 ///
 /// That is what keeps the projection stable under RoPE. A change at one
 /// position leaves everything to its right at the same distance from the
 /// question and everything to its left at the same distance from the system
-/// prompt. Every change here is an insertion at the point or a removal, so:
-/// a lock never moves relative to the question while it is held; long-lived
-/// provenance on the left keeps its place beside the system prompt; and the
-/// churn — newcomers arriving, the weakest leaving — lands in the middle,
-/// where attention is weakest anyway.
+/// prompt. Every change here is an insertion at the end or a removal, so
+/// long-lived members on the left keep their place beside the system prompt,
+/// and the churn — newcomers arriving, the weakest leaving — lands nearer the
+/// dialogue.
 ///
-/// **Locks** are pinned: they never decay and are never dislodged, and they
-/// sit on top of the voluntary budget under a ceiling of their own — a read
-/// the model makes adds to what it carries, it never takes the place of the
-/// provenance around it. A lock is released into provenance in place when its
-/// promise ends ([`Self::release`], [`Self::release_one`]); from then it
-/// competes for the voluntary budget like any provenance, and the next
-/// [`Self::observe`] trims the weakest provenance if it no longer fits.
-/// **Provenance** decays by momentum and leaves below the floor. When a
-/// newcomer needs room, the weakest provenance is dislodged only when the
-/// newcomer is [`DISLODGE_MARGIN`] stronger. The **seeds** are the first
-/// provenance a conversation admits.
+/// Members decay by momentum and leave below the floor. When a newcomer needs
+/// room, the weakest member is dislodged only when the newcomer is
+/// [`DISLODGE_MARGIN`] stronger. The **seeds** are the first members a
+/// conversation admits.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkingSet {
     members: Vec<Member>,
-    /// Where the next member enters: members before it entered as provenance,
-    /// members from it on as this task's locks.
-    insert_at: usize,
-    /// Momentum per conversation — members and candidates alike. A locked
-    /// member's entry is frozen until its release.
+    /// Momentum per conversation — members and candidates alike.
     momentum: HashMap<TimelineId, f32>,
     /// Conversations that may not enter for now: the readings of files the
     /// current turn's loop read for real, already verbatim in its dialogue
@@ -156,40 +121,20 @@ impl WorkingSet {
     pub fn clear_withheld(&mut self) {
         self.withheld.clear();
     }
-    /// Every member in emission order, each with whether it is locked.
-    pub fn members(&self) -> Vec<(TimelineId, bool)> {
-        self.members
-            .iter()
-            .map(|m| (m.timeline, m.locked))
-            .collect()
+    /// Every member in emission order.
+    pub fn members(&self) -> Vec<TimelineId> {
+        self.members.iter().map(|m| m.timeline).collect()
     }
 
-    /// The locked members, in emission order — the pinned tier.
-    pub fn pinned(&self) -> Vec<TimelineId> {
-        self.members
-            .iter()
-            .filter(|m| m.locked)
-            .map(|m| m.timeline)
-            .collect()
-    }
-
-    /// Whether `timeline` is locked.
-    pub fn is_pinned(&self, timeline: TimelineId) -> bool {
-        self.members
-            .iter()
-            .any(|m| m.timeline == timeline && m.locked)
-    }
-
-    /// Whether `timeline` is a member, locked or not.
+    /// Whether `timeline` is a member.
     pub fn is_member(&self, timeline: TimelineId) -> bool {
         self.position(timeline).is_some()
     }
 
-    /// The unlocked members with their momentum, in emission order.
+    /// The members with their momentum, in emission order.
     pub fn provenance(&self) -> Vec<(TimelineId, f32)> {
         self.members
             .iter()
-            .filter(|m| !m.locked)
             .map(|m| (m.timeline, self.momentum_of(m.timeline).unwrap_or(0.0)))
             .collect()
     }
@@ -235,89 +180,8 @@ impl WorkingSet {
         self.members.iter().map(|m| m.tokens).sum()
     }
 
-    /// Tokens the members of one standing hold — the locks (`true`), or the
-    /// voluntary members (`false`).
-    fn tokens_where(&self, locked: bool) -> usize {
-        self.members
-            .iter()
-            .filter(|m| m.locked == locked)
-            .map(|m| m.tokens)
-            .sum()
-    }
-
-    /// Where the next member enters.
-    pub fn insertion_point(&self) -> usize {
-        self.insert_at
-    }
-
     fn position(&self, timeline: TimelineId) -> Option<usize> {
         self.members.iter().position(|m| m.timeline == timeline)
-    }
-
-    /// Lock `timeline` for as long as the reply promising it stands.
-    ///
-    /// A member is locked where it stands — moving it would undo the stability
-    /// this order exists for, and its content is in context wherever it sits.
-    /// A newcomer enters just before the insertion point, on top of the
-    /// voluntary members: it dislodges nothing. A lock that would take the
-    /// locks past `lock_tokens` is refused and the call runs for real. A lock
-    /// is never refused for its type's share — the model asked for it — but
-    /// it counts toward that share, so provenance of its type makes room.
-    pub fn lock(
-        &mut self,
-        timeline: TimelineId,
-        candidate: Candidate,
-        limits: Limits,
-    ) -> Result<(), Refusal> {
-        if let Some(at) = self.position(timeline) {
-            self.members[at].locked = true;
-            return Ok(());
-        }
-        let share = candidate.share.ok_or(Refusal::Gone)?;
-        let tokens = candidate.tokens.ok_or(Refusal::NoCost)?;
-        if tokens > limits.max_file_tokens {
-            return Err(Refusal::TooLarge);
-        }
-        if self.tokens_where(true) + tokens > limits.lock_tokens {
-            return Err(Refusal::Full);
-        }
-        self.members.insert(
-            self.insert_at,
-            Member {
-                timeline,
-                tokens,
-                share,
-                kind: candidate.kind,
-                locked: true,
-            },
-        );
-        Ok(())
-    }
-
-    /// Put back a lock the conversation's history says was served, whatever it
-    /// costs now: the model was told it has this content, and a restart must
-    /// not quietly take it away.
-    pub fn restore_lock(
-        &mut self,
-        timeline: TimelineId,
-        tokens: usize,
-        share: WorkingSetShare,
-        kind: Option<TypeCap>,
-    ) {
-        if let Some(at) = self.position(timeline) {
-            self.members[at].locked = true;
-            return;
-        }
-        self.members.insert(
-            self.insert_at,
-            Member {
-                timeline,
-                tokens,
-                share,
-                kind,
-                locked: true,
-            },
-        );
     }
 
     /// Seed provenance with `candidates`, in list order: each gains `momentum`
@@ -358,49 +222,14 @@ impl WorkingSet {
         refused
     }
 
-    /// The end of a task: every lock becomes provenance where it stands, at
-    /// `released` momentum (or what it already had, if that is higher), and the
-    /// insertion point moves past them all — so a file the model kept working
-    /// in stays, one it read once decays out, and the next task's members enter
-    /// beside the dialogue. Nothing moves.
-    pub fn release(&mut self, released: f32) {
-        for m in &mut self.members {
-            if m.locked {
-                m.locked = false;
-                let entry = self.momentum.entry(m.timeline).or_insert(0.0);
-                *entry = entry.max(released);
-            }
-        }
-        self.insert_at = self.members.len();
-    }
-
-    /// One lock becomes provenance where it stands, at `released` momentum (or
-    /// what it already had, if that is higher) — the promise behind it has
-    /// ended: the reply that made it has left the dialogue's projection, or the
-    /// file it holds was changed. Every other lock stands, and nothing moves.
-    /// Returns whether `timeline` was locked.
-    pub fn release_one(&mut self, timeline: TimelineId, released: f32) -> bool {
-        let Some(at) = self
-            .position(timeline)
-            .filter(|&at| self.members[at].locked)
-        else {
-            return false;
-        };
-        self.members[at].locked = false;
-        let entry = self.momentum.entry(timeline).or_insert(0.0);
-        *entry = entry.max(released);
-        true
-    }
-
     /// Fold one reprojection in.
     ///
-    /// 1. Momentum: `m ← (1 − β)·m + fresh` for every conversation that is not
-    ///    locked, where one the scan did not score counts as a fresh zero.
+    /// 1. Momentum: `m ← (1 − β)·m + fresh` for every conversation, where one
+    ///    the scan did not score counts as a fresh zero.
     /// 2. Below `min_momentum` a conversation leaves the map, and a member
-    ///    leaves the sequence — the gap closes. So does an unlocked member
-    ///    `admissible` no longer allows (out of scope, gone). Then, while the
-    ///    voluntary members are over budget — a released lock joined them —
-    ///    the weakest of them leaves.
+    ///    leaves the sequence — the gap closes. So does a member `candidate`
+    ///    no longer allows (out of scope, gone). Then, while the members are
+    ///    over budget, the weakest of them leaves.
     /// 3. The strongest candidates that are not members try to enter, each
     ///    dislodging only provenance it beats by [`DISLODGE_MARGIN`] — at most
     ///    `max_admits` of them. One reprojection that admits a dozen files
@@ -417,33 +246,26 @@ impl WorkingSet {
         candidate: &dyn Fn(TimelineId) -> Option<Candidate>,
     ) {
         let max_admits = max_admits.get();
-        let locked: Vec<TimelineId> = self.pinned();
         let keep = 1.0 - beta;
-        for (timeline, m) in self.momentum.iter_mut() {
-            if !locked.contains(timeline) {
-                *m *= keep;
-            }
+        for m in self.momentum.values_mut() {
+            *m *= keep;
         }
         for (&timeline, &score) in fresh {
-            if !locked.contains(&timeline) {
-                *self.momentum.entry(timeline).or_insert(0.0) += score;
-            }
+            *self.momentum.entry(timeline).or_insert(0.0) += score;
         }
         self.fresh.clone_from(fresh);
         // Retention judges strength, so a file the indexer keeps reading
         // outlasts its fading provenance score.
         let (hits, hits_cfg) = (&self.hits, &self.hits_cfg);
-        self.momentum.retain(|timeline, m| {
-            *m * hits.lift(*timeline, hits_cfg) >= min_momentum || locked.contains(timeline)
-        });
+        self.momentum
+            .retain(|timeline, m| *m * hits.lift(*timeline, hits_cfg) >= min_momentum);
 
         let leaving: Vec<usize> = self
             .members
             .iter()
             .enumerate()
             .filter(|(_, m)| {
-                !m.locked
-                    && (!self.momentum.contains_key(&m.timeline) || candidate(m.timeline).is_none())
+                !self.momentum.contains_key(&m.timeline) || candidate(m.timeline).is_none()
             })
             .map(|(i, _)| i)
             .collect();
@@ -501,8 +323,7 @@ impl WorkingSet {
         self.momentum.remove(&timeline);
     }
 
-    /// Enter `timeline` as provenance at the insertion point, which moves past
-    /// it.
+    /// Enter `timeline` after every member already there.
     fn admit(
         &mut self,
         timeline: TimelineId,
@@ -510,22 +331,16 @@ impl WorkingSet {
         share: WorkingSetShare,
         kind: Option<TypeCap>,
     ) {
-        self.members.insert(
-            self.insert_at,
-            Member {
-                timeline,
-                tokens,
-                share,
-                kind,
-                locked: false,
-            },
-        );
-        self.insert_at += 1;
+        self.members.push(Member {
+            timeline,
+            tokens,
+            share,
+            kind,
+        });
     }
 
-    /// Tokens the budget's members of type `id` hold — the locks among them
-    /// too, which are never dislodged for it but take their share of it.
-    /// Guidance is a pool apart and holds no type's share.
+    /// Tokens the budget's members of type `id` hold. Guidance is a pool
+    /// apart and holds no type's share.
     fn type_tokens(&self, id: u8) -> usize {
         self.members
             .iter()
@@ -535,9 +350,7 @@ impl WorkingSet {
     }
 
     /// Bring every type back under its share: while one holds more than its
-    /// cap, its weakest voluntary member leaves — a lock of its type joined it,
-    /// or a lock was released into it. One whose locks alone pass the cap keeps
-    /// them and loses every voluntary member.
+    /// cap, its weakest member leaves.
     fn trim_types(&mut self, limits: Limits) {
         let mut kinds: Vec<TypeCap> = self
             .members
@@ -555,8 +368,7 @@ impl WorkingSet {
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| {
-                        !m.locked
-                            && m.share != WorkingSetShare::Guidance
+                        m.share != WorkingSetShare::Guidance
                             && m.kind.is_some_and(|k| k.id == kind.id)
                     })
                     .map(|(i, m)| (i, self.score_of(m.timeline).unwrap_or(0.0)))
@@ -569,13 +381,11 @@ impl WorkingSet {
         }
     }
 
-    /// The voluntary members that must leave for `tokens` more voluntary
-    /// tokens of `share`, of type `kind`, to fit, weakest first among those
-    /// `may_dislodge` allows (judged on their strength, [`Self::score_of`]) —
-    /// or `None` when no such set makes it fit. On a momentum tie the one
-    /// nearest the insertion point goes first: it moves the fewest members on
-    /// its left. Locks count against nothing here but their type's share; they
-    /// sit on top. Guidance is a pool apart: it is bounded by `guidance_tokens`
+    /// The members that must leave for `tokens` more tokens of `share`, of
+    /// type `kind`, to fit, weakest first among those `may_dislodge` allows
+    /// (judged on their strength, [`Self::score_of`]) — or `None` when no such
+    /// set makes it fit. On a momentum tie the newest goes first: it moves the
+    /// fewest members on its left. Guidance is a pool apart: it is bounded by `guidance_tokens`
     /// alone and dislodges only guidance, and nothing else dislodges it. A
     /// typed newcomer its type has no room for dislodges only its own type,
     /// as a folder past `folder_tokens` dislodges only folders — so a burst of
@@ -594,7 +404,7 @@ impl WorkingSet {
         let mut typed: usize = kind.map_or(0, |k| self.type_tokens(k.id));
         let type_bound =
             |typed: usize| kind.is_some_and(|k| typed + tokens > k.tokens(limits.budget_tokens));
-        let in_pool = |m: &Member| !m.locked && (m.share == WorkingSetShare::Guidance) == guidance;
+        let in_pool = |m: &Member| (m.share == WorkingSetShare::Guidance) == guidance;
         let mut total: usize = self
             .members
             .iter()
@@ -608,7 +418,7 @@ impl WorkingSet {
         let mut folders: usize = self
             .members
             .iter()
-            .filter(|m| !m.locked && m.share == WorkingSetShare::Folders)
+            .filter(|m| m.share == WorkingSetShare::Folders)
             .map(|m| m.tokens)
             .sum();
         let folder_bound = |folders: usize| {
@@ -648,16 +458,12 @@ impl WorkingSet {
         }
     }
 
-    /// Remove the members at `indices`, closing each gap and keeping the
-    /// insertion point between the same two members.
+    /// Remove the members at `indices`, closing each gap.
     fn evict(&mut self, indices: &[usize]) {
         let mut sorted = indices.to_vec();
         sorted.sort_unstable_by(|a, b| b.cmp(a));
         for i in sorted {
             self.members.remove(i);
-            if i < self.insert_at {
-                self.insert_at -= 1;
-            }
         }
     }
 }
@@ -679,7 +485,6 @@ mod tests {
             budget_tokens,
             folder_tokens: budget_tokens,
             guidance_tokens: budget_tokens,
-            lock_tokens: budget_tokens,
             max_file_tokens: 1_000,
         }
     }
@@ -714,7 +519,7 @@ mod tests {
     }
 
     fn order(ws: &WorkingSet) -> Vec<u64> {
-        ws.members().iter().map(|(t, _)| t.raw()).collect()
+        ws.members().iter().map(|t| t.raw()).collect()
     }
 
     fn observe(ws: &mut WorkingSet, fresh: &[(u64, f32)], budget: usize) {
@@ -840,132 +645,31 @@ mod tests {
         assert_eq!(order(&ws), vec![1, 2], "it enters on the momentum it kept");
     }
 
-    /// **Locks enter just before the insertion point**: the oldest lock stays
-    /// nearest the dialogue, the youngest beside the provenance.
+    /// **A newcomer enters after the members already there**, whatever its
+    /// strength: the oldest members keep their places.
     #[test]
-    fn a_new_lock_enters_left_of_the_older_locks() {
+    fn a_newcomer_enters_after_the_members_already_there() {
         let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 900.0)], 1_000);
-        for raw in [2, 3, 4] {
-            ws.lock(tl(raw), cand(raw), limits(1_000)).unwrap();
-        }
-        assert_eq!(order(&ws), vec![1, 4, 3, 2]);
-        assert_eq!(ws.pinned(), vec![tl(4), tl(3), tl(2)]);
+        observe(&mut ws, &[(1, 300.0)], 1_000);
+        observe(&mut ws, &[(2, 5_000.0)], 1_000);
+        assert_eq!(order(&ws), vec![1, 2]);
     }
 
-    /// **Provenance enters after the provenance already there**, beside the
-    /// locks: the newest provenance sits next to the youngest lock.
+    /// A conversation with no total, past the cap, or in no group never enters.
     #[test]
-    fn new_provenance_enters_between_the_provenance_and_the_locks() {
-        let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 900.0)], 1_000);
-        ws.lock(tl(2), cand(2), limits(1_000)).unwrap();
-        observe(&mut ws, &[(3, 900.0)], 1_000);
-        assert_eq!(order(&ws), vec![1, 3, 2]);
-    }
-
-    /// **A member is locked where it stands** — nothing moves.
-    #[test]
-    fn locking_a_member_leaves_it_in_place() {
-        let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 900.0), (2, 800.0)], 1_000);
-        ws.lock(tl(3), cand(3), limits(1_000)).unwrap();
-        let before = order(&ws);
-        ws.lock(tl(1), cand(1), limits(1_000)).unwrap();
-        ws.lock(tl(3), cand(3), limits(1_000)).unwrap();
-        assert_eq!(order(&ws), before);
-        assert!(ws.is_pinned(tl(1)) && ws.is_pinned(tl(3)));
-    }
-
-    /// **Release turns every lock into provenance in place** and moves the
-    /// insertion point past them, so the next task enters beside the dialogue.
-    #[test]
-    fn release_keeps_every_position_and_moves_the_insertion_point_to_the_end() {
-        let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 900.0)], 1_000);
-        ws.lock(tl(2), cand(2), limits(1_000)).unwrap();
-        ws.lock(tl(3), cand(3), limits(1_000)).unwrap();
-        ws.release(5_000.0);
-        assert_eq!(order(&ws), vec![1, 3, 2]);
-        assert!(ws.pinned().is_empty());
-        assert_eq!(ws.momentum_of(tl(2)), Some(5_000.0));
-        assert_eq!(ws.insertion_point(), 3);
-        ws.lock(tl(4), cand(4), limits(1_000)).unwrap();
-        assert_eq!(order(&ws), vec![1, 3, 2, 4]);
-    }
-
-    /// **One lock released ends only its own promise**: it becomes provenance
-    /// in place, at the released momentum, every other lock stands, and the
-    /// insertion point does not move. Releasing what is not locked does nothing.
-    #[test]
-    fn releasing_one_lock_leaves_the_others_standing_and_nothing_moving() {
-        let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 900.0)], 1_000);
-        ws.lock(tl(2), cand(2), limits(1_000)).unwrap();
-        ws.lock(tl(3), cand(3), limits(1_000)).unwrap();
-        let point = ws.insertion_point();
-        assert!(ws.release_one(tl(2), 5_000.0));
-        assert_eq!(order(&ws), vec![1, 3, 2]);
-        assert_eq!(ws.pinned(), vec![tl(3)]);
-        assert_eq!(ws.momentum_of(tl(2)), Some(5_000.0));
-        assert_eq!(ws.insertion_point(), point);
-        assert!(!ws.release_one(tl(2), 5_000.0), "already released");
-        assert!(!ws.release_one(tl(1), 5_000.0), "provenance is no lock");
-    }
-
-    /// **A lock sits on top of the voluntary budget**: with the provenance
-    /// filling it, a new lock enters and dislodges nothing.
-    #[test]
-    fn a_lock_sits_on_top_of_a_full_voluntary_budget() {
-        let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 900.0), (2, 300.0), (3, 600.0)], 300);
-        assert_eq!(order(&ws), vec![1, 3, 2]);
-        ws.lock(tl(4), cand(4), limits(300)).unwrap();
-        assert_eq!(order(&ws), vec![1, 3, 2, 4], "nothing left for it");
-        assert_eq!(ws.tokens(), 400);
-    }
-
-    /// **A released lock rejoins the voluntary members**, and the next
-    /// reprojection trims the weakest of them back under the budget.
-    #[test]
-    fn a_released_lock_is_trimmed_back_into_the_budget() {
-        let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 900.0), (2, 300.0), (3, 600.0)], 300);
-        ws.lock(tl(4), cand(4), limits(300)).unwrap();
-        assert!(ws.release_one(tl(4), 5_000.0));
-        observe(&mut ws, &[], 300);
-        assert_eq!(order(&ws), vec![1, 3, 4], "2, the weakest, left");
-    }
-
-    /// **Locks are never dislodged, and keep to their own ceiling**: a lock
-    /// that would take the locks past `lock_tokens` is refused, and nothing is
-    /// evicted for it.
-    #[test]
-    fn a_lock_past_the_lock_ceiling_is_refused() {
-        let mut ws = WorkingSet::default();
-        ws.lock(tl(1), cand(1), limits(200)).unwrap();
-        ws.lock(tl(2), cand(2), limits(200)).unwrap();
-        assert_eq!(ws.lock(tl(3), cand(3), limits(200)), Err(Refusal::Full));
-        assert_eq!(order(&ws), vec![2, 1]);
-    }
-
-    #[test]
-    fn a_conversation_with_no_total_past_the_cap_or_in_no_group_is_refused() {
-        let mut ws = WorkingSet::default();
-        assert_eq!(
-            ws.lock(tl(9), cand(9), limits(10_000)),
-            Err(Refusal::NoCost)
-        );
-        assert_eq!(
-            ws.lock(tl(8), cand(8), limits(10_000)),
-            Err(Refusal::TooLarge)
-        );
+    fn a_conversation_with_no_total_past_the_cap_or_in_no_group_never_enters() {
         let nowhere = Candidate {
             tokens: Some(100),
             share: None,
             kind: None,
         };
-        assert_eq!(ws.lock(tl(7), nowhere, limits(10_000)), Err(Refusal::Gone));
+        let mut ws = WorkingSet::default();
+        let refused = ws.seed(
+            &[(tl(9), cand(9)), (tl(8), cand(8)), (tl(7), nowhere)],
+            limits(10_000),
+            1_000.0,
+        );
+        assert_eq!(refused, vec![tl(9), tl(8), tl(7)]);
         assert!(ws.members().is_empty());
     }
 
@@ -984,28 +688,15 @@ mod tests {
     }
 
     /// **A member that fades leaves, and the gap closes** — the members on
-    /// either side keep their order and the insertion point stays between the
-    /// same two.
+    /// either side keep their order.
     #[test]
     fn a_faded_member_leaves_and_the_gap_closes() {
         let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 5_000.0), (2, 120.0), (3, 5_000.0)], 1_000);
-        ws.lock(tl(4), cand(4), limits(1_000)).unwrap();
-        assert_eq!(order(&ws), vec![1, 3, 2, 4]);
+        observe(&mut ws, &[(1, 5_000.0), (2, 130.0), (3, 5_000.0)], 1_000);
+        observe(&mut ws, &[(4, 5_000.0)], 1_000);
+        assert_eq!(order(&ws), vec![1, 3, 2, 4], "2 is at 104");
         observe(&mut ws, &[], 1_000);
-        assert_eq!(order(&ws), vec![1, 3, 4], "2 fell under 100");
-        assert_eq!(ws.insertion_point(), 2);
-    }
-
-    /// **A locked member neither decays nor leaves** while it is held.
-    #[test]
-    fn a_lock_does_not_decay() {
-        let mut ws = WorkingSet::default();
-        ws.lock(tl(1), cand(1), limits(1_000)).unwrap();
-        for _ in 0..20 {
-            observe(&mut ws, &[], 1_000);
-        }
-        assert_eq!(order(&ws), vec![1]);
+        assert_eq!(order(&ws), vec![1, 3, 4], "2 fell to 83, under 100");
     }
 
     /// **Seeds enter in list order at the seeding momentum, while there is
@@ -1023,7 +714,6 @@ mod tests {
             Some(1_000.0),
             "3 waits as a candidate"
         );
-        assert!(ws.pinned().is_empty());
     }
 
     /// An unattended seed fades like any other file: 1,000 × 0.8¹⁰ ≈ 107 is
@@ -1049,7 +739,6 @@ mod tests {
             budget_tokens: 300,
             folder_tokens: 100,
             guidance_tokens: 0,
-            lock_tokens: 300,
             max_file_tokens: 1_000,
         };
         let fresh: HashMap<TimelineId, f32> = HashMap::from([(tl(50), 900.0), (tl(1), 200.0)]);
@@ -1071,7 +760,6 @@ mod tests {
             budget_tokens: 200,
             folder_tokens: 0,
             guidance_tokens: 100,
-            lock_tokens: 300,
             max_file_tokens: 1_000,
         }
     }
@@ -1126,14 +814,12 @@ mod tests {
         assert_eq!(order(&ws), vec![1]);
     }
 
-    /// **An unlocked member the scope no longer offers leaves**; a lock stays —
-    /// it is a promise.
+    /// **A member the scope no longer offers leaves.**
     #[test]
-    fn a_member_out_of_scope_leaves_unless_locked() {
+    fn a_member_out_of_scope_leaves() {
         let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 900.0)], 1_000);
-        ws.lock(tl(2), cand(2), limits(1_000)).unwrap();
-        let gone = |t: TimelineId| (t.raw() > 2).then(|| cand(t.raw()));
+        observe(&mut ws, &[(1, 900.0), (2, 900.0)], 1_000);
+        let gone = |t: TimelineId| (t.raw() == 2).then(|| cand(t.raw()));
         ws.observe(
             &HashMap::new(),
             0.2,
@@ -1166,20 +852,6 @@ mod tests {
         );
         ws.observe(&HashMap::new(), 0.2, 100.0, limits(1_000), two, &info);
         assert_eq!(order(&ws), vec![1, 2, 3, 4]);
-    }
-
-    /// A restored lock is put back whatever it costs — the model was told.
-    #[test]
-    fn a_restored_lock_ignores_the_budget() {
-        let mut ws = WorkingSet::default();
-        ws.restore_lock(tl(8), 2_000, FILES, None);
-        ws.restore_lock(tl(1), 100, FILES, None);
-        assert_eq!(
-            order(&ws),
-            vec![1, 8],
-            "restored in order, each before the last"
-        );
-        assert_eq!(ws.tokens(), 2_100);
     }
 
     /// **Documents enter up to their share, then the code does**: three strong
@@ -1224,38 +896,6 @@ mod tests {
         );
     }
 
-    /// **A locked document counts toward the share but is never refused**:
-    /// three locks pass the share, a strong document newcomer then finds no
-    /// room — only locks hold it — and a file still enters.
-    #[test]
-    fn locked_documents_count_toward_the_share_and_are_never_refused() {
-        let mut ws = WorkingSet::default();
-        for raw in [70, 71, 72] {
-            ws.lock(tl(raw), cand(raw), limits(1_000)).unwrap();
-        }
-        assert_eq!(ws.type_tokens(DOCS.id), 300);
-        observe(&mut ws, &[(73, 5_000.0), (1, 200.0)], 1_000);
-        assert_eq!(order(&ws), vec![1, 72, 71, 70]);
-    }
-
-    /// **Released documents are trimmed back to their share**: three locked
-    /// documents released into provenance leave two after the next
-    /// reprojection, and the file beside them stays.
-    #[test]
-    fn released_documents_are_trimmed_back_to_their_share() {
-        let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 900.0)], 1_000);
-        for raw in [70, 71, 72] {
-            ws.lock(tl(raw), cand(raw), limits(1_000)).unwrap();
-        }
-        ws.release(5_000.0);
-        observe(&mut ws, &[], 1_000);
-        let members = order(&ws);
-        assert!(members.contains(&1), "{members:?}");
-        assert_eq!(ws.type_tokens(DOCS.id), 200, "{members:?}");
-        assert_eq!(members.len(), 3, "{members:?}");
-    }
-
     /// **Seeds keep to the share too**: of three document seeds two enter,
     /// and the code seed after them.
     #[test]
@@ -1289,11 +929,9 @@ mod tests {
     #[test]
     fn a_removed_conversation_leaves_and_the_gap_closes() {
         let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 900.0), (2, 800.0)], 1_000);
-        ws.lock(tl(3), cand(3), limits(1_000)).unwrap();
+        observe(&mut ws, &[(1, 900.0), (2, 800.0), (3, 700.0)], 1_000);
         ws.remove(tl(1));
         assert_eq!(order(&ws), vec![2, 3]);
-        assert_eq!(ws.insertion_point(), 1);
         assert_eq!(ws.momentum_of(tl(1)), None);
     }
 }

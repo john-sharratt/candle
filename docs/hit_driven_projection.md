@@ -911,7 +911,8 @@ show it.
     insertion order.
 26. **Locks removed (§8.5).** `WorkingSet::lock`, `restore_lock`, `release`,
     `release_one`, the lock marks, the engine's lock methods, `lock_tokens`,
-    the fill's lock tier and `Refusal`'s lock variants go. Per reprojection
+    the fill's lock tier, `Refusal`, the `WorkingSetLock` origin and the
+    assembler's refusal of a pinned turn that is not hot go — built. Per reprojection
     and per kind, one info line logs: pooled pieces and tokens, admitted and
     dropped; each pooled piece's page count beside its rank (the pool's size
     bias, `docs/results/dependency_battery_gap_analysis_2026-11-18.md`); hit

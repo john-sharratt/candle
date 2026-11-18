@@ -35,7 +35,7 @@ use super::schema::{
 };
 use super::warm_pool;
 use super::working_set_observe::{working_set_config, working_set_fresh};
-use super::working_set_pick::{Standing, WorkingSetMembers};
+use super::working_set_pick::WorkingSetMembers;
 use crate::cancel::CancelToken;
 use crate::error::ConversationError;
 use crate::index_pages::StoredPages;
@@ -6033,26 +6033,18 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 
     /// The target's working-set members in `group`, in the working set's order.
     ///
-    /// A lock is kept whatever the retrieval scope says now — it is a promise
-    /// already made to the model. Provenance the scope no longer offers is left
-    /// out, the same as every other selection from a scoped group; the next
-    /// observation takes it out of the set.
+    /// A member the scope no longer offers is left out, the same as every
+    /// other selection from a scoped group; the next observation takes it out
+    /// of the set.
     fn working_set_members(&self, group: GroupId) -> Option<WorkingSetMembers> {
         let target = self.target.timeline;
         let ws = self.read.working_set(target)?;
         let members = ws
             .members()
             .into_iter()
-            .filter(|(tl, _)| self.read.placing_group(target, *tl) == Some(group))
-            .filter(|(tl, locked)| *locked || self.read.scope_offers(group, target, *tl))
-            .map(|(tl, locked)| {
-                let standing = if locked {
-                    Standing::Locked
-                } else {
-                    Standing::Provenance(ws.momentum_of(tl).unwrap_or(0.0))
-                };
-                (tl, standing)
-            })
+            .filter(|tl| self.read.placing_group(target, *tl) == Some(group))
+            .filter(|tl| self.read.scope_offers(group, target, *tl))
+            .map(|tl| (tl, ws.momentum_of(tl).unwrap_or(0.0)))
             .collect();
         Some(WorkingSetMembers { members })
     }

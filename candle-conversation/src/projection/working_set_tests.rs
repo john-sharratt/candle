@@ -8,7 +8,7 @@ use super::ids::{GroupId, TimelineId, TurnIndex, TurnKey};
 use super::project::{
     OptionalState, ProjectionMode, ProjectionTarget, SelectionState, TOOL_ROUND_SELECTOR,
 };
-use super::working_set_pick::{Standing, WorkingSetMembers, PINNED_SCORE};
+use super::working_set_pick::WorkingSetMembers;
 use crate::substrate::ContentResolver;
 use crate::summary_tree::SelectionOrigin;
 
@@ -48,11 +48,9 @@ layers:
     working_set:
       budget_tokens: 1000
       folder_tokens: 300
-      lock_tokens: 1000
       beta: 0.2
       min_momentum: 100
       max_file_tokens: 800
-      release_on: [write]
       reserve_tokens: 500
     budget:
       priority: 100
@@ -91,21 +89,13 @@ impl WsResolver {
     }
 
     /// The next member of `group`'s working set, after the ones added before.
-    fn member(mut self, group: GroupId, raw: u64, standing: Standing) -> Self {
+    fn provenance(mut self, group: GroupId, raw: u64, momentum: f32) -> Self {
         self.members
             .entry(group)
             .or_default()
             .members
-            .push((tl(raw), standing));
+            .push((tl(raw), momentum));
         self
-    }
-
-    fn lock(self, group: GroupId, raw: u64) -> Self {
-        self.member(group, raw, Standing::Locked)
-    }
-
-    fn provenance(self, group: GroupId, raw: u64, momentum: f32) -> Self {
-        self.member(group, raw, Standing::Provenance(momentum))
     }
 }
 
@@ -209,8 +199,8 @@ fn emitted_with(
 }
 
 /// Every member emits whole, in the working set's order — never re-sorted by
-/// momentum, standing or timeline id. The set enforced the budget when its
-/// members entered, so the projection trims nothing.
+/// momentum or timeline id. The set enforced the budget when its members
+/// entered, so the projection trims nothing.
 #[test]
 fn every_member_emits_whole_in_the_sets_order() {
     let f = fixture();
@@ -222,36 +212,29 @@ fn every_member_emits_whole_in_the_sets_order() {
         .with_conversation(14, f.scopes, 1, 50)
         .provenance(f.scopes, 13, 500.0)
         .provenance(f.scopes, 10, 9_000.0)
-        .lock(f.scopes, 14)
-        .lock(f.scopes, 12);
+        .provenance(f.scopes, 14, 200.0)
+        .provenance(f.scopes, 12, 300.0);
     assert_eq!(
         emitted(&f.b, f.target, &r),
         vec![(13, 3), (10, 2), (14, 1), (12, 1), (DIALOGUE, 1)],
     );
 }
 
-/// A lock is recorded at the pinned score, provenance at its momentum.
+/// A member is recorded at its momentum, as a working-set pick.
 #[test]
-fn each_member_carries_its_standing_into_the_selection_record() {
+fn each_member_carries_its_momentum_into_the_selection_record() {
     let f = fixture();
     let r = WsResolver::default()
         .with_conversation(DIALOGUE, f.conversation, 1, 10)
-        .with_conversation(10, f.scopes, 1, 50)
         .with_conversation(12, f.scopes, 1, 50)
-        .provenance(f.scopes, 12, 4_000.0)
-        .lock(f.scopes, 10);
+        .provenance(f.scopes, 12, 4_000.0);
     let proj = f.b.project(f.target, &r);
-    let key = |raw: u64| TurnKey::new(tl(raw), TurnIndex(0));
+    let key = TurnKey::new(tl(12), TurnIndex(0));
     assert_eq!(
-        proj.selection_origins[&key(10)],
-        SelectionOrigin::WorkingSetLock
-    );
-    assert_eq!(
-        proj.selection_origins[&key(12)],
+        proj.selection_origins[&key],
         SelectionOrigin::WorkingSetMomentum
     );
-    assert_eq!(proj.selection_scores.turn(key(10)), PINNED_SCORE);
-    assert_eq!(proj.selection_scores.turn(key(12)), 4_000.0);
+    assert_eq!(proj.selection_scores.turn(key), 4_000.0);
 }
 
 /// The folder group and the file group each emit their own members, the
@@ -282,8 +265,8 @@ fn the_dialogue_selects_the_same_with_or_without_a_working_set() {
         .with_conversation(DIALOGUE, f.conversation, 6, 100)
         .with_conversation(30, f.scopes, 1, 700)
         .with_conversation(20, f.structure, 1, 300)
-        .lock(f.scopes, 30)
-        .lock(f.structure, 20);
+        .provenance(f.scopes, 30, 900.0)
+        .provenance(f.structure, 20, 900.0);
     let own = |r: &WsResolver| -> Vec<(u64, usize)> {
         emitted(&f.b, f.target, r)
             .into_iter()
@@ -322,8 +305,8 @@ fn the_working_set_sits_ahead_of_the_dialogue_in_every_round() {
         .with_conversation(DIALOGUE, f.conversation, 1, 10)
         .with_conversation(20, f.structure, 1, 100)
         .with_conversation(30, f.scopes, 1, 100)
-        .lock(f.structure, 20)
-        .lock(f.scopes, 30);
+        .provenance(f.structure, 20, 900.0)
+        .provenance(f.scopes, 30, 900.0);
     let mut round = SelectionState::new();
     round.set_optional(TOOL_ROUND_SELECTOR, OptionalState::Present);
     for selection in [SelectionState::new(), round] {
@@ -335,9 +318,8 @@ fn the_working_set_sits_ahead_of_the_dialogue_in_every_round() {
 }
 
 /// **The working set sits between the dialogue's opening and its own turns**:
-/// the inherited chain first, then the working set — its locks last — then the
-/// conversation itself, so a file the model was just told it has is next to
-/// the turns that asked for it.
+/// the inherited chain first, then the working set in its own order, then the
+/// conversation itself.
 #[test]
 fn the_working_set_sits_between_the_chain_and_the_dialogues_own_turns() {
     let f = fixture();
@@ -349,36 +331,34 @@ fn the_working_set_sits_between_the_chain_and_the_dialogues_own_turns() {
         .with_conversation(30, f.scopes, 1, 100)
         .with_conversation(31, f.scopes, 1, 100)
         .provenance(f.scopes, 31, 900.0)
-        .lock(f.structure, 20)
-        .lock(f.scopes, 30);
+        .provenance(f.structure, 20, 900.0)
+        .provenance(f.scopes, 30, 900.0);
     assert_eq!(
         emitted(&f.b, f.target, &r),
         vec![(CHAIN, 1), (20, 1), (31, 1), (30, 1), (DIALOGUE, 1)],
     );
 }
 
-/// **A focused projection keeps only what the conversation was served.** The
-/// locked members stay, in the set's order; the ones there by momentum go.
+/// **A focused projection carries no working set**: it is held to the
+/// conversation itself.
 #[test]
-fn a_focused_projection_keeps_the_locked_members_only() {
+fn a_focused_projection_carries_no_working_set() {
     let f = fixture();
     let r = WsResolver::default()
         .with_conversation(DIALOGUE, f.conversation, 2, 10)
         .with_conversation(10, f.scopes, 2, 50)
-        .with_conversation(12, f.scopes, 1, 50)
         .with_conversation(20, f.structure, 1, 50)
         .provenance(f.structure, 20, 9_000.0)
-        .provenance(f.scopes, 10, 9_000.0)
-        .lock(f.scopes, 12);
+        .provenance(f.scopes, 10, 9_000.0);
     assert_eq!(
         emitted(&f.b, f.target, &r),
-        vec![(20, 1), (10, 2), (12, 1), (DIALOGUE, 2)],
+        vec![(20, 1), (10, 2), (DIALOGUE, 2)],
         "unfocused, everything"
     );
     assert_eq!(
         emitted(&f.b.focused(), f.target, &r),
-        vec![(12, 1), (DIALOGUE, 2)],
-        "focused, the served file and the conversation"
+        vec![(DIALOGUE, 2)],
+        "focused, the conversation alone"
     );
 }
 
@@ -422,7 +402,7 @@ fn a_target_without_a_working_set_selects_nothing() {
     let r = WsResolver::default()
         .with_conversation(40, f.scopes, 2, 10)
         .with_conversation(20, f.structure, 1, 100)
-        .lock(f.structure, 20);
+        .provenance(f.structure, 20, 900.0);
     assert!(
         emitted(&f.b, scopes_target, &r)
             .iter()

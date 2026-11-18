@@ -109,7 +109,7 @@ use crate::summary_tree::{
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnSegment};
-use crate::working_set::{Candidate, Limits, Refusal, TypeShares, WorkingSet};
+use crate::working_set::{Candidate, Limits, TypeShares, WorkingSet};
 use crate::ConversationError;
 use calibration_record::{standing, CalRecord, CalRecords, CalSnapshot};
 use deleted_set::DeletedSet;
@@ -3021,11 +3021,8 @@ impl Substrate {
     /// protected. Only items with both a hot and a warm copy are evicted, so
     /// eviction is hot→warm (the warm copy survives for a fast reload).
     ///
-    /// **Every live working set and every dialogue's pinned working set are
-    /// protected too**, not only the projection being elevated: a residence
-    /// another slot's wave attends is in use, and a pinned item is content a
-    /// model was told it has — one dialogue's elevation must not evict
-    /// another's promise.
+    /// **Every live working set is protected too**, not only the projection
+    /// being elevated: a residence another slot's wave attends is in use.
     pub fn evict_hot_to_free(
         &self,
         keep_sections: &[SectionId],
@@ -3035,13 +3032,12 @@ impl Substrate {
         self.evict_hot_inner(keep_sections, keep_turns, target_bytes, true)
     }
 
-    /// [`Self::evict_hot_to_free`] for a guest's drain, with no dialogue's
-    /// pinned working set protected — only `keep_*`.
+    /// [`Self::evict_hot_to_free`] for a guest's drain, with no live working
+    /// set protected — only `keep_*`.
     ///
-    /// **Nothing forwards for the length of a drain.** A pinned working set is
-    /// content a model was told it has, and the promise is kept by its next
-    /// projection, which lifts what it selects warm→hot before that turn's
-    /// first forward. Evicted here, it reloads from RAM then. Held, it was the
+    /// **Nothing forwards for the length of a drain.** A slot's next
+    /// projection lifts what it selects warm→hot before that turn's first
+    /// forward, so what is evicted here reloads from RAM then. Held, it was the
     /// draw: on WhiteWorld (2026-10-27 09:37) one dialogue's 16 GB working set
     /// left a draw 6.8 GB short with nothing in flight, and the draw failed.
     pub fn evict_hot_for_guest(
@@ -3058,22 +3054,17 @@ impl Substrate {
         keep_sections: &[SectionId],
         keep_turns: &[TurnKey],
         target_bytes: u64,
-        protect_pinned: bool,
+        protect_live: bool,
     ) -> EvictionReport {
         if target_bytes == 0 {
             return EvictionReport { count: 0, bytes: 0 };
         }
         let mut keep = self.keep_residences(keep_sections, keep_turns);
-        if protect_pinned {
+        if protect_live {
             // Every live working set, not only the projection being elevated:
             // a residence another slot's wave attends is as much in use as this
             // one's.
             keep.extend(self.residences.pinned());
-            for timeline in self.pinned_anywhere() {
-                if let Some(entry) = self.timelines.get(&timeline) {
-                    keep.extend(entry.turns.values().map(|t| t.content.residence));
-                }
-            }
         }
 
         // Walk oldest→newest, taking victims until we've freed enough.
@@ -3115,12 +3106,7 @@ impl Substrate {
     pub fn hot_census(&self, keep_sections: &[SectionId], keep_turns: &[TurnKey]) -> HotCensus {
         let mut census = HotCensus::default();
         let keep = self.keep_residences(keep_sections, keep_turns);
-        let mut pinned: HashSet<ResidenceIndex> = self.residences.pinned().into_iter().collect();
-        for timeline in self.pinned_anywhere() {
-            if let Some(entry) = self.timelines.get(&timeline) {
-                pinned.extend(entry.turns.values().map(|t| t.content.residence));
-            }
-        }
+        let pinned: HashSet<ResidenceIndex> = self.residences.pinned().into_iter().collect();
         for e in self.sections.values() {
             let r = self.residences.get(e.residence);
             if r.has_hot() {
@@ -3756,38 +3742,6 @@ impl Substrate {
         }
     }
 
-    /// Lock `timeline` into `target`'s working set, priced at its recorded
-    /// token total. A refusal means the call must run for real.
-    pub fn working_set_lock(
-        &mut self,
-        target: TimelineId,
-        timeline: TimelineId,
-        limits: Limits,
-    ) -> Result<(), Refusal> {
-        let candidate = self
-            .working_set_candidate(target, timeline)
-            .ok_or(Refusal::Gone)?;
-        self.working_set_mut(target)
-            .lock(timeline, candidate, limits)
-    }
-
-    /// Put back a lock `target`'s history records as served. `false` when the
-    /// conversation it names can no longer deliver anything.
-    pub fn working_set_restore_lock(&mut self, target: TimelineId, timeline: TimelineId) -> bool {
-        let Some(Candidate {
-            share: Some(share),
-            kind,
-            ..
-        }) = self.working_set_candidate(target, timeline)
-        else {
-            return false;
-        };
-        let tokens = self.timeline_token_total(timeline);
-        self.working_set_mut(target)
-            .restore_lock(timeline, tokens, share, kind);
-        true
-    }
-
     /// Seed `target`'s provenance with `candidates` at `momentum`
     /// ([`WorkingSet::seed`]). Returns the candidates that did not enter.
     pub fn working_set_seed(
@@ -3812,24 +3766,6 @@ impl Substrate {
                 .seed(&admissible, limits, momentum),
         );
         refused
-    }
-
-    /// Release `target`'s locks into provenance at `released` momentum.
-    pub fn working_set_release(&mut self, target: TimelineId, released: f32) {
-        if let Some(ws) = arc_mut(&mut self.working_sets, &target) {
-            ws.release(released);
-        }
-    }
-
-    /// Release `read`'s lock alone in `target`'s working set
-    /// ([`WorkingSet::release_one`]). Returns whether it was locked.
-    pub fn working_set_release_one(
-        &mut self,
-        target: TimelineId,
-        read: TimelineId,
-        released: f32,
-    ) -> bool {
-        arc_mut(&mut self.working_sets, &target).is_some_and(|ws| ws.release_one(read, released))
     }
 
     /// Keep `reads` from entering `target`'s working set
@@ -3882,14 +3818,6 @@ impl Substrate {
     /// set is about to be rebuilt from its own history.
     pub fn working_set_clear(&mut self, target: TimelineId) {
         self.working_sets.remove(&target);
-    }
-
-    /// Every conversation pinned in any dialogue's working set.
-    fn pinned_anywhere(&self) -> HashSet<TimelineId> {
-        self.working_sets
-            .values()
-            .flat_map(|ws| ws.pinned())
-            .collect()
     }
 
     // ── retrieval scope ─────────────────────────────────────────────────────
@@ -8937,40 +8865,14 @@ mod tests {
             budget_tokens,
             folder_tokens: budget_tokens,
             guidance_tokens: budget_tokens,
-            lock_tokens: budget_tokens,
             max_file_tokens: 100_000,
         }
-    }
-
-    /// A lock is priced at the conversation's recorded token total, and one
-    /// that would not fit beside the locks already held is refused while they
-    /// stay — each new lock entering before the older ones.
-    #[test]
-    fn a_lock_is_priced_at_the_recorded_token_total() {
-        let (mut sub, target, reads) = working_set_fixture(3, 100);
-        assert_eq!(
-            sub.working_set_lock(target, reads[0], ws_limits(250)),
-            Ok(())
-        );
-        assert_eq!(
-            sub.working_set_lock(target, reads[1], ws_limits(250)),
-            Ok(())
-        );
-        assert_eq!(
-            sub.working_set_lock(target, reads[2], ws_limits(250)),
-            Err(Refusal::Full)
-        );
-        assert_eq!(
-            sub.working_set(target).unwrap().pinned(),
-            vec![reads[1], reads[0]]
-        );
     }
 
     /// **A reading past `max_file_tokens` is a member where the fill carves.**
     /// With no trained window the engine emits members whole, so a 300-token
     /// reading against a 200-token cap is refused as a seed and on momentum.
-    /// With one, it is seeded and admitted, charged the 200 it can place. A
-    /// lock of it is refused on either engine, because a lock is placed whole.
+    /// With one, it is seeded and admitted, charged the 200 it can place.
     #[test]
     fn a_reading_past_the_cap_is_charged_the_cap_where_the_fill_carves() {
         let capped = Limits {
@@ -8991,23 +8893,19 @@ mod tests {
         };
         let members = |sub: &Substrate, target| -> Vec<TimelineId> {
             sub.working_set(target)
-                .map(|ws| ws.members().into_iter().map(|(tl, _)| tl).collect())
+                .map(|ws| ws.members())
                 .unwrap_or_default()
         };
 
-        let (mut whole, target, reads) = working_set_fixture(3, 300);
+        let (mut whole, target, reads) = working_set_fixture(2, 300);
         assert_eq!(
             whole.working_set_seed(target, &[reads[0]], capped, 1000.0),
             vec![reads[0]]
         );
         observe(&mut whole, target, reads[1]);
         assert!(members(&whole, target).is_empty());
-        assert_eq!(
-            whole.working_set_lock(target, reads[2], capped),
-            Err(Refusal::TooLarge)
-        );
 
-        let (mut carved, target, reads) = working_set_fixture(3, 300);
+        let (mut carved, target, reads) = working_set_fixture(2, 300);
         carved.set_trained_window(Some(262_144));
         assert!(carved
             .working_set_seed(target, &[reads[0]], capped, 1000.0)
@@ -9015,23 +8913,16 @@ mod tests {
         observe(&mut carved, target, reads[1]);
         assert_eq!(members(&carved, target), vec![reads[0], reads[1]]);
         assert_eq!(carved.working_set(target).unwrap().tokens(), 400);
-        assert_eq!(
-            carved.working_set_lock(target, reads[2], capped),
-            Err(Refusal::TooLarge)
-        );
     }
 
     /// A link of the dialogue's own inherited chain is projected as its opening
-    /// already, so it is never a member: not seeded, not locked, not admitted
-    /// on momentum. Admitted, it emitted twice.
+    /// already, so it is never a member: not seeded, not admitted on momentum.
+    /// Admitted, it emitted twice.
     #[test]
     fn a_link_of_the_dialogues_own_chain_is_never_a_member() {
         let (mut sub, target, reads) = working_set_fixture(2, 10);
         set_parent(&mut sub, target, reads[0]);
-        assert_eq!(
-            sub.working_set_lock(target, reads[0], ws_limits(1000)),
-            Err(Refusal::Gone)
-        );
+        assert!(sub.working_set_candidate(target, reads[0]).is_none());
         assert_eq!(
             sub.working_set_seed(target, &[reads[0], reads[1]], ws_limits(1000), 1000.0),
             vec![reads[0]],
@@ -9047,13 +8938,7 @@ mod tests {
             ws_limits(1000),
             NonZeroUsize::new(4).unwrap(),
         );
-        let members: Vec<TimelineId> = sub
-            .working_set(target)
-            .unwrap()
-            .members()
-            .into_iter()
-            .map(|(tl, _)| tl)
-            .collect();
+        let members = sub.working_set(target).unwrap().members();
         assert_eq!(members, vec![reads[1]]);
     }
 
@@ -9064,11 +8949,15 @@ mod tests {
         let elsewhere = unshared_timeline(7);
         sub.register_timeline(elsewhere, LayerId::for_test(1), GroupId::for_test(9));
         sub.append_with_blocks(elsewhere, 10, 0, 1);
-        assert_eq!(
-            sub.working_set_lock(target, elsewhere, ws_limits(1000)),
-            Err(Refusal::Gone)
+        let candidate = sub.working_set_candidate(target, elsewhere);
+        assert!(
+            candidate.is_some_and(|c| c.share.is_none()),
+            "no group's share"
         );
-        assert!(!sub.working_set_restore_lock(target, elsewhere));
+        assert_eq!(
+            sub.working_set_seed(target, &[elsewhere], ws_limits(1000), 1000.0),
+            vec![elsewhere]
+        );
     }
 
     /// A retired conversation reads as a miss. Its turns are gone, so serving
@@ -9081,11 +8970,7 @@ mod tests {
         let empty = unshared_timeline(1);
         sub.register_timeline(empty, LayerId::for_test(1), GroupId::for_test(1));
         for tl in [reads[0], reads[1], empty, target] {
-            assert_eq!(
-                sub.working_set_lock(target, tl, ws_limits(1000)),
-                Err(Refusal::Gone)
-            );
-            assert!(!sub.working_set_restore_lock(target, tl));
+            assert!(sub.working_set_candidate(target, tl).is_none(), "{tl:?}");
         }
         assert_eq!(
             sub.working_set_seed(target, &[reads[0], empty], ws_limits(1000), 1000.0),
@@ -9114,8 +8999,8 @@ mod tests {
 
     /// **A conversation that is not whole is gone.** A gap — a turn another
     /// member wrote and this one has not fetched — and a retired turn are both
-    /// empty, and the projection skips an empty turn: locked, the conversation
-    /// was promised whole and placed nothing.
+    /// empty, and the projection skips an empty turn: admitted, the
+    /// conversation would place less than it is charged.
     #[test]
     fn a_conversation_that_is_not_whole_is_gone() {
         let (mut sub, target, _) = working_set_fixture(0, 10);
@@ -9124,11 +9009,7 @@ mod tests {
         sub.restore_gap_turn(partial);
         sub.append_with_blocks(partial, 10, 0, 1);
         assert_eq!(sub.turn_count(partial), 2);
-        assert_eq!(
-            sub.working_set_lock(target, partial, ws_limits(1000)),
-            Err(Refusal::Gone)
-        );
-        assert!(!sub.working_set_restore_lock(target, partial));
+        assert!(sub.working_set_candidate(target, partial).is_none());
         assert_eq!(
             sub.working_set_seed(target, &[partial], ws_limits(1000), 1000.0),
             vec![partial],
@@ -9141,10 +9022,7 @@ mod tests {
         assert!(sub.holds_whole(retired));
         sub.tombstone_turn(retired, 1);
         assert!(!sub.holds_whole(retired));
-        assert_eq!(
-            sub.working_set_lock(target, retired, ws_limits(1000)),
-            Err(Refusal::Gone)
-        );
+        assert!(sub.working_set_candidate(target, retired).is_none());
     }
 
     /// **A calibration names what it calibrates, and is never a member.**
@@ -9173,8 +9051,8 @@ mod tests {
     }
 
     /// The lookup keys each live calibration by its conversation — archived
-    /// ones included, tombstoned ones not — and a calibration is refused as a
-    /// lock however whole it is.
+    /// ones included, tombstoned ones not — and a calibration is never a
+    /// candidate however whole it is.
     #[test]
     fn a_calibration_is_found_by_its_conversation_and_never_delivered() {
         let (mut sub, target, reads) = working_set_fixture(1, 10);
@@ -9203,11 +9081,8 @@ mod tests {
         let mut expect = vec![a, b];
         expect.sort();
         assert_eq!(sub.calibrations(), HashMap::from([(file, expect)]));
-        assert_eq!(
-            sub.working_set_lock(target, a, ws_limits(1000)),
-            Err(Refusal::Gone)
-        );
-        assert_eq!(sub.working_set_lock(target, file, ws_limits(1000)), Ok(()));
+        assert!(sub.working_set_candidate(target, a).is_none());
+        assert!(sub.working_set_candidate(target, file).is_some());
 
         // Re-pointed at another unit, a calibration moves with it.
         let other = unshared_timeline(14);
@@ -9229,15 +9104,13 @@ mod tests {
         assert_eq!(sub.calibrations_of(other).collect::<Vec<_>>(), expect);
     }
 
-    /// A tombstoned conversation leaves every dialogue's working set — a pinned
-    /// item whose turns are gone would keep emitting a broken promise — and a
-    /// tombstoned dialogue's own set goes with it.
+    /// A tombstoned conversation leaves every dialogue's working set — a member
+    /// whose turns are gone would place nothing — and a tombstoned dialogue's
+    /// own set goes with it.
     #[test]
     fn a_tombstone_leaves_every_working_set() {
         let (mut sub, target, reads) = working_set_fixture(3, 10);
-        sub.working_set_seed(target, &[reads[0]], ws_limits(1000), 1000.0);
-        sub.working_set_lock(target, reads[1], ws_limits(1000))
-            .unwrap();
+        sub.working_set_seed(target, &[reads[0], reads[1]], ws_limits(1000), 1000.0);
         sub.working_set_observe(
             target,
             &HashMap::from([(reads[2], 500.0)]),
@@ -9253,29 +9126,15 @@ mod tests {
             sub.tombstone_timeline(*r);
         }
         let ws = sub.working_set(target).unwrap();
-        assert!(ws.pinned().is_empty());
         assert!(ws.provenance().is_empty());
         sub.tombstone_timeline(target);
         assert!(sub.working_set(target).is_none());
     }
 
     #[test]
-    fn release_moves_the_locks_into_provenance() {
-        let (mut sub, target, reads) = working_set_fixture(1, 10);
-        sub.working_set_lock(target, reads[0], ws_limits(1000))
-            .unwrap();
-        sub.working_set_release(target, 5000.0);
-        let ws = sub.working_set(target).unwrap();
-        assert!(ws.pinned().is_empty());
-        assert_eq!(ws.provenance(), vec![(reads[0], 5000.0)]);
-    }
-
-    #[test]
     fn clearing_drops_the_set_for_a_rebuild() {
         let (mut sub, target, reads) = working_set_fixture(2, 10);
-        for r in &reads {
-            sub.working_set_lock(target, *r, ws_limits(1000)).unwrap();
-        }
+        sub.working_set_seed(target, &reads, ws_limits(1000), 1000.0);
         sub.working_set_clear(target);
         assert!(sub.working_set(target).is_none());
     }
@@ -10895,47 +10754,40 @@ mod tests {
         assert!(sub.residence(b).hot().is_none(), "b evicted instead");
     }
 
-    /// A conversation pinned in ANY dialogue's working set is protected, not
-    /// only the projection being elevated: one dialogue's elevation must not
-    /// evict content another dialogue was told it has.
+    /// A residence any slot's live working set attends is protected, not only
+    /// the projection being elevated: one dialogue's elevation must not evict
+    /// what another slot's wave reads.
     #[test]
-    fn evict_hot_to_free_protects_every_dialogues_pinned_working_set() {
+    fn evict_hot_to_free_protects_every_live_working_set() {
         let (layer, group, file, mut sub) = make_timeline();
-        let (_, a) = install_hot_and_warm(&mut sub, file, 100_000_000);
+        let (a_idx, a) = install_hot_and_warm(&mut sub, file, 100_000_000);
         let other = unshared_timeline(1);
         sub.register_timeline(other, layer, group);
         let (_, b) = install_hot_and_warm(&mut sub, other, 100_000_000);
-        let dialogue = unshared_timeline(2);
-        sub.register_timeline(dialogue, layer, group);
-        sub.set_working_set_share(group, WorkingSetShare::Remainder);
-        assert!(sub.working_set_restore_lock(dialogue, file));
+        sub.set_working_set_pins(&[TurnKey::new(file, a_idx)], &[]);
 
         let report = sub.evict_hot_to_free(&[], &[], 100_000_000);
         assert_eq!(report.count, 1);
-        assert!(sub.residence(a).has_hot(), "the pinned file stays hot");
-        assert!(sub.residence(b).hot().is_none(), "the unpinned one goes");
+        assert!(sub.residence(a).has_hot(), "the attended file stays hot");
+        assert!(sub.residence(b).hot().is_none(), "the other one goes");
     }
 
-    /// A guest's drain takes a pinned working set too, and still spares the
+    /// A guest's drain takes a live working set too, and still spares the
     /// keep list.
     #[test]
-    fn evict_hot_for_guest_takes_pinned_working_sets_but_not_the_keep_list() {
+    fn evict_hot_for_guest_takes_live_working_sets_but_not_the_keep_list() {
         let (layer, group, file, mut sub) = make_timeline();
         let (a_idx, a) = install_hot_and_warm(&mut sub, file, 100_000_000);
         let other = unshared_timeline(1);
         sub.register_timeline(other, layer, group);
         let (b_idx, b) = install_hot_and_warm(&mut sub, other, 100_000_000);
-        let dialogue = unshared_timeline(2);
-        sub.register_timeline(dialogue, layer, group);
-        sub.set_working_set_share(group, WorkingSetShare::Remainder);
-        assert!(sub.working_set_restore_lock(dialogue, file));
+        sub.set_working_set_pins(&[TurnKey::new(file, a_idx)], &[]);
 
         let report = sub.evict_hot_for_guest(&[], &[TurnKey::new(other, b_idx)], u64::MAX);
         assert_eq!(report.count, 1);
-        assert!(sub.residence(a).hot().is_none(), "the pinned file goes");
+        assert!(sub.residence(a).hot().is_none(), "the attended file goes");
         assert!(sub.residence(a).has_warm(), "and keeps its warm copy");
         assert!(sub.residence(b).has_hot(), "the kept turn stays");
-        let _ = a_idx;
     }
 
     /// The census counts what the eviction would take and names what it
@@ -10943,14 +10795,11 @@ mod tests {
     #[test]
     fn hot_census_reads_as_the_eviction_would() {
         let (layer, group, file, mut sub) = make_timeline();
-        let (_, a) = install_hot_and_warm(&mut sub, file, 100_000_000);
+        let (a_idx, a) = install_hot_and_warm(&mut sub, file, 100_000_000);
         let other = unshared_timeline(1);
         sub.register_timeline(other, layer, group);
         let (_, b) = install_hot_and_warm(&mut sub, other, 50_000_000);
-        let dialogue = unshared_timeline(2);
-        sub.register_timeline(dialogue, layer, group);
-        sub.set_working_set_share(group, WorkingSetShare::Remainder);
-        assert!(sub.working_set_restore_lock(dialogue, file));
+        sub.set_working_set_pins(&[TurnKey::new(file, a_idx)], &[]);
 
         let census = sub.hot_census(&[], &[]);
         assert_eq!(census.pinned, 100_000_000);

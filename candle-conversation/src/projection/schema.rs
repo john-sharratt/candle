@@ -1571,13 +1571,10 @@ pub struct Schema {
     /// How a selecting model's hits are counted and how they move a placed
     /// piece's score (`hits:`, [`HitsConfig`]).
     pub hits: HitsConfig,
-    /// A projection held to the target's own conversation: the system prompt,
-    /// the target group's turns, and from every other layer only the
-    /// working-set members the conversation was *served* — the locked ones,
-    /// promises it was given and may still be reading from. Nothing is gathered
-    /// from another layer, unlocked working-set members are left out, and no
-    /// other layer is scanned, so the projection teaches nothing back (no
-    /// momentum, no backgrounds).
+    /// A projection held to the target's own conversation: the system prompt
+    /// and the target group's turns. Nothing is gathered from another layer,
+    /// the working set is left out, and no other layer is scanned, so the
+    /// projection teaches nothing back (no momentum, no backgrounds).
     ///
     /// **Not a YAML field.** Set at runtime on a copy of a builder by
     /// [`super::Builder::focused`], for a question put beside a conversation

@@ -43,7 +43,7 @@ use crate::substrate::{ConvCompression, Substrate};
 use crate::summary_tree::{SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 use crate::turn_text::literal_tokenizer;
-use crate::working_set::{Limits, Refusal, TypeShares, WorkingSet};
+use crate::working_set::{Limits, TypeShares, WorkingSet};
 
 use candle::quantized::pinned_staging::release_recycled_wc;
 use candle::Device;
@@ -1355,27 +1355,6 @@ impl ConversationEngine {
         self.conversation.read().holds_whole(timeline)
     }
 
-    /// Lock `read` into `target`'s working set — the conversation that already
-    /// read this content, standing in for reading it again
-    /// (`docs/zend_working_set.md` §4.5). A refusal means the caller must do
-    /// the real read.
-    pub fn working_set_lock(
-        &self,
-        target: TimelineId,
-        read: TimelineId,
-        limits: Limits,
-    ) -> Result<(), Refusal> {
-        self.conversation
-            .update(|s| s.working_set_lock(target, read, limits))
-    }
-
-    /// Put back a lock `target`'s own history records as served. `false` when
-    /// the conversation it names can no longer deliver anything.
-    pub fn working_set_restore_lock(&self, target: TimelineId, read: TimelineId) -> bool {
-        self.conversation
-            .update(|s| s.working_set_restore_lock(target, read))
-    }
-
     /// Seed `target`'s provenance with `candidates` at `momentum`, in list
     /// order while the budget has room. Returns the candidates that did not
     /// enter.
@@ -1388,24 +1367,6 @@ impl ConversationEngine {
     ) -> Vec<TimelineId> {
         self.conversation
             .update(|s| s.working_set_seed(target, candidates, limits, momentum))
-    }
-
-    /// Release `target`'s locks into provenance at `released` momentum.
-    pub fn working_set_release(&self, target: TimelineId, released: f32) {
-        self.conversation
-            .update(|s| s.working_set_release(target, released));
-    }
-
-    /// Release `read`'s lock alone in `target`'s working set at `released`
-    /// momentum — its promise has ended. Returns whether it was locked.
-    pub fn working_set_release_one(
-        &self,
-        target: TimelineId,
-        read: TimelineId,
-        released: f32,
-    ) -> bool {
-        self.conversation
-            .update(|s| s.working_set_release_one(target, read, released))
     }
 
     /// Keep `reads` out of `target`'s working set until

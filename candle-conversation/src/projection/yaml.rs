@@ -970,7 +970,6 @@ fn parse_recency(
 struct YamlWorkingSet {
     budget_tokens: usize,
     folder_tokens: usize,
-    lock_tokens: usize,
     beta: f32,
     min_momentum: f32,
     max_file_tokens: usize,
@@ -979,8 +978,6 @@ struct YamlWorkingSet {
     guidance_tokens: usize,
     #[serde(default)]
     seeds: Vec<String>,
-    #[serde(default)]
-    release_on: Vec<String>,
     /// Provenance members one reprojection admits; [`DEFAULT_MAX_SWAPS`] when
     /// absent.
     #[serde(default)]
@@ -1090,8 +1087,8 @@ fn parse_working_set(
     // The slot is the engine's trained window, which the schema does not know:
     // the shares and the window are caps on one fill of it
     // (`docs/hit_driven_projection.md` §7.2), so they may sum past it; the
-    // reserve and the locks are measured against it at each fill, which runs on
-    // the rung above when they pass it (`WorkingSetConfig::slot_window`).
+    // reserve is measured against it at each fill, which runs on the rung above
+    // when it passes it (`WorkingSetConfig::slot_window`).
     let max_admits = match yw.max_admits {
         None => DEFAULT_MAX_SWAPS,
         Some(n) => NonZeroUsize::new(n).ok_or_else(|| {
@@ -1108,12 +1105,10 @@ fn parse_working_set(
         budget_tokens: yw.budget_tokens,
         folder_tokens: yw.folder_tokens,
         guidance_tokens: yw.guidance_tokens,
-        lock_tokens: yw.lock_tokens,
         beta: yw.beta,
         min_momentum: yw.min_momentum,
         max_file_tokens: yw.max_file_tokens,
         seeds: yw.seeds.clone(),
-        release_on: yw.release_on.clone(),
         max_admits,
         reserve_tokens: yw.reserve_tokens,
         type_shares,

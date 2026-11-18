@@ -114,7 +114,6 @@ use super::selection::LINEAGE_RANK_STEP;
 use super::selection::{apply_selection, trim_to_budget_low_score_first};
 use super::swap_cap::{cap_new_members, SwapCap};
 use super::working_set_pick;
-use super::working_set_pick::Standing;
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{NodeId, SelectionDiagnostics, SelectionOrigin};
 
@@ -1846,17 +1845,14 @@ pub fn run_with_sink<R: ContentResolver>(
             .iter_mut()
             .filter(|gs| gs.working_set.is_some())
         {
-            let Some(mut members) = resolver.working_set_members(gs.schema.id) else {
+            // Focused, the projection is held to the conversation itself
+            // (`Schema::focus`): it carries no working set.
+            if schema.focus {
+                continue;
+            }
+            let Some(members) = resolver.working_set_members(gs.schema.id) else {
                 continue;
             };
-            // Focused, only what the conversation was served: a locked member
-            // is a promise it may still be reading from, an unlocked one is
-            // provenance (`Schema::focus`).
-            if schema.focus {
-                members
-                    .members
-                    .retain(|(_, standing)| matches!(standing, Standing::Locked));
-            }
             for p in working_set_pick::pick(&members) {
                 for key in resolver.timeline_turns(p.timeline) {
                     selection_scores.set_turn(key, p.score, true);
@@ -2299,14 +2295,10 @@ pub fn run_with_sink<R: ContentResolver>(
                     .filter(|(k, _)| k.timeline == tl)
                     .copied()
                     .collect();
-                let locked = keys.iter().any(|(k, _)| {
-                    selection_origins.get(k) == Some(&SelectionOrigin::WorkingSetLock)
-                });
                 let score = keys.iter().map(|(_, s)| *s).fold(0.0, f32::max);
                 let ks: Vec<TurnKey> = keys.iter().map(|(k, _)| *k).collect();
                 working.push(WorkingPiece {
                     kind,
-                    locked,
                     score,
                     exchanges: exchanges_of(&ks),
                 });
