@@ -208,7 +208,7 @@ knows something about it. It reads oldest first, then the present:
 
 ```
 - WhiteWorld — motherd 5207-e74ade355, below the floor 5211-8088a2457 (raised 6.0 h ago)
-  6.5 h ago  keep tried motherd 5210-…: rolled back — slow: no proof line within 10 min
+  6.5 h ago  keep tried motherd <build>: rolled back — slow: no proof line within 10 min
              (last line: INFO syncing …)
   6.5 h ago  keep restored 5207-e74ade355 (pid 22508); serving on 5207, install pending
   6.0 h ago  floor raised to 5211; older builds may serve until 30 min from now
