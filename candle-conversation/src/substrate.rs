@@ -3747,6 +3747,19 @@ impl Substrate {
         })
     }
 
+    /// What a seed or a provenance candidate costs a working set on this
+    /// substrate's engine. An engine with a trained window carves the slot
+    /// (`docs/hit_driven_projection.md` §7.2), placing at most
+    /// `max_file_tokens` of one reading, so a longer reading is charged that
+    /// much ([`Candidate::carved_to`]); an engine that emits members whole is
+    /// charged their whole size, and the working set refuses one past the cap.
+    fn provenance_charge(&self, candidate: Candidate, limits: Limits) -> Candidate {
+        match self.trained_window {
+            Some(_) => candidate.carved_to(limits.max_file_tokens),
+            None => candidate,
+        }
+    }
+
     /// Lock `timeline` into `target`'s working set, priced at its recorded
     /// token total. A refusal means the call must run for real.
     pub fn working_set_lock(
@@ -3792,7 +3805,9 @@ impl Substrate {
         let mut admissible = Vec::new();
         for &timeline in candidates {
             match self.working_set_candidate(target, timeline) {
-                Some(candidate) => admissible.push((timeline, candidate)),
+                Some(candidate) => {
+                    admissible.push((timeline, self.provenance_charge(candidate, limits)))
+                }
                 None => refused.push(timeline),
             }
         }
@@ -3862,6 +3877,7 @@ impl Substrate {
         let chain: HashSet<TimelineId> = self.inherited_chain(target).into_iter().collect();
         ws.observe(fresh, beta, min_momentum, limits, max_admits, &|timeline| {
             self.working_set_candidate_beside(target, &chain, timeline)
+                .map(|c| self.provenance_charge(c, limits))
         });
         self.working_sets.insert(target, Arc::new(ws));
     }
@@ -9062,6 +9078,57 @@ mod tests {
         assert_eq!(
             sub.working_set(target).unwrap().pinned(),
             vec![reads[1], reads[0]]
+        );
+    }
+
+    /// **A reading past `max_file_tokens` is a member where the fill carves.**
+    /// With no trained window the engine emits members whole, so a 300-token
+    /// reading against a 200-token cap is refused as a seed and on momentum. With
+    /// one, it is seeded and admitted, charged the 200 it can place; a lock of it
+    /// is refused on either engine, because a lock is placed whole.
+    #[test]
+    fn a_reading_past_the_cap_is_charged_the_cap_where_the_fill_carves() {
+        let capped = Limits {
+            max_file_tokens: 200,
+            ..ws_limits(1000)
+        };
+        let observe = |sub: &mut Substrate, target, read| {
+            sub.working_set_observe(
+                target,
+                &HashMap::from([(read, 5000.0)]),
+                &HashMap::new(),
+                &HitsConfig::default(),
+                0.2,
+                100.0,
+                capped,
+                NonZeroUsize::new(4).unwrap(),
+            )
+        };
+        let members = |sub: &Substrate, target| -> Vec<TimelineId> {
+            sub.working_set(target)
+                .map(|ws| ws.members().into_iter().map(|(tl, _)| tl).collect())
+                .unwrap_or_default()
+        };
+
+        let (mut whole, target, reads) = working_set_fixture(2, 300);
+        assert_eq!(
+            whole.working_set_seed(target, &[reads[0]], capped, 1000.0),
+            vec![reads[0]]
+        );
+        observe(&mut whole, target, reads[1]);
+        assert!(members(&whole, target).is_empty());
+
+        let (mut carved, target, reads) = working_set_fixture(3, 300);
+        carved.set_trained_window(Some(262_144));
+        assert!(carved
+            .working_set_seed(target, &[reads[0]], capped, 1000.0)
+            .is_empty());
+        observe(&mut carved, target, reads[1]);
+        assert_eq!(members(&carved, target), vec![reads[0], reads[1]]);
+        assert_eq!(carved.working_set(target).unwrap().tokens(), 400);
+        assert_eq!(
+            carved.working_set_lock(target, reads[2], capped),
+            Err(Refusal::TooLarge)
         );
     }
 

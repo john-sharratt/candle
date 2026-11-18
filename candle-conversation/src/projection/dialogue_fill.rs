@@ -6,7 +6,9 @@
 //! - **the lineage**, each exchange whole, scored from its base (§8.4);
 //! - **the working set**: a locked piece's every round as locks; any other
 //!   piece's request and answer as its floor, and its tool rounds — a reading's
-//!   pages — by the piece's score (§8.2);
+//!   pages — at the piece's score, ranked among themselves by each round's own
+//!   score, so a reading its cap will not take whole keeps its best pages
+//!   (§8.2, [`piece_round_score`]);
 //! - **the dialogue** (§8.3): its newest exchange as the current one — its
 //!   request, newest tool round and reply kept, its older tool rounds shed
 //!   first — its first exchange's request and answer, and its `recent`
@@ -117,6 +119,22 @@ impl Units {
     }
 }
 
+/// The score one round of an unlocked working-set piece enters the fill at:
+/// the piece's own `piece` score, lifted by up to as much again by how the
+/// round stands among the piece's rounds — `round`, its turns' score (the
+/// scan's evidence for that page, lifted by the hits on it), against `best`,
+/// the highest of the piece's rounds. The piece's level decides how it ranks
+/// against the other pieces; the rounds' own scores decide which pages a
+/// reading longer than `max_file_tokens` keeps (`docs/hit_driven_projection.md`
+/// §8.2). A piece with no scored round enters at `piece` throughout.
+fn piece_round_score(piece: f32, round: f32, best: f32) -> f32 {
+    if best > 0.0 {
+        piece * (1.0 + round.max(0.0) / best)
+    } else {
+        piece
+    }
+}
+
 /// Plan `slot` (module docs). `score` is a turn's score; `tokens` a record's.
 pub fn plan(
     slot: &DialogueSlot,
@@ -174,6 +192,12 @@ pub fn plan(
     for (p, wp) in slot.working.iter().enumerate() {
         let pid = piece();
         let mut floor: Vec<Unit> = Vec::new();
+        let best = wp
+            .exchanges
+            .iter()
+            .flat_map(|ex| (0..round_count(ex.len())).map(|r| round_score(ex, r)))
+            .fold(0.0, f32::max);
+        let ranked = |s: f32| piece_round_score(wp.score, s, best);
         for (e, ex) in wp.exchanges.iter().enumerate() {
             let n = round_count(ex.len());
             if n == 0 {
@@ -188,14 +212,16 @@ pub fn plan(
                 continue;
             }
             let pair_tokens = round_tokens(ex, 0) + round_tokens(ex, n - 1);
-            let pair = units.add(part, vec![0, n - 1], pid, wp.kind, pair_tokens, wp.score);
+            let pair_score = ranked(round_score(ex, 0).max(round_score(ex, n - 1)));
+            let pair = units.add(part, vec![0, n - 1], pid, wp.kind, pair_tokens, pair_score);
             floor.push(pair);
             if n == 2 {
                 // A plain question and answer: the pair is all there is.
                 input.scored.push(pair);
             }
             for r in 1..n - 1 {
-                let u = units.add(part, vec![r], pid, wp.kind, round_tokens(ex, r), wp.score);
+                let s = ranked(round_score(ex, r));
+                let u = units.add(part, vec![r], pid, wp.kind, round_tokens(ex, r), s);
                 input.scored.push(u);
             }
         }
@@ -432,6 +458,52 @@ mod tests {
                 (k(5, 3), Some(TurnRecord::Assistant)),
             ]]
         );
+    }
+
+    /// **A reading past its cap keeps the page its own score names, not its
+    /// first**: room for everything, but `max_file` of 40 holds the pair and one
+    /// 20-token page. Turn 5:3 is the one the scan scored, so page round 3 (5:2's
+    /// call, 5:3's result) is kept over round 1, which ties would have kept.
+    #[test]
+    fn a_capped_reading_keeps_its_best_scored_page() {
+        let slot = DialogueSlot {
+            room: 10_000,
+            caps: Caps {
+                max_file: 40,
+                ..caps()
+            },
+            recent: 0,
+            lineage: vec![],
+            working: vec![WorkingPiece {
+                kind: Kind::Reading,
+                locked: false,
+                score: 500.0,
+                exchanges: vec![vec![k(5, 0), k(5, 1), k(5, 2), k(5, 3)]],
+            }],
+            own: vec![],
+            context: vec![],
+        };
+        let p = plan(&slot, |t| if t == k(5, 3) { 900.0 } else { 0.0 }, ten);
+        assert_eq!(
+            p.working,
+            vec![vec![
+                (k(5, 0), Some(TurnRecord::User)),
+                (k(5, 2), Some(TurnRecord::Assistant)),
+                (k(5, 3), None),
+            ]]
+        );
+    }
+
+    /// A round's score keeps its piece's level and ranks it among the piece's
+    /// rounds: the best round is lifted to twice the piece, an unscored one
+    /// stays at it, and a piece with nothing scored is its own score throughout.
+    #[test]
+    fn a_pieces_rounds_rank_within_its_level() {
+        assert_eq!(piece_round_score(500.0, 900.0, 900.0), 1_000.0);
+        assert_eq!(piece_round_score(500.0, 450.0, 900.0), 750.0);
+        assert_eq!(piece_round_score(500.0, 0.0, 900.0), 500.0);
+        assert_eq!(piece_round_score(500.0, -3.0, 900.0), 500.0);
+        assert_eq!(piece_round_score(500.0, 0.0, 0.0), 500.0);
     }
 
     /// An older exchange the room has no place for leaves whole; the current

@@ -583,9 +583,19 @@ not cost 48K, only the pages the question reads.
   (`opening_prompt`, the reading's tool grammar), and its round limit is the
   file's page count, not `MAX_FILE_READ_ROUNDS`, so a file of any length reads
   to its end in rounds of one page.
-- **Scored per round.** Each page has its own hit counter and base. The base
-  is provenance's score for the reading, the same for every round of it; hits
-  decide which pages of it the slot holds.
+- **Scored per round.** Each page has its own hit counter and base. Its base
+  is provenance's normalized score for that round (§7.1), lifted by its hits.
+  A page enters the fill at its piece's score, lifted by up to as much again
+  by how its own score stands among the piece's pages
+  (`dialogue_fill::piece_round_score`). So the piece's level decides how it
+  ranks against other pieces, and its pages' own scores decide which of them
+  the slot holds. A piece with no scored page enters at its own score, and
+  ties go to the oldest page.
+- **A reading longer than `max_file` is a member.** The working set charges it
+  `max_file_tokens`, the most of it the slot places, not its whole size
+  (`docs/zend_working_set.md` §4.4). It is pooled whole like any piece, and
+  the slot holds its request, its answer and its best pages under the
+  `max_file` cap.
 - **The reading's own projection is not carved.** While a reading is being
   ingested its conversation is its own target and selected whole
   (`target_is_ingest_self`), as it is today.
