@@ -74,18 +74,25 @@ pub(crate) struct SettledGround {
     pub frontier: usize,
 }
 
-/// Whether an idle scheduler owes another settle: ground has changed since the
-/// last one left the partition at `settled`, and the frontier now stands above
-/// what is live — holes a pack could close, or a frontier a tenant gave up.
+/// Whether an idle scheduler owes another settle: ground has been freed since
+/// the last one left the partition at `settled` — fewer regions live, or a lower
+/// frontier — and the frontier now stands above what is live: holes a pack could
+/// close, or a frontier a tenant gave up.
 ///
-/// **Only on a change.** A settle that could not lower the frontier leaves it
-/// above `live` (a tenant standing on the top region that no pass can move), and
-/// asking again over the same ground repeats every pass for nothing; the gate
-/// behind each pass already refuses that, but the passes still census to find out.
-/// A shape no settle has seen yet (`None`) is owed one whenever the frontier is
-/// above what is live.
+/// **Only when ground was freed.** A settle that could not lower the frontier
+/// leaves it above `live` (a tenant standing on the top region that no pass can
+/// move), and asking again over the same ground repeats every pass for nothing.
+/// Ground that only grew is not freed either: an ingest running while the
+/// scheduler waits idle adds regions on every wake, and a settle owed on each of
+/// those ran dozens a second on BlackWorld (2026-11-17, 23:28). A shape no
+/// settle has seen yet (`None`) is owed one whenever the frontier is above what
+/// is live.
 pub(super) fn resettle_owed(settled: Option<SettledGround>, now: SettledGround) -> bool {
-    now.frontier > now.live && settled != Some(now)
+    let freed = match settled {
+        None => true,
+        Some(s) => now.live < s.live || now.frontier < s.frontier,
+    };
+    now.frontier > now.live && freed
 }
 
 /// Offer the weight side ground until it stops taking it. `negotiate` runs one
@@ -232,6 +239,19 @@ mod tests {
     fn a_packed_partition_owes_no_settle() {
         assert!(!resettle_owed(Some(ground(260, 300)), ground(141, 141)));
         assert!(!resettle_owed(None, ground(0, 0)));
+    }
+
+    /// **Ground that only grew owes nothing**: an ingest adding regions while
+    /// the scheduler waits idle, its holes left as the last settle found them.
+    #[test]
+    fn a_growing_partition_owes_no_settle() {
+        let settled = Some(ground(141, 861));
+        assert!(!resettle_owed(settled, ground(150, 861)));
+        assert!(!resettle_owed(settled, ground(150, 870)));
+        assert!(
+            resettle_owed(settled, ground(150, 840)),
+            "a frontier given up is freed ground, whatever else grew"
+        );
     }
 
     /// A policy that never stops granting is bounded.
