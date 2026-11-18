@@ -983,8 +983,9 @@ mod tests {
         ProjectionBucket, ProjectionPoint, SegmentTokens, SelectedTurn, SelectionScores,
         SystemItem,
     };
-    use crate::substrate::ContentResolver;
+    use crate::substrate::{whole_turn_records, ContentResolver};
     use crate::summary_tree::TurnKind;
+    use crate::turn_layout::TurnRecord;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1190,6 +1191,12 @@ layers:
         }
         fn turn_score(&self, _turn: TurnKey) -> f32 {
             0.0
+        }
+        fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
+            whole_turn_records(self.turn_token_count(turn), record)
+        }
+        fn trained_window(&self) -> Option<usize> {
+            None
         }
         fn section_token_count(&self, section: SectionId) -> usize {
             *self.section_tokens.get(&section.raw()).unwrap_or(&0)

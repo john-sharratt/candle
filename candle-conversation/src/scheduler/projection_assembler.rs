@@ -3756,6 +3756,7 @@ mod tests {
         GroupId, HitsConfig, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId,
         WorkingSetShare,
     };
+    use crate::substrate::whole_turn_records;
     use crate::working_set::Limits;
     use std::num::NonZeroUsize;
 
@@ -3775,6 +3776,12 @@ mod tests {
         }
         fn turn_token_count(&self, _turn: TurnKey) -> usize {
             10
+        }
+        fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
+            whole_turn_records(self.turn_token_count(turn), record)
+        }
+        fn trained_window(&self) -> Option<usize> {
+            None
         }
         fn turn_score(&self, _turn: TurnKey) -> f32 {
             0.0

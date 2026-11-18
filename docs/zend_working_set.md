@@ -364,13 +364,18 @@ so a longer reading could be admitted at the cap's cost. Today it cannot.
 Measured 2026-11-18 on BlackWorld: across 30 dialogue prompts, every one of
 2,187 placed turns was a whole turn and never a single record, although the
 working-set groups held about 75K tokens against the 64K budget each time.
-The fill's caps do not bind in production. The budget holds only because
-admission refuses whole sizes. Admitting a reading past the cap at the cap's
-cost was tried (cec2653ed) and placed a 60K-token reading whole, so it was
-withdrawn. Until the fill carves, the five battery answer files past the cap
-can never be placed: `scheduler/mod.rs` (306K tokens), `quantized/cuda.rs`,
-`conversation.rs`, `region_pool.rs` and `projection_assembler.rs`
-(`docs/results/battery_gap_analysis_2026-11-18.md`).
+The fill never ran. `SubstrateRead`'s `ContentResolver` took the trait's
+default `trained_window` of `None`, so `TargetedRead`, which every dialogue
+projects through, saw no trained window. The working-set members were placed
+whole on the path for an engine that does not select, and the budget held
+only because admission refuses whole sizes. Admitting a reading past the cap
+at the cap's cost was tried on that path (cec2653ed) and placed a 60K-token
+reading whole, so it was withdrawn. `trained_window` and `record_tokens` now
+have no default, and every resolver states both. Until the fill is seen
+carving on the daemon, a reading past the cap stays out, and the five battery
+answer files past it cannot be placed: `scheduler/mod.rs` (306K tokens),
+`quantized/cuda.rs`, `conversation.rs`, `region_pool.rs` and
+`projection_assembler.rs` (`docs/results/battery_gap_analysis_2026-11-18.md`).
 
 The rule reads the dialogue's `WorkingSet` through the resolver
 (`ContentResolver::working_set_members`, filtered to the group); a target whose

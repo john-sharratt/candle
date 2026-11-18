@@ -1121,6 +1121,16 @@ impl TurnPartWrite {
 
 // ── ContentResolver trait ─────────────────────────────────────────────────────
 
+/// [`ContentResolver::record_tokens`] for a resolver that keeps no record
+/// edges: a turn of `whole` tokens is all assistant record, so it is never
+/// carved.
+pub fn whole_turn_records(whole: usize, record: TurnRecord) -> usize {
+    match record {
+        TurnRecord::User => 0,
+        TurnRecord::Assistant => whole,
+    }
+}
+
 /// Supplies dynamic content metadata to the projection engine.
 ///
 /// The resolver never returns content itself — only the **turn count**,
@@ -1180,22 +1190,26 @@ pub trait ContentResolver {
     fn turn_token_count(&self, turn: TurnKey) -> usize;
 
     /// Tokens one record of a turn holds (`docs/hit_driven_projection.md`
-    /// §8.1). Default: the whole turn is its assistant record — a resolver
-    /// that keeps no record edges has turns that are not carved.
-    fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
-        match record {
-            TurnRecord::User => 0,
-            TurnRecord::Assistant => self.turn_token_count(turn),
-        }
-    }
+    /// §8.1). A resolver that keeps no record edges answers the whole turn as
+    /// its assistant record ([`whole_turn_records`]).
+    ///
+    /// **No default, like [`Self::trained_window`].** A resolver that forgot it
+    /// would price every turn as if it had no edges, and the fill would carve
+    /// against the wrong costs without a word.
+    fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize;
 
     /// The trained window of the engine the projection is for — the slot a
     /// dialogue's fill holds (`docs/hit_driven_projection.md` §4). `None` for
     /// an engine whose attention selects nothing, which is filled by its
     /// layers' windows instead.
-    fn trained_window(&self) -> Option<usize> {
-        None
-    }
+    ///
+    /// **No default.** `SubstrateRead` once took the trait's `None` while the
+    /// substrate it reads held the engine's window, so `TargetedRead`, which
+    /// every dialogue projection runs through, never filled a slot. Members
+    /// were placed whole and no cap bound: measured 2026-11-18 on BlackWorld,
+    /// every placed turn of 30 prompts was whole, with the working set ~75K
+    /// against a 64K budget. Each resolver says which it is.
+    fn trained_window(&self) -> Option<usize>;
 
     /// Relevance score for a turn — the wide-Q belief score the scheduler
     /// recorded for this projection. Zero when unscored.
@@ -8324,6 +8338,14 @@ impl Substrate {
 /// sibling conversations of the same shape) MUST project through [`TargetedRead`]
 /// — this bare impl is for structural / test callers only.
 impl ContentResolver for Substrate {
+    fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
+        self.turn_record_tokens(turn.timeline, turn.index, record)
+    }
+
+    fn trained_window(&self) -> Option<usize> {
+        Substrate::trained_window(self)
+    }
+
     fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
         self.active_timelines_for_group(group)
             .flat_map(|tl| {
@@ -8458,6 +8480,15 @@ impl<'a> std::ops::Deref for ScoredSubstrate<'a> {
 /// sibling-timeline masking** — a target-masked projection routes through
 /// [`TargetedRead`]; this pairing is for structural / test callers.
 impl<'a> ContentResolver for ScoredSubstrate<'a> {
+    fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
+        self.substrate
+            .turn_record_tokens(turn.timeline, turn.index, record)
+    }
+
+    fn trained_window(&self) -> Option<usize> {
+        self.substrate.trained_window()
+    }
+
     fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
         self.substrate
             .active_timelines_for_group(group)
@@ -8598,6 +8629,15 @@ impl<'a> std::ops::Deref for SubstrateRead<'a> {
 /// **no** sibling-timeline masking (it has no target). Wrap in [`TargetedRead`]
 /// for a target-masked projection; this bare guard is for structural / test reads.
 impl<'a> ContentResolver for SubstrateRead<'a> {
+    fn record_tokens(&self, turn: TurnKey, record: TurnRecord) -> usize {
+        self.guard
+            .turn_record_tokens(turn.timeline, turn.index, record)
+    }
+
+    fn trained_window(&self) -> Option<usize> {
+        self.guard.trained_window()
+    }
+
     fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
         self.guard
             .active_timelines_for_group(group)
