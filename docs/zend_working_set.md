@@ -371,7 +371,7 @@ Measured 2026-11-18, the §9.12 battery's answers sit in five files past the
 cap: `scheduler/mod.rs` (306K tokens), `quantized/cuda.rs`,
 `conversation.rs`, `region_pool.rs` and `projection_assembler.rs`. Refused
 whole, they could never be placed, and two questions had no other answer
-file (`docs/results/battery_gap_analysis_2026-11-18.md`). The same day
+file (`docs/results/dependency_battery_gap_analysis_2026-11-18.md`). The same day
 showed the fill had never run on the daemon: `SubstrateRead`'s
 `ContentResolver` took the trait's default `trained_window` of `None`, so
 every dialogue projected as if its engine did not select. Across 30 prompts,
