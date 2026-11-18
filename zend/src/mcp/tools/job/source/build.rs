@@ -1,11 +1,12 @@
 //! A build or test run on an agent, as a job: its output is its log, read on
 //! the agent.
 
-use agent::client::Agents;
+use agent::client::{AgentError, Agents};
 use agent::wire::JobView;
 use cluster::log_read::{Line, LogAsk, LogRead, Summary};
 
 use super::super::{pages, JobHandle, Standing, PAGE_LINES};
+use super::agent_miss::{miss, restarting, Miss};
 use super::Row;
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::tools::repo_job::{describe, host_in, host_of, lost, Handle, NO_AGENTS};
@@ -71,16 +72,53 @@ pub fn summary_text(job: &JobHandle, s: &Summary) -> String {
     out
 }
 
+/// What a failed call to `h`'s agent answers: a job whose agent is
+/// restarting stands, not ended, and a status waits on; one an agent that
+/// serves does not hold is lost (`agent_miss`).
+async fn missed(
+    agents: &Agents,
+    job: &JobHandle,
+    h: &Handle,
+    e: &AgentError,
+) -> Result<Standing, String> {
+    match miss(agents, h.node, e).await {
+        Miss::Restarting => Ok(Standing {
+            ended: false,
+            line: restarting(&job.to_string(), &host_of(agents, h.node).await),
+            detail: String::new(),
+            total: 0,
+            size: 0,
+            marks: Vec::new(),
+        }),
+        Miss::NotHeld | Miss::Failed => Err(lost(h, e)),
+    }
+}
+
+/// What a failed read of `h`'s log answers: the agent is restarting and the
+/// read is asked again, or the job is lost.
+pub(super) async fn read_missed(agents: &Agents, h: &Handle, e: &AgentError) -> String {
+    match miss(agents, h.node, e).await {
+        Miss::Restarting => format!(
+            "{}: ask again in a moment — the same call",
+            restarting(&format!("build:{h}"), &host_of(agents, h.node).await)
+        ),
+        Miss::NotHeld | Miss::Failed => lost(h, e),
+    }
+}
+
 pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Standing, String> {
     let agents = agents(call)?;
     let at = h.at(&agents);
-    let view = agents.view(at, &h.id).await.map_err(|e| lost(h, &e))?;
+    let view = match agents.view(at, &h.id).await {
+        Ok(v) => v,
+        Err(e) => return missed(&agents, job, h, &e).await,
+    };
     let host = host_of(&agents, h.node).await;
     let ended = view.status.is_finished();
-    let read = agents
-        .read_log(at, &h.id, &LogAsk::Summary)
-        .await
-        .map_err(|e| lost(h, &e))?;
+    let read = match agents.read_log(at, &h.id, &LogAsk::Summary).await {
+        Ok(r) => r,
+        Err(e) => return missed(&agents, job, h, &e).await,
+    };
     let detail = match (&read.summary, ended) {
         (Some(s), true) => summary_text(job, s),
         (Some(s), false) => s.last.last().map_or(String::new(), |l| {
@@ -100,10 +138,10 @@ pub async fn standing(call: &OpsCall, job: &JobHandle, h: &Handle) -> Result<Sta
 
 pub async fn read(call: &OpsCall, h: &Handle, ask: &LogAsk) -> Result<LogRead, String> {
     let agents = agents(call)?;
-    agents
-        .read_log(h.at(&agents), &h.id, ask)
-        .await
-        .map_err(|e| lost(h, &e))
+    match agents.read_log(h.at(&agents), &h.id, ask).await {
+        Ok(read) => Ok(read),
+        Err(e) => Err(read_missed(&agents, h, &e).await),
+    }
 }
 
 pub async fn cancel(call: &OpsCall, job: &JobHandle, h: &Handle) -> Answer {
@@ -114,7 +152,7 @@ pub async fn cancel(call: &OpsCall, job: &JobHandle, h: &Handle) -> Answer {
     let at = h.at(&agents);
     let before = match agents.view(at, &h.id).await {
         Ok(v) => v,
-        Err(e) => return Answer::error(lost(h, &e)),
+        Err(e) => return Answer::error(read_missed(&agents, h, &e).await),
     };
     let host = host_of(&agents, h.node).await;
     if before.status.is_finished() {
@@ -128,7 +166,7 @@ pub async fn cancel(call: &OpsCall, job: &JobHandle, h: &Handle) -> Answer {
             "Cancelled.\n{}",
             describe(&job.to_string(), &host, &view, now_ms())
         )),
-        Err(e) => Answer::error(lost(h, &e)),
+        Err(e) => Answer::error(read_missed(&agents, h, &e).await),
     }
 }
 

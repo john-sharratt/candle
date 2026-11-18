@@ -25,6 +25,7 @@ use axum::http::Method;
 use serde_json::{json, Value};
 use zend_vfs::JobStatus;
 
+use super::job::source::agent_miss::{miss, Miss};
 use super::repo_job::{host_of, lost, state, Handle};
 use crate::mcp::ops::{self, json_of};
 use crate::mcp::ops_tools::OpsCall;
@@ -37,6 +38,10 @@ pub mod status;
 
 /// The services keep runs.
 pub const SERVICES: [&str; 5] = ["motherd", "web", "mcp", "yenbot", BATTLECITIES];
+
+/// What a deploy is said to build while neither its agent, which is
+/// restarting, nor keep's board, which has no trial of it yet, can name it.
+pub const UNNAMED_SERVICE: &str = "its service";
 
 /// The Battle Cities game server (`docs/battlecities_app.md`).
 pub const BATTLECITIES: &str = "battlecities";
@@ -286,8 +291,16 @@ pub async fn resolve(
             let state = keep(call, Method::GET, KEEP_STATE, &host, None)
                 .await
                 .map_err(|k| format!("{}; and {k}", lost(handle, &e)))?;
-            let (service, stage) =
-                trial_in(handle, &state).ok_or_else(|| untraced(handle, &host, &e))?;
+            // No trial on the board: untraced only when an agent that serves
+            // says it holds no such build. One restarting may still hold it, or
+            // may have parked it on keep (`docs/jobs.md` §6.1).
+            let (service, stage) = match trial_in(handle, &state) {
+                Some(found) => found,
+                None => match miss(agents, handle.node, &e).await {
+                    Miss::Restarting => (UNNAMED_SERVICE, Stage::Building),
+                    Miss::NotHeld | Miss::Failed => return Err(untraced(handle, &host, &e)),
+                },
+            };
             return Ok(Deploy {
                 handle: handle.clone(),
                 host,

@@ -11,7 +11,7 @@ use super::super::{shifted, JobHandle, Standing};
 use super::build::{self, agents, summary_text};
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::tools::cluster_status::ago;
-use crate::mcp::tools::repo_job::{lost, phase, span, Handle};
+use crate::mcp::tools::repo_job::{phase, span, Handle};
 use crate::mcp::tools::service::{
     keep, resolve, Deploy, Stage, KEEP_CANCEL, KEEP_LOG, PROOF_WINDOW_MS,
 };
@@ -34,12 +34,15 @@ fn tried(d: &Deploy) -> bool {
 
 /// `ask` of the build's log: empty once the agent no longer holds the job
 /// ([`Deploy::build`]), so the deploy's output is then the marker and the
-/// trial's log.
+/// trial's log. A read that fails after the deploy was resolved — the trial's
+/// restart taking the agent between the two calls — reads the same way: keep's
+/// board answers for the deploy, never the agent's absence (`docs/jobs.md`
+/// §6.1).
 async fn build_log(call: &OpsCall, d: &Deploy, ask: &LogAsk) -> Result<LogRead, String> {
     if d.build.is_none() {
         return Ok(LogRead::default());
     }
-    build::read(call, &d.handle, ask).await
+    Ok(build::read(call, &d.handle, ask).await.unwrap_or_default())
 }
 
 /// What a deploy whose build job is gone says of its build.
@@ -253,7 +256,7 @@ pub async fn cancel(call: &OpsCall, job: &JobHandle, h: &Handle) -> Answer {
                 "Cancelled {job}: its build of {} on {} is stopped, and nothing will be tried.",
                 d.service, d.host
             )),
-            Err(e) => Answer::error(lost(h, &e)),
+            Err(e) => Answer::error(build::read_missed(&agents, h, &e).await),
         },
         Stage::Trying(_) => {
             let body = json!({"service": d.service});

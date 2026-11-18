@@ -166,7 +166,11 @@ tried.
 
 ### 6.1 A job across its agent's restart
 
-**Status: designed, not built** (2026-11-19).
+**Status: built** (2026-11-19, `zend/src/mcp/tools/job/source/agent_miss.rs`).
+The classification is tested on its own (`only_a_serving_agents_404_is_a_lost_job`);
+the agent client has no seam a scripted agent could stand behind, so the
+end-to-end cases below are covered by that classification and the callers
+that route every miss through it.
 
 **What went wrong.** On 2026-11-19, `job_status` on the deploy of 8088a2457 to
 BlackWorld (`deploy:76c3a0f4d39bd9db:MGignEd3tEg`) answered *"the agent refused

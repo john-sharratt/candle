@@ -16,6 +16,7 @@ use super::{JobHandle, Standing};
 use crate::mcp::ops_tools::OpsCall;
 use crate::mcp::tools::Answer;
 
+pub mod agent_miss;
 pub mod build;
 pub mod cluster;
 pub mod deploy;
