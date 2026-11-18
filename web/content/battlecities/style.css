@@ -141,3 +141,64 @@ aside,
 .about a {
     color: #c98a3e;
 }
+
+/* Legal pages */
+
+.legal {
+    max-width: 70ch;
+    margin: 2.5rem auto;
+    padding: 0 1.25rem 3rem;
+}
+
+.legal .back {
+    margin-bottom: 2rem;
+}
+
+.legal .back a {
+    color: #c98a3e;
+    text-decoration: none;
+}
+
+.legal .back a:hover {
+    text-decoration: underline;
+}
+
+.legal .date {
+    font-style: italic;
+    color: #888;
+    margin-bottom: 1.5em;
+}
+
+.legal h2 {
+    margin-top: 2em;
+}
+
+.legal ol {
+    padding-left: 1.5em;
+}
+
+.legal code {
+    background: #333;
+    padding: 0.15em 0.4em;
+    border-radius: 3px;
+    font-size: 0.9em;
+}
+
+/* Footer */
+
+.site-footer {
+    max-width: 34rem;
+    margin: 2rem auto;
+    padding: 1.5rem 1.25rem;
+    border-top: 1px solid #333;
+    font-size: 0.85em;
+    color: #888;
+}
+
+.site-footer p {
+    margin: 0.3em 0;
+}
+
+.site-footer a {
+    color: #c98a3e;
+}
