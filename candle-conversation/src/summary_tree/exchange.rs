@@ -170,6 +170,20 @@ pub fn exchange_of(couplings: &Couplings, total: usize, i: usize) -> Range<usize
     start..end + 1
 }
 
+/// The exchange the turn after a timeline's `total` `Normal` turns continues:
+/// the newest exchange when its last turn couples into that next turn — which
+/// is then the tool output of the newest turn's calls — and empty when the next
+/// turn opens an exchange of its own (a new user message).
+///
+/// A coupling is written after the tools return and before the response turn is
+/// submitted, so while that turn is in flight it already reads as continuing.
+pub fn continued_exchange(couplings: &Couplings, total: usize) -> Range<usize> {
+    match total.checked_sub(1) {
+        Some(last) if couplings.contains(&(last as u32)) => exchange_of(couplings, total, last),
+        _ => 0..0,
+    }
+}
+
 /// Whether an exchange is **settled** — a later `Normal` turn already exists
 /// beyond it, so it can never grow and its leaf is safe to seal.
 ///
@@ -302,6 +316,27 @@ mod tests {
         for i in 1..=3 {
             assert_eq!(exchange_of(&c, 4, i), 1..4, "expanding from {i}");
         }
+    }
+
+    /// The turn in flight after a call turn is its tool output, so it continues
+    /// the whole run of round-trips that led to the call.
+    #[test]
+    fn a_coupled_newest_turn_is_continued_with_its_run() {
+        // #0 a past answer; #1–#3 a request's rounds, #3 calling a tool.
+        assert_eq!(continued_exchange(&couplings(&[1, 2, 3]), 4), 1..4);
+    }
+
+    /// A newest turn that called nothing ends its request: the turn after it is
+    /// a new user message and continues nothing.
+    #[test]
+    fn an_uncoupled_newest_turn_is_not_continued() {
+        assert_eq!(continued_exchange(&couplings(&[1, 2]), 4), 0..0);
+        assert_eq!(continued_exchange(&couplings(&[]), 1), 0..0);
+    }
+
+    #[test]
+    fn no_turns_continue_nothing() {
+        assert_eq!(continued_exchange(&couplings(&[]), 0), 0..0);
     }
 
     #[test]

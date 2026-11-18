@@ -102,7 +102,7 @@ use crate::provenance::chunk_exclusion::ChunkExclusion;
 use crate::provenance::SigWindow;
 use crate::scheduler::profile;
 use crate::summary_tree::exchange::Couplings;
-use crate::summary_tree::exchange::{exchanges, over_normals};
+use crate::summary_tree::exchange::{continued_exchange, exchanges, over_normals};
 use crate::summary_tree::{
     select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
     TurnKind, MERGE_FANOUT,
@@ -552,6 +552,18 @@ pub struct Substrate {
 /// reasoning about waves while the clock actually ran on publishes, which made
 /// the window unreachable and the demote silently inert.
 pub const IDLE_DEMOTE_GRACE_EPOCHS: u64 = 16;
+
+/// How many of a request's newest rounds keep their reasoning in its next
+/// projection ([`Substrate::reasoning_turns`]).
+///
+/// The model's template keeps every round's reasoning since the user's message;
+/// a cap keeps a long tool loop from carrying all of it. Measured 2026-11-18
+/// (conversation `yenbot-employee-lifecycle/anonymous-demo-mode`): with one
+/// round kept, a 27-round loop re-derived its plan from scratch every round —
+/// 300 to 6,000 tokens of thinking each — and saved the same note six times.
+/// Eight rounds hold a plan across a typical read-then-edit stretch at about
+/// 2K tokens of thinking a round, ~16K in all, inside the dialogue's share.
+pub const REASONING_ROUNDS: usize = 8;
 
 /// The scheduler's publisher id for [`ResidenceSlab::publish_pins`].
 const SCHEDULER_PINS: u64 = 0;
@@ -3999,19 +4011,38 @@ impl Substrate {
     /// a head turn and every turn its tool round-trips coupled after it
     /// ([`exchanges`]). A summary node is in none.
     pub fn exchanges_of(&self, timeline: TimelineId) -> Vec<Vec<TurnIndex>> {
-        let total = self.turn_count(timeline);
-        let normals: Vec<TurnIndex> = (0..total)
+        let normals = self.normals_of(timeline);
+        let couplings = over_normals(&self.couplings_of(timeline), &normals);
+        exchanges(&couplings, normals.len())
+            .into_iter()
+            .map(|r| r.map(|pos| normals[pos]).collect())
+            .collect()
+    }
+
+    /// The turns of `timeline` whose reasoning its next projection keeps: the
+    /// newest [`REASONING_ROUNDS`] rounds of the request its next turn
+    /// continues ([`continued_exchange`]), oldest first. Empty when the next turn
+    /// is a new user message — a finished request's reasoning is not carried
+    /// into the next one (`docs/thinking_span_projection.md` §6.3).
+    pub fn reasoning_turns(&self, timeline: TimelineId) -> Vec<TurnIndex> {
+        let normals = self.normals_of(timeline);
+        let couplings = over_normals(&self.couplings_of(timeline), &normals);
+        let request = continued_exchange(&couplings, normals.len());
+        let from = request
+            .start
+            .max(request.end.saturating_sub(REASONING_ROUNDS));
+        normals[from..request.end].to_vec()
+    }
+
+    /// `timeline`'s `Normal` turns in order: every turn but its summary nodes.
+    fn normals_of(&self, timeline: TimelineId) -> Vec<TurnIndex> {
+        (0..self.turn_count(timeline))
             .map(TurnIndex)
             .filter(|idx| {
                 !self
                     .tree_meta_of(timeline, *idx)
                     .is_some_and(|m| m.kind.is_summary())
             })
-            .collect();
-        let couplings = over_normals(&self.couplings_of(timeline), &normals);
-        exchanges(&couplings, normals.len())
-            .into_iter()
-            .map(|r| r.map(|pos| normals[pos]).collect())
             .collect()
     }
 
@@ -8550,6 +8581,51 @@ mod tests {
     /// return the same id — two "different" timelines then share their turns.
     fn unshared_timeline(n: u64) -> TimelineId {
         TimelineId::from_raw((1 << 62) | n).expect("non-zero timeline id")
+    }
+
+    /// A dialogue of `turns` turns, each of `coupled` calling a tool the next
+    /// turn answers.
+    fn dialogue(turns: u32, coupled: &[u32]) -> (Substrate, TimelineId) {
+        let mut sub = Substrate::new();
+        let timeline = unshared_timeline(31);
+        sub.register_timeline(timeline, LayerId::for_test(1), GroupId::for_test(1));
+        for _ in 0..turns {
+            sub.append_with_blocks(timeline, 10, 0, 1);
+        }
+        for &from in coupled {
+            sub.couple_turn(timeline, from, RecordIdentity::NONE);
+        }
+        (sub, timeline)
+    }
+
+    /// While a tool loop runs, the turn in flight continues it: the loop's
+    /// rounds keep their reasoning, the request before it does not.
+    #[test]
+    fn a_running_tool_loop_keeps_its_rounds_reasoning() {
+        // #0–#1 a finished request; #2 the user's message, calling; #3 calling.
+        let (sub, timeline) = dialogue(4, &[2, 3]);
+        assert_eq!(
+            sub.reasoning_turns(timeline),
+            vec![TurnIndex(2), TurnIndex(3)]
+        );
+    }
+
+    /// A long loop keeps only its newest `REASONING_ROUNDS` rounds.
+    #[test]
+    fn a_long_tool_loop_keeps_its_newest_rounds() {
+        let coupled: Vec<u32> = (0..12).collect();
+        let (sub, timeline) = dialogue(12, &coupled);
+        let kept: Vec<TurnIndex> = (4..12).map(TurnIndex).collect();
+        assert_eq!(REASONING_ROUNDS, 8);
+        assert_eq!(sub.reasoning_turns(timeline), kept);
+    }
+
+    /// A newest turn that called nothing finished its request: the next turn
+    /// is a new user message, and no reasoning is carried into it.
+    #[test]
+    fn a_finished_request_keeps_no_reasoning() {
+        let (sub, timeline) = dialogue(4, &[1, 2]);
+        assert_eq!(sub.reasoning_turns(timeline), Vec::<TurnIndex>::new());
     }
 
     /// A lift multiplies a scored turn, gives an unscored one what its reads

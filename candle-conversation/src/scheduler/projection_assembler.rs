@@ -1344,7 +1344,13 @@ pub(super) fn apply_segments_build(
     //    NewUserMessage is deferred to prefill after the gaps are filled.
     // The glue/order decision is owned by `assemble_pieces` (the single source
     // of truth, shared with the substrate debug view).
-    let mut walker = SegmentWalker::new(ctx.conversation);
+    // The turns that go in with their reasoning, read once for the whole walk:
+    // the newest rounds of the request the slot's next turn continues.
+    let reasoning = match ctx.slot_target {
+        Some(t) => ctx.conversation.read().reasoning_turns(t.timeline),
+        None => Vec::new(),
+    };
+    let mut walker = SegmentWalker::new(ctx.conversation, reasoning);
     // A sealed turn's `/no_think` switch needs no look-up here: it is baked into
     // the turn's own grid, so injecting the turn injects the switch it was
     // sealed with. Its ROLE MARKERS do need one: a turn sealed before the
@@ -1382,20 +1388,9 @@ pub(super) fn apply_segments_build(
         let _g = profile::span("apply:identities");
         let read = ctx.conversation.read();
         let slot_timeline = ctx.slot_target.map(|t| t.timeline);
-        let mut newest: HashMap<TimelineId, Option<TurnIndex>> = HashMap::new();
-        for piece in &pieces {
-            if let AssembledPiece::Turn {
-                timeline: Some(tl), ..
-            } = piece
-            {
-                newest
-                    .entry(*tl)
-                    .or_insert_with(|| read.turn_indices(*tl).max());
-            }
-        }
-        let whole = |tl: TimelineId, idx: TurnIndex| {
-            keeps_reasoning(slot_timeline, tl, newest.get(&tl).copied().flatten(), idx)
-        };
+        let reasoning = &walker.reasoning;
+        let whole =
+            |tl: TimelineId, idx: TurnIndex| keeps_reasoning(slot_timeline, tl, reasoning, idx);
         let stamp = |id: SectionId| section_content_stamp(&read.section_tokens_of(id));
         let causal_only = ctx.boundary_markers.causal_only_glue;
         let bridge = |next: Option<&AssembledPiece>| {
@@ -1980,6 +1975,9 @@ struct SegmentWalker<'c> {
     /// Where a splice is putting pieces in, while one is (`apply_edit`); the
     /// slot's tail otherwise.
     insert: Option<InsertCursor>,
+    /// The slot's own turns that go in with their reasoning
+    /// ([`Substrate::reasoning_turns`]); every other turn is windowed.
+    reasoning: Vec<TurnIndex>,
 }
 
 /// An edit's insertion point and what its pieces bring that is placed after
@@ -1993,7 +1991,7 @@ struct InsertCursor {
 }
 
 impl<'c> SegmentWalker<'c> {
-    fn new(conversation: &'c Conversation) -> Self {
+    fn new(conversation: &'c Conversation, reasoning: Vec<TurnIndex>) -> Self {
         Self {
             glue_tokens: Vec::new(),
             glue_write_slice: Vec::new(),
@@ -2021,6 +2019,7 @@ impl<'c> SegmentWalker<'c> {
             turn_pages_us: 0,
             placed_page: None,
             insert: None,
+            reasoning,
         }
     }
 
@@ -2325,22 +2324,22 @@ fn inject_sealed_section(
 
 /// Whether a selected turn may be injected WHOLE, reasoning included.
 ///
-/// Exactly one turn in a projection may: the newest turn of the timeline the
-/// slot is continuing. Every other turn — older turns of the same
-/// conversation, and every turn borrowed from another one — goes in with its
-/// `<think>` span windowed out.
+/// Only the slot's own rounds of the request it is continuing may — `reasoning`,
+/// from [`Substrate::reasoning_turns`]. Every other turn — the slot's finished
+/// requests, and every turn borrowed from another conversation — goes in with
+/// its `<think>` span windowed out.
 ///
 /// `slot_timeline` is `None` for a projection with no slot identity (mocks,
-/// structural callers). That cannot be "the turn this slot is continuing", so
-/// nothing keeps its reasoning — the safe direction, since windowing only ever
-/// removes reasoning from the context.
+/// structural callers). That continues no request, so nothing keeps its
+/// reasoning — the safe direction, since windowing only ever removes reasoning
+/// from the context.
 fn keeps_reasoning(
     slot_timeline: Option<TimelineId>,
     turn_timeline: TimelineId,
-    newest_of_turn_timeline: Option<TurnIndex>,
+    reasoning: &[TurnIndex],
     index: TurnIndex,
 ) -> bool {
-    slot_timeline == Some(turn_timeline) && newest_of_turn_timeline == Some(index)
+    slot_timeline == Some(turn_timeline) && reasoning.contains(&index)
 }
 
 fn inject_sealed_turn(
@@ -2378,22 +2377,17 @@ fn inject_sealed_turn(
     // re-reading it, and the ingest write path (adopt/couple/mint) had a writer
     // queued, so writer-priority refused the second read forever. `turn_sealed_of`
     // returns an owned `Arc`, so the early drop is free.
-    // **The rule: the most recent turn goes in whole, every older one with its
-    // reasoning windowed out.** Positional and nothing else — no mode, no flag,
-    // no tool state. A turn's reasoning is therefore attendable in exactly one
-    // subsequent projection, which is what lets a tool call's follow-up turn
-    // decode against the thinking that produced the call without anything here
-    // knowing a tool was involved.
+    // **The rule: the newest rounds of the request the slot is continuing go in
+    // whole, every other turn with its reasoning windowed out**
+    // (`Substrate::reasoning_turns`, `docs/thinking_span_projection.md` §6.3).
+    // The request is read off the turn couplings — no mode, no flag, no tool
+    // state — so a tool loop decodes against the thinking that planned it, and
+    // a new user message starts with none.
     //
     // **By turn index, not by position in the piece walk.** Groups emit in score
     // order with the highest last, so a tool-scope or repo_map group can emit
     // turns after the conversation group's — the last `Turn` piece is not
-    // reliably the most recent turn. The comparison always finds it because the
-    // conversation group's recent window is inviolate.
-    //
-    // (Known and accepted: an async summary appended between a tool call and its
-    // result takes the highest index, and the call turn is then windowed a turn
-    // early. See `docs/thinking_span_projection.md` §6.3 before adding a clause.)
+    // reliably the most recent turn.
     //
     // The rows come from the turn's stored record: its bytes while the
     // substrate still holds them, a slot's held copy while one places the turn
@@ -2421,45 +2415,30 @@ fn inject_sealed_turn(
         lock.end();
         fetch.end();
         let _window = profile::span("inject:turn:window");
-        // **"Most recent" is the SLOT's most recent, not each timeline's.**
-        //
-        // A projection can span timelines — retrieval pulls in other
-        // conversations' turns, and a forked conversation inherits its
-        // ancestors' (`Substrate::inherited_chain`). `turn_indices(timeline)`
-        // answers "newest turn of ITS OWN timeline", so every foreign
-        // conversation contributed its last turn whole, reasoning included,
-        // and the rule above — reasoning attendable in exactly ONE subsequent
-        // projection — silently became "one per timeline".
-        //
-        // The model then reads someone else's `<think>` as its own most recent
-        // thought. Measured: an inherited block reading "The user wants me to
-        // read ARCHITECTURE.md — I already have lines 1-200 from a previous
-        // read" made the next conversation skip its own `file_read` and
-        // summarise the wrong file, and made a dialogue answer that inherited
-        // instruction instead of the question it was asked.
-        //
-        // Only the turn the slot is actually continuing may keep its
-        // reasoning. Single-timeline projections are unaffected: there the
-        // target IS the only timeline, which is the case this rule was written
-        // for and still behaves exactly as before.
-        let newest_span = profile::span("inject:turn:newest_index");
-        let newest = conv.turn_indices(timeline).max();
-        newest_span.end();
-        let resolved =
-            if keeps_reasoning(ctx.slot_target.map(|t| t.timeline), timeline, newest, index) {
-                let _g = profile::span("inject:turn:sealed_whole");
-                (conv.turn_sealed_of(timeline, index), stored)
-            } else {
-                let _g = profile::span("inject:turn:without_thinking");
-                // An `Err` here is a turn whose reasoning cannot be windowed. It is
-                // propagated rather than skipped: injecting it whole would show the
-                // reasoning the projection was asked to remove, and skipping it would
-                // silently drop a turn the selection chose.
-                match conv.turn_sealed_without_thinking(timeline, index, stored)? {
-                    Some((kv, page)) => (Some(kv), page),
-                    None => (None, None),
-                }
-            };
+        // **Only the SLOT's own request keeps reasoning, never another
+        // timeline's.** A projection can span timelines — retrieval pulls in
+        // other conversations' turns, and a forked conversation inherits its
+        // ancestors' (`Substrate::inherited_chain`) — and the model reads any
+        // `<think>` it is shown as its own. Measured: an inherited block reading
+        // "The user wants me to read ARCHITECTURE.md — I already have lines
+        // 1-200 from a previous read" made the next conversation skip its own
+        // `file_read` and summarise the wrong file, and made a dialogue answer
+        // that inherited instruction instead of the question it was asked.
+        let slot_timeline = ctx.slot_target.map(|t| t.timeline);
+        let resolved = if keeps_reasoning(slot_timeline, timeline, &walker.reasoning, index) {
+            let _g = profile::span("inject:turn:sealed_whole");
+            (conv.turn_sealed_of(timeline, index), stored)
+        } else {
+            let _g = profile::span("inject:turn:without_thinking");
+            // An `Err` here is a turn whose reasoning cannot be windowed. It is
+            // propagated rather than skipped: injecting it whole would show the
+            // reasoning the projection was asked to remove, and skipping it would
+            // silently drop a turn the selection chose.
+            match conv.turn_sealed_without_thinking(timeline, index, stored)? {
+                Some((kv, page)) => (Some(kv), page),
+                None => (None, None),
+            }
+        };
         walker.turn_window_us += t_window.elapsed().as_micros() as u64;
         resolved
     };
@@ -3367,7 +3346,7 @@ pub(super) fn apply_segments_finish(
     // inject when there is no glue), so the user message must push a fresh writer
     // chunk rather than extend it — `last_was_sealed = true` unconditionally.
     if let Some(tokens) = deferred_user {
-        let mut walker = SegmentWalker::new(ctx.conversation);
+        let mut walker = SegmentWalker::new(ctx.conversation, Vec::new());
         walker.last_was_sealed = true;
         handle_new_user_message(state, ctx, &mut walker, &tokens)?;
     }
@@ -3623,55 +3602,43 @@ layers:
         assert_eq!(reasons, [Some(SelectionOrigin::Seed)]);
     }
 
-    /// The turn the slot is continuing keeps its reasoning — the ordinary
-    /// single-conversation case, unchanged.
+    /// Every round of the request the slot is continuing keeps its reasoning.
     #[test]
-    fn the_slots_own_newest_turn_keeps_its_reasoning() {
+    fn the_slots_request_rounds_keep_their_reasoning() {
         let slot = tl(7);
-        assert!(keeps_reasoning(
-            Some(slot),
-            slot,
-            Some(TurnIndex(4)),
-            TurnIndex(4)
-        ));
+        let request = [TurnIndex(2), TurnIndex(3), TurnIndex(4)];
+        for idx in request {
+            assert!(keeps_reasoning(Some(slot), slot, &request, idx), "{idx:?}");
+        }
     }
 
     #[test]
-    fn an_older_turn_of_the_slots_own_conversation_is_windowed() {
+    fn a_turn_of_a_finished_request_is_windowed() {
         let slot = tl(7);
-        assert!(!keeps_reasoning(
-            Some(slot),
-            slot,
-            Some(TurnIndex(4)),
-            TurnIndex(2)
-        ));
+        let request = [TurnIndex(3), TurnIndex(4)];
+        assert!(!keeps_reasoning(Some(slot), slot, &request, TurnIndex(1)));
     }
 
     /// **The regression this guards.** A projection that spans timelines —
     /// retrieval, or a forked conversation inheriting its ancestors — must not
-    /// let a borrowed conversation's last turn arrive with its reasoning. Read
-    /// as the slot's own most recent thought, an inherited "I already read that
-    /// file" makes the next turn skip its own work.
+    /// let a borrowed conversation's turn arrive with its reasoning. Read as the
+    /// slot's own thought, an inherited "I already read that file" makes the
+    /// next turn skip its own work.
     #[test]
-    fn an_inherited_conversations_newest_turn_is_windowed() {
+    fn another_timelines_turn_is_windowed_at_the_same_index() {
         let slot = tl(7);
         let ancestor = tl(3);
         assert!(
-            !keeps_reasoning(Some(slot), ancestor, Some(TurnIndex(1)), TurnIndex(1)),
-            "the newest turn of a FOREIGN timeline is not the slot's live turn",
+            !keeps_reasoning(Some(slot), ancestor, &[TurnIndex(1)], TurnIndex(1)),
+            "an index of the slot's request names no FOREIGN turn",
         );
     }
 
-    /// With no slot identity there is no turn being continued, so nothing keeps
-    /// its reasoning — windowing is the safe direction.
+    /// With no slot identity there is no request being continued, so nothing
+    /// keeps its reasoning — windowing is the safe direction.
     #[test]
     fn without_a_slot_target_nothing_keeps_its_reasoning() {
-        assert!(!keeps_reasoning(
-            None,
-            tl(3),
-            Some(TurnIndex(1)),
-            TurnIndex(1)
-        ));
+        assert!(!keeps_reasoning(None, tl(3), &[TurnIndex(1)], TurnIndex(1)));
     }
 
     /// The island cache's retention contract: an entry survives exactly

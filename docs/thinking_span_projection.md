@@ -19,16 +19,17 @@ because both were reasoned to the wrong answer first:
 
 ## 1. The rule
 
-> **A turn seals with everything it decoded. At projection, the most recent
-> turn is injected whole; every older turn is injected with its
-> `<think>…</think>` span windowed out of the K/V.**
+> **A turn seals with everything it decoded. At projection, the newest
+> `REASONING_ROUNDS` (8) rounds of the request the slot is continuing are
+> injected whole; every other turn is injected with its `<think>…</think>` span
+> windowed out of the K/V.**
 
-That is the entire design. It is positional — a function of a turn's distance
-from the end of the conversation — and nothing else. No mode, no flag, no tool
-state, no conversation type.
+The request is read off the turn couplings (§6.3): the run of tool round-trips
+the turn in flight continues, and nothing when that turn is a new user message.
+No mode, no flag, no tool state, no conversation type.
 
-A turn's reasoning is therefore visible in exactly one subsequent projection
-and never again.
+A turn's reasoning is therefore visible for the rest of its request, up to eight
+rounds, and never after the request has been answered.
 
 ---
 
@@ -51,9 +52,10 @@ Three problems, which until now had three different mechanisms:
 3. **Sealed bytes are the long-term record.** Whatever is sealed is what every
    future projection, summary, and fork sees.
 
-The rule solves all three at once. (2) falls out for free: the turn carrying
-the tool call *is* the previous turn when the result is decoded, so its
-reasoning is projected without anything having to know a tool was involved.
+The rule solves all three at once. (2) falls out of the couplings: the turn
+carrying the tool call is coupled to the result turn before that turn is
+submitted, so its reasoning is projected while the result is decoded, and the
+reasoning of every round before it in the same request stays with it.
 
 ---
 
@@ -459,56 +461,39 @@ Accepting it is the right call:
   is no hidden state to correct. Stripping the K/V is the closest achievable
   analogue, and chasing the fold pursues a fidelity the reference never had.
 
-### 6.3 Why one turn, and not "since the last user query"
+### 6.3 The request's rounds, capped at eight
 
 The Qwen chat template's `last_query_index` keeps thinking for every message
 after the last genuine user query, and a `<tool_response>`-wrapped user message
 does not count as one. That preserves reasoning across an entire multi-step tool
-loop.
+loop, and drops it once the request is answered.
 
-One-turn-back reproduces this **exactly** for the common shape —
-`think → call → result → answer` — because the answer turn's predecessor is the
-call turn. At three or more tool steps it loses the oldest step's reasoning
-while retaining that step's prose and every intermediate result. That is a
-graceful degradation, not a failure.
+**The request is read off the couplings, not off tool state**
+(`Substrate::reasoning_turns`, `summary_tree::exchange::continued_exchange`).
+zend couples a call turn to the next turn after the tools return and before it
+submits their output (`docs/archived/immutable_summary_forest.md`, *Exchanges*),
+so while that output turn is in flight the newest sealed turn is already
+coupled. The turns joined to it by couplings — the newest exchange — are the
+request's rounds so far. A newest turn with no coupling answered its request:
+the turn in flight is a new user message, and no reasoning is carried into it.
+Couplings are taken over `Normal` turns, so an asynchronous summary appended
+between a call and its result does not cut the run.
 
-Making it exact would mean the rule reading "keep thinking for turns after the
-last non-tool user message" — which puts tool awareness back into the projection
-layer to buy fidelity in a case that degrades gracefully anyway. The trade is
-not worth the coupling. **This is the design's central simplicity decision and
-the one most likely to be revisited under pressure; revisit it only with a
-measured failure, never with a hypothetical one.**
+**Capped at the newest `REASONING_ROUNDS` = 8 rounds.** The template keeps all of
+them; a long loop carrying every round's thinking would fill the dialogue's
+share with reasoning. Eight rounds hold a plan across a typical read-then-edit
+stretch at about 2K tokens of thinking a round — ~16K in all, inside the
+dialogue's 60% of the room (`docs/hit_driven_projection.md` §7.2).
 
-Long agentic loops are where the degradation stops being graceful: a loop of
-many steps keeps each step's calls and loses why it made them. The answer
-leaves this rule as it is and gives the conclusions somewhere to live outside
-the `<think>` span. A turn that opens a tool call first writes a
-`journal_note`, which is visible text and so survives the windowing
-(`docs/zend_journal.md` §5.2).
-
-#### The second known degradation: a summary in the window
-
-An asynchronous summary turn can be appended between a call turn's seal and its
-result turn's submit, and it takes the highest turn index when it does. §8.6's
-rule then windows the call turn, and the result decodes without the reasoning
-that motivated the call — keeping the `<tool_call>` and the `<tool_response>`,
-losing the motivation.
-
-This is not hypothetical, and it is not new to this design: the tool loop
-already defends against exactly it, and says so —
-
-> *"Couple the call turn by its OWN sealed index (`resp.seal.turn_index`), never
-> by 'the last turn': the async summariser can append a summary turn in this
-> window, so the newest index may not be the call turn."*
-> — `zend/src/session.rs:2831`
-
-It is recorded rather than fixed, for the reason above. Every repair is a second
-clause: "highest index that is not a summary" needs the projection to ask what
-kind a turn is, and no reformulation avoids it, because the summary genuinely
-*was* appended between the two turns. It also self-limits — a summary only lands
-here in a session already under compression pressure, and the loss is one tool
-call's motivation. **Do not fix this without a measured failure**; note it here
-so the next reader knows it was seen, not missed.
+**Measured, 2026-11-18.** The rule this replaced kept one turn: the newest
+sealed turn of the slot's timeline. A 27-round worker loop
+(`yenbot-employee-lifecycle/anonymous-demo-mode`) lost each round's plan two
+rounds later. From round 17 on, every round re-derived the same plan from
+scratch (300 to 6,000 tokens of thinking), saved the same conclusion with
+`journal_note` six times — the visible-text workaround that rule relied on
+(`docs/zend_journal.md` §5.2) — re-ran a search it had already run, and never
+began the edits; at round 26 it wrote "I've been going in circles" and noted
+the finding again.
 
 ### 6.4 Why not seal twice, or tombstone and reseal
 
@@ -522,10 +507,11 @@ from position alone.
 
 ### 6.5 The storage property
 
-Every turn now seals its reasoning K/V, and that K/V is read by exactly one
-subsequent projection. Reasoning bytes therefore accumulate in the substrate and
-are, after one turn, cold. This is correct and cheap — sealed K/V is compressed
-and tiered to NVMe — and it is what makes the one-turn window possible at all.
+Every turn now seals its reasoning K/V, and that K/V is read only while its
+request runs. Reasoning bytes therefore accumulate in the substrate and are,
+once the request is answered, cold. This is correct and cheap — sealed K/V is
+compressed and tiered to NVMe — and it is what makes the request window possible
+at all.
 It is a property of the design, not a leak.
 
 ### 6.6 Why the cut is exact, and not rounded to row boundaries
@@ -953,19 +939,18 @@ match: the page boundary and the `KvSpan` are the same grid position, from 8.1.
 
 ### 8.6 The projection rule
 
-In the segment walk, a `SealedKind::Turn` injects whole when it is the highest
-turn index on the slot's own target timeline, and windowed otherwise.
+In the segment walk, a `SealedKind::Turn` injects whole when it is on the slot's
+own target timeline and among `Substrate::reasoning_turns` of it (§6.3), read
+once per walk; it is windowed otherwise (`projection_assembler::keeps_reasoning`).
 
 **By turn index, not by position in the piece list.** Groups emit in score order
 with the highest last (`project.rs:1682`), so a tool-scope or repo_map group can
 emit turns after the conversation group's — the last `Turn` piece in the walk is
-not reliably the most recent turn. The index comparison always finds it, because
-the conversation group's recent window is inviolate (`selection.rs:238`) and so
-the predecessor is always selected.
+not reliably the most recent turn.
 
-The one case where the highest index is not the turn you want — an async summary
-appended between a tool call and its result — is a known, accepted degradation.
-Read §6.3 before adding a clause for it.
+**Never another timeline's turn.** A turn borrowed by retrieval or inherited
+from an ancestor is windowed whatever its index: the model reads any `<think>`
+it is shown as its own.
 
 ### 8.7 The coverage gate
 
@@ -1152,8 +1137,11 @@ and one tokeniser round trip.
 - **The tool round trip carries its reasoning.** A `think → call → result →
   answer` exchange where the answer depends on a fact stated only inside the
   call turn's reasoning.
-- **The turn after that does not.** The same conversation one turn later:
-  the fact is no longer attendable.
+- **The next request does not.** The same conversation after a new user
+  message: the fact is no longer attendable.
+- **A long loop keeps its newest eight rounds.** In a loop of more than
+  `REASONING_ROUNDS` rounds, a fact stated only in the oldest round's reasoning
+  is no longer attendable; one in the eighth-newest still is.
 - **Recall of the fold.** A probe asking about something stated *only* inside a
   windowed-out reasoning block, several turns later. The GDN state saw it and
   cannot forget it (§6.2), so a positive result here is expected and is not a
