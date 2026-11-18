@@ -1341,19 +1341,22 @@ impl Qwen4ExpBatched {
             return Ok(layers);
         }
         let _place = span("qsa:page:decode_place");
-        let (_, sealed) = paged_index::decode_aux(blob)?;
-        if sealed.len() != want {
+        // Only the layers to place are decoded: a container holds every layer,
+        // and the pool places the sampled few.
+        let (_, sections) = paged_index::aux_parts(blob)?;
+        if sections.len() != want {
             candle::bail!(
                 "qwen4exp: an injected piece carries {} index pages but this checkpoint has \
                  {want} KV layers — the layers it does not cover would select against an \
                  empty candidate set",
-                sealed.len()
+                sections.len()
             );
         }
-        let host: Vec<(&Q8Keys, usize)> = missing
+        let sealed: Vec<SealedIndex> = missing
             .iter()
-            .map(|&kv| (&sealed[kv].keys, sealed[kv].last_cells))
-            .collect();
+            .map(|&kv| paged_index::decode_page(sections[kv]))
+            .collect::<Result<_>>()?;
+        let host: Vec<(&Q8Keys, usize)> = sealed.iter().map(|s| (&s.keys, s.last_cells)).collect();
         let placed: Vec<(usize, Arc<ResidentPage>)> = missing
             .iter()
             .copied()
@@ -1393,13 +1396,15 @@ impl Qwen4ExpBatched {
             return Ok(0);
         }
         let d = self.model.cfg.indexer.head_dim;
-        let (_, sealed) = paged_index::decode_aux(blob)?;
+        // Sized from the sections' headers: nothing is decoded to count it.
+        let (_, sections) = paged_index::aux_parts(blob)?;
         let slot = candle_nn::kv_cache::slot_stride(super::index_keys::key_page_bytes(d));
-        Ok(missing
-            .iter()
-            .filter_map(|&kv| sealed.get(kv))
-            .map(|s| s.n_rows().div_ceil(super::index_keys::PAGE_BLOCKS) * slot)
-            .sum())
+        let mut bytes = 0usize;
+        for section in missing.iter().filter_map(|&kv| sections.get(kv)) {
+            let rows = paged_index::section_rows(section)?;
+            bytes += rows.div_ceil(super::index_keys::PAGE_BLOCKS) * slot;
+        }
+        Ok(bytes)
     }
 
     /// Hold `blob`'s pages at the sampled layers in `seq`'s pool — a piece the

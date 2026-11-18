@@ -5,9 +5,12 @@
 //! (`reproject prepare split`, `reproject observe split`, `reproject (zero-copy
 //! rebuild)`) keep one recent instance each, which says what one looked like
 //! and nothing about where a run's time went. The census adds every part of
-//! every reprojection, by how it ended, and the scheduler writes it as one
-//! `reprojection census` line when the first reprojection to end after its
-//! minute does — one line a minute while reprojections run, none while idle.
+//! every reprojection, by how it ended, and the scheduler writes it when the
+//! first reprojection to end after its minute does — one minute's census while
+//! reprojections run, none while idle. It is two lines, short enough for a log
+//! reader to show whole: `reprojection census` with the outcomes and the
+//! prepare half (`probe` to `truncate`), and `reprojection census apply` with
+//! the apply half (`elevate` to `view`).
 
 use std::time::{Duration, Instant};
 
@@ -171,23 +174,23 @@ impl ReprojectCensus {
         at.1 += total_us;
     }
 
-    /// The census line once [`CENSUS_EVERY`] has passed since the last and a
+    /// The census's two lines — the outcomes and prepare half, then the apply
+    /// half — once [`CENSUS_EVERY`] has passed since the last and a
     /// reprojection ended in it, starting the next; `None` otherwise.
-    pub(crate) fn due(&mut self, now: Instant) -> Option<String> {
+    pub(crate) fn due(&mut self, now: Instant) -> Option<[String; 2]> {
         let window = now.saturating_duration_since(self.since);
         if window < CENSUS_EVERY {
             return None;
         }
         let ran = self.ended.iter().any(|(n, _)| *n > 0);
-        let line = ran.then(|| self.line(window));
+        let lines = ran.then(|| self.lines(window));
         *self = Self::new(now);
-        line
+        lines
     }
 
-    fn line(&self, window: Duration) -> String {
-        let ms = |us: u64| format!("{:.1}", us as f64 / 1000.0);
+    fn lines(&self, window: Duration) -> [String; 2] {
         let [rebuilt, kept, declined] = self.ended;
-        let mut out = format!(
+        let mut prepare = format!(
             "window_s={} rebuilt={} rebuilt_ms={} kept={} kept_ms={} declined={} declined_ms={}",
             window.as_secs(),
             rebuilt.0,
@@ -197,25 +200,44 @@ impl ReprojectCensus {
             declined.0,
             ms(declined.1),
         );
-        for part in Part::ALL {
-            out.push_str(&format!(
+        let mut apply = format!("window_s={}", window.as_secs());
+        let apply_from = Part::ALL
+            .iter()
+            .position(|&p| p == APPLY_FROM)
+            .unwrap_or(Part::ALL.len());
+        for (i, part) in Part::ALL.into_iter().enumerate() {
+            let line = if i < apply_from {
+                &mut prepare
+            } else {
+                &mut apply
+            };
+            line.push_str(&format!(
                 " {}_ms={}",
                 part.name(),
                 ms(self.parts_us[part as usize])
             ));
         }
-        out
+        [prepare, apply]
     }
+}
+
+/// The first part of a reprojection's apply half.
+const APPLY_FROM: Part = Part::Elevate;
+
+/// Microseconds as milliseconds to a tenth.
+fn ms(us: u64) -> String {
+    format!("{:.1}", us as f64 / 1000.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// **Every part and every outcome is in the line, summed**, in the order
-    /// a reprojection runs, in milliseconds to a tenth.
+    /// **Every part and every outcome is in the census, summed**, in the
+    /// order a reprojection runs, in milliseconds to a tenth: the outcomes and
+    /// the prepare half on the first line, the apply half on the second.
     #[test]
-    fn the_line_sums_each_part_and_outcome() {
+    fn the_lines_sum_each_part_and_outcome() {
         let t0 = Instant::now();
         let mut c = ReprojectCensus::new(t0);
         c.add(Part::Score, 120_000);
@@ -225,17 +247,19 @@ mod tests {
         c.ended(Outcome::Rebuilt, 190_000);
         c.ended(Outcome::Rebuilt, 180_000);
         c.ended(Outcome::Kept, 14_000);
+        let [prepare, apply] = c.due(t0 + CENSUS_EVERY).expect("a reprojection ended");
         assert_eq!(
-            c.due(t0 + CENSUS_EVERY).as_deref(),
-            Some(
-                "window_s=60 rebuilt=2 rebuilt_ms=370.0 kept=1 kept_ms=14.0 declined=0 \
-                 declined_ms=0.0 probe_ms=0.0 warm_ms=0.0 score_ms=260.5 hits_ms=18.3 \
-                 ws_ms=0.0 pool_ms=0.0 challenger_ms=0.0 project_ms=0.0 identity_ms=0.0 \
-                 lift_ms=0.0 gap_ms=0.0 snapshot_ms=0.0 seal_ms=0.0 move_ms=0.0 \
-                 free_view_ms=0.0 release_ms=0.0 truncate_ms=0.0 elevate_ms=0.0 \
-                 whole_ms=0.0 build_ms=0.0 glue_ms=0.0 finish_ms=0.0 inject_ms=0.0 \
-                 view_ms=4.0"
-            )
+            prepare,
+            "window_s=60 rebuilt=2 rebuilt_ms=370.0 kept=1 kept_ms=14.0 declined=0 \
+             declined_ms=0.0 probe_ms=0.0 warm_ms=0.0 score_ms=260.5 hits_ms=18.3 \
+             ws_ms=0.0 pool_ms=0.0 challenger_ms=0.0 project_ms=0.0 identity_ms=0.0 \
+             lift_ms=0.0 gap_ms=0.0 snapshot_ms=0.0 seal_ms=0.0 move_ms=0.0 \
+             free_view_ms=0.0 release_ms=0.0 truncate_ms=0.0"
+        );
+        assert_eq!(
+            apply,
+            "window_s=60 elevate_ms=0.0 whole_ms=0.0 build_ms=0.0 glue_ms=0.0 \
+             finish_ms=0.0 inject_ms=0.0 view_ms=4.0"
         );
     }
 
@@ -247,7 +271,7 @@ mod tests {
         let mut c = ReprojectCensus::new(t0);
         c.ended(Outcome::Declined, 1_000);
         assert_eq!(c.due(t0 + CENSUS_EVERY / 2), None);
-        let first = c.due(t0 + CENSUS_EVERY).expect("a reprojection ended");
+        let [first, _] = c.due(t0 + CENSUS_EVERY).expect("a reprojection ended");
         assert!(first.contains(" declined=1 declined_ms=1.0 "), "{first}");
         assert_eq!(c.due(t0 + CENSUS_EVERY * 2), None);
         c.add(Part::Glue, 5_000);

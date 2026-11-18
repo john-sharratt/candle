@@ -25,8 +25,8 @@
 use candle::{DType, Device, Result, Tensor};
 use candle_transformers::models::qwen4exp::key_q8::{blocks, Q8Keys};
 use candle_transformers::models::qwen4exp::paged_index::{
-    decode_aux, decode_page, encode_aux, encode_page, migrate_aux, AuxMigration, IndexPage,
-    PagedIndex, SealedIndex, F32_INDEX_VERSION,
+    aux_parts, decode_aux, decode_page, encode_aux, encode_page, migrate_aux, section_rows,
+    AuxMigration, IndexPage, PagedIndex, SealedIndex, F32_INDEX_VERSION,
 };
 use candle_transformers::models::rope_schedule::{plain_inv_freq, FactoredRope};
 
@@ -450,6 +450,38 @@ fn the_aux_container_round_trips_ple_and_every_page() -> Result<()> {
             "layer {i}'s open block did not survive the round trip"
         );
     }
+    Ok(())
+}
+
+/// **A container's sections are each layer's page as [`encode_page`] wrote it,
+/// byte for byte**, after its PLE bytes, and a section's header alone gives its
+/// completed rows: what lets the pool decode only the layers it places and size
+/// them without decoding any.
+#[test]
+fn the_aux_sections_are_each_layers_page_as_written() -> Result<()> {
+    let mut rng = Lcg(559);
+    let ple = [7u8, 8, 9];
+    let sealed: Vec<SealedIndex> = (0..3)
+        .map(|i| SealedIndex {
+            keys: Q8Keys::quantize(&rng.vec((3 + i) * HEAD_DIM), HEAD_DIM),
+            last_cells: 1 + i,
+            open: rng.vec(i * HEAD_DIM),
+        })
+        .collect();
+    let blob = encode_aux(&ple, &sealed)?;
+    let (ple_back, sections) = aux_parts(&blob)?;
+    assert_eq!(ple_back, &ple[..]);
+    assert_eq!(sections.len(), 3);
+    for (i, (section, layer)) in sections.iter().zip(&sealed).enumerate() {
+        assert_eq!(
+            *section,
+            &encode_page(layer)?[..],
+            "layer {i}'s section bytes"
+        );
+        assert_eq!(section_rows(section)?, 3 + i, "layer {i}'s rows");
+    }
+    let (_, decoded) = decode_aux(&blob)?;
+    assert_eq!(decode_page(sections[1])?.keys, decoded[1].keys);
     Ok(())
 }
 

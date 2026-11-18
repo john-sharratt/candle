@@ -581,6 +581,20 @@ pub fn encode_aux(ple: &[u8], layers: &[SealedIndex]) -> Result<Vec<u8>> {
 /// Read back what [`encode_aux`] wrote: the PLE bytes and one sealed index per
 /// attention layer.
 pub fn decode_aux(blob: &[u8]) -> Result<(Vec<u8>, Vec<SealedIndex>)> {
+    let (ple, sections) = aux_parts(blob)?;
+    let pages = sections
+        .into_iter()
+        .map(decode_page)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((ple.to_vec(), pages))
+}
+
+/// What [`encode_aux`] wrote, unparsed: the PLE bytes and each attention
+/// layer's section, in layer order. A reader that wants some of the layers
+/// decodes those alone ([`decode_page`]), and one that only sizes them reads
+/// their headers ([`section_rows`]): a container holds every layer, and the
+/// pool places the sampled few.
+pub fn aux_parts(blob: &[u8]) -> Result<(&[u8], Vec<&[u8]>)> {
     let u32_at = |o: usize| -> Result<u32> {
         let b = blob
             .get(o..o + 4)
@@ -601,21 +615,25 @@ pub fn decode_aux(blob: &[u8]) -> Result<(Vec<u8>, Vec<SealedIndex>)> {
     let ple_end = 8 + ple_len;
     let ple = blob
         .get(8..ple_end)
-        .ok_or_else(|| candle::Error::Msg("aux blob: PLE section truncated".into()))?
-        .to_vec();
+        .ok_or_else(|| candle::Error::Msg("aux blob: PLE section truncated".into()))?;
     let n_pages = u32_at(ple_end)? as usize;
     let mut off = ple_end + 4;
-    let mut pages = Vec::with_capacity(n_pages);
+    let mut sections = Vec::with_capacity(n_pages);
     for i in 0..n_pages {
         let len = u32_at(off)? as usize;
         off += 4;
         let section = blob
             .get(off..off + len)
             .ok_or_else(|| candle::Error::Msg(format!("aux blob: page {i} truncated")))?;
-        pages.push(decode_page(section)?);
+        sections.push(section);
         off += len;
     }
-    Ok((ple, pages))
+    Ok((ple, sections))
+}
+
+/// The completed rows a layer's section holds, from its header alone.
+pub fn section_rows(section: &[u8]) -> Result<usize> {
+    Ok(page_header(section)?.0)
 }
 
 /// A layer's completed rows and its open block: `rows, dim, last_cells, n_open`

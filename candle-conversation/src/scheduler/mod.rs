@@ -12749,10 +12749,14 @@ impl Scheduler {
             outcome,
             now.saturating_duration_since(started).as_micros() as u64,
         );
-        if let Some(census) = self.reproject_census.due(now) {
+        if let Some([prepare, apply]) = self.reproject_census.due(now) {
             tracing::info!(
                 target: "candle_conversation::scheduler::reproject",
-                "reprojection census {census}"
+                "reprojection census {prepare}"
+            );
+            tracing::info!(
+                target: "candle_conversation::scheduler::reproject",
+                "reprojection census apply {apply}"
             );
         }
     }

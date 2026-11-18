@@ -45,6 +45,11 @@ pub(super) struct PoolRefresh {
     pub read_bytes: usize,
     /// Microseconds the reads took — the `pool:index_read` span.
     pub read_us: u64,
+    /// Of `read_us`, fetching the turns' index pages — from memory when held,
+    /// off the log when cold.
+    pub fetch_us: u64,
+    /// Of `read_us`, placing the sampled layers' pages on the device.
+    pub place_us: u64,
     /// Of `admitted`, pieces taken up from lingering, their pages still held.
     pub revived: usize,
     /// Pieces lingering after it (`pool_linger`).
@@ -159,7 +164,10 @@ impl Scheduler {
             let mut whole = true;
             for i in from..turns {
                 stats.walked += 1;
-                let pages = match conversation.turn_index_page(tl, TurnIndex(i)) {
+                let t_fetch = Instant::now();
+                let fetched = conversation.turn_index_page(tl, TurnIndex(i));
+                stats.fetch_us += t_fetch.elapsed().as_micros() as u64;
+                let pages = match fetched {
                     Ok(Some(p)) => p,
                     Ok(None) => continue,
                     Err(e) => {
@@ -184,7 +192,10 @@ impl Scheduler {
                     break;
                 };
                 for ((width, bytes), key) in framed.iter().zip(pages.page_keys()) {
-                    match self.model.pool_positional_state(slot.0, bytes, key) {
+                    let t_place = Instant::now();
+                    let placed = self.model.pool_positional_state(slot.0, bytes, key);
+                    stats.place_us += t_place.elapsed().as_micros() as u64;
+                    match placed {
                         Ok(_) => {
                             keys.push(*key);
                             layout.entry(TurnIndex(i)).or_default().push((*width, *key));
@@ -265,6 +276,8 @@ impl Scheduler {
             index_read_turns = stats.walked,
             index_read_bytes = stats.read_bytes,
             index_read_us = stats.read_us,
+            fetch_us = stats.fetch_us,
+            place_us = stats.place_us,
             revived = stats.revived,
             lingering = stats.lingering,
             ring_pages = self.pool_read_ring.len(),
